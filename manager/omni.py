@@ -204,12 +204,24 @@ def qemu_command(acct, cfg, dev):
     append = ("stack_depot_disable=on cgroup_disable=pressure "
               "root=/dev/ram0 noexec=off "
               f"SRC={base['src']} DATA=vdb")
+
+    # Display device differs by profile:
+    #  - dev: virtio-vga keeps a legacy VGA text console so firmware/kernel
+    #    text is VISIBLE for debugging (+ serial log).
+    #  - production: NO VGA text device (virtio-gpu-pci) so SeaBIOS/iPXE
+    #    firmware text has nowhere to print, and console=null discards the
+    #    Bliss initrd script output. Result: black from power-on to the
+    #    loading screen. virtio-gpu-pci uses the same virtio_gpu DRM driver
+    #    as virtio-vga, so ARM game rendering is unaffected (verified).
     if dev:
         append += " console=tty0 console=ttyS0,115200"
+        gpu = ["-device", "virtio-vga"]
+        nic = "virtio-net-pci,netdev=net0"
     else:
-        # Silent boot: no kernel log spam, no blinking cursor, skip setup
-        # wizard. GRUB is already absent (direct kernel boot).
-        append += " quiet loglevel=0 vt.global_cursor_default=0 SETUPWIZARD=0"
+        append += (" quiet loglevel=0 console=null "
+                   "vt.global_cursor_default=0 SETUPWIZARD=0")
+        gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
+        nic = "virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
 
     cmd = [
         "qemu-system-x86_64",
@@ -219,14 +231,14 @@ def qemu_command(acct, cfg, dev):
         "-m", str(q["mem_mb"]),
         "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
         "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
-        "-device", "virtio-vga",
+        *gpu,
         "-display", "sdl",
         "-device", "qemu-xhci",
         "-device", "usb-kbd",
         "-device", "usb-tablet",
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
-        "-device", "virtio-net-pci,netdev=net0",
+        "-device", nic,
         "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
         "-kernel", str(images / base["kernel"]),
         "-initrd", str(images / base["initrd"]),
@@ -362,7 +374,13 @@ def provision_settings(acct, label):
         for pkg in BLISS_HOME_PACKAGES:
             adb(acct, "shell", "pm", "disable-user", "--user", "0", pkg,
                 timeout=15)
-        print(f"[{label}] kiosk set as HOME, Bliss launchers disabled")
+        # Launch the kiosk once now so it sets the solid-black wallpaper
+        # into /data before the first production boot (no wallpaper flash).
+        adb(acct, "shell", "am", "start", "-n",
+            "com.omni.kiosk/.MainActivity", timeout=15)
+        time.sleep(3)
+        print(f"[{label}] kiosk set as HOME, Bliss launchers disabled, "
+              f"black wallpaper applied")
     if acct.get("game_package"):
         adb(acct, "shell", "settings", "put", "global",
             "omni_game_package", acct["game_package"], timeout=10)

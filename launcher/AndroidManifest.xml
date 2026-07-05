@@ -7,6 +7,9 @@
     <!-- See every installed package so we can find the game (Android 11+
          package-visibility rules would otherwise hide it). -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- Set a solid-black system wallpaper so no default Bliss wallpaper
+         flashes between the boot animation and the game launching. -->
+    <uses-permission android:name="android.permission.SET_WALLPAPER" />
 
     <application
         android:label="Omni Kiosk"

@@ -1,6 +1,6 @@
 {
   "images_dir": "C:/Users/berat/OmniImages",
-  "current_base": "v2",
+  "current_base": "v3",
   "data_template": "data-template-8g.qcow2",
   "bases": {
     "v1": {
@@ -15,6 +15,13 @@
       "initrd": "base-v2.initrd.img",
       "src": "/android-2024-10-11",
       "notes": "base-v1 + custom loading screen + kiosk system app (Phase 4/5)"
+    },
+    "v3": {
+      "disk": "base-v3.qcow2",
+      "kernel": "base-v3.kernel",
+      "initrd": "base-v3.initrd.img",
+      "src": "/android-2024-10-11",
+      "notes": "base-v2 + kiosk with black-wallpaper. Silent-boot (no console text) is host-side: production profile uses -vga none/virtio-gpu-pci/console=null."
     }
   },
   "qemu": {

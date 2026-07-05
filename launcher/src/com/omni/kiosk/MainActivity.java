@@ -1,12 +1,14 @@
 package com.omni.kiosk;
 
 import android.app.Activity;
+import android.app.WallpaperManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.provider.Settings;
@@ -86,6 +88,8 @@ public class MainActivity extends Activity {
             if (game != null) launchGame(game, "tap");
         });
 
+        ensureBlackWallpaper();
+
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_PACKAGE_ADDED);
         f.addAction(Intent.ACTION_PACKAGE_REPLACED);
@@ -118,6 +122,21 @@ public class MainActivity extends Activity {
             // a blip and the host does nothing; if it is dead the host
             // watchdog will power us off after its grace period.
             status.setText("");
+        }
+    }
+
+    /** Force the system wallpaper to solid black (once), so no default
+     *  Bliss wallpaper can flash between boot animation and game launch.
+     *  Stored in /data, so it persists per-account. */
+    private void ensureBlackWallpaper() {
+        try {
+            WallpaperManager wm = WallpaperManager.getInstance(this);
+            Bitmap black = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+            black.eraseColor(Color.BLACK);
+            wm.setBitmap(black);
+            black.recycle();
+        } catch (Exception e) {
+            Log.w(TAG, "could not set black wallpaper: " + e);
         }
     }
 
