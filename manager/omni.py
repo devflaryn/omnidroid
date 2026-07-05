@@ -369,19 +369,29 @@ def cmd_create(args):
 
 
 def cmd_start(args):
+    """Spawn a detached QEMU instance and return immediately.
+
+    The VM is never tied to this process: PID + ports are recorded in
+    accounts/<name>/run.json, lifecycle is managed via PID/adb/QMP.
+    Use --wait (or 'omni resume <name>') to block until boot completes.
+    """
     cfg = load_config()
     acct = load_account(args.name)
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
     first = not acct.get("first_boot_done")
+    pid = spawn_qemu(acct, cfg, dev=args.dev or first)
+    print(f"[start {args.name}] detached: qemu pid {pid}, "
+          f"adb 127.0.0.1:{acct['adb_port']}, "
+          f"qmp 127.0.0.1:{acct['qmp_port']}")
+    if first:
+        print(f"[start {args.name}] first boot of this account: one-time "
+              f"dexopt, ~15 min. Track progress: omni resume {args.name}",
+              flush=True)
+    if not args.wait:
+        return
     timeout = args.timeout or (FIRST_BOOT_TIMEOUT if first
                                else NORMAL_BOOT_TIMEOUT)
-    if first:
-        print(f"[start {args.name}] NOTE: first boot of this account — "
-              f"one-time dexopt, expect ~15 min", flush=True)
-    pid = spawn_qemu(acct, cfg, dev=args.dev or first)
-    print(f"[start {args.name}] qemu pid {pid}, "
-          f"adb 127.0.0.1:{acct['adb_port']}")
     if not wait_for_boot(acct, timeout, f"start {args.name}",
                          first_boot=first):
         sys.exit(1)
@@ -509,6 +519,8 @@ def main():
     s = sub.add_parser("start")
     s.add_argument("name")
     s.add_argument("--dev", action="store_true")
+    s.add_argument("--wait", action="store_true",
+                   help="block until boot completes (default: detach)")
     s.add_argument("--timeout", type=int, default=None)
     s.set_defaults(func=cmd_start)
 
