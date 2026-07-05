@@ -1,0 +1,24 @@
+# Disk images — never commit (large binaries, live outside the project anyway)
+*.qcow2
+*.img
+*.iso
+*.raw
+
+# Per-account runtime state (overlays, data disks, logs)
+accounts/
+work/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Android build outputs (kiosk APK)
+*.apk
+launcher/build/
+launcher/.gradle/
+local.properties
+
+# OS noise
+Thumbs.db
+desktop.ini

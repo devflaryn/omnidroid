@@ -1,0 +1,8 @@
+{
+  "images_dir": "C:/Users/berat/OmniImages",
+  "bases": {
+    "v1": "base-v1.qcow2"
+  },
+  "current_base": "v1",
+  "notes": "qcow2 base images are immutable once any account references them. Never commit image files."
+}
