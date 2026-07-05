@@ -219,3 +219,29 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
 3. Serial console (`-serial file:` + `console=ttyS0` appended after `console=tty0`) stays in dev-mode boots for diagnosability; drop from production boots (keeps `quiet`).
 4. First boot of a fresh data disk takes many minutes (first-boot dexopt, WHPX): manager must allow ≥15 min timeout for *first* boot of an account, ~2-4 min for subsequent boots.
 5. WHPX quirks learned: QMP `screendump` returns garbage (don't trust it); warm reboots are suspect — manager should always cold-start instances.
+
+---
+
+## Phase 2 results (2026-07-05) — COMPLETE
+
+**Manager:** `manager/omni.py` — `create / start / resume / stop / list [--stats] / install / run-app / adb`. QEMU spawns fully detached (PID+ports in `accounts/<n>/run.json`); `start` returns immediately (`--wait` opts in); `stop` = in-guest `svc power shutdown` → 90 s → QMP `quit` → kill. `list` verifies liveness by PID (ctypes OpenProcess — never `os.kill(pid,0)` on Windows, it terminates the target).
+
+**Critical bug found & fixed:** the Bliss initrd only *mounts* the `DATA=` device — a blank disk leaves Android with no `/data` and it hangs before adbd (this, not WHPX, explained the "first boot hang"). Data disks are now copies of a formatted-empty ext4 template: `OmniImages/data-template-8g.qcow2` (1.5 MB). With a formatted disk, **first boot is ~2–3 min, not ~15** (dexopt runs in background after boot).
+
+**Two accounts side by side, ARM game running (Roblox, arm64-v8a-only APK):**
+
+| Metric | alice | bob |
+|---|---|---|
+| `/data` device | `/dev/block/vdb` ✅ | `/dev/block/vdb` ✅ |
+| Native bridge | libndk ✅ | libndk ✅ |
+| Game installed via adb + running foreground | ✅ `ActivityNativeMain` | ✅ `ActivityNativeMain` |
+| Game PSS (login screen) | 963 MB | 957 MB |
+| Guest RAM used (of 4096 MB) | 2289 MB | 2225 MB |
+| QEMU host-resident | 4297 MB | 4298 MB |
+
+**Measured capacity (replaces the void 2 GB guess):** on Windows a QEMU instance costs its **full `-m` allocation + ~0.2 GB** resident once the guest touches its pages (no page sharing on WHPX). Guest actually uses ~2.3 GB with the game at the login screen (more in real gameplay — remeasure in-game).
+- **Windows, 32 GB host, `-m 4096` (current): ~6 concurrent instances** (≈27 GB usable ÷ 4.3 GB).
+- Windows, `-m 3072` (looks safe at menu; validate in gameplay): ~8 instances.
+- **Linux + KVM + KSM (projection, measure in Phase 8):** 30–40 % dedup of identical system/game code pages → effective ~2.6–3.0 GB/instance → **~9–11 instances** at `-m 4096`, 12–16 at `-m 3072`; more after the Phase 9 low_ram/zram work.
+
+Phase 3 (per-account data split) was absorbed into Phase 2 — built into the manager and verified on both accounts. Login isolation (two different game accounts) needs the user's credentials: log in inside each window, then we confirm settings persist independently across restarts.
