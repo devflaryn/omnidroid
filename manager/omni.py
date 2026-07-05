@@ -530,11 +530,152 @@ def cmd_list(args):
 def cmd_install(args):
     acct = load_account(args.name)
     print(f"[install {args.name}] installing {args.apk} ...")
-    r = adb(acct, "install", "-r", "-g", args.apk, timeout=600)
+    r = adb(acct, "install", "-r", "-g", "--no-incremental", args.apk,
+            timeout=600)
     out = (r.stdout + r.stderr).strip()
     print(f"[install {args.name}] {out}")
     if "Success" not in out:
         sys.exit(1)
+    pkg = apk_package_name(args.apk)
+    if pkg:
+        acct["game_package"] = pkg
+        save_account(acct)
+        adb(acct, "shell", "settings", "put", "global",
+            "omni_game_package", pkg, timeout=10)
+        print(f"[install {args.name}] game package = {pkg} "
+              f"(saved + pushed to guest)")
+
+
+def apk_package_name(apk):
+    """Read the package name from an APK via build-tools aapt2/aapt."""
+    import glob
+    sdk = Path.home() / "AppData/Local/Android/Sdk/build-tools"
+    for bt in sorted(glob.glob(str(sdk / "*")), reverse=True):
+        for tool, argv in (("aapt2.exe", ["dump", "packagename", apk]),
+                           ("aapt.exe", ["dump", "badging", apk])):
+            exe = Path(bt) / tool
+            if not exe.exists():
+                continue
+            try:
+                r = subprocess.run([str(exe)] + argv, capture_output=True,
+                                   text=True, timeout=30)
+                if tool == "aapt2.exe" and r.returncode == 0:
+                    return r.stdout.strip().splitlines()[0]
+                m = re.search(r"package: name='([^']+)'", r.stdout)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+    return None
+
+
+# Bliss packages that claim HOME; disabled per-account so the kiosk is
+# the only launcher. Settings' FallbackHome must NOT be disabled.
+BLISS_HOME_PACKAGES = ("com.android.launcher3",
+                       "com.farmerbb.taskbar.support",
+                       "cu.axel.smartdock")
+
+
+def cmd_kioskify(args):
+    """Install the kiosk APK on a running instance, make it the HOME app,
+    and disable Bliss launchers/taskbar (all per-/data, reversible)."""
+    acct = load_account(args.name)
+    label = f"kioskify {args.name}"
+    adb(acct, "root")
+    time.sleep(2)
+    adb_connect(acct)
+    r = adb(acct, "install", "-r", "-g", "--no-incremental", args.apk,
+            timeout=120)
+    out = (r.stdout + r.stderr).strip()
+    print(f"[{label}] install kiosk: {out}")
+    if "Success" not in out:
+        sys.exit(1)
+    adb(acct, "shell", "cmd", "package", "set-home-activity",
+        "--user", "0", "com.omni.kiosk/.MainActivity", timeout=15)
+    for pkg in BLISS_HOME_PACKAGES:
+        adb(acct, "shell", "pm", "disable-user", "--user", "0", pkg,
+            timeout=15)
+    if acct.get("game_package"):
+        adb(acct, "shell", "settings", "put", "global",
+            "omni_game_package", acct["game_package"], timeout=10)
+    r = adb(acct, "shell", "cmd", "shortcut", "get-default-launcher",
+            timeout=10)
+    print(f"[{label}] default launcher now: {r.stdout.strip()}")
+
+
+WATCH_POLL_SECS = 3
+
+
+def cmd_watch(args):
+    """Host-side shutdown watchdog. THE decider for 'game closed'.
+
+    States:
+      WAITING  - game process has never been seen yet (kiosk may still
+                 be launching it). No timeout here by default.
+      RUNNING  - game process exists. Blips (ads, dialogs, webviews,
+                 focus loss, loading screens) keep the process alive,
+                 so they never leave this state.
+      GRACE    - process is GONE. Confirm it stays gone for --grace
+                 seconds of consecutive polls; any reappearance (quick
+                 relaunch, in-place restart) returns to RUNNING.
+      -> after grace expires: power the instance off (in-guest adb
+         shutdown first, QMP quit fallback -> _shutdown chain).
+
+    'Not foreground' is deliberately NOT a shutdown signal - only
+    process death is. adb hiccups count as 'unknown' and never advance
+    the grace timer; if the QEMU process itself dies we just exit.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # visible in logs
+    except Exception:
+        pass
+    acct = load_account(args.name)
+    pkg = args.package or acct.get("game_package")
+    if not pkg:
+        sys.exit("error: no game package known; pass --package or "
+                 "run 'omni install' first")
+    grace = args.grace
+    label = f"watch {args.name}"
+    print(f"[{label}] pkg={pkg} grace={grace}s poll={WATCH_POLL_SECS}s")
+
+    state = "WAITING"
+    gone_since = None
+    while True:
+        if not running_pid(args.name):
+            print(f"[{label}] QEMU process is gone - exiting watchdog")
+            return
+        pid_out = None
+        try:
+            r = adb(acct, "shell", "pidof", pkg, timeout=8)
+            pid_out = r.stdout.strip()
+        except Exception:
+            pid_out = None          # adb hiccup -> unknown
+
+        if pid_out is None:
+            # Unknown: never advance grace on missing information.
+            print(f"[{label}] adb unreachable (state={state}) - holding")
+        elif pid_out:
+            if state != "RUNNING":
+                print(f"[{label}] game process up (pid {pid_out}) "
+                      f"[{state} -> RUNNING]")
+            state = "RUNNING"
+            gone_since = None
+        else:
+            if state == "RUNNING":
+                state = "GRACE"
+                gone_since = time.time()
+                print(f"[{label}] game process GONE - grace "
+                      f"{grace}s starts [RUNNING -> GRACE]")
+            elif state == "GRACE":
+                waited = time.time() - gone_since
+                if waited >= grace:
+                    print(f"[{label}] gone for {waited:.0f}s >= "
+                          f"{grace}s - shutting instance down")
+                    _shutdown(acct, label)
+                    return
+                print(f"[{label}] still gone ({waited:.0f}/{grace}s)")
+            # WAITING: game never started yet; keep waiting.
+        time.sleep(WATCH_POLL_SECS)
 
 
 def cmd_run_app(args):
@@ -586,6 +727,20 @@ def main():
     i.add_argument("name")
     i.add_argument("apk")
     i.set_defaults(func=cmd_install)
+
+    w = sub.add_parser("watch")
+    w.add_argument("name")
+    w.add_argument("--package", default=None)
+    w.add_argument("--grace", type=int, default=20,
+                   help="seconds the game process must stay gone "
+                        "before shutdown (default 20)")
+    w.set_defaults(func=cmd_watch)
+
+    k = sub.add_parser("kioskify")
+    k.add_argument("name")
+    k.add_argument("--apk", default=str(REPO / "launcher" / "build"
+                                        / "omni-kiosk.apk"))
+    k.set_defaults(func=cmd_kioskify)
 
     r = sub.add_parser("run-app")
     r.add_argument("name")
