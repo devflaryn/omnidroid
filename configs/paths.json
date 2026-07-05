@@ -1,6 +1,7 @@
 {
   "images_dir": "C:/Users/berat/OmniImages",
   "current_base": "v1",
+  "data_template": "data-template-8g.qcow2",
   "bases": {
     "v1": {
       "disk": "base-v1.qcow2",

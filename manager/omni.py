@@ -264,21 +264,22 @@ def running_pid(name):
 # ---------- boot waiting with visible progress ----------
 
 def wait_for_boot(acct, timeout, label, first_boot=False):
-    """Poll until sys.boot_completed=1, printing progress lines."""
+    """Poll until sys.boot_completed=1, printing honest progress lines."""
     d = account_dir(acct["name"])
     serial_log = d / "serial.log"
     start = time.time()
     phase = "starting QEMU"
     last_print = 0.0
+    last_change = time.time()
+    adbd_seen = False
+    initrd_found = False
     while time.time() - start < timeout:
         elapsed = time.time() - start
 
-        new_phase = phase
-        if phase == "starting QEMU" and serial_log.exists():
+        if not initrd_found and serial_log.exists():
             try:
-                txt = serial_log.read_text(errors="ignore")
-                if "Found at" in txt:
-                    new_phase = "OS detected by initrd"
+                if "Found at" in serial_log.read_text(errors="ignore"):
+                    initrd_found = True
             except OSError:
                 pass
         adb_connect(acct)
@@ -286,20 +287,32 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
             print(f"[{label}] boot completed after {elapsed/60:.1f} min")
             return True
         try:
-            state = adb(acct, "get-state").stdout.strip()
+            if adb(acct, "get-state").stdout.strip() == "device":
+                adbd_seen = True
         except subprocess.TimeoutExpired:
-            state = ""
-        if state == "device":
-            new_phase = "Android booting (adb up)"
-        elif "OS detected" in new_phase:
-            new_phase = ("Android first boot: optimizing apps (dexopt) — "
-                         "one-time step, can take ~15 min"
-                         if first_boot else "Android booting")
+            pass
 
+        if adbd_seen and first_boot:
+            new_phase = ("Android first boot: app optimization (dexopt), "
+                         "one-time, ~15 min")
+        elif adbd_seen:
+            new_phase = "Android booting (adbd up)"
+        elif initrd_found:
+            new_phase = "initrd found OS; Android starting (adbd not up yet)"
+        else:
+            new_phase = "starting QEMU"
+
+        if new_phase != phase:
+            last_change = time.time()
+        stalled = time.time() - last_change > 600 and not adbd_seen
+        if stalled:
+            new_phase += ("  [WARNING: no progress signal for 10+ min - "
+                          f"check accounts/{acct['name']}/serial.log "
+                          "and qemu.log]")
         if new_phase != phase or elapsed - last_print >= 15:
             phase = new_phase
             last_print = elapsed
-            print(f"[{label}] {elapsed/60:.1f} min — {phase}", flush=True)
+            print(f"[{label}] {elapsed/60:.1f} min - {phase}", flush=True)
         time.sleep(5)
     print(f"[{label}] TIMED OUT after {timeout/60:.0f} min")
     return False
@@ -341,9 +354,17 @@ def cmd_create(args):
                     "-b", str(base_disk), "-F", "qcow2",
                     str(d / "system.qcow2")], check=True,
                    capture_output=True)
-    subprocess.run(["qemu-img", "create", "-f", "qcow2",
-                    str(d / "data.qcow2"), args.data_size],
-                   check=True, capture_output=True)
+    # /data disk must be a pre-formatted ext4 filesystem: the Bliss initrd
+    # only mounts DATA= devices, it never formats them (a blank disk hangs
+    # Android before adbd). Copy the formatted-empty template.
+    import shutil
+    template = Path(cfg["images_dir"]) / cfg["data_template"]
+    if not template.exists():
+        sys.exit(f"error: data template missing: {template}")
+    if args.data_size != cfg["qemu"]["data_disk_size"]:
+        print(f"[create {name}] note: --data-size ignored for now; "
+              f"template is {cfg['qemu']['data_disk_size']}")
+    shutil.copyfile(template, d / "data.qcow2")
     print(f"[create {name}] disks ready "
           f"(overlay on {base['disk']}, data {args.data_size}); "
           f"adb port {adb_port}, qmp port {qmp_port}")
@@ -420,7 +441,7 @@ def _shutdown(acct, label):
             print(f"[{label}] instance is down (clean)")
             return
         time.sleep(3)
-    print(f"[{label}] guest did not power off in 90s — QMP quit")
+    print(f"[{label}] guest did not power off in 90s - QMP quit")
     qmp(acct, "quit")
     time.sleep(5)
     if pid_alive(pid):
