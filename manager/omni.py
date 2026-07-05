@@ -207,7 +207,9 @@ def qemu_command(acct, cfg, dev):
     if dev:
         append += " console=tty0 console=ttyS0,115200"
     else:
-        append += " quiet"
+        # Silent boot: no kernel log spam, no blinking cursor, skip setup
+        # wizard. GRUB is already absent (direct kernel boot).
+        append += " quiet loglevel=0 vt.global_cursor_default=0 SETUPWIZARD=0"
 
     cmd = [
         "qemu-system-x86_64",
@@ -330,6 +332,26 @@ def post_boot(acct, label):
     return ok
 
 
+def provision_settings(acct, label):
+    """One-time per-account /data settings: kill the lock screen and mark
+    setup complete so boot goes straight to HOME. Idempotent."""
+    adb(acct, "root")
+    time.sleep(2)
+    adb_connect(acct)
+    for args in (
+        ("shell", "locksettings", "set-disabled", "true"),
+        ("shell", "settings", "put", "secure", "lockscreen.disabled", "1"),
+        ("shell", "settings", "put", "global", "device_provisioned", "1"),
+        ("shell", "settings", "put", "secure", "user_setup_complete", "1"),
+    ):
+        try:
+            adb(acct, *args, timeout=10)
+        except Exception:
+            pass
+    print(f"[{label}] provisioned /data settings (lock screen off, "
+          f"setup complete)")
+
+
 # ---------- commands ----------
 
 def cmd_create(args):
@@ -382,6 +404,7 @@ def cmd_create(args):
                          first_boot=True):
         sys.exit(f"[create {name}] provisioning failed (timeout)")
     post_boot(acct, f"create {name}")
+    provision_settings(acct, f"create {name}")
     acct["first_boot_done"] = True
     save_account(acct)
     _shutdown(acct, f"create {name}")
@@ -418,6 +441,7 @@ def cmd_start(args):
         sys.exit(1)
     post_boot(acct, f"start {args.name}")
     if first:
+        provision_settings(acct, f"start {args.name}")
         acct["first_boot_done"] = True
         save_account(acct)
 
@@ -468,6 +492,7 @@ def cmd_resume(args):
         sys.exit(1)
     post_boot(acct, f"resume {args.name}")
     if first:
+        provision_settings(acct, f"resume {args.name}")
         acct["first_boot_done"] = True
         save_account(acct)
 

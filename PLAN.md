@@ -265,3 +265,22 @@ Phase 3 (per-account data split) was absorbed into Phase 2 — built into the ma
 | `-vga std` | **display never inits** (Bliss has no std-VGA path; window stuck 720×400, adb offline) — not viable |
 
 **Conclusion:** not fixable by Android gralloc/HWC flags, display backend, or virtio device variant. The swap is in **QEMU 11.0.50 (dev snapshot `v11.0.0-12631-g54e84cdc7a`) virtio-gpu presentation on Windows**. `virtio-vga` is *required* (only device Bliss drives), so we cannot switch it away. Most likely real fix = **stable QEMU build** (qemu.weilnetz.de/w64) — the Phase-1 note already flagged the dev-snapshot as a risk. Pending user decision on QEMU build vs deferring (swap is cosmetic to the SDL window; pipeline/game logic unaffected).
+
+**DECISION (user, 2026-07-05): DEFER.** Continue to Phase 4/5; revisit color at the kiosk-display phase. Verification of colors meanwhile uses Android `screencap` (shows true colors) as ground truth, not the swapped host window.
+
+---
+
+## Phase 4 results (2026-07-05) — silent boot + custom loading screen — COMPLETE
+
+**Silent boot** (all host-side, no image edits): GRUB already absent (direct kernel boot). Production boot append now adds `quiet loglevel=0 vt.global_cursor_default=0 SETUPWIZARD=0` (in `omni.py` `qemu_command`, non-dev branch). Dev boots keep serial console for diagnosis.
+
+**Custom loading screen:** replaced `/system/media/bootanimation.zip` (system-as-root: `/` = `/dev/loop0` = system.img, ro; `mount -o remount,rw /` makes it writable, writes captured by the qcow2 overlay → will bake into base-v2). Original kept as `bootanimation.zip.orig`.
+- Tooling: `tools/make_bootanimation.py` (packs frames → **STORED** zip, desc.txt first — deflate would silently fail to play), `tools/gen_placeholder_frames.ps1` (System.Drawing placeholder: rotating arc + pulsing "LOADING"). Placeholder art in `assets/loading/`; **user swaps `assets/loading/frames/part0/*.png` for their own art, re-runs the two tools.**
+- **Verified true-color** via `screencap` of the live `bootanimation` binary: blue arc at two different rotation angles across frames (= it animates), correct colors (not R/B-swapped, because guest screencap is ground truth). Boot-time `bootanim` service ran clean (no zip errors in logcat).
+- Note: adbd on WHPX only becomes reachable at ~boot_completed, so the boot-window animation can't be caught via adb screencap; the live-binary method is the reliable in-guest proof. Host-window view during real boot will show it R/B-swapped until the QEMU-build color fix.
+
+**No lock screen:** `/data` settings (`locksettings set-disabled true`, `lockscreen.disabled=1`, `device_provisioned=1`, `user_setup_complete=1`). These are per-`/data`, so wired into the manager as `provision_settings()`, run once on each account's first boot (create/start/resume). Existing alice/bob need a one-time apply.
+
+**ARM translation:** `ro.dalvik.vm.native.bridge=libndk_translation.so` still OK on the modified system (bootanimation is a media asset — no libs/props touched). Full game-launch regression deferred to Phase 5 on the flattened base-v2.
+
+**base-v2 NOT flattened yet (deliberate):** the `work/base-builder-system.qcow2` overlay (on base-v1) holds the bootanimation change and is preserved. Phase 5 adds the kiosk APK to the same overlay, then it flattens to `base-v2.qcow2` once — avoids writing a 6 GB base twice.
