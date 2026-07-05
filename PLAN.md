@@ -193,3 +193,29 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
    - *Without root:* **host watchdog (concrete design):** manager polls `adb shell dumpsys activity activities` every ~2 s and parses the resumed/top activity package. State machine: `WAITING_FOR_GAME` → (game becomes top) → `GAME_RUNNING` → (game no longer top AND process absent per `pidof`) → send QMP `system_powerdown` → if QEMU still alive after 20 s grace → QMP `quit`/kill.
 3. **/data-on-second-disk is a Phase 1 GATE.** Prove Bliss mounts `/data` from a second virtio disk (`DATA=` kernel param or equivalent) before building anything on the two-disk design. If it does not work cleanly: STOP and present the fallback (data-in-overlay + `qemu-img rebase` on base updates) for an explicit decision.
 4. **All instance-count/RAM figures are placeholders until measured.** Early phase: boot one instance with the real game running, record actual guest+QEMU memory use, recompute Windows and Linux+KSM capacity for the 32 GB host.
+
+---
+
+## Phase 0 + Phase 1 results (2026-07-05) — COMPLETE
+
+**Phase 0:** `base-v1.qcow2` moved to `C:\Users\berat\OmniImages\` (immutable). `configs/paths.json`, `.gitignore` (`*.qcow2` etc.), git repo initialized.
+
+**Phase 1 verification results (all on throwaway overlay):**
+
+| Check | Result |
+|---|---|
+| /data on second disk (**the gate**) | ✅ **PASSED** — `DATA=vdb` kernel param mounts `/dev/block/vdb` as `/data`; verified `mount` shows `/dev/block/vdb on /data type ext4`. Two-disk architecture is confirmed viable. |
+| ARM translation | ✅ `ro.dalvik.vm.native.bridge=libndk_translation.so`, abilist `x86_64,arm64-v8a,x86,armeabi-v7a,armeabi`. Game-launch check pending (need game APK). |
+| Root | ✅ Image has KernelSU; **`adb root` restarts adbd as root** (works on this user build). Manager gets root without any in-guest APK privileges. |
+| Shutdown chain | ✅ `adb shell svc power shutdown` → guest powers off → QEMU process exits cleanly. (Plain ACPI/QMP `system_powerdown` is IGNORED by Android — manager must use adb shutdown first, QMP `quit` as fallback.) |
+| adb over TCP | ✅ Guest adbd listens on 5555 by build default (`ro.adb.secure=0`, no auth); works via `hostfwd=tcp:127.0.0.1:PORT-:5555`. Survives blank /data. |
+| **Direct kernel boot** | ✅ Kernel + initrd extracted to host (`work/kernel`, `work/initrd.img`). QEMU `-kernel/-initrd/-append "... SRC=/android-2024-10-11 DATA=vdb ..."` boots fine. **GRUB is bypassed entirely** — no GRUB menu to hide, and per-account kernel params (DATA disk) come from the manager, zero base-image edits. |
+| Idle RAM (no game) | Guest uses ~1.5 GB of its 4 GB; QEMU host process ≈ 4.3 GB resident (full allocation) + ~0.2-0.5 GB overhead. Windows does not share pages between instances. Game measurement pending. |
+| Storage after 1st boot | System overlay: 776 MiB. Data disk (8 G virtual): 478 MiB. Base shared: 6.17 GiB. |
+
+**Architecture updates locked in from findings:**
+1. Boot via `-kernel/-initrd/-append` (files in `images/` next to each base version, extracted once per base update). GRUB/bootloader screens no longer exist in the boot path. §3's GRUB row is obsolete.
+2. Manager shutdown order: `adb shell svc power shutdown` → wait → QMP `quit`. `adb root` immediately after connect, always.
+3. Serial console (`-serial file:` + `console=ttyS0` appended after `console=tty0`) stays in dev-mode boots for diagnosability; drop from production boots (keeps `quiet`).
+4. First boot of a fresh data disk takes many minutes (first-boot dexopt, WHPX): manager must allow ≥15 min timeout for *first* boot of an account, ~2-4 min for subsequent boots.
+5. WHPX quirks learned: QMP `screendump` returns garbage (don't trust it); warm reboots are suspect — manager should always cold-start instances.
