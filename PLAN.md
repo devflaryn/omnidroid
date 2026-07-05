@@ -316,3 +316,28 @@ Grace default 20 s (tune per game via `--grace`; a heavy game with long black-sc
 **ARM translation:** `libndk_translation.so` present; the arm64-only Roblox launches and renders on the kiosk instance. Kiosk is a HOME app + media/settings only — no `/system` libs or bridge props touched.
 
 **AWAITING USER REVIEW before flatten** (per instruction "stop and show shutdown-edge results before flattening"). Next: add kiosk to the base-builder overlay as the system default HOME, flatten overlay → `base-v2.qcow2`, then full ARM game-launch regression on a fresh account created on base-v2.
+
+---
+
+## base-v2 built + verified (2026-07-05) — Phase 4/5 COMPLETE
+
+**Step 1 — "Viewing full screen" suppressed:** `provision_settings()` now also sets `secure immersive_mode_confirmations=confirmed` (per-`/data`, first boot). Confirmed absent on base-v2 run.
+
+**Step 2 — base-v2 flattened:** into the base-builder overlay (which already held the Phase 4 loading screen) I installed the kiosk as a **regular `/system/app`** (`/system/app/OmniKiosk/OmniKiosk.apk`, context `u:object_r:system_file:s0` matching real system apps; `/system/app` not `priv-app` to avoid the privileged-permission allowlist requirement), removed the 9 MB bootanimation `.orig` backup, then `qemu-img convert -c` → **`base-v2.qcow2`, self-contained (no backing file), 2.74 GiB**. Kernel/initrd copied as `base-v2.kernel`/`.initrd.img` (unchanged from v1 — they live on a different partition than the modified system.img). `configs/paths.json`: `current_base=v2`. `provision_settings()` sets kiosk as HOME + disables Bliss launchers when the kiosk package is present (so v2 accounts self-configure; v1 accounts skip cleanly).
+
+**Step 3 — brand-new account `dave` from base-v2, full run (zero intervention):**
+
+| Check | Result |
+|---|---|
+| Silent boot → custom loading screen → kiosk | ✅ boot ~0.5 min, no console text |
+| Kiosk auto-launches Roblox on boot | ✅ Roblox foreground at t≈3 s after boot, no intervention |
+| ARM translation | ✅ `ro.dalvik.vm.native.bridge=libndk_translation.so`, abilist has `arm64-v8a`; arm64-only Roblox **renders** (login screen screencap) |
+| "Viewing full screen" message | ✅ does NOT appear (`immersive_mode_confirmations=confirmed`) |
+| Lock screen | ✅ does NOT appear (`locksettings get-disabled = true`) |
+| Kiosk is a base-v2 system app | ✅ `pm path com.omni.kiosk = /system/app/OmniKiosk/OmniKiosk.apk` |
+| Default HOME | ✅ `com.omni.kiosk/.MainActivity` |
+| Close game → clean shutdown | ✅ watchdog `RUNNING→GRACE`, countdown 3..21 s, `svc power shutdown`, **QEMU exited clean** |
+
+**Isolation preserved:** `base-v1.qcow2` still 6.17 GiB (never written). Each account has its own independent `data.qcow2` (alice 1776 / bob 1455 / charlie 2667 / dave 2176 MB — all different). Overlays back the correct base (alice/bob/charlie→v1, dave→v2). alice/bob still running throughout, untouched.
+
+**Constraints honored:** only media (bootanimation), a HOME app (kiosk in /system/app), and `/data` settings changed. No `/system` libraries or native-bridge props touched — verified by libndk + Roblox rendering on the flattened base-v2.

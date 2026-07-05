@@ -1,6 +1,6 @@
 {
   "images_dir": "C:/Users/berat/OmniImages",
-  "current_base": "v1",
+  "current_base": "v2",
   "data_template": "data-template-8g.qcow2",
   "bases": {
     "v1": {
@@ -8,6 +8,13 @@
       "kernel": "base-v1.kernel",
       "initrd": "base-v1.initrd.img",
       "src": "/android-2024-10-11"
+    },
+    "v2": {
+      "disk": "base-v2.qcow2",
+      "kernel": "base-v2.kernel",
+      "initrd": "base-v2.initrd.img",
+      "src": "/android-2024-10-11",
+      "notes": "base-v1 + custom loading screen + kiosk system app (Phase 4/5)"
     }
   },
   "qemu": {

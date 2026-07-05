@@ -343,13 +343,32 @@ def provision_settings(acct, label):
         ("shell", "settings", "put", "secure", "lockscreen.disabled", "1"),
         ("shell", "settings", "put", "global", "device_provisioned", "1"),
         ("shell", "settings", "put", "secure", "user_setup_complete", "1"),
+        # Suppress the "Viewing full screen / swipe down to exit" immersive
+        # confirmation so it never appears when the kiosk/game hides bars.
+        ("shell", "settings", "put", "secure",
+         "immersive_mode_confirmations", "confirmed"),
     ):
         try:
             adb(acct, *args, timeout=10)
         except Exception:
             pass
+    # If the kiosk is present (system app in base-v2), make it the only
+    # HOME: set default launcher + disable Bliss launchers/taskbar. All
+    # per-/data and reversible; skipped cleanly on bases without it.
+    r = adb(acct, "shell", "pm", "path", "com.omni.kiosk", timeout=10)
+    if "package:" in (r.stdout or ""):
+        adb(acct, "shell", "cmd", "package", "set-home-activity",
+            "--user", "0", "com.omni.kiosk/.MainActivity", timeout=15)
+        for pkg in BLISS_HOME_PACKAGES:
+            adb(acct, "shell", "pm", "disable-user", "--user", "0", pkg,
+                timeout=15)
+        print(f"[{label}] kiosk set as HOME, Bliss launchers disabled")
+    if acct.get("game_package"):
+        adb(acct, "shell", "settings", "put", "global",
+            "omni_game_package", acct["game_package"], timeout=10)
+
     print(f"[{label}] provisioned /data settings (lock screen off, "
-          f"setup complete)")
+          f"immersive confirmed, setup complete)")
 
 
 # ---------- commands ----------
