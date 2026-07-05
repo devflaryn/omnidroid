@@ -245,3 +245,23 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
 - **Linux + KVM + KSM (projection, measure in Phase 8):** 30–40 % dedup of identical system/game code pages → effective ~2.6–3.0 GB/instance → **~9–11 instances** at `-m 4096`, 12–16 at `-m 3072`; more after the Phase 9 low_ram/zram work.
 
 Phase 3 (per-account data split) was absorbed into Phase 2 — built into the manager and verified on both accounts. Login isolation (two different game accounts) needs the user's credentials: log in inside each window, then we confirm settings persist independently across restarts.
+
+---
+
+## Color-swap investigation (2026-07-05)
+
+**Symptom:** QEMU window shows red↔blue swapped (user-confirmed visually). **Quantified:** built a pixel comparator (host window capture vs Android `screencap`, scoring only saturated pixels). Every host capture is a *clean* R/B swap (swapped-error ≈ 0 across 1300+ pixels on Roblox gameplay + home-selector icons) — not a true negative. Android's own framebuffer is always correct (screencap correct), so rendering/translation are fine; only QEMU's virtio-gpu → host presentation swaps.
+
+**Tested (all on throwaway overlay), R/B swap PERSISTS in every case:**
+
+| Config | Result |
+|---|---|
+| `-device virtio-vga -display sdl` (user's original) | swapped |
+| `-display sdl,gl=on` | swapped |
+| `-display gtk` | swapped |
+| `HWC=drm_minigbm GRALLOC=minigbm_arcvm` | swapped |
+| `GRALLOC=minigbm_gbm_mesa` | swapped |
+| `-device virtio-gpu-pci` | swapped |
+| `-vga std` | **display never inits** (Bliss has no std-VGA path; window stuck 720×400, adb offline) — not viable |
+
+**Conclusion:** not fixable by Android gralloc/HWC flags, display backend, or virtio device variant. The swap is in **QEMU 11.0.50 (dev snapshot `v11.0.0-12631-g54e84cdc7a`) virtio-gpu presentation on Windows**. `virtio-vga` is *required* (only device Bliss drives), so we cannot switch it away. Most likely real fix = **stable QEMU build** (qemu.weilnetz.de/w64) — the Phase-1 note already flagged the dev-snapshot as a risk. Pending user decision on QEMU build vs deferring (swap is cosmetic to the SDL window; pipeline/game logic unaffected).
