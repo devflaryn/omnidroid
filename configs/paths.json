@@ -1,8 +1,20 @@
 {
   "images_dir": "C:/Users/berat/OmniImages",
-  "bases": {
-    "v1": "base-v1.qcow2"
-  },
   "current_base": "v1",
-  "notes": "qcow2 base images are immutable once any account references them. Never commit image files."
+  "bases": {
+    "v1": {
+      "disk": "base-v1.qcow2",
+      "kernel": "base-v1.kernel",
+      "initrd": "base-v1.initrd.img",
+      "src": "/android-2024-10-11"
+    }
+  },
+  "qemu": {
+    "mem_mb": 4096,
+    "smp": 4,
+    "data_disk_size": "8G",
+    "adb_port_start": 16001,
+    "qmp_port_start": 17001
+  },
+  "notes": "Base images are immutable once any account references them. Never commit image files."
 }
