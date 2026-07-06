@@ -5,11 +5,13 @@ Each account = a cheap qcow2 overlay on the shared immutable base (system)
 plus an independent data disk (Android /data). Instances boot via direct
 kernel boot (-kernel/-initrd/-append): no GRUB, per-account kernel params.
 
-Usage:
-  python omni.py create <name> [--no-provision] [--data-size 8G]
-  python omni.py start  <name> [--dev] [--timeout SECS]
-  python omni.py stop   <name>
-  python omni.py list   [--stats]
+Usage (full guide: HOWTO.md; --json on create/start/stop/remove/list
+emits exactly one machine-readable line on stdout — the GUI contract):
+  python omni.py create <name> [--no-provision] [--json]
+  python omni.py start  <name> [--mode M] [--wait] [--json]
+  python omni.py stop   <name> [--timeout SECS] [--json]
+  python omni.py remove <name> [--json]              # DESTRUCTIVE
+  python omni.py list   [--stats] [--json]
   python omni.py install <name> <apk> [package]
   python omni.py run-app <name> <package>
   python omni.py adb    <name> -- <adb args...>
@@ -53,6 +55,28 @@ NORMAL_BOOT_TIMEOUT = 360
 # to a directory via /S /D=<dir>, so no global install is needed.
 DEFAULT_QEMU_URL = ("https://qemu.weilnetz.de/w64/"
                     "qemu-w64-setup-20240423.exe")
+
+
+# ---------- machine-readable output (the GUI contract) ----------
+
+def emit_json(obj):
+    """The one JSON payload a --json command prints on stdout."""
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def enable_json_mode():
+    """--json: stdout must carry EXACTLY the JSON payload. Redirect every
+    informational print() (progress, warnings) to stderr so a GUI can
+    parse stdout blindly. emit_json writes to sys.stdout directly and is
+    unaffected."""
+    import builtins
+    orig = builtins.print
+
+    def _to_stderr(*a, **k):
+        k.setdefault("file", sys.stderr)
+        orig(*a, **k)
+    builtins.print = _to_stderr
 
 
 # ---------- config / account state ----------
@@ -175,8 +199,9 @@ def all_accounts():
 # One shared index per account keeps the triple aligned; the three ranges
 # are 1000 apart, so adb/qmp/vnc can NEVER collide below 1000 instances
 # (and instance counts are host-RAM-bound long before that). vnc_port is
-# RESERVED now (recorded in account.json) but not yet passed to QEMU —
-# a local VNC server will bind it later.
+# WIRED: QEMU's built-in VNC server listens on it, 127.0.0.1 ONLY. No
+# auth — that is safe ONLY because of the localhost bind (HARD RULE:
+# never bind VNC to a network interface without adding auth).
 VNC_PORT_START_DEFAULT = 18001
 
 
@@ -430,9 +455,9 @@ def check_accel():
 # Per-instance performance modes. Counts are NEVER capped — these tune the
 # per-instance footprint; the host's free RAM decides how many run.
 # ALL instances are HEADLESS (-display none), always: no host window
-# exists anywhere. View/control happens via adb (screenshot/logcat) today;
-# a local VNC server will be wired to each instance's RESERVED vnc_port
-# later (see the port scheme note at allocate_ports). With no window the
+# exists anywhere. View/control happens via adb (screenshot/logcat) or an
+# optional VNC viewer on the instance's vnc_port (127.0.0.1 only — see
+# the port scheme note at allocate_ports). With no window the
 # old VirGL path (needed a host GL window) and the R/B software-blit swap
 # are both moot — guest-side rendering is unchanged and screencap is
 # always true-color.
@@ -459,6 +484,18 @@ def qemu_command(acct, cfg, dev, mode=None, accel=None):
     d = account_dir(acct["name"])
     accel = accel or default_accel()
     mode = mode or resolve_mode(cfg)
+
+    # The per-account port triple must be distinct (the shared-index scheme
+    # guarantees it below 1000 instances; assert anyway before handing the
+    # ports to QEMU).
+    if len({acct["adb_port"], acct["qmp_port"], acct["vnc_port"]}) != 3:
+        sys.exit(f"error: port collision for '{acct['name']}': "
+                 f"adb {acct['adb_port']} qmp {acct['qmp_port']} "
+                 f"vnc {acct['vnc_port']}")
+    vnc_display = acct["vnc_port"] - 5900     # QEMU -vnc takes a display #
+    if vnc_display < 0:
+        sys.exit(f"error: vnc_port {acct['vnc_port']} is below QEMU's "
+                 f"5900 display offset")
 
     append = ("stack_depot_disable=on cgroup_disable=pressure "
               "root=/dev/ram0 noexec=off "
@@ -491,7 +528,15 @@ def qemu_command(acct, cfg, dev, mode=None, accel=None):
         "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
         "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
         *gpu,
-        "-display", "none",       # headless ALWAYS; VNC will attach later
+        "-display", "none",       # headless ALWAYS; VNC below is an
+                                  # attach point, never a window
+        # Built-in VNC server on the account's reserved port. LOCALHOST
+        # ONLY: no auth is safe ONLY because of the 127.0.0.1 bind — never
+        # bind a network interface without adding auth in the same change.
+        # Idle (no viewer) it does no framebuffer encoding, so leaving it
+        # on costs ~nothing across hours-long headless runs; a viewer
+        # disconnecting never affects the instance.
+        "-vnc", f"127.0.0.1:{vnc_display}",
         "-device", "qemu-xhci",
         "-device", "usb-kbd",
         "-device", "usb-tablet",
@@ -787,9 +832,14 @@ def cmd_create(args):
           f"(overlay on {base['disk']}, data {args.data_size}); "
           f"adb port {adb_port}, qmp port {qmp_port}")
 
+    created = {"name": name, "base": acct["base"], "adb_port": adb_port,
+               "qmp_port": qmp_port, "vnc_port": vnc_port,
+               "vnc_host": "127.0.0.1", "ok": True}
     if args.no_provision:
         print(f"[create {name}] skipping provisioning; first 'start' "
               f"will run the one-time first boot (~15 min)")
+        if getattr(args, "json", False):
+            emit_json({**created, "provisioned": False})
         return
 
     print(f"[create {name}] provisioning: first boot runs Android's "
@@ -806,6 +856,8 @@ def cmd_create(args):
     _shutdown(acct, f"create {name}")
     print(f"[create {name}] provisioned and shut down. "
           f"Subsequent boots take ~2-4 min.")
+    if getattr(args, "json", False):
+        emit_json({**created, "provisioned": True})
 
 
 def cmd_start(args):
@@ -831,59 +883,78 @@ def _cmd_start(args):
     pid = spawn_qemu(acct, cfg, dev=dev, mode=None if dev else mode,
                      accel=accel)
     modestr = "dev" if dev else mode["name"]
+    json_mode = getattr(args, "json", False)
+    result = {"name": args.name, "pid": pid, "mode": modestr,
+              "headless": True,
+              "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
+              "vnc_port": acct["vnc_port"], "vnc_host": "127.0.0.1",
+              "adb_serial": f"127.0.0.1:{acct['adb_port']}",
+              "first_boot": first, "ok": True}
     print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr} "
           f"(headless), adb 127.0.0.1:{acct['adb_port']}, "
           f"qmp 127.0.0.1:{acct['qmp_port']}, "
-          f"vnc-reserved {acct['vnc_port']}")
+          f"vnc 127.0.0.1:{acct['vnc_port']}")
     if first:
         print(f"[start {args.name}] first boot of this account: one-time "
               f"dexopt, ~15 min. Track progress: omni resume {args.name}",
               flush=True)
     if not args.wait:
+        if json_mode:
+            emit_json(result)
         return
     timeout = args.timeout or (FIRST_BOOT_TIMEOUT if first
                                else NORMAL_BOOT_TIMEOUT)
     if not wait_for_boot(acct, timeout, f"start {args.name}",
                          first_boot=first):
+        if json_mode:
+            emit_json({**result, "booted": False, "ok": False})
         sys.exit(1)
-    post_boot(acct, f"start {args.name}")
+    bridge_ok = post_boot(acct, f"start {args.name}")
     if first:
         provision_settings(acct, f"start {args.name}")
         acct["first_boot_done"] = True
         save_account(acct)
+    if json_mode:
+        emit_json({**result, "booted": True, "native_bridge_ok": bridge_ok})
 
 
-def _shutdown(acct, label):
+def _shutdown(acct, label, timeout=90):
     """Graceful in-guest shutdown, then QMP quit fallback. Host-side
-    fallback is mandatory: never rely on the guest self-killing."""
+    fallback is mandatory: never rely on the guest self-killing.
+    Returns the method that brought the instance down:
+    'not-running' | 'powerdown' | 'qmp-quit' | 'killed' | 'kill-failed'.
+    Every path is hard-bounded: timeout + 5s QMP wait + 2s kill wait."""
     name = acct["name"]
     pid = running_pid(name)
     if not pid:
         print(f"[{label}] not running")
-        return
+        return "not-running"
     try:
         adb(acct, "shell", "svc", "power", "shutdown", timeout=10)
         print(f"[{label}] sent in-guest shutdown, waiting for QEMU exit...")
     except Exception:
         print(f"[{label}] adb unreachable, using QMP fallback")
-    deadline = time.time() + 90
+    deadline = time.time() + timeout
     while time.time() < deadline:
         if not pid_alive(pid):
             print(f"[{label}] instance is down (clean)")
-            return
+            return "powerdown"
         time.sleep(3)
-    print(f"[{label}] guest did not power off in 90s - QMP quit")
+    print(f"[{label}] guest did not power off in {timeout}s - QMP quit")
     qmp(acct, "quit")
     time.sleep(5)
-    if pid_alive(pid):
-        print(f"[{label}] still alive — killing pid {pid}")
-        if IS_WINDOWS:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True)
-        else:
-            import os
-            import signal
-            os.kill(pid, signal.SIGKILL)
+    if not pid_alive(pid):
+        return "qmp-quit"
+    print(f"[{label}] still alive — killing pid {pid}")
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True)
+    else:
+        import os
+        import signal
+        os.kill(pid, signal.SIGKILL)
+    time.sleep(2)
+    return "killed" if not pid_alive(pid) else "kill-failed"
 
 
 def cmd_resume(args):
@@ -905,8 +976,77 @@ def cmd_resume(args):
 
 
 def cmd_stop(args):
+    """Power the instance OFF. This is distinct from a viewer merely
+    disconnecting: a VNC/adb disconnect is a no-op (the instance keeps
+    running headless — the default); stop is the explicit power path."""
     acct = load_account(args.name)
-    _shutdown(acct, f"stop {args.name}")
+    was_running = bool(running_pid(args.name))
+    method = _shutdown(acct, f"stop {args.name}", timeout=args.timeout)
+    ok = method != "kill-failed"
+    if getattr(args, "json", False):
+        emit_json({"name": args.name, "was_running": was_running,
+                   "stopped": ok, "method": method, "ok": ok})
+    if not ok:
+        sys.exit(1)
+
+
+def _assert_deletable(path):
+    """Guardrail for the ONLY destructive command (remove): the resolved
+    target must live strictly inside accounts/ — structurally incapable
+    of touching a base image, the images dir, or anything else. Resolve
+    first so '..' or symlink tricks cannot escape; double-check that the
+    images dir is not inside the deletion target (misconfig protection)."""
+    p = Path(path).resolve()
+    root = ACCOUNTS_DIR.resolve()
+    if root not in p.parents:
+        sys.exit(f"error: refusing to delete {p}: outside {root}")
+    try:
+        images = Path(resolve_images_dir(read_config())).resolve()
+    except Exception:
+        images = None
+    if images and (images == p or p in images.parents):
+        sys.exit(f"error: refusing to delete {p}: it contains the images "
+                 f"dir {images}")
+    return p
+
+
+def cmd_remove(args):
+    """DESTRUCTIVE: stop the instance if running, then delete
+    accounts/<name>/ — system overlay + data.qcow2 + state. The account's
+    game data is gone for good; bases and other accounts are untouched.
+    Ports free automatically (allocation scans surviving accounts)."""
+    name = args.name
+    # Exact-name only: same charset create enforces; no globs, no partial
+    # matches, and no path separators can ever reach the delete path.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        sys.exit("error: account name must match [A-Za-z0-9_-]+ exactly "
+                 "(no globs/partial names)")
+    acct = load_account(name)         # exits if the account doesn't exist
+    target = _assert_deletable(account_dir(name))
+    was_running = bool(running_pid(name))
+    if was_running:
+        _shutdown(acct, f"remove {name}", timeout=args.timeout)
+        if running_pid(name):
+            sys.exit(f"error: '{name}' would not stop; NOT deleting")
+    import shutil
+    for _ in range(10):
+        try:
+            shutil.rmtree(target)
+            break
+        except PermissionError:
+            time.sleep(1)     # QEMU may still be releasing file handles
+    else:
+        sys.exit(f"error: could not delete {target} (files still locked)")
+    print(f"[remove {name}] deleted {target} (overlay + data.qcow2 + "
+          f"state); ports adb {acct['adb_port']} qmp {acct['qmp_port']} "
+          f"vnc {acct['vnc_port']} freed")
+    if getattr(args, "json", False):
+        emit_json({"name": name, "removed": True,
+                   "was_running": was_running,
+                   "freed_ports": {"adb": acct["adb_port"],
+                                   "qmp": acct["qmp_port"],
+                                   "vnc": acct["vnc_port"]},
+                   "ok": True})
 
 
 # ---------- base migration (update accounts to a newer base) ----------
@@ -1501,33 +1641,64 @@ def cmd_bench_ksm(args):
             _shutdown(load_account(r["name"]), f"bench {r['name']}")
 
 
+def account_status(a, stats=False):
+    """One account's live state as a plain dict — shared by the human
+    list output and --json (the GUI relies on these exact keys)."""
+    pid = running_pid(a["name"])
+    rec = {"name": a["name"], "base": a["base"], "running": bool(pid),
+           "pid": pid, "mode": None,
+           "adb_port": a["adb_port"], "qmp_port": a["qmp_port"],
+           "vnc_port": a.get("vnc_port"), "vnc_host": "127.0.0.1",
+           "adb_serial": f"127.0.0.1:{a['adb_port']}",
+           "game_package": a.get("game_package")}
+    if pid:
+        try:
+            run = json.loads((account_dir(a["name"]) /
+                              "run.json").read_text())
+            rec["mode"] = run.get("mode")
+            rec["started"] = run.get("started")
+        except Exception:
+            pass
+    if pid and stats:
+        rss = host_rss_mb(pid)
+        rec["host_rss_mb"] = round(rss) if rss else None
+        rec["guest_used_mb"] = None
+        try:
+            mem = adb(a, "shell", "head", "-3", "/proc/meminfo",
+                      timeout=8).stdout
+            tot = int(re.search(r"MemTotal:\s+(\d+)", mem).group(1))
+            avail = int(re.search(r"MemAvailable:\s+(\d+)", mem).group(1))
+            rec["guest_used_mb"] = round((tot - avail) / 1024)
+        except Exception:
+            pass
+        if IS_LINUX:
+            merged = pid_ksm_merged_mb(pid)
+            if merged is not None:
+                rec["ksm_merged_mb"] = round(merged)
+    return rec
+
+
 def cmd_list(args):
     accts = all_accounts()
+    if getattr(args, "json", False):
+        emit_json([account_status(a, stats=args.stats) for a in accts])
+        return
     if not accts:
         print("no accounts. create one: qemu-manager create <name>")
         return
     for a in accts:
-        pid = running_pid(a["name"])
-        state = f"RUNNING pid {pid}" if pid else "stopped"
-        line = (f"{a['name']:<16} base {a['base']}  adb {a['adb_port']}  "
-                f"qmp {a['qmp_port']}  vnc {a.get('vnc_port', '?')}  "
-                f"{state}")
-        if pid and args.stats:
-            rss = host_rss_mb(pid)
-            guest = ""
-            try:
-                mem = adb(a, "shell", "head", "-3", "/proc/meminfo",
-                          timeout=8).stdout
-                tot = int(re.search(r"MemTotal:\s+(\d+)", mem).group(1))
-                avail = int(re.search(r"MemAvailable:\s+(\d+)", mem).group(1))
-                guest = f"  guest-used {(tot - avail) / 1024:.0f} MB"
-            except Exception:
-                pass
-            line += (f"  host-rss {rss:.0f} MB" if rss else "") + guest
-            if IS_LINUX:
-                merged = pid_ksm_merged_mb(pid)
-                if merged is not None:
-                    line += f"  ksm-merged {merged:.0f} MB"
+        rec = account_status(a, stats=args.stats)
+        state = f"RUNNING pid {rec['pid']}" if rec["running"] else "stopped"
+        line = (f"{rec['name']:<16} base {rec['base']}  "
+                f"adb {rec['adb_port']}  qmp {rec['qmp_port']}  "
+                f"vnc {rec['vnc_port'] or '?'}  {state}")
+        if rec["running"] and args.stats:
+            if rec.get("host_rss_mb"):
+                line += f"  host-rss {rec['host_rss_mb']} MB"
+            if rec.get("guest_used_mb"):
+                line += f"  guest-used {rec['guest_used_mb']} MB"
+            if rec.get("ksm_merged_mb") is not None:
+                line += f"  ksm-merged {rec['ksm_merged_mb']} MB"
         print(line)
 
 
@@ -1816,6 +1987,9 @@ def main():
     c.add_argument("name")
     c.add_argument("--no-provision", action="store_true")
     c.add_argument("--data-size", default=None)
+    c.add_argument("--json", action="store_true",
+                   help="one machine-readable JSON line on stdout "
+                        "(progress goes to stderr)")
     c.set_defaults(func=cmd_create)
 
     s = sub.add_parser("start")
@@ -1832,18 +2006,42 @@ def main():
     s.add_argument("--wait", action="store_true",
                    help="block until boot completes (default: detach)")
     s.add_argument("--timeout", type=int, default=None)
+    s.add_argument("--json", action="store_true",
+                   help="one machine-readable JSON line on stdout with "
+                        "pid + adb/qmp/vnc ports")
     s.set_defaults(func=cmd_start)
 
     rs = sub.add_parser("resume")
     rs.add_argument("name")
     rs.set_defaults(func=cmd_resume)
 
-    st = sub.add_parser("stop")
+    st = sub.add_parser("stop",
+                        help="power the instance OFF (adb shutdown -> QMP "
+                             "quit -> kill). A viewer merely disconnecting "
+                             "must NOT call this: instances keep running "
+                             "headless by default")
     st.add_argument("name")
+    st.add_argument("--timeout", type=int, default=90,
+                    help="seconds to wait for graceful power-off before "
+                         "escalating (default 90)")
+    st.add_argument("--json", action="store_true")
     st.set_defaults(func=cmd_stop)
+
+    rm = sub.add_parser("remove",
+                        help="DESTRUCTIVE: stop if running, then delete "
+                             "accounts/<name>/ entirely (overlay + "
+                             "data.qcow2 + state); ports are freed. Can "
+                             "only ever delete inside accounts/")
+    rm.add_argument("name", help="exact account name (no globs)")
+    rm.add_argument("--timeout", type=int, default=90,
+                    help="seconds to wait for graceful power-off first")
+    rm.add_argument("--json", action="store_true")
+    rm.set_defaults(func=cmd_remove)
 
     l = sub.add_parser("list")
     l.add_argument("--stats", action="store_true")
+    l.add_argument("--json", action="store_true",
+                   help="JSON array of accounts on stdout")
     l.set_defaults(func=cmd_list)
 
     i = sub.add_parser("install")
@@ -1990,9 +2188,20 @@ def main():
     ta.set_defaults(func=cmd_test_apk)
 
     args = p.parse_args()
+    if getattr(args, "json", False):
+        enable_json_mode()
     if getattr(args, "data_size", None) is None and args.cmd == "create":
         args.data_size = load_config()["qemu"]["data_disk_size"]
-    args.func(args)
+    try:
+        args.func(args)
+    except SystemExit as e:
+        # In --json mode even fatal errors are machine-readable: emit
+        # {ok:false, error} on stdout, keep the message on stderr, exit 1.
+        if getattr(args, "json", False) and isinstance(e.code, str):
+            print(e.code)                       # -> stderr in json mode
+            emit_json({"ok": False, "error": e.code})
+            sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":

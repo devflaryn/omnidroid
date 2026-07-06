@@ -6,6 +6,9 @@
 3. **CHANGELOG.md** — what each base version and manager change delivered.
 4. **git log** — commit-by-commit history.
 
+(**HOWTO.md** is the user/GUI-facing usage guide — full command
+reference incl. the `--json` schemas the omnidroid GUI depends on.)
+
 Then: `python manager/omni.py list` and `python manager/omni.py bases` to see
 live state. The repo is self-describing; you do NOT need the prior chat.
 
@@ -19,9 +22,9 @@ behavior on Windows (WHPX) and Linux (KVM+KSM); only packaging differs.
 Each "account" is an isolated Android instance that boots straight into a
 single game (silent boot → custom loading screen → game), fully locked
 down (no status bar, no launcher, no escape), and powers off when the game
-closes. **ALL instances run HEADLESS, always** (no host window; a local
-VNC will attach later on each instance's reserved port). Shipped as
-**`qemu-manager`**:
+closes. **ALL instances run HEADLESS, always** (no host window; each
+instance exposes a **localhost-only VNC attach point** on its vnc_port —
+wired 2026-07-06). Shipped as **`qemu-manager`**:
 - **Windows `qemu-manager.exe`** — fully portable: `setup` (or first use)
   downloads a **portable QEMU into ./qemu only**. Nothing is ever
   installed to the host system (no global install/registry/PATH).
@@ -29,6 +32,12 @@ VNC will attach later on each instance's reserved port). Shipped as
   `build-linux.sh` — PyInstaller can't cross-build) — uses **system QEMU**
   (`sudo apt install qemu-system-x86 qemu-utils android-tools-adb`);
   `setup` preflights qemu / `/dev/kvm` / KSM with exact fix commands.
+
+**Naming split (confirmed with user, 2026-07-06):** the engine stays
+**`qemu-manager`** — do NOT rename it. The user-facing product is a
+separate GUI app, **`omnidroid.exe`** (built in another session), which
+drives this engine via the `--json` CLI (see "GUI contract" below and
+**HOWTO.md**, the detailed usage guide).
 
 **Test game:** Roblox (`com.roblox.client`, arm64-v8a only) at
 `C:\Users\berat\Downloads\roblox.apk`. It uses its own account system (no
@@ -133,13 +142,37 @@ Instance lifecycle:
   — detached HEADLESS boot; returns immediately (`--wait` blocks). Ex:
   `omni start alice --mode playable`
 - `resume <name>` — attach to a running instance, wait for boot, run checks.
-- `stop <name>` — graceful shutdown chain (adb → QMP → kill).
+- `stop <name> [--timeout S]` — explicit POWER-OFF chain (adb → QMP →
+  kill), every step hard-bounded; reports the `method` used. A viewer
+  disconnect must NOT call this (see GUI contract).
+- `remove <name> [--timeout S]` — **DESTRUCTIVE**: stop if running →
+  delete `accounts/<name>/` (overlay + data.qcow2 + state) → ports
+  freed. Guardrails: exact `[A-Za-z0-9_-]+` name only; resolved target
+  asserted inside `accounts/` (structurally cannot touch bases/images).
 - `list [--stats]` — accounts, base, ports (adb/qmp/vnc), running PID
   (+ RAM with --stats).
+- **`--json` (create/start/stop/remove/list) — the GUI contract:**
+  stdout carries EXACTLY one JSON payload (progress → stderr); errors
+  become `{"ok":false,"error":…}` + exit 1. `start --json` returns
+  pid + adb/qmp/vnc ports immediately. Full schemas in HOWTO.md §5.
 - **Port scheme (invariant):** one shared index i per account →
-  adb `16001+i`, qmp `17001+i`, **vnc `18001+i` (RESERVED now, wired
-  later)**. Ranges 1000 apart → the three can never collide below 1000
-  instances. Old accounts are backfilled automatically on load.
+  adb `16001+i`, qmp `17001+i`, vnc `18001+i` — **all three WIRED**,
+  all bound 127.0.0.1 only. Ranges 1000 apart → the three can never
+  collide below 1000 instances (also asserted at spawn). Old accounts
+  are backfilled automatically on load.
+- **VNC (wired 2026-07-06):** QEMU's built-in VNC server runs on every
+  instance's vnc_port (QEMU display = port − 5900), **127.0.0.1 only,
+  no auth** (safe ONLY because of the bind — HARD CONSTRAINT 4).
+  Always on: an idle listener does no framebuffer encoding (measured
+  host RSS unchanged). Instance stays `-display none`; VNC is an
+  attach point, never a window. Note: on this QEMU dev snapshot the
+  VNC framebuffer shows the known host-side **R/B swap** (guest/
+  screencap are true-color; see Color note below).
+- **GUI contract — disconnect vs shutdown:** a VNC/adb client
+  disconnecting is a NO-OP; instances keep running headless (that is
+  the default state, designed for hours-long unwatched runs). Power-off
+  happens only via explicit `stop`/`remove` or the `watch` watchdog
+  when the game closes.
 Apps / control:
 - `install <name> <apk>` — adb-install a game into `/data` (dev), record +
   set it as the kiosk's target. Ex: `omni install alice roblox.apk`
@@ -196,17 +229,20 @@ anywhere — verified no code path opens one). Modes are pure RAM/CPU tiers:
 - **brutal**: 2 GB, 2 vCPU — max instances.
 - Override: `--mem MB`. (`--gpu`/`--headless` flags and the VirGL path
   were REMOVED with headless-always — a GL window can't exist.)
-- View/control: `omni screenshot` (true colors) + adb today; a **local
-  VNC server will attach later** to each instance's reserved `vnc_port`
-  (18001+i, already allocated per account — do NOT repurpose the range).
+- View/control: `omni screenshot` (true colors) + adb, or any VNC
+  viewer at `127.0.0.1:<vnc_port>` (18001+i, localhost-only, wired
+  2026-07-06 — colors R/B-swapped on this QEMU build, see Color note).
 
-## Color note (historical; moot under headless-always)
+## Color note
 The old R/B swap was in QEMU's **software virtio-gpu→SDL window blit**
-only. With no host window there is nothing to swap: guest rendering and
-`screencap`/screenshots were ALWAYS true-color. If the future VNC viewer
-shows swapped colors, that's the same host-side presentation bug family —
-check QEMU build/VNC path, never gralloc (guest is fine; one gralloc
-tweak even breaks boot).
+only. Guest rendering and `screencap`/screenshots were ALWAYS true-color.
+**Confirmed 2026-07-06: the wired VNC path swaps too** — VNC framebuffer
+mean RGB was exactly R↔B-mirrored vs screencap ground truth (46.4/51.8/
+52.6 vs 52.6/51.8/46.4, Roblox login). Same host-side presentation bug
+family on this QEMU dev snapshot; **cosmetic only** (input + view work).
+Fix candidates if the GUI needs true color: stable QEMU build (flagged
+since Phase 1) or swap channels in the viewer. NEVER touch gralloc
+(guest is fine; one gralloc tweak even breaks boot).
 
 ## Honest host limits (measured, RAM-bound; CPU never the limit)
 - Per software instance w/ Roblox running: **~3.2 GB resident** (the game
@@ -267,6 +303,15 @@ tweak even breaks boot).
 3. **Preserve base/data isolation:** bases immutable once referenced;
    `data.qcow2` never touched on base updates; the original image is never
    booted writable.
+4. **VNC stays localhost-only.** The per-instance VNC server has NO auth —
+   that is safe ONLY because it binds 127.0.0.1. **Never bind VNC to a
+   network interface without adding authentication (and preferably TLS/
+   tunneling) in the same change** — a future "remote viewing" feature
+   must not silently expose every instance's screen+input to the LAN.
+5. **Destructive ops are confined to `accounts/`:** `remove` (the only
+   one) must keep its structural guardrails — exact-name match, resolved
+   path asserted under `accounts/`, never able to touch a base file or
+   the images dir.
 
 ## Open / optional items (nothing required)
 - **Server base updates (INTENDED FLOW — networking NOT implemented; the
@@ -282,8 +327,8 @@ tweak even breaks boot).
      boots, data untouched** (measured 0.2 s for 6 accounts).
   Bases stay immutable: an update is always a NEW versioned file +
   repoint, never an in-place edit (in-place would corrupt every overlay).
-- **Local VNC view/control** — not built yet; per-instance `vnc_port`
-  (18001+i) is reserved in account.json and shown by `list`/`start`.
+- ~~Local VNC view/control~~ — **DONE 2026-07-06** (localhost-only, always
+  on, R/B-swapped colors on this QEMU build — cosmetic; see Color note).
 - **Linux/KVM + KSM port — HOST-SIDE CODE PREP DONE (2026-07-06), hardware
   pending.** The manager is Linux-ready without a Linux host ever having
   run it: accel auto-detect (WHPX/KVM) + `--accel` override, `-machine

@@ -6,6 +6,66 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Manager — 2026-07-06 — VNC wired (localhost-only), GUI JSON contract, remove, HOWTO
+
+Engine features for the separate **omnidroid.exe GUI** (naming split
+confirmed: engine stays `qemu-manager`, no renames). Host-side flags +
+CLI only — no base change, no /system or bridge props touched.
+
+**1. VNC attach point WIRED (was reserved-only).** Every instance
+(production and dev/builder profiles) now starts QEMU's built-in VNC
+server on its reserved `vnc_port` (18001+i → QEMU display `:12101+i`),
+bound to **127.0.0.1 ONLY**. Instances stay `-display none` headless;
+VNC is an optional attach surface, always on because an idle listener
+does no framebuffer encoding (measured host-rss 3235 MB at `-m 3072`
+with Roblox ≈ the documented pre-VNC 3195 MB) — hours-long unwatched
+runs pay nothing. Port-triple distinctness asserted at spawn.
+**NEW HARD CONSTRAINT #4: no-auth VNC is safe ONLY because of the
+localhost bind — never bind a network interface without adding auth in
+the same change.**
+- **Color note (measured):** the VNC framebuffer serves a clean **R/B
+  swap** vs adb-screencap ground truth (mean RGB 46.4/51.8/52.6 vs
+  52.6/51.8/46.4 on the Roblox login screen) — the SAME documented
+  host-side presentation bug family as the old SDL blit on this QEMU
+  dev snapshot. Guest rendering is true-color (screencap proves it);
+  candidates if it matters for the GUI: stable QEMU build (already
+  flagged) or swap channels in the viewer. Never touch gralloc.
+
+**2. GUI contract: `--json` + `remove` + stop semantics.**
+- `--json` on `create`/`start`/`stop`/`remove`/`list`: stdout carries
+  EXACTLY one JSON payload (progress → stderr); fatal errors become
+  `{"ok":false,"error":…}` + exit 1. `start --json` returns pid +
+  adb/qmp/vnc ports immediately (detached); `--wait` adds
+  `booted`/`native_bridge_ok`. `list --json [--stats]` returns the
+  full fleet with live state/RSS/guest-used.
+- **NEW `remove <name>`** — the project's first destructive op, with
+  hard guardrails: exact `[A-Za-z0-9_-]+` name only (no globs/paths);
+  the resolved delete target is asserted to live inside `accounts/`
+  (structurally cannot touch a base/images dir — double-checked that
+  images_dir is not inside the target); stop-first with the bounded
+  chain, refuses to delete if the instance won't stop; Windows
+  file-lock retry. Deletes overlay + data.qcow2 + state; ports freed
+  (index reused by next create).
+- **Disconnect ≠ shutdown (documented contract):** a VNC/adb viewer
+  disconnect is a no-op — instances keep running headless (default).
+  `stop [--timeout S]` is the only power path (adb `svc power
+  shutdown` → QMP quit → kill, every step hard-bounded, reports
+  `method`). All GUI commands are headless with hard timeouts (adb
+  readiness only) and identical on Windows/Linux.
+
+**3. HOWTO.md** — new detailed usage guide (setup, concepts, full
+command reference with JSON schemas, VNC + security rule, workflows,
+troubleshooting).
+
+**Verified live (throwaway account, then removed):** create --json
+(provisioned ~1 min) → start --json --wait hard (booted 0.3 min) →
+netstat: adb/qmp/vnc all 127.0.0.1-LISTENING, no collisions → real RFB
+3.8 handshake + full 4,096,000-byte raw framebuffer → probe disconnect
+→ instance still up (boot_completed=1) → libndk OK → **Roblox
+foreground + renders (screencap)** → stop --json (method=powerdown) →
+remove --json (folder gone, ports freed) → fleet list + images dir
+byte-identical to pre-test snapshot.
+
 ## Manager — 2026-07-06 — headless-always, qemu-manager packaging, FAST update-all
 
 **1. Headless always.** `--headless`, `--gpu` and `--window` REMOVED; every
