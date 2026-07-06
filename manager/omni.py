@@ -266,45 +266,84 @@ def qmp(acct, execute, arguments=None, timeout=6):
 
 # ---------- qemu ----------
 
-def qemu_command(acct, cfg, dev):
+# Per-instance performance modes. Counts are NEVER capped — these tune the
+# per-instance footprint; the host's free RAM decides how many run.
+#   gpu:   virgl    = -device virtio-gpu-gl + -display sdl,gl=on
+#                     (host-GL: CORRECT COLORS + GPU accel; the ONLY combo
+#                      that fixes the R/B swap on this QEMU build)
+#          software = -vga none + virtio-gpu-pci + -display sdl
+#                     (no GPU; host window shows R/B SWAPPED on this build)
+#   headless: -display none (no window at all; drive via adb)
+MODES = {
+    "playable": {"gpu": "virgl",    "mem": 4096, "smp": 4, "headless": False},
+    "hard":     {"gpu": "software", "mem": 3072, "smp": 4, "headless": False},
+    "brutal":   {"gpu": "software", "mem": 2048, "smp": 2, "headless": True},
+}
+DEFAULT_MODE = "playable"
+
+
+def resolve_mode(cfg, name=None, gpu=None, mem=None, headless=None):
+    m = dict(MODES[name or DEFAULT_MODE])
+    m["name"] = name or DEFAULT_MODE
+    if gpu:
+        m["gpu"] = gpu
+    if mem:
+        m["mem"] = mem
+    if headless is not None:
+        m["headless"] = headless
+    # Headless has no window, so a GL context is pointless -> software path.
+    if m["headless"]:
+        m["gpu"] = "software"
+    return m
+
+
+def qemu_command(acct, cfg, dev, mode=None):
     base = cfg["bases"][acct["base"]]
     images = Path(cfg["images_dir"])
     q = cfg["qemu"]
     d = account_dir(acct["name"])
     accel = "whpx,kernel-irqchip=off" if IS_WINDOWS else "kvm"
+    mode = mode or resolve_mode(cfg)
 
     append = ("stack_depot_disable=on cgroup_disable=pressure "
               "root=/dev/ram0 noexec=off "
               f"SRC={base['src']} DATA=vdb")
+    smp = q["smp"]
+    mem = q["mem_mb"]
+    display = ["-display", "sdl"]
 
-    # Display device differs by profile:
-    #  - dev: virtio-vga keeps a legacy VGA text console so firmware/kernel
-    #    text is VISIBLE for debugging (+ serial log).
-    #  - production: NO VGA text device (virtio-gpu-pci) so SeaBIOS/iPXE
-    #    firmware text has nowhere to print, and console=null discards the
-    #    Bliss initrd script output. Result: black from power-on to the
-    #    loading screen. virtio-gpu-pci uses the same virtio_gpu DRM driver
-    #    as virtio-vga, so ARM game rendering is unaffected (verified).
     if dev:
+        # Dev/builder boot: legacy VGA text console VISIBLE for debugging.
         append += " console=tty0 console=ttyS0,115200"
         gpu = ["-device", "virtio-vga"]
         nic = "virtio-net-pci,netdev=net0"
     else:
+        # Production silent boot (no firmware/console text) + per-mode GPU.
         append += (" quiet loglevel=0 console=null "
                    "vt.global_cursor_default=0 SETUPWIZARD=0")
-        gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
         nic = "virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
+        smp = mode["smp"]
+        mem = mode["mem"]
+        if mode["headless"]:
+            gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
+            display = ["-display", "none"]
+        elif mode["gpu"] == "virgl":
+            # VirGL: correct colors + GPU accel (host OpenGL).
+            gpu = ["-vga", "none", "-device", "virtio-gpu-gl"]
+            display = ["-display", "sdl,gl=on"]
+        else:
+            gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
 
     cmd = [
         qemu_bin("qemu-system-x86_64"),
         "-machine", f"q35,accel={accel}",
         "-cpu", "qemu64",
-        "-smp", str(q["smp"]),
-        "-m", str(q["mem_mb"]),
+        "-smp", str(smp),
+        "-m", str(mem),
         "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
         "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
         *gpu,
-        "-display", "sdl",
+        *display,
         "-device", "qemu-xhci",
         "-device", "usb-kbd",
         "-device", "usb-tablet",
@@ -322,7 +361,7 @@ def qemu_command(acct, cfg, dev):
     return cmd
 
 
-def spawn_qemu(acct, cfg, dev):
+def spawn_qemu(acct, cfg, dev, mode=None):
     d = account_dir(acct["name"])
     log = open(d / "qemu.log", "w")
     kwargs = {}
@@ -332,10 +371,11 @@ def spawn_qemu(acct, cfg, dev):
         kwargs["creationflags"] = DETACHED | NEW_GROUP
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(qemu_command(acct, cfg, dev),
+    proc = subprocess.Popen(qemu_command(acct, cfg, dev, mode),
                             stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
-        {"pid": proc.pid, "started": time.time()}))
+        {"pid": proc.pid, "started": time.time(),
+         "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE)}))
     return proc.pid
 
 
@@ -556,8 +596,23 @@ def _cmd_start(args):
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
     first = not acct.get("first_boot_done")
-    pid = spawn_qemu(acct, cfg, dev=args.dev or first)
-    print(f"[start {args.name}] detached: qemu pid {pid}, "
+    dev = args.dev or first          # first boot always uses the dev profile
+    mode = resolve_mode(cfg, args.mode, gpu=args.gpu, mem=args.mem,
+                        headless=args.headless or None)
+    pid = spawn_qemu(acct, cfg, dev=dev, mode=None if dev else mode)
+    # VirGL can fail to init on some hosts; detect an immediate QEMU exit
+    # and fall back to software so the instance still comes up.
+    if not dev and mode["gpu"] == "virgl":
+        time.sleep(4)
+        if not pid_alive(pid):
+            print(f"[start {args.name}] VirGL failed to start on this host; "
+                  f"falling back to software rendering")
+            mode = resolve_mode(cfg, args.mode, gpu="software", mem=args.mem,
+                                headless=args.headless or None)
+            pid = spawn_qemu(acct, cfg, dev=False, mode=mode)
+    modestr = "dev" if dev else f"{mode['name']}/{mode['gpu']}" + (
+        "/headless" if mode["headless"] else "")
+    print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr}, "
           f"adb 127.0.0.1:{acct['adb_port']}, "
           f"qmp 127.0.0.1:{acct['qmp_port']}")
     if first:
@@ -984,6 +1039,118 @@ def cmd_kioskify(args):
     print(f"[{label}] default launcher now: {r.stdout.strip()}")
 
 
+# ---------- dev / testing harness (scriptable, JSON output) ----------
+
+def _foreground(acct):
+    try:
+        r = adb(acct, "shell", "dumpsys", "activity", "activities",
+                timeout=10)
+        m = re.search(r"topResumedActivity=ActivityRecord\{\S+ \S+ (\S+)",
+                      r.stdout)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def cmd_screenshot(args):
+    """Pull a screenshot from the guest framebuffer (true colors, works
+    headless). Prints JSON: {ok, path}."""
+    acct = load_account(args.name)
+    out = args.out or str(account_dir(args.name)
+                          / f"shot-{int(time.time())}.png")
+    try:
+        adb(acct, "shell", "screencap", "-p", "/data/local/tmp/_s.png",
+            timeout=30)
+        adb(acct, "pull", "/data/local/tmp/_s.png", out, timeout=60)
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
+    ok = Path(out).exists() and Path(out).stat().st_size > 0
+    print(json.dumps({"ok": ok, "path": out if ok else None}))
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_logcat(args):
+    """Read guest logcat (raw, machine-parseable). --clear wipes it;
+    --tag filters to a tag; otherwise dumps and returns."""
+    acct = load_account(args.name)
+    if args.clear:
+        adb(acct, "logcat", "-c", timeout=15)
+        print(json.dumps({"ok": True, "cleared": True}))
+        return
+    argv = ["logcat", "-d"]
+    if args.tag:
+        argv += ["-s", args.tag]
+    r = adb(acct, *argv, timeout=args.timeout)
+    sys.stdout.write(r.stdout)
+
+
+def cmd_test_apk(args):
+    """One-shot dev harness: ensure a FRESH session with NO app pre-baked
+    (v3 dev base, kiosk), install the given APK, let the kiosk launch it,
+    and report machine-readable JSON. Headless by default. After this,
+    drive with: omni screenshot / logcat / adb.
+
+    Emits a single JSON line: {account, adb_port, qmp_port, package,
+    installed, launched, foreground, pid, mode}."""
+    ensure_qemu()
+    cfg = load_config()
+    name = args.name
+    result = {"account": name}
+    fresh = not (account_dir(name) / "account.json").exists()
+    if fresh and not args.reuse:
+        # Create a clean dev account on the current (dev) base.
+        import argparse as _a
+        ca = _a.Namespace(name=name, no_provision=False,
+                          data_size=cfg["qemu"]["data_disk_size"])
+        cmd_create(ca)
+    acct = load_account(name)
+    result["base"] = acct["base"]
+    if not running_pid(name):
+        mode = resolve_mode(cfg, args.mode, headless=not args.window)
+        spawn_qemu(acct, cfg, dev=False, mode=mode)
+        if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, f"test {name}"):
+            print(json.dumps({**result, "ok": False,
+                              "error": "boot timeout"}))
+            sys.exit(1)
+        post_boot(acct, f"test {name}")
+        result["mode"] = mode["name"] + ("/headless" if mode["headless"]
+                                         else "")
+    pkg = apk_package_name(args.apk)
+    result["package"] = pkg
+    adb(acct, "logcat", "-c", timeout=15)
+    r = adb(acct, "install", "-r", "-g", "--no-incremental", args.apk,
+            timeout=600)
+    result["installed"] = "Success" in (r.stdout + r.stderr)
+    if pkg:
+        acct["game_package"] = pkg
+        save_account(acct)
+        adb(acct, "shell", "settings", "put", "global",
+            "omni_game_package", pkg, timeout=10)
+        # kiosk auto-launches on PACKAGE_ADDED; also nudge explicitly.
+        adb(acct, "shell", "monkey", "-p", pkg, "-c",
+            "android.intent.category.LAUNCHER", "1", timeout=30)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        fg = _foreground(acct)
+        if fg and pkg and fg.startswith(pkg):
+            break
+        time.sleep(3)
+    result["foreground"] = _foreground(acct)
+    try:
+        result["pid"] = (adb(acct, "shell", "pidof", pkg, timeout=8)
+                         .stdout.strip() or None) if pkg else None
+    except Exception:
+        result["pid"] = None
+    result["launched"] = bool(result["pid"])
+    result["adb_port"] = acct["adb_port"]
+    result["qmp_port"] = acct["qmp_port"]
+    result["adb_serial"] = f"127.0.0.1:{acct['adb_port']}"
+    result["ok"] = result["installed"] and result["launched"]
+    print(json.dumps(result))
+
+
 WATCH_POLL_SECS = 3
 
 
@@ -1086,6 +1253,16 @@ def main():
 
     s = sub.add_parser("start")
     s.add_argument("name")
+    s.add_argument("--mode", choices=list(MODES), default=None,
+                   help="playable (VirGL, correct color, smooth) | hard "
+                        "(software, more instances) | brutal (headless, "
+                        "min RAM, max instances). Default: playable")
+    s.add_argument("--gpu", choices=["virgl", "software"], default=None,
+                   help="override the mode's renderer")
+    s.add_argument("--mem", type=int, default=None,
+                   help="override guest RAM in MB")
+    s.add_argument("--headless", action="store_true",
+                   help="no display window (any mode); drive via adb")
     s.add_argument("--dev", action="store_true")
     s.add_argument("--wait", action="store_true",
                    help="block until boot completes (default: detach)")
@@ -1169,6 +1346,30 @@ def main():
                               "production mode switch)")
     ubz.add_argument("tag")
     ubz.set_defaults(func=cmd_use_base)
+
+    sc = sub.add_parser("screenshot", help="pull a screenshot (JSON out)")
+    sc.add_argument("name")
+    sc.add_argument("--out", default=None)
+    sc.set_defaults(func=cmd_screenshot)
+
+    lc = sub.add_parser("logcat", help="read/clear guest logcat")
+    lc.add_argument("name")
+    lc.add_argument("--tag", default=None, help="filter to a log tag")
+    lc.add_argument("--clear", action="store_true")
+    lc.add_argument("--timeout", type=int, default=30)
+    lc.set_defaults(func=cmd_logcat)
+
+    ta = sub.add_parser("test-apk",
+                        help="dev harness: fresh session, install+launch an "
+                             "APK, report JSON (headless, scriptable)")
+    ta.add_argument("name")
+    ta.add_argument("--apk", required=True)
+    ta.add_argument("--mode", choices=list(MODES), default="hard")
+    ta.add_argument("--window", action="store_true",
+                    help="show a display window (default headless)")
+    ta.add_argument("--reuse", action="store_true",
+                    help="reuse the account if it already exists")
+    ta.set_defaults(func=cmd_test_apk)
 
     args = p.parse_args()
     if getattr(args, "data_size", None) is None and args.cmd == "create":

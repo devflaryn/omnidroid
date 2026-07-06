@@ -3,6 +3,45 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Manager — 2026-07-06 — color fix, performance modes, dev harness
+
+**R/B color swap FIXED via VirGL.** The swap was in QEMU's software 2D
+virtio-gpu→SDL blit on this build. Confirmed exhaustively: gralloc backends
+(`GRALLOC=gbm` even breaks boot), display backends, and virtio device
+variants all still swap under software rendering. The fix is **VirGL**
+(`-device virtio-gpu-gl -display sdl,gl=on`): host OpenGL presents correct
+colors AND accelerates the GPU. Verified visually on the Roblox screen
+through the manager — blue links blue, orange terrain orange (vs the
+software A/B where they were swapped). Roblox still renders via libndk.
+Software rendering still swaps (host-side blit bug); documented per mode.
+
+**Performance modes** — `omni start <name> --mode playable|hard|brutal`.
+Instance counts are NEVER capped; modes only tune the per-instance
+footprint (host free RAM decides how many run).
+- `playable` (default): VirGL (correct color + GPU), 4 GB, 4 vCPU. Smooth,
+  few instances.
+- `hard`: software rendering, 3 GB, 4 vCPU. More instances (R/B swapped on
+  the host window; use `--gpu virgl` for correct color).
+- `brutal`: headless (no window), software, 2 GB, 2 vCPU. Max instances.
+- Overrides: `--gpu virgl|software`, `--mem MB`, `--headless` (any mode).
+- **VirGL graceful fallback**: if VirGL fails to start (host GL issue),
+  `start` detects the immediate QEMU exit and relaunches in software.
+- Mode recorded in `accounts/<name>/run.json`. Dev/builder boots are
+  unchanged (virtio-vga + serial, visible for debugging).
+
+**Dev / testing harness (scriptable, JSON output, headless).**
+- `omni test-apk <name> --apk <apk> [--mode hard] [--window] [--reuse]` —
+  one-shot: ensure a FRESH session with no app pre-baked (v3 dev base +
+  kiosk), install the APK, let the kiosk launch it, emit one JSON line:
+  `{account, base, mode, package, installed, launched, foreground, pid,
+  adb_port, qmp_port, adb_serial, ok}`. Headless by default.
+- `omni screenshot <name> [--out path]` — pull a framebuffer screenshot
+  (true colors, works headless); prints JSON `{ok, path}`.
+- `omni logcat <name> [--tag T] [--clear]` — read/clear guest logcat.
+- `omni adb <name> -- <args>` — arbitrary adb (existing).
+  An agent scripts: `test-apk` → parse JSON → `screenshot`/`logcat`/`adb`
+  against the reported `adb_serial`.
+
 ## Manager — 2026-07-06 — base migration, QEMU auto-install, exe, prod updates
 
 **Base migration (update accounts to a newer base, keeping their data).**
