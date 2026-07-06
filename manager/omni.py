@@ -536,6 +536,12 @@ def lockdown_and_trim(acct, label):
     per-/data: sets the kiosk as device owner so it can fully disable the
     status bar / Quick-Settings pull-down / nav gestures, kills the setup
     wizard, disables unneeded apps, and zeroes animations."""
+    # If an older kiosk was ever adb-installed into /data (e.g. via
+    # 'kioskify'), that copy shadows the base's /system kiosk and may lack
+    # the device-admin receiver -> "Unknown admin". Revert to the system
+    # kiosk first so device owner can be set.
+    adb(acct, "shell", "cmd", "package", "uninstall-system-updates",
+        "com.omni.kiosk", timeout=30)
     # Device owner: enables the kiosk's Lock Task Mode. Works only on a
     # device with no added accounts (kiosk accounts have none). Idempotent-
     # ish: ignore "already set" failures.
