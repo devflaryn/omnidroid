@@ -6,6 +6,50 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Manager — 2026-07-06 — fresh-install guards, base auto-register, doctor
+
+**Bug fixed:** on a blank deployment (exe in a new folder, setup run,
+images_dir still empty) `create` crashed with `KeyError: None` —
+`load_config` indexed `bases[current_base]` with `current_base: null`.
+
+**1. Missing-base guard everywhere.** `load_config` (the gate every
+base-needing command goes through: create/start/update-base/update-all/
+rebuild-base/update-kiosk/bench-ksm) now handles a null/unregistered
+`current_base` and missing base files explicitly: clean actionable
+error listing the EXACT files + full images_dir path (never a
+traceback), `{"ok":false,"error":…}` + exit 1 in `--json` mode. The
+create `--data-size` default lookup moved out of `main()` into
+`cmd_create` so it's inside the same guard/JSON wrapper.
+
+**2. Blank deployment self-bootstraps.** `read_config` (not just
+`setup`) creates the default `configs/paths.json` next to the exe on
+first use — drop `qemu-manager.exe` into any folder and every command
+works. Malformed config JSON also errors cleanly now. Default template
+gains `default_src` (kernel SRC= for auto-registered bases).
+
+**3. Base AUTO-REGISTRATION.** Complete `base-vN.qcow2 + .kernel +
+.initrd.img` triples found in images_dir that aren't registered yet are
+registered automatically on the next command (src from `default_src`;
+`current_base` = highest vN when unset). Copy the files in — nothing
+else to do. This is the exact hook the future server download lands on.
+Registration only ADDS config entries; bases/accounts never touched.
+
+**4. `doctor` command + airtight setup guidance.** `doctor [--json]`
+reports config path, images_dir, registered bases, per-file presence
+with FULL missing paths, data-template, QEMU/adb resolution, and a
+`ready` verdict (exit 0/1 — the GUI can gate on it). `setup` now prints
+the same missing-file list + the copy-these-files help block
+(exact names: `base-vN.qcow2`, `base-vN.kernel`, `base-vN.initrd.img`,
+`data-template-8g.qcow2`).
+
+**Verified both states with the shipped exe in a sandbox folder:**
+empty images_dir → `create`/`create --json`/`update-all`/`setup`/
+`doctor` all fail clean with the file list (no tracebacks, exit 1);
+then base-v5 files + template copied in → `create` auto-registered v5
+(current=v5), provisioned, `start --wait` booted with libndk OK, then
+stop/remove clean. Healthy repo install regressed: `doctor` ready,
+config byte-identical (no rewrite).
+
 ## Manager — 2026-07-06 — VNC wired (localhost-only), GUI JSON contract, remove, HOWTO
 
 Engine features for the separate **omnidroid.exe GUI** (naming split

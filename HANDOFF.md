@@ -131,10 +131,23 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 
 ## CLI (identical: `python manager/omni.py …` == `qemu-manager(.exe) …`)
 Setup:
+- **Blank-deployment bootstrap (2026-07-06):** the exe can be dropped
+  into ANY folder — every command self-creates `configs/paths.json`
+  (default template incl. `default_src`) next to it. Complete
+  `base-vN.qcow2/.kernel/.initrd.img` triples appearing in images_dir
+  are **auto-registered on the next command** (current_base = highest
+  vN when unset) — this is the hook the future server download uses.
+  With no usable base, every base-needing command (create/start/
+  update-*/rebuild-base) exits CLEANLY with the exact copy-these-files
+  message (never a traceback; `--json` gets `{"ok":false,"error":…}`).
 - `setup` — first-run, idempotent. Windows: creates folders + downloads
   portable QEMU into ./qemu (self-contained, never touches the host
   system). Linux: creates `~/OmniImages`, preflights system QEMU /
-  `/dev/kvm` / KSM with exact fix commands. JSON report.
+  `/dev/kvm` / KSM with exact fix commands. JSON report + the exact
+  missing-file list when the base isn't there yet.
+- `doctor [--json]` — readiness check: per-file base/template presence
+  (full missing paths), QEMU/adb resolution, `ready` verdict. Exit 0 =
+  ready, 1 = not. The GUI can gate its UI on this.
 Instance lifecycle:
 - `create <name>` — new account on current base; provisions (headless first
   boot). Ex: `omni create alice`
@@ -320,8 +333,9 @@ since Phase 1) or swap channels in the viewer. NEVER touch gralloc
   The local flow is already in place and verified:
   1. new `base-vN+1.qcow2` (+ `.kernel`/`.initrd.img`) lands in the
      images dir (today out-of-band; later downloaded),
-  2. register it under `bases` in `configs/paths.json` + set
-     `current_base`,
+  2. it is AUTO-REGISTERED on the next command (2026-07-06; `src` from
+     config `default_src`) — manual registration no longer needed,
+     though `use-base` still switches the default explicitly,
   3. `update-all` — AUTO takes the FAST overlay-repoint for a pure
      system/game swap: **all accounts on the new base in seconds, no
      boots, data untouched** (measured 0.2 s for 6 accounts).

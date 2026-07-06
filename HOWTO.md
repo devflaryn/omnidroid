@@ -70,10 +70,42 @@ printing exact fix commands for anything missing (e.g.
 `sudo usermod -aG kvm $USER`). The Linux binary is built ON a Linux box
 via `build-linux.sh` (PyInstaller cannot cross-build).
 
-Base images (`base-vN.qcow2` + `.kernel` + `.initrd.img` +
-`data-template-8g.qcow2`) must be present in the images dir
+### Fresh deployment: drop the exe anywhere
+
+`qemu-manager.exe` is designed to be copied into any folder and just
+work — **every command self-bootstraps** `configs/paths.json` (and
+`accounts/`, `./qemu` on Windows) next to the exe on first use. What it
+cannot invent is the base image. Until the base files exist, every
+command that needs one fails with a clean message telling you exactly
+what to copy where (no crashes), and `--json` callers get
+`{"ok": false, "error": …}`.
+
+Make the install ready by copying these files into the images dir
 (`configs/paths.json` → `images_dir`; Windows default
-`C:/Users/berat/OmniImages`, Linux `~/OmniImages`).
+`C:/Users/berat/OmniImages`, Linux `~/OmniImages`):
+
+```
+base-vN.qcow2            the immutable Bliss OS system image (e.g. base-v5.qcow2)
+base-vN.kernel           its extracted kernel
+base-vN.initrd.img       its extracted initrd
+data-template-8g.qcow2   formatted-empty ext4 /data template
+```
+
+Complete `base-vN` triples are **auto-registered on the next command**
+(current base = highest version if none was set) — no manual config
+editing. This is also the hook for the future server download: a new
+base landing in `images_dir` registers itself the same way.
+
+### Verify readiness: `doctor`
+
+```
+qemu-manager doctor [--json]
+```
+
+Reports the config path, images dir, registered bases, per-file
+presence (exact missing paths), data template, QEMU/adb resolution, and
+an overall `ready` verdict. Exit 0 = ready to create/boot; exit 1 = the
+report says precisely what is missing and where to put it.
 
 ---
 
@@ -241,8 +273,10 @@ it out. Bases are never edited in place.
 
 ### Platform
 
-#### `omni setup` / `omni qemu-info [--install]`
-First-run setup (see §2) / show or repair QEMU resolution.
+#### `omni setup` / `omni doctor [--json]` / `omni qemu-info [--install]`
+First-run setup (see §2) / readiness check — what's present/missing in
+images_dir, QEMU/adb resolution, `ready` verdict, exit 0/1 (see §2) /
+show or repair QEMU resolution.
 
 #### `omni ksm [status|on|off] [--aggressive]` / `omni bench-ksm ...`
 Linux only (clean no-op on Windows): control kernel samepage merging /
@@ -338,6 +372,10 @@ qemu-manager remove p1 --json                  # explicit delete only
 
 ## 9. Troubleshooting
 
+- **"no base image is registered" / "base assets missing"** — the
+  install has no usable base yet. The error lists the exact files and
+  the full images_dir path; copy them in and re-run (they register
+  automatically). `qemu-manager doctor` shows what's still missing.
 - **First boot seems stuck** — it is dexopt: allow up to 15 min once per
   account. `omni resume <name>` shows progress phases. Dev boots write
   `accounts/<name>/serial.log`; every boot writes `qemu.log`.

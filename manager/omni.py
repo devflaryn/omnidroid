@@ -56,6 +56,28 @@ NORMAL_BOOT_TIMEOUT = 360
 DEFAULT_QEMU_URL = ("https://qemu.weilnetz.de/w64/"
                     "qemu-w64-setup-20240423.exe")
 
+# Kernel SRC= param for auto-registered bases (all Bliss 16.9.7 lineage
+# bases v1..v5 use this). Overridable per config ("default_src") and per
+# base ("src") — a future downloaded base can carry its own.
+DEFAULT_SRC = "/android-2024-10-11"
+
+# Config bootstrapped on a blank deployment (exe dropped into a new
+# folder): any command self-creates this, then base files are copied (or
+# later: downloaded) into images_dir and auto-registered.
+DEFAULT_CONFIG = {
+    "images_dir": {"windows": "C:/Users/berat/OmniImages",
+                   "linux": "~/OmniImages"},
+    "current_base": None,
+    "data_template": "data-template-8g.qcow2",
+    "default_src": DEFAULT_SRC,
+    "bases": {},
+    "qemu": {"mem_mb": 4096, "smp": 4, "data_disk_size": "8G",
+             "adb_port_start": 16001, "qmp_port_start": 17001,
+             "vnc_port_start": 18001},
+    "notes": ("Base images are immutable once any account references "
+              "them. Never commit image files."),
+}
+
 
 # ---------- machine-readable output (the GUI contract) ----------
 
@@ -81,9 +103,27 @@ def enable_json_mode():
 
 # ---------- config / account state ----------
 
+def ensure_config():
+    """Bootstrap configs/paths.json on a blank deployment so the exe can
+    be dropped into any folder and every command just works (base files
+    are then copied — later: downloaded — into images_dir)."""
+    if CONFIG_PATH.exists():
+        return False
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
+    print(f"[config] created default config: {CONFIG_PATH}")
+    return True
+
+
 def read_config():
-    """Plain JSON read, no validation (safe to call before QEMU exists)."""
-    return json.loads(CONFIG_PATH.read_text())
+    """Plain JSON read, no base validation (safe to call before QEMU or
+    any base exists). Self-bootstraps a default config."""
+    ensure_config()
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as e:
+        sys.exit(f"error: {CONFIG_PATH} is not valid JSON ({e}). Fix or "
+                 f"delete it (a default will be recreated).")
 
 
 def resolve_images_dir(cfg):
@@ -100,15 +140,85 @@ def resolve_images_dir(cfg):
     return str(Path(v).expanduser())
 
 
+def base_setup_help(images_dir, cfg=None):
+    """The exact, actionable 'make this install ready' message — shown by
+    setup, doctor, and every base-needing command when no base is usable."""
+    template = (cfg or {}).get("data_template", "data-template-8g.qcow2")
+    return (
+        f"\nThis install has no usable base image yet. Copy the base "
+        f"assets into:\n"
+        f"  {images_dir}\n"
+        f"required files (exact names; vN = a version tag, e.g. v1):\n"
+        f"  base-vN.qcow2         the immutable Bliss OS system image\n"
+        f"  base-vN.kernel        its extracted kernel\n"
+        f"  base-vN.initrd.img    its extracted initrd\n"
+        f"  {template}    formatted-empty ext4 /data template\n"
+        f"Complete base-vN triples are registered automatically on the "
+        f"next command\n(or run: qemu-manager setup). Check readiness any "
+        f"time with: qemu-manager doctor\n"
+        f"(These files will arrive via download in a future version.)")
+
+
+def autoregister_bases():
+    """Scan images_dir for complete base-vN.qcow2 + .kernel + .initrd.img
+    triples that are not registered yet; register them (src from config
+    'default_src') and, if no current_base is set, point it at the highest
+    version found. Persists the RAW config (keeps the per-platform
+    images_dir dict intact). Returns (raw_config, newly_registered_tags).
+    Registration only ADDS entries — existing bases/accounts are never
+    touched, honoring base immutability."""
+    raw = read_config()
+    images = Path(resolve_images_dir(raw))
+    bases = raw.setdefault("bases", {})
+    known_disks = {b.get("disk") for b in bases.values()}
+    new = []
+    if images.exists():
+        for disk in sorted(images.glob("base-*.qcow2")):
+            m = re.fullmatch(r"base-(v\d+)\.qcow2", disk.name)
+            if not m or disk.name in known_disks or m.group(1) in bases:
+                continue
+            tag = m.group(1)
+            kernel = images / f"base-{tag}.kernel"
+            initrd = images / f"base-{tag}.initrd.img"
+            if kernel.exists() and initrd.exists():
+                bases[tag] = {"disk": disk.name, "kernel": kernel.name,
+                              "initrd": initrd.name,
+                              "src": raw.get("default_src", DEFAULT_SRC),
+                              "notes": "auto-registered from images_dir"}
+                new.append(tag)
+    changed = bool(new)
+    if not raw.get("current_base") and bases:
+        raw["current_base"] = max(
+            bases, key=lambda t: int(re.sub(r"\D", "", t) or 0))
+        changed = True
+    if changed:
+        CONFIG_PATH.write_text(json.dumps(raw, indent=2))
+        if new:
+            print(f"[config] auto-registered base(s) from {images}: "
+                  f"{', '.join(new)} (current: {raw['current_base']})")
+    return raw, new
+
+
 def load_config():
-    cfg = read_config()
+    """Config for commands that NEED a bootable base. Never tracebacks on
+    a fresh/incomplete install: auto-registers base files that appeared in
+    images_dir, and otherwise exits with the exact copy-these-files help."""
+    cfg, _ = autoregister_bases()
     cfg["images_dir"] = resolve_images_dir(cfg)   # normalized for callers
-    base = cfg["bases"][cfg["current_base"]]
     images = Path(cfg["images_dir"])
-    for key in ("disk", "kernel", "initrd"):
-        p = images / base[key]
-        if not p.exists():
-            sys.exit(f"error: base asset missing: {p}")
+    tag = cfg.get("current_base")
+    bases = cfg.get("bases") or {}
+    if not tag or tag not in bases:
+        sys.exit("error: no base image is registered - cannot create or "
+                 "boot instances." + base_setup_help(images, cfg))
+    base = bases[tag]
+    missing = [str(images / base[key]) for key in ("disk", "kernel",
+                                                   "initrd")
+               if not (images / base[key]).exists()]
+    if missing:
+        sys.exit(f"error: base '{tag}' is registered but its files are "
+                 f"missing:\n  " + "\n  ".join(missing)
+                 + base_setup_help(images, cfg))
     return cfg
 
 
@@ -799,6 +909,8 @@ def make_overlay(system_path, base_disk):
 def cmd_create(args):
     ensure_qemu()
     cfg = load_config()
+    if args.data_size is None:
+        args.data_size = cfg["qemu"]["data_disk_size"]
     name = args.name
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         sys.exit("error: account name must be [A-Za-z0-9_-]+")
@@ -1405,6 +1517,69 @@ def cmd_qemu_info(args):
     }, indent=2))
 
 
+def install_readiness():
+    """Everything doctor/setup need to say whether THIS deployment can
+    create/boot instances: per-file base-asset presence (after auto-
+    registering any new base triples found in images_dir), QEMU and adb
+    resolution, and an overall 'ready' verdict with the exact missing
+    file paths."""
+    import shutil as _sh
+    raw, new = autoregister_bases()
+    images = Path(resolve_images_dir(raw))
+    tag = raw.get("current_base")
+    bases = raw.get("bases") or {}
+    missing = []
+    base_ready = bool(tag and tag in bases)
+    if base_ready:
+        missing += [str(images / bases[tag][k])
+                    for k in ("disk", "kernel", "initrd")
+                    if not (images / bases[tag][k]).exists()]
+        base_ready = not missing
+    template = raw.get("data_template", "data-template-8g.qcow2")
+    template_ready = (images / template).exists()
+    if not template_ready:
+        missing.append(str(images / template))
+    qemu_ok = _qemu_present()
+    adb_ok = _sh.which("adb") is not None
+    rep = {"config": str(CONFIG_PATH),
+           "images_dir": str(images),
+           "images_dir_exists": images.exists(),
+           "auto_registered": new,
+           "bases_registered": sorted(bases),
+           "current_base": tag,
+           "base_ready": base_ready,
+           "data_template_ready": template_ready,
+           "missing_files": missing,
+           "qemu_present": qemu_ok,
+           "qemu": qemu_bin("qemu-system-x86_64") if qemu_ok else None,
+           "adb_present": adb_ok,
+           "accounts": len(all_accounts()),
+           "ready": base_ready and template_ready and qemu_ok and adb_ok}
+    if not qemu_ok:
+        rep["qemu_hint"] = ("run: qemu-manager setup (Windows: portable "
+                            "download into ./qemu; Linux: sudo apt "
+                            "install qemu-system-x86 qemu-utils)")
+    if not adb_ok:
+        rep["adb_hint"] = ("adb not on PATH - install Android "
+                           "platform-tools (Linux: sudo apt install "
+                           "android-tools-adb)")
+    return rep
+
+
+def cmd_doctor(args):
+    """Readiness check for this deployment. Exit 0 = ready to create/boot
+    instances; exit 1 = something is missing (report says exactly what)."""
+    rep = install_readiness()
+    if getattr(args, "json", False):
+        emit_json({**rep, "ok": rep["ready"]})
+    else:
+        print(json.dumps(rep, indent=2))
+        if not (rep["base_ready"] and rep["data_template_ready"]):
+            print(base_setup_help(rep["images_dir"], read_config()))
+    if not rep["ready"]:
+        sys.exit(1)
+
+
 def cmd_setup(args):
     """First-run setup. Idempotent; also runs implicitly on first use.
 
@@ -1415,23 +1590,7 @@ def cmd_setup(args):
     download) — preflights qemu/adb//dev/kvm/KSM and prints the exact
     install command for anything missing.
     """
-    if not CONFIG_PATH.exists():
-        # Blank deployment (e.g. qemu-manager.exe dropped into a new
-        # folder): bootstrap a default config. Base images arrive
-        # out-of-band today (later from the update server) and are then
-        # registered under "bases".
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps({
-            "images_dir": {"windows": "C:/Users/berat/OmniImages",
-                           "linux": "~/OmniImages"},
-            "current_base": None,
-            "data_template": "data-template-8g.qcow2",
-            "bases": {},
-            "qemu": {"mem_mb": 4096, "smp": 4, "data_disk_size": "8G",
-                     "adb_port_start": 16001, "qmp_port_start": 17001,
-                     "vnc_port_start": 18001},
-        }, indent=2))
-        print(f"[setup] created default config: {CONFIG_PATH}")
+    ensure_config()          # blank deployment: bootstrap default config
     cfg = read_config()
     images = Path(resolve_images_dir(cfg))
     report = {"platform": "windows" if IS_WINDOWS else "linux",
@@ -1464,18 +1623,22 @@ def cmd_setup(args):
         report["ksm"] = ksm_available()
         if report["ksm"] and ksm_stats().get("run") != 1:
             report["ksm_hint"] = "enable page dedup: qemu-manager ksm on"
-    # Base assets present? (they arrive out-of-band today; later from the
-    # update server — see HANDOFF 'server base updates').
-    base = cfg["bases"].get(cfg.get("current_base"), {})
-    have = all((images / base.get(k, "_")).exists()
-               for k in ("disk", "kernel", "initrd")) if base else False
-    report["base_assets"] = have
-    if not have:
+    # Base assets present? Auto-register anything the user (later: the
+    # downloader) dropped into images_dir, then report readiness with the
+    # exact missing paths (see HANDOFF 'server base updates').
+    ready = install_readiness()
+    report["base_assets"] = (ready["base_ready"]
+                             and ready["data_template_ready"])
+    report["current_base"] = ready["current_base"]
+    if ready["auto_registered"]:
+        report["auto_registered"] = ready["auto_registered"]
+    if not report["base_assets"]:
         report["ok"] = False
-        report["base_hint"] = (f"copy base files + "
-                               f"{cfg.get('data_template','data template')} "
-                               f"into {images}")
+        report["missing_files"] = ready["missing_files"]
+        report["base_hint"] = "see the file list below (or: qemu-manager doctor)"
     print(json.dumps(report, indent=2))
+    if not report["base_assets"]:
+        print(base_setup_help(images, cfg))
     if not report["ok"]:
         sys.exit(1)
 
@@ -2123,6 +2286,14 @@ def main():
     qi.add_argument("--install", action="store_true")
     qi.set_defaults(func=cmd_qemu_info)
 
+    dr = sub.add_parser("doctor",
+                        help="readiness check: exact base/template files "
+                             "present in images_dir, QEMU/adb resolvable. "
+                             "Exit 0 = ready, 1 = not (says what to copy "
+                             "where)")
+    dr.add_argument("--json", action="store_true")
+    dr.set_defaults(func=cmd_doctor)
+
     km = sub.add_parser("ksm",
                         help="Linux KSM status/on/off (clean no-op on "
                              "Windows)")
@@ -2190,8 +2361,6 @@ def main():
     args = p.parse_args()
     if getattr(args, "json", False):
         enable_json_mode()
-    if getattr(args, "data_size", None) is None and args.cmd == "create":
-        args.data_size = load_config()["qemu"]["data_disk_size"]
     try:
         args.func(args)
     except SystemExit as e:
