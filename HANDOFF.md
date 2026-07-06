@@ -211,6 +211,15 @@ likely fix software too (deferred).
 - VirGL for correct color (not a QEMU downgrade/upgrade right now).
 - GApps/GMS kept (Play Integrity risk); GApps removal is out of scope.
 - Provisioning/builder boots are headless by design.
+- **On Windows/WHPX, package trims buy IN-GUEST headroom only — never
+  host RAM or more instances** (guest page cache expands into freed RAM;
+  QEMU touches ~its full `-m` and Windows shares nothing). Measured
+  2026-07-06: −119 MB guest-used, host RSS unchanged. Host-RAM density
+  is a **Linux/KSM concern — this is the documented reason the Linux
+  port matters.** Consequently **virtio-balloon (Tier 2) is REJECTED**
+  (user, 2026-07-06): lmkd-kills-the-game risk not worth it on a host
+  where RSS won't drop anyway. Tier 3 (low_ram/zram-resize/telephony
+  disables) stays documented-only. Don't re-propose these on Windows.
 
 ## HARD CONSTRAINTS (every change must honor)
 1. **Never touch `/system` libraries or ARM native-bridge props**
@@ -239,13 +248,9 @@ likely fix software too (deferred).
   ~6 GB usable after Ubuntu ≈ **3–4 brutal instances even with KSM** —
   FEWER than the ~7 the 32 GB Windows host runs. Scaling past Windows
   needs a high-RAM Linux machine later; don't oversell the laptop numbers.
-- **RAM proposals awaiting approval (from the 2026-07-06 measured pass;
-  details in CHANGELOG):** Tier 2 = virtio-balloon +
-  `free-page-reporting=on` (+ optional QMP balloon squeeze after game
-  launch) — the only Windows-side lever that could make host RSS track
-  real guest usage; risk = over-squeeze → lmkd kills the game. Tier 3
-  (propose-only, base changes): `ro.config.low_ram=true`, zram resize,
-  telephony/SE/contacts-provider disables. Nothing applied.
+- ~~RAM proposals~~ **DECIDED 2026-07-06: Tier 2 (virtio-balloon)
+  REJECTED, Tier 3 documented-only** (see Settled decisions). Windows
+  optimization work is CLOSED; host-RAM density comes from Linux/KSM.
 - **Deeper boot-service trimming** — risky, low payoff (boot is dominated by
   system_server/zygote, not the trimmed apps). Only behind the regression check.
 - **Production base with lockdown** — build via `rebuild-base --game` on v5

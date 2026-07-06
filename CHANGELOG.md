@@ -38,17 +38,18 @@ number needs `-m` reduction, ballooning (proposed below), or Linux+KSM.
 = libndk_translation.so`, Roblox foreground + rendering (screencap), kiosk
 still DeviceOwner (Lock Task active).
 
-**Proposed, NOT applied (risk-ranked, need approval):**
-- *Tier 2 (host-side flags, medium):* `virtio-balloon` +
-  `free-page-reporting=on`, optionally manager-driven QMP `balloon`
-  squeeze after game launch — the only Windows-side lever that could make
-  host RSS track real guest usage. Risk: over-squeeze → lmkd kills the
-  game; needs a measured trial.
-- *Tier 3 (base changes / risky, propose-only):* `ro.config.low_ram=true`
-  (build.prop — outside the allowed change surface as-is; may break
-  webview/GMS/Roblox login), zram resize (ramdisk fstab), disabling
-  telephony (`com.android.phone`) / `com.android.se` / contacts provider
-  (crash-loop risk, modest payoff).
+**Decisions (user, 2026-07-06) — Windows optimization CLOSED:**
+- *Tier 2 (virtio-balloon + free-page-reporting / QMP squeeze):*
+  **REJECTED** — lmkd-kills-the-game risk not worth it, and host RSS
+  won't drop on WHPX regardless (page cache expands into freed RAM).
+- *Tier 3 (`ro.config.low_ram`, zram resize, telephony/SE/contacts-
+  provider disables):* stays **documented-only**.
+- **Key finding, now a settled decision:** on Windows/WHPX package trims
+  buy in-guest headroom (good for brutal's 2 GB), NOT host RAM or more
+  instances — that only comes from KSM on Linux. This is the documented
+  reason the Linux port matters.
+- Tier-1 trims rolled out fleet-wide via `update-all` (all accounts
+  re-provisioned on v5; per-account data preserved; regression passed).
 - Kept untouched: GMS + Play Store, latin IME, Settings (FallbackHome),
   managedprovisioning, /system libs + bridge props (off-limits).
 
