@@ -14,12 +14,21 @@ live state. The repo is self-describing; you do NOT need the prior chat.
 ## What this project is
 A **kiosk game-launcher + multi-account manager** on top of a **Bliss OS
 16.9.7** image (Android 13, x86_64, with **libndk ARM translation** so an
-ARM-only game runs on x86), run in **QEMU on Windows**. Each "account" is an
-isolated Android instance that boots straight into a single game (silent
-boot → custom loading screen → game), fully locked down (no status bar, no
-launcher, no escape), and powers off when the game closes. Shipped as a
-single **`omni.exe`** that **auto-downloads a portable QEMU on first use**
-(QEMU is NOT bundled in the exe, NOT installed globally).
+ARM-only game runs on x86), run in **QEMU** — cross-platform: same CLI and
+behavior on Windows (WHPX) and Linux (KVM+KSM); only packaging differs.
+Each "account" is an isolated Android instance that boots straight into a
+single game (silent boot → custom loading screen → game), fully locked
+down (no status bar, no launcher, no escape), and powers off when the game
+closes. **ALL instances run HEADLESS, always** (no host window; a local
+VNC will attach later on each instance's reserved port). Shipped as
+**`qemu-manager`**:
+- **Windows `qemu-manager.exe`** — fully portable: `setup` (or first use)
+  downloads a **portable QEMU into ./qemu only**. Nothing is ever
+  installed to the host system (no global install/registry/PATH).
+- **Linux `qemu-manager`** (ELF, built ON the Linux box via
+  `build-linux.sh` — PyInstaller can't cross-build) — uses **system QEMU**
+  (`sudo apt install qemu-system-x86 qemu-utils android-tools-adb`);
+  `setup` preflights qemu / `/dev/kvm` / KSM with exact fix commands.
 
 **Test game:** Roblox (`com.roblox.client`, arm64-v8a only) at
 `C:\Users\berat\Downloads\roblox.apk`. It uses its own account system (no
@@ -42,7 +51,9 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
   - `tools/` — `make_bootanimation.py` (STORED-zip packer),
     `gen_placeholder_frames.ps1` (placeholder loading animation).
   - `assets/loading/` — loading-screen frames + `bootanimation.zip`.
-  - `build-exe.ps1` — builds `dist/omni.exe` (PyInstaller onefile).
+  - `build-exe.ps1` — builds `dist/qemu-manager.exe` on Windows;
+    `build-linux.sh` — builds `dist/qemu-manager` ON Linux (two-build
+    process; PyInstaller cannot cross-build).
   - `accounts/` (gitignored) — per-account overlay+data+state.
 
 ## Architecture
@@ -109,16 +120,26 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 - **Current fleet:** accounts alice, bob, charlie, dave, erin — all on **v5**,
   all DeviceOwner (lockdown active), data preserved through every migration.
 
-## omni CLI (identical whether `python manager/omni.py …` or `omni.exe …`)
+## CLI (identical: `python manager/omni.py …` == `qemu-manager(.exe) …`)
+Setup:
+- `setup` — first-run, idempotent. Windows: creates folders + downloads
+  portable QEMU into ./qemu (self-contained, never touches the host
+  system). Linux: creates `~/OmniImages`, preflights system QEMU /
+  `/dev/kvm` / KSM with exact fix commands. JSON report.
 Instance lifecycle:
 - `create <name>` — new account on current base; provisions (headless first
   boot). Ex: `omni create alice`
-- `start <name> [--mode ...] [--gpu ...] [--mem MB] [--headless] [--wait] [--dev]`
-  — detached boot; returns immediately (`--wait` blocks). Ex:
+- `start <name> [--mode ...] [--mem MB] [--accel A] [--wait] [--dev]`
+  — detached HEADLESS boot; returns immediately (`--wait` blocks). Ex:
   `omni start alice --mode playable`
 - `resume <name>` — attach to a running instance, wait for boot, run checks.
 - `stop <name>` — graceful shutdown chain (adb → QMP → kill).
-- `list [--stats]` — accounts, base, ports, running PID (+ RAM with --stats).
+- `list [--stats]` — accounts, base, ports (adb/qmp/vnc), running PID
+  (+ RAM with --stats).
+- **Port scheme (invariant):** one shared index i per account →
+  adb `16001+i`, qmp `17001+i`, **vnc `18001+i` (RESERVED now, wired
+  later)**. Ranges 1000 apart → the three can never collide below 1000
+  instances. Old accounts are backfilled automatically on load.
 Apps / control:
 - `install <name> <apk>` — adb-install a game into `/data` (dev), record +
   set it as the kiosk's target. Ex: `omni install alice roblox.apk`
@@ -133,7 +154,19 @@ Bases / rollout:
 - `use-base <tag>` — set default base for new accounts (dev/prod switch).
 - `update-base <name> [--to vN] [--no-reprovision]` — migrate ONE account's
   overlay to a base, keep its data, re-provision.
-- `update-all [--to vN] [--skip-current]` — migrate ALL accounts (data kept).
+- `update-all [--to vN] [--fast|--full] [--skip-current]` — migrate ALL
+  accounts (data kept). **AUTO picks per account:**
+  - **FAST (default when the base's game package is unchanged for that
+    account, or the account has a dev-installed game):** discard + fresh
+    overlay on the new base — a metadata-only qemu-img op, **no boot, no
+    re-provision; 6 accounts measured in 0.2 s** (100+ ≈ seconds). This is
+    how OS/game/kiosk updates ship (they live in /system → the overlay).
+  - **FULL (auto when the base game package changes; force with
+    `--full`):** boot + idempotent re-provision — required whenever
+    provisioned **/data** state must change (kiosk target game, lockdown
+    policies, TRIM_PACKAGES updates).
+  - Never edit an existing base in place (corrupts overlays): every
+    update = NEW immutable base vN+1, then repoint.
 - `rebuild-base --game <apk>` — bake/replace the pre-installed game as a
   `/system/app` system app in a NEW base version (extracts native libs),
   make current. Then `update-all` rolls it out. Ex:
@@ -156,22 +189,24 @@ QEMU / platform:
   the future Linux box is its test.**
 
 ## Performance modes (`--mode`, per-instance; counts NEVER capped)
-- **playable** (default): VirGL (`virtio-gpu-gl` + `-display sdl,gl=on`),
-  4 GB, 4 vCPU — **correct colors + GPU accel**, smooth, few instances.
-- **hard**: software rendering (`virtio-gpu-pci`), 3 GB, 4 vCPU — more
-  instances; **host window shows R/B swapped** (use `--gpu virgl` to fix).
-- **brutal**: **headless** (no window), software, 2 GB, 2 vCPU — max instances.
-- Overrides: `--gpu virgl|software`, `--mem MB`, `--headless` (any mode).
-- **VirGL graceful fallback:** if host GL init fails, `start` detects the
-  immediate QEMU exit and relaunches in software automatically.
+**ALL instances are HEADLESS, always** (`-display none`; no host window
+anywhere — verified no code path opens one). Modes are pure RAM/CPU tiers:
+- **playable** (default): 4 GB, 4 vCPU.
+- **hard**: 3 GB, 4 vCPU — more instances.
+- **brutal**: 2 GB, 2 vCPU — max instances.
+- Override: `--mem MB`. (`--gpu`/`--headless` flags and the VirGL path
+  were REMOVED with headless-always — a GL window can't exist.)
+- View/control: `omni screenshot` (true colors) + adb today; a **local
+  VNC server will attach later** to each instance's reserved `vnc_port`
+  (18001+i, already allocated per account — do NOT repurpose the range).
 
-## Color fix (settled)
-The R/B swap (blue↔orange) is in QEMU's **software** virtio-gpu→SDL blit on
-this build; gralloc/display/device tweaks don't fix it (one breaks boot).
-**VirGL fixes it** (host OpenGL) AND adds GPU accel — baked into `playable`.
-So: **correct colors under VirGL/playable only.** Software modes still swap,
-but `brutal` is headless (no window) so it's moot. A stable QEMU build would
-likely fix software too (deferred).
+## Color note (historical; moot under headless-always)
+The old R/B swap was in QEMU's **software virtio-gpu→SDL window blit**
+only. With no host window there is nothing to swap: guest rendering and
+`screencap`/screenshots were ALWAYS true-color. If the future VNC viewer
+shows swapped colors, that's the same host-side presentation bug family —
+check QEMU build/VNC path, never gralloc (guest is fine; one gralloc
+tweak even breaks boot).
 
 ## Honest host limits (measured, RAM-bound; CPU never the limit)
 - Per software instance w/ Roblox running: **~3.2 GB resident** (the game
@@ -208,7 +243,8 @@ likely fix software too (deferred).
   for stability over the ~35 s speed win. Snapshots rejected: stale in-game
   sessions, shared/duplicated device identity across restored instances, and
   brittleness across base/QEMU updates. ~35 s cold boot is accepted.
-- VirGL for correct color (not a QEMU downgrade/upgrade right now).
+- ~~VirGL for correct color~~ — MOOT since headless-always (2026-07-06):
+  no host window exists; VirGL/`--gpu`/`--headless` flags removed.
 - GApps/GMS kept (Play Integrity risk); GApps removal is out of scope.
 - Provisioning/builder boots are headless by design.
 - **On Windows/WHPX, package trims buy IN-GUEST headroom only — never
@@ -233,6 +269,21 @@ likely fix software too (deferred).
    booted writable.
 
 ## Open / optional items (nothing required)
+- **Server base updates (INTENDED FLOW — networking NOT implemented; the
+  fast path was built to support it).** In production, qemu-manager will
+  detect an update on the user's server and download a new base qcow2.
+  The local flow is already in place and verified:
+  1. new `base-vN+1.qcow2` (+ `.kernel`/`.initrd.img`) lands in the
+     images dir (today out-of-band; later downloaded),
+  2. register it under `bases` in `configs/paths.json` + set
+     `current_base`,
+  3. `update-all` — AUTO takes the FAST overlay-repoint for a pure
+     system/game swap: **all accounts on the new base in seconds, no
+     boots, data untouched** (measured 0.2 s for 6 accounts).
+  Bases stay immutable: an update is always a NEW versioned file +
+  repoint, never an in-place edit (in-place would corrupt every overlay).
+- **Local VNC view/control** — not built yet; per-instance `vnc_port`
+  (18001+i) is reserved in account.json and shown by `list`/`start`.
 - **Linux/KVM + KSM port — HOST-SIDE CODE PREP DONE (2026-07-06), hardware
   pending.** The manager is Linux-ready without a Linux host ever having
   run it: accel auto-detect (WHPX/KVM) + `--accel` override, `-machine

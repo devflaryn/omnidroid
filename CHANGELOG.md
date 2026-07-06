@@ -6,7 +6,51 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
-## Manager — 2026-07-06 — Tier-1 RAM trims round 2 (measured, −119 MB guest)
+## Manager — 2026-07-06 — headless-always, qemu-manager packaging, FAST update-all
+
+**1. Headless always.** `--headless`, `--gpu` and `--window` REMOVED; every
+instance (production and dev/builder) boots with `-display none` — no code
+path opens a host window (verified by grep + live boot). Modes are now pure
+RAM/CPU tiers (playable 4G/4c, hard 3G/4c, brutal 2G/2c; `--mem` override).
+VirGL path + fallback deleted (needed a GL window); the old R/B swap is
+moot (guest rendering/screencap always was true-color). **Port scheme
+(invariant):** one shared index i per account → adb 16001+i, qmp 17001+i,
+**vnc 18001+i RESERVED** for the future local VNC (recorded in
+account.json, shown in `list`/`start`, NOT yet passed to QEMU). Ranges
+1000 apart → no collision below 1000 instances; old accounts backfilled
+automatically.
+
+**2. qemu-manager packaging + setup.** Artifact renamed `omni.exe` →
+**`qemu-manager.exe`** (built; CLI unchanged). New **`setup`** command
+(idempotent, also implicit on first use): Windows = create folders +
+download portable QEMU into ./qemu ONLY (nothing installed to the host
+system); Linux = create `~/OmniImages`, preflight system QEMU
+(`sudo apt install qemu-system-x86 qemu-utils android-tools-adb`),
+`/dev/kvm`, KSM — with exact fix commands. **Two-build process:**
+PyInstaller cannot cross-build — `build-exe.ps1` on Windows,
+`build-linux.sh` ON the Linux box → `dist/qemu-manager` (ELF). Same
+source, identical CLI; Linux additionally gets `-accel kvm` + KSM.
+
+**3. FAST update-all (scales to 100+ accounts).** `update-all` now AUTO-
+picks per account:
+- **FAST**: discard + recreate the disposable overlay against the NEW
+  base (fresh `qemu-img create -b` — the correct way to change backing
+  files; never rebase, never edit a base in place). No boot, no
+  re-provision, data.qcow2 untouched. **Measured: 6 accounts in 0.2 s.**
+  Correct whenever provisioned /data state stays valid: OS/game/kiosk
+  updates all live in /system and arrive via the overlay itself.
+- **FULL** (boot + idempotent re-provision): auto when the base's game
+  package changes for that account (omni_game_package lives in /data);
+  force with `--full` for /data policy changes (lockdown, trims).
+  `--fast` forces repoint-only.
+**Verified live:** fake base-v6 (byte-copy of v5) registered → `update-all
+--to v6` = 6/6 FAST in 0.2 s → alice COLD-BOOTED headless on v6 in ~30 s,
+kiosk auto-launched Roblox, **still logged in** (data preserved), libndk
+OK → fleet fast-reverted to v5 (0.1 s), v6 deregistered + deleted.
+
+**4. Server updates (design note only).** Production flow documented in
+HANDOFF: server-downloaded base file → register + set current →
+`update-all` fast-repoints everyone in seconds. No networking built.
 
 Measure-first pass on a fresh v5 account (`regcheck`, hard/headless,
 Roblox at login). Fixed A/B protocol: cold boot → Roblox process up →

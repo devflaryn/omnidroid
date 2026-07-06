@@ -118,8 +118,10 @@ def ensure_qemu():
     if _qemu_present():
         return
     if not IS_WINDOWS:
-        sys.exit("QEMU not found. Install it, e.g.: "
-                 "sudo apt install qemu-system-x86 qemu-utils")
+        # Linux policy: SYSTEM QEMU only (no portable download).
+        sys.exit("QEMU not found. Install the system packages:\n"
+                 "  sudo apt install qemu-system-x86 qemu-utils "
+                 "android-tools-adb\nthen re-run (see: qemu-manager setup)")
     import urllib.request
     url = (read_config().get("qemu", {}).get("download_url")
            or DEFAULT_QEMU_URL)
@@ -147,7 +149,7 @@ def load_account(name):
     p = account_dir(name) / "account.json"
     if not p.exists():
         sys.exit(f"error: no such account '{name}' (looked for {p})")
-    return json.loads(p.read_text())
+    return ensure_vnc_port(json.loads(p.read_text()))
 
 
 def save_account(acct):
@@ -160,22 +162,51 @@ def all_accounts():
     if not ACCOUNTS_DIR.exists():
         return []
     return sorted(
-        (json.loads((d / "account.json").read_text())
+        (ensure_vnc_port(json.loads((d / "account.json").read_text()))
          for d in ACCOUNTS_DIR.iterdir()
          if (d / "account.json").exists()),
         key=lambda a: a["name"])
 
 
+# Per-instance PORT SCHEME (documented invariant):
+#   instance index i (0-based)  ->  adb = adb_port_start + i   (16001+)
+#                                   qmp = qmp_port_start + i   (17001+)
+#                                   vnc = vnc_port_start + i   (18001+)
+# One shared index per account keeps the triple aligned; the three ranges
+# are 1000 apart, so adb/qmp/vnc can NEVER collide below 1000 instances
+# (and instance counts are host-RAM-bound long before that). vnc_port is
+# RESERVED now (recorded in account.json) but not yet passed to QEMU —
+# a local VNC server will bind it later.
+VNC_PORT_START_DEFAULT = 18001
+
+
+def vnc_start(cfg):
+    return cfg["qemu"].get("vnc_port_start", VNC_PORT_START_DEFAULT)
+
+
 def allocate_ports(cfg):
-    used_adb = {a["adb_port"] for a in all_accounts()}
-    used_qmp = {a["qmp_port"] for a in all_accounts()}
-    adb_port = cfg["qemu"]["adb_port_start"]
-    while adb_port in used_adb:
-        adb_port += 1
-    qmp_port = cfg["qemu"]["qmp_port_start"]
-    while qmp_port in used_qmp:
-        qmp_port += 1
-    return adb_port, qmp_port
+    q = cfg["qemu"]
+    used = set()
+    for a in all_accounts():
+        used.add(a["adb_port"] - q["adb_port_start"])
+        used.add(a["qmp_port"] - q["qmp_port_start"])
+    i = 0
+    while i in used:
+        i += 1
+    return (q["adb_port_start"] + i, q["qmp_port_start"] + i,
+            vnc_start(cfg) + i)
+
+
+def ensure_vnc_port(acct):
+    """Backfill the reserved vnc_port on accounts created before the
+    scheme existed (derived from the account's adb index, so the triple
+    stays aligned)."""
+    if "vnc_port" not in acct:
+        cfg = read_config()
+        idx = acct["adb_port"] - cfg["qemu"]["adb_port_start"]
+        acct["vnc_port"] = vnc_start(cfg) + idx
+        save_account(acct)
+    return acct
 
 
 # ---------- process helpers ----------
@@ -398,36 +429,30 @@ def check_accel():
 
 # Per-instance performance modes. Counts are NEVER capped — these tune the
 # per-instance footprint; the host's free RAM decides how many run.
-#   gpu:   virgl    = -device virtio-gpu-gl + -display sdl,gl=on
-#                     (host-GL: CORRECT COLORS + GPU accel; the ONLY combo
-#                      that fixes the R/B swap on this QEMU build)
-#          software = -vga none + virtio-gpu-pci + -display sdl
-#                     (no GPU; host window shows R/B SWAPPED on this build)
-#   headless: -display none (no window at all; drive via adb)
+# ALL instances are HEADLESS (-display none), always: no host window
+# exists anywhere. View/control happens via adb (screenshot/logcat) today;
+# a local VNC server will be wired to each instance's RESERVED vnc_port
+# later (see the port scheme note at allocate_ports). With no window the
+# old VirGL path (needed a host GL window) and the R/B software-blit swap
+# are both moot — guest-side rendering is unchanged and screencap is
+# always true-color.
 MODES = {
-    "playable": {"gpu": "virgl",    "mem": 4096, "smp": 4, "headless": False},
-    "hard":     {"gpu": "software", "mem": 3072, "smp": 4, "headless": False},
-    "brutal":   {"gpu": "software", "mem": 2048, "smp": 2, "headless": True},
+    "playable": {"mem": 4096, "smp": 4},
+    "hard":     {"mem": 3072, "smp": 4},
+    "brutal":   {"mem": 2048, "smp": 2},
 }
 DEFAULT_MODE = "playable"
 
 
-def resolve_mode(cfg, name=None, gpu=None, mem=None, headless=None):
+def resolve_mode(cfg, name=None, mem=None):
     m = dict(MODES[name or DEFAULT_MODE])
     m["name"] = name or DEFAULT_MODE
-    if gpu:
-        m["gpu"] = gpu
     if mem:
         m["mem"] = mem
-    if headless is not None:
-        m["headless"] = headless
-    # Headless has no window, so a GL context is pointless -> software path.
-    if m["headless"]:
-        m["gpu"] = "software"
     return m
 
 
-def qemu_command(acct, cfg, dev, mode=None, dev_headless=False, accel=None):
+def qemu_command(acct, cfg, dev, mode=None, accel=None):
     base = cfg["bases"][acct["base"]]
     images = Path(cfg["images_dir"])
     q = cfg["qemu"]
@@ -440,33 +465,22 @@ def qemu_command(acct, cfg, dev, mode=None, dev_headless=False, accel=None):
               f"SRC={base['src']} DATA=vdb")
     smp = q["smp"]
     mem = q["mem_mb"]
-    display = ["-display", "sdl"]
 
     if dev:
-        # Dev/builder boot: legacy VGA text console + serial log for
-        # debugging. Provisioning/builder boots run headless (no window) so
-        # a dexopt-busy SDL window can't look "frozen"; serial still logs.
+        # Dev/builder boot: serial console log for debugging (headless like
+        # everything else; virtio-vga kept so the guest has its usual DRM
+        # device during provisioning/builder sessions).
         append += " console=tty0 console=ttyS0,115200"
         gpu = ["-device", "virtio-vga"]
         nic = "virtio-net-pci,netdev=net0"
-        if dev_headless:
-            display = ["-display", "none"]
     else:
-        # Production silent boot (no firmware/console text) + per-mode GPU.
+        # Production silent boot (no firmware/console text).
         append += (" quiet loglevel=0 console=null "
                    "vt.global_cursor_default=0 SETUPWIZARD=0")
         nic = "virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
         smp = mode["smp"]
         mem = mode["mem"]
-        if mode["headless"]:
-            gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
-            display = ["-display", "none"]
-        elif mode["gpu"] == "virgl":
-            # VirGL: correct colors + GPU accel (host OpenGL).
-            gpu = ["-vga", "none", "-device", "virtio-gpu-gl"]
-            display = ["-display", "sdl,gl=on"]
-        else:
-            gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
+        gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
 
     cmd = [
         qemu_bin("qemu-system-x86_64"),
@@ -477,7 +491,7 @@ def qemu_command(acct, cfg, dev, mode=None, dev_headless=False, accel=None):
         "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
         "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
         *gpu,
-        *display,
+        "-display", "none",       # headless ALWAYS; VNC will attach later
         "-device", "qemu-xhci",
         "-device", "usb-kbd",
         "-device", "usb-tablet",
@@ -495,7 +509,7 @@ def qemu_command(acct, cfg, dev, mode=None, dev_headless=False, accel=None):
     return cmd
 
 
-def spawn_qemu(acct, cfg, dev, mode=None, dev_headless=True, accel=None):
+def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
     check_accel()
     d = account_dir(acct["name"])
     log = open(d / "qemu.log", "w")
@@ -507,8 +521,7 @@ def spawn_qemu(acct, cfg, dev, mode=None, dev_headless=True, accel=None):
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(
-        qemu_command(acct, cfg, dev, mode, dev_headless=dev_headless,
-                     accel=accel),
+        qemu_command(acct, cfg, dev, mode, accel=accel),
         stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
@@ -751,9 +764,10 @@ def cmd_create(args):
 
     base = cfg["bases"][cfg["current_base"]]
     base_disk = Path(cfg["images_dir"]) / base["disk"]
-    adb_port, qmp_port = allocate_ports(cfg)
+    adb_port, qmp_port, vnc_port = allocate_ports(cfg)
     acct = {"name": name, "base": cfg["current_base"],
             "adb_port": adb_port, "qmp_port": qmp_port,
+            "vnc_port": vnc_port,        # reserved for future local VNC
             "first_boot_done": False, "created": time.time()}
     save_account(acct)
 
@@ -812,26 +826,15 @@ def _cmd_start(args):
         sys.exit(f"error: '{args.name}' is already running")
     first = not acct.get("first_boot_done")
     dev = args.dev or first          # first boot always uses the dev profile
-    mode = resolve_mode(cfg, args.mode, gpu=args.gpu, mem=args.mem,
-                        headless=args.headless or None)
+    mode = resolve_mode(cfg, args.mode, mem=args.mem)
     accel = getattr(args, "accel", None)
     pid = spawn_qemu(acct, cfg, dev=dev, mode=None if dev else mode,
                      accel=accel)
-    # VirGL can fail to init on some hosts; detect an immediate QEMU exit
-    # and fall back to software so the instance still comes up.
-    if not dev and mode["gpu"] == "virgl":
-        time.sleep(4)
-        if not pid_alive(pid):
-            print(f"[start {args.name}] VirGL failed to start on this host; "
-                  f"falling back to software rendering")
-            mode = resolve_mode(cfg, args.mode, gpu="software", mem=args.mem,
-                                headless=args.headless or None)
-            pid = spawn_qemu(acct, cfg, dev=False, mode=mode, accel=accel)
-    modestr = "dev" if dev else f"{mode['name']}/{mode['gpu']}" + (
-        "/headless" if mode["headless"] else "")
-    print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr}, "
-          f"adb 127.0.0.1:{acct['adb_port']}, "
-          f"qmp 127.0.0.1:{acct['qmp_port']}")
+    modestr = "dev" if dev else mode["name"]
+    print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr} "
+          f"(headless), adb 127.0.0.1:{acct['adb_port']}, "
+          f"qmp 127.0.0.1:{acct['qmp_port']}, "
+          f"vnc-reserved {acct['vnc_port']}")
     if first:
         print(f"[start {args.name}] first boot of this account: one-time "
               f"dexopt, ~15 min. Track progress: omni resume {args.name}",
@@ -950,6 +953,47 @@ def migrate_account(name, cfg, target=None, reprovision=True):
     print(f"[{label}] migrated to {target} and re-provisioned")
 
 
+def account_needs_full_update(acct, cfg, target):
+    """FAST vs FULL decision for one account.
+
+    FAST (overlay repoint, no boot) is correct whenever the account's
+    provisioned /data state stays valid on the new base. Everything that
+    lives in /system — the OS, a baked game APK update (same package), a
+    new kiosk APK — arrives via the overlay itself. The ONE thing the
+    repoint can't deliver is a /data change, and the only /data value
+    derived from the base is the kiosk's target game package
+    (omni_game_package). So:
+      - account has a dev-installed game  -> base game irrelevant -> FAST
+      - base game package unchanged       -> FAST
+      - base game package differs         -> FULL (boot + re-provision)
+    Policy/settings changes (lockdown, trims) are invisible here — force
+    them with update-all --full.
+    """
+    if acct.get("game_package"):
+        return False
+    games = cfg.get("base_game", {})
+    return games.get(acct["base"]) != games.get(target)
+
+
+def migrate_account_fast(name, cfg, target):
+    """FAST path: discard the disposable system overlay, create a fresh
+    one backed by the NEW base (a metadata-only qemu-img create — the
+    clean way to change backing files; never rebase, never edit a base in
+    place). data.qcow2 untouched; no boot; seconds per account."""
+    acct = load_account(name)
+    label = f"update {name}"
+    if running_pid(name):
+        _shutdown(acct, label)
+    d = account_dir(name)
+    base_disk = Path(cfg["images_dir"]) / cfg["bases"][target]["disk"]
+    old = acct["base"]
+    make_overlay(d / "system.qcow2", base_disk)      # data.qcow2 untouched
+    acct["base"] = target
+    save_account(acct)
+    print(f"[{label}] FAST: overlay {old} -> {target} "
+          f"(no boot; data.qcow2 preserved)")
+
+
 def cmd_update_base(args):
     ensure_qemu()
     cfg = load_config()
@@ -958,19 +1002,42 @@ def cmd_update_base(args):
 
 
 def cmd_update_all(args):
+    """Migrate ALL accounts to a base. Default AUTO: per account, take the
+    near-instant overlay-repoint FAST path unless the base's game package
+    changed for that account (then boot + re-provision). --fast / --full
+    force one path for every account. Scales to 100+ accounts: a pure
+    system/game base swap is seconds total, not hours."""
+    if args.fast and args.full:
+        sys.exit("error: --fast and --full are mutually exclusive")
     ensure_qemu()
     cfg = load_config()
     target = args.to or cfg["current_base"]
+    if target not in cfg["bases"]:
+        sys.exit(f"error: no base '{target}'. Known: {list(cfg['bases'])}")
     names = [a["name"] for a in all_accounts()]
     todo = [n for n in names
             if load_account(n)["base"] != target or not args.skip_current]
     print(f"[update-all] target base {target}; "
           f"{len(todo)}/{len(names)} account(s) to migrate: {todo}")
+    t0 = time.time()
+    slow = []
     for n in todo:
-        migrate_account(n, cfg, target=target,
-                        reprovision=not args.no_reprovision)
-    print(f"[update-all] done. All migrated accounts now on {target}; "
-          f"per-account data preserved.")
+        if args.full:
+            full = True
+        elif args.fast:
+            full = False
+        else:
+            full = account_needs_full_update(load_account(n), cfg, target)
+        if full:
+            slow.append(n)
+            migrate_account(n, cfg, target=target,
+                            reprovision=not args.no_reprovision)
+        else:
+            migrate_account_fast(n, cfg, target)
+    print(f"[update-all] done in {time.time() - t0:.1f}s. "
+          f"{len(todo) - len(slow)} fast / {len(slow)} full; all on "
+          f"{target}; per-account data preserved."
+          + (f" Full (booted): {slow}" if slow else ""))
 
 
 # ---------- production base rebuild (update pre-installed game) ----------
@@ -1039,9 +1106,10 @@ def _build_next_base(cfg, mutate, notes, base_game=None):
     if d.exists():
         shutil.rmtree(d)
     d.mkdir(parents=True)
-    adb_port, qmp_port = allocate_ports(cfg)
+    adb_port, qmp_port, vnc_port = allocate_ports(cfg)
     acct = {"name": bname, "base": cur, "adb_port": adb_port,
-            "qmp_port": qmp_port, "first_boot_done": True}
+            "qmp_port": qmp_port, "vnc_port": vnc_port,
+            "first_boot_done": True}
     save_account(acct)
     make_overlay(d / "system.qcow2", cur_disk)
     shutil.copyfile(images / cfg["data_template"], d / "data.qcow2")
@@ -1197,6 +1265,81 @@ def cmd_qemu_info(args):
     }, indent=2))
 
 
+def cmd_setup(args):
+    """First-run setup. Idempotent; also runs implicitly on first use.
+
+    Windows: fully self-contained/portable — creates the tool's folders
+    and downloads a PORTABLE QEMU into ./qemu ONLY. Never installs
+    anything to the host system (no global install, no registry, no PATH).
+    Linux: creates folders/config; uses SYSTEM QEMU (never a portable
+    download) — preflights qemu/adb//dev/kvm/KSM and prints the exact
+    install command for anything missing.
+    """
+    if not CONFIG_PATH.exists():
+        # Blank deployment (e.g. qemu-manager.exe dropped into a new
+        # folder): bootstrap a default config. Base images arrive
+        # out-of-band today (later from the update server) and are then
+        # registered under "bases".
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps({
+            "images_dir": {"windows": "C:/Users/berat/OmniImages",
+                           "linux": "~/OmniImages"},
+            "current_base": None,
+            "data_template": "data-template-8g.qcow2",
+            "bases": {},
+            "qemu": {"mem_mb": 4096, "smp": 4, "data_disk_size": "8G",
+                     "adb_port_start": 16001, "qmp_port_start": 17001,
+                     "vnc_port_start": 18001},
+        }, indent=2))
+        print(f"[setup] created default config: {CONFIG_PATH}")
+    cfg = read_config()
+    images = Path(resolve_images_dir(cfg))
+    report = {"platform": "windows" if IS_WINDOWS else "linux",
+              "images_dir": str(images), "ok": True}
+    for d in (images, ACCOUNTS_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    if IS_WINDOWS:
+        ensure_qemu()                       # portable download into ./qemu
+        report["qemu"] = qemu_bin("qemu-system-x86_64")
+        report["qemu_portable_dir"] = str(QEMU_DIR)
+    else:
+        import shutil as _sh
+        missing = [t for t in ("qemu-system-x86_64", "qemu-img", "adb")
+                   if not _sh.which(t)]
+        if missing:
+            report["ok"] = False
+            report["missing"] = missing
+            report["install"] = ("sudo apt install qemu-system-x86 "
+                                 "qemu-utils android-tools-adb")
+        else:
+            report["qemu"] = _sh.which("qemu-system-x86_64")
+        import os
+        kvm = Path("/dev/kvm")
+        report["kvm"] = (kvm.exists()
+                         and os.access(kvm, os.R_OK | os.W_OK))
+        if not report["kvm"]:
+            report["ok"] = False
+            report["kvm_fix"] = ("enable VT-x/AMD-V in BIOS; sudo usermod "
+                                 "-aG kvm $USER; re-login; check kvm-ok")
+        report["ksm"] = ksm_available()
+        if report["ksm"] and ksm_stats().get("run") != 1:
+            report["ksm_hint"] = "enable page dedup: qemu-manager ksm on"
+    # Base assets present? (they arrive out-of-band today; later from the
+    # update server — see HANDOFF 'server base updates').
+    base = cfg["bases"].get(cfg.get("current_base"), {})
+    have = all((images / base.get(k, "_")).exists()
+               for k in ("disk", "kernel", "initrd")) if base else False
+    report["base_assets"] = have
+    if not have:
+        report["ok"] = False
+        report["base_hint"] = (f"copy base files + "
+                               f"{cfg.get('data_template','data template')} "
+                               f"into {images}")
+    print(json.dumps(report, indent=2))
+    if not report["ok"]:
+        sys.exit(1)
+
+
 def cmd_ksm(args):
     """Inspect/control Linux KSM. On Windows: documented no-op (KSM is a
     Linux kernel feature; WHPX shares nothing between VMs)."""
@@ -1308,7 +1451,7 @@ def cmd_bench_ksm(args):
         acct = load_account(name)
         pkg = acct.get("game_package") or base_game
         if not running_pid(name):
-            mode = resolve_mode(cfg, args.mode, headless=True)
+            mode = resolve_mode(cfg, args.mode)
             spawn_qemu(acct, cfg, dev=False, mode=mode)
         if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, f"bench {name}"):
             print(f"[bench] {name} boot timeout - stopping bench")
@@ -1361,13 +1504,14 @@ def cmd_bench_ksm(args):
 def cmd_list(args):
     accts = all_accounts()
     if not accts:
-        print("no accounts. create one: python omni.py create <name>")
+        print("no accounts. create one: qemu-manager create <name>")
         return
     for a in accts:
         pid = running_pid(a["name"])
         state = f"RUNNING pid {pid}" if pid else "stopped"
         line = (f"{a['name']:<16} base {a['base']}  adb {a['adb_port']}  "
-                f"qmp {a['qmp_port']}  {state}")
+                f"qmp {a['qmp_port']}  vnc {a.get('vnc_port', '?')}  "
+                f"{state}")
         if pid and args.stats:
             rss = host_rss_mb(pid)
             guest = ""
@@ -1532,15 +1676,14 @@ def cmd_test_apk(args):
     acct = load_account(name)
     result["base"] = acct["base"]
     if not running_pid(name):
-        mode = resolve_mode(cfg, args.mode, headless=not args.window)
+        mode = resolve_mode(cfg, args.mode)
         spawn_qemu(acct, cfg, dev=False, mode=mode)
         if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, f"test {name}"):
             print(json.dumps({**result, "ok": False,
                               "error": "boot timeout"}))
             sys.exit(1)
         post_boot(acct, f"test {name}")
-        result["mode"] = mode["name"] + ("/headless" if mode["headless"]
-                                         else "")
+        result["mode"] = mode["name"]
     pkg = apk_package_name(args.apk)
     result["package"] = pkg
     adb(acct, "logcat", "-c", timeout=15)
@@ -1678,15 +1821,10 @@ def main():
     s = sub.add_parser("start")
     s.add_argument("name")
     s.add_argument("--mode", choices=list(MODES), default=None,
-                   help="playable (VirGL, correct color, smooth) | hard "
-                        "(software, more instances) | brutal (headless, "
-                        "min RAM, max instances). Default: playable")
-    s.add_argument("--gpu", choices=["virgl", "software"], default=None,
-                   help="override the mode's renderer")
+                   help="RAM/CPU tier (all headless): playable 4G/4c | "
+                        "hard 3G/4c | brutal 2G/2c. Default: playable")
     s.add_argument("--mem", type=int, default=None,
                    help="override guest RAM in MB")
-    s.add_argument("--headless", action="store_true",
-                   help="no display window (any mode); drive via adb")
     s.add_argument("--accel", default=None,
                    help="override hypervisor (auto: Windows=whpx, "
                         "Linux=kvm). E.g. 'tcg' for a no-hypervisor test")
@@ -1747,8 +1885,17 @@ def main():
 
     ua = sub.add_parser("update-all",
                         help="migrate ALL accounts to a base (default: "
-                             "current); per-account data preserved")
+                             "current); per-account data preserved. AUTO "
+                             "picks the near-instant no-boot fast path "
+                             "when the base game is unchanged")
     ua.add_argument("--to", default=None)
+    ua.add_argument("--fast", action="store_true",
+                    help="force overlay-repoint only (no boot) for every "
+                         "account, even if the base game changed")
+    ua.add_argument("--full", action="store_true",
+                    help="force boot + re-provision for every account "
+                         "(needed for /data policy/settings changes, e.g. "
+                         "lockdown or trim updates)")
     ua.add_argument("--no-reprovision", action="store_true")
     ua.add_argument("--skip-current", action="store_true",
                     help="skip accounts already on the target base")
@@ -1766,6 +1913,12 @@ def main():
     uk.add_argument("--apk", default=str(REPO / "launcher" / "build"
                                          / "omni-kiosk.apk"))
     uk.set_defaults(func=cmd_update_kiosk)
+
+    su = sub.add_parser("setup",
+                        help="first-run setup: folders + QEMU (Windows: "
+                             "portable download, self-contained; Linux: "
+                             "system QEMU preflight). Idempotent")
+    su.set_defaults(func=cmd_setup)
 
     qi = sub.add_parser("qemu-info",
                         help="show resolved QEMU path / install if missing")
@@ -1832,8 +1985,6 @@ def main():
     ta.add_argument("name")
     ta.add_argument("--apk", required=True)
     ta.add_argument("--mode", choices=list(MODES), default="hard")
-    ta.add_argument("--window", action="store_true",
-                    help="show a display window (default headless)")
     ta.add_argument("--reuse", action="store_true",
                     help="reuse the account if it already exists")
     ta.set_defaults(func=cmd_test_apk)

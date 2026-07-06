@@ -46,7 +46,8 @@
     "smp": 4,
     "data_disk_size": "8G",
     "adb_port_start": 16001,
-    "qmp_port_start": 17001
+    "qmp_port_start": 17001,
+    "vnc_port_start": 18001
   },
   "notes": "Base images are immutable once any account references them. Never commit image files.",
   "base_game": {
