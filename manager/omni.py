@@ -708,6 +708,49 @@ def _next_base_tag(cfg):
     return f"v{max(nums) + 1}"
 
 
+# APK lib/<abi> dir -> Android system-app nativeLibraryDir name.
+_ABI_TO_SYSLIB = {"arm64-v8a": "arm64", "armeabi-v7a": "arm",
+                  "armeabi": "arm", "x86_64": "x86_64", "x86": "x86"}
+
+
+def _bake_native_libs(acct, game_apk, appdir, label):
+    """Extract native .so files from the APK and place them under
+    <appdir>/lib/<abi> so a /system/app game can load them (required for
+    ARM games, which libndk then translates)."""
+    import zipfile
+    import tempfile
+    pushed = 0
+    with zipfile.ZipFile(game_apk) as z:
+        by_abi = {}
+        for name in z.namelist():
+            parts = name.split("/")
+            if (len(parts) == 3 and parts[0] == "lib"
+                    and name.endswith(".so")):
+                by_abi.setdefault(parts[1], []).append(name)
+        tmp = Path(tempfile.mkdtemp(prefix="omnilib_"))
+        try:
+            for abi, names in by_abi.items():
+                syslib = _ABI_TO_SYSLIB.get(abi, abi)
+                local = tmp / abi
+                local.mkdir(parents=True, exist_ok=True)
+                for name in names:
+                    (local / Path(name).name).write_bytes(z.read(name))
+                dst = f"{appdir}/lib/{syslib}"
+                adb(acct, "shell", f"mkdir -p {dst}", timeout=15)
+                adb(acct, "push", str(local) + "/.", dst + "/", timeout=300)
+                adb(acct, "shell",
+                    f"chmod 755 {dst}/*.so; "
+                    f"chcon u:object_r:system_file:s0 {dst} {dst}/*.so",
+                    timeout=30)
+                pushed += len(names)
+                print(f"[{label}]   libs {abi} -> lib/{syslib} "
+                      f"({len(names)} .so)")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+    return pushed
+
+
 def rebuild_base(cfg, game_apk):
     """Bake/replace the pre-installed game APK as a /system/app system app
     in a NEW base version, then make it current. Existing accounts are NOT
@@ -757,7 +800,13 @@ def rebuild_base(cfg, game_apk):
                 timeout=120)
         if "BAKED" not in r.stdout:
             sys.exit(f"[{label}] baking failed: {r.stdout}{r.stderr}")
-        print(f"[{label}] baked {pkg} as system app")
+        # A /system/app APK does NOT get its native libs auto-extracted the
+        # way a /data install does, so an ARM game would crash at load. We
+        # extract the .so files into lib/<abi> ourselves (libndk still
+        # translates the ARM libs at runtime).
+        n = _bake_native_libs(acct, game_apk, appdir, label)
+        adb(acct, "shell", "sync", timeout=15)
+        print(f"[{label}] baked {pkg} as system app ({n} native libs)")
         _shutdown(acct, label)
 
         newdisk = images / f"base-{nxt}.qcow2"
@@ -792,6 +841,31 @@ def cmd_rebuild_base(args):
     ensure_qemu()
     cfg = load_config()
     rebuild_base(cfg, args.game)
+
+
+def cmd_use_base(args):
+    """Set the default base for NEW accounts (mode switch: e.g. a dev base
+    without the game vs a production base with the game pre-installed).
+    Does not touch existing accounts (use update-all for that)."""
+    raw = read_config()
+    if args.tag not in raw["bases"]:
+        sys.exit(f"error: no base '{args.tag}'. Known: "
+                 f"{list(raw['bases'])}")
+    raw["current_base"] = args.tag
+    CONFIG_PATH.write_text(json.dumps(raw, indent=2))
+    print(f"current base = {args.tag} "
+          f"({raw['bases'][args.tag].get('notes','')})")
+
+
+def cmd_bases(args):
+    raw = read_config()
+    cur = raw["current_base"]
+    for tag, b in raw["bases"].items():
+        game = raw.get("base_game", {}).get(tag)
+        mark = " *" if tag == cur else "  "
+        print(f"{mark}{tag}: {b.get('notes','')}"
+              + (f"  [game: {game}]" if game else ""))
+    print(f"\ncurrent (default for new accounts): {cur}")
 
 
 def cmd_qemu_info(args):
@@ -1086,6 +1160,15 @@ def main():
                         help="show resolved QEMU path / install if missing")
     qi.add_argument("--install", action="store_true")
     qi.set_defaults(func=cmd_qemu_info)
+
+    bs = sub.add_parser("bases", help="list registered bases + current")
+    bs.set_defaults(func=cmd_bases)
+
+    ubz = sub.add_parser("use-base",
+                         help="set default base for new accounts (dev vs "
+                              "production mode switch)")
+    ubz.add_argument("tag")
+    ubz.set_defaults(func=cmd_use_base)
 
     args = p.parse_args()
     if getattr(args, "data_size", None) is None and args.cmd == "create":

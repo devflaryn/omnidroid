@@ -22,6 +22,13 @@
       "initrd": "base-v3.initrd.img",
       "src": "/android-2024-10-11",
       "notes": "base-v2 + kiosk with black-wallpaper. Silent-boot (no console text) is host-side: production profile uses -vga none/virtio-gpu-pci/console=null."
+    },
+    "v4": {
+      "disk": "base-v4.qcow2",
+      "kernel": "base-v4.kernel",
+      "initrd": "base-v4.initrd.img",
+      "src": "/android-2024-10-11",
+      "notes": "v3 + pre-installed game com.roblox.client (system app, libs extracted) \u2014 PRODUCTION"
     }
   },
   "qemu": {
@@ -31,5 +38,8 @@
     "adb_port_start": 16001,
     "qmp_port_start": 17001
   },
-  "notes": "Base images are immutable once any account references them. Never commit image files."
+  "notes": "Base images are immutable once any account references them. Never commit image files.",
+  "base_game": {
+    "v4": "com.roblox.client"
+  }
 }

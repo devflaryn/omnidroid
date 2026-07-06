@@ -3,6 +3,75 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Manager — 2026-07-06 — base migration, QEMU auto-install, exe, prod updates
+
+**Base migration (update accounts to a newer base, keeping their data).**
+An account = a disposable `system.qcow2` overlay on a shared base + an
+independent `data.qcow2` (all logins/settings/apps). Migration recreates
+only the overlay against the new base; `data.qcow2` is never touched.
+- `omni update-base <name> [--to vN]` — migrate one account.
+- `omni update-all [--to vN] [--skip-current]` — migrate every account.
+- Each migration re-provisions (idempotent): applies the new base's kiosk/
+  HOME/settings without erasing data. **Verified:** alice v1→v3 kept a
+  `/sdcard` marker file + installed Roblox, gained the v3 kiosk, and
+  auto-launched Roblox. All 5 accounts migrated v1/v2→v3, data preserved.
+
+**Production pre-installed-game update (no data loss for any user).**
+- `omni rebuild-base --game <apk>` — boots a throwaway builder on the
+  current base, bakes/replaces the game as a `/system/app` system app
+  (`/system/app/OmniGame/OmniGame.apk`, correct SELinux context),
+  **extracts the APK's native `.so` libs into `lib/<abi>`** (a `/system/app`
+  APK is NOT auto-extracted like a `/data` install, so an ARM game would
+  crash at load without this — libndk still translates the ARM libs),
+  flattens to a new self-contained base version, registers it, makes it
+  current.
+- Roll out to everyone: `omni update-all` → each account's overlay repoints
+  to the new base (new game) while its `data.qcow2` (per-account login/
+  saves) is preserved. So updating the pre-installed APK reaches all users
+  without erasing data.
+- `provision_settings` sets the kiosk's target game from the base's
+  pre-installed game (production) or the adb-installed game (dev).
+
+**Dev vs production mode switch.**
+- `omni bases` — list registered bases (marks current) + any pre-installed
+  game per base.
+- `omni use-base <tag>` — set the default base for new accounts (e.g. a dev
+  base with no game vs a production base with the game baked in).
+- Dev workflow: base without game; `omni install <acct> <apk>` per account.
+  Production workflow: game baked in base via `rebuild-base`; every account
+  gets it.
+
+**QEMU auto-install on first use (not bundled in the exe).**
+- `qemu_bin()` resolves the QEMU executable: config `qemu.dir` → local
+  `./qemu` (auto-installed) → PATH.
+- `ensure_qemu()` runs before any command that needs QEMU; if QEMU is not
+  resolvable it downloads a portable Windows QEMU installer and silently
+  installs it into `./qemu` (NSIS `/S /D=`), no global install. Overridable
+  via config `qemu.download_url`. No-op when QEMU is already present.
+- `omni qemu-info [--install]` — show/repair QEMU resolution.
+
+**Single Windows exe.**
+- `build-exe.ps1` → `dist/omni.exe` (PyInstaller onefile, ~9.5 MB, stdlib
+  only). Ships next to `configs/`; `accounts/`, `work/`, `qemu/` are created
+  beside it. The exe's CLI is identical to `python omni.py …`, so external
+  scripts call it the same way. QEMU is NOT inside the exe — fetched on
+  first use. Verified: `omni.exe list` and `omni.exe qemu-info` work.
+
+## base-v4 — 2026-07-06 — PRODUCTION base (game pre-installed)
+
+`v3 + Roblox baked as a `/system/app` system app` with its 11 arm64 `.so`
+libs extracted into `lib/arm64`. Built via `omni rebuild-base --game
+roblox.apk`. **Verified:** a brand-new account on v4 (`prod2`) boots
+straight into Roblox — pre-installed system app, kiosk auto-launches it,
+renders via libndk — with NO adb install and no manual steps.
+
+This is the production lineage. `current_base` is kept at **v3 (dev
+default)**; switch to production with `omni use-base v4`. Dev accounts (v3,
+game via `omni install`) and production accounts (v4, game pre-installed)
+coexist. Updating the pre-installed game for everyone: `omni rebuild-base
+--game <newapk>` (→ v5) then `omni update-all` — each account's overlay
+repoints to the new base while its data.qcow2 (login/saves) is preserved.
+
 ## base-v3 — 2026-07-06
 
 Two cosmetic boot leaks fixed. Fresh-account end-to-end verified.
