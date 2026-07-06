@@ -24,19 +24,40 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+def _app_root():
+    """Project root — works both as a .py and as a PyInstaller onefile exe.
+    When frozen, files live next to the exe (sys.executable), not in the
+    temporary _MEIPASS extraction dir."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+REPO = _app_root()
 CONFIG_PATH = REPO / "configs" / "paths.json"
 ACCOUNTS_DIR = REPO / "accounts"
+QEMU_DIR = REPO / "qemu"          # local (auto-installed) QEMU lives here
 IS_WINDOWS = platform.system() == "Windows"
 
 FIRST_BOOT_TIMEOUT = 1500   # first boot runs full dexopt; be patient
 NORMAL_BOOT_TIMEOUT = 360
 
+# Default portable QEMU installer (Windows). Overridable in config
+# ("qemu": {"download_url": ...}). NSIS installer supports silent install
+# to a directory via /S /D=<dir>, so no global install is needed.
+DEFAULT_QEMU_URL = ("https://qemu.weilnetz.de/w64/"
+                    "qemu-w64-setup-20240423.exe")
+
 
 # ---------- config / account state ----------
 
+def read_config():
+    """Plain JSON read, no validation (safe to call before QEMU exists)."""
+    return json.loads(CONFIG_PATH.read_text())
+
+
 def load_config():
-    cfg = json.loads(CONFIG_PATH.read_text())
+    cfg = read_config()
     base = cfg["bases"][cfg["current_base"]]
     images = Path(cfg["images_dir"])
     for key in ("disk", "kernel", "initrd"):
@@ -44,6 +65,57 @@ def load_config():
         if not p.exists():
             sys.exit(f"error: base asset missing: {p}")
     return cfg
+
+
+# ---------- qemu resolution + auto-install ----------
+
+def qemu_bin(tool):
+    """Resolve a QEMU executable path. Order: config 'qemu.dir' -> local
+    QEMU_DIR (auto-installed) -> bare name (found on PATH). Lets the shipped
+    exe use a bundled/downloaded QEMU without a global install."""
+    exe = tool + (".exe" if IS_WINDOWS else "")
+    try:
+        qd = read_config().get("qemu", {}).get("dir")
+    except Exception:
+        qd = None
+    for cand in ([Path(qd) / exe] if qd else []) + [QEMU_DIR / exe]:
+        if cand.exists():
+            return str(cand)
+    return tool          # PATH
+
+
+def _qemu_present():
+    import shutil
+    p = qemu_bin("qemu-system-x86_64")
+    return Path(p).exists() or shutil.which(p) is not None
+
+
+def ensure_qemu():
+    """Install QEMU into QEMU_DIR on first use if it is not already
+    resolvable (config dir, local dir, or PATH). Not bundled in the exe —
+    downloaded on demand. No-op when QEMU is already available."""
+    if _qemu_present():
+        return
+    if not IS_WINDOWS:
+        sys.exit("QEMU not found. Install it, e.g.: "
+                 "sudo apt install qemu-system-x86 qemu-utils")
+    import urllib.request
+    url = (read_config().get("qemu", {}).get("download_url")
+           or DEFAULT_QEMU_URL)
+    QEMU_DIR.mkdir(parents=True, exist_ok=True)
+    installer = QEMU_DIR / "qemu-setup.exe"
+    print(f"[qemu] not found; downloading portable QEMU from {url}")
+    print(f"[qemu] (one-time, ~150 MB) -> {QEMU_DIR}")
+    urllib.request.urlretrieve(url, installer)
+    print("[qemu] installing silently (no global install)...")
+    # NSIS silent install into QEMU_DIR; /D must be last and unquoted.
+    r = subprocess.run(f'"{installer}" /S /D={QEMU_DIR}', shell=True)
+    installer.unlink(missing_ok=True)
+    if not _qemu_present():
+        sys.exit(f"[qemu] auto-install failed (exit {r.returncode}). "
+                 f"Install QEMU manually or set qemu.dir in "
+                 f"configs/paths.json")
+    print(f"[qemu] ready: {qemu_bin('qemu-system-x86_64')}")
 
 
 def account_dir(name):
@@ -224,7 +296,7 @@ def qemu_command(acct, cfg, dev):
         nic = "virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
 
     cmd = [
-        "qemu-system-x86_64",
+        qemu_bin("qemu-system-x86_64"),
         "-machine", f"q35,accel={accel}",
         "-cpu", "qemu64",
         "-smp", str(q["smp"]),
@@ -381,9 +453,18 @@ def provision_settings(acct, label):
         time.sleep(3)
         print(f"[{label}] kiosk set as HOME, Bliss launchers disabled, "
               f"black wallpaper applied")
-    if acct.get("game_package"):
+    # Which game the kiosk should launch: an adb-installed one (dev) takes
+    # precedence, else the base's pre-installed system-app game (production).
+    game = acct.get("game_package")
+    if not game:
+        try:
+            game = read_config().get("base_game", {}).get(acct["base"])
+        except Exception:
+            game = None
+    if game:
         adb(acct, "shell", "settings", "put", "global",
-            "omni_game_package", acct["game_package"], timeout=10)
+            "omni_game_package", game, timeout=10)
+        print(f"[{label}] kiosk game package = {game}")
 
     print(f"[{label}] provisioned /data settings (lock screen off, "
           f"immersive confirmed, setup complete)")
@@ -391,7 +472,19 @@ def provision_settings(acct, label):
 
 # ---------- commands ----------
 
+def make_overlay(system_path, base_disk):
+    """(Re)create a cheap qcow2 system overlay backed by base_disk. The
+    overlay only absorbs disposable system-partition COW writes, so it is
+    safe to delete and recreate against a different base (account data
+    lives on the separate data.qcow2, never in this overlay)."""
+    Path(system_path).unlink(missing_ok=True)
+    subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2",
+                    "-b", str(base_disk), "-F", "qcow2",
+                    str(system_path)], check=True, capture_output=True)
+
+
 def cmd_create(args):
+    ensure_qemu()
     cfg = load_config()
     name = args.name
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -409,10 +502,7 @@ def cmd_create(args):
             "first_boot_done": False, "created": time.time()}
     save_account(acct)
 
-    subprocess.run(["qemu-img", "create", "-f", "qcow2",
-                    "-b", str(base_disk), "-F", "qcow2",
-                    str(d / "system.qcow2")], check=True,
-                   capture_output=True)
+    make_overlay(d / "system.qcow2", base_disk)
     # /data disk must be a pre-formatted ext4 filesystem: the Bliss initrd
     # only mounts DATA= devices, it never formats them (a blank disk hangs
     # Android before adbd). Copy the formatted-empty template.
@@ -450,6 +540,11 @@ def cmd_create(args):
 
 
 def cmd_start(args):
+    ensure_qemu()
+    return _cmd_start(args)
+
+
+def _cmd_start(args):
     """Spawn a detached QEMU instance and return immediately.
 
     The VM is never tied to this process: PID + ports are recorded in
@@ -537,6 +632,181 @@ def cmd_resume(args):
 def cmd_stop(args):
     acct = load_account(args.name)
     _shutdown(acct, f"stop {args.name}")
+
+
+# ---------- base migration (update accounts to a newer base) ----------
+
+def migrate_account(name, cfg, target=None, reprovision=True):
+    """Repoint an account's disposable system overlay onto `target` base
+    (default: current). The account's data.qcow2 is NEVER touched, so all
+    logins/settings/installed apps survive. Re-provisioning (idempotent)
+    applies the new base's kiosk/HOME/settings. This is how a base update
+    (e.g. an updated pre-installed game) reaches every account without
+    erasing per-account data."""
+    cfg = cfg or load_config()
+    target = target or cfg["current_base"]
+    acct = load_account(name)
+    label = f"update {name}"
+    if acct["base"] == target:
+        print(f"[{label}] already on base {target}; re-provisioning")
+    if running_pid(name):
+        _shutdown(acct, label)
+    d = account_dir(name)
+    base = cfg["bases"][target]
+    base_disk = Path(cfg["images_dir"]) / base["disk"]
+    old = acct["base"]
+    make_overlay(d / "system.qcow2", base_disk)      # data.qcow2 untouched
+    acct["base"] = target
+    save_account(acct)
+    print(f"[{label}] overlay {old} -> {target}; data.qcow2 preserved")
+    if not reprovision:
+        return
+    # Boot once (dev) and re-apply settings so the new base's kiosk/system
+    # game/HOME take effect on the existing data disk.
+    spawn_qemu(acct, cfg, dev=True)
+    first = not acct.get("first_boot_done")
+    if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT if first
+                         else NORMAL_BOOT_TIMEOUT, label, first_boot=first):
+        print(f"[{label}] WARNING: boot timed out; leaving instance for "
+              f"inspection")
+        return
+    post_boot(acct, label)
+    provision_settings(acct, label)
+    acct["first_boot_done"] = True
+    save_account(acct)
+    _shutdown(acct, label)
+    print(f"[{label}] migrated to {target} and re-provisioned")
+
+
+def cmd_update_base(args):
+    ensure_qemu()
+    cfg = load_config()
+    migrate_account(args.name, cfg, target=args.to,
+                    reprovision=not args.no_reprovision)
+
+
+def cmd_update_all(args):
+    ensure_qemu()
+    cfg = load_config()
+    target = args.to or cfg["current_base"]
+    names = [a["name"] for a in all_accounts()]
+    todo = [n for n in names
+            if load_account(n)["base"] != target or not args.skip_current]
+    print(f"[update-all] target base {target}; "
+          f"{len(todo)}/{len(names)} account(s) to migrate: {todo}")
+    for n in todo:
+        migrate_account(n, cfg, target=target,
+                        reprovision=not args.no_reprovision)
+    print(f"[update-all] done. All migrated accounts now on {target}; "
+          f"per-account data preserved.")
+
+
+# ---------- production base rebuild (update pre-installed game) ----------
+
+def _next_base_tag(cfg):
+    nums = [int(k[1:]) for k in cfg["bases"] if re.fullmatch(r"v\d+", k)]
+    return f"v{max(nums) + 1}"
+
+
+def rebuild_base(cfg, game_apk):
+    """Bake/replace the pre-installed game APK as a /system/app system app
+    in a NEW base version, then make it current. Existing accounts are NOT
+    changed until you run 'update-all' — which repoints their overlays to
+    this base and keeps every data.qcow2 (so the game updates for all users
+    without erasing their per-account data)."""
+    import shutil
+    cur = cfg["current_base"]
+    nxt = _next_base_tag(cfg)
+    label = f"rebuild {cur}->{nxt}"
+    images = Path(cfg["images_dir"])
+    cur_disk = images / cfg["bases"][cur]["disk"]
+    pkg = apk_package_name(game_apk)
+    if not pkg:
+        sys.exit(f"[{label}] could not read package name from {game_apk}")
+
+    bname = "_builder"
+    d = account_dir(bname)
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    adb_port, qmp_port = allocate_ports(cfg)
+    acct = {"name": bname, "base": cur, "adb_port": adb_port,
+            "qmp_port": qmp_port, "first_boot_done": True}
+    save_account(acct)
+    make_overlay(d / "system.qcow2", cur_disk)
+    shutil.copyfile(images / cfg["data_template"], d / "data.qcow2")
+
+    try:
+        print(f"[{label}] booting builder on {cur} to bake {pkg}")
+        spawn_qemu(acct, cfg, dev=True)
+        if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
+            sys.exit(f"[{label}] builder boot failed")
+        adb(acct, "root")
+        time.sleep(3)
+        adb_connect(acct)
+        appdir = "/system/app/OmniGame"
+        adb(acct, "push", game_apk, "/data/local/tmp/game.apk", timeout=600)
+        r = adb(acct, "shell",
+                f"mount -o remount,rw / && rm -rf {appdir} && "
+                f"mkdir -p {appdir} && "
+                f"cp /data/local/tmp/game.apk {appdir}/OmniGame.apk && "
+                f"chmod 644 {appdir}/OmniGame.apk && "
+                f"chcon u:object_r:system_file:s0 {appdir} && "
+                f"chcon u:object_r:system_file:s0 {appdir}/OmniGame.apk && "
+                f"rm /data/local/tmp/game.apk && sync && echo BAKED",
+                timeout=120)
+        if "BAKED" not in r.stdout:
+            sys.exit(f"[{label}] baking failed: {r.stdout}{r.stderr}")
+        print(f"[{label}] baked {pkg} as system app")
+        _shutdown(acct, label)
+
+        newdisk = images / f"base-{nxt}.qcow2"
+        print(f"[{label}] flattening overlay -> {newdisk} (self-contained)")
+        subprocess.run([qemu_bin("qemu-img"), "convert", "-O", "qcow2",
+                        "-c", str(d / "system.qcow2"), str(newdisk)],
+                       check=True)
+        shutil.copyfile(images / cfg["bases"][cur]["kernel"],
+                        images / f"base-{nxt}.kernel")
+        shutil.copyfile(images / cfg["bases"][cur]["initrd"],
+                        images / f"base-{nxt}.initrd.img")
+
+        raw = read_config()
+        raw["bases"][nxt] = {
+            "disk": f"base-{nxt}.qcow2",
+            "kernel": f"base-{nxt}.kernel",
+            "initrd": f"base-{nxt}.initrd.img",
+            "src": cfg["bases"][cur]["src"],
+            "notes": f"{cur} + pre-installed game {pkg} (system app)"}
+        raw.setdefault("base_game", {})[nxt] = pkg
+        raw["current_base"] = nxt
+        CONFIG_PATH.write_text(json.dumps(raw, indent=2))
+        print(f"[{label}] base {nxt} built (game {pkg} pre-installed), now "
+              f"current. Roll out to all accounts: omni update-all")
+    finally:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+    return nxt, pkg
+
+
+def cmd_rebuild_base(args):
+    ensure_qemu()
+    cfg = load_config()
+    rebuild_base(cfg, args.game)
+
+
+def cmd_qemu_info(args):
+    import shutil
+    if args.install:
+        ensure_qemu()
+    resolved = qemu_bin("qemu-system-x86_64")
+    where = resolved if Path(resolved).exists() else shutil.which(resolved)
+    print(json.dumps({
+        "qemu_system": resolved,
+        "resolved_to": where,
+        "present": _qemu_present(),
+        "local_qemu_dir": str(QEMU_DIR),
+        "qemu_img": qemu_bin("qemu-img"),
+    }, indent=2))
 
 
 def cmd_list(args):
@@ -788,6 +1058,34 @@ def main():
     a.add_argument("name")
     a.add_argument("rest", nargs=argparse.REMAINDER)
     a.set_defaults(func=cmd_adb)
+
+    ub = sub.add_parser("update-base",
+                        help="migrate one account to a base (default: "
+                             "current), keeping its data")
+    ub.add_argument("name")
+    ub.add_argument("--to", default=None, help="target base tag (e.g. v3)")
+    ub.add_argument("--no-reprovision", action="store_true")
+    ub.set_defaults(func=cmd_update_base)
+
+    ua = sub.add_parser("update-all",
+                        help="migrate ALL accounts to a base (default: "
+                             "current); per-account data preserved")
+    ua.add_argument("--to", default=None)
+    ua.add_argument("--no-reprovision", action="store_true")
+    ua.add_argument("--skip-current", action="store_true",
+                    help="skip accounts already on the target base")
+    ua.set_defaults(func=cmd_update_all)
+
+    rb = sub.add_parser("rebuild-base",
+                        help="bake/replace the pre-installed game in a new "
+                             "base version (production); then update-all")
+    rb.add_argument("--game", required=True, help="path to the game APK")
+    rb.set_defaults(func=cmd_rebuild_base)
+
+    qi = sub.add_parser("qemu-info",
+                        help="show resolved QEMU path / install if missing")
+    qi.add_argument("--install", action="store_true")
+    qi.set_defaults(func=cmd_qemu_info)
 
     args = p.parse_args()
     if getattr(args, "data_size", None) is None and args.cmd == "create":

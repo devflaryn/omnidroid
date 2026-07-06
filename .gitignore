@@ -19,6 +19,15 @@ launcher/build/
 launcher/.gradle/
 local.properties
 
+# PyInstaller exe build artifacts
+dist/
+build/
+*.exe
+*.spec
+
+# Auto-downloaded portable QEMU (fetched on first use, never committed)
+qemu/
+
 # OS noise
 Thumbs.db
 desktop.ini
