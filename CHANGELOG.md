@@ -3,6 +3,49 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## base-v5 — 2026-07-06 — status-bar lockdown + faster boot / less RAM
+
+**Problem confirmed on a fresh v4 kiosk account:** swiping down still opened
+the full Quick-Settings panel (immersive mode only *hides* the bar), and an
+"Android Setup — finish setting up…" notification lingered. `dpm
+list-owners` = no owners.
+
+**Lock Task Mode lockdown (device-owner kiosk pinning).** The kiosk now has
+a `DeviceAdminReceiver`; provisioning runs `dpm set-device-owner
+com.omni.kiosk/.OmniDeviceAdminReceiver`. As device owner the kiosk:
+`setLockTaskPackages([kiosk, game])`, `setLockTaskFeatures(NONE)`,
+`setStatusBarDisabled(true)`, and `startLockTask()` around the game launch.
+Result: status bar, Quick-Settings pull-down, notifications, and home/recents
+gestures are fully disabled while the game runs — no escape surface. All
+per-`/data` (device owner + policies live in `/data`); no `/system` libs or
+bridge props touched.
+
+**Setup-wizard notification killed** — `pm disable-user
+com.google.android.setupwizard` in provisioning.
+
+**Less RAM** (`pm disable-user`, per-`/data`, reversible): disabled Google
+Assistant/search (`googlequicksearchbox`, ~215 MB), device restore,
+AboutBliss, and the preinstalled Camera/Termux/file-manager apps; zeroed UI
+animation scales. GMS + Play Store KEPT (the game may use Play Integrity —
+regression confirms Roblox still launches/renders). **Measured with Roblox
+running: guest RAM dropped from ~2289 MB (v3) to ~2004 MB (v5), ≈285 MB
+saved per instance** — all 7 trimmed processes confirmed absent.
+
+**Boot time — honest result: unchanged.** Measured `boot_completed` back to
+back under identical host load: v3 ≈35 s, v5 ≈35 s. The trimmed apps don't
+run on the boot-critical path (they start after `boot_completed`), so
+disabling them saves RAM, not boot time. Meaningful boot-time reduction
+would need riskier system-service/zygote-preload trimming (deferred; every
+such change must keep passing the ARM regression check).
+
+**New manager command:** `omni update-kiosk [--apk ...]` — ship a new kiosk
+launcher in a new base version (reuses the generalized base-builder), then
+`omni update-all` rolls it out (per-account data preserved).
+
+base-v5 = v3 (dev) + the lock-task kiosk. Existing accounts migrated with
+`update-all` (re-provision applies the device-owner lockdown + trims to each
+account's `/data`).
+
 ## Manager — 2026-07-06 — color fix, performance modes, dev harness
 
 **R/B color swap FIXED via VirGL.** The swap was in QEMU's software 2D

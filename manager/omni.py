@@ -297,7 +297,7 @@ def resolve_mode(cfg, name=None, gpu=None, mem=None, headless=None):
     return m
 
 
-def qemu_command(acct, cfg, dev, mode=None):
+def qemu_command(acct, cfg, dev, mode=None, dev_headless=False):
     base = cfg["bases"][acct["base"]]
     images = Path(cfg["images_dir"])
     q = cfg["qemu"]
@@ -313,10 +313,14 @@ def qemu_command(acct, cfg, dev, mode=None):
     display = ["-display", "sdl"]
 
     if dev:
-        # Dev/builder boot: legacy VGA text console VISIBLE for debugging.
+        # Dev/builder boot: legacy VGA text console + serial log for
+        # debugging. Provisioning/builder boots run headless (no window) so
+        # a dexopt-busy SDL window can't look "frozen"; serial still logs.
         append += " console=tty0 console=ttyS0,115200"
         gpu = ["-device", "virtio-vga"]
         nic = "virtio-net-pci,netdev=net0"
+        if dev_headless:
+            display = ["-display", "none"]
     else:
         # Production silent boot (no firmware/console text) + per-mode GPU.
         append += (" quiet loglevel=0 console=null "
@@ -361,7 +365,7 @@ def qemu_command(acct, cfg, dev, mode=None):
     return cmd
 
 
-def spawn_qemu(acct, cfg, dev, mode=None):
+def spawn_qemu(acct, cfg, dev, mode=None, dev_headless=True):
     d = account_dir(acct["name"])
     log = open(d / "qemu.log", "w")
     kwargs = {}
@@ -371,8 +375,9 @@ def spawn_qemu(acct, cfg, dev, mode=None):
         kwargs["creationflags"] = DETACHED | NEW_GROUP
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(qemu_command(acct, cfg, dev, mode),
-                            stdout=log, stderr=log, **kwargs)
+    proc = subprocess.Popen(
+        qemu_command(acct, cfg, dev, mode, dev_headless=dev_headless),
+        stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
          "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE)}))
@@ -506,8 +511,57 @@ def provision_settings(acct, label):
             "omni_game_package", game, timeout=10)
         print(f"[{label}] kiosk game package = {game}")
 
+    lockdown_and_trim(acct, label)
+
     print(f"[{label}] provisioned /data settings (lock screen off, "
           f"immersive confirmed, setup complete)")
+
+
+# Packages a single-game kiosk never needs. Disabling frees RAM and trims
+# boot (all `pm disable-user` = per-/data, reversible, no /system touched).
+# GMS + Play Store are intentionally KEPT (the game may use Play Integrity).
+TRIM_PACKAGES = (
+    "com.google.android.setupwizard",         # setup wizard + its notification
+    "com.google.android.googlequicksearchbox",  # Assistant/search (~215 MB)
+    "com.google.android.apps.restore",        # device restore
+    "org.blissroms.aboutbliss",               # Bliss about app
+    "net.sourceforge.opencamera",             # preinstalled camera
+    "com.termux",                             # preinstalled terminal
+    "com.amaze.filemanager",                  # preinstalled file manager
+)
+
+
+def lockdown_and_trim(acct, label):
+    """Kiosk lockdown (device-owner Lock Task) + boot/RAM trims. All
+    per-/data: sets the kiosk as device owner so it can fully disable the
+    status bar / Quick-Settings pull-down / nav gestures, kills the setup
+    wizard, disables unneeded apps, and zeroes animations."""
+    # Device owner: enables the kiosk's Lock Task Mode. Works only on a
+    # device with no added accounts (kiosk accounts have none). Idempotent-
+    # ish: ignore "already set" failures.
+    r = adb(acct, "shell", "dpm", "set-device-owner",
+            "com.omni.kiosk/.OmniDeviceAdminReceiver", timeout=20)
+    out = (r.stdout + r.stderr)
+    if "Success" in out:
+        print(f"[{label}] kiosk is DEVICE OWNER (Lock Task lockdown active)")
+    elif "already" in out.lower() or "not allowed" in out.lower():
+        print(f"[{label}] device owner already set / present")
+    else:
+        print(f"[{label}] NOTE: could not set device owner: "
+              f"{out.strip()[:120]}")
+    # Trim unneeded packages (RAM + boot).
+    for pkg in TRIM_PACKAGES:
+        try:
+            adb(acct, "shell", "pm", "disable-user", "--user", "0", pkg,
+                timeout=15)
+        except Exception:
+            pass
+    # Zero UI animations (snappier, tiny boot win).
+    for k in ("window_animation_scale", "transition_animation_scale",
+              "animator_duration_scale"):
+        adb(acct, "shell", "settings", "put", "global", k, "0", timeout=10)
+    print(f"[{label}] trimmed {len(TRIM_PACKAGES)} unneeded packages, "
+          f"animations off")
 
 
 # ---------- commands ----------
@@ -806,21 +860,16 @@ def _bake_native_libs(acct, game_apk, appdir, label):
     return pushed
 
 
-def rebuild_base(cfg, game_apk):
-    """Bake/replace the pre-installed game APK as a /system/app system app
-    in a NEW base version, then make it current. Existing accounts are NOT
-    changed until you run 'update-all' — which repoints their overlays to
-    this base and keeps every data.qcow2 (so the game updates for all users
-    without erasing their per-account data)."""
+def _build_next_base(cfg, mutate, notes, base_game=None):
+    """Boot a throwaway builder on the current base, let `mutate(acct,label)`
+    modify /system (remount rw already up to the caller), flatten to the
+    next base version, register it, and make it current. Returns the tag."""
     import shutil
     cur = cfg["current_base"]
     nxt = _next_base_tag(cfg)
-    label = f"rebuild {cur}->{nxt}"
+    label = f"build {cur}->{nxt}"
     images = Path(cfg["images_dir"])
     cur_disk = images / cfg["bases"][cur]["disk"]
-    pkg = apk_package_name(game_apk)
-    if not pkg:
-        sys.exit(f"[{label}] could not read package name from {game_apk}")
 
     bname = "_builder"
     d = account_dir(bname)
@@ -835,33 +884,16 @@ def rebuild_base(cfg, game_apk):
     shutil.copyfile(images / cfg["data_template"], d / "data.qcow2")
 
     try:
-        print(f"[{label}] booting builder on {cur} to bake {pkg}")
+        print(f"[{label}] booting builder on {cur}")
         spawn_qemu(acct, cfg, dev=True)
         if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
             sys.exit(f"[{label}] builder boot failed")
         adb(acct, "root")
         time.sleep(3)
         adb_connect(acct)
-        appdir = "/system/app/OmniGame"
-        adb(acct, "push", game_apk, "/data/local/tmp/game.apk", timeout=600)
-        r = adb(acct, "shell",
-                f"mount -o remount,rw / && rm -rf {appdir} && "
-                f"mkdir -p {appdir} && "
-                f"cp /data/local/tmp/game.apk {appdir}/OmniGame.apk && "
-                f"chmod 644 {appdir}/OmniGame.apk && "
-                f"chcon u:object_r:system_file:s0 {appdir} && "
-                f"chcon u:object_r:system_file:s0 {appdir}/OmniGame.apk && "
-                f"rm /data/local/tmp/game.apk && sync && echo BAKED",
-                timeout=120)
-        if "BAKED" not in r.stdout:
-            sys.exit(f"[{label}] baking failed: {r.stdout}{r.stderr}")
-        # A /system/app APK does NOT get its native libs auto-extracted the
-        # way a /data install does, so an ARM game would crash at load. We
-        # extract the .so files into lib/<abi> ourselves (libndk still
-        # translates the ARM libs at runtime).
-        n = _bake_native_libs(acct, game_apk, appdir, label)
+        adb(acct, "shell", "mount -o remount,rw /", timeout=20)
+        mutate(acct, label)
         adb(acct, "shell", "sync", timeout=15)
-        print(f"[{label}] baked {pkg} as system app ({n} native libs)")
         _shutdown(acct, label)
 
         newdisk = images / f"base-{nxt}.qcow2"
@@ -880,22 +912,86 @@ def rebuild_base(cfg, game_apk):
             "kernel": f"base-{nxt}.kernel",
             "initrd": f"base-{nxt}.initrd.img",
             "src": cfg["bases"][cur]["src"],
-            "notes": f"{cur} + pre-installed game {pkg} (system app)"}
-        raw.setdefault("base_game", {})[nxt] = pkg
+            "notes": notes}
+        # Carry forward the prior base's pre-installed game, unless changed.
+        prior_game = raw.get("base_game", {}).get(cur)
+        if base_game:
+            raw.setdefault("base_game", {})[nxt] = base_game
+        elif prior_game:
+            raw.setdefault("base_game", {})[nxt] = prior_game
         raw["current_base"] = nxt
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
-        print(f"[{label}] base {nxt} built (game {pkg} pre-installed), now "
-              f"current. Roll out to all accounts: omni update-all")
+        print(f"[{label}] base {nxt} built and current. "
+              f"Roll out: omni update-all")
     finally:
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
-    return nxt, pkg
+    return nxt
+
+
+def rebuild_base(cfg, game_apk):
+    """Bake/replace the pre-installed game APK as a /system/app system app in
+    a NEW base version. update-all rolls it out, keeping each data.qcow2."""
+    pkg = apk_package_name(game_apk)
+    if not pkg:
+        sys.exit(f"could not read package name from {game_apk}")
+
+    def mutate(acct, label):
+        appdir = "/system/app/OmniGame"
+        adb(acct, "push", game_apk, "/data/local/tmp/game.apk", timeout=600)
+        r = adb(acct, "shell",
+                f"rm -rf {appdir} && mkdir -p {appdir} && "
+                f"cp /data/local/tmp/game.apk {appdir}/OmniGame.apk && "
+                f"chmod 644 {appdir}/OmniGame.apk && "
+                f"chcon u:object_r:system_file:s0 {appdir} && "
+                f"chcon u:object_r:system_file:s0 {appdir}/OmniGame.apk && "
+                f"rm /data/local/tmp/game.apk && echo BAKED", timeout=120)
+        if "BAKED" not in r.stdout:
+            sys.exit(f"[{label}] baking failed: {r.stdout}{r.stderr}")
+        n = _bake_native_libs(acct, game_apk, appdir, label)
+        print(f"[{label}] baked {pkg} as system app ({n} native libs)")
+
+    return _build_next_base(cfg, mutate,
+                            notes=f"pre-installed game {pkg} (system app)",
+                            base_game=pkg)
+
+
+def update_kiosk_base(cfg, kiosk_apk):
+    """Replace the kiosk system app (/system/app/OmniKiosk) in a NEW base
+    version — e.g. to ship a new launcher with Lock Task lockdown."""
+    if not Path(kiosk_apk).exists():
+        sys.exit(f"kiosk apk not found: {kiosk_apk}")
+
+    def mutate(acct, label):
+        appdir = "/system/app/OmniKiosk"
+        adb(acct, "push", kiosk_apk, "/data/local/tmp/kiosk.apk",
+            timeout=120)
+        r = adb(acct, "shell",
+                f"rm -rf {appdir} && mkdir -p {appdir} && "
+                f"cp /data/local/tmp/kiosk.apk {appdir}/OmniKiosk.apk && "
+                f"chmod 644 {appdir}/OmniKiosk.apk && "
+                f"chcon u:object_r:system_file:s0 {appdir} && "
+                f"chcon u:object_r:system_file:s0 {appdir}/OmniKiosk.apk && "
+                f"rm /data/local/tmp/kiosk.apk && echo KIOSK_OK", timeout=60)
+        if "KIOSK_OK" not in r.stdout:
+            sys.exit(f"[{label}] kiosk swap failed: {r.stdout}{r.stderr}")
+        print(f"[{label}] replaced kiosk system app")
+
+    return _build_next_base(cfg, mutate,
+                            notes="updated kiosk (Lock Task lockdown + "
+                                  "boot/RAM trims)")
 
 
 def cmd_rebuild_base(args):
     ensure_qemu()
     cfg = load_config()
     rebuild_base(cfg, args.game)
+
+
+def cmd_update_kiosk(args):
+    ensure_qemu()
+    cfg = load_config()
+    update_kiosk_base(cfg, args.apk)
 
 
 def cmd_use_base(args):
@@ -1332,6 +1428,13 @@ def main():
                              "base version (production); then update-all")
     rb.add_argument("--game", required=True, help="path to the game APK")
     rb.set_defaults(func=cmd_rebuild_base)
+
+    uk = sub.add_parser("update-kiosk",
+                        help="ship a new kiosk launcher in a new base "
+                             "version; then update-all")
+    uk.add_argument("--apk", default=str(REPO / "launcher" / "build"
+                                         / "omni-kiosk.apk"))
+    uk.set_defaults(func=cmd_update_kiosk)
 
     qi = sub.add_parser("qemu-info",
                         help="show resolved QEMU path / install if missing")

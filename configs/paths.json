@@ -1,6 +1,6 @@
 {
   "images_dir": "C:/Users/berat/OmniImages",
-  "current_base": "v3",
+  "current_base": "v5",
   "data_template": "data-template-8g.qcow2",
   "bases": {
     "v1": {
@@ -29,6 +29,13 @@
       "initrd": "base-v4.initrd.img",
       "src": "/android-2024-10-11",
       "notes": "v3 + pre-installed game com.roblox.client (system app, libs extracted) \u2014 PRODUCTION"
+    },
+    "v5": {
+      "disk": "base-v5.qcow2",
+      "kernel": "base-v5.kernel",
+      "initrd": "base-v5.initrd.img",
+      "src": "/android-2024-10-11",
+      "notes": "updated kiosk (Lock Task lockdown + boot/RAM trims)"
     }
   },
   "qemu": {

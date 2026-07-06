@@ -8,10 +8,16 @@ $out = "$root\build"
 
 Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force "$out\classes" | Out-Null
+New-Item -ItemType Directory -Force "$out\compiled" | Out-Null
 
-# 1. Link manifest (no resources needed - UI is programmatic)
+# 1a. Compile resources (res/xml/device_admin.xml for the device-admin receiver)
+& "$bt\aapt2.exe" compile --dir "$root\res" -o "$out\compiled\res.zip"
+if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
+
+# 1b. Link manifest + compiled resources
 & "$bt\aapt2.exe" link --manifest "$root\AndroidManifest.xml" `
     -I $androidJar --min-sdk-version 26 --target-sdk-version 33 `
+    "$out\compiled\res.zip" `
     -o "$out\base.apk"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 

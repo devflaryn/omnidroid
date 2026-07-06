@@ -2,7 +2,9 @@ package com.omni.kiosk;
 
 import android.app.Activity;
 import android.app.WallpaperManager;
+import android.app.admin.DevicePolicyManager;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -89,6 +91,7 @@ public class MainActivity extends Activity {
         });
 
         ensureBlackWallpaper();
+        configureLockTask();
 
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_PACKAGE_ADDED);
@@ -140,6 +143,53 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** If the kiosk is device owner, whitelist itself + the game for Lock
+     *  Task Mode and disable the status bar. Lock Task fully blocks the
+     *  status bar / Quick-Settings pull-down / nav gestures — immersive
+     *  mode alone only hides the bar (it can be swiped back). */
+    private void configureLockTask() {
+        try {
+            DevicePolicyManager dpm =
+                    getSystemService(DevicePolicyManager.class);
+            if (dpm == null || !dpm.isDeviceOwnerApp(getPackageName())) {
+                return;
+            }
+            ComponentName admin =
+                    new ComponentName(this, OmniDeviceAdminReceiver.class);
+            String game = resolveGamePackage();
+            String[] pkgs = (game != null)
+                    ? new String[]{getPackageName(), game}
+                    : new String[]{getPackageName()};
+            dpm.setLockTaskPackages(admin, pkgs);
+            try {
+                // Disable every lock-task escape surface: no status bar,
+                // no notifications, no home/recents, no system info.
+                dpm.setLockTaskFeatures(admin,
+                        DevicePolicyManager.LOCK_TASK_FEATURE_NONE);
+            } catch (Throwable ignore) { }
+            try {
+                dpm.setStatusBarDisabled(admin, true);
+            } catch (Throwable ignore) { }
+            Log.i(TAG, "device owner: lock task configured for "
+                    + java.util.Arrays.toString(pkgs));
+        } catch (Exception e) {
+            Log.w(TAG, "configureLockTask failed: " + e);
+        }
+    }
+
+    /** Enter Lock Task (pinning). Safe to call repeatedly. */
+    private void enterLockTask() {
+        try {
+            DevicePolicyManager dpm =
+                    getSystemService(DevicePolicyManager.class);
+            if (dpm != null && dpm.isLockTaskPermitted(getPackageName())) {
+                startLockTask();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "startLockTask failed: " + e);
+        }
+    }
+
     private void hideSystemUi() {
         getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
@@ -179,6 +229,21 @@ public class MainActivity extends Activity {
         Log.i(TAG, "launching " + pkg + " (" + why + ")");
         status.setText("");
         launchedThisBoot = true;
+        // Ensure the game is whitelisted for Lock Task, then pin, so the
+        // game runs with the status bar / gestures fully locked out.
+        try {
+            DevicePolicyManager dpm =
+                    getSystemService(DevicePolicyManager.class);
+            if (dpm != null && dpm.isDeviceOwnerApp(getPackageName())) {
+                ComponentName admin = new ComponentName(
+                        this, OmniDeviceAdminReceiver.class);
+                dpm.setLockTaskPackages(admin,
+                        new String[]{getPackageName(), pkg});
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "whitelist game for lock task failed: " + e);
+        }
+        enterLockTask();
         li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(li);
     }
