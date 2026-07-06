@@ -1,5 +1,8 @@
 # Changelog
 
+> **Resuming from a fresh session? Read `HANDOFF.md` first**, then `PLAN.md`,
+> then this file, then `git log`. Entries are newest-first.
+
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 

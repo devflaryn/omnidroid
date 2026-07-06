@@ -1,5 +1,11 @@
 # Omnidroid — Kiosk Game Launcher & Multi-Account Manager: PLAN
 
+> **Resuming? Read `HANDOFF.md` first** (current state), then this file
+> (history/decisions), then `CHANGELOG.md`, then `git log`.
+> **Status (2026-07-06): Phases 0–7 complete + many extras; current base = v5.**
+> This document is the original plan plus appended per-phase results; the
+> "draft" line below is historical.
+
 **Status:** draft for approval — no code has been written yet.
 **Date:** 2026-07-05
 
@@ -148,6 +154,28 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
 ---
 
 ## 7. Ordered task list (execute together, copy-first at every step)
+
+> **STATUS (2026-07-06): Phases 0–7 COMPLETE. Phases 8–9 optional/open.**
+> Current base = **v5** (dev, Lock-Task kiosk + RAM trims). Full details in
+> CHANGELOG.md and HANDOFF.md. Quick status per phase:
+> - Phase 0 Housekeeping — ✅ DONE
+> - Phase 1 Prove pipeline (ARM bridge, /data-on-2nd-disk gate, root) — ✅ DONE
+> - Phase 2 Manager skeleton — ✅ DONE (detached start, watchdog, list, etc.)
+> - Phase 3 Per-account data split — ✅ DONE (absorbed into Phase 2)
+> - Phase 4 Silent boot + custom loading screen — ✅ DONE (→ base-v2; silent
+>   boot later moved fully host-side in base-v3: -vga none/console=null)
+> - Phase 5 Kiosk launcher APK (auto-launch, no-apk, close→shutdown) — ✅ DONE
+> - Phase 6 Base update pipeline (`update-base`/`update-all`/`update-kiosk`) — ✅ DONE
+> - Phase 7 Production mode (game baked as /system/app, libs extracted) — ✅ DONE (base-v4)
+> - **Plus (beyond original plan):** black-wallpaper seam fix + host-side
+>   silent boot (base-v3); performance modes playable/hard/brutal + --headless;
+>   VirGL color fix; dev/test harness (test-apk/screenshot/logcat, JSON);
+>   single `omni.exe` + auto-download portable QEMU; **Lock Task Mode
+>   device-owner lockdown + RAM trims (base-v5)**.
+> - Phase 8 Linux/KVM+KSM port — ⬜ OPEN (optional; for concurrency beyond ~7).
+> - Phase 9 Deeper RAM/boot trimming (low_ram/zram/services) — ⬜ OPTIONAL
+>   (app-level RAM trims already done in v5; deeper service trims are risky,
+>   low payoff — boot is dominated by system_server/zygote).
 
 **Phase 0 — Housekeeping (10 min)**
 1. Create `images/` outside the project (e.g. `C:\Users\berat\OmniImages\`), move `base.qcow2` there as `base-v1.qcow2`.
