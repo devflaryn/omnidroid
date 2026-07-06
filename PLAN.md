@@ -172,10 +172,18 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
 >   VirGL color fix; dev/test harness (test-apk/screenshot/logcat, JSON);
 >   single `omni.exe` + auto-download portable QEMU; **Lock Task Mode
 >   device-owner lockdown + RAM trims (base-v5)**.
-> - Phase 8 Linux/KVM+KSM port — ⬜ OPEN (optional; for concurrency beyond ~7).
-> - Phase 9 Deeper RAM/boot trimming (low_ram/zram/services) — ⬜ OPTIONAL
->   (app-level RAM trims already done in v5; deeper service trims are risky,
->   low payoff — boot is dominated by system_server/zygote).
+> - Phase 8 Linux/KVM+KSM port — 🟨 HOST-SIDE PREP DONE 2026-07-06 (accel
+>   auto-detect + mem-merge, `omni ksm`, `bench-ksm` scaffold, per-platform
+>   images_dir; Windows verified unaffected). Blocked on hardware: first
+>   Linux box will be an Ubuntu 24.04 laptop with ~8 GB RAM — that box
+>   PROVES portability only (~3–4 brutal instances, FEWER than Windows'
+>   ~7); real scale needs a high-RAM Linux machine later.
+> - Phase 9 Deeper RAM/boot trimming (low_ram/zram/services) — 🟨 PARTIAL:
+>   Tier-1 round 2 applied 2026-07-06 (16 more pm-disable trims, measured
+>   −119 MB guest-used; host RSS unchanged on WHPX — page cache refills
+>   freed RAM). Remaining (low_ram/zram-resize/balloon/service trims) are
+>   PROPOSE-ONLY, risk-ranked in CHANGELOG; boot is dominated by
+>   system_server/zygote either way.
 
 **Phase 0 — Housekeeping (10 min)**
 1. Create `images/` outside the project (e.g. `C:\Users\berat\OmniImages\`), move `base.qcow2` there as `base-v1.qcow2`.

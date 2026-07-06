@@ -38,6 +38,12 @@ CONFIG_PATH = REPO / "configs" / "paths.json"
 ACCOUNTS_DIR = REPO / "accounts"
 QEMU_DIR = REPO / "qemu"          # local (auto-installed) QEMU lives here
 IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
+
+# Linux KSM (kernel samepage merging) sysfs interface. Dedups identical
+# guest RAM pages across instances (same immutable base => big overlap).
+KSM_DIR = Path("/sys/kernel/mm/ksm")
+PAGE_SIZE = 4096
 
 FIRST_BOOT_TIMEOUT = 1500   # first boot runs full dexopt; be patient
 NORMAL_BOOT_TIMEOUT = 360
@@ -56,8 +62,23 @@ def read_config():
     return json.loads(CONFIG_PATH.read_text())
 
 
+def resolve_images_dir(cfg):
+    """images_dir may be a plain string (legacy) or a per-platform dict
+    ({"windows": ..., "linux": ...}) so one checkout works on both hosts.
+    ~ is expanded (Linux convention: ~/OmniImages)."""
+    v = cfg["images_dir"]
+    if isinstance(v, dict):
+        key = "windows" if IS_WINDOWS else "linux"
+        v = v.get(key) or v.get("default")
+        if not v:
+            sys.exit(f"error: configs/paths.json images_dir has no entry "
+                     f"for platform '{key}'")
+    return str(Path(v).expanduser())
+
+
 def load_config():
     cfg = read_config()
+    cfg["images_dir"] = resolve_images_dir(cfg)   # normalized for callers
     base = cfg["bases"][cfg["current_base"]]
     images = Path(cfg["images_dir"])
     for key in ("disk", "kernel", "initrd"):
@@ -220,6 +241,82 @@ def host_rss_mb(pid):
         return None
 
 
+def host_mem_available_mb():
+    """Host free-for-use memory in MB (the number that decides how many
+    instances fit). Linux: MemAvailable. Windows: ullAvailPhys."""
+    try:
+        if IS_WINDOWS:
+            import ctypes
+
+            class MEMSTAT(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_uint32),
+                            ("dwMemoryLoad", ctypes.c_uint32),
+                            ("ullTotalPhys", ctypes.c_uint64),
+                            ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64),
+                            ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64),
+                            ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+            st = MEMSTAT()
+            st.dwLength = ctypes.sizeof(MEMSTAT)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(st)):
+                return None
+            return st.ullAvailPhys / (1024 * 1024)
+        txt = Path("/proc/meminfo").read_text()
+        m = re.search(r"MemAvailable:\s+(\d+) kB", txt)
+        return int(m.group(1)) / 1024 if m else None
+    except Exception:
+        return None
+
+
+# ---------- KSM (Linux kernel samepage merging) ----------
+
+def ksm_available():
+    return IS_LINUX and KSM_DIR.exists()
+
+
+def ksm_stats():
+    """Read all /sys/kernel/mm/ksm/* values (ints where possible).
+    None when KSM is not available (non-Linux or kernel without KSM)."""
+    if not ksm_available():
+        return None
+    out = {}
+    for f in sorted(KSM_DIR.iterdir()):
+        try:
+            v = f.read_text().strip()
+            out[f.name] = int(v) if v.lstrip("-").isdigit() else v
+        except OSError:
+            pass
+    return out
+
+
+def ksm_write(name, value):
+    """Write one KSM sysfs knob; exits with sudo advice on EPERM."""
+    try:
+        (KSM_DIR / name).write_text(str(value))
+    except PermissionError:
+        sys.exit(f"error: no permission to write {KSM_DIR / name} - "
+                 f"run with sudo (or install/enable ksmtuned)")
+
+
+def ksm_saved_mb(stats):
+    """Approx MB deduplicated: each page in pages_sharing points at a
+    shared page instead of owning its own copy."""
+    return stats.get("pages_sharing", 0) * PAGE_SIZE / (1024 * 1024)
+
+
+def pid_ksm_merged_mb(pid):
+    """Per-process KSM-merged pages (kernel >= 6.1 exposes
+    ksm_merging_pages). None if unsupported."""
+    try:
+        n = int(Path(f"/proc/{pid}/ksm_merging_pages").read_text())
+        return n * PAGE_SIZE / (1024 * 1024)
+    except Exception:
+        return None
+
+
 # ---------- adb / qmp ----------
 
 def adb(acct, *args, timeout=20, check=False):
@@ -266,6 +363,39 @@ def qmp(acct, execute, arguments=None, timeout=6):
 
 # ---------- qemu ----------
 
+def default_accel():
+    """Hypervisor auto-detect: WHPX on Windows, KVM elsewhere. Overridable
+    per-start with --accel (e.g. 'tcg' for a no-hypervisor smoke test)."""
+    return "whpx,kernel-irqchip=off" if IS_WINDOWS else "kvm"
+
+
+def machine_arg(accel):
+    """-machine string. On Linux/KVM add mem-merge=on explicitly: it marks
+    guest RAM MADV_MERGEABLE so KSM can dedup identical pages across
+    instances (it is the QEMU default, but distro builds vary — be
+    explicit; it is what the whole Linux scaling story depends on)."""
+    m = f"q35,accel={accel}"
+    if IS_LINUX and accel.split(",")[0] == "kvm":
+        m += ",mem-merge=on"
+    return m
+
+
+def check_accel():
+    """Linux preflight: warn loudly if /dev/kvm is unusable (QEMU would
+    fail or crawl under TCG). Windows/WHPX has no equivalent check."""
+    if not IS_LINUX:
+        return
+    import os
+    kvm = Path("/dev/kvm")
+    if not kvm.exists():
+        print("[accel] WARNING: /dev/kvm missing - KVM unavailable. "
+              "Enable VT-x/AMD-V in BIOS and install qemu-system-x86; "
+              "check with 'kvm-ok' (apt install cpu-checker).")
+    elif not os.access(kvm, os.R_OK | os.W_OK):
+        print("[accel] WARNING: no permission on /dev/kvm - add your user "
+              "to the kvm group: sudo usermod -aG kvm $USER (re-login).")
+
+
 # Per-instance performance modes. Counts are NEVER capped — these tune the
 # per-instance footprint; the host's free RAM decides how many run.
 #   gpu:   virgl    = -device virtio-gpu-gl + -display sdl,gl=on
@@ -297,12 +427,12 @@ def resolve_mode(cfg, name=None, gpu=None, mem=None, headless=None):
     return m
 
 
-def qemu_command(acct, cfg, dev, mode=None, dev_headless=False):
+def qemu_command(acct, cfg, dev, mode=None, dev_headless=False, accel=None):
     base = cfg["bases"][acct["base"]]
     images = Path(cfg["images_dir"])
     q = cfg["qemu"]
     d = account_dir(acct["name"])
-    accel = "whpx,kernel-irqchip=off" if IS_WINDOWS else "kvm"
+    accel = accel or default_accel()
     mode = mode or resolve_mode(cfg)
 
     append = ("stack_depot_disable=on cgroup_disable=pressure "
@@ -340,7 +470,7 @@ def qemu_command(acct, cfg, dev, mode=None, dev_headless=False):
 
     cmd = [
         qemu_bin("qemu-system-x86_64"),
-        "-machine", f"q35,accel={accel}",
+        "-machine", machine_arg(accel),
         "-cpu", "qemu64",
         "-smp", str(smp),
         "-m", str(mem),
@@ -365,7 +495,8 @@ def qemu_command(acct, cfg, dev, mode=None, dev_headless=False):
     return cmd
 
 
-def spawn_qemu(acct, cfg, dev, mode=None, dev_headless=True):
+def spawn_qemu(acct, cfg, dev, mode=None, dev_headless=True, accel=None):
+    check_accel()
     d = account_dir(acct["name"])
     log = open(d / "qemu.log", "w")
     kwargs = {}
@@ -376,7 +507,8 @@ def spawn_qemu(acct, cfg, dev, mode=None, dev_headless=True):
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(
-        qemu_command(acct, cfg, dev, mode, dev_headless=dev_headless),
+        qemu_command(acct, cfg, dev, mode, dev_headless=dev_headless,
+                     accel=accel),
         stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
@@ -528,6 +660,29 @@ TRIM_PACKAGES = (
     "net.sourceforge.opencamera",             # preinstalled camera
     "com.termux",                             # preinstalled terminal
     "com.amaze.filemanager",                  # preinstalled file manager
+    # Tier-1 trims (2026-07-06, measured -119 MB guest-used w/ Roblox).
+    # Persistent/running services a single-game kiosk never needs:
+    "org.omnirom.omnijaws",                   # weather service (was running)
+    "org.lineageos.updater",                  # OTA updater (persistent)
+    "com.android.touch.gestures",             # Bliss gestures (persistent;
+                                              # Lock Task blocks them anyway)
+    # Boot-spawned apps that idle in cached state (page-touch avoidance):
+    "com.farmerbb.taskbar",                   # taskbar main pkg
+    "io.chaldeaprjkt.gamespace",              # game overlay
+    "player.phonograph.plus",                 # music player
+    "com.android.deskclock",
+    "com.android.dialer",                     # dialer UI (telephony svc kept)
+    "com.android.contacts",
+    "com.android.messaging",
+    "com.google.android.projection.gearhead",  # Android Auto
+    "com.google.android.gm.exchange",
+    "com.google.android.syncadapters.calendar",
+    "com.android.printspooler",
+    "com.android.imsserviceentitlement",
+    "com.android.cellbroadcastreceiver.module",
+    # Deliberately KEPT: GMS/Play Store (Play Integrity), latin IME (login
+    # typing), Settings (FallbackHome), managedprovisioning (device owner),
+    # networkstack / com.android.phone / media provider (stability).
 )
 
 
@@ -659,7 +814,9 @@ def _cmd_start(args):
     dev = args.dev or first          # first boot always uses the dev profile
     mode = resolve_mode(cfg, args.mode, gpu=args.gpu, mem=args.mem,
                         headless=args.headless or None)
-    pid = spawn_qemu(acct, cfg, dev=dev, mode=None if dev else mode)
+    accel = getattr(args, "accel", None)
+    pid = spawn_qemu(acct, cfg, dev=dev, mode=None if dev else mode,
+                     accel=accel)
     # VirGL can fail to init on some hosts; detect an immediate QEMU exit
     # and fall back to software so the instance still comes up.
     if not dev and mode["gpu"] == "virgl":
@@ -669,7 +826,7 @@ def _cmd_start(args):
                   f"falling back to software rendering")
             mode = resolve_mode(cfg, args.mode, gpu="software", mem=args.mem,
                                 headless=args.headless or None)
-            pid = spawn_qemu(acct, cfg, dev=False, mode=mode)
+            pid = spawn_qemu(acct, cfg, dev=False, mode=mode, accel=accel)
     modestr = "dev" if dev else f"{mode['name']}/{mode['gpu']}" + (
         "/headless" if mode["headless"] else "")
     print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr}, "
@@ -1040,6 +1197,167 @@ def cmd_qemu_info(args):
     }, indent=2))
 
 
+def cmd_ksm(args):
+    """Inspect/control Linux KSM. On Windows: documented no-op (KSM is a
+    Linux kernel feature; WHPX shares nothing between VMs)."""
+    if IS_WINDOWS:
+        print("ksm: no-op on Windows. KSM (kernel samepage merging) is a "
+              "Linux kernel feature - on the Linux/KVM host it dedups "
+              "identical guest pages across instances. Nothing to do here.")
+        return
+    if not ksm_available():
+        sys.exit("error: /sys/kernel/mm/ksm not present - kernel built "
+                 "without KSM")
+    if args.action == "on":
+        if args.aggressive:
+            ksm_write("pages_to_scan", 1000)
+            ksm_write("sleep_millisecs", 20)
+        ksm_write("run", 1)
+        print("[ksm] scanning enabled"
+              + (" (aggressive)" if args.aggressive else ""))
+    elif args.action == "off":
+        # run=0 stops scanning but keeps already-merged pages shared;
+        # run=2 would force-unmerge everything (not offered: it spikes RAM).
+        ksm_write("run", 0)
+        print("[ksm] scanning stopped (existing merges kept)")
+    st = ksm_stats()
+    st["_deduped_mb"] = round(ksm_saved_mb(st), 1)
+    print(json.dumps(st, indent=2))
+
+
+def _wait_game_running(acct, pkg, timeout=180):
+    """Poll until the game process exists in the guest (kiosk launches it
+    on boot). Process presence, not foreground - same rule as the watchdog."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if adb(acct, "shell", "pidof", pkg, timeout=8).stdout.strip():
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
+
+
+def _ksm_wait_settle(settle_secs, timeout=600):
+    """Block until KSM pages_sharing stops moving (<1% drift held for
+    settle_secs). Returns the settled pages_sharing value."""
+    last = None
+    stable_since = None
+    start = time.time()
+    while time.time() - start < timeout:
+        cur = ksm_stats().get("pages_sharing", 0)
+        if last is not None and abs(cur - last) <= max(last, 100) * 0.01:
+            stable_since = stable_since or time.time()
+            if time.time() - stable_since >= settle_secs:
+                return cur
+        else:
+            stable_since = None
+        last = cur
+        time.sleep(10)
+    return last or 0
+
+
+def cmd_bench_ksm(args):
+    """Measure REAL instances-per-GB with KSM on a Linux/KVM host.
+
+    SCAFFOLD - written on Windows 2026-07-06, first executed when the
+    Ubuntu laptop exists; treat the first Linux run as its test.
+
+    Method (honest marginal cost, not RSS - RSS double-counts pages KSM
+    shares): start identical instances one at a time (default brutal/
+    headless), each to boot_completed + game process up; after each, wait
+    for pages_sharing to plateau, then record the marginal drop in host
+    MemAvailable. Stops when MemAvailable < --floor-mb: the RAM floor ends
+    the bench, never a count cap. One JSON line per step + summary table.
+    """
+    if IS_WINDOWS:
+        sys.exit("bench-ksm needs a Linux host with KVM+KSM (Phase 8 "
+                 "measurement tool; Windows/WHPX shares nothing).")
+    ensure_qemu()
+    check_accel()
+    if not ksm_available():
+        sys.exit("error: /sys/kernel/mm/ksm not present on this kernel")
+    cfg = load_config()
+    if ksm_stats().get("run") != 1:
+        print("[bench] enabling KSM (aggressive scan for the bench)")
+        ksm_write("pages_to_scan", 1000)
+        ksm_write("sleep_millisecs", 20)
+        ksm_write("run", 1)
+
+    base_game = read_config().get("base_game", {}).get(cfg["current_base"])
+    if not base_game and not args.apk:
+        sys.exit("error: current base has no pre-installed game; pass "
+                 "--apk <game.apk> so instances run the real workload")
+
+    base_avail = host_mem_available_mb()
+    print(f"[bench] baseline: MemAvailable {base_avail:.0f} MB, "
+          f"pages_sharing {ksm_stats().get('pages_sharing', 0)}, "
+          f"mode {args.mode}, floor {args.floor_mb} MB")
+    rows = []
+    prev_avail = base_avail
+    for i in range(1, args.max + 1):
+        name = f"{args.prefix}{i}"
+        if not (account_dir(name) / "account.json").exists():
+            import argparse as _a
+            print(f"[bench] creating {name} (one-time first-boot dexopt - "
+                  f"slow now, fast on reruns)")
+            cmd_create(_a.Namespace(
+                name=name, no_provision=False,
+                data_size=cfg["qemu"]["data_disk_size"]))
+        acct = load_account(name)
+        pkg = acct.get("game_package") or base_game
+        if not running_pid(name):
+            mode = resolve_mode(cfg, args.mode, headless=True)
+            spawn_qemu(acct, cfg, dev=False, mode=mode)
+        if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, f"bench {name}"):
+            print(f"[bench] {name} boot timeout - stopping bench")
+            break
+        post_boot(acct, f"bench {name}")
+        if args.apk and not acct.get("game_package"):
+            r = adb(acct, "install", "-r", "-g", "--no-incremental",
+                    args.apk, timeout=600)
+            if "Success" in (r.stdout + r.stderr):
+                pkg = apk_package_name(args.apk) or pkg
+                if pkg:
+                    acct["game_package"] = pkg
+                    save_account(acct)
+                    adb(acct, "shell", "settings", "put", "global",
+                        "omni_game_package", pkg, timeout=10)
+        if pkg and not _wait_game_running(acct, pkg):
+            print(f"[bench] WARNING: {pkg} never came up in {name}; "
+                  f"numbers for this step measure an idle instance")
+        sharing = _ksm_wait_settle(args.settle_secs)
+        avail = host_mem_available_mb()
+        st = ksm_stats()
+        pids = [running_pid(f"{args.prefix}{k}") for k in range(1, i + 1)]
+        rss = sum(r for r in (host_rss_mb(p) for p in pids if p) if r)
+        row = {"n": i, "name": name,
+               "mem_available_mb": round(avail),
+               "marginal_mb": round(prev_avail - avail),
+               "sum_qemu_rss_mb": round(rss),
+               "ksm_pages_sharing": sharing,
+               "ksm_deduped_mb": round(ksm_saved_mb(st), 1)}
+        if isinstance(st.get("general_profit"), int):
+            row["ksm_general_profit_mb"] = round(
+                st["general_profit"] / (1024 * 1024), 1)
+        rows.append(row)
+        print(json.dumps(row))
+        prev_avail = avail
+        if avail < args.floor_mb:
+            print(f"[bench] MemAvailable {avail:.0f} < floor "
+                  f"{args.floor_mb} MB - stopping (RAM floor, not a cap)")
+            break
+    print("\n[bench]  n  marginal_MB  avail_MB  ksm_deduped_MB")
+    for r in rows:
+        print(f"[bench] {r['n']:>2}  {r['marginal_mb']:>11}  "
+              f"{r['mem_available_mb']:>8}  {r['ksm_deduped_mb']:>14}")
+    if rows and not args.keep:
+        print("[bench] stopping bench instances (--keep leaves them up)")
+        for r in rows:
+            _shutdown(load_account(r["name"]), f"bench {r['name']}")
+
+
 def cmd_list(args):
     accts = all_accounts()
     if not accts:
@@ -1062,6 +1380,10 @@ def cmd_list(args):
             except Exception:
                 pass
             line += (f"  host-rss {rss:.0f} MB" if rss else "") + guest
+            if IS_LINUX:
+                merged = pid_ksm_merged_mb(pid)
+                if merged is not None:
+                    line += f"  ksm-merged {merged:.0f} MB"
         print(line)
 
 
@@ -1365,6 +1687,9 @@ def main():
                    help="override guest RAM in MB")
     s.add_argument("--headless", action="store_true",
                    help="no display window (any mode); drive via adb")
+    s.add_argument("--accel", default=None,
+                   help="override hypervisor (auto: Windows=whpx, "
+                        "Linux=kvm). E.g. 'tcg' for a no-hypervisor test")
     s.add_argument("--dev", action="store_true")
     s.add_argument("--wait", action="store_true",
                    help="block until boot completes (default: detach)")
@@ -1446,6 +1771,39 @@ def main():
                         help="show resolved QEMU path / install if missing")
     qi.add_argument("--install", action="store_true")
     qi.set_defaults(func=cmd_qemu_info)
+
+    km = sub.add_parser("ksm",
+                        help="Linux KSM status/on/off (clean no-op on "
+                             "Windows)")
+    km.add_argument("action", nargs="?", default="status",
+                    choices=["status", "on", "off"])
+    km.add_argument("--aggressive", action="store_true",
+                    help="with 'on': pages_to_scan=1000, sleep=20ms "
+                         "(faster dedup, more ksmd CPU)")
+    km.set_defaults(func=cmd_ksm)
+
+    bk = sub.add_parser("bench-ksm",
+                        help="Linux-only: measure real instances-per-GB "
+                             "with KSM (Phase 8; scaffold until the Linux "
+                             "host exists)")
+    bk.add_argument("--mode", choices=list(MODES), default="brutal")
+    bk.add_argument("--max", type=int, default=99,
+                    help="safety bound on bench steps (the RAM floor is "
+                         "what actually stops the bench)")
+    bk.add_argument("--floor-mb", type=int, default=2048, dest="floor_mb",
+                    help="stop when host MemAvailable drops below this")
+    bk.add_argument("--settle-secs", type=int, default=60,
+                    dest="settle_secs",
+                    help="KSM pages_sharing must be stable this long "
+                         "before measuring")
+    bk.add_argument("--apk", default=None,
+                    help="game APK to install per instance (needed on a "
+                         "dev base with no pre-installed game)")
+    bk.add_argument("--prefix", default="bench",
+                    help="bench account name prefix")
+    bk.add_argument("--keep", action="store_true",
+                    help="leave bench instances running afterwards")
+    bk.set_defaults(func=cmd_bench_ksm)
 
     bs = sub.add_parser("bases", help="list registered bases + current")
     bs.set_defaults(func=cmd_bases)

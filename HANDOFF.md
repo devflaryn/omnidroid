@@ -81,8 +81,10 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
   lock screen, marks setup complete, suppresses immersive confirmation,
   reverts any stale `/data` kiosk override (`uninstall-system-updates`), sets
   kiosk as HOME + disables Bliss launchers, sets device owner (lockdown),
-  sets black wallpaper, sets the game package, disables 7 unneeded apps +
-  zeroes animations (RAM trim), disables the setup wizard.
+  sets black wallpaper, sets the game package, disables 23 unneeded apps
+  (`TRIM_PACKAGES`: v5's 7 + 16 Tier-1 trims of 2026-07-06) + zeroes
+  animations (RAM trim), disables the setup wizard. Existing accounts get
+  new trims on their next re-provision (`update-all`/`update-base`).
 
 ## Base versions (immutable, versioned, self-contained after flatten)
 | Base | Contents | Role |
@@ -138,8 +140,20 @@ Bases / rollout:
   `omni rebuild-base --game roblox.apk`
 - `update-kiosk [--apk ...]` — ship a new kiosk launcher in a NEW base
   version (uses `launcher/build/omni-kiosk.apk` by default). Then `update-all`.
-QEMU:
+QEMU / platform:
 - `qemu-info [--install]` — show resolved QEMU path / trigger auto-install.
+- `start --accel <str>` — override the auto-detected hypervisor
+  (Windows→`whpx,kernel-irqchip=off`, Linux→`kvm` + `-machine mem-merge=on`
+  so KSM can dedup guest pages).
+- `ksm [status|on|off] [--aggressive]` — Linux KSM control via
+  `/sys/kernel/mm/ksm/*` (prints stats + MB deduped). Clean no-op message
+  on Windows.
+- `bench-ksm [--mode brutal] [--floor-mb N] [--apk ...]` — Linux-only
+  Phase 8 measurement: adds identical headless instances one at a time,
+  waits for `pages_sharing` to plateau, records the **marginal drop in
+  host MemAvailable** per instance (RSS double-counts KSM-shared pages).
+  Stops at the RAM floor, never a count cap. **Scaffold — first run on
+  the future Linux box is its test.**
 
 ## Performance modes (`--mode`, per-instance; counts NEVER capped)
 - **playable** (default): VirGL (`virtio-gpu-gl` + `-display sdl,gl=on`),
@@ -167,6 +181,13 @@ likely fix software too (deferred).
   WSL → ~13–19 GB free); ~**7–8** with them closed (~25–27 GB free).
 - Rule: keep ~2 GB OS headroom; stop when free RAM nears ~3 GB.
 - v5 RAM trims save **~285 MB/instance** (~2289→~2004 MB guest with Roblox).
+- **Tier-1 trims round 2 (2026-07-06): −119 MB more guest-used**
+  (1789→1670 MB, fixed T+480 s protocol, Roblox at login; 206→191 guest
+  processes). **Host RSS did NOT move** (3195 MB at `-m 3072`): on WHPX
+  the guest page cache expands into freed RAM, so QEMU touches ~its full
+  allocation regardless. Guest trims = in-guest headroom (safer at
+  brutal's 2 GB), NOT host RAM. Host-side levers: lower `-m`,
+  virtio-balloon (proposed, unapproved), or Linux+KSM.
 - **Boot time ~35 s cold, unchanged by trims** (trimmed apps aren't on the
   boot-critical path — they save RAM, not boot time).
 
@@ -203,9 +224,28 @@ likely fix software too (deferred).
    booted writable.
 
 ## Open / optional items (nothing required)
-- **Linux/KVM + KSM port** — to scale concurrency beyond ~7 (KSM dedups
-  identical pages across clone VMs). The manager already branches accel by
-  platform; needs real testing on Linux.
+- **Linux/KVM + KSM port — HOST-SIDE CODE PREP DONE (2026-07-06), hardware
+  pending.** The manager is Linux-ready without a Linux host ever having
+  run it: accel auto-detect (WHPX/KVM) + `--accel` override, `-machine
+  mem-merge=on` on KVM, `/dev/kvm` preflight warnings, `omni ksm`,
+  `omni bench-ksm` (measurement scaffold), per-platform `images_dir`
+  (`configs/paths.json` maps windows→`C:/Users/berat/OmniImages`,
+  linux→`~/OmniImages`), KSM-aware `list --stats`. Windows verified
+  unaffected (QEMU cmdline byte-identical; fresh-account regression run).
+  Still TODO on real hardware: KVM+KSM bench, ARM-translation + full kiosk
+  parity gates, cross-platform account portability test.
+  **Honest expectation for the planned first Linux box (Ubuntu 24.04
+  laptop, ~8 GB RAM): it PROVES the port works; it does NOT unlock scale.**
+  ~6 GB usable after Ubuntu ≈ **3–4 brutal instances even with KSM** —
+  FEWER than the ~7 the 32 GB Windows host runs. Scaling past Windows
+  needs a high-RAM Linux machine later; don't oversell the laptop numbers.
+- **RAM proposals awaiting approval (from the 2026-07-06 measured pass;
+  details in CHANGELOG):** Tier 2 = virtio-balloon +
+  `free-page-reporting=on` (+ optional QMP balloon squeeze after game
+  launch) — the only Windows-side lever that could make host RSS track
+  real guest usage; risk = over-squeeze → lmkd kills the game. Tier 3
+  (propose-only, base changes): `ro.config.low_ram=true`, zram resize,
+  telephony/SE/contacts-provider disables. Nothing applied.
 - **Deeper boot-service trimming** — risky, low payoff (boot is dominated by
   system_server/zygote, not the trimmed apps). Only behind the regression check.
 - **Production base with lockdown** — build via `rebuild-base --game` on v5

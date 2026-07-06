@@ -6,6 +6,81 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Manager — 2026-07-06 — Tier-1 RAM trims round 2 (measured, −119 MB guest)
+
+Measure-first pass on a fresh v5 account (`regcheck`, hard/headless,
+Roblox at login). Fixed A/B protocol: cold boot → Roblox process up →
+measure at exactly T+480 s after `boot_completed`.
+
+**Applied (16 more `pm disable-user` packages — same proven per-`/data`
+reversible mechanism as v5's 7):** the running weather service
+(`org.omnirom.omnijaws`), two persistents (`org.lineageos.updater` OTA
+updater, `com.android.touch.gestures` Bliss gestures — Lock Task blocks
+gestures anyway), and 13 boot-spawned apps idling in cached state
+(taskbar main pkg, gamespace, phonograph music player, deskclock, dialer
+UI, contacts, messaging, Android Auto, gm.exchange, calendar sync,
+printspooler, imsserviceentitlement, cellbroadcast). All folded into
+`TRIM_PACKAGES`; existing accounts pick them up on next re-provision
+(`update-all` or `update-base`).
+
+**Measured:** guest-used **1789 → 1670 MB (−119 MB)**, guest processes
+206 → 191, boot 36 → 31 s (noise-level). zram (1.5 GB zstd, on by
+default via `persist.sys.zram_enabled=1`) confirmed working, ~360 MB used.
+
+**Honest finding — host RSS UNCHANGED (3195 MB at `-m 3072`):** on
+Windows/WHPX the guest page cache expands into whatever RAM the trims
+free, so QEMU still touches ~its full allocation and Windows shares/
+reclaims nothing. Guest-side trims buy in-guest headroom (safer at
+brutal's 2 GB, less lmkd pressure) — NOT host RAM. Moving the host
+number needs `-m` reduction, ballooning (proposed below), or Linux+KSM.
+
+**Regression passed on the trimmed instance:** `ro.dalvik.vm.native.bridge
+= libndk_translation.so`, Roblox foreground + rendering (screencap), kiosk
+still DeviceOwner (Lock Task active).
+
+**Proposed, NOT applied (risk-ranked, need approval):**
+- *Tier 2 (host-side flags, medium):* `virtio-balloon` +
+  `free-page-reporting=on`, optionally manager-driven QMP `balloon`
+  squeeze after game launch — the only Windows-side lever that could make
+  host RSS track real guest usage. Risk: over-squeeze → lmkd kills the
+  game; needs a measured trial.
+- *Tier 3 (base changes / risky, propose-only):* `ro.config.low_ram=true`
+  (build.prop — outside the allowed change surface as-is; may break
+  webview/GMS/Roblox login), zram resize (ramdisk fstab), disabling
+  telephony (`com.android.phone`) / `com.android.se` / contacts provider
+  (crash-loop risk, modest payoff).
+- Kept untouched: GMS + Play Store, latin IME, Settings (FallbackHome),
+  managedprovisioning, /system libs + bridge props (off-limits).
+
+## Manager — 2026-07-06 — Linux/KVM+KSM readiness (host-side prep; no Linux hardware yet)
+
+Phase 8 groundwork done **entirely on Windows** — code paths are correct
+and guarded, NOT simulated, and untested-on-Linux parts say so:
+- **Accel auto-detect**: Windows→`whpx,kernel-irqchip=off`, Linux→`kvm`
+  with explicit `-machine mem-merge=on` (marks guest RAM MADV_MERGEABLE so
+  KSM can dedup identical pages across instances). `start --accel <str>`
+  overrides. Linux preflight warns if `/dev/kvm` is missing/unwritable.
+- **`omni ksm [status|on|off] [--aggressive]`** — drives
+  `/sys/kernel/mm/ksm/*`, prints stats + MB deduped; clean no-op message
+  on Windows. `list --stats` shows per-instance `ksm-merged` MB on Linux.
+- **`omni bench-ksm`** — Phase 8 measurement scaffold (Linux-guarded):
+  adds identical headless instances one at a time, waits for
+  `pages_sharing` plateau, records the **marginal MemAvailable drop** per
+  instance (RSS double-counts shared pages), stops at a RAM floor (never
+  a count cap), JSON per step + summary; stops instances unless `--keep`.
+- **Per-platform `images_dir`** — `configs/paths.json` now maps
+  windows→`C:/Users/berat/OmniImages`, linux→`~/OmniImages` (legacy string
+  form still accepted; `~` expanded) so one checkout works on both hosts.
+- **Windows regression**: generated QEMU command line verified
+  byte-identical to pre-change (production and dev profiles); CLI sanity
+  (`list`/`bases`/`ksm`/`qemu-info`) OK; fresh v5 account end-to-end
+  (boot → kiosk → Roblox renders via libndk) re-run.
+
+**Expectation note (do not oversell):** the planned first Linux host is an
+8 GB Ubuntu 24.04 laptop → ~6 GB usable → **~3–4 brutal instances even
+with KSM**, fewer than Windows' ~7. The laptop proves cross-platform
+parity; real scale needs a high-RAM Linux box.
+
 ## base-v5 — 2026-07-06 — status-bar lockdown + faster boot / less RAM
 
 **Problem confirmed on a fresh v4 kiosk account:** swiping down still opened
