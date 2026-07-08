@@ -1,7 +1,8 @@
 {
   "images_dir": {
     "windows": "C:/Users/berat/OmniImages",
-    "linux": "~/OmniImages"
+    "linux": "~/OmniImages",
+    "darwin": "~/OmniImages"
   },
   "current_base": "v5",
   "data_template": "data-template-8g.qcow2",
@@ -39,6 +40,15 @@
       "initrd": "base-v5.initrd.img",
       "src": "/android-2024-10-11",
       "notes": "updated kiosk (Lock Task lockdown + boot/RAM trims)"
+    },
+    "arm": {
+      "type": "arm-uefi",
+      "base_disk": "base_arm.qcow2",
+      "system": "base_arm_system.qcow2",
+      "data": "base_arm_data.qcow2",
+      "efivars": "base_arm_efivars.fd",
+      "src": "https://github.com/jqssun/android-lineage-qemu (LineageOS 23.2 arm64, virtio_arm64only)",
+      "notes": "auto-registered arm64/UEFI base (LineageOS 23.2, kiosk+device-owner provisioned matched pair)"
     }
   },
   "qemu": {

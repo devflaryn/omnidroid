@@ -41,6 +41,12 @@ ACCOUNTS_DIR = REPO / "accounts"
 QEMU_DIR = REPO / "qemu"          # local (auto-installed) QEMU lives here
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
+IS_MACOS = platform.system() == "Darwin"
+# Host CPU architecture. arm64 Macs (Apple Silicon) run the arm64 base
+# natively under HVF with NO translation layer; x86_64 hosts run the Bliss
+# x86 base under WHPX/KVM. Base selection keys off this (see host_arch_base).
+HOST_ARCH = platform.machine().lower()
+IS_ARM64_HOST = HOST_ARCH in ("arm64", "aarch64")
 
 # Linux KSM (kernel samepage merging) sysfs interface. Dedups identical
 # guest RAM pages across instances (same immutable base => big overlap).
@@ -61,12 +67,80 @@ DEFAULT_QEMU_URL = ("https://qemu.weilnetz.de/w64/"
 # base ("src") — a future downloaded base can carry its own.
 DEFAULT_SRC = "/android-2024-10-11"
 
+# ---------- base types ----------
+# "x86-bliss"  : Bliss OS x86_64, direct kernel boot (-kernel/-initrd + SRC=/
+#                DATA= append). Cheap disposable overlay on a shared immutable
+#                base; kiosk baked in /system; provisioning writes /data.
+# "arm-uefi"   : LineageOS arm64, UEFI/GRUB disk boot (EDK2 pflash + GPT vda).
+#                Runs NATIVELY under HVF on Apple Silicon — no translation.
+#                /data is file-based-encrypted (FBE) with keys in /metadata
+#                (a partition on the vda system overlay), so the system
+#                overlay and the /data disk are a MATCHED PAIR captured
+#                together at provisioning time — a fresh overlay against a
+#                provisioned /data fails with init_user0_failed. An account
+#                therefore copies the provisioned (system-overlay, data,
+#                efivars) trio rather than provisioning on first boot.
+BASE_TYPE_X86 = "x86-bliss"
+BASE_TYPE_ARM = "arm-uefi"
+
+
+def base_type(base):
+    return base.get("type", BASE_TYPE_X86)
+
+
+def acct_base_is_arm(acct):
+    """True if this account's base is arm-uefi (reads config; safe/cheap)."""
+    try:
+        b = (read_config().get("bases") or {}).get(acct.get("base"), {})
+        return base_type(b) == BASE_TYPE_ARM
+    except Exception:
+        return False
+
+
+# arm-uefi base default filenames in images_dir (a future downloaded base
+# can override any of these in its config entry).
+ARM_BASE_DISK = "base_arm.qcow2"            # pristine system, shared backing
+ARM_BASE_SYSTEM = "base_arm_system.qcow2"   # provisioned overlay (FBE keys)
+ARM_BASE_DATA = "base_arm_data.qcow2"       # provisioned /data (kiosk + DO)
+ARM_BASE_EFIVARS = "base_arm_efivars.fd"    # provisioned UEFI vars
+ARM_BASE_TAG = "arm"
+
+# EDK2 aarch64 firmware CODE (read-only); resolved from the QEMU install.
+# On macOS/brew it ships inside the qemu Cellar; overridable via config
+# qemu.arm_edk2_code.
+ARM_EDK2_CANDIDATES = (
+    "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
+    "/usr/local/share/qemu/edk2-aarch64-code.fd",
+    "/usr/share/qemu/edk2-aarch64-code.fd",
+)
+
+
+def arm_edk2_code():
+    """Absolute path to edk2-aarch64-code.fd (UEFI firmware CODE volume).
+    Config qemu.arm_edk2_code wins; else the brew Cellar (globbed, newest);
+    else the well-known share dirs."""
+    import glob
+    try:
+        cfgd = read_config().get("qemu", {}).get("arm_edk2_code")
+    except Exception:
+        cfgd = None
+    if cfgd and Path(cfgd).exists():
+        return cfgd
+    cellar = sorted(glob.glob(
+        "/opt/homebrew/Cellar/qemu/*/share/qemu/edk2-aarch64-code.fd"))
+    for cand in ([cellar[-1]] if cellar else []) + list(ARM_EDK2_CANDIDATES):
+        if Path(cand).exists():
+            return cand
+    return None
+
+
 # Config bootstrapped on a blank deployment (exe dropped into a new
 # folder): any command self-creates this, then base files are copied (or
 # later: downloaded) into images_dir and auto-registered.
 DEFAULT_CONFIG = {
     "images_dir": {"windows": "C:/Users/berat/OmniImages",
-                   "linux": "~/OmniImages"},
+                   "linux": "~/OmniImages",
+                   "darwin": "~/OmniImages"},
     "current_base": None,
     "data_template": "data-template-8g.qcow2",
     "default_src": DEFAULT_SRC,
@@ -132,8 +206,11 @@ def resolve_images_dir(cfg):
     ~ is expanded (Linux convention: ~/OmniImages)."""
     v = cfg["images_dir"]
     if isinstance(v, dict):
-        key = "windows" if IS_WINDOWS else "linux"
-        v = v.get(key) or v.get("default")
+        key = "windows" if IS_WINDOWS else "darwin" if IS_MACOS else "linux"
+        # Back-compat: older configs only have windows/linux; macOS falls
+        # back to the linux path convention (~/OmniImages).
+        v = v.get(key) or (v.get("linux") if IS_MACOS else None) \
+            or v.get("default")
         if not v:
             sys.exit(f"error: configs/paths.json images_dir has no entry "
                      f"for platform '{key}'")
@@ -186,10 +263,35 @@ def autoregister_bases():
                               "src": raw.get("default_src", DEFAULT_SRC),
                               "notes": "auto-registered from images_dir"}
                 new.append(tag)
+    # arm-uefi base: register the provisioned matched-pair trio if present
+    # (base_arm.qcow2 backing + base_arm_system.qcow2 overlay + _data + _efivars).
+    # Independent of the x86 vN scheme; only ADDS an "arm" entry.
+    if (ARM_BASE_TAG not in bases and images.exists()
+            and (images / ARM_BASE_DISK).exists()
+            and (images / ARM_BASE_SYSTEM).exists()
+            and (images / ARM_BASE_DATA).exists()):
+        bases[ARM_BASE_TAG] = {
+            "type": BASE_TYPE_ARM,
+            "base_disk": ARM_BASE_DISK,
+            "system": ARM_BASE_SYSTEM,
+            "data": ARM_BASE_DATA,
+            "efivars": ARM_BASE_EFIVARS,
+            "src": "https://github.com/jqssun/android-lineage-qemu "
+                   "(LineageOS 23.2 arm64, virtio_arm64only)",
+            "notes": "auto-registered arm64/UEFI base (LineageOS 23.2, "
+                     "kiosk+device-owner provisioned matched pair)"}
+        new.append(ARM_BASE_TAG)
     changed = bool(new)
     if not raw.get("current_base") and bases:
-        raw["current_base"] = max(
-            bases, key=lambda t: int(re.sub(r"\D", "", t) or 0))
+        # Prefer an arm base on an arm64 host, else the highest x86 vN.
+        x86 = [t for t in bases if base_type(bases[t]) == BASE_TYPE_X86]
+        if IS_ARM64_HOST and ARM_BASE_TAG in bases:
+            raw["current_base"] = ARM_BASE_TAG
+        elif x86:
+            raw["current_base"] = max(
+                x86, key=lambda t: int(re.sub(r"\D", "", t) or 0))
+        else:
+            raw["current_base"] = next(iter(bases))
         changed = True
     if changed:
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
@@ -199,6 +301,33 @@ def autoregister_bases():
     return raw, new
 
 
+def effective_base_tag(cfg):
+    """The base tag to use, selected by HOST ARCHITECTURE. On an arm64 host
+    prefer an arm-uefi base (config 'current_base_arm', else the first
+    arm-uefi base, else 'arm'); on x86 hosts use current_base. This keeps
+    x86 behavior byte-identical while letting the same checkout pick the
+    arm base automatically on Apple Silicon."""
+    bases = cfg.get("bases") or {}
+    if IS_ARM64_HOST:
+        cand = cfg.get("current_base_arm")
+        if cand and cand in bases and base_type(bases[cand]) == BASE_TYPE_ARM:
+            return cand
+        for t, b in bases.items():
+            if base_type(b) == BASE_TYPE_ARM:
+                return t
+    return cfg.get("current_base")
+
+
+def base_missing_files(images, base):
+    """Per-type list of a base's missing files (absolute paths)."""
+    if base_type(base) == BASE_TYPE_ARM:
+        keys = ("base_disk", "system", "data")   # efivars optional
+        return [str(images / base[k]) for k in keys
+                if base.get(k) and not (images / base[k]).exists()]
+    return [str(images / base[k]) for k in ("disk", "kernel", "initrd")
+            if not (images / base[k]).exists()]
+
+
 def load_config():
     """Config for commands that NEED a bootable base. Never tracebacks on
     a fresh/incomplete install: auto-registers base files that appeared in
@@ -206,15 +335,14 @@ def load_config():
     cfg, _ = autoregister_bases()
     cfg["images_dir"] = resolve_images_dir(cfg)   # normalized for callers
     images = Path(cfg["images_dir"])
-    tag = cfg.get("current_base")
+    # Host architecture selects the base (arm64 -> arm-uefi; x86 -> current).
+    tag = effective_base_tag(cfg)
+    cfg["_effective_base"] = tag
     bases = cfg.get("bases") or {}
     if not tag or tag not in bases:
         sys.exit("error: no base image is registered - cannot create or "
                  "boot instances." + base_setup_help(images, cfg))
-    base = bases[tag]
-    missing = [str(images / base[key]) for key in ("disk", "kernel",
-                                                   "initrd")
-               if not (images / base[key]).exists()]
+    missing = base_missing_files(images, bases[tag])
     if missing:
         sys.exit(f"error: base '{tag}' is registered but its files are "
                  f"missing:\n  " + "\n  ".join(missing)
@@ -239,9 +367,16 @@ def qemu_bin(tool):
     return tool          # PATH
 
 
+def qemu_system_name():
+    """The QEMU system emulator this HOST needs: aarch64 on Apple Silicon
+    (arm64 guest, native under HVF), x86_64 everywhere else."""
+    return "qemu-system-aarch64" if (IS_MACOS and IS_ARM64_HOST) \
+        else "qemu-system-x86_64"
+
+
 def _qemu_present():
     import shutil
-    p = qemu_bin("qemu-system-x86_64")
+    p = qemu_bin(qemu_system_name())
     return Path(p).exists() or shutil.which(p) is not None
 
 
@@ -251,6 +386,11 @@ def ensure_qemu():
     downloaded on demand. No-op when QEMU is already available."""
     if _qemu_present():
         return
+    if IS_MACOS:
+        # macOS policy: SYSTEM QEMU only (Homebrew), like Linux.
+        sys.exit("QEMU not found. Install it with Homebrew:\n"
+                 "  brew install qemu android-platform-tools\n"
+                 "then re-run (see: omnidroid setup)")
     if not IS_WINDOWS:
         # Linux policy: SYSTEM QEMU only (no portable download).
         sys.exit("QEMU not found. Install the system packages:\n"
@@ -272,7 +412,7 @@ def ensure_qemu():
         sys.exit(f"[qemu] auto-install failed (exit {r.returncode}). "
                  f"Install QEMU manually or set qemu.dir in "
                  f"configs/paths.json")
-    print(f"[qemu] ready: {qemu_bin('qemu-system-x86_64')}")
+    print(f"[qemu] ready: {qemu_bin(qemu_system_name())}")
 
 
 def account_dir(name):
@@ -530,9 +670,14 @@ def qmp(acct, execute, arguments=None, timeout=6):
 # ---------- qemu ----------
 
 def default_accel():
-    """Hypervisor auto-detect: WHPX on Windows, KVM elsewhere. Overridable
-    per-start with --accel (e.g. 'tcg' for a no-hypervisor smoke test)."""
-    return "whpx,kernel-irqchip=off" if IS_WINDOWS else "kvm"
+    """Hypervisor auto-detect: WHPX on Windows, HVF on macOS (Apple Silicon),
+    KVM on Linux. Overridable per-start with --accel (e.g. 'tcg' for a
+    no-hypervisor smoke test)."""
+    if IS_WINDOWS:
+        return "whpx,kernel-irqchip=off"
+    if IS_MACOS:
+        return "hvf"
+    return "kvm"
 
 
 def machine_arg(accel):
@@ -587,17 +732,10 @@ def resolve_mode(cfg, name=None, mem=None):
     return m
 
 
-def qemu_command(acct, cfg, dev, mode=None, accel=None):
-    base = cfg["bases"][acct["base"]]
-    images = Path(cfg["images_dir"])
-    q = cfg["qemu"]
-    d = account_dir(acct["name"])
-    accel = accel or default_accel()
-    mode = mode or resolve_mode(cfg)
-
-    # The per-account port triple must be distinct (the shared-index scheme
-    # guarantees it below 1000 instances; assert anyway before handing the
-    # ports to QEMU).
+def _assert_port_triple(acct):
+    """The per-account port triple must be distinct (the shared-index scheme
+    guarantees it below 1000 instances; assert anyway before handing the
+    ports to QEMU). Returns the QEMU -vnc display number."""
     if len({acct["adb_port"], acct["qmp_port"], acct["vnc_port"]}) != 3:
         sys.exit(f"error: port collision for '{acct['name']}': "
                  f"adb {acct['adb_port']} qmp {acct['qmp_port']} "
@@ -606,6 +744,84 @@ def qemu_command(acct, cfg, dev, mode=None, accel=None):
     if vnc_display < 0:
         sys.exit(f"error: vnc_port {acct['vnc_port']} is below QEMU's "
                  f"5900 display offset")
+    return vnc_display
+
+
+def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
+    """arm-uefi (LineageOS arm64) QEMU command — native under HVF on Apple
+    Silicon, NO translation layer. UEFI/GRUB disk boot: EDK2 pflash CODE +
+    per-account writable efivars, GPT system disk (vda, the provisioned
+    overlay carrying /metadata FBE keys) + /data (vdb). Same headless +
+    localhost-VNC model as x86; base flags proven in tools/arm64/boot_arm64.sh.
+    Silent boot is handled inside the guest image (GRUB/kernel), not via a
+    Bliss-style -append, so there is no dev/prod append split here — the dev
+    flag only adds a serial log."""
+    base = cfg["bases"][acct["base"]]
+    q = cfg["qemu"]
+    d = account_dir(acct["name"])
+    accel = accel or default_accel()
+    mode = mode or resolve_mode(cfg)
+    vnc_display = _assert_port_triple(acct)
+    smp = q["smp"] if dev else mode["smp"]
+    mem = q["mem_mb"] if dev else mode["mem"]
+
+    code = arm_edk2_code()
+    if not code:
+        sys.exit("error: edk2-aarch64-code.fd (UEFI firmware) not found - "
+                 "install qemu (brew install qemu) or set qemu.arm_edk2_code "
+                 "in configs/paths.json")
+    cmd = [
+        qemu_bin("qemu-system-aarch64"),
+        "-machine", "virt",
+        "-accel", accel,          # hvf on Apple Silicon (no translation)
+        "-cpu", "host",
+        "-smp", str(smp),
+        "-m", str(mem),
+        # UEFI firmware: read-only CODE + per-account writable vars.
+        "-drive", (f"if=pflash,unit=0,file={code},file.locking=off,"
+                   "format=raw,readonly=on"),
+        "-drive", f"if=pflash,unit=1,file={d / 'efivars.fd'}",
+        # System overlay (vda, has /metadata FBE keys) + /data (vdb).
+        "-device", "virtio-blk-pci,drive=vda,bootindex=0",
+        "-device", "virtio-blk-pci,drive=vdb,bootindex=1",
+        "-drive", (f"file={d / 'system.qcow2'},if=none,id=vda,"
+                   "discard=unmap,detect-zeroes=unmap"),
+        "-drive", (f"file={d / 'data.qcow2'},if=none,id=vdb,"
+                   "discard=unmap,detect-zeroes=unmap"),
+        "-device", "virtio-gpu-pci",
+        "-display", "none",       # headless ALWAYS (same rule as x86)
+        # Built-in VNC server, LOCALHOST ONLY (no auth is safe ONLY because
+        # of the 127.0.0.1 bind — HARD RULE, same as x86; never bind a
+        # network interface without adding auth in the same change).
+        "-vnc", f"127.0.0.1:{vnc_display}",
+        "-device", "nec-usb-xhci,id=usb-bus",
+        "-device", "qemu-xhci,id=usb-controller-0",
+        "-device", "usb-tablet,bus=usb-bus.0",
+        "-device", "usb-kbd,bus=usb-bus.0",
+        "-netdev", ("user,id=net0,"
+                    f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
+        "-device", "virtio-net-pci,netdev=net0",
+        "-device", "virtio-serial",
+        "-device", "virtio-rng-pci",
+        "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
+        "-name", f"omni-{acct['name']}",
+    ]
+    if dev:
+        cmd += ["-serial", f"file:{d / 'serial.log'}"]
+    return cmd
+
+
+def qemu_command(acct, cfg, dev, mode=None, accel=None):
+    base = cfg["bases"][acct["base"]]
+    if base_type(base) == BASE_TYPE_ARM:
+        return qemu_command_arm(acct, cfg, dev, mode=mode, accel=accel)
+    images = Path(cfg["images_dir"])
+    q = cfg["qemu"]
+    d = account_dir(acct["name"])
+    accel = accel or default_accel()
+    mode = mode or resolve_mode(cfg)
+
+    vnc_display = _assert_port_triple(acct)
 
     append = ("stack_depot_disable=on cgroup_disable=pressure "
               "root=/dev/ram0 noexec=off "
@@ -750,7 +966,17 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
 
 
 def post_boot(acct, label):
-    """adb root (KernelSU image allows it) and basic sanity props."""
+    """Post-boot sanity. x86/Bliss: adb root (KernelSU) + verify the libndk
+    ARM native-bridge is present (its whole reason to exist). arm/LineageOS
+    runs the app arm64-NATIVE (no bridge) and is a user build (no adb root),
+    so there the check is that the CPU ABI is arm64-v8a instead."""
+    if acct_base_is_arm(acct):
+        adb_connect(acct)
+        abi = adb_getprop(acct, "ro.product.cpu.abilist")
+        ok = "arm64-v8a" in abi
+        print(f"[{label}] arm64 native (no translation): abilist={abi or '?'}"
+              f" {'OK' if ok else '*** NOT arm64-v8a ***'}")
+        return ok
     adb(acct, "root")
     time.sleep(3)
     adb_connect(acct)
@@ -906,6 +1132,40 @@ def make_overlay(system_path, base_disk):
                     str(system_path)], check=True, capture_output=True)
 
 
+def _create_arm(args, cfg, acct, base, d, name, adb_port, qmp_port, vnc_port):
+    """arm-uefi account creation: copy the provisioned matched-pair trio
+    (system overlay + /data + efivars) into the account dir. The overlay
+    keeps its qcow2 backing pointer to the shared immutable base_disk, so
+    only the per-account delta + /data are copied. Already provisioned
+    (kiosk, device-owner, HOME) so first_boot_done is set immediately."""
+    import shutil
+    images = Path(cfg["images_dir"])
+    sys_tmpl = images / base["system"]
+    data_tmpl = images / base["data"]
+    efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
+    # System overlay: copy the provisioned overlay (preserves its backing
+    # pointer to base_disk); if that fails, fall back to a fresh overlay
+    # (NOTE: a fresh overlay fails FBE decrypt — copy is the correct path).
+    shutil.copyfile(sys_tmpl, d / "system.qcow2")
+    shutil.copyfile(data_tmpl, d / "data.qcow2")
+    if efi_tmpl.exists():
+        shutil.copyfile(efi_tmpl, d / "efivars.fd")
+    else:
+        sys.exit(f"error: arm base efivars template missing: {efi_tmpl}")
+    acct["first_boot_done"] = True         # provisioning baked into the pair
+    save_account(acct)
+    print(f"[create {name}] arm64 disks ready (provisioned pair copied from "
+          f"{base['system']}+{base['data']}; overlay backed by "
+          f"{base['base_disk']}); adb {adb_port}, qmp {qmp_port}, "
+          f"vnc {vnc_port}")
+    created = {"name": name, "base": acct["base"], "adb_port": adb_port,
+               "qmp_port": qmp_port, "vnc_port": vnc_port,
+               "vnc_host": "127.0.0.1", "provisioned": True,
+               "arch": "arm64", "ok": True}
+    if getattr(args, "json", False):
+        emit_json(created)
+
+
 def cmd_create(args):
     ensure_qemu()
     cfg = load_config()
@@ -919,15 +1179,24 @@ def cmd_create(args):
         sys.exit(f"error: account '{name}' already exists")
     d.mkdir(parents=True, exist_ok=True)
 
-    base = cfg["bases"][cfg["current_base"]]
-    base_disk = Path(cfg["images_dir"]) / base["disk"]
+    tag = cfg.get("_effective_base") or cfg["current_base"]
+    base = cfg["bases"][tag]
     adb_port, qmp_port, vnc_port = allocate_ports(cfg)
-    acct = {"name": name, "base": cfg["current_base"],
+    acct = {"name": name, "base": tag,
             "adb_port": adb_port, "qmp_port": qmp_port,
             "vnc_port": vnc_port,        # reserved for future local VNC
             "first_boot_done": False, "created": time.time()}
     save_account(acct)
 
+    # arm-uefi: the kiosk + device-owner + HOME are all baked into the
+    # provisioned matched pair (see BASE_TYPE_ARM note). An account is just a
+    # copy of that (system-overlay, data, efivars) trio — already-provisioned,
+    # so NO first boot / dexopt / device-owner step is needed here.
+    if base_type(base) == BASE_TYPE_ARM:
+        return _create_arm(args, cfg, acct, base, d, name,
+                           adb_port, qmp_port, vnc_port)
+
+    base_disk = Path(cfg["images_dir"]) / base["disk"]
     make_overlay(d / "system.qcow2", base_disk)
     # /data disk must be a pre-formatted ext4 filesystem: the Bliss initrd
     # only mounts DATA= devices, it never formats them (a blank disk hangs
@@ -1041,8 +1310,15 @@ def _shutdown(acct, label, timeout=90):
     if not pid:
         print(f"[{label}] not running")
         return "not-running"
+    # In-guest power-off. x86/Bliss uses KernelSU root `svc power shutdown`.
+    # arm/LineageOS is a user build (no adb root) and its ACPI powerdown does
+    # NOT halt an idle guest (proof-of-life finding), so use `reboot -p` (the
+    # guest-side path verified to power the arm image off reliably).
     try:
-        adb(acct, "shell", "svc", "power", "shutdown", timeout=10)
+        if acct_base_is_arm(acct):
+            adb(acct, "shell", "reboot", "-p", timeout=10)
+        else:
+            adb(acct, "shell", "svc", "power", "shutdown", timeout=10)
         print(f"[{label}] sent in-guest shutdown, waiting for QEMU exit...")
     except Exception:
         print(f"[{label}] adb unreachable, using QMP fallback")
@@ -1526,19 +1802,24 @@ def install_readiness():
     import shutil as _sh
     raw, new = autoregister_bases()
     images = Path(resolve_images_dir(raw))
-    tag = raw.get("current_base")
+    # Base selected by host architecture (arm64 -> arm-uefi; x86 -> current).
+    tag = effective_base_tag(raw)
     bases = raw.get("bases") or {}
     missing = []
     base_ready = bool(tag and tag in bases)
+    arm = base_ready and base_type(bases[tag]) == BASE_TYPE_ARM
     if base_ready:
-        missing += [str(images / bases[tag][k])
-                    for k in ("disk", "kernel", "initrd")
-                    if not (images / bases[tag][k]).exists()]
+        missing += base_missing_files(images, bases[tag])
         base_ready = not missing
-    template = raw.get("data_template", "data-template-8g.qcow2")
-    template_ready = (images / template).exists()
-    if not template_ready:
-        missing.append(str(images / template))
+    # arm-uefi bakes /data into the base's own data template (no separate
+    # ext4 data-template needed); x86 requires the shared data_template.
+    if arm:
+        template_ready = True
+    else:
+        template = raw.get("data_template", "data-template-8g.qcow2")
+        template_ready = (images / template).exists()
+        if not template_ready:
+            missing.append(str(images / template))
     qemu_ok = _qemu_present()
     adb_ok = _sh.which("adb") is not None
     rep = {"config": str(CONFIG_PATH),
@@ -1546,12 +1827,15 @@ def install_readiness():
            "images_dir_exists": images.exists(),
            "auto_registered": new,
            "bases_registered": sorted(bases),
-           "current_base": tag,
+           "host_arch": HOST_ARCH,
+           "effective_base": tag,
+           "base_type": base_type(bases[tag]) if base_ready else None,
+           "current_base": raw.get("current_base"),
            "base_ready": base_ready,
            "data_template_ready": template_ready,
            "missing_files": missing,
            "qemu_present": qemu_ok,
-           "qemu": qemu_bin("qemu-system-x86_64") if qemu_ok else None,
+           "qemu": qemu_bin(qemu_system_name()) if qemu_ok else None,
            "adb_present": adb_ok,
            "accounts": len(all_accounts()),
            "ready": base_ready and template_ready and qemu_ok and adb_ok}

@@ -180,6 +180,60 @@ so libndk is irrelevant here), carrying the same kiosk features as x86.
 - **HARD CONSTRAINT (arm lane):** VNC stays **localhost-only** here too — same
   no-auth-so-127.0.0.1-only rule as constraint #4 below.
 
+### base_arm BUILD STATUS (2026-07-08, session 2) — WORKING kiosk, silent-boot/root PENDING
+The arm base is **built, registered, and functional** for create/boot/kiosk/
+lockdown/shutdown. What remains (silent boot, custom loading animation, root)
+is blocked on read-only-system editing and is a **surfaced decision**, below.
+
+- **images_dir (macOS `~/OmniImages`) holds the arm base set:**
+  - `base_arm.qcow2` — pristine LineageOS 23.2 system (5 GiB virt), **shared
+    immutable backing**.
+  - `base_arm_system.qcow2` — provisioned overlay (~7 MB, backed by
+    base_arm.qcow2). **Holds the `/metadata` FBE keys** — see matched-pair note.
+  - `base_arm_data.qcow2` — provisioned `/data` (~1 GB): kiosk installed,
+    **device-owner set**, kiosk is HOME, lockscreen off, adb key authorized.
+  - `base_arm_efivars.fd` — provisioned UEFI vars.
+  - Config entry `bases.arm` (type `arm-uefi`); `current_base` stays `v5`
+    (x86) — the arm base is chosen by **host arch**, not current_base.
+- **FBE MATCHED PAIR (the load-bearing fact).** `/data` is file-based-encrypted;
+  keys live in `/metadata`, a partition on the **vda system overlay**. So the
+  system overlay and `/data` are ONE unit: a fresh overlay + provisioned `/data`
+  → `init_user0_failed` (recovery); a truncated `/data` copy →
+  `set_policy_failed:/data/misc`. An account therefore **copies the provisioned
+  trio** (system overlay + data + efivars); the overlay keeps its qcow2 backing
+  to the shared base_arm.qcow2, so only the ~1 GB `/data` + tiny overlay are
+  per-account. Capture templates only from a **fully powered-off** guest (use
+  `qemu-img convert` for /data) — copying while QEMU still writes corrupts it.
+- **Device-owner provisioning recipe (no root needed):** boot fresh data →
+  complete the first-boot wizard (adbd is in trade-in mode until then) →
+  enable USB debugging + authorize adb (one-time, GUI) → `settings put global
+  device_provisioned 0` → `dpm set-device-owner …/OmniDeviceAdminReceiver`
+  (succeeds: 0 accounts) → set HOME + game + disable LineageOS launcher +
+  lockscreen off. Bake this into the data template once; accounts just copy it.
+- **VERIFIED via the engine** (`omni create armtest` → `start` → `install
+  test_arm64.apk` → `stop`): boots to kiosk in ~15–40 s; kiosk is HOME and
+  auto-launches Roblox; **swipe-down from the top does NOTHING** (Lock Task
+  kills the status bar + Quick-Settings panel); Roblox renders arm64-native
+  (~0.5–2% jank); `omni stop` powers off cleanly via `reboot -p`.
+- **PENDING — Phase C, needs a go/no-go (read-only-system edits).** Today the
+  visible boot is NOT silent: TianoCore UEFI splash → GRUB menu (8 s countdown)
+  → scrolling kernel console → LineageOS boot animation → kiosk. Making it
+  silent (edit grub.cfg: `timeout=0`, `quiet console=ttynull`, drop
+  `console=tty0`), swapping the **custom loading animation**
+  (`/product/media/bootanimation.zip`), and **root** all require writing the
+  read-only vda. Blockers on this Mac: user build (no `adb root`; `adb root` is
+  gated by `persist.sys.root_access`), and macOS has **no qemu-nbd/libguestfs**
+  (`Kernel /dev/nbdN support not available`) to edit the qcow2 offline. Only
+  on-macOS route: boot **LineageOS Recovery** (root context, shown in the GRUB
+  menu) to mount partitions rw and edit grub.cfg + bootanimation (and/or install
+  **Magisk** via the maintainer's `boot_arm64only.img` patch for runtime root).
+  dm-verity/AVB is OFF ("AVB is not enabled" in dmesg), so edits won't trip
+  verity. This is a real sub-project with brick risk — **do it in its own
+  session once the user picks the approach.**
+- **Build the kiosk APK on this host:** `launcher/build.sh` (macOS/Linux
+  counterpart of build.ps1). Boot the base by hand with
+  `tools/arm64/boot_arm64.sh <Data dir> [vnc N]`.
+
 ## CLI (identical: `python manager/omni.py …` == `omnidroid(.exe) …`)
 Setup:
 - **Blank-deployment bootstrap (2026-07-06):** the exe can be dropped

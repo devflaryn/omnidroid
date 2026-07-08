@@ -6,6 +6,73 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## arm64 / Apple Silicon — 2026-07-08 — base_arm (LineageOS 23.2), arch-aware engine
+
+Second arm session (after the 2026-07-08 proof-of-life). Built a working
+**arm64 kiosk base** that runs the target app **arm64-native under HVF, no
+translation layer**, and made the engine **host-architecture-aware** without
+touching any x86 path. See HANDOFF "ARM64 / Apple Silicon" for the full state.
+
+**App gate (Step 1) — PASSED.** The heavy test app is Roblox
+(`com.roblox.client`, arm64-v8a). Under QEMU/HVF it installs, launches, and
+renders its native UI at ~0.5–2% jank, `primaryCpuAbi=arm64-v8a` (proves the
+no-translation premise). Its "Connection error" is host-ISP SNI/DPI censorship
+of Roblox (google:443 works, only Roblox blocked) — a networking matter the
+user handles host-side via VPN, NOT an image problem. Gate bar = launches +
+renders → met.
+
+**Engine (arch-aware, x86 untouched).** `manager/omni.py`:
+- New `BASE_TYPE_ARM` ("arm-uefi") alongside the default `BASE_TYPE_X86`
+  ("x86-bliss"); every arm branch is gated on base type so x86 code paths are
+  byte-identical. Host detection: `IS_MACOS`, `IS_ARM64_HOST`, `HOST_ARCH`.
+- `default_accel()` → **hvf** on macOS; `qemu_system_name()` →
+  **qemu-system-aarch64** on Apple Silicon; `resolve_images_dir` gained a
+  `darwin` key (falls back to the linux `~/OmniImages`).
+- `qemu_command_arm()`: the proven boot from `tools/arm64/boot_arm64.sh`
+  (`-machine virt -accel hvf -cpu host`, EDK2 pflash + per-account efivars,
+  virtio-blk vda/vdb, virtio-gpu-pci, `-display none` + **localhost-only VNC**,
+  adb hostfwd). `effective_base_tag()` picks the arm base on an arm64 host and
+  `current_base` (x86) elsewhere — **base selection by host architecture**.
+- arm accounts are created by **copying a provisioned matched pair** (see FBE
+  note) instead of first-boot provisioning; `post_boot` verifies
+  `arm64-v8a` (native) instead of the libndk bridge; `_shutdown` uses
+  `reboot -p` on arm (ACPI powerdown alone does not halt this image).
+- `doctor`/`autoregister` are arch-aware; the arm base auto-registers from
+  `base_arm*.qcow2` in images_dir.
+- Kiosk APK now builds on macOS/Linux via `launcher/build.sh` (aapt2→javac→
+  d8→apksigner; jars classes so paths with spaces work). The kiosk Java is
+  arch-independent — one APK runs on x86 and arm64.
+
+**KEY FINDING — FBE matched pair.** LineageOS `/data` is file-based-encrypted
+with keys in `/metadata` (a partition on the **vda system overlay**). So the
+system overlay and `/data` disk are a MATCHED PAIR captured together: a fresh
+overlay against a provisioned `/data` fails at boot (`init_user0_failed`); a
+half-copied data disk fails (`set_policy_failed:/data/misc`). base_arm is
+therefore a pristine shared system (`base_arm.qcow2`) + a **provisioned
+overlay+data+efivars trio** (`base_arm_system/…_data/…_efivars`); an account
+copies the trio (overlay stays backed by the shared base). Verified end to
+end via `omni create/start/install/stop`.
+
+**DONE & verified on arm:** silent-of-*console* aside (see below), an account
+boots the provisioned kiosk in ~15–40 s; kiosk is HOME and auto-launches the
+app; **device-owner Lock Task fully blocks the status bar AND the swipe-down
+Quick-Settings panel** (verified: swipe-from-top does nothing); app renders
+arm64-native; `omni stop` powers off cleanly via the arm path. Device-owner
+is assigned by the workaround the proof-of-life predicted: complete the
+first-boot wizard (adb needs it), then `settings put global device_provisioned
+0` → `dpm set-device-owner` succeeds (no root, 0 accounts).
+
+**BLOCKED — surfaced for a decision (Phase C).** Silent boot (TianoCore UEFI
+splash → GRUB 8 s menu → scrolling kernel console are all visible today),
+custom loading animation (`/product/media/bootanimation.zip`), and in-guest
+root all require writing the **read-only vda** (grub.cfg, /product). On this
+user build there is no adb root, and macOS has **no qemu-nbd/libguestfs** path
+to edit the qcow2 offline (`qemu-nbd: Kernel /dev/nbdN support not available`).
+The only on-macOS route is booting **LineageOS Recovery** (root context) to
+mount partitions rw and edit grub.cfg + swap the boot animation (and/or install
+Magisk for runtime root) — a real sub-project with brick risk. Awaiting the
+user's go/no-go on approach + effort before doing image surgery.
+
 ## Manager — 2026-07-07 — renamed `qemu-manager` → `omnidroid`
 
 The engine/CLI (and its artifacts) is now **`omnidroid`**
