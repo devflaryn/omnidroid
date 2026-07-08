@@ -215,7 +215,12 @@ is blocked on read-only-system editing and is a **surfaced decision**, below.
   auto-launches Roblox; **swipe-down from the top does NOTHING** (Lock Task
   kills the status bar + Quick-Settings panel); Roblox renders arm64-native
   (~0.5–2% jank); `omni stop` powers off cleanly via `reboot -p`.
-- **PENDING — Phase C, needs a go/no-go (read-only-system edits).** Today the
+- **DEFERRED by user (2026-07-08): shipping base_arm as-is.** Phase C (silent
+  boot, custom loading animation, root) is intentional future work, not an
+  unfinished task — the base is shipped as a functional kiosk without them.
+  When revisited, no approach was pre-chosen; the options are in the decision
+  note below. Details of what's deferred and why:
+- **Phase C (read-only-system edits) — the deferred work.** Today the
   visible boot is NOT silent: TianoCore UEFI splash → GRUB menu (8 s countdown)
   → scrolling kernel console → LineageOS boot animation → kiosk. Making it
   silent (edit grub.cfg: `timeout=0`, `quiet console=ttynull`, drop

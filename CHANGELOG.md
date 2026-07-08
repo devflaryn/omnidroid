@@ -62,7 +62,11 @@ is assigned by the workaround the proof-of-life predicted: complete the
 first-boot wizard (adb needs it), then `settings put global device_provisioned
 0` → `dpm set-device-owner` succeeds (no root, 0 accounts).
 
-**BLOCKED — surfaced for a decision (Phase C).** Silent boot (TianoCore UEFI
+**DEFERRED by user (2026-07-08): base_arm ships as-is** — a functional kiosk
+without silent boot / custom animation / root. Phase C below is intentional
+future work, done in its own session once an approach is chosen.
+
+**Phase C (deferred).** Silent boot (TianoCore UEFI
 splash → GRUB 8 s menu → scrolling kernel console are all visible today),
 custom loading animation (`/product/media/bootanimation.zip`), and in-guest
 root all require writing the **read-only vda** (grub.cfg, /product). On this
