@@ -130,6 +130,56 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 - **Current fleet:** accounts alice, bob, charlie, dave, erin — all on **v5**,
   all DeviceOwner (lockdown active), data preserved through every migration.
 
+## ARM64 / Apple Silicon (proof-of-life, 2026-07-08)
+**Status: PROOF-OF-LIFE ONLY. `base_arm` NOT built yet** — that is its own
+next session. Everything below is a Mac Mini (Apple Silicon, arm64) finding;
+the entire x86 product above (bases v1–v5, accounts, manager) is **untouched**.
+Goal of the eventual arm lane: a `base_arm.qcow2` running **arm64 Android
+natively under HVF with NO translation layer** (the target app is arm64-native,
+so libndk is irrelevant here), carrying the same kiosk features as x86.
+
+- **Result: arm64 Android boots fully under QEMU/HVF on this Mac.** Reached a
+  booted, provisioned home screen; verified over adb: `ro.product.cpu.abilist=
+  arm64-v8a`, `uname -m=aarch64`, Android 16, kernel Linux 6.12.81 under `-accel
+  hvf -cpu host`. **No translation layer involved** — arm64 guest on arm64 host.
+- **Viable base source:** **`jqssun/android-lineage-qemu`** — LineageOS **23.2**
+  (Android 16), **arm64-v8a**, the **`virtio_arm64only`** build. Prebuilt qcow2,
+  actively maintained, purpose-built for QEMU `virt` + HVF, documents a Magisk
+  root path. Release asset used: `UTM-VM-lineage-23.2-*-virtio_arm64only.zip`
+  (unzips to `LineageOS_on_arm64.utm/Data/` = `vda.qcow2` + `vdb.qcow2` +
+  `efi_vars.fd`). Repo: https://github.com/jqssun/android-lineage-qemu
+  (alternatives evaluated & ranked lower: AOSP Cuttlefish — Google-official but
+  macOS/HVF host support poorly documented; Bliss OS arm64 — x86/virgl-centric).
+- **Working boot command/flags:** saved as **`tools/arm64/boot_arm64.sh`**
+  (portable; takes the VM Data dir + optional VNC display N). Essence:
+  `qemu-system-aarch64 -machine virt -accel hvf -cpu host -smp 4 -m 4096`,
+  **EDK2 pflash** (`edk2-aarch64-code.fd`, ships with brew qemu) + `efi_vars.fd`,
+  two **`virtio-blk-pci`** disks (vda=system, vdb=data — same 2-disk shape as
+  x86), **`virtio-gpu-pci`**, **`-display none -vnc 127.0.0.1:N`** (headless +
+  localhost VNC, same model as x86), **`hostfwd tcp:127.0.0.1:5555`** for adb.
+  Toolchain: `brew install qemu android-platform-tools`; `sysctl kern.hv_support`=1.
+- **Kiosk primitives — all confirmed present on the arm image:**
+  - **Custom HOME app:** `cmd package set-home-activity` works; HOME reassignable.
+  - **Device-owner / Lock Task:** `dpm set-device-owner`/`set-active-admin`
+    present; features `android.software.device_admin` + `managed_users`; **0
+    accounts** on device (the usual DO blocker); SELinux **Enforcing**.
+  - **Root:** `adb root` is gated by LineageOS's `persist.sys.root_access`
+    (shell can't set it; needs the su-addon dev-menu toggle) — use one of the
+    two root paths below.
+- **⚠️ Two build-time notes for the `base_arm` session (don't relearn these):**
+  1. **Assign device-owner DURING first-boot provisioning, NOT after.** On this
+     booted instance `device_provisioned=1`/`user_setup_complete=1` already, so
+     a post-hoc `dpm set-device-owner` is blocked. Provision DO on a fresh/wiped
+     base before setup completes (same as the x86 flow).
+  2. **Pick a root path:** LineageOS **su-addon** (enables the "Root access"
+     Developer-options toggle → `persist.sys.root_access`) **or** the
+     maintainer's documented **Magisk boot-image patch** (`boot_arm64only.img`).
+- **Quirk:** adbd on this image starts in **trade-in mode** and refuses `shell:`
+  until the setup wizard is finished — complete first-boot setup (via VNC) before
+  expecting `adb shell`.
+- **HARD CONSTRAINT (arm lane):** VNC stays **localhost-only** here too — same
+  no-auth-so-127.0.0.1-only rule as constraint #4 below.
+
 ## CLI (identical: `python manager/omni.py …` == `omnidroid(.exe) …`)
 Setup:
 - **Blank-deployment bootstrap (2026-07-06):** the exe can be dropped
