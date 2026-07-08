@@ -20,6 +20,8 @@ import argparse
 import json
 import platform
 import re
+import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -2238,6 +2240,143 @@ def _foreground(acct):
         return None
 
 
+# ---------- live VNC viewer (real-time screen + mouse/keyboard control) ----------
+
+def _port_open(host, port, timeout=0.5):
+    """True if a TCP connection to host:port succeeds right now."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _macos_screen_sharing_app():
+    """Absolute path to the built-in Screen Sharing.app, or None. Its
+    location moved across macOS versions (Utilities on 13+, CoreServices on
+    older); mdfind is the last resort."""
+    for p in ("/System/Applications/Utilities/Screen Sharing.app",
+              "/System/Library/CoreServices/Applications/Screen Sharing.app",
+              "/Applications/Screen Sharing.app"):
+        if Path(p).exists():
+            return p
+    try:
+        r = subprocess.run(["mdfind", "-name", "Screen Sharing.app"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            if line.strip().endswith("Screen Sharing.app") \
+                    and Path(line.strip()).exists():
+                return line.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _vnc_viewer_command(host, port, viewer=None):
+    """The command that opens a real VNC client window at host:port, with
+    live screen + mouse/keyboard. Resolution order:
+      1. explicit template (--viewer or config qemu.vnc_viewer): a shell
+         string with {host}/{port}/{url}/{display} placeholders, e.g.
+         "vncviewer {host}::{port}" or "/Applications/…/VNC Viewer {url}".
+      2. OS-native client (no install): macOS Screen Sharing via `open
+         vnc://`; Windows hands the vnc:// URL to the shell.
+      3. A known VNC client found on PATH (TigerVNC/remmina/gvncviewer).
+    Returns (argv_list, shell_bool) or None if nothing suitable was found.
+    QEMU maps -vnc display D to TCP port 5900+D, so port = 5900 + display."""
+    url = f"vnc://{host}:{port}"
+    display = port - 5900
+    tmpl = viewer or (read_config().get("qemu", {}).get("vnc_viewer"))
+    if tmpl:
+        argv = [a.format(host=host, port=port, url=url, display=display)
+                for a in shlex.split(tmpl)]
+        return argv, False
+    if IS_MACOS:
+        # Built-in Screen Sharing.app — real-time, full mouse/keyboard.
+        # Launch it BY PATH, not via `open vnc://`: the vnc:// URL scheme is
+        # often hijacked by a third-party handler (e.g. RealVNC), so the
+        # scheme route can silently open the wrong app or nothing. `open -a
+        # <app> vnc://…` forces the built-in client regardless.
+        app = _macos_screen_sharing_app()
+        if app:
+            return ["open", "-a", app, url], False
+        return ["open", url], False   # fall back to the scheme handler
+    if IS_WINDOWS:
+        for exe in ("vncviewer.exe", "tvnviewer.exe"):
+            p = shutil.which(exe)
+            if p:
+                return [p, f"{host}::{port}"], False
+        # Fall back to whatever is registered for the vnc:// scheme.
+        return ["cmd", "/c", "start", "", url], False
+    # Linux / other: try common clients on PATH.
+    if shutil.which("vncviewer"):                       # TigerVNC / TightVNC
+        return ["vncviewer", f"{host}::{port}"], False   # :: = raw TCP port
+    if shutil.which("remmina"):
+        return ["remmina", "-c", url], False
+    if shutil.which("gvncviewer"):
+        return ["gvncviewer", f"{host}:{display}"], False
+    if shutil.which("xdg-open"):
+        return ["xdg-open", url], False
+    return None
+
+
+def cmd_view(args):
+    """Open a live VNC window onto an instance — real-time screen with mouse
+    and keyboard control — launched straight from the terminal. Uses a real
+    VNC client (macOS Screen Sharing by default; override with --viewer or
+    config qemu.vnc_viewer). The instance must be running; --start boots it
+    first (detached) and waits for the VNC port. Localhost-only: the viewer
+    connects to 127.0.0.1 — the server has no auth, safe ONLY on the loopback
+    bind (see the port-scheme HARD RULE)."""
+    cfg = load_config()
+    acct = load_account(args.name)
+    host = "127.0.0.1"
+    port = acct["vnc_port"]
+    started = False
+    if not running_pid(args.name):
+        if not args.start:
+            sys.exit(f"error: '{args.name}' is not running. Start it first "
+                     f"(omni start {args.name}) or: omni view {args.name} "
+                     f"--start")
+        first = not acct.get("first_boot_done")
+        spawn_qemu(acct, cfg, dev=args.dev or first,
+                   mode=resolve_mode(cfg, args.mode))
+        started = True
+        print(f"[view {args.name}] started instance (detached); waiting for "
+              f"VNC on {host}:{port} ...")
+
+    # Wait for the QEMU VNC server to accept connections (it binds at process
+    # start, so this is quick; generous bound covers a cold spawn).
+    deadline = time.time() + (args.timeout if started else 5)
+    while not _port_open(host, port):
+        if not running_pid(args.name):
+            sys.exit(f"error: '{args.name}' is not running (QEMU exited "
+                     f"before its VNC port opened)")
+        if time.time() > deadline:
+            sys.exit(f"error: VNC port {host}:{port} did not open in time")
+        time.sleep(0.5)
+
+    resolved = _vnc_viewer_command(host, port, viewer=args.viewer)
+    if not resolved:
+        sys.exit("error: no VNC client found. Install one (Linux: "
+                 "'sudo apt install tigervnc-viewer' or remmina) or set a "
+                 "launcher: --viewer 'yourviewer {host}::{port}' (or config "
+                 "qemu.vnc_viewer). The instance's screen is at "
+                 f"{host}:{port}.")
+    argv, use_shell = resolved
+    try:
+        subprocess.Popen(argv, shell=use_shell)
+    except Exception as e:
+        sys.exit(f"error: failed to launch VNC viewer {argv}: {e}")
+    note = ("Screen Sharing" if (IS_MACOS and not args.viewer
+            and not cfg.get("qemu", {}).get("vnc_viewer")) else argv[0])
+    print(f"[view {args.name}] opened live viewer ({note}) on {host}:{port} "
+          f"- real-time screen, mouse + keyboard control"
+          + ("  [no password: connect anyway]" if IS_MACOS else ""))
+    if getattr(args, "json", False):
+        emit_json({"name": args.name, "vnc_host": host, "vnc_port": port,
+                   "viewer": argv, "started": started, "ok": True})
+
+
 def cmd_screenshot(args):
     """Pull a screenshot from the guest framebuffer (true colors, works
     headless). Prints JSON: {ok, path}."""
@@ -2619,6 +2758,26 @@ def main():
                               "production mode switch)")
     ubz.add_argument("tag")
     ubz.set_defaults(func=cmd_use_base)
+
+    vw = sub.add_parser("view",
+                        help="open a LIVE VNC window (real-time screen + "
+                             "mouse/keyboard) onto an instance, from the "
+                             "terminal. macOS uses built-in Screen Sharing")
+    vw.add_argument("name")
+    vw.add_argument("--start", action="store_true",
+                    help="boot the instance first if it isn't running")
+    vw.add_argument("--mode", choices=list(MODES), default=None,
+                    help="mode to use when --start boots the instance")
+    vw.add_argument("--dev", action="store_true",
+                    help="with --start: use the dev boot profile")
+    vw.add_argument("--viewer", default=None,
+                    help="VNC client launch template, e.g. "
+                         "'vncviewer {host}::{port}' or a viewer path with "
+                         "{url}. Overrides config qemu.vnc_viewer")
+    vw.add_argument("--timeout", type=int, default=NORMAL_BOOT_TIMEOUT,
+                    help="seconds to wait for the VNC port when --start")
+    vw.add_argument("--json", action="store_true")
+    vw.set_defaults(func=cmd_view)
 
     sc = sub.add_parser("screenshot", help="pull a screenshot (JSON out)")
     sc.add_argument("name")

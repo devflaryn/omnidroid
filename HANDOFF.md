@@ -238,6 +238,16 @@ is blocked on read-only-system editing and is a **surfaced decision**, below.
 - **Build the kiosk APK on this host:** `launcher/build.sh` (macOS/Linux
   counterpart of build.ps1). Boot the base by hand with
   `tools/arm64/boot_arm64.sh <Data dir> [vnc N]`.
+- **Live viewer:** `omni view <account> [--start]` opens a real-time VNC
+  window (screen + mouse + keyboard) on the account's localhost `vnc_port`.
+  macOS uses the built-in **Screen Sharing.app launched BY PATH**
+  (`/System/Applications/Utilities/Screen Sharing.app`) — NOT `open vnc://`,
+  because the `vnc://` URL scheme is commonly hijacked by a third-party
+  handler (RealVNC here), which silently opens the wrong app / nothing. No
+  password (localhost, no auth — connect anyway). Override the client with
+  `--viewer 'cmd {host}::{port}'` or config `qemu.vnc_viewer`
+  (`{host}/{port}/{url}/{display}` placeholders); Linux tries TigerVNC/
+  remmina/gvncviewer, Windows tries vncviewer.exe then the shell handler.
 
 ## CLI (identical: `python manager/omni.py …` == `omnidroid(.exe) …`)
 Setup:
