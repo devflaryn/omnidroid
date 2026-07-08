@@ -2319,14 +2319,43 @@ def _vnc_viewer_command(host, port, viewer=None):
     return None
 
 
+def _spawn_builtin_viewer(name, host, port, title):
+    """Launch the self-contained Tk+RFB viewer (manager/vncview.py) as a
+    detached process so the terminal returns and multiple viewers can run.
+    Works frozen (exe supports the hidden `_vncview` subcommand) and as a
+    plain script (re-invoke this file with `_vncview`)."""
+    a = ["_vncview", "--host", host, "--port", str(port)]
+    if title:
+        a += ["--title", title]
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + a
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())] + a
+    # Detach stdio too: if the child inherited the terminal's stdout/stderr,
+    # the shell would block waiting for EOF while the (long-lived) viewer
+    # holds the pipe open. Send viewer output to a per-account log.
+    d = account_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    log = open(d / "viewer.log", "a")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(cmd, **kwargs)
+
+
 def cmd_view(args):
-    """Open a live VNC window onto an instance — real-time screen with mouse
-    and keyboard control — launched straight from the terminal. Uses a real
-    VNC client (macOS Screen Sharing by default; override with --viewer or
-    config qemu.vnc_viewer). The instance must be running; --start boots it
-    first (detached) and waits for the VNC port. Localhost-only: the viewer
-    connects to 127.0.0.1 — the server has no auth, safe ONLY on the loopback
-    bind (see the port-scheme HARD RULE)."""
+    """Open a LIVE window onto an instance — real-time screen with mouse and
+    keyboard control — launched straight from the terminal.
+
+    Default: the SELF-CONTAINED Python viewer (manager/vncview.py: Tk + a
+    minimal RFB client) — identical on Windows/macOS/Linux, no OS
+    screen-sharing app. `--native` instead launches the OS/native VNC client
+    (macOS Screen Sharing, or --viewer/config qemu.vnc_viewer, or a client on
+    PATH). Instance must be running; --start boots it first and waits for the
+    VNC port. Localhost-only: the viewer connects to 127.0.0.1 — the server
+    has no auth, safe ONLY on the loopback bind (port-scheme HARD RULE)."""
     cfg = load_config()
     acct = load_account(args.name)
     host = "127.0.0.1"
@@ -2355,26 +2384,43 @@ def cmd_view(args):
             sys.exit(f"error: VNC port {host}:{port} did not open in time")
         time.sleep(0.5)
 
-    resolved = _vnc_viewer_command(host, port, viewer=args.viewer)
-    if not resolved:
-        sys.exit("error: no VNC client found. Install one (Linux: "
-                 "'sudo apt install tigervnc-viewer' or remmina) or set a "
-                 "launcher: --viewer 'yourviewer {host}::{port}' (or config "
-                 "qemu.vnc_viewer). The instance's screen is at "
-                 f"{host}:{port}.")
-    argv, use_shell = resolved
-    try:
-        subprocess.Popen(argv, shell=use_shell)
-    except Exception as e:
-        sys.exit(f"error: failed to launch VNC viewer {argv}: {e}")
-    note = ("Screen Sharing" if (IS_MACOS and not args.viewer
-            and not cfg.get("qemu", {}).get("vnc_viewer")) else argv[0])
-    print(f"[view {args.name}] opened live viewer ({note}) on {host}:{port} "
-          f"- real-time screen, mouse + keyboard control"
-          + ("  [no password: connect anyway]" if IS_MACOS else ""))
+    title = f"omni: {args.name}  ({host}:{port})"
+    use_native = getattr(args, "native", False) or args.viewer \
+        or cfg.get("qemu", {}).get("vnc_viewer")
+    if use_native:
+        resolved = _vnc_viewer_command(host, port, viewer=args.viewer)
+        if not resolved:
+            sys.exit("error: no native VNC client found. Drop --native to use "
+                     "the built-in viewer, or set --viewer 'client "
+                     "{host}::{port}'. Screen is at " f"{host}:{port}.")
+        argv, use_shell = resolved
+        try:
+            subprocess.Popen(argv, shell=use_shell)
+        except Exception as e:
+            sys.exit(f"error: failed to launch native viewer {argv}: {e}")
+        viewer_desc, vpid = argv[0], None
+    else:
+        try:
+            proc = _spawn_builtin_viewer(args.name, host, port, title)
+        except Exception as e:
+            sys.exit(f"error: failed to launch built-in viewer: {e}")
+        viewer_desc, vpid = "built-in (Tk+RFB)", proc.pid
+
+    print(f"[view {args.name}] live viewer opened [{viewer_desc}] on "
+          f"{host}:{port} - real-time screen, mouse + keyboard control"
+          + (f"; viewer pid {vpid}" if vpid else ""))
     if getattr(args, "json", False):
         emit_json({"name": args.name, "vnc_host": host, "vnc_port": port,
-                   "viewer": argv, "started": started, "ok": True})
+                   "viewer": viewer_desc, "viewer_pid": vpid,
+                   "started": started, "ok": True})
+
+
+def _run_vncview(a):
+    """Internal: run the built-in viewer in THIS process (invoked as the
+    hidden `_vncview` subcommand by _spawn_builtin_viewer)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import vncview
+    return vncview.run_viewer(a.host, a.port, a.title)
 
 
 def cmd_screenshot(args):
@@ -2770,14 +2816,26 @@ def main():
                     help="mode to use when --start boots the instance")
     vw.add_argument("--dev", action="store_true",
                     help="with --start: use the dev boot profile")
+    vw.add_argument("--native", action="store_true",
+                    help="use the OS/native VNC client instead of the "
+                         "built-in cross-platform viewer")
     vw.add_argument("--viewer", default=None,
-                    help="VNC client launch template, e.g. "
-                         "'vncviewer {host}::{port}' or a viewer path with "
-                         "{url}. Overrides config qemu.vnc_viewer")
+                    help="native VNC client launch template (implies "
+                         "--native), e.g. 'vncviewer {host}::{port}' or a "
+                         "viewer path with {url}. Overrides config "
+                         "qemu.vnc_viewer")
     vw.add_argument("--timeout", type=int, default=NORMAL_BOOT_TIMEOUT,
                     help="seconds to wait for the VNC port when --start")
     vw.add_argument("--json", action="store_true")
     vw.set_defaults(func=cmd_view)
+
+    # Hidden internal: run the built-in Tk+RFB viewer in-process (spawned by
+    # `omni view` as a detached child). Not for direct use.
+    vv = sub.add_parser("_vncview")
+    vv.add_argument("--host", default="127.0.0.1")
+    vv.add_argument("--port", type=int, required=True)
+    vv.add_argument("--title", default=None)
+    vv.set_defaults(func=lambda a: sys.exit(_run_vncview(a)))
 
     sc = sub.add_parser("screenshot", help="pull a screenshot (JSON out)")
     sc.add_argument("name")

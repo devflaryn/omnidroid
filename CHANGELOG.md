@@ -6,6 +6,34 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Manager — 2026-07-09 — `omni view`: live VNC viewer (self-contained + native)
+
+New `omni view <account> [--start]` opens a LIVE window onto an instance —
+real-time screen with mouse + keyboard control — launched from the terminal
+(detached; returns immediately, output → `accounts/<name>/viewer.log`). It
+resolves the account's localhost `vnc_port`, optionally boots the instance
+and waits for the port, then opens a viewer.
+
+- **Default: a self-contained cross-platform viewer** (`manager/vncview.py`)
+  — a Tkinter window + a minimal pure-Python **RFB/VNC client** (Raw +
+  CopyRect + DesktopSize; 32bpp BGRX pixel format decoded via Pillow so
+  colours are correct on any QEMU build). Same viewer on Windows/macOS/Linux;
+  no dependence on an OS screen-sharing app or an external VNC client. Deps:
+  tkinter + Pillow. Verified against a live arm instance: the decoded
+  framebuffer is **pixel-identical to a QMP screendump**, and injected
+  pointer events reach the guest input stack (`getevent` shows ABS_MT_*/
+  BTN_MOUSE). Mouse (move/left/middle/right/wheel) + keyboard (X11 keysyms)
+  are forwarded.
+- **`--native`** keeps the OS-client path: macOS launches the built-in
+  **Screen Sharing.app by PATH** (not `open vnc://` — that scheme is often
+  hijacked by a third-party handler like RealVNC, which silently opens the
+  wrong app / nothing); `--viewer`/config `qemu.vnc_viewer` force a specific
+  client; Linux tries TigerVNC/remmina/gvncviewer, Windows vncviewer.exe.
+- Localhost-only, no auth (safe only on the loopback bind — the port-scheme
+  HARD RULE). x86 paths untouched. build-exe.ps1 / build-linux.sh gained the
+  `--hidden-import vncview/tkinter/PIL` flags the frozen builds need (the
+  viewer is imported lazily by name).
+
 ## arm64 / Apple Silicon — 2026-07-08 — base_arm (LineageOS 23.2), arch-aware engine
 
 Second arm session (after the 2026-07-08 proof-of-life). Built a working

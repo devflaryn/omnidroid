@@ -238,16 +238,30 @@ is blocked on read-only-system editing and is a **surfaced decision**, below.
 - **Build the kiosk APK on this host:** `launcher/build.sh` (macOS/Linux
   counterpart of build.ps1). Boot the base by hand with
   `tools/arm64/boot_arm64.sh <Data dir> [vnc N]`.
-- **Live viewer:** `omni view <account> [--start]` opens a real-time VNC
-  window (screen + mouse + keyboard) on the account's localhost `vnc_port`.
-  macOS uses the built-in **Screen Sharing.app launched BY PATH**
-  (`/System/Applications/Utilities/Screen Sharing.app`) — NOT `open vnc://`,
-  because the `vnc://` URL scheme is commonly hijacked by a third-party
-  handler (RealVNC here), which silently opens the wrong app / nothing. No
-  password (localhost, no auth — connect anyway). Override the client with
-  `--viewer 'cmd {host}::{port}'` or config `qemu.vnc_viewer`
-  (`{host}/{port}/{url}/{display}` placeholders); Linux tries TigerVNC/
-  remmina/gvncviewer, Windows tries vncviewer.exe then the shell handler.
+- **Live viewer:** `omni view <account> [--start]` opens a real-time window
+  (screen + mouse + keyboard) on the account's localhost `vnc_port`, and
+  returns the terminal immediately (viewer runs detached; output →
+  `accounts/<name>/viewer.log`).
+  - **Default = self-contained cross-platform viewer** (`manager/vncview.py`:
+    Tkinter window + a minimal pure-Python RFB client — Raw/CopyRect/
+    DesktopSize, 32bpp BGRX pixel format so colours are correct on any QEMU
+    build). Identical on Windows/macOS/Linux; no OS screen-sharing app. Deps:
+    tkinter + Pillow (`pip install pillow`; Linux also `apt install
+    python3-tk`). The frozen exe bundles them via the `--hidden-import`
+    flags in build-exe.ps1 / build-linux.sh (vncview is imported lazily by
+    name, so those flags are REQUIRED for freezing). Verified against a live
+    instance: framebuffer decode is pixel-identical to a QMP screendump, and
+    injected pointer events reach the guest (`getevent` shows ABS_MT_*/
+    BTN_MOUSE).
+  - **`--native`** instead uses the OS/native client. macOS launches built-in
+    **Screen Sharing.app BY PATH** (`/System/Applications/Utilities/Screen
+    Sharing.app`) — NOT `open vnc://`, because the `vnc://` scheme is commonly
+    hijacked by a third-party handler (RealVNC here) that silently opens the
+    wrong app / nothing. `--viewer 'cmd {host}::{port}'` or config
+    `qemu.vnc_viewer` (`{host}/{port}/{url}/{display}`) force a specific
+    client (implies --native); Linux tries TigerVNC/remmina/gvncviewer,
+    Windows vncviewer.exe then the shell handler.
+  - No password anywhere (localhost, no auth — connect/proceed).
 
 ## CLI (identical: `python manager/omni.py …` == `omnidroid(.exe) …`)
 Setup:
