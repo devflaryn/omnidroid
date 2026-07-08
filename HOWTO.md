@@ -1,9 +1,9 @@
-# qemu-manager — How to Use
+# omnidroid — How to Use
 
-Complete usage guide for the **qemu-manager** engine (`qemu-manager.exe`
-on Windows, `qemu-manager` ELF on Linux; identical to
+Complete usage guide for the **omnidroid** engine (`omnidroid.exe`
+on Windows, `omnidroid` ELF on Linux; identical to
 `python manager/omni.py …` from a checkout). This is the engine the
-**omnidroid.exe** GUI drives — the GUI is a separate app; everything the
+GUI (a separate app, built in another session) drives; everything the
 GUI does goes through the commands documented here, so a human at a
 terminal can do all of it too.
 
@@ -50,7 +50,7 @@ OmniImages/  (outside the repo)          accounts/<name>/   (per account)
 ### Windows
 
 ```
-qemu-manager.exe setup
+omnidroid.exe setup
 ```
 
 Idempotent; also runs implicitly on first use. Creates the folder layout
@@ -62,7 +62,7 @@ need `adb` (Android platform-tools) on PATH.
 
 ```
 sudo apt install qemu-system-x86 qemu-utils android-tools-adb
-./qemu-manager setup
+./omnidroid setup
 ```
 
 Uses system QEMU. `setup` preflights QEMU, `/dev/kvm` access, and KSM,
@@ -72,7 +72,7 @@ via `build-linux.sh` (PyInstaller cannot cross-build).
 
 ### Fresh deployment: drop the exe anywhere
 
-`qemu-manager.exe` is designed to be copied into any folder and just
+`omnidroid.exe` is designed to be copied into any folder and just
 work — **every command self-bootstraps** `configs/paths.json` (and
 `accounts/`, `./qemu` on Windows) next to the exe on first use. What it
 cannot invent is the base image. Until the base files exist, every
@@ -99,7 +99,7 @@ base landing in `images_dir` registers itself the same way.
 ### Verify readiness: `doctor`
 
 ```
-qemu-manager doctor [--json]
+omnidroid doctor [--json]
 ```
 
 Reports the config path, images dir, registered bases, per-file
@@ -112,18 +112,18 @@ report says precisely what is missing and where to put it.
 ## 3. Quickstart
 
 ```bash
-qemu-manager create alice            # one-time: ~3-15 min (first boot + provisioning)
-qemu-manager start alice             # cold boot, headless, detached (~35 s to game)
-qemu-manager list --stats            # who is running, ports, RAM
-qemu-manager watch alice             # host watchdog: powers off when the game closes
-qemu-manager stop alice              # explicit power-off (adb -> QMP -> kill)
-qemu-manager remove alice            # DESTRUCTIVE: delete the account + its data
+omnidroid create alice            # one-time: ~3-15 min (first boot + provisioning)
+omnidroid start alice             # cold boot, headless, detached (~35 s to game)
+omnidroid list --stats            # who is running, ports, RAM
+omnidroid watch alice             # host watchdog: powers off when the game closes
+omnidroid stop alice              # explicit power-off (adb -> QMP -> kill)
+omnidroid remove alice            # DESTRUCTIVE: delete the account + its data
 ```
 
 On a **dev base** (no game baked in) install the game per account once:
 
 ```bash
-qemu-manager install alice roblox.apk   # kiosk auto-launches it immediately
+omnidroid install alice roblox.apk   # kiosk auto-launches it immediately
 ```
 
 To watch a running instance, point any VNC viewer at
@@ -151,7 +151,7 @@ The ranges are 1000 apart, so the three channels can never collide below
 
 ## 5. Command reference
 
-Below, `omni` stands for `qemu-manager(.exe)` or `python manager/omni.py`.
+Below, `omni` stands for `omnidroid(.exe)` or `python manager/omni.py`.
 
 `--json` (on `create`, `start`, `stop`, `remove`, `list`) prints **exactly
 one machine-readable JSON line on stdout**; all progress/log text moves to
@@ -288,7 +288,7 @@ measure real instances-per-GB with KSM.
 
 Every instance runs QEMU's built-in VNC server on its `vnc_port`, bound to
 **127.0.0.1 only**. Connect any RFB viewer (TigerVNC, RealVNC, noVNC via
-a local websockify, the omnidroid GUI) to `127.0.0.1:<vnc_port>`.
+a local websockify, the GUI app) to `127.0.0.1:<vnc_port>`.
 For viewers that take a display number instead of a port, the display is
 `vnc_port − 5900` (e.g. 18001 → `:12101`).
 
@@ -343,29 +343,29 @@ design, do not re-add).
 
 ### Dev: test a game build on a fresh instance
 ```bash
-qemu-manager test-apk t1 --apk mygame.apk --mode hard
+omnidroid test-apk t1 --apk mygame.apk --mode hard
 # -> one JSON line; then poke it:
-qemu-manager screenshot t1
-qemu-manager logcat t1 --tag OmniKiosk
-qemu-manager adb t1 -- shell dumpsys activity activities
-qemu-manager remove t1 --json
+omnidroid screenshot t1
+omnidroid logcat t1 --tag OmniKiosk
+omnidroid adb t1 -- shell dumpsys activity activities
+omnidroid remove t1 --json
 ```
 
 ### Production: ship a game update to every account
 ```bash
-qemu-manager rebuild-base --game newgame.apk   # new immutable base vN+1
-qemu-manager update-all                        # data preserved; FAST/FULL auto
+omnidroid rebuild-base --game newgame.apk   # new immutable base vN+1
+omnidroid update-all                        # data preserved; FAST/FULL auto
 ```
 
 ### GUI: manage an account end to end (all JSON)
 ```bash
-qemu-manager create p1 --json
-qemu-manager start p1 --json                   # returns pid + ports at once
+omnidroid create p1 --json
+omnidroid start p1 --json                   # returns pid + ports at once
 # ... GUI connects viewer to 127.0.0.1:<vnc_port> whenever asked,
 #     disconnects freely; instance keeps running ...
-qemu-manager list --stats --json               # live dashboard
-qemu-manager stop p1 --json                    # explicit power-off only
-qemu-manager remove p1 --json                  # explicit delete only
+omnidroid list --stats --json               # live dashboard
+omnidroid stop p1 --json                    # explicit power-off only
+omnidroid remove p1 --json                  # explicit delete only
 ```
 
 ---
@@ -375,7 +375,7 @@ qemu-manager remove p1 --json                  # explicit delete only
 - **"no base image is registered" / "base assets missing"** — the
   install has no usable base yet. The error lists the exact files and
   the full images_dir path; copy them in and re-run (they register
-  automatically). `qemu-manager doctor` shows what's still missing.
+  automatically). `omnidroid doctor` shows what's still missing.
 - **First boot seems stuck** — it is dexopt: allow up to 15 min once per
   account. `omni resume <name>` shows progress phases. Dev boots write
   `accounts/<name>/serial.log`; every boot writes `qemu.log`.

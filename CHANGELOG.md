@@ -6,6 +6,18 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Manager — 2026-07-07 — renamed `qemu-manager` → `omnidroid`
+
+The engine/CLI (and its artifacts) is now **`omnidroid`**
+(`omnidroid.exe` on Windows, `omnidroid` ELF on Linux). This supersedes
+the 2026-07-06 naming split ("engine stays qemu-manager"): the user
+decided the CLI itself is the omnidroid product. Rename only — CLI
+commands, JSON contract, and behavior unchanged. Updated build scripts
+(`build-exe.ps1`, `build-linux.sh` output names), all user-facing hint
+strings in `manager/omni.py`, and all docs. Older entries below may
+still say `qemu-manager`/`omni.exe` where they describe historical
+artifacts.
+
 ## Manager — 2026-07-06 — fresh-install guards, base auto-register, doctor
 
 **Bug fixed:** on a blank deployment (exe in a new folder, setup run,
@@ -23,7 +35,7 @@ create `--data-size` default lookup moved out of `main()` into
 
 **2. Blank deployment self-bootstraps.** `read_config` (not just
 `setup`) creates the default `configs/paths.json` next to the exe on
-first use — drop `qemu-manager.exe` into any folder and every command
+first use — drop the exe into any folder and every command
 works. Malformed config JSON also errors cleanly now. Default template
 gains `default_src` (kernel SRC= for auto-registered bases).
 
@@ -52,8 +64,8 @@ config byte-identical (no rewrite).
 
 ## Manager — 2026-07-06 — VNC wired (localhost-only), GUI JSON contract, remove, HOWTO
 
-Engine features for the separate **omnidroid.exe GUI** (naming split
-confirmed: engine stays `qemu-manager`, no renames). Host-side flags +
+Engine features for the separate GUI app (naming split of 2026-07-06,
+since superseded by the 2026-07-07 rename above). Host-side flags +
 CLI only — no base change, no /system or bridge props touched.
 
 **1. VNC attach point WIRED (was reserved-only).** Every instance
@@ -110,7 +122,7 @@ foreground + renders (screencap)** → stop --json (method=powerdown) →
 remove --json (folder gone, ports freed) → fleet list + images dir
 byte-identical to pre-test snapshot.
 
-## Manager — 2026-07-06 — headless-always, qemu-manager packaging, FAST update-all
+## Manager — 2026-07-06 — headless-always, engine packaging, FAST update-all
 
 **1. Headless always.** `--headless`, `--gpu` and `--window` REMOVED; every
 instance (production and dev/builder) boots with `-display none` — no code
@@ -124,15 +136,16 @@ account.json, shown in `list`/`start`, NOT yet passed to QEMU). Ranges
 1000 apart → no collision below 1000 instances; old accounts backfilled
 automatically.
 
-**2. qemu-manager packaging + setup.** Artifact renamed `omni.exe` →
-**`qemu-manager.exe`** (built; CLI unchanged). New **`setup`** command
+**2. Engine packaging + setup.** Artifact renamed `omni.exe` →
+a standalone engine exe (since 2026-07-07: **`omnidroid.exe`**; built,
+CLI unchanged). New **`setup`** command
 (idempotent, also implicit on first use): Windows = create folders +
 download portable QEMU into ./qemu ONLY (nothing installed to the host
 system); Linux = create `~/OmniImages`, preflight system QEMU
 (`sudo apt install qemu-system-x86 qemu-utils android-tools-adb`),
 `/dev/kvm`, KSM — with exact fix commands. **Two-build process:**
 PyInstaller cannot cross-build — `build-exe.ps1` on Windows,
-`build-linux.sh` ON the Linux box → `dist/qemu-manager` (ELF). Same
+`build-linux.sh` ON the Linux box → `dist/omnidroid` (ELF). Same
 source, identical CLI; Linux additionally gets `-accel kvm` + KSM.
 
 **3. FAST update-all (scales to 100+ accounts).** `update-all` now AUTO-

@@ -154,8 +154,8 @@ def base_setup_help(images_dir, cfg=None):
         f"  base-vN.initrd.img    its extracted initrd\n"
         f"  {template}    formatted-empty ext4 /data template\n"
         f"Complete base-vN triples are registered automatically on the "
-        f"next command\n(or run: qemu-manager setup). Check readiness any "
-        f"time with: qemu-manager doctor\n"
+        f"next command\n(or run: omnidroid setup). Check readiness any "
+        f"time with: omnidroid doctor\n"
         f"(These files will arrive via download in a future version.)")
 
 
@@ -255,7 +255,7 @@ def ensure_qemu():
         # Linux policy: SYSTEM QEMU only (no portable download).
         sys.exit("QEMU not found. Install the system packages:\n"
                  "  sudo apt install qemu-system-x86 qemu-utils "
-                 "android-tools-adb\nthen re-run (see: qemu-manager setup)")
+                 "android-tools-adb\nthen re-run (see: omnidroid setup)")
     import urllib.request
     url = (read_config().get("qemu", {}).get("download_url")
            or DEFAULT_QEMU_URL)
@@ -1556,7 +1556,7 @@ def install_readiness():
            "accounts": len(all_accounts()),
            "ready": base_ready and template_ready and qemu_ok and adb_ok}
     if not qemu_ok:
-        rep["qemu_hint"] = ("run: qemu-manager setup (Windows: portable "
+        rep["qemu_hint"] = ("run: omnidroid setup (Windows: portable "
                             "download into ./qemu; Linux: sudo apt "
                             "install qemu-system-x86 qemu-utils)")
     if not adb_ok:
@@ -1622,7 +1622,7 @@ def cmd_setup(args):
                                  "-aG kvm $USER; re-login; check kvm-ok")
         report["ksm"] = ksm_available()
         if report["ksm"] and ksm_stats().get("run") != 1:
-            report["ksm_hint"] = "enable page dedup: qemu-manager ksm on"
+            report["ksm_hint"] = "enable page dedup: omnidroid ksm on"
     # Base assets present? Auto-register anything the user (later: the
     # downloader) dropped into images_dir, then report readiness with the
     # exact missing paths (see HANDOFF 'server base updates').
@@ -1635,7 +1635,7 @@ def cmd_setup(args):
     if not report["base_assets"]:
         report["ok"] = False
         report["missing_files"] = ready["missing_files"]
-        report["base_hint"] = "see the file list below (or: qemu-manager doctor)"
+        report["base_hint"] = "see the file list below (or: omnidroid doctor)"
     print(json.dumps(report, indent=2))
     if not report["base_assets"]:
         print(base_setup_help(images, cfg))
@@ -1847,7 +1847,7 @@ def cmd_list(args):
         emit_json([account_status(a, stats=args.stats) for a in accts])
         return
     if not accts:
-        print("no accounts. create one: qemu-manager create <name>")
+        print("no accounts. create one: omnidroid create <name>")
         return
     for a in accts:
         rec = account_status(a, stats=args.stats)

@@ -7,7 +7,7 @@
 4. **git log** — commit-by-commit history.
 
 (**HOWTO.md** is the user/GUI-facing usage guide — full command
-reference incl. the `--json` schemas the omnidroid GUI depends on.)
+reference incl. the `--json` schemas the GUI depends on.)
 
 Then: `python manager/omni.py list` and `python manager/omni.py bases` to see
 live state. The repo is self-describing; you do NOT need the prior chat.
@@ -24,20 +24,21 @@ single game (silent boot → custom loading screen → game), fully locked
 down (no status bar, no launcher, no escape), and powers off when the game
 closes. **ALL instances run HEADLESS, always** (no host window; each
 instance exposes a **localhost-only VNC attach point** on its vnc_port —
-wired 2026-07-06). Shipped as **`qemu-manager`**:
-- **Windows `qemu-manager.exe`** — fully portable: `setup` (or first use)
+wired 2026-07-06). Shipped as **`omnidroid`**:
+- **Windows `omnidroid.exe`** — fully portable: `setup` (or first use)
   downloads a **portable QEMU into ./qemu only**. Nothing is ever
   installed to the host system (no global install/registry/PATH).
-- **Linux `qemu-manager`** (ELF, built ON the Linux box via
+- **Linux `omnidroid`** (ELF, built ON the Linux box via
   `build-linux.sh` — PyInstaller can't cross-build) — uses **system QEMU**
   (`sudo apt install qemu-system-x86 qemu-utils android-tools-adb`);
   `setup` preflights qemu / `/dev/kvm` / KSM with exact fix commands.
 
-**Naming split (confirmed with user, 2026-07-06):** the engine stays
-**`qemu-manager`** — do NOT rename it. The user-facing product is a
-separate GUI app, **`omnidroid.exe`** (built in another session), which
-drives this engine via the `--json` CLI (see "GUI contract" below and
-**HOWTO.md**, the detailed usage guide).
+**Naming (updated 2026-07-07, supersedes the 2026-07-06 split):** the
+engine/CLI is named **`omnidroid`** (formerly `qemu-manager` — renamed
+at the user's request; no `qemu-manager` references should remain). A
+separate GUI app (built in another session) drives this engine via the
+`--json` CLI (see "GUI contract" below and **HOWTO.md**, the detailed
+usage guide).
 
 **Test game:** Roblox (`com.roblox.client`, arm64-v8a only) at
 `C:\Users\berat\Downloads\roblox.apk`. It uses its own account system (no
@@ -60,8 +61,8 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
   - `tools/` — `make_bootanimation.py` (STORED-zip packer),
     `gen_placeholder_frames.ps1` (placeholder loading animation).
   - `assets/loading/` — loading-screen frames + `bootanimation.zip`.
-  - `build-exe.ps1` — builds `dist/qemu-manager.exe` on Windows;
-    `build-linux.sh` — builds `dist/qemu-manager` ON Linux (two-build
+  - `build-exe.ps1` — builds `dist/omnidroid.exe` on Windows;
+    `build-linux.sh` — builds `dist/omnidroid` ON Linux (two-build
     process; PyInstaller cannot cross-build).
   - `accounts/` (gitignored) — per-account overlay+data+state.
 
@@ -129,7 +130,7 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 - **Current fleet:** accounts alice, bob, charlie, dave, erin — all on **v5**,
   all DeviceOwner (lockdown active), data preserved through every migration.
 
-## CLI (identical: `python manager/omni.py …` == `qemu-manager(.exe) …`)
+## CLI (identical: `python manager/omni.py …` == `omnidroid(.exe) …`)
 Setup:
 - **Blank-deployment bootstrap (2026-07-06):** the exe can be dropped
   into ANY folder — every command self-creates `configs/paths.json`
@@ -328,7 +329,7 @@ since Phase 1) or swap channels in the viewer. NEVER touch gralloc
 
 ## Open / optional items (nothing required)
 - **Server base updates (INTENDED FLOW — networking NOT implemented; the
-  fast path was built to support it).** In production, qemu-manager will
+  fast path was built to support it).** In production, omnidroid will
   detect an update on the user's server and download a new base qcow2.
   The local flow is already in place and verified:
   1. new `base-vN+1.qcow2` (+ `.kernel`/`.initrd.img`) lands in the
