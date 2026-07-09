@@ -40,6 +40,6 @@
     "qmp_port_start": 17001,
     "vnc_port_start": 18001
   },
-  "notes": "Base images are immutable once any account references them. They live in images/ inside the checkout and ARE committed. base_x86 + base_arm are the two canonical bases; the host architecture selects between them.",
+  "notes": "Base images are immutable once any account references them. They live in the external data dir (images_dir; Windows C:/Users/berat/OmniImages, Linux ~/OmniImages) and are NEVER committed. base_x86 + base_arm are the two canonical bases; the host architecture selects between them.",
   "base_game": {}
 }
