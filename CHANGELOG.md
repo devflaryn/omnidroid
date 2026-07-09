@@ -6,6 +6,34 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Integration milestone — 2026-07-09 — frozen contract v1, both clients wired, Finding B closed
+
+Project-level milestone (spans the workspace, not just this engine — recorded
+here and in HANDOFF "Integration milestone status").
+
+- **This checkout is now the canonical arch-aware engine** (`base_x86` +
+  `base_arm`, cross-arch guard); images external in `OmniImages`; rollback tag
+  **`hub-reconciled`**.
+- **Froze `contracts/omnidroid-api.md` v1** and made the engine honor it:
+  `version` handshake; `--arch`/`--base` on create; `arch` in
+  create/start/list + `bases --json`; ABI-safe install/test-apk (default
+  `--abi arm64-v8a` on x86, `native_bridge_used`/`abi_installed`,
+  `--require-translation`); cross-arch refusal normalized to
+  `{"ok":false,"error":"arch_boundary"}`+exit 1. `[CURRENT]` behavior kept
+  byte-identical (additive `arch` field only).
+- **Finding B (wrong-ABI trap) closed end-to-end** — engine + both clients:
+  a fat APK on x86 installs arm64 and exercises libndk translation
+  (`native_bridge_used=true`); a wrong ABI hard-fails.
+- **QEMU** resolves from / downloads into the PRODUCT dir only (never PATH on
+  Windows), hard-timeout, config-only URL.
+- **Clients wired to the contract** (separate repos): omni-executor
+  (`97d6553`) — version-gate + arch UI; omni-agent (`ac789c9`) — ABI-safe
+  install/test asserts the path, plus the workspace/Docker redesign
+  (`b4e3d8d`, pick any host folder → bind-mount → build in container →
+  host-side ABI-safe install).
+
+See HANDOFF "Integration milestone status" for DONE / DEFERRED / safety nets.
+
 ## Naming — 2026-07-09 — canonical `base_x86` + `base_arm` (versionless filenames)
 
 Unified the two bases onto ONE naming scheme. The x86 base files were renamed

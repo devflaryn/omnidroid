@@ -14,6 +14,80 @@ live state. The repo is self-describing; you do NOT need the prior chat.
 
 ---
 
+## Integration milestone status (2026-07-09)
+
+The multi-app integration (engine + both clients) is DONE and verified on the
+Windows x86 host. This section is the single source of truth for what's
+finished, deferred, and still held as a safety net.
+
+### DONE (committed + verified)
+- **Canonical arch-aware engine** is `Omni Apps/omnidroid` (this repo). It has
+  the two canonical bases `base_x86` + `base_arm`, arch modelled on bases/
+  accounts, and the `update-all`/`update-base` cross-arch refusal. Images live
+  in the external data dir (`OmniImages`), never committed. Rollback marker:
+  tag **`hub-reconciled`**.
+- **Frozen contract `contracts/omnidroid-api.md` v1** — both clients code
+  against it. Engine honors it: `version` handshake, `--arch`/`--base` on
+  create, `arch` in create/start/list + `bases --json`, ABI-safe
+  install/test-apk (default `--abi arm64-v8a` on x86, `native_bridge_used`,
+  `--require-translation`), and `{"ok":false,"error":"arch_boundary"}`+exit 1.
+- **Finding B closed end-to-end.** A fat APK on an x86 account installs its
+  arm64 lib and exercises libndk translation (`native_bridge_used=true`); a
+  wrong ABI is a hard `abi_not_translated` failure. Proven in the engine AND in
+  both clients.
+- **omni-executor** conforms to the contract (version-gate warns on a stale
+  engine, arch badges, arch_boundary handled) — verified create→start→viewer→
+  stop→remove via its API + GUI launch. Commit `97d6553`.
+- **omni-agent** ABI-safe: install/test-apk assert the intended path (x86 ⇒
+  translation, arm ⇒ native); a wrong ABI FAILS the test/session. Commit
+  `ac789c9`.
+- **omni-agent workspace/Docker redesign (Part 2):** no fixed workspace — the
+  user picks a host folder at runtime (= project root), bind-mounted into the
+  container; Docker-shareable preflight; emulator stays on the host via
+  omnidroid. Verified pick→mount→in-container build→host ABI-safe install.
+  Commit `b4e3d8d`.
+- **QEMU resolves from the PRODUCT dir only** (never PATH on Windows), with a
+  hard-timeout download and a config-only URL (no hardcoded default).
+
+### DEFERRED (not started; nothing blocks them)
+- **omni-executor product bundle rebuild** — the exe bundled next to the
+  executor is the OLD pre-contract build and its standalone config lists the
+  deleted `v1..v5` bases. Before shipping, rebuild the bundle with the current
+  engine + a clean config + its own `./qemu`. (The version-gate WARNS against
+  the stale engine, so this is fail-safe.) See the "omni-executor packaging"
+  item below.
+- **QEMU + base-image download URLs → Hostinger** — production delivery of
+  both the portable QEMU and the base qcow2s is one "download from my server"
+  story (see "QEMU delivery" + "Server base updates" below). Host them on
+  Hostinger and set `qemu.download_url` (+ the base download source); no engine
+  code change needed.
+- **arm Phase C cosmetics** — the arm64/LineageOS base shipped "as-is" (see
+  "ARM64 / Apple Silicon"); the deferred Phase C cosmetic polish (silent boot /
+  wallpaper parity with x86) is still open.
+- **Mac `.app` packaging** — the engine runs on Apple Silicon (arm base,
+  native under HVF) but there is no packaged macOS `.app` bundle yet.
+- **Real from-source APK build against a fresh account** — the Part 2 verify
+  used a signature-PRESERVING in-container package (so it reinstalled over the
+  existing test app). A true recompile+resign produces a NEW signing identity
+  and needs a FRESH account to install cleanly. **Verify a real from-source APK
+  build against a fresh account when `omni-exec-android` is first built.**
+
+### Safety nets still in place (2026-07-09 — do not reclaim without confirming)
+- `Omni Apps/omnidroid.stale-x86only.backup` (~24 GB) — the pre-reconcile
+  x86-only copy + its old accounts. No unique git commits; superseded by
+  `hub-reconciled`. **Safe to reclaim now.**
+- `Omni Apps/omni-agent/workspace` (~1.1 GB) — orphaned data from the old
+  fixed-workspace model; code no longer references it. **Safe to reclaim now.**
+- `Desktop/test/omnidroid` (~7.5 GB) — the reconcile source-of-truth (full
+  granular arm git history) AND holder of `test_arm64.apk` (the fat-APK test
+  fixture the agent's ABI tests still use). **KEEP until** the fixture is
+  relocated to a canonical path and confidence in the integration is settled.
+- `Desktop/test/omnidroid/images` (~6 GB) — duplicates `OmniImages`; reclaimable
+  only after repointing test's config at `OmniImages` (else it breaks test).
+- `OmniImages` (~5.9 GB) — LIVE canonical bases, not a safety net; always keep.
+
+---
+
 ## What this project is
 A **kiosk game-launcher + multi-account manager** on top of a **Bliss OS
 16.9.7** image (Android 13, x86_64, with **libndk ARM translation** so an
