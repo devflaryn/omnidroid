@@ -6,6 +6,60 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## Naming — 2026-07-09 — canonical `base_x86` + `base_arm` (versionless filenames)
+
+Unified the two bases onto ONE naming scheme. The x86 base files were renamed
+`base-v5.* → base_x86.*` (`base_x86.qcow2` / `.kernel` / `.initrd.img`),
+mirroring `base_arm.*` exactly: **the filename no longer carries a version**.
+Version tracking did NOT go away — it moved *inside* the config entry
+(`configs/paths.json` base `x86`: `"version": 5` + a `"changelog"` map of
+v1→v5). `base_x86` + `base_arm` are now the **two canonical bases**; the host
+architecture selects between them at runtime.
+
+**What changed**
+- `configs/paths.json`: the `v1..v5` entries collapse into one `x86` entry
+  (versionless disk/kernel/initrd + `version`/`changelog`); `current_base:
+  "x86"`. `base_game` cleared (the pre-installed-game production base is v4's
+  lineage, not carried on the dev x86 base used here).
+- `manager/omni.py`: new `X86_BASE_*` constants next to the `ARM_BASE_*` ones;
+  `autoregister_bases()` registers the canonical `base_x86` triple as tag
+  `x86` (legacy `base-vN` triples still auto-register for old deployments);
+  `current_base` defaults to `x86` when unset; `_next_base_tag()` counts the
+  internal `version` field so a future `rebuild-base` continues the lineage
+  (x86@5 → next build `v6`). `base_setup_help` and the docs updated to the new
+  filenames.
+- **Migration guard (correctness):** `migrate_account` / `migrate_account_fast`
+  / `update-all` now refuse to cross the architecture boundary — arm-uefi
+  accounts are provisioned matched-pair copies (FBE /data), so an overlay
+  repoint would corrupt them. `update-all` skips arm accounts and rejects an
+  arm target.
+
+**Arch-aware selection verified on this x86_64 Windows host.** `doctor`:
+`host_arch=amd64 → effective_base=x86 (x86-bliss)`, `qemu-system-x86_64` +
+WHPX. The `base_arm*` files sit in the same `images/` folder and are
+harmlessly ignored (no arm/HVF attempt on Windows).
+
+**End-to-end x86 loop — PASSED** (fresh account `xtest`, `test_arm64.apk`):
+create → first-boot dexopt + provision (kiosk HOME, **device owner**, 23-pkg
+trim) → clean shutdown → **cold** production boot (`boot_completed` in ~0.4
+min) → kiosk auto-launched the app (`topResumedActivity=…ActivityNativeMain`).
+**libndk ARM translation validated after the rename:** with the app forced to
+its arm64-v8a lib (`primaryCpuAbi=arm64-v8a`), the live process maps show
+`libndk_translation.so` **and** the app's arm64 native libs
+(`lib/arm64/libroblox.so`, `libbacktrace-native.so`, …) loaded, and the arm64
+native GL splash renders on screen. `ro.dalvik.vm.native.bridge=
+libndk_translation.so` throughout. **Device-owner lockdown intact:**
+`mLockTaskModeState=LOCKED`, status bar disabled (`mDisabled1=0x7a60000`), a
+swipe-down gesture did nothing. Clean shutdown on app close via the host
+watchdog. Account removed.
+
+> **Note — `test_arm64.apk` is a *fat* APK** (`lib/{arm64-v8a,armeabi-v7a,
+> x86_64}`), not arm-only. A plain `install` on the x86 base lets Android pick
+> the **x86_64** lib → the app runs native and libndk is NOT exercised. To
+> actually validate the translation path we reinstalled with `--abi
+> arm64-v8a`. If the intent is "always translated," the base would need its
+> x86_64 lib stripped or an arm-only APK.
+
 ## Manager — 2026-07-09 — `omni view`: live VNC viewer (self-contained + native)
 
 New `omni view <account> [--start]` opens a LIVE window onto an instance —

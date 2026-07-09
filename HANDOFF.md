@@ -48,10 +48,17 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 - Host: Windows 11, **i7-13700F (16c/24t), 31.8 GB RAM**. QEMU 11.0 (dev
   snapshot) on PATH; adb (platform-tools) on PATH; Python 3.14; JDK 21 +
   Android build-tools 36 (for the kiosk APK).
-- **Disk images live OUTSIDE the repo** at `C:\Users\berat\OmniImages\`
-  (`base-vN.qcow2` + `base-vN.kernel` + `base-vN.initrd.img`, plus
-  `data-template-8g.qcow2`). `*.qcow2/*.img` are gitignored and must never
-  be committed.
+- **Disk images live in `images/` inside the checkout** (committed;
+  `.gitignore` un-ignores `images/*`). **Two canonical bases** (2026-07-09):
+  - `base_x86.qcow2` + `base_x86.kernel` + `base_x86.initrd.img`
+    (Bliss x86_64; renamed from `base-v5.*` — version now lives in the
+    config entry's `version`/`changelog`, not the filename), plus
+    `data-template-8g.qcow2` (formatted-empty ext4 /data template);
+  - `base_arm.qcow2` + `base_arm_system.qcow2` + `base_arm_data.qcow2` +
+    `base_arm_efivars.fd` (LineageOS 23.2 arm64/UEFI provisioned pair).
+  The host architecture selects the base at runtime (x86_64 → x86/WHPX/KVM,
+  arm64 Mac → arm/HVF); the other architecture's files sit in the same
+  folder and are harmlessly ignored.
 - Repo: `C:\Users\berat\Desktop\Omni Apps\omnidroid\`.
   - `manager/omni.py` — the manager (the whole product logic).
   - `launcher/` — the kiosk APK source (`com.omni.kiosk`) + Gradle-free
@@ -267,10 +274,12 @@ is blocked on read-only-system editing and is a **surfaced decision**, below.
 Setup:
 - **Blank-deployment bootstrap (2026-07-06):** the exe can be dropped
   into ANY folder — every command self-creates `configs/paths.json`
-  (default template incl. `default_src`) next to it. Complete
-  `base-vN.qcow2/.kernel/.initrd.img` triples appearing in images_dir
-  are **auto-registered on the next command** (current_base = highest
-  vN when unset) — this is the hook the future server download uses.
+  (default template incl. `default_src`) next to it. A complete
+  canonical `base_x86.qcow2/.kernel/.initrd.img` triple appearing in
+  images_dir is **auto-registered on the next command** (tag `x86`;
+  current_base = `x86` when unset), as are legacy versioned
+  `base-vN.*` triples and the `base_arm` provisioned pair — this is
+  the hook the future server download uses.
   With no usable base, every base-needing command (create/start/
   update-*/rebuild-base) exits CLEANLY with the exact copy-these-files
   message (never a traceback; `--json` gets `{"ok":false,"error":…}`).
@@ -465,8 +474,12 @@ since Phase 1) or swap channels in the viewer. NEVER touch gralloc
   fast path was built to support it).** In production, omnidroid will
   detect an update on the user's server and download a new base qcow2.
   The local flow is already in place and verified:
-  1. new `base-vN+1.qcow2` (+ `.kernel`/`.initrd.img`) lands in the
-     images dir (today out-of-band; later downloaded),
+  1. a new base triple (+ `.kernel`/`.initrd.img`) lands in the images
+     dir (today out-of-band; later downloaded). Note: `rebuild-base`/
+     `update-kiosk` still emit **versioned** `base-vN.*` files — bases
+     are immutable while overlays reference them, so a rebuild can never
+     overwrite `base_x86.qcow2` in place; promoting a build to the
+     canonical versionless name is a release/rename step,
   2. it is AUTO-REGISTERED on the next command (2026-07-06; `src` from
      config `default_src`) — manual registration no longer needed,
      though `use-base` still switches the default explicitly,

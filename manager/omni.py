@@ -107,6 +107,15 @@ ARM_BASE_DATA = "base_arm_data.qcow2"       # provisioned /data (kiosk + DO)
 ARM_BASE_EFIVARS = "base_arm_efivars.fd"    # provisioned UEFI vars
 ARM_BASE_TAG = "arm"
 
+# x86-bliss base canonical filenames in images_dir — mirrors the base_arm
+# scheme exactly: versionless filename, version tracked INSIDE the config
+# entry ("version" + "changelog"). Legacy base-vN.* triples are still
+# auto-registered so old deployments keep working.
+X86_BASE_DISK = "base_x86.qcow2"
+X86_BASE_KERNEL = "base_x86.kernel"
+X86_BASE_INITRD = "base_x86.initrd.img"
+X86_BASE_TAG = "x86"
+
 # EDK2 aarch64 firmware CODE (read-only); resolved from the QEMU install.
 # On macOS/brew it ships inside the qemu Cellar; overridable via config
 # qemu.arm_edk2_code.
@@ -140,9 +149,7 @@ def arm_edk2_code():
 # folder): any command self-creates this, then base files are copied (or
 # later: downloaded) into images_dir and auto-registered.
 DEFAULT_CONFIG = {
-    "images_dir": {"windows": "C:/Users/berat/OmniImages",
-                   "linux": "~/OmniImages",
-                   "darwin": "~/OmniImages"},
+    "images_dir": "images",
     "current_base": None,
     "data_template": "data-template-8g.qcow2",
     "default_src": DEFAULT_SRC,
@@ -203,20 +210,24 @@ def read_config():
 
 
 def resolve_images_dir(cfg):
-    """images_dir may be a plain string (legacy) or a per-platform dict
+    """images_dir may be a plain string or a per-platform dict
     ({"windows": ..., "linux": ...}) so one checkout works on both hosts.
-    ~ is expanded (Linux convention: ~/OmniImages)."""
+    ~ is expanded; a relative path is resolved against the project root
+    (default: images/ inside the checkout, travels with the repo)."""
     v = cfg["images_dir"]
     if isinstance(v, dict):
         key = "windows" if IS_WINDOWS else "darwin" if IS_MACOS else "linux"
         # Back-compat: older configs only have windows/linux; macOS falls
-        # back to the linux path convention (~/OmniImages).
+        # back to the linux path convention.
         v = v.get(key) or (v.get("linux") if IS_MACOS else None) \
             or v.get("default")
         if not v:
             sys.exit(f"error: configs/paths.json images_dir has no entry "
                      f"for platform '{key}'")
-    return str(Path(v).expanduser())
+    p = Path(v).expanduser()
+    if not p.is_absolute():
+        p = REPO / p
+    return str(p)
 
 
 def base_setup_help(images_dir, cfg=None):
@@ -227,30 +238,46 @@ def base_setup_help(images_dir, cfg=None):
         f"\nThis install has no usable base image yet. Copy the base "
         f"assets into:\n"
         f"  {images_dir}\n"
-        f"required files (exact names; vN = a version tag, e.g. v1):\n"
-        f"  base-vN.qcow2         the immutable Bliss OS system image\n"
-        f"  base-vN.kernel        its extracted kernel\n"
-        f"  base-vN.initrd.img    its extracted initrd\n"
+        f"required files (exact names):\n"
+        f"  base_x86.qcow2        the immutable Bliss OS system image\n"
+        f"  base_x86.kernel       its extracted kernel\n"
+        f"  base_x86.initrd.img   its extracted initrd\n"
         f"  {template}    formatted-empty ext4 /data template\n"
-        f"Complete base-vN triples are registered automatically on the "
-        f"next command\n(or run: omnidroid setup). Check readiness any "
+        f"(legacy versioned triples base-vN.qcow2/.kernel/.initrd.img are "
+        f"also accepted.)\nComplete bases are registered automatically on "
+        f"the next command\n(or run: omnidroid setup). Check readiness any "
         f"time with: omnidroid doctor\n"
         f"(These files will arrive via download in a future version.)")
 
 
 def autoregister_bases():
-    """Scan images_dir for complete base-vN.qcow2 + .kernel + .initrd.img
-    triples that are not registered yet; register them (src from config
-    'default_src') and, if no current_base is set, point it at the highest
-    version found. Persists the RAW config (keeps the per-platform
-    images_dir dict intact). Returns (raw_config, newly_registered_tags).
-    Registration only ADDS entries — existing bases/accounts are never
-    touched, honoring base immutability."""
+    """Scan images_dir for complete, not-yet-registered base file sets and
+    register them (src from config 'default_src'): the canonical versionless
+    base_x86 triple (mirrors base_arm; version lives in the entry, not the
+    filename) plus legacy base-vN triples. If no current_base is set, point
+    it at the canonical x86 base (else the highest legacy version). Persists
+    the RAW config (keeps the per-platform images_dir dict intact). Returns
+    (raw_config, newly_registered_tags). Registration only ADDS entries —
+    existing bases/accounts are never touched, honoring base immutability."""
     raw = read_config()
     images = Path(resolve_images_dir(raw))
     bases = raw.setdefault("bases", {})
     known_disks = {b.get("disk") for b in bases.values()}
     new = []
+    # Canonical x86 base: versionless base_x86 triple (mirrors base_arm).
+    if (X86_BASE_TAG not in bases and X86_BASE_DISK not in known_disks
+            and images.exists()
+            and (images / X86_BASE_DISK).exists()
+            and (images / X86_BASE_KERNEL).exists()
+            and (images / X86_BASE_INITRD).exists()):
+        bases[X86_BASE_TAG] = {"type": BASE_TYPE_X86,
+                               "disk": X86_BASE_DISK,
+                               "kernel": X86_BASE_KERNEL,
+                               "initrd": X86_BASE_INITRD,
+                               "src": raw.get("default_src", DEFAULT_SRC),
+                               "notes": "auto-registered canonical x86 base "
+                                        "from images_dir"}
+        new.append(X86_BASE_TAG)
     if images.exists():
         for disk in sorted(images.glob("base-*.qcow2")):
             m = re.fullmatch(r"base-(v\d+)\.qcow2", disk.name)
@@ -285,10 +312,13 @@ def autoregister_bases():
         new.append(ARM_BASE_TAG)
     changed = bool(new)
     if not raw.get("current_base") and bases:
-        # Prefer an arm base on an arm64 host, else the highest x86 vN.
+        # Prefer an arm base on an arm64 host, else the canonical x86 base,
+        # else the highest legacy x86 vN.
         x86 = [t for t in bases if base_type(bases[t]) == BASE_TYPE_X86]
         if IS_ARM64_HOST and ARM_BASE_TAG in bases:
             raw["current_base"] = ARM_BASE_TAG
+        elif X86_BASE_TAG in bases:
+            raw["current_base"] = X86_BASE_TAG
         elif x86:
             raw["current_base"] = max(
                 x86, key=lambda t: int(re.sub(r"\D", "", t) or 0))
@@ -1452,6 +1482,15 @@ def migrate_account(name, cfg, target=None, reprovision=True):
     target = target or cfg["current_base"]
     acct = load_account(name)
     label = f"update {name}"
+    # Overlay repoint is an x86-bliss mechanism only. arm-uefi accounts are
+    # copies of a provisioned matched pair (system overlay + FBE /data) —
+    # repointing their overlay would break FBE decrypt AND destroy the
+    # provisioned state. Never cross the architecture boundary.
+    if base_type(cfg["bases"][target]) == BASE_TYPE_ARM \
+            or acct_base_is_arm(acct):
+        print(f"[{label}] SKIP: arm-uefi bases/accounts don't migrate via "
+              f"overlay repoint (matched-pair copies); nothing done")
+        return
     if acct["base"] == target:
         print(f"[{label}] already on base {target}; re-provisioning")
     if running_pid(name):
@@ -1512,6 +1551,10 @@ def migrate_account_fast(name, cfg, target):
     place). data.qcow2 untouched; no boot; seconds per account."""
     acct = load_account(name)
     label = f"update {name}"
+    if acct_base_is_arm(acct):        # same guard as migrate_account
+        print(f"[{label}] SKIP: arm-uefi account (matched-pair copy, no "
+              f"overlay repoint)")
+        return
     if running_pid(name):
         _shutdown(acct, label)
     d = account_dir(name)
@@ -1544,7 +1587,15 @@ def cmd_update_all(args):
     target = args.to or cfg["current_base"]
     if target not in cfg["bases"]:
         sys.exit(f"error: no base '{target}'. Known: {list(cfg['bases'])}")
-    names = [a["name"] for a in all_accounts()]
+    if base_type(cfg["bases"][target]) == BASE_TYPE_ARM:
+        sys.exit("error: update-all migrates x86-bliss overlays only; "
+                 "arm-uefi accounts are matched-pair copies (recreate them "
+                 "from a new provisioned pair instead)")
+    all_names = [a["name"] for a in all_accounts()]
+    names = [a["name"] for a in all_accounts() if not acct_base_is_arm(a)]
+    skipped_arm = sorted(set(all_names) - set(names))
+    if skipped_arm:
+        print(f"[update-all] skipping arm-uefi account(s): {skipped_arm}")
     todo = [n for n in names
             if load_account(n)["base"] != target or not args.skip_current]
     print(f"[update-all] target base {target}; "
@@ -1573,8 +1624,13 @@ def cmd_update_all(args):
 # ---------- production base rebuild (update pre-installed game) ----------
 
 def _next_base_tag(cfg):
+    """Next build tag. Counts legacy vN tags AND the internal 'version'
+    field of versionless entries (base_x86), so a rebuild on the canonical
+    base continues its lineage (x86 at version 5 -> next build is v6)."""
     nums = [int(k[1:]) for k in cfg["bases"] if re.fullmatch(r"v\d+", k)]
-    return f"v{max(nums) + 1}"
+    nums += [b["version"] for b in cfg["bases"].values()
+             if isinstance(b.get("version"), int)]
+    return f"v{max(nums, default=0) + 1}"
 
 
 # APK lib/<abi> dir -> Android system-app nativeLibraryDir name.

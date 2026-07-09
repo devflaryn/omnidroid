@@ -1,45 +1,23 @@
 {
-  "images_dir": {
-    "windows": "C:/Users/berat/OmniImages",
-    "linux": "~/OmniImages",
-    "darwin": "~/OmniImages"
-  },
-  "current_base": "v5",
+  "images_dir": "images",
+  "current_base": "x86",
   "data_template": "data-template-8g.qcow2",
   "bases": {
-    "v1": {
-      "disk": "base-v1.qcow2",
-      "kernel": "base-v1.kernel",
-      "initrd": "base-v1.initrd.img",
-      "src": "/android-2024-10-11"
-    },
-    "v2": {
-      "disk": "base-v2.qcow2",
-      "kernel": "base-v2.kernel",
-      "initrd": "base-v2.initrd.img",
+    "x86": {
+      "type": "x86-bliss",
+      "disk": "base_x86.qcow2",
+      "kernel": "base_x86.kernel",
+      "initrd": "base_x86.initrd.img",
+      "version": 5,
       "src": "/android-2024-10-11",
-      "notes": "base-v1 + custom loading screen + kiosk system app (Phase 4/5)"
-    },
-    "v3": {
-      "disk": "base-v3.qcow2",
-      "kernel": "base-v3.kernel",
-      "initrd": "base-v3.initrd.img",
-      "src": "/android-2024-10-11",
-      "notes": "base-v2 + kiosk with black-wallpaper. Silent-boot (no console text) is host-side: production profile uses -vga none/virtio-gpu-pci/console=null."
-    },
-    "v4": {
-      "disk": "base-v4.qcow2",
-      "kernel": "base-v4.kernel",
-      "initrd": "base-v4.initrd.img",
-      "src": "/android-2024-10-11",
-      "notes": "v3 + pre-installed game com.roblox.client (system app, libs extracted) \u2014 PRODUCTION"
-    },
-    "v5": {
-      "disk": "base-v5.qcow2",
-      "kernel": "base-v5.kernel",
-      "initrd": "base-v5.initrd.img",
-      "src": "/android-2024-10-11",
-      "notes": "updated kiosk (Lock Task lockdown + boot/RAM trims)"
+      "notes": "canonical x86_64 base (Bliss 16.9.7). Versionless filename mirrors base_arm; lineage tracked in 'version' + 'changelog' (files were base-v5.* until 2026-07-09).",
+      "changelog": {
+        "1": "pristine Bliss OS 16.9.7 x86_64 (2026-07-05)",
+        "2": "v1 + custom loading screen + kiosk system app (2026-07-05)",
+        "3": "v2 + kiosk with black wallpaper; silent boot moved host-side (2026-07-06)",
+        "4": "v3 + pre-installed game com.roblox.client as system app - PRODUCTION (2026-07-06)",
+        "5": "updated kiosk (Lock Task lockdown + boot/RAM trims) (2026-07-06)"
+      }
     },
     "arm": {
       "type": "arm-uefi",
@@ -59,8 +37,6 @@
     "qmp_port_start": 17001,
     "vnc_port_start": 18001
   },
-  "notes": "Base images are immutable once any account references them. Never commit image files.",
-  "base_game": {
-    "v4": "com.roblox.client"
-  }
+  "notes": "Base images are immutable once any account references them. They live in images/ inside the checkout and ARE committed. base_x86 + base_arm are the two canonical bases; the host architecture selects between them.",
+  "base_game": {}
 }

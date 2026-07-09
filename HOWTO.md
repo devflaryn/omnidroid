@@ -29,10 +29,10 @@ x86. Each *account* is a fully isolated Android instance that:
 ### The two-disk design (why account data is safe)
 
 ```
-OmniImages/  (outside the repo)          accounts/<name>/   (per account)
-  base-vN.qcow2      <- immutable,        system.qcow2  <- disposable overlay
-  base-vN.kernel        shared by         data.qcow2    <- Android /data:
-  base-vN.initrd.img    all accounts                       logins, saves,
+images/  (inside the repo, committed)    accounts/<name>/   (per account)
+  base_x86.qcow2     <- immutable,        system.qcow2  <- disposable overlay
+  base_x86.kernel       shared by         data.qcow2    <- Android /data:
+  base_x86.initrd.img   all accounts                       logins, saves,
   data-template-8g.qcow2                                   installed apps
                                           account.json  <- ports, base, state
 ```
@@ -81,18 +81,21 @@ what to copy where (no crashes), and `--json` callers get
 `{"ok": false, "error": …}`.
 
 Make the install ready by copying these files into the images dir
-(`configs/paths.json` → `images_dir`; Windows default
-`C:/Users/berat/OmniImages`, Linux `~/OmniImages`):
+(`configs/paths.json` → `images_dir`; default `images/` inside the
+checkout — a relative path resolves against the project root):
 
 ```
-base-vN.qcow2            the immutable Bliss OS system image (e.g. base-v5.qcow2)
-base-vN.kernel           its extracted kernel
-base-vN.initrd.img       its extracted initrd
+base_x86.qcow2           the immutable Bliss OS system image
+base_x86.kernel          its extracted kernel
+base_x86.initrd.img      its extracted initrd
 data-template-8g.qcow2   formatted-empty ext4 /data template
 ```
 
-Complete `base-vN` triples are **auto-registered on the next command**
-(current base = highest version if none was set) — no manual config
+The `base_x86` filenames are **versionless** (mirroring `base_arm`);
+the base's version lives inside its config entry (`version` +
+`changelog`), not in the filename. Legacy versioned `base-vN` triples
+are still accepted. Complete bases are **auto-registered on the next
+command** (current base = `x86` if none was set) — no manual config
 editing. This is also the hook for the future server download: a new
 base landing in `images_dir` registers itself the same way.
 

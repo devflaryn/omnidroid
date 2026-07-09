@@ -1,8 +1,11 @@
-# Disk images — never commit (large binaries, live outside the project anyway)
+# Stray disk images are ignored, but the base images in images/ are
+# tracked — the project needs them (note: >100MB files require git-lfs
+# on GitHub; base_arm.qcow2 is ~2.1GB)
 *.qcow2
 *.img
 *.iso
 *.raw
+!images/*
 
 # Per-account runtime state (overlays, data disks, logs)
 accounts/
