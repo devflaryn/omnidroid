@@ -1,5 +1,8 @@
 {
-  "images_dir": "images",
+  "images_dir": {
+    "windows": "C:/Users/berat/OmniImages",
+    "linux": "~/OmniImages"
+  },
   "current_base": "x86",
   "data_template": "data-template-8g.qcow2",
   "bases": {

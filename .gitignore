@@ -1,11 +1,11 @@
-# Stray disk images are ignored, but the base images in images/ are
-# tracked — the project needs them (note: >100MB files require git-lfs
-# on GitHub; base_arm.qcow2 is ~2.1GB)
+# Disk images are NEVER committed — they live in the external data dir
+# (images_dir in configs/paths.json; Windows C:/Users/berat/OmniImages,
+# Linux ~/OmniImages) and are delivered/downloaded out of band.
 *.qcow2
 *.img
 *.iso
 *.raw
-!images/*
+images/
 
 # Per-account runtime state (overlays, data disks, logs)
 accounts/
