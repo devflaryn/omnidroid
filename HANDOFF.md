@@ -504,6 +504,19 @@ since Phase 1) or swap channels in the viewer. NEVER touch gralloc
   from a portable copy (the product-dir model works today). To wire it later,
   just set `qemu.download_url` (and/or ship QEMU inside the product); no code
   change needed.
+- **omni-executor packaging — engine bundle is STALE (packaging TODO,
+  2026-07-09).** omni-executor's code now conforms to omnidroid-api v1
+  (version handshake, arch surfacing, arch_boundary handling) and is verified
+  against the current engine via its `OMNIDROID_ENGINE` override. BUT the
+  `omnidroid.exe` **bundled** next to the executor is the old pre-contract
+  build, and its standalone `configs/paths.json` still lists the deleted
+  `v1..v5` bases. **Before shipping, the executor product bundle must be
+  rebuilt with: the CURRENT engine (build a fresh `omnidroid.exe` from this
+  checkout), a CLEAN `configs/paths.json` (x86+arm, images_dir → the per-user
+  data dir), and its own `./qemu` in the product dir.** The executor's new
+  version-gate correctly WARNS when run against the stale engine, so this is
+  fail-safe, not silent. (Same product-dir + QEMU-delivery story as the
+  "QEMU delivery" item above.)
 - ~~Local VNC view/control~~ — **DONE 2026-07-06** (localhost-only, always
   on, R/B-swapped colors on this QEMU build — cosmetic; see Color note).
 - **Linux/KVM + KSM port — HOST-SIDE CODE PREP DONE (2026-07-06), hardware
