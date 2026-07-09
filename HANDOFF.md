@@ -488,6 +488,22 @@ since Phase 1) or swap channels in the viewer. NEVER touch gralloc
      boots, data untouched** (measured 0.2 s for 6 accounts).
   Bases stay immutable: an update is always a NEW versioned file +
   repoint, never an in-place edit (in-place would corrupt every overlay).
+- **QEMU delivery (DEFERRED decision, 2026-07-09).** The QEMU resolution +
+  auto-install MECHANISM is done and proven: on Windows QEMU resolves ONLY
+  from the product dir (config `qemu.dir` → `./qemu`), **never PATH/global**;
+  if missing it downloads into `./qemu` with a hard socket + installer timeout
+  and a clear error (never hangs). What is NOT decided is the *delivery
+  source*. There is deliberately **no hardcoded download URL** anymore — the
+  old pinned public URL (weilnetz) rotted and started 404ing, so
+  `DEFAULT_QEMU_URL = None`; `ensure_qemu` reads `qemu.download_url` from
+  config and, when unset, exits with an actionable message (populate `./qemu`
+  or set the URL). **INTENDED production answer:** host a portable QEMU on the
+  user's own server/CDN — the **SAME delivery path as the base-image
+  download** above — so QEMU + base are one consistent "download from my
+  server" story once that server exists. Until then: keep `./qemu` populated
+  from a portable copy (the product-dir model works today). To wire it later,
+  just set `qemu.download_url` (and/or ship QEMU inside the product); no code
+  change needed.
 - ~~Local VNC view/control~~ — **DONE 2026-07-06** (localhost-only, always
   on, R/B-swapped colors on this QEMU build — cosmetic; see Color note).
 - **Linux/KVM + KSM port — HOST-SIDE CODE PREP DONE (2026-07-06), hardware

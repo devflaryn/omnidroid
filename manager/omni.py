@@ -58,11 +58,15 @@ PAGE_SIZE = 4096
 FIRST_BOOT_TIMEOUT = 1500   # first boot runs full dexopt; be patient
 NORMAL_BOOT_TIMEOUT = 360
 
-# Default portable QEMU installer (Windows). Overridable in config
-# ("qemu": {"download_url": ...}). NSIS installer supports silent install
-# to a directory via /S /D=<dir>, so no global install is needed.
-DEFAULT_QEMU_URL = ("https://qemu.weilnetz.de/w64/"
-                    "qemu-w64-setup-20240423.exe")
+# Portable QEMU installer URL. Intentionally NOT hardcoded to any third-party
+# URL: pinned public URLs rot (the old weilnetz pin started 404ing). Set it in
+# config ("qemu": {"download_url": ...}) when a delivery source exists. The
+# INTENDED production answer (deferred — see HANDOFF "QEMU delivery") is to host
+# a portable QEMU on the user's own server/CDN, the SAME path as the base-image
+# download, so QEMU + base are one "download from my server" story. Until then,
+# populate ./qemu from a portable copy (the product-dir model already works).
+# The NSIS installer supports silent install via /S /D=<dir> (no global install).
+DEFAULT_QEMU_URL = None
 
 # Kernel SRC= param for auto-registered bases (all Bliss 16.9.7 lineage
 # bases v1..v5 use this). Overridable per config ("default_src") and per
@@ -476,6 +480,16 @@ def ensure_qemu():
     import urllib.request
     url = (read_config().get("qemu", {}).get("download_url")
            or DEFAULT_QEMU_URL)
+    if not url:
+        # No delivery source configured (and none hardcoded, by design). Give a
+        # clear, actionable message rather than reaching for a rotting default.
+        sys.exit(
+            f"QEMU not found in the product dir and no download source is "
+            f"configured.\nEither place a portable QEMU in:\n  {QEMU_DIR}\n"
+            f"or set 'qemu.download_url' (and/or 'qemu.dir') in "
+            f"configs/paths.json.\n(Production: host portable QEMU on your "
+            f"server/CDN — same delivery path as the base image; see HANDOFF "
+            f"\"QEMU delivery\".)")
     QEMU_DIR.mkdir(parents=True, exist_ok=True)
     installer = QEMU_DIR / "qemu-setup.exe"
     print(f"[qemu] not found; downloading portable QEMU into the product "
