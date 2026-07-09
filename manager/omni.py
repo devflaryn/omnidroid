@@ -99,6 +99,25 @@ def acct_base_is_arm(acct):
         return False
 
 
+# ---------- canonical arch tokens (contract omnidroid-api.md v1 §2) ----------
+# The frozen arch enum both clients code against is "x86" | "arm". It maps
+# base type x86-bliss->"x86", arm-uefi->"arm"; host amd64/x86_64->"x86",
+# arm64/aarch64->"arm".
+def arch_of_base(base):
+    """Canonical arch token for a base entry: 'x86' | 'arm'."""
+    return "arm" if base_type(base) == BASE_TYPE_ARM else "x86"
+
+
+def acct_arch(acct):
+    """Canonical arch token for an account: 'x86' | 'arm'."""
+    return "arm" if acct_base_is_arm(acct) else "x86"
+
+
+def host_arch_token():
+    """Canonical arch token for THIS host: 'arm' on arm64, else 'x86'."""
+    return "arm" if IS_ARM64_HOST else "x86"
+
+
 # arm-uefi base default filenames in images_dir (a future downloaded base
 # can override any of these in its config entry).
 ARM_BASE_DISK = "base_arm.qcow2"            # pristine system, shared backing
@@ -170,11 +189,17 @@ def emit_json(obj):
     sys.stdout.flush()
 
 
+# Set True by enable_json_mode(); read by fail() to shape typed errors.
+_JSON_MODE = False
+
+
 def enable_json_mode():
     """--json: stdout must carry EXACTLY the JSON payload. Redirect every
     informational print() (progress, warnings) to stderr so a GUI can
     parse stdout blindly. emit_json writes to sys.stdout directly and is
     unaffected."""
+    global _JSON_MODE
+    _JSON_MODE = True
     import builtins
     orig = builtins.print
 
@@ -182,6 +207,19 @@ def enable_json_mode():
         k.setdefault("file", sys.stderr)
         orig(*a, **k)
     builtins.print = _to_stderr
+
+
+def fail(code, message=None, exit_code=1):
+    """Contract-shaped fatal error (omnidroid-api.md v1 §8). In --json mode
+    emit {"ok":false,"error":<code>,"message":<msg>} on stdout; always write a
+    human line to stderr; exit nonzero. Use for the TYPED errors the contract
+    names (arch_boundary, abi_not_translated, install_failed, no_base, ...);
+    legacy sys.exit(str) sites are left untouched to keep [CURRENT] behavior."""
+    msg = message or code
+    if _JSON_MODE:
+        emit_json({"ok": False, "error": code, "message": msg})
+    sys.stderr.write(f"error: {msg}\n")
+    sys.exit(exit_code)
 
 
 # ---------- config / account state ----------
@@ -385,9 +423,13 @@ def load_config():
 # ---------- qemu resolution + auto-install ----------
 
 def qemu_bin(tool):
-    """Resolve a QEMU executable path. Order: config 'qemu.dir' -> local
-    QEMU_DIR (auto-installed) -> bare name (found on PATH). Lets the shipped
-    exe use a bundled/downloaded QEMU without a global install."""
+    """Resolve a QEMU executable path from the PRODUCT directory only.
+    Order: config 'qemu.dir' (an explicit product-side override) -> local
+    QEMU_DIR (auto-downloaded, next to the engine). On Windows the shipped
+    product NEVER falls back to a host/global/PATH QEMU: if it isn't in the
+    product dir yet, the returned (non-existent) product path drives
+    ensure_qemu() to download it there. On Linux/macOS the documented model is
+    SYSTEM QEMU (apt/brew), so a bare name (PATH) is the final fallback."""
     exe = tool + (".exe" if IS_WINDOWS else "")
     try:
         qd = read_config().get("qemu", {}).get("dir")
@@ -396,7 +438,10 @@ def qemu_bin(tool):
     for cand in ([Path(qd) / exe] if qd else []) + [QEMU_DIR / exe]:
         if cand.exists():
             return str(cand)
-    return tool          # PATH
+    if IS_WINDOWS:
+        # Product-dir only — never PATH. ensure_qemu() populates QEMU_DIR.
+        return str(QEMU_DIR / exe)
+    return tool          # Linux/macOS: system QEMU (apt/brew) is the model
 
 
 def qemu_system_name():
@@ -433,16 +478,36 @@ def ensure_qemu():
            or DEFAULT_QEMU_URL)
     QEMU_DIR.mkdir(parents=True, exist_ok=True)
     installer = QEMU_DIR / "qemu-setup.exe"
-    print(f"[qemu] not found; downloading portable QEMU from {url}")
-    print(f"[qemu] (one-time, ~150 MB) -> {QEMU_DIR}")
-    urllib.request.urlretrieve(url, installer)
-    print("[qemu] installing silently (no global install)...")
-    # NSIS silent install into QEMU_DIR; /D must be last and unquoted.
-    r = subprocess.run(f'"{installer}" /S /D={QEMU_DIR}', shell=True)
+    print(f"[qemu] not found; downloading portable QEMU into the product "
+          f"dir {QEMU_DIR}")
+    print(f"[qemu] from {url} (one-time, ~150 MB)")
+    # Hard socket timeout so a stalled/blackholed connection can NEVER hang the
+    # engine: a clear error is raised instead. Stream to disk (no whole file in
+    # RAM). The download lands ONLY in QEMU_DIR — never a global/system path.
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp, \
+                open(installer, "wb") as f:
+            shutil.copyfileobj(resp, f)
+    except Exception as e:
+        installer.unlink(missing_ok=True)
+        sys.exit(f"[qemu] download failed or timed out ({e}). Set "
+                 f"'qemu.dir' in configs/paths.json to a QEMU install, or "
+                 f"place a portable QEMU in {QEMU_DIR} manually.")
+    print("[qemu] installing silently into the product dir (no global "
+          "install)...")
+    # NSIS silent install into QEMU_DIR; /D must be last and unquoted. Bounded
+    # so a wedged installer can't hang either.
+    try:
+        r = subprocess.run(f'"{installer}" /S /D={QEMU_DIR}', shell=True,
+                           timeout=300)
+    except subprocess.TimeoutExpired:
+        installer.unlink(missing_ok=True)
+        sys.exit(f"[qemu] installer timed out after 300s. Place a portable "
+                 f"QEMU in {QEMU_DIR} manually or set 'qemu.dir'.")
     installer.unlink(missing_ok=True)
     if not _qemu_present():
         sys.exit(f"[qemu] auto-install failed (exit {r.returncode}). "
-                 f"Install QEMU manually or set qemu.dir in "
+                 f"Install QEMU into {QEMU_DIR} manually or set qemu.dir in "
                  f"configs/paths.json")
     print(f"[qemu] ready: {qemu_bin(qemu_system_name())}")
 
@@ -1193,26 +1258,56 @@ def _create_arm(args, cfg, acct, base, d, name, adb_port, qmp_port, vnc_port):
     created = {"name": name, "base": acct["base"], "adb_port": adb_port,
                "qmp_port": qmp_port, "vnc_port": vnc_port,
                "vnc_host": "127.0.0.1", "provisioned": True,
-               "arch": "arm64", "ok": True}
+               "arch": arch_of_base(base), "ok": True}
     if getattr(args, "json", False):
         emit_json(created)
 
 
+def _select_base_tag(cfg, arch=None, base_tag=None):
+    """Base tag for a NEW account, honoring --base/--arch (contract §6.1).
+    Default (neither given): the host-arch effective base — byte-identical to
+    the previous behavior. --base pins an explicit tag; --arch picks that
+    arch's base (preferring the effective/current base if it matches).
+    An --arch/--base mismatch is refused with arch_boundary."""
+    bases = cfg.get("bases") or {}
+    if base_tag is not None:
+        if base_tag not in bases:
+            fail("no_base", f"no base '{base_tag}'. Known: {list(bases)}")
+        if arch and arch_of_base(bases[base_tag]) != arch:
+            fail("arch_boundary",
+                 f"--base {base_tag} is {arch_of_base(bases[base_tag])} but "
+                 f"--arch {arch} was requested")
+        return base_tag
+    if arch is not None:
+        cands = [t for t in bases if arch_of_base(bases[t]) == arch]
+        for pref in (cfg.get("_effective_base"), cfg.get("current_base")):
+            if pref in cands:
+                return pref
+        if cands:
+            return cands[0]
+        fail("no_base", f"no {arch} base registered (known: "
+                        f"{ {t: arch_of_base(bases[t]) for t in bases} })")
+    return cfg.get("_effective_base") or cfg["current_base"]
+
+
 def cmd_create(args):
-    ensure_qemu()
     cfg = load_config()
     if args.data_size is None:
         args.data_size = cfg["qemu"]["data_disk_size"]
     name = args.name
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         sys.exit("error: account name must be [A-Za-z0-9_-]+")
+    # Validate arch/base BEFORE requiring QEMU or creating any dirs, so a bad
+    # --arch/--base request fails cleanly (arch_boundary/no_base) without
+    # triggering a QEMU download.
+    tag = _select_base_tag(cfg, getattr(args, "arch", None),
+                           getattr(args, "base", None))
+    base = cfg["bases"][tag]
     d = account_dir(name)
     if (d / "account.json").exists():
         sys.exit(f"error: account '{name}' already exists")
     d.mkdir(parents=True, exist_ok=True)
-
-    tag = cfg.get("_effective_base") or cfg["current_base"]
-    base = cfg["bases"][tag]
+    ensure_qemu()
     adb_port, qmp_port, vnc_port = allocate_ports(cfg)
     acct = {"name": name, "base": tag,
             "adb_port": adb_port, "qmp_port": qmp_port,
@@ -1247,7 +1342,8 @@ def cmd_create(args):
 
     created = {"name": name, "base": acct["base"], "adb_port": adb_port,
                "qmp_port": qmp_port, "vnc_port": vnc_port,
-               "vnc_host": "127.0.0.1", "ok": True}
+               "vnc_host": "127.0.0.1", "arch": arch_of_base(base),
+               "ok": True}
     if args.no_provision:
         print(f"[create {name}] skipping provisioning; first 'start' "
               f"will run the one-time first boot (~15 min)")
@@ -1302,7 +1398,7 @@ def _cmd_start(args):
               "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
               "vnc_port": acct["vnc_port"], "vnc_host": "127.0.0.1",
               "adb_serial": f"127.0.0.1:{acct['adb_port']}",
-              "first_boot": first, "ok": True}
+              "first_boot": first, "arch": acct_arch(acct), "ok": True}
     print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr} "
           f"(headless), adb 127.0.0.1:{acct['adb_port']}, "
           f"qmp 127.0.0.1:{acct['qmp_port']}, "
@@ -1568,10 +1664,25 @@ def migrate_account_fast(name, cfg, target):
 
 
 def cmd_update_base(args):
-    ensure_qemu()
     cfg = load_config()
-    migrate_account(args.name, cfg, target=args.to,
+    target = args.to or cfg["current_base"]
+    if target not in cfg["bases"]:
+        fail("no_base", f"no base '{target}'. Known: {list(cfg['bases'])}")
+    acct = load_account(args.name)
+    # ARCH BOUNDARY (contract §7.2): arm-uefi accounts/bases are matched-pair
+    # copies (FBE) — overlay repoint would break decrypt and destroy state.
+    # Checked BEFORE ensure_qemu so the refusal never triggers a QEMU install.
+    if base_type(cfg["bases"][target]) == BASE_TYPE_ARM \
+            or acct_base_is_arm(acct):
+        fail("arch_boundary",
+             "arm-uefi accounts/bases do not migrate via overlay repoint "
+             "(matched-pair copies); recreate from a provisioned pair")
+    ensure_qemu()
+    migrate_account(args.name, cfg, target=target,
                     reprovision=not args.no_reprovision)
+    if getattr(args, "json", False):
+        emit_json({"name": args.name, "migrated": True, "base": target,
+                   "arch": acct_arch(acct), "ok": True})
 
 
 def cmd_update_all(args):
@@ -1582,15 +1693,17 @@ def cmd_update_all(args):
     system/game base swap is seconds total, not hours."""
     if args.fast and args.full:
         sys.exit("error: --fast and --full are mutually exclusive")
-    ensure_qemu()
     cfg = load_config()
     target = args.to or cfg["current_base"]
     if target not in cfg["bases"]:
-        sys.exit(f"error: no base '{target}'. Known: {list(cfg['bases'])}")
+        fail("no_base", f"no base '{target}'. Known: {list(cfg['bases'])}")
+    # ARCH BOUNDARY (contract §7.2): an arm-uefi TARGET is refused outright —
+    # update-all migrates x86-bliss overlays only. Checked before ensure_qemu.
     if base_type(cfg["bases"][target]) == BASE_TYPE_ARM:
-        sys.exit("error: update-all migrates x86-bliss overlays only; "
-                 "arm-uefi accounts are matched-pair copies (recreate them "
-                 "from a new provisioned pair instead)")
+        fail("arch_boundary",
+             "update-all migrates x86-bliss overlays only; arm-uefi accounts "
+             "are matched-pair copies (recreate from a new provisioned pair)")
+    ensure_qemu()
     all_names = [a["name"] for a in all_accounts()]
     names = [a["name"] for a in all_accounts() if not acct_base_is_arm(a)]
     skipped_arm = sorted(set(all_names) - set(names))
@@ -1618,7 +1731,13 @@ def cmd_update_all(args):
     print(f"[update-all] done in {time.time() - t0:.1f}s. "
           f"{len(todo) - len(slow)} fast / {len(slow)} full; all on "
           f"{target}; per-account data preserved."
-          + (f" Full (booted): {slow}" if slow else ""))
+          + (f" Full (booted): {slow}" if slow else "")
+          + (f" Skipped arm (arch_boundary): {skipped_arm}"
+             if skipped_arm else ""))
+    if getattr(args, "json", False):
+        emit_json({"target": target, "migrated": todo,
+                   "fast": len(todo) - len(slow), "full": len(slow),
+                   "skipped_arm": skipped_arm, "ok": True})
 
 
 # ---------- production base rebuild (update pre-installed game) ----------
@@ -1825,13 +1944,44 @@ def cmd_use_base(args):
           f"({raw['bases'][args.tag].get('notes','')})")
 
 
+CONTRACT_VERSION = "1.0"
+
+
+def cmd_version(args):
+    """Contract handshake (omnidroid-api.md v1 §4). First call every client
+    makes so it can refuse/degrade against an engine that predates this
+    contract. 'bases' maps arch token -> registered base tag (current_base
+    preferred for its arch)."""
+    raw = read_config()
+    bases = raw.get("bases") or {}
+    by_arch = {}
+    for tag in [raw.get("current_base")] + list(bases):
+        if tag in bases:
+            by_arch.setdefault(arch_of_base(bases[tag]), tag)
+    rep = {"engine": "omnidroid", "contract": CONTRACT_VERSION,
+           "arch_aware": True, "host_arch": host_arch_token(),
+           "bases": by_arch, "current_base": raw.get("current_base"),
+           "ok": True}
+    if getattr(args, "json", False):
+        emit_json(rep)
+    else:
+        print(json.dumps(rep, indent=2))
+
+
 def cmd_bases(args):
     raw = read_config()
     cur = raw["current_base"]
+    if getattr(args, "json", False):
+        bases = [{"tag": tag, "arch": arch_of_base(b), "type": base_type(b),
+                  "game_package": raw.get("base_game", {}).get(tag),
+                  "notes": b.get("notes", "")}
+                 for tag, b in raw["bases"].items()]
+        emit_json({"current_base": cur, "bases": bases, "ok": True})
+        return
     for tag, b in raw["bases"].items():
         game = raw.get("base_game", {}).get(tag)
         mark = " *" if tag == cur else "  "
-        print(f"{mark}{tag}: {b.get('notes','')}"
+        print(f"{mark}{tag}: {b.get('notes','')}  [{arch_of_base(b)}]"
               + (f"  [game: {game}]" if game else ""))
     print(f"\ncurrent (default for new accounts): {cur}")
 
@@ -2150,7 +2300,8 @@ def account_status(a, stats=False):
     """One account's live state as a plain dict — shared by the human
     list output and --json (the GUI relies on these exact keys)."""
     pid = running_pid(a["name"])
-    rec = {"name": a["name"], "base": a["base"], "running": bool(pid),
+    rec = {"name": a["name"], "base": a["base"], "arch": acct_arch(a),
+           "running": bool(pid),
            "pid": pid, "mode": None,
            "adb_port": a["adb_port"], "qmp_port": a["qmp_port"],
            "vnc_port": a.get("vnc_port"), "vnc_host": "127.0.0.1",
@@ -2207,23 +2358,81 @@ def cmd_list(args):
         print(line)
 
 
+# ---------- ABI-safe install (contract omnidroid-api.md v1 §5) ----------
+# A fat APK on the x86 base would let Android pick the x86_64 lib and run
+# NATIVE, bypassing libndk translation — the wrong path. So x86 accounts
+# default to pinning arm64-v8a; the arm base runs arm64 native (no pin).
+
+def _resolve_install_abi(acct, abi, no_abi_pin):
+    """ABI to pin on install: explicit --abi wins; else default arm64-v8a on
+    x86 accounts (exercise libndk translation); arm accounts and --no-abi-pin
+    get no pin (native selection)."""
+    if no_abi_pin:
+        return None
+    if abi:
+        return abi
+    return "arm64-v8a" if acct_arch(acct) == "x86" else None
+
+
+def _abi_install(acct, apk, abi, timeout=600):
+    """adb install with an optional forced --abi (pins native-lib extraction)."""
+    argv = ["install", "-r", "-g", "--no-incremental"]
+    if abi:
+        argv += ["--abi", abi]
+    argv.append(apk)
+    return adb(acct, *argv, timeout=timeout)
+
+
+def installed_primary_abi(acct, pkg):
+    """The ABI Android actually bound for <pkg> (primaryCpuAbi) — i.e. which
+    native libs the app will load. None if unknown / no native libs."""
+    try:
+        out = adb(acct, "shell", "dumpsys", "package", pkg, timeout=20).stdout
+    except Exception:
+        return None
+    m = re.search(r"primaryCpuAbi=(\S+)", out or "")
+    if m and m.group(1) not in ("null", "none", ""):
+        return m.group(1)
+    return None
+
+
+def _is_arm_abi(abi):
+    return bool(abi and abi.startswith(("arm", "armeabi")))
+
+
 def cmd_install(args):
     acct = load_account(args.name)
-    print(f"[install {args.name}] installing {args.apk} ...")
-    r = adb(acct, "install", "-r", "-g", "--no-incremental", args.apk,
-            timeout=600)
+    json_mode = getattr(args, "json", False)
+    arch = acct_arch(acct)
+    abi = _resolve_install_abi(acct, getattr(args, "abi", None),
+                               getattr(args, "no_abi_pin", False))
+    print(f"[install {args.name}] installing {args.apk}"
+          + (f" (--abi {abi})" if abi else " (no ABI pin)") + " ...")
+    r = _abi_install(acct, args.apk, abi)
     out = (r.stdout + r.stderr).strip()
     print(f"[install {args.name}] {out}")
     if "Success" not in out:
-        sys.exit(1)
+        fail("install_failed", f"adb install failed: {out[:400]}")
     pkg = apk_package_name(args.apk)
+    abi_installed = installed_primary_abi(acct, pkg) if pkg else None
+    native_bridge_used = _is_arm_abi(abi_installed) and arch == "x86"
     if pkg:
         acct["game_package"] = pkg
         save_account(acct)
         adb(acct, "shell", "settings", "put", "global",
             "omni_game_package", pkg, timeout=10)
         print(f"[install {args.name}] game package = {pkg} "
-              f"(saved + pushed to guest)")
+              f"(saved + pushed to guest); primaryCpuAbi={abi_installed} "
+              f"native_bridge_used={native_bridge_used}")
+    if getattr(args, "require_translation", False) and not native_bridge_used:
+        fail("abi_not_translated",
+             f"required ARM translation not exercised: primaryCpuAbi="
+             f"{abi_installed} on {arch} account (native_bridge_used=false)")
+    if json_mode:
+        emit_json({"name": args.name, "package": pkg, "installed": True,
+                   "abi_installed": abi_installed,
+                   "native_bridge_used": native_bridge_used,
+                   "arch": arch, "ok": True})
 
 
 def apk_package_name(apk):
@@ -2534,6 +2743,7 @@ def cmd_test_apk(args):
         cmd_create(ca)
     acct = load_account(name)
     result["base"] = acct["base"]
+    result["arch"] = acct_arch(acct)
     if not running_pid(name):
         mode = resolve_mode(cfg, args.mode)
         spawn_qemu(acct, cfg, dev=False, mode=mode)
@@ -2545,10 +2755,21 @@ def cmd_test_apk(args):
         result["mode"] = mode["name"]
     pkg = apk_package_name(args.apk)
     result["package"] = pkg
+    abi = _resolve_install_abi(acct, getattr(args, "abi", None),
+                               getattr(args, "no_abi_pin", False))
     adb(acct, "logcat", "-c", timeout=15)
-    r = adb(acct, "install", "-r", "-g", "--no-incremental", args.apk,
-            timeout=600)
+    r = _abi_install(acct, args.apk, abi)
     result["installed"] = "Success" in (r.stdout + r.stderr)
+    abi_installed = (installed_primary_abi(acct, pkg)
+                     if pkg and result["installed"] else None)
+    result["abi_installed"] = abi_installed
+    result["native_bridge_used"] = _is_arm_abi(abi_installed) \
+        and result["arch"] == "x86"
+    if getattr(args, "require_translation", False) \
+            and not result["native_bridge_used"]:
+        print(json.dumps({**result, "ok": False,
+                          "error": "abi_not_translated"}))
+        sys.exit(1)
     if pkg:
         acct["game_package"] = pkg
         save_account(acct)
@@ -2671,8 +2892,19 @@ def main():
     p = argparse.ArgumentParser(prog="omni")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    vr = sub.add_parser("version",
+                        help="print the engine + contract handshake "
+                             "(omnidroid-api.md v1 §4)")
+    vr.add_argument("--json", action="store_true")
+    vr.set_defaults(func=cmd_version)
+
     c = sub.add_parser("create")
     c.add_argument("name")
+    c.add_argument("--arch", choices=["x86", "arm"], default=None,
+                   help="architecture for the new account (default: the "
+                        "host arch's base)")
+    c.add_argument("--base", default=None,
+                   help="explicit registered base tag (must match --arch)")
     c.add_argument("--no-provision", action="store_true")
     c.add_argument("--data-size", default=None)
     c.add_argument("--json", action="store_true",
@@ -2732,9 +2964,22 @@ def main():
                    help="JSON array of accounts on stdout")
     l.set_defaults(func=cmd_list)
 
-    i = sub.add_parser("install")
+    i = sub.add_parser("install",
+                       help="install a game APK (ABI-safe: x86 accounts "
+                            "default to --abi arm64-v8a so a fat APK "
+                            "exercises libndk translation)")
     i.add_argument("name")
     i.add_argument("apk")
+    i.add_argument("--abi", default=None,
+                   help="force this ABI on install (default arm64-v8a on x86 "
+                        "accounts; none on arm accounts)")
+    i.add_argument("--no-abi-pin", dest="no_abi_pin", action="store_true",
+                   help="do not pin an ABI (let Android select natively)")
+    i.add_argument("--require-translation", dest="require_translation",
+                   action="store_true",
+                   help="fail (abi_not_translated) if the ARM translation "
+                        "path was not actually exercised")
+    i.add_argument("--json", action="store_true")
     i.set_defaults(func=cmd_install)
 
     w = sub.add_parser("watch")
@@ -2767,6 +3012,7 @@ def main():
     ub.add_argument("name")
     ub.add_argument("--to", default=None, help="target base tag (e.g. v3)")
     ub.add_argument("--no-reprovision", action="store_true")
+    ub.add_argument("--json", action="store_true")
     ub.set_defaults(func=cmd_update_base)
 
     ua = sub.add_parser("update-all",
@@ -2785,6 +3031,7 @@ def main():
     ua.add_argument("--no-reprovision", action="store_true")
     ua.add_argument("--skip-current", action="store_true",
                     help="skip accounts already on the target base")
+    ua.add_argument("--json", action="store_true")
     ua.set_defaults(func=cmd_update_all)
 
     rb = sub.add_parser("rebuild-base",
@@ -2853,6 +3100,7 @@ def main():
     bk.set_defaults(func=cmd_bench_ksm)
 
     bs = sub.add_parser("bases", help="list registered bases + current")
+    bs.add_argument("--json", action="store_true")
     bs.set_defaults(func=cmd_bases)
 
     ubz = sub.add_parser("use-base",
@@ -2911,6 +3159,15 @@ def main():
     ta.add_argument("name")
     ta.add_argument("--apk", required=True)
     ta.add_argument("--mode", choices=list(MODES), default="hard")
+    ta.add_argument("--abi", default=None,
+                    help="force this ABI on install (default arm64-v8a on "
+                         "x86 accounts; none on arm accounts)")
+    ta.add_argument("--no-abi-pin", dest="no_abi_pin", action="store_true",
+                    help="do not pin an ABI (native selection)")
+    ta.add_argument("--require-translation", dest="require_translation",
+                    action="store_true",
+                    help="fail (abi_not_translated) if the ARM translation "
+                         "path was not exercised")
     ta.add_argument("--reuse", action="store_true",
                     help="reuse the account if it already exists")
     ta.set_defaults(func=cmd_test_apk)
