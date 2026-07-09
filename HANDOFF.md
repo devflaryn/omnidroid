@@ -50,12 +50,15 @@ finished, deferred, and still held as a safety net.
   hard-timeout download and a config-only URL (no hardcoded default).
 
 ### DEFERRED (not started; nothing blocks them)
-- **omni-executor product bundle rebuild** — the exe bundled next to the
-  executor is the OLD pre-contract build and its standalone config lists the
-  deleted `v1..v5` bases. Before shipping, rebuild the bundle with the current
-  engine + a clean config + its own `./qemu`. (The version-gate WARNS against
-  the stale engine, so this is fail-safe.) See the "omni-executor packaging"
-  item below.
+- **Bundled engine rebuild (BOTH clients)** — the `omnidroid.exe` bundled next
+  to omni-executor AND the one at `omni-agent/tools/omnidroid/omnidroid.exe` are
+  the OLD pre-contract build with a stale standalone config (lists the deleted
+  `v1..v5` bases, `current_base v5`). Before shipping, rebuild each bundle with
+  the current engine + a clean config + its own `./qemu`. Fail-safe until then:
+  the executor version-gate WARNS on the stale engine, and the agent now
+  **defaults to the canonical sibling checkout** `omnidroid/manager/omni.py`
+  (not its stale bundled exe) and FAILS FAST with a clear error if a base is
+  missing (2026-07-09 fix) — so neither client silently uses the stale engine.
 - **QEMU + base-image download URLs → Hostinger** — production delivery of
   both the portable QEMU and the base qcow2s is one "download from my server"
   story (see "QEMU delivery" + "Server base updates" below). Host them on
