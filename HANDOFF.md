@@ -50,15 +50,29 @@ finished, deferred, and still held as a safety net.
   hard-timeout download and a config-only URL (no hardcoded default).
 
 ### DEFERRED (not started; nothing blocks them)
-- **Bundled engine rebuild (BOTH clients)** — the `omnidroid.exe` bundled next
-  to omni-executor AND the one at `omni-agent/tools/omnidroid/omnidroid.exe` are
-  the OLD pre-contract build with a stale standalone config (lists the deleted
-  `v1..v5` bases, `current_base v5`). Before shipping, rebuild each bundle with
-  the current engine + a clean config + its own `./qemu`. Fail-safe until then:
-  the executor version-gate WARNS on the stale engine, and the agent now
-  **defaults to the canonical sibling checkout** `omnidroid/manager/omni.py`
-  (not its stale bundled exe) and FAILS FAST with a clear error if a base is
-  missing (2026-07-09 fix) — so neither client silently uses the stale engine.
+- **omni-agent bundle — REBUILT & DONE (2026-07-09).** `omni-agent/tools/
+  omnidroid/` was rebuilt from the canonical engine: fresh `omnidroid.exe`
+  (PyInstaller, contract 1.0), clean `configs/paths.json` (x86+arm →
+  OmniImages, no v1-5), its own `./qemu`, stale accounts cleared. The agent now
+  drives its OWN bundle (self-contained), verified override-free
+  (version 1.0 → doctor ready base_x86 → boot → ABI-safe install
+  native_bridge_used=true → Roblox rendered). Staleness can no longer be
+  silent: the engine path is logged, the version handshake flags a contract
+  mismatch, and the doctor preflight FAILS FAST on a missing base (1.3 s
+  terminal error, no loop). **When the engine changes, rebuild this bundle**
+  (`omnidroid/build-exe.ps1` → copy exe + a clean config + qemu into
+  `tools/omnidroid`). NB: the bundle's `configs/`, `accounts/`, `qemu/` are
+  gitignored runtime state — only the exe + HOWTO are tracked, so a fresh clone
+  bootstraps a default config (cross-machine base/qemu delivery = the Hostinger
+  item below).
+- **omni-executor bundle — STILL STALE (rebuild before shipping).** The
+  `omnidroid.exe` bundled next to omni-executor is the SAME OLD pre-contract
+  build with the stale `v1..v5` config (`current_base v5`) — the identical
+  landmine the agent just had. Rebuild it the same way (current exe + clean
+  config + `./qemu`) before shipping. Fail-safe until then: the executor's
+  version-gate WARNS when it detects the stale engine, so it can't silently
+  mislead — but it won't actually run against a good engine until rebuilt. The
+  user will do this as a separate step.
 - **QEMU + base-image download URLs → Hostinger** — production delivery of
   both the portable QEMU and the base qcow2s is one "download from my server"
   story (see "QEMU delivery" + "Server base updates" below). Host them on
