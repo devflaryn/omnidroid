@@ -30,6 +30,27 @@
       "efivars": "base_arm_efivars.fd",
       "src": "https://github.com/jqssun/android-lineage-qemu (LineageOS 23.2 arm64, virtio_arm64only)",
       "notes": "auto-registered arm64/UEFI base (LineageOS 23.2, kiosk+device-owner provisioned matched pair)"
+    },
+    "dev": {
+      "type": "x86-bliss",
+      "disk": "base-dev.qcow2",
+      "kernel": "base-dev.kernel",
+      "initrd": "base-dev.initrd.img",
+      "src": "/android-2024-10-11",
+      "notes": "dev/debug base: base_x86 + frida 17.15.4 + root/frida hiding devkit (omni-agent only; NOT shipped). hidden frida port 27142.",
+      "devkit": {
+        "frida_version": "17.15.4",
+        "frida_port": 27142,
+        "magisk_tools": true,
+        "magisk_version": "v30.7",
+        "tools": [
+          "frida-server",
+          "omni-fridad",
+          "omni-frida-stop",
+          "omni-hide",
+          "omni-magisk"
+        ]
+      }
     }
   },
   "qemu": {

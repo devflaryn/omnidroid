@@ -228,6 +228,33 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 - **Current fleet:** accounts alice, bob, charlie, dave, erin — all on **v5**,
   all DeviceOwner (lockdown active), data preserved through every migration.
 
+### `dev` base — the frida/debug remaster (2026-07-13, NEW; do not confuse terms)
+Terminology clash to watch: above, "dev base" means *a base without a baked
+game* (v5). The **NEW `dev` base** is a different thing — the reverse-engineering
+image `base-dev.qcow2`, built by **`omni build-dev-base`** (see `DEV-BASE.md`).
+
+- It is `base_x86` + a devkit baked into `/system`: **frida-server 17.15.4**,
+  `omni-fridad` (hidden frida launch: custom port 27142 + randomized process
+  name), `omni-hide` (root/frida hiding: Magisk `resetprop` prop-spoofs +
+  KernelSU per-app denylist), `omni-magisk` (the `resetprop` applet only — NOT a
+  full Magisk install), an `omni_fridad` init service (disabled), a manifest.
+- **`base_x86` / `base_arm` are UNCHANGED** (byte-identical, same filenames).
+  `base-dev.*` is add-only; **`current_base` stays `x86`** — building the dev
+  base never repoints it. Selected ONLY via `create --base dev` (agent:
+  `ensure_emulator_running(dev=true)` / `OMNI_USE_DEV_BASE=1`).
+- **Root = KernelSU** (already in the base — that's why `adb root`/remount work;
+  it is kernel-level, so it does NOT depend on `ro.debuggable`). Full Magisk over
+  KernelSU on x86 soft-bricks, so we ship only Magisk's `resetprop` for hiding.
+  SELinux is **Permissive** on this Bliss build (frida works with no ptrace
+  friction). Measured on a booted dev account: the base ALREADY ships
+  `ro.build.tags=release-keys`, `ro.boot.verifiedbootstate=green`,
+  `ro.debuggable=0` (so `omni-hide`'s resetprop step is mostly "already clean").
+  Residuals (documented, honest): Permissive is itself detectable; KernelSU su/
+  manager artifacts remain; stock frida thread names remain unless a
+  `frida-server-patched` is dropped in.
+- Rebuild to change the devkit (immutable, like every base). Scripts live in
+  `devkit/`; binaries are fetched at build time.
+
 ## ARM64 / Apple Silicon (proof-of-life, 2026-07-08)
 **Status: PROOF-OF-LIFE ONLY. `base_arm` NOT built yet** — that is its own
 next session. Everything below is a Mac Mini (Apple Silicon, arm64) finding;

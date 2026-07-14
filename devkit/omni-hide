@@ -1,0 +1,83 @@
+#!/system/bin/sh
+# omni-hide [package] — best-effort hiding of root + frida from a target app's
+# detection routines. Ships ONLY inside base-dev.qcow2.
+#
+# The dev base is rooted with KernelSU (not Magisk): a full Magisk install on
+# top of KernelSU on Android-x86 is a kernel-level conflict and is unsafe, so
+# instead we bake the Magisk *tools* (the `resetprop` applet -> omni-magisk)
+# and use KernelSU's own per-app hiding. This script:
+#   1. Reports/normalizes the classic root/emulator prop "tells" (build tags,
+#      verified boot state, debuggable, ...). This Bliss base already ships most
+#      of them clean (release-keys / green / ro.debuggable=0), so the common
+#      result is "already clean"; anything not clean is set with resetprop.
+#      Root here is KernelSU (kernel-level), so it does NOT depend on
+#      ro.debuggable — normalizing these props does not break `adb root`.
+#   2. If a target package is given and a KernelSU control path is present, adds
+#      it to the denylist / requests root be umounted for it (best-effort).
+#   3. Confirms frida is not on the default 27042 port / "frida-server" name.
+#
+# Idempotent. Prints what it actually applied vs. what was already clean.
+MAGISK=/system/bin/omni-magisk
+PKG="$1"
+WORK=/data/local/tmp/.omni
+
+# The Magisk multicall dispatches by argv[0]: invoke it via a 'resetprop'-named
+# symlink so the resetprop applet runs (calling it as `omni-magisk resetprop`
+# yields "applet not found"). Kept in a private tmp dir, not in PATH.
+RP=""
+if [ -x "$MAGISK" ]; then
+    mkdir -p "$WORK" 2>/dev/null
+    ln -sf "$MAGISK" "$WORK/resetprop" 2>/dev/null
+    [ -x "$WORK/resetprop" ] && RP="$WORK/resetprop"
+fi
+
+applied=""; already=""; skipped=""
+# want <key> <value>: set only if not already that value.
+want() {
+    key="$1"; val="$2"
+    if [ -n "$RP" ]; then
+        cur=$("$RP" "$key" 2>/dev/null)
+        if [ "$cur" = "$val" ]; then already="$already $key"; return; fi
+        if "$RP" -n "$key" "$val" >/dev/null 2>&1; then
+            new=$("$RP" "$key" 2>/dev/null)
+            if [ "$new" = "$val" ]; then applied="$applied $key"; return; fi
+        fi
+    fi
+    # No resetprop, or set had no effect — fall back to reporting the getprop.
+    cur=$(getprop "$key" 2>/dev/null)
+    if [ "$cur" = "$val" ]; then already="$already $key"; else skipped="$skipped $key"; fi
+}
+
+want ro.build.tags release-keys
+want ro.build.type user
+want ro.boot.verifiedbootstate green
+want ro.boot.flash.locked 1
+want ro.boot.veritymode enforcing
+want ro.boot.vbmeta.device_state locked
+want ro.boot.warranty_bit 0
+want ro.warranty_bit 0
+want ro.debuggable 0
+
+# --- per-app KernelSU denylist (best effort) ---
+ksu_note="(no KernelSU control path found)"
+if [ -n "$PKG" ] && command -v ksud >/dev/null 2>&1; then
+    if ksud profile set-umount "$PKG" true >/dev/null 2>&1 \
+       || ksud module denylist add "$PKG" >/dev/null 2>&1; then
+        ksu_note="requested KernelSU umount/denylist for $PKG"
+    else
+        ksu_note="ksud present but denylist call not accepted (version differs) for $PKG"
+    fi
+fi
+
+# --- frida sanity ---
+frida_note="frida hidden-launch via omni-fridad (custom port, renamed process)"
+if netstat -tln 2>/dev/null | grep -q "127.0.0.1:27042[^0-9]"; then
+    frida_note="WARNING: something is listening on the DEFAULT frida port 27042"
+fi
+
+echo "omni-hide: props already clean:${already:- (none)}"
+echo "omni-hide: props set now      :${applied:- (none)}"
+[ -n "$skipped" ] && echo "omni-hide: props NOT set       :${skipped} (resetprop unavailable?)"
+echo "omni-hide: KernelSU -> $ksu_note"
+echo "omni-hide: frida    -> $frida_note"
+echo "omni-hide: root is KernelSU (kernel-level), independent of ro.debuggable."

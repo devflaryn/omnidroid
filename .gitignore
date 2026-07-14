@@ -34,3 +34,17 @@ qemu/
 # OS noise
 Thumbs.db
 desktop.ini
+.DS_Store
+
+# Agent/tooling config + editors
+.claude/
+.opencode/
+.codex/
+.agents/
+.vscode/
+.idea/
+
+# Python caches / stray run logs
+.pytest_cache/
+.mypy_cache/
+*.log

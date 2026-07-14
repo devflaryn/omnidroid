@@ -14,6 +14,7 @@ emits exactly one machine-readable line on stdout — the GUI contract):
   python omni.py list   [--stats] [--json]
   python omni.py install <name> <apk> [package]
   python omni.py run-app <name> <package>
+  python omni.py capture <name> [--duration S] [--package PKG] [--json]
   python omni.py adb    <name> -- <adb args...>
 """
 import argparse
@@ -25,6 +26,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -138,6 +140,24 @@ X86_BASE_DISK = "base_x86.qcow2"
 X86_BASE_KERNEL = "base_x86.kernel"
 X86_BASE_INITRD = "base_x86.initrd.img"
 X86_BASE_TAG = "x86"
+
+# dev/debug base (base-dev.qcow2): a remaster of base_x86 with a frida +
+# root-hiding devkit baked into /system (see devkit/README.md and
+# `omni build-dev-base`). DEV-ONLY: it is a separate registered base that only
+# omni-agent ever selects (`create --base dev`); the SHIPPED bases (base_x86 /
+# base_arm) never contain any of it, and building it NEVER changes current_base.
+# The filename intentionally uses the versionless `base-dev` form (it is not a
+# vN production lineage) — the auto-register vN scanner skips it (only matches
+# base-vN), so it is registered explicitly by the builder.
+DEV_BASE_DISK = "base-dev.qcow2"
+DEV_BASE_KERNEL = "base-dev.kernel"
+DEV_BASE_INITRD = "base-dev.initrd.img"
+DEV_BASE_TAG = "dev"
+# frida-server pinned for the dev base (android-x86_64). Override with
+# `build-dev-base --frida-version`. The default frida loopback port for the
+# hidden launcher is intentionally NOT 27042.
+DEFAULT_FRIDA_VERSION = "17.15.4"
+DEFAULT_FRIDA_PORT = 27142
 
 # EDK2 aarch64 firmware CODE (read-only); resolved from the QEMU install.
 # On macOS/brew it ships inside the qemu Cellar; overridable via config
@@ -320,6 +340,24 @@ def autoregister_bases():
                                "notes": "auto-registered canonical x86 base "
                                         "from images_dir"}
         new.append(X86_BASE_TAG)
+    # dev/debug base: register the base-dev triple as tag 'dev' if present.
+    # ADD-ONLY and it is never made current_base (that stays the production x86
+    # base) — building/registering it must not change what new shipped accounts
+    # boot. Placed before the legacy vN scan; the vN regex below skips base-dev.
+    if (DEV_BASE_TAG not in bases and DEV_BASE_DISK not in known_disks
+            and images.exists()
+            and (images / DEV_BASE_DISK).exists()
+            and (images / DEV_BASE_KERNEL).exists()
+            and (images / DEV_BASE_INITRD).exists()):
+        bases[DEV_BASE_TAG] = {"type": BASE_TYPE_X86,
+                               "disk": DEV_BASE_DISK,
+                               "kernel": DEV_BASE_KERNEL,
+                               "initrd": DEV_BASE_INITRD,
+                               "src": raw.get("default_src", DEFAULT_SRC),
+                               "notes": "auto-registered dev/debug base "
+                                        "(frida + root-hiding devkit; omni-agent "
+                                        "only) from images_dir"}
+        new.append(DEV_BASE_TAG)
     if images.exists():
         for disk in sorted(images.glob("base-*.qcow2")):
             m = re.fullmatch(r"base-(v\d+)\.qcow2", disk.name)
@@ -1437,6 +1475,7 @@ def _cmd_start(args):
         provision_settings(acct, f"start {args.name}")
         acct["first_boot_done"] = True
         save_account(acct)
+    maybe_start_autocap(load_account(args.name), f"start {args.name}")
     if json_mode:
         emit_json({**result, "booted": True, "native_bridge_ok": bridge_ok})
 
@@ -1503,6 +1542,7 @@ def cmd_resume(args):
         provision_settings(acct, f"resume {args.name}")
         acct["first_boot_done"] = True
         save_account(acct)
+    maybe_start_autocap(load_account(args.name), f"resume {args.name}")
 
 
 def cmd_stop(args):
@@ -1511,6 +1551,9 @@ def cmd_stop(args):
     running headless — the default); stop is the explicit power path."""
     acct = load_account(args.name)
     was_running = bool(running_pid(args.name))
+    # Stop the always-on recorder first so it finalizes cleanly instead of
+    # racing the VNC teardown as QEMU powers off.
+    stop_autocap(args.name)
     method = _shutdown(acct, f"stop {args.name}", timeout=args.timeout)
     ok = method != "kill-failed"
     if getattr(args, "json", False):
@@ -1555,6 +1598,7 @@ def cmd_remove(args):
     target = _assert_deletable(account_dir(name))
     was_running = bool(running_pid(name))
     if was_running:
+        stop_autocap(name)
         _shutdown(acct, f"remove {name}", timeout=args.timeout)
         if running_pid(name):
             sys.exit(f"error: '{name}' would not stop; NOT deleting")
@@ -1944,6 +1988,283 @@ def cmd_update_kiosk(args):
     update_kiosk_base(cfg, args.apk)
 
 
+# ---------- dev/debug base build (frida + root-hiding devkit) ----------
+#
+# base-dev.qcow2 is a REMASTER of the canonical x86 base with a debugging
+# toolkit baked into /system: frida-server, a hidden frida launcher, and
+# root/frida hiding helpers (Magisk resetprop applet + KernelSU per-app deny).
+# It reuses the exact rebuild-base pipeline shape (boot a throwaway builder on
+# base_x86, `adb root` + remount rw, mutate /system, flatten the overlay) but:
+#   * the SOURCE is pinned to the pristine x86 base (never current_base);
+#   * the OUTPUT is base-dev.* registered under tag 'dev';
+#   * current_base is NEVER changed — the shipped product keeps booting base_x86.
+# Only omni-agent (a dev-only dependency) ever selects it via `create --base dev`.
+
+def _http_json(url, timeout=60):
+    import urllib.request
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "omnidroid-devbase",
+                      "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _download(url, dest, label, timeout=300):
+    import urllib.request
+    import shutil
+    print(f"[{label}] downloading {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "omnidroid-devbase"})
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+    return dest
+
+
+def _stage_devkit(frida_version, include_magisk, frida_port, label):
+    """Prepare (host-side) every artifact baked into base-dev: the frida-server
+    binary (xz-decompressed), the optional Magisk resetprop applet (extracted
+    from the Magisk APK), and LF-normalized device scripts from devkit/.
+    Returns a dict of local paths; the caller pushes them in _devkit_mutate."""
+    import tempfile
+    import lzma
+    import zipfile
+    import shutil
+    stg = Path(tempfile.mkdtemp(prefix="omnidevkit_"))
+    out = {"dir": stg, "frida_version": frida_version, "frida_port": frida_port,
+           "magisk": None, "magisk_version": None, "scripts": {}}
+
+    # frida-server (android-x86_64), decompress the .xz to a bare ELF.
+    xz = stg / f"frida-server-{frida_version}-android-x86_64.xz"
+    url = (f"https://github.com/frida/frida/releases/download/{frida_version}/"
+           f"frida-server-{frida_version}-android-x86_64.xz")
+    _download(url, xz, label)
+    srv = stg / "frida-server"
+    with lzma.open(xz) as zf, open(srv, "wb") as f:
+        shutil.copyfileobj(zf, f)
+    xz.unlink()
+    out["frida_server"] = srv
+    print(f"[{label}] frida-server {frida_version} staged "
+          f"({srv.stat().st_size} bytes)")
+
+    # Magisk resetprop applet — best-effort; the build continues without it.
+    if include_magisk:
+        try:
+            meta = _http_json(
+                "https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
+            apk_asset = next((a for a in meta.get("assets", [])
+                              if a["name"].lower().endswith(".apk")), None)
+            if not apk_asset:
+                raise RuntimeError("no .apk asset in Magisk latest release")
+            apk = stg / apk_asset["name"]
+            _download(apk_asset["browser_download_url"], apk, label)
+            with zipfile.ZipFile(apk) as z:
+                libs = [n for n in z.namelist()
+                        if re.fullmatch(r"lib/x86_64/libmagisk(64)?\.so", n)]
+                if not libs:
+                    raise RuntimeError("no lib/x86_64/libmagisk*.so in the APK")
+                magisk = stg / "omni-magisk"
+                magisk.write_bytes(z.read(sorted(libs)[0]))
+                out["magisk"] = magisk
+                out["magisk_version"] = meta.get("tag_name")
+                print(f"[{label}] magisk applet staged from {sorted(libs)[0]} "
+                      f"({meta.get('tag_name')})")
+            apk.unlink()
+        except Exception as e:
+            print(f"[{label}] WARNING: magisk staging failed ({e}); continuing "
+                  f"without the resetprop applet (omni-hide prop-spoofing "
+                  f"degrades, root+frida hiding via KernelSU/port/name still on)")
+
+    # LF-normalized device scripts (Windows checkouts may hold CRLF; /system/bin/sh
+    # chokes on \r). Source of truth is devkit/.
+    devkit_src = REPO / "devkit"
+    for name in ("omni-fridad", "omni-frida-stop", "omni-hide"):
+        data = (devkit_src / name).read_bytes().replace(b"\r\n", b"\n")
+        p = stg / name
+        p.write_bytes(data)
+        out["scripts"][name] = p
+    rc = (devkit_src / "omni-devkit.rc").read_bytes().replace(b"\r\n", b"\n")
+    (stg / "omni-devkit.rc").write_bytes(rc)
+    out["rc"] = stg / "omni-devkit.rc"
+    return out
+
+
+def _devkit_mutate(acct, label, staging, frida_port):
+    """Bake the dev toolkit into /system (builder already `adb root` + remount
+    rw). Everything lands under /system so it flattens into base-dev.qcow2."""
+    def sh(cmd, timeout=60):
+        return adb(acct, "shell", cmd, timeout=timeout)
+
+    def push_bin(src, dst, mode="755"):
+        base = Path(dst).name
+        tmp = f"/data/local/tmp/{base}"
+        adb(acct, "push", str(src), tmp, timeout=300)
+        r = sh(f"cp {tmp} {dst} && chmod {mode} {dst} && "
+               f"chcon u:object_r:system_file:s0 {dst} && rm -f {tmp} && "
+               f"echo OK_{base}")
+        if f"OK_{base}" not in r.stdout:
+            sys.exit(f"[{label}] failed to install {dst}: {r.stdout}{r.stderr}")
+
+    getenforce = sh("getenforce").stdout.strip()
+    print(f"[{label}] guest SELinux mode: {getenforce or '?'}")
+    # Headroom check: frida-server v17 is ~106MB. The system partition already
+    # hosts baked game system-apps (~150MB Roblox) in production, so it has
+    # slack, but log it so a space failure is diagnosable at a glance.
+    df = sh("df -h /system 2>/dev/null || df -h /").stdout.strip()
+    print(f"[{label}] /system free space:\n{df}")
+
+    push_bin(staging["frida_server"], "/system/bin/frida-server")
+    print(f"[{label}] installed /system/bin/frida-server")
+
+    if staging.get("magisk"):
+        push_bin(staging["magisk"], "/system/bin/omni-magisk")
+        print(f"[{label}] installed /system/bin/omni-magisk (resetprop applet)")
+
+    for name, src in staging["scripts"].items():
+        push_bin(src, f"/system/bin/{name}")
+        print(f"[{label}] installed /system/bin/{name}")
+
+    sh("mkdir -p /system/etc/init")
+    push_bin(staging["rc"], "/system/etc/init/omni-devkit.rc", mode="644")
+    print(f"[{label}] installed /system/etc/init/omni-devkit.rc")
+
+    manifest = {
+        "devkit": "omnidroid-dev-base",
+        "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "frida_version": staging["frida_version"],
+        "frida_port": frida_port,
+        "frida_server": "/system/bin/frida-server",
+        "frida_server_patched": "/system/bin/frida-server-patched (optional drop-in)",
+        "magisk_tools": bool(staging.get("magisk")),
+        "magisk_version": staging.get("magisk_version"),
+        "root": "KernelSU (base, kernel-level) + Magisk resetprop applet (prop hiding)",
+        "selinux": getenforce,
+        "launch": "omni-fridad (start hidden) / omni-frida-stop",
+        "hide": "omni-hide [package]",
+        "note": ("dev/debug base only; never shipped. Root is KernelSU "
+                 "(independent of ro.debuggable, which this base already ships "
+                 "=0 alongside release-keys/verifiedbootstate=green)."),
+    }
+    mtmp = Path(staging["dir"]) / "manifest.json"
+    mtmp.write_text(json.dumps(manifest, indent=2))
+    sh("mkdir -p /system/etc/omni-devkit")
+    push_bin(mtmp, "/system/etc/omni-devkit/manifest.json", mode="644")
+    print(f"[{label}] installed /system/etc/omni-devkit/manifest.json")
+
+    r = sh("for f in /system/bin/frida-server /system/bin/omni-fridad "
+           "/system/bin/omni-frida-stop /system/bin/omni-hide "
+           "/system/etc/init/omni-devkit.rc "
+           "/system/etc/omni-devkit/manifest.json; do "
+           "[ -e \"$f\" ] && echo \"present $f\" || echo \"MISSING $f\"; done")
+    print(f"[{label}] verify:\n{r.stdout.strip()}")
+    if "MISSING" in r.stdout:
+        sys.exit(f"[{label}] devkit verification failed:\n{r.stdout}")
+
+
+def build_dev_base(cfg, frida_version=DEFAULT_FRIDA_VERSION,
+                   frida_port=DEFAULT_FRIDA_PORT, include_magisk=True,
+                   keep_builder=False):
+    """Remaster the pristine x86 base into base-dev.qcow2 with the dev toolkit
+    baked in, register it as tag 'dev', and leave current_base untouched."""
+    import shutil
+    label = "build-dev-base"
+    bases = cfg.get("bases", {})
+    if X86_BASE_TAG not in bases:
+        fail("no_base", f"the canonical x86 base '{X86_BASE_TAG}' is not "
+                        f"registered; build-dev-base remasters it. Known: "
+                        f"{list(bases)}")
+    src = X86_BASE_TAG
+    images = Path(cfg["images_dir"])
+    src_disk = images / bases[src]["disk"]
+    src_kernel = images / bases[src]["kernel"]
+    src_initrd = images / bases[src]["initrd"]
+
+    print(f"[{label}] staging devkit (frida {frida_version}"
+          f"{', magisk tools' if include_magisk else ', no magisk'})...")
+    staging = _stage_devkit(frida_version, include_magisk, frida_port, label)
+
+    bname = "_devbuilder"
+    d = account_dir(bname)
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+    acct = {"name": bname, "base": src, "adb_port": adb_port,
+            "qmp_port": qmp_port, "vnc_port": vnc_port,
+            "first_boot_done": True}
+    save_account(acct)
+    make_overlay(d / "system.qcow2", src_disk)
+    shutil.copyfile(images / cfg["data_template"], d / "data.qcow2")
+
+    try:
+        print(f"[{label}] booting throwaway builder on base '{src}' (headless)")
+        spawn_qemu(acct, cfg, dev=True)
+        if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
+            sys.exit(f"[{label}] builder boot failed "
+                     f"(see accounts/{bname}/qemu.log + serial.log)")
+        adb(acct, "root")
+        time.sleep(3)
+        adb_connect(acct)
+        adb(acct, "shell", "mount -o remount,rw /", timeout=20)
+        _devkit_mutate(acct, label, staging, frida_port)
+        adb(acct, "shell", "sync", timeout=15)
+        _shutdown(acct, label)
+
+        newdisk = images / DEV_BASE_DISK
+        print(f"[{label}] flattening overlay -> {newdisk} (self-contained)")
+        newdisk.unlink(missing_ok=True)
+        subprocess.run([qemu_bin("qemu-img"), "convert", "-O", "qcow2",
+                        "-c", str(d / "system.qcow2"), str(newdisk)],
+                       check=True)
+        shutil.copyfile(src_kernel, images / DEV_BASE_KERNEL)
+        shutil.copyfile(src_initrd, images / DEV_BASE_INITRD)
+
+        raw = read_config()
+        raw.setdefault("bases", {})[DEV_BASE_TAG] = {
+            "type": BASE_TYPE_X86,
+            "disk": DEV_BASE_DISK,
+            "kernel": DEV_BASE_KERNEL,
+            "initrd": DEV_BASE_INITRD,
+            "src": bases[src]["src"],
+            "notes": (f"dev/debug base: base_x86 + frida {frida_version} + "
+                      f"root/frida hiding devkit (omni-agent only; NOT shipped). "
+                      f"hidden frida port {frida_port}."),
+            "devkit": {
+                "frida_version": frida_version,
+                "frida_port": frida_port,
+                "magisk_tools": bool(staging.get("magisk")),
+                "magisk_version": staging.get("magisk_version"),
+                "tools": ["frida-server", "omni-fridad", "omni-frida-stop",
+                          "omni-hide"] + (["omni-magisk"]
+                                          if staging.get("magisk") else []),
+            },
+        }
+        # HARD RULE: do NOT change current_base — the shipped product stays on
+        # the production x86 base. The dev base is opt-in via `--base dev` only.
+        CONFIG_PATH.write_text(json.dumps(raw, indent=2))
+        print(f"[{label}] DONE. Registered base '{DEV_BASE_TAG}' -> {DEV_BASE_DISK}")
+        print(f"[{label}] current_base UNCHANGED (still "
+              f"'{raw.get('current_base')}').")
+        print(f"[{label}] use it: omni create <name> --base {DEV_BASE_TAG}")
+        return DEV_BASE_TAG
+    finally:
+        if not keep_builder and d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(staging["dir"], ignore_errors=True)
+
+
+def cmd_build_dev_base(args):
+    ensure_qemu()
+    cfg = load_config()
+    tag = build_dev_base(cfg, frida_version=args.frida_version,
+                         frida_port=args.frida_port,
+                         include_magisk=not args.no_magisk,
+                         keep_builder=args.keep_builder)
+    if getattr(args, "json", False):
+        raw = read_config()
+        emit_json({"ok": True, "base": tag, "disk": DEV_BASE_DISK,
+                   "current_base": raw.get("current_base"),
+                   "devkit": raw["bases"][tag].get("devkit")})
+
+
 def cmd_use_base(args):
     """Set the default base for NEW accounts (mode switch: e.g. a dev base
     without the game vs a production base with the game pre-installed).
@@ -1975,6 +2296,25 @@ def cmd_version(args):
     rep = {"engine": "omnidroid", "contract": CONTRACT_VERSION,
            "arch_aware": True, "host_arch": host_arch_token(),
            "bases": by_arch, "current_base": raw.get("current_base"),
+           # Advertise millisecond-precise VNC capture so a client can prefer
+           # it over adb-screencap polling and fall back cleanly on old engines
+           # (omni-agent reads capabilities.capture; see _emulator_capture_contract).
+           "capabilities": {
+               "capture": {
+                   "supported": True,
+                   "metadata_version": 2,
+                   "coverage": "vnc_framebuffer",
+                   "auto": True,          # continuous dev-base auto-screenshots
+                   "always_on": True,     # auto-starts on every dev boot (engine-owned)
+                   "options": ["package", "duration", "sample-scale-w",
+                               "change-percent", "black-threshold",
+                               "auto", "max-seconds", "max-keyframes"],
+               },
+           },
+           "commands": ["version", "create", "start", "stop", "remove", "list",
+                        "install", "run-app", "adb", "screenshot", "logcat",
+                        "capture", "autocap", "test-apk", "doctor", "bases",
+                        "use-base"],
            "ok": True}
     if getattr(args, "json", False):
         emit_json(rep)
@@ -2736,6 +3076,478 @@ def cmd_logcat(args):
     sys.stdout.write(r.stdout)
 
 
+# ---------- millisecond-precise capture (contract omnidroid-api.md v1 §6.8) ----
+# Quick logcat crash markers for the engine's own summary. The AGENT does the
+# rich analysis (omni-agent/tools/_emulator_diagnostics.py) on the logcat.txt we
+# write; this is only enough to set crash_detected in the one-line JSON so a
+# standalone client (omni-executor) still learns "it crashed".
+_CAP_CRASH_RE = re.compile(
+    r"FATAL EXCEPTION|Fatal signal|signal\s+\d+\s+\(SIG|beginning of crash|"
+    r"ANR in |Abort message:|FORTIFY|CheckJNI",
+    re.IGNORECASE)
+
+
+def _pidof(acct, pkg):
+    """First numeric pid of pkg in the guest, or None. Cheap; polled on a
+    background thread during capture to build a process lifecycle timeline."""
+    if not pkg:
+        return None
+    try:
+        out = adb(acct, "shell", "pidof", pkg, timeout=8).stdout
+    except Exception:
+        return None
+    for tok in out.split():
+        if tok.isdigit():
+            return int(tok)
+    return None
+
+
+class _PidPoller(threading.Thread):
+    """Polls `pidof <pkg>` on a fixed cadence to time when the app process
+    starts and (crucially) when it DISAPPEARS — the signal that distinguishes a
+    real crash/close from a merely black screen. Timestamps are relative to the
+    same monotonic origin the frame capture uses so events line up with frames.
+    """
+
+    def __init__(self, acct, pkg, start_ns, interval=0.5):
+        super().__init__(name="pid-poller", daemon=True)
+        self.acct, self.pkg, self.start_ns = acct, pkg, start_ns
+        self.interval = interval
+        self._stop = threading.Event()
+        self.events = []          # merge_diagnostics-shaped: type/t_ms/pid
+        self.last_pid = None
+        self.ever_started = False
+
+    def _t_ms(self):
+        return max(0, int(round((time.perf_counter_ns() - self.start_ns) / 1e6)))
+
+    def run(self):
+        while not self._stop.is_set():
+            pid = _pidof(self.acct, self.pkg)
+            t = self._t_ms()
+            if pid and self.last_pid is None:
+                self.events.append({"type": ("app_restarted" if self.ever_started
+                                             else "app_started"),
+                                    "t_ms": t, "pid": pid})
+                self.ever_started = True
+            elif pid and self.last_pid and pid != self.last_pid:
+                self.events.append({"type": "app_restarted", "t_ms": t, "pid": pid})
+            elif not pid and self.last_pid is not None:
+                self.events.append({"type": "app_exited", "t_ms": t,
+                                    "pid": self.last_pid})
+            self.last_pid = pid
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+
+
+def _annotate_frames(frames, events):
+    """Light per-frame app_state/pid/crash from the pid timeline, so the engine's
+    metadata is useful to a client that does NO post-processing. The agent
+    re-derives this (also folding logcat) via merge_diagnostics."""
+    timeline = sorted(events, key=lambda e: e.get("t_ms", 0))
+    state, pid, started = "not_started", None, False
+    cur = 0
+    for fr in sorted(frames, key=lambda f: f.get("t_ms", 0)):
+        while cur < len(timeline) and (timeline[cur].get("t_ms") or 0) <= fr.get("t_ms", 0):
+            ev = timeline[cur]
+            if ev["type"] in ("app_started", "app_restarted"):
+                state, pid, started = "running", ev.get("pid"), True
+            elif ev["type"] == "app_crashed":
+                state, pid = "crashed", None
+            elif ev["type"] in ("app_exited", "app_killed"):
+                state, pid = ("exited" if started else state), None
+            cur += 1
+        fr["app_state"], fr["pid"] = state, pid
+        fr["crash"] = bool(fr.get("crash") or state == "crashed")
+    return state
+
+
+def _capture_finalize(acct, out_dir, meta, events, pkg, running=False):
+    """Shared tail for both bounded and auto capture: dump the epoch logcat,
+    decide crash/exit, annotate frames, and write the FINAL metadata.json. In
+    auto mode capture.py has been flushing metadata live throughout; this is the
+    authoritative last write (running=False) with logcat folded in."""
+    logcat_text = ""
+    try:
+        logcat_text = adb(acct, "logcat", "-b", "all", "-v", "epoch", "-d",
+                          timeout=60).stdout or ""
+    except Exception as e:  # noqa: BLE001
+        meta.setdefault("warnings", []).append(f"logcat dump failed: {e}")
+    try:
+        (out_dir / "logcat.txt").write_text(logcat_text, encoding="utf-8",
+                                            errors="replace")
+    except Exception:
+        pass
+
+    crash_detected = bool(_CAP_CRASH_RE.search(logcat_text))
+    exit_detected = any(e["type"] in ("app_exited", "app_killed") for e in events)
+    if crash_detected:
+        events.append({"type": "app_crashed",
+                       "t_ms": events[-1]["t_ms"] if events else None,
+                       "pid": None})
+    app_state = _annotate_frames(meta.get("keyframes", []), events)
+
+    meta.update({
+        "running": running,
+        "package": pkg,
+        "process_events": events,
+        "logcat_file": "logcat.txt",
+        "crash_detected": crash_detected,
+        "exit_detected": exit_detected,
+        "app_state": app_state,
+    })
+    (out_dir / "metadata.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return crash_detected, exit_detected, app_state
+
+
+def cmd_capture(args):
+    """Record millisecond-precise keyframes from the instance's VNC framebuffer
+    while tracking the app process, then emit one JSON line describing where the
+    keyframes + metadata.json + logcat.txt were written.
+
+    Unlike `screenshot` (one adb round-trip) this observes EVERY display update
+    (see manager/capture.py), so a loading screen shown for a few ms before a
+    black screen is captured as two frames with the true gap between them. A
+    black frame is only a VISUAL fact; crash/exit is decided from the process
+    timeline + logcat, so the caller can tell "app crashed/closed" from "screen
+    is black but the app is alive".
+
+    With ``--auto`` this becomes the always-on auto-screenshot feature: there is
+    no fixed window — it observes continuously and drops a keyframe on EVERY big
+    change until stopped (a STOP sentinel file in the output dir, an optional
+    --max-seconds cap, SIGINT/SIGTERM, or the instance powering off), flushing
+    metadata.json live so a reader sees frames as they land. Auto mode is a
+    DEV-BASE-ONLY feature (base-dev.qcow2); it refuses to run on x86/arm bases."""
+    import os
+    import capture as _capture
+    acct = load_account(args.name)
+    json_mode = getattr(args, "json", False)
+    auto = bool(getattr(args, "auto", False))
+    if not running_pid(args.name):
+        return fail("not_running",
+                    f"account '{args.name}' is not running; start it first",
+                    exit_code=1)
+    if auto and acct.get("base") != "dev":
+        return fail("dev_base_required",
+                    f"auto screenshots are a dev-base feature; account "
+                    f"'{args.name}' is on base '{acct.get('base')}'. Recreate it "
+                    f"with --base dev (base-dev.qcow2) to use --auto.")
+    vnc_port = acct.get("vnc_port")
+    if not vnc_port:
+        return fail("engine_error", f"account '{args.name}' has no vnc_port")
+
+    pkg = getattr(args, "package", None) or acct.get("game_package")
+    prefix = "autocap" if auto else "capture"
+    out_dir = Path(args.out) if getattr(args, "out", None) else \
+        (account_dir(args.name) / f"{prefix}-{int(time.time())}")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear the full log buffer so the dump at the end brackets THIS window only.
+    try:
+        adb(acct, "logcat", "-b", "all", "-c", timeout=15)
+    except Exception:
+        pass
+
+    start_ns = time.perf_counter_ns()
+    poller = _PidPoller(acct, pkg, start_ns) if pkg else None
+    if poller:
+        poller.start()
+
+    stop_event = threading.Event()
+    watcher = None
+    if auto:
+        # Record our pid so a supervisor (omni-agent) can hard-stop if needed,
+        # and watch for the STOP sentinel + termination signals for a clean stop.
+        try:
+            (out_dir / "capture.pid").write_text(str(os.getpid()), encoding="utf-8")
+        except Exception:
+            pass
+        stop_file = out_dir / "STOP"
+        max_seconds = float(getattr(args, "max_seconds", 0) or 0)
+
+        def _watch_stop():
+            deadline = start_ns + int(max_seconds * 1e9) if max_seconds > 0 else None
+            while not stop_event.is_set():
+                if stop_file.exists():
+                    stop_event.set(); return
+                if deadline and time.perf_counter_ns() >= deadline:
+                    stop_event.set(); return
+                stop_event.wait(0.25)
+
+        watcher = threading.Thread(target=_watch_stop, name="cap-stop", daemon=True)
+        watcher.start()
+        try:
+            import signal
+            for _sig in (getattr(signal, "SIGINT", None),
+                         getattr(signal, "SIGTERM", None)):
+                if _sig is not None:
+                    signal.signal(_sig, lambda *_a: stop_event.set())
+        except Exception:
+            pass
+
+    def _enrich(meta):
+        # Live process annotation during auto mode: fold the pid timeline into
+        # each flushed metadata so a reader sees app_state/pid without waiting.
+        evs = list(poller.events) if poller else []
+        meta["app_state"] = _annotate_frames(meta.get("keyframes", []), evs)
+        meta["package"] = pkg
+        meta["process_events"] = evs
+
+    # Saved-keyframe cap: an always-on recorder must not stop saving after the
+    # bounded default (240) on a long session, so --auto gets a much higher cap.
+    max_kf = getattr(args, "max_keyframes", 0) or 0
+    if max_kf <= 0:
+        max_kf = AUTOCAP_MAX_KEYFRAMES if auto else _capture.DEFAULT_MAX_KEYFRAMES
+
+    if auto:
+        cap_kwargs = dict(stop_event=stop_event,
+                          metadata_path=str(out_dir / "metadata.json"),
+                          enrich=_enrich, max_keyframes=max_kf)
+        duration_arg = None  # unbounded
+        print(f"[autocap {args.name}] observing VNC 127.0.0.1:{vnc_port} "
+              f"continuously (STOP file / --max-seconds / signal to end)"
+              + (f", tracking {pkg}" if pkg else ""))
+    else:
+        cap_kwargs = dict(max_keyframes=max_kf)
+        duration_arg = args.duration
+        print(f"[capture {args.name}] observing VNC 127.0.0.1:{vnc_port} for "
+              f"{args.duration}s" + (f", tracking {pkg}" if pkg else ""))
+
+    try:
+        meta = _capture.run_capture(
+            "127.0.0.1", vnc_port, str(out_dir), duration_arg,
+            sample_scale_w=args.sample_scale_w,
+            change_percent=args.change_percent,
+            black_threshold=args.black_threshold,
+            **cap_kwargs)
+    except Exception as e:  # noqa: BLE001
+        if poller:
+            poller.stop()
+        stop_event.set()
+        return fail("engine_error", f"capture failed: {e}")
+    if poller:
+        poller.stop()
+        poller.join(timeout=2)
+    stop_event.set()
+    events = list(poller.events) if poller else []
+
+    crash_detected, exit_detected, app_state = _capture_finalize(
+        acct, out_dir, meta, events, pkg, running=False)
+
+    result = {
+        "name": args.name,
+        "auto": auto,
+        "output_dir": str(out_dir),
+        "metadata_path": str(out_dir / "metadata.json"),
+        "logcat_path": str(out_dir / "logcat.txt"),
+        "keyframe_count": meta["keyframe_count"],
+        "samples_seen": meta["samples_taken"],
+        "duration_ms": meta["duration_ms"],
+        "package": pkg,
+        "crash_detected": crash_detected,
+        "exit_detected": exit_detected,
+        "app_state": app_state,
+        "coverage": "vnc_framebuffer",
+        "ok": True,
+    }
+    print(f"[{prefix} {args.name}] kept {meta['keyframe_count']} keyframe(s) from "
+          f"{meta['samples_taken']} update(s); app_state={app_state} "
+          f"crash={crash_detected} exit={exit_detected}")
+    if json_mode:
+        emit_json(result)
+    else:
+        print(json.dumps(result, indent=2))
+
+
+# ---------- always-on dev auto-screenshots (engine-owned lifecycle) ----------
+# The auto-screenshot recorder is NOT an opt-in the caller toggles: for a DEV
+# account it is started automatically the moment the instance finishes booting
+# (cmd_start --wait / cmd_resume), runs continuously for the instance's lifetime,
+# and is stopped on power-off (cmd_stop / cmd_remove). It writes to
+# $OMNI_AUTOCAP_DIR when set (omni-agent points that at its /workspace), else
+# accounts/<name>/autocap. `ensure_autocap` is idempotent — booting, resuming,
+# or an explicit `omni autocap --ensure` never stacks a second recorder — so the
+# same feed is guaranteed on whenever a dev instance is up.
+AUTOCAP_MAX_KEYFRAMES = 5000            # long always-on session, not a 20s window
+_AUTOCAP_STATE_FILE = "autocap.json"    # in account_dir: {pid, out_dir, package}
+
+
+def _autocap_out_dir(name, override=None):
+    import os
+    d = override or os.environ.get("OMNI_AUTOCAP_DIR")
+    return str(Path(d)) if d else str(account_dir(name) / "autocap")
+
+
+def _autocap_state(name):
+    """(pid, out_dir) of a LIVE recorder for this account, or (None, None)."""
+    p = account_dir(name) / _AUTOCAP_STATE_FILE
+    if not p.exists():
+        return None, None
+    try:
+        st = json.loads(p.read_text())
+    except Exception:  # noqa: BLE001
+        return None, None
+    pid = st.get("pid")
+    if pid and pid_alive(pid):
+        return pid, st.get("out_dir")
+    return None, None
+
+
+def _spawn_autocap(name, out_dir, package=None, max_keyframes=AUTOCAP_MAX_KEYFRAMES):
+    """Detached self-invocation of `capture <name> --auto` (mirrors _spawn_view):
+    the recorder outlives the start/resume process that launched it."""
+    a = ["capture", name, "--auto", "--out", out_dir,
+         "--max-keyframes", str(max_keyframes)]
+    if package:
+        a += ["--package", package]
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + a
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())] + a
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    logf = open(Path(out_dir) / "autocap_engine.log", "ab")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": logf,
+              "stderr": subprocess.STDOUT}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    finally:
+        logf.close()
+    return proc.pid
+
+
+def ensure_autocap(acct, out_dir=None, force=False):
+    """Idempotently ensure the continuous recorder is running for a DEV account.
+    No-op (and returns running=False) on non-dev bases — the feature is dev-only.
+    Returns a small status dict."""
+    name = acct["name"]
+    if acct.get("base") != "dev":
+        return {"running": False, "reason": "not_dev_base",
+                "out_dir": None, "pid": None}
+    want = _autocap_out_dir(name, out_dir)
+    pid, cur_dir = _autocap_state(name)
+    if pid and not force:
+        same = cur_dir and Path(cur_dir).resolve() == Path(want).resolve()
+        if same or not out_dir:
+            # Already running (and either the caller didn't pin a dir, or it
+            # matches) — idempotent no-op, the whole point of "ensure".
+            return {"running": True, "pid": pid, "out_dir": cur_dir,
+                    "already": True}
+        # A DIFFERENT output dir was explicitly requested -> repoint.
+        _stop_autocap_proc(name, pid, cur_dir)
+    elif pid and force:
+        _stop_autocap_proc(name, pid, cur_dir)
+    out = want
+    outp = Path(out)
+    outp.mkdir(parents=True, exist_ok=True)
+    # Fresh feed for this instance session: drop stale frames/metadata/sentinel
+    # so a reader never mixes a previous boot's screenshots with this one.
+    for f in outp.glob("frame_*.png"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    for fn in ("metadata.json", "STOP", "capture.pid"):
+        try:
+            (outp / fn).unlink()
+        except OSError:
+            pass
+    pkg = acct.get("game_package")
+    pid = _spawn_autocap(name, out, package=pkg)
+    (account_dir(name) / _AUTOCAP_STATE_FILE).write_text(
+        json.dumps({"pid": pid, "out_dir": out, "package": pkg,
+                    "started": time.time()}), encoding="utf-8")
+    return {"running": True, "pid": pid, "out_dir": out, "already": False}
+
+
+def _stop_autocap_proc(name, pid, out_dir):
+    """STOP the recorder gracefully (it watches for the sentinel + finalizes),
+    then hard-kill if it lingers."""
+    if out_dir:
+        try:
+            (Path(out_dir) / "STOP").write_text("stop\n", encoding="utf-8")
+        except OSError:
+            pass
+    if pid:
+        for _ in range(25):
+            if not pid_alive(pid):
+                break
+            time.sleep(0.2)
+        if pid_alive(pid):
+            try:
+                if IS_WINDOWS:
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                   capture_output=True)
+                else:
+                    import os as _os
+                    _os.kill(pid, 15)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def stop_autocap(name):
+    """Stop any recorder for this account and clear its state file. Called on
+    power-off so a stopped instance never leaves a recorder attached to a dead
+    VNC (the recorder also self-exits when VNC closes; this is the clean path)."""
+    pid, out_dir = _autocap_state(name)
+    if pid:
+        _stop_autocap_proc(name, pid, out_dir)
+    try:
+        (account_dir(name) / _AUTOCAP_STATE_FILE).unlink()
+    except OSError:
+        pass
+    return {"stopped": bool(pid), "out_dir": out_dir}
+
+
+def maybe_start_autocap(acct, label):
+    """Best-effort auto-start hook for the boot paths. Never raises into the
+    boot flow — a recorder failure must not fail `start`."""
+    try:
+        r = ensure_autocap(acct)
+        if r.get("running") and not r.get("already"):
+            print(f"[{label}] auto-screenshots ON (dev base) -> {r['out_dir']}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[{label}] auto-screenshots could not start: {e}")
+
+
+def cmd_autocap(args):
+    """Inspect/control the always-on dev auto-screenshot recorder. The default
+    action, --ensure, is IDEMPOTENT: it starts a recorder only if one is not
+    already running, so omni-agent can call it on every ensure-emulator without
+    ever stacking two. --status reports; --stop halts it; --restart forces a
+    fresh one (e.g. to repoint --out)."""
+    acct = load_account(args.name)
+    json_mode = getattr(args, "json", False)
+    if getattr(args, "stop", False):
+        r = stop_autocap(args.name)
+    elif getattr(args, "status", False):
+        pid, out_dir = _autocap_state(args.name)
+        r = {"running": bool(pid), "pid": pid, "out_dir": out_dir,
+             "base": acct.get("base")}
+    else:  # --ensure (default)
+        if not running_pid(args.name):
+            return fail("not_running",
+                        f"account '{args.name}' is not running; start it first")
+        if acct.get("base") != "dev":
+            return fail("dev_base_required",
+                        f"auto screenshots are a dev-base feature; account "
+                        f"'{args.name}' is on base '{acct.get('base')}'.")
+        r = ensure_autocap(acct, out_dir=getattr(args, "out", None),
+                           force=getattr(args, "restart", False))
+    out = {"name": args.name, "ok": True, **r}
+    if json_mode:
+        emit_json(out)
+    else:
+        print(json.dumps(out, indent=2))
+
+
 def cmd_test_apk(args):
     """One-shot dev harness: ensure a FRESH session with NO app pre-baked
     (v3 dev base, kiosk), install the given APK, let the kiosk launch it,
@@ -3061,6 +3873,27 @@ def main():
                                          / "omni-kiosk.apk"))
     uk.set_defaults(func=cmd_update_kiosk)
 
+    bdb = sub.add_parser("build-dev-base",
+                         help="remaster base_x86 -> base-dev.qcow2 with a "
+                              "frida + root/frida-hiding devkit baked in "
+                              "(dev/debug base for omni-agent; NOT shipped; "
+                              "current_base is left unchanged)")
+    bdb.add_argument("--frida-version", default=DEFAULT_FRIDA_VERSION,
+                     dest="frida_version",
+                     help=f"frida-server version to bake "
+                          f"(default {DEFAULT_FRIDA_VERSION})")
+    bdb.add_argument("--frida-port", type=int, default=DEFAULT_FRIDA_PORT,
+                     dest="frida_port",
+                     help=f"hidden frida-server loopback port "
+                          f"(default {DEFAULT_FRIDA_PORT}, deliberately not 27042)")
+    bdb.add_argument("--no-magisk", action="store_true", dest="no_magisk",
+                     help="skip baking the Magisk resetprop applet "
+                          "(omni-hide prop-spoofing degrades)")
+    bdb.add_argument("--keep-builder", action="store_true", dest="keep_builder",
+                     help="keep the throwaway _devbuilder account dir (debug)")
+    bdb.add_argument("--json", action="store_true")
+    bdb.set_defaults(func=cmd_build_dev_base)
+
     su = sub.add_parser("setup",
                         help="first-run setup: folders + QEMU (Windows: "
                              "portable download, self-contained; Linux: "
@@ -3166,6 +3999,59 @@ def main():
     lc.add_argument("--clear", action="store_true")
     lc.add_argument("--timeout", type=int, default=30)
     lc.set_defaults(func=cmd_logcat)
+
+    cap = sub.add_parser("capture",
+                         help="millisecond-precise keyframe capture from the "
+                              "VNC framebuffer + process/logcat diagnostics")
+    cap.add_argument("name")
+    cap.add_argument("--out", default=None,
+                     help="output dir for keyframes + metadata.json + "
+                          "logcat.txt (default accounts/<name>/capture-<ts>)")
+    cap.add_argument("--duration", type=float, default=20.0,
+                     help="seconds to observe the screen (bounded mode)")
+    cap.add_argument("--auto", action="store_true",
+                     help="continuous auto-screenshot mode (DEV BASE ONLY): "
+                          "observe indefinitely, drop a keyframe on every big "
+                          "change, flush metadata.json live; stop via a STOP "
+                          "file in --out, --max-seconds, a signal, or shutdown")
+    cap.add_argument("--max-seconds", dest="max_seconds", type=float, default=0.0,
+                     help="auto mode safety cap in seconds (0 = no cap; run "
+                          "until STOP/signal/instance shutdown)")
+    cap.add_argument("--package", default=None,
+                     help="app package to track (start/exit/crash); default "
+                          "the account's kiosk game_package")
+    cap.add_argument("--sample-scale-w", dest="sample_scale_w", type=int,
+                     default=160, help="downscale width for change detection")
+    cap.add_argument("--change-percent", dest="change_percent", type=float,
+                     default=8.0, help="%% of changed pixels => a scene change")
+    cap.add_argument("--black-threshold", dest="black_threshold", type=float,
+                     default=10.0, help="mean brightness below => black frame")
+    cap.add_argument("--max-keyframes", dest="max_keyframes", type=int, default=0,
+                     help="cap on saved keyframes (0 = default: 240 bounded / "
+                          "5000 for --auto)")
+    cap.add_argument("--json", action="store_true")
+    cap.set_defaults(func=cmd_capture)
+
+    aco = sub.add_parser("autocap",
+                         help="control the always-on dev auto-screenshot "
+                              "recorder (auto-starts on a dev boot; this is for "
+                              "explicit ensure/status/stop)")
+    aco.add_argument("name")
+    aco_g = aco.add_mutually_exclusive_group()
+    aco_g.add_argument("--ensure", action="store_true",
+                       help="start the recorder if not already running "
+                            "(idempotent; the default action)")
+    aco_g.add_argument("--stop", action="store_true",
+                       help="stop the recorder for this account")
+    aco_g.add_argument("--status", action="store_true",
+                       help="report whether a recorder is running + its out dir")
+    aco.add_argument("--restart", action="store_true",
+                     help="force a fresh recorder (e.g. to repoint --out)")
+    aco.add_argument("--out", default=None,
+                     help="output dir (default $OMNI_AUTOCAP_DIR or "
+                          "accounts/<name>/autocap)")
+    aco.add_argument("--json", action="store_true")
+    aco.set_defaults(func=cmd_autocap)
 
     ta = sub.add_parser("test-apk",
                         help="dev harness: fresh session, install+launch an "

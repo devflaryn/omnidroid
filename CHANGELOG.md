@@ -6,6 +6,66 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-07-13 — dev/prod x86 split: `build-dev-base` + `base-dev.qcow2` (frida + root/frida hiding)
+
+- **New `omni build-dev-base` command** (`manager/omni.py`: `_stage_devkit`,
+  `_devkit_mutate`, `build_dev_base`, `cmd_build_dev_base`). Remasters the
+  pristine `base_x86` into a SEPARATE dev/debug base, `base-dev.qcow2`,
+  registered under the tag `dev`. Reuses the exact `rebuild-base` pipeline shape
+  (throwaway builder on `base_x86`, `adb root` + `mount -o remount,rw /`, mutate
+  `/system`, `qemu-img convert` flatten) but the source is always the pristine
+  x86 base (never `current_base`), the output is `base-dev.*`, and **`current_base`
+  is NEVER changed** — the shipped product keeps booting `base_x86`.
+- **`base_x86` / `base_arm` are untouched** — same filenames, same config, same
+  behavior. `base-dev` is add-only. `autoregister_bases()` re-registers the
+  `dev` tag if the `base-dev.*` triple is present but never makes it current.
+- **Baked devkit** (`/system`, dev base only; scripts sourced from `devkit/`,
+  binaries fetched at build time): `frida-server` (x86_64, pinned 17.15.4),
+  `omni-fridad` (start frida hidden — custom loopback port not 27042 +
+  randomized process name; prefers `frida-server-patched` if dropped in),
+  `omni-frida-stop`, `omni-hide` (Magisk `resetprop` prop-spoofs of the
+  build-tag/verified-boot root tells + KernelSU per-app denylist), `omni-magisk`
+  (the Magisk multicall binary, used ONLY as `resetprop` — NOT a full Magisk
+  install; full Magisk over KernelSU on x86 soft-bricks), an `omni_fridad` init
+  service (disabled by default), and a `manifest.json`.
+- **Root model:** the base is already KernelSU-rooted (kernel-level — that's why
+  `adb root` + remount work, independent of `ro.debuggable`); the dev base keeps
+  KernelSU and adds only Magisk's `resetprop` for hiding. SELinux is Permissive
+  on this Bliss build, so frida runs without ptrace friction. Measured on a
+  booted dev account: the base ALREADY ships `ro.build.tags=release-keys`,
+  `ro.boot.verifiedbootstate=green`, `ro.debuggable=0`, so the prop-based root
+  tells look stock by default. Honest residuals (see `DEV-BASE.md`): Permissive
+  is itself detectable; KernelSU su/manager artifacts remain; stock frida thread
+  names remain unless a patched `frida-server-patched` is dropped in.
+- **Selection:** opt-in only via `omni create <name> --base dev`. `omni-agent`
+  wires this through `ensure_emulator_running(dev=true)` / `OMNI_USE_DEV_BASE=1`
+  and adds `ensure_frida_server` + `hide_root_from_app` tools. New doc:
+  `DEV-BASE.md`; `devkit/README.md` documents the on-device payload.
+
+## 2026-07-12 — `capture`: millisecond-precise VNC keyframes + crash/black diagnostics
+
+- **New `omni capture <name>` command** (`manager/capture.py` +
+  `cmd_capture`). Attaches to the instance's loopback VNC server and observes
+  EVERY completed framebuffer update via `vncview.RFBClient`'s `on_frame` hook
+  (host-monotonic `perf_counter_ns` per update; the recv-thread callback only
+  enqueues, a worker diffs/encodes — so two updates can never coalesce and a
+  loading screen shown for a few ms before a black screen is captured as TWO
+  keyframes with the true `delta_ms` between them). Change detection keeps only
+  meaningful frames (a looping spinner is ignored; a real transition or a move
+  into/out of black is kept — `KeyframeSelector`).
+- **Crash vs black-screen distinction.** A background `_PidTracker` times when
+  the tracked app process starts and DISAPPEARS; `capture` also grabs
+  `logcat -b all -v epoch` and scans it. `metadata.json` carries per-frame
+  `app_state`/`crash`, `process_events[]`, `start_epoch_ms`, and top-level
+  `crash_detected`/`exit_detected` — so a client can tell "app crashed/closed"
+  from "screen is black but the app is alive".
+- **`version` now advertises `capabilities.capture`** (`supported`,
+  `metadata_version: 2`, `coverage: "vnc_framebuffer"`, `options`) so a client
+  prefers it and falls back to adb-screencap polling on an older engine.
+  Additive only; all `[CURRENT]` output byte-identical. Contract updated:
+  `contracts/omnidroid-api.md` §4, §6.8. Rebuild the bundled agent engine
+  (`build-exe.ps1` → copy into `omni-agent/tools/omnidroid/`) to ship it.
+
 ## Integration milestone — 2026-07-09 — frozen contract v1, both clients wired, Finding B closed
 
 Project-level milestone (spans the workspace, not just this engine — recorded

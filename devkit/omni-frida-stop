@@ -1,0 +1,19 @@
+#!/system/bin/sh
+# omni-frida-stop — stop any devkit frida-server started by omni-fridad.
+# Only ships inside base-dev.qcow2.
+WORK=/data/local/tmp/.omni
+n=0
+# Kill the randomly-named copies we launch from the private work dir.
+for p in $(ls /proc 2>/dev/null); do
+    [ -d "/proc/$p" ] || continue
+    exe=$(readlink "/proc/$p/exe" 2>/dev/null)
+    case "$exe" in
+        "$WORK"/*) kill -9 "$p" 2>/dev/null && n=$((n+1)) ;;
+    esac
+done
+# Belt-and-braces: anything still holding the frida-server name.
+if command -v pkill >/dev/null 2>&1; then
+    pkill -9 -f "$WORK/" 2>/dev/null
+    pkill -9 -x frida-server 2>/dev/null
+fi
+echo "omni-frida-stop: stopped $n devkit frida-server process(es)"

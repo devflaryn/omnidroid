@@ -1,0 +1,59 @@
+#!/system/bin/sh
+# omni-fridad — start the baked frida-server in a lightly-hidden mode.
+#
+# This ships ONLY inside base-dev.qcow2 (the dev/debug base). It is NEVER
+# present in the shipped production bases (base_x86 / base_arm).
+#
+# Hardening applied vs. a naive `frida-server` launch:
+#   * binds a CUSTOM loopback port (not the well-known 27042), so a port scan
+#     for 27042 misses it;
+#   * execs a RANDOMLY-NAMED copy from a private tmp dir, so `ps` /
+#     /proc/<pid>/comm do not show the string "frida-server";
+#   * prefers a patched binary at /system/bin/frida-server-patched if a tester
+#     drops one in (patched builds also rename the internal gum/gmain threads,
+#     closing the residual thread-name detection that stock frida cannot).
+#
+# Root is required (run under `adb root` or `su`). Port is read from the devkit
+# manifest so the host tooling and this script always agree.
+DEVKIT=/system/etc/omni-devkit
+MANIFEST="$DEVKIT/manifest.json"
+
+PORT="$(sed -n 's/.*"frida_port"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$MANIFEST" 2>/dev/null | head -n1)"
+[ -z "$PORT" ] && PORT=27142
+
+SRV=/system/bin/frida-server
+[ -x /system/bin/frida-server-patched ] && SRV=/system/bin/frida-server-patched
+if [ ! -x "$SRV" ]; then
+    echo "omni-fridad: ERROR frida-server binary not found at $SRV" >&2
+    exit 1
+fi
+
+WORK=/data/local/tmp/.omni
+mkdir -p "$WORK" 2>/dev/null
+chmod 771 "$WORK" 2>/dev/null
+
+# Already listening on our port? Don't double-start.
+if command -v netstat >/dev/null 2>&1; then
+    if netstat -tln 2>/dev/null | grep -q "127.0.0.1:$PORT[^0-9]"; then
+        echo "omni-fridad: already listening on 127.0.0.1:$PORT"
+        exit 0
+    fi
+fi
+
+# Randomized innocuous name so process listings don't reveal frida.
+NAME="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d - | cut -c1-10)"
+[ -z "$NAME" ] && NAME="sysd$$"
+BIN="$WORK/.$NAME"
+cat "$SRV" > "$BIN" 2>/dev/null && chmod 755 "$BIN" 2>/dev/null
+[ -x "$BIN" ] || BIN="$SRV"   # fall back to the real path if the copy failed
+
+# Detach so it survives the adb shell exiting.
+nohup "$BIN" -l "127.0.0.1:$PORT" >/dev/null 2>&1 &
+PID=$!
+sleep 1
+if kill -0 "$PID" 2>/dev/null; then
+    echo "omni-fridad: frida-server up as '.$NAME' on 127.0.0.1:$PORT (pid $PID)"
+    exit 0
+fi
+echo "omni-fridad: ERROR frida-server exited immediately (check SELinux: $(getenforce 2>/dev/null))" >&2
+exit 1

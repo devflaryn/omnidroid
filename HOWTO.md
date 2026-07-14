@@ -274,6 +274,24 @@ Build a NEW immutable base version with the game baked as a `/system/app`
 (native libs extracted) / with a new kiosk build. Then `update-all` rolls
 it out. Bases are never edited in place.
 
+#### `omni build-dev-base [--frida-version V] [--frida-port P] [--no-magisk] [--json]`
+Remaster the **production x86 base** into a separate **dev/debug base**,
+`base-dev.qcow2`, registered under the tag `dev`. It bakes a reverse-engineering
+toolkit into `/system` — **frida-server**, a hidden frida launcher
+(`omni-fridad`: custom loopback port, randomized process name), and root/frida
+**hiding** helpers (`omni-hide`: Magisk `resetprop` prop-spoofs + KernelSU
+per-app denylist). Same pipeline as `rebuild-base` (boot builder on the pristine
+`base_x86`, `adb root` + remount, mutate `/system`, flatten), but:
+- the source is always the pristine `base_x86` (never `current_base`);
+- the output is `base-dev.qcow2` (+ `base-dev.kernel` / `base-dev.initrd.img`);
+- **`current_base` is left unchanged** — the shipped product keeps booting
+  `base_x86`; the dev base is opt-in only.
+
+DEV-ONLY: only `omni-agent` (a dev dependency) ever selects it, via
+`omni create <name> --base dev`. The shipped bases never contain the devkit.
+Full detail: **`DEV-BASE.md`**. JSON: `{"ok", "base": "dev", "disk":
+"base-dev.qcow2", "current_base": "x86", "devkit": {...}}`.
+
 ### Platform
 
 #### `omni setup` / `omni doctor [--json]` / `omni qemu-info [--install]`

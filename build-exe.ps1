@@ -11,16 +11,19 @@
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Push-Location $root
-# The built-in VNC viewer (manager\vncview.py) is imported lazily by name,
-# so PyInstaller can't auto-detect it — add it and its GUI deps explicitly.
+# The built-in VNC viewer (manager\vncview.py) and the capture engine
+# (manager\capture.py) are imported lazily by name, so PyInstaller can't
+# auto-detect them — add them and their GUI/imaging deps explicitly.
 # (Windows python.org builds ship tkinter; Pillow via `pip install pillow`.)
 py -3 -m PyInstaller --onefile --name omnidroid `
     --distpath "$root\dist" --workpath "$root\build\pyi" `
     --specpath "$root\build" `
     --paths "$root\manager" `
     --hidden-import vncview `
+    --hidden-import capture `
     --hidden-import tkinter `
     --hidden-import PIL.Image --hidden-import PIL.ImageTk `
+    --hidden-import PIL.ImageChops --hidden-import PIL.ImageStat `
     "$root\manager\omni.py"
 Pop-Location
 Write-Output "BUILT: $root\dist\omnidroid.exe"

@@ -57,13 +57,23 @@ class RFBClient:
     Tk front-end reads. Thread model: recv loop in its own thread; sends
     (input + update requests) guarded by _wlock."""
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, on_frame=None):
         self.host, self.port = host, port
         self.sock = None
         self.width = self.height = 0
         self.fb = bytearray()          # width*height*4, BGRX
         self.name = ""
         self._wlock = threading.Lock()
+        # The viewer is allowed to coalesce redraw notifications (`dirty`),
+        # but recorders are not: a state which exists for one completed RFB
+        # update must be observable before the backing framebuffer is changed
+        # by the next update.  `on_frame` therefore receives an immutable copy
+        # of every completed update directly from the receive loop, timestamped
+        # with the host's monotonic high-resolution clock.
+        self._fblock = threading.Lock()
+        self.on_frame = on_frame
+        self.update_count = 0
+        self.last_update_ns = None
         self.dirty = threading.Event()
         self.closed = threading.Event()
         self.error = None
@@ -137,6 +147,18 @@ class RFBClient:
         self.width, self.height = w, h
         self.fb = bytearray(w * h * 4)           # BGRX, opaque black
 
+    def snapshot(self):
+        """Return a consistent immutable framebuffer snapshot.
+
+        Shape: ``(width, height, bgrx_bytes, completed_ns, sequence)``.
+        ``completed_ns`` uses :func:`time.perf_counter_ns`; it is the time the
+        most recent RFB framebuffer update completed on the host, not a guest
+        wall-clock or an assertion that the display updates at 1 kHz.
+        """
+        with self._fblock:
+            return (self.width, self.height, bytes(self.fb),
+                    self.last_update_ns, self.update_count)
+
     def _set_pixel_format(self):
         # 32bpp, depth 24, little-endian, true-colour, RGB shifts 16/8/0 ->
         # in-memory bytes per pixel are B,G,R,x (BGRX) — matched by PIL's
@@ -197,22 +219,34 @@ class RFBClient:
                 pass
 
     def _framebuffer_update(self):
-        self._recvn(1)                           # padding
-        nrects = struct.unpack("!H", self._recvn(2))[0]
-        for _ in range(nrects):
-            x, y, w, h, enc = struct.unpack("!HHHHi", self._recvn(12))
-            if enc == _ENC_RAW:
-                self._raw_rect(x, y, w, h)
-            elif enc == _ENC_COPYRECT:
-                sx, sy = struct.unpack("!HH", self._recvn(4))
-                self._copy_rect(x, y, w, h, sx, sy)
-            elif enc == _ENC_DESKTOPSIZE:
-                self._resize(w, h)
-                self.request_update(incremental=False)
-                break
-            else:
-                raise ConnectionError(f"unsupported encoding {enc}")
+        with self._fblock:
+            self._recvn(1)                       # padding
+            nrects = struct.unpack("!H", self._recvn(2))[0]
+            for _ in range(nrects):
+                x, y, w, h, enc = struct.unpack("!HHHHi", self._recvn(12))
+                if enc == _ENC_RAW:
+                    self._raw_rect(x, y, w, h)
+                elif enc == _ENC_COPYRECT:
+                    sx, sy = struct.unpack("!HH", self._recvn(4))
+                    self._copy_rect(x, y, w, h, sx, sy)
+                elif enc == _ENC_DESKTOPSIZE:
+                    self._resize(w, h)
+                    self.request_update(incremental=False)
+                    break
+                else:
+                    raise ConnectionError(f"unsupported encoding {enc}")
+            completed_ns = time.perf_counter_ns()
+            self.update_count += 1
+            self.last_update_ns = completed_ns
+            sequence = self.update_count
+            width, height = self.width, self.height
+            # Copy under the framebuffer lock.  The callback can enqueue this
+            # immutable value and return quickly; unlike Event-based redraws,
+            # two consecutive updates can never collapse into one frame.
+            frame = bytes(self.fb) if self.on_frame else None
         self.dirty.set()
+        if self.on_frame:
+            self.on_frame(width, height, frame, completed_ns, sequence)
 
     def _raw_rect(self, x, y, w, h, ):
         data = self._recvn(w * h * 4)
@@ -348,8 +382,9 @@ def run_viewer(host, port, title):
         if client.dirty.is_set() and client.width:
             client.dirty.clear()
             try:
-                img = Image.frombytes("RGB", (client.width, client.height),
-                                      bytes(client.fb), "raw", "BGRX")
+                width, height, frame, _, _ = client.snapshot()
+                img = Image.frombytes("RGB", (width, height), frame,
+                                      "raw", "BGRX")
                 photo = ImageTk.PhotoImage(img)
                 label.configure(image=photo)
                 state["photo"] = photo           # keep a ref (Tk GCs images)
