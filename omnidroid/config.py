@@ -90,6 +90,10 @@ def qemu_bin(tool):
         from omnidroid import engine
         qd = engine.read_config().get("qemu", {}).get("dir")
     except Exception:
+        # Deliberately broad: engine.read_config() can fail for many reasons
+        # (no config yet, mid-import cycle since engine imports config, a
+        # corrupt file, ...). Any failure here just means "no override" --
+        # never a reason to blow up qemu_bin() resolution.
         qd = None
     for cand in ([Path(qd) / exe] if qd else []) + [QEMU_DIR / exe]:
         if cand.exists():

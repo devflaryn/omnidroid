@@ -35,11 +35,15 @@ from omnidroid import config
 from omnidroid.config import (
     REPO, CONFIG_PATH, QEMU_DIR,
     IS_WINDOWS, IS_LINUX, IS_MACOS, HOST_ARCH, IS_ARM64_HOST,
-    resolve_images_dir, qemu_bin, qemu_system_name,
+    resolve_images_dir, images_dir, qemu_bin, qemu_system_name,
 )
 
 # Data-store root (accounts.json, accounts/, logs/, runtime/). Defaults to
 # REPO; relocatable via OMNI_DATA_DIR (see omnidroid.config.data_dir()).
+# Captured once at import time (intentional: the data root doesn't need to
+# move mid-process) -- contrast with the cookie store, which re-resolves
+# per call via _store_root() so tests that flip OMNI_DATA_DIR at runtime
+# see it take effect.
 ACCOUNTS_DIR = config.data_dir() / "accounts"
 
 
@@ -378,7 +382,7 @@ def autoregister_bases():
     (raw_config, newly_registered_tags). Registration only ADDS entries —
     existing bases/accounts are never touched, honoring base immutability."""
     raw = read_config()
-    images = Path(resolve_images_dir(raw))
+    images = Path(images_dir(raw))
     bases = raw.setdefault("bases", {})
     known_disks = {b.get("disk") for b in bases.values()}
     new = []
@@ -514,7 +518,7 @@ def load_config():
     a fresh/incomplete install: auto-registers base files that appeared in
     images_dir, and otherwise exits with the exact copy-these-files help."""
     cfg, _ = autoregister_bases()
-    cfg["images_dir"] = resolve_images_dir(cfg)   # normalized for callers
+    cfg["images_dir"] = images_dir(cfg)   # normalized for callers (OMNI_IMAGES_DIR wins)
     images = Path(cfg["images_dir"])
     # Host architecture selects the base (arm64 -> arm-uefi; x86 -> current).
     tag = effective_base_tag(cfg)
@@ -531,7 +535,7 @@ def load_config():
     return cfg
 
 
-# ---------- qemu resolution + auto-install ----------
+# ---------- qemu auto-install ----------
 
 def _qemu_present():
     import shutil
@@ -1948,7 +1952,7 @@ def _assert_deletable(path):
     if root not in p.parents:
         sys.exit(f"error: refusing to delete {p}: outside {root}")
     try:
-        images = Path(resolve_images_dir(read_config())).resolve()
+        images = Path(images_dir(read_config())).resolve()
     except Exception:
         images = None
     if images and (images == p or p in images.parents):
@@ -3816,7 +3820,7 @@ def install_readiness():
     file paths."""
     import shutil as _sh
     raw, new = autoregister_bases()
-    images = Path(resolve_images_dir(raw))
+    images = Path(images_dir(raw))
     # Base selected by host architecture (arm64 -> arm-uefi; x86 -> current).
     tag = effective_base_tag(raw)
     bases = raw.get("bases") or {}
@@ -3891,7 +3895,7 @@ def cmd_setup(args):
     """
     ensure_config()          # blank deployment: bootstrap default config
     cfg = read_config()
-    images = Path(resolve_images_dir(cfg))
+    images = Path(images_dir(cfg))
     report = {"platform": "windows" if IS_WINDOWS else "linux",
               "images_dir": str(images), "ok": True}
     for d in (images, ACCOUNTS_DIR):
@@ -4569,7 +4573,6 @@ def cmd_view(args):
 def _run_vncview(a):
     """Internal: run the built-in viewer in THIS process (invoked as the
     hidden `_vncview` subcommand by _spawn_builtin_viewer)."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from omnidroid import vncview
     return vncview.run_viewer(a.host, a.port, a.title)
 
