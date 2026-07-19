@@ -691,9 +691,10 @@ def all_accounts():
     from omnidroid import accounts as _acc
     cfg = read_config()
     running = {i["name"]: i for i in running_instances()}
-    out = []
+    out, seen = [], set()
     for entry in _acc.list_accounts(_store_root()):
         name = entry["username"]
+        seen.add(name)
         r = running.get(name)
         base_tag = r["base"] if (r and r.get("base")) else _base_tag_for_mode(
             _acc.get_account(_store_root(), name))
@@ -704,6 +705,19 @@ def all_accounts():
             for k in ("adb_port", "qmp_port", "vnc_port"):
                 if r.get(k) is not None:
                     acct[k] = r[k]
+        out.append(acct)
+    # Union: running instances NOT registered in the store (temp build/bench
+    # instances) must still appear so running-instance safety guards see them.
+    for name, r in running.items():
+        if name in seen:
+            continue
+        base_tag = r.get("base") or _base_tag_for_mode(None)
+        acct = {"name": name, "base": base_tag, "ephemeral": True,
+                "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+                "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
+        for k in ("adb_port", "qmp_port", "vnc_port"):
+            if r.get(k) is not None:
+                acct[k] = r[k]
         out.append(acct)
     return sorted(out, key=lambda a: a["name"])
 
@@ -2140,14 +2154,14 @@ def cmd_remove(args):
     else:
         sys.exit(f"error: could not delete {target} (files still locked)")
     print(f"[remove {name}] deleted {target} (overlay + data.qcow2 + "
-          f"state); ports adb {acct['adb_port']} qmp {acct['qmp_port']} "
-          f"vnc {acct['vnc_port']} freed")
+          f"state); ports adb {acct.get('adb_port')} qmp {acct.get('qmp_port')} "
+          f"vnc {acct.get('vnc_port')} freed")
     if getattr(args, "json", False):
         emit_json({"name": name, "removed": True,
                    "was_running": was_running,
-                   "freed_ports": {"adb": acct["adb_port"],
-                                   "qmp": acct["qmp_port"],
-                                   "vnc": acct["vnc_port"]},
+                   "freed_ports": {"adb": acct.get("adb_port"),
+                                   "qmp": acct.get("qmp_port"),
+                                   "vnc": acct.get("vnc_port")},
                    "ok": True})
 
 
@@ -4308,7 +4322,7 @@ def cmd_list(args):
         rec = account_status(a, stats=args.stats)
         state = f"RUNNING pid {rec['pid']}" if rec["running"] else "stopped"
         line = (f"{rec['name']:<16} base {rec['base']}  "
-                f"adb {rec['adb_port']}  qmp {rec['qmp_port']}  "
+                f"adb {rec['adb_port'] or '?'}  qmp {rec['qmp_port'] or '?'}  "
                 f"vnc {rec['vnc_port'] or '?'}  {state}")
         if rec["running"] and args.stats:
             if rec.get("host_rss_mb"):
@@ -4663,21 +4677,22 @@ def cmd_view(args):
     VNC port. Localhost-only: the viewer connects to 127.0.0.1 — the server
     has no auth, safe ONLY on the loopback bind (port-scheme HARD RULE)."""
     cfg = load_config()
-    acct = load_account(args.name)
     host = "127.0.0.1"
-    port = acct["vnc_port"]
     started = False
     if not running_pid(args.name):
         if not args.start:
             sys.exit(f"error: '{args.name}' is not running. Start it first "
                      f"(omni start {args.name}) or: omni view {args.name} "
                      f"--start")
-        first = not acct.get("first_boot_done")
-        spawn_qemu(acct, cfg, dev=args.dev or first,
-                   mode=resolve_mode(cfg, args.mode))
+        acct = build_acct(args.name, cfg, dev=args.dev)
+        spawn_qemu(acct, cfg, dev=args.dev, mode=resolve_mode(cfg, args.mode))
         started = True
+        port = acct["vnc_port"]
         print(f"[view {args.name}] started instance (detached); waiting for "
               f"VNC on {host}:{port} ...")
+    else:
+        acct = load_account(args.name)
+        port = acct["vnc_port"]
 
     # Wait for the QEMU VNC server to accept connections (it binds at process
     # start, so this is quick; generous bound covers a cold spawn).

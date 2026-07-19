@@ -125,5 +125,25 @@ def test_build_acct_bad_name_fails(tmp_path, monkeypatch):
         engine.build_acct("bad name!", cfg)
 
 
+def test_all_accounts_outer_joins_running_instances_not_in_store(
+        tmp_path, monkeypatch):
+    """all_accounts() must be a FULL OUTER JOIN of the cookie store and live
+    runtime state: a running instance whose name is NOT in the store (e.g. a
+    temp build/bench instance) must still be surfaced, or the
+    running-instance safety guards in cmd_bake_game / cmd_brand_base
+    --in-place / update_kiosk_arm silently go blind to it."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    accounts.save_account(tmp_path, "insstore", "cookie", 1)
+    _write_run(tmp_path, "insstore", pid=os.getpid(), adb_port=16001,
+               qmp_port=17001, vnc_port=18001, base="prod")
+    _write_run(tmp_path, "tempbench", pid=os.getpid(), adb_port=16002,
+               qmp_port=17002, vnc_port=18002, base="prod")
+
+    names = {a["name"] for a in engine.all_accounts()}
+
+    assert "insstore" in names
+    assert "tempbench" in names
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
