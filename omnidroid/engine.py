@@ -818,13 +818,15 @@ def pid_alive(pid):
 
 def runtime_dir(username):
     """Per-instance throwaway dir: efivars, run.json (ports+pid), qemu.log,
-    autocap frames. Wiped on stop (A3). Replaces the old accounts/<name>/."""
+    autocap frames. Wiped on `stop` and `remove` (see _wipe_runtime).
+    Replaces the old accounts/<name>/ for the product path."""
     return config.runtime_root() / username
 
 
 def _wipe_runtime(name):
     """Delete the per-instance runtime dir (efivars.fd, run.json, qemu.log,
     autocap frames) once an ephemeral instance (build_acct) has stopped.
+    Called from cmd_stop (after a successful power-off) and cmd_remove.
     Ephemeral instances write nothing under accounts/<name>/, so this IS
     the entire teardown -- no folder to remove there."""
     import shutil
@@ -1992,7 +1994,14 @@ def _shutdown(acct, label, timeout=90):
 def cmd_stop(args):
     """Power the instance OFF. This is distinct from a viewer merely
     disconnecting: a VNC/adb disconnect is a no-op (the instance keeps
-    running headless — the default); stop is the explicit power path."""
+    running headless — the default); stop is the explicit power path.
+
+    Diskless model: a successful power-off also wipes runtime/<name>/
+    (efivars, run.json, qemu.log, autocap frames) -- that dir is the ONLY
+    per-instance state an ephemeral account writes, so this IS the entire
+    teardown. Skipped if the shutdown chain had to give up (kill-failed):
+    the instance may still be alive, and wiping run.json would orphan a
+    live QEMU process (running_pid would stop seeing it)."""
     acct = load_account(args.name)
     was_running = bool(running_pid(args.name))
     # Stop the always-on recorder first so it finalizes cleanly instead of
@@ -2000,9 +2009,12 @@ def cmd_stop(args):
     stop_autocap(args.name)
     method = _shutdown(acct, f"stop {args.name}", timeout=args.timeout)
     ok = method != "kill-failed"
+    if ok:
+        _wipe_runtime(args.name)
     if getattr(args, "json", False):
         emit_json({"name": args.name, "was_running": was_running,
-                   "stopped": ok, "method": method, "ok": ok})
+                   "stopped": ok, "method": method,
+                   "runtime_wiped": ok, "ok": ok})
     if not ok:
         sys.exit(1)
 
@@ -2028,42 +2040,63 @@ def _assert_deletable(path):
 
 
 def cmd_remove(args):
-    """DESTRUCTIVE: stop the instance if running, then delete
-    accounts/<name>/ — system overlay + data.qcow2 + state. The account's
-    game data is gone for good; bases and other accounts are untouched.
-    Ports free automatically (allocation scans surviving accounts)."""
+    """DESTRUCTIVE: stop the instance if running, then delete its identity.
+
+    Diskless model: an account IS a store entry (omnidroid/accounts.py) plus
+    whatever it left in runtime/<name>/ while running. There is no
+    per-account folder for a product account any more, so 'remove' deletes
+    the store record and wipes runtime/<name>/ -- that's the entire
+    footprint. A legacy accounts/<name>/ folder (base-build/maintenance
+    accounts made by _make_persistent_arm_account et al, or leftovers from
+    before this migration) is also rmtree'd here IF one happens to exist,
+    but its absence is never an error."""
     name = args.name
     # Exact-name only: same charset create enforces; no globs, no partial
     # matches, and no path separators can ever reach the delete path.
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         sys.exit("error: account name must match [A-Za-z0-9_-]+ exactly "
                  "(no globs/partial names)")
-    acct = load_account(name)         # exits if the account doesn't exist
-    target = _assert_deletable(account_dir(name))
+    from omnidroid import accounts as _acc
+    rec = _acc.get_account(_store_root(), name)
+    has_runtime = runtime_dir(name).exists()
+    legacy_dir = account_dir(name)
+    has_legacy = legacy_dir.exists()
+    if rec is None and not has_runtime and not has_legacy:
+        sys.exit(f"error: no such account '{name}'")
     was_running = bool(running_pid(name))
     if was_running:
+        # load_account needs either a store record or a live run.json to
+        # build a handle -- both are guaranteed here since was_running=True
+        # implies a live runtime/<name>/run.json.
+        acct = load_account(name)
         stop_autocap(name)
         _shutdown(acct, f"remove {name}", timeout=args.timeout)
         if running_pid(name):
             sys.exit(f"error: '{name}' would not stop; NOT deleting")
-    import shutil
-    for _ in range(10):
-        try:
-            shutil.rmtree(target)
-            break
-        except PermissionError:
-            time.sleep(1)     # QEMU may still be releasing file handles
-    else:
-        sys.exit(f"error: could not delete {target} (files still locked)")
-    print(f"[remove {name}] deleted {target} (overlay + data.qcow2 + "
-          f"state); ports adb {acct.get('adb_port')} qmp {acct.get('qmp_port')} "
-          f"vnc {acct.get('vnc_port')} freed")
+    store_removed = _acc.remove_account(_store_root(), name)
+    _wipe_runtime(name)
+    legacy_removed = False
+    if has_legacy:
+        target = _assert_deletable(legacy_dir)
+        import shutil
+        for _ in range(10):
+            try:
+                shutil.rmtree(target)
+                legacy_removed = True
+                break
+            except PermissionError:
+                time.sleep(1)     # QEMU may still be releasing file handles
+        else:
+            sys.exit(f"error: could not delete {target} (files still locked)")
+    print(f"[remove {name}] store entry {'cleared' if store_removed else '(none)'}"
+          f", runtime/{name}/ wiped"
+          + (f", legacy folder {target} deleted" if legacy_removed else ""))
     if getattr(args, "json", False):
         emit_json({"name": name, "removed": True,
                    "was_running": was_running,
-                   "freed_ports": {"adb": acct.get("adb_port"),
-                                   "qmp": acct.get("qmp_port"),
-                                   "vnc": acct.get("vnc_port")},
+                   "store_removed": store_removed,
+                   "runtime_wiped": True,
+                   "legacy_folder_removed": legacy_removed,
                    "ok": True})
 
 
@@ -4458,8 +4491,10 @@ def _spawn_builtin_viewer(name, host, port, title):
         cmd = [sys.executable, str(Path(__file__).resolve())] + a
     # Detach stdio too: if the child inherited the terminal's stdout/stderr,
     # the shell would block waiting for EOF while the (long-lived) viewer
-    # holds the pipe open. Send viewer output to a per-account log.
-    d = account_dir(name)
+    # holds the pipe open. Send viewer output to the per-instance runtime dir
+    # (diskless model: product-path per-instance state lives under
+    # runtime/<name>/, not accounts/<name>/ -- wiped on stop like the rest).
+    d = runtime_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "viewer.log", "a")
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
@@ -4552,7 +4587,7 @@ def cmd_screenshot(args):
     """Pull a screenshot from the guest framebuffer (true colors, works
     headless). Prints JSON: {ok, path}."""
     acct = load_account(args.name)
-    out = args.out or str(account_dir(args.name)
+    out = args.out or str(runtime_dir(args.name)
                           / f"shot-{int(time.time())}.png")
     try:
         adb(acct, "shell", "screencap", "-p", "/data/local/tmp/_s.png",
@@ -4907,7 +4942,7 @@ def cmd_capture(args):
 # (cmd_start --wait), runs continuously for the instance's lifetime,
 # and is stopped on power-off (cmd_stop / cmd_remove). It writes to
 # $OMNI_AUTOCAP_DIR when set (omni-agent points that at its /workspace), else
-# accounts/<name>/autocap. `ensure_autocap` is idempotent — booting, resuming,
+# runtime/<name>/autocap. `ensure_autocap` is idempotent — booting, resuming,
 # or an explicit `omni autocap --ensure` never stacks a second recorder — so the
 # same feed is guaranteed on whenever a dev instance is up.
 AUTOCAP_MAX_KEYFRAMES = 5000            # long always-on session, not a 20s window
@@ -5585,7 +5620,12 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None):
     if first:
         provision_settings(acct, label)
         acct["first_boot_done"] = True
-        save_account(acct)
+        # NOTE: no save_account() here. The only caller (cmd_start) always
+        # passes a build_acct() handle, which already carries
+        # first_boot_done=True -- so `first` is always False in practice and
+        # this branch is dead in the product path. A stray save_account()
+        # would write accounts/<name>/account.json, a file nothing reads
+        # under the diskless model; dropped rather than left as a landmine.
     _devkit_activate(acct, label)
     return True, first
 
@@ -5831,10 +5871,11 @@ def main():
     st.set_defaults(func=cmd_stop)
 
     rm = sub.add_parser("remove",
-                        help="DESTRUCTIVE: stop if running, then delete "
-                             "accounts/<name>/ entirely (overlay + "
-                             "data.qcow2 + state); ports are freed. Can "
-                             "only ever delete inside accounts/")
+                        help="DESTRUCTIVE: stop if running, then delete the "
+                             "account's store entry and wipe runtime/<name>/; "
+                             "ports are freed. Also deletes a legacy "
+                             "accounts/<name>/ folder if one exists (can only "
+                             "ever delete inside accounts/)")
     rm.add_argument("name", help="exact account name (no globs)")
     rm.add_argument("--timeout", type=int, default=90,
                     help="seconds to wait for graceful power-off first")
@@ -6157,7 +6198,7 @@ def main():
     cap.add_argument("name")
     cap.add_argument("--out", default=None,
                      help="output dir for keyframes + metadata.json + "
-                          "logcat.txt (default accounts/<name>/capture-<ts>)")
+                          "logcat.txt (default runtime/<name>/capture-<ts>)")
     cap.add_argument("--duration", type=float, default=20.0,
                      help="seconds to observe the screen (bounded mode)")
     cap.add_argument("--auto", action="store_true",
@@ -6206,7 +6247,7 @@ def main():
                      help="force a fresh recorder (e.g. to repoint --out)")
     aco.add_argument("--out", default=None,
                      help="output dir (default $OMNI_AUTOCAP_DIR or "
-                          "accounts/<name>/autocap)")
+                          "runtime/<name>/autocap)")
     aco.add_argument("--json", action="store_true")
     aco.set_defaults(func=cmd_autocap)
 

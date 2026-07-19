@@ -12,6 +12,7 @@ accounts/<name>/ stops existing.
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -143,6 +144,74 @@ def test_all_accounts_outer_joins_running_instances_not_in_store(
 
     assert "insstore" in names
     assert "tempbench" in names
+
+
+# ---------- Task 5: remove -> store delete + wipe runtime; stop -> wipe ----
+
+def test_cmd_remove_deletes_store_entry_and_wipes_runtime(tmp_path, monkeypatch):
+    """`remove` in the diskless model has no per-account folder to delete: the
+    account IS the store entry (omnidroid/accounts.py) plus whatever it left
+    in runtime/<name>/. Seed both (a dead pid, so the instance already reads
+    as stopped) and confirm cmd_remove clears the store record AND wipes the
+    runtime dir."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    accounts.save_account(tmp_path, "gone", "cookie", 1)
+    accounts.set_fields(tmp_path, "gone", base="prod")
+    _write_run(tmp_path, "gone", pid=999999999, adb_port=16001,
+               qmp_port=17001, vnc_port=18001, base="prod")
+    assert accounts.get_account(tmp_path, "gone") is not None
+    assert (tmp_path / "runtime" / "gone").exists()
+
+    args = SimpleNamespace(name="gone", timeout=5, json=True)
+    engine.cmd_remove(args)
+
+    assert accounts.get_account(tmp_path, "gone") is None
+    assert not (tmp_path / "runtime" / "gone").exists()
+
+
+def test_cmd_remove_unknown_account_exits(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    args = SimpleNamespace(name="never-existed", timeout=5, json=True)
+    with pytest.raises(SystemExit):
+        engine.cmd_remove(args)
+
+
+def test_cmd_stop_wipes_runtime_after_successful_shutdown(tmp_path, monkeypatch):
+    """The core diskless 'wipe on stop' promise: after a shutdown that did
+    NOT have to fall back to a kill (method != 'kill-failed'), runtime/<name>/
+    (efivars, run.json, qemu.log, autocap frames) must be gone -- that dir is
+    the entire per-instance footprint an ephemeral account leaves."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    accounts.save_account(tmp_path, "s", "cookie", 1)
+    accounts.set_fields(tmp_path, "s", base="prod")
+    _write_run(tmp_path, "s", pid=os.getpid(), adb_port=16001,
+               qmp_port=17001, vnc_port=18001, base="prod")
+    monkeypatch.setattr(engine, "_shutdown",
+                        lambda acct, label, timeout=90: "powerdown")
+
+    args = SimpleNamespace(name="s", timeout=5, json=True)
+    engine.cmd_stop(args)
+
+    assert not (tmp_path / "runtime" / "s").exists()
+
+
+def test_cmd_stop_does_not_wipe_runtime_on_kill_failed(tmp_path, monkeypatch):
+    """A failed kill means the instance may still be alive -- wiping run.json
+    here would orphan a live QEMU process (running_pid would stop seeing it),
+    so the runtime dir must survive a kill-failed stop."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    accounts.save_account(tmp_path, "stuck", "cookie", 1)
+    accounts.set_fields(tmp_path, "stuck", base="prod")
+    _write_run(tmp_path, "stuck", pid=os.getpid(), adb_port=16003,
+               qmp_port=17003, vnc_port=18003, base="prod")
+    monkeypatch.setattr(engine, "_shutdown",
+                        lambda acct, label, timeout=90: "kill-failed")
+
+    args = SimpleNamespace(name="stuck", timeout=5, json=True)
+    with pytest.raises(SystemExit):
+        engine.cmd_stop(args)
+
+    assert (tmp_path / "runtime" / "stuck").exists()
 
 
 if __name__ == "__main__":
