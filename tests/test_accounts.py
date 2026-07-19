@@ -6,7 +6,7 @@ design, so what is testable here is the part that must never go wrong — the
 single-file store keyed by username, its permissions, migration from the old
 per-label files, and the rule that a cookie never leaks into output.
 
-    python3 tests/test_cookies.py
+    python3 tests/test_accounts.py
 """
 import json
 import os
