@@ -12,6 +12,10 @@ images/
 accounts/
 work/
 
+# Diskless per-instance throwaway state (per-boot efivars, run.json with
+# ports, qemu.log, autocap frames). Never committed — regenerated every boot.
+runtime/
+
 # CREDENTIALS — a .ROBLOSECURITY cookie is full access to a Roblox account.
 # Never commit one. `omni login` writes cookies/<label>.json; `omni play
 # --token-file` reads a raw one.
