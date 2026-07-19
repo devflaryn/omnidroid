@@ -72,5 +72,58 @@ def test_unknown_account_exits(tmp_path, monkeypatch):
         engine.load_account("ghost-of-nobody")
 
 
+def _build_cfg(images_dir):
+    return {
+        "images_dir": str(images_dir),
+        "qemu": {"adb_port_start": 16001, "qmp_port_start": 17001,
+                 "vnc_port_start": 18001},
+        "bases": {
+            "arm": {"type": engine.BASE_TYPE_ARM, "base_disk": "b.qcow2",
+                    "system": "s.qcow2", "data": "d.qcow2",
+                    "efivars": "base_arm_efivars.fd"},
+        },
+        "current_base": "arm",
+    }
+
+
+def test_build_acct_allocates_ports_and_writes_no_account_folder(
+        tmp_path, monkeypatch):
+    """`build_acct` is the launch handle: it allocates ports up front (unlike
+    load_account, which only sees ports for an ALREADY running instance) and
+    stages a fresh efivars into runtime/<name>/ -- but it must never create
+    accounts/<name>/, since ephemeral instances boot the shared base
+    templates directly and have nothing per-account to persist."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "base_arm_efivars.fd").write_bytes(b"EFI-TEMPLATE")
+    cfg = _build_cfg(images)
+    monkeypatch.setattr(engine, "ensure_qemu", lambda: None)
+
+    handle = engine.build_acct("newacct", cfg)
+
+    assert handle["name"] == "newacct"
+    assert handle["base"] == "arm"
+    assert handle["ephemeral"] is True
+    assert handle["dev"] is False
+    assert handle["first_boot_done"] is True
+    assert handle["game_package"] == engine.ROBLOX_PACKAGE
+    assert handle["adb_port"] == 16001
+    assert handle["qmp_port"] == 17001
+    assert handle["vnc_port"] == 18001
+
+    assert (tmp_path / "runtime" / "newacct" / "efivars.fd").read_bytes() \
+        == b"EFI-TEMPLATE"
+    assert not (tmp_path / "accounts" / "newacct").exists()
+
+
+def test_build_acct_bad_name_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    cfg = _build_cfg(tmp_path / "images")
+    monkeypatch.setattr(engine, "ensure_qemu", lambda: None)
+    with pytest.raises(SystemExit):
+        engine.build_acct("bad name!", cfg)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

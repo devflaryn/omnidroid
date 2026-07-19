@@ -682,13 +682,30 @@ def save_account(acct):
 
 
 def all_accounts():
-    if not ACCOUNTS_DIR.exists():
-        return []
-    return sorted(
-        (ensure_vnc_port(json.loads((d / "account.json").read_text()))
-         for d in ACCOUNTS_DIR.iterdir()
-         if (d / "account.json").exists()),
-        key=lambda a: a["name"])
+    """Every STORE-listed account (omnidroid/accounts.py), joined with live
+    running state (runtime/*/run.json via running_instances()). Replaces the
+    old accounts/*/account.json folder scan: identity now lives in the
+    central cookie store, not per-account folders. A non-running account's
+    handle carries no port keys at all (nothing has allocated them yet) --
+    callers that need a port must check running state first."""
+    from omnidroid import accounts as _acc
+    cfg = read_config()
+    running = {i["name"]: i for i in running_instances()}
+    out = []
+    for entry in _acc.list_accounts(_store_root()):
+        name = entry["username"]
+        r = running.get(name)
+        base_tag = r["base"] if (r and r.get("base")) else _base_tag_for_mode(
+            _acc.get_account(_store_root(), name))
+        acct = {"name": name, "base": base_tag, "ephemeral": True,
+                "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+                "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
+        if r:
+            for k in ("adb_port", "qmp_port", "vnc_port"):
+                if r.get(k) is not None:
+                    acct[k] = r[k]
+        out.append(acct)
+    return sorted(out, key=lambda a: a["name"])
 
 
 # Per-instance PORT SCHEME (documented invariant):
@@ -722,18 +739,6 @@ def allocate_ports(cfg):
         i += 1
     return (q["adb_port_start"] + i, q["qmp_port_start"] + i,
             vnc_start(cfg) + i)
-
-
-def ensure_vnc_port(acct):
-    """Backfill the reserved vnc_port on accounts created before the
-    scheme existed (derived from the account's adb index, so the triple
-    stays aligned)."""
-    if "vnc_port" not in acct:
-        cfg = read_config()
-        idx = acct["adb_port"] - cfg["qemu"]["adb_port_start"]
-        acct["vnc_port"] = vnc_start(cfg) + idx
-        save_account(acct)
-    return acct
 
 
 # ---------- process helpers ----------
@@ -1549,6 +1554,46 @@ def _create_arm(args, cfg, acct, base, d, name, adb_port, qmp_port, vnc_port):
         emit_json(created)
 
 
+def build_acct(name, cfg, dev=False):
+    """Build the EPHEMERAL launch handle for `name`: resolves the base tag,
+    allocates a fresh port triple, and stages a per-boot efivars copy into
+    runtime_dir(name) -- but writes NO account.json and creates NO overlays.
+    Ephemeral instances boot the shared base templates directly (snapshot=on,
+    see qemu_command_arm), so there is nothing per-account to persist; the
+    handle is pure launch state (name/base/ports), same key shape as
+    load_account()'s but always carrying ports since this is what actually
+    reserves them.
+
+    This is the LAUNCH counterpart to load_account(): load_account reads an
+    identity that may or may not be running; build_acct allocates a fresh
+    instance to run. arm-only by design (the product is arm; dev is
+    arm+devkit). dev=True selects the dev base (gated by OMNI_DEV_MODE
+    upstream via assert_dev_allowed)."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        fail("bad_name",
+             f"instance/username must be [A-Za-z0-9_-]+ (got '{name}')")
+    tag = "dev" if dev else _select_base_tag(cfg, arch="arm")
+    base = cfg["bases"][tag]
+    if base_type(base) != BASE_TYPE_ARM:
+        fail("arch_boundary",
+             f"instances are arm-only; base '{tag}' is {arch_of_base(base)}")
+    assert_dev_allowed(tag, base)
+    ensure_qemu()
+    adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+    d = runtime_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    import shutil
+    images = Path(cfg["images_dir"])
+    efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
+    if not efi_tmpl.exists():
+        fail("no_base", f"arm base efivars template missing: {efi_tmpl}")
+    shutil.copyfile(efi_tmpl, d / "efivars.fd")
+    return {"name": name, "base": tag,
+            "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port,
+            "ephemeral": True, "dev": base_is_dev(base),
+            "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
+
+
 def ensure_instance(name, cfg, dev=False, ephemeral=False):
     """Return the account dict for instance <name>, creating a THIN arm instance
     if it does not exist yet. This is what lets `omni play <username>` work with
@@ -1910,9 +1955,9 @@ def _cmd_start(args):
     Use --wait (or 'omni resume <name>') to block until boot completes.
     """
     cfg = load_config()
-    acct = load_account(args.name)
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
+    acct = build_acct(args.name, cfg, dev=args.dev)
     first = not acct.get("first_boot_done")
     dev = args.dev or first          # first boot always uses the dev profile
     mode = resolve_mode(cfg, args.mode, mem=args.mem)
@@ -4216,12 +4261,13 @@ def account_status(a, stats=False):
     """One account's live state as a plain dict — shared by the human
     list output and --json (the GUI relies on these exact keys)."""
     pid = running_pid(a["name"])
+    adb_port = a.get("adb_port")
     rec = {"name": a["name"], "base": a["base"], "arch": acct_arch(a),
            "running": bool(pid),
            "pid": pid, "mode": None,
-           "adb_port": a["adb_port"], "qmp_port": a["qmp_port"],
+           "adb_port": adb_port, "qmp_port": a.get("qmp_port"),
            "vnc_port": a.get("vnc_port"), "vnc_host": "127.0.0.1",
-           "adb_serial": f"127.0.0.1:{a['adb_port']}",
+           "adb_serial": f"127.0.0.1:{adb_port}" if adb_port else None,
            "game_package": a.get("game_package")}
     if pid:
         try:
@@ -5798,9 +5844,8 @@ def cmd_play(args):
                     f"'{args.name}'.")
 
     # Only NOW do we know a session is deliverable (a real token, or the
-    # explicit --no-token escape hatch) — create/reuse the instance.
-    acct = ensure_instance(args.name, cfg, dev=dev,
-                           ephemeral=getattr(args, "ephemeral", False))
+    # explicit --no-token escape hatch) — build the launch handle.
+    acct = build_acct(args.name, cfg, dev=dev)
     sess["updated"] = time.time()
     save_session(args.name, sess)
 

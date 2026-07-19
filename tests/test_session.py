@@ -211,47 +211,47 @@ class PlayGatesOnLogin(unittest.TestCase):
         return SimpleNamespace(**base)
 
     def test_no_token_never_creates_an_instance(self):
-        with mock.patch.object(omni, "ensure_instance") as ensure_mock:
+        with mock.patch.object(omni, "build_acct") as build_mock:
             with self.assertRaises(SystemExit):
                 omni.cmd_play(self._args())
-            ensure_mock.assert_not_called()
+            build_mock.assert_not_called()
         self.assertFalse((self.tmp / "accounts" / "brand_new_name").exists())
 
     def test_no_place_never_creates_an_instance_either(self):
-        with mock.patch.object(omni, "ensure_instance") as ensure_mock:
+        with mock.patch.object(omni, "build_acct") as build_mock:
             with self.assertRaises(SystemExit):
                 omni.cmd_play(self._args(place=None))
-            ensure_mock.assert_not_called()
+            build_mock.assert_not_called()
 
-    def test_explicit_no_token_still_reaches_ensure_instance(self):
+    def test_explicit_no_token_still_reaches_build_acct(self):
         """--no-token is a deliberate, explicit escape hatch (land on
         Roblox's own login screen) — the one case allowed to proceed without
-        a cookie, so it must still reach ensure_instance()."""
+        a cookie, so it must still reach build_acct()."""
         stub_acct = {"name": "brand_new_name", "adb_port": 1, "vnc_port": 1,
                     "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
-        with mock.patch.object(omni, "ensure_instance",
-                              return_value=stub_acct) as ensure_mock, \
+        with mock.patch.object(omni, "build_acct",
+                              return_value=stub_acct) as build_mock, \
              mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
              mock.patch.object(omni, "acct_is_dev", return_value=True):
             with self.assertRaises(SystemExit):
                 omni.cmd_play(self._args(no_token=True))
-        ensure_mock.assert_called_once()
+        build_mock.assert_called_once()
 
-    def test_saved_account_still_reaches_ensure_instance(self):
+    def test_saved_account_still_reaches_build_acct(self):
         """A name that IS a saved Roblox account (has a cookie) must keep
         working exactly as before — this only gates a name with NO cookie."""
         ck.save_account(str(self.tmp), "realuser", "sometoken")
         stub_acct = {"name": "realuser", "adb_port": 1, "vnc_port": 1,
                     "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
-        with mock.patch.object(omni, "ensure_instance",
-                              return_value=stub_acct) as ensure_mock, \
+        with mock.patch.object(omni, "build_acct",
+                              return_value=stub_acct) as build_mock, \
              mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
              mock.patch.object(omni, "acct_is_dev", return_value=True):
             with self.assertRaises(SystemExit):
                 omni.cmd_play(self._args(name="realuser"))
-        ensure_mock.assert_called_once()
+        build_mock.assert_called_once()
 
 
 if __name__ == "__main__":
