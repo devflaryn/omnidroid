@@ -1601,6 +1601,27 @@ def _select_base_tag(cfg, arch=None, base_tag=None):
 
 
 def cmd_create(args):
+    # No name given: this is the ACCOUNT-REGISTRATION flow. `omni create` opens a
+    # browser sign-in (selenium); `omni create --token* <cookie>` validates a
+    # cookie you already have. Either way the account is saved under its
+    # auto-detected Roblox USERNAME (never a user-typed name); an optional --alias
+    # is a display-only label. The instance itself is created on demand by
+    # `omni play <username>` (ephemeral/thin), so no disk is made here.
+    if getattr(args, "name", None) is None:
+        r, err = _capture_and_save_account(args)
+        if err:
+            return fail(err[0], err[1])
+        out = {"ok": True, "username": r["username"], "user_id": r["user_id"],
+               "custom_name": getattr(args, "alias", None) or None,
+               "path": r["path"]}
+        if getattr(args, "json", False):
+            emit_json(out)
+        else:
+            print(json.dumps(out, indent=2))
+            print(f"\nplay as this account:  omni play {r['username']} "
+                  f"--place <placeId>  (add --ephemeral for a fresh throwaway boot)")
+        return
+
     cfg = load_config()
     if args.data_size is None:
         args.data_size = cfg["qemu"]["data_disk_size"]
@@ -5816,6 +5837,34 @@ def _token_flag_given(args):
            or getattr(args, "token_stdin", False))
 
 
+def _capture_and_save_account(args):
+    """Shared account-registration core for `login` and the bare `create`: adopt
+    a cookie (--token*) verified headlessly, or capture one via a real browser
+    sign-in; save it under the auto-detected USERNAME. Returns (record, None) on
+    success or (None, (error, message)) on failure — no printing/exit here."""
+    import cookies as _ck
+    token_requested = _token_flag_given(args)
+    tok = resolve_token(args)
+    if token_requested and not tok:
+        # A --token* flag was GIVEN but resolved empty (blank file/stdin/arg).
+        # Failing loudly beats silently swapping a headless call for a 5-minute
+        # wait on a visible browser sign-in.
+        return None, ("bad_token", "--token/--token-file/--token-stdin was "
+                                   "given but resolved to an empty cookie")
+    if tok:
+        r = _ck.capture_login_from_cookie(REPO, tok, browser=args.browser)
+    else:
+        r = _ck.capture_login(REPO, browser=args.browser, timeout=args.timeout,
+                              profile_dir=getattr(args, "profile_dir", None))
+    if not r.get("ok"):
+        return None, (r.get("error", "login_failed"), r.get("message"))
+    # Optional display-only alias (never the identity/instance name).
+    alias = getattr(args, "alias", None)
+    if alias:
+        _ck.set_custom_name(REPO, r["username"], alias)
+    return r, None
+
+
 def cmd_login(args):
     """Save a Roblox account's session cookie, saved under its USERNAME.
 
@@ -5830,26 +5879,12 @@ def cmd_login(args):
       an interactive login has to clear.
 
     Either way: ready to use as `omni play <username> --place`."""
-    import cookies as _ck
-    token_requested = _token_flag_given(args)
-    tok = resolve_token(args)
-    if token_requested and not tok:
-        # A --token* flag was GIVEN but resolved empty (blank file/stdin/arg).
-        # Falling through to the interactive flow here would silently swap a
-        # headless call into a 5-minute wait for a visible browser sign-in —
-        # fail loudly instead.
-        return fail("bad_token", "--token/--token-file/--token-stdin was "
-                                 "given but resolved to an empty cookie")
-    if tok:
-        r = _ck.capture_login_from_cookie(REPO, tok, browser=args.browser)
-    else:
-        r = _ck.capture_login(REPO, browser=args.browser, timeout=args.timeout,
-                              profile_dir=getattr(args, "profile_dir", None))
-    if not r.get("ok"):
-        return fail(r.get("error", "login_failed"), r.get("message"))
+    r, err = _capture_and_save_account(args)
+    if err:
+        return fail(err[0], err[1])
     # NOTE: the cookie itself is deliberately absent from this output.
     out = {"ok": True, "username": r["username"], "user_id": r["user_id"],
-           "path": r["path"]}
+           "custom_name": getattr(args, "alias", None) or None, "path": r["path"]}
     if getattr(args, "json", False):
         emit_json(out)
     else:
@@ -5944,14 +5979,47 @@ def main():
     p = argparse.ArgumentParser(prog="omni")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def _token_args(parser):
+        # No --account flag: the positional IS the account username (from
+        # `omni login`), so its cookie is looked up automatically. These flags
+        # are a manual OVERRIDE for a raw cookie (testing / an account you have
+        # not saved).
+        g = parser.add_mutually_exclusive_group()
+        g.add_argument("--token", default=None,
+                       help="override: a raw Roblox .ROBLOSECURITY cookie. "
+                            "Prefer --token-file — an argv token is visible to "
+                            "every process on this host while the command runs")
+        g.add_argument("--token-file", dest="token_file", default=None,
+                       help="override: file containing the .ROBLOSECURITY cookie")
+        g.add_argument("--token-stdin", dest="token_stdin", action="store_true",
+                       help="override: read the .ROBLOSECURITY cookie from stdin")
+
     vr = sub.add_parser("version",
                         help="print the engine + contract handshake "
                              "(omnidroid-api.md v1 §4)")
     vr.add_argument("--json", action="store_true")
     vr.set_defaults(func=cmd_version)
 
-    c = sub.add_parser("create")
-    c.add_argument("name")
+    c = sub.add_parser("create",
+                       help="add a Roblox account (no name): `omni create` opens "
+                            "a browser sign-in; `omni create --token* <cookie>` "
+                            "validates a cookie you already have. Saved under the "
+                            "auto-detected USERNAME (+ optional --alias). Passing a "
+                            "NAME instead makes a raw instance disk (internal).")
+    c.add_argument("name", nargs="?", default=None,
+                   help="omit to register an account by username (login flow); "
+                        "give a name only for a raw internal instance disk")
+    # Account-registration (bare `create`) options — mirror `login`.
+    c.add_argument("--alias", default=None,
+                   help="display-only label for the account (the instance name is "
+                        "always the Roblox username, never this)")
+    c.add_argument("--browser", choices=["chrome", "firefox"], default="chrome")
+    c.add_argument("--timeout", type=int, default=300,
+                   help="interactive sign-in: seconds to wait for you to finish")
+    c.add_argument("--profile-dir", dest="profile_dir", default=None,
+                   help="reuse a browser profile dir (interactive sign-in only)")
+    _token_args(c)
+    # Raw instance-disk (named `create`) options.
     c.add_argument("--arch", choices=["x86", "arm"], default=None,
                    help="architecture for the new account (default: the "
                         "host arch's base)")
@@ -6101,21 +6169,6 @@ def main():
                          "app. 'magisk': open the Magisk manager app (root UI).")
     du.add_argument("--json", action="store_true")
     du.set_defaults(func=cmd_dev_ui)
-
-    def _token_args(parser):
-        # No --account flag: the positional IS the account username (from
-        # `omni login`), so its cookie is looked up automatically. These flags
-        # are a manual OVERRIDE for a raw cookie (testing / an account you have
-        # not saved).
-        g = parser.add_mutually_exclusive_group()
-        g.add_argument("--token", default=None,
-                       help="override: a raw Roblox .ROBLOSECURITY cookie. "
-                            "Prefer --token-file — an argv token is visible to "
-                            "every process on this host while the command runs")
-        g.add_argument("--token-file", dest="token_file", default=None,
-                       help="override: file containing the .ROBLOSECURITY cookie")
-        g.add_argument("--token-stdin", dest="token_stdin", action="store_true",
-                       help="override: read the .ROBLOSECURITY cookie from stdin")
 
     lg = sub.add_parser("login",
                         help="sign in to a Roblox account. Default: opens a "
