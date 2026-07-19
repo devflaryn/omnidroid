@@ -51,6 +51,20 @@ This is sub-project **A**. Two later sub-projects, designed separately, are out 
 
 ### 1. Data model
 
+> **Implementation note (reconciled with current code):** the single central
+> `accounts.json` already exists — it is the store in `manager/cookies.py`
+> (`{version, accounts:{username: {username, user_id, display_name, custom_name,
+> cookie, saved}}}`, keyed by username, mode `0600`). The diskless model
+> **extends** that store; it does not introduce a new file. Spec field `token`
+> is the store's existing `cookie`; `place_id`/`base`/`proxy`/`group`/`notes`
+> are new fields folded in (today `place_id` lives in the per-account folder's
+> `session.json`, which is being retired). The `accounts/<name>/` **folders**
+> (per-account `account.json` ports/base/first_boot_done, `session.json`,
+> overlays, `run.json`) are the cruft being removed. Cookie injection stays as
+> the kiosk `com.omni.kiosk/.SessionReceiver` `SET_SESSION` broadcast — only the
+> *source* of token/place changes (central store, not a folder). The schema
+> below is the target shape of a store record after A2.
+
 **Persistent — `accounts.json`** (single file in the in-project data dir, mode `0600`):
 
 ```json
