@@ -18,6 +18,7 @@ emits exactly one machine-readable line on stdout — the GUI contract):
   python omni.py adb    <name> -- <adb args...>
 """
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -779,6 +780,26 @@ def allocate_ports(cfg):
             vnc_start(cfg) + i)
 
 
+@contextlib.contextmanager
+def _launch_lock():
+    """Serialize the allocate-ports + reserve-slot critical section across
+    concurrent `start` launches on one host. Without it, two parallel launches
+    race to the same free port index. POSIX flock; a no-op on Windows (the
+    120-concurrent farm is Linux, dev is macOS -- both POSIX; the shipped
+    Windows product launches one instance at a time)."""
+    lock_path = config.runtime_root() / ".launch.lock"
+    f = open(lock_path, "w")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass   # Windows / no-flock: degrade to no lock (single-launch host)
+        yield
+    finally:
+        f.close()
+
+
 # ---------- process helpers ----------
 
 def pid_alive(pid):
@@ -826,6 +847,20 @@ def runtime_dir(username):
     autocap frames. Wiped on `stop` and `remove` (see _wipe_runtime).
     Replaces the old accounts/<name>/ for the product path."""
     return config.runtime_root() / username
+
+
+def _reserve_ports(name, adb_port, qmp_port, vnc_port):
+    """Claim a port slot for `name` by writing a run.json reservation with THIS
+    launcher process's pid, so a concurrent allocate_ports() (which counts
+    runtime/*/run.json with a live pid) sees the slot as taken until
+    spawn_qemu() overwrites it with the real QEMU pid. Self-healing: if the
+    launch aborts before spawn, the launcher exits, its pid dies, and
+    running_instances() stops counting the stale reservation -> slot freed."""
+    d = runtime_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "run.json").write_text(json.dumps(
+        {"pid": os.getpid(), "started": time.time(), "reserving": True,
+         "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port}))
 
 
 def _wipe_runtime(name):
@@ -1589,7 +1624,14 @@ def build_acct(name, cfg, dev=False):
              f"instances are arm-only; base '{tag}' is {arch_of_base(base)}")
     assert_dev_allowed(tag, base)
     ensure_qemu()
-    adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+    # Hold the launch lock across allocate + reserve ONLY (tiny critical
+    # section): a lock alone isn't enough (allocate-then-release before spawn
+    # would let a concurrent launcher see the same slot free), so the
+    # reservation write happens BEFORE the lock releases -- see
+    # _launch_lock/_reserve_ports docstrings.
+    with _launch_lock():
+        adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+        _reserve_ports(name, adb_port, qmp_port, vnc_port)
     d = runtime_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     import shutil

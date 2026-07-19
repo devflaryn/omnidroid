@@ -53,3 +53,36 @@ def test_allocate_ports_reuses_freed_slots(tmp_path, monkeypatch):
     # a DEAD instance at index 1 does NOT reserve a slot -> still index 1
     _write_run(tmp_path, "dead", 2, 16002)
     assert engine.allocate_ports(cfg) == (16002, 17002, 18002)
+
+
+def test_build_acct_reserves_port_slot_before_spawn(tmp_path, monkeypatch):
+    """A reservation (live launcher pid, no QEMU spawned yet) must be visible
+    to allocate_ports the same way a live QEMU instance is -- this is what
+    closes the concurrent-`start` race: launcher A allocates+reserves index 0
+    inside the lock, so launcher B (racing right behind it) sees index 0 taken
+    and allocates index 1 instead. If the launcher dies before spawn_qemu
+    overwrites the reservation with the real QEMU pid, the reservation is
+    self-healing: its pid goes dead and running_instances() stops counting
+    it, freeing the slot back up."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    cfg = {"qemu": {"adb_port_start": 16001, "qmp_port_start": 17001,
+                    "vnc_port_start": 18001}}
+    assert engine.allocate_ports(cfg) == (16001, 17001, 18001)
+    # This process reserves index 0 (as build_acct would, under the lock).
+    engine._reserve_ports("a", 16001, 17001, 18001)
+    assert engine.allocate_ports(cfg) == (16002, 17002, 18002)
+    # Simulate the launcher dying before spawn_qemu ever overwrote run.json:
+    # a dead pid must not keep the slot reserved.
+    _write_run(tmp_path, "a", 2, 16001)
+    assert engine.allocate_ports(cfg) == (16001, 17001, 18001)
+
+
+def test_launch_lock_is_reentrant_safe_serial(tmp_path, monkeypatch):
+    """Basic smoke test: acquiring and releasing the launch lock twice in a
+    row (as two sequential `start` launches would) doesn't deadlock or
+    error."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    with engine._launch_lock():
+        pass
+    with engine._launch_lock():
+        pass
