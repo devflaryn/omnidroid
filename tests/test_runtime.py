@@ -29,6 +29,18 @@ def test_running_instances_lists_only_live_pids(tmp_path, monkeypatch):
     assert "dead" not in names
 
 
+def test_spawn_records_ports_in_runtime_run_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    # running_pid reads runtime/<name>/run.json
+    d = tmp_path / "runtime" / "x"
+    d.mkdir(parents=True)
+    (d / "run.json").write_text(json.dumps(
+        {"pid": os.getpid(), "adb_port": 16005}))
+    assert engine.running_pid("x") == os.getpid()
+    # a name with no runtime dir is not running
+    assert engine.running_pid("ghost") is None
+
+
 def test_allocate_ports_reuses_freed_slots(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     cfg = {"qemu": {"adb_port_start": 16001, "qmp_port_start": 17001,

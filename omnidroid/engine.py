@@ -998,7 +998,8 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
     flag only adds a serial log."""
     base = cfg["bases"][acct["base"]]
     q = cfg["qemu"]
-    d = account_dir(acct["name"])
+    d = account_dir(acct["name"])          # overlay disks only (Task 4 removes these)
+    rd = runtime_dir(acct["name"])         # per-boot files: efivars.fd, serial.log
     images = Path(cfg["images_dir"])
     accel = accel or default_accel()
     mode = mode or resolve_mode(cfg)
@@ -1018,10 +1019,19 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
         sys_src = images / base["system"]
         data_src = images / base["data"]
         disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
+        # Ephemeral efivars is refreshed fresh EVERY boot (see
+        # _refresh_ephemeral_efivars, called from spawn_qemu before this
+        # command is built) into runtime_dir — genuinely per-boot, throwaway.
+        efivars_src = rd / "efivars.fd"
     else:
         sys_src = d / "system.qcow2"
         data_src = d / "data.qcow2"
         disk_opts = ",discard=unmap,detect-zeroes=unmap"
+        # Non-ephemeral efivars is written ONCE at account creation (see
+        # _create_arm/ensure_instance) and persists across boots like the
+        # overlay disks — stays under account_dir until Task 4 removes the
+        # per-account overlay model entirely.
+        efivars_src = d / "efivars.fd"
 
     code = arm_edk2_code()
     if not code:
@@ -1038,7 +1048,7 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
         # UEFI firmware: read-only CODE + per-account writable vars.
         "-drive", (f"if=pflash,unit=0,file={code},file.locking=off,"
                    "format=raw,readonly=on"),
-        "-drive", f"if=pflash,unit=1,file={d / 'efivars.fd'}",
+        "-drive", f"if=pflash,unit=1,file={efivars_src}",
         # System overlay (vda, has /metadata FBE keys) + /data (vdb).
         "-device", "virtio-blk-pci,drive=vda,bootindex=0",
         "-device", "virtio-blk-pci,drive=vdb,bootindex=1",
@@ -1076,7 +1086,7 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
             "-drive", f"file={devkit_src},if=none,id=vdc{disk_opts}",
         ]
     if dev:
-        cmd += ["-serial", f"file:{d / 'serial.log'}"]
+        cmd += ["-serial", f"file:{rd / 'serial.log'}"]
     return cmd
 
 
@@ -1159,7 +1169,7 @@ def _refresh_ephemeral_efivars(acct, cfg):
     if base_type(base) != BASE_TYPE_ARM:
         return
     images = Path(cfg["images_dir"])
-    d = account_dir(acct["name"])
+    d = runtime_dir(acct["name"])
     d.mkdir(parents=True, exist_ok=True)
     efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
     if efi_tmpl.exists():
@@ -1168,7 +1178,8 @@ def _refresh_ephemeral_efivars(acct, cfg):
 
 def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
     check_accel()
-    d = account_dir(acct["name"])
+    d = runtime_dir(acct["name"])
+    d.mkdir(parents=True, exist_ok=True)
     if acct.get("ephemeral"):
         _refresh_ephemeral_efivars(acct, cfg)
     log = open(d / "qemu.log", "w")
@@ -1184,12 +1195,14 @@ def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
         stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
-         "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE)}))
+         "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE),
+         "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
+         "vnc_port": acct["vnc_port"]}))
     return proc.pid
 
 
 def running_pid(name):
-    p = account_dir(name) / "run.json"
+    p = runtime_dir(name) / "run.json"
     if not p.exists():
         return None
     pid = json.loads(p.read_text()).get("pid")
@@ -1200,7 +1213,11 @@ def running_pid(name):
 
 def wait_for_boot(acct, timeout, label, first_boot=False):
     """Poll until sys.boot_completed=1, printing honest progress lines."""
-    d = account_dir(acct["name"])
+    # arm's serial.log is written under runtime_dir (see qemu_command_arm);
+    # x86's stays under account_dir (qemu_command/x86 is untouched — Task 4
+    # retires x86 instances along with the overlay-disk model).
+    d = runtime_dir(acct["name"]) if acct_base_is_arm(acct) \
+        else account_dir(acct["name"])
     serial_log = d / "serial.log"
     start = time.time()
     phase = "starting QEMU"
@@ -1242,8 +1259,7 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
         stalled = time.time() - last_change > 600 and not adbd_seen
         if stalled:
             new_phase += ("  [WARNING: no progress signal for 10+ min - "
-                          f"check accounts/{acct['name']}/serial.log "
-                          "and qemu.log]")
+                          f"check {d / 'serial.log'} and qemu.log]")
         if new_phase != phase or elapsed - last_print >= 15:
             phase = new_phase
             last_print = elapsed
@@ -4152,7 +4168,7 @@ def account_status(a, stats=False):
            "game_package": a.get("game_package")}
     if pid:
         try:
-            run = json.loads((account_dir(a["name"]) /
+            run = json.loads((runtime_dir(a["name"]) /
                               "run.json").read_text())
             rec["mode"] = run.get("mode")
             rec["started"] = run.get("started")
@@ -4827,7 +4843,7 @@ def cmd_capture(args):
     pkg = getattr(args, "package", None) or acct.get("game_package")
     prefix = "autocap" if auto else "capture"
     out_dir = Path(args.out) if getattr(args, "out", None) else \
-        (account_dir(args.name) / f"{prefix}-{int(time.time())}")
+        (runtime_dir(args.name) / f"{prefix}-{int(time.time())}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4972,18 +4988,18 @@ def cmd_capture(args):
 # or an explicit `omni autocap --ensure` never stacks a second recorder — so the
 # same feed is guaranteed on whenever a dev instance is up.
 AUTOCAP_MAX_KEYFRAMES = 5000            # long always-on session, not a 20s window
-_AUTOCAP_STATE_FILE = "autocap.json"    # in account_dir: {pid, out_dir, package}
+_AUTOCAP_STATE_FILE = "autocap.json"    # in runtime_dir: {pid, out_dir, package}
 
 
 def _autocap_out_dir(name, override=None):
     import os
     d = override or os.environ.get("OMNI_AUTOCAP_DIR")
-    return str(Path(d)) if d else str(account_dir(name) / "autocap")
+    return str(Path(d)) if d else str(runtime_dir(name) / "autocap")
 
 
 def _autocap_state(name):
     """(pid, out_dir) of a LIVE recorder for this account, or (None, None)."""
-    p = account_dir(name) / _AUTOCAP_STATE_FILE
+    p = runtime_dir(name) / _AUTOCAP_STATE_FILE
     if not p.exists():
         return None, None
     try:
@@ -5060,7 +5076,9 @@ def ensure_autocap(acct, out_dir=None, force=False):
             pass
     pkg = acct.get("game_package")
     pid = _spawn_autocap(name, out, package=pkg)
-    (account_dir(name) / _AUTOCAP_STATE_FILE).write_text(
+    rd = runtime_dir(name)
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / _AUTOCAP_STATE_FILE).write_text(
         json.dumps({"pid": pid, "out_dir": out, "package": pkg,
                     "started": time.time()}), encoding="utf-8")
     return {"running": True, "pid": pid, "out_dir": out, "already": False}
@@ -5099,7 +5117,7 @@ def stop_autocap(name):
     if pid:
         _stop_autocap_proc(name, pid, out_dir)
     try:
-        (account_dir(name) / _AUTOCAP_STATE_FILE).unlink()
+        (runtime_dir(name) / _AUTOCAP_STATE_FILE).unlink()
     except OSError:
         pass
     return {"stopped": bool(pid), "out_dir": out_dir}
