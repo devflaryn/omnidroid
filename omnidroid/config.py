@@ -44,6 +44,14 @@ def data_dir() -> Path:
     return REPO
 
 
+def runtime_root() -> Path:
+    """Directory holding per-instance throwaway state (runtime/<username>/).
+    Under the data dir so it follows OMNI_DATA_DIR; created on demand."""
+    p = data_dir() / "runtime"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def resolve_images_dir(cfg):
     """images_dir may be a plain string or a per-platform dict
     ({"windows": ..., "linux": ...}) so one checkout works on both hosts.
