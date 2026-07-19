@@ -107,10 +107,10 @@ def _migrate_legacy(repo):
 
 
 def save_account(repo, username, cookie, user_id=None, display_name=None):
-    """Upsert an account keyed by username. A previously-set custom_name is
-    PRESERVED across re-logins (a routine cookie refresh must not silently wipe
-    a friendly label someone attached with set_custom_name) — it is only ever
-    changed by set_custom_name."""
+    """Upsert an account keyed by username. Previously-set fields that are NOT
+    part of a routine cookie refresh (custom_name, place_id, base, proxy, group,
+    notes) are PRESERVED across re-logins — a cookie refresh must not wipe
+    metadata attached elsewhere."""
     data = _read(repo)
     existing = data["accounts"].get(username) or {}
     data["accounts"][username] = {
@@ -119,6 +119,11 @@ def save_account(repo, username, cookie, user_id=None, display_name=None):
         "display_name": display_name,
         "custom_name": existing.get("custom_name"),
         "cookie": cookie,
+        "place_id": existing.get("place_id"),
+        "base": existing.get("base"),
+        "proxy": existing.get("proxy"),
+        "group": existing.get("group"),
+        "notes": existing.get("notes"),
         "saved": time.time(),
     }
     _write(repo, data)
@@ -162,9 +167,59 @@ def list_accounts(repo):
                     "user_id": rec.get("user_id"),
                     "display_name": rec.get("display_name"),
                     "custom_name": rec.get("custom_name"),
+                    "place_id": rec.get("place_id"),
+                    "base": rec.get("base"),
+                    "group": rec.get("group"),
                     "saved": rec.get("saved"),
                     "has_cookie": bool(rec.get("cookie"))})
     return out
+
+
+_SETTABLE_FIELDS = ("place_id", "base", "proxy", "group", "notes")
+
+
+def _validate_place_id(v):
+    if v is None:
+        return None
+    try:
+        pid = int(str(v).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"place_id must be a positive integer, got {v!r}")
+    if pid <= 0:
+        raise ValueError(f"place_id must be positive, got {pid}")
+    return pid
+
+
+def _validate_base(v):
+    if v is None:
+        return None
+    if v not in ("prod", "dev"):
+        raise ValueError(f"base must be 'prod' or 'dev', got {v!r}")
+    return v
+
+
+def set_fields(repo, username, **fields):
+    """Update metadata fields on an EXISTING account without touching the
+    cookie/identity. Settable: place_id, base, proxy, group, notes. Returns
+    False if no account is saved under that username. Raises ValueError on an
+    unknown field name or an invalid place_id/base value."""
+    for key in fields:
+        if key not in _SETTABLE_FIELDS:
+            raise ValueError(f"unknown field {key!r}; settable: "
+                             f"{', '.join(_SETTABLE_FIELDS)}")
+    data = _read(repo)
+    if username not in data["accounts"]:
+        return False
+    rec = data["accounts"][username]
+    if "place_id" in fields:
+        rec["place_id"] = _validate_place_id(fields["place_id"])
+    if "base" in fields:
+        rec["base"] = _validate_base(fields["base"])
+    for key in ("proxy", "group", "notes"):
+        if key in fields:
+            rec[key] = fields[key]
+    _write(repo, data)
+    return True
 
 
 def whoami(cookie, timeout=20):

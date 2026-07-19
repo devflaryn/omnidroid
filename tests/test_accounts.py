@@ -6,7 +6,7 @@ design, so what is testable here is the part that must never go wrong — the
 single-file store keyed by username, its permissions, migration from the old
 per-label files, and the rule that a cookie never leaks into output.
 
-    python3 tests/test_cookies.py
+    python3 tests/test_accounts.py
 """
 import json
 import os
@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from omnidroid import cookies  # noqa: E402
+from omnidroid import accounts as cookies  # noqa: E402
 
 TOKEN = "_|WARNING:-DO-NOT-SHARE-THIS.--" + ("Q" * 300) + "tAiL99"
 
@@ -67,6 +67,79 @@ class Store(unittest.TestCase):
         cookies.save_account(self.repo, "u", "old", 1)
         cookies.save_account(self.repo, "u", "new", 1)
         self.assertEqual(cookies.get_account(self.repo, "u")["cookie"], "new")
+
+    def test_new_fields_default_to_none_on_first_save(self):
+        cookies.save_account(self.repo, "u", TOKEN, 7)
+        rec = cookies.get_account(self.repo, "u")
+        for f in ("place_id", "base", "proxy", "group", "notes"):
+            self.assertIn(f, rec)
+            self.assertIsNone(rec[f])
+
+    def test_new_fields_survive_relogin(self):
+        cookies.save_account(self.repo, "u", "old", 1)
+        # simulate A2.2 setting fields, then a routine cookie refresh
+        data = json.loads(cookies.accounts_path(self.repo).read_text())
+        data["accounts"]["u"]["place_id"] = 123
+        data["accounts"]["u"]["base"] = "dev"
+        data["accounts"]["u"]["group"] = "farm-a"
+        cookies.accounts_path(self.repo).write_text(json.dumps(data))
+        cookies.save_account(self.repo, "u", "new", 1)   # re-login
+        rec = cookies.get_account(self.repo, "u")
+        self.assertEqual(rec["cookie"], "new")           # cookie refreshed
+        self.assertEqual(rec["place_id"], 123)           # field preserved
+        self.assertEqual(rec["base"], "dev")
+        self.assertEqual(rec["group"], "farm-a")
+
+    def test_listing_exposes_place_base_group_but_not_proxy_notes(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        data = json.loads(cookies.accounts_path(self.repo).read_text())
+        data["accounts"]["u"].update(
+            {"place_id": 9, "base": "prod", "group": "g",
+             "proxy": "http://secret:pw@host", "notes": "n"})
+        cookies.accounts_path(self.repo).write_text(json.dumps(data))
+        entry = cookies.list_accounts(self.repo)[0]
+        self.assertEqual(entry["place_id"], 9)
+        self.assertEqual(entry["base"], "prod")
+        self.assertEqual(entry["group"], "g")
+        self.assertNotIn("proxy", entry)
+        self.assertNotIn("notes", entry)
+        self.assertNotIn("cookie", entry)
+
+    def test_set_fields_updates_existing_account(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        ok = cookies.set_fields(self.repo, "u",
+                                place_id="4483381587", base="dev",
+                                group="farm-a", notes="test")
+        self.assertTrue(ok)
+        rec = cookies.get_account(self.repo, "u")
+        self.assertEqual(rec["place_id"], 4483381587)   # coerced to int
+        self.assertEqual(rec["base"], "dev")
+        self.assertEqual(rec["group"], "farm-a")
+        self.assertEqual(rec["notes"], "test")
+        self.assertEqual(rec["cookie"], TOKEN)           # cookie untouched
+
+    def test_set_fields_returns_false_for_missing_account(self):
+        self.assertFalse(cookies.set_fields(self.repo, "ghost", base="prod"))
+
+    def test_set_fields_rejects_bad_place_id(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", place_id="-5")
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", place_id="notanumber")
+
+    def test_set_fields_rejects_bad_base_and_unknown_field(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", base="staging")
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", cookie="hacked")
+
+    def test_set_fields_clears_with_none(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        cookies.set_fields(self.repo, "u", place_id=7)
+        cookies.set_fields(self.repo, "u", place_id=None)
+        self.assertIsNone(cookies.get_account(self.repo, "u")["place_id"])
 
 
 class CustomName(unittest.TestCase):

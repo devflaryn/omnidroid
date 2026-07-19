@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omnidroid import engine as omni  # noqa: E402
-from omnidroid import cookies as ck  # noqa: E402
+from omnidroid import accounts as ck  # noqa: E402
 
 TOKEN = "_|WARNING:-DO-NOT-SHARE-THIS.--" + ("A" * 200) + "ZZbEnD"
 
