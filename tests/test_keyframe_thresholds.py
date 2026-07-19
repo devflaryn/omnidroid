@@ -13,12 +13,11 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                os.pardir, "manager"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PIL import Image, ImageDraw  # noqa: E402
 
-import capture  # noqa: E402
+from omnidroid import capture  # noqa: E402
 
 W, H = 1280, 720
 BG = (20, 20, 24)

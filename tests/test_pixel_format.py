@@ -14,10 +14,9 @@ import struct
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                os.pardir, "manager"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import capture  # noqa: E402
+from omnidroid import capture  # noqa: E402
 
 
 def _pixel(rgbx_bytes):
@@ -54,7 +53,7 @@ class PixelFormat(unittest.TestCase):
         decoder expects. Measured: changing these makes QEMU emit a different
         byte order the decoder then gets wrong, so request and decode are a
         matched pair — this guards the request half."""
-        import vncview
+        from omnidroid import vncview
         sent = {}
         client = vncview.RFBClient.__new__(vncview.RFBClient)
         client._send = lambda data: sent.setdefault("pf", data)

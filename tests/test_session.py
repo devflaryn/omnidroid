@@ -19,9 +19,17 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 os.pardir, "manager"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import omni  # noqa: E402
-import cookies as ck  # noqa: E402
+from omnidroid import cookies as ck  # noqa: E402
+
+# manager/omni.py still does a bare `import cookies as _ck` internally (it
+# moves in Task 3). Pre-seed sys.modules so that lookup resolves to the real
+# omnidroid.cookies module instead of colliding with the gitignored
+# ./cookies/ data directory, which Python treats as an empty PEP 420
+# namespace package now that manager/cookies.py no longer lives there.
+sys.modules.setdefault("cookies", ck)
 
 TOKEN = "_|WARNING:-DO-NOT-SHARE-THIS.--" + ("A" * 200) + "ZZbEnD"
 
