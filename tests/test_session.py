@@ -221,12 +221,12 @@ class LoginTokenFlag(unittest.TestCase):
 
 
 class PlayGatesOnLogin(unittest.TestCase):
-    """`omni play <name>` must never create an instance (overlay + /data + QEMU
-    disks) for a name with no saved cookie and no override. Regression
+    """`omni start <name>` must never create an instance (overlay + /data +
+    QEMU disks) for a name with no saved cookie and no override. Regression
     coverage for the bug where ensure_instance() ran BEFORE the token check,
     so a brand-new or misspelled name (e.g. a literal 'omniagent') left a
-    real instance directory on disk even though the play always failed with
-    no_token — "the only way to create a profile is to log in" was not
+    real instance directory on disk even though the launch always failed
+    with no_token — "the only way to create a profile is to log in" was not
     actually enforced."""
 
     def setUp(self):
@@ -242,6 +242,7 @@ class PlayGatesOnLogin(unittest.TestCase):
             mock.patch.dict(os.environ, {"OMNI_DATA_DIR": str(self.tmp)}),
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
+            mock.patch.object(omni, "running_pid", lambda name: None),
         ]
         for p in patches:
             p.start()
@@ -252,22 +253,17 @@ class PlayGatesOnLogin(unittest.TestCase):
                     token_file=None, token_stdin=False, job=None,
                     access_code=None, link_code=None, launch_data=None,
                     user_id=None, no_token=False, dev=False, window=False,
-                    no_window=True, accel=None, timeout=None, json=True)
+                    no_window=True, mode=None, mem=None, accel=None,
+                    timeout=None, json=True)
         base.update(over)
         return SimpleNamespace(**base)
 
     def test_no_token_never_creates_an_instance(self):
         with mock.patch.object(omni, "build_acct") as build_mock:
             with self.assertRaises(SystemExit):
-                omni.cmd_play(self._args())
+                omni.cmd_start(self._args())
             build_mock.assert_not_called()
         self.assertFalse((self.tmp / "accounts" / "brand_new_name").exists())
-
-    def test_no_place_never_creates_an_instance_either(self):
-        with mock.patch.object(omni, "build_acct") as build_mock:
-            with self.assertRaises(SystemExit):
-                omni.cmd_play(self._args(place=None))
-            build_mock.assert_not_called()
 
     def test_explicit_no_token_still_reaches_build_acct(self):
         """--no-token is a deliberate, explicit escape hatch (land on
@@ -281,7 +277,7 @@ class PlayGatesOnLogin(unittest.TestCase):
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
              mock.patch.object(omni, "acct_is_dev", return_value=True):
             with self.assertRaises(SystemExit):
-                omni.cmd_play(self._args(no_token=True))
+                omni.cmd_start(self._args(no_token=True))
         build_mock.assert_called_once()
 
     def test_saved_account_still_reaches_build_acct(self):
@@ -296,8 +292,81 @@ class PlayGatesOnLogin(unittest.TestCase):
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
              mock.patch.object(omni, "acct_is_dev", return_value=True):
             with self.assertRaises(SystemExit):
-                omni.cmd_play(self._args(name="realuser"))
+                omni.cmd_start(self._args(name="realuser"))
         build_mock.assert_called_once()
+
+    def test_saved_account_with_no_place_still_reaches_build_acct(self):
+        """A place is now OPTIONAL: no place means a HOME boot, not a
+        rejection. A saved account with no place must still reach
+        build_acct() (it used to fail with no_place before any instance
+        could be created)."""
+        ck.save_account(str(self.tmp), "realuser", "sometoken")
+        stub_acct = {"name": "realuser", "adb_port": 1, "vnc_port": 1,
+                    "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
+        with mock.patch.object(omni, "build_acct",
+                              return_value=stub_acct) as build_mock, \
+             mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
+             mock.patch.object(omni, "acct_arch", return_value="arm"), \
+             mock.patch.object(omni, "acct_is_dev", return_value=True):
+            with self.assertRaises(SystemExit):
+                omni.cmd_start(self._args(name="realuser", place=None))
+        build_mock.assert_called_once()
+
+
+class StartHomeVsJoin(unittest.TestCase):
+    """`omni start` with no --place boots to HOME (play=False, cookie
+    delivered, nothing joined); with --place it JOINS (play=True)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="omni-test-repo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        patches = [
+            mock.patch.object(omni, "REPO", self.tmp),
+            mock.patch.object(omni, "ACCOUNTS_DIR", self.tmp / "accounts"),
+            mock.patch.dict(os.environ, {"OMNI_DATA_DIR": str(self.tmp)}),
+            mock.patch.object(omni, "ensure_qemu", lambda: None),
+            mock.patch.object(omni, "load_config", lambda: {}),
+            mock.patch.object(omni, "running_pid", lambda name: None),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        ck.save_account(str(self.tmp), "realuser", "sometoken")
+
+    def _args(self, **over):
+        base = dict(name="realuser", place=None, token=None, token_file=None,
+                    token_stdin=False, job=None, access_code=None,
+                    link_code=None, launch_data=None, user_id=None,
+                    no_token=False, dev=False, window=False, no_window=True,
+                    mode=None, mem=None, accel=None, timeout=None, json=True)
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _run(self, **over):
+        stub_acct = {"name": "realuser", "adb_port": 1, "vnc_port": 1,
+                    "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
+        with mock.patch.object(omni, "build_acct", return_value=stub_acct), \
+             mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
+             mock.patch.object(omni, "acct_arch", return_value="arm"), \
+             mock.patch.object(omni, "acct_is_dev", return_value=True), \
+             mock.patch.object(omni, "deliver_session",
+                              return_value={"delivered": True}) as deliver_mock, \
+             mock.patch.object(omni, "_spawn_builtin_viewer"):
+            omni.cmd_start(self._args(**over))
+        return deliver_mock
+
+    def test_no_place_delivers_home_not_join(self):
+        deliver_mock = self._run(place=None)
+        deliver_mock.assert_called_once()
+        _, kwargs = deliver_mock.call_args
+        # play is passed positionally or as kwarg depending on call site;
+        # cmd_start calls deliver_session(acct, label, sess, play=is_join).
+        self.assertFalse(deliver_mock.call_args.kwargs.get("play", True))
+
+    def test_place_delivers_join(self):
+        deliver_mock = self._run(place="606849621")
+        deliver_mock.assert_called_once()
+        self.assertTrue(deliver_mock.call_args.kwargs.get("play", False))
 
 
 if __name__ == "__main__":

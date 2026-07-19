@@ -1611,7 +1611,7 @@ def build_acct(name, cfg, dev=False):
 
 def ensure_instance(name, cfg, dev=False, ephemeral=False):
     """Return the account dict for instance <name>, creating a THIN arm instance
-    if it does not exist yet. This is what lets `omni play <username>` work with
+    if it does not exist yet. This is what lets `omni start <username>` work with
     no prior `omni create`: the instance is named for the account and is a cheap
     COW overlay of the shared base, so there is no per-account 1 GB disk and
     nothing to clean up but the cookie.
@@ -1958,68 +1958,109 @@ def _devkit_activate(acct, label):
 
 
 def cmd_start(args):
+    """Boot (or reuse) an instance, deliver its saved Roblox session, and land
+    either INSIDE a place (if one is set) or on the account's home screen,
+    logged in, with no menu and no simulated taps — the product's whole
+    point.
+
+    Identical on the dev and production bases: same kiosk, same session
+    broadcast, same roblox:// join. The dev base only differs in what is
+    additionally available (frida/Magisk + always-on screenshots)."""
     ensure_qemu()
-    return _cmd_start(args)
-
-
-def _cmd_start(args):
-    """Spawn a detached QEMU instance and return immediately.
-
-    The VM is never tied to this process: PID + ports are recorded in
-    accounts/<name>/run.json, lifecycle is managed via PID/adb/QMP.
-    Use --wait (or 'omni resume <name>') to block until boot completes.
-    """
     cfg = load_config()
+    dev = args.dev
+    label = f"start {args.name}"
+    json_mode = getattr(args, "json", False)
+
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
-    acct = build_acct(args.name, cfg, dev=args.dev)
-    first = not acct.get("first_boot_done")
-    dev = args.dev or first          # first boot always uses the dev profile
-    mode = resolve_mode(cfg, args.mode, mem=args.mem)
-    accel = getattr(args, "accel", None)
-    pid = spawn_qemu(acct, cfg, dev=dev, mode=None if dev else mode,
-                     accel=accel)
-    # Auto-screenshots start HERE, not after boot: QEMU's VNC server is live the
-    # moment the process is up, so the recorder sees the boot screen and every
-    # frame after it. Starting it post-boot (or only on --wait) would silently
-    # drop the whole boot sequence — the part a tester most wants timed.
-    maybe_start_autocap(acct, f"start {args.name}")
-    modestr = "dev" if dev else mode["name"]
-    json_mode = getattr(args, "json", False)
-    result = {"name": args.name, "pid": pid, "mode": modestr,
-              "headless": True,
-              "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
-              "vnc_port": acct["vnc_port"], "vnc_host": "127.0.0.1",
-              "adb_serial": f"127.0.0.1:{acct['adb_port']}",
-              "first_boot": first, "arch": acct_arch(acct), "ok": True}
-    print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr} "
-          f"(headless), adb 127.0.0.1:{acct['adb_port']}, "
-          f"qmp 127.0.0.1:{acct['qmp_port']}, "
-          f"vnc 127.0.0.1:{acct['vnc_port']}")
-    if first:
-        print(f"[start {args.name}] first boot of this account: one-time "
-              f"dexopt, ~15 min. Track progress: omni resume {args.name}",
-              flush=True)
-    if not args.wait:
+
+    # Resolve the session BEFORE creating anything on disk. store_session() and
+    # resolve_token()/account_cookie() are pure reads of the central store —
+    # neither needs an instance directory to exist, so this is safe to do
+    # ahead of build_acct(). That ordering is load-bearing, not cosmetic:
+    # "the only way to create a profile is to log in" means a brand-new name
+    # with no saved cookie and no override must fail HERE, before a real
+    # instance (efivars + ports) gets allocated for it.
+    place_override = (_validate_place_id(args.place)
+                      if getattr(args, "place", None) is not None else None)
+    sess = store_session(args.name, args, place_override=place_override)
+    # --token/--token-file/--token-stdin (or the account's own saved cookie)
+    # still wins over whatever store_session() found, same priority order as
+    # resolve_token() always documented.
+    tok = resolve_token(args)
+    if tok:
+        sess["token"] = tok
+    if not sess.get("token") and not getattr(args, "no_token", False):
+        return fail("no_token",
+                    f"no saved Roblox account '{args.name}'. Sign it in first: "
+                    f"`omni login` (saves the account under its username), then "
+                    f"`omni start {args.name}`. (Or override with "
+                    f"--token-file <file>, or --no-token to land on Roblox's "
+                    f"own login screen.) No instance was created for "
+                    f"'{args.name}'.")
+    # A place is OPTIONAL: with one set, this is a JOIN; without one, it's a
+    # HOME boot — logged in via the delivered cookie, no deep link, no join.
+    is_join = bool(sess.get("place_id"))
+
+    # Only NOW do we know a session is deliverable (a real token, or the
+    # explicit --no-token escape hatch) — build the launch handle. Nothing is
+    # persisted here: the store owns the account's cookie (via `omni login`)
+    # and its default place (via `omni session --place`); --place above is a
+    # one-off override for THIS launch only.
+    acct = build_acct(args.name, cfg, dev=dev)
+
+    booted, first = _ensure_booted(acct, cfg, label,
+                                   timeout=getattr(args, "timeout", None),
+                                   accel=getattr(args, "accel", None))
+    result = {"name": args.name, "place_id": sess.get("place_id"),
+              "deeplink": roblox_deeplink(sess), "first_boot": first,
+              "arch": acct_arch(acct), "dev": acct_is_dev(acct),
+              "adb_port": acct["adb_port"], "vnc_port": acct["vnc_port"],
+              "session": public_session(sess)}
+    if not booted:
+        result.update({"ok": False, "booted": False, "error": "boot_timeout"})
         if json_mode:
             emit_json(result)
-        return
-    timeout = args.timeout or (FIRST_BOOT_TIMEOUT if first
-                               else NORMAL_BOOT_TIMEOUT)
-    if not wait_for_boot(acct, timeout, f"start {args.name}",
-                         first_boot=first):
-        if json_mode:
-            emit_json({**result, "booted": False, "ok": False})
         sys.exit(1)
-    bridge_ok = post_boot(acct, f"start {args.name}")
-    if first:
-        provision_settings(acct, f"start {args.name}")
-        acct["first_boot_done"] = True
-        save_account(acct)
-    devkit = _devkit_activate(acct, f"start {args.name}")
+
+    status = deliver_session(acct, label, sess, play=is_join)
+    result.update({"booted": True, "ok": bool(status.get("delivered")),
+                   **{k: v for k, v in status.items() if k != "kiosk"}})
+    result["kiosk"] = status.get("kiosk")
+
+    # Open a live WINDOW onto this instance so you can watch/play it, and so two
+    # `omni start` runs give two accounts side by side. Each viewer is its own
+    # detached process bound to this instance's own VNC port, so N windows for N
+    # accounts just work. Default ON for interactive use; suppressed by
+    # --no-window and by --json (a machine/automation caller drives via capture).
+    want_window = (not getattr(args, "no_window", False)
+                   and (getattr(args, "window", False) or not json_mode))
+    viewer_pid = None
+    if result["ok"] and want_window:
+        try:
+            if _wait_for_vnc("127.0.0.1", acct["vnc_port"], timeout=10):
+                title = (f"omni: {args.name}  (place {sess['place_id']})"
+                         if is_join else f"omni: {args.name}  (home)")
+                viewer_pid = _spawn_builtin_viewer(
+                    args.name, "127.0.0.1", acct["vnc_port"], title).pid
+                result["viewer_pid"] = viewer_pid
+        except Exception as e:  # noqa: BLE001 — a window failure must not fail start
+            print(f"[{label}] could not open a window: {e}")
+
     if json_mode:
-        emit_json({**result, "booted": True, "native_bridge_ok": bridge_ok,
-                   "devkit": devkit})
+        emit_json(result)
+    elif result["ok"]:
+        where = (f"window opened (pid {viewer_pid})" if viewer_pid
+                 else f"vnc 127.0.0.1:{acct['vnc_port']} to watch")
+        if is_join:
+            print(f"[{label}] joined place {sess['place_id']} — {where}")
+        else:
+            print(f"[{label}] logged in on home — {where}")
+    else:
+        print(f"[{label}] session NOT applied: "
+              f"{status.get('reason')} {status.get('detail', '')}")
+        sys.exit(1)
 
 
 def _shutdown(acct, label, timeout=90):
@@ -2539,7 +2580,7 @@ def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
     /metadata keys came from a copy of that very image.
 
     Without this, a FRESH account ships the kiosk build that was current when the
-    template was last captured — so `omni play` gets no_kiosk_reply until someone
+    template was last captured — so `omni start` gets no_kiosk_reply until someone
     installs the new kiosk by hand.
     """
     kiosk_apk = Path(kiosk_apk)
@@ -3174,7 +3215,7 @@ GRUB_CFG_PATH = "boot/grub/grub.cfg"
 # This is not a convenience — without it the product does not work at all. adbd
 # otherwise demands authorization, which Android asks for with an "Allow USB
 # debugging?" DIALOG on the guest screen. Nothing can answer it: the instance is
-# headless, the kiosk cannot dismiss a system dialog, and `omni play` needs adb
+# headless, the kiosk cannot dismiss a system dialog, and `omni start` needs adb
 # to reach the kiosk in the first place. Every fresh account would sit at that
 # dialog forever.
 #
@@ -5687,9 +5728,11 @@ def kiosk_installed(acct):
 
 def deliver_session(acct, label, sess, play=True, restart=True):
     """Hand `sess` (see store_session()) to the in-guest kiosk and (by default)
-    tell it to join. Returns a status dict; never raises into a boot path."""
+    tell it to join. `play=False` (no place_id) is HOME mode: the cookie is
+    still delivered — the account is logged in — but no place is joined.
+    Returns a status dict; never raises into a boot path."""
     name = acct["name"]
-    if not sess.get("place_id"):
+    if not sess.get("token") and not sess.get("place_id"):
         return {"delivered": False, "reason": "no_session"}
     if not kiosk_installed(acct):
         return {"delivered": False, "reason": "kiosk_missing",
@@ -5720,18 +5763,21 @@ def deliver_session(acct, label, sess, play=True, restart=True):
             ROBLOX_PACKAGE, timeout=15)
     except Exception as e:  # noqa: BLE001 — the broadcast below still works
         print(f"[{label}] could not set omni_game_package: {e}")
-    if play and restart:
+    if restart:
         # Cold-start Roblox so the new cookie is read at startup. Without this,
         # switching accounts silently joins as the PREVIOUS user: the client
         # caches the authenticated user in-process. This has to happen host-side
         # — as shell we hold FORCE_STOP_PACKAGES, whereas the kiosk (an ordinary
-        # app, device owner or not) cannot stop a foreground app at all.
+        # app, device owner or not) cannot stop a foreground app at all. Applies
+        # in HOME mode too (play=False): the cookie still needs a cold start to
+        # take effect.
         try:
             adb(acct, "shell", "am", "force-stop", ROBLOX_PACKAGE, timeout=25)
         except Exception as e:  # noqa: BLE001 — a live instance still plays
             print(f"[{label}] could not force-stop {ROBLOX_PACKAGE}: {e}")
-    extras = {"place_id": ("--el", int(sess["place_id"])),
-              "play": ("--ez", "true" if play else "false")}
+    extras = {"play": ("--ez", "true" if play else "false")}
+    if sess.get("place_id"):
+        extras["place_id"] = ("--el", int(sess["place_id"]))
     if sess.get("token"):
         extras["token"] = ("--es", sess["token"])
     for key, flag in (("game_instance_id", "--es"), ("access_code", "--es"),
@@ -5749,7 +5795,7 @@ def deliver_session(acct, label, sess, play=True, restart=True):
               "place_id": sess.get("place_id"), "played": bool(reply.get("launched"))}
     if not ok:
         status["reason"] = reply.get("error") or "kiosk_rejected"
-    print(f"[{label}] session -> kiosk: place {sess.get('place_id')}, "
+    print(f"[{label}] session -> kiosk: place {sess.get('place_id') or 'home'}, "
           f"token {redact_token(sess.get('token')) or 'NONE'}, "
           f"{'joined' if reply.get('launched') else 'not joined'}"
           + (f" ({reply.get('error')})" if reply.get("error") else ""))
@@ -5782,129 +5828,6 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None):
         save_account(acct)
     _devkit_activate(acct, label)
     return True, first
-
-
-def _dev_mode_for_play(args):
-    """Whether `omni play` should target the DEV base for a NEW instance.
-
-    This is SELECTION (use dev), which is distinct from ACCESS (may use dev,
-    i.e. OMNI_DEV_MODE / dev_mode_enabled). The agent sets OMNI_DEV_MODE=1 just to
-    UNLOCK the dev base, but still plays production by default — so dev selection
-    must NOT be implied by OMNI_DEV_MODE, only by an explicit --dev or the
-    dedicated OMNI_USE_DEV_BASE 'default to dev' env. assert_dev_allowed still
-    refuses dev to a caller that has not unlocked it."""
-    if getattr(args, "dev", False):
-        return True
-    return _truthy_env("OMNI_USE_DEV_BASE")
-
-
-def _truthy_env(name):
-    return str(os.environ.get(name, "")).strip().lower() in (
-        "1", "true", "yes", "on")
-
-
-def cmd_play(args):
-    """Boot (or reuse) an instance and land INSIDE a place, logged in, with no
-    menu and no simulated taps — the product's whole point.
-
-    Identical on the dev and production bases: same kiosk, same session
-    broadcast, same roblox:// join. The dev base only differs in what is
-    additionally available (frida/Magisk + always-on screenshots)."""
-    ensure_qemu()
-    cfg = load_config()
-    dev = _dev_mode_for_play(args)
-    label = f"play {args.name}"
-    json_mode = getattr(args, "json", False)
-
-    # Resolve the session BEFORE creating anything on disk. store_session() and
-    # resolve_token()/account_cookie() are pure reads of the central store —
-    # neither needs an instance directory to exist, so this is safe to do
-    # ahead of ensure_instance(). That ordering is load-bearing, not cosmetic:
-    # "the only way to create a profile is to log in" means a brand-new name
-    # with no saved cookie and no override must fail HERE, before a real
-    # instance (overlay + /data + QEMU disks) gets created for it — not
-    # after, the way it used to.
-    place_override = (_validate_place_id(args.place)
-                      if getattr(args, "place", None) is not None else None)
-    sess = store_session(args.name, args, place_override=place_override)
-    # --token/--token-file/--token-stdin (or the account's own saved cookie)
-    # still wins over whatever store_session() found, same priority order as
-    # resolve_token() always documented.
-    tok = resolve_token(args)
-    if tok:
-        sess["token"] = tok
-    if not sess.get("place_id"):
-        return fail("no_place",
-                    f"no place to join: pass --place <placeId> (or set one "
-                    f"first with `omni session {args.name} --place <id>`)")
-    if not sess.get("token") and not getattr(args, "no_token", False):
-        return fail("no_token",
-                    f"no saved Roblox account '{args.name}'. Sign it in first: "
-                    f"`omni login` (saves the account under its username), then "
-                    f"`omni play {args.name} --place <id>`. (Or override with "
-                    f"--token-file <file>, or --no-token to land on Roblox's "
-                    f"own login screen.) No instance was created for "
-                    f"'{args.name}'.")
-
-    # Only NOW do we know a session is deliverable (a real token, or the
-    # explicit --no-token escape hatch) — build the launch handle. Nothing is
-    # persisted here: the store owns the account's cookie (via `omni login`)
-    # and its default place (via `omni session --place`); --place above is a
-    # one-off override for THIS launch only.
-    acct = build_acct(args.name, cfg, dev=dev)
-
-    # The kiosk's game package: Roblox is what this product runs.
-    if acct.get("game_package") != ROBLOX_PACKAGE:
-        acct["game_package"] = ROBLOX_PACKAGE
-        save_account(acct)
-
-    booted, first = _ensure_booted(acct, cfg, label,
-                                   timeout=getattr(args, "timeout", None),
-                                   accel=getattr(args, "accel", None))
-    result = {"name": args.name, "place_id": sess["place_id"],
-              "deeplink": roblox_deeplink(sess), "first_boot": first,
-              "arch": acct_arch(acct), "dev": acct_is_dev(acct),
-              "adb_port": acct["adb_port"], "vnc_port": acct["vnc_port"],
-              "session": public_session(sess)}
-    if not booted:
-        result.update({"ok": False, "booted": False, "error": "boot_timeout"})
-        if json_mode:
-            emit_json(result)
-        sys.exit(1)
-
-    status = deliver_session(acct, label, sess, play=True)
-    result.update({"booted": True, "ok": bool(status.get("delivered")),
-                   **{k: v for k, v in status.items() if k != "kiosk"}})
-    result["kiosk"] = status.get("kiosk")
-
-    # Open a live WINDOW onto this instance so you can watch/play it, and so two
-    # `omni play` runs give two accounts side by side. Each viewer is its own
-    # detached process bound to this instance's own VNC port, so N windows for N
-    # accounts just work. Default ON for interactive use; suppressed by
-    # --no-window and by --json (a machine/automation caller drives via capture).
-    want_window = (not getattr(args, "no_window", False)
-                   and (getattr(args, "window", False) or not json_mode))
-    viewer_pid = None
-    if result["ok"] and want_window:
-        try:
-            if _wait_for_vnc("127.0.0.1", acct["vnc_port"], timeout=10):
-                title = f"omni: {args.name}  (place {sess['place_id']})"
-                viewer_pid = _spawn_builtin_viewer(
-                    args.name, "127.0.0.1", acct["vnc_port"], title).pid
-                result["viewer_pid"] = viewer_pid
-        except Exception as e:  # noqa: BLE001 — a window failure must not fail play
-            print(f"[{label}] could not open a window: {e}")
-
-    if json_mode:
-        emit_json(result)
-    elif result["ok"]:
-        where = (f"window opened (pid {viewer_pid})" if viewer_pid
-                 else f"vnc 127.0.0.1:{acct['vnc_port']} to watch")
-        print(f"[{label}] joined place {sess['place_id']} — {where}")
-    else:
-        print(f"[{label}] session NOT applied: "
-              f"{status.get('reason')} {status.get('detail', '')}")
-        sys.exit(1)
 
 
 def _token_flag_given(args):
@@ -5964,7 +5887,7 @@ def cmd_login(args):
       real authenticated session before it is trusted and saved — the same bar
       an interactive login has to clear.
 
-    Either way: ready to use as `omni play <username> --place`."""
+    Either way: ready to use as `omni start <username> --place`."""
     r, err = _capture_and_save_account(args)
     if err:
         return fail(err[0], err[1])
@@ -5975,7 +5898,7 @@ def cmd_login(args):
         emit_json(out)
     else:
         print(json.dumps(out, indent=2))
-        print(f"\nplay as this account:  omni play {r['username']} "
+        print(f"\nplay as this account:  omni start {r['username']} "
               f"--place <placeId>")
 
 
@@ -6101,8 +6024,48 @@ def main():
                         "(progress goes to stderr)")
     c.set_defaults(func=cmd_create)
 
-    s = sub.add_parser("start")
-    s.add_argument("name")
+    s = sub.add_parser("start",
+                       help="launch an instance for a saved account: boot, "
+                            "deliver its Roblox session and land INSIDE a "
+                            "place if one is set, or on the account's home "
+                            "screen if not — logged in, no menu, no taps. "
+                            "`omni start <username> [--place <id>]`. The "
+                            "instance is auto-created (ephemeral); run two "
+                            "for two accounts at once. Dev and production "
+                            "alike")
+    s.add_argument("name", metavar="username",
+                   help="a saved Roblox account username (from `omni login`). "
+                        "It names the instance too — its cookie is used "
+                        "automatically, no --account needed")
+    s.add_argument("--place", default=None,
+                   help="Roblox placeId to join (persisted; reused next "
+                        "time). If omitted, boots to the account's home "
+                        "screen, logged in but not joined to any place")
+    _token_args(s)
+    s.add_argument("--job", default=None,
+                   help="gameInstanceId (JobId) to join a SPECIFIC server")
+    s.add_argument("--access-code", dest="access_code", default=None,
+                   help="private server accessCode")
+    s.add_argument("--link-code", dest="link_code", default=None,
+                   help="private server linkCode")
+    s.add_argument("--launch-data", dest="launch_data", default=None,
+                   help="launchData string (<=200 bytes decoded), readable "
+                        "in-game via Player:GetJoinData()")
+    s.add_argument("--user-id", dest="user_id", type=int, default=None,
+                   help="informational: which Roblox user the token belongs to")
+    s.add_argument("--no-token", dest="no_token", action="store_true",
+                   help="proceed without a login (lands on Roblox's login "
+                        "screen, which needs taps — almost never what you want)")
+    s.add_argument("--dev", action="store_true",
+                   help="launch the instance on the DEV base (frida+Magisk); "
+                        "dev-only, refused without OMNI_DEV_MODE")
+    s_win = s.add_mutually_exclusive_group()
+    s_win.add_argument("--window", action="store_true",
+                       help="open a live window even in --json mode (two "
+                            "starts = two accounts side by side)")
+    s_win.add_argument("--no-window", dest="no_window", action="store_true",
+                       help="do not open a window (headless; watch via "
+                            "`omni view` or capture)")
     s.add_argument("--mode", choices=list(MODES), default=None,
                    help="RAM/CPU tier (all headless): playable 4G/4c | "
                         "hard 3G/4c | brutal 2G/2c. Default: playable")
@@ -6111,13 +6074,8 @@ def main():
     s.add_argument("--accel", default=None,
                    help="override hypervisor (auto: Windows=whpx, "
                         "Linux=kvm). E.g. 'tcg' for a no-hypervisor test")
-    s.add_argument("--dev", action="store_true")
-    s.add_argument("--wait", action="store_true",
-                   help="block until boot completes (default: detach)")
     s.add_argument("--timeout", type=int, default=None)
-    s.add_argument("--json", action="store_true",
-                   help="one machine-readable JSON line on stdout with "
-                        "pid + adb/qmp/vnc ports")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_start)
 
     rs = sub.add_parser("resume")
@@ -6244,7 +6202,7 @@ def main():
                              "HEADLESS browser, no window, nothing to click. "
                              "Either way it saves the cookie under the "
                              "account's USERNAME (auto-detected). Then: "
-                             "omni play <username> --place <id>")
+                             "omni start <username> --place <id>")
     lg.add_argument("--browser", choices=["chrome", "firefox"], default="chrome")
     lg.add_argument("--timeout", type=int, default=300,
                     help="interactive sign-in only: seconds to wait for you "
@@ -6273,52 +6231,6 @@ def main():
                          "to clear it")
     ac.add_argument("--json", action="store_true")
     ac.set_defaults(func=cmd_accounts)
-
-    pl = sub.add_parser("play",
-                        help="launch an instance for a saved account and land "
-                             "INSIDE a place, logged in, with no menu and no "
-                             "taps. `omni play <username> --place <id>`. The "
-                             "instance is auto-created (thin); run two for two "
-                             "accounts at once. Dev and production alike")
-    pl.add_argument("name", metavar="username",
-                    help="a saved Roblox account username (from `omni login`). "
-                         "It names the instance too — its cookie is used "
-                         "automatically, no --account needed")
-    pl.add_argument("--place", default=None,
-                    help="Roblox placeId to join (persisted; reused next time)")
-    _token_args(pl)
-    pl.add_argument("--job", default=None,
-                    help="gameInstanceId (JobId) to join a SPECIFIC server")
-    pl.add_argument("--access-code", dest="access_code", default=None,
-                    help="private server accessCode")
-    pl.add_argument("--link-code", dest="link_code", default=None,
-                    help="private server linkCode")
-    pl.add_argument("--launch-data", dest="launch_data", default=None,
-                    help="launchData string (<=200 bytes decoded), readable "
-                         "in-game via Player:GetJoinData()")
-    pl.add_argument("--user-id", dest="user_id", type=int, default=None,
-                    help="informational: which Roblox user the token belongs to")
-    pl.add_argument("--no-token", dest="no_token", action="store_true",
-                    help="join without a login (lands on Roblox's login "
-                         "screen, which needs taps — almost never what you want)")
-    pl.add_argument("--ephemeral", action="store_true",
-                    help="fully-shared, no-persistence instance: boot the shared "
-                         "base directly (snapshot=on), no per-account overlay disks "
-                         "— many run concurrently, nothing persists between boots")
-    pl.add_argument("--dev", action="store_true",
-                    help="create the instance on the DEV base (frida+Magisk); "
-                         "dev-only, refused without OMNI_DEV_MODE")
-    pl_win = pl.add_mutually_exclusive_group()
-    pl_win.add_argument("--window", action="store_true",
-                        help="open a live window even in --json mode (two plays "
-                             "= two accounts side by side)")
-    pl_win.add_argument("--no-window", dest="no_window", action="store_true",
-                        help="do not open a window (headless; watch via "
-                             "`omni view` or capture)")
-    pl.add_argument("--accel", default=None)
-    pl.add_argument("--timeout", type=int, default=None)
-    pl.add_argument("--json", action="store_true")
-    pl.set_defaults(func=cmd_play)
 
     se = sub.add_parser("session",
                         help="inspect/set/clear an account's Roblox session "
