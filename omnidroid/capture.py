@@ -40,9 +40,9 @@ import queue
 import threading
 import time
 
-# vncview is a sibling module (manager/); the frozen exe adds --hidden-import
-# vncview, and a checkout runs with manager/ on sys.path (see omni.py).
-import vncview
+# vncview is a sibling module (omnidroid/); the frozen exe adds --hidden-import
+# vncview, and a checkout runs with the repo root on sys.path (see omni.py).
+from omnidroid import vncview
 
 
 # Change-detection defaults. Kept behaviourally aligned with the agent's adb

@@ -31,27 +31,27 @@ import threading
 import time
 from pathlib import Path
 
-def _app_root():
-    """Project root — works both as a .py and as a PyInstaller onefile exe.
-    When frozen, files live next to the exe (sys.executable), not in the
-    temporary _MEIPASS extraction dir."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+from omnidroid import config
+from omnidroid.config import (
+    REPO, CONFIG_PATH, QEMU_DIR,
+    IS_WINDOWS, IS_LINUX, IS_MACOS, HOST_ARCH, IS_ARM64_HOST,
+    images_dir, qemu_bin, qemu_system_name,
+)
+
+# Data-store root (accounts.json, accounts/, logs/, runtime/). Defaults to
+# REPO; relocatable via OMNI_DATA_DIR (see omnidroid.config.data_dir()).
+# Captured once at import time (intentional: the data root doesn't need to
+# move mid-process) -- contrast with the cookie store, which re-resolves
+# per call via _store_root() so tests that flip OMNI_DATA_DIR at runtime
+# see it take effect.
+ACCOUNTS_DIR = config.data_dir() / "accounts"
 
 
-REPO = _app_root()
-CONFIG_PATH = REPO / "configs" / "paths.json"
-ACCOUNTS_DIR = REPO / "accounts"
-QEMU_DIR = REPO / "qemu"          # local (auto-installed) QEMU lives here
-IS_WINDOWS = platform.system() == "Windows"
-IS_LINUX = platform.system() == "Linux"
-IS_MACOS = platform.system() == "Darwin"
-# Host CPU architecture. arm64 Macs (Apple Silicon) run the arm64 base
-# natively under HVF with NO translation layer; x86_64 hosts run the Bliss
-# x86 base under WHPX/KVM. Base selection keys off this (see host_arch_base).
-HOST_ARCH = platform.machine().lower()
-IS_ARM64_HOST = HOST_ARCH in ("arm64", "aarch64")
+def _store_root():
+    """Root dir for the cookie store (accounts.json), re-resolved per call
+    so tests/tools that flip OMNI_DATA_DIR at runtime see it take effect."""
+    return config.data_dir()
+
 
 # Linux KSM (kernel samepage merging) sysfs interface. Dedups identical
 # guest RAM pages across instances (same immutable base => big overlap).
@@ -352,27 +352,6 @@ def read_config():
                  f"delete it (a default will be recreated).")
 
 
-def resolve_images_dir(cfg):
-    """images_dir may be a plain string or a per-platform dict
-    ({"windows": ..., "linux": ...}) so one checkout works on both hosts.
-    ~ is expanded; a relative path is resolved against the project root
-    (default: images/ inside the checkout, travels with the repo)."""
-    v = cfg["images_dir"]
-    if isinstance(v, dict):
-        key = "windows" if IS_WINDOWS else "darwin" if IS_MACOS else "linux"
-        # Back-compat: older configs only have windows/linux; macOS falls
-        # back to the linux path convention.
-        v = v.get(key) or (v.get("linux") if IS_MACOS else None) \
-            or v.get("default")
-        if not v:
-            sys.exit(f"error: configs/paths.json images_dir has no entry "
-                     f"for platform '{key}'")
-    p = Path(v).expanduser()
-    if not p.is_absolute():
-        p = REPO / p
-    return str(p)
-
-
 def base_setup_help(images_dir, cfg=None):
     """The exact, actionable 'make this install ready' message — shown by
     setup, doctor, and every base-needing command when no base is usable."""
@@ -403,7 +382,7 @@ def autoregister_bases():
     (raw_config, newly_registered_tags). Registration only ADDS entries —
     existing bases/accounts are never touched, honoring base immutability."""
     raw = read_config()
-    images = Path(resolve_images_dir(raw))
+    images = Path(images_dir(raw))
     bases = raw.setdefault("bases", {})
     known_disks = {b.get("disk") for b in bases.values()}
     new = []
@@ -539,7 +518,7 @@ def load_config():
     a fresh/incomplete install: auto-registers base files that appeared in
     images_dir, and otherwise exits with the exact copy-these-files help."""
     cfg, _ = autoregister_bases()
-    cfg["images_dir"] = resolve_images_dir(cfg)   # normalized for callers
+    cfg["images_dir"] = images_dir(cfg)   # normalized for callers (OMNI_IMAGES_DIR wins)
     images = Path(cfg["images_dir"])
     # Host architecture selects the base (arm64 -> arm-uefi; x86 -> current).
     tag = effective_base_tag(cfg)
@@ -556,36 +535,7 @@ def load_config():
     return cfg
 
 
-# ---------- qemu resolution + auto-install ----------
-
-def qemu_bin(tool):
-    """Resolve a QEMU executable path from the PRODUCT directory only.
-    Order: config 'qemu.dir' (an explicit product-side override) -> local
-    QEMU_DIR (auto-downloaded, next to the engine). On Windows the shipped
-    product NEVER falls back to a host/global/PATH QEMU: if it isn't in the
-    product dir yet, the returned (non-existent) product path drives
-    ensure_qemu() to download it there. On Linux/macOS the documented model is
-    SYSTEM QEMU (apt/brew), so a bare name (PATH) is the final fallback."""
-    exe = tool + (".exe" if IS_WINDOWS else "")
-    try:
-        qd = read_config().get("qemu", {}).get("dir")
-    except Exception:
-        qd = None
-    for cand in ([Path(qd) / exe] if qd else []) + [QEMU_DIR / exe]:
-        if cand.exists():
-            return str(cand)
-    if IS_WINDOWS:
-        # Product-dir only — never PATH. ensure_qemu() populates QEMU_DIR.
-        return str(QEMU_DIR / exe)
-    return tool          # Linux/macOS: system QEMU (apt/brew) is the model
-
-
-def qemu_system_name():
-    """The QEMU system emulator this HOST needs: aarch64 on Apple Silicon
-    (arm64 guest, native under HVF), x86_64 everywhere else."""
-    return "qemu-system-aarch64" if (IS_MACOS and IS_ARM64_HOST) \
-        else "qemu-system-x86_64"
-
+# ---------- qemu auto-install ----------
 
 def _qemu_present():
     import shutil
@@ -2002,7 +1952,7 @@ def _assert_deletable(path):
     if root not in p.parents:
         sys.exit(f"error: refusing to delete {p}: outside {root}")
     try:
-        images = Path(resolve_images_dir(read_config())).resolve()
+        images = Path(images_dir(read_config())).resolve()
     except Exception:
         images = None
     if images and (images == p or p in images.parents):
@@ -3870,7 +3820,7 @@ def install_readiness():
     file paths."""
     import shutil as _sh
     raw, new = autoregister_bases()
-    images = Path(resolve_images_dir(raw))
+    images = Path(images_dir(raw))
     # Base selected by host architecture (arm64 -> arm-uefi; x86 -> current).
     tag = effective_base_tag(raw)
     bases = raw.get("bases") or {}
@@ -3945,7 +3895,7 @@ def cmd_setup(args):
     """
     ensure_config()          # blank deployment: bootstrap default config
     cfg = read_config()
-    images = Path(resolve_images_dir(cfg))
+    images = Path(images_dir(cfg))
     report = {"platform": "windows" if IS_WINDOWS else "linux",
               "images_dir": str(images), "ok": True}
     for d in (images, ACCOUNTS_DIR):
@@ -4623,8 +4573,7 @@ def cmd_view(args):
 def _run_vncview(a):
     """Internal: run the built-in viewer in THIS process (invoked as the
     hidden `_vncview` subcommand by _spawn_builtin_viewer)."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import vncview
+    from omnidroid import vncview
     return vncview.run_viewer(a.host, a.port, a.title)
 
 
@@ -4826,7 +4775,7 @@ def cmd_capture(args):
     DEV-BASE-ONLY feature (the arm devkit disk); it refuses to run on the
     production bases."""
     import os
-    import capture as _capture
+    from omnidroid import capture as _capture
     acct = load_account(args.name)
     json_mode = getattr(args, "json", False)
     auto = bool(getattr(args, "auto", False))
@@ -5477,8 +5426,8 @@ def public_session(sess):
 
 def account_cookie(username):
     """The saved .ROBLOSECURITY for a Roblox username, or None."""
-    import cookies as _ck
-    rec = _ck.get_account(REPO, username)
+    from omnidroid import cookies as _ck
+    rec = _ck.get_account(_store_root(), username)
     return rec.get("cookie") if rec else None
 
 
@@ -5821,7 +5770,7 @@ def _capture_and_save_account(args):
     a cookie (--token*) verified headlessly, or capture one via a real browser
     sign-in; save it under the auto-detected USERNAME. Returns (record, None) on
     success or (None, (error, message)) on failure — no printing/exit here."""
-    import cookies as _ck
+    from omnidroid import cookies as _ck
     token_requested = _token_flag_given(args)
     tok = resolve_token(args)
     if token_requested and not tok:
@@ -5831,16 +5780,18 @@ def _capture_and_save_account(args):
         return None, ("bad_token", "--token/--token-file/--token-stdin was "
                                    "given but resolved to an empty cookie")
     if tok:
-        r = _ck.capture_login_from_cookie(REPO, tok, browser=args.browser)
+        r = _ck.capture_login_from_cookie(_store_root(), tok,
+                                          browser=args.browser)
     else:
-        r = _ck.capture_login(REPO, browser=args.browser, timeout=args.timeout,
+        r = _ck.capture_login(_store_root(), browser=args.browser,
+                              timeout=args.timeout,
                               profile_dir=getattr(args, "profile_dir", None))
     if not r.get("ok"):
         return None, (r.get("error", "login_failed"), r.get("message"))
     # Optional display-only alias (never the identity/instance name).
     alias = getattr(args, "alias", None)
     if alias:
-        _ck.set_custom_name(REPO, r["username"], alias)
+        _ck.set_custom_name(_store_root(), r["username"], alias)
     return r, None
 
 
@@ -5874,29 +5825,29 @@ def cmd_login(args):
 
 def cmd_accounts(args):
     """List / verify / remove saved Roblox accounts. Never prints a cookie."""
-    import cookies as _ck
+    from omnidroid import cookies as _ck
     if getattr(args, "set_custom_name", None):
         username, custom = args.set_custom_name
         # Display-only label, separate from the username (the account's real
         # identity and the instance name — never changed by this).
-        existed = _ck.set_custom_name(REPO, username, custom)
+        existed = _ck.set_custom_name(_store_root(), username, custom)
         if not existed:
             return fail("no_account", f"no saved account '{username}'")
         out = {"ok": True, "username": username, "custom_name": custom or None}
     elif getattr(args, "remove", None):
-        existed = _ck.remove_account(REPO, args.remove)
+        existed = _ck.remove_account(_store_root(), args.remove)
         out = {"ok": True, "removed": args.remove, "existed": existed}
     else:
-        accts = _ck.list_accounts(REPO)
+        accts = _ck.list_accounts(_store_root())
         if getattr(args, "verify", False):
             # A cookie dies when the account signs out or changes password, and
             # otherwise only surfaces as a login screen inside the VM minutes
             # later. One cheap call tells you now.
             for a in accts:
-                rec = _ck.get_account(REPO, a["username"])
+                rec = _ck.get_account(_store_root(), a["username"])
                 uid, _uname = _ck.whoami((rec or {}).get("cookie") or "")
                 a["valid"] = bool(uid)
-        out = {"ok": True, "accounts": accts, "store": str(_ck.accounts_path(REPO))}
+        out = {"ok": True, "accounts": accts, "store": str(_ck.accounts_path(_store_root()))}
     if getattr(args, "json", False):
         emit_json(out)
     else:
@@ -5955,7 +5906,7 @@ def cmd_adb(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="omni")
+    p = argparse.ArgumentParser(prog="omnidroid")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def _token_args(parser):

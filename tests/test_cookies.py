@@ -16,10 +16,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                os.pardir, "manager"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import cookies  # noqa: E402
+from omnidroid import cookies  # noqa: E402
 
 TOKEN = "_|WARNING:-DO-NOT-SHARE-THIS.--" + ("Q" * 300) + "tAiL99"
 

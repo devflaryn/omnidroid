@@ -17,11 +17,10 @@ from types import SimpleNamespace
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                os.pardir, "manager"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import omni  # noqa: E402
-import cookies as ck  # noqa: E402
+from omnidroid import engine as omni  # noqa: E402
+from omnidroid import cookies as ck  # noqa: E402
 
 TOKEN = "_|WARNING:-DO-NOT-SHARE-THIS.--" + ("A" * 200) + "ZZbEnD"
 
@@ -191,6 +190,10 @@ class PlayGatesOnLogin(unittest.TestCase):
         patches = [
             mock.patch.object(omni, "REPO", self.tmp),
             mock.patch.object(omni, "ACCOUNTS_DIR", accounts_dir),
+            # The cookie store now routes through config.data_dir() (see
+            # omnidroid.config / engine._store_root); redirect it alongside
+            # REPO so a saved account is found where this test saves it.
+            mock.patch.dict(os.environ, {"OMNI_DATA_DIR": str(self.tmp)}),
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
         ]

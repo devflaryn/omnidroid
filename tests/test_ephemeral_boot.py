@@ -8,8 +8,8 @@ import sys
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "manager"))
-import omni  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from omnidroid import engine as omni  # noqa: E402
 
 
 def _cfg():

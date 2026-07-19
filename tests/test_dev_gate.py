@@ -12,10 +12,9 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                os.pardir, "manager"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import omni  # noqa: E402
+from omnidroid import engine as omni  # noqa: E402
 
 CFG = {
     "current_base": "arm",
