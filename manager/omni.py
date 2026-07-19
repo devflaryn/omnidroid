@@ -1017,11 +1017,29 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
     base = cfg["bases"][acct["base"]]
     q = cfg["qemu"]
     d = account_dir(acct["name"])
+    images = Path(cfg["images_dir"])
     accel = accel or default_accel()
     mode = mode or resolve_mode(cfg)
     vnc_display = _assert_port_triple(acct)
     smp = q["smp"] if dev else mode["smp"]
     mem = q["mem_mb"] if dev else mode["mem"]
+
+    # EPHEMERAL (fully-shared, no-persistence) instances boot the SHARED provisioned
+    # base templates DIRECTLY with snapshot=on: every write goes to a throwaway
+    # per-process overlay that QEMU discards on exit, so nothing persists and many
+    # instances of the same base run CONCURRENTLY (each opens the backing read-only).
+    # The instance is then pure config (accounts.json cookie/alias) with NO
+    # per-account system/data/devkit qcow2 files — only a fresh per-boot efivars.
+    # Non-ephemeral accounts keep their per-account COW overlays (unchanged).
+    ephemeral = bool(acct.get("ephemeral"))
+    if ephemeral:
+        sys_src = images / base["system"]
+        data_src = images / base["data"]
+        disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
+    else:
+        sys_src = d / "system.qcow2"
+        data_src = d / "data.qcow2"
+        disk_opts = ",discard=unmap,detect-zeroes=unmap"
 
     code = arm_edk2_code()
     if not code:
@@ -1042,10 +1060,8 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
         # System overlay (vda, has /metadata FBE keys) + /data (vdb).
         "-device", "virtio-blk-pci,drive=vda,bootindex=0",
         "-device", "virtio-blk-pci,drive=vdb,bootindex=1",
-        "-drive", (f"file={d / 'system.qcow2'},if=none,id=vda,"
-                   "discard=unmap,detect-zeroes=unmap"),
-        "-drive", (f"file={d / 'data.qcow2'},if=none,id=vdb,"
-                   "discard=unmap,detect-zeroes=unmap"),
+        "-drive", f"file={sys_src},if=none,id=vda{disk_opts}",
+        "-drive", f"file={data_src},if=none,id=vdb{disk_opts}",
         "-device", "virtio-gpu-pci",
         "-display", "none",       # headless ALWAYS (same rule as x86)
         # Built-in VNC server, LOCALHOST ONLY (no auth is safe ONLY because
@@ -1068,12 +1084,14 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
     # cheap per-account COW overlay of the shared base_arm_devkit.qcow2 (frida +
     # Magisk + omni tools). The guest sees it as /dev/block/vdc and mounts it
     # read-only during activation (see _devkit_activate). Not bootable.
-    devkit_disk = d / "devkit.qcow2"
-    if acct_is_dev(acct) and devkit_disk.exists():
+    # Dev vdc: the shared devkit template (snapshot=on) for ephemeral instances,
+    # else the per-account COW overlay.
+    devkit_src = (images / base["devkit"]) if (ephemeral and base.get("devkit")) \
+        else (d / "devkit.qcow2")
+    if acct_is_dev(acct) and Path(devkit_src).exists():
         cmd += [
             "-device", "virtio-blk-pci,drive=vdc",
-            "-drive", (f"file={devkit_disk},if=none,id=vdc,"
-                       "discard=unmap,detect-zeroes=unmap"),
+            "-drive", f"file={devkit_src},if=none,id=vdc{disk_opts}",
         ]
     if dev:
         cmd += ["-serial", f"file:{d / 'serial.log'}"]
@@ -1149,9 +1167,28 @@ def qemu_command(acct, cfg, dev, mode=None, accel=None):
     return cmd
 
 
+def _refresh_ephemeral_efivars(acct, cfg):
+    """Give an ephemeral instance a FRESH copy of the base UEFI vars for this boot,
+    so nothing persists across boots (the system/data/devkit disks are the shared
+    templates opened snapshot=on; efivars is the only writable file, and pflash
+    needs a real file). arm-only; no-op otherwise."""
+    import shutil
+    base = cfg["bases"][acct["base"]]
+    if base_type(base) != BASE_TYPE_ARM:
+        return
+    images = Path(cfg["images_dir"])
+    d = account_dir(acct["name"])
+    d.mkdir(parents=True, exist_ok=True)
+    efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
+    if efi_tmpl.exists():
+        shutil.copyfile(efi_tmpl, d / "efivars.fd")
+
+
 def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
     check_accel()
     d = account_dir(acct["name"])
+    if acct.get("ephemeral"):
+        _refresh_ephemeral_efivars(acct, cfg)
     log = open(d / "qemu.log", "w")
     kwargs = {}
     if IS_WINDOWS:
@@ -1418,23 +1455,31 @@ def _create_arm(args, cfg, acct, base, d, name, adb_port, qmp_port, vnc_port):
     sys_tmpl = images / base["system"]
     data_tmpl = images / base["data"]
     efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
-    make_overlay(d / "system.qcow2", sys_tmpl)
-    make_overlay(d / "data.qcow2", data_tmpl)
-    if efi_tmpl.exists():
-        shutil.copyfile(efi_tmpl, d / "efivars.fd")   # tiny; per-account UEFI vars
-    else:
+    ephemeral = bool(acct.get("ephemeral"))
+    if not efi_tmpl.exists():
         sys.exit(f"error: arm base efivars template missing: {efi_tmpl}")
-    acct["first_boot_done"] = True         # provisioning baked into the pair
-    # Dev base: attach the extra devkit disk as a cheap per-account COW overlay
-    # of the shared base_arm_devkit.qcow2 (frida + Magisk + omni tools). It is
-    # wired into the QEMU command as vdc and activated on start.
-    devkit = None
-    if base_is_dev(base):
-        devkit = base["devkit"]
-        make_overlay(d / "devkit.qcow2", images / devkit)
-        acct["dev"] = True
+    devkit = base["devkit"] if base_is_dev(base) else None
+    if ephemeral:
+        # Fully-shared, no-persistence: create NO per-account system/data/devkit
+        # overlays. The instance boots the shared templates directly (snapshot=on,
+        # see qemu_command_arm) and owns only a fresh per-boot efivars — so it is
+        # pure config (cookie + alias) with nothing to grow or clean up.
+        shutil.copyfile(efi_tmpl, d / "efivars.fd")
+        acct["first_boot_done"] = True
+        if devkit:
+            acct["dev"] = True
         save_account(acct)
     else:
+        make_overlay(d / "system.qcow2", sys_tmpl)
+        make_overlay(d / "data.qcow2", data_tmpl)
+        shutil.copyfile(efi_tmpl, d / "efivars.fd")   # tiny; per-account UEFI vars
+        acct["first_boot_done"] = True         # provisioning baked into the pair
+        # Dev base: attach the extra devkit disk as a cheap per-account COW overlay
+        # of the shared base_arm_devkit.qcow2 (frida + Magisk + omni tools). It is
+        # wired into the QEMU command as vdc and activated on start.
+        if devkit:
+            make_overlay(d / "devkit.qcow2", images / devkit)
+            acct["dev"] = True
         save_account(acct)
     extra = f" + devkit disk {devkit} (vdc)" if devkit else ""
     print(f"[create {name}] arm64 disks ready (provisioned pair copied from "
@@ -1449,12 +1494,17 @@ def _create_arm(args, cfg, acct, base, d, name, adb_port, qmp_port, vnc_port):
         emit_json(created)
 
 
-def ensure_instance(name, cfg, dev=False):
+def ensure_instance(name, cfg, dev=False, ephemeral=False):
     """Return the account dict for instance <name>, creating a THIN arm instance
     if it does not exist yet. This is what lets `omni play <username>` work with
     no prior `omni create`: the instance is named for the account and is a cheap
-    (~0.4 MB) COW overlay of the shared base, so there is no per-account 1 GB
-    disk and nothing to clean up but the cookie.
+    COW overlay of the shared base, so there is no per-account 1 GB disk and
+    nothing to clean up but the cookie.
+
+    ephemeral=True makes it fully-shared/no-persistence: NO per-account
+    system/data/devkit overlays at all — it boots the shared templates directly
+    (snapshot=on) and owns only a fresh per-boot efivars, so many instances run
+    concurrently and nothing persists between boots.
 
     arm-only by design (the product is arm; dev is arm+devkit). dev=True selects
     the dev base (gated by OMNI_DEV_MODE upstream)."""
@@ -1476,14 +1526,27 @@ def ensure_instance(name, cfg, dev=False):
     acct = {"name": name, "base": tag, "adb_port": adb_port,
             "qmp_port": qmp_port, "vnc_port": vnc_port,
             "first_boot_done": True, "created": time.time()}
+    if ephemeral:
+        acct["ephemeral"] = True
     save_account(acct)
     import shutil
     images = Path(cfg["images_dir"])
-    make_overlay(d / "system.qcow2", images / base["system"])
-    make_overlay(d / "data.qcow2", images / base["data"])
     efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
     if not efi_tmpl.exists():
         fail("no_base", f"arm base efivars template missing: {efi_tmpl}")
+    if ephemeral:
+        # No per-account overlays: the shared templates are booted snapshot=on.
+        shutil.copyfile(efi_tmpl, d / "efivars.fd")
+        if base_is_dev(base):
+            acct["dev"] = True
+        acct["game_package"] = ROBLOX_PACKAGE
+        save_account(acct)
+        print(f"[play {name}] created EPHEMERAL instance on base '{tag}' "
+              f"(shared disks, snapshot=on — no per-account overlay; "
+              f"adb {adb_port} vnc {vnc_port})")
+        return load_account(name)
+    make_overlay(d / "system.qcow2", images / base["system"])
+    make_overlay(d / "data.qcow2", images / base["data"])
     shutil.copyfile(efi_tmpl, d / "efivars.fd")
     if base_is_dev(base):
         make_overlay(d / "devkit.qcow2", images / base["devkit"])
@@ -1560,6 +1623,8 @@ def cmd_create(args):
             "adb_port": adb_port, "qmp_port": qmp_port,
             "vnc_port": vnc_port,        # reserved for future local VNC
             "first_boot_done": False, "created": time.time()}
+    if getattr(args, "ephemeral", False):
+        acct["ephemeral"] = True     # fully-shared, no-persistence (arm; see _create_arm)
     save_account(acct)
 
     # arm-uefi: the kiosk + device-owner + HOME are all baked into the
@@ -5678,7 +5743,8 @@ def cmd_play(args):
 
     # Only NOW do we know a session is deliverable (a real token, or the
     # explicit --no-token escape hatch) — create/reuse the instance.
-    acct = ensure_instance(args.name, cfg, dev=dev)
+    acct = ensure_instance(args.name, cfg, dev=dev,
+                           ephemeral=getattr(args, "ephemeral", False))
     sess["updated"] = time.time()
     save_session(args.name, sess)
 
@@ -5892,6 +5958,9 @@ def main():
     c.add_argument("--base", default=None,
                    help="explicit registered base tag (must match --arch)")
     c.add_argument("--no-provision", action="store_true")
+    c.add_argument("--ephemeral", action="store_true",
+                   help="fully-shared, no-persistence instance (boot shared base "
+                        "snapshot=on; no per-account overlay disks)")
     c.add_argument("--data-size", default=None)
     c.add_argument("--json", action="store_true",
                    help="one machine-readable JSON line on stdout "
@@ -6113,6 +6182,10 @@ def main():
     pl.add_argument("--no-token", dest="no_token", action="store_true",
                     help="join without a login (lands on Roblox's login "
                          "screen, which needs taps — almost never what you want)")
+    pl.add_argument("--ephemeral", action="store_true",
+                    help="fully-shared, no-persistence instance: boot the shared "
+                         "base directly (snapshot=on), no per-account overlay disks "
+                         "— many run concurrently, nothing persists between boots")
     pl.add_argument("--dev", action="store_true",
                     help="create the instance on the DEV base (frida+Magisk); "
                          "dev-only, refused without OMNI_DEV_MODE")
