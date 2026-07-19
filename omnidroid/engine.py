@@ -5533,7 +5533,6 @@ KIOSK_PACKAGE = "com.omni.kiosk"
 KIOSK_RECEIVER = KIOSK_PACKAGE + "/.SessionReceiver"
 KIOSK_ACTION_SET_SESSION = "com.omni.kiosk.SET_SESSION"
 KIOSK_ACTION_CLEAR_SESSION = "com.omni.kiosk.CLEAR_SESSION"
-SESSION_FILE = "session.json"
 
 # Runtime permissions granted to the game before launch so Android never parks a
 # consent dialog on top of it. POST_NOTIFICATIONS is the one that actually bites
@@ -5546,35 +5545,6 @@ ROBLOX_RUNTIME_PERMS = (
     "android.permission.RECORD_AUDIO",
     "android.permission.CAMERA",
 )
-
-
-def session_path(name):
-    return account_dir(name) / SESSION_FILE
-
-
-def load_session(name):
-    p = session_path(name)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text())
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def save_session(name, sess):
-    """Persist the account's session. The file holds a live account credential,
-    so it is written 0600 — the rest of accounts/<name>/ is not secret, this is."""
-    p = session_path(name)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(sess, indent=2) + "\n", encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass          # best-effort: Windows has no POSIX mode
-    os.replace(tmp, p)
-    return p
 
 
 def redact_token(tok):
@@ -5626,6 +5596,27 @@ def resolve_token(args):
     if name:
         return account_cookie(name)
     return None
+
+
+def store_session(name, args=None, place_override=None):
+    """The launch session for <name>, sourced from the central store:
+    token = the stored cookie, place_id = an explicit override else the stored
+    place_id. Optional transient join params come from CLI args (not
+    persisted)."""
+    from omnidroid import accounts as _acc
+    rec = _acc.get_account(_store_root(), name) or {}
+    sess = {"token": rec.get("cookie"), "place_id": None}
+    place = place_override if place_override is not None else rec.get("place_id")
+    if place is not None:
+        sess["place_id"] = place
+    if args is not None:
+        for attr, key in (("job", "game_instance_id"), ("user_id", "user_id"),
+                          ("access_code", "access_code"), ("link_code", "link_code"),
+                          ("launch_data", "launch_data")):
+            v = getattr(args, attr, None)
+            if v is not None:
+                sess[key] = v
+    return sess
 
 
 def _validate_place_id(v):
@@ -5694,11 +5685,10 @@ def kiosk_installed(acct):
     return "package:" in (r.stdout or "")
 
 
-def deliver_session(acct, label, play=True, restart=True):
-    """Hand the account's session to the in-guest kiosk and (by default) tell it
-    to join. Returns a status dict; never raises into a boot path."""
+def deliver_session(acct, label, sess, play=True, restart=True):
+    """Hand `sess` (see store_session()) to the in-guest kiosk and (by default)
+    tell it to join. Returns a status dict; never raises into a boot path."""
     name = acct["name"]
-    sess = load_session(name)
     if not sess.get("place_id"):
         return {"delivered": False, "reason": "no_session"}
     if not kiosk_installed(acct):
@@ -5826,26 +5816,23 @@ def cmd_play(args):
     label = f"play {args.name}"
     json_mode = getattr(args, "json", False)
 
-    # Resolve the session BEFORE creating anything on disk. load_session() and
-    # resolve_token()/account_cookie() are pure reads (accounts.json, or an
-    # ALREADY-existing instance's session.json) — neither needs an instance
-    # directory to exist, so this is safe to do ahead of ensure_instance().
-    # That ordering is load-bearing, not cosmetic: "the only way to create a
-    # profile is to log in" means a brand-new name with no saved cookie and no
-    # override must fail HERE, before a real instance (overlay + /data + QEMU
-    # disks) gets created for it — not after, the way it used to.
-    sess = load_session(args.name)
+    # Resolve the session BEFORE creating anything on disk. store_session() and
+    # resolve_token()/account_cookie() are pure reads of the central store —
+    # neither needs an instance directory to exist, so this is safe to do
+    # ahead of ensure_instance(). That ordering is load-bearing, not cosmetic:
+    # "the only way to create a profile is to log in" means a brand-new name
+    # with no saved cookie and no override must fail HERE, before a real
+    # instance (overlay + /data + QEMU disks) gets created for it — not
+    # after, the way it used to.
+    place_override = (_validate_place_id(args.place)
+                      if getattr(args, "place", None) is not None else None)
+    sess = store_session(args.name, args, place_override=place_override)
+    # --token/--token-file/--token-stdin (or the account's own saved cookie)
+    # still wins over whatever store_session() found, same priority order as
+    # resolve_token() always documented.
     tok = resolve_token(args)
     if tok:
         sess["token"] = tok
-    if getattr(args, "place", None) is not None:
-        sess["place_id"] = _validate_place_id(args.place)
-    for attr, key in (("job", "game_instance_id"), ("access_code", "access_code"),
-                      ("link_code", "link_code"), ("launch_data", "launch_data"),
-                      ("user_id", "user_id")):
-        v = getattr(args, attr, None)
-        if v is not None:
-            sess[key] = v
     if not sess.get("place_id"):
         return fail("no_place",
                     f"no place to join: pass --place <placeId> (or set one "
@@ -5860,10 +5847,11 @@ def cmd_play(args):
                     f"'{args.name}'.")
 
     # Only NOW do we know a session is deliverable (a real token, or the
-    # explicit --no-token escape hatch) — build the launch handle.
+    # explicit --no-token escape hatch) — build the launch handle. Nothing is
+    # persisted here: the store owns the account's cookie (via `omni login`)
+    # and its default place (via `omni session --place`); --place above is a
+    # one-off override for THIS launch only.
     acct = build_acct(args.name, cfg, dev=dev)
-    sess["updated"] = time.time()
-    save_session(args.name, sess)
 
     # The kiosk's game package: Roblox is what this product runs.
     if acct.get("game_package") != ROBLOX_PACKAGE:
@@ -5884,7 +5872,7 @@ def cmd_play(args):
             emit_json(result)
         sys.exit(1)
 
-    status = deliver_session(acct, label, play=True)
+    status = deliver_session(acct, label, sess, play=True)
     result.update({"booted": True, "ok": bool(status.get("delivered")),
                    **{k: v for k, v in status.items() if k != "kiosk"}})
     result["kiosk"] = status.get("kiosk")
@@ -6023,41 +6011,36 @@ def cmd_accounts(args):
 
 
 def cmd_session(args):
-    """Inspect / set / clear an account's Roblox session without launching."""
+    """Inspect / set / clear an account's Roblox session (token + place),
+    sourced from the central store, without launching.
+
+    The token always comes from `omni login`; this command only ever touches
+    place_id. A --token* flag, if passed, is accepted but not persisted here
+    — the store owns the cookie."""
+    from omnidroid import accounts as _acc
     acct = load_account(args.name)
     name = args.name
     if getattr(args, "clear", False):
-        try:
-            session_path(name).unlink()
-        except OSError:
-            pass
+        _acc.set_fields(_store_root(), name, place_id=None)
         if running_pid(name) and kiosk_installed(acct):
             kiosk_broadcast(acct, KIOSK_ACTION_CLEAR_SESSION)
         out = {"name": name, "ok": True, "cleared": True}
-    elif getattr(args, "show", False) or not (
-            resolve_token(args) or getattr(args, "place", None)):
-        out = {"name": name, "ok": True, "session": public_session(load_session(name))}
-    else:
-        sess = load_session(name)
-        tok = resolve_token(args)
-        if tok:
-            sess["token"] = tok
-        if getattr(args, "place", None) is not None:
-            sess["place_id"] = _validate_place_id(args.place)
-        for attr, key in (("job", "game_instance_id"), ("user_id", "user_id"),
-                          ("launch_data", "launch_data")):
-            v = getattr(args, attr, None)
-            if v is not None:
-                sess[key] = v
-        sess["updated"] = time.time()
-        save_session(name, sess)
+    elif getattr(args, "place", None) is not None:
+        try:
+            _acc.set_fields(_store_root(), name, place_id=args.place)
+        except ValueError as e:
+            return fail("bad_place", str(e))
+        sess = store_session(name)
         # A live instance picks the change up now; --play re-joins with it.
         applied = None
         if running_pid(name) and kiosk_installed(acct):
-            applied = deliver_session(acct, f"session {name}",
+            applied = deliver_session(acct, f"session {name}", sess,
                                       play=bool(getattr(args, "play", False)))
         out = {"name": name, "ok": True, "session": public_session(sess),
                "applied": applied}
+    else:
+        out = {"name": name, "ok": True,
+               "session": public_session(store_session(name))}
     if getattr(args, "json", False):
         emit_json(out)
     else:
