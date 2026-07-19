@@ -1601,27 +1601,6 @@ def _select_base_tag(cfg, arch=None, base_tag=None):
 
 
 def cmd_create(args):
-    # No name given: this is the ACCOUNT-REGISTRATION flow. `omni create` opens a
-    # browser sign-in (selenium); `omni create --token* <cookie>` validates a
-    # cookie you already have. Either way the account is saved under its
-    # auto-detected Roblox USERNAME (never a user-typed name); an optional --alias
-    # is a display-only label. The instance itself is created on demand by
-    # `omni play <username>` (ephemeral/thin), so no disk is made here.
-    if getattr(args, "name", None) is None:
-        r, err = _capture_and_save_account(args)
-        if err:
-            return fail(err[0], err[1])
-        out = {"ok": True, "username": r["username"], "user_id": r["user_id"],
-               "custom_name": getattr(args, "alias", None) or None,
-               "path": r["path"]}
-        if getattr(args, "json", False):
-            emit_json(out)
-        else:
-            print(json.dumps(out, indent=2))
-            print(f"\nplay as this account:  omni play {r['username']} "
-                  f"--place <placeId>  (add --ephemeral for a fresh throwaway boot)")
-        return
-
     cfg = load_config()
     if args.data_size is None:
         args.data_size = cfg["qemu"]["data_disk_size"]
@@ -6001,25 +5980,10 @@ def main():
     vr.set_defaults(func=cmd_version)
 
     c = sub.add_parser("create",
-                       help="add a Roblox account (no name): `omni create` opens "
-                            "a browser sign-in; `omni create --token* <cookie>` "
-                            "validates a cookie you already have. Saved under the "
-                            "auto-detected USERNAME (+ optional --alias). Passing a "
-                            "NAME instead makes a raw instance disk (internal).")
-    c.add_argument("name", nargs="?", default=None,
-                   help="omit to register an account by username (login flow); "
-                        "give a name only for a raw internal instance disk")
-    # Account-registration (bare `create`) options — mirror `login`.
-    c.add_argument("--alias", default=None,
-                   help="display-only label for the account (the instance name is "
-                        "always the Roblox username, never this)")
-    c.add_argument("--browser", choices=["chrome", "firefox"], default="chrome")
-    c.add_argument("--timeout", type=int, default=300,
-                   help="interactive sign-in: seconds to wait for you to finish")
-    c.add_argument("--profile-dir", dest="profile_dir", default=None,
-                   help="reuse a browser profile dir (interactive sign-in only)")
-    _token_args(c)
-    # Raw instance-disk (named `create`) options.
+                       help="INTERNAL: make a raw instance disk for <name> "
+                            "(used by omni-agent). To ADD A ROBLOX ACCOUNT use "
+                            "`omni login` instead.")
+    c.add_argument("name")
     c.add_argument("--arch", choices=["x86", "arm"], default=None,
                    help="architecture for the new account (default: the "
                         "host arch's base)")
