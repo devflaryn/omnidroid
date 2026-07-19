@@ -35,7 +35,7 @@ from omnidroid import config
 from omnidroid.config import (
     REPO, CONFIG_PATH, QEMU_DIR,
     IS_WINDOWS, IS_LINUX, IS_MACOS, HOST_ARCH, IS_ARM64_HOST,
-    resolve_images_dir, images_dir, qemu_bin, qemu_system_name,
+    images_dir, qemu_bin, qemu_system_name,
 )
 
 # Data-store root (accounts.json, accounts/, logs/, runtime/). Defaults to
