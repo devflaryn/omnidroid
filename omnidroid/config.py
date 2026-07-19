@@ -4,6 +4,7 @@
 Every path/arch decision in OmniDroid routes through here so one checkout runs
 on Windows, macOS, and Linux without any other module knowing the branches.
 """
+import os
 import platform
 import sys
 from pathlib import Path
@@ -32,6 +33,18 @@ HOST_ARCH = platform.machine().lower()
 IS_ARM64_HOST = HOST_ARCH in ("arm64", "aarch64")
 
 
+def data_dir() -> Path:
+    """Directory holding accounts.json, accounts/, logs/, runtime/.
+    Defaults to the project root; OMNI_DATA_DIR relocates it (created if
+    missing) so state can travel independently of the code checkout."""
+    env = os.environ.get("OMNI_DATA_DIR")
+    if env:
+        p = Path(env).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return REPO
+
+
 def resolve_images_dir(cfg):
     """images_dir may be a plain string or a per-platform dict
     ({"windows": ..., "linux": ...}) so one checkout works on both hosts.
@@ -39,9 +52,10 @@ def resolve_images_dir(cfg):
     (default: images/ inside the checkout, travels with the repo)."""
     v = cfg["images_dir"]
     if isinstance(v, dict):
+        # macOS has no dedicated key in older configs: it explicitly falls
+        # back to the linux path convention (~/OmniImages-style), same as
+        # the historical behavior.
         key = "windows" if IS_WINDOWS else "darwin" if IS_MACOS else "linux"
-        # Back-compat: older configs only have windows/linux; macOS falls
-        # back to the linux path convention.
         v = v.get(key) or (v.get("linux") if IS_MACOS else None) \
             or v.get("default")
         if not v:
@@ -51,6 +65,15 @@ def resolve_images_dir(cfg):
     if not p.is_absolute():
         p = REPO / p
     return str(p)
+
+
+def images_dir(cfg) -> str:
+    """Absolute images dir. OMNI_IMAGES_DIR wins over the config value so a
+    host can point at an external image store without editing paths.json."""
+    env = os.environ.get("OMNI_IMAGES_DIR")
+    if env:
+        return str(Path(env).expanduser())
+    return resolve_images_dir(cfg)
 
 
 # ---------- qemu resolution + auto-install ----------

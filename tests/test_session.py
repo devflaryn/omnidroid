@@ -190,6 +190,10 @@ class PlayGatesOnLogin(unittest.TestCase):
         patches = [
             mock.patch.object(omni, "REPO", self.tmp),
             mock.patch.object(omni, "ACCOUNTS_DIR", accounts_dir),
+            # The cookie store now routes through config.data_dir() (see
+            # omnidroid.config / engine._store_root); redirect it alongside
+            # REPO so a saved account is found where this test saves it.
+            mock.patch.dict(os.environ, {"OMNI_DATA_DIR": str(self.tmp)}),
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
         ]

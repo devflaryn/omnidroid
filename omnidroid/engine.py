@@ -31,11 +31,23 @@ import threading
 import time
 from pathlib import Path
 
+from omnidroid import config
 from omnidroid.config import (
-    REPO, CONFIG_PATH, ACCOUNTS_DIR, QEMU_DIR,
+    REPO, CONFIG_PATH, QEMU_DIR,
     IS_WINDOWS, IS_LINUX, IS_MACOS, HOST_ARCH, IS_ARM64_HOST,
     resolve_images_dir, qemu_bin, qemu_system_name,
 )
+
+# Data-store root (accounts.json, accounts/, logs/, runtime/). Defaults to
+# REPO; relocatable via OMNI_DATA_DIR (see omnidroid.config.data_dir()).
+ACCOUNTS_DIR = config.data_dir() / "accounts"
+
+
+def _store_root():
+    """Root dir for the cookie store (accounts.json), re-resolved per call
+    so tests/tools that flip OMNI_DATA_DIR at runtime see it take effect."""
+    return config.data_dir()
+
 
 # Linux KSM (kernel samepage merging) sysfs interface. Dedups identical
 # guest RAM pages across instances (same immutable base => big overlap).
@@ -5412,7 +5424,7 @@ def public_session(sess):
 def account_cookie(username):
     """The saved .ROBLOSECURITY for a Roblox username, or None."""
     from omnidroid import cookies as _ck
-    rec = _ck.get_account(REPO, username)
+    rec = _ck.get_account(_store_root(), username)
     return rec.get("cookie") if rec else None
 
 
@@ -5765,16 +5777,18 @@ def _capture_and_save_account(args):
         return None, ("bad_token", "--token/--token-file/--token-stdin was "
                                    "given but resolved to an empty cookie")
     if tok:
-        r = _ck.capture_login_from_cookie(REPO, tok, browser=args.browser)
+        r = _ck.capture_login_from_cookie(_store_root(), tok,
+                                          browser=args.browser)
     else:
-        r = _ck.capture_login(REPO, browser=args.browser, timeout=args.timeout,
+        r = _ck.capture_login(_store_root(), browser=args.browser,
+                              timeout=args.timeout,
                               profile_dir=getattr(args, "profile_dir", None))
     if not r.get("ok"):
         return None, (r.get("error", "login_failed"), r.get("message"))
     # Optional display-only alias (never the identity/instance name).
     alias = getattr(args, "alias", None)
     if alias:
-        _ck.set_custom_name(REPO, r["username"], alias)
+        _ck.set_custom_name(_store_root(), r["username"], alias)
     return r, None
 
 
@@ -5813,24 +5827,24 @@ def cmd_accounts(args):
         username, custom = args.set_custom_name
         # Display-only label, separate from the username (the account's real
         # identity and the instance name — never changed by this).
-        existed = _ck.set_custom_name(REPO, username, custom)
+        existed = _ck.set_custom_name(_store_root(), username, custom)
         if not existed:
             return fail("no_account", f"no saved account '{username}'")
         out = {"ok": True, "username": username, "custom_name": custom or None}
     elif getattr(args, "remove", None):
-        existed = _ck.remove_account(REPO, args.remove)
+        existed = _ck.remove_account(_store_root(), args.remove)
         out = {"ok": True, "removed": args.remove, "existed": existed}
     else:
-        accts = _ck.list_accounts(REPO)
+        accts = _ck.list_accounts(_store_root())
         if getattr(args, "verify", False):
             # A cookie dies when the account signs out or changes password, and
             # otherwise only surfaces as a login screen inside the VM minutes
             # later. One cheap call tells you now.
             for a in accts:
-                rec = _ck.get_account(REPO, a["username"])
+                rec = _ck.get_account(_store_root(), a["username"])
                 uid, _uname = _ck.whoami((rec or {}).get("cookie") or "")
                 a["valid"] = bool(uid)
-        out = {"ok": True, "accounts": accts, "store": str(_ck.accounts_path(REPO))}
+        out = {"ok": True, "accounts": accts, "store": str(_ck.accounts_path(_store_root()))}
     if getattr(args, "json", False):
         emit_json(out)
     else:
