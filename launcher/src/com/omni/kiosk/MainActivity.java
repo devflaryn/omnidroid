@@ -156,6 +156,19 @@ public class MainActivity extends Activity {
             }
             ComponentName admin =
                     new ComponentName(this, OmniDeviceAdminReceiver.class);
+            // Auto-grant runtime permissions device-wide. Without this, Roblox
+            // stops on Android 13+ with "Allow Roblox to send you
+            // notifications?" — a dialog sitting on top of the game that
+            // someone has to tap. The product promise is a launch with no menu
+            // and no taps, so the device owner answers these instead of the
+            // user. Only the DO can do this; it applies to permissions the app
+            // requests, it does not invent new ones.
+            try {
+                dpm.setPermissionPolicy(
+                        admin, DevicePolicyManager.PERMISSION_POLICY_AUTO_GRANT);
+            } catch (Throwable t) {
+                Log.w(TAG, "could not set auto-grant permission policy: " + t);
+            }
             String game = resolveGamePackage();
             String[] pkgs = (game != null)
                     ? new String[]{getPackageName(), game}
@@ -223,14 +236,44 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    /**
+     * Start the game. When the game is Roblox AND a session is configured, this
+     * JOINS THE PLACE directly (roblox://experiences/start?placeId=...) instead
+     * of opening the app's home screen — that is what makes a boot land in the
+     * game with no menu and no simulated taps. Everything else (a plain APK
+     * under test, no session set) still gets the ordinary launcher intent.
+     */
     private void launchGame(String pkg, String why) {
+        // Whitelist + pin BEFORE anything starts: a game launched while it is
+        // not yet a Lock Task package gets blocked by the pin, so the order
+        // here is load-bearing, not cosmetic.
+        whitelistForLockTask(pkg);
+        enterLockTask();
+
+        if (OmniSession.ROBLOX_PACKAGE.equals(pkg) && OmniSession.hasSession(this)) {
+            String err = OmniSession.join(this, why);
+            if (err == null) {
+                status.setText("");
+                launchedThisBoot = true;
+                return;
+            }
+            // Fall through to the plain launcher intent: better to show Roblox's
+            // own screen than a dead kiosk. The host sees the reason in logcat
+            // and in the `omni play` reply.
+            Log.w(TAG, "deep-link join failed (" + err + "); "
+                    + "falling back to the launcher intent");
+        }
         Intent li = getPackageManager().getLaunchIntentForPackage(pkg);
         if (li == null) return;
         Log.i(TAG, "launching " + pkg + " (" + why + ")");
         status.setText("");
         launchedThisBoot = true;
-        // Ensure the game is whitelisted for Lock Task, then pin, so the
-        // game runs with the status bar / gestures fully locked out.
+        li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(li);
+    }
+
+    /** Allow the kiosk + the game to run inside Lock Task Mode. */
+    private void whitelistForLockTask(String pkg) {
         try {
             DevicePolicyManager dpm =
                     getSystemService(DevicePolicyManager.class);
@@ -243,8 +286,5 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             Log.w(TAG, "whitelist game for lock task failed: " + e);
         }
-        enterLockTask();
-        li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        startActivity(li);
     }
 }

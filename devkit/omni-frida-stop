@@ -1,6 +1,13 @@
 #!/system/bin/sh
 # omni-frida-stop — stop any devkit frida-server started by omni-fridad.
-# Only ships inside base-dev.qcow2.
+# Ships ONLY on the dev devkit disk (base_arm_devkit.qcow2).
+if [ "$(id -u)" != 0 ]; then
+    for SU in /debug_ramdisk/su /sbin/su su; do
+        "$SU" 0 true 2>/dev/null && exec "$SU" 0 "$0" "$@"
+    done
+    echo "omni-frida-stop: ERROR need Magisk root (su)" >&2; exit 1
+fi
+
 WORK=/data/local/tmp/.omni
 n=0
 # Kill the randomly-named copies we launch from the private work dir.

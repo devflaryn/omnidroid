@@ -1,49 +1,48 @@
 #!/system/bin/sh
-# omni-hide [package] — best-effort hiding of root + frida from a target app's
-# detection routines. Ships ONLY inside base-dev.qcow2.
+# omni-hide [package] — best-effort hiding of ROOT, MAGISK, and FRIDA from a
+# target app's detection routines. Ships ONLY on the dev devkit disk.
 #
-# The dev base is rooted with KernelSU (not Magisk): a full Magisk install on
-# top of KernelSU on Android-x86 is a kernel-level conflict and is unsafe, so
-# instead we bake the Magisk *tools* (the `resetprop` applet -> omni-magisk)
-# and use KernelSU's own per-app hiding. This script:
-#   1. Reports/normalizes the classic root/emulator prop "tells" (build tags,
-#      verified boot state, debuggable, ...). This Bliss base already ships most
-#      of them clean (release-keys / green / ro.debuggable=0), so the common
-#      result is "already clean"; anything not clean is set with resetprop.
-#      Root here is KernelSU (kernel-level), so it does NOT depend on
-#      ro.debuggable — normalizing these props does not break `adb root`.
-#   2. If a target package is given and a KernelSU control path is present, adds
-#      it to the denylist / requests root be umounted for it (best-effort).
-#   3. Confirms frida is not on the default 27042 port / "frida-server" name.
+# The dev base is rooted with MAGISK (a patched boot in the dev system overlay).
+# Magisk's own hiding machinery is the tool here:
+#   1. Add the target package to the Magisk DenyList so Magisk unmounts its
+#      modifications and hides the su/daemon for that app (needs Zygisk +
+#      Enforce DenyList — set once by omni-magisk-setup). Shamiko, if installed,
+#      makes this a strong whitelist-style hide and conceals the Magisk app too.
+#   2. Normalize the classic root/verified-boot prop "tells" with Magisk's
+#      resetprop applet (build tags -> release-keys, verifiedbootstate -> green,
+#      etc.). Idempotent: only changes props not already at the wanted value.
+#   3. Confirm frida is NOT on the default 27042 port / "frida-server" name
+#      (omni-fridad already binds a custom port + random process name).
 #
-# Idempotent. Prints what it actually applied vs. what was already clean.
-MAGISK=/system/bin/omni-magisk
-PKG="$1"
-WORK=/data/local/tmp/.omni
-
-# The Magisk multicall dispatches by argv[0]: invoke it via a 'resetprop'-named
-# symlink so the resetprop applet runs (calling it as `omni-magisk resetprop`
-# yields "applet not found"). Kept in a private tmp dir, not in PATH.
-RP=""
-if [ -x "$MAGISK" ]; then
-    mkdir -p "$WORK" 2>/dev/null
-    ln -sf "$MAGISK" "$WORK/resetprop" 2>/dev/null
-    [ -x "$WORK/resetprop" ] && RP="$WORK/resetprop"
+# Root required (Magisk su). Prints what it applied vs. what was already clean.
+if [ "$(id -u)" != 0 ]; then
+    for SU in /debug_ramdisk/su /sbin/su su; do
+        "$SU" 0 true 2>/dev/null && exec "$SU" 0 "$0" "$@"
+    done
+    echo "omni-hide: ERROR need Magisk root (su)" >&2; exit 1
 fi
 
+PKG="$1"
+# Like su, the magisk applet lives in Magisk's own tmpfs, NOT on $PATH (a bare
+# `command -v magisk` never finds it on this all-read-only base).
+have_magisk=0
+MAGISK_BIN=""
+for M in /debug_ramdisk/magisk /sbin/magisk magisk; do
+    "$M" -v >/dev/null 2>&1 && { MAGISK_BIN="$M"; have_magisk=1; break; }
+done
+
+# --- resetprop prop normalization (via the Magisk applet) ---
 applied=""; already=""; skipped=""
-# want <key> <value>: set only if not already that value.
 want() {
     key="$1"; val="$2"
-    if [ -n "$RP" ]; then
-        cur=$("$RP" "$key" 2>/dev/null)
+    if [ "$have_magisk" = 1 ]; then
+        cur=$("$MAGISK_BIN" resetprop "$key" 2>/dev/null)
         if [ "$cur" = "$val" ]; then already="$already $key"; return; fi
-        if "$RP" -n "$key" "$val" >/dev/null 2>&1; then
-            new=$("$RP" "$key" 2>/dev/null)
+        if "$MAGISK_BIN" resetprop -n "$key" "$val" >/dev/null 2>&1; then
+            new=$("$MAGISK_BIN" resetprop "$key" 2>/dev/null)
             if [ "$new" = "$val" ]; then applied="$applied $key"; return; fi
         fi
     fi
-    # No resetprop, or set had no effect — fall back to reporting the getprop.
     cur=$(getprop "$key" 2>/dev/null)
     if [ "$cur" = "$val" ]; then already="$already $key"; else skipped="$skipped $key"; fi
 }
@@ -58,14 +57,17 @@ want ro.boot.warranty_bit 0
 want ro.warranty_bit 0
 want ro.debuggable 0
 
-# --- per-app KernelSU denylist (best effort) ---
-ksu_note="(no KernelSU control path found)"
-if [ -n "$PKG" ] && command -v ksud >/dev/null 2>&1; then
-    if ksud profile set-umount "$PKG" true >/dev/null 2>&1 \
-       || ksud module denylist add "$PKG" >/dev/null 2>&1; then
-        ksu_note="requested KernelSU umount/denylist for $PKG"
+# --- per-app Magisk DenyList (hide root + Magisk) ---
+deny_note="(no package given)"
+if [ -n "$PKG" ]; then
+    if [ "$have_magisk" = 1 ]; then
+        if "$MAGISK_BIN" --denylist add "$PKG" >/dev/null 2>&1; then
+            deny_note="added $PKG to Magisk DenyList (root+Magisk hidden for it)"
+        else
+            deny_note="magisk present but denylist add not accepted for $PKG"
+        fi
     else
-        ksu_note="ksud present but denylist call not accepted (version differs) for $PKG"
+        deny_note="magisk not found — dev boot not patched? ($PKG NOT hidden)"
     fi
 fi
 
@@ -78,6 +80,6 @@ fi
 echo "omni-hide: props already clean:${already:- (none)}"
 echo "omni-hide: props set now      :${applied:- (none)}"
 [ -n "$skipped" ] && echo "omni-hide: props NOT set       :${skipped} (resetprop unavailable?)"
-echo "omni-hide: KernelSU -> $ksu_note"
+echo "omni-hide: Magisk   -> $deny_note"
 echo "omni-hide: frida    -> $frida_note"
-echo "omni-hide: root is KernelSU (kernel-level), independent of ro.debuggable."
+echo "omni-hide: root is Magisk; ensure Zygisk+DenyList are on (omni-magisk-setup)."

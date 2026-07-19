@@ -1,0 +1,97 @@
+#!/system/bin/sh
+# omni-magisk-setup — one-time Magisk configuration for the dev base.
+#
+# Prereq: the dev system overlay's boot is already Magisk-patched (root exists),
+# so the `magisk` daemon/binary is present. This script turns on the hiding
+# machinery so a target app with root/Magisk/frida detection sees a clean device:
+#   * Zygisk ON            (required for the DenyList to actually unmount Magisk
+#                           and hide the su/daemon from an app's process view);
+#   * Enforce DenyList ON  (apply the denylist to listed apps);
+#   * Shamiko module       (if present on the devkit disk) — stronger, whitelist-
+#                           style hiding + hides the Magisk app itself;
+#   * optionally installs the Magisk manager app from the devkit APK.
+# Zygisk/DenyList toggles take effect after a reboot; the engine reboots the dev
+# account once after setup. Per-app hiding is done at run time by omni-hide.
+#
+# Idempotent. Ships ONLY on the dev devkit disk (base_arm_devkit.qcow2).
+if [ "$(id -u)" != 0 ]; then
+    for SU in /debug_ramdisk/su /sbin/su su; do
+        "$SU" 0 true 2>/dev/null && exec "$SU" 0 "$0" "$@"
+    done
+    echo "omni-magisk-setup: ERROR need Magisk root (su)" >&2; exit 1
+fi
+
+MOUNT="${OMNI_DEVKIT_MOUNT:-/mnt/omni-devkit}"
+DEVKIT="${OMNI_DEVKIT:-/data/local/tmp/omni-devkit}"
+
+# Like su, the magisk applet lives in Magisk's own tmpfs, NOT on $PATH (a bare
+# `command -v magisk` never finds it on this all-read-only base).
+MAGISK_BIN=""
+for M in /debug_ramdisk/magisk /sbin/magisk magisk; do
+    "$M" -v >/dev/null 2>&1 && { MAGISK_BIN="$M"; break; }
+done
+if [ -z "$MAGISK_BIN" ]; then
+    echo "omni-magisk-setup: ERROR 'magisk' not found — the dev boot is not "
+    echo "  Magisk-patched (root missing). Build with: omni build-dev-base --patch-boot"
+    exit 1
+fi
+echo "omni-magisk-setup: Magisk $("$MAGISK_BIN" -c 2>/dev/null)"
+
+# Populate the Magisk app-managed environment (/data/adb/magisk). An offline
+# boot patch (--patch-boot) roots the device — magiskd + su work — but never
+# fills /data/adb/magisk, which is normally the app's Direct-Install step. When
+# it's empty the Magisk app pops "Requires additional setup / reboot" and its
+# own env_check() fails. The devkit /bin ships the exact matching arm64 magisk
+# binaries + util_functions.sh/boot_patch.sh (same build that patched the boot),
+# so copy them in — this is Magisk's own fix_env behaviour. Idempotent; copy
+# only (the /mnt devkit mount is noexec, but we never exec from it here).
+MBIN=/data/adb/magisk
+BINSRC=""
+for b in "$MOUNT/bin" "$DEVKIT/bin"; do [ -d "$b" ] && { BINSRC="$b"; break; }; done
+env_ok=1
+for f in busybox magiskboot magiskinit magiskpolicy util_functions.sh boot_patch.sh; do
+    [ -f "$MBIN/$f" ] || env_ok=0
+done
+if [ "$env_ok" = 1 ]; then
+    echo "  Magisk env already installed ($MBIN)"
+elif [ -n "$BINSRC" ]; then
+    rm -rf "$MBIN"/* 2>/dev/null
+    mkdir -p "$MBIN"
+    chmod 700 /data/adb
+    if cp -af "$BINSRC"/. "$MBIN"/; then
+        chmod -R 755 "$MBIN"; chown -R 0:0 "$MBIN"
+        echo "  installed Magisk env into $MBIN (clears the app's 'additional setup' prompt)"
+    else
+        echo "  (could not populate $MBIN from $BINSRC)"
+    fi
+else
+    echo "  WARNING: no devkit /bin found — cannot populate $MBIN; the Magisk"
+    echo "    app may keep asking for 'additional setup'."
+fi
+
+# Enable Zygisk + Enforce DenyList via Magisk's settings DB.
+set_setting() {
+    "$MAGISK_BIN" --sqlite "REPLACE INTO settings (key,value) VALUES('$1',$2)" \
+        >/dev/null 2>&1 && echo "  set $1=$2" || echo "  (could not set $1)"
+}
+set_setting zygisk 1
+set_setting denylist 1
+
+# Shamiko (optional) — stronger hiding; drop Shamiko.zip into the devkit
+# disk's /modules to enable. Best-effort.
+for z in "$DEVKIT"/modules/*.zip "$MOUNT"/modules/*.zip; do
+    [ -f "$z" ] || continue
+    echo "  installing module $(basename "$z")"
+    "$MAGISK_BIN" --install-module "$z" >/dev/null 2>&1 \
+        && echo "    installed" || echo "    module install not accepted"
+done
+
+# Optionally install the Magisk manager app (GUI). Not required for hiding.
+for apk in "$DEVKIT/magisk.apk" "$MOUNT/magisk.apk"; do
+    [ -f "$apk" ] || continue
+    pm install -r "$apk" >/dev/null 2>&1 && echo "  Magisk app installed"
+    break
+done
+
+echo "omni-magisk-setup: done. Zygisk/DenyList apply after a reboot."
+echo "  Add a target app to hiding at run time: omni-hide <package>"

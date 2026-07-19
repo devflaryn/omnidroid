@@ -48,5 +48,29 @@
                 <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
             </intent-filter>
         </receiver>
+
+        <!-- Host -> kiosk session channel (`omni play` / `omni session`).
+             Must be exported: the sender is adb shell, a different uid.
+             Guarded by DUMP, which shell (uid 2000) holds and which a normal
+             third-party app can never be granted - so the host can drive the
+             session but an app on the device cannot hijack it. -->
+        <receiver
+            android:name=".SessionReceiver"
+            android:permission="android.permission.DUMP"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.omni.kiosk.SET_SESSION" />
+                <action android:name="com.omni.kiosk.CLEAR_SESSION" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Kiosk -> Roblox session channel: the injected bootstrap reads the
+             token here and installs it into Roblox's own cookie jar. Exported
+             by necessity (cross-app); the provider itself answers only when
+             getCallingPackage() is Roblox. -->
+        <provider
+            android:name=".SessionProvider"
+            android:authorities="com.omni.kiosk.session"
+            android:exported="true" />
     </application>
 </manifest>

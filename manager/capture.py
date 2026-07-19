@@ -48,10 +48,33 @@ import vncview
 # Change-detection defaults. Kept behaviourally aligned with the agent's adb
 # fallback (omni-agent/tools/_emulator_frame_capture.py) so a report reads the
 # same whichever provider produced it.
+#
+# The two scene thresholds are set from MEASURED separation, not taste (see
+# tests/test_keyframe_thresholds.py, which pins these cases):
+#
+#   animating spinner .................. 0.06 % changed / 0.06 mean
+#   progress bar, empty -> full ........ 1.13 % changed / 1.21 mean
+#   ---------------- scene threshold: 2 % ------------------------------
+#   small toast (2 % of screen) ........ 2.33 % changed / 4.56 mean
+#   popup dialog (6 % of screen) ....... 6.38 % changed / 13.55 mean
+#   full menu/scene change ............. 92.9 % changed / 142.3 mean
+#
+# It used to sit at 8 % / 14.0 — 7x above the loudest ignorable animation, which
+# also silently dropped every popup smaller than ~1/8 of the screen (the 6 %
+# dialog above missed on BOTH metrics). 2 % / 4.0 clears the animation noise
+# floor and still catches a toast.
+#
+# The usable band is genuinely narrow (1.13 % .. 2.33 %) because "% of changed
+# pixels" is a SIZE metric: a wide thin progress bar and a small dialog move a
+# similar pixel count, and nothing here distinguishes them by shape. The
+# consequence, accepted deliberately: an animated element larger than ~2 % of the
+# screen (a big spinning logo) WILL keyframe. Widening the band needs a different
+# metric (e.g. contiguous-region change), not a nudged constant — so
+# tests/test_keyframe_thresholds.py asserts the ordering rather than the numbers.
 DEFAULT_SAMPLE_SCALE_W = 160
 DEFAULT_PIXEL_THRESHOLD = 24        # per-channel delta for a pixel to "change"
-DEFAULT_CHANGE_PERCENT = 8.0        # % of changed pixels => scene change
-DEFAULT_CHANGE_THRESHOLD = 14.0     # mean abs delta backstop (0-255)
+DEFAULT_CHANGE_PERCENT = 2.0        # % of changed pixels => scene change
+DEFAULT_CHANGE_THRESHOLD = 4.0      # mean abs delta backstop (0-255)
 DEFAULT_BLACK_THRESHOLD = 10.0      # mean brightness below => black frame
 DEFAULT_MAX_KEYFRAMES = 240
 _QUEUE_MAXSIZE = 256                # bounded; blocking put = back-pressure
@@ -65,10 +88,10 @@ def _lazy_pil():
 
 def _image_from_bgrx(width, height, bgrx):
     Image, _ImageChops, _ImageStat = _lazy_pil()
-    # QEMU's set_pixel_format in vncview yields B,G,R,x bytes per pixel; PIL's
-    # "BGRX" raw decoder reads that straight into an RGB image (correct colours
-    # on any QEMU build).
-    return Image.frombytes("RGB", (width, height), bgrx, "raw", "BGRX")
+    # QEMU (virtio-gpu on this base) delivers R,G,B,x bytes per pixel; PIL's
+    # "RGBX" raw decoder reads that straight into an RGB image. Verified against
+    # `adb screencap` ground truth (exact match); the old "BGRX" was R/B-swapped.
+    return Image.frombytes("RGB", (width, height), bgrx, "raw", "RGBX")
 
 
 def _frame_metrics(img_a, img_b, pixel_threshold):

@@ -6,6 +6,135 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-07-17 — `omni play` no longer creates a profile without a login; `custom_name`; agent-side headless login
+
+**Root cause of the failed overnight test:** the agent was handed a cookie.txt
++ a stock (non-bootstrapped) `roblox-v2.726.apk` and asked to launch place
+`8737899170`. It had no tool to turn a cookie into a saved account (the only
+exposed path was a human running `omni login`), so it fell back to the
+generic `run_apk_test_session` pipeline, which installed the STOCK apk onto
+the hardcoded `omniagent` instance and delivered the cookie to it anyway.
+Per contracts/omni-session.md §1.2 a stock Roblox build has NO code path that
+ever reads the session cookie — so it silently landed on Roblox's own login
+screen while `run_apk_test_session` still reported install+launch as
+successful. Fixed on both sides:
+
+- **`omni play <name>` refuses to create ANY instance for a name with no
+  saved cookie and no override** (`manager/omni.py`: `cmd_play`). `resolve_token`/
+  `load_session` are pure reads and don't need an instance directory to exist,
+  so the token/place validation now runs BEFORE `ensure_instance()` — a
+  brand-new or misspelled name fails `no_token` before any overlay/`/data`/QEMU
+  disk gets created for it, instead of after. `--no-token` (the deliberate
+  "show Roblox's own login screen" escape hatch) is unaffected. Regression
+  tests: `tests/test_session.py::PlayGatesOnLogin`.
+- **`custom_name`** (`manager/cookies.py`: `save_account`, `set_custom_name`,
+  `list_accounts`) — a saved account may carry a friendly display-only label
+  via `omni accounts --set-custom-name <username> <name>`, preserved across a
+  cookie refresh. The username stays the account's real identity and the
+  instance name; this never renames anything. Tests: `tests/test_cookies.py::CustomName`.
+- **omni-agent: `login_roblox_account`** (`tools/roblox_session.py`) — wraps
+  `omni login --token-file/--token/--token-stdin` as a tool, so the agent can
+  register/refresh an account from a cookie it was handed, headlessly, with no
+  human running `omni login` first. Same upsert-by-username store, so
+  re-registering the same cookie never creates a duplicate account or
+  instance.
+- **omni-agent: `launch_roblox_build`** — the one-call pipeline for "cookie +
+  place id (+ optionally a new APK)": login_roblox_account -> (if apk_path
+  given) decode_apk -> inject_session_bootstrap -> recompile_apk -> sign_apk ->
+  install -> play_roblox, every stage idempotent and stage-tagged on failure.
+  `run_apk_test_session`'s description now explicitly says NOT to use it for a
+  Roblox cookie/login flow (it has no concept of accounts or cookies).
+- Verified end to end against real assets: `login_roblox_account` correctly
+  rejected an actually-expired cookie.txt with a clean `stage: "login"` error
+  (no instance created) in ~37s; `play_roblox` against an existing saved
+  account with a still-valid cookie reused its existing instance (no
+  duplicate) and delivered the session.
+- Removed the stray `omniagent` dev instance this bug had left on disk (via
+  `omni stop` + `omni remove`, not a raw file delete).
+
+## 2026-07-17 — `omni login` accepts an already-obtained cookie (headless), not just an interactive sign-in
+
+- **`omni login --token/--token-file/--token-stdin`** (`manager/omni.py`:
+  `cmd_login`, `_token_flag_given`; `manager/cookies.py`:
+  `capture_login_from_cookie`, `_driver(..., headless=)`). Adopts a
+  `.ROBLOSECURITY` cookie you already have (e.g. exported from another
+  browser/device) instead of driving a fresh interactive sign-in. No window:
+  the cookie is loaded into a **headless** Chrome/Firefox and held to the same
+  bar an interactive login has to clear before being trusted — it must land on
+  `/home` (not `/login`) AND `users/authenticated` must resolve it to a real
+  user — before the account is saved under its username in `accounts.json`,
+  same store as the interactive path.
+- **Fail-fast on an unusable token**: a `--token*` flag that resolves to an
+  empty cookie (blank file, empty stdin, `--token ""`) is a hard `bad_token`
+  error, detected by presence (`_token_flag_given`, `is not None`) rather than
+  truthiness. Without this an empty value would silently fall through to the
+  interactive flow — turning a supposedly-headless, few-second call into an
+  unattended up-to-5-minute wait on a visible browser window nobody is
+  watching. Caught in testing before shipping (both the truthy-empty-string
+  and the blank-file case).
+- No engine contract or CLI-shape change for `omni play`/`omni session`/the
+  in-Roblox bootstrap — this only adds an alternate way to populate
+  `accounts.json`. See `contracts/omni-session.md` §3.0.
+- Tests: `tests/test_cookies.py::CaptureLoginFromCookie` (mocked
+  driver/whoami, no real browser), `tests/test_session.py::LoginTokenFlag`.
+
+## 2026-07-14 — dev base moved to arm + delivered as an extra disk (vdc), not a new base
+
+**Big change (replaces the 2026-07-13 x86 dev base).** The dev/debug base is no
+longer a separate flattened x86 image. It is the shared, immutable `base_arm`
+**plus one extra virtio disk** (`base_arm_devkit.qcow2`, attached to dev accounts
+as **vdc**) carrying the whole toolkit. `base_arm.qcow2` is never modified.
+
+- **Deleted the entire x86 `base-dev` machinery**: the `base-dev.qcow2`/`.kernel`/
+  `.initrd.img` files, the `dev` config entry, the `DEV_BASE_DISK/KERNEL/INITRD`
+  constants, the `_stage_devkit`/`_devkit_mutate` `/system`-baking + flatten
+  pipeline, and the `base-dev` auto-registration. The old `omni-devkit.rc` init
+  service is gone (no more `/system` editing).
+- **`omni build-dev-base` rebuilt for arm** (`manager/omni.py`: `_stage_devkit_arm`,
+  `_build_ext4_qcow2`, `_find_mke2fs`, `_gpt_partition`, `_patch_dev_boot`,
+  `build_dev_base`). It now, **all host-side (no guest boot, no root, cross-
+  platform)**: stages the android-**arm64** frida-server + the **Magisk** APK
+  (with its extracted arm64 `magiskboot`/`magiskinit`/`magiskpolicy`/`busybox` +
+  `boot_patch.sh`) + the `omni-*` scripts + a manifest; builds
+  `base_arm_devkit.qcow2` via **`mke2fs -d`** (rootless ext4 populate) →
+  `qemu-img convert` to qcow2 (~256 MiB); creates the thin `base_arm_devsystem.qcow2`
+  overlay (COW on `base_arm.qcow2`) to hold the rooted boot; registers `dev`
+  (arm-uefi + `devkit`). `current_base` is never changed. Downloads prefer
+  **curl** (system certs) with a urllib fallback.
+- **Dev account model**: `omni create <n> --base dev` copies the arm trio + makes
+  a cheap COW overlay of the devkit disk (`devkit.qcow2`), wired into
+  `qemu_command_arm` as **vdc**, and flags the account `dev:true`. On start/resume,
+  `_devkit_activate` mounts vdc read-only + stages the exec-capable tools; all
+  tools run as **root via Magisk `su`** (arm base is a `user` build — `adb root`
+  is unavailable). Auto-screenshots / capture dev-gates now key on the account's
+  `dev` flag (`acct_is_dev`), not an x86 base tag.
+- **Root = Magisk (user-chosen) — WORKING + VERIFIED (2026-07-14).**
+  `--patch-boot` roots the dev overlay's boot (`vda6`) via an **offline**
+  magiskboot patch (raw-export → GPT-locate `boot` → run Magisk `boot_patch.sh`
+  with the full arm64 toolset in a throwaway arm guest → write back → re-import).
+  Keeps `base_arm.qcow2` immutable; OFF by default + disk-space guarded. Verified:
+  the guest boots with `magiskd` running as root + the Magisk app auto-installed;
+  `su` → `uid=0(root) context=u:r:magisk:s0`.
+  - **`su` is not on `$PATH`** (all-read-only base → Magisk keeps it in its own
+    tmpfs `/debug_ramdisk/su`); the engine + agent probe it (`resolve_su` /
+    `_resolve_su`).
+  - **Headless su via a dev `/data` template**: MagiskSU prompts for approval
+    (GUI) the first time, which hangs headless — so root is granted **once**
+    through the app and baked into **`base_arm_devdata.qcow2`** (a copy of the
+    provisioned `/data` with the shell grant Forever, `root_access=3`, Zygisk +
+    DenyList on). Dev accounts use it → root works from first boot, no prompt.
+    Matched FBE pair with `base_arm_devsystem.qcow2`.
+  - Hiding = Magisk Zygisk/DenyList (+ Shamiko) via `omni-magisk-setup` /
+    `omni-hide`, hiding root, Magisk, and frida.
+- **arm64-native win**: the base runs arm64 natively (no libndk), so frida native
+  Interceptor/Stalker hooks of the app's own arm64 `.so` now work (the x86 dev
+  base couldn't).
+- **omni-agent updated** (`tools/android_emulator.py`, `tools/frida_tools.py`,
+  `TOOLS.md`): dev detection via the vdc devkit manifest + a precise "dev but not
+  rooted" error; `su`-path-resolving activation/`omni-fridad`/`omni-hide`; arm64
+  frida notes.
+- See `DEV-BASE.md` + `devkit/README.md` (both rewritten).
+
 ## 2026-07-13 — dev/prod x86 split: `build-dev-base` + `base-dev.qcow2` (frida + root/frida hiding)
 
 - **New `omni build-dev-base` command** (`manager/omni.py`: `_stage_devkit`,

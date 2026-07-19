@@ -1,49 +1,54 @@
-# omnidroid devkit — the base-dev.qcow2 payload
+# omnidroid devkit — the `base_arm_devkit.qcow2` payload
 
-These files are baked into **`base-dev.qcow2`** (and only that image) by
-`omni build-dev-base`. They are the on-device half of the dev/debug base: the
-production bases (`base_x86.qcow2`, `base_arm.qcow2`) never contain any of them.
+These scripts are the on-device half of the **dev/debug base**. They are copied
+onto the extra **devkit disk** (`base_arm_devkit.qcow2`) by `omni build-dev-base`
+and attached to dev accounts as **vdc**. The production bases (`base_x86.qcow2`,
+`base_arm.qcow2`) never contain any of them, and `base_arm.qcow2` is never
+modified — the toolkit lives entirely on the separate vdc disk.
 
-Everything here lands under `/system` inside the flattened dev base, so it
-survives into every account created from `base-dev` (per-account `/data` is
-disposable and is *not* where the toolkit lives).
+At start, the engine mounts vdc read-only at `/mnt/omni-devkit` and stages an
+exec-capable copy at `/data/local/tmp/omni-devkit`. Everything here runs as
+**root via Magisk `su`** (the arm base is a `user` build — `adb root` is
+unavailable; root comes from a Magisk-patched boot, see `../DEV-BASE.md`).
 
-| File | Installed to (in base-dev `/system`) | Purpose |
-|------|--------------------------------------|---------|
-| `omni-fridad`      | `/system/bin/omni-fridad`            | Start frida-server hidden: custom loopback port (not 27042), randomly-named process, prefers a patched binary if present. |
-| `omni-frida-stop`  | `/system/bin/omni-frida-stop`        | Stop any devkit frida-server. |
-| `omni-hide`        | `/system/bin/omni-hide`              | Best-effort hide root+frida from a target app (resetprop spoofs via the baked Magisk applet + KernelSU per-app denylist). |
-| `omni-devkit.rc`   | `/system/etc/init/omni-devkit.rc`    | `omni_fridad` init service (DISABLED by default; `start omni_fridad`). |
+| File | Purpose |
+|------|---------|
+| `omni-fridad`      | Start the android-**arm64** frida-server hidden: custom loopback port (not 27042), randomly-named process, prefers `frida-server-patched` if present. Self-elevates via `su 0`. |
+| `omni-frida-stop`  | Stop any devkit frida-server. |
+| `omni-hide`        | Hide root + Magisk + frida from a target app: add it to the Magisk **DenyList** + resetprop-spoof the classic root/verified-boot props. |
+| `omni-magisk-setup`| One-time: enable **Zygisk + Enforce DenyList**, install **Shamiko** (if `Shamiko.zip` is dropped into the disk's `/modules`), optionally install the Magisk manager app. |
 
-Also baked by the builder (not source-controlled here — fetched at build time):
+Also placed on the disk by the builder (not source-controlled here — fetched at
+build time):
 
-| Path in base-dev | What |
+| Path on the disk | What |
 |------------------|------|
-| `/system/bin/frida-server`         | stock frida-server (x86_64), pinned version. |
-| `/system/bin/frida-server-patched` | *optional* anti-detection build; drop one in to close the gum/gmain thread-name gap stock frida can't. |
-| `/system/bin/omni-magisk`          | Magisk multicall binary, used only as `omni-magisk resetprop …` (NOT a full Magisk install). |
-| `/system/etc/omni-devkit/manifest.json` | records versions, the frida port, and what was installed. |
+| `/frida-server`         | android-arm64 frida-server, pinned version. |
+| `/frida-server-patched` | *optional* anti-detection build; drop one in to close the gum/gmain thread-name gap stock frida can't. |
+| `/magisk.apk`           | the Magisk installer/manager APK. |
+| `/bin/magiskboot`, `/bin/magiskinit`, `/bin/magiskpolicy`, `/bin/busybox` | Magisk arm64 multicall binaries. |
+| `/bin/boot_patch.sh`, `/bin/util_functions.sh` | Magisk's boot-image patch scripts (used by `--patch-boot`). |
+| `/manifest.json` | records versions, the hidden frida port, the mount paths, and what was installed. |
 
-## Why KernelSU + Magisk *tools* (not full Magisk)
+## Why Magisk (not KernelSU)
 
-The Bliss base is already rooted with **KernelSU**. Stacking a full Magisk
-(patched boot ramdisk + its own su) on top on Android-x86 is a kernel-level
-conflict and routinely soft-bricks the image. So the dev base keeps KernelSU as
-the root provider and borrows only Magisk's userspace `resetprop` applet for
-prop-spoofing — the piece you actually need to defeat build-tag / verified-boot
-root checks — plus KernelSU's own per-app hiding for the target under test.
+The retired x86 dev base was rooted with KernelSU (already in the Bliss image).
+The arm LineageOS base ships **no root** (a `user` build), so the dev base roots
+it with **Magisk** (a patched boot in the dev system overlay), which is also the
+maintainer's documented root path for this image. Magisk brings its own hiding
+(Zygisk + DenyList, plus Shamiko) which is what `omni-hide` / `omni-magisk-setup`
+drive to hide root, the Magisk install itself, and frida from a target app.
 
-## Residual signals (be honest about these)
+## Notes / honest limits
 
-- This Bliss base already ships the classic root-detection props **clean**
-  (`ro.build.tags=release-keys`, `ro.boot.verifiedbootstate=green`,
-  `ro.debuggable=0`), and root is **KernelSU** (kernel-level, so `adb root`/`su`
-  work regardless of `ro.debuggable`). So the prop side looks stock by default.
-- SELinux is **Permissive** on this base (frida runs with no ptrace friction) —
-  which is itself detectable via `getenforce`.
-- Stock frida-server still names its worker threads `gmain` / `gum-js-loop` /
-  `pool-frida`. `omni-fridad` hides the *process* name and *port*, but not those
-  thread names — drop a patched `frida-server-patched` in to close that gap.
+- The boot patch (`omni build-dev-base --patch-boot`) is brick-risky and must be
+  verified on a real boot; without it these scripts have no `su` to run under.
+- SELinux is **Enforcing** on this LineageOS base (unlike the old Permissive
+  Bliss dev base) — frida-server runs fine under Magisk, but a target can still
+  read `getenforce`.
+- Stock frida-server still names its worker threads `gmain`/`gum-js-loop`/
+  `pool-frida`; `omni-fridad` hides the process name + port but not those thread
+  names — drop a patched `frida-server-patched` on the disk to close that gap.
 
-Edit a script here, then rebuild the base (`omni build-dev-base`) to ship the
-change; the base is immutable once built, exactly like the production bases.
+Edit a script here, then rebuild the disk (`omni build-dev-base`) to ship the
+change; the devkit disk is immutable once built, like the bases.

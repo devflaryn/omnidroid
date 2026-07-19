@@ -7,9 +7,21 @@
 *.raw
 images/
 
-# Per-account runtime state (overlays, data disks, logs)
+# Per-account runtime state (overlays, data disks, logs). Also covers
+# accounts/<name>/session.json, which holds a live .ROBLOSECURITY.
 accounts/
 work/
+
+# CREDENTIALS — a .ROBLOSECURITY cookie is full access to a Roblox account.
+# Never commit one. `omni login` writes cookies/<label>.json; `omni play
+# --token-file` reads a raw one.
+cookies/
+accounts.json
+cookie.txt
+cookies.txt
+*.cookie
+*cookie*.txt
+tokens/
 
 # Python
 __pycache__/

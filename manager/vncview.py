@@ -53,7 +53,7 @@ _KEYSYMS = {
 
 
 class RFBClient:
-    """Minimal RFB 3.x client. Maintains a BGRX framebuffer bytearray that a
+    """Minimal RFB 3.x client. Maintains an RGBX framebuffer bytearray that a
     Tk front-end reads. Thread model: recv loop in its own thread; sends
     (input + update requests) guarded by _wlock."""
 
@@ -61,7 +61,7 @@ class RFBClient:
         self.host, self.port = host, port
         self.sock = None
         self.width = self.height = 0
-        self.fb = bytearray()          # width*height*4, BGRX
+        self.fb = bytearray()          # width*height*4, RGBX
         self.name = ""
         self._wlock = threading.Lock()
         # The viewer is allowed to coalesce redraw notifications (`dirty`),
@@ -145,7 +145,7 @@ class RFBClient:
 
     def _resize(self, w, h):
         self.width, self.height = w, h
-        self.fb = bytearray(w * h * 4)           # BGRX, opaque black
+        self.fb = bytearray(w * h * 4)           # RGBX, opaque black
 
     def snapshot(self):
         """Return a consistent immutable framebuffer snapshot.
@@ -160,9 +160,17 @@ class RFBClient:
                     self.last_update_ns, self.update_count)
 
     def _set_pixel_format(self):
-        # 32bpp, depth 24, little-endian, true-colour, RGB shifts 16/8/0 ->
-        # in-memory bytes per pixel are B,G,R,x (BGRX) — matched by PIL's
-        # "BGRX" raw decoder for correct colours on any QEMU build.
+        # 32bpp, depth 24, little-endian, true-colour. Do NOT change these shift
+        # values without re-running the ground-truth check below — QEMU DOES
+        # honour this request, so the shifts and the frame decoder are a matched
+        # pair. This exact request (16/8/0) combined with a PIL "RGBX" decode was
+        # VERIFIED against `adb screencap` ground truth: exact match (mean channel
+        # diff 0.00). The old code paired the SAME request with a "BGRX" decode,
+        # which is R/B-swapped (diff ~23) — the "red looks purple / colours a bit
+        # off" bug. (Changing these shifts to 0/8/16 was measured to make QEMU
+        # emit a different byte order that RGBX then decodes WRONG, i.e. QEMU is
+        # honouring the request, not ignoring it — hence "leave the shifts, fix
+        # the decoder".)
         pf = struct.pack("!BBBB HHH BBB xxx",
                          32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
         self._send(struct.pack("!Bxxx", _SET_PIXEL_FORMAT) + pf)
@@ -384,7 +392,7 @@ def run_viewer(host, port, title):
             try:
                 width, height, frame, _, _ = client.snapshot()
                 img = Image.frombytes("RGB", (width, height), frame,
-                                      "raw", "BGRX")
+                                      "raw", "RGBX")
                 photo = ImageTk.PhotoImage(img)
                 label.configure(image=photo)
                 state["photo"] = photo           # keep a ref (Tk GCs images)

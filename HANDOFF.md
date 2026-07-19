@@ -228,32 +228,55 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 - **Current fleet:** accounts alice, bob, charlie, dave, erin — all on **v5**,
   all DeviceOwner (lockdown active), data preserved through every migration.
 
-### `dev` base — the frida/debug remaster (2026-07-13, NEW; do not confuse terms)
+### `dev` base — the arm devkit disk (2026-07-14, REPLACES the x86 base-dev)
 Terminology clash to watch: above, "dev base" means *a base without a baked
-game* (v5). The **NEW `dev` base** is a different thing — the reverse-engineering
-image `base-dev.qcow2`, built by **`omni build-dev-base`** (see `DEV-BASE.md`).
+game* (v5). The **`dev` base** here is a different thing — the reverse-
+engineering environment, built by **`omni build-dev-base`** (see `DEV-BASE.md`).
 
-- It is `base_x86` + a devkit baked into `/system`: **frida-server 17.15.4**,
-  `omni-fridad` (hidden frida launch: custom port 27142 + randomized process
-  name), `omni-hide` (root/frida hiding: Magisk `resetprop` prop-spoofs +
-  KernelSU per-app denylist), `omni-magisk` (the `resetprop` applet only — NOT a
-  full Magisk install), an `omni_fridad` init service (disabled), a manifest.
-- **`base_x86` / `base_arm` are UNCHANGED** (byte-identical, same filenames).
-  `base-dev.*` is add-only; **`current_base` stays `x86`** — building the dev
-  base never repoints it. Selected ONLY via `create --base dev` (agent:
-  `ensure_emulator_running(dev=true)` / `OMNI_USE_DEV_BASE=1`).
-- **Root = KernelSU** (already in the base — that's why `adb root`/remount work;
-  it is kernel-level, so it does NOT depend on `ro.debuggable`). Full Magisk over
-  KernelSU on x86 soft-bricks, so we ship only Magisk's `resetprop` for hiding.
-  SELinux is **Permissive** on this Bliss build (frida works with no ptrace
-  friction). Measured on a booted dev account: the base ALREADY ships
-  `ro.build.tags=release-keys`, `ro.boot.verifiedbootstate=green`,
-  `ro.debuggable=0` (so `omni-hide`'s resetprop step is mostly "already clean").
-  Residuals (documented, honest): Permissive is itself detectable; KernelSU su/
-  manager artifacts remain; stock frida thread names remain unless a
-  `frida-server-patched` is dropped in.
+**It is no longer a separate flattened image.** It is the shared, immutable
+`base_arm` **plus one extra virtio disk** (`base_arm_devkit.qcow2`, attached to
+dev accounts as **vdc**) carrying the toolkit. `base_arm.qcow2` is never
+modified. The old x86 `base-dev.qcow2` (frida/Magisk baked into `/system`) and
+all its machinery were **deleted** (2026-07-14).
+
+- The devkit disk carries: android-**arm64** **frida-server 17.15.4**, the
+  **Magisk** APK + its extracted arm64 `magiskboot`/`magiskinit`/… + Magisk's
+  `boot_patch.sh`, and the `omni-*` scripts (`omni-fridad` hidden frida launch
+  custom port 27142 + random name; `omni-hide` DenyList + resetprop hiding;
+  `omni-frida-stop`; `omni-magisk-setup` one-time Zygisk/DenyList enable). Built
+  entirely host-side (`mke2fs -d`, rootless, cross-platform).
+- **`base_x86` / `base_arm` are UNCHANGED**; the devkit is add-only;
+  **`current_base` stays `x86`**. Selected ONLY via `create --base dev` (agent:
+  `ensure_emulator_running(dev=true)` / `OMNI_USE_DEV_BASE=1`). A dev account =
+  the arm trio + a cheap COW overlay of the devkit disk (vdc), flagged
+  `dev:true`; `_devkit_activate` mounts vdc + stages the tools on start.
+- **Root = Magisk (user-chosen) — WORKING + VERIFIED (2026-07-14).** The arm
+  LineageOS base is a `user` build (`adb root` DISABLED, no su-addon), so root
+  comes ONLY from a **Magisk-patched boot**. `build-dev-base --patch-boot` roots
+  the *dev system overlay's* boot (`vda6`) via an OFFLINE magiskboot patch
+  (raw-export → GPT → run Magisk `boot_patch.sh` with the full arm64 toolset in a
+  throwaway guest → write back → re-import), keeping `base_arm.qcow2` immutable.
+  Verified: guest boots with `magiskd` as root + Magisk app auto-installed; `su`
+  → `uid=0(root) context=u:r:magisk:s0`. Hiding (root + Magisk + frida) is Magisk
+  Zygisk/DenyList (+ Shamiko). SELinux is **Enforcing** on this base.
+- **Two headless-root facts baked in:** (1) `su` is NOT on `$PATH` (all-read-only
+  base → Magisk keeps it at `/debug_ramdisk/su`); engine + agent probe it
+  (`resolve_su`/`_resolve_su`). (2) MagiskSU prompts (GUI) the first time, which
+  hangs headless — so the grant is baked into a dev `/data` template,
+  **`base_arm_devdata.qcow2`** (shell granted Forever + `root_access=3` + Zygisk +
+  DenyList), a matched FBE pair with `base_arm_devsystem.qcow2`. Dev accounts use
+  it → **root works from first boot, no prompt.** The current images_dir has the
+  rooted `base_arm_devsystem.qcow2` + `base_arm_devkit.qcow2` +
+  `base_arm_devdata.qcow2`; `omni create <n> --base dev` gives a rooted dev
+  account.
+- **arm64-native win**: no libndk translation, so frida native Interceptor/
+  Stalker hooks of the app's own arm64 `.so` now work.
 - Rebuild to change the devkit (immutable, like every base). Scripts live in
   `devkit/`; binaries are fetched at build time.
+- **Bundled-engine note**: `omni-agent/tools/omnidroid/omnidroid.exe` (Windows)
+  is stale — its `configs/paths.json` still lists the deleted x86 base-dev.
+  On the Mac the agent drives the source `manager/omni.py` (dev fallback), so
+  this doesn't bite here; rebuild the Windows bundle before shipping.
 
 ## ARM64 / Apple Silicon (proof-of-life, 2026-07-08)
 **Status: PROOF-OF-LIFE ONLY. `base_arm` NOT built yet** — that is its own

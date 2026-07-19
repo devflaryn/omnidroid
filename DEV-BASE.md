@@ -1,204 +1,171 @@
-# omnidroid dev/prod base split — `base-dev.qcow2`
+# omnidroid dev base — the arm "devkit disk" (`base_arm_devkit.qcow2`)
 
-The x86 line is split into two registered bases that live side by side in the
-images dir. **Nothing about the production base changed** — same filename, same
-config, same behavior. The dev base is a separate, opt-in image.
+The dev/debug base is **not a separate flattened image** anymore. It is the
+**shared, immutable `base_arm` plus one extra virtio disk** attached to dev
+accounts as **vdc**: `base_arm_devkit.qcow2`. That disk carries the whole
+reverse-engineering toolkit. `base_arm.qcow2` is **never modified** — a dev
+account is an ordinary arm account (system-overlay + data + efivars trio) with
+the devkit disk added, exactly like accounts already carry a separate `/data`
+disk.
 
-| Base tag | Disk | Shipped? | Contents |
-|----------|------|----------|----------|
-| `x86` (production) | `base_x86.qcow2` | **Yes** | Bliss OS + kiosk, exactly as before. Untouched. |
-| `arm` (production) | `base_arm.qcow2` | **Yes** | LineageOS arm64 pair, as before. Untouched. |
-| `dev` (dev/debug)  | `base-dev.qcow2` | **No**  | `base_x86` + a frida / root-hiding **devkit** baked into `/system`. Only `omni-agent` ever boots it. |
+The retired x86 `base-dev.qcow2` (frida/Magisk baked into `/system`, x86_64
+under libndk translation) is **gone**. The arm base runs **arm64 natively** — no
+translation — so native frida hooks (Interceptor/Stalker) now work too.
 
-`current_base` stays `x86`. Building or registering the dev base never changes
-it, so every shipped account keeps booting the production base. The dev base is
-selected **only** explicitly: `omni create <name> --base dev` (or, from the
-agent, `ensure_emulator_running(dev=true)` / `OMNI_USE_DEV_BASE=1`).
+| Base tag | Disks | Shipped? | Contents |
+|----------|-------|----------|----------|
+| `x86` (production) | `base_x86.qcow2` (+kernel/initrd) | **Yes** | Bliss OS + kiosk. Untouched. |
+| `arm` (production) | `base_arm.qcow2` + provisioned trio | **Yes** | LineageOS arm64 + kiosk. Untouched. |
+| `dev` (dev/debug) | `base_arm` + **`base_arm_devkit.qcow2` (vdc)** + a rooted dev system overlay | **No** | frida-server (arm64) + Magisk + omni tools. Only `omni-agent` boots it. |
+
+`current_base` is **never** changed by building the dev base. It is selected
+**only** explicitly: `omni create <name> --base dev` (agent:
+`ensure_emulator_running(dev=true)` / `OMNI_USE_DEV_BASE=1`).
 
 ## Building it
 
 ```bash
-omni build-dev-base                 # frida (pinned) + Magisk resetprop applet
-omni build-dev-base --json          # machine-readable result
+omni build-dev-base                 # build the devkit disk + register 'dev' (no root yet)
+omni build-dev-base --json
 omni build-dev-base --frida-version 17.15.4 --frida-port 27142
-omni build-dev-base --no-magisk     # skip the resetprop applet
+omni build-dev-base --no-magisk     # frida only, no Magisk (no root/hiding)
+omni build-dev-base --patch-boot    # ALSO Magisk-patch the boot to ROOT it (see below)
 ```
 
-It reuses the exact `rebuild-base` pipeline shape: boot a throwaway builder on
-the **pristine** `base_x86` (never `current_base`), `adb root` + `mount -o
-remount,rw /`, inject the devkit into `/system`, flatten the overlay into
-`base-dev.qcow2` (+ copy the x86 kernel/initrd to `base-dev.kernel` /
-`base-dev.initrd.img`), and register the `dev` tag. `base_x86` is only ever read
-(overlay-backed), so the production base cannot be modified by this command.
+What `build-dev-base` does (all host-side, **no guest boot, no root, cross-
+platform**):
 
-The build is idempotent: re-running rebuilds `base-dev.qcow2` from a fresh
-`base_x86` overlay. Bases are immutable once accounts reference them — to change
-the devkit, rebuild rather than editing in place.
+1. **Stages the toolkit** into a directory: the android-**arm64** frida-server
+   (xz→ELF), the **Magisk** APK (the release build, not `app-debug.apk`) + its
+   extracted arm64 `magiskboot`/`magiskinit`/`magisk`/`init-ld`/`magiskpolicy`/
+   `busybox` + `boot_patch.sh`/`util_functions.sh`/`stub.apk`, the LF-normalized
+   `omni-*` scripts, and a `manifest.json`.
+2. **Builds `base_arm_devkit.qcow2`** — a populated ext4 image via `mke2fs -d`
+   (rootless, works on macOS/Linux/Windows-arm64) → `qemu-img convert` to qcow2.
+   This is the extra vdc disk. **~256 MiB.**
+3. **Creates `base_arm_devsystem.qcow2`** — a copy of the provisioned arm system
+   overlay (thin, still COW-backed by `base_arm.qcow2`). This is where the
+   Magisk-patched (rooted) boot will live. `base_arm.qcow2` is only ever read.
+4. **Registers the `dev` base** in `configs/paths.json` (arm-uefi + `devkit`).
+   `current_base` is left unchanged.
 
-## What gets baked into `/system` (dev base only)
+Downloads use `curl` (system cert store) with a urllib fallback, so a fresh
+python.org install (no bundled CA certs) still works.
+
+## What lands on the devkit disk
 
 Source for the scripts is `devkit/` (see `devkit/README.md`); binaries are
 fetched at build time.
 
-| Path | What |
-|------|------|
-| `/system/bin/frida-server` | stock frida-server (x86_64), pinned version. |
-| `/system/bin/frida-server-patched` | *optional* anti-detection build — drop one in and `omni-fridad` prefers it. |
-| `/system/bin/omni-fridad` | start frida-server **hidden**: custom loopback port (not 27042) + randomized process name. |
-| `/system/bin/omni-frida-stop` | stop the devkit frida-server. |
-| `/system/bin/omni-hide` | best-effort hide root+frida from a target app. |
-| `/system/bin/omni-magisk` | Magisk multicall binary, used only as `omni-magisk resetprop …`. |
-| `/system/etc/init/omni-devkit.rc` | `omni_fridad` init service (DISABLED by default). |
-| `/system/etc/omni-devkit/manifest.json` | versions, frida port, what was installed. |
+| Path on the disk | What |
+|------------------|------|
+| `/frida-server` | android-**arm64** frida-server, pinned version. |
+| `/frida-server-patched` | *optional* anti-detection build — drop one in and `omni-fridad` prefers it. |
+| `/magisk.apk` | the Magisk installer/manager APK (also used to root the boot). |
+| `/bin/magiskboot`, `/bin/magiskinit`, `/bin/magiskpolicy`, `/bin/busybox` | Magisk arm64 multicall binaries. |
+| `/bin/boot_patch.sh`, `/bin/util_functions.sh` | Magisk's boot-image patch scripts. |
+| `/omni-fridad` | start frida-server **hidden** (custom loopback port, randomized process name). |
+| `/omni-frida-stop` | stop the devkit frida-server. |
+| `/omni-hide` | hide root + Magisk + frida from a target app (Magisk DenyList + resetprop). |
+| `/omni-magisk-setup` | one-time: enable Zygisk + Enforce DenyList (+ Shamiko/manager if present). |
+| `/manifest.json` | versions, hidden frida port, mount paths. |
 
-## Root & hiding model — KernelSU, not full Magisk
+## How a dev account uses it
 
-The Bliss base is already rooted with **KernelSU**. Installing a full Magisk
-(patched boot ramdisk + its own `su`) on top on Android-x86 is a kernel-level
-conflict that routinely soft-bricks the image. So the dev base:
+- `omni create <name> --base dev` copies the arm trio **and** creates a cheap
+  per-account COW overlay of the devkit disk (`accounts/<name>/devkit.qcow2`),
+  wired into QEMU as **vdc**. The account is flagged `"dev": true`.
+- On `start`/`resume`, the engine **activates** the devkit (`_devkit_activate`):
+  mounts vdc **read-only** at `/mnt/omni-devkit` and stages the exec-capable copy
+  at `/data/local/tmp/omni-devkit` (the tools all run as **root via Magisk `su`**;
+  `/mnt` is a noexec tmpfs, so binaries are read from the mount but never
+  exec'd there directly). If the boot is not yet rooted, activation prints a
+  clear "not rooted — run `--patch-boot`" note and does not fail the start.
 
-- keeps **KernelSU** as the root provider (the base already had it — that's why
-  `adb root` and `mount -o remount,rw /` work), and
-- borrows only Magisk's **`resetprop` applet** for the prop-spoofing you
-  actually need to defeat build-tag / verified-boot root checks, plus KernelSU's
-  own per-app denylist for the specific app under test.
+## Root & hiding model — Magisk (user-chosen)
 
-That is the honest reading of "use magisk to hide root and frida": the hiding
-tools ship, without the risky full-Magisk-on-KernelSU install.
+The LineageOS arm base is a **`user` build**: `adb root` is disabled and there is
+no su-addon, so root comes **only from a Magisk-patched boot**. `--patch-boot`
+roots the **dev system overlay's** boot partition (`boot` = `vda6`), so:
 
-### What the base already gets right (measured on a booted dev account)
+- `base_arm.qcow2` stays byte-identical — the patch lives in
+  `base_arm_devsystem.qcow2` (still COW on the immutable base).
+- root is **Magisk `su`** (the whole devkit runs as root via `su 0`).
+- hiding is Magisk's own machinery: `omni-magisk-setup` turns on **Zygisk +
+  Enforce DenyList** (and installs **Shamiko** if you drop `Shamiko.zip` into the
+  disk's `/modules`, which also hides the Magisk app itself); `omni-hide <pkg>`
+  adds the target to the **DenyList** (Magisk unmounts its modifications + hides
+  su/daemon for that app) and resetprop-spoofs the classic root/verified-boot
+  props. frida is hidden by `omni-fridad` (custom port + randomized process name).
 
-- The classic prop-based root/tamper "tells" are **already clean** in this Bliss
-  base: `ro.build.tags=release-keys`, `ro.boot.verifiedbootstate=green`,
-  `ro.debuggable=0`. So a detector reading those sees a stock-looking device
-  out of the box — `omni-hide`'s resetprop step is mostly a no-op here (it
-  reports "already clean") and exists for props a future base doesn't pre-set.
-- **Root is KernelSU (kernel-level)**, so `adb root` and app `su` work
-  regardless of `ro.debuggable` — normalizing build props never costs you root.
+### The boot patch (`--patch-boot`) — how it works
 
-### Honest residual signals
+`_patch_dev_boot` roots the dev overlay **offline** (no prior root needed, cross-
+platform — no `qemu-nbd`/libguestfs): export the overlay to raw (merged through
+its base backing), pull `vda6` (the `boot` partition) out via a minimal GPT
+reader, run Magisk's `boot_patch.sh` (with the full arm64 toolset: `magiskboot`,
+`magiskinit`, `magisk`, `init-ld`, `stub.apk`) on that boot **file** inside a
+throwaway arm guest (it patches a file — no in-guest root needed), write the
+patched image back at the same offset, and re-import to qcow2. base_arm.qcow2 is
+never touched.
 
-- SELinux on this Bliss base is **Permissive**, so frida-server runs without
-  ptrace friction — but a target can read `getenforce` and treat Permissive as a
-  tamper signal. (Forcing Enforcing risks breaking the guest; left as-is.)
-- KernelSU still leaves its own artifacts (the `su` implementation, the manager
-  package) that a determined detector can probe; `omni-hide` requests KernelSU's
-  per-app umount/denylist for the target when a `ksud` control path exists.
-- Stock frida-server still names worker threads `gmain` / `gum-js-loop` /
-  `pool-frida`. `omni-fridad` hides the *process name* and *port* but not those
-  thread names — drop a patched `frida-server-patched` in to close that gap.
+It is OFF by default (editing boot is inherently risky) and needs real disk
+headroom (the raw export is ~the disk's virtual size, ~5 GiB); it refuses to run
+and leaves the overlay UNROOTED if there isn't enough free space.
+
+**VERIFIED WORKING (2026-07-14, arm64 LineageOS 23.2 under HVF):** after the
+patch the guest boots with `magiskd` running as root and the Magisk manager app
+auto-installed; `su` grants `uid=0(root) … context=u:r:magisk:s0`.
+
+### Headless su + the reproducible dev `/data` template
+
+Two gotchas that the build handles for you:
+
+1. **`su` is not on `$PATH`.** This LineageOS is all-read-only, so Magisk can't
+   symlink `su` into a PATH dir — it lives in Magisk's own tmpfs at
+   **`/debug_ramdisk/su`**. The engine + agent probe `/debug_ramdisk/su` →
+   `/sbin/su` → `su` (`resolve_su` / `_resolve_su`), so callers never hardcode it.
+2. **MagiskSU prompts for approval** (a GUI dialog) the first time a uid requests
+   root — which hangs a headless run. So root is granted **once** through the app
+   and baked into a dev `/data` template: **`base_arm_devdata.qcow2`** is a copy
+   of the provisioned `/data` where the Magisk policy DB already grants the adb
+   shell **Forever**, with `root_access=3` + **Zygisk + Enforce DenyList** on.
+   Dev accounts use it (config `dev.data`), so **root works headlessly from first
+   boot — no prompt, no taps**. It is a matched FBE pair with
+   `base_arm_devsystem.qcow2` (same `/metadata` keys), so all dev accounts share
+   it safely.
+
+Regenerating the template (only if you rebuild the rooted boot from scratch):
+boot a dev account, install the full Magisk apk (`pm install`), trigger `su`,
+tap **GRANT (Forever)** on the `SuRequestActivity` dialog (drive it over VNC / via
+`adb shell input tap`), set `root_access=3`/`zygisk=1`/`denylist=1` via
+`magisk --sqlite`, then capture that account's `data.qcow2` →
+`base_arm_devdata.qcow2`.
+
+Verify at any time:
+```bash
+omni create dbg --base dev
+omni start dbg --wait
+omni adb dbg -- shell /debug_ramdisk/su 0 id     # expect uid=0(root)
+```
 
 ## Using it
 
 ```bash
-# omnidroid, directly:
-omni create dbg --base dev            # a dev account (frida baked in)
+# omnidroid, directly (tools run as root via the resolved su):
+omni create dbg --base dev
 omni start dbg --wait
-omni adb dbg -- root
-omni adb dbg -- shell omni-fridad     # frida-server up, hidden, custom port
-omni adb dbg -- shell omni-hide com.target.app
+omni adb dbg -- shell /debug_ramdisk/su 0 /data/local/tmp/omni-devkit/omni-fridad
+omni adb dbg -- shell /debug_ramdisk/su 0 /data/local/tmp/omni-devkit/omni-hide com.target.app
 
-# omni-agent:
+# omni-agent (handles su resolution + activation for you):
 ensure_emulator_running(dev=true)     # or export OMNI_USE_DEV_BASE=1
 ensure_frida_server()                 # -> frida -H 127.0.0.1:<forwarded port>
 hide_root_from_app("com.target.app")
 ```
 
-The dev base is a superset of the production x86 base, so everything else
-(install, kiosk launch, screenshots, logcat, capture) works identically.
-
-## Always-on auto-screenshots (dev base only)
-
-A dev instance **captures screenshots automatically the whole time it is up** —
-you never toggle it on. The moment `omni start`/`omni resume` finishes booting a
-dev account, the engine spawns a continuous recorder that observes the VNC
-framebuffer and drops a keyframe on **every big on-screen change** — a
-black→loading flip (even one shown for a few milliseconds) is always caught,
-while a spinning loader stays below the change threshold and is ignored, so you
-don't drown in near-duplicate frames. It runs for the instance's whole lifetime
-and is stopped on `omni stop`/`omni remove`. This is **dev-base only**: the
-recorder never starts on `x86`/`arm`.
-
-Output goes to **`$OMNI_AUTOCAP_DIR`** when set (omni-agent points that at its
-`/workspace/screenshots/auto`), else `accounts/<name>/autocap`.
-
-```bash
-omni create dbg --base dev
-omni start dbg --wait          # <- recorder auto-starts here (prints "auto-screenshots ON")
-omni autocap dbg --status      # {running:true, out_dir:...}
-#   ... drive the app; frames appear live in the out dir ...
-omni stop dbg                  # <- recorder is finalized + stopped with the instance
-```
-
-`omni autocap <name>` manages it explicitly when needed (all idempotent):
-
-```bash
-omni autocap dbg --ensure      # start it if not already running (never stacks two)
-omni autocap dbg --status
-omni autocap dbg --stop
-omni autocap dbg --restart --out DIR   # repoint the feed
-```
-
-The underlying recorder is `omni capture <name> --auto` (also runnable directly
-for a manual, explicitly-scoped feed; refuses non-dev bases with
-`dev_base_required`). Properties:
-
-- **Live**: `metadata.json` is rewritten atomically after every kept keyframe, so
-  a reader (omni-agent) sees frames as they land; `metadata.running` flips to
-  `false` once finalized (logcat + crash/exit verdict folded in).
-- **Timestamped filenames**: `frame_<index>_t<elapsed>ms_+<gap-since-previous>ms_w<HHMMSS_mmm>.png`
-  — the gap tells an *instant* transition (+40ms) from one that *took time*
-  (+62665ms) straight off the filename.
-- **High cap**: an always-on session keeps up to 5000 keyframes (vs 240 for a
-  bounded `--duration` window).
-- **Stops on**: `omni stop`/`omni autocap --stop`, a `STOP` file in the out dir,
-  `--max-seconds`, SIGINT/SIGTERM, or the instance powering off (VNC closes).
-
-From `omni-agent` it is fully automatic: `ensure_emulator_running(dev=True)`
-points the recorder at `/workspace/screenshots/auto/`, and the agent just calls
-**`read_auto_screenshots`** to read the accumulating feed — no start/stop.
-
-## Detection test — Roblox 2.726 (Byfron/Hyperion), 2026-07-13
-
-Validated against `com.roblox.client` v2.726.1142 (arm64-only, via libndk), one of
-the most aggressive mobile anti-tamper stacks, on a fresh `dev` account:
-
-- **Not flagged.** Roblox boots to its normal login screen (Create Account /
-  Sign In) — it does not refuse to boot and does not black-screen, with
-  KernelSU root + the frida-server binary + `omni-magisk` all present.
-- **Hidden frida-server undetected.** With `omni-fridad` running frida on the
-  custom port, a naive scan finds nothing: no `:27042`, no process named
-  `frida-server`, no `/data/local/tmp/frida-server`. Roblox behaved identically
-  to frida-off (same process lifecycle, no `frida`/`hyperion`/`byfron`/`tamper`
-  lines in `logcat -b all`).
-- **Attach + hook works.** Host frida (17.15.4) connected through the forwarded
-  hidden port, enumerated the guest (91 procs), **attached to Roblox and ran an
-  in-process script** (`Process.enumerateModules()` → 321 modules, arch x64) —
-  Roblox stayed alive and did not self-terminate.
-- **An ANR ("Roblox isn't responding") on a warm force-stop+relaunch is emulator
-  performance, NOT detection** — it reproduces identically with frida OFF (it's a
-  5s input-dispatch timeout on the heavy `ActivitySplash` re-init). A cold launch
-  (the agent's `run_apk_test_session` path) reaches the responsive login cleanly.
-
-### Honest limits of this result
-
-- Tested at the **login/splash** stage (no account, not inside an experience).
-  Byfron/Hyperion's deepest checks engage when joining a game; that frontier was
-  not exercised.
-- frida attaches to the **x86_64 native** app process; the arm64 game code runs
-  under libndk translation, so hooking translated arm64 frames is more involved
-  than hooking native x86_64.
-
-### Hardening ladder (if a tougher target ever does flag it)
-
-1. **Perf:** cold-launch + a higher mode (`--mode playable`, more `--mem`) to
-   avoid warm-relaunch ANRs — not a detection fix, just stability.
-2. **Root:** the base already presents clean props (release-keys / green /
-   `ro.debuggable=0`) and hides via KernelSU. For per-app invisibility against a
-   determined detector, add **ZygiskNext** (Zygisk for KernelSU) + **Shamiko**
-   (denylist) as KernelSU modules and denylist the target package.
-3. **Active-frida detection** (in-process gum/gmain thread names): needs a
-   patched frida — drop a build at `/system/bin/frida-server-patched` and
-   `omni-fridad` prefers it. Note the public patched forks (strongR-frida,
-   Florida) ship **arm/arm64 only**, so for this x86_64 guest that binary has to
-   be built from source; stock frida (used here) was not detected at login.
+The dev base is a superset of the production arm base, so everything else
+(install, kiosk launch, screenshots, logcat, capture, always-on auto-
+screenshots) works identically. Auto-screenshots remain a **dev-base-only**
+feature (now detected by the account's `dev` flag / the vdc disk, not an x86
+base tag).

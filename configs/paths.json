@@ -24,31 +24,39 @@
     },
     "arm": {
       "type": "arm-uefi",
-      "base_disk": "base_arm.qcow2",
+      "base_disk": "base_arm_v2.qcow2",
       "system": "base_arm_system.qcow2",
       "data": "base_arm_data.qcow2",
       "efivars": "base_arm_efivars.fd",
       "src": "https://github.com/jqssun/android-lineage-qemu (LineageOS 23.2 arm64, virtio_arm64only)",
-      "notes": "auto-registered arm64/UEFI base (LineageOS 23.2, kiosk+device-owner provisioned matched pair)"
+      "notes": "arm64/UEFI base (LineageOS 23.2). v2 = branded + silent + insecure_adb + Roblox baked in. base_arm.qcow2 (v1) is kept because existing account overlays are still COW-backed by it.",
+      "version": 2,
+      "changelog": {
+        "1": "pristine LineageOS 23.2 arm64 (jqssun virtio) + kiosk/device-owner provisioned pair",
+        "2": "v1 + Omni loading screen (product/media), silent boot (quiet/loglevel=0), GRUB menu hidden (no LineageOS logo/countdown), androidboot.insecure_adb=1 (adb reachable on a fresh boot - without it every new account stalls on 'Allow USB debugging?'), and Roblox pre-installed as a system app in /product/app/Roblox with its arm64 native libs (2026-07-17)"
+      }
     },
     "dev": {
-      "type": "x86-bliss",
-      "disk": "base-dev.qcow2",
-      "kernel": "base-dev.kernel",
-      "initrd": "base-dev.initrd.img",
-      "src": "/android-2024-10-11",
-      "notes": "dev/debug base: base_x86 + frida 17.15.4 + root/frida hiding devkit (omni-agent only; NOT shipped). hidden frida port 27142.",
-      "devkit": {
+      "type": "arm-uefi",
+      "base_disk": "base_arm.qcow2",
+      "system": "base_arm_devsystem_v2.qcow2",
+      "data": "base_arm_devdata.qcow2",
+      "efivars": "base_arm_efivars.fd",
+      "devkit": "base_arm_devkit.qcow2",
+      "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
+      "notes": "arm dev base: base_arm + base_arm_devkit.qcow2 (vdc) with frida 17.15.4 (arm64) + Magisk [root pending: --patch-boot]. omni-agent only; NOT shipped. hidden frida port 27142. devsystem v2: same branding/silent/insecure_adb as base_arm v2 (the dev system image is STANDALONE, so it does not inherit the shared base's branding and must be branded separately).",
+      "devkit_manifest": {
         "frida_version": "17.15.4",
         "frida_port": 27142,
-        "magisk_tools": true,
+        "magisk": true,
         "magisk_version": "v30.7",
+        "rooted": false,
         "tools": [
           "frida-server",
           "omni-fridad",
           "omni-frida-stop",
           "omni-hide",
-          "omni-magisk"
+          "omni-magisk-setup"
         ]
       }
     }
@@ -62,5 +70,7 @@
     "vnc_port_start": 18001
   },
   "notes": "Base images are immutable once any account references them. They live in the external data dir (images_dir; Windows C:/Users/berat/OmniImages, Linux ~/OmniImages) and are NEVER committed. base_x86 + base_arm are the two canonical bases; the host architecture selects between them.",
-  "base_game": {}
+  "base_game": {
+    "arm": "com.roblox.client"
+  }
 }

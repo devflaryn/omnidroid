@@ -1,30 +1,47 @@
 #!/system/bin/sh
-# omni-fridad — start the baked frida-server in a lightly-hidden mode.
+# omni-fridad — start the devkit frida-server (android-arm64) in a hidden mode.
 #
-# This ships ONLY inside base-dev.qcow2 (the dev/debug base). It is NEVER
-# present in the shipped production bases (base_x86 / base_arm).
+# This ships ONLY on the dev devkit disk (base_arm_devkit.qcow2, attached as
+# vdc). It is NEVER present in the shipped production bases (base_x86/base_arm).
 #
-# Hardening applied vs. a naive `frida-server` launch:
-#   * binds a CUSTOM loopback port (not the well-known 27042), so a port scan
-#     for 27042 misses it;
-#   * execs a RANDOMLY-NAMED copy from a private tmp dir, so `ps` /
-#     /proc/<pid>/comm do not show the string "frida-server";
-#   * prefers a patched binary at /system/bin/frida-server-patched if a tester
-#     drops one in (patched builds also rename the internal gum/gmain threads,
-#     closing the residual thread-name detection that stock frida cannot).
+# The arm base runs arm64 NATIVELY (no libndk translation), so this frida-server
+# is the android-arm64 build and native Interceptor/Stalker hooks of the app's
+# own arm64 code work (unlike the retired x86 dev base).
 #
-# Root is required (run under `adb root` or `su`). Port is read from the devkit
-# manifest so the host tooling and this script always agree.
-DEVKIT=/system/etc/omni-devkit
+# Hardening vs. a naive `frida-server` launch:
+#   * binds a CUSTOM loopback port (not the well-known 27042);
+#   * execs a RANDOMLY-NAMED copy from a private tmp dir, so ps / comm never
+#     show "frida-server";
+#   * prefers a patched binary at $DEVKIT/frida-server-patched if present
+#     (patched builds also rename the internal gum/gmain threads).
+#
+# Root is required (Magisk su). The port + frida path come from the devkit
+# manifest so host tooling and this script always agree. Magisk's su is not in
+# $PATH on this read-only base, so self-elevate via the known su locations.
+if [ "$(id -u)" != 0 ]; then
+    for SU in /debug_ramdisk/su /sbin/su su; do
+        "$SU" 0 true 2>/dev/null && exec "$SU" 0 "$0" "$@"
+    done
+    echo "omni-fridad: ERROR need Magisk root (su)" >&2; exit 1
+fi
+
+DEVKIT="${OMNI_DEVKIT:-/data/local/tmp/omni-devkit}"
+MOUNT="${OMNI_DEVKIT_MOUNT:-/mnt/omni-devkit}"
 MANIFEST="$DEVKIT/manifest.json"
+[ -f "$MANIFEST" ] || MANIFEST="$MOUNT/manifest.json"
 
 PORT="$(sed -n 's/.*"frida_port"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$MANIFEST" 2>/dev/null | head -n1)"
 [ -z "$PORT" ] && PORT=27142
 
-SRV=/system/bin/frida-server
-[ -x /system/bin/frida-server-patched ] && SRV=/system/bin/frida-server-patched
-if [ ! -x "$SRV" ]; then
-    echo "omni-fridad: ERROR frida-server binary not found at $SRV" >&2
+# Locate the frida-server binary: patched drop-in first, then the devkit copy,
+# then the read-only mount.
+SRV=""
+for cand in "$DEVKIT/frida-server-patched" "$MOUNT/frida-server-patched" \
+            "$DEVKIT/frida-server" "$MOUNT/frida-server"; do
+    [ -f "$cand" ] && { SRV="$cand"; break; }
+done
+if [ -z "$SRV" ]; then
+    echo "omni-fridad: ERROR frida-server not found under $DEVKIT or $MOUNT" >&2
     exit 1
 fi
 
@@ -45,15 +62,15 @@ NAME="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d - | cut -c1-10)"
 [ -z "$NAME" ] && NAME="sysd$$"
 BIN="$WORK/.$NAME"
 cat "$SRV" > "$BIN" 2>/dev/null && chmod 755 "$BIN" 2>/dev/null
-[ -x "$BIN" ] || BIN="$SRV"   # fall back to the real path if the copy failed
+[ -x "$BIN" ] || BIN="$SRV"   # fall back to the source path if the copy failed
 
-# Detach so it survives the adb shell exiting.
+# Detach so it survives the shell exiting.
 nohup "$BIN" -l "127.0.0.1:$PORT" >/dev/null 2>&1 &
 PID=$!
 sleep 1
 if kill -0 "$PID" 2>/dev/null; then
-    echo "omni-fridad: frida-server up as '.$NAME' on 127.0.0.1:$PORT (pid $PID)"
+    echo "omni-fridad: frida-server (arm64) up as '.$NAME' on 127.0.0.1:$PORT (pid $PID)"
     exit 0
 fi
-echo "omni-fridad: ERROR frida-server exited immediately (check SELinux: $(getenforce 2>/dev/null))" >&2
+echo "omni-fridad: ERROR frida-server exited immediately (SELinux: $(getenforce 2>/dev/null))" >&2
 exit 1
