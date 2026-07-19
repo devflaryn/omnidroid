@@ -134,6 +134,25 @@ def dev_mode_enabled():
         "1", "true", "yes", "on")
 
 
+def _truthy_env(name):
+    return str(os.environ.get(name, "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _dev_mode_for_play(args):
+    """Whether `omni start` should target the DEV base for a NEW instance.
+
+    This is SELECTION (use dev), which is distinct from ACCESS (may use dev,
+    i.e. OMNI_DEV_MODE / dev_mode_enabled). The agent sets OMNI_DEV_MODE=1 just to
+    UNLOCK the dev base, but still runs production by default — so dev selection
+    must NOT be implied by OMNI_DEV_MODE, only by an explicit --dev or the
+    dedicated OMNI_USE_DEV_BASE 'default to dev' env. assert_dev_allowed still
+    refuses dev to a caller that has not unlocked it."""
+    if getattr(args, "dev", False):
+        return True
+    return _truthy_env("OMNI_USE_DEV_BASE")
+
+
 def visible_bases(cfg_or_raw):
     """The bases this caller is allowed to see: everything, minus dev bases when
     dev mode is off."""
@@ -1958,17 +1977,17 @@ def _devkit_activate(acct, label):
 
 
 def cmd_start(args):
-    """Boot (or reuse) an instance, deliver its saved Roblox session, and land
-    either INSIDE a place (if one is set) or on the account's home screen,
-    logged in, with no menu and no simulated taps — the product's whole
-    point.
+    """Boot an instance, deliver its saved Roblox session, and land either
+    INSIDE a place (if one is set) or on the account's home screen, logged in,
+    with no menu and no simulated taps — the product's whole point. Rejects if
+    the instance is already running (one live instance per username).
 
     Identical on the dev and production bases: same kiosk, same session
     broadcast, same roblox:// join. The dev base only differs in what is
     additionally available (frida/Magisk + always-on screenshots)."""
     ensure_qemu()
     cfg = load_config()
-    dev = args.dev
+    dev = _dev_mode_for_play(args)
     label = f"start {args.name}"
     json_mode = getattr(args, "json", False)
 
@@ -5614,7 +5633,7 @@ def account_cookie(username):
 def resolve_token(args):
     """The cookie to log in with, in priority order:
 
-    1. the instance name IS a saved account username (`omni play <username>`) —
+    1. the instance name IS a saved account username (`omni start <username>`) —
        the normal path; no flag needed;
     2. an explicit --token-file / --token-stdin / --token (manual override).
 
