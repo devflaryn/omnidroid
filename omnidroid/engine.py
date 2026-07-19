@@ -631,13 +631,15 @@ def account_dir(name):
     return ACCOUNTS_DIR / name
 
 
-def _base_tag_for_mode(rec):
+def _base_tag_for_mode(rec, cfg=None):
     """Resolve a store record's base MODE ("prod"/"dev"/None -- see
     omnidroid/accounts.py) to a cfg base TAG (a key into cfg["bases"]).
     The store and the engine speak different vocabularies for "base": the
     store tracks a coarse mode, the engine needs the exact registered base
-    entry to boot/introspect."""
-    cfg = read_config()
+    entry to boot/introspect. `rec` need only carry a "base" key (a full
+    record or a list_accounts entry both work); pass `cfg` to avoid a
+    re-read when resolving many accounts at once (e.g. all_accounts)."""
+    cfg = cfg if cfg is not None else read_config()
     bases = cfg.get("bases") or {}
     mode = (rec or {}).get("base")
     if mode == "dev":
@@ -715,8 +717,11 @@ def all_accounts():
         name = entry["username"]
         seen.add(name)
         r = running.get(name)
+        # `entry` (from list_accounts) already carries the base MODE, so pass
+        # it straight to _base_tag_for_mode -- no need to re-fetch the full
+        # record per account -- and reuse the cfg read above.
         base_tag = r["base"] if (r and r.get("base")) else _base_tag_for_mode(
-            _acc.get_account(_store_root(), name))
+            entry, cfg)
         acct = {"name": name, "base": base_tag, "ephemeral": True,
                 "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
                 "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
@@ -730,7 +735,7 @@ def all_accounts():
     for name, r in running.items():
         if name in seen:
             continue
-        base_tag = r.get("base") or _base_tag_for_mode(None)
+        base_tag = r.get("base") or _base_tag_for_mode(None, cfg)
         acct = {"name": name, "base": base_tag, "ephemeral": True,
                 "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
                 "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
@@ -971,16 +976,31 @@ def pid_ksm_merged_mb(pid):
 
 # ---------- adb / qmp ----------
 
+def _require_adb_port(acct):
+    """A diskless handle carries ports only while the instance is RUNNING
+    (they live in runtime/<name>/run.json). A command run against a stopped
+    account gets a portless handle — fail cleanly here instead of a raw
+    KeyError traceback. Internal pollers (wait_for_boot etc.) always run
+    against a live instance, so this never fires for them."""
+    port = acct.get("adb_port")
+    if port is None:
+        fail("not_running",
+             f"'{acct.get('name')}' is not running — start it first "
+             f"(omnidroid start {acct.get('name')})")
+    return port
+
+
 def adb(acct, *args, timeout=20, check=False):
-    serial = f"127.0.0.1:{acct['adb_port']}"
+    serial = f"127.0.0.1:{_require_adb_port(acct)}"
     cmd = ["adb", "-s", serial] + list(args)
     return subprocess.run(cmd, capture_output=True, text=True,
                           timeout=timeout, check=check)
 
 
 def adb_connect(acct):
+    port = _require_adb_port(acct)
     try:
-        subprocess.run(["adb", "connect", f"127.0.0.1:{acct['adb_port']}"],
+        subprocess.run(["adb", "connect", f"127.0.0.1:{port}"],
                        capture_output=True, text=True, timeout=15)
     except subprocess.TimeoutExpired:
         pass
