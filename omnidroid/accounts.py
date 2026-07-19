@@ -175,6 +175,53 @@ def list_accounts(repo):
     return out
 
 
+_SETTABLE_FIELDS = ("place_id", "base", "proxy", "group", "notes")
+
+
+def _validate_place_id(v):
+    if v is None:
+        return None
+    try:
+        pid = int(str(v).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"place_id must be a positive integer, got {v!r}")
+    if pid <= 0:
+        raise ValueError(f"place_id must be positive, got {pid}")
+    return pid
+
+
+def _validate_base(v):
+    if v is None:
+        return None
+    if v not in ("prod", "dev"):
+        raise ValueError(f"base must be 'prod' or 'dev', got {v!r}")
+    return v
+
+
+def set_fields(repo, username, **fields):
+    """Update metadata fields on an EXISTING account without touching the
+    cookie/identity. Settable: place_id, base, proxy, group, notes. Returns
+    False if no account is saved under that username. Raises ValueError on an
+    unknown field name or an invalid place_id/base value."""
+    for key in fields:
+        if key not in _SETTABLE_FIELDS:
+            raise ValueError(f"unknown field {key!r}; settable: "
+                             f"{', '.join(_SETTABLE_FIELDS)}")
+    data = _read(repo)
+    if username not in data["accounts"]:
+        return False
+    rec = data["accounts"][username]
+    if "place_id" in fields:
+        rec["place_id"] = _validate_place_id(fields["place_id"])
+    if "base" in fields:
+        rec["base"] = _validate_base(fields["base"])
+    for key in ("proxy", "group", "notes"):
+        if key in fields:
+            rec[key] = fields[key]
+    _write(repo, data)
+    return True
+
+
 def whoami(cookie, timeout=20):
     """(user_id, username) for a cookie, or (None, None). Also the cheapest
     proof that a stored cookie is still VALID — Roblox invalidates a cookie when

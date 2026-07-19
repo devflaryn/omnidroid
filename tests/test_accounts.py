@@ -105,6 +105,42 @@ class Store(unittest.TestCase):
         self.assertNotIn("notes", entry)
         self.assertNotIn("cookie", entry)
 
+    def test_set_fields_updates_existing_account(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        ok = cookies.set_fields(self.repo, "u",
+                                place_id="4483381587", base="dev",
+                                group="farm-a", notes="test")
+        self.assertTrue(ok)
+        rec = cookies.get_account(self.repo, "u")
+        self.assertEqual(rec["place_id"], 4483381587)   # coerced to int
+        self.assertEqual(rec["base"], "dev")
+        self.assertEqual(rec["group"], "farm-a")
+        self.assertEqual(rec["notes"], "test")
+        self.assertEqual(rec["cookie"], TOKEN)           # cookie untouched
+
+    def test_set_fields_returns_false_for_missing_account(self):
+        self.assertFalse(cookies.set_fields(self.repo, "ghost", base="prod"))
+
+    def test_set_fields_rejects_bad_place_id(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", place_id="-5")
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", place_id="notanumber")
+
+    def test_set_fields_rejects_bad_base_and_unknown_field(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", base="staging")
+        with self.assertRaises(ValueError):
+            cookies.set_fields(self.repo, "u", cookie="hacked")
+
+    def test_set_fields_clears_with_none(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        cookies.set_fields(self.repo, "u", place_id=7)
+        cookies.set_fields(self.repo, "u", place_id=None)
+        self.assertIsNone(cookies.get_account(self.repo, "u")["place_id"])
+
 
 class CustomName(unittest.TestCase):
     """A friendly custom_name is a display-only label alongside the username —
