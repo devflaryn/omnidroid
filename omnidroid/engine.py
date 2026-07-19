@@ -722,7 +722,6 @@ def pid_alive(pid):
 def runtime_dir(username):
     """Per-instance throwaway dir: efivars, run.json (ports+pid), qemu.log,
     autocap frames. Wiped on stop (A3). Replaces the old accounts/<name>/."""
-    from omnidroid import config
     return config.runtime_root() / username
 
 
@@ -730,7 +729,7 @@ def running_instances():
     """Every instance with a LIVE qemu pid, read from runtime/*/run.json.
     Dead/stale run.json files are ignored. Returns dicts with name + ports."""
     out = []
-    root = _config_runtime_root()
+    root = config.data_dir() / "runtime"
     if not root.exists():
         return out
     for d in sorted(root.iterdir()):
@@ -747,11 +746,6 @@ def running_instances():
                         "qmp_port": data.get("qmp_port"),
                         "vnc_port": data.get("vnc_port")})
     return out
-
-
-def _config_runtime_root():
-    from omnidroid import config
-    return config.runtime_root()
 
 
 def host_rss_mb(pid):
