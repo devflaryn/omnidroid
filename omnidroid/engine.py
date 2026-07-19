@@ -18,6 +18,7 @@ emits exactly one machine-readable line on stdout — the GUI contract):
   python omni.py adb    <name> -- <adb args...>
 """
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -132,6 +133,25 @@ DEV_MODE_ENV = "OMNI_DEV_MODE"
 def dev_mode_enabled():
     return str(os.environ.get(DEV_MODE_ENV, "")).strip().lower() in (
         "1", "true", "yes", "on")
+
+
+def _truthy_env(name):
+    return str(os.environ.get(name, "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _dev_mode_for_play(args):
+    """Whether `omni start` should target the DEV base for a NEW instance.
+
+    This is SELECTION (use dev), which is distinct from ACCESS (may use dev,
+    i.e. OMNI_DEV_MODE / dev_mode_enabled). The agent sets OMNI_DEV_MODE=1 just to
+    UNLOCK the dev base, but still runs production by default — so dev selection
+    must NOT be implied by OMNI_DEV_MODE, only by an explicit --dev or the
+    dedicated OMNI_USE_DEV_BASE 'default to dev' env. assert_dev_allowed still
+    refuses dev to a caller that has not unlocked it."""
+    if getattr(args, "dev", False):
+        return True
+    return _truthy_env("OMNI_USE_DEV_BASE")
 
 
 def visible_bases(cfg_or_raw):
@@ -612,11 +632,69 @@ def account_dir(name):
     return ACCOUNTS_DIR / name
 
 
+def _base_tag_for_mode(rec, cfg=None):
+    """Resolve a store record's base MODE ("prod"/"dev"/None -- see
+    omnidroid/accounts.py) to a cfg base TAG (a key into cfg["bases"]).
+    The store and the engine speak different vocabularies for "base": the
+    store tracks a coarse mode, the engine needs the exact registered base
+    entry to boot/introspect. `rec` need only carry a "base" key (a full
+    record or a list_accounts entry both work); pass `cfg` to avoid a
+    re-read when resolving many accounts at once (e.g. all_accounts)."""
+    cfg = cfg if cfg is not None else read_config()
+    bases = cfg.get("bases") or {}
+    mode = (rec or {}).get("base")
+    if mode == "dev":
+        for t, b in bases.items():
+            if base_is_dev(b):
+                return t
+        return DEV_BASE_TAG
+    # prod or unset: the arm production tag.
+    tag = effective_base_tag(cfg)
+    if tag and tag in bases and not base_is_dev(bases[tag]):
+        return tag
+    for t, b in bases.items():
+        if base_type(b) == BASE_TYPE_ARM and not base_is_dev(b):
+            return t
+    return ARM_BASE_TAG
+
+
 def load_account(name):
-    p = account_dir(name) / "account.json"
-    if not p.exists():
-        sys.exit(f"error: no such account '{name}' (looked for {p})")
-    return ensure_vnc_port(json.loads(p.read_text()))
+    """Build a runtime HANDLE for `name` -- identity from the central store
+    (omnidroid/accounts.py), live ports (and, if running, the exact base tag)
+    from runtime/<name>/run.json. Reads NO per-account folder: the ~14
+    running-instance commands only ever need name/base/ports/dev/game_package,
+    all of which live in one of those two places now."""
+    from omnidroid import accounts as _acc
+    rec = _acc.get_account(_store_root(), name)
+    run_path = runtime_dir(name) / "run.json"
+    run = None
+    if run_path.exists():
+        try:
+            run = json.loads(run_path.read_text())
+        except Exception:  # noqa: BLE001
+            run = None
+    if rec is None and run is None:
+        sys.exit(f"error: no such account '{name}'")
+
+    cfg = read_config()
+    if run and run.get("base"):
+        base_tag = run["base"]
+    else:
+        base_tag = _base_tag_for_mode(rec)
+
+    acct = {
+        "name": name,
+        "base": base_tag,
+        "ephemeral": True,
+        "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+        "game_package": ROBLOX_PACKAGE,
+        "first_boot_done": True,
+    }
+    if run:
+        for key in ("adb_port", "qmp_port", "vnc_port"):
+            if run.get(key) is not None:
+                acct[key] = run[key]
+    return acct
 
 
 def save_account(acct):
@@ -626,13 +704,47 @@ def save_account(acct):
 
 
 def all_accounts():
-    if not ACCOUNTS_DIR.exists():
-        return []
-    return sorted(
-        (ensure_vnc_port(json.loads((d / "account.json").read_text()))
-         for d in ACCOUNTS_DIR.iterdir()
-         if (d / "account.json").exists()),
-        key=lambda a: a["name"])
+    """Every STORE-listed account (omnidroid/accounts.py), joined with live
+    running state (runtime/*/run.json via running_instances()). Replaces the
+    old accounts/*/account.json folder scan: identity now lives in the
+    central cookie store, not per-account folders. A non-running account's
+    handle carries no port keys at all (nothing has allocated them yet) --
+    callers that need a port must check running state first."""
+    from omnidroid import accounts as _acc
+    cfg = read_config()
+    running = {i["name"]: i for i in running_instances()}
+    out, seen = [], set()
+    for entry in _acc.list_accounts(_store_root()):
+        name = entry["username"]
+        seen.add(name)
+        r = running.get(name)
+        # `entry` (from list_accounts) already carries the base MODE, so pass
+        # it straight to _base_tag_for_mode -- no need to re-fetch the full
+        # record per account -- and reuse the cfg read above.
+        base_tag = r["base"] if (r and r.get("base")) else _base_tag_for_mode(
+            entry, cfg)
+        acct = {"name": name, "base": base_tag, "ephemeral": True,
+                "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+                "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
+        if r:
+            for k in ("adb_port", "qmp_port", "vnc_port"):
+                if r.get(k) is not None:
+                    acct[k] = r[k]
+        out.append(acct)
+    # Union: running instances NOT registered in the store (temp build/bench
+    # instances) must still appear so running-instance safety guards see them.
+    for name, r in running.items():
+        if name in seen:
+            continue
+        base_tag = r.get("base") or _base_tag_for_mode(None, cfg)
+        acct = {"name": name, "base": base_tag, "ephemeral": True,
+                "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+                "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
+        for k in ("adb_port", "qmp_port", "vnc_port"):
+            if r.get(k) is not None:
+                acct[k] = r[k]
+        out.append(acct)
+    return sorted(out, key=lambda a: a["name"])
 
 
 # Per-instance PORT SCHEME (documented invariant):
@@ -668,16 +780,24 @@ def allocate_ports(cfg):
             vnc_start(cfg) + i)
 
 
-def ensure_vnc_port(acct):
-    """Backfill the reserved vnc_port on accounts created before the
-    scheme existed (derived from the account's adb index, so the triple
-    stays aligned)."""
-    if "vnc_port" not in acct:
-        cfg = read_config()
-        idx = acct["adb_port"] - cfg["qemu"]["adb_port_start"]
-        acct["vnc_port"] = vnc_start(cfg) + idx
-        save_account(acct)
-    return acct
+@contextlib.contextmanager
+def _launch_lock():
+    """Serialize the allocate-ports + reserve-slot critical section across
+    concurrent `start` launches on one host. Without it, two parallel launches
+    race to the same free port index. POSIX flock; a no-op on Windows (the
+    120-concurrent farm is Linux, dev is macOS -- both POSIX; the shipped
+    Windows product launches one instance at a time)."""
+    lock_path = config.runtime_root() / ".launch.lock"
+    f = open(lock_path, "w")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass   # Windows / no-flock: degrade to no lock (single-launch host)
+        yield
+    finally:
+        f.close()
 
 
 # ---------- process helpers ----------
@@ -724,8 +844,33 @@ def pid_alive(pid):
 
 def runtime_dir(username):
     """Per-instance throwaway dir: efivars, run.json (ports+pid), qemu.log,
-    autocap frames. Wiped on stop (A3). Replaces the old accounts/<name>/."""
+    autocap frames. Wiped on `stop` and `remove` (see _wipe_runtime).
+    Replaces the old accounts/<name>/ for the product path."""
     return config.runtime_root() / username
+
+
+def _reserve_ports(name, adb_port, qmp_port, vnc_port):
+    """Claim a port slot for `name` by writing a run.json reservation with THIS
+    launcher process's pid, so a concurrent allocate_ports() (which counts
+    runtime/*/run.json with a live pid) sees the slot as taken until
+    spawn_qemu() overwrites it with the real QEMU pid. Self-healing: if the
+    launch aborts before spawn, the launcher exits, its pid dies, and
+    running_instances() stops counting the stale reservation -> slot freed."""
+    d = runtime_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "run.json").write_text(json.dumps(
+        {"pid": os.getpid(), "started": time.time(), "reserving": True,
+         "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port}))
+
+
+def _wipe_runtime(name):
+    """Delete the per-instance runtime dir (efivars.fd, run.json, qemu.log,
+    autocap frames) once an ephemeral instance (build_acct) has stopped.
+    Called from cmd_stop (after a successful power-off) and cmd_remove.
+    Ephemeral instances write nothing under accounts/<name>/, so this IS
+    the entire teardown -- no folder to remove there."""
+    import shutil
+    shutil.rmtree(runtime_dir(name), ignore_errors=True)
 
 
 def running_instances():
@@ -745,6 +890,7 @@ def running_instances():
             continue
         if pid_alive(data.get("pid")):
             out.append({"name": d.name, "pid": data["pid"],
+                        "base": data.get("base"),
                         "adb_port": data.get("adb_port"),
                         "qmp_port": data.get("qmp_port"),
                         "vnc_port": data.get("vnc_port")})
@@ -865,16 +1011,31 @@ def pid_ksm_merged_mb(pid):
 
 # ---------- adb / qmp ----------
 
+def _require_adb_port(acct):
+    """A diskless handle carries ports only while the instance is RUNNING
+    (they live in runtime/<name>/run.json). A command run against a stopped
+    account gets a portless handle — fail cleanly here instead of a raw
+    KeyError traceback. Internal pollers (wait_for_boot etc.) always run
+    against a live instance, so this never fires for them."""
+    port = acct.get("adb_port")
+    if port is None:
+        fail("not_running",
+             f"'{acct.get('name')}' is not running — start it first "
+             f"(omnidroid start {acct.get('name')})")
+    return port
+
+
 def adb(acct, *args, timeout=20, check=False):
-    serial = f"127.0.0.1:{acct['adb_port']}"
+    serial = f"127.0.0.1:{_require_adb_port(acct)}"
     cmd = ["adb", "-s", serial] + list(args)
     return subprocess.run(cmd, capture_output=True, text=True,
                           timeout=timeout, check=check)
 
 
 def adb_connect(acct):
+    port = _require_adb_port(acct)
     try:
-        subprocess.run(["adb", "connect", f"127.0.0.1:{acct['adb_port']}"],
+        subprocess.run(["adb", "connect", f"127.0.0.1:{port}"],
                        capture_output=True, text=True, timeout=15)
     except subprocess.TimeoutExpired:
         pass
@@ -1028,9 +1189,10 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
         data_src = d / "data.qcow2"
         disk_opts = ",discard=unmap,detect-zeroes=unmap"
         # Non-ephemeral efivars is written ONCE at account creation (see
-        # _create_arm/ensure_instance) and persists across boots like the
-        # overlay disks — stays under account_dir until Task 4 removes the
-        # per-account overlay model entirely.
+        # _make_persistent_arm_account, used only by base-build/maintenance
+        # flows now) and persists across boots like the overlay disks —
+        # stays under account_dir; this whole non-ephemeral path is
+        # live-path-straggler territory (Task 5).
         efivars_src = d / "efivars.fd"
 
     code = arm_edk2_code()
@@ -1196,6 +1358,7 @@ def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
          "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE),
+         "base": acct["base"],
          "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
          "vnc_port": acct["vnc_port"]}))
     return proc.pid
@@ -1436,79 +1599,21 @@ def make_overlay(system_path, base_disk):
                     str(system_path)], check=True, capture_output=True)
 
 
-def _create_arm(args, cfg, acct, base, d, name, adb_port, qmp_port, vnc_port):
-    """arm-uefi account creation: THIN COW overlays of the provisioned matched
-    pair (system + /data) plus an efivars copy. Already provisioned (kiosk,
-    device-owner, HOME) so first_boot_done is set immediately.
+def build_acct(name, cfg, dev=False):
+    """Build the EPHEMERAL launch handle for `name`: resolves the base tag,
+    allocates a fresh port triple, and stages a per-boot efivars copy into
+    runtime_dir(name) -- but writes NO account.json and creates NO overlays.
+    Ephemeral instances boot the shared base templates directly (snapshot=on,
+    see qemu_command_arm), so there is nothing per-account to persist; the
+    handle is pure launch state (name/base/ports), same key shape as
+    load_account()'s but always carrying ports since this is what actually
+    reserves them.
 
-    Both system.qcow2 and data.qcow2 are qcow2 overlays backed by the shared
-    templates — NOT copies. That is the whole disk-savings model: an instance is
-    ~0.4 MB instead of ~1 GB, and the ONLY thing that differs between accounts is
-    the cookie delivered at runtime. A backed overlay presents the template's
-    encrypted /data byte-for-byte, so FBE decrypt works (the old "fresh overlay
-    fails FBE" caveat was about an EMPTY overlay with no backing — verified: a
-    backed overlay boots)."""
-    import shutil
-    images = Path(cfg["images_dir"])
-    sys_tmpl = images / base["system"]
-    data_tmpl = images / base["data"]
-    efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
-    ephemeral = bool(acct.get("ephemeral"))
-    if not efi_tmpl.exists():
-        sys.exit(f"error: arm base efivars template missing: {efi_tmpl}")
-    devkit = base["devkit"] if base_is_dev(base) else None
-    if ephemeral:
-        # Fully-shared, no-persistence: create NO per-account system/data/devkit
-        # overlays. The instance boots the shared templates directly (snapshot=on,
-        # see qemu_command_arm) and owns only a fresh per-boot efivars — so it is
-        # pure config (cookie + alias) with nothing to grow or clean up.
-        shutil.copyfile(efi_tmpl, d / "efivars.fd")
-        acct["first_boot_done"] = True
-        if devkit:
-            acct["dev"] = True
-        save_account(acct)
-    else:
-        make_overlay(d / "system.qcow2", sys_tmpl)
-        make_overlay(d / "data.qcow2", data_tmpl)
-        shutil.copyfile(efi_tmpl, d / "efivars.fd")   # tiny; per-account UEFI vars
-        acct["first_boot_done"] = True         # provisioning baked into the pair
-        # Dev base: attach the extra devkit disk as a cheap per-account COW overlay
-        # of the shared base_arm_devkit.qcow2 (frida + Magisk + omni tools). It is
-        # wired into the QEMU command as vdc and activated on start.
-        if devkit:
-            make_overlay(d / "devkit.qcow2", images / devkit)
-            acct["dev"] = True
-        save_account(acct)
-    extra = f" + devkit disk {devkit} (vdc)" if devkit else ""
-    print(f"[create {name}] arm64 disks ready (provisioned pair copied from "
-          f"{base['system']}+{base['data']}; overlay backed by "
-          f"{base['base_disk']}{extra}); adb {adb_port}, qmp {qmp_port}, "
-          f"vnc {vnc_port}")
-    created = {"name": name, "base": acct["base"], "adb_port": adb_port,
-               "qmp_port": qmp_port, "vnc_port": vnc_port,
-               "vnc_host": "127.0.0.1", "provisioned": True, "dev": bool(devkit),
-               "arch": arch_of_base(base), "ok": True}
-    if getattr(args, "json", False):
-        emit_json(created)
-
-
-def ensure_instance(name, cfg, dev=False, ephemeral=False):
-    """Return the account dict for instance <name>, creating a THIN arm instance
-    if it does not exist yet. This is what lets `omni play <username>` work with
-    no prior `omni create`: the instance is named for the account and is a cheap
-    COW overlay of the shared base, so there is no per-account 1 GB disk and
-    nothing to clean up but the cookie.
-
-    ephemeral=True makes it fully-shared/no-persistence: NO per-account
-    system/data/devkit overlays at all — it boots the shared templates directly
-    (snapshot=on) and owns only a fresh per-boot efivars, so many instances run
-    concurrently and nothing persists between boots.
-
-    arm-only by design (the product is arm; dev is arm+devkit). dev=True selects
-    the dev base (gated by OMNI_DEV_MODE upstream)."""
-    d = account_dir(name)
-    if (d / "account.json").exists():
-        return load_account(name)
+    This is the LAUNCH counterpart to load_account(): load_account reads an
+    identity that may or may not be running; build_acct allocates a fresh
+    instance to run. arm-only by design (the product is arm; dev is
+    arm+devkit). dev=True selects the dev base (gated by OMNI_DEV_MODE
+    upstream via assert_dev_allowed)."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         fail("bad_name",
              f"instance/username must be [A-Za-z0-9_-]+ (got '{name}')")
@@ -1519,43 +1624,26 @@ def ensure_instance(name, cfg, dev=False, ephemeral=False):
              f"instances are arm-only; base '{tag}' is {arch_of_base(base)}")
     assert_dev_allowed(tag, base)
     ensure_qemu()
+    # Hold the launch lock across allocate + reserve ONLY (tiny critical
+    # section): a lock alone isn't enough (allocate-then-release before spawn
+    # would let a concurrent launcher see the same slot free), so the
+    # reservation write happens BEFORE the lock releases -- see
+    # _launch_lock/_reserve_ports docstrings.
+    with _launch_lock():
+        adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+        _reserve_ports(name, adb_port, qmp_port, vnc_port)
+    d = runtime_dir(name)
     d.mkdir(parents=True, exist_ok=True)
-    adb_port, qmp_port, vnc_port = allocate_ports(cfg)
-    acct = {"name": name, "base": tag, "adb_port": adb_port,
-            "qmp_port": qmp_port, "vnc_port": vnc_port,
-            "first_boot_done": True, "created": time.time()}
-    if ephemeral:
-        acct["ephemeral"] = True
-    save_account(acct)
     import shutil
     images = Path(cfg["images_dir"])
     efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
     if not efi_tmpl.exists():
         fail("no_base", f"arm base efivars template missing: {efi_tmpl}")
-    if ephemeral:
-        # No per-account overlays: the shared templates are booted snapshot=on.
-        shutil.copyfile(efi_tmpl, d / "efivars.fd")
-        if base_is_dev(base):
-            acct["dev"] = True
-        acct["game_package"] = ROBLOX_PACKAGE
-        save_account(acct)
-        print(f"[play {name}] created EPHEMERAL instance on base '{tag}' "
-              f"(shared disks, snapshot=on — no per-account overlay; "
-              f"adb {adb_port} vnc {vnc_port})")
-        return load_account(name)
-    make_overlay(d / "system.qcow2", images / base["system"])
-    make_overlay(d / "data.qcow2", images / base["data"])
     shutil.copyfile(efi_tmpl, d / "efivars.fd")
-    if base_is_dev(base):
-        make_overlay(d / "devkit.qcow2", images / base["devkit"])
-        acct["dev"] = True
-    acct["game_package"] = ROBLOX_PACKAGE
-    save_account(acct)
-    tot = sum((d / f).stat().st_size for f in
-              ("system.qcow2", "data.qcow2") if (d / f).exists())
-    print(f"[play {name}] created thin instance on base '{tag}' "
-          f"({tot / 1048576:.1f} MiB overlays; adb {adb_port} vnc {vnc_port})")
-    return load_account(name)
+    return {"name": name, "base": tag,
+            "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port,
+            "ephemeral": True, "dev": base_is_dev(base),
+            "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
 
 
 def _select_base_tag(cfg, arch=None, base_tag=None):
@@ -1598,85 +1686,58 @@ def _select_base_tag(cfg, arch=None, base_tag=None):
     return default
 
 
-def cmd_create(args):
-    cfg = load_config()
-    if args.data_size is None:
-        args.data_size = cfg["qemu"]["data_disk_size"]
-    name = args.name
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
-        sys.exit("error: account name must be [A-Za-z0-9_-]+")
-    # Validate arch/base BEFORE requiring QEMU or creating any dirs, so a bad
-    # --arch/--base request fails cleanly (arch_boundary/no_base) without
-    # triggering a QEMU download.
-    tag = _select_base_tag(cfg, getattr(args, "arch", None),
-                           getattr(args, "base", None))
+def _make_persistent_arm_account(name, cfg, tag=None):
+    """Create a PERSISTENT (non-ephemeral) thin arm account on base `tag`
+    (default: the config's current/effective base): COW overlays of the
+    base's already-provisioned system+data pair, plus a per-account efivars
+    copy -- the same disk layout `cmd_create`'s arm branch used to produce
+    (see the deleted `_create_arm`'s non-ephemeral path). Already-provisioned
+    (kiosk, device-owner, HOME baked into the template), so first_boot_done
+    is set immediately; no boot happens here.
+
+    This exists ONLY for base-build/maintenance flows that need a real,
+    on-disk overlay to boot and write into -- update_kiosk_arm's throwaway
+    capture account, cmd_test_apk's disposable dev harness. It is NOT part
+    of the product's login/start path, which is fully ephemeral via
+    build_acct() and writes nothing to disk (see build_acct's docstring).
+    arm-only, matching build_acct."""
+    tag = tag or _select_base_tag(cfg)
     base = cfg["bases"][tag]
+    # Dev-base safety gate: an explicit tag (e.g. `update-kiosk --base dev`)
+    # bypasses _select_base_tag's auto-avoidance, so gate here unconditionally
+    # — same convention build_acct() follows. Refuses a dev base without
+    # OMNI_DEV_MODE=1 (customer-safety boundary; see dev-mode gate comment).
+    assert_dev_allowed(tag, base)
+    if base_type(base) != BASE_TYPE_ARM:
+        fail("arch_boundary", f"base '{tag}' is not arm-uefi")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        fail("bad_name", f"account name must be [A-Za-z0-9_-]+ (got '{name}')")
     d = account_dir(name)
     if (d / "account.json").exists():
-        sys.exit(f"error: account '{name}' already exists")
-    d.mkdir(parents=True, exist_ok=True)
+        fail("engine_error", f"account '{name}' already exists")
     ensure_qemu()
+    d.mkdir(parents=True, exist_ok=True)
     adb_port, qmp_port, vnc_port = allocate_ports(cfg)
     acct = {"name": name, "base": tag,
-            "adb_port": adb_port, "qmp_port": qmp_port,
-            "vnc_port": vnc_port,        # reserved for future local VNC
-            "first_boot_done": False, "created": time.time()}
-    if getattr(args, "ephemeral", False):
-        acct["ephemeral"] = True     # fully-shared, no-persistence (arm; see _create_arm)
-    save_account(acct)
-
-    # arm-uefi: the kiosk + device-owner + HOME are all baked into the
-    # provisioned matched pair (see BASE_TYPE_ARM note). An account is just a
-    # copy of that (system-overlay, data, efivars) trio — already-provisioned,
-    # so NO first boot / dexopt / device-owner step is needed here.
-    if base_type(base) == BASE_TYPE_ARM:
-        return _create_arm(args, cfg, acct, base, d, name,
-                           adb_port, qmp_port, vnc_port)
-
-    base_disk = Path(cfg["images_dir"]) / base["disk"]
-    make_overlay(d / "system.qcow2", base_disk)
-    # /data disk must be a pre-formatted ext4 filesystem: the Bliss initrd
-    # only mounts DATA= devices, it never formats them (a blank disk hangs
-    # Android before adbd). Copy the formatted-empty template.
+            "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port,
+            "first_boot_done": True, "created": time.time()}
     import shutil
-    template = Path(cfg["images_dir"]) / cfg["data_template"]
-    if not template.exists():
-        sys.exit(f"error: data template missing: {template}")
-    if args.data_size != cfg["qemu"]["data_disk_size"]:
-        print(f"[create {name}] note: --data-size ignored for now; "
-              f"template is {cfg['qemu']['data_disk_size']}")
-    shutil.copyfile(template, d / "data.qcow2")
-    print(f"[create {name}] disks ready "
-          f"(overlay on {base['disk']}, data {args.data_size}); "
-          f"adb port {adb_port}, qmp port {qmp_port}")
-
-    created = {"name": name, "base": acct["base"], "adb_port": adb_port,
-               "qmp_port": qmp_port, "vnc_port": vnc_port,
-               "vnc_host": "127.0.0.1", "arch": arch_of_base(base),
-               "ok": True}
-    if args.no_provision:
-        print(f"[create {name}] skipping provisioning; first 'start' "
-              f"will run the one-time first boot (~15 min)")
-        if getattr(args, "json", False):
-            emit_json({**created, "provisioned": False})
-        return
-
-    print(f"[create {name}] provisioning: first boot runs Android's "
-          f"one-time app optimization (dexopt). Expect ~15 minutes; "
-          f"progress below.", flush=True)
-    spawn_qemu(acct, cfg, dev=True)
-    if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, f"create {name}",
-                         first_boot=True):
-        sys.exit(f"[create {name}] provisioning failed (timeout)")
-    post_boot(acct, f"create {name}")
-    provision_settings(acct, f"create {name}")
-    acct["first_boot_done"] = True
+    images = Path(cfg["images_dir"])
+    efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
+    if not efi_tmpl.exists():
+        fail("no_base", f"arm base efivars template missing: {efi_tmpl}")
+    make_overlay(d / "system.qcow2", images / base["system"])
+    make_overlay(d / "data.qcow2", images / base["data"])
+    shutil.copyfile(efi_tmpl, d / "efivars.fd")
+    devkit = base["devkit"] if base_is_dev(base) else None
+    if devkit:
+        make_overlay(d / "devkit.qcow2", images / devkit)
+        acct["dev"] = True
     save_account(acct)
-    _shutdown(acct, f"create {name}")
-    print(f"[create {name}] provisioned and shut down. "
-          f"Subsequent boots take ~2-4 min.")
-    if getattr(args, "json", False):
-        emit_json({**created, "provisioned": True})
+    print(f"[create {name}] arm64 disks ready (provisioned pair copied from "
+          f"{base['system']}+{base['data']}); adb {adb_port}, qmp {qmp_port}, "
+          f"vnc {vnc_port}")
+    return load_account(name)
 
 
 # Magisk's su on this all-read-only LineageOS lives in Magisk's own tmpfs, NOT
@@ -1841,68 +1902,109 @@ def _devkit_activate(acct, label):
 
 
 def cmd_start(args):
+    """Boot an instance, deliver its saved Roblox session, and land either
+    INSIDE a place (if one is set) or on the account's home screen, logged in,
+    with no menu and no simulated taps — the product's whole point. Rejects if
+    the instance is already running (one live instance per username).
+
+    Identical on the dev and production bases: same kiosk, same session
+    broadcast, same roblox:// join. The dev base only differs in what is
+    additionally available (frida/Magisk + always-on screenshots)."""
     ensure_qemu()
-    return _cmd_start(args)
-
-
-def _cmd_start(args):
-    """Spawn a detached QEMU instance and return immediately.
-
-    The VM is never tied to this process: PID + ports are recorded in
-    accounts/<name>/run.json, lifecycle is managed via PID/adb/QMP.
-    Use --wait (or 'omni resume <name>') to block until boot completes.
-    """
     cfg = load_config()
-    acct = load_account(args.name)
+    dev = _dev_mode_for_play(args)
+    label = f"start {args.name}"
+    json_mode = getattr(args, "json", False)
+
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
-    first = not acct.get("first_boot_done")
-    dev = args.dev or first          # first boot always uses the dev profile
-    mode = resolve_mode(cfg, args.mode, mem=args.mem)
-    accel = getattr(args, "accel", None)
-    pid = spawn_qemu(acct, cfg, dev=dev, mode=None if dev else mode,
-                     accel=accel)
-    # Auto-screenshots start HERE, not after boot: QEMU's VNC server is live the
-    # moment the process is up, so the recorder sees the boot screen and every
-    # frame after it. Starting it post-boot (or only on --wait) would silently
-    # drop the whole boot sequence — the part a tester most wants timed.
-    maybe_start_autocap(acct, f"start {args.name}")
-    modestr = "dev" if dev else mode["name"]
-    json_mode = getattr(args, "json", False)
-    result = {"name": args.name, "pid": pid, "mode": modestr,
-              "headless": True,
-              "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
-              "vnc_port": acct["vnc_port"], "vnc_host": "127.0.0.1",
-              "adb_serial": f"127.0.0.1:{acct['adb_port']}",
-              "first_boot": first, "arch": acct_arch(acct), "ok": True}
-    print(f"[start {args.name}] detached: qemu pid {pid}, mode {modestr} "
-          f"(headless), adb 127.0.0.1:{acct['adb_port']}, "
-          f"qmp 127.0.0.1:{acct['qmp_port']}, "
-          f"vnc 127.0.0.1:{acct['vnc_port']}")
-    if first:
-        print(f"[start {args.name}] first boot of this account: one-time "
-              f"dexopt, ~15 min. Track progress: omni resume {args.name}",
-              flush=True)
-    if not args.wait:
+
+    # Resolve the session BEFORE creating anything on disk. store_session() and
+    # resolve_token()/account_cookie() are pure reads of the central store —
+    # neither needs an instance directory to exist, so this is safe to do
+    # ahead of build_acct(). That ordering is load-bearing, not cosmetic:
+    # "the only way to create a profile is to log in" means a brand-new name
+    # with no saved cookie and no override must fail HERE, before a real
+    # instance (efivars + ports) gets allocated for it.
+    place_override = (_validate_place_id(args.place)
+                      if getattr(args, "place", None) is not None else None)
+    sess = store_session(args.name, args, place_override=place_override)
+    # --token/--token-file/--token-stdin (or the account's own saved cookie)
+    # still wins over whatever store_session() found, same priority order as
+    # resolve_token() always documented.
+    tok = resolve_token(args)
+    if tok:
+        sess["token"] = tok
+    if not sess.get("token") and not getattr(args, "no_token", False):
+        return fail("no_token",
+                    f"no saved Roblox account '{args.name}'. Sign it in first: "
+                    f"`omni login` (saves the account under its username), then "
+                    f"`omni start {args.name}`. (Or override with "
+                    f"--token-file <file>, or --no-token to land on Roblox's "
+                    f"own login screen.) No instance was created for "
+                    f"'{args.name}'.")
+    # A place is OPTIONAL: with one set, this is a JOIN; without one, it's a
+    # HOME boot — logged in via the delivered cookie, no deep link, no join.
+    is_join = bool(sess.get("place_id"))
+
+    # Only NOW do we know a session is deliverable (a real token, or the
+    # explicit --no-token escape hatch) — build the launch handle. Nothing is
+    # persisted here: the store owns the account's cookie (via `omni login`)
+    # and its default place (via `omni session --place`); --place above is a
+    # one-off override for THIS launch only.
+    acct = build_acct(args.name, cfg, dev=dev)
+
+    booted, first = _ensure_booted(acct, cfg, label,
+                                   timeout=getattr(args, "timeout", None),
+                                   accel=getattr(args, "accel", None))
+    result = {"name": args.name, "place_id": sess.get("place_id"),
+              "deeplink": roblox_deeplink(sess), "first_boot": first,
+              "arch": acct_arch(acct), "dev": acct_is_dev(acct),
+              "adb_port": acct["adb_port"], "vnc_port": acct["vnc_port"],
+              "session": public_session(sess)}
+    if not booted:
+        result.update({"ok": False, "booted": False, "error": "boot_timeout"})
         if json_mode:
             emit_json(result)
-        return
-    timeout = args.timeout or (FIRST_BOOT_TIMEOUT if first
-                               else NORMAL_BOOT_TIMEOUT)
-    if not wait_for_boot(acct, timeout, f"start {args.name}",
-                         first_boot=first):
-        if json_mode:
-            emit_json({**result, "booted": False, "ok": False})
         sys.exit(1)
-    bridge_ok = post_boot(acct, f"start {args.name}")
-    if first:
-        provision_settings(acct, f"start {args.name}")
-        acct["first_boot_done"] = True
-        save_account(acct)
-    devkit = _devkit_activate(acct, f"start {args.name}")
+
+    status = deliver_session(acct, label, sess, play=is_join)
+    result.update({"booted": True, "ok": bool(status.get("delivered")),
+                   **{k: v for k, v in status.items() if k != "kiosk"}})
+    result["kiosk"] = status.get("kiosk")
+
+    # Open a live WINDOW onto this instance so you can watch/play it, and so two
+    # `omni start` runs give two accounts side by side. Each viewer is its own
+    # detached process bound to this instance's own VNC port, so N windows for N
+    # accounts just work. Default ON for interactive use; suppressed by
+    # --no-window and by --json (a machine/automation caller drives via capture).
+    want_window = (not getattr(args, "no_window", False)
+                   and (getattr(args, "window", False) or not json_mode))
+    viewer_pid = None
+    if result["ok"] and want_window:
+        try:
+            if _wait_for_vnc("127.0.0.1", acct["vnc_port"], timeout=10):
+                title = (f"omni: {args.name}  (place {sess['place_id']})"
+                         if is_join else f"omni: {args.name}  (home)")
+                viewer_pid = _spawn_builtin_viewer(
+                    args.name, "127.0.0.1", acct["vnc_port"], title).pid
+                result["viewer_pid"] = viewer_pid
+        except Exception as e:  # noqa: BLE001 — a window failure must not fail start
+            print(f"[{label}] could not open a window: {e}")
+
     if json_mode:
-        emit_json({**result, "booted": True, "native_bridge_ok": bridge_ok,
-                   "devkit": devkit})
+        emit_json(result)
+    elif result["ok"]:
+        where = (f"window opened (pid {viewer_pid})" if viewer_pid
+                 else f"vnc 127.0.0.1:{acct['vnc_port']} to watch")
+        if is_join:
+            print(f"[{label}] joined place {sess['place_id']} — {where}")
+        else:
+            print(f"[{label}] logged in on home — {where}")
+    else:
+        print(f"[{label}] session NOT applied: "
+              f"{status.get('reason')} {status.get('detail', '')}")
+        sys.exit(1)
 
 
 def _shutdown(acct, label, timeout=90):
@@ -1951,30 +2053,17 @@ def _shutdown(acct, label, timeout=90):
     return "killed" if not pid_alive(pid) else "kill-failed"
 
 
-def cmd_resume(args):
-    """Re-attach to an already-running instance: wait for boot, run
-    post-boot checks, mark first boot done. Leaves the instance running."""
-    acct = load_account(args.name)
-    if not running_pid(args.name):
-        sys.exit(f"error: '{args.name}' is not running")
-    first = not acct.get("first_boot_done")
-    timeout = FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT
-    if not wait_for_boot(acct, timeout, f"resume {args.name}",
-                         first_boot=first):
-        sys.exit(1)
-    post_boot(acct, f"resume {args.name}")
-    if first:
-        provision_settings(acct, f"resume {args.name}")
-        acct["first_boot_done"] = True
-        save_account(acct)
-    _devkit_activate(acct, f"resume {args.name}")
-    maybe_start_autocap(load_account(args.name), f"resume {args.name}")
-
-
 def cmd_stop(args):
     """Power the instance OFF. This is distinct from a viewer merely
     disconnecting: a VNC/adb disconnect is a no-op (the instance keeps
-    running headless — the default); stop is the explicit power path."""
+    running headless — the default); stop is the explicit power path.
+
+    Diskless model: a successful power-off also wipes runtime/<name>/
+    (efivars, run.json, qemu.log, autocap frames) -- that dir is the ONLY
+    per-instance state an ephemeral account writes, so this IS the entire
+    teardown. Skipped if the shutdown chain had to give up (kill-failed):
+    the instance may still be alive, and wiping run.json would orphan a
+    live QEMU process (running_pid would stop seeing it)."""
     acct = load_account(args.name)
     was_running = bool(running_pid(args.name))
     # Stop the always-on recorder first so it finalizes cleanly instead of
@@ -1982,9 +2071,12 @@ def cmd_stop(args):
     stop_autocap(args.name)
     method = _shutdown(acct, f"stop {args.name}", timeout=args.timeout)
     ok = method != "kill-failed"
+    if ok:
+        _wipe_runtime(args.name)
     if getattr(args, "json", False):
         emit_json({"name": args.name, "was_running": was_running,
-                   "stopped": ok, "method": method, "ok": ok})
+                   "stopped": ok, "method": method,
+                   "runtime_wiped": ok, "ok": ok})
     if not ok:
         sys.exit(1)
 
@@ -2010,42 +2102,63 @@ def _assert_deletable(path):
 
 
 def cmd_remove(args):
-    """DESTRUCTIVE: stop the instance if running, then delete
-    accounts/<name>/ — system overlay + data.qcow2 + state. The account's
-    game data is gone for good; bases and other accounts are untouched.
-    Ports free automatically (allocation scans surviving accounts)."""
+    """DESTRUCTIVE: stop the instance if running, then delete its identity.
+
+    Diskless model: an account IS a store entry (omnidroid/accounts.py) plus
+    whatever it left in runtime/<name>/ while running. There is no
+    per-account folder for a product account any more, so 'remove' deletes
+    the store record and wipes runtime/<name>/ -- that's the entire
+    footprint. A legacy accounts/<name>/ folder (base-build/maintenance
+    accounts made by _make_persistent_arm_account et al, or leftovers from
+    before this migration) is also rmtree'd here IF one happens to exist,
+    but its absence is never an error."""
     name = args.name
     # Exact-name only: same charset create enforces; no globs, no partial
     # matches, and no path separators can ever reach the delete path.
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         sys.exit("error: account name must match [A-Za-z0-9_-]+ exactly "
                  "(no globs/partial names)")
-    acct = load_account(name)         # exits if the account doesn't exist
-    target = _assert_deletable(account_dir(name))
+    from omnidroid import accounts as _acc
+    rec = _acc.get_account(_store_root(), name)
+    has_runtime = runtime_dir(name).exists()
+    legacy_dir = account_dir(name)
+    has_legacy = legacy_dir.exists()
+    if rec is None and not has_runtime and not has_legacy:
+        sys.exit(f"error: no such account '{name}'")
     was_running = bool(running_pid(name))
     if was_running:
+        # load_account needs either a store record or a live run.json to
+        # build a handle -- both are guaranteed here since was_running=True
+        # implies a live runtime/<name>/run.json.
+        acct = load_account(name)
         stop_autocap(name)
         _shutdown(acct, f"remove {name}", timeout=args.timeout)
         if running_pid(name):
             sys.exit(f"error: '{name}' would not stop; NOT deleting")
-    import shutil
-    for _ in range(10):
-        try:
-            shutil.rmtree(target)
-            break
-        except PermissionError:
-            time.sleep(1)     # QEMU may still be releasing file handles
-    else:
-        sys.exit(f"error: could not delete {target} (files still locked)")
-    print(f"[remove {name}] deleted {target} (overlay + data.qcow2 + "
-          f"state); ports adb {acct['adb_port']} qmp {acct['qmp_port']} "
-          f"vnc {acct['vnc_port']} freed")
+    store_removed = _acc.remove_account(_store_root(), name)
+    _wipe_runtime(name)
+    legacy_removed = False
+    if has_legacy:
+        target = _assert_deletable(legacy_dir)
+        import shutil
+        for _ in range(10):
+            try:
+                shutil.rmtree(target)
+                legacy_removed = True
+                break
+            except PermissionError:
+                time.sleep(1)     # QEMU may still be releasing file handles
+        else:
+            sys.exit(f"error: could not delete {target} (files still locked)")
+    print(f"[remove {name}] store entry {'cleared' if store_removed else '(none)'}"
+          f", runtime/{name}/ wiped"
+          + (f", legacy folder {target} deleted" if legacy_removed else ""))
     if getattr(args, "json", False):
         emit_json({"name": name, "removed": True,
                    "was_running": was_running,
-                   "freed_ports": {"adb": acct["adb_port"],
-                                   "qmp": acct["qmp_port"],
-                                   "vnc": acct["vnc_port"]},
+                   "store_removed": store_removed,
+                   "runtime_wiped": True,
+                   "legacy_folder_removed": legacy_removed,
                    "ok": True})
 
 
@@ -2102,51 +2215,6 @@ def migrate_account(name, cfg, target=None, reprovision=True):
     print(f"[{label}] migrated to {target} and re-provisioned")
 
 
-def account_needs_full_update(acct, cfg, target):
-    """FAST vs FULL decision for one account.
-
-    FAST (overlay repoint, no boot) is correct whenever the account's
-    provisioned /data state stays valid on the new base. Everything that
-    lives in /system — the OS, a baked game APK update (same package), a
-    new kiosk APK — arrives via the overlay itself. The ONE thing the
-    repoint can't deliver is a /data change, and the only /data value
-    derived from the base is the kiosk's target game package
-    (omni_game_package). So:
-      - account has a dev-installed game  -> base game irrelevant -> FAST
-      - base game package unchanged       -> FAST
-      - base game package differs         -> FULL (boot + re-provision)
-    Policy/settings changes (lockdown, trims) are invisible here — force
-    them with update-all --full.
-    """
-    if acct.get("game_package"):
-        return False
-    games = cfg.get("base_game", {})
-    return games.get(acct["base"]) != games.get(target)
-
-
-def migrate_account_fast(name, cfg, target):
-    """FAST path: discard the disposable system overlay, create a fresh
-    one backed by the NEW base (a metadata-only qemu-img create — the
-    clean way to change backing files; never rebase, never edit a base in
-    place). data.qcow2 untouched; no boot; seconds per account."""
-    acct = load_account(name)
-    label = f"update {name}"
-    if acct_base_is_arm(acct):        # same guard as migrate_account
-        print(f"[{label}] SKIP: arm-uefi account (matched-pair copy, no "
-              f"overlay repoint)")
-        return
-    if running_pid(name):
-        _shutdown(acct, label)
-    d = account_dir(name)
-    base_disk = Path(cfg["images_dir"]) / cfg["bases"][target]["disk"]
-    old = acct["base"]
-    make_overlay(d / "system.qcow2", base_disk)      # data.qcow2 untouched
-    acct["base"] = target
-    save_account(acct)
-    print(f"[{label}] FAST: overlay {old} -> {target} "
-          f"(no boot; data.qcow2 preserved)")
-
-
 def cmd_update_base(args):
     cfg = load_config()
     target = args.to or cfg["current_base"]
@@ -2167,61 +2235,6 @@ def cmd_update_base(args):
     if getattr(args, "json", False):
         emit_json({"name": args.name, "migrated": True, "base": target,
                    "arch": acct_arch(acct), "ok": True})
-
-
-def cmd_update_all(args):
-    """Migrate ALL accounts to a base. Default AUTO: per account, take the
-    near-instant overlay-repoint FAST path unless the base's game package
-    changed for that account (then boot + re-provision). --fast / --full
-    force one path for every account. Scales to 100+ accounts: a pure
-    system/game base swap is seconds total, not hours."""
-    if args.fast and args.full:
-        sys.exit("error: --fast and --full are mutually exclusive")
-    cfg = load_config()
-    target = args.to or cfg["current_base"]
-    if target not in cfg["bases"]:
-        fail("no_base", f"no base '{target}'. Known: {list(cfg['bases'])}")
-    # ARCH BOUNDARY (contract §7.2): an arm-uefi TARGET is refused outright —
-    # update-all migrates x86-bliss overlays only. Checked before ensure_qemu.
-    if base_type(cfg["bases"][target]) == BASE_TYPE_ARM:
-        fail("arch_boundary",
-             "update-all migrates x86-bliss overlays only; arm-uefi accounts "
-             "are matched-pair copies (recreate from a new provisioned pair)")
-    ensure_qemu()
-    all_names = [a["name"] for a in all_accounts()]
-    names = [a["name"] for a in all_accounts() if not acct_base_is_arm(a)]
-    skipped_arm = sorted(set(all_names) - set(names))
-    if skipped_arm:
-        print(f"[update-all] skipping arm-uefi account(s): {skipped_arm}")
-    todo = [n for n in names
-            if load_account(n)["base"] != target or not args.skip_current]
-    print(f"[update-all] target base {target}; "
-          f"{len(todo)}/{len(names)} account(s) to migrate: {todo}")
-    t0 = time.time()
-    slow = []
-    for n in todo:
-        if args.full:
-            full = True
-        elif args.fast:
-            full = False
-        else:
-            full = account_needs_full_update(load_account(n), cfg, target)
-        if full:
-            slow.append(n)
-            migrate_account(n, cfg, target=target,
-                            reprovision=not args.no_reprovision)
-        else:
-            migrate_account_fast(n, cfg, target)
-    print(f"[update-all] done in {time.time() - t0:.1f}s. "
-          f"{len(todo) - len(slow)} fast / {len(slow)} full; all on "
-          f"{target}; per-account data preserved."
-          + (f" Full (booted): {slow}" if slow else "")
-          + (f" Skipped arm (arch_boundary): {skipped_arm}"
-             if skipped_arm else ""))
-    if getattr(args, "json", False):
-        emit_json({"target": target, "migrated": todo,
-                   "fast": len(todo) - len(slow), "full": len(slow),
-                   "skipped_arm": skipped_arm, "ok": True})
 
 
 # ---------- production base rebuild (update pre-installed game) ----------
@@ -2351,7 +2364,9 @@ def _build_next_base(cfg, mutate, notes, base_game=None):
 
 def rebuild_base(cfg, game_apk):
     """Bake/replace the pre-installed game APK as a /system/app system app in
-    a NEW base version. update-all rolls it out, keeping each data.qcow2."""
+    a NEW base version. Ephemeral instances pick it up on their next boot;
+    `update-base` migrates an existing persistent account, keeping its
+    data.qcow2."""
     pkg = apk_package_name(game_apk)
     if not pkg:
         sys.exit(f"could not read package name from {game_apk}")
@@ -2422,7 +2437,7 @@ def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
     /metadata keys came from a copy of that very image.
 
     Without this, a FRESH account ships the kiosk build that was current when the
-    template was last captured — so `omni play` gets no_kiosk_reply until someone
+    template was last captured — so `omni start` gets no_kiosk_reply until someone
     installs the new kiosk by hand.
     """
     kiosk_apk = Path(kiosk_apk)
@@ -2445,14 +2460,8 @@ def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
         return fail("instance_running",
                     f"stop running instances first ({', '.join(live)}): the "
                     f"template is rebuilt from a clean boot")
-    class _A:  # minimal args for cmd_create
-        pass
-    a = _A()
-    a.name, a.arch, a.base, a.no_provision = name, None, tag, True
-    a.data_size, a.json = None, False
     print(f"[{label}] building a throwaway account '{name}' off base '{tag}'")
-    cmd_create(a)
-    acct = load_account(name)
+    acct = _make_persistent_arm_account(name, cfg, tag=tag)
     try:
         spawn_qemu(acct, cfg, dev=False, mode=resolve_mode(cfg))
         if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, label):
@@ -3057,7 +3066,7 @@ GRUB_CFG_PATH = "boot/grub/grub.cfg"
 # This is not a convenience — without it the product does not work at all. adbd
 # otherwise demands authorization, which Android asks for with an "Allow USB
 # debugging?" DIALOG on the guest screen. Nothing can answer it: the instance is
-# headless, the kiosk cannot dismiss a system dialog, and `omni play` needs adb
+# headless, the kiosk cannot dismiss a system dialog, and `omni start` needs adb
 # to reach the kiosk in the first place. Every fresh account would sit at that
 # dialog forever.
 #
@@ -4062,12 +4071,23 @@ def cmd_bench_ksm(args):
     Ubuntu laptop exists; treat the first Linux run as its test.
 
     Method (honest marginal cost, not RSS - RSS double-counts pages KSM
-    shares): start identical instances one at a time (default brutal/
-    headless), each to boot_completed + game process up; after each, wait
-    for pages_sharing to plateau, then record the marginal drop in host
-    MemAvailable. Stops when MemAvailable < --floor-mb: the RAM floor ends
-    the bench, never a count cap. One JSON line per step + summary table.
-    """
+    shares): start identical EPHEMERAL instances one at a time (default
+    brutal/headless), each to boot_completed + game process up; after each,
+    wait for pages_sharing to plateau, then record the marginal drop in
+    host MemAvailable. Stops when MemAvailable < --floor-mb: the RAM floor
+    ends the bench, never a count cap. One JSON line per step + summary
+    table.
+
+    Diskless model: each step is a fresh build_acct() instance (arm-only;
+    shared base templates, snapshot=on). No account.json and no
+    accounts/<name>/ folder are ever created -- an ephemeral arm instance is
+    already fully provisioned (kiosk + Roblox baked into the base template),
+    so unlike the old persistent-account bench there is no first-boot/dexopt
+    step here; every step boots at the same ~2-4 min speed. Roblox
+    (build_acct's default game_package) is the real workload measured;
+    --apk installs an override game fresh into that step's instance instead
+    (nothing persists between steps, so a reinstall happens every time it's
+    given -- there is no "first run is slow, reruns are fast" anymore)."""
     if IS_WINDOWS:
         sys.exit("bench-ksm needs a Linux host with KVM+KSM (Phase 8 "
                  "measurement tool; Windows/WHPX shares nothing).")
@@ -4082,11 +4102,6 @@ def cmd_bench_ksm(args):
         ksm_write("sleep_millisecs", 20)
         ksm_write("run", 1)
 
-    base_game = read_config().get("base_game", {}).get(cfg["current_base"])
-    if not base_game and not args.apk:
-        sys.exit("error: current base has no pre-installed game; pass "
-                 "--apk <game.apk> so instances run the real workload")
-
     base_avail = host_mem_available_mb()
     print(f"[bench] baseline: MemAvailable {base_avail:.0f} MB, "
           f"pages_sharing {ksm_stats().get('pages_sharing', 0)}, "
@@ -4095,30 +4110,30 @@ def cmd_bench_ksm(args):
     prev_avail = base_avail
     for i in range(1, args.max + 1):
         name = f"{args.prefix}{i}"
-        if not (account_dir(name) / "account.json").exists():
-            import argparse as _a
-            print(f"[bench] creating {name} (one-time first-boot dexopt - "
-                  f"slow now, fast on reruns)")
-            cmd_create(_a.Namespace(
-                name=name, no_provision=False,
-                data_size=cfg["qemu"]["data_disk_size"]))
-        acct = load_account(name)
-        pkg = acct.get("game_package") or base_game
-        if not running_pid(name):
-            mode = resolve_mode(cfg, args.mode)
-            spawn_qemu(acct, cfg, dev=False, mode=mode)
+        # Never re-spawn over a still-live instance of this name (e.g. a prior
+        # `bench-ksm --keep` run): that would orphan the old QEMU process and
+        # clobber its run.json/efivars. Skip to the next free name instead.
+        if running_pid(name):
+            print(f"[bench] {name} already running (kept from a prior run) "
+                  f"- skipping this slot")
+            continue
+        acct = build_acct(name, cfg, dev=False)
+        pkg = acct.get("game_package")
+        mode = resolve_mode(cfg, args.mode)
+        spawn_qemu(acct, cfg, dev=False, mode=mode)
         if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, f"bench {name}"):
             print(f"[bench] {name} boot timeout - stopping bench")
+            _shutdown(acct, f"bench {name}")
+            _wipe_runtime(name)
             break
         post_boot(acct, f"bench {name}")
-        if args.apk and not acct.get("game_package"):
+        if args.apk:
             r = adb(acct, "install", "-r", "-g", "--no-incremental",
                     args.apk, timeout=600)
             if "Success" in (r.stdout + r.stderr):
                 pkg = apk_package_name(args.apk) or pkg
                 if pkg:
                     acct["game_package"] = pkg
-                    save_account(acct)
                     adb(acct, "shell", "settings", "put", "global",
                         "omni_game_package", pkg, timeout=10)
         if pkg and not _wait_game_running(acct, pkg):
@@ -4153,18 +4168,20 @@ def cmd_bench_ksm(args):
         print("[bench] stopping bench instances (--keep leaves them up)")
         for r in rows:
             _shutdown(load_account(r["name"]), f"bench {r['name']}")
+            _wipe_runtime(r["name"])
 
 
 def account_status(a, stats=False):
     """One account's live state as a plain dict — shared by the human
     list output and --json (the GUI relies on these exact keys)."""
     pid = running_pid(a["name"])
+    adb_port = a.get("adb_port")
     rec = {"name": a["name"], "base": a["base"], "arch": acct_arch(a),
            "running": bool(pid),
            "pid": pid, "mode": None,
-           "adb_port": a["adb_port"], "qmp_port": a["qmp_port"],
+           "adb_port": adb_port, "qmp_port": a.get("qmp_port"),
            "vnc_port": a.get("vnc_port"), "vnc_host": "127.0.0.1",
-           "adb_serial": f"127.0.0.1:{a['adb_port']}",
+           "adb_serial": f"127.0.0.1:{adb_port}" if adb_port else None,
            "game_package": a.get("game_package")}
     if pid:
         try:
@@ -4199,13 +4216,13 @@ def cmd_list(args):
         emit_json([account_status(a, stats=args.stats) for a in accts])
         return
     if not accts:
-        print("no accounts. create one: omnidroid create <name>")
+        print("no accounts. log one in: omnidroid login <username>")
         return
     for a in accts:
         rec = account_status(a, stats=args.stats)
         state = f"RUNNING pid {rec['pid']}" if rec["running"] else "stopped"
         line = (f"{rec['name']:<16} base {rec['base']}  "
-                f"adb {rec['adb_port']}  qmp {rec['qmp_port']}  "
+                f"adb {rec['adb_port'] or '?'}  qmp {rec['qmp_port'] or '?'}  "
                 f"vnc {rec['vnc_port'] or '?'}  {state}")
         if rec["running"] and args.stats:
             if rec.get("host_rss_mb"):
@@ -4536,8 +4553,10 @@ def _spawn_builtin_viewer(name, host, port, title):
         cmd = [sys.executable, str(Path(__file__).resolve())] + a
     # Detach stdio too: if the child inherited the terminal's stdout/stderr,
     # the shell would block waiting for EOF while the (long-lived) viewer
-    # holds the pipe open. Send viewer output to a per-account log.
-    d = account_dir(name)
+    # holds the pipe open. Send viewer output to the per-instance runtime dir
+    # (diskless model: product-path per-instance state lives under
+    # runtime/<name>/, not accounts/<name>/ -- wiped on stop like the rest).
+    d = runtime_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "viewer.log", "a")
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
@@ -4560,21 +4579,22 @@ def cmd_view(args):
     VNC port. Localhost-only: the viewer connects to 127.0.0.1 — the server
     has no auth, safe ONLY on the loopback bind (port-scheme HARD RULE)."""
     cfg = load_config()
-    acct = load_account(args.name)
     host = "127.0.0.1"
-    port = acct["vnc_port"]
     started = False
     if not running_pid(args.name):
         if not args.start:
             sys.exit(f"error: '{args.name}' is not running. Start it first "
                      f"(omni start {args.name}) or: omni view {args.name} "
                      f"--start")
-        first = not acct.get("first_boot_done")
-        spawn_qemu(acct, cfg, dev=args.dev or first,
-                   mode=resolve_mode(cfg, args.mode))
+        acct = build_acct(args.name, cfg, dev=args.dev)
+        spawn_qemu(acct, cfg, dev=args.dev, mode=resolve_mode(cfg, args.mode))
         started = True
+        port = acct["vnc_port"]
         print(f"[view {args.name}] started instance (detached); waiting for "
               f"VNC on {host}:{port} ...")
+    else:
+        acct = load_account(args.name)
+        port = acct["vnc_port"]
 
     # Wait for the QEMU VNC server to accept connections (it binds at process
     # start, so this is quick; generous bound covers a cold spawn).
@@ -4629,7 +4649,7 @@ def cmd_screenshot(args):
     """Pull a screenshot from the guest framebuffer (true colors, works
     headless). Prints JSON: {ok, path}."""
     acct = load_account(args.name)
-    out = args.out or str(account_dir(args.name)
+    out = args.out or str(runtime_dir(args.name)
                           / f"shot-{int(time.time())}.png")
     try:
         adb(acct, "shell", "screencap", "-p", "/data/local/tmp/_s.png",
@@ -4981,10 +5001,10 @@ def cmd_capture(args):
 # ---------- always-on dev auto-screenshots (engine-owned lifecycle) ----------
 # The auto-screenshot recorder is NOT an opt-in the caller toggles: for a DEV
 # account it is started automatically the moment the instance finishes booting
-# (cmd_start --wait / cmd_resume), runs continuously for the instance's lifetime,
+# (cmd_start --wait), runs continuously for the instance's lifetime,
 # and is stopped on power-off (cmd_stop / cmd_remove). It writes to
 # $OMNI_AUTOCAP_DIR when set (omni-agent points that at its /workspace), else
-# accounts/<name>/autocap. `ensure_autocap` is idempotent — booting, resuming,
+# runtime/<name>/autocap. `ensure_autocap` is idempotent — booting, resuming,
 # or an explicit `omni autocap --ensure` never stacks a second recorder — so the
 # same feed is guaranteed on whenever a dev instance is up.
 AUTOCAP_MAX_KEYFRAMES = 5000            # long always-on session, not a 20s window
@@ -5180,10 +5200,7 @@ def cmd_test_apk(args):
     fresh = not (account_dir(name) / "account.json").exists()
     if fresh and not args.reuse:
         # Create a clean dev account on the current (dev) base.
-        import argparse as _a
-        ca = _a.Namespace(name=name, no_provision=False,
-                          data_size=cfg["qemu"]["data_disk_size"])
-        cmd_create(ca)
+        _make_persistent_arm_account(name, cfg)
     acct = load_account(name)
     result["base"] = acct["base"]
     result["arch"] = acct_arch(acct)
@@ -5414,7 +5431,6 @@ KIOSK_PACKAGE = "com.omni.kiosk"
 KIOSK_RECEIVER = KIOSK_PACKAGE + "/.SessionReceiver"
 KIOSK_ACTION_SET_SESSION = "com.omni.kiosk.SET_SESSION"
 KIOSK_ACTION_CLEAR_SESSION = "com.omni.kiosk.CLEAR_SESSION"
-SESSION_FILE = "session.json"
 
 # Runtime permissions granted to the game before launch so Android never parks a
 # consent dialog on top of it. POST_NOTIFICATIONS is the one that actually bites
@@ -5427,35 +5443,6 @@ ROBLOX_RUNTIME_PERMS = (
     "android.permission.RECORD_AUDIO",
     "android.permission.CAMERA",
 )
-
-
-def session_path(name):
-    return account_dir(name) / SESSION_FILE
-
-
-def load_session(name):
-    p = session_path(name)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text())
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def save_session(name, sess):
-    """Persist the account's session. The file holds a live account credential,
-    so it is written 0600 — the rest of accounts/<name>/ is not secret, this is."""
-    p = session_path(name)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(sess, indent=2) + "\n", encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass          # best-effort: Windows has no POSIX mode
-    os.replace(tmp, p)
-    return p
 
 
 def redact_token(tok):
@@ -5484,7 +5471,7 @@ def account_cookie(username):
 def resolve_token(args):
     """The cookie to log in with, in priority order:
 
-    1. the instance name IS a saved account username (`omni play <username>`) —
+    1. the instance name IS a saved account username (`omni start <username>`) —
        the normal path; no flag needed;
     2. an explicit --token-file / --token-stdin / --token (manual override).
 
@@ -5507,6 +5494,27 @@ def resolve_token(args):
     if name:
         return account_cookie(name)
     return None
+
+
+def store_session(name, args=None, place_override=None):
+    """The launch session for <name>, sourced from the central store:
+    token = the stored cookie, place_id = an explicit override else the stored
+    place_id. Optional transient join params come from CLI args (not
+    persisted)."""
+    from omnidroid import accounts as _acc
+    rec = _acc.get_account(_store_root(), name) or {}
+    sess = {"token": rec.get("cookie"), "place_id": None}
+    place = place_override if place_override is not None else rec.get("place_id")
+    if place is not None:
+        sess["place_id"] = place
+    if args is not None:
+        for attr, key in (("job", "game_instance_id"), ("user_id", "user_id"),
+                          ("access_code", "access_code"), ("link_code", "link_code"),
+                          ("launch_data", "launch_data")):
+            v = getattr(args, attr, None)
+            if v is not None:
+                sess[key] = v
+    return sess
 
 
 def _validate_place_id(v):
@@ -5575,12 +5583,13 @@ def kiosk_installed(acct):
     return "package:" in (r.stdout or "")
 
 
-def deliver_session(acct, label, play=True, restart=True):
-    """Hand the account's session to the in-guest kiosk and (by default) tell it
-    to join. Returns a status dict; never raises into a boot path."""
+def deliver_session(acct, label, sess, play=True, restart=True):
+    """Hand `sess` (see store_session()) to the in-guest kiosk and (by default)
+    tell it to join. `play=False` (no place_id) is HOME mode: the cookie is
+    still delivered — the account is logged in — but no place is joined.
+    Returns a status dict; never raises into a boot path."""
     name = acct["name"]
-    sess = load_session(name)
-    if not sess.get("place_id"):
+    if not sess.get("token") and not sess.get("place_id"):
         return {"delivered": False, "reason": "no_session"}
     if not kiosk_installed(acct):
         return {"delivered": False, "reason": "kiosk_missing",
@@ -5611,18 +5620,21 @@ def deliver_session(acct, label, play=True, restart=True):
             ROBLOX_PACKAGE, timeout=15)
     except Exception as e:  # noqa: BLE001 — the broadcast below still works
         print(f"[{label}] could not set omni_game_package: {e}")
-    if play and restart:
+    if restart:
         # Cold-start Roblox so the new cookie is read at startup. Without this,
         # switching accounts silently joins as the PREVIOUS user: the client
         # caches the authenticated user in-process. This has to happen host-side
         # — as shell we hold FORCE_STOP_PACKAGES, whereas the kiosk (an ordinary
-        # app, device owner or not) cannot stop a foreground app at all.
+        # app, device owner or not) cannot stop a foreground app at all. Applies
+        # in HOME mode too (play=False): the cookie still needs a cold start to
+        # take effect.
         try:
             adb(acct, "shell", "am", "force-stop", ROBLOX_PACKAGE, timeout=25)
         except Exception as e:  # noqa: BLE001 — a live instance still plays
             print(f"[{label}] could not force-stop {ROBLOX_PACKAGE}: {e}")
-    extras = {"place_id": ("--el", int(sess["place_id"])),
-              "play": ("--ez", "true" if play else "false")}
+    extras = {"play": ("--ez", "true" if play else "false")}
+    if sess.get("place_id"):
+        extras["place_id"] = ("--el", int(sess["place_id"]))
     if sess.get("token"):
         extras["token"] = ("--es", sess["token"])
     for key, flag in (("game_instance_id", "--es"), ("access_code", "--es"),
@@ -5640,7 +5652,7 @@ def deliver_session(acct, label, play=True, restart=True):
               "place_id": sess.get("place_id"), "played": bool(reply.get("launched"))}
     if not ok:
         status["reason"] = reply.get("error") or "kiosk_rejected"
-    print(f"[{label}] session -> kiosk: place {sess.get('place_id')}, "
+    print(f"[{label}] session -> kiosk: place {sess.get('place_id') or 'home'}, "
           f"token {redact_token(sess.get('token')) or 'NONE'}, "
           f"{'joined' if reply.get('launched') else 'not joined'}"
           + (f" ({reply.get('error')})" if reply.get("error") else ""))
@@ -5670,135 +5682,14 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None):
     if first:
         provision_settings(acct, label)
         acct["first_boot_done"] = True
-        save_account(acct)
+        # NOTE: no save_account() here. The only caller (cmd_start) always
+        # passes a build_acct() handle, which already carries
+        # first_boot_done=True -- so `first` is always False in practice and
+        # this branch is dead in the product path. A stray save_account()
+        # would write accounts/<name>/account.json, a file nothing reads
+        # under the diskless model; dropped rather than left as a landmine.
     _devkit_activate(acct, label)
     return True, first
-
-
-def _dev_mode_for_play(args):
-    """Whether `omni play` should target the DEV base for a NEW instance.
-
-    This is SELECTION (use dev), which is distinct from ACCESS (may use dev,
-    i.e. OMNI_DEV_MODE / dev_mode_enabled). The agent sets OMNI_DEV_MODE=1 just to
-    UNLOCK the dev base, but still plays production by default — so dev selection
-    must NOT be implied by OMNI_DEV_MODE, only by an explicit --dev or the
-    dedicated OMNI_USE_DEV_BASE 'default to dev' env. assert_dev_allowed still
-    refuses dev to a caller that has not unlocked it."""
-    if getattr(args, "dev", False):
-        return True
-    return _truthy_env("OMNI_USE_DEV_BASE")
-
-
-def _truthy_env(name):
-    return str(os.environ.get(name, "")).strip().lower() in (
-        "1", "true", "yes", "on")
-
-
-def cmd_play(args):
-    """Boot (or reuse) an instance and land INSIDE a place, logged in, with no
-    menu and no simulated taps — the product's whole point.
-
-    Identical on the dev and production bases: same kiosk, same session
-    broadcast, same roblox:// join. The dev base only differs in what is
-    additionally available (frida/Magisk + always-on screenshots)."""
-    ensure_qemu()
-    cfg = load_config()
-    dev = _dev_mode_for_play(args)
-    label = f"play {args.name}"
-    json_mode = getattr(args, "json", False)
-
-    # Resolve the session BEFORE creating anything on disk. load_session() and
-    # resolve_token()/account_cookie() are pure reads (accounts.json, or an
-    # ALREADY-existing instance's session.json) — neither needs an instance
-    # directory to exist, so this is safe to do ahead of ensure_instance().
-    # That ordering is load-bearing, not cosmetic: "the only way to create a
-    # profile is to log in" means a brand-new name with no saved cookie and no
-    # override must fail HERE, before a real instance (overlay + /data + QEMU
-    # disks) gets created for it — not after, the way it used to.
-    sess = load_session(args.name)
-    tok = resolve_token(args)
-    if tok:
-        sess["token"] = tok
-    if getattr(args, "place", None) is not None:
-        sess["place_id"] = _validate_place_id(args.place)
-    for attr, key in (("job", "game_instance_id"), ("access_code", "access_code"),
-                      ("link_code", "link_code"), ("launch_data", "launch_data"),
-                      ("user_id", "user_id")):
-        v = getattr(args, attr, None)
-        if v is not None:
-            sess[key] = v
-    if not sess.get("place_id"):
-        return fail("no_place",
-                    f"no place to join: pass --place <placeId> (or set one "
-                    f"first with `omni session {args.name} --place <id>`)")
-    if not sess.get("token") and not getattr(args, "no_token", False):
-        return fail("no_token",
-                    f"no saved Roblox account '{args.name}'. Sign it in first: "
-                    f"`omni login` (saves the account under its username), then "
-                    f"`omni play {args.name} --place <id>`. (Or override with "
-                    f"--token-file <file>, or --no-token to land on Roblox's "
-                    f"own login screen.) No instance was created for "
-                    f"'{args.name}'.")
-
-    # Only NOW do we know a session is deliverable (a real token, or the
-    # explicit --no-token escape hatch) — create/reuse the instance.
-    acct = ensure_instance(args.name, cfg, dev=dev,
-                           ephemeral=getattr(args, "ephemeral", False))
-    sess["updated"] = time.time()
-    save_session(args.name, sess)
-
-    # The kiosk's game package: Roblox is what this product runs.
-    if acct.get("game_package") != ROBLOX_PACKAGE:
-        acct["game_package"] = ROBLOX_PACKAGE
-        save_account(acct)
-
-    booted, first = _ensure_booted(acct, cfg, label,
-                                   timeout=getattr(args, "timeout", None),
-                                   accel=getattr(args, "accel", None))
-    result = {"name": args.name, "place_id": sess["place_id"],
-              "deeplink": roblox_deeplink(sess), "first_boot": first,
-              "arch": acct_arch(acct), "dev": acct_is_dev(acct),
-              "adb_port": acct["adb_port"], "vnc_port": acct["vnc_port"],
-              "session": public_session(sess)}
-    if not booted:
-        result.update({"ok": False, "booted": False, "error": "boot_timeout"})
-        if json_mode:
-            emit_json(result)
-        sys.exit(1)
-
-    status = deliver_session(acct, label, play=True)
-    result.update({"booted": True, "ok": bool(status.get("delivered")),
-                   **{k: v for k, v in status.items() if k != "kiosk"}})
-    result["kiosk"] = status.get("kiosk")
-
-    # Open a live WINDOW onto this instance so you can watch/play it, and so two
-    # `omni play` runs give two accounts side by side. Each viewer is its own
-    # detached process bound to this instance's own VNC port, so N windows for N
-    # accounts just work. Default ON for interactive use; suppressed by
-    # --no-window and by --json (a machine/automation caller drives via capture).
-    want_window = (not getattr(args, "no_window", False)
-                   and (getattr(args, "window", False) or not json_mode))
-    viewer_pid = None
-    if result["ok"] and want_window:
-        try:
-            if _wait_for_vnc("127.0.0.1", acct["vnc_port"], timeout=10):
-                title = f"omni: {args.name}  (place {sess['place_id']})"
-                viewer_pid = _spawn_builtin_viewer(
-                    args.name, "127.0.0.1", acct["vnc_port"], title).pid
-                result["viewer_pid"] = viewer_pid
-        except Exception as e:  # noqa: BLE001 — a window failure must not fail play
-            print(f"[{label}] could not open a window: {e}")
-
-    if json_mode:
-        emit_json(result)
-    elif result["ok"]:
-        where = (f"window opened (pid {viewer_pid})" if viewer_pid
-                 else f"vnc 127.0.0.1:{acct['vnc_port']} to watch")
-        print(f"[{label}] joined place {sess['place_id']} — {where}")
-    else:
-        print(f"[{label}] session NOT applied: "
-              f"{status.get('reason')} {status.get('detail', '')}")
-        sys.exit(1)
 
 
 def _token_flag_given(args):
@@ -5858,7 +5749,7 @@ def cmd_login(args):
       real authenticated session before it is trusted and saved — the same bar
       an interactive login has to clear.
 
-    Either way: ready to use as `omni play <username> --place`."""
+    Either way: ready to use as `omni start <username> --place`."""
     r, err = _capture_and_save_account(args)
     if err:
         return fail(err[0], err[1])
@@ -5869,7 +5760,7 @@ def cmd_login(args):
         emit_json(out)
     else:
         print(json.dumps(out, indent=2))
-        print(f"\nplay as this account:  omni play {r['username']} "
+        print(f"\nplay as this account:  omni start {r['username']} "
               f"--place <placeId>")
 
 
@@ -5905,41 +5796,36 @@ def cmd_accounts(args):
 
 
 def cmd_session(args):
-    """Inspect / set / clear an account's Roblox session without launching."""
+    """Inspect / set / clear an account's Roblox session (token + place),
+    sourced from the central store, without launching.
+
+    The token always comes from `omni login`; this command only ever touches
+    place_id. A --token* flag, if passed, is accepted but not persisted here
+    — the store owns the cookie."""
+    from omnidroid import accounts as _acc
     acct = load_account(args.name)
     name = args.name
     if getattr(args, "clear", False):
-        try:
-            session_path(name).unlink()
-        except OSError:
-            pass
+        _acc.set_fields(_store_root(), name, place_id=None)
         if running_pid(name) and kiosk_installed(acct):
             kiosk_broadcast(acct, KIOSK_ACTION_CLEAR_SESSION)
         out = {"name": name, "ok": True, "cleared": True}
-    elif getattr(args, "show", False) or not (
-            resolve_token(args) or getattr(args, "place", None)):
-        out = {"name": name, "ok": True, "session": public_session(load_session(name))}
-    else:
-        sess = load_session(name)
-        tok = resolve_token(args)
-        if tok:
-            sess["token"] = tok
-        if getattr(args, "place", None) is not None:
-            sess["place_id"] = _validate_place_id(args.place)
-        for attr, key in (("job", "game_instance_id"), ("user_id", "user_id"),
-                          ("launch_data", "launch_data")):
-            v = getattr(args, attr, None)
-            if v is not None:
-                sess[key] = v
-        sess["updated"] = time.time()
-        save_session(name, sess)
+    elif getattr(args, "place", None) is not None:
+        try:
+            _acc.set_fields(_store_root(), name, place_id=args.place)
+        except ValueError as e:
+            return fail("bad_place", str(e))
+        sess = store_session(name)
         # A live instance picks the change up now; --play re-joins with it.
         applied = None
         if running_pid(name) and kiosk_installed(acct):
-            applied = deliver_session(acct, f"session {name}",
+            applied = deliver_session(acct, f"session {name}", sess,
                                       play=bool(getattr(args, "play", False)))
         out = {"name": name, "ok": True, "session": public_session(sess),
                "applied": applied}
+    else:
+        out = {"name": name, "ok": True,
+               "session": public_session(store_session(name))}
     if getattr(args, "json", False):
         emit_json(out)
     else:
@@ -5980,28 +5866,48 @@ def main():
     vr.add_argument("--json", action="store_true")
     vr.set_defaults(func=cmd_version)
 
-    c = sub.add_parser("create",
-                       help="INTERNAL: make a raw instance disk for <name> "
-                            "(used by omni-agent). To ADD A ROBLOX ACCOUNT use "
-                            "`omni login` instead.")
-    c.add_argument("name")
-    c.add_argument("--arch", choices=["x86", "arm"], default=None,
-                   help="architecture for the new account (default: the "
-                        "host arch's base)")
-    c.add_argument("--base", default=None,
-                   help="explicit registered base tag (must match --arch)")
-    c.add_argument("--no-provision", action="store_true")
-    c.add_argument("--ephemeral", action="store_true",
-                   help="fully-shared, no-persistence instance (boot shared base "
-                        "snapshot=on; no per-account overlay disks)")
-    c.add_argument("--data-size", default=None)
-    c.add_argument("--json", action="store_true",
-                   help="one machine-readable JSON line on stdout "
-                        "(progress goes to stderr)")
-    c.set_defaults(func=cmd_create)
-
-    s = sub.add_parser("start")
-    s.add_argument("name")
+    s = sub.add_parser("start",
+                       help="launch an instance for a saved account: boot, "
+                            "deliver its Roblox session and land INSIDE a "
+                            "place if one is set, or on the account's home "
+                            "screen if not — logged in, no menu, no taps. "
+                            "`omni start <username> [--place <id>]`. The "
+                            "instance is auto-created (ephemeral); run two "
+                            "for two accounts at once. Dev and production "
+                            "alike")
+    s.add_argument("name", metavar="username",
+                   help="a saved Roblox account username (from `omni login`). "
+                        "It names the instance too — its cookie is used "
+                        "automatically, no --account needed")
+    s.add_argument("--place", default=None,
+                   help="Roblox placeId to join (persisted; reused next "
+                        "time). If omitted, boots to the account's home "
+                        "screen, logged in but not joined to any place")
+    _token_args(s)
+    s.add_argument("--job", default=None,
+                   help="gameInstanceId (JobId) to join a SPECIFIC server")
+    s.add_argument("--access-code", dest="access_code", default=None,
+                   help="private server accessCode")
+    s.add_argument("--link-code", dest="link_code", default=None,
+                   help="private server linkCode")
+    s.add_argument("--launch-data", dest="launch_data", default=None,
+                   help="launchData string (<=200 bytes decoded), readable "
+                        "in-game via Player:GetJoinData()")
+    s.add_argument("--user-id", dest="user_id", type=int, default=None,
+                   help="informational: which Roblox user the token belongs to")
+    s.add_argument("--no-token", dest="no_token", action="store_true",
+                   help="proceed without a login (lands on Roblox's login "
+                        "screen, which needs taps — almost never what you want)")
+    s.add_argument("--dev", action="store_true",
+                   help="launch the instance on the DEV base (frida+Magisk); "
+                        "dev-only, refused without OMNI_DEV_MODE")
+    s_win = s.add_mutually_exclusive_group()
+    s_win.add_argument("--window", action="store_true",
+                       help="open a live window even in --json mode (two "
+                            "starts = two accounts side by side)")
+    s_win.add_argument("--no-window", dest="no_window", action="store_true",
+                       help="do not open a window (headless; watch via "
+                            "`omni view` or capture)")
     s.add_argument("--mode", choices=list(MODES), default=None,
                    help="RAM/CPU tier (all headless): playable 4G/4c | "
                         "hard 3G/4c | brutal 2G/2c. Default: playable")
@@ -6010,18 +5916,9 @@ def main():
     s.add_argument("--accel", default=None,
                    help="override hypervisor (auto: Windows=whpx, "
                         "Linux=kvm). E.g. 'tcg' for a no-hypervisor test")
-    s.add_argument("--dev", action="store_true")
-    s.add_argument("--wait", action="store_true",
-                   help="block until boot completes (default: detach)")
     s.add_argument("--timeout", type=int, default=None)
-    s.add_argument("--json", action="store_true",
-                   help="one machine-readable JSON line on stdout with "
-                        "pid + adb/qmp/vnc ports")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_start)
-
-    rs = sub.add_parser("resume")
-    rs.add_argument("name")
-    rs.set_defaults(func=cmd_resume)
 
     st = sub.add_parser("stop",
                         help="power the instance OFF (adb shutdown -> QMP "
@@ -6036,10 +5933,11 @@ def main():
     st.set_defaults(func=cmd_stop)
 
     rm = sub.add_parser("remove",
-                        help="DESTRUCTIVE: stop if running, then delete "
-                             "accounts/<name>/ entirely (overlay + "
-                             "data.qcow2 + state); ports are freed. Can "
-                             "only ever delete inside accounts/")
+                        help="DESTRUCTIVE: stop if running, then delete the "
+                             "account's store entry and wipe runtime/<name>/; "
+                             "ports are freed. Also deletes a legacy "
+                             "accounts/<name>/ folder if one exists (can only "
+                             "ever delete inside accounts/)")
     rm.add_argument("name", help="exact account name (no globs)")
     rm.add_argument("--timeout", type=int, default=90,
                     help="seconds to wait for graceful power-off first")
@@ -6143,7 +6041,7 @@ def main():
                              "HEADLESS browser, no window, nothing to click. "
                              "Either way it saves the cookie under the "
                              "account's USERNAME (auto-detected). Then: "
-                             "omni play <username> --place <id>")
+                             "omni start <username> --place <id>")
     lg.add_argument("--browser", choices=["chrome", "firefox"], default="chrome")
     lg.add_argument("--timeout", type=int, default=300,
                     help="interactive sign-in only: seconds to wait for you "
@@ -6173,52 +6071,6 @@ def main():
     ac.add_argument("--json", action="store_true")
     ac.set_defaults(func=cmd_accounts)
 
-    pl = sub.add_parser("play",
-                        help="launch an instance for a saved account and land "
-                             "INSIDE a place, logged in, with no menu and no "
-                             "taps. `omni play <username> --place <id>`. The "
-                             "instance is auto-created (thin); run two for two "
-                             "accounts at once. Dev and production alike")
-    pl.add_argument("name", metavar="username",
-                    help="a saved Roblox account username (from `omni login`). "
-                         "It names the instance too — its cookie is used "
-                         "automatically, no --account needed")
-    pl.add_argument("--place", default=None,
-                    help="Roblox placeId to join (persisted; reused next time)")
-    _token_args(pl)
-    pl.add_argument("--job", default=None,
-                    help="gameInstanceId (JobId) to join a SPECIFIC server")
-    pl.add_argument("--access-code", dest="access_code", default=None,
-                    help="private server accessCode")
-    pl.add_argument("--link-code", dest="link_code", default=None,
-                    help="private server linkCode")
-    pl.add_argument("--launch-data", dest="launch_data", default=None,
-                    help="launchData string (<=200 bytes decoded), readable "
-                         "in-game via Player:GetJoinData()")
-    pl.add_argument("--user-id", dest="user_id", type=int, default=None,
-                    help="informational: which Roblox user the token belongs to")
-    pl.add_argument("--no-token", dest="no_token", action="store_true",
-                    help="join without a login (lands on Roblox's login "
-                         "screen, which needs taps — almost never what you want)")
-    pl.add_argument("--ephemeral", action="store_true",
-                    help="fully-shared, no-persistence instance: boot the shared "
-                         "base directly (snapshot=on), no per-account overlay disks "
-                         "— many run concurrently, nothing persists between boots")
-    pl.add_argument("--dev", action="store_true",
-                    help="create the instance on the DEV base (frida+Magisk); "
-                         "dev-only, refused without OMNI_DEV_MODE")
-    pl_win = pl.add_mutually_exclusive_group()
-    pl_win.add_argument("--window", action="store_true",
-                        help="open a live window even in --json mode (two plays "
-                             "= two accounts side by side)")
-    pl_win.add_argument("--no-window", dest="no_window", action="store_true",
-                        help="do not open a window (headless; watch via "
-                             "`omni view` or capture)")
-    pl.add_argument("--accel", default=None)
-    pl.add_argument("--timeout", type=int, default=None)
-    pl.add_argument("--json", action="store_true")
-    pl.set_defaults(func=cmd_play)
-
     se = sub.add_parser("session",
                         help="inspect/set/clear an account's Roblox session "
                              "(token + place) without launching")
@@ -6231,8 +6083,6 @@ def main():
     se.add_argument("--play", action="store_true",
                     help="if the instance is running, re-join with the new "
                          "session immediately")
-    se.add_argument("--show", action="store_true",
-                    help="print the stored session (token redacted)")
     se.add_argument("--clear", action="store_true",
                     help="forget the token+place, and log the live instance out")
     se.add_argument("--json", action="store_true")
@@ -6252,28 +6102,10 @@ def main():
     ub.add_argument("--json", action="store_true")
     ub.set_defaults(func=cmd_update_base)
 
-    ua = sub.add_parser("update-all",
-                        help="migrate ALL accounts to a base (default: "
-                             "current); per-account data preserved. AUTO "
-                             "picks the near-instant no-boot fast path "
-                             "when the base game is unchanged")
-    ua.add_argument("--to", default=None)
-    ua.add_argument("--fast", action="store_true",
-                    help="force overlay-repoint only (no boot) for every "
-                         "account, even if the base game changed")
-    ua.add_argument("--full", action="store_true",
-                    help="force boot + re-provision for every account "
-                         "(needed for /data policy/settings changes, e.g. "
-                         "lockdown or trim updates)")
-    ua.add_argument("--no-reprovision", action="store_true")
-    ua.add_argument("--skip-current", action="store_true",
-                    help="skip accounts already on the target base")
-    ua.add_argument("--json", action="store_true")
-    ua.set_defaults(func=cmd_update_all)
-
     rb = sub.add_parser("rebuild-base",
                         help="bake/replace the pre-installed game in a new "
-                             "base version (production); then update-all")
+                             "base version (production); ephemeral instances "
+                             "pick it up on next boot")
     rb.add_argument("--game", required=True, help="path to the game APK")
     rb.set_defaults(func=cmd_rebuild_base)
 
@@ -6359,8 +6191,9 @@ def main():
                     help="KSM pages_sharing must be stable this long "
                          "before measuring")
     bk.add_argument("--apk", default=None,
-                    help="game APK to install per instance (needed on a "
-                         "dev base with no pre-installed game)")
+                    help="override game APK to install fresh into each "
+                         "instance instead of measuring the baked-in "
+                         "Roblox workload")
     bk.add_argument("--prefix", default="bench",
                     help="bench account name prefix")
     bk.add_argument("--keep", action="store_true",
@@ -6427,7 +6260,7 @@ def main():
     cap.add_argument("name")
     cap.add_argument("--out", default=None,
                      help="output dir for keyframes + metadata.json + "
-                          "logcat.txt (default accounts/<name>/capture-<ts>)")
+                          "logcat.txt (default runtime/<name>/capture-<ts>)")
     cap.add_argument("--duration", type=float, default=20.0,
                      help="seconds to observe the screen (bounded mode)")
     cap.add_argument("--auto", action="store_true",
@@ -6476,7 +6309,7 @@ def main():
                      help="force a fresh recorder (e.g. to repoint --out)")
     aco.add_argument("--out", default=None,
                      help="output dir (default $OMNI_AUTOCAP_DIR or "
-                          "accounts/<name>/autocap)")
+                          "runtime/<name>/autocap)")
     aco.add_argument("--json", action="store_true")
     aco.set_defaults(func=cmd_autocap)
 
