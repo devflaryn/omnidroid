@@ -62,6 +62,8 @@ This is sub-project **A**. Two later sub-projects, designed separately, are out 
       "token": "<roblox cookie/token>",
       "place_id": null,
       "base": "prod",
+      "proxy": null,
+      "group": null,
       "created_at": 1784438529.0,
       "notes": null
     }
@@ -73,6 +75,9 @@ This is sub-project **A**. Two later sub-projects, designed separately, are out 
 - `token` is the captured Roblox cookie/session used for cookie-login at boot.
 - `place_id` is an optional default place to join; `null`/absent means boot to home.
 - `base` is `"prod"` or `"dev"`.
+- `proxy` and `group` are **reserved for future use** — always written (default `null`) so later
+  updates (per-account proxying, account grouping/tagging) need no schema migration. A does not
+  consume them yet.
 - `version` supports future schema migration. (Current on-disk shape is `{version, accounts:[names]}`;
   the new shape replaces it — see Migration.)
 - This record **is** the entire account. No folder, no disk, no stored ports.
@@ -163,7 +168,9 @@ pyproject.toml           # console_scripts: omnidroid = "omnidroid.cli:main"
   `omnidroid <cmd>` (after `pip install -e .`), `python -m omnidroid <cmd>`, `python manager.py <cmd>`.
 - omni-agent and the future UI `import omnidroid` and call the API directly — they do not shell out.
 - The ~15 dev/build commands (the bulk of the old 6500 lines) are quarantined in `baseimg.py`, so
-  the everyday runtime path (login/start/stop) lives in small, readable modules.
+  the everyday runtime path (login/start/stop) lives in small, readable modules. `baseimg.py` may
+  be subdivided further during implementation planning if it grows unwieldy (e.g. `baseimg/` with
+  `brand.py`, `bake.py`, `devbase.py`); the runtime modules stay as listed.
 - **No feature regressions**: every preserved command behaves as before after the move.
 
 ### 5. Cross-platform / paths (`config.py` owns all paths)
