@@ -1639,6 +1639,11 @@ def _make_persistent_arm_account(name, cfg, tag=None):
     arm-only, matching build_acct."""
     tag = tag or _select_base_tag(cfg)
     base = cfg["bases"][tag]
+    # Dev-base safety gate: an explicit tag (e.g. `update-kiosk --base dev`)
+    # bypasses _select_base_tag's auto-avoidance, so gate here unconditionally
+    # — same convention build_acct() follows. Refuses a dev base without
+    # OMNI_DEV_MODE=1 (customer-safety boundary; see dev-mode gate comment).
+    assert_dev_allowed(tag, base)
     if base_type(base) != BASE_TYPE_ARM:
         fail("arch_boundary", f"base '{tag}' is not arm-uefi")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -4010,6 +4015,13 @@ def cmd_bench_ksm(args):
     prev_avail = base_avail
     for i in range(1, args.max + 1):
         name = f"{args.prefix}{i}"
+        # Never re-spawn over a still-live instance of this name (e.g. a prior
+        # `bench-ksm --keep` run): that would orphan the old QEMU process and
+        # clobber its run.json/efivars. Skip to the next free name instead.
+        if running_pid(name):
+            print(f"[bench] {name} already running (kept from a prior run) "
+                  f"- skipping this slot")
+            continue
         acct = build_acct(name, cfg, dev=False)
         pkg = acct.get("game_package")
         mode = resolve_mode(cfg, args.mode)
