@@ -12,8 +12,8 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "manager"))
-import omni  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from omnidroid import engine as omni  # noqa: E402
 
 
 # Real adb-install stderr seen on a reused instance (verified live).

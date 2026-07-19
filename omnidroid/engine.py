@@ -4624,7 +4624,7 @@ def _run_vncview(a):
     """Internal: run the built-in viewer in THIS process (invoked as the
     hidden `_vncview` subcommand by _spawn_builtin_viewer)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import vncview
+    from omnidroid import vncview
     return vncview.run_viewer(a.host, a.port, a.title)
 
 
@@ -4826,7 +4826,7 @@ def cmd_capture(args):
     DEV-BASE-ONLY feature (the arm devkit disk); it refuses to run on the
     production bases."""
     import os
-    import capture as _capture
+    from omnidroid import capture as _capture
     acct = load_account(args.name)
     json_mode = getattr(args, "json", False)
     auto = bool(getattr(args, "auto", False))
@@ -5477,7 +5477,7 @@ def public_session(sess):
 
 def account_cookie(username):
     """The saved .ROBLOSECURITY for a Roblox username, or None."""
-    import cookies as _ck
+    from omnidroid import cookies as _ck
     rec = _ck.get_account(REPO, username)
     return rec.get("cookie") if rec else None
 
@@ -5821,7 +5821,7 @@ def _capture_and_save_account(args):
     a cookie (--token*) verified headlessly, or capture one via a real browser
     sign-in; save it under the auto-detected USERNAME. Returns (record, None) on
     success or (None, (error, message)) on failure — no printing/exit here."""
-    import cookies as _ck
+    from omnidroid import cookies as _ck
     token_requested = _token_flag_given(args)
     tok = resolve_token(args)
     if token_requested and not tok:
@@ -5874,7 +5874,7 @@ def cmd_login(args):
 
 def cmd_accounts(args):
     """List / verify / remove saved Roblox accounts. Never prints a cookie."""
-    import cookies as _ck
+    from omnidroid import cookies as _ck
     if getattr(args, "set_custom_name", None):
         username, custom = args.set_custom_name
         # Display-only label, separate from the username (the account's real
@@ -5955,7 +5955,7 @@ def cmd_adb(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="omni")
+    p = argparse.ArgumentParser(prog="omnidroid")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def _token_args(parser):
