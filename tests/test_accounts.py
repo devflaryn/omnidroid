@@ -68,6 +68,43 @@ class Store(unittest.TestCase):
         cookies.save_account(self.repo, "u", "new", 1)
         self.assertEqual(cookies.get_account(self.repo, "u")["cookie"], "new")
 
+    def test_new_fields_default_to_none_on_first_save(self):
+        cookies.save_account(self.repo, "u", TOKEN, 7)
+        rec = cookies.get_account(self.repo, "u")
+        for f in ("place_id", "base", "proxy", "group", "notes"):
+            self.assertIn(f, rec)
+            self.assertIsNone(rec[f])
+
+    def test_new_fields_survive_relogin(self):
+        cookies.save_account(self.repo, "u", "old", 1)
+        # simulate A2.2 setting fields, then a routine cookie refresh
+        data = json.loads(cookies.accounts_path(self.repo).read_text())
+        data["accounts"]["u"]["place_id"] = 123
+        data["accounts"]["u"]["base"] = "dev"
+        data["accounts"]["u"]["group"] = "farm-a"
+        cookies.accounts_path(self.repo).write_text(json.dumps(data))
+        cookies.save_account(self.repo, "u", "new", 1)   # re-login
+        rec = cookies.get_account(self.repo, "u")
+        self.assertEqual(rec["cookie"], "new")           # cookie refreshed
+        self.assertEqual(rec["place_id"], 123)           # field preserved
+        self.assertEqual(rec["base"], "dev")
+        self.assertEqual(rec["group"], "farm-a")
+
+    def test_listing_exposes_place_base_group_but_not_proxy_notes(self):
+        cookies.save_account(self.repo, "u", TOKEN, 1)
+        data = json.loads(cookies.accounts_path(self.repo).read_text())
+        data["accounts"]["u"].update(
+            {"place_id": 9, "base": "prod", "group": "g",
+             "proxy": "http://secret:pw@host", "notes": "n"})
+        cookies.accounts_path(self.repo).write_text(json.dumps(data))
+        entry = cookies.list_accounts(self.repo)[0]
+        self.assertEqual(entry["place_id"], 9)
+        self.assertEqual(entry["base"], "prod")
+        self.assertEqual(entry["group"], "g")
+        self.assertNotIn("proxy", entry)
+        self.assertNotIn("notes", entry)
+        self.assertNotIn("cookie", entry)
+
 
 class CustomName(unittest.TestCase):
     """A friendly custom_name is a display-only label alongside the username —

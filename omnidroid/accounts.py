@@ -107,10 +107,10 @@ def _migrate_legacy(repo):
 
 
 def save_account(repo, username, cookie, user_id=None, display_name=None):
-    """Upsert an account keyed by username. A previously-set custom_name is
-    PRESERVED across re-logins (a routine cookie refresh must not silently wipe
-    a friendly label someone attached with set_custom_name) — it is only ever
-    changed by set_custom_name."""
+    """Upsert an account keyed by username. Previously-set fields that are NOT
+    part of a routine cookie refresh (custom_name, place_id, base, proxy, group,
+    notes) are PRESERVED across re-logins — a cookie refresh must not wipe
+    metadata attached elsewhere."""
     data = _read(repo)
     existing = data["accounts"].get(username) or {}
     data["accounts"][username] = {
@@ -119,6 +119,11 @@ def save_account(repo, username, cookie, user_id=None, display_name=None):
         "display_name": display_name,
         "custom_name": existing.get("custom_name"),
         "cookie": cookie,
+        "place_id": existing.get("place_id"),
+        "base": existing.get("base"),
+        "proxy": existing.get("proxy"),
+        "group": existing.get("group"),
+        "notes": existing.get("notes"),
         "saved": time.time(),
     }
     _write(repo, data)
@@ -162,6 +167,9 @@ def list_accounts(repo):
                     "user_id": rec.get("user_id"),
                     "display_name": rec.get("display_name"),
                     "custom_name": rec.get("custom_name"),
+                    "place_id": rec.get("place_id"),
+                    "base": rec.get("base"),
+                    "group": rec.get("group"),
                     "saved": rec.get("saved"),
                     "has_cookie": bool(rec.get("cookie"))})
     return out
