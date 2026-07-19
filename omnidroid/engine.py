@@ -820,6 +820,7 @@ def running_instances():
             continue
         if pid_alive(data.get("pid")):
             out.append({"name": d.name, "pid": data["pid"],
+                        "base": data.get("base"),
                         "adb_port": data.get("adb_port"),
                         "qmp_port": data.get("qmp_port"),
                         "vnc_port": data.get("vnc_port")})
