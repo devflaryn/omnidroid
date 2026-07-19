@@ -21,7 +21,6 @@ def _app_root():
 
 REPO = _app_root()
 CONFIG_PATH = REPO / "configs" / "paths.json"
-ACCOUNTS_DIR = REPO / "accounts"
 QEMU_DIR = REPO / "qemu"          # local (auto-installed) QEMU lives here
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"

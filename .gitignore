@@ -27,6 +27,7 @@ tokens/
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
 
 # Android build outputs (kiosk APK)
 *.apk
