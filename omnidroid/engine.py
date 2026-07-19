@@ -612,11 +612,67 @@ def account_dir(name):
     return ACCOUNTS_DIR / name
 
 
+def _base_tag_for_mode(rec):
+    """Resolve a store record's base MODE ("prod"/"dev"/None -- see
+    omnidroid/accounts.py) to a cfg base TAG (a key into cfg["bases"]).
+    The store and the engine speak different vocabularies for "base": the
+    store tracks a coarse mode, the engine needs the exact registered base
+    entry to boot/introspect."""
+    cfg = read_config()
+    bases = cfg.get("bases") or {}
+    mode = (rec or {}).get("base")
+    if mode == "dev":
+        for t, b in bases.items():
+            if base_is_dev(b):
+                return t
+        return DEV_BASE_TAG
+    # prod or unset: the arm production tag.
+    tag = effective_base_tag(cfg)
+    if tag and tag in bases and not base_is_dev(bases[tag]):
+        return tag
+    for t, b in bases.items():
+        if base_type(b) == BASE_TYPE_ARM and not base_is_dev(b):
+            return t
+    return ARM_BASE_TAG
+
+
 def load_account(name):
-    p = account_dir(name) / "account.json"
-    if not p.exists():
-        sys.exit(f"error: no such account '{name}' (looked for {p})")
-    return ensure_vnc_port(json.loads(p.read_text()))
+    """Build a runtime HANDLE for `name` -- identity from the central store
+    (omnidroid/accounts.py), live ports (and, if running, the exact base tag)
+    from runtime/<name>/run.json. Reads NO per-account folder: the ~14
+    running-instance commands only ever need name/base/ports/dev/game_package,
+    all of which live in one of those two places now."""
+    from omnidroid import accounts as _acc
+    rec = _acc.get_account(_store_root(), name)
+    run_path = runtime_dir(name) / "run.json"
+    run = None
+    if run_path.exists():
+        try:
+            run = json.loads(run_path.read_text())
+        except Exception:  # noqa: BLE001
+            run = None
+    if rec is None and run is None:
+        sys.exit(f"error: no such account '{name}'")
+
+    cfg = read_config()
+    if run and run.get("base"):
+        base_tag = run["base"]
+    else:
+        base_tag = _base_tag_for_mode(rec)
+
+    acct = {
+        "name": name,
+        "base": base_tag,
+        "ephemeral": True,
+        "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+        "game_package": ROBLOX_PACKAGE,
+        "first_boot_done": True,
+    }
+    if run:
+        for key in ("adb_port", "qmp_port", "vnc_port"):
+            if run.get(key) is not None:
+                acct[key] = run[key]
+    return acct
 
 
 def save_account(acct):
@@ -1196,6 +1252,7 @@ def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
          "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE),
+         "base": acct["base"],
          "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
          "vnc_port": acct["vnc_port"]}))
     return proc.pid
