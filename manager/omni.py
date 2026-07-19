@@ -1638,23 +1638,38 @@ def resolve_su(acct):
     return None
 
 
-def _magisk_pkg(acct):
+def _magisk_pkg(acct, su=None):
     """The installed Magisk manager app's package name, or None. Magisk can be
-    installed under its default 'com.topjohnwu.magisk' or a hidden/random
-    ('repackaged') package, so we discover it from the package list rather than
-    hard-coding. Best-effort; never raises."""
+    installed under its default 'com.topjohnwu.magisk' OR a hidden/random
+    ('repackaged') package with no 'magisk' in the name — so if the name scan
+    fails we ask the Magisk daemon itself (root) for its stored requester package.
+    Best-effort; never raises."""
     try:
         r = adb(acct, "shell", "pm", "list", "packages", timeout=10)
     except Exception:
-        return None
-    pkgs = [ln.split(":", 1)[1].strip() for ln in (r.stdout or "").splitlines()
+        r = None
+    pkgs = [ln.split(":", 1)[1].strip() for ln in ((r.stdout if r else "") or "").splitlines()
             if ln.startswith("package:")]
-    for p in pkgs:
-        if p == "com.topjohnwu.magisk":
-            return p
+    if "com.topjohnwu.magisk" in pkgs:
+        return "com.topjohnwu.magisk"
     for p in pkgs:
         if "magisk" in p.lower():
             return p
+    # Hidden/repackaged: the daemon stores the manager package as 'requester'.
+    su = su or resolve_su(acct)
+    if su:
+        q = 'magisk --sqlite "SELECT value FROM strings WHERE key=\'requester\'"'
+        try:
+            rr = adb(acct, "shell", f"{su} 0 sh -c {shlex.quote(q)}", timeout=15)
+            for ln in ((rr.stdout or "")).splitlines():
+                ln = ln.strip()
+                # rows print as: value=<pkg>
+                if ln.startswith("value=") and "." in ln[6:]:
+                    cand = ln[6:].strip()
+                    if cand in pkgs or not pkgs:
+                        return cand
+        except Exception:
+            pass
     return None
 
 
@@ -5266,16 +5281,40 @@ def cmd_dev_ui(args):
             print(out["message"])
         return
     if args.show == "magisk":
-        mpkg = _magisk_pkg(acct)
+        su = resolve_su(acct)
+        mpkg = _magisk_pkg(acct, su)
+        diag = {"su": su, "magisk_pkg": mpkg}
         if not mpkg:
-            out = {"ok": False, "error": "magisk_not_installed",
-                   "message": "Magisk manager app not found on this instance."}
+            out = {"ok": False, "error": "magisk_not_found", "diag": diag,
+                   "message": ("Could not find the Magisk manager app. List packages to see its "
+                               f"name: omni adb {args.name} -- shell pm list packages | grep -i magisk "
+                               "(if hidden/repackaged it has a random name).")}
+            print(out["message"])
         else:
-            adb(acct, "shell", "monkey", "-p", mpkg,
-                "-c", "android.intent.category.LAUNCHER", "1", timeout=20)
-            out = {"ok": True, "showing": "magisk", "magisk_pkg": mpkg,
-                   "message": f"Magisk app ({mpkg}) foregrounded. "
-                              f"Switch back: omni dev-ui {args.name} --show kiosk"}
+            # The kiosk pins itself with Lock Task Mode (device-owner), which blocks
+            # launching other apps — that is why a plain `am start`/monkey did
+            # nothing. Release the lock task via ROOT first, then launch Magisk as
+            # root so it comes to the front. Best-effort; we report each step so a
+            # failure is diagnosable from the --json output.
+            steps = {}
+            if su:
+                r1 = adb(acct, "shell", f"{su} 0 sh -c {shlex.quote('am task lock stop')}",
+                         timeout=15)
+                steps["lock_stop"] = ((r1.stdout or "") + (r1.stderr or "")).strip()[-200:]
+                r2 = adb(acct, "shell",
+                         f"{su} 0 sh -c {shlex.quote(f'monkey -p {mpkg} -c android.intent.category.LAUNCHER 1')}",
+                         timeout=20)
+                steps["launch"] = ((r2.stdout or "") + (r2.stderr or "")).strip()[-200:]
+            else:
+                r2 = adb(acct, "shell", "monkey", "-p", mpkg,
+                         "-c", "android.intent.category.LAUNCHER", "1", timeout=20)
+                steps["launch_no_root"] = ((r2.stdout or "") + (r2.stderr or "")).strip()[-200:]
+            diag["steps"] = steps
+            out = {"ok": True, "showing": "magisk", "diag": diag,
+                   "message": (f"Tried to open Magisk ({mpkg}) via {'root' if su else 'shell'}. "
+                               f"If it still didn't appear, the kiosk Lock Task is holding the "
+                               f"foreground — paste this --json diag. "
+                               f"Back to kiosk: omni dev-ui {args.name} --show kiosk")}
             print(out["message"])
     else:
         res = _assert_kiosk_foreground(acct, f"dev-ui {args.name}")
