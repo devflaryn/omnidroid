@@ -5426,8 +5426,8 @@ def public_session(sess):
 
 def account_cookie(username):
     """The saved .ROBLOSECURITY for a Roblox username, or None."""
-    from omnidroid import cookies as _ck
-    rec = _ck.get_account(_store_root(), username)
+    from omnidroid import accounts as _acc
+    rec = _acc.get_account(_store_root(), username)
     return rec.get("cookie") if rec else None
 
 
@@ -5770,7 +5770,7 @@ def _capture_and_save_account(args):
     a cookie (--token*) verified headlessly, or capture one via a real browser
     sign-in; save it under the auto-detected USERNAME. Returns (record, None) on
     success or (None, (error, message)) on failure — no printing/exit here."""
-    from omnidroid import cookies as _ck
+    from omnidroid import accounts as _acc
     token_requested = _token_flag_given(args)
     tok = resolve_token(args)
     if token_requested and not tok:
@@ -5780,10 +5780,10 @@ def _capture_and_save_account(args):
         return None, ("bad_token", "--token/--token-file/--token-stdin was "
                                    "given but resolved to an empty cookie")
     if tok:
-        r = _ck.capture_login_from_cookie(_store_root(), tok,
+        r = _acc.capture_login_from_cookie(_store_root(), tok,
                                           browser=args.browser)
     else:
-        r = _ck.capture_login(_store_root(), browser=args.browser,
+        r = _acc.capture_login(_store_root(), browser=args.browser,
                               timeout=args.timeout,
                               profile_dir=getattr(args, "profile_dir", None))
     if not r.get("ok"):
@@ -5791,7 +5791,7 @@ def _capture_and_save_account(args):
     # Optional display-only alias (never the identity/instance name).
     alias = getattr(args, "alias", None)
     if alias:
-        _ck.set_custom_name(_store_root(), r["username"], alias)
+        _acc.set_custom_name(_store_root(), r["username"], alias)
     return r, None
 
 
@@ -5825,29 +5825,29 @@ def cmd_login(args):
 
 def cmd_accounts(args):
     """List / verify / remove saved Roblox accounts. Never prints a cookie."""
-    from omnidroid import cookies as _ck
+    from omnidroid import accounts as _acc
     if getattr(args, "set_custom_name", None):
         username, custom = args.set_custom_name
         # Display-only label, separate from the username (the account's real
         # identity and the instance name — never changed by this).
-        existed = _ck.set_custom_name(_store_root(), username, custom)
+        existed = _acc.set_custom_name(_store_root(), username, custom)
         if not existed:
             return fail("no_account", f"no saved account '{username}'")
         out = {"ok": True, "username": username, "custom_name": custom or None}
     elif getattr(args, "remove", None):
-        existed = _ck.remove_account(_store_root(), args.remove)
+        existed = _acc.remove_account(_store_root(), args.remove)
         out = {"ok": True, "removed": args.remove, "existed": existed}
     else:
-        accts = _ck.list_accounts(_store_root())
+        accts = _acc.list_accounts(_store_root())
         if getattr(args, "verify", False):
             # A cookie dies when the account signs out or changes password, and
             # otherwise only surfaces as a login screen inside the VM minutes
             # later. One cheap call tells you now.
             for a in accts:
-                rec = _ck.get_account(_store_root(), a["username"])
-                uid, _uname = _ck.whoami((rec or {}).get("cookie") or "")
+                rec = _acc.get_account(_store_root(), a["username"])
+                uid, _uname = _acc.whoami((rec or {}).get("cookie") or "")
                 a["valid"] = bool(uid)
-        out = {"ok": True, "accounts": accts, "store": str(_ck.accounts_path(_store_root()))}
+        out = {"ok": True, "accounts": accts, "store": str(_acc.accounts_path(_store_root()))}
     if getattr(args, "json", False):
         emit_json(out)
     else:
