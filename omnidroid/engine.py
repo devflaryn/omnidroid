@@ -653,11 +653,14 @@ def vnc_start(cfg):
 
 
 def allocate_ports(cfg):
+    """Lowest free port-index across RUNNING instances (a stopped instance
+    frees its slot immediately). The three ranges are 1000 apart, so the shared
+    index keeps adb/qmp/vnc aligned and collision-free below 1000 concurrent."""
     q = cfg["qemu"]
     used = set()
-    for a in all_accounts():
-        used.add(a["adb_port"] - q["adb_port_start"])
-        used.add(a["qmp_port"] - q["qmp_port_start"])
+    for inst in running_instances():
+        if inst.get("adb_port") is not None:
+            used.add(inst["adb_port"] - q["adb_port_start"])
     i = 0
     while i in used:
         i += 1
