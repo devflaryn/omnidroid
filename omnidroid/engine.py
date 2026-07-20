@@ -2005,7 +2005,10 @@ def cmd_start(args):
             emit_json(result)
         sys.exit(1)
 
-    status = deliver_session(acct, label, sess, play=is_join)
+    # start ALWAYS launches: the kiosk joins when the session carries a place,
+    # else lands on home (logged in). play=is_join was the home-mode bug --
+    # play=False told the kiosk not to launch at all, so home never appeared.
+    status = deliver_session(acct, label, sess, play=True)
     result.update({"booted": True, "ok": bool(status.get("delivered")),
                    **{k: v for k, v in status.items() if k != "kiosk"}})
     result["kiosk"] = status.get("kiosk")

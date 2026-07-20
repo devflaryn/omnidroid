@@ -59,12 +59,15 @@ public class SessionReceiver extends BroadcastReceiver {
 
     private void apply(Context c, Intent i, JSONObject out) throws Exception {
         long place = i.getLongExtra(OmniSession.KEY_PLACE_ID, 0L);
-        if (place <= 0L) {
-            out.put("ok", false).put("error", "no_place");
-            return;
-        }
         SharedPreferences.Editor e = OmniSession.prefs(c).edit();
-        e.putLong(OmniSession.KEY_PLACE_ID, place);
+        if (place > 0L) {
+            e.putLong(OmniSession.KEY_PLACE_ID, place);
+        } else {
+            // HOME mode: no place to join. Clear any stale place so a later
+            // reboot-driven auto-join can't fire on an old target; the account
+            // is still logged in (token below) and lands on Roblox's home.
+            e.remove(OmniSession.KEY_PLACE_ID);
+        }
         putIfPresent(e, i, OmniSession.KEY_TOKEN);
         putIfPresent(e, i, OmniSession.KEY_GAME_INSTANCE_ID);
         putIfPresent(e, i, OmniSession.KEY_ACCESS_CODE);
@@ -96,7 +99,16 @@ public class SessionReceiver extends BroadcastReceiver {
         if (!hasToken) out.put("warning", "no_token_stored");
 
         if (i.getBooleanExtra("play", false)) {
-            String err = OmniSession.join(c, "host session");
+            // play = "launch now". A place joins it; no place but a stored
+            // token lands on HOME (logged in); nothing to launch otherwise.
+            String err;
+            if (place > 0L) {
+                err = OmniSession.join(c, "host session");
+            } else if (hasToken) {
+                err = OmniSession.launchHome(c);
+            } else {
+                err = "no_session";
+            }
             out.put("launched", err == null);
             if (err != null) out.put("error", err).put("ok", false);
         } else {

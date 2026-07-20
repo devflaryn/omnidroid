@@ -314,8 +314,11 @@ class PlayGatesOnLogin(unittest.TestCase):
 
 
 class StartHomeVsJoin(unittest.TestCase):
-    """`omni start` with no --place boots to HOME (play=False, cookie
-    delivered, nothing joined); with --place it JOINS (play=True)."""
+    """`omni start` always LAUNCHES (play=True): the kiosk decides join-vs-home
+    by whether the session carries a place_id. With --place the session has a
+    place (JOIN); with no place the session has none (HOME -- the kiosk lands
+    Roblox on its home screen, logged in). play=False would tell the kiosk not
+    to launch at all, which is wrong for start (see the home-mode bug)."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="omni-test-repo-"))
@@ -355,18 +358,22 @@ class StartHomeVsJoin(unittest.TestCase):
             omni.cmd_start(self._args(**over))
         return deliver_mock
 
-    def test_no_place_delivers_home_not_join(self):
+    def test_no_place_delivers_home_launch(self):
         deliver_mock = self._run(place=None)
         deliver_mock.assert_called_once()
-        _, kwargs = deliver_mock.call_args
-        # play is passed positionally or as kwarg depending on call site;
-        # cmd_start calls deliver_session(acct, label, sess, play=is_join).
-        self.assertFalse(deliver_mock.call_args.kwargs.get("play", True))
+        # start ALWAYS launches (play=True); HOME = the delivered session has
+        # no place_id, so the kiosk lands on home instead of joining.
+        self.assertTrue(deliver_mock.call_args.kwargs.get("play", False))
+        sess = deliver_mock.call_args.args[2]
+        self.assertIsNone(sess.get("place_id"))
 
     def test_place_delivers_join(self):
         deliver_mock = self._run(place="606849621")
         deliver_mock.assert_called_once()
+        # play=True AND a place_id present -> the kiosk joins that place.
         self.assertTrue(deliver_mock.call_args.kwargs.get("play", False))
+        sess = deliver_mock.call_args.args[2]
+        self.assertEqual(sess.get("place_id"), 606849621)
 
 
 if __name__ == "__main__":

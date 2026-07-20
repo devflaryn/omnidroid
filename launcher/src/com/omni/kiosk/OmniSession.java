@@ -120,6 +120,30 @@ public final class OmniSession {
     }
 
     /**
+     * Launch Roblox to its OWN home screen (no deep link) — HOME mode. The
+     * account is already logged in (its cookie was published via
+     * SessionProvider for the in-Roblox bootstrap to install on cold start), so
+     * the app lands on the mobile home/discover screen instead of joining a
+     * place. Uses the package launcher intent, not a roblox:// VIEW, so it can
+     * never resolve to a browser or a chooser. Returns null on success, else a
+     * short reason the host can act on.
+     */
+    public static String launchHome(Context c) {
+        if (!isInstalled(c, ROBLOX_PACKAGE)) return "roblox_not_installed";
+        Intent i = c.getPackageManager().getLaunchIntentForPackage(ROBLOX_PACKAGE);
+        if (i == null) return "no_launch_intent";
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            c.startActivity(i);
+        } catch (Exception e) {
+            Log.w(TAG, "home launch failed: " + e);
+            return "start_failed";
+        }
+        Log.i(TAG, "launched home (logged in, no join)");
+        return null;
+    }
+
+    /**
      * Join the configured place. Returns null on success, else a short reason
      * the host can act on.
      */
