@@ -1995,7 +1995,7 @@ def cmd_start(args):
     cfg = load_config()
     dev = _dev_mode_for_play(args)
     if getattr(args, "apk", None):
-        if not _dev_mode_for_play(args):
+        if not dev:
             return fail("apk_dev_only",
                         "--apk requires the dev base: pass --dev (or set "
                         "OMNI_USE_DEV_BASE). Installing a custom APK is a "
@@ -2065,7 +2065,7 @@ def cmd_start(args):
         ir = _install_apk(acct, args.apk, label)
         if not ir.get("ok"):
             result.update({"booted": True, "ok": False,
-                           "error": "apk_install_failed",
+                           "error": ir.get("error", "apk_install_failed"),
                            "detail": ir.get("detail")})
             if json_mode:
                 emit_json(result)
