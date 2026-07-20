@@ -241,6 +241,12 @@ ARM_DEVKIT_DISK = "base_arm_devkit.qcow2"
 # The rooted dev SYSTEM overlay (COW on base_arm.qcow2) — holds the Magisk-
 # patched boot. base_arm.qcow2 stays immutable.
 ARM_DEVSYSTEM_DISK = "base_arm_devsystem.qcow2"
+# Root-state markers embedded in the dev base's human-readable `notes`. Kept as
+# constants because _dev_base_entry rewrites whichever one is stale when it
+# preserves a hand-edited note — `notes` must never contradict
+# devkit_manifest.rooted.
+ROOTED_MARKER = " [rooted]"
+ROOT_PENDING_MARKER = " [root pending: --patch-boot]"
 # The dev /data template: a copy of the provisioned arm /data that ALSO has
 # Magisk fully configured (shell su granted Forever, root_access=3, Zygisk +
 # DenyList on), captured once from a rooted dev boot. When present, dev accounts
@@ -2890,6 +2896,56 @@ def _stage_devkit_arm(frida_version, include_magisk, frida_port, label):
     return out
 
 
+def _dev_base_entry(raw, arm, devkit_disk, dev_data, frida_version,
+                    frida_port, magisk, magisk_version, rooted):
+    """Build the bases['dev'] entry, PRESERVING fields an existing dev
+    registration already carries.
+
+    `base_disk` and `notes` are deliberately sticky. The dev system image is
+    STANDALONE -- it carries its own copy of every partition and shadows the
+    shared base (see _brand_target) -- so its base_disk is an independent
+    choice, NOT something to inherit from the arm base on every rebuild.
+    Copying arm's base_disk here silently repoints dev from base_arm.qcow2 to
+    base_arm_v2.qcow2, changing which image the dev guest boots with no log
+    line and no opt-in.
+
+    `system` is deliberately NOT sticky: build-dev-base owns which devsystem
+    file the dev base uses, so a temporary repoint (a probe image) never
+    becomes permanent by way of a rebuild.
+    """
+    prev = (raw.get("bases") or {}).get(DEV_BASE_TAG) or {}
+    marker = ROOTED_MARKER if rooted else ROOT_PENDING_MARKER
+    stale = ROOT_PENDING_MARKER if rooted else ROOTED_MARKER
+    default_notes = (f"arm dev base: base_arm + {devkit_disk} (vdc) with "
+                     f"frida {frida_version} (arm64) + Magisk{marker}"
+                     f". omni-agent only; NOT shipped. hidden frida port "
+                     f"{frida_port}.")
+    # A preserved note must not outlive the fact it asserts: re-point the root
+    # marker at reality so `notes` can never contradict devkit_manifest.rooted.
+    prev_notes = prev.get("notes")
+    if prev_notes and stale in prev_notes:
+        prev_notes = prev_notes.replace(stale, marker)
+    return {
+        "type": BASE_TYPE_ARM,
+        "base_disk": prev.get("base_disk") or arm["base_disk"],
+        "system": ARM_DEVSYSTEM_DISK,
+        "data": dev_data,
+        "efivars": arm.get("efivars", ARM_BASE_EFIVARS),
+        "devkit": devkit_disk,
+        "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
+        "notes": prev_notes or default_notes,
+        "devkit_manifest": {
+            "frida_version": frida_version,
+            "frida_port": frida_port,
+            "magisk": bool(magisk),
+            "magisk_version": magisk_version,
+            "rooted": rooted,
+            "tools": ["frida-server", "omni-fridad", "omni-frida-stop",
+                      "omni-hide", "omni-magisk-setup"],
+        },
+    }
+
+
 def build_dev_base(cfg, frida_version=DEFAULT_FRIDA_VERSION,
                    frida_port=DEFAULT_FRIDA_PORT, include_magisk=True,
                    keep_builder=False, patch_boot=False):
@@ -2944,29 +3000,11 @@ def build_dev_base(cfg, frida_version=DEFAULT_FRIDA_VERSION,
         raw = read_config()
         dev_data = (ARM_DEVDATA_DISK if (images / ARM_DEVDATA_DISK).exists()
                     else arm["data"])
-        raw.setdefault("bases", {})[DEV_BASE_TAG] = {
-            "type": BASE_TYPE_ARM,
-            "base_disk": arm["base_disk"],
-            "system": ARM_DEVSYSTEM_DISK,
-            "data": dev_data,
-            "efivars": arm.get("efivars", ARM_BASE_EFIVARS),
-            "devkit": ARM_DEVKIT_DISK,
-            "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
-            "notes": (f"arm dev base: base_arm + {ARM_DEVKIT_DISK} (vdc) with "
-                      f"frida {frida_version} (arm64) + Magisk"
-                      f"{' [rooted]' if rooted else ' [root pending: --patch-boot]'}"
-                      f". omni-agent only; NOT shipped. hidden frida port "
-                      f"{frida_port}."),
-            "devkit_manifest": {
-                "frida_version": frida_version,
-                "frida_port": frida_port,
-                "magisk": bool(staging.get("magisk")),
-                "magisk_version": staging.get("magisk_version"),
-                "rooted": rooted,
-                "tools": ["frida-server", "omni-fridad", "omni-frida-stop",
-                          "omni-hide", "omni-magisk-setup"],
-            },
-        }
+        raw.setdefault("bases", {})[DEV_BASE_TAG] = _dev_base_entry(
+            raw, arm, devkit_disk=ARM_DEVKIT_DISK, dev_data=dev_data,
+            frida_version=frida_version, frida_port=frida_port,
+            magisk=bool(staging.get("magisk")),
+            magisk_version=staging.get("magisk_version"), rooted=rooted)
         # HARD RULE: do NOT change current_base — the shipped product stays on
         # the production base. The dev base is opt-in via `--base dev` only.
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
