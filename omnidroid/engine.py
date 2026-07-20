@@ -1960,6 +1960,28 @@ def _devkit_activate(acct, label):
     return {"activated": False, "reason": "mount_failed", "detail": out.strip()[-400:]}
 
 
+_BOOTSTRAP_LOGIN_MARKER = "OmniBootstrap: session cookie installed"
+
+
+def _await_bootstrap_login(acct, timeout=25):
+    """Poll guest logcat for the OmniBootstrap login marker. A dev --apk
+    install can silently be a plain/stock Roblox build that cannot read the
+    delivered session cookie -- it "delivers" fine but lands on a Sign In
+    page. This is the LOUD check that catches that: condition-based poll
+    (dump + check, repeat), not a single fixed sleep, so it returns as soon
+    as the marker shows up instead of always paying the full timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = adb(acct, "logcat", "-d", timeout=15).stdout or ""
+        except Exception:
+            out = ""
+        if _BOOTSTRAP_LOGIN_MARKER in out:
+            return True
+        time.sleep(2)
+    return False
+
+
 def cmd_start(args):
     """Boot an instance, deliver its saved Roblox session, and land either
     INSIDE a place (if one is set) or on the account's home screen, logged in,
@@ -2056,6 +2078,26 @@ def cmd_start(args):
     result.update({"booted": True, "ok": bool(status.get("delivered")),
                    **{k: v for k, v in status.items() if k != "kiosk"}})
     result["kiosk"] = status.get("kiosk")
+
+    # dev-only, LOUD failure check: deliver_session reporting "delivered" only
+    # means the cookie broadcast reached the app -- it says nothing about
+    # whether the app could actually USE it. A plain/stock Roblox APK (no
+    # OmniBootstrap) silently lands on a Sign In page while everything above
+    # reports success. Only probe when --apk was used (dev testing) and
+    # delivery itself succeeded -- never on the trusted/baked prod path, and
+    # never when delivery already failed (that error is the real one).
+    if getattr(args, "apk", None) and result.get("ok"):
+        if not _await_bootstrap_login(acct):
+            result["ok"] = False
+            result["error"] = "not_logged_in"
+            print(f"[{label}] the installed APK logged in NO ONE (no "
+                  f"'{_BOOTSTRAP_LOGIN_MARKER}' in logcat within 25s) -- a "
+                  f"plain/stock Roblox cannot read the session cookie; "
+                  f"build a login-capable APK via omni-agent's "
+                  f"inject_session_bootstrap.")
+            if json_mode:
+                emit_json(result)
+            sys.exit(1)
 
     # Open a live WINDOW onto this instance so you can watch/play it, and so two
     # `omni start` runs give two accounts side by side. Each viewer is its own

@@ -7,6 +7,7 @@ without booting anything.
 
     python3 tests/test_session.py     (or: pytest tests/)
 """
+import contextlib
 import os
 import shutil
 import sys
@@ -512,7 +513,9 @@ class ApkInstallOnStart(unittest.TestCase):
              mock.patch.object(omni, "roblox_deeplink", return_value=None), \
              mock.patch.object(omni, "public_session", return_value={}), \
              mock.patch.object(omni, "_install_apk", install_mock), \
-             mock.patch.object(omni, "deliver_session", deliver_mock):
+             mock.patch.object(omni, "deliver_session", deliver_mock), \
+             mock.patch.object(omni, "_await_bootstrap_login",
+                               return_value=True):
             omni.cmd_start(self._args())
         install_mock.assert_called_once()
         deliver_mock.assert_called_once()
@@ -563,6 +566,112 @@ class ApkInstallOnStart(unittest.TestCase):
             omni.cmd_start(self._args(apk=None, dev=False))
         install_mock.assert_not_called()
         deliver_mock.assert_called_once()
+
+
+class ApkBootstrapLoginProbe(unittest.TestCase):
+    """`omni start <name> --dev --apk <path>` (Task 3 of sub-project B) must
+    verify the account actually logged in -- a plain/stock Roblox APK can't
+    read the delivered session cookie and silently lands on a Sign In page.
+    After deliver_session reports delivered, poll guest logcat for the
+    OmniBootstrap marker; report ok:False, error:'not_logged_in' if it never
+    appears. This probe must be gated to the dev --apk path only -- the
+    normal prod/default path is trusted/baked and must never pay for it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="omni-test-repo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        patches = [
+            mock.patch.object(omni, "REPO", self.tmp),
+            mock.patch.object(omni, "ACCOUNTS_DIR", self.tmp / "accounts"),
+            mock.patch.dict(os.environ, {"OMNI_DATA_DIR": str(self.tmp)}),
+            mock.patch.object(omni, "ensure_qemu", lambda: None),
+            mock.patch.object(omni, "load_config", lambda: {}),
+            mock.patch.object(omni, "running_pid", lambda name: None),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        ck.save_account(str(self.tmp), "realuser", "sometoken")
+        self.real_apk = self.tmp / "real.apk"
+        self.real_apk.write_bytes(b"fake apk bytes")
+
+    def _args(self, **over):
+        base = dict(name="realuser", place=None, token=None, token_file=None,
+                    token_stdin=False, job=None, access_code=None,
+                    link_code=None, launch_data=None, user_id=None,
+                    no_token=False, dev=True, window=False, no_window=True,
+                    mode=None, mem=None, accel=None, timeout=None, json=True,
+                    apk=str(self.real_apk))
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _stub_acct(self):
+        return {"name": "realuser", "adb_port": 1, "vnc_port": 1,
+                "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
+
+    @contextlib.contextmanager
+    def _patched(self, deliver_result, probe_result, capture):
+        with contextlib.ExitStack() as stack:
+            enter = stack.enter_context
+            enter(mock.patch.object(omni, "build_acct",
+                                     return_value=self._stub_acct()))
+            enter(mock.patch.object(omni, "_ensure_booted",
+                                     return_value=(True, False)))
+            enter(mock.patch.object(omni, "acct_arch", return_value="arm"))
+            enter(mock.patch.object(omni, "acct_is_dev", return_value=True))
+            enter(mock.patch.object(omni, "roblox_deeplink",
+                                     return_value=None))
+            enter(mock.patch.object(omni, "public_session",
+                                     return_value={}))
+            enter(mock.patch.object(omni, "_install_apk",
+                                     return_value={"ok": True}))
+            deliver_mock = enter(mock.patch.object(
+                omni, "deliver_session", return_value=deliver_result))
+            probe_mock = enter(mock.patch.object(
+                omni, "_await_bootstrap_login", return_value=probe_result))
+            enter(mock.patch.object(omni, "emit_json",
+                                     side_effect=capture.update))
+            yield deliver_mock, probe_mock
+
+    def test_probe_false_reports_not_logged_in(self):
+        deliver_result = {"delivered": True, "kiosk": {"ok": True}}
+        captured = {}
+        with self._patched(deliver_result, False, captured) as \
+                (deliver_mock, probe_mock):
+            with self.assertRaises(SystemExit):
+                omni.cmd_start(self._args())
+        probe_mock.assert_called_once()
+        deliver_mock.assert_called_once()
+        self.assertFalse(captured.get("ok"))
+        self.assertEqual(captured.get("error"), "not_logged_in")
+
+    def test_probe_true_leaves_ok_true(self):
+        deliver_result = {"delivered": True, "kiosk": {"ok": True}}
+        captured = {}
+        with self._patched(deliver_result, True, captured) as \
+                (deliver_mock, probe_mock):
+            omni.cmd_start(self._args())
+        probe_mock.assert_called_once()
+        self.assertTrue(captured.get("ok"))
+        self.assertNotEqual(captured.get("error"), "not_logged_in")
+
+    def test_no_apk_never_probes(self):
+        deliver_result = {"delivered": True, "kiosk": {"ok": True}}
+        captured = {}
+        with self._patched(deliver_result, False, captured) as \
+                (deliver_mock, probe_mock):
+            omni.cmd_start(self._args(apk=None, dev=False))
+        probe_mock.assert_not_called()
+        self.assertTrue(captured.get("ok"))
+
+    def test_apk_but_not_delivered_never_probes(self):
+        deliver_result = {"delivered": False}
+        captured = {}
+        with self._patched(deliver_result, False, captured) as \
+                (deliver_mock, probe_mock):
+            omni.cmd_start(self._args())
+        probe_mock.assert_not_called()
+        self.assertFalse(captured.get("ok"))
 
 
 if __name__ == "__main__":
