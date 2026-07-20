@@ -2036,6 +2036,19 @@ def cmd_start(args):
             emit_json(result)
         sys.exit(1)
 
+    # dev-only: install a custom APK on the freshly-booted dev base BEFORE
+    # any session is delivered. A failed install must not hand the account a
+    # session it can't actually run -- abort here instead of proceeding.
+    if getattr(args, "apk", None):
+        ir = _install_apk(acct, args.apk, label)
+        if not ir.get("ok"):
+            result.update({"booted": True, "ok": False,
+                           "error": "apk_install_failed",
+                           "detail": ir.get("detail")})
+            if json_mode:
+                emit_json(result)
+            sys.exit(1)
+
     # start ALWAYS launches: the kiosk joins when the session carries a place,
     # else lands on home (logged in). play=is_join was the home-mode bug --
     # play=False told the kiosk not to launch at all, so home never appeared.
@@ -4362,23 +4375,25 @@ def _install_block_reason(out):
     return "version downgrade" if "VERSION_DOWNGRADE" in (out or "") else "signature mismatch"
 
 
-def cmd_install(args):
-    acct = load_account(args.name)
-    json_mode = getattr(args, "json", False)
+def _install_apk(acct, apk_path, label, abi=None, no_abi_pin=False):
+    """Shared install core: ABI-safe `adb install` + the reused-instance
+    pin/sig auto-recovery. Used by both `omni install` (cmd_install) and
+    `omni start --apk` (cmd_start's dev-apk path). Returns a result dict; it
+    never calls fail() / sys.exit -- callers decide how to surface an error
+    (cmd_install turns a failure into fail("install_failed", ...); cmd_start
+    turns it into an `apk_install_failed` JSON result + sys.exit(1))."""
     # adb is a per-invocation client: nothing has necessarily `adb connect`ed to
     # this instance yet, and every `adb -s <serial> …` then fails with "device
     # not found". That is exactly the dev loop (`start` -> `install` -> `play`
     # are three separate processes), so connect first.
     adb_connect(acct)
-    arch = acct_arch(acct)
-    abi = _resolve_install_abi(acct, getattr(args, "abi", None),
-                               getattr(args, "no_abi_pin", False))
-    print(f"[install {args.name}] installing {args.apk}"
+    abi = _resolve_install_abi(acct, abi, no_abi_pin)
+    print(f"[{label}] installing {apk_path}"
           + (f" (--abi {abi})" if abi else " (no ABI pin)") + " ...")
-    pkg = apk_package_name(args.apk)
-    r = _abi_install(acct, args.apk, abi)
+    pkg = apk_package_name(apk_path)
+    r = _abi_install(acct, apk_path, abi)
     out = (r.stdout + r.stderr).strip()
-    print(f"[install {args.name}] {out}")
+    print(f"[{label}] {out}")
     # A REUSED instance usually already carries a differently-signed / version-
     # incompatible build of the same package (stock Roblox vs a re-signed test
     # build, or two successive agent builds). adb refuses to replace across a
@@ -4390,7 +4405,7 @@ def cmd_install(args):
     # after force-stop => Success), uninstall it, then reinstall fresh. The kiosk
     # relaunches the new build on its own via its ACTION_PACKAGE_ADDED receiver.
     if "Success" not in out and _install_needs_clean_replace(out) and pkg:
-        print(f"[install {args.name}] existing build of {pkg} blocks the update "
+        print(f"[{label}] existing build of {pkg} blocks the update "
               f"({_install_block_reason(out)}); clearing the kiosk pin + reinstalling ...")
         # The kiosk RE-PINS the configured game the instant it is force-stopped
         # (Lock Task + auto-relaunch), so a bare force-stop -> uninstall races the
@@ -4403,24 +4418,42 @@ def cmd_install(args):
         adb(acct, "shell", "am", "start", "-n", "com.omni.kiosk/.MainActivity", timeout=15)
         time.sleep(3)   # let the kiosk take the foreground before we uninstall
         u = adb(acct, "uninstall", pkg, timeout=120)
-        print(f"[install {args.name}] uninstall {pkg}: {(u.stdout + u.stderr).strip()[:200]}")
+        print(f"[{label}] uninstall {pkg}: {(u.stdout + u.stderr).strip()[:200]}")
         # Point the kiosk back at the game so it relaunches the fresh build (the
         # success path below re-asserts this; setting it here also leaves the
         # kiosk correctly targeted if the reinstall itself then fails).
         adb(acct, "shell", "settings", "put", "global", "omni_game_package", pkg, timeout=15)
-        r = _abi_install(acct, args.apk, abi)
+        r = _abi_install(acct, apk_path, abi)
         out = (r.stdout + r.stderr).strip()
-        print(f"[install {args.name}] reinstall: {out}")
+        print(f"[{label}] reinstall: {out}")
     if "Success" not in out:
-        fail("install_failed", f"adb install failed: {out[:400]}")
+        return {"ok": False, "error": "apk_install_failed",
+                "detail": out[:400], "package": pkg}
     abi_installed = installed_primary_abi(acct, pkg) if pkg else None
-    native_bridge_used = _is_arm_abi(abi_installed) and arch == "x86"
+    native_bridge_used = _is_arm_abi(abi_installed) and acct_arch(acct) == "x86"
+    return {"ok": True, "package": pkg, "abi_installed": abi_installed,
+            "native_bridge_used": native_bridge_used, "out": out}
+
+
+def cmd_install(args):
+    acct = load_account(args.name)
+    json_mode = getattr(args, "json", False)
+    arch = acct_arch(acct)
+    label = f"install {args.name}"
+    ir = _install_apk(acct, args.apk, label,
+                      abi=getattr(args, "abi", None),
+                      no_abi_pin=getattr(args, "no_abi_pin", False))
+    if ir["ok"] is False:
+        fail("install_failed", f"adb install failed: {ir['detail']}")
+    pkg = ir["package"]
+    abi_installed = ir["abi_installed"]
+    native_bridge_used = ir["native_bridge_used"]
     if pkg:
         acct["game_package"] = pkg
         save_account(acct)
         adb(acct, "shell", "settings", "put", "global",
             "omni_game_package", pkg, timeout=10)
-        print(f"[install {args.name}] game package = {pkg} "
+        print(f"[{label}] game package = {pkg} "
               f"(saved + pushed to guest); primaryCpuAbi={abi_installed} "
               f"native_bridge_used={native_bridge_used}")
     if getattr(args, "require_translation", False) and not native_bridge_used:

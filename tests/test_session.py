@@ -460,5 +460,110 @@ class StartHomeVsJoin(unittest.TestCase):
         self.assertEqual(sess.get("place_id"), 606849621)
 
 
+class ApkInstallOnStart(unittest.TestCase):
+    """`omni start <name> --dev --apk <path>` (Task 2 of sub-project B) must
+    install the APK on the dev base AFTER boot and BEFORE delivering the
+    session -- a failed install must never hand the account a session, and
+    the default (no --apk) path must never call the installer at all."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="omni-test-repo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        patches = [
+            mock.patch.object(omni, "REPO", self.tmp),
+            mock.patch.object(omni, "ACCOUNTS_DIR", self.tmp / "accounts"),
+            mock.patch.dict(os.environ, {"OMNI_DATA_DIR": str(self.tmp)}),
+            mock.patch.object(omni, "ensure_qemu", lambda: None),
+            mock.patch.object(omni, "load_config", lambda: {}),
+            mock.patch.object(omni, "running_pid", lambda name: None),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        ck.save_account(str(self.tmp), "realuser", "sometoken")
+        self.real_apk = self.tmp / "real.apk"
+        self.real_apk.write_bytes(b"fake apk bytes")
+
+    def _args(self, **over):
+        base = dict(name="realuser", place=None, token=None, token_file=None,
+                    token_stdin=False, job=None, access_code=None,
+                    link_code=None, launch_data=None, user_id=None,
+                    no_token=False, dev=True, window=False, no_window=True,
+                    mode=None, mem=None, accel=None, timeout=None, json=True,
+                    apk=str(self.real_apk))
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _stub_acct(self):
+        return {"name": "realuser", "adb_port": 1, "vnc_port": 1,
+                "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
+
+    def test_install_runs_after_boot_and_before_deliver(self):
+        manager = mock.Mock()
+        install_mock = mock.Mock(return_value={"ok": True})
+        deliver_mock = mock.Mock(return_value={"delivered": True,
+                                                "kiosk": {"ok": True}})
+        manager.attach_mock(install_mock, "_install_apk")
+        manager.attach_mock(deliver_mock, "deliver_session")
+        with mock.patch.object(omni, "build_acct", return_value=self._stub_acct()), \
+             mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
+             mock.patch.object(omni, "acct_arch", return_value="arm"), \
+             mock.patch.object(omni, "acct_is_dev", return_value=True), \
+             mock.patch.object(omni, "roblox_deeplink", return_value=None), \
+             mock.patch.object(omni, "public_session", return_value={}), \
+             mock.patch.object(omni, "_install_apk", install_mock), \
+             mock.patch.object(omni, "deliver_session", deliver_mock):
+            omni.cmd_start(self._args())
+        install_mock.assert_called_once()
+        deliver_mock.assert_called_once()
+        names = [c[0] for c in manager.mock_calls]
+        self.assertLess(names.index("_install_apk"),
+                        names.index("deliver_session"),
+                        "install must run before deliver_session")
+
+    def test_install_failure_aborts_before_deliver_and_reports_error(self):
+        install_mock = mock.Mock(return_value={"ok": False,
+                                                "error": "apk_install_failed",
+                                                "detail": "boom"})
+        deliver_mock = mock.Mock(return_value={"delivered": True,
+                                                "kiosk": {"ok": True}})
+        captured = {}
+
+        def _capture_json(result):
+            captured.update(result)
+
+        with mock.patch.object(omni, "build_acct", return_value=self._stub_acct()), \
+             mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
+             mock.patch.object(omni, "acct_arch", return_value="arm"), \
+             mock.patch.object(omni, "acct_is_dev", return_value=True), \
+             mock.patch.object(omni, "roblox_deeplink", return_value=None), \
+             mock.patch.object(omni, "public_session", return_value={}), \
+             mock.patch.object(omni, "_install_apk", install_mock), \
+             mock.patch.object(omni, "deliver_session", deliver_mock), \
+             mock.patch.object(omni, "emit_json", side_effect=_capture_json):
+            with self.assertRaises(SystemExit):
+                omni.cmd_start(self._args())
+        install_mock.assert_called_once()
+        deliver_mock.assert_not_called()
+        self.assertFalse(captured.get("ok"))
+        self.assertEqual(captured.get("error"), "apk_install_failed")
+
+    def test_no_apk_never_calls_installer(self):
+        install_mock = mock.Mock(return_value={"ok": True})
+        deliver_mock = mock.Mock(return_value={"delivered": True,
+                                                "kiosk": {"ok": True}})
+        with mock.patch.object(omni, "build_acct", return_value=self._stub_acct()), \
+             mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
+             mock.patch.object(omni, "acct_arch", return_value="arm"), \
+             mock.patch.object(omni, "acct_is_dev", return_value=True), \
+             mock.patch.object(omni, "roblox_deeplink", return_value=None), \
+             mock.patch.object(omni, "public_session", return_value={}), \
+             mock.patch.object(omni, "_install_apk", install_mock), \
+             mock.patch.object(omni, "deliver_session", deliver_mock):
+            omni.cmd_start(self._args(apk=None, dev=False))
+        install_mock.assert_not_called()
+        deliver_mock.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
