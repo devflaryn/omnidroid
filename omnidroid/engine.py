@@ -1770,11 +1770,33 @@ def _make_persistent_arm_account(name, cfg, tag=None):
     if devkit:
         make_overlay(d / "devkit.qcow2", images / devkit)
         acct["dev"] = True
+    acct["game_package"] = ROBLOX_PACKAGE
     save_account(acct)
     print(f"[create {name}] arm64 disks ready (provisioned pair copied from "
           f"{base['system']}+{base['data']}); adb {adb_port}, qmp {qmp_port}, "
           f"vnc {vnc_port}")
-    return load_account(name)
+    # Return the handle we just built -- NOT load_account(name), which is now
+    # store-based and would not find this persistent folder-only build account
+    # (it has no store entry). This handle carries real per-account overlays,
+    # so `ephemeral` is absent/false -> qemu_command_arm boots the overlays,
+    # not the shared snapshot=on templates. Base-build only (update_kiosk_arm,
+    # cmd_test_apk); the product path never comes here.
+    return acct
+
+
+def _load_persistent_arm_account(name):
+    """Load an existing persistent (folder-backed) base-build account's handle
+    from accounts/<name>/account.json. The base-build/maintenance counterpart
+    to load_account() -- which is store-based (for ephemeral product accounts)
+    and cannot see a folder-only build account. Used for the `test-apk --reuse`
+    path. Backfills game_package for older folder records."""
+    p = account_dir(name) / "account.json"
+    if not p.exists():
+        fail("no_account",
+             f"no such build account '{name}' (looked for {p})")
+    acct = json.loads(p.read_text())
+    acct.setdefault("game_package", ROBLOX_PACKAGE)
+    return acct
 
 
 # Magisk's su on this all-read-only LineageOS lives in Magisk's own tmpfs, NOT
@@ -5239,9 +5261,13 @@ def cmd_test_apk(args):
     result = {"account": name}
     fresh = not (account_dir(name) / "account.json").exists()
     if fresh and not args.reuse:
-        # Create a clean dev account on the current (dev) base.
-        _make_persistent_arm_account(name, cfg)
-    acct = load_account(name)
+        # Create a clean dev account on the current (dev) base. This is a
+        # persistent folder-backed build account, NOT a product/store account,
+        # so use the handle it returns directly (load_account is store-based
+        # and would not find it).
+        acct = _make_persistent_arm_account(name, cfg)
+    else:
+        acct = _load_persistent_arm_account(name)   # --reuse an existing one
     result["base"] = acct["base"]
     result["arch"] = acct_arch(acct)
     if not running_pid(name):
