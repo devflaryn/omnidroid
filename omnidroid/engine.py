@@ -769,10 +769,10 @@ def allocate_ports(cfg):
     frees its slot immediately). The three ranges are 1000 apart, so the shared
     index keeps adb/qmp/vnc aligned and collision-free below 1000 concurrent."""
     q = cfg["qemu"]
-    used = set()
-    for inst in running_instances():
-        if inst.get("adb_port") is not None:
-            used.add(inst["adb_port"] - q["adb_port_start"])
+    # Scan CLAIMED slots (running instances AND live reservations), not just
+    # running_instances() -- a concurrent launch that has reserved but not yet
+    # spawned still holds its slot, so this closes the allocate/spawn race.
+    used = {p - q["adb_port_start"] for p in _claimed_port_indices()}
     i = 0
     while i in used:
         i += 1
@@ -888,6 +888,12 @@ def running_instances():
             data = json.loads(rj.read_text())
         except Exception:  # noqa: BLE001
             continue
+        # A reservation is not a running instance (see running_pid). It holds a
+        # port slot (allocate_ports scans _claimed_port_indices, which DOES
+        # count live reservations) but must not appear as a live game to
+        # list/all_accounts/_ensure_booted.
+        if data.get("reserving"):
+            continue
         if pid_alive(data.get("pid")):
             out.append({"name": d.name, "pid": data["pid"],
                         "base": data.get("base"),
@@ -895,6 +901,29 @@ def running_instances():
                         "qmp_port": data.get("qmp_port"),
                         "vnc_port": data.get("vnc_port")})
     return out
+
+
+def _claimed_port_indices():
+    """Port indices currently CLAIMED across runtime/*/run.json -- a slot is
+    claimed by a live running instance OR a live reservation (build_acct's
+    pre-spawn run.json). This is what allocate_ports must avoid, so a concurrent
+    launch that has reserved-but-not-yet-spawned still blocks the slot. A dead
+    pid (crashed launcher, exited QEMU) frees its slot."""
+    root = config.data_dir() / "runtime"
+    claimed = set()
+    if not root.exists():
+        return claimed
+    for d in sorted(root.iterdir()):
+        rj = d / "run.json"
+        if not rj.exists():
+            continue
+        try:
+            data = json.loads(rj.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        if data.get("adb_port") is not None and pid_alive(data.get("pid")):
+            claimed.add(data["adb_port"])
+    return claimed
 
 
 def host_rss_mb(pid):
@@ -1368,7 +1397,15 @@ def running_pid(name):
     p = runtime_dir(name) / "run.json"
     if not p.exists():
         return None
-    pid = json.loads(p.read_text()).get("pid")
+    data = json.loads(p.read_text())
+    # A reservation (build_acct's pre-spawn run.json, carrying the live LAUNCHER
+    # pid) is NOT a running instance: no QEMU exists yet. spawn_qemu overwrites
+    # it with the real QEMU pid and no `reserving` flag. Treating a reservation
+    # as running would make _ensure_booted skip the spawn and, after the
+    # launcher exits, leave the real QEMU untracked.
+    if data.get("reserving"):
+        return None
+    pid = data.get("pid")
     return pid if pid_alive(pid) else None
 
 

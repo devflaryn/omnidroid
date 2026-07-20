@@ -86,3 +86,38 @@ def test_launch_lock_is_reentrant_safe_serial(tmp_path, monkeypatch):
         pass
     with engine._launch_lock():
         pass
+
+
+def test_reservation_is_not_a_running_instance(tmp_path, monkeypatch):
+    """A port reservation (build_acct's pre-spawn run.json, carrying the live
+    LAUNCHER pid + reserving=True) must NOT read as a running instance:
+    running_pid returns None and running_instances omits it, so _ensure_booted
+    still spawns and `stop`/`list` don't mistake a reservation (or, after the
+    launcher exits, a real QEMU whose reservation was overwritten) for a live
+    game. But allocate_ports MUST still treat the slot as claimed so a
+    concurrent launch doesn't collide."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    # A reservation with THIS (alive) process's pid — as _reserve_ports writes.
+    engine._reserve_ports("resv", 16001, 17001, 18001)
+    # It is NOT a running instance...
+    assert engine.running_pid("resv") is None
+    assert "resv" not in {i["name"] for i in engine.running_instances()}
+    # ...but its port slot IS claimed (index 0 taken -> next alloc is index 1).
+    cfg = {"qemu": {"adb_port_start": 16001, "qmp_port_start": 17001,
+                    "vnc_port_start": 18001}}
+    assert engine.allocate_ports(cfg) == (16002, 17002, 18002)
+
+
+def test_spawn_overwrite_makes_reservation_a_real_running_instance(tmp_path,
+                                                                    monkeypatch):
+    """Once spawn_qemu overwrites the reservation run.json with a live QEMU pid
+    (no reserving flag), it IS a running instance again."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    engine._reserve_ports("x", 16001, 17001, 18001)
+    assert engine.running_pid("x") is None            # reservation: not running
+    # spawn_qemu's write shape: real pid, no reserving flag.
+    (tmp_path / "runtime" / "x" / "run.json").write_text(json.dumps(
+        {"pid": os.getpid(), "started": 1.0, "base": "arm",
+         "adb_port": 16001, "qmp_port": 17001, "vnc_port": 18001}))
+    assert engine.running_pid("x") == os.getpid()     # now a real instance
+    assert "x" in {i["name"] for i in engine.running_instances()}
