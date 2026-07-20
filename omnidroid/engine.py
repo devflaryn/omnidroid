@@ -1969,6 +1969,78 @@ def _devkit_activate(acct, label):
 _BOOTSTRAP_LOGIN_MARKER = "OmniBootstrap: session cookie installed"
 
 
+ROBLOX_AUTH_URL = "https://users.roblox.com/v1/users/authenticated"
+
+
+def _curl_json(url, cookie, timeout=15):
+    """GET <url> carrying <cookie> as .ROBLOSECURITY. Returns (code, body);
+    code is None when the CHECK ITSELF could not run.
+
+    curl rather than urllib deliberately: the Python builds this ships on do
+    not reliably carry a system CA store (the macOS python.org build fails
+    EVERY https call with CERTIFICATE_VERIFY_FAILED), while curl works on every
+    host we run. The engine already shells out to adb/qemu, so this is in
+    keeping with the surrounding code.
+    """
+    argv = ["curl", "-s", "--max-time", str(timeout),
+            "-H", f"Cookie: .ROBLOSECURITY={cookie}",
+            "-H", "User-Agent: Roblox/Android",
+            "-w", "\nHTTP_CODE=%{http_code}", url]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout + 5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None, ""
+    out = r.stdout or ""
+    m = re.search(r"HTTP_CODE=(\d+)\s*$", out)
+    if not m:
+        return None, out
+    return int(m.group(1)), out[:m.start()]
+
+
+def validate_roblox_cookie(cookie, timeout=15):
+    """Ask Roblox whether <cookie> is still a live session. TRI-STATE:
+
+        ok True  -> authenticated (also returns user_id/username)
+        ok False -> Roblox definitively rejected it (401) => abort loudly
+        ok None  -> the check could not run => callers MUST fail open
+
+    Why this exists: the OmniBootstrap logcat marker only proves the APK
+    INJECTED the cookie, never that Roblox ACCEPTED it. A dead cookie injects
+    perfectly, emits the marker, and lands on the Sign In page -- so
+    _await_bootstrap_login passes and `start` reports success against a login
+    screen. Checking on the HOST, before boot, turns that silent 40s lie into
+    an immediate, accurate failure.
+
+    The cookie is never echoed back in the result (results get printed/JSON'd).
+    """
+    if not cookie:
+        return {"ok": False, "error": "cookie_invalid",
+                "detail": "no session cookie saved for this account"}
+    code, body = _curl_json(ROBLOX_AUTH_URL, cookie, timeout=timeout)
+    if code is None:
+        return {"ok": None, "error": "check_unavailable",
+                "detail": "could not reach Roblox (no network, no curl, or timeout)"}
+    if code == 401:
+        return {"ok": False, "error": "cookie_invalid",
+                "detail": "Roblox says this session is not authenticated (HTTP 401). "
+                          "The cookie is expired or was invalidated -- sign the "
+                          "account in again to save a fresh one."}
+    if code != 200:
+        return {"ok": None, "error": "check_unavailable",
+                "detail": f"Roblox returned HTTP {code}; says nothing about the cookie"}
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return {"ok": None, "error": "check_unavailable",
+                "detail": "unparseable response (captive portal / proxy?)"}
+    if not isinstance(data, dict) or "id" not in data:
+        return {"ok": None, "error": "check_unavailable",
+                "detail": "unexpected response shape"}
+    return {"ok": True, "user_id": data.get("id"),
+            "username": data.get("name")}
+
+
 def _await_bootstrap_login(acct, timeout=25):
     """Poll guest logcat for the OmniBootstrap login marker. A dev --apk
     install can silently be a plain/stock Roblox build that cannot read the
@@ -2042,6 +2114,27 @@ def cmd_start(args):
     # A place is OPTIONAL: with one set, this is a JOIN; without one, it's a
     # HOME boot — logged in via the delivered cookie, no deep link, no join.
     is_join = bool(sess.get("place_id"))
+
+    # PREFLIGHT: is the cookie still a live session? The in-guest OmniBootstrap
+    # marker only proves the APK INJECTED it, never that Roblox ACCEPTED it —
+    # a dead cookie injects fine, emits the marker, and lands on the Sign In
+    # page, so the post-boot probe passes and we report success against a login
+    # screen (observed 2026-07-20). Ask Roblox HERE, before spending a ~40s
+    # boot, and fail with an accurate reason instead of a confident lie.
+    # FAILS OPEN: ok is None when the check itself could not run (offline host,
+    # no curl, Roblox 5xx) — never block a boot on our own blindness.
+    if sess.get("token") and not getattr(args, "no_cookie_check", False):
+        chk = validate_roblox_cookie(sess["token"])
+        if chk["ok"] is False:
+            return fail("cookie_invalid",
+                        f"{chk['detail']} No instance was created for "
+                        f"'{args.name}'. (Skip this check with "
+                        f"--no-cookie-check.)")
+        if chk["ok"] is None:
+            print(f"[{label}] cookie preflight skipped: {chk['detail']}")
+        else:
+            print(f"[{label}] cookie preflight: live session "
+                  f"(user {chk.get('username')} / {chk.get('user_id')})")
 
     # Only NOW do we know a session is deliverable (a real token, or the
     # explicit --no-token escape hatch) — build the launch handle. Nothing is
@@ -6086,6 +6179,11 @@ def main():
     s.add_argument("--no-token", dest="no_token", action="store_true",
                    help="proceed without a login (lands on Roblox's login "
                         "screen, which needs taps — almost never what you want)")
+    s.add_argument("--no-cookie-check", dest="no_cookie_check",
+                   action="store_true",
+                   help="skip the pre-boot check that asks Roblox whether the "
+                        "saved cookie is still valid (the check fails open on "
+                        "network problems, so you rarely need this)")
     s.add_argument("--dev", action="store_true",
                    help="launch the instance on the DEV base (frida+Magisk); "
                         "dev-only, refused without OMNI_DEV_MODE")

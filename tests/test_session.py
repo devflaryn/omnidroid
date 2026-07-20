@@ -244,6 +244,13 @@ class PlayGatesOnLogin(unittest.TestCase):
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
             mock.patch.object(omni, "running_pid", lambda name: None),
+            # cmd_start now asks Roblox whether the saved cookie is live before
+            # booting. These tests exercise other behavior with fake tokens, so
+            # pin the preflight to "live" — otherwise every one of them makes a
+            # real network call and then aborts on the 401.
+            mock.patch.object(omni, "validate_roblox_cookie",
+                              return_value={"ok": True, "user_id": 1,
+                                            "username": "realuser"}),
         ]
         for p in patches:
             p.start()
@@ -331,6 +338,13 @@ class ApkFlagDevGating(unittest.TestCase):
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
             mock.patch.object(omni, "running_pid", lambda name: None),
+            # cmd_start now asks Roblox whether the saved cookie is live before
+            # booting. These tests exercise other behavior with fake tokens, so
+            # pin the preflight to "live" — otherwise every one of them makes a
+            # real network call and then aborts on the 401.
+            mock.patch.object(omni, "validate_roblox_cookie",
+                              return_value={"ok": True, "user_id": 1,
+                                            "username": "realuser"}),
         ]
         for p in patches:
             p.start()
@@ -415,6 +429,13 @@ class StartHomeVsJoin(unittest.TestCase):
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
             mock.patch.object(omni, "running_pid", lambda name: None),
+            # cmd_start now asks Roblox whether the saved cookie is live before
+            # booting. These tests exercise other behavior with fake tokens, so
+            # pin the preflight to "live" — otherwise every one of them makes a
+            # real network call and then aborts on the 401.
+            mock.patch.object(omni, "validate_roblox_cookie",
+                              return_value={"ok": True, "user_id": 1,
+                                            "username": "realuser"}),
         ]
         for p in patches:
             p.start()
@@ -477,6 +498,13 @@ class ApkInstallOnStart(unittest.TestCase):
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
             mock.patch.object(omni, "running_pid", lambda name: None),
+            # cmd_start now asks Roblox whether the saved cookie is live before
+            # booting. These tests exercise other behavior with fake tokens, so
+            # pin the preflight to "live" — otherwise every one of them makes a
+            # real network call and then aborts on the 401.
+            mock.patch.object(omni, "validate_roblox_cookie",
+                              return_value={"ok": True, "user_id": 1,
+                                            "username": "realuser"}),
         ]
         for p in patches:
             p.start()
@@ -587,6 +615,13 @@ class ApkBootstrapLoginProbe(unittest.TestCase):
             mock.patch.object(omni, "ensure_qemu", lambda: None),
             mock.patch.object(omni, "load_config", lambda: {}),
             mock.patch.object(omni, "running_pid", lambda name: None),
+            # cmd_start now asks Roblox whether the saved cookie is live before
+            # booting. These tests exercise other behavior with fake tokens, so
+            # pin the preflight to "live" — otherwise every one of them makes a
+            # real network call and then aborts on the 401.
+            mock.patch.object(omni, "validate_roblox_cookie",
+                              return_value={"ok": True, "user_id": 1,
+                                            "username": "realuser"}),
         ]
         for p in patches:
             p.start()
