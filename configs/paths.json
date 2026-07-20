@@ -39,18 +39,18 @@
     "dev": {
       "type": "arm-uefi",
       "base_disk": "base_arm.qcow2",
-      "system": "base_arm_devsystem_v2.qcow2",
+      "system": "base_arm_devsystem.qcow2",
       "data": "base_arm_devdata.qcow2",
       "efivars": "base_arm_efivars.fd",
       "devkit": "base_arm_devkit.qcow2",
       "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
-      "notes": "arm dev base: base_arm + base_arm_devkit.qcow2 (vdc) with frida 17.15.4 (arm64) + Magisk [root pending: --patch-boot]. omni-agent only; NOT shipped. hidden frida port 27142. devsystem v2: same branding/silent/insecure_adb as base_arm v2 (the dev system image is STANDALONE, so it does not inherit the shared base's branding and must be branded separately).",
+      "notes": "arm dev base: base_arm + base_arm_devkit.qcow2 (vdc) with frida 17.15.4 (arm64) + Magisk [rooted]. omni-agent only; NOT shipped. hidden frida port 27142. devsystem v2: same branding/silent/insecure_adb as base_arm v2 (the dev system image is STANDALONE, so it does not inherit the shared base's branding and must be branded separately).",
       "devkit_manifest": {
         "frida_version": "17.15.4",
         "frida_port": 27142,
         "magisk": true,
         "magisk_version": "v30.7",
-        "rooted": false,
+        "rooted": true,
         "tools": [
           "frida-server",
           "omni-fridad",

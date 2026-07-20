@@ -6,7 +6,8 @@
 (Option B: keep baked Roblox, root force-remove at runtime) is UNCHANGED. This document
 replaces its *execution sequence* (steps 1–4) with a rehearsal-first one, and records state
 verified on-device 2026-07-20.
-**Status:** Approved direction.
+**Status:** EXECUTED 2026-07-20 — goal achieved. See "Outcome" at the bottom; Phase 3 turned out
+to be unnecessary because the amended spec's root cause was falsified on-device.
 
 ## User-facing goal (the acceptance statement)
 
@@ -99,6 +100,35 @@ chose root-first sequencing so the sync targets a surface proven on-device.
 - **Phase 3:** unit tests for the force-install decision + command construction (mockable, as in
   B's `ApkInstallOnStart` tests); prod path unchanged.
 - **Phase 4:** the acceptance statement above, twice, with two differently-signed APKs.
+
+## Outcome (2026-07-20, executed)
+
+**Goal met.** The dev image boots rooted and accepts any APK repeatably, including across
+signing-cert changes. Full evidence in `.superpowers/sdd/progress.md`.
+
+**The amended spec's root cause was FALSIFIED.** `2026-07-20-dev-base-apk-swap-root-design.md`
+states Roblox is a baked SYSTEM app on the dev base (`pm path` -> `/product/app/Roblox/Roblox.apk`,
+`pkgFlags=[ SYSTEM HAS_CODE ]`, cert `ff081c2e`). On the rooted branded dev image that is simply
+not true: `pm path com.roblox.client` is empty and there is no `/product/app/Roblox`. The dev
+system image received branding parity with arm v2 but never received the Roblox bake — only the
+PROD `base_arm_v2.qcow2` did (arm v2 changelog entry "2", 2026-07-17).
+
+Consequences:
+- **Phase 3 (dev force-install) was never built and is not needed.** With no baked system app
+  there is no PMS signature authority to defeat; a resigned APK is an ordinary user-app install.
+- **Option A vs Option B is moot.** Neither runtime force-remove nor a Roblox-stripping rebuild
+  is required.
+- The rehearsal still paid for itself: it proved `--patch-boot` works on this host (the `.bak` is
+  a rooted image) and that root can remount `/product` rw — and it caught a stale-QEMU port
+  collision that had produced a false "not rooted" reading.
+
+**Still true and still needed:** rooting the dev base (Phase 2). Root is what the devkit/frida
+work depends on, independent of the APK question.
+
+**Separate bug found (not this plan):** a live QEMU that `running_pid`/`list` reports as stopped.
+The port allocator then re-issues its port, so a later `start` silently attaches to the wrong
+instance and reports `boot completed after 0.0 min`. Distinct from `49658d1` (a reservation
+masquerading as running); this is the inverse. Needs its own fix + regression test.
 
 ## Out of scope
 
