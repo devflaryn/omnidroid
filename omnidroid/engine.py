@@ -1972,6 +1972,15 @@ def cmd_start(args):
     ensure_qemu()
     cfg = load_config()
     dev = _dev_mode_for_play(args)
+    if getattr(args, "apk", None):
+        if not _dev_mode_for_play(args):
+            return fail("apk_dev_only",
+                        "--apk requires the dev base: pass --dev (or set "
+                        "OMNI_USE_DEV_BASE). Installing a custom APK is a "
+                        "dev-only capability, not available in production.")
+        if not Path(args.apk).exists():
+            return fail("bad_apk",
+                        f"--apk path not found: {args.apk}")
     label = f"start {args.name}"
     json_mode = getattr(args, "json", False)
 
@@ -5967,6 +5976,10 @@ def main():
     s.add_argument("--dev", action="store_true",
                    help="launch the instance on the DEV base (frida+Magisk); "
                         "dev-only, refused without OMNI_DEV_MODE")
+    s.add_argument("--apk", default=None,
+                   help="install this Roblox APK on the dev base before "
+                        "delivering the session; dev-only, requires --dev/"
+                        "OMNI_USE_DEV_BASE")
     s_win = s.add_mutually_exclusive_group()
     s_win.add_argument("--window", action="store_true",
                        help="open a live window even in --json mode (two "

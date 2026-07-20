@@ -254,7 +254,7 @@ class PlayGatesOnLogin(unittest.TestCase):
                     access_code=None, link_code=None, launch_data=None,
                     user_id=None, no_token=False, dev=False, window=False,
                     no_window=True, mode=None, mem=None, accel=None,
-                    timeout=None, json=True)
+                    timeout=None, json=True, apk=None)
         base.update(over)
         return SimpleNamespace(**base)
 
@@ -311,6 +311,90 @@ class PlayGatesOnLogin(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 omni.cmd_start(self._args(name="realuser", place=None))
         build_mock.assert_called_once()
+
+
+class ApkFlagDevGating(unittest.TestCase):
+    """`omni start --apk <path>` (Task 1 of sub-project B): the flag is
+    dev-only and its path must exist. No install behavior here — only the
+    two early guards in cmd_start(), which must run BEFORE build_acct() so
+    a rejected --apk never boots or touches an instance."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="omni-test-repo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        accounts_dir = self.tmp / "accounts"
+        patches = [
+            mock.patch.object(omni, "REPO", self.tmp),
+            mock.patch.object(omni, "ACCOUNTS_DIR", accounts_dir),
+            mock.patch.dict(os.environ, {"OMNI_DATA_DIR": str(self.tmp)}),
+            mock.patch.object(omni, "ensure_qemu", lambda: None),
+            mock.patch.object(omni, "load_config", lambda: {}),
+            mock.patch.object(omni, "running_pid", lambda name: None),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _args(self, **over):
+        base = dict(name="realuser", place=None, token=None, token_file=None,
+                    token_stdin=False, job=None, access_code=None,
+                    link_code=None, launch_data=None, user_id=None,
+                    no_token=False, dev=False, window=False, no_window=True,
+                    mode=None, mem=None, accel=None, timeout=None, json=True,
+                    apk=None)
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _fail_recorder(self):
+        """Wrap omni.fail so we can assert on the CODE it was called with,
+        not just that some SystemExit happened."""
+        calls = []
+        orig_fail = omni.fail
+
+        def _wrapped(code, *a, **k):
+            calls.append(code)
+            return orig_fail(code, *a, **k)
+        return calls, mock.patch.object(omni, "fail", side_effect=_wrapped)
+
+    def test_apk_without_dev_is_rejected_before_build_acct(self):
+        ck.save_account(str(self.tmp), "realuser", "sometoken")
+        calls, fail_patch = self._fail_recorder()
+        with fail_patch, \
+             mock.patch.object(omni, "build_acct") as build_mock:
+            with self.assertRaises(SystemExit):
+                omni.cmd_start(self._args(apk="x.apk", dev=False))
+            build_mock.assert_not_called()
+        self.assertEqual(calls, ["apk_dev_only"])
+
+    def test_apk_nonexistent_path_is_rejected_before_build_acct(self):
+        ck.save_account(str(self.tmp), "realuser", "sometoken")
+        calls, fail_patch = self._fail_recorder()
+        with fail_patch, \
+             mock.patch.object(omni, "build_acct") as build_mock:
+            with self.assertRaises(SystemExit):
+                omni.cmd_start(self._args(apk="/nonexistent/path.apk",
+                                          dev=True))
+            build_mock.assert_not_called()
+        self.assertEqual(calls, ["bad_apk"])
+
+    def test_apk_valid_path_with_dev_passes_validation(self):
+        ck.save_account(str(self.tmp), "realuser", "sometoken")
+        real_apk = self.tmp / "real.apk"
+        real_apk.write_bytes(b"fake apk bytes")
+        stub_acct = {"name": "realuser", "adb_port": 1, "vnc_port": 1,
+                    "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
+        calls, fail_patch = self._fail_recorder()
+        with fail_patch, \
+             mock.patch.object(omni, "build_acct",
+                              return_value=stub_acct) as build_mock, \
+             mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
+             mock.patch.object(omni, "acct_arch", return_value="arm"), \
+             mock.patch.object(omni, "acct_is_dev", return_value=True):
+            with self.assertRaises(SystemExit):
+                omni.cmd_start(self._args(apk=str(real_apk), dev=True))
+            build_mock.assert_called_once()
+        self.assertNotIn("apk_dev_only", calls)
+        self.assertNotIn("bad_apk", calls)
 
 
 class StartHomeVsJoin(unittest.TestCase):
