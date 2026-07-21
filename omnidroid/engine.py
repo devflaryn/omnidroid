@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 from omnidroid import config
+from omnidroid import farming
 from omnidroid.config import (
     REPO, CONFIG_PATH, QEMU_DIR,
     IS_WINDOWS, IS_LINUX, IS_MACOS, HOST_ARCH, IS_ARM64_HOST,
@@ -2149,7 +2150,8 @@ def cmd_start(args):
 
     booted, first = _ensure_booted(acct, cfg, label,
                                    timeout=getattr(args, "timeout", None),
-                                   accel=getattr(args, "accel", None))
+                                   accel=getattr(args, "accel", None),
+                                   mode_name=getattr(args, "mode", None))
     result = {"name": args.name, "place_id": sess.get("place_id"),
               "deeplink": roblox_deeplink(sess), "first_boot": first,
               "arch": acct_arch(acct), "dev": acct_is_dev(acct),
@@ -5944,7 +5946,13 @@ def deliver_session(acct, label, sess, play=True, restart=True):
     return status
 
 
-def _ensure_booted(acct, cfg, label, timeout=None, accel=None):
+def apply_farming_squeeze(acct):
+    """Run the farming runtime squeeze over adb. Called only on a farming boot."""
+    for cmd in farming.build_squeeze_sequence():
+        adb(acct, *cmd, timeout=20)
+
+
+def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None):
     """Boot the instance if it isn't up, and block until Android is ready.
     Returns (ok, first_boot)."""
     first = not acct.get("first_boot_done")
@@ -5955,7 +5963,8 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None):
         print(f"[{label}] instance is up but Android is still booting; waiting")
     else:
         dev = first          # first boot always uses the dev profile
-        spawn_qemu(acct, cfg, dev=dev, mode=None if dev else resolve_mode(cfg),
+        spawn_qemu(acct, cfg, dev=dev,
+                   mode=None if dev else resolve_mode(cfg, mode_name),
                    accel=accel)
         # Same rule as `start`: the recorder attaches at spawn so a dev session
         # has screenshots of the boot screen itself.
@@ -5974,6 +5983,16 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None):
         # would write accounts/<name>/account.json, a file nothing reads
         # under the diskless model; dropped rather than left as a landmine.
     _devkit_activate(acct, label)
+    # acct_is_dev(acct), not the local `dev` var above: `dev` only reflects
+    # the ephemeral "first boot uses the dev profile" rule (and is a no-op in
+    # the product path, since build_acct() always pre-sets
+    # first_boot_done=True -- see the NOTE above); it is also unset entirely
+    # on the "already running, still booting" branch. acct_is_dev is the
+    # actual account-dev-ness signal (same one _devkit_activate uses above),
+    # so a real --dev boot never squeezes regardless of which branch was
+    # taken to get here.
+    if not acct_is_dev(acct) and mode_name == "farming":
+        apply_farming_squeeze(acct)
     return True, first
 
 
@@ -6204,7 +6223,9 @@ def main():
                             "`omni view` or capture)")
     s.add_argument("--mode", choices=list(MODES), default=None,
                    help="RAM/CPU tier (all headless): playable 4G/4c | "
-                        "hard 3G/4c | brutal 2G/2c. Default: playable")
+                        "hard 3G/4c | brutal 2G/2c | farming 512M/2c "
+                        "(joined-idle, squeezed post-boot). "
+                        "Default: playable")
     s.add_argument("--mem", type=int, default=None,
                    help="override guest RAM in MB")
     s.add_argument("--accel", default=None,
