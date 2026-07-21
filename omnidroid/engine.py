@@ -1156,6 +1156,10 @@ MODES = {
     "playable": {"mem": 4096, "smp": 4},
     "hard":     {"mem": 3072, "smp": 4},
     "brutal":   {"mem": 2048, "smp": 2},
+    # farming: headless, joined-idle, squeezed as small as stable. mem is a
+    # STARTING point the live measurement (Task 9) tunes; the runtime squeeze
+    # (farming.py) does the rest after boot.
+    "farming":  {"mem": 512, "smp": 2},
 }
 DEFAULT_MODE = "playable"
 
