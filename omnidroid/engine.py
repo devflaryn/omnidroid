@@ -1117,6 +1117,14 @@ def default_accel():
     return "kvm"
 
 
+def _gl_window_requested():
+    """B2 spike apparatus: env OMNI_GL_WINDOW=1 asks a start to open a native
+    GPU-accelerated window instead of the headless VNC path. Reversible and
+    off by default — this is the experiment switch, replaced by the real
+    capability-gated playable mode once the spike proves feasibility."""
+    return os.environ.get("OMNI_GL_WINDOW", "").strip() not in ("", "0", "false", "False")
+
+
 def machine_arg(accel):
     """-machine string. On Linux/KVM add mem-merge=on explicitly: it marks
     guest RAM MADV_MERGEABLE so KSM can dedup identical pages across
@@ -1207,6 +1215,12 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
     vnc_display = _assert_port_triple(acct)
     smp = q["smp"] if dev else mode["smp"]
     mem = q["mem_mb"] if dev else mode["mem"]
+    # B2 spike apparatus (see _gl_window_requested): normally headless ALWAYS
+    # (same rule as x86). Only when OMNI_GL_WINDOW is set, on macOS, and not a
+    # dev boot, swap to a native GPU-accelerated cocoa window for the spike.
+    gpu_display = (["-device", "virtio-gpu-gl", "-display", "cocoa,gl=on"]
+                   if (_gl_window_requested() and IS_MACOS and not dev)
+                   else ["-device", "virtio-gpu-pci", "-display", "none"])
 
     # EPHEMERAL (fully-shared, no-persistence) instances boot the SHARED provisioned
     # base templates DIRECTLY with snapshot=on: every write goes to a throwaway
@@ -1256,8 +1270,7 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
         "-device", "virtio-blk-pci,drive=vdb,bootindex=1",
         "-drive", f"file={sys_src},if=none,id=vda{disk_opts}",
         "-drive", f"file={data_src},if=none,id=vdb{disk_opts}",
-        "-device", "virtio-gpu-pci",
-        "-display", "none",       # headless ALWAYS (same rule as x86)
+        *gpu_display,
         # Built-in VNC server, LOCALHOST ONLY (no auth is safe ONLY because
         # of the 127.0.0.1 bind — HARD RULE, same as x86; never bind a
         # network interface without adding auth in the same change).
