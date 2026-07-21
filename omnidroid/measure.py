@@ -37,3 +37,32 @@ def stray_qemu_pids(ps_text, known_pids):
         if pid not in known:
             out.append(pid)
     return out
+
+
+import re as _re
+import time as _time
+
+
+def parse_guest_used_kb(meminfo_text):
+    """Guest used RAM (kB) = MemTotal - MemAvailable from /proc/meminfo text."""
+    def _kb(key):
+        m = _re.search(rf"^{key}:\s+(\d+)\s*kB", meminfo_text or "", _re.M)
+        return int(m.group(1)) if m else None
+    total, avail = _kb("MemTotal"), _kb("MemAvailable")
+    if total is None or avail is None:
+        return None
+    return total - avail
+
+
+def measurement_row(base, mode, arch, boot_minutes, host_rss_kb, guest_used_kb):
+    """One comparable measurement row (units normalized to MB)."""
+    return {
+        "base": base,
+        "mode": mode,
+        "arch": arch,
+        "boot_minutes": boot_minutes,
+        "host_rss_mb": round(host_rss_kb / 1024, 1) if host_rss_kb else None,
+        "guest_used_mb": round(guest_used_kb / 1024, 1) if guest_used_kb else None,
+        "suspect": is_suspect_boot(boot_minutes),
+        "ts": int(_time.time()),
+    }
