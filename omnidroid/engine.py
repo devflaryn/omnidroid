@@ -4099,6 +4099,7 @@ def cmd_version(args):
                         "install", "run-app", "adb", "screenshot", "logcat",
                         "capture", "autocap", "test-apk", "doctor", "bases",
                         "use-base"],
+           "modes": list(MODES),
            "ok": True}
     if getattr(args, "json", False):
         emit_json(rep)
