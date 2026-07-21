@@ -68,6 +68,16 @@ Fill this in, then commit this file (`git add` + `git commit`):
 - **Render verdict** (ACCELERATED / SOFTWARE / BLACK):
 - **Notes** (how the framerate felt, anything odd, any anti-cheat/kick behavior):
 
+### Partial result (2026-07-21, INCONCLUSIVE — pending re-run)
+- The accelerated window opened and the Roblox MENU already felt **noticeably
+  smoother** than software rendering — an early positive (ACCELERATED-leaning)
+  signal.
+- BUT Roblox pushed a NEW version, so the current bootstrap APK hit an update
+  error and could not join place 8737899170 yet. Full verdict is DEFERRED until
+  omni-agent patches the new Roblox version into a fresh bootstrap APK; then
+  re-run steps 2-5 and record the real joined-in-place verdict.
+- Treat B2 as "leaning green, unconfirmed" until the joined re-run is done.
+
 ---
 
 ## What the result means (what happens next)
