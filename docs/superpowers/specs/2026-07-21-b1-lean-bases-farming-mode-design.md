@@ -38,6 +38,13 @@ QEMU-flag tweak.
   the game is backgrounded/low-activity (no active rendering, minimal
   scripting). <400MB is only plausible in this state; an actively-rendering
   Roblox exceeds 400MB by itself.
+- **Measurement APK + place (2026-07-21 update):** the base's currently
+  pre-installed Roblox is FLAGGED and boots to a black screen — useless for RAM
+  measurement. All B1 measurements MUST instead install and measure the
+  bootstrap APK at `~/Desktop/overnight tests/update test/roblox-v2.726-bootstrap.apk`,
+  and must be taken while **joined to place id `8737899170`** (in-place,
+  joined-idle) — NOT on the home screen. A home-screen or black-screen RSS is
+  not a valid B1 measurement.
 - **Mixed production hosts** — x86 Windows/Linux and ARM Macs. B1 stays
   host-agnostic; the <400MB *guarantee* is tightest on Linux/KVM and
   best-effort on macOS/HVF. The design reports the real measured number

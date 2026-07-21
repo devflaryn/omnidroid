@@ -742,11 +742,22 @@ measured numbers (the deliverable is the recorded evidence + the new trimmed
 image registered via Task 5's `register_trim`). A subagent CANNOT complete these
 without a live engine — mark them BLOCKED-until-live if run in a sandbox.
 
+**MEASUREMENT PARAMETERS (binding for every "measure" step below):**
+- The base's **pre-installed Roblox is FLAGGED and boots to a black screen** —
+  do NOT measure it. Before any measurement, install the bootstrap APK
+  `~/Desktop/overnight tests/update test/roblox-v2.726-bootstrap.apk` (dev
+  install path, or the appropriate install for the base) and measure THAT.
+- Every RSS measurement is taken while **joined to place id `8737899170`**
+  (in-place, joined-idle) — never on the home screen or a black screen. A
+  home-screen/black-screen number is invalid; discard and re-measure joined.
+- Combine with the stale-QEMU guard: run `stray_qemu_pids` first; only record a
+  row whose boot time is plausible (`is_suspect_boot` False).
+
 ### Task 7: Phase 0 baseline + Phase 1 PROD ARM trim
 
 **Deliverable:** `docs/superpowers/runbooks/B1-prod-arm-trim.md` with recorded rows.
 
-- [ ] **Step 1: Baseline measure (Phase 0).** Boot `base_arm` (playable), join Roblox to a place, let it idle. Record a `measurement_row` (boot_minutes, host qemu RSS via `ps`, guest used via `adb shell cat /proc/meminfo`). Run `stray_qemu_pids` first; if suspect, kill strays and re-measure. This row is the arm baseline.
+- [ ] **Step 1: Baseline measure (Phase 0).** Boot `base_arm` (playable). Install the bootstrap APK `~/Desktop/overnight tests/update test/roblox-v2.726-bootstrap.apk` (NOT the flagged pre-installed Roblox — it black-screens). Join **place id `8737899170`**, let it settle to joined-idle. Record a `measurement_row` (boot_minutes, host qemu RSS via `ps`, guest used via `adb shell cat /proc/meminfo`). Run `stray_qemu_pids` first; if suspect, kill strays and re-measure. This joined-idle row is the arm baseline.
 - [ ] **Step 2: Trim batch — arm /data template.** Via the `update_kiosk_arm` copy-back pattern, remove unused `/data` apps (stock browser/gallery/email/etc. if present there). Boot a throwaway account, remove, copy `/data` back.
 - [ ] **Step 3: PROD floor smoke-test.** kiosk boots → launches Roblox APK → adb reachable on a FRESH boot → cookie login works → VNC view works → Lock-Task kiosk intact. If any fail, REVERT this batch.
 - [ ] **Step 4: Trim batch — arm /system/product bloat** (constrained: no `adb root`; keep `/product/app/Roblox`). Flatten. **Re-run the PROD floor AND confirm the matched-pair FBE still decrypts** (clean boot to a usable kiosk). Revert if the pair desyncs.
@@ -757,7 +768,7 @@ without a live engine — mark them BLOCKED-until-live if run in a sandbox.
 
 **Deliverable:** `docs/superpowers/runbooks/B1-prod-x86-trim.md`.
 
-- [ ] **Step 1: Baseline measure.** Boot `base_x86` (playable) — on the ARM Mac this runs under slow TCG; that's accepted. Join Roblox, idle, record the row (guard against strays first).
+- [ ] **Step 1: Baseline measure.** Boot `base_x86` (playable) — on the ARM Mac this runs under slow TCG; that's accepted. Install the bootstrap APK (see MEASUREMENT PARAMETERS above; not the flagged pre-installed one), join **place id `8737899170`**, settle to joined-idle, record the row (guard against strays first).
 - [ ] **Step 2: Trim via the /system flow.** x86 supports `adb root` + `mount -o remount,rw /` + `/system` edits + flatten (engine.py ~2522–2558). Remove unused apps/services in batches.
 - [ ] **Step 3: PROD floor smoke-test** (same six checks). Revert any batch that fails.
 - [ ] **Step 4: Register + re-measure.** `register_trim(cfg, "x86", ...)`, retain prior, record delta.
@@ -770,7 +781,7 @@ without a live engine — mark them BLOCKED-until-live if run in a sandbox.
 - [ ] **Step 1: DEV ARM trim** on `base_arm_devsystem` (lowest priority, done last). Trim in batches.
 - [ ] **Step 2: DEV floor smoke-test** — PROD floor PLUS: frida-server reachable on 27142, Magisk `su` works, devkit vdc mounts + activates (`_devkit_activate`), dev-UI/kiosk toggle works, always-on screenshots work. A trim that breaks `su`/frida is REVERTED.
 - [ ] **Step 3: Register + measure dev.** `register_trim(cfg, "dev", ...)`, retain prior.
-- [ ] **Step 4: Farming measure (Phase 2).** On the trimmed `base_arm` (and `base_x86`), `start --mode farming` (which now applies the squeeze). Join Roblox, idle, confirm the session STAYS connected after the squeeze (not AFK-kicked). Record farming joined-idle RSS + boot time. Guard against strays.
+- [ ] **Step 4: Farming measure (Phase 2).** On the trimmed `base_arm` (and `base_x86`), `start --mode farming` (which now applies the squeeze). Install the bootstrap APK (not the flagged one), join **place id `8737899170`**, settle to joined-idle, and confirm the session STAYS connected after the squeeze (not AFK-kicked / not black-screened). Record farming joined-idle RSS + boot time. Guard against strays.
 - [ ] **Step 5: Phase 3 decision gate.** Compare farming `guest_used_mb` to 400. **If ≤400 (or as-low-as-stable):** DONE — one base per arch; record the achieved number. **If >400:** record the shortfall and open a follow-up spec for a dedicated stripped farming image (do NOT build it here — that's a new decision with data).
 - [ ] **Step 6: Commit the runbook** with the full measurement table (baseline → trimmed → farming, both arches) and the decision-gate verdict.
 
