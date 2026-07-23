@@ -5,12 +5,16 @@ truth (see verified-liveness, Tasks 8-12)."""
 import contextlib
 import json
 import os
+import pathlib
 import re
 import time
 from pathlib import Path
 
 from omnidroid import config
 from omnidroid.config import IS_WINDOWS
+
+
+_PROC = pathlib.Path("/proc")   # overridable in tests
 
 
 # Per-instance PORT SCHEME (documented invariant):
@@ -106,6 +110,27 @@ def pid_alive(pid):
             return True
         except OSError:
             return False
+
+
+def _cmdline_has_token(pid, token):
+    """True iff the Linux /proc/<pid>/cmdline arg vector contains `token`.
+    Cheap identity confirmation that kills PID-recycle false positives with
+    no socket. Returns False anywhere /proc is unavailable (macOS/Windows)."""
+    try:
+        raw = (_PROC / str(pid) / "cmdline").read_bytes()
+    except (OSError, ValueError):
+        return False
+    return token.encode() in raw.split(b"\x00")
+
+
+def _qmp_name(qmp_port, timeout=0.25):
+    """The guest name from QMP query-name on qmp_port, or None on any
+    error/refusal. Fast (short timeout) — runs in hot paths."""
+    from omnidroid.qemu_proc import qmp   # lazy: qemu_proc imports runtime_dir
+    resp = qmp({"qmp_port": qmp_port}, "query-name", timeout=timeout)
+    if not resp:
+        return None
+    return (resp.get("return") or {}).get("name")
 
 
 def expected_identity(rec):
