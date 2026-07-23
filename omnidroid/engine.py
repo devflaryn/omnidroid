@@ -55,11 +55,6 @@ def _store_root():
     return config.data_dir()
 
 
-# Linux KSM (kernel samepage merging) sysfs interface. Dedups identical
-# guest RAM pages across instances (same immutable base => big overlap).
-KSM_DIR = Path("/sys/kernel/mm/ksm")
-PAGE_SIZE = 4096
-
 FIRST_BOOT_TIMEOUT = 1500   # first boot runs full dexopt; be patient
 NORMAL_BOOT_TIMEOUT = 360
 
@@ -711,49 +706,8 @@ def host_mem_available_mb():
 
 
 # ---------- KSM (Linux kernel samepage merging) ----------
-
-def ksm_available():
-    return IS_LINUX and KSM_DIR.exists()
-
-
-def ksm_stats():
-    """Read all /sys/kernel/mm/ksm/* values (ints where possible).
-    None when KSM is not available (non-Linux or kernel without KSM)."""
-    if not ksm_available():
-        return None
-    out = {}
-    for f in sorted(KSM_DIR.iterdir()):
-        try:
-            v = f.read_text().strip()
-            out[f.name] = int(v) if v.lstrip("-").isdigit() else v
-        except OSError:
-            pass
-    return out
-
-
-def ksm_write(name, value):
-    """Write one KSM sysfs knob; exits with sudo advice on EPERM."""
-    try:
-        (KSM_DIR / name).write_text(str(value))
-    except PermissionError:
-        sys.exit(f"error: no permission to write {KSM_DIR / name} - "
-                 f"run with sudo (or install/enable ksmtuned)")
-
-
-def ksm_saved_mb(stats):
-    """Approx MB deduplicated: each page in pages_sharing points at a
-    shared page instead of owning its own copy."""
-    return stats.get("pages_sharing", 0) * PAGE_SIZE / (1024 * 1024)
-
-
-def pid_ksm_merged_mb(pid):
-    """Per-process KSM-merged pages (kernel >= 6.1 exposes
-    ksm_merging_pages). None if unsupported."""
-    try:
-        n = int(Path(f"/proc/{pid}/ksm_merging_pages").read_text())
-        return n * PAGE_SIZE / (1024 * 1024)
-    except Exception:
-        return None
+from omnidroid.ksm import *  # noqa: F401,F403
+from omnidroid.ksm import _ksm_wait_settle  # noqa: F401
 
 
 # ---------- adb / qmp ----------
@@ -3985,25 +3939,6 @@ def _wait_game_running(acct, pkg, timeout=180):
             pass
         time.sleep(3)
     return False
-
-
-def _ksm_wait_settle(settle_secs, timeout=600):
-    """Block until KSM pages_sharing stops moving (<1% drift held for
-    settle_secs). Returns the settled pages_sharing value."""
-    last = None
-    stable_since = None
-    start = time.time()
-    while time.time() - start < timeout:
-        cur = ksm_stats().get("pages_sharing", 0)
-        if last is not None and abs(cur - last) <= max(last, 100) * 0.01:
-            stable_since = stable_since or time.time()
-            if time.time() - stable_since >= settle_secs:
-                return cur
-        else:
-            stable_since = None
-        last = cur
-        time.sleep(10)
-    return last or 0
 
 
 def cmd_bench_ksm(args):
