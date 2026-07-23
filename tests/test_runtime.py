@@ -43,6 +43,7 @@ def test_spawn_records_ports_in_runtime_run_json(tmp_path, monkeypatch):
 
 def test_allocate_ports_reuses_freed_slots(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("omnidroid.runtime._port_answers", lambda port, timeout=0.25: False)
     cfg = {"qemu": {"adb_port_start": 16001, "qmp_port_start": 17001,
                     "vnc_port_start": 18001}}
     # no running instances -> index 0
@@ -65,6 +66,7 @@ def test_build_acct_reserves_port_slot_before_spawn(tmp_path, monkeypatch):
     self-healing: its pid goes dead and running_instances() stops counting
     it, freeing the slot back up."""
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("omnidroid.runtime._port_answers", lambda port, timeout=0.25: False)
     cfg = {"qemu": {"adb_port_start": 16001, "qmp_port_start": 17001,
                     "vnc_port_start": 18001}}
     assert engine.allocate_ports(cfg) == (16001, 17001, 18001)

@@ -100,6 +100,7 @@ def test_build_acct_allocates_ports_and_writes_no_account_folder(
     (images / "base_arm_efivars.fd").write_bytes(b"EFI-TEMPLATE")
     cfg = _build_cfg(images)
     monkeypatch.setattr(engine, "ensure_qemu", lambda: None)
+    monkeypatch.setattr("omnidroid.runtime._port_answers", lambda port, timeout=0.25: False)
 
     handle = engine.build_acct("newacct", cfg)
 

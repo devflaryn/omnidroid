@@ -55,11 +55,6 @@ def _store_root():
     return config.data_dir()
 
 
-# Linux KSM (kernel samepage merging) sysfs interface. Dedups identical
-# guest RAM pages across instances (same immutable base => big overlap).
-KSM_DIR = Path("/sys/kernel/mm/ksm")
-PAGE_SIZE = 4096
-
 FIRST_BOOT_TIMEOUT = 1500   # first boot runs full dexopt; be patient
 NORMAL_BOOT_TIMEOUT = 360
 
@@ -91,27 +86,15 @@ DEFAULT_SRC = "/android-2024-10-11"
 #                provisioned /data fails with init_user0_failed. An account
 #                therefore copies the provisioned (system-overlay, data,
 #                efivars) trio rather than provisioning on first boot.
-BASE_TYPE_X86 = "x86-bliss"
-BASE_TYPE_ARM = "arm-uefi"
+from omnidroid.bases import *  # noqa: F401,F403
+from omnidroid.bases import (_truthy_env, _dev_mode_for_play, _select_base_tag,
+                             _next_base_tag)  # noqa: F401
 
 
-def base_type(base):
-    return base.get("type", BASE_TYPE_X86)
 
 
-def acct_base_is_arm(acct):
-    """True if this account's base is arm-uefi (reads config; safe/cheap)."""
-    try:
-        b = (read_config().get("bases") or {}).get(acct.get("base"), {})
-        return base_type(b) == BASE_TYPE_ARM
-    except Exception:
-        return False
 
 
-def base_is_dev(base):
-    """True if a base entry carries the dev devkit disk (frida + Magisk tools).
-    The dev base is arm-uefi + a 'devkit' field naming the extra vdc disk."""
-    return bool(base.get("devkit"))
 
 
 # ---------- dev-mode gate ----------
@@ -128,77 +111,26 @@ def base_is_dev(base):
 # it explicitly (see android_emulator._omni_env). A customer running the shipped
 # product never has it set, so for them the dev base does not exist even if its
 # images somehow do.
-DEV_MODE_ENV = "OMNI_DEV_MODE"
 
 
-def dev_mode_enabled():
-    return str(os.environ.get(DEV_MODE_ENV, "")).strip().lower() in (
-        "1", "true", "yes", "on")
 
 
-def _truthy_env(name):
-    return str(os.environ.get(name, "")).strip().lower() in (
-        "1", "true", "yes", "on")
 
 
-def _dev_mode_for_play(args):
-    """Whether `omni start` should target the DEV base for a NEW instance.
-
-    This is SELECTION (use dev), which is distinct from ACCESS (may use dev,
-    i.e. OMNI_DEV_MODE / dev_mode_enabled). The agent sets OMNI_DEV_MODE=1 just to
-    UNLOCK the dev base, but still runs production by default — so dev selection
-    must NOT be implied by OMNI_DEV_MODE, only by an explicit --dev or the
-    dedicated OMNI_USE_DEV_BASE 'default to dev' env. assert_dev_allowed still
-    refuses dev to a caller that has not unlocked it."""
-    if getattr(args, "dev", False):
-        return True
-    return _truthy_env("OMNI_USE_DEV_BASE")
 
 
-def visible_bases(cfg_or_raw):
-    """The bases this caller is allowed to see: everything, minus dev bases when
-    dev mode is off."""
-    bases = cfg_or_raw.get("bases") or {}
-    if dev_mode_enabled():
-        return dict(bases)
-    return {t: b for t, b in bases.items() if not base_is_dev(b)}
 
 
-def assert_dev_allowed(tag, base):
-    """Refuse a dev base to a caller that has not opted in."""
-    if base_is_dev(base) and not dev_mode_enabled():
-        fail("dev_base_locked",
-             f"base '{tag}' is a development base (frida/Magisk root) and is "
-             f"not available in this build. It is unlocked only for the "
-             f"omni-agent devtool ({DEV_MODE_ENV}=1).")
 
 
-def acct_is_dev(acct):
-    """True if this account is a dev account: either it was created from a dev
-    base (its base entry has a 'devkit') or it carries an explicit dev flag.
-    Reads config; safe/cheap. Dev accounts get the devkit disk attached as vdc
-    and the frida/Magisk activation on start."""
-    if acct.get("dev"):
-        return True
-    try:
-        b = (read_config().get("bases") or {}).get(acct.get("base"), {})
-        return base_is_dev(b)
-    except Exception:
-        return False
 
 
 # ---------- canonical arch tokens (contract omnidroid-api.md v1 §2) ----------
 # The frozen arch enum both clients code against is "x86" | "arm". It maps
 # base type x86-bliss->"x86", arm-uefi->"arm"; host amd64/x86_64->"x86",
 # arm64/aarch64->"arm".
-def arch_of_base(base):
-    """Canonical arch token for a base entry: 'x86' | 'arm'."""
-    return "arm" if base_type(base) == BASE_TYPE_ARM else "x86"
 
 
-def acct_arch(acct):
-    """Canonical arch token for an account: 'x86' | 'arm'."""
-    return "arm" if acct_base_is_arm(acct) else "x86"
 
 
 def host_arch_token():
@@ -208,20 +140,11 @@ def host_arch_token():
 
 # arm-uefi base default filenames in images_dir (a future downloaded base
 # can override any of these in its config entry).
-ARM_BASE_DISK = "base_arm.qcow2"            # pristine system, shared backing
-ARM_BASE_SYSTEM = "base_arm_system.qcow2"   # provisioned overlay (FBE keys)
-ARM_BASE_DATA = "base_arm_data.qcow2"       # provisioned /data (kiosk + DO)
-ARM_BASE_EFIVARS = "base_arm_efivars.fd"    # provisioned UEFI vars
-ARM_BASE_TAG = "arm"
 
 # x86-bliss base canonical filenames in images_dir — mirrors the base_arm
 # scheme exactly: versionless filename, version tracked INSIDE the config
 # entry ("version" + "changelog"). Legacy base-vN.* triples are still
 # auto-registered so old deployments keep working.
-X86_BASE_DISK = "base_x86.qcow2"
-X86_BASE_KERNEL = "base_x86.kernel"
-X86_BASE_INITRD = "base_x86.initrd.img"
-X86_BASE_TAG = "x86"
 
 # dev/debug base — the arm "devkit disk" model (replaces the old x86 base-dev).
 #
@@ -235,31 +158,22 @@ X86_BASE_TAG = "x86"
 # DEV-ONLY: only omni-agent selects it (`create --base dev`); the shipped bases
 # (base_x86 / base_arm) never carry any of it, and building it NEVER changes
 # current_base.
-DEV_BASE_TAG = "dev"
 # The extra devkit disk (attached to dev accounts as vdc). Shared + immutable;
 # each dev account gets a cheap COW overlay of it (like the system overlay).
-ARM_DEVKIT_DISK = "base_arm_devkit.qcow2"
 # The rooted dev SYSTEM overlay (COW on base_arm.qcow2) — holds the Magisk-
 # patched boot. base_arm.qcow2 stays immutable.
-ARM_DEVSYSTEM_DISK = "base_arm_devsystem.qcow2"
 # Root-state markers embedded in the dev base's human-readable `notes`. Kept as
 # constants because _dev_base_entry rewrites whichever one is stale when it
 # preserves a hand-edited note — `notes` must never contradict
 # devkit_manifest.rooted.
-ROOTED_MARKER = " [rooted]"
-ROOT_PENDING_MARKER = " [root pending: --patch-boot]"
 # The dev /data template: a copy of the provisioned arm /data that ALSO has
 # Magisk fully configured (shell su granted Forever, root_access=3, Zygisk +
 # DenyList on), captured once from a rooted dev boot. When present, dev accounts
 # use it so root works HEADLESSLY from first boot (no GUI su prompt). It is a
 # matched pair with base_arm_devsystem (same /metadata FBE keys).
-ARM_DEVDATA_DISK = "base_arm_devdata.qcow2"
 # Where the guest mounts the devkit disk (read-only) and where the activated,
 # exec-capable copy of the toolkit lives. /mnt is a noexec tmpfs on this base,
 # so the toolkit is copied to /data/local/tmp for execution (see _devkit_*).
-DEVKIT_MOUNT = "/mnt/omni-devkit"          # ro mount of vdc (source of truth)
-DEVKIT_WORK = "/data/local/tmp/omni-devkit"  # exec-capable activated copy
-DEVKIT_MANIFEST_GUEST = DEVKIT_WORK + "/manifest.json"
 # frida-server pinned for the dev base (android-ARM64 — the base runs arm64
 # natively under HVF/KVM, no translation). Override with
 # `build-dev-base --frida-version`. The hidden frida port is intentionally NOT
@@ -270,30 +184,8 @@ DEFAULT_FRIDA_PORT = 27142
 # EDK2 aarch64 firmware CODE (read-only); resolved from the QEMU install.
 # On macOS/brew it ships inside the qemu Cellar; overridable via config
 # qemu.arm_edk2_code.
-ARM_EDK2_CANDIDATES = (
-    "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
-    "/usr/local/share/qemu/edk2-aarch64-code.fd",
-    "/usr/share/qemu/edk2-aarch64-code.fd",
-)
 
 
-def arm_edk2_code():
-    """Absolute path to edk2-aarch64-code.fd (UEFI firmware CODE volume).
-    Config qemu.arm_edk2_code wins; else the brew Cellar (globbed, newest);
-    else the well-known share dirs."""
-    import glob
-    try:
-        cfgd = read_config().get("qemu", {}).get("arm_edk2_code")
-    except Exception:
-        cfgd = None
-    if cfgd and Path(cfgd).exists():
-        return cfgd
-    cellar = sorted(glob.glob(
-        "/opt/homebrew/Cellar/qemu/*/share/qemu/edk2-aarch64-code.fd"))
-    for cand in ([cellar[-1]] if cellar else []) + list(ARM_EDK2_CANDIDATES):
-        if Path(cand).exists():
-            return cand
-    return None
 
 
 # Config bootstrapped on a blank deployment (exe dropped into a new
@@ -314,44 +206,11 @@ DEFAULT_CONFIG = {
 
 
 # ---------- machine-readable output (the GUI contract) ----------
-
-def emit_json(obj):
-    """The one JSON payload a --json command prints on stdout."""
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
-
-
-# Set True by enable_json_mode(); read by fail() to shape typed errors.
-_JSON_MODE = False
-
-
-def enable_json_mode():
-    """--json: stdout must carry EXACTLY the JSON payload. Redirect every
-    informational print() (progress, warnings) to stderr so a GUI can
-    parse stdout blindly. emit_json writes to sys.stdout directly and is
-    unaffected."""
-    global _JSON_MODE
-    _JSON_MODE = True
-    import builtins
-    orig = builtins.print
-
-    def _to_stderr(*a, **k):
-        k.setdefault("file", sys.stderr)
-        orig(*a, **k)
-    builtins.print = _to_stderr
-
-
-def fail(code, message=None, exit_code=1):
-    """Contract-shaped fatal error (omnidroid-api.md v1 §8). In --json mode
-    emit {"ok":false,"error":<code>,"message":<msg>} on stdout; always write a
-    human line to stderr; exit nonzero. Use for the TYPED errors the contract
-    names (arch_boundary, abi_not_translated, install_failed, no_base, ...);
-    legacy sys.exit(str) sites are left untouched to keep [CURRENT] behavior."""
-    msg = message or code
-    if _JSON_MODE:
-        emit_json({"ok": False, "error": code, "message": msg})
-    sys.stderr.write(f"error: {msg}\n")
-    sys.exit(exit_code)
+# Relocated to omnidroid/output.py (Task 2 extraction); re-exported below so
+# every `engine.<name>` caller keeps resolving.
+from omnidroid.output import emit_json, enable_json_mode, fail, redact_token
+from omnidroid import output   # for output._JSON_MODE single-source reads
+from omnidroid.output import _JSON_MODE  # noqa: F401  (facade re-export)
 
 
 # ---------- config / account state ----------
@@ -379,165 +238,12 @@ def read_config():
                  f"delete it (a default will be recreated).")
 
 
-def base_setup_help(images_dir, cfg=None):
-    """The exact, actionable 'make this install ready' message — shown by
-    setup, doctor, and every base-needing command when no base is usable."""
-    template = (cfg or {}).get("data_template", "data-template-8g.qcow2")
-    return (
-        f"\nThis install has no usable base image yet. Copy the base "
-        f"assets into:\n"
-        f"  {images_dir}\n"
-        f"required files (exact names):\n"
-        f"  base_x86.qcow2        the immutable Bliss OS system image\n"
-        f"  base_x86.kernel       its extracted kernel\n"
-        f"  base_x86.initrd.img   its extracted initrd\n"
-        f"  {template}    formatted-empty ext4 /data template\n"
-        f"(legacy versioned triples base-vN.qcow2/.kernel/.initrd.img are "
-        f"also accepted.)\nComplete bases are registered automatically on "
-        f"the next command\n(or run: omnidroid setup). Check readiness any "
-        f"time with: omnidroid doctor\n"
-        f"(These files will arrive via download in a future version.)")
 
 
-def autoregister_bases():
-    """Scan images_dir for complete, not-yet-registered base file sets and
-    register them (src from config 'default_src'): the canonical versionless
-    base_x86 triple (mirrors base_arm; version lives in the entry, not the
-    filename) plus legacy base-vN triples. If no current_base is set, point
-    it at the canonical x86 base (else the highest legacy version). Persists
-    the RAW config (keeps the per-platform images_dir dict intact). Returns
-    (raw_config, newly_registered_tags). Registration only ADDS entries —
-    existing bases/accounts are never touched, honoring base immutability."""
-    raw = read_config()
-    images = Path(images_dir(raw))
-    bases = raw.setdefault("bases", {})
-    known_disks = {b.get("disk") for b in bases.values()}
-    new = []
-    # Canonical x86 base: versionless base_x86 triple (mirrors base_arm).
-    if (X86_BASE_TAG not in bases and X86_BASE_DISK not in known_disks
-            and images.exists()
-            and (images / X86_BASE_DISK).exists()
-            and (images / X86_BASE_KERNEL).exists()
-            and (images / X86_BASE_INITRD).exists()):
-        bases[X86_BASE_TAG] = {"type": BASE_TYPE_X86,
-                               "disk": X86_BASE_DISK,
-                               "kernel": X86_BASE_KERNEL,
-                               "initrd": X86_BASE_INITRD,
-                               "src": raw.get("default_src", DEFAULT_SRC),
-                               "notes": "auto-registered canonical x86 base "
-                                        "from images_dir"}
-        new.append(X86_BASE_TAG)
-    if images.exists():
-        for disk in sorted(images.glob("base-*.qcow2")):
-            m = re.fullmatch(r"base-(v\d+)\.qcow2", disk.name)
-            if not m or disk.name in known_disks or m.group(1) in bases:
-                continue
-            tag = m.group(1)
-            kernel = images / f"base-{tag}.kernel"
-            initrd = images / f"base-{tag}.initrd.img"
-            if kernel.exists() and initrd.exists():
-                bases[tag] = {"disk": disk.name, "kernel": kernel.name,
-                              "initrd": initrd.name,
-                              "src": raw.get("default_src", DEFAULT_SRC),
-                              "notes": "auto-registered from images_dir"}
-                new.append(tag)
-    # arm-uefi base: register the provisioned matched-pair trio if present
-    # (base_arm.qcow2 backing + base_arm_system.qcow2 overlay + _data + _efivars).
-    # Independent of the x86 vN scheme; only ADDS an "arm" entry.
-    if (ARM_BASE_TAG not in bases and images.exists()
-            and (images / ARM_BASE_DISK).exists()
-            and (images / ARM_BASE_SYSTEM).exists()
-            and (images / ARM_BASE_DATA).exists()):
-        bases[ARM_BASE_TAG] = {
-            "type": BASE_TYPE_ARM,
-            "base_disk": ARM_BASE_DISK,
-            "system": ARM_BASE_SYSTEM,
-            "data": ARM_BASE_DATA,
-            "efivars": ARM_BASE_EFIVARS,
-            "src": "https://github.com/jqssun/android-lineage-qemu "
-                   "(LineageOS 23.2 arm64, virtio_arm64only)",
-            "notes": "auto-registered arm64/UEFI base (LineageOS 23.2, "
-                     "kiosk+device-owner provisioned matched pair)"}
-        new.append(ARM_BASE_TAG)
-    # dev/debug base: the arm base PLUS the extra devkit disk (attached as vdc).
-    # ADD-ONLY; never made current_base (the shipped product stays on the arm/x86
-    # production base). Registered only when the arm base files AND the devkit
-    # disk are present. It reuses the arm provisioned trio (a rooted dev system
-    # overlay is preferred if `base_arm_devsystem.qcow2` exists). See
-    # build_dev_base() / DEV_BASE_TAG.
-    if (DEV_BASE_TAG not in bases and images.exists()
-            and (images / ARM_DEVKIT_DISK).exists()
-            and (images / ARM_BASE_DISK).exists()
-            and (images / ARM_BASE_SYSTEM).exists()
-            and (images / ARM_BASE_DATA).exists()):
-        dev_system = (ARM_DEVSYSTEM_DISK
-                      if (images / ARM_DEVSYSTEM_DISK).exists()
-                      else ARM_BASE_SYSTEM)
-        dev_data = (ARM_DEVDATA_DISK if (images / ARM_DEVDATA_DISK).exists()
-                    else ARM_BASE_DATA)
-        bases[DEV_BASE_TAG] = {
-            "type": BASE_TYPE_ARM,
-            "base_disk": ARM_BASE_DISK,
-            "system": dev_system,
-            "data": dev_data,
-            "efivars": ARM_BASE_EFIVARS,
-            "devkit": ARM_DEVKIT_DISK,
-            "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
-            "notes": "auto-registered arm dev base: base_arm + the "
-                     "base_arm_devkit.qcow2 extra disk (vdc); omni-agent only"}
-        new.append(DEV_BASE_TAG)
-    changed = bool(new)
-    if not raw.get("current_base") and bases:
-        # Prefer an arm base on an arm64 host, else the canonical x86 base,
-        # else the highest legacy x86 vN.
-        x86 = [t for t in bases if base_type(bases[t]) == BASE_TYPE_X86]
-        if IS_ARM64_HOST and ARM_BASE_TAG in bases:
-            raw["current_base"] = ARM_BASE_TAG
-        elif X86_BASE_TAG in bases:
-            raw["current_base"] = X86_BASE_TAG
-        elif x86:
-            raw["current_base"] = max(
-                x86, key=lambda t: int(re.sub(r"\D", "", t) or 0))
-        else:
-            raw["current_base"] = next(iter(bases))
-        changed = True
-    if changed:
-        CONFIG_PATH.write_text(json.dumps(raw, indent=2))
-        if new:
-            print(f"[config] auto-registered base(s) from {images}: "
-                  f"{', '.join(new)} (current: {raw['current_base']})")
-    return raw, new
 
 
-def effective_base_tag(cfg):
-    """The base tag to use, selected by HOST ARCHITECTURE. On an arm64 host
-    prefer an arm-uefi base (config 'current_base_arm', else the first
-    arm-uefi base, else 'arm'); on x86 hosts use current_base. This keeps
-    x86 behavior byte-identical while letting the same checkout pick the
-    arm base automatically on Apple Silicon."""
-    bases = cfg.get("bases") or {}
-    if IS_ARM64_HOST:
-        cand = cfg.get("current_base_arm")
-        if cand and cand in bases and base_type(bases[cand]) == BASE_TYPE_ARM:
-            return cand
-        for t, b in bases.items():
-            if base_type(b) == BASE_TYPE_ARM:
-                return t
-    return cfg.get("current_base")
 
 
-def base_missing_files(images, base):
-    """Per-type list of a base's missing files (absolute paths)."""
-    if base_type(base) == BASE_TYPE_ARM:
-        keys = ("base_disk", "system", "data")   # efivars optional
-        missing = [str(images / base[k]) for k in keys
-                   if base.get(k) and not (images / base[k]).exists()]
-        # A dev base additionally needs its extra devkit disk (vdc).
-        if base.get("devkit") and not (images / base["devkit"]).exists():
-            missing.append(str(images / base["devkit"]))
-        return missing
-    return [str(images / base[k]) for k in ("disk", "kernel", "initrd")
-            if not (images / base[k]).exists()]
 
 
 def load_config():
@@ -754,683 +460,26 @@ def all_accounts():
     return sorted(out, key=lambda a: a["name"])
 
 
-# Per-instance PORT SCHEME (documented invariant):
-#   instance index i (0-based)  ->  adb = adb_port_start + i   (16001+)
-#                                   qmp = qmp_port_start + i   (17001+)
-#                                   vnc = vnc_port_start + i   (18001+)
-# One shared index per account keeps the triple aligned; the three ranges
-# are 1000 apart, so adb/qmp/vnc can NEVER collide below 1000 instances
-# (and instance counts are host-RAM-bound long before that). vnc_port is
-# WIRED: QEMU's built-in VNC server listens on it, 127.0.0.1 ONLY. No
-# auth — that is safe ONLY because of the localhost bind (HARD RULE:
-# never bind VNC to a network interface without adding auth).
-VNC_PORT_START_DEFAULT = 18001
-
-
-def vnc_start(cfg):
-    return cfg["qemu"].get("vnc_port_start", VNC_PORT_START_DEFAULT)
-
-
-def allocate_ports(cfg):
-    """Lowest free port-index across RUNNING instances (a stopped instance
-    frees its slot immediately). The three ranges are 1000 apart, so the shared
-    index keeps adb/qmp/vnc aligned and collision-free below 1000 concurrent."""
-    q = cfg["qemu"]
-    # Scan CLAIMED slots (running instances AND live reservations), not just
-    # running_instances() -- a concurrent launch that has reserved but not yet
-    # spawned still holds its slot, so this closes the allocate/spawn race.
-    used = {p - q["adb_port_start"] for p in _claimed_port_indices()}
-    i = 0
-    while i in used:
-        i += 1
-    return (q["adb_port_start"] + i, q["qmp_port_start"] + i,
-            vnc_start(cfg) + i)
-
-
-@contextlib.contextmanager
-def _launch_lock():
-    """Serialize the allocate-ports + reserve-slot critical section across
-    concurrent `start` launches on one host. Without it, two parallel launches
-    race to the same free port index. POSIX flock; a no-op on Windows (the
-    120-concurrent farm is Linux, dev is macOS -- both POSIX; the shipped
-    Windows product launches one instance at a time)."""
-    lock_path = config.runtime_root() / ".launch.lock"
-    f = open(lock_path, "w")
-    try:
-        try:
-            import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass   # Windows / no-flock: degrade to no lock (single-launch host)
-        yield
-    finally:
-        f.close()
-
-
-# ---------- process helpers ----------
-
-def pid_alive(pid):
-    if pid is None:
-        return False
-    if IS_WINDOWS:
-        # NEVER use os.kill(pid, 0) on Windows: it TERMINATES the process.
-        import ctypes
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        h = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not h:
-            return False
-        code = ctypes.c_ulong()
-        ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
-        ctypes.windll.kernel32.CloseHandle(h)
-        return bool(ok) and code.value == STILL_ACTIVE
-    else:
-        import os
-        # Reap first, and treat a zombie as DEAD. os.kill(pid, 0) succeeds on a
-        # zombie, so a QEMU we spawned IN-PROCESS (update-kiosk, play's
-        # _ensure_booted) reports as "still running" after it has exited — which
-        # made _shutdown escalate powerdown -> QMP quit -> SIGKILL against an
-        # already-dead process and then return 'kill-failed'. Callers ask "is the
-        # instance running?"; a zombie is not.
-        #
-        # The usual detached case (`omni start` exits, QEMU reparents to init) is
-        # unaffected: waitpid raises ChildProcessError and we fall through.
-        try:
-            wpid, _status = os.waitpid(pid, os.WNOHANG)
-            if wpid == pid:
-                return False          # exited; just reaped it
-        except (ChildProcessError, OSError):
-            pass                      # not our child — the normal case
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
-
-def runtime_dir(username):
-    """Per-instance throwaway dir: efivars, run.json (ports+pid), qemu.log,
-    autocap frames. Wiped on `stop` and `remove` (see _wipe_runtime).
-    Replaces the old accounts/<name>/ for the product path."""
-    return config.runtime_root() / username
-
-
-def _reserve_ports(name, adb_port, qmp_port, vnc_port):
-    """Claim a port slot for `name` by writing a run.json reservation with THIS
-    launcher process's pid, so a concurrent allocate_ports() (which counts
-    runtime/*/run.json with a live pid) sees the slot as taken until
-    spawn_qemu() overwrites it with the real QEMU pid. Self-healing: if the
-    launch aborts before spawn, the launcher exits, its pid dies, and
-    running_instances() stops counting the stale reservation -> slot freed."""
-    d = runtime_dir(name)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "run.json").write_text(json.dumps(
-        {"pid": os.getpid(), "started": time.time(), "reserving": True,
-         "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port}))
-
-
-def _wipe_runtime(name):
-    """Delete the per-instance runtime dir (efivars.fd, run.json, qemu.log,
-    autocap frames) once an ephemeral instance (build_acct) has stopped.
-    Called from cmd_stop (after a successful power-off) and cmd_remove.
-    Ephemeral instances write nothing under accounts/<name>/, so this IS
-    the entire teardown -- no folder to remove there."""
-    import shutil
-    shutil.rmtree(runtime_dir(name), ignore_errors=True)
-
-
-def running_instances():
-    """Every instance with a LIVE qemu pid, read from runtime/*/run.json.
-    Dead/stale run.json files are ignored. Returns dicts with name + ports."""
-    out = []
-    root = config.data_dir() / "runtime"
-    if not root.exists():
-        return out
-    for d in sorted(root.iterdir()):
-        rj = d / "run.json"
-        if not rj.exists():
-            continue
-        try:
-            data = json.loads(rj.read_text())
-        except Exception:  # noqa: BLE001
-            continue
-        # A reservation is not a running instance (see running_pid). It holds a
-        # port slot (allocate_ports scans _claimed_port_indices, which DOES
-        # count live reservations) but must not appear as a live game to
-        # list/all_accounts/_ensure_booted.
-        if data.get("reserving"):
-            continue
-        if pid_alive(data.get("pid")):
-            out.append({"name": d.name, "pid": data["pid"],
-                        "base": data.get("base"),
-                        "adb_port": data.get("adb_port"),
-                        "qmp_port": data.get("qmp_port"),
-                        "vnc_port": data.get("vnc_port")})
-    return out
-
-
-def _claimed_port_indices():
-    """Port indices currently CLAIMED across runtime/*/run.json -- a slot is
-    claimed by a live running instance OR a live reservation (build_acct's
-    pre-spawn run.json). This is what allocate_ports must avoid, so a concurrent
-    launch that has reserved-but-not-yet-spawned still blocks the slot. A dead
-    pid (crashed launcher, exited QEMU) frees its slot."""
-    root = config.data_dir() / "runtime"
-    claimed = set()
-    if not root.exists():
-        return claimed
-    for d in sorted(root.iterdir()):
-        rj = d / "run.json"
-        if not rj.exists():
-            continue
-        try:
-            data = json.loads(rj.read_text())
-        except Exception:  # noqa: BLE001
-            continue
-        if data.get("adb_port") is not None and pid_alive(data.get("pid")):
-            claimed.add(data["adb_port"])
-    return claimed
-
-
-def host_rss_mb(pid):
-    """Resident memory of a host process, in MB."""
-    try:
-        if IS_WINDOWS:
-            import ctypes
-            import ctypes.wintypes as wt
-
-            class PMC(ctypes.Structure):
-                _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD),
-                            ("PeakWorkingSetSize", ctypes.c_size_t),
-                            ("WorkingSetSize", ctypes.c_size_t),
-                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                            ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                            ("PagefileUsage", ctypes.c_size_t),
-                            ("PeakPagefileUsage", ctypes.c_size_t)]
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if not h:
-                return None
-            pmc = PMC()
-            pmc.cb = ctypes.sizeof(PMC)
-            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
-                h, ctypes.byref(pmc), pmc.cb)
-            ctypes.windll.kernel32.CloseHandle(h)
-            return pmc.WorkingSetSize / (1024 * 1024) if ok else None
-        else:
-            txt = Path(f"/proc/{pid}/status").read_text()
-            m = re.search(r"VmRSS:\s+(\d+) kB", txt)
-            return int(m.group(1)) / 1024 if m else None
-    except Exception:
-        return None
-
-
-def host_mem_available_mb():
-    """Host free-for-use memory in MB (the number that decides how many
-    instances fit). Linux: MemAvailable. Windows: ullAvailPhys."""
-    try:
-        if IS_WINDOWS:
-            import ctypes
-
-            class MEMSTAT(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_uint32),
-                            ("dwMemoryLoad", ctypes.c_uint32),
-                            ("ullTotalPhys", ctypes.c_uint64),
-                            ("ullAvailPhys", ctypes.c_uint64),
-                            ("ullTotalPageFile", ctypes.c_uint64),
-                            ("ullAvailPageFile", ctypes.c_uint64),
-                            ("ullTotalVirtual", ctypes.c_uint64),
-                            ("ullAvailVirtual", ctypes.c_uint64),
-                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
-            st = MEMSTAT()
-            st.dwLength = ctypes.sizeof(MEMSTAT)
-            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(
-                    ctypes.byref(st)):
-                return None
-            return st.ullAvailPhys / (1024 * 1024)
-        txt = Path("/proc/meminfo").read_text()
-        m = re.search(r"MemAvailable:\s+(\d+) kB", txt)
-        return int(m.group(1)) / 1024 if m else None
-    except Exception:
-        return None
+# ---------- ports / process / instance tracking ----------
+from omnidroid.runtime import *  # noqa: F401,F403
+from omnidroid.runtime import (_reserve_ports, _wipe_runtime,
+                               _claimed_port_indices, _launch_lock)  # noqa: F401
 
 
 # ---------- KSM (Linux kernel samepage merging) ----------
-
-def ksm_available():
-    return IS_LINUX and KSM_DIR.exists()
-
-
-def ksm_stats():
-    """Read all /sys/kernel/mm/ksm/* values (ints where possible).
-    None when KSM is not available (non-Linux or kernel without KSM)."""
-    if not ksm_available():
-        return None
-    out = {}
-    for f in sorted(KSM_DIR.iterdir()):
-        try:
-            v = f.read_text().strip()
-            out[f.name] = int(v) if v.lstrip("-").isdigit() else v
-        except OSError:
-            pass
-    return out
-
-
-def ksm_write(name, value):
-    """Write one KSM sysfs knob; exits with sudo advice on EPERM."""
-    try:
-        (KSM_DIR / name).write_text(str(value))
-    except PermissionError:
-        sys.exit(f"error: no permission to write {KSM_DIR / name} - "
-                 f"run with sudo (or install/enable ksmtuned)")
-
-
-def ksm_saved_mb(stats):
-    """Approx MB deduplicated: each page in pages_sharing points at a
-    shared page instead of owning its own copy."""
-    return stats.get("pages_sharing", 0) * PAGE_SIZE / (1024 * 1024)
-
-
-def pid_ksm_merged_mb(pid):
-    """Per-process KSM-merged pages (kernel >= 6.1 exposes
-    ksm_merging_pages). None if unsupported."""
-    try:
-        n = int(Path(f"/proc/{pid}/ksm_merging_pages").read_text())
-        return n * PAGE_SIZE / (1024 * 1024)
-    except Exception:
-        return None
+from omnidroid.ksm import *  # noqa: F401,F403
+from omnidroid.ksm import _ksm_wait_settle  # noqa: F401
 
 
 # ---------- adb / qmp ----------
 
-def _require_adb_port(acct):
-    """A diskless handle carries ports only while the instance is RUNNING
-    (they live in runtime/<name>/run.json). A command run against a stopped
-    account gets a portless handle — fail cleanly here instead of a raw
-    KeyError traceback. Internal pollers (wait_for_boot etc.) always run
-    against a live instance, so this never fires for them."""
-    port = acct.get("adb_port")
-    if port is None:
-        fail("not_running",
-             f"'{acct.get('name')}' is not running — start it first "
-             f"(omnidroid start {acct.get('name')})")
-    return port
+from omnidroid.adb import *  # noqa: F401,F403
+from omnidroid.adb import _require_adb_port, _pidof, _foreground  # noqa: F401
 
 
-def adb(acct, *args, timeout=20, check=False):
-    serial = f"127.0.0.1:{_require_adb_port(acct)}"
-    cmd = ["adb", "-s", serial] + list(args)
-    return subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=timeout, check=check)
-
-
-def adb_connect(acct):
-    port = _require_adb_port(acct)
-    try:
-        subprocess.run(["adb", "connect", f"127.0.0.1:{port}"],
-                       capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        pass
-
-
-def adb_getprop(acct, prop):
-    try:
-        r = adb(acct, "shell", "getprop", prop, timeout=8)
-        return r.stdout.strip()
-    except Exception:
-        return ""
-
-
-def qmp(acct, execute, arguments=None, timeout=6):
-    """Send one QMP command; returns parsed response line or None."""
-    try:
-        with socket.create_connection(("127.0.0.1", acct["qmp_port"]),
-                                      timeout=timeout) as s:
-            s.settimeout(timeout)
-            f = s.makefile("rw", encoding="utf-8", newline="\n")
-            f.readline()                                   # greeting
-            f.write('{"execute":"qmp_capabilities"}\n'); f.flush()
-            f.readline()
-            msg = {"execute": execute}
-            if arguments:
-                msg["arguments"] = arguments
-            f.write(json.dumps(msg) + "\n"); f.flush()
-            return json.loads(f.readline())
-    except Exception:
-        return None
-
-
-# ---------- qemu ----------
-
-def default_accel():
-    """Hypervisor auto-detect: WHPX on Windows, HVF on macOS (Apple Silicon),
-    KVM on Linux. Overridable per-start with --accel (e.g. 'tcg' for a
-    no-hypervisor smoke test)."""
-    if IS_WINDOWS:
-        return "whpx,kernel-irqchip=off"
-    if IS_MACOS:
-        return "hvf"
-    return "kvm"
-
-
-def _gl_window_requested():
-    """B2 spike apparatus: env OMNI_GL_WINDOW=1 asks a start to open a native
-    GPU-accelerated window instead of the headless VNC path. Reversible and
-    off by default — this is the experiment switch, replaced by the real
-    capability-gated playable mode once the spike proves feasibility."""
-    return os.environ.get("OMNI_GL_WINDOW", "").strip() not in ("", "0", "false", "False")
-
-
-def machine_arg(accel):
-    """-machine string. On Linux/KVM add mem-merge=on explicitly: it marks
-    guest RAM MADV_MERGEABLE so KSM can dedup identical pages across
-    instances (it is the QEMU default, but distro builds vary — be
-    explicit; it is what the whole Linux scaling story depends on)."""
-    m = f"q35,accel={accel}"
-    if IS_LINUX and accel.split(",")[0] == "kvm":
-        m += ",mem-merge=on"
-    return m
-
-
-def check_accel():
-    """Linux preflight: warn loudly if /dev/kvm is unusable (QEMU would
-    fail or crawl under TCG). Windows/WHPX has no equivalent check."""
-    if not IS_LINUX:
-        return
-    import os
-    kvm = Path("/dev/kvm")
-    if not kvm.exists():
-        print("[accel] WARNING: /dev/kvm missing - KVM unavailable. "
-              "Enable VT-x/AMD-V in BIOS and install qemu-system-x86; "
-              "check with 'kvm-ok' (apt install cpu-checker).")
-    elif not os.access(kvm, os.R_OK | os.W_OK):
-        print("[accel] WARNING: no permission on /dev/kvm - add your user "
-              "to the kvm group: sudo usermod -aG kvm $USER (re-login).")
-
-
-# Per-instance performance modes. Counts are NEVER capped — these tune the
-# per-instance footprint; the host's free RAM decides how many run.
-# ALL instances are HEADLESS (-display none), always: no host window
-# exists anywhere. View/control happens via adb (screenshot/logcat) or an
-# optional VNC viewer on the instance's vnc_port (127.0.0.1 only — see
-# the port scheme note at allocate_ports). With no window the
-# old VirGL path (needed a host GL window) and the R/B software-blit swap
-# are both moot — guest-side rendering is unchanged and screencap is
-# always true-color.
-MODES = {
-    "playable": {"mem": 4096, "smp": 4},
-    "hard":     {"mem": 3072, "smp": 4},
-    "brutal":   {"mem": 2048, "smp": 2},
-    # farming: headless, joined-idle, squeezed as small as stable. mem is a
-    # STARTING point the live measurement (Task 9) tunes; the runtime squeeze
-    # (farming.py) does the rest after boot.
-    "farming":  {"mem": 512, "smp": 2},
-}
-DEFAULT_MODE = "playable"
-
-
-def resolve_mode(cfg, name=None, mem=None):
-    m = dict(MODES[name or DEFAULT_MODE])
-    m["name"] = name or DEFAULT_MODE
-    if mem:
-        m["mem"] = mem
-    return m
-
-
-def _assert_port_triple(acct):
-    """The per-account port triple must be distinct (the shared-index scheme
-    guarantees it below 1000 instances; assert anyway before handing the
-    ports to QEMU). Returns the QEMU -vnc display number."""
-    if len({acct["adb_port"], acct["qmp_port"], acct["vnc_port"]}) != 3:
-        sys.exit(f"error: port collision for '{acct['name']}': "
-                 f"adb {acct['adb_port']} qmp {acct['qmp_port']} "
-                 f"vnc {acct['vnc_port']}")
-    vnc_display = acct["vnc_port"] - 5900     # QEMU -vnc takes a display #
-    if vnc_display < 0:
-        sys.exit(f"error: vnc_port {acct['vnc_port']} is below QEMU's "
-                 f"5900 display offset")
-    return vnc_display
-
-
-def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
-    """arm-uefi (LineageOS arm64) QEMU command — native under HVF on Apple
-    Silicon, NO translation layer. UEFI/GRUB disk boot: EDK2 pflash CODE +
-    per-account writable efivars, GPT system disk (vda, the provisioned
-    overlay carrying /metadata FBE keys) + /data (vdb). Same headless +
-    localhost-VNC model as x86; base flags proven in tools/arm64/boot_arm64.sh.
-    Silent boot is handled inside the guest image (GRUB/kernel), not via a
-    Bliss-style -append, so there is no dev/prod append split here — the dev
-    flag only adds a serial log."""
-    base = cfg["bases"][acct["base"]]
-    q = cfg["qemu"]
-    d = account_dir(acct["name"])          # overlay disks only (Task 4 removes these)
-    rd = runtime_dir(acct["name"])         # per-boot files: efivars.fd, serial.log
-    images = Path(cfg["images_dir"])
-    accel = accel or default_accel()
-    mode = mode or resolve_mode(cfg)
-    vnc_display = _assert_port_triple(acct)
-    smp = q["smp"] if dev else mode["smp"]
-    mem = q["mem_mb"] if dev else mode["mem"]
-    # B2 spike apparatus (see _gl_window_requested): normally headless ALWAYS
-    # (same rule as x86). Only when OMNI_GL_WINDOW is set, on macOS, and not a
-    # dev boot, swap to a native GPU-accelerated cocoa window for the spike.
-    gpu_display = (["-device", "virtio-gpu-gl", "-display", "cocoa,gl=on"]
-                   if (_gl_window_requested() and IS_MACOS and not dev)
-                   else ["-device", "virtio-gpu-pci", "-display", "none"])
-
-    # EPHEMERAL (fully-shared, no-persistence) instances boot the SHARED provisioned
-    # base templates DIRECTLY with snapshot=on: every write goes to a throwaway
-    # per-process overlay that QEMU discards on exit, so nothing persists and many
-    # instances of the same base run CONCURRENTLY (each opens the backing read-only).
-    # The instance is then pure config (accounts.json cookie/alias) with NO
-    # per-account system/data/devkit qcow2 files — only a fresh per-boot efivars.
-    # Non-ephemeral accounts keep their per-account COW overlays (unchanged).
-    ephemeral = bool(acct.get("ephemeral"))
-    if ephemeral:
-        sys_src = images / base["system"]
-        data_src = images / base["data"]
-        disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
-        # Ephemeral efivars is refreshed fresh EVERY boot (see
-        # _refresh_ephemeral_efivars, called from spawn_qemu before this
-        # command is built) into runtime_dir — genuinely per-boot, throwaway.
-        efivars_src = rd / "efivars.fd"
-    else:
-        sys_src = d / "system.qcow2"
-        data_src = d / "data.qcow2"
-        disk_opts = ",discard=unmap,detect-zeroes=unmap"
-        # Non-ephemeral efivars is written ONCE at account creation (see
-        # _make_persistent_arm_account, used only by base-build/maintenance
-        # flows now) and persists across boots like the overlay disks —
-        # stays under account_dir; this whole non-ephemeral path is
-        # live-path-straggler territory (Task 5).
-        efivars_src = d / "efivars.fd"
-
-    code = arm_edk2_code()
-    if not code:
-        sys.exit("error: edk2-aarch64-code.fd (UEFI firmware) not found - "
-                 "install qemu (brew install qemu) or set qemu.arm_edk2_code "
-                 "in configs/paths.json")
-    cmd = [
-        qemu_bin("qemu-system-aarch64"),
-        "-machine", "virt",
-        "-accel", accel,          # hvf on Apple Silicon (no translation)
-        "-cpu", "host",
-        "-smp", str(smp),
-        "-m", str(mem),
-        # UEFI firmware: read-only CODE + per-account writable vars.
-        "-drive", (f"if=pflash,unit=0,file={code},file.locking=off,"
-                   "format=raw,readonly=on"),
-        "-drive", f"if=pflash,unit=1,file={efivars_src}",
-        # System overlay (vda, has /metadata FBE keys) + /data (vdb).
-        "-device", "virtio-blk-pci,drive=vda,bootindex=0",
-        "-device", "virtio-blk-pci,drive=vdb,bootindex=1",
-        "-drive", f"file={sys_src},if=none,id=vda{disk_opts}",
-        "-drive", f"file={data_src},if=none,id=vdb{disk_opts}",
-        *gpu_display,
-        # Built-in VNC server, LOCALHOST ONLY (no auth is safe ONLY because
-        # of the 127.0.0.1 bind — HARD RULE, same as x86; never bind a
-        # network interface without adding auth in the same change).
-        "-vnc", f"127.0.0.1:{vnc_display}",
-        "-device", "nec-usb-xhci,id=usb-bus",
-        "-device", "qemu-xhci,id=usb-controller-0",
-        "-device", "usb-tablet,bus=usb-bus.0",
-        "-device", "usb-kbd,bus=usb-bus.0",
-        "-netdev", ("user,id=net0,"
-                    f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
-        "-device", "virtio-net-pci,netdev=net0",
-        "-device", "virtio-serial",
-        "-device", "virtio-rng-pci",
-        "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
-        "-name", f"omni-{acct['name']}",
-    ]
-    # Dev accounts: attach the devkit disk as a THIRD virtio-blk (vdc). It is a
-    # cheap per-account COW overlay of the shared base_arm_devkit.qcow2 (frida +
-    # Magisk + omni tools). The guest sees it as /dev/block/vdc and mounts it
-    # read-only during activation (see _devkit_activate). Not bootable.
-    # Dev vdc: the shared devkit template (snapshot=on) for ephemeral instances,
-    # else the per-account COW overlay.
-    devkit_src = (images / base["devkit"]) if (ephemeral and base.get("devkit")) \
-        else (d / "devkit.qcow2")
-    if acct_is_dev(acct) and Path(devkit_src).exists():
-        cmd += [
-            "-device", "virtio-blk-pci,drive=vdc",
-            "-drive", f"file={devkit_src},if=none,id=vdc{disk_opts}",
-        ]
-    if dev:
-        cmd += ["-serial", f"file:{rd / 'serial.log'}"]
-    return cmd
-
-
-def qemu_command(acct, cfg, dev, mode=None, accel=None):
-    base = cfg["bases"][acct["base"]]
-    if base_type(base) == BASE_TYPE_ARM:
-        return qemu_command_arm(acct, cfg, dev, mode=mode, accel=accel)
-    images = Path(cfg["images_dir"])
-    q = cfg["qemu"]
-    d = account_dir(acct["name"])
-    accel = accel or default_accel()
-    mode = mode or resolve_mode(cfg)
-
-    vnc_display = _assert_port_triple(acct)
-
-    append = ("stack_depot_disable=on cgroup_disable=pressure "
-              "root=/dev/ram0 noexec=off "
-              f"SRC={base['src']} DATA=vdb")
-    smp = q["smp"]
-    mem = q["mem_mb"]
-
-    if dev:
-        # Dev/builder boot: serial console log for debugging (headless like
-        # everything else; virtio-vga kept so the guest has its usual DRM
-        # device during provisioning/builder sessions).
-        append += " console=tty0 console=ttyS0,115200"
-        gpu = ["-device", "virtio-vga"]
-        nic = "virtio-net-pci,netdev=net0"
-    else:
-        # Production silent boot (no firmware/console text).
-        append += (" quiet loglevel=0 console=null "
-                   "vt.global_cursor_default=0 SETUPWIZARD=0")
-        nic = "virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
-        smp = mode["smp"]
-        mem = mode["mem"]
-        gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
-
-    cmd = [
-        qemu_bin("qemu-system-x86_64"),
-        "-machine", machine_arg(accel),
-        "-cpu", "qemu64",
-        "-smp", str(smp),
-        "-m", str(mem),
-        "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
-        "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
-        *gpu,
-        "-display", "none",       # headless ALWAYS; VNC below is an
-                                  # attach point, never a window
-        # Built-in VNC server on the account's reserved port. LOCALHOST
-        # ONLY: no auth is safe ONLY because of the 127.0.0.1 bind — never
-        # bind a network interface without adding auth in the same change.
-        # Idle (no viewer) it does no framebuffer encoding, so leaving it
-        # on costs ~nothing across hours-long headless runs; a viewer
-        # disconnecting never affects the instance.
-        "-vnc", f"127.0.0.1:{vnc_display}",
-        "-device", "qemu-xhci",
-        "-device", "usb-kbd",
-        "-device", "usb-tablet",
-        "-netdev", ("user,id=net0,"
-                    f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
-        "-device", nic,
-        "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
-        "-kernel", str(images / base["kernel"]),
-        "-initrd", str(images / base["initrd"]),
-        "-append", append,
-        "-name", f"omni-{acct['name']}",
-    ]
-    if dev:
-        cmd += ["-serial", f"file:{d / 'serial.log'}"]
-    return cmd
-
-
-def _refresh_ephemeral_efivars(acct, cfg):
-    """Give an ephemeral instance a FRESH copy of the base UEFI vars for this boot,
-    so nothing persists across boots (the system/data/devkit disks are the shared
-    templates opened snapshot=on; efivars is the only writable file, and pflash
-    needs a real file). arm-only; no-op otherwise."""
-    import shutil
-    base = cfg["bases"][acct["base"]]
-    if base_type(base) != BASE_TYPE_ARM:
-        return
-    images = Path(cfg["images_dir"])
-    d = runtime_dir(acct["name"])
-    d.mkdir(parents=True, exist_ok=True)
-    efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
-    if efi_tmpl.exists():
-        shutil.copyfile(efi_tmpl, d / "efivars.fd")
-
-
-def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
-    check_accel()
-    d = runtime_dir(acct["name"])
-    d.mkdir(parents=True, exist_ok=True)
-    if acct.get("ephemeral"):
-        _refresh_ephemeral_efivars(acct, cfg)
-    log = open(d / "qemu.log", "w")
-    kwargs = {}
-    if IS_WINDOWS:
-        DETACHED = 0x00000008          # DETACHED_PROCESS
-        NEW_GROUP = 0x00000200         # CREATE_NEW_PROCESS_GROUP
-        kwargs["creationflags"] = DETACHED | NEW_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    proc = subprocess.Popen(
-        qemu_command(acct, cfg, dev, mode, accel=accel),
-        stdout=log, stderr=log, **kwargs)
-    (d / "run.json").write_text(json.dumps(
-        {"pid": proc.pid, "started": time.time(),
-         "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE),
-         "base": acct["base"],
-         "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
-         "vnc_port": acct["vnc_port"]}))
-    return proc.pid
-
-
-def running_pid(name):
-    p = runtime_dir(name) / "run.json"
-    if not p.exists():
-        return None
-    data = json.loads(p.read_text())
-    # A reservation (build_acct's pre-spawn run.json, carrying the live LAUNCHER
-    # pid) is NOT a running instance: no QEMU exists yet. spawn_qemu overwrites
-    # it with the real QEMU pid and no `reserving` flag. Treating a reservation
-    # as running would make _ensure_booted skip the spawn and, after the
-    # launcher exits, leave the real QEMU untracked.
-    if data.get("reserving"):
-        return None
-    pid = data.get("pid")
-    return pid if pid_alive(pid) else None
+from omnidroid.qemu_proc import *  # noqa: F401,F403
+from omnidroid.qemu_proc import (_gl_window_requested, _assert_port_triple,
+                                 _refresh_ephemeral_efivars)  # noqa: F401
 
 
 # ---------- boot waiting with visible progress ----------
@@ -1707,44 +756,6 @@ def build_acct(name, cfg, dev=False):
             "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
 
 
-def _select_base_tag(cfg, arch=None, base_tag=None):
-    """Base tag for a NEW account, honoring --base/--arch (contract §6.1).
-    Default (neither given): the host-arch effective base — byte-identical to
-    the previous behavior. --base pins an explicit tag; --arch picks that
-    arch's base (preferring the effective/current base if it matches).
-    An --arch/--base mismatch is refused with arch_boundary."""
-    bases = cfg.get("bases") or {}
-    if base_tag is not None:
-        if base_tag not in bases:
-            fail("no_base", f"no base '{base_tag}'. "
-                            f"Known: {list(visible_bases(cfg))}")
-        assert_dev_allowed(base_tag, bases[base_tag])
-        if arch and arch_of_base(bases[base_tag]) != arch:
-            fail("arch_boundary",
-                 f"--base {base_tag} is {arch_of_base(bases[base_tag])} but "
-                 f"--arch {arch} was requested")
-        return base_tag
-    # Auto-selection must never LAND on a dev base by accident (e.g. it happens
-    # to be the only arm base registered) — dev is only ever explicit.
-    bases = visible_bases(cfg)
-    if arch is not None:
-        cands = [t for t in bases if arch_of_base(bases[t]) == arch]
-        for pref in (cfg.get("_effective_base"), cfg.get("current_base")):
-            if pref in cands:
-                return pref
-        if cands:
-            return cands[0]
-        fail("no_base", f"no {arch} base registered (known: "
-                        f"{ {t: arch_of_base(bases[t]) for t in bases} })")
-    default = cfg.get("_effective_base") or cfg["current_base"]
-    if default not in bases:
-        # Reachable when current_base points at a dev base and this caller has
-        # no dev opt-in. Refusing beats silently booting a rooted frida image as
-        # if it were the product.
-        fail("no_base",
-             f"default base '{default}' is not available in this build "
-             f"(known: {list(bases)})")
-    return default
 
 
 def _make_persistent_arm_account(name, cfg, tag=None):
@@ -2087,6 +1098,8 @@ def cmd_start(args):
     Identical on the dev and production bases: same kiosk, same session
     broadcast, same roblox:// join. The dev base only differs in what is
     additionally available (frida/Magisk + always-on screenshots)."""
+    from omnidroid.runtime import reconcile_runtime
+    reconcile_runtime()
     ensure_qemu()
     cfg = load_config()
     dev = _dev_mode_for_play(args)
@@ -2483,14 +1496,6 @@ def cmd_update_base(args):
 
 # ---------- production base rebuild (update pre-installed game) ----------
 
-def _next_base_tag(cfg):
-    """Next build tag. Counts legacy vN tags AND the internal 'version'
-    field of versionless entries (base_x86), so a rebuild on the canonical
-    base continues its lineage (x86 at version 5 -> next build is v6)."""
-    nums = [int(k[1:]) for k in cfg["bases"] if re.fullmatch(r"v\d+", k)]
-    nums += [b["version"] for b in cfg["bases"].values()
-             if isinstance(b.get("version"), int)]
-    return f"v{max(nums, default=0) + 1}"
 
 
 # APK lib/<abi> dir -> Android system-app nativeLibraryDir name.
@@ -4322,25 +3327,6 @@ def _wait_game_running(acct, pkg, timeout=180):
     return False
 
 
-def _ksm_wait_settle(settle_secs, timeout=600):
-    """Block until KSM pages_sharing stops moving (<1% drift held for
-    settle_secs). Returns the settled pages_sharing value."""
-    last = None
-    stable_since = None
-    start = time.time()
-    while time.time() - start < timeout:
-        cur = ksm_stats().get("pages_sharing", 0)
-        if last is not None and abs(cur - last) <= max(last, 100) * 0.01:
-            stable_since = stable_since or time.time()
-            if time.time() - stable_since >= settle_secs:
-                return cur
-        else:
-            stable_since = None
-        last = cur
-        time.sleep(10)
-    return last or 0
-
-
 def cmd_bench_ksm(args):
     """Measure REAL instances-per-GB with KSM on a Linux/KVM host.
 
@@ -4488,6 +3474,8 @@ def account_status(a, stats=False):
 
 
 def cmd_list(args):
+    from omnidroid.runtime import reconcile_runtime
+    reconcile_runtime()
     accts = all_accounts()
     if getattr(args, "json", False):
         emit_json([account_status(a, stats=args.stats) for a in accts])
@@ -4746,17 +3734,6 @@ def cmd_kioskify(args):
 
 # ---------- dev / testing harness (scriptable, JSON output) ----------
 
-def _foreground(acct):
-    try:
-        r = adb(acct, "shell", "dumpsys", "activity", "activities",
-                timeout=10)
-        m = re.search(r"topResumedActivity=ActivityRecord\{\S+ \S+ (\S+)",
-                      r.stdout)
-        return m.group(1) if m else None
-    except Exception:
-        return None
-
-
 # ---------- live VNC viewer (real-time screen + mouse/keyboard control) ----------
 
 def _port_open(host, port, timeout=0.5):
@@ -4985,21 +3962,6 @@ _CAP_CRASH_RE = re.compile(
     r"FATAL EXCEPTION|Fatal signal|signal\s+\d+\s+\(SIG|beginning of crash|"
     r"ANR in |Abort message:|FORTIFY|CheckJNI",
     re.IGNORECASE)
-
-
-def _pidof(acct, pkg):
-    """First numeric pid of pkg in the guest, or None. Cheap; polled on a
-    background thread during capture to build a process lifecycle timeline."""
-    if not pkg:
-        return None
-    try:
-        out = adb(acct, "shell", "pidof", pkg, timeout=8).stdout
-    except Exception:
-        return None
-    for tok in out.split():
-        if tok.isdigit():
-            return int(tok)
-    return None
 
 
 class _PidPoller(threading.Thread):
@@ -5744,14 +4706,6 @@ ROBLOX_RUNTIME_PERMS = (
     "android.permission.RECORD_AUDIO",
     "android.permission.CAMERA",
 )
-
-
-def redact_token(tok):
-    """Never print a token. Enough tail to tell two tokens apart in a log, never
-    enough to use one."""
-    if not tok:
-        return None
-    return f"<{len(tok)} chars, ...{tok[-6:]}>"
 
 
 def public_session(sess):
