@@ -114,3 +114,18 @@ def test_instance_live_legacy_record_falls_back_to_pid(monkeypatch):
     rec = {"name": "acc0", "pid": 4242}
     monkeypatch.setattr(runtime, "pid_alive", lambda pid: True)
     assert runtime.instance_live(rec) is True
+
+def test_allocate_ports_skips_a_port_that_answers(monkeypatch):
+    # No run.json claims anything, but a live listener sits on index 0's qmp
+    # port. allocate_ports must NOT hand out index 0.
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    live_port = srv.getsockname()[1]
+    cfg = {"qemu": {"adb_port_start": 6000, "qmp_port_start": live_port,
+                    "vnc_port_start": 18001}}
+    monkeypatch.setattr(runtime, "_claimed_port_indices", lambda: set())
+    monkeypatch.setattr(runtime, "vnc_start", lambda c: 18001)
+    try:
+        adb_port, qmp_port, vnc_port = runtime.allocate_ports(cfg)
+        assert qmp_port != live_port          # index 0 was skipped
+    finally:
+        srv.close()

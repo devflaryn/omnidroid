@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import re
+import socket as _socket
 import time
 from pathlib import Path
 
@@ -34,6 +35,20 @@ def vnc_start(cfg):
     return cfg["qemu"].get("vnc_port_start", VNC_PORT_START_DEFAULT)
 
 
+def _port_answers(port, timeout=0.25):
+    """True iff something accepts a TCP connection on 127.0.0.1:port. Final
+    collision guard: never issue a port a live QEMU answers on. A refused
+    connection means free; any other socket error resolves to True (treat as
+    occupied) — ambiguity costs one port index, never a collision."""
+    try:
+        with _socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except ConnectionRefusedError:
+        return False          # nobody home -> free
+    except OSError:
+        return True           # ambiguous -> treat as occupied (safe direction)
+
+
 def allocate_ports(cfg):
     """Lowest free port-index across RUNNING instances (a stopped instance
     frees its slot immediately). The three ranges are 1000 apart, so the shared
@@ -44,10 +59,16 @@ def allocate_ports(cfg):
     # spawned still holds its slot, so this closes the allocate/spawn race.
     used = {p - q["adb_port_start"] for p in _claimed_port_indices()}
     i = 0
-    while i in used:
-        i += 1
-    return (q["adb_port_start"] + i, q["qmp_port_start"] + i,
-            vnc_start(cfg) + i)
+    while True:
+        if i in used:
+            i += 1
+            continue
+        adb_port = q["adb_port_start"] + i
+        qmp_port = q["qmp_port_start"] + i
+        if _port_answers(qmp_port) or _port_answers(adb_port):
+            i += 1
+            continue
+        return (adb_port, qmp_port, vnc_start(cfg) + i)
 
 
 @contextlib.contextmanager
