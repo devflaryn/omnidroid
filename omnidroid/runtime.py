@@ -133,6 +133,31 @@ def _qmp_name(qmp_port, timeout=0.25):
     return (resp.get("return") or {}).get("name")
 
 
+def instance_live(rec):
+    """Verified liveness: is `rec`'s recorded process THE QEMU for this
+    instance (not a recycled pid, not a stranger)? Cheap-first.
+
+    1. pid must be alive at all.
+    2. Legacy records (no identity) fall back to pid-only with a warning.
+    3. Linux cheap path: /proc/<pid>/cmdline carries the -name token -> live.
+    4. Authoritative path: QMP query-name equals the token -> live.
+    Any ambiguity resolves to NOT live (safe direction: frees nothing that
+    is actually answering, and never claims a stranger)."""
+    pid = rec.get("pid")
+    if not pid_alive(pid):
+        return False
+    token = rec.get("identity")
+    if not token:
+        import sys
+        sys.stderr.write(
+            f"warn: {rec.get('name')} run.json has no identity; "
+            f"trusting pid {pid} (pre-upgrade record)\n")
+        return True
+    if _cmdline_has_token(pid, token):
+        return True
+    return _qmp_name(rec.get("qmp_port")) == token
+
+
 def expected_identity(rec):
     """The QEMU -name token for this instance: f"omni-{name}". Both
     qemu_command and qemu_command_arm emit exactly this, so it is readable
@@ -192,7 +217,7 @@ def running_instances():
         # list/all_accounts/_ensure_booted.
         if data.get("reserving"):
             continue
-        if pid_alive(data.get("pid")):
+        if instance_live(data):
             out.append({"name": d.name, "pid": data["pid"],
                         "base": data.get("base"),
                         "adb_port": data.get("adb_port"),
@@ -219,7 +244,7 @@ def _claimed_port_indices():
             data = json.loads(rj.read_text())
         except Exception:  # noqa: BLE001
             continue
-        if data.get("adb_port") is not None and pid_alive(data.get("pid")):
+        if data.get("adb_port") is not None and instance_live(data):
             claimed.add(data["adb_port"])
     return claimed
 
@@ -303,4 +328,4 @@ def running_pid(name):
     if data.get("reserving"):
         return None
     pid = data.get("pid")
-    return pid if pid_alive(pid) else None
+    return pid if instance_live(data) else None

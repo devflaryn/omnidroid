@@ -65,3 +65,52 @@ def test_qmp_name_reads_guest_name():
 def test_qmp_name_none_when_nobody_listens():
     # An almost-certainly-closed port returns None fast.
     assert runtime._qmp_name(1) is None
+
+import subprocess
+
+def test_instance_live_rejects_recycled_pid(monkeypatch):
+    # A live but UNRELATED process (a sleep). pid is alive, but neither the
+    # cmdline token nor QMP identity match -> not our instance.
+    p = subprocess.Popen(["sleep", "30"])
+    try:
+        rec = {"name": "acc0", "pid": p.pid, "qmp_port": 1,
+               "identity": "omni-acc0"}
+        monkeypatch.setattr(runtime, "_cmdline_has_token", lambda pid, tok: False)
+        monkeypatch.setattr(runtime, "_qmp_name", lambda port, timeout=0.25: None)
+        assert runtime.instance_live(rec) is False
+    finally:
+        p.terminate(); p.wait()
+
+def test_instance_live_true_on_cmdline_match(monkeypatch):
+    p = subprocess.Popen(["sleep", "30"])
+    try:
+        rec = {"name": "acc0", "pid": p.pid, "qmp_port": 1,
+               "identity": "omni-acc0"}
+        monkeypatch.setattr(runtime, "_cmdline_has_token",
+                            lambda pid, tok: tok == "omni-acc0")
+        assert runtime.instance_live(rec) is True   # cheap path, no socket
+    finally:
+        p.terminate(); p.wait()
+
+def test_instance_live_true_on_qmp_match_when_no_cmdline(monkeypatch):
+    p = subprocess.Popen(["sleep", "30"])
+    try:
+        rec = {"name": "acc0", "pid": p.pid, "qmp_port": 5,
+               "identity": "omni-acc0"}
+        monkeypatch.setattr(runtime, "_cmdline_has_token", lambda pid, tok: False)
+        monkeypatch.setattr(runtime, "_qmp_name",
+                            lambda port, timeout=0.25: "omni-acc0")
+        assert runtime.instance_live(rec) is True
+    finally:
+        p.terminate(); p.wait()
+
+def test_instance_live_false_when_pid_dead(monkeypatch):
+    rec = {"name": "acc0", "pid": 999999, "qmp_port": 1, "identity": "omni-acc0"}
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: False)
+    assert runtime.instance_live(rec) is False
+
+def test_instance_live_legacy_record_falls_back_to_pid(monkeypatch):
+    # No identity field (pre-upgrade run.json) -> trust pid_alive alone.
+    rec = {"name": "acc0", "pid": 4242}
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: True)
+    assert runtime.instance_live(rec) is True
