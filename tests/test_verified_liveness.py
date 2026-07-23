@@ -129,3 +129,25 @@ def test_allocate_ports_skips_a_port_that_answers(monkeypatch):
         assert qmp_port != live_port          # index 0 was skipped
     finally:
         srv.close()
+
+def test_reconcile_gcs_dead_and_silent(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"; (root / "acc0").mkdir(parents=True)
+    (root / "acc0" / "run.json").write_text(json.dumps(
+        {"pid": 999999, "identity": "omni-acc0", "qmp_port": 1,
+         "adb_port": 2}))
+    monkeypatch.setattr(runtime.config, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(runtime, "instance_live", lambda rec: False)
+    monkeypatch.setattr(runtime, "_port_answers", lambda port, timeout=0.25: False)
+    result = runtime.reconcile_runtime()
+    assert "acc0" in result["gc"]
+    assert not (root / "acc0").exists()
+
+def test_reconcile_keeps_live_instance(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"; (root / "acc0").mkdir(parents=True)
+    (root / "acc0" / "run.json").write_text(json.dumps(
+        {"pid": 4242, "identity": "omni-acc0", "qmp_port": 1, "adb_port": 2}))
+    monkeypatch.setattr(runtime.config, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(runtime, "instance_live", lambda rec: True)
+    result = runtime.reconcile_runtime()
+    assert result["gc"] == []
+    assert (root / "acc0").exists()

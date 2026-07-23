@@ -1098,6 +1098,8 @@ def cmd_start(args):
     Identical on the dev and production bases: same kiosk, same session
     broadcast, same roblox:// join. The dev base only differs in what is
     additionally available (frida/Magisk + always-on screenshots)."""
+    from omnidroid.runtime import reconcile_runtime
+    reconcile_runtime()
     ensure_qemu()
     cfg = load_config()
     dev = _dev_mode_for_play(args)
@@ -3472,6 +3474,8 @@ def account_status(a, stats=False):
 
 
 def cmd_list(args):
+    from omnidroid.runtime import reconcile_runtime
+    reconcile_runtime()
     accts = all_accounts()
     if getattr(args, "json", False):
         emit_json([account_status(a, stats=args.stats) for a in accts])

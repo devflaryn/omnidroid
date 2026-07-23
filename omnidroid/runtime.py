@@ -336,6 +336,37 @@ def host_mem_available_mb():
         return None
 
 
+def reconcile_runtime():
+    """Sweep runtime/*: GC directories whose recorded process is dead AND whose
+    ports are silent; report (do NOT adopt) any run.json-less directory. Returns
+    {"gc": [names], "orphans": [names]}. Synchronous — callers trigger it."""
+    result = {"gc": [], "orphans": []}
+    root = config.data_dir() / "runtime"
+    if not root.exists():
+        return result
+    for d in sorted(root.iterdir()):
+        rj = d / "run.json"
+        if not rj.exists():
+            result["orphans"].append(d.name)
+            continue
+        try:
+            data = json.loads(rj.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        if data.get("reserving"):
+            continue
+        if instance_live(data):
+            continue
+        qmp_port = data.get("qmp_port")
+        adb_port = data.get("adb_port")
+        silent = not ((qmp_port and _port_answers(qmp_port))
+                      or (adb_port and _port_answers(adb_port)))
+        if silent:
+            _wipe_runtime(d.name)
+            result["gc"].append(d.name)
+    return result
+
+
 def running_pid(name):
     p = runtime_dir(name) / "run.json"
     if not p.exists():
