@@ -108,6 +108,13 @@ def pid_alive(pid):
             return False
 
 
+def expected_identity(rec):
+    """The QEMU -name token for this instance: f"omni-{name}". Both
+    qemu_command and qemu_command_arm emit exactly this, so it is readable
+    back from /proc/<pid>/cmdline and from QMP query-name."""
+    return f"omni-{rec['name']}"
+
+
 def runtime_dir(username):
     """Per-instance throwaway dir: efivars, run.json (ports+pid), qemu.log,
     autocap frames. Wiped on `stop` and `remove` (see _wipe_runtime).

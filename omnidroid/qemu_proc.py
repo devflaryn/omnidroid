@@ -325,7 +325,7 @@ def _refresh_ephemeral_efivars(acct, cfg):
 
 
 def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
-    from omnidroid.engine import runtime_dir
+    from omnidroid.runtime import runtime_dir
     check_accel()
     d = runtime_dir(acct["name"])
     d.mkdir(parents=True, exist_ok=True)
@@ -344,6 +344,7 @@ def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
         stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
+         "identity": f"omni-{acct['name']}",
          "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE),
          "base": acct["base"],
          "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
