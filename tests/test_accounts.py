@@ -108,12 +108,12 @@ class Store(unittest.TestCase):
     def test_set_fields_updates_existing_account(self):
         cookies.save_account(self.repo, "u", TOKEN, 1)
         ok = cookies.set_fields(self.repo, "u",
-                                place_id="4483381587", base="dev",
+                                place_id="4483381587", base="prod",
                                 group="farm-a", notes="test")
         self.assertTrue(ok)
         rec = cookies.get_account(self.repo, "u")
         self.assertEqual(rec["place_id"], 4483381587)   # coerced to int
-        self.assertEqual(rec["base"], "dev")
+        self.assertEqual(rec["base"], "prod")
         self.assertEqual(rec["group"], "farm-a")
         self.assertEqual(rec["notes"], "test")
         self.assertEqual(rec["cookie"], TOKEN)           # cookie untouched

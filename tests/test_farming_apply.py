@@ -43,10 +43,15 @@ class FarmingGate(unittest.TestCase):
              mock.patch.object(omni, "wait_for_boot", return_value=True), \
              mock.patch.object(omni, "post_boot"), \
              mock.patch.object(omni, "_devkit_activate"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=False), \
+             mock.patch.object(omni, "_enforce_hiding"), \
+             mock.patch.object(omni, "assert_kiosk_game"), \
              mock.patch.object(omni, "resolve_mode",
-                 side_effect=lambda cfg, name=None: {
-                     "name": name or "playable", "mem": 1, "smp": 1}), \
+                 side_effect=lambda cfg, name=None, **kw: {
+                     "name": name or "playable", "mem": 1, "smp": 1,
+                     "balloon": None}), \
+             mock.patch.object(omni, "apply_balloon_target"), \
+             mock.patch.object(omni, "apply_roblox_settings"), \
+             mock.patch.object(omni, "enable_zram"), \
              mock.patch.object(omni, "apply_farming_squeeze") as sq:
             omni._ensure_booted(acct, {}, "t", mode_name=mode_name)
         return sq
@@ -57,21 +62,27 @@ class FarmingGate(unittest.TestCase):
     def test_playable_does_not_squeeze(self):
         self.assertFalse(self._boot("playable").called)
 
-    def test_dev_account_never_squeezes(self):
-        """Even mode_name='farming', a dev account must never squeeze."""
-        acct = {"name": "u1", "first_boot_done": True, "dev": True}
+    def test_debug_boot_never_squeezes(self):
+        """Even mode_name='farming', a DEBUG boot must never squeeze (its extra
+        devkit/frida footprint isn't the production baseline)."""
+        acct = {"name": "u1", "first_boot_done": True, "debug": True}
         with mock.patch.object(omni, "running_pid", return_value=None), \
              mock.patch.object(omni, "spawn_qemu"), \
              mock.patch.object(omni, "maybe_start_autocap"), \
              mock.patch.object(omni, "wait_for_boot", return_value=True), \
              mock.patch.object(omni, "post_boot"), \
              mock.patch.object(omni, "_devkit_activate"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True), \
+             mock.patch.object(omni, "_enforce_hiding"), \
+             mock.patch.object(omni, "assert_kiosk_game"), \
              mock.patch.object(omni, "resolve_mode",
-                 side_effect=lambda cfg, name=None: {
-                     "name": name or "playable", "mem": 1, "smp": 1}), \
+                 side_effect=lambda cfg, name=None, **kw: {
+                     "name": name or "playable", "mem": 1, "smp": 1,
+                     "balloon": None}), \
+             mock.patch.object(omni, "apply_balloon_target"), \
+             mock.patch.object(omni, "apply_roblox_settings"), \
+             mock.patch.object(omni, "enable_zram"), \
              mock.patch.object(omni, "apply_farming_squeeze") as sq:
-            omni._ensure_booted(acct, {}, "t", mode_name="farming")
+            omni._ensure_booted(acct, {}, "t", mode_name="farming", debug=True)
         self.assertFalse(sq.called)
 
 

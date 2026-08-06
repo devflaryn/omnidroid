@@ -167,7 +167,6 @@ class PreflightGatesTheBoot(unittest.TestCase):
              mock.patch.object(omni, "build_acct", build), \
              mock.patch.object(omni, "_ensure_booted", booted), \
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=False), \
              mock.patch.object(omni, "roblox_deeplink", return_value=None), \
              mock.patch.object(omni, "public_session", return_value={}), \
              mock.patch.object(omni, "deliver_session",

@@ -1,5 +1,20 @@
 # omnidroid/bases.py
-"""Base-image registry, arch resolution, and the dev-base gate."""
+"""Base-image registry, arch resolution, and the debug (devkit) attachment.
+
+There is no separate "dev base". Every shipped base is DUAL-USE: it boots as
+the production image, and omni-agent can debug on that same image. The three
+capabilities that used to be fused into one `dev` base tag are now separate:
+
+  root     a property of the BASE IMAGE (Magisk-patched boot, baked in, always
+           present). Marked by `"rooted": true` on the base entry.
+  hiding   a property of the shipped /data + an idempotent per-boot enforce
+           step (Zygisk + Enforce DenyList). Active in production too.
+  toolkit  the devkit disk (frida-server + the omni-* scripts) — an ATTACHABLE
+           disk, opt-in per boot via `omni start --debug` / agent debug=true.
+
+So "debug" is a BOOT OPTION, not a base. The same account can boot production
+on one run and debug on the next.
+"""
 import json
 import os
 import re
@@ -30,18 +45,14 @@ def acct_base_is_arm(acct):
         return False
 
 
-def base_is_dev(base):
-    """True if a base entry carries the dev devkit disk (frida + Magisk tools).
-    The dev base is arm-uefi + a 'devkit' field naming the extra vdc disk."""
-    return bool(base.get("devkit"))
+def base_is_rooted(base):
+    """True if this base image ships a Magisk-patched (rooted) boot.
 
-
-DEV_MODE_ENV = "OMNI_DEV_MODE"
-
-
-def dev_mode_enabled():
-    return str(os.environ.get(DEV_MODE_ENV, "")).strip().lower() in (
-        "1", "true", "yes", "on")
+    Root is baked into the shipped image, so this is a property of the BASE,
+    not of the account or of how it was booted. Root-needing operations check
+    this to give an actionable 'this base is not rooted yet' message instead of
+    failing obscurely."""
+    return bool(base.get("rooted"))
 
 
 def _truthy_env(name):
@@ -49,51 +60,18 @@ def _truthy_env(name):
         "1", "true", "yes", "on")
 
 
-def _dev_mode_for_play(args):
-    """Whether `omni start` should target the DEV base for a NEW instance.
+DEBUG_ENV = "OMNI_DEBUG_BOOT"
 
-    This is SELECTION (use dev), which is distinct from ACCESS (may use dev,
-    i.e. OMNI_DEV_MODE / dev_mode_enabled). The agent sets OMNI_DEV_MODE=1 just to
-    UNLOCK the dev base, but still runs production by default — so dev selection
-    must NOT be implied by OMNI_DEV_MODE, only by an explicit --dev or the
-    dedicated OMNI_USE_DEV_BASE 'default to dev' env. assert_dev_allowed still
-    refuses dev to a caller that has not unlocked it."""
-    if getattr(args, "dev", False):
+
+def _debug_boot_requested(args=None):
+    """Whether THIS boot should attach the devkit disk (frida + omni-* tools).
+
+    A per-boot option, never a property of the account or the base: `--debug`
+    on the command, or OMNI_DEBUG_BOOT=1 to default a whole session to debug
+    boots. Production is the default in both cases."""
+    if getattr(args, "debug", False):
         return True
-    return _truthy_env("OMNI_USE_DEV_BASE")
-
-
-def visible_bases(cfg_or_raw):
-    """The bases this caller is allowed to see: everything, minus dev bases when
-    dev mode is off."""
-    bases = cfg_or_raw.get("bases") or {}
-    if dev_mode_enabled():
-        return dict(bases)
-    return {t: b for t, b in bases.items() if not base_is_dev(b)}
-
-
-def assert_dev_allowed(tag, base):
-    """Refuse a dev base to a caller that has not opted in."""
-    if base_is_dev(base) and not dev_mode_enabled():
-        fail("dev_base_locked",
-             f"base '{tag}' is a development base (frida/Magisk root) and is "
-             f"not available in this build. It is unlocked only for the "
-             f"omni-agent devtool ({DEV_MODE_ENV}=1).")
-
-
-def acct_is_dev(acct):
-    """True if this account is a dev account: either it was created from a dev
-    base (its base entry has a 'devkit') or it carries an explicit dev flag.
-    Reads config; safe/cheap. Dev accounts get the devkit disk attached as vdc
-    and the frida/Magisk activation on start."""
-    from omnidroid.engine import read_config
-    if acct.get("dev"):
-        return True
-    try:
-        b = (read_config().get("bases") or {}).get(acct.get("base"), {})
-        return base_is_dev(b)
-    except Exception:
-        return False
+    return _truthy_env(DEBUG_ENV)
 
 
 def arch_of_base(base):
@@ -121,6 +99,113 @@ ARM_BASE_EFIVARS = "base_arm_efivars.fd"    # provisioned UEFI vars
 ARM_BASE_TAG = "arm"
 
 
+# The ROOTED shipped images. `base_arm_system_rooted.qcow2` is a THIN COW
+# overlay of the current production system overlay carrying only the Magisk-
+# patched boot partition (vda6) — the production lineage is preserved, not
+# flattened. `base_arm_data_rooted.qcow2` is the production /data plus the
+# Magisk policy (root_access=3, zygisk=1, denylist=1, adb shell granted
+# Forever, the game on the DenyList) so root is headless from first boot and
+# hidden from the game in production. Both are preferred when present; a
+# deployment without them registers the unrooted images and still works.
+ARM_ROOTED_SYSTEM = "base_arm_system_rooted.qcow2"
+
+
+ARM_ROOTED_DATA = "base_arm_data_rooted.qcow2"
+
+
+# The GAME-BAKED /data: a THIN COW overlay of the rooted /data carrying the
+# game APK (installed as an updated system app, so it lands in /data/app) and
+# `omni_game_package` in the settings database.
+#
+# Why /data and not the system image: `omni bake-game` writes the APK into
+# /product/app inside the 2.3 GB system image, which needs ~6 GiB of scratch
+# and produces a new base — per Roblox update. Roblox updates often. An
+# updated system app in /data does the same job, the package name never
+# changes across versions, and the overlay is only as big as the APK.
+ARM_GAME_DATA = "base_arm_data_game.qcow2"
+
+# Echoed by the in-guest bake script only after every step has been verified,
+# so the caller can refuse to capture a /data where a step silently did
+# nothing. The two markers are deliberately NOT substrings of one another —
+# the caller tests with `in`, and a failure marker that contained the success
+# marker would report the opposite of what happened.
+GAME_BAKE_OK = "OMNI_GAME_BAKE_OK"
+GAME_BAKE_INSTALL_FAILED = "OMNI_GAME_BAKE_APK_REJECTED"
+
+
+def data_bake_source(base):
+    """The /data image a game bake must overlay — always the PRISTINE one.
+
+    Anti-chaining rule, and the whole reason this is a function. The bake's
+    output becomes the base's `data`, so re-baking (which is what a Roblox
+    update is) would otherwise overlay the previous bake, and every update
+    would add a link to the chain that still carries the superseded APK. Going
+    back to the rooted image each time keeps a re-bake exactly as cheap as the
+    first one and leaves no dead versions behind.
+
+    `root_manifest.rooted_data` is the recorded pristine image on a rooted
+    base; an unrooted deployment falls back to its own `data`, which has never
+    been baked over."""
+    manifest = base.get("root_manifest") or {}
+    return manifest.get("rooted_data") or base.get("data")
+
+
+def resolve_bake_package(explicit, tag, cfg):
+    """Which package the bake should register as the game.
+
+    Deliberately does NOT read the APK. apk_package_name() shells out to the
+    Android SDK's aapt2, which is not installed on every host, and a Roblox
+    update never changes the package name anyway — so making the bake depend
+    on it would fail the common case for no benefit. An explicit --package
+    still wins for a genuinely different app."""
+    if explicit:
+        return explicit
+    try:
+        return (cfg or {}).get("base_game", {}).get(tag)
+    except Exception:  # noqa: BLE001 — no/!dict config
+        return None
+
+
+def build_game_bake_script(pkg, apk_guest_path):
+    """The in-guest script the bake runs as root.
+
+    `apk_guest_path` None bakes ONLY the setting (the kiosk fix) and touches
+    no APK — worth keeping separable, because that half needs no 131 MB push
+    and is the part that actually stops the Magisk guess.
+
+    `pm install -r -d`: -r REPLACES the pre-installed system app instead of
+    failing with INSTALL_FAILED_ALREADY_EXISTS, and -d permits a downgrade so
+    rolling back a bad Roblox build does not need a base rebuild either.
+
+    The install result is CHECKED. `pm install` exits 0 and prints its verdict
+    on stdout, so the exit status says nothing — the first version of this
+    script therefore captured a /data whose install had been rejected:
+
+        Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package
+        com.roblox.client signatures do not match newer version; ignoring!]
+        OMNI_GAME_BAKE_OK
+
+    A replacement APK must be signed with the SAME key as the one baked into
+    the system image; an officially-signed Roblox build will not install over
+    a re-signed one, and vice versa. That is a real constraint on the update
+    workflow, and it has to surface as a failed bake rather than as a silently
+    unchanged image."""
+    steps = []
+    if apk_guest_path:
+        steps.append(
+            f"pm install -r -d {apk_guest_path} 2>&1 | grep -q Success "
+            f"|| {{ echo {GAME_BAKE_INSTALL_FAILED}; "
+            f"pm install -r -d {apk_guest_path} 2>&1; exit 1; }}")
+        steps.append(f"rm -f {apk_guest_path}")
+    steps.append(f"settings put global omni_game_package {pkg}")
+    # Read it back before claiming success: `settings put` is asynchronous
+    # through system_server and a silent failure here would be captured into
+    # the image and ship.
+    steps.append(f'[ "$(settings get global omni_game_package)" = "{pkg}" ] '
+                 f"&& echo {GAME_BAKE_OK}")
+    return "; ".join(steps)
+
+
 X86_BASE_DISK = "base_x86.qcow2"
 
 
@@ -130,25 +215,29 @@ X86_BASE_KERNEL = "base_x86.kernel"
 X86_BASE_INITRD = "base_x86.initrd.img"
 
 
+X86_ROOTED_INITRD = "base_x86_rooted.initrd.img"
+
+
 X86_BASE_TAG = "x86"
 
 
-DEV_BASE_TAG = "dev"
+# The devkit disk: frida-server + the omni-* device scripts, per architecture.
+# It belongs to NO base entry — it is attached as vdc only on a `--debug` boot,
+# so a production instance's hardware profile is unchanged.
+DEVKIT_DISKS = {"arm": "base_arm_devkit.qcow2",
+                "x86": "base_x86_devkit.qcow2"}
 
 
-ARM_DEVKIT_DISK = "base_arm_devkit.qcow2"
+ARM_DEVKIT_DISK = DEVKIT_DISKS["arm"]
 
 
-ARM_DEVSYSTEM_DISK = "base_arm_devsystem.qcow2"
+X86_DEVKIT_DISK = DEVKIT_DISKS["x86"]
 
 
 ROOTED_MARKER = " [rooted]"
 
 
-ROOT_PENDING_MARKER = " [root pending: --patch-boot]"
-
-
-ARM_DEVDATA_DISK = "base_arm_devdata.qcow2"
+ROOT_PENDING_MARKER = " [root pending: run `omni root-base`]"
 
 
 DEVKIT_MOUNT = "/mnt/omni-devkit"          # ro mount of vdc (source of truth)
@@ -158,6 +247,18 @@ DEVKIT_WORK = "/data/local/tmp/omni-devkit"  # exec-capable activated copy
 
 
 DEVKIT_MANIFEST_GUEST = DEVKIT_WORK + "/manifest.json"
+
+
+def devkit_disk_name(arch):
+    """Devkit disk filename for a canonical arch token ('arm' | 'x86')."""
+    return DEVKIT_DISKS.get(arch, DEVKIT_DISKS["arm"])
+
+
+def devkit_disk_for_base(images, base):
+    """Absolute path to the devkit disk this base would use, or None if that
+    disk has not been built yet. images may be str or Path."""
+    p = Path(images) / devkit_disk_name(arch_of_base(base))
+    return p if p.exists() else None
 
 
 ARM_EDK2_CANDIDATES = (
@@ -228,13 +329,20 @@ def autoregister_bases():
             and (images / X86_BASE_DISK).exists()
             and (images / X86_BASE_KERNEL).exists()
             and (images / X86_BASE_INITRD).exists()):
+        # Prefer the ROOTED initrd when it has been built: same shipped disk,
+        # a Magisk-patched ramdisk, so the x86 base is dual-use too.
+        rooted = (images / X86_ROOTED_INITRD).exists()
         bases[X86_BASE_TAG] = {"type": BASE_TYPE_X86,
                                "disk": X86_BASE_DISK,
                                "kernel": X86_BASE_KERNEL,
-                               "initrd": X86_BASE_INITRD,
+                               "initrd": (X86_ROOTED_INITRD if rooted
+                                          else X86_BASE_INITRD),
+                               "rooted": rooted,
                                "src": raw.get("default_src", DEFAULT_SRC),
                                "notes": "auto-registered canonical x86 base "
-                                        "from images_dir"}
+                                        "from images_dir"
+                                        + (ROOTED_MARKER if rooted
+                                           else ROOT_PENDING_MARKER)}
         new.append(X86_BASE_TAG)
     if images.exists():
         for disk in sorted(images.glob("base-*.qcow2")):
@@ -257,44 +365,25 @@ def autoregister_bases():
             and (images / ARM_BASE_DISK).exists()
             and (images / ARM_BASE_SYSTEM).exists()
             and (images / ARM_BASE_DATA).exists()):
+        # Prefer the ROOTED matched pair when it has been built. It is the same
+        # production lineage — the system overlay is a thin COW child of the
+        # unrooted one carrying only the Magisk-patched boot — so this is a
+        # dual-use base, not a second "dev" base.
+        rooted = ((images / ARM_ROOTED_SYSTEM).exists()
+                  and (images / ARM_ROOTED_DATA).exists())
         bases[ARM_BASE_TAG] = {
             "type": BASE_TYPE_ARM,
             "base_disk": ARM_BASE_DISK,
-            "system": ARM_BASE_SYSTEM,
-            "data": ARM_BASE_DATA,
+            "system": ARM_ROOTED_SYSTEM if rooted else ARM_BASE_SYSTEM,
+            "data": ARM_ROOTED_DATA if rooted else ARM_BASE_DATA,
             "efivars": ARM_BASE_EFIVARS,
+            "rooted": rooted,
             "src": "https://github.com/jqssun/android-lineage-qemu "
                    "(LineageOS 23.2 arm64, virtio_arm64only)",
             "notes": "auto-registered arm64/UEFI base (LineageOS 23.2, "
-                     "kiosk+device-owner provisioned matched pair)"}
+                     "kiosk+device-owner provisioned matched pair)"
+                     + (ROOTED_MARKER if rooted else ROOT_PENDING_MARKER)}
         new.append(ARM_BASE_TAG)
-    # dev/debug base: the arm base PLUS the extra devkit disk (attached as vdc).
-    # ADD-ONLY; never made current_base (the shipped product stays on the arm/x86
-    # production base). Registered only when the arm base files AND the devkit
-    # disk are present. It reuses the arm provisioned trio (a rooted dev system
-    # overlay is preferred if `base_arm_devsystem.qcow2` exists). See
-    # build_dev_base() / DEV_BASE_TAG.
-    if (DEV_BASE_TAG not in bases and images.exists()
-            and (images / ARM_DEVKIT_DISK).exists()
-            and (images / ARM_BASE_DISK).exists()
-            and (images / ARM_BASE_SYSTEM).exists()
-            and (images / ARM_BASE_DATA).exists()):
-        dev_system = (ARM_DEVSYSTEM_DISK
-                      if (images / ARM_DEVSYSTEM_DISK).exists()
-                      else ARM_BASE_SYSTEM)
-        dev_data = (ARM_DEVDATA_DISK if (images / ARM_DEVDATA_DISK).exists()
-                    else ARM_BASE_DATA)
-        bases[DEV_BASE_TAG] = {
-            "type": BASE_TYPE_ARM,
-            "base_disk": ARM_BASE_DISK,
-            "system": dev_system,
-            "data": dev_data,
-            "efivars": ARM_BASE_EFIVARS,
-            "devkit": ARM_DEVKIT_DISK,
-            "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
-            "notes": "auto-registered arm dev base: base_arm + the "
-                     "base_arm_devkit.qcow2 extra disk (vdc); omni-agent only"}
-        new.append(DEV_BASE_TAG)
     changed = bool(new)
     if not raw.get("current_base") and bases:
         # Prefer an arm base on an arm64 host, else the canonical x86 base,
@@ -339,12 +428,8 @@ def base_missing_files(images, base):
     """Per-type list of a base's missing files (absolute paths)."""
     if base_type(base) == BASE_TYPE_ARM:
         keys = ("base_disk", "system", "data")   # efivars optional
-        missing = [str(images / base[k]) for k in keys
-                   if base.get(k) and not (images / base[k]).exists()]
-        # A dev base additionally needs its extra devkit disk (vdc).
-        if base.get("devkit") and not (images / base["devkit"]).exists():
-            missing.append(str(images / base["devkit"]))
-        return missing
+        return [str(images / base[k]) for k in keys
+                if base.get(k) and not (images / base[k]).exists()]
     return [str(images / base[k]) for k in ("disk", "kernel", "initrd")
             if not (images / base[k]).exists()]
 
@@ -358,17 +443,12 @@ def _select_base_tag(cfg, arch=None, base_tag=None):
     bases = cfg.get("bases") or {}
     if base_tag is not None:
         if base_tag not in bases:
-            fail("no_base", f"no base '{base_tag}'. "
-                            f"Known: {list(visible_bases(cfg))}")
-        assert_dev_allowed(base_tag, bases[base_tag])
+            fail("no_base", f"no base '{base_tag}'. Known: {list(bases)}")
         if arch and arch_of_base(bases[base_tag]) != arch:
             fail("arch_boundary",
                  f"--base {base_tag} is {arch_of_base(bases[base_tag])} but "
                  f"--arch {arch} was requested")
         return base_tag
-    # Auto-selection must never LAND on a dev base by accident (e.g. it happens
-    # to be the only arm base registered) — dev is only ever explicit.
-    bases = visible_bases(cfg)
     if arch is not None:
         cands = [t for t in bases if arch_of_base(bases[t]) == arch]
         for pref in (cfg.get("_effective_base"), cfg.get("current_base")):
@@ -380,11 +460,8 @@ def _select_base_tag(cfg, arch=None, base_tag=None):
                         f"{ {t: arch_of_base(bases[t]) for t in bases} })")
     default = cfg.get("_effective_base") or cfg["current_base"]
     if default not in bases:
-        # Reachable when current_base points at a dev base and this caller has
-        # no dev opt-in. Refusing beats silently booting a rooted frida image as
-        # if it were the product.
         fail("no_base",
-             f"default base '{default}' is not available in this build "
+             f"default base '{default}' is not registered "
              f"(known: {list(bases)})")
     return default
 

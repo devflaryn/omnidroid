@@ -33,7 +33,7 @@ def _acct(**over):
 
 
 class EphemeralBoot(unittest.TestCase):
-    def _cmd(self, acct, dev=False):
+    def _cmd(self, acct, interactive=False):
         with mock.patch.object(omni, "arm_edk2_code", return_value="/fw/code.fd"), \
              mock.patch.object(omni, "qemu_bin", side_effect=lambda x: x), \
              mock.patch.object(omni, "default_accel", return_value="tcg"), \
@@ -44,7 +44,7 @@ class EphemeralBoot(unittest.TestCase):
                                side_effect=lambda n: Path(f"/RT/{n}")), \
              mock.patch.object(omni, "account_dir",
                                side_effect=lambda n: Path(f"/AC/{n}")):
-            return " ".join(omni.qemu_command_arm(acct, _cfg(), dev=dev))
+            return " ".join(omni.qemu_command_arm(acct, _cfg(), interactive))
 
     def test_ephemeral_uses_shared_templates_with_snapshot(self):
         cmd = self._cmd(_acct(ephemeral=True))
@@ -64,15 +64,15 @@ class EphemeralBoot(unittest.TestCase):
 
     def test_efivars_and_serial_split_by_ephemeral(self):
         # Ephemeral: efivars + serial.log both under the throwaway runtime dir.
-        # dev=True so qemu_command_arm actually emits the -serial flag (arm-only
-        # boots write serial.log solely on dev boots; see qemu_command_arm).
-        eph = self._cmd(_acct(ephemeral=True), dev=True)
+        # interactive=True so qemu_command_arm actually emits the -serial flag (arm-only
+        # boots write serial.log solely on interactive boots; see qemu_command_arm).
+        eph = self._cmd(_acct(ephemeral=True), interactive=True)
         self.assertIn("/RT/u1/efivars.fd", eph)
         self.assertIn("/RT/u1/serial.log", eph)
         self.assertNotIn("/AC/u1/efivars.fd", eph)
         # Non-ephemeral: efivars stays in the per-account dir (Task 4 territory),
         # but serial.log still goes to the runtime dir.
-        non = self._cmd(_acct(), dev=True)
+        non = self._cmd(_acct(), interactive=True)
         self.assertIn("/AC/u1/efivars.fd", non)
         self.assertIn("/RT/u1/serial.log", non)
         self.assertNotIn("/RT/u1/efivars.fd", non)

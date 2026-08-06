@@ -6,6 +6,429 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-06 — `bake-data-game`: the game lives in /data, and updating it is one command
+
+`omni bake-data-game [apk]` installs the game into the base's **/data** and
+bakes `omni_game_package` there, then points the base at the result.
+
+Why /data: `omni bake-game` writes the APK into `/product/app` inside the
+2.3 GB system image, so every Roblox update meant a new base and ~6 GiB of
+scratch. `pm install -r -d` lands an UPDATED SYSTEM APP in `/data/app`, which
+is all a kiosk that launches by package name needs, and the package name never
+changes between Roblox versions. An update is now one ~2-minute run.
+
+The output is a THIN COW overlay of the pristine rooted /data (32 MB for the
+setting alone). Every re-bake starts from that same pristine image —
+`data_bake_source()` reads `root_manifest.rooted_data`, never the current
+`data`, so updates never chain overlays and no superseded APK is carried
+forward. Verified: a bad 221 MB capture was repaired back to 32 MB simply by
+re-running the command.
+
+This also removes the last of the kiosk race. With the setting already in
+/data, the kiosk picks the right package at ITS OWN boot:
+
+```
+lock task configured for [com.omni.kiosk, com.roblox.client]
+launching com.roblox.client (boot)
+```
+
+— correct whitelist from the start, and no `Attempted Lock Task Mode
+violation` at all.
+
+**A failed install must fail the bake.** The first version of the script
+checked only that the SETTING read back, so this shipped:
+
+```
+guest: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package
+       com.roblox.client signatures do not match newer version; ignoring!]
+OMNI_GAME_BAKE_OK
+captured -> base_arm_data_game.qcow2 (221 MB thin overlay)
+```
+
+`pm install` exits 0 and prints its verdict on stdout, so the exit status says
+nothing. The script now greps for `Success` and aborts with a distinct marker
+otherwise, and the command explains the cause.
+
+**Constraint this surfaced, and it shapes the update workflow:** a replacement
+APK must be signed with the SAME key as the build baked into the system image.
+An officially-signed Roblox will not install over a re-signed one, or the
+reverse. Use APKs from the same signing pipeline as the baked build.
+
+## 2026-08-06 — fix: Roblox black-screened because the settings installer took its files/ dir
+
+Not the APK, and not "the pre-installed Roblox is flagged" as `FOOTPRINT.md`
+recorded — `farming.build_client_settings_script` was locking the game out of
+its own data directory.
+
+The script runs as root and starts with `mkdir -p
+/data/data/com.roblox.client/files/ClientSettings`, which CREATES THE
+INTERMEDIATE `files/` as root:root when it does not already exist. The chown
+that follows only covered the leaf. Measured on a live instance — every other
+directory in the sandbox belongs to the app, and one does not:
+
+```
+drwx------ 12 10138 10138  /data/data/com.roblox.client/
+drwxrwx--x  2 10138 10138  ./databases
+drwxr-xr-x  3 0     0      ./files              <-- root:root
+drwxr-xr-x  2 10138 10138  ./files/ClientSettings
+```
+
+so the game could not create anything under its own `files/`:
+
+```
+E SplitCompat:      Unable to create directory: .../files/splitcompat
+E CrossProcessLock: .../files/generatefid.lock: EACCES (Permission denied)
+E FA:               .../files/google_app_measurement.db: EACCES
+```
+
+It never finished initialising and dropped out of the foreground, which is the
+black screen. `files/` is now chowned and `restorecon`ed alongside
+`ClientSettings/` — but deliberately NOT with a blanket `chown -R` over the
+package dir, because `cache/` and `code_cache/` are owned `10138:20138` and a
+recursive chown would corrupt their group.
+
+Verified live: `files` owned `10138 10138`, and
+`topResumedActivity=com.roblox.client/.ActivityNativeMain` with the account
+logged in and the home screen rendering. The only dialog left is Roblox's own
+"your version is out of date" — which is what `bake-data-game` is for.
+
+## 2026-08-06 — fix: instances came up showing Magisk instead of the game
+
+Reported as "when I open an instance it launches with magisk, not the apk".
+Traced on a live rooted arm instance; the whole chain is recorded in
+`assert_kiosk_game`'s docstring and `tests/test_kiosk_boot_app.py`.
+
+The kiosk chooses what to launch in `MainActivity.resolveGamePackage()`. When
+`Settings.Global.omni_game_package` is unset it falls back to a dev-mode guess:
+"the first launchable NON-SYSTEM app". Observed timeline:
+
+```
+02:15:40.882  OmniKiosk: launching com.topjohnwu.magisk (boot)
+02:15:43.274  settings put global omni_game_package com.roblox.client
+02:15:44.904  E ActivityTaskManager: Attempted Lock Task Mode violation
+                 r=...com.roblox.client/.ActivityProtocolLaunch
+```
+
+The setting arrived 2.4 s AFTER the kiosk had already resolved, launched and
+PINNED its choice under Lock Task. Four things combined:
+
+- `omni_game_package` was only written by `deliver_session` (whose own comment
+  says it is for "a LATER REBOOT") and by `provision_settings`, which never
+  runs on the arm bases;
+- instances are EPHEMERAL, so `/data` is discarded at power-off and that later
+  reboot never inherits it — every boot came up with the setting unset;
+- rooting production (the dual-use change) installed the Magisk MANAGER as a
+  launchable non-system app, so the guess started landing on it. Roblox is a
+  SYSTEM app (`/product/app/Roblox/Roblox.apk`) and can never win that scan;
+- the kiosk then whitelisted and pinned MAGISK for Lock Task, so the real
+  game was not on the whitelist when the session arrived and its launch was
+  refused.
+
+`_assert_kiosk_foreground` — which force-stops the Magisk app and re-fronts
+the kiosk — existed, but its only caller was inside `_devkit_activate`, i.e.
+only on a `--debug` boot. That is exactly the dev-base-era gating the dual-use
+change was meant to remove; its own spec says this should be unconditional.
+
+Fixed at the cause: `assert_kiosk_game` now runs on EVERY boot, writes
+`omni_game_package` before the session is delivered, and then re-fronts the
+kiosk. Best-effort throughout — it reports and returns rather than failing a
+boot. Verified live: Magisk no longer takes over, the kiosk is the resumed
+activity, the Lock Task whitelist is `[com.roblox.client, com.omni.kiosk]`,
+and Roblox now actually starts (it previously never did).
+
+STILL OPEN, and needs a kiosk APK change rather than a host one: Roblox starts
+but does not reach the foreground — the kiosk stays on top showing its black
+view while the game sits frozen in the background. `launchGame` sets
+`launchedThisBoot = true` even when the START was refused by Lock Task, and
+`onResume` therefore never retries. The clean fix is to bake
+`omni_game_package` into the base `/data` so the kiosk's FIRST
+`configureLockTask()`/`launchGame()` already picks the game and no race
+exists; failing that, stop latching on a refused start.
+
+## 2026-08-06 — `gaming` mode: the second use case gets its own tuning
+
+The engine now serves two jobs explicitly instead of one job with tiers. See
+`MODES.md` for the full comparison; `FOOTPRINT.md` still owns the farming
+numbers, which this change does not touch.
+
+`omni start <acct> --mode gaming` opens a native QEMU window on the host,
+returns the guest to its native resolution, zeroes the animation scales,
+disables doze, drops swappiness to 10, installs a 240 fps ClientAppSettings
+profile, and — after the session lands, because that broadcast is what starts
+the game — pins the game to the `top-app` cpuset. Verified live end to end;
+every lever was read back out of the guest, not inferred from a log line.
+
+`gaming` is a NEW mode rather than a change to `playable`, because `playable`
+is `DEFAULT_MODE`: teaching it to open a window would have put a QEMU window
+on every existing `omni start`, including automated ones. Every other mode's
+QEMU command is byte-for-byte what it was.
+
+**The window is capability-detected, and the detection found a wall.**
+`default_display` asks the QEMU binary what it actually has. On the dev Mac
+(Homebrew QEMU 11.0.2, Apple Silicon) the answer is that there is no GL at
+all:
+
+```
+$ qemu-system-aarch64 -display cocoa,gl=on
+qemu-system-aarch64: OpenGL support was not enabled in this build of QEMU
+$ qemu-system-aarch64 -device help | grep gpu
+name "virtio-gpu-pci", bus PCI, alias "virtio-gpu"        # no -gl variant
+```
+
+So there are three tiers, not two: `gl` (virgl, 3D accelerated), `window`
+(native window, software rendering) and `none` (headless). The middle tier is
+what that host gets today, and it is still the large input-latency win —
+window input goes straight to the guest's usb-tablet/usb-kbd instead of a VNC
+round trip. Reaching `gl` needs a QEMU built with virglrenderer AND a guest
+driver that can drive it; the second is the open B3 question.
+
+**This also fixes the B2 spike, which could not have worked.** The spike
+emitted `-device virtio-gpu-gl -display cocoa,gl=on` unconditionally whenever
+`OMNI_GL_WINDOW` was set. `virtio-gpu-gl` is not a device model on that QEMU
+build, so the command could not start — while `test_gl_spike.py` went green,
+because it only ever compared strings to strings. That test now runs the
+generated command against the REAL local QEMU and asserts every `-device` and
+`-display` it names is one the binary advertises. `OMNI_GL_WINDOW` survives as
+an alias for the window request, now routed through the same capability gate.
+
+**Three silent no-ops were found by checking the guest instead of the log**,
+all of them the failure shape `farming.sh` already documents (a step that runs,
+fails, hits its trailing `; true`, and reports success):
+
+- **swappiness was never set.** `echo 10 > /proc/sys/vm/swappiness` as uid
+  shell is `Permission denied`. Root-needing steps now go through `su` and are
+  OMITTED — and reported — when there is no root, rather than emitted to fail.
+- **the cpuset move could never find a pid.** It ran in the post-boot
+  sequence, but the game only starts when the session is delivered afterwards,
+  so `pidof` matched nothing every time. It is now its own step, run after
+  delivery, and it waits for the pid instead of sampling once.
+- **`apply_roblox_settings` described the wrong profile.** The success line
+  hardcoded the farming text, so a gaming boot printed "fps cap + lowest
+  quality; ~2x less host CPU" while doing the opposite. It now reports the
+  profile it installed.
+
+**One UX bug fixed on the way in:** an interactive gaming start would have
+opened the QEMU window AND the built-in VNC viewer — two windows onto one
+instance, the VNC one laggier. `spawn_qemu` now records `native_window` in
+`run.json` (read off the command actually handed to QEMU) and the viewer
+stands down, unless `--window` was passed explicitly or the boot degraded to
+headless. The VNC *server* stays on in every mode: screenshot, autocap and the
+`omnidroid-input` skill all attach to it.
+
+Not measured, and not claimed: actual frame rate. The guest currently ANRs
+SystemUI and foregrounds the Magisk manager instead of the kiosk — identically
+on the unchanged headless path, so it belongs to the freshly-built rooted base
+(dual-use Phase 2), not to this change.
+
+## 2026-08-06 — dual-use bases: the dev base is gone
+
+The separate `dev` base is removed. Every shipped base (`arm`, `x86`) is now
+**dual-use**: it ships to production AND omni-agent debugs on that same image.
+What used to be the dev base is split into three independent things:
+
+- **root** — a Magisk-patched boot, baked into the shipped image (`"rooted":
+  true`). `omni root-base [--base <tag>]` bakes it into a THIN COW overlay of
+  the production system (`base_arm_system_rooted.qcow2`, host-side qemu-io
+  write — no flatten, no nbd, no guest root) plus a matched rooted `/data`.
+- **hiding** — Zygisk + Enforce DenyList with `com.roblox.client` on the
+  DenyList, re-enforced on EVERY boot (`_enforce_hiding`), so production
+  presents as an unrooted device.
+- **toolkit** — the devkit disk `base_<arch>_devkit.qcow2` (frida + `omni-*`
+  tools), built by `omni build-devkit [--arch arm|x86]`, attached as vdc ONLY
+  on a `--debug` boot. A production instance's hardware profile is unchanged.
+
+`debug` is a per-BOOT option (`omni start --debug`, agent `debug=true`,
+`OMNI_DEBUG_BOOT=1`) — not a base and not an account property. `--apk` (swap
+the Roblox build) now works on EVERY base and no longer requires debug. Gone:
+`OMNI_DEV_MODE`/`OMNI_USE_DEV_BASE`, `start --dev`, `build-dev-base`, the dev
+base entry, and the dev-visibility gate. See `DUAL-USE-BASE.md`.
+
+## 2026-08-05 — per-instance footprint: a real memory model, and three silent no-ops fixed
+
+Goal: 2-3 playable instances on a workstation, 50+ farming instances on a
+server. Everything below was measured on the arm64 base (LineageOS 23.2,
+HVF); no number here is an estimate.
+
+**Three things were silently not working.** Each looked fine and reported
+success:
+
+- **`omni start --mem N` was ignored.** `_ensure_booted` called
+  `resolve_mode()` without it, so the flag never reached QEMU. A farming boot
+  therefore always ran at the mode's own 512 MB and surfaced as an
+  unexplained boot timeout. Two separate 5- and 7-minute "boot failures"
+  during this work were this flag being dropped.
+- **`farming` mode's 512 MB never booted.** It was set on the theory that a
+  squeezed instance needs no more, and had never been run. 512 MB does not
+  reach adbd at all; 1024 MB boots but idles with 143 MB available, which the
+  ~614 MB game does not fit into.
+- **Most of the farming squeeze was a no-op.** `adb shell` does not forward
+  argv — it joins the arguments and lets the guest's shell re-parse them — so
+  `["shell","sh","-c","pm disable-user X; am force-stop X"]` arrived as
+  `sh -c pm` followed by a separate `am force-stop X`. The zram, swappiness,
+  lmkd, doze, trim-memory and cpuset steps never ran, and the package trim
+  disabled nothing while its force-stop half worked. Every script is now
+  `shlex.quote`d (`farming.sh`), verified live: the same package went from
+  "not disabled" to disabled immediately.
+
+**The memory model.** `mem` is the guest's ADDRESS SPACE (must be big enough
+to boot and hold the game); `balloon` is the post-boot cap on what the HOST
+pays. Sizing `mem` down to the footprint you want is the mistake that
+produced the 512 MB mode.
+
+- **virtio-balloon with `free-page-reporting=on`, on every instance, both
+  architectures.** The guest returns freed pages without being asked, so host
+  RSS tracks the live set instead of `-m`. Measured: a booted 2 GB guest
+  idling at ~850 MB guest-used sat at ~120-250 MB host RSS.
+- **`apply_balloon_target` polls.** Inflation is asynchronous; a single eager
+  `query-balloon` reports the pre-inflation size, which is indistinguishable
+  from a missing balloon driver — it reported exactly that on a guest that
+  did reach its target ~20 s later.
+- **`farming` is `mem 2048 / smp 1`, with TWO balloon targets** — 1536
+  without zram, 1024 with it — chosen by probing the guest, not by assuming.
+  Both are measured. Without zram, 1024 kills the game as it finishes loading
+  (`has died: fg TOP`, `mem-pressure-event`) and 1536 holds it at 614 MB with
+  336 MB spare.
+
+**zram is the single biggest memory win, and it was nearly missed.** The
+squeeze had a zram step from the start; it never worked, because writing
+`/sys/block/zram0/*` and `swapon` need CAP_SYS_ADMIN and the production base
+is not rooted — so it failed silently and nobody had measured what it would
+have bought. Run properly (dev base, root, lz4) it compresses **496 MB of
+guest pages into 167 MB — 2.97x** — and the game then survives caps that
+previously killed it: 1280, 1024, and even 896, with ZERO kills and no
+mem-pressure events (98 threads, state S at 1024).
+
+So the per-instance host cap drops **1536 -> 1024 MB, a third**. 1024 rather
+than 896 deliberately: 896 left only 89 MB available, and every number here
+was measured against a game on its login screen, not joined to a place.
+Capacity: a 64 GB server goes from ~40 to **~62 instances**, which is what
+finally clears the 50+ target.
+
+`enable_zram()` runs it through su when the instance has root and REPORTS
+whether swap actually came up; `zram_active()` then probes `SwapTotal` so the
+balloon picks the right floor. Choosing the low cap without zram is not a
+missed optimization, it is an OOM — hence the probe rather than a flag.
+
+**`omni enable-zram-base` (new) — the production delivery, and it turned out
+to be one property.** Runtime zram needs privileges the production base does
+not grant, so it had to be baked. The first implementation added a zram line
+to the image's fstab via debugfs surgery. Then the actual image was read,
+which showed that was wrong twice over:
+
+  /vendor/etc/fstab.virtio      /dev/block/zram0 none swap defaults zramsize=50%
+  /vendor/etc/init/zram.rc      on early-init -> modprobe zram.ko
+                                on init       -> comp_algorithm = lz4
+                                on property:persist.sys.zram_enabled=1
+                                              -> swapon_all
+
+The base already ships the device, the compressor, the fstab entry and the
+swapon, all wired together. zram was never missing — it is switched OFF
+behind `persist.sys.zram_enabled`. And the fstab paths the surgery probed did
+not include the real one (`/vendor/etc/fstab.virtio`), so it would have
+failed outright. That code is deleted rather than kept as a fallback:
+reading the image beats guessing at it.
+
+VERIFIED end-to-end on the real base: `setprop persist.sys.zram_enabled 1`
+made init run swapon_all and SwapTotal went 0 -> 470980 kB immediately, sized
+at 50% of guest RAM by the fstab — which scales better than any fixed number
+this project could pick. The runtime `enable_zram()` now flips that property
+instead of poking /sys/block/zram0 by hand.
+
+It is a `persist.*` property, so it IS settable at runtime — but SELinux
+denies uid shell (measured: "Failed to set property"). Hence root on the dev
+base, or baked into build.prop for production, which is what the command
+does, reusing the build.prop surgery `strip-base` already had under test.
+Unlike `strip-base` it is NOT gated: that gate exists because the low-RAM
+PROFILE was measured to break boot, whereas this is a single
+LineageOS-supported toggle for a subsystem the image already carries.
+
+NOT YET RUN on the real base: the qcow2 round trip needs ~6 GiB scratch and
+this machine has under 1 GiB free. The refusal now names the specific backup
+images whose original still exists, with sizes, and does not touch them.
+
+**Roblox's own settings: the CPU lever (`apply_roblox_settings`).** The only
+change that reaches INSIDE the game, and the one "quality and speed do not
+matter, you can disable rendering" licenses. A ClientAppSettings.json with
+`DFIntTaskSchedulerTargetFps: 5` plus lowest-quality render flags is written
+into the client's ClientSettings dir. Measured on the dev base with the real
+Roblox APK installed (`omni install`), rooted:
+
+- memory 680 MB -> 677 MB — **no change**. Not a surprise in hindsight: the
+  game's footprint is engine code, assets and script state, not framebuffers.
+- host CPU **36% -> 18.8%, roughly halved.**
+
+Filed honestly as a CPU optimization, not a memory one. It matters anyway for
+the farming target: 50 instances at 36% of a core each need ~18 cores just to
+idle, at 18.8% they need ~9. For a fleet, CPU binds as hard as RAM.
+
+It needs ROOT (the file is in the game's private data dir; `adb shell` is uid
+shell and `run-as` needs a debuggable build), so it applies on the dev base
+only. On production it prints a LOUD skip naming the two real delivery
+options — bake the file into the base /data image, or have the OmniBootstrap
+APK (which already injects the session cookie and runs AS com.roblox.client)
+write it. It does not pretend to have run.
+
+**`omni measure` (new).** Reports what running instances actually cost:
+median host RSS over repeated samples (single samples are near-meaningless —
+observed 72 MB to 1244 MB on one idle instance inside a minute), guest used,
+balloon size, and capacity. Capacity is planned against the **balloon cap**,
+not the observed median, so an idle fleet cannot flatter the number.
+
+**Platform honesty.** balloon + free-page-reporting decommit for real on
+Linux/KVM. On macOS/HVF QEMU's madvise is advisory: a balloon inflate left
+host RSS high and rising (from thrash). The 50+-instance target is a Linux
+number; macOS runs the 2-3 playable instances. `omni measure` prints which
+regime it is in.
+
+**The tier-1 trim never ran on production instances.** `TRIM_PACKAGES` is
+applied by `lockdown_and_trim` from `provision_settings`, which only fires on
+a FIRST boot — and `build_acct()` hands the production path a handle with
+`first_boot_done` already True, so on every ephemeral instance that list was
+dead code. deskclock, lineageos.updater, lineageparts and permissioncontroller
+were all found resident on a booted farming instance. The list now also lives
+in `lean.PROVISION_TRIM_PACKAGES` and runs from the squeeze: measured -70 MB
+guest-used with the game running. Trim list 21 -> 34 packages.
+
+**SystemUI: measured, not assumed.** It is the largest non-game process
+(~336 MB RSS) and the obvious next thing to cut. `pm disable-user --user 0
+com.android.systemui` on a healthy instance takes the WHOLE GUEST DOWN — adb
+goes offline permanently and the QEMU process collapses to ~1.6 MB RSS. It
+stays in `KEEP_ALWAYS` and the evidence is recorded there so nobody has to
+brick an instance to re-learn it.
+
+**KSM is now reported by `omni measure`**, per-instance (`ksm_merged_mb`,
+kernel >= 6.1) and fleet-wide. This is the only mechanism that gets a 50+
+fleet near 400 MB/instance: 50 guests booted from one base hold overwhelmingly
+identical pages and KSM collapses them to one physical copy, while
+per-instance RSS counts a shared page once per instance and therefore
+over-states a large fleet. When KSM is off or absent, measure says so and why.
+
+**Where the floor actually is** (arm64, measured): the squeezed Android
+baseline is ~620 MB and Roblox with its engine active is ~609 MB, so a joined
+farming instance needs ~1.23 GB live — which is what sets balloon=1536 and
+why 1024 kills the game. ~400 MB per guest is not reachable: the game alone is
+more than that, and no host-side or Android-side tuning changes it. 400 MB as
+an AMORTIZED cost across a large Linux fleet is a different question and is
+what the KSM reporting above exists to answer.
+
+**x86 is validated against a real QEMU, not just against our own
+expectations** (`test_qemu_accepts_devices.py`). Every other test checks the
+command line we intend to emit, which is not the same as QEMU agreeing to
+build the machine — a gap this session demonstrated painfully, shipping ~200
+lines of fstab surgery whose unit tests all passed while the code probed
+paths that did not exist on the real image. The new test constructs the
+machine for real with `-S` and asks QMP whether it came up and whether the
+balloon is actually present. Both x86 modes pass, confirming
+`virtio-balloon-pci,free-page-reporting=on` is valid on x86/q35 as well as
+arm — the memory model depends on it on both, and only arm had ever been
+booted. x86 specifically because it cannot be booted on this project's Apple
+Silicon dev machine without TCG, so it is the arch most likely to rot
+unnoticed.
+
+Tests: `test_qemu_footprint.py`, `test_lean_profile.py`,
+`test_squeeze_quoting.py`, `test_strip_base_props.py` (builds a real ext4 and
+runs the debugfs surgery against it). Suite 222 -> 286.
+
 ## 2026-07-17 — `omni play` no longer creates a profile without a login; `custom_name`; agent-side headless login
 
 **Root cause of the failed overnight test:** the agent was handed a cookie.txt

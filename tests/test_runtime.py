@@ -99,6 +99,14 @@ def test_reservation_is_not_a_running_instance(tmp_path, monkeypatch):
     game. But allocate_ports MUST still treat the slot as claimed so a
     concurrent launch doesn't collide."""
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    # This test is about BOOKKEEPING (does a reservation claim its slot?), so
+    # it must not also depend on which ports happen to be free on the machine
+    # running it. allocate_ports additionally probes the host and skips any
+    # port a live QEMU answers on — so with a real instance running on the
+    # developer's box it returned 16003 here, failing a test that had nothing
+    # to say about host ports. Same isolation the sibling tests above use.
+    monkeypatch.setattr("omnidroid.runtime._port_answers",
+                        lambda port, timeout=0.25: False)
     # A reservation with THIS (alive) process's pid — as _reserve_ports writes.
     engine._reserve_ports("resv", 16001, 17001, 18001)
     # It is NOT a running instance...

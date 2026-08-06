@@ -9,8 +9,10 @@ import time
 from pathlib import Path
 
 from omnidroid import config
+from omnidroid import lean
 from omnidroid.bases import (
-    base_type, BASE_TYPE_ARM, acct_is_dev, arm_edk2_code, ARM_BASE_EFIVARS,
+    base_type, BASE_TYPE_ARM, devkit_disk_for_base, arm_edk2_code,
+    ARM_BASE_EFIVARS,
 )
 from omnidroid.config import IS_WINDOWS, IS_LINUX, IS_MACOS, qemu_bin
 
@@ -48,11 +50,140 @@ def default_accel():
 
 
 def _gl_window_requested():
-    """B2 spike apparatus: env OMNI_GL_WINDOW=1 asks a start to open a native
-    GPU-accelerated window instead of the headless VNC path. Reversible and
-    off by default — this is the experiment switch, replaced by the real
-    capability-gated playable mode once the spike proves feasibility."""
+    """env OMNI_GL_WINDOW=1 asks ANY start to open a native window.
+
+    This began as the B2 spike switch and is kept as an alias for `--mode
+    gaming`, so the B2 runbook's one-liner still means something. What changed
+    is that it no longer hardcodes GPU args: it only sets the REQUEST, and
+    default_display still decides what the host can actually give it. The old
+    behaviour emitted `-device virtio-gpu-gl` unconditionally, which on a QEMU
+    without virglrenderer (the Homebrew macOS build — see the capability block
+    below) is not a device model at all, so QEMU exited instead of booting."""
     return os.environ.get("OMNI_GL_WINDOW", "").strip() not in ("", "0", "false", "False")
+
+
+# ------------------------------------------------------- display capability
+#
+# THREE tiers, because the middle one is what the primary host actually has.
+# MEASURED 2026-08-06 on the dev Mac (Homebrew QEMU 11.0.2, Apple Silicon):
+#
+#     $ qemu-system-aarch64 -display cocoa,gl=on
+#     qemu-system-aarch64: OpenGL support was not enabled in this build of QEMU
+#     $ qemu-system-aarch64 -device help | grep gpu
+#     name "virtio-gpu-pci", bus PCI, alias "virtio-gpu"    <- no -gl variant
+#
+# and there is no `virglrenderer` Homebrew formula to add one. So the `gl`
+# tier is real but NOT reachable on this host today; it needs a QEMU built
+# with --enable-opengl --enable-virglrenderer.
+#
+# Collapsing that to "headless" would be the expensive mistake, because a
+# NATIVE WINDOW is available right now and is already the big input-latency
+# win: with `-display cocoa` the host's mouse/key events go straight into the
+# guest's usb-tablet/usb-kbd, instead of a VNC round trip through
+# framebuffer encode -> decode -> synthesised input. Rendering is still
+# software in that tier; latency is not.
+GL_GPU_DEVICE = "virtio-gpu-gl-pci"          # needs virglrenderer in QEMU
+HEADLESS_GPU_ARGS = ["-device", "virtio-gpu-pci"]
+HEADLESS_DISPLAY_ARGS = ["-display", "none"]
+
+# Windowing backends that can carry a real window, best first per platform.
+# `vnc`, `none`, `curses`, `egl-headless` and `dbus` are deliberately absent:
+# none of them opens a low-latency native window with input attached.
+_WINDOW_BACKENDS = {"macos": ("cocoa",), "linux": ("gtk", "sdl"),
+                    "windows": ("gtk", "sdl")}
+
+
+def _platform_key():
+    if IS_MACOS:
+        return "macos"
+    if IS_WINDOWS:
+        return "windows"
+    return "linux"
+
+
+def _host_has_gui():
+    """Whether a host GUI session plausibly exists to put a window in.
+
+    Conservative on purpose: a false negative costs a window (we fall back to
+    the headless path that already works), a false positive costs a BOOT —
+    QEMU exits when a display backend cannot connect. macOS and Windows always
+    have a window server; Linux is judged by $DISPLAY/$WAYLAND_DISPLAY, which
+    is exactly what is missing over a plain ssh session."""
+    if IS_MACOS or IS_WINDOWS:
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _qemu_help_texts(tool):
+    """(display_help, device_help) as reported by the resolved QEMU binary.
+
+    Returns ("", "") on ANY failure — missing binary, timeout, non-zero exit.
+    default_display reads that as "no window is possible", which degrades to
+    the headless path. Asking QEMU beats hardcoding a build matrix: the same
+    version is compiled with wildly different feature sets by brew, apt and
+    the Windows bundle."""
+    try:
+        b = qemu_bin(tool)
+        def _run(*args):
+            return subprocess.run([b, *args], capture_output=True, text=True,
+                                  timeout=10).stdout or ""
+        return _run("-display", "help"), _run("-device", "help")
+    except Exception:
+        return "", ""
+
+
+def default_display(qemu_display_help="", qemu_device_help="", has_gui=True):
+    """What kind of window this host can open, as a capability descriptor.
+
+    Pure: every host fact is an argument, so the whole matrix is unit-testable
+    and nothing here shells out. Mirrors default_accel() in spirit — detect,
+    never assume. Returns a dict with:
+
+        tier          "gl" | "window" | "none"
+        available     tier != "none"
+        gpu_args      the -device pair to use
+        display_args  the -display pair to use
+        reason        human-readable, and ACTIONABLE when a tier was missed
+                      ("your QEMU lacks X") rather than just "unavailable"
+    """
+    def _none(reason):
+        return {"available": False, "tier": "none", "gpu_args": [],
+                "display_args": [], "reason": reason}
+
+    if not has_gui:
+        return _none("no host GUI session (headless/ssh) to open a window in")
+    backend = next((b for b in _WINDOW_BACKENDS[_platform_key()]
+                    if b in qemu_display_help), None)
+    if not backend:
+        wanted = "/".join(_WINDOW_BACKENDS[_platform_key()])
+        return _none(f"this QEMU build has no {wanted} display backend")
+    if GL_GPU_DEVICE in qemu_device_help:
+        return {"available": True, "tier": "gl",
+                "gpu_args": ["-device", GL_GPU_DEVICE],
+                "display_args": ["-display", f"{backend},gl=on"],
+                "reason": f"{backend},gl=on + {GL_GPU_DEVICE} (3D accelerated)"}
+    return {"available": True, "tier": "window",
+            "gpu_args": list(HEADLESS_GPU_ARGS),
+            "display_args": ["-display", backend],
+            "reason": (f"native {backend} window, software rendering — this "
+                       f"QEMU has no {GL_GPU_DEVICE} (built without "
+                       f"virglrenderer/OpenGL)")}
+
+
+def gpu_display_args(want_window, capability):
+    """(gpu_args, display_args) for this boot. Pure, and NEVER raises.
+
+    Any malformed capability, any tier of "none", or simply not wanting a
+    window, yields today's headless pair unchanged. That total-degradation
+    property is the compatibility guarantee: a detection bug can cost a
+    window, never a boot."""
+    if not want_window or not isinstance(capability, dict):
+        return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
+    gpu = capability.get("gpu_args") or []
+    display = capability.get("display_args") or []
+    if not capability.get("available") or not gpu or not display:
+        return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
+    return list(gpu), list(display)
 
 
 def machine_arg(accel):
@@ -91,24 +222,188 @@ def check_accel():
 # old VirGL path (needed a host GL window) and the R/B software-blit swap
 # are both moot — guest-side rendering is unchanged and screencap is
 # always true-color.
+#
+# THE MEMORY MODEL — `mem` is not the footprint. Read this before tuning it.
+#
+# `mem` is the guest's ADDRESS SPACE: how much RAM Android thinks it has. It
+# has to be big enough for the guest to boot and to hold the game, and it is
+# NOT what the host pays. What the host pays is how many of those pages are
+# actually backed, and that is governed by `balloon`/free-page-reporting
+# below. Sizing `mem` down to "the footprint we want" is the mistake this
+# comment exists to prevent: it was set to 512 here on the theory that a
+# squeezed instance needs no more, and a 512 MB instance simply never boots —
+# measured 2026-08-05, two separate 5- and 7-minute boots that never reached
+# adbd. 1024 boots but idles at 143 MB available, which the game does not fit
+# into. 2048 boots in ~40 s and leaves ~1 GB available with Roblox resident.
+#
+# So: `mem` = enough to boot and run comfortably, `balloon` = the number you
+# actually care about.
 MODES = {
-    "playable": {"mem": 4096, "smp": 4},
-    "hard":     {"mem": 3072, "smp": 4},
-    "brutal":   {"mem": 2048, "smp": 2},
-    # farming: headless, joined-idle, squeezed as small as stable. mem is a
-    # STARTING point the live measurement (Task 9) tunes; the runtime squeeze
-    # (farming.py) does the rest after boot.
-    "farming":  {"mem": 512, "smp": 2},
+    # gaming: the OTHER use case, and the only mode that asks for a host
+    # window. Everything above is a RAM/CPU tier on the same headless boot;
+    # this one optimises for frames and input latency instead, and expects
+    # one or two instances rather than fifty.
+    #
+    # Why a new mode rather than teaching `playable` to do it: `playable` is
+    # DEFAULT_MODE, so every bare `omni start` resolves to it. Opening a
+    # window there would put a QEMU window on every existing start, including
+    # the ones running under automation with nobody at the screen. Additive
+    # beats surprising.
+    #
+    # `window: True` is a REQUEST, never a promise — default_display decides
+    # what the host can actually provide and gpu_display_args degrades to the
+    # headless pair when the answer is "nothing". A gaming boot on a machine
+    # with no window server is a normal headless boot, not an error.
+    #
+    # No balloon: reclaiming pages out from under a running game is a stutter
+    # source, and this mode is not trying to fit fifty instances in a host.
+    # free-page-reporting is still attached (balloon_device is unconditional),
+    # which costs nothing while nobody inflates it.
+    "gaming":   {"mem": 4096, "smp": 4, "balloon": None, "usb": True,
+                 "display": lean.NATIVE_DISPLAY, "window": True},
+    "playable": {"mem": 4096, "smp": 4, "balloon": None,
+                 "usb": True, "display": lean.NATIVE_DISPLAY},
+    "hard":     {"mem": 3072, "smp": 4, "balloon": None,
+                 "usb": True, "display": lean.NATIVE_DISPLAY},
+    "brutal":   {"mem": 2048, "smp": 2, "balloon": None,
+                 "usb": True, "display": lean.NATIVE_DISPLAY},
+    # farming: headless, joined-idle, squeezed as small as stable. smp 1
+    # because 50+ instances means 50+ vCPU threads, and a joined-idle game
+    # loop does not need a second core. `balloon` is the post-boot reclaim
+    # target applied once the runtime squeeze has finished — see
+    # apply_balloon_target.
+    #
+    # usb stays TRUE, and that is a reversal worth recording. Dropping the
+    # xHCI controller + tablet + keyboard looked like free savings: nothing
+    # taps a farming instance by hand, input goes through `adb shell input`.
+    # Then a guest that rebooted came up with adb UNAUTHORIZED (the
+    # androidboot.insecure_adb authorization does not survive a guest-
+    # initiated reboot), which puts an "Allow USB debugging?" dialog on
+    # screen — and with no input device there is no way to dismiss it, from
+    # adb (unauthorized) or from QMP (input-send-event needs a device). The
+    # instance was permanently unreachable. Across a 50-instance fleet an
+    # unrecoverable instance costs far more than the handful of device models
+    # it saves, and measurement put the real wins in the balloon and the
+    # package trim, not here. Keep the hands on the machine.
+    #
+    # balloon=1536 is MEASURED, not chosen (2026-08-05, arm64 base + the
+    # squeeze below). At 1024 the guest boots and looks healthy, and then
+    # Roblox dies the moment it finishes loading: "Process com.roblox.client
+    # has died: fg TOP" with "Rescheduling restart ... for mem-pressure-event"
+    # in logcat. At 1536 the same instance holds the game at 614 MB resident
+    # with 336 MB still available and no kills. The floor is set by the game
+    # (~614 MB) plus a squeezed Android (~690 MB), and no amount of host-side
+    # tuning moves it — only shrinking the guest workload does.
+    # Two balloon targets, because the safe floor depends on whether the
+    # guest has zram. MEASURED 2026-08-05 (arm64, real Roblox APK):
+    #   no zram   -> 1024 kills the game ("has died: fg TOP" +
+    #                mem-pressure-event); 1536 holds it at 614 MB with 336 MB
+    #                spare. So 1536 is the floor for an unsqueezed guest.
+    #   with zram -> lz4 compresses ~3x, so the guest holds far less. The
+    #                floor was then walked down on a real PRODUCTION instance
+    #                (non-rooted, zram from the baked property, game running):
+    #                  896 -> alive, ~200 MB RSS, ~590 MB swapped, 0 kills,
+    #                         85-131 MB available, sustained 3+ min  <- default
+    #                  768 -> alive, 0 kills, but only 34 MB available
+    #                  640 -> the game DIES (2 mem-pressure kills)
+    # 896 rather than 768: "only the instances must be on" is the stated
+    # requirement, and 34 MB of headroom is not a margin, it is luck. 896 held
+    # with zero kills and real headroom, and is 12.5% denser than the 1024
+    # this started at. Anyone who wants 768 can now ask for it — `--balloon`
+    # is honoured exactly (see resolve_mode; it used to be overridden here).
+    # Every number was measured against the game on its login screen, so a
+    # joined instance has less headroom than these suggest.
+    #
+    # The no-zram 1536 is likewise deliberately NOT lowered to 1280, even
+    # though 1280 was measured to hold after the 34-package trim landed
+    # (game alive at ~517 MB, zero kills, stable). It leaves only 117 MB
+    # available against 336 MB at 1536, and the stated requirement is "the
+    # instances must be on" — an OOM-killed game is an instance that is off,
+    # which costs more than the density gains. Anyone who wants that trade
+    # can take it explicitly with `--balloon 1280`.
+    "farming":  {"mem": 2048, "smp": 1, "balloon": 1536, "balloon_zram": 896,
+                 "usb": True, "display": lean.FARMING_DISPLAY},
 }
 DEFAULT_MODE = "playable"
 
 
-def resolve_mode(cfg, name=None, mem=None):
+def resolve_mode(cfg, name=None, mem=None, balloon=None):
     m = dict(MODES[name or DEFAULT_MODE])
     m["name"] = name or DEFAULT_MODE
     if mem:
         m["mem"] = mem
+    if balloon is not None:
+        # 0 disables the post-boot reclaim without having to special-case
+        # None at the call site (argparse cannot express "absent vs zero").
+        m["balloon"] = balloon or None
+        # An EXPLICIT --balloon must win outright. Dropping balloon_zram is
+        # what makes that true: otherwise apply_balloon_target probes the
+        # guest, finds zram, and quietly substitutes the mode's own zram
+        # figure — so `--balloon 896` on a zram guest silently ran at 1024.
+        # Same family as the `--mem` bug this file already documents: a flag
+        # accepted by argparse and then overridden downstream is worse than
+        # one that was never offered.
+        m.pop("balloon_zram", None)
     return m
+
+
+def resolve_gpu_display(mode, interactive, tool):
+    """The (gpu_args, display_args) pair for one boot, host-checked.
+
+    A window is wanted when the mode asks for one (`gaming`) or OMNI_GL_WINDOW
+    is set — never on an interactive builder boot, which already redirects the
+    console to a serial log and runs unattended.
+
+    The host probe is skipped entirely unless a window is wanted: it costs two
+    QEMU subprocess launches, and a host starting fifty farming instances must
+    not pay that fifty times for an answer it would discard."""
+    want = (bool(mode.get("window")) or _gl_window_requested()) and not interactive
+    if not want:
+        return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
+    cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui())
+    if not cap.get("available"):
+        print(f"[gpu] no host window available ({cap.get('reason')}); "
+              f"booting headless — attach with `omni view <name>`")
+    return gpu_display_args(True, cap)
+
+
+def balloon_device(mode):
+    """The virtio-balloon device args for this mode, or [] when unwanted.
+
+    free-page-reporting is the load-bearing flag, not the balloon itself:
+    with it, the guest hands every page it frees straight back to the host
+    without anyone asking, so host RSS tracks the guest's live set instead of
+    its `-m` size. Measured on the arm64 base (2026-08-05): a booted 2 GB
+    guest that idles at ~850 MB guest-used sits at ~120-250 MB host RSS
+    instead of 2 GB.
+
+    It is attached in EVERY mode, including playable. A guest kernel without
+    the driver just leaves the device unused, so there is no downside branch
+    to maintain, and the memory win is not farming-specific.
+
+    PLATFORM NOTE: the reclaim is real on Linux/KVM, where the madvise QEMU
+    issues actually decommits the page. On macOS/HVF it is advisory — the
+    same test showed host RSS staying high (and rising, from thrash) after a
+    balloon inflate. That is why the 50+-instance target is a Linux number;
+    macOS runs the 2-3 playable instances and does not pretend otherwise."""
+    return ["-device", "virtio-balloon-pci,free-page-reporting=on,id=omniball"]
+
+
+def usb_devices(mode, arm):
+    """USB controller + input devices, or [] for a mode that has no hands on
+    it. Two controllers used to be attached on arm (nec-usb-xhci AND
+    qemu-xhci) with the input devices bound only to the first — the second
+    was dead weight on every single arm boot."""
+    if not mode.get("usb", True):
+        return []
+    if arm:
+        return [
+            "-device", "nec-usb-xhci,id=usb-bus",
+            "-device", "usb-tablet,bus=usb-bus.0",
+            "-device", "usb-kbd,bus=usb-bus.0",
+        ]
+    return ["-device", "qemu-xhci", "-device", "usb-kbd",
+            "-device", "usb-tablet"]
 
 
 def _assert_port_triple(acct):
@@ -126,15 +421,19 @@ def _assert_port_triple(acct):
     return vnc_display
 
 
-def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
+def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
+                     debug=False):
     """arm-uefi (LineageOS arm64) QEMU command — native under HVF on Apple
     Silicon, NO translation layer. UEFI/GRUB disk boot: EDK2 pflash CODE +
     per-account writable efivars, GPT system disk (vda, the provisioned
     overlay carrying /metadata FBE keys) + /data (vdb). Same headless +
     localhost-VNC model as x86; base flags proven in tools/arm64/boot_arm64.sh.
-    Silent boot is handled inside the guest image (GRUB/kernel), not via a
-    Bliss-style -append, so there is no dev/prod append split here — the dev
-    flag only adds a serial log."""
+
+    `interactive` is a BOOT PROFILE (builder/maintenance boots: full host
+    smp/mem + a serial log), NOT a base selection. `debug` attaches the devkit
+    disk as vdc for reverse-engineering work. They are independent: a normal
+    headless production boot can be a debug boot, and an interactive builder
+    boot need not be."""
     from omnidroid.engine import runtime_dir, account_dir
     base = cfg["bases"][acct["base"]]
     q = cfg["qemu"]
@@ -144,14 +443,14 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
     accel = accel or default_accel()
     mode = mode or resolve_mode(cfg)
     vnc_display = _assert_port_triple(acct)
-    smp = q["smp"] if dev else mode["smp"]
-    mem = q["mem_mb"] if dev else mode["mem"]
-    # B2 spike apparatus (see _gl_window_requested): normally headless ALWAYS
-    # (same rule as x86). Only when OMNI_GL_WINDOW is set, on macOS, and not a
-    # dev boot, swap to a native GPU-accelerated cocoa window for the spike.
-    gpu_display = (["-device", "virtio-gpu-gl", "-display", "cocoa,gl=on"]
-                   if (_gl_window_requested() and IS_MACOS and not dev)
-                   else ["-device", "virtio-gpu-pci", "-display", "none"])
+    smp = q["smp"] if interactive else mode["smp"]
+    mem = q["mem_mb"] if interactive else mode["mem"]
+    # Headless unless THIS boot asked for a window and the host can open one
+    # (see resolve_gpu_display). Every other mode gets the byte-for-byte
+    # headless pair it has always had.
+    gpu_args, display_args = resolve_gpu_display(mode, interactive,
+                                                 "qemu-system-aarch64")
+    gpu_display = gpu_args + display_args
 
     # EPHEMERAL (fully-shared, no-persistence) instances boot the SHARED provisioned
     # base templates DIRECTLY with snapshot=on: every write goes to a throwaway
@@ -206,41 +505,62 @@ def qemu_command_arm(acct, cfg, dev, mode=None, accel=None):
         # of the 127.0.0.1 bind — HARD RULE, same as x86; never bind a
         # network interface without adding auth in the same change).
         "-vnc", f"127.0.0.1:{vnc_display}",
-        "-device", "nec-usb-xhci,id=usb-bus",
-        "-device", "qemu-xhci,id=usb-controller-0",
-        "-device", "usb-tablet,bus=usb-bus.0",
-        "-device", "usb-kbd,bus=usb-bus.0",
+        *usb_devices(mode, arm=True),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
         "-device", "virtio-net-pci,netdev=net0",
-        "-device", "virtio-serial",
+        # virtio-rng stays: without it the guest's early entropy pool fills
+        # from nothing and boot stalls. virtio-serial was dropped — no guest
+        # or host component has ever opened a port on it.
         "-device", "virtio-rng-pci",
+        *balloon_device(mode),
         "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
         "-name", f"omni-{acct['name']}",
     ]
-    # Dev accounts: attach the devkit disk as a THIRD virtio-blk (vdc). It is a
-    # cheap per-account COW overlay of the shared base_arm_devkit.qcow2 (frida +
-    # Magisk + omni tools). The guest sees it as /dev/block/vdc and mounts it
-    # read-only during activation (see _devkit_activate). Not bootable.
-    # Dev vdc: the shared devkit template (snapshot=on) for ephemeral instances,
-    # else the per-account COW overlay.
-    devkit_src = (images / base["devkit"]) if (ephemeral and base.get("devkit")) \
-        else (d / "devkit.qcow2")
-    if acct_is_dev(acct) and Path(devkit_src).exists():
-        cmd += [
-            "-device", "virtio-blk-pci,drive=vdc",
-            "-drive", f"file={devkit_src},if=none,id=vdc{disk_opts}",
-        ]
-    if dev:
+    cmd += devkit_drive_args(acct, cfg, debug, disk_opts)
+    if interactive:
         cmd += ["-serial", f"file:{rd / 'serial.log'}"]
     return cmd
 
 
-def qemu_command(acct, cfg, dev, mode=None, accel=None):
+def devkit_drive_args(acct, cfg, debug, disk_opts):
+    """QEMU args attaching the devkit disk as vdc — ONLY on a debug boot.
+
+    This is what makes a shipped base dual-use without changing production: a
+    production instance never gets this disk, so its hardware profile is
+    unchanged and there is no extra block device for an app to enumerate. The
+    guest mounts it read-only at /mnt/omni-devkit during activation (see
+    _devkit_activate); it is never booted from.
+
+    Source: the shared per-arch template opened snapshot=on (writes discarded)
+    for ephemeral instances, else a per-account COW overlay if one exists.
+    Returns [] when debug is off or the disk has not been built."""
+    if not debug:
+        return []
+    from omnidroid.engine import account_dir
+    base = cfg["bases"][acct["base"]]
+    images = Path(cfg["images_dir"])
+    per_acct = account_dir(acct["name"]) / "devkit.qcow2"
+    shared = not (not acct.get("ephemeral") and per_acct.exists())
+    src = devkit_disk_for_base(images, base) if shared else per_acct
+    if not src or not Path(src).exists():
+        return []
+    # The SHARED template must be opened snapshot=on even for a non-ephemeral
+    # instance: without it two concurrent debug boots would write the same
+    # file. A per-account overlay is already private, so it keeps disk_opts.
+    opts = disk_opts
+    if shared and "snapshot=on" not in opts:
+        opts += ",snapshot=on"
+    return ["-device", "virtio-blk-pci,drive=vdc",
+            "-drive", f"file={src},if=none,id=vdc{opts}"]
+
+
+def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False):
     from omnidroid.engine import account_dir
     base = cfg["bases"][acct["base"]]
     if base_type(base) == BASE_TYPE_ARM:
-        return qemu_command_arm(acct, cfg, dev, mode=mode, accel=accel)
+        return qemu_command_arm(acct, cfg, interactive, mode=mode, accel=accel,
+                                debug=debug)
     images = Path(cfg["images_dir"])
     q = cfg["qemu"]
     d = account_dir(acct["name"])
@@ -255,9 +575,13 @@ def qemu_command(acct, cfg, dev, mode=None, accel=None):
     smp = q["smp"]
     mem = q["mem_mb"]
 
-    if dev:
-        # Dev/builder boot: serial console log for debugging (headless like
-        # everything else; virtio-vga kept so the guest has its usual DRM
+    # Same rule as arm: headless unless this boot asked for a window AND the
+    # host can open one. Interactive boots always come back headless.
+    gpu_args, display_args = resolve_gpu_display(mode, interactive,
+                                                 "qemu-system-x86_64")
+    if interactive:
+        # Interactive/builder boot: serial console log for debugging (headless
+        # like everything else; virtio-vga kept so the guest has its usual DRM
         # device during provisioning/builder sessions).
         append += " console=tty0 console=ttyS0,115200"
         gpu = ["-device", "virtio-vga"]
@@ -269,7 +593,9 @@ def qemu_command(acct, cfg, dev, mode=None, accel=None):
         nic = "virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
         smp = mode["smp"]
         mem = mode["mem"]
-        gpu = ["-vga", "none", "-device", "virtio-gpu-pci"]
+        # -vga none first: the emulated VGA adapter is dead weight next to the
+        # virtio GPU, in every tier.
+        gpu = ["-vga", "none"] + gpu_args
 
     cmd = [
         qemu_bin("qemu-system-x86_64"),
@@ -280,30 +606,45 @@ def qemu_command(acct, cfg, dev, mode=None, accel=None):
         "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
         "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
         *gpu,
-        "-display", "none",       # headless ALWAYS; VNC below is an
-                                  # attach point, never a window
-        # Built-in VNC server on the account's reserved port. LOCALHOST
+        *display_args,            # "none" in every mode but gaming
+        # Built-in VNC server on the account's reserved port. It stays on even
+        # when a native window is open: `omni screenshot`, the auto-capture
+        # recorder and the omnidroid-input skill all attach to this
+        # framebuffer (capture.py), and dropping it on a gaming boot would
+        # silently blind every one of them. LOCALHOST
         # ONLY: no auth is safe ONLY because of the 127.0.0.1 bind — never
         # bind a network interface without adding auth in the same change.
         # Idle (no viewer) it does no framebuffer encoding, so leaving it
         # on costs ~nothing across hours-long headless runs; a viewer
         # disconnecting never affects the instance.
         "-vnc", f"127.0.0.1:{vnc_display}",
-        "-device", "qemu-xhci",
-        "-device", "usb-kbd",
-        "-device", "usb-tablet",
+        *usb_devices(mode, arm=False),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
         "-device", nic,
+        *balloon_device(mode),
         "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
         "-kernel", str(images / base["kernel"]),
         "-initrd", str(images / base["initrd"]),
         "-append", append,
         "-name", f"omni-{acct['name']}",
     ]
-    if dev:
+    cmd += devkit_drive_args(acct, cfg, debug, ",format=qcow2")
+    if interactive:
         cmd += ["-serial", f"file:{d / 'serial.log'}"]
     return cmd
+
+
+def command_opens_a_window(cmd):
+    """True when this QEMU command will put a window on the host's screen.
+
+    Read off the command actually being handed to QEMU rather than re-running
+    the decision: the argv IS what the process will do, so this cannot drift
+    from it the way a second copy of the capability logic would."""
+    for i, arg in enumerate(cmd):
+        if arg == "-display" and i + 1 < len(cmd):
+            return cmd[i + 1].split(",")[0] not in ("none", "")
+    return False
 
 
 def _refresh_ephemeral_efivars(acct, cfg):
@@ -324,7 +665,7 @@ def _refresh_ephemeral_efivars(acct, cfg):
         shutil.copyfile(efi_tmpl, d / "efivars.fd")
 
 
-def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
+def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False):
     from omnidroid.runtime import runtime_dir
     check_accel()
     d = runtime_dir(acct["name"])
@@ -339,13 +680,22 @@ def spawn_qemu(acct, cfg, dev, mode=None, accel=None):
         kwargs["creationflags"] = DETACHED | NEW_GROUP
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(
-        qemu_command(acct, cfg, dev, mode, accel=accel),
-        stdout=log, stderr=log, **kwargs)
+    cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
+         # Whether THIS boot put a real window on the host's screen. Recorded
+         # rather than recomputed, so `omni start` can stand its VNC viewer
+         # down instead of showing a second, laggier window onto the same
+         # instance — and so a degraded gaming boot (host could not open one)
+         # still gets the viewer it needs to be watchable at all.
+         "native_window": command_opens_a_window(cmd),
          "identity": f"omni-{acct['name']}",
-         "mode": (mode or {}).get("name", "dev" if dev else DEFAULT_MODE),
+         "mode": (mode or {}).get(
+             "name", "interactive" if interactive else DEFAULT_MODE),
+         # Whether THIS boot attached the devkit — read back by the debug
+         # tooling so it can tell "not a debug boot" from "activation failed".
+         "debug": bool(debug),
          "base": acct["base"],
          "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
          "vnc_port": acct["vnc_port"]}))

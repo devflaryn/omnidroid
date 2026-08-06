@@ -22,7 +22,7 @@ def test_run_json_records_identity(tmp_path, monkeypatch):
                         lambda name: tmp_path / name)
     acct = {"name": "acc0", "base": "arm", "adb_port": 6000,
             "qmp_port": 7000, "vnc_port": 18001}
-    qemu_proc.spawn_qemu(acct, {"qemu": {}}, dev=False)
+    qemu_proc.spawn_qemu(acct, {"qemu": {}}, interactive=False)
     rj = json.loads((tmp_path / "acc0" / "run.json").read_text())
     assert rj["identity"] == "omni-acc0"
 

@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Host display capability detection and the window-vs-headless decision.
+
+    python3 tests/test_gpu_display.py
+
+Gaming mode wants the lowest-latency window the HOST can actually give it;
+farming mode and every host that cannot open a window must keep today's
+headless path byte-for-byte.
+
+There are THREE tiers, not two, and the middle one is the whole reason this
+is not a boolean. MEASURED on the dev Mac (2026-08-06, Homebrew QEMU 11.0.2,
+Apple Silicon):
+
+    $ qemu-system-aarch64 -display cocoa,gl=on
+    qemu-system-aarch64: OpenGL support was not enabled in this build of QEMU
+    $ qemu-system-aarch64 -device help | grep gpu
+    name "virtio-gpu-pci", bus PCI, alias "virtio-gpu"      # no -gl variant
+
+So `gl` is unavailable on the primary host today, while a NATIVE COCOA WINDOW
+is available right now — and a native window is already the big input-latency
+win over the VNC path (no framebuffer encode/decode round trip; host events go
+straight to the guest's usb-tablet/usb-kbd). Collapsing "no virgl" to
+"headless" would throw that away.
+
+`default_display` reports what the host can do (pure — every host fact is
+passed in). `gpu_display_args` decides what to hand QEMU and must NEVER raise:
+a detection bug has to cost a window, never a boot.
+"""
+import os
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from omnidroid import engine as omni  # noqa: E402
+from omnidroid import qemu_proc  # noqa: E402
+
+# The platform flags are patched on qemu_proc, not on engine. `engine` does
+# `from omnidroid.qemu_proc import *`, so engine.default_display IS
+# qemu_proc.default_display and it resolves IS_MACOS in QEMU_PROC's globals —
+# patching engine.IS_MACOS rebinds a name the function never reads, which
+# silently passes on a macOS host and silently lies everywhere else.
+
+# Real `-display help` / `-device help` shapes.
+MAC_DISPLAY_HELP = "none\ncurses\ncocoa\ndbus\n"          # the actual Mac build
+GL_DISPLAY_HELP = "none\ncocoa\ngtk\nsdl\nvnc\negl-headless\n"
+GL_DEVICE_HELP = "virtio-gpu-pci\nvirtio-gpu-gl-pci\nvirtio-vga\n"
+NO_GL_DEVICE_HELP = "virtio-gpu-device\nvirtio-gpu-pci\n"  # the actual Mac build
+
+HEADLESS_GPU = ["-device", "virtio-gpu-pci"]
+HEADLESS_DISPLAY = ["-display", "none"]
+
+
+def _mac():
+    return mock.patch.multiple(qemu_proc, IS_MACOS=True, IS_LINUX=False,
+                               IS_WINDOWS=False)
+
+
+def _linux():
+    return mock.patch.multiple(qemu_proc, IS_MACOS=False, IS_LINUX=True,
+                               IS_WINDOWS=False)
+
+
+class DetectsTheGlTier(unittest.TestCase):
+    def test_macos_with_a_gl_build_is_accelerated(self):
+        with _mac():
+            cap = omni.default_display(GL_DISPLAY_HELP, GL_DEVICE_HELP,
+                                       has_gui=True)
+        self.assertEqual(cap["tier"], "gl")
+        self.assertIn("cocoa,gl=on", " ".join(cap["display_args"]))
+        self.assertIn("virtio-gpu-gl-pci", " ".join(cap["gpu_args"]))
+
+    def test_linux_with_a_gl_build_uses_gtk_or_sdl(self):
+        with _linux():
+            cap = omni.default_display(GL_DISPLAY_HELP, GL_DEVICE_HELP,
+                                       has_gui=True)
+        self.assertEqual(cap["tier"], "gl")
+        self.assertRegex(" ".join(cap["display_args"]), r"gtk,gl=on|sdl,gl=on")
+
+
+class DetectsTheWindowTier(unittest.TestCase):
+    """The tier the primary host actually has today."""
+
+    def test_macos_without_virgl_still_gets_a_native_window(self):
+        with _mac():
+            cap = omni.default_display(MAC_DISPLAY_HELP, NO_GL_DEVICE_HELP,
+                                       has_gui=True)
+        self.assertEqual(cap["tier"], "window")
+        self.assertEqual(cap["display_args"], ["-display", "cocoa"])
+        self.assertEqual(cap["gpu_args"], HEADLESS_GPU)
+
+    def test_the_reason_names_the_missing_piece(self):
+        # The user has to be able to act on this: it is the difference between
+        # "your Mac cannot do it" and "your QEMU was built without OpenGL".
+        with _mac():
+            cap = omni.default_display(MAC_DISPLAY_HELP, NO_GL_DEVICE_HELP,
+                                       has_gui=True)
+        self.assertIn("virtio-gpu-gl", cap["reason"])
+
+    def test_linux_without_virgl_still_gets_a_native_window(self):
+        with _linux():
+            cap = omni.default_display("none\ngtk\nsdl\nvnc\n",
+                                       NO_GL_DEVICE_HELP, has_gui=True)
+        self.assertEqual(cap["tier"], "window")
+        self.assertRegex(" ".join(cap["display_args"]), r"gtk|sdl")
+
+
+class DegradesToHeadless(unittest.TestCase):
+    def test_a_headless_host_session_has_no_window_tier(self):
+        with _mac():
+            cap = omni.default_display(GL_DISPLAY_HELP, GL_DEVICE_HELP,
+                                       has_gui=False)
+        self.assertEqual(cap["tier"], "none")
+        self.assertTrue(cap["reason"])
+
+    def test_a_build_with_no_windowing_backend_has_none(self):
+        with _mac():
+            cap = omni.default_display("none\ncurses\nvnc\n",
+                                       GL_DEVICE_HELP, has_gui=True)
+        self.assertEqual(cap["tier"], "none")
+
+    def test_empty_help_text_reads_as_none_not_as_assume_it_works(self):
+        # _qemu_help_texts returns ("", "") whenever the probe fails.
+        with _mac():
+            cap = omni.default_display("", "", has_gui=True)
+        self.assertEqual(cap["tier"], "none")
+
+
+class GpuDisplayArgs(unittest.TestCase):
+    GL = {"available": True, "tier": "gl",
+          "display_args": ["-display", "cocoa,gl=on"],
+          "gpu_args": ["-device", "virtio-gpu-gl-pci"], "reason": "ok"}
+    WINDOW = {"available": True, "tier": "window",
+              "display_args": ["-display", "cocoa"],
+              "gpu_args": ["-device", "virtio-gpu-pci"], "reason": "no virgl"}
+    NONE = {"available": False, "tier": "none", "display_args": [],
+            "gpu_args": [], "reason": "no host GUI"}
+
+    def test_wanted_and_gl_available_is_accelerated(self):
+        gpu, disp = omni.gpu_display_args(True, self.GL)
+        self.assertEqual(gpu, ["-device", "virtio-gpu-gl-pci"])
+        self.assertEqual(disp, ["-display", "cocoa,gl=on"])
+
+    def test_wanted_and_window_available_opens_the_window(self):
+        gpu, disp = omni.gpu_display_args(True, self.WINDOW)
+        self.assertEqual(disp, ["-display", "cocoa"])
+
+    def test_wanted_but_nothing_available_degrades_to_headless(self):
+        gpu, disp = omni.gpu_display_args(True, self.NONE)
+        self.assertEqual(gpu, HEADLESS_GPU)
+        self.assertEqual(disp, HEADLESS_DISPLAY)
+
+    def test_not_wanted_is_headless_even_when_a_window_is_available(self):
+        for cap in (self.GL, self.WINDOW):
+            gpu, disp = omni.gpu_display_args(False, cap)
+            self.assertEqual(gpu, HEADLESS_GPU)
+            self.assertEqual(disp, HEADLESS_DISPLAY)
+
+    def test_malformed_capability_degrades_instead_of_raising(self):
+        for junk in ({}, None, "yes", 7, {"available": True}, {"tier": "gl"}):
+            gpu, disp = omni.gpu_display_args(True, junk)
+            self.assertEqual(gpu, HEADLESS_GPU,
+                             f"junk capability {junk!r} must degrade")
+            self.assertEqual(disp, HEADLESS_DISPLAY)
+
+
+class HostGuiProbe(unittest.TestCase):
+    def test_macos_always_has_a_gui(self):
+        with _mac():
+            self.assertTrue(qemu_proc._host_has_gui())
+
+    def test_a_headless_linux_session_has_none(self):
+        with _linux(), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(qemu_proc._host_has_gui())
+
+    def test_linux_under_wayland_has_one(self):
+        with _linux(), mock.patch.dict(
+                os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=True):
+            self.assertTrue(qemu_proc._host_has_gui())
+
+
+class QemuHelpProbe(unittest.TestCase):
+    def test_a_failing_probe_returns_empty_strings_not_an_exception(self):
+        with mock.patch.object(qemu_proc, "qemu_bin",
+                               side_effect=OSError("no qemu")):
+            self.assertEqual(qemu_proc._qemu_help_texts("qemu-system-aarch64"),
+                             ("", ""))
+
+
+if __name__ == "__main__":
+    unittest.main()

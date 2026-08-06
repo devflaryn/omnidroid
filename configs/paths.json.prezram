@@ -25,28 +25,39 @@
     "arm": {
       "type": "arm-uefi",
       "base_disk": "base_arm_v2.qcow2",
-      "system": "base_arm_system_rooted.qcow2",
-      "data": "base_arm_data_game.qcow2",
+      "system": "base_arm_system.qcow2",
+      "data": "base_arm_data.qcow2",
       "efivars": "base_arm_efivars.fd",
       "src": "https://github.com/jqssun/android-lineage-qemu (LineageOS 23.2 arm64, virtio_arm64only)",
-      "notes": "arm64/UEFI base (LineageOS 23.2). v2 = branded + silent + insecure_adb + Roblox baked in. base_arm.qcow2 (v1) is kept because existing account overlays are still COW-backed by it. [rooted]",
-      "version": 3,
+      "notes": "arm64/UEFI base (LineageOS 23.2). v2 = branded + silent + insecure_adb + Roblox baked in. base_arm.qcow2 (v1) is kept because existing account overlays are still COW-backed by it.",
+      "version": 2,
       "changelog": {
         "1": "pristine LineageOS 23.2 arm64 (jqssun virtio) + kiosk/device-owner provisioned pair",
-        "2": "v1 + Omni loading screen (product/media), silent boot (quiet/loglevel=0), GRUB menu hidden (no LineageOS logo/countdown), androidboot.insecure_adb=1 (adb reachable on a fresh boot - without it every new account stalls on 'Allow USB debugging?'), and Roblox pre-installed as a system app in /product/app/Roblox with its arm64 native libs (2026-07-17)",
-        "3": "v2 + persist.sys.zram_enabled=1 baked into /product/etc/build.prop, which turns on the zram swap the image already declares in /vendor/etc/fstab.virtio (zramsize=50%, lz4) via the swapon_all trigger in /vendor/etc/init/zram.rc. Measured: lz4 compresses ~3x, the safe balloon cap drops 1536 -> 1024 MB, and a production (non-rooted) instance holds Roblox at that cap with zero kills. base_arm_system_zram.qcow2 is a ~1 MB COW overlay of base_arm_system.qcow2, which is untouched - revert by pointing 'system' back at it. (2026-08-05) NOTE: zstd was tried on top of this (v4) and REVERTED - it is worse. At the 896 MB cap lz4 holds with zero kills, zstd killed the game with 3 mem-pressure kills, and boot went 0.8 min -> 5+ min (timing out `omni start`). zstd wins on compression RATIO but loses on THROUGHPUT, and on one vCPU it is reclaim LATENCY that decides whether an instance survives pressure. Do not retry without more vCPUs."
-      },
-      "rooted": true,
-      "root_manifest": {
-        "magisk_version": "v30.7",
+        "2": "v1 + Omni loading screen (product/media), silent boot (quiet/loglevel=0), GRUB menu hidden (no LineageOS logo/countdown), androidboot.insecure_adb=1 (adb reachable on a fresh boot - without it every new account stalls on 'Allow USB debugging?'), and Roblox pre-installed as a system app in /product/app/Roblox with its arm64 native libs (2026-07-17)"
+      }
+    },
+    "dev": {
+      "type": "arm-uefi",
+      "base_disk": "base_arm.qcow2",
+      "system": "base_arm_devsystem.qcow2",
+      "data": "base_arm_devdata.qcow2",
+      "efivars": "base_arm_efivars.fd",
+      "devkit": "base_arm_devkit.qcow2",
+      "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
+      "notes": "arm dev base: base_arm + base_arm_devkit.qcow2 (vdc) with frida 17.15.4 (arm64) + Magisk [rooted]. omni-agent only; NOT shipped. hidden frida port 27142. devsystem v2: same branding/silent/insecure_adb as base_arm v2 (the dev system image is STANDALONE, so it does not inherit the shared base's branding and must be branded separately).",
+      "devkit_manifest": {
         "frida_version": "17.15.4",
         "frida_port": 27142,
-        "rooted_system": "base_arm_system_rooted.qcow2",
-        "rooted_data": "base_arm_data_rooted.qcow2"
-      },
-      "game_baked": {
-        "package": "com.roblox.client",
-        "apk": null
+        "magisk": true,
+        "magisk_version": "v30.7",
+        "rooted": true,
+        "tools": [
+          "frida-server",
+          "omni-fridad",
+          "omni-frida-stop",
+          "omni-hide",
+          "omni-magisk-setup"
+        ]
       }
     }
   },

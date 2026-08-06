@@ -54,6 +54,38 @@ def parse_guest_used_kb(meminfo_text):
     return total - avail
 
 
+def capacity(host_total_mb, per_instance_mb, reserve_mb=2048):
+    """How many instances of `per_instance_mb` fit in `host_total_mb`.
+
+    `reserve_mb` is held back for the host OS and the engine itself and is
+    NOT optional: a plan that fills RAM to the last megabyte does not give
+    you one more instance, it gives you a host that starts swapping and 50
+    instances that all miss their game ticks together."""
+    if not per_instance_mb or per_instance_mb <= 0:
+        return None
+    usable = max(0, host_total_mb - reserve_mb)
+    return int(usable // per_instance_mb)
+
+
+def summarize(samples):
+    """Reduce repeated host-RSS samples of one instance to a reportable pair.
+
+    MEDIAN, not mean, and the max is kept alongside it. Host RSS under
+    free-page-reporting is genuinely spiky — measured swings of 72 MB to
+    1244 MB on one idle instance within a single minute, as the guest frees
+    a batch of pages and then touches them again. A mean over that is
+    dominated by the spikes and a single sample is a coin flip; the median is
+    what the host actually sustains, and the max is what it must survive."""
+    vals = sorted(v for v in samples if v is not None)
+    if not vals:
+        return {"median_mb": None, "max_mb": None, "samples": 0}
+    mid = len(vals) // 2
+    median = (vals[mid] if len(vals) % 2
+              else (vals[mid - 1] + vals[mid]) / 2)
+    return {"median_mb": round(median, 1), "max_mb": round(vals[-1], 1),
+            "samples": len(vals)}
+
+
 def measurement_row(base, mode, arch, boot_minutes, host_rss_kb, guest_used_kb):
     """One comparable measurement row (units normalized to MB)."""
     return {

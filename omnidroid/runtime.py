@@ -241,6 +241,9 @@ def running_instances():
         if instance_live(data):
             out.append({"name": d.name, "pid": data["pid"],
                         "base": data.get("base"),
+                        # Whether THIS boot attached the devkit disk (vdc).
+                        # A per-boot property, not a property of the account.
+                        "debug": bool(data.get("debug")),
                         "adb_port": data.get("adb_port"),
                         "qmp_port": data.get("qmp_port"),
                         "vnc_port": data.get("vnc_port")})

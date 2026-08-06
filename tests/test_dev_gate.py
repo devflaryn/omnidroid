@@ -1,106 +1,91 @@
 #!/usr/bin/env python3
-"""The dev base (frida + Magisk root) must be invisible and unselectable to a
-customer build, and available to omni-agent.
+"""Debug is a per-BOOT option, not a base and not an account property.
 
-This is a product-safety boundary, not a preference: omni-executor renders its
-base picker from `bases --json` and switches with `use-base`, so anything these
-functions expose is one click away for a customer.
+There is no dev base and no dev-mode gate: every registered base is dual-use.
+`omni start --debug` (or OMNI_DEBUG_BOOT=1) attaches the devkit disk as vdc;
+a plain boot never gets it, so a production instance's hardware profile is
+unchanged.
 
     python3 tests/test_dev_gate.py     (or: pytest tests/)
 """
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omnidroid import engine as omni  # noqa: E402
-
-CFG = {
-    "current_base": "arm",
-    "bases": {
-        "x86": {"type": "x86-bliss", "disk": "base_x86.qcow2"},
-        "arm": {"type": "arm-uefi", "base_disk": "base_arm.qcow2"},
-        "dev": {"type": "arm-uefi", "base_disk": "base_arm.qcow2",
-                "devkit": "base_arm_devkit.qcow2"},
-    },
-}
+from omnidroid import bases as b  # noqa: E402
+from omnidroid import qemu_proc  # noqa: E402
 
 
-class DevGate(unittest.TestCase):
+class DebugBootRequest(unittest.TestCase):
+    """_debug_boot_requested: --debug or OMNI_DEBUG_BOOT, never implied."""
 
     def setUp(self):
-        self._saved = os.environ.pop(omni.DEV_MODE_ENV, None)
+        self._saved = os.environ.pop(b.DEBUG_ENV, None)
 
     def tearDown(self):
-        os.environ.pop(omni.DEV_MODE_ENV, None)
+        os.environ.pop(b.DEBUG_ENV, None)
         if self._saved is not None:
-            os.environ[omni.DEV_MODE_ENV] = self._saved
+            os.environ[b.DEBUG_ENV] = self._saved
 
-    def dev_on(self):
-        os.environ[omni.DEV_MODE_ENV] = "1"
+    def test_flag_requests_debug(self):
+        self.assertTrue(b._debug_boot_requested(SimpleNamespace(debug=True)))
 
-    # ---- what identifies a dev base ----
+    def test_default_is_production(self):
+        self.assertFalse(b._debug_boot_requested(SimpleNamespace(debug=False)))
+        self.assertFalse(b._debug_boot_requested(SimpleNamespace()))
 
-    def test_devkit_field_is_what_marks_a_base_dev(self):
-        self.assertTrue(omni.base_is_dev(CFG["bases"]["dev"]))
-        self.assertFalse(omni.base_is_dev(CFG["bases"]["arm"]))
-        self.assertFalse(omni.base_is_dev(CFG["bases"]["x86"]))
+    def test_env_enables_debug(self):
+        os.environ[b.DEBUG_ENV] = "1"
+        self.assertTrue(b._debug_boot_requested(SimpleNamespace(debug=False)))
 
-    # ---- visibility ----
+    def test_only_truthy_env_enables(self):
+        for v in ("0", "", "no", "off"):
+            os.environ[b.DEBUG_ENV] = v
+            self.assertFalse(b._debug_boot_requested(SimpleNamespace(debug=False)),
+                             f"{v!r} should not enable debug")
 
-    def test_customer_cannot_see_the_dev_base(self):
-        self.assertEqual(sorted(omni.visible_bases(CFG)), ["arm", "x86"])
 
-    def test_agent_can_see_the_dev_base(self):
-        self.dev_on()
-        self.assertEqual(sorted(omni.visible_bases(CFG)), ["arm", "dev", "x86"])
+class DevkitAttachment(unittest.TestCase):
+    """devkit_drive_args attaches vdc only on a debug boot, and only when the
+    per-arch devkit disk exists."""
 
-    def test_only_explicit_truthy_values_unlock(self):
-        for val, expect in (("1", True), ("true", True), ("TRUE", True),
-                            ("yes", True), ("on", True),
-                            ("0", False), ("", False), ("false", False),
-                            ("maybe", False)):
-            os.environ[omni.DEV_MODE_ENV] = val
-            self.assertEqual(omni.dev_mode_enabled(), expect,
-                             f"{omni.DEV_MODE_ENV}={val!r}")
+    def _args(self, debug, disk_exists):
+        acct = {"name": "u1", "base": "arm", "ephemeral": True}
+        cfg = {"images_dir": "/img",
+               "bases": {"arm": {"type": "arm-uefi"}}}
+        with mock.patch.object(qemu_proc, "devkit_disk_for_base",
+                               return_value=("/img/base_arm_devkit.qcow2"
+                                             if disk_exists else None)), \
+             mock.patch("pathlib.Path.exists", return_value=disk_exists):
+            return qemu_proc.devkit_drive_args(acct, cfg, debug,
+                                               ",snapshot=on")
 
-    # ---- selection ----
+    def test_production_boot_has_no_vdc(self):
+        self.assertEqual(self._args(debug=False, disk_exists=True), [])
 
-    def test_customer_cannot_select_the_dev_base(self):
-        with self.assertRaises(SystemExit):
-            omni._select_base_tag(CFG, base_tag="dev")
+    def test_debug_boot_attaches_vdc(self):
+        args = self._args(debug=True, disk_exists=True)
+        self.assertIn("virtio-blk-pci,drive=vdc", args)
+        self.assertTrue(any("vdc" in a for a in args))
 
-    def test_agent_can_select_the_dev_base(self):
-        self.dev_on()
-        self.assertEqual(omni._select_base_tag(CFG, base_tag="dev"), "dev")
+    def test_debug_boot_without_disk_is_a_noop(self):
+        self.assertEqual(self._args(debug=True, disk_exists=False), [])
 
-    def test_production_bases_are_unaffected(self):
-        self.assertEqual(omni._select_base_tag(CFG, base_tag="arm"), "arm")
-        self.assertEqual(omni._select_base_tag(CFG, arch="x86"), "x86")
 
-    def test_arch_autoselect_never_lands_on_dev(self):
-        """--arch arm must resolve to the production arm base even though the
-        dev base is also arm."""
-        cfg = {"current_base": "dev", "bases": CFG["bases"]}
-        self.assertEqual(omni._select_base_tag(cfg, arch="arm"), "arm")
+class NoDevBaseSymbols(unittest.TestCase):
+    """The dev-base gate is gone; its symbols must not resurface."""
 
-    def test_dev_only_arm_deployment_does_not_leak_dev_to_arch_select(self):
-        """If the ONLY arm base registered is the dev one, a customer asking for
-        arm gets a clean no_base — not a silent rooted boot."""
-        cfg = {"current_base": "x86",
-               "bases": {"x86": CFG["bases"]["x86"], "dev": CFG["bases"]["dev"]}}
-        with self.assertRaises(SystemExit):
-            omni._select_base_tag(cfg, arch="arm")
-
-    def test_default_pointing_at_dev_refuses_rather_than_boots_it(self):
-        """current_base=dev in a customer build is a misconfiguration; creating
-        an account with no flags must fail loudly, not quietly use dev."""
-        cfg = {"current_base": "dev", "bases": CFG["bases"]}
-        with self.assertRaises(SystemExit):
-            omni._select_base_tag(cfg)
-        self.dev_on()
-        self.assertEqual(omni._select_base_tag(cfg), "dev")
+    def test_removed_symbols_are_absent(self):
+        for name in ("acct_is_dev", "base_is_dev", "assert_dev_allowed",
+                     "visible_bases", "dev_mode_enabled", "DEV_BASE_TAG",
+                     "build_dev_base"):
+            self.assertFalse(hasattr(omni, name),
+                             f"engine.{name} should have been removed")
 
 
 if __name__ == "__main__":

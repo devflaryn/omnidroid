@@ -34,6 +34,8 @@ from pathlib import Path
 
 from omnidroid import config
 from omnidroid import farming
+from omnidroid import gaming
+from omnidroid import lean
 from omnidroid.config import (
     REPO, CONFIG_PATH, QEMU_DIR,
     IS_WINDOWS, IS_LINUX, IS_MACOS, HOST_ARCH, IS_ARM64_HOST,
@@ -87,8 +89,8 @@ DEFAULT_SRC = "/android-2024-10-11"
 #                therefore copies the provisioned (system-overlay, data,
 #                efivars) trio rather than provisioning on first boot.
 from omnidroid.bases import *  # noqa: F401,F403
-from omnidroid.bases import (_truthy_env, _dev_mode_for_play, _select_base_tag,
-                             _next_base_tag)  # noqa: F401
+from omnidroid.bases import (_truthy_env, _debug_boot_requested,
+                             _select_base_tag, _next_base_tag)  # noqa: F401
 
 
 
@@ -97,20 +99,20 @@ from omnidroid.bases import (_truthy_env, _dev_mode_for_play, _select_base_tag,
 
 
 
-# ---------- dev-mode gate ----------
-# Dev mode (frida + Magisk root + always-on screenshots) is a DEVELOPER
-# capability, not a product feature: customers must not be able to reach it. The
-# strongest guard is that the dev images are never shipped, but that is not
-# enough on its own — `bases` and `use-base` are generic over whatever is
-# registered, so on a workstation where the dev base EXISTS the product GUI
-# (omni-executor calls exactly those two commands) would happily list "dev" and
-# let a click switch to it.
+# ---------- dual-use bases ----------
+# There is no separate dev base and no dev-mode gate. Every shipped base is
+# DUAL-USE: the same image that ships to production is the one omni-agent
+# debugs on. What used to be "the dev base" is now three independent things —
+# see omnidroid/bases.py for the full split:
 #
-# So dev bases are invisible and unselectable unless the caller opts in via
-# OMNI_DEV_MODE=1. omni-agent — the only thing that should ever boot dev — sets
-# it explicitly (see android_emulator._omni_env). A customer running the shipped
-# product never has it set, so for them the dev base does not exist even if its
-# images somehow do.
+#   root     baked into the shipped image (Magisk-patched boot), always there.
+#   hiding   baked into the shipped /data and re-enforced on EVERY boot
+#            (Zygisk + Enforce DenyList), so production looks unrooted.
+#   toolkit  the devkit disk (frida-server + omni-* scripts), attached as vdc
+#            ONLY on a `--debug` boot.
+#
+# So "debug" is a per-BOOT option, not a base and not an account property. The
+# same account boots production on one run and debug on the next, off one image.
 
 
 
@@ -146,38 +148,21 @@ def host_arch_token():
 # entry ("version" + "changelog"). Legacy base-vN.* triples are still
 # auto-registered so old deployments keep working.
 
-# dev/debug base — the arm "devkit disk" model (replaces the old x86 base-dev).
+# The devkit disk — the attachable debug toolkit, built host-side (rootless,
+# cross-platform via `mke2fs -d`) as an ext4 image carrying the frida-server for
+# that arch, Magisk (apk + magiskboot), the omni-* device scripts, and a
+# manifest. It belongs to no base entry: `omni start --debug` attaches it as vdc
+# and the guest mounts it read-only at /mnt/omni-devkit, copying the toolkit to
+# /data/local/tmp to execute it (/mnt is a noexec tmpfs). See _devkit_* and
+# `omni build-devkit`.
 #
-# Instead of baking frida/Magisk into a whole new /system image (the retired
-# x86 `base-dev.qcow2`), the dev environment is the SHARED `base_arm` PLUS one
-# extra virtio disk attached as vdc: `base_arm_devkit.qcow2`, an ext4 image
-# built host-side (rootless, cross-platform via `mke2fs -d`) carrying the
-# arm64 frida-server, Magisk (apk + magiskboot), the omni-* device scripts, and
-# a manifest. `base_arm.qcow2` is NEVER modified — a dev account is a normal arm
-# account (system-overlay + data + efivars trio) with the devkit disk added.
-# DEV-ONLY: only omni-agent selects it (`create --base dev`); the shipped bases
-# (base_x86 / base_arm) never carry any of it, and building it NEVER changes
-# current_base.
-# The extra devkit disk (attached to dev accounts as vdc). Shared + immutable;
-# each dev account gets a cheap COW overlay of it (like the system overlay).
-# The rooted dev SYSTEM overlay (COW on base_arm.qcow2) — holds the Magisk-
-# patched boot. base_arm.qcow2 stays immutable.
-# Root-state markers embedded in the dev base's human-readable `notes`. Kept as
-# constants because _dev_base_entry rewrites whichever one is stale when it
-# preserves a hand-edited note — `notes` must never contradict
-# devkit_manifest.rooted.
-# The dev /data template: a copy of the provisioned arm /data that ALSO has
-# Magisk fully configured (shell su granted Forever, root_access=3, Zygisk +
-# DenyList on), captured once from a rooted dev boot. When present, dev accounts
-# use it so root works HEADLESSLY from first boot (no GUI su prompt). It is a
-# matched pair with base_arm_devsystem (same /metadata FBE keys).
-# Where the guest mounts the devkit disk (read-only) and where the activated,
-# exec-capable copy of the toolkit lives. /mnt is a noexec tmpfs on this base,
-# so the toolkit is copied to /data/local/tmp for execution (see _devkit_*).
-# frida-server pinned for the dev base (android-ARM64 — the base runs arm64
-# natively under HVF/KVM, no translation). Override with
-# `build-dev-base --frida-version`. The hidden frida port is intentionally NOT
-# the well-known 27042.
+# Root-state markers embedded in a base's human-readable `notes`; kept as
+# constants because the notes must never contradict the entry's `rooted` flag.
+#
+# frida-server is pinned for the devkit (android-<arch>). The base runs its
+# guest arch natively (arm64 under HVF/KVM, x86_64 under WHPX/KVM), so no
+# translation. Override with `omni build-devkit --frida-version`. The hidden
+# frida port is intentionally NOT the well-known 27042.
 DEFAULT_FRIDA_VERSION = "17.15.4"
 DEFAULT_FRIDA_PORT = 27142
 
@@ -346,37 +331,70 @@ def account_dir(name):
 
 
 def _base_tag_for_mode(rec, cfg=None):
-    """Resolve a store record's base MODE ("prod"/"dev"/None -- see
-    omnidroid/accounts.py) to a cfg base TAG (a key into cfg["bases"]).
-    The store and the engine speak different vocabularies for "base": the
-    store tracks a coarse mode, the engine needs the exact registered base
-    entry to boot/introspect. `rec` need only carry a "base" key (a full
-    record or a list_accounts entry both work); pass `cfg` to avoid a
-    re-read when resolving many accounts at once (e.g. all_accounts)."""
+    """Resolve a store record's base MODE to a cfg base TAG (a key into
+    cfg["bases"]). The store and the engine speak different vocabularies for
+    "base": the store tracks a coarse mode, the engine needs the exact
+    registered base entry to boot/introspect. `rec` need only carry a "base"
+    key (a full record or a list_accounts entry both work); pass `cfg` to avoid
+    a re-read when resolving many accounts at once (e.g. all_accounts).
+
+    There is only one mode now — every shipped base is dual-use, so a legacy
+    "dev" record resolves to the same production base as everything else."""
     cfg = cfg if cfg is not None else read_config()
     bases = cfg.get("bases") or {}
-    mode = (rec or {}).get("base")
-    if mode == "dev":
-        for t, b in bases.items():
-            if base_is_dev(b):
-                return t
-        return DEV_BASE_TAG
-    # prod or unset: the arm production tag.
     tag = effective_base_tag(cfg)
-    if tag and tag in bases and not base_is_dev(bases[tag]):
+    if tag and tag in bases:
         return tag
     for t, b in bases.items():
-        if base_type(b) == BASE_TYPE_ARM and not base_is_dev(b):
+        if base_type(b) == BASE_TYPE_ARM:
             return t
     return ARM_BASE_TAG
 
 
+def _booted_with_native_window(name):
+    """Did this instance's CURRENT boot open a QEMU window on the host?
+
+    Recorded by spawn_qemu into run.json (see command_opens_a_window), not
+    recomputed here — the capability probe is host state that can change
+    between the spawn and this call, and the only answer that matters is what
+    the running process actually did. Unknown reads as False, which keeps the
+    VNC viewer: an extra window is a nuisance, a missing one is a black box."""
+    try:
+        run = json.loads((runtime_dir(name) / "run.json").read_text())
+        return bool(run.get("native_window"))
+    except Exception:  # noqa: BLE001 — no run.json, unreadable, or older format
+        return False
+
+
+def _want_vnc_viewer(native_window, explicit_window, json_mode, no_window):
+    """Whether `omni start` should also spawn the built-in Tk/RFB viewer.
+
+    The instance always RUNS a VNC server — screenshot, autocap and the
+    omnidroid-input skill attach to it in every mode. This decides only
+    whether to put a second viewer WINDOW on screen, and the gaming case is
+    why it exists: a native QEMU window plus the VNC viewer means two windows
+    onto one instance, and the VNC one is the laggier of the two, so it is the
+    one a user would click and then judge the mode by.
+
+    Order matters: --no-window is absolute, then an explicit --window (the
+    user asked for the viewer; do not second-guess), then the native window
+    stands it down, then today's rule (on interactively, off under --json)."""
+    if no_window:
+        return False
+    if explicit_window:
+        return True
+    if native_window:
+        return False
+    return not json_mode
+
+
 def load_account(name):
     """Build a runtime HANDLE for `name` -- identity from the central store
-    (omnidroid/accounts.py), live ports (and, if running, the exact base tag)
-    from runtime/<name>/run.json. Reads NO per-account folder: the ~14
-    running-instance commands only ever need name/base/ports/dev/game_package,
-    all of which live in one of those two places now."""
+    (omnidroid/accounts.py), live ports (and, if running, the exact base tag
+    and whether it was a debug boot) from runtime/<name>/run.json. Reads NO
+    per-account folder: the ~14 running-instance commands only ever need
+    name/base/ports/debug/game_package, all of which live in one of those two
+    places now."""
     from omnidroid import accounts as _acc
     rec = _acc.get_account(_store_root(), name)
     run_path = runtime_dir(name) / "run.json"
@@ -399,7 +417,9 @@ def load_account(name):
         "name": name,
         "base": base_tag,
         "ephemeral": True,
-        "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+        # Per-BOOT, not per-account: true only if the live boot attached the
+        # devkit disk. An account that is not running is never "debug".
+        "debug": bool((run or {}).get("debug")),
         "game_package": ROBLOX_PACKAGE,
         "first_boot_done": True,
     }
@@ -437,7 +457,7 @@ def all_accounts():
         base_tag = r["base"] if (r and r.get("base")) else _base_tag_for_mode(
             entry, cfg)
         acct = {"name": name, "base": base_tag, "ephemeral": True,
-                "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+                "debug": bool(r.get("debug")) if r else False,
                 "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
         if r:
             for k in ("adb_port", "qmp_port", "vnc_port"):
@@ -451,7 +471,7 @@ def all_accounts():
             continue
         base_tag = r.get("base") or _base_tag_for_mode(None, cfg)
         acct = {"name": name, "base": base_tag, "ephemeral": True,
-                "dev": base_is_dev((cfg.get("bases") or {}).get(base_tag, {})),
+                "debug": bool(r.get("debug")),
                 "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
         for k in ("adb_port", "qmp_port", "vnc_port"):
             if r.get(k) is not None:
@@ -709,30 +729,31 @@ def make_overlay(system_path, base_disk):
                     str(system_path)], check=True, capture_output=True)
 
 
-def build_acct(name, cfg, dev=False):
+def build_acct(name, cfg, debug=False):
     """Build the EPHEMERAL launch handle for `name`: resolves the base tag,
     allocates a fresh port triple, and stages a per-boot efivars copy into
     runtime_dir(name) -- but writes NO account.json and creates NO overlays.
     Ephemeral instances boot the shared base templates directly (snapshot=on,
     see qemu_command_arm), so there is nothing per-account to persist; the
-    handle is pure launch state (name/base/ports), same key shape as
+    handle is pure launch state (name/base/ports/debug), same key shape as
     load_account()'s but always carrying ports since this is what actually
     reserves them.
 
     This is the LAUNCH counterpart to load_account(): load_account reads an
     identity that may or may not be running; build_acct allocates a fresh
-    instance to run. arm-only by design (the product is arm; dev is
-    arm+devkit). dev=True selects the dev base (gated by OMNI_DEV_MODE
-    upstream via assert_dev_allowed)."""
+    instance to run. arm-only by design (the product is arm).
+
+    `debug` is a per-BOOT flag: it flows to spawn_qemu to attach the devkit
+    disk (vdc). It does NOT change the base — production and debug boot the
+    exact same dual-use image."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         fail("bad_name",
              f"instance/username must be [A-Za-z0-9_-]+ (got '{name}')")
-    tag = "dev" if dev else _select_base_tag(cfg, arch="arm")
+    tag = _select_base_tag(cfg, arch="arm")
     base = cfg["bases"][tag]
     if base_type(base) != BASE_TYPE_ARM:
         fail("arch_boundary",
              f"instances are arm-only; base '{tag}' is {arch_of_base(base)}")
-    assert_dev_allowed(tag, base)
     ensure_qemu()
     # Hold the launch lock across allocate + reserve ONLY (tiny critical
     # section): a lock alone isn't enough (allocate-then-release before spawn
@@ -752,7 +773,7 @@ def build_acct(name, cfg, dev=False):
     shutil.copyfile(efi_tmpl, d / "efivars.fd")
     return {"name": name, "base": tag,
             "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port,
-            "ephemeral": True, "dev": base_is_dev(base),
+            "ephemeral": True, "debug": bool(debug),
             "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
 
 
@@ -775,11 +796,6 @@ def _make_persistent_arm_account(name, cfg, tag=None):
     arm-only, matching build_acct."""
     tag = tag or _select_base_tag(cfg)
     base = cfg["bases"][tag]
-    # Dev-base safety gate: an explicit tag (e.g. `update-kiosk --base dev`)
-    # bypasses _select_base_tag's auto-avoidance, so gate here unconditionally
-    # — same convention build_acct() follows. Refuses a dev base without
-    # OMNI_DEV_MODE=1 (customer-safety boundary; see dev-mode gate comment).
-    assert_dev_allowed(tag, base)
     if base_type(base) != BASE_TYPE_ARM:
         fail("arch_boundary", f"base '{tag}' is not arm-uefi")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -801,10 +817,6 @@ def _make_persistent_arm_account(name, cfg, tag=None):
     make_overlay(d / "system.qcow2", images / base["system"])
     make_overlay(d / "data.qcow2", images / base["data"])
     shutil.copyfile(efi_tmpl, d / "efivars.fd")
-    devkit = base["devkit"] if base_is_dev(base) else None
-    if devkit:
-        make_overlay(d / "devkit.qcow2", images / devkit)
-        acct["dev"] = True
     acct["game_package"] = ROBLOX_PACKAGE
     save_account(acct)
     print(f"[create {name}] arm64 disks ready (provisioned pair copied from "
@@ -843,14 +855,24 @@ SU_CANDIDATES = ("/debug_ramdisk/su", "/sbin/su", "su")
 
 def resolve_su(acct):
     """Return the working Magisk su path in the guest ('/debug_ramdisk/su' etc.)
-    or None if root is unavailable (dev boot not patched / not granted)."""
+    or None if root is unavailable — NOT granted / not rooted / not present.
+
+    CRUCIAL: on a rooted base whose /data has NOT pre-granted the shell, the very
+    first `su` request pops MagiskSU's approval dialog and BLOCKS until someone
+    taps it — so the adb call hangs and times out. That must read as 'no su',
+    never as an exception that propagates into the boot flow (it would crash
+    every production boot). So a timeout/error on a candidate is swallowed and
+    treated as 'this candidate did not grant'."""
     for cand in SU_CANDIDATES:
         # Must go through `sh -c` (matches _devkit_activate's invocation):
         # MagiskSU's getopt permutes argv, so a bare trailing `-u` (as in
         # `su 0 id -u`) is misread as an unrecognized su OPTION (usage/exit 2)
         # instead of being passed to `id`.
-        r = adb(acct, "shell", f"{cand} 0 sh -c {shlex.quote('id -u')}",
-                timeout=15)
+        try:
+            r = adb(acct, "shell", f"{cand} 0 sh -c {shlex.quote('id -u')}",
+                    timeout=8)
+        except Exception:  # noqa: BLE001 — a prompting su hangs -> timeout; not root
+            continue
         if (r.stdout or "").strip().splitlines()[-1:] == ["0"]:
             return cand
     return None
@@ -891,6 +913,69 @@ def _magisk_pkg(acct, su=None):
     return None
 
 
+def resolve_game_package(acct, cfg=None):
+    """Which package the kiosk should treat as THE GAME, or None.
+
+    An adb-installed game on the account handle wins (that is what `--apk`
+    and dev/test flows set); otherwise the base's own pre-installed game from
+    `base_game` in the config. Never raises on a missing/!dict config — the
+    caller degrades to leaving the setting alone."""
+    game = acct.get("game_package")
+    if game:
+        return game
+    try:
+        return (cfg or {}).get("base_game", {}).get(acct["base"])
+    except Exception:  # noqa: BLE001 — no config, wrong shape, unreadable
+        return None
+
+
+def assert_kiosk_game(acct, cfg, label):
+    """Tell the kiosk what the game is, on EVERY boot, then re-front it.
+
+    THE BUG THIS EXISTS FOR (traced live 2026-08-06 on the rooted arm base).
+    The kiosk's resolveGamePackage() falls back to "the first launchable
+    NON-SYSTEM app" when Settings.Global `omni_game_package` is unset. The
+    setting was only ever written by deliver_session (whose own comment says
+    it is for "a LATER REBOOT") and by provision_settings (which never runs on
+    the arm bases). Instances are EPHEMERAL, so /data is discarded at
+    power-off and that later reboot never inherits it: every boot came up with
+    the setting unset. Observed:
+
+        02:15:40.882  OmniKiosk: launching com.topjohnwu.magisk (boot)
+        02:15:43.274  settings put global omni_game_package com.roblox.client
+        02:15:44.904  E ActivityTaskManager: Attempted Lock Task Mode violation
+                         r=...com.roblox.client/.ActivityProtocolLaunch
+
+    Before the dual-use change that fallback found nothing to pick. Rooting
+    production installed the Magisk MANAGER as a launchable non-system app, so
+    the guess started landing on it — and the kiosk then whitelisted and
+    PINNED Magisk under Lock Task, which is why the real game's launch was
+    refused afterwards. Roblox itself is a SYSTEM app here
+    (/product/app/Roblox/Roblox.apk) and can never win that scan, so the
+    setting is the only thing that can select it.
+
+    Writing it before the session arrives, and then re-fronting the kiosk so
+    it re-runs launchGame() (which re-whitelists and re-pins the right
+    package), is the fix at the cause rather than at the symptom."""
+    game = resolve_game_package(acct, cfg)
+    if game:
+        try:
+            adb(acct, "shell", "settings", "put", "global",
+                "omni_game_package", game, timeout=15)
+            print(f"[{label}] kiosk game package = {game}")
+        except Exception as e:  # noqa: BLE001 — never fail a boot over this
+            print(f"[{label}] could not set omni_game_package: {e}")
+    # Best-effort, like every other post-boot assertion here: an instance that
+    # could not be re-fronted must still end up booted and reachable, so this
+    # reports and returns rather than propagating into the boot.
+    try:
+        return _assert_kiosk_foreground(acct, label)
+    except Exception as e:  # noqa: BLE001
+        print(f"[{label}] kiosk UI: could not re-front ({e}); the instance is "
+              f"up — check `omni screenshot` to see what is on screen")
+        return {"kiosk_foreground": False, "reason": "error"}
+
+
 def _assert_kiosk_foreground(acct, label):
     """Make the KIOSK the visible UI on a dev instance: keep it as HOME and
     foreground it, and stop the Magisk manager app so its 'additional setup' /
@@ -925,21 +1010,20 @@ def _assert_kiosk_foreground(acct, label):
 
 
 def _devkit_activate(acct, label):
-    """Activate the dev devkit disk after boot: mount vdc read-only and stage
-    the omni-* tools into an exec-capable dir (/data/local/tmp/omni-devkit).
-    Needs Magisk root (su) — the tools all run as root. Best-effort: on a
-    not-yet-rooted dev boot it explains what to do and returns without failing
-    the start. Returns a small status dict."""
-    if not acct_is_dev(acct):
-        return {"activated": False, "reason": "not_dev"}
+    """Activate the devkit disk after a DEBUG boot: mount vdc read-only and
+    stage the omni-* tools into an exec-capable dir (/data/local/tmp/omni-devkit).
+    Needs Magisk root (su) — the tools all run as root. Best-effort: on an
+    unrooted base it explains what to do and returns without failing the start.
+    Only called on a `--debug` boot (the caller gates it), so the vdc disk is
+    present. Returns a small status dict."""
     # Root via Magisk su (the arm base is a 'user' build — `adb root` is NOT
-    # available; root comes only from the patched-boot Magisk daemon). The dev
-    # /data template pre-grants shell, so this is headless (no su prompt).
+    # available; root comes only from the patched-boot Magisk daemon). The
+    # shipped /data pre-grants shell, so this is headless (no su prompt).
     su = resolve_su(acct)
     if not su:
         print(f"[{label}] devkit: Magisk root not available (su denied/missing). "
-              f"The dev boot is not patched/granted — frida can't attach and "
-              f"hiding is off. Build it with: omni build-dev-base --patch-boot")
+              f"The base is not rooted — frida can't attach and hiding is off. "
+              f"Build the rooted image with: omni root-base <tag>")
         return {"activated": False, "reason": "no_root", "devkit_disk": True}
     # Mount vdc ro and copy the scripts + manifest to an exec-capable dir. (The
     # frida-server binary is read from the mount by omni-fridad; /mnt is noexec
@@ -993,6 +1077,86 @@ def _devkit_activate(acct, label):
                 "kiosk_ui": kiosk_ui}
     print(f"[{label}] devkit: activation incomplete:\n{out.strip()[-800:]}")
     return {"activated": False, "reason": "mount_failed", "detail": out.strip()[-400:]}
+
+
+# The game package. The shipped base is rooted, so it MUST be on the Magisk
+# DenyList in production or Roblox's own root/Magisk detection would see through
+# the device. _enforce_hiding adds it on every boot.
+GAME_PACKAGE = "com.roblox.client"
+
+
+def _enforce_hiding(acct, label):
+    """Re-enforce Magisk hiding so the game sees an UNROOTED device — run on
+    EVERY boot, production included. This is what makes a rooted shipped base
+    safe to ship: the device is rooted, but hidden.
+
+    Needs only `su` and the `magisk` applet, BOTH of which live in the rooted
+    boot — NO devkit disk required, so it runs on a plain production boot with
+    no vdc attached. Idempotent. On an UNROOTED base (no su) it is a logged
+    no-op and never fails the boot, so an unrooted deployment still works.
+
+    What it asserts (mirrors omni-magisk-setup + omni-hide, minus anything that
+    needs the devkit files):
+      * Zygisk + Enforce DenyList ON (the DenyList only unmounts Magisk for a
+        listed app when these are on);
+      * the game package ON the DenyList;
+      * the classic root/verified-boot prop 'tells' normalized via resetprop.
+    """
+    su = resolve_su(acct)
+    if not su:
+        # Unrooted base (Phase-1 deployment, or root not yet built). Not an
+        # error: production simply runs without root/hiding until the rooted
+        # image lands. Say so once, quietly.
+        print(f"[{label}] hiding: base is not rooted (no su) — skipping "
+              f"DenyList/prop enforcement. This is fine for an unrooted "
+              f"deployment; build the rooted image to enable it.")
+        return {"enforced": False, "reason": "not_rooted"}
+    pkg = acct.get("game_package") or GAME_PACKAGE
+    # One root shell does everything. `magisk` (like su) lives in Magisk's own
+    # tmpfs, never on $PATH, so probe the known locations. resetprop -n on each
+    # prop is idempotent (it no-ops when already at the wanted value).
+    # Shamiko (module id zygisk_shamiko), if installed + enabled, does the
+    # hiding — and it REQUIRES DenyList ENFORCEMENT to be OFF (it reads the list
+    # itself). Without Shamiko, Magisk's own Enforce-DenyList does the hiding, so
+    # it must be ON. Either way: Zygisk on + the game ON the list. So the
+    # enforce-flag is the ONLY thing that flips on Shamiko's presence.
+    script = (
+        'M=""; for m in /debug_ramdisk/magisk /sbin/magisk magisk; do '
+        '"$m" -v >/dev/null 2>&1 && { M="$m"; break; }; done; '
+        '[ -z "$M" ] && { echo NO_MAGISK; exit 0; }; '
+        'SH=/data/adb/modules/zygisk_shamiko; '
+        'if [ -d "$SH" ] && [ ! -f "$SH/disable" ]; then EN=0; echo SHAMIKO; '
+        'else EN=1; fi; '
+        '"$M" --sqlite "REPLACE INTO settings (key,value) VALUES(\'zygisk\',1)" >/dev/null 2>&1; '
+        '"$M" --sqlite "REPLACE INTO settings (key,value) VALUES(\'denylist\',$EN)" >/dev/null 2>&1; '
+        # Add to the DenyList, then CONFIRM membership — `add` returns non-zero
+        # when the package is already listed (baked into the rooted /data), which
+        # is success, not failure. So trust `denylist ls`, not add's exit code.
+        f'"$M" --denylist add {shlex.quote(pkg)} >/dev/null 2>&1; '
+        f'"$M" --denylist ls 2>/dev/null | grep -q {shlex.quote(pkg)} && echo DENY_OK || echo DENY_FAIL; '
+        'for kv in ro.build.tags=release-keys ro.build.type=user '
+        'ro.boot.verifiedbootstate=green ro.boot.flash.locked=1 '
+        'ro.boot.veritymode=enforcing ro.boot.vbmeta.device_state=locked '
+        'ro.boot.warranty_bit=0 ro.warranty_bit=0 ro.debuggable=0; do '
+        'k=${kv%%=*}; v=${kv#*=}; "$M" resetprop -n "$k" "$v" >/dev/null 2>&1; done; '
+        'echo HIDING_DONE'
+    )
+    r = adb(acct, "shell", f"{su} 0 sh -c {shlex.quote(script)}", timeout=30)
+    out = (r.stdout or "") + (r.stderr or "")
+    if "NO_MAGISK" in out:
+        print(f"[{label}] hiding: su works but the `magisk` applet was not "
+              f"found — boot is rooted by something other than Magisk? "
+              f"DenyList hiding not applied.")
+        return {"enforced": False, "reason": "no_magisk"}
+    ok = "HIDING_DONE" in out
+    deny_ok = "DENY_OK" in out
+    shamiko = "SHAMIKO" in out
+    hider = "Shamiko" if shamiko else "Enforce-DenyList"
+    print(f"[{label}] hiding: {hider} + Zygisk, {pkg} "
+          f"{'on DenyList' if deny_ok else 'DenyList add FAILED'}, "
+          f"root/verified-boot props normalized.")
+    return {"enforced": ok, "denylist": deny_ok, "package": pkg,
+            "shamiko": shamiko}
 
 
 _BOOTSTRAP_LOGIN_MARKER = "OmniBootstrap: session cookie installed"
@@ -1102,13 +1266,12 @@ def cmd_start(args):
     reconcile_runtime()
     ensure_qemu()
     cfg = load_config()
-    dev = _dev_mode_for_play(args)
+    debug = _debug_boot_requested(args)
     if getattr(args, "apk", None):
-        if not dev:
-            return fail("apk_dev_only",
-                        "--apk requires the dev base: pass --dev (or set "
-                        "OMNI_USE_DEV_BASE). Installing a custom APK is a "
-                        "dev-only capability, not available in production.")
+        # --apk installs a custom Roblox build for testing. This works on EVERY
+        # base (root is available on all of them now) and is INDEPENDENT of
+        # --debug: it needs adb/pm install, not the frida devkit. Do not force a
+        # debug boot and do not gate it — see the apk-swap-all-bases note.
         if not Path(args.apk).exists():
             return fail("bad_apk",
                         f"--apk path not found: {args.apk}")
@@ -1172,15 +1335,18 @@ def cmd_start(args):
     # persisted here: the store owns the account's cookie (via `omni login`)
     # and its default place (via `omni session --place`); --place above is a
     # one-off override for THIS launch only.
-    acct = build_acct(args.name, cfg, dev=dev)
+    acct = build_acct(args.name, cfg, debug=debug)
 
     booted, first = _ensure_booted(acct, cfg, label,
                                    timeout=getattr(args, "timeout", None),
                                    accel=getattr(args, "accel", None),
-                                   mode_name=getattr(args, "mode", None))
+                                   mode_name=getattr(args, "mode", None),
+                                   mem=getattr(args, "mem", None),
+                                   balloon=getattr(args, "balloon", None),
+                                   debug=debug)
     result = {"name": args.name, "place_id": sess.get("place_id"),
               "deeplink": roblox_deeplink(sess), "first_boot": first,
-              "arch": acct_arch(acct), "dev": acct_is_dev(acct),
+              "arch": acct_arch(acct), "debug": bool(debug),
               "adb_port": acct["adb_port"], "vnc_port": acct["vnc_port"],
               "session": public_session(sess)}
     if not booted:
@@ -1189,9 +1355,9 @@ def cmd_start(args):
             emit_json(result)
         sys.exit(1)
 
-    # dev-only: install a custom APK on the freshly-booted dev base BEFORE
+    # --apk: install a custom Roblox build on ANY freshly-booted base BEFORE
     # any session is delivered. A failed install must not hand the account a
-    # session it can't actually run -- abort here instead of proceeding.
+    # session it can't actually run -- abort here instead.
     if getattr(args, "apk", None):
         ir = _install_apk(acct, args.apk, label)
         if not ir.get("ok"):
@@ -1210,13 +1376,20 @@ def cmd_start(args):
                    **{k: v for k, v in status.items() if k != "kiosk"}})
     result["kiosk"] = status.get("kiosk")
 
-    # dev-only, LOUD failure check: deliver_session reporting "delivered" only
-    # means the cookie broadcast reached the app -- it says nothing about
-    # whether the app could actually USE it. A plain/stock Roblox APK (no
-    # OmniBootstrap) silently lands on a Sign In page while everything above
-    # reports success. Only probe when --apk was used (dev testing) and
-    # delivery itself succeeded -- never on the trusted/baked prod path, and
-    # never when delivery already failed (that error is the real one).
+    # Only now does the game process exist — the kiosk launches it in response
+    # to the broadcast above. Pinning it to the top-app cpuset any earlier
+    # finds no pid and silently does nothing (see gaming.build_pin_game_step).
+    if resolve_mode(read_config(), getattr(args, "mode", None))["name"] \
+            == "gaming":
+        pin_game_to_top_app(acct, label)
+
+    # LOUD failure check (only when a custom --apk was installed): deliver_session
+    # reporting "delivered" only means the cookie broadcast reached the app -- it
+    # says nothing about whether the app could actually USE it. A plain/stock
+    # Roblox APK (no OmniBootstrap) silently lands on a Sign In page while
+    # everything above reports success. Only probe when --apk was used and
+    # delivery itself succeeded -- never on the trusted/baked path, and never
+    # when delivery already failed (that error is the real one).
     if getattr(args, "apk", None) and result.get("ok"):
         if not _await_bootstrap_login(acct):
             result["ok"] = False
@@ -1235,8 +1408,11 @@ def cmd_start(args):
     # detached process bound to this instance's own VNC port, so N windows for N
     # accounts just work. Default ON for interactive use; suppressed by
     # --no-window and by --json (a machine/automation caller drives via capture).
-    want_window = (not getattr(args, "no_window", False)
-                   and (getattr(args, "window", False) or not json_mode))
+    want_window = _want_vnc_viewer(
+        native_window=_booted_with_native_window(args.name),
+        explicit_window=getattr(args, "window", False),
+        json_mode=json_mode,
+        no_window=getattr(args, "no_window", False))
     viewer_pid = None
     if result["ok"] and want_window:
         try:
@@ -1455,9 +1631,9 @@ def migrate_account(name, cfg, target=None, reprovision=True):
     print(f"[{label}] overlay {old} -> {target}; data.qcow2 preserved")
     if not reprovision:
         return
-    # Boot once (dev) and re-apply settings so the new base's kiosk/system
-    # game/HOME take effect on the existing data disk.
-    spawn_qemu(acct, cfg, dev=True)
+    # Boot once (interactive/builder profile) and re-apply settings so the new
+    # base's kiosk/system game/HOME take effect on the existing data disk.
+    spawn_qemu(acct, cfg, interactive=True)
     first = not acct.get("first_boot_done")
     if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT if first
                          else NORMAL_BOOT_TIMEOUT, label, first_boot=first):
@@ -1567,7 +1743,7 @@ def _build_next_base(cfg, mutate, notes, base_game=None):
 
     try:
         print(f"[{label}] booting builder on {cur}")
-        spawn_qemu(acct, cfg, dev=True)
+        spawn_qemu(acct, cfg, interactive=True)
         if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
             sys.exit(f"[{label}] builder boot failed")
         adb(acct, "root")
@@ -1712,7 +1888,7 @@ def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
     print(f"[{label}] building a throwaway account '{name}' off base '{tag}'")
     acct = _make_persistent_arm_account(name, cfg, tag=tag)
     try:
-        spawn_qemu(acct, cfg, dev=False, mode=resolve_mode(cfg))
+        spawn_qemu(acct, cfg, interactive=False, mode=resolve_mode(cfg))
         if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, label):
             return fail("boot_timeout",
                         f"the throwaway account did not boot; template "
@@ -1778,22 +1954,24 @@ def cmd_update_kiosk(args):
     update_kiosk_base(cfg, args.apk)
 
 
-# ---------- dev/debug base build (arm devkit disk: frida + Magisk) ----------
+# ---------- devkit build + base rooting (frida + Magisk) ----------
 #
-# The dev environment is NOT a separate flattened /system image anymore. It is
-# the SHARED, immutable `base_arm` PLUS one extra virtio disk:
-# `base_arm_devkit.qcow2` (attached to dev accounts as vdc). That disk is an
-# ext4 filesystem BUILT ENTIRELY HOST-SIDE (no guest boot, no root, cross-
-# platform via `mke2fs -d`) carrying:
-#   * frida-server (android-arm64 — the base runs arm64 natively, no libndk),
-#   * Magisk (the APK installer + the extracted arm64 magiskboot/magiskinit/…),
-#   * the omni-* device scripts (hidden frida launch + root/frida hiding),
-#   * a manifest.json (versions, hidden frida port, mount paths).
-# `base_arm.qcow2` is NEVER modified. Root comes from a Magisk-patched boot
-# living in the cheap dev SYSTEM OVERLAY (`base_arm_devsystem.qcow2`, COW on
-# base_arm.qcow2) — see _patch_dev_boot(); the production base stays untouched.
-# Only omni-agent (a dev-only dependency) ever selects it (`create --base dev`),
-# and building it NEVER changes current_base.
+# Two orthogonal build steps, neither of which changes which base ships:
+#
+# `omni build-devkit [--arch arm|x86]` — builds the ATTACHABLE devkit disk
+#   `base_<arch>_devkit.qcow2`, an ext4 image BUILT ENTIRELY HOST-SIDE (no guest
+#   boot, no root, cross-platform via `mke2fs -d`) carrying:
+#     * frida-server for the guest arch (native — no translation),
+#     * Magisk (the APK installer + the extracted magiskboot/magiskinit/…),
+#     * the omni-* device scripts (hidden frida launch + root/frida hiding),
+#     * a manifest.json (versions, hidden frida port, mount paths).
+#   It belongs to no base; `omni start --debug` attaches it as vdc.
+#
+# `omni root-base [--base <tag>]` — bakes root INTO a shipped base by Magisk-
+#   patching its boot into a THIN COW overlay of the production system
+#   (`base_arm_system_rooted.qcow2` — see _patch_boot_into_overlay), plus a
+#   matched rooted /data. The production system image is never modified and
+#   current_base never changes; the base just gains `"rooted": true`.
 
 def _curl_bin():
     """curl path if usable (present on macOS, Linux, and Windows 10+). Preferred
@@ -1850,8 +2028,8 @@ def _download(url, dest, label, timeout=300):
 # rooted first-stage init; magisk is the daemon/su (single binary in v26+, no
 # 32/64 split); init-ld is LD_PRELOAD'd into /init. These are exactly what
 # Magisk's boot_patch.sh injects into the ramdisk (+ stub.apk from assets).
-_MAGISK_ARM64_LIBS = ("magiskboot", "magiskinit", "magiskpolicy",
-                      "magisk", "init-ld", "busybox")
+_MAGISK_LIBS = ("magiskboot", "magiskinit", "magiskpolicy",
+                "magisk", "init-ld", "busybox")
 
 
 def _find_mke2fs():
@@ -1897,38 +2075,53 @@ def _build_ext4_qcow2(staging_dir, out_qcow2, label, min_mb=256):
         raw.unlink(missing_ok=True)
 
 
-def _stage_devkit_arm(frida_version, include_magisk, frida_port, label):
-    """Assemble (host-side) the directory that becomes the devkit disk root:
-    the android-arm64 frida-server ELF, the Magisk APK + its extracted arm64
-    magiskboot/… binaries, the LF-normalized omni-* scripts, and manifest.json.
-    Returns {"dir": <root>, ...}. NOTHING is pushed to a guest here — the whole
-    disk is built from this directory with mke2fs."""
+# frida + Magisk per-arch download coordinates. The base runs its guest arch
+# NATIVELY (arm64 under HVF/KVM, x86_64 under WHPX/KVM), so frida-server must
+# match the guest arch, and Magisk's multicall libs come from the matching ABI
+# dir inside the APK.
+_DEVKIT_ARCH = {
+    "arm": {"frida": "android-arm64", "abi": "arm64-v8a", "manifest_abi": "arm64-v8a"},
+    "x86": {"frida": "android-x86_64", "abi": "x86_64", "manifest_abi": "x86_64"},
+}
+
+
+def _stage_devkit(arch, frida_version, include_magisk, frida_port, label):
+    """Assemble (host-side) the directory that becomes the devkit disk root for
+    `arch` ('arm' | 'x86'): the matching frida-server ELF, the Magisk APK + its
+    extracted multicall binaries for that ABI, the LF-normalized omni-* scripts,
+    and manifest.json. Returns {"dir": <root>, ...}. NOTHING is pushed to a
+    guest here — the whole disk is built from this directory with mke2fs."""
     import tempfile
     import lzma
     import zipfile
+    spec = _DEVKIT_ARCH.get(arch)
+    if not spec:
+        fail("bad_arch", f"devkit arch must be arm|x86, got {arch!r}")
     stg = Path(tempfile.mkdtemp(prefix="omnidevkit_"))
     (stg / "bin").mkdir()
-    out = {"dir": stg, "frida_version": frida_version, "frida_port": frida_port,
-           "magisk": False, "magisk_version": None, "magiskboot": None,
-           "tools": []}
+    out = {"dir": stg, "arch": arch, "frida_version": frida_version,
+           "frida_port": frida_port, "magisk": False, "magisk_version": None,
+           "magiskboot": None, "tools": []}
 
-    # frida-server (android-arm64 — native, no translation), .xz -> bare ELF.
-    xz = stg / f"frida-server-{frida_version}-android-arm64.xz"
+    # frida-server for the guest arch (native, no translation), .xz -> ELF.
+    frida_arch = spec["frida"]
+    xz = stg / f"frida-server-{frida_version}-{frida_arch}.xz"
     url = (f"https://github.com/frida/frida/releases/download/{frida_version}/"
-           f"frida-server-{frida_version}-android-arm64.xz")
+           f"frida-server-{frida_version}-{frida_arch}.xz")
     _download(url, xz, label)
     srv = stg / "frida-server"
     with lzma.open(xz) as zf, open(srv, "wb") as f:
         shutil.copyfileobj(zf, f)
     srv.chmod(0o755)
     xz.unlink()
-    print(f"[{label}] frida-server {frida_version} (arm64) staged "
+    print(f"[{label}] frida-server {frida_version} ({frida_arch}) staged "
           f"({srv.stat().st_size} bytes)")
 
-    # Magisk: keep the full APK (the on-device installer) AND extract the arm64
-    # multicall binaries + the patch scripts. Best-effort; build continues if
-    # the download fails (root/hiding then needs a manually-dropped Magisk).
+    # Magisk: keep the full APK (the on-device installer) AND extract the
+    # matching-ABI multicall binaries + the patch scripts. Best-effort; build
+    # continues if the download fails (root/hiding then needs a dropped Magisk).
     if include_magisk:
+        abi = spec["abi"]
         try:
             meta = _http_json(
                 "https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
@@ -1944,8 +2137,8 @@ def _stage_devkit_arm(frida_version, include_magisk, frida_port, label):
             _download(apk_asset["browser_download_url"], apk, label)
             with zipfile.ZipFile(apk) as z:
                 names = set(z.namelist())
-                for tool in _MAGISK_ARM64_LIBS:
-                    member = f"lib/arm64-v8a/lib{tool}.so"
+                for tool in _MAGISK_LIBS:
+                    member = f"lib/{abi}/lib{tool}.so"
                     if member in names:
                         dst = stg / "bin" / tool
                         dst.write_bytes(z.read(member))
@@ -1968,11 +2161,11 @@ def _stage_devkit_arm(frida_version, include_magisk, frida_port, label):
             out["magiskboot"] = mb if mb.exists() else None
             out["boot_patchable"] = not missing
             print(f"[{label}] Magisk {meta.get('tag_name')} staged from "
-                  f"{apk_asset['name']} (arm64 "
-                  f"{', '.join(t for t in _MAGISK_ARM64_LIBS if (stg/'bin'/t).exists())})")
+                  f"{apk_asset['name']} ({abi} "
+                  f"{', '.join(t for t in _MAGISK_LIBS if (stg/'bin'/t).exists())})")
             if missing:
                 print(f"[{label}] NOTE: boot-patch files missing {missing} — "
-                      f"--patch-boot may not work with this Magisk build.")
+                      f"root-base may not work with this Magisk build.")
         except Exception as e:
             print(f"[{label}] WARNING: Magisk staging failed ({e}); the devkit "
                   f"disk will ship without Magisk — root + hiding are then "
@@ -1992,9 +2185,9 @@ def _stage_devkit_arm(frida_version, include_magisk, frida_port, label):
         out["tools"].append(name)
 
     manifest = {
-        "devkit": "omnidroid-dev-base-arm",
+        "devkit": f"omnidroid-devkit-{arch}",
         "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "arch": "arm64-v8a",
+        "arch": spec["manifest_abi"],
         "frida_version": frida_version,
         "frida_port": frida_port,
         "frida_server": "frida-server",
@@ -2004,132 +2197,38 @@ def _stage_devkit_arm(frida_version, include_magisk, frida_port, label):
         "magisk_apk": "magisk.apk" if out["magisk"] else None,
         "mount": DEVKIT_MOUNT,
         "work": DEVKIT_WORK,
-        "root": "Magisk (patched boot in the dev system overlay)",
+        "root": "Magisk (baked into the shipped rooted boot)",
         "hide": "Magisk DenyList/Shamiko (hides root, Magisk, and frida)",
         "launch": "omni-fridad (start hidden) / omni-frida-stop",
-        "note": "dev/debug base only; never shipped. Delivered as the vdc disk.",
+        "note": "attached as the vdc disk only on a --debug boot.",
     }
     (stg / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return out
 
 
-def _dev_base_entry(raw, arm, devkit_disk, dev_data, frida_version,
-                    frida_port, magisk, magisk_version, rooted):
-    """Build the bases['dev'] entry, PRESERVING fields an existing dev
-    registration already carries.
+def build_devkit(cfg, arch=None, frida_version=DEFAULT_FRIDA_VERSION,
+                 frida_port=DEFAULT_FRIDA_PORT, include_magisk=True):
+    """Build the ATTACHABLE devkit disk for `arch` (default: the host arch).
 
-    `base_disk` and `notes` are deliberately sticky. The dev system image is
-    STANDALONE -- it carries its own copy of every partition and shadows the
-    shared base (see _brand_target) -- so its base_disk is an independent
-    choice, NOT something to inherit from the arm base on every rebuild.
-    Copying arm's base_disk here silently repoints dev from base_arm.qcow2 to
-    base_arm_v2.qcow2, changing which image the dev guest boots with no log
-    line and no opt-in.
+    This is the debug toolkit only (frida-server + the omni-* scripts + the
+    Magisk multicall binaries), assembled fully host-side (no boot, no root) as
+    a populated ext4 qcow2. It belongs to NO base entry: `omni start --debug`
+    attaches it as vdc. It never changes any base or current_base — rooting the
+    shipped image is a separate step (`omni root-base`).
 
-    `system` is deliberately NOT sticky: build-dev-base owns which devsystem
-    file the dev base uses, so a temporary repoint (a probe image) never
-    becomes permanent by way of a rebuild.
-    """
-    prev = (raw.get("bases") or {}).get(DEV_BASE_TAG) or {}
-    marker = ROOTED_MARKER if rooted else ROOT_PENDING_MARKER
-    stale = ROOT_PENDING_MARKER if rooted else ROOTED_MARKER
-    default_notes = (f"arm dev base: base_arm + {devkit_disk} (vdc) with "
-                     f"frida {frida_version} (arm64) + Magisk{marker}"
-                     f". omni-agent only; NOT shipped. hidden frida port "
-                     f"{frida_port}.")
-    # A preserved note must not outlive the fact it asserts: re-point the root
-    # marker at reality so `notes` can never contradict devkit_manifest.rooted.
-    prev_notes = prev.get("notes")
-    if prev_notes and stale in prev_notes:
-        prev_notes = prev_notes.replace(stale, marker)
-    return {
-        "type": BASE_TYPE_ARM,
-        "base_disk": prev.get("base_disk") or arm["base_disk"],
-        "system": ARM_DEVSYSTEM_DISK,
-        "data": dev_data,
-        "efivars": arm.get("efivars", ARM_BASE_EFIVARS),
-        "devkit": devkit_disk,
-        "src": "base_arm + devkit disk (frida + Magisk + omni tools)",
-        "notes": prev_notes or default_notes,
-        "devkit_manifest": {
-            "frida_version": frida_version,
-            "frida_port": frida_port,
-            "magisk": bool(magisk),
-            "magisk_version": magisk_version,
-            "rooted": rooted,
-            "tools": ["frida-server", "omni-fridad", "omni-frida-stop",
-                      "omni-hide", "omni-magisk-setup"],
-        },
-    }
-
-
-def build_dev_base(cfg, frida_version=DEFAULT_FRIDA_VERSION,
-                   frida_port=DEFAULT_FRIDA_PORT, include_magisk=True,
-                   keep_builder=False, patch_boot=False):
-    """Build the arm dev environment WITHOUT touching base_arm: assemble the
-    devkit disk (frida + Magisk + omni tools) fully host-side, create the cheap
-    dev system overlay that will carry the Magisk-patched (rooted) boot, and
-    register the 'dev' base. current_base is never changed.
-
-    patch_boot=True additionally runs the Magisk boot patch on the dev overlay
-    (roots it). That step edits the boot partition and is brick-risky, so it is
-    OFF by default — see _patch_dev_boot()."""
-    label = "build-dev-base"
-    bases = cfg.get("bases", {})
-    if ARM_BASE_TAG not in bases or base_type(bases[ARM_BASE_TAG]) != BASE_TYPE_ARM:
-        fail("no_base", f"the arm base '{ARM_BASE_TAG}' is not registered; the "
-                        f"dev base is built on top of it. Known: {list(bases)}")
-    arm = bases[ARM_BASE_TAG]
+    Returns the absolute path of the disk it wrote."""
+    arch = arch or host_arch_token()
+    label = f"build-devkit:{arch}"
     images = Path(cfg["images_dir"])
-    for k in ("base_disk", "system", "data"):
-        if not (images / arm[k]).exists():
-            fail("no_base", f"arm base file missing: {images / arm[k]}")
-
-    print(f"[{label}] staging devkit (frida {frida_version} arm64"
+    print(f"[{label}] staging devkit (frida {frida_version} {arch}"
           f"{', + Magisk' if include_magisk else ', no Magisk'})...")
-    staging = _stage_devkit_arm(frida_version, include_magisk, frida_port, label)
-
+    staging = _stage_devkit(arch, frida_version, include_magisk, frida_port, label)
     try:
-        # 1) The extra disk (vdc): a populated ext4 qcow2, built entirely on the
-        #    host (no boot, no root). This is the whole "dev toolkit".
-        devkit_disk = images / ARM_DEVKIT_DISK
+        devkit_disk = images / devkit_disk_name(arch)
         _build_ext4_qcow2(staging["dir"], devkit_disk, label)
-
-        # 2) The dev system overlay: a copy of the provisioned arm system overlay
-        #    (thin, still COW-backed by the immutable base_arm.qcow2). It will
-        #    hold the Magisk-patched boot. base_arm.qcow2 is NEVER modified.
-        devsystem = images / ARM_DEVSYSTEM_DISK
-        if not devsystem.exists():
-            shutil.copyfile(images / arm["system"], devsystem)
-            print(f"[{label}] created dev system overlay {ARM_DEVSYSTEM_DISK} "
-                  f"(COW on {arm['base_disk']}; base stays immutable)")
-
-        rooted = False
-        if patch_boot:
-            rooted = _patch_dev_boot(cfg, images, devsystem, staging, label)
-        else:
-            print(f"[{label}] SKIPPED boot patch (root). The dev base is built "
-                  f"and usable for tooling; to ROOT it (needed for frida to "
-                  f"attach and for on-device hiding) run: "
-                  f"omni build-dev-base --patch-boot  (brick-risky; see DEV-BASE.md)")
-
-        # 3) Register the dev base: arm base + the devkit disk (+ rooted overlay).
-        raw = read_config()
-        dev_data = (ARM_DEVDATA_DISK if (images / ARM_DEVDATA_DISK).exists()
-                    else arm["data"])
-        raw.setdefault("bases", {})[DEV_BASE_TAG] = _dev_base_entry(
-            raw, arm, devkit_disk=ARM_DEVKIT_DISK, dev_data=dev_data,
-            frida_version=frida_version, frida_port=frida_port,
-            magisk=bool(staging.get("magisk")),
-            magisk_version=staging.get("magisk_version"), rooted=rooted)
-        # HARD RULE: do NOT change current_base — the shipped product stays on
-        # the production base. The dev base is opt-in via `--base dev` only.
-        CONFIG_PATH.write_text(json.dumps(raw, indent=2))
-        print(f"[{label}] DONE. Registered base '{DEV_BASE_TAG}' = base_arm + "
-              f"{ARM_DEVKIT_DISK} (vdc){' [ROOTED]' if rooted else ''}")
-        print(f"[{label}] current_base UNCHANGED (still '{raw.get('current_base')}').")
-        print(f"[{label}] use it: omni create <name> --base {DEV_BASE_TAG}")
-        return DEV_BASE_TAG
+        print(f"[{label}] DONE. Built {devkit_disk.name}. It attaches as vdc on "
+              f"`omni start --debug` / agent debug=true. No base was changed.")
+        return devkit_disk
     finally:
         shutil.rmtree(staging["dir"], ignore_errors=True)
 
@@ -2185,6 +2284,13 @@ def _gpt_partition(raw_path, name):
 BOOTANIM_FS = "product"                      # logical partition inside super
 BOOTANIM_PATH = "/media/bootanimation.zip"   # path INSIDE that filesystem
 BOOTANIM_SELINUX = "u:object_r:system_file:s0"
+
+# Logical partition inside `super` that carries build.prop. `system`, not
+# `product`: the boot animation lives in product, but the properties the
+# framework reads at startup come from the system image.
+LEAN_PROP_FS = "system"
+
+
 
 
 def _debugfs_bin():
@@ -2644,6 +2750,163 @@ def _bake_apk_into_product(raw_path, fs_off, apk, app_name, label):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def bake_data_game(cfg, tag, apk, pkg, label):
+    """Boot a builder, install the game into /DATA, bake `omni_game_package`,
+    and keep the resulting THIN overlay. Returns the overlay path or None.
+
+    Why /data rather than the system image: `omni bake-game` writes the APK
+    into /product inside the 2.3 GB system image, so every Roblox update means
+    a new base and ~6 GiB of scratch. An `pm install -r -d` lands an UPDATED
+    SYSTEM APP in /data/app, does the same job for a kiosk that launches by
+    package name, and the package name never changes between Roblox versions —
+    so an update is one run of this command, and the overlay is only about as
+    big as the APK.
+
+    Uses no root: `pm install` and `settings put global` both work as uid
+    shell, so this works on an unrooted deployment too."""
+    images = Path(cfg["images_dir"])
+    base = cfg["bases"][tag]
+    src_name = data_bake_source(base)
+    src = images / src_name
+    if not src.exists():
+        print(f"[{label}] pristine /data not found: {src}")
+        return None
+    # Build the overlay in images/ so its backing reference stays inside the
+    # image directory, and under a .tmp name so a failed bake never clobbers
+    # the /data that is currently shipping.
+    out = images / ARM_GAME_DATA
+    tmp = out.with_suffix(".tmp.qcow2")
+    bname = "_gamedata"
+    d = account_dir(bname)
+    try:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+        adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+        acct = {"name": bname, "base": tag, "adb_port": adb_port,
+                "qmp_port": qmp_port, "vnc_port": vnc_port,
+                "game_package": pkg, "first_boot_done": True}
+        save_account(acct)
+        make_overlay(d / "system.qcow2", images / base["system"])
+        make_overlay(d / "data.qcow2", src)
+        shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
+                        d / "efivars.fd")
+        _spawn_builder_with_disks(acct, cfg, [], label)
+        if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
+            print(f"[{label}] builder did not boot; nothing captured.")
+            return None
+        guest_apk = None
+        if apk:
+            guest_apk = "/data/local/tmp/omni-game.apk"
+            print(f"[{label}] pushing {apk.name} "
+                  f"({apk.stat().st_size // (1024*1024)} MB)...")
+            adb(acct, "push", str(apk), guest_apk, timeout=900)
+        script = build_game_bake_script(pkg, guest_apk)
+        r = adb(acct, "shell", "sh", "-c", shlex.quote(script), timeout=900)
+        out_text = ((r.stdout or "") + (r.stderr or "")).strip()
+        print(f"[{label}] guest: {out_text[-300:]}")
+        if GAME_BAKE_INSTALL_FAILED in out_text:
+            print(f"[{label}] the APK was REJECTED by the guest. The commonest "
+                  f"cause is a signature mismatch: a replacement must be "
+                  f"signed with the SAME key as the build baked into the "
+                  f"system image (an officially-signed Roblox will not "
+                  f"install over a re-signed one, or the reverse). Nothing "
+                  f"was captured; the shipping /data is untouched.")
+            _shutdown(acct, label)
+            return None
+        if GAME_BAKE_OK not in out_text:
+            print(f"[{label}] the bake did not confirm — NOT capturing this "
+                  f"/data. The shipping image is untouched.")
+            _shutdown(acct, label)
+            return None
+        _shutdown(acct, label)
+        # Keep the overlay itself: it is thin (only the APK + settings differ
+        # from the pristine /data). Rewrite its backing reference to a bare
+        # filename so the image directory stays relocatable, same convention
+        # as base_arm_system_zram.qcow2.
+        shutil.move(str(d / "data.qcow2"), str(tmp))
+        subprocess.run([qemu_bin("qemu-img"), "rebase", "-u",
+                        "-b", src_name, "-F", "qcow2", str(tmp)],
+                       check=True, capture_output=True)
+        tmp.replace(out)
+        size_mb = out.stat().st_size // (1024 * 1024)
+        print(f"[{label}] captured -> {out.name} ({size_mb} MB thin overlay "
+              f"on {src_name})")
+        return out
+    except Exception as e:  # noqa: BLE001
+        print(f"[{label}] /data game bake failed ({type(e).__name__}: {e}).")
+        tmp.unlink(missing_ok=True)
+        return None
+    finally:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def cmd_bake_data_game(args):
+    """Install the game into the base's /DATA and bake `omni_game_package`.
+
+    This is the update-friendly counterpart to `bake-game`: re-run it with a
+    newer APK and it starts again from the PRISTINE rooted /data (see
+    data_bake_source), so updates never chain overlays and never rebuild the
+    2.3 GB system image.
+
+        omni bake-data-game ~/Downloads/roblox-2.727.apk
+        omni bake-data-game                 # just the kiosk setting, no APK
+    """
+    ensure_qemu()
+    cfg = load_config()
+    tag = getattr(args, "base", None) or effective_base_tag(cfg)
+    base = (cfg.get("bases") or {}).get(tag)
+    if not base:
+        return fail("no_base", f"no base '{tag}'")
+    if base_type(base) != BASE_TYPE_ARM:
+        return fail("arch_boundary",
+                    f"base '{tag}' is not arm; this command only knows the "
+                    f"arm /data layout")
+    pkg = resolve_bake_package(getattr(args, "package", None), tag, cfg)
+    if not pkg:
+        return fail("engine_error",
+                    "no game package: pass --package, or set base_game."
+                    f"{tag} in configs/paths.json")
+    apk = None
+    if getattr(args, "apk", None):
+        apk = Path(args.apk)
+        if not apk.exists():
+            return fail("engine_error", f"apk not found: {apk}")
+        try:
+            import zipfile
+            with zipfile.ZipFile(apk) as z:
+                if "AndroidManifest.xml" not in z.namelist():
+                    return fail("engine_error", f"{apk} is not an APK")
+        except zipfile.BadZipFile:
+            return fail("engine_error", f"{apk} is not a valid APK (bad zip)")
+    live = [a["name"] for a in all_accounts() if running_pid(a["name"])]
+    if live:
+        return fail("instance_running",
+                    f"stop running instances first: {', '.join(live)}")
+    label = f"bake-data-game {tag}"
+    out = bake_data_game(cfg, tag, apk, pkg, label)
+    if not out:
+        return fail("engine_error", "bake failed; see the log above")
+    # Point the base at the baked /data. data_bake_source() keeps the pristine
+    # image recorded, so the NEXT bake still starts from it.
+    raw = json.loads(CONFIG_PATH.read_text())
+    entry = raw.setdefault("bases", {}).setdefault(tag, {})
+    entry.setdefault("root_manifest", {}).setdefault(
+        "rooted_data", data_bake_source(base))
+    entry["data"] = ARM_GAME_DATA
+    entry["game_baked"] = {"package": pkg,
+                           "apk": apk.name if apk else None}
+    CONFIG_PATH.write_text(json.dumps(raw, indent=2))
+    print(f"[{label}] base '{tag}' now boots {ARM_GAME_DATA} "
+          f"(game {pkg}{', apk ' + apk.name if apk else ''})")
+    print(f"[{label}] to update the game later, just re-run this command with "
+          f"the new APK — no base rebuild.")
+    if getattr(args, "json", False):
+        emit_json({"ok": True, "base": tag, "data": ARM_GAME_DATA,
+                   "package": pkg, "apk": apk.name if apk else None})
+
+
 def cmd_bake_game(args):
     """Bake the game APK into an arm image as a pre-installed system app, so a
     production instance ships with it and boots straight into it.
@@ -2845,9 +3108,7 @@ def cmd_brand_base(args):
     free = shutil.disk_usage(images).free
     need = 6 * 1024 ** 3
     if free < need:
-        return fail("engine_error",
-                    f"need ~{need // 1024**3} GiB free in {images} for the raw "
-                    f"round-trip, have {free // 1024**3} GiB")
+        return fail("engine_error", _scratch_help(images, free, need))
 
     import tempfile
     work = Path(tempfile.mkdtemp(prefix="omni-brand-", dir=str(images)))
@@ -2910,46 +3171,39 @@ def cmd_brand_base(args):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _patch_dev_boot(cfg, images, devsystem, staging, label):
-    """Root the dev system overlay by Magisk-patching its boot partition (vda6),
-    keeping base_arm.qcow2 immutable. Bootstrap-free + cross-platform: export the
-    overlay to raw (merged through its base backing), pull the boot image out via
-    GPT, patch it with magiskboot INSIDE a throwaway arm guest (magiskboot only
-    needs to run on a FILE — no in-guest root), write the patched image back, and
-    re-import to qcow2. Returns True on success. Brick-risky + must be verified on
-    a real boot; any failure leaves the UNROOTED overlay intact and returns False.
+def _patch_boot_into_overlay(cfg, images, rooted_system, prod_system, staging,
+                             label):
+    """Magisk-patch the boot partition (vda6) of `rooted_system`, a THIN COW
+    overlay of the production system `prod_system`. The production lineage is
+    preserved — we never flatten and never touch prod_system.
+
+    Cross-platform + bootstrap-free (no nbd/libguestfs): read the current boot
+    image out of prod via a raw export + GPT, patch it with Magisk's
+    boot_patch.sh INSIDE a throwaway arm guest (magiskboot patches a FILE, so no
+    in-guest root), pull the patched boot back to the host, then write it INTO
+    the rooted overlay at the vda6 offset with `qemu-io write`. qemu-io opens the
+    qcow2 respecting its backing chain and lands the write in the TOP overlay
+    only (COW), so the overlay stays thin AND the write needs no guest root (the
+    earlier in-guest `dd` approach failed: the builder shell is not root, so it
+    cannot write /dev/block/*). Returns True on success; any failure leaves the
+    overlay unrooted (it can just be deleted).
     """
     if not staging.get("magisk") or not staging.get("magiskboot"):
         print(f"[{label}] cannot patch boot: Magisk (magiskboot) was not staged.")
         return False
     import tempfile
-    # The offline method exports the full disk to raw (~5 GiB) then reimports a
-    # patched qcow2 (~2 GiB) — needs real headroom. Fail cleanly (don't fill the
-    # disk) if it isn't there.
-    vsize = 0
-    try:
-        info = json.loads(subprocess.run(
-            [qemu_bin("qemu-img"), "info", "--output=json", str(devsystem)],
-            capture_output=True, text=True, check=True).stdout)
-        vsize = int(info.get("virtual-size", 0))
-    except Exception:
-        pass
-    need = int(vsize * 1.6) or (7 * 1024**3)
-    free = shutil.disk_usage(images).free
-    if free < need:
-        print(f"[{label}] NOT enough free disk for the offline boot patch: need "
-              f"~{need // 1024**3} GiB, have {free // 1024**3} GiB free in "
-              f"{images}. Free space (or root on a machine with headroom) and "
-              f"re-run `omni build-dev-base --patch-boot`. Overlay left UNROOTED.")
-        return False
     work = Path(tempfile.mkdtemp(prefix="omni_bootpatch_"))
-    bname = "_devbootpatch"
+    bname = "_rootpatch"
     d = account_dir(bname)
     try:
-        full = work / "vda.raw"
-        print(f"[{label}] exporting dev overlay -> raw (merged) to read boot...")
+        # Read the CURRENT boot image out of the production system (raw export
+        # merged through its backing chain), located via GPT. The overlay shares
+        # the identical partition layout (it is a COW child), so this offset is
+        # valid for writing back into the overlay too.
+        full = work / "prod.raw"
+        print(f"[{label}] exporting prod system -> raw (merged) to read boot...")
         subprocess.run([qemu_bin("qemu-img"), "convert", "-O", "raw",
-                        str(devsystem), str(full)], check=True)
+                        str(prod_system), str(full)], check=True)
         part = _gpt_partition(full, "boot")
         if not part:
             print(f"[{label}] boot partition not found in GPT; aborting patch.")
@@ -2959,12 +3213,13 @@ def _patch_dev_boot(cfg, images, devsystem, staging, label):
         with open(full, "rb") as sf, open(boot_img, "wb") as bf:
             sf.seek(off)
             bf.write(sf.read(size))
+        full.unlink(missing_ok=True)   # the raw export is only needed for read
         print(f"[{label}] boot partition @ {off} ({size} bytes) extracted")
 
-        # Boot a throwaway arm builder (plain base_arm) to run Magisk's
-        # boot_patch.sh. It patches a boot.img FILE using the pushed toolset, so
-        # NO in-guest root is needed (magiskboot/magiskinit run as the shell user
-        # from /data/local/tmp — the same domain frida-server runs in).
+        # Throwaway arm builder: boots production (its own COW system+data) just
+        # to RUN boot_patch.sh on the boot.img FILE. No in-guest root is needed
+        # (magiskboot patches a file); the overlay is NOT attached to the guest —
+        # the write-back happens host-side below.
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
@@ -2974,22 +3229,19 @@ def _patch_dev_boot(cfg, images, devsystem, staging, label):
                 "first_boot_done": True}
         save_account(acct)
         arm = cfg["bases"][ARM_BASE_TAG]
-        shutil.copyfile(images / arm["system"], d / "system.qcow2")
-        shutil.copyfile(images / arm["data"], d / "data.qcow2")
+        make_overlay(d / "system.qcow2", prod_system)
+        make_overlay(d / "data.qcow2", images / arm["data"])
         shutil.copyfile(images / arm.get("efivars", ARM_BASE_EFIVARS),
                         d / "efivars.fd")
 
         print(f"[{label}] booting arm builder to run boot_patch.sh (headless)")
-        spawn_qemu(acct, cfg, dev=True)
+        spawn_qemu(acct, cfg, interactive=True)
         if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
             print(f"[{label}] builder boot failed; aborting patch.")
             return False
         W = "/data/local/tmp/omni-bootpatch"
         adb(acct, "shell", f"rm -rf {W}; mkdir -p {W}", timeout=15)
         adb(acct, "push", str(boot_img), f"{W}/boot.img", timeout=300)
-        # Push the full Magisk patch toolset (magiskboot, magiskinit, magisk,
-        # init-ld, stub.apk, boot_patch.sh, util_functions.sh) — boot_patch.sh
-        # injects magisk/init-ld/stub into the ramdisk and swaps init.
         bindir = Path(staging["dir"]) / "bin"
         for f in sorted(bindir.iterdir()):
             if f.is_file():
@@ -3002,33 +3254,38 @@ def _patch_dev_boot(cfg, images, devsystem, staging, label):
                 timeout=240)
         out = (r.stdout or "") + (r.stderr or "")
         print(f"[{label}] boot_patch.sh:\n{out.strip()[-2000:]}")
+        # Pull the patched boot back to the host.
         patched = work / "new-boot.img"
         adb(acct, "pull", f"{W}/new-boot.img", str(patched), timeout=120)
         _shutdown(acct, label)
         if not patched.exists() or patched.stat().st_size == 0:
-            print(f"[{label}] patched boot not produced; aborting (overlay left "
-                  f"UNROOTED).")
+            print(f"[{label}] patched boot not produced; aborting (overlay "
+                  f"unrooted).")
             return False
         if patched.stat().st_size > size:
             print(f"[{label}] patched boot ({patched.stat().st_size}) exceeds "
                   f"partition ({size}); aborting to avoid corruption.")
             return False
-        # Write the patched boot back into the raw disk (same offset, in place)
-        # then re-import to qcow2 (standalone, dev-only).
-        with open(full, "r+b") as sf, open(patched, "rb") as pf:
-            sf.seek(off)
-            sf.write(pf.read())
-        print(f"[{label}] re-importing rooted disk -> {devsystem.name}")
-        tmp_qcow = devsystem.with_suffix(".rooted.tmp.qcow2")
-        subprocess.run([qemu_bin("qemu-img"), "convert", "-O", "qcow2", "-c",
-                        str(full), str(tmp_qcow)], check=True)
-        tmp_qcow.replace(devsystem)
-        print(f"[{label}] boot patched (Magisk). VERIFY on a real boot: create a "
-              f"dev account, `omni adb <n> -- shell su -c id` should show uid=0.")
+        # HOST-SIDE write-back into the qcow2 overlay via qemu-io. The write goes
+        # into the TOP overlay only (COW over prod_system), so it stays thin and
+        # needs no guest root. `write -s <file> <offset> <len>` copies the file's
+        # bytes in at the byte offset.
+        wlen = patched.stat().st_size
+        cmd = (f"write -s {shlex.quote(str(patched))} {off} {wlen}")
+        wb = subprocess.run([qemu_bin("qemu-io"), "-c", cmd, str(rooted_system)],
+                            capture_output=True, text=True)
+        print(f"[{label}] qemu-io write -> {rooted_system.name} @ {off}:\n"
+              f"{(wb.stdout or '').strip()}{(wb.stderr or '').strip()}")
+        if wb.returncode != 0:
+            print(f"[{label}] qemu-io write-back failed (rc {wb.returncode}); "
+                  f"delete {rooted_system.name} and retry.")
+            return False
+        print(f"[{label}] boot patched into {rooted_system.name} (thin overlay, "
+              f"prod lineage preserved).")
         return True
     except Exception as e:
-        print(f"[{label}] boot patch FAILED ({type(e).__name__}: {e}); the dev "
-              f"overlay is left UNROOTED (safe).")
+        print(f"[{label}] boot patch FAILED ({type(e).__name__}: {e}); the "
+              f"rooted overlay is left unrooted (safe to delete).")
         return False
     finally:
         if d.exists():
@@ -3036,32 +3293,1017 @@ def _patch_dev_boot(cfg, images, devsystem, staging, label):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def cmd_build_dev_base(args):
+def _spawn_builder_with_disks(acct, cfg, extra_disks, label):
+    """Spawn a throwaway arm builder guest (interactive profile) with EXTRA
+    QEMU -drive/-device args appended — used to attach the rooted overlay as a
+    write target. Thin wrapper: build the normal command, splice in the extras
+    before -name, and Popen it like spawn_qemu does."""
+    from omnidroid.qemu_proc import qemu_command
+    from omnidroid.runtime import runtime_dir
+    rd = runtime_dir(acct["name"])
+    rd.mkdir(parents=True, exist_ok=True)
+    cmd = qemu_command(acct, cfg, interactive=True)
+    # Insert the extra disks just before the trailing -name flag.
+    ni = cmd.index("-name") if "-name" in cmd else len(cmd)
+    cmd = cmd[:ni] + list(extra_disks) + cmd[ni:]
+    log = open(rd / "qemu.log", "w")
+    kwargs = {"start_new_session": True}
+    if IS_WINDOWS:
+        kwargs = {"creationflags": 0x00000008 | 0x00000200}
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log, **kwargs)
+    (rd / "run.json").write_text(json.dumps(
+        {"pid": proc.pid, "started": time.time(),
+         "identity": f"omni-{acct['name']}", "base": acct["base"],
+         "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
+         "vnc_port": acct["vnc_port"]}))
+    return proc.pid
+
+
+def root_base(cfg, tag=None, frida_version=DEFAULT_FRIDA_VERSION,
+              frida_port=DEFAULT_FRIDA_PORT):
+    """Make a shipped base DUAL-USE by ROOTING its image: Magisk-patch the boot
+    into a thin rooted system overlay and register the base as rooted. The base
+    stays the same production image (same backing chain, same /data provisioning)
+    — root is simply baked in, hidden from the game by _enforce_hiding on every
+    boot. current_base is unchanged; nothing about which base ships changes.
+
+    arm today (the boot-patch flow is arm-uefi). Brick-risky (it edits a boot
+    partition) and must be verified on a real boot — see DEV-BASE.md's successor
+    notes. Returns the rooted system disk path on success.
+    """
+    tag = tag or effective_base_tag(cfg) or ARM_BASE_TAG
+    label = f"root-base:{tag}"
+    bases = cfg.get("bases", {})
+    if tag not in bases:
+        fail("no_base", f"no base '{tag}' to root. Known: {list(bases)}")
+    base = bases[tag]
+    if base_type(base) != BASE_TYPE_ARM:
+        # x86 (Bliss) boots kernel + initrd, not a GPT boot partition, so the
+        # arm boot-patch flow does not apply. Rooting Bliss means Magisk-patching
+        # its initrd ramdisk into base_x86_rooted.initrd.img (auto-registered
+        # when present) — a distinct, host-arch-specific build step. The devkit
+        # (frida + omni-* tools) is arch-generic and already builds for x86 via
+        # `omni build-devkit --arch x86`; only the rooted initrd is x86-only.
+        fail("arch_boundary",
+             f"root-base's boot-patch flow is arm-uefi only; '{tag}' is "
+             f"{arch_of_base(base)}. For x86, produce base_x86_rooted.initrd.img "
+             f"by Magisk-patching the Bliss initrd on an x86 host; it is picked "
+             f"up automatically. (The x86 devkit already builds with "
+             f"`omni build-devkit --arch x86`.)")
+    images = Path(cfg["images_dir"])
+    prod_system = images / base["system"]
+    if not prod_system.exists():
+        fail("no_base", f"base system image missing: {prod_system}")
+
+    print(f"[{label}] staging devkit toolset (Magisk) for the boot patch...")
+    staging = _stage_devkit("arm", frida_version, True, frida_port, label)
+    try:
+        # Thin COW overlay of the CURRENT production system — this is where the
+        # rooted boot lands; the production system image is never modified.
+        rooted_system = images / ARM_ROOTED_SYSTEM
+        if rooted_system.exists():
+            print(f"[{label}] {ARM_ROOTED_SYSTEM} exists; rebuilding it fresh.")
+            rooted_system.unlink()
+        make_overlay(rooted_system, prod_system)
+        print(f"[{label}] created thin rooted overlay {ARM_ROOTED_SYSTEM} "
+              f"(COW on {base['system']})")
+
+        if not _patch_boot_into_overlay(cfg, images, rooted_system, prod_system,
+                                        staging, label):
+            rooted_system.unlink(missing_ok=True)
+            fail("root_failed", "boot patch failed; base left unrooted "
+                                "(see the log above).")
+
+        # Rooted /data: the pre-granted matched /data. A rooted SYSTEM alone is
+        # NOT shippable — an ungranted /data makes su PROMPT on every production
+        # boot. So the base is only registered rooted when the granted /data
+        # exists. Prefer an already-built one; else bake it now.
+        rooted_data = images / ARM_ROOTED_DATA
+        if not rooted_data.exists():
+            _bake_rooted_data(cfg, images, base, rooted_system, staging, label)
+        data_ok = rooted_data.exists()
+
+        if not data_ok:
+            # Keep the (verified) rooted system overlay on disk so a later
+            # `root-base` re-run can reuse it, but DO NOT flip the base to rooted
+            # — that would strand production on the su prompt.
+            print(f"[{label}] boot patch OK, but the pre-granted rooted /data "
+                  f"could not be produced (the MagiskSU Grant needs the Magisk "
+                  f"manager app installed to show its dialog). Base left "
+                  f"UNROOTED. Fix: `omni build-devkit --arch arm` so "
+                  f"omni-magisk-setup can install the app, then re-run "
+                  f"`omni root-base`. {ARM_ROOTED_SYSTEM} is kept for reuse.")
+            return None
+
+        # Re-register the base as rooted, pointing at the rooted matched pair.
+        raw = read_config()
+        entry = raw["bases"][tag]
+        entry["system"] = ARM_ROOTED_SYSTEM
+        entry["data"] = ARM_ROOTED_DATA
+        entry["rooted"] = True
+        notes = entry.get("notes", "")
+        if ROOT_PENDING_MARKER in notes:
+            notes = notes.replace(ROOT_PENDING_MARKER, ROOTED_MARKER)
+        elif ROOTED_MARKER not in notes:
+            notes += ROOTED_MARKER
+        entry["notes"] = notes
+        entry["root_manifest"] = {
+            "magisk_version": staging.get("magisk_version"),
+            "frida_version": frida_version, "frida_port": frida_port,
+            "rooted_system": ARM_ROOTED_SYSTEM,
+            "rooted_data": ARM_ROOTED_DATA,
+        }
+        CONFIG_PATH.write_text(json.dumps(raw, indent=2))
+        print(f"[{label}] DONE. Base '{tag}' is now ROOTED (dual-use). "
+              f"current_base UNCHANGED ('{raw.get('current_base')}'). VERIFY on "
+              f"a real boot: `omni start <name>` then `omni adb <name> -- shell "
+              f"/debug_ramdisk/su 0 id` should show uid=0.")
+        return rooted_system
+    finally:
+        shutil.rmtree(staging["dir"], ignore_errors=True)
+
+
+def _grant_su_via_dialog(acct, label, tries=8):
+    """Headlessly approve MagiskSU's first-request dialog (SuRequestActivity).
+
+    On a fresh /data the first `su` pops a GUI approval dialog and blocks. We
+    trigger it in the BACKGROUND (so nothing hangs), then find the Grant button
+    with `uiautomator dump` and tap its centre — the same thing a human does over
+    VNC, done headlessly. Returns True if su works afterward. This is the one
+    step the old dev /data needed a manual tap for."""
+    import re as _re
+    # Trigger the prompt without blocking: fire su in the background. It will sit
+    # on the dialog; our tap releases it.
+    for cand in SU_CANDIDATES:
+        adb(acct, "shell",
+            f"(setsid {cand} 0 id >/data/local/tmp/su_probe 2>&1 &) ; true",
+            timeout=8)
+    for _ in range(tries):
+        time.sleep(3)
+        try:
+            adb(acct, "shell", "uiautomator dump /data/local/tmp/ui.xml",
+                timeout=20)
+            r = adb(acct, "shell", "cat /data/local/tmp/ui.xml", timeout=15)
+        except Exception:  # noqa: BLE001
+            continue
+        xml = r.stdout or ""
+        # Find the Grant node: text/content-desc/resource-id mentioning grant.
+        node = None
+        for m in _re.finditer(r'<node[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"[^>]*/?>',
+                              xml):
+            seg = xml[max(0, m.start() - 400):m.end() + 1]
+            if _re.search(r'(?i)(text|content-desc)="grant"|resource-id="[^"]*grant',
+                          seg):
+                x = (int(m.group(1)) + int(m.group(3))) // 2
+                y = (int(m.group(2)) + int(m.group(4))) // 2
+                node = (x, y)
+                break
+        if node:
+            adb(acct, "shell", "input", "tap", str(node[0]), str(node[1]),
+                timeout=15)
+            print(f"[{label}] su dialog: tapped Grant @ {node}")
+            time.sleep(2)
+        if resolve_su(acct):
+            return True
+    return bool(resolve_su(acct))
+
+
+def _bake_rooted_data(cfg, images, base, rooted_system, staging, label):
+    """Produce base_arm_data_rooted.qcow2: the production /data with Magisk's
+    policy pre-configured (shell su granted Forever, root_access=3, zygisk=1,
+    denylist=1, the game on the DenyList) so root is headless from first boot and
+    the game is hidden. Boots the ROOTED system with a COW of prod /data, grants
+    su via the dialog, applies the policy over adb, then captures that /data.
+
+    Returns True only if it produced a genuinely pre-granted rooted /data. A
+    False return means the caller must NOT register the base rooted — a rooted
+    system with an ungranted /data would prompt for su on every production boot.
+    """
+    print(f"[{label}] baking rooted /data (headless su + hiding policy)...")
+    bname = "_rootdata"
+    d = account_dir(bname)
+    try:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+        adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+        acct = {"name": bname, "base": ARM_BASE_TAG,
+                "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port,
+                "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
+        save_account(acct)
+        # Boot the ROOTED system overlay + a private COW of prod /data.
+        make_overlay(d / "system.qcow2", rooted_system)
+        make_overlay(d / "data.qcow2", images / base["data"])
+        shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
+                        d / "efivars.fd")
+        # Attach the devkit disk so omni-magisk-setup's files are reachable.
+        devkit = images / devkit_disk_name("arm")
+        extra = []
+        if devkit.exists():
+            extra = ["-device", "virtio-blk-pci,drive=vdKIT",
+                     "-drive", f"file={devkit},if=none,id=vdKIT,format=qcow2,"
+                               f"snapshot=on"]
+        _spawn_builder_with_disks(acct, cfg, extra, label)
+        if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
+            print(f"[{label}] rooted boot did not come up; cannot bake /data.")
+            return False
+        su = resolve_su(acct)
+        if not su:
+            # Fresh /data: the first su prompts, and SuRequestActivity only
+            # renders if the Magisk MANAGER APP is installed AND magiskd has
+            # registered it as the manager (which happens on the boot AFTER
+            # install). So: push+install the staged apk, REBOOT so magiskd picks
+            # it up, then approve the dialog headlessly.
+            apk = Path(staging["dir"]) / "magisk.apk"
+            if apk.exists():
+                try:
+                    adb(acct, "push", str(apk), "/data/local/tmp/magisk.apk",
+                        timeout=120)
+                    ir = adb(acct, "shell",
+                             "pm install -r /data/local/tmp/magisk.apk 2>&1",
+                             timeout=120)
+                    print(f"[{label}] Magisk app install: "
+                          f"{((ir.stdout or '')+(ir.stderr or '')).strip()[-120:]}")
+                    print(f"[{label}] rebooting so magiskd registers the manager...")
+                    try:
+                        adb(acct, "shell", "reboot", timeout=10)
+                    except Exception:  # noqa: BLE001 — reboot drops the adb conn
+                        pass
+                    time.sleep(8)
+                    adb_connect(acct)
+                    if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
+                        print(f"[{label}] guest did not come back after reboot.")
+                        _shutdown(acct, label)
+                        return False
+                except Exception as e:  # noqa: BLE001
+                    print(f"[{label}] Magisk app install/reboot failed: {e}")
+            print(f"[{label}] su prompts on this fresh /data; approving the "
+                  f"MagiskSU dialog headlessly...")
+            if _grant_su_via_dialog(acct, label):
+                su = resolve_su(acct)
+        if not su:
+            print(f"[{label}] could NOT obtain headless su (dialog not approved "
+                  f"— Magisk app may not be installed to show it). Baking a "
+                  f"granted /data needs a one-time Grant; skipping.")
+            _shutdown(acct, label)
+            return False
+        # Pre-grant shell su Forever + turn on zygisk/denylist + the game on the
+        # DenyList, straight into the Magisk policy DB.
+        policy = (
+            'M=""; for m in /debug_ramdisk/magisk /sbin/magisk magisk; do '
+            '"$m" -v >/dev/null 2>&1 && { M="$m"; break; }; done; '
+            '"$M" --sqlite "REPLACE INTO policies (uid,policy,until,logging,'
+            'notification) VALUES(2000,2,0,1,1)" >/dev/null 2>&1; '
+            '"$M" --sqlite "REPLACE INTO settings (key,value) VALUES(\'root_access\',3)" >/dev/null 2>&1; '
+            '"$M" --sqlite "REPLACE INTO settings (key,value) VALUES(\'zygisk\',1)" >/dev/null 2>&1; '
+            '"$M" --sqlite "REPLACE INTO settings (key,value) VALUES(\'denylist\',1)" >/dev/null 2>&1; '
+            f'"$M" --denylist add {ROBLOX_PACKAGE} >/dev/null 2>&1; echo POLICY_OK')
+        pr = adb(acct, "shell", f"{su} 0 sh -c {shlex.quote(policy)}", timeout=45)
+        pout = ((pr.stdout or "") + (pr.stderr or "")).strip()
+        print(f"[{label}] policy: {pout[-200:]}")
+        if "POLICY_OK" not in pout:
+            print(f"[{label}] policy write did not confirm; not capturing /data.")
+            _shutdown(acct, label)
+            return False
+        _shutdown(acct, label)
+        # Capture the resulting /data (flattened, standalone) as the rooted /data.
+        rooted_data = images / ARM_ROOTED_DATA
+        tmp = rooted_data.with_suffix(".tmp.qcow2")
+        subprocess.run([qemu_bin("qemu-img"), "convert", "-O", "qcow2", "-c",
+                        str(d / "data.qcow2"), str(tmp)], check=True)
+        tmp.replace(rooted_data)
+        print(f"[{label}] captured rooted /data -> {ARM_ROOTED_DATA}")
+        return True
+    except Exception as e:
+        print(f"[{label}] rooted /data bake failed ({type(e).__name__}: {e}).")
+        return False
+    finally:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def cmd_build_devkit(args):
     ensure_qemu()
     cfg = load_config()
-    tag = build_dev_base(cfg, frida_version=args.frida_version,
-                         frida_port=args.frida_port,
-                         include_magisk=not args.no_magisk,
-                         keep_builder=args.keep_builder,
-                         patch_boot=getattr(args, "patch_boot", False))
+    arch = getattr(args, "arch", None) or host_arch_token()
+    disk = build_devkit(cfg, arch=arch,
+                        frida_version=args.frida_version,
+                        frida_port=args.frida_port,
+                        include_magisk=not args.no_magisk)
+    if getattr(args, "json", False):
+        emit_json({"ok": True, "arch": arch, "devkit_disk": Path(disk).name})
+
+
+def cmd_root_base(args):
+    ensure_qemu()
+    cfg = load_config()
+    tag = getattr(args, "base", None)
+    disk = root_base(cfg, tag=tag, frida_version=args.frida_version,
+                     frida_port=args.frida_port)
     if getattr(args, "json", False):
         raw = read_config()
-        emit_json({"ok": True, "base": tag, "devkit_disk": ARM_DEVKIT_DISK,
+        rtag = tag or effective_base_tag(raw) or ARM_BASE_TAG
+        # disk is None when the rooted SYSTEM built but the pre-granted /data
+        # could not be produced — the base is deliberately left UNROOTED.
+        emit_json({"ok": disk is not None, "base": rtag,
+                   "rooted": disk is not None,
+                   "rooted_system": (Path(disk).name if disk else None),
                    "current_base": raw.get("current_base"),
-                   "devkit": raw["bases"][tag].get("devkit_manifest")})
+                   "root_manifest": raw["bases"].get(rtag, {}).get("root_manifest")})
+
+
+def _host_rss_mb(pid):
+    """Resident set of one QEMU process in MB, or None if it is gone."""
+    try:
+        r = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+        v = (r.stdout or "").strip().split()
+        return int(v[0]) / 1024 if v else None
+    except Exception:
+        return None
+
+
+def _host_total_mb():
+    """Total physical RAM of this host in MB, or None if unobtainable."""
+    try:
+        if IS_MACOS:
+            r = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                               capture_output=True, text=True, timeout=10)
+            return int(r.stdout.strip()) / 1048576
+        if IS_LINUX:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return None
+
+
+def _runtime_handle(name):
+    """A read-only account handle for a RUNNING instance, from its run.json.
+
+    Enough to talk to the instance (adb + QMP ports) and nothing more. The
+    point is that it allocates nothing and writes nothing, so read-only
+    commands cannot disturb a live instance the way build_acct() would."""
+    try:
+        run = json.loads((runtime_dir(name) / "run.json").read_text())
+    except Exception:
+        return None
+    if not all(k in run for k in ("adb_port", "qmp_port")):
+        return None
+    return {"name": name, "adb_port": run["adb_port"],
+            "qmp_port": run["qmp_port"],
+            "vnc_port": run.get("vnc_port"), "base": run.get("base")}
+
+
+def cmd_measure(args):
+    """Report what each RUNNING instance actually costs the host.
+
+    Exists because every capacity number in this project used to be an
+    assertion. The farming mode shipped at 512 MB on the theory that a
+    squeezed instance needs no more, and nobody had booted one — it does not
+    boot at all. This command is the cheapest way to keep that from
+    recurring: it samples real processes and prints what it saw.
+
+    Host RSS is sampled repeatedly and reduced to a median (see
+    measure.summarize) because free-page-reporting makes any single sample
+    close to meaningless."""
+    from omnidroid import measure as _m
+    from omnidroid.runtime import reconcile_runtime
+    reconcile_runtime()
+    names = ([args.name] if getattr(args, "name", None)
+             else [a["name"] for a in all_accounts() if running_pid(a["name"])])
+    if not names:
+        return fail("no_instance",
+                    "no running instances to measure. Start one first: "
+                    "`omni start <name> --mode farming`")
+    n_samples = max(1, getattr(args, "samples", 8))
+    interval = max(1, getattr(args, "interval", 5))
+
+    rows, series = [], {n: [] for n in names}
+    # Read-only handles built straight from run.json. Emphatically NOT
+    # build_acct(): that ALLOCATES — it reserves a port triple and rewrites
+    # run.json — so calling it here replaced a live instance's record with a
+    # `reserving` placeholder and made the engine lose track of the QEMU it
+    # was in the middle of measuring. A measurement command must not be able
+    # to change what it measures.
+    accts = {n: _runtime_handle(n) for n in names}
+    # Interleave the sampling across instances so every instance is observed
+    # over the SAME wall-clock window. Sampling them one after another would
+    # compare an instance measured while its neighbour was booting against
+    # one measured while the host was quiet.
+    for i in range(n_samples):
+        for name in names:
+            pid = running_pid(name)
+            series[name].append(_host_rss_mb(pid) if pid else None)
+        if i < n_samples - 1:
+            time.sleep(interval)
+
+    for name in names:
+        pid = running_pid(name)
+        run = {}
+        try:
+            run = json.loads((runtime_dir(name) / "run.json").read_text())
+        except Exception:
+            pass
+        acct = accts.get(name)
+        guest_total = guest_avail = None
+        balloon_mb = None
+        if acct:
+            try:
+                out = adb(acct, "shell", "cat", "/proc/meminfo",
+                          timeout=20).stdout
+                guest_used = _m.parse_guest_used_kb(out)
+                for line in (out or "").splitlines():
+                    if line.startswith("MemTotal:"):
+                        guest_total = int(line.split()[1]) / 1024
+                    elif line.startswith("MemAvailable:"):
+                        guest_avail = int(line.split()[1]) / 1024
+            except Exception:
+                guest_used = None
+            r = qmp(acct, "query-balloon") or {}
+            actual = (r.get("return") or {}).get("actual")
+            balloon_mb = int(actual / 1048576) if actual else None
+        else:
+            guest_used = None
+        host = _m.summarize(series[name])
+        # KSM-merged pages for THIS qemu (Linux, kernel >= 6.1). This is the
+        # number that decides whether 50 instances fit: 50 guests booted from
+        # one base image hold overwhelmingly identical pages, and KSM
+        # collapses them to one physical copy. Per-instance RSS counts a
+        # merged page for every instance sharing it, so RSS alone
+        # systematically over-states a large fleet.
+        rows.append({"name": name, "mode": run.get("mode"),
+                     "base": run.get("base"), "pid": pid,
+                     "host_rss_median_mb": host["median_mb"],
+                     "host_rss_max_mb": host["max_mb"],
+                     "guest_total_mb": round(guest_total, 1) if guest_total else None,
+                     "guest_avail_mb": round(guest_avail, 1) if guest_avail else None,
+                     "guest_used_mb": round(guest_used / 1024, 1) if guest_used else None,
+                     "balloon_mb": balloon_mb,
+                     "ksm_merged_mb": (round(pid_ksm_merged_mb(pid), 1)
+                                       if pid and IS_LINUX else None)})
+
+    host_total = _host_total_mb()
+    medians = [r["host_rss_median_mb"] for r in rows if r["host_rss_median_mb"]]
+    per_inst = (sum(medians) / len(medians)) if medians else None
+    # Capacity is planned against the CEILING, not against what the instances
+    # happen to be using while you look at them. An observed median is a
+    # snapshot of instances that may be idle, pre-game, or mid-reclaim; the
+    # balloon cap is the most memory the guest is permitted to hold, so it is
+    # the only number that a host is guaranteed to survive. Planning off the
+    # median is how you fit "128 instances" onto a box that dies at 14.
+    caps = [r["balloon_mb"] for r in rows if r["balloon_mb"]]
+    ceiling = max(caps) if caps else None
+    planning_mb = ceiling or per_inst
+    result = {"ok": True, "instances": rows,
+              "samples": n_samples, "interval_s": interval,
+              "host_total_mb": round(host_total) if host_total else None,
+              "per_instance_median_mb": round(per_inst, 1) if per_inst else None,
+              "planning_mb": round(planning_mb) if planning_mb else None,
+              "planning_basis": ("balloon cap" if ceiling
+                                 else "observed median (NO balloon cap set - "
+                                      "this is a floor, not a ceiling)"),
+              "estimated_capacity": (
+                  _m.capacity(host_total, planning_mb)
+                  if (host_total and planning_mb) else None),
+              "ksm": _ksm_summary(rows),
+              "platform_note": (
+                  "macOS/HVF: the balloon and free-page-reporting are advisory "
+                  "here - QEMU's madvise does not reliably decommit, so host "
+                  "RSS overstates what the same instance costs on Linux/KVM. "
+                  "Treat the 50+-instance target as a Linux number."
+                  if IS_MACOS else
+                  "Linux/KVM: balloon + free-page-reporting decommit for real; "
+                  "enable KSM (`omni ksm --on`) to dedup identical guest pages "
+                  "across instances on top of this.")}
+    if getattr(args, "json", False):
+        emit_json(result)
+        return
+    print(f"{'instance':<18}{'mode':<10}{'host RSS med':>13}"
+          f"{'max':>8}{'guest used':>12}{'balloon':>9}")
+    for r in rows:
+        print(f"{r['name']:<18}{str(r['mode'] or '?'):<10}"
+              f"{_fmt_mb(r['host_rss_median_mb']):>13}"
+              f"{_fmt_mb(r['host_rss_max_mb']):>8}"
+              f"{_fmt_mb(r['guest_used_mb']):>12}"
+              f"{_fmt_mb(r['balloon_mb']):>9}")
+    if per_inst:
+        print(f"\n{len(rows)} instance(s) sampled {n_samples}x/{interval}s; "
+              f"median {per_inst:.0f} MB each right now")
+    if host_total and planning_mb:
+        print(f"planning at {planning_mb:.0f} MB/instance "
+              f"({result['planning_basis']})")
+        print(f"host has {host_total / 1024:.1f} GiB -> ~"
+              f"{result['estimated_capacity']} instances "
+              f"(2 GiB reserved for the host)")
+        if not ceiling:
+            print("set a balloon cap (--balloon, or use --mode farming) to "
+                  "make this a ceiling rather than a guess")
+    k = result["ksm"]
+    if not k.get("available") or not k.get("running"):
+        print(f"KSM: {k.get('why')}")
+    else:
+        print(f"KSM: {k['saved_mb']:.0f} MB deduplicated across the fleet "
+              f"({k['full_scans']} full scans)")
+        print("  -> the per-instance rows above each count shared pages "
+              "separately, so a large fleet costs LESS than their sum")
+    print(f"\nNOTE: {result['platform_note']}")
+
+
+def _fmt_mb(v):
+    return f"{v:.0f}M" if v else "-"
+
+
+def _ksm_summary(rows):
+    """Fleet-wide KSM picture, or a reason there isn't one.
+
+    Kept separate from the per-instance rows because the interesting quantity
+    is fleet-level: KSM's whole value here is that N instances of the SAME
+    base hold N copies of the same Android pages, and it collapses them to
+    one. That saving does not belong to any single instance, and per-instance
+    RSS double-counts it — which is exactly why a fleet's real cost is lower
+    than summing the rows suggests."""
+    if not IS_LINUX:
+        return {"available": False,
+                "why": "KSM is a Linux kernel feature; this host is not Linux"}
+    if not ksm_available():
+        return {"available": False,
+                "why": "no /sys/kernel/mm/ksm - kernel built without KSM"}
+    stats = ksm_stats() or {}
+    if not stats.get("run"):
+        return {"available": True, "running": False,
+                "why": "KSM is present but OFF - turn it on with "
+                       "`omni ksm --on`. Until then every instance keeps its "
+                       "own copy of identical guest pages."}
+    merged = [r["ksm_merged_mb"] for r in rows if r.get("ksm_merged_mb")]
+    return {"available": True, "running": True,
+            "saved_mb": round(ksm_saved_mb(stats), 1),
+            "merged_mb_per_instance": round(sum(merged) / len(merged), 1)
+            if merged else None,
+            "pages_sharing": stats.get("pages_sharing"),
+            "full_scans": stats.get("full_scans")}
+
+
+def _bake_lean_props(raw_path, fs_off, label, props=None):
+    """Merge the lean profile into build.prop inside the ext4 at fs_off.
+
+    Returns (None, path, added) on success or (error_string, None, 0). The
+    image is left untouched on any failure — this runs against a base that
+    every account overlay is COW-backed by, so a half-written build.prop is
+    not a bug, it is a fleet-wide brick."""
+    import tempfile
+    dbg = _debugfs_bin()
+    if not dbg:
+        return ("debugfs (e2fsprogs) not found — needed to edit the system "
+                "filesystem. macOS: brew install e2fsprogs. "
+                "Debian/Ubuntu: apt install e2fsprogs.", None, 0)
+    dev = f"{raw_path}?offset={fs_off}"
+    tmp = Path(tempfile.mkdtemp(prefix="omni-lean-"))
+    try:
+        # Probe for build.prop: the layout differs between system-as-root and
+        # nested-system images, and guessing wrong would either fail loudly
+        # (fine) or write a build.prop nothing reads (not fine).
+        target, current = None, ""
+        for cand in lean.BUILD_PROP_CANDIDATES:
+            out = tmp / "cur.prop"
+            subprocess.run([dbg, "-R", f"dump {cand} {out}", dev],
+                           capture_output=True, text=True, timeout=120)
+            if out.exists() and out.stat().st_size:
+                target = cand
+                current = out.read_text(errors="replace")
+                break
+        if not target:
+            return (f"no build.prop found in this filesystem (tried "
+                    f"{', '.join(lean.BUILD_PROP_CANDIDATES)})", None, 0)
+
+        # Preserve the SELinux label. build.prop is read by init and by every
+        # process that reads a system property file; an unlabelled
+        # replacement is denied and the guest boots with none of these
+        # properties (or does not boot). Read the REAL label off the image
+        # rather than hardcoding one — it differs across images.
+        ea = tmp / "label.val"
+        subprocess.run([dbg, "-R", f"ea_get -f {ea} {target} security.selinux",
+                        dev], capture_output=True, text=True, timeout=120)
+        label_val = ea.read_bytes() if ea.exists() else b""
+        if not label_val:
+            return (f"could not read the SELinux label of {target}; refusing "
+                    f"to write an unlabelled build.prop", None, 0)
+
+        props = lean.baked_props() if props is None else props
+        merged = tmp / "build.prop"
+        merged.write_text(lean.merge_build_prop(current, props))
+        script = tmp / "cmds.txt"
+        script.write_text(
+            f"rm {target}\n"
+            f"cd {str(Path(target).parent) or '/'}\n"
+            f"write {merged} {Path(target).name}\n"
+            f"sif {target} mode 0100644\n"
+            f"sif {target} uid 0\n"
+            f"sif {target} gid 0\n"
+            f"ea_set -f {ea} {target} security.selinux\n"
+        )
+        r = subprocess.run([dbg, "-w", "-f", str(script), dev],
+                           capture_output=True, text=True, timeout=300)
+        out = (r.stdout or "") + (r.stderr or "")
+        if "Allocated inode" not in out:
+            return (f"debugfs write did not land: {out.strip()[-400:]}",
+                    None, 0)
+
+        # Read back and verify EVERY property, rather than trusting the
+        # write. A build.prop that is present but missing ro.config.low_ram
+        # is the failure mode that costs a whole rebuild to notice.
+        back = tmp / "readback.prop"
+        subprocess.run([dbg, "-R", f"dump {target} {back}", dev],
+                       capture_output=True, text=True, timeout=120)
+        if not back.exists():
+            return ("readback of the written build.prop failed", None, 0)
+        text = back.read_text(errors="replace")
+        missing = [f"{k}={v}" for k, v in props.items()
+                   if f"{k}={v}" not in text]
+        if missing:
+            return (f"{len(missing)} propert"
+                    f"{'y' if len(missing) == 1 else 'ies'} missing after "
+                    f"write (e.g. {missing[0]})", None, 0)
+        rl = subprocess.run([dbg, "-R", f"ea_list {target}", dev],
+                            capture_output=True, text=True, timeout=120)
+        if "security.selinux" not in (rl.stdout or ""):
+            return (f"SELinux label missing after write on {target}",
+                    None, 0)
+        print(f"[{label}] {target}: {len(props)} lean properties baked "
+              f"(label preserved)")
+        return None, target, len(props)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _backing_args(backing):
+    """qemu-img convert args that make the OUTPUT a thin overlay on `backing`.
+
+    The flag was renamed: `-B` up to QEMU 10.0, `-b` (plus an explicit
+    `-F` backing format) after. Probe the help text rather than the version
+    string — the help is what this binary will actually accept."""
+    try:
+        h = subprocess.run([qemu_bin("qemu-img"), "convert", "--help"],
+                           capture_output=True, text=True, timeout=30)
+        text = (h.stdout or "") + (h.stderr or "")
+    except Exception:
+        text = ""
+    if "--backing" in text or "-b, " in text:
+        return ["-b", str(backing), "-F", "qcow2"]
+    return ["-B", str(backing)]
+
+
+def scratch_needed(disk):
+    """Bytes of free space a qcow2 round trip on `disk` really needs.
+
+    Peak usage is the RAW export plus the thin overlay we emit, not two full
+    copies — so this is sized from the image's ACTUAL allocated size (what
+    the raw will occupy on any filesystem with sparse-file support: APFS,
+    ext4, btrfs, xfs) plus a 1 GiB margin.
+
+    The previous flat 6 GiB was a constant copied from an older command that
+    wrote a full second copy. Over-stating the requirement is not harmless
+    here: it is the difference between telling someone to free one stale
+    backup and telling them to free three."""
+    try:
+        r = subprocess.run([qemu_bin("qemu-img"), "info", "--output=json",
+                            str(disk)], capture_output=True, text=True,
+                           timeout=60)
+        info = json.loads(r.stdout)
+        actual = int(info.get("actual-size") or info["virtual-size"])
+    except Exception:
+        # Unknown -> fall back to the old conservative figure rather than
+        # guess low and fail halfway through a multi-GiB conversion.
+        return 6 * 1024 ** 3
+    return actual + 1024 ** 3
+
+
+def reclaimable_backups(images):
+    """Backup images in `images` whose ORIGINAL still exists, newest last.
+
+    Returns [(path, bytes)]. A base-image round trip needs several GiB of
+    scratch, and on a full disk the useful answer is not "free some space" —
+    it is which specific files are redundant. Only files matching a backup
+    suffix are listed, and only when the thing they back up is still present,
+    so nothing here is a last copy. This ADVISES; it never deletes."""
+    out = []
+    for p in sorted(Path(images).glob("*")):
+        if not p.is_file():
+            continue
+        name = p.name
+        orig = None
+        if name.endswith(".bak"):
+            orig = p.with_name(name[:-4])
+        elif ".safebak" in name:
+            orig = p.with_name(name.split(".safebak")[0])
+        if orig and orig.exists() and orig != p:
+            out.append((p, p.stat().st_size))
+    return sorted(out, key=lambda t: t[1])
+
+
+def _scratch_help(scratch, free, need, images=None):
+    """The 'not enough disk' message, naming what is actually reclaimable.
+
+    Offers BOTH ways out: move the scratch elsewhere, or reclaim a redundant
+    backup. Deleting someone's backups should never be the only option a
+    tool leaves them."""
+    msg = (f"need ~{need // 1024**3} GiB free in {scratch} for the qcow2 "
+           f"round trip, have {free / 1024**3:.1f} GiB.\n\n"
+           f"Either point the scratch at another volume with "
+           f"--scratch-dir /path/on/another/disk (it holds only temporary "
+           f"state; the image written at the end is a thin overlay of a few "
+           f"hundred KB), or reclaim space below.")
+    cands = reclaimable_backups(images or scratch)
+    if not cands:
+        return msg + " No redundant backup images found to reclaim."
+    total = sum(sz for _, sz in cands)
+    lines = [f"  {p.name}  ({sz / 1024**3:.1f} GiB)" for p, sz in cands[::-1]]
+    return (msg + f"\n\nThese {len(cands)} file(s) in {images} are BACKUPS "
+            f"whose original is still present, totalling "
+            f"{total / 1024**3:.1f} GiB:\n" + "\n".join(lines) +
+            f"\n\nThey are yours to keep or delete - this command will not "
+            f"touch them. Removing ONE of the larger ones is usually enough "
+            f"to reach {need // 1024**3} GiB.")
+
+
+def cmd_enable_zram_base(args):
+    """Bake `persist.sys.zram_enabled=1` into a base image's build.prop.
+
+    This is how a NON-ROOTED production instance gets zram, and it is one
+    property because the base already ships everything else: the zram device,
+    the lz4 compressor, an fstab entry sized `zramsize=50%`, and an init
+    trigger that runs swapon_all when this property is 1 (all read off a live
+    instance; see lean.py). Verified there: flipping it took SwapTotal from 0
+    to 470980 kB with no other change.
+
+    Worth it because zram is a third of the per-instance footprint — lz4
+    compressed 496 MB of guest pages into 167 MB (2.97x measured), which
+    takes the safe balloon cap from 1536 MB to 1024 MB and a 64 GB server
+    from ~40 to ~62 instances.
+
+    Unlike `strip-base` this is NOT gated. That gate exists because the
+    low-RAM PROFILE was measured to break boot; this is a single
+    LineageOS-supported toggle for a subsystem the image already carries, and
+    it is a persist.* property rather than one of the ro.* framework switches
+    that caused the RescueParty loop. Build-machine command (e2fsprogs +
+    scratch for the qcow2 round trip); writes a NEW image unless --in-place.
+    """
+    cfg = load_config()
+    tag = getattr(args, "base", None) or effective_base_tag(cfg) or "arm"
+    bases = cfg.get("bases") or {}
+    if tag not in bases:
+        return fail("no_base", f"no base '{tag}'. Known: {list(bases)}")
+    base = bases[tag]
+    if base_type(base) != BASE_TYPE_ARM:
+        return fail("arch_boundary",
+                    f"base '{tag}' is {arch_of_base(base)}; this command only "
+                    f"knows the arm (super/logical-partition) layout.")
+    images = Path(cfg["images_dir"])
+    disk, why = _brand_target(cfg, base, images)
+    if not disk.exists():
+        return fail("no_base", f"base disk not found: {disk}")
+
+    label = f"enable-zram-base {tag}"
+    if why:
+        print(f"[{label}] {why}")
+    in_place = bool(getattr(args, "in_place", False))
+    if in_place:
+        live = [a["name"] for a in all_accounts()
+                if running_pid(a["name"])
+                and _brand_target(cfg, bases.get(a.get("base"), {}),
+                                  images)[0] == disk]
+        if live:
+            return fail("instance_running",
+                        f"cannot rewrite {disk.name} in place: "
+                        f"{', '.join(live)} running on it. Stop it first, or "
+                        f"drop --in-place.")
+    out = Path(getattr(args, "out", None) or
+               (disk if in_place else
+                disk.with_name(disk.stem + "_zram.qcow2")))
+
+    # Scratch may live on ANOTHER volume. The round trip's peak cost is the
+    # raw export, which is pure temporary state -- there is no reason it must
+    # sit next to the images, and on a full internal disk an external drive
+    # is a far better answer than deleting someone's backups.
+    scratch = Path(getattr(args, "scratch_dir", None) or images).expanduser()
+    if not scratch.is_dir():
+        return fail("engine_error", f"--scratch-dir not a directory: {scratch}")
+    free = shutil.disk_usage(scratch).free
+    need = scratch_needed(disk)
+    if free < need:
+        return fail("engine_error", _scratch_help(scratch, free, need,
+                                                  images=images))
+
+    import tempfile
+    work = Path(tempfile.mkdtemp(prefix="omni-zram-", dir=str(scratch)))
+    raw = work / "base.raw"
+    try:
+        print(f"[{label}] exporting {disk.name} -> raw")
+        subprocess.run([qemu_bin("qemu-img"), "convert", "-f", "qcow2",
+                        "-O", "raw", str(disk), str(raw)],
+                       check=True, capture_output=True, timeout=1800)
+        sup = _gpt_partition(str(raw), "super")
+        if not sup:
+            return fail("engine_error", "no 'super' partition in the base disk")
+        found = _lp_partition(str(raw), sup[0], LEAN_PROP_FS)
+        if not found:
+            return fail("engine_error",
+                        f"could not locate the '{LEAN_PROP_FS}' filesystem "
+                        f"in super")
+        fs_off, fs_size = found
+        print(f"[{label}] super at 0x{sup[0]:x}; {LEAN_PROP_FS} fs at "
+              f"0x{fs_off:x} ({fs_size / 1048576:.0f} MiB)")
+
+        # Same verified surgery strip-base uses (probe, preserve the SELinux
+        # label, merge rather than append, read back every key).
+        err, prop_path, n = _bake_lean_props(str(raw), fs_off, label,
+                                             props=lean.ZRAM_ENABLE_PROP)
+        if err:
+            return fail("engine_error", err)
+        if not _fsck_ok(str(raw), fs_off, label):
+            return fail("engine_error",
+                        f"refusing to emit an image whose {LEAN_PROP_FS} "
+                        f"filesystem is not clean")
+
+        staged = work / "zram.qcow2"
+        # Write the result as a THIN OVERLAY backed by the original rather
+        # than a full second copy. Only clusters that actually differ get
+        # stored, and a one-property build.prop edit differs in a handful —
+        # so the output is hundreds of KB instead of ~2.3 GiB, and the peak
+        # scratch is just the raw export. That is the difference between
+        # needing ~3 GiB free and needing ~6, which on a full disk is the
+        # difference between deleting one stale backup and three.
+        #
+        # This is the same shape the project already relies on:
+        # base_arm_system.qcow2 is itself a 7.5 MiB overlay on the shared
+        # base. In-place is the exception — it must be self-contained, since
+        # an image cannot be its own backing file.
+        conv = [qemu_bin("qemu-img"), "convert", "-f", "raw", "-O", "qcow2"]
+        if not in_place:
+            conv += _backing_args(disk)
+        print(f"[{label}] importing raw -> qcow2"
+              + ("" if in_place else f" (thin, backed by {disk.name})"))
+        subprocess.run(conv + [str(raw), str(staged)],
+                       check=True, capture_output=True, timeout=1800)
+        if in_place:
+            bak = disk.with_suffix(".qcow2.bak")
+            if not bak.exists():
+                print(f"[{label}] backing up {disk.name} -> {bak.name}")
+                shutil.copy2(disk, bak)
+        shutil.move(str(staged), str(out))
+        print(f"[{label}] wrote {out} ({out.stat().st_size / 1048576:.0f} MiB)")
+        result = {"ok": True, "base": tag, "image": str(out),
+                  "build_prop": prop_path, "properties": n,
+                  "in_place": in_place,
+                  "note": ("Boot a farming instance on this image and check "
+                           "`grep SwapTotal /proc/meminfo` is non-zero; the "
+                           "balloon then picks the lower 1024 MB cap itself.")}
+        if getattr(args, "json", False):
+            emit_json(result)
+        return
+    except subprocess.CalledProcessError as e:
+        return fail("engine_error",
+                    f"qemu-img failed: {(e.stderr or b'')[-400:]}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cmd_strip_base(args):
+    """Bake the low-RAM property profile (lean.py) into a base image.
+
+    This is the half of the footprint work that CANNOT be done at runtime:
+    `ro.*` properties are frozen by init once set, so `ro.config.low_ram` —
+    the single biggest Android-level memory lever there is — has to be in the
+    image. Everything that can be done over adb lives in the farming squeeze
+    instead.
+
+    Build-machine command. Writes a NEW image by default, because a base is
+    immutable once any account references it (--in-place keeps a .bak and
+    refuses while an instance is running on the image)."""
+    # HARD GATE, first thing, before any work or any disk is touched.
+    # strip-base writes to an image every account's COW overlay is backed by,
+    # and the profile it would write is known to break boot (see lean.py:
+    # recovery/RescueParty with the full set, never-boots with the memory-only
+    # subset). Running it blind would take out the whole fleet at once, so it
+    # refuses unless a human has explicitly accepted that.
+    force = bool(getattr(args, "force_unverified", False))
+    if not lean.PROFILE_VERIFIED and not force:
+        return fail("profile_unverified",
+                    f"refusing to bake: {lean.PROFILE_EVIDENCE} "
+                    f"Re-run with --force-unverified if you are bisecting and "
+                    f"understand that the resulting image may not boot. "
+                    f"Prefer bisecting on the DEV base with a Magisk "
+                    f"system.prop module first - it needs no disk space and "
+                    f"no image is modified.")
+    cfg = load_config()
+    tag = getattr(args, "base", None) or effective_base_tag(cfg) or "arm"
+    bases = cfg.get("bases") or {}
+    if tag not in bases:
+        return fail("no_base", f"no base '{tag}'. Known: {list(bases)}")
+    base = bases[tag]
+    if base_type(base) != BASE_TYPE_ARM:
+        return fail("arch_boundary",
+                    f"base '{tag}' is {arch_of_base(base)}; strip-base only "
+                    f"knows the arm (super/logical-partition) layout. The x86 "
+                    f"base carries its properties in its own build tree — "
+                    f"bake them there and rebuild with `omni rebuild-base`.")
+    images = Path(cfg["images_dir"])
+    disk, why = _brand_target(cfg, base, images)
+    if not disk.exists():
+        return fail("no_base", f"base disk not found: {disk}")
+
+    label = f"strip-base {tag}"
+    if why:
+        print(f"[{label}] {why}")
+    in_place = bool(getattr(args, "in_place", False))
+    if in_place:
+        live = [a["name"] for a in all_accounts()
+                if running_pid(a["name"])
+                and _brand_target(cfg, bases.get(a.get("base"), {}),
+                                  images)[0] == disk]
+        if live:
+            return fail("instance_running",
+                        f"cannot rewrite {disk.name} in place: "
+                        f"{', '.join(live)} "
+                        f"{'is' if len(live) == 1 else 'are'} running on it. "
+                        f"Stop it first (omni stop {live[0]}), or drop "
+                        f"--in-place to write a new image alongside.")
+    out = Path(getattr(args, "out", None) or
+               (disk if in_place else
+                disk.with_name(disk.stem + "_lean.qcow2")))
+
+    free = shutil.disk_usage(images).free
+    need = 6 * 1024 ** 3
+    if free < need:
+        return fail("engine_error", _scratch_help(images, free, need))
+
+    import tempfile
+    work = Path(tempfile.mkdtemp(prefix="omni-lean-", dir=str(images)))
+    raw = work / "base.raw"
+    try:
+        print(f"[{label}] exporting {disk.name} -> raw")
+        subprocess.run([qemu_bin("qemu-img"), "convert", "-f", "qcow2",
+                        "-O", "raw", str(disk), str(raw)],
+                       check=True, capture_output=True, timeout=1800)
+        sup = _gpt_partition(str(raw), "super")
+        if not sup:
+            return fail("engine_error", "no 'super' partition in the base disk")
+        found = _lp_partition(str(raw), sup[0], LEAN_PROP_FS)
+        if not found:
+            return fail("engine_error",
+                        f"could not locate the '{LEAN_PROP_FS}' filesystem in "
+                        f"super (single-linear-extent liblp expected)")
+        fs_off, fs_size = found
+        print(f"[{label}] super at 0x{sup[0]:x}; {LEAN_PROP_FS} fs at "
+              f"0x{fs_off:x} ({fs_size / 1048576:.0f} MiB)")
+
+        err, prop_path, n = _bake_lean_props(
+            str(raw), fs_off, label,
+            props=lean.baked_props(include_unverified=True))
+        if err:
+            return fail("engine_error", err)
+        if not _fsck_ok(str(raw), fs_off, label):
+            return fail("engine_error",
+                        f"refusing to emit an image whose {LEAN_PROP_FS} "
+                        f"filesystem is not clean")
+
+        staged = work / "lean.qcow2"
+        print(f"[{label}] importing raw -> qcow2")
+        subprocess.run([qemu_bin("qemu-img"), "convert", "-f", "raw",
+                        "-O", "qcow2", str(raw), str(staged)],
+                       check=True, capture_output=True, timeout=1800)
+        if in_place:
+            bak = disk.with_suffix(".qcow2.bak")
+            if not bak.exists():
+                print(f"[{label}] backing up {disk.name} -> {bak.name}")
+                shutil.copy2(disk, bak)
+        shutil.move(str(staged), str(out))
+        size_mb = out.stat().st_size / 1048576
+        print(f"[{label}] wrote {out} ({size_mb:.0f} MiB)")
+        result = {"ok": True, "base": tag, "image": str(out),
+                  "build_prop": prop_path, "properties": n,
+                  "in_place": in_place,
+                  "note": ("Boot a farming instance on this image and check "
+                           "`getprop ro.config.low_ram` is 'true'; the "
+                           "properties only count once init has read them.")}
+        if getattr(args, "json", False):
+            emit_json(result)
+        return
+    except subprocess.CalledProcessError as e:
+        return fail("engine_error",
+                    f"qemu-img failed: {(e.stderr or b'')[-400:]}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def cmd_use_base(args):
-    """Set the default base for NEW accounts (mode switch: e.g. a dev base
-    without the game vs a production base with the game pre-installed).
-    Does not touch existing accounts (use update-all for that)."""
+    """Set the default base for NEW accounts (e.g. switch between the arm and
+    x86 bases). Does not touch existing accounts (use update-all for that)."""
     raw = read_config()
-    visible = visible_bases(raw)
-    if args.tag not in visible:
-        # A locked dev base reports the SAME "no base" as a nonexistent one:
-        # for a customer build the dev base genuinely does not exist, and a
-        # distinct error would just advertise it.
-        sys.exit(f"error: no base '{args.tag}'. Known: {list(visible)}")
+    bases = raw.get("bases") or {}
+    if args.tag not in bases:
+        sys.exit(f"error: no base '{args.tag}'. Known: {list(bases)}")
     raw["current_base"] = args.tag
     CONFIG_PATH.write_text(json.dumps(raw, indent=2))
     print(f"current base = {args.tag} "
@@ -3069,6 +4311,20 @@ def cmd_use_base(args):
 
 
 CONTRACT_VERSION = "1.0"
+
+
+def registered_commands():
+    """Every subcommand this engine actually accepts, sorted.
+
+    Built by asking the parser, so it cannot drift from the code the way the
+    hand-written list it replaced did. Kept out of `_HIDDEN_COMMANDS` is
+    deliberate: a client is better served by knowing a build-machine command
+    exists and choosing not to call it than by a list that quietly lies."""
+    parser = build_parser()
+    for action in parser._actions:
+        if getattr(action, "dest", None) == "cmd" and action.choices:
+            return sorted(action.choices)
+    return []
 
 
 def cmd_version(args):
@@ -3100,10 +4356,13 @@ def cmd_version(args):
                                "auto", "max-seconds", "max-keyframes"],
                },
            },
-           "commands": ["version", "create", "start", "stop", "remove", "list",
-                        "install", "run-app", "adb", "screenshot", "logcat",
-                        "capture", "autocap", "test-apk", "doctor", "bases",
-                        "use-base"],
+           # DERIVED from the parser, never hand-listed. The literal that used
+           # to live here had drifted from the engine it describes: it
+           # advertised `create` (since removed) and omitted `setup`, `login`
+           # and `view` -- the three calls omni-executor actually makes. A
+           # client that trusts this field would call a command that does not
+           # exist and refuse three that do.
+           "commands": registered_commands(),
            "modes": list(MODES),
            "ok": True}
     if getattr(args, "json", False):
@@ -3115,18 +4374,15 @@ def cmd_version(args):
 def cmd_bases(args):
     raw = read_config()
     cur = raw["current_base"]
-    # Dev bases are omitted unless OMNI_DEV_MODE=1: this is the list the product
-    # GUI renders its base picker from, so anything listed here is reachable by
-    # a customer's click.
-    listed = visible_bases(raw)
+    # Every registered base is shipped/dual-use now; there is nothing to hide.
+    listed = raw.get("bases") or {}
     if getattr(args, "json", False):
         bases = [{"tag": tag, "arch": arch_of_base(b), "type": base_type(b),
                   "game_package": raw.get("base_game", {}).get(tag),
-                  "dev": base_is_dev(b),
+                  "rooted": base_is_rooted(b),
                   "notes": b.get("notes", "")}
                  for tag, b in listed.items()]
-        emit_json({"current_base": cur, "bases": bases,
-                   "dev_mode": dev_mode_enabled(), "ok": True})
+        emit_json({"current_base": cur, "bases": bases, "ok": True})
         return
     for tag, b in listed.items():
         game = raw.get("base_game", {}).get(tag)
@@ -3380,10 +4636,10 @@ def cmd_bench_ksm(args):
             print(f"[bench] {name} already running (kept from a prior run) "
                   f"- skipping this slot")
             continue
-        acct = build_acct(name, cfg, dev=False)
+        acct = build_acct(name, cfg, debug=False)
         pkg = acct.get("game_package")
         mode = resolve_mode(cfg, args.mode)
-        spawn_qemu(acct, cfg, dev=False, mode=mode)
+        spawn_qemu(acct, cfg, interactive=False, mode=mode)
         if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, f"bench {name}"):
             print(f"[bench] {name} boot timeout - stopping bench")
             _shutdown(acct, f"bench {name}")
@@ -3860,8 +5116,10 @@ def cmd_view(args):
             sys.exit(f"error: '{args.name}' is not running. Start it first "
                      f"(omni start {args.name}) or: omni view {args.name} "
                      f"--start")
-        acct = build_acct(args.name, cfg, dev=args.dev)
-        spawn_qemu(acct, cfg, dev=args.dev, mode=resolve_mode(cfg, args.mode))
+        debug = bool(getattr(args, "debug", False))
+        acct = build_acct(args.name, cfg, debug=debug)
+        spawn_qemu(acct, cfg, interactive=False, debug=debug,
+                   mode=resolve_mode(cfg, args.mode))
         started = True
         port = acct["vnc_port"]
         print(f"[view {args.name}] started instance (detached); waiting for "
@@ -4110,11 +5368,11 @@ def cmd_capture(args):
         return fail("not_running",
                     f"account '{args.name}' is not running; start it first",
                     exit_code=1)
-    if auto and not acct_is_dev(acct):
-        return fail("dev_base_required",
-                    f"auto screenshots are a dev-base feature; account "
-                    f"'{args.name}' is on base '{acct.get('base')}'. Recreate it "
-                    f"with --base dev to use --auto.")
+    if auto and not acct.get("debug"):
+        return fail("debug_boot_required",
+                    f"auto screenshots are a debug feature; instance "
+                    f"'{args.name}' was not booted with --debug. Restart it "
+                    f"with `omni start {args.name} --debug` to use --auto.")
     vnc_port = acct.get("vnc_port")
     if not vnc_port:
         return fail("engine_error", f"account '{args.name}' has no vnc_port")
@@ -4318,12 +5576,12 @@ def _spawn_autocap(name, out_dir, package=None, max_keyframes=AUTOCAP_MAX_KEYFRA
 
 
 def ensure_autocap(acct, out_dir=None, force=False):
-    """Idempotently ensure the continuous recorder is running for a DEV account.
-    No-op (and returns running=False) on non-dev bases — the feature is dev-only.
-    Returns a small status dict."""
+    """Idempotently ensure the continuous recorder is running for a DEBUG boot.
+    No-op (and returns running=False) on a plain production boot — the feature
+    rides on the debug boot. Returns a small status dict."""
     name = acct["name"]
-    if not acct_is_dev(acct):
-        return {"running": False, "reason": "not_dev_base",
+    if not acct.get("debug"):
+        return {"running": False, "reason": "not_debug_boot",
                 "out_dir": None, "pid": None}
     want = _autocap_out_dir(name, out_dir)
     pid, cur_dir = _autocap_state(name)
@@ -4408,7 +5666,7 @@ def maybe_start_autocap(acct, label):
     try:
         r = ensure_autocap(acct)
         if r.get("running") and not r.get("already"):
-            print(f"[{label}] auto-screenshots ON (dev base) -> {r['out_dir']}")
+            print(f"[{label}] auto-screenshots ON (debug boot) -> {r['out_dir']}")
     except Exception as e:  # noqa: BLE001
         print(f"[{label}] auto-screenshots could not start: {e}")
 
@@ -4431,10 +5689,10 @@ def cmd_autocap(args):
         if not running_pid(args.name):
             return fail("not_running",
                         f"account '{args.name}' is not running; start it first")
-        if not acct_is_dev(acct):
-            return fail("dev_base_required",
-                        f"auto screenshots are a dev-base feature; account "
-                        f"'{args.name}' is on base '{acct.get('base')}'.")
+        if not acct.get("debug"):
+            return fail("debug_boot_required",
+                        f"auto screenshots are a debug feature; instance "
+                        f"'{args.name}' was not booted with --debug.")
         r = ensure_autocap(acct, out_dir=getattr(args, "out", None),
                            force=getattr(args, "restart", False))
     out = {"name": args.name, "ok": True, **r}
@@ -4445,10 +5703,10 @@ def cmd_autocap(args):
 
 
 def cmd_test_apk(args):
-    """One-shot dev harness: ensure a FRESH session with NO app pre-baked
-    (v3 dev base, kiosk), install the given APK, let the kiosk launch it,
-    and report machine-readable JSON. Headless by default. After this,
-    drive with: omni screenshot / logcat / adb.
+    """One-shot APK-swap harness: ensure a FRESH session, install the given
+    APK, let the kiosk launch it, and report machine-readable JSON. Works on any
+    base. Headless by default. After this, drive with: omni screenshot / logcat
+    / adb.
 
     Emits a single JSON line: {account, adb_port, qmp_port, package,
     installed, launched, foreground, pid, mode}."""
@@ -4458,10 +5716,10 @@ def cmd_test_apk(args):
     result = {"account": name}
     fresh = not (account_dir(name) / "account.json").exists()
     if fresh and not args.reuse:
-        # Create a clean dev account on the current (dev) base. This is a
-        # persistent folder-backed build account, NOT a product/store account,
-        # so use the handle it returns directly (load_account is store-based
-        # and would not find it).
+        # Create a clean account on the current base. This is a persistent
+        # folder-backed build account, NOT a product/store account, so use the
+        # handle it returns directly (load_account is store-based and would not
+        # find it).
         acct = _make_persistent_arm_account(name, cfg)
     else:
         acct = _load_persistent_arm_account(name)   # --reuse an existing one
@@ -4469,7 +5727,7 @@ def cmd_test_apk(args):
     result["arch"] = acct_arch(acct)
     if not running_pid(name):
         mode = resolve_mode(cfg, args.mode)
-        spawn_qemu(acct, cfg, dev=False, mode=mode)
+        spawn_qemu(acct, cfg, interactive=False, mode=mode)
         if not wait_for_boot(acct, NORMAL_BOOT_TIMEOUT, f"test {name}"):
             print(json.dumps({**result, "ok": False,
                               "error": "boot timeout"}))
@@ -4604,13 +5862,15 @@ def cmd_run_app(args):
 
 
 def cmd_dev_ui(args):
-    """Switch a DEV instance's visible UI. `--show kiosk` (default) foregrounds the
-    kiosk and stops the Magisk app; `--show magisk` opens the Magisk manager (root
-    UI) so the agent/user can manage root, then switch back with `--show kiosk`."""
+    """Switch a DEBUG instance's visible UI. `--show kiosk` (default) foregrounds
+    the kiosk and stops the Magisk app; `--show magisk` opens the Magisk manager
+    (root UI), then switch back with `--show kiosk`. The Magisk manager app is
+    installed by the devkit, so this needs a --debug boot."""
     acct = load_account(args.name)
-    if not acct_is_dev(acct):
-        out = {"ok": False, "error": "not_dev",
-               "message": f"'{args.name}' is not a dev instance (no Magisk UI to toggle)."}
+    if not acct.get("debug"):
+        out = {"ok": False, "error": "not_debug_boot",
+               "message": f"'{args.name}' was not booted with --debug "
+                          f"(no Magisk manager app to toggle)."}
         if getattr(args, "json", False):
             emit_json(out)
         else:
@@ -4914,28 +6174,275 @@ def deliver_session(acct, label, sess, play=True, restart=True):
     return status
 
 
-def apply_farming_squeeze(acct):
-    """Run the farming runtime squeeze over adb. Called only on a farming boot."""
-    for cmd in farming.build_squeeze_sequence():
+def apply_farming_squeeze(acct, mode=None):
+    """Run the farming runtime squeeze over adb. Called only on a farming boot.
+
+    Every step is fire-and-forget by construction (each shell one-liner ends
+    in `true`), because a squeeze is an optimization, never a precondition:
+    an instance that could not disable one package must still end up joined
+    and running, just fatter."""
+    for cmd in farming.build_squeeze_sequence(mode):
         adb(acct, *cmd, timeout=20)
 
 
-def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None):
+def apply_gaming_tuning(acct, mode=None, label=None):
+    """Run the gaming runtime tune-up over adb. Called only on a gaming boot.
+
+    Fire-and-forget for the same reason as the farming squeeze: this is what
+    makes an instance pleasant to play, never what makes it work. It also
+    UNDOES the farming levers that persist in /data, so an account that was
+    farmed and is then started in gaming mode does not keep a 480x270 display
+    and a background-cpuset game — see gaming.py.
+
+    Two steps need root (swappiness, top-app cpuset). Without it they are
+    skipped and SAID OUT LOUD rather than emitted to fail silently: as uid
+    shell both writes are denied, and every script here ends in `; true`, so
+    an unreported skip would look exactly like success."""
+    su = resolve_su(acct)
+    for cmd in gaming.build_tuning_sequence(mode, su=su):
+        adb(acct, *cmd, timeout=20)
+    if label:
+        if su:
+            print(f"[{label}] gaming tune-up: native resolution, animations "
+                  f"off, doze off, swappiness {gaming.GAMING_SWAPPINESS}")
+        else:
+            print(f"[{label}] gaming tune-up: applied WITHOUT root - skipped "
+                  + ", ".join(gaming.root_only_steps()))
+
+
+def pin_game_to_top_app(acct, label=None):
+    """Move the running game onto the top-app cpuset. Call AFTER the session
+    has been delivered — that broadcast is what launches the game, so there is
+    no pid to move before it. Returns True when the move landed."""
+    step = gaming.build_pin_game_step(resolve_su(acct))
+    if not step:
+        if label:
+            print(f"[{label}] cpuset: SKIPPED - no root on this instance")
+        return False
+    adb(acct, *step, timeout=gaming.PIN_WAIT_SECS + 15)
+    ok = "top-app" in (adb(acct, "shell",
+                           f"cat /proc/$(pidof {gaming.GAME_PKG})/cgroup",
+                           timeout=20).stdout or "")
+    if label:
+        print(f"[{label}] cpuset: "
+              + ("game on top-app (latency-critical scheduler set)" if ok
+                 else "game NOT pinned - it runs in its default cpuset"))
+    return ok
+
+
+# Balloon inflation is asynchronous; these bound how long we wait for the
+# guest to actually hand the pages back before calling it a miss. ~30 s total,
+# against a measured ~20 s to settle a 2048 -> 1024 MB inflation.
+ZRAM_SETTLE_TRIES = 6
+ZRAM_SETTLE_SECS = 2
+
+BALLOON_SETTLE_TRIES = 10
+BALLOON_SETTLE_SECS = 3
+BALLOON_TOLERANCE = 1.05     # within 5% of target counts as reached
+
+
+def zram_active(acct):
+    """True when the guest actually has swap on (i.e. zram came up).
+
+    Deliberately a guest-state probe, not a record of whether we ran the
+    zram step: enabling zram needs root, so on the non-rooted production base
+    the step runs, fails silently, and would otherwise leave us confidently
+    applying a cap that kills the game."""
+    try:
+        out = adb(acct, "shell", "sh", "-c",
+                  shlex.quote("grep ^SwapTotal /proc/meminfo"),
+                  timeout=20).stdout or ""
+        return int(re.sub(r"\D", "", out) or 0) > 0
+    except Exception:
+        return False
+
+
+def enable_zram(acct, mode=None, label=None):
+    """Turn on the zram swap the base already ships, and REPORT the outcome.
+
+    The image is not missing zram — it ships the device, the lz4 compressor,
+    an fstab entry (`zramsize=50%`) and an init trigger that calls
+    swapon_all. All of it sits behind one property. So this flips that
+    property rather than poking /sys/block/zram0 by hand; the old manual
+    dance duplicated what /vendor/etc/init/zram.rc already does, and picked a
+    fixed size where the fstab's 50% scales with the guest.
+
+    Verified on the real base: setting it made init run swapon_all and
+    SwapTotal went 0 -> 470980 kB immediately.
+
+    Needs root: it is a persist.* property (settable at runtime, unlike ro.*)
+    but SELinux denies uid shell — measured "Failed to set property". So on
+    the production base this reports a skip and names the fix, rather than
+    failing quietly the way the original zram step did for months."""
+    su = resolve_su(acct)
+    prop = next(iter(lean.ZRAM_ENABLE_PROP))
+    val = lean.ZRAM_ENABLE_PROP[prop]
+    if su:
+        adb(acct, "shell",
+            f"{su} 0 sh -c {shlex.quote(f'setprop {prop} {val}')}", timeout=30)
+        # init reacts to the property asynchronously; give swapon_all a beat.
+        for _ in range(ZRAM_SETTLE_TRIES):
+            if zram_active(acct):
+                break
+            time.sleep(ZRAM_SETTLE_SECS)
+    ok = zram_active(acct)
+    if label:
+        if ok:
+            print(f"[{label}] zram: swap on via {prop} "
+                  f"(lz4, 50% of guest RAM, ~3x compression measured) - "
+                  f"instance can hold a third less RAM")
+        else:
+            print(f"[{label}] zram: NOT enabled"
+                  + ("" if su else f" (no root; {prop} is denied to uid "
+                                   f"shell by SELinux)")
+                  + f". Instance keeps the higher memory cap. For production, "
+                    f"bake {prop}={val} into the base: "
+                    f"`omni enable-zram-base`.")
+    return ok
+
+
+def apply_roblox_settings(acct, label=None, settings=None):
+    """Install a Roblox ClientAppSettings.json profile.
+
+    `settings` selects the profile; None keeps the farming default (fps cap +
+    lowest quality), which is what every pre-existing caller means. A gaming
+    boot passes lean.GAMING_APP_SETTINGS instead — the same install path and
+    the same root requirement, with the tick cap opened up rather than clamped.
+
+    Measured 2026-08-05: no memory change (680 -> 677 MB) but host CPU per
+    instance roughly HALVED (36% -> 18.8%). For the 50+-instance target CPU
+    binds as hard as RAM, so this is the biggest CPU lever available.
+
+    Returns True if applied, False if it could not be. It reports the skip
+    LOUDLY rather than returning quietly, because a step that silently does
+    nothing while looking successful is exactly the failure mode this
+    codebase already had (see farming.sh)."""
+    su = resolve_su(acct)
+    script = farming.build_client_settings_script(su, settings)
+    if not script:
+        if label:
+            print(f"[{label}] roblox settings: SKIPPED - no root on this "
+                  f"instance, and the file lives in the game's private data "
+                  f"dir. The ~2x CPU saving is NOT applied here. Bake it into "
+                  f"the base /data image or have OmniBootstrap write it.")
+        return False
+    adb(acct, "shell", f"{su} 0 sh -c {shlex.quote(script)}", timeout=30)
+    # Verify by reading it back as root; a chown/label mistake leaves a file
+    # the app cannot read, which is indistinguishable from success.
+    r = adb(acct, "shell",
+            f"{su} 0 sh -c {shlex.quote(f'cat {lean.CLIENT_SETTINGS_FILE}')}",
+            timeout=20)
+    ok = "DFIntTaskSchedulerTargetFps" in (r.stdout or "")
+    if label:
+        # Describe the profile that was actually installed. The old line
+        # hardcoded the farming description, so a gaming boot -- which opens
+        # the tick cap up rather than clamping it -- reported "fps cap +
+        # lowest quality; ~2x less host CPU" while doing the opposite.
+        fps = (settings or lean.CLIENT_APP_SETTINGS).get(
+            "DFIntTaskSchedulerTargetFps")
+        detail = (f"tick target {fps} fps, low render cost"
+                  if settings is lean.GAMING_APP_SETTINGS
+                  else f"fps cap {fps} + lowest quality; ~2x less host CPU")
+        print(f"[{label}] roblox settings: "
+              + (f"applied ({detail})" if ok
+                 else "write did NOT land - instance runs uncapped"))
+    return ok
+
+
+def apply_balloon_target(acct, mode, label=None):
+    """Inflate the virtio-balloon to the mode's post-boot target.
+
+    This is the HARD cap on what one instance costs the host, as opposed to
+    free-page-reporting, which is best-effort and only returns pages the
+    guest happens to have freed. It runs AFTER the squeeze so the guest has
+    already released what it can and the balloon only has to claim what is
+    genuinely spare.
+
+    Returns the balloon's actual size in MB, or None when the mode wants no
+    balloon or the guest has no balloon driver to answer with."""
+    target_mb = (mode or {}).get("balloon")
+    # zram changes which floor is safe, so ASK the guest rather than assume.
+    # With lz4 compressing ~3x, the guest survives a third less RAM; without
+    # it, the same target kills the game outright. Reading SwapTotal is the
+    # only honest way to know which regime this instance is actually in --
+    # the squeeze's zram step needs root and is a no-op on the production
+    # base, so "we ran the step" proves nothing.
+    if target_mb and (mode or {}).get("balloon_zram"):
+        if zram_active(acct):
+            target_mb = mode["balloon_zram"]
+            if label:
+                print(f"[{label}] zram is active - using the lower "
+                      f"{target_mb} MB cap")
+        elif label:
+            print(f"[{label}] no zram in this guest - holding the "
+                  f"{target_mb} MB cap (the lower one would OOM the game)")
+    if not target_mb:
+        return None
+    if qmp(acct, "balloon", {"value": int(target_mb) * 1024 * 1024}) is None:
+        if label:
+            print(f"[{label}] balloon: QMP unreachable, instance keeps its "
+                  f"full {mode.get('mem')} MB")
+        return None
+    # Read back rather than trusting the request: a guest without the balloon
+    # driver accepts the command and simply never inflates, and reporting a
+    # target we did not actually reach is how a capacity plan turns into an
+    # out-of-memory host.
+    #
+    # POLL, do not sample once. Inflation is asynchronous: QEMU returns the
+    # moment the request is queued, and the guest then walks its free lists
+    # handing pages back over some seconds. An immediate query-balloon
+    # reports the pre-inflation size every time, which reads exactly like a
+    # missing balloon driver — measured 2026-08-05, a guest that reached its
+    # 1024 MB target in ~20 s was reported as "driver missing (actual 2046)"
+    # by a single eager read.
+    actual_mb = None
+    for _ in range(BALLOON_SETTLE_TRIES):
+        r = qmp(acct, "query-balloon") or {}
+        actual = (r.get("return") or {}).get("actual")
+        actual_mb = int(actual / (1024 * 1024)) if actual else None
+        if actual_mb and actual_mb <= target_mb * BALLOON_TOLERANCE:
+            break
+        time.sleep(BALLOON_SETTLE_SECS)
+    if label:
+        if actual_mb and actual_mb <= target_mb * BALLOON_TOLERANCE:
+            print(f"[{label}] balloon: guest capped at {actual_mb} MB "
+                  f"(target {target_mb} MB)")
+        else:
+            print(f"[{label}] balloon: target {target_mb} MB NOT reached "
+                  f"(actual {actual_mb} MB after "
+                  f"{BALLOON_SETTLE_TRIES * BALLOON_SETTLE_SECS}s) - guest "
+                  f"balloon driver missing? Instance still runs, just fatter.")
+    return actual_mb
+
+
+def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
+                   mem=None, balloon=None, debug=None):
     """Boot the instance if it isn't up, and block until Android is ready.
-    Returns (ok, first_boot)."""
+    Returns (ok, first_boot). `debug` (per-boot) attaches the devkit disk;
+    default None means fall back to the account handle's own `debug` flag."""
+    if debug is None:
+        debug = bool(acct.get("debug"))
     first = not acct.get("first_boot_done")
+    # Resolved ONCE and reused for the spawn, the squeeze, and the balloon.
+    # Previously the spawn called resolve_mode() inline and dropped `mem`
+    # entirely, so `omni start --mem 2048` silently booted at the mode's own
+    # size — a 512 MB farming boot that never reached adbd, reported as a
+    # boot timeout with no hint that the flag had been ignored.
+    mode = resolve_mode(cfg, mode_name, mem=mem, balloon=balloon)
     if running_pid(acct["name"]):
         adb_connect(acct)
         if adb_getprop(acct, "sys.boot_completed") == "1":
             return True, first
         print(f"[{label}] instance is up but Android is still booting; waiting")
     else:
-        dev = first          # first boot always uses the dev profile
-        spawn_qemu(acct, cfg, dev=dev,
-                   mode=None if dev else resolve_mode(cfg, mode_name),
-                   accel=accel)
-        # Same rule as `start`: the recorder attaches at spawn so a dev session
-        # has screenshots of the boot screen itself.
+        # `interactive` is the boot PROFILE (full host smp/mem + serial log),
+        # historically used for a first/provisioning boot. It is independent of
+        # `debug`, which attaches the devkit disk.
+        interactive = first
+        spawn_qemu(acct, cfg, interactive=interactive,
+                   mode=None if interactive else mode, accel=accel, debug=debug)
+        # Same rule as `start`: the recorder attaches at spawn so a debug
+        # session has screenshots of the boot screen itself.
         maybe_start_autocap(acct, label)
     t = timeout or (FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT)
     if not wait_for_boot(acct, t, label, first_boot=first):
@@ -4950,17 +6457,49 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None):
         # this branch is dead in the product path. A stray save_account()
         # would write accounts/<name>/account.json, a file nothing reads
         # under the diskless model; dropped rather than left as a landmine.
-    _devkit_activate(acct, label)
-    # acct_is_dev(acct), not the local `dev` var above: `dev` only reflects
-    # the ephemeral "first boot uses the dev profile" rule (and is a no-op in
-    # the product path, since build_acct() always pre-sets
-    # first_boot_done=True -- see the NOTE above); it is also unset entirely
-    # on the "already running, still booting" branch. acct_is_dev is the
-    # actual account-dev-ness signal (same one _devkit_activate uses above),
-    # so a real --dev boot never squeezes regardless of which branch was
-    # taken to get here.
-    if not acct_is_dev(acct) and mode_name == "farming":
-        apply_farming_squeeze(acct)
+    # EVERY boot, production included: re-enforce Magisk hiding so the game
+    # sees an unrooted device. Idempotent, needs only su, no devkit disk. On an
+    # unrooted base it is a logged no-op. This is what lets the shipped base be
+    # rooted-yet-safe in production.
+    _enforce_hiding(acct, label)
+    # EVERY boot, production included: tell the kiosk which package is the
+    # game and re-front it. Without this the kiosk's dev-mode fallback guesses,
+    # and on a ROOTED base it guesses the Magisk manager — see
+    # assert_kiosk_game for the full trace. This used to happen only inside
+    # _devkit_activate, i.e. only on a --debug boot, which is exactly the
+    # dev-base-era gating the dual-use change was supposed to remove.
+    assert_kiosk_game(acct, cfg, label)
+    # A debug boot ALSO stages the devkit toolkit (frida + omni-* tools) off
+    # the vdc disk attached at spawn. `debug` is the per-boot flag resolved at
+    # the top of this function.
+    if debug:
+        _devkit_activate(acct, label)
+    # GAMING: the other use case. No zram, no squeeze and no balloon — every
+    # one of those trades responsiveness for density, which is the wrong
+    # direction here. It gets the opposite ClientAppSettings profile (tick cap
+    # opened up instead of clamped to 5 fps) and a tune-up that also reverses
+    # the farming levers persisted in /data by any earlier farming boot.
+    if mode_name == "gaming":
+        apply_roblox_settings(acct, label, settings=lean.GAMING_APP_SETTINGS)
+        if not debug:
+            apply_gaming_tuning(acct, mode, label)
+    if mode_name == "farming":
+        # Roblox's own settings need root, which every base now has, so they
+        # apply on any farming instance.
+        apply_roblox_settings(acct, label)
+    if mode_name == "farming":
+        # zram before the balloon: it decides WHICH cap is safe, and
+        # apply_balloon_target probes the guest for it.
+        enable_zram(acct, mode, label)
+    # The farming squeeze is a PRODUCTION memory optimization; a debug boot
+    # carries the extra devkit/frida footprint and its numbers aren't the
+    # production baseline, so skip the squeeze there (as the old dev path did).
+    if not debug and mode_name == "farming":
+        apply_farming_squeeze(acct, mode)
+    if mode_name == "farming":
+        # Balloon strictly last: it should only ever claim memory the guest
+        # has already been persuaded to give up.
+        apply_balloon_target(acct, mode, label)
     return True, first
 
 
@@ -5113,7 +6652,18 @@ def cmd_adb(args):
     sys.exit(r.returncode)
 
 
-def main():
+def build_parser():
+    """The full argparse parser, with every subcommand registered.
+
+    Extracted from main() so the command list can be DERIVED rather
+    than hand-maintained. cmd_version advertises this engine's
+    subcommands over the client contract, and the literal it used to
+    carry had drifted: it advertised `create` (removed from the
+    engine) while omitting `setup`, `login` and `view` -- the three
+    calls omni-executor actually makes. A client honouring that
+    contract would invoke a dead command and refuse three live ones.
+    Deriving it from the parser makes that class of drift impossible.
+    """
     p = argparse.ArgumentParser(prog="omnidroid")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -5175,13 +6725,15 @@ def main():
                    help="skip the pre-boot check that asks Roblox whether the "
                         "saved cookie is still valid (the check fails open on "
                         "network problems, so you rarely need this)")
-    s.add_argument("--dev", action="store_true",
-                   help="launch the instance on the DEV base (frida+Magisk); "
-                        "dev-only, refused without OMNI_DEV_MODE")
+    s.add_argument("--debug", action="store_true",
+                   help="attach the devkit disk (frida + omni-* tools) for "
+                        "reverse-engineering. The base is the same dual-use "
+                        "production image either way; this just adds the "
+                        "toolkit (vdc). Also settable via OMNI_DEBUG_BOOT=1.")
     s.add_argument("--apk", default=None,
-                   help="install this Roblox APK on the dev base before "
-                        "delivering the session; dev-only, requires --dev/"
-                        "OMNI_USE_DEV_BASE")
+                   help="install this Roblox APK before delivering the session "
+                        "(for testing a custom build). Works on any base; does "
+                        "NOT require --debug.")
     s_win = s.add_mutually_exclusive_group()
     s_win.add_argument("--window", action="store_true",
                        help="open a live window even in --json mode (two "
@@ -5190,12 +6742,24 @@ def main():
                        help="do not open a window (headless; watch via "
                             "`omni view` or capture)")
     s.add_argument("--mode", choices=list(MODES), default=None,
-                   help="RAM/CPU tier (all headless): playable 4G/4c | "
-                        "hard 3G/4c | brutal 2G/2c | farming 512M/2c "
-                        "(joined-idle, squeezed post-boot). "
-                        "Default: playable")
+                   help="what this instance is FOR. gaming 4G/4c - opens a "
+                        "native window on the host (GPU-accelerated where "
+                        "QEMU supports it, otherwise a plain window; falls "
+                        "back to headless on a host with no display), "
+                        "uncapped engine tick, animations off, game on the "
+                        "top-app cpuset - for playing, not for scale. "
+                        "farming 2G/1c - headless, joined-idle, squeezed "
+                        "post-boot then ballooned down, for many instances. "
+                        "The rest are headless RAM/CPU tiers: playable 4G/4c "
+                        "| hard 3G/4c | brutal 2G/2c. Default: playable")
     s.add_argument("--mem", type=int, default=None,
-                   help="override guest RAM in MB")
+                   help="override guest RAM in MB. This is the guest's "
+                        "ADDRESS SPACE, not its host footprint - see "
+                        "--balloon for the number the host pays")
+    s.add_argument("--balloon", type=int, default=None,
+                   help="post-boot balloon target in MB: the hard cap on "
+                        "this instance's host memory. 0 disables it. "
+                        "Default: the mode's own (farming 1024, others off)")
     s.add_argument("--accel", default=None,
                    help="override hypervisor (auto: Windows=whpx, "
                         "Linux=kvm). E.g. 'tcg' for a no-hypervisor test")
@@ -5280,6 +6844,64 @@ def main():
     bb.add_argument("--json", action="store_true")
     bb.set_defaults(func=cmd_brand_base)
 
+    ms = sub.add_parser("measure",
+                        help="report what running instances actually cost the "
+                             "host (median RSS over repeated samples, guest "
+                             "used, balloon size) and how many fit")
+    ms.add_argument("name", nargs="?", default=None,
+                    help="one instance (default: every running instance)")
+    ms.add_argument("--samples", type=int, default=8,
+                    help="host-RSS samples per instance (default 8). More is "
+                         "better: free-page-reporting makes RSS very spiky")
+    ms.add_argument("--interval", type=int, default=5,
+                    help="seconds between samples (default 5)")
+    ms.add_argument("--json", action="store_true")
+    ms.set_defaults(func=cmd_measure)
+
+    ez = sub.add_parser("enable-zram-base",
+                        help="bake a zram swap entry into a base image's "
+                             "fstab so init brings zram up at boot. This is "
+                             "how a NON-ROOTED production instance gets zram "
+                             "- worth a third of the per-instance footprint "
+                             "(2.97x compression measured). BUILD-machine "
+                             "command: e2fsprogs + ~6 GiB scratch")
+    ez.add_argument("--base", default=None,
+                    help="base tag (default: this host's effective base)")
+    ez.add_argument("--out", default=None,
+                    help="output image (default: <base>_zram.qcow2)")
+    ez.add_argument("--scratch-dir", dest="scratch_dir", default=None,
+                    help="directory for the temporary raw export (default: "
+                         "the images dir). Point this at an external drive "
+                         "when the internal disk is full - it holds only "
+                         "temporary state")
+    ez.add_argument("--in-place", dest="in_place", action="store_true",
+                    help="overwrite the base image itself, keeping a .bak")
+    ez.add_argument("--json", action="store_true")
+    ez.set_defaults(func=cmd_enable_zram_base)
+
+    sb = sub.add_parser("strip-base",
+                        help="bake the low-RAM property profile into an arm "
+                             "base (ro.config.low_ram + lmkd/dalvik/hwui "
+                             "tuning). These CANNOT be set at runtime - init "
+                             "freezes ro.* - so this is the base-image half "
+                             "of the footprint work. BUILD-machine command: "
+                             "needs e2fsprogs + ~6 GiB scratch")
+    sb.add_argument("--base", default=None,
+                    help="base tag (default: this host's effective base)")
+    sb.add_argument("--out", default=None,
+                    help="output image (default: <base>_lean.qcow2)")
+    sb.add_argument("--in-place", dest="in_place", action="store_true",
+                    help="overwrite the base image itself, keeping a .bak. "
+                         "Only safe when no account is running")
+    sb.add_argument("--force-unverified", dest="force_unverified",
+                    action="store_true",
+                    help="bake the profile even though it is UNVERIFIED and "
+                         "known to break boot on the arm base (recovery / "
+                         "RescueParty). Only for bisecting. Without this the "
+                         "command refuses.")
+    sb.add_argument("--json", action="store_true")
+    sb.set_defaults(func=cmd_strip_base)
+
     bg = sub.add_parser("bake-game",
                         help="bake a game APK into an arm image as a "
                              "pre-installed SYSTEM app, so production ships "
@@ -5294,6 +6916,25 @@ def main():
                     help="directory name under /product/app (default OmniGame)")
     bg.add_argument("--json", action="store_true")
     bg.set_defaults(func=cmd_bake_game)
+
+    bdg = sub.add_parser("bake-data-game",
+                         help="install the game into the base's /DATA and bake "
+                              "the kiosk's game package. The UPDATE-FRIENDLY "
+                              "one: re-run with a newer APK to update the game "
+                              "(~2 min, no system-image rebuild, no scratch "
+                              "space). Every run starts from the pristine "
+                              "/data, so updates never chain.")
+    bdg.add_argument("apk", nargs="?", default=None,
+                     help="game APK to install as an updated system app. "
+                          "Omit to bake only the kiosk game-package setting.")
+    bdg.add_argument("--base", default=None, help="base tag (default: current)")
+    bdg.add_argument("--package", default=None,
+                     help="package name to register as the game (default: "
+                          "base_game.<tag> from configs/paths.json). The APK is "
+                          "NOT parsed for it — Roblox never changes its package "
+                          "name and aapt2 is not installed everywhere.")
+    bdg.add_argument("--json", action="store_true")
+    bdg.set_defaults(func=cmd_bake_data_game)
 
     k = sub.add_parser("kioskify")
     k.add_argument("name")
@@ -5404,31 +7045,42 @@ def main():
     uk.add_argument("--json", action="store_true")
     uk.set_defaults(func=cmd_update_kiosk)
 
-    bdb = sub.add_parser("build-dev-base",
-                         help="build the arm dev base = base_arm + the "
-                              "base_arm_devkit.qcow2 extra disk (frida + Magisk "
-                              "+ omni tools, attached to dev accounts as vdc). "
-                              "base_arm stays immutable; current_base unchanged; "
-                              "omni-agent only, NOT shipped")
-    bdb.add_argument("--frida-version", default=DEFAULT_FRIDA_VERSION,
+    bdk = sub.add_parser("build-devkit",
+                         help="build the attachable devkit disk "
+                              "(base_<arch>_devkit.qcow2 = frida-server + omni-* "
+                              "tools + Magisk binaries). Attached as vdc only on "
+                              "an `omni start --debug` boot; changes no base")
+    bdk.add_argument("--arch", choices=("arm", "x86"), default=None,
+                     help="which arch's devkit to build (default: this host's)")
+    bdk.add_argument("--frida-version", default=DEFAULT_FRIDA_VERSION,
                      dest="frida_version",
-                     help=f"frida-server version (arm64) to stage "
+                     help=f"frida-server version to stage "
                           f"(default {DEFAULT_FRIDA_VERSION})")
-    bdb.add_argument("--frida-port", type=int, default=DEFAULT_FRIDA_PORT,
+    bdk.add_argument("--frida-port", type=int, default=DEFAULT_FRIDA_PORT,
                      dest="frida_port",
                      help=f"hidden frida-server loopback port "
                           f"(default {DEFAULT_FRIDA_PORT}, deliberately not 27042)")
-    bdb.add_argument("--no-magisk", action="store_true", dest="no_magisk",
-                     help="skip staging Magisk (root + on-device hiding then "
-                          "unavailable until a Magisk APK is dropped in)")
-    bdb.add_argument("--patch-boot", action="store_true", dest="patch_boot",
-                     help="ALSO Magisk-patch the dev system overlay's boot to "
-                          "ROOT it (needed for frida to attach). Edits the boot "
-                          "partition — brick-risky; verify on a real boot")
-    bdb.add_argument("--keep-builder", action="store_true", dest="keep_builder",
-                     help="keep the throwaway builder account dir (debug)")
-    bdb.add_argument("--json", action="store_true")
-    bdb.set_defaults(func=cmd_build_dev_base)
+    bdk.add_argument("--no-magisk", action="store_true", dest="no_magisk",
+                     help="skip staging the Magisk binaries")
+    bdk.add_argument("--json", action="store_true")
+    bdk.set_defaults(func=cmd_build_devkit)
+
+    rbb = sub.add_parser("root-base",
+                         help="make a shipped base DUAL-USE by baking a "
+                              "Magisk-patched (rooted) boot into a thin overlay "
+                              "of it, and a matched rooted /data. Same production "
+                              "image, root simply baked in + hidden every boot. "
+                              "Brick-risky (edits a boot partition)")
+    rbb.add_argument("--base", default=None,
+                     help="base tag to root (default: the host's effective base)")
+    rbb.add_argument("--frida-version", default=DEFAULT_FRIDA_VERSION,
+                     dest="frida_version",
+                     help=f"frida-server version to stage into the toolset "
+                          f"(default {DEFAULT_FRIDA_VERSION})")
+    rbb.add_argument("--frida-port", type=int, default=DEFAULT_FRIDA_PORT,
+                     dest="frida_port", help="hidden frida-server loopback port")
+    rbb.add_argument("--json", action="store_true")
+    rbb.set_defaults(func=cmd_root_base)
 
     su = sub.add_parser("setup",
                         help="first-run setup: folders + QEMU (Windows: "
@@ -5502,8 +7154,8 @@ def main():
                     help="boot the instance first if it isn't running")
     vw.add_argument("--mode", choices=list(MODES), default=None,
                     help="mode to use when --start boots the instance")
-    vw.add_argument("--dev", action="store_true",
-                    help="with --start: use the dev boot profile")
+    vw.add_argument("--debug", action="store_true",
+                    help="with --start: attach the devkit disk (frida + tools)")
     vw.add_argument("--native", action="store_true",
                     help="use the OS/native VNC client instead of the "
                          "built-in cross-platform viewer")
@@ -5615,6 +7267,11 @@ def main():
                     help="reuse the account if it already exists")
     ta.set_defaults(func=cmd_test_apk)
 
+    return p
+
+
+def main():
+    p = build_parser()
     args = p.parse_args()
     if getattr(args, "json", False):
         enable_json_mode()

@@ -26,7 +26,7 @@
       "type": "arm-uefi",
       "base_disk": "base_arm_v2.qcow2",
       "system": "base_arm_system_rooted.qcow2",
-      "data": "base_arm_data_game.qcow2",
+      "data": "base_arm_data_rooted.qcow2",
       "efivars": "base_arm_efivars.fd",
       "src": "https://github.com/jqssun/android-lineage-qemu (LineageOS 23.2 arm64, virtio_arm64only)",
       "notes": "arm64/UEFI base (LineageOS 23.2). v2 = branded + silent + insecure_adb + Roblox baked in. base_arm.qcow2 (v1) is kept because existing account overlays are still COW-backed by it. [rooted]",
@@ -43,10 +43,6 @@
         "frida_port": 27142,
         "rooted_system": "base_arm_system_rooted.qcow2",
         "rooted_data": "base_arm_data_rooted.qcow2"
-      },
-      "game_baked": {
-        "package": "com.roblox.client",
-        "apk": null
       }
     }
   },

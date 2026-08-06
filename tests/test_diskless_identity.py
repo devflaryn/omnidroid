@@ -31,21 +31,22 @@ def test_store_account_with_running_instance_yields_handle_from_run_json(
         tmp_path, monkeypatch):
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     accounts.save_account(tmp_path, "u", "cookie", 1)
-    accounts.set_fields(tmp_path, "u", base="dev")
+    accounts.set_fields(tmp_path, "u", base="prod")
+    # A DEBUG boot records debug=True in run.json (a per-boot property).
     _write_run(tmp_path, "u", pid=os.getpid(), adb_port=16005,
-               qmp_port=17005, vnc_port=18005, base="dev")
+               qmp_port=17005, vnc_port=18005, base="arm", debug=True)
 
     handle = engine.load_account("u")
 
     assert handle["name"] == "u"
-    assert handle["base"] == "dev"          # taken straight from run.json
+    assert handle["base"] == "arm"          # taken straight from run.json
     assert handle["adb_port"] == 16005
     assert handle["qmp_port"] == 17005
     assert handle["vnc_port"] == 18005
     assert handle["ephemeral"] is True
     assert handle["first_boot_done"] is True
     assert handle["game_package"] == engine.ROBLOX_PACKAGE
-    assert handle["dev"] is True
+    assert handle["debug"] is True          # per-boot, from run.json
 
 
 def test_store_account_prod_mode_no_runtime_yields_identity_only_handle(
@@ -57,10 +58,8 @@ def test_store_account_prod_mode_no_runtime_yields_identity_only_handle(
     handle = engine.load_account("p")
 
     assert handle["name"] == "p"
-    assert handle["dev"] is False
+    assert handle["debug"] is False           # not running -> never debug
     assert handle["base"]                     # truthy: a resolved cfg base tag
-    assert engine.base_is_dev(
-        engine.read_config()["bases"].get(handle["base"], {})) is False
     assert handle.get("adb_port") is None
     assert handle["ephemeral"] is True
     assert handle["first_boot_done"] is True
@@ -107,7 +106,7 @@ def test_build_acct_allocates_ports_and_writes_no_account_folder(
     assert handle["name"] == "newacct"
     assert handle["base"] == "arm"
     assert handle["ephemeral"] is True
-    assert handle["dev"] is False
+    assert handle["debug"] is False
     assert handle["first_boot_done"] is True
     assert handle["game_package"] == engine.ROBLOX_PACKAGE
     assert handle["adb_port"] == 16001

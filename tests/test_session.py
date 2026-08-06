@@ -260,7 +260,7 @@ class PlayGatesOnLogin(unittest.TestCase):
         base = dict(name="brand_new_name", place="606849621", token=None,
                     token_file=None, token_stdin=False, job=None,
                     access_code=None, link_code=None, launch_data=None,
-                    user_id=None, no_token=False, dev=False, window=False,
+                    user_id=None, no_token=False, debug=False, window=False,
                     no_window=True, mode=None, mem=None, accel=None,
                     timeout=None, json=True, apk=None)
         base.update(over)
@@ -282,8 +282,7 @@ class PlayGatesOnLogin(unittest.TestCase):
         with mock.patch.object(omni, "build_acct",
                               return_value=stub_acct) as build_mock, \
              mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
-             mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True):
+             mock.patch.object(omni, "acct_arch", return_value="arm"):
             with self.assertRaises(SystemExit):
                 omni.cmd_start(self._args(no_token=True))
         build_mock.assert_called_once()
@@ -297,8 +296,7 @@ class PlayGatesOnLogin(unittest.TestCase):
         with mock.patch.object(omni, "build_acct",
                               return_value=stub_acct) as build_mock, \
              mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
-             mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True):
+             mock.patch.object(omni, "acct_arch", return_value="arm"):
             with self.assertRaises(SystemExit):
                 omni.cmd_start(self._args(name="realuser"))
         build_mock.assert_called_once()
@@ -314,18 +312,17 @@ class PlayGatesOnLogin(unittest.TestCase):
         with mock.patch.object(omni, "build_acct",
                               return_value=stub_acct) as build_mock, \
              mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
-             mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True):
+             mock.patch.object(omni, "acct_arch", return_value="arm"):
             with self.assertRaises(SystemExit):
                 omni.cmd_start(self._args(name="realuser", place=None))
         build_mock.assert_called_once()
 
 
-class ApkFlagDevGating(unittest.TestCase):
-    """`omni start --apk <path>` (Task 1 of sub-project B): the flag is
-    dev-only and its path must exist. No install behavior here — only the
-    two early guards in cmd_start(), which must run BEFORE build_acct() so
-    a rejected --apk never boots or touches an instance."""
+class ApkFlagGating(unittest.TestCase):
+    """`omni start --apk <path>`: the APK swap works on EVERY base (no dev
+    gate) and its path must exist. No install behavior here — only the early
+    path guard in cmd_start(), which must run BEFORE build_acct() so a bad
+    --apk never boots or touches an instance."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="omni-test-repo-"))
@@ -354,7 +351,7 @@ class ApkFlagDevGating(unittest.TestCase):
         base = dict(name="realuser", place=None, token=None, token_file=None,
                     token_stdin=False, job=None, access_code=None,
                     link_code=None, launch_data=None, user_id=None,
-                    no_token=False, dev=False, window=False, no_window=True,
+                    no_token=False, debug=False, window=False, no_window=True,
                     mode=None, mem=None, accel=None, timeout=None, json=True,
                     apk=None)
         base.update(over)
@@ -371,15 +368,24 @@ class ApkFlagDevGating(unittest.TestCase):
             return orig_fail(code, *a, **k)
         return calls, mock.patch.object(omni, "fail", side_effect=_wrapped)
 
-    def test_apk_without_dev_is_rejected_before_build_acct(self):
+    def test_apk_without_debug_is_accepted(self):
         ck.save_account(str(self.tmp), "realuser", "sometoken")
+        real_apk = self.tmp / "real.apk"
+        real_apk.write_bytes(b"fake apk bytes")
+        stub_acct = {"name": "realuser", "adb_port": 1, "vnc_port": 1,
+                    "base": "arm", "game_package": omni.ROBLOX_PACKAGE}
         calls, fail_patch = self._fail_recorder()
         with fail_patch, \
-             mock.patch.object(omni, "build_acct") as build_mock:
+             mock.patch.object(omni, "build_acct",
+                              return_value=stub_acct) as build_mock, \
+             mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
+             mock.patch.object(omni, "acct_arch", return_value="arm"):
             with self.assertRaises(SystemExit):
-                omni.cmd_start(self._args(apk="x.apk", dev=False))
-            build_mock.assert_not_called()
-        self.assertEqual(calls, ["apk_dev_only"])
+                # No --debug: --apk must STILL be accepted (works on every base).
+                omni.cmd_start(self._args(apk=str(real_apk), debug=False))
+            build_mock.assert_called_once()
+        self.assertNotIn("apk_dev_only", calls)
+        self.assertNotIn("bad_apk", calls)
 
     def test_apk_nonexistent_path_is_rejected_before_build_acct(self):
         ck.save_account(str(self.tmp), "realuser", "sometoken")
@@ -387,26 +393,24 @@ class ApkFlagDevGating(unittest.TestCase):
         with fail_patch, \
              mock.patch.object(omni, "build_acct") as build_mock:
             with self.assertRaises(SystemExit):
-                omni.cmd_start(self._args(apk="/nonexistent/path.apk",
-                                          dev=True))
+                omni.cmd_start(self._args(apk="/nonexistent/path.apk"))
             build_mock.assert_not_called()
         self.assertEqual(calls, ["bad_apk"])
 
-    def test_apk_valid_path_with_dev_passes_validation(self):
+    def test_apk_valid_path_passes_validation(self):
         ck.save_account(str(self.tmp), "realuser", "sometoken")
         real_apk = self.tmp / "real.apk"
         real_apk.write_bytes(b"fake apk bytes")
         stub_acct = {"name": "realuser", "adb_port": 1, "vnc_port": 1,
-                    "base": "dev", "game_package": omni.ROBLOX_PACKAGE}
+                    "base": "arm", "game_package": omni.ROBLOX_PACKAGE}
         calls, fail_patch = self._fail_recorder()
         with fail_patch, \
              mock.patch.object(omni, "build_acct",
                               return_value=stub_acct) as build_mock, \
              mock.patch.object(omni, "_ensure_booted", return_value=(False, True)), \
-             mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True):
+             mock.patch.object(omni, "acct_arch", return_value="arm"):
             with self.assertRaises(SystemExit):
-                omni.cmd_start(self._args(apk=str(real_apk), dev=True))
+                omni.cmd_start(self._args(apk=str(real_apk)))
             build_mock.assert_called_once()
         self.assertNotIn("apk_dev_only", calls)
         self.assertNotIn("bad_apk", calls)
@@ -446,7 +450,7 @@ class StartHomeVsJoin(unittest.TestCase):
         base = dict(name="realuser", place=None, token=None, token_file=None,
                     token_stdin=False, job=None, access_code=None,
                     link_code=None, launch_data=None, user_id=None,
-                    no_token=False, dev=False, window=False, no_window=True,
+                    no_token=False, debug=False, window=False, no_window=True,
                     mode=None, mem=None, accel=None, timeout=None, json=True)
         base.update(over)
         return SimpleNamespace(**base)
@@ -457,7 +461,6 @@ class StartHomeVsJoin(unittest.TestCase):
         with mock.patch.object(omni, "build_acct", return_value=stub_acct), \
              mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True), \
              mock.patch.object(omni, "deliver_session",
                               return_value={"delivered": True}) as deliver_mock, \
              mock.patch.object(omni, "_spawn_builtin_viewer"):
@@ -483,8 +486,8 @@ class StartHomeVsJoin(unittest.TestCase):
 
 
 class ApkInstallOnStart(unittest.TestCase):
-    """`omni start <name> --dev --apk <path>` (Task 2 of sub-project B) must
-    install the APK on the dev base AFTER boot and BEFORE delivering the
+    """`omni start <name> --apk <path>` must
+    install the APK on ANY base AFTER boot and BEFORE delivering the
     session -- a failed install must never hand the account a session, and
     the default (no --apk) path must never call the installer at all."""
 
@@ -517,7 +520,7 @@ class ApkInstallOnStart(unittest.TestCase):
         base = dict(name="realuser", place=None, token=None, token_file=None,
                     token_stdin=False, job=None, access_code=None,
                     link_code=None, launch_data=None, user_id=None,
-                    no_token=False, dev=True, window=False, no_window=True,
+                    no_token=False, debug=False, window=False, no_window=True,
                     mode=None, mem=None, accel=None, timeout=None, json=True,
                     apk=str(self.real_apk))
         base.update(over)
@@ -537,7 +540,6 @@ class ApkInstallOnStart(unittest.TestCase):
         with mock.patch.object(omni, "build_acct", return_value=self._stub_acct()), \
              mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True), \
              mock.patch.object(omni, "roblox_deeplink", return_value=None), \
              mock.patch.object(omni, "public_session", return_value={}), \
              mock.patch.object(omni, "_install_apk", install_mock), \
@@ -566,7 +568,6 @@ class ApkInstallOnStart(unittest.TestCase):
         with mock.patch.object(omni, "build_acct", return_value=self._stub_acct()), \
              mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True), \
              mock.patch.object(omni, "roblox_deeplink", return_value=None), \
              mock.patch.object(omni, "public_session", return_value={}), \
              mock.patch.object(omni, "_install_apk", install_mock), \
@@ -586,18 +587,17 @@ class ApkInstallOnStart(unittest.TestCase):
         with mock.patch.object(omni, "build_acct", return_value=self._stub_acct()), \
              mock.patch.object(omni, "_ensure_booted", return_value=(True, False)), \
              mock.patch.object(omni, "acct_arch", return_value="arm"), \
-             mock.patch.object(omni, "acct_is_dev", return_value=True), \
              mock.patch.object(omni, "roblox_deeplink", return_value=None), \
              mock.patch.object(omni, "public_session", return_value={}), \
              mock.patch.object(omni, "_install_apk", install_mock), \
              mock.patch.object(omni, "deliver_session", deliver_mock):
-            omni.cmd_start(self._args(apk=None, dev=False))
+            omni.cmd_start(self._args(apk=None))
         install_mock.assert_not_called()
         deliver_mock.assert_called_once()
 
 
 class ApkBootstrapLoginProbe(unittest.TestCase):
-    """`omni start <name> --dev --apk <path>` (Task 3 of sub-project B) must
+    """`omni start <name> --apk <path>` must
     verify the account actually logged in -- a plain/stock Roblox APK can't
     read the delivered session cookie and silently lands on a Sign In page.
     After deliver_session reports delivered, poll guest logcat for the
@@ -634,7 +634,7 @@ class ApkBootstrapLoginProbe(unittest.TestCase):
         base = dict(name="realuser", place=None, token=None, token_file=None,
                     token_stdin=False, job=None, access_code=None,
                     link_code=None, launch_data=None, user_id=None,
-                    no_token=False, dev=True, window=False, no_window=True,
+                    no_token=False, debug=False, window=False, no_window=True,
                     mode=None, mem=None, accel=None, timeout=None, json=True,
                     apk=str(self.real_apk))
         base.update(over)
@@ -653,7 +653,6 @@ class ApkBootstrapLoginProbe(unittest.TestCase):
             enter(mock.patch.object(omni, "_ensure_booted",
                                      return_value=(True, False)))
             enter(mock.patch.object(omni, "acct_arch", return_value="arm"))
-            enter(mock.patch.object(omni, "acct_is_dev", return_value=True))
             enter(mock.patch.object(omni, "roblox_deeplink",
                                      return_value=None))
             enter(mock.patch.object(omni, "public_session",
@@ -695,7 +694,7 @@ class ApkBootstrapLoginProbe(unittest.TestCase):
         captured = {}
         with self._patched(deliver_result, False, captured) as \
                 (deliver_mock, probe_mock):
-            omni.cmd_start(self._args(apk=None, dev=False))
+            omni.cmd_start(self._args(apk=None))
         probe_mock.assert_not_called()
         self.assertTrue(captured.get("ok"))
 

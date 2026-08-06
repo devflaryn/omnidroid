@@ -191,10 +191,16 @@ def _validate_place_id(v):
 
 
 def _validate_base(v):
+    """The store's coarse base MODE. There is no separate dev base any more —
+    every shipped base is dual-use — so "prod" is the only mode. "dev" is still
+    ACCEPTED and normalized to "prod" so accounts saved by an older build keep
+    loading instead of hard-failing on read."""
     if v is None:
         return None
-    if v not in ("prod", "dev"):
-        raise ValueError(f"base must be 'prod' or 'dev', got {v!r}")
+    if v == "dev":
+        return "prod"
+    if v != "prod":
+        raise ValueError(f"base must be 'prod', got {v!r}")
     return v
 
 

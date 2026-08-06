@@ -68,7 +68,46 @@ Fill this in, then commit this file (`git add` + `git commit`):
 - **Render verdict** (ACCELERATED / SOFTWARE / BLACK):
 - **Notes** (how the framerate felt, anything odd, any anti-cheat/kick behavior):
 
-### Partial result (2026-07-21, INCONCLUSIVE — pending re-run)
+### RESOLVED (2026-08-06) — the spike could not have worked as written
+
+The experiment above never needed the Mac to answer it; the QEMU binary
+answers it directly, and the answer is that this host has no OpenGL at all:
+
+```
+$ qemu-system-aarch64 -display cocoa,gl=on
+qemu-system-aarch64: OpenGL support was not enabled in this build of QEMU
+$ qemu-system-aarch64 -device help | grep gpu
+name "virtio-gpu-pci", bus PCI, alias "virtio-gpu"        # no -gl variant
+$ brew info virglrenderer
+Error: No available formula with the name "virglrenderer".
+```
+
+`virtio-gpu-gl` is not a device model on this build, so
+`OMNI_GL_WINDOW=1 omni start` produced a command QEMU exits on rather than a
+window. Whatever was seen on 2026-07-21 as "the menu felt smoother", it was
+not the GL path — that command could not have started.
+
+**So the verdict is neither ACCELERATED nor SOFTWARE/BLACK: the experiment was
+untestable on this host, and the blocker is host-side, not guest-side.**
+
+What replaced it (see `MODES.md` and the 2026-08-06 CHANGELOG entry): the
+window path is now capability-detected with three tiers — `gl`, `window`
+(native window, software rendering) and `none` — and this host lands on
+`window`, which is live and verified. `omni start <acct> --mode gaming` is the
+supported command; `OMNI_GL_WINDOW` remains as an alias.
+
+Getting a real answer to the ORIGINAL question now needs, in order:
+
+1. a QEMU built `--enable-opengl --enable-virglrenderer` (source build on
+   macOS; virglrenderer has no Homebrew formula), then
+2. the guest question, which is the real B3: LineageOS arm64 renders in
+   software here, so even a virgl-capable QEMU needs a guest driver stack that
+   can drive it.
+
+Step 2 is the larger piece and is unchanged by any of this. The Task-1
+apparatus stays as the reproduction switch.
+
+### Partial result (2026-07-21, INCONCLUSIVE — superseded by the above)
 - The accelerated window opened and the Roblox MENU already felt **noticeably
   smoother** than software rendering — an early positive (ACCELERATED-leaning)
   signal.

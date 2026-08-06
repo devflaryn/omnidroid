@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""Re-registering the dev base must PRESERVE an existing base_disk and notes.
-
-`build_dev_base` rewrites bases.dev wholesale. Copying base_disk from the arm
-base silently repoints dev from base_arm.qcow2 to base_arm_v2.qcow2 -- changing
-which image the dev guest actually boots, with no log line and no opt-in. The
-dev system image is STANDALONE (it shadows the shared base -- see
-_brand_target), so its base_disk is an independent choice, not something to
-inherit from the arm base on every rebuild.
+"""Auto-registration of the DUAL-USE bases: an arm/x86 base prefers its ROOTED
+matched pair when those images exist, and falls back to the unrooted images
+(with a "root pending" note) when they don't. There is no separate dev base.
 
     python3 tests/test_dev_base_registration.py     (or: pytest tests/)
 """
@@ -15,104 +10,80 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omnidroid import engine as omni  # noqa: E402
+from omnidroid import bases as b  # noqa: E402
 
 
-class DevBaseReRegistration(unittest.TestCase):
+class ArmRootedRegistration(unittest.TestCase):
+    """autoregister_bases picks the rooted matched pair over the unrooted one
+    whenever base_arm_system_rooted.qcow2 + base_arm_data_rooted.qcow2 exist."""
+
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="omni-devreg-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="omni-reg-"))
+        self.images = self.tmp / "images"
+        self.images.mkdir()
         self.cfg_path = self.tmp / "paths.json"
-        self.existing = {
-            "current_base": "x86",
-            "bases": {
-                "arm": {"type": "arm-uefi", "base_disk": "base_arm_v2.qcow2",
-                        "system": "base_arm_system.qcow2",
-                        "data": "base_arm_data.qcow2",
-                        "efivars": "base_arm_efivars.fd"},
-                "dev": {"type": "arm-uefi", "base_disk": "base_arm.qcow2",
-                        "system": "base_arm_devsystem.qcow2",
-                        "data": "base_arm_devdata.qcow2",
-                        "notes": "hand-written note that must survive"},
-            },
-        }
-        self.cfg_path.write_text(json.dumps(self.existing))
+        self.cfg_path.write_text(json.dumps({"images_dir": str(self.images),
+                                             "current_base": None, "bases": {}}))
+        self._patches = [
+            unittest.mock.patch.object(omni, "CONFIG_PATH", self.cfg_path),
+            unittest.mock.patch.object(b, "CONFIG_PATH", self.cfg_path),
+            unittest.mock.patch.dict(os.environ,
+                                     {"OMNI_IMAGES_DIR": str(self.images)}),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
 
-    def _entry(self, raw=None, rooted=True):
-        raw = raw if raw is not None else json.loads(self.cfg_path.read_text())
-        arm = raw["bases"]["arm"]
-        return omni._dev_base_entry(
-            raw, arm, devkit_disk="base_arm_devkit.qcow2",
-            dev_data="base_arm_devdata.qcow2", frida_version="17.15.4",
-            frida_port=27142, magisk=True, magisk_version="v30.7",
-            rooted=rooted)
+    def _touch(self, *names):
+        for n in names:
+            (self.images / n).write_bytes(b"x")
 
-    def test_existing_base_disk_is_preserved(self):
-        entry = self._entry()
-        self.assertEqual(entry["base_disk"], "base_arm.qcow2",
-                         "re-registration must not repoint dev at the arm base disk")
+    def _arm_files(self):
+        self._touch(b.ARM_BASE_DISK, b.ARM_BASE_SYSTEM, b.ARM_BASE_DATA,
+                    b.ARM_BASE_EFIVARS)
 
-    def test_existing_notes_are_preserved(self):
-        entry = self._entry()
-        self.assertIn("hand-written note", entry["notes"])
-
-    def test_rooted_flag_still_updates(self):
-        entry = self._entry(rooted=True)
-        self.assertTrue(entry["devkit_manifest"]["rooted"])
-        entry = self._entry(rooted=False)
-        self.assertFalse(entry["devkit_manifest"]["rooted"])
-
-    def test_system_always_tracks_the_canonical_devsystem(self):
-        # `system` is NOT sticky: build-dev-base owns which devsystem file the
-        # dev base uses, so a temporary repoint (e.g. a probe image) is not
-        # silently made permanent by a rebuild.
-        raw = json.loads(self.cfg_path.read_text())
-        raw["bases"]["dev"]["system"] = "base_arm_devsystem_probe.qcow2"
-        entry = self._entry(raw)
-        self.assertEqual(entry["system"], omni.ARM_DEVSYSTEM_DISK)
-
-    def test_preserved_notes_get_a_truthful_root_marker(self):
-        # Sticky notes must not outlive the fact they assert. A preserved note
-        # saying "root pending" after the boot HAS been patched would contradict
-        # devkit_manifest.rooted sitting directly below it.
-        raw = json.loads(self.cfg_path.read_text())
-        raw["bases"]["dev"]["notes"] = (
-            "arm dev base: hand-written context [root pending: --patch-boot]. "
-            "hidden frida port 27142.")
-        entry = self._entry(raw, rooted=True)
-        self.assertIn("hand-written context", entry["notes"],
-                      "the human-written part of the note must survive")
-        self.assertNotIn("root pending", entry["notes"])
-        self.assertIn("[rooted]", entry["notes"])
-
-    def test_root_marker_downgrades_when_root_is_lost(self):
-        raw = json.loads(self.cfg_path.read_text())
-        raw["bases"]["dev"]["notes"] = "arm dev base: context [rooted]. port 27142."
-        entry = self._entry(raw, rooted=False)
-        self.assertIn("context", entry["notes"])
-        self.assertNotIn("[rooted]", entry["notes"])
+    def test_unrooted_arm_registers_root_pending(self):
+        self._arm_files()
+        raw, new = b.autoregister_bases()
+        self.assertIn("arm", raw["bases"])
+        entry = raw["bases"]["arm"]
+        self.assertFalse(entry.get("rooted"))
+        self.assertEqual(entry["system"], b.ARM_BASE_SYSTEM)
         self.assertIn("root pending", entry["notes"])
 
-    def test_notes_without_a_marker_are_left_alone(self):
-        raw = json.loads(self.cfg_path.read_text())
-        entry = self._entry(raw, rooted=True)
-        self.assertEqual(entry["notes"], "hand-written note that must survive")
+    def test_rooted_pair_is_preferred_when_present(self):
+        self._arm_files()
+        self._touch(b.ARM_ROOTED_SYSTEM, b.ARM_ROOTED_DATA)
+        raw, new = b.autoregister_bases()
+        entry = raw["bases"]["arm"]
+        self.assertTrue(entry["rooted"])
+        self.assertEqual(entry["system"], b.ARM_ROOTED_SYSTEM)
+        self.assertEqual(entry["data"], b.ARM_ROOTED_DATA)
+        self.assertIn("[rooted]", entry["notes"])
 
-    def test_fresh_registration_falls_back_to_arm_base_disk(self):
-        raw = json.loads(self.cfg_path.read_text())
-        del raw["bases"]["dev"]
-        entry = self._entry(raw)
-        self.assertEqual(entry["base_disk"], "base_arm_v2.qcow2",
-                         "with no existing dev entry, inherit the arm base disk")
+    def test_no_dev_base_is_ever_registered(self):
+        self._arm_files()
+        self._touch(b.ARM_DEVKIT_DISK)   # devkit disk present…
+        raw, new = b.autoregister_bases()
+        # …but it is NOT a base; only the arm base is registered.
+        self.assertEqual(set(raw["bases"]), {"arm"})
 
-    def test_fresh_registration_generates_notes_reflecting_root_state(self):
-        raw = json.loads(self.cfg_path.read_text())
-        del raw["bases"]["dev"]
-        self.assertIn("[rooted]", self._entry(raw, rooted=True)["notes"])
-        self.assertIn("root pending", self._entry(raw, rooted=False)["notes"])
+
+class DevkitIsArchGeneric(unittest.TestCase):
+    def test_devkit_name_per_arch(self):
+        self.assertEqual(b.devkit_disk_name("arm"), "base_arm_devkit.qcow2")
+        self.assertEqual(b.devkit_disk_name("x86"), "base_x86_devkit.qcow2")
+
+    def test_base_is_rooted_reads_the_flag(self):
+        self.assertTrue(b.base_is_rooted({"rooted": True}))
+        self.assertFalse(b.base_is_rooted({}))
 
 
 if __name__ == "__main__":
+    import unittest.mock  # noqa: F401
     unittest.main(verbosity=2)
