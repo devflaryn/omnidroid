@@ -41,6 +41,85 @@ Host: macOS / Apple Silicon, QEMU 11.0.2 (Homebrew), `-accel hvf -cpu host`.
 | `direct-io` migration parameter | **Not available** in this build (`No build-time support for direct-io`). Optional; enabled only where the build accepts it. |
 | WHPX (Windows) migration support | **UNVERIFIED.** Spiked in Phase 1. See §8. |
 
+## 2b. Spike results — real arm64 guest (2026-08-09)
+
+§2 was probed on a toy VM. A second spike ran the **real** LineageOS arm64 guest
+with the full production headless topology (EDK2 pflash vars, virtio-blk
+system+data, virtio-gpu-pci, nec-usb-xhci + tablet + kbd, slirp with hostfwd,
+VNC, virtio-balloon with free-page-reporting, virtio-rng), at 4096 MB / 4 vCPU.
+
+| Measurement | Result |
+| --- | --- |
+| Cold boot to `sys.boot_completed` | **19.5-20.3 s** |
+| Bake (`stop` + `migrate file:`) | **17.1-19.5 s**, one-time |
+| **Restore to live Android** | **2.8-6.2 s** (migration load alone 2.0-3.1 s) |
+| State file | 4.2 GiB apparent / **2.3-2.5 GiB actual** (sparse) |
+| Golden entry unmodified by restores | **Yes** — `snapshot=on` sharing holds |
+| Post-restore product checks | `boot_completed`, arm64 abilist, adb shell, package manager, kiosk present, VNC serving — **all pass** |
+
+Cold boot measures spawn -> `boot_completed` only, which is why it is below the
+31-40 s figure in CHANGELOG (that includes first-boot and post-boot work).
+
+Three findings changed the design:
+
+**(a) Restore needs `-incoming defer`, not `-incoming file:`.** `mapped-ram` and
+`multifd` must be enabled on the *destination* before the stream is read, and
+capabilities can only be set over QMP. A plain `-incoming file:` dies with
+`Capability mapped-ram is off, but received capability is on`. The restore path
+is therefore: spawn with `-incoming defer` -> QMP handshake
+(`migrate-set-capabilities` + `migrate-set-parameters`) -> `migrate-incoming` ->
+wait `completed` -> `cont`.
+
+**(b) Clock skew is real and `-rtc base=utc,clock=host` does NOT fix it.**
+Measured skew equalled the wall time between bake and restore exactly (22-28 s
+in a test run seconds after baking; a day-old entry wakes a day behind).
+`adb shell su -c "date -s @<epoch>"` corrected it to **0 s**. §7's clock step is
+mandatory, not defensive.
+
+**(c) BLOCKER — a second concurrent restore from one entry is unreachable over
+adb.** See §8b.
+
+## 8b. Open blocker: concurrent restore and adb
+
+**Evidence.** One restored instance works reliably (adb up in 3.1 s). A second
+instance restored concurrently from the same golden entry loads its migration
+successfully and **is alive** — VNC serves on both — but its adb transport sits
+`offline` and never completes the handshake.
+
+Ruled out by experiment:
+
+- *Not* a per-instance defect: the second instance restored **alone** works
+  (adb up in 3.1 s).
+- *Not* pre-existing: **two concurrent cold boots** from the same shared
+  template both stay `device` and both answer adb. Restore introduces this.
+- *Not* host-side adb-server deduplication: giving each instance its **own** adb
+  server (`ANDROID_ADB_SERVER_PORT`) did not help — the second is still
+  `offline`.
+- *Not* fixed by quiescing adbd at bake time: `stop adbd; start adbd` before
+  freezing made it **worse** (adbd not listening in the frozen image, so *both*
+  instances failed). Do not retry this without verifying adbd is actually
+  listening at the freeze point.
+
+**Leading hypothesis** (unconfirmed): the guest's adbd carries established
+socket/identity state into the snapshot, and every restored instance replays it
+identically, so two of them cannot both complete the ADB handshake against the
+same host. Root-causing is Phase 1 work, not design work.
+
+**Interim rule, which ships regardless of root cause:**
+
+> Restore only when **no other running instance is using the same golden
+> entry**. Otherwise cold-boot.
+
+This is correct under all the evidence above: the first instance restores fast,
+any concurrent sibling cold-boots at today's speed, and both work. It preserves
+§4's spine, gives the win to the common single-instance `playable` case
+immediately, and leaves farming at today's behaviour until the blocker is
+solved. Lifting the rule is a Phase 2 item gated on a root cause.
+
+**Not yet verified:** a restored instance running concurrently with a
+*cold-booted* one. Phase 1 must test this before the interim rule is trusted for
+mixed fleets.
+
 ## 3. Mechanism decision
 
 Three options were considered.
@@ -181,8 +260,9 @@ Owns the cache and nothing else. Pure functions, unit-testable with no QEMU:
 `warm` parameter:
 
 - **Restore:** system/data point at the entry's warm overlays (still
-  `snapshot=on`, so N concurrent instances are unchanged), efivars copied from
-  the entry, `-incoming file:<entry>/state` appended, mem/smp forced from meta.
+  `snapshot=on` — verified to leave the entry byte-identical), efivars copied
+  from the entry, `-incoming defer` appended (see §2b(a)), mem/smp forced from
+  meta. The load is then driven over QMP, not by the command line.
 - **Bake:** real writable overlays under a temp bake dir instead of
   `snapshot=on`, so the freeze point is persistable.
 - `-rtc base=utc,clock=host` on both paths (see §7).
@@ -229,10 +309,12 @@ again.
 ## 7. Post-restore step order (the "must not break" list)
 
 1. **Clock resync — first, before anything touches Roblox.** A restored guest
-   wakes with its wall clock frozen at bake time. `-rtc base=utc,clock=host`
-   supplies a correct RTC at restore; the guest is then forced to re-read it.
-   Skipping this breaks TLS certificate validation and cookie acceptance, which
-   would present as "auto-login stopped working".
+   wakes with its wall clock frozen at bake time; measured skew equals the wall
+   time since the bake. `-rtc base=utc,clock=host` **does not** correct it
+   (verified). The fix that works is an explicit guest set —
+   `adb shell su -c "date -s @<host_epoch>"` — which brought skew to 0 s in the
+   spike. Skipping this breaks TLS certificate validation and cookie
+   acceptance, which would present as "auto-login stopped working".
 2. `_enforce_hiding` — unchanged, idempotent, already per-boot.
 3. `assert_kiosk_game` — unchanged.
 4. Mode tuning (quality / zram / squeeze / balloon / cpuset pin) — unchanged.
@@ -296,6 +378,11 @@ visible.
 within tolerance of host, cookie delivered and account logged in, place joined,
 CLI contract surface answers on the restored instance.
 
+**Concurrency (§8b):** a second launch against an entry already in use
+cold-boots instead of restoring; a restored instance and a cold-booted one run
+side by side with both reachable over adb (currently unverified — must be
+tested before the interim rule is trusted).
+
 **Regression:** `--debug` neither reads nor writes the cache; a base version
 bump misses; a different offset misses; a bake failure still yields a working
 instance; a corrupt/poisoned `state` file is deleted and the launch falls back
@@ -313,12 +400,19 @@ without interfering.
   (all ephemeral instances boot the same `/data` template), so restore
   introduces no regression.
 
-## 13. Expected result and honest caveat
+## 13. Expected result and honest caveats
 
-Android boot should fall from ~35 s to roughly 2-4 s.
+**Measured, not estimated (§2b):** the Android half falls from **19.5-20.3 s to
+2.8-6.2 s** on the real guest. That part of the goal is demonstrated, not
+promised.
 
-Whether the **end-to-end** `start` -> in-place target of 15 s is met depends on
-Phase 0's Roblox number, which is currently unknown. If Roblox's own cold start
-exceeds roughly 12 s, 15 s is not reachable by this design alone and the
-deferred warm-Roblox freeze becomes necessary. Phase 0 settles it; the option
-stays open.
+Three caveats stand between that and "done":
+
+1. **The Roblox half is still unmeasured.** Whether the end-to-end `start` ->
+   in-place target of 15 s is met depends on Phase 0's number. If Roblox's own
+   cold start exceeds roughly 12 s, 15 s is not reachable by this design alone
+   and the deferred warm-Roblox freeze becomes necessary. The option stays open.
+2. **Concurrent restore is blocked (§8b).** Until root-caused, only one instance
+   per golden entry gets the fast path; siblings cold-boot. `playable`'s common
+   single-instance case gets the full win now; farming does not.
+3. **Windows/WHPX is unverified (§8).** It degrades to today's behaviour.
