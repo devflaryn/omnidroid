@@ -1495,7 +1495,11 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
                                 debug=debug, warm=warm, bake=bake)
 ```
 
-(keep the rest of the existing x86 body unchanged below that).
+**The x86 body needs the SAME treatment — this feature is not arm-only.** Give it the identical three behaviours: `warm` set sources both disks from the entry, opens them `snapshot=on`, and appends `-incoming defer`; `bake` set uses real writable overlays with no `snapshot=on` and no `-incoming`; neither set emits exactly what it emits today. The x86 base boots by direct kernel (`-kernel`/`-initrd`/`-append`) rather than UEFI pflash, so it has no efivars to source from the entry — omit that part rather than faking it.
+
+Leaving x86 out is the failure this plan originally shipped: the cache would bake entries, find them, and then boot cold anyway, with no error and no log line. It looks healthy and does nothing, and nothing points at the architecture as the cause.
+
+Passing BOTH `warm` and `bake` must raise `ValueError` in both builders. Restore winning is the right precedence, but no legitimate caller passes both, so it is a programming error and deserves a diagnostic rather than a silent choice.
 
 Finally, forward the flags from `spawn_qemu`:
 
