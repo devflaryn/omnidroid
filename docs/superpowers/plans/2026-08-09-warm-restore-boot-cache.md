@@ -25,6 +25,7 @@
 - **Use `python3.13 -m pytest tests/<file> -q`.** On this machine bare `python3` is 3.14 and has no pytest; only `python3.13` does (pytest 9.1.1). `python3 -m unittest discover -s tests -p "<file>"` also works as a fallback. Wherever a task below says `python3 -m pytest`, run `python3.13 -m pytest`.
 - **Full-suite baseline (measured 2026-08-09, commit 41e3644): `539 passed, 76 subtests passed`, zero failures.** "No new failures" means the suite must still finish with zero failures and at least 539 passing.
 - Commit after every task.
+- **Pre-existing uncommitted WIP.** This branch was cut from a working tree with ~47 modified files. `omnidroid/qemu_proc.py` and `omnidroid/runtime.py` still carry unrelated uncommitted changes authored earlier by someone else (`omnidroid/engine.py` did too, and was swept into the Task 2 commit). When a task edits one of these files, its hunks interleave with that WIP inside the same functions, so `git add <file>` commits both and no safe hunk-level split exists. This is expected — **do not try to separate them, do not revert or "clean up" anything you did not write, and do not reformat the file.** Say so plainly in the commit message: name the file, and state that it contains pre-existing unrelated changes alongside the task's own. An accurate message is the requirement; a surgically clean commit is not.
 
 ## File Structure
 
