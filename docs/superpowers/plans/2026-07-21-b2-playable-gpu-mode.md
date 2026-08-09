@@ -33,7 +33,7 @@
 
 ## Task 1: Spike apparatus — `OMNI_GL_WINDOW` arg-swap (OFFLINE, TDD)
 
-**Why first, before the runbook:** the user is not technical and cannot hand-paste a ~40-arg QEMU command. This tiny, reversible env-var swap turns the spike into a one-line `OMNI_GL_WINDOW=1 omni start ...`. It changes NOTHING unless the env var is set.
+**Why first, before the runbook:** the user is not technical and cannot hand-paste a ~40-arg QEMU command. This tiny, reversible env-var swap turns the spike into a one-line `OMNI_GL_WINDOW=1 omnidroid start ...`. It changes NOTHING unless the env var is set.
 
 **Files:**
 - Modify: `omnidroid/engine.py` (arm block 1259-1260, + a helper)
@@ -194,8 +194,8 @@ running and joined to a place, and look at how it renders.
 
 ## Steps (copy/paste each command)
 
-1. Pick a logged-in account name you already have (from `omni login`). Call it
-   ACCT below. If you have none, run `omni login` first.
+1. Pick a logged-in account name you already have (from `omnidroid login`). Call it
+   ACCT below. If you have none, run `omnidroid login` first.
 
 2. Start it WITH the accelerated window (the `OMNI_GL_WINDOW=1` prefix is the
    only difference from a normal start):
@@ -212,7 +212,7 @@ running and joined to a place, and look at how it renders.
        adb -s 127.0.0.1:16001 install -r "$HOME/Desktop/overnight tests/update test/roblox-v2.726-bootstrap.apk"
 
    (16001 is the default adb port of the first instance; if you started a second
-   one it's 16002, etc. `omni list` shows ports.)
+   one it's 16002, etc. `omnidroid list` shows ports.)
 
 4. In the window, let Roblox open and log in (the bootstrap cookie handles it),
    then join place id **8737899170** (the account/session should deep-link; if it
@@ -522,7 +522,7 @@ raw spike swap; OMNI_GL_WINDOW still drives the play request."
 
 Deliverable: `docs/superpowers/runbooks/B2-playable-confirm.md`.
 
-- [ ] **Step 1** — Write the runbook: (a) `OMNI_GL_WINDOW=1 omni start ACCT --mode playable` opens the accelerated window and Roblox renders accelerated joined to place 8737899170 (bootstrap APK); (b) a NORMAL `omni start ACCT --mode farming` still boots headless (no window); (c) forcing unavailability (e.g. `omni start` on a headless SSH session, or a QEMU without virtio-gpu-gl) DEGRADES to headless+VNC with the honest reason line and does NOT crash. Record all three.
+- [ ] **Step 1** — Write the runbook: (a) `OMNI_GL_WINDOW=1 omnidroid start ACCT --mode playable` opens the accelerated window and Roblox renders accelerated joined to place 8737899170 (bootstrap APK); (b) a NORMAL `omnidroid start ACCT --mode farming` still boots headless (no window); (c) forcing unavailability (e.g. `omnidroid start` on a headless SSH session, or a QEMU without virtio-gpu-gl) DEGRADES to headless+VNC with the honest reason line and does NOT crash. Record all three.
 - [ ] **Step 2** — Run it on the Mac; record results.
 - [ ] **Step 3** — Commit the runbook: `git add docs/superpowers/runbooks/B2-playable-confirm.md && git commit -m "docs(b2): playable-GL live confirm (accel + farming-headless + degrade)"`.
 

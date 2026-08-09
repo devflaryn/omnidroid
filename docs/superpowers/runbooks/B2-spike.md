@@ -18,8 +18,8 @@ Roblox running and joined to a place, and look at how it renders.
 
 ## Steps (copy/paste each command)
 
-**1. Pick a logged-in account name** you already have (from `omni login`).
-Call it `ACCT` in the commands below. If you have none yet, run `omni login`
+**1. Pick a logged-in account name** you already have (from `omnidroid login`).
+Call it `ACCT` in the commands below. If you have none yet, run `omnidroid login`
 first and use that username.
 
 **2. Start it WITH the accelerated window.** The only difference from a normal
@@ -42,7 +42,7 @@ adb -s 127.0.0.1:16001 install -r "$HOME/Desktop/overnight tests/update test/rob
 ```
 
 - `16001` is the default adb port of the first instance. If you started a second
-  instance it's `16002`, and so on — `omni list` shows each instance's ports.
+  instance it's `16002`, and so on — `omnidroid list` shows each instance's ports.
 
 **4. Get into the game.** In the window, let Roblox open and log in (the
 bootstrap cookie logs you in automatically), then **join place id
@@ -83,7 +83,7 @@ Error: No available formula with the name "virglrenderer".
 ```
 
 `virtio-gpu-gl` is not a device model on this build, so
-`OMNI_GL_WINDOW=1 omni start` produced a command QEMU exits on rather than a
+`OMNI_GL_WINDOW=1 omnidroid start` produced a command QEMU exits on rather than a
 window. Whatever was seen on 2026-07-21 as "the menu felt smoother", it was
 not the GL path — that command could not have started.
 
@@ -93,7 +93,7 @@ untestable on this host, and the blocker is host-side, not guest-side.**
 What replaced it (see `MODES.md` and the 2026-08-06 CHANGELOG entry): the
 window path is now capability-detected with three tiers — `gl`, `window`
 (native window, software rendering) and `none` — and this host lands on
-`window`, which is live and verified. `omni start <acct> --mode gaming` is the
+`window`, which is live and verified. `omnidroid start <acct> --mode gaming` is the
 supported command; `OMNI_GL_WINDOW` remains as an alias.
 
 Getting a real answer to the ORIGINAL question now needs, in order:
@@ -130,5 +130,5 @@ apparatus stays as the reproduction switch.
   in blind.
 
 Either way, this experiment is safe and reversible: the `OMNI_GL_WINDOW` switch
-does nothing unless you set it, so your normal `omni start` and all farming
+does nothing unless you set it, so your normal `omnidroid start` and all farming
 instances are completely unaffected.

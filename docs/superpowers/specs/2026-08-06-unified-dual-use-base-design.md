@@ -20,7 +20,7 @@ them is the whole design:
 | **Toolkit** (frida-server, `omni-*` scripts) | the vdc devkit disk, welded to the dev base | an attachable disk, opt-in per boot |
 
 `dev` therefore stops being a **base** and becomes a **boot option**:
-`omni start <acct> --debug` / agent `debug=true` attaches the devkit as vdc.
+`omnidroid start <acct> --debug` / agent `debug=true` attaches the devkit as vdc.
 The base underneath is the same production image either way.
 
 This kills the drift that made today's dev base a generation behind
@@ -37,8 +37,8 @@ the dev-only gating on `start --apk` and on auto-screenshots, and the
 
 `build-dev-base` splits into two orthogonal commands:
 
-- `omni build-devkit [--arch arm|x86]` — builds the attachable toolkit disk.
-- `omni root-base <tag>` — Magisk-patches a base's system overlay to root it.
+- `omnidroid build-devkit [--arch arm|x86]` — builds the attachable toolkit disk.
+- `omnidroid root-base <tag>` — Magisk-patches a base's system overlay to root it.
 
 Separately, `spawn_qemu(acct, cfg, dev=...)` is a *different* "dev": it means
 **interactive-window boot profile**, not dev base. Renamed to `interactive`
@@ -105,7 +105,7 @@ shippable before Phase 2 produces the images.
   supports it) rather than relying on DenyList alone.
 - The zram/balloon-1024 tuning was measured on an **unrooted** instance.
   Rooting adds magiskd + Zygisk to every zygote, so Phase 2 re-runs
-  `omni measure`.
+  `omnidroid measure`.
 - x86 cannot be boot-verified on an Apple Silicon host except under very slow
   TCG. The x86 half ships code-complete and image-built; live verification
   happens on the x86 box.
