@@ -195,17 +195,43 @@ def touch(entry):
         pass
 
 
+def _safe_iterdir(root):
+    """List a directory's children; an unreadable root degrades to empty.
+
+    Path.iterdir() raises PermissionError/OSError on a directory that
+    exists but can't be read (permissions damage, a corrupted mount) --
+    unlike Path.glob(), which is why entry_bytes() doesn't need this. A
+    housekeeping sweep must treat that the same as an empty cache, not
+    crash the whole sweep over one unreadable root.
+    """
+    try:
+        return list(root.iterdir())
+    except OSError:
+        return []
+
+
+def _safe_last_used(value):
+    """Coerce a meta.json `last_used` value to float; anything unusable
+    (missing, None, non-numeric string, ...) degrades to 0.0, which sorts
+    the entry oldest -- the safe direction, since a corrupt entry should be
+    the first one evicted, not the one that crashes the sweep."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def list_entries(images_dir):
     """[(key, path, last_used, size_bytes)] for every complete-looking entry."""
     root = warm_root(images_dir)
     if not root.is_dir():
         return []
     out = []
-    for d in root.iterdir():
+    for d in _safe_iterdir(root):
         if not d.is_dir() or d.name.startswith("."):
             continue
         meta = read_meta(d) or {}
-        out.append((d.name, d, float(meta.get("last_used") or 0),
+        out.append((d.name, d, _safe_last_used(meta.get("last_used")),
                     entry_bytes(d)))
     return out
 
@@ -225,6 +251,16 @@ def evict_lru(images_dir, in_use, max_entries=DEFAULT_MAX_ENTRIES,
     exceeding) max_entries/max_bytes must never force the eviction of some
     OTHER, still-useful entry, since the pinned one occupies its space no
     matter what we do.
+
+    Accepted trade-off: because pinned entries are excluded from the
+    ledger, total on-disk cache size CAN legitimately exceed max_bytes
+    while a large entry is pinned. That is fine -- max_bytes is a soft
+    cost-control knob, not the disk-safety mechanism. The actual hard
+    backstop against filling the disk is has_room()'s FREE_RESERVE_BYTES
+    check at bake time, which looks at real free space, not this budget.
+    Do not "fix" the candidate-only accounting above back to counting
+    pinned entries -- that reintroduces the bug where a pinned entry alone
+    forces eviction of an unrelated, still-useful one for no benefit.
     """
     entries = sorted(list_entries(images_dir), key=lambda r: r[2])
     candidates = [r for r in entries if r[0] not in in_use]
@@ -251,7 +287,7 @@ def prune(images_dir, valid_keys, in_use):
     if not root.is_dir():
         return []
     removed = []
-    for d in root.iterdir():
+    for d in _safe_iterdir(root):
         if d.is_dir() and d.name.startswith((".bake-", ".trash-")):
             _remove(d)
             continue
@@ -276,7 +312,7 @@ def prune_staging(images_dir):
     if not root.is_dir():
         return []
     removed = []
-    for d in root.iterdir():
+    for d in _safe_iterdir(root):
         if d.is_dir() and d.name.startswith((".bake-", ".trash-")):
             _remove(d)
             removed.append(d.name)

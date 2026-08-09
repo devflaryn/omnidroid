@@ -436,6 +436,54 @@ class DiskBudget(unittest.TestCase):
         self.assertEqual(warmcache.evict_lru(empty, in_use=set()), [])
         self.assertEqual(warmcache.prune(empty, set(), set()), [])
 
+    def test_non_numeric_last_used_does_not_crash_the_sweep(self):
+        # NOTHING HERE MAY RAISE INTO A BOOT PATH: a corrupt meta.json in
+        # ONE entry must degrade (sorting oldest, i.e. evicted first), not
+        # abort list_entries()/evict_lru() for every other entry.
+        bad = self._entry("bad", last_used=100)
+        (bad / warmcache.META_NAME).write_text(json.dumps(
+            {"key": "bad", "qemu_version": "11.0.2",
+             "last_used": "not-a-number"}))
+        self._entry("good", last_used=50)
+
+        by_key = {k: last_used for k, _, last_used, _ in
+                  warmcache.list_entries(self.tmp)}
+        self.assertEqual(by_key["bad"], 0.0)
+
+        evicted = warmcache.evict_lru(self.tmp, in_use=set(), max_entries=1,
+                                      max_bytes=10**9)
+        self.assertEqual(evicted, ["bad"])
+        self.assertTrue(warmcache.entry_path(self.tmp, "good").exists())
+
+
+class UnreadableCacheRoot(unittest.TestCase):
+    """Path.iterdir() (unlike Path.glob(), which entry_bytes() uses) raises
+    PermissionError/OSError on a directory that exists but can't be read --
+    permissions damage, a corrupted mount. Housekeeping must treat that the
+    same as an empty cache, not crash the sweep."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = warmcache.warm_root(self.tmp)
+        self.root.mkdir(parents=True)
+        (self.root / "somekey").mkdir()
+        os.chmod(self.root, 0o000)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.chmod(self.root, 0o755)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_list_entries_on_unreadable_root_returns_empty(self):
+        self.assertEqual(warmcache.list_entries(self.tmp), [])
+
+    def test_prune_on_unreadable_root_returns_empty(self):
+        self.assertEqual(warmcache.prune(self.tmp, valid_keys=set(),
+                                         in_use=set()), [])
+
+    def test_prune_staging_on_unreadable_root_returns_empty(self):
+        self.assertEqual(warmcache.prune_staging(self.tmp), [])
+
 
 if __name__ == "__main__":
     unittest.main()
