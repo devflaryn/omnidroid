@@ -372,9 +372,6 @@ cold boot.
 """
 import hashlib
 import json
-import shutil
-import time
-from pathlib import Path
 
 WARM_DIRNAME = "warm"
 STATE_NAME = "state"
@@ -392,10 +389,32 @@ def cache_key(*, arch, base_tag, base_version, offset, mode_name, mem_mb, smp,
     Keyword-only on purpose: ten positional fields would be trivially
     transposable, and a transposed key silently restores the wrong machine.
     Numeric fields are normalized so "8192" and 8192 are one entry.
+    Never raises: bad input produces a distinct key, not an exception.
+
+    json.dumps rather than a separator join: ANY single separator can appear
+    inside a field and shift the boundary into its neighbour. That is not
+    theoretical -- offset='a|b', mode_name='c' and offset='a',
+    mode_name='b|c' collided on one key under a "|" join, which means
+    restoring a machine state that does not describe the machine booting.
+    base_tag is a free-form key in configs/paths.json with no character
+    validation, so nothing upstream prevents it.
     """
-    payload = "|".join(str(x) for x in (
-        arch, base_tag, int(base_version), offset, mode_name,
-        int(mem_mb), int(smp), machine, accel, qemu_version))
+    def safe_int(value):
+        """Try to convert to int; fall back to string representation.
+
+        cache_key sits on the boot path and this module's contract is that a
+        failure is a MISS, never an exception -- so a garbage mem_mb must
+        still return a (distinct) key rather than raising TypeError.
+        """
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return str(value)
+
+    payload = json.dumps([
+        arch, base_tag, safe_int(base_version), offset, mode_name,
+        safe_int(mem_mb), safe_int(smp), machine, accel, qemu_version
+    ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 ```
 
