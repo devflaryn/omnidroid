@@ -1884,6 +1884,8 @@ git commit -m "feat: track which warm entry each running instance uses"
 **Interfaces:**
 - Consumes: everything from Tasks 3-10.
 - Produces:
+  - `_ensure_booted(...)` gains a private `_no_rebake=False` keyword: when True the launch may still RESTORE but must not BAKE, which is what stops the post-bake handoff from recursing forever.
+  - `_halt_qemu(acct) -> None` — immediate QMP `quit` + SIGKILL. Used instead of `_shutdown()`, which tries an in-guest power-off that cannot work on a paused guest and would burn its 90 s timeout on every bake.
   - `_warm_key_for(acct, cfg, mode, accel) -> str | None` — `None` when the cache must not be used at all (debug boot, unknown QEMU version).
   - `_warm_entry_for(acct, cfg, mode, accel, debug) -> tuple[Path | None, str | None]` — applies the interim concurrency rule and returns `(entry, key)`.
   - `_qemu_version(tool) -> str` — cached `qemu-system-*  --version` first line.
@@ -1952,6 +1954,30 @@ In `omnidroid/engine.py`, add above `_ensure_booted`:
 ```python
 RESTORE_TIMEOUT = 30       # a healthy warm restore is seconds, not minutes
 _QEMU_VERSION_CACHE = {}
+
+
+def _halt_qemu(acct):
+    """Kill this instance's QEMU immediately. NOT _shutdown().
+
+    _shutdown() tries a graceful in-guest power-off first, which cannot work
+    on a guest that is PAUSED (the bake stops the VM before migrating) and
+    would burn its 90 s timeout on every bake. Both callers here -- the
+    post-bake handoff and the poisoned-entry fallback -- want the process
+    gone now, and neither has any in-guest state worth preserving.
+    """
+    from omnidroid.qemu_proc import qmp
+    name = acct["name"]
+    pid = running_pid(name)
+    qmp(acct, "quit")
+    time.sleep(1)
+    if pid and pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    # run.json is deliberately left alone: the next spawn_qemu overwrites it,
+    # and wiping it here would strip the port reservation this instance still
+    # owns for the restore that follows.
 
 
 def _qemu_version(tool):
@@ -2027,12 +2053,13 @@ Then rewrite the spawn branch of `_ensure_booted`. Replace the existing `else:` 
             # and cold-boot. One slow launch, never a failed one.
             print(f"[{label}] warm restore did not come up; discarding the "
                   f"entry and cold-booting")
-            stop_instance(acct["name"])
+            _halt_qemu(acct)
             shutil.rmtree(entry, ignore_errors=True)
             entry = None
 
         # COLD PATH, optionally baking a new entry on the way.
-        want_bake = (_warm_cache_allowed(debug, in_use, key)
+        want_bake = (not _no_rebake
+                     and _warm_cache_allowed(debug, in_use, key)
                      and not interactive
                      and warmcache.has_room(
                          images, warmboot.projected_entry_bytes(mode["mem"])))
@@ -2058,11 +2085,17 @@ Then rewrite the spawn branch of `_ensure_booted`. Replace the existing `else:` 
                 # The bake stopped the VM and moved its disks into the entry;
                 # restore from what we just made so the FIRST launch takes the
                 # same code path as every later one.
-                stop_instance(acct["name"])
+                #
+                # _no_rebake guards the recursion: if THAT restore also fails,
+                # the entry is discarded and the retry cold-boots WITHOUT
+                # baking again -- otherwise a reproducibly-bad bake would loop
+                # bake -> restore -> discard -> bake forever.
+                _halt_qemu(acct)
                 return _ensure_booted(acct, cfg, label, timeout=timeout,
                                       accel=accel, mode_name=mode_name,
                                       mem=mem, smp=smp, balloon=balloon,
-                                      quality=quality, debug=debug)
+                                      quality=quality, debug=debug,
+                                      _no_rebake=True)
             return True, first
 ```
 
@@ -2083,7 +2116,7 @@ def _stage_bake_overlays(acct, cfg, rd):
               rd / "bake_data.qcow2"))
     for backing, overlay in pairs:
         overlay.unlink(missing_ok=True)
-        subprocess.run([qemu_img(), "create", "-f", "qcow2", "-F", "qcow2",
+        subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2",
                         "-b", str(backing), str(overlay)],
                        check=True, capture_output=True)
     shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
@@ -2137,7 +2170,15 @@ class PruneStaging(unittest.TestCase):
         self.assertTrue(entry.exists())
 ```
 
-Ensure `shutil` and `subprocess` are imported in `engine.py` (both already are) and that `qemu_img` resolves — if `engine.py` has no `qemu_img` helper, use `qemu_bin("qemu-img")`.
+`shutil`, `subprocess`, `os`, `time` and `signal` must all be importable in `engine.py` — verify each at the top of the file and add any that are missing. `qemu_bin("qemu-img")` is the established qemu-img resolver (already used five times in `engine.py`); there is no `qemu_img()` helper.
+
+Also add the `_no_rebake=False` keyword to the `_ensure_booted` signature itself:
+
+```python
+def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
+                   mem=None, balloon=None, debug=None, smp=None, quality=None,
+                   _no_rebake=False):
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
