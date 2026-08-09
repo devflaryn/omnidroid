@@ -9,6 +9,7 @@ launch.
 """
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -99,6 +100,18 @@ class ClockResync(unittest.TestCase):
             {"name": "t"}, "lbl", adb_fn=lambda *a, **k: R(),
             now_fn=lambda: 1))
 
+    def test_adb_timeout_reading_guest_clock_returns_none_instead_of_raising(self):
+        # The real adb() is subprocess.run(..., timeout=...), which raises
+        # subprocess.TimeoutExpired -- NOT an OSError -- when a still-booting
+        # guest never answers. That is the single most likely real-world
+        # cause of an unreadable clock, so it must degrade like every other
+        # failure here rather than propagate into the boot path.
+        def timing_out(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="adb shell date +%s", timeout=20)
+
+        self.assertIsNone(warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=timing_out, now_fn=lambda: 1))
+
 
 class Restore(unittest.TestCase):
     def setUp(self):
@@ -153,6 +166,10 @@ class Bake(unittest.TestCase):
                                  "lbl", session_factory=lambda *a, **k: sess)
         self.assertTrue(ok)
         self.assertIsNotNone(warmcache.lookup(self.images, "k", "11.0.2"))
+        # The single most safety-critical property of a bake: a resumed
+        # guest would keep writing to the very overlays the state file
+        # describes, silently diverging them from what was just captured.
+        self.assertNotIn("cont", sess.calls)
 
     def test_it_stops_the_vm_before_migrating(self):
         # Migrating a running guest would capture a torn machine.
@@ -180,16 +197,21 @@ class Bake(unittest.TestCase):
             {"name": "t", "qmp_port": 1}, self.images, "k",
             {"qemu_version": "11.0.2"}, self.rd, "lbl", session_factory=boom))
 
-    def test_migrate_completed_without_usable_state_stays_unfindable(self):
+    def test_migrate_completed_without_usable_state_reports_failure(self):
         # QMP can report "completed" while the state file itself is missing
         # or truncated (e.g. QEMU died mid-stream). lookup()'s REQUIRED_FILES
         # check exists precisely to catch this -- a bake must never route
         # around it (e.g. by pre-writing a placeholder) to make that check
-        # pass; a truncated/missing state must stay a miss.
+        # pass; a truncated/missing state must stay a miss AND bake_entry
+        # must itself report False, not just leave an entry lookup() will
+        # later reject. Trusting query-migrate's status alone here would
+        # mean every future launch pays the stop+migrate cost, logs a false
+        # success, and still cold-boots -- forever, silently.
         sess = FakeSession(0, write_state=False)
-        warmboot.bake_entry({"name": "t", "qmp_port": 1}, self.images, "k",
-                            {"qemu_version": "11.0.2"}, self.rd, "lbl",
-                            session_factory=lambda *a, **k: sess)
+        ok = warmboot.bake_entry({"name": "t", "qmp_port": 1}, self.images, "k",
+                                 {"qemu_version": "11.0.2"}, self.rd, "lbl",
+                                 session_factory=lambda *a, **k: sess)
+        self.assertFalse(ok)
         self.assertIsNone(warmcache.lookup(self.images, "k", "11.0.2"))
 
 
