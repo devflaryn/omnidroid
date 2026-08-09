@@ -424,6 +424,13 @@ def warm_keys_in_use():
             data = json.loads((d / "run.json").read_text())
         except (OSError, ValueError):
             continue
+        if not isinstance(data, dict):
+            # A run.json can be valid JSON and still not be an object (e.g.
+            # `[]` or `"x"`) -- same guard warmcache.read_meta() already
+            # applies to meta.json, and for the same reason: one malformed
+            # sibling directory must not raise into every other launch's
+            # cache-key resolution.
+            continue
         key = data.get("warm_key")
         if not key:
             continue

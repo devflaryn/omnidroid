@@ -7015,6 +7015,7 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
         qver = None
         base = None
         key = None
+        in_use = set()
         try:
             images = Path(images_dir(cfg))
             tool = ("qemu-system-aarch64" if acct_base_is_arm(acct)
@@ -7029,10 +7030,17 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                     mode_name=mode["name"], mem_mb=mode["mem"], smp=mode["smp"],
                     machine="virt" if acct_base_is_arm(acct) else "q35",
                     accel=accel or default_accel(), qemu_version=qver)
+            # Inside the same guarded region as the rest of cache-key
+            # resolution: a sibling instance's malformed run.json (or any
+            # other unexpected failure reading the runtime root) must yield
+            # "no keys in use" here, not an exception straight into the boot
+            # path -- that would break EVERY launch on the host, including
+            # the cold-boot fallback this except clause exists to guarantee.
+            in_use = warm_keys_in_use()
         except Exception:      # noqa: BLE001 - unresolved cfg = no cache, not a crash
             images = None
             key = None
-        in_use = warm_keys_in_use()
+            in_use = set()
         entry = None
         if _warm_cache_allowed(debug, in_use, key):
             entry = warmcache.lookup(images, key, qver)
@@ -7066,7 +7074,20 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                          images, warmboot.projected_entry_bytes(mode["mem"])))
         if want_bake:
             rd = runtime_dir(acct["name"])
-            _stage_bake_overlays(acct, cfg, rd)
+            try:
+                _stage_bake_overlays(acct, cfg, rd)
+            except Exception as e:      # noqa: BLE001 - a bake is an optimisation,
+                # never a precondition of a successful launch. want_bake is
+                # true on essentially every non-first, non-debug boot, so a
+                # missing/unreadable backing image, a full disk or a
+                # permission error here is the ordinary path, not an edge
+                # case -- it must degrade to a normal cold boot, not fail
+                # the launch. Falling through with want_bake left True would
+                # have spawn_qemu told to bake off overlays that were never
+                # created.
+                print(f"[{label}] could not stage warm-bake overlays ({e}); "
+                      f"booting normally without baking")
+                want_bake = False
         # bake/warm_key are only ever non-default on a bake attempt: passing
         # them unconditionally would change this call's kwargs on EVERY
         # ordinary boot, not just a baking one.
