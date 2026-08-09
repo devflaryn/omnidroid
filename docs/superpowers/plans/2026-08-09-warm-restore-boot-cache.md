@@ -21,7 +21,9 @@
 - **Interim concurrency rule:** restore only when no other running instance uses the same golden entry; otherwise cold-boot (spec §8b).
 - **`--debug` boots never read or write the cache** (the devkit vdc disk changes device topology).
 - **Free-space reserve: 10 GiB.** Cache limits default to 4 entries / 8 GiB.
-- Tests are `unittest.TestCase` classes with `sys.path.insert(0, ...)` at the top, matching `tests/test_mode_scaling.py`. Run with `python3 -m pytest tests/<file> -q`.
+- Tests are `unittest.TestCase` classes with `sys.path.insert(0, ...)` at the top, matching `tests/test_mode_scaling.py`.
+- **Use `python3.13 -m pytest tests/<file> -q`.** On this machine bare `python3` is 3.14 and has no pytest; only `python3.13` does (pytest 9.1.1). `python3 -m unittest discover -s tests -p "<file>"` also works as a fallback. Wherever a task below says `python3 -m pytest`, run `python3.13 -m pytest`.
+- **Full-suite baseline (measured 2026-08-09, commit 41e3644): `539 passed, 76 subtests passed`, zero failures.** "No new failures" means the suite must still finish with zero failures and at least 539 passing.
 - Commit after every task.
 
 ## File Structure
