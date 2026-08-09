@@ -392,12 +392,25 @@ def warm_keys_in_use():
     Eviction uses it so a live instance's disks are never deleted, and the
     interim concurrency rule uses it so a second launch against an in-use
     entry cold-boots instead of landing `offline` on adb (design spec 8b).
+
+    A housekeeping sweep on the boot path: an unreadable runtime root
+    (permissions damage, a half-mounted volume) degrades to "no keys in
+    use" rather than raising -- same treatment as warmcache.py's own
+    `_safe_iterdir()`, and for the same reason (Path.iterdir() raises
+    PermissionError/OSError on a directory that exists but can't be read,
+    unlike Path.glob()). One bad instance directory (unreadable run.json,
+    or a directory that vanishes mid-sweep) must not abort the sweep for
+    every other instance either.
     """
     keys = set()
     root = config.runtime_root()
     if not root.is_dir():
         return keys
-    for d in root.iterdir():
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return keys
+    for d in entries:
         if not d.is_dir():
             continue
         try:
@@ -405,6 +418,12 @@ def warm_keys_in_use():
         except (OSError, ValueError):
             continue
         key = data.get("warm_key")
-        if key and running_pid(d.name):
+        if not key:
+            continue
+        try:
+            live = running_pid(d.name)
+        except (OSError, ValueError):
+            continue
+        if live:
             keys.add(key)
     return keys
