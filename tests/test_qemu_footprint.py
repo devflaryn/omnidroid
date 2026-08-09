@@ -167,7 +167,7 @@ class BalloonTarget(unittest.TestCase):
 
 
 class MemPlumbing(unittest.TestCase):
-    """`omni start --mem N` was accepted by argparse and then dropped on the
+    """`omnidroid start --mem N` was accepted by argparse and then dropped on the
     floor: _ensure_booted called resolve_mode() without it, so the flag
     silently booted at the mode's own size. A 512 MB farming boot then
     surfaced as an unexplained boot timeout."""

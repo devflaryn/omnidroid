@@ -149,6 +149,23 @@ class Restore(unittest.TestCase):
             {"name": "t", "qmp_port": 1}, self.entry, "lbl",
             session_factory=boom))
 
+    def test_restore_bounds_the_connect_timeout_under_the_restore_budget(self):
+        # RESTORE_TIMEOUT (engine.py) is 30s; QmpSession's own connect
+        # default is 60s. Burning that before even attempting the migration
+        # would blow the restore's whole budget on a QEMU that never opens
+        # its QMP port -- restore_into must pass something well under 30s.
+        captured = {}
+
+        def factory(port, **kw):
+            captured.update(kw)
+            return FakeSession(port, **kw)
+
+        ok = warmboot.restore_into({"name": "t", "qmp_port": 1}, self.entry,
+                                   "lbl", session_factory=factory)
+        self.assertTrue(ok)
+        self.assertIn("connect_timeout", captured)
+        self.assertLess(captured["connect_timeout"], 30.0)
+
 
 class Bake(unittest.TestCase):
     def setUp(self):

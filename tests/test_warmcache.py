@@ -85,6 +85,28 @@ class TheCacheKey(unittest.TestCase):
         valid_key = warmcache.cache_key(**dict(BASE, smp=6))
         self.assertNotEqual(key, valid_key)
 
+    def test_no_offset_image_stat_is_a_stable_distinct_key(self):
+        # The no-offset case (--offset none / --apk) must not raise and must
+        # be reproducible.
+        k1 = warmcache.cache_key(**BASE, offset_image_stat=None)
+        k2 = warmcache.cache_key(**BASE, offset_image_stat=None)
+        self.assertEqual(k1, k2)
+
+    def test_changing_the_offset_images_size_or_mtime_changes_the_key(self):
+        # `offset delete <name>` + `offset create <name> <different apk>`
+        # reuses the offset NAME for a different build. Without the image's
+        # own identity folded in, that reused name would key-match the OLD
+        # entry and silently restore a stale Roblox build.
+        base_key = warmcache.cache_key(**BASE, offset_image_stat=(1234, 1000))
+        same_key = warmcache.cache_key(**BASE, offset_image_stat=(1234, 1000))
+        self.assertEqual(base_key, same_key)
+        diff_size = warmcache.cache_key(**BASE, offset_image_stat=(9999, 1000))
+        diff_mtime = warmcache.cache_key(**BASE, offset_image_stat=(1234, 2000))
+        no_stat = warmcache.cache_key(**BASE, offset_image_stat=None)
+        self.assertNotEqual(base_key, diff_size)
+        self.assertNotEqual(base_key, diff_mtime)
+        self.assertNotEqual(base_key, no_stat)
+
 
 def _make_entry(tmp, key, qemu_version="11.0.2", missing=()):
     """Build a complete-looking entry on disk; `missing` omits files."""

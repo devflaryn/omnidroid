@@ -10,7 +10,7 @@ capabilities that used to be fused into one `dev` base tag are now separate:
   hiding   a property of the shipped /data + an idempotent per-boot enforce
            step (Zygisk + Enforce DenyList). Active in production too.
   toolkit  the devkit disk (frida-server + the omni-* scripts) — an ATTACHABLE
-           disk, opt-in per boot via `omni start --debug` / agent debug=true.
+           disk, opt-in per boot via `omnidroid start --debug` / agent debug=true.
 
 So "debug" is a BOOT OPTION, not a base. The same account can boot production
 on one run and debug on the next.
@@ -74,6 +74,24 @@ def _debug_boot_requested(args=None):
     return _truthy_env(DEBUG_ENV)
 
 
+NO_WARM_ENV = "OMNI_NO_WARM"
+
+
+def _no_warm_requested(args=None):
+    """Whether THIS launch must skip the warm-restore boot cache entirely --
+    neither restore from an entry nor bake a new one.
+
+    The cache's kill switch: `--no-warm` on the command, or OMNI_NO_WARM=1 to
+    disable it for every launch on the host. It is on by default and its
+    real-host verification is not done yet, so there must be a way to turn it
+    off without editing code. Routed through _warm_cache_allowed() in
+    engine.py, the one decision point both restore and bake are gated
+    through."""
+    if getattr(args, "no_warm", False):
+        return True
+    return _truthy_env(NO_WARM_ENV)
+
+
 def arch_of_base(base):
     """Canonical arch token for a base entry: 'x86' | 'arm'."""
     return "arm" if base_type(base) == BASE_TYPE_ARM else "x86"
@@ -117,7 +135,7 @@ ARM_ROOTED_DATA = "base_arm_data_rooted.qcow2"
 # game APK (installed as an updated system app, so it lands in /data/app) and
 # `omni_game_package` in the settings database.
 #
-# Why /data and not the system image: `omni bake-game` writes the APK into
+# Why /data and not the system image: `omnidroid bake-game` writes the APK into
 # /product/app inside the 2.3 GB system image, which needs ~6 GiB of scratch
 # and produces a new base — per Roblox update. Roblox updates often. An
 # updated system app in /data does the same job, the package name never
@@ -237,7 +255,7 @@ X86_DEVKIT_DISK = DEVKIT_DISKS["x86"]
 ROOTED_MARKER = " [rooted]"
 
 
-ROOT_PENDING_MARKER = " [root pending: run `omni root-base`]"
+ROOT_PENDING_MARKER = " [root pending: run `omnidroid root-base`]"
 
 
 DEVKIT_MOUNT = "/mnt/omni-devkit"          # ro mount of vdc (source of truth)
@@ -385,6 +403,21 @@ def autoregister_bases():
                      + (ROOTED_MARKER if rooted else ROOT_PENDING_MARKER)}
         new.append(ARM_BASE_TAG)
     changed = bool(new)
+    # A BASE SHIPS NO GAME. Any base still pointing `data` at a pre-offsets
+    # single bake is cleaned here and its baked /data adopted as an offset, so
+    # an existing install converges on the offsets model on its next command
+    # without losing the Roblox it is running today. Idempotent; a clean base
+    # is untouched. Lazy import: offsets imports this module.
+    from omnidroid import offsets as _offsets  # noqa: PLC0415 — cycle break
+    for tag, b in bases.items():
+        if base_type(b) != BASE_TYPE_ARM:
+            continue
+        moved = _offsets.migrate_legacy_bake(b)
+        if moved:
+            changed = True
+            print(f"[config] base '{tag}' is now CLEAN; its baked Roblox was "
+                  f"adopted as offset '{moved}' (default). "
+                  f"See `omnidroid offset list`.")
     if not raw.get("current_base") and bases:
         # Prefer an arm base on an arm64 host, else the canonical x86 base,
         # else the highest legacy x86 vN.

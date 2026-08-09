@@ -3,7 +3,7 @@
 
     python3 tests/test_gaming_window_handoff.py
 
-`omni start` opens the built-in Tk/RFB viewer by default for interactive use.
+`omnidroid start` opens the built-in Tk/RFB viewer by default for interactive use.
 A gaming boot that also opens a QEMU native window would therefore put TWO
 windows on screen for one instance — and the VNC one is the laggy one, so it
 is the one a user would naturally click on and then judge the mode by.

@@ -49,7 +49,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- Host -> kiosk session channel (`omni play` / `omni session`).
+        <!-- Host -> kiosk session channel (`omnidroid play` / `omnidroid session`).
              Must be exported: the sender is adb shell, a different uid.
              Guarded by DUMP, which shell (uid 2000) holds and which a normal
              third-party app can never be granted - so the host can drive the

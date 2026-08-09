@@ -1,7 +1,7 @@
 # omnidroid devkit — the `base_arm_devkit.qcow2` payload
 
 These scripts are the on-device half of the **dev/debug base**. They are copied
-onto the extra **devkit disk** (`base_arm_devkit.qcow2`) by `omni build-dev-base`
+onto the extra **devkit disk** (`base_arm_devkit.qcow2`) by `omnidroid build-dev-base`
 and attached to dev accounts as **vdc**. The production bases (`base_x86.qcow2`,
 `base_arm.qcow2`) never contain any of them, and `base_arm.qcow2` is never
 modified — the toolkit lives entirely on the separate vdc disk.
@@ -41,7 +41,7 @@ drive to hide root, the Magisk install itself, and frida from a target app.
 
 ## Notes / honest limits
 
-- The boot patch (`omni build-dev-base --patch-boot`) is brick-risky and must be
+- The boot patch (`omnidroid build-dev-base --patch-boot`) is brick-risky and must be
   verified on a real boot; without it these scripts have no `su` to run under.
 - SELinux is **Enforcing** on this LineageOS base (unlike the old Permissive
   Bliss dev base) — frida-server runs fine under Magisk, but a target can still
@@ -50,5 +50,5 @@ drive to hide root, the Magisk install itself, and frida from a target app.
   `pool-frida`; `omni-fridad` hides the process name + port but not those thread
   names — drop a patched `frida-server-patched` on the disk to close that gap.
 
-Edit a script here, then rebuild the disk (`omni build-dev-base`) to ship the
+Edit a script here, then rebuild the disk (`omnidroid build-dev-base`) to ship the
 change; the devkit disk is immutable once built, like the bases.

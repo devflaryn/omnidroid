@@ -17,7 +17,7 @@ work/
 runtime/
 
 # CREDENTIALS — a .ROBLOSECURITY cookie is full access to a Roblox account.
-# Never commit one. `omni login` writes cookies/<label>.json; `omni play
+# Never commit one. `omnidroid login` writes cookies/<label>.json; `omnidroid play
 # --token-file` reads a raw one.
 cookies/
 accounts.json

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration test for the build.prop surgery `omni strip-base` performs.
+"""Integration test for the build.prop surgery `omnidroid strip-base` performs.
 
     python3 tests/test_strip_base_props.py
 

@@ -14,6 +14,14 @@ from pathlib import Path
 from omnidroid import warmcache
 from omnidroid.qmpsession import QmpSession
 
+# The whole restore is budgeted at RESTORE_TIMEOUT (engine.py, 30s -- a
+# healthy warm restore is seconds, not minutes). QmpSession's own connect
+# retry defaults to 60s, which alone would blow that budget 2x over on a
+# restored QEMU that never opens its QMP port, before wait_for_boot even
+# gets a turn. Kept well under 30s so the boot-completion wait that follows
+# still has a meaningful budget left.
+RESTORE_CONNECT_TIMEOUT = 20.0
+
 # A migration file is sparse: it costs roughly the guest's resident set, not
 # its -m size. Measured on the arm64 base: a 4096 MB guest froze to ~2.4 GiB.
 # Budget 70% of RAM so the free-space check errs toward skipping a bake.
@@ -55,16 +63,23 @@ def resync_guest_clock(acct, label, adb_fn=None, now_fn=time.time):
     return skew
 
 
-def restore_into(acct, entry, label, session_factory=QmpSession):
+def restore_into(acct, entry, label, session_factory=QmpSession,
+                 connect_timeout=RESTORE_CONNECT_TIMEOUT):
     """Drive the deferred incoming migration on an already-spawned QEMU.
 
     The QEMU must have been spawned with `-incoming defer`. Capabilities have
     to be negotiated BEFORE migrate-incoming or the destination rejects the
     stream outright. Returns True only if the guest is running afterwards.
+
+    `connect_timeout` is bounded well under RESTORE_TIMEOUT -- see
+    RESTORE_CONNECT_TIMEOUT above -- unlike bake_entry(), which keeps
+    QmpSession's own generous default: a bake is not raced against a 30s
+    budget the way a restore is.
     """
     state = Path(entry) / warmcache.STATE_NAME
     try:
-        with session_factory(acct["qmp_port"]) as s:
+        with session_factory(acct["qmp_port"],
+                             connect_timeout=connect_timeout) as s:
             s.set_migration_caps()
             r = s.cmd("migrate-incoming", {"uri": f"file:{state}"})
             if "error" in r:

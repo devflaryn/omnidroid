@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""A gaming boot applies the gaming tune-up — and only a gaming boot does.
+"""Post-boot tuning follows the mode's PROFILE, in both directions.
 
     python3 tests/test_gaming_apply.py
 
-The engine's post-boot block is a list of `if mode_name == "farming"` gates.
-Adding a second use case means every one of them has to be right in BOTH
-directions: a gaming boot must not inherit farming's squeeze, balloon or
-5-fps settings, and a farming boot must not start paying for gaming's tune-up.
-Getting either wrong is silent — the instance still boots, it is just tuned
-for the wrong job.
+Every mode declares a `profile`: "performance" (spend the host on one
+instance) or "density" (spend quality on instance count). The engine branches
+on that, and it has to be right in BOTH directions — a performance boot must
+not inherit farming's squeeze, balloon or 5-fps settings, and a farming boot
+must not start paying for the performance tune-up. Getting either wrong is
+silent: the instance still boots, it is just tuned for the wrong job.
+
+THE BUG THIS FILE NOW PINS. The engine used to compare `mode_name`, the raw
+--mode argument, against the literals "gaming" and "farming". A bare
+`omnidroid start` passes mode_name=None, which resolves to `playable` — the
+DEFAULT mode — and matched neither literal, so the most-used mode was the only
+one that got NO post-boot tuning at all. `PlayableBoot` below is the
+regression test: playable is a performance mode and must be tuned like one.
 """
 import os
 import sys
@@ -84,16 +91,36 @@ class FarmingBoot(unittest.TestCase):
 
 
 class PlayableBoot(unittest.TestCase):
-    """The default mode keeps doing nothing extra, as today."""
+    """The DEFAULT mode is a performance mode and must be tuned like one.
 
-    def test_applies_neither_profile(self):
-        calls = _boot("playable")
-        self.assertNotIn("gaming_tuning", calls)
-        self.assertNotIn("farming_squeeze", calls)
+    This is the regression test for the mode_name-vs-profile bug: `playable`
+    is what a bare `omnidroid start` resolves to, and it used to fall through
+    every gate untouched."""
+
+    def setUp(self):
+        self.calls = _boot("playable")
+
+    def test_applies_the_performance_tuning(self):
+        self.assertIn("gaming_tuning", self.calls)
+
+    def test_installs_a_roblox_profile(self):
+        self.assertIn("roblox_settings", self.calls)
+
+    def test_does_not_run_the_farming_squeeze(self):
+        self.assertNotIn("farming_squeeze", self.calls)
+
+    def test_does_not_inflate_a_balloon(self):
+        self.assertNotIn("balloon", self.calls)
+
+    def test_the_untyped_default_is_tuned_too(self):
+        # mode_name=None is what cmd_start passes when nobody typed --mode.
+        # It must behave exactly like an explicit `playable`.
+        self.assertEqual(_boot(None), self.calls)
 
 
 class TheProfileThatGetsInstalled(unittest.TestCase):
-    def test_a_gaming_boot_installs_the_gaming_settings(self):
+    @staticmethod
+    def _settings_for(mode_name, quality=None):
         seen = {}
 
         def capture(acct, label=None, settings=None):
@@ -111,8 +138,29 @@ class TheProfileThatGetsInstalled(unittest.TestCase):
                  mock.patch.object(omni, "_enforce_hiding"), \
                  mock.patch.object(omni, "apply_gaming_tuning"):
                 omni._ensure_booted(_acct(), omni.read_config(), "t",
-                                    mode_name="gaming")
-        self.assertIs(seen["settings"], lean.GAMING_APP_SETTINGS)
+                                    mode_name=mode_name, quality=quality)
+        return seen["settings"]
+
+    def test_a_gaming_boot_installs_the_high_quality_settings(self):
+        # Quality, not just frame rate: `playable`/`gaming` are what the AI
+        # SCREENSHOTS, and a screenshot of a deliberately ugly render is a
+        # screenshot of a different program.
+        self.assertIs(self._settings_for("gaming"),
+                      lean.PLAYABLE_APP_SETTINGS)
+
+    def test_a_playable_boot_installs_the_same_high_quality_settings(self):
+        self.assertIs(self._settings_for("playable"),
+                      lean.PLAYABLE_APP_SETTINGS)
+
+    def test_a_farming_boot_installs_the_low_profile(self):
+        self.assertIs(self._settings_for("farming"),
+                      lean.CLIENT_APP_SETTINGS)
+
+    def test_an_explicit_quality_flag_wins_over_the_mode(self):
+        self.assertIs(self._settings_for("playable", quality="balanced"),
+                      lean.GAMING_APP_SETTINGS)
+        self.assertIs(self._settings_for("farming", quality="high"),
+                      lean.PLAYABLE_APP_SETTINGS)
 
     def test_apply_roblox_settings_defaults_to_the_farming_profile(self):
         # Existing callers pass no `settings` and must keep the 5-fps profile.

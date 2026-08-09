@@ -29,13 +29,24 @@ REQUIRED_FILES = (STATE_NAME, SYSTEM_NAME, DATA_NAME, EFIVARS_NAME, META_NAME)
 
 
 def cache_key(*, arch, base_tag, base_version, offset, mode_name, mem_mb, smp,
-              machine, accel, qemu_version):
+              machine, accel, qemu_version, offset_image_stat=None):
     """Stable short hash of the exact machine shape an entry describes.
 
-    Keyword-only on purpose: ten positional fields would be trivially
+    Keyword-only on purpose: ten-plus positional fields would be trivially
     transposable, and a transposed key silently restores the wrong machine.
     Numeric fields are normalized so "8192" and 8192 are one entry.
     Never raises: bad input produces a distinct key, not an exception.
+
+    `offset_image_stat` folds the offset's BACKING IMAGE identity (size,
+    mtime) into the key, not just its name. The name alone is not enough:
+    `offset delete <name>` followed by `offset create <name> <different
+    apk>` reuses the same name for a different build, and without this the
+    reused name would silently key-match the OLD entry -- restoring stale
+    Roblox. Cheap (a stat(), already paid to resolve the launch) and, unlike
+    hashing the image, does not cost an extra multi-hundred-MB read per
+    launch. `None` (no offset / stat unavailable) is itself a distinct,
+    stable value -- the no-offset case does not need special-casing beyond
+    that.
     """
     def safe_int(value):
         """Try to convert to int; fall back to string representation."""
@@ -46,7 +57,8 @@ def cache_key(*, arch, base_tag, base_version, offset, mode_name, mem_mb, smp,
 
     payload = json.dumps([
         arch, base_tag, safe_int(base_version), offset, mode_name,
-        safe_int(mem_mb), safe_int(smp), machine, accel, qemu_version
+        safe_int(mem_mb), safe_int(smp), machine, accel, qemu_version,
+        list(offset_image_stat) if offset_image_stat is not None else None,
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 

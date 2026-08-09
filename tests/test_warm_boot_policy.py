@@ -61,6 +61,19 @@ def _cfg():
                               "efivars": "efivars.fd"}}}
 
 
+def _acct_x86(first_boot_done=True, debug=False):
+    return {"name": "u2", "adb_port": 16002, "qmp_port": 17002,
+            "vnc_port": 18002, "base": "x86", "ephemeral": True,
+            "first_boot_done": first_boot_done, "debug": debug}
+
+
+def _cfg_x86():
+    return {"images_dir": "/tmp/omni-warm-boot-policy-images-x86",
+            "bases": {"x86": {"type": "x86-bliss", "version": 1,
+                              "kernel": "k.img", "initrd": "i.img",
+                              "src": "/android-x86"}}}
+
+
 class _StubbedBoot:
     """Runs _ensure_booted with every warm-cache collaborator stubbed out --
     no real QEMU process, QMP socket, adb, or disk I/O. Each test overrides
@@ -132,9 +145,10 @@ class _StubbedBoot:
     def __exit__(self, *exc):
         self.stack.close()
 
-    def run(self, acct=None, mode_name="hard", **kw):
+    def run(self, acct=None, cfg=None, mode_name="hard", **kw):
         acct = acct or _acct()
-        return engine._ensure_booted(acct, _cfg(), "t", mode_name=mode_name,
+        cfg = cfg if cfg is not None else _cfg()
+        return engine._ensure_booted(acct, cfg, "t", mode_name=mode_name,
                                      **kw)
 
 
@@ -163,7 +177,10 @@ class WarmRestoreBranchSelection(unittest.TestCase):
         self.assertNotIn("bake", kwargs)
         b.mocks["bake_entry"].assert_not_called()
 
-    def test_a_restore_that_never_comes_up_discards_the_entry_and_cold_boots(self):
+    def test_a_restore_whose_android_never_finishes_booting_keeps_the_entry_and_cold_boots(self):
+        # I4(a): a mere wait_for_boot timeout does NOT implicate the state
+        # file (adb hiccup, port conflict, ...) -- only a rejected/failed
+        # migrate does. The entry must be KEPT here, not destroyed.
         entry = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(
             entry, ignore_errors=True))
@@ -177,8 +194,8 @@ class WarmRestoreBranchSelection(unittest.TestCase):
             ok, first = b.run()
         self.assertTrue(ok)
         self.assertFalse(first)
-        # The poisoned entry is gone...
-        self.assertFalse(entry.exists())
+        # The entry is NOT implicated by a boot timeout alone -- kept.
+        self.assertTrue(entry.exists())
         # ...and the fallback actually cold-booted (a second spawn_qemu, this
         # one WITHOUT warm= or bake=).
         self.assertEqual(b.mocks["spawn_qemu"].call_count, 2)
@@ -186,6 +203,45 @@ class WarmRestoreBranchSelection(unittest.TestCase):
         self.assertNotIn("warm", second_kwargs)
         self.assertNotIn("bake", second_kwargs)
         b.mocks["bake_entry"].assert_not_called()
+
+    def test_a_rejected_restore_discards_the_poisoned_entry_when_unused(self):
+        # I4(a): restore_into() itself failing (migrate rejected/failed) DOES
+        # implicate the state file -- that entry must be discarded.
+        entry = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            entry, ignore_errors=True))
+        with _StubbedBoot(lookup=mock.MagicMock(return_value=entry),
+                          restore_into=mock.MagicMock(return_value=False),
+                          has_room=mock.MagicMock(return_value=False)) as b:
+            ok, first = b.run()
+        self.assertTrue(ok)
+        self.assertFalse(first)
+        self.assertFalse(entry.exists())
+        self.assertEqual(b.mocks["spawn_qemu"].call_count, 2)
+        _, second_kwargs = b.mocks["spawn_qemu"].call_args_list[1]
+        self.assertNotIn("warm", second_kwargs)
+        self.assertNotIn("bake", second_kwargs)
+
+    def test_a_rejected_restore_does_not_delete_an_entry_in_use_by_a_sibling(self):
+        # I4(b): `in_use` is sampled before THIS launch's own spawn_qemu made
+        # its run.json visible, so a concurrent sibling launch could have
+        # started restoring from the SAME entry in the meantime. The
+        # fresh, immediately-before-the-rmtree check must catch that.
+        entry = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            entry, ignore_errors=True))
+        in_use_calls = mock.MagicMock(side_effect=[set(), {"FIXEDKEY"}])
+        with mock.patch.object(warmcache, "cache_key", return_value="FIXEDKEY"):
+            with _StubbedBoot(lookup=mock.MagicMock(return_value=entry),
+                              restore_into=mock.MagicMock(return_value=False),
+                              has_room=mock.MagicMock(return_value=False),
+                              warm_keys_in_use=in_use_calls) as b:
+                ok, first = b.run()
+        self.assertTrue(ok)
+        self.assertFalse(first)
+        # A sibling is running off this entry right now -- must not delete.
+        self.assertTrue(entry.exists())
+        self.assertEqual(b.mocks["spawn_qemu"].call_count, 2)
 
     def test_a_cache_miss_on_a_non_interactive_boot_attempts_a_bake(self):
         with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
@@ -245,6 +301,117 @@ class WarmBakeHandoff(unittest.TestCase):
         b.mocks["post_boot"].assert_called_once()
         b.mocks["_enforce_hiding"].assert_called_once()
         b.mocks["assert_kiosk_game"].assert_called_once()
+
+
+class WarmRestoreGetsTuned(unittest.TestCase):
+    """I2: a warm-restored instance must reach the SAME post-boot mode
+    tuning a cold-booted one does -- the density chain (zram + squeeze +
+    balloon) IS farming's whole density mechanism, so a restored farming
+    instance that skips it silently runs at full memory.
+    """
+
+    def _restored(self, **kw):
+        entry = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            entry, ignore_errors=True))
+        return _StubbedBoot(lookup=mock.MagicMock(return_value=entry), **kw)
+
+    def test_a_successful_restore_applies_performance_tuning(self):
+        with self._restored() as b:
+            ok, first = b.run(mode_name="hard")
+        self.assertTrue(ok)
+        self.assertFalse(first)
+        b.mocks["apply_roblox_settings"].assert_called_once()
+        b.mocks["apply_gaming_tuning"].assert_called_once()
+        b.mocks["enable_zram"].assert_not_called()
+        b.mocks["apply_farming_squeeze"].assert_not_called()
+        b.mocks["apply_balloon_target"].assert_not_called()
+
+    def test_a_successful_restore_applies_farming_tuning(self):
+        # The density chain -- zram (decides the survivable balloon cap),
+        # then the squeeze, then the balloon strictly last -- is farming's
+        # actual density mechanism. Skipping it defeats the mode entirely.
+        with self._restored() as b:
+            ok, first = b.run(mode_name="farming")
+        self.assertTrue(ok)
+        self.assertFalse(first)
+        b.mocks["apply_roblox_settings"].assert_called_once()
+        b.mocks["enable_zram"].assert_called_once()
+        b.mocks["apply_farming_squeeze"].assert_called_once()
+        b.mocks["apply_balloon_target"].assert_called_once()
+        b.mocks["apply_gaming_tuning"].assert_not_called()
+
+    def test_a_successful_restore_does_not_cold_boot_a_second_time(self):
+        with self._restored() as b:
+            b.run(mode_name="hard")
+        self.assertEqual(b.mocks["spawn_qemu"].call_count, 1)
+        b.mocks["wait_for_boot"].assert_called_once()
+
+
+class WarmCacheIsArmOnly(unittest.TestCase):
+    """I6: the cache only knows how to stage/move efivars.fd (UEFI pflash
+    vars); x86 has no such concept. It must never attempt a lookup or a
+    bake for an x86 base, and must say so rather than silently never
+    engaging (the old bug: an x86-only host raised inside
+    _stage_bake_overlays and swallowed it; a mixed host could file an
+    unrelated arm base's efivars.fd inside an x86 entry)."""
+
+    def test_x86_never_looks_up_or_bakes_and_says_why(self):
+        with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
+            with mock.patch("builtins.print") as p:
+                ok, first = b.run(acct=_acct_x86(), cfg=_cfg_x86())
+        self.assertTrue(ok)
+        b.mocks["lookup"].assert_not_called()
+        b.mocks["_stage_bake_overlays"].assert_not_called()
+        b.mocks["bake_entry"].assert_not_called()
+        _, kwargs = b.mocks["spawn_qemu"].call_args
+        self.assertNotIn("warm", kwargs)
+        self.assertNotIn("bake", kwargs)
+        messages = " ".join(str(c) for c in p.call_args_list)
+        self.assertIn("arm-only", messages)
+
+
+class WarmCacheKillSwitch(unittest.TestCase):
+    """I8: --no-warm / OMNI_NO_WARM=1 must disable BOTH restore and bake for
+    a launch, routed through the single _warm_cache_allowed() decision
+    point."""
+
+    def test_no_warm_flag_disables_restore(self):
+        entry = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            entry, ignore_errors=True))
+        with _StubbedBoot(lookup=mock.MagicMock(return_value=entry)) as b:
+            ok, first = b.run(no_warm=True)
+        self.assertTrue(ok)
+        b.mocks["lookup"].assert_not_called()
+        b.mocks["restore_into"].assert_not_called()
+        _, kwargs = b.mocks["spawn_qemu"].call_args
+        self.assertNotIn("warm", kwargs)
+
+    def test_no_warm_flag_disables_bake(self):
+        with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
+            ok, first = b.run(no_warm=True)
+        self.assertTrue(ok)
+        b.mocks["_stage_bake_overlays"].assert_not_called()
+        b.mocks["bake_entry"].assert_not_called()
+        _, kwargs = b.mocks["spawn_qemu"].call_args
+        self.assertNotIn("bake", kwargs)
+
+    def test_omni_no_warm_env_var_disables_the_cache(self):
+        entry = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            entry, ignore_errors=True))
+        with mock.patch.dict(os.environ, {"OMNI_NO_WARM": "1"}):
+            with _StubbedBoot(lookup=mock.MagicMock(return_value=entry)) as b:
+                ok, first = b.run()
+        self.assertTrue(ok)
+        b.mocks["lookup"].assert_not_called()
+
+    def test_warm_cache_allowed_refuses_when_no_warm(self):
+        self.assertFalse(engine._warm_cache_allowed(
+            debug=False, in_use=set(), key="k", no_warm=True))
+        self.assertTrue(engine._warm_cache_allowed(
+            debug=False, in_use=set(), key="k", no_warm=False))
 
 
 if __name__ == "__main__":

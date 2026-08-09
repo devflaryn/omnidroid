@@ -6,12 +6,121 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-08 — OFFSETS: many Roblox versions on one clean base; playable takes the machine; one debugging surface
+
+Three changes, driven by one requirement each.
+
+### 1. The base ships no Roblox. Versions are offsets.
+
+`bake-data-game` baked into ONE fixed filename (`base_arm_data_game.qcow2`)
+and then pointed `bases.<tag>.data` at it. Two consequences the product could
+not live with: the BASE carried a Roblox version, so "which Roblox am I
+running?" was a property of the image rather than of the launch; and a second
+version could not exist — baking build B destroyed build A, and getting A back
+meant re-baking from an APK you might no longer have.
+
+An **offset** is a named, thin qcow2 COW overlay of the base's PRISTINE /data
+carrying one baked build. Offsets are siblings, one is the DEFAULT, and the
+base's own `data` stays pristine forever.
+
+```
+omnidroid offset create 2.731.944 --apk roblox.apk   # ~2 min, base untouched
+omnidroid offset create test --apk build.apk         # coexists with the above
+omnidroid offset list | show | default <n> | remove <n>
+omnidroid start alice                                # the DEFAULT version
+omnidroid start alice --offset test                  # a specific version
+omnidroid start alice --no-offset                    # the clean base
+```
+
+- **Per LAUNCH, never per account.** Nothing about an account selects a
+  version; cookie injection into the bootstrapped Roblox is unchanged.
+- **Anti-chaining, kept.** Every offset overlays the pristine /data
+  (`data_bake_source`), never another offset — so re-baking stays as cheap as
+  the first bake and deleting one offset cannot harm another.
+- **No silent fallbacks.** An unknown `--offset` is a hard `no_offset` error
+  listing what IS baked; two offsets with no recorded default is
+  `no_default_offset`. Running the wrong Roblox under the right name is the
+  most expensive way for this to be wrong.
+- **Existing installs migrate themselves.** `autoregister_bases` detects a base
+  still pointing at the old single bake, adopts that image as offset `legacy`
+  (default), and restores `data` to the pristine image. Idempotent.
+- `bake-data-game` survives as a deprecated alias for
+  `offset create --default --force`.
+- `omnidroid bake-game --remove` is new: it strips the Roblox baked into the
+  system image's `/product/app/Roblox`, so the base is clean at that layer too.
+  Build-machine command (e2fsprogs + ~6 GiB scratch). Until it is run, that
+  copy is simply shadowed by every offset's `pm install -r -d`.
+
+### 2. `playable` takes the machine; `farming` still gives it back
+
+`playable` is the DEFAULT mode, what a human plays in AND what the AI tests
+in, so it now sizes itself to the host instead of sitting at a constant
+4096 MB / 4 vCPU:
+
+```
+mem = clamp(min(host_ram/2, host_ram - 6 GB), 4096, 8192)   # 512 MB steps
+smp = clamp(host_cores - 2, 4, 8)
+```
+
+The reserve is the load-bearing half: a guest sized past the host's spare RAM
+makes the HOST swap, and a swapping host misses QEMU's vCPU deadlines — slower
+than the smaller guest would have been. `--mem`/`--smp` (the latter is new)
+win outright, and an unreadable host falls back to the old constants: an
+unreadable host costs you the upgrade, never the boot.
+
+New `--quality high|balanced|low` selects the Roblox `ClientAppSettings`
+profile; `playable`/`gaming` default to the new **`high`** profile (quality
+level 10, post-FX on, DPI scaling on). Rationale: the AI reasons about
+screenshots, and a screenshot at quality 3 with post-FX off is a screenshot of
+a different program. MSAA stays at 0 — the guest has no 3D acceleration on the
+primary host, so it is the one quality key that multiplies per-pixel cost for
+almost nothing.
+
+**A real bug fixed on the way.** `_ensure_booted` branched on `mode_name` —
+the raw `--mode` argument — against the literals `"gaming"` and `"farming"`.
+A bare `omnidroid start` passes no `--mode`, resolves to `playable`, and
+matched NEITHER: the most-used mode was the only one receiving no post-boot
+tuning at all. Modes now declare a `profile` (`performance` | `density`) and
+the engine branches on that. `tests/test_gaming_apply.py::PlayableBoot` pins
+it.
+
+### 3. One debugging surface, for people and for both AIs
+
+```
+omnidroid debug-info <name>          # what can I actually do to this instance?
+omnidroid su <name> -- <command>     # root, correctly quoted
+omnidroid frida <name> [--status|--stop]
+```
+
+`su` exists because three silent traps were being re-derived (and re-broken)
+by every caller: Magisk's `su` is not on `$PATH`; MagiskSU permutes argv so
+`su 0 id -u` is read as an su OPTION; and `adb shell` joins-and-reparses its
+argv so an unquoted `a; b` runs a fragment of itself and still reports
+success. It fails with `no_root` rather than quietly running as uid `shell` —
+a silent privilege downgrade produces wrong output that looks right.
+
+`frida` starts the devkit's hidden frida-server and `adb forward`s it to a
+host port, printing the `-H` target. It distinguishes "not a debug boot" from
+"debug boot but unrooted", because those need different fixes and the message
+that conflated them sent people to the wrong one. Status probes the PORT, not
+a process name — the server deliberately runs under a randomized name.
+
+`debug-info` reports what IS true rather than what was requested, with a fix
+attached to each missing capability.
+
+`omnidroid version` now advertises `capabilities.offsets`,
+`capabilities.debug` and the per-base offset registry, so a client can offer a
+version picker and know whether a bare `start` will resolve at all.
+`omnidroid doctor` reports offsets and hints when none is default.
+
+536 tests pass (was 457 before this work; 79 new).
+
 ## 2026-08-06 — `bake-data-game`: the game lives in /data, and updating it is one command
 
-`omni bake-data-game [apk]` installs the game into the base's **/data** and
+`omnidroid bake-data-game [apk]` installs the game into the base's **/data** and
 bakes `omni_game_package` there, then points the base at the result.
 
-Why /data: `omni bake-game` writes the APK into `/product/app` inside the
+Why /data: `omnidroid bake-game` writes the APK into `/product/app` inside the
 2.3 GB system image, so every Roblox update meant a new base and ~6 GiB of
 scratch. `pm install -r -d` lands an UPDATED SYSTEM APP in `/data/app`, which
 is all a kiosk that launches by package name needs, and the package name never
@@ -151,7 +260,7 @@ The engine now serves two jobs explicitly instead of one job with tiers. See
 `MODES.md` for the full comparison; `FOOTPRINT.md` still owns the farming
 numbers, which this change does not touch.
 
-`omni start <acct> --mode gaming` opens a native QEMU window on the host,
+`omnidroid start <acct> --mode gaming` opens a native QEMU window on the host,
 returns the guest to its native resolution, zeroes the animation scales,
 disables doze, drops swappiness to 10, installs a 240 fps ClientAppSettings
 profile, and — after the session lands, because that broadcast is what starts
@@ -160,7 +269,7 @@ every lever was read back out of the guest, not inferred from a log line.
 
 `gaming` is a NEW mode rather than a change to `playable`, because `playable`
 is `DEFAULT_MODE`: teaching it to open a window would have put a QEMU window
-on every existing `omni start`, including automated ones. Every other mode's
+on every existing `omnidroid start`, including automated ones. Every other mode's
 QEMU command is byte-for-byte what it was.
 
 **The window is capability-detected, and the detection found a wall.**
@@ -227,17 +336,17 @@ The separate `dev` base is removed. Every shipped base (`arm`, `x86`) is now
 What used to be the dev base is split into three independent things:
 
 - **root** — a Magisk-patched boot, baked into the shipped image (`"rooted":
-  true`). `omni root-base [--base <tag>]` bakes it into a THIN COW overlay of
+  true`). `omnidroid root-base [--base <tag>]` bakes it into a THIN COW overlay of
   the production system (`base_arm_system_rooted.qcow2`, host-side qemu-io
   write — no flatten, no nbd, no guest root) plus a matched rooted `/data`.
 - **hiding** — Zygisk + Enforce DenyList with `com.roblox.client` on the
   DenyList, re-enforced on EVERY boot (`_enforce_hiding`), so production
   presents as an unrooted device.
 - **toolkit** — the devkit disk `base_<arch>_devkit.qcow2` (frida + `omni-*`
-  tools), built by `omni build-devkit [--arch arm|x86]`, attached as vdc ONLY
+  tools), built by `omnidroid build-devkit [--arch arm|x86]`, attached as vdc ONLY
   on a `--debug` boot. A production instance's hardware profile is unchanged.
 
-`debug` is a per-BOOT option (`omni start --debug`, agent `debug=true`,
+`debug` is a per-BOOT option (`omnidroid start --debug`, agent `debug=true`,
 `OMNI_DEBUG_BOOT=1`) — not a base and not an account property. `--apk` (swap
 the Roblox build) now works on EVERY base and no longer requires debug. Gone:
 `OMNI_DEV_MODE`/`OMNI_USE_DEV_BASE`, `start --dev`, `build-dev-base`, the dev
@@ -252,7 +361,7 @@ HVF); no number here is an estimate.
 **Three things were silently not working.** Each looked fine and reported
 success:
 
-- **`omni start --mem N` was ignored.** `_ensure_booted` called
+- **`omnidroid start --mem N` was ignored.** `_ensure_booted` called
   `resolve_mode()` without it, so the flag never reached QEMU. A farming boot
   therefore always ran at the mode's own 512 MB and surfaced as an
   unexplained boot timeout. Two separate 5- and 7-minute "boot failures"
@@ -309,7 +418,7 @@ whether swap actually came up; `zram_active()` then probes `SwapTotal` so the
 balloon picks the right floor. Choosing the low cap without zram is not a
 missed optimization, it is an OOM — hence the probe rather than a flag.
 
-**`omni enable-zram-base` (new) — the production delivery, and it turned out
+**`omnidroid enable-zram-base` (new) — the production delivery, and it turned out
 to be one property.** Runtime zram needs privileges the production base does
 not grant, so it had to be baked. The first implementation added a zram line
 to the image's fstab via debugfs surgery. Then the actual image was read,
@@ -351,7 +460,7 @@ change that reaches INSIDE the game, and the one "quality and speed do not
 matter, you can disable rendering" licenses. A ClientAppSettings.json with
 `DFIntTaskSchedulerTargetFps: 5` plus lowest-quality render flags is written
 into the client's ClientSettings dir. Measured on the dev base with the real
-Roblox APK installed (`omni install`), rooted:
+Roblox APK installed (`omnidroid install`), rooted:
 
 - memory 680 MB -> 677 MB — **no change**. Not a surprise in hindsight: the
   game's footprint is engine code, assets and script state, not framebuffers.
@@ -368,7 +477,7 @@ options — bake the file into the base /data image, or have the OmniBootstrap
 APK (which already injects the session cookie and runs AS com.roblox.client)
 write it. It does not pretend to have run.
 
-**`omni measure` (new).** Reports what running instances actually cost:
+**`omnidroid measure` (new).** Reports what running instances actually cost:
 median host RSS over repeated samples (single samples are near-meaningless —
 observed 72 MB to 1244 MB on one idle instance inside a minute), guest used,
 balloon size, and capacity. Capacity is planned against the **balloon cap**,
@@ -377,7 +486,7 @@ not the observed median, so an idle fleet cannot flatter the number.
 **Platform honesty.** balloon + free-page-reporting decommit for real on
 Linux/KVM. On macOS/HVF QEMU's madvise is advisory: a balloon inflate left
 host RSS high and rising (from thrash). The 50+-instance target is a Linux
-number; macOS runs the 2-3 playable instances. `omni measure` prints which
+number; macOS runs the 2-3 playable instances. `omnidroid measure` prints which
 regime it is in.
 
 **The tier-1 trim never ran on production instances.** `TRIM_PACKAGES` is
@@ -396,7 +505,7 @@ goes offline permanently and the QEMU process collapses to ~1.6 MB RSS. It
 stays in `KEEP_ALWAYS` and the evidence is recorded there so nobody has to
 brick an instance to re-learn it.
 
-**KSM is now reported by `omni measure`**, per-instance (`ksm_merged_mb`,
+**KSM is now reported by `omnidroid measure`**, per-instance (`ksm_merged_mb`,
 kernel >= 6.1) and fleet-wide. This is the only mechanism that gets a 50+
 fleet near 400 MB/instance: 50 guests booted from one base hold overwhelmingly
 identical pages and KSM collapses them to one physical copy, while
@@ -429,12 +538,12 @@ Tests: `test_qemu_footprint.py`, `test_lean_profile.py`,
 `test_squeeze_quoting.py`, `test_strip_base_props.py` (builds a real ext4 and
 runs the debugfs surgery against it). Suite 222 -> 286.
 
-## 2026-07-17 — `omni play` no longer creates a profile without a login; `custom_name`; agent-side headless login
+## 2026-07-17 — `omnidroid play` no longer creates a profile without a login; `custom_name`; agent-side headless login
 
 **Root cause of the failed overnight test:** the agent was handed a cookie.txt
 + a stock (non-bootstrapped) `roblox-v2.726.apk` and asked to launch place
 `8737899170`. It had no tool to turn a cookie into a saved account (the only
-exposed path was a human running `omni login`), so it fell back to the
+exposed path was a human running `omnidroid login`), so it fell back to the
 generic `run_apk_test_session` pipeline, which installed the STOCK apk onto
 the hardcoded `omniagent` instance and delivered the cookie to it anyway.
 Per contracts/omni-session.md §1.2 a stock Roblox build has NO code path that
@@ -442,7 +551,7 @@ ever reads the session cookie — so it silently landed on Roblox's own login
 screen while `run_apk_test_session` still reported install+launch as
 successful. Fixed on both sides:
 
-- **`omni play <name>` refuses to create ANY instance for a name with no
+- **`omnidroid play <name>` refuses to create ANY instance for a name with no
   saved cookie and no override** (`manager/omni.py`: `cmd_play`). `resolve_token`/
   `load_session` are pure reads and don't need an instance directory to exist,
   so the token/place validation now runs BEFORE `ensure_instance()` — a
@@ -452,13 +561,13 @@ successful. Fixed on both sides:
   tests: `tests/test_session.py::PlayGatesOnLogin`.
 - **`custom_name`** (`manager/cookies.py`: `save_account`, `set_custom_name`,
   `list_accounts`) — a saved account may carry a friendly display-only label
-  via `omni accounts --set-custom-name <username> <name>`, preserved across a
+  via `omnidroid accounts --set-custom-name <username> <name>`, preserved across a
   cookie refresh. The username stays the account's real identity and the
   instance name; this never renames anything. Tests: `tests/test_cookies.py::CustomName`.
 - **omni-agent: `login_roblox_account`** (`tools/roblox_session.py`) — wraps
-  `omni login --token-file/--token/--token-stdin` as a tool, so the agent can
+  `omnidroid login --token-file/--token/--token-stdin` as a tool, so the agent can
   register/refresh an account from a cookie it was handed, headlessly, with no
-  human running `omni login` first. Same upsert-by-username store, so
+  human running `omnidroid login` first. Same upsert-by-username store, so
   re-registering the same cookie never creates a duplicate account or
   instance.
 - **omni-agent: `launch_roblox_build`** — the one-call pipeline for "cookie +
@@ -473,11 +582,11 @@ successful. Fixed on both sides:
   account with a still-valid cookie reused its existing instance (no
   duplicate) and delivered the session.
 - Removed the stray `omniagent` dev instance this bug had left on disk (via
-  `omni stop` + `omni remove`, not a raw file delete).
+  `omnidroid stop` + `omnidroid remove`, not a raw file delete).
 
-## 2026-07-17 — `omni login` accepts an already-obtained cookie (headless), not just an interactive sign-in
+## 2026-07-17 — `omnidroid login` accepts an already-obtained cookie (headless), not just an interactive sign-in
 
-- **`omni login --token/--token-file/--token-stdin`** (`manager/omni.py`:
+- **`omnidroid login --token/--token-file/--token-stdin`** (`manager/omni.py`:
   `cmd_login`, `_token_flag_given`; `manager/cookies.py`:
   `capture_login_from_cookie`, `_driver(..., headless=)`). Adopts a
   `.ROBLOSECURITY` cookie you already have (e.g. exported from another
@@ -495,7 +604,7 @@ successful. Fixed on both sides:
   unattended up-to-5-minute wait on a visible browser window nobody is
   watching. Caught in testing before shipping (both the truthy-empty-string
   and the blank-file case).
-- No engine contract or CLI-shape change for `omni play`/`omni session`/the
+- No engine contract or CLI-shape change for `omnidroid play`/`omnidroid session`/the
   in-Roblox bootstrap — this only adds an alternate way to populate
   `accounts.json`. See `contracts/omni-session.md` §3.0.
 - Tests: `tests/test_cookies.py::CaptureLoginFromCookie` (mocked
@@ -513,7 +622,7 @@ as **vdc**) carrying the whole toolkit. `base_arm.qcow2` is never modified.
   constants, the `_stage_devkit`/`_devkit_mutate` `/system`-baking + flatten
   pipeline, and the `base-dev` auto-registration. The old `omni-devkit.rc` init
   service is gone (no more `/system` editing).
-- **`omni build-dev-base` rebuilt for arm** (`manager/omni.py`: `_stage_devkit_arm`,
+- **`omnidroid build-dev-base` rebuilt for arm** (`manager/omni.py`: `_stage_devkit_arm`,
   `_build_ext4_qcow2`, `_find_mke2fs`, `_gpt_partition`, `_patch_dev_boot`,
   `build_dev_base`). It now, **all host-side (no guest boot, no root, cross-
   platform)**: stages the android-**arm64** frida-server + the **Magisk** APK
@@ -524,7 +633,7 @@ as **vdc**) carrying the whole toolkit. `base_arm.qcow2` is never modified.
   overlay (COW on `base_arm.qcow2`) to hold the rooted boot; registers `dev`
   (arm-uefi + `devkit`). `current_base` is never changed. Downloads prefer
   **curl** (system certs) with a urllib fallback.
-- **Dev account model**: `omni create <n> --base dev` copies the arm trio + makes
+- **Dev account model**: `omnidroid create <n> --base dev` copies the arm trio + makes
   a cheap COW overlay of the devkit disk (`devkit.qcow2`), wired into
   `qemu_command_arm` as **vdc**, and flags the account `dev:true`. On start/resume,
   `_devkit_activate` mounts vdc read-only + stages the exec-capable tools; all
@@ -560,7 +669,7 @@ as **vdc**) carrying the whole toolkit. `base_arm.qcow2` is never modified.
 
 ## 2026-07-13 — dev/prod x86 split: `build-dev-base` + `base-dev.qcow2` (frida + root/frida hiding)
 
-- **New `omni build-dev-base` command** (`manager/omni.py`: `_stage_devkit`,
+- **New `omnidroid build-dev-base` command** (`manager/omni.py`: `_stage_devkit`,
   `_devkit_mutate`, `build_dev_base`, `cmd_build_dev_base`). Remasters the
   pristine `base_x86` into a SEPARATE dev/debug base, `base-dev.qcow2`,
   registered under the tag `dev`. Reuses the exact `rebuild-base` pipeline shape
@@ -589,14 +698,14 @@ as **vdc**) carrying the whole toolkit. `base_arm.qcow2` is never modified.
   tells look stock by default. Honest residuals (see `DEV-BASE.md`): Permissive
   is itself detectable; KernelSU su/manager artifacts remain; stock frida thread
   names remain unless a patched `frida-server-patched` is dropped in.
-- **Selection:** opt-in only via `omni create <name> --base dev`. `omni-agent`
+- **Selection:** opt-in only via `omnidroid create <name> --base dev`. `omni-agent`
   wires this through `ensure_emulator_running(dev=true)` / `OMNI_USE_DEV_BASE=1`
   and adds `ensure_frida_server` + `hide_root_from_app` tools. New doc:
   `DEV-BASE.md`; `devkit/README.md` documents the on-device payload.
 
 ## 2026-07-12 — `capture`: millisecond-precise VNC keyframes + crash/black diagnostics
 
-- **New `omni capture <name>` command** (`manager/capture.py` +
+- **New `omnidroid capture <name>` command** (`manager/capture.py` +
   `cmd_capture`). Attaches to the instance's loopback VNC server and observes
   EVERY completed framebuffer update via `vncview.RFBClient`'s `on_frame` hook
   (host-monotonic `perf_counter_ns` per update; the recv-thread callback only
@@ -700,9 +809,9 @@ watchdog. Account removed.
 > arm64-v8a`. If the intent is "always translated," the base would need its
 > x86_64 lib stripped or an arm-only APK.
 
-## Manager — 2026-07-09 — `omni view`: live VNC viewer (self-contained + native)
+## Manager — 2026-07-09 — `omnidroid view`: live VNC viewer (self-contained + native)
 
-New `omni view <account> [--start]` opens a LIVE window onto an instance —
+New `omnidroid view <account> [--start]` opens a LIVE window onto an instance —
 real-time screen with mouse + keyboard control — launched from the terminal
 (detached; returns immediately, output → `accounts/<name>/viewer.log`). It
 resolves the account's localhost `vnc_port`, optionally boots the instance
@@ -773,13 +882,13 @@ half-copied data disk fails (`set_policy_failed:/data/misc`). base_arm is
 therefore a pristine shared system (`base_arm.qcow2`) + a **provisioned
 overlay+data+efivars trio** (`base_arm_system/…_data/…_efivars`); an account
 copies the trio (overlay stays backed by the shared base). Verified end to
-end via `omni create/start/install/stop`.
+end via `omnidroid create/start/install/stop`.
 
 **DONE & verified on arm:** silent-of-*console* aside (see below), an account
 boots the provisioned kiosk in ~15–40 s; kiosk is HOME and auto-launches the
 app; **device-owner Lock Task fully blocks the status bar AND the swipe-down
 Quick-Settings panel** (verified: swipe-from-top does nothing); app renders
-arm64-native; `omni stop` powers off cleanly via the arm path. Device-owner
+arm64-native; `omnidroid stop` powers off cleanly via the arm path. Device-owner
 is assigned by the workaround the proof-of-life predicted: complete the
 first-boot wizard (adb needs it), then `settings put global device_provisioned
 0` → `dpm set-device-owner` succeeds (no root, 0 accounts).
@@ -1015,10 +1124,10 @@ and guarded, NOT simulated, and untested-on-Linux parts say so:
   with explicit `-machine mem-merge=on` (marks guest RAM MADV_MERGEABLE so
   KSM can dedup identical pages across instances). `start --accel <str>`
   overrides. Linux preflight warns if `/dev/kvm` is missing/unwritable.
-- **`omni ksm [status|on|off] [--aggressive]`** — drives
+- **`omnidroid ksm [status|on|off] [--aggressive]`** — drives
   `/sys/kernel/mm/ksm/*`, prints stats + MB deduped; clean no-op message
   on Windows. `list --stats` shows per-instance `ksm-merged` MB on Linux.
-- **`omni bench-ksm`** — Phase 8 measurement scaffold (Linux-guarded):
+- **`omnidroid bench-ksm`** — Phase 8 measurement scaffold (Linux-guarded):
   adds identical headless instances one at a time, waits for
   `pages_sharing` plateau, records the **marginal MemAvailable drop** per
   instance (RSS double-counts shared pages), stops at a RAM floor (never
@@ -1071,9 +1180,9 @@ disabling them saves RAM, not boot time. Meaningful boot-time reduction
 would need riskier system-service/zygote-preload trimming (deferred; every
 such change must keep passing the ARM regression check).
 
-**New manager command:** `omni update-kiosk [--apk ...]` — ship a new kiosk
+**New manager command:** `omnidroid update-kiosk [--apk ...]` — ship a new kiosk
 launcher in a new base version (reuses the generalized base-builder), then
-`omni update-all` rolls it out (per-account data preserved).
+`omnidroid update-all` rolls it out (per-account data preserved).
 
 base-v5 = v3 (dev) + the lock-task kiosk. Existing accounts migrated with
 `update-all` (re-provision applies the device-owner lockdown + trims to each
@@ -1091,7 +1200,7 @@ through the manager — blue links blue, orange terrain orange (vs the
 software A/B where they were swapped). Roblox still renders via libndk.
 Software rendering still swaps (host-side blit bug); documented per mode.
 
-**Performance modes** — `omni start <name> --mode playable|hard|brutal`.
+**Performance modes** — `omnidroid start <name> --mode playable|hard|brutal`.
 Instance counts are NEVER capped; modes only tune the per-instance
 footprint (host free RAM decides how many run).
 - `playable` (default): VirGL (correct color + GPU), 4 GB, 4 vCPU. Smooth,
@@ -1106,15 +1215,15 @@ footprint (host free RAM decides how many run).
   unchanged (virtio-vga + serial, visible for debugging).
 
 **Dev / testing harness (scriptable, JSON output, headless).**
-- `omni test-apk <name> --apk <apk> [--mode hard] [--window] [--reuse]` —
+- `omnidroid test-apk <name> --apk <apk> [--mode hard] [--window] [--reuse]` —
   one-shot: ensure a FRESH session with no app pre-baked (v3 dev base +
   kiosk), install the APK, let the kiosk launch it, emit one JSON line:
   `{account, base, mode, package, installed, launched, foreground, pid,
   adb_port, qmp_port, adb_serial, ok}`. Headless by default.
-- `omni screenshot <name> [--out path]` — pull a framebuffer screenshot
+- `omnidroid screenshot <name> [--out path]` — pull a framebuffer screenshot
   (true colors, works headless); prints JSON `{ok, path}`.
-- `omni logcat <name> [--tag T] [--clear]` — read/clear guest logcat.
-- `omni adb <name> -- <args>` — arbitrary adb (existing).
+- `omnidroid logcat <name> [--tag T] [--clear]` — read/clear guest logcat.
+- `omnidroid adb <name> -- <args>` — arbitrary adb (existing).
   An agent scripts: `test-apk` → parse JSON → `screenshot`/`logcat`/`adb`
   against the reported `adb_serial`.
 
@@ -1124,15 +1233,15 @@ footprint (host free RAM decides how many run).
 An account = a disposable `system.qcow2` overlay on a shared base + an
 independent `data.qcow2` (all logins/settings/apps). Migration recreates
 only the overlay against the new base; `data.qcow2` is never touched.
-- `omni update-base <name> [--to vN]` — migrate one account.
-- `omni update-all [--to vN] [--skip-current]` — migrate every account.
+- `omnidroid update-base <name> [--to vN]` — migrate one account.
+- `omnidroid update-all [--to vN] [--skip-current]` — migrate every account.
 - Each migration re-provisions (idempotent): applies the new base's kiosk/
   HOME/settings without erasing data. **Verified:** alice v1→v3 kept a
   `/sdcard` marker file + installed Roblox, gained the v3 kiosk, and
   auto-launched Roblox. All 5 accounts migrated v1/v2→v3, data preserved.
 
 **Production pre-installed-game update (no data loss for any user).**
-- `omni rebuild-base --game <apk>` — boots a throwaway builder on the
+- `omnidroid rebuild-base --game <apk>` — boots a throwaway builder on the
   current base, bakes/replaces the game as a `/system/app` system app
   (`/system/app/OmniGame/OmniGame.apk`, correct SELinux context),
   **extracts the APK's native `.so` libs into `lib/<abi>`** (a `/system/app`
@@ -1140,7 +1249,7 @@ only the overlay against the new base; `data.qcow2` is never touched.
   crash at load without this — libndk still translates the ARM libs),
   flattens to a new self-contained base version, registers it, makes it
   current.
-- Roll out to everyone: `omni update-all` → each account's overlay repoints
+- Roll out to everyone: `omnidroid update-all` → each account's overlay repoints
   to the new base (new game) while its `data.qcow2` (per-account login/
   saves) is preserved. So updating the pre-installed APK reaches all users
   without erasing data.
@@ -1148,11 +1257,11 @@ only the overlay against the new base; `data.qcow2` is never touched.
   pre-installed game (production) or the adb-installed game (dev).
 
 **Dev vs production mode switch.**
-- `omni bases` — list registered bases (marks current) + any pre-installed
+- `omnidroid bases` — list registered bases (marks current) + any pre-installed
   game per base.
-- `omni use-base <tag>` — set the default base for new accounts (e.g. a dev
+- `omnidroid use-base <tag>` — set the default base for new accounts (e.g. a dev
   base with no game vs a production base with the game baked in).
-- Dev workflow: base without game; `omni install <acct> <apk>` per account.
+- Dev workflow: base without game; `omnidroid install <acct> <apk>` per account.
   Production workflow: game baked in base via `rebuild-base`; every account
   gets it.
 
@@ -1163,7 +1272,7 @@ only the overlay against the new base; `data.qcow2` is never touched.
   resolvable it downloads a portable Windows QEMU installer and silently
   installs it into `./qemu` (NSIS `/S /D=`), no global install. Overridable
   via config `qemu.download_url`. No-op when QEMU is already present.
-- `omni qemu-info [--install]` — show/repair QEMU resolution.
+- `omnidroid qemu-info [--install]` — show/repair QEMU resolution.
 
 **Single Windows exe.**
 - `build-exe.ps1` → `dist/omni.exe` (PyInstaller onefile, ~9.5 MB, stdlib
@@ -1175,16 +1284,16 @@ only the overlay against the new base; `data.qcow2` is never touched.
 ## base-v4 — 2026-07-06 — PRODUCTION base (game pre-installed)
 
 `v3 + Roblox baked as a `/system/app` system app` with its 11 arm64 `.so`
-libs extracted into `lib/arm64`. Built via `omni rebuild-base --game
+libs extracted into `lib/arm64`. Built via `omnidroid rebuild-base --game
 roblox.apk`. **Verified:** a brand-new account on v4 (`prod2`) boots
 straight into Roblox — pre-installed system app, kiosk auto-launches it,
 renders via libndk — with NO adb install and no manual steps.
 
 This is the production lineage. `current_base` is kept at **v3 (dev
-default)**; switch to production with `omni use-base v4`. Dev accounts (v3,
-game via `omni install`) and production accounts (v4, game pre-installed)
-coexist. Updating the pre-installed game for everyone: `omni rebuild-base
---game <newapk>` (→ v5) then `omni update-all` — each account's overlay
+default)**; switch to production with `omnidroid use-base v4`. Dev accounts (v3,
+game via `omnidroid install`) and production accounts (v4, game pre-installed)
+coexist. Updating the pre-installed game for everyone: `omnidroid rebuild-base
+--game <newapk>` (→ v5) then `omnidroid update-all` — each account's overlay
 repoints to the new base while its data.qcow2 (login/saves) is preserved.
 
 ## base-v3 — 2026-07-06

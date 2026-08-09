@@ -1,42 +1,87 @@
 # Two use cases, one engine
 
-> **Updating the game:** `omni bake-data-game <new-roblox.apk>` — installs it
-> into the base's /data as an updated system app, ~2 minutes, no system-image
-> rebuild and no scratch space. Every run starts from the pristine rooted
-> /data, so updates never chain. The replacement APK must be signed with the
-> same key as the build already baked into the system image, or the guest
-> rejects it and the bake aborts without touching the shipping image.
-> Run `omni bake-data-game` with no APK to bake only the kiosk's game-package
-> setting.
-
+> **Adding or updating a Roblox version:** `omnidroid offset create <name> --apk
+> <roblox.apk>` — see `HOWTO.md`. Versions are **offsets**: named, thin /data
+> overlays that coexist on one clean base, with one marked default. The old
+> `bake-data-game` is a deprecated alias for it.
 
 OmniDroid serves two jobs that pull in opposite directions, and almost every
-tuning decision in the codebase is a choice between them.
+tuning decision in the codebase is a choice between them. Each mode declares
+which job it is for as a **profile**, and that — not the mode's name — is what
+the engine branches on:
 
-| | `--mode gaming` | `--mode farming` |
-|---|---|---|
-| what matters | frames, input latency | RAM and CPU per instance |
-| what does not | density, host footprint | speed, quality, anything visual |
-| instances per host | 1–2 | 50+ (on a 64 GB Linux host) |
-| host window | yes, when the host can open one | never |
-| guest display | the base's native 1280x800 | 480x270 @ 80 dpi |
-| engine tick | 240 fps target | 5 fps cap |
-| balloon | none | 896 MB (with zram) / 1536 (without) |
-| vCPU / RAM | 4 / 4096 MB | 1 / 2048 MB |
-| zram | off | on (baked into the base) |
-| scheduler | game on the `top-app` cpuset | game on `background` |
-| doze | disabled | force-idled |
+- **`performance`** — spend the host on ONE instance. `playable` (the
+  default), `gaming`, and the smaller fixed tiers `hard`/`brutal`.
+- **`density`** — spend quality on instance COUNT. `farming`, and only
+  `farming`.
 
-`playable`, `hard` and `brutal` are unchanged headless RAM/CPU tiers, not use
-cases. `playable` is still `DEFAULT_MODE`, so a bare `omni start` behaves
-exactly as it always has.
+| | `--mode playable` (default) | `--mode gaming` | `--mode farming` |
+|---|---|---|---|
+| what matters | frames, quality, fast boots | the above **plus** a host window | RAM and CPU per instance |
+| what does not | density, host footprint | density, host footprint | speed, quality, anything visual |
+| instances per host | 1–2 | 1–2 | 50+ (on a 64 GB Linux host) |
+| host window | never (attach with `view`) | yes, when the host can open one | never |
+| guest display | the base's native 1280x800 | native 1280x800 | 480x270 @ 80 dpi |
+| engine tick | 240 fps target | 240 fps target | 5 fps cap |
+| render quality | `high` — real textures, lighting, post-FX | `high` | lowest everything |
+| balloon | none | none | 896 MB (with zram) / 1536 (without) |
+| vCPU / RAM | **sized to the host**, up to 8 / 8192 MB | same | 1 / 2048 MB |
+| zram | off | off | on (baked into the base) |
+| scheduler | game on the `top-app` cpuset | same | game on `background` |
+| doze | disabled | disabled | force-idled |
+
+`hard` (3072 MB / 4 vCPU) and `brutal` (2048 MB / 2 vCPU) are fixed smaller
+tiers for a tight host. They are performance-profile modes too — they are
+explicit "give this instance LESS" requests, so they are the two modes that do
+**not** grow to the host.
+
+## Playable takes the machine
+
+`playable` is what a human plays in **and** what the AI tests in, so it is
+sized to the host rather than pinned at a constant:
+
+```
+mem  = clamp(min(host_ram/2, host_ram - 6 GB), 4096 MB, 8192 MB)   # 512 MB steps
+smp  = clamp(host_cores - 2, 4, 8)
+```
+
+"As much as it safely can" is the load-bearing half. A guest sized past the
+host's spare RAM makes the **host** swap, and a swapping host misses QEMU's
+vCPU deadlines — slower than the smaller guest would have been, and on macOS
+eventually fatal to the process. So the host keeps a 6 GB reserve and two
+cores. The 4096 MB floor is the measured requirement: at 1024 MB the game is
+OOM-killed outright (`has died: fg TOP` + `mem-pressure-event`).
+
+An explicit `--mem` / `--smp` always wins outright over the host-derived size,
+and a host whose capacity cannot be read falls back to the declared 4096/4 —
+an unreadable host costs you the upgrade, never the boot.
+
+### Render quality
+
+`--quality` picks the Roblox `ClientAppSettings.json` profile:
+
+| | tick | quality level | post-FX | used by |
+|---|---|---|---|---|
+| `high` | 240 | 10 | on | playable, gaming (default) |
+| `balanced` | 240 | 3 | off | hard, brutal — maximum frame rate |
+| `low` | 5 | 1 | off | farming |
+
+`high` is the default for the modes the AI screenshots, and that is the point:
+a screenshot of a deliberately ugly render is a screenshot of a different
+program — a missing texture, a bad shader or a mis-lit model is simply not
+visible at quality level 3 with post-FX off.
+
+MSAA stays at 0 even in `high`. The guest has no 3D acceleration on the
+primary host (see below), so every sample is resolved in software on the same
+CPU running the game; it is the one quality key that multiplies cost per pixel
+with almost nothing to show for it at this resolution.
 
 ---
 
 ## Gaming mode
 
 ```sh
-omni start <account> --mode gaming
+omnidroid start <account> --mode gaming
 ```
 
 ### The window
@@ -55,10 +100,10 @@ Degradation is total and silent-safe: a malformed capability, a headless SSH
 session or a QEMU without any window backend all produce the byte-for-byte
 headless command, so a detection bug can cost a window but never a boot.
 
-The instance still runs its VNC server in **every** mode — `omni screenshot`,
+The instance still runs its VNC server in **every** mode — `omnidroid screenshot`,
 the autocap recorder and the `omnidroid-input` skill all attach to that
 framebuffer. What a native window suppresses is only the second *viewer*
-window `omni start` would otherwise open onto the same instance.
+window `omnidroid start` would otherwise open onto the same instance.
 
 ### The GL tier is not reachable on the dev Mac today
 
@@ -90,22 +135,30 @@ Until both land, "GPU acceleration" for this project means the window tier.
 The code is already capability-gated, so a QEMU that gains virgl lights up the
 `gl` tier with no code change.
 
-### What a gaming boot does inside the guest
+### What a performance boot does inside the guest
 
-Applied after boot (`gaming.build_tuning_sequence`), and note that most of it
-is an **undo**: the farming levers persist in a non-ephemeral account's
-`/data`, so an account that was farmed and is then started in gaming mode
-keeps a 480x270 display until something reverses it.
+Applied after boot (`gaming.build_tuning_sequence`) on **every**
+performance-profile mode — `playable` included — and note that most of it is
+an **undo**: the farming levers persist in `/data`, so an offset whose /data
+was last touched by a farming boot keeps a 480x270 display until something
+reverses it.
 
 - `wm size reset` / `wm density reset` — back to native
 - all three animation scales to 0
 - `swappiness` 10 — keep the game's pages resident (root only)
 - `deviceidle disable` + game whitelisted — no throttling of a foreground game
 - IME re-enabled — farming disables it, and nothing can be typed without it
-- ClientAppSettings with a 240 fps tick target and low render cost
+- the `high` ClientAppSettings profile (240 fps tick, quality 10, post-FX on)
 
 Then, **after** the session is delivered (the broadcast is what launches the
 game), `pin_game_to_top_app` moves it onto the `top-app` cpuset.
+
+> **This used to apply to `gaming` only, by accident.** The engine compared
+> `mode_name` — the raw `--mode` argument — against the literals `"gaming"`
+> and `"farming"`. A bare `omnidroid start` passes no `--mode`, resolves to
+> `playable`, and therefore matched neither: the most-used mode was the only
+> one that got no post-boot tuning at all. Branching on `profile` fixes it at
+> the cause. `tests/test_gaming_apply.py::PlayableBoot` is the regression test.
 
 ### Verified live, 2026-08-06
 

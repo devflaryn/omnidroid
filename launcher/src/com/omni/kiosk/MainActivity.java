@@ -259,7 +259,7 @@ public class MainActivity extends Activity {
             }
             // Fall through to the plain launcher intent: better to show Roblox's
             // own screen than a dead kiosk. The host sees the reason in logcat
-            // and in the `omni play` reply.
+            // and in the `omnidroid play` reply.
             Log.w(TAG, "deep-link join failed (" + err + "); "
                     + "falling back to the launcher intent");
         }

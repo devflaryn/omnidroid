@@ -75,11 +75,49 @@ class WarmRestoreArgs(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-incoming") + 1], "defer")
         self.assertFalse(any(str(a).startswith("file:") for a in cmd))
 
-    def test_restore_uses_the_entrys_own_efivars(self):
-        cmd = qp.qemu_command_arm(_acct(), _cfg(self.images), interactive=False,
+    def test_restore_uses_a_private_runtime_dir_copy_not_the_entrys_own_file(self):
+        # pflash needs a real writable file, unlike the disks (snapshot=on).
+        # Pointing it straight at the entry's own efivars.fd would let a
+        # restore write into a file every other restore of the same entry
+        # shares -- it must be a private per-instance copy instead.
+        from omnidroid.runtime import runtime_dir
+        acct = _acct()
+        cmd = qp.qemu_command_arm(acct, _cfg(self.images), interactive=False,
                                   warm=self.entry)
         pflash = [a for a in cmd if "if=pflash,unit=1" in str(a)][0]
-        self.assertIn(str(self.entry / warmcache.EFIVARS_NAME), pflash)
+        rd = runtime_dir(acct["name"])
+        self.assertIn(str(rd / "efivars.fd"), pflash)
+        self.assertNotIn(str(self.entry), pflash)
+
+    def test_spawn_stages_a_private_efivars_copy_and_leaves_the_entry_untouched(self):
+        import os
+        import tempfile
+        import shutil as shutil_mod
+        from omnidroid.runtime import runtime_dir
+
+        data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil_mod.rmtree, data_dir, ignore_errors=True)
+        old = os.environ.get("OMNI_DATA_DIR")
+        os.environ["OMNI_DATA_DIR"] = str(data_dir)
+        self.addCleanup(lambda: (os.environ.pop("OMNI_DATA_DIR", None)
+                                 if old is None
+                                 else os.environ.__setitem__("OMNI_DATA_DIR", old)))
+
+        acct = _acct()
+        entry_efivars = self.entry / warmcache.EFIVARS_NAME
+        before = entry_efivars.read_bytes()
+        before_mtime = entry_efivars.stat().st_mtime_ns
+
+        qp._stage_warm_efivars(acct, _cfg(self.images), self.entry)
+
+        rd = runtime_dir(acct["name"])
+        copy_path = rd / "efivars.fd"
+        self.assertTrue(copy_path.exists())
+        self.assertEqual(copy_path.read_bytes(), before)
+        # Mutate the private copy -- the entry's own file must be unaffected.
+        copy_path.write_bytes(b"mutated")
+        self.assertEqual(entry_efivars.read_bytes(), before)
+        self.assertEqual(entry_efivars.stat().st_mtime_ns, before_mtime)
 
     def test_bake_uses_writable_overlays_not_snapshot_on(self):
         # The freeze point must be persistable; snapshot=on would discard it.

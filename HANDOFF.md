@@ -190,7 +190,7 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
   `setStatusBarDisabled(true)`, `startLockTask()` — status bar, Quick-Settings
   pull-down, notifications, and nav gestures are fully blocked while the game
   runs. (Immersive mode alone only hides the bar — it swipes back.)
-- **Shutdown watchdog (host-side is the decider).** `omni watch` polls
+- **Shutdown watchdog (host-side is the decider).** `omnidroid watch` polls
   `pidof <game>` via adb; state machine WAITING→RUNNING→GRACE→shutdown. Only
   **process death** (gone for `--grace` secs of consecutive polls) triggers
   shutdown — NOT foreground changes (ads/dialogs/loading keep the process
@@ -214,24 +214,24 @@ Google sign-in), but **GApps/GMS are kept** (it may use Play Integrity).
 | **v4** | v3 + Roblox pre-installed as `/system/app` (libs extracted) | **PRODUCTION** (old kiosk, pre-lockdown) |
 | **v5** | v3 + Lock-Task kiosk + RAM trims | **current DEV base** (no baked game) |
 
-- `current_base` = **v5** (dev). `omni bases` lists them; `omni use-base <tag>`
+- `current_base` = **v5** (dev). `omnidroid bases` lists them; `omnidroid use-base <tag>`
   sets the default for NEW accounts (dev v5 vs a production base).
 - **Dev vs production:** dev base (v5) has the kiosk but no game — install
-  per-account via `omni install` (game lives in that account's `/data`).
+  per-account via `omnidroid install` (game lives in that account's `/data`).
   Production base has the game baked as `/system/app` (a `/system/app` APK
   needs its native `.so` libs extracted into `lib/<abi>` or an ARM game
   crashes at load — `rebuild-base` does this automatically; libndk translates).
 - **v4 is production but on the OLD (pre-lockdown) kiosk.** To get a
-  production base WITH the lockdown: `omni rebuild-base --game <apk>` (it
+  production base WITH the lockdown: `omnidroid rebuild-base --game <apk>` (it
   builds on current=v5, so the new production base inherits the lock-task
-  kiosk), then `omni update-all`.
+  kiosk), then `omnidroid update-all`.
 - **Current fleet:** accounts alice, bob, charlie, dave, erin — all on **v5**,
   all DeviceOwner (lockdown active), data preserved through every migration.
 
 ### `dev` base — the arm devkit disk (2026-07-14, REPLACES the x86 base-dev)
 Terminology clash to watch: above, "dev base" means *a base without a baked
 game* (v5). The **`dev` base** here is a different thing — the reverse-
-engineering environment, built by **`omni build-dev-base`** (see `DEV-BASE.md`).
+engineering environment, built by **`omnidroid build-dev-base`** (see `DEV-BASE.md`).
 
 **It is no longer a separate flattened image.** It is the shared, immutable
 `base_arm` **plus one extra virtio disk** (`base_arm_devkit.qcow2`, attached to
@@ -267,7 +267,7 @@ all its machinery were **deleted** (2026-07-14).
   DenyList), a matched FBE pair with `base_arm_devsystem.qcow2`. Dev accounts use
   it → **root works from first boot, no prompt.** The current images_dir has the
   rooted `base_arm_devsystem.qcow2` + `base_arm_devkit.qcow2` +
-  `base_arm_devdata.qcow2`; `omni create <n> --base dev` gives a rooted dev
+  `base_arm_devdata.qcow2`; `omnidroid create <n> --base dev` gives a rooted dev
   account.
 - **arm64-native win**: no libndk translation, so frida native Interceptor/
   Stalker hooks of the app's own arm64 `.so` now work.
@@ -358,11 +358,11 @@ is blocked on read-only-system editing and is a **surfaced decision**, below.
   device_provisioned 0` → `dpm set-device-owner …/OmniDeviceAdminReceiver`
   (succeeds: 0 accounts) → set HOME + game + disable LineageOS launcher +
   lockscreen off. Bake this into the data template once; accounts just copy it.
-- **VERIFIED via the engine** (`omni create armtest` → `start` → `install
+- **VERIFIED via the engine** (`omnidroid create armtest` → `start` → `install
   test_arm64.apk` → `stop`): boots to kiosk in ~15–40 s; kiosk is HOME and
   auto-launches Roblox; **swipe-down from the top does NOTHING** (Lock Task
   kills the status bar + Quick-Settings panel); Roblox renders arm64-native
-  (~0.5–2% jank); `omni stop` powers off cleanly via `reboot -p`.
+  (~0.5–2% jank); `omnidroid stop` powers off cleanly via `reboot -p`.
 - **DEFERRED by user (2026-07-08): shipping base_arm as-is.** Phase C (silent
   boot, custom loading animation, root) is intentional future work, not an
   unfinished task — the base is shipped as a functional kiosk without them.
@@ -386,7 +386,7 @@ is blocked on read-only-system editing and is a **surfaced decision**, below.
 - **Build the kiosk APK on this host:** `launcher/build.sh` (macOS/Linux
   counterpart of build.ps1). Boot the base by hand with
   `tools/arm64/boot_arm64.sh <Data dir> [vnc N]`.
-- **Live viewer:** `omni view <account> [--start]` opens a real-time window
+- **Live viewer:** `omnidroid view <account> [--start]` opens a real-time window
   (screen + mouse + keyboard) on the account's localhost `vnc_port`, and
   returns the terminal immediately (viewer runs detached; output →
   `accounts/<name>/viewer.log`).
@@ -434,10 +434,10 @@ Setup:
   ready, 1 = not. The GUI can gate its UI on this.
 Instance lifecycle:
 - `create <name>` — new account on current base; provisions (headless first
-  boot). Ex: `omni create alice`
+  boot). Ex: `omnidroid create alice`
 - `start <name> [--mode ...] [--mem MB] [--accel A] [--wait] [--dev]`
   — detached HEADLESS boot; returns immediately (`--wait` blocks). Ex:
-  `omni start alice --mode playable`
+  `omnidroid start alice --mode playable`
 - `resume <name>` — attach to a running instance, wait for boot, run checks.
 - `stop <name> [--timeout S]` — explicit POWER-OFF chain (adb → QMP →
   kill), every step hard-bounded; reports the `method` used. A viewer
@@ -472,11 +472,11 @@ Instance lifecycle:
   when the game closes.
 Apps / control:
 - `install <name> <apk>` — adb-install a game into `/data` (dev), record +
-  set it as the kiosk's target. Ex: `omni install alice roblox.apk`
+  set it as the kiosk's target. Ex: `omnidroid install alice roblox.apk`
 - `run-app <name> <pkg>` — launch a package.
 - `watch <name> [--grace N] [--package P]` — host shutdown watchdog.
 - `adb <name> -- <args...>` — arbitrary adb against that instance. Ex:
-  `omni adb alice -- shell getprop ro.dalvik.vm.native.bridge`
+  `omnidroid adb alice -- shell getprop ro.dalvik.vm.native.bridge`
 - `kioskify <name> [--apk ...]` — (legacy) install kiosk into a running
   instance + set HOME. Prefer baking via the base now.
 Bases / rollout:
@@ -500,7 +500,7 @@ Bases / rollout:
 - `rebuild-base --game <apk>` — bake/replace the pre-installed game as a
   `/system/app` system app in a NEW base version (extracts native libs),
   make current. Then `update-all` rolls it out. Ex:
-  `omni rebuild-base --game roblox.apk`
+  `omnidroid rebuild-base --game roblox.apk`
 - `update-kiosk [--apk ...]` — ship a new kiosk launcher in a NEW base
   version (uses `launcher/build/omni-kiosk.apk` by default). Then `update-all`.
 QEMU / platform:
@@ -526,7 +526,7 @@ anywhere — verified no code path opens one). Modes are pure RAM/CPU tiers:
 - **brutal**: 2 GB, 2 vCPU — max instances.
 - Override: `--mem MB`. (`--gpu`/`--headless` flags and the VirGL path
   were REMOVED with headless-always — a GL window can't exist.)
-- View/control: `omni screenshot` (true colors) + adb, or any VNC
+- View/control: `omnidroid screenshot` (true colors) + adb, or any VNC
   viewer at `127.0.0.1:<vnc_port>` (18001+i, localhost-only, wired
   2026-07-06 — colors R/B-swapped on this QEMU build, see Color note).
 
@@ -560,14 +560,14 @@ since Phase 1) or swap channels in the viewer. NEVER touch gralloc
   boot-critical path — they save RAM, not boot time).
 
 ## Dev / testing harness (scriptable, headless, JSON)
-- `omni test-apk <name> --apk <apk> [--mode hard] [--window] [--reuse]` —
+- `omnidroid test-apk <name> --apk <apk> [--mode hard] [--window] [--reuse]` —
   one-shot: FRESH v5 dev session (kiosk, no baked game) → headless boot →
   install → kiosk auto-launches → emit ONE JSON line:
   `{account, base, mode, package, installed, launched, foreground, pid,
   adb_port, qmp_port, adb_serial, ok}`.
-- `omni screenshot <name> [--out path]` — framebuffer PNG (true colors, works
+- `omnidroid screenshot <name> [--out path]` — framebuffer PNG (true colors, works
   headless); prints JSON `{ok, path}`.
-- `omni logcat <name> [--tag T] [--clear]` — read/clear guest logcat.
+- `omnidroid logcat <name> [--tag T] [--clear]` — read/clear guest logcat.
 - Agent pattern: run `test-apk` → parse JSON → drive `screenshot`/`logcat`/
   `adb` against the reported `adb_serial`. Works from `omni.exe` identically.
 
@@ -663,8 +663,8 @@ since Phase 1) or swap channels in the viewer. NEVER touch gralloc
 - **Linux/KVM + KSM port — HOST-SIDE CODE PREP DONE (2026-07-06), hardware
   pending.** The manager is Linux-ready without a Linux host ever having
   run it: accel auto-detect (WHPX/KVM) + `--accel` override, `-machine
-  mem-merge=on` on KVM, `/dev/kvm` preflight warnings, `omni ksm`,
-  `omni bench-ksm` (measurement scaffold), per-platform `images_dir`
+  mem-merge=on` on KVM, `/dev/kvm` preflight warnings, `omnidroid ksm`,
+  `omnidroid bench-ksm` (measurement scaffold), per-platform `images_dir`
   (`configs/paths.json` maps windows→`C:/Users/berat/OmniImages`,
   linux→`~/OmniImages`), KSM-aware `list --stats`. Windows verified
   unaffected (QEMU cmdline byte-identical; fresh-account regression run).

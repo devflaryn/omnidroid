@@ -91,6 +91,7 @@ DEFAULT_SRC = "/android-2024-10-11"
 #                efivars) trio rather than provisioning on first boot.
 from omnidroid.bases import *  # noqa: F401,F403
 from omnidroid.bases import (_truthy_env, _debug_boot_requested,
+                             _no_warm_requested,
                              _select_base_tag, _next_base_tag)  # noqa: F401
 from omnidroid import offsets as offsets_mod
 
@@ -1355,6 +1356,7 @@ def cmd_start(args):
     ensure_qemu()
     cfg = load_config()
     debug = _debug_boot_requested(args)
+    no_warm = _no_warm_requested(args)
     if getattr(args, "apk", None):
         # --apk installs a custom Roblox build for testing. This works on EVERY
         # base (root is available on all of them now) and is INDEPENDENT of
@@ -1443,7 +1445,7 @@ def cmd_start(args):
                                    smp=getattr(args, "smp", None),
                                    balloon=getattr(args, "balloon", None),
                                    quality=getattr(args, "quality", None),
-                                   debug=debug)
+                                   debug=debug, no_warm=no_warm)
     timings.mark("boot")
     result = {"name": args.name, "place_id": sess.get("place_id"),
               "deeplink": roblox_deeplink(sess), "first_boot": first,
@@ -6934,15 +6936,19 @@ def _qemu_version(tool):
     return _QEMU_VERSION_CACHE[tool]
 
 
-def _warm_cache_allowed(debug, in_use, key):
+def _warm_cache_allowed(debug, in_use, key, no_warm=False):
     """May THIS launch use the warm cache?
 
     False for a debug boot (the devkit vdc disk changes device topology, so a
-    restore would not match), for an unknown key, and for an entry already
+    restore would not match), for an unknown key, for an entry already
     backing a running instance -- the second concurrent restore comes up alive
-    but `offline` on adb (design spec 8b). Refusing costs one cold boot.
+    but `offline` on adb (design spec 8b) -- and for `no_warm` (the
+    --no-warm / OMNI_NO_WARM=1 kill switch). This is the ONE decision point
+    both restore and bake are gated through, so the kill switch and every
+    other refusal reason only need to be encoded once. Refusing costs one
+    cold boot.
     """
-    if debug or not key:
+    if debug or not key or no_warm:
         return False
     return key not in in_use
 
@@ -6964,19 +6970,34 @@ def _stage_bake_overlays(acct, cfg, rd):
         subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2",
                         "-b", str(backing), str(overlay)],
                        check=True, capture_output=True)
-    shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
-                    rd / "efivars.fd")
+    # efivars/pflash is a UEFI concept: only the arm base boots through EDK2
+    # firmware. x86 boots by direct kernel/initrd and has no efivars file at
+    # all. Staging one unconditionally (as this used to, defaulting to
+    # ARM_BASE_EFIVARS when the base has no "efivars" key) either raised on
+    # an x86-only host -- caught by the caller, want_bake silently went False
+    # forever -- or, on a host that ALSO has an arm base, quietly copied that
+    # UNRELATED arm base's UEFI blob into this x86 runtime dir and then into
+    # the entry warmboot.bake_entry() produces. See _ensure_booted, which
+    # already refuses to key/restore/bake a non-arm base for the same reason.
+    if base_type(base) == BASE_TYPE_ARM:
+        shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
+                        rd / "efivars.fd")
 
 
 def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                    mem=None, balloon=None, debug=None, smp=None, quality=None,
-                   _no_rebake=False):
+                   no_warm=None, _no_rebake=False):
     """Boot the instance if it isn't up, and block until Android is ready.
     Returns (ok, first_boot). `debug` (per-boot) attaches the devkit disk;
     default None means fall back to the account handle's own `debug` flag.
-    `quality` overrides the mode's own ClientAppSettings profile."""
+    `no_warm` (per-boot) disables the warm-restore cache; default None means
+    fall back to the OMNI_NO_WARM=1 kill switch (cmd_start resolves --no-warm
+    itself and passes the result down). `quality` overrides the mode's own
+    ClientAppSettings profile."""
     if debug is None:
         debug = bool(acct.get("debug"))
+    if no_warm is None:
+        no_warm = _no_warm_requested()
     first = not acct.get("first_boot_done")
     # Resolved ONCE and reused for the spawn, the squeeze, and the balloon.
     # Previously the spawn called resolve_mode() inline and dropped `mem`
@@ -6993,6 +7014,15 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # left False here so the shared wait/tail code after the if/else (taken
     # also when the instance was already up) has a safe default to test.
     want_bake = False
+    # True only once a warm restore has both completed AND Android has
+    # finished booting -- lets the shared tail below skip the cold-boot
+    # spawn/wait it would otherwise (redundantly, or wrongly) run, while
+    # still reaching the SAME post-boot pipeline a cold boot reaches
+    # (post_boot, kiosk/hiding enforcement, and -- the actual bug this
+    # fixes -- the mode tuning block). A restored instance must be
+    # equivalent to a cold-booted one, not a stripped-down one that
+    # returned early before any of that ran.
+    restored = False
     if running_pid(acct["name"]):
         adb_connect(acct)
         if adb_getprop(acct, "sys.boot_completed") == "1":
@@ -7022,11 +7052,38 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                     else "qemu-system-x86_64")
             qver = _qemu_version(tool)
             base = cfg["bases"][acct["base"]]
-            if qver:
+            if not acct_base_is_arm(acct):
+                # The cache only knows how to stage/move an efivars.fd (UEFI
+                # pflash vars): x86 boots by direct kernel/initrd and has no
+                # such concept. Leaving `key` unset makes _warm_cache_allowed()
+                # refuse both a restore lookup and a bake for this launch --
+                # explicit and logged, rather than a bake that raises deep
+                # inside _stage_bake_overlays/warmboot.bake_entry, or (on a
+                # host that also has an arm base) one that succeeds by
+                # accident and files that unrelated arm base's efivars.fd
+                # inside an x86 entry.
+                print(f"[{label}] warm-restore cache is arm-only on this "
+                      f"host; '{acct['base']}' has no efivars/pflash "
+                      f"concept -- cold-booting")
+            elif qver:
+                # Folds the offset's BACKING IMAGE identity (size, mtime)
+                # into the key, not just its name: `offset delete <name>`
+                # followed by `offset create <name> <different apk>` reuses
+                # the name for a different build, and the name alone would
+                # key-match the OLD entry and silently restore the stale
+                # Roblox. None (no offset, e.g. `--apk`/`--offset none`) is
+                # itself a stable, distinct value -- no extra branching
+                # needed for that case.
+                offset_image_stat = None
+                data_image = acct.get("data_image")
+                if data_image:
+                    st = (images / data_image).stat()
+                    offset_image_stat = (st.st_size, int(st.st_mtime))
                 key = warmcache.cache_key(
                     arch=acct_arch(acct), base_tag=acct["base"],
                     base_version=base.get("version", 0),
                     offset=acct.get("offset") or "none",
+                    offset_image_stat=offset_image_stat,
                     mode_name=mode["name"], mem_mb=mode["mem"], smp=mode["smp"],
                     machine="virt" if acct_base_is_arm(acct) else "q35",
                     accel=accel or default_accel(), qemu_version=qver)
@@ -7042,7 +7099,7 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             key = None
             in_use = set()
         entry = None
-        if _warm_cache_allowed(debug, in_use, key):
+        if _warm_cache_allowed(debug, in_use, key, no_warm=no_warm):
             entry = warmcache.lookup(images, key, qver)
 
         if entry is not None:
@@ -7050,86 +7107,120 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             spawn_qemu(acct, cfg, interactive=False, mode=mode, accel=accel,
                        debug=debug, warm=entry, warm_key=key)
             maybe_start_autocap(acct, label)
-            if warmboot.restore_into(acct, entry, label):
+            migrated = warmboot.restore_into(acct, entry, label)
+            if migrated:
                 warmcache.touch(entry)
-                if wait_for_boot(acct, RESTORE_TIMEOUT, label):
-                    warmboot.resync_guest_clock(acct, label)
-                    post_boot(acct, label)
-                    _enforce_hiding(acct, label)
-                    assert_kiosk_game(acct, cfg, label)
-                    return True, first
-            # POISONED ENTRY: the state file itself is suspect, so delete it
-            # and cold-boot. One slow launch, never a failed one.
-            print(f"[{label}] warm restore did not come up; discarding the "
-                  f"entry and cold-booting")
-            _halt_qemu(acct)
-            shutil.rmtree(entry, ignore_errors=True)
-            entry = None
+            if migrated and wait_for_boot(acct, RESTORE_TIMEOUT, label):
+                warmboot.resync_guest_clock(acct, label)
+                restored = True
+            else:
+                # The QEMU this launch just spawned is either paused (a
+                # rejected/failed migration) or running but never reached
+                # adbd -- either way it must die before the cold-boot
+                # fallback below spawns a fresh one on the same ports.
+                _halt_qemu(acct)
+                if not migrated:
+                    # POISONED ENTRY: restore_into() ITSELF failed, so the
+                    # state file is the suspect -- discard it. A mere
+                    # wait_for_boot timeout (migrated True) does NOT imply
+                    # that: adb not answering inside RESTORE_TIMEOUT can be a
+                    # port conflict, a transient adb hiccup, or any number of
+                    # causes unrelated to the state file, so that case keeps
+                    # the entry rather than destroying a ~2.4 GiB, one-cold-
+                    # boot-plus-bake artifact over an unrelated failure.
+                    #
+                    # `in_use` above was sampled before THIS launch's own
+                    # spawn_qemu made its run.json visible, so a second,
+                    # concurrent launch against the same entry could have
+                    # started restoring from it in the meantime. Re-check
+                    # warm_keys_in_use() FRESH, immediately before the
+                    # rmtree, so this launch never deletes an entry a
+                    # sibling is now actually running on.
+                    if key not in warm_keys_in_use():
+                        print(f"[{label}] warm restore rejected; discarding "
+                              f"the entry and cold-booting")
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        print(f"[{label}] warm restore rejected, but "
+                              f"another instance is now running off this "
+                              f"entry; keeping it and cold-booting")
+                else:
+                    print(f"[{label}] warm restore came up but Android "
+                          f"never finished booting; cold-booting instead "
+                          f"(entry kept -- the state file is not implicated)")
+                entry = None
 
-        # COLD PATH, optionally baking a new entry on the way.
-        want_bake = (not _no_rebake
-                     and _warm_cache_allowed(debug, in_use, key)
-                     and not interactive
-                     and warmcache.has_room(
-                         images, warmboot.projected_entry_bytes(mode["mem"])))
+        if not restored:
+            # COLD PATH, optionally baking a new entry on the way.
+            want_bake = (not _no_rebake
+                        and _warm_cache_allowed(debug, in_use, key,
+                                                no_warm=no_warm)
+                        and not interactive
+                        and warmcache.has_room(
+                            images, warmboot.projected_entry_bytes(mode["mem"])))
+            if want_bake:
+                rd = runtime_dir(acct["name"])
+                try:
+                    _stage_bake_overlays(acct, cfg, rd)
+                except Exception as e:      # noqa: BLE001 - a bake is an optimisation,
+                    # never a precondition of a successful launch. want_bake is
+                    # true on essentially every non-first, non-debug boot, so a
+                    # missing/unreadable backing image, a full disk or a
+                    # permission error here is the ordinary path, not an edge
+                    # case -- it must degrade to a normal cold boot, not fail
+                    # the launch. Falling through with want_bake left True would
+                    # have spawn_qemu told to bake off overlays that were never
+                    # created.
+                    print(f"[{label}] could not stage warm-bake overlays ({e}); "
+                          f"booting normally without baking")
+                    want_bake = False
+            # bake/warm_key are only ever non-default on a bake attempt: passing
+            # them unconditionally would change this call's kwargs on EVERY
+            # ordinary boot, not just a baking one.
+            bake_kwargs = {"bake": True, "warm_key": key} if want_bake else {}
+            spawn_qemu(acct, cfg, interactive=interactive,
+                       mode=None if interactive else mode, accel=accel,
+                       debug=debug, **bake_kwargs)
+            # Same rule as `start`: the recorder attaches at spawn so a debug
+            # session has screenshots of the boot screen itself.
+            maybe_start_autocap(acct, label)
+    if not restored:
+        t = timeout or (FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT)
+        if not wait_for_boot(acct, t, label, first_boot=first):
+            return False, first
         if want_bake:
-            rd = runtime_dir(acct["name"])
-            try:
-                _stage_bake_overlays(acct, cfg, rd)
-            except Exception as e:      # noqa: BLE001 - a bake is an optimisation,
-                # never a precondition of a successful launch. want_bake is
-                # true on essentially every non-first, non-debug boot, so a
-                # missing/unreadable backing image, a full disk or a
-                # permission error here is the ordinary path, not an edge
-                # case -- it must degrade to a normal cold boot, not fail
-                # the launch. Falling through with want_bake left True would
-                # have spawn_qemu told to bake off overlays that were never
-                # created.
-                print(f"[{label}] could not stage warm-bake overlays ({e}); "
-                      f"booting normally without baking")
-                want_bake = False
-        # bake/warm_key are only ever non-default on a bake attempt: passing
-        # them unconditionally would change this call's kwargs on EVERY
-        # ordinary boot, not just a baking one.
-        bake_kwargs = {"bake": True, "warm_key": key} if want_bake else {}
-        spawn_qemu(acct, cfg, interactive=interactive,
-                   mode=None if interactive else mode, accel=accel,
-                   debug=debug, **bake_kwargs)
-        # Same rule as `start`: the recorder attaches at spawn so a debug
-        # session has screenshots of the boot screen itself.
-        maybe_start_autocap(acct, label)
-    t = timeout or (FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT)
-    if not wait_for_boot(acct, t, label, first_boot=first):
-        return False, first
-    if want_bake:
-        meta = {"qemu_version": qver, "mem_mb": mode["mem"],
-                "smp": mode["smp"], "mode": mode["name"],
-                "base": acct["base"], "base_version": base.get("version", 0),
-                "offset": acct.get("offset") or "none"}
-        if warmboot.bake_entry(acct, images, key, meta,
-                               runtime_dir(acct["name"]), label):
-            warmcache.evict_lru(images, warm_keys_in_use())
-            # The bake stopped the VM and moved its disks into the entry;
-            # restore from what we just made so the FIRST launch takes the
-            # same code path as every later one.
-            #
-            # _no_rebake guards the recursion: if THAT restore also fails,
-            # the entry is discarded and the retry cold-boots WITHOUT
-            # baking again -- otherwise a reproducibly-bad bake would loop
-            # bake -> restore -> discard -> bake forever.
-            _halt_qemu(acct)
-            return _ensure_booted(acct, cfg, label, timeout=timeout,
-                                  accel=accel, mode_name=mode_name,
-                                  mem=mem, smp=smp, balloon=balloon,
-                                  quality=quality, debug=debug,
-                                  _no_rebake=True)
-        # BAKE FAILED: bake_entry() issues a QMP `stop` before attempting the
-        # migrate and does not resume the guest on failure, so the boot this
-        # launch already waited for is paused, not usable, until resumed here.
-        # Baking was an add-on, not a precondition of a successful launch --
-        # resume and fall through to the ordinary post-boot pipeline below
-        # exactly as an unbaked cold boot would.
-        qmp(acct, "cont")
+            meta = {"qemu_version": qver, "mem_mb": mode["mem"],
+                    "smp": mode["smp"], "mode": mode["name"],
+                    "base": acct["base"], "base_version": base.get("version", 0),
+                    "offset": acct.get("offset") or "none"}
+            if warmboot.bake_entry(acct, images, key, meta,
+                                   runtime_dir(acct["name"]), label):
+                warmcache.evict_lru(images, warm_keys_in_use())
+                # The bake stopped the VM and moved its disks into the entry;
+                # restore from what we just made so the FIRST launch takes the
+                # same code path as every later one.
+                #
+                # _no_rebake guards the recursion: if THAT restore also fails,
+                # the entry is discarded and the retry cold-boots WITHOUT
+                # baking again -- otherwise a reproducibly-bad bake would loop
+                # bake -> restore -> discard -> bake forever.
+                _halt_qemu(acct)
+                return _ensure_booted(acct, cfg, label, timeout=timeout,
+                                      accel=accel, mode_name=mode_name,
+                                      mem=mem, smp=smp, balloon=balloon,
+                                      quality=quality, debug=debug,
+                                      no_warm=no_warm, _no_rebake=True)
+            # BAKE FAILED: bake_entry() issues a QMP `stop` before attempting the
+            # migrate and does not resume the guest on failure, so the boot this
+            # launch already waited for is paused, not usable, until resumed here.
+            # Baking was an add-on, not a precondition of a successful launch --
+            # resume and fall through to the ordinary post-boot pipeline below
+            # exactly as an unbaked cold boot would.
+            qmp(acct, "cont")
+    # SHARED TAIL: reached by every successful path -- an instance that was
+    # already up, a fresh cold boot, and (the fix here) a successful warm
+    # restore alike -- so a restored instance gets the exact same post-boot
+    # pipeline, including the mode tuning below, as a cold-booted one.
     post_boot(acct, label)
     if first:
         provision_settings(acct, label)
@@ -7662,6 +7753,11 @@ def build_parser():
                         "reverse-engineering. The base is the same dual-use "
                         "production image either way; this just adds the "
                         "toolkit (vdc). Also settable via OMNI_DEBUG_BOOT=1.")
+    s.add_argument("--no-warm", dest="no_warm", action="store_true",
+                   help="disable the warm-restore boot cache for THIS launch "
+                        "(no restore, no bake) -- always cold-boot. Kill "
+                        "switch; also settable for every launch on the host "
+                        "via OMNI_NO_WARM=1.")
     s.add_argument("--apk", default=None,
                    help="install this Roblox APK before delivering the session "
                         "(for testing a custom build). Works on any base; does "

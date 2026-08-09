@@ -294,7 +294,7 @@ def run_viewer(host, port, title):
         sys.stderr.write(
             "error: Pillow is required for the built-in viewer.\n"
             "  install it:  python3 -m pip install pillow\n"
-            "  (or use a native client: omni view <acct> --native)\n")
+            "  (or use a native client: omnidroid view <acct> --native)\n")
         return 3
 
     client = RFBClient(host, port)

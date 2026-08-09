@@ -115,23 +115,85 @@ report says precisely what is missing and where to put it.
 ## 3. Quickstart
 
 ```bash
-omnidroid create alice            # one-time: ~3-15 min (first boot + provisioning)
-omnidroid start alice             # cold boot, headless, detached (~35 s to game)
-omnidroid list --stats            # who is running, ports, RAM
-omnidroid watch alice             # host watchdog: powers off when the game closes
-omnidroid stop alice              # explicit power-off (adb -> QMP -> kill)
-omnidroid remove alice            # DESTRUCTIVE: delete the account + its data
+# ONE-TIME per host: bake a Roblox version. The base ships CLEAN.
+omnidroid offset create 2.731.944 --apk ~/Downloads/roblox.apk
+omnidroid offset list                # * marks the default
+
+omnidroid login --token-file cookie.txt   # saves the account under its username
+omnidroid start alice --place 8737899170  # boots, logs in, joins. ~35 s
+omnidroid list --stats               # who is running, ports, RAM, which version
+omnidroid stop alice                 # explicit power-off (adb -> QMP -> kill)
 ```
 
-On a **dev base** (no game baked in) install the game per account once:
+There is no `create`: instances are ephemeral and `start` allocates one.
+`start` with no `--offset` boots the **default** version; `--offset <name>`
+boots another one.
+
+To watch a running instance: `omnidroid view alice`, or point any VNC viewer
+at `127.0.0.1:<vnc_port>` (e.g. `127.0.0.1:18001` for the first account).
+Closing the viewer does nothing to the instance — see §6.
+
+---
+
+## 3a. Roblox versions: offsets
+
+A **base ships no Roblox.** Each version is an *offset*: a named, thin qcow2
+overlay of the base's pristine `/data` carrying one baked build. Offsets are
+siblings — adding one never replaces, deletes or disturbs another — and
+exactly one is the **default** a bare `omnidroid start` uses.
 
 ```bash
-omnidroid install alice roblox.apk   # kiosk auto-launches it immediately
+omnidroid offset create 2.731.944 --apk roblox.apk   # ~2 min, ~130 MB overlay
+omnidroid offset create --apk build.apk              # name from the APK's versionName
+omnidroid offset create test --apk build.apk --default
+omnidroid offset list [--json]
+omnidroid offset show [<name>]
+omnidroid offset default <name>      # which version a bare `start` boots
+omnidroid offset remove <name>       # DESTRUCTIVE: entry + image
 ```
 
-To watch a running instance, point any VNC viewer at
-`127.0.0.1:<vnc_port>` (e.g. `127.0.0.1:18001` for the first account).
-Closing the viewer does nothing to the instance — see §6.
+Then, per launch:
+
+```bash
+omnidroid start alice                       # the DEFAULT version
+omnidroid start alice --offset 2.740.101    # a specific version
+omnidroid start alice --apk build.apk       # install a build for THIS launch only
+omnidroid start alice --no-offset           # the clean base, deliberately game-less
+```
+
+Things worth knowing:
+
+- **Offsets are per-LAUNCH, never per-account.** Nothing about an account
+  selects a version, and cookie injection into the bootstrapped Roblox is
+  completely unchanged — the offset decides only *which Roblox binary* is on
+  the instance, never who logs into it. The same account can run 2.731.944
+  now and a test build next time.
+- **Naming a version that is not baked is a hard error**, never a silent
+  fallback to the default. Running the wrong Roblox under the right name is
+  the most expensive way for this to be wrong.
+- **Two or more offsets with no default recorded is also an error** — pick one
+  with `--offset` for that launch, or `omnidroid offset default <name>` once.
+- **Every offset overlays the PRISTINE /data**, never another offset. That
+  keeps re-baking as cheap as the first bake, and makes deleting one offset
+  incapable of harming another.
+- **A signature mismatch aborts the bake.** A replacement must be signed with
+  the same key as the build baked into the system image; an officially-signed
+  Roblox will not install over a re-signed one, or the reverse. The bake fails
+  loudly rather than capturing an image whose install was rejected.
+- `bake-data-game` still works: it is a deprecated alias for
+  `offset create --default --force`.
+
+### Truly clean system image
+
+The shipped arm base (v2) also has Roblox in `/product/app/Roblox` inside the
+2.3 GB system image. Every offset shadows it (`pm install -r -d` lands an
+updated system app in `/data/app` that wins), so it changes no behaviour — but
+`--no-offset` is then not really game-less, and the image carries ~130 MB it
+never uses. To be rid of it, once, on a build machine:
+
+```bash
+omnidroid bake-game --remove        # needs e2fsprogs + ~6 GiB scratch
+```
 
 ---
 
@@ -164,35 +226,38 @@ code 1. This is the GUI contract — parse stdout, ignore stderr, check
 
 ### Lifecycle
 
-#### `omni create <name> [--no-provision] [--json]`
-Creates the account (overlay + data disk from the ext4 template + port
-allocation), then boots once to provision: lock screen off, kiosk set as
-HOME + device owner (Lock Task lockdown), unneeded packages disabled
-(RAM trims), black wallpaper, setup wizard suppressed. First boot runs
-Android's one-time dexopt — allow **~3–15 min**. Ends powered off.
-- `--no-provision`: create disks only; the first `start` provisions.
-- Name must match `[A-Za-z0-9_-]+`.
-- JSON: `{"name", "base", "adb_port", "qmp_port", "vnc_port",
-  "vnc_host": "127.0.0.1", "provisioned": true|false, "ok": true}`
+> **There is no `create`.** Instances are EPHEMERAL: `start` allocates one,
+> boots the shared base templates with `snapshot=on`, and discards every write
+> at power-off. The only way an account comes into existence is `omnidroid
+> login` (which saves its cookie under the account's real username); the only
+> way one boots is `omnidroid start <username>`.
 
-#### `omni start <name> [--mode M] [--mem MB] [--accel A] [--wait] [--timeout S] [--dev] [--json]`
-Cold-boots the instance **headless and detached** — the command returns
-immediately; the VM is not tied to the calling process (PID recorded in
-`accounts/<name>/run.json`). Boot to game ≈ 35 s.
-- `--mode playable|hard|brutal` — RAM/CPU tier (see §7). Default playable.
-- `--mem MB` — override guest RAM.
-- `--wait` — block until `sys.boot_completed=1` (adb readiness — nothing
-  display-dependent), then verify the ARM bridge. Hard timeout: 360 s
-  normal boot, 1500 s first boot, or `--timeout`.
-- `--accel` — override hypervisor (auto: Windows→WHPX, Linux→KVM).
-- `--dev` — builder profile (serial log, virtio-vga) — still headless.
-- JSON (immediate): `{"name", "pid", "mode", "headless": true,
-  "adb_port", "qmp_port", "vnc_port", "vnc_host", "adb_serial",
-  "first_boot", "ok": true}`.
-  With `--wait` adds `"booted": true|false, "native_bridge_ok": true|false`.
+#### `omnidroid start <username> [--place ID] [--offset NAME] [--mode M] [--mem MB] [--smp N] [--quality Q] [--apk PATH] [--debug] [--accel A] [--timeout S] [--json]`
+Boots an instance for a saved account, delivers its Roblox session, and lands
+either **inside** a place (if one is set) or on the account's home screen,
+logged in — no menu, no simulated taps. Detached: the command returns and the
+VM is not tied to the calling process (PID in `runtime/<name>/run.json`).
+Boot to game ≈ 35 s.
+- `--place ID` — numeric placeId to join (persisted; reused next time).
+- `--offset NAME` — which **baked Roblox version** (see §3a). Omitted = the
+  base's default. `--no-offset` boots the clean base.
+- `--apk PATH` — install a custom Roblox build before delivering the session.
+  Works on every base; needs no `--debug`. Implies a clean boot (the APK *is*
+  the version), and the start **fails loudly** if the installed build logs in
+  nobody — a stock Roblox has no code path that reads a session cookie.
+- `--mode` / `--mem` / `--smp` / `--quality` — see §7.
+- `--debug` — attach the devkit disk (frida + `omni-*` tools) for this boot
+  only. Also settable with `OMNI_DEBUG_BOOT=1`.
+- `--window` / `--no-window` — force or suppress the VNC viewer window.
+- `--accel` — override hypervisor (auto: macOS→HVF, Windows→WHPX, Linux→KVM).
+- JSON: `{"name", "place_id", "deeplink", "offset", "arch", "debug",
+  "adb_port", "vnc_port", "session", "booted", "ok"}`.
 - Starting an already-running account is an error (exit 1).
+- Boots with **no cookie** are refused before anything is allocated
+  (`no_token`), as are boots whose saved cookie Roblox no longer recognises
+  (`cookie_invalid`) — the pre-boot check fails *open* on network problems.
 
-#### `omni stop <name> [--timeout S] [--json]`
+#### `omnidroid stop <name> [--timeout S] [--json]`
 **Explicit power-off** (this is NOT what a viewer disconnect should call —
 see §6). Graceful chain, every step hard-bounded: in-guest
 `svc power shutdown` (10 s adb timeout) → wait up to `--timeout` (default
@@ -201,7 +266,7 @@ see §6). Graceful chain, every step hard-bounded: in-guest
   "not-running"|"powerdown"|"qmp-quit"|"killed"|"kill-failed", "ok"}`
 - Stopping a stopped instance is fine: `method: "not-running", ok: true`.
 
-#### `omni remove <name> [--timeout S] [--json]`  — DESTRUCTIVE
+#### `omnidroid remove <name> [--timeout S] [--json]`  — DESTRUCTIVE
 Deletes the account: stop if running (same bounded chain as `stop`; if it
 somehow cannot be stopped, remove **refuses** and deletes nothing) →
 delete `accounts/<name>/` (system overlay + **data.qcow2** + state) →
@@ -214,53 +279,51 @@ ports are freed (the index is reused by the next `create`).
 - JSON: `{"name", "removed": true, "was_running",
   "freed_ports": {"adb", "qmp", "vnc"}, "ok": true}`
 
-#### `omni list [--stats] [--json]`
+#### `omnidroid list [--stats] [--json]`
 All accounts with base, ports, and state. `--stats` adds host RSS MB,
 guest-used MB (via adb, 8 s timeout per instance), and on Linux
 KSM-merged MB.
-- JSON: array of `{"name", "base", "running", "pid", "mode",
-  "adb_port", "qmp_port", "vnc_port", "vnc_host", "adb_serial",
+- JSON: array of `{"name", "base", "running", "pid", "mode", "offset",
+  "debug", "adb_port", "qmp_port", "vnc_port", "vnc_host", "adb_serial",
   "game_package"}` (+ `"started"` epoch when running; + `"host_rss_mb"`,
-  `"guest_used_mb"` with `--stats`).
-
-#### `omni resume <name>`
-Attach to an already-running instance: wait for boot, run the post-boot
-checks. Useful to track a first boot started detached.
+  `"guest_used_mb"` with `--stats`). `offset` is the version the LIVE boot
+  picked, which can differ from today's default if the default was changed
+  underneath it.
 
 ### Game / in-guest control
 
-#### `omni install <name> <apk>`
+#### `omnidroid install <name> <apk>`
 `adb install` a game into the account's `/data` (dev workflow), record it,
 and set it as the kiosk's launch target — the kiosk launches it the moment
 the install completes.
 
-#### `omni run-app <name> <package>` / `omni adb <name> -- <args...>`
+#### `omnidroid run-app <name> <package>` / `omnidroid adb <name> -- <args...>`
 Launch a package / run any adb command against that instance
-(e.g. `omni adb alice -- shell getprop ro.dalvik.vm.native.bridge`).
+(e.g. `omnidroid adb alice -- shell getprop ro.dalvik.vm.native.bridge`).
 
-#### `omni watch <name> [--grace N] [--package P]`
+#### `omnidroid watch <name> [--grace N] [--package P]`
 The host-side shutdown watchdog: polls the game's **process** (never
 foreground state — ads/dialogs/loading don't kill it) and powers the
 instance off after the process is gone `--grace` s (default 20). This is
 the production "game closed → machine off" path.
 
-#### `omni screenshot <name> [--out path]` / `omni logcat <name> [--tag T] [--clear]`
+#### `omnidroid screenshot <name> [--out path]` / `omnidroid logcat <name> [--tag T] [--clear]`
 True-color framebuffer PNG (works headless; JSON `{ok, path}`) / guest
 logcat.
 
-#### `omni test-apk <name> --apk <apk> [--mode M] [--reuse]`
+#### `omnidroid test-apk <name> --apk <apk> [--mode M] [--reuse]`
 Dev harness: fresh session → headless boot → install → kiosk launches →
 one JSON line with the outcome (`installed/launched/foreground/ok`, ports,
 serial).
 
 ### Bases / updates
 
-#### `omni bases` / `omni use-base <tag>`
+#### `omnidroid bases` / `omnidroid use-base <tag>`
 List registered bases (current marked, pre-installed game shown) / set the
 default base for **new** accounts (dev base = no game, install per
 account; production base = game baked in).
 
-#### `omni update-base <name> [--to vN]` / `omni update-all [--to vN] [--fast|--full] [--skip-current]`
+#### `omnidroid update-base <name> [--to vN]` / `omnidroid update-all [--to vN] [--fast|--full] [--skip-current]`
 Migrate one/all accounts to a base **keeping their data**. `update-all`
 auto-picks per account:
 - **FAST** (base game unchanged for that account): recreate the overlay
@@ -269,12 +332,12 @@ auto-picks per account:
   idempotent re-provision — needed whenever provisioned `/data` state
   must change (kiosk target, lockdown policies, package-trim updates).
 
-#### `omni rebuild-base --game <apk>` / `omni update-kiosk [--apk ...]`
+#### `omnidroid rebuild-base --game <apk>` / `omnidroid update-kiosk [--apk ...]`
 Build a NEW immutable base version with the game baked as a `/system/app`
 (native libs extracted) / with a new kiosk build. Then `update-all` rolls
 it out. Bases are never edited in place.
 
-#### `omni build-dev-base [--frida-version V] [--frida-port P] [--no-magisk] [--json]`
+#### `omnidroid build-dev-base [--frida-version V] [--frida-port P] [--no-magisk] [--json]`
 Remaster the **production x86 base** into a separate **dev/debug base**,
 `base-dev.qcow2`, registered under the tag `dev`. It bakes a reverse-engineering
 toolkit into `/system` — **frida-server**, a hidden frida launcher
@@ -288,18 +351,18 @@ per-app denylist). Same pipeline as `rebuild-base` (boot builder on the pristine
   `base_x86`; the dev base is opt-in only.
 
 DEV-ONLY: only `omni-agent` (a dev dependency) ever selects it, via
-`omni create <name> --base dev`. The shipped bases never contain the devkit.
+`omnidroid create <name> --base dev`. The shipped bases never contain the devkit.
 Full detail: **`DEV-BASE.md`**. JSON: `{"ok", "base": "dev", "disk":
 "base-dev.qcow2", "current_base": "x86", "devkit": {...}}`.
 
 ### Platform
 
-#### `omni setup` / `omni doctor [--json]` / `omni qemu-info [--install]`
+#### `omnidroid setup` / `omnidroid doctor [--json]` / `omnidroid qemu-info [--install]`
 First-run setup (see §2) / readiness check — what's present/missing in
 images_dir, QEMU/adb resolution, `ready` verdict, exit 0/1 (see §2) /
 show or repair QEMU resolution.
 
-#### `omni ksm [status|on|off] [--aggressive]` / `omni bench-ksm ...`
+#### `omnidroid ksm [status|on|off] [--aggressive]` / `omnidroid bench-ksm ...`
 Linux only (clean no-op on Windows): control kernel samepage merging /
 measure real instances-per-GB with KSM.
 
@@ -320,12 +383,12 @@ For viewers that take a display number instead of a port, the display is
 - **Disconnect ≠ shutdown (the GUI contract).** Closing a viewer merely
   closes a socket: the instance keeps running headless — that is the
   default, expected state. Powering an instance OFF is only ever an
-  explicit act: `omni stop` (or the `watch` watchdog when the game
+  explicit act: `omnidroid stop` (or the `watch` watchdog when the game
   closes). A GUI must never call `stop` on viewer close.
 - Input works over VNC (QEMU exposes usb-kbd/usb-tablet); the guest kiosk
   lockdown still applies — you see and control exactly what the locked
   kiosk allows.
-- `omni screenshot` remains the scriptable no-viewer alternative.
+- `omnidroid screenshot` remains the scriptable no-viewer alternative.
 
 ### SECURITY — hard rule
 
@@ -341,22 +404,103 @@ the LAN. (Also recorded as HARD CONSTRAINT #4 in HANDOFF.md.)
 
 ## 7. Performance modes and capacity
 
-Modes are pure RAM/CPU tiers (all headless; counts NEVER capped — host
-free RAM decides):
+Modes come in two **profiles**, and that — not the mode's name — is what the
+engine branches on after boot. Full detail in `MODES.md`.
 
-| Mode       | Guest RAM | vCPUs | Use |
-|------------|-----------|-------|-----|
-| `playable` | 4 GB      | 4     | default, most comfortable |
-| `hard`     | 3 GB      | 4     | more instances |
-| `brutal`   | 2 GB      | 2     | max instances |
+| Mode       | Profile | Guest RAM | vCPUs | Use |
+|------------|---------|-----------|-------|-----|
+| `playable` | performance | **sized to the host**, 4–8 GB | 4–8 | DEFAULT. Playing, and every AI test |
+| `gaming`   | performance | same | same | the above **plus** a native host window |
+| `hard`     | performance | 3 GB | 4 | a tight host |
+| `brutal`   | performance | 2 GB | 2 | a very tight host |
+| `farming`  | density | 2 GB (ballooned to ~896 MB) | 1 | many instances at once |
+
+**`playable` takes the machine.** It is what a human plays in and what the AI
+tests in, so it is sized to the host rather than pinned at a constant:
+`mem = clamp(min(host_ram/2, host_ram - 6 GB), 4096, 8192)` in 512 MB steps,
+`smp = clamp(host_cores - 2, 4, 8)`. The host keeps a 6 GB reserve and two
+cores on purpose — a guest sized past the host's spare RAM makes the *host*
+swap, and a swapping host misses QEMU's vCPU deadlines, which is slower than
+the smaller guest would have been. The 4096 MB floor is measured: at 1024 MB
+the game is OOM-killed outright.
+
+`--mem` / `--smp` always win over the host-derived size. A host whose capacity
+cannot be read falls back to 4096/4.
+
+**`--quality high|balanced|low`** picks the Roblox render profile.
+`playable`/`gaming` default to `high` (real textures, lighting and post-FX) —
+a screenshot of a deliberately ugly render is a screenshot of a different
+program. `balanced` trades that back for frame rate; `low` is farming's 5 fps
+cap.
+
+**`farming` is the opposite trade** and inherits none of the above: headless,
+480x270, 5 fps tick, zram on, squeezed post-boot, then ballooned to a MEASURED
+floor (896 MB with zram, 1536 without — below that the game is OOM-killed).
+See `FOOTPRINT.md`.
 
 Measured on the 32 GB Windows host (Roblox running): ~3.2 GB host-resident
-per instance; **~4–5 concurrent** with normal desktop apps open, **~7–8**
-with them closed. Keep ~2 GB OS headroom; stop adding when free RAM nears
-~3 GB. On Windows/WHPX guest-side trims do NOT reduce host RSS (QEMU
-touches its full `-m`); host-RAM density is what the Linux/KSM port is
-for. Boot is ~35 s cold; instances always cold-boot (no snapshots — by
-design, do not re-add).
+per instance in a performance mode; **~4–5 concurrent** with normal desktop
+apps open, **~7–8** with them closed. On Windows/WHPX guest-side trims do NOT
+reduce host RSS (QEMU touches its full `-m`); host-RAM density is what the
+Linux/KSM port is for. Boot is ~35 s cold; instances always cold-boot (no
+snapshots — by design, do not re-add).
+
+---
+
+## 7a. Debugging: the whole surface
+
+Everything below works on **any** base — root is baked into every shipped
+image. `--debug` adds only the devkit disk (frida + the `omni-*` tools).
+
+```bash
+omnidroid debug-info alice [--json]   # ← START HERE when something failed
+```
+
+`debug-info` answers "what can I actually do to this instance?": root
+availability, devkit attachment, frida state, which offset is running, the
+mode, the foreground app, and the adb/VNC/QMP endpoints — each missing
+capability carrying its own fix. Every failure below otherwise looks the same
+from the outside ("the tool did nothing").
+
+```bash
+omnidroid screenshot alice --out s.png       # PNG off the VNC framebuffer
+omnidroid capture alice --duration 20        # ms-precise keyframes + logcat
+omnidroid logcat alice --tag OmniBootstrap   # prove a login really happened
+omnidroid adb alice -- shell dumpsys activity activities
+
+omnidroid su alice -- id -u                  # root, correctly quoted
+omnidroid su alice -- 'pm list packages | grep roblox'
+
+omnidroid start alice --debug                # attach the devkit (frida + tools)
+omnidroid frida alice                        # start + forward; prints -H target
+omnidroid frida alice --status               # exit 1 if it is not running
+omnidroid frida alice --stop
+omnidroid su alice -- /data/local/tmp/omni-devkit/omni-hide com.roblox.client
+
+omnidroid start alice --apk build.apk        # test a custom Roblox build
+omnidroid install alice some.apk             # ABI-safe install into a live one
+```
+
+**Why `omnidroid su` exists rather than `adb shell su`.** Three traps, all
+silent, all previously re-derived by every caller:
+
+1. Magisk's `su` is not on `$PATH` — it lives in its own tmpfs
+   (`/debug_ramdisk/su`), so a bare `su` fails with "inaccessible or not
+   found";
+2. MagiskSU **permutes argv**, so `su 0 id -u` reads `-u` as an *su option*
+   and exits 2;
+3. `adb shell` does not forward argv — it *joins* the arguments and re-parses
+   them in the guest shell, so an unquoted `a; b` runs a fragment of itself
+   and still reports success.
+
+`omnidroid su` gets all three right in one place and exits with the guest
+command's own status. It fails with `no_root` rather than quietly running as
+uid `shell`: a silent privilege downgrade produces wrong output that looks
+right, which is the worst possible outcome for a debugging session.
+
+**Its own flags go before the name** — `omnidroid su --json alice -- id -u` —
+because everything after the name is the guest command. Typing them after the
+name is caught and reported rather than executed.
 
 ---
 
@@ -372,15 +516,24 @@ omnidroid adb t1 -- shell dumpsys activity activities
 omnidroid remove t1 --json
 ```
 
-### Production: ship a game update to every account
+### Ship a new Roblox version to every account
 ```bash
-omnidroid rebuild-base --game newgame.apk   # new immutable base vN+1
-omnidroid update-all                        # data preserved; FAST/FULL auto
+omnidroid offset create 2.740.101 --apk newroblox.apk   # ~2 min, base untouched
+omnidroid offset default 2.740.101                      # every bare start uses it
+# the previous version is still there — roll back with one command:
+omnidroid offset default 2.731.944
+```
+
+### Test a new version WITHOUT disturbing the one in use
+```bash
+omnidroid offset create candidate --apk build.apk   # NOT --default
+omnidroid start tester --offset candidate --place 8737899170
+omnidroid logcat tester --tag OmniBootstrap         # prove the login is real
+omnidroid offset remove candidate                   # when done
 ```
 
 ### GUI: manage an account end to end (all JSON)
 ```bash
-omnidroid create p1 --json
 omnidroid start p1 --json                   # returns pid + ports at once
 # ... GUI connects viewer to 127.0.0.1:<vnc_port> whenever asked,
 #     disconnects freely; instance keeps running ...
@@ -398,23 +551,23 @@ omnidroid remove p1 --json                  # explicit delete only
   the full images_dir path; copy them in and re-run (they register
   automatically). `omnidroid doctor` shows what's still missing.
 - **First boot seems stuck** — it is dexopt: allow up to 15 min once per
-  account. `omni resume <name>` shows progress phases. Dev boots write
+  account. `omnidroid resume <name>` shows progress phases. Dev boots write
   `accounts/<name>/serial.log`; every boot writes `qemu.log`.
 - **`start` fails immediately / PID dies at once** — read
   `accounts/<name>/qemu.log`. Common: another process took one of the
   account's three ports; WHPX not enabled (Windows Hypervisor Platform
   feature); `/dev/kvm` missing (Linux — `setup` prints the fix).
-- **adb can't connect** — `adb kill-server`, then any omni command
+- **adb can't connect** — `adb kill-server`, then any omnidroid command
   (they auto-`adb connect 127.0.0.1:<port>`).
-- **VNC viewer can't connect** — instance running? (`omni list`.) Viewer
+- **VNC viewer can't connect** — instance running? (`omnidroid list`.) Viewer
   must target `127.0.0.1` (it is never reachable from other machines —
   that is intentional; see §6).
-- **Instance won't die** — `omni stop` escalates automatically and
+- **Instance won't die** — `omnidroid stop` escalates automatically and
   reports `method`; `kill-failed` (never observed) means investigate the
   QEMU process manually.
 - **Game doesn't launch on boot** — dev base with no game installed shows
-  "no apk found" on black: `omni install <name> <apk>`. Check
-  `omni logcat <name> --tag OmniKiosk`.
+  "no apk found" on black: `omnidroid install <name> <apk>`. Check
+  `omnidroid logcat <name> --tag OmniKiosk`.
 - **Never do these:** edit a base file in place (corrupts every overlay
   on it); touch `/system` libs or the ARM bridge props
   (`ro.dalvik.vm.native.bridge`); commit `*.qcow2`; bind VNC beyond

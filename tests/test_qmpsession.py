@@ -120,6 +120,34 @@ class Session(unittest.TestCase):
         with QmpSession(fake.port) as s:
             self.assertEqual(s.wait_migrate(timeout=0, sleep=0), "timeout")
 
+    def test_wait_migrate_treats_an_error_reply_as_terminal_not_a_hang(self):
+        # A dead QEMU on the other end of an already-established connection
+        # answers query-migrate with an error dict (see cmd()'s own
+        # docstring) -- that must be terminal, not a None status polled for
+        # the full 600s timeout. Proven by call count, not wall time: a big
+        # timeout with sleep=0 would return "fast" either way, but a real
+        # bug here would still send hundreds of query-migrate commands.
+        fake = FakeQmp([{"return": {}},
+                        {"error": {"class": "GenericError", "desc": "gone"}}])
+        with QmpSession(fake.port) as s:
+            status = s.wait_migrate(timeout=600.0, sleep=0)
+        self.assertEqual(status, "failed")
+        qm_calls = [m for m in fake.received if m["execute"] == "query-migrate"]
+        self.assertEqual(len(qm_calls), 1)
+
+    def test_wait_migrate_treats_a_closed_connection_as_terminal_not_a_hang(self):
+        # Exactly the corrupt-state-file case the design anticipates: QEMU
+        # exits while loading, the socket goes dead, and cmd() degrades that
+        # to an error dict rather than raising. wait_migrate must not spin.
+        fake = FakeQmp([{"return": {}}])
+        s = QmpSession(fake.port)
+        try:
+            s._sock.shutdown(socket.SHUT_WR)
+            status = s.wait_migrate(timeout=600.0, sleep=0)
+            self.assertEqual(status, "failed")
+        finally:
+            s.close()
+
     def test_connect_failure_raises_a_clear_error(self):
         # Port 1 is never a QMP server; the caller must be able to catch this
         # and fall back to a cold boot.

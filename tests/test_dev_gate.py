@@ -2,7 +2,7 @@
 """Debug is a per-BOOT option, not a base and not an account property.
 
 There is no dev base and no dev-mode gate: every registered base is dual-use.
-`omni start --debug` (or OMNI_DEBUG_BOOT=1) attaches the devkit disk as vdc;
+`omnidroid start --debug` (or OMNI_DEBUG_BOOT=1) attaches the devkit disk as vdc;
 a plain boot never gets it, so a production instance's hardware profile is
 unchanged.
 

@@ -92,11 +92,22 @@ class QmpSession:
 
     def wait_migrate(self, timeout=600.0, sleep=0.25):
         """Poll query-migrate until terminal. Returns the status string, or
-        'timeout' -- never hangs, so a stuck migration degrades to a cold boot."""
+        'timeout' -- never hangs, so a stuck migration degrades to a cold boot.
+
+        An `{"error": ...}` reply is ALSO terminal, treated as 'failed'. This
+        is what a dead QMP connection looks like: cmd() degrades a closed
+        socket or a write failure to that same error-dict shape rather than
+        raising (see cmd()'s own docstring), so without this check a QEMU
+        that exited mid-migration would report a status of None forever and
+        this loop would spin in a tight 0.25s poll for the full `timeout` --
+        on the bake path that is 10 minutes with the guest already stopped.
+        """
         deadline = time.monotonic() + timeout
         while True:
-            status = (self.cmd("query-migrate").get("return", {})
-                      .get("status"))
+            reply = self.cmd("query-migrate")
+            if "error" in reply:
+                return "failed"
+            status = (reply.get("return", {}) or {}).get("status")
             if status in ("completed", "failed", "cancelled"):
                 return status
             if time.monotonic() >= deadline:

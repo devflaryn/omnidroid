@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Roblox account cookie manager.
 
-`omni login` opens a real browser at Roblox's login page, YOU sign in (password,
+`omnidroid login` opens a real browser at Roblox's login page, YOU sign in (password,
 2FA, captcha — all of it stays between you and Roblox), and the moment the
 browser lands on roblox.com/home this reads the `.ROBLOSECURITY` cookie and saves
 the account under its Roblox USERNAME (auto-detected — no label to type).
-`omni play <username> --place <id>` then launches an instance as that account.
+`omnidroid play <username> --place <id>` then launches an instance as that account.
 
 Why a browser instead of an HTTP login: Roblox's sign-in is captcha- and
 2FA-gated by design. Driving it headlessly would mean defeating those checks;
@@ -13,7 +13,7 @@ this deliberately does not. The human does the login, the tool only picks up the
 resulting cookie — the same thing you would do by hand with devtools, minus the
 copy-paste mistakes.
 
-`omni login --token-file <file>` (or --token/--token-stdin) skips the sign-in
+`omnidroid login --token-file <file>` (or --token/--token-stdin) skips the sign-in
 entirely for a cookie you already have — no captcha/2FA to defeat, since you
 already completed them elsewhere. It is still verified, just headlessly: the
 cookie is loaded into a browser with no window and only trusted once Roblox
@@ -41,7 +41,7 @@ WHOAMI_URL = "https://users.roblox.com/v1/users/authenticated"
 # USERNAME (the login name from users/authenticated `.name`, NOT the display
 # name). This replaces the old cookies/<label>.json-per-account scheme — one file
 # is easier to back up, and the username IS the identity used everywhere
-# (`omni login` auto-derives it; `omni play <username>` uses it directly).
+# (`omnidroid login` auto-derives it; `omnidroid play <username>` uses it directly).
 #
 # 0600, gitignored. A .ROBLOSECURITY is full account access.
 ACCOUNTS_FILE = "accounts.json"

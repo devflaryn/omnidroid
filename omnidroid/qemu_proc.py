@@ -596,8 +596,11 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
     ephemeral = bool(acct.get("ephemeral"))
     # WARM RESTORE: the disks are the golden entry's frozen overlays, opened
     # snapshot=on exactly like a shared template -- so N instances can share
-    # one entry and no restore can ever modify it. efivars is the entry's own
-    # copy (pflash needs a real writable file).
+    # one entry and no restore can ever modify it. Unlike the disks, pflash
+    # cannot be opened snapshot=on (it needs a real writable file), so
+    # efivars is a PRIVATE per-instance copy staged into runtime_dir by
+    # spawn_qemu (see _stage_warm_efivars) -- never the entry's own file,
+    # or a restore could write into the shared golden entry.
     from omnidroid import warmcache
     if warm is not None and bake:
         # Programming error, not a runtime condition: no legitimate caller
@@ -611,7 +614,12 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         sys_src = warm / warmcache.SYSTEM_NAME
         data_src = warm / warmcache.DATA_NAME
         disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
-        efivars_src = warm / warmcache.EFIVARS_NAME
+        # The instance's OWN copy (staged by spawn_qemu via
+        # _stage_warm_efivars), not warm / warmcache.EFIVARS_NAME -- pflash
+        # needs a writable file, and pointing it at the entry directly would
+        # let this restore write into a file every other restore of the same
+        # entry shares.
+        efivars_src = rd / "efivars.fd"
     elif bake:
         # BAKE: writable overlays under the instance's runtime dir. The freeze
         # point has to be persistable, so snapshot=on is exactly wrong here.
@@ -866,6 +874,26 @@ def _refresh_ephemeral_efivars(acct, cfg):
         shutil.copyfile(efi_tmpl, d / "efivars.fd")
 
 
+def _stage_warm_efivars(acct, cfg, warm):
+    """Give a warm-RESTORE boot its OWN writable copy of the entry's
+    efivars.fd, so pflash never writes into the shared golden entry (see the
+    comment on efivars_src in qemu_command_arm). Same shape as
+    _refresh_ephemeral_efivars: arm-only; a no-op otherwise, since x86 has no
+    efivars/pflash concept at all and never reaches here with a warm entry
+    (the cache is arm-only -- see engine._ensure_booted)."""
+    from omnidroid.engine import runtime_dir
+    import shutil
+    base = cfg["bases"][acct["base"]]
+    if base_type(base) != BASE_TYPE_ARM:
+        return
+    from omnidroid import warmcache
+    d = runtime_dir(acct["name"])
+    d.mkdir(parents=True, exist_ok=True)
+    src = Path(warm) / warmcache.EFIVARS_NAME
+    if src.exists():
+        shutil.copyfile(src, d / "efivars.fd")
+
+
 def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
                warm=None, bake=False, warm_key=None):
     from omnidroid.runtime import runtime_dir
@@ -874,6 +902,8 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
     d.mkdir(parents=True, exist_ok=True)
     if acct.get("ephemeral"):
         _refresh_ephemeral_efivars(acct, cfg)
+    if warm is not None:
+        _stage_warm_efivars(acct, cfg, warm)
     log = open(d / "qemu.log", "w")
     kwargs = {}
     if IS_WINDOWS:

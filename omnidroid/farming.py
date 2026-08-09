@@ -6,7 +6,7 @@ adb, without a separate image. This module only BUILDS the command sequence
 
 Division of labour with lean.py: anything that has to be a `ro.*` property, or
 that means deleting files, is a BASE-IMAGE change and lives in lean.py behind
-`omni strip-base`. Everything here is what can still be done to an already-
+`omnidroid strip-base`. Everything here is what can still be done to an already-
 booted guest over adb. The split is not stylistic — `setprop ro.config.low_ram
 true` at runtime is silently ignored, because init freezes `ro.*` once it has
 set it. Trying to do the base-image tier from here is the obvious wrong turn.

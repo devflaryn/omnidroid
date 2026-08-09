@@ -10,7 +10,7 @@ The two use cases this engine serves pull in opposite directions:
 
 `gaming` is a separate mode rather than a change to `playable` on purpose:
 `playable` is DEFAULT_MODE, so teaching it to open a window would put a QEMU
-window on every existing `omni start`. Adding a mode is additive; every other
+window on every existing `omnidroid start`. Adding a mode is additive; every other
 mode's command has to stay byte-for-byte what it is today, and that is what
 most of these tests assert.
 """
@@ -130,7 +130,7 @@ class ArmBootUsesTheHostCapability(unittest.TestCase):
 
 
 class VncSurvivesTheWindow(unittest.TestCase):
-    """`omni screenshot`, the auto-capture recorder and the omnidroid-input
+    """`omnidroid screenshot`, the auto-capture recorder and the omnidroid-input
     skill all attach to the instance's VNC framebuffer (see capture.py). A
     gaming boot that dropped `-vnc` would silently blind every one of them,
     so the window is ADDITIVE to VNC, never a replacement."""
