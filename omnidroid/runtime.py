@@ -367,6 +367,13 @@ def reconcile_runtime():
         if silent:
             _wipe_runtime(d.name)
             result["gc"].append(d.name)
+    try:
+        from omnidroid import warmcache
+        from omnidroid.engine import read_config
+        from omnidroid.config import images_dir
+        warmcache.prune_staging(images_dir(read_config()))
+    except Exception:      # noqa: BLE001 - housekeeping never fails a command
+        pass
     return result
 
 
