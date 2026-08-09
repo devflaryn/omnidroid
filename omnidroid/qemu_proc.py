@@ -867,7 +867,7 @@ def _refresh_ephemeral_efivars(acct, cfg):
 
 
 def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
-               warm=None, bake=False):
+               warm=None, bake=False, warm_key=None):
     from omnidroid.runtime import runtime_dir
     check_accel()
     d = runtime_dir(acct["name"])
@@ -907,5 +907,5 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
          "offset": acct.get("offset"),
          "data_image": acct.get("data_image"),
          "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
-         "vnc_port": acct["vnc_port"]}))
+         "vnc_port": acct["vnc_port"], "warm_key": warm_key}))
     return proc.pid

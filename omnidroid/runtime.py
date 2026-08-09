@@ -118,7 +118,7 @@ def pid_alive(pid):
         # already-dead process and then return 'kill-failed'. Callers ask "is the
         # instance running?"; a zombie is not.
         #
-        # The usual detached case (`omni start` exits, QEMU reparents to init) is
+        # The usual detached case (`omnidroid start` exits, QEMU reparents to init) is
         # unaffected: waitpid raises ChildProcessError and we fall through.
         try:
             wpid, _status = os.waitpid(pid, os.WNOHANG)
@@ -384,3 +384,27 @@ def running_pid(name):
         return None
     pid = data.get("pid")
     return pid if instance_live(data) else None
+
+
+def warm_keys_in_use():
+    """Golden-entry keys backing a RUNNING instance right now.
+
+    Eviction uses it so a live instance's disks are never deleted, and the
+    interim concurrency rule uses it so a second launch against an in-use
+    entry cold-boots instead of landing `offline` on adb (design spec 8b).
+    """
+    keys = set()
+    root = config.runtime_root()
+    if not root.is_dir():
+        return keys
+    for d in root.iterdir():
+        if not d.is_dir():
+            continue
+        try:
+            data = json.loads((d / "run.json").read_text())
+        except (OSError, ValueError):
+            continue
+        key = data.get("warm_key")
+        if key and running_pid(d.name):
+            keys.add(key)
+    return keys
