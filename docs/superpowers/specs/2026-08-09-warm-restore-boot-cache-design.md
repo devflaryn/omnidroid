@@ -129,6 +129,35 @@ Migration requires identical `-m` and `-smp` between save and restore, but
   will swap is slower than the smaller cold guest and, on macOS, eventually
   fatal to the process.
 
+### 5.4 Disk budget and eviction
+
+Warm entries are large and the host they must live on is not empty. Measured on
+the primary host, 2026-08-09: the images volume is **89% full, 24 GiB free**,
+while a `playable` entry is expected to cost order 1.5-2.5 GB. Six entries
+(3 offsets x 2 modes) would consume roughly half the remaining space. A cache
+that silently fills the disk would take the product down — a direct violation of
+*stability > speed*.
+
+Rules:
+
+- **Free-space floor.** Before a bake, require the entry's projected size plus a
+  **10 GiB reserve** to be available. Below the floor, skip the bake entirely and
+  run as today. A launch is never failed or delayed over cache housekeeping, and
+  the engine never competes with the user for the last of their disk.
+- **LRU eviction, bounded by count and bytes.** Keep at most `warm.max_entries`
+  (default 4) and `warm.max_bytes` (default 8 GiB), evicting least-recently-used
+  entries first. `meta.json` carries a `last_used` timestamp, stamped on each
+  restore.
+- **Eviction is safe by construction.** An entry is a pure derived artifact:
+  deleting one costs a single cold boot, never data. Entries in use by a running
+  instance are never evicted.
+- **Orphan reclaim.** `prune()` (§6.1) removes entries whose base version or
+  offset no longer exists, and runs from `reconcile_runtime()` — so a base update
+  reclaims the space its stale entries held rather than accumulating alongside
+  the new ones.
+- Both limits are configurable in `configs/paths.json` under `warm`, and
+  `omnidroid footprint` reports cache size and per-entry last-used.
+
 ## 6. Components
 
 ### 6.1 `omnidroid/warmcache.py` (new)
@@ -142,6 +171,9 @@ Owns the cache and nothing else. Pure functions, unit-testable with no QEMU:
 - `begin_bake()` / `commit_bake()` / `discard_bake()` — bake into a temp dir,
   atomic rename on commit, so a partial entry is never visible
 - `prune(cfg)` — reclaim orphaned entries; called from `reconcile_runtime()`
+- `has_room(cfg, projected_bytes) -> bool` — free-space floor check (§5.4)
+- `evict_lru(cfg)` — enforce `max_entries` / `max_bytes`, skipping entries in
+  use by a running instance (§5.4)
 
 ### 6.2 `omnidroid/qemu_proc.py`
 
@@ -252,7 +284,9 @@ win is proven and how the mechanism-C decision is later settled.
 
 ## 11. Testing
 
-**Unit (no QEMU):** key stability and sensitivity (base version bump, offset
+**Unit (no QEMU):** free-space floor blocks a bake and leaves behaviour
+unchanged; LRU eviction respects `max_entries`/`max_bytes` and never evicts an
+entry in use; key stability and sensitivity (base version bump, offset
 change, mode change, mem/smp change, QEMU version change each produce a
 different key); `lookup` returns `None` on missing file, corrupt `meta.json`,
 and version mismatch; `begin`/`commit`/`discard` never leave a partial entry
