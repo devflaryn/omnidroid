@@ -28,12 +28,26 @@ def _cfg(images):
             "bases": {"arm": {"type": "arm-uefi",
                               "system": "base_arm_system_rooted.qcow2",
                               "data": "base_arm_data_rooted.qcow2",
-                              "efivars": "base_arm_efivars.fd"}}}
+                              "efivars": "base_arm_efivars.fd"},
+                      # Modeled on the real `bases.x86` entry in
+                      # configs/paths.json: x86-bliss boots by direct
+                      # kernel/initrd, not UEFI pflash.
+                      "x86": {"type": "x86-bliss",
+                              "disk": "base_x86.qcow2",
+                              "kernel": "base_x86.kernel",
+                              "initrd": "base_x86.initrd.img",
+                              "src": "/android-2024-10-11"}}}
 
 
 def _acct():
     return {"name": "t", "base": "arm", "ephemeral": True, "adb_port": 16001,
             "qmp_port": 17001, "vnc_port": 18001, "arch": "arm64"}
+
+
+def _acct_x86():
+    return {"name": "t86", "base": "x86", "ephemeral": False,
+            "adb_port": 16002, "qmp_port": 17002, "vnc_port": 18002,
+            "arch": "x86_64"}
 
 
 class WarmRestoreArgs(unittest.TestCase):
@@ -86,6 +100,55 @@ class WarmRestoreArgs(unittest.TestCase):
                                     interactive=False, warm=None, bake=False)
         self.assertEqual(before, after)
         self.assertNotIn("-incoming", before)
+
+    def test_warm_and_bake_together_raises_on_arm(self):
+        with self.assertRaises(ValueError):
+            qp.qemu_command_arm(_acct(), _cfg(self.images), interactive=False,
+                                warm=self.entry, bake=True)
+
+    # ------------------------------------------------------------- x86 ----
+    # The design spec is explicit that qemu_command() (x86) is NOT arm-only
+    # and must gain the same warm parameter -- cross-platform is a hard
+    # requirement, not an arm nicety.
+
+    def test_x86_restore_opens_the_golden_disks_snapshot_on(self):
+        cmd = qp.qemu_command(_acct_x86(), _cfg(self.images), interactive=False,
+                              warm=self.entry)
+        drives = [a for a in cmd if a.startswith("file=")]
+        golden = [d for d in drives if warmcache.SYSTEM_NAME in d
+                  or warmcache.DATA_NAME in d]
+        self.assertEqual(len(golden), 2, drives)
+        for d in golden:
+            self.assertIn("snapshot=on", d)
+
+    def test_x86_restore_defers_incoming_and_never_uses_incoming_file(self):
+        cmd = qp.qemu_command(_acct_x86(), _cfg(self.images), interactive=False,
+                              warm=self.entry)
+        self.assertIn("-incoming", cmd)
+        self.assertEqual(cmd[cmd.index("-incoming") + 1], "defer")
+        self.assertFalse(any(str(a).startswith("file:") for a in cmd))
+
+    def test_x86_bake_uses_writable_overlays_not_snapshot_on(self):
+        cmd = qp.qemu_command(_acct_x86(), _cfg(self.images), interactive=False,
+                              bake=True)
+        drives = [a for a in cmd if a.startswith("file=")]
+        self.assertTrue(drives)
+        for d in drives:
+            self.assertNotIn("snapshot=on", d)
+        self.assertNotIn("-incoming", cmd)
+
+    def test_x86_normal_boot_is_byte_for_byte_unchanged(self):
+        before = qp.qemu_command(_acct_x86(), _cfg(self.images),
+                                 interactive=False)
+        after = qp.qemu_command(_acct_x86(), _cfg(self.images),
+                                interactive=False, warm=None, bake=False)
+        self.assertEqual(before, after)
+        self.assertNotIn("-incoming", before)
+
+    def test_warm_and_bake_together_raises_on_x86(self):
+        with self.assertRaises(ValueError):
+            qp.qemu_command(_acct_x86(), _cfg(self.images), interactive=False,
+                            warm=self.entry, bake=True)
 
 
 if __name__ == "__main__":

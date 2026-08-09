@@ -599,6 +599,13 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
     # one entry and no restore can ever modify it. efivars is the entry's own
     # copy (pflash needs a real writable file).
     from omnidroid import warmcache
+    if warm is not None and bake:
+        # Programming error, not a runtime condition: no legitimate caller
+        # asks to both restore a frozen entry AND capture a fresh freeze
+        # point in the same boot. Restore silently winning would hide the
+        # caller's bug instead of surfacing it.
+        raise ValueError("qemu_command_arm: warm and bake are mutually "
+                         "exclusive")
     if warm is not None:
         warm = Path(warm)
         sys_src = warm / warmcache.SYSTEM_NAME
@@ -721,7 +728,7 @@ def devkit_drive_args(acct, cfg, debug, disk_opts):
 
 def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
                  warm=None, bake=False):
-    from omnidroid.engine import account_dir
+    from omnidroid.engine import account_dir, runtime_dir
     base = cfg["bases"][acct["base"]]
     if base_type(base) == BASE_TYPE_ARM:
         return qemu_command_arm(acct, cfg, interactive, mode=mode, accel=accel,
@@ -729,10 +736,34 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
     images = Path(cfg["images_dir"])
     q = cfg["qemu"]
     d = account_dir(acct["name"])
+    rd = runtime_dir(acct["name"])
     accel = accel or default_accel()
     mode = mode or resolve_mode(cfg)
 
     vnc_display = _assert_port_triple(acct)
+
+    if warm is not None and bake:
+        # Same rule as the arm builder: a caller asking for both is a bug,
+        # not a runtime state -- restore silently winning would hide it.
+        raise ValueError("qemu_command: warm and bake are mutually exclusive")
+    # WARM RESTORE / BAKE: same disk-sourcing rule as arm (see
+    # qemu_command_arm), adapted to x86's virtio disk syntax. x86 boots by
+    # direct kernel/initrd rather than UEFI pflash, so there is no efivars
+    # file here -- that part of the arm branch has no x86 equivalent.
+    from omnidroid import warmcache
+    if warm is not None:
+        warm = Path(warm)
+        sys_src = warm / warmcache.SYSTEM_NAME
+        data_src = warm / warmcache.DATA_NAME
+        disk_opts = ",format=qcow2,if=virtio,snapshot=on"
+    elif bake:
+        sys_src = rd / "bake_system.qcow2"
+        data_src = rd / "bake_data.qcow2"
+        disk_opts = ",format=qcow2,if=virtio"
+    else:
+        sys_src = d / "system.qcow2"
+        data_src = d / "data.qcow2"
+        disk_opts = ",format=qcow2,if=virtio"
 
     append = ("stack_depot_disable=on cgroup_disable=pressure "
               "root=/dev/ram0 noexec=off "
@@ -768,8 +799,8 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         "-cpu", "qemu64",
         "-smp", str(smp),
         "-m", str(mem),
-        "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
-        "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
+        "-drive", f"file={sys_src}{disk_opts}",
+        "-drive", f"file={data_src}{disk_opts}",
         *gpu,
         *display_args,            # "none" in every mode but gaming
         # Built-in VNC server on the account's reserved port. It stays on even
@@ -797,6 +828,11 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
     cmd += devkit_drive_args(acct, cfg, debug, ",format=qcow2")
     if interactive:
         cmd += ["-serial", f"file:{d / 'serial.log'}"]
+    if warm is not None:
+        # Same reasoning as the arm builder: caps (mapped-ram/multifd) can
+        # only be set over QMP before the stream is read, so this must be
+        # `-incoming defer`, never `-incoming file:<path>`.
+        cmd += ["-incoming", "defer"]
     return cmd
 
 
