@@ -1210,7 +1210,7 @@ class QmpSession:
         while True:
             try:
                 self._sock = socket.create_connection(("127.0.0.1", port),
-                                                      timeout=timeout)
+                                                        timeout=timeout)
                 break
             except OSError as e:
                 last = e
@@ -1220,20 +1220,41 @@ class QmpSession:
                         f"within {connect_timeout}s: {last}") from last
                 time.sleep(0.25)
         self._sock.settimeout(timeout)
-        self._f = self._sock.makefile("rw", encoding="utf-8", newline="\n")
-        self._f.readline()                       # greeting
-        self.cmd("qmp_capabilities")
+        self._f = None
+        try:
+            self._f = self._sock.makefile("rw", encoding="utf-8", newline="\n")
+            greeting = self._f.readline()             # greeting
+            if not greeting:
+                raise OSError(
+                    f"QMP on 127.0.0.1:{port} closed the connection before "
+                    f"sending its greeting")
+            caps = self.cmd("qmp_capabilities")
+            if "error" in caps:
+                raise OSError(
+                    f"QMP on 127.0.0.1:{port} rejected qmp_capabilities: "
+                    f"{caps['error']}")
+        except Exception:
+            # Don't leak the fd: every retried cold-boot fallback would
+            # otherwise leak another one.
+            self.close()
+            raise
 
     def cmd(self, execute, arguments=None):
         """Send one command, return its parsed reply (return OR error).
 
         Asynchronous events are skipped: only a reply carries `return`/`error`.
+        A write/flush failure (QEMU already dead) degrades to the same error
+        dict shape as a closed connection, rather than raising -- callers
+        fall back to a cold boot on an error dict, not on an exception.
         """
         msg = {"execute": execute}
         if arguments:
             msg["arguments"] = arguments
-        self._f.write(json.dumps(msg) + "\n")
-        self._f.flush()
+        try:
+            self._f.write(json.dumps(msg) + "\n")
+            self._f.flush()
+        except (OSError, ValueError) as e:
+            return {"error": {"desc": f"QMP connection closed: {e}"}}
         while True:
             line = self._f.readline()
             if not line:
@@ -1252,7 +1273,7 @@ class QmpSession:
         """
         self.cmd("migrate-set-capabilities",
                  {"capabilities": [{"capability": c, "state": True}
-                                   for c in MIGRATION_CAPS]})
+                                    for c in MIGRATION_CAPS]})
         self.cmd("migrate-set-parameters", {"multifd-channels": channels})
 
     def wait_migrate(self, timeout=600.0, sleep=0.25):
