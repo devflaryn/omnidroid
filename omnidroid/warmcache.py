@@ -148,3 +148,136 @@ def commit_bake(images_dir, key, tmp, meta):
 def discard_bake(tmp):
     """Throw a staged bake away. Idempotent; never raises."""
     shutil.rmtree(Path(tmp), ignore_errors=True)
+
+
+DEFAULT_MAX_ENTRIES = 4
+DEFAULT_MAX_BYTES = 8 * 2**30
+FREE_RESERVE_BYTES = 10 * 2**30
+
+
+def entry_bytes(entry):
+    """Bytes an entry occupies. Best-effort; unreadable files count as 0."""
+    total = 0
+    for f in Path(entry).glob("*"):
+        try:
+            total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def has_room(images_dir, projected_bytes, reserve=FREE_RESERVE_BYTES,
+             free_fn=None):
+    """Is there room for a new entry AND the reserve still left over?
+
+    Below the floor we skip the bake entirely and run as today: a launch is
+    never failed or delayed over cache housekeeping, and the engine never
+    competes with the user for the last of their disk.
+    """
+    try:
+        free = (free_fn or (lambda p: shutil.disk_usage(p).free))(
+            str(images_dir))
+        return free >= projected_bytes + reserve
+    except Exception:      # noqa: BLE001 - unreadable disk: skip the bake
+        return False
+
+
+def touch(entry):
+    """Stamp last_used so eviction can order entries. Never raises."""
+    entry = Path(entry)
+    meta = read_meta(entry)
+    if meta is None:
+        return
+    meta["last_used"] = time.time()
+    try:
+        (entry / META_NAME).write_text(json.dumps(meta, indent=2))
+    except OSError:
+        pass
+
+
+def list_entries(images_dir):
+    """[(key, path, last_used, size_bytes)] for every complete-looking entry."""
+    root = warm_root(images_dir)
+    if not root.is_dir():
+        return []
+    out = []
+    for d in root.iterdir():
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        meta = read_meta(d) or {}
+        out.append((d.name, d, float(meta.get("last_used") or 0),
+                    entry_bytes(d)))
+    return out
+
+
+def _remove(entry):
+    shutil.rmtree(Path(entry), ignore_errors=True)
+
+
+def evict_lru(images_dir, in_use, max_entries=DEFAULT_MAX_ENTRIES,
+              max_bytes=DEFAULT_MAX_BYTES):
+    """Enforce the entry-count and byte ceilings, oldest first.
+
+    An entry is a pure derived artifact, so eviction costs exactly one cold
+    boot -- never data. Entries backing a RUNNING instance are pinned and
+    never touched -- and the budget is measured over the evictable
+    candidates only, not the pinned ones: a pinned entry alone filling (or
+    exceeding) max_entries/max_bytes must never force the eviction of some
+    OTHER, still-useful entry, since the pinned one occupies its space no
+    matter what we do.
+    """
+    entries = sorted(list_entries(images_dir), key=lambda r: r[2])
+    candidates = [r for r in entries if r[0] not in in_use]
+    total = sum(r[3] for r in candidates)
+    count = len(candidates)
+    removed = []
+    for key, path, _, size in candidates:
+        if count <= max_entries and total <= max_bytes:
+            break
+        _remove(path)
+        removed.append(key)
+        count -= 1
+        total -= size
+    return removed
+
+
+def prune(images_dir, valid_keys, in_use):
+    """Reclaim entries whose key no longer exists, plus abandoned staging dirs.
+
+    Called from reconcile_runtime(), so a base update reclaims the space its
+    stale entries held instead of accumulating alongside the new ones.
+    """
+    root = warm_root(images_dir)
+    if not root.is_dir():
+        return []
+    removed = []
+    for d in root.iterdir():
+        if d.is_dir() and d.name.startswith((".bake-", ".trash-")):
+            _remove(d)
+            continue
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        if d.name in valid_keys or d.name in in_use:
+            continue
+        _remove(d)
+        removed.append(d.name)
+    return removed
+
+
+def prune_staging(images_dir):
+    """Reclaim abandoned `.bake-`/`.trash-` staging directories only.
+
+    Safe to call from anywhere -- unlike prune(), it never needs the full set
+    of still-reachable keys, so it can run speculatively (e.g. at process
+    startup) without risking wiping live entries over an incomplete
+    valid_keys set.
+    """
+    root = warm_root(images_dir)
+    if not root.is_dir():
+        return []
+    removed = []
+    for d in root.iterdir():
+        if d.is_dir() and d.name.startswith((".bake-", ".trash-")):
+            _remove(d)
+            removed.append(d.name)
+    return removed

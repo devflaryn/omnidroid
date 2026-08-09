@@ -320,5 +320,122 @@ class BakeLifecycle(unittest.TestCase):
         self.assertEqual(len(set(trash_names)), 3)
 
 
+class DiskBudget(unittest.TestCase):
+    """The images volume was measured 89% full while an entry costs ~2 GB.
+    An unbounded cache would take the product down, so these limits are a
+    stability requirement, not tidiness."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _entry(self, key, last_used, size=1024):
+        e = warmcache.entry_path(self.tmp, key)
+        e.mkdir(parents=True, exist_ok=True)
+        for name in warmcache.REQUIRED_FILES:
+            if name != warmcache.META_NAME:
+                (e / name).write_bytes(b"0" * size)
+        (e / warmcache.META_NAME).write_text(json.dumps(
+            {"key": key, "qemu_version": "11.0.2", "last_used": last_used}))
+        return e
+
+    def test_bake_is_skipped_when_the_disk_is_near_full(self):
+        # Skipping a bake costs one slow launch; filling the disk costs the
+        # product. Never fail or delay the launch over housekeeping.
+        self.assertFalse(warmcache.has_room(
+            self.tmp, projected_bytes=2 * 2**30,
+            free_fn=lambda p: 11 * 2**30))     # 11 GiB free, need 2 + 10 reserve
+        self.assertTrue(warmcache.has_room(
+            self.tmp, projected_bytes=2 * 2**30,
+            free_fn=lambda p: 13 * 2**30))
+
+    def test_eviction_removes_least_recently_used_first(self):
+        self._entry("old", last_used=100)
+        self._entry("mid", last_used=200)
+        self._entry("new", last_used=300)
+        evicted = warmcache.evict_lru(self.tmp, in_use=set(), max_entries=2,
+                                      max_bytes=10**9)
+        self.assertEqual(evicted, ["old"])
+        self.assertFalse(warmcache.entry_path(self.tmp, "old").exists())
+        self.assertTrue(warmcache.entry_path(self.tmp, "new").exists())
+
+    def test_eviction_never_removes_an_entry_in_use(self):
+        # Deleting the disks a running instance is backed by would kill it.
+        self._entry("old", last_used=100)
+        self._entry("new", last_used=300)
+        evicted = warmcache.evict_lru(self.tmp, in_use={"old"}, max_entries=1,
+                                      max_bytes=10**9)
+        self.assertEqual(evicted, [])
+        self.assertTrue(warmcache.entry_path(self.tmp, "old").exists())
+
+    def test_eviction_respects_a_byte_ceiling(self):
+        # Each entry (4 required files @ size bytes + meta.json) is ~4.1 KB
+        # here; 6000 comfortably fits one entry but not two, so exactly the
+        # older one must go.
+        self._entry("a", last_used=100, size=1024)
+        self._entry("b", last_used=200, size=1024)
+        evicted = warmcache.evict_lru(self.tmp, in_use=set(), max_entries=99,
+                                      max_bytes=6000)
+        self.assertEqual(evicted, ["a"])
+
+    def test_touch_updates_last_used(self):
+        e = self._entry("k", last_used=1)
+        warmcache.touch(e)
+        self.assertGreater(warmcache.read_meta(e)["last_used"], 1)
+
+    def test_prune_reclaims_entries_whose_key_no_longer_exists(self):
+        # A base update changes every key; the old entries are pure garbage.
+        self._entry("stale", last_used=100)
+        self._entry("live", last_used=200)
+        removed = warmcache.prune(self.tmp, valid_keys={"live"}, in_use=set())
+        self.assertEqual(removed, ["stale"])
+        self.assertTrue(warmcache.entry_path(self.tmp, "live").exists())
+
+    def test_prune_removes_abandoned_staging_dirs(self):
+        staging = warmcache.begin_bake(self.tmp, "somekey")
+        warmcache.prune(self.tmp, valid_keys=set(), in_use=set())
+        self.assertFalse(staging.exists())
+
+    def test_prune_removes_abandoned_trash_dirs(self):
+        # commit_bake can leave a .trash-<key>-<ns> dir behind if killed
+        # mid-publish; nothing else reclaims it, so prune must.
+        trash = warmcache.warm_root(self.tmp) / ".trash-somekey-123"
+        trash.mkdir(parents=True)
+        warmcache.prune(self.tmp, valid_keys=set(), in_use=set())
+        self.assertFalse(trash.exists())
+
+    def test_prune_staging_removes_bake_and_trash_dirs_without_valid_keys(self):
+        # prune_staging is safe to call from anywhere: it needs no
+        # (potentially incomplete) valid_keys set, because it only ever
+        # touches .bake-/.trash- staging dirs, never a published entry.
+        staging = warmcache.begin_bake(self.tmp, "somekey")
+        trash = warmcache.warm_root(self.tmp) / ".trash-otherkey-456"
+        trash.mkdir(parents=True)
+        live = self._entry("live", last_used=200)
+        removed = warmcache.prune_staging(self.tmp)
+        self.assertCountEqual(removed, [staging.name, trash.name])
+        self.assertFalse(staging.exists())
+        self.assertFalse(trash.exists())
+        self.assertTrue(live.exists())
+
+    def test_prune_staging_on_missing_cache_dir_is_not_an_error(self):
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        self.assertEqual(warmcache.prune_staging(empty), [])
+
+    def test_prune_keeps_an_in_use_entry_even_if_its_key_went_stale(self):
+        self._entry("running", last_used=100)
+        removed = warmcache.prune(self.tmp, valid_keys=set(),
+                                  in_use={"running"})
+        self.assertEqual(removed, [])
+
+    def test_missing_cache_dir_is_not_an_error(self):
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        self.assertEqual(warmcache.list_entries(empty), [])
+        self.assertEqual(warmcache.evict_lru(empty, in_use=set()), [])
+        self.assertEqual(warmcache.prune(empty, set(), set()), [])
+
+
 if __name__ == "__main__":
     unittest.main()
