@@ -138,6 +138,49 @@ class EntryLookup(unittest.TestCase):
             {"key": "somethingelse", "qemu_version": "11.0.2"}))
         self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
 
+    def test_each_zero_byte_file_is_a_miss(self):
+        # A zero-byte state/qcow2/efivars file is a truncated write, not a
+        # usable entry -- handing it to QEMU fails in a way nobody traces
+        # back to the cache.
+        for name in warmcache.REQUIRED_FILES:
+            with self.subTest(zero_byte=name):
+                tmp = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+                e = _make_entry(tmp, self.key)
+                (e / name).write_bytes(b"")
+                self.assertIsNone(warmcache.lookup(tmp, self.key, "11.0.2"))
+
+    def test_state_as_a_directory_is_a_miss(self):
+        # REQUIRED_FILES entries must be regular files; a directory that
+        # happens to share the name must not be accepted as the file.
+        e = _make_entry(self.tmp, self.key)
+        (e / warmcache.STATE_NAME).unlink()
+        (e / warmcache.STATE_NAME).mkdir()
+        self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
+
+    def test_missing_qemu_version_in_meta_is_a_miss_even_with_none_argument(self):
+        # meta.get(...) != qemu_version must not pass spuriously when both
+        # sides are None -- an entry with no recorded QEMU version is never
+        # valid, regardless of what the caller passes.
+        e = _make_entry(self.tmp, self.key)
+        (e / warmcache.META_NAME).write_text(json.dumps({"key": self.key}))
+        self.assertIsNone(warmcache.lookup(self.tmp, self.key, None))
+
+
+class ReadMetaShape(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_read_meta_rejects_a_json_list(self):
+        # Valid JSON but the wrong shape: read_meta must treat this as
+        # absent rather than returning something callers would .get() into
+        # an AttributeError.
+        entry = self.tmp / "entry"
+        entry.mkdir()
+        (entry / warmcache.META_NAME).write_text(json.dumps(["not", "a", "dict"]))
+        self.assertIsNone(warmcache.read_meta(entry))
+
 
 if __name__ == "__main__":
     unittest.main()

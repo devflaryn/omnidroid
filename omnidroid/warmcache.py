@@ -80,10 +80,12 @@ def lookup(images_dir, key, qemu_version):
             return None
         if meta.get("key") != key:
             return None
-        if meta.get("qemu_version") != qemu_version:
+        meta_qemu_version = meta.get("qemu_version")
+        if not meta_qemu_version or meta_qemu_version != qemu_version:
             return None
         for name in REQUIRED_FILES:
-            if not (entry / name).exists():
+            path = entry / name
+            if not path.is_file() or path.stat().st_size == 0:
                 return None
         return entry
     except Exception:      # noqa: BLE001 - a broken cache is a miss, never a crash
