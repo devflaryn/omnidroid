@@ -1743,6 +1743,7 @@ False, so the caller falls back to today's cold boot. Nothing raises into a
 launch.
 """
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -1770,7 +1771,12 @@ def resync_guest_clock(acct, label, adb_fn=None, now_fn=time.time):
     try:
         before = int(adb_fn(acct, "shell", "date", "+%s",
                             timeout=20).stdout.strip())
-    except (ValueError, AttributeError, OSError):
+    # subprocess.SubprocessError covers subprocess.TimeoutExpired, which is
+    # what the real adb() raises when a still-booting guest never answers --
+    # the single most likely real-world cause of an unreadable clock, and
+    # NOT an OSError, so it must be caught here explicitly or it propagates
+    # straight into the boot path.
+    except (ValueError, AttributeError, OSError, subprocess.SubprocessError):
         print(f"[{label}] could not read the guest clock; skipping resync")
         return None
     host = int(now_fn())
@@ -1778,7 +1784,9 @@ def resync_guest_clock(acct, label, adb_fn=None, now_fn=time.time):
     try:
         adb_fn(acct, "shell", "su", "-c", f"date -s @{host}", timeout=20)
     except Exception:      # noqa: BLE001 - never fail a boot over the clock
-        pass
+        print(f"[{label}] guest clock read ({skew}s skew) but the "
+              f"correction command failed; clock left uncorrected")
+        return skew
     print(f"[{label}] guest clock resynced (was {skew}s behind host)")
     return skew
 
@@ -1827,12 +1835,12 @@ def bake_entry(acct, images_dir, key, meta, runtime_dir, label,
     staging = None
     try:
         staging = warmcache.begin_bake(images_dir, key)
+        state_path = staging / warmcache.STATE_NAME
         with session_factory(acct["qmp_port"]) as s:
             s.set_migration_caps()
             if "error" in s.cmd("stop"):
                 raise RuntimeError("could not stop the guest")
-            r = s.cmd("migrate",
-                      {"uri": f"file:{staging / warmcache.STATE_NAME}"})
+            r = s.cmd("migrate", {"uri": f"file:{state_path}"})
             if "error" in r:
                 raise RuntimeError(r["error"].get("desc", "migrate rejected"))
             status = s.wait_migrate()
@@ -1844,6 +1852,19 @@ def bake_entry(acct, images_dir, key, meta, runtime_dir, label,
                          (rd / "efivars.fd", warmcache.EFIVARS_NAME)):
             shutil.move(str(src), str(staging / dst))
         warmcache.commit_bake(images_dir, key, staging, meta)
+        staging = None      # committed: nothing left at the old path to discard
+        # QMP can report "completed" while the `file:` write never actually
+        # landed (an I/O error not surfaced through the migration state
+        # machine, a disk that filled mid-write, ...). Trusting that status
+        # alone would leave every future launch paying the stop+migrate
+        # cost, logging a false success, and still cold-booting -- forever,
+        # silently. Re-run the same check a restore would trust.
+        if warmcache.lookup(images_dir, key, meta.get("qemu_version")) is None:
+            shutil.rmtree(warmcache.entry_path(images_dir, key),
+                          ignore_errors=True)
+            print(f"[{label}] warm bake produced an unusable entry "
+                  f"(failed post-commit validation); discarded")
+            return False
         print(f"[{label}] warm entry baked ({key})")
         return True
     except Exception as e:      # noqa: BLE001 - a failed bake is not a failed launch
