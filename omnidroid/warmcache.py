@@ -113,17 +113,35 @@ def commit_bake(images_dir, key, tmp, meta):
     The rename is the only moment an entry becomes visible, so a crash at any
     earlier point leaves the previous entry (or no entry) intact rather than a
     half-written one a boot would trust.
+
+    A directory can't be renamed onto an existing non-empty directory on
+    POSIX (ENOTEMPTY), so replacing an entry is a three-step dance: move the
+    old entry aside (frees the destination, old data still intact on disk),
+    rename the new one into place, and only once that succeeds does the old
+    one actually get deleted. If the publish rename fails, the old entry is
+    renamed back so a previously-working, expensive-to-rebuild entry is never
+    lost alongside a failed write.
     """
     tmp = Path(tmp)
     meta = dict(meta, key=key, last_used=time.time())
     (tmp / META_NAME).write_text(json.dumps(meta, indent=2))
     entry = entry_path(images_dir, key)
     entry.parent.mkdir(parents=True, exist_ok=True)
+    doomed = None
     if entry.exists():
-        doomed = warm_root(images_dir) / f".trash-{key}-{int(time.time())}"
+        doomed = warm_root(images_dir) / f".trash-{key}-{time.time_ns()}"
         entry.rename(doomed)
+    try:
+        tmp.rename(entry)
+    except Exception:
+        if doomed is not None:
+            try:
+                doomed.rename(entry)
+            except Exception:      # noqa: BLE001 - never mask the original error
+                pass
+        raise
+    if doomed is not None:
         shutil.rmtree(doomed, ignore_errors=True)
-    tmp.rename(entry)
     return entry
 
 

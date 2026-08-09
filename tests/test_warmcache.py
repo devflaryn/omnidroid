@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omnidroid import warmcache  # noqa: E402
@@ -195,9 +196,18 @@ class BakeLifecycle(unittest.TestCase):
 
     def test_a_partial_bake_is_never_visible_as_an_entry(self):
         # The whole point of staging: a crash mid-bake must not leave an
-        # entry that lookup() would hand to a boot.
+        # entry that lookup() would hand to a boot. Prove isolation, not just
+        # incompleteness: stage a directory that is itself distinct from the
+        # published entry path, populate it with a COMPLETE, otherwise-valid
+        # entry (all five required files, matching meta.json), and confirm
+        # lookup() still can't see it. A test that merely omits files would
+        # also pass if begin_bake staged directly at entry_path(), silently
+        # losing the atomicity guarantee.
         staging = warmcache.begin_bake(self.tmp, self.key)
-        (staging / warmcache.STATE_NAME).write_bytes(b"half")
+        self.assertNotEqual(staging, warmcache.entry_path(self.tmp, self.key))
+        self._fill(staging)
+        (staging / warmcache.META_NAME).write_text(json.dumps(
+            {"key": self.key, "qemu_version": "11.0.2"}))
         self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
 
     def test_commit_makes_the_entry_findable(self):
@@ -206,6 +216,9 @@ class BakeLifecycle(unittest.TestCase):
         warmcache.commit_bake(self.tmp, self.key, staging,
                               {"key": self.key, "qemu_version": "11.0.2"})
         self.assertIsNotNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
+        # Publication must be a rename, not a copy: a regression that swaps
+        # in shutil.copytree would leave the staging dir behind.
+        self.assertFalse(staging.exists())
 
     def test_commit_stamps_key_and_last_used_even_if_caller_forgot(self):
         staging = warmcache.begin_bake(self.tmp, self.key)
@@ -240,6 +253,71 @@ class BakeLifecycle(unittest.TestCase):
         warmcache.discard_bake(staging)
         self.assertFalse(staging.exists())
         warmcache.discard_bake(staging)      # must not raise
+
+    def test_commit_rolls_back_and_preserves_the_old_entry_if_publish_fails(self):
+        # The old entry must be moved aside, not destroyed, before the new
+        # one is installed: if the final rename fails (I/O error, ENOSPC on
+        # the metadata op), a previously-working, expensive-to-rebuild entry
+        # must survive rather than being lost alongside the failed write.
+        first = warmcache.begin_bake(self.tmp, self.key)
+        self._fill(first)
+        warmcache.commit_bake(self.tmp, self.key, first,
+                              {"qemu_version": "11.0.2"})
+        entry = warmcache.entry_path(self.tmp, self.key)
+        original_bytes = (entry / warmcache.STATE_NAME).read_bytes()
+
+        second = warmcache.begin_bake(self.tmp, self.key)
+        self._fill(second)
+        (second / warmcache.STATE_NAME).write_bytes(b"never-should-land")
+
+        real_rename = Path.rename
+
+        def flaky_rename(self_path, target):
+            if self_path == second:
+                raise OSError("simulated publish failure")
+            return real_rename(self_path, target)
+
+        with mock.patch.object(Path, "rename", flaky_rename):
+            with self.assertRaises(OSError):
+                warmcache.commit_bake(self.tmp, self.key, second,
+                                      {"qemu_version": "11.0.2"})
+
+        self.assertTrue(entry.exists())
+        self.assertEqual((entry / warmcache.STATE_NAME).read_bytes(),
+                         original_bytes)
+        self.assertIsNotNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
+
+    def test_commit_uses_unique_trash_names_within_the_same_wall_clock_second(self):
+        # int(time.time()) truncates to whole seconds: two commits landing in
+        # the same second used to produce identical .trash-{key}-{sec} names,
+        # which could raise on the second entry.rename(doomed). Freeze
+        # time.time() and confirm the trash names commit_bake actually
+        # cleans up stay distinct regardless.
+        first = warmcache.begin_bake(self.tmp, self.key)
+        self._fill(first)
+        warmcache.commit_bake(self.tmp, self.key, first,
+                              {"qemu_version": "11.0.2"})
+
+        trash_names = []
+        real_rmtree = shutil.rmtree
+
+        def capturing_rmtree(path, ignore_errors=False):
+            name = Path(path).name
+            if name.startswith(".trash-"):
+                trash_names.append(name)
+            return real_rmtree(path, ignore_errors=ignore_errors)
+
+        with mock.patch("time.time", return_value=1234.0), \
+             mock.patch.object(warmcache.shutil, "rmtree",
+                                side_effect=capturing_rmtree):
+            for i in range(3):
+                staging = warmcache.begin_bake(self.tmp, self.key)
+                self._fill(staging)
+                warmcache.commit_bake(self.tmp, self.key, staging,
+                                      {"qemu_version": "11.0.2"})
+
+        self.assertEqual(len(trash_names), 3)
+        self.assertEqual(len(set(trash_names)), 3)
 
 
 if __name__ == "__main__":
