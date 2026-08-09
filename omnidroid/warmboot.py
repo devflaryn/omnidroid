@@ -16,7 +16,7 @@ from omnidroid.qmpsession import QmpSession
 # A migration file is sparse: it costs roughly the guest's resident set, not
 # its -m size. Measured on the arm64 base: a 4096 MB guest froze to ~2.4 GiB.
 # Budget 70% of RAM so the free-space check errs toward skipping a bake.
-def PROJECTED_ENTRY_BYTES(mem_mb):
+def projected_entry_bytes(mem_mb):
     return int(mem_mb * 0.7 * 2**20)
 
 
@@ -92,13 +92,6 @@ def bake_entry(acct, images_dir, key, meta, runtime_dir, label,
     try:
         staging = warmcache.begin_bake(images_dir, key)
         state_path = staging / warmcache.STATE_NAME
-        # QEMU opens (and overwrites) this path itself once `migrate` runs for
-        # real, so this placeholder is only load-bearing under test, where the
-        # QMP session is faked and no bytes ever land on disk. Without it a
-        # genuinely successful fake migrate would still leave a zero-byte
-        # `state`, which warmcache.lookup()'s REQUIRED_FILES check (by design)
-        # treats identically to a truncated one and reports as a miss.
-        state_path.write_bytes(b"\0")
         with session_factory(acct["qmp_port"]) as s:
             s.set_migration_caps()
             if "error" in s.cmd("stop"):

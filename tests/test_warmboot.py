@@ -19,18 +19,32 @@ from omnidroid import warmboot, warmcache  # noqa: E402
 
 
 class FakeSession:
-    """Records the command order and replays a scripted migration status."""
+    """Records the command order and replays a scripted migration status.
+
+    Also models the one side effect of a real `migrate`/`migrate-incoming`
+    that this code actually depends on: QEMU writes the machine state to the
+    `file:` URI it's given. `write_state=False` models a migrate that reports
+    `completed` over QMP but never produced a usable state file (e.g. it
+    crashed mid-stream) -- the exact case a naive implementation could
+    silently publish as a good cache entry.
+    """
 
     def __init__(self, port, migrate_status="completed", fail_on=None,
-                 connect_timeout=60.0, timeout=15.0):
+                 connect_timeout=60.0, timeout=15.0, write_state=True):
         self.calls = []
         self._status = migrate_status
         self._fail_on = fail_on or set()
+        self._write_state = write_state
 
     def cmd(self, execute, arguments=None):
         self.calls.append(execute)
         if execute in self._fail_on:
             return {"error": {"desc": "nope"}}
+        if execute in ("migrate", "migrate-incoming") and self._write_state:
+            uri = (arguments or {}).get("uri", "")
+            if uri.startswith("file:"):
+                Path(uri[len("file:"):]).write_bytes(
+                    b"fake-qemu-machine-state\n" * 64)
         return {"return": {}}
 
     def set_migration_caps(self, channels=4):
@@ -165,6 +179,18 @@ class Bake(unittest.TestCase):
         self.assertFalse(warmboot.bake_entry(
             {"name": "t", "qmp_port": 1}, self.images, "k",
             {"qemu_version": "11.0.2"}, self.rd, "lbl", session_factory=boom))
+
+    def test_migrate_completed_without_usable_state_stays_unfindable(self):
+        # QMP can report "completed" while the state file itself is missing
+        # or truncated (e.g. QEMU died mid-stream). lookup()'s REQUIRED_FILES
+        # check exists precisely to catch this -- a bake must never route
+        # around it (e.g. by pre-writing a placeholder) to make that check
+        # pass; a truncated/missing state must stay a miss.
+        sess = FakeSession(0, write_state=False)
+        warmboot.bake_entry({"name": "t", "qmp_port": 1}, self.images, "k",
+                            {"qemu_version": "11.0.2"}, self.rd, "lbl",
+                            session_factory=lambda *a, **k: sess)
+        self.assertIsNone(warmcache.lookup(self.images, "k", "11.0.2"))
 
 
 if __name__ == "__main__":
