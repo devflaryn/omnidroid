@@ -15,6 +15,8 @@ cold boot.
 """
 import hashlib
 import json
+import shutil
+import time
 from pathlib import Path
 
 WARM_DIRNAME = "warm"
@@ -90,3 +92,41 @@ def lookup(images_dir, key, qemu_version):
         return entry
     except Exception:      # noqa: BLE001 - a broken cache is a miss, never a crash
         return None
+
+
+def _staging_path(images_dir, key):
+    return warm_root(images_dir) / f".bake-{key}"
+
+
+def begin_bake(images_dir, key):
+    """A clean staging dir for a new entry. Caller writes the payload files
+    into it; the entry only becomes visible at commit_bake()."""
+    staging = _staging_path(images_dir, key)
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging
+
+
+def commit_bake(images_dir, key, tmp, meta):
+    """Publish a staged bake atomically, replacing any existing entry.
+
+    The rename is the only moment an entry becomes visible, so a crash at any
+    earlier point leaves the previous entry (or no entry) intact rather than a
+    half-written one a boot would trust.
+    """
+    tmp = Path(tmp)
+    meta = dict(meta, key=key, last_used=time.time())
+    (tmp / META_NAME).write_text(json.dumps(meta, indent=2))
+    entry = entry_path(images_dir, key)
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    if entry.exists():
+        doomed = warm_root(images_dir) / f".trash-{key}-{int(time.time())}"
+        entry.rename(doomed)
+        shutil.rmtree(doomed, ignore_errors=True)
+    tmp.rename(entry)
+    return entry
+
+
+def discard_bake(tmp):
+    """Throw a staged bake away. Idempotent; never raises."""
+    shutil.rmtree(Path(tmp), ignore_errors=True)

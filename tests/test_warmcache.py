@@ -182,5 +182,65 @@ class ReadMetaShape(unittest.TestCase):
         self.assertIsNone(warmcache.read_meta(entry))
 
 
+class BakeLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.key = warmcache.cache_key(**BASE)
+
+    def _fill(self, d):
+        for name in warmcache.REQUIRED_FILES:
+            if name != warmcache.META_NAME:
+                (d / name).write_bytes(b"payload")
+
+    def test_a_partial_bake_is_never_visible_as_an_entry(self):
+        # The whole point of staging: a crash mid-bake must not leave an
+        # entry that lookup() would hand to a boot.
+        staging = warmcache.begin_bake(self.tmp, self.key)
+        (staging / warmcache.STATE_NAME).write_bytes(b"half")
+        self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
+
+    def test_commit_makes_the_entry_findable(self):
+        staging = warmcache.begin_bake(self.tmp, self.key)
+        self._fill(staging)
+        warmcache.commit_bake(self.tmp, self.key, staging,
+                              {"key": self.key, "qemu_version": "11.0.2"})
+        self.assertIsNotNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
+
+    def test_commit_stamps_key_and_last_used_even_if_caller_forgot(self):
+        staging = warmcache.begin_bake(self.tmp, self.key)
+        self._fill(staging)
+        warmcache.commit_bake(self.tmp, self.key, staging,
+                              {"qemu_version": "11.0.2"})
+        meta = warmcache.read_meta(warmcache.entry_path(self.tmp, self.key))
+        self.assertEqual(meta["key"], self.key)
+        self.assertIsInstance(meta["last_used"], (int, float))
+
+    def test_commit_replaces_an_existing_entry(self):
+        first = warmcache.begin_bake(self.tmp, self.key)
+        self._fill(first)
+        warmcache.commit_bake(self.tmp, self.key, first,
+                              {"qemu_version": "11.0.2"})
+        second = warmcache.begin_bake(self.tmp, self.key)
+        self._fill(second)
+        (second / warmcache.STATE_NAME).write_bytes(b"newer")
+        warmcache.commit_bake(self.tmp, self.key, second,
+                              {"qemu_version": "11.0.2"})
+        entry = warmcache.entry_path(self.tmp, self.key)
+        self.assertEqual((entry / warmcache.STATE_NAME).read_bytes(), b"newer")
+
+    def test_begin_bake_clears_a_stale_staging_dir(self):
+        staging = warmcache.begin_bake(self.tmp, self.key)
+        (staging / "leftover").write_bytes(b"junk")
+        staging2 = warmcache.begin_bake(self.tmp, self.key)
+        self.assertFalse((staging2 / "leftover").exists())
+
+    def test_discard_removes_staging_and_is_idempotent(self):
+        staging = warmcache.begin_bake(self.tmp, self.key)
+        warmcache.discard_bake(staging)
+        self.assertFalse(staging.exists())
+        warmcache.discard_bake(staging)      # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
