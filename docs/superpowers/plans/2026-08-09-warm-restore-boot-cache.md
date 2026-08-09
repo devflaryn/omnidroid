@@ -556,10 +556,22 @@ def lookup(images_dir, key, qemu_version):
             return None
         if meta.get("key") != key:
             return None
-        if meta.get("qemu_version") != qemu_version:
+        # An entry with NO recorded qemu_version is never valid. Comparing
+        # meta.get(...) != qemu_version directly would pass spuriously when
+        # both sides are None.
+        meta_qemu_version = meta.get("qemu_version")
+        if not meta_qemu_version or meta_qemu_version != qemu_version:
             return None
+        # is_file() + size, not exists(): a zero-byte or truncated `state`,
+        # or a DIRECTORY named `state`, all satisfy exists() and would hand
+        # QEMU an incomplete machine state -- the failure mode nobody traces
+        # back to the cache. commit_bake()'s atomic rename (Task 5) should
+        # make a partial entry invisible in the first place; this is the
+        # second line of defence for what that discipline cannot cover, such
+        # as a disk that filled mid-bake.
         for name in REQUIRED_FILES:
-            if not (entry / name).exists():
+            path = entry / name
+            if not path.is_file() or path.stat().st_size == 0:
                 return None
         return entry
     except Exception:      # noqa: BLE001 - a broken cache is a miss, never a crash
