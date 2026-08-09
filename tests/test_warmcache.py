@@ -8,9 +8,13 @@ bookkeeping: a base update, a new APK/offset, a mode change, a resize, or a
 QEMU upgrade must each produce a different key so the stale entry is simply
 never found. These tests are what keeps that property true.
 """
+import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omnidroid import warmcache  # noqa: E402
@@ -79,6 +83,60 @@ class TheCacheKey(unittest.TestCase):
         # The bad key should differ from the valid one.
         valid_key = warmcache.cache_key(**dict(BASE, smp=6))
         self.assertNotEqual(key, valid_key)
+
+
+def _make_entry(tmp, key, qemu_version="11.0.2", missing=()):
+    """Build a complete-looking entry on disk; `missing` omits files."""
+    e = warmcache.entry_path(tmp, key)
+    e.mkdir(parents=True, exist_ok=True)
+    for name in warmcache.REQUIRED_FILES:
+        if name in missing or name == warmcache.META_NAME:
+            continue
+        (e / name).write_bytes(b"x")
+    if warmcache.META_NAME not in missing:
+        (e / warmcache.META_NAME).write_text(json.dumps(
+            {"key": key, "qemu_version": qemu_version, "mem_mb": 8192,
+             "smp": 6, "last_used": 0}))
+    return e
+
+
+class EntryLookup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.key = warmcache.cache_key(**BASE)
+
+    def test_complete_entry_is_found(self):
+        e = _make_entry(self.tmp, self.key)
+        self.assertEqual(warmcache.lookup(self.tmp, self.key, "11.0.2"), e)
+
+    def test_missing_entry_is_a_miss_not_an_error(self):
+        self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
+
+    def test_each_missing_file_is_a_miss(self):
+        for name in warmcache.REQUIRED_FILES:
+            with self.subTest(missing=name):
+                tmp = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+                _make_entry(tmp, self.key, missing=(name,))
+                self.assertIsNone(warmcache.lookup(tmp, self.key, "11.0.2"))
+
+    def test_qemu_version_mismatch_is_a_miss(self):
+        # The migration stream format is tied to the QEMU build that wrote it.
+        _make_entry(self.tmp, self.key, qemu_version="11.0.2")
+        self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.1.0"))
+
+    def test_corrupt_meta_is_a_miss_not_a_crash(self):
+        e = _make_entry(self.tmp, self.key)
+        (e / warmcache.META_NAME).write_text("{not json")
+        self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
+
+    def test_meta_key_must_match_the_directory_key(self):
+        # Guards against a hand-copied or half-renamed entry.
+        e = _make_entry(self.tmp, self.key)
+        (e / warmcache.META_NAME).write_text(json.dumps(
+            {"key": "somethingelse", "qemu_version": "11.0.2"}))
+        self.assertIsNone(warmcache.lookup(self.tmp, self.key, "11.0.2"))
 
 
 if __name__ == "__main__":

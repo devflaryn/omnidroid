@@ -15,6 +15,7 @@ cold boot.
 """
 import hashlib
 import json
+from pathlib import Path
 
 WARM_DIRNAME = "warm"
 STATE_NAME = "state"
@@ -46,3 +47,44 @@ def cache_key(*, arch, base_tag, base_version, offset, mode_name, mem_mb, smp,
         safe_int(mem_mb), safe_int(smp), machine, accel, qemu_version
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def warm_root(images_dir):
+    """Directory holding all cache entries, under the images dir."""
+    return Path(images_dir) / WARM_DIRNAME
+
+
+def entry_path(images_dir, key):
+    return warm_root(images_dir) / key
+
+
+def read_meta(entry):
+    """Parsed meta.json, or None if absent/unreadable/not an object."""
+    try:
+        data = json.loads((Path(entry) / META_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def lookup(images_dir, key, qemu_version):
+    """The entry for `key`, or None. A None return ALWAYS means "cold boot".
+
+    Validates that the entry is complete and was written by this QEMU build.
+    Never raises: an unreadable cache is a miss, not a failed launch.
+    """
+    try:
+        entry = entry_path(images_dir, key)
+        meta = read_meta(entry)
+        if not meta:
+            return None
+        if meta.get("key") != key:
+            return None
+        if meta.get("qemu_version") != qemu_version:
+            return None
+        for name in REQUIRED_FILES:
+            if not (entry / name).exists():
+                return None
+        return entry
+    except Exception:      # noqa: BLE001 - a broken cache is a miss, never a crash
+        return None
