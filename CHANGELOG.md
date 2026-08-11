@@ -6,6 +6,49 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-09 — An instance can no longer blank: the never-sleep guarantee
+
+Instances went black after a stretch with no input. Diagnosed on a live arm
+instance rather than from the docs, and the reading is the point:
+
+```
+$ settings get system screen_off_timeout       ->  -1
+$ dumpsys power | grep 'Screen off timeout'    ->  Screen off timeout: 10000 ms
+```
+
+`-1` reads like "never" and is not: PowerManagerService clamps the setting up
+to `mMinimumScreenOffTimeoutConfig`, so **every instance shipped with a ten
+second blank**. It only looked healthy because the guest reported AC power and
+`stay_on_while_plugged_in` happened to cover AC — a coincidence, not a
+guarantee. `dumpsys battery unplug` put the same instance into
+`mWakefulness=Dozing` inside 22 s.
+
+**New `omnidroid/awake.py`** builds the sequence that closes all six
+independent rungs of the sleep ladder (`screen_off_timeout`,
+`stay_on_while_plugged_in`, `sleep_timeout`, `attentive_timeout`,
+`adaptive_sleep`, the dream manager), plus the `dumpsys battery` override
+WITHOUT WHICH the stay-on setting is a silent no-op — it is a mask of plug
+types, and a QEMU guest with no battery HAL reports nothing plugged in. Root
+adds a kernel wakelock so the guest cannot suspend either. Four adb round
+trips, not fifteen: the settings writes ride in one shell script.
+
+* **Applied on EVERY boot in EVERY mode** (`apply_awake`, in `_ensure_booted`'s
+  shared tail, so a warm-restored instance gets it too). Deliberately ABOVE the
+  profile branch — a dark screen is not a mode trade-off. It is also
+  deliberately not `deviceidle`: doze stays the mode's decision.
+* **The watchdog re-asserts every 5 min.** The battery override is the one
+  lever that expires (a framework restart drops it).
+* **`omnidroid awake <name> [--check]`** applies or reads it back for an
+  instance already running.
+* **Verified against `dumpsys power`, never `settings get`** — the whole bug is
+  that those disagree. `never_blanks()` is a separate question from
+  `is_awake()`: the instance that was 10 s from black read `Awake`.
+* Kiosk `MainActivity` takes `FLAG_KEEP_SCREEN_ON` / `TURN_SCREEN_ON` for the
+  stretch before the game fronts. Needs a `launcher/build.sh` + base re-bake to
+  ship; the host-side half above is what is load-bearing and it needs neither.
+* Kill switch `OMNI_NO_AWAKE=1`. `tests/test_awake.py` (34 tests) covers the
+  builders, the quoting, and the parser against the real captured dumps.
+
 ## 2026-08-08 — OFFSETS: many Roblox versions on one clean base; playable takes the machine; one debugging surface
 
 Three changes, driven by one requirement each.

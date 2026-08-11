@@ -107,6 +107,8 @@ class _StubbedBoot:
             (engine, "maybe_start_autocap", "maybe_start_autocap", {}),
             (engine, "wait_for_boot", "wait_for_boot", dict(return_value=True)),
             (engine, "post_boot", "post_boot", {}),
+            (engine, "apply_awake", "apply_awake",
+             dict(return_value=True)),
             (engine, "_enforce_hiding", "_enforce_hiding", {}),
             (engine, "assert_kiosk_game", "assert_kiosk_game", {}),
             (engine, "_devkit_activate", "_devkit_activate", {}),
@@ -340,6 +342,46 @@ class WarmRestoreGetsTuned(unittest.TestCase):
         b.mocks["apply_farming_squeeze"].assert_called_once()
         b.mocks["apply_balloon_target"].assert_called_once()
         b.mocks["apply_gaming_tuning"].assert_not_called()
+
+    def test_a_successful_restore_is_kept_awake_too(self):
+        # The never-sleep guarantee is NOT mode tuning -- it sits above the
+        # profile branch precisely so both modes get it -- but it lives in the
+        # same shared tail, so an early return on the restore path would drop
+        # it exactly the way it once dropped the tuning. A warm-restored
+        # instance that blanks is the same product bug as a cold-booted one
+        # that blanks.
+        with self._restored() as b:
+            ok, _ = b.run(mode_name="hard")
+        self.assertTrue(ok)
+        b.mocks["apply_awake"].assert_called_once()
+
+    def test_a_farming_restore_is_kept_awake_too(self):
+        # Farming is the mode where this matters MOST: nobody is watching, so
+        # a blanked instance stops rendering (and stops earning) unnoticed.
+        with self._restored() as b:
+            b.run(mode_name="farming")
+        b.mocks["apply_awake"].assert_called_once()
+
+    def test_a_cold_boot_is_kept_awake(self):
+        with _StubbedBoot() as b:
+            ok, _ = b.run()
+        self.assertTrue(ok)
+        b.mocks["apply_awake"].assert_called_once()
+
+    def test_the_screen_is_kept_awake_before_the_mode_gets_its_say(self):
+        # Ordering, not decoration: gaming's tune-up and farming's squeeze both
+        # write settings and move the game around. Applying the awake levers
+        # after them would let a mode step be the last writer on a shared
+        # surface; applying them first leaves the mode owning everything it
+        # legitimately does own.
+        order = []
+        with _StubbedBoot(
+                apply_awake=mock.MagicMock(
+                    side_effect=lambda *a, **k: order.append("awake")),
+                apply_gaming_tuning=mock.MagicMock(
+                    side_effect=lambda *a, **k: order.append("tuning"))) as b:
+            b.run(mode_name="hard")
+        self.assertEqual(order, ["awake", "tuning"])
 
     def test_a_successful_restore_does_not_cold_boot_a_second_time(self):
         with self._restored() as b:

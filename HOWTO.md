@@ -307,6 +307,21 @@ foreground state — ads/dialogs/loading don't kill it) and powers the
 instance off after the process is gone `--grace` s (default 20). This is
 the production "game closed → machine off" path.
 
+#### `omnidroid awake <name> [--check]`
+Re-apply the **never sleep / never blank** guarantee to a running instance,
+or `--check` to only read it back. Every boot already does this (see
+"Never sleep" below); this is for an instance started before the feature
+existed, or one whose battery override something reset mid-session.
+
+```
+$ omnidroid awake alice --check
+[awake alice] wakefulness=Awake screen-off-timeout=10000 ms powered=True
+              stay-on-mask=1 -> CAN BLANK from inactivity
+$ omnidroid awake alice
+[awake alice] awake: screen-off timeout never, stay-on plug mask 15,
+              battery forced charging, daydream off - it will NOT blank
+```
+
 #### `omnidroid screenshot <name> [--out path]` / `omnidroid logcat <name> [--tag T] [--clear]`
 True-color framebuffer PNG (works headless; JSON `{ok, path}`) / guest
 logcat.
@@ -444,6 +459,41 @@ apps open, **~7–8** with them closed. On Windows/WHPX guest-side trims do NOT
 reduce host RSS (QEMU touches its full `-m`); host-RAM density is what the
 Linux/KSM port is for. Boot is ~35 s cold; instances always cold-boot (no
 snapshots — by design, do not re-add).
+
+### Never sleep, never blank
+
+**Every boot, every mode**, an instance is made incapable of blanking from
+inactivity. No opt-in, and not a mode trade-off: a blanked farming instance
+stops rendering and so stops earning, and a blanked `playable` one is a black
+VNC window. `omnidroid/awake.py` has the full reasoning; the short version is
+that Android's sleep ladder has six independent rungs and disabling only the
+famous one leaves the other five to blank the screen anyway.
+
+MEASURED on a live arm instance (2026-08-09), before the change:
+
+```
+$ settings get system screen_off_timeout       ->  -1
+$ dumpsys power | grep 'Screen off timeout'    ->  Screen off timeout: 10000 ms
+```
+
+`-1` is **not** "never" — PowerManagerService clamps it up to
+`mMinimumScreenOffTimeoutConfig`, so the base shipped with a **ten second**
+blank. It only stayed lit because the guest happened to report AC power and
+`stay_on_while_plugged_in` happened to cover AC. Removing that coincidence
+(`dumpsys battery unplug`) put the same instance into `mWakefulness=Dozing`
+within 22 s. After the change, the same test idles indefinitely at
+`mWakefulness=Awake`, `Screen off timeout: 2147483647 ms`.
+
+Two things follow from this that are worth knowing:
+
+* **Verify with `dumpsys power`, never with `settings get`.** The setting is
+  not the effective value. `omnidroid awake <name> --check` reads the right
+  one.
+* **The watchdog re-asserts it every 5 min.** The `dumpsys battery` override
+  is the one lever with an expiry (a framework restart drops it), and
+  `stay_on_while_plugged_in` goes straight back to being a no-op when it goes.
+
+Kill switch: `OMNI_NO_AWAKE=1` leaves Android's own power management alone.
 
 ---
 

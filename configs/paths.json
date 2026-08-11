@@ -73,9 +73,39 @@
           "version_code": 2760,
           "created": 1786219450,
           "notes": null
+        },
+        "arceus-local": {
+          "data": "base_arm_data_offset_arceus-local.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-omni-local.apk",
+          "apk_path": "/Users/berat/Desktop/overnight tests/server test/arceus-omni-local.apk",
+          "version_name": "2.731.944",
+          "version_code": 2760,
+          "created": 1786319427,
+          "notes": null
+        },
+        "arceusfull": {
+          "data": "base_arm_data_offset_arceusfull.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-local-full.apk",
+          "apk_path": "/Users/berat/Desktop/overnight tests/server test/arceus-local-full.apk",
+          "version_name": "2.731.944",
+          "version_code": 2760,
+          "created": 1786361479,
+          "notes": null
+        },
+        "arceusae": {
+          "data": "base_arm_data_offset_arceusae.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-autoexec.apk",
+          "apk_path": "/Users/berat/Desktop/overnight tests/server test/arceus-autoexec.apk",
+          "version_name": "2.731.944",
+          "version_code": 2760,
+          "created": 1786364701,
+          "notes": null
         }
       },
-      "default_offset": "patched"
+      "default_offset": "arceusae"
     }
   },
   "qemu": {

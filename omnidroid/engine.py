@@ -1044,6 +1044,19 @@ def assert_kiosk_game(acct, cfg, label):
             print(f"[{label}] kiosk game package = {game}")
         except Exception as e:  # noqa: BLE001 — never fail a boot over this
             print(f"[{label}] could not set omni_game_package: {e}")
+        # NOTE: the kiosk reads omni_game_package ONCE, in onCreate ->
+        # resolveGamePackage -> configureLockTask (setLockTaskPackages). On the
+        # ephemeral arm /data the setting is unset at first boot, so the kiosk
+        # resolves the WRONG package (first launchable non-system app = the Magisk
+        # manager) and whitelists IT — not the game — for Lock Task, so the game's
+        # deep-link join is a Lock Task violation and gets force-stopped (black
+        # screen after "joined"). Writing the setting here does not help a
+        # kiosk that already resolved, and the device-owner kiosk cannot be
+        # force-stopped over adb (needs root, absent on a non-debug boot). The
+        # durable fix is to bake omni_game_package into the base /data so the
+        # kiosk's very first onCreate reads it — see update_kiosk_arm, which sets
+        # it in the throwaway before capture. This write stays as a belt-and-braces
+        # re-assert for bases built before that fix. (Traced + fixed 2026-08-10.)
     # Best-effort, like every other post-boot assertion here: an instance that
     # could not be re-fronted must still end up booted and reachable, so this
     # reports and returns rather than propagating into the boot.
@@ -2014,6 +2027,20 @@ def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
             return fail("install_failed",
                         f"kiosk install failed: {out.strip()[-300:]}")
         print(f"[{label}] installed {kiosk_apk.name}")
+        # Bake omni_game_package into the TEMPLATE so the kiosk's very first
+        # onCreate on a fresh ephemeral /data resolves the GAME (not the first
+        # launchable non-system app — the Magisk manager) and whitelists it for
+        # Lock Task. Without it the game's deep-link join is a Lock Task violation
+        # and gets force-stopped (black screen after "joined"), and the
+        # device-owner kiosk cannot be restarted over adb to re-resolve. See
+        # assert_kiosk_game. (Traced + fixed 2026-08-10.)
+        game_pkg = resolve_game_package(acct, cfg) or "com.roblox.client"
+        try:
+            adb(acct, "shell", "settings", "put", "global",
+                "omni_game_package", game_pkg, timeout=15)
+            print(f"[{label}] baked omni_game_package = {game_pkg} into the template")
+        except Exception as e:  # noqa: BLE001 — never fail the bake over this
+            print(f"[{label}] could not bake omni_game_package: {e}")
         # Deliberately do NOT launch the kiosk here. It would enter Lock Task
         # Mode, and lock task BLOCKS `reboot -p` — the guest then never powers
         # off, _shutdown escalates to SIGKILL, and the capture is refused. There

@@ -43,12 +43,21 @@ def _boot(mode_name):
             return True
         return f
 
+    # assert_kiosk_game and adb are mocked for a reason that costs real time:
+    # _acct() claims adb_port 16001, and on a developer machine that port is
+    # very often a REAL running instance. Unmocked, this harness talked to it —
+    # the module hung for minutes against a live guest and, worse, mutated it.
+    # Nothing here wants a device; every assertion is about which collaborator
+    # the engine chose.
     with mock.patch.object(omni, "running_pid", return_value=None), \
          mock.patch.object(omni, "spawn_qemu", return_value=1234), \
          mock.patch.object(omni, "maybe_start_autocap"), \
          mock.patch.object(omni, "wait_for_boot", return_value=True), \
          mock.patch.object(omni, "post_boot"), \
          mock.patch.object(omni, "_enforce_hiding"), \
+         mock.patch.object(omni, "assert_kiosk_game"), \
+         mock.patch.object(omni, "adb"), \
+         mock.patch.object(omni, "apply_awake", rec("awake")), \
          mock.patch.object(omni, "apply_roblox_settings", rec("roblox_settings")), \
          mock.patch.object(omni, "enable_zram", rec("zram")), \
          mock.patch.object(omni, "apply_farming_squeeze", rec("farming_squeeze")), \
@@ -116,6 +125,29 @@ class PlayableBoot(unittest.TestCase):
         # mode_name=None is what cmd_start passes when nobody typed --mode.
         # It must behave exactly like an explicit `playable`.
         self.assertEqual(_boot(None), self.calls)
+
+
+class BothProfilesGetTheNeverBlankGuarantee(unittest.TestCase):
+    """The one post-boot step that is NOT a profile decision.
+
+    Every other entry in `calls` is deliberately asymmetric — the whole point
+    of this file is that a density boot and a performance boot get different
+    treatment. This one must be symmetric: a blanked instance is broken in
+    both directions, so it sits above the profile branch rather than in either
+    arm of it. If a future refactor moves it inside one, these two tests are
+    what notice.
+    """
+
+    def test_a_performance_boot_is_kept_awake(self):
+        self.assertIn("awake", _boot("gaming"))
+
+    def test_a_density_boot_is_kept_awake(self):
+        # Farming needs it MOST: nobody is watching, so a blanked instance
+        # stops rendering (and stops earning) unnoticed for hours.
+        self.assertIn("awake", _boot("farming"))
+
+    def test_the_untyped_default_is_kept_awake(self):
+        self.assertIn("awake", _boot(None))
 
 
 class TheProfileThatGetsInstalled(unittest.TestCase):

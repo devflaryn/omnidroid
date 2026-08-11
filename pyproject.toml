@@ -9,6 +9,12 @@ description = "Multi-account Android (Roblox) instance manager"
 requires-python = ">=3.13"
 dependencies = []
 
+# selenium is only needed for the headless cookie-login verification path
+# (accounts.capture_login_from_cookie / capture_login). Kept optional so the
+# core engine stays dependency-light: `pip install omnidroid[login]`.
+[project.optional-dependencies]
+login = ["selenium>=4.20"]
+
 [project.scripts]
 omnidroid = "omnidroid.cli:main"
 

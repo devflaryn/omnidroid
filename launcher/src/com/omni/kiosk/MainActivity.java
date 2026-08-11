@@ -17,6 +17,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.TextView;
 
 import java.util.Arrays;
@@ -75,6 +76,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        keepScreenOn();
         status = new TextView(this);
         status.setBackgroundColor(Color.BLACK);
         status.setTextColor(Color.WHITE);
@@ -125,6 +127,34 @@ public class MainActivity extends Activity {
             // a blip and the host does nothing; if it is dead the host
             // watchdog will power us off after its grace period.
             status.setText("");
+        }
+    }
+
+    /**
+     * The kiosk window never lets the display sleep.
+     *
+     * The host applies the same guarantee device-wide over adb (see
+     * awake.py), and that is the load-bearing half — this is the window-level
+     * belt to its braces, and it covers a case the settings do not: the gap
+     * between HOME appearing and the game taking the foreground. The kiosk is
+     * HOME, so it is on screen at boot, whenever the game blips, and forever
+     * on a "no apk found" instance — exactly the idle stretches with no input
+     * that Android would otherwise blank.
+     *
+     * FLAG_KEEP_SCREEN_ON is scoped to this window, so it releases by itself
+     * when the game takes over; no wakelock to leak. TURN_SCREEN_ON /
+     * SHOW_WHEN_LOCKED make a boot that lands with the display already off
+     * (a warm-restored instance) wake into the kiosk rather than sit dark.
+     */
+    private void keepScreenOn() {
+        try {
+            getWindow().addFlags(
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                    | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                    | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
+        } catch (Exception e) {
+            Log.w(TAG, "could not set keep-screen-on flags: " + e);
         }
     }
 
