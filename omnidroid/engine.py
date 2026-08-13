@@ -824,11 +824,17 @@ def build_acct(name, cfg, debug=False, offset=None, allow_no_offset=False,
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         fail("bad_name",
              f"instance/username must be [A-Za-z0-9_-]+ (got '{name}')")
-    tag = _select_base_tag(cfg, arch="arm")
+    # The HOST's base, not a hardcoded arm one: an amd64 Windows box boots the
+    # x86-bliss base under WHPX, an Apple-Silicon Mac boots the arm64 base
+    # under HVF. _select_base_tag()'s default already resolves the effective
+    # (host-arch) base, so pinning arch="arm" here was what made every x86
+    # launch fail with "no arm base registered".
+    tag = _select_base_tag(cfg)
     base = cfg["bases"][tag]
-    if base_type(base) != BASE_TYPE_ARM:
+    if base_type(base) not in (BASE_TYPE_ARM, BASE_TYPE_X86):
         fail("arch_boundary",
-             f"instances are arm-only; base '{tag}' is {arch_of_base(base)}")
+             f"instances are arm-uefi or x86-bliss; base '{tag}' is "
+             f"{arch_of_base(base)}")
     # Resolved BEFORE any port is reserved: a launch that names a version this
     # host has not baked must fail having allocated nothing, the same rule
     # cmd_start already follows for a missing cookie.
@@ -847,10 +853,14 @@ def build_acct(name, cfg, debug=False, offset=None, allow_no_offset=False,
     d.mkdir(parents=True, exist_ok=True)
     import shutil
     images = Path(cfg["images_dir"])
-    efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
-    if not efi_tmpl.exists():
-        fail("no_base", f"arm base efivars template missing: {efi_tmpl}")
-    shutil.copyfile(efi_tmpl, d / "efivars.fd")
+    # Only arm boots through UEFI and therefore needs per-boot pflash vars;
+    # x86 boots its disk directly with -kernel/-initrd and has no efivars at
+    # all (_refresh_ephemeral_efivars is likewise an arch-guarded no-op).
+    if base_type(base) == BASE_TYPE_ARM:
+        efi_tmpl = images / base.get("efivars", ARM_BASE_EFIVARS)
+        if not efi_tmpl.exists():
+            fail("no_base", f"arm base efivars template missing: {efi_tmpl}")
+        shutil.copyfile(efi_tmpl, d / "efivars.fd")
     return {"name": name, "base": tag,
             "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port,
             "ephemeral": True, "debug": bool(debug),

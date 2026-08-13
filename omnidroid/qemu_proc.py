@@ -245,7 +245,7 @@ MODES = {
     # one or two instances rather than fifty.
     #
     # Why a new mode rather than teaching `playable` to do it: `playable` is
-    # DEFAULT_MODE, so every bare `omni start` resolves to it. Opening a
+    # DEFAULT_MODE, so every bare `omnidroid start` resolves to it. Opening a
     # window there would put a QEMU window on every existing start, including
     # the ones running under automation with nobody at the screen. Additive
     # beats surprising.
@@ -259,14 +259,37 @@ MODES = {
     # source, and this mode is not trying to fit fifty instances in a host.
     # free-page-reporting is still attached (balloon_device is unconditional),
     # which costs nothing while nobody inflates it.
+    #
+    # `profile` is the POST-BOOT intent, and it is what the engine branches on
+    # instead of the mode name. Two values:
+    #   "performance"  spend host resources on one instance: no balloon, no
+    #                  squeeze, native resolution, the game on the top-app
+    #                  cpuset, the quality ClientAppSettings profile. Used by
+    #                  gaming/playable/hard/brutal.
+    #   "density"      spend quality on instance COUNT: squeeze, zram, balloon,
+    #                  5 fps tick, 480x270. Used by farming.
+    # Branching on the name was a real bug: `_ensure_booted` compared the RAW
+    # --mode argument, so a bare `omnidroid start` (which resolves to
+    # `playable`) matched neither "gaming" nor "farming" and got NO post-boot
+    # tuning at all — the default mode was the only untuned one.
+    #
+    # `autoscale` says this mode should GROW to the host. playable and gaming
+    # are "give this instance the machine"; hard/brutal are explicit "give it
+    # less" requests and must stay the fixed tiers they advertise.
     "gaming":   {"mem": 4096, "smp": 4, "balloon": None, "usb": True,
-                 "display": lean.NATIVE_DISPLAY, "window": True},
+                 "display": lean.NATIVE_DISPLAY, "window": True,
+                 "profile": "performance", "autoscale": True,
+                 "quality": "high"},
     "playable": {"mem": 4096, "smp": 4, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY},
+                 "usb": True, "display": lean.NATIVE_DISPLAY,
+                 "profile": "performance", "autoscale": True,
+                 "quality": "high"},
     "hard":     {"mem": 3072, "smp": 4, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY},
+                 "usb": True, "display": lean.NATIVE_DISPLAY,
+                 "profile": "performance", "quality": "balanced"},
     "brutal":   {"mem": 2048, "smp": 2, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY},
+                 "usb": True, "display": lean.NATIVE_DISPLAY,
+                 "profile": "performance", "quality": "balanced"},
     # farming: headless, joined-idle, squeezed as small as stable. smp 1
     # because 50+ instances means 50+ vCPU threads, and a joined-idle game
     # loop does not need a second core. `balloon` is the post-boot reclaim
@@ -322,14 +345,125 @@ MODES = {
     # which costs more than the density gains. Anyone who wants that trade
     # can take it explicitly with `--balloon 1280`.
     "farming":  {"mem": 2048, "smp": 1, "balloon": 1536, "balloon_zram": 896,
-                 "usb": True, "display": lean.FARMING_DISPLAY},
+                 "usb": True, "display": lean.FARMING_DISPLAY,
+                 "profile": "density", "quality": "low"},
 }
 DEFAULT_MODE = "playable"
 
 
-def resolve_mode(cfg, name=None, mem=None, balloon=None):
+# ------------------------------------------------------- performance sizing
+#
+# What "use the most resources" has to mean in practice. An autoscaled mode
+# takes as much of the host as it can WITHOUT putting the host itself under
+# memory pressure, because the failure this guards against is not a slow
+# guest — it is the host swapping, which makes everything (including QEMU's
+# own vCPU threads) miss deadlines, and on macOS eventually kills the process.
+#
+# So: half of physical RAM, never leaving the host less than HOST_RESERVE_MB,
+# clamped into [FLOOR, CEIL]. The floor is the measured requirement (a guest
+# under ~2 GB cannot hold Roblox at all — see the balloon notes above, where
+# 1024 MB OOM-killed the game); the ceiling is where more guest RAM stops
+# buying frames, since Roblox's working set is ~614 MB resident and the rest
+# is page cache.
+#
+# vCPUs: cores minus two, so the host keeps a core for QEMU's own I/O threads
+# and a core for everything else. Never more than PERF_SMP_CEIL — QEMU's
+# per-vCPU threads cost real host CPU even when the guest is idle, and Android
+# scales poorly past a handful of cores in an emulated SoC.
+PERF_MEM_FLOOR_MB = 4096
+PERF_MEM_CEIL_MB = 8192
+PERF_HOST_RESERVE_MB = 6144
+PERF_MEM_FRACTION = 0.5
+PERF_MEM_GRANULARITY_MB = 512
+PERF_SMP_FLOOR = 4
+PERF_SMP_CEIL = 8
+PERF_SMP_HOST_RESERVE = 2
+
+
+def autoscale_perf(mode, host_mem_mb=None, host_cpus=None):
+    """Grow an autoscaling mode to fit THIS host. Pure; never raises.
+
+    Returns a NEW dict. A mode without `autoscale`, or a host whose capacity
+    could not be read, comes back byte-identical to what went in — an
+    unreadable host must cost you the upgrade, never the boot.
+    """
+    if not isinstance(mode, dict) or not mode.get("autoscale"):
+        return dict(mode) if isinstance(mode, dict) else mode
+    m = dict(mode)
+    if host_mem_mb:
+        want = min(host_mem_mb * PERF_MEM_FRACTION,
+                   host_mem_mb - PERF_HOST_RESERVE_MB)
+        want = int(want // PERF_MEM_GRANULARITY_MB) * PERF_MEM_GRANULARITY_MB
+        # max() with the mode's own floor, not just the constant: a mode that
+        # declares more than the floor is stating a requirement, and shrinking
+        # to fit a small host would silently break the thing it asked for.
+        m["mem"] = max(PERF_MEM_FLOOR_MB, m.get("mem", 0),
+                       min(want, PERF_MEM_CEIL_MB))
+    if host_cpus:
+        m["smp"] = max(PERF_SMP_FLOOR,
+                       min(PERF_SMP_CEIL, host_cpus - PERF_SMP_HOST_RESERVE))
+    return m
+
+
+def host_capacity():
+    """(total_ram_mb, cpu_count) for this host; either may be None.
+
+    Impure counterpart to autoscale_perf, kept separate so the sizing policy
+    stays unit-testable without a host probe. Every failure yields None, which
+    autoscale_perf reads as 'keep the declared defaults'."""
+    import multiprocessing
+    mem = None
+    try:
+        if IS_MACOS:
+            r = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                               capture_output=True, text=True, timeout=10)
+            mem = int((r.stdout or "0").strip()) // 1048576 or None
+        elif IS_LINUX:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    mem = int(line.split()[1]) // 1024
+                    break
+        elif IS_WINDOWS:
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = _MS()
+            st.dwLength = ctypes.sizeof(_MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            mem = int(st.ullTotalPhys) // 1048576 or None
+    except Exception:  # noqa: BLE001 — an unreadable host is not an error here
+        mem = None
+    try:
+        cpus = multiprocessing.cpu_count()
+    except Exception:  # noqa: BLE001
+        cpus = None
+    return mem, cpus
+
+
+def resolve_mode(cfg, name=None, mem=None, balloon=None, smp=None,
+                 host=None):
+    """The resolved mode dict for one boot.
+
+    Order is load-bearing: AUTOSCALE FIRST, explicit flags second, so an
+    explicit `--mem`/`--smp` always wins outright over the host-derived size.
+    `host` is an injectable (mem_mb, cpus) pair for tests; None probes."""
     m = dict(MODES[name or DEFAULT_MODE])
     m["name"] = name or DEFAULT_MODE
+    if m.get("autoscale"):
+        host_mem, host_cpus = host if host is not None else host_capacity()
+        m = autoscale_perf(m, host_mem, host_cpus)
+        m["name"] = name or DEFAULT_MODE
+    if smp:
+        m["smp"] = smp
     if mem:
         m["mem"] = mem
     if balloon is not None:
@@ -363,7 +497,7 @@ def resolve_gpu_display(mode, interactive, tool):
     cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui())
     if not cap.get("available"):
         print(f"[gpu] no host window available ({cap.get('reason')}); "
-              f"booting headless — attach with `omni view <name>`")
+              f"booting headless — attach with `omnidroid view <name>`")
     return gpu_display_args(True, cap)
 
 
@@ -422,7 +556,7 @@ def _assert_port_triple(acct):
 
 
 def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
-                     debug=False):
+                     debug=False, warm=None, bake=False):
     """arm-uefi (LineageOS arm64) QEMU command — native under HVF on Apple
     Silicon, NO translation layer. UEFI/GRUB disk boot: EDK2 pflash CODE +
     per-account writable efivars, GPT system disk (vda, the provisioned
@@ -460,9 +594,48 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
     # per-account system/data/devkit qcow2 files — only a fresh per-boot efivars.
     # Non-ephemeral accounts keep their per-account COW overlays (unchanged).
     ephemeral = bool(acct.get("ephemeral"))
-    if ephemeral:
+    # WARM RESTORE: the disks are the golden entry's frozen overlays, opened
+    # snapshot=on exactly like a shared template -- so N instances can share
+    # one entry and no restore can ever modify it. Unlike the disks, pflash
+    # cannot be opened snapshot=on (it needs a real writable file), so
+    # efivars is a PRIVATE per-instance copy staged into runtime_dir by
+    # spawn_qemu (see _stage_warm_efivars) -- never the entry's own file,
+    # or a restore could write into the shared golden entry.
+    from omnidroid import warmcache
+    if warm is not None and bake:
+        # Programming error, not a runtime condition: no legitimate caller
+        # asks to both restore a frozen entry AND capture a fresh freeze
+        # point in the same boot. Restore silently winning would hide the
+        # caller's bug instead of surfacing it.
+        raise ValueError("qemu_command_arm: warm and bake are mutually "
+                         "exclusive")
+    if warm is not None:
+        warm = Path(warm)
+        sys_src = warm / warmcache.SYSTEM_NAME
+        data_src = warm / warmcache.DATA_NAME
+        disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
+        # The instance's OWN copy (staged by spawn_qemu via
+        # _stage_warm_efivars), not warm / warmcache.EFIVARS_NAME -- pflash
+        # needs a writable file, and pointing it at the entry directly would
+        # let this restore write into a file every other restore of the same
+        # entry shares.
+        efivars_src = rd / "efivars.fd"
+    elif bake:
+        # BAKE: writable overlays under the instance's runtime dir. The freeze
+        # point has to be persistable, so snapshot=on is exactly wrong here.
+        sys_src = rd / "bake_system.qcow2"
+        data_src = rd / "bake_data.qcow2"
+        disk_opts = ",discard=unmap,detect-zeroes=unmap"
+        efivars_src = rd / "efivars.fd"
+    elif ephemeral:
         sys_src = images / base["system"]
-        data_src = images / base["data"]
+        # WHICH ROBLOX this boot runs is chosen HERE, by the resolved offset —
+        # a thin COW overlay of the base's pristine /data carrying one baked
+        # game version (see omnidroid/offsets.py). `data_image` is put on the
+        # handle by build_acct(); falling back to base["data"] boots the base's
+        # own /data, which on a clean base means NO game at all (the `--apk`
+        # and `--offset none` paths).
+        data_src = images / (acct.get("data_image") or base["data"])
         disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
         # Ephemeral efivars is refreshed fresh EVERY boot (see
         # _refresh_ephemeral_efivars, called from spawn_qemu before this
@@ -520,6 +693,12 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
     cmd += devkit_drive_args(acct, cfg, debug, disk_opts)
     if interactive:
         cmd += ["-serial", f"file:{rd / 'serial.log'}"]
+    if warm is not None:
+        # NOT `-incoming file:<path>`. mapped-ram/multifd must be enabled on
+        # the destination before the stream is read, and capabilities can only
+        # be set over QMP -- so the load is deferred and driven by
+        # warmboot.restore_into(). See the design spec, section 2b(a).
+        cmd += ["-incoming", "defer"]
     return cmd
 
 
@@ -555,19 +734,59 @@ def devkit_drive_args(acct, cfg, debug, disk_opts):
             "-drive", f"file={src},if=none,id=vdc{opts}"]
 
 
-def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False):
-    from omnidroid.engine import account_dir
+def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
+                 warm=None, bake=False):
+    from omnidroid.engine import account_dir, runtime_dir
     base = cfg["bases"][acct["base"]]
     if base_type(base) == BASE_TYPE_ARM:
         return qemu_command_arm(acct, cfg, interactive, mode=mode, accel=accel,
-                                debug=debug)
+                                debug=debug, warm=warm, bake=bake)
     images = Path(cfg["images_dir"])
     q = cfg["qemu"]
     d = account_dir(acct["name"])
+    rd = runtime_dir(acct["name"])
     accel = accel or default_accel()
     mode = mode or resolve_mode(cfg)
 
     vnc_display = _assert_port_triple(acct)
+
+    if warm is not None and bake:
+        # Same rule as the arm builder: a caller asking for both is a bug,
+        # not a runtime state -- restore silently winning would hide it.
+        raise ValueError("qemu_command: warm and bake are mutually exclusive")
+    # WARM RESTORE / BAKE: same disk-sourcing rule as arm (see
+    # qemu_command_arm), adapted to x86's virtio disk syntax. x86 boots by
+    # direct kernel/initrd rather than UEFI pflash, so there is no efivars
+    # file here -- that part of the arm branch has no x86 equivalent.
+    from omnidroid import warmcache
+    if warm is not None:
+        warm = Path(warm)
+        sys_src = warm / warmcache.SYSTEM_NAME
+        data_src = warm / warmcache.DATA_NAME
+        disk_opts = ",format=qcow2,if=virtio,snapshot=on"
+    elif bake:
+        sys_src = rd / "bake_system.qcow2"
+        data_src = rd / "bake_data.qcow2"
+        disk_opts = ",format=qcow2,if=virtio"
+    elif acct.get("ephemeral"):
+        # Same model as arm (see qemu_command_arm): boot the SHARED base
+        # templates directly with snapshot=on, so every write lands in a
+        # throwaway per-process overlay QEMU discards on exit and N instances
+        # can run concurrently off one base.
+        #
+        # WHICH ROBLOX this boot runs is chosen HERE, by the resolved offset —
+        # a thin COW overlay of the base's pristine /data carrying one baked
+        # version. `data_image` is put on the handle by build_acct(). x86 has
+        # no base["data"], so a boot with no offset falls back to the shared
+        # empty /data template, which means no game at all (the `--apk` and
+        # `--offset none` paths).
+        sys_src = images / base["disk"]
+        data_src = images / (acct.get("data_image") or cfg["data_template"])
+        disk_opts = ",format=qcow2,if=virtio,snapshot=on"
+    else:
+        sys_src = d / "system.qcow2"
+        data_src = d / "data.qcow2"
+        disk_opts = ",format=qcow2,if=virtio"
 
     append = ("stack_depot_disable=on cgroup_disable=pressure "
               "root=/dev/ram0 noexec=off "
@@ -603,12 +822,12 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False):
         "-cpu", "qemu64",
         "-smp", str(smp),
         "-m", str(mem),
-        "-drive", f"file={d / 'system.qcow2'},format=qcow2,if=virtio",
-        "-drive", f"file={d / 'data.qcow2'},format=qcow2,if=virtio",
+        "-drive", f"file={sys_src}{disk_opts}",
+        "-drive", f"file={data_src}{disk_opts}",
         *gpu,
         *display_args,            # "none" in every mode but gaming
         # Built-in VNC server on the account's reserved port. It stays on even
-        # when a native window is open: `omni screenshot`, the auto-capture
+        # when a native window is open: `omnidroid screenshot`, the auto-capture
         # recorder and the omnidroid-input skill all attach to this
         # framebuffer (capture.py), and dropping it on a gaming boot would
         # silently blind every one of them. LOCALHOST
@@ -632,6 +851,11 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False):
     cmd += devkit_drive_args(acct, cfg, debug, ",format=qcow2")
     if interactive:
         cmd += ["-serial", f"file:{d / 'serial.log'}"]
+    if warm is not None:
+        # Same reasoning as the arm builder: caps (mapped-ram/multifd) can
+        # only be set over QMP before the stream is read, so this must be
+        # `-incoming defer`, never `-incoming file:<path>`.
+        cmd += ["-incoming", "defer"]
     return cmd
 
 
@@ -665,13 +889,36 @@ def _refresh_ephemeral_efivars(acct, cfg):
         shutil.copyfile(efi_tmpl, d / "efivars.fd")
 
 
-def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False):
+def _stage_warm_efivars(acct, cfg, warm):
+    """Give a warm-RESTORE boot its OWN writable copy of the entry's
+    efivars.fd, so pflash never writes into the shared golden entry (see the
+    comment on efivars_src in qemu_command_arm). Same shape as
+    _refresh_ephemeral_efivars: arm-only; a no-op otherwise, since x86 has no
+    efivars/pflash concept at all and never reaches here with a warm entry
+    (the cache is arm-only -- see engine._ensure_booted)."""
+    from omnidroid.engine import runtime_dir
+    import shutil
+    base = cfg["bases"][acct["base"]]
+    if base_type(base) != BASE_TYPE_ARM:
+        return
+    from omnidroid import warmcache
+    d = runtime_dir(acct["name"])
+    d.mkdir(parents=True, exist_ok=True)
+    src = Path(warm) / warmcache.EFIVARS_NAME
+    if src.exists():
+        shutil.copyfile(src, d / "efivars.fd")
+
+
+def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
+               warm=None, bake=False, warm_key=None):
     from omnidroid.runtime import runtime_dir
     check_accel()
     d = runtime_dir(acct["name"])
     d.mkdir(parents=True, exist_ok=True)
     if acct.get("ephemeral"):
         _refresh_ephemeral_efivars(acct, cfg)
+    if warm is not None:
+        _stage_warm_efivars(acct, cfg, warm)
     log = open(d / "qemu.log", "w")
     kwargs = {}
     if IS_WINDOWS:
@@ -680,12 +927,13 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False):
         kwargs["creationflags"] = DETACHED | NEW_GROUP
     else:
         kwargs["start_new_session"] = True
-    cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug)
+    cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug,
+                       warm=warm, bake=bake)
     proc = subprocess.Popen(cmd, stdout=log, stderr=log, **kwargs)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
          # Whether THIS boot put a real window on the host's screen. Recorded
-         # rather than recomputed, so `omni start` can stand its VNC viewer
+         # rather than recomputed, so `omnidroid start` can stand its VNC viewer
          # down instead of showing a second, laggier window onto the same
          # instance — and so a degraded gaming boot (host could not open one)
          # still gets the viewer it needs to be watchable at all.
@@ -697,6 +945,12 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False):
          # tooling so it can tell "not a debug boot" from "activation failed".
          "debug": bool(debug),
          "base": acct["base"],
+         # WHICH Roblox version this boot is running: the resolved offset name
+         # and the /data overlay it selected. Recorded rather than recomputed
+         # so `list`/`debug-info` can report the live instance's actual version
+         # even after the default offset has been changed underneath it.
+         "offset": acct.get("offset"),
+         "data_image": acct.get("data_image"),
          "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
-         "vnc_port": acct["vnc_port"]}))
+         "vnc_port": acct["vnc_port"], "warm_key": warm_key}))
     return proc.pid
