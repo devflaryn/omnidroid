@@ -36,17 +36,40 @@ def vnc_start(cfg):
 
 
 def _port_answers(port, timeout=0.25):
-    """True iff something accepts a TCP connection on 127.0.0.1:port. Final
-    collision guard: never issue a port a live QEMU answers on. A refused
-    connection means free; any other socket error resolves to True (treat as
-    occupied) — ambiguity costs one port index, never a collision."""
+    """True iff 127.0.0.1:port is already taken. Final collision guard: never
+    issue a port a live QEMU answers on.
+
+    BIND, not connect. This used to infer "free" from ConnectionRefusedError,
+    which assumes the host RSTs a SYN sent to a CLOSED loopback port. That is
+    true on BSD/macOS and Linux; it is NOT true on Windows hosts whose
+    endpoint-security filter silently DROPS those SYNs. There every probe
+    timed out, every timeout resolved to True ("ambiguous -> occupied", the
+    safe direction), so allocate_ports() below walked port indices forever:
+    `omni start` hung with zero output, no QEMU process, no timeout, on a host
+    whose version/doctor/bases all passed. Binding asks the kernel directly
+    and is authoritative on every platform.
+
+    SO_REUSEADDR is deliberately NOT set. On Windows it permits binding a port
+    another socket already holds, which would turn this guard into a
+    rubber stamp and reintroduce exactly the collision it exists to prevent.
+
+    `timeout` is accepted and ignored — a bind does not wait on the network.
+    It stays in the signature because callers and tests pass it.
+    """
+    del timeout  # not meaningful for a bind; kept for signature compatibility
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
-        with _socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except ConnectionRefusedError:
-        return False          # nobody home -> free
+        s.bind(("127.0.0.1", port))
+        return False          # the kernel gave it to us -> nobody home -> free
     except OSError:
-        return True           # ambiguous -> treat as occupied (safe direction)
+        return True           # in use (or unusable) -> occupied
+    finally:
+        s.close()
+
+
+# The three port ranges are 1000 apart, so index 1000 would put an adb port
+# on top of the qmp range. That makes 1000 the natural ceiling, not a guess.
+_MAX_PORT_INDEX = 1000
 
 
 def allocate_ports(cfg):
@@ -58,17 +81,23 @@ def allocate_ports(cfg):
     # running_instances() -- a concurrent launch that has reserved but not yet
     # spawned still holds its slot, so this closes the allocate/spawn race.
     used = {p - q["adb_port_start"] for p in _claimed_port_indices()}
-    i = 0
-    while True:
+    for i in range(_MAX_PORT_INDEX):
         if i in used:
-            i += 1
             continue
         adb_port = q["adb_port_start"] + i
         qmp_port = q["qmp_port_start"] + i
         if _port_answers(qmp_port) or _port_answers(adb_port):
-            i += 1
             continue
         return (adb_port, qmp_port, vnc_start(cfg) + i)
+    # Bounded on purpose. This loop was `while True`, so a host that reported
+    # every port occupied (see _port_answers) made `omni start` hang forever
+    # with no output instead of failing. An undiagnosable host must fail fast
+    # and name the thing that is wrong.
+    raise RuntimeError(
+        f"no free port index below {_MAX_PORT_INDEX}: every adb/qmp port in "
+        f"{q['adb_port_start']}..{q['adb_port_start'] + _MAX_PORT_INDEX - 1} "
+        f"reads as occupied. Either that many instances are really running, "
+        f"or this host is blackholing loopback probes.")
 
 
 @contextlib.contextmanager
@@ -118,7 +147,7 @@ def pid_alive(pid):
         # already-dead process and then return 'kill-failed'. Callers ask "is the
         # instance running?"; a zombie is not.
         #
-        # The usual detached case (`omni start` exits, QEMU reparents to init) is
+        # The usual detached case (`omnidroid start` exits, QEMU reparents to init) is
         # unaffected: waitpid raises ChildProcessError and we fall through.
         try:
             wpid, _status = os.waitpid(pid, os.WNOHANG)
@@ -367,6 +396,13 @@ def reconcile_runtime():
         if silent:
             _wipe_runtime(d.name)
             result["gc"].append(d.name)
+    try:
+        from omnidroid import warmcache
+        from omnidroid.engine import read_config
+        from omnidroid.config import images_dir
+        warmcache.prune_staging(images_dir(read_config()))
+    except Exception:      # noqa: BLE001 - housekeeping never fails a command
+        pass
     return result
 
 
@@ -384,3 +420,53 @@ def running_pid(name):
         return None
     pid = data.get("pid")
     return pid if instance_live(data) else None
+
+
+def warm_keys_in_use():
+    """Golden-entry keys backing a RUNNING instance right now.
+
+    Eviction uses it so a live instance's disks are never deleted, and the
+    interim concurrency rule uses it so a second launch against an in-use
+    entry cold-boots instead of landing `offline` on adb (design spec 8b).
+
+    A housekeeping sweep on the boot path: an unreadable runtime root
+    (permissions damage, a half-mounted volume) degrades to "no keys in
+    use" rather than raising -- same treatment as warmcache.py's own
+    `_safe_iterdir()`, and for the same reason (Path.iterdir() raises
+    PermissionError/OSError on a directory that exists but can't be read,
+    unlike Path.glob()). One bad instance directory (unreadable run.json,
+    or a directory that vanishes mid-sweep) must not abort the sweep for
+    every other instance either.
+    """
+    keys = set()
+    root = config.runtime_root()
+    if not root.is_dir():
+        return keys
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return keys
+    for d in entries:
+        if not d.is_dir():
+            continue
+        try:
+            data = json.loads((d / "run.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            # A run.json can be valid JSON and still not be an object (e.g.
+            # `[]` or `"x"`) -- same guard warmcache.read_meta() already
+            # applies to meta.json, and for the same reason: one malformed
+            # sibling directory must not raise into every other launch's
+            # cache-key resolution.
+            continue
+        key = data.get("warm_key")
+        if not key:
+            continue
+        try:
+            live = running_pid(d.name)
+        except (OSError, ValueError):
+            continue
+        if live:
+            keys.add(key)
+    return keys
