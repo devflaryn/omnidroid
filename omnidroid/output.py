@@ -5,10 +5,40 @@ import sys
 import json
 
 
+def write_safely(stream, text):
+    """Write to a stream that may be dead, and never raise.
+
+    The engine usually runs INSIDE the GUI: its stdout/stderr are pipes owned
+    by the app. When the app stops reading them -- its watchdog timer fires
+    and kills the read end, the window closes, the Popen object is collected
+    -- the next write from the engine fails. On Windows that surfaces as
+    OSError(EINVAL, "Invalid argument"), which in a frozen windowed build
+    means a PyInstaller "Unhandled exception in script" dialog and a dead
+    launch.
+
+    A PROGRESS LINE MUST NEVER KILL A BOOT. Losing the message is the correct
+    trade: the instance is fine, only the narration is gone. Observed exactly
+    this: wait_for_boot printed its 15-second progress line after the GUI had
+    given up, and the whole start died with Errno 22.
+
+    A frozen windowed process can also have `None` for stdio when nothing is
+    piped at all, which is why the None check comes first.
+    """
+    if stream is None:
+        return False
+    try:
+        stream.write(text)
+        stream.flush()
+        return True
+    except (OSError, ValueError, AttributeError):
+        # OSError: dead pipe / invalid handle. ValueError: closed file.
+        # AttributeError: a stub stream without write/flush.
+        return False
+
+
 def emit_json(obj):
     """The one JSON payload a --json command prints on stdout."""
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    write_safely(sys.stdout, json.dumps(obj) + "\n")
 
 
 # Set True by enable_json_mode(); read by fail() to shape typed errors.
@@ -27,7 +57,12 @@ def enable_json_mode():
 
     def _to_stderr(*a, **k):
         k.setdefault("file", sys.stderr)
-        orig(*a, **k)
+        try:
+            orig(*a, **k)
+        except (OSError, ValueError, AttributeError):
+            # The GUI owns this pipe and may have stopped reading it; see
+            # write_safely. Never let narration kill the command.
+            pass
     builtins.print = _to_stderr
 
 
@@ -40,7 +75,7 @@ def fail(code, message=None, exit_code=1):
     msg = message or code
     if _JSON_MODE:
         emit_json({"ok": False, "error": code, "message": msg})
-    sys.stderr.write(f"error: {msg}\n")
+    write_safely(sys.stderr, f"error: {msg}\n")
     sys.exit(exit_code)
 
 

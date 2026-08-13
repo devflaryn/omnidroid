@@ -7352,9 +7352,16 @@ def _stage_bake_overlays(acct, cfg, rd):
     base = cfg["bases"][acct["base"]]
     images = Path(images_dir(cfg))
     rd.mkdir(parents=True, exist_ok=True)
-    pairs = ((images / base["system"], rd / "bake_system.qcow2"),
-             (images / (acct.get("data_image") or base["data"]),
-              rd / "bake_data.qcow2"))
+    # An x86-bliss base carries `disk` (its system image) and has no `data` of
+    # its own -- a fresh instance is seeded from the shared template -- so the
+    # arm key names would KeyError here.
+    is_x86 = base_type(base) == BASE_TYPE_X86
+    system_src = base["disk"] if is_x86 else base["system"]
+    data_src = (acct.get("data_image")
+                or (cfg.get("data_template") if is_x86 else None)
+                or base.get("data"))
+    pairs = ((images / system_src, rd / "bake_system.qcow2"),
+             (images / data_src, rd / "bake_data.qcow2"))
     for backing, overlay in pairs:
         overlay.unlink(missing_ok=True)
         subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2",
@@ -7442,20 +7449,7 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                     else "qemu-system-x86_64")
             qver = _qemu_version(tool)
             base = cfg["bases"][acct["base"]]
-            if not acct_base_is_arm(acct):
-                # The cache only knows how to stage/move an efivars.fd (UEFI
-                # pflash vars): x86 boots by direct kernel/initrd and has no
-                # such concept. Leaving `key` unset makes _warm_cache_allowed()
-                # refuse both a restore lookup and a bake for this launch --
-                # explicit and logged, rather than a bake that raises deep
-                # inside _stage_bake_overlays/warmboot.bake_entry, or (on a
-                # host that also has an arm base) one that succeeds by
-                # accident and files that unrelated arm base's efivars.fd
-                # inside an x86 entry.
-                print(f"[{label}] warm-restore cache is arm-only on this "
-                      f"host; '{acct['base']}' has no efivars/pflash "
-                      f"concept -- cold-booting")
-            elif qver:
+            if qver:
                 # Folds the offset's BACKING IMAGE identity (size, mtime)
                 # into the key, not just its name: `offset delete <name>`
                 # followed by `offset create <name> <different apk>` reuses
@@ -7582,7 +7576,11 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             meta = {"qemu_version": qver, "mem_mb": mode["mem"],
                     "smp": mode["smp"], "mode": mode["name"],
                     "base": acct["base"], "base_version": base.get("version", 0),
-                    "offset": acct.get("offset") or "none"}
+                    "offset": acct.get("offset") or "none",
+                    # Records which files the entry is expected to carry:
+                    # an x86 entry legitimately has no efivars.fd. See
+                    # warmcache.required_files().
+                    "arch": acct_arch(acct)}
             if warmboot.bake_entry(acct, images, key, meta,
                                    runtime_dir(acct["name"]), label):
                 warmcache.evict_lru(images, warm_keys_in_use())
