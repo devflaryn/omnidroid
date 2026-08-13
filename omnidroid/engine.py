@@ -2999,7 +2999,16 @@ def bake_offset(cfg, tag, out_name, apk, pkg, label):
     shell, so this works on an unrooted deployment too."""
     images = Path(cfg["images_dir"])
     base = cfg["bases"][tag]
-    src_name = data_bake_source(base)
+    # An x86-bliss base ships a system disk + kernel/initrd and NO /data of
+    # its own -- a fresh instance is seeded from the shared empty ext4
+    # template -- so that template is the pristine image an x86 offset
+    # overlays. The arm base carries its own provisioned /data.
+    is_x86 = base_type(base) == BASE_TYPE_X86
+    src_name = (cfg.get("data_template") if is_x86 else None) \
+        or data_bake_source(base)
+    if not src_name:
+        print(f"[{label}] base '{tag}' has no pristine /data to overlay")
+        return None
     src = images / src_name
     if not src.exists():
         print(f"[{label}] pristine /data not found: {src}")
@@ -3022,10 +3031,15 @@ def bake_offset(cfg, tag, out_name, apk, pkg, label):
                 "qmp_port": qmp_port, "vnc_port": vnc_port,
                 "game_package": pkg, "first_boot_done": True}
         save_account(acct)
-        make_overlay(d / "system.qcow2", images / base["system"])
+        # x86 boots its system disk directly with -kernel/-initrd; arm boots a
+        # provisioned system+data pair through UEFI, so only arm has an
+        # efivars template to seed.
+        make_overlay(d / "system.qcow2",
+                     images / (base["disk"] if is_x86 else base["system"]))
         make_overlay(d / "data.qcow2", src)
-        shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
-                        d / "efivars.fd")
+        if not is_x86:
+            shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
+                            d / "efivars.fd")
         _spawn_builder_with_disks(acct, cfg, [], label)
         if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
             print(f"[{label}] builder did not boot; nothing captured.")
@@ -3232,18 +3246,25 @@ def cmd_offset_consent(args):
 
 def _offset_base(args, cfg=None):
     """(cfg, tag, base) for an `offset ...` subcommand, or exit with an
-    actionable error. Offsets are an arm /data concept; an x86 base is
-    refused by name rather than by a confusing missing-file error later."""
+    actionable error.
+
+    Offsets are a /DATA concept, not an arm concept. This used to refuse
+    anything that was not arm-uefi, back when the arm base was the only one
+    with a pristine /data to overlay. An x86-bliss base has one too -- the
+    shared empty ext4 template every fresh x86 instance is seeded from (see
+    bases.data_bake_source) -- so a Windows/x86 host bakes its Roblox version
+    exactly the same way, into x86/base_x86_data_offset_<name>.qcow2. A base
+    of any OTHER type still has no defined /data to overlay and is refused."""
     cfg = cfg or load_config()
     tag = getattr(args, "base", None) or effective_base_tag(cfg)
     base = (cfg.get("bases") or {}).get(tag)
     if not base:
         fail("no_base", f"no base '{tag}'. Known: "
                         f"{list((cfg.get('bases') or {}))}")
-    if base_type(base) != BASE_TYPE_ARM:
+    if base_type(base) not in (BASE_TYPE_ARM, BASE_TYPE_X86):
         fail("arch_boundary",
-             f"base '{tag}' is {arch_of_base(base)}; offsets are an arm /data "
-             f"concept and only exist on arm-uefi bases")
+             f"base '{tag}' is {arch_of_base(base)}; offsets overlay a base's "
+             f"pristine /data and only arm-uefi and x86-bliss bases have one")
     return cfg, tag, base
 
 
