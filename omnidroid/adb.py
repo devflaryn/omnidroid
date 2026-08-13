@@ -36,6 +36,55 @@ def adb_connect(acct):
         pass
 
 
+def adb_state(acct):
+    """'device' | 'offline' | 'unknown' | '' — the HOST's view of the endpoint."""
+    try:
+        return subprocess.run(["adb", "-s",
+                               f"127.0.0.1:{_require_adb_port(acct)}",
+                               "get-state"],
+                              capture_output=True, text=True,
+                              timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001 — a probe must never raise
+        return ""
+
+
+def adb_recover(acct, hard=False):
+    """Clear an endpoint the host's adb server has stuck in `offline`.
+
+    Why this exists: `adb connect` on an endpoint already in the server's
+    table just answers "already connected" and changes nothing, so once the
+    entry goes offline -- which happens when something connects while the
+    guest is mid-boot, before adbd is accepting -- every later poll sees
+    `offline` forever. wait_for_boot then spins to its full timeout against a
+    guest that is actually up and idle: `start` hangs for fifteen minutes with
+    no output and the UI shows no sign of a boot that already finished.
+
+    Escalates, because the cheap fixes are not reliable: disconnect+connect
+    was observed NOT to clear the entry (it still reported "already
+    connected"). `adb reconnect offline` is the targeted command for this
+    state; `kill-server` is the one verified to always work, so it is the last
+    resort -- it is heavy (it drops every other endpoint on the host, which
+    then simply reconnect) and must not be the first move.
+    """
+    port = _require_adb_port(acct)
+    serial = f"127.0.0.1:{port}"
+
+    def _run(args, timeout=20):
+        try:
+            subprocess.run(["adb"] + args, capture_output=True, text=True,
+                           timeout=timeout)
+        except Exception:  # noqa: BLE001 — recovery is best-effort
+            pass
+
+    if hard:
+        _run(["kill-server"], timeout=30)
+        _run(["start-server"], timeout=30)
+    else:
+        _run(["disconnect", serial])
+        _run(["reconnect", "offline"])
+    _run(["connect", serial])
+
+
 def adb_getprop(acct, prop):
     try:
         r = adb(acct, "shell", "getprop", prop, timeout=8)

@@ -516,6 +516,15 @@ from omnidroid.qemu_proc import (_gl_window_requested, _assert_port_triple,
 
 # ---------- boot waiting with visible progress ----------
 
+# Consecutive `offline` polls before wait_for_boot tries to unstick the adb
+# endpoint. A few offline reads are NORMAL early in a boot (adbd is not
+# accepting yet), so the soft attempt waits until the state looks persistent
+# rather than transient, and the server restart waits considerably longer
+# because it drops every other endpoint on the host.
+_ADB_SOFT_RECOVER = 8
+_ADB_HARD_RECOVER = 25
+
+
 def wait_for_boot(acct, timeout, label, first_boot=False):
     """Poll until sys.boot_completed=1, printing honest progress lines."""
     # arm's serial.log is written under runtime_dir (see qemu_command_arm);
@@ -530,6 +539,7 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
     last_change = time.time()
     adbd_seen = False
     initrd_found = False
+    offline_polls = 0
     while time.time() - start < timeout:
         elapsed = time.time() - start
 
@@ -544,10 +554,25 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
             print(f"[{label}] boot completed after {elapsed/60:.1f} min")
             return True
         try:
-            if adb(acct, "get-state").stdout.strip() == "device":
+            state = adb(acct, "get-state").stdout.strip()
+            if state == "device":
                 adbd_seen = True
+                offline_polls = 0
         except subprocess.TimeoutExpired:
-            pass
+            state = ""
+
+        # An endpoint the host's adb server has stuck in `offline` never
+        # heals on its own: `adb connect` just says "already connected", so
+        # this loop would poll a dead entry until timeout while the guest sat
+        # fully booted and idle. Escalate instead of spinning -- see
+        # adb.adb_recover for why the cheap fix alone is not enough.
+        if state == "offline":
+            offline_polls += 1
+            if offline_polls in (_ADB_SOFT_RECOVER, _ADB_HARD_RECOVER):
+                hard = offline_polls >= _ADB_HARD_RECOVER
+                print(f"[{label}] adb endpoint stuck offline; "
+                      f"{'restarting the adb server' if hard else 'reconnecting'}")
+                adb_recover(acct, hard=hard)
 
         if adbd_seen and first_boot:
             new_phase = ("Android first boot: app optimization (dexopt), "
