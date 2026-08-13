@@ -20,7 +20,15 @@ def _app_root():
 
 
 REPO = _app_root()
-CONFIG_PATH = REPO / "configs" / "paths.json"
+# OMNIDROID_CONFIG_PATH lets an embedding host (e.g. the omni-executor GUI's
+# frozen --omnidroid subprocess) point the loader at a config file it wrote
+# itself, instead of the fixed REPO/configs/paths.json. This must be read at
+# import time: engine.py and bases.py do `from .config import CONFIG_PATH`
+# (a direct name binding evaluated once, at import), and the embedding host
+# sets the env var BEFORE importing omnidroid, so resolving it here is
+# correct and sufficient -- no other module recomputes REPO/configs itself.
+_env_cfg = os.environ.get("OMNIDROID_CONFIG_PATH")
+CONFIG_PATH = Path(_env_cfg) if _env_cfg else REPO / "configs" / "paths.json"
 QEMU_DIR = REPO / "qemu"          # local (auto-installed) QEMU lives here
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
