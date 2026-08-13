@@ -9,7 +9,7 @@ import android.util.Log;
 import org.json.JSONObject;
 
 /**
- * Host -> kiosk session channel: `omni play` / `omni session` on the host send
+ * Host -> kiosk session channel: `omnidroid play` / `omnidroid session` on the host send
  * an ordered broadcast here, this stores it and (optionally) joins immediately.
  *
  * Reached from the host as:
