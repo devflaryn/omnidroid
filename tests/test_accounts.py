@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for the account cookie store (`omni login` / `omni accounts`).
+"""Offline tests for the account cookie store (`omnidroid login` / `omnidroid accounts`).
 
 No browser, no network: the Selenium flow needs a human at a login page by
 design, so what is testable here is the part that must never go wrong — the
@@ -50,7 +50,7 @@ class Store(unittest.TestCase):
         self.assertEqual(mode, 0o600, f"store is {oct(mode)}, want 0600")
 
     def test_listing_never_exposes_the_cookie(self):
-        """`omni accounts` output is printed and JSON-returned; a cookie in it
+        """`omnidroid accounts` output is printed and JSON-returned; a cookie in it
         would end up in terminal scrollback, logs, and agent transcripts."""
         cookies.save_account(self.repo, "someuser", TOKEN, 42)
         blob = json.dumps(cookies.list_accounts(self.repo))
@@ -163,7 +163,7 @@ class CustomName(unittest.TestCase):
         self.assertFalse(cookies.set_custom_name(self.repo, "nope", "X"))
 
     def test_relogin_preserves_custom_name(self):
-        """Re-running `omni login` (a cookie refresh) must not silently wipe a
+        """Re-running `omnidroid login` (a cookie refresh) must not silently wipe a
         custom_name someone attached earlier."""
         cookies.save_account(self.repo, "erin7231", TOKEN, 1)
         cookies.set_custom_name(self.repo, "erin7231", "Farm 3")
@@ -214,12 +214,37 @@ class CustomName(unittest.TestCase):
         self.assertEqual(rec["cookie"], TOKEN)
         self.assertIsNone(cookies.get_account(self.repo, "main"))
 
+    def test_a_removed_account_is_not_resurrected_by_the_legacy_file(self):
+        """REGRESSION, and a privacy one.
+
+        The migration runs on every read, so a REMOVED account came straight
+        back from cookies/<label>.json the next time anything listed the store:
+        remove_account() reported success and the record reappeared. That broke
+        the guarantee that signing out of an Omni account drops the cookies it
+        pulled onto a shared machine — the next person to sign in found them
+        again.
+        """
+        legacy = os.path.join(self.repo, "cookies")
+        os.makedirs(legacy)
+        with open(os.path.join(legacy, "main.json"), "w") as fh:
+            json.dump({"label": "main", "username": "realname",
+                       "user_id": 7, "cookie": TOKEN}, fh)
+        self.assertIsNotNone(cookies.get_account(self.repo, "realname"))
+
+        self.assertTrue(cookies.remove_account(self.repo, "realname"))
+
+        self.assertIsNone(cookies.get_account(self.repo, "realname"))
+        self.assertEqual(cookies.list_accounts(self.repo), [])
+        # The legacy file itself is left alone — it is the user's data, and the
+        # migration simply does not read it a second time.
+        self.assertTrue(os.path.exists(os.path.join(legacy, "main.json")))
+
 
 class Whoami(unittest.TestCase):
 
     def test_bad_cookie_is_none_not_an_exception(self):
         """Offline/garbage input must degrade to (None, None). A raised
-        exception here would abort `omni accounts --verify` on one dead cookie."""
+        exception here would abort `omnidroid accounts --verify` on one dead cookie."""
         uid, uname = cookies.whoami("definitely-not-a-real-cookie", timeout=8)
         self.assertIsNone(uid)
         self.assertIsNone(uname)
@@ -253,7 +278,7 @@ class _FakeDriver:
 
 
 class CaptureLoginFromCookie(unittest.TestCase):
-    """`omni login --token*`: adopt an already-obtained cookie via a HEADLESS
+    """`omnidroid login --token*`: adopt an already-obtained cookie via a HEADLESS
     browser instead of an interactive sign-in. No real Chrome here — `_driver`
     and `whoami` are mocked so this stays as offline as the rest of the file;
     the browser/network parts are exercised manually (see the CLI itself)."""
