@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Roblox account cookie manager.
 
-`omni login` opens a real browser at Roblox's login page, YOU sign in (password,
+`omnidroid login` opens a real browser at Roblox's login page, YOU sign in (password,
 2FA, captcha — all of it stays between you and Roblox), and the moment the
 browser lands on roblox.com/home this reads the `.ROBLOSECURITY` cookie and saves
 the account under its Roblox USERNAME (auto-detected — no label to type).
-`omni play <username> --place <id>` then launches an instance as that account.
+`omnidroid play <username> --place <id>` then launches an instance as that account.
 
 Why a browser instead of an HTTP login: Roblox's sign-in is captcha- and
 2FA-gated by design. Driving it headlessly would mean defeating those checks;
@@ -13,7 +13,7 @@ this deliberately does not. The human does the login, the tool only picks up the
 resulting cookie — the same thing you would do by hand with devtools, minus the
 copy-paste mistakes.
 
-`omni login --token-file <file>` (or --token/--token-stdin) skips the sign-in
+`omnidroid login --token-file <file>` (or --token/--token-stdin) skips the sign-in
 entirely for a cookie you already have — no captcha/2FA to defeat, since you
 already completed them elsewhere. It is still verified, just headlessly: the
 cookie is loaded into a browser with no window and only trusted once Roblox
@@ -26,6 +26,8 @@ and never returned by a --json command.
 """
 import json
 import os
+import re
+import sys
 import time
 from pathlib import Path
 
@@ -41,7 +43,7 @@ WHOAMI_URL = "https://users.roblox.com/v1/users/authenticated"
 # USERNAME (the login name from users/authenticated `.name`, NOT the display
 # name). This replaces the old cookies/<label>.json-per-account scheme — one file
 # is easier to back up, and the username IS the identity used everywhere
-# (`omni login` auto-derives it; `omni play <username>` uses it directly).
+# (`omnidroid login` auto-derives it; `omnidroid play <username>` uses it directly).
 #
 # 0600, gitignored. A .ROBLOSECURITY is full account access.
 ACCOUNTS_FILE = "accounts.json"
@@ -316,15 +318,53 @@ def _chrome_binary():
     return None
 
 
+_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+\.\d+)")
+
+
+def _windows_browser_version(binary):
+    """Chrome's version on Windows, where `--version` tells you nothing.
+
+    chrome.exe is a GUI subsystem binary: run with --version it prints NOTHING
+    to stdout and returns immediately, so the POSIX probe below silently
+    yields None on every Windows host and _resolve_chromedriver never passes
+    --browser-version -- disabling the exact version-pinning this is all for.
+
+    Chrome installs its build into a version-named folder beside the exe
+    (Application\\151.0.7922.110\\), which is true for every Chromium build
+    (Edge, Brave, Chromium) and needs no registry access. The Chrome-specific
+    BLBeacon registry key is the fallback.
+    """
+    try:
+        app_dir = Path(binary).resolve().parent
+        vers = sorted((d.name for d in app_dir.iterdir()
+                       if d.is_dir() and _VERSION_RE.fullmatch(d.name)),
+                      key=lambda s: [int(p) for p in s.split(".")])
+        if vers:
+            return vers[-1]
+    except Exception:  # noqa: BLE001 — unreadable dir is not fatal
+        pass
+    try:
+        import winreg  # noqa: PLC0415 — Windows-only, imported lazily
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Google\Chrome\BLBeacon") as k:
+            v = winreg.QueryValueEx(k, "version")[0]
+        return v if _VERSION_RE.fullmatch(str(v)) else None
+    except Exception:  # noqa: BLE001 — no key / not Chrome
+        return None
+
+
 def _browser_version(binary):
-    import re
     import subprocess
+    if sys.platform == "win32":
+        v = _windows_browser_version(binary)
+        if v:
+            return v
     try:
         out = subprocess.run([binary, "--version"], capture_output=True,
                              text=True, timeout=15).stdout
     except Exception:  # noqa: BLE001
         return None
-    m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out or "")
+    m = _VERSION_RE.search(out or "")
     return m.group(1) if m else None
 
 
