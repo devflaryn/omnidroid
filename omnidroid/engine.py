@@ -553,13 +553,13 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
         if adb_getprop(acct, "sys.boot_completed") == "1":
             print(f"[{label}] boot completed after {elapsed/60:.1f} min")
             return True
-        try:
-            state = adb(acct, "get-state").stdout.strip()
-            if state == "device":
-                adbd_seen = True
-                offline_polls = 0
-        except subprocess.TimeoutExpired:
-            state = ""
+        # adb_state(), not adb(...).stdout: an OFFLINE endpoint reports itself
+        # on stderr and leaves stdout empty, so reading stdout alone saw ""
+        # for the one condition the recovery below exists to handle.
+        state = adb_state(acct)
+        if state == "device":
+            adbd_seen = True
+            offline_polls = 0
 
         # An endpoint the host's adb server has stuck in `offline` never
         # heals on its own: `adb connect` just says "already connected", so

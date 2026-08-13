@@ -186,6 +186,34 @@ def gpu_display_args(want_window, capability):
     return list(gpu), list(display)
 
 
+def x86_cpu_model(accel, cfg=None):
+    """The -cpu model for an x86 guest. `qemu64` unless config says otherwise.
+
+    `qemu64` is QEMU's portable BASELINE: roughly a K8-era x86-64 with SSE2
+    and nothing since -- no SSE4.2, no AVX, no AES-NI. It LOOKS like an
+    obvious win to pass `host` through instead, especially here, where the
+    x86 base exists to run an arm64 APK through libndk_translation and every
+    translated NEON instruction has to land on some vector ISA.
+
+    MEASURED, and it is not. On a Windows/WHPX host (i7-13700F, Bliss 16.9.7,
+    Android 13) three boots with `-cpu host` did not complete at all -- one
+    hit a 6-minute timeout, two hit 15-minute timeouts -- while the same
+    image on the same machine with `qemu64` booted in 0.9 min. The guest sat
+    near-idle rather than working hard, which points at the kernel taking a
+    bad path on features it did not expect (a 13th-gen hybrid P/E topology
+    is an unusual thing to hand a 2016-era Android x86 kernel) rather than at
+    raw compute.
+
+    So the baseline stays the default, and `host` is available for a host
+    that wants it via config qemu.cpu. Revisit with a newer base kernel;
+    do NOT flip this back on reasoning alone -- re-measure.
+    """
+    override = ((cfg or {}).get("qemu") or {}).get("cpu")
+    if override:
+        return override
+    return "qemu64"
+
+
 def machine_arg(accel):
     """-machine string. On Linux/KVM add mem-merge=on explicitly: it marks
     guest RAM MADV_MERGEABLE so KSM can dedup identical pages across
@@ -379,6 +407,12 @@ PERF_SMP_FLOOR = 4
 PERF_SMP_CEIL = 8
 PERF_SMP_HOST_RESERVE = 2
 
+# WHPX-only ceilings. See the comment in autoscale_perf(): on Windows the
+# autoscaled 8192 MB / 8 vCPU booted 6.5x SLOWER than 4096 MB / 4 vCPU on the
+# same host and image, so on WHPX these are caps, not targets.
+WHPX_MEM_CEIL_MB = 4096
+WHPX_SMP_CEIL = 4
+
 
 def autoscale_perf(mode, host_mem_mb=None, host_cpus=None):
     """Grow an autoscaling mode to fit THIS host. Pure; never raises.
@@ -402,6 +436,21 @@ def autoscale_perf(mode, host_mem_mb=None, host_cpus=None):
     if host_cpus:
         m["smp"] = max(PERF_SMP_FLOOR,
                        min(PERF_SMP_CEIL, host_cpus - PERF_SMP_HOST_RESERVE))
+    # WHPX does not scale the way KVM/HVF do. Growing an instance to the
+    # host's capacity makes it DRAMATICALLY slower to boot there, which is
+    # the opposite of what autoscaling is for.
+    #
+    # MEASURED on Windows/WHPX (i7-13700F, 32 GB, Bliss 16.9.7): the very
+    # same image and offset booted in 0.9 min at 4096 MB / 4 vCPU and took
+    # 5.9 min at the autoscaled 8192 MB / 8 vCPU -- 6.5x worse for twice the
+    # resources. The guest sat near-idle while slow, so this is WHPX's
+    # per-vCPU exit/IPI cost rather than the guest wanting more.
+    #
+    # Deliberately WHPX-only: KVM and HVF scale as expected and keep the
+    # larger ceilings.
+    if IS_WINDOWS:
+        m["mem"] = min(m.get("mem", WHPX_MEM_CEIL_MB), WHPX_MEM_CEIL_MB)
+        m["smp"] = min(m.get("smp", WHPX_SMP_CEIL), WHPX_SMP_CEIL)
     return m
 
 
@@ -819,7 +868,7 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
     cmd = [
         qemu_bin("qemu-system-x86_64"),
         "-machine", machine_arg(accel),
-        "-cpu", "qemu64",
+        "-cpu", x86_cpu_model(accel, cfg),
         "-smp", str(smp),
         "-m", str(mem),
         "-drive", f"file={sys_src}{disk_opts}",

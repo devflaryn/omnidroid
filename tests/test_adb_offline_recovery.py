@@ -81,5 +81,37 @@ class Escalation(unittest.TestCase):
                            engine._ADB_SOFT_RECOVER * 2)
 
 
+
+
+class StateReadsBothStreams(unittest.TestCase):
+    """REGRESSION: `adb get-state` reports an OFFLINE endpoint on stderr and
+    leaves stdout EMPTY. Reading stdout alone returned "" for exactly the
+    condition wait_for_boot's recovery keys on, so the recovery never fired
+    and a launch sat at its full timeout against a guest that was already up
+    -- which is what "booting takes 15 minutes" actually was."""
+
+    def _state(self, stdout="", stderr="", rc=0):
+        with mock.patch.object(adbmod.subprocess, "run",
+                               return_value=mock.Mock(stdout=stdout,
+                                                      stderr=stderr,
+                                                      returncode=rc)):
+            return adbmod.adb_state(ACCT)
+
+    def test_a_healthy_device_still_reads_from_stdout(self):
+        self.assertEqual(self._state(stdout="device\n"), "device")
+
+    def test_offline_is_detected_on_stderr(self):
+        self.assertEqual(
+            self._state(stderr="error: device offline\n", rc=1), "offline")
+
+    def test_a_missing_endpoint_is_unknown_not_offline(self):
+        # Must NOT trigger the recovery escalation: nothing is stuck.
+        self.assertEqual(
+            self._state(stderr="error: device '127.0.0.1:1' not found\n",
+                        rc=1), "unknown")
+
+    def test_an_unrecognised_error_is_empty(self):
+        self.assertEqual(self._state(stderr="error: something else\n", rc=1), "")
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,15 +37,31 @@ def adb_connect(acct):
 
 
 def adb_state(acct):
-    """'device' | 'offline' | 'unknown' | '' — the HOST's view of the endpoint."""
+    """'device' | 'offline' | 'unknown' | '' — the HOST's view of the endpoint.
+
+    Reads BOTH streams. `adb get-state` prints the state to stdout only when
+    it HAS one ("device"); for an endpoint the server is holding in the
+    offline state it writes "error: device offline" to STDERR and leaves
+    stdout empty. Checking stdout alone therefore reported "" for exactly the
+    condition this exists to detect, so wait_for_boot's recovery never fired
+    and a launch sat at its full timeout against a guest that was up.
+    """
     try:
-        return subprocess.run(["adb", "-s",
-                               f"127.0.0.1:{_require_adb_port(acct)}",
-                               "get-state"],
-                              capture_output=True, text=True,
-                              timeout=10).stdout.strip()
+        r = subprocess.run(["adb", "-s",
+                            f"127.0.0.1:{_require_adb_port(acct)}",
+                            "get-state"],
+                           capture_output=True, text=True, timeout=10)
     except Exception:  # noqa: BLE001 — a probe must never raise
         return ""
+    out = (r.stdout or "").strip()
+    if out:
+        return out
+    err = (r.stderr or "").lower()
+    if "offline" in err:
+        return "offline"
+    if "not found" in err or "no devices" in err:
+        return "unknown"
+    return ""
 
 
 def adb_recover(acct, hard=False):
