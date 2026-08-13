@@ -20,7 +20,15 @@ def _app_root():
 
 
 REPO = _app_root()
-CONFIG_PATH = REPO / "configs" / "paths.json"
+# OMNIDROID_CONFIG_PATH lets an embedding host (e.g. the omni-executor GUI's
+# frozen --omnidroid subprocess) point the loader at a config file it wrote
+# itself, instead of the fixed REPO/configs/paths.json. This must be read at
+# import time: engine.py and bases.py do `from .config import CONFIG_PATH`
+# (a direct name binding evaluated once, at import), and the embedding host
+# sets the env var BEFORE importing omnidroid, so resolving it here is
+# correct and sufficient -- no other module recomputes REPO/configs itself.
+_env_cfg = os.environ.get("OMNIDROID_CONFIG_PATH")
+CONFIG_PATH = Path(_env_cfg) if _env_cfg else REPO / "configs" / "paths.json"
 QEMU_DIR = REPO / "qemu"          # local (auto-installed) QEMU lives here
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -117,3 +125,56 @@ def qemu_system_name():
     (arm64 guest, native under HVF), x86_64 everywhere else."""
     return "qemu-system-aarch64" if (IS_MACOS and IS_ARM64_HOST) \
         else "qemu-system-x86_64"
+
+
+# ---------- Windows console suppression (GUI embedding) ----------
+
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _has_own_console():
+    """True if this process owns a console window.
+
+    A console-hosted CLI run returns True; the engine running inside the
+    frozen GUI (omni-exec.exe is built windowed) returns False."""
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:  # noqa: BLE001 — never let a probe break startup
+        return True     # assume console: the safe direction (change nothing)
+
+
+def install_no_console_default():
+    """Stop every child process from flashing up its own console window.
+
+    A launch runs DOZENS of short-lived console tools (adb polled once a
+    second by wait_for_boot, qemu-img, e2fsprogs...). When the parent has NO
+    console of its own -- which is exactly the case inside the frozen GUI,
+    built windowed -- Windows gives each of those children a BRAND NEW console
+    window. The user sees terminal windows strobing across the screen for the
+    whole boot.
+
+    Applied as a Popen default rather than at ~69 call sites, so a new
+    subprocess call cannot reintroduce the flicker by forgetting a flag.
+
+    Deliberately scoped to the no-console case: when the engine IS running in
+    a terminal, children inherit that console, no window is created, and this
+    changes nothing. Calls that already set `creationflags` are left alone --
+    the QEMU spawns pass DETACHED_PROCESS, which CREATE_NO_WINDOW would
+    conflict with (Windows ignores it alongside DETACHED/NEW_CONSOLE anyway).
+    """
+    if not IS_WINDOWS or _has_own_console():
+        return False
+    import subprocess
+    if getattr(subprocess.Popen, "_omni_no_window", False):
+        return False                      # idempotent
+    original = subprocess.Popen.__init__
+
+    def _init(self, *args, **kwargs):
+        if not kwargs.get("creationflags"):
+            kwargs["creationflags"] = CREATE_NO_WINDOW
+        return original(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _init
+    subprocess.Popen._omni_no_window = True
+    return True
