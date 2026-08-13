@@ -42,7 +42,7 @@ from omnidroid import lean
 from omnidroid.config import (
     REPO, CONFIG_PATH, QEMU_DIR,
     IS_WINDOWS, IS_LINUX, IS_MACOS, HOST_ARCH, IS_ARM64_HOST,
-    images_dir, qemu_bin, qemu_system_name,
+    images_dir, qemu_bin, qemu_system_name, self_argv_prefix,
 )
 
 # Data-store root (accounts.json, accounts/, logs/, runtime/). Defaults to
@@ -5830,7 +5830,10 @@ def _spawn_builtin_viewer(name, host, port, title):
     if title:
         a += ["--title", title]
     if getattr(sys, "frozen", False):
-        cmd = [sys.executable] + a
+        # self_argv_prefix(): an embedding host (omni-exec.exe) routes to the
+        # engine only via its own argv marker. Without it this relaunches the
+        # HOST GUI instead of the child. Empty for the standalone exe.
+        cmd = [sys.executable] + self_argv_prefix() + a
     else:
         cmd = [sys.executable, str(Path(__file__).resolve())] + a
     # Detach stdio too: if the child inherited the terminal's stdout/stderr,
@@ -6311,7 +6314,10 @@ def _spawn_autocap(name, out_dir, package=None, max_keyframes=AUTOCAP_MAX_KEYFRA
     if package:
         a += ["--package", package]
     if getattr(sys, "frozen", False):
-        cmd = [sys.executable] + a
+        # self_argv_prefix(): an embedding host (omni-exec.exe) routes to the
+        # engine only via its own argv marker. Without it this relaunches the
+        # HOST GUI instead of the child. Empty for the standalone exe.
+        cmd = [sys.executable] + self_argv_prefix() + a
     else:
         cmd = [sys.executable, str(Path(__file__).resolve())] + a
     Path(out_dir).mkdir(parents=True, exist_ok=True)

@@ -127,6 +127,26 @@ def qemu_system_name():
         else "qemu-system-x86_64"
 
 
+def self_argv_prefix():
+    """Argv the frozen HOST binary needs before an omnidroid subcommand.
+
+    The engine re-invokes itself for detached children (the VNC viewer, the
+    autocap recorder) as `[sys.executable, "<subcommand>", ...]`. That is
+    correct for the standalone omnidroid.exe, whose frozen entry point IS the
+    engine CLI. It is WRONG when the engine is embedded in a host app:
+    omni-exec.exe's entry point is the GUI, which only routes to the engine
+    when argv[1] is "--omnidroid". Without the prefix, `omni-exec.exe
+    _vncview ...` falls through and launches a SECOND COPY OF THE GUI instead
+    of the viewer -- which is exactly what clicking "Open viewer" did.
+
+    The host declares its own shape via OMNIDROID_SELF_ARGV (omni-executor
+    sets "--omnidroid"); unset means "my argv is the engine's", the
+    standalone-exe behaviour, so nothing changes there.
+    """
+    import shlex
+    return shlex.split(os.environ.get("OMNIDROID_SELF_ARGV", ""))
+
+
 # ---------- Windows console suppression (GUI embedding) ----------
 
 CREATE_NO_WINDOW = 0x08000000
