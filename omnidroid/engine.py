@@ -5144,10 +5144,14 @@ def install_readiness():
            # A base that boots is not the same as a base that can LAUNCH: the
            # base ships no Roblox, so a bare `start` also needs a default
            # offset. Reported separately so doctor names the right fix.
+           # Reported for x86 too. These were arm-gated back when offsets
+           # were an arm-only concept; an x86 base bakes them the same way
+           # now, and hardcoding [] told a Windows user "no Roblox baked" on
+           # a deployment whose default offset boots perfectly.
            "offsets": (offsets_mod.offset_rows(bases[tag], images)
-                       if arm else []),
+                       if base_ready else []),
            "default_offset": (offsets_mod.default_offset_name(bases[tag])
-                              if arm else None),
+                              if base_ready else None),
            "qemu_present": qemu_ok,
            "qemu": qemu_bin(qemu_system_name()) if qemu_ok else None,
            "adb_present": adb_ok,
