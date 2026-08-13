@@ -25,6 +25,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -32,7 +33,9 @@ import threading
 import time
 from pathlib import Path
 
+from omnidroid import awake
 from omnidroid import config
+from omnidroid import consent
 from omnidroid import farming
 from omnidroid import gaming
 from omnidroid import lean
@@ -90,7 +93,9 @@ DEFAULT_SRC = "/android-2024-10-11"
 #                efivars) trio rather than provisioning on first boot.
 from omnidroid.bases import *  # noqa: F401,F403
 from omnidroid.bases import (_truthy_env, _debug_boot_requested,
+                             _no_warm_requested,
                              _select_base_tag, _next_base_tag)  # noqa: F401
+from omnidroid import offsets as offsets_mod
 
 
 
@@ -151,17 +156,17 @@ def host_arch_token():
 # The devkit disk — the attachable debug toolkit, built host-side (rootless,
 # cross-platform via `mke2fs -d`) as an ext4 image carrying the frida-server for
 # that arch, Magisk (apk + magiskboot), the omni-* device scripts, and a
-# manifest. It belongs to no base entry: `omni start --debug` attaches it as vdc
+# manifest. It belongs to no base entry: `omnidroid start --debug` attaches it as vdc
 # and the guest mounts it read-only at /mnt/omni-devkit, copying the toolkit to
 # /data/local/tmp to execute it (/mnt is a noexec tmpfs). See _devkit_* and
-# `omni build-devkit`.
+# `omnidroid build-devkit`.
 #
 # Root-state markers embedded in a base's human-readable `notes`; kept as
 # constants because the notes must never contradict the entry's `rooted` flag.
 #
 # frida-server is pinned for the devkit (android-<arch>). The base runs its
 # guest arch natively (arm64 under HVF/KVM, x86_64 under WHPX/KVM), so no
-# translation. Override with `omni build-devkit --frida-version`. The hidden
+# translation. Override with `omnidroid build-devkit --frida-version`. The hidden
 # frida port is intentionally NOT the well-known 27042.
 DEFAULT_FRIDA_VERSION = "17.15.4"
 DEFAULT_FRIDA_PORT = 27142
@@ -179,7 +184,7 @@ DEFAULT_FRIDA_PORT = 27142
 DEFAULT_CONFIG = {
     "images_dir": "images",
     "current_base": None,
-    "data_template": "data-template-8g.qcow2",
+    "data_template": X86_DATA_TEMPLATE,
     "default_src": DEFAULT_SRC,
     "bases": {},
     "qemu": {"mem_mb": 4096, "smp": 4, "data_disk_size": "8G",
@@ -367,7 +372,7 @@ def _booted_with_native_window(name):
 
 
 def _want_vnc_viewer(native_window, explicit_window, json_mode, no_window):
-    """Whether `omni start` should also spawn the built-in Tk/RFB viewer.
+    """Whether `omnidroid start` should also spawn the built-in Tk/RFB viewer.
 
     The instance always RUNS a VNC server — screenshot, autocap and the
     omnidroid-input skill attach to it in every mode. This decides only
@@ -420,6 +425,10 @@ def load_account(name):
         # Per-BOOT, not per-account: true only if the live boot attached the
         # devkit disk. An account that is not running is never "debug".
         "debug": bool((run or {}).get("debug")),
+        # Which Roblox version the LIVE boot picked, not what the default is
+        # now — the default can be changed while an instance is running.
+        "offset": (run or {}).get("offset"),
+        "data_image": (run or {}).get("data_image"),
         "game_package": ROBLOX_PACKAGE,
         "first_boot_done": True,
     }
@@ -458,6 +467,8 @@ def all_accounts():
             entry, cfg)
         acct = {"name": name, "base": base_tag, "ephemeral": True,
                 "debug": bool(r.get("debug")) if r else False,
+                "offset": (r or {}).get("offset"),
+                "data_image": (r or {}).get("data_image"),
                 "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
         if r:
             for k in ("adb_port", "qmp_port", "vnc_port"):
@@ -472,6 +483,7 @@ def all_accounts():
         base_tag = r.get("base") or _base_tag_for_mode(None, cfg)
         acct = {"name": name, "base": base_tag, "ephemeral": True,
                 "debug": bool(r.get("debug")),
+                "offset": r.get("offset"), "data_image": r.get("data_image"),
                 "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
         for k in ("adb_port", "qmp_port", "vnc_port"):
             if r.get(k) is not None:
@@ -729,7 +741,65 @@ def make_overlay(system_path, base_disk):
                     str(system_path)], check=True, capture_output=True)
 
 
-def build_acct(name, cfg, debug=False):
+def resolve_launch_offset(cfg, tag, requested=None, allow_none=False,
+                          label=None):
+    """Which Roblox OFFSET this launch boots — the whole version selection.
+
+    Returns (offset_name, data_image_filename); both None means "boot the
+    base's own /data", which on a clean base is a Roblox-less instance.
+
+    The failure modes are separated deliberately, because they need different
+    answers from the caller:
+
+      unknown    the user named a version that is not baked -> hard error,
+                 listing what IS baked. Silently falling back to the default
+                 here would run the wrong Roblox under the right name, which
+                 is the single most expensive way to be wrong.
+      ambiguous  several offsets, none marked default -> hard error asking for
+                 `omnidroid offset default <name>`.
+      none       nothing baked at all -> hard error UNLESS allow_none (the
+                 `--apk` / `--offset none` paths supply their own build).
+    """
+    base = (cfg.get("bases") or {}).get(tag) or {}
+    name, entry, why = offsets_mod.resolve_offset(base, requested)
+    known = list(offsets_mod.offsets_of(base))
+    if why == "unknown":
+        fail("no_offset",
+             f"no Roblox offset '{requested}' on base '{tag}'. Baked: "
+             f"{known or 'none'}. Bake one with `omnidroid offset create "
+             f"{requested} --apk <path>`.")
+    if why == "ambiguous":
+        fail("no_default_offset",
+             f"base '{tag}' has {len(known)} offsets ({', '.join(known)}) and "
+             f"no default. Pick one for this launch with `--offset <name>`, "
+             f"or set it once with `omnidroid offset default <name>`.")
+    if name is None:
+        if not allow_none:
+            fail("no_offset",
+                 f"base '{tag}' has NO Roblox baked (the base ships clean). "
+                 f"Bake a version first: `omnidroid offset create <name> "
+                 f"--apk <roblox.apk>` — or pass `--apk <path>` to install a "
+                 f"build for this launch only, or `--offset none` to boot a "
+                 f"deliberately game-less instance.")
+        return None, None
+    img = offsets_mod.offset_data_image(base, name)
+    images = Path(cfg["images_dir"])
+    if not (images / img).exists():
+        fail("no_offset",
+             f"offset '{name}' is registered on base '{tag}' but its image is "
+             f"missing: {images / img}. Re-bake it (`omnidroid offset create "
+             f"{name} --apk <path>`) or drop it (`omnidroid offset remove "
+             f"{name}`).")
+    if label:
+        print(f"[{label}] roblox offset: {name}"
+              + (f" ({entry.get('version_name')})" if entry.get("version_name")
+                 else "")
+              + ("" if why == "explicit" else "  [default]"))
+    return name, img
+
+
+def build_acct(name, cfg, debug=False, offset=None, allow_no_offset=False,
+               label=None):
     """Build the EPHEMERAL launch handle for `name`: resolves the base tag,
     allocates a fresh port triple, and stages a per-boot efivars copy into
     runtime_dir(name) -- but writes NO account.json and creates NO overlays.
@@ -745,7 +815,12 @@ def build_acct(name, cfg, debug=False):
 
     `debug` is a per-BOOT flag: it flows to spawn_qemu to attach the devkit
     disk (vdc). It does NOT change the base — production and debug boot the
-    exact same dual-use image."""
+    exact same dual-use image.
+
+    `offset` is the per-BOOT Roblox VERSION (see omnidroid/offsets.py). It is
+    likewise not a property of the account: there is exactly one account
+    identity and it can be launched on any baked version. None means "the
+    base's default offset"."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         fail("bad_name",
              f"instance/username must be [A-Za-z0-9_-]+ (got '{name}')")
@@ -754,6 +829,11 @@ def build_acct(name, cfg, debug=False):
     if base_type(base) != BASE_TYPE_ARM:
         fail("arch_boundary",
              f"instances are arm-only; base '{tag}' is {arch_of_base(base)}")
+    # Resolved BEFORE any port is reserved: a launch that names a version this
+    # host has not baked must fail having allocated nothing, the same rule
+    # cmd_start already follows for a missing cookie.
+    off_name, data_image = resolve_launch_offset(
+        cfg, tag, offset, allow_none=allow_no_offset, label=label)
     ensure_qemu()
     # Hold the launch lock across allocate + reserve ONLY (tiny critical
     # section): a lock alone isn't enough (allocate-then-release before spawn
@@ -774,6 +854,7 @@ def build_acct(name, cfg, debug=False):
     return {"name": name, "base": tag,
             "adb_port": adb_port, "qmp_port": qmp_port, "vnc_port": vnc_port,
             "ephemeral": True, "debug": bool(debug),
+            "offset": off_name, "data_image": data_image,
             "game_package": ROBLOX_PACKAGE, "first_boot_done": True}
 
 
@@ -965,6 +1046,19 @@ def assert_kiosk_game(acct, cfg, label):
             print(f"[{label}] kiosk game package = {game}")
         except Exception as e:  # noqa: BLE001 — never fail a boot over this
             print(f"[{label}] could not set omni_game_package: {e}")
+        # NOTE: the kiosk reads omni_game_package ONCE, in onCreate ->
+        # resolveGamePackage -> configureLockTask (setLockTaskPackages). On the
+        # ephemeral arm /data the setting is unset at first boot, so the kiosk
+        # resolves the WRONG package (first launchable non-system app = the Magisk
+        # manager) and whitelists IT — not the game — for Lock Task, so the game's
+        # deep-link join is a Lock Task violation and gets force-stopped (black
+        # screen after "joined"). Writing the setting here does not help a
+        # kiosk that already resolved, and the device-owner kiosk cannot be
+        # force-stopped over adb (needs root, absent on a non-debug boot). The
+        # durable fix is to bake omni_game_package into the base /data so the
+        # kiosk's very first onCreate reads it — see update_kiosk_arm, which sets
+        # it in the throwaway before capture. This write stays as a belt-and-braces
+        # re-assert for bases built before that fix. (Traced + fixed 2026-08-10.)
     # Best-effort, like every other post-boot assertion here: an instance that
     # could not be re-fronted must still end up booted and reachable, so this
     # reports and returns rather than propagating into the boot.
@@ -972,7 +1066,7 @@ def assert_kiosk_game(acct, cfg, label):
         return _assert_kiosk_foreground(acct, label)
     except Exception as e:  # noqa: BLE001
         print(f"[{label}] kiosk UI: could not re-front ({e}); the instance is "
-              f"up — check `omni screenshot` to see what is on screen")
+              f"up — check `omnidroid screenshot` to see what is on screen")
         return {"kiosk_foreground": False, "reason": "error"}
 
 
@@ -1023,7 +1117,7 @@ def _devkit_activate(acct, label):
     if not su:
         print(f"[{label}] devkit: Magisk root not available (su denied/missing). "
               f"The base is not rooted — frida can't attach and hiding is off. "
-              f"Build the rooted image with: omni root-base <tag>")
+              f"Build the rooted image with: omnidroid root-base <tag>")
         return {"activated": False, "reason": "no_root", "devkit_disk": True}
     # Mount vdc ro and copy the scripts + manifest to an exec-capable dir. (The
     # frida-server binary is read from the mount by omni-fridad; /mnt is noexec
@@ -1069,7 +1163,7 @@ def _devkit_activate(acct, label):
         # Dev boots to the SAME kiosk as production: re-assert the kiosk as the
         # foreground HOME and stop the Magisk app from sitting on top (the reported
         # "Magisk screen instead of kiosk"). Switch back any time with
-        # `omni dev-ui <name> --show magisk`.
+        # `omnidroid dev-ui <name> --show magisk`.
         kiosk_ui = _assert_kiosk_foreground(acct, label)
         return {"activated": True, "su": su, "mount": DEVKIT_MOUNT,
                 "work": DEVKIT_WORK,
@@ -1253,6 +1347,16 @@ def _await_bootstrap_login(acct, timeout=25):
     return False
 
 
+def _start_timings_stages(has_apk):
+    """The stage names `cmd_start` marks, in order. Declared separately from
+    the marking itself so the emitted contract is testable without a boot."""
+    stages = ["boot"]
+    if has_apk:
+        stages.append("apk_install")
+    stages += ["session_delivered", "game_foreground"]
+    return stages
+
+
 def cmd_start(args):
     """Boot an instance, deliver its saved Roblox session, and land either
     INSIDE a place (if one is set) or on the account's home screen, logged in,
@@ -1267,6 +1371,7 @@ def cmd_start(args):
     ensure_qemu()
     cfg = load_config()
     debug = _debug_boot_requested(args)
+    no_warm = _no_warm_requested(args)
     if getattr(args, "apk", None):
         # --apk installs a custom Roblox build for testing. This works on EVERY
         # base (root is available on all of them now) and is INDEPENDENT of
@@ -1300,8 +1405,8 @@ def cmd_start(args):
     if not sess.get("token") and not getattr(args, "no_token", False):
         return fail("no_token",
                     f"no saved Roblox account '{args.name}'. Sign it in first: "
-                    f"`omni login` (saves the account under its username), then "
-                    f"`omni start {args.name}`. (Or override with "
+                    f"`omnidroid login` (saves the account under its username), then "
+                    f"`omnidroid start {args.name}`. (Or override with "
                     f"--token-file <file>, or --no-token to land on Roblox's "
                     f"own login screen.) No instance was created for "
                     f"'{args.name}'.")
@@ -1332,25 +1437,40 @@ def cmd_start(args):
 
     # Only NOW do we know a session is deliverable (a real token, or the
     # explicit --no-token escape hatch) — build the launch handle. Nothing is
-    # persisted here: the store owns the account's cookie (via `omni login`)
-    # and its default place (via `omni session --place`); --place above is a
+    # persisted here: the store owns the account's cookie (via `omnidroid login`)
+    # and its default place (via `omnidroid session --place`); --place above is a
     # one-off override for THIS launch only.
-    acct = build_acct(args.name, cfg, debug=debug)
+    # WHICH Roblox: the named offset, else the base's default. `--apk` and
+    # `--offset none` are the two ways to say "boot the clean base", because
+    # both supply (or deliberately omit) the build themselves.
+    want_offset = getattr(args, "offset", None)
+    if getattr(args, "no_offset", False):
+        want_offset = offsets_mod.NO_OFFSET
+    acct = build_acct(args.name, cfg, debug=debug, offset=want_offset,
+                      allow_no_offset=bool(getattr(args, "apk", None)),
+                      label=label)
 
+    from omnidroid.timings import Timings
+    timings = Timings()
     booted, first = _ensure_booted(acct, cfg, label,
                                    timeout=getattr(args, "timeout", None),
                                    accel=getattr(args, "accel", None),
                                    mode_name=getattr(args, "mode", None),
                                    mem=getattr(args, "mem", None),
+                                   smp=getattr(args, "smp", None),
                                    balloon=getattr(args, "balloon", None),
-                                   debug=debug)
+                                   quality=getattr(args, "quality", None),
+                                   debug=debug, no_warm=no_warm)
+    timings.mark("boot")
     result = {"name": args.name, "place_id": sess.get("place_id"),
               "deeplink": roblox_deeplink(sess), "first_boot": first,
               "arch": acct_arch(acct), "debug": bool(debug),
+              "offset": acct.get("offset"),
               "adb_port": acct["adb_port"], "vnc_port": acct["vnc_port"],
               "session": public_session(sess)}
     if not booted:
         result.update({"ok": False, "booted": False, "error": "boot_timeout"})
+        result["timings"] = timings.as_dict()
         if json_mode:
             emit_json(result)
         sys.exit(1)
@@ -1364,14 +1484,17 @@ def cmd_start(args):
             result.update({"booted": True, "ok": False,
                            "error": ir.get("error", "apk_install_failed"),
                            "detail": ir.get("detail")})
+            result["timings"] = timings.as_dict()
             if json_mode:
                 emit_json(result)
             sys.exit(1)
+        timings.mark("apk_install")
 
     # start ALWAYS launches: the kiosk joins when the session carries a place,
     # else lands on home (logged in). play=is_join was the home-mode bug --
     # play=False told the kiosk not to launch at all, so home never appeared.
     status = deliver_session(acct, label, sess, play=True)
+    timings.mark("session_delivered")
     result.update({"booted": True, "ok": bool(status.get("delivered")),
                    **{k: v for k, v in status.items() if k != "kiosk"}})
     result["kiosk"] = status.get("kiosk")
@@ -1379,9 +1502,13 @@ def cmd_start(args):
     # Only now does the game process exist — the kiosk launches it in response
     # to the broadcast above. Pinning it to the top-app cpuset any earlier
     # finds no pid and silently does nothing (see gaming.build_pin_game_step).
-    if resolve_mode(read_config(), getattr(args, "mode", None))["name"] \
-            == "gaming":
+    # EVERY performance-profile mode gets the pin, not just `gaming`: the
+    # latency-critical scheduler set is what makes an instance feel like a
+    # game, and `playable` is the mode a human and the AI actually use.
+    if resolve_mode(read_config(), getattr(args, "mode", None)).get(
+            "profile", "performance") == "performance":
         pin_game_to_top_app(acct, label)
+    timings.mark("game_foreground")
 
     # LOUD failure check (only when a custom --apk was installed): deliver_session
     # reporting "delivered" only means the cookie broadcast reached the app -- it
@@ -1399,12 +1526,13 @@ def cmd_start(args):
                   f"plain/stock Roblox cannot read the session cookie; "
                   f"build a login-capable APK via omni-agent's "
                   f"inject_session_bootstrap.")
+            result["timings"] = timings.as_dict()
             if json_mode:
                 emit_json(result)
             sys.exit(1)
 
     # Open a live WINDOW onto this instance so you can watch/play it, and so two
-    # `omni start` runs give two accounts side by side. Each viewer is its own
+    # `omnidroid start` runs give two accounts side by side. Each viewer is its own
     # detached process bound to this instance's own VNC port, so N windows for N
     # accounts just work. Default ON for interactive use; suppressed by
     # --no-window and by --json (a machine/automation caller drives via capture).
@@ -1425,6 +1553,7 @@ def cmd_start(args):
         except Exception as e:  # noqa: BLE001 — a window failure must not fail start
             print(f"[{label}] could not open a window: {e}")
 
+    result["timings"] = timings.as_dict()
     if json_mode:
         emit_json(result)
     elif result["ok"]:
@@ -1780,7 +1909,7 @@ def _build_next_base(cfg, mutate, notes, base_game=None):
         raw["current_base"] = nxt
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
         print(f"[{label}] base {nxt} built and current. "
-              f"Roll out: omni update-all")
+              f"Roll out: omnidroid update-all")
     finally:
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
@@ -1862,7 +1991,7 @@ def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
     /metadata keys came from a copy of that very image.
 
     Without this, a FRESH account ships the kiosk build that was current when the
-    template was last captured — so `omni start` gets no_kiosk_reply until someone
+    template was last captured — so `omnidroid start` gets no_kiosk_reply until someone
     installs the new kiosk by hand.
     """
     kiosk_apk = Path(kiosk_apk)
@@ -1900,6 +2029,20 @@ def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
             return fail("install_failed",
                         f"kiosk install failed: {out.strip()[-300:]}")
         print(f"[{label}] installed {kiosk_apk.name}")
+        # Bake omni_game_package into the TEMPLATE so the kiosk's very first
+        # onCreate on a fresh ephemeral /data resolves the GAME (not the first
+        # launchable non-system app — the Magisk manager) and whitelists it for
+        # Lock Task. Without it the game's deep-link join is a Lock Task violation
+        # and gets force-stopped (black screen after "joined"), and the
+        # device-owner kiosk cannot be restarted over adb to re-resolve. See
+        # assert_kiosk_game. (Traced + fixed 2026-08-10.)
+        game_pkg = resolve_game_package(acct, cfg) or "com.roblox.client"
+        try:
+            adb(acct, "shell", "settings", "put", "global",
+                "omni_game_package", game_pkg, timeout=15)
+            print(f"[{label}] baked omni_game_package = {game_pkg} into the template")
+        except Exception as e:  # noqa: BLE001 — never fail the bake over this
+            print(f"[{label}] could not bake omni_game_package: {e}")
         # Deliberately do NOT launch the kiosk here. It would enter Lock Task
         # Mode, and lock task BLOCKS `reboot -p` — the guest then never powers
         # off, _shutdown escalates to SIGKILL, and the capture is refused. There
@@ -1958,16 +2101,16 @@ def cmd_update_kiosk(args):
 #
 # Two orthogonal build steps, neither of which changes which base ships:
 #
-# `omni build-devkit [--arch arm|x86]` — builds the ATTACHABLE devkit disk
+# `omnidroid build-devkit [--arch arm|x86]` — builds the ATTACHABLE devkit disk
 #   `base_<arch>_devkit.qcow2`, an ext4 image BUILT ENTIRELY HOST-SIDE (no guest
 #   boot, no root, cross-platform via `mke2fs -d`) carrying:
 #     * frida-server for the guest arch (native — no translation),
 #     * Magisk (the APK installer + the extracted magiskboot/magiskinit/…),
 #     * the omni-* device scripts (hidden frida launch + root/frida hiding),
 #     * a manifest.json (versions, hidden frida port, mount paths).
-#   It belongs to no base; `omni start --debug` attaches it as vdc.
+#   It belongs to no base; `omnidroid start --debug` attaches it as vdc.
 #
-# `omni root-base [--base <tag>]` — bakes root INTO a shipped base by Magisk-
+# `omnidroid root-base [--base <tag>]` — bakes root INTO a shipped base by Magisk-
 #   patching its boot into a THIN COW overlay of the production system
 #   (`base_arm_system_rooted.qcow2` — see _patch_boot_into_overlay), plus a
 #   matched rooted /data. The production system image is never modified and
@@ -2212,9 +2355,9 @@ def build_devkit(cfg, arch=None, frida_version=DEFAULT_FRIDA_VERSION,
 
     This is the debug toolkit only (frida-server + the omni-* scripts + the
     Magisk multicall binaries), assembled fully host-side (no boot, no root) as
-    a populated ext4 qcow2. It belongs to NO base entry: `omni start --debug`
+    a populated ext4 qcow2. It belongs to NO base entry: `omnidroid start --debug`
     attaches it as vdc. It never changes any base or current_base — rooting the
-    shipped image is a separate step (`omni root-base`).
+    shipped image is a separate step (`omnidroid root-base`).
 
     Returns the absolute path of the disk it wrote."""
     arch = arch or host_arch_token()
@@ -2227,7 +2370,7 @@ def build_devkit(cfg, arch=None, frida_version=DEFAULT_FRIDA_VERSION,
         devkit_disk = images / devkit_disk_name(arch)
         _build_ext4_qcow2(staging["dir"], devkit_disk, label)
         print(f"[{label}] DONE. Built {devkit_disk.name}. It attaches as vdc on "
-              f"`omni start --debug` / agent debug=true. No base was changed.")
+              f"`omnidroid start --debug` / agent debug=true. No base was changed.")
         return devkit_disk
     finally:
         shutil.rmtree(staging["dir"], ignore_errors=True)
@@ -2453,7 +2596,7 @@ GRUB_CFG_PATH = "boot/grub/grub.cfg"
 # This is not a convenience — without it the product does not work at all. adbd
 # otherwise demands authorization, which Android asks for with an "Allow USB
 # debugging?" DIALOG on the guest screen. Nothing can answer it: the instance is
-# headless, the kiosk cannot dismiss a system dialog, and `omni start` needs adb
+# headless, the kiosk cannot dismiss a system dialog, and `omnidroid start` needs adb
 # to reach the kiosk in the first place. Every fresh account would sit at that
 # dialog forever.
 #
@@ -2750,17 +2893,107 @@ def _bake_apk_into_product(raw_path, fs_off, apk, app_name, label):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def bake_data_game(cfg, tag, apk, pkg, label):
-    """Boot a builder, install the game into /DATA, bake `omni_game_package`,
-    and keep the resulting THIN overlay. Returns the overlay path or None.
+def _remove_apk_from_product(raw_path, fs_off, app_name, label):
+    """Delete a baked SYSTEM app from the product filesystem — the inverse of
+    _bake_apk_into_product, and what makes a base TRULY carry no game.
 
-    Why /data rather than the system image: `omni bake-game` writes the APK
-    into /product inside the 2.3 GB system image, so every Roblox update means
-    a new base and ~6 GiB of scratch. An `pm install -r -d` lands an UPDATED
-    SYSTEM APP in /data/app, does the same job for a kiosk that launches by
-    package name, and the package name never changes between Roblox versions —
-    so an update is one run of this command, and the overlay is only about as
-    big as the APK.
+    Why it exists. Offsets already make the /data layer clean: the base's
+    /data is pristine and every Roblox version is a sibling overlay. But the
+    arm base's SYSTEM image (base v2) also has Roblox baked at
+    /product/app/Roblox. That copy is shadowed at runtime — every offset
+    installs with `pm install -r -d`, which lands an UPDATED SYSTEM APP in
+    /data/app that wins over the /product one — so it changes no behaviour.
+    It does mean `--offset none` boots a base that still HAS a Roblox, and
+    that the system image carries ~130 MB it never uses.
+
+    Run once on a build machine to be rid of it. Returns None on success,
+    else an error string. Reads the directory back to prove the delete landed
+    rather than trusting debugfs's exit status.
+    """
+    import tempfile
+    dbg = _debugfs_bin()
+    if not dbg:
+        return ("debugfs (e2fsprogs) not found — needed to edit the product "
+                "filesystem. macOS: brew install e2fsprogs.")
+    dev = f"{raw_path}?offset={fs_off}"
+    d = f"/app/{app_name}"
+    probe = subprocess.run([dbg, "-R", f"ls -l {d}", dev],
+                           capture_output=True, text=True, timeout=300)
+    if "File not found" in ((probe.stdout or "") + (probe.stderr or "")):
+        print(f"[{label}] product{d} is already absent — nothing to remove")
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="omni-unbake-"))
+    try:
+        # Depth-first: ext2 rmdir refuses a non-empty directory, and the lib
+        # tree below is where ~107 MB of Roblox .so files live.
+        lines = [f"rm {d}/{app_name}.apk\n"]
+        libs = subprocess.run(
+            [dbg, "-R", f"ls -l {d}/lib/{_BAKE_LIBDIR}", dev],
+            capture_output=True, text=True, timeout=300).stdout or ""
+        for tok in re.findall(r"\s(\S+\.so)\s*$", libs, re.M):
+            lines.append(f"rm {d}/lib/{_BAKE_LIBDIR}/{tok}\n")
+        lines += [f"rmdir {d}/lib/{_BAKE_LIBDIR}\n", f"rmdir {d}/lib\n",
+                  f"rmdir {d}\n"]
+        script = tmp / "cmds.txt"
+        script.write_text("".join(lines))
+        subprocess.run([dbg, "-w", "-f", str(script), dev],
+                       capture_output=True, text=True, timeout=1800)
+        back = subprocess.run([dbg, "-R", f"ls -l {d}", dev],
+                              capture_output=True, text=True, timeout=300)
+        out = (back.stdout or "") + (back.stderr or "")
+        if "File not found" not in out:
+            return (f"product{d} still exists after the delete — refusing to "
+                    f"claim a clean base. debugfs said: {out.strip()[-300:]}")
+        print(f"[{label}] product{d} removed — this system image now ships "
+              f"NO game")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _product_roblox_dirs(raw_path, fs_off):
+    """Every /product/app/<Dir> that looks like a Roblox system app.
+
+    The arm base can carry MORE THAN ONE (seen in the wild: both `Roblox` and
+    `ArceusRoblox`, each holding com.roblox.client). `bake-game --remove` used
+    to strip only the one named `Roblox`, so the sibling survived, kept
+    com.roblox.client present, and every re-signed offset bake then failed with
+    INSTALL_FAILED_UPDATE_INCOMPATIBLE. This lists them so --remove clears ALL.
+    """
+    dbg = _debugfs_bin()
+    if not dbg:
+        return []
+    out = subprocess.run([dbg, "-R", "ls -l /app", f"{raw_path}?offset={fs_off}"],
+                         capture_output=True, text=True, timeout=300).stdout or ""
+    names = []
+    for line in out.splitlines():
+        parts = line.split()
+        # debugfs `ls -l`: inode MODE links uid gid size date time NAME.
+        # A directory's mode octal starts with 4 (S_IFDIR); name is the last token.
+        if len(parts) >= 2 and parts[1].startswith("4"):
+            name = parts[-1]
+            if name not in (".", "..") and "roblox" in name.lower():
+                names.append(name)
+    return names
+
+
+def bake_offset(cfg, tag, out_name, apk, pkg, label):
+    """Boot a builder, install ONE Roblox version into /DATA, bake
+    `omni_game_package`, and keep the resulting THIN overlay as `out_name`.
+    Returns the overlay path or None.
+
+    This is the mechanism behind `omnidroid offset create`. Each call produces
+    an INDEPENDENT sibling overlay of the base's pristine /data — never an
+    overlay of another offset (see omnidroid/offsets.py for why chaining is
+    refused) — so any number of Roblox versions coexist at roughly APK size
+    each, and deleting one cannot disturb another.
+
+    Why /data rather than the system image: `omnidroid bake-game` writes the APK
+    into /product inside the 2.3 GB system image, so every Roblox version means
+    a new 2.3 GB base and ~6 GiB of scratch. A `pm install -r -d` lands an
+    UPDATED SYSTEM APP in /data/app, does the same job for a kiosk that
+    launches by package name, and the package name never changes between
+    Roblox versions — so a new version is one ~2-minute command.
 
     Uses no root: `pm install` and `settings put global` both work as uid
     shell, so this works on an unrooted deployment too."""
@@ -2773,8 +3006,10 @@ def bake_data_game(cfg, tag, apk, pkg, label):
         return None
     # Build the overlay in images/ so its backing reference stays inside the
     # image directory, and under a .tmp name so a failed bake never clobbers
-    # the /data that is currently shipping.
-    out = images / ARM_GAME_DATA
+    # an offset that already exists and boots.
+    out = images / out_name
+    out.parent.mkdir(parents=True, exist_ok=True)   # images_dir/arm/ on a
+    #                                                 first-ever bake
     tmp = out.with_suffix(".tmp.qcow2")
     bname = "_gamedata"
     d = account_dir(bname)
@@ -2822,11 +3057,16 @@ def bake_data_game(cfg, tag, apk, pkg, label):
         _shutdown(acct, label)
         # Keep the overlay itself: it is thin (only the APK + settings differ
         # from the pristine /data). Rewrite its backing reference to a bare
-        # filename so the image directory stays relocatable, same convention
-        # as base_arm_system_zram.qcow2.
+        # filename so the image directory stays relocatable.
+        #
+        # BARE, not `src_name`: recorded image names carry their arch
+        # subfolder (arm/base_arm_data_rooted.qcow2), and a backing reference
+        # resolves relative to the OVERLAY's own directory — which is that
+        # same arm/ folder. Writing the prefixed name would look for
+        # arm/arm/base_arm_data_rooted.qcow2 and the offset would not open.
         shutil.move(str(d / "data.qcow2"), str(tmp))
         subprocess.run([qemu_bin("qemu-img"), "rebase", "-u",
-                        "-b", src_name, "-F", "qcow2", str(tmp)],
+                        "-b", Path(src_name).name, "-F", "qcow2", str(tmp)],
                        check=True, capture_output=True)
         tmp.replace(out)
         size_mb = out.stat().st_size // (1024 * 1024)
@@ -2834,7 +3074,7 @@ def bake_data_game(cfg, tag, apk, pkg, label):
               f"on {src_name})")
         return out
     except Exception as e:  # noqa: BLE001
-        print(f"[{label}] /data game bake failed ({type(e).__name__}: {e}).")
+        print(f"[{label}] offset bake failed ({type(e).__name__}: {e}).")
         tmp.unlink(missing_ok=True)
         return None
     finally:
@@ -2842,84 +3082,453 @@ def bake_data_game(cfg, tag, apk, pkg, label):
             shutil.rmtree(d, ignore_errors=True)
 
 
-def cmd_bake_data_game(args):
-    """Install the game into the base's /DATA and bake `omni_game_package`.
+def bake_consent_into_offset(cfg, tag, base, img_name, pkg, label):
+    """Apply the unattended-consent policy INSIDE an offset image, in place.
 
-    This is the update-friendly counterpart to `bake-game`: re-run it with a
-    newer APK and it starts again from the PRISTINE rooted /data (see
-    data_bake_source), so updates never chain overlays and never rebuild the
-    2.3 GB system image.
+    Why a builder boot and not a host-side edit: the policy lives in the
+    settings provider and in /data/system/{appops,runtime-permissions}.xml —
+    framework-owned databases. Editing those from the host means writing an
+    ext4 image behind a running framework's back; booting Android and letting
+    `appops`/`pm`/`settings` do it is the only way that produces the same
+    bytes the framework itself would.
 
-        omni bake-data-game ~/Downloads/roblox-2.727.apk
-        omni bake-data-game                 # just the kiosk setting, no APK
+    The write is an OVERLAY-THEN-COMMIT, never a direct boot off the offset:
+
+        offset.qcow2  <- tmp overlay (the builder's writable /data)
+                      -> qemu-img commit merges the overlay back down
+
+    A builder that crashed or a policy that did not confirm therefore leaves
+    the offset byte-for-byte untouched — the commit is the ONLY thing that
+    modifies it, and it only runs after the guest echoes the marker.
+
+    Committing changes the offset's size and mtime, which is exactly what
+    invalidates any warm-cache entry keyed on it (see warmcache.cache_key's
+    offset_image_stat) — the next launch cold-boots once and re-bakes rather
+    than restoring a pre-policy machine.
+    """
+    images = Path(cfg["images_dir"])
+    target = images / img_name
+    if not target.exists():
+        print(f"[{label}] offset image not found: {target}")
+        return False
+    bname = "_consent"
+    d = account_dir(bname)
+    try:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+        adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+        acct = {"name": bname, "base": tag, "adb_port": adb_port,
+                "qmp_port": qmp_port, "vnc_port": vnc_port,
+                "game_package": pkg, "first_boot_done": True}
+        save_account(acct)
+        make_overlay(d / "system.qcow2", images / base["system"])
+        make_overlay(d / "data.qcow2", target)
+        shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
+                        d / "efivars.fd")
+        _spawn_builder_with_disks(acct, cfg, [], label)
+        if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
+            print(f"[{label}] builder did not boot; {img_name} is untouched.")
+            return False
+        out = ""
+        for step in consent.build_consent_sequence(pkg):
+            r = adb(acct, *step, timeout=180)
+            out += (r.stdout or "") + (r.stderr or "")
+        if not consent.applied_ok(out):
+            print(f"[{label}] the guest did not confirm the policy — NOT "
+                  f"committing. {img_name} is untouched. "
+                  f"guest said: {out.strip()[-200:] or '<nothing>'}")
+            _shutdown(acct, label)
+            return False
+        # Push the RAM-held app-ops to disk, then throw the RAM state away and
+        # reload from it. Applying is not persisting: the first version of this
+        # function skipped these two steps and committed an image whose ops
+        # read back as "No operations." See consent.build_persist_script.
+        adb(acct, *consent.build_persist_script(), timeout=60)
+        adb(acct, *consent.build_reload_script(), timeout=60)
+        # Read it back INSIDE the same boot, before the image is committed: a
+        # policy that did not land must not be baked in and then discovered at
+        # launch time. After the reload above, an op still reading `allow` is
+        # ON DISK — which is exactly what the commit is about to capture.
+        r = adb(acct, *consent.build_consent_probe(pkg), timeout=30)
+        state = consent.parse_consent_state((r.stdout or "") + (r.stderr or ""))
+        counts = consent.parse_counts(out)
+        # Gate on the half that is actually IMAGE STATE. Requiring the app-ops
+        # here would fail every bake on Android 16: they apply, they reach
+        # disk, and the permission APEX re-derives them at boot anyway (see
+        # consent.build_persist_script). The boot-time step owns that half.
+        if not state.get("dialogs_hidden"):
+            print(f"[{label}] read-back after the disk round trip says the "
+                  f"policy did NOT persist ({state}) — not committing; "
+                  f"{img_name} is untouched.")
+            _shutdown(acct, label)
+            return False
+        _shutdown(acct, label)
+        before = target.stat().st_size
+        subprocess.run([qemu_bin("qemu-img"), "commit", "-f", "qcow2",
+                        str(d / "data.qcow2")], check=True, capture_output=True)
+        grew = (target.stat().st_size - before) // 1024
+        print(f"[{label}] {consent.baked_summary(counts, state)} — committed "
+              f"into {img_name} (+{grew} KB)")
+        return True
+    except Exception as e:      # noqa: BLE001 — report, never raise into a CLI
+        print(f"[{label}] consent bake failed ({type(e).__name__}: {e}); "
+              f"{img_name} is untouched.")
+        return False
+    finally:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def cmd_offset_consent(args):
+    """Bake the unattended-consent policy into offset image(s).
+
+        omnidroid offset consent arceusae
+        omnidroid offset consent --all
+
+    The same policy the engine applies on every boot (full disk access, the
+    install/overlay/storage app-ops, every dangerous runtime permission, and
+    `hide_error_dialogs`), written INTO the image so it is already true before
+    the first post-boot step runs — and true for anything else that boots the
+    image. Idempotent: re-running it re-asserts the same state.
     """
     ensure_qemu()
-    cfg = load_config()
+    cfg, tag, base = _offset_base(args)
+    offs = offsets_mod.offsets_of(base)
+    if not offs:
+        return fail("no_offset", f"base '{tag}' has no offsets to bake into")
+    if not getattr(args, "all", False) and not getattr(args, "name", None):
+        return fail("bad_args",
+                    f"name a version or pass --all. Known: {list(offs)}")
+    names = list(offs) if getattr(args, "all", False) else [args.name]
+    unknown = [n for n in names if n not in offs]
+    if unknown:
+        return fail("no_offset",
+                    f"no offset {unknown} on base '{tag}'. Known: {list(offs)}")
+    live = [a["name"] for a in all_accounts() if running_pid(a["name"])]
+    if live:
+        return fail("instance_running",
+                    f"stop running instances first: {', '.join(live)} "
+                    f"(the offset image would be open by a live QEMU)")
+    results = {}
+    for name in names:
+        img = offsets_mod.offset_data_image(base, name)
+        pkg = (offs[name].get("package")
+               or resolve_bake_package(None, tag, cfg) or ROBLOX_PACKAGE)
+        results[name] = bake_consent_into_offset(
+            cfg, tag, base, img, pkg, f"offset consent {name}")
+    ok = [n for n, v in results.items() if v]
+    bad = [n for n, v in results.items() if not v]
+    print(f"[offset consent] baked into: {', '.join(ok) or 'nothing'}"
+          + (f"  |  FAILED (untouched): {', '.join(bad)}" if bad else ""))
+    if getattr(args, "json", False):
+        emit_json({"ok": not bad, "base": tag, "baked": ok, "failed": bad})
+    if bad:
+        return fail("consent_bake_failed",
+                    f"the policy was not baked into: {', '.join(bad)}. Those "
+                    f"images are untouched; the boot-time policy still "
+                    f"applies to them at launch.")
+
+
+def _offset_base(args, cfg=None):
+    """(cfg, tag, base) for an `offset ...` subcommand, or exit with an
+    actionable error. Offsets are an arm /data concept; an x86 base is
+    refused by name rather than by a confusing missing-file error later."""
+    cfg = cfg or load_config()
     tag = getattr(args, "base", None) or effective_base_tag(cfg)
     base = (cfg.get("bases") or {}).get(tag)
     if not base:
-        return fail("no_base", f"no base '{tag}'")
+        fail("no_base", f"no base '{tag}'. Known: "
+                        f"{list((cfg.get('bases') or {}))}")
     if base_type(base) != BASE_TYPE_ARM:
-        return fail("arch_boundary",
-                    f"base '{tag}' is not arm; this command only knows the "
-                    f"arm /data layout")
-    pkg = resolve_bake_package(getattr(args, "package", None), tag, cfg)
-    if not pkg:
-        return fail("engine_error",
-                    "no game package: pass --package, or set base_game."
-                    f"{tag} in configs/paths.json")
-    apk = None
-    if getattr(args, "apk", None):
-        apk = Path(args.apk)
-        if not apk.exists():
-            return fail("engine_error", f"apk not found: {apk}")
-        try:
-            import zipfile
-            with zipfile.ZipFile(apk) as z:
-                if "AndroidManifest.xml" not in z.namelist():
-                    return fail("engine_error", f"{apk} is not an APK")
-        except zipfile.BadZipFile:
-            return fail("engine_error", f"{apk} is not a valid APK (bad zip)")
+        fail("arch_boundary",
+             f"base '{tag}' is {arch_of_base(base)}; offsets are an arm /data "
+             f"concept and only exist on arm-uefi bases")
+    return cfg, tag, base
+
+
+def _write_base_entry(tag, mutate):
+    """Re-read the RAW config, mutate one base entry, write it back.
+
+    Re-reads deliberately: `load_config()` hands back a NORMALIZED copy
+    (images_dir resolved to an absolute path, `_effective_base` injected), and
+    writing that back would bake this host's absolute image path into a config
+    the other platform also reads."""
+    raw = json.loads(CONFIG_PATH.read_text())
+    entry = raw.setdefault("bases", {}).setdefault(tag, {})
+    mutate(entry)
+    CONFIG_PATH.write_text(json.dumps(raw, indent=2))
+    return entry
+
+
+def cmd_offset_list(args):
+    """List every baked Roblox version on a base, marking the default."""
+    cfg, tag, base = _offset_base(args)
+    rows = offsets_mod.offset_rows(base, cfg["images_dir"])
+    if getattr(args, "json", False):
+        emit_json({"ok": True, "base": tag,
+                   "default": offsets_mod.default_offset_name(base),
+                   "offsets": rows})
+        return
+    if not rows:
+        print(f"base '{tag}' has NO Roblox baked — it is a clean base.\n"
+              f"Bake one:  omnidroid offset create <name> --apk <roblox.apk>")
+        return
+    print(f"offsets on base '{tag}'  (* = default, used by a bare "
+          f"`omnidroid start`)")
+    for r in rows:
+        ver = f" v{r['version_name']}" if r.get("version_name") else ""
+        size = f" {r['size_mb']} MB" if r.get("size_mb") is not None else ""
+        miss = "" if r.get("present", True) else "   [IMAGE MISSING]"
+        print(f" {'*' if r['default'] else ' '} {r['name']}{ver}"
+              f"   ({r['data']}{size}){miss}")
+        if r.get("apk"):
+            print(f"     from {r['apk']}"
+                  + (f"  package {r['package']}" if r.get("package") else ""))
+        if r.get("notes"):
+            print(f"     {r['notes']}")
+    if not offsets_mod.default_offset_name(base):
+        print("\nNO DEFAULT SET — a bare `omnidroid start` will refuse. "
+              "Set one: omnidroid offset default <name>")
+
+
+def cmd_offset_create(args):
+    """Bake a Roblox APK into a NEW named offset (or replace one by name).
+
+        omnidroid offset create 2.740.101 --apk ~/Downloads/roblox.apk
+        omnidroid offset create --apk build.apk           # name from the APK
+        omnidroid offset create test --apk build.apk --default
+
+    The base itself is NEVER modified: it keeps shipping its pristine, clean
+    /data, and this only adds a sibling overlay next to the other offsets.
+    """
+    ensure_qemu()
+    cfg, tag, base = _offset_base(args)
+    apk = Path(args.apk)
+    if not apk.exists():
+        return fail("bad_apk", f"apk not found: {apk}")
+    try:
+        import zipfile
+        with zipfile.ZipFile(apk) as z:
+            if "AndroidManifest.xml" not in z.namelist():
+                return fail("bad_apk", f"{apk} is not an APK")
+    except zipfile.BadZipFile:
+        return fail("bad_apk", f"{apk} is not a valid APK (bad zip)")
+
+    info = offsets_mod.apk_version_info(apk)
+    name = getattr(args, "name", None) or offsets_mod.suggest_offset_name(
+        apk, info)
+    if not name:
+        return fail("bad_offset_name",
+                    f"could not derive an offset name from {apk.name}; pass "
+                    f"one explicitly: `omnidroid offset create <name> --apk "
+                    f"{apk}`")
+    if not offsets_mod.valid_offset_name(name):
+        return fail("bad_offset_name",
+                    f"offset name must match [A-Za-z0-9][A-Za-z0-9._-]{{0,47}} "
+                    f"and cannot be '{offsets_mod.NO_OFFSET}' (got '{name}')")
+    existing = offsets_mod.offsets_of(base)
+    if name in existing and not getattr(args, "force", False):
+        return fail("offset_exists",
+                    f"offset '{name}' already exists on base '{tag}'. Re-bake "
+                    f"it with --force, or pick another name. (Offsets are "
+                    f"siblings — creating a new one never disturbs this one.)")
+    # The package is NOT read from the APK for the registration: a Roblox
+    # update never changes it, and making the bake depend on aapt2 fails hosts
+    # that have no Android SDK (see bases.resolve_bake_package). The manifest
+    # probe above is best-effort labelling only.
+    pkg = (getattr(args, "package", None) or info.get("package")
+           or resolve_bake_package(None, tag, cfg) or ROBLOX_PACKAGE)
     live = [a["name"] for a in all_accounts() if running_pid(a["name"])]
     if live:
         return fail("instance_running",
                     f"stop running instances first: {', '.join(live)}")
-    label = f"bake-data-game {tag}"
-    out = bake_data_game(cfg, tag, apk, pkg, label)
+
+    # Re-baking an existing offset REUSES its recorded image name rather than
+    # recomputing one. An offset baked under an older naming convention would
+    # otherwise get a second file on disk while the registry moved to the new
+    # name — leaving the old image orphaned and unreferenced.
+    out_name = (offsets_mod.offset_data_image(base, name) if name in existing
+                else offsets_mod.offset_image_name(name, base=base))
+    label = f"offset create {name}"
+    print(f"[{label}] baking {apk.name}"
+          + (f" (v{info['version_name']})" if info.get("version_name") else "")
+          + f" as offset '{name}' on base '{tag}' -> {out_name}")
+    out = bake_offset(cfg, tag, out_name, apk, pkg, label)
     if not out:
-        return fail("engine_error", "bake failed; see the log above")
-    # Point the base at the baked /data. data_bake_source() keeps the pristine
-    # image recorded, so the NEXT bake still starts from it.
-    raw = json.loads(CONFIG_PATH.read_text())
-    entry = raw.setdefault("bases", {}).setdefault(tag, {})
-    entry.setdefault("root_manifest", {}).setdefault(
-        "rooted_data", data_bake_source(base))
-    entry["data"] = ARM_GAME_DATA
-    entry["game_baked"] = {"package": pkg,
-                           "apk": apk.name if apk else None}
-    CONFIG_PATH.write_text(json.dumps(raw, indent=2))
-    print(f"[{label}] base '{tag}' now boots {ARM_GAME_DATA} "
-          f"(game {pkg}{', apk ' + apk.name if apk else ''})")
-    print(f"[{label}] to update the game later, just re-run this command with "
-          f"the new APK — no base rebuild.")
+        return fail("bake_failed", "bake failed; see the log above. Nothing "
+                                   "was registered and no other offset was "
+                                   "touched.")
+    make_default = bool(getattr(args, "default", False))
+
+    def _mutate(entry):
+        # The pristine /data is recorded (once) so every FUTURE bake still
+        # overlays it rather than this offset — the anti-chaining rule.
+        entry.setdefault("root_manifest", {}).setdefault(
+            "rooted_data", data_bake_source(base))
+        offsets_mod.register_offset(entry, name, {
+            "data": out_name, "package": pkg, "apk": apk.name,
+            "apk_path": str(apk.resolve()),
+            "version_name": info.get("version_name"),
+            "version_code": info.get("version_code"),
+            "created": int(time.time()),
+            "notes": getattr(args, "notes", None),
+        }, make_default=make_default)
+
+    entry = _write_base_entry(tag, _mutate)
+    is_default = entry.get("default_offset") == name
+    print(f"[{label}] offset '{name}' ready"
+          + ("  [DEFAULT — a bare `omnidroid start` now uses it]"
+             if is_default else
+             f"  (not default; switch with `omnidroid offset default {name}` "
+             f"or launch with `--offset {name}`)"))
     if getattr(args, "json", False):
-        emit_json({"ok": True, "base": tag, "data": ARM_GAME_DATA,
-                   "package": pkg, "apk": apk.name if apk else None})
+        emit_json({"ok": True, "base": tag, "offset": name,
+                   "data": out_name, "package": pkg, "apk": apk.name,
+                   "version_name": info.get("version_name"),
+                   "version_code": info.get("version_code"),
+                   "default": is_default})
+
+
+def cmd_offset_default(args):
+    """Mark one baked version as the default for bare launches."""
+    cfg, tag, base = _offset_base(args)
+    name = args.name
+    if name not in offsets_mod.offsets_of(base):
+        return fail("no_offset",
+                    f"no offset '{name}' on base '{tag}'. Baked: "
+                    f"{list(offsets_mod.offsets_of(base)) or 'none'}")
+    _write_base_entry(tag, lambda e: e.update({"default_offset": name}))
+    print(f"default offset for base '{tag}' is now '{name}' — a bare "
+          f"`omnidroid start <username>` boots it.")
+    if getattr(args, "json", False):
+        emit_json({"ok": True, "base": tag, "default": name})
+
+
+def cmd_offset_remove(args):
+    """Delete a baked version: its registry entry AND its overlay image.
+
+    Refuses while an instance booted from that offset is still running — the
+    qcow2 is open by QEMU, and deleting it out from under a live guest is a
+    corruption, not a cleanup."""
+    cfg, tag, base = _offset_base(args)
+    name = args.name
+    if name not in offsets_mod.offsets_of(base):
+        return fail("no_offset",
+                    f"no offset '{name}' on base '{tag}'. Baked: "
+                    f"{list(offsets_mod.offsets_of(base)) or 'none'}")
+    img = offsets_mod.offset_data_image(base, name)
+    live = [a["name"] for a in all_accounts()
+            if running_pid(a["name"])
+            and (a.get("offset") == name or a.get("data_image") == img)]
+    if live:
+        return fail("instance_running",
+                    f"offset '{name}' is in use by running instance(s): "
+                    f"{', '.join(live)}. Stop them first "
+                    f"(`omnidroid stop <name>`).")
+    removed = {}
+
+    def _mutate(entry):
+        removed["entry"] = offsets_mod.unregister_offset(entry, name)
+        removed["default"] = entry.get("default_offset")
+
+    _write_base_entry(tag, _mutate)
+    images = Path(cfg["images_dir"]).resolve()
+    path = (images / img).resolve()
+    deleted = False
+    # Structurally confined to images_dir: `img` comes out of a config file a
+    # human can edit, and an unlink() driven by an unchecked config value is
+    # how a cleanup command turns into an arbitrary delete.
+    if images not in path.parents or "/" in img or "\\" in img:
+        return fail("engine_error",
+                    f"refusing to delete '{img}': an offset image must be a "
+                    f"bare filename inside {images}")
+    if getattr(args, "keep_image", False):
+        print(f"kept the image: {path}")
+    elif path.exists():
+        path.unlink()
+        deleted = True
+        print(f"deleted {path}")
+    now_default = removed.get("default") or (
+        "UNSET (set one with `omnidroid offset default <name>`)")
+    print(f"offset '{name}' removed from base '{tag}'. "
+          f"Default is now {now_default}")
+    if getattr(args, "json", False):
+        emit_json({"ok": True, "base": tag, "removed": name,
+                   "image_deleted": deleted,
+                   "default": removed.get("default")})
+
+
+def cmd_offset_show(args):
+    """Everything recorded about one baked version."""
+    cfg, tag, base = _offset_base(args)
+    rows = {r["name"]: r for r in offsets_mod.offset_rows(base,
+                                                          cfg["images_dir"])}
+    name = args.name or offsets_mod.default_offset_name(base)
+    if not name or name not in rows:
+        return fail("no_offset",
+                    f"no offset '{name}' on base '{tag}'. Baked: "
+                    f"{list(rows) or 'none'}")
+    row = rows[name]
+    if getattr(args, "json", False):
+        emit_json({"ok": True, "base": tag, **row})
+        return
+    print(json.dumps(row, indent=2))
+
+
+def cmd_bake_data_game(args):
+    """DEPRECATED alias for `omnidroid offset create` (kept so existing
+    scripts and docs keep working).
+
+    It baked into ONE fixed slot and pointed the base at it, which is exactly
+    the "the base carries a Roblox version" model offsets replaced. Mapped
+    onto an offset named after the APK (or `--name`), promoted to default so
+    the old single-slot behaviour is preserved."""
+    print("[deprecated] `bake-data-game` is now `omnidroid offset create`. "
+          "Baking as an offset (the base stays clean).")
+    if not getattr(args, "apk", None):
+        return fail("bad_apk",
+                    "`bake-data-game` with no APK baked only the kiosk's "
+                    "game-package setting. That setting is now written on "
+                    "EVERY boot by assert_kiosk_game(), so there is nothing "
+                    "to bake — pass an APK to create an offset instead.")
+    args.name = getattr(args, "name", None)
+    args.default = True
+    args.force = True
+    return cmd_offset_create(args)
 
 
 def cmd_bake_game(args):
-    """Bake the game APK into an arm image as a pre-installed system app, so a
-    production instance ships with it and boots straight into it.
+    """Bake a game APK into an arm SYSTEM image, or (--remove) strip one out.
 
-    Build-machine command (needs e2fsprogs + ~6 GiB scratch), same shape as
-    brand-base. Point it at the branded production candidate:
+    LEGACY under the offsets model, and worth saying plainly: baking a game
+    into the 2.3 GB system image is what offsets replaced. A version baked
+    here needs a whole new base per Roblox update; a version baked as an
+    offset is a ~130 MB sibling overlay produced in ~2 minutes. Use
+    `omnidroid offset create` for versions.
 
-        omni bake-game roblox.apk --image ~/OmniImages/base_arm_branded.qcow2
+    What is still worth running is the INVERSE. The shipped arm base (v2) has
+    Roblox in /product/app/Roblox, so its system image is not truly clean:
+
+        omnidroid bake-game --remove            # strip it; base ships no game
+
+    Build-machine command either way (needs e2fsprogs + ~6 GiB scratch), same
+    shape as brand-base:
+
+        omnidroid bake-game roblox.apk --image ~/OmniImages/base_arm_branded.qcow2
     """
     cfg = load_config()
-    apk = Path(args.apk)
-    if not apk.exists():
-        return fail("engine_error", f"apk not found: {apk}")
+    remove = bool(getattr(args, "remove", False))
+    apk = None
+    if not remove:
+        if not getattr(args, "apk", None):
+            return fail("engine_error",
+                        "bake-game needs an APK (or --remove to strip the "
+                        "baked one out). For a new Roblox VERSION you almost "
+                        "certainly want `omnidroid offset create` instead.")
+        apk = Path(args.apk)
+        if not apk.exists():
+            return fail("engine_error", f"apk not found: {apk}")
     images = Path(cfg["images_dir"])
     tag = getattr(args, "base", None) or "arm"
     if getattr(args, "image", None):
@@ -2947,13 +3556,14 @@ def cmd_bake_game(args):
                     f"{'is' if len(live) == 1 else 'are'} running on it.")
 
     pkg = None
-    try:
-        import zipfile
-        with zipfile.ZipFile(apk) as z:
-            if "AndroidManifest.xml" not in z.namelist():
-                return fail("engine_error", f"{apk} is not an APK")
-    except zipfile.BadZipFile:
-        return fail("engine_error", f"{apk} is not a valid zip")
+    if not remove:
+        try:
+            import zipfile
+            with zipfile.ZipFile(apk) as z:
+                if "AndroidManifest.xml" not in z.namelist():
+                    return fail("engine_error", f"{apk} is not an APK")
+        except zipfile.BadZipFile:
+            return fail("engine_error", f"{apk} is not a valid zip")
 
     import tempfile
     work = Path(tempfile.mkdtemp(prefix="omni-bake-", dir=str(images)))
@@ -2971,10 +3581,24 @@ def cmd_bake_game(args):
             return fail("engine_error",
                         f"could not locate the '{BOOTANIM_FS}' filesystem")
         fs_off, _fs_size = found
-        name = getattr(args, "name", None) or "OmniGame"
-        err = _bake_apk_into_product(str(raw), fs_off, str(apk), name, label)
-        if err:
-            return fail("engine_error", err)
+        if remove and not getattr(args, "name", None):
+            # No explicit dir: strip EVERY Roblox app dir. The base can carry
+            # more than one (e.g. Roblox + ArceusRoblox); leaving any behind
+            # keeps com.roblox.client present and breaks re-signed offset bakes.
+            targets = _product_roblox_dirs(str(raw), fs_off) or ["Roblox"]
+            for t in targets:
+                err = _remove_apk_from_product(str(raw), fs_off, t, label)
+                if err:
+                    return fail("engine_error", err)
+            name = ", ".join(targets)
+        else:
+            name = getattr(args, "name", None) or ("Roblox" if remove
+                                                   else "OmniGame")
+            err = (_remove_apk_from_product(str(raw), fs_off, name, label)
+                   if remove else
+                   _bake_apk_into_product(str(raw), fs_off, str(apk), name, label))
+            if err:
+                return fail("engine_error", err)
         if not _fsck_ok(str(raw), fs_off, label):
             return fail("engine_error",
                         "refusing to emit an image whose product filesystem is "
@@ -2990,9 +3614,13 @@ def cmd_bake_game(args):
             print(f"[{label}] backed up -> {bak.name}")
         shutil.move(str(staged), str(disk))
         print(f"[{label}] wrote {disk}")
-        result = {"ok": True, "image": str(disk), "apk": str(apk),
+        result = {"ok": True, "image": str(disk),
+                  "apk": None if remove else str(apk), "removed": remove,
                   "app_dir": f"/product/app/{name}", "package": pkg,
-                  "note": ("Boot a FRESH account on this image: the game should "
+                  "note": ("This system image now ships NO game — every "
+                           "Roblox version comes from an offset "
+                           "(`omnidroid offset list`)." if remove else
+                           "Boot a FRESH account on this image: the game should "
                            "already be installed, with no adb install.")}
         if getattr(args, "json", False):
             emit_json(result)
@@ -3099,7 +3727,7 @@ def cmd_brand_base(args):
             fail("instance_running",
                  f"cannot rewrite {disk.name} in place: "
                  f"{', '.join(live)} {'is' if len(live) == 1 else 'are'} "
-                 f"running on it. Stop it first (omni stop {live[0]}), or drop "
+                 f"running on it. Stop it first (omnidroid stop {live[0]}), or drop "
                  f"--in-place to write a new image alongside.")
     out = Path(getattr(args, "out", None) or
                (disk if in_place else disk.with_name(
@@ -3343,13 +3971,13 @@ def root_base(cfg, tag=None, frida_version=DEFAULT_FRIDA_VERSION,
         # its initrd ramdisk into base_x86_rooted.initrd.img (auto-registered
         # when present) — a distinct, host-arch-specific build step. The devkit
         # (frida + omni-* tools) is arch-generic and already builds for x86 via
-        # `omni build-devkit --arch x86`; only the rooted initrd is x86-only.
+        # `omnidroid build-devkit --arch x86`; only the rooted initrd is x86-only.
         fail("arch_boundary",
              f"root-base's boot-patch flow is arm-uefi only; '{tag}' is "
              f"{arch_of_base(base)}. For x86, produce base_x86_rooted.initrd.img "
              f"by Magisk-patching the Bliss initrd on an x86 host; it is picked "
              f"up automatically. (The x86 devkit already builds with "
-             f"`omni build-devkit --arch x86`.)")
+             f"`omnidroid build-devkit --arch x86`.)")
     images = Path(cfg["images_dir"])
     prod_system = images / base["system"]
     if not prod_system.exists():
@@ -3390,9 +4018,9 @@ def root_base(cfg, tag=None, frida_version=DEFAULT_FRIDA_VERSION,
             print(f"[{label}] boot patch OK, but the pre-granted rooted /data "
                   f"could not be produced (the MagiskSU Grant needs the Magisk "
                   f"manager app installed to show its dialog). Base left "
-                  f"UNROOTED. Fix: `omni build-devkit --arch arm` so "
+                  f"UNROOTED. Fix: `omnidroid build-devkit --arch arm` so "
                   f"omni-magisk-setup can install the app, then re-run "
-                  f"`omni root-base`. {ARM_ROOTED_SYSTEM} is kept for reuse.")
+                  f"`omnidroid root-base`. {ARM_ROOTED_SYSTEM} is kept for reuse.")
             return None
 
         # Re-register the base as rooted, pointing at the rooted matched pair.
@@ -3416,7 +4044,7 @@ def root_base(cfg, tag=None, frida_version=DEFAULT_FRIDA_VERSION,
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
         print(f"[{label}] DONE. Base '{tag}' is now ROOTED (dual-use). "
               f"current_base UNCHANGED ('{raw.get('current_base')}'). VERIFY on "
-              f"a real boot: `omni start <name>` then `omni adb <name> -- shell "
+              f"a real boot: `omnidroid start <name>` then `omnidroid adb <name> -- shell "
               f"/debug_ramdisk/su 0 id` should show uid=0.")
         return rooted_system
     finally:
@@ -3676,7 +4304,7 @@ def cmd_measure(args):
     if not names:
         return fail("no_instance",
                     "no running instances to measure. Start one first: "
-                    "`omni start <name> --mode farming`")
+                    "`omnidroid start <name> --mode farming`")
     n_samples = max(1, getattr(args, "samples", 8))
     interval = max(1, getattr(args, "interval", 5))
 
@@ -3775,7 +4403,7 @@ def cmd_measure(args):
                   "Treat the 50+-instance target as a Linux number."
                   if IS_MACOS else
                   "Linux/KVM: balloon + free-page-reporting decommit for real; "
-                  "enable KSM (`omni ksm --on`) to dedup identical guest pages "
+                  "enable KSM (`omnidroid ksm --on`) to dedup identical guest pages "
                   "across instances on top of this.")}
     if getattr(args, "json", False):
         emit_json(result)
@@ -3834,7 +4462,7 @@ def _ksm_summary(rows):
     if not stats.get("run"):
         return {"available": True, "running": False,
                 "why": "KSM is present but OFF - turn it on with "
-                       "`omni ksm --on`. Until then every instance keeps its "
+                       "`omnidroid ksm --on`. Until then every instance keeps its "
                        "own copy of identical guest pages."}
     merged = [r["ksm_merged_mb"] for r in rows if r.get("ksm_merged_mb")]
     return {"available": True, "running": True,
@@ -4207,7 +4835,7 @@ def cmd_strip_base(args):
                     f"base '{tag}' is {arch_of_base(base)}; strip-base only "
                     f"knows the arm (super/logical-partition) layout. The x86 "
                     f"base carries its properties in its own build tree — "
-                    f"bake them there and rebuild with `omni rebuild-base`.")
+                    f"bake them there and rebuild with `omnidroid rebuild-base`.")
     images = Path(cfg["images_dir"])
     disk, why = _brand_target(cfg, base, images)
     if not disk.exists():
@@ -4227,7 +4855,7 @@ def cmd_strip_base(args):
                         f"cannot rewrite {disk.name} in place: "
                         f"{', '.join(live)} "
                         f"{'is' if len(live) == 1 else 'are'} running on it. "
-                        f"Stop it first (omni stop {live[0]}), or drop "
+                        f"Stop it first (omnidroid stop {live[0]}), or drop "
                         f"--in-place to write a new image alongside.")
     out = Path(getattr(args, "out", None) or
                (disk if in_place else
@@ -4338,9 +4966,17 @@ def cmd_version(args):
     for tag in [raw.get("current_base")] + list(bases):
         if tag in bases:
             by_arch.setdefault(arch_of_base(bases[tag]), tag)
+    # Roblox versions, per base. A client (omni-executor, omni-agent) needs
+    # this to offer a version picker and to know whether a bare launch will
+    # even resolve — an engine with no default offset refuses `start`.
+    offs = {tag: {"default": offsets_mod.default_offset_name(b),
+                  "available": list(offsets_mod.offsets_of(b))}
+            for tag, b in bases.items()
+            if base_type(b) == BASE_TYPE_ARM}
     rep = {"engine": "omnidroid", "contract": CONTRACT_VERSION,
            "arch_aware": True, "host_arch": host_arch_token(),
            "bases": by_arch, "current_base": raw.get("current_base"),
+           "offsets": offs,
            # Advertise millisecond-precise VNC capture so a client can prefer
            # it over adb-screencap polling and fall back cleanly on old engines
            # (omni-agent reads capabilities.capture; see _emulator_capture_contract).
@@ -4354,6 +4990,27 @@ def cmd_version(args):
                    "options": ["package", "duration", "sample-scale-w",
                                "change-percent", "black-threshold",
                                "auto", "max-seconds", "max-keyframes"],
+               },
+               # Many baked Roblox versions on one clean base; the base ships
+               # no game. `start --offset <name>` picks one per launch.
+               "offsets": {
+                   "supported": True,
+                   "clean_base": True,
+                   "per_account": False,
+                   "commands": ["offset list", "offset create",
+                                "offset default", "offset remove",
+                                "offset show"],
+               },
+               # Everything an AI/dev needs for high-level debugging without
+               # shelling around the engine.
+               "debug": {
+                   "su": True,            # `omnidroid su <name> -- <cmd>`
+                   "frida": True,         # `omnidroid frida <name> --start`
+                   "screenshot": True,
+                   "logcat": True,
+                   "apk_install": True,   # `start --apk` / `install`
+                   "devkit_boot": True,   # `start --debug`
+                   "info": True,          # `omnidroid debug-info <name>`
                },
            },
            # DERIVED from the parser, never hand-listed. The literal that used
@@ -4380,6 +5037,9 @@ def cmd_bases(args):
         bases = [{"tag": tag, "arch": arch_of_base(b), "type": base_type(b),
                   "game_package": raw.get("base_game", {}).get(tag),
                   "rooted": base_is_rooted(b),
+                  # A base ships NO game now — the versions live in offsets.
+                  "offsets": list(offsets_mod.offsets_of(b)),
+                  "default_offset": offsets_mod.default_offset_name(b),
                   "notes": b.get("notes", "")}
                  for tag, b in listed.items()]
         emit_json({"current_base": cur, "bases": bases, "ok": True})
@@ -4389,6 +5049,8 @@ def cmd_bases(args):
         mark = " *" if tag == cur else "  "
         print(f"{mark}{tag}: {b.get('notes','')}  [{arch_of_base(b)}]"
               + (f"  [game: {game}]" if game else ""))
+        if base_type(b) == BASE_TYPE_ARM:
+            print(f"     roblox: {offsets_mod.offsets_summary(b)}")
     print(f"\ncurrent (default for new accounts): {cur}")
 
 
@@ -4430,7 +5092,7 @@ def install_readiness():
     if arm:
         template_ready = True
     else:
-        template = raw.get("data_template", "data-template-8g.qcow2")
+        template = raw.get("data_template", X86_DATA_TEMPLATE)
         template_ready = (images / template).exists()
         if not template_ready:
             missing.append(str(images / template))
@@ -4448,6 +5110,13 @@ def install_readiness():
            "base_ready": base_ready,
            "data_template_ready": template_ready,
            "missing_files": missing,
+           # A base that boots is not the same as a base that can LAUNCH: the
+           # base ships no Roblox, so a bare `start` also needs a default
+           # offset. Reported separately so doctor names the right fix.
+           "offsets": (offsets_mod.offset_rows(bases[tag], images)
+                       if arm else []),
+           "default_offset": (offsets_mod.default_offset_name(bases[tag])
+                              if arm else None),
            "qemu_present": qemu_ok,
            "qemu": qemu_bin(qemu_system_name()) if qemu_ok else None,
            "adb_present": adb_ok,
@@ -4461,6 +5130,17 @@ def install_readiness():
         rep["adb_hint"] = ("adb not on PATH - install Android "
                            "platform-tools (Linux: sudo apt install "
                            "android-tools-adb)")
+    # NOT folded into `ready`: a deployment with no offset is correctly
+    # installed and can boot, run adb, take screenshots and test an --apk
+    # build. It just cannot do a bare `start` yet, so it gets a hint rather
+    # than a failed doctor.
+    if arm and base_ready and not rep["default_offset"]:
+        rep["offset_hint"] = (
+            "no default Roblox version baked - a bare `omnidroid start "
+            "<username>` will refuse. Bake one: `omnidroid offset create "
+            "<name> --apk <roblox.apk>`"
+            + ("  (offsets exist but none is default: `omnidroid offset "
+               "default <name>`)" if rep["offsets"] else ""))
     return rep
 
 
@@ -4636,7 +5316,11 @@ def cmd_bench_ksm(args):
             print(f"[bench] {name} already running (kept from a prior run) "
                   f"- skipping this slot")
             continue
-        acct = build_acct(name, cfg, debug=False)
+        # `--apk` supplies the build, so a clean base is fine there; otherwise
+        # the bench measures whatever the default offset has baked.
+        acct = build_acct(name, cfg, debug=False,
+                          offset=getattr(args, "offset", None),
+                          allow_no_offset=bool(getattr(args, "apk", None)))
         pkg = acct.get("game_package")
         mode = resolve_mode(cfg, args.mode)
         spawn_qemu(acct, cfg, interactive=False, mode=mode)
@@ -4701,6 +5385,7 @@ def account_status(a, stats=False):
            "adb_port": adb_port, "qmp_port": a.get("qmp_port"),
            "vnc_port": a.get("vnc_port"), "vnc_host": "127.0.0.1",
            "adb_serial": f"127.0.0.1:{adb_port}" if adb_port else None,
+           "offset": a.get("offset"), "debug": bool(a.get("debug")),
            "game_package": a.get("game_package")}
     if pid:
         try:
@@ -4708,6 +5393,7 @@ def account_status(a, stats=False):
                               "run.json").read_text())
             rec["mode"] = run.get("mode")
             rec["started"] = run.get("started")
+            rec["offset"] = run.get("offset")
         except Exception:
             pass
     if pid and stats:
@@ -4745,6 +5431,12 @@ def cmd_list(args):
         line = (f"{rec['name']:<16} base {rec['base']}  "
                 f"adb {rec['adb_port'] or '?'}  qmp {rec['qmp_port'] or '?'}  "
                 f"vnc {rec['vnc_port'] or '?'}  {state}")
+        if rec["running"]:
+            line += f"  roblox {rec.get('offset') or 'none'}"
+            if rec.get("mode"):
+                line += f"  mode {rec['mode']}"
+            if rec.get("debug"):
+                line += "  [debug]"
         if rec["running"] and args.stats:
             if rec.get("host_rss_mb"):
                 line += f"  host-rss {rec['host_rss_mb']} MB"
@@ -4814,8 +5506,8 @@ def _install_block_reason(out):
 
 def _install_apk(acct, apk_path, label, abi=None, no_abi_pin=False):
     """Shared install core: ABI-safe `adb install` + the reused-instance
-    pin/sig auto-recovery. Used by both `omni install` (cmd_install) and
-    `omni start --apk` (cmd_start's dev-apk path). Returns a result dict; it
+    pin/sig auto-recovery. Used by both `omnidroid install` (cmd_install) and
+    `omnidroid start --apk` (cmd_start's dev-apk path). Returns a result dict; it
     never calls fail() / sys.exit -- callers decide how to surface an error
     (cmd_install turns a failure into fail("install_failed", ...); cmd_start
     turns it into an `apk_install_failed` JSON result + sys.exit(1))."""
@@ -5114,10 +5806,12 @@ def cmd_view(args):
     if not running_pid(args.name):
         if not args.start:
             sys.exit(f"error: '{args.name}' is not running. Start it first "
-                     f"(omni start {args.name}) or: omni view {args.name} "
+                     f"(omnidroid start {args.name}) or: omnidroid view {args.name} "
                      f"--start")
         debug = bool(getattr(args, "debug", False))
-        acct = build_acct(args.name, cfg, debug=debug)
+        acct = build_acct(args.name, cfg, debug=debug,
+                          offset=getattr(args, "offset", None),
+                          label=f"view {args.name}")
         spawn_qemu(acct, cfg, interactive=False, debug=debug,
                    mode=resolve_mode(cfg, args.mode))
         started = True
@@ -5372,7 +6066,7 @@ def cmd_capture(args):
         return fail("debug_boot_required",
                     f"auto screenshots are a debug feature; instance "
                     f"'{args.name}' was not booted with --debug. Restart it "
-                    f"with `omni start {args.name} --debug` to use --auto.")
+                    f"with `omnidroid start {args.name} --debug` to use --auto.")
     vnc_port = acct.get("vnc_port")
     if not vnc_port:
         return fail("engine_error", f"account '{args.name}' has no vnc_port")
@@ -5522,7 +6216,7 @@ def cmd_capture(args):
 # and is stopped on power-off (cmd_stop / cmd_remove). It writes to
 # $OMNI_AUTOCAP_DIR when set (omni-agent points that at its /workspace), else
 # runtime/<name>/autocap. `ensure_autocap` is idempotent — booting, resuming,
-# or an explicit `omni autocap --ensure` never stacks a second recorder — so the
+# or an explicit `omnidroid autocap --ensure` never stacks a second recorder — so the
 # same feed is guaranteed on whenever a dev instance is up.
 AUTOCAP_MAX_KEYFRAMES = 5000            # long always-on session, not a 20s window
 _AUTOCAP_STATE_FILE = "autocap.json"    # in runtime_dir: {pid, out_dir, package}
@@ -5705,7 +6399,7 @@ def cmd_autocap(args):
 def cmd_test_apk(args):
     """One-shot APK-swap harness: ensure a FRESH session, install the given
     APK, let the kiosk launch it, and report machine-readable JSON. Works on any
-    base. Headless by default. After this, drive with: omni screenshot / logcat
+    base. Headless by default. After this, drive with: omnidroid screenshot / logcat
     / adb.
 
     Emits a single JSON line: {account, adb_port, qmp_port, package,
@@ -5809,7 +6503,7 @@ def cmd_watch(args):
     pkg = args.package or acct.get("game_package")
     if not pkg:
         sys.exit("error: no game package known; pass --package or "
-                 "run 'omni install' first")
+                 "run 'omnidroid install' first")
     grace = args.grace
     label = f"watch {args.name}"
     print(f"[{label}] pkg={pkg} grace={grace}s poll={WATCH_POLL_SECS}s")
@@ -5891,7 +6585,7 @@ def cmd_dev_ui(args):
         if not mpkg:
             out = {"ok": False, "error": "magisk_not_found", "diag": diag,
                    "message": ("Could not find the Magisk manager app. List packages to see its "
-                               f"name: omni adb {args.name} -- shell pm list packages | grep -i magisk "
+                               f"name: omnidroid adb {args.name} -- shell pm list packages | grep -i magisk "
                                "(if hidden/repackaged it has a random name).")}
             print(out["message"])
         else:
@@ -5918,7 +6612,7 @@ def cmd_dev_ui(args):
                    "message": (f"Tried to open Magisk ({mpkg}) via {'root' if su else 'shell'}. "
                                f"If it still didn't appear, the kiosk Lock Task is holding the "
                                f"foreground — paste this --json diag. "
-                               f"Back to kiosk: omni dev-ui {args.name} --show kiosk")}
+                               f"Back to kiosk: omnidroid dev-ui {args.name} --show kiosk")}
             print(out["message"])
     else:
         res = _assert_kiosk_foreground(acct, f"dev-ui {args.name}")
@@ -5961,6 +6655,13 @@ KIOSK_ACTION_CLEAR_SESSION = "com.omni.kiosk.CLEAR_SESSION"
 # feature (voice chat, camera) cannot introduce a new prompt into a flow that is
 # supposed to have none. Granting a permission the build does not declare is a
 # harmless no-op error.
+#
+# A NARROWER, EARLIER-BOUND copy of what apply_consent now does for every
+# package from its own manifest (consent.py). Kept because it belongs to the
+# session flow rather than to the boot: it re-asserts the three that matter for
+# a login/join immediately before launching the game, without depending on the
+# boot step having run. Add new blanket grants to consent.APP_OPS/the manifest
+# sweep, not here.
 ROBLOX_RUNTIME_PERMS = (
     "android.permission.POST_NOTIFICATIONS",
     "android.permission.RECORD_AUDIO",
@@ -5986,7 +6687,7 @@ def account_cookie(username):
 def resolve_token(args):
     """The cookie to log in with, in priority order:
 
-    1. the instance name IS a saved account username (`omni start <username>`) —
+    1. the instance name IS a saved account username (`omnidroid start <username>`) —
        the normal path; no flag needed;
     2. an explicit --token-file / --token-stdin / --token (manual override).
 
@@ -6110,7 +6811,7 @@ def deliver_session(acct, label, sess, play=True, restart=True):
         return {"delivered": False, "reason": "kiosk_missing",
                 "detail": f"{KIOSK_PACKAGE} is not installed on '{name}'; "
                           f"the session/auto-join feature needs it "
-                          f"(omni kioskify {name})"}
+                          f"(omnidroid kioskify {name})"}
     # Answer Android's runtime-permission prompts before they can appear. On
     # Android 13+ Roblox asks for POST_NOTIFICATIONS on first run and parks an
     # "Allow Roblox to send you notifications?" dialog ON TOP of the game — a
@@ -6297,7 +6998,7 @@ def enable_zram(acct, mode=None, label=None):
                                    f"shell by SELinux)")
                   + f". Instance keeps the higher memory cap. For production, "
                     f"bake {prop}={val} into the base: "
-                    f"`omni enable-zram-base`.")
+                    f"`omnidroid enable-zram-base`.")
     return ok
 
 
@@ -6334,19 +7035,127 @@ def apply_roblox_settings(acct, label=None, settings=None):
             timeout=20)
     ok = "DFIntTaskSchedulerTargetFps" in (r.stdout or "")
     if label:
-        # Describe the profile that was actually installed. The old line
-        # hardcoded the farming description, so a gaming boot -- which opens
-        # the tick cap up rather than clamping it -- reported "fps cap +
-        # lowest quality; ~2x less host CPU" while doing the opposite.
-        fps = (settings or lean.CLIENT_APP_SETTINGS).get(
-            "DFIntTaskSchedulerTargetFps")
-        detail = (f"tick target {fps} fps, low render cost"
-                  if settings is lean.GAMING_APP_SETTINGS
-                  else f"fps cap {fps} + lowest quality; ~2x less host CPU")
+        # Describe the profile that was actually installed, DERIVED from the
+        # dict rather than from which constant it happens to be. The original
+        # line hardcoded the farming description, so a gaming boot -- which
+        # opens the tick cap up rather than clamping it -- reported "fps cap +
+        # lowest quality; ~2x less host CPU" while doing the opposite; keying
+        # off object identity then made a third profile silently misreport too.
+        eff = settings or lean.CLIENT_APP_SETTINGS
+        fps = eff.get("DFIntTaskSchedulerTargetFps")
+        qlvl = eff.get("DFIntDebugFRMQualityLevelOverride")
+        fx = "post-FX on" if eff.get("FFlagDisablePostFx") is False \
+            else "post-FX off"
+        detail = (f"tick target {fps} fps, quality level {qlvl}, {fx}"
+                  if fps and fps > 30
+                  else f"fps cap {fps} + quality level {qlvl}; "
+                       f"~2x less host CPU")
         print(f"[{label}] roblox settings: "
               + (f"applied ({detail})" if ok
                  else "write did NOT land - instance runs uncapped"))
     return ok
+
+
+def apply_awake(acct, label=None):
+    """Make the instance incapable of sleeping or blanking from inactivity.
+
+    EVERY boot, EVERY mode, no opt-in — a blanked farming instance stops
+    rendering (and stops earning) unnoticed, and a blanked playable one is a
+    black VNC window. `omnidroid/awake.py` carries the reasoning and the
+    measurements; the short version is that Android's sleep ladder has six
+    independent rungs and disabling only the famous one leaves the other five
+    to blank the screen anyway.
+
+    Verified from `dumpsys power`, NEVER from `settings get`: the setting is
+    not the effective value. A live arm instance reported
+    `screen_off_timeout = -1` while PowerManagerService clamped it up to a TEN
+    SECOND blank, so reading the setting back would have reported a satisfied
+    guarantee on an instance that was ten seconds from going black.
+
+    Returns True iff the guest's own dump says it can no longer blank.
+    """
+    if not awake.awake_enabled(os.environ):
+        if label:
+            print(f"[{label}] awake: SKIPPED ({awake.NO_AWAKE_ENV} is set) — "
+                  f"Android's own power management is left alone and this "
+                  f"instance CAN blank from inactivity")
+        return False
+    su = resolve_su(acct)
+    try:
+        for step in awake.build_awake_sequence(su):
+            adb(acct, *step, timeout=30)
+        r = adb(acct, *awake.build_state_probe(), timeout=30)
+    except Exception as e:      # noqa: BLE001 — never a boot blocker
+        if label:
+            print(f"[{label}] awake: NOT applied ({type(e).__name__}: {e}) — "
+                  f"this instance can blank from inactivity")
+        return False
+    dump = (r.stdout or "") + (r.stderr or "")
+    guaranteed = awake.never_blanks(dump)
+    st = awake.parse_power_state(dump)
+    if label:
+        # Report the READING, and name the one step root buys — an unreported
+        # skip of a 0220 root:system write looks exactly like success.
+        timeout_s = (st["screen_off_timeout_ms"] or 0) // 1000
+        detail = (f"wakefulness={st['wakefulness'] or '?'}, "
+                  f"screen-off timeout {timeout_s}s"
+                  + ("" if su else
+                     f" (no root: {awake.root_only_steps()[0]} SKIPPED)"))
+        print(f"[{label}] awake: "
+              + (f"never blanks — {detail}" if guaranteed
+                 else f"NOT guaranteed — {detail}"))
+    return guaranteed
+
+
+def apply_consent(acct, cfg=None, label=None):
+    """Grant what would otherwise need a tap, and silence the error dialogs.
+
+    Runs on EVERY boot, production included, for the same reason _enforce_hiding
+    does: it is per-/data state, so an offset baked before this feature existed
+    (or a `--apk` one-off, which installs into a throwaway instance) has none of
+    it, and a policy that only new images get is a policy that mostly is not on.
+
+    Needs no root — see consent.py. Never fails a boot: an instance that lost
+    adb mid-sequence is reported, not raised.
+    """
+    if not consent.consent_enabled(os.environ):
+        if label:
+            print(f"[{label}] consent: SKIPPED "
+                  f"({consent.NO_CONSENT_ENV} is set) — permission prompts "
+                  f"and ANR/crash dialogs will appear as the platform sends "
+                  f"them")
+        return False
+    game = resolve_game_package(acct, cfg)
+    out = ""
+    try:
+        for step in consent.build_consent_sequence(game):
+            r = adb(acct, *step, timeout=120)
+            out += (r.stdout or "") + (r.stderr or "")
+    except Exception as e:      # noqa: BLE001 — an add-on, never a boot blocker
+        if label:
+            print(f"[{label}] consent: NOT applied "
+                  f"({type(e).__name__}: {e})")
+        return False
+    if not consent.applied_ok(out):
+        if label:
+            print(f"[{label}] consent: the guest did not confirm — permission "
+                  f"prompts and error dialogs may still appear. "
+                  f"guest said: {out.strip()[-200:] or '<nothing>'}")
+        return False
+    counts = consent.parse_counts(out)
+    # Read the state BACK rather than trusting the commands that were sent:
+    # `appops set` on a package that does not exist exits 0 and does nothing.
+    state = {"dialogs_hidden": True, "full_disk": False, "install_unknown": False}
+    if game:
+        try:
+            r = adb(acct, *consent.build_consent_probe(game), timeout=30)
+            state = consent.parse_consent_state((r.stdout or "")
+                                                + (r.stderr or ""))
+        except Exception:       # noqa: BLE001 — probe failure is not a failure
+            pass
+    if label:
+        print(f"[{label}] {consent.summary_line(counts, state)}")
+    return state.get("dialogs_hidden", False)
 
 
 def apply_balloon_target(acct, mode, label=None):
@@ -6415,20 +7224,135 @@ def apply_balloon_target(acct, mode, label=None):
     return actual_mb
 
 
+RESTORE_TIMEOUT = 30       # a healthy warm restore is seconds, not minutes
+_QEMU_VERSION_CACHE = {}
+
+
+def _halt_qemu(acct):
+    """Kill this instance's QEMU immediately. NOT _shutdown().
+
+    _shutdown() tries a graceful in-guest power-off first, which cannot work
+    on a guest that is PAUSED (the bake stops the VM before migrating) and
+    would burn its 90 s timeout on every bake. Both callers here -- the
+    post-bake handoff and the poisoned-entry fallback -- want the process
+    gone now, and neither has any in-guest state worth preserving.
+    """
+    from omnidroid.qemu_proc import qmp
+    name = acct["name"]
+    pid = running_pid(name)
+    qmp(acct, "quit")
+    time.sleep(1)
+    if pid and pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    # run.json is deliberately left alone: the next spawn_qemu overwrites it,
+    # and wiping it here would strip the port reservation this instance still
+    # owns for the restore that follows.
+
+
+def _qemu_version(tool):
+    """First line of `<tool> --version`, cached. Part of the cache key: the
+    migration stream format is tied to the QEMU build that wrote it."""
+    if tool not in _QEMU_VERSION_CACHE:
+        try:
+            out = subprocess.run([qemu_bin(tool), "--version"],
+                                 capture_output=True, text=True,
+                                 timeout=20).stdout.splitlines()
+            _QEMU_VERSION_CACHE[tool] = out[0].strip() if out else ""
+        except Exception:      # noqa: BLE001 - unknown version = no cache
+            _QEMU_VERSION_CACHE[tool] = ""
+    return _QEMU_VERSION_CACHE[tool]
+
+
+def _warm_cache_allowed(debug, in_use, key, no_warm=False):
+    """May THIS launch use the warm cache?
+
+    False for a debug boot (the devkit vdc disk changes device topology, so a
+    restore would not match), for an unknown key, for an entry already
+    backing a running instance -- the second concurrent restore comes up alive
+    but `offline` on adb (design spec 8b) -- and for `no_warm` (the
+    --no-warm / OMNI_NO_WARM=1 kill switch). This is the ONE decision point
+    both restore and bake are gated through, so the kill switch and every
+    other refusal reason only need to be encoded once. Refusing costs one
+    cold boot.
+    """
+    if debug or not key or no_warm:
+        return False
+    return key not in in_use
+
+
+def _stage_bake_overlays(acct, cfg, rd):
+    """Writable COW overlays for a BAKE boot, plus a fresh efivars.
+
+    A bake must persist its freeze point, so it cannot use the shared
+    templates opened snapshot=on the way a normal ephemeral boot does.
+    """
+    base = cfg["bases"][acct["base"]]
+    images = Path(images_dir(cfg))
+    rd.mkdir(parents=True, exist_ok=True)
+    pairs = ((images / base["system"], rd / "bake_system.qcow2"),
+             (images / (acct.get("data_image") or base["data"]),
+              rd / "bake_data.qcow2"))
+    for backing, overlay in pairs:
+        overlay.unlink(missing_ok=True)
+        subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2",
+                        "-b", str(backing), str(overlay)],
+                       check=True, capture_output=True)
+    # efivars/pflash is a UEFI concept: only the arm base boots through EDK2
+    # firmware. x86 boots by direct kernel/initrd and has no efivars file at
+    # all. Staging one unconditionally (as this used to, defaulting to
+    # ARM_BASE_EFIVARS when the base has no "efivars" key) either raised on
+    # an x86-only host -- caught by the caller, want_bake silently went False
+    # forever -- or, on a host that ALSO has an arm base, quietly copied that
+    # UNRELATED arm base's UEFI blob into this x86 runtime dir and then into
+    # the entry warmboot.bake_entry() produces. See _ensure_booted, which
+    # already refuses to key/restore/bake a non-arm base for the same reason.
+    if base_type(base) == BASE_TYPE_ARM:
+        shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
+                        rd / "efivars.fd")
+
+
 def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
-                   mem=None, balloon=None, debug=None):
+                   mem=None, balloon=None, debug=None, smp=None, quality=None,
+                   no_warm=None, _no_rebake=False):
     """Boot the instance if it isn't up, and block until Android is ready.
     Returns (ok, first_boot). `debug` (per-boot) attaches the devkit disk;
-    default None means fall back to the account handle's own `debug` flag."""
+    default None means fall back to the account handle's own `debug` flag.
+    `no_warm` (per-boot) disables the warm-restore cache; default None means
+    fall back to the OMNI_NO_WARM=1 kill switch (cmd_start resolves --no-warm
+    itself and passes the result down). `quality` overrides the mode's own
+    ClientAppSettings profile."""
     if debug is None:
         debug = bool(acct.get("debug"))
+    if no_warm is None:
+        no_warm = _no_warm_requested()
     first = not acct.get("first_boot_done")
     # Resolved ONCE and reused for the spawn, the squeeze, and the balloon.
     # Previously the spawn called resolve_mode() inline and dropped `mem`
-    # entirely, so `omni start --mem 2048` silently booted at the mode's own
+    # entirely, so `omnidroid start --mem 2048` silently booted at the mode's own
     # size — a 512 MB farming boot that never reached adbd, reported as a
     # boot timeout with no hint that the flag had been ignored.
-    mode = resolve_mode(cfg, mode_name, mem=mem, balloon=balloon)
+    mode = resolve_mode(cfg, mode_name, mem=mem, balloon=balloon, smp=smp)
+    if mode.get("profile") == "performance":
+        print(f"[{label}] mode {mode['name']}: {mode['mem']} MB / "
+              f"{mode['smp']} vCPU, quality {quality or mode.get('quality')}, "
+              f"no balloon"
+              + (" (sized to this host)" if mode.get("autoscale") else ""))
+    # Set in the cold-boot branch below when this launch staged a bake;
+    # left False here so the shared wait/tail code after the if/else (taken
+    # also when the instance was already up) has a safe default to test.
+    want_bake = False
+    # True only once a warm restore has both completed AND Android has
+    # finished booting -- lets the shared tail below skip the cold-boot
+    # spawn/wait it would otherwise (redundantly, or wrongly) run, while
+    # still reaching the SAME post-boot pipeline a cold boot reaches
+    # (post_boot, kiosk/hiding enforcement, and -- the actual bug this
+    # fixes -- the mode tuning block). A restored instance must be
+    # equivalent to a cold-booted one, not a stripped-down one that
+    # returned early before any of that ran.
+    restored = False
     if running_pid(acct["name"]):
         adb_connect(acct)
         if adb_getprop(acct, "sys.boot_completed") == "1":
@@ -6439,14 +7363,194 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
         # historically used for a first/provisioning boot. It is independent of
         # `debug`, which attaches the devkit disk.
         interactive = first
-        spawn_qemu(acct, cfg, interactive=interactive,
-                   mode=None if interactive else mode, accel=accel, debug=debug)
-        # Same rule as `start`: the recorder attaches at spawn so a debug
-        # session has screenshots of the boot screen itself.
-        maybe_start_autocap(acct, label)
-    t = timeout or (FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT)
-    if not wait_for_boot(acct, t, label, first_boot=first):
-        return False, first
+        from omnidroid import warmboot, warmcache
+        from omnidroid.runtime import warm_keys_in_use
+        # Resolving the cache key needs a fully-populated cfg (images_dir,
+        # bases) that not every caller has (e.g. a bare read_config() with no
+        # base registered yet). That must be a MISS, never a crash: nothing
+        # about the warm cache may raise into a boot path (see warmcache.py's
+        # own module docstring) -- key stays None and this launch just cold-
+        # boots exactly as it did before this feature existed.
+        images = None
+        qver = None
+        base = None
+        key = None
+        in_use = set()
+        try:
+            images = Path(images_dir(cfg))
+            tool = ("qemu-system-aarch64" if acct_base_is_arm(acct)
+                    else "qemu-system-x86_64")
+            qver = _qemu_version(tool)
+            base = cfg["bases"][acct["base"]]
+            if not acct_base_is_arm(acct):
+                # The cache only knows how to stage/move an efivars.fd (UEFI
+                # pflash vars): x86 boots by direct kernel/initrd and has no
+                # such concept. Leaving `key` unset makes _warm_cache_allowed()
+                # refuse both a restore lookup and a bake for this launch --
+                # explicit and logged, rather than a bake that raises deep
+                # inside _stage_bake_overlays/warmboot.bake_entry, or (on a
+                # host that also has an arm base) one that succeeds by
+                # accident and files that unrelated arm base's efivars.fd
+                # inside an x86 entry.
+                print(f"[{label}] warm-restore cache is arm-only on this "
+                      f"host; '{acct['base']}' has no efivars/pflash "
+                      f"concept -- cold-booting")
+            elif qver:
+                # Folds the offset's BACKING IMAGE identity (size, mtime)
+                # into the key, not just its name: `offset delete <name>`
+                # followed by `offset create <name> <different apk>` reuses
+                # the name for a different build, and the name alone would
+                # key-match the OLD entry and silently restore the stale
+                # Roblox. None (no offset, e.g. `--apk`/`--offset none`) is
+                # itself a stable, distinct value -- no extra branching
+                # needed for that case.
+                offset_image_stat = None
+                data_image = acct.get("data_image")
+                if data_image:
+                    st = (images / data_image).stat()
+                    offset_image_stat = (st.st_size, int(st.st_mtime))
+                key = warmcache.cache_key(
+                    arch=acct_arch(acct), base_tag=acct["base"],
+                    base_version=base.get("version", 0),
+                    offset=acct.get("offset") or "none",
+                    offset_image_stat=offset_image_stat,
+                    mode_name=mode["name"], mem_mb=mode["mem"], smp=mode["smp"],
+                    machine="virt" if acct_base_is_arm(acct) else "q35",
+                    accel=accel or default_accel(), qemu_version=qver)
+            # Inside the same guarded region as the rest of cache-key
+            # resolution: a sibling instance's malformed run.json (or any
+            # other unexpected failure reading the runtime root) must yield
+            # "no keys in use" here, not an exception straight into the boot
+            # path -- that would break EVERY launch on the host, including
+            # the cold-boot fallback this except clause exists to guarantee.
+            in_use = warm_keys_in_use()
+        except Exception:      # noqa: BLE001 - unresolved cfg = no cache, not a crash
+            images = None
+            key = None
+            in_use = set()
+        entry = None
+        if _warm_cache_allowed(debug, in_use, key, no_warm=no_warm):
+            entry = warmcache.lookup(images, key, qver)
+
+        if entry is not None:
+            # FAST PATH: restore a pre-booted machine instead of booting one.
+            spawn_qemu(acct, cfg, interactive=False, mode=mode, accel=accel,
+                       debug=debug, warm=entry, warm_key=key)
+            maybe_start_autocap(acct, label)
+            migrated = warmboot.restore_into(acct, entry, label)
+            if migrated:
+                warmcache.touch(entry)
+            if migrated and wait_for_boot(acct, RESTORE_TIMEOUT, label):
+                warmboot.resync_guest_clock(acct, label)
+                restored = True
+            else:
+                # The QEMU this launch just spawned is either paused (a
+                # rejected/failed migration) or running but never reached
+                # adbd -- either way it must die before the cold-boot
+                # fallback below spawns a fresh one on the same ports.
+                _halt_qemu(acct)
+                if not migrated:
+                    # POISONED ENTRY: restore_into() ITSELF failed, so the
+                    # state file is the suspect -- discard it. A mere
+                    # wait_for_boot timeout (migrated True) does NOT imply
+                    # that: adb not answering inside RESTORE_TIMEOUT can be a
+                    # port conflict, a transient adb hiccup, or any number of
+                    # causes unrelated to the state file, so that case keeps
+                    # the entry rather than destroying a ~2.4 GiB, one-cold-
+                    # boot-plus-bake artifact over an unrelated failure.
+                    #
+                    # `in_use` above was sampled before THIS launch's own
+                    # spawn_qemu made its run.json visible, so a second,
+                    # concurrent launch against the same entry could have
+                    # started restoring from it in the meantime. Re-check
+                    # warm_keys_in_use() FRESH, immediately before the
+                    # rmtree, so this launch never deletes an entry a
+                    # sibling is now actually running on.
+                    if key not in warm_keys_in_use():
+                        print(f"[{label}] warm restore rejected; discarding "
+                              f"the entry and cold-booting")
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        print(f"[{label}] warm restore rejected, but "
+                              f"another instance is now running off this "
+                              f"entry; keeping it and cold-booting")
+                else:
+                    print(f"[{label}] warm restore came up but Android "
+                          f"never finished booting; cold-booting instead "
+                          f"(entry kept -- the state file is not implicated)")
+                entry = None
+
+        if not restored:
+            # COLD PATH, optionally baking a new entry on the way.
+            want_bake = (not _no_rebake
+                        and _warm_cache_allowed(debug, in_use, key,
+                                                no_warm=no_warm)
+                        and not interactive
+                        and warmcache.has_room(
+                            images, warmboot.projected_entry_bytes(mode["mem"])))
+            if want_bake:
+                rd = runtime_dir(acct["name"])
+                try:
+                    _stage_bake_overlays(acct, cfg, rd)
+                except Exception as e:      # noqa: BLE001 - a bake is an optimisation,
+                    # never a precondition of a successful launch. want_bake is
+                    # true on essentially every non-first, non-debug boot, so a
+                    # missing/unreadable backing image, a full disk or a
+                    # permission error here is the ordinary path, not an edge
+                    # case -- it must degrade to a normal cold boot, not fail
+                    # the launch. Falling through with want_bake left True would
+                    # have spawn_qemu told to bake off overlays that were never
+                    # created.
+                    print(f"[{label}] could not stage warm-bake overlays ({e}); "
+                          f"booting normally without baking")
+                    want_bake = False
+            # bake/warm_key are only ever non-default on a bake attempt: passing
+            # them unconditionally would change this call's kwargs on EVERY
+            # ordinary boot, not just a baking one.
+            bake_kwargs = {"bake": True, "warm_key": key} if want_bake else {}
+            spawn_qemu(acct, cfg, interactive=interactive,
+                       mode=None if interactive else mode, accel=accel,
+                       debug=debug, **bake_kwargs)
+            # Same rule as `start`: the recorder attaches at spawn so a debug
+            # session has screenshots of the boot screen itself.
+            maybe_start_autocap(acct, label)
+    if not restored:
+        t = timeout or (FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT)
+        if not wait_for_boot(acct, t, label, first_boot=first):
+            return False, first
+        if want_bake:
+            meta = {"qemu_version": qver, "mem_mb": mode["mem"],
+                    "smp": mode["smp"], "mode": mode["name"],
+                    "base": acct["base"], "base_version": base.get("version", 0),
+                    "offset": acct.get("offset") or "none"}
+            if warmboot.bake_entry(acct, images, key, meta,
+                                   runtime_dir(acct["name"]), label):
+                warmcache.evict_lru(images, warm_keys_in_use())
+                # The bake stopped the VM and moved its disks into the entry;
+                # restore from what we just made so the FIRST launch takes the
+                # same code path as every later one.
+                #
+                # _no_rebake guards the recursion: if THAT restore also fails,
+                # the entry is discarded and the retry cold-boots WITHOUT
+                # baking again -- otherwise a reproducibly-bad bake would loop
+                # bake -> restore -> discard -> bake forever.
+                _halt_qemu(acct)
+                return _ensure_booted(acct, cfg, label, timeout=timeout,
+                                      accel=accel, mode_name=mode_name,
+                                      mem=mem, smp=smp, balloon=balloon,
+                                      quality=quality, debug=debug,
+                                      no_warm=no_warm, _no_rebake=True)
+            # BAKE FAILED: bake_entry() issues a QMP `stop` before attempting the
+            # migrate and does not resume the guest on failure, so the boot this
+            # launch already waited for is paused, not usable, until resumed here.
+            # Baking was an add-on, not a precondition of a successful launch --
+            # resume and fall through to the ordinary post-boot pipeline below
+            # exactly as an unbaked cold boot would.
+            qmp(acct, "cont")
+    # SHARED TAIL: reached by every successful path -- an instance that was
+    # already up, a fresh cold boot, and (the fix here) a successful warm
+    # restore alike -- so a restored instance gets the exact same post-boot
+    # pipeline, including the mode tuning below, as a cold-booted one.
     post_boot(acct, label)
     if first:
         provision_settings(acct, label)
@@ -6469,37 +7573,63 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # _devkit_activate, i.e. only on a --debug boot, which is exactly the
     # dev-base-era gating the dual-use change was supposed to remove.
     assert_kiosk_game(acct, cfg, label)
+    # EVERY boot: grant the permissions a human would otherwise be asked to
+    # tap through (full disk access above all) and silence the ANR/crash
+    # dialogs. Before the mode tuning on purpose — the tuning is the longest
+    # part of the pipeline and an error dialog raised during it would be
+    # exactly the modal this suppresses. It touches no display or memory
+    # lever, so neither profile can disagree with it.
+    apply_consent(acct, cfg, label)
+    # EVERY boot, EVERY mode, and ABOVE the profile branch on purpose: the
+    # never-blank guarantee is not a mode trade-off, and applying it before the
+    # tuning leaves each mode the last writer on the display levers it
+    # legitimately owns (gaming resets wm size/density, farming sets 480x270).
+    # It sits in this shared tail so a WARM RESTORE gets it too — a restored
+    # instance that blanks is the same product bug as a cold-booted one.
+    apply_awake(acct, label)
     # A debug boot ALSO stages the devkit toolkit (frida + omni-* tools) off
     # the vdc disk attached at spawn. `debug` is the per-boot flag resolved at
     # the top of this function.
     if debug:
         _devkit_activate(acct, label)
-    # GAMING: the other use case. No zram, no squeeze and no balloon — every
-    # one of those trades responsiveness for density, which is the wrong
-    # direction here. It gets the opposite ClientAppSettings profile (tick cap
-    # opened up instead of clamped to 5 fps) and a tune-up that also reverses
-    # the farming levers persisted in /data by any earlier farming boot.
-    if mode_name == "gaming":
-        apply_roblox_settings(acct, label, settings=lean.GAMING_APP_SETTINGS)
+    # POST-BOOT TUNING, branched on the mode's PROFILE rather than on the raw
+    # --mode string. That distinction is the bug fix: this used to compare
+    # `mode_name`, the argument as typed, so a bare `omnidroid start` — which
+    # resolves to `playable`, the DEFAULT mode — matched neither "gaming" nor
+    # "farming" and received no tuning whatsoever. The most-used mode was the
+    # only untuned one.
+    profile = mode.get("profile", "performance")
+    quality = quality or mode.get("quality")
+    settings = lean.app_settings_for(quality)
+    if quality and settings is None:
+        print(f"[{label}] unknown quality profile '{quality}' — leaving "
+              f"Roblox's own settings alone. Known: "
+              f"{list(lean.QUALITY_PROFILES)}")
+    if profile == "density":
+        # FARMING. Every lever here trades quality and responsiveness for
+        # instance COUNT, in a fixed order: settings, then zram (which decides
+        # WHICH balloon cap is survivable), then the squeeze, then the balloon
+        # strictly last so it only claims memory the guest has already given up.
+        if settings is not None:
+            apply_roblox_settings(acct, label, settings=settings)
+        enable_zram(acct, mode, label)
+        # The squeeze is a PRODUCTION memory optimization; a debug boot carries
+        # the extra devkit/frida footprint and its numbers aren't the
+        # production baseline, so skip it there (as the old dev path did).
+        if not debug:
+            apply_farming_squeeze(acct, mode)
+        apply_balloon_target(acct, mode, label)
+    else:
+        # PERFORMANCE (playable / gaming / hard / brutal). No zram, no squeeze
+        # and no balloon — each of those trades responsiveness for density,
+        # which is the wrong direction here. The tune-up also REVERSES the
+        # farming levers that persist in /data, so an offset that was last
+        # touched by a farming boot does not carry a 480x270 display into a
+        # playable one.
+        if settings is not None:
+            apply_roblox_settings(acct, label, settings=settings)
         if not debug:
             apply_gaming_tuning(acct, mode, label)
-    if mode_name == "farming":
-        # Roblox's own settings need root, which every base now has, so they
-        # apply on any farming instance.
-        apply_roblox_settings(acct, label)
-    if mode_name == "farming":
-        # zram before the balloon: it decides WHICH cap is safe, and
-        # apply_balloon_target probes the guest for it.
-        enable_zram(acct, mode, label)
-    # The farming squeeze is a PRODUCTION memory optimization; a debug boot
-    # carries the extra devkit/frida footprint and its numbers aren't the
-    # production baseline, so skip the squeeze there (as the old dev path did).
-    if not debug and mode_name == "farming":
-        apply_farming_squeeze(acct, mode)
-    if mode_name == "farming":
-        # Balloon strictly last: it should only ever claim memory the guest
-        # has already been persuaded to give up.
-        apply_balloon_target(acct, mode, label)
     return True, first
 
 
@@ -6508,7 +7638,7 @@ def _token_flag_given(args):
     passed, even if it resolves to an empty cookie (a blank file/stdin/arg).
 
     `is not None`, not truthiness: `--token ""` must still count as GIVEN.
-    Used by `omni login` to fail fast on an unusable token rather than
+    Used by `omnidroid login` to fail fast on an unusable token rather than
     silently falling back to the interactive browser flow (which would turn a
     supposedly-headless, few-second call into an up-to-5-minute wait for a
     visible browser sign-in that nobody is watching for)."""
@@ -6560,7 +7690,7 @@ def cmd_login(args):
       real authenticated session before it is trusted and saved — the same bar
       an interactive login has to clear.
 
-    Either way: ready to use as `omni start <username> --place`."""
+    Either way: ready to use as `omnidroid start <username> --place`."""
     r, err = _capture_and_save_account(args)
     if err:
         return fail(err[0], err[1])
@@ -6571,7 +7701,7 @@ def cmd_login(args):
         emit_json(out)
     else:
         print(json.dumps(out, indent=2))
-        print(f"\nplay as this account:  omni start {r['username']} "
+        print(f"\nplay as this account:  omnidroid start {r['username']} "
               f"--place <placeId>")
 
 
@@ -6610,7 +7740,7 @@ def cmd_session(args):
     """Inspect / set / clear an account's Roblox session (token + place),
     sourced from the central store, without launching.
 
-    The token always comes from `omni login`; this command only ever touches
+    The token always comes from `omnidroid login`; this command only ever touches
     place_id. A --token* flag, if passed, is accepted but not persisted here
     — the store owns the cookie."""
     from omnidroid import accounts as _acc
@@ -6652,6 +7782,243 @@ def cmd_adb(args):
     sys.exit(r.returncode)
 
 
+# --------------------------------------------------------- debugging surface
+#
+# Everything below exists so that a person or an AI can do high-level
+# debugging through ONE documented command surface, instead of each caller
+# re-deriving the guest's quirks and getting them subtly wrong. The three
+# quirks that keep biting, all of them already paid for once:
+#
+#   1. `su` is not on $PATH. Magisk's su lives in its own tmpfs
+#      (/debug_ramdisk/su); a bare `su` fails with "inaccessible or not found".
+#   2. MagiskSU PERMUTES argv, so `su 0 id -u` is read as an su OPTION and
+#      exits 2. Everything must go through `su 0 sh -c '<script>'`.
+#   3. `adb shell` does not forward argv — it JOINS the arguments and re-parses
+#      them in the guest shell, so an unquoted `a; b` silently runs a fragment
+#      of itself and reports success (see farming.sh for the measured case).
+#
+# cmd_su gets all three right in one place. Nothing else should hand-roll it.
+
+def cmd_su(args):
+    """Run a command as ROOT in the guest, correctly quoted.
+
+        omnidroid su erin7231 -- id -u
+        omnidroid su erin7231 -- 'pm list packages | grep roblox'
+        omnidroid su erin7231 --json -- getprop ro.build.fingerprint
+
+    Exits with the guest command's own status, so it composes in scripts. A
+    base without working root fails with `no_root` and the exact fix rather
+    than running the command as uid shell and quietly producing wrong output —
+    silent privilege downgrade is how a debugging session reaches a false
+    conclusion."""
+    rest = list(args.rest or [])
+    # argparse's REMAINDER swallows EVERYTHING after the account name, flags
+    # included — so `omnidroid su bob --json -- id` would run the literal
+    # command "--json -- id" as root and report whatever that produced. Say so
+    # loudly instead: a silently-mangled root command is exactly the class of
+    # failure this command exists to eliminate.
+    if rest and rest[0].startswith("-"):
+        return fail("bad_args",
+                    f"omnidroid's own flags must come BEFORE the account name "
+                    f"(argparse stops parsing them at the first positional). "
+                    f"Write: omnidroid su {rest[0]} ... {args.name} -- "
+                    f"<command>")
+    script = " ".join(rest) if len(rest) > 1 else (rest[0] if rest else "")
+    if not script.strip():
+        return fail("bad_args",
+                    "nothing to run. Usage: omnidroid su [--json] [--timeout N]"
+                    " <name> -- <command>")
+    # Argument validation FIRST, then the instance: a malformed command line is
+    # the caller's mistake and should be reported as such, not masked by
+    # whatever the account lookup happens to say.
+    acct = load_account(args.name)
+    adb_connect(acct)
+    su = resolve_su(acct)
+    if not su:
+        return fail("no_root",
+                    f"Magisk root is not available on '{args.name}'. The base "
+                    f"must be rooted (`omnidroid root-base`) and the instance "
+                    f"restarted. Note this is NOT `adb root` — the arm base is "
+                    f"a LineageOS 'user' build, so root comes only from the "
+                    f"Magisk-patched boot.")
+    r = adb(acct, "shell", f"{su} 0 sh -c {shlex.quote(script)}",
+            timeout=getattr(args, "timeout", 120))
+    if getattr(args, "json", False):
+        emit_json({"ok": r.returncode == 0, "su": su, "command": script,
+                   "exit_code": r.returncode,
+                   "stdout": r.stdout, "stderr": r.stderr})
+    else:
+        sys.stdout.write(r.stdout or "")
+        sys.stderr.write(r.stderr or "")
+    sys.exit(r.returncode)
+
+
+def _frida_status(acct, su, guest_port):
+    """(running, detail) for the hidden frida-server inside the guest.
+
+    Probes the PORT, not the process name: the devkit deliberately runs
+    frida-server under a randomized name on a non-standard loopback port so a
+    naive scan misses it — which means a name-based check here would miss it
+    too and report "not running" at every call."""
+    try:
+        r = adb(acct, "shell",
+                f"{su} 0 sh -c "
+                f"{shlex.quote(f'netstat -lnt 2>/dev/null | grep :{guest_port}')}",
+                timeout=20)
+        out = (r.stdout or "").strip()
+        return bool(out), out
+    except Exception as e:  # noqa: BLE001 — a probe must never fail the command
+        return False, f"probe failed: {type(e).__name__}"
+
+
+def cmd_frida(args):
+    """Start / inspect / stop the guest's hidden frida-server and forward it
+    to a host port you can attach to.
+
+        omnidroid start erin7231 --debug        # frida lives on the devkit disk
+        omnidroid frida erin7231                # start + forward, prints -H target
+        omnidroid frida erin7231 --status
+        omnidroid frida erin7231 --stop
+
+    Requires a DEBUG boot (the devkit disk carries frida-server) on a rooted
+    base. Both preconditions are checked and named separately, because "not a
+    debug boot" and "debug boot but not rooted" need different fixes and the
+    generic message that conflated them sent people to the wrong one."""
+    acct = load_account(args.name)
+    adb_connect(acct)
+    guest_port = getattr(args, "port", None) or DEFAULT_FRIDA_PORT
+    su = resolve_su(acct)
+    if not su:
+        return fail("no_root",
+                    f"'{args.name}' has no Magisk root, so frida-server "
+                    f"cannot be started. Root the base once with `omnidroid "
+                    f"root-base`, then restart the instance.")
+    # The devkit disk is what CARRIES frida-server; it is attached only on a
+    # --debug boot. Distinguish "no disk" from "disk present, not staged".
+    has_disk = "vdc" in (adb(acct, "shell", "ls", "/dev/block/vdc",
+                             timeout=10).stdout or "")
+    if not has_disk:
+        return fail("no_devkit",
+                    f"'{args.name}' was not booted with --debug, so the devkit "
+                    f"disk (frida-server + omni-* tools) is not attached. "
+                    f"Restart it: `omnidroid stop {args.name} && omnidroid "
+                    f"start {args.name} --debug`. If the disk itself has never "
+                    f"been built: `omnidroid build-devkit`.")
+    if getattr(args, "stop", False):
+        adb(acct, "shell",
+            f"{su} 0 sh -c {shlex.quote('pkill -f frida || true')}", timeout=30)
+        subprocess.run(["adb", "-s", f"127.0.0.1:{acct['adb_port']}",
+                        "forward", "--remove-all"],
+                       capture_output=True, text=True, timeout=15)
+        print(f"[frida {args.name}] stopped and forwards removed")
+        if getattr(args, "json", False):
+            emit_json({"ok": True, "running": False})
+        return
+    if not getattr(args, "status", False):
+        # Idempotent: omni-fridad no-ops when a server is already up.
+        _devkit_activate(acct, f"frida {args.name}")
+        adb(acct, "shell", f"{su} 0 sh -c {shlex.quote(DEVKIT_WORK + '/omni-fridad')}",
+            timeout=60)
+    running, detail = _frida_status(acct, su, guest_port)
+    host_port = None
+    if running:
+        # tcp:0 asks adb to allocate a free host port and print it. The guest
+        # port is loopback-INSIDE the VM, so the forward is not a convenience —
+        # without it there is nothing on the host to attach to.
+        fwd = subprocess.run(["adb", "-s", f"127.0.0.1:{acct['adb_port']}",
+                              "forward", "tcp:0", f"tcp:{guest_port}"],
+                             capture_output=True, text=True, timeout=20)
+        cand = (fwd.stdout or "").strip()
+        host_port = int(cand) if cand.isdigit() else guest_port
+        if not cand.isdigit():
+            subprocess.run(["adb", "-s", f"127.0.0.1:{acct['adb_port']}",
+                            "forward", f"tcp:{host_port}",
+                            f"tcp:{guest_port}"],
+                           capture_output=True, text=True, timeout=20)
+    rep = {"ok": bool(running), "running": bool(running),
+           "guest_port": guest_port, "host_port": host_port,
+           "attach": f"frida -H 127.0.0.1:{host_port}" if host_port else None,
+           "detail": detail}
+    if getattr(args, "json", False):
+        emit_json(rep)
+    elif running:
+        print(f"[frida {args.name}] up on guest 127.0.0.1:{guest_port} "
+              f"(hidden name/port)\n"
+              f"  attach from the host:  frida -H 127.0.0.1:{host_port}\n"
+              f"  hide root from an app: omnidroid su {args.name} -- "
+              f"{DEVKIT_WORK}/omni-hide <package>")
+    else:
+        print(f"[frida {args.name}] NOT running (guest port {guest_port} has "
+              f"no listener). Try `omnidroid frida {args.name}` without "
+              f"--status to start it.")
+    if not running and getattr(args, "status", False):
+        sys.exit(1)
+
+
+def cmd_debug_info(args):
+    """One JSON blob answering 'what can I actually do to this instance?'.
+
+    The command an AI should call FIRST when a debugging step fails, because
+    every capability below has a different precondition and the failures look
+    alike from the outside: no root and no devkit both present as "the tool
+    did nothing". Reports what IS true rather than what was requested."""
+    acct = load_account(args.name)
+    if not running_pid(args.name):
+        return fail("not_running",
+                    f"'{args.name}' is not running. Start it: `omnidroid "
+                    f"start {args.name}` (add --debug for frida).")
+    adb_connect(acct)
+    cfg = read_config()
+    base = (cfg.get("bases") or {}).get(acct["base"]) or {}
+    su = resolve_su(acct)
+    has_disk = "vdc" in (adb(acct, "shell", "ls", "/dev/block/vdc",
+                             timeout=10).stdout or "")
+    frida_running = False
+    if su and has_disk:
+        frida_running, _ = _frida_status(acct, su, DEFAULT_FRIDA_PORT)
+    try:
+        run = json.loads((runtime_dir(args.name) / "run.json").read_text())
+    except Exception:  # noqa: BLE001
+        run = {}
+    fg = _foreground(acct)
+    rep = {
+        "ok": True,
+        "name": args.name,
+        "base": acct["base"],
+        "arch": acct_arch(acct),
+        "mode": run.get("mode"),
+        "debug_boot": bool(run.get("debug")),
+        "offset": run.get("offset"),
+        "offset_default": offsets_mod.default_offset_name(base),
+        "offsets_available": list(offsets_mod.offsets_of(base)),
+        "adb_serial": f"127.0.0.1:{acct['adb_port']}",
+        "vnc": f"127.0.0.1:{acct['vnc_port']}",
+        "qmp_port": acct.get("qmp_port"),
+        "game_package": resolve_game_package(acct, cfg),
+        "foreground": fg,
+        "root": {"available": bool(su), "su": su,
+                 "fix": None if su else "omnidroid root-base, then restart"},
+        "devkit": {"attached": has_disk, "mount": DEVKIT_MOUNT,
+                   "tools": DEVKIT_WORK,
+                   "fix": None if has_disk
+                   else f"restart with: omnidroid start {args.name} --debug"},
+        "frida": {"running": frida_running, "guest_port": DEFAULT_FRIDA_PORT,
+                  "start": f"omnidroid frida {args.name}"},
+        "can": {
+            "screenshot": True,
+            "logcat": True,
+            "install_apk": True,
+            "run_su": bool(su),
+            "frida": bool(su and has_disk),
+            "hide_root": bool(su and has_disk),
+        },
+    }
+    if getattr(args, "json", False):
+        emit_json(rep)
+    else:
+        print(json.dumps(rep, indent=2))
+
+
 def build_parser():
     """The full argparse parser, with every subcommand registered.
 
@@ -6669,7 +8036,7 @@ def build_parser():
 
     def _token_args(parser):
         # No --account flag: the positional IS the account username (from
-        # `omni login`), so its cookie is looked up automatically. These flags
+        # `omnidroid login`), so its cookie is looked up automatically. These flags
         # are a manual OVERRIDE for a raw cookie (testing / an account you have
         # not saved).
         g = parser.add_mutually_exclusive_group()
@@ -6693,12 +8060,12 @@ def build_parser():
                             "deliver its Roblox session and land INSIDE a "
                             "place if one is set, or on the account's home "
                             "screen if not — logged in, no menu, no taps. "
-                            "`omni start <username> [--place <id>]`. The "
+                            "`omnidroid start <username> [--place <id>]`. The "
                             "instance is auto-created (ephemeral); run two "
                             "for two accounts at once. Dev and production "
                             "alike")
     s.add_argument("name", metavar="username",
-                   help="a saved Roblox account username (from `omni login`). "
+                   help="a saved Roblox account username (from `omnidroid login`). "
                         "It names the instance too — its cookie is used "
                         "automatically, no --account needed")
     s.add_argument("--place", default=None,
@@ -6730,32 +8097,61 @@ def build_parser():
                         "reverse-engineering. The base is the same dual-use "
                         "production image either way; this just adds the "
                         "toolkit (vdc). Also settable via OMNI_DEBUG_BOOT=1.")
+    s.add_argument("--no-warm", dest="no_warm", action="store_true",
+                   help="disable the warm-restore boot cache for THIS launch "
+                        "(no restore, no bake) -- always cold-boot. Kill "
+                        "switch; also settable for every launch on the host "
+                        "via OMNI_NO_WARM=1.")
     s.add_argument("--apk", default=None,
                    help="install this Roblox APK before delivering the session "
                         "(for testing a custom build). Works on any base; does "
-                        "NOT require --debug.")
+                        "NOT require --debug. Implies a clean boot: the APK "
+                        "IS the version, so no offset is required.")
+    s_off = s.add_mutually_exclusive_group()
+    s_off.add_argument("--offset", default=None,
+                       help="which BAKED Roblox version to boot (see "
+                            "`omnidroid offset list`). Omit to use the base's "
+                            "DEFAULT offset — that is what a bare "
+                            "`omnidroid start <username>` means. Offsets are "
+                            "per-LAUNCH, never per-account.")
+    s_off.add_argument("--no-offset", dest="no_offset", action="store_true",
+                       help="boot the clean base with NO Roblox baked in "
+                            "(same as `--offset none`). For base work, or "
+                            "alongside --apk.")
     s_win = s.add_mutually_exclusive_group()
     s_win.add_argument("--window", action="store_true",
                        help="open a live window even in --json mode (two "
                             "starts = two accounts side by side)")
     s_win.add_argument("--no-window", dest="no_window", action="store_true",
                        help="do not open a window (headless; watch via "
-                            "`omni view` or capture)")
+                            "`omnidroid view` or capture)")
     s.add_argument("--mode", choices=list(MODES), default=None,
-                   help="what this instance is FOR. gaming 4G/4c - opens a "
-                        "native window on the host (GPU-accelerated where "
-                        "QEMU supports it, otherwise a plain window; falls "
-                        "back to headless on a host with no display), "
-                        "uncapped engine tick, animations off, game on the "
-                        "top-app cpuset - for playing, not for scale. "
-                        "farming 2G/1c - headless, joined-idle, squeezed "
-                        "post-boot then ballooned down, for many instances. "
-                        "The rest are headless RAM/CPU tiers: playable 4G/4c "
-                        "| hard 3G/4c | brutal 2G/2c. Default: playable")
+                   help="what this instance is FOR. playable (DEFAULT) - "
+                        "MAXIMUM resources: sized to this host (up to 8G / 6 "
+                        "vCPU), no balloon, no squeeze, native resolution, "
+                        "high-quality render, game on the top-app cpuset. The "
+                        "mode to test and to play in. gaming - the same, plus "
+                        "a native window on the host. farming - MINIMUM "
+                        "resources: 2G/1c headless, joined-idle, squeezed "
+                        "post-boot then ballooned to ~896 MB, for many "
+                        "instances at once. hard 3G/4c | brutal 2G/2c are "
+                        "fixed smaller tiers for a tight host")
     s.add_argument("--mem", type=int, default=None,
                    help="override guest RAM in MB. This is the guest's "
                         "ADDRESS SPACE, not its host footprint - see "
-                        "--balloon for the number the host pays")
+                        "--balloon for the number the host pays. Wins over "
+                        "the host-derived size in playable/gaming")
+    s.add_argument("--smp", type=int, default=None,
+                   help="override guest vCPU count. Wins over the "
+                        "host-derived count in playable/gaming")
+    s.add_argument("--quality", choices=list(lean.QUALITY_PROFILES),
+                   default=None,
+                   help="Roblox render profile. high (playable/gaming "
+                        "default): real textures/lighting/post-FX - what a "
+                        "player sees, and what a screenshot must show to be "
+                        "worth reasoning about. balanced: effects off, "
+                        "maximum frame rate. low (farming default): 5 fps "
+                        "cap, lowest everything")
     s.add_argument("--balloon", type=int, default=None,
                    help="post-boot balloon target in MB: the hard cap on "
                         "this instance's host memory. 0 disables it. "
@@ -6903,36 +8299,119 @@ def build_parser():
     sb.set_defaults(func=cmd_strip_base)
 
     bg = sub.add_parser("bake-game",
-                        help="bake a game APK into an arm image as a "
-                             "pre-installed SYSTEM app, so production ships "
-                             "with it. BUILD-machine command (e2fsprogs + "
+                        help="LEGACY: bake a game APK into an arm SYSTEM image "
+                             "(use `offset create` for versions). Still the "
+                             "way to STRIP a baked game out: `bake-game "
+                             "--remove` makes the system image ship no game "
+                             "at all. BUILD-machine command (e2fsprogs + "
                              "~6 GiB scratch)")
-    bg.add_argument("apk")
+    bg.add_argument("apk", nargs="?", default=None)
+    bg.add_argument("--remove", action="store_true",
+                    help="DELETE the baked system app instead of installing "
+                         "one, so the base truly carries no Roblox. Every "
+                         "version then comes from an offset")
     bg.add_argument("--base", default="arm", help="base tag (default: arm)")
     bg.add_argument("--image", default=None,
                     help="operate on this image instead of the base's "
                          "(e.g. the branded production candidate)")
-    bg.add_argument("--name", default="OmniGame",
-                    help="directory name under /product/app (default OmniGame)")
+    bg.add_argument("--name", default=None,
+                    help="directory name under /product/app (default: "
+                         "OmniGame when baking, Roblox when --remove)")
     bg.add_argument("--json", action="store_true")
     bg.set_defaults(func=cmd_bake_game)
 
+    # ---- offsets: many baked Roblox versions on ONE clean base -------------
+    off = sub.add_parser("offset",
+                         help="manage BAKED ROBLOX VERSIONS ('offsets'). Each "
+                              "offset is a named, thin /data overlay carrying "
+                              "one Roblox build; the base itself stays clean "
+                              "and one offset is the DEFAULT that a bare "
+                              "`omnidroid start` boots. Add versions freely — "
+                              "they are siblings, so a new one never replaces "
+                              "or disturbs an existing one")
+    offsub = off.add_subparsers(dest="offset_cmd", required=True)
+
+    ol = offsub.add_parser("list", help="every baked version (* = default)")
+    ol.add_argument("--base", default=None, help="base tag (default: current)")
+    ol.add_argument("--json", action="store_true")
+    ol.set_defaults(func=cmd_offset_list)
+
+    oc = offsub.add_parser("create",
+                           help="bake a Roblox APK into a NEW named version "
+                                "(~2 min; no base rebuild, no scratch space)")
+    oc.add_argument("name", nargs="?", default=None,
+                    help="name for this version (default: the APK's own "
+                         "versionName, e.g. 2.731.944)")
+    oc.add_argument("--apk", required=True, help="the Roblox APK to bake")
+    oc.add_argument("--base", default=None, help="base tag (default: current)")
+    oc.add_argument("--package", default=None,
+                    help="package to register as the game (default: the APK's "
+                         "own, else base_game.<tag>)")
+    oc.add_argument("--default", action="store_true",
+                    help="also make this the default version for bare launches")
+    oc.add_argument("--force", action="store_true",
+                    help="re-bake over an offset of the same name")
+    oc.add_argument("--notes", default=None, help="free-text note to record")
+    oc.add_argument("--json", action="store_true")
+    oc.set_defaults(func=cmd_offset_create)
+
+    od = offsub.add_parser("default",
+                           help="make one baked version the default for a "
+                                "bare `omnidroid start`")
+    od.add_argument("name")
+    od.add_argument("--base", default=None, help="base tag (default: current)")
+    od.add_argument("--json", action="store_true")
+    od.set_defaults(func=cmd_offset_default)
+
+    orm = offsub.add_parser("remove",
+                            help="DESTRUCTIVE: delete a baked version and its "
+                                 "overlay image (refuses while in use)")
+    orm.add_argument("name")
+    orm.add_argument("--base", default=None, help="base tag (default: current)")
+    orm.add_argument("--keep-image", dest="keep_image", action="store_true",
+                     help="unregister it but leave the qcow2 on disk")
+    orm.add_argument("--json", action="store_true")
+    orm.set_defaults(func=cmd_offset_remove)
+
+    ocs = offsub.add_parser("consent",
+                            help="bake the unattended-consent policy INTO a "
+                                 "version's image (~2 min each). Only the "
+                                 "no-ANR/crash-dialog half is image state on "
+                                 "Android 16; the app-ops (full disk access, "
+                                 "install-unknown, overlay) and the runtime "
+                                 "grants are re-applied by the engine on "
+                                 "EVERY boot, baked or not")
+    ocs.add_argument("name", nargs="?", default=None,
+                     help="the version to bake into (or use --all)")
+    ocs.add_argument("--all", action="store_true",
+                     help="every baked version on this base")
+    ocs.add_argument("--base", default=None, help="base tag (default: current)")
+    ocs.add_argument("--json", action="store_true")
+    ocs.set_defaults(func=cmd_offset_consent)
+
+    osh = offsub.add_parser("show", help="everything recorded about a version")
+    osh.add_argument("name", nargs="?", default=None,
+                     help="default: the default offset")
+    osh.add_argument("--base", default=None, help="base tag (default: current)")
+    osh.add_argument("--json", action="store_true")
+    osh.set_defaults(func=cmd_offset_show)
+
     bdg = sub.add_parser("bake-data-game",
-                         help="install the game into the base's /DATA and bake "
-                              "the kiosk's game package. The UPDATE-FRIENDLY "
-                              "one: re-run with a newer APK to update the game "
-                              "(~2 min, no system-image rebuild, no scratch "
-                              "space). Every run starts from the pristine "
-                              "/data, so updates never chain.")
+                         help="DEPRECATED alias for `omnidroid offset create "
+                              "--default`. It baked into one fixed slot and "
+                              "pointed the base at it; offsets keep the base "
+                              "clean and let versions coexist")
     bdg.add_argument("apk", nargs="?", default=None,
-                     help="game APK to install as an updated system app. "
-                          "Omit to bake only the kiosk game-package setting.")
+                     help="game APK to bake as an offset")
+    bdg.add_argument("--name", default=None,
+                     help="offset name (default: the APK's versionName)")
     bdg.add_argument("--base", default=None, help="base tag (default: current)")
     bdg.add_argument("--package", default=None,
                      help="package name to register as the game (default: "
                           "base_game.<tag> from configs/paths.json). The APK is "
                           "NOT parsed for it — Roblox never changes its package "
                           "name and aapt2 is not installed everywhere.")
+    bdg.add_argument("--notes", default=None)
     bdg.add_argument("--json", action="store_true")
     bdg.set_defaults(func=cmd_bake_data_game)
 
@@ -6965,7 +8444,7 @@ def build_parser():
                              "HEADLESS browser, no window, nothing to click. "
                              "Either way it saves the cookie under the "
                              "account's USERNAME (auto-detected). Then: "
-                             "omni start <username> --place <id>")
+                             "omnidroid start <username> --place <id>")
     lg.add_argument("--browser", choices=["chrome", "firefox"], default="chrome")
     lg.add_argument("--timeout", type=int, default=300,
                     help="interactive sign-in only: seconds to wait for you "
@@ -6987,7 +8466,7 @@ def build_parser():
     ac.add_argument("--set-custom-name", dest="set_custom_name", nargs=2,
                     metavar=("USERNAME", "NAME"),
                     help="attach a friendly custom_name to a saved account, "
-                         "e.g. `omni accounts --set-custom-name erin7231 "
+                         "e.g. `omnidroid accounts --set-custom-name erin7231 "
                          "\"Farm 3\"`. Display-only: the USERNAME stays the "
                          "account's real identity and the instance name — "
                          "this never renames anything. Pass an empty string "
@@ -7012,10 +8491,57 @@ def build_parser():
     se.add_argument("--json", action="store_true")
     se.set_defaults(func=cmd_session)
 
-    a = sub.add_parser("adb")
+    a = sub.add_parser("adb",
+                       help="raw adb against one instance: "
+                            "`omnidroid adb <name> -- shell ls /sdcard`")
     a.add_argument("name")
     a.add_argument("rest", nargs=argparse.REMAINDER)
     a.set_defaults(func=cmd_adb)
+
+    suc = sub.add_parser("su",
+                         help="run a command as ROOT in the guest, quoted "
+                              "correctly: `omnidroid su <name> -- <command>`. "
+                              "Handles Magisk's off-PATH su, its argv "
+                              "permutation, and adb's argv re-parse - the "
+                              "three traps that make hand-rolled root calls "
+                              "silently no-op. NOTE: omnidroid's own flags go "
+                              "BEFORE the name (everything after it is the "
+                              "guest command)")
+    # Flags declared before the positional so `--json`/`--timeout` are usable;
+    # argparse's REMAINDER stops option parsing at the first positional, so
+    # they must be TYPED before the name too. cmd_su detects and reports the
+    # wrong order rather than running a mangled command as root.
+    suc.add_argument("--timeout", type=int, default=120)
+    suc.add_argument("--json", action="store_true")
+    suc.add_argument("name")
+    suc.add_argument("rest", nargs=argparse.REMAINDER)
+    suc.set_defaults(func=cmd_su)
+
+    fr = sub.add_parser("frida",
+                        help="start/inspect/stop the guest's hidden "
+                             "frida-server and forward it to a host port. "
+                             "Needs a --debug boot (the devkit disk carries "
+                             "frida) on a rooted base")
+    fr.add_argument("name")
+    fr_g = fr.add_mutually_exclusive_group()
+    fr_g.add_argument("--status", action="store_true",
+                      help="report only; exit 1 if it is not running")
+    fr_g.add_argument("--stop", action="store_true",
+                      help="stop the server and drop the host forwards")
+    fr.add_argument("--port", type=int, default=None,
+                    help=f"guest frida port (default {DEFAULT_FRIDA_PORT}, "
+                         f"deliberately not the well-known 27042)")
+    fr.add_argument("--json", action="store_true")
+    fr.set_defaults(func=cmd_frida)
+
+    di = sub.add_parser("debug-info",
+                        help="what can actually be done to this instance: "
+                             "root, devkit, frida, offset, mode, foreground "
+                             "app, ports. The first call to make when a "
+                             "debugging step failed for an unclear reason")
+    di.add_argument("name")
+    di.add_argument("--json", action="store_true")
+    di.set_defaults(func=cmd_debug_info)
 
     ub = sub.add_parser("update-base",
                         help="migrate one account to a base (default: "
@@ -7049,7 +8575,7 @@ def build_parser():
                          help="build the attachable devkit disk "
                               "(base_<arch>_devkit.qcow2 = frida-server + omni-* "
                               "tools + Magisk binaries). Attached as vdc only on "
-                              "an `omni start --debug` boot; changes no base")
+                              "an `omnidroid start --debug` boot; changes no base")
     bdk.add_argument("--arch", choices=("arm", "x86"), default=None,
                      help="which arch's devkit to build (default: this host's)")
     bdk.add_argument("--frida-version", default=DEFAULT_FRIDA_VERSION,
@@ -7129,6 +8655,9 @@ def build_parser():
                     help="override game APK to install fresh into each "
                          "instance instead of measuring the baked-in "
                          "Roblox workload")
+    bk.add_argument("--offset", default=None,
+                    help="which baked Roblox version to bench (default: the "
+                         "base's default offset)")
     bk.add_argument("--prefix", default="bench",
                     help="bench account name prefix")
     bk.add_argument("--keep", action="store_true",
@@ -7156,6 +8685,9 @@ def build_parser():
                     help="mode to use when --start boots the instance")
     vw.add_argument("--debug", action="store_true",
                     help="with --start: attach the devkit disk (frida + tools)")
+    vw.add_argument("--offset", default=None,
+                    help="with --start: which baked Roblox version to boot "
+                         "(default: the base's default offset)")
     vw.add_argument("--native", action="store_true",
                     help="use the OS/native VNC client instead of the "
                          "built-in cross-platform viewer")
@@ -7170,7 +8702,7 @@ def build_parser():
     vw.set_defaults(func=cmd_view)
 
     # Hidden internal: run the built-in Tk+RFB viewer in-process (spawned by
-    # `omni view` as a detached child). Not for direct use.
+    # `omnidroid view` as a detached child). Not for direct use.
     vv = sub.add_parser("_vncview")
     vv.add_argument("--host", default="127.0.0.1")
     vv.add_argument("--port", type=int, required=True)
