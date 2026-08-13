@@ -86,6 +86,32 @@ GL_GPU_DEVICE = "virtio-gpu-gl-pci"          # needs virglrenderer in QEMU
 HEADLESS_GPU_ARGS = ["-device", "virtio-gpu-pci"]
 HEADLESS_DISPLAY_ARGS = ["-display", "none"]
 
+# ------------------------------------------------- headless GPU acceleration
+#
+# A FOURTH tier, and the one that matters for how the product actually runs.
+#
+# The three tiers above answer "what window can this host open", and GL was
+# reachable only WITH a window (`gaming` mode). But every production instance
+# is headless — no window, VNC only — so every production instance was
+# rendering on llvmpipe, in software, on the CPU. Measured in-guest on the x86
+# base: `ro.hardware.egl=mesa`, SurfaceFlinger on a software renderer, with
+# Roblox's arm64 build already paying binary translation on top. That is the
+# "why is this so slow" the hardware could not explain: a 4060 sat idle while
+# the CPU drew every frame.
+#
+# `-display egl-headless` fixes exactly that. It gives QEMU a host GL context
+# with NO window, so virglrenderer can hand the guest's GL calls to the real
+# GPU while the framebuffer still goes out over VNC — the viewer, screenshot,
+# autocap and the input skill all keep working unchanged.
+#
+# Gated on the QEMU build advertising BOTH pieces, because neither is
+# universal: the Windows bundle has them, and a Homebrew macOS QEMU has
+# neither (no virglrenderer formula), where this degrades to today's software
+# path rather than failing a boot.
+HEADLESS_GL_DISPLAY = "egl-headless"
+HEADLESS_GL_GPU_ARGS = ["-device", GL_GPU_DEVICE]
+HEADLESS_GL_DISPLAY_ARGS = ["-display", HEADLESS_GL_DISPLAY]
+
 # Windowing backends that can carry a real window, best first per platform.
 # `vnc`, `none`, `curses`, `egl-headless` and `dbus` are deliberately absent:
 # none of them opens a low-latency native window with input attached.
@@ -114,6 +140,9 @@ def _host_has_gui():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+_HELP_CACHE = {}
+
+
 def _qemu_help_texts(tool):
     """(display_help, device_help) as reported by the resolved QEMU binary.
 
@@ -121,15 +150,28 @@ def _qemu_help_texts(tool):
     default_display reads that as "no window is possible", which degrades to
     the headless path. Asking QEMU beats hardcoding a build matrix: the same
     version is compiled with wildly different feature sets by brew, apt and
-    the Windows bundle."""
+    the Windows bundle.
+
+    MEMOISED per process: it costs two QEMU launches, the answer cannot change
+    while this process runs, and every headless boot now asks (not just the
+    rare `gaming` one). A host bringing up fifty farming instances would
+    otherwise pay a hundred subprocess launches for one constant.
+    """
+    if tool in _HELP_CACHE:
+        return _HELP_CACHE[tool]
     try:
         b = qemu_bin(tool)
         def _run(*args):
             return subprocess.run([b, *args], capture_output=True, text=True,
                                   timeout=10).stdout or ""
-        return _run("-display", "help"), _run("-device", "help")
+        answer = _run("-display", "help"), _run("-device", "help")
     except Exception:
+        # NOT cached: a failure here can be transient (a QEMU still being
+        # installed by `setup`), and caching "no GPU" for the process lifetime
+        # would outlast the condition.
         return "", ""
+    _HELP_CACHE[tool] = answer
+    return answer
 
 
 def default_display(qemu_display_help="", qemu_device_help="", has_gui=True):
@@ -530,24 +572,79 @@ def resolve_mode(cfg, name=None, mem=None, balloon=None, smp=None,
     return m
 
 
-def resolve_gpu_display(mode, interactive, tool):
+def headless_gl_capability(qemu_display_help="", qemu_device_help=""):
+    """Can this QEMU render a HEADLESS guest on the host GPU?
+
+    Pure, like default_display: both host facts are arguments. Needs the
+    virgl-backed GPU model AND the windowless GL display backend — either one
+    alone is useless.
+    """
+    has_gpu = GL_GPU_DEVICE in qemu_device_help
+    has_display = HEADLESS_GL_DISPLAY in qemu_display_help
+    if has_gpu and has_display:
+        return {"available": True,
+                "gpu_args": list(HEADLESS_GL_GPU_ARGS),
+                "display_args": list(HEADLESS_GL_DISPLAY_ARGS),
+                "reason": f"{HEADLESS_GL_DISPLAY} + {GL_GPU_DEVICE} "
+                          f"(host GPU, no window)"}
+    missing = []
+    if not has_gpu:
+        missing.append(GL_GPU_DEVICE)
+    if not has_display:
+        missing.append(f"-display {HEADLESS_GL_DISPLAY}")
+    return {"available": False, "gpu_args": [], "display_args": [],
+            "reason": f"this QEMU build has no {' and no '.join(missing)} "
+                      f"(built without virglrenderer/OpenGL) — rendering "
+                      f"stays on the CPU"}
+
+
+def _headless_gl_wanted(cfg):
+    """Config `qemu.headless_gl` (default ON), overridable by OMNI_HEADLESS_GL.
+
+    Default-on because the software path is a large, silent performance loss
+    and the capability is host-detected anyway. The switch exists because GPU
+    stacks fail in ways a capability probe cannot see — a driver that
+    advertises virgl and then renders nothing is a black screen, not an error
+    — so there has to be one thing to turn off before anyone starts bisecting.
+    """
+    env = os.environ.get("OMNI_HEADLESS_GL", "").strip()
+    if env:
+        return env not in ("0", "false", "False", "no")
+    value = ((cfg or {}).get("qemu") or {}).get("headless_gl")
+    return True if value is None else bool(value)
+
+
+def resolve_gpu_display(mode, interactive, tool, cfg=None):
     """The (gpu_args, display_args) pair for one boot, host-checked.
 
     A window is wanted when the mode asks for one (`gaming`) or OMNI_GL_WINDOW
     is set — never on an interactive builder boot, which already redirects the
     console to a serial log and runs unattended.
 
-    The host probe is skipped entirely unless a window is wanted: it costs two
-    QEMU subprocess launches, and a host starting fifty farming instances must
-    not pay that fifty times for an answer it would discard."""
-    want = (bool(mode.get("window")) or _gl_window_requested()) and not interactive
-    if not want:
+    Without a window we no longer fall straight to software: a host whose QEMU
+    can do `egl-headless` renders on the real GPU anyway. An interactive
+    builder boot deliberately stays on the plain virtio path — it exists to
+    mutate an image, not to draw, and it must work identically on every host.
+    """
+    want_window = (bool(mode.get("window")) or _gl_window_requested()) and not interactive
+    if want_window:
+        cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui())
+        if not cap.get("available"):
+            print(f"[gpu] no host window available ({cap.get('reason')}); "
+                  f"booting headless — attach with `omnidroid view <name>`")
+            return _headless_pair(interactive, tool, cfg)
+        return gpu_display_args(True, cap)
+    return _headless_pair(interactive, tool, cfg)
+
+
+def _headless_pair(interactive, tool, cfg):
+    if interactive or not _headless_gl_wanted(cfg):
         return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
-    cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui())
+    cap = headless_gl_capability(*_qemu_help_texts(tool))
     if not cap.get("available"):
-        print(f"[gpu] no host window available ({cap.get('reason')}); "
-              f"booting headless — attach with `omnidroid view <name>`")
-    return gpu_display_args(True, cap)
+        return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
+    print(f"[gpu] headless GPU acceleration: {cap['reason']}")
+    return list(cap["gpu_args"]), list(cap["display_args"])
 
 
 def balloon_device(mode):
@@ -632,7 +729,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
     # (see resolve_gpu_display). Every other mode gets the byte-for-byte
     # headless pair it has always had.
     gpu_args, display_args = resolve_gpu_display(mode, interactive,
-                                                 "qemu-system-aarch64")
+                                                 "qemu-system-aarch64", cfg)
     gpu_display = gpu_args + display_args
 
     # EPHEMERAL (fully-shared, no-persistence) instances boot the SHARED provisioned
@@ -846,7 +943,7 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
     # Same rule as arm: headless unless this boot asked for a window AND the
     # host can open one. Interactive boots always come back headless.
     gpu_args, display_args = resolve_gpu_display(mode, interactive,
-                                                 "qemu-system-x86_64")
+                                                 "qemu-system-x86_64", cfg)
     if interactive:
         # Interactive/builder boot: serial console log for debugging (headless
         # like everything else; virtio-vga kept so the guest has its usual DRM
@@ -908,6 +1005,13 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
     return cmd
 
 
+# Display backends that render WITHOUT putting a window on screen. `egl-headless`
+# is the subtle one: it takes a real host GL context (that is the whole point)
+# but shows nothing. Reading it as "a window opened" would make `start` stand
+# its VNC viewer down, leaving the user with no way to see the instance at all.
+_WINDOWLESS_DISPLAYS = ("none", "", HEADLESS_GL_DISPLAY, "egl-headless")
+
+
 def command_opens_a_window(cmd):
     """True when this QEMU command will put a window on the host's screen.
 
@@ -916,7 +1020,7 @@ def command_opens_a_window(cmd):
     from it the way a second copy of the capability logic would."""
     for i, arg in enumerate(cmd):
         if arg == "-display" and i + 1 < len(cmd):
-            return cmd[i + 1].split(",")[0] not in ("none", "")
+            return cmd[i + 1].split(",")[0] not in _WINDOWLESS_DISPLAYS
     return False
 
 

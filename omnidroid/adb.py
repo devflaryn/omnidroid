@@ -1,9 +1,48 @@
 # omnidroid/adb.py
 """ADB transport + guest-shell primitives keyed off an account's adb_port."""
+import os
 import re
 import subprocess
+import tempfile
 
 from omnidroid.output import fail
+
+
+def _run_adb(cmd, timeout):
+    """Run an adb command WITHOUT giving it a pipe to inherit.
+
+    `adb` forks a long-lived SERVER daemon the first time it is used, and that
+    daemon inherits whatever stdout/stderr it was handed. With
+    capture_output=True those are pipes that stay open for the daemon's whole
+    life, so:
+
+      * the pipe never reaches EOF, and
+      * subprocess.run's timeout handling — which kills the child and then
+        calls communicate() again to reap it — blocks in that second
+        communicate() FOREVER, timeout or no timeout.
+
+    Observed exactly that: `omnidroid start` sat in adb_connect for 12+
+    minutes against a QEMU that had already exited, with a 15 s timeout set.
+    Temp files break the inheritance chain: the daemon may keep them open, but
+    nothing here waits on EOF, so the timeout means what it says.
+    """
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=err)
+        except OSError as exc:
+            raise FileNotFoundError(f"could not run adb: {exc}") from None
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+        out.seek(0)
+        err.seek(0)
+        decode = lambda b: b.decode("utf-8", "replace")   # noqa: E731
+        return subprocess.CompletedProcess(cmd, code, decode(out.read()),
+                                           decode(err.read()))
 
 
 def _require_adb_port(acct):
@@ -23,16 +62,21 @@ def _require_adb_port(acct):
 def adb(acct, *args, timeout=20, check=False):
     serial = f"127.0.0.1:{_require_adb_port(acct)}"
     cmd = ["adb", "-s", serial] + list(args)
-    return subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=timeout, check=check)
+    r = _run_adb(cmd, timeout)
+    if check and r.returncode != 0:
+        raise subprocess.CalledProcessError(r.returncode, cmd, r.stdout, r.stderr)
+    return r
 
 
 def adb_connect(acct):
     port = _require_adb_port(acct)
     try:
-        subprocess.run(["adb", "connect", f"127.0.0.1:{port}"],
-                       capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
+        _run_adb(["adb", "connect", f"127.0.0.1:{port}"], timeout=15)
+    # TimeoutExpired is the expected one (a closed loopback port TIMES OUT on
+    # this Windows host instead of refusing). OSError is not: it means the adb
+    # binary could not be run at all, and letting that escape from a probe
+    # turned "adb is missing" into a traceback from whatever loop called it.
+    except (subprocess.TimeoutExpired, OSError):
         pass
 
 
@@ -47,10 +91,8 @@ def adb_state(acct):
     and a launch sat at its full timeout against a guest that was up.
     """
     try:
-        r = subprocess.run(["adb", "-s",
-                            f"127.0.0.1:{_require_adb_port(acct)}",
-                            "get-state"],
-                           capture_output=True, text=True, timeout=10)
+        r = _run_adb(["adb", "-s", f"127.0.0.1:{_require_adb_port(acct)}",
+                      "get-state"], timeout=10)
     except Exception:  # noqa: BLE001 — a probe must never raise
         return ""
     out = (r.stdout or "").strip()
@@ -87,8 +129,7 @@ def adb_recover(acct, hard=False):
 
     def _run(args, timeout=20):
         try:
-            subprocess.run(["adb"] + args, capture_output=True, text=True,
-                           timeout=timeout)
+            _run_adb(["adb"] + args, timeout)
         except Exception:  # noqa: BLE001 — recovery is best-effort
             pass
 

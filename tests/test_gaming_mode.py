@@ -10,7 +10,7 @@ The two use cases this engine serves pull in opposite directions:
 
 `gaming` is a separate mode rather than a change to `playable` on purpose:
 `playable` is DEFAULT_MODE, so teaching it to open a window would put a QEMU
-window on every existing `omni start`. Adding a mode is additive; every other
+window on every existing `omnidroid start`. Adding a mode is additive; every other
 mode's command has to stay byte-for-byte what it is today, and that is what
 most of these tests assert.
 """
@@ -39,7 +39,11 @@ def _acct(base="arm"):
 
 
 def _cfg():
+    # `data_template` is required by the x86 command builder (an x86 boot with
+    # no offset falls back to the shared empty /data). Without it the x86 cases
+    # below died with KeyError before reaching a single assertion.
     return {"images_dir": "/imgs", "current_base": "arm",
+            "data_template": "data-template-8g.qcow2",
             "bases": {"arm": {"type": "arm-uefi",
                               "system": "base_arm_system.qcow2",
                               "data": "base_arm_data.qcow2",
@@ -130,7 +134,7 @@ class ArmBootUsesTheHostCapability(unittest.TestCase):
 
 
 class VncSurvivesTheWindow(unittest.TestCase):
-    """`omni screenshot`, the auto-capture recorder and the omnidroid-input
+    """`omnidroid screenshot`, the auto-capture recorder and the omnidroid-input
     skill all attach to the instance's VNC framebuffer (see capture.py). A
     gaming boot that dropped `-vnc` would silently blind every one of them,
     so the window is ADDITIVE to VNC, never a replacement."""
@@ -168,24 +172,37 @@ class TheSpikeEnvStillWorks(unittest.TestCase):
         self.assertIn("-display none", cmd)
 
 
-class NoProbeWhenNoWindowIsWanted(unittest.TestCase):
-    """`default_display` costs two QEMU subprocess launches. A farming host
-    starting 50 instances must not pay that 50 times for an answer it will
-    discard."""
+class TheHostIsProbedAtMostOnce(unittest.TestCase):
+    """Probing the host costs two QEMU subprocess launches.
 
-    def test_a_farming_boot_never_probes_the_host(self):
+    This used to assert a farming boot never probes at all, because only
+    `gaming` cared about the answer. Headless boots now care too — that is how
+    they get `egl-headless` and the host GPU instead of software rendering —
+    so "never" is no longer the right property. The COST concern behind it is
+    unchanged and still load-bearing: a host bringing up 50 instances must not
+    pay 100 subprocess launches for an answer that cannot change. So the
+    invariant is now "asked once per process", enforced by the memo in
+    _qemu_help_texts.
+    """
+
+    def test_fifty_boots_probe_the_host_once(self):
         from pathlib import Path
+        qemu_proc._HELP_CACHE.clear()
         with mock.patch.dict(os.environ, {}, clear=False), \
-             mock.patch.object(qemu_proc, "_qemu_help_texts") as probe, \
+             mock.patch.object(qemu_proc, "subprocess") as sp, \
              mock.patch.object(qemu_proc, "arm_edk2_code", return_value="/fw/c.fd"), \
              mock.patch.object(qemu_proc, "qemu_bin", side_effect=lambda x: x), \
              mock.patch.object(qemu_proc, "default_accel", return_value="hvf"), \
              mock.patch.object(omni, "runtime_dir", side_effect=lambda n: Path(f"/RT/{n}")), \
              mock.patch.object(omni, "account_dir", side_effect=lambda n: Path(f"/AC/{n}")):
+            sp.run.return_value = mock.Mock(stdout="")
             os.environ.pop("OMNI_GL_WINDOW", None)
             mode = qemu_proc.resolve_mode(_cfg(), "farming")
-            qemu_proc.qemu_command(_acct(), _cfg(), False, mode=mode)
-        probe.assert_not_called()
+            for _ in range(50):
+                qemu_proc.qemu_command(_acct(), _cfg(), False, mode=mode)
+            # two calls: `-display help` and `-device help`, once between them
+            self.assertLessEqual(sp.run.call_count, 2)
+        qemu_proc._HELP_CACHE.clear()
 
 
 if __name__ == "__main__":

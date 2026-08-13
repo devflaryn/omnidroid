@@ -180,11 +180,42 @@ class HostGuiProbe(unittest.TestCase):
 
 
 class QemuHelpProbe(unittest.TestCase):
+    def setUp(self):
+        # The probe is MEMOISED per process (every headless boot asks it now,
+        # and two QEMU launches per boot would be pure waste). Tests that
+        # exercise the probe itself must start from a cold cache or they read
+        # back whatever an earlier test cached.
+        qemu_proc._HELP_CACHE.clear()
+
+    tearDown = setUp
+
     def test_a_failing_probe_returns_empty_strings_not_an_exception(self):
         with mock.patch.object(qemu_proc, "qemu_bin",
                                side_effect=OSError("no qemu")):
             self.assertEqual(qemu_proc._qemu_help_texts("qemu-system-aarch64"),
                              ("", ""))
+
+    def test_the_answer_is_asked_for_once_and_reused(self):
+        with mock.patch.object(qemu_proc, "qemu_bin", side_effect=lambda t: t), \
+             mock.patch.object(qemu_proc.subprocess, "run",
+                               return_value=mock.Mock(stdout="cocoa\n")) as run:
+            first = qemu_proc._qemu_help_texts("qemu-system-aarch64")
+            second = qemu_proc._qemu_help_texts("qemu-system-aarch64")
+        self.assertEqual(first, second)
+        self.assertEqual(run.call_count, 2)      # -display help, -device help
+
+    def test_a_failure_is_not_cached(self):
+        """A QEMU that is still being installed by `setup` must not be
+        remembered as "has no GPU" for the rest of the process."""
+        with mock.patch.object(qemu_proc, "qemu_bin",
+                               side_effect=OSError("not installed yet")):
+            self.assertEqual(qemu_proc._qemu_help_texts("qemu-system-x86_64"),
+                             ("", ""))
+        with mock.patch.object(qemu_proc, "qemu_bin", side_effect=lambda t: t), \
+             mock.patch.object(qemu_proc.subprocess, "run",
+                               return_value=mock.Mock(stdout="egl-headless\n")):
+            self.assertIn("egl-headless",
+                          qemu_proc._qemu_help_texts("qemu-system-x86_64")[0])
 
 
 if __name__ == "__main__":

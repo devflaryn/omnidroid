@@ -525,6 +525,18 @@ _ADB_SOFT_RECOVER = 8
 _ADB_HARD_RECOVER = 25
 
 
+def _print_qemu_log_tail(acct, label, lines=8):
+    """Show why QEMU gave up. Its log is the only place the reason exists —
+    the process is detached, so nothing else ever sees its stderr."""
+    try:
+        log = runtime_dir(acct["name"]) / "qemu.log"
+        text = log.read_text(errors="ignore").strip()
+    except OSError:
+        return
+    for line in text.splitlines()[-lines:]:
+        print(f"[{label}] qemu: {line}")
+
+
 def wait_for_boot(acct, timeout, label, first_boot=False):
     """Poll until sys.boot_completed=1, printing honest progress lines."""
     # arm's serial.log is written under runtime_dir (see qemu_command_arm);
@@ -549,6 +561,19 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
                     initrd_found = True
             except OSError:
                 pass
+        # QEMU gone means this boot is over, and no amount of further polling
+        # will change that. Without this the loop kept probing a dead endpoint
+        # for its FULL timeout (25 minutes on a first boot) while the real
+        # error — QEMU's own exit message, e.g. a missing backing file — sat
+        # unread in qemu.log. Only checked once a pid has been recorded, so a
+        # spawn that has not written run.json yet is not mistaken for a death.
+        pid = running_pid(acct["name"])
+        if pid is None and elapsed > 10:
+            print(f"[{label}] QEMU exited before the guest booted — "
+                  f"see {d / 'qemu.log'}")
+            _print_qemu_log_tail(acct, label)
+            return False
+
         adb_connect(acct)
         if adb_getprop(acct, "sys.boot_completed") == "1":
             print(f"[{label}] boot completed after {elapsed/60:.1f} min")

@@ -17,6 +17,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.TextView;
 
 import java.util.Arrays;
@@ -75,6 +76,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        keepScreenOn();
         status = new TextView(this);
         status.setBackgroundColor(Color.BLACK);
         status.setTextColor(Color.WHITE);
@@ -90,6 +92,7 @@ public class MainActivity extends Activity {
             if (game != null) launchGame(game, "tap");
         });
 
+        dismissKeyguard();
         ensureBlackWallpaper();
         configureLockTask();
 
@@ -125,6 +128,85 @@ public class MainActivity extends Activity {
             // a blip and the host does nothing; if it is dead the host
             // watchdog will power us off after its grace period.
             status.setText("");
+        }
+    }
+
+    /**
+     * The kiosk window never lets the display sleep.
+     *
+     * The host applies the same guarantee device-wide over adb (see
+     * awake.py), and that is the load-bearing half — this is the window-level
+     * belt to its braces, and it covers a case the settings do not: the gap
+     * between HOME appearing and the game taking the foreground. The kiosk is
+     * HOME, so it is on screen at boot, whenever the game blips, and forever
+     * on a "no apk found" instance — exactly the idle stretches with no input
+     * that Android would otherwise blank.
+     *
+     * FLAG_KEEP_SCREEN_ON is scoped to this window, so it releases by itself
+     * when the game takes over; no wakelock to leak. TURN_SCREEN_ON /
+     * SHOW_WHEN_LOCKED make a boot that lands with the display already off
+     * (a warm-restored instance) wake into the kiosk rather than sit dark.
+     */
+    private void keepScreenOn() {
+        try {
+            getWindow().addFlags(
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                    | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                    | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
+        } catch (Exception e) {
+            Log.w(TAG, "could not set keep-screen-on flags: " + e);
+        }
+    }
+
+    /**
+     * Get rid of the lock screen — the "swipe up to enter" the instance used to
+     * boot into.
+     *
+     * There is no user here to swipe: a boot that stops at the keyguard is a
+     * boot that never reaches the game, and on a headless farming instance
+     * nobody is even watching to notice. Three layers, because each covers a
+     * case the others do not:
+     *
+     *  1. KeyguardManager.requestDismissKeyguard — dismisses the keyguard that
+     *     is showing RIGHT NOW, which is the one blocking this boot. Works
+     *     without device owner, and needs no permission for an insecure
+     *     keyguard (the only kind these images have).
+     *  2. DevicePolicyManager.setKeyguardDisabled — device-owner only, and the
+     *     durable one: it stops the keyguard being created on every subsequent
+     *     boot and screen-on, rather than racing to dismiss it each time.
+     *  3. The window flags in keepScreenOn() (SHOW_WHEN_LOCKED |
+     *     DISMISS_KEYGUARD), already applied, which let this activity be
+     *     visible even if a keyguard does slip in front.
+     *
+     * The host also writes `locksettings set-disabled` into /data (see
+     * engine.provision_settings). That is the belt; this is the braces, and it
+     * matters because an image whose /data was baked before that provisioning
+     * existed would otherwise keep its lock screen forever.
+     */
+    private void dismissKeyguard() {
+        try {
+            android.app.KeyguardManager km =
+                    getSystemService(android.app.KeyguardManager.class);
+            if (km != null && km.isKeyguardLocked()) {
+                km.requestDismissKeyguard(this, null);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "requestDismissKeyguard failed: " + t);
+        }
+        try {
+            DevicePolicyManager dpm = getSystemService(DevicePolicyManager.class);
+            if (dpm != null && dpm.isDeviceOwnerApp(getPackageName())) {
+                ComponentName admin =
+                        new ComponentName(this, OmniDeviceAdminReceiver.class);
+                // Returns false (rather than throwing) when a secure lock
+                // credential is set — these images have none, so a false here
+                // is worth a log line, not a failure.
+                boolean off = dpm.setKeyguardDisabled(admin, true);
+                Log.i(TAG, "device owner: keyguard disabled = " + off);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "setKeyguardDisabled failed: " + t);
         }
     }
 
@@ -259,7 +341,7 @@ public class MainActivity extends Activity {
             }
             // Fall through to the plain launcher intent: better to show Roblox's
             // own screen than a dead kiosk. The host sees the reason in logcat
-            // and in the `omni play` reply.
+            // and in the `omnidroid play` reply.
             Log.w(TAG, "deep-link join failed (" + err + "); "
                     + "falling back to the launcher intent");
         }

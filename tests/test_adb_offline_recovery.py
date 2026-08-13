@@ -26,11 +26,11 @@ class Recovery(unittest.TestCase):
     def _calls(self, hard):
         seen = []
 
-        def fake_run(cmd, **kw):
+        def fake_run(cmd, timeout):
             seen.append(cmd)
             return mock.Mock(stdout="", stderr="", returncode=0)
 
-        with mock.patch.object(adbmod.subprocess, "run", fake_run):
+        with mock.patch.object(adbmod, "_run_adb", fake_run):
             adbmod.adb_recover(ACCT, hard=hard)
         return [c[1:] for c in seen]      # drop the leading "adb"
 
@@ -56,16 +56,17 @@ class Recovery(unittest.TestCase):
 
     def test_recovery_never_raises(self):
         # It runs inside a poll loop; a failure here must not kill the boot.
-        with mock.patch.object(adbmod.subprocess, "run",
+        with mock.patch.object(adbmod, "_run_adb",
                                side_effect=OSError("adb gone")):
             adbmod.adb_recover(ACCT)          # must not raise
             adbmod.adb_recover(ACCT, hard=True)
 
     def test_state_reports_offline_and_never_raises(self):
-        with mock.patch.object(adbmod.subprocess, "run",
-                               return_value=mock.Mock(stdout="offline\n")):
+        with mock.patch.object(adbmod, "_run_adb",
+                               return_value=mock.Mock(stdout="offline\n",
+                                                      stderr="")):
             self.assertEqual(adbmod.adb_state(ACCT), "offline")
-        with mock.patch.object(adbmod.subprocess, "run",
+        with mock.patch.object(adbmod, "_run_adb",
                                side_effect=OSError("boom")):
             self.assertEqual(adbmod.adb_state(ACCT), "")
 
@@ -91,7 +92,7 @@ class StateReadsBothStreams(unittest.TestCase):
     -- which is what "booting takes 15 minutes" actually was."""
 
     def _state(self, stdout="", stderr="", rc=0):
-        with mock.patch.object(adbmod.subprocess, "run",
+        with mock.patch.object(adbmod, "_run_adb",
                                return_value=mock.Mock(stdout=stdout,
                                                       stderr=stderr,
                                                       returncode=rc)):
@@ -112,6 +113,54 @@ class StateReadsBothStreams(unittest.TestCase):
 
     def test_an_unrecognised_error_is_empty(self):
         self.assertEqual(self._state(stderr="error: something else\n", rc=1), "")
+
+class NoPipeForTheAdbServer(unittest.TestCase):
+    """REGRESSION: `adb` forks a long-lived SERVER that inherits our stdout and
+    stderr. Handed PIPES (capture_output=True), that daemon holds them open for
+    its whole life, so subprocess.run's timeout path -- kill the child, then
+    communicate() again to reap it -- blocks in that second communicate()
+    FOREVER. Measured: adb_connect sat for 12+ minutes against a QEMU that had
+    already exited, with a 15 s timeout set.
+
+    So the transport must never hand adb a pipe. This pins that."""
+
+    def test_adb_is_never_given_a_pipe(self):
+        captured = {}
+
+        class FakeProc:
+            pid = 1234
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kw):
+            captured.update(kw)
+            return FakeProc()
+
+        with mock.patch.object(adbmod.subprocess, "Popen", fake_popen):
+            r = adbmod._run_adb(["adb", "devices"], timeout=5)
+        self.assertEqual(r.returncode, 0)
+        self.assertIsNot(captured.get("stdout"), adbmod.subprocess.PIPE)
+        self.assertIsNot(captured.get("stderr"), adbmod.subprocess.PIPE)
+        # stdin, too: an inherited console stdin is its own hang.
+        self.assertIs(captured.get("stdin"), adbmod.subprocess.DEVNULL)
+
+    def test_a_timeout_kills_the_child_and_raises(self):
+        killed = []
+
+        class HangingProc:
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    raise adbmod.subprocess.TimeoutExpired("adb", timeout)
+                return 0
+            def kill(self):
+                killed.append(True)
+
+        with mock.patch.object(adbmod.subprocess, "Popen",
+                               lambda cmd, **kw: HangingProc()):
+            with self.assertRaises(adbmod.subprocess.TimeoutExpired):
+                adbmod._run_adb(["adb", "devices"], timeout=1)
+        self.assertTrue(killed, "a timed-out adb must be killed, not left running")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -121,10 +121,15 @@ class ModeSizing(unittest.TestCase):
         self.assertGreaterEqual(int(cmd[cmd.index("-m") + 1]), 2048)
 
     def test_instances_stay_headless_and_localhost_only(self):
+        # "Headless" means NO WINDOW ON SCREEN — not literally `-display none`.
+        # On a host whose QEMU can do it, a headless boot uses `egl-headless`
+        # to render on the real GPU; that still puts nothing on screen, and
+        # asserting the exact string would forbid the acceleration rather than
+        # protect the property that matters.
+        from omnidroid.qemu_proc import command_opens_a_window
         for cmd in (arm_cmd("farming"), x86_cmd("farming")):
-            joined = " ".join(cmd)
-            self.assertIn("-display none", joined)
-            self.assertIn("-vnc 127.0.0.1:", joined)
+            self.assertFalse(command_opens_a_window(cmd))
+            self.assertIn("-vnc 127.0.0.1:", " ".join(cmd))
 
 
 class BalloonTarget(unittest.TestCase):
@@ -167,7 +172,7 @@ class BalloonTarget(unittest.TestCase):
 
 
 class MemPlumbing(unittest.TestCase):
-    """`omni start --mem N` was accepted by argparse and then dropped on the
+    """`omnidroid start --mem N` was accepted by argparse and then dropped on the
     floor: _ensure_booted called resolve_mode() without it, so the flag
     silently booted at the mode's own size. A 512 MB farming boot then
     surfaced as an unexplained boot timeout."""
@@ -186,6 +191,8 @@ class MemPlumbing(unittest.TestCase):
              mock.patch.object(omni, "_devkit_activate"), \
              mock.patch.object(omni, "_enforce_hiding"), \
              mock.patch.object(omni, "assert_kiosk_game"), \
+             mock.patch.object(omni, "apply_consent"), \
+             mock.patch.object(omni, "apply_awake"), \
              mock.patch.object(omni, "apply_farming_squeeze"), \
              mock.patch.object(omni, "apply_balloon_target"), \
              mock.patch.object(omni, "apply_roblox_settings"), \
