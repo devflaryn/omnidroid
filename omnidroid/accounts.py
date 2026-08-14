@@ -475,8 +475,17 @@ def capture_login(repo, browser="chrome", timeout=300, profile_dir=None,
         return {"ok": False, "error": "browser_failed",
                 "message": f"could not start {browser}: {e}"}
 
+    # Same contract as capture_login_from_cookie: callers read r["ok"], so an
+    # escaping WebDriverException is not an error message, it is a dead process
+    # (and, in the frozen GUI build, a raw traceback dialog).
+    from selenium.common.exceptions import WebDriverException
     try:
-        drv.get(LOGIN_URL)
+        try:
+            drv.get(LOGIN_URL)
+        except WebDriverException as e:
+            return {"ok": False, "error": "navigation_failed",
+                    "message": (f"the browser could not open the Roblox login "
+                                f"page: {_wd_reason(e)}")}
         on_status(f"[login] browser open at {LOGIN_URL} — sign in "
                   f"(password/2FA/captcha all stay between you and Roblox).")
         on_status(f"[login] waiting up to {timeout}s for a landing on "
@@ -518,11 +527,85 @@ def capture_login(repo, browser="chrome", timeout=300, profile_dir=None,
                if seen_home else "never reached roblox.com/home")
         return {"ok": False, "error": "timeout",
                 "message": f"no authenticated session within {timeout}s: {why}"}
+    except WebDriverException as e:
+        return {"ok": False, "error": "browser_failed",
+                "message": (f"the browser failed during sign-in: "
+                            f"{_wd_reason(e)}")}
     finally:
         try:
             drv.quit()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _wd_reason(e):
+    """The first useful line of a WebDriverException.
+
+    Its __str__ already starts with "Message: " and then appends a stacktrace
+    and session info, so interpolating it raw gives "Message: Message: unable
+    to set cookie" followed by 20 lines of chromedriver addresses."""
+    lines = str(e).strip().splitlines()
+    line = lines[0].strip() if lines else ""
+    # Doubled in practice: chromedriver's own text already reads "Message:
+    # unable to set cookie", and __str__ prepends another one. Strip until
+    # there is none left rather than assuming a fixed number.
+    while line.startswith("Message:"):
+        line = line[len("Message:"):].strip()
+    return line or e.__class__.__name__
+
+
+def _plant_cookie(drv, cookie, on_status=print):
+    """Put `.ROBLOSECURITY` into the browser's jar. None on success, else
+    (error, message).
+
+    `add_cookie` is a WebDriver call bound to the CURRENT DOCUMENT's origin, so
+    it fails with a bare "unable to set cookie" whenever the browser is not
+    actually sitting on roblox.com — a DNS failure, a captive portal, a proxy,
+    or anything else that leaves Chrome on `chrome-error://chromewebdata/`
+    looks identical from here. Reported from a real machine (Chrome 151) and
+    NOT reproducible on a healthy one, which is exactly the signature of a
+    navigation that did not land.
+
+    So: check the origin first and say so plainly, then fall back to CDP
+    `Network.setCookie`, which writes straight to the network stack and does
+    not care what document is loaded. Between them, the only remaining failure
+    is one worth reporting.
+    """
+    from selenium.common.exceptions import WebDriverException
+
+    try:
+        url = drv.current_url or ""
+    except WebDriverException:
+        return ("browser_closed",
+                "the headless browser session ended before the cookie could "
+                "be planted")
+    if "roblox.com" not in url:
+        return ("navigation_failed",
+                f"the browser could not open roblox.com (it is on {url!r}). "
+                f"Check the internet connection, VPN or proxy — a cookie "
+                f"cannot be planted for a site the browser never reached.")
+
+    spec = {"name": COOKIE_NAME, "value": cookie, "domain": ".roblox.com",
+            "path": "/", "secure": True}
+    first_error = None
+    try:
+        drv.add_cookie(spec)
+        return None
+    except WebDriverException as e:
+        first_error = _wd_reason(e)
+
+    # CDP: same cookie, written without reference to the loaded document.
+    try:
+        drv.execute_cdp_cmd("Network.setCookie",
+                            {**spec, "httpOnly": True, "sameSite": "None"})
+        if drv.get_cookie(COOKIE_NAME):
+            on_status("[login] planted the cookie via CDP "
+                      "(add_cookie was refused)")
+            return None
+    except Exception:  # noqa: BLE001 — a failed fallback must not mask the cause
+        pass
+    return ("cookie_rejected",
+            f"the browser refused the session cookie: {first_error}")
 
 
 def capture_login_from_cookie(repo, cookie, browser="chrome", timeout=30,
@@ -556,12 +639,25 @@ def capture_login_from_cookie(repo, cookie, browser="chrome", timeout=30,
         return {"ok": False, "error": "browser_failed",
                 "message": f"could not start headless {browser}: {e}"}
 
+    # Every failure below MUST come back as a result dict. cmd_login and
+    # _capture_and_save_account both read `r["ok"]`, so an exception escaping
+    # here does not become an error message — it takes down the whole process,
+    # and in the frozen GUI build that surfaces as PyInstaller's raw
+    # "Unhandled exception in script" traceback dialog. That is exactly what a
+    # WebDriverException out of add_cookie did.
+    from selenium.common.exceptions import WebDriverException
     try:
         # add_cookie() only works once the browser is already on a matching
         # domain — robots.txt is the cheapest real page roblox.com serves.
-        drv.get("https://www.roblox.com/robots.txt")
-        drv.add_cookie({"name": COOKIE_NAME, "value": cookie,
-                        "domain": ".roblox.com", "path": "/", "secure": True})
+        try:
+            drv.get("https://www.roblox.com/robots.txt")
+        except WebDriverException as e:
+            return {"ok": False, "error": "navigation_failed",
+                    "message": (f"the browser could not open roblox.com: "
+                                f"{_wd_reason(e)}")}
+        planted = _plant_cookie(drv, cookie, on_status)
+        if planted:
+            return {"ok": False, "error": planted[0], "message": planted[1]}
         on_status(f"[login] headless {browser} verifying the cookie ...")
         drv.get("https://www.roblox.com/home")
         deadline = time.time() + timeout
@@ -593,6 +689,12 @@ def capture_login_from_cookie(repo, cookie, browser="chrome", timeout=30,
                   f"saved to {ACCOUNTS_FILE} (0600)")
         return {"ok": True, "username": uname, "user_id": uid,
                 "path": str(accounts_path(repo))}
+    except WebDriverException as e:
+        # The backstop for anything the specific handlers above did not name.
+        # Adding an account failing is a message; the app dying is a bug.
+        return {"ok": False, "error": "browser_failed",
+                "message": (f"the headless browser failed: "
+                            f"{_wd_reason(e)}")}
     finally:
         try:
             drv.quit()
