@@ -99,14 +99,21 @@ HEADLESS_DISPLAY_ARGS = ["-display", "none"]
 # "why is this so slow" the hardware could not explain: a 4060 sat idle while
 # the CPU drew every frame.
 #
-# `-display egl-headless` fixes exactly that. It gives QEMU a host GL context
-# with NO window, so virglrenderer can hand the guest's GL calls to the real
-# GPU while the framebuffer still goes out over VNC — the viewer, screenshot,
-# autocap and the input skill all keep working unchanged.
+# `-display egl-headless` addresses exactly that: it gives QEMU a host GL
+# context with NO window, so virglrenderer can hand the guest's GL calls to the
+# real GPU.
+#
+# IT COSTS THE VIEWER. On this QEMU/ANGLE build the guest renders into a host
+# GL texture that is never read back into the 2D surface the VNC server
+# publishes, so `omnidroid view` shows a BLACK SCREEN while the guest is
+# drawing normally (measured both ways on one host; see _headless_gl_wanted).
+# So it is OFF by default and opt-in via config `qemu.headless_gl` /
+# OMNI_HEADLESS_GL=1 — worth it for a headless farming instance nobody
+# watches, never worth it when someone needs to see the screen.
 #
 # Gated on the QEMU build advertising BOTH pieces, because neither is
 # universal: the Windows bundle has them, and a Homebrew macOS QEMU has
-# neither (no virglrenderer formula), where this degrades to today's software
+# neither (no virglrenderer formula), where this degrades to the software
 # path rather than failing a boot.
 HEADLESS_GL_DISPLAY = "egl-headless"
 HEADLESS_GL_GPU_ARGS = ["-device", GL_GPU_DEVICE]
@@ -599,19 +606,36 @@ def headless_gl_capability(qemu_display_help="", qemu_device_help=""):
 
 
 def _headless_gl_wanted(cfg):
-    """Config `qemu.headless_gl` (default ON), overridable by OMNI_HEADLESS_GL.
+    """Config `qemu.headless_gl` (default OFF), overridable by OMNI_HEADLESS_GL.
 
-    Default-on because the software path is a large, silent performance loss
-    and the capability is host-detected anyway. The switch exists because GPU
-    stacks fail in ways a capability probe cannot see — a driver that
-    advertises virgl and then renders nothing is a black screen, not an error
-    — so there has to be one thing to turn off before anyone starts bisecting.
+    DEFAULT OFF, and that is a measurement, not caution.
+
+    `egl-headless` renders the guest into a host GL texture. This QEMU/ANGLE
+    build never reads that texture back into the 2D surface the VNC server
+    publishes, so the viewer — the product's only window into an instance —
+    goes ALL BLACK while the guest is drawing perfectly well. Measured on the
+    same host, same image, same account, only this flag differing:
+
+        headless_gl on   VNC framebuffer all channels (0,0)     [black]
+        headless_gl off  VNC framebuffer all channels (0,255)   [content]
+
+    and QEMU's own `screendump` had content in both cases, which is what pins
+    it on the GL->VNC path rather than on the guest.
+
+    Rendering the guest on the GPU is still a real win for a headless farming
+    instance nobody watches, so the capability stays and this switch turns it
+    on. It must not be the default while the viewer matters.
+
+    (An earlier version of this comment claimed the framebuffer "still goes out
+    over VNC unchanged". It does not. That was never tested: every screenshot
+    taken while developing it came from `adb exec-out screencap`, which reads
+    Android's compositor and would look identical either way.)
     """
     env = os.environ.get("OMNI_HEADLESS_GL", "").strip()
     if env:
         return env not in ("0", "false", "False", "no")
     value = ((cfg or {}).get("qemu") or {}).get("headless_gl")
-    return True if value is None else bool(value)
+    return False if value is None else bool(value)
 
 
 def resolve_gpu_display(mode, interactive, tool, cfg=None):

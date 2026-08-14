@@ -14,12 +14,27 @@ and after, on the same machine (Windows, QEMU 11.0.50, RTX 4060):
     GLES: Mesa, virgl (ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 ...))
 
 `-display egl-headless` is what makes that possible: a real host GL context
-with NO window, so virglrenderer can use the GPU while the framebuffer still
-goes out over VNC (viewer, screenshot, autocap and the input tooling unchanged).
+with NO window, so virglrenderer can use the GPU.
 
-The two properties worth pinning are the ones that would silently break the
+IT IS OFF BY DEFAULT, and that is the single most important thing these tests
+pin. On this QEMU/ANGLE build the guest renders into a host GL texture that is
+never read back into the 2D surface the VNC server publishes, so `omnidroid
+view` shows a BLACK SCREEN while the guest is drawing perfectly well.
+Measured on one host, same image, same account, only the flag differing:
+
+    headless_gl on    VNC framebuffer (0,0) on every channel      [black]
+    headless_gl off   VNC framebuffer (0,255) on every channel    [content]
+
+QEMU's own `screendump` had content either way, which is what pins it on the
+GL->VNC readback rather than on the guest. It shipped default-ON for a few
+hours on the strength of a claim that was never tested — every screenshot
+taken while developing it came from `adb exec-out screencap`, which reads
+Android's compositor and looks identical either way.
+
+The properties worth pinning are the ones that would silently break the
 product rather than fail loudly:
 
+  * it stays OFF unless asked for, so the viewer works,
   * it must degrade, never fail, on a QEMU without the pieces (the Homebrew
     macOS build has neither), and
   * egl-headless must still count as HEADLESS — read as "a window opened",
@@ -73,8 +88,22 @@ class Resolution(unittest.TestCase):
             return qemu_proc.resolve_gpu_display(mode, interactive,
                                                  "qemu-system-x86_64", cfg)
 
-    def test_a_capable_host_gets_the_gpu(self):
+    def test_it_is_OFF_by_default_because_it_blacks_out_the_viewer(self):
+        """The default is a MEASUREMENT, not caution.
+
+        egl-headless renders into a host GL texture this QEMU/ANGLE build never
+        reads back into the 2D surface VNC publishes, so `omnidroid view` shows
+        a black screen while the guest draws normally. Measured on one host,
+        same image, only this flag differing: VNC framebuffer (0,0) on every
+        channel with it on, (0,255) with it off, and QEMU's own screendump had
+        content either way.
+        """
         gpu, display = self._pair(WINDOWS_QEMU)
+        self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
+        self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
+
+    def test_a_capable_host_gets_the_gpu_when_asked(self):
+        gpu, display = self._pair(WINDOWS_QEMU, cfg={"qemu": {"headless_gl": True}})
         self.assertEqual(display, ["-display", "egl-headless"])
         self.assertEqual(gpu, ["-device", "virtio-gpu-gl-pci"])
 
@@ -90,20 +119,27 @@ class Resolution(unittest.TestCase):
         self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
         self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
 
-    def test_config_can_turn_it_off(self):
-        cfg = {"qemu": {"headless_gl": False}}
+    def test_config_can_turn_it_on(self):
+        cfg = {"qemu": {"headless_gl": True}}
         gpu, display = self._pair(WINDOWS_QEMU, cfg=cfg)
-        self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
-
-    def test_env_can_turn_it_off_without_touching_config(self):
-        gpu, display = self._pair(WINDOWS_QEMU, env={"OMNI_HEADLESS_GL": "0"})
-        self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
-
-    def test_env_can_turn_it_on_over_a_config_that_disables_it(self):
-        cfg = {"qemu": {"headless_gl": False}}
-        gpu, display = self._pair(WINDOWS_QEMU, cfg=cfg,
-                                  env={"OMNI_HEADLESS_GL": "1"})
         self.assertEqual(display, ["-display", "egl-headless"])
+
+    def test_env_can_turn_it_on_without_touching_config(self):
+        gpu, display = self._pair(WINDOWS_QEMU, env={"OMNI_HEADLESS_GL": "1"})
+        self.assertEqual(display, ["-display", "egl-headless"])
+
+    def test_env_can_turn_it_off_over_a_config_that_enables_it(self):
+        cfg = {"qemu": {"headless_gl": True}}
+        gpu, display = self._pair(WINDOWS_QEMU, cfg=cfg,
+                                  env={"OMNI_HEADLESS_GL": "0"})
+        self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
+
+    def test_an_incapable_host_ignores_the_request_entirely(self):
+        """Asking for GPU rendering on a QEMU that cannot do it must degrade,
+        never produce args that make QEMU exit instead of booting."""
+        gpu, display = self._pair(BREW_MAC_QEMU, cfg={"qemu": {"headless_gl": True}})
+        self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
+        self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
 
 
 class StillHeadless(unittest.TestCase):
