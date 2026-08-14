@@ -733,8 +733,26 @@ TRIM_PACKAGES = (
     "com.android.printspooler",
     "com.android.imsserviceentitlement",
     "com.android.cellbroadcastreceiver.module",
-    # Deliberately KEPT: GMS/Play Store (Play Integrity), latin IME (login
-    # typing), Settings (FallbackHome), managedprovisioning (device owner),
+    # The Play STORE, and this one is a bug fix rather than a memory trim.
+    #
+    # Left enabled it self-updates on a loop inside the guest, and every
+    # update REPLACES packages the game depends on. Android kills a process
+    # whose dependency is replaced, so Roblox was being killed and relaunched
+    # every ~45 seconds — reported as "the kiosk restarts the game from 0,
+    # logs in, closes and reopens continuously". Traced live:
+    #
+    #   I ActivityManager: Killing 5717:com.google.android.gms … due to installPackageLI
+    #   I ActivityManager: Process com.android.vending (pid 6276) has died
+    #   W ActivityManager: Rescheduling restart … for mem-pressure-event
+    #
+    # Disabling it: zero kills in the next 100 s, same Roblox pid throughout.
+    #
+    # GMS ITSELF IS STILL KEPT. Play Integrity lives in GMS, not in the store,
+    # and it is the store that does the self-updating — so this is the narrow
+    # cut, not "drop Google".
+    "com.android.vending",
+    # Deliberately KEPT: GMS (Play Integrity), latin IME (login typing),
+    # Settings (FallbackHome), managedprovisioning (device owner),
     # networkstack / com.android.phone / media provider (stability).
 )
 
@@ -1140,6 +1158,53 @@ def resolve_game_package(acct, cfg=None):
         return (cfg or {}).get("base_game", {}).get(acct["base"])
     except Exception:  # noqa: BLE001 — no config, wrong shape, unreadable
         return None
+
+
+# The Play Store is in TRIM_PACKAGES, but that list only runs during
+# provision_settings -- which is dead on the product path, because instances
+# are EPHEMERAL and boot from a pre-provisioned /data with first_boot_done
+# already set. So the store comes back enabled on every launch and has to be
+# quietened on every launch, exactly like assert_kiosk_game below.
+_STORE_PKG = "com.android.vending"
+
+
+def quiet_the_store(acct, label=None):
+    """Stop the Play Store self-updating, on EVERY boot.
+
+    Left running it updates itself and GMS on a loop, and each update REPLACES
+    packages the game depends on. Android kills a process whose dependency is
+    replaced, so Roblox was killed and relaunched every ~45 seconds -- the
+    "kiosk restarts the game from 0, logs in, closes and reopens continuously"
+    report. Traced live on this base:
+
+        I ActivityManager: Killing 5717:com.google.android.gms … due to installPackageLI
+        I ActivityManager: Process com.android.vending (pid 6276) has died
+        W ActivityManager: Rescheduling restart … for mem-pressure-event
+
+    Disabled: zero kills over the next 100 s and the same Roblox pid
+    throughout, on the same instance that had been cycling.
+
+    GMS itself is left alone -- Play Integrity lives there, not in the store,
+    and it is the store that does the updating. `pm disable-user` is per-/data
+    and reversible, like every other trim here.
+    """
+    if not acct.get("adb_port"):
+        return          # no live endpoint to talk to; nothing to quieten
+    try:
+        r = adb(acct, "shell", "pm", "disable-user", "--user", "0", _STORE_PKG,
+                timeout=20)
+        out = (r.stdout or "") + (r.stderr or "")
+    # SystemExit too, NOT just Exception: adb's _require_adb_port calls fail(),
+    # which sys.exits. A best-effort tune-up must never be able to end the
+    # process — it took down three unrelated test suites the moment this was
+    # added to the boot tail.
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        out = str(e)
+    if label and "disabled" not in out:
+        # Say so rather than pretend: if this did not land, the game will be
+        # killed on a loop and the cause will not be obvious from the symptom.
+        print(f"[{label}] play store: could NOT disable {_STORE_PKG} "
+              f"({out.strip()[:120]}) - the game may be restarted repeatedly")
 
 
 def assert_kiosk_game(acct, cfg, label):
@@ -7731,6 +7796,7 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # assert_kiosk_game for the full trace. This used to happen only inside
     # _devkit_activate, i.e. only on a --debug boot, which is exactly the
     # dev-base-era gating the dual-use change was supposed to remove.
+    quiet_the_store(acct, label)
     assert_kiosk_game(acct, cfg, label)
     # EVERY boot: grant the permissions a human would otherwise be asked to
     # tap through (full disk access above all) and silence the ANR/crash
