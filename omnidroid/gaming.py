@@ -50,6 +50,11 @@ def su_sh(su, script):
     '<quoted script>'"`, one argument, quoted once, so adb's re-parse of the
     joined argv lands the whole script in root's shell rather than the first
     word of it."""
+    # "" is a VALID root mode: on the x86 Bliss base adbd ITSELF runs as uid 0,
+    # so there is no wrapper to prepend and `{su} 0 sh -c ...` would run the
+    # literal command `0`. See engine.resolve_root_shell.
+    if su == "":
+        return ["shell", f"sh -c {shlex.quote(script)}"]
     return ["shell", f"{su} 0 sh -c {shlex.quote(script)}"]
 
 
@@ -121,7 +126,7 @@ def build_tuning_sequence(mode=None, su=None):
         steps.append(["shell", "settings", "put", "global", scale, "0"])
 
     # 3) Keep the game's pages resident. See GAMING_SWAPPINESS. Root-only.
-    if su:
+    if su is not None:
         steps.append(su_sh(su, f"echo {GAMING_SWAPPINESS} > "
                                "/proc/sys/vm/swappiness 2>/dev/null; true"))
 

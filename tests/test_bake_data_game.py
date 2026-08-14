@@ -11,7 +11,7 @@ Two requirements, and the second is what shapes the design:
      A host-side `settings put` after boot is always too late: the kiosk has
      resolved, launched and PINNED its choice under Lock Task by then.
 
-  2. Roblox updates often. Baking it into the SYSTEM image (`omni bake-game`,
+  2. Roblox updates often. Baking it into the SYSTEM image (`omnidroid bake-game`,
      /product/app/Roblox) means rebuilding a 2.3 GB base with ~6 GiB of scratch
      for every update. Installing it into /DATA instead makes an update one
      ~2-minute command, because an updated system app lives in /data/app and

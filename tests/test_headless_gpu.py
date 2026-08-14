@@ -62,7 +62,11 @@ class Capability(unittest.TestCase):
         cap = qemu_proc.headless_gl_capability(*WINDOWS_QEMU)
         self.assertTrue(cap["available"])
         self.assertEqual(cap["display_args"], ["-display", "egl-headless"])
-        self.assertEqual(cap["gpu_args"], ["-device", "virtio-gpu-gl-pci"])
+        # The panel size is named explicitly: the device's own mode list
+        # starts at 640x480 and the guest takes the first entry, so a GL boot
+        # came up at 640x480 while the software path gave 1280x800.
+        self.assertEqual(cap["gpu_args"],
+                         ["-device", "virtio-gpu-gl-pci,xres=1280,yres=800"])
 
     def test_a_qemu_without_virglrenderer_cannot(self):
         cap = qemu_proc.headless_gl_capability(*BREW_MAC_QEMU)
@@ -105,7 +109,7 @@ class Resolution(unittest.TestCase):
     def test_a_capable_host_gets_the_gpu_when_asked(self):
         gpu, display = self._pair(WINDOWS_QEMU, cfg={"qemu": {"headless_gl": True}})
         self.assertEqual(display, ["-display", "egl-headless"])
-        self.assertEqual(gpu, ["-device", "virtio-gpu-gl-pci"])
+        self.assertEqual(gpu, ["-device", "virtio-gpu-gl-pci,xres=1280,yres=800"])
 
     def test_an_incapable_host_gets_exactly_what_it_had_before(self):
         gpu, display = self._pair(BREW_MAC_QEMU)

@@ -2,7 +2,7 @@
 """Offline tests for the reused-instance install-recovery matcher.
 
 Pure functions — no VM, no adb. Pins WHICH adb-install failures trigger the
-auto force-stop + unpin + uninstall + reinstall path in `omni install`, so a
+auto force-stop + unpin + uninstall + reinstall path in `omnidroid install`, so a
 refactor can't silently stop matching the real adb error strings and let the
 agent dead-end again on a reused instance.
 

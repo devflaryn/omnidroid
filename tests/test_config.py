@@ -1,3 +1,4 @@
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -61,6 +62,30 @@ def test_engine_imports_the_override_aware_images_dir():
     name)."""
     from omnidroid import engine
     assert engine.images_dir is config.images_dir
+
+
+def test_config_path_env_override(tmp_path, monkeypatch):
+    """OMNIDROID_CONFIG_PATH lets an embedding host (the omni-executor GUI's
+    frozen --omnidroid subprocess) point the loader at a config file it
+    wrote itself, instead of the fixed REPO/configs/paths.json. CONFIG_PATH
+    is a direct name binding computed at IMPORT time (engine.py/bases.py do
+    `from .config import CONFIG_PATH`), so this must be exercised via
+    importlib.reload with the env already set -- calling config.CONFIG_PATH
+    without reloading would still see the value bound at the first import."""
+    target = tmp_path / "custom-paths.json"
+    monkeypatch.setenv("OMNIDROID_CONFIG_PATH", str(target))
+    try:
+        importlib.reload(config)
+        assert config.CONFIG_PATH == target
+    finally:
+        monkeypatch.delenv("OMNIDROID_CONFIG_PATH", raising=False)
+        importlib.reload(config)  # restore the default binding for other tests
+
+
+def test_config_path_no_env_falls_back_to_repo_configs(monkeypatch):
+    monkeypatch.delenv("OMNIDROID_CONFIG_PATH", raising=False)
+    importlib.reload(config)
+    assert config.CONFIG_PATH == config.REPO / "configs" / "paths.json"
 
 
 def test_install_readiness_honors_images_dir_override(tmp_path, monkeypatch):

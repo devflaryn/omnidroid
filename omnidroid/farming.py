@@ -6,7 +6,7 @@ adb, without a separate image. This module only BUILDS the command sequence
 
 Division of labour with lean.py: anything that has to be a `ro.*` property, or
 that means deleting files, is a BASE-IMAGE change and lives in lean.py behind
-`omni strip-base`. Everything here is what can still be done to an already-
+`omnidroid strip-base`. Everything here is what can still be done to an already-
 booted guest over adb. The split is not stylistic — `setprop ro.config.low_ram
 true` at runtime is silently ignored, because init freezes `ro.*` once it has
 set it. Trying to do the base-image tier from here is the obvious wrong turn.
@@ -104,7 +104,10 @@ def build_client_settings_script(su, settings=None):
     code_cache/ are owned 10138:20138 (a different GROUP), so recursing over
     the whole sandbox would corrupt them while fixing this.
     """
-    if not su:
+    # `is None`, not falsy: "" is a VALID root mode (adbd already runs as uid
+    # 0 on the x86 base, so no wrapper is needed). Treating "" as "no root" is
+    # what skipped this tune on every x86 launch — see engine.resolve_root_shell.
+    if su is None:
         return None
     body = lean.client_settings_json(settings)
     files_dir = lean.CLIENT_SETTINGS_DIR.rsplit("/", 1)[0]

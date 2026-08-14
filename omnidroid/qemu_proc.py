@@ -83,6 +83,14 @@ def _gl_window_requested():
 # framebuffer encode -> decode -> synthesised input. Rendering is still
 # software in that tier; latency is not.
 GL_GPU_DEVICE = "virtio-gpu-gl-pci"          # needs virglrenderer in QEMU
+# The guest panel size for the GL device, set EXPLICITLY.
+#
+# virtio-gpu-gl-pci documents xres/yres defaulting to 1280x800, but the mode
+# list it hands the guest starts with 640x480 and Android takes the first one:
+# a GL boot came up at 640x480 while the software path gave 1280x800. Naming
+# them puts the preferred mode where the guest will pick it.
+GL_XRES, GL_YRES = 1280, 800
+_GL_DEVICE_ARG = f"{GL_GPU_DEVICE},xres={GL_XRES},yres={GL_YRES}"
 HEADLESS_GPU_ARGS = ["-device", "virtio-gpu-pci"]
 HEADLESS_DISPLAY_ARGS = ["-display", "none"]
 
@@ -116,7 +124,7 @@ HEADLESS_DISPLAY_ARGS = ["-display", "none"]
 # neither (no virglrenderer formula), where this degrades to the software
 # path rather than failing a boot.
 HEADLESS_GL_DISPLAY = "egl-headless"
-HEADLESS_GL_GPU_ARGS = ["-device", GL_GPU_DEVICE]
+HEADLESS_GL_GPU_ARGS = ["-device", _GL_DEVICE_ARG]
 HEADLESS_GL_DISPLAY_ARGS = ["-display", HEADLESS_GL_DISPLAY]
 
 # Windowing backends that can carry a real window, best first per platform.
@@ -208,7 +216,7 @@ def default_display(qemu_display_help="", qemu_device_help="", has_gui=True):
         return _none(f"this QEMU build has no {wanted} display backend")
     if GL_GPU_DEVICE in qemu_device_help:
         return {"available": True, "tier": "gl",
-                "gpu_args": ["-device", GL_GPU_DEVICE],
+                "gpu_args": ["-device", _GL_DEVICE_ARG],
                 "display_args": ["-display", f"{backend},gl=on"],
                 "reason": f"{backend},gl=on + {GL_GPU_DEVICE} (3D accelerated)"}
     return {"available": True, "tier": "window",
@@ -847,7 +855,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         # Built-in VNC server, LOCALHOST ONLY (no auth is safe ONLY because
         # of the 127.0.0.1 bind — HARD RULE, same as x86; never bind a
         # network interface without adding auth in the same change).
-        "-vnc", f"127.0.0.1:{vnc_display}",
+        *vnc_args(display_args, vnc_display),
         *usb_devices(mode, arm=True),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
@@ -1006,7 +1014,7 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         # Idle (no viewer) it does no framebuffer encoding, so leaving it
         # on costs ~nothing across hours-long headless runs; a viewer
         # disconnecting never affects the instance.
-        "-vnc", f"127.0.0.1:{vnc_display}",
+        *vnc_args(display_args, vnc_display),
         *usb_devices(mode, arm=False),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
@@ -1034,6 +1042,45 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
 # but shows nothing. Reading it as "a window opened" would make `start` stand
 # its VNC viewer down, leaving the user with no way to see the instance at all.
 _WINDOWLESS_DISPLAYS = ("none", "", HEADLESS_GL_DISPLAY, "egl-headless")
+
+
+def uses_gl_context(display_args):
+    """Does this display pair give QEMU a GL context?
+
+    `gl=on` on a windowed backend, or egl-headless. Both are mutually exclusive
+    with the VNC server (see vnc_args).
+    """
+    for arg in display_args or []:
+        text = str(arg)
+        if "gl=on" in text or text.split(",")[0] == HEADLESS_GL_DISPLAY:
+            return True
+    return False
+
+
+def vnc_args(display_args, vnc_display):
+    """The `-vnc` pair, or nothing when a GL context rules it out.
+
+    QEMU REFUSES the combination, and says so:
+
+        qemu: -vnc 127.0.0.1:12101: Display vnc is incompatible with the GL context
+
+    That single line explains both GPU failures on this host. `gaming` mode
+    (gtk,gl=on) exited on startup instead of booting, because -vnc was always
+    appended. And `egl-headless` did not error but published a framebuffer VNC
+    could never be fed from, which is the black viewer.
+
+    So GL and VNC are an either/or, and the choice follows the display:
+      * a GL boot has a real window (or is farming, where nobody is watching),
+        so it does not need the VNC server, and
+      * every other boot keeps VNC exactly as before.
+
+    What a GL boot gives up: `omnidroid view`, and capture.py/autocap, which
+    attach to this framebuffer. `omnidroid screenshot` is unaffected — it goes
+    through adb, not VNC.
+    """
+    if uses_gl_context(display_args):
+        return []
+    return ["-vnc", f"127.0.0.1:{vnc_display}"]
 
 
 def command_opens_a_window(cmd):

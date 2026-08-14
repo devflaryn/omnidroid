@@ -72,16 +72,23 @@ def test_unknown_account_exits(tmp_path, monkeypatch):
         engine.load_account("ghost-of-nobody")
 
 
-def _build_cfg(images_dir):
+def _build_cfg(images_dir, offsets=True):
+    """A minimal bootable cfg. `offsets` mirrors the real world: the base's
+    own /data ships CLEAN (no Roblox), and a launch picks a baked version — so
+    a cfg without an offset registry is a cfg on which `start` must refuse."""
+    base = {"type": engine.BASE_TYPE_ARM, "base_disk": "b.qcow2",
+            "system": "s.qcow2", "data": "d.qcow2",
+            "efivars": "base_arm_efivars.fd"}
+    if offsets:
+        base["offsets"] = {"2.731.944": {
+            "data": "base_arm_data_offset_2.731.944.qcow2",
+            "package": "com.roblox.client"}}
+        base["default_offset"] = "2.731.944"
     return {
         "images_dir": str(images_dir),
         "qemu": {"adb_port_start": 16001, "qmp_port_start": 17001,
                  "vnc_port_start": 18001},
-        "bases": {
-            "arm": {"type": engine.BASE_TYPE_ARM, "base_disk": "b.qcow2",
-                    "system": "s.qcow2", "data": "d.qcow2",
-                    "efivars": "base_arm_efivars.fd"},
-        },
+        "bases": {"arm": base},
         "current_base": "arm",
     }
 
@@ -97,6 +104,7 @@ def test_build_acct_allocates_ports_and_writes_no_account_folder(
     images = tmp_path / "images"
     images.mkdir()
     (images / "base_arm_efivars.fd").write_bytes(b"EFI-TEMPLATE")
+    (images / "base_arm_data_offset_2.731.944.qcow2").write_bytes(b"OFFSET")
     cfg = _build_cfg(images)
     monkeypatch.setattr(engine, "ensure_qemu", lambda: None)
     monkeypatch.setattr("omnidroid.runtime._port_answers", lambda port, timeout=0.25: False)
@@ -112,6 +120,10 @@ def test_build_acct_allocates_ports_and_writes_no_account_folder(
     assert handle["adb_port"] == 16001
     assert handle["qmp_port"] == 17001
     assert handle["vnc_port"] == 18001
+    # The launch handle carries WHICH Roblox this boot runs: the base's
+    # default offset, resolved to the /data overlay qemu_command_arm opens.
+    assert handle["offset"] == "2.731.944"
+    assert handle["data_image"] == "base_arm_data_offset_2.731.944.qcow2"
 
     assert (tmp_path / "runtime" / "newacct" / "efivars.fd").read_bytes() \
         == b"EFI-TEMPLATE"

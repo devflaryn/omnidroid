@@ -11,6 +11,20 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omnidroid import engine as omni  # noqa: E402
 from omnidroid import farming  # noqa: E402
+from omnidroid.qemu_proc import MODES  # noqa: E402
+
+
+def _fake_resolve_mode(cfg, name=None, **kw):
+    """A tiny resolved mode, but carrying the REAL `profile` for this name.
+
+    The engine branches on the profile, not on the mode name, so a stub that
+    dropped it would make every mode look like a performance mode and this
+    file would assert nothing. Sizes stay at 1 — they are irrelevant here and
+    keeping them tiny makes it obvious the stub is not the real table."""
+    real = MODES.get(name or "playable", {})
+    return {"name": name or "playable", "mem": 1, "smp": 1, "balloon": None,
+            "profile": real.get("profile", "performance"),
+            "quality": real.get("quality")}
 
 
 class ApplySqueeze(unittest.TestCase):
@@ -26,7 +40,7 @@ class ApplySqueeze(unittest.TestCase):
 
 
 class FarmingGate(unittest.TestCase):
-    """_ensure_booted only squeezes on a farming-named, non-dev boot.
+    """_ensure_booted only squeezes on a DENSITY-profile, non-debug boot.
 
     Exercises the NOT-running path (running_pid -> falsy) since the
     already-running branch returns early (before the squeeze gate) when
@@ -45,12 +59,13 @@ class FarmingGate(unittest.TestCase):
              mock.patch.object(omni, "_devkit_activate"), \
              mock.patch.object(omni, "_enforce_hiding"), \
              mock.patch.object(omni, "assert_kiosk_game"), \
+             mock.patch.object(omni, "apply_consent"), \
+             mock.patch.object(omni, "apply_awake"), \
              mock.patch.object(omni, "resolve_mode",
-                 side_effect=lambda cfg, name=None, **kw: {
-                     "name": name or "playable", "mem": 1, "smp": 1,
-                     "balloon": None}), \
+                 side_effect=_fake_resolve_mode), \
              mock.patch.object(omni, "apply_balloon_target"), \
              mock.patch.object(omni, "apply_roblox_settings"), \
+             mock.patch.object(omni, "apply_gaming_tuning"), \
              mock.patch.object(omni, "enable_zram"), \
              mock.patch.object(omni, "apply_farming_squeeze") as sq:
             omni._ensure_booted(acct, {}, "t", mode_name=mode_name)
@@ -74,12 +89,13 @@ class FarmingGate(unittest.TestCase):
              mock.patch.object(omni, "_devkit_activate"), \
              mock.patch.object(omni, "_enforce_hiding"), \
              mock.patch.object(omni, "assert_kiosk_game"), \
+             mock.patch.object(omni, "apply_consent"), \
+             mock.patch.object(omni, "apply_awake"), \
              mock.patch.object(omni, "resolve_mode",
-                 side_effect=lambda cfg, name=None, **kw: {
-                     "name": name or "playable", "mem": 1, "smp": 1,
-                     "balloon": None}), \
+                 side_effect=_fake_resolve_mode), \
              mock.patch.object(omni, "apply_balloon_target"), \
              mock.patch.object(omni, "apply_roblox_settings"), \
+             mock.patch.object(omni, "apply_gaming_tuning"), \
              mock.patch.object(omni, "enable_zram"), \
              mock.patch.object(omni, "apply_farming_squeeze") as sq:
             omni._ensure_booted(acct, {}, "t", mode_name="farming", debug=True)

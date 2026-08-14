@@ -41,7 +41,11 @@ class ArmRootedRegistration(unittest.TestCase):
 
     def _touch(self, *names):
         for n in names:
-            (self.images / n).write_bytes(b"x")
+            # Recorded names carry their arch subfolder (arm/…, x86/…), so
+            # the folder has to exist before the file can be written.
+            p = self.images / n
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x")
 
     def _arm_files(self):
         self._touch(b.ARM_BASE_DISK, b.ARM_BASE_SYSTEM, b.ARM_BASE_DATA,
@@ -76,8 +80,11 @@ class ArmRootedRegistration(unittest.TestCase):
 
 class DevkitIsArchGeneric(unittest.TestCase):
     def test_devkit_name_per_arch(self):
-        self.assertEqual(b.devkit_disk_name("arm"), "base_arm_devkit.qcow2")
-        self.assertEqual(b.devkit_disk_name("x86"), "base_x86_devkit.qcow2")
+        # Each devkit disk lives in ITS OWN arch subfolder of images_dir.
+        self.assertEqual(b.devkit_disk_name("arm"),
+                         "arm/base_arm_devkit.qcow2")
+        self.assertEqual(b.devkit_disk_name("x86"),
+                         "x86/base_x86_devkit.qcow2")
 
     def test_base_is_rooted_reads_the_flag(self):
         self.assertTrue(b.base_is_rooted({"rooted": True}))

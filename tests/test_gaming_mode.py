@@ -133,17 +133,45 @@ class ArmBootUsesTheHostCapability(unittest.TestCase):
         self.assertIn("-display none", cmd)
 
 
-class VncSurvivesTheWindow(unittest.TestCase):
-    """`omnidroid screenshot`, the auto-capture recorder and the omnidroid-input
-    skill all attach to the instance's VNC framebuffer (see capture.py). A
-    gaming boot that dropped `-vnc` would silently blind every one of them,
-    so the window is ADDITIVE to VNC, never a replacement."""
+class VncAndGlAreMutuallyExclusive(unittest.TestCase):
+    """VNC is kept on every boot it CAN be kept on — but QEMU refuses to have
+    both a GL context and a VNC server, and says so:
 
-    def test_vnc_is_present_on_a_gaming_boot(self):
-        self.assertIn("-vnc 127.0.0.1:", _cmd("gaming", GL_CAP))
+        qemu: -vnc 127.0.0.1:12101: Display vnc is incompatible with the GL context
+
+    This class used to assert the opposite ("the window is ADDITIVE to VNC,
+    never a replacement"). That assertion was never true on a host that can
+    actually do GL: a gaming boot emitted both and QEMU EXITED on startup
+    instead of booting. Measured on Windows/QEMU 11.0.50 the day the GL path
+    was first exercised for real.
+
+    So the rule is: GL boots drop -vnc, everything else keeps it. What a GL
+    boot gives up is `omnidroid view` and capture.py/autocap, which read that
+    framebuffer; `omnidroid screenshot` is unaffected (it goes through adb).
+    """
+
+    def test_a_gl_boot_drops_vnc_because_qemu_refuses_both(self):
+        cmd = _cmd("gaming", GL_CAP)
+        self.assertIn("gl=on", cmd)
+        self.assertNotIn("-vnc", cmd)
+
+    def test_a_windowed_boot_without_gl_keeps_vnc(self):
+        # tier "window" is a native window with SOFTWARE rendering — no GL
+        # context, so nothing stops VNC being served alongside it.
+        cmd = _cmd("gaming", WINDOW_CAP)
+        self.assertIn("-display cocoa", cmd)
+        self.assertIn("-vnc 127.0.0.1:", cmd)
 
     def test_vnc_is_present_on_a_farming_boot(self):
         self.assertIn("-vnc 127.0.0.1:", _cmd("farming"))
+
+    def test_headless_gl_also_drops_vnc(self):
+        # The same incompatibility, and the reason egl-headless produced a
+        # BLACK viewer rather than an error: QEMU accepted the pair and then
+        # published a framebuffer it could never fill.
+        self.assertEqual(qemu_proc.vnc_args(["-display", "egl-headless"], 1), [])
+        self.assertEqual(qemu_proc.vnc_args(["-display", "none"], 1),
+                         ["-vnc", "127.0.0.1:1"])
 
 
 class X86GetsTheSameTreatment(unittest.TestCase):

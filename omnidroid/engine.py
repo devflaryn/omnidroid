@@ -1019,6 +1019,78 @@ def resolve_su(acct):
     return None
 
 
+ROOT_VIA_ADBD = ""          # adbd is already uid 0; no wrapper needed
+_ROOT_MODE_CACHE = {}
+
+
+def resolve_root_shell(acct, refresh=False):
+    """How to run a command as ROOT in this guest, or None if you cannot.
+
+        ""        adbd itself runs as uid 0 -> plain `sh -c`
+        "<path>"  a Magisk su binary          -> `<path> 0 sh -c ...`
+        None      no root at all
+
+    The x86 Bliss base has the first kind, and everything here used to miss it:
+    resolve_su() looks for an `su` BINARY, finds none, and every root-gated
+    tune reported "no root on this instance" and skipped — on a guest whose
+    `adb shell id -u` answers 0 and which can write anywhere.
+
+    That was not cosmetic. The Roblox ClientAppSettings tune is measured at
+    roughly HALF the host CPU per instance (36% -> 18.8%), and it was being
+    skipped on every single x86 launch. Verified by hand on a live instance:
+
+        $ adb shell id -u                                    -> 0
+        $ adb shell 'echo x > /data/data/com.roblox.client/…' -> WRITE_OK
+
+    Cached per account: the answer cannot change while an instance is up, and
+    resolve_su() costs up to three adb round trips, each of which can sit for
+    its full timeout when a prompting su is present.
+    """
+    name = acct.get("name")
+    if not refresh and name in _ROOT_MODE_CACHE:
+        return _ROOT_MODE_CACHE[name]
+    mode = None
+    try:
+        r = adb(acct, "shell", "id -u", timeout=8)
+        if (r.stdout or "").strip().splitlines()[-1:] == ["0"]:
+            mode = ROOT_VIA_ADBD
+    except Exception:  # noqa: BLE001 — a probe must never break a boot
+        pass
+    if mode is None:
+        mode = resolve_su(acct)
+    # Only a POSITIVE answer is cached. "No root" is very often just "asked too
+    # early" — the probe runs over adb, and a call made before the endpoint is
+    # up answers None for a guest that is perfectly rootable. Caching that
+    # stuck every later step on the skip path: measured as `cpuset: SKIPPED`
+    # on a boot whose own tune-up had already run as root moments earlier.
+    if name and mode is not None:
+        _ROOT_MODE_CACHE[name] = mode
+    return mode
+
+
+def root_shell(acct, script, timeout=30):
+    """Run `script` as root by whichever route this guest offers.
+
+    Returns the CompletedProcess, or None when there is no root — so a caller
+    can tell "it ran" from "there was no way to run it", which is the
+    distinction the old `su`-only check collapsed.
+    """
+    mode = resolve_root_shell(acct)
+    if mode is None:
+        return None
+    # shlex.quote in BOTH branches. adb re-joins argv with spaces and the guest
+    # shell parses the result again, so a multi-command script handed over as
+    # separate argv elements silently loses everything after the first
+    # metacharacter — and still exits 0. That is this repo's known trap, and it
+    # bit here first time: the settings write reported "did NOT land" because
+    # the heredoc never survived the round trip.
+    if mode == ROOT_VIA_ADBD:
+        return adb(acct, "shell", f"sh -c {shlex.quote(script)}",
+                   timeout=timeout)
+    return adb(acct, "shell", f"{mode} 0 sh -c {shlex.quote(script)}",
+               timeout=timeout)
+
+
 def _magisk_pkg(acct, su=None):
     """The installed Magisk manager app's package name, or None. Magisk can be
     installed under its default 'com.topjohnwu.magisk' OR a hidden/random
@@ -6990,11 +7062,11 @@ def apply_gaming_tuning(acct, mode=None, label=None):
     skipped and SAID OUT LOUD rather than emitted to fail silently: as uid
     shell both writes are denied, and every script here ends in `; true`, so
     an unreported skip would look exactly like success."""
-    su = resolve_su(acct)
+    su = resolve_root_shell(acct)
     for cmd in gaming.build_tuning_sequence(mode, su=su):
         adb(acct, *cmd, timeout=20)
     if label:
-        if su:
+        if su is not None:
             print(f"[{label}] gaming tune-up: native resolution, animations "
                   f"off, doze off, swappiness {gaming.GAMING_SWAPPINESS}")
         else:
@@ -7006,7 +7078,7 @@ def pin_game_to_top_app(acct, label=None):
     """Move the running game onto the top-app cpuset. Call AFTER the session
     has been delivered — that broadcast is what launches the game, so there is
     no pid to move before it. Returns True when the move landed."""
-    step = gaming.build_pin_game_step(resolve_su(acct))
+    step = gaming.build_pin_game_step(resolve_root_shell(acct))
     if not step:
         if label:
             print(f"[{label}] cpuset: SKIPPED - no root on this instance")
@@ -7109,7 +7181,7 @@ def apply_roblox_settings(acct, label=None, settings=None):
     LOUDLY rather than returning quietly, because a step that silently does
     nothing while looking successful is exactly the failure mode this
     codebase already had (see farming.sh)."""
-    su = resolve_su(acct)
+    su = resolve_root_shell(acct)
     script = farming.build_client_settings_script(su, settings)
     if not script:
         if label:
@@ -7118,13 +7190,11 @@ def apply_roblox_settings(acct, label=None, settings=None):
                   f"dir. The ~2x CPU saving is NOT applied here. Bake it into "
                   f"the base /data image or have OmniBootstrap write it.")
         return False
-    adb(acct, "shell", f"{su} 0 sh -c {shlex.quote(script)}", timeout=30)
+    root_shell(acct, script, timeout=30)
     # Verify by reading it back as root; a chown/label mistake leaves a file
     # the app cannot read, which is indistinguishable from success.
-    r = adb(acct, "shell",
-            f"{su} 0 sh -c {shlex.quote(f'cat {lean.CLIENT_SETTINGS_FILE}')}",
-            timeout=20)
-    ok = "DFIntTaskSchedulerTargetFps" in (r.stdout or "")
+    r = root_shell(acct, f"cat {lean.CLIENT_SETTINGS_FILE}", timeout=20)
+    ok = "DFIntTaskSchedulerTargetFps" in ((r.stdout if r else "") or "")
     if label:
         # Describe the profile that was actually installed, DERIVED from the
         # dict rather than from which constant it happens to be. The original

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for the Roblox session layer (`omni play` / `omni session`).
+"""Offline tests for the Roblox session layer (`omnidroid play` / `omnidroid session`).
 
 Everything here is a pure function — no VM, no adb, no network — so the join URL
 format, the token-redaction rule and the kiosk reply parsing are all pinned
@@ -193,7 +193,7 @@ class StoreSession(unittest.TestCase):
 
 
 class LoginTokenFlag(unittest.TestCase):
-    """`omni login --token*` must be detected by PRESENCE, not truthiness — an
+    """`omnidroid login --token*` must be detected by PRESENCE, not truthiness — an
     empty `--token ""` / blank --token-file has to fail fast rather than
     silently falling back to the interactive browser flow (a headless,
     few-second call turning into an unattended 5-minute wait for a visible
@@ -222,7 +222,7 @@ class LoginTokenFlag(unittest.TestCase):
 
 
 class PlayGatesOnLogin(unittest.TestCase):
-    """`omni start <name>` must never create an instance (overlay + /data +
+    """`omnidroid start <name>` must never create an instance (overlay + /data +
     QEMU disks) for a name with no saved cookie and no override. Regression
     coverage for the bug where ensure_instance() ran BEFORE the token check,
     so a brand-new or misspelled name (e.g. a literal 'omniagent') left a
@@ -319,7 +319,7 @@ class PlayGatesOnLogin(unittest.TestCase):
 
 
 class ApkFlagGating(unittest.TestCase):
-    """`omni start --apk <path>`: the APK swap works on EVERY base (no dev
+    """`omnidroid start --apk <path>`: the APK swap works on EVERY base (no dev
     gate) and its path must exist. No install behavior here — only the early
     path guard in cmd_start(), which must run BEFORE build_acct() so a bad
     --apk never boots or touches an instance."""
@@ -417,7 +417,7 @@ class ApkFlagGating(unittest.TestCase):
 
 
 class StartHomeVsJoin(unittest.TestCase):
-    """`omni start` always LAUNCHES (play=True): the kiosk decides join-vs-home
+    """`omnidroid start` always LAUNCHES (play=True): the kiosk decides join-vs-home
     by whether the session carries a place_id. With --place the session has a
     place (JOIN); with no place the session has none (HOME -- the kiosk lands
     Roblox on its home screen, logged in). play=False would tell the kiosk not
@@ -486,7 +486,7 @@ class StartHomeVsJoin(unittest.TestCase):
 
 
 class ApkInstallOnStart(unittest.TestCase):
-    """`omni start <name> --apk <path>` must
+    """`omnidroid start <name> --apk <path>` must
     install the APK on ANY base AFTER boot and BEFORE delivering the
     session -- a failed install must never hand the account a session, and
     the default (no --apk) path must never call the installer at all."""
@@ -597,7 +597,7 @@ class ApkInstallOnStart(unittest.TestCase):
 
 
 class ApkBootstrapLoginProbe(unittest.TestCase):
-    """`omni start <name> --apk <path>` must
+    """`omnidroid start <name> --apk <path>` must
     verify the account actually logged in -- a plain/stock Roblox APK can't
     read the delivered session cookie and silently lands on a Sign In page.
     After deliver_session reports delivered, poll guest logcat for the
