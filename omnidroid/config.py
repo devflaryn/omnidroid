@@ -95,13 +95,24 @@ def images_dir(cfg) -> str:
 
 def qemu_bin(tool):
     """Resolve a QEMU executable path from the PRODUCT directory only.
-    Order: config 'qemu.dir' (an explicit product-side override) -> local
-    QEMU_DIR (auto-downloaded, next to the engine). On Windows the shipped
-    product NEVER falls back to a host/global/PATH QEMU: if it isn't in the
-    product dir yet, the returned (non-existent) product path drives
-    ensure_qemu() to download it there. On Linux/macOS the documented model is
-    SYSTEM QEMU (apt/brew), so a bare name (PATH) is the final fallback."""
+    Order: OMNI_QEMU_DIR (the embedding host's installed QEMU) -> config
+    'qemu.dir' (an explicit product-side override) -> local QEMU_DIR
+    (auto-downloaded, next to the engine). On Windows the shipped product
+    NEVER falls back to a host/global/PATH QEMU: if it isn't in the product
+    dir yet, the returned (non-existent) product path drives ensure_qemu() to
+    download it there. On Linux/macOS the documented model is SYSTEM QEMU
+    (apt/brew), so a bare name (PATH) is the final fallback.
+
+    OMNI_QEMU_DIR exists because QEMU_DIR is the WRONG home for an installed
+    QEMU under the desktop app: it resolves to <exe dir>/qemu, and the app's
+    updater replaces that whole tree on every update (updates.py
+    apply_staged_app renames the app dir aside and copies the new build in),
+    which would delete a 200 MB install on each release. The executor installs
+    it beside the images instead and points the engine here — env, not just
+    config, so a subprocess still resolves it if paths.json is stale or was
+    written by a different install."""
     exe = tool + (".exe" if IS_WINDOWS else "")
+    env_dir = os.environ.get("OMNI_QEMU_DIR")
     try:
         from omnidroid import engine
         qd = engine.read_config().get("qemu", {}).get("dir")
@@ -111,7 +122,8 @@ def qemu_bin(tool):
         # corrupt file, ...). Any failure here just means "no override" --
         # never a reason to blow up qemu_bin() resolution.
         qd = None
-    for cand in ([Path(qd) / exe] if qd else []) + [QEMU_DIR / exe]:
+    for cand in ([Path(env_dir) / exe] if env_dir else []) \
+            + ([Path(qd) / exe] if qd else []) + [QEMU_DIR / exe]:
         if cand.exists():
             return str(cand)
     if IS_WINDOWS:

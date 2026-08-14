@@ -266,6 +266,55 @@ def _qemu_present():
     return Path(p).exists() or shutil.which(p) is not None
 
 
+def _run_elevated(command, timeout=600):
+    """Run one command line as administrator and wait for it; returns its exit
+    code. Windows only.
+
+    Elevation is a SHELL verb ("runas"), which is why subprocess cannot do it:
+    CreateProcess refuses a requireAdministrator binary outright with WinError
+    740. SEE_MASK_NOCLOSEPROCESS is what makes the call waitable — plain
+    ShellExecuteW hands back an HINSTANCE and no process handle, so there
+    would be no way to know whether the installer finished, let alone whether
+    it worked.
+    """
+    import ctypes
+
+    class _SEI(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong), ("fMask", ctypes.c_ulong),
+                    ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
+                    ("lpFile", ctypes.c_wchar_p),
+                    ("lpParameters", ctypes.c_wchar_p),
+                    ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
+                    ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
+                    ("dwHotKey", ctypes.c_ulong), ("hIcon", ctypes.c_void_p),
+                    ("hProcess", ctypes.c_void_p)]
+
+    info = _SEI()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x00000040 | 0x00008000   # NOCLOSEPROCESS | NO_CONSOLE
+    info.lpVerb = "runas"
+    info.lpFile = os.environ.get("COMSPEC") or "cmd.exe"
+    info.lpParameters = f"/c {command}"
+    info.nShow = 0
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.GetLastError()
+        if err == 1223:                    # ERROR_CANCELLED
+            sys.exit("[qemu] administrator permission was declined; QEMU "
+                     "cannot be installed without it.")
+        sys.exit(f"[qemu] could not request administrator rights ({err})")
+    if not info.hProcess:
+        sys.exit("[qemu] the elevated installer did not start")
+    if ctypes.windll.kernel32.WaitForSingleObject(
+            info.hProcess, int(timeout * 1000)) == 0x102:
+        ctypes.windll.kernel32.CloseHandle(info.hProcess)
+        raise subprocess.TimeoutExpired("qemu-setup", timeout)
+    code = ctypes.c_ulong()
+    ctypes.windll.kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    ctypes.windll.kernel32.CloseHandle(info.hProcess)
+    return int(code.value)
+
+
 def ensure_qemu():
     """Install QEMU into QEMU_DIR on first use if it is not already
     resolvable (config dir, local dir, or PATH). Not bundled in the exe —
@@ -316,16 +365,36 @@ def ensure_qemu():
           "install)...")
     # NSIS silent install into QEMU_DIR; /D must be last and unquoted. Bounded
     # so a wedged installer can't hang either.
+    #
+    # The installer is manifested requireAdministrator, so an unelevated
+    # CreateProcess does not run it and fail — it never STARTS, raising
+    # WinError 740 ("the requested operation requires elevation"). shell=True
+    # only moves that failure into cmd.exe, which reports it as a non-zero
+    # exit and made this look like a broken download. Elevation is a shell
+    # verb, so it needs ShellExecute; _run_elevated() below does that and
+    # costs one UAC prompt.
+    cmd = f'"{installer}" /S /D={QEMU_DIR}'
     try:
-        r = subprocess.run(f'"{installer}" /S /D={QEMU_DIR}', shell=True,
-                           timeout=300)
+        try:
+            r = subprocess.run(cmd, timeout=600)
+            code = r.returncode
+        except OSError as e:
+            if getattr(e, "winerror", None) != 740:
+                raise
+            print("[qemu] the installer needs administrator rights; "
+                  "requesting them...")
+            code = _run_elevated(cmd, timeout=600)
     except subprocess.TimeoutExpired:
         installer.unlink(missing_ok=True)
-        sys.exit(f"[qemu] installer timed out after 300s. Place a portable "
+        sys.exit(f"[qemu] installer timed out after 600s. Place a portable "
+                 f"QEMU in {QEMU_DIR} manually or set 'qemu.dir'.")
+    except OSError as e:
+        installer.unlink(missing_ok=True)
+        sys.exit(f"[qemu] could not run the installer ({e}). Place a portable "
                  f"QEMU in {QEMU_DIR} manually or set 'qemu.dir'.")
     installer.unlink(missing_ok=True)
     if not _qemu_present():
-        sys.exit(f"[qemu] auto-install failed (exit {r.returncode}). "
+        sys.exit(f"[qemu] auto-install failed (exit {code}). "
                  f"Install QEMU into {QEMU_DIR} manually or set qemu.dir in "
                  f"configs/paths.json")
     print(f"[qemu] ready: {qemu_bin(qemu_system_name())}")
