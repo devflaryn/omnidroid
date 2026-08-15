@@ -1010,6 +1010,107 @@ def resolve_game_package(acct, cfg=None):
         return None
 
 
+# The resolver Private DNS points at. A HOSTNAME, not an address: Android's
+# "hostname" mode pins the certificate to this name, which is what makes the
+# channel unspoofable and therefore un-interceptable. `network.private_dns` in
+# the config or OMNI_PRIVATE_DNS overrides it; the literal "off" disables it.
+DEFAULT_PRIVATE_DNS = "dns.google"
+
+# A host that ONLY fails when plaintext DNS is being tampered with. It is one
+# of the CDN names the Roblox client fetches every mesh, texture and sound
+# from, so if this does not resolve, the game cannot load a world no matter
+# what else is right.
+_DNS_CANARY = "t0.rbxcdn.com"
+
+
+def private_dns_hostname(cfg=None):
+    """The Private DNS resolver hostname for this boot, or None when off."""
+    value = (os.environ.get("OMNI_PRIVATE_DNS", "").strip()
+             or ((cfg or {}).get("network") or {}).get("private_dns")
+             or DEFAULT_PRIVATE_DNS)
+    return None if str(value).strip().lower() in ("off", "0", "no") else value
+
+
+def ensure_private_dns(acct, cfg=None, label=None):
+    """Put the guest's DNS on DNS-over-TLS, on EVERY boot. Best-effort.
+
+    THE BUG THIS EXISTS FOR, diagnosed 2026-08-15. The game logged in, joined
+    a place, never finished loading it, and minutes later put up
+    "Disconnected ... (Error Code: 277)". The frame rate was blamed, and the
+    frame rate was not the problem. logcat:
+
+        HttpError: DnsResolve  Could not resolve host: fts.rbxcdn.com
+        MeshContentProvider failed to process ... because 'could not fetch'
+
+    hundreds of times, while `google.com`, `roblox.com` and `cloudflare.com`
+    all resolved in the same guest. So it was not the DNS relay failing, which
+    is what it looks like at first.
+
+    The relay was faithfully forwarding to the HOST's resolvers, and the
+    failure is upstream of the host entirely:
+
+        resolver             fts.rbxcdn.com   t0.rbxcdn.com
+        ISP                  FAIL             FAIL
+        8.8.8.8  over UDP    FAIL             FAIL      <- not the resolver
+        1.1.1.1  over UDP    FAIL             FAIL      <- not the resolver
+        Cloudflare over DoH  2.22.89.53       2.20.134.200
+
+    Plaintext UDP:53 fails against EVERY resolver while the same queries
+    succeed over HTTPS, which is transparent interception on the network path
+    -- an ISP-level Roblox block applied to the asset CDN. Changing which
+    resolver the guest is told about cannot fix that; only taking the queries
+    out of plaintext can.
+
+    Android has exactly that built in. Private DNS in `hostname` mode is
+    DNS-over-TLS on TCP:853 with the resolver's certificate pinned to the
+    name, so an interceptor can neither read nor forge it. Verified on a live
+    instance, immediately after setting it, the three hosts that had failed
+    every time:
+
+        fts.rbxcdn.com -> d2shmbw56nyjcv.cloudfront.net (108.157.60.23)
+        t0.rbxcdn.com  -> djm1c8bbf58td.cloudfront.net  (65.9.9.110)
+        c0.rbxcdn.com  -> a2047.dscw27.akamai.net       (46.196.223.240)
+
+    EVERY boot and EVERY mode, not just the playable ones: a farming instance
+    that cannot fetch assets is one that never gets into the game. Best-effort
+    with a SystemExit guard -- adb's _require_adb_port calls fail(), which
+    sys.exits, and a boot-tail tune-up must never end the process.
+    """
+    if not acct.get("adb_port"):
+        return False
+    host = private_dns_hostname(cfg)
+    if host is None:
+        return False
+    try:
+        adb(acct, "shell", "settings", "put", "global",
+            "private_dns_mode", "hostname", timeout=20)
+        adb(acct, "shell", "settings", "put", "global",
+            "private_dns_specifier", host, timeout=20)
+        # Android brings the TLS session up lazily; the canary below is what
+        # proves it, so give the resolver a moment rather than reporting a
+        # failure that is really a race.
+        time.sleep(3)
+        r = adb(acct, "shell", f"ping -c1 -W4 {_DNS_CANARY}", timeout=25)
+        out = (r.stdout or "") + (r.stderr or "")
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        out = str(e)
+    ok = "unknown host" not in out and "PING" in out
+    if label:
+        if ok:
+            print(f"[{label}] dns: encrypted (DNS-over-TLS via {host}) - "
+                  f"asset CDN reachable")
+        else:
+            # Loud, because the symptom this prevents is a game that loads
+            # forever and then disconnects, which reads as a performance
+            # problem and is not one.
+            print(f"[{label}] dns: could NOT verify {_DNS_CANARY} through "
+                  f"{host}. If the game loads forever or disconnects with "
+                  f"error 277, its asset CDN is being DNS-blocked on this "
+                  f"network - set network.private_dns to a resolver that "
+                  f"works here, or OMNI_PRIVATE_DNS=off to stop trying.")
+    return ok
+
+
 def assert_kiosk_game(acct, cfg, label):
     """Tell the kiosk what the game is, on EVERY boot, then re-front it.
 
@@ -1382,6 +1483,15 @@ def cmd_start(args):
                         f"--apk path not found: {args.apk}")
     label = f"start {args.name}"
     json_mode = getattr(args, "json", False)
+
+    # --no-window now means what it says: NOTHING appears on screen. It
+    # used to suppress only the VNC viewer, which was the whole meaning of
+    # "window" back when no mode opened a native one. `playable` opens one
+    # now (see qemu_proc.MODES), so the flag has to reach the argv builder
+    # too -- via the environment, because that builder is called from four
+    # places and a fifth parameter is how one of them ends up not passing it.
+    if getattr(args, "no_window", False):
+        os.environ["OMNI_NO_WINDOW"] = "1"
 
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
@@ -7572,6 +7682,10 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # assert_kiosk_game for the full trace. This used to happen only inside
     # _devkit_activate, i.e. only on a --debug boot, which is exactly the
     # dev-base-era gating the dual-use change was supposed to remove.
+    # BEFORE the kiosk launches the game, not after: the client resolves
+    # its asset CDN during startup, and a resolver swapped in underneath a
+    # running client leaves the failed lookups already cached as failures.
+    ensure_private_dns(acct, cfg, label)
     assert_kiosk_game(acct, cfg, label)
     # EVERY boot: grant the permissions a human would otherwise be asked to
     # tap through (full disk access above all) and silence the ANR/crash

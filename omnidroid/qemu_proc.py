@@ -62,6 +62,23 @@ def _gl_window_requested():
     return os.environ.get("OMNI_GL_WINDOW", "").strip() not in ("", "0", "false", "False")
 
 
+def window_suppressed():
+    """True when this boot must NOT put a window on the host, whatever the
+    mode asks for. Set by `--no-window` (cmd_start exports it).
+
+    The escape hatch for `playable` becoming a windowed mode. `--no-window`
+    used to mean only "do not spawn the VNC viewer", which was the whole
+    meaning of a window back when no mode opened a native one; it now means
+    what it says, for both kinds.
+
+    Read from the ENVIRONMENT rather than threaded through six signatures on
+    purpose: QEMU argv construction is reached from `_ensure_booted`,
+    `spawn_qemu` and the bake/warm paths, and adding a parameter to each is how
+    one of them ends up not passing it."""
+    return os.environ.get("OMNI_NO_WINDOW", "").strip() not in (
+        "", "0", "false", "False", "no")
+
+
 # ------------------------------------------------------- display capability
 #
 # THREE tiers, because the middle one is what the primary host actually has.
@@ -280,8 +297,27 @@ MODES = {
                  "display": lean.NATIVE_DISPLAY, "window": True,
                  "profile": "performance", "autoscale": True,
                  "quality": "high"},
+    # playable ALSO asks for a window now. Two reasons, and on THIS host only
+    # the second one is collectable today:
+    #
+    #  1. A window is what gives QEMU a host GL context, without which
+    #     virglrenderer cannot run and the guest renders on llvmpipe. Measured
+    #     on the Windows host at 1280x800: 3.2 fps headless, 16.5 fps windowed.
+    #     Homebrew's macOS QEMU has no virglrenderer and no gl display backend
+    #     (`-display help` lists none/curses/cocoa/dbus), so this half is inert
+    #     here until a QEMU built --enable-opengl --enable-virglrenderer
+    #     exists. default_display already degrades to the software tier, so it
+    #     costs nothing to ask.
+    #  2. INPUT LATENCY, which is available right now. With `-display cocoa`
+    #     the host's mouse and key events go straight into the guest's
+    #     usb-tablet/usb-kbd; the headless path routes them through a VNC
+    #     round trip of framebuffer encode, decode and synthesised input.
+    #     Rendering stays software in that tier; latency does not.
+    #
+    # `--no-window` / OMNI_NO_WINDOW is the opt-out for callers with nobody at
+    # the screen (see window_suppressed).
     "playable": {"mem": 4096, "smp": 4, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY,
+                 "usb": True, "display": lean.NATIVE_DISPLAY, "window": True,
                  "profile": "performance", "autoscale": True,
                  "quality": "high"},
     "hard":     {"mem": 3072, "smp": 4, "balloon": None,
@@ -492,6 +528,13 @@ def resolve_gpu_display(mode, interactive, tool):
     QEMU subprocess launches, and a host starting fifty farming instances must
     not pay that fifty times for an answer it would discard."""
     want = (bool(mode.get("window")) or _gl_window_requested()) and not interactive
+    if want and window_suppressed():
+        # An explicit "nothing on screen" beats the mode's request. This is
+        # the escape hatch that lets `playable` be a windowed mode: automation
+        # passes --no-window and gets exactly what it used to get.
+        print("[gpu] --no-window: booting headless (no host window, so no "
+              "host GL context — the guest renders in software)")
+        return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
     if not want:
         return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
     cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui())
