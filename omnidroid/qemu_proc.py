@@ -1099,6 +1099,40 @@ def gpu_policy(cfg=None, mode=None):
     return GPU_AUTO
 
 
+# Platforms where the performance profile PRESENTS in a host window.
+#
+# Linux is absent ON PURPOSE and only until a Linux host exists to verify it
+# (2026-08-16). It is the one platform whose egl-headless really presents, so
+# gaming works there today; switching it blind would trade a working copy path
+# for an unrun one and drop the VNC server with it, because QEMU refuses -vnc
+# beside a GL window. macOS is present and needs no gate: its egl-headless
+# does NOT present (HEADLESS_GL_PRESENTS), so _headless_gl_pair returns None
+# there and the window path is reached anyway.
+_WINDOW_PRESENT_PLATFORMS = ("windows", "macos")
+
+
+def _presents_a_window(policy, mode):
+    """Whether this boot should PRESENT the guest in a host window.
+
+    The two profiles want opposite things from the same trade and this is the
+    one line that says so. `performance` is one instance somebody is playing:
+    a window is zero copies and native input, and it costs only the VNC server
+    nobody was watching. `density` is many instances nobody is watching: it
+    wants the GPU without a window, which is what the windowless pair gives.
+
+    MEASURED, and the reason this predicate exists at all: on Linux
+    `egl-headless` presents, so `auto` resolved there for BOTH profiles and
+    gaming paid a GPU readback, an RFB encode and a Python RFB decode on every
+    frame while rendering on the GPU the whole time.
+    """
+    if policy == GPU_WINDOW:
+        return True
+    if policy != GPU_AUTO:
+        return False
+    return ((mode or {}).get("profile") == "performance"
+            and _platform_key() in _WINDOW_PRESENT_PLATFORMS)
+
+
 def resolve_gpu_display(mode, interactive, tool, cfg=None):
     """The (gpu_args, display_args) pair for one boot, host-checked.
 
@@ -1136,7 +1170,8 @@ def resolve_gpu_display(mode, interactive, tool, cfg=None):
     if policy == GPU_OFF:
         return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
 
-    if policy in (GPU_AUTO, GPU_HEADLESS):
+    if policy == GPU_HEADLESS or (policy == GPU_AUTO
+                                  and not _presents_a_window(policy, mode)):
         pair = _headless_gl_pair(tool, cfg, mode)
         if pair is not None:
             return pair

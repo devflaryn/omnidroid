@@ -10,9 +10,15 @@ The two use cases this engine serves pull in opposite directions:
 
 They now share one display policy, and these tests pin it:
 
-  * NO MODE opens a native QEMU window. A window is reachable only through the
-    OMNI_GL_WINDOW debugging hatch, and it is the one boot that gives up `-vnc`
-    (QEMU refuses the pair — see below).
+  * FARMING never opens a native QEMU window on its own; a window is
+    reachable only through the OMNI_GL_WINDOW debugging hatch, and it is the
+    one boot that gives up `-vnc` (QEMU refuses the pair — see below).
+  * GAMING is the exception, as of 2026-08-15
+    (tests/test_gaming_window_policy.py): its `performance` profile takes a
+    real window on any platform whose egl-headless does not already present
+    a frame (Windows and macOS today; Linux is deferred), because the window
+    is zero copies and native input and it costs only the VNC server nobody
+    was watching. See qemu_proc._presents_a_window.
   * A headless boot still reaches the GPU where `-display egl-headless` can
     actually present, and keeps its VNC server while doing it.
   * A host that can do neither still BOOTS, on software rendering.
@@ -143,12 +149,16 @@ class TheModeExists(unittest.TestCase):
 
 
 class ArmBootUsesTheHostCapability(unittest.TestCase):
-    def test_gaming_prefers_a_windowless_gpu_over_a_windowed_one(self):
-        # Both are on offer. The windowless one wins, because it keeps the VNC
-        # viewer as well as the GPU.
+    def test_gaming_takes_the_window_even_when_a_windowless_gpu_is_on_offer(self):
+        """Stale since 2026-08-15 (tests/test_gaming_window_policy.py): this
+        used to assert the windowless pair won because it kept the VNC viewer
+        as well as the GPU. The PROFILE decides now, not availability --
+        `performance` always takes the window (zero copies, native input) on
+        a platform that presents one (this host, Windows, does), and pays the
+        VNC server for it. See qemu_proc._presents_a_window."""
         cmd = _cmd("gaming", GL_CAP, headless_gl=True)
-        self.assertIn("-display egl-headless", cmd)
-        self.assertIn("-vnc 127.0.0.1:", cmd)
+        self.assertIn("-display cocoa,gl=on", cmd)
+        self.assertNotIn("-vnc 127.0.0.1:", cmd)
 
     def test_gaming_falls_back_to_a_window_when_that_is_the_only_gl(self):
         # `auto` means "get to the GPU whatever it takes". On a host whose
@@ -198,10 +208,16 @@ class ArmBootUsesTheHostCapability(unittest.TestCase):
         self.assertIn("-display none", cmd)
         self.assertIn("-vnc 127.0.0.1:", cmd)
 
-    def test_a_host_whose_egl_headless_presents_gets_the_gpu_and_keeps_vnc(self):
+    def test_gaming_does_not_fall_back_to_the_windowless_gpu_when_no_window_exists(self):
+        """Stale since 2026-08-15: this used to assert that gaming, given a
+        working windowless GPU pair, used it when the host had no window
+        capability (NO_CAP) to fall back on. `performance` no longer
+        considers the windowless pair at all -- once it decides to present a
+        window it either gets one or degrades all the way to software, same
+        as a detection bug would. See qemu_proc._presents_a_window."""
         cmd = _cmd("gaming", NO_CAP, headless_gl=True)
-        self.assertIn("-device virtio-gpu-gl-pci", cmd)
-        self.assertIn("-display egl-headless", cmd)
+        self.assertIn("-device virtio-gpu-pci", cmd)
+        self.assertIn("-display none", cmd)
         self.assertIn("-vnc 127.0.0.1:", cmd)
 
     def test_a_host_that_cannot_present_headless_gl_degrades_to_software(self):
@@ -265,9 +281,15 @@ class OnlyAWindowedGlBootGivesUpVnc(unittest.TestCase):
 
 
 class X86GetsTheSameTreatment(unittest.TestCase):
-    def test_gaming_takes_the_windowless_gpu_on_x86_too(self):
+    def test_gaming_takes_the_window_on_x86_too(self):
+        """Stale since 2026-08-15: this used to assert the windowless GPU
+        pair (WINDOW_CAP has no GL device, so headless_gl=True fakes a
+        `default_display` with no gl either way). PROFILE decides now: even
+        with a windowless pair on offer, gaming takes the window -- here a
+        software one, since WINDOW_CAP carries no GL device -- and a
+        non-GL window does not block -vnc."""
         cmd = _cmd("gaming", WINDOW_CAP, base="x86", headless_gl=True)
-        self.assertIn("-display egl-headless", cmd)
+        self.assertIn("-display cocoa", cmd)
         self.assertIn("-vnc 127.0.0.1:", cmd)
 
     def test_farming_takes_the_gpu_on_x86_too(self):
