@@ -1814,7 +1814,7 @@ def _start_timings_stages(has_apk, density=False):
         stages.append("apk_install")
     stages += ["session_delivered", "game_foreground"]
     if density:
-        stages.append("density_settled")
+        stages += ["density_settled", "squeeze_verified"]
     return stages
 
 
@@ -2061,6 +2061,21 @@ def cmd_start(args):
         settle_density_instance(acct, launch_mode, label, debug=debug,
                                 quality=quality)
         timings.mark("density_settled")
+        # ...and then WATCH IT, because the squeeze has been measured to kill
+        # the client about a minute later while every check above still says
+        # the launch went perfectly. An `ok: true` for an instance that is
+        # already dying is worse than a slow launch.
+        survived = verify_client_survived(acct, label, cfg=cfg)
+        result["client_survived"] = survived
+        if survived.get("alive") is False:
+            result["ok"] = False
+            result["error"] = "client_died_after_squeeze"
+            result["message"] = (
+                f"the client died {survived['died_after_s']}s after the "
+                f"farming squeeze. The instance is up and answering adb, but "
+                f"Roblox is not running, so it is not farming anything. "
+                f"Bisect the squeeze with OMNI_FARM_SKIP.")
+        timings.mark("squeeze_verified")
     # WHAT THE CLIENT ITSELF SAYS, on every mode and every launch that got as
     # far as delivering a session. Recorded, never asserted: `ok` means the
     # session was delivered and the kiosk launched the game, which is a
@@ -7968,6 +7983,71 @@ def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
         print(f"[{label}] the game was still growing after "
               f"{int(timeout)}s ({prev or '?'} MB) — squeezing anyway")
     return False, prev
+
+
+# How long after the squeeze to keep watching before calling a density launch a
+# success. MEASURED 2026-08-15 on PS99: a squeezed farming instance is alive,
+# in-world and reporting `ok: true` at t+0, and GONE by t+90 -- every reading
+# this project ever took was inside that first minute, which is precisely why
+# it went unnoticed. `probe_client_join` runs in the same window and says
+# `in_world: true` about a client that has about a minute left.
+#
+# So a density launch now watches past its own death window before claiming
+# anything. It costs the launch that time; a launch that reports success for an
+# instance which is already dying costs strictly more than that.
+# OMNI_SQUEEZE_GRACE=0 turns it off.
+SQUEEZE_GRACE_S = 120
+SQUEEZE_GRACE_POLL_S = 15
+
+
+def squeeze_grace_s(cfg=None):
+    """Seconds to watch a squeezed client before believing it. 0 disables."""
+    raw = os.environ.get("OMNI_SQUEEZE_GRACE")
+    if raw is None:
+        raw = ((cfg or {}).get("qemu") or {}).get("squeeze_grace")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return SQUEEZE_GRACE_S
+
+
+def verify_client_survived(acct, label=None, grace=None, cfg=None):
+    """Did the client outlive the squeeze? {alive, died_after_s, checked_s}.
+
+    Never raises and never fails a launch -- it REPORTS. The caller decides
+    what an instance that died means, and the honest answer is not `ok: true`.
+    """
+    budget = squeeze_grace_s(cfg) if grace is None else max(0, int(grace))
+    if not budget:
+        return {"alive": None, "died_after_s": None, "checked_s": 0,
+                "reason": "disabled"}
+    start = time.time()
+    while True:
+        try:
+            pid = (adb(acct, "shell", "pidof", farming.GAME_PKG,
+                       timeout=25).stdout or "").strip()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            # A flaky adb is not a dead game -- but this except is DELIBERATELY
+            # narrow. The first version caught bare Exception and swallowed a
+            # NameError on an undefined GAME_PKG, so every call reported the
+            # client alive: the check could not have failed, which is the one
+            # thing a liveness check must never do.
+            pid = "?"
+        waited = time.time() - start
+        if pid == "":
+            if label:
+                print(f"[{label}] the client DIED {waited:.0f}s after the "
+                      f"squeeze — this instance is not farming anything. "
+                      f"Bisect with OMNI_FARM_SKIP (see MODES.md).")
+            return {"alive": False, "died_after_s": round(waited, 1),
+                    "checked_s": round(waited, 1), "reason": "process_gone"}
+        if waited >= budget:
+            if label:
+                print(f"[{label}] client still alive {waited:.0f}s after the "
+                      f"squeeze")
+            return {"alive": True, "died_after_s": None,
+                    "checked_s": round(waited, 1), "reason": "outlived_grace"}
+        time.sleep(SQUEEZE_GRACE_POLL_S)
 
 
 def settle_density_instance(acct, mode, label=None, debug=False, wait=True,
