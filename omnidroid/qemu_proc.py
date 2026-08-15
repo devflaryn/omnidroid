@@ -1235,8 +1235,9 @@ def resolve_gpu_display(mode, interactive, tool, cfg=None):
     if cap.get("tier") == "gl":
         print(f"[gpu] {cap['reason']}. This host can only take a GL context "
               f"through a window, so QEMU serves no VNC on this boot — the "
-              f"window is hidden and `omnidroid view` HOSTS it inside our own "
-              f"viewer instead (GPU-rendered, native input, no copy). "
+              f"window is hidden during boot, and `omnidroid view` shows it "
+              f"restyled, with our own title bar above it (GPU-rendered, "
+              f"native input, no copy). "
               f"`screenshot` works either way; capture/autocap do not. "
               f"--gpu headless keeps VNC and gives up the GPU.")
     else:
