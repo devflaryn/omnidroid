@@ -1800,13 +1800,21 @@ def _await_bootstrap_login(acct, timeout=25):
     return False
 
 
-def _start_timings_stages(has_apk):
+def _start_timings_stages(has_apk, density=False):
     """The stage names `cmd_start` marks, in order. Declared separately from
-    the marking itself so the emitted contract is testable without a boot."""
+    the marking itself so the emitted contract is testable without a boot.
+
+    `density_settled` is farming-only and is the LONGEST stage by far — the
+    squeeze waits for the client's memory to plateau before touching it, so a
+    farming launch is minutes where a gaming one is seconds. It was being
+    marked without being declared, which made the one stage a caller most
+    needs to budget for the one stage the contract did not mention."""
     stages = ["boot"]
     if has_apk:
         stages.append("apk_install")
     stages += ["session_delivered", "game_foreground"]
+    if density:
+        stages.append("density_settled")
     return stages
 
 
@@ -1931,19 +1939,41 @@ def cmd_start(args):
     # --debug: both change what the machine IS, and a pre-booted slot cannot
     # retroactively have been that machine.
     acct = None
+    # How big the guest has to be to hold THIS place, which is not a property
+    # of the mode. Resolved once, before the pool key is built, because a slot
+    # booted at 2048 is not interchangeable with one this launch needs at 3072
+    # -- `mem` is part of the spec the key hashes, so getting this wrong hands
+    # the launch a slot too small and OOM-kills the client minutes later.
+    # Both lookups are best-effort. This used to sit inside the pool block,
+    # where a `try` already covered it; hoisting it made an unresolvable base
+    # raise on a path that never needed one. Neither the arch nor the floor is
+    # a precondition of a launch -- without them the mode's own size is used,
+    # which is exactly what happened before this existed.
+    try:
+        launch_arch = arch_of_base(cfg["bases"][_select_base_tag(cfg)])
+    except Exception:      # noqa: BLE001 - an unresolvable base is reported
+        launch_arch = None  # by build_acct, in its own words, further down
+    try:
+        want_mem = guest_mem_for_launch(cfg, args, sess, arch=launch_arch)
+    except Exception:      # noqa: BLE001
+        want_mem = getattr(args, "mem", None)
+    if want_mem and want_mem != getattr(args, "mem", None):
+        print(f"[{label}] guest RAM raised to {want_mem} MB for place "
+              f"{sess.get('place_id')} — the mode's default is measured to "
+              f"OOM-kill this game (override with --mem)")
     if not (getattr(args, "apk", None) or debug or no_warm):
         try:
             acct = pool_try_adopt(
                 args.name, cfg,
                 pool_launch_spec(
                     cfg, mode_name=getattr(args, "mode", None),
-                    mem=getattr(args, "mem", None),
+                    mem=want_mem,
                     smp=getattr(args, "smp", None),
                     balloon=getattr(args, "balloon", None),
                     quality=getattr(args, "quality", None),
                     guest_display=_guest_display_arg(args),
                     offset=want_offset, debug=False,
-                    arch=arch_of_base(cfg["bases"][_select_base_tag(cfg)])),
+                    arch=launch_arch),
                 label, accel=getattr(args, "accel", None))
         except Exception as e:      # noqa: BLE001 - the pool is an optimisation
             print(f"[{label}] warm pool unavailable ({e}); booting normally")
@@ -1959,7 +1989,7 @@ def cmd_start(args):
                                    timeout=getattr(args, "timeout", None),
                                    accel=getattr(args, "accel", None),
                                    mode_name=getattr(args, "mode", None),
-                                   mem=getattr(args, "mem", None),
+                                   mem=want_mem,
                                    smp=getattr(args, "smp", None),
                                    balloon=getattr(args, "balloon", None),
                                    quality=getattr(args, "quality", None),
@@ -2008,9 +2038,9 @@ def cmd_start(args):
     # finds no pid and silently does nothing (see gaming.build_pin_game_step).
     # EVERY performance-profile mode gets the pin, not just `gaming`: the
     # latency-critical scheduler set is what makes an instance feel like a
-    # game, and `playable` is the mode a human and the AI actually use.
+    # game, and gaming is the mode a human and the AI actually use.
     launch_mode = resolve_mode(cfg, getattr(args, "mode", None),
-                               mem=getattr(args, "mem", None),
+                               mem=want_mem,
                                smp=getattr(args, "smp", None),
                                balloon=getattr(args, "balloon", None),
                                arch=acct_arch(acct),
@@ -2024,7 +2054,12 @@ def cmd_start(args):
     # the load is what stopped a farming instance ever reaching the world
     # (measured 2026-08-16; see settle_density_instance and MODES.md).
     if launch_mode.get("profile") == "density" and result.get("ok"):
-        settle_density_instance(acct, launch_mode, label, debug=debug)
+        # The RESOLVED quality, so `--quality minimal` reaches the
+        # squeeze's panel step and not just the ClientAppSettings half.
+        quality, _note = _quality_for_boot(
+            args.name, getattr(args, "quality", None), launch_mode)
+        settle_density_instance(acct, launch_mode, label, debug=debug,
+                                quality=quality)
         timings.mark("density_settled")
     # WHAT THE CLIENT ITSELF SAYS, on every mode and every launch that got as
     # far as delivering a session. Recorded, never asserted: `ok` means the
@@ -5723,6 +5758,17 @@ def install_readiness():
            "qemu_present": qemu_ok,
            "qemu": qemu_bin(qemu_system_name()) if qemu_ok else None,
            "adb_present": adb_ok,
+           # THE SCRATCH VOLUME, because it is the resource that decides how
+           # many instances a host can actually hold and the only one whose
+           # exhaustion is silent. Each ephemeral guest keeps its writes in a
+           # `snapshot=on` overlay here (PS99 measured 1.3 GB); when the volume
+           # fills, QEMU dies with a zero-byte log. `doctor` is where someone
+           # looks when instances vanish for no reason, so the number belongs
+           # here rather than only in a warning nobody scrolled back to.
+           "scratch_dir": str(scratch_dir(raw) or ""),
+           "scratch_free_mb": scratch_free_mb(raw),
+           "scratch_fits_instances": (
+               (scratch_free_mb(raw) or 0) // SCRATCH_PER_INSTANCE_MB),
            "accounts": len(all_accounts()),
            "ready": base_ready and template_ready and qemu_ok and adb_ok}
     if not qemu_ok:
@@ -5874,7 +5920,7 @@ def cmd_bench_ksm(args):
 
     Method (honest marginal cost, not RSS - RSS double-counts pages KSM
     shares): start identical EPHEMERAL instances one at a time (default
-    brutal/headless), each to boot_completed + game process up; after each,
+    farming/headless), each to boot_completed + game process up; after each,
     wait for pages_sharing to plateau, then record the marginal drop in
     host MemAvailable. Stops when MemAvailable < --floor-mb: the RAM floor
     ends the bench, never a count cap. One JSON line per step + summary
@@ -7924,7 +7970,8 @@ def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
     return False, prev
 
 
-def settle_density_instance(acct, mode, label=None, debug=False, wait=True):
+def settle_density_instance(acct, mode, label=None, debug=False, wait=True,
+                            quality=None):
     """The farming squeeze, applied to an instance that is already PLAYING.
 
     Order inside is unchanged and still load-bearing — zram first (it decides
@@ -7955,11 +8002,11 @@ def settle_density_instance(acct, mode, label=None, debug=False, wait=True):
     # extra devkit/frida footprint and its numbers aren't the production
     # baseline, so skip it there (as the old dev path did).
     if not debug:
-        apply_farming_squeeze(acct, mode, label)
+        apply_farming_squeeze(acct, mode, label, quality=quality)
     return apply_balloon_target(acct, mode, label)
 
 
-def apply_farming_squeeze(acct, mode=None, label=None):
+def apply_farming_squeeze(acct, mode=None, label=None, quality=None):
     """Run the farming runtime squeeze over adb. Called only on a farming boot.
 
     Every step is fire-and-forget by construction (each shell one-liner ends
@@ -7970,12 +8017,18 @@ def apply_farming_squeeze(acct, mode=None, label=None):
     OMNI_FARM_SKIP names steps to leave out (`trimmemory,doze`, ...). It exists
     because this sequence is the prime suspect whenever Roblox will not run on
     the x86 base, and bisecting it by editing farming.py makes every attempt a
-    different build. See farming.STEP_NAMES."""
+    different build. See farming.STEP_NAMES.
+
+    `quality` is the RESOLVED profile, not the mode's own: `--quality minimal`
+    has to reach the panel half of the render floor, and the mode dict still
+    says "low". Passing the mode here and the flag nowhere is exactly how half
+    a setting gets applied while the other half silently does not."""
     skip = farming.parse_skip(os.environ.get("OMNI_FARM_SKIP"))
     if skip and label:
         print(f"[{label}] farming squeeze: skipping {', '.join(skip)} "
               f"(OMNI_FARM_SKIP)")
-    for cmd in farming.build_squeeze_sequence(mode, skip=skip):
+    for cmd in farming.build_squeeze_sequence(mode, skip=skip,
+                                              quality=quality):
         adb(acct, *cmd, timeout=20)
 
 
@@ -8124,7 +8177,7 @@ def enable_zram(acct, mode=None, label=None):
     A mode may switch it OFF, and x86 farming does. Roblox is arm64-only, so
     the x86 base runs it through libndk_translation, and swapping translated
     code pages out makes the translator abort with `Cannot process signal 11`
-    (measured -- see MODES["farming"]["zram_x86"]). zram is a memory win that
+    (measured -- see MODES["farming"]["swappiness_x86"]). zram is a memory win that
     costs the game its life there, which is not a trade."""
     if mode is not None and not mode.get("zram", True):
         # The SQUEEZE turns it off (farming.build_squeeze_sequence emits a
@@ -8656,7 +8709,8 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             if migrated:
                 warmcache.touch(entry)
             if migrated and wait_for_boot(acct, RESTORE_TIMEOUT, label):
-                warmboot.resync_guest_clock(acct, label)
+                warmboot.resync_guest_clock(acct, label,
+                                            root_fn=resolve_root_shell)
                 restored = True
             else:
                 # The QEMU this launch just spawned is either paused (a
@@ -8736,6 +8790,32 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                     print(f"[{label}] could not stage warm-bake overlays ({e}); "
                           f"booting normally without baking")
                     want_bake = False
+            # THE SCRATCH, which is the other disk this launch spends and the
+            # one nobody budgets for. An ephemeral guest keeps its writes in a
+            # `snapshot=on` overlay, and PS99 grew one to 1.3 GB just loading
+            # its assets. Reap first (a leaked overlay from a QEMU that died
+            # rather than exited is still 1.3 GB, and Windows will not let us
+            # unlink one that is genuinely in use), then say so if what is
+            # left cannot hold this instance.
+            #
+            # A warning, not a refusal: the caller asked for an instance and
+            # the disk may yet be freed by the reap above or by whatever else
+            # is running. But it must be SAID -- a full volume kills QEMU with
+            # a zero-byte log, because writing the log needs the same disk, and
+            # that failure is indistinguishable from the guest vanishing.
+            gone, freed_mb = reap_scratch(cfg, live_pids=live_qemu_pids())
+            if gone:
+                print(f"[{label}] scratch: reclaimed {freed_mb} MB from "
+                      f"{gone} leaked guest overlay(s)")
+            room, free_mb, need_mb = scratch_room(cfg)
+            if not room:
+                print(f"[{label}] WARNING: only {free_mb} MB free on the "
+                      f"scratch volume and this instance wants ~{need_mb} MB. "
+                      f"A guest that runs the disk out is killed by QEMU with "
+                      f"an EMPTY log — if this instance disappears without a "
+                      f"reason, this is the reason. Free some space, or point "
+                      f"config qemu.scratch_dir / OMNI_SCRATCH_DIR at a "
+                      f"roomier volume ({scratch_dir(cfg)}).")
             # bake/warm_key are only ever non-default on a bake attempt: passing
             # them unconditionally would change this call's kwargs on EVERY
             # ordinary boot, not just a baking one.
@@ -8890,7 +8970,7 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
         if settings is not None:
             apply_roblox_settings(acct, label, settings=settings)
     else:
-        # PERFORMANCE (playable / gaming / hard / brutal). No zram, no squeeze
+        # PERFORMANCE (gaming). No zram, no squeeze
         # and no balloon — each of those trades responsiveness for density,
         # which is the wrong direction here. The tune-up also REVERSES the
         # farming levers that persist in /data, so an offset that was last
@@ -8918,12 +8998,43 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
 # running. See MODES.md "Boot time" and pool.py's docstring.
 
 
+def guest_mem_for_launch(cfg, args, sess, arch=None):
+    """`--mem` for this launch, raised to the floor the PLACE actually needs.
+
+    A mode's `mem` is a property of the MODE; what a Roblox place needs is a
+    property of the GAME, and the two have been conflated since farming had a
+    number at all. Farming's 2048 MB is right for a light place and OOM-kills
+    PS99 -- measured three times on 2026-08-16, under gaming tuning with no
+    squeeze and no balloon in the way, so nothing else was taking the blame.
+
+    Returns None when the mode's own size already clears the floor, because
+    None is what lets `resolve_mode` autoscale gaming to the host. Returning
+    the resolved number instead would silently PIN gaming to whatever this
+    function computed, which is the opposite of what a floor is for.
+
+    An explicit `--mem` always wins: a flag argparse accepts and something
+    downstream overrides is a failure this codebase has already had twice."""
+    explicit = getattr(args, "mem", None)
+    if explicit:
+        return explicit
+    place = (sess or {}).get("place_id")
+    if not place:
+        return None
+    try:
+        resolved = resolve_mode(cfg, getattr(args, "mode", None), arch=arch)
+        have = int(resolved.get("mem") or 0)
+    except Exception:      # noqa: BLE001 - an unresolvable mode is argparse's
+        return None        # problem to report, not this helper's
+    floor = lean.guest_mem_floor_mb(place, have)
+    return floor if floor > have else None
+
+
 def pool_launch_spec(cfg, *, mode_name=None, mem=None, smp=None, balloon=None,
                      quality=None, guest_display="unset", offset=None,
                      debug=False, arch=None):
     """The machine a launch would boot, RESOLVED -- never as typed.
 
-    Resolution is the whole point: `--mode playable` and `--mode gaming` name
+    Resolution is the whole point: `--mode gaming` and a bare default name
     one machine, `--mem` unset on a gaming boot resolves to a host-derived
     number, and the panel comes from OMNI_PANEL/config/mode in that order. A
     key built from the raw arguments would give every equivalent launch a
@@ -9002,6 +9113,20 @@ def pool_try_adopt(name, cfg, spec, label, accel=None):
               f"booting normally")
         return None
     pool.mark_adopted(rec["slot"], name)
+    # THE CLOCK, before any session is delivered. A pool slot is a live VM, so
+    # its clock keeps ticking and the usual answer is "nothing to do" -- which
+    # is why this costs one adb round trip and prints nothing when the skew is
+    # under the threshold. It is here for the case a desktop actually has: the
+    # host SLEEPS. A guest that comes back behind by the length of a lunch
+    # break fails Roblox auth and TLS, and the symptom is indistinguishable
+    # from a dead cookie, so the one thing that must not happen is finding out
+    # about it from the login screen.
+    clock = warmboot.resync_guest_clock(acct, label,
+                                        root_fn=resolve_root_shell)
+    if clock.get("corrected") and clock.get("residual_s"):
+        print(f"[{label}] guest clock did NOT take ({clock['residual_s']}s "
+              f"still out); Roblox auth may fail as though the cookie were "
+              f"dead")
     waited = time.time() - (rec.get("ready_at") or time.time())
     print(f"[{label}] warm pool: took slot {rec['slot']} "
           f"(pre-booted {int(waited)}s ago) — no boot needed")
@@ -9178,9 +9303,12 @@ def _spawn_pool_manager():
     Same detached shape as the viewer/recorder (see _spawn_builtin_viewer),
     including self_argv_prefix() -- without it an embedding host relaunches
     its own GUI instead of the child."""
-    from omnidroid.runtime import pid_alive
+    # NOT pid_alive(manager_pid): a pid recorded before a reboot is very
+    # likely alive again as something else, and believing it means no
+    # manager is ever spawned on this host and the pool silently stops
+    # refilling. The heartbeat file is written by the manager itself.
     cur = pool.read_pool() or {}
-    if cur.get("manager_pid") and pid_alive(cur["manager_pid"]):
+    if cur.get("manager_pid") and pool.manager_alive():
         return cur["manager_pid"]
     a = ["_poolmgr"]
     if getattr(sys, "frozen", False):
@@ -9222,14 +9350,32 @@ def cmd_poolmgr(args):
         if not cur:
             print("[pool] no pool configured; manager exiting", flush=True)
             return {"ok": True, "stopped": True}
-        size = int(cur.get("size") or 0)
-        key = cur.get("key")
-        spec = cur.get("spec") or {}
+        want = pool.desired()
+        size = int(want.get("size") or 0)
+        key = want.get("key")
+        spec = want.get("spec") or {}
         if size <= 0:
             print("[pool] size 0; manager exiting", flush=True)
             return {"ok": True, "stopped": True}
+        if not want.get("persistent", True):
+            print("[pool] pool is not persistent; manager exiting", flush=True)
+            return {"ok": True, "stopped": True}
+        # The beacon, written every tick. `_spawn_pool_manager` reads it
+        # instead of testing the recorded pid, because a pid that predates a
+        # reboot is very likely alive again as something else -- believe it and
+        # this host never spawns a manager again.
+        pool.manager_heartbeat()
         pool.sweep()
         reconcile_runtime()
+        # Reap what a crashed guest left behind. The manager is the only thing
+        # on this host guaranteed to be running between launches, which makes
+        # it the right place: a leaked `snapshot=on` overlay is ~1.3 GB, and
+        # the volume filling is what kills instances with an empty log.
+        gone, freed_mb = reap_scratch(load_config(),
+                                      live_pids=live_qemu_pids())
+        if gone:
+            print(f"[pool] scratch: reclaimed {freed_mb} MB from {gone} "
+                  f"leaked overlay(s)", flush=True)
         ready = pool.ready_slots(key)
         if len(ready) < size:
             cfg = load_config()
@@ -9794,21 +9940,20 @@ def build_parser():
                         "game on the top-app cpuset. farming - MINIMUM "
                         "resources: 2G headless, joined-idle, squeezed "
                         "post-boot then ballooned, for many instances at "
-                        "once. Both are headless and both render on the GPU; "
-                        "the difference is what they spend. "
-                        "(playable/hard/brutal are retired names that still "
-                        "resolve to gaming.)")
+                        "once. Gaming takes the best acceleration this host "
+                        "has; farming never opens a window and renders at "
+                        "the floor. The difference is what they spend.")
     s.add_argument("--mem", type=int, default=None,
                    help="override guest RAM in MB. This is the guest's "
                         "ADDRESS SPACE, not its host footprint - see "
                         "--balloon for the number the host pays. Wins over "
-                        "the host-derived size in playable/gaming")
+                        "the host-derived size in gaming")
     s.add_argument("--smp", type=int, default=None,
                    help="override guest vCPU count. Wins over the "
-                        "host-derived count in playable/gaming")
+                        "host-derived count in gaming")
     s.add_argument("--quality", choices=list(lean.QUALITY_PROFILES),
                    default=None,
-                   help="Roblox render profile. high (playable/gaming "
+                   help="Roblox render profile. high (gaming "
                         "default): real textures/lighting/post-FX - what a "
                         "player sees, and what a screenshot must show to be "
                         "worth reasoning about. balanced: effects off, "

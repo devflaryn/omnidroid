@@ -14,6 +14,9 @@ set it. Trying to do the base-image tier from here is the obvious wrong turn.
 Levers, in the order they are applied (the order is load-bearing — see
 build_squeeze_sequence):
   - shrink the display, so every graphics buffer downstream shrinks with it;
+  - drop to the RENDER FLOOR (`--quality minimal`): a smaller panel again, and
+    the animation scales off, because the remaining cost of an unattended
+    instance is the guest rasterising frames nobody looks at;
   - disable packages the single-game kiosk provably never uses;
   - enable zram swap so cold pages compress instead of staying resident;
   - tune lmkd (lowmemorykiller) to reclaim hard WITHOUT OOM-killing the game;
@@ -129,6 +132,7 @@ def build_client_settings_script(su, settings=None):
 # it is to run the guest with one of them removed. Bisecting it by editing
 # this file means every attempt is a different build of the product.
 STEP_DISPLAY = "display"
+STEP_RENDER = "render"
 STEP_TRIM_PACKAGES = "packages"
 STEP_ZRAM = "zram"
 STEP_SWAPPINESS = "swappiness"
@@ -137,9 +141,9 @@ STEP_QUIESCE = "quiesce"
 STEP_DOZE = "doze"
 STEP_TRIM_MEMORY = "trimmemory"
 STEP_CPUSET = "cpuset"
-STEP_NAMES = (STEP_DISPLAY, STEP_TRIM_PACKAGES, STEP_ZRAM, STEP_SWAPPINESS,
-              STEP_LMKD, STEP_QUIESCE, STEP_DOZE, STEP_TRIM_MEMORY,
-              STEP_CPUSET)
+STEP_NAMES = (STEP_DISPLAY, STEP_RENDER, STEP_TRIM_PACKAGES, STEP_ZRAM,
+              STEP_SWAPPINESS, STEP_LMKD, STEP_QUIESCE, STEP_DOZE,
+              STEP_TRIM_MEMORY, STEP_CPUSET)
 
 
 def parse_skip(text):
@@ -150,17 +154,26 @@ def parse_skip(text):
     return tuple(n for n in STEP_NAMES if n in wanted)
 
 
-def build_squeeze_sequence(mode=None, skip=()):
+def build_squeeze_sequence(mode=None, skip=(), quality=None):
     """Ordered list of adb `shell` argv vectors for the farming squeeze.
 
     `mode` is a resolved MODES entry; None falls back to the farming defaults
     so existing callers keep working. `skip` is a collection of STEP_NAMES to
-    leave out (see the constants above, and OMNI_FARM_SKIP).
+    leave out (see the constants above, and OMNI_FARM_SKIP). `quality` is the
+    EFFECTIVE quality profile for this boot — the engine resolves `--quality`
+    against the mode's own default and knows the answer, and passing it in
+    keeps that resolution in one place; None falls back to the mode's own
+    `quality` key so a caller that does not care still gets the right thing.
 
     Ordering is load-bearing:
       1. display FIRST — every later step's memory picture is then measured
          against the small display, and shrinking it after apps have already
          allocated tablet-sized buffers just leaves the big buffers around;
+      1b. the RENDER FLOOR immediately after, for exactly that reason: it is a
+         second, smaller panel, so it belongs in the same slot as the first
+         one. Putting it later would mean every buffer between here and there
+         is sized for a panel this boot is about to abandon — the same mistake
+         the display step exists to avoid, made twice;
       2. package disable before zram, so the pages freed by force-stopping
          those apps are free pages rather than things zram has to compress;
       3. cpuset LAST, because it needs the game's pid, which only exists once
@@ -169,6 +182,8 @@ def build_squeeze_sequence(mode=None, skip=()):
     mode = mode or {}
     skip = set(skip or ())
     display = mode.get("display", lean.FARMING_DISPLAY)
+    quality = quality if quality is not None else mode.get("quality")
+    floor = lean.display_for_quality(quality, display)
     mem_mb = mode.get("mem", 2048)
     zram_mb = zram_size_mb(mem_mb)
 
@@ -178,6 +193,76 @@ def build_squeeze_sequence(mode=None, skip=()):
     #    it just composites ~30x fewer pixels.
     if STEP_DISPLAY not in skip:
         steps += lean.display_args(display)
+
+    # 1b) The RENDER FLOOR. Farming is unattended: no fps requirement, no view
+    #     quality requirement, and — because the mode boots `-display none`
+    #     with an idle VNC server that encodes nothing — no HOST-side render
+    #     cost to attack. Every remaining lever is inside the guest, and what
+    #     is left there is the guest rasterising frames nobody looks at.
+    #
+    #     A smaller panel again, but only when the quality profile actually
+    #     asked for one: `display_for_quality` returns `display` unchanged for
+    #     every profile except `minimal`, so a normal farming boot emits
+    #     nothing here and its first step is still `wm size 480x270`.
+    #
+    #     Gated on the DISPLAY step as well as its own, and that is a bisect
+    #     property rather than caution: `OMNI_FARM_SKIP=display` means "do not
+    #     touch the panel", and a render floor that resized anyway would make
+    #     that bisect prove nothing. To keep the panel at the mode's own size
+    #     but drop the rest of the floor, skip `render` alone.
+    #
+    #     That costs a `minimal` boot a SECOND resize — 480x270 and then
+    #     320x180 — and the transient is bought deliberately. Folding the floor
+    #     into the display step would save two adb calls and destroy the
+    #     property above: the two panels would stop being independently
+    #     removable, which on the step this project has twice had to bisect is
+    #     the wrong trade. The residual risk is that each `wm size` is a
+    #     configuration change delivered to a running Roblox client; it already
+    #     survives one (measured in-world on PS99, 2026-08-16), and surviving
+    #     two is UNVERIFIED.
+    #
+    #     WHAT IS DELIBERATELY NOT HERE, because both look like obvious wins:
+    #
+    #       * setprop. Every compositing-related property in lean.py is `ro.*`
+    #         — the HWUI cache tier, `ro.surface_flinger.max_frame_buffer_
+    #         acquired_buffers`, `ro.config.avoid_gfx_accel`,
+    #         `ro.zygote.disable_gl_preload`. init freezes `ro.*` once it has
+    #         set it, so setting any of them from here is a SILENT no-op that
+    #         reports success (lean.py's opening docstring is about exactly
+    #         this split). The one non-`ro.` graphics key,
+    #         `debug.sf.nobootanimation`, is read by SurfaceFlinger at boot and
+    #         is long moot by the time this runs — the squeeze happens AFTER
+    #         the client has loaded. And `ro.config.low_ram` is not merely
+    #         inert here, it BRICKS the guest when baked (SystemUI crash-loop
+    #         into recovery — lean.py:120-127). So this step emits no setprop
+    #         at all; a placebo would be worse than nothing, because it would
+    #         look like the lever had been pulled.
+    #       * blanking the screen. `svc power`/a POWER keyevent would stop
+    #         SurfaceFlinger compositing outright, and it is forbidden: a
+    #         blanked farming instance stops rendering and stops EARNING,
+    #         unnoticed. omnidroid/awake.py exists to prevent exactly this and
+    #         runs on every boot in every mode.
+    #
+    #     What is left is real but modest, and is filed honestly as such:
+    #     the panel, and the two animation scales the quiesce step does not
+    #     already cover. Animations are pure raster work with no simulation
+    #     effect, they run whenever a window or a view transitions, and a
+    #     guest whose UI nobody watches has no use for a single frame of them.
+    #     `window_animation_scale` is NOT repeated here — the quiesce step
+    #     already sets it, and two steps writing the same setting would make a
+    #     bisect of either one lie about what it changed.
+    #
+    #     NOT MEASURED. Every number in this module came off a live instance;
+    #     this step has not been run against a place. It is chosen because each
+    #     part removes a specific, named source of raster work, not because it
+    #     was timed.
+    if STEP_RENDER not in skip:
+        if floor != display and STEP_DISPLAY not in skip:
+            steps += lean.display_args(floor)
+        steps.append(sh("settings put global transition_animation_scale 0 "
+                        ">/dev/null 2>&1; "
+                        "settings put global animator_duration_scale 0 "
+                        ">/dev/null 2>&1; true"))
 
     # 2) Tier-2 package trim. force-stop after disable so an already-running
     #    instance releases its pages now rather than at the next lmkd sweep.

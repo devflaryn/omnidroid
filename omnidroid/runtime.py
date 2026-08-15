@@ -470,3 +470,33 @@ def warm_keys_in_use():
         if live:
             keys.add(key)
     return keys
+
+
+def live_qemu_pids():
+    """Pids of the QEMU processes this install currently has running.
+
+    Used by the scratch reaper to avoid unlinking an overlay out from under a
+    guest on POSIX, where an open file unlinks happily and the instance loses
+    every write it has made. On Windows the open handle refuses the unlink by
+    itself, which is why the reaper is safe there without consulting this.
+
+    Same degradation rule as warm_keys_in_use(): an unreadable runtime root is
+    "no pids", never an exception, because this runs on the boot path."""
+    pids = set()
+    root = config.runtime_root()
+    if not root.is_dir():
+        return pids
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return pids
+    for d in entries:
+        if not d.is_dir():
+            continue
+        try:
+            pid = running_pid(d.name)
+        except (OSError, ValueError):
+            continue
+        if pid:
+            pids.add(int(pid))
+    return pids

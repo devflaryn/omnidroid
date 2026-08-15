@@ -223,6 +223,57 @@ def build_prop_lines(props=None):
 FARMING_DISPLAY = (480, 270, 80)      # width, height, dpi
 NATIVE_DISPLAY = None                  # playable/dev: leave the base's own
 
+# The RENDER FLOOR panel, used by `--quality minimal` (see MINIMAL_APP_SETTINGS
+# and farming.STEP_RENDER). 320x180 is 57 600 pixels against 480x270's
+# 129 600 — 2.25x fewer to rasterise, composite and scan out, on an instance
+# whose display exists only because Android insists on having one.
+#
+# UNVERIFIED. FARMING_DISPLAY was measured in-world on PS99 (screenshot,
+# 2026-08-16); this one has not been run against a place at all. It is a
+# smaller number of the same kind, not a result.
+#
+# WHY THE DENSITY IS 60 AND NOT LOWER, which is the part that can break the
+# product rather than just make it ugly. Android reports the panel to apps in
+# dp, as `px * 160 / dpi`, so the LOGICAL screen barely moves here:
+#
+#     480x270 @ 80 dpi  ->  960x540 dp,  0.500 px per dp
+#     320x180 @ 60 dpi  ->  853x480 dp,  0.375 px per dp
+#
+# i.e. a layout that fits today still has room, while each dp costs a quarter
+# less. Push the density lower and the dp count climbs without bound against a
+# shrinking pixel budget, which is where a layout runs out of pixels to draw
+# into — and Roblox's own UI is the one thing in this guest we cannot inspect
+# or fix. `wm density` below ~60 HAS NOT BEEN VERIFIED, and the reason to be
+# careful is not aesthetics: from outside the guest a collapsed or unclickable
+# UI is INDISTINGUISHABLE from a hung client. adb is up, the process is alive,
+# PSS is flat, the squeeze reports success — exactly the profile of the
+# splash-screen wedge that cost this project a week (see
+# farming.build_squeeze_sequence and the settle probe).
+MINIMAL_DISPLAY = (320, 180, 60)
+
+
+def display_for_quality(quality, default=FARMING_DISPLAY):
+    """The guest panel a quality profile asks for.
+
+    Only `minimal` overrides; everything else gets `default`, which the
+    farming squeeze passes as the resolved mode's own `display` so this
+    function can never silently shrink a mode that did not ask for it. An
+    unknown quality name falls back to `default` rather than raising: this is
+    called from the post-boot squeeze, where a bad name must cost the boot its
+    render floor and nothing else. (`app_settings_for` returns None for an
+    unknown name instead, because installing the WRONG ClientAppSettings
+    profile is a real error and a slightly-too-big panel is not.)
+
+    `default is None` — NATIVE_DISPLAY, "leave the base's own resolution
+    alone" — wins over `minimal`, and that is the same trap resolve_mode's
+    `guest_display` sentinel documents: None is a MEANINGFUL value here, not
+    an absent one. Somebody who asked for the native panel and the render
+    floor together gets the panel they asked for; the rest of the floor still
+    applies."""
+    if quality == "minimal" and default is not None:
+        return MINIMAL_DISPLAY
+    return default
+
 
 def display_args(display):
     """adb argv vectors that apply a (w, h, dpi) display override, or [] for
@@ -312,6 +363,51 @@ CLIENT_APP_SETTINGS = {
     "DFFlagDisableDPIScale": True,
 }
 
+# The RENDER FLOOR profile — farming's `low`, with the one key that still has
+# room in it taken down another step.
+#
+# WHY IT IS DERIVED AND NOT RETYPED: `minimal` must be "everything `low` does,
+# and less". Copying the dict out would let the two drift the first time
+# somebody edits CLIENT_APP_SETTINGS, and a `minimal` that is accidentally
+# HEAVIER than `low` is the kind of inversion nothing downstream would notice
+# — the engine just installs whichever dict it is handed.
+#
+# THE TICK TARGET IS THE ONLY KEY LOWERED, and that is a finding rather than
+# laziness. Everything else in the farming profile is ALREADY at its floor:
+#
+#   DFIntDebugFRMQualityLevelOverride  1   the bottom of Roblox's own 1..21
+#                                          scale; there is no 0
+#   FFlagDisablePostFx                 on  post-processing already off
+#   FIntRenderShadowIntensity          0
+#   FIntDebugForceMSAASamples          0
+#   DFIntCSGLevelOfDetailSwitchingDistance 0
+#   FIntRenderLocalLightUpdatesMax/Min 1
+#
+# Three keys COULD hold a smaller number and deliberately do not:
+# DFIntMaxFrameBufferSize (4), FIntTerrainArraySliceSize (4) and the local
+# light update pair (1 -> 0). Nothing in this repo records what units any of
+# them are in or what the engine does at 0, and a client that renders nothing
+# looks exactly like a client that hung — see the MINIMAL_DISPLAY note.
+# Guessing a smaller number for a key whose meaning is unverified is how you
+# buy an unfalsifiable bug, so they keep the values the farming profile
+# MEASURED.
+#
+# 3 fps rather than 5: the tick target caps the WHOLE engine loop, which is why
+# it was worth 36% -> 18.8% host CPU per instance on its own (2026-08-05), and
+# it is the only remaining lever with a monotonic story — fewer ticks is less
+# of everything, including the raster work nobody is looking at.
+#
+# UNVERIFIED, AND WITH A NAMED RISK. 5 fps is measured in-world on PS99; 3 is
+# not, and two things could go wrong that this file cannot see from outside:
+# the scheduler may clamp values below some floor (in which case `minimal`
+# quietly equals `low`, which is harmless), or the client may fall behind its
+# own network heartbeat and be dropped with a 27x error (which is NOT harmless,
+# and looks like a healthy idle instance until you read the client log —
+# engine.probe_client_join is what reads it). `--quality low` is the way back
+# to the measured setting; bisect there first if instances start dropping.
+MINIMAL_APP_SETTINGS = dict(CLIENT_APP_SETTINGS,
+                            DFIntTaskSchedulerTargetFps=3)
+
 # The GAMING profile — the same lever pulled the other way.
 #
 # Farming caps the engine tick at 5 fps because nobody is watching. Gaming
@@ -389,11 +485,18 @@ PLAYABLE_APP_SETTINGS = {
 }
 
 
-# The three profiles, by the name `--quality` takes. Kept as ONE mapping so
-# the CLI, the mode table and the engine cannot disagree about what a quality
-# name means — the failure this codebase has already had twice (a flag
-# accepted by argparse and then overridden downstream).
+# The profiles, by the name `--quality` takes. Kept as ONE mapping so the CLI,
+# the mode table and the engine cannot disagree about what a quality name means
+# — the failure this codebase has already had twice (a flag accepted by
+# argparse and then overridden downstream). `omnidroid start --quality` takes
+# its choices straight off this dict, so adding a key here adds the flag value.
+#
+# Ordered heaviest-last on purpose: it reads as a ladder, and `minimal` sits
+# BELOW `low` rather than beside it. `low` is the measured farming profile and
+# stays the default for the density mode; `minimal` is the opt-in floor for
+# "as many instances as this host will hold", and it is unverified in-world.
 QUALITY_PROFILES = {
+    "minimal": MINIMAL_APP_SETTINGS,   # render floor: 3 fps, 320x180 panel
     "low": CLIENT_APP_SETTINGS,        # farming: 5 fps, lowest everything
     "balanced": GAMING_APP_SETTINGS,   # max fps, effects off
     "high": PLAYABLE_APP_SETTINGS,     # real render; playable/gaming default
@@ -422,6 +525,67 @@ def client_settings_json(settings=None):
     import json as _json
     return _json.dumps(settings or CLIENT_APP_SETTINGS,
                        indent=2, sort_keys=True)
+
+
+# --------------------------------------------------- per-game memory floor
+
+# How much guest RAM a PLACE needs. Not a tuning constant — a property of the
+# game, measured per place id, and the distinction is the whole point of this
+# table.
+#
+# `MODES["farming"]["mem"]` is 2048 and that is the right DEFAULT: it boots
+# Android plus a Roblox client on a light place with room to spare, and every
+# balloon figure in FOOTPRINT.md was taken against it. It is simply wrong for
+# a heavy place, and no single number can be right for both — the variable is
+# the game's world, which this engine does not get a vote on.
+#
+# MEASURED 2026-08-16, Pet Simulator 99 (place 8737899170), x86 base, in-world,
+# `dumpsys meminfo com.roblox.client`:
+#
+#   game PSS on the LOGIN screen (what FOOTPRINT.md measured)  ~500-680 MB
+#   game PSS loading and holding the PS99 world                1018 -> 1528 MB
+#
+# At 2048 MB the client was OOM-KILLED THREE TIMES IN A ROW, under gaming
+# tuning, with no squeeze and no balloon in the way — so it was memory, not the
+# squeeze and not the translator. At 3072 the same launch reached the world and
+# stayed there (screenshot-verified: PS99's live leaderboard, chat scrolling,
+# its own teleport logic running). See CHANGELOG 2026-08-16 and FOOTPRINT.md.
+#
+# AN UNMEASURED PLACE GETS THE DEFAULT AND MAY OOM. That is deliberate: this
+# table records measurements, and inventing a floor for a place nobody has run
+# would make it a table of guesses that reads like a table of facts. The
+# symptom to look for is `has died: fg TOP` / `mem-pressure-event` in logcat
+# while the client is still loading. Measure the place you intend to farm
+# before promising a fleet size for it.
+#
+# Keys are STRINGS because a place id arrives as one (argv, run.json, the app's
+# settings) and is 10 digits today — comfortably inside an int, but nothing
+# here needs it to be one, and normalising on the way in beats hoping every
+# caller agrees on the type.
+GUEST_MEM_FLOOR_DEFAULT_MB = 2048
+
+GUEST_MEM_FLOOR_MB = {
+    "8737899170": 3072,   # Pet Simulator 99 — measured, see above
+}
+
+
+def guest_mem_floor_mb(place_id, default=GUEST_MEM_FLOOR_DEFAULT_MB):
+    """Minimum guest MB measured for this place, or `default`.
+
+    `default` is what the CALLER already decided to use (the resolved mode's
+    `mem`, or a `--mem` the user typed), so an unmeasured place is left exactly
+    as it would have been and a measured one can only be raised, never lowered:
+    a place with a 3072 floor started with `--mem 4096` keeps its 4096. The
+    max() is the part that makes this safe to wire in unconditionally.
+
+    None/blank place id -> `default`. The launch path can genuinely not know
+    the place (no `--place`, the client lands on the home screen), and that has
+    to mean "no measurement applies", not a crash on the boot path."""
+    key = str(place_id or "").strip()
+    if not key:
+        return default
+    floor = GUEST_MEM_FLOOR_MB.get(key)
+    return max(default, floor) if floor else default
 
 
 # ------------------------------------------------------------------ packages

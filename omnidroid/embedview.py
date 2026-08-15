@@ -25,6 +25,24 @@ WINDOWS ONLY, and that is not a gap: it is the only platform where the window
 is forced. Linux renders windowless through `egl-headless` and macOS has no
 virgl at all yet, so both keep the VNC viewer, which works there.
 
+THE OTHER TWO PLATFORMS USE THE VNC VIEWER, AND THAT IS THE RIGHT ANSWER --
+not a port waiting to be written. Say so out loud, because "embed the window
+there too" is the obvious idea and it is wrong in a different way on each:
+
+  * macOS has no public API for it at all. An NSWindow cannot adopt a view
+    from another process; the only thing that does is the private
+    CGSSetWindowParent, which is unsupported, unsigned-code-hostile and free
+    to break on any system update. There is no measurement to take here.
+  * Linux does not need it. `egl-headless` presents there, so QEMU renders on
+    the GPU AND serves a framebuffer at the same time -- exactly the pair
+    Windows refuses -- and a GPU boot on Linux therefore has no window to
+    reparent. XEmbed would work if there were one; there is not.
+
+Hiding is a separate question with a separate answer: `hostwin.py` hides the
+real QEMU window on all three platforms where one exists, because that is
+strictly better than a copy wherever it is possible. Embedding is the part
+that stops at the Windows boundary.
+
 Undo matters as much as the embed: a QEMU window left parented to a viewer that
 has closed is a window with no title bar and no way to reach it. `release()`
 always runs -- on clean exit, on error, and from the atexit hook -- and puts the
@@ -33,7 +51,7 @@ window back on the desktop, hidden, exactly as it was found.
 import sys
 import time
 
-from omnidroid.config import IS_WINDOWS
+from omnidroid.config import IS_LINUX, IS_MACOS, IS_WINDOWS
 
 GWL_STYLE = -16
 WS_CHILD = 0x40000000
@@ -53,6 +71,27 @@ SWP_SHOWWINDOW = 0x0040
 def available():
     """Whether embedding is possible on this host at all."""
     return IS_WINDOWS
+
+
+def available_reason():
+    """Why embedding is not offered here, or "" when it is.
+
+    Kept next to `available()` so the answer travels with the check: a bare
+    False sends the next reader looking for a bug, and there is none to find --
+    see the module docstring. Callers print this instead of "Windows only",
+    which is true and tells nobody anything.
+    """
+    if IS_WINDOWS:
+        return ""
+    if IS_MACOS:
+        return ("macOS has no public API to embed another process's window "
+                "(only the private CGSSetWindowParent), so the viewer "
+                "connects to QEMU's VNC server instead")
+    if IS_LINUX:
+        return ("a GPU boot on Linux is windowless -- `egl-headless` presents "
+                "there, so QEMU renders on the GPU and serves VNC at the same "
+                "time -- so there is no window to embed and no reason to")
+    return "embedding is implemented for Windows only"
 
 
 class EmbeddedQemuWindow:
@@ -181,8 +220,8 @@ def run_embedded_viewer(identity, title=None, size=None, pid=None):
     fall back to the RFB viewer without having to duplicate the checks.
     """
     if not available():
-        sys.stderr.write("embedded viewer: Windows only (every other host "
-                         "renders windowless and keeps its VNC server)\n")
+        sys.stderr.write(f"embedded viewer: not available here — "
+                         f"{available_reason()}\n")
         return 3
     import tkinter as tk
 

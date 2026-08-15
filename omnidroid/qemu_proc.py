@@ -2,6 +2,7 @@
 """QEMU command construction, process spawn, and QMP monitor access."""
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -1760,6 +1761,16 @@ def _hide_window_if_wanted(cmd, identity, cfg):
     if gpu_policy(cfg) == GPU_WINDOW:
         return False
     from omnidroid import hostwin
+    # Ask BEFORE trying. A host with no way to hide a window (Wayland, macOS
+    # without Accessibility, a Linux box with none of xdotool/wmctrl/xlib)
+    # would otherwise spend find_window's entire timeout rediscovering that on
+    # every single boot, and then say only "could not". backend() is probed
+    # once per process, so this costs nothing on the host that can.
+    if not hostwin.can_hide():
+        print(f"[gpu] the QEMU window stays on screen: "
+              f"{hostwin.backend_reason()}. Rendering is unaffected, and "
+              f"`omnidroid view` still works.")
+        return False
     hidden = hostwin.hide_qemu_window(identity)
     if hidden:
         # ...and KEEP it hidden. GTK re-shows the window during early boot (the
@@ -1772,9 +1783,149 @@ def _hide_window_if_wanted(cmd, identity, cfg):
               f"the only working GL context on this host, and it keeps "
               f"rendering while invisible. Watch with `omnidroid view`.")
     else:
-        print(f"[gpu] could not hide the QEMU window for {identity}; it stays "
-              f"on screen. Rendering is unaffected.")
+        print(f"[gpu] could not hide the QEMU window for {identity} "
+              f"(backend {hostwin.backend()}); it stays on screen. Rendering "
+              f"is unaffected.")
     return hidden
+
+
+# --------------------------------------------------------------- the scratch
+#
+# Every ephemeral boot runs its disks `snapshot=on`, which is what makes an
+# instance diskless: QEMU keeps the guest's writes in a TEMPORARY OVERLAY and
+# throws it away at exit. That overlay is not small and it is not on a disk
+# anybody chose.
+#
+# MEASURED 2026-08-15, PS99, one farming instance: the overlay reached
+# **1.3 GB** by the time the client was in the world — the game downloads its
+# assets into /data and every byte of that lands here. QEMU creates the file
+# with the libc temp directory (`GetTempPath` on Windows, `TMPDIR` elsewhere),
+# so by default it goes to `%TEMP%`, which is exactly where nobody is looking.
+#
+# Two failures came out of that on this box, and the second one is nasty:
+#
+#   * the overlays LEAK. A QEMU that dies rather than exiting cleanly never
+#     unlinks its file. `%TEMP%` held 3.7 GB of them from three sessions, one
+#     of them two days old.
+#   * a full volume kills instances SILENTLY. With the disk exhausted QEMU
+#     aborts, and it cannot write the reason into `qemu.log` because writing
+#     the log needs the same disk — so the symptom is a guest that was fine a
+#     moment ago and is now simply gone, with a zero-byte log and no Windows
+#     error report. That is what it looked like twice before the temp
+#     directory was measured.
+#
+# So: point QEMU at a scratch directory we own, reap what leaks into it, and
+# refuse a boot that cannot fit rather than discovering it three minutes in.
+# The number this caps is INSTANCE COUNT — at ~1.3 GB of scratch each, a host
+# runs out of disk long before it runs out of the RAM everyone budgets for.
+
+SCRATCH_DIRNAME = "scratch"
+# What one ephemeral instance is assumed to want. PS99 measured 1.3 GB; the
+# reserve is deliberately above it, because the cost of guessing low is a dead
+# instance and the cost of guessing high is a warning.
+SCRATCH_PER_INSTANCE_MB = 2048
+# Never let a boot take the volume below this. A Windows host with no free
+# disk does not merely stop this program.
+SCRATCH_FLOOR_MB = 2048
+
+
+def scratch_dir(cfg=None):
+    """Where QEMU puts its `snapshot=on` overlays. Ours, not `%TEMP%`.
+
+    Beside `runtime/` rather than inside it: `reconcile_runtime()` treats every
+    directory under `runtime/` that has no `run.json` as an orphaned instance,
+    so putting the scratch there would have it reported as one on every sweep.
+    """
+    override = (os.environ.get("OMNI_SCRATCH_DIR")
+                or ((cfg or {}).get("qemu") or {}).get("scratch_dir"))
+    d = Path(override) if override else config.data_dir() / SCRATCH_DIRNAME
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+
+def scratch_env(cfg=None, env=None):
+    """The child environment that puts QEMU's overlay in `scratch_dir`.
+
+    All three names are set on purpose: Windows' GetTempPath reads TMP then
+    TEMP, and glibc/glib read TMPDIR. Setting only the one that matters on the
+    platform you happen to be testing is how this silently reverts."""
+    base = dict(os.environ if env is None else env)
+    d = scratch_dir(cfg)
+    if d is None:
+        return base
+    for name in ("TMP", "TEMP", "TMPDIR"):
+        base[name] = str(d)
+    return base
+
+
+def scratch_free_mb(cfg=None):
+    """Free MB on the volume holding the scratch, or None if unknowable."""
+    d = scratch_dir(cfg)
+    if d is None:
+        return None
+    try:
+        return shutil.disk_usage(str(d)).free // (1024 * 1024)
+    except OSError:
+        return None
+
+
+def scratch_room(cfg=None, want_mb=None):
+    """(has_room, free_mb, needed_mb). Never raises; unknown free = has room.
+
+    Unknown must mean YES. A disk-usage call that fails on some future host is
+    not a reason to refuse to boot; it is a reason to stop asking."""
+    want = int(want_mb or SCRATCH_PER_INSTANCE_MB)
+    needed = want + SCRATCH_FLOOR_MB
+    free = scratch_free_mb(cfg)
+    if free is None:
+        return True, None, needed
+    return free >= needed, free, needed
+
+
+def reap_scratch(cfg=None, live_pids=()):
+    """Delete leaked QEMU overlays. Returns (files, megabytes) reclaimed.
+
+    An overlay belonging to a RUNNING QEMU cannot be deleted on Windows -- the
+    open handle makes the unlink fail -- and that is what makes this safe to
+    run at any time rather than only when nothing is booted. `live_pids` is
+    accepted for the POSIX case, where an open file unlinks happily and the
+    running guest would lose its writes.
+
+    QEMU names these `vl.XXXXXX` (qemu-file's template). Matching the name
+    rather than deleting the directory's contents matters: the scratch dir is
+    a plain directory a user may well have pointed somewhere shared."""
+    d = scratch_dir(cfg)
+    if d is None:
+        return 0, 0
+    files = megabytes = 0
+    live = set(int(p) for p in live_pids or ())
+    for p in d.glob("vl.*"):
+        try:
+            if not IS_WINDOWS and live and _scratch_owner(p) in live:
+                continue
+            size = p.stat().st_size
+            p.unlink()
+        except OSError:      # noqa: PERF203 - a locked file is the live case
+            continue
+        files += 1
+        megabytes += size // (1024 * 1024)
+    return files, megabytes
+
+
+def _scratch_owner(path):
+    """The pid holding `path` open on POSIX, or None. Best-effort by design:
+    on Windows the failed unlink already answers this question."""
+    if IS_WINDOWS:
+        return None
+    try:
+        out = subprocess.run(["fuser", str(path)], capture_output=True,
+                             text=True, timeout=5).stdout.split()
+        return int(out[0]) if out else None
+    except Exception:      # noqa: BLE001 - no fuser, no answer, no crash
+        return None
 
 
 def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
@@ -1797,7 +1948,8 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
         kwargs["start_new_session"] = True
     cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug,
                        warm=warm, bake=bake)
-    proc = subprocess.Popen(cmd, stdout=log, stderr=log, **kwargs)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log,
+                            env=scratch_env(cfg), **kwargs)
     identity = f"omni-{acct['name']}"
     hidden = _hide_window_if_wanted(cmd, identity, cfg)
     (d / "run.json").write_text(json.dumps(

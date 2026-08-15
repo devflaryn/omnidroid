@@ -79,41 +79,165 @@ class FakeSession:
         return False
 
 
+class _R:
+    """An adb CompletedProcess, as much of one as this module reads."""
+
+    def __init__(self, out=""):
+        self.stdout = out
+
+
+def _fake_adb(guest_epochs, sent):
+    """An adb that answers `date +%s` from `guest_epochs` (in order, the last
+    value repeating) and records every argv it was handed.
+
+    Recording ARGV is the whole point: these tests assert on the command that
+    would be sent, never by running adb. The guest shell re-parses whatever
+    adb joins with spaces, so the exact element boundaries are the behaviour.
+    """
+    seq = list(guest_epochs)
+
+    def adb(acct, *args, **kw):
+        sent.append(args)
+        if args[:2] == ("shell", "date"):
+            return _R(f"{seq.pop(0) if len(seq) > 1 else seq[0]}\n")
+        return _R("")
+    return adb
+
+
+def _set_calls(sent):
+    return [" ".join(a) for a in sent if "date -s" in " ".join(a)]
+
+
 class ClockResync(unittest.TestCase):
     """A restored guest wakes with the clock frozen at bake time; measured
     skew equals the wall time since the bake. -rtc base=utc,clock=host does
     NOT fix it. A wrong clock breaks TLS and cookie acceptance, which looks
-    exactly like "auto-login is broken"."""
+    exactly like "auto-login is broken".
+
+    The same function now runs on the warm-POOL path too, where the guest has
+    been live for hours and the skew comes from the HOST sleeping rather than
+    from a freeze -- so the no-op case matters as much as the correcting one.
+    """
 
     def test_it_sets_the_guest_clock_to_host_time(self):
         sent = []
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000, 2000], sent),
+            now_fn=lambda: 2000)
 
-        class R:
-            def __init__(self, out):
-                self.stdout = out
-
-        def fake_adb(acct, *args, **kw):
-            sent.append(args)
-            if args[:2] == ("shell", "date"):
-                return R("1000\n" if len(sent) == 1 else "2000\n")
-            return R("")
-
-        skew = warmboot.resync_guest_clock(
-            {"name": "t"}, "lbl", adb_fn=fake_adb, now_fn=lambda: 2000)
-
-        self.assertEqual(skew, 1000)
+        self.assertEqual(res["skew_s"], 1000)
+        self.assertTrue(res["corrected"])
+        self.assertEqual(res["reason"], warmboot.CLOCK_OK)
         joined = [" ".join(a) for a in sent]
         self.assertTrue(any("date -s @2000" in j for j in joined), joined)
 
-    def test_unreadable_guest_clock_returns_none_instead_of_raising(self):
-        class R:
-            stdout = "not-a-number"
+    def test_a_clock_already_right_costs_one_round_trip_and_no_log(self):
+        # This runs on EVERY launch now. Correcting a 1s skew would spend a
+        # second adb round trip and a log line per launch to move a clock that
+        # was already right -- which is how a real diagnostic turns into noise
+        # nobody reads.
+        sent = []
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1999], sent),
+            now_fn=lambda: 2000)
 
-        self.assertIsNone(warmboot.resync_guest_clock(
-            {"name": "t"}, "lbl", adb_fn=lambda *a, **k: R(),
-            now_fn=lambda: 1))
+        self.assertFalse(res["corrected"])
+        self.assertEqual(res["reason"], warmboot.CLOCK_WITHIN_THRESHOLD)
+        self.assertEqual(res["skew_s"], 1)
+        self.assertEqual(len(sent), 1, sent)
+        self.assertEqual(_set_calls(sent), [])
 
-    def test_adb_timeout_reading_guest_clock_returns_none_instead_of_raising(self):
+    def test_the_threshold_is_a_parameter_not_a_constant(self):
+        sent = []
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000, 2000], sent),
+            now_fn=lambda: 2000, threshold_s=5000)
+        self.assertEqual(res["reason"], warmboot.CLOCK_WITHIN_THRESHOLD)
+
+    def test_root_via_adbd_sends_sh_dash_c_with_no_su_prefix(self):
+        # `""` is a VALID root mode: the x86 Bliss base ships no su binary at
+        # all, but its adbd already runs as uid 0. Prefixing `su` there is
+        # exactly what made every root-gated tune skip on x86 -- and a clock
+        # left uncorrected is reported to the user as a dead cookie.
+        sent = []
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000, 2000], sent),
+            now_fn=lambda: 2000, root_fn=lambda acct: "")
+
+        self.assertTrue(res["corrected"])
+        self.assertEqual(_set_calls(sent), ["shell sh -c 'date -s @2000'"])
+
+    def test_a_su_binary_gets_the_magisk_argv_form(self):
+        sent = []
+        warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000, 2000], sent),
+            now_fn=lambda: 2000, root_fn=lambda acct: "/sbin/su")
+        self.assertEqual(_set_calls(sent),
+                         ["shell /sbin/su 0 sh -c 'date -s @2000'"])
+
+    def test_no_root_reports_it_instead_of_raising_or_pretending(self):
+        # None means "no root at all". Sending the command anyway would exit 0
+        # with the clock untouched, and this would log a successful resync
+        # that never happened.
+        sent = []
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000], sent),
+            now_fn=lambda: 2000, root_fn=lambda acct: None)
+
+        self.assertFalse(res["corrected"])
+        self.assertEqual(res["reason"], warmboot.CLOCK_NO_ROOT)
+        self.assertEqual(res["skew_s"], 1000)
+        self.assertEqual(_set_calls(sent), [])
+
+    def test_a_root_resolver_that_blows_up_is_no_root_not_a_failed_boot(self):
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000], []),
+            now_fn=lambda: 2000,
+            root_fn=lambda acct: (_ for _ in ()).throw(RuntimeError("boom")))
+        self.assertEqual(res["reason"], warmboot.CLOCK_NO_ROOT)
+
+    def test_no_resolver_keeps_the_legacy_su_dash_c_form(self):
+        sent = []
+        warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000, 2000], sent),
+            now_fn=lambda: 2000)
+        self.assertEqual(_set_calls(sent), ["shell su -c date -s @2000"])
+
+    def test_a_correction_that_does_not_stick_is_reported_not_celebrated(self):
+        # `date -s` exits 0 and the clock does not move: Android's time
+        # detector re-applying its own network suggestion is the leading
+        # suspect. Whether that happens on these bases is unverified, so the
+        # residual read is how the measurement gets made in the field.
+        sent = []
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=_fake_adb([1000, 1000], sent),
+            now_fn=lambda: 2000, root_fn=lambda acct: "")
+
+        self.assertFalse(res["corrected"])
+        self.assertEqual(res["reason"], warmboot.CLOCK_SET_FAILED)
+        self.assertEqual(res["residual_s"], 1000)
+
+    def test_a_failing_set_command_still_returns_a_result(self):
+        def adb(acct, *args, **kw):
+            if args[:2] == ("shell", "date"):
+                return _R("1000\n")
+            raise OSError("device offline")
+
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=adb, now_fn=lambda: 2000)
+        self.assertEqual(res["reason"], warmboot.CLOCK_SET_FAILED)
+        self.assertEqual(res["skew_s"], 1000)
+
+    def test_unreadable_guest_clock_returns_a_result_instead_of_raising(self):
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=lambda *a, **k: _R("not-a-number"),
+            now_fn=lambda: 1)
+        self.assertEqual(res["reason"], warmboot.CLOCK_UNREADABLE)
+        # None skew is NOT zero skew: a caller must not read this as "fine".
+        self.assertIsNone(res["skew_s"])
+        self.assertFalse(res["corrected"])
+
+    def test_adb_timeout_reading_the_clock_is_a_result_not_an_exception(self):
         # The real adb() is subprocess.run(..., timeout=...), which raises
         # subprocess.TimeoutExpired -- NOT an OSError -- when a still-booting
         # guest never answers. That is the single most likely real-world
@@ -122,8 +246,38 @@ class ClockResync(unittest.TestCase):
         def timing_out(*a, **k):
             raise subprocess.TimeoutExpired(cmd="adb shell date +%s", timeout=20)
 
-        self.assertIsNone(warmboot.resync_guest_clock(
-            {"name": "t"}, "lbl", adb_fn=timing_out, now_fn=lambda: 1))
+        res = warmboot.resync_guest_clock(
+            {"name": "t"}, "lbl", adb_fn=timing_out, now_fn=lambda: 1)
+        self.assertEqual(res["reason"], warmboot.CLOCK_UNREADABLE)
+        self.assertIsNone(res["skew_s"])
+
+
+class ClockProbe(unittest.TestCase):
+    """The read-only half. A caller has to be able to ASK how far off a guest
+    is -- e.g. to decide whether a long-warm pool slot is worth recycling --
+    without touching a guest somebody may be playing on."""
+
+    def test_it_reads_the_skew_and_mutates_nothing(self):
+        sent = []
+        skew = warmboot.guest_clock_skew(
+            {"name": "t"}, adb_fn=_fake_adb([1000], sent), now_fn=lambda: 2000)
+
+        self.assertEqual(skew, 1000)
+        self.assertEqual(sent, [("shell", "date", "+%s")])
+
+    def test_an_unreadable_clock_is_none_not_zero(self):
+        # Zero would read as "this guest is fine", which is the opposite of
+        # what an unanswerable adb means.
+        self.assertIsNone(warmboot.guest_clock_skew(
+            {"name": "t"}, adb_fn=lambda *a, **k: _R(""), now_fn=lambda: 1))
+
+    def test_adb_noise_before_the_answer_is_not_an_unreadable_clock(self):
+        # adb interleaves its own chatter with command output; engine's own
+        # `id -u` parsing takes the last line for the same reason.
+        noisy = _R("* daemon started successfully *\n1000\n")
+        self.assertEqual(warmboot.guest_clock_skew(
+            {"name": "t"}, adb_fn=lambda *a, **k: noisy,
+            now_fn=lambda: 2000), 1000)
 
 
 class Restore(unittest.TestCase):

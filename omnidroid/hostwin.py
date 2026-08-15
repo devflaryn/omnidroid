@@ -20,14 +20,42 @@ The viewer then HOSTS that window rather than connecting to a framebuffer --
 see `embedview.py`. Reparenting it costs no copy, no encode and no decode, and
 input goes straight into the guest instead of being synthesised from RFB.
 
-Windows-only by design, and that is not a gap: it is the only platform where a
-window is forced. Linux renders windowless through egl-headless as intended,
-and macOS has no virgl at all yet, so both are already headless there. Every
-function here is a no-op that reports False elsewhere.
+WHY THE OTHER TWO PLATFORMS ARE HERE. Windows is the only host where a window
+is *forced*, but every host where QEMU opens one owes the user the same thing:
+a view they can toggle, and nothing on screen they did not ask for. Hiding the
+real window beats a copy-based viewer wherever it is possible -- same pixels,
+drawn once, no encode -- so it is tried first everywhere and the VNC viewer is
+the fallback rather than the plan. Backends, probed once per process:
+
+  * `win32`               -- ShowWindow(SW_HIDE). Measured, load-bearing.
+  * `x11-xdotool`         -- unmap the window, found by _NET_WM_NAME.
+  * `x11-wmctrl`          -- ask the window manager for _NET_WM_STATE_HIDDEN.
+  * `x11-xlib`            -- the same unmap, in-process, when python-xlib
+                             happens to be installed (never required).
+  * `macos-systemevents`  -- hide the whole QEMU *application* by its unix id.
+                             There is no public API to hide one window of
+                             another process on macOS, so the application is
+                             the smallest unit available, and the handle is
+                             therefore the pid rather than a window.
+
+WAYLAND IS NOT SUPPORTED AND MUST NOT PRETEND TO BE. The protocol gives a
+client no way to enumerate, map or unmap another client's surfaces -- that is a
+design property, not a missing feature -- and QEMU's GTK display on a Wayland
+session is a Wayland client, so there is no X11 window for xdotool to find
+either. `backend()` returns "none" there with a reason the caller can print,
+and every function returns False. Reporting "hidden" for a window still sitting
+on the user's screen is worse than doing nothing.
+
+Nothing here may raise into a boot path. Every probe, every subprocess and
+every backend returns a falsy value on failure: a visible window is a cosmetic
+problem, an exception here is a launch that died for one.
 """
+import os
+import shutil
+import subprocess
 import time
 
-from omnidroid.config import IS_WINDOWS
+from omnidroid.config import IS_LINUX, IS_MACOS, IS_WINDOWS
 
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
@@ -39,7 +67,167 @@ SW_SHOW = 5
 # a boot -- which is why nothing here raises.
 DEFAULT_TIMEOUT = 20.0
 POLL_SECONDS = 0.1
+# A subprocess-backed probe is not free: xdotool and osascript each cost a
+# fork+exec, and polling one at 0.1 s against the 20 s bound is 200 process
+# launches to discover a window that never appeared. The window turns up in
+# well under a second when it turns up at all, so the coarser interval loses
+# nothing real.
+SUBPROCESS_POLL_SECONDS = 0.35
 
+BACKEND_NONE = "none"
+BACKEND_WIN32 = "win32"
+BACKEND_XDOTOOL = "x11-xdotool"
+BACKEND_WMCTRL = "x11-wmctrl"
+BACKEND_XLIB = "x11-xlib"
+BACKEND_MACOS = "macos-systemevents"
+
+_SUBPROCESS_BACKENDS = (BACKEND_XDOTOOL, BACKEND_WMCTRL, BACKEND_MACOS)
+
+# How long a helper command gets before it is abandoned. These are all
+# millisecond-scale tools; a bound only matters because an X server that has
+# gone away can leave xdotool blocked on a socket forever, and that would
+# otherwise be a boot that never returns.
+CMD_TIMEOUT = 5.0
+
+_BACKEND_CACHE = {}
+_WHICH_CACHE = {}
+# Set when a backend that EXISTS refuses to work for a reason retrying cannot
+# fix -- today only macOS's TCC permissions. Kept apart from the probe result
+# so `can_hide()` can go False mid-process and stop `keep_hidden` asking the
+# same denied question 375 times.
+_DENIED = {}
+
+
+# ---------- backend probe ----------
+
+def _which(tool):
+    """shutil.which, memoised, and the seam the tests monkeypatch.
+
+    Memoised because `keep_hidden` asks the same questions every poll for two
+    and a half minutes, and because the backend chosen from these answers is
+    already frozen for the process -- a tool that appears mid-run would change
+    nothing anyway, so remembering the miss is not a lie."""
+    if tool not in _WHICH_CACHE:
+        _WHICH_CACHE[tool] = shutil.which(tool)
+    return _WHICH_CACHE[tool]
+
+
+def _import_xlib():
+    """python-xlib's display module, or None.
+
+    Optional BY POLICY: this project ships no third-party dependencies, so xlib
+    is used when a host happens to have it (many Linux desktops do, via other
+    packages) and is never required."""
+    try:
+        from Xlib import display
+        return display
+    except Exception:      # noqa: BLE001 - an optional import must not raise
+        return None
+
+
+def _session_is_wayland():
+    return bool(os.environ.get("WAYLAND_DISPLAY")) or \
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+
+
+def _detect_backend():
+    """(name, reason). `reason` is "" unless the name is "none".
+
+    Order on Linux is preference, not availability: xdotool actually unmaps the
+    window, wmctrl only ASKS the window manager to, and xlib does what xdotool
+    does but needs a package we refuse to depend on.
+    """
+    if IS_WINDOWS:
+        return BACKEND_WIN32, ""
+    if IS_MACOS:
+        if not _which("osascript"):
+            return BACKEND_NONE, ("osascript is not on PATH, so System Events "
+                                  "cannot be asked to hide the application")
+        return BACKEND_MACOS, ""
+    if IS_LINUX:
+        if _session_is_wayland():
+            return BACKEND_NONE, (
+                "this is a Wayland session: the protocol gives one client no "
+                "way to map or unmap another's window, and QEMU's GTK display "
+                "is a Wayland client with no X11 window to find. Use the VNC "
+                "viewer, or log into an X11 session")
+        if not os.environ.get("DISPLAY"):
+            return BACKEND_NONE, ("no $DISPLAY: this session has no X server, "
+                                  "so there is no window to hide")
+        if _which("xdotool"):
+            return BACKEND_XDOTOOL, ""
+        if _which("wmctrl"):
+            return BACKEND_WMCTRL, ""
+        if _import_xlib() is not None:
+            return BACKEND_XLIB, ""
+        return BACKEND_NONE, ("no X11 window tool: install xdotool (best), "
+                              "or wmctrl, or the python-xlib package")
+    return BACKEND_NONE, "hiding windows is not implemented for this platform"
+
+
+def _backend_probe():
+    """The memoised (name, reason).
+
+    Keyed on the platform flags rather than kept in a bare global so a test
+    that patches them re-probes; in a real process the key never changes and
+    the PATH lookups happen exactly once.
+    """
+    key = (IS_WINDOWS, IS_LINUX, IS_MACOS)
+    if key not in _BACKEND_CACHE:
+        try:
+            _BACKEND_CACHE[key] = _detect_backend()
+        except Exception:      # noqa: BLE001 - a probe must never raise
+            return BACKEND_NONE, "the backend probe itself failed"
+    return _BACKEND_CACHE[key]
+
+
+def backend():
+    """Short name of the mechanism that hides windows on this host, or "none".
+
+    Callers print it. "The window did not get hidden and nobody said why" is
+    the failure mode that costs an afternoon, so the answer is always a name
+    plus, when it is "none", a `backend_reason()`."""
+    return _backend_probe()[0]
+
+
+def backend_reason():
+    """Why hide/show cannot work here, or "" when it can.
+
+    Covers both "no mechanism exists" (Wayland, no $DISPLAY, no tool) and "the
+    mechanism exists and was refused" (macOS without Accessibility permission),
+    because from the user's chair those are the same question."""
+    name, reason = _backend_probe()
+    return _DENIED.get(name) or reason
+
+
+def can_hide():
+    """Whether hiding is possible at all, so a caller can pick a policy without
+    a failed attempt -- and, on a windowed boot, without the window flashing up
+    while we find out."""
+    name = backend()
+    return name != BACKEND_NONE and not _DENIED.get(name)
+
+
+def _poll_seconds():
+    return SUBPROCESS_POLL_SECONDS if backend() in _SUBPROCESS_BACKENDS \
+        else POLL_SECONDS
+
+
+def _run(argv, timeout=CMD_TIMEOUT):
+    """(rc, stdout, stderr) for a short helper command.
+
+    (None, "", "") when it could not run at all -- a missing binary, a timeout,
+    an X server that went away. Every caller treats that as "no", which is the
+    only safe direction here."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout)
+    except Exception:      # noqa: BLE001 - see the module docstring
+        return None, "", ""
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+# ---------- win32 ----------
 
 def _window_title(hwnd):
     import ctypes
@@ -114,30 +302,417 @@ def _enum_windows(match=None, pid=None):
     return found
 
 
+def _show(hwnd, how):
+    try:
+        import ctypes
+        ctypes.windll.user32.ShowWindow(hwnd, how)
+        return True
+    except Exception:      # noqa: BLE001
+        return False
+
+
+# ---------- X11 ----------
+
+# Characters with a meaning in a POSIX extended regex outside a bracket
+# expression. NOT re.escape(): that also escapes `-`, and `\-` is undefined in
+# POSIX ERE -- xdotool's regcomp is free to reject it, and every identity this
+# project builds is `omni-<account>`.
+_ERE_SPECIAL = ".[]{}()*+?|^$\\"
+
+
+def _x11_name_pattern(identity):
+    """xdotool matches `--name` as a POSIX extended regex, so an account whose
+    name contains a `.` or a `+` would otherwise match the wrong window."""
+    return "".join("\\" + c if c in _ERE_SPECIAL else c for c in identity)
+
+
+def _xdotool_search(identity, pid=None, only_visible=False):
+    """[window ids] as strings, or [].
+
+    `--all` is NOT optional: xdotool ORs its criteria by default, so
+    `--pid X --name Y` without it matches every window of that process OR every
+    window with that name -- which on a host running several instances is the
+    wrong window, silently.
+
+    The pid criterion reads `_NET_WM_PID`, which GTK sets. A QEMU started
+    through a wrapper, or on an X server that never saw the property, has none,
+    so an empty pid-qualified result falls back to the name alone rather than
+    concluding the window is gone -- the same "either alone finds it" rule the
+    win32 path has.
+    """
+    base = ["xdotool", "search"]
+    if only_visible:
+        base = base + ["--onlyvisible"]
+    pattern = _x11_name_pattern(identity) if identity else None
+    tries = []
+    if pid is not None and pattern:
+        tries.append(base + ["--all", "--pid", str(pid), "--name", pattern])
+    elif pid is not None:
+        tries.append(base + ["--pid", str(pid)])
+    if pattern:
+        tries.append(base + ["--name", pattern])
+    for argv in tries:
+        rc, out, _err = _run(argv)
+        if rc == 0 and out.strip():
+            return out.split()
+    return []
+
+
+def _wmctrl_windows(identity, pid=None):
+    """[(window id, title)] from `wmctrl -l -p`.
+
+    `-p` adds the pid column, which is the only way wmctrl can tell two
+    instances apart when the window titles are similar."""
+    rc, out, _err = _run(["wmctrl", "-l", "-p"])
+    if rc != 0:
+        return []
+    hits = []
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        wid, _desktop, wpid, _host, title = parts
+        if pid is not None and wpid != str(pid):
+            continue
+        if identity and identity.lower() not in title.lower():
+            continue
+        if not identity and pid is None:
+            continue
+        hits.append((wid, title))
+    return hits
+
+
+def _xprop_is_mapped(wid):
+    """Whether a wmctrl-found window is on screen, read from ICCCM WM_STATE.
+
+    wmctrl itself cannot answer this: `wmctrl -l` lists a window whether or not
+    the window manager has hidden it, and there is no state column. xprop ships
+    in the same x11-utils family as wmctrl so it is usually present, and when
+    it is not this reports False -- "no reason to re-hide" -- rather than
+    guessing. A missed re-hide costs a visible window once; a wrong True costs
+    a wmctrl fork every poll for two and a half minutes.
+
+    Worth knowing while you are here: EWMH defines _NET_WM_STATE_HIDDEN as a
+    state the window MANAGER sets, so `wmctrl -b add,hidden` is honoured by
+    some window managers and quietly ignored by others. That is exactly why
+    xdotool, which unmaps the window itself, is probed for first.
+    """
+    if not _which("xprop"):
+        return False
+    rc, out, _err = _run(["xprop", "-id", str(wid), "WM_STATE"])
+    if rc != 0:
+        return False
+    return "normal" in out.lower()
+
+
+def _xlib_window_id(wid):
+    """Window ids arrive decimal from xdotool and hex from wmctrl; base 0 takes
+    either without the caller having to know which backend it came from."""
+    return int(str(wid), 0)
+
+
+def _xlib_display():
+    mod = _import_xlib()
+    if mod is None:
+        return None
+    try:
+        return mod.Display()
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def _xlib_close(d):
+    try:
+        d.close()
+    except Exception:      # noqa: BLE001
+        pass
+
+
+def _xlib_windows(identity, pid=None):
+    """[(window id, title)] via python-xlib.
+
+    Reads `_NET_CLIENT_LIST` rather than walking the window tree: the client
+    list is what the window manager considers a real window, so it skips the
+    override-redirect menus and GTK's helper windows that a tree walk trips
+    over. Ids, not window objects: every call opens its own Display and closes
+    it, and an Xlib window outlives its display only as a broken reference.
+    """
+    d = _xlib_display()
+    if d is None:
+        return []
+    try:
+        root = d.screen().root
+        prop = root.get_full_property(d.intern_atom("_NET_CLIENT_LIST"), 0)
+        net_name = d.intern_atom("_NET_WM_NAME")
+        net_pid = d.intern_atom("_NET_WM_PID")
+        hits = []
+        for wid in (list(prop.value) if prop else []):
+            w = d.create_resource_object("window", wid)
+            title = ""
+            p = w.get_full_property(net_name, 0)
+            if p is not None and p.value:
+                title = p.value.decode("utf-8", "replace") \
+                    if isinstance(p.value, bytes) else str(p.value)
+            if not title:
+                title = w.get_wm_name() or ""
+            if identity and identity.lower() not in title.lower():
+                continue
+            if pid is not None:
+                pp = w.get_full_property(net_pid, 0)
+                if pp is None or not pp.value or int(pp.value[0]) != pid:
+                    continue
+            if not identity and pid is None:
+                continue
+            hits.append((int(wid), title))
+        return hits
+    except Exception:      # noqa: BLE001
+        return []
+    finally:
+        _xlib_close(d)
+
+
+def _xlib_set_visible(wid, visible):
+    d = _xlib_display()
+    if d is None:
+        return False
+    try:
+        w = d.create_resource_object("window", _xlib_window_id(wid))
+        if visible:
+            w.map()
+        else:
+            w.unmap()
+        # Without the sync the request is still sitting in Xlib's output buffer
+        # when this returns True, and the window is demonstrably still up.
+        d.sync()
+        return True
+    except Exception:      # noqa: BLE001
+        return False
+    finally:
+        _xlib_close(d)
+
+
+def _xlib_is_visible(wid):
+    d = _xlib_display()
+    if d is None:
+        return False
+    try:
+        from Xlib import X
+        w = d.create_resource_object("window", _xlib_window_id(wid))
+        return w.get_attributes().map_state == X.IsViewable
+    except Exception:      # noqa: BLE001
+        return False
+    finally:
+        _xlib_close(d)
+
+
+# ---------- macOS ----------
+
+# What a TCC refusal looks like in osascript's stderr. Matched on the TEXT and
+# deliberately NOT on the error number: -1719 is "Can't get <object>", which is
+# also what a pid that has already exited returns, and sending a user to System
+# Settings because their instance had stopped would be a worse bug than the one
+# this detects.
+_MACOS_DENIED_MARKERS = (
+    "assistive access",                        # Accessibility not granted
+    "not authorized to send apple events",     # Automation not granted
+    "not authorised to send apple events",
+)
+
+
+def _macos_get_visible_script(pid):
+    """Addressed by unix id, never by name: several QEMU instances are the same
+    application, so `first process whose name is "qemu-system-x86_64"` would
+    read (and hide) whichever one System Events happened to list first."""
+    return ('tell application "System Events" to get visible of '
+            f'(first process whose unix id is {int(pid)})')
+
+
+def _macos_set_visible_script(pid, visible):
+    return ('tell application "System Events" to set visible of '
+            f'(first process whose unix id is {int(pid)}) to '
+            f'{"true" if visible else "false"}')
+
+
+def _osascript(script):
+    return ["osascript", "-e", script]
+
+
+def _note_macos_failure(err):
+    """Record a permissions refusal so it is reported once and not retried.
+
+    Returns True when this was a refusal rather than an ordinary failure."""
+    low = (err or "").lower()
+    if not any(m in low for m in _MACOS_DENIED_MARKERS):
+        return False
+    first = (err or "").strip().splitlines()
+    _DENIED[BACKEND_MACOS] = (
+        "System Events refused: grant this app Accessibility and Automation "
+        "permission under System Settings > Privacy & Security, or the QEMU "
+        "window cannot be hidden"
+        + (f" ({first[0].strip()})" if first else ""))
+    return True
+
+
+def _macos_is_visible(pid):
+    """True/False, or None when System Events could not answer -- which is also
+    how "there is no such process" arrives, since a dead pid and a refused
+    query both fail the same query."""
+    rc, out, err = _run(_osascript(_macos_get_visible_script(pid)))
+    if rc != 0:
+        _note_macos_failure(err)
+        return None
+    text = out.strip().lower()
+    return text == "true" if text in ("true", "false") else None
+
+
+def _macos_set_visible(pid, visible):
+    """Hide or show the whole QEMU APPLICATION. There is no public API to hide
+    one window of another process on macOS, and QEMU's cocoa display is one
+    window per instance, so the application is both the smallest and the right
+    unit here.
+
+    Unlike the Windows path this is NOT known to keep rendering while hidden --
+    and it does not need to be: macOS has no virgl, so those frames are blitted
+    by QEMU on the CPU from a framebuffer the guest fills either way. Nothing
+    the guest does depends on the window being on screen.
+    """
+    rc, _out, err = _run(_osascript(_macos_set_visible_script(pid, visible)))
+    if rc != 0:
+        _note_macos_failure(err)
+        return False
+    # Read it back. The command succeeds against a process that is already
+    # hidden, against one with no windows at all, and against an app that
+    # declines to deactivate -- so the exit code does not answer "is it off the
+    # user's screen now", which is the only question being asked.
+    state = _macos_is_visible(pid)
+    return state is not None and state == visible
+
+
+def _macos_processes(identity, pid=None):
+    """[pid] for the QEMU application to hide.
+
+    The handle on this platform IS the pid, because applications are what macOS
+    can hide. `pgrep -f` matches the whole command line, where `-name
+    omni-<account>` sits, so a caller that only knows the identity still
+    resolves to one process. Our own pid is excluded: an engine invoked with
+    the identity somewhere on its own command line would otherwise ask System
+    Events to hide the engine.
+    """
+    if pid is not None:
+        return [pid] if _macos_is_visible(pid) is not None else []
+    if not identity:
+        return []
+    rc, out, _err = _run(["pgrep", "-f", identity])
+    if rc != 0:
+        return []
+    me = os.getpid()
+    found = []
+    for token in out.split():
+        try:
+            n = int(token)
+        except ValueError:
+            continue
+        if n != me and _macos_is_visible(n) is not None:
+            found.append(n)
+    return found
+
+
+# ---------- backend dispatch ----------
+
+def _find_handles(identity, pid):
+    name = backend()
+    if name == BACKEND_WIN32:
+        return [hwnd for hwnd, _t in _enum_windows(identity or None, pid)]
+    if name == BACKEND_XDOTOOL:
+        return _xdotool_search(identity, pid)
+    if name == BACKEND_WMCTRL:
+        return [wid for wid, _t in _wmctrl_windows(identity, pid)]
+    if name == BACKEND_XLIB:
+        return [wid for wid, _t in _xlib_windows(identity, pid)]
+    if name == BACKEND_MACOS:
+        return _macos_processes(identity, pid)
+    return []
+
+
+def _set_visible(handle, visible):
+    name = backend()
+    if name == BACKEND_WIN32:
+        # SW_SHOWNOACTIVATE, not SW_SHOW: showing is always requested from a
+        # viewer or a CLI the user is already looking at, and stealing focus
+        # from it is not what "let me see that window" means.
+        return _show(handle, SW_SHOWNOACTIVATE if visible else SW_HIDE)
+    if name == BACKEND_XDOTOOL:
+        rc, _o, _e = _run(["xdotool",
+                           "windowmap" if visible else "windowunmap",
+                           str(handle)])
+        return rc == 0
+    if name == BACKEND_WMCTRL:
+        # `-i` is not optional: without it `-r` treats its argument as a title
+        # to match, and the window id we found would be searched for as text.
+        rc, _o, _e = _run(["wmctrl", "-i", "-r", str(handle), "-b",
+                           "remove,hidden" if visible else "add,hidden"])
+        return rc == 0
+    if name == BACKEND_XLIB:
+        return _xlib_set_visible(handle, visible)
+    if name == BACKEND_MACOS:
+        return _macos_set_visible(handle, visible)
+    return False
+
+
+def _handle_is_visible(handle, identity, pid):
+    name = backend()
+    if name == BACKEND_WIN32:
+        try:
+            import ctypes
+            return bool(ctypes.windll.user32.IsWindowVisible(handle))
+        except Exception:      # noqa: BLE001
+            return False
+    if name == BACKEND_XDOTOOL:
+        # xdotool has no "is this id mapped" query, so ask the search itself:
+        # `--onlyvisible` filters out the window we just unmapped.
+        return str(handle) in _xdotool_search(identity, pid, only_visible=True)
+    if name == BACKEND_WMCTRL:
+        return _xprop_is_mapped(handle)
+    if name == BACKEND_XLIB:
+        return _xlib_is_visible(handle)
+    if name == BACKEND_MACOS:
+        return _macos_is_visible(handle) is True
+    return False
+
+
+# ---------- public API ----------
+
 def find_window(identity, timeout=DEFAULT_TIMEOUT, pid=None):
-    """The hwnd of the QEMU window for `identity`, or None.
+    """The handle of the QEMU window for `identity`, or None.
 
     `identity` is what the engine passes to `-name` (`omni-<account>`), which
     QEMU uses as its window title; `pid` is the QEMU process, which the engine
     records in run.json. Either alone finds the window; together they are
     unambiguous when several instances are up.
 
-    Searches CHILD windows too -- see _walk_windows for why that is not
-    optional once the viewer starts embedding.
+    On Windows this searches CHILD windows too -- see _walk_windows for why
+    that is not optional once the viewer starts embedding.
+
+    THE HANDLE'S TYPE IS THE BACKEND'S: an HWND on Windows, an X11 window id on
+    Linux, and on macOS the QEMU pid itself, because that platform hides
+    applications rather than windows. Callers hand it straight back to this
+    module and must not interpret it; `embedview` is the single exception and
+    it is Windows-only.
     """
-    if not IS_WINDOWS or (not identity and pid is None):
+    if backend() == BACKEND_NONE or (not identity and pid is None):
         return None
     deadline = time.monotonic() + timeout
+    poll = _poll_seconds()
     while True:
         try:
-            hits = _enum_windows(identity or None, pid)
+            hits = _find_handles(identity, pid)
         except Exception:      # noqa: BLE001 - a probe must never raise
             return None
         if hits:
-            return hits[0][0]
+            return hits[0]
         if time.monotonic() >= deadline:
             return None
-        time.sleep(POLL_SECONDS)
+        time.sleep(poll)
 
 
 def window_is_embedded(identity, pid=None):
@@ -145,22 +720,20 @@ def window_is_embedded(identity, pid=None):
 
     That is the "a viewer already has it" state, and it has to be told apart
     from "the window is gone": one means open the window you already have, the
-    other means the guest is blind and the instance needs restarting."""
+    other means the guest is blind and the instance needs restarting.
+
+    False on every other backend by CONSTRUCTION, not by omission: nothing
+    reparents QEMU's window off Windows (macOS has no public cross-process
+    embedding, and a Linux GPU boot is windowless), so this state cannot
+    arise there."""
+    if backend() != BACKEND_WIN32:
+        return False
     hwnd = find_window(identity, timeout=0, pid=pid)
     if hwnd is None:
         return False
     try:
         import ctypes
         return bool(ctypes.windll.user32.GetParent(hwnd))
-    except Exception:      # noqa: BLE001
-        return False
-
-
-def _show(hwnd, how):
-    try:
-        import ctypes
-        ctypes.windll.user32.ShowWindow(hwnd, how)
-        return True
     except Exception:      # noqa: BLE001
         return False
 
@@ -173,10 +746,37 @@ def hide_qemu_window(identity, timeout=DEFAULT_TIMEOUT, pid=None):
     on screen. A visible window is a cosmetic problem; an exception here would
     be a launch that died for one.
     """
-    hwnd = find_window(identity, timeout=timeout, pid=pid)
-    if hwnd is None:
+    handle = find_window(identity, timeout=timeout, pid=pid)
+    if handle is None:
         return False
-    return _show(hwnd, SW_HIDE)
+    return _set_visible(handle, False)
+
+
+def show_qemu_window(identity, timeout=2.0, pid=None):
+    """Bring a hidden QEMU window back, for when someone needs to look at it
+    directly (the one configuration where a GL problem is visible with none of
+    this project's code in the path).
+
+    `pid` is optional and additive: the macOS backend can only address a
+    process, and while it will find one from the identity via pgrep, a caller
+    that already has the pid (the engine reads it from run.json) should pass
+    it rather than pay a process scan and risk the wrong match."""
+    handle = find_window(identity, timeout=timeout, pid=pid)
+    if handle is None:
+        return False
+    return _set_visible(handle, True)
+
+
+def window_is_visible(identity, pid=None):
+    """True if a window for `identity` is currently on screen. Used by tests
+    and by `debug-info`, so "did the hide actually take" is answerable."""
+    handle = find_window(identity, timeout=0, pid=pid)
+    if handle is None:
+        return False
+    try:
+        return _handle_is_visible(handle, identity, pid)
+    except Exception:      # noqa: BLE001
+        return False
 
 
 # How long to keep re-hiding after the first hide.
@@ -188,6 +788,11 @@ def hide_qemu_window(identity, timeout=DEFAULT_TIMEOUT, pid=None):
 # can stop once the boot is over rather than run forever fighting the user.
 KEEP_HIDDEN_SECONDS = 150.0
 KEEP_HIDDEN_POLL = 0.4
+# The same watch, paced for backends that cost a fork per question. 0.4 s would
+# be ~750 process launches over the full 150 s window; the thing being caught
+# is GTK re-mapping the window during boot, which stays re-mapped until we act,
+# so a slower look loses nothing but the seconds it is visible.
+KEEP_HIDDEN_POLL_SLOW = 1.5
 
 
 def keep_hidden(identity, seconds=KEEP_HIDDEN_SECONDS):
@@ -198,48 +803,28 @@ def keep_hidden(identity, seconds=KEEP_HIDDEN_SECONDS):
     a launch that fails on some other path must not have to remember to tear
     this down. Losing the watcher costs a visible window, nothing else.
     """
-    if not IS_WINDOWS or not identity:
+    if not can_hide() or not identity:
         return None
     import threading
     stop_flag = threading.Event()
+    poll = KEEP_HIDDEN_POLL if backend() == BACKEND_WIN32 \
+        else KEEP_HIDDEN_POLL_SLOW
 
     def _watch():
         deadline = time.monotonic() + seconds
         while not stop_flag.is_set() and time.monotonic() < deadline:
             try:
+                # A macOS TCC refusal is permanent for this process, so stop
+                # rather than spend the remaining minutes re-asking a question
+                # already answered with "no".
+                if not can_hide():
+                    return
                 if window_is_visible(identity):
                     hide_qemu_window(identity, timeout=0)
             except Exception:      # noqa: BLE001 - never raise off a daemon
                 pass
-            stop_flag.wait(KEEP_HIDDEN_POLL)
+            stop_flag.wait(poll)
 
     threading.Thread(target=_watch, daemon=True,
                      name=f"hide-{identity}").start()
     return stop_flag.set
-
-
-def show_qemu_window(identity, timeout=2.0):
-    """Bring a hidden QEMU window back, for when someone needs to look at it
-    directly (the one configuration where a GL problem is visible with none of
-    this project's code in the path).
-
-    SW_SHOWNOACTIVATE, not SW_SHOW: this is called from a viewer or a CLI the
-    user is already looking at, and stealing focus from it is not what asking
-    to see a window means."""
-    hwnd = find_window(identity, timeout=timeout)
-    if hwnd is None:
-        return False
-    return _show(hwnd, SW_SHOWNOACTIVATE)
-
-
-def window_is_visible(identity, pid=None):
-    """True if a window for `identity` is currently on screen. Used by tests
-    and by `debug-info`, so "did the hide actually take" is answerable."""
-    hwnd = find_window(identity, timeout=0, pid=pid)
-    if hwnd is None:
-        return False
-    try:
-        import ctypes
-        return bool(ctypes.windll.user32.IsWindowVisible(hwnd))
-    except Exception:      # noqa: BLE001
-        return False

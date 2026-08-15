@@ -4,6 +4,7 @@
     python3 tests/test_farming_apply.py
 """
 import os
+import shlex
 import sys
 import unittest
 from unittest import mock
@@ -37,6 +38,60 @@ class ApplySqueeze(unittest.TestCase):
         # first positional arg of each call is the account
         for call in adb.call_args_list:
             self.assertIs(call.args[0], acct)
+
+
+class TheRenderFloorReachesTheDevice(unittest.TestCase):
+    """STEP_RENDER is a real step: it goes over adb, and it bisects.
+
+    The squeeze is the prime suspect whenever Roblox will not run on the x86
+    base, so every lever in it has to be removable BY NAME from the
+    environment. A step that could only be disabled by editing farming.py
+    would make every bisect attempt a different build of the product."""
+
+    def _run(self, mode=None, env=None):
+        """The argv vectors apply_farming_squeeze actually hands to adb.
+
+        OMNI_FARM_SKIP is cleared unless the case sets it: a developer running
+        the suite mid-bisect must not silently change what these assert."""
+        acct = {"name": "u1"}
+        env = dict(env or {})
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(omni, "adb") as adb:
+            if "OMNI_FARM_SKIP" not in env:
+                os.environ.pop("OMNI_FARM_SKIP", None)
+            omni.apply_farming_squeeze(acct, mode)
+        return [list(c.args[1:]) for c in adb.call_args_list]
+
+    def test_the_render_step_is_sent(self):
+        flat = " ".join(" ".join(c) for c in self._run())
+        self.assertIn("animator_duration_scale", flat)
+
+    def test_a_minimal_quality_mode_sends_the_smaller_panel(self):
+        """The mode dict alone is enough to select the floor, so the engine
+        can wire `--quality minimal` through without a new argument."""
+        mode = dict(MODES["farming"], quality="minimal")
+        flat = " ".join(" ".join(c) for c in self._run(mode))
+        self.assertIn("wm size 320x180", flat)
+        self.assertIn("wm density 60", flat)
+
+    def test_OMNI_FARM_SKIP_render_removes_exactly_that_step(self):
+        full = self._run()
+        skipped = self._run(env={"OMNI_FARM_SKIP": "render"})
+        self.assertEqual(len(full) - len(skipped), 1)
+        flat = " ".join(" ".join(c) for c in skipped)
+        self.assertNotIn("animator_duration_scale", flat)
+        # ...and the display step, which shares its slot, is untouched.
+        self.assertEqual(skipped[0], ["shell", "wm", "size", "480x270"])
+
+    def test_every_step_sent_is_a_quoted_argv_vector(self):
+        """`adb shell` joins argv and lets the guest re-parse it; an unquoted
+        multi-command script silently runs fragments of itself and still
+        reports success. Asserted at the CALL SITE, not just in the builder."""
+        for cmd in self._run(dict(MODES["farming"], quality="minimal")):
+            self.assertEqual(cmd[0], "shell")
+            if cmd[:3] == ["shell", "sh", "-c"]:
+                self.assertEqual(len(cmd), 4)
+                self.assertEqual(cmd[3], shlex.quote(shlex.split(cmd[3])[0]))
 
 
 class FarmingGate(unittest.TestCase):
