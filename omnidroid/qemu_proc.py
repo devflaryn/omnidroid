@@ -62,6 +62,28 @@ def _gl_window_requested():
     return os.environ.get("OMNI_GL_WINDOW", "").strip() not in ("", "0", "false", "False")
 
 
+def window_suppressed(cfg=None):
+    """True when this boot must NOT put a window on the host, whatever the
+    mode asks for.
+
+    The escape hatch for `playable` becoming a windowed mode. `--no-window`
+    used to mean only "do not spawn the VNC viewer", which was the whole
+    meaning of a window back when no mode opened a native one; `cmd_start` now
+    exports OMNI_NO_WINDOW for the same flag, so one flag means one thing —
+    nothing appears on screen — for both kinds of window.
+
+    Read from the ENVIRONMENT rather than threaded through six signatures on
+    purpose: QEMU argv construction is reached from `_ensure_booted`,
+    `spawn_qemu` and the bake/warm paths, and adding a parameter to each is how
+    one of them ends up not passing it. Config `qemu.no_window` is the durable
+    form for a headless server that should never open one.
+    """
+    env = os.environ.get("OMNI_NO_WINDOW", "").strip()
+    if env:
+        return env not in ("0", "false", "False", "no")
+    return bool(((cfg or {}).get("qemu") or {}).get("no_window"))
+
+
 # ------------------------------------------------------- display capability
 #
 # THREE tiers, because the middle one is what the primary host actually has.
@@ -365,8 +387,33 @@ MODES = {
                  "display": lean.NATIVE_DISPLAY, "window": True,
                  "profile": "performance", "autoscale": True,
                  "quality": "high"},
+    # playable ALSO asks for a window now, and that is the single biggest
+    # performance change this file has ever carried. MEASURED 2026-08-15 on the
+    # Windows host (i7-13700F + RTX 4060), one account, one place, 1280x800,
+    # frame counts off `dumpsys SurfaceFlinger --timestats` with the render
+    # confirmed by screenshot at the moment of measurement:
+    #
+    #     playable, as it was   GLES: Mesa, llvmpipe        95 frames / 30.1 s
+    #                                                       ->  3.2 fps
+    #     playable, with this   GLES: Mesa, virgl (RTX 4060) 496 frames / 30.0 s
+    #                                                       -> 16.5 fps
+    #
+    # 5.2x, and the low number is exactly the "3 fps, unplayable" a user
+    # reported. Without a window there is no host GL context, so virglrenderer
+    # cannot run and Mesa falls back to llvmpipe: every pixel of a 3D game was
+    # being drawn on the CPU that is already paying arm64 translation, on a
+    # machine with an idle discrete GPU. The window is also what removes the
+    # input path's latency — host events go straight into usb-tablet/usb-kbd
+    # instead of round-tripping through VNC encode/decode plus synthesised
+    # input.
+    #
+    # Why this is not the same surprise the comment above warned about: the
+    # window is a REQUEST that `resolve_gpu_display` still adjudicates, and it
+    # is now suppressible outright by `--no-window` / OMNI_NO_WINDOW=1 (see
+    # window_suppressed), which is what every automated caller passes. A boot
+    # on a host with no window server is still a normal headless boot.
     "playable": {"mem": 4096, "smp": 4, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY,
+                 "usb": True, "display": lean.NATIVE_DISPLAY, "window": True,
                  "profile": "performance", "autoscale": True,
                  "quality": "high"},
     "hard":     {"mem": 3072, "smp": 4, "balloon": None,
@@ -659,6 +706,14 @@ def resolve_gpu_display(mode, interactive, tool, cfg=None):
     mutate an image, not to draw, and it must work identically on every host.
     """
     want_window = (bool(mode.get("window")) or _gl_window_requested()) and not interactive
+    if want_window and window_suppressed(cfg):
+        # An explicit "nothing on screen" beats the mode's request. Said out
+        # loud because it costs the GPU: without a window there is no host GL
+        # context, so the guest renders on llvmpipe (measured at 3.2 fps
+        # against 16.5 with the window — see MODES["playable"]).
+        print("[gpu] --no-window: booting headless, so the guest renders in "
+              "SOFTWARE. Drop --no-window for GPU acceleration.")
+        return _headless_pair(interactive, tool, cfg)
     if want_window:
         cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui())
         if not cap.get("available"):
@@ -697,8 +752,38 @@ def balloon_device(mode):
     issues actually decommits the page. On macOS/HVF it is advisory — the
     same test showed host RSS staying high (and rising, from thrash) after a
     balloon inflate. That is why the 50+-instance target is a Linux number;
-    macOS runs the 2-3 playable instances and does not pretend otherwise."""
+    macOS runs the 2-3 playable instances and does not pretend otherwise.
+
+    ON WINDOWS free-page-reporting is not merely advisory, it is NEGATIVE, and
+    it is dropped there. QEMU has no madvise on Windows, so every page the
+    guest reports free fails `ram_block_discard_range` and QEMU logs a line
+    about it. MEASURED 2026-08-15 on a normal playable boot: 925 such lines in
+    ~60 s of runtime, 78 KB of qemu.log, and one failed discard attempt per
+    4 MB block for the life of the instance -- all of it buying exactly zero
+    reclaimed memory, since the discard IS the reclaim. The balloon device
+    itself stays, so `apply_balloon_target`'s QMP inflate still exists."""
+    if IS_WINDOWS:
+        return ["-device", "virtio-balloon-pci,id=omniball"]
     return ["-device", "virtio-balloon-pci,free-page-reporting=on,id=omniball"]
+
+
+def smp_arg(smp):
+    """The -smp string, with an EXPLICIT one-socket topology.
+
+    A bare `-smp 4` leaves QEMU to factor the count itself, and it factors it
+    into 4 SOCKETS of 1 core -- four single-core packages, a shape no physical
+    phone or PC has. Android's scheduler builds its cpusets and its energy
+    model around cores that share a package and treats separate sockets as
+    separate scheduling domains, so the topology is not cosmetic. Naming
+    sockets=1,cores=N,threads=1 hands the guest the machine it expects.
+
+    NOT a throughput claim: measured on the Windows host it was inside the
+    run-to-run noise on frame rate. It is here because the guest's view of its
+    own topology should be true, and because the cpuset tuning in gaming.py
+    reasons about exactly that.
+    """
+    n = max(1, int(smp))
+    return f"{n},sockets=1,cores={n},threads=1"
 
 
 def usb_devices(mode, arm):
@@ -791,7 +876,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         warm = Path(warm)
         sys_src = warm / warmcache.SYSTEM_NAME
         data_src = warm / warmcache.DATA_NAME
-        disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
+        disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on,cache=unsafe"
         # The instance's OWN copy (staged by spawn_qemu via
         # _stage_warm_efivars), not warm / warmcache.EFIVARS_NAME -- pflash
         # needs a writable file, and pointing it at the entry directly would
@@ -814,7 +899,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         # own /data, which on a clean base means NO game at all (the `--apk`
         # and `--offset none` paths).
         data_src = images / (acct.get("data_image") or base["data"])
-        disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on"
+        disk_opts = ",discard=unmap,detect-zeroes=unmap,snapshot=on,cache=unsafe"
         # Ephemeral efivars is refreshed fresh EVERY boot (see
         # _refresh_ephemeral_efivars, called from spawn_qemu before this
         # command is built) into runtime_dir — genuinely per-boot, throwaway.
@@ -840,7 +925,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         "-machine", "virt",
         "-accel", accel,          # hvf on Apple Silicon (no translation)
         "-cpu", "host",
-        "-smp", str(smp),
+        "-smp", smp_arg(smp),
         "-m", str(mem),
         # UEFI firmware: read-only CODE + per-account writable vars.
         "-drive", (f"if=pflash,unit=0,file={code},file.locking=off,"
@@ -941,7 +1026,7 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         warm = Path(warm)
         sys_src = warm / warmcache.SYSTEM_NAME
         data_src = warm / warmcache.DATA_NAME
-        disk_opts = ",format=qcow2,if=virtio,snapshot=on"
+        disk_opts = ",format=qcow2,if=virtio,snapshot=on,cache=unsafe"
     elif bake:
         sys_src = rd / "bake_system.qcow2"
         data_src = rd / "bake_data.qcow2"
@@ -958,9 +1043,19 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         # no base["data"], so a boot with no offset falls back to the shared
         # empty /data template, which means no game at all (the `--apk` and
         # `--offset none` paths).
+        #
+        # `cache=unsafe` goes with `snapshot=on` and ONLY with it. It makes the
+        # guest's flushes no-ops, which is normally how you lose a filesystem
+        # to a host crash — but the thing being flushed here is the throwaway
+        # overlay QEMU deletes when the process exits. There is no state to
+        # lose, so honouring a durability barrier for it is pure cost: an
+        # Android boot fsyncs constantly (packages, dalvik cache, logs) and
+        # every one of those was hitting the host disk to protect data that
+        # was already guaranteed to be discarded. The persistent branch below
+        # keeps QEMU's default caching, because there it is real data.
         sys_src = images / base["disk"]
         data_src = images / (acct.get("data_image") or cfg["data_template"])
-        disk_opts = ",format=qcow2,if=virtio,snapshot=on"
+        disk_opts = ",format=qcow2,if=virtio,snapshot=on,cache=unsafe"
     else:
         sys_src = d / "system.qcow2"
         data_src = d / "data.qcow2"
@@ -998,7 +1093,7 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         qemu_bin("qemu-system-x86_64"),
         "-machine", machine_arg(accel),
         "-cpu", x86_cpu_model(accel, cfg),
-        "-smp", str(smp),
+        "-smp", smp_arg(smp),
         "-m", str(mem),
         "-drive", f"file={sys_src}{disk_opts}",
         "-drive", f"file={data_src}{disk_opts}",
@@ -1083,6 +1178,35 @@ def vnc_args(display_args, vnc_display):
     return ["-vnc", f"127.0.0.1:{vnc_display}"]
 
 
+def command_renders_on_gpu(cmd):
+    """True when this QEMU command hands the guest a virgl-backed GPU.
+
+    Read off the argv for the same reason as command_opens_a_window: the
+    command IS what the process will do, so a second copy of the capability
+    logic cannot drift from it. What it decides downstream is not cosmetic —
+    the Roblox quality profile and the guest panel size are both wrong answers
+    when rendering turns out to be software (see engine._ensure_booted)."""
+    return any(GL_GPU_DEVICE in str(a) for a in cmd)
+
+
+def gl_panel_size(cmd):
+    """(w, h) the GL GPU device was told to advertise, or None.
+
+    Parsed back out of the argv rather than assumed from the constants,
+    because a config or a future mode may override the device string and the
+    guest must be resized to what was ACTUALLY asked for."""
+    for arg in cmd:
+        text = str(arg)
+        if not text.startswith(GL_GPU_DEVICE):
+            continue
+        opts = dict(p.split("=", 1) for p in text.split(",")[1:] if "=" in p)
+        try:
+            return int(opts["xres"]), int(opts["yres"])
+        except (KeyError, ValueError):
+            return None
+    return None
+
+
 def command_opens_a_window(cmd):
     """True when this QEMU command will put a window on the host's screen.
 
@@ -1162,6 +1286,15 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
          # instance — and so a degraded gaming boot (host could not open one)
          # still gets the viewer it needs to be watchable at all.
          "native_window": command_opens_a_window(cmd),
+         # Whether THIS boot rendered on the host GPU, and at what panel size.
+         # Recorded for the same reason as native_window — the argv is the
+         # truth — and read back by _ensure_booted, which cannot otherwise
+         # tell a virgl guest from an llvmpipe one and would install a quality
+         # profile the renderer cannot afford. `gl_panel` also carries the fix
+         # for the GL device's 640x480 default: the guest takes the first mode
+         # it is offered, so the tune-up has to name the one we asked for.
+         "gpu": "gl" if command_renders_on_gpu(cmd) else "software",
+         "gl_panel": gl_panel_size(cmd),
          "identity": f"omni-{acct['name']}",
          "mode": (mode or {}).get(
              "name", "interactive" if interactive else DEFAULT_MODE),

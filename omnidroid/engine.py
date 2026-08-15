@@ -433,11 +433,42 @@ def _booted_with_native_window(name):
     between the spawn and this call, and the only answer that matters is what
     the running process actually did. Unknown reads as False, which keeps the
     VNC viewer: an extra window is a nuisance, a missing one is a black box."""
+    return bool(_run_record(name).get("native_window"))
+
+
+def _run_record(name):
+    """This instance's run.json as a dict, or {} when there is not one."""
     try:
-        run = json.loads((runtime_dir(name) / "run.json").read_text())
-        return bool(run.get("native_window"))
-    except Exception:  # noqa: BLE001 — no run.json, unreadable, or older format
-        return False
+        return json.loads((runtime_dir(name) / "run.json").read_text())
+    except Exception:  # noqa: BLE001 — absent, unreadable, or an older format
+        return {}
+
+
+def boot_renders_on_gpu(name):
+    """Did this instance's CURRENT boot get a virgl-backed GPU?
+
+    Same contract as _booted_with_native_window: recorded by spawn_qemu from
+    the argv it actually ran, never recomputed here. UNKNOWN READS AS FALSE,
+    and that is the safe direction — the caller uses this to decide how much
+    rendering work to ask the guest for, and guessing "GPU" on a software
+    boot is what produces a 3 fps instance."""
+    return _run_record(name).get("gpu") == "gl"
+
+
+def boot_gl_panel(name):
+    """(w, h) the GL GPU advertised on this boot, or None on the software path.
+
+    The guest takes the FIRST mode the virtio GPU offers, which is 640x480
+    regardless of the xres/yres the device was given, so this is what the
+    post-boot tune-up needs in order to override it (see
+    gaming.build_tuning_sequence)."""
+    panel = _run_record(name).get("gl_panel")
+    if isinstance(panel, (list, tuple)) and len(panel) == 2:
+        try:
+            return int(panel[0]), int(panel[1])
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _want_vnc_viewer(native_window, explicit_window, json_mode, no_window):
@@ -1276,6 +1307,111 @@ def quiet_the_store(acct, label=None):
               f"({out.strip()[:120]}) - the game may be restarted repeatedly")
 
 
+# The resolver Private DNS points at. A HOSTNAME, not an address: Android's
+# "hostname" mode pins the certificate to this name, which is what makes the
+# channel unspoofable and therefore un-interceptable. `dns.google` is chosen
+# over `one.one.one.one` only because it resolved on the filtered network this
+# was diagnosed on; either works, and `network.private_dns` in the config or
+# OMNI_PRIVATE_DNS overrides it. The literal "off" disables the whole thing.
+DEFAULT_PRIVATE_DNS = "dns.google"
+
+# A host that ONLY fails when plaintext DNS is being tampered with. It is one
+# of the CDN names the Roblox client fetches every mesh, texture and sound
+# from, so if this does not resolve, the game cannot load a world no matter
+# what else is right.
+_DNS_CANARY = "t0.rbxcdn.com"
+
+
+def private_dns_hostname(cfg=None):
+    """The Private DNS resolver hostname for this boot, or None when off."""
+    value = (os.environ.get("OMNI_PRIVATE_DNS", "").strip()
+             or ((cfg or {}).get("network") or {}).get("private_dns")
+             or DEFAULT_PRIVATE_DNS)
+    return None if str(value).strip().lower() in ("off", "0", "no") else value
+
+
+def ensure_private_dns(acct, cfg=None, label=None):
+    """Put the guest's DNS on DNS-over-TLS, on EVERY boot. Best-effort.
+
+    THE BUG THIS EXISTS FOR, diagnosed 2026-08-15 on the Windows host. The
+    game logged in, joined a place, and then never finished loading it;
+    minutes later the client put up "Disconnected ... (Error Code: 277)". The
+    frame rate was blamed, and the frame rate was not the problem. logcat:
+
+        HttpError: DnsResolve  Could not resolve host: fts.rbxcdn.com
+        AssetProvider ... failed!! cdnHttpErrorCode: DnsResolve
+        MeshContentProvider failed to process ... because 'could not fetch'
+
+    hundreds of times. In the guest, `ping google.com`, `roblox.com` and
+    `cloudflare.com` all resolved; only `*.rbxcdn.com` did not. So it was not
+    slirp's DNS relay failing, which is what it looks like at first.
+
+    The relay was faithfully forwarding to the HOST's resolvers, and the
+    failure is upstream of the host entirely:
+
+        resolver             fts.rbxcdn.com   t0.rbxcdn.com
+        ISP (Türk Telekom)   FAIL             FAIL
+        8.8.8.8  over UDP    FAIL             FAIL      <- not the resolver
+        1.1.1.1  over UDP    FAIL             FAIL      <- not the resolver
+        Cloudflare over DoH  2.22.89.53       2.20.134.200
+
+    Plaintext UDP:53 fails against EVERY resolver while the same queries
+    succeed over HTTPS, which is transparent interception on the network path
+    — the ISP-level Roblox block, applied to the asset CDN. Changing which
+    resolver the guest is told about cannot fix that; only taking the queries
+    out of plaintext can.
+
+    Android has exactly that built in. Private DNS in `hostname` mode is
+    DNS-over-TLS on TCP:853 with the resolver's certificate pinned to the
+    name, so an interceptor can neither read nor forge it. Verified on a live
+    instance, immediately after setting it, the three hosts that had failed
+    every time:
+
+        fts.rbxcdn.com -> d2shmbw56nyjcv.cloudfront.net (108.157.60.23)
+        t0.rbxcdn.com  -> djm1c8bbf58td.cloudfront.net  (65.9.9.110)
+        c0.rbxcdn.com  -> a2047.dscw27.akamai.net       (46.196.223.240)
+
+    EVERY boot and EVERY mode, not just the playable ones: a farming instance
+    that cannot fetch assets is a farming instance that is not in the game.
+    Best-effort with a SystemExit guard, for the same reason quiet_the_store
+    has one — adb's _require_adb_port calls fail(), which sys.exits, and a
+    tune-up must never be able to end the process.
+    """
+    if not acct.get("adb_port"):
+        return False
+    host = private_dns_hostname(cfg)
+    if host is None:
+        return False
+    try:
+        adb(acct, "shell", "settings", "put", "global",
+            "private_dns_mode", "hostname", timeout=20)
+        adb(acct, "shell", "settings", "put", "global",
+            "private_dns_specifier", host, timeout=20)
+        # Android brings the TLS session up lazily; the canary below is the
+        # thing that proves it, so give the resolver a moment to be ready
+        # rather than reporting a failure that is really a race.
+        time.sleep(3)
+        r = adb(acct, "shell", f"ping -c1 -W4 {_DNS_CANARY}", timeout=25)
+        out = (r.stdout or "") + (r.stderr or "")
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        out = str(e)
+    ok = "unknown host" not in out and "PING" in out
+    if label:
+        if ok:
+            print(f"[{label}] dns: encrypted (DNS-over-TLS via {host}) — "
+                  f"asset CDN reachable")
+        else:
+            # Loud, because the symptom this prevents is a game that loads
+            # forever and then disconnects, which reads as a performance
+            # problem and is not one.
+            print(f"[{label}] dns: could NOT verify {_DNS_CANARY} through "
+                  f"{host}. If the game loads forever or disconnects with "
+                  f"error 277, its asset CDN is being DNS-blocked on this "
+                  f"network — set network.private_dns to a resolver that "
+                  f"works here, or OMNI_PRIVATE_DNS=off to stop trying.")
+    return ok
+
+
 def assert_kiosk_game(acct, cfg, label):
     """Tell the kiosk what the game is, on EVERY boot, then re-front it.
 
@@ -1648,6 +1784,15 @@ def cmd_start(args):
                         f"--apk path not found: {args.apk}")
     label = f"start {args.name}"
     json_mode = getattr(args, "json", False)
+
+    # --no-window now means what it says: NOTHING appears on screen. It used
+    # to suppress only the VNC viewer, which was the whole meaning of "window"
+    # back when no mode opened a native one. `playable` opens a GPU window now
+    # (see qemu_proc.MODES), so the flag has to reach the argv builder as well
+    # — via the environment, because that builder is called from four places
+    # and a fifth parameter is how one of them ends up not passing it.
+    if getattr(args, "no_window", False):
+        os.environ["OMNI_NO_WINDOW"] = "1"
 
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
@@ -7197,15 +7342,52 @@ def apply_gaming_tuning(acct, mode=None, label=None):
     shell both writes are denied, and every script here ends in `; true`, so
     an unreported skip would look exactly like success."""
     su = resolve_root_shell(acct)
-    for cmd in gaming.build_tuning_sequence(mode, su=su):
+    panel = boot_gl_panel(acct.get("name"))
+    for cmd in gaming.build_tuning_sequence(mode, su=su, gl_panel=panel):
         adb(acct, *cmd, timeout=20)
     if label:
+        where = (f"{panel[0]}x{panel[1]} (GL panel)" if panel
+                 else "native resolution")
         if su is not None:
-            print(f"[{label}] gaming tune-up: native resolution, animations "
+            print(f"[{label}] gaming tune-up: {where}, animations "
                   f"off, doze off, swappiness {gaming.GAMING_SWAPPINESS}")
         else:
             print(f"[{label}] gaming tune-up: applied WITHOUT root - skipped "
                   + ", ".join(gaming.root_only_steps()))
+
+
+# What a performance mode falls back to when this boot turned out to have no
+# GPU. `high` is quality level 10 with post-processing ON — a profile written
+# for a renderer that has a GPU behind it; `balanced` is level 3 with post-FX
+# off. MEASURED 2026-08-15 at 1280x800 on the same account and place:
+#
+#     software renderer, quality high        3.2 fps
+#     GPU (virgl), quality high             16.5 fps
+#     GPU (virgl), quality balanced         16.4 fps
+#
+# i.e. with a GPU the quality profile costs almost nothing and `high` is free
+# to keep, and without one the expensive profile is being asked of the same
+# CPU that is already translating every arm64 instruction the game executes.
+_SOFTWARE_QUALITY_FALLBACK = "balanced"
+
+
+def _quality_for_boot(name, explicit=None, mode=None):
+    """(quality, note) — the Roblox quality profile this boot should install.
+
+    An explicit `--quality` always wins and returns no note: a flag argparse
+    accepts and something downstream overrides is a failure this codebase has
+    already had twice (see resolve_mode's --balloon comment).
+    """
+    if explicit:
+        return explicit, None
+    quality = (mode or {}).get("quality")
+    if quality != "high" or boot_renders_on_gpu(name):
+        return quality, None
+    return _SOFTWARE_QUALITY_FALLBACK, (
+        f"quality: this boot has NO GPU (software rendering), so the "
+        f"'{quality}' profile would be drawn on the CPU — using "
+        f"'{_SOFTWARE_QUALITY_FALLBACK}' instead. Drop --no-window, or "
+        f"install a QEMU with virglrenderer, for the full profile.")
 
 
 def pin_game_to_top_app(acct, label=None):
@@ -7213,7 +7395,7 @@ def pin_game_to_top_app(acct, label=None):
     has been delivered — that broadcast is what launches the game, so there is
     no pid to move before it. Returns True when the move landed."""
     step = gaming.build_pin_game_step(resolve_root_shell(acct))
-    if not step:
+    if step is None:
         if label:
             print(f"[{label}] cpuset: SKIPPED - no root on this instance")
         return False
@@ -7866,6 +8048,10 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # _devkit_activate, i.e. only on a --debug boot, which is exactly the
     # dev-base-era gating the dual-use change was supposed to remove.
     quiet_the_store(acct, label)
+    # BEFORE the kiosk launches the game, not after: the client resolves its
+    # asset CDN during startup, and a resolver swapped in underneath a running
+    # client leaves the failed lookups already cached as failures.
+    ensure_private_dns(acct, cfg, label)
     assert_kiosk_game(acct, cfg, label)
     # EVERY boot: grant the permissions a human would otherwise be asked to
     # tap through (full disk access above all) and silence the ANR/crash
@@ -7893,8 +8079,13 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # "farming" and received no tuning whatsoever. The most-used mode was the
     # only untuned one.
     profile = mode.get("profile", "performance")
-    quality = quality or mode.get("quality")
+    # An EXPLICIT --quality is the user's call and is never second-guessed;
+    # only the mode's own default adapts to what this boot can actually draw.
+    quality, quality_note = _quality_for_boot(
+        acct.get("name"), explicit=quality, mode=mode)
     settings = lean.app_settings_for(quality)
+    if quality_note:
+        print(f"[{label}] {quality_note}")
     if quality and settings is None:
         print(f"[{label}] unknown quality profile '{quality}' — leaving "
               f"Roblox's own settings alone. Known: "
@@ -8417,15 +8608,20 @@ def build_parser():
                        help="open a live window even in --json mode (two "
                             "starts = two accounts side by side)")
     s_win.add_argument("--no-window", dest="no_window", action="store_true",
-                       help="do not open a window (headless; watch via "
-                            "`omnidroid view` or capture)")
+                       help="do not open a window AT ALL — no native QEMU "
+                            "window and no VNC viewer (watch via `omnidroid "
+                            "view` or capture). COSTS THE GPU: without a "
+                            "window there is no host GL context, so the guest "
+                            "renders in software (measured 3.2 fps against "
+                            "16.5). For automation, not for playing.")
     s.add_argument("--mode", choices=list(MODES), default=None,
                    help="what this instance is FOR. playable (DEFAULT) - "
                         "MAXIMUM resources: sized to this host (up to 8G / 6 "
-                        "vCPU), no balloon, no squeeze, native resolution, "
-                        "high-quality render, game on the top-app cpuset. The "
-                        "mode to test and to play in. gaming - the same, plus "
-                        "a native window on the host. farming - MINIMUM "
+                        "vCPU), no balloon, no squeeze, a GPU-accelerated "
+                        "native window with direct input, high-quality "
+                        "render, game on the top-app cpuset. The mode to test "
+                        "and to play in. gaming - an alias for it. farming - "
+                        "MINIMUM "
                         "resources: 2G/1c headless, joined-idle, squeezed "
                         "post-boot then ballooned to ~896 MB, for many "
                         "instances at once. hard 3G/4c | brutal 2G/2c are "

@@ -52,22 +52,37 @@ def x86_cmd(mode_name="farming", interactive=False, debug=False):
 
 class Balloon(unittest.TestCase):
     """free-page-reporting is the mechanism that makes host RSS track the
-    guest's live set instead of its -m size. It must be on EVERY instance,
-    both architectures — a guest without the driver just ignores the device,
-    so there is no reason to branch."""
+    guest's live set instead of its -m size. It is on EVERY instance and both
+    architectures on a host where it can WORK — a guest without the driver
+    just ignores the device, so there is no reason to branch on the guest.
 
-    def test_arm_has_free_page_reporting(self):
-        joined = " ".join(arm_cmd())
-        self.assertIn("virtio-balloon-pci", joined)
-        self.assertIn("free-page-reporting=on", joined)
+    There is a reason to branch on the HOST. QEMU has no madvise on Windows,
+    so every reported page fails `ram_block_discard_range` and QEMU logs a
+    line saying so: measured 2026-08-15, 925 such lines and 78 KB of qemu.log
+    in ~60 s of a normal boot, reclaiming nothing, because the discard is what
+    the reclaim WAS. The device itself stays everywhere (apply_balloon_target
+    drives it over QMP); only the flag that cannot work is dropped."""
 
-    def test_x86_has_free_page_reporting(self):
-        joined = " ".join(x86_cmd())
-        self.assertIn("virtio-balloon-pci", joined)
-        self.assertIn("free-page-reporting=on", joined)
+    def test_the_balloon_device_is_always_attached(self):
+        for joined in (" ".join(arm_cmd()), " ".join(x86_cmd()),
+                       " ".join(arm_cmd("playable"))):
+            self.assertIn("virtio-balloon-pci", joined)
 
-    def test_playable_gets_it_too(self):
-        self.assertIn("free-page-reporting=on", " ".join(arm_cmd("playable")))
+    def test_free_page_reporting_follows_whether_the_host_can_do_it(self):
+        want = not qemu_proc.IS_WINDOWS
+        for label, joined in (("arm", " ".join(arm_cmd())),
+                              ("x86", " ".join(x86_cmd())),
+                              ("playable", " ".join(arm_cmd("playable")))):
+            self.assertEqual("free-page-reporting=on" in joined, want, label)
+
+    def test_the_flag_is_dropped_only_on_windows(self):
+        # The policy itself, independent of which host runs the suite.
+        with mock.patch.object(qemu_proc, "IS_WINDOWS", True):
+            self.assertNotIn("free-page-reporting",
+                             " ".join(qemu_proc.balloon_device({})))
+        with mock.patch.object(qemu_proc, "IS_WINDOWS", False):
+            self.assertIn("free-page-reporting=on",
+                          " ".join(qemu_proc.balloon_device({})))
 
 
 class DroppedHardware(unittest.TestCase):
@@ -112,8 +127,16 @@ class DroppedHardware(unittest.TestCase):
 
 class ModeSizing(unittest.TestCase):
     def test_farming_is_single_vcpu(self):
+        # The count is still one; it now carries an explicit topology, because
+        # a bare `-smp N` factors into N single-core SOCKETS and Android's
+        # scheduler reasons about packages. See qemu_proc.smp_arg.
         cmd = arm_cmd("farming")
-        self.assertEqual(cmd[cmd.index("-smp") + 1], "1")
+        self.assertEqual(cmd[cmd.index("-smp") + 1],
+                         "1,sockets=1,cores=1,threads=1")
+
+    def test_the_topology_is_one_socket_of_n_cores(self):
+        self.assertEqual(qemu_proc.smp_arg(4), "4,sockets=1,cores=4,threads=1")
+        self.assertEqual(qemu_proc.smp_arg(1), "1,sockets=1,cores=1,threads=1")
 
     def test_farming_boots_with_enough_address_space(self):
         """512 MB was measured twice and never reached adbd."""

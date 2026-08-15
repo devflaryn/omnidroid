@@ -159,7 +159,16 @@ class BothProfilesGetTheNeverBlankGuarantee(unittest.TestCase):
 
 class TheProfileThatGetsInstalled(unittest.TestCase):
     @staticmethod
-    def _settings_for(mode_name, quality=None):
+    def _settings_for(mode_name, quality=None, gpu=True):
+        """The ClientAppSettings one boot installs.
+
+        `gpu` is what this boot's argv actually gave the guest, read back from
+        run.json in production (see engine.boot_renders_on_gpu) and faked here
+        because spawn_qemu is mocked out and never writes one. It defaults to
+        True so the cases below are read as "on a normal, accelerated boot",
+        which is what every performance-mode boot on a host with a window
+        server now is.
+        """
         seen = {}
 
         def capture(acct, label=None, settings=None):
@@ -167,6 +176,7 @@ class TheProfileThatGetsInstalled(unittest.TestCase):
             return True
 
         with mock.patch.object(omni, "resolve_su", return_value="su"), \
+             mock.patch.object(omni, "boot_renders_on_gpu", return_value=gpu), \
              mock.patch.object(omni, "adb"):
             with mock.patch.object(omni, "apply_roblox_settings", capture), \
                  mock.patch.object(omni, "running_pid", return_value=None), \
@@ -200,6 +210,32 @@ class TheProfileThatGetsInstalled(unittest.TestCase):
                       lean.GAMING_APP_SETTINGS)
         self.assertIs(self._settings_for("farming", quality="high"),
                       lean.PLAYABLE_APP_SETTINGS)
+
+    def test_a_software_boot_does_not_get_the_gpu_priced_profile(self):
+        """`high` is quality level 10 with post-processing ON — a profile
+        written for a renderer with a GPU behind it. On a boot that turned out
+        to have none (no window server, --no-window, a QEMU without
+        virglrenderer) every one of those pixels is drawn by the same CPU that
+        is already translating each arm64 instruction the game executes, so
+        the mode's default steps down. MEASURED at 1280x800: with a GPU the
+        profile costs almost nothing (16.5 fps high vs 16.4 balanced); without
+        one the whole boot is 3.2 fps."""
+        self.assertIs(self._settings_for("playable", gpu=False),
+                      lean.GAMING_APP_SETTINGS)
+        self.assertIs(self._settings_for("gaming", gpu=False),
+                      lean.GAMING_APP_SETTINGS)
+
+    def test_an_explicit_quality_flag_wins_on_a_software_boot_too(self):
+        # The step-down adjusts a DEFAULT. A flag argparse accepts and
+        # something downstream overrides is the failure this repo has already
+        # had twice.
+        self.assertIs(self._settings_for("playable", quality="high", gpu=False),
+                      lean.PLAYABLE_APP_SETTINGS)
+
+    def test_farming_is_untouched_by_the_step_down(self):
+        # It already asks for the cheapest profile there is.
+        self.assertIs(self._settings_for("farming", gpu=False),
+                      lean.CLIENT_APP_SETTINGS)
 
     def test_apply_roblox_settings_defaults_to_the_farming_profile(self):
         # Existing callers pass no `settings` and must keep the 5-fps profile.

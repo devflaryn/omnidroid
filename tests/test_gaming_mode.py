@@ -8,11 +8,21 @@ The two use cases this engine serves pull in opposite directions:
   farming  — headless, many instances, RAM/CPU is the only thing that matters
   gaming   — one or two instances, frames and INPUT LATENCY are all that matter
 
-`gaming` is a separate mode rather than a change to `playable` on purpose:
-`playable` is DEFAULT_MODE, so teaching it to open a window would put a QEMU
-window on every existing `omnidroid start`. Adding a mode is additive; every other
-mode's command has to stay byte-for-byte what it is today, and that is what
-most of these tests assert.
+`gaming` began as a separate mode so that `playable` — DEFAULT_MODE, and so
+what every bare `omnidroid start` resolves to — would not put a QEMU window on
+screen for automated callers. That reasoning was overturned by measurement on
+2026-08-15: without a window there is no host GL context, so virglrenderer
+cannot run and the guest renders every frame on the CPU. At 1280x800, one
+account, one place, frame counts off `dumpsys SurfaceFlinger --timestats`:
+
+    no window (llvmpipe)             95 frames / 30.1 s  ->  3.2 fps
+    window   (virgl, RTX 4060)      496 frames / 30.0 s  -> 16.5 fps
+
+3.2 fps is not a mode that is merely un-tuned, it is one nobody can play, so
+`playable` asks for the window now and `--no-window` / OMNI_NO_WINDOW is the
+explicit opt-out for callers with nobody at the screen. What these tests pin
+is that the opt-out works, that the density and fixed-tier modes are
+untouched, and that a host which cannot open a window still BOOTS.
 """
 import os
 import sys
@@ -80,9 +90,17 @@ class TheModeExists(unittest.TestCase):
     def test_gaming_is_a_registered_mode(self):
         self.assertIn("gaming", qemu_proc.MODES)
 
-    def test_gaming_asks_for_a_window_and_no_other_mode_does(self):
-        wanting = [n for n, m in qemu_proc.MODES.items() if m.get("window")]
-        self.assertEqual(wanting, ["gaming"])
+    def test_only_the_performance_modes_ask_for_a_window(self):
+        # `playable` joined `gaming` here on 2026-08-15, and that is the point
+        # of the change rather than a slip: without a window there is no host
+        # GL context, so virglrenderer cannot run and the guest renders on
+        # llvmpipe. Measured at 1280x800 on one account and place: 3.2 fps
+        # without, 16.5 fps with. The modes that must NOT ask are the density
+        # and fixed-tier ones, and that is what this pins.
+        wanting = sorted(n for n, m in qemu_proc.MODES.items() if m.get("window"))
+        self.assertEqual(wanting, ["gaming", "playable"])
+        for name in ("farming", "hard", "brutal"):
+            self.assertFalse(qemu_proc.MODES[name].get("window"), name)
 
     def test_gaming_keeps_the_bases_native_resolution(self):
         # A shrunken display is a farming lever; a game needs its real one.
@@ -95,9 +113,19 @@ class TheModeExists(unittest.TestCase):
         # Reclaiming pages under a running game is a stutter source.
         self.assertIsNone(qemu_proc.MODES["gaming"]["balloon"])
 
-    def test_playable_is_still_the_default_and_still_headless(self):
+    def test_playable_is_still_the_default(self):
         self.assertEqual(qemu_proc.DEFAULT_MODE, "playable")
-        self.assertFalse(qemu_proc.MODES["playable"].get("window"))
+
+    def test_no_window_suppresses_the_native_window_too(self):
+        # The escape hatch that lets `playable` be windowed. It used to
+        # suppress only the VNC viewer, which was the whole meaning of
+        # "window" when no mode opened a native one.
+        cmd = _cmd("playable", GL_CAP,
+                   env={"OMNI_NO_WINDOW": "1", "OMNI_GL_WINDOW": ""})
+        self.assertIn("-display none", cmd)
+        self.assertNotIn("gl=on", cmd)
+        # ...and the VNC server comes back, because nothing holds a GL context.
+        self.assertIn("-vnc 127.0.0.1:", cmd)
 
 
 class ArmBootUsesTheHostCapability(unittest.TestCase):
@@ -123,10 +151,26 @@ class ArmBootUsesTheHostCapability(unittest.TestCase):
         self.assertIn("-display none", cmd)
         self.assertNotIn("gl=on", cmd)
 
-    def test_playable_the_default_is_untouched_on_a_gl_host(self):
+    def test_playable_the_default_is_accelerated_on_a_gl_host(self):
+        # The whole point of the change: the mode a person actually plays in
+        # is the one that has to reach the GPU.
         cmd = _cmd("playable", GL_CAP)
+        self.assertIn("-device virtio-gpu-gl-pci", cmd)
+        self.assertIn("-display cocoa,gl=on", cmd)
+        self.assertNotIn("-display none", cmd)
+
+    def test_playable_on_a_headless_host_degrades_without_failing(self):
+        # A host with no window server (a server, a plain ssh session) must
+        # still boot. Losing the GPU is the cost; losing the boot is not.
+        cmd = _cmd("playable", NO_CAP)
         self.assertIn("-device virtio-gpu-pci", cmd)
         self.assertIn("-display none", cmd)
+
+    def test_the_fixed_tiers_stay_headless_on_a_gl_host(self):
+        for name in ("hard", "brutal"):
+            cmd = _cmd(name, GL_CAP)
+            self.assertIn("-display none", cmd, name)
+            self.assertNotIn("gl=on", cmd, name)
 
     def test_an_interactive_builder_boot_never_opens_a_window(self):
         cmd = _cmd("gaming", GL_CAP, interactive=True)

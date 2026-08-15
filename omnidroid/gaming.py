@@ -91,14 +91,32 @@ GAMING_SWAPPINESS = 10
 REENABLE_PACKAGES = ("com.android.inputmethod.latin",)
 
 
-def build_tuning_sequence(mode=None, su=None):
+# The density that goes with a GL panel override. 160 dpi is Android's mdpi
+# baseline — one dp is one pixel — which is what the software path's 1280x800
+# panel already reports, so overriding the size without it would leave the UI
+# laid out for the GL device's own 120 dpi and everything would be drawn a
+# sixth too small.
+GL_PANEL_DENSITY = 160
+
+
+def build_tuning_sequence(mode=None, su=None, gl_panel=None):
     """Ordered list of adb `shell` argv vectors for the gaming tune-up.
 
     `mode` is a resolved MODES entry; None falls back to the gaming defaults so
-    a caller without one still gets a correct sequence. `su` is the guest's su
-    binary (engine.resolve_su) or None on an unrooted instance, in which case
-    the two root-only steps are OMITTED rather than emitted-and-ignored — see
-    root_only_steps().
+    a caller without one still gets a correct sequence. `su` is the guest's
+    root shell prefix (engine.resolve_root_shell): "" when adbd is already
+    uid 0, a path when there is an su binary, or None on an unrooted instance,
+    in which case the two root-only steps are OMITTED rather than
+    emitted-and-ignored — see root_only_steps().
+
+    `gl_panel` is the (w, h) the virtio GPU was told to advertise on a GL boot,
+    or None on the software path. It exists because of a real defect: the GL
+    device offers the guest a mode list that STARTS at 640x480, Android takes
+    the first entry, and a GPU-accelerated boot therefore came up at 640x480
+    while the software one gave 1280x800 — measured 2026-08-15, `wm size`
+    reporting `Physical size: 640x480` on a device passed xres=1280,yres=800.
+    `wm size reset` cannot fix that, because 640x480 IS the physical size as
+    far as the guest is concerned; only an explicit override moves it.
 
     Ordering mirrors farming's reasoning: the display goes FIRST so everything
     measured afterwards is measured against the real resolution, and the
@@ -108,11 +126,17 @@ def build_tuning_sequence(mode=None, su=None):
     mode = mode or {}
     steps = []
 
-    # 1) Native resolution. `reset` rather than an explicit w/h: the base's own
-    #    size is the right answer and hardcoding one here would silently pin
-    #    every future base to today's panel.
-    steps.append(["shell", "wm", "size", "reset"])
-    steps.append(["shell", "wm", "density", "reset"])
+    # 1) The panel. `reset` on the software path, because the base's own size
+    #    is the right answer there and hardcoding one would silently pin every
+    #    future base to today's panel. An explicit size ONLY when a GL boot
+    #    handed us one, which is the case `reset` gets wrong (see gl_panel).
+    if gl_panel:
+        w, h = gl_panel
+        steps.append(["shell", "wm", "size", f"{w}x{h}"])
+        steps.append(["shell", "wm", "density", str(GL_PANEL_DENSITY)])
+    else:
+        steps.append(["shell", "wm", "size", "reset"])
+        steps.append(["shell", "wm", "density", "reset"])
     #    A mode carrying an explicit display still wins (NATIVE_DISPLAY is
     #    None, so gaming normally adds nothing here).
     steps += lean.display_args(mode.get("display"))
@@ -174,8 +198,17 @@ def build_pin_game_step(su):
     top-app rather than foreground: it is the cpuset Android's own scheduler
     treats as the latency-critical app, which is exactly the claim this mode
     makes. Root-only — /dev/cpuset/*/tasks is not writable by uid shell.
+
+    `su is None`, NOT `not su`. "" is a VALID root mode — it means adbd itself
+    runs as uid 0, which is exactly what the x86 Bliss base does — and a
+    falsy test read it as "no root" and returned None. That is the whole of
+    the long-standing `cpuset: SKIPPED - no root on this instance` on a guest
+    whose `adb shell id -u` answers 0 (re-confirmed by hand 2026-08-15). The
+    same trap is documented on su_sh above and was fixed there; this call site
+    was missed, so the one step that needed it most never ran. Every gate on a
+    root mode has to be an identity test against None.
     """
-    if not su:
+    if su is None:
         return None
     return su_sh(su, (
         f"for i in $(seq 1 {PIN_WAIT_SECS}); do "
