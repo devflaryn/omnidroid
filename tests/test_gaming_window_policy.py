@@ -219,5 +219,28 @@ class TheFlagsAreGatedToPlatformsThatPresent(unittest.TestCase):
         self.assertIn("zoom-to-fit=on", display[1])
 
 
+class RunRecordSaysWhatTheDisplayIs(unittest.TestCase):
+    """`view` must not have to re-derive the boot's display policy: the argv
+    IS what the process did, so it is read once at spawn and written down."""
+
+    def test_a_gl_window_boot_is_recorded_as_such(self):
+        cmd = ["qemu-system-x86_64", "-display",
+               "gtk,gl=on,show-menubar=off,window-close=off,zoom-to-fit=on"]
+        self.assertEqual(qemu_proc.display_kind(cmd), "gl-window")
+
+    def test_a_software_window_boot_is_recorded_as_a_window(self):
+        self.assertEqual(
+            qemu_proc.display_kind(["qemu", "-display", "gtk"]), "window")
+
+    def test_a_headless_boot_with_vnc_is_recorded_as_vnc(self):
+        self.assertEqual(
+            qemu_proc.display_kind(["qemu", "-display", "egl-headless",
+                                    "-vnc", "127.0.0.1:1"]), "vnc")
+
+    def test_a_headless_boot_with_no_vnc_is_none(self):
+        self.assertEqual(
+            qemu_proc.display_kind(["qemu", "-display", "none"]), "none")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6540,6 +6540,32 @@ def _clear_window_bar_pid(name):
         pass
 
 
+def _persist_window_bar_geometry(name, identity, pid):
+    """Save where the user left the window, so the NEXT `view` restores it
+    instead of letting QEMU pick its own default position.
+
+    Best-effort, like every write in this file's window path: a window that
+    is already gone (the instance was just stopped) reads back None from
+    window_geometry and this is a no-op; an unreadable/absent run.json is
+    also a no-op rather than a fresh file that would drop everything else
+    spawn_qemu wrote. Never raises -- this runs from a detached, console-less
+    process's `finally`, where an exception here has nowhere to go but
+    silently killing the process before the pid file gets cleared.
+    """
+    from omnidroid import hostwin
+    try:
+        geometry = hostwin.window_geometry(identity, pid=pid)
+        if geometry is None:
+            return
+        run = _run_record(name)
+        if not run:
+            return
+        run["geometry"] = list(geometry)
+        (runtime_dir(name) / "run.json").write_text(json.dumps(run))
+    except Exception:      # noqa: BLE001
+        pass
+
+
 def boot_has_hidden_window(name):
     """Did this boot open a QEMU window and then hide it?
 
@@ -6598,6 +6624,19 @@ def cmd_view(args):
         run = _run_record(args.name)
         identity = run.get("identity") or f"omni-{args.name}"
         qemu_pid = run.get("pid")
+        # --hide: the same action the window's own X already offers (hide or
+        # stop, windowbar.py) but reachable from the app without the user
+        # finding the window on the desktop first. Deliberately ahead of the
+        # no-window probe below: hide_qemu_window() already treats "no
+        # window" as a harmless no-op (see hostwin.hide_qemu_window), so
+        # there is no honest failure to surface here the probe would add --
+        # only an extra ~2s wait for an action that has nothing to wait for.
+        if getattr(args, "hide", False):
+            hostwin.hide_qemu_window(identity, pid=qemu_pid)
+            if getattr(args, "json", False):
+                emit_json({"name": args.name, "viewer": "window",
+                           "hidden": True, "ok": True})
+            return
         # Probe for the window FIRST, with a short timeout, before touching
         # its chrome. A window that genuinely is not there is a different,
         # honest problem from "it's there but restyling it failed" --
@@ -6716,9 +6755,15 @@ def _run_windowbar(a):
                                         on_stop=stop_instance)
     finally:
         # However this exits -- hide, stop, or the window closed some other
-        # way -- the pid file that says "a bar is already open" must not
-        # outlive the bar, or the NEXT `view` believes a bar is up when it
-        # is not and never opens a new one.
+        # way -- persist where the user left the window BEFORE clearing the
+        # pid file, so the NEXT `view` restores it instead of QEMU's own
+        # default position. Same `finally`, so it happens on every exit path,
+        # not just the clean one.
+        _persist_window_bar_geometry(a.name, a.identity,
+                                     getattr(a, "pid", None))
+        # The pid file that says "a bar is already open" must not outlive
+        # the bar, or the NEXT `view` believes a bar is up when it is not
+        # and never opens a new one.
         _clear_window_bar_pid(a.name)
 
 
@@ -10701,6 +10746,10 @@ def build_parser():
                          "qemu.vnc_viewer")
     vw.add_argument("--timeout", type=int, default=NORMAL_BOOT_TIMEOUT,
                     help="seconds to wait for the VNC port when --start")
+    vw.add_argument("--hide", action="store_true",
+                    help="hide this instance's window without stopping it "
+                         "(only applies to a boot presenting a native "
+                         "window; view again to bring it back)")
     vw.add_argument("--json", action="store_true")
     vw.set_defaults(func=cmd_view)
 

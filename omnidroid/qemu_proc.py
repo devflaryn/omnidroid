@@ -1820,6 +1820,23 @@ def command_opens_a_window(cmd):
     return False
 
 
+def display_kind(cmd):
+    """What this boot put on screen, read off the argv it was spawned with.
+
+    Written into run.json so `view` never re-derives the policy: the argv IS
+    what the process did, and a second copy of the decision is a second thing
+    that can drift.
+    """
+    display = []
+    for i, arg in enumerate(cmd):
+        if arg == "-display" and i + 1 < len(cmd):
+            display = [cmd[i + 1]]
+            break
+    if not command_opens_a_window(["-display"] + display):
+        return "vnc" if "-vnc" in cmd else "none"
+    return "gl-window" if uses_gl_context(display) else "window"
+
+
 def _refresh_ephemeral_efivars(acct, cfg):
     """Give an ephemeral instance a FRESH copy of the base UEFI vars for this boot,
     so nothing persists across boots (the system/data/devkit disks are the shared
@@ -2090,6 +2107,10 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
          # it is offered, so the tune-up has to name the one we asked for.
          "gpu": "gl" if command_renders_on_gpu(cmd) else "software",
          "gl_panel": gl_panel_size(cmd),
+         # What this boot actually put on screen -- read once off the argv
+         # rather than re-derived, so `view` never carries a second copy of
+         # the display policy that could drift from what the process did.
+         "display_kind": display_kind(cmd),
          "identity": f"omni-{acct['name']}",
          "mode": (mode or {}).get(
              "name", "interactive" if interactive else DEFAULT_MODE),
