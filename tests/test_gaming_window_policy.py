@@ -27,17 +27,27 @@ GAMING = {"profile": "performance", "gpu": "auto", "panel": (1280, 800)}
 FARMING = {"profile": "density", "gpu": "auto", "panel": (640, 480)}
 
 
+def _resolve_display(mode, platform_key, cfg=None):
+    """Shared by every TestCase below that needs a fully-mocked
+    resolve_gpu_display() call. A module-level function rather than a method
+    repeated on each class, so the mock.patch block that makes this file's
+    tests deterministic (fixed platform, fixed `-display help`/`-device
+    help`, a GUI host, a clean environ) exists in exactly one place.
+    """
+    with mock.patch.object(qemu_proc, "_platform_key",
+                           return_value=platform_key), \
+         mock.patch.object(qemu_proc, "_qemu_help_texts",
+                           return_value=(DISPLAY_HELP, DEVICE_HELP)), \
+         mock.patch.object(qemu_proc, "_host_has_gui", return_value=True), \
+         mock.patch.dict(os.environ, {}, clear=True):
+        return qemu_proc.resolve_gpu_display(mode, False,
+                                              "qemu-system-x86_64", cfg)
+
+
 class ProfileDecidesTheDisplay(unittest.TestCase):
 
     def resolve(self, mode, platform_key, cfg=None):
-        with mock.patch.object(qemu_proc, "_platform_key",
-                               return_value=platform_key), \
-             mock.patch.object(qemu_proc, "_qemu_help_texts",
-                               return_value=(DISPLAY_HELP, DEVICE_HELP)), \
-             mock.patch.object(qemu_proc, "_host_has_gui", return_value=True), \
-             mock.patch.dict(os.environ, {}, clear=True):
-            return qemu_proc.resolve_gpu_display(mode, False,
-                                                  "qemu-system-x86_64", cfg)
+        return _resolve_display(mode, platform_key, cfg)
 
     def test_gaming_on_linux_keeps_egl_headless_until_a_host_verifies_it(self):
         """DEFERRED, not a design decision reversed.
@@ -96,15 +106,8 @@ class TheProfileOverridesAnExplicitHeadlessGlRequest(unittest.TestCase):
     """
 
     def resolve(self, mode, platform_key):
-        cfg = {"qemu": {"headless_gl": True}}
-        with mock.patch.object(qemu_proc, "_platform_key",
-                               return_value=platform_key), \
-             mock.patch.object(qemu_proc, "_qemu_help_texts",
-                               return_value=(DISPLAY_HELP, DEVICE_HELP)), \
-             mock.patch.object(qemu_proc, "_host_has_gui", return_value=True), \
-             mock.patch.dict(os.environ, {}, clear=True):
-            return qemu_proc.resolve_gpu_display(mode, False,
-                                                  "qemu-system-x86_64", cfg)
+        return _resolve_display(mode, platform_key,
+                                {"qemu": {"headless_gl": True}})
 
     def test_gaming_still_takes_the_window_on_windows(self):
         _gpu, display = self.resolve(GAMING, "windows")
@@ -121,6 +124,56 @@ class TheProfileOverridesAnExplicitHeadlessGlRequest(unittest.TestCase):
         # windowless pair for farming, exactly as it did before.
         _gpu, display = self.resolve(FARMING, "windows")
         self.assertEqual(display, ["-display", "egl-headless"])
+
+
+class WindowFlagsAreBackendSpecific(unittest.TestCase):
+    """QEMU rejects an unknown suboption outright, so this cannot be one list.
+
+    -display gtk  takes show-menubar, window-close, zoom-to-fit
+    -display sdl  takes window-close only
+    -display cocoa takes zoom-to-fit only -- no window-close, which is one
+    more reason macOS gets its close behaviour from the QEMU patch.
+    """
+
+    def test_gtk_gets_all_three(self):
+        flags = qemu_proc.window_flags("gtk")
+        self.assertIn("show-menubar=off", flags)
+        self.assertIn("window-close=off", flags)
+        self.assertIn("zoom-to-fit=on", flags)
+
+    def test_sdl_gets_only_window_close(self):
+        flags = qemu_proc.window_flags("sdl")
+        self.assertIn("window-close=off", flags)
+        self.assertNotIn("show-menubar", flags)
+        self.assertNotIn("zoom-to-fit", flags)
+
+    def test_cocoa_never_gets_window_close(self):
+        flags = qemu_proc.window_flags("cocoa")
+        self.assertIn("zoom-to-fit=on", flags)
+        self.assertNotIn("window-close", flags)
+        self.assertNotIn("show-menubar", flags)
+
+    def test_an_unknown_backend_gets_nothing_rather_than_a_refused_boot(self):
+        self.assertEqual(qemu_proc.window_flags("wayland-thing"), "")
+
+
+class TheFlagsReachTheCommand(unittest.TestCase):
+
+    def resolve(self, mode, platform_key):
+        return _resolve_display(mode, platform_key)
+
+    def test_a_gaming_gtk_boot_carries_our_flags(self):
+        _gpu, display = self.resolve(GAMING, "windows")
+        self.assertIn("show-menubar=off", display[1])
+        self.assertIn("window-close=off", display[1])
+        self.assertIn("zoom-to-fit=on", display[1])
+
+    def test_it_is_still_recognised_as_a_gl_boot(self):
+        _gpu, display = self.resolve(GAMING, "windows")
+        self.assertTrue(qemu_proc.uses_gl_context(display))
+        self.assertTrue(qemu_proc.blocks_vnc(display))
+        self.assertTrue(qemu_proc.command_opens_a_window(
+            ["-display", display[1]]))
 
 
 if __name__ == "__main__":

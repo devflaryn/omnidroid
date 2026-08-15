@@ -315,6 +315,30 @@ _WINDOW_BACKENDS = {"macos": ("cocoa",), "linux": ("gtk", "sdl"),
 # been wrong.
 _GL_OPTION = {"macos": "gl=es", "linux": "gl=on", "windows": "gl=on"}
 
+# Suboptions we set on a PRESENTED window, per backend. Not one list, because
+# QEMU refuses an unknown suboption outright rather than ignoring it -- so a
+# `show-menubar=off` sent to `cocoa` does not degrade, it fails the boot.
+#
+#   show-menubar=off   QEMU's own View/Machine menus are not our chrome
+#   window-close=off   the X must not quit QEMU: the strip asks first, and a
+#                      window that closes the VM by accident costs a boot
+#   zoom-to-fit=on     the guest panel is fixed at the base's native mode, so
+#                      the window scales rather than letterboxing
+_WINDOW_FLAGS = {
+    "gtk":   ("show-menubar=off", "window-close=off", "zoom-to-fit=on"),
+    "sdl":   ("window-close=off",),
+    "cocoa": ("zoom-to-fit=on",),
+}
+
+
+def window_flags(backend):
+    """Comma-joined suboptions for a presented window on `backend`.
+
+    An unrecognised backend gets "" rather than a guess: an unknown suboption
+    is a refused boot, and no flag at all is merely a plainer window.
+    """
+    return ",".join(_WINDOW_FLAGS.get(backend, ()))
+
 
 def _platform_key():
     if IS_MACOS:
@@ -401,11 +425,15 @@ def default_display(qemu_display_help="", qemu_device_help="", has_gui=True,
         gl = _GL_OPTION[_platform_key()]        # gl=es on macOS — see _GL_OPTION
         return {"available": True, "tier": "gl",
                 "gpu_args": ["-device", gl_device_arg(panel, cfg)],
-                "display_args": ["-display", f"{backend},{gl}"],
+                "display_args": ["-display",
+                                 ",".join(filter(None, (backend, gl,
+                                                        window_flags(backend))))],
                 "reason": f"{backend},{gl} + {GL_GPU_DEVICE} (3D accelerated)"}
     return {"available": True, "tier": "window",
             "gpu_args": list(HEADLESS_GPU_ARGS),
-            "display_args": ["-display", backend],
+            "display_args": ["-display",
+                             ",".join(filter(None,
+                                             (backend, window_flags(backend))))],
             "reason": (f"native {backend} window, software rendering — this "
                        f"QEMU has no {GL_GPU_DEVICE} (built without "
                        f"virglrenderer/OpenGL)")}

@@ -374,10 +374,16 @@ class MacOsAsksForGlTheOnlyWayMacOsCanGiveIt(unittest.TestCase):
     wrong makes a correctly-installed virgl QEMU look broken."""
 
     def test_macos_asks_for_gl_es(self):
+        # assertIn rather than an exact string: the suboptions window_flags()
+        # appends (test_gaming_window_policy.py) are a separate concern from
+        # this test's — gl=es vs gl=on per platform.
         with mock.patch.object(qemu_proc, "_platform_key", return_value="macos"):
             cap = qemu_proc.default_display(
                 qemu_display_help="cocoa", qemu_device_help=qemu_proc.GL_GPU_DEVICE)
-        self.assertEqual(cap["display_args"], ["-display", "cocoa,gl=es"])
+        self.assertEqual(cap["display_args"][0], "-display")
+        self.assertTrue(cap["display_args"][1].startswith("cocoa,"),
+                        cap["display_args"][1])
+        self.assertIn("gl=es", cap["display_args"][1].split(","))
 
     def test_the_others_ask_for_gl_on(self):
         for key, backend in (("windows", "gtk"), ("linux", "gtk")):
@@ -385,7 +391,9 @@ class MacOsAsksForGlTheOnlyWayMacOsCanGiveIt(unittest.TestCase):
                 cap = qemu_proc.default_display(
                     qemu_display_help=backend,
                     qemu_device_help=qemu_proc.GL_GPU_DEVICE)
-            self.assertEqual(cap["display_args"], ["-display", f"{backend},gl=on"], key)
+            self.assertEqual(cap["display_args"][0], "-display", key)
+            self.assertTrue(cap["display_args"][1].startswith(f"{backend},"), key)
+            self.assertIn("gl=on", cap["display_args"][1].split(","), key)
 
     def test_gl_es_still_counts_as_a_gl_context(self):
         """The one that bites. QEMU REFUSES `-vnc` together with a WINDOWED GL

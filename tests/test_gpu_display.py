@@ -92,11 +92,18 @@ class DetectsTheWindowTier(unittest.TestCase):
     """The tier the primary host actually has today."""
 
     def test_macos_without_virgl_still_gets_a_native_window(self):
+        # assertIn rather than an exact string: window_flags() now appends
+        # this backend's suboptions (test_gaming_window_policy.py) — cocoa
+        # gets zoom-to-fit=on. That is a separate concern from what this test
+        # checks, which is the tier and the backend itself.
         with _mac():
             cap = omni.default_display(MAC_DISPLAY_HELP, NO_GL_DEVICE_HELP,
                                        has_gui=True)
         self.assertEqual(cap["tier"], "window")
-        self.assertEqual(cap["display_args"], ["-display", "cocoa"])
+        self.assertEqual(cap["display_args"][0], "-display")
+        self.assertTrue(cap["display_args"][1].startswith("cocoa"),
+                        cap["display_args"][1])
+        self.assertIn("zoom-to-fit=on", cap["display_args"][1].split(","))
         self.assertEqual(cap["gpu_args"], HEADLESS_GPU)
 
     def test_the_reason_names_the_missing_piece(self):
