@@ -110,6 +110,21 @@ _WINDOW_BACKENDS = {"macos": ("cocoa",), "linux": ("gtk", "sdl"),
                     "windows": ("gtk", "sdl")}
 
 
+# HOW to ask for GL, per platform. This is not a style choice -- the wrong one
+# does not degrade, it fails.
+#
+# `gl=on` means "give me desktop OpenGL". macOS DEPRECATED OpenGL in favour of
+# Metal, and every macOS QEMU that can do GL at all does it through ANGLE,
+# which speaks OpenGL **ES** and translates to Metal. So on macOS the option is
+# `gl=es`; `gl=on`/`gl=core` either refuse outright or render upside down
+# (documented by every build that ships this: knazarov/qemu-virgl and
+# akihikodaki's patches both say `gl=es`, "not gl=on or gl=core"). Getting this
+# wrong would make a correctly-installed virgl QEMU look broken, and the
+# obvious conclusion -- "GPU acceleration does not work on macOS" -- would be
+# wrong. THIS host is the one it matters on.
+_GL_OPTION = {"macos": "gl=es", "linux": "gl=on", "windows": "gl=on"}
+
+
 def _platform_key():
     if IS_MACOS:
         return "macos"
@@ -175,10 +190,11 @@ def default_display(qemu_display_help="", qemu_device_help="", has_gui=True):
         wanted = "/".join(_WINDOW_BACKENDS[_platform_key()])
         return _none(f"this QEMU build has no {wanted} display backend")
     if GL_GPU_DEVICE in qemu_device_help:
+        _gl = _GL_OPTION[_platform_key()]   # gl=es on macOS — see _GL_OPTION
         return {"available": True, "tier": "gl",
                 "gpu_args": ["-device", GL_GPU_DEVICE],
-                "display_args": ["-display", f"{backend},gl=on"],
-                "reason": f"{backend},gl=on + {GL_GPU_DEVICE} (3D accelerated)"}
+                "display_args": ["-display", f"{backend},{_gl}"],
+                "reason": f"{backend},{_gl} + {GL_GPU_DEVICE} (3D accelerated)"}
     return {"available": True, "tier": "window",
             "gpu_args": list(HEADLESS_GPU_ARGS),
             "display_args": ["-display", backend],
@@ -583,6 +599,51 @@ def usb_devices(mode, arm):
             "-device", "usb-tablet"]
 
 
+# Display backends that render WITHOUT putting a window on screen.
+_WINDOWLESS_DISPLAYS = ("none", "", "egl-headless")
+
+
+def uses_gl_context(display_args):
+    """Does this display pair give QEMU a GL context?
+
+    Any `gl=` that is not `off`, or egl-headless. Matching `gl=` generally
+    rather than the literal `gl=on` is load-bearing HERE above all: macOS takes
+    `gl=es` (ANGLE -> Metal, see _GL_OPTION), and a check that only knew
+    `gl=on` would read a macOS GL boot as non-GL and leave -vnc on the command
+    line."""
+    for arg in display_args or []:
+        text = str(arg)
+        if text.split(",")[0] in ("egl-headless",):
+            return True
+        for opt in text.split(",")[1:]:
+            if opt.startswith("gl=") and opt != "gl=off":
+                return True
+    return False
+
+
+def vnc_args(display_args, vnc_display):
+    """The `-vnc` pair, or nothing when a GL context rules it out.
+
+    QEMU REFUSES the combination and says so in one line:
+
+        qemu: -vnc 127.0.0.1:12101: Display vnc is incompatible with the GL context
+
+    This lineage appended `-vnc` UNCONDITIONALLY, which was harmless only
+    because no mode here had ever opened a GL window. `playable` asks for one
+    now, so the first GL-capable QEMU installed on this host would have made
+    every start exit instead of booting -- with the explanation sitting unread
+    in runtime/<name>/qemu.log. Ported from the Windows lineage, where exactly
+    that happened.
+
+    What a GL boot gives up: `omnidroid view` and capture.py/autocap, which
+    read this framebuffer. `omnidroid screenshot` is unaffected -- it goes
+    through adb.
+    """
+    if uses_gl_context(display_args):
+        return []
+    return ["-vnc", f"127.0.0.1:{vnc_display}"]
+
+
 def _assert_port_triple(acct):
     """The per-account port triple must be distinct (the shared-index scheme
     guarantees it below 1000 instances; assert anyway before handing the
@@ -720,7 +781,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         # Built-in VNC server, LOCALHOST ONLY (no auth is safe ONLY because
         # of the 127.0.0.1 bind — HARD RULE, same as x86; never bind a
         # network interface without adding auth in the same change).
-        "-vnc", f"127.0.0.1:{vnc_display}",
+        *vnc_args(display_args, vnc_display),
         *usb_devices(mode, arm=True),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
@@ -864,7 +925,7 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         # Idle (no viewer) it does no framebuffer encoding, so leaving it
         # on costs ~nothing across hours-long headless runs; a viewer
         # disconnecting never affects the instance.
-        "-vnc", f"127.0.0.1:{vnc_display}",
+        *vnc_args(display_args, vnc_display),
         *usb_devices(mode, arm=False),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
