@@ -559,3 +559,42 @@ SLEEPS, and a guest that wakes behind fails Roblox auth and TLS with a symptom
 indistinguishable from a dead cookie. The resync runs on every adoption, costs
 one adb round trip when there is nothing to fix, and corrected 18 s on a slot
 that was 35 seconds old.
+
+## The render floor: what it actually bought (mostly nothing)
+
+*2026-08-15, PS99, in-world, farming, `--mem 3072`, x86/WHPX. Four runs.*
+
+Farming boots `-display none` with an idle VNC server that encodes nothing, so
+there is **no host-side render cost to attack**. Every remaining lever is
+inside the guest. `--quality minimal` was added to pull two of them: a 3 fps
+tick target (down from 5) and a 320x180 panel (down from 480x270).
+
+| run | client | guest CPU (2 vCPU) |
+|---|---|---|
+| `--quality low` (the shipped default) | alive, in-world | user 150-156%, **idle 24-35%** |
+| `--quality minimal`, floor as a SECOND resize | **DEAD** — process gone, black screen | 200% idle |
+| `--quality minimal`, `OMNI_FARM_SKIP=render` (3 fps, no resize) | alive, in-world, PSS 1349 MB | user 140-158%, **idle 19-27%** |
+
+Two conclusions, and the second one is the useful one.
+
+**1. A second mid-session `wm size` kills the client.** The `minimal` boot's
+Roblox process was simply gone: `screencap` solid black, the guest's
+MemAvailable jumping 591 MB → 2202 MB as its 1.6 GB was released, guest at
+200% idle. That last number is a trap — it reads exactly like the "engine
+deadlocks rather than crawls" signature in the x86 section, and it is not
+that. The control proves it: identical ClientAppSettings, no second resize,
+client alive. **One configuration change to a running Roblox client is
+survivable; two are not.** The floor's panel is now folded into the FIRST and
+only resize.
+
+**2. Dropping the tick target 5 → 3 fps buys nothing measurable.** Idle at
+3 fps (19-27%) is indistinguishable from idle at 5 fps (24-35%) — if anything
+it is worse, which is noise. That is consistent with what the resolution
+section already says: **the guest is CPU-bound on arm64 translation, not
+fill-bound.** Roblox running through `libndk_translation` is where the 150%
+goes, and no render setting reaches it.
+
+So `minimal` stays available and is **not** the farming default, which remains
+`low`. Do not reach for it expecting a saving; the measured way to fit more
+instances on this host is `-m` (host RSS tracks it almost exactly) and free
+disk for the scratch, not render settings.

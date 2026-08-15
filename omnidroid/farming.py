@@ -189,10 +189,27 @@ def build_squeeze_sequence(mode=None, skip=(), quality=None):
 
     steps = []
 
-    # 1) Shrink the display. Roblox keeps running and keeps its connection;
-    #    it just composites ~30x fewer pixels.
+    # 1) Shrink the display, ONCE. Roblox keeps running and keeps its
+    #    connection; it just composites ~30x fewer pixels.
+    #
+    #    The render floor's panel is folded in here rather than emitted as a
+    #    second resize later, and that is a MEASUREMENT, not tidying.
+    #    2026-08-15, PS99, in-world, `--quality minimal`: a second `wm size`
+    #    (480x270 -> 320x180) delivered to a running client KILLED it --
+    #    process gone, screen black, the guest's MemAvailable jumping 591 MB
+    #    -> 2202 MB as its 1.6 GB was released, and the guest falling to 200%
+    #    idle, which reads exactly like the "engine deadlocks rather than
+    #    crawls" signature and is not it. The same boot with
+    #    `OMNI_FARM_SKIP=render` -- same 3 fps ClientAppSettings, no second
+    #    resize -- stayed alive and in-world (PSS 1349 MB). One configuration
+    #    change to a running Roblox client is survivable; two are not.
+    #
+    #    Both bisect knobs still mean what they say: `OMNI_FARM_SKIP=display`
+    #    leaves the panel entirely alone, and `OMNI_FARM_SKIP=render` leaves
+    #    it at the mode's own size.
     if STEP_DISPLAY not in skip:
-        steps += lean.display_args(display)
+        panel = display if STEP_RENDER in skip else floor
+        steps += lean.display_args(panel)
 
     # 1b) The RENDER FLOOR. Farming is unattended: no fps requirement, no view
     #     quality requirement, and — because the mode boots `-display none`
@@ -257,8 +274,6 @@ def build_squeeze_sequence(mode=None, skip=(), quality=None):
     #     part removes a specific, named source of raster work, not because it
     #     was timed.
     if STEP_RENDER not in skip:
-        if floor != display and STEP_DISPLAY not in skip:
-            steps += lean.display_args(floor)
         steps.append(sh("settings put global transition_animation_scale 0 "
                         ">/dev/null 2>&1; "
                         "settings put global animator_duration_scale 0 "

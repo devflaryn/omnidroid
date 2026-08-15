@@ -134,19 +134,35 @@ class TheRenderStep(unittest.TestCase):
         self.assertNotIn(farming.STEP_RENDER, farming.parse_skip("renderer"))
 
     def test_it_sits_with_the_display_step_not_after_the_trim(self):
-        """Ordering rationale (farming.build_squeeze_sequence): the floor is a
-        SECOND, smaller panel, so it belongs in the same slot as the first
-        one. Everything between the two would otherwise size its buffers for a
-        panel this boot is about to abandon."""
+        """Ordering rationale (farming.build_squeeze_sequence): the panel is
+        settled before anything else runs, so nothing in between sizes its
+        buffers for a panel this boot is about to abandon."""
         steps = self._minimal()
         render = _first(steps, "transition_animation_scale")
         self.assertGreater(render, _first(steps, "wm size"))
         self.assertLess(render, _first(steps, "pm disable-user"))
 
-    def test_it_applies_the_smaller_panel_on_minimal(self):
+    def test_minimal_resizes_ONCE_because_twice_kills_the_client(self):
+        """MEASURED 2026-08-15, PS99, in-world, `--quality minimal`.
+
+        The floor used to arrive as a SECOND `wm size` (480x270 -> 320x180)
+        after the mode's own. That killed the client outright: the Roblox
+        process was gone, `screencap` returned solid black, the guest's
+        MemAvailable jumped 591 MB -> 2202 MB as its 1.6 GB was released, and
+        the guest fell to 200% idle -- which reads exactly like the "engine
+        deadlocks rather than crawls" signature this project already has a
+        section about, and is NOT that. It is simply dead.
+
+        The control settles it: the same boot with `OMNI_FARM_SKIP=render` --
+        identical 3 fps ClientAppSettings, no second resize -- stayed alive and
+        in-world at PSS 1349 MB, with CPU indistinguishable from a `low` boot.
+
+        So one configuration change delivered to a running Roblox client is
+        survivable and two are not, and the floor's panel has to arrive as the
+        FIRST and only resize."""
         steps = self._minimal()
-        self.assertEqual(steps[0], ["shell", "wm", "size", "480x270"])
-        self.assertIn(["shell", "wm", "size", "320x180"], steps)
+        sizes = [s for s in steps if s[:3] == ["shell", "wm", "size"]]
+        self.assertEqual(sizes, [["shell", "wm", "size", "320x180"]])
         self.assertIn(["shell", "wm", "density", "60"], steps)
 
     def test_a_normal_farming_boot_gets_no_second_resize(self):
