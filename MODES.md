@@ -607,3 +607,48 @@ defined as the record of what was tried.
 Farming stays at `low`. The measured way to fit more instances on this host is
 `-m` (host RSS tracks it almost exactly) and free scratch disk — not render
 settings.
+
+## CORRECTION: farming's CPU is llvmpipe, and the GPU halves it
+
+*2026-08-15, PS99, in-world, per-thread out of `/proc/<pid>/task/*/stat`.*
+
+Two sections above say the guest is "CPU-bound on arm64 translation, not
+fill-bound". **That is wrong**, and it was inference from two null results
+rather than a measurement. Attributing the CPU per thread settles it:
+
+| software (`--gpu headless`) | | GPU (hidden GL window) | |
+|---|---|---|---|
+| `llvmpipe-1` | 52.8% | *gone* | |
+| `llvmpipe-0` | 51.8% | *gone* | |
+| `HttpClient` | 11.1% | `FunctionMarshal` | 18.3% |
+| `FunctionMarshal` | 10.0% | ` RBX Worker A` | 17.3% |
+| ` RBX Worker A` | 6.8% | ` RBX Worker B` | 20.0% |
+| **TOTAL** | **141.1%** | **TOTAL** | **72.3%** |
+
+**Three quarters of a software farming instance's CPU is llvmpipe** —
+software GL, rasterising frames nobody looks at. The arm64-translated game
+code (` RBX Worker *`) is a small minority of it.
+
+That also explains why the render floor measured as nothing. The fps cap
+throttles Roblox's *task scheduler* and the panel changes its *pixel count*;
+neither reaches the software rasteriser's per-frame work. The lever was never
+"render less" — it was **"render somewhere else"**.
+
+So farming's GPU policy is now `auto`, and the settle also got faster
+(67 s vs 116–148 s) because the client loads against a GPU. Since CPU is what
+decides how many instances a host holds, this roughly doubles the ceiling.
+
+**`auto`, not `window`.** An explicit `window` means "I want to see it", so
+`_hide_window_if_wanted` leaves it on screen — verified. `auto` opens one only
+because this host has no other route to a GL context, then hides it. On a real
+headless farm box with no window server, `auto` finds nothing and falls back to
+software, which is the old behaviour.
+
+**What it costs:** QEMU refuses `-vnc` beside a GL context, so `capture` and
+`autocap` are unavailable on a GPU farming boot and `omnidroid view` uses the
+embedded window. **`screenshot` goes through adb and is unaffected** — verified
+against a GPU farming instance.
+
+**Untested:** GPU contention with many concurrent instances. Only one Roblox
+cookie was live when this was measured, so a single instance is the only
+in-world data point. That is the number to take before promising a fleet size.
