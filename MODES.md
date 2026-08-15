@@ -160,7 +160,10 @@ taskkill /F /PID <bar>
 after the kill    totalFrames = 3464   over 34s   (~102 fps)
 ```
 
-— frame production did not even dip. This is the check the whole redesign
+— frame production did not even dip. (The 94/102 fps here are idle
+Android/BlissOS setup-wizard compositing — this pass could not reach PS99 on
+this box, see below — not a gameplay number and not comparable to the
+24.2–58 fps PS99 band further down.) This is the check the whole redesign
 exists for, and it holds.
 
 **Known issue, found on this same hardware pass:** the bar's *size* does not
@@ -170,9 +173,45 @@ toplevel size) rather than the intended "exactly as wide as the guest window,
 34 px tall" — overlapping the guest's top-left corner rather than sitting
 flush above it. Ownership, ownership-triggered kill-safety, hide, and the
 close dialog's three buttons all still work correctly; only the strip's shape
-is wrong. Suspected cause, not yet fixed: `root.resizable(False, False)` runs
+was wrong. Suspected cause at the time: `root.resizable(False, False)` runs
 before `bar.follow()`'s raw `SetWindowPos`, so a later `WM_GETMINMAXINFO` may
-clamp the window back to Tk's own requested size. Needs a follow-up task.
+clamp the window back to Tk's own requested size. **That suspicion was
+wrong — see the correction immediately below.**
+
+### CORRECTION, 2026-08-16: it was a Tk min/max lock, not the caption arithmetic
+
+Fixed and hardware-verified in `4daa97e`, the very next commit after the
+hardware pass above. The suspected cause — a race between the caption
+arithmetic and `follow()`'s `SetWindowPos` — was never it. On Windows, Tk's
+`wm resizable(False, False)` does two things, not one: it strips
+`WS_THICKFRAME`/`WS_MAXIMIZEBOX` (wanted), and it *also* locks the window's
+`WM_GETMINMAXINFO` min/max track size to whatever Tk's own "natural" client
+size happens to be at that instant — for a bare toplevel with no child
+widgets yet, that is Tk's built-in ~200×200 default, nothing to do with the
+guest window's real rect (not known yet at that point in the function). The
+lock is not a one-time race to lose, either: **Windows re-enforces it on
+every later `SetWindowPos`**, including the one `follow()` makes once the
+real rect is known — which is exactly the measured 216×239 clamp.
+
+The fix never calls `resizable()` at all. `_strip_resize_border()` removes
+`WS_THICKFRAME`/`WS_MAXIMIZEBOX` by hand via `GetWindowLongPtrW`/
+`SetWindowLongPtrW`/`SetWindowPos(..., SWP_FRAMECHANGED)` — the same
+technique `hostwin.apply_chrome` already uses on QEMU's own window — so no
+lock is ever installed. `follow()` additionally reads back the height
+Windows actually granted: a `WS_CAPTION` window has a system-enforced
+minimum caption height (measured 40 px on this box, against `BAR_HEIGHT`'s
+nominal 34), so it repositions — never resizes — so the bar's bottom edge
+lands exactly on the guest's top edge no matter what floor a given
+machine's DPI/theme enforces.
+
+Hardware-verified the same night: bar `(208,168)-(864,208)` against guest
+`(208,208)-(864,752)` — full width, zero overlap, zero gap. Kill-safety was
+re-verified against the new code too: SurfaceFlinger `totalFrames` went
+1952 → 2059 across a force-kill of the bar's process, guest untouched. Full
+diagnosis, rejected alternatives (`root.geometry()`, `minsize()`/
+`maxsize()`, reordering the calls, `overrideredirect(True)`), and the new
+test coverage are in the "Geometry fix" section of
+`.superpowers/sdd/2026-08-15-gaming-gpu-window/task-9-report.md`.
 
 GTK re-shows the window during early boot, so `hostwin.keep_hidden()` re-hides
 it for the length of a boot and then stops; after that a single hide sticks.

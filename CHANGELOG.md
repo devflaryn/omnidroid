@@ -6,6 +6,44 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-16 (later) — the bar's geometry fix, and a second stale message
+
+**Both defects the hardware pass below found were fixed the same day**, in
+`4daa97e` — the entry underneath still describes them as open follow-up
+work; this corrects that.
+
+**The bar's size.** The suspected cause logged below — a race between
+`root.resizable(False, False)` and `follow()`'s `SetWindowPos` — was wrong.
+On Windows, `wm resizable(False, False)` does two things: it strips
+`WS_THICKFRAME`/`WS_MAXIMIZEBOX` (wanted), and it also locks the window's
+`WM_GETMINMAXINFO` min/max track size to Tk's own ~200×200 default for an
+empty toplevel — and Windows **re-enforces that lock on every later
+`SetWindowPos`**, which is exactly the measured 216×239 clamp. The fix never
+calls `resizable()`: `_strip_resize_border()` strips those two style bits by
+hand, the same technique `hostwin.apply_chrome` already uses on QEMU's own
+window. `follow()` also reads back the height Windows actually granted — a
+`WS_CAPTION` window has a system minimum, measured 40px against the nominal
+`BAR_HEIGHT` of 34 — and repositions (never resizes) so the bar's bottom
+edge lands exactly on the guest's top edge. Hardware-verified: bar
+`(208,168)-(864,208)` against guest `(208,208)-(864,752)`, full width, zero
+overlap, zero gap. Kill-safety re-verified across the change:
+`totalFrames` 1952 → 2059 across a force-kill of the bar's process.
+
+**The stale `[gpu]` message, and a second copy of it found alongside.**
+`qemu_proc.py`'s GL-window `[gpu]` line was reworded away from the deleted
+`SetParent` design. The same stale "HOSTS that window inside our own
+viewer" phrasing also turned up in `engine.py`'s
+`vnc_unavailable_reason()` (surfaced by `cmd_view`'s `no_vnc_gl_window`
+failure) — found by reading every `[gpu]`-prefixed message in
+`qemu_proc.py` plus its siblings, not just the one flagged below — and
+fixed the same way.
+
+`MODES.md`'s known-issue paragraph got the equivalent `### CORRECTION`
+treatment rather than a silent rewrite. Full diagnosis, rejected
+alternatives, and the new test coverage:
+`.superpowers/sdd/2026-08-15-gaming-gpu-window/task-9-report.md`, "Geometry
+fix" section.
+
 ## 2026-08-16 — gaming's window redesign, measured on real Windows hardware
 
 **The `SetParent`-hosted viewer is gone.** Gaming's GPU window used to make
@@ -35,7 +73,8 @@ taskkill /F /PID <bar pid>                  bar dies; QEMU pid untouched
 SurfaceFlinger --timestats, bar dead        totalFrames = 3464 / 34s (~102 fps)
 ```
 
-Frame production did not dip after the force-kill — the single most important
+Frame production did not dip after the force-kill (94/102 fps here are idle
+Android/BlissOS compositing, not PS99 gameplay — see below) — the single most important
 check in this pass, and it holds. The close prompt's three buttons (Cancel /
 Hide / Stop) were each exercised via UI Automation + synthetic clicks and
 behaved as designed: Cancel does nothing, Hide destroys the bar and hides the
@@ -57,20 +96,21 @@ safety, none of which depend on Roblox) — the existing 24.2–58 fps PS99 band
 in `MODES.md` predates this redesign and still stands, since only the window's
 ownership and chrome changed, not the render path.
 
-**Bug found by this hardware pass, not fixed here:** the bar's on-screen size
-does not match `bar_geometry()`'s intent — it should be exactly as wide as the
-guest window and 34px tall, sitting flush above it; on this box it instead
-came up ~216×239px (overlapping the guest's top-left corner). Position was
-correct, size was not. Suspected: `root.resizable(False, False)` in
-`windowbar.py` runs before the geometry-setting `SetWindowPos`, and a later
-`WM_GETMINMAXINFO` clamps the window back to Tk's own default size. Logged in
-`MODES.md`; needs a follow-up task.
+**Bug found by this hardware pass, fixed the same day (see the entry
+above):** the bar's on-screen size did not match `bar_geometry()`'s intent —
+it should be exactly as wide as the guest window and 34px tall, sitting
+flush above it; on this box it instead came up ~216×239px (overlapping the
+guest's top-left corner). Position was correct, size was not. Suspected at
+the time: `root.resizable(False, False)` in `windowbar.py` runs before the
+geometry-setting `SetWindowPos`, and a later `WM_GETMINMAXINFO` clamps the
+window back to Tk's own default size — **that suspicion was wrong; the
+entry above has the real cause and the fix.** Logged in `MODES.md`.
 
-**Also found:** `qemu_proc.py`'s `[gpu]` log line for the GL-window tier still
-describes the deleted design ("`omnidroid view` HOSTS it inside our own
-viewer instead") — stale text from before this plan, printed on every gaming
-boot on Windows. Not fixed here (out of this task's file scope); flagged for
-a follow-up doc/message fix.
+**Also found, fixed the same day alongside a second copy of it (see the
+entry above):** `qemu_proc.py`'s `[gpu]` log line for the GL-window tier
+still described the deleted design ("`omnidroid view` HOSTS it inside our
+own viewer instead") — stale text from before this plan, printed on every
+gaming boot on Windows.
 
 **Local environment notes, not repo changes:** this box's `images_dir`
 (`C:\Users\berat\OmniImages`) had no `x86/` subfolder populated even though
