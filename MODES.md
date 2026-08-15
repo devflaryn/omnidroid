@@ -577,15 +577,19 @@ tick target (down from 5) and a 320x180 panel (down from 480x270).
 
 Two conclusions, and the second one is the useful one.
 
-**1. A second mid-session `wm size` kills the client.** The `minimal` boot's
+**1. The 320x180 panel kills the client — by itself.** The `minimal` boot's
 Roblox process was simply gone: `screencap` solid black, the guest's
 MemAvailable jumping 591 MB → 2202 MB as its 1.6 GB was released, guest at
 200% idle. That last number is a trap — it reads exactly like the "engine
 deadlocks rather than crawls" signature in the x86 section, and it is not
-that. The control proves it: identical ClientAppSettings, no second resize,
-client alive. **One configuration change to a running Roblox client is
-survivable; two are not.** The floor's panel is now folded into the FIRST and
-only resize.
+that. It is simply dead.
+
+The first bisect (`OMNI_FARM_SKIP=render`) kept the client alive, which made
+"a SECOND mid-session `wm size`" the obvious culprit — but that skip removed
+the small panel too, so both explanations fitted. Folding the floor into a
+single resize and running it again killed the client just the same. **The
+panel itself is fatal, not the repetition.** 480x270 is measured in-world
+repeatedly and is fine.
 
 **2. Dropping the tick target 5 → 3 fps buys nothing measurable.** Idle at
 3 fps (19-27%) is indistinguishable from idle at 5 fps (24-35%) — if anything
@@ -594,7 +598,12 @@ section already says: **the guest is CPU-bound on arm64 translation, not
 fill-bound.** Roblox running through `libndk_translation` is where the 150%
 goes, and no render setting reaches it.
 
-So `minimal` stays available and is **not** the farming default, which remains
-`low`. Do not reach for it expecting a saving; the measured way to fit more
-instances on this host is `-m` (host RSS tracks it almost exactly) and free
-disk for the scratch, not render settings.
+So `minimal` is a profile whose only measured effects are "no saving" and
+"kills the game". It is **removed from `QUALITY_PROFILES`** rather than left
+selectable, and `display_for_quality` is gated on the profile being live so a
+programmatic caller cannot re-apply the fatal panel either. The dicts stay
+defined as the record of what was tried.
+
+Farming stays at `low`. The measured way to fit more instances on this host is
+`-m` (host RSS tracks it almost exactly) and free scratch disk — not render
+settings.
