@@ -97,6 +97,35 @@ REENABLE_PACKAGES = ("com.android.inputmethod.latin",)
 # laid out for the GL device's own 120 dpi and everything would be drawn a
 # sixth too small.
 GL_PANEL_DENSITY = 160
+# The panel height 160 dpi is the right answer FOR. Above this, density has to
+# rise with the panel or the UI keeps its pixel size while the screen grows,
+# and Roblox's on-screen controls end up postage stamps in a corner.
+GL_PANEL_BASE_HEIGHT = 800
+# Android refuses absurd densities and a mis-set one is unrecoverable without
+# another `wm density` round trip, so clamp to the range real devices use.
+GL_DENSITY_MIN, GL_DENSITY_MAX = 120, 480
+
+
+def density_for_panel(panel, base_height=GL_PANEL_BASE_HEIGHT,
+                      base_density=GL_PANEL_DENSITY):
+    """The dpi that keeps UI elements the same APPARENT size on `panel`.
+
+    Pure and clamped; never raises. Density is what Android lays out in — a
+    button declared 48dp is 48 physical pixels at 160 dpi and 96 at 320 — so
+    holding density fixed while the panel grows is what makes a 1440p guest
+    look like a 800p one viewed from across the room. Scaling it with the
+    panel's HEIGHT (not its area or its width) is what every Android device
+    family does, and it keeps a 16:9 panel and a 16:10 one comparable.
+    """
+    try:
+        height = int(panel[1])
+    except (TypeError, IndexError, ValueError):
+        return base_density
+    scaled = round(base_density * height / float(base_height))
+    # Land on a multiple of 20: Android buckets density into the ldpi/mdpi/…
+    # families and an off-bucket value makes it pick assets by rounding anyway.
+    scaled = int(round(scaled / 20.0) * 20)
+    return max(GL_DENSITY_MIN, min(GL_DENSITY_MAX, scaled))
 
 
 def build_tuning_sequence(mode=None, su=None, gl_panel=None):
@@ -133,7 +162,8 @@ def build_tuning_sequence(mode=None, su=None, gl_panel=None):
     if gl_panel:
         w, h = gl_panel
         steps.append(["shell", "wm", "size", f"{w}x{h}"])
-        steps.append(["shell", "wm", "density", str(GL_PANEL_DENSITY)])
+        steps.append(["shell", "wm", "density",
+                      str(density_for_panel(gl_panel))])
     else:
         steps.append(["shell", "wm", "size", "reset"])
         steps.append(["shell", "wm", "density", "reset"])

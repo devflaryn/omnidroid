@@ -303,6 +303,7 @@ def devkit_disk_for_base(images, base):
     return p if p.exists() else None
 
 
+ARM_EDK2_NAME = "edk2-aarch64-code.fd"
 ARM_EDK2_CANDIDATES = (
     "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
     "/usr/local/share/qemu/edk2-aarch64-code.fd",
@@ -312,9 +313,20 @@ ARM_EDK2_CANDIDATES = (
 
 def arm_edk2_code():
     """Absolute path to edk2-aarch64-code.fd (UEFI firmware CODE volume).
-    Config qemu.arm_edk2_code wins; else the brew Cellar (globbed, newest);
-    else the well-known share dirs."""
+    Config qemu.arm_edk2_code wins; else beside the QEMU this install actually
+    resolves; else the brew Cellar (globbed, newest); else the well-known share
+    dirs.
+
+    "Beside the resolved QEMU" is the branch that was missing, and it is the
+    only one that can ever hit on Windows: ARM_EDK2_CANDIDATES is three POSIX
+    paths, so an arm boot on a Windows host looked for firmware in
+    /usr/share/qemu and exited with "install qemu (brew install qemu)" on a
+    machine whose QEMU ships the file at <qemu dir>\\share\\edk2-aarch64-code.fd.
+    Resolved through qemu_bin() rather than a fixed path so it follows
+    OMNI_QEMU_DIR / config `qemu.dir` like everything else.
+    """
     import glob
+    from omnidroid.config import qemu_bin
     from omnidroid.engine import read_config
     try:
         cfgd = read_config().get("qemu", {}).get("arm_edk2_code")
@@ -322,11 +334,20 @@ def arm_edk2_code():
         cfgd = None
     if cfgd and Path(cfgd).exists():
         return cfgd
+    beside = []
+    try:
+        qdir = Path(qemu_bin("qemu-system-aarch64")).parent
+        beside = [qdir / "share" / ARM_EDK2_NAME,
+                  qdir / "share" / "qemu" / ARM_EDK2_NAME,
+                  qdir.parent / "share" / "qemu" / ARM_EDK2_NAME]
+    except Exception:      # noqa: BLE001 - an unresolvable QEMU is just no hit
+        beside = []
     cellar = sorted(glob.glob(
         "/opt/homebrew/Cellar/qemu/*/share/qemu/edk2-aarch64-code.fd"))
-    for cand in ([cellar[-1]] if cellar else []) + list(ARM_EDK2_CANDIDATES):
+    for cand in beside + ([cellar[-1]] if cellar else []) \
+            + list(ARM_EDK2_CANDIDATES):
         if Path(cand).exists():
-            return cand
+            return str(cand)
     return None
 
 

@@ -112,7 +112,149 @@ GL_GPU_DEVICE = "virtio-gpu-gl-pci"          # needs virglrenderer in QEMU
 # a GL boot came up at 640x480 while the software path gave 1280x800. Naming
 # them puts the preferred mode where the guest will pick it.
 GL_XRES, GL_YRES = 1280, 800
-_GL_DEVICE_ARG = f"{GL_GPU_DEVICE},xres={GL_XRES},yres={GL_YRES}"
+DEFAULT_PANEL = (GL_XRES, GL_YRES)
+# Farming draws a postage stamp (lean.FARMING_DISPLAY is 480x270), so the
+# PANEL is sized down with it. This is not cosmetic: the panel decides how big
+# every buffer in the pipeline is -- the guest's own scanout, SurfaceFlinger's
+# triple buffer, and the host-side framebuffer VNC encodes from. 640x480
+# rather than a literal 480x270 because 640x480 is a mode every guest kernel
+# already has, and `wm size` handles the rest inside Android.
+FARMING_PANEL = (640, 480)
+# Panels a caller may ask for by name, so `--panel 1080p` is a thing.
+PANEL_NAMES = {
+    "480p": (854, 480), "720p": (1280, 720), "800p": (1280, 800),
+    "900p": (1600, 900), "1080p": (1920, 1080), "1440p": (2560, 1440),
+}
+
+
+def parse_panel(text):
+    """(w, h) from "1920x1080" or a name in PANEL_NAMES, else None.
+
+    Never raises: an unparseable value is None, which every caller reads as
+    "use the default" -- a typo in a config file must not fail a boot.
+    """
+    if not text:
+        return None
+    s = str(text).strip().lower()
+    if s in PANEL_NAMES:
+        return PANEL_NAMES[s]
+    for sep in ("x", "*", ":"):
+        if sep in s:
+            a, _, b = s.partition(sep)
+            try:
+                w, h = int(a), int(b)
+            except ValueError:
+                return None
+            # Even widths only: virtio-gpu scanout and every video-ish
+            # consumer downstream assume it, and an odd width shows up as a
+            # one-pixel tear rather than an error.
+            if 320 <= w <= 7680 and 240 <= h <= 4320:
+                return (w - (w % 2), h - (h % 2))
+            return None
+    return None
+
+
+def panel_for(mode=None, cfg=None):
+    """The (w, h) panel this boot hands the guest.
+
+    Order: OMNI_PANEL -> config `qemu.panel` -> the mode's own `panel` ->
+    DEFAULT_PANEL. An explicit request wins over the mode because "run it at
+    1080p" is a statement about the product, not about the mode.
+
+    ⚠ ASKING FOR MORE THAN THE BASE'S NATIVE MODE COSTS AND BUYS NOTHING.
+    MEASURED 2026-08-15 on the x86 base (native 1280x800), `--panel 1080p`:
+    the boot took **3.3+ minutes without reaching adbd** where the same image
+    at 1280x800 took 0.8, QEMU stayed alive with **no scanout errors at all**,
+    and when the guest finally came up **it was still 1280x800** -- `screencap`
+    returned a 1280x800 image. So the guest ignores a mode its panel does not
+    carry, after paying a long stall trying. Smaller-than-native panels are
+    fine and are what farming uses. Raising the ceiling needs a base whose mode
+    list carries the larger mode, not a bigger number here."""
+    for candidate in (os.environ.get("OMNI_PANEL"),
+                      ((cfg or {}).get("qemu") or {}).get("panel")):
+        parsed = parse_panel(candidate)
+        if parsed:
+            return parsed
+    declared = (mode or {}).get("panel")
+    return parse_panel(declared) or tuple(declared or ()) or DEFAULT_PANEL
+
+
+def display_override(cfg=None):
+    """A verbatim `-display` argument from config `qemu.display` / OMNI_DISPLAY.
+
+    An experiment hatch, and it earns its place: the difference between the
+    display backends on this platform is not a matter of degree -- one of them
+    renders and never scans out -- and finding that out costs a real boot each
+    time. Being able to say `OMNI_DISPLAY=dbus,p2p=on,gl=on` and boot is what
+    makes that a four-minute question instead of a code change.
+
+    Whatever is given is passed straight through, so the caller owns its
+    correctness; the capability probe is bypassed entirely.
+    """
+    for candidate in (os.environ.get("OMNI_DISPLAY"),
+                      ((cfg or {}).get("qemu") or {}).get("display")):
+        if candidate:
+            return str(candidate).strip()
+    return ""
+
+
+def gpu_extra_opts(cfg=None):
+    """Extra `-device virtio-gpu-gl-pci` suboptions, from config or env.
+
+    `qemu.gpu_opts` / OMNI_GPU_OPTS, appended verbatim (e.g.
+    "blob=true,hostmem=256M"). It exists because the interesting knobs on this
+    device — blob resources, venus, drm_native_context — are guest-kernel and
+    host-driver dependent in ways no capability probe can answer: they either
+    fix the scanout or break the boot, and which one it is has to be measured
+    per host. A bad value costs one boot and is undone by unsetting it.
+    """
+    for candidate in (os.environ.get("OMNI_GPU_OPTS"),
+                      ((cfg or {}).get("qemu") or {}).get("gpu_opts")):
+        if candidate:
+            return str(candidate).strip().strip(",")
+    return ""
+
+
+def force_video_mode(cfg=None):
+    """Whether to pin the guest's physical mode with a `video=` kernel arg.
+
+    OFF by default, and that is a measurement rather than caution.
+
+    The idea was sound: on a WINDOWED GL boot the guest takes the first mode
+    the virtio GPU offers and comes up 640x480, which Android then papers over
+    with a `wm size` OVERRIDE -- so the compositor renders the full 1280x800
+    and SurfaceFlinger scales it down onto a quarter-size scanout. `video=
+    <connector>:<mode>` is the kernel's own override for exactly that.
+
+    MEASURED 2026-08-15, and it does not pay:
+      * On the headless paths it changed NOTHING. Both `egl-headless` and plain
+        `-display none` already come up at the panel size; a boot with the arg
+        and a boot without it both reported `Physical size: 1280x800`.
+      * On the WINDOWED GL path it HUNG THE GUEST. `-display gtk,gl=on` plus
+        `video=Virtual-1:1280x800` never reached adbd -- five minutes of
+        "starting QEMU", QEMU alive and `running` over QMP, the guest stuck
+        before userspace. The same boot without the arg came up normally and
+        joined the place.
+
+    So it stays available (a future base, or a host where the 640x480 default
+    actually bites) and stays off. Config `qemu.force_video_mode`, env
+    OMNI_FORCE_VIDEO_MODE=1.
+    """
+    env = os.environ.get("OMNI_FORCE_VIDEO_MODE", "").strip()
+    if env:
+        return env not in ("0", "false", "False", "no")
+    value = ((cfg or {}).get("qemu") or {}).get("force_video_mode")
+    return False if value is None else bool(value)
+
+
+def gl_device_arg(panel=None, cfg=None):
+    w, h = panel or DEFAULT_PANEL
+    arg = f"{GL_GPU_DEVICE},xres={w},yres={h}"
+    extra = gpu_extra_opts(cfg)
+    return f"{arg},{extra}" if extra else arg
+
+
+_GL_DEVICE_ARG = gl_device_arg()
 HEADLESS_GPU_ARGS = ["-device", "virtio-gpu-pci"]
 HEADLESS_DISPLAY_ARGS = ["-display", "none"]
 
@@ -131,15 +273,18 @@ HEADLESS_DISPLAY_ARGS = ["-display", "none"]
 #
 # `-display egl-headless` addresses exactly that: it gives QEMU a host GL
 # context with NO window, so virglrenderer can hand the guest's GL calls to the
-# real GPU.
+# real GPU. It is the ONLY tier that satisfies all three product requirements
+# at once — no window on the host, a VNC framebuffer for the viewer, and the
+# guest rendering on the GPU — and it is now the DEFAULT for every mode.
 #
-# IT COSTS THE VIEWER. On this QEMU/ANGLE build the guest renders into a host
-# GL texture that is never read back into the 2D surface the VNC server
-# publishes, so `omnidroid view` shows a BLACK SCREEN while the guest is
-# drawing normally (measured both ways on one host; see _headless_gl_wanted).
-# So it is OFF by default and opt-in via config `qemu.headless_gl` /
-# OMNI_HEADLESS_GL=1 — worth it for a headless farming instance nobody
-# watches, never worth it when someone needs to see the screen.
+# THE VIEWER IS NOT LOST, and the belief that it was is what kept this off for
+# a week. QEMU documents egl-headless as the display you pair WITH vnc/spice,
+# and `ui/egl-headless.c` reads the rendered texture back into the 2D
+# DisplaySurface (egl_fb_read) and then calls dpy_gfx_update — which is exactly
+# what the VNC server encodes from. The black viewer that was measured came
+# from a build of this file in which `-vnc` was still being appended next to a
+# WINDOWED gl display; see blocks_vnc(), which is now the only thing allowed to
+# drop it.
 #
 # Gated on the QEMU build advertising BOTH pieces, because neither is
 # universal: the Windows bundle has them, and a Homebrew macOS QEMU has
@@ -225,7 +370,8 @@ def _qemu_help_texts(tool):
     return answer
 
 
-def default_display(qemu_display_help="", qemu_device_help="", has_gui=True):
+def default_display(qemu_display_help="", qemu_device_help="", has_gui=True,
+                    panel=None, cfg=None):
     """What kind of window this host can open, as a capability descriptor.
 
     Pure: every host fact is an argument, so the whole matrix is unit-testable
@@ -253,7 +399,7 @@ def default_display(qemu_display_help="", qemu_device_help="", has_gui=True):
     if GL_GPU_DEVICE in qemu_device_help:
         gl = _GL_OPTION[_platform_key()]        # gl=es on macOS — see _GL_OPTION
         return {"available": True, "tier": "gl",
-                "gpu_args": ["-device", _GL_DEVICE_ARG],
+                "gpu_args": ["-device", gl_device_arg(panel, cfg)],
                 "display_args": ["-display", f"{backend},{gl}"],
                 "reason": f"{backend},{gl} + {GL_GPU_DEVICE} (3D accelerated)"}
     return {"available": True, "tier": "window",
@@ -335,6 +481,52 @@ def check_accel():
               "to the kvm group: sudo usermod -aG kvm $USER (re-login).")
 
 
+# ------------------------------------------------------------- the GPU policy
+#
+# One setting, three answers, because the honest answer differs by host and the
+# user is the only one who can make the trade when it does.
+#
+#   auto      (default) get the guest onto the GPU by whatever means this host
+#             supports, PREFERRING no window. On a host whose egl-headless can
+#             present that is headless + VNC + GPU, all three at once. On one
+#             whose cannot -- Windows today -- the only GL context QEMU will
+#             give is attached to a native window, so `auto` opens one, and
+#             says so.
+#   headless  never put a window on the screen, whatever it costs. GPU if it
+#             can be had without one, software otherwise. This is the setting
+#             for an unattended host, and the one to pick if a QEMU window on
+#             screen is unacceptable.
+#   window    always ask for the native window (the lowest-latency way to drive
+#             a guest by hand; also the only configuration where a GL problem
+#             is visible without any of this code in the path).
+#   off       software rendering, headless. The old behaviour, kept because it
+#             is the one configuration with no host-GPU dependency at all.
+#
+# WHY THE WINDOW AND VNC CANNOT BOTH BE HAD: QEMU refuses them together --
+#
+#     qemu: -vnc 127.0.0.1:12101: Display vnc is incompatible with the GL context
+#
+# -- for every windowed GL backend (re-verified on 11.0.50 across gtk/sdl x
+# gl=on/es/core). So on a host where the window is the only GL context, a
+# GPU-accelerated boot has no VNC server, and `omnidroid view` / capture /
+# autocap do not work on it. `omnidroid screenshot` still does: it goes through
+# adb, not VNC.
+#
+# The numbers behind making `auto` prefer the GPU over the viewer, measured at
+# 1280x800 on PS99 with the render confirmed by screenshot at the same instant:
+#
+#     software (llvmpipe)       95 frames / 30.1 s  ->  3.2 fps
+#     GPU (virgl, RTX 4060)    728 frames / 30.1 s  -> 24.2 fps
+#     GPU (virgl, RTX 4060)   1346 frames / 30.1 s  -> 44.8 fps
+#
+# Two separate in-world runs for the GPU row, and the spread is real: PS99 is a
+# busy server-authoritative place, so how much is streaming in at the moment of
+# the sample moves the number a long way. What does not move is the ratio to
+# the software row -- 7x at the low end.
+GPU_AUTO, GPU_HEADLESS, GPU_WINDOW, GPU_OFF = "auto", "headless", "window", "off"
+GPU_POLICIES = (GPU_AUTO, GPU_HEADLESS, GPU_WINDOW, GPU_OFF)
+
+
 # Per-instance performance modes. Counts are NEVER capped — these tune the
 # per-instance footprint; the host's free RAM decides how many run.
 # ALL instances are HEADLESS (-display none), always: no host window
@@ -361,21 +553,19 @@ def check_accel():
 # So: `mem` = enough to boot and run comfortably, `balloon` = the number you
 # actually care about.
 MODES = {
-    # gaming: the OTHER use case, and the only mode that asks for a host
-    # window. Everything above is a RAM/CPU tier on the same headless boot;
-    # this one optimises for frames and input latency instead, and expects
-    # one or two instances rather than fifty.
+    # gaming: spend the whole host on ONE instance. Frames, resolution and
+    # input latency are what matter; density and host footprint are not.
     #
-    # Why a new mode rather than teaching `playable` to do it: `playable` is
-    # DEFAULT_MODE, so every bare `omnidroid start` resolves to it. Opening a
-    # window there would put a QEMU window on every existing start, including
-    # the ones running under automation with nobody at the screen. Additive
-    # beats surprising.
-    #
-    # `window: True` is a REQUEST, never a promise — default_display decides
-    # what the host can actually provide and gpu_display_args degrades to the
-    # headless pair when the answer is "nothing". A gaming boot on a machine
-    # with no window server is a normal headless boot, not an error.
+    # It is HEADLESS, like everything else, and that is the change this table
+    # exists to record. `gaming` used to be the one mode that asked for a
+    # native QEMU window, because a window was the only way QEMU would hand
+    # itself a GL context -- and without a GL context virglrenderer cannot run
+    # and Mesa falls back to llvmpipe, which is the "3 fps, unplayable" this
+    # project spent a week on. `-display egl-headless` gives the same GL
+    # context with NO window (see the headless-GL block above), so the window
+    # bought nothing that could not be had without it, and it cost the VNC
+    # viewer -- QEMU refuses `-vnc` alongside a WINDOWED gl display, so every
+    # GPU boot came up with no framebuffer for anyone to look at.
     #
     # No balloon: reclaiming pages out from under a running game is a stutter
     # source, and this mode is not trying to fit fifty instances in a host.
@@ -383,60 +573,28 @@ MODES = {
     # which costs nothing while nobody inflates it.
     #
     # `profile` is the POST-BOOT intent, and it is what the engine branches on
-    # instead of the mode name. Two values:
+    # instead of the mode name. Two values, one per mode now:
     #   "performance"  spend host resources on one instance: no balloon, no
     #                  squeeze, native resolution, the game on the top-app
-    #                  cpuset, the quality ClientAppSettings profile. Used by
-    #                  gaming/playable/hard/brutal.
+    #                  cpuset, the quality ClientAppSettings profile.
     #   "density"      spend quality on instance COUNT: squeeze, zram, balloon,
-    #                  5 fps tick, 480x270. Used by farming.
-    # Branching on the name was a real bug: `_ensure_booted` compared the RAW
-    # --mode argument, so a bare `omnidroid start` (which resolves to
-    # `playable`) matched neither "gaming" nor "farming" and got NO post-boot
-    # tuning at all — the default mode was the only untuned one.
+    #                  5 fps tick, 480x270.
+    # Branching on the name was a real bug once: `_ensure_booted` compared the
+    # RAW --mode argument, so a bare `omnidroid start` matched neither literal
+    # and got NO post-boot tuning at all. The profile key survives the mode
+    # cull because it is the thing the engine actually reads.
     #
-    # `autoscale` says this mode should GROW to the host. playable and gaming
-    # are "give this instance the machine"; hard/brutal are explicit "give it
-    # less" requests and must stay the fixed tiers they advertise.
-    "gaming":   {"mem": 4096, "smp": 4, "balloon": None, "usb": True,
-                 "display": lean.NATIVE_DISPLAY, "window": True,
-                 "profile": "performance", "autoscale": True,
-                 "quality": "high"},
-    # playable ALSO asks for a window now, and that is the single biggest
-    # performance change this file has ever carried. MEASURED 2026-08-15 on the
-    # Windows host (i7-13700F + RTX 4060), one account, one place, 1280x800,
-    # frame counts off `dumpsys SurfaceFlinger --timestats` with the render
-    # confirmed by screenshot at the moment of measurement:
+    # `autoscale` says this mode should GROW to the host, up to the WHPX caps
+    # in autoscale_perf().
     #
-    #     playable, as it was   GLES: Mesa, llvmpipe        95 frames / 30.1 s
-    #                                                       ->  3.2 fps
-    #     playable, with this   GLES: Mesa, virgl (RTX 4060) 496 frames / 30.0 s
-    #                                                       -> 16.5 fps
-    #
-    # 5.2x, and the low number is exactly the "3 fps, unplayable" a user
-    # reported. Without a window there is no host GL context, so virglrenderer
-    # cannot run and Mesa falls back to llvmpipe: every pixel of a 3D game was
-    # being drawn on the CPU that is already paying arm64 translation, on a
-    # machine with an idle discrete GPU. The window is also what removes the
-    # input path's latency — host events go straight into usb-tablet/usb-kbd
-    # instead of round-tripping through VNC encode/decode plus synthesised
-    # input.
-    #
-    # Why this is not the same surprise the comment above warned about: the
-    # window is a REQUEST that `resolve_gpu_display` still adjudicates, and it
-    # is now suppressible outright by `--no-window` / OMNI_NO_WINDOW=1 (see
-    # window_suppressed), which is what every automated caller passes. A boot
-    # on a host with no window server is still a normal headless boot.
-    "playable": {"mem": 4096, "smp": 4, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY, "window": True,
-                 "profile": "performance", "autoscale": True,
-                 "quality": "high"},
-    "hard":     {"mem": 3072, "smp": 4, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY,
-                 "profile": "performance", "quality": "balanced"},
-    "brutal":   {"mem": 2048, "smp": 2, "balloon": None,
-                 "usb": True, "display": lean.NATIVE_DISPLAY,
-                 "profile": "performance", "quality": "balanced"},
+    # `panel` is the physical guest display this boot asks for. It is a mode
+    # default, not a fixed constant: `--panel 1080p` / OMNI_PANEL / config
+    # `qemu.panel` all override it (see panel_for).
+    "gaming":  {"mem": 4096, "smp": 4, "balloon": None, "usb": True,
+                "display": lean.NATIVE_DISPLAY, "panel": DEFAULT_PANEL,
+                "gpu": GPU_AUTO,
+                "profile": "performance", "autoscale": True,
+                "quality": "high"},
     # farming: headless, joined-idle, squeezed as small as stable. smp 1
     # because 50+ instances means 50+ vCPU threads, and a joined-idle game
     # loop does not need a second core. `balloon` is the post-boot reclaim
@@ -456,14 +614,6 @@ MODES = {
     # it saves, and measurement put the real wins in the balloon and the
     # package trim, not here. Keep the hands on the machine.
     #
-    # balloon=1536 is MEASURED, not chosen (2026-08-05, arm64 base + the
-    # squeeze below). At 1024 the guest boots and looks healthy, and then
-    # Roblox dies the moment it finishes loading: "Process com.roblox.client
-    # has died: fg TOP" with "Rescheduling restart ... for mem-pressure-event"
-    # in logcat. At 1536 the same instance holds the game at 614 MB resident
-    # with 336 MB still available and no kills. The floor is set by the game
-    # (~614 MB) plus a squeezed Android (~690 MB), and no amount of host-side
-    # tuning moves it — only shrinking the guest workload does.
     # Two balloon targets, because the safe floor depends on whether the
     # guest has zram. MEASURED 2026-08-05 (arm64, real Roblox APK):
     #   no zram   -> 1024 kills the game ("has died: fg TOP" +
@@ -473,29 +623,105 @@ MODES = {
     #                floor was then walked down on a real PRODUCTION instance
     #                (non-rooted, zram from the baked property, game running):
     #                  896 -> alive, ~200 MB RSS, ~590 MB swapped, 0 kills,
-    #                         85-131 MB available, sustained 3+ min  <- default
+    #                         85-131 MB available, sustained 3+ min
     #                  768 -> alive, 0 kills, but only 34 MB available
     #                  640 -> the game DIES (2 mem-pressure kills)
-    # 896 rather than 768: "only the instances must be on" is the stated
-    # requirement, and 34 MB of headroom is not a margin, it is luck. 896 held
-    # with zero kills and real headroom, and is 12.5% denser than the 1024
-    # this started at. Anyone who wants 768 can now ask for it — `--balloon`
-    # is honoured exactly (see resolve_mode; it used to be overridden here).
-    # Every number was measured against the game on its login screen, so a
-    # joined instance has less headroom than these suggest.
+    # Every number there was taken against the game on its LOGIN screen, which
+    # is why they did not survive contact with a real place: see FARMING_*
+    # below and FOOTPRINT.md for the PS99 re-measurement.
     #
-    # The no-zram 1536 is likewise deliberately NOT lowered to 1280, even
-    # though 1280 was measured to hold after the 34-package trim landed
-    # (game alive at ~517 MB, zero kills, stable). It leaves only 117 MB
-    # available against 336 MB at 1536, and the stated requirement is "the
-    # instances must be on" — an OOM-killed game is an instance that is off,
-    # which costs more than the density gains. Anyone who wants that trade
-    # can take it explicitly with `--balloon 1280`.
-    "farming":  {"mem": 2048, "smp": 1, "balloon": 1536, "balloon_zram": 896,
-                 "usb": True, "display": lean.FARMING_DISPLAY,
-                 "profile": "density", "quality": "low"},
+    # `smp_x86` is an ARCH OVERRIDE, not a preference. smp 1 is right on arm,
+    # where the guest runs Roblox's own arm64 build natively. On the x86 base
+    # every instruction of that same build goes through libndk_translation, and
+    # one vCPU is not enough to get through startup: MEASURED 2026-08-15 on
+    # PS99, a farming boot reached boot_completed fine and then the ordered
+    # `am broadcast` that hands over the session did not return within 45 s,
+    # taking the whole launch down with it. Two vCPUs is the cheapest thing
+    # that makes an x86 farming instance actually reach the game, and a joined
+    # idle instance goes back to using almost none of the second one.
+    #
+    # `swappiness_x86` is the second arch override, and like the first it is a
+    # REQUIREMENT rather than a preference.
+    #
+    # MEASURED 2026-08-15: a farming instance on the x86 base joins PS99 and
+    # then Roblox ABORTS, with plenty of memory free and no OOM kill:
+    #
+    #   F libc  : Fatal signal 6 (SIGABRT) ... pid (Main), tid (Thread-19)
+    #   F DEBUG : Abort message: 'Cannot process signal 11'
+    #   F DEBUG : #04 libndk_translation.so (HandleHostSignal(int, siginfo*, ...))
+    #
+    # That is the TRANSLATOR aborting: Roblox ships arm64 only, the x86 base
+    # runs it through libndk_translation, translated code took a SIGSEGV, and
+    # the translator's host-signal handler could not process a fault arriving
+    # in translated context. Farming is the only mode that swaps hard --
+    # `swappiness 100`, `page-cluster 0`, zram on -- and evicting translated
+    # code pages is exactly how you manufacture that fault. Gaming, which runs
+    # at swappiness 10 with no zram, has never crashed this way.
+    #
+    # SWAPPINESS ALONE IS THE FIX, and turning zram off as well was measured
+    # to be actively worse. Two runs, everything else identical:
+    #
+    #   swappiness 10, zram ON    aborts 0, guest 830 MB / 315 MB free,
+    #                             client reached Roblox's loading screen
+    #   swappiness 10, zram OFF   aborts 0, guest 1485 MB / 648 MB free, and
+    #                             Roblox was OOM-KILLED over and over
+    #                             ("has died: fg TOP" x3 + "mem-pressure-event")
+    #
+    # zram is not what breaks the translator -- swapping HARD is. With lz4
+    # compressing ~3x, zram is also the only reason a 2 GB guest holds this
+    # game at all, so removing it traded a crash for a different crash. Keep
+    # it; just stop being eager about using it.
+    #
+    # The arm base runs Roblox NATIVELY, has no translator to upset, and keeps
+    # the aggressive setting.
+    "farming": {"mem": 2048, "smp": 1, "smp_x86": 2,
+                "balloon": 1536, "balloon_zram": 896,
+                "swappiness": 100, "swappiness_x86": 10,
+                "zram": True,
+                "usb": True, "display": lean.FARMING_DISPLAY,
+                "panel": FARMING_PANEL, "gpu": GPU_HEADLESS,
+                "profile": "density", "quality": "low"},
 }
-DEFAULT_MODE = "playable"
+DEFAULT_MODE = "gaming"
+
+# The mode list used to have five entries: playable (the default), gaming,
+# hard, brutal and farming. Three of them are gone, and nothing was lost with
+# them:
+#
+#   playable  was gaming with `window: False`. Once gaming stopped opening a
+#             window there was no difference left to name.
+#   hard      3072 MB / 4 vCPU, and
+#   brutal    2048 MB / 2 vCPU — two fixed "give this instance less" tiers
+#             that predate `--mem` / `--smp` being honoured properly. They are
+#             `--mem 3072` and `--mem 2048 --smp 2`, which is the same request
+#             said in the flag that already exists.
+#
+# They stay ACCEPTED as aliases rather than becoming argparse errors, because
+# an installed app is a client of this CLI: omni-executor persists the chosen
+# mode in its settings and 1.0.14 ships `"mode": "playable"` as its default, so
+# rejecting the name would break every launch from an app that has not been
+# updated yet. An alias resolves silently; nothing downstream ever sees the old
+# name (`mode["name"]` is the resolved one), so run.json, the warm-cache key
+# and the UI all agree on the two real modes.
+MODE_ALIASES = {"playable": "gaming", "hard": "gaming", "brutal": "gaming"}
+
+
+def resolve_mode_name(name):
+    """The canonical mode name for whatever a caller typed.
+
+    None/empty -> DEFAULT_MODE; a legacy name -> its replacement; anything
+    else comes back unchanged so the caller can report an honest "unknown
+    mode" against the real list."""
+    if not name:
+        return DEFAULT_MODE
+    key = str(name).strip().lower()
+    return MODE_ALIASES.get(key, key)
+
+
+# Every name `--mode` will accept: the real modes first, then the aliases.
+# Kept in this order so `--help` shows the two that exist before the three
+# that are only tolerated.
+MODE_CHOICES = list(MODES) + list(MODE_ALIASES)
 
 
 # ------------------------------------------------------- performance sizing
@@ -617,23 +843,82 @@ def host_capacity():
     return mem, cpus
 
 
+def parse_guest_display(text):
+    """(w, h, dpi) from "480x270", "480x270x80" or "native"/"off" -> None.
+
+    The GUEST display is not the same thing as the PANEL: the panel is the
+    virtio-gpu device's mode (what the hardware advertises), this is what
+    Android is told to lay out at with `wm size`/`wm density`. Farming shrinks
+    the second one hard -- 480x270 at 80 dpi -- because it is the single
+    cheapest way to make the whole compositing pipeline small.
+
+    Exposed so that "is the postage-stamp display what stops Roblox loading?"
+    is a question you can answer with a flag instead of an edit. Returns
+    ("native",) sentinel handling to the caller: None means leave it alone.
+    """
+    if text is None:
+        return "unset"
+    s = str(text).strip().lower()
+    if s in ("native", "off", "none", "reset"):
+        return None
+    parts = s.replace("*", "x").split("x")
+    try:
+        if len(parts) == 2:
+            return (int(parts[0]), int(parts[1]), 80)
+        if len(parts) == 3:
+            return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        pass
+    return "unset"
+
+
 def resolve_mode(cfg, name=None, mem=None, balloon=None, smp=None,
-                 host=None):
+                 host=None, arch=None, guest_display="unset"):
     """The resolved mode dict for one boot.
 
     Order is load-bearing: AUTOSCALE FIRST, explicit flags second, so an
     explicit `--mem`/`--smp` always wins outright over the host-derived size.
-    `host` is an injectable (mem_mb, cpus) pair for tests; None probes."""
-    m = dict(MODES[name or DEFAULT_MODE])
-    m["name"] = name or DEFAULT_MODE
+    `host` is an injectable (mem_mb, cpus) pair for tests; None probes.
+
+    A legacy mode name (playable/hard/brutal) resolves to its replacement HERE,
+    once, so everything downstream — run.json, the warm-cache key, the tuning
+    branch, the UI — sees the canonical name and cannot disagree about which
+    mode this boot is.
+
+    `arch` ("x86" | "arm") lets a mode declare a per-architecture override.
+    Only farming uses one, and it is not a preference: see `smp_x86`."""
+    resolved = resolve_mode_name(name)
+    if resolved not in MODES:
+        raise KeyError(f"unknown mode {name!r}; known modes: "
+                       f"{', '.join(MODES)}")
+    if name and resolved != str(name).strip().lower():
+        print(f"[mode] '{name}' is a retired mode name; running "
+              f"'{resolved}'. Known modes: {', '.join(MODES)}")
+    m = dict(MODES[resolved])
+    m["name"] = resolved
+    # Per-arch overrides, applied BEFORE autoscale and before the explicit
+    # flags, so both still win over them in the usual order. ANY key can carry
+    # one as `<key>_<arch>`; the arch-suffixed keys are then stripped so
+    # nothing downstream has to know the mechanism exists.
+    if arch:
+        for key in [k for k in list(m) if k.endswith(f"_{arch}")]:
+            m[key[: -len(arch) - 1]] = m[key]
+        for junk in [k for k in list(m)
+                     if k.rsplit("_", 1)[-1] in ("x86", "arm")]:
+            m.pop(junk, None)
     if m.get("autoscale"):
         host_mem, host_cpus = host if host is not None else host_capacity()
         m = autoscale_perf(m, host_mem, host_cpus)
-        m["name"] = name or DEFAULT_MODE
+        m["name"] = resolved
     if smp:
         m["smp"] = smp
     if mem:
         m["mem"] = mem
+    if guest_display != "unset":
+        # None is a MEANINGFUL value here ("leave the base's own resolution
+        # alone"), which is why the no-op sentinel is the string rather than
+        # None -- the same trap `--balloon 0` documents below.
+        m["display"] = guest_display
     if balloon is not None:
         # 0 disables the post-boot reclaim without having to special-case
         # None at the call site (argparse cannot express "absent vs zero").
@@ -646,24 +931,32 @@ def resolve_mode(cfg, name=None, mem=None, balloon=None, smp=None,
         # accepted by argparse and then overridden downstream is worse than
         # one that was never offered.
         m.pop("balloon_zram", None)
+        # ...and the same rule against the HOST-capability skip:
+        # apply_balloon_target declines to inflate on a host that cannot take
+        # the pages back (Windows), which is right for a mode's own default
+        # and wrong for something a human typed. Recorded here because that is
+        # where "the user asked for this" is still known.
+        m["balloon_explicit"] = True
     return m
 
 
-def headless_gl_capability(qemu_display_help="", qemu_device_help=""):
+def headless_gl_capability(qemu_display_help="", qemu_device_help="",
+                           panel=None, cfg=None):
     """Can this QEMU render a HEADLESS guest on the host GPU?
 
-    Pure, like default_display: both host facts are arguments. Needs the
-    virgl-backed GPU model AND the windowless GL display backend — either one
+    Pure, like default_display: every host fact is an argument. Needs the
+    virgl-backed GPU model AND the windowless GL display backend -- either one
     alone is useless.
     """
     has_gpu = GL_GPU_DEVICE in qemu_device_help
     has_display = HEADLESS_GL_DISPLAY in qemu_display_help
     if has_gpu and has_display:
+        w, h = panel or DEFAULT_PANEL
         return {"available": True,
-                "gpu_args": list(HEADLESS_GL_GPU_ARGS),
+                "gpu_args": ["-device", gl_device_arg((w, h), cfg)],
                 "display_args": list(HEADLESS_GL_DISPLAY_ARGS),
                 "reason": f"{HEADLESS_GL_DISPLAY} + {GL_GPU_DEVICE} "
-                          f"(host GPU, no window)"}
+                          f"at {w}x{h} (host GPU, no window)"}
     missing = []
     if not has_gpu:
         missing.append(GL_GPU_DEVICE)
@@ -671,81 +964,181 @@ def headless_gl_capability(qemu_display_help="", qemu_device_help=""):
         missing.append(f"-display {HEADLESS_GL_DISPLAY}")
     return {"available": False, "gpu_args": [], "display_args": [],
             "reason": f"this QEMU build has no {' and no '.join(missing)} "
-                      f"(built without virglrenderer/OpenGL) — rendering "
+                      f"(built without virglrenderer/OpenGL) -- rendering "
                       f"stays on the CPU"}
 
 
+# Can `-display egl-headless` on THIS PLATFORM actually put the guest's
+# scanout on screen? Not "does QEMU accept the flag" -- it accepts it
+# everywhere -- but "does a frame ever come out".
+#
+# MEASURED 2026-08-15, QEMU 11.0.50 on Windows 11 / RTX 4060, x86 Bliss guest,
+# three separate boots (plain, blob=true+hostmem=512M, and with the forced
+# `video=` mode removed). Every one of them:
+#
+#     dmesg:  [drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1203
+#                                                        (command 0x103)
+#     dumpsys SurfaceFlinger --timestats:   totalFrames = 0
+#     adb exec-out screencap:               solid black
+#     VNC framebuffer:                      1 update, mean brightness 0.0
+#
+# 0x103 is VIRTIO_GPU_CMD_SET_SCANOUT and 0x1203 is
+# VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID: QEMU is refusing to scan out the
+# buffer the guest hands it. The guest's GL itself came up fine -- SurfaceFlinger
+# reported `GLES: Mesa, virgl (ANGLE (NVIDIA ... RTX 4060)), OpenGL ES 2.0` and
+# logcat had no GL errors at all -- so this is a PRESENTATION failure, not a
+# rendering one. The likely cause is that egl-headless advertises dmabuf
+# support, the guest allocates its scanout accordingly, and Windows has no
+# dmabuf for QEMU to import; but the cause matters less than the measurement.
+#
+# So on Windows, headless GL renders into a hole. The honest options there are
+# a native window (GPU, no VNC -- QEMU refuses the pair) or headless VNC on
+# llvmpipe. Linux is the platform egl-headless was written for and where it
+# pairs with VNC as documented; macOS is unknown and is marked False rather
+# than assumed, since a wrong True costs a black screen and a wrong False
+# costs nothing but a config flag.
+#
+# Override with config `qemu.headless_gl` / OMNI_HEADLESS_GL=1 -- re-measure
+# with `dumpsys SurfaceFlinger --timestats -dump | grep totalFrames` before
+# believing any change here.
+HEADLESS_GL_PRESENTS = {"windows": False, "linux": True, "macos": False}
+
+
+def headless_gl_presents():
+    """Whether this platform's egl-headless is known to actually present."""
+    return HEADLESS_GL_PRESENTS.get(_platform_key(), False)
+
+
 def _headless_gl_wanted(cfg):
-    """Config `qemu.headless_gl` (default OFF), overridable by OMNI_HEADLESS_GL.
+    """Config `qemu.headless_gl`, overridable by OMNI_HEADLESS_GL.
 
-    DEFAULT OFF, and that is a measurement, not caution.
+    The DEFAULT is per-platform (see HEADLESS_GL_PRESENTS), not a constant,
+    because the answer genuinely differs: on Linux this is the whole point of
+    the display backend, and on Windows it produces a guest that renders
+    perfectly and shows nothing.
 
-    `egl-headless` renders the guest into a host GL texture. This QEMU/ANGLE
-    build never reads that texture back into the 2D surface the VNC server
-    publishes, so the viewer — the product's only window into an instance —
-    goes ALL BLACK while the guest is drawing perfectly well. Measured on the
-    same host, same image, same account, only this flag differing:
-
-        headless_gl on   VNC framebuffer all channels (0,0)     [black]
-        headless_gl off  VNC framebuffer all channels (0,255)   [content]
-
-    and QEMU's own `screendump` had content in both cases, which is what pins
-    it on the GL->VNC path rather than on the guest.
-
-    Rendering the guest on the GPU is still a real win for a headless farming
-    instance nobody watches, so the capability stays and this switch turns it
-    on. It must not be the default while the viewer matters.
-
-    (An earlier version of this comment claimed the framebuffer "still goes out
-    over VNC unchanged". It does not. That was never tested: every screenshot
-    taken while developing it came from `adb exec-out screencap`, which reads
-    Android's compositor and would look identical either way.)
+    An explicit setting always wins, in either direction. Forcing it ON on
+    Windows is a supported thing to do -- it is how the measurement above gets
+    re-taken on a newer QEMU -- and it is why this stayed a flag rather than
+    becoming a hardcoded platform branch.
     """
     env = os.environ.get("OMNI_HEADLESS_GL", "").strip()
     if env:
         return env not in ("0", "false", "False", "no")
     value = ((cfg or {}).get("qemu") or {}).get("headless_gl")
-    return False if value is None else bool(value)
+    return headless_gl_presents() if value is None else bool(value)
+
+
+
+
+def gpu_policy(cfg=None, mode=None):
+    """This boot's GPU policy: env OMNI_GPU -> config `qemu.gpu` -> the mode's
+    own -> auto.
+
+    The MODE gets a say because the two modes want opposite things from the
+    same trade. `gaming` is one instance somebody is playing, so it takes the
+    GPU even where that costs a window. `farming` is fifty instances nobody is
+    watching: its tick is capped at 5 fps and its render quality is the floor,
+    so the GPU buys it almost nothing -- and fifty QEMU windows is not a
+    product. Farming therefore defaults to `headless`, which is exactly what it
+    has always done, and still picks up windowless GPU rendering for free on a
+    host that can present it.
+
+    An unrecognised value falls back rather than failing a boot; the caller
+    (cmd_start) validates an explicitly-typed one up front, where a typo can
+    still be reported.
+    """
+    for candidate in (os.environ.get("OMNI_GPU"),
+                      ((cfg or {}).get("qemu") or {}).get("gpu"),
+                      (mode or {}).get("gpu")):
+        value = str(candidate or "").strip().lower()
+        if value in GPU_POLICIES:
+            return value
+    # OMNI_GL_WINDOW predates this setting and is kept as an alias, so the B2
+    # runbook one-liner still means something.
+    if _gl_window_requested():
+        return GPU_WINDOW
+    return GPU_AUTO
 
 
 def resolve_gpu_display(mode, interactive, tool, cfg=None):
     """The (gpu_args, display_args) pair for one boot, host-checked.
 
-    A window is wanted when the mode asks for one (`gaming`) or OMNI_GL_WINDOW
-    is set — never on an interactive builder boot, which already redirects the
-    console to a serial log and runs unattended.
+    Pure policy on top of two capability probes; never raises, and every path
+    degrades to the byte-for-byte headless software pair rather than to an
+    argv QEMU would refuse. A detection bug can cost the GPU; it cannot cost a
+    boot.
 
-    Without a window we no longer fall straight to software: a host whose QEMU
-    can do `egl-headless` renders on the real GPU anyway. An interactive
-    builder boot deliberately stays on the plain virtio path — it exists to
-    mutate an image, not to draw, and it must work identically on every host.
+    An interactive builder boot ignores the policy entirely: it exists to
+    mutate an image, not to draw, and it must behave identically on every host.
     """
-    want_window = (bool(mode.get("window")) or _gl_window_requested()) and not interactive
-    if want_window and window_suppressed(cfg):
-        # An explicit "nothing on screen" beats the mode's request. Said out
-        # loud because it costs the GPU: without a window there is no host GL
-        # context, so the guest renders on llvmpipe (measured at 3.2 fps
-        # against 16.5 with the window — see MODES["playable"]).
-        print("[gpu] --no-window: booting headless, so the guest renders in "
-              "SOFTWARE. Drop --no-window for GPU acceleration.")
-        return _headless_pair(interactive, tool, cfg)
-    if want_window:
-        cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui())
-        if not cap.get("available"):
-            print(f"[gpu] no host window available ({cap.get('reason')}); "
-                  f"booting headless — attach with `omnidroid view <name>`")
-            return _headless_pair(interactive, tool, cfg)
-        return gpu_display_args(True, cap)
-    return _headless_pair(interactive, tool, cfg)
-
-
-def _headless_pair(interactive, tool, cfg):
-    if interactive or not _headless_gl_wanted(cfg):
+    if interactive:
         return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
-    cap = headless_gl_capability(*_qemu_help_texts(tool))
+
+    override = display_override(cfg)
+    if override:
+        # The GPU device follows the display: a `gl=`/egl/dbus-gl display with
+        # the plain virtio-gpu behind it is a boot with no acceleration at all,
+        # which is never what someone typing this is testing for.
+        wants_gl = uses_gl_context(["-display", override]) or "gl=" in override
+        gpu = (["-device", gl_device_arg(panel_for(mode, cfg), cfg)]
+               if wants_gl else list(HEADLESS_GPU_ARGS))
+        print(f"[gpu] OMNI_DISPLAY override: -display {override} "
+              f"({'GL' if wants_gl else 'no GL'})")
+        return gpu, ["-display", override]
+
+    policy = gpu_policy(cfg, mode)
+    # --no-window / OMNI_NO_WINDOW / config qemu.no_window is absolute: it
+    # means "nothing on my screen", so it can only ever narrow the policy.
+    if window_suppressed(cfg) and policy in (GPU_AUTO, GPU_WINDOW):
+        if policy == GPU_WINDOW:
+            print("[gpu] --no-window overrides the `window` GPU policy.")
+        policy = GPU_HEADLESS
+
+    if policy == GPU_OFF:
+        return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
+
+    if policy in (GPU_AUTO, GPU_HEADLESS):
+        pair = _headless_gl_pair(tool, cfg, mode)
+        if pair is not None:
+            return pair
+        if policy == GPU_HEADLESS:
+            print("[gpu] headless: this host cannot render a windowless guest "
+                  "on the GPU, so it renders in SOFTWARE. The VNC viewer "
+                  "works. Use --gpu window for the GPU (it costs the viewer "
+                  "-- QEMU refuses -vnc beside a GL window).")
+            return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
+
+    # auto with no headless GL, or an explicit window request.
+    cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui(),
+                          panel=panel_for(mode, cfg), cfg=cfg)
     if not cap.get("available"):
+        print(f"[gpu] no host window available ({cap.get('reason')}); "
+              f"booting headless in software")
         return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
-    print(f"[gpu] headless GPU acceleration: {cap['reason']}")
+    if cap.get("tier") == "gl":
+        print(f"[gpu] {cap['reason']}. This host can only take a GL context "
+              f"through a window, so QEMU serves no VNC on this boot — the "
+              f"window is hidden and `omnidroid view` HOSTS it inside our own "
+              f"viewer instead (GPU-rendered, native input, no copy). "
+              f"`screenshot` works either way; capture/autocap do not. "
+              f"--gpu headless keeps VNC and gives up the GPU.")
+    else:
+        print(f"[gpu] {cap['reason']}")
+    return gpu_display_args(True, cap)
+
+
+def _headless_gl_pair(tool, cfg, mode):
+    """The windowless GPU pair, or None when this host cannot present one."""
+    if not _headless_gl_wanted(cfg):
+        return None
+    cap = headless_gl_capability(*_qemu_help_texts(tool),
+                                 panel=panel_for(mode, cfg), cfg=cfg)
+    if not cap.get("available"):
+        print(f"[gpu] no headless GPU acceleration: {cap['reason']}")
+        return None
+    print(f"[gpu] headless GPU acceleration: {cap['reason']} — VNC viewer "
+          f"stays available")
     return list(cap["gpu_args"]), list(cap["display_args"])
 
 
@@ -780,6 +1173,37 @@ def balloon_device(mode):
     if IS_WINDOWS:
         return ["-device", "virtio-balloon-pci,id=omniball"]
     return ["-device", "virtio-balloon-pci,free-page-reporting=on,id=omniball"]
+
+
+# ---------------------------------------------------------------- guest MTU
+
+def nic_mtu_suffix(cfg=None, label=None):
+    """`,host_mtu=N` for the guest NIC when this host's egress is smaller than
+    a standard Ethernet frame, else "".
+
+    virtio has a feature bit for exactly this (`VIRTIO_NET_F_MTU`), so the
+    guest kernel brings `eth0` up at N by itself -- nothing has to run inside
+    the guest, and it is right from the first packet rather than after a
+    post-boot fix-up.
+
+    WHY IT MATTERS HERE: QEMU's user networking gives the guest 1500 and then
+    sends its packets out through the HOST's stack. Behind a VPN that stack is
+    smaller. TCP survives (MSS negotiation); **UDP does not**, and Roblox's
+    gameplay traffic is UDP. MEASURED 2026-08-15 on this host: ProtonVPN's IP
+    interface is 1420, the guest was at 1500, and PS99 connected to a real
+    game server ("Connection accepted from 128.116.13.34") and then dropped
+    with "Disconnected (Error Code: 277)" every time the world started
+    streaming. See omnidroid/netmtu.py.
+    """
+    from omnidroid import netmtu
+    mtu, why = netmtu.guest_mtu(cfg)
+    if mtu >= netmtu.DEFAULT_MTU:
+        return ""
+    if label:
+        print(f"[{label}] guest MTU {mtu} (from {why}) — this host's path to "
+              f"the internet cannot carry a full 1500-byte frame, and UDP "
+              f"has no way to find that out for itself")
+    return f",host_mtu={mtu}"
 
 
 def smp_arg(smp):
@@ -959,7 +1383,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         *usb_devices(mode, arm=True),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
-        "-device", "virtio-net-pci,netdev=net0",
+        "-device", "virtio-net-pci,netdev=net0" + nic_mtu_suffix(cfg),
         # virtio-rng stays: without it the guest's early entropy pool fills
         # from nothing and boot stalls. virtio-serial was dropped — no guest
         # or host component has ever opened a port on it.
@@ -1092,17 +1516,37 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         # device during provisioning/builder sessions).
         append += " console=tty0 console=ttyS0,115200"
         gpu = ["-device", "virtio-vga"]
-        nic = "virtio-net-pci,netdev=net0"
+        nic = "virtio-net-pci,netdev=net0" + nic_mtu_suffix(cfg)
     else:
         # Production silent boot (no firmware/console text).
         append += (" quiet loglevel=0 console=null "
                    "vt.global_cursor_default=0 SETUPWIZARD=0")
-        nic = "virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
+        nic = ("virtio-net-pci,netdev=net0,romfile="   # no iPXE option ROM
+               + nic_mtu_suffix(cfg))
         smp = mode["smp"]
         mem = mode["mem"]
         # -vga none first: the emulated VGA adapter is dead weight next to the
         # virtio GPU, in every tier.
         gpu = ["-vga", "none"] + gpu_args
+        # FORCE THE PHYSICAL MODE, because xres/yres on the device is only a
+        # request. MEASURED 2026-08-15 on a GL boot that asked for 1280x800:
+        #
+        #     $ adb shell wm size
+        #     Physical size: 640x480
+        #     Override size: 1280x800
+        #
+        # The device's xres/yres set the PREFERRED mode in the EDID, but the
+        # guest kernel took the first entry in the mode list anyway, so the
+        # real scanout was 640x480 and Android was compositing 1280x800 and
+        # letting SurfaceFlinger scale it DOWN to fit. That is the worst of
+        # both: the full pixel cost of the big surface and the sharpness of the
+        # small one. `video=<connector>:<mode>` is the kernel's own override
+        # and settles it before DRM ever reads the EDID. virtio-gpu's connector
+        # is `Virtual-1`; an unknown connector name is silently ignored by the
+        # kernel, so this cannot cost a boot on a base that names it otherwise.
+        if force_video_mode(cfg):
+            pw, ph = panel_for(mode, cfg)
+            append += f" video=Virtual-1:{pw}x{ph}"
 
     cmd = [
         qemu_bin("qemu-system-x86_64"),
@@ -1157,16 +1601,11 @@ _WINDOWLESS_DISPLAYS = ("none", "", HEADLESS_GL_DISPLAY, "egl-headless")
 def uses_gl_context(display_args):
     """Does this display pair give QEMU a GL context?
 
-    Any `gl=` that is not `off` on a windowed backend, or egl-headless. Both
-    are mutually exclusive with the VNC server (see vnc_args).
+    Any `gl=` that is not `off` on a windowed backend, or egl-headless.
 
     Matching `gl=` generally rather than the literal `gl=on` is load-bearing:
     macOS takes `gl=es` (ANGLE -> Metal; see _GL_OPTION), and a check that only
-    knew `gl=on` would read a macOS GL boot as non-GL, leave `-vnc` on the
-    command line, and QEMU would REFUSE TO START — "Display vnc is
-    incompatible with the GL context". That is the same one-line failure that
-    made `--mode gaming` exit instead of booting before vnc_args existed, and
-    it would have come straight back on the first Mac to get a virgl QEMU.
+    knew `gl=on` would read a macOS GL boot as non-GL.
     """
     for arg in display_args or []:
         text = str(arg)
@@ -1178,28 +1617,48 @@ def uses_gl_context(display_args):
     return False
 
 
-def vnc_args(display_args, vnc_display):
-    """The `-vnc` pair, or nothing when a GL context rules it out.
+def blocks_vnc(display_args):
+    """Would QEMU refuse `-vnc` next to this display?
 
-    QEMU REFUSES the combination, and says so:
+    This is NOT the same question as uses_gl_context(), and conflating the two
+    cost this project its viewer on every GPU-accelerated boot.
+
+    QEMU refuses the combination for a WINDOWED display that has taken a GL
+    context:
 
         qemu: -vnc 127.0.0.1:12101: Display vnc is incompatible with the GL context
 
-    That single line explains both GPU failures on this host. `gaming` mode
-    (gtk,gl=on) exited on startup instead of booting, because -vnc was always
-    appended. And `egl-headless` did not error but published a framebuffer VNC
-    could never be fed from, which is the black viewer.
+    It does not refuse `egl-headless`. That display exists precisely to be
+    paired with vnc/spice -- QEMU's own manual says so ("this display needs to
+    be paired with either VNC or SPICE displays") and `ui/egl-headless.c` reads
+    the rendered texture back into the 2D surface (egl_fb_read) and then calls
+    dpy_gfx_update, which is the surface the VNC server encodes. VERIFIED on
+    this host by starting QEMU with both and watching the framebuffer.
 
-    So GL and VNC are an either/or, and the choice follows the display:
-      * a GL boot has a real window (or is farming, where nobody is watching),
-        so it does not need the VNC server, and
-      * every other boot keeps VNC exactly as before.
-
-    What a GL boot gives up: `omnidroid view`, and capture.py/autocap, which
-    attach to this framebuffer. `omnidroid screenshot` is unaffected — it goes
-    through adb, not VNC.
+    So exactly one case drops `-vnc`: a windowed backend with `gl=` on. That
+    only happens under OMNI_GL_WINDOW=1 now, and it is the one boot where
+    losing the VNC server does not matter -- the window IS the viewer.
     """
-    if uses_gl_context(display_args):
+    for arg in display_args or []:
+        text = str(arg)
+        parts = text.split(",")
+        if parts[0] in _WINDOWLESS_DISPLAYS:
+            continue                       # none / egl-headless: VNC is fine
+        for opt in parts[1:]:
+            if opt.startswith("gl=") and opt != "gl=off":
+                return True
+    return False
+
+
+def vnc_args(display_args, vnc_display):
+    """The `-vnc` pair, dropped only for a windowed GL boot (see blocks_vnc).
+
+    What a windowed GL boot gives up: `omnidroid view`, and capture.py/autocap,
+    which attach to this framebuffer. `omnidroid screenshot` is unaffected --
+    it goes through adb, not VNC. Every headless boot -- which is every boot
+    the product makes -- keeps the server, GPU-accelerated or not.
+    """
+    if blocks_vnc(display_args):
         return []
     return ["-vnc", f"127.0.0.1:{vnc_display}"]
 
@@ -1283,6 +1742,41 @@ def _stage_warm_efivars(acct, cfg, warm):
         shutil.copyfile(src, d / "efivars.fd")
 
 
+def _hide_window_if_wanted(cmd, identity, cfg):
+    """Hide the QEMU window this spawn just opened, unless it was asked for.
+
+    On Windows the window is the price of the GPU, not a feature (see
+    hostwin.py). Only an explicit `--gpu window` means "put it on my screen";
+    `auto` opens it because it has to and then gets it out of the way.
+
+    Runs INLINE rather than on a thread, and that is deliberate: it takes about
+    as long as QEMU needs to map its window (measured well under a second), and
+    doing it before spawn_qemu returns means the window cannot flash on screen
+    after `start` has already told the caller the instance is up. It also can
+    never delay a boot past its bound, because find_window() has one.
+    """
+    if not command_opens_a_window(cmd):
+        return False
+    if gpu_policy(cfg) == GPU_WINDOW:
+        return False
+    from omnidroid import hostwin
+    hidden = hostwin.hide_qemu_window(identity)
+    if hidden:
+        # ...and KEEP it hidden. GTK re-shows the window during early boot (the
+        # GL area being realised, the guest's first modeset), so a single hide
+        # at spawn is undone before the guest has even joined a place. The
+        # watcher is bounded and stops on its own; after the boot, one hide
+        # sticks (measured).
+        hostwin.keep_hidden(identity)
+        print(f"[gpu] the QEMU window is hidden — it exists only because it is "
+              f"the only working GL context on this host, and it keeps "
+              f"rendering while invisible. Watch with `omnidroid view`.")
+    else:
+        print(f"[gpu] could not hide the QEMU window for {identity}; it stays "
+              f"on screen. Rendering is unaffected.")
+    return hidden
+
+
 def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
                warm=None, bake=False, warm_key=None):
     from omnidroid.runtime import runtime_dir
@@ -1304,6 +1798,8 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
     cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug,
                        warm=warm, bake=bake)
     proc = subprocess.Popen(cmd, stdout=log, stderr=log, **kwargs)
+    identity = f"omni-{acct['name']}"
+    hidden = _hide_window_if_wanted(cmd, identity, cfg)
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
          # Whether THIS boot put a real window on the host's screen. Recorded
@@ -1312,6 +1808,12 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
          # instance — and so a degraded gaming boot (host could not open one)
          # still gets the viewer it needs to be watchable at all.
          "native_window": command_opens_a_window(cmd),
+         # ...and whether it was then HIDDEN. The two are different questions:
+         # a hidden window still holds the GL context (that is the whole point
+         # of hiding rather than not opening it), but there is nothing on
+         # screen for a user to look at, so the viewer has to come from
+         # somewhere else. `omnidroid view` reads this to decide what to say.
+         "window_hidden": hidden,
          # Whether THIS boot rendered on the host GPU, and at what panel size.
          # Recorded for the same reason as native_window — the argv is the
          # truth — and read back by _ensure_booted, which cannot otherwise

@@ -1,150 +1,462 @@
-# Two use cases, one engine
+# Two modes, one engine
 
-> **Updating the game:** `omni bake-data-game <new-roblox.apk>` — installs it
-> into the base's /data as an updated system app, ~2 minutes, no system-image
-> rebuild and no scratch space. Every run starts from the pristine rooted
-> /data, so updates never chain. The replacement APK must be signed with the
-> same key as the build already baked into the system image, or the guest
-> rejects it and the bake aborts without touching the shipping image.
-> Run `omni bake-data-game` with no APK to bake only the kiosk's game-package
-> setting.
-
+> **Adding or updating a Roblox version:** `omnidroid offset create <name> --apk
+> <roblox.apk>` — see `HOWTO.md`. Versions are **offsets**: named, thin /data
+> overlays that coexist on one clean base, with one marked default.
 
 OmniDroid serves two jobs that pull in opposite directions, and almost every
-tuning decision in the codebase is a choice between them.
+tuning decision in the codebase is a choice between them. Each mode declares
+which job it is for as a **profile**, and that — not the mode's name — is what
+the engine branches on:
 
-| | `--mode gaming` | `--mode farming` |
+- **`performance`** — spend the host on ONE instance. `gaming`, the default.
+- **`density`** — spend quality on instance COUNT. `farming`.
+
+| | `--mode gaming` (default) | `--mode farming` |
 |---|---|---|
-| what matters | frames, input latency | RAM and CPU per instance |
+| what matters | frames, resolution, input latency | RAM and CPU per instance |
 | what does not | density, host footprint | speed, quality, anything visual |
-| instances per host | 1–2 | 50+ (on a 64 GB Linux host) |
-| host window | yes, when the host can open one | never |
-| guest display | the base's native 1280x800 | 480x270 @ 80 dpi |
+| instances per host | 1–2 | many (see the footprint note below) |
+| host window | never *visible* — hidden, and hosted by our viewer (see **The GPU**) | never |
+| guest MTU | matched to the host's egress (see **Farming**) — both modes | same |
+| guest panel | 1280x800 (`--panel` overrides) | 640x480, `wm size` 480x270 |
 | engine tick | 240 fps target | 5 fps cap |
-| balloon | none | 896 MB (with zram) / 1536 (without) |
-| vCPU / RAM | 4 / 4096 MB | 1 / 2048 MB |
+| render quality | `high` — real textures, lighting, post-FX | lowest everything |
+| balloon | none | 896 MB (with zram) / 1536 (without) — **skipped entirely on a host that cannot return the pages; see Farming** |
+| vCPU / RAM | **sized to the host**, capped 4 GB / 4 vCPU on WHPX | 2048 MB, 1 vCPU (2 on x86) |
 | zram | off | on (baked into the base) |
 | scheduler | game on the `top-app` cpuset | game on `background` |
-| doze | disabled | force-idled |
+| GPU policy | `auto` | `headless` |
 
-`playable`, `hard` and `brutal` are unchanged headless RAM/CPU tiers, not use
-cases. `playable` is still `DEFAULT_MODE`, so a bare `omni start` behaves
-exactly as it always has.
+### The three modes that are gone
+
+`playable`, `hard` and `brutal` were removed on 2026-08-15.
+
+* `playable` was `gaming` without a window. Once no mode opened a window,
+  there was no difference left to name.
+* `hard` (3072 MB / 4 vCPU) and `brutal` (2048 MB / 2 vCPU) were fixed "give
+  this instance less" tiers that predate `--mem`/`--smp` being honoured
+  properly. `--mem 3072` says the same thing in the flag that already exists.
+
+**All three are still ACCEPTED and resolve to `gaming`.** An installed app
+persists the mode it was configured with — 1.0.14 ships `"mode": "playable"` as
+its default — so rejecting the name would break every launch from a client that
+has not updated. The alias is resolved once, in `resolve_mode()`, so run.json,
+the warm-cache key, the tuning branch and the UI all see `gaming`.
 
 ---
 
-## Gaming mode
+## Gaming takes the machine
 
-```sh
-omni start <account> --mode gaming
+```
+mem  = clamp(min(host_ram/2, host_ram - 6 GB), 4096 MB, 8192 MB)   # 512 MB steps
+smp  = clamp(host_cores - 2, 4, 8)
 ```
 
-### The window
+...then capped at **4096 MB / 4 vCPU on WHPX**, because on Windows the
+autoscaled 8192/8 booted 6.5x SLOWER than 4096/4 on the same image (0.9 min vs
+5.9 min). KVM and HVF keep the larger ceilings.
 
-A gaming boot asks for a native QEMU window and takes the best tier the host
-can actually provide. The capability is detected by asking the QEMU binary
-what it has (`qemu_proc.default_display`), never assumed:
+"As much as it safely can" is the load-bearing half: a guest sized past the
+host's spare RAM makes the **host** swap, and a swapping host misses QEMU's
+vCPU deadlines — slower than the smaller guest would have been. An explicit
+`--mem`/`--smp` always wins outright.
 
-| tier | what you get | when |
+### Resolution
+
+`--panel WxH` (or `720p`/`800p`/`1080p`/`1440p`), config `qemu.panel`, env
+`OMNI_PANEL`. Defaults to the mode's own.
+
+Bigger costs frames, and not for the reason you would guess: the guest is
+**CPU-bound on arm64 translation, not fill-bound**. Measured on the x86 base,
+640x480 gave 19 fps against 14 at 1280x800 — a 4.2x pixel cut for 33% more
+frames. `libndk_translation` is the wall and no flag removes it.
+
+---
+
+## The GPU
+
+One setting, `--gpu` (config `qemu.gpu`, env `OMNI_GPU`), four values:
+
+| | |
+|---|---|
+| `auto` | **default.** Reach the GPU whatever it takes. If that needs a window, open it HIDDEN and let the viewer host it. |
+| `headless` | Never a window. Keeps the VNC viewer. GPU only if it can be had windowless. |
+| `window` | Always open a native QEMU window. |
+| `off` | Software rendering, headless. |
+
+Two host facts decide what `auto` actually does, and both are measured rather
+than assumed:
+
+**1. QEMU refuses a VNC server beside a GL WINDOW.**
+
+```
+qemu: -vnc 127.0.0.1:12101: Display vnc is incompatible with the GL context
+```
+
+Re-verified on QEMU 11.0.50 across `gtk`/`sdl` × `gl=on`/`gl=es`/`gl=core` —
+all four refuse. It does **not** refuse `egl-headless`, which QEMU documents as
+the display to pair with VNC. Conflating those two cases is what left every
+GPU-accelerated boot with no VNC server at all, which then got reported as "the
+viewer is black".
+
+**2. Whether `egl-headless` can actually PRESENT is per-platform.**
+
+On Linux it can; that is what the backend was written for. On Windows the guest
+renders on the GPU and never scans out. Measured 2026-08-15 across three boots
+(plain, `blob=true,hostmem=512M`, and without the forced `video=` mode), all
+identical:
+
+```
+dmesg      [drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1203 (command 0x103)
+timestats  totalFrames = 0
+screencap  solid black
+VNC        1 update, mean brightness 0.0
+```
+
+`0x103` is `SET_SCANOUT`, `0x1203` is `ERR_INVALID_RESOURCE_ID`. The guest's GL
+was fine — SurfaceFlinger came up on `virgl (ANGLE (NVIDIA … RTX 4060))` with no
+GL errors in logcat — so this is presentation, not rendering.
+
+**So on Windows a GPU-accelerated instance has a window and no VNC server.**
+That does not mean you have to look at a QEMU window, and you never do:
+
+### You only ever see OUR viewer
+
+| | |
+|---|---|
+| the window is **hidden** at spawn | it exists only to hold the GL context |
+| a hidden window **keeps rendering** | measured: 303 frames / 30 s while invisible |
+| `omnidroid view` **hosts** it | `SetParent` makes it a child of our Tk window |
+
+So the guest lives *inside* the product's viewer — our title, our chrome — with
+QEMU's GL surface composited straight into it. Nothing is copied, encoded or
+decoded per frame, and input goes into the guest's `usb-tablet`/`usb-kbd`
+directly instead of being synthesised from an RFB event. **Measured embedded:
+702 frames / 12.1 s = 58 fps.**
+
+GTK re-shows the window during early boot, so `hostwin.keep_hidden()` re-hides
+it for the length of a boot and then stops; after that a single hide sticks
+(30 s of polling never saw it return).
+
+`--gpu window` is the one setting that leaves it on screen, for when a GL
+problem has to be seen with none of this project's code in the path.
+
+**The one hazard, and it is reported rather than silent:** Windows destroys a
+child window when its parent dies, so a viewer that is FORCE-killed (rather
+than closed with its X) takes QEMU's window with it. The instance keeps running
+and keeps answering adb, and renders nothing at all — measured,
+`totalFrames = 0`. `omnidroid view` detects exactly that state and says so,
+instead of opening an empty window onto a blind guest.
+
+| | fps at 1280x800 on PS99 | what you watch |
 |---|---|---|
-| `gl` | `virtio-gpu-gl-pci` + `<backend>,gl=on` — real 3D acceleration | QEMU built with virglrenderer/OpenGL |
-| `window` | `virtio-gpu-pci` + `<backend>` — native window, software rendering | QEMU with a cocoa/gtk/sdl backend |
-| `none` | today's headless `-display none` | no host GUI, or no windowing backend |
+| `--gpu auto` (default) | **24.2–58** across runs | our viewer, hosting the hidden window |
+| `--gpu headless` | 3.2 | our viewer, over VNC |
 
-Degradation is total and silent-safe: a malformed capability, a headless SSH
-session or a QEMU without any window backend all produce the byte-for-byte
-headless command, so a detection bug can cost a window but never a boot.
+The GPU spread is real rather than noise in the method: PS99 is a busy
+server-authoritative place and how much is streaming in when the sample is
+taken moves it a long way. The ratio to software does not move.
 
-The instance still runs its VNC server in **every** mode — `omni screenshot`,
-the autocap recorder and the `omnidroid-input` skill all attach to that
-framebuffer. What a native window suppresses is only the second *viewer*
-window `omni start` would otherwise open onto the same instance.
+On a host whose `egl-headless` presents — Linux — none of this is needed:
+`auto` gets GPU, no window and VNC all at once, and the same viewer connects
+the ordinary way. macOS has no virgl yet, so it renders in software and also
+uses VNC. **The viewer is the same on all three; only what it attaches to
+differs.**
 
-### The GL tier is not reachable on the dev Mac today
+---
 
-MEASURED 2026-08-06, Homebrew QEMU 11.0.2 on Apple Silicon:
+## Farming
+
+**It reaches the PS99 world.** Measured 2026-08-16, screenshot-verified
+in-world (Roblox's top bar, PS99's live player leaderboard, its chat and its
+own teleport logic) with the squeeze already applied — display override
+480x270, zram on, no balloon:
 
 ```
-$ qemu-system-aarch64 -display cocoa,gl=on
-qemu-system-aarch64: OpenGL support was not enabled in this build of QEMU
-$ qemu-system-aarch64 -device help | grep gpu
-name "virtio-gpu-pci", bus PCI, alias "virtio-gpu"        # no -gl variant
-$ brew info virglrenderer
-Error: No available formula with the name "virglrenderer".
+start <acct> --place 8737899170 --mode farming --mem 3072
+  boot 155 s;  game PSS 2.1 GB / RSS 1.5 GB
+  guest 2.9 GB, 587 MB available, 341 MB swap free
+  host RSS 3239 MB
 ```
 
-So on that host gaming mode lands on the `window` tier: a real cocoa window,
-software rendering. That is still the large input-latency win, because host
-input events go straight into the guest's `usb-tablet`/`usb-kbd` instead of
-making a VNC round trip through framebuffer encode → decode → synthesised
-input.
+Two things that had to be true first, and neither is a knob in this table:
 
-Reaching the `gl` tier needs **two** things, and neither exists yet:
+* **The squeeze runs AFTER the client has loaded**, not in the boot tail. See
+  the correction below.
+* **The guest's MTU has to fit the host's egress.** Behind a VPN it does not
+  by default, and Roblox's gameplay traffic is UDP, so the client connects and
+  then dies. `virtio-net-pci,host_mtu` — see `omnidroid/netmtu.py`.
 
-1. a QEMU built `--enable-opengl --enable-virglrenderer` (source build on
-   macOS; on Linux the distro packages generally already have it), and
-2. a **guest** driver that can drive virgl — the LineageOS arm64 image renders
-   in software today. This is the open B3 question, and it is the bigger half.
+And one number that is a property of the GAME rather than of this mode:
+**PS99 needs `--mem 3072`.** At the mode's own 2048 the client is OOM-killed.
 
-Until both land, "GPU acceleration" for this project means the window tier.
-The code is already capability-gated, so a QEMU that gains virgl lights up the
-`gl` tier with no code change.
+The stated target is ~400 MB per instance. **On Windows that is not reachable,
+and the reason is the host side rather than the guest.** Measured on PS99,
+2026-08-15:
 
-### What a gaming boot does inside the guest
+| | |
+|---|---|
+| guest MemTotal after balloon | 1450 MB (balloon reported `capped at 897 MB`) |
+| Roblox PSS / RSS in-guest | 508 MB / 743 MB |
+| **host RSS for the QEMU process** | **2198 MB** |
+
+The balloon works — the guest really does give the pages back — but **QEMU on
+Windows has no `madvise`**, so `ram_block_discard_range` fails and the host
+never gets them. free-page-reporting is dropped there for the same reason (it
+logged ~925 failed discards per minute and reclaimed nothing). So on Windows
+the host pays the full `-m` plus overhead, whatever the guest does.
+
+Two consequences:
+
+* **The lever that works on Windows is `-m` itself**, not the balloon:
+  `--mem 1536` costs the host ~1.6 GB where 2048 costs ~2.2 GB. The floor is
+  set by the game (~740 MB RSS) plus a squeezed Android.
+
+  **So as of 2026-08-16 the balloon is not inflated at all on such a host.**
+  It was never a saving there and it is a real cost to the guest: at the
+  896 MB cap the session handover itself timed out (`pm path` did not answer
+  in 45 s, twice) and the client could not load PS99. `apply_balloon_target`
+  now says so and skips; `host_can_reclaim_balloon()` is the predicate, an
+  explicit `--balloon` still wins outright, and `OMNI_FORCE_BALLOON=1` puts
+  it back for measurement.
+* **The ~400 MB story is a Linux story.** There the balloon and
+  free-page-reporting decommit for real and KSM dedups identical pages across
+  instances, so per-instance cost tracks the 896 MB cap and falls further
+  across a fleet. `FOOTPRINT.md` has the full picture.
+
+The user's "~400 MB in the desktop Roblox app" is the closest comparison to the
+**game process** (508 MB PSS here), not to an instance: an instance is that
+game *plus a whole Android* plus QEMU.
+
+### Two farming bugs fixed on 2026-08-15
+
+* **`smp 1` could not get x86 through the session handover.** Roblox's arm64
+  build runs through `libndk_translation` on the x86 base, and the ordered
+  `am broadcast` that hands over the session did not return within 45 s — which
+  raised `TimeoutExpired` straight out of `cmd_start` as a traceback. Farming
+  now takes `smp_x86: 2`, `kiosk_broadcast` treats a timeout as a RESULT rather
+  than an exception, and its budget is 120 s.
+* **The balloon was reported as broken when it was merely slow.** At the 30 s
+  mark a 2048→896 MB inflation read 1805 MB and the launch printed "guest
+  balloon driver missing?"; the same guest read 938 MB a minute later and
+  reached its target. The wait is 90 s now, and a balloon that is still moving
+  says so instead of blaming the guest kernel.
+
+### Farming on x86: the translator cannot be swapped out
+
+A farming instance used to boot, join PS99 and then sit on the Roblox splash
+forever. Bisected on 2026-08-15 by running each suspect:
+
+| suspect | test | result |
+|---|---|---|
+| the 5 fps tick cap | `--quality balanced` | not it |
+| the 480x270 display | `--guest-display native` | not it |
+| the package trim | read the list | not it (no WebView; game is in `KEEP_ALWAYS`) |
+| doze | read the sequence | not it (game whitelisted before `force-idle`) |
+| memory | `--mem 4096 --balloon 3072` | not it — **and it revealed the answer** |
+
+With 2.1 GB free and no OOM kill, Roblox still died. `logcat -b crash`:
+
+```
+F libc  : Fatal signal 6 (SIGABRT), code -1 (SI_QUEUE) in tid 5013 (Thread-19)
+F DEBUG : Abort message: 'Cannot process signal 11'
+F DEBUG : #04 libndk_translation.so (ndk_translation::HandleHostSignal(...))
+```
+
+**That is the TRANSLATOR aborting, not the game.** Roblox ships arm64 only, so
+the x86 base runs it through `libndk_translation`; translated code took a
+SIGSEGV, and the translator's host-signal handler could not process a fault
+arriving in translated context.
+
+Farming is the only mode that swaps hard — `swappiness 100`, `page-cluster 0`,
+zram on — and evicting translated code pages is exactly how that fault is
+manufactured. Gaming runs at swappiness 10 with no zram and has never crashed
+this way.
+
+**The fix is an arch override, not a retreat.** `MODES["farming"]` carries
+`swappiness_x86: 10` and `zram_x86: False`; the arm base runs Roblox
+*natively*, has no translator to upset, and keeps both levers. Measured with
+just the swappiness half in place: **translator aborts 1 → 0**, and the client
+got past the black splash to Roblox's loading screen.
+
+**Two traps inside that fix:**
+
+* **Skipping the zram step is not the same as zram being off.** The base ships
+  it ON — `persist.sys.zram_enabled` is baked into build.prop and
+  `/vendor/etc/init/zram.rc` calls `swapon_all` at boot. A launch that had just
+  printed "zram: OFF for this mode" still had `SwapTotal: 1045168 kB`. x86
+  farming now issues an explicit `swapoff`.
+* **The balloon cap follows zram, and it should.** `apply_balloon_target`
+  probes the guest rather than trusting the mode, so with zram genuinely off it
+  selects the non-zram floor (1536 MB) instead of 896 — which is correct, and
+  is the honest cost of not being able to swap on this base.
+
+**CORRECTION, measured the same night: keep zram, only lower swappiness.**
+Turning zram off as well made things worse, not safer:
+
+| | translator aborts | guest | outcome |
+|---|---|---|---|
+| swappiness 10, zram ON | 0 | 830 MB / 315 MB free | reached Roblox's loading screen |
+| swappiness 10, zram OFF | 0 | 1485 MB / 648 MB free | **Roblox OOM-killed 3x** (`mem-pressure-event`) |
+
+zram is not what breaks the translator — swapping HARD is — and with lz4
+compressing ~3x it is the only reason a 2 GB guest holds this game at all. So
+`swappiness_x86: 10` stays and `zram_x86` is gone; the explicit `swapoff` went
+with it.
+
+### CORRECTION, 2026-08-16: it was WHEN the squeeze ran, not what it did
+
+The section above is right about the crash and wrong about the cause, and the
+difference matters because the fix is different. Re-measured on PS99, holding
+memory constant at 3072 MB with the balloon off so it could not be the
+variable:
+
+| tuning | guest | what the client did |
+|---|---|---|
+| farming, full squeeze | 1.8 GB free | alive, PSS FLAT at ~400 MB, engine parked in `futex_wait`, **guest 200% idle** for 6 min |
+| farming, `--quality balanced` (tick 240) | 1.8 GB free | identical stall — the 5 fps tick is not it |
+| farming, `OMNI_FARM_SKIP=<every step>` | 1.8 GB free | **PSS 1173 MB at 111 s and climbing — it loads the place** |
+| **gaming at the same 2048 MB / 2 vCPU** (control) | — | zero translator aborts, PSS to 1476 MB, then OOM-killed |
+
+Two things fall out of that, and both contradict what was believed:
+
+* **Swapping hard does not break the translator.** The gaming control drove
+  its zram to `SwapFree: 0.2 MB` with zero aborts.
+* **The engine does not crawl, it deadlocks.** `debuggerd -j` on a stalled
+  client: Roblox's `Main` thread and its single ` RBX Worker A` both in
+  `futex_wait` (syscall 202, NULL timeout), guest 200% idle. Nothing is going
+  to wake them.
+
+**The squeeze was running in the boot tail — before `cmd_start` delivers the
+session, i.e. before the client has been told which place to load.** Every
+lever in it exists to make a JOINED, IDLE instance cheap; applied to a client
+that is still starting, they starve the thing they are supposed to shrink.
+
+So the squeeze, zram and the balloon now run in `settle_density_instance()`,
+which `cmd_start` calls AFTER the session is delivered and after the client's
+memory has stopped growing (`wait_for_game_settled` — PSS plateau above a
+700 MB floor, so a splash screen never counts as settled). `OMNI_SETTLE_TIMEOUT`
+/ config `qemu.settle_timeout` bounds the wait; 0 squeezes immediately.
+
+**A density launch is therefore MINUTES rather than seconds**, and that is the
+honest reading of "this instance is ready" — `timings.stages.density_settled`
+reports it.
+
+`OMNI_FARM_SKIP=<step,...>` (see `farming.STEP_NAMES`) leaves named steps out,
+because this sequence has now twice been what stopped Roblox running on the
+x86 base and bisecting it by editing `farming.py` makes every attempt a
+different build.
+
+---
+
+## What a performance boot does inside the guest
 
 Applied after boot (`gaming.build_tuning_sequence`), and note that most of it
-is an **undo**: the farming levers persist in a non-ephemeral account's
-`/data`, so an account that was farmed and is then started in gaming mode
-keeps a 480x270 display until something reverses it.
+is an **undo**: the farming levers persist in `/data`, so an offset whose /data
+was last touched by a farming boot keeps a 480x270 display until something
+reverses it.
 
-- `wm size reset` / `wm density reset` — back to native
+- `wm size` / `wm density` to the panel (density scales with it — see
+  `gaming.density_for_panel`, so a 1080p panel does not shrink the UI)
 - all three animation scales to 0
 - `swappiness` 10 — keep the game's pages resident (root only)
 - `deviceidle disable` + game whitelisted — no throttling of a foreground game
 - IME re-enabled — farming disables it, and nothing can be typed without it
-- ClientAppSettings with a 240 fps tick target and low render cost
+- the `high` ClientAppSettings profile (240 fps tick, quality 10, post-FX on)
 
 Then, **after** the session is delivered (the broadcast is what launches the
 game), `pin_game_to_top_app` moves it onto the `top-app` cpuset.
 
-### Verified live, 2026-08-06
-
-On `HezMi_ImYu`, arm64 rooted base, Apple Silicon:
-
-```
-boot completed after 0.6–1.5 min
-roblox settings: applied (tick target 240 fps, low render cost)
-gaming tune-up: native resolution, animations off, doze off, swappiness 10
-cpuset: game on top-app (latency-critical scheduler set)
-```
-
-Read back out of the guest independently:
-
-| lever | verified |
-|---|---|
-| QEMU window | `QEMU omni-HezMi_ImYu` present on screen |
-| display | `Physical size: 1280x800` (not the farming postage stamp) |
-| swappiness | `10` |
-| tick target | `"DFIntTaskSchedulerTargetFps": 240` |
-| cpuset | `3:cpuset:/top-app`, still `/top-app` 15 s later |
-
-### Two honest limits
-
-- **The cpuset pin does not survive a game restart.** Observed: the game
-  restarted (pid 5507 → 5730) and the new process came up in `/background`.
-  The pin holds for the process it was applied to; it is not a policy.
-- **Frame rate has not been measured.** The guest currently shows a
-  `System UI isn't responding` ANR and foregrounds the Magisk manager rather
-  than the kiosk. That reproduces identically on the **unchanged** headless
-  `--mode playable` path, so it is a property of the freshly-built rooted base
-  (dual-use Phase 2, still unverified per its own spec), not of gaming mode.
-  No fps claim can be made until that is fixed.
-
 ---
 
-## Farming mode
+## Boot time
 
-Unchanged by this work. See `FOOTPRINT.md` for the full measured picture. The
-short version: ~896 MB per instance with zram, ~71 instances on a 64 GB Linux
-host, and the ~400 MB per-instance target is not reachable with Roblox, whose
-engine alone is ~680 MB resident.
+### The warm POOL — the fast path that does work on Windows
+
+```
+omnidroid pool start --size 2 --mode gaming     # keep 2 warm, in the background
+omnidroid pool fill  --size 1 --mode gaming     # boot them now, in this process
+omnidroid pool status
+omnidroid pool stop
+```
+
+A slot is an ordinary instance booted to the **account-free ready point** —
+Android up, kiosk up, DNS/consent/awake/mode tuning applied, no session
+delivered. `start` then adopts one instead of booting:
+
+```
+cold   spawn -> 47-190 s boot -> deliver session -> playing
+pool                             deliver session -> playing
+```
+
+**Measured 2026-08-15, x86 base, PS99, gaming 2048 MB / 2 vCPU:**
+
+```
+omnidroid pool fill --size 1 ...            slot ready in 58.8 s
+omnidroid start admn1b12farm3 --place ...   warm pool: took slot _pool0
+                                            timings.stages.boot = 0.082 s
+                                            session delivered   = 7.6 s
+```
+
+**0.08 s instead of 47-190 s.** Nothing is serialised, so WHPX has nothing to
+object to — which is the whole reason this exists and the warm CACHE cannot
+(see below).
+
+Three things about it are load-bearing:
+
+* **A slot is only handed to a launch that would have booted the same
+  machine.** The key hashes the RESOLVED spec — arch, base + version, offset
+  *and its image's identity*, mode, mem, smp, accel, gpu, panel, quality,
+  guest display — so `--mode playable` and `--mode gaming` share a slot (they
+  are one machine) while `--mem 2048` and `--mem 4096` never do.
+* **Adoption copies `run.json`, it does not move the directory.** QEMU holds
+  `qemu.log` open and Windows will not move a directory out from under an open
+  handle. The copy keeps the slot's `identity` (`omni-_pool0`) verbatim: the
+  QEMU process was named at spawn and cannot be renamed, and `instance_live`
+  compares the recorded identity against QMP `query-name`, so rewriting it
+  would make a healthy adopted instance read as dead.
+* **The claim is an `O_EXCL` file create.** Two concurrent launches cannot be
+  handed one guest — which would put the second account's cookie into the
+  first account's game.
+
+The manager boots slots **one at a time**. Two guests booting at once on this
+host starve each other badly enough to have earned its own gotcha, and a pool
+that fills slowly beats one that makes the instance somebody is playing
+stutter while it fills.
+
+A slot appears in `omnidroid list` while it is warm, tagged `[warm pool]`.
+That is deliberate: the "refuse while an instance is running" guards read the
+same list, and hiding pool slots from them is how a guard silently stops
+guarding.
+
+### There is no warm-boot CACHE on Windows, and that is a hypervisor limit
+QEMU/WHPX registers a migration blocker at CPU realize time:
+
+```
+warm bake failed (migration State blocked due to non-migratable CPUID feature
+support,dirty memory tracking support, and XSAVE/XRSTOR support)
+```
+
+WHPX exposes no way to read back guest CPUID state, no dirty-page log and no
+XSAVE area, so there is nothing for QEMU to serialise. No capability, transport
+or flag changes it. `_warm_cache_allowed()` refuses the whole mechanism there
+rather than paying a guest stop, two staged qcow2 overlays and a refused
+migration on every launch. It still works on KVM and HVF.
+
+Two other things were found while chasing this, and both are fixed:
+
+* **QEMU cannot migrate to a FILE on Windows at all** — `file:` fails with
+  "Failed to set FD nonblocking: Input/output error" (Windows has no
+  non-blocking file handles), and `mapped-ram`+`multifd` killed the QEMU
+  process outright. `omnidroid/migfile.py` relays the stream over a loopback
+  socket instead, which works. It is still gated off by the WHPX blocker above,
+  but the transport is correct for any host that gets a migratable accelerator.
+* **The disk check was silent.** This dev box had 7.4 GiB free against a
+  hardcoded 10 GiB reserve, so `has_room()` said no on every launch and nothing
+  was ever printed. The reserve is configurable now
+  (`qemu.warm_reserve_gb` / `OMNI_WARM_RESERVE_GB`) and a skipped bake says
+  what it needed and what it found.
+
+Cold boot on the Windows host, measured on PS99: **47–102 s** to a joined game,
+depending on mode.

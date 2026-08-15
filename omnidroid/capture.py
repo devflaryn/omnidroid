@@ -250,7 +250,7 @@ def run_capture(host, port, output_dir, duration_seconds,
     Two windowing modes, selected by ``duration_seconds``:
 
     * **bounded** (``duration_seconds > 0``): observe for that many seconds, then
-      return — the classic ``omni capture`` window.
+      return — the classic ``omnidroid capture`` window.
     * **continuous / auto** (``duration_seconds`` is None or <= 0): observe until
       ``stop_event`` is set or the VNC connection ends (the instance stopped).
       This is what powers the always-on auto-screenshot feature: every big

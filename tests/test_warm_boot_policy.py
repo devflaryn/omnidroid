@@ -26,26 +26,53 @@ from omnidroid import warmboot, warmcache  # noqa: E402
 
 
 class WarmPolicy(unittest.TestCase):
+    """Every call names an ACCELERATOR, because one of the refusal reasons is
+    now the accelerator itself and these assertions must not depend on
+    whichever host runs them. `kvm` stands for "can migrate"."""
+
     def test_debug_boots_never_touch_the_cache(self):
         self.assertFalse(engine._warm_cache_allowed(debug=True, in_use=set(),
-                                                    key="k"))
+                                                    key="k", accel="kvm"))
 
     def test_a_normal_boot_may_use_the_cache(self):
         self.assertTrue(engine._warm_cache_allowed(debug=False, in_use=set(),
-                                                   key="k"))
+                                                   key="k", accel="kvm"))
 
     def test_an_entry_already_in_use_is_refused(self):
         # Interim rule: siblings cold-boot until the adb blocker is root-caused.
         self.assertFalse(engine._warm_cache_allowed(debug=False,
-                                                    in_use={"k"}, key="k"))
+                                                    in_use={"k"}, key="k",
+                                                    accel="kvm"))
 
     def test_a_different_entry_being_in_use_is_irrelevant(self):
         self.assertTrue(engine._warm_cache_allowed(debug=False,
-                                                   in_use={"other"}, key="k"))
+                                                   in_use={"other"}, key="k",
+                                                   accel="kvm"))
 
     def test_no_key_means_no_cache(self):
         self.assertFalse(engine._warm_cache_allowed(debug=False, in_use=set(),
-                                                    key=None))
+                                                    key=None, accel="kvm"))
+
+    def test_an_accelerator_that_cannot_migrate_is_refused(self):
+        """The one that matters on Windows.
+
+        QEMU/WHPX registers a migration blocker at CPU realize time, so a bake
+        cannot succeed there however much disk, however good the transport.
+        MEASURED against a real booted instance:
+
+            warm bake failed (migration State blocked due to non-migratable
+            CPUID feature support,dirty memory tracking support, and
+            XSAVE/XRSTOR support)
+
+        Without this gate every launch pays a guest stop, two staged qcow2
+        overlays and a refused migration, forever, for a cache that can never
+        hold anything."""
+        self.assertFalse(engine._warm_cache_allowed(
+            debug=False, in_use=set(), key="k",
+            accel="whpx,kernel-irqchip=off"))
+        for good in ("kvm", "hvf", "tcg"):
+            self.assertTrue(engine._warm_cache_allowed(
+                debug=False, in_use=set(), key="k", accel=good), good)
 
 
 def _acct(base="arm", first_boot_done=True, debug=False):
@@ -128,6 +155,13 @@ class _StubbedBoot:
              dict(return_value=set())),
             (warmcache, "lookup", "lookup", dict(return_value=None)),
             (warmcache, "has_room", "has_room", dict(return_value=True)),
+            # _ensure_booted asks room_report(), not has_room(): a skipped
+            # bake has to be able to PRINT why, and a bare bool cannot. The
+            # tuple is (has_room, free_bytes, needed_bytes).
+            (warmcache, "room_report", "room_report",
+             dict(return_value=(True, 1 << 40, 1 << 20))),
+            (warmcache, "free_reserve_bytes", "free_reserve_bytes",
+             dict(return_value=0)),
             (warmcache, "touch", "touch", {}),
             (warmcache, "evict_lru", "evict_lru", {}),
             (warmboot, "restore_into", "restore_into", dict(return_value=True)),
@@ -194,7 +228,7 @@ class WarmRestoreBranchSelection(unittest.TestCase):
         # is a separate concern, covered by WarmBakeHandoff below.
         with _StubbedBoot(lookup=mock.MagicMock(return_value=entry),
                           wait_for_boot=wait,
-                          has_room=mock.MagicMock(return_value=False)) as b:
+                          room_report=mock.MagicMock(return_value=(False, 1, 1 << 40))) as b:
             ok, first = b.run()
         self.assertTrue(ok)
         self.assertFalse(first)
@@ -216,7 +250,7 @@ class WarmRestoreBranchSelection(unittest.TestCase):
             entry, ignore_errors=True))
         with _StubbedBoot(lookup=mock.MagicMock(return_value=entry),
                           restore_into=mock.MagicMock(return_value=False),
-                          has_room=mock.MagicMock(return_value=False)) as b:
+                          room_report=mock.MagicMock(return_value=(False, 1, 1 << 40))) as b:
             ok, first = b.run()
         self.assertTrue(ok)
         self.assertFalse(first)
@@ -238,7 +272,7 @@ class WarmRestoreBranchSelection(unittest.TestCase):
         with mock.patch.object(warmcache, "cache_key", return_value="FIXEDKEY"):
             with _StubbedBoot(lookup=mock.MagicMock(return_value=entry),
                               restore_into=mock.MagicMock(return_value=False),
-                              has_room=mock.MagicMock(return_value=False),
+                              room_report=mock.MagicMock(return_value=(False, 1, 1 << 40)),
                               warm_keys_in_use=in_use_calls) as b:
                 ok, first = b.run()
         self.assertTrue(ok)
@@ -248,7 +282,7 @@ class WarmRestoreBranchSelection(unittest.TestCase):
         self.assertEqual(b.mocks["spawn_qemu"].call_count, 2)
 
     def test_a_cache_miss_on_a_non_interactive_boot_attempts_a_bake(self):
-        with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
+        with _StubbedBoot(room_report=mock.MagicMock(return_value=(True, 1 << 40, 1 << 20))) as b:
             ok, first = b.run()
         self.assertTrue(ok)
         self.assertFalse(first)
@@ -331,18 +365,25 @@ class WarmRestoreGetsTuned(unittest.TestCase):
         b.mocks["apply_farming_squeeze"].assert_not_called()
         b.mocks["apply_balloon_target"].assert_not_called()
 
-    def test_a_successful_restore_applies_farming_tuning(self):
-        # The density chain -- zram (decides the survivable balloon cap),
-        # then the squeeze, then the balloon strictly last -- is farming's
-        # actual density mechanism. Skipping it defeats the mode entirely.
+    def test_a_successful_restore_gets_the_settings_and_not_the_squeeze(self):
+        # The density chain -- zram, the squeeze, the balloon -- no longer
+        # runs in the boot tail AT ALL, restored or cold: every lever in it
+        # exists to make a JOINED, IDLE instance cheap, and at this point the
+        # session has not been delivered, so the client has not been told
+        # which place to load. Applying it to a client that is still loading
+        # is what stopped farming ever reaching the PS99 world (measured
+        # 2026-08-16; see settle_density_instance, which cmd_start calls once
+        # the client has finished loading). What a restore must STILL get is
+        # the ClientAppSettings file, because Roblox reads it at client start
+        # and there is no second chance.
         with self._restored() as b:
             ok, first = b.run(mode_name="farming")
         self.assertTrue(ok)
         self.assertFalse(first)
         b.mocks["apply_roblox_settings"].assert_called_once()
-        b.mocks["enable_zram"].assert_called_once()
-        b.mocks["apply_farming_squeeze"].assert_called_once()
-        b.mocks["apply_balloon_target"].assert_called_once()
+        b.mocks["enable_zram"].assert_not_called()
+        b.mocks["apply_farming_squeeze"].assert_not_called()
+        b.mocks["apply_balloon_target"].assert_not_called()
         b.mocks["apply_gaming_tuning"].assert_not_called()
 
     def test_a_successful_restore_is_kept_awake_too(self):
@@ -407,13 +448,13 @@ class WarmCacheCoversX86(unittest.TestCase):
     """
 
     def test_x86_looks_up_the_cache_like_arm(self):
-        with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
+        with _StubbedBoot(room_report=mock.MagicMock(return_value=(True, 1 << 40, 1 << 20))) as b:
             ok, first = b.run(acct=_acct_x86(), cfg=_cfg_x86())
         self.assertTrue(ok)
         b.mocks["lookup"].assert_called()
 
     def test_x86_bakes_an_entry_after_a_cold_boot(self):
-        with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
+        with _StubbedBoot(room_report=mock.MagicMock(return_value=(True, 1 << 40, 1 << 20))) as b:
             ok, first = b.run(acct=_acct_x86(), cfg=_cfg_x86())
         self.assertTrue(ok)
         b.mocks["_stage_bake_overlays"].assert_called()
@@ -422,7 +463,7 @@ class WarmCacheCoversX86(unittest.TestCase):
     def test_the_entry_records_its_arch(self):
         # required_files() keys off this: without it an x86 entry would be
         # judged incomplete for lacking efivars.fd and never restore.
-        with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
+        with _StubbedBoot(room_report=mock.MagicMock(return_value=(True, 1 << 40, 1 << 20))) as b:
             b.run(acct=_acct_x86(), cfg=_cfg_x86())
         args, _ = b.mocks["bake_entry"].call_args
         meta = args[3]
@@ -465,7 +506,7 @@ class WarmCacheKillSwitch(unittest.TestCase):
         self.assertNotIn("warm", kwargs)
 
     def test_no_warm_flag_disables_bake(self):
-        with _StubbedBoot(has_room=mock.MagicMock(return_value=True)) as b:
+        with _StubbedBoot(room_report=mock.MagicMock(return_value=(True, 1 << 40, 1 << 20))) as b:
             ok, first = b.run(no_warm=True)
         self.assertTrue(ok)
         b.mocks["_stage_bake_overlays"].assert_not_called()
@@ -485,9 +526,9 @@ class WarmCacheKillSwitch(unittest.TestCase):
 
     def test_warm_cache_allowed_refuses_when_no_warm(self):
         self.assertFalse(engine._warm_cache_allowed(
-            debug=False, in_use=set(), key="k", no_warm=True))
+            debug=False, in_use=set(), key="k", no_warm=True, accel="kvm"))
         self.assertTrue(engine._warm_cache_allowed(
-            debug=False, in_use=set(), key="k", no_warm=False))
+            debug=False, in_use=set(), key="k", no_warm=False, accel="kvm"))
 
 
 if __name__ == "__main__":

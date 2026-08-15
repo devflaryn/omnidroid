@@ -98,9 +98,22 @@ class FarmingBoot(unittest.TestCase):
     def setUp(self):
         self.calls = _boot("farming")
 
-    def test_still_does_everything_it_did(self):
-        for step in ("roblox_settings", "zram", "farming_squeeze", "balloon"):
-            self.assertIn(step, self.calls)
+    def test_the_boot_writes_the_settings_and_nothing_else(self):
+        """ClientAppSettings is the only farming lever that belongs at BOOT.
+
+        Roblox reads that file when the client starts, so it has to be written
+        before the client does — but zram, the squeeze and the balloon all
+        exist to make a JOINED, IDLE instance cheap, and this point in the
+        boot is before the session has even been delivered. Applying them here
+        starved the client's initial load: MEASURED 2026-08-16 on PS99 at
+        3072 MB with no balloon, the client sat at a flat ~400 MB with its
+        engine parked in `futex_wait` and the guest 200% idle. They moved to
+        `settle_density_instance`, which `cmd_start` calls once the client has
+        finished loading — and with that, farming reaches the PS99 world.
+        """
+        self.assertIn("roblox_settings", self.calls)
+        for step in ("zram", "farming_squeeze", "balloon"):
+            self.assertNotIn(step, self.calls)
 
     def test_does_not_run_the_gaming_tuning(self):
         self.assertNotIn("gaming_tuning", self.calls)

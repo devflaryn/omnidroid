@@ -16,29 +16,38 @@ and after, on the same machine (Windows, QEMU 11.0.50, RTX 4060):
 `-display egl-headless` is what makes that possible: a real host GL context
 with NO window, so virglrenderer can use the GPU.
 
-IT IS OFF BY DEFAULT, and that is the single most important thing these tests
-pin. On this QEMU/ANGLE build the guest renders into a host GL texture that is
-never read back into the 2D surface the VNC server publishes, so `omnidroid
-view` shows a BLACK SCREEN while the guest is drawing perfectly well.
-Measured on one host, same image, same account, only the flag differing:
+ITS DEFAULT IS PER-PLATFORM, and that is the single most important thing these
+tests pin. `-display egl-headless` gives the guest a GL context everywhere, but
+on Windows the frames never reach a scanout. MEASURED 2026-08-15, three boots
+(plain, blob=true+hostmem=512M, and without the forced `video=` mode), all
+identical:
 
-    headless_gl on    VNC framebuffer (0,0) on every channel      [black]
-    headless_gl off   VNC framebuffer (0,255) on every channel    [content]
+    dmesg           [drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1203
+                                                               (command 0x103)
+    timestats       totalFrames = 0
+    screencap       solid black
+    VNC             1 update, mean brightness 0.0
 
-QEMU's own `screendump` had content either way, which is what pins it on the
-GL->VNC readback rather than on the guest. It shipped default-ON for a few
-hours on the strength of a claim that was never tested — every screenshot
-taken while developing it came from `adb exec-out screencap`, which reads
-Android's compositor and looks identical either way.
+0x103 is SET_SCANOUT and 0x1203 is ERR_INVALID_RESOURCE_ID: QEMU refuses to
+scan out the buffer the guest offers. The guest's GL was fine — SurfaceFlinger
+came up on `virgl (ANGLE (NVIDIA ... RTX 4060))` with no GL errors in logcat —
+so this is presentation, not rendering. Linux is the platform egl-headless was
+written for and keeps the default ON there.
 
 The properties worth pinning are the ones that would silently break the
 product rather than fail loudly:
 
-  * it stays OFF unless asked for, so the viewer works,
+  * the default follows HEADLESS_GL_PRESENTS, so a host that cannot present
+    does not come up black,
+  * an explicit setting wins in BOTH directions (that is how the measurement
+    above gets re-taken on a newer QEMU),
   * it must degrade, never fail, on a QEMU without the pieces (the Homebrew
-    macOS build has neither), and
+    macOS build has neither),
   * egl-headless must still count as HEADLESS — read as "a window opened",
-    `start` stands its VNC viewer down and the user can see nothing at all.
+    `start` stands its VNC viewer down and the user can see nothing at all, and
+  * `-vnc` must SURVIVE it: egl-headless is the display QEMU documents as the
+    one to pair with VNC, and dropping the server there is what produced the
+    original "black viewer" report.
 """
 import os
 import sys
@@ -83,28 +92,39 @@ class Capability(unittest.TestCase):
 
 class Resolution(unittest.TestCase):
     def _pair(self, help_texts, interactive=False, cfg=None, env=None):
-        mode = {"window": False}
+        """(gpu_args, display_args) for a HEADLESS boot on a faked host."""
+        mode = {}
         with mock.patch.dict(os.environ, env or {}, clear=False), \
              mock.patch.object(qemu_proc, "_qemu_help_texts",
                                return_value=help_texts):
             if not env:
                 os.environ.pop("OMNI_HEADLESS_GL", None)
+            for stale in ("OMNI_GL_WINDOW", "OMNI_PANEL", "OMNI_GPU_OPTS",
+                          "OMNI_NO_WINDOW"):
+                os.environ.pop(stale, None)
+            # This class is about the HEADLESS tier only. Under the default
+            # `auto` policy a host that cannot present a windowless GL guest
+            # falls through to a native window, which is a different question
+            # (tests/test_gaming_mode.py owns it).
+            os.environ.setdefault("OMNI_GPU", qemu_proc.GPU_HEADLESS)
             return qemu_proc.resolve_gpu_display(mode, interactive,
                                                  "qemu-system-x86_64", cfg)
 
-    def test_it_is_OFF_by_default_because_it_blacks_out_the_viewer(self):
-        """The default is a MEASUREMENT, not caution.
-
-        egl-headless renders into a host GL texture this QEMU/ANGLE build never
-        reads back into the 2D surface VNC publishes, so `omnidroid view` shows
-        a black screen while the guest draws normally. Measured on one host,
-        same image, only this flag differing: VNC framebuffer (0,0) on every
-        channel with it on, (0,255) with it off, and QEMU's own screendump had
-        content either way.
-        """
+    def test_the_default_follows_what_this_platform_can_present(self):
+        """The default is a MEASUREMENT, not caution. See the module docstring:
+        on Windows an egl-headless guest renders and never scans out."""
         gpu, display = self._pair(WINDOWS_QEMU)
-        self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
-        self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
+        if qemu_proc.headless_gl_presents():
+            self.assertEqual(display, ["-display", "egl-headless"])
+        else:
+            self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
+            self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
+
+    def test_windows_is_pinned_OFF_and_linux_ON(self):
+        # Pinned as a table rather than as behaviour, so changing it is a
+        # deliberate edit next to the measurement that justifies it.
+        self.assertFalse(qemu_proc.HEADLESS_GL_PRESENTS["windows"])
+        self.assertTrue(qemu_proc.HEADLESS_GL_PRESENTS["linux"])
 
     def test_a_capable_host_gets_the_gpu_when_asked(self):
         gpu, display = self._pair(WINDOWS_QEMU, cfg={"qemu": {"headless_gl": True}})
@@ -112,14 +132,16 @@ class Resolution(unittest.TestCase):
         self.assertEqual(gpu, ["-device", "virtio-gpu-gl-pci,xres=1280,yres=800"])
 
     def test_an_incapable_host_gets_exactly_what_it_had_before(self):
-        gpu, display = self._pair(BREW_MAC_QEMU)
+        gpu, display = self._pair(BREW_MAC_QEMU,
+                                  cfg={"qemu": {"headless_gl": True}})
         self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
         self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
 
     def test_a_builder_boot_stays_on_the_plain_path(self):
         # Builder/maintenance boots exist to mutate an image, not to draw, and
         # must behave identically on every host.
-        gpu, display = self._pair(WINDOWS_QEMU, interactive=True)
+        gpu, display = self._pair(WINDOWS_QEMU, interactive=True,
+                                  cfg={"qemu": {"headless_gl": True}})
         self.assertEqual(display, qemu_proc.HEADLESS_DISPLAY_ARGS)
         self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
 
@@ -146,6 +168,38 @@ class Resolution(unittest.TestCase):
         self.assertEqual(gpu, qemu_proc.HEADLESS_GPU_ARGS)
 
 
+class VncSurvivesHeadlessGl(unittest.TestCase):
+    """The bug that cost the viewer, pinned so it cannot come back.
+
+    QEMU refuses `-vnc` beside a WINDOWED display that has taken a GL context.
+    It does NOT refuse egl-headless — that display exists to be paired with
+    vnc/spice. Treating the two cases the same is what left every
+    GPU-accelerated boot with no VNC server at all, which then read as "the
+    viewer is black"."""
+
+    def test_egl_headless_keeps_the_vnc_server(self):
+        self.assertEqual(
+            qemu_proc.vnc_args(["-display", "egl-headless"], 101),
+            ["-vnc", "127.0.0.1:101"])
+
+    def test_a_windowed_gl_display_still_drops_it(self):
+        for d in ("gtk,gl=on", "sdl,gl=on", "cocoa,gl=es"):
+            self.assertEqual(qemu_proc.vnc_args(["-display", d], 101), [], d)
+
+    def test_a_windowed_display_without_gl_keeps_it(self):
+        self.assertEqual(qemu_proc.vnc_args(["-display", "gtk"], 101),
+                         ["-vnc", "127.0.0.1:101"])
+
+    def test_plain_headless_keeps_it(self):
+        self.assertEqual(qemu_proc.vnc_args(["-display", "none"], 101),
+                         ["-vnc", "127.0.0.1:101"])
+
+    def test_blocks_vnc_is_not_the_same_question_as_uses_gl_context(self):
+        egl = ["-display", "egl-headless"]
+        self.assertTrue(qemu_proc.uses_gl_context(egl))
+        self.assertFalse(qemu_proc.blocks_vnc(egl))
+
+
 class StillHeadless(unittest.TestCase):
     def test_egl_headless_does_not_count_as_a_window(self):
         cmd = ["qemu", "-display", "egl-headless", "-vnc", "127.0.0.1:1"]
@@ -160,6 +214,48 @@ class StillHeadless(unittest.TestCase):
     def test_display_none_is_still_headless(self):
         self.assertFalse(qemu_proc.command_opens_a_window(
             ["qemu", "-display", "none"]))
+
+
+class TheViewerSaysWhyItIsGone(unittest.TestCase):
+    """A GPU boot that took a window has no VNC server, and the message the
+    user gets has to say THAT.
+
+    Without it, `omnidroid view` fails with "the VNC port did not open in
+    time", which points at a timeout, a firewall or a slow boot -- anything
+    except the one thing that is true. Same for the app's View button, which
+    calls `view --json`.
+    """
+
+    def setUp(self):
+        from omnidroid import engine
+        self.engine = engine
+
+    def _reason(self, run):
+        with mock.patch.object(self.engine, "_run_record", return_value=run):
+            return self.engine.vnc_unavailable_reason("u1")
+
+    def test_a_windowed_gl_boot_explains_itself(self):
+        why = self._reason({"native_window": True, "gpu": "gl"})
+        self.assertIsNotNone(why)
+        # It has to name the escape hatch and the thing that still works.
+        self.assertIn("--gpu headless", why)
+        self.assertIn("screenshot", why)
+
+    def test_a_headless_gpu_boot_has_nothing_to_explain(self):
+        self.assertIsNone(self._reason({"native_window": False, "gpu": "gl"}))
+
+    def test_a_software_boot_has_nothing_to_explain(self):
+        self.assertIsNone(self._reason({"native_window": False,
+                                        "gpu": "software"}))
+
+    def test_a_windowed_boot_without_gl_keeps_its_server(self):
+        # tier "window" is a native window with software rendering: no GL
+        # context, so QEMU has no objection to -vnc and the viewer works.
+        self.assertIsNone(self._reason({"native_window": True,
+                                        "gpu": "software"}))
+
+    def test_an_unknown_instance_does_not_invent_a_reason(self):
+        self.assertIsNone(self._reason({}))
 
 
 if __name__ == "__main__":

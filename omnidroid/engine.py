@@ -38,6 +38,7 @@ from omnidroid import config
 from omnidroid import consent
 from omnidroid import farming
 from omnidroid import gaming
+from omnidroid import glmask
 from omnidroid import lean
 from omnidroid.config import (
     REPO, CONFIG_PATH, QEMU_DIR,
@@ -91,11 +92,14 @@ DEFAULT_SRC = "/android-2024-10-11"
 #                provisioned /data fails with init_user0_failed. An account
 #                therefore copies the provisioned (system-overlay, data,
 #                efivars) trio rather than provisioning on first boot.
+from omnidroid import embedview
+from omnidroid import migfile
 from omnidroid.bases import *  # noqa: F401,F403
 from omnidroid.bases import (_truthy_env, _debug_boot_requested,
                              _no_warm_requested,
                              _select_base_tag, _next_base_tag)  # noqa: F401
 from omnidroid import offsets as offsets_mod
+from omnidroid import pool
 
 
 
@@ -468,6 +472,32 @@ def boot_gl_panel(name):
             return int(panel[0]), int(panel[1])
         except (TypeError, ValueError):
             return None
+    return None
+
+
+def vnc_unavailable_reason(name):
+    """Why this instance has no VNC server, or None if it should have one.
+
+    QEMU refuses `-vnc` beside a windowed GL display, so a boot that took the
+    GPU through a native window has no framebuffer for anyone to attach to.
+    Without this, `view`/`capture` fail with "the VNC port did not open in
+    time", which points at a timeout, a firewall, a slow boot -- anything
+    except the one thing that is actually true. Read off the boot's own
+    run.json rather than recomputed, like every other property of a live
+    instance."""
+    run = _run_record(name)
+    if not run:
+        return None
+    if run.get("native_window") and run.get("gpu") == "gl":
+        return (f"this boot took the GPU through a native QEMU window, and "
+                f"QEMU refuses a VNC server beside one — so '{name}' has no "
+                f"framebuffer to attach to. `omnidroid view {name}` still "
+                f"works: it HOSTS that window inside our own viewer rather "
+                f"than connecting to a framebuffer. What has no VNC to read "
+                f"is `capture`/autocap. `omnidroid screenshot {name}` works "
+                f"either way — it goes through adb. Start with "
+                f"`--gpu headless` if you need the VNC framebuffer itself "
+                f"(that boot renders in software, ~3 fps on this host).")
     return None
 
 
@@ -966,6 +996,28 @@ def resolve_launch_offset(cfg, tag, requested=None, allow_none=False,
     return name, img
 
 
+def validate_instance_name(name, allow_pool=False):
+    """Refuse a name that cannot safely become a runtime directory.
+
+    Called before ANYTHING writes under `runtime/<name>/`. That used to be
+    build_acct's job alone, which was fine while build_acct was the only thing
+    that wrote there — the warm pool's adoption now writes a run.json BEFORE
+    build_acct is reached, so the check has to move earlier than the caller
+    that happens to need it.
+
+    The `_pool` prefix is reserved: `pool.sweep()` deletes dead directories
+    whose name starts with it, so an account called `_pool0` would be a real
+    account whose runtime the pool GCs out from under it."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name or ""):
+        fail("bad_name",
+             f"instance/username must be [A-Za-z0-9_-]+ (got '{name}')")
+    if not allow_pool and pool.is_slot(name):
+        fail("reserved_name",
+             f"'{pool.SLOT_PREFIX}…' is reserved for the warm pool "
+             f"(got '{name}'); the pool GCs those directories.")
+    return name
+
+
 def build_acct(name, cfg, debug=False, offset=None, allow_no_offset=False,
                label=None):
     """Build the EPHEMERAL launch handle for `name`: resolves the base tag,
@@ -989,9 +1041,8 @@ def build_acct(name, cfg, debug=False, offset=None, allow_no_offset=False,
     likewise not a property of the account: there is exactly one account
     identity and it can be launched on any baked version. None means "the
     base's default offset"."""
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
-        fail("bad_name",
-             f"instance/username must be [A-Za-z0-9_-]+ (got '{name}')")
+    # A pool slot IS built through here, so it must be allowed its own prefix.
+    validate_instance_name(name, allow_pool=pool.is_slot(name))
     # The HOST's base, not a hardcoded arm one: an amd64 Windows box boots the
     # x86-bliss base under WHPX, an Apple-Silicon Mac boots the arm64 base
     # under HVF. _select_base_tag()'s default already resolves the effective
@@ -1785,15 +1836,32 @@ def cmd_start(args):
     label = f"start {args.name}"
     json_mode = getattr(args, "json", False)
 
-    # --no-window now means what it says: NOTHING appears on screen. It used
-    # to suppress only the VNC viewer, which was the whole meaning of "window"
-    # back when no mode opened a native one. `playable` opens a GPU window now
-    # (see qemu_proc.MODES), so the flag has to reach the argv builder as well
-    # — via the environment, because that builder is called from four places
-    # and a fifth parameter is how one of them ends up not passing it.
+    # --no-window suppresses the VIEWER. No mode opens a native QEMU window
+    # any more (see qemu_proc.resolve_gpu_display), so this no longer costs the
+    # GPU — it is purely "do not put anything on my screen". It still reaches
+    # the argv builder via the environment, because that builder is called from
+    # four places and a fifth parameter is how one of them ends up not passing
+    # it, and because it must still override the OMNI_GL_WINDOW escape hatch.
     if getattr(args, "no_window", False):
         os.environ["OMNI_NO_WINDOW"] = "1"
+    # --panel likewise: panel_for() reads OMNI_PANEL ahead of the config and
+    # the mode, so one assignment here reaches every argv builder and the
+    # post-boot tune-up alike.
+    if getattr(args, "gpu", None):
+        os.environ["OMNI_GPU"] = str(args.gpu)
+    if getattr(args, "panel", None):
+        from omnidroid.qemu_proc import parse_panel
+        if not parse_panel(args.panel):
+            return fail("bad_panel",
+                        f"--panel {args.panel!r} is not a size. Use WxH "
+                        f"(1920x1080) or a name ({'/'.join(PANEL_NAMES)}).")
+        os.environ["OMNI_PANEL"] = str(args.panel)
 
+    # BEFORE anything reads or writes runtime/<name>/. It used to be enough
+    # that build_acct validated, because build_acct was the first thing to
+    # touch that directory; the warm pool's adoption writes a run.json before
+    # build_acct is reached.
+    validate_instance_name(args.name)
     if running_pid(args.name):
         sys.exit(f"error: '{args.name}' is already running")
 
@@ -1857,9 +1925,33 @@ def cmd_start(args):
     want_offset = getattr(args, "offset", None)
     if getattr(args, "no_offset", False):
         want_offset = offsets_mod.NO_OFFSET
-    acct = build_acct(args.name, cfg, debug=debug, offset=want_offset,
-                      allow_no_offset=bool(getattr(args, "apk", None)),
-                      label=label)
+    # WARM POOL FIRST. A pooled slot is an instance already booted to exactly
+    # the point build_acct + _ensure_booted would have reached, so adopting
+    # one replaces the boot rather than shortening it. Skipped for --apk and
+    # --debug: both change what the machine IS, and a pre-booted slot cannot
+    # retroactively have been that machine.
+    acct = None
+    if not (getattr(args, "apk", None) or debug or no_warm):
+        try:
+            acct = pool_try_adopt(
+                args.name, cfg,
+                pool_launch_spec(
+                    cfg, mode_name=getattr(args, "mode", None),
+                    mem=getattr(args, "mem", None),
+                    smp=getattr(args, "smp", None),
+                    balloon=getattr(args, "balloon", None),
+                    quality=getattr(args, "quality", None),
+                    guest_display=_guest_display_arg(args),
+                    offset=want_offset, debug=False,
+                    arch=arch_of_base(cfg["bases"][_select_base_tag(cfg)])),
+                label, accel=getattr(args, "accel", None))
+        except Exception as e:      # noqa: BLE001 - the pool is an optimisation
+            print(f"[{label}] warm pool unavailable ({e}); booting normally")
+            acct = None
+    if acct is None:
+        acct = build_acct(args.name, cfg, debug=debug, offset=want_offset,
+                          allow_no_offset=bool(getattr(args, "apk", None)),
+                          label=label)
 
     from omnidroid.timings import Timings
     timings = Timings()
@@ -1871,6 +1963,7 @@ def cmd_start(args):
                                    smp=getattr(args, "smp", None),
                                    balloon=getattr(args, "balloon", None),
                                    quality=getattr(args, "quality", None),
+                                   guest_display=_guest_display_arg(args),
                                    debug=debug, no_warm=no_warm)
     timings.mark("boot")
     result = {"name": args.name, "place_id": sess.get("place_id"),
@@ -1916,10 +2009,42 @@ def cmd_start(args):
     # EVERY performance-profile mode gets the pin, not just `gaming`: the
     # latency-critical scheduler set is what makes an instance feel like a
     # game, and `playable` is the mode a human and the AI actually use.
-    if resolve_mode(read_config(), getattr(args, "mode", None)).get(
-            "profile", "performance") == "performance":
+    launch_mode = resolve_mode(cfg, getattr(args, "mode", None),
+                               mem=getattr(args, "mem", None),
+                               smp=getattr(args, "smp", None),
+                               balloon=getattr(args, "balloon", None),
+                               arch=acct_arch(acct),
+                               guest_display=_guest_display_arg(args))
+    if launch_mode.get("profile", "performance") == "performance":
         pin_game_to_top_app(acct, label)
     timings.mark("game_foreground")
+    # FARMING squeezes HERE, not in the boot tail. The whole point of the
+    # squeeze is to make a joined, IDLE instance cheap, and until this line the
+    # client has not even been told which place to load — squeezing it during
+    # the load is what stopped a farming instance ever reaching the world
+    # (measured 2026-08-16; see settle_density_instance and MODES.md).
+    if launch_mode.get("profile") == "density" and result.get("ok"):
+        settle_density_instance(acct, launch_mode, label, debug=debug)
+        timings.mark("density_settled")
+    # WHAT THE CLIENT ITSELF SAYS, on every mode and every launch that got as
+    # far as delivering a session. Recorded, never asserted: `ok` means the
+    # session was delivered and the kiosk launched the game, which is a
+    # DIFFERENT claim from "Roblox is in the place". A client sitting on
+    # "Connection Failed (Error Code: 279)" satisfied every check this engine
+    # had -- seen repeatedly on 2026-08-16, and the cause was off-box both
+    # times (a DPI filter, then the guest's MTU not fitting the host's VPN).
+    #
+    # Not gated on the density profile: a gaming launch fails the same way,
+    # and it is the one a human is watching.
+    if result.get("ok"):
+        result["client"] = probe_client_join(acct, label)
+    # The game process exists now, so a renderer mask can be CHECKED rather
+    # than assumed. Only asked when one was actually requested: the mask is
+    # off by default (it kills the client on the x86 base -- see glmask.py),
+    # and reporting `gl_mask: null` on every ordinary launch would be noise
+    # about a feature nobody turned on.
+    if result.get("ok") and any(gl_mask_settings(cfg)):
+        result["gl_mask"] = verify_gl_mask(acct, label)
 
     # LOUD failure check (only when a custom --apk was installed): deliver_session
     # reporting "delivered" only means the cookie broadcast reached the app -- it
@@ -4673,7 +4798,49 @@ def cmd_root_base(args):
 
 
 def _host_rss_mb(pid):
-    """Resident set of one QEMU process in MB, or None if it is gone."""
+    """Resident set of one QEMU process in MB, or None if it is gone.
+
+    `ps` is a POSIX tool and Windows has none, so on Windows this returned None
+    for every instance and `omnidroid measure` -- the command whose entire job
+    is to report what an instance costs the host -- printed a dash in its main
+    column on the platform the product ships on. GetProcessMemoryInfo is the
+    direct equivalent: WorkingSetSize IS the resident set.
+    """
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD),
+                            ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t),
+                            ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t)]
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            PROCESS_VM_READ = 0x0010
+            k32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+            handle = k32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                False, int(pid))
+            if not handle:
+                return None
+            try:
+                pmc = _PMC()
+                pmc.cb = ctypes.sizeof(_PMC)
+                if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc),
+                                                  pmc.cb):
+                    return None
+                return pmc.WorkingSetSize / 1048576
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - a measurement must never raise
+            return None
     try:
         r = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
                            capture_output=True, text=True, timeout=10)
@@ -5822,6 +5989,12 @@ def account_status(a, stats=False):
            "vnc_port": a.get("vnc_port"), "vnc_host": "127.0.0.1",
            "adb_serial": f"127.0.0.1:{adb_port}" if adb_port else None,
            "offset": a.get("offset"), "debug": bool(a.get("debug")),
+           # A warm-POOL slot is a real running instance -- all_accounts()
+           # unions it in deliberately, so the "refuse while something is
+           # running" guards still see it -- but it is not somebody's account
+           # and must not be presented as one. Flagged rather than filtered:
+           # hiding it here is how a guard silently stops guarding.
+           "pool_slot": pool.is_slot(a["name"]),
            "game_package": a.get("game_package")}
     if pid:
         try:
@@ -5873,6 +6046,8 @@ def cmd_list(args):
                 line += f"  mode {rec['mode']}"
             if rec.get("debug"):
                 line += "  [debug]"
+            if rec.get("pool_slot"):
+                line += "  [warm pool]"
         if rec["running"] and args.stats:
             if rec.get("host_rss_mb"):
                 line += f"  host-rss {rec['host_rss_mb']} MB"
@@ -6228,6 +6403,49 @@ def _spawn_builtin_viewer(name, host, port, title):
     return subprocess.Popen(cmd, **kwargs)
 
 
+# How long `view` waits to see whether the embedded viewer stayed up. It either
+# attaches within a few hundred ms or exits, so this only has to be longer than
+# a Tk startup on a loaded host -- and every second of it is a second the user
+# waits for a window that is already on screen.
+EMBED_VIEWER_SETTLE = 2.5
+
+
+def _spawn_embedded_viewer(name, title, panel, identity=None, pid=None):
+    """Launch the viewer that HOSTS QEMU's own window instead of copying its
+    pixels (see omnidroid/embedview.py). Same detached-process shape as the RFB
+    viewer, so both are killed, logged and reasoned about identically."""
+    a = ["_embedview", "--identity", identity or f"omni-{name}"]
+    if pid:
+        a += ["--pid", str(pid)]
+    if title:
+        a += ["--title", title]
+    if panel:
+        a += ["--size", f"{panel[0]}x{panel[1]}"]
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + self_argv_prefix() + a
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())] + a
+    d = runtime_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    log = open(d / "viewer.log", "a")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(cmd, **kwargs)
+
+
+def boot_has_hidden_window(name):
+    """Did this boot open a QEMU window and then hide it?
+
+    That is the configuration where the viewer must EMBED rather than connect:
+    the pixels exist, on the GPU, in a window nobody can see, and there is no
+    VNC server because QEMU refuses one beside a GL window."""
+    run = _run_record(name)
+    return bool(run.get("native_window")) and bool(run.get("window_hidden"))
+
+
 def cmd_view(args):
     """Open a LIVE window onto an instance — real-time screen with mouse and
     keyboard control — launched straight from the terminal.
@@ -6263,6 +6481,88 @@ def cmd_view(args):
 
     # Wait for the QEMU VNC server to accept connections (it binds at process
     # start, so this is quick; generous bound covers a cold spawn).
+    # A GPU boot on this host has its pixels in a hidden QEMU window and no VNC
+    # server at all (QEMU refuses one beside a GL window). Do not connect to a
+    # port nobody is listening on -- HOST that window inside our own viewer
+    # instead. Same window to the user, none of the copy/encode/decode a
+    # framebuffer protocol would cost, and input goes straight into the guest's
+    # usb-tablet instead of being synthesised from RFB.
+    if boot_has_hidden_window(args.name) and embedview.available() \
+            and not getattr(args, "native", False):
+        # A viewer that was FORCE-killed takes QEMU's window down with it --
+        # Windows destroys a child window when its parent dies, and QEMU does
+        # not make a new one. The instance keeps running and keeps answering
+        # adb, but it renders nothing at all (measured: totalFrames = 0 after
+        # a taskkill /F on the viewer). Say that, rather than opening an empty
+        # window onto a guest whose display is gone.
+        from omnidroid import hostwin
+        run = _run_record(args.name)
+        identity = run.get("identity") or f"omni-{args.name}"
+        qemu_pid = run.get("pid")
+        # THREE states, and telling them apart is the whole point. They were
+        # one state for an afternoon, and "you already have this open" reported
+        # itself as "the guest's display was destroyed" -- because EnumWindows
+        # does not list child windows, and an embedded window IS a child.
+        if hostwin.window_is_embedded(identity, pid=qemu_pid):
+            hostwin.show_qemu_window(identity)
+            print(f"[view {args.name}] a viewer already has this instance's "
+                  f"window; bringing it forward")
+            if getattr(args, "json", False):
+                emit_json({"name": args.name, "viewer": "embedded",
+                           "already": True, "vnc_host": None,
+                           "vnc_port": None, "started": started, "ok": True})
+            return
+        if hostwin.find_window(identity, timeout=2, pid=qemu_pid) is None:
+            return fail(
+                "display_lost",
+                f"'{args.name}' is running but its display is gone: the QEMU "
+                f"window that held the GL context was destroyed, which happens "
+                f"when a viewer is force-killed rather than closed. The guest "
+                f"is alive on adb but renders nothing. Restart it "
+                f"(`omnidroid stop {args.name} && omnidroid start "
+                f"{args.name}`), and close the viewer with its X next time.")
+        panel = boot_gl_panel(args.name)
+        title = f"omni: {args.name}"
+        try:
+            proc = _spawn_embedded_viewer(args.name, title, panel,
+                                          identity=identity, pid=qemu_pid)
+        except Exception as e:      # noqa: BLE001
+            return fail("viewer_failed",
+                        f"could not open the embedded viewer: {e}")
+        # The child does the actual reparenting and can still fail at it (the
+        # window went away in the meantime, Tk missing, ...). It exits
+        # immediately when it does, so a short wait turns a silent empty
+        # viewer into a real error with the child's own reason.
+        try:
+            rc = proc.wait(timeout=EMBED_VIEWER_SETTLE)
+        except subprocess.TimeoutExpired:
+            rc = None                      # still up: it attached
+        if rc is not None:
+            tail = ""
+            try:
+                tail = (runtime_dir(args.name) / "viewer.log").read_text(
+                    errors="replace").strip().splitlines()[-1]
+            except Exception:      # noqa: BLE001
+                pass
+            return fail("viewer_failed",
+                        f"the embedded viewer exited immediately (rc={rc})"
+                        + (f": {tail}" if tail else ""))
+        print(f"[view {args.name}] live viewer opened [embedded QEMU window] "
+              f"- GPU-rendered, native input; viewer pid {proc.pid}")
+        if getattr(args, "json", False):
+            emit_json({"name": args.name, "viewer": "embedded",
+                       "viewer_pid": proc.pid, "vnc_host": None,
+                       "vnc_port": None, "started": started, "ok": True})
+        return
+
+    why = vnc_unavailable_reason(args.name)
+    if why:
+        # fail(), not sys.exit(): the app calls this through `view --json` and
+        # a bare exit gives it a non-zero status with nothing to show the user.
+        # This is the one message that has to reach the screen intact, because
+        # it is the difference between "the viewer is broken" and "this boot
+        # traded the viewer for the GPU, and here is how to swap back".
+        return fail("no_vnc_gl_window", why)
     deadline = time.time() + (args.timeout if started else 5)
     while not _port_open(host, port):
         if not running_pid(args.name):
@@ -6301,6 +6601,16 @@ def cmd_view(args):
         emit_json({"name": args.name, "vnc_host": host, "vnc_port": port,
                    "viewer": viewer_desc, "viewer_pid": vpid,
                    "started": started, "ok": True})
+
+
+def _run_embedview(a):
+    """Hidden subcommand: the embedded-window viewer child process."""
+    size = None
+    if getattr(a, "size", None):
+        from omnidroid.qemu_proc import parse_panel
+        size = parse_panel(a.size)
+    return embedview.run_embedded_viewer(a.identity, title=a.title,
+                                        size=size, pid=getattr(a, "pid", None))
 
 
 def _run_vncview(a):
@@ -6799,6 +7109,11 @@ def stop_autocap(name):
 def maybe_start_autocap(acct, label):
     """Best-effort auto-start hook for the boot paths. Never raises into the
     boot flow — a recorder failure must not fail `start`."""
+    # A boot that took the GPU through a window has no VNC server for the
+    # recorder to read (see vnc_unavailable_reason). Skipping quietly beats
+    # spawning a recorder that will spin on a port nobody is listening on.
+    if vnc_unavailable_reason(acct.get("name")):
+        return
     try:
         r = ensure_autocap(acct)
         if r.get("running") and not r.get("already"):
@@ -7221,31 +7536,83 @@ def _parse_broadcast_result(out):
         return {"raw": raw}
 
 
-def kiosk_broadcast(acct, action, extras=None, timeout=45):
+def kiosk_broadcast(acct, action, extras=None, timeout=120):
     """Send an ordered broadcast to the kiosk and return its parsed reply.
 
     Values are quoted for the GUEST shell: `adb shell` concatenates argv into one
     string that the device's sh re-parses, so an unquoted token (or launch_data
-    JSON) would be word-split there."""
+    JSON) would be word-split there.
+
+    A TIMEOUT IS A RESULT, NOT AN EXCEPTION. An ordered broadcast blocks until
+    the receiver has run, so this call is as slow as the guest is: on a farming
+    boot (1-2 vCPU, squeezed, balloon inflating, Roblox starting under arm64
+    translation) 45 s was not enough and `adb` raised TimeoutExpired straight
+    out of cmd_start -- a full traceback where the user should have seen "the
+    session was not delivered". Returning `(None, ...)` puts it back on the
+    ordinary failure path deliver_session already has.
+
+    The default is 120 s for the same reason: the old 45 s was measured against
+    a performance boot and is simply the wrong budget for a density one.
+    """
     parts = ["am", "broadcast", "-a", shlex.quote(action),
              "-n", shlex.quote(KIOSK_RECEIVER)]
     for key, (flag, val) in (extras or {}).items():
         parts += [flag, shlex.quote(key), shlex.quote(str(val))]
-    r = adb(acct, "shell", " ".join(parts), timeout=timeout)
+    try:
+        r = adb(acct, "shell", " ".join(parts), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"<no reply: the kiosk broadcast timed out after {timeout}s>"
+    except OSError as e:
+        return None, f"<no reply: could not run adb ({e})>"
     out = (r.stdout or "") + (r.stderr or "")
     return _parse_broadcast_result(out), out
 
 
+# `pm path` on a squeezed farming guest is not a fast call: package manager
+# queries queue behind whatever else the 1-2 vCPU guest is doing. 15 s was not
+# enough and the TimeoutExpired came out of `start` as a traceback -- MEASURED
+# on a farming boot that had already joined successfully. Two tries, generous
+# budget, and a timeout answers False rather than raising.
+KIOSK_PROBE_TIMEOUT = 45
+KIOSK_PROBE_TRIES = 2
+
+
 def kiosk_installed(acct):
-    r = adb(acct, "shell", "pm", "path", KIOSK_PACKAGE, timeout=15)
-    return "package:" in (r.stdout or "")
+    """Is the in-guest kiosk installed? A slow guest answers late, not never."""
+    for attempt in range(KIOSK_PROBE_TRIES):
+        r = adb_soft(acct, "shell", "pm", "path", KIOSK_PACKAGE,
+                     timeout=KIOSK_PROBE_TIMEOUT)
+        if "package:" in (r.stdout or ""):
+            return True
+        if r.returncode != -1:
+            return False                    # answered, and it is not there
+        if attempt + 1 < KIOSK_PROBE_TRIES:
+            print(f"[kiosk] `pm path` did not answer in "
+                  f"{KIOSK_PROBE_TIMEOUT}s; retrying")
+    return False
 
 
 def deliver_session(acct, label, sess, play=True, restart=True):
-    """Hand `sess` (see store_session()) to the in-guest kiosk and (by default)
-    tell it to join. `play=False` (no place_id) is HOME mode: the cookie is
-    still delivered — the account is logged in — but no place is joined.
-    Returns a status dict; never raises into a boot path."""
+    """Hand `sess` to the kiosk and (by default) tell it to join.
+
+    Returns a status dict; NEVER raises into a boot path -- and that promise is
+    now enforced here rather than assumed of every call inside. It was not
+    true: a `pm path` that did not answer within its timeout came out of
+    `omnidroid start` as a traceback, on the mode most likely to be slow. A
+    delivery that fails has to look like every other delivery failure, so the
+    launch can report it and the instance can keep running.
+    """
+    try:
+        return _deliver_session(acct, label, sess, play=play, restart=restart)
+    except Exception as e:      # noqa: BLE001 - see the docstring: never raise
+        print(f"[{label}] session delivery failed: {e!r}")
+        return {"delivered": False, "reason": "delivery_error",
+                "detail": repr(e)[:400]}
+
+
+def _deliver_session(acct, label, sess, play=True, restart=True):
+    """The actual delivery. `play=False` (no place_id) is HOME mode: the cookie
+    is still delivered — the account is logged in — but no place is joined."""
     name = acct["name"]
     if not sess.get("token") and not sess.get("place_id"):
         return {"delivered": False, "reason": "no_session"}
@@ -7317,14 +7684,298 @@ def deliver_session(acct, label, sess, play=True, restart=True):
     return status
 
 
-def apply_farming_squeeze(acct, mode=None):
+def gl_mask_settings(cfg=None):
+    """(renderer, vendor) this boot claims, or (None, None) when masking off.
+
+    Order matches every other setting in the engine: env -> config -> default.
+
+    DEFAULT OFF, and that is a measurement rather than caution: on the x86
+    base the `wrap.` property KILLS the client three seconds into startup —
+    seccomp refuses the `mount()` that the arm64 native bridge makes while
+    initialising, because the wrapped launch re-execs and the app's seccomp
+    filter is already installed by then. Roblox is arm64-only, so every launch
+    on that base goes through the native bridge. glmask.py has the tombstone
+    and the two mechanisms that could still work. Turn it on with
+    OMNI_GL_MASK=1 / config hiding.gl_mask if you are testing one of them."""
+    hiding = ((cfg or {}).get("hiding") or {})
+    raw = os.environ.get("OMNI_GL_MASK", hiding.get("gl_mask", "off"))
+    if str(raw).strip().lower() in ("off", "0", "no", "none", "false"):
+        return None, None
+    renderer = (os.environ.get("OMNI_GL_RENDERER")
+                or hiding.get("gl_renderer") or glmask.DEFAULT_RENDERER)
+    vendor = (os.environ.get("OMNI_GL_VENDOR")
+              or hiding.get("gl_vendor") or glmask.DEFAULT_VENDOR)
+    return renderer, vendor
+
+
+def apply_gl_mask(acct, cfg=None, label=None):
+    """Make the game see a phone's GPU instead of llvmpipe/virgl.
+
+    Runs on EVERY boot and EVERY mode -- a gaming instance is exactly as
+    detectable as a farming one, and the whole cost is one property.
+
+    MUST run before the game starts, which is why it lives in the boot tail
+    and not beside the tuning: `wrap.<pkg>` is read by Zygote at fork time, so
+    setting it under a running client does nothing until that client is
+    restarted. `deliver_session` restarts it moments later, so the wrapped
+    launch is the one that gets the cookie.
+
+    Needs root to set a property, and gets it: adbd runs as uid 0 on the x86
+    base (see resolve_root_shell -- `""` is a VALID root mode)."""
+    # NEVER raise into the boot path. This is a best-effort tune-up in the
+    # shared boot tail, and the tail's other steps learned the same lesson the
+    # hard way: adb's _require_adb_port calls fail(), which sys.exits, so
+    # SystemExit has to be caught alongside Exception or a missing endpoint
+    # ends the process. See quiet_the_store, which documents the three test
+    # suites that went down when it was added without this.
+    try:
+        return _apply_gl_mask(acct, cfg, label)
+    except (Exception, SystemExit) as e:      # noqa: BLE001
+        if label:
+            print(f"[{label}] gl mask: skipped ({e})")
+        return {"applied": False, "reason": "error", "detail": str(e)}
+
+
+def _apply_gl_mask(acct, cfg=None, label=None):
+    renderer, vendor = gl_mask_settings(cfg)
+    if not renderer and not vendor:
+        # The default. Clear the property rather than merely not setting it:
+        # a mask enabled EARLIER IN THIS BOOT (an experiment, an adopted pool
+        # slot warmed with it on) would otherwise still be in force, and it
+        # kills the client. Properties do not survive a guest reboot, so this
+        # is about the live guest, not about /data.
+        root_shell(acct, glmask.build_clear_script(
+            acct.get("game_package") or GAME_PACKAGE), timeout=15)
+        return {"applied": False, "reason": "disabled"}
+    pkg = acct.get("game_package") or GAME_PACKAGE
+    value = glmask.wrap_value(renderer, vendor)
+    if not glmask.value_fits(value):
+        # An over-long value does not truncate -- the property service refuses
+        # it outright and setprop still exits 0, so this must be caught here
+        # or the boot silently runs unmasked.
+        if label:
+            print(f"[{label}] gl mask: NOT applied — the renderer/vendor "
+                  f"strings need {len(value)} chars and an Android property "
+                  f"holds {glmask.PROP_VALUE_MAX}. Shorten "
+                  f"hiding.gl_renderer / hiding.gl_vendor.")
+        return {"applied": False, "reason": "too_long", "length": len(value)}
+    r = root_shell(acct, glmask.build_apply_script(value, pkg), timeout=20)
+    if r is None:
+        if label:
+            print(f"[{label}] gl mask: SKIPPED — no root on this instance, "
+                  f"and `wrap.` is a system property. The guest keeps "
+                  f"reporting its real renderer.")
+        return {"applied": False, "reason": "no_root"}
+    got = glmask.parse_applied((r.stdout or "") + (r.stderr or ""))
+    ok = bool(got) and got.strip() == value.strip()
+    if label:
+        if ok:
+            print(f"[{label}] gl mask: the game will report "
+                  f"'{renderer}' ({vendor}) instead of this host's renderer")
+        else:
+            print(f"[{label}] gl mask: the property did not stick "
+                  f"(wanted {value!r}, guest holds {got!r}). The guest "
+                  f"reports its real renderer.")
+    return {"applied": ok, "value": value, "guest": got,
+            "renderer": renderer, "vendor": vendor}
+
+
+def verify_gl_mask(acct, label=None):
+    """Did the mask actually reach the RUNNING game's environment?
+
+    Reads `/proc/<pid>/environ`, not the property: the property proves only
+    that a property was set. `wrap.` is refused for a non-debuggable app on a
+    non-debuggable build, and that refusal is silent -- the app just starts
+    normally -- so nothing short of the process's own environ is evidence."""
+    pkg = acct.get("game_package") or GAME_PACKAGE
+    r = root_shell(acct, glmask.build_verify_script(pkg), timeout=20)
+    if r is None:
+        return {"verified": None, "detail": "no root"}
+    applied, detail = glmask.parse_verify((r.stdout or "") + (r.stderr or ""))
+    if label and applied is False:
+        print(f"[{label}] gl mask: set, but the running game does NOT carry "
+              f"it ({detail}). Zygote refuses `wrap.` for an app it does not "
+              f"consider debuggable — check `getprop ro.debuggable`.")
+    elif label and applied:
+        print(f"[{label}] gl mask: confirmed in the game's own environment")
+    return {"verified": applied, "detail": detail}
+
+
+# How the deferred squeeze decides the client has finished loading.
+#
+# PSS, sampled over adb, rather than a log marker: Roblox's log vocabulary
+# moves between client builds and a marker that silently stops matching would
+# put the squeeze back where it was (on top of a loading client) with nothing
+# to show for it. Memory is the thing the squeeze is about anyway.
+SETTLE_INTERVAL_S = 15
+SETTLE_TIMEOUT_S = 420
+# Below this the client is on a splash or a login screen, not in a place. PS99
+# passes it within ~40 s of the session landing (measured: 1173 MB at 111 s).
+SETTLE_FLOOR_MB = 700
+# Two consecutive samples within this of each other = it has stopped growing.
+SETTLE_TOLERANCE = 0.04
+SETTLE_STABLE_SAMPLES = 2
+
+
+# Where the Roblox client keeps its own log, and what it says about the join.
+# Read as a REPORT, never as a gate: the wording moves between client builds,
+# so a miss must mean "could not tell", not "it failed".
+CLIENT_LOG_DIR = "/data/data/{pkg}/files/appData/logs"
+CLIENT_JOINED = (r"Connection accepted", r"clientReplicator",
+                 r"DataModel::doDataModelSetup", r"Received CLIENT_ID")
+CLIENT_REFUSED = (r"Error Code: (\d+)", r"DisconnectReason",
+                  r"Failed to connect to the experience")
+
+
+def probe_client_join(acct, label=None):
+    """What the client itself says about the join: joined, refused, or silent.
+
+    Exists because `start` reporting ok=true means the SESSION was delivered
+    and the kiosk launched the game — it says nothing about whether Roblox
+    then got into the place. A client sitting on "Connection Failed (Error
+    Code: 279)" satisfies every check this engine had, which is exactly the
+    "confident lie" failure this codebase keeps rediscovering.
+    """
+    pkg = acct.get("game_package") or GAME_PACKAGE
+    d = CLIENT_LOG_DIR.format(pkg=pkg)
+    try:
+        r = root_shell(acct, f"L=$(ls -t {d} 2>/dev/null | head -1); "
+                             f'[ -n "$L" ] && tail -400 {d}/$L', timeout=60)
+    except (Exception, SystemExit):      # noqa: BLE001
+        return {"in_world": None, "detail": "could not read the client log"}
+    body = ((r.stdout if r else "") or "") if r is not None else ""
+    if not body.strip():
+        return {"in_world": None, "detail": "no client log yet"}
+    err = None
+    for pat in CLIENT_REFUSED:
+        m = re.search(pat, body)
+        if m:
+            err = m.group(0)
+            break
+    joined = any(re.search(p, body) for p in CLIENT_JOINED)
+    state = {"in_world": bool(joined and not err), "joined_marker": joined,
+             "error": err}
+    if label and err:
+        print(f"[{label}] the client is NOT in the place — it reports "
+              f"'{err}'. The session was delivered and the game launched; "
+              f"the JOIN is what failed.")
+    return state
+
+
+def game_pss_mb(acct):
+    """The game's total PSS in MB, or None if it is not running/answering."""
+    try:
+        pkg = acct.get("game_package") or GAME_PACKAGE
+        out = (adb(acct, "shell", "dumpsys", "meminfo", pkg,
+                   timeout=60).stdout or "")
+    except (Exception, SystemExit):      # noqa: BLE001
+        return None
+    m = re.search(r"TOTAL PSS:\s*(\d+)", out) or re.search(r"TOTAL\s+(\d+)",
+                                                           out)
+    return round(int(m.group(1)) / 1024, 1) if m else None
+
+
+def settle_timeout_s(cfg=None):
+    """How long a farming launch waits for the client before squeezing.
+
+    Configurable because it is the one part of `start` that got LONGER: a
+    density launch now blocks until the client has loaded, which is the
+    honest definition of "this instance is ready" but is minutes rather than
+    seconds. A fleet launcher that would rather have the handle back can set
+    `OMNI_SETTLE_TIMEOUT=0` and squeeze immediately (accepting that it lands
+    on a loading client, which is what this change exists to stop)."""
+    raw = os.environ.get("OMNI_SETTLE_TIMEOUT")
+    if raw is None:
+        raw = ((cfg or {}).get("qemu") or {}).get("settle_timeout")
+    try:
+        return max(0, int(raw)) if raw is not None else SETTLE_TIMEOUT_S
+    except (TypeError, ValueError):
+        return SETTLE_TIMEOUT_S
+
+
+def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
+                          interval=SETTLE_INTERVAL_S):
+    """Block until the client has stopped growing, or `timeout`.
+
+    Returns (settled, pss). `settled` False with a real pss means "still
+    growing when we ran out of patience" — the caller squeezes anyway, because
+    a farming instance that never squeezes is not a farming instance; it just
+    says so rather than pretending it waited for the right moment."""
+    stable = 0
+    prev = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        pss = game_pss_mb(acct)
+        if pss and prev and pss >= SETTLE_FLOOR_MB:
+            if abs(pss - prev) <= prev * SETTLE_TOLERANCE:
+                stable += 1
+                if stable >= SETTLE_STABLE_SAMPLES:
+                    if label:
+                        print(f"[{label}] the game has finished loading "
+                              f"({pss:.0f} MB resident) — squeezing now")
+                    return True, pss
+            else:
+                stable = 0
+        prev = pss if pss else prev
+        time.sleep(interval)
+    if label:
+        print(f"[{label}] the game was still growing after "
+              f"{int(timeout)}s ({prev or '?'} MB) — squeezing anyway")
+    return False, prev
+
+
+def settle_density_instance(acct, mode, label=None, debug=False, wait=True):
+    """The farming squeeze, applied to an instance that is already PLAYING.
+
+    Order inside is unchanged and still load-bearing — zram first (it decides
+    which balloon cap is survivable), then the squeeze, then the balloon
+    strictly last so it only claims what the guest has already given up. What
+    changed is WHEN: this used to run in the boot tail, before the session was
+    even delivered, which starved the client's initial load and left the
+    engine parked in `futex_wait` on a 200%-idle guest.
+
+    `wait=False` squeezes immediately — for a caller that already knows the
+    client is loaded, and for tests."""
+    if wait:
+        budget = settle_timeout_s(read_config())
+        if budget:
+            wait_for_game_settled(acct, label, timeout=budget)
+            # A client that FAILED to join also stops growing, so the plateau
+            # alone cannot tell "loaded" from "sitting on Error 279" -- and
+            # squeezing the second one is squeezing a client that is about to
+            # be retried. Reported rather than acted on: the squeeze still
+            # runs (a farming instance has to end up small either way), but
+            # the launch says what it actually found.
+            probe_client_join(acct, label)
+        elif label:
+            print(f"[{label}] OMNI_SETTLE_TIMEOUT=0 — squeezing without "
+                  f"waiting for the client to finish loading")
+    enable_zram(acct, mode, label)
+    # The squeeze is a PRODUCTION memory optimization; a debug boot carries the
+    # extra devkit/frida footprint and its numbers aren't the production
+    # baseline, so skip it there (as the old dev path did).
+    if not debug:
+        apply_farming_squeeze(acct, mode, label)
+    return apply_balloon_target(acct, mode, label)
+
+
+def apply_farming_squeeze(acct, mode=None, label=None):
     """Run the farming runtime squeeze over adb. Called only on a farming boot.
 
     Every step is fire-and-forget by construction (each shell one-liner ends
     in `true`), because a squeeze is an optimization, never a precondition:
     an instance that could not disable one package must still end up joined
-    and running, just fatter."""
-    for cmd in farming.build_squeeze_sequence(mode):
+    and running, just fatter.
+
+    OMNI_FARM_SKIP names steps to leave out (`trimmemory,doze`, ...). It exists
+    because this sequence is the prime suspect whenever Roblox will not run on
+    the x86 base, and bisecting it by editing farming.py makes every attempt a
+    different build. See farming.STEP_NAMES."""
+    skip = farming.parse_skip(os.environ.get("OMNI_FARM_SKIP"))
+    if skip and label:
+        print(f"[{label}] farming squeeze: skipping {', '.join(skip)} "
+              f"(OMNI_FARM_SKIP)")
+    for cmd in farming.build_squeeze_sequence(mode, skip=skip):
         adb(acct, *cmd, timeout=20)
 
 
@@ -7411,14 +8062,29 @@ def pin_game_to_top_app(acct, label=None):
 
 
 # Balloon inflation is asynchronous; these bound how long we wait for the
-# guest to actually hand the pages back before calling it a miss. ~30 s total,
-# against a measured ~20 s to settle a 2048 -> 1024 MB inflation.
+# guest to actually hand the pages back before calling it a miss.
 ZRAM_SETTLE_TRIES = 6
 ZRAM_SETTLE_SECS = 2
 
-BALLOON_SETTLE_TRIES = 10
+# 90 s, not the 30 s this started at. MEASURED 2026-08-15 on the x86 base
+# (Bliss 16.9.7, WHPX, 1 vCPU, 2048 -> 896 MB): at the 30 s mark the balloon
+# read 1805 MB and the launch printed "guest balloon driver missing?" -- and
+# then the SAME guest, asked again by hand a minute later, read 938 MB and was
+# still falling toward the target it eventually reached. The driver was there
+# and working the whole time; a one-vCPU guest reclaiming ~1.1 GB while Android
+# is still settling is simply slower than the budget allowed, and the diagnosis
+# printed was not just wrong, it pointed at the guest kernel.
+#
+# The cost of waiting longer is bounded and only paid when the balloon is
+# genuinely still moving (the loop breaks the moment it reaches target); the
+# cost of being wrong is a capacity plan built on a number nobody trusts.
+BALLOON_SETTLE_TRIES = 30
 BALLOON_SETTLE_SECS = 3
 BALLOON_TOLERANCE = 1.05     # within 5% of target counts as reached
+# Below this, the balloon is clearly WORKING and just slow/blocked by the
+# guest's live set -- a very different thing from "no driver", and it must not
+# be reported the same way.
+BALLOON_PROGRESS_FRACTION = 0.5
 
 
 def zram_active(acct):
@@ -7453,7 +8119,21 @@ def enable_zram(acct, mode=None, label=None):
     Needs root: it is a persist.* property (settable at runtime, unlike ro.*)
     but SELinux denies uid shell — measured "Failed to set property". So on
     the production base this reports a skip and names the fix, rather than
-    failing quietly the way the original zram step did for months."""
+    failing quietly the way the original zram step did for months.
+
+    A mode may switch it OFF, and x86 farming does. Roblox is arm64-only, so
+    the x86 base runs it through libndk_translation, and swapping translated
+    code pages out makes the translator abort with `Cannot process signal 11`
+    (measured -- see MODES["farming"]["zram_x86"]). zram is a memory win that
+    costs the game its life there, which is not a trade."""
+    if mode is not None and not mode.get("zram", True):
+        # The SQUEEZE turns it off (farming.build_squeeze_sequence emits a
+        # swapoff), because the base ships it on. This only declines to turn
+        # it ON.
+        if label:
+            print(f"[{label}] zram: OFF for this mode — the arm64 translator "
+                  f"cannot survive having its code pages swapped out")
+        return False
     su = resolve_su(acct)
     prop = next(iter(lean.ZRAM_ENABLE_PROP))
     val = lean.ZRAM_ENABLE_PROP[prop]
@@ -7635,6 +8315,22 @@ def apply_consent(acct, cfg=None, label=None):
     return state.get("dialogs_hidden", False)
 
 
+def host_can_reclaim_balloon():
+    """Does inflating the balloon actually give this HOST its memory back?
+
+    A capability, not a platform check, even though today it answers the same
+    thing: the question is whether QEMU's `ram_block_discard_range` can
+    decommit, and on Windows there is no `madvise` for it to call. Naming the
+    capability rather than testing `IS_WINDOWS` at the call site keeps the
+    reason in one place — and lets the balloon logic be exercised on a host
+    that does not have it (see tests/test_qemu_footprint.py).
+
+    `docs/windows-ram-discard.md` has the patch that would make this True on
+    Windows, and the measurement showing it still would not reach the stated
+    fleet size for a heavy place."""
+    return not IS_WINDOWS
+
+
 def apply_balloon_target(acct, mode, label=None):
     """Inflate the virtio-balloon to the mode's post-boot target.
 
@@ -7647,6 +8343,28 @@ def apply_balloon_target(acct, mode, label=None):
     Returns the balloon's actual size in MB, or None when the mode wants no
     balloon or the guest has no balloon driver to answer with."""
     target_mb = (mode or {}).get("balloon")
+    # A HOST THAT CANNOT TAKE THE PAGES BACK GETS NO BALLOON. On Windows QEMU
+    # has no madvise, so `ram_block_discard_range` fails and the pages the
+    # guest hands over are never released -- the host keeps paying the full
+    # `-m` either way. MEASURED 2026-08-15 on PS99: guest squeezed to 830 MB
+    # by the balloon, host RSS 2190 MB. The inflate is therefore not a saving
+    # there, it is a pure cost to the guest, and it is a large one: at the
+    # 896 MB cap the session handover itself timed out (`pm path` did not
+    # answer in 45 s, twice) and the client could not load the place.
+    #
+    # The lever that DOES work on Windows is `-m`. free-page-reporting is
+    # already dropped there for exactly this reason (see balloon_device); this
+    # is the same fact applied to the explicit inflate.
+    if (target_mb and not host_can_reclaim_balloon()
+            and not (mode or {}).get("balloon_explicit")
+            and not _truthy_env("OMNI_FORCE_BALLOON")):
+        if label:
+            print(f"[{label}] balloon: not inflating — this host cannot "
+                  f"return the pages (QEMU has no madvise on Windows), so it "
+                  f"would cost the guest {mode.get('mem', 0) - target_mb} MB "
+                  f"and save the host nothing. Use --mem to cap an instance "
+                  f"here. (OMNI_FORCE_BALLOON=1 overrides.)")
+        return None
     # zram changes which floor is safe, so ASK the guest rather than assume.
     # With lz4 compressing ~3x, the guest survives a third less RAM; without
     # it, the same target kills the game outright. Reading SwapTotal is the
@@ -7681,23 +8399,39 @@ def apply_balloon_target(acct, mode, label=None):
     # missing balloon driver — measured 2026-08-05, a guest that reached its
     # 1024 MB target in ~20 s was reported as "driver missing (actual 2046)"
     # by a single eager read.
+    started_mb = None
     actual_mb = None
     for _ in range(BALLOON_SETTLE_TRIES):
         r = qmp(acct, "query-balloon") or {}
         actual = (r.get("return") or {}).get("actual")
         actual_mb = int(actual / (1024 * 1024)) if actual else None
+        if started_mb is None:
+            started_mb = actual_mb
         if actual_mb and actual_mb <= target_mb * BALLOON_TOLERANCE:
             break
         time.sleep(BALLOON_SETTLE_SECS)
+    waited = BALLOON_SETTLE_TRIES * BALLOON_SETTLE_SECS
     if label:
         if actual_mb and actual_mb <= target_mb * BALLOON_TOLERANCE:
             print(f"[{label}] balloon: guest capped at {actual_mb} MB "
                   f"(target {target_mb} MB)")
+        elif actual_mb and started_mb and started_mb > actual_mb:
+            # It IS inflating -- it just has not finished. Distinguish this
+            # from "no driver" explicitly: they need opposite responses, and
+            # calling the first one the second is how the x86 base got blamed
+            # for a kernel it builds correctly.
+            moved = started_mb - actual_mb
+            want = max(1, started_mb - target_mb)
+            print(f"[{label}] balloon: still deflating the guest after "
+                  f"{waited}s - {actual_mb} MB now, target {target_mb} MB "
+                  f"({100 * moved // want}% of the way). The driver is "
+                  f"working; a 1-vCPU guest just reclaims slowly. It keeps "
+                  f"going in the background.")
         else:
-            print(f"[{label}] balloon: target {target_mb} MB NOT reached "
-                  f"(actual {actual_mb} MB after "
-                  f"{BALLOON_SETTLE_TRIES * BALLOON_SETTLE_SECS}s) - guest "
-                  f"balloon driver missing? Instance still runs, just fatter.")
+            print(f"[{label}] balloon: target {target_mb} MB NOT reached and "
+                  f"nothing moved in {waited}s (actual {actual_mb} MB) - "
+                  f"guest balloon driver missing? Instance still runs, just "
+                  f"fatter.")
     return actual_mb
 
 
@@ -7743,19 +8477,27 @@ def _qemu_version(tool):
     return _QEMU_VERSION_CACHE[tool]
 
 
-def _warm_cache_allowed(debug, in_use, key, no_warm=False):
+def _warm_cache_allowed(debug, in_use, key, no_warm=False, accel=None):
     """May THIS launch use the warm cache?
 
     False for a debug boot (the devkit vdc disk changes device topology, so a
     restore would not match), for an unknown key, for an entry already
     backing a running instance -- the second concurrent restore comes up alive
-    but `offline` on adb (design spec 8b) -- and for `no_warm` (the
-    --no-warm / OMNI_NO_WARM=1 kill switch). This is the ONE decision point
-    both restore and bake are gated through, so the kill switch and every
-    other refusal reason only need to be encoded once. Refusing costs one
-    cold boot.
+    but `offline` on adb (design spec 8b) -- for `no_warm` (the
+    --no-warm / OMNI_NO_WARM=1 kill switch), and for an ACCELERATOR THAT
+    CANNOT MIGRATE. This is the ONE decision point both restore and bake are
+    gated through, so the kill switch and every other refusal reason only need
+    to be encoded once. Refusing costs one cold boot.
+
+    The accelerator gate is the one that matters on Windows: QEMU/WHPX blocks
+    migration outright (see migfile.NON_MIGRATABLE_ACCELS for the verbatim
+    error and the measurement), so without it every launch stops the guest,
+    stages two qcow2 overlays and drives a migration that is refused -- work
+    paid on every boot for a cache that can never hold anything.
     """
     if debug or not key or no_warm:
+        return False
+    if not migfile.accel_supports_migration(accel or default_accel()):
         return False
     return key not in in_use
 
@@ -7800,7 +8542,7 @@ def _stage_bake_overlays(acct, cfg, rd):
 
 def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                    mem=None, balloon=None, debug=None, smp=None, quality=None,
-                   no_warm=None, _no_rebake=False):
+                   no_warm=None, guest_display="unset", _no_rebake=False):
     """Boot the instance if it isn't up, and block until Android is ready.
     Returns (ok, first_boot). `debug` (per-boot) attaches the devkit disk;
     default None means fall back to the account handle's own `debug` flag.
@@ -7818,7 +8560,8 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # entirely, so `omnidroid start --mem 2048` silently booted at the mode's own
     # size — a 512 MB farming boot that never reached adbd, reported as a
     # boot timeout with no hint that the flag had been ignored.
-    mode = resolve_mode(cfg, mode_name, mem=mem, balloon=balloon, smp=smp)
+    mode = resolve_mode(cfg, mode_name, mem=mem, balloon=balloon, smp=smp,
+                        arch=acct_arch(acct), guest_display=guest_display)
     if mode.get("profile") == "performance":
         print(f"[{label}] mode {mode['name']}: {mode['mem']} MB / "
               f"{mode['smp']} vCPU, quality {quality or mode.get('quality')}, "
@@ -7900,7 +8643,8 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             key = None
             in_use = set()
         entry = None
-        if _warm_cache_allowed(debug, in_use, key, no_warm=no_warm):
+        if _warm_cache_allowed(debug, in_use, key, no_warm=no_warm,
+                               accel=accel):
             entry = warmcache.lookup(images, key, qver)
 
         if entry is not None:
@@ -7955,10 +8699,27 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             # COLD PATH, optionally baking a new entry on the way.
             want_bake = (not _no_rebake
                         and _warm_cache_allowed(debug, in_use, key,
-                                                no_warm=no_warm)
-                        and not interactive
-                        and warmcache.has_room(
-                            images, warmboot.projected_entry_bytes(mode["mem"])))
+                                                no_warm=no_warm, accel=accel)
+                        and not interactive)
+            if want_bake:
+                # SAY WHY when the disk is the reason. A silent skip here is
+                # what hid the warm cache being off on this project's own dev
+                # box for its entire life: 7.4 GiB free against a 10 GiB
+                # reserve, every launch paying a 62 s cold boot, and not one
+                # line of output pointing at the disk.
+                room, free, needed = warmcache.room_report(
+                    images, warmboot.projected_entry_bytes(mode["mem"]),
+                    reserve=warmcache.free_reserve_bytes(cfg))
+                if not room:
+                    want_bake = False
+                    have = (f"{free / 2**30:.1f} GiB free"
+                            if free is not None else "free space unreadable")
+                    print(f"[{label}] warm cache: not baking a fast-boot "
+                          f"entry — needs {needed / 2**30:.1f} GiB, {have}. "
+                          f"Every launch will cold-boot until there is room "
+                          f"(free some space, or lower the reserve with "
+                          f"config qemu.warm_reserve_gb / "
+                          f"OMNI_WARM_RESERVE_GB).")
             if want_bake:
                 rd = runtime_dir(acct["name"])
                 try:
@@ -8041,6 +8802,12 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # unrooted base it is a logged no-op. This is what lets the shipped base be
     # rooted-yet-safe in production.
     _enforce_hiding(acct, label)
+    # EVERY boot, EVERY mode: stop the game from being told it is running on
+    # llvmpipe/virgl. Here rather than in the tuning block because the wrap
+    # property is read by Zygote when the app process is FORKED -- setting it
+    # after the client is up changes nothing until the next launch, and the
+    # next launch is deliver_session's restart, moments from now.
+    apply_gl_mask(acct, cfg, label)
     # EVERY boot, production included: tell the kiosk which package is the
     # game and re-front it. Without this the kiosk's dev-mode fallback guesses,
     # and on a ROOTED base it guesses the Magisk manager — see
@@ -8052,6 +8819,11 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # asset CDN during startup, and a resolver swapped in underneath a running
     # client leaves the failed lookups already cached as failures.
     ensure_private_dns(acct, cfg, label)
+    # Says the MTU line if this host's egress is smaller than a full frame.
+    # The value was already applied at spawn (`host_mtu` on the NIC); this is
+    # the report, and it is memoised so it costs nothing the second time.
+    from omnidroid.qemu_proc import nic_mtu_suffix
+    nic_mtu_suffix(cfg, label)
     assert_kiosk_game(acct, cfg, label)
     # EVERY boot: grant the permissions a human would otherwise be asked to
     # tap through (full disk access above all) and silence the ANR/crash
@@ -8091,19 +8863,32 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
               f"Roblox's own settings alone. Known: "
               f"{list(lean.QUALITY_PROFILES)}")
     if profile == "density":
-        # FARMING. Every lever here trades quality and responsiveness for
-        # instance COUNT, in a fixed order: settings, then zram (which decides
-        # WHICH balloon cap is survivable), then the squeeze, then the balloon
-        # strictly last so it only claims memory the guest has already given up.
+        # FARMING, and ONLY the half that has to be in place before the client
+        # starts. `ClientAppSettings` is read by Roblox at launch, so it must
+        # be written now or not at all.
+        #
+        # ZRAM, THE SQUEEZE AND THE BALLOON DELIBERATELY DO NOT RUN HERE ANY
+        # MORE. They used to, and it is why a farming instance never reached
+        # the world: this point in the boot is BEFORE the session is
+        # delivered, so the client has not begun loading the place — and every
+        # one of those levers exists to make an IDLE joined instance cheap.
+        # Applied to a loading client they starve the load instead.
+        #
+        # MEASURED 2026-08-16 on PS99, all at 3072 MB with no balloon, so
+        # memory could not be the variable:
+        #
+        #   full squeeze before the session   game alive, PSS flat ~400 MB,
+        #                                     engine parked in futex_wait,
+        #                                     guest 200% IDLE for 6 minutes
+        #   OMNI_FARM_SKIP=<every step>       PSS 1173 MB at 111 s and
+        #                                     climbing — it loads the place
+        #
+        # and a gaming-tuned control at the SAME 2048 MB / 2 vCPU loaded fine,
+        # so it is neither the guest size nor the vCPU count. See
+        # settle_density_instance(), which cmd_start calls once the client has
+        # actually finished loading.
         if settings is not None:
             apply_roblox_settings(acct, label, settings=settings)
-        enable_zram(acct, mode, label)
-        # The squeeze is a PRODUCTION memory optimization; a debug boot carries
-        # the extra devkit/frida footprint and its numbers aren't the
-        # production baseline, so skip it there (as the old dev path did).
-        if not debug:
-            apply_farming_squeeze(acct, mode)
-        apply_balloon_target(acct, mode, label)
     else:
         # PERFORMANCE (playable / gaming / hard / brutal). No zram, no squeeze
         # and no balloon — each of those trades responsiveness for density,
@@ -8116,6 +8901,363 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
         if not debug:
             apply_gaming_tuning(acct, mode, label)
     return True, first
+
+
+# ============================================================== warm POOL
+#
+# omnidroid/pool.py holds the state model (what a slot is, why adoption
+# copies rather than moves, how a claim is made atomic). This half is the
+# engine's: resolving the spec/key that a launch and the pool manager must
+# agree on, booting a slot to the account-free ready point, and handing a
+# warm one to `start`.
+#
+# WHY A POOL AND NOT THE WARM CACHE: on Windows QEMU/WHPX refuses to
+# serialise a guest at all (migration blocker at CPU realize time), so
+# `warmboot.bake_entry` can never produce an entry there -- measured, and
+# final. A pool never serialises anything; the machine is simply already
+# running. See MODES.md "Boot time" and pool.py's docstring.
+
+
+def pool_launch_spec(cfg, *, mode_name=None, mem=None, smp=None, balloon=None,
+                     quality=None, guest_display="unset", offset=None,
+                     debug=False, arch=None):
+    """The machine a launch would boot, RESOLVED -- never as typed.
+
+    Resolution is the whole point: `--mode playable` and `--mode gaming` name
+    one machine, `--mem` unset on a gaming boot resolves to a host-derived
+    number, and the panel comes from OMNI_PANEL/config/mode in that order. A
+    key built from the raw arguments would give every equivalent launch a
+    different key, and the pool would never hit."""
+    from omnidroid.qemu_proc import gpu_policy, panel_for, resolve_mode
+    m = resolve_mode(cfg, mode_name, mem=mem, smp=smp, balloon=balloon,
+                     arch=arch, guest_display=guest_display)
+    panel = panel_for(m, cfg)
+    display = m.get("display")
+    return {"mode": m["name"], "mem": m["mem"], "smp": m["smp"],
+            "balloon": m.get("balloon"),
+            "gpu": gpu_policy(cfg, m),
+            "panel": f"{int(panel[0])}x{int(panel[1])}",
+            "quality": quality or m.get("quality"),
+            # JSON has no tuples, and the key is a hash of JSON -- a list and
+            # a tuple with the same contents must not hash differently.
+            "guest_display": list(display) if display else None,
+            "offset": offset, "debug": bool(debug)}
+
+
+def pool_key_for(cfg, spec, accel=None, label=None):
+    """The slot key for `spec` on this host, or None if it cannot be resolved.
+
+    Never raises into a launch: an unresolvable key means "no pool for this
+    launch", exactly as an unresolvable warm-cache key means "cold boot".
+    That rule is why `start` can call this unconditionally."""
+    from omnidroid.qemu_proc import default_accel
+    try:
+        tag = _select_base_tag(cfg)
+        base = cfg["bases"][tag]
+        arch = arch_of_base(base)
+        off_name, data_image = resolve_launch_offset(
+            cfg, tag, spec.get("offset"), allow_none=True, label=label)
+        stat = None
+        if data_image:
+            st = (Path(images_dir(cfg)) / data_image).stat()
+            stat = (st.st_size, int(st.st_mtime))
+        return pool.slot_key(arch=arch, base_tag=tag,
+                             base_version=base.get("version", 0),
+                             offset=off_name, offset_image_stat=stat,
+                             accel=accel or default_accel(), spec=spec)
+    except Exception:      # noqa: BLE001 - no key is a MISS, never a failure
+        return None
+
+
+def pool_try_adopt(name, cfg, spec, label, accel=None):
+    """Hand this launch a pre-booted instance, or None.
+
+    Returns the launch handle (build_acct's shape) on success, having already
+    written `runtime/<name>/run.json`. `_ensure_booted` then finds the
+    instance up with `sys.boot_completed=1` and returns immediately -- which
+    is the entire fast path. Nothing here spawns, allocates or waits.
+
+    A claimed slot that turns out not to answer adb is RELEASED and the launch
+    falls through to a cold boot: a stale slot must cost one probe, not the
+    launch."""
+    key = pool_key_for(cfg, spec, accel=accel, label=label)
+    if not key:
+        return None
+    rec = pool.claim(key)
+    if rec is None:
+        return None
+    run = pool.adopt_run_json(rec["slot"], name)
+    if not run:
+        pool.release(rec["slot"], "no run.json")
+        return None
+    acct = pool.acct_from_slot(name, rec, run)
+    # PROVE it before promising it. A slot whose QEMU is alive but whose
+    # guest has wedged would otherwise be handed over as "instant", and the
+    # launch would fail somewhere much later with no mention of the pool.
+    adb_connect(acct)
+    if adb_getprop(acct, "sys.boot_completed") != "1":
+        _wipe_runtime(name)
+        pool.release(rec["slot"], "guest not answering")
+        print(f"[{label}] warm pool: slot {rec['slot']} did not answer adb; "
+              f"booting normally")
+        return None
+    pool.mark_adopted(rec["slot"], name)
+    waited = time.time() - (rec.get("ready_at") or time.time())
+    print(f"[{label}] warm pool: took slot {rec['slot']} "
+          f"(pre-booted {int(waited)}s ago) — no boot needed")
+    return acct
+
+
+def _apply_spec_env(spec):
+    """Put the spec's gpu/panel back into the environment before a slot boots.
+
+    `gpu_policy()` and `panel_for()` read OMNI_GPU/OMNI_PANEL ahead of the
+    config, and `cmd_start` sets them from its flags. The pool MANAGER is a
+    different process that only ever sees the spec dict, so without this a
+    slot booted by the manager would silently differ from the slot the key
+    promises -- a pool that hands out machines nobody asked for."""
+    if spec.get("gpu"):
+        os.environ["OMNI_GPU"] = str(spec["gpu"])
+    if spec.get("panel"):
+        os.environ["OMNI_PANEL"] = str(spec["panel"])
+
+
+def pool_boot_slot(cfg, spec, key, slot=None, label=None):
+    """Boot ONE account-free slot to the ready point.
+
+    This is `start` minus the session: the same `_ensure_booted`, so a pooled
+    instance is not a stripped-down thing that later has to be topped up --
+    it has had the identical post-boot pipeline (DNS, consent, awake, kiosk,
+    mode tuning) that a cold launch applies before its cookie arrives."""
+    _apply_spec_env(spec)
+    slot = slot or pool.free_slot_name()
+    label = label or f"pool {slot}"
+    pool.write_slot_meta(slot, key=key, spec=spec, state="booting",
+                         started=time.time())
+    t0 = time.time()
+    try:
+        acct = build_acct(slot, cfg, debug=bool(spec.get("debug")),
+                          offset=spec.get("offset"), label=label)
+        booted, _first = _ensure_booted(
+            acct, cfg, label,
+            mode_name=spec.get("mode"), mem=spec.get("mem"),
+            smp=spec.get("smp"), balloon=spec.get("balloon"),
+            quality=spec.get("quality"), debug=bool(spec.get("debug")),
+            # A slot is a fast-boot mechanism itself; letting it also try to
+            # bake a warm-cache entry would pay the stop + overlay + refused
+            # migration on every slot on WHPX, and duplicate the mechanism
+            # everywhere else.
+            no_warm=True)
+    except SystemExit as e:      # fail() sys.exits; a slot must not take the
+        pool.write_slot_meta(slot, state="failed", error=str(e))   # manager
+        return False, slot                                         # down
+    except Exception as e:       # noqa: BLE001
+        pool.write_slot_meta(slot, state="failed", error=repr(e))
+        return False, slot
+    if not booted:
+        pool.write_slot_meta(slot, state="failed", error="boot_timeout")
+        return False, slot
+    pool.write_slot_meta(slot, state="ready", ready_at=time.time(),
+                         booted_s=round(time.time() - t0, 1))
+    print(f"[{label}] ready in {time.time() - t0:.1f}s")
+    return True, slot
+
+
+def _pool_spec_from_args(args, cfg):
+    return pool_launch_spec(
+        cfg,
+        mode_name=getattr(args, "mode", None),
+        mem=getattr(args, "mem", None), smp=getattr(args, "smp", None),
+        balloon=getattr(args, "balloon", None),
+        quality=getattr(args, "quality", None),
+        guest_display=_guest_display_arg(args),
+        offset=getattr(args, "offset", None),
+        debug=False,
+        arch=arch_of_base(cfg["bases"][_select_base_tag(cfg)]))
+
+
+def cmd_pool(args):
+    """`omnidroid pool start|status|stop|fill` -- the warm pool of pre-booted,
+    account-free instances."""
+    from omnidroid.runtime import reconcile_runtime
+    cfg = load_config()
+    action = args.action
+    if action == "status":
+        reconcile_runtime()
+        cur = pool.read_pool() or {}
+        key = cur.get("key")
+        out = pool.summary(key)
+        out["ok"] = True
+        if getattr(args, "json", False):
+            emit_json(out)
+        else:
+            print(f"pool: size {cur.get('size', 0)}, "
+                  f"{out['ready']} ready / {out['booting']} booting / "
+                  f"{out['adopted']} adopted / {out['dead']} dead")
+            for s in out["slots"]:
+                print(f"  {s['slot']:8} {s['state']:8} "
+                      f"live={str(s['live']):5} adb={s['adb_port']} "
+                      f"{'-> ' + s['adopted_by'] if s['adopted_by'] else ''}")
+        return out
+    if action == "stop":
+        # Config FIRST, then the slots. The manager re-reads the config at the
+        # top of every tick and exits when it is gone, so clearing it first is
+        # what stops it replacing the slots we are about to shut down. A boot
+        # already in flight still finishes and leaves one orphan slot behind;
+        # it is reported (as `dead` in status) and a second `pool stop` — or
+        # any `reconcile_runtime` — removes it.
+        pool.clear_pool()
+        stopped = []
+        for s in pool.list_slots():
+            if s["live"]:
+                try:
+                    _shutdown(load_account(s["slot"]), f"pool {s['slot']}",
+                              timeout=60)
+                except SystemExit:
+                    pass
+                stopped.append(s["slot"])
+        removed = pool.sweep()
+        out = {"ok": True, "stopped": stopped, "removed": removed}
+        if getattr(args, "json", False):
+            emit_json(out)
+        else:
+            print(f"pool: stopped {len(stopped)}, removed {len(removed)}")
+        return out
+    # start / fill
+    ensure_qemu()
+    # Same as cmd_start: these two are read from the environment by every
+    # argv builder, so one assignment here reaches the spec resolution below
+    # AND (via the spec) every slot the manager boots later.
+    if getattr(args, "gpu", None):
+        os.environ["OMNI_GPU"] = str(args.gpu)
+    if getattr(args, "panel", None):
+        from omnidroid.qemu_proc import parse_panel
+        if not parse_panel(args.panel):
+            return fail("bad_panel",
+                        f"--panel {args.panel!r} is not a size. Use WxH "
+                        f"(1920x1080) or a name ({'/'.join(PANEL_NAMES)}).")
+        os.environ["OMNI_PANEL"] = str(args.panel)
+    spec = _pool_spec_from_args(args, cfg)
+    key = pool_key_for(cfg, spec, label="pool")
+    if not key:
+        return fail("pool_key", "could not resolve what this host would boot "
+                                "(no base registered?); pool not started")
+    size = int(getattr(args, "size", 1) or 1)
+    pool.write_pool({"size": size, "spec": spec, "key": key,
+                     "started": time.time()})
+    if action == "fill":
+        # Synchronous: boot slots here, in this process, until the pool is
+        # full. This is what the manager runs in a loop, exposed on its own
+        # so a pool can be filled without a background process at all.
+        made = []
+        while len(pool.ready_slots(key)) < size:
+            ok, slot = pool_boot_slot(cfg, spec, key)
+            made.append({"slot": slot, "ok": ok})
+            if not ok:
+                break
+        out = {"ok": all(m["ok"] for m in made) if made else True,
+               "size": size, "booted": made,
+               "ready": len(pool.ready_slots(key))}
+        if getattr(args, "json", False):
+            emit_json(out)
+        return out
+    pid = _spawn_pool_manager()
+    out = {"ok": True, "size": size, "key": key, "spec": spec, "manager": pid}
+    if getattr(args, "json", False):
+        emit_json(out)
+    else:
+        print(f"pool: keeping {size} instance(s) warm "
+              f"({spec['mode']}, {spec['mem']} MB, {spec['smp']} vCPU); "
+              f"manager pid {pid}")
+    return out
+
+
+def _spawn_pool_manager():
+    """Start the detached manager loop, or return the live one's pid.
+
+    Same detached shape as the viewer/recorder (see _spawn_builtin_viewer),
+    including self_argv_prefix() -- without it an embedding host relaunches
+    its own GUI instead of the child."""
+    from omnidroid.runtime import pid_alive
+    cur = pool.read_pool() or {}
+    if cur.get("manager_pid") and pid_alive(cur["manager_pid"]):
+        return cur["manager_pid"]
+    a = ["_poolmgr"]
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + self_argv_prefix() + a
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())] + a
+    d = config.runtime_root()
+    d.mkdir(parents=True, exist_ok=True)
+    log = open(d / "pool.log", "a")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **kwargs)
+    cur["manager_pid"] = proc.pid
+    pool.write_pool(cur)
+    return proc.pid
+
+
+# How often the manager reconciles. A slot takes 47-190 s to boot, so there
+# is nothing to gain from a tighter loop, and every wake-up is a process that
+# does nothing on an idle host.
+POOL_TICK_SECS = 5
+
+
+def cmd_poolmgr(args):
+    """The detached manager: keep `size` slots warm, one boot at a time.
+
+    SERIAL on purpose. Two guests booting at once on this host starved each
+    other badly enough to be worth a gotcha of its own (two 4-vCPU guests plus
+    an upload took a boot to 17 s of guest CPU in 7 minutes), and a pool that
+    fills slowly is strictly better than one that makes the instance somebody
+    is actually playing stutter while it fills."""
+    from omnidroid.runtime import reconcile_runtime
+    print(f"[pool] manager up (pid {os.getpid()})", flush=True)
+    while True:
+        cur = pool.read_pool()
+        if not cur:
+            print("[pool] no pool configured; manager exiting", flush=True)
+            return {"ok": True, "stopped": True}
+        size = int(cur.get("size") or 0)
+        key = cur.get("key")
+        spec = cur.get("spec") or {}
+        if size <= 0:
+            print("[pool] size 0; manager exiting", flush=True)
+            return {"ok": True, "stopped": True}
+        pool.sweep()
+        reconcile_runtime()
+        ready = pool.ready_slots(key)
+        if len(ready) < size:
+            cfg = load_config()
+            ok, slot = pool_boot_slot(cfg, spec, key)
+            print(f"[pool] slot {slot}: {'ready' if ok else 'FAILED'} "
+                  f"({len(pool.ready_slots(key))}/{size} warm)", flush=True)
+            if not ok:
+                # A failing spec would otherwise spin: boot, fail, boot again,
+                # forever, at 100% of a core. Back off and let the next tick
+                # try once more rather than hammering.
+                time.sleep(POOL_TICK_SECS * 6)
+        else:
+            time.sleep(POOL_TICK_SECS)
+
+
+def _guest_display_arg(args):
+    """The resolved `--guest-display`, or the "unset" sentinel.
+
+    `None` is a real value (native resolution), so absence cannot be None."""
+    raw = getattr(args, "guest_display", None)
+    if raw is None:
+        return "unset"
+    from omnidroid.qemu_proc import parse_guest_display
+    parsed = parse_guest_display(raw)
+    if parsed == "unset":
+        fail("bad_guest_display",
+             f"--guest-display {raw!r} is not WxH, WxHxDPI or `native`")
+    return parsed
 
 
 def _token_flag_given(args):
@@ -8605,27 +9747,57 @@ def build_parser():
                             "alongside --apk.")
     s_win = s.add_mutually_exclusive_group()
     s_win.add_argument("--window", action="store_true",
-                       help="open a live window even in --json mode (two "
-                            "starts = two accounts side by side)")
+                       help="open the VNC viewer even in --json mode (two "
+                            "starts = two accounts side by side). QEMU itself "
+                            "is always headless; this is the viewer.")
     s_win.add_argument("--no-window", dest="no_window", action="store_true",
-                       help="do not open a window AT ALL — no native QEMU "
-                            "window and no VNC viewer (watch via `omnidroid "
-                            "view` or capture). COSTS THE GPU: without a "
-                            "window there is no host GL context, so the guest "
-                            "renders in software (measured 3.2 fps against "
-                            "16.5). For automation, not for playing.")
-    s.add_argument("--mode", choices=list(MODES), default=None,
-                   help="what this instance is FOR. playable (DEFAULT) - "
-                        "MAXIMUM resources: sized to this host (up to 8G / 6 "
-                        "vCPU), no balloon, no squeeze, a GPU-accelerated "
-                        "native window with direct input, high-quality "
-                        "render, game on the top-app cpuset. The mode to test "
-                        "and to play in. gaming - an alias for it. farming - "
-                        "MINIMUM "
-                        "resources: 2G/1c headless, joined-idle, squeezed "
-                        "post-boot then ballooned to ~896 MB, for many "
-                        "instances at once. hard 3G/4c | brutal 2G/2c are "
-                        "fixed smaller tiers for a tight host")
+                       help="do not open the VNC viewer (watch later with "
+                            "`omnidroid view` or capture). The instance still "
+                            "runs its VNC server and still renders on the "
+                            "GPU — this costs you nothing but the window.")
+    s.add_argument("--gpu", choices=list(GPU_POLICIES), default=None,
+                   help="how hard to try for GPU rendering. auto (DEFAULT) - "
+                        "get the guest onto the GPU whatever it takes, "
+                        "preferring no window; on a host whose QEMU can "
+                        "present a windowless GL guest that is headless + VNC "
+                        "+ GPU together, and on one that cannot (Windows "
+                        "today) it opens a native window, because that is the "
+                        "only GL context QEMU will give. headless - never put "
+                        "a window on screen; keeps the VNC viewer, gives up "
+                        "the GPU where a window is the only way to it. window "
+                        "- always open one. off - software rendering. NOTE: "
+                        "QEMU refuses a VNC server beside a GL WINDOW, so on "
+                        "such a host `auto`/`window` cost you `view`, "
+                        "`capture` and autocap (but not `screenshot`).")
+    s.add_argument("--guest-display", dest="guest_display", default=None,
+                   help="what Android is told to lay out at (`wm size`), as "
+                        "WxH, WxHxDPI, or `native` to leave the base's own "
+                        "resolution alone. NOT the same as --panel, which is "
+                        "the virtio-gpu device's mode. Farming defaults to "
+                        "480x270x80; `--guest-display native` is how you ask "
+                        "whether that postage stamp is what a game is choking "
+                        "on.")
+    s.add_argument("--panel", default=None,
+                   help="guest display size for this boot: WxH or a name "
+                        "(720p/800p/1080p/1440p). Defaults to the mode's own "
+                        "(gaming 1280x800, farming 640x480). Bigger costs "
+                        "frames — the guest is CPU-bound on arm64 "
+                        "translation, not fill-bound. ABOVE THE BASE'S "
+                        "NATIVE 1280x800 it also does not work: measured, "
+                        "1920x1080 stalled the boot for 3.3+ min and the "
+                        "guest still came up 1280x800. Smaller is fine.")
+    s.add_argument("--mode", choices=MODE_CHOICES, default=None,
+                   metavar="{gaming,farming}",
+                   help="what this instance is FOR. gaming (DEFAULT) - "
+                        "MAXIMUM resources: sized to this host, no balloon, "
+                        "no squeeze, GPU-accelerated, high-quality render, "
+                        "game on the top-app cpuset. farming - MINIMUM "
+                        "resources: 2G headless, joined-idle, squeezed "
+                        "post-boot then ballooned, for many instances at "
+                        "once. Both are headless and both render on the GPU; "
+                        "the difference is what they spend. "
+                        "(playable/hard/brutal are retired names that still "
+                        "resolve to gaming.)")
     s.add_argument("--mem", type=int, default=None,
                    help="override guest RAM in MB. This is the guest's "
                         "ADDRESS SPACE, not its host footprint - see "
@@ -8682,6 +9854,33 @@ def build_parser():
     l.add_argument("--json", action="store_true",
                    help="JSON array of accounts on stdout")
     l.set_defaults(func=cmd_list)
+
+    pl = sub.add_parser("pool",
+                        help="keep N account-free instances PRE-BOOTED, so "
+                             "`start` skips the boot entirely (the only fast "
+                             "path on Windows -- WHPX cannot snapshot a VM)")
+    pl.add_argument("action", choices=("start", "status", "stop", "fill"),
+                    help="start: run the background manager. fill: boot slots "
+                         "now, in this process, and exit. status/stop: what "
+                         "they say")
+    pl.add_argument("--size", type=int, default=1,
+                    help="how many warm instances to keep (default 1)")
+    # The spec flags mirror `start`'s exactly, because a slot is only usable
+    # by a launch that resolves to the SAME machine -- see pool_launch_spec.
+    pl.add_argument("--mode", default=None, choices=MODE_CHOICES)
+    pl.add_argument("--mem", type=int, default=None)
+    pl.add_argument("--smp", type=int, default=None)
+    pl.add_argument("--balloon", type=int, default=None)
+    pl.add_argument("--quality", default=None)
+    pl.add_argument("--offset", default=None)
+    pl.add_argument("--gpu", default=None, choices=GPU_POLICIES)
+    pl.add_argument("--panel", default=None)
+    pl.add_argument("--guest-display", dest="guest_display", default=None)
+    pl.add_argument("--json", action="store_true")
+    pl.set_defaults(func=cmd_pool)
+
+    pm = sub.add_parser("_poolmgr")      # hidden: the detached manager loop
+    pm.set_defaults(func=cmd_poolmgr)
 
     i = sub.add_parser("install",
                        help="install a game APK (ABI-safe: x86 accounts "
@@ -9131,7 +10330,8 @@ def build_parser():
                         help="Linux-only: measure real instances-per-GB "
                              "with KSM (Phase 8; scaffold until the Linux "
                              "host exists)")
-    bk.add_argument("--mode", choices=list(MODES), default="brutal")
+    bk.add_argument("--mode", choices=MODE_CHOICES, default="farming",
+                    metavar="{gaming,farming}")
     bk.add_argument("--max", type=int, default=99,
                     help="safety bound on bench steps (the RAM floor is "
                          "what actually stops the bench)")
@@ -9171,7 +10371,8 @@ def build_parser():
     vw.add_argument("name")
     vw.add_argument("--start", action="store_true",
                     help="boot the instance first if it isn't running")
-    vw.add_argument("--mode", choices=list(MODES), default=None,
+    vw.add_argument("--mode", choices=MODE_CHOICES, default=None,
+                    metavar="{gaming,farming}",
                     help="mode to use when --start boots the instance")
     vw.add_argument("--debug", action="store_true",
                     help="with --start: attach the devkit disk (frida + tools)")
@@ -9198,6 +10399,19 @@ def build_parser():
     vv.add_argument("--port", type=int, required=True)
     vv.add_argument("--title", default=None)
     vv.set_defaults(func=lambda a: sys.exit(_run_vncview(a)))
+
+    # Hidden internal: the viewer that HOSTS QEMU's own window rather than
+    # copying its framebuffer. Spawned by `omnidroid view` on a boot whose
+    # pixels live in a hidden GL window (see embedview.py). Not for direct use.
+    ev = sub.add_parser("_embedview")
+    ev.add_argument("--identity", required=True,
+                    help="the QEMU window title, i.e. omni-<account>")
+    ev.add_argument("--title", default=None)
+    ev.add_argument("--size", default=None, help="WxH of the guest panel")
+    ev.add_argument("--pid", type=int, default=None,
+                    help="the QEMU pid, so the window is found even if its "
+                         "title is not what we expect")
+    ev.set_defaults(func=lambda a: sys.exit(_run_embedview(a)))
 
     sc = sub.add_parser("screenshot", help="pull a screenshot (JSON out)")
     sc.add_argument("name")
@@ -9275,7 +10489,8 @@ def build_parser():
                              "APK, report JSON (headless, scriptable)")
     ta.add_argument("name")
     ta.add_argument("--apk", required=True)
-    ta.add_argument("--mode", choices=list(MODES), default="hard")
+    ta.add_argument("--mode", choices=MODE_CHOICES, default="gaming",
+                    metavar="{gaming,farming}")
     ta.add_argument("--abi", default=None,
                     help="force this ABI on install (default arm64-v8a on "
                          "x86 accounts; none on arm accounts)")

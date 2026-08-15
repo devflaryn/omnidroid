@@ -15,6 +15,7 @@ cold boot.
 """
 import hashlib
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -183,6 +184,51 @@ DEFAULT_MAX_BYTES = 8 * 2**30
 FREE_RESERVE_BYTES = 10 * 2**30
 
 
+def free_reserve_bytes(cfg=None):
+    """Free space the cache refuses to eat into, in bytes.
+
+    Configurable, and it had to become configurable the moment the cache was
+    the answer to "make boots instant". MEASURED 2026-08-15 on the Windows dev
+    box: 7.4 GiB free on a 930 GiB volume, so has_room() said no on EVERY
+    launch, no entry was ever baked, and every boot paid the full 62 s cold
+    path -- silently, because a skipped bake printed nothing. The 10 GiB
+    default is a good default and a bad hard-code.
+
+    `qemu.warm_reserve_gb` in the config, OMNI_WARM_RESERVE_GB in the
+    environment. 0 disables the reserve entirely (the caller is then the only
+    thing standing between the cache and a full disk, which is a choice a host
+    is allowed to make).
+    """
+    for candidate in (os.environ.get("OMNI_WARM_RESERVE_GB"),
+                      ((cfg or {}).get("qemu") or {}).get("warm_reserve_gb")):
+        if candidate in (None, ""):
+            continue
+        try:
+            gb = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if gb >= 0:
+            return int(gb * 2**30)
+    return FREE_RESERVE_BYTES
+
+
+def room_report(images_dir, projected_bytes, reserve=None, free_fn=None):
+    """(has_room, free_bytes, needed_bytes) — has_room() with its reasons.
+
+    Exists so a skipped bake can SAY why. `has_room` returning a bare bool is
+    what made the disk-full case invisible; every caller that refuses a bake
+    should be able to print the numbers it refused on.
+    """
+    reserve = FREE_RESERVE_BYTES if reserve is None else reserve
+    try:
+        free = (free_fn or (lambda p: shutil.disk_usage(p).free))(
+            str(images_dir))
+    except Exception:      # noqa: BLE001 - unreadable disk: skip the bake
+        return False, None, projected_bytes + reserve
+    needed = projected_bytes + reserve
+    return free >= needed, free, needed
+
+
 def entry_bytes(entry):
     """Bytes an entry occupies. Best-effort; unreadable files count as 0."""
     total = 0
@@ -201,13 +247,11 @@ def has_room(images_dir, projected_bytes, reserve=FREE_RESERVE_BYTES,
     Below the floor we skip the bake entirely and run as today: a launch is
     never failed or delayed over cache housekeeping, and the engine never
     competes with the user for the last of their disk.
+
+    Prefer room_report() at any call site that can print — see its docstring
+    for why a bare bool here cost this project every warm boot it ever had.
     """
-    try:
-        free = (free_fn or (lambda p: shutil.disk_usage(p).free))(
-            str(images_dir))
-        return free >= projected_bytes + reserve
-    except Exception:      # noqa: BLE001 - unreadable disk: skip the bake
-        return False
+    return room_report(images_dir, projected_bytes, reserve, free_fn)[0]
 
 
 def touch(entry):

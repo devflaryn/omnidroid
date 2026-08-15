@@ -6,7 +6,7 @@ LineageOS logo.
 | Base | Custom loading screen? |
 |---|---|
 | `x86` (Bliss) | **Yes** — baked into `/system/media/bootanimation.zip` when base_x86 v2 was built (`configs/paths.json` → `bases.x86.changelog["2"]`). |
-| `arm` (LineageOS 23.2) | **Built + boot-verified** (`omni brand-base` → `base_arm_branded.qcow2`). **Not yet swapped into the live base** — see "Remaining step". |
+| `arm` (LineageOS 23.2) | **Built + boot-verified** (`omnidroid brand-base` → `base_arm_branded.qcow2`). **Not yet swapped into the live base** — see "Remaining step". |
 | `dev` (arm + devkit) | **DONE + boot-verified, live.** `base_arm_devsystem.qcow2` was branded in place (`.bak` kept). |
 
 A dev boot now goes **black → Omni loading animation → Android**: no LineageOS
@@ -27,12 +27,12 @@ logo, no boot menu, no countdown, no kernel log, no GRUB chatter.
 > (`_brand_target` checks for a backing file) and brands the standalone image
 > directly. Rebasing a dev overlay onto a branded base is a silent no-op.
 
-## How it works: `omni brand-base`
+## How it works: `omnidroid brand-base`
 
 ```bash
-omni brand-base                          # -> base_arm_branded.qcow2 (safe, new file)
-omni brand-base --animation my.zip       # bake different art
-omni brand-base --in-place               # overwrite the base, keeping a .bak
+omnidroid brand-base                          # -> base_arm_branded.qcow2 (safe, new file)
+omnidroid brand-base --animation my.zip       # bake different art
+omnidroid brand-base --in-place               # overwrite the base, keeping a .bak
 ```
 
 Build-machine command (like `build-dev-base`). Needs **e2fsprogs** (`brew install
@@ -104,7 +104,7 @@ so no overlay has ever written those blocks, and they read the new content
 through. When you want it live:
 
 ```bash
-omni brand-base --in-place        # keeps base_arm.qcow2.bak
+omnidroid brand-base --in-place        # keeps base_arm.qcow2.bak
 ```
 
 ## Silent boot on arm — also done

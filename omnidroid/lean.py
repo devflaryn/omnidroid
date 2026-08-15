@@ -9,7 +9,7 @@ connected. This module is the single place that says what gets cut.
 Three tiers, applied at three different times:
 
   BAKED_PROPS   -> appended to the base image's build.prop, OFFLINE
-                   (`omni strip-base`). Only tier that can set `ro.*`
+                   (`omnidroid strip-base`). Only tier that can set `ro.*`
                    properties: they are read-only once init has set them, so
                    `setprop ro.config.low_ram true` at runtime is a silent
                    no-op. This is why the big Android-level lever HAS to be a
@@ -182,7 +182,7 @@ def baked_props(include_unverified=False):
     Returns {} unless `include_unverified` is set, because nothing in this
     profile has been shown to boot — see the block comment above for the two
     measurements. Callers that genuinely want the experimental set (a bisect
-    harness, a test) pass the flag; `omni strip-base` requires an explicit
+    harness, a test) pass the flag; `omnidroid strip-base` requires an explicit
     --force-unverified from a human.
 
     Ordered least- to most-specific so a later tier can override an earlier
@@ -199,7 +199,7 @@ def baked_props(include_unverified=False):
 # Marks the block this module owns inside build.prop. merge_build_prop strips
 # it before re-adding, which is what makes a re-bake idempotent instead of
 # appending a fresh header every time.
-PROFILE_MARKER = "# --- omnidroid lean profile (omni strip-base) ---"
+PROFILE_MARKER = "# --- omnidroid lean profile (omnidroid strip-base) ---"
 
 
 def build_prop_lines(props=None):
@@ -345,6 +345,70 @@ GAMING_APP_SETTINGS = {
     "DFFlagDisableDPIScale": True,
 }
 
+# The HIGH-QUALITY profile — what `playable`/`gaming` install by default.
+#
+# The requirement changed, and this profile is the change: `playable` is now
+# the mode both a human PLAYS in and an AI TESTS in, and testing against a
+# deliberately ugly render is testing a different program. A UI regression, a
+# missing texture, a shader artefact, a wrongly-lit model — none of those are
+# visible at quality level 3 with post-processing off, so the screenshots an
+# agent reasons about have to come off a client rendering roughly what a real
+# player sees.
+#
+# What is turned UP relative to GAMING_APP_SETTINGS:
+#   quality level 3 -> 10   the mid-band of Roblox's own 1..21 scale: real
+#                           textures, real materials, real lighting.
+#   post-FX          on     the single biggest visual difference; without it
+#                           the game looks flat and unlit.
+#   shadows          on     at a low intensity, not off.
+#   DPI scale        on     (DFFlagDisableDPIScale False) so the UI is laid
+#                           out at the panel's real density rather than 1:1
+#                           pixels, which is what a phone actually shows.
+#
+# What stays OFF, and why that is not an inconsistency: MSAA. On the primary
+# host QEMU has no virglrenderer, so the guest has NO 3D acceleration and every
+# sample is resolved in software on the same CPU running the game (see
+# qemu_proc.default_display). Multisampling is the one lever that multiplies
+# that cost per pixel with almost nothing to show for it at this resolution, so
+# it is the one quality key not raised. Everything else here buys visible
+# fidelity; MSAA would only buy edge smoothing at several times the frame cost.
+#
+# The tick target stays at 240 — a ceiling, not a target — so the RENDERER
+# decides the frame rate, not the scheduler. Raising quality lowers the frame
+# rate the renderer can sustain; that is the trade this profile takes on
+# purpose, and `--quality balanced` is how you take the other one.
+#
+# NOT MEASURED, same caveat as GAMING_APP_SETTINGS.
+PLAYABLE_APP_SETTINGS = {
+    "DFIntTaskSchedulerTargetFps": 240,
+    "DFIntDebugFRMQualityLevelOverride": 10,
+    "FFlagDisablePostFx": False,
+    "FIntDebugForceMSAASamples": 0,
+    "FIntRenderShadowIntensity": 1,
+    "DFFlagDisableDPIScale": False,
+}
+
+
+# The three profiles, by the name `--quality` takes. Kept as ONE mapping so
+# the CLI, the mode table and the engine cannot disagree about what a quality
+# name means — the failure this codebase has already had twice (a flag
+# accepted by argparse and then overridden downstream).
+QUALITY_PROFILES = {
+    "low": CLIENT_APP_SETTINGS,        # farming: 5 fps, lowest everything
+    "balanced": GAMING_APP_SETTINGS,   # max fps, effects off
+    "high": PLAYABLE_APP_SETTINGS,     # real render; playable/gaming default
+}
+
+
+def app_settings_for(quality):
+    """The ClientAppSettings dict for a quality name, or None if unknown.
+
+    None on purpose rather than a silent fallback: a caller that passed a
+    quality this build does not know must say so, not quietly install the
+    farming profile onto a gaming boot."""
+    return QUALITY_PROFILES.get(quality)
+
+
 # Where the Roblox client reads them from, inside its own private data dir.
 CLIENT_SETTINGS_DIR = "/data/data/com.roblox.client/files/ClientSettings"
 CLIENT_SETTINGS_FILE = CLIENT_SETTINGS_DIR + "/ClientAppSettings.json"
@@ -467,7 +531,7 @@ def trim_packages(extra=()):
 
 # --------------------------------------------------------------- image strip
 
-# `omni strip-base` bakes PROPERTIES ONLY. Deleting the app directories
+# `omnidroid strip-base` bakes PROPERTIES ONLY. Deleting the app directories
 # themselves was considered and deliberately dropped: `pm disable-user`
 # already stops those packages from running or holding memory, so removing
 # their APKs buys only the PackageManager parse time and PackageSetting for a

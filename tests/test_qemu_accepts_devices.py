@@ -72,11 +72,13 @@ class QemuAcceptsX86Devices(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def _construct(self, mode_name):
+    def _construct(self, mode_name, gpu=None, headless_gl=False):
         """Build the machine with -S and return (status, balloon_ok)."""
         acct = {"name": "x86devtest", "adb_port": ADB, "qmp_port": QMP_PORT,
                 "vnc_port": VNC, "base": "x86"}
-        with mock.patch("omnidroid.engine.account_dir", return_value=self.tmp):
+        env = {"OMNI_GPU": gpu} if gpu else {}
+        with mock.patch("omnidroid.engine.account_dir", return_value=self.tmp),              mock.patch.dict(os.environ, env, clear=False),              mock.patch.object(qemu_proc, "_headless_gl_wanted",
+                               return_value=headless_gl):
             cmd = qemu_proc.qemu_command(
                 acct, _CFG, False,
                 mode=omni.resolve_mode(_CFG, mode_name), accel="tcg")
@@ -114,8 +116,22 @@ class QemuAcceptsX86Devices(unittest.TestCase):
                         "virtio-balloon-pci is missing on x86 - the whole "
                         "memory model depends on it")
 
-    def test_playable_machine_is_constructible(self):
-        status, balloon = self._construct("playable")
+    def test_gaming_machine_is_constructible(self):
+        status, balloon = self._construct("gaming")
+        self.assertIsNotNone(status, "QMP never answered")
+        self.assertTrue(balloon)
+
+    def test_the_headless_gpu_device_set_is_constructible(self):
+        """The pair the product emits on a host that CAN present a windowless
+        GL guest: virtio-gpu-gl-pci + egl-headless + a VNC server.
+
+        Worth constructing for real because QEMU refuses `-vnc` beside a
+        WINDOWED gl display and the difference between the two cases is
+        exactly the bug that cost this project its viewer. If QEMU ever
+        started refusing this one too, every headless GPU boot would exit on
+        startup instead of booting."""
+        status, balloon = self._construct("gaming", gpu="headless",
+                                          headless_gl=True)
         self.assertIsNotNone(status, "QMP never answered")
         self.assertTrue(balloon)
 

@@ -68,6 +68,29 @@ def adb(acct, *args, timeout=20, check=False):
     return r
 
 
+def adb_soft(acct, *args, timeout=20):
+    """`adb`, but a timeout or a missing binary is a RESULT, not an exception.
+
+    Returns a CompletedProcess with returncode -1 and empty streams when the
+    call could not complete, so a caller can treat "no answer" the same way it
+    treats "answered with nothing".
+
+    This exists because of a failure that kept recurring in one shape: a
+    squeezed farming guest (1-2 vCPU, ballooned, running an arm64 build through
+    libndk_translation) answers adb slowly, several probes in the launch path
+    carry 8-20 s timeouts, and `subprocess.TimeoutExpired` from any one of them
+    came out of `omnidroid start` as a TRACEBACK. Twice: once from the ordered
+    `am broadcast` that hands over the session, and once from the `pm path`
+    that checks the kiosk is installed. A slow guest is an ordinary condition
+    on the mode built for slow guests; it must never be an unhandled error.
+    """
+    try:
+        return adb(acct, *args, timeout=timeout)
+    except (subprocess.SubprocessError, OSError):
+        return subprocess.CompletedProcess(
+            ["adb", *args], -1, "", f"<no answer within {timeout}s>")
+
+
 def adb_connect(acct):
     port = _require_adb_port(acct)
     try:

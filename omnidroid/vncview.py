@@ -294,7 +294,7 @@ def run_viewer(host, port, title):
         sys.stderr.write(
             "error: Pillow is required for the built-in viewer.\n"
             "  install it:  python3 -m pip install pillow\n"
-            "  (or use a native client: omni view <acct> --native)\n")
+            "  (or use a native client: omnidroid view <acct> --native)\n")
         return 3
 
     client = RFBClient(host, port)
@@ -380,6 +380,17 @@ def run_viewer(host, port, title):
     root.bind("<KeyRelease>", on_key(False))
     label.focus_set()
 
+    # How often the UI thread LOOKS for a new frame. Not a frame rate: the
+    # redraw only happens when the RFB thread has actually completed an update,
+    # so a still screen costs one flag read per tick and nothing else.
+    #
+    # It used to be 40 ms, which is a hard ~25 fps ceiling on a viewer whose job
+    # is to feel like a game. QEMU's VNC server refreshes at ~30 Hz, so polling
+    # at 8 ms means a completed update is drawn on the next tick rather than up
+    # to 40 ms later -- the difference is entirely input-to-photon latency,
+    # which is the thing this viewer is judged on.
+    POLL_MS = 8
+
     def tick():
         if client.closed.is_set():
             err = client.error
@@ -393,18 +404,28 @@ def run_viewer(host, port, title):
                 width, height, frame, _, _ = client.snapshot()
                 img = Image.frombytes("RGB", (width, height), frame,
                                       "raw", "RGBX")
-                photo = ImageTk.PhotoImage(img)
-                label.configure(image=photo)
-                state["photo"] = photo           # keep a ref (Tk GCs images)
+                photo = state["photo"]
+                if photo is None or (photo.width(), photo.height()) != (width,
+                                                                       height):
+                    # Only on the first frame and on a desktop resize. Building
+                    # a PhotoImage allocates a new Tk image object and a fresh
+                    # X/GDI pixmap every time; at 1280x800 that is ~4 MB of
+                    # churn per frame, and it was being paid on EVERY frame.
+                    photo = ImageTk.PhotoImage(img)
+                    label.configure(image=photo)
+                    state["photo"] = photo
+                else:
+                    # In-place blit into the pixmap Tk is already showing.
+                    photo.paste(img)
             except Exception:
                 pass
-        root.after(40, tick)                     # ~25 fps cap
+        root.after(POLL_MS, tick)
 
     def on_close():
         client.close()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
-    root.after(40, tick)
+    root.after(POLL_MS, tick)
     root.mainloop()
     client.close()
     return 0

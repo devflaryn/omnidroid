@@ -155,6 +155,27 @@ class ModeSizing(unittest.TestCase):
             self.assertIn("-vnc 127.0.0.1:", " ".join(cmd))
 
 
+# Every balloon assertion below is about the LOGIC -- which cap is chosen,
+# how long it waits, whether a flag wins. Whether the HOST can take the pages
+# back is a separate question, and on Windows the answer is no, so leaving it
+# unpatched made this file pass or fail depending on which machine ran it.
+# Pinned True for the module; the one class that is about the capability
+# patches it False for itself.
+_HOST_RECLAIM_PATCH = None
+
+
+def setUpModule():
+    global _HOST_RECLAIM_PATCH
+    _HOST_RECLAIM_PATCH = mock.patch.object(
+        omni, "host_can_reclaim_balloon", return_value=True)
+    _HOST_RECLAIM_PATCH.start()
+
+
+def tearDownModule():
+    if _HOST_RECLAIM_PATCH is not None:
+        _HOST_RECLAIM_PATCH.stop()
+
+
 class BalloonTarget(unittest.TestCase):
     """apply_balloon_target must POLL. Inflation is asynchronous: QEMU
     returns as soon as the request is queued and the guest then walks its
@@ -192,6 +213,47 @@ class BalloonTarget(unittest.TestCase):
         with mock.patch.object(omni, "qmp", return_value=None):
             self.assertIsNone(omni.apply_balloon_target(
                 {"name": "u1", "qmp_port": 1}, {"balloon": 1024, "mem": 2048}))
+
+
+class AHostThatCannotTakeThePagesBack(unittest.TestCase):
+    """No balloon where the inflate cannot reach the host.
+
+    On Windows QEMU has no `madvise`, so `ram_block_discard_range` fails and
+    every page the guest hands over stays charged to the host. MEASURED
+    2026-08-15 on PS99: the guest squeezed to 830 MB by the balloon while the
+    QEMU process held 2190 MB. The inflate is therefore not a saving there,
+    it is a pure cost to the guest -- and a large one: at the 896 MB cap the
+    session handover itself timed out and the client never loaded the place.
+    """
+
+    def _applied(self, mode, can_reclaim):
+        seen = {}
+
+        def fake_qmp(acct, cmd, args=None, **kw):
+            if cmd == "balloon":
+                seen["mb"] = args["value"] // (1024 * 1024)
+                return {"return": {}}
+            return {"return": {"actual": seen.get("mb", 0) * 1024 * 1024}}
+
+        with mock.patch.object(omni, "qmp", side_effect=fake_qmp),              mock.patch.object(omni, "host_can_reclaim_balloon",
+                               return_value=can_reclaim),              mock.patch.object(omni, "zram_active", return_value=False),              mock.patch.object(omni.time, "sleep"):
+            omni.apply_balloon_target({"name": "u1", "qmp_port": 1}, mode)
+        return seen.get("mb")
+
+    def test_a_modes_own_balloon_is_skipped(self):
+        self.assertIsNone(self._applied({"balloon": 896, "mem": 2048},
+                                        can_reclaim=False))
+
+    def test_and_applied_where_it_does_reach_the_host(self):
+        self.assertEqual(self._applied({"balloon": 896, "mem": 2048},
+                                       can_reclaim=True), 896)
+
+    def test_but_an_explicit_flag_still_wins(self):
+        # Same rule as --mem and --balloon vs balloon_zram: a flag argparse
+        # accepts and the engine then ignores is worse than one never offered.
+        mode = omni.resolve_mode({}, "farming", balloon=1200)
+        self.assertTrue(mode["balloon_explicit"])
+        self.assertEqual(self._applied(mode, can_reclaim=False), 1200)
 
 
 class MemPlumbing(unittest.TestCase):

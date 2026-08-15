@@ -122,11 +122,40 @@ def build_client_settings_script(su, settings=None):
     )
 
 
-def build_squeeze_sequence(mode=None):
+# The squeeze's steps, by name, in the order they are applied. Every step
+# carries its name so a caller can skip one BY NAME -- which is not a
+# convenience: this sequence has now twice been the thing that stopped Roblox
+# from running on the x86 base, and the only way to find out which lever did
+# it is to run the guest with one of them removed. Bisecting it by editing
+# this file means every attempt is a different build of the product.
+STEP_DISPLAY = "display"
+STEP_TRIM_PACKAGES = "packages"
+STEP_ZRAM = "zram"
+STEP_SWAPPINESS = "swappiness"
+STEP_LMKD = "lmkd"
+STEP_QUIESCE = "quiesce"
+STEP_DOZE = "doze"
+STEP_TRIM_MEMORY = "trimmemory"
+STEP_CPUSET = "cpuset"
+STEP_NAMES = (STEP_DISPLAY, STEP_TRIM_PACKAGES, STEP_ZRAM, STEP_SWAPPINESS,
+              STEP_LMKD, STEP_QUIESCE, STEP_DOZE, STEP_TRIM_MEMORY,
+              STEP_CPUSET)
+
+
+def parse_skip(text):
+    """Step names from a comma-separated list (OMNI_FARM_SKIP), ignoring
+    anything that is not a real step -- a typo must not silently disable a
+    different lever, and must not fail a boot either."""
+    wanted = {p.strip().lower() for p in str(text or "").split(",") if p.strip()}
+    return tuple(n for n in STEP_NAMES if n in wanted)
+
+
+def build_squeeze_sequence(mode=None, skip=()):
     """Ordered list of adb `shell` argv vectors for the farming squeeze.
 
     `mode` is a resolved MODES entry; None falls back to the farming defaults
-    so existing callers keep working.
+    so existing callers keep working. `skip` is a collection of STEP_NAMES to
+    leave out (see the constants above, and OMNI_FARM_SKIP).
 
     Ordering is load-bearing:
       1. display FIRST — every later step's memory picture is then measured
@@ -138,6 +167,7 @@ def build_squeeze_sequence(mode=None):
          the game is actually up.
     """
     mode = mode or {}
+    skip = set(skip or ())
     display = mode.get("display", lean.FARMING_DISPLAY)
     mem_mb = mode.get("mem", 2048)
     zram_mb = zram_size_mb(mem_mb)
@@ -146,59 +176,92 @@ def build_squeeze_sequence(mode=None):
 
     # 1) Shrink the display. Roblox keeps running and keeps its connection;
     #    it just composites ~30x fewer pixels.
-    steps += lean.display_args(display)
+    if STEP_DISPLAY not in skip:
+        steps += lean.display_args(display)
 
     # 2) Tier-2 package trim. force-stop after disable so an already-running
     #    instance releases its pages now rather than at the next lmkd sweep.
     #    One shell per package on purpose: a single mega-command that failed
     #    halfway would silently skip every package after the failure.
-    for pkg in lean.trim_packages():
-        steps.append(sh(f"pm disable-user --user 0 {pkg} >/dev/null 2>&1; "
-                        f"am force-stop {pkg} >/dev/null 2>&1; true"))
+    if STEP_TRIM_PACKAGES not in skip:
+        for pkg in lean.trim_packages():
+            steps.append(sh(f"pm disable-user --user 0 {pkg} >/dev/null 2>&1; "
+                            f"am force-stop {pkg} >/dev/null 2>&1; true"))
 
     # 3) zram swap on, so the guest reclaims under the low mem cap. lz4 over
     #    the zstd default: farming trades compression ratio for CPU, and CPU
     #    is the scarce resource when 50 instances share a host.
-    steps.append(sh("swapon /dev/block/zram0 2>/dev/null || ("
-                    "echo 1 > /sys/block/zram0/reset 2>/dev/null; "
-                    "echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null; "
-                    f"echo {zram_mb}M > /sys/block/zram0/disksize 2>/dev/null || "
-                    f"zramctl -f -s {zram_mb}M 2>/dev/null; "
-                    "mkswap /dev/block/zram0 2>/dev/null; "
-                    "swapon /dev/block/zram0 2>/dev/null); true"))
+    #
+    #    SKIPPED where the mode says so, and on x86 it does. Roblox is arm64
+    #    only, so the x86 base runs it through libndk_translation, and swapping
+    #    translated code pages out makes the translator take a SIGSEGV it
+    #    cannot handle -- `Abort message: 'Cannot process signal 11'` in
+    #    ndk_translation::HandleHostSignal, with memory free and no OOM kill.
+    #    See MODES["farming"]["zram_x86"].
+    if STEP_ZRAM in skip:
+        pass
+    elif not mode.get("zram", True):
+        # NOT ENOUGH TO SKIP THE SWAPON: the base ships zram already ON.
+        # `persist.sys.zram_enabled` is baked into build.prop and
+        # /vendor/etc/init/zram.rc calls swapon_all at boot, so a guest that
+        # was never asked to enable zram still comes up with ~1 GB of it --
+        # measured, `SwapTotal: 1045168 kB` on an x86 farming instance whose
+        # launch had just printed "zram: OFF for this mode". Turning it off
+        # has to be an explicit step.
+        steps.append(sh("swapoff /dev/block/zram0 2>/dev/null; "
+                        "swapoff -a 2>/dev/null; true"))
+    if mode.get("zram", True):
+        steps.append(sh("swapon /dev/block/zram0 2>/dev/null || ("
+                        "echo 1 > /sys/block/zram0/reset 2>/dev/null; "
+                        "echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null; "
+                        f"echo {zram_mb}M > /sys/block/zram0/disksize 2>/dev/null || "
+                        f"zramctl -f -s {zram_mb}M 2>/dev/null; "
+                        "mkswap /dev/block/zram0 2>/dev/null; "
+                        "swapon /dev/block/zram0 2>/dev/null); true"))
 
-    # 4) Swap anonymous memory into zram aggressively. 100+ is the Android
-    #    low-RAM convention: with a compressed backing device, swapping is
-    #    cheaper than dropping the game's warm file pages.
-    steps.append(sh("echo 100 > /proc/sys/vm/swappiness 2>/dev/null; "
-                    "echo 0 > /proc/sys/vm/page-cluster 2>/dev/null; true"))
+    # 4) How hard to swap anonymous memory. 100+ is the Android low-RAM
+    #    convention and is right where there IS a compressed backing device and
+    #    nothing minds its pages moving. On x86 the mode sets 10 instead: see
+    #    the zram note above -- the translator cannot survive having its code
+    #    pages evicted, and swappiness is the lever that decides how eagerly
+    #    that happens.
+    swappiness = mode.get("swappiness", 100)
+    if STEP_SWAPPINESS not in skip:
+        steps.append(sh(f"echo {int(swappiness)} > /proc/sys/vm/swappiness "
+                        "2>/dev/null; "
+                        "echo 0 > /proc/sys/vm/page-cluster 2>/dev/null; true"))
 
     # 5) lmkd: reclaim aggressively but keep the game alive. These are the
     #    runtime-settable half of lean.LMKD_PROPS (the ro.* half needs the
     #    baked base). Restarting lmkd makes it re-read them.
-    steps.append(sh("setprop ro.lmk.use_psi true; "
-                    "setprop ro.lmk.critical_upgrade true; "
-                    "setprop ro.lmk.kill_heaviest_task true; "
-                    "setprop ctl.restart lmkd; true"))
+    if STEP_LMKD not in skip:
+        steps.append(sh("setprop ro.lmk.use_psi true; "
+                        "setprop ro.lmk.critical_upgrade true; "
+                        "setprop ro.lmk.kill_heaviest_task true; "
+                        "setprop ctl.restart lmkd; true"))
 
     # 6) Quiesce residual background work farming doesn't need. Safe on a
     #    headless kiosk instance.
-    steps.append(["shell", "cmd", "activity", "idle-maintenance"])
-    steps.append(["shell", "settings", "put", "global",
-                  "window_animation_scale", "0"])
+    if STEP_QUIESCE not in skip:
+        steps.append(["shell", "cmd", "activity", "idle-maintenance"])
+        steps.append(["shell", "settings", "put", "global",
+                      "window_animation_scale", "0"])
     # Doze the device, but whitelist the game FIRST — an un-whitelisted
     # Roblox would lose its network the moment doze engaged, which is the
     # exact opposite of "the instances must be on".
-    steps.append(sh(f"dumpsys deviceidle whitelist +{GAME_PKG} "
-                    ">/dev/null 2>&1; "
-                    "dumpsys deviceidle force-idle >/dev/null 2>&1; true"))
+    if STEP_DOZE not in skip:
+        steps.append(sh(f"dumpsys deviceidle whitelist +{GAME_PKG} "
+                        ">/dev/null 2>&1; "
+                        "dumpsys deviceidle force-idle >/dev/null 2>&1; true"))
 
     # 7) Ask the game to drop its own caches, then throttle it to the
     #    background cpuset. send-trim-memory is what the framework itself
     #    sends under pressure, so apps release exactly what they are built to.
-    steps.append(sh(f"am send-trim-memory {GAME_PKG} RUNNING_CRITICAL "
-                    ">/dev/null 2>&1; true"))
-    steps.append(sh(f"PID=$(pidof {GAME_PKG} 2>/dev/null); "
-                    f'[ -n "$PID" ] && echo $PID > '
-                    f"/dev/cpuset/background/tasks 2>/dev/null; true"))
+    if STEP_TRIM_MEMORY not in skip:
+        steps.append(sh(f"am send-trim-memory {GAME_PKG} RUNNING_CRITICAL "
+                        ">/dev/null 2>&1; true"))
+    if STEP_CPUSET not in skip:
+        steps.append(sh(f"PID=$(pidof {GAME_PKG} 2>/dev/null); "
+                        f'[ -n "$PID" ] && echo $PID > '
+                        f"/dev/cpuset/background/tasks 2>/dev/null; true"))
     return steps

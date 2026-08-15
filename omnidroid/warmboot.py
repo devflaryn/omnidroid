@@ -11,6 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from omnidroid import migfile
 from omnidroid import warmcache
 from omnidroid.qmpsession import QmpSession
 
@@ -21,6 +22,19 @@ from omnidroid.qmpsession import QmpSession
 # gets a turn. Kept well under 30s so the boot-completion wait that follows
 # still has a meaningful budget left.
 RESTORE_CONNECT_TIMEOUT = 20.0
+
+# The loopback port the TCP relay prefers, derived from the instance's own
+# reserved triple the same way every other port is: adb 16001+i, qmp 17001+i,
+# vnc 18001+i, relay 19001+i. Kept 1000 above vnc so it cannot collide below
+# 1000 concurrent instances, exactly like the other three. It is transient --
+# open only while a bake or a restore is streaming -- so it is never recorded
+# in run.json, and migfile falls back to an ephemeral port if it is taken.
+RELAY_PORT_OFFSET = 1000
+
+
+def _relay_port(acct):
+    port = (acct or {}).get("vnc_port")
+    return port + RELAY_PORT_OFFSET if port else None
 
 # A migration file is sparse: it costs roughly the guest's resident set, not
 # its -m size. Measured on the arm64 base: a 4096 MB guest froze to ~2.4 GiB.
@@ -71,24 +85,31 @@ def restore_into(acct, entry, label, session_factory=QmpSession,
     to be negotiated BEFORE migrate-incoming or the destination rejects the
     stream outright. Returns True only if the guest is running afterwards.
 
+    The TRANSPORT is read back out of the entry's own meta.json rather than
+    recomputed, because the two formats are not interchangeable: a mapped-ram
+    file fed to a QEMU that did not enable the capability is rejected, and the
+    rejection looks exactly like a corrupt entry. An entry written before the
+    field existed is a `file` entry, which is what every entry written before
+    this change actually was.
+
     `connect_timeout` is bounded well under RESTORE_TIMEOUT -- see
     RESTORE_CONNECT_TIMEOUT above -- unlike bake_entry(), which keeps
     QmpSession's own generous default: a bake is not raced against a 30s
     budget the way a restore is.
     """
-    state = Path(entry) / warmcache.STATE_NAME
+    entry = Path(entry)
+    state = entry / warmcache.STATE_NAME
+    transport = (warmcache.read_meta(entry) or {}).get(
+        "transport", migfile.TRANSPORT_FILE)
     try:
         with session_factory(acct["qmp_port"],
                              connect_timeout=connect_timeout) as s:
-            s.set_migration_caps()
-            r = s.cmd("migrate-incoming", {"uri": f"file:{state}"})
-            if "error" in r:
-                print(f"[{label}] warm restore rejected: "
-                      f"{r['error'].get('desc')}")
-                return False
-            status = s.wait_migrate()
-            if status != "completed":
-                print(f"[{label}] warm restore did not complete ({status})")
+            s.set_migration_caps(caps=migfile.transport_caps(transport))
+            ok, detail = migfile.load_state(
+                s, state, transport=transport,
+                preferred_port=_relay_port(acct))
+            if not ok:
+                print(f"[{label}] warm restore rejected: {detail}")
                 return False
             s.cmd("cont")
             return True
@@ -115,16 +136,17 @@ def bake_entry(acct, images_dir, key, meta, runtime_dir, label,
     try:
         staging = warmcache.begin_bake(images_dir, key)
         state_path = staging / warmcache.STATE_NAME
+        transport = migfile.default_transport()
         with session_factory(acct["qmp_port"]) as s:
-            s.set_migration_caps()
+            s.set_migration_caps(caps=migfile.transport_caps(transport))
             if "error" in s.cmd("stop"):
                 raise RuntimeError("could not stop the guest")
-            r = s.cmd("migrate", {"uri": f"file:{state_path}"})
-            if "error" in r:
-                raise RuntimeError(r["error"].get("desc", "migrate rejected"))
-            status = s.wait_migrate()
-            if status != "completed":
-                raise RuntimeError(f"migration {status}")
+            ok, detail = migfile.save_state(
+                s, state_path, transport=transport,
+                preferred_port=_relay_port(acct))
+            if not ok:
+                raise RuntimeError(f"migration {detail}")
+        meta = dict(meta, transport=transport)
         # The guest is stopped, so these are exactly the freeze-point disks.
         for src, dst in ((rd / "bake_system.qcow2", warmcache.SYSTEM_NAME),
                          (rd / "bake_data.qcow2", warmcache.DATA_NAME),
@@ -138,7 +160,7 @@ def bake_entry(acct, images_dir, key, meta, runtime_dir, label,
             shutil.move(str(src), str(staging / dst))
         warmcache.commit_bake(images_dir, key, staging, meta)
         staging = None      # committed: nothing left at the old path to discard
-        # QMP can report "completed" while the `file:` write never actually
+        # QMP can report "completed" while the write never actually
         # landed (an I/O error not surfaced through the migration state
         # machine, a disk that filled mid-write, ...). Trusting that status
         # alone would leave every future launch paying the stop+migrate
@@ -150,7 +172,8 @@ def bake_entry(acct, images_dir, key, meta, runtime_dir, label,
             print(f"[{label}] warm bake produced an unusable entry "
                   f"(failed post-commit validation); discarded")
             return False
-        print(f"[{label}] warm entry baked ({key})")
+        print(f"[{label}] warm entry baked ({key}, {transport} transport, "
+              f"{detail})")
         return True
     except Exception as e:      # noqa: BLE001 - a failed bake is not a failed launch
         print(f"[{label}] warm bake failed ({e}); this launch is unaffected")

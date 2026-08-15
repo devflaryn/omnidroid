@@ -65,11 +65,11 @@ class FarmingMode(unittest.TestCase):
         omni.resolve_mode({}, "farming", mem=9999, balloon=1)
         self.assertNotEqual(omni.MODES["farming"]["mem"], 9999)
 
-    def test_playable_is_untouched_and_uncapped(self):
-        self.assertEqual(omni.DEFAULT_MODE, "playable")
-        p = omni.MODES["playable"]
+    def test_gaming_is_untouched_and_uncapped(self):
+        self.assertEqual(omni.DEFAULT_MODE, "gaming")
+        p = omni.MODES["gaming"]
         self.assertEqual((p["mem"], p["smp"]), (4096, 4))
-        # A playable instance is one a human is looking at and touching.
+        # A gaming instance is one a human is looking at and touching.
         self.assertIsNone(p["balloon"])
         self.assertTrue(p["usb"])
         self.assertIsNone(p["display"])

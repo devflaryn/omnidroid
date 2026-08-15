@@ -78,12 +78,12 @@ accounts/<name>/
 Python CLI, working name `omni`:
 
 ```
-omni create <name>            # make overlay + data disk + account.json
-omni start <name> [--dev]     # boot instance: free ports, QEMU flags, adb connect
-omni stop <name>              # graceful ACPI shutdown via QMP, then hard-kill fallback
-omni list                     # accounts + running state + RAM use
-omni install <name> game.apk  # adb install into a running instance (dev mode)
-omni update-base <new.qcow2>  # register base-v(N+1), migrate accounts (see §5)
+omnidroid create <name>            # make overlay + data disk + account.json
+omnidroid start <name> [--dev]     # boot instance: free ports, QEMU flags, adb connect
+omnidroid stop <name>              # graceful ACPI shutdown via QMP, then hard-kill fallback
+omnidroid list                     # accounts + running state + RAM use
+omnidroid install <name> game.apk  # adb install into a running instance (dev mode)
+omnidroid update-base <new.qcow2>  # register base-v(N+1), migrate accounts (see §5)
 ```
 
 Per instance the manager assigns: an adb port (host 5555+i forwarded to guest 5555 via QEMU user networking — adb-over-TCP enabled once in the base), and a QMP control socket (QEMU's JSON control channel) for clean shutdown and monitoring. It also runs a **watchdog**: polls `adb shell pidof <game>`; when the game process is gone (and the guest didn't shut itself down), it powers the instance off.
@@ -120,7 +120,7 @@ Small Kotlin app (`com.omni.kiosk`), minSdk 26 (Android 8+ per your game), one f
   1. In-guest: kiosk invokes shutdown (`su -c svc power shutdown` if the image has root; or via device-owner privileges). QEMU is started with `-no-reboot`-style semantics so guest poweroff ends the process.
   2. Host fallback: the manager's watchdog notices the game pid is gone / guest halted and issues QMP `system_powerdown`, then kills QEMU after a timeout. So shutdown works even if the in-guest path is unavailable.
 
-Dev vs production: dev mode = game installed per-account via `omni install` (freely uninstall/reinstall). Production = game baked into the base as a system app (`/system/priv-app` or `/product/app` with its ARM native libs intact — installed through a base-edit session, again without touching the bridge).
+Dev vs production: dev mode = game installed per-account via `omnidroid install` (freely uninstall/reinstall). Production = game baked into the base as a system app (`/system/priv-app` or `/product/app` with its ARM native libs intact — installed through a base-edit session, again without touching the bridge).
 
 ---
 
@@ -131,7 +131,7 @@ Rules that make this safe:
 1. **Bases are immutable and versioned.** `base-v1.qcow2` is never written after accounts exist on it.
 2. **To build v2:** create a fresh overlay on v1 → boot it → apply updates (Bliss update, game update, tweaks) → verify ARM translation + game launch → flatten it (`qemu-img convert` merges base+overlay into a standalone `base-v2.qcow2`).
 3. **To migrate an account:** delete/recreate its cheap `system.qcow2` overlay pointing at v2. Its `data.qcow2` (all logins, saves, settings) is not on the overlay chain, so it survives untouched. `account.json` records which base version each account uses, so migration can be gradual and reversible (v1 stays on disk until nobody references it).
-4. `omni update-base` automates 2–3 and refuses to delete a base that any account still references.
+4. `omnidroid update-base` automates 2–3 and refuses to delete a base that any account still references.
 
 This is exactly "update the base once, every account gets it" — with zero risk to account data because data was never stored in the overlay.
 
@@ -173,7 +173,7 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
 >   single `omni.exe` + auto-download portable QEMU; **Lock Task Mode
 >   device-owner lockdown + RAM trims (base-v5)**.
 > - Phase 8 Linux/KVM+KSM port — 🟨 HOST-SIDE PREP DONE 2026-07-06 (accel
->   auto-detect + mem-merge, `omni ksm`, `bench-ksm` scaffold, per-platform
+>   auto-detect + mem-merge, `omnidroid ksm`, `bench-ksm` scaffold, per-platform
 >   images_dir; Windows verified unaffected). Blocked on hardware: first
 >   Linux box will be an Ubuntu 24.04 laptop with ~8 GB RAM — that box
 >   PROVES portability only (~3–4 brutal instances, FEWER than Windows'
@@ -194,7 +194,7 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
 4. Verify: adb connects; `getprop ro.dalvik.vm.native.bridge` shows libndk; install the game APK; it runs. Record baseline RAM use and boot time. Check for root (→ open question 2).
 
 **Phase 2 — Manager skeleton (Windows)**
-5. `omni create/start/stop/list` with overlay creation, port allocation, QMP shutdown, adb auto-connect. Two accounts booting side by side.
+5. `omnidroid create/start/stop/list` with overlay creation, port allocation, QMP shutdown, adb auto-connect. Two accounts booting side by side.
 
 **Phase 3 — Per-account data split**
 6. Add `data.qcow2` per account + `DATA=` boot param (this is the step most specific to Bliss internals — tested on throwaway copies until right). Verify: two accounts log into two different game accounts, settings persist independently, deleting a system overlay loses nothing.
@@ -206,7 +206,7 @@ These are estimates; Phase 1 includes measuring the real idle footprint of your 
 8. Build `com.omni.kiosk`, install as HOME, disable Bliss launcher/taskbar. Test the full loop: boot → loading screen → game auto-launch → close game → instance powers off. Test "no apk found" + adb-install-triggers-launch (dev mode).
 
 **Phase 6 — Base update pipeline**
-9. Implement `omni update-base`; prove an existing account keeps its login/settings across a base update.
+9. Implement `omnidroid update-base`; prove an existing account keeps its login/settings across a base update.
 
 **Phase 7 — Production mode**
 10. Bake the game into the base as a system app; verify per-account logins still isolate via data disks.
@@ -329,7 +329,7 @@ Phase 3 (per-account data split) was absorbed into Phase 2 — built into the ma
 
 **Kiosk APK** (`launcher/`, `com.omni.kiosk`, ~12 KB, built Gradle-free via `launcher/build.ps1`: aapt2 → javac → d8 → apksigner; JDK 21 + build-tools 36.0.0). Registered as HOME (`MAIN`/`HOME`/`DEFAULT`), fullscreen immersive black. Reads game package from `Settings.Global omni_game_package` (manager sets it on `install`); dev fallback = first launchable non-system app **excluding a denylist** of base preinstalled apps (opencamera/termux/amaze/kernelsu/keymapper) — without the denylist it wrongly grabbed Open Camera.
 
-**Manager additions:** `omni kioskify <name>` (install kiosk, `set-home-activity`, `pm disable-user` the 3 Bliss launchers), `omni watch <name> --grace N` (host watchdog), `omni install` now records package + pushes `omni_game_package`, and uses `--no-incremental` (Bliss rejects incremental sessions; adb was falling back to streamed with a scary trace).
+**Manager additions:** `omnidroid kioskify <name>` (install kiosk, `set-home-activity`, `pm disable-user` the 3 Bliss launchers), `omnidroid watch <name> --grace N` (host watchdog), `omnidroid install` now records package + pushes `omni_game_package`, and uses `--no-incremental` (Bliss rejects incremental sessions; adb was falling back to streamed with a scary trace).
 
 **Four behaviors, all verified on account `charlie` (fresh, base-v1 + kiosk):**
 
@@ -337,12 +337,12 @@ Phase 3 (per-account data split) was absorbed into Phase 2 — built into the ma
 |---|---|
 | "no apk found" black screen when game absent | ✅ configured game not installed → centered "no apk found" on black |
 | Auto-launch game on boot | ✅ cold boot → silent boot → loading screen → kiosk → **Roblox foreground & rendering** (screencap confirms arm64 game via libndk), zero intervention |
-| Instantly launch a newly adb-installed APK | ✅ `omni install charlie roblox.apk` → kiosk logcat `PACKAGE_ADDED … launching com.roblox.client (new apk installed)` → foreground |
+| Instantly launch a newly adb-installed APK | ✅ `omnidroid install charlie roblox.apk` → kiosk logcat `PACKAGE_ADDED … launching com.roblox.client (new apk installed)` → foreground |
 | Shut down when game closes | ✅ see edge test below |
 
 **Shutdown-edge test — the critical distinction between "game closed" and "game blipped":**
 
-The kiosk app NEVER decides shutdown. The **host watchdog** (`omni watch`) owns it, and it keys on **process death, never foreground**. State machine: `WAITING → RUNNING` (pidof game present) `→ GRACE` (pidof empty) `→ shutdown` only after `--grace` seconds of *consecutive* absence; any reappearance returns to RUNNING; adb hiccups count as "unknown" and never advance the grace timer.
+The kiosk app NEVER decides shutdown. The **host watchdog** (`omnidroid watch`) owns it, and it keys on **process death, never foreground**. State machine: `WAITING → RUNNING` (pidof game present) `→ GRACE` (pidof empty) `→ shutdown` only after `--grace` seconds of *consecutive* absence; any reappearance returns to RUNNING; adb hiccups count as "unknown" and never advance the grace timer.
 
 - **Blip (must stay alive):** launched kiosk over the running game so the game fully **left the foreground** (top activity became `com.omni.kiosk`) while its **process stayed alive (pid 5331)**. Watchdog held `RUNNING`, never entered GRACE. Waited 25 s (> 20 s grace) → **instance still up** (`boot_completed=1`). Proves foreground change / dialog / ad / webview / loading does not trigger shutdown.
 - **Real close (must shut down):** `am force-stop com.roblox.client` → pidof empty → log: `RUNNING → GRACE`, countdown `3/6/9/12/15/18/21s`, then `gone for 21s >= 20s - shutting instance down` → in-guest `svc power shutdown` → **QEMU exited clean**.

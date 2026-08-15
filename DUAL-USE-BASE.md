@@ -14,9 +14,9 @@ So **debug is a per-BOOT option, not a base and not an account property.** The
 same account boots production on one run and debug on the next, off one image.
 
 ```bash
-omni start <name>                 # production boot: rooted, hidden, no devkit disk
-omni start <name> --debug         # debug boot: same image + the devkit disk (vdc)
-omni start <name> --apk build.apk # swap the Roblox build — works on ANY base, no --debug needed
+omnidroid start <name>                 # production boot: rooted, hidden, no devkit disk
+omnidroid start <name> --debug         # debug boot: same image + the devkit disk (vdc)
+omnidroid start <name> --apk build.apk # swap the Roblox build — works on ANY base, no --debug needed
 ```
 
 Agent equivalents: `ensure_emulator_running(debug=true)` (or
@@ -28,20 +28,20 @@ apk_path=..., debug=...)`. APK swap never requires `debug`.
 Two orthogonal build steps; neither changes which base ships or `current_base`.
 
 ```bash
-omni build-devkit [--arch arm|x86]   # build the attachable devkit disk (frida + omni-* tools + Magisk bins)
-omni root-base   [--base <tag>]      # bake a Magisk-patched (rooted) boot into a thin overlay of the base
+omnidroid build-devkit [--arch arm|x86]   # build the attachable devkit disk (frida + omni-* tools + Magisk bins)
+omnidroid root-base   [--base <tag>]      # bake a Magisk-patched (rooted) boot into a thin overlay of the base
 ```
 
-### `omni build-devkit`
+### `omnidroid build-devkit`
 
 Assembles `base_<arch>_devkit.qcow2` entirely host-side (rootless,
 cross-platform via `mke2fs -d`): the native-arch frida-server ELF, the Magisk
 APK + its extracted multicall binaries, the LF-normalized `omni-*` scripts, and
-a `manifest.json`. It belongs to no base entry — `omni start --debug` attaches
+a `manifest.json`. It belongs to no base entry — `omnidroid start --debug` attaches
 it as vdc, and the guest mounts it read-only at `/mnt/omni-devkit`, staging the
 toolkit into `/data/local/tmp/omni-devkit` to execute it (`/mnt` is noexec).
 
-### `omni root-base`
+### `omnidroid root-base`
 
 Bakes root **into** a shipped base without changing which image it is:
 
@@ -87,17 +87,17 @@ is kept for reuse. To finish it by hand, once:
 
 ```bash
 # 1. Boot the rooted system with a fresh /data + the devkit, and watch it:
-omni view _rootdata --start --debug        # or drive it over VNC
+omnidroid view _rootdata --start --debug        # or drive it over VNC
 # 2. In the guest: open the Magisk app, complete its setup, trigger su
 #    (any omni-* tool), and tap GRANT (Forever) on the dialog. Then set the
 #    policy so it is headless forever:
-omni adb _rootdata -- shell su 0 magisk --sqlite \
+omnidroid adb _rootdata -- shell su 0 magisk --sqlite \
   "REPLACE INTO settings (key,value) VALUES('root_access',3)"
-omni adb _rootdata -- shell su 0 magisk --denylist add com.roblox.client
+omnidroid adb _rootdata -- shell su 0 magisk --denylist add com.roblox.client
 # 3. Capture that /data as the rooted /data, then re-run root-base:
 qemu-img convert -O qcow2 -c <that account's data.qcow2> \
   $OMNI_IMAGES_DIR/base_arm_data_rooted.qcow2
-omni root-base --base arm     # now finds base_arm_data_rooted.qcow2 -> registers rooted
+omnidroid root-base --base arm     # now finds base_arm_data_rooted.qcow2 -> registers rooted
 ```
 
 Until then the base ships **unrooted** and fully functional (production boots,
@@ -122,11 +122,11 @@ no extra block device unless `--debug` was asked for.
 ## Verify
 
 ```bash
-omni build-devkit --arch arm         # build the devkit disk (once)
-omni root-base --base arm            # bake root: system auto-verified; /data grant
+omnidroid build-devkit --arch arm         # build the devkit disk (once)
+omnidroid root-base --base arm            # bake root: system auto-verified; /data grant
                                      #  headless if it can, else the manual step above
-omni start dbg --debug               # boot with the devkit attached
-omni adb dbg -- shell /debug_ramdisk/su 0 id      # expect uid=0(root) once granted
+omnidroid start dbg --debug               # boot with the devkit attached
+omnidroid adb dbg -- shell /debug_ramdisk/su 0 id      # expect uid=0(root) once granted
 # frida / hiding are then driven by the omni-* tools via the resolved su.
 ```
 
@@ -136,7 +136,7 @@ omni adb dbg -- shell /debug_ramdisk/su 0 id      # expect uid=0(root) once gran
   `"rooted": true` on the real production zram+baked-Roblox image:
   `base_arm_system_rooted.qcow2` (thin overlay, Magisk-patched boot) +
   `base_arm_data_rooted.qcow2` (shell su granted **Forever**, Zygisk + Enforce
-  DenyList, `com.roblox.client` on the DenyList). Verified via `omni start`:
+  DenyList, `com.roblox.client` on the DenyList). Verified via `omnidroid start`:
   boots in ~0.8 min, `su 0 sh -c id` → `uid=0 context=u:r:magisk:s0` with **no
   prompt**, Roblox stays baked (`/product/app/Roblox`), DenyList lists it, and
   props read `release-keys` / `verifiedbootstate=green` (presents as unrooted).
@@ -170,7 +170,7 @@ fetched at build time.
 | `/frida-server` | native-arch frida-server, pinned version. |
 | `/frida-server-patched` | *optional* anti-detection build — drop one in and `omni-fridad` prefers it. |
 | `/magisk.apk` | the Magisk installer/manager APK. |
-| `/bin/magiskboot`, `/bin/magiskinit`, `/bin/magiskpolicy`, `/bin/busybox` | Magisk multicall binaries (used by `omni root-base`). |
+| `/bin/magiskboot`, `/bin/magiskinit`, `/bin/magiskpolicy`, `/bin/busybox` | Magisk multicall binaries (used by `omnidroid root-base`). |
 | `/bin/boot_patch.sh`, `/bin/util_functions.sh` | Magisk's boot-image patch scripts. |
 | `/omni-fridad` | start frida-server **hidden** (custom loopback port, randomized process name). |
 | `/omni-frida-stop` | stop the devkit frida-server. |

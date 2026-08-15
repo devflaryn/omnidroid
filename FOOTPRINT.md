@@ -12,6 +12,28 @@ is an estimate. Full narrative in `CHANGELOG.md`.
 | 50+ farming instances | **met on a 64 GB host** (~71) — zram is baked and verified on production |
 | ~400 MB RAM per instance | **not achievable** — see below |
 
+> **⚠ EVERY NUMBER IN THIS FILE WAS TAKEN AGAINST A CLIENT THAT WAS NOT IN A
+> PLACE**, and that changes the fleet arithmetic more than anything else in
+> it. Re-measured 2026-08-16 on **Pet Simulator 99** (place `8737899170`),
+> in-world, `dumpsys meminfo com.roblox.client`:
+>
+> | | |
+> |---|---|
+> | game PSS on the login screen (what this file measured) | ~500-680 MB |
+> | **game PSS loading and holding the PS99 world** | **1018 → 1528 MB** |
+>
+> A 2048 MB guest cannot hold it: the client was OOM-killed three times in a
+> row at that size, under gaming tuning, with no squeeze in the way. So the
+> per-instance floor for a BUSY place is ~1.8-2 GB, not 896 MB, and "50+
+> instances" is a statement about a game, not about this engine. **Measure the
+> place you intend to farm before promising a fleet size for it.**
+>
+> The 896 MB cap below is still right for what it was measured against, and
+> still right for lighter places. It is the *target* that has to be stated per
+> game. See `docs/windows-ram-discard.md` for what this does to the
+> 30-instances-on-32-GB goal (short version: the game is the wall, not the
+> hypervisor).
+
 The arm base is at **version 3**: `persist.sys.zram_enabled=1` is baked into
 `/product/etc/build.prop`, so every production instance boots with zram and
 the balloon caps it at 896 MB by itself. Verified on a genuinely non-rooted
@@ -65,7 +87,7 @@ runtime, but SELinux denies uid `shell`, so production needs it baked.
 `base_arm_system.qcow2` (untouched), carrying one changed file. The config's
 `bases.arm.system` points at it; revert by pointing it back.
 
-`omni enable-zram-base` does the same edit via a qcow2 round trip, which needs
+`omnidroid enable-zram-base` does the same edit via a qcow2 round trip, which needs
 ~3.3 GiB of scratch (`--scratch-dir` can put that on another volume). With no
 scratch space at all, the method actually used here works instead and costs
 about a megabyte:
@@ -95,7 +117,7 @@ sync; umount /mnt/omniedit
 Acceptance test on a production instance:
 
 ```sh
-omni start <name> --mode farming
+omnidroid start <name> --mode farming
 adb -s 127.0.0.1:<adb_port> shell grep SwapTotal /proc/meminfo   # must be > 0
 ```
 
@@ -123,7 +145,7 @@ was baked in and measured. Result:
 | | lz4 | zstd |
 |---|---|---|
 | 896 MB cap, game running | 0 kills, sustained 3+ min | **3 mem-pressure kills, game dead** |
-| boot time | 0.8 min | 5+ min (timed out `omni start`) |
+| boot time | 0.8 min | 5+ min (timed out `omnidroid start`) |
 
 zstd wins on compression RATIO and loses on THROUGHPUT. On one vCPU it is
 reclaim LATENCY that decides whether an instance survives pressure: the guest
@@ -163,7 +185,7 @@ joined instance has less headroom than these suggest.
 ## Capacity arithmetic
 
 Planning is against the balloon **cap**, never observed RSS — an idle fleet
-flatters the number, and `omni measure` enforces this.
+flatters the number, and `omnidroid measure` enforces this.
 
 | host | instances at 896 MB (2 GiB reserved) |
 |---|---|
@@ -178,9 +200,9 @@ per-instance size, because 50 × 400 MB = 20 GB exceeds the machine.
 
 - **KSM dedup.** 50 guests from one base hold overwhelmingly identical
   pages; KSM collapses them, so a large fleet costs less than the sum of its
-  instances. `omni measure` reports `ksm_merged_mb` per instance and
+  instances. `omnidroid measure` reports `ksm_merged_mb` per instance and
   fleet-wide `saved_mb`. Linux-only — unverifiable on macOS. Turn it on with
-  `omni ksm --on`.
+  `omnidroid ksm --on`.
 - **A genuinely joined instance.** Without a live Roblox cookie the game sits
   on its login screen; the kiosk's Lock Task whitelist is `[com.omni.kiosk]`
   until a session is delivered. All game numbers here are foreground-with-
@@ -201,7 +223,7 @@ the ownership fixed, the SAME baked APK logs in and renders its home screen,
 and `topResumedActivity` is `com.roblox.client/.ActivityNativeMain`.
 
 It does still show Roblox's own "your version is out of date" dialog — a real
-but ordinary update, handled by `omni bake-data-game <newer.apk>` without
+but ordinary update, handled by `omnidroid bake-data-game <newer.apk>` without
 rebuilding any base. See the 2026-08-06 CHANGELOG entries.
 
 ## Platform note
@@ -209,4 +231,4 @@ rebuilding any base. See the 2026-08-06 CHANGELOG entries.
 balloon and free-page-reporting decommit for real on Linux/KVM. On macOS/HVF
 QEMU's `madvise` is advisory — a balloon inflate left host RSS high and
 rising. The 50+ story is a Linux number; macOS runs the 2–3 playable
-instances. `omni measure` prints which regime it is in.
+instances. `omnidroid measure` prints which regime it is in.
