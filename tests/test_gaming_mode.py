@@ -277,5 +277,43 @@ class TheHostIsProbedAtMostOnce(unittest.TestCase):
         qemu_proc._HELP_CACHE.clear()
 
 
+class MacOsAsksForGlTheOnlyWayMacOsCanGiveIt(unittest.TestCase):
+    """macOS deprecated OpenGL, so every macOS QEMU that can do GL does it
+    through ANGLE, which speaks OpenGL ES and translates to Metal. The option
+    is `gl=es`; `gl=on`/`gl=core` refuse or render upside down. Getting this
+    wrong makes a correctly-installed virgl QEMU look broken."""
+
+    def test_macos_asks_for_gl_es(self):
+        with mock.patch.object(qemu_proc, "_platform_key", return_value="macos"):
+            cap = qemu_proc.default_display(
+                qemu_display_help="cocoa", qemu_device_help=qemu_proc.GL_GPU_DEVICE)
+        self.assertEqual(cap["display_args"], ["-display", "cocoa,gl=es"])
+
+    def test_the_others_ask_for_gl_on(self):
+        for key, backend in (("windows", "gtk"), ("linux", "gtk")):
+            with mock.patch.object(qemu_proc, "_platform_key", return_value=key):
+                cap = qemu_proc.default_display(
+                    qemu_display_help=backend,
+                    qemu_device_help=qemu_proc.GL_GPU_DEVICE)
+            self.assertEqual(cap["display_args"], ["-display", f"{backend},gl=on"], key)
+
+    def test_gl_es_still_counts_as_a_gl_context(self):
+        """The one that bites. QEMU REFUSES `-vnc` together with a GL context
+        and exits, so a gl=es boot that was not recognised as GL would keep
+        -vnc and never start -- the same one-line failure that made `gaming`
+        exit before vnc_args existed."""
+        self.assertTrue(qemu_proc.uses_gl_context(["-display", "cocoa,gl=es"]))
+        self.assertEqual(qemu_proc.vnc_args(["-display", "cocoa,gl=es"], 1), [])
+
+    def test_gl_off_is_not_a_gl_context(self):
+        self.assertFalse(qemu_proc.uses_gl_context(["-display", "cocoa,gl=off"]))
+        self.assertEqual(qemu_proc.vnc_args(["-display", "cocoa,gl=off"], 1),
+                         ["-vnc", "127.0.0.1:1"])
+
+    def test_a_plain_backend_is_not_a_gl_context(self):
+        self.assertFalse(qemu_proc.uses_gl_context(["-display", "cocoa"]))
+        self.assertFalse(qemu_proc.uses_gl_context(["-display", "none"]))
+
+
 if __name__ == "__main__":
     unittest.main()

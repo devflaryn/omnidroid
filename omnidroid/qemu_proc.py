@@ -155,6 +155,20 @@ HEADLESS_GL_DISPLAY_ARGS = ["-display", HEADLESS_GL_DISPLAY]
 _WINDOW_BACKENDS = {"macos": ("cocoa",), "linux": ("gtk", "sdl"),
                     "windows": ("gtk", "sdl")}
 
+# HOW to ask for GL, per platform. This is not a style choice — the wrong one
+# does not degrade, it fails.
+#
+# `gl=on` means "give me desktop OpenGL". macOS DEPRECATED OpenGL in favour of
+# Metal, and every macOS QEMU that can do GL at all does it through ANGLE,
+# which speaks OpenGL **ES** and translates to Metal. So on macOS the option is
+# `gl=es`; `gl=on`/`gl=core` either refuse outright or render upside down
+# (documented by every build that ships this: knazarov/qemu-virgl and
+# akihikodaki's patches both say `gl=es`, "not gl=on or gl=core"). Getting this
+# wrong would have made a correctly-installed virgl QEMU look broken, and the
+# obvious conclusion — "GPU acceleration does not work on macOS" — would have
+# been wrong.
+_GL_OPTION = {"macos": "gl=es", "linux": "gl=on", "windows": "gl=on"}
+
 
 def _platform_key():
     if IS_MACOS:
@@ -237,10 +251,11 @@ def default_display(qemu_display_help="", qemu_device_help="", has_gui=True):
         wanted = "/".join(_WINDOW_BACKENDS[_platform_key()])
         return _none(f"this QEMU build has no {wanted} display backend")
     if GL_GPU_DEVICE in qemu_device_help:
+        gl = _GL_OPTION[_platform_key()]        # gl=es on macOS — see _GL_OPTION
         return {"available": True, "tier": "gl",
                 "gpu_args": ["-device", _GL_DEVICE_ARG],
-                "display_args": ["-display", f"{backend},gl=on"],
-                "reason": f"{backend},gl=on + {GL_GPU_DEVICE} (3D accelerated)"}
+                "display_args": ["-display", f"{backend},{gl}"],
+                "reason": f"{backend},{gl} + {GL_GPU_DEVICE} (3D accelerated)"}
     return {"available": True, "tier": "window",
             "gpu_args": list(HEADLESS_GPU_ARGS),
             "display_args": ["-display", backend],
@@ -1142,13 +1157,24 @@ _WINDOWLESS_DISPLAYS = ("none", "", HEADLESS_GL_DISPLAY, "egl-headless")
 def uses_gl_context(display_args):
     """Does this display pair give QEMU a GL context?
 
-    `gl=on` on a windowed backend, or egl-headless. Both are mutually exclusive
-    with the VNC server (see vnc_args).
+    Any `gl=` that is not `off` on a windowed backend, or egl-headless. Both
+    are mutually exclusive with the VNC server (see vnc_args).
+
+    Matching `gl=` generally rather than the literal `gl=on` is load-bearing:
+    macOS takes `gl=es` (ANGLE -> Metal; see _GL_OPTION), and a check that only
+    knew `gl=on` would read a macOS GL boot as non-GL, leave `-vnc` on the
+    command line, and QEMU would REFUSE TO START — "Display vnc is
+    incompatible with the GL context". That is the same one-line failure that
+    made `--mode gaming` exit instead of booting before vnc_args existed, and
+    it would have come straight back on the first Mac to get a virgl QEMU.
     """
     for arg in display_args or []:
         text = str(arg)
-        if "gl=on" in text or text.split(",")[0] == HEADLESS_GL_DISPLAY:
+        if text.split(",")[0] == HEADLESS_GL_DISPLAY:
             return True
+        for opt in text.split(",")[1:]:
+            if opt.startswith("gl=") and opt != "gl=off":
+                return True
     return False
 
 

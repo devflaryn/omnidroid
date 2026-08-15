@@ -63,11 +63,21 @@ def _linux():
 
 class DetectsTheGlTier(unittest.TestCase):
     def test_macos_with_a_gl_build_is_accelerated(self):
+        """macOS asks for gl=ES, and that is not a detail.
+
+        This test asserted `cocoa,gl=on` until 2026-08-15, which was wrong and
+        had never been exercised because no macOS host here had a GL-capable
+        QEMU to try it on. macOS DEPRECATED OpenGL in favour of Metal: every
+        macOS QEMU that can do GL does it through ANGLE, which speaks OpenGL ES
+        and translates to Metal. `gl=on`/`gl=core` refuse or render upside
+        down. Had this shipped, the first Mac to get a virgl QEMU would have
+        looked like "GPU acceleration does not work on macOS"."""
         with _mac():
             cap = omni.default_display(GL_DISPLAY_HELP, GL_DEVICE_HELP,
                                        has_gui=True)
         self.assertEqual(cap["tier"], "gl")
-        self.assertIn("cocoa,gl=on", " ".join(cap["display_args"]))
+        self.assertIn("cocoa,gl=es", " ".join(cap["display_args"]))
+        self.assertNotIn("gl=on", " ".join(cap["display_args"]))
         self.assertIn("virtio-gpu-gl-pci", " ".join(cap["gpu_args"]))
 
     def test_linux_with_a_gl_build_uses_gtk_or_sdl(self):
