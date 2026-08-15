@@ -4,9 +4,9 @@
     python3 -m pytest tests/test_window_chrome.py -q
 
 The caption goes because the strip IS the title bar; leaving QEMU's would put
-two title bars on screen, which is the trap embedview.py documented before it
-was deleted. WS_THICKFRAME stays so the composite can still be resized by
-dragging the guest window's edges.
+two title bars on screen -- a second one it would be impossible to click.
+WS_THICKFRAME stays so the composite can still be resized by dragging the
+guest window's edges.
 
 Nothing here may raise: a host where the chrome cannot be applied gets a plain
 window and a printed reason, never a failed boot.

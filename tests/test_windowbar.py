@@ -3,10 +3,11 @@
 
     python3 -m pytest tests/test_windowbar.py -q
 
-Today (embedview.py, deleted by this work) QEMU's window is a CHILD of our
-viewer, and Windows destroys a child with its parent: a force-killed viewer
-took the guest's display with it permanently -- instance alive, answering adb,
-totalFrames = 0. An OWNED window has the properties we want and not that one:
+Before this work QEMU's window was made a CHILD of a viewer (the embedded
+viewer, now deleted), and Windows destroys a child with its parent: a
+force-killed viewer took the guest's display with it permanently -- instance
+alive, answering adb, totalFrames = 0. An OWNED window has the properties we
+want and not that one:
 
   * it always floats above its owner (z-order solved without polling)
   * it minimises and restores with its owner

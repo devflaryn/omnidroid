@@ -92,7 +92,6 @@ DEFAULT_SRC = "/android-2024-10-11"
 #                provisioned /data fails with init_user0_failed. An account
 #                therefore copies the provisioned (system-overlay, data,
 #                efivars) trio rather than provisioning on first boot.
-from omnidroid import embedview
 from omnidroid import migfile
 from omnidroid.bases import *  # noqa: F401,F403
 from omnidroid.bases import (_truthy_env, _debug_boot_requested,
@@ -6464,24 +6463,24 @@ def _spawn_builtin_viewer(name, host, port, title):
     return subprocess.Popen(cmd, **kwargs)
 
 
-# How long `view` waits to see whether the embedded viewer stayed up. It either
-# attaches within a few hundred ms or exits, so this only has to be longer than
-# a Tk startup on a loaded host -- and every second of it is a second the user
-# waits for a window that is already on screen.
-EMBED_VIEWER_SETTLE = 2.5
+def _spawn_window_bar(name, title, identity, pid):
+    """Start the title bar in its own process, detached.
 
+    Detached on purpose: it is a window, not a step of the launch, and `view`
+    must return as soon as the guest is on screen. It holds nothing hostage --
+    the bar is OWNED BY the guest's window, so killing it however you like
+    leaves the guest rendering (windowbar.py).
 
-def _spawn_embedded_viewer(name, title, panel, identity=None, pid=None):
-    """Launch the viewer that HOSTS QEMU's own window instead of copying its
-    pixels (see omnidroid/embedview.py). Same detached-process shape as the RFB
-    viewer, so both are killed, logged and reasoned about identically."""
-    a = ["_embedview", "--identity", identity or f"omni-{name}"]
-    if pid:
-        a += ["--pid", str(pid)]
+    Same detached-process shape as the RFB viewer: frozen-aware argv, a
+    per-instance log, DETACHED_PROCESS on Windows. That shape is proven in
+    the shipped PyInstaller binary; anything narrower (relaunching via
+    `-m omnidroid`) works in dev and fails in production.
+    """
+    a = ["_windowbar", name, "--identity", identity]
     if title:
         a += ["--title", title]
-    if panel:
-        a += ["--size", f"{panel[0]}x{panel[1]}"]
+    if pid:
+        a += ["--pid", str(pid)]
     if getattr(sys, "frozen", False):
         cmd = [sys.executable] + self_argv_prefix() + a
     else:
@@ -6548,71 +6547,30 @@ def cmd_view(args):
     # instead. Same window to the user, none of the copy/encode/decode a
     # framebuffer protocol would cost, and input goes straight into the guest's
     # usb-tablet instead of being synthesised from RFB.
-    if boot_has_hidden_window(args.name) and embedview.available() \
-            and not getattr(args, "native", False):
-        # A viewer that was FORCE-killed takes QEMU's window down with it --
-        # Windows destroys a child window when its parent dies, and QEMU does
-        # not make a new one. The instance keeps running and keeps answering
-        # adb, but it renders nothing at all (measured: totalFrames = 0 after
-        # a taskkill /F on the viewer). Say that, rather than opening an empty
-        # window onto a guest whose display is gone.
+    if boot_has_hidden_window(args.name) and not getattr(args, "native", False):
         from omnidroid import hostwin
         run = _run_record(args.name)
         identity = run.get("identity") or f"omni-{args.name}"
         qemu_pid = run.get("pid")
-        # THREE states, and telling them apart is the whole point. They were
-        # one state for an afternoon, and "you already have this open" reported
-        # itself as "the guest's display was destroyed" -- because EnumWindows
-        # does not list child windows, and an embedded window IS a child.
-        if hostwin.window_is_embedded(identity, pid=qemu_pid):
-            hostwin.show_qemu_window(identity)
-            print(f"[view {args.name}] a viewer already has this instance's "
-                  f"window; bringing it forward")
-            if getattr(args, "json", False):
-                emit_json({"name": args.name, "viewer": "embedded",
-                           "already": True, "vnc_host": None,
-                           "vnc_port": None, "started": started, "ok": True})
-            return
-        if hostwin.find_window(identity, timeout=2, pid=qemu_pid) is None:
-            return fail(
-                "display_lost",
-                f"'{args.name}' is running but its display is gone: the QEMU "
-                f"window that held the GL context was destroyed, which happens "
-                f"when a viewer is force-killed rather than closed. The guest "
-                f"is alive on adb but renders nothing. Restart it "
-                f"(`omnidroid stop {args.name} && omnidroid start "
-                f"{args.name}`), and close the viewer with its X next time.")
-        panel = boot_gl_panel(args.name)
+        # Restyle first, THEN show. The other order puts an unstyled window
+        # with a caption on screen for a frame and then yanks it about, which
+        # reads as a glitch in the product rather than as a window being set
+        # up.
+        chrome = hostwin.apply_chrome(identity, pid=qemu_pid,
+                                      geometry=run.get("geometry"))
+        if not chrome["applied"]:
+            print(f"[view {args.name}] the window keeps QEMU's own chrome: "
+                  f"{chrome['reason']}. Rendering and input are unaffected.")
+        hostwin.show_qemu_window(identity)
         title = f"omni: {args.name}"
         try:
-            proc = _spawn_embedded_viewer(args.name, title, panel,
-                                          identity=identity, pid=qemu_pid)
+            _spawn_window_bar(args.name, title, identity, qemu_pid)
         except Exception as e:      # noqa: BLE001
-            return fail("viewer_failed",
-                        f"could not open the embedded viewer: {e}")
-        # The child does the actual reparenting and can still fail at it (the
-        # window went away in the meantime, Tk missing, ...). It exits
-        # immediately when it does, so a short wait turns a silent empty
-        # viewer into a real error with the child's own reason.
-        try:
-            rc = proc.wait(timeout=EMBED_VIEWER_SETTLE)
-        except subprocess.TimeoutExpired:
-            rc = None                      # still up: it attached
-        if rc is not None:
-            tail = ""
-            try:
-                tail = (runtime_dir(args.name) / "viewer.log").read_text(
-                    errors="replace").strip().splitlines()[-1]
-            except Exception:      # noqa: BLE001
-                pass
-            return fail("viewer_failed",
-                        f"the embedded viewer exited immediately (rc={rc})"
-                        + (f": {tail}" if tail else ""))
-        print(f"[view {args.name}] live viewer opened [embedded QEMU window] "
-              f"- GPU-rendered, native input; viewer pid {proc.pid}")
+            print(f"[view {args.name}] the title bar did not start ({e}); the "
+                  f"window is usable and the app can still hide or stop it.")
         if getattr(args, "json", False):
-            emit_json({"name": args.name, "viewer": "embedded",
-                       "viewer_pid": proc.pid, "vnc_host": None,
+            emit_json({"name": args.name, "viewer": "window",
+                       "chrome": chrome["applied"], "vnc_host": None,
                        "vnc_port": None, "started": started, "ok": True})
         return
 
@@ -6664,14 +6622,18 @@ def cmd_view(args):
                    "started": started, "ok": True})
 
 
-def _run_embedview(a):
-    """Hidden subcommand: the embedded-window viewer child process."""
-    size = None
-    if getattr(a, "size", None):
-        from omnidroid.qemu_proc import parse_panel
-        size = parse_panel(a.size)
-    return embedview.run_embedded_viewer(a.identity, title=a.title,
-                                        size=size, pid=getattr(a, "pid", None))
+def _run_windowbar(a):
+    """Hidden subcommand: run the title bar for one instance, detached from
+    `view` (see _spawn_window_bar). Not a user-facing command."""
+    from omnidroid import windowbar
+
+    def stop_instance(_identity):
+        cmd_stop(type("Args", (), {"name": a.name, "json": False,
+                                   "timeout": 90})())
+
+    return windowbar.run_window_bar(a.identity, title=a.title,
+                                    pid=getattr(a, "pid", None),
+                                    on_stop=stop_instance)
 
 
 def _run_vncview(a):
@@ -10664,18 +10626,19 @@ def build_parser():
     vv.add_argument("--title", default=None)
     vv.set_defaults(func=lambda a: sys.exit(_run_vncview(a)))
 
-    # Hidden internal: the viewer that HOSTS QEMU's own window rather than
-    # copying its framebuffer. Spawned by `omnidroid view` on a boot whose
-    # pixels live in a hidden GL window (see embedview.py). Not for direct use.
-    ev = sub.add_parser("_embedview")
-    ev.add_argument("--identity", required=True,
+    # Hidden internal: the title bar for one instance, owned BY the guest's
+    # QEMU window (see windowbar.py). Spawned by `omnidroid view` on a boot
+    # whose pixels live in a window (hidden through boot, shown by `view`).
+    # Not for direct use.
+    wb = sub.add_parser("_windowbar")
+    wb.add_argument("name")
+    wb.add_argument("--identity", required=True,
                     help="the QEMU window title, i.e. omni-<account>")
-    ev.add_argument("--title", default=None)
-    ev.add_argument("--size", default=None, help="WxH of the guest panel")
-    ev.add_argument("--pid", type=int, default=None,
+    wb.add_argument("--title", default=None)
+    wb.add_argument("--pid", type=int, default=None,
                     help="the QEMU pid, so the window is found even if its "
                          "title is not what we expect")
-    ev.set_defaults(func=lambda a: sys.exit(_run_embedview(a)))
+    wb.set_defaults(func=lambda a: sys.exit(_run_windowbar(a)))
 
     sc = sub.add_parser("screenshot", help="pull a screenshot (JSON out)")
     sc.add_argument("name")

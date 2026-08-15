@@ -16,9 +16,10 @@ the user paying it visually: the window is created (QEMU needs it), and then it
 is hidden. **A hidden window keeps rendering** -- measured, 303 frames in 30 s
 with the window invisible -- so nothing is lost but the sight of it.
 
-The viewer then HOSTS that window rather than connecting to a framebuffer --
-see `embedview.py`. Reparenting it costs no copy, no encode and no decode, and
-input goes straight into the guest instead of being synthesised from RFB.
+`view` then RESTYLES that same window in place -- see `apply_chrome` below and
+`windowbar.py`'s bar, owned BY the window -- rather than copying its pixels
+into a viewer of our own. No reparenting, no copy, no encode and no decode,
+and input goes straight into the guest instead of being synthesised from RFB.
 
 WHY THE OTHER TWO PLATFORMS ARE HERE. Windows is the only host where a window
 is *forced*, but every host where QEMU opens one owes the user the same thing:
@@ -696,8 +697,7 @@ def find_window(identity, timeout=DEFAULT_TIMEOUT, pid=None):
     THE HANDLE'S TYPE IS THE BACKEND'S: an HWND on Windows, an X11 window id on
     Linux, and on macOS the QEMU pid itself, because that platform hides
     applications rather than windows. Callers hand it straight back to this
-    module and must not interpret it; `embedview` is the single exception and
-    it is Windows-only.
+    module and must not interpret it.
     """
     if backend() == BACKEND_NONE or (not identity and pid is None):
         return None
@@ -713,29 +713,6 @@ def find_window(identity, timeout=DEFAULT_TIMEOUT, pid=None):
         if time.monotonic() >= deadline:
             return None
         time.sleep(poll)
-
-
-def window_is_embedded(identity, pid=None):
-    """True when the QEMU window exists but is a CHILD of something.
-
-    That is the "a viewer already has it" state, and it has to be told apart
-    from "the window is gone": one means open the window you already have, the
-    other means the guest is blind and the instance needs restarting.
-
-    False on every other backend by CONSTRUCTION, not by omission: nothing
-    reparents QEMU's window off Windows (macOS has no public cross-process
-    embedding, and a Linux GPU boot is windowless), so this state cannot
-    arise there."""
-    if backend() != BACKEND_WIN32:
-        return False
-    hwnd = find_window(identity, timeout=0, pid=pid)
-    if hwnd is None:
-        return False
-    try:
-        import ctypes
-        return bool(ctypes.windll.user32.GetParent(hwnd))
-    except Exception:      # noqa: BLE001
-        return False
 
 
 def hide_qemu_window(identity, timeout=DEFAULT_TIMEOUT, pid=None):
@@ -770,10 +747,10 @@ def show_qemu_window(identity, timeout=2.0, pid=None):
 # ---------- chrome: QEMU's window, restyled in place ----------
 #
 # The caption goes and the sizing border stays. The strip (windowbar.py) is
-# the title bar; leaving QEMU's own would put TWO on screen, which is exactly
-# what the deleted embedview.py warned about ("a second title bar it is
-# impossible to click"). WS_THICKFRAME stays so the composite is still
-# resizable by dragging the guest window's edges, with the strip following.
+# the title bar; leaving QEMU's own would put TWO on screen -- a second title
+# bar it is impossible to click. WS_THICKFRAME stays so the composite is
+# still resizable by dragging the guest window's edges, with the strip
+# following.
 GWL_STYLE = -16
 WS_CAPTION = 0x00C00000
 WS_THICKFRAME = 0x00040000

@@ -37,7 +37,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from omnidroid import embedview, hostwin  # noqa: E402
+from omnidroid import hostwin  # noqa: E402
 
 
 class Recorder:
@@ -185,7 +185,6 @@ class NothingHappensAndNothingRaises(unittest.TestCase):
             self.assertFalse(hostwin.hide_qemu_window("omni-u1"))
             self.assertFalse(hostwin.show_qemu_window("omni-u1"))
             self.assertFalse(hostwin.window_is_visible("omni-u1"))
-            self.assertFalse(hostwin.window_is_embedded("omni-u1"))
             self.assertIsNone(hostwin.keep_hidden("omni-u1"))
 
     def test_the_full_timeout_is_not_waited_out_for_a_known_no(self):
@@ -442,39 +441,6 @@ class LinuxThroughWmctrl(unittest.TestCase):
         with self._w() as h:
             self.assertFalse(hostwin.window_is_visible("omni-u1"))
         self.assertNotIn("xprop", [a[0] for a in h.argvs])
-
-
-class EmbeddingIsStillWindowsOnly(unittest.TestCase):
-    """Hiding went cross-platform; reparenting cannot, and says why."""
-
-    def test_available_is_unchanged(self):
-        with host(win=True):
-            pass
-        self.assertEqual(embedview.available(), embedview.IS_WINDOWS)
-
-    def test_windows_needs_no_reason_because_it_works(self):
-        with mock.patch.object(embedview, "IS_WINDOWS", True):
-            self.assertEqual(embedview.available_reason(), "")
-
-    def test_macos_names_the_private_api_it_refuses_to_use(self):
-        with mock.patch.object(embedview, "IS_WINDOWS", False), \
-             mock.patch.object(embedview, "IS_MACOS", True), \
-             mock.patch.object(embedview, "IS_LINUX", False):
-            self.assertIn("CGSSetWindowParent", embedview.available_reason())
-
-    def test_linux_says_it_does_not_need_it(self):
-        with mock.patch.object(embedview, "IS_WINDOWS", False), \
-             mock.patch.object(embedview, "IS_MACOS", False), \
-             mock.patch.object(embedview, "IS_LINUX", True):
-            self.assertIn("egl-headless", embedview.available_reason())
-
-    def test_nothing_is_ever_embedded_off_windows(self):
-        # window_is_embedded is the "a viewer already has it" state, and it
-        # cannot arise where nothing reparents.
-        with host(linux=True, tools=("xdotool",),
-                  run=Recorder({"xdotool": (0, "12345\n", "")})) as h:
-            self.assertFalse(hostwin.window_is_embedded("omni-u1"))
-        self.assertEqual(h.argvs, [])
 
 
 class KeepHiddenKeepsItsContract(unittest.TestCase):
