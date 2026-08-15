@@ -460,3 +460,64 @@ Two other things were found while chasing this, and both are fixed:
 
 Cold boot on the Windows host, measured on PS99: **47–102 s** to a joined game,
 depending on mode.
+
+---
+
+## The scratch, and why it — not RAM — caps instance count
+
+*Measured 2026-08-15, Windows host, PS99, x86 base.*
+
+Every ephemeral boot runs its disks `snapshot=on`. That is what makes an
+instance diskless: QEMU keeps the guest's writes in a **temporary overlay** and
+throws it away at exit. Two things about that file were never budgeted for.
+
+**It is big.** One farming instance in the PS99 world grew its overlay to
+**1.3 GB** — the game downloads its assets into `/data` and every byte lands
+there.
+
+**It went to `%TEMP%`, and it leaked.** QEMU creates it with the libc temp
+directory (`GetTempPath` on Windows, `TMPDIR` elsewhere), and a QEMU that
+*dies* rather than exits never unlinks it. This box had **3.7 GB** of leaked
+overlays from three sessions, the oldest two days old.
+
+**And a full volume kills instances silently.** With the disk exhausted QEMU
+aborts — and cannot write the reason into `qemu.log`, because writing the log
+needs the same disk. The symptom is an instance that was in the world a moment
+ago and is now simply gone, with a **zero-byte log** and no Windows error
+report. It was diagnosed twice as a guest crash before the temp directory was
+measured.
+
+So:
+
+| | |
+|---|---|
+| overlays live in | `<data dir>/scratch` — ours, not `%TEMP%` |
+| set by | `TMP`/`TEMP`/`TMPDIR` on QEMU's child env (`scratch_env`) |
+| leaked ones | reaped on every boot and every pool tick (`reap_scratch`) |
+| a live guest's overlay | **cannot** be reaped on Windows (the open handle refuses the unlink), which is what makes the reaper safe to run from the boot path |
+| preflight | `scratch_room()` warns below `SCRATCH_PER_INSTANCE_MB + SCRATCH_FLOOR_MB` |
+| visible in | `doctor` → `scratch_dir`, `scratch_free_mb`, `scratch_fits_instances` |
+| override | `qemu.scratch_dir` / `OMNI_SCRATCH_DIR` |
+
+**Plan capacity off the disk, not only the RAM.** At ~1.3 GB of scratch and
+~2.2–3.2 GB of host RSS per instance, a 32 GB box with 100 GB free runs out of
+RAM first, and a 32 GB box with 8 GB free runs out of **disk** at three
+instances — while `list` still shows the others as healthy right up until they
+vanish.
+
+## Farming's memory floor is a property of the GAME
+
+`MODES["farming"]["mem"]` is 2048. PS99 is OOM-killed at that size, measured
+three times with no squeeze and no balloon in the way, and needs **3072**.
+That is not a farming constant that was set too low; it is a per-game number
+that had no home. `lean.GUEST_MEM_FLOOR_MB` is now that home, and
+`guest_mem_floor_mb(place_id, default)` only ever **raises** — so gaming's
+host-derived autoscaling is untouched, and an explicit `--mem` always wins.
+
+**`pool fill` takes `--place` for the same reason.** `mem` is part of the slot
+key, so a pool warmed at the mode's 2048 is *invisible* to a PS99 launch that
+resolves to 3072: every launch cold-boots while `pool status` cheerfully
+reports slots ready.
+
+An unmeasured place gets the default and may OOM. Measure a place before
+promising a fleet size for it.

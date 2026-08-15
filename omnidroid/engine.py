@@ -9097,6 +9097,26 @@ def pool_try_adopt(name, cfg, spec, label, accel=None):
     rec = pool.claim(key)
     if rec is None:
         return None
+    # ONCE THE SLOT IS CLAIMED, every exit has to release it. `cmd_start`
+    # wraps this whole call in `except Exception -> boot normally`, which
+    # degrades the LAUNCH correctly and does nothing for the SLOT: a throw
+    # between the claim and the return leaves `adopted.json` on disk forever,
+    # so a live, healthy, ready instance is never handed to anybody again and
+    # `pool status` reports it adopted by an account that is not using it.
+    # Measured exactly that way -- one NameError in the clock step below burned
+    # the only slot in the pool and every subsequent launch cold-booted while
+    # the pool reported itself full.
+    try:
+        return _pool_adopt_claimed(rec, name, label)
+    except Exception:      # noqa: BLE001 - re-raised; the point is the release
+        pool.release(rec["slot"], "adoption raised")
+        _wipe_runtime(name)
+        raise
+
+
+def _pool_adopt_claimed(rec, name, label):
+    """Adopt an ALREADY-CLAIMED slot. Only `pool_try_adopt` may call this: it
+    is the half that must not be entered without the release guard."""
     run = pool.adopt_run_json(rec["slot"], name)
     if not run:
         pool.release(rec["slot"], "no run.json")
@@ -9121,7 +9141,8 @@ def pool_try_adopt(name, cfg, spec, label, accel=None):
     # break fails Roblox auth and TLS, and the symptom is indistinguishable
     # from a dead cookie, so the one thing that must not happen is finding out
     # about it from the login screen.
-    clock = warmboot.resync_guest_clock(acct, label,
+    from omnidroid import warmboot      # local: engine imports it per-call,
+    clock = warmboot.resync_guest_clock(acct, label,   # see _ensure_booted
                                         root_fn=resolve_root_shell)
     if clock.get("corrected") and clock.get("residual_s"):
         print(f"[{label}] guest clock did NOT take ({clock['residual_s']}s "
@@ -9189,10 +9210,21 @@ def pool_boot_slot(cfg, spec, key, slot=None, label=None):
 
 
 def _pool_spec_from_args(args, cfg):
+    # `--place` sizes the slot for the GAME it is being warmed for. The spec
+    # is hashed into the slot key and `mem` is part of it, so a pool filled at
+    # the mode's 2048 is simply INVISIBLE to a PS99 launch that resolves its
+    # floor to 3072 -- every launch would cold-boot while `pool status`
+    # cheerfully reported slots ready. Warming a pool for a place you then
+    # cannot use it for is worse than not having one.
+    arch = arch_of_base(cfg["bases"][_select_base_tag(cfg)])
+    mem = getattr(args, "mem", None)
+    if not mem and getattr(args, "place", None):
+        mem = guest_mem_for_launch(
+            cfg, args, {"place_id": getattr(args, "place", None)}, arch=arch)
     return pool_launch_spec(
         cfg,
         mode_name=getattr(args, "mode", None),
-        mem=getattr(args, "mem", None), smp=getattr(args, "smp", None),
+        mem=mem, smp=getattr(args, "smp", None),
         balloon=getattr(args, "balloon", None),
         quality=getattr(args, "quality", None),
         guest_display=_guest_display_arg(args),
@@ -10012,7 +10044,14 @@ def build_parser():
                     help="how many warm instances to keep (default 1)")
     # The spec flags mirror `start`'s exactly, because a slot is only usable
     # by a launch that resolves to the SAME machine -- see pool_launch_spec.
-    pl.add_argument("--mode", default=None, choices=MODE_CHOICES)
+    pl.add_argument("--mode", default=None, choices=MODE_CHOICES,
+                    metavar="{gaming,farming}")
+    pl.add_argument("--place", default=None,
+                    help="size the slots for THIS place. `mem` is part of the "
+                         "slot key, so a pool warmed at the mode's default is "
+                         "INVISIBLE to a launch whose game needs more -- every "
+                         "launch cold-boots while `pool status` reports slots "
+                         "ready. Pass the place you are going to farm.")
     pl.add_argument("--mem", type=int, default=None)
     pl.add_argument("--smp", type=int, default=None)
     pl.add_argument("--balloon", type=int, default=None)
