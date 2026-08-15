@@ -767,6 +767,139 @@ def show_qemu_window(identity, timeout=2.0, pid=None):
     return _set_visible(handle, True)
 
 
+# ---------- chrome: QEMU's window, restyled in place ----------
+#
+# The caption goes and the sizing border stays. The strip (windowbar.py) is
+# the title bar; leaving QEMU's own would put TWO on screen, which is exactly
+# what the deleted embedview.py warned about ("a second title bar it is
+# impossible to click"). WS_THICKFRAME stays so the composite is still
+# resizable by dragging the guest window's edges, with the strip following.
+GWL_STYLE = -16
+WS_CAPTION = 0x00C00000
+WS_THICKFRAME = 0x00040000
+WS_SYSMENU = 0x00080000
+WS_MINIMIZEBOX = 0x00020000
+WS_MAXIMIZEBOX = 0x00010000
+
+WM_SETICON = 0x0080
+ICON_SMALL, ICON_BIG = 0, 1
+
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+
+
+def _user32():
+    """user32, imported lazily so this module stays importable anywhere."""
+    import ctypes
+    return ctypes.windll.user32
+
+
+def _get_style(u, hwnd):
+    if hasattr(u, "GetWindowLongPtrW"):
+        return u.GetWindowLongPtrW(hwnd, GWL_STYLE)
+    return u.GetWindowLongW(hwnd, GWL_STYLE)
+
+
+def _set_style(u, hwnd, style):
+    if hasattr(u, "SetWindowLongPtrW"):
+        return u.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+    return u.SetWindowLongW(hwnd, GWL_STYLE, style)
+
+
+def _chrome_result(applied, reason="", hwnd=None):
+    return {"applied": applied, "reason": reason, "hwnd": hwnd}
+
+
+def apply_chrome(identity, pid=None, icon=None, geometry=None,
+                 timeout=DEFAULT_TIMEOUT):
+    """Restyle QEMU's window into ours. Never raises.
+
+    Returns {"applied", "reason", "hwnd"}. A host that cannot do it gets a
+    plain window and a reason -- this is chrome, and chrome is never worth a
+    failed boot.
+    """
+    name = backend()
+    if name != BACKEND_WIN32:
+        return _chrome_result(
+            False,
+            f"restyling another process's window is implemented for Windows "
+            f"only; this host's backend is {name}")
+    hwnd = find_window(identity, timeout=timeout, pid=pid)
+    if hwnd is None:
+        return _chrome_result(False, f"no window found for '{identity}'")
+    try:
+        u = _user32()
+        style = _get_style(u, hwnd)
+        style &= ~(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+        style |= WS_THICKFRAME
+        _set_style(u, hwnd, style)
+        if icon:
+            _apply_icon(u, hwnd, icon)
+        if geometry:
+            x, y, width, height = geometry
+            u.SetWindowPos(hwnd, 0, int(x), int(y), int(width), int(height),
+                           SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        else:
+            # The frame changed even when the geometry did not, and Windows
+            # does not recompute the non-client area until it is told.
+            u.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                           SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+                           | SWP_NOSIZE | SWP_NOMOVE)
+        return _chrome_result(True, "", hwnd)
+    except Exception as e:      # noqa: BLE001 - chrome never fails a boot
+        return _chrome_result(False, f"could not restyle the window: {e}")
+
+
+def _apply_icon(u, hwnd, icon):
+    """Put our icon on the window. Best-effort, like everything here."""
+    import ctypes
+    hicon = ctypes.windll.user32.LoadImageW(
+        None, str(icon), 1, 0, 0, 0x00000010 | 0x00008000)  # IMAGE_ICON
+    if hicon:
+        u.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+        u.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+
+
+def _window_rect(hwnd):
+    """(left, top, right, bottom) from GetWindowRect, or None.
+
+    Its own seam, apart from `_user32()`: the real call has to pass
+    `ctypes.byref(rect)`, and a `byref` object has no attributes a fake can
+    set, so a test cannot stand in for GetWindowRect through `_user32()`
+    alone. Replacing this function instead is what the tests do.
+    """
+    import ctypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    rect = RECT()
+    if not _user32().GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
+
+def window_geometry(identity, pid=None, timeout=2.0):
+    """(x, y, width, height) of QEMU's window, or None."""
+    if backend() != BACKEND_WIN32:
+        return None
+    hwnd = find_window(identity, timeout=timeout, pid=pid)
+    if hwnd is None:
+        return None
+    try:
+        rect = _window_rect(hwnd)
+        if rect is None:
+            return None
+        left, top, right, bottom = rect
+        return (left, top, right - left, bottom - top)
+    except Exception:      # noqa: BLE001
+        return None
+
+
 def window_is_visible(identity, pid=None):
     """True if a window for `identity` is currently on screen. Used by tests
     and by `debug-info`, so "did the hide actually take" is answerable."""
