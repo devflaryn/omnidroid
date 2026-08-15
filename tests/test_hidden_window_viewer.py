@@ -216,23 +216,79 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
                         return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
              mock.patch("omnidroid.hostwin.hide_qemu_window",
                         side_effect=lambda *a, **k: hidden.append((a, k))), \
              mock.patch("omnidroid.hostwin.find_window") as find_window, \
              mock.patch("omnidroid.hostwin.apply_chrome") as chrome, \
              mock.patch("omnidroid.hostwin.show_qemu_window") as show, \
-             mock.patch("omnidroid.engine._spawn_window_bar") as spawn:
+             mock.patch("omnidroid.engine._spawn_window_bar") as spawn, \
+             mock.patch("omnidroid.engine._persist_window_bar_geometry") \
+                as persist, \
+             mock.patch("omnidroid.engine._kill_window_bar") as kill, \
+             mock.patch("omnidroid.engine._clear_window_bar_pid") as clear:
             engine.cmd_view(_args(name="farm3", hide=True))
         self.assertEqual(len(hidden), 1)
         self.assertEqual(hidden[0][0], ("omni-farm3",))
         self.assertEqual(hidden[0][1].get("pid"), 4242)
+        # Not apply_chrome's 20s DEFAULT_TIMEOUT: the case that pays this
+        # cost is exactly the one where the window is genuinely gone, and a
+        # hide has to fail fast there like every other probe in this branch.
+        self.assertEqual(hidden[0][1].get("timeout"), 2)
         # Hiding must not probe for the window, restyle it, show it, or spawn
         # a bar -- it is a distinct, minimal action, not a shortcut through
-        # the rest of the window path.
+        # the rest of the window path. And with no bar running, none of the
+        # live-bar teardown (persist/kill/clear) has anything to do.
         find_window.assert_not_called()
         chrome.assert_not_called()
         show.assert_not_called()
         spawn.assert_not_called()
+        persist.assert_not_called()
+        kill.assert_not_called()
+        clear.assert_not_called()
+
+    def test_hide_while_a_bar_is_live_persists_geometry_kills_it_then_hides(self):
+        """The bar is OWNED by QEMU's window, not a CHILD of it -- Windows
+        only cascades DESTROY to an OWNED window when the OWNER is
+        destroyed (that is what lets `stop` clean the bar up for free); a
+        bare hide of the owner gives no such guarantee, so a live bar is
+        left on screen, captioning nothing, unless this branch kills it
+        itself. And killing it does NOT run `_run_windowbar`'s `finally` --
+        Windows does not run them on termination -- so the geometry that
+        `finally` would have persisted has to be captured and written HERE,
+        strictly before the kill or the hide, or it is lost for good."""
+        calls = []
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=9999), \
+             mock.patch("omnidroid.engine._persist_window_bar_geometry",
+                        side_effect=lambda *a, **k:
+                            calls.append(("geometry", a))), \
+             mock.patch("omnidroid.engine._kill_window_bar",
+                        side_effect=lambda *a, **k: calls.append(("kill", a))), \
+             mock.patch("omnidroid.engine._clear_window_bar_pid",
+                        side_effect=lambda *a, **k:
+                            calls.append(("clear", a))), \
+             mock.patch("omnidroid.hostwin.hide_qemu_window",
+                        side_effect=lambda *a, **k:
+                            calls.append(("hide", a, k)) or True):
+            engine.cmd_view(_args(name="farm3", hide=True))
+        # Order is the whole point: geometry captured while the window is
+        # still visible, THEN the bar dies, THEN its pid file is cleared,
+        # THEN the window is hidden.
+        self.assertEqual([c[0] for c in calls], ["geometry", "kill", "clear",
+                                                  "hide"])
+        self.assertEqual(calls[0][1], ("farm3", "omni-farm3", 4242))
+        self.assertEqual(calls[1][1], (9999,))
+        self.assertEqual(calls[2][1], ("farm3",))
 
     def test_hide_reports_json_when_asked(self):
         with mock.patch("omnidroid.engine.load_config", return_value={}), \
@@ -243,12 +299,36 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
                         return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
              mock.patch("omnidroid.hostwin.hide_qemu_window",
                         return_value=True), \
              mock.patch("omnidroid.engine.emit_json") as emit:
             engine.cmd_view(_args(name="farm3", hide=True, json=True))
         emit.assert_called_once_with(
             {"name": "farm3", "viewer": "window", "hidden": True, "ok": True})
+
+    def test_hide_reports_the_actual_result_not_always_true(self):
+        # The window was genuinely gone: hide_qemu_window's own contract is
+        # to report False rather than raise, and that must reach the JSON
+        # honestly instead of being papered over with a hardcoded True.
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
+             mock.patch("omnidroid.hostwin.hide_qemu_window",
+                        return_value=False), \
+             mock.patch("omnidroid.engine.emit_json") as emit:
+            engine.cmd_view(_args(name="farm3", hide=True, json=True))
+        emit.assert_called_once_with(
+            {"name": "farm3", "viewer": "window", "hidden": False,
+             "ok": True})
 
     def test_hide_without_json_prints_nothing_that_crashes(self):
         # No --json: cmd_view must still return cleanly rather than raise.
@@ -260,6 +340,8 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
                         return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
              mock.patch("omnidroid.hostwin.hide_qemu_window",
                         return_value=True):
             result = engine.cmd_view(_args(name="farm3", hide=True))

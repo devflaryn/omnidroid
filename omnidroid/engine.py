@@ -6540,6 +6540,27 @@ def _clear_window_bar_pid(name):
         pass
 
 
+def _kill_window_bar(pid):
+    """Force-terminate a window bar process by pid. Best-effort: a failed
+    kill leaves a bar on screen over a hidden window, which the next `view`
+    or `--hide` cleans up -- never a reason to fail the hide itself.
+
+    Not a graceful request -- the bar has no IPC channel to ask it to close
+    on its own, and `--hide` is meant to be immediate. Same kill mechanism
+    every other detached child in this file force-stops with (see the
+    shutdown chain's own escalation and _stop_autocap_proc): taskkill on
+    Windows, SIGKILL elsewhere.
+    """
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except Exception:      # noqa: BLE001
+        pass
+
+
 def _persist_window_bar_geometry(name, identity, pid):
     """Save where the user left the window, so the NEXT `view` restores it
     instead of letting QEMU pick its own default position.
@@ -6630,12 +6651,32 @@ def cmd_view(args):
         # no-window probe below: hide_qemu_window() already treats "no
         # window" as a harmless no-op (see hostwin.hide_qemu_window), so
         # there is no honest failure to surface here the probe would add --
-        # only an extra ~2s wait for an action that has nothing to wait for.
+        # only an extra wait for an action that has nothing to wait for
+        # (hence timeout=2 below, not apply_chrome's 20s default).
         if getattr(args, "hide", False):
-            hostwin.hide_qemu_window(identity, pid=qemu_pid)
+            # A live bar is OWNED by QEMU's window, not a CHILD of it --
+            # Windows only cascades DESTROY to an OWNED window when the
+            # OWNER is destroyed (that is what lets `stop` clean the bar up
+            # for free); a bare hide of the owner gives no such guarantee,
+            # so an untouched bar would be left on screen, captioning
+            # nothing. It has to be killed here. And killing it does NOT
+            # run `_run_windowbar`'s `finally` -- Windows does not run them
+            # on termination -- so the geometry that `finally` would have
+            # persisted must be captured and written FIRST, while the
+            # window is still visible, or it is lost for good. Order is
+            # load-bearing: persist, then kill, then clear its pid file (so
+            # the next `view` does not believe a bar only WE just killed is
+            # still open), then hide.
+            bar_pid = _running_window_bar_pid(args.name)
+            if bar_pid is not None:
+                _persist_window_bar_geometry(args.name, identity, qemu_pid)
+                _kill_window_bar(bar_pid)
+                _clear_window_bar_pid(args.name)
+            hidden = hostwin.hide_qemu_window(identity, pid=qemu_pid,
+                                              timeout=2)
             if getattr(args, "json", False):
                 emit_json({"name": args.name, "viewer": "window",
-                           "hidden": True, "ok": True})
+                           "hidden": hidden, "ok": True})
             return
         # Probe for the window FIRST, with a short timeout, before touching
         # its chrome. A window that genuinely is not there is a different,
