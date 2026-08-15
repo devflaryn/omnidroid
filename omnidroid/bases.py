@@ -117,6 +117,12 @@ ARM_BASE_EFIVARS = "base_arm_efivars.fd"    # provisioned UEFI vars
 ARM_BASE_TAG = "arm"
 
 
+# Arch subfolder prefix under images_dir. (Recovered constant: this was
+# uncommitted WIP lost to a stray `git checkout omnidroid/bases.py`. offsets.py
+# builds paths as ARM_DIR + filename → "arm/base_arm_data_offset_<name>.qcow2".)
+ARM_DIR = "arm/"
+
+
 # The ROOTED shipped images. `base_arm_system_rooted.qcow2` is a THIN COW
 # overlay of the current production system overlay carrying only the Magisk-
 # patched boot partition (vda6) — the production lineage is preserved, not
@@ -237,6 +243,13 @@ X86_ROOTED_INITRD = "base_x86_rooted.initrd.img"
 
 
 X86_BASE_TAG = "x86"
+
+
+# (Recovered WIP constants, symmetric to ARM_DIR — lost to the same stray
+# `git checkout`.) x86 arch subfolder + the empty ext4 /data template that
+# seeds a fresh instance's /data (matches configs/paths.json "data_template").
+X86_DIR = "x86/"
+X86_DATA_TEMPLATE = X86_DIR + "data-template-8g.qcow2"
 
 
 # The devkit disk: frida-server + the omni-* device scripts, per architecture.

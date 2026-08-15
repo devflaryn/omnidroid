@@ -133,8 +133,15 @@ def _wake_now():
 # stay_on_while_plugged_in is written first so it lands even if a later write
 # on a locked-down base is refused.
 SETTINGS = (
-    # Rung 2. The developer-options "Stay awake" lever. Only meaningful once
-    # the battery override above says "plugged in".
+    # Rung 0. Turn Developer options on, so the lever below is the REAL
+    # developer setting and is visible as such in Settings -> System ->
+    # Developer options -> "Stay awake". It changes no behaviour by itself
+    # (stay_on_while_plugged_in is honoured either way) — it is here so the
+    # guarantee can be inspected and toggled from inside the guest's own UI
+    # rather than existing only as an invisible provider row.
+    ("global", "development_settings_enabled", 1),
+    # Rung 2. The developer-options "Stay awake" lever itself. Only meaningful
+    # once the battery override above says "plugged in".
     ("global", "stay_on_while_plugged_in", STAY_ON_ANY_PLUG),
     # Rung 1. The classic inactivity timer — the fallback for the case where
     # something resets the battery override out from under us.

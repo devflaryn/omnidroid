@@ -6,6 +6,142 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-12 — the never-blank guarantee is actually applied now
+
+`omnidroid/awake.py` shipped complete on 2026-08-09, with tests and a HOWTO
+section describing it as applied on every boot — and **nothing ever called
+it**. No engine import, no CLI command: the module was dead code, the
+documented guarantee did not exist in the product, and the 33 red tests in
+`test_gaming_apply.py` + `test_warm_boot_policy.py` were all mocking an
+`engine.apply_awake` that had never been written.
+
+It is now wired the way those tests already specified: `apply_awake` in the
+shared post-boot tail, EVERY boot and EVERY mode, above the profile branch
+(so each mode stays the last writer on the display levers it owns) and inside
+the shared tail (so a WARM RESTORE is kept awake too — a restored instance
+that blanks is the same bug as a cold-booted one). It reports the reading, not
+the intent, and names the step it had to skip without root.
+
+**No watchdog and no `awake` command**, deliberately: the guarantee is
+Android's own developer settings, written once into /data where they stay.
+Developer options is now enabled too (`development_settings_enabled=1`) so
+**Stay awake** is the real, visible Developer-options toggle rather than an
+invisible provider row. `build_awake_recheck` is left in the module unused —
+it was already unused before this change.
+
+Verified on the case that used to fail: with the AC coincidence removed
+(`dumpsys battery unplug` → `mIsPowered=false`) the instance still reads
+`mWakefulness=Awake`, `Screen off timeout: 2147483647 ms`, kernel wakelock
+`omni_awake` held. The pre-change build reached `mWakefulness=Dozing` in 22 s.
+
+## 2026-08-12 — unattended consent: no permission taps, no ANR/crash dialogs
+
+An instance that stops for a modal is not headless. Two of those modals were
+reachable in normal use: Roblox/Arceus asking for **full disk access** and for
+**install-unknown-apps**, and the framework's own **"… keeps stopping" / "isn't
+responding"** dialogs, which park over the screen until somebody dismisses them.
+
+New pure module `omnidroid/consent.py` (shaped like awake.py/farming.py: it
+BUILDS the guest sequence, the engine applies it) and a new post-boot step
+`apply_consent`, called on EVERY boot between `assert_kiosk_game` and the mode
+tuning:
+
+  * `settings put global hide_error_dialogs 1`
+  * app-ops set to `allow` for every covered package: MANAGE_EXTERNAL_STORAGE
+    (full disk access), REQUEST_INSTALL_PACKAGES, LEGACY_STORAGE,
+    READ/WRITE_EXTERNAL_STORAGE, SYSTEM_ALERT_WINDOW
+  * every DANGEROUS runtime permission each package's own manifest declares,
+    read from `dumpsys package` rather than from a hardcoded list
+
+Covered packages are the third-party ones **plus the game** — the game is an
+updated system app, so `pm list packages -3` does not list it, and a `-3`-only
+loop would have skipped the one package the feature exists for.
+`OMNI_NO_CONSENT=1` turns the whole step off (you want the dialogs back when
+reproducing a crash-loop by eye).
+
+MEASURED on a live arm64 instance (Android 16 / SDK 36) — all four of these
+changed the implementation:
+
+  1. **`hide_error_dialogs` is read live.** A/B'd by crashing a stock app
+     (`am crash com.android.settings`): at 0 the "Settings keeps stopping"
+     dialog appears, at 1 the identical crash leaves the screen untouched — no
+     configuration change, no framework restart. So this step touches no
+     `wm size`/`wm density`, which would have silently undone a farming boot's
+     480x270.
+  2. **None of it needs root** — `appops`, `pm grant` and `settings` all work
+     as uid shell, so it applies on an unrooted deployment too.
+  3. **Only the settings half is IMAGE state.** `omnidroid offset consent
+     <name>|--all` bakes the policy into an offset image (overlay-then-commit,
+     so a failed bake leaves the image byte-identical). Booting the committed
+     image with the boot-time step disabled shows `hide_error_dialogs=1`
+     persisted — but the app-ops read back as `default`, on both images, twice.
+     They reach disk within the boot (`appops write-settings` survives an
+     `appops read-settings` round trip) yet the permission APEX
+     (`/data/misc_de/0/apexdata/com.android.permission/`) re-derives them at
+     boot. Runtime grants are worse: no shell verb flushes them at all. The
+     bake therefore claims ONLY the dialog half — `consent.baked_summary` is a
+     separate function from `summary_line` precisely so it cannot overclaim.
+  4. **SYSTEM_ALERT_WINDOW is a no-op for a package that doesn't declare it.**
+     `appops set` exits 0 and the mode still reads `default` (Roblox does not
+     declare it). Kept in the list for a companion/executor APK that does, and
+     deliberately excluded from the probe so it can never fail a bake.
+
+NOT automated, deliberately: after REQUEST_INSTALL_PACKAGES is granted, an app
+that installs an APK still gets PackageInstaller's own confirm screen ("Update
+this app?"). No setting suppresses it — it is a platform consent step, and the
+only ways past are a UI tap or a privileged installer.
+
+## 2026-08-12 — images_dir is classified by architecture, and carries only live images
+
+`images_dir` was a flat pile of 33 files — every base lineage ever built,
+their `.bak`/`.safebak-*` copies, and the removed dev base — 30 GB of which
+only ~5 GB was reachable from the config. It is now two arch folders holding
+exactly what the manager opens:
+
+    images_dir/
+      arm/  base_arm_system_rooted.qcow2   the booted system (standalone)
+            base_arm_data_rooted.qcow2     the PRISTINE /data
+            base_arm_data_offset_*.qcow2   one thin overlay per Roblox build
+            base_arm_efivars.fd            base_arm_devkit.qcow2
+      x86/  base_x86.qcow2 / .kernel / .initrd.img
+            base_x86_devkit.qcow2          data-template-8g.qcow2
+      warm/ the warm-restore boot cache (arch-neutral, unchanged)
+
+**The subfolder is part of the recorded name.** Every `images_dir / <name>`
+join is unchanged; what changed is the constants in `bases.py`
+(`ARM_DIR` / `X86_DIR`), `offsets.offset_image_name`, and the values in
+`configs/paths.json`. Two rules follow from qcow2 backing references, which
+resolve relative to the OVERLAY's own directory:
+
+  1. a base and every overlay of it live in the SAME arch folder — that is
+     what keeps `bake_offset`'s `rebase -u -b <bare name>` (and therefore a
+     relocatable images_dir) working, and
+  2. anything writing a backing reference must strip the prefix — hence
+     `Path(src_name).name` in `bake_offset`. Writing the recorded name would
+     look for `arm/arm/base_arm_data_rooted.qcow2` and the offset would not
+     open.
+
+**`base_disk` is gone from the arm base.** `base_arm_system_rooted.qcow2` is
+standalone (no backing file) and is what boots; the v1/v2 lineage under it was
+never opened, only validated for existence. `autoregister_bases` now accepts
+EITHER shape — the rooted pair alone, or the legacy `base_arm.qcow2` +
+overlay + data trio (which still records `base_disk`) — because a base needs
+only what it boots: system + data + efivars.
+
+Archived out of `images_dir` (moved, not deleted, to
+`~/Desktop/OmniImages-backup/`): the v1/v2 arm lineage, the unrooted
+system/data pair, every `.bak`/`.safebak-*`, the removed dev base
+(`base_arm_devsystem*`, `base_arm_devdata*`), the unreferenced
+`data-template-arm.qcow2` / `efi_vars_arm.fd`, and four superseded offsets
+(`legacy`, `arceus`, `patched`, `arceus-local`), which were also unregistered.
+`arceusae` (default) and `arceusfull` remain.
+
+Verified on the arm64 Mac: two instances booted side by side on different
+offsets (`arceusae` + `arceusfull`), each with its own APK inside
+(md5 `97e2b57c…` vs `c48d79b4…`), both backed through `arm/`. Suite: 655
+passed, 33 pre-existing failures (`engine.apply_awake` harness drift, present
+at HEAD before this change).
+
 ## 2026-08-09 — An instance can no longer blank: the never-sleep guarantee
 
 Instances went black after a stretch with no input. Diagnosed on a live arm

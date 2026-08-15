@@ -186,6 +186,8 @@ class MemPlumbing(unittest.TestCase):
              mock.patch.object(omni, "_devkit_activate"), \
              mock.patch.object(omni, "_enforce_hiding"), \
              mock.patch.object(omni, "assert_kiosk_game"), \
+             mock.patch.object(omni, "apply_consent"), \
+             mock.patch.object(omni, "apply_awake"), \
              mock.patch.object(omni, "apply_farming_squeeze"), \
              mock.patch.object(omni, "apply_balloon_target"), \
              mock.patch.object(omni, "apply_roblox_settings"), \

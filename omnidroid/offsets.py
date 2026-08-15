@@ -5,7 +5,7 @@ An **offset** is a named, versioned Roblox build, baked into a THIN qcow2 COW
 overlay of the base's pristine /data. Offsets coexist; exactly one is the
 DEFAULT, and a bare `omnidroid start <user>` boots that one.
 
-    images_dir/
+    images_dir/arm/
       base_arm_data_rooted.qcow2                 <- the base's PRISTINE /data
       base_arm_data_offset_2.731.944.qcow2       <- offset "2.731.944"  (thin)
       base_arm_data_offset_2.740.101.qcow2       <- offset "2.740.101"  (thin)
@@ -48,7 +48,7 @@ import re
 import zipfile
 from pathlib import Path
 
-from omnidroid.bases import data_bake_source
+from omnidroid.bases import ARM_DIR, data_bake_source
 
 
 # An offset name lands in a FILENAME, so it is restricted to characters that
@@ -71,14 +71,16 @@ def valid_offset_name(name):
 
 
 def offset_image_name(name):
-    """Filename of the /data overlay backing offset `name`.
+    """Path of the /data overlay backing offset `name`, relative to images_dir.
 
-    A BARE filename, deliberately: offsets live flat in images_dir alongside
-    the pristine /data they overlay, because a qcow2's backing reference is
-    resolved relative to the overlay's OWN directory. Putting offsets in a
-    subdirectory would break every `qemu-img rebase -u -b <bare name>` the
-    bake does to keep the image directory relocatable."""
-    return f"base_arm_data_offset_{name}.qcow2"
+    Offsets live in the SAME arch subfolder (images_dir/arm/) as the pristine
+    /data they overlay. That co-location is the requirement, not flatness: a
+    qcow2's backing reference resolves relative to the overlay's OWN
+    directory, so the bake can still rewrite it to a bare filename
+    (`qemu-img rebase -u -b <bare name>`) and keep the image directory
+    relocatable. An offset in a DIFFERENT directory from its backing file is
+    what would break that."""
+    return ARM_DIR + f"base_arm_data_offset_{name}.qcow2"
 
 
 def offsets_of(base):
@@ -269,7 +271,7 @@ def suggest_offset_name(apk_path, info=None):
 
 # The single-slot image the pre-offsets `bake-data-game` wrote. Only ever read
 # now, by migrate_legacy_bake.
-LEGACY_GAME_DATA = "base_arm_data_game.qcow2"
+LEGACY_GAME_DATA = ARM_DIR + "base_arm_data_game.qcow2"
 
 LEGACY_OFFSET_NAME = "legacy"
 
@@ -293,8 +295,10 @@ def migrate_legacy_bake(base, name=LEGACY_OFFSET_NAME):
     if data != LEGACY_GAME_DATA and "offset" not in data:
         # Some other non-pristine /data (a hand-built image). Still clean the
         # base — the invariant is "the base ships no game" — but say so by
-        # naming the offset after the file rather than "legacy".
-        name = re.sub(r"^base_arm_data_|\.qcow2$", "", data) or name
+        # naming the offset after the file rather than "legacy". The recorded
+        # value carries its arch subfolder, so name from the BASENAME.
+        name = re.sub(r"^base_arm_data_|\.qcow2$", "",
+                      Path(data).name) or name
         name = name if valid_offset_name(name) else LEGACY_OFFSET_NAME
     entry = dict(base.get("game_baked") or {})
     register_offset(base, name, {

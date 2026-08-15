@@ -76,12 +76,28 @@ def _write(repo, data):
     return p
 
 
+MIGRATED_MARKER = ".migrated"
+
+
 def _migrate_legacy(repo):
     """Fold any old cookies/<label>.json into accounts.json ONCE, keyed by the
-    stored username (falling back to the label). Idempotent; leaves the old files
-    in place but they are no longer read after this."""
+    stored username (falling back to the label). Leaves the old files in place
+    but they are no longer read after this.
+
+    ONCE is enforced with a marker file, and that is load-bearing rather than an
+    optimisation. This runs on every read, so without it a REMOVED account was
+    silently re-created from the legacy file the next time anything listed the
+    store — `remove_account` reported success and the account came back.
+
+    That surfaced as a privacy bug, not a cosmetic one: signing out of an Omni
+    account is supposed to drop the cookies that account pulled onto a shared
+    machine, and the deleted records reappeared for the next user who signed in.
+    """
     legacy = Path(repo) / "cookies"
     if not legacy.is_dir():
+        return
+    marker = legacy / MIGRATED_MARKER
+    if marker.exists():
         return
     data = _read(repo)
     changed = False
@@ -104,6 +120,12 @@ def _migrate_legacy(repo):
         changed = True
     if changed:
         _write(repo, data)
+    # Marked whether or not anything moved: an empty legacy dir is just as
+    # migrated as a full one, and re-scanning it on every read buys nothing.
+    try:
+        marker.write_text("migrated into accounts.json\n", encoding="utf-8")
+    except OSError:
+        pass          # a read-only legacy dir only costs a repeated scan
 
 
 def save_account(repo, username, cookie, user_id=None, display_name=None):

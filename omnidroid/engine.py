@@ -33,7 +33,9 @@ import threading
 import time
 from pathlib import Path
 
+from omnidroid import awake
 from omnidroid import config
+from omnidroid import consent
 from omnidroid import farming
 from omnidroid import gaming
 from omnidroid import lean
@@ -182,7 +184,7 @@ DEFAULT_FRIDA_PORT = 27142
 DEFAULT_CONFIG = {
     "images_dir": "images",
     "current_base": None,
-    "data_template": "data-template-8g.qcow2",
+    "data_template": X86_DATA_TEMPLATE,
     "default_src": DEFAULT_SRC,
     "bases": {},
     "qemu": {"mem_mb": 4096, "smp": 4, "data_disk_size": "8G",
@@ -2949,6 +2951,32 @@ def _remove_apk_from_product(raw_path, fs_off, app_name, label):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _product_roblox_dirs(raw_path, fs_off):
+    """Every /product/app/<Dir> that looks like a Roblox system app.
+
+    The arm base can carry MORE THAN ONE (seen in the wild: both `Roblox` and
+    `ArceusRoblox`, each holding com.roblox.client). `bake-game --remove` used
+    to strip only the one named `Roblox`, so the sibling survived, kept
+    com.roblox.client present, and every re-signed offset bake then failed with
+    INSTALL_FAILED_UPDATE_INCOMPATIBLE. This lists them so --remove clears ALL.
+    """
+    dbg = _debugfs_bin()
+    if not dbg:
+        return []
+    out = subprocess.run([dbg, "-R", "ls -l /app", f"{raw_path}?offset={fs_off}"],
+                         capture_output=True, text=True, timeout=300).stdout or ""
+    names = []
+    for line in out.splitlines():
+        parts = line.split()
+        # debugfs `ls -l`: inode MODE links uid gid size date time NAME.
+        # A directory's mode octal starts with 4 (S_IFDIR); name is the last token.
+        if len(parts) >= 2 and parts[1].startswith("4"):
+            name = parts[-1]
+            if name not in (".", "..") and "roblox" in name.lower():
+                names.append(name)
+    return names
+
+
 def bake_offset(cfg, tag, out_name, apk, pkg, label):
     """Boot a builder, install ONE Roblox version into /DATA, bake
     `omni_game_package`, and keep the resulting THIN overlay as `out_name`.
@@ -2980,6 +3008,8 @@ def bake_offset(cfg, tag, out_name, apk, pkg, label):
     # image directory, and under a .tmp name so a failed bake never clobbers
     # an offset that already exists and boots.
     out = images / out_name
+    out.parent.mkdir(parents=True, exist_ok=True)   # images_dir/arm/ on a
+    #                                                 first-ever bake
     tmp = out.with_suffix(".tmp.qcow2")
     bname = "_gamedata"
     d = account_dir(bname)
@@ -3027,11 +3057,16 @@ def bake_offset(cfg, tag, out_name, apk, pkg, label):
         _shutdown(acct, label)
         # Keep the overlay itself: it is thin (only the APK + settings differ
         # from the pristine /data). Rewrite its backing reference to a bare
-        # filename so the image directory stays relocatable, same convention
-        # as base_arm_system_zram.qcow2.
+        # filename so the image directory stays relocatable.
+        #
+        # BARE, not `src_name`: recorded image names carry their arch
+        # subfolder (arm/base_arm_data_rooted.qcow2), and a backing reference
+        # resolves relative to the OVERLAY's own directory — which is that
+        # same arm/ folder. Writing the prefixed name would look for
+        # arm/arm/base_arm_data_rooted.qcow2 and the offset would not open.
         shutil.move(str(d / "data.qcow2"), str(tmp))
         subprocess.run([qemu_bin("qemu-img"), "rebase", "-u",
-                        "-b", src_name, "-F", "qcow2", str(tmp)],
+                        "-b", Path(src_name).name, "-F", "qcow2", str(tmp)],
                        check=True, capture_output=True)
         tmp.replace(out)
         size_mb = out.stat().st_size // (1024 * 1024)
@@ -3045,6 +3080,154 @@ def bake_offset(cfg, tag, out_name, apk, pkg, label):
     finally:
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
+
+
+def bake_consent_into_offset(cfg, tag, base, img_name, pkg, label):
+    """Apply the unattended-consent policy INSIDE an offset image, in place.
+
+    Why a builder boot and not a host-side edit: the policy lives in the
+    settings provider and in /data/system/{appops,runtime-permissions}.xml —
+    framework-owned databases. Editing those from the host means writing an
+    ext4 image behind a running framework's back; booting Android and letting
+    `appops`/`pm`/`settings` do it is the only way that produces the same
+    bytes the framework itself would.
+
+    The write is an OVERLAY-THEN-COMMIT, never a direct boot off the offset:
+
+        offset.qcow2  <- tmp overlay (the builder's writable /data)
+                      -> qemu-img commit merges the overlay back down
+
+    A builder that crashed or a policy that did not confirm therefore leaves
+    the offset byte-for-byte untouched — the commit is the ONLY thing that
+    modifies it, and it only runs after the guest echoes the marker.
+
+    Committing changes the offset's size and mtime, which is exactly what
+    invalidates any warm-cache entry keyed on it (see warmcache.cache_key's
+    offset_image_stat) — the next launch cold-boots once and re-bakes rather
+    than restoring a pre-policy machine.
+    """
+    images = Path(cfg["images_dir"])
+    target = images / img_name
+    if not target.exists():
+        print(f"[{label}] offset image not found: {target}")
+        return False
+    bname = "_consent"
+    d = account_dir(bname)
+    try:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+        adb_port, qmp_port, vnc_port = allocate_ports(cfg)
+        acct = {"name": bname, "base": tag, "adb_port": adb_port,
+                "qmp_port": qmp_port, "vnc_port": vnc_port,
+                "game_package": pkg, "first_boot_done": True}
+        save_account(acct)
+        make_overlay(d / "system.qcow2", images / base["system"])
+        make_overlay(d / "data.qcow2", target)
+        shutil.copyfile(images / base.get("efivars", ARM_BASE_EFIVARS),
+                        d / "efivars.fd")
+        _spawn_builder_with_disks(acct, cfg, [], label)
+        if not wait_for_boot(acct, FIRST_BOOT_TIMEOUT, label):
+            print(f"[{label}] builder did not boot; {img_name} is untouched.")
+            return False
+        out = ""
+        for step in consent.build_consent_sequence(pkg):
+            r = adb(acct, *step, timeout=180)
+            out += (r.stdout or "") + (r.stderr or "")
+        if not consent.applied_ok(out):
+            print(f"[{label}] the guest did not confirm the policy — NOT "
+                  f"committing. {img_name} is untouched. "
+                  f"guest said: {out.strip()[-200:] or '<nothing>'}")
+            _shutdown(acct, label)
+            return False
+        # Push the RAM-held app-ops to disk, then throw the RAM state away and
+        # reload from it. Applying is not persisting: the first version of this
+        # function skipped these two steps and committed an image whose ops
+        # read back as "No operations." See consent.build_persist_script.
+        adb(acct, *consent.build_persist_script(), timeout=60)
+        adb(acct, *consent.build_reload_script(), timeout=60)
+        # Read it back INSIDE the same boot, before the image is committed: a
+        # policy that did not land must not be baked in and then discovered at
+        # launch time. After the reload above, an op still reading `allow` is
+        # ON DISK — which is exactly what the commit is about to capture.
+        r = adb(acct, *consent.build_consent_probe(pkg), timeout=30)
+        state = consent.parse_consent_state((r.stdout or "") + (r.stderr or ""))
+        counts = consent.parse_counts(out)
+        # Gate on the half that is actually IMAGE STATE. Requiring the app-ops
+        # here would fail every bake on Android 16: they apply, they reach
+        # disk, and the permission APEX re-derives them at boot anyway (see
+        # consent.build_persist_script). The boot-time step owns that half.
+        if not state.get("dialogs_hidden"):
+            print(f"[{label}] read-back after the disk round trip says the "
+                  f"policy did NOT persist ({state}) — not committing; "
+                  f"{img_name} is untouched.")
+            _shutdown(acct, label)
+            return False
+        _shutdown(acct, label)
+        before = target.stat().st_size
+        subprocess.run([qemu_bin("qemu-img"), "commit", "-f", "qcow2",
+                        str(d / "data.qcow2")], check=True, capture_output=True)
+        grew = (target.stat().st_size - before) // 1024
+        print(f"[{label}] {consent.baked_summary(counts, state)} — committed "
+              f"into {img_name} (+{grew} KB)")
+        return True
+    except Exception as e:      # noqa: BLE001 — report, never raise into a CLI
+        print(f"[{label}] consent bake failed ({type(e).__name__}: {e}); "
+              f"{img_name} is untouched.")
+        return False
+    finally:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def cmd_offset_consent(args):
+    """Bake the unattended-consent policy into offset image(s).
+
+        omnidroid offset consent arceusae
+        omnidroid offset consent --all
+
+    The same policy the engine applies on every boot (full disk access, the
+    install/overlay/storage app-ops, every dangerous runtime permission, and
+    `hide_error_dialogs`), written INTO the image so it is already true before
+    the first post-boot step runs — and true for anything else that boots the
+    image. Idempotent: re-running it re-asserts the same state.
+    """
+    ensure_qemu()
+    cfg, tag, base = _offset_base(args)
+    offs = offsets_mod.offsets_of(base)
+    if not offs:
+        return fail("no_offset", f"base '{tag}' has no offsets to bake into")
+    if not getattr(args, "all", False) and not getattr(args, "name", None):
+        return fail("bad_args",
+                    f"name a version or pass --all. Known: {list(offs)}")
+    names = list(offs) if getattr(args, "all", False) else [args.name]
+    unknown = [n for n in names if n not in offs]
+    if unknown:
+        return fail("no_offset",
+                    f"no offset {unknown} on base '{tag}'. Known: {list(offs)}")
+    live = [a["name"] for a in all_accounts() if running_pid(a["name"])]
+    if live:
+        return fail("instance_running",
+                    f"stop running instances first: {', '.join(live)} "
+                    f"(the offset image would be open by a live QEMU)")
+    results = {}
+    for name in names:
+        img = offsets_mod.offset_data_image(base, name)
+        pkg = (offs[name].get("package")
+               or resolve_bake_package(None, tag, cfg) or ROBLOX_PACKAGE)
+        results[name] = bake_consent_into_offset(
+            cfg, tag, base, img, pkg, f"offset consent {name}")
+    ok = [n for n, v in results.items() if v]
+    bad = [n for n, v in results.items() if not v]
+    print(f"[offset consent] baked into: {', '.join(ok) or 'nothing'}"
+          + (f"  |  FAILED (untouched): {', '.join(bad)}" if bad else ""))
+    if getattr(args, "json", False):
+        emit_json({"ok": not bad, "base": tag, "baked": ok, "failed": bad})
+    if bad:
+        return fail("consent_bake_failed",
+                    f"the policy was not baked into: {', '.join(bad)}. Those "
+                    f"images are untouched; the boot-time policy still "
+                    f"applies to them at launch.")
 
 
 def _offset_base(args, cfg=None):
@@ -3398,13 +3581,24 @@ def cmd_bake_game(args):
             return fail("engine_error",
                         f"could not locate the '{BOOTANIM_FS}' filesystem")
         fs_off, _fs_size = found
-        name = getattr(args, "name", None) or ("Roblox" if remove
-                                               else "OmniGame")
-        err = (_remove_apk_from_product(str(raw), fs_off, name, label)
-               if remove else
-               _bake_apk_into_product(str(raw), fs_off, str(apk), name, label))
-        if err:
-            return fail("engine_error", err)
+        if remove and not getattr(args, "name", None):
+            # No explicit dir: strip EVERY Roblox app dir. The base can carry
+            # more than one (e.g. Roblox + ArceusRoblox); leaving any behind
+            # keeps com.roblox.client present and breaks re-signed offset bakes.
+            targets = _product_roblox_dirs(str(raw), fs_off) or ["Roblox"]
+            for t in targets:
+                err = _remove_apk_from_product(str(raw), fs_off, t, label)
+                if err:
+                    return fail("engine_error", err)
+            name = ", ".join(targets)
+        else:
+            name = getattr(args, "name", None) or ("Roblox" if remove
+                                                   else "OmniGame")
+            err = (_remove_apk_from_product(str(raw), fs_off, name, label)
+                   if remove else
+                   _bake_apk_into_product(str(raw), fs_off, str(apk), name, label))
+            if err:
+                return fail("engine_error", err)
         if not _fsck_ok(str(raw), fs_off, label):
             return fail("engine_error",
                         "refusing to emit an image whose product filesystem is "
@@ -4898,7 +5092,7 @@ def install_readiness():
     if arm:
         template_ready = True
     else:
-        template = raw.get("data_template", "data-template-8g.qcow2")
+        template = raw.get("data_template", X86_DATA_TEMPLATE)
         template_ready = (images / template).exists()
         if not template_ready:
             missing.append(str(images / template))
@@ -6461,6 +6655,13 @@ KIOSK_ACTION_CLEAR_SESSION = "com.omni.kiosk.CLEAR_SESSION"
 # feature (voice chat, camera) cannot introduce a new prompt into a flow that is
 # supposed to have none. Granting a permission the build does not declare is a
 # harmless no-op error.
+#
+# A NARROWER, EARLIER-BOUND copy of what apply_consent now does for every
+# package from its own manifest (consent.py). Kept because it belongs to the
+# session flow rather than to the boot: it re-asserts the three that matter for
+# a login/join immediately before launching the game, without depending on the
+# boot step having run. Add new blanket grants to consent.APP_OPS/the manifest
+# sweep, not here.
 ROBLOX_RUNTIME_PERMS = (
     "android.permission.POST_NOTIFICATIONS",
     "android.permission.RECORD_AUDIO",
@@ -6853,6 +7054,108 @@ def apply_roblox_settings(acct, label=None, settings=None):
               + (f"applied ({detail})" if ok
                  else "write did NOT land - instance runs uncapped"))
     return ok
+
+
+def apply_awake(acct, label=None):
+    """Make the instance incapable of sleeping or blanking from inactivity.
+
+    EVERY boot, EVERY mode, no opt-in — a blanked farming instance stops
+    rendering (and stops earning) unnoticed, and a blanked playable one is a
+    black VNC window. `omnidroid/awake.py` carries the reasoning and the
+    measurements; the short version is that Android's sleep ladder has six
+    independent rungs and disabling only the famous one leaves the other five
+    to blank the screen anyway.
+
+    Verified from `dumpsys power`, NEVER from `settings get`: the setting is
+    not the effective value. A live arm instance reported
+    `screen_off_timeout = -1` while PowerManagerService clamped it up to a TEN
+    SECOND blank, so reading the setting back would have reported a satisfied
+    guarantee on an instance that was ten seconds from going black.
+
+    Returns True iff the guest's own dump says it can no longer blank.
+    """
+    if not awake.awake_enabled(os.environ):
+        if label:
+            print(f"[{label}] awake: SKIPPED ({awake.NO_AWAKE_ENV} is set) — "
+                  f"Android's own power management is left alone and this "
+                  f"instance CAN blank from inactivity")
+        return False
+    su = resolve_su(acct)
+    try:
+        for step in awake.build_awake_sequence(su):
+            adb(acct, *step, timeout=30)
+        r = adb(acct, *awake.build_state_probe(), timeout=30)
+    except Exception as e:      # noqa: BLE001 — never a boot blocker
+        if label:
+            print(f"[{label}] awake: NOT applied ({type(e).__name__}: {e}) — "
+                  f"this instance can blank from inactivity")
+        return False
+    dump = (r.stdout or "") + (r.stderr or "")
+    guaranteed = awake.never_blanks(dump)
+    st = awake.parse_power_state(dump)
+    if label:
+        # Report the READING, and name the one step root buys — an unreported
+        # skip of a 0220 root:system write looks exactly like success.
+        timeout_s = (st["screen_off_timeout_ms"] or 0) // 1000
+        detail = (f"wakefulness={st['wakefulness'] or '?'}, "
+                  f"screen-off timeout {timeout_s}s"
+                  + ("" if su else
+                     f" (no root: {awake.root_only_steps()[0]} SKIPPED)"))
+        print(f"[{label}] awake: "
+              + (f"never blanks — {detail}" if guaranteed
+                 else f"NOT guaranteed — {detail}"))
+    return guaranteed
+
+
+def apply_consent(acct, cfg=None, label=None):
+    """Grant what would otherwise need a tap, and silence the error dialogs.
+
+    Runs on EVERY boot, production included, for the same reason _enforce_hiding
+    does: it is per-/data state, so an offset baked before this feature existed
+    (or a `--apk` one-off, which installs into a throwaway instance) has none of
+    it, and a policy that only new images get is a policy that mostly is not on.
+
+    Needs no root — see consent.py. Never fails a boot: an instance that lost
+    adb mid-sequence is reported, not raised.
+    """
+    if not consent.consent_enabled(os.environ):
+        if label:
+            print(f"[{label}] consent: SKIPPED "
+                  f"({consent.NO_CONSENT_ENV} is set) — permission prompts "
+                  f"and ANR/crash dialogs will appear as the platform sends "
+                  f"them")
+        return False
+    game = resolve_game_package(acct, cfg)
+    out = ""
+    try:
+        for step in consent.build_consent_sequence(game):
+            r = adb(acct, *step, timeout=120)
+            out += (r.stdout or "") + (r.stderr or "")
+    except Exception as e:      # noqa: BLE001 — an add-on, never a boot blocker
+        if label:
+            print(f"[{label}] consent: NOT applied "
+                  f"({type(e).__name__}: {e})")
+        return False
+    if not consent.applied_ok(out):
+        if label:
+            print(f"[{label}] consent: the guest did not confirm — permission "
+                  f"prompts and error dialogs may still appear. "
+                  f"guest said: {out.strip()[-200:] or '<nothing>'}")
+        return False
+    counts = consent.parse_counts(out)
+    # Read the state BACK rather than trusting the commands that were sent:
+    # `appops set` on a package that does not exist exits 0 and does nothing.
+    state = {"dialogs_hidden": True, "full_disk": False, "install_unknown": False}
+    if game:
+        try:
+            r = adb(acct, *consent.build_consent_probe(game), timeout=30)
+            state = consent.parse_consent_state((r.stdout or "")
+                                                + (r.stderr or ""))
+        except Exception:       # noqa: BLE001 — probe failure is not a failure
+            pass
+    if label:
+        print(f"[{label}] {consent.summary_line(counts, state)}")
+    return state.get("dialogs_hidden", False)
 
 
 def apply_balloon_target(acct, mode, label=None):
@@ -7270,6 +7573,20 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # _devkit_activate, i.e. only on a --debug boot, which is exactly the
     # dev-base-era gating the dual-use change was supposed to remove.
     assert_kiosk_game(acct, cfg, label)
+    # EVERY boot: grant the permissions a human would otherwise be asked to
+    # tap through (full disk access above all) and silence the ANR/crash
+    # dialogs. Before the mode tuning on purpose — the tuning is the longest
+    # part of the pipeline and an error dialog raised during it would be
+    # exactly the modal this suppresses. It touches no display or memory
+    # lever, so neither profile can disagree with it.
+    apply_consent(acct, cfg, label)
+    # EVERY boot, EVERY mode, and ABOVE the profile branch on purpose: the
+    # never-blank guarantee is not a mode trade-off, and applying it before the
+    # tuning leaves each mode the last writer on the display levers it
+    # legitimately owns (gaming resets wm size/density, farming sets 480x270).
+    # It sits in this shared tail so a WARM RESTORE gets it too — a restored
+    # instance that blanks is the same product bug as a cold-booted one.
+    apply_awake(acct, label)
     # A debug boot ALSO stages the devkit toolkit (frida + omni-* tools) off
     # the vdc disk attached at spawn. `debug` is the per-boot flag resolved at
     # the top of this function.
@@ -8055,6 +8372,22 @@ def build_parser():
                      help="unregister it but leave the qcow2 on disk")
     orm.add_argument("--json", action="store_true")
     orm.set_defaults(func=cmd_offset_remove)
+
+    ocs = offsub.add_parser("consent",
+                            help="bake the unattended-consent policy INTO a "
+                                 "version's image (~2 min each). Only the "
+                                 "no-ANR/crash-dialog half is image state on "
+                                 "Android 16; the app-ops (full disk access, "
+                                 "install-unknown, overlay) and the runtime "
+                                 "grants are re-applied by the engine on "
+                                 "EVERY boot, baked or not")
+    ocs.add_argument("name", nargs="?", default=None,
+                     help="the version to bake into (or use --all)")
+    ocs.add_argument("--all", action="store_true",
+                     help="every baked version on this base")
+    ocs.add_argument("--base", default=None, help="base tag (default: current)")
+    ocs.add_argument("--json", action="store_true")
+    ocs.set_defaults(func=cmd_offset_consent)
 
     osh = offsub.add_parser("show", help="everything recorded about a version")
     osh.add_argument("name", nargs="?", default=None,

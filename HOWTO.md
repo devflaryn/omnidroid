@@ -486,14 +486,66 @@ within 22 s. After the change, the same test idles indefinitely at
 
 Two things follow from this that are worth knowing:
 
+* **There is no `awake` command and no watchdog.** The guarantee is Android's
+  own developer settings, written once per boot into /data, where they stay:
+  Developer options is enabled (`development_settings_enabled=1`), **Stay
+  awake** is on (`stay_on_while_plugged_in=15`, every plug type), the
+  inactivity timer is effectively infinite, and the three "user is away"
+  timers plus the screensaver are off. Nothing has to keep re-asserting them.
 * **Verify with `dumpsys power`, never with `settings get`.** The setting is
-  not the effective value. `omnidroid awake <name> --check` reads the right
-  one.
-* **The watchdog re-asserts it every 5 min.** The `dumpsys battery` override
-  is the one lever with an expiry (a framework restart drops it), and
-  `stay_on_while_plugged_in` goes straight back to being a no-op when it goes.
+  not the effective value — that is the whole lesson above. `omnidroid
+  debug-info <name>` and the `awake:` line on every `start` read the right one:
+
+```
+[start alice] awake: never blanks — wakefulness=Awake, screen-off timeout 2147483s
+```
+
+MEASURED after the change, on the case that used to fail: with the AC
+coincidence deliberately removed (`dumpsys battery unplug`, `mIsPowered=false`)
+the instance still reads `mWakefulness=Awake` and `Screen off timeout:
+2147483647 ms`, and the kernel wakelock `omni_awake` is held. The old build
+was in `mWakefulness=Dozing` 22 s into the same test.
 
 Kill switch: `OMNI_NO_AWAKE=1` leaves Android's own power management alone.
+
+### Never wait for a tap: permissions and error dialogs
+
+**Every boot, every mode**, before the mode tuning, the engine grants what a
+human would otherwise have to tap through and silences the framework's own
+error dialogs (`omnidroid/consent.py`):
+
+| | |
+|---|---|
+| full disk access | app-op `MANAGE_EXTERNAL_STORAGE` — "…isn't allowed to access all files" |
+| install unknown apps | app-op `REQUEST_INSTALL_PACKAGES` |
+| storage / overlay | `LEGACY_STORAGE`, `READ`/`WRITE_EXTERNAL_STORAGE`, `SYSTEM_ALERT_WINDOW` |
+| runtime permissions | every DANGEROUS permission each package's own manifest declares |
+| no ANR / crash modals | `settings put global hide_error_dialogs 1` |
+
+Covered packages are the third-party ones **plus the game** — the game is an
+updated system app and does not appear in `pm list packages -3`.
+
+```
+[start alice] consent: full disk access, install-unknown, error dialogs off (2 package(s), 7 runtime permission(s) granted)
+```
+
+That line is a READ-BACK, not a receipt for commands sent. Kill switch:
+`OMNI_NO_CONSENT=1`, which you want when reproducing a crash-loop by eye.
+
+**What is image state and what is not.** `omnidroid offset consent <name>`
+(or `--all`) bakes the policy into an offset image — overlay-then-commit, so a
+bake that fails leaves the image byte-identical. Only the **dialog half**
+survives into the image: measured twice on both images, a committed image
+boots with `hide_error_dialogs=1` but its app-ops read back as `default`,
+because the permission APEX re-derives them at boot. Runtime grants cannot
+even be flushed. So the boot-time step is the load-bearing one and the bake is
+belt-and-braces; the command says so rather than claiming what it did not
+persist.
+
+**Not automated:** once `REQUEST_INSTALL_PACKAGES` is granted, an app that
+goes on to install an APK still gets PackageInstaller's own confirm screen
+("Update this app?"). No setting suppresses that — it is a platform consent
+step. Drive it with the `omnidroid-input` skill if a flow needs it.
 
 ---
 

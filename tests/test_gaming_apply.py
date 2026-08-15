@@ -56,6 +56,7 @@ def _boot(mode_name):
          mock.patch.object(omni, "post_boot"), \
          mock.patch.object(omni, "_enforce_hiding"), \
          mock.patch.object(omni, "assert_kiosk_game"), \
+         mock.patch.object(omni, "apply_consent"), \
          mock.patch.object(omni, "adb"), \
          mock.patch.object(omni, "apply_awake", rec("awake")), \
          mock.patch.object(omni, "apply_roblox_settings", rec("roblox_settings")), \
@@ -63,8 +64,14 @@ def _boot(mode_name):
          mock.patch.object(omni, "apply_farming_squeeze", rec("farming_squeeze")), \
          mock.patch.object(omni, "apply_balloon_target", rec("balloon")), \
          mock.patch.object(omni, "apply_gaming_tuning", rec("gaming_tuning")):
+        # no_warm: this harness passes the REAL config, so without it the boot
+        # walks into the warm-cache lookup/bake — QMP sockets and qemu-img
+        # against the host's actual images dir, for a test whose every
+        # assertion is about which tuning collaborator the mode chose. (It
+        # never showed up before because this whole file failed at the
+        # apply_awake patch, which the engine did not have.)
         ok, _ = omni._ensure_booted(_acct(), omni.read_config(), "t",
-                                    mode_name=mode_name)
+                                    mode_name=mode_name, no_warm=True)
     assert ok
     return calls
 

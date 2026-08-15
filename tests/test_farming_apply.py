@@ -59,6 +59,8 @@ class FarmingGate(unittest.TestCase):
              mock.patch.object(omni, "_devkit_activate"), \
              mock.patch.object(omni, "_enforce_hiding"), \
              mock.patch.object(omni, "assert_kiosk_game"), \
+             mock.patch.object(omni, "apply_consent"), \
+             mock.patch.object(omni, "apply_awake"), \
              mock.patch.object(omni, "resolve_mode",
                  side_effect=_fake_resolve_mode), \
              mock.patch.object(omni, "apply_balloon_target"), \
@@ -87,6 +89,8 @@ class FarmingGate(unittest.TestCase):
              mock.patch.object(omni, "_devkit_activate"), \
              mock.patch.object(omni, "_enforce_hiding"), \
              mock.patch.object(omni, "assert_kiosk_game"), \
+             mock.patch.object(omni, "apply_consent"), \
+             mock.patch.object(omni, "apply_awake"), \
              mock.patch.object(omni, "resolve_mode",
                  side_effect=_fake_resolve_mode), \
              mock.patch.object(omni, "apply_balloon_target"), \

@@ -111,6 +111,8 @@ class _StubbedBoot:
              dict(return_value=True)),
             (engine, "_enforce_hiding", "_enforce_hiding", {}),
             (engine, "assert_kiosk_game", "assert_kiosk_game", {}),
+            (engine, "apply_consent", "apply_consent",
+             dict(return_value=True)),
             (engine, "_devkit_activate", "_devkit_activate", {}),
             (engine, "apply_roblox_settings", "apply_roblox_settings", {}),
             (engine, "enable_zram", "enable_zram", {}),

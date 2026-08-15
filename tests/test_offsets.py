@@ -18,9 +18,11 @@ The requirement these tests pin, in the order it was stated:
 import os
 import sys
 import unittest
+from pathlib import PurePosixPath
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from omnidroid import bases  # noqa: E402
 from omnidroid import offsets  # noqa: E402
 from omnidroid import engine as omni  # noqa: E402
 
@@ -53,13 +55,16 @@ class Naming(unittest.TestCase):
         for n in ("", "-x", ".hidden", "a b", "a/b", "a" * 49):
             self.assertFalse(offsets.valid_offset_name(n), n)
 
-    def test_the_image_name_is_flat_and_derived_from_the_offset_name(self):
-        # FLAT on purpose: a qcow2's backing reference resolves relative to
-        # the overlay's own directory, so a subdirectory would break the
-        # `rebase -u -b <bare name>` that keeps images_dir relocatable.
+    def test_the_image_name_sits_beside_the_data_it_overlays(self):
+        # An offset lives in the SAME arch subfolder as the pristine /data it
+        # overlays. That co-location is what keeps `rebase -u -b <bare name>`
+        # (and therefore a relocatable images_dir) working: a qcow2's backing
+        # reference resolves relative to the overlay's OWN directory.
         self.assertEqual(offsets.offset_image_name("2.731.944"),
-                         "base_arm_data_offset_2.731.944.qcow2")
-        self.assertNotIn("/", offsets.offset_image_name("x"))
+                         "arm/base_arm_data_offset_2.731.944.qcow2")
+        self.assertEqual(
+            PurePosixPath(offsets.offset_image_name("x")).parent,
+            PurePosixPath(bases.ARM_ROOTED_DATA).parent)
 
 
 class TheBaseStaysClean(unittest.TestCase):
