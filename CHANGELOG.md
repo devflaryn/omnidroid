@@ -6,6 +6,86 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-16 — gaming's window redesign, measured on real Windows hardware
+
+**The `SetParent`-hosted viewer is gone.** Gaming's GPU window used to make
+QEMU's window a *child* of our Tk viewer; force-killing the viewer took the
+child down with it — instance alive, answering adb, `totalFrames = 0` forever.
+The replacement restyles QEMU's OWN window in place (caption/sysmenu/min/max
+stripped, `WS_THICKFRAME` kept) and spawns a thin bar of ours as a separate
+process whose window is made an OWNER of QEMU's via `GWLP_HWNDPARENT` — never
+the reverse. Destroying an owned window does nothing to its owner, which is
+the property this whole redesign exists for.
+
+**Reconfirmed on this box's hardware** (x86 base, `admn1b12farm3`, `--mode
+gaming --gpu auto`, QEMU 11.0.50, `gtk,gl=on,show-menubar=off,window-close=off,
+zoom-to-fit=on` + `virtio-gpu-gl-pci`):
+
+```
+window hidden through boot        confirmed: 30 screenshots sampled every 4s
+                                   across a ~117s cold boot, no flash
+run.json                          "display_kind": "gl-window"
+chrome after `view`               no QEMU menu bar, no second title bar;
+                                   QEMU style 0x16040000 (no WS_CAPTION,
+                                   no WS_SYSMENU); bar style 0x16CA0008
+                                   (has both); bar owner == QEMU hwnd
+
+SurfaceFlinger --timestats, bar running     totalFrames = 3305 / 35s (~94 fps)
+taskkill /F /PID <bar pid>                  bar dies; QEMU pid untouched
+SurfaceFlinger --timestats, bar dead        totalFrames = 3464 / 34s (~102 fps)
+```
+
+Frame production did not dip after the force-kill — the single most important
+check in this pass, and it holds. The close prompt's three buttons (Cancel /
+Hide / Stop) were each exercised via UI Automation + synthetic clicks and
+behaved as designed: Cancel does nothing, Hide destroys the bar and hides the
+window (`list` still shows it running, `view` restores it), Stop powers the
+instance off. Separately, `omnidroid view <name> --hide` was run with the bar
+open specifically to settle a question code review could not: whether Windows
+cascades a bare `SW_HIDE` to an owned window. **It does not**, and the code
+already accounts for that (`--hide` persists geometry, kills the bar, clears
+its pid file, *then* hides) — reconfirmed on screen: no orphaned bar, no
+guesswork left.
+
+**What could not be measured:** the fps figures above are idle Android/BlissOS
+setup-wizard compositing, not PS99 gameplay. The saved account's Roblox
+session cookie had been server-side invalidated (HTTP 401) since an earlier
+network change on this box, and installing a plain (non-Omni-baked) Roblox APK
+for the run doesn't pair with the kiosk's session receiver (`no_kiosk_reply`).
+This does not weaken the result being measured (window/chrome/ownership/kill-
+safety, none of which depend on Roblox) — the existing 24.2–58 fps PS99 band
+in `MODES.md` predates this redesign and still stands, since only the window's
+ownership and chrome changed, not the render path.
+
+**Bug found by this hardware pass, not fixed here:** the bar's on-screen size
+does not match `bar_geometry()`'s intent — it should be exactly as wide as the
+guest window and 34px tall, sitting flush above it; on this box it instead
+came up ~216×239px (overlapping the guest's top-left corner). Position was
+correct, size was not. Suspected: `root.resizable(False, False)` in
+`windowbar.py` runs before the geometry-setting `SetWindowPos`, and a later
+`WM_GETMINMAXINFO` clamps the window back to Tk's own default size. Logged in
+`MODES.md`; needs a follow-up task.
+
+**Also found:** `qemu_proc.py`'s `[gpu]` log line for the GL-window tier still
+describes the deleted design ("`omnidroid view` HOSTS it inside our own
+viewer instead") — stale text from before this plan, printed on every gaming
+boot on Windows. Not fixed here (out of this task's file scope); flagged for
+a follow-up doc/message fix.
+
+**Local environment notes, not repo changes:** this box's `images_dir`
+(`C:\Users\berat\OmniImages`) had no `x86/` subfolder populated even though
+`configs/paths.json` (locally modified, uncommitted) already expects one; the
+real base files were only present in an old flat layout at
+`Desktop\OmniImages`. Fixed locally with four zero-cost NTFS hardlinks into
+`OmniImages\x86\` rather than copying ~2.96 GB with ~5.7 GB free. Separately,
+`omnidroid` was not pip-installed on this box, so the window bar's non-frozen
+dev-mode spawn (`python <path to engine.py> _windowbar ...`, run as a bare
+script rather than `-m omnidroid`) could not resolve `from omnidroid import
+awake` and crashed instantly (`ModuleNotFoundError`) every time `view` tried
+to open a bar. This is a dev-only gap shared with the pre-existing VNC viewer
+spawn (same shape, same file) — invisible in the shipped PyInstaller build,
+which is frozen — fixed locally with `pip install -e . --no-deps`.
+
 ## 2026-08-16 — farming reaches the PS99 world, and a warm POOL
 
 **`--mode farming` gets into Pet Simulator 99 and stays there, squeezed.**

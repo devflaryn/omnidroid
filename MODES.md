@@ -17,7 +17,7 @@ the engine branches on:
 | what matters | frames, resolution, input latency | RAM and CPU per instance |
 | what does not | density, host footprint | speed, quality, anything visual |
 | instances per host | 1–2 | many (see the footprint note below) |
-| host window | never *visible* — hidden, and hosted by our viewer (see **The GPU**) | never |
+| host window | hidden through boot; `omnidroid view` restyles QEMU's own window in place and adds our bar (see **The GPU**) | never |
 | guest MTU | matched to the host's egress (see **Farming**) — both modes | same |
 | guest panel | 1280x800 (`--panel` overrides) | 640x480, `wm size` 480x270 |
 | engine tick | 240 fps target | 5 fps cap |
@@ -80,7 +80,7 @@ One setting, `--gpu` (config `qemu.gpu`, env `OMNI_GPU`), four values:
 
 | | |
 |---|---|
-| `auto` | **default.** Reach the GPU whatever it takes. If that needs a window, open it HIDDEN and let the viewer host it. |
+| `auto` | **default.** Reach the GPU whatever it takes. If that needs a window, open it HIDDEN and restyle it in place (`omnidroid view`). |
 | `headless` | Never a window. Keeps the VNC viewer. GPU only if it can be had windowless. |
 | `window` | Always open a native QEMU window. |
 | `off` | Software rendering, headless. |
@@ -119,50 +119,102 @@ was fine — SurfaceFlinger came up on `virgl (ANGLE (NVIDIA … RTX 4060))` wit
 GL errors in logcat — so this is presentation, not rendering.
 
 **So on Windows a GPU-accelerated instance has a window and no VNC server.**
-That does not mean you have to look at a QEMU window, and you never do:
+It is not hidden behind a viewer of ours — it IS the window you look at, we
+just take away QEMU's chrome and put a strip of our own above it:
 
-### You only ever see OUR viewer
+### QEMU's own window, restyled, with a bar of ours OWNING it
+
+The design this replaced (`SetParent`) made QEMU's window a *child* of our Tk
+viewer, so the guest lived *inside* the product's window. That is gone. What
+runs now:
 
 | | |
 |---|---|
 | the window is **hidden** at spawn | it exists only to hold the GL context |
-| a hidden window **keeps rendering** | measured: 303 frames / 30 s while invisible |
-| `omnidroid view` **hosts** it | `SetParent` makes it a child of our Tk window |
+| a hidden window **keeps rendering** | reconfirmed 2026-08-16: no flash across a full boot, sampled every 4s |
+| `omnidroid view` **restyles it in place** | `hostwin.apply_chrome`: caption/sysmenu/min/max stripped, `WS_THICKFRAME` kept, so it still resizes but shows none of QEMU's own chrome |
+| a thin bar of ours is spawned | a separate process (`windowbar.py`), its window made an OWNER of QEMU's window via `GWLP_HWNDPARENT` — never the reverse |
 
-So the guest lives *inside* the product's viewer — our title, our chrome — with
-QEMU's GL surface composited straight into it. Nothing is copied, encoded or
-decoded per frame, and input goes into the guest's `usb-tablet`/`usb-kbd`
-directly instead of being synthesised from an RFB event. **Measured embedded:
-702 frames / 12.1 s = 58 fps.**
+QEMU's window stays top-level for its whole life; only its *style bits* change
+(caption/sysmenu/minimize/maximize cleared, `WS_THICKFRAME` kept — confirmed
+2026-08-16 by reading the live style word off a running instance: `0x16040000`
+= `WS_VISIBLE|WS_CLIPSIBLINGS|WS_CLIPCHILDREN|WS_THICKFRAME`, no `WS_CAPTION`,
+no `WS_SYSMENU`). The bar is a real top-level window with its own caption
+(style `0x16CA0008` includes `WS_CAPTION|WS_SYSMENU`) that Windows floats
+above its owner automatically and minimises/restores with it — no polling, no
+z-order management of our own. Nothing is copied, encoded or decoded per
+frame (there was never a framebuffer in this design, restyled or not), and
+input goes into the guest's `usb-tablet`/`usb-kbd` directly.
+
+**THE OWNERSHIP DIRECTION IS THE WHOLE POINT.** The old design's one hazard
+was that Windows destroys a *child* window when its parent dies, so a viewer
+that was FORCE-killed took QEMU's window with it — instance alive, answering
+adb, rendering nothing (`totalFrames = 0`, measured under that design). Making
+the bar an OWNED window instead of an owner inverts the failure: destroying an
+owned window does nothing to its owner. **Reconfirmed on hardware 2026-08-16:**
+`taskkill /F /PID <bar pid>` mid-render, then re-measured —
+
+```
+before the kill   totalFrames = 3305   over 35s   (~94 fps)
+taskkill /F /PID <bar>
+after the kill    totalFrames = 3464   over 34s   (~102 fps)
+```
+
+— frame production did not even dip. This is the check the whole redesign
+exists for, and it holds.
+
+**Known issue, found on this same hardware pass:** the bar's *size* does not
+match `windowbar.bar_geometry()`'s intent. Position lands exactly where
+computed; on this box the bar instead came up ~216×239 px (Tk's own default
+toplevel size) rather than the intended "exactly as wide as the guest window,
+34 px tall" — overlapping the guest's top-left corner rather than sitting
+flush above it. Ownership, ownership-triggered kill-safety, hide, and the
+close dialog's three buttons all still work correctly; only the strip's shape
+is wrong. Suspected cause, not yet fixed: `root.resizable(False, False)` runs
+before `bar.follow()`'s raw `SetWindowPos`, so a later `WM_GETMINMAXINFO` may
+clamp the window back to Tk's own requested size. Needs a follow-up task.
 
 GTK re-shows the window during early boot, so `hostwin.keep_hidden()` re-hides
-it for the length of a boot and then stops; after that a single hide sticks
-(30 s of polling never saw it return).
+it for the length of a boot and then stops; after that a single hide sticks.
+Re-verified 2026-08-16 across a full ~117 s cold boot (screenshots sampled
+every 4 s): the window never appeared on screen.
 
 `--gpu window` is the one setting that leaves it on screen, for when a GL
 problem has to be seen with none of this project's code in the path.
 
-**The one hazard, and it is reported rather than silent:** Windows destroys a
-child window when its parent dies, so a viewer that is FORCE-killed (rather
-than closed with its X) takes QEMU's window with it. The instance keeps running
-and keeps answering adb, and renders nothing at all — measured,
-`totalFrames = 0`. `omnidroid view` detects exactly that state and says so,
-instead of opening an empty window onto a blind guest.
+**Hiding from the app (`omnidroid view <name> --hide`) is a different path
+from the bar's own X**, and it has to be: Windows only cascades a *destroy* to
+an owned window, not a bare `ShowWindow(SW_HIDE)` on the owner — an untouched
+bar would be left on screen captioning nothing. So `--hide` persists the
+window's geometry, kills the bar itself, clears its pid file, *then* hides.
+Reconfirmed on hardware 2026-08-16 with the bar open: after `--hide`, the bar
+process was gone, its window handle invalid, and the screen showed neither the
+bar nor the guest — no orphan, exactly as designed.
 
 | | fps at 1280x800 on PS99 | what you watch |
 |---|---|---|
-| `--gpu auto` (default) | **24.2–58** across runs | our viewer, hosting the hidden window |
+| `--gpu auto` (default) | **24.2–58** across runs | QEMU's own restyled window, our bar above it |
 | `--gpu headless` | 3.2 | our viewer, over VNC |
+
+That PS99 band predates this redesign but still applies: only the window's
+*ownership and chrome* changed here, not the render path
+(`gtk,gl=on`+`virtio-gpu-gl-pci`), so the same GPU throughput is expected. The
+2026-08-16 hardware pass above could not reach PS99 itself on this box (the
+saved account's cookie had been server-side invalidated — HTTP 401 — and a
+plain, non-baked Roblox APK installed for the run doesn't pair with the kiosk's
+session receiver), so its 94–102 fps figures are idle Android/BlissOS
+setup-wizard compositing, not gameplay — real GPU-accelerated frames, useful
+to prove the mechanism, but not a PS99 number and not to be read as one.
 
 The GPU spread is real rather than noise in the method: PS99 is a busy
 server-authoritative place and how much is streaming in when the sample is
 taken moves it a long way. The ratio to software does not move.
 
 On a host whose `egl-headless` presents — Linux — none of this is needed:
-`auto` gets GPU, no window and VNC all at once, and the same viewer connects
-the ordinary way. macOS has no virgl yet, so it renders in software and also
-uses VNC. **The viewer is the same on all three; only what it attaches to
-differs.**
+`auto` gets GPU, no window and VNC all at once, and a viewer connects the
+ordinary way. macOS has no virgl yet, so it renders in software and also uses
+VNC. **Only Windows gaming shows QEMU's own window; Linux and macOS still
+connect a viewer over VNC to a windowless guest.**
 
 ---
 
