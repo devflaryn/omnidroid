@@ -105,6 +105,20 @@ class ClosePrompt(unittest.TestCase):
         hide.assert_not_called()
         self.assertEqual(stopped, [])
 
+    def test_a_failed_stop_is_flagged_and_never_reported_as_success(self):
+        def boom(_name):
+            raise RuntimeError("could not kill the process")
+
+        bar = windowbar.WindowBar("omni-farm3", on_stop=boom)
+        self.assertFalse(bar.stop_failed)
+        with mock.patch.object(windowbar, "_ask_close", return_value="stop"):
+            # The CHOICE is still reported as "stop" -- on_close() never
+            # lies about which button was pressed -- but the failure must be
+            # discoverable, or a caller has no way to tell this apart from a
+            # real stop.
+            self.assertEqual(bar.on_close(), "stop")
+        self.assertTrue(bar.stop_failed)
+
 
 if __name__ == "__main__":
     unittest.main()

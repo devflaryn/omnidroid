@@ -22,9 +22,10 @@ process cannot intercept another's WM_CLOSE without injecting a DLL. QEMU is
 therefore spawned `window-close=off` and its X is inert -- and its caption is
 stripped, so there is no second title bar to click.
 
-WINDOWS FIRST. The X11 backend is written but UNVERIFIED (no Linux host in
-this setup); macOS gets this from the QEMU patch, because it has no public API
-to restyle or own another process's NSWindow.
+WINDOWS ONLY, for now. Linux is deferred -- no X11 code exists in this module
+(own() returns False there, same as on every other non-Windows host); macOS
+gets this from the QEMU patch instead, because it has no public API to
+restyle or own another process's NSWindow.
 """
 import sys
 
@@ -109,6 +110,14 @@ class WindowBar:
         self.on_stop = on_stop
         self.owner_hwnd = None
         self.bar_hwnd = None
+        # Set by on_close() when a "stop" answer's hook raised. The RETURN
+        # VALUE of on_close() stays "stop" regardless -- that is the CHOICE
+        # the user made, not whether it worked -- so this flag is the only
+        # place a caller can tell a failed stop from a real one. Checked by
+        # run_window_bar before it destroys the bar: closing the window on a
+        # failed stop would tell the user a still-running ~3 GB instance had
+        # gone away, with no console anywhere to say otherwise.
+        self.stop_failed = False
 
     def own(self, bar_hwnd, owner_hwnd):
         """Make the bar an owned window of the guest's window.
@@ -137,24 +146,40 @@ class WindowBar:
             return False
 
     def on_close(self, parent=None):
-        """The X was clicked. Returns "hide", "stop" or "cancel"."""
+        """The X was clicked. Returns "hide", "stop" or "cancel".
+
+        The return value is always the CHOICE the user made, never whether
+        it succeeded -- callers and tests both depend on that contract. A
+        "stop" hook that raises does not change the return value to
+        something else; it sets `self.stop_failed` instead (and writes the
+        reason to stderr for anyone with a console), so a caller can tell a
+        real stop from a failed one without this method lying about which
+        button was pressed.
+        """
         answer = _ask_close(parent)
-        try:
-            if answer == "hide":
-                hostwin.hide_qemu_window(self.identity)
-            elif answer == "stop" and self.on_stop:
+        self.stop_failed = False
+        if answer == "hide":
+            hostwin.hide_qemu_window(self.identity)
+        elif answer == "stop" and self.on_stop:
+            try:
                 self.on_stop(self.identity)
-        except Exception:      # noqa: BLE001 - a caller-supplied hook (or a
-            # host call) must not blow up the close prompt's caller.
-            pass
+            except Exception as e:      # noqa: BLE001 - the hook is
+                # caller-supplied and must not blow up the close prompt's
+                # caller; record it instead of hiding it.
+                self.stop_failed = True
+                sys.stderr.write(
+                    f"window bar: stop hook for '{self.identity}' failed: "
+                    f"{e}\n")
         return answer
 
 
 def run_window_bar(identity, title=None, pid=None, on_stop=None):
     """Show the guest's window with our bar above it. Blocks until closed.
 
-    Returns 0 when the bar ran, 2 when there was no window to attach to, and
-    3 on a host where this is not implemented.
+    Returns 0 when the bar ran, 2 when there was no window to attach to, 3 on
+    a host where this is not implemented, and 4 when the bar's own top-level
+    handle could not be resolved (see below) -- a distinct code from 2/3
+    because it is neither "no window" nor "wrong platform".
     """
     if not IS_WINDOWS:
         sys.stderr.write(
@@ -176,14 +201,24 @@ def run_window_bar(identity, title=None, pid=None, on_stop=None):
 
     bar = WindowBar(identity, pid=pid, on_stop=on_stop)
     # GetAncestor(GA_ROOT): Tk's winfo_id() is the widget's HWND, which is not
-    # always the top-level one. Owning the wrong handle silently does nothing.
+    # always the top-level one. Owning the wrong handle silently does
+    # nothing at all -- no error, no effect -- so a failure to resolve it is
+    # NOT a degraded mode to fall back from. It is treated as a hard failure:
+    # do not attach, do not open a bar. Falling back to the widget handle
+    # would produce a bar that looks fine but never floats above its owner
+    # and never minimises with it, with no diagnostic trail at all -- exactly
+    # the class of silent misfeature this whole design exists to remove.
     try:
         bar_hwnd = _user32().GetAncestor(root.winfo_id(), GA_ROOT)
-    except Exception:      # noqa: BLE001 - fall back to the widget's own
-        # handle rather than crash the bar; own() still guards IS_WINDOWS and
-        # a wrong handle only costs the floating/minimise behaviour, not a
-        # boot.
-        bar_hwnd = root.winfo_id()
+    except Exception:      # noqa: BLE001
+        bar_hwnd = None
+    if not bar_hwnd:
+        root.destroy()
+        sys.stderr.write(
+            f"window bar: could not resolve the top-level window handle "
+            f"for '{identity}' (GetAncestor failed); not attaching a bar "
+            f"it could not actually own\n")
+        return 4
     bar.own(bar_hwnd, owner)
 
     rect = hostwin.window_geometry(identity, pid=pid)
@@ -191,7 +226,12 @@ def run_window_bar(identity, title=None, pid=None, on_stop=None):
         bar.follow(rect)
 
     def on_delete():
-        if bar.on_close(root) in ("hide", "stop"):
+        answer = bar.on_close(root)
+        # A failed stop must NOT close the bar -- an open bar is the only
+        # signal that reaches the user when this process has no console
+        # (Task 5 spawns it detached), and destroying it here would look
+        # exactly like a successful stop.
+        if answer == "hide" or (answer == "stop" and not bar.stop_failed):
             root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_delete)
