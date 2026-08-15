@@ -521,3 +521,41 @@ reports slots ready.
 
 An unmeasured place gets the default and may OOM. Measure a place before
 promising a fleet size for it.
+
+## The warm pool, measured end to end
+
+*2026-08-15, Windows/WHPX, PS99, x86 base, farming.*
+
+```
+pool fill --size 1 --mode farming --place 8737899170
+    slot ready in                     34.8 s
+
+start <acct> --place 8737899170 --mode farming
+    guest RAM raised to 3072 MB for place 8737899170
+    guest clock resynced (was -18s behind host)
+    warm pool: took slot _pool0 — no boot needed
+    timings.stages.boot               0.093 s      (cold: 35-60 s)
+    timings.stages.session_delivered  0.52 s
+    timings.stages.density_settled    147.9 s
+    client.in_world                   true
+```
+
+**A snapshot would be slower than this, not faster.** Reproduced on QEMU
+11.0.50 here: under `-accel whpx` all three save paths (`migrate`, `savevm`,
+QMP `migrate`) refuse with the same blocker, while the same binary under
+`-accel tcg` snapshots fine — so the machinery works and WHPX is fenced off.
+The only route is a patched QEMU with the blocker removed, which is exactly
+what Google's Android Emulator fork does. Even then, `loadvm` has to read
+~2.2 GB of guest RAM off disk; the pool hands over a live slot in 0.08 s. A
+snapshot's value here would be **capacity** (parking idle instances to disk)
+and surviving a host reboot — never latency.
+
+HVF (macOS/arm64) and KVM register no such blocker, so the warm CACHE stays
+enabled there. Neither was exercised this session.
+
+**The clock is why adoption is not just "hand over a pid".** A slot is a live
+VM whose clock ticks, so the usual answer is "nothing to do" — but a desktop
+SLEEPS, and a guest that wakes behind fails Roblox auth and TLS with a symptom
+indistinguishable from a dead cookie. The resync runs on every adoption, costs
+one adb round trip when there is nothing to fix, and corrected 18 s on a slot
+that was 35 seconds old.
