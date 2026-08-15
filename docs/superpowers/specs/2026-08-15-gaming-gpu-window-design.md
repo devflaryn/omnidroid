@@ -79,8 +79,21 @@ from `XSetTransientForHint`.
 
 The close button has to be ours because it cannot be anyone else's: one process
 cannot intercept another's `WM_CLOSE` without DLL injection, so QEMU is spawned
-`window-close=off` (its own X is inert and is stripped from the caption) and the
-prompt lives on the strip.
+`window-close=off` and the prompt lives on the strip.
+
+**Which means QEMU's window gives up its whole caption, not just its close
+box.** A strip above a window that still has a title bar puts two title bars on
+screen — the exact trap `embedview.py` documents ("the guest appears inside our
+viewer wearing a second title bar it is impossible to click"). So `WS_CAPTION`
+goes and `WS_THICKFRAME` stays: the composite is resized by dragging QEMU's own
+window edges, the strip follows via the location hook, and the strip *is* the
+title bar — our title, our icon, minimise, and the X. DWM styling (dark mode,
+rounded corners, border colour) therefore applies to the strip, which is the
+window that has a caption.
+
+The user's choice was "restyled chrome" over "frameless"; this delivers that,
+with the caption being ours rather than the OS's — which is what asking on close
+requires.
 
 ### 3b. Per-platform mechanism
 
@@ -90,10 +103,21 @@ prompt lives on the strip.
 | Linux | `virtio-gpu-gl-pci` + `-display gtk,gl=on` | X11 from outside: `_MOTIF_WM_HINTS`, `_NET_WM_ICON`, `XSetTransientForHint` | strip |
 | macOS | `virtio-gpu-gl-pci` + `-display cocoa,gl=es` | **compiled into our QEMU build** — macOS has no public API to restyle another process's `NSWindow`, only the private `CGSSetWindowParent` | the patch |
 
-Common QEMU flags on a gaming boot:
-`-display <backend>,gl=<...>,show-menubar=off,window-close=off,zoom-to-fit=on`
-and `-name "omni-<account>"`, which is the identity everything finds the window
-by.
+Window flags on a gaming boot are **backend-specific**, because the backends do
+not take the same suboptions and QEMU rejects an unknown one outright:
+
+| backend | flags |
+|---|---|
+| `gtk` | `gl=on,show-menubar=off,window-close=off,zoom-to-fit=on` |
+| `sdl` | `gl=on,window-close=off` — no `show-menubar`, no `zoom-to-fit` |
+| `cocoa` | `gl=es,zoom-to-fit=on` — no `show-menubar`, **no `window-close`** |
+
+`-name "omni-<account>"` is unchanged and is the identity everything finds the
+window by. macOS having no `window-close=off` is one more reason its close
+behaviour comes from the QEMU patch rather than from outside.
+
+The strip is built on **tkinter and ctypes only**. This project ships no
+third-party dependencies, and that rule is not relaxed for a viewer.
 
 **`gl=es` on macOS is a requirement, not a preference.** macOS deprecated
 OpenGL for Metal, so its QEMU goes through ANGLE, which speaks GL ES; `gl=on`
