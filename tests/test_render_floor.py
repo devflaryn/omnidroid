@@ -42,10 +42,32 @@ def _first(steps, needle):
 
 
 class TheMinimalProfile(unittest.TestCase):
-    def test_minimal_is_a_quality_name(self):
-        self.assertIn("minimal", lean.QUALITY_PROFILES)
-        self.assertIs(lean.app_settings_for("minimal"),
-                      lean.MINIMAL_APP_SETTINGS)
+    """`minimal` is a TOMBSTONE, not a profile. Measured 2026-08-15 on PS99,
+    in-world, four runs: its 320x180 panel killed the client every time it was
+    applied -- process gone, `screencap` solid black, guest MemAvailable
+    jumping ~591 MB -> ~2227 MB as the game's 1.6 GB was released -- including
+    after the sequence was changed to resize only ONCE, which is what ruled
+    out "a second mid-session wm size" as the cause. And its other half, 3 fps
+    instead of 5, was indistinguishable from `low` in guest idle (19-27% vs
+    24-35%), because the guest is CPU-bound on arm64 translation rather than
+    fill-bound.
+
+    The dicts stay defined as the record of what was tried. What must not come
+    back is `minimal` being SELECTABLE."""
+
+    def test_minimal_is_not_selectable(self):
+        self.assertNotIn("minimal", lean.QUALITY_PROFILES)
+        self.assertIsNone(lean.app_settings_for("minimal"))
+
+    def test_the_fatal_panel_is_unreachable_even_by_name(self):
+        """argparse refuses `--quality minimal` now, but a programmatic caller
+        could still hand the string to the squeeze. It must not resize."""
+        self.assertEqual(lean.display_for_quality("minimal"),
+                         lean.FARMING_DISPLAY)
+
+    def test_the_record_of_what_was_tried_is_kept(self):
+        self.assertEqual(lean.MINIMAL_DISPLAY, (320, 180, 60))
+        self.assertIn(FPS, lean.MINIMAL_APP_SETTINGS)
 
     def test_it_ticks_slower_than_low(self):
         """The tick target caps the WHOLE engine loop, which is why it was
@@ -85,9 +107,13 @@ class TheMinimalProfile(unittest.TestCase):
 
 
 class TheMinimalPanel(unittest.TestCase):
-    def test_display_for_quality_shrinks_only_minimal(self):
+    def test_display_for_quality_shrinks_nothing_any_more(self):
+        """`minimal` was the only profile that shrank, and its panel killed
+        the client (see TheMinimalProfile). The function stays because the
+        squeeze calls it; what it must never do again is return a panel
+        smaller than the mode asked for."""
         self.assertEqual(lean.display_for_quality("minimal"),
-                         lean.MINIMAL_DISPLAY)
+                         lean.FARMING_DISPLAY)
         self.assertEqual(lean.display_for_quality("low"), lean.FARMING_DISPLAY)
 
     def test_an_unknown_quality_keeps_the_default_panel(self):
@@ -142,28 +168,24 @@ class TheRenderStep(unittest.TestCase):
         self.assertGreater(render, _first(steps, "wm size"))
         self.assertLess(render, _first(steps, "pm disable-user"))
 
-    def test_minimal_resizes_ONCE_because_twice_kills_the_client(self):
-        """MEASURED 2026-08-15, PS99, in-world, `--quality minimal`.
+    def test_no_squeeze_ever_shrinks_below_the_modes_own_panel(self):
+        """MEASURED 2026-08-15, PS99, in-world, four runs.
 
-        The floor used to arrive as a SECOND `wm size` (480x270 -> 320x180)
-        after the mode's own. That killed the client outright: the Roblox
-        process was gone, `screencap` returned solid black, the guest's
-        MemAvailable jumped 591 MB -> 2202 MB as its 1.6 GB was released, and
-        the guest fell to 200% idle -- which reads exactly like the "engine
-        deadlocks rather than crawls" signature this project already has a
-        section about, and is NOT that. It is simply dead.
+        The floor's 320x180 panel KILLS the client. First seen when it arrived
+        as a second `wm size` after the mode's own, which made "two resizes"
+        the obvious suspect; folding it into a single resize and running it
+        again killed the client just the same -- process gone, `screencap`
+        solid black, guest MemAvailable jumping ~591 MB -> ~2227 MB as the
+        game's 1.6 GB was released. The panel itself is fatal, not the number
+        of times it is set. 480x270 is measured in-world repeatedly.
 
-        The control settles it: the same boot with `OMNI_FARM_SKIP=render` --
-        identical 3 fps ClientAppSettings, no second resize -- stayed alive and
-        in-world at PSS 1349 MB, with CPU indistinguishable from a `low` boot.
-
-        So one configuration change delivered to a running Roblox client is
-        survivable and two are not, and the floor's panel has to arrive as the
-        FIRST and only resize."""
-        steps = self._minimal()
-        sizes = [s for s in steps if s[:3] == ["shell", "wm", "size"]]
-        self.assertEqual(sizes, [["shell", "wm", "size", "320x180"]])
-        self.assertIn(["shell", "wm", "density", "60"], steps)
+        So `minimal` is gone from QUALITY_PROFILES and no quality string --
+        including one handed in programmatically -- may shrink the panel."""
+        for quality in ("low", "minimal", "balanced", "high", "ultra", None):
+            steps = self._minimal(quality=quality)
+            sizes = [s for s in steps if s[:3] == ["shell", "wm", "size"]]
+            self.assertEqual(sizes, [["shell", "wm", "size", "480x270"]],
+                             f"quality={quality!r} resized below the mode")
 
     def test_a_normal_farming_boot_gets_no_second_resize(self):
         """`low` already IS the mode's panel, so the floor must emit nothing
@@ -223,17 +245,19 @@ class TheRenderStep(unittest.TestCase):
 
     def test_quality_falls_back_to_the_mode_s_own(self):
         """A caller that does not care still gets the right thing: farming's
-        mode entry carries `quality`, so the sequence can resolve it."""
+        mode entry carries `quality`, so the sequence can resolve it. It
+        resolves to the mode's panel now, because the smaller one is fatal."""
         mode = dict(MODES["farming"], quality="minimal")
-        self.assertIn("320x180", _flat(farming.build_squeeze_sequence(mode)))
+        self.assertIn("480x270", _flat(farming.build_squeeze_sequence(mode)))
+        self.assertNotIn("320x180", _flat(farming.build_squeeze_sequence(mode)))
 
     def test_it_is_deterministic(self):
         self.assertEqual(self._minimal(), self._minimal())
 
     @staticmethod
-    def _minimal(skip=()):
+    def _minimal(skip=(), quality="minimal"):
         return farming.build_squeeze_sequence(dict(MODES["farming"]),
-                                              skip=skip, quality="minimal")
+                                              skip=skip, quality=quality)
 
 
 class QuotingSurvivesTheRenderFloor(unittest.TestCase):

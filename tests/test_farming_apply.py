@@ -66,13 +66,19 @@ class TheRenderFloorReachesTheDevice(unittest.TestCase):
         flat = " ".join(" ".join(c) for c in self._run())
         self.assertIn("animator_duration_scale", flat)
 
-    def test_a_minimal_quality_mode_sends_the_smaller_panel(self):
-        """The mode dict alone is enough to select the floor, so the engine
-        can wire `--quality minimal` through without a new argument."""
+    def test_a_minimal_quality_mode_no_longer_sends_a_smaller_panel(self):
+        """MEASURED 2026-08-15, PS99, in-world: the 320x180 panel KILLS the
+        client — process gone, `screencap` solid black, guest MemAvailable
+        jumping ~591 MB -> ~2227 MB as the game's 1.6 GB was released. It did
+        so both as a second `wm size` and, after the sequence was folded to
+        resize once, as the only one. The panel is fatal, not the repetition.
+
+        Asserted at the ADB layer rather than only on the builder, because the
+        thing that must never reach a live guest again is this argv."""
         mode = dict(MODES["farming"], quality="minimal")
         flat = " ".join(" ".join(c) for c in self._run(mode))
-        self.assertIn("wm size 320x180", flat)
-        self.assertIn("wm density 60", flat)
+        self.assertNotIn("320x180", flat)
+        self.assertIn("wm size 480x270", flat)
 
     def test_OMNI_FARM_SKIP_render_removes_exactly_that_step(self):
         full = self._run()

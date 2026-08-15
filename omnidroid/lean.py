@@ -270,7 +270,12 @@ def display_for_quality(quality, default=FARMING_DISPLAY):
     an absent one. Somebody who asked for the native panel and the render
     floor together gets the panel they asked for; the rest of the floor still
     applies."""
-    if quality == "minimal" and default is not None:
+    # Gated on the profile being LIVE, not just on the name. `minimal` was
+    # removed from QUALITY_PROFILES after its panel was measured to kill the
+    # client (see the comment there); leaving this reachable by name would let
+    # a programmatic caller re-apply the one setting that is known to be fatal
+    # while argparse quietly refuses the same string on the command line.
+    if quality in QUALITY_PROFILES and quality == "minimal" and default is not None:
         return MINIMAL_DISPLAY
     return default
 
@@ -495,11 +500,34 @@ PLAYABLE_APP_SETTINGS = {
 # BELOW `low` rather than beside it. `low` is the measured farming profile and
 # stays the default for the density mode; `minimal` is the opt-in floor for
 # "as many instances as this host will hold", and it is unverified in-world.
+# `minimal` IS DELIBERATELY NOT HERE. It was a render floor -- 3 fps instead
+# of 5, and a 320x180 panel instead of 480x270 -- and it was measured on
+# 2026-08-15 against PS99, in-world, four runs. Both halves failed, in
+# opposite ways:
+#
+#   * the 320x180 panel KILLS THE CLIENT. Every run that applied it ended with
+#     the Roblox process gone, `screencap` solid black, and the guest's
+#     MemAvailable jumping ~591 MB -> ~2227 MB as its 1.6 GB was released.
+#     Twice, and then once more after the sequence was changed to resize only
+#     ONCE, which is what ruled out "a second mid-session `wm size`" as the
+#     cause: the small panel itself is fatal. 480x270 is fine and is measured
+#     in-world repeatedly.
+#   * 3 fps buys NOTHING. Guest idle at 3 fps (19-27%) is indistinguishable
+#     from idle at 5 fps (24-35%). That is consistent with what MODES.md
+#     already says about resolution -- the guest is CPU-bound on arm64
+#     translation, not fill-bound, so no render setting reaches where the
+#     150% actually goes (libndk_translation).
+#
+# So the profile is removed from the map rather than left selectable: keeping
+# it would mean shipping a `--quality` value whose only measured effect is to
+# kill the game. MINIMAL_APP_SETTINGS and MINIMAL_DISPLAY stay defined as the
+# record of what was tried, in the same spirit as glmask.py's tombstone. If
+# you want to re-open this, the lever with room in it is `-m` and the scratch
+# disk, not the renderer.
 QUALITY_PROFILES = {
-    "minimal": MINIMAL_APP_SETTINGS,   # render floor: 3 fps, 320x180 panel
     "low": CLIENT_APP_SETTINGS,        # farming: 5 fps, lowest everything
     "balanced": GAMING_APP_SETTINGS,   # max fps, effects off
-    "high": PLAYABLE_APP_SETTINGS,     # real render; playable/gaming default
+    "high": PLAYABLE_APP_SETTINGS,     # real render; gaming default
 }
 
 
