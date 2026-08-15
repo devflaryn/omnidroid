@@ -116,5 +116,31 @@ class ChromeElsewhere(unittest.TestCase):
         self.assertIn("macos", result["reason"].lower())
 
 
+class ChromeOnLinuxIsDeferredAndSaysSo(unittest.TestCase):
+    """Linux keeps QEMU's own frame until a host has verified a replacement.
+
+    The reason has to name the state -- 'not implemented yet' -- rather than
+    read as a failure, because nothing is broken: the window works, the guest
+    renders on the GPU, and the VNC viewer is still there. Only the chrome is
+    missing.
+    """
+
+    def test_an_x11_backend_declines_with_a_deferral_not_an_error(self):
+        for name in (hostwin.BACKEND_XDOTOOL, hostwin.BACKEND_WMCTRL,
+                     hostwin.BACKEND_XLIB):
+            with mock.patch.object(hostwin, "backend", return_value=name):
+                result = hostwin.apply_chrome("omni-farm3")
+            self.assertFalse(result["applied"])
+            self.assertIn("not implemented", result["reason"].lower())
+            self.assertIn("linux", result["reason"].lower())
+
+    def test_the_decline_never_raises_and_never_blocks_a_boot(self):
+        with mock.patch.object(hostwin, "backend",
+                               return_value=hostwin.BACKEND_XLIB):
+            result = hostwin.apply_chrome("omni-farm3")
+        self.assertIsInstance(result, dict)
+        self.assertIn("hwnd", result)
+
+
 if __name__ == "__main__":
     unittest.main()

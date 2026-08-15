@@ -807,11 +807,19 @@ def apply_chrome(identity, pid=None, icon=None, geometry=None,
     failed boot.
     """
     name = backend()
+    if name in (BACKEND_XDOTOOL, BACKEND_WMCTRL, BACKEND_XLIB):
+        return _chrome_result(
+            False,
+            "window chrome is not implemented on Linux yet: the window keeps "
+            "QEMU's own frame. Nothing is broken -- the guest renders on the "
+            "GPU and the VNC viewer works. _MOTIF_WM_HINTS is the route and "
+            "it will be written against a real host rather than guessed at.")
     if name != BACKEND_WIN32:
         return _chrome_result(
             False,
-            f"restyling another process's window is implemented for Windows "
-            f"only; this host's backend is {name}")
+            f"restyling another process's window is not implemented for "
+            f"backend {name}; on macOS the chrome comes from our own QEMU "
+            f"build instead")
     hwnd = find_window(identity, timeout=timeout, pid=pid)
     if hwnd is None:
         return _chrome_result(False, f"no window found for '{identity}'")
