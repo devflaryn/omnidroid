@@ -210,6 +210,21 @@ class NothingHappensAndNothingRaises(unittest.TestCase):
             self.assertIsNone(hostwin.keep_hidden(""))
         self.assertEqual(h.argvs, [])
 
+    def test_a_platform_none_of_the_three_flags_recognise_is_also_a_no(self):
+        # Recovered from tests/test_hidden_window_viewer.py (pre-Task-5,
+        # commit ef52be7) -- distinct from every other case in this class:
+        # those all pick ONE of win/linux/mac True via host(), which exercises
+        # a real backend's own "no tool available" branch. Patching just
+        # IS_WINDOWS False here, with IS_LINUX/IS_MACOS left at this box's
+        # real (also False) values, is the only place _detect_backend's final
+        # catch-all ("hiding windows is not implemented for this platform")
+        # gets exercised at all.
+        with mock.patch.object(hostwin, "IS_WINDOWS", False):
+            self.assertIsNone(hostwin.find_window("omni-x"))
+            self.assertFalse(hostwin.hide_qemu_window("omni-x"))
+            self.assertFalse(hostwin.window_is_visible("omni-x"))
+            self.assertIsNone(hostwin.keep_hidden("omni-x"))
+
 
 class MacOsHidesTheApplication(unittest.TestCase):
     """There is no per-window API for another process on macOS, so the unit is
