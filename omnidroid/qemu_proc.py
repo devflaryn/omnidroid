@@ -334,9 +334,24 @@ _WINDOW_FLAGS = {
 def window_flags(backend):
     """Comma-joined suboptions for a presented window on `backend`.
 
+    Gated on _WINDOW_PRESENT_PLATFORMS (defined below, near gpu_policy() —
+    resolved at call time, so the forward reference is fine): these
+    suboptions are OUR chrome policy, not QEMU's defaults, and we do not
+    impose chrome on a platform we cannot run. QEMU refuses an unknown
+    suboption OUTRIGHT rather than ignoring it, so if the assumption that
+    Linux's gtk accepts all three turns out wrong, `--gpu window` on Linux
+    (a real, explicit escape hatch -- not just the gated `auto` path) would
+    stop booting entirely rather than degrade, and that assumption is
+    UNTESTED there. Linux therefore keeps QEMU's bare backend/gl argv,
+    unchanged from before this file grew window_flags(), until a Linux host
+    verifies the suboptions -- exactly the same gate _presents_a_window()
+    already applies, and the same flip re-enables both at once.
+
     An unrecognised backend gets "" rather than a guess: an unknown suboption
     is a refused boot, and no flag at all is merely a plainer window.
     """
+    if _platform_key() not in _WINDOW_PRESENT_PLATFORMS:
+        return ""
     return ",".join(_WINDOW_FLAGS.get(backend, ()))
 
 
