@@ -169,10 +169,32 @@ class ArmBootUsesTheHostCapability(unittest.TestCase):
         self.assertIn("-device virtio-gpu-pci", cmd)
         self.assertIn("-display none", cmd)
 
-    def test_farming_stays_headless_even_when_a_window_is_on_offer(self):
-        # Fifty QEMU windows is not a product, and a 5-fps-capped instance
-        # nobody watches gains almost nothing from the GPU.
+    def test_farming_takes_the_gpu_through_a_hidden_window(self):
+        """"A 5-fps-capped instance nobody watches gains almost nothing from
+        the GPU" was the old rationale here, and it is WRONG. Measured
+        2026-08-15 on PS99, in-world, per-thread out of /proc:
+
+            software          GPU (hidden GL window)
+            llvmpipe-1 52.8%  (gone)
+            llvmpipe-0 51.8%  (gone)
+            TOTAL     141.1%  TOTAL 72.3%
+
+        Three quarters of a software farming instance's CPU is llvmpipe
+        rasterising frames nobody looks at, and CPU is exactly the scarce
+        thing in a density boot. "Fifty QEMU windows is not a product" still
+        holds -- which is why the policy is `auto` and not `window`: the
+        window is opened only because this host has no other route to a GL
+        context, and is then hidden."""
         cmd = _cmd("farming", GL_CAP, headless_gl=False)
+        self.assertIn("-device virtio-gpu-gl-pci", cmd)
+        self.assertIn("gl=on", cmd)
+        # QEMU refuses -vnc beside a GL context; screenshot goes via adb.
+        self.assertNotIn("-vnc 127.0.0.1:", cmd)
+
+    def test_farming_still_degrades_to_software_with_no_gpu(self):
+        """A real headless farm box has no window server. `auto` must find
+        nothing and fall back, not fail."""
+        cmd = _cmd("farming", NO_CAP, headless_gl=False)
         self.assertIn("-display none", cmd)
         self.assertIn("-vnc 127.0.0.1:", cmd)
 
@@ -248,10 +270,12 @@ class X86GetsTheSameTreatment(unittest.TestCase):
         self.assertIn("-display egl-headless", cmd)
         self.assertIn("-vnc 127.0.0.1:", cmd)
 
-    def test_farming_stays_headless_on_x86(self):
+    def test_farming_takes_the_gpu_on_x86_too(self):
+        """The 141.1% -> 72.3% measurement was taken on the x86 base, which is
+        the one the product ships on."""
         cmd = _cmd("farming", GL_CAP, base="x86")
-        self.assertIn("-display none", cmd)
-        self.assertNotIn("gl=on", cmd)
+        self.assertIn("gl=on", cmd)
+        self.assertIn("-device virtio-gpu-gl-pci", cmd)
 
     def test_the_physical_mode_is_NOT_forced_by_default(self):
         # `video=Virtual-1:<mode>` looked like the fix for a GL boot coming up

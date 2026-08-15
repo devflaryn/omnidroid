@@ -680,7 +680,44 @@ MODES = {
                 "swappiness": 100, "swappiness_x86": 10,
                 "zram": True,
                 "usb": True, "display": lean.FARMING_DISPLAY,
-                "panel": FARMING_PANEL, "gpu": GPU_HEADLESS,
+                # GPU_AUTO, not GPU_HEADLESS, and this is the single biggest
+                # density lever measured on this project.
+                #
+                # MEASURED 2026-08-15, PS99, in-world, farming, per-THREAD out
+                # of /proc/<pid>/task/*/stat over 20 s:
+                #
+                #   software (GPU_HEADLESS)          GPU (hidden GL window)
+                #   ------------------------------   ----------------------
+                #   llvmpipe-1      52.8%            (gone)
+                #   llvmpipe-0      51.8%            (gone)
+                #    RBX Worker A    6.8%             RBX Worker A   17.3%
+                #   ------------------------------   ----------------------
+                #   TOTAL          141.1%            TOTAL          72.3%
+                #
+                # THREE QUARTERS of a software farming instance's CPU is
+                # llvmpipe rasterising frames nobody looks at. Moving that to
+                # the host GPU halves the per-instance cost, which is the
+                # thing that decides how many instances a host can hold --
+                # and it is why the fps cap and the smaller panel both
+                # measured as nothing: they throttle Roblox's scheduler and
+                # its pixel count, not the software rasteriser's per-frame
+                # work.
+                #
+                # `auto` and not `window`: an explicit `window` request means
+                # "I want to see it", so _hide_window_if_wanted deliberately
+                # leaves it on screen. `auto` opens the window only because
+                # this host has no other route to a GL context, then HIDES it
+                # -- verified, the guest keeps rendering while invisible.
+                #
+                # It degrades correctly rather than bravely: on a host with no
+                # window server (a real headless farm box) `auto` finds no
+                # display and falls back to software, which is exactly the old
+                # behaviour. The cost where it does engage is VNC -- QEMU
+                # refuses `-vnc` beside a GL context -- so `capture`/`autocap`
+                # are unavailable and `omnidroid view` uses the embedded
+                # window instead. `screenshot` goes through adb and is
+                # unaffected, which is what farming actually needs.
+                "panel": FARMING_PANEL, "gpu": GPU_AUTO,
                 "profile": "density", "quality": "low"},
 }
 DEFAULT_MODE = "gaming"
