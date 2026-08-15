@@ -41,6 +41,9 @@ class ViewShowsTheWindowAndItsBar(unittest.TestCase):
              mock.patch("omnidroid.engine._run_record",
                         return_value={"identity": "omni-farm3", "pid": 4242,
                                       "display_kind": "gl-window"}), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=1), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
              mock.patch("omnidroid.hostwin.apply_chrome",
                         side_effect=lambda *a, **k: calls.append("chrome")
                         or {"applied": True, "reason": "", "hwnd": 1}), \
@@ -50,6 +53,208 @@ class ViewShowsTheWindowAndItsBar(unittest.TestCase):
                         side_effect=lambda *a, **k: calls.append("bar")):
             engine.cmd_view(_args(name="farm3"))
         self.assertEqual(calls, ["chrome", "show", "bar"])
+
+    def test_show_is_given_the_pid_so_a_title_substring_cannot_hit_the_wrong_window(self):
+        # e.g. omni-farm3 vs omni-farm30 with several gaming instances up.
+        seen = {}
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=1), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
+             mock.patch("omnidroid.hostwin.apply_chrome",
+                        return_value={"applied": True, "reason": "",
+                                      "hwnd": 1}), \
+             mock.patch("omnidroid.hostwin.show_qemu_window",
+                        side_effect=lambda *a, **k: seen.update(
+                            args=a, kwargs=k)), \
+             mock.patch("omnidroid.engine._spawn_window_bar"):
+            engine.cmd_view(_args(name="farm3"))
+        self.assertEqual(seen["kwargs"].get("pid"), 4242)
+
+
+class AWindowThatIsGenuinelyNotThereFailsFast(unittest.TestCase):
+    """A missing window and a window whose STYLING failed are different,
+    honest problems -- conflating them told the user "cosmetic problem,
+    rendering unaffected" and then opened an empty desktop."""
+
+    def _fail_recorder(self):
+        """Wrap engine.fail so the CODE it was called with can be asserted
+        on, not just that some SystemExit happened -- same pattern as
+        test_session.py's _fail_recorder."""
+        calls = []
+        orig_fail = engine.fail
+
+        def _wrapped(code, *a, **k):
+            calls.append(code)
+            return orig_fail(code, *a, **k)
+        return calls, mock.patch.object(engine, "fail", side_effect=_wrapped)
+
+    def test_a_missing_window_fails_instead_of_opening_an_empty_desktop(self):
+        fail_calls, fail_patch = self._fail_recorder()
+        touched = []
+        with fail_patch, \
+             mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=None), \
+             mock.patch("omnidroid.hostwin.apply_chrome",
+                        side_effect=lambda *a, **k: touched.append("chrome")), \
+             mock.patch("omnidroid.hostwin.show_qemu_window",
+                        side_effect=lambda *a, **k: touched.append("show")), \
+             mock.patch("omnidroid.engine._spawn_window_bar",
+                        side_effect=lambda *a, **k: touched.append("bar")):
+            with self.assertRaises(SystemExit):
+                engine.cmd_view(_args(name="farm3"))
+        self.assertEqual(fail_calls, ["no_window"])
+        # Chrome/show/bar must never run against a window that is not there.
+        self.assertEqual(touched, [])
+
+    def test_the_probe_uses_a_short_timeout_not_apply_chromes_twenty_second_default(self):
+        # The deleted embedded-viewer probe used timeout=2; apply_chrome's
+        # own DEFAULT_TIMEOUT is 20s, sized for "wait at spawn", not for a
+        # `view` that must fail fast when the window is simply gone.
+        seen = {}
+
+        def fake_find_window(_identity, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            return None
+
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.hostwin.find_window",
+                        side_effect=fake_find_window):
+            with self.assertRaises(SystemExit):
+                engine.cmd_view(_args(name="farm3"))
+        self.assertEqual(seen.get("timeout"), 2)
+
+
+class ASecondViewDoesNotStackASecondBar(unittest.TestCase):
+    """The old embedded-viewer path answered a second `view` with "a viewer
+    already has this instance's window; bringing it forward" -- removing the
+    reparenting hazard is not a reason to remove that handling."""
+
+    def test_a_live_bar_is_brought_forward_and_no_second_one_spawns(self):
+        shown = []
+        spawned = []
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=1), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=9999), \
+             mock.patch("omnidroid.hostwin.show_qemu_window",
+                        side_effect=lambda *a, **k: shown.append((a, k))), \
+             mock.patch("omnidroid.hostwin.apply_chrome") as chrome, \
+             mock.patch("omnidroid.engine._spawn_window_bar",
+                        side_effect=lambda *a, **k: spawned.append(1)):
+            engine.cmd_view(_args(name="farm3"))
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(shown[0][1].get("pid"), 4242)
+        self.assertEqual(spawned, [])   # no second bar
+        chrome.assert_not_called()      # no need to restyle an already-open window
+
+    def test_a_dead_pid_file_falls_through_to_a_normal_spawn(self):
+        spawned = []
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=1), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
+             mock.patch("omnidroid.hostwin.apply_chrome",
+                        return_value={"applied": True, "reason": "",
+                                      "hwnd": 1}), \
+             mock.patch("omnidroid.hostwin.show_qemu_window"), \
+             mock.patch("omnidroid.engine._spawn_window_bar",
+                        side_effect=lambda *a, **k: spawned.append(1)):
+            engine.cmd_view(_args(name="farm3"))
+        self.assertEqual(spawned, [1])
+
+
+class TheBarsPidFileTracksItsLifetime(unittest.TestCase):
+    """`_running_window_bar_pid` reads what `_write_window_bar_pid` writes
+    and what `_run_windowbar`'s `finally` clears -- the plumbing under
+    ASecondViewDoesNotStackASecondBar, tested directly against a real
+    temp directory rather than mocked out."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self._tmp, ignore_errors=True))
+
+    def test_no_file_means_no_bar(self):
+        with mock.patch.object(engine, "runtime_dir",
+                               return_value=self._tmp):
+            self.assertIsNone(engine._running_window_bar_pid("u1"))
+
+    def test_a_live_pid_is_reported(self):
+        with mock.patch.object(engine, "runtime_dir",
+                               return_value=self._tmp), \
+             mock.patch.object(engine, "pid_alive", return_value=True):
+            engine._write_window_bar_pid("u1", 4242)
+            self.assertEqual(engine._running_window_bar_pid("u1"), 4242)
+
+    def test_a_dead_pid_reads_as_no_bar(self):
+        with mock.patch.object(engine, "runtime_dir",
+                               return_value=self._tmp), \
+             mock.patch.object(engine, "pid_alive", return_value=False):
+            engine._write_window_bar_pid("u1", 4242)
+            self.assertIsNone(engine._running_window_bar_pid("u1"))
+
+    def test_a_corrupt_file_reads_as_no_bar_not_a_crash(self):
+        with mock.patch.object(engine, "runtime_dir",
+                               return_value=self._tmp):
+            (self._tmp / "windowbar.pid").write_text("not-a-pid")
+            self.assertIsNone(engine._running_window_bar_pid("u1"))
+
+    def test_clearing_removes_the_file_and_is_safe_when_there_is_none(self):
+        with mock.patch.object(engine, "runtime_dir",
+                               return_value=self._tmp):
+            engine._write_window_bar_pid("u1", 4242)
+            engine._clear_window_bar_pid("u1")
+            self.assertFalse((self._tmp / "windowbar.pid").exists())
+            engine._clear_window_bar_pid("u1")   # idempotent, does not raise
+
+    def test_run_windowbar_clears_the_pid_file_on_the_way_out(self):
+        with mock.patch.object(engine, "runtime_dir",
+                               return_value=self._tmp), \
+             mock.patch("omnidroid.windowbar.run_window_bar",
+                        return_value=0):
+            engine._write_window_bar_pid("u1", 4242)
+            a = type("Args", (), {"name": "u1", "identity": "omni-u1",
+                                  "title": None, "pid": None})()
+            engine._run_windowbar(a)
+        self.assertFalse((self._tmp / "windowbar.pid").exists())
 
 
 class WhenTheWindowIsHidden(unittest.TestCase):

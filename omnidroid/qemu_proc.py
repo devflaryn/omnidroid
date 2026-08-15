@@ -757,8 +757,8 @@ MODES = {
                 # display and falls back to software, which is exactly the old
                 # behaviour. The cost where it does engage is VNC -- QEMU
                 # refuses `-vnc` beside a GL context -- so `capture`/`autocap`
-                # are unavailable and `omnidroid view` uses the embedded
-                # window instead. `screenshot` goes through adb and is
+                # are unavailable and `omnidroid view` restyles and shows this
+                # same window instead. `screenshot` goes through adb and is
                 # unaffected, which is what farming actually needs.
                 "panel": FARMING_PANEL, "gpu": GPU_AUTO,
                 "profile": "density", "quality": "low"},

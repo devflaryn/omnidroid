@@ -120,6 +120,35 @@ class ClosePrompt(unittest.TestCase):
             self.assertEqual(bar.on_close(), "stop")
         self.assertTrue(bar.stop_failed)
 
+    def test_a_system_exit_from_the_hook_is_caught_not_let_through(self):
+        # cmd_stop ends in sys.exit(1) on a failed shutdown, and
+        # load_account (called first) does sys.exit(str) on a bad account --
+        # both raise SystemExit, which a bare `except Exception` does NOT
+        # catch. Uncaught, it would escape on_close, Tkinter would re-raise
+        # it out of mainloop(), and this detached, console-less process
+        # would simply vanish -- indistinguishable from a successful stop on
+        # an instance that may still be running with several GB attached.
+        def boom(_name):
+            raise SystemExit(1)
+
+        bar = windowbar.WindowBar("omni-farm3", on_stop=boom)
+        with mock.patch.object(windowbar, "_ask_close", return_value="stop"):
+            # Must not raise SystemExit out of on_close, and must still
+            # report the CHOICE the user made.
+            self.assertEqual(bar.on_close(), "stop")
+        self.assertTrue(bar.stop_failed)
+
+    def test_a_keyboard_interrupt_from_the_hook_still_propagates(self):
+        # The fix for SystemExit must not become a bare `except:` -- Ctrl-C
+        # during a stop has to actually interrupt the process.
+        def boom(_name):
+            raise KeyboardInterrupt()
+
+        bar = windowbar.WindowBar("omni-farm3", on_stop=boom)
+        with mock.patch.object(windowbar, "_ask_close", return_value="stop"):
+            with self.assertRaises(KeyboardInterrupt):
+                bar.on_close()
+
 
 if __name__ == "__main__":
     unittest.main()

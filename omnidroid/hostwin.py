@@ -252,15 +252,20 @@ def _window_pid(hwnd):
 def _walk_windows(visit):
     """Call `visit(hwnd)` for every top-level window AND every child of one.
 
-    THE CHILDREN MATTER, and leaving them out was a real defect. `EnumWindows`
-    lists only top-level windows -- so the moment the viewer embeds QEMU's
-    window (SetParent makes it a child), it disappears from the search. A
-    second `omnidroid view` on an already-embedded instance then found no
-    window and reported the guest's display as DESTROYED, which is a different
-    and much more alarming state than "you already have it open".
+    BELT-AND-BRACES, not load-bearing: nothing reparents QEMU's window today
+    -- `view` restyles it in place and puts our own bar above it as an OWNED
+    window, never a child (windowbar.py). This walk used to be load-bearing,
+    when an earlier viewer made QEMU's window a child via SetParent:
+    `EnumWindows` lists only top-level windows, so the moment that happened
+    the window disappeared from the search, and a second `omnidroid view`
+    found nothing and reported the guest's display as DESTROYED -- a far more
+    alarming state than "you already have it open". That viewer is gone, but
+    the walk stays: it costs one extra EnumChildWindows per top-level window,
+    and keeping it means a future caller that reparents something again does
+    not silently reintroduce the same failure.
 
-    One level of children is enough: QEMU's window is reparented directly onto
-    the viewer's frame, never deeper.
+    One level of children is enough for that case: a reparented window would
+    sit directly on its new parent, never deeper.
     """
     import ctypes
     from ctypes import wintypes
@@ -283,9 +288,11 @@ def _walk_windows(visit):
 def _enum_windows(match=None, pid=None):
     """[(hwnd, title)] for windows matching `match` in the title, `pid`, or both.
 
-    Matching on the PID is what makes this survive embedding and a retitled
-    window; the title match stays because the pid is not always to hand (the
-    engine spawns QEMU detached and a caller may only know the identity).
+    Matching on the PID is what makes this immune to a retitled window (and
+    would survive a window being made a child of something else, if anything
+    ever did that again -- see _walk_windows); the title match stays because
+    the pid is not always to hand (the engine spawns QEMU detached and a
+    caller may only know the identity).
     """
     found = []
 
@@ -691,8 +698,9 @@ def find_window(identity, timeout=DEFAULT_TIMEOUT, pid=None):
     records in run.json. Either alone finds the window; together they are
     unambiguous when several instances are up.
 
-    On Windows this searches CHILD windows too -- see _walk_windows for why
-    that is not optional once the viewer starts embedding.
+    On Windows this searches CHILD windows too -- belt-and-braces rather than
+    load-bearing today, since nothing reparents QEMU's window anymore (see
+    _walk_windows).
 
     THE HANDLE'S TYPE IS THE BACKEND'S: an HWND on Windows, an X11 window id on
     Linux, and on macOS the QEMU pid itself, because that platform hides

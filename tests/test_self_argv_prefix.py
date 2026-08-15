@@ -97,5 +97,79 @@ class SpawnedViewerCommand(unittest.TestCase):
         self.assertIn("18001", cmd)
 
 
+class SpawnedWindowBarCommand(unittest.TestCase):
+    """The command actually handed to Popen for the window-bar child.
+
+    This is the highest-consequence code in the gaming-window task: invisible
+    in every mocked-out test of cmd_view, fatal in every shipped release if
+    it ever regresses to the dev-only `[sys.executable, "-m", "omnidroid",
+    ...]` shape -- that shape works when this file is run as a script and
+    fails silently in the PyInstaller binary, exactly the failure
+    SpawnedViewerCommand above exists to pin for the RFB viewer. Mirrors it
+    line for line for `_spawn_window_bar`.
+    """
+
+    def _spawned_cmd(self, frozen, prefix, tmp):
+        from omnidroid import engine
+        seen = {}
+
+        class FakeProc:
+            pid = 4343
+
+        def fake_popen(cmd, **kw):
+            seen["cmd"] = cmd
+            return FakeProc()
+
+        if prefix is None:
+            os.environ.pop("OMNIDROID_SELF_ARGV", None)
+        else:
+            os.environ["OMNIDROID_SELF_ARGV"] = prefix
+
+        with mock.patch.object(engine.sys, "frozen", frozen, create=True), \
+             mock.patch.object(engine.sys, "executable", r"C:\App\omni-exec.exe"), \
+             mock.patch.object(engine.subprocess, "Popen", fake_popen), \
+             mock.patch.object(engine, "runtime_dir", return_value=tmp):
+            engine._spawn_window_bar("u1", "omni: u1", "omni-u1", 4242)
+        return seen["cmd"]
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self._tmp, ignore_errors=True))
+
+    def tearDown(self):
+        os.environ.pop("OMNIDROID_SELF_ARGV", None)
+
+    def test_an_embedding_host_gets_its_marker_first(self):
+        cmd = self._spawned_cmd(True, "--omnidroid", self._tmp)
+        self.assertEqual(cmd[0], r"C:\App\omni-exec.exe")
+        self.assertEqual(cmd[1], "--omnidroid")
+        self.assertEqual(cmd[2], "_windowbar")
+
+    def test_the_standalone_exe_is_unchanged(self):
+        cmd = self._spawned_cmd(True, None, self._tmp)
+        self.assertEqual(cmd[1], "_windowbar")
+
+    def test_the_identity_title_and_pid_still_reach_the_bar(self):
+        cmd = self._spawned_cmd(True, "--omnidroid", self._tmp)
+        self.assertIn("--identity", cmd)
+        self.assertIn("omni-u1", cmd)
+        self.assertIn("--pid", cmd)
+        self.assertIn("4242", cmd)
+
+    def test_the_non_frozen_dev_shape_reinvokes_this_file_not_dash_m(self):
+        # NOT [sys.executable, "-m", "omnidroid", ...] -- that shape has no
+        # entry point once frozen. Same non-frozen shape as _vncview/_embed
+        # style subcommands: re-run engine.py itself with the subcommand as
+        # argv.
+        cmd = self._spawned_cmd(False, None, self._tmp)
+        self.assertEqual(cmd[0], r"C:\App\omni-exec.exe")
+        self.assertNotIn("-m", cmd)
+        self.assertTrue(cmd[1].endswith("engine.py"), cmd[1])
+        self.assertEqual(cmd[2], "_windowbar")
+
+
 if __name__ == "__main__":
     unittest.main()

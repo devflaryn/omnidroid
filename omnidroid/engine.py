@@ -6496,12 +6496,57 @@ def _spawn_window_bar(name, title, identity, pid):
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _window_bar_pid_path(name):
+    return runtime_dir(name) / "windowbar.pid"
+
+
+def _running_window_bar_pid(name):
+    """The pid of a still-alive window bar for this instance, or None.
+
+    A SECOND `view` while a bar is already open must bring the existing
+    window forward rather than stack another bar above the same one -- the
+    old embedded-viewer path had this as a three-state check ("already
+    embedded" / display gone / fresh); this replaces the "already open"
+    state with a pid file the bar writes on the way up and clears on the way
+    down (_write_window_bar_pid / _run_windowbar's `finally`). A stale file
+    (the bar crashed, was killed, or the host rebooted) reads as dead and
+    falls through to a normal spawn -- the safe direction, since a missed
+    "already open" costs one harmless extra bar, not a `view` that hangs or
+    lies.
+    """
+    try:
+        pid = int(_window_bar_pid_path(name).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid_alive(pid) else None
+
+
+def _write_window_bar_pid(name, pid):
+    """Best-effort: a failed write only means the NEXT `view` fails to spot
+    this bar and spawns another one, no worse than before this file
+    existed."""
+    try:
+        d = runtime_dir(name)
+        d.mkdir(parents=True, exist_ok=True)
+        _window_bar_pid_path(name).write_text(str(pid))
+    except Exception:      # noqa: BLE001
+        pass
+
+
+def _clear_window_bar_pid(name):
+    try:
+        _window_bar_pid_path(name).unlink(missing_ok=True)
+    except Exception:      # noqa: BLE001
+        pass
+
+
 def boot_has_hidden_window(name):
     """Did this boot open a QEMU window and then hide it?
 
-    That is the configuration where the viewer must EMBED rather than connect:
-    the pixels exist, on the GPU, in a window nobody can see, and there is no
-    VNC server because QEMU refuses one beside a GL window."""
+    That is the configuration where `view` must restyle and show QEMU's own
+    window rather than connect to a VNC port: the pixels exist, on the GPU,
+    in a window nobody can see, and there is no VNC server because QEMU
+    refuses one beside a GL window."""
     run = _run_record(name)
     return bool(run.get("native_window")) and bool(run.get("window_hidden"))
 
@@ -6543,31 +6588,65 @@ def cmd_view(args):
     # start, so this is quick; generous bound covers a cold spawn).
     # A GPU boot on this host has its pixels in a hidden QEMU window and no VNC
     # server at all (QEMU refuses one beside a GL window). Do not connect to a
-    # port nobody is listening on -- HOST that window inside our own viewer
-    # instead. Same window to the user, none of the copy/encode/decode a
-    # framebuffer protocol would cost, and input goes straight into the guest's
-    # usb-tablet instead of being synthesised from RFB.
+    # port nobody is listening on -- RESTYLE and SHOW that same window
+    # instead, with our own bar above it (windowbar.py). Same window to the
+    # user, none of the copy/encode/decode a framebuffer protocol would cost,
+    # and input goes straight into the guest's usb-tablet instead of being
+    # synthesised from RFB.
     if boot_has_hidden_window(args.name) and not getattr(args, "native", False):
         from omnidroid import hostwin
         run = _run_record(args.name)
         identity = run.get("identity") or f"omni-{args.name}"
         qemu_pid = run.get("pid")
+        # Probe for the window FIRST, with a short timeout, before touching
+        # its chrome. A window that genuinely is not there is a different,
+        # honest problem from "it's there but restyling it failed" --
+        # conflating them told the user "cosmetic problem, rendering
+        # unaffected" and then opened an empty desktop. apply_chrome's own
+        # DEFAULT_TIMEOUT (20s) is sized for "wait for QEMU to map a window
+        # at spawn", not for this: a `view` against an instance whose window
+        # is simply gone must fail fast, not stall ~20s to discover it.
+        if hostwin.find_window(identity, timeout=2, pid=qemu_pid) is None:
+            return fail(
+                "no_window",
+                f"'{args.name}' is running, but no window was found for it "
+                f"(looked for '{identity}'"
+                + (f", pid {qemu_pid}" if qemu_pid else "") +
+                f"). There is nothing to show. Restart it to get a fresh "
+                f"window: `omnidroid stop {args.name} && omnidroid start "
+                f"{args.name}`.")
+        # A bar already open for this instance means bring IT forward, not
+        # stack a second one above the same window.
+        bar_pid = _running_window_bar_pid(args.name)
+        if bar_pid is not None:
+            hostwin.show_qemu_window(identity, pid=qemu_pid)
+            print(f"[view {args.name}] a window is already open for this "
+                  f"instance (bar pid {bar_pid}); bringing it forward.")
+            if getattr(args, "json", False):
+                emit_json({"name": args.name, "viewer": "window",
+                           "already_open": True, "vnc_host": None,
+                           "vnc_port": None, "started": started, "ok": True})
+            return
         # Restyle first, THEN show. The other order puts an unstyled window
         # with a caption on screen for a frame and then yanks it about, which
         # reads as a glitch in the product rather than as a window being set
-        # up.
-        chrome = hostwin.apply_chrome(identity, pid=qemu_pid,
+        # up. The window is already confirmed present above, so this is a
+        # short re-probe, not the ~20s worst case.
+        chrome = hostwin.apply_chrome(identity, pid=qemu_pid, timeout=2,
                                       geometry=run.get("geometry"))
         if not chrome["applied"]:
             print(f"[view {args.name}] the window keeps QEMU's own chrome: "
                   f"{chrome['reason']}. Rendering and input are unaffected.")
-        hostwin.show_qemu_window(identity)
+        hostwin.show_qemu_window(identity, pid=qemu_pid)
         title = f"omni: {args.name}"
+        proc = None
         try:
-            _spawn_window_bar(args.name, title, identity, qemu_pid)
+            proc = _spawn_window_bar(args.name, title, identity, qemu_pid)
         except Exception as e:      # noqa: BLE001
             print(f"[view {args.name}] the title bar did not start ({e}); the "
                   f"window is usable and the app can still hide or stop it.")
+        if proc is not None:
+            _write_window_bar_pid(args.name, proc.pid)
         if getattr(args, "json", False):
             emit_json({"name": args.name, "viewer": "window",
                        "chrome": chrome["applied"], "vnc_host": None,
@@ -6631,9 +6710,16 @@ def _run_windowbar(a):
         cmd_stop(type("Args", (), {"name": a.name, "json": False,
                                    "timeout": 90})())
 
-    return windowbar.run_window_bar(a.identity, title=a.title,
-                                    pid=getattr(a, "pid", None),
-                                    on_stop=stop_instance)
+    try:
+        return windowbar.run_window_bar(a.identity, title=a.title,
+                                        pid=getattr(a, "pid", None),
+                                        on_stop=stop_instance)
+    finally:
+        # However this exits -- hide, stop, or the window closed some other
+        # way -- the pid file that says "a bar is already open" must not
+        # outlive the bar, or the NEXT `view` believes a bar is up when it
+        # is not and never opens a new one.
+        _clear_window_bar_pid(a.name)
 
 
 def _run_vncview(a):

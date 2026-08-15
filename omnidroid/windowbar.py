@@ -163,9 +163,18 @@ class WindowBar:
         elif answer == "stop" and self.on_stop:
             try:
                 self.on_stop(self.identity)
-            except Exception as e:      # noqa: BLE001 - the hook is
-                # caller-supplied and must not blow up the close prompt's
-                # caller; record it instead of hiding it.
+            # SystemExit alongside Exception, NOT a bare `except:` --
+            # KeyboardInterrupt must still propagate. The hook is
+            # engine.cmd_stop, which ends in sys.exit(1) on a failed
+            # shutdown, and load_account (called first) does sys.exit(str)
+            # on a bad account -- both raise SystemExit, which `except
+            # Exception` does NOT catch. Left uncaught it escapes on_close,
+            # Tkinter re-raises it out of mainloop(), and this whole
+            # (detached, console-less) process dies -- indistinguishable
+            # from a successful stop, on an instance that may still be
+            # running with several GB attached. Treat it exactly like any
+            # other failed stop: record it, do not let it vanish the bar.
+            except (Exception, SystemExit) as e:      # noqa: BLE001
                 self.stop_failed = True
                 sys.stderr.write(
                     f"window bar: stop hook for '{self.identity}' failed: "
