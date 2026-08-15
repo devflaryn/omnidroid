@@ -652,3 +652,76 @@ against a GPU farming instance.
 **Untested:** GPU contention with many concurrent instances. Only one Roblox
 cookie was live when this was measured, so a single instance is the only
 in-world data point. That is the number to take before promising a fleet size.
+
+## Linux/KVM: both things Windows cannot do, measured
+
+*2026-08-15, WSL2 Ubuntu (kernel 6.6.87.2-microsoft-standard-WSL2), nested
+KVM, QEMU 8.2.2. A minimal Linux guest, not the Android base — these
+characterise the HYPERVISOR, not Roblox's working set.*
+
+### Host RSS actually falls
+
+QEMU process RSS (MiB), `-m 2048`, `virtio-balloon-pci`:
+
+| | idle | guest dirties 1 GiB | guest frees it | after QMP balloon → 1024 |
+|---|---|---|---|---|
+| `free-page-reporting=on` | **189.4** | 1213.6 | **195.6** | 187.8 |
+| `free-page-reporting=off` | 217.5 | 1213.6 | 1213.6 | **189.7** |
+
+Three things, and all three are the opposite of the Windows measurement:
+
+* **A `-m 2048` guest idles at ~190 MiB, not 2048.** QEMU only backs pages the
+  guest has touched. On Windows host RSS tracks `-m` almost exactly.
+* **The guest freeing 1 GiB returned 1018 MiB to the host in under 30 s, with
+  no host-side action at all** — that is `free-page-reporting` working.
+* The control isolates it: with reporting off, freeing returns nothing, but an
+  explicit balloon inflate still reclaims 1024 MiB. **Both mechanisms decommit
+  for real.** On Windows neither does, because there is no `madvise`.
+
+**So ~400 MB/instance is reachable on Linux and the hypervisor is no longer
+what stands in the way.** Host RSS ≈ guest live set + ~150-190 MiB of QEMU.
+Reaching 400 MB now needs the squeezed Android guest's live set to sit around
+210-250 MiB — a guest-side question, which is precisely the question Windows
+made unanswerable.
+
+### savevm/loadvm works, and it is fast
+
+`-m 2048` with 768 MiB of **incompressible** guest data live:
+
+```
+savevm                          1.73 s   (947 MiB of state, 444 MiB/s)
+loadvm                          1.26 s   state verified correct
+migrate to file (defaults)      7.22 s   131 MiB/s  <- QEMU's default
+                                                       max-bandwidth throttle
+migrate, max-bandwidth 4 GiB/s  0.76 s   1183 MiB/s (8.8x)
+restore into a FRESH qemu       0.74 s   guest responsive at 0.75 s
+```
+
+Extrapolated to a farming instance (`-m 3072`, ~2 GiB live): **~1.7 s to save,
+~1.7 s to restore**, against a 47-190 s cold boot. No migration blocker exists.
+
+**Zero pages are free, so do not measure with `/dev/zero`.** A first attempt
+snapshotted 1280 MiB of guest data to 117 MiB in 0.28 s because QEMU skips
+zero pages entirely. The numbers above were re-taken with `/dev/urandom`. A
+freshly booted, ballooned Android guest will snapshot far smaller than its
+`-m` — which helps, but do not quote the zero-page number as a result.
+
+### WSL2 is a test bench, not a runtime
+
+It validated the Linux code paths, which had never been exercised. It cannot
+ship:
+
+| | |
+|---|---|
+| storage | `/mnt/c` (drvfs) **219 MB/s** vs **7.1 GB/s** on the distro's ext4 — images must never live on `/mnt/c` |
+| GPU | `/dev/dxg` exists, **`/dev/dri` does not** — no DRM render node, so no virgl for a nested guest: headless farming only |
+| network | NAT behind NAT, on top of the VPN's 1420 MTU already documented above |
+| disk | `ext4.vhdx` grows and never shrinks (`wsl --manage <d> --set-sparse true` reclaims, distro stopped) |
+
+`/dev/kvm` needed no `.wslconfig` change here, but the user must be in the
+`kvm` group — `check_accel()` already prints that exact fix.
+
+The Linux code paths themselves are already written and were simply never run:
+`default_accel()` returns `kvm`, `machine_arg()` adds `mem-merge=on` for KSM,
+and `check_accel()` preflights `/dev/kvm`. KSM is available in this kernel, so
+cross-instance dedup stacks on top of the balloon.
