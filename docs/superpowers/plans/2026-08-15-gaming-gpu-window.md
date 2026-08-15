@@ -20,7 +20,8 @@
 - **Windowed GL boots have no VNC server.** `blocks_vnc()` already encodes it. Do not try to keep both; QEMU refuses the pair.
 - **The base panel ceiling is 1280x800.** Do not add code that requests more; the guest ignores a mode its panel does not carry and stalls for minutes first.
 - **Tests are `unittest.TestCase` classes run under pytest,** with `sys.path.insert(0, ...)` at the top, matching every file in `tests/`.
-- **Linux tasks are UNVERIFIED — there is no Linux host in this setup.** They ship as code and unit tests; no task may report Linux as working. macOS tasks are gated on sub-project B and are limited here to pure policy plus a readiness reporter.
+- **Linux is DEFERRED, not implemented.** A Linux host arrives 2026-08-16; until then Linux keeps today's behaviour exactly (`egl-headless` + VNC, QEMU's own frame). Do not write X11 chrome, do not switch the Linux render policy, and do not leave code no one has run. The single lever is `_WINDOW_PRESENT_PLATFORMS` in Task 1 — adding `"linux"` to it, then implementing the X11 chrome, is tomorrow's work and has its own task list.
+- **macOS** is gated on sub-project B and is limited here to pure policy plus a readiness reporter.
 
 ---
 
@@ -43,7 +44,7 @@
 
 ---
 
-### Task 1: Gaming's `auto` takes a window on every platform
+### Task 1: Gaming's `auto` takes a window (Windows and macOS; Linux deferred)
 
 Today `GPU_AUTO` tries the windowless GL pair first (`_headless_gl_pair`, `qemu_proc.py:1169`). On Linux that succeeds, so gaming gets `egl-headless` + VNC — GPU rendering followed by a readback, an RFB encode and a Python RFB decode per frame. The performance profile must go straight to the window.
 
@@ -97,12 +98,21 @@ class ProfileDecidesTheDisplay(unittest.TestCase):
              mock.patch.dict(os.environ, {}, clear=True):
             return qemu_proc.resolve_gpu_display(mode, False, "qemu-system-x86_64")
 
-    def test_gaming_on_linux_takes_a_gl_window_not_egl_headless(self):
+    def test_gaming_on_linux_keeps_egl_headless_until_a_host_verifies_it(self):
+        """DEFERRED, not a design decision reversed.
+
+        Linux is the one platform whose egl-headless actually presents, so
+        gaming works there today via VNC -- at the cost of a readback, an RFB
+        encode and a Python RFB decode per frame. The window is better and the
+        spec says so, but switching it blind would trade a working copy path
+        for an unrun one AND drop the VNC server (QEMU refuses -vnc beside a GL
+        window), leaving a Linux user with a raw QEMU frame and no viewer.
+
+        Flip this by adding "linux" to _WINDOW_PRESENT_PLATFORMS once a Linux
+        host has run it.
+        """
         _gpu, display = self.resolve(GAMING, "linux")
-        self.assertEqual(display[0], "-display")
-        self.assertTrue(display[1].startswith("gtk,"), display[1])
-        self.assertIn("gl=on", display[1])
-        self.assertNotIn("egl-headless", display[1])
+        self.assertEqual(display, ["-display", "egl-headless"])
 
     def test_gaming_on_windows_takes_a_gl_window(self):
         _gpu, display = self.resolve(GAMING, "windows")
@@ -157,7 +167,23 @@ def _presents_a_window(policy, mode):
         return True
     if policy != GPU_AUTO:
         return False
-    return (mode or {}).get("profile") == "performance"
+    return ((mode or {}).get("profile") == "performance"
+            and _platform_key() in _WINDOW_PRESENT_PLATFORMS)
+```
+
+and directly above it, the platform gate:
+
+```python
+# Platforms where the performance profile PRESENTS in a host window.
+#
+# Linux is absent ON PURPOSE and only until a Linux host exists to verify it
+# (2026-08-16). It is the one platform whose egl-headless really presents, so
+# gaming works there today; switching it blind would trade a working copy path
+# for an unrun one and drop the VNC server with it, because QEMU refuses -vnc
+# beside a GL window. macOS is present and needs no gate: its egl-headless
+# does NOT present (HEADLESS_GL_PRESENTS), so _headless_gl_pair returns None
+# there and the window path is reached anyway.
+_WINDOW_PRESENT_PLATFORMS = ("windows", "macos")
 ```
 
 - [ ] **Step 4: Route `auto` around the windowless pair for the performance profile**
@@ -1303,69 +1329,76 @@ git commit -m "run.json records the display kind; the app can hide a window with
 
 ---
 
-### Task 7: Linux X11 backend — UNVERIFIED, no host
+### Task 7: Linux stays exactly as it is — DEFERRED to 2026-08-16
 
-**This task ships code that cannot be run in this setup.** Every commit message and every printed reason must be honest about that. Do not mark Linux as working anywhere.
+**Nothing is implemented for Linux in this plan.** A host arrives tomorrow;
+until then Linux keeps today's behaviour (`egl-headless` + VNC, QEMU's own
+frame), which works. The only Linux work here is making the *decline* honest,
+so a Linux user reads a reason rather than watching chrome silently not happen.
+
+Writing an X11 backend now would mean shipping a `_MOTIF_WM_HINTS` path and a
+`WM_TRANSIENT_FOR` path that no one has ever run, in a subsystem whose whole
+history is measurements contradicting what looked obvious. That is the trade
+this task refuses.
 
 **Files:**
-- Modify: `omnidroid/hostwin.py` (`apply_chrome` X11 branch)
-- Modify: `omnidroid/windowbar.py` (`own` X11 branch)
+- Modify: `omnidroid/hostwin.py` (`apply_chrome`, the non-Windows branch from Task 3)
 - Test: `tests/test_window_chrome.py` (append)
 
 **Interfaces:**
-- Consumes: `hostwin._import_xlib()`, `hostwin._xlib_window_id(wid)`, `hostwin.BACKEND_XLIB`, `BACKEND_XDOTOOL`, `BACKEND_WMCTRL`.
-- Produces: nothing new to other tasks.
+- Consumes: `hostwin.backend()`, `BACKEND_XDOTOOL`, `BACKEND_WMCTRL`, `BACKEND_XLIB`.
+- Produces: nothing new.
 
 - [ ] **Step 1: Write the failing test**
 
 Append to `tests/test_window_chrome.py`:
 
 ```python
-class ChromeOnX11(unittest.TestCase):
-    """UNVERIFIED: written against the protocol, never run on a Linux host.
+class ChromeOnLinuxIsDeferredAndSaysSo(unittest.TestCase):
+    """Linux keeps QEMU's own frame until a host has verified a replacement.
 
-    _MOTIF_WM_HINTS is how a client asks a window manager to drop decorations:
-    a 5-long property whose flags field bit 1 means "the decorations field is
-    meaningful" and whose decorations field 0 means "none". Every mainstream WM
-    honours it; a WM that does not simply leaves the frame on, which is the
-    same degradation as a failed chrome call on Windows.
+    The reason has to name the state -- 'not implemented yet' -- rather than
+    read as a failure, because nothing is broken: the window works, the guest
+    renders on the GPU, and the VNC viewer is still there. Only the chrome is
+    missing.
     """
 
-    def test_the_motif_hint_asks_for_no_decorations(self):
-        self.assertEqual(hostwin.MOTIF_HINTS_NO_DECORATIONS,
-                         (2, 0, 0, 0, 0))
+    def test_an_x11_backend_declines_with_a_deferral_not_an_error(self):
+        for name in (hostwin.BACKEND_XDOTOOL, hostwin.BACKEND_WMCTRL,
+                     hostwin.BACKEND_XLIB):
+            with mock.patch.object(hostwin, "backend", return_value=name):
+                result = hostwin.apply_chrome("omni-farm3")
+            self.assertFalse(result["applied"])
+            self.assertIn("not implemented", result["reason"].lower())
+            self.assertIn("linux", result["reason"].lower())
 
-    def test_an_x11_backend_reports_unverified_rather_than_success(self):
+    def test_the_decline_never_raises_and_never_blocks_a_boot(self):
         with mock.patch.object(hostwin, "backend",
-                               return_value=hostwin.BACKEND_XDOTOOL), \
-             mock.patch.object(hostwin, "find_window", return_value=7):
+                               return_value=hostwin.BACKEND_XLIB):
             result = hostwin.apply_chrome("omni-farm3")
-        self.assertIn("unverified", result["reason"].lower())
+        self.assertIsInstance(result, dict)
+        self.assertIn("hwnd", result)
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
 
 Run: `python -m pytest tests/test_window_chrome.py -q`
-Expected: FAIL — no `MOTIF_HINTS_NO_DECORATIONS`.
+Expected: FAIL — Task 3's generic reason says "implemented for Windows only"
+and does not name Linux or the deferral.
 
-- [ ] **Step 3: Implement the X11 branch**
+- [ ] **Step 3: Make the decline specific**
 
-In `omnidroid/hostwin.py`, add above `apply_chrome`:
-
-```python
-# _MOTIF_WM_HINTS: (flags, functions, decorations, input_mode, status).
-# flags bit 1 (MWM_HINTS_DECORATIONS) says the decorations field means
-# something; decorations 0 means none. This is how every X11 client that wants
-# a frameless window asks for one, and a WM that ignores it just leaves the
-# frame on -- the same degradation as a failed chrome call on Windows.
-MOTIF_HINTS_NO_DECORATIONS = (2, 0, 0, 0, 0)
-```
-
-and in `apply_chrome`, replace the early `if name != BACKEND_WIN32` return with:
+In `omnidroid/hostwin.py`, replace the non-Windows early return in
+`apply_chrome` with:
 
 ```python
     if name in (BACKEND_XDOTOOL, BACKEND_WMCTRL, BACKEND_XLIB):
-        return _x11_apply_chrome(identity, pid, geometry, timeout)
+        return _chrome_result(
+            False,
+            "window chrome is not implemented on Linux yet: the window keeps "
+            "QEMU's own frame. Nothing is broken -- the guest renders on the "
+            "GPU and the VNC viewer works. _MOTIF_WM_HINTS is the route and "
+            "it will be written against a real host rather than guessed at.")
     if name != BACKEND_WIN32:
         return _chrome_result(
             False,
@@ -1374,85 +1407,16 @@ and in `apply_chrome`, replace the early `if name != BACKEND_WIN32` return with:
             f"build instead")
 ```
 
-then add:
-
-```python
-def _x11_apply_chrome(identity, pid, geometry, timeout):
-    """Drop the frame via _MOTIF_WM_HINTS. UNVERIFIED -- no Linux host.
-
-    Says so in its own reason string rather than reporting a clean success
-    nobody has watched happen. Remove the word when a Linux box has run it.
-    """
-    display = _import_xlib()
-    if display is None:
-        return _chrome_result(
-            False, "python-xlib is not installed, so the window keeps its "
-                   "frame; rendering and input are unaffected")
-    hwnd = find_window(identity, timeout=timeout, pid=pid)
-    if hwnd is None:
-        return _chrome_result(False, f"no window found for '{identity}'")
-    try:
-        d = _xlib_display()
-        window = d.create_resource_object("window", _xlib_window_id(hwnd))
-        atom = d.get_atom("_MOTIF_WM_HINTS")
-        window.change_property(atom, atom, 32,
-                               list(MOTIF_HINTS_NO_DECORATIONS))
-        if geometry:
-            x, y, width, height = geometry
-            window.configure(x=int(x), y=int(y),
-                             width=int(width), height=int(height))
-        d.sync()
-        return _chrome_result(
-            True, "applied via _MOTIF_WM_HINTS (UNVERIFIED: no Linux host has "
-                  "run this path)", hwnd)
-    except Exception as e:      # noqa: BLE001
-        return _chrome_result(False, f"could not restyle the window: {e}")
-```
-
-In `omnidroid/windowbar.py`, extend `own` so X11 uses transient-for, which gives the same always-above-and-never-destructive relationship:
-
-```python
-    def own(self, bar_hwnd, owner_hwnd):
-        """Make the bar an owned window of the guest's window.
-
-        NEVER the reverse -- see the module docstring. On X11 the equivalent
-        relationship is WM_TRANSIENT_FOR, which keeps the bar above its target
-        and, like Windows ownership, does not destroy the target when the bar
-        goes. UNVERIFIED: no Linux host has run this.
-        """
-        if IS_WINDOWS:
-            try:
-                _user32().SetWindowLongPtrW(bar_hwnd, GWLP_HWNDPARENT,
-                                            owner_hwnd)
-                self.bar_hwnd, self.owner_hwnd = bar_hwnd, owner_hwnd
-                return True
-            except Exception:      # noqa: BLE001
-                return False
-        display = hostwin._import_xlib()
-        if display is None:
-            return False
-        try:
-            d = hostwin._xlib_display()
-            bar = d.create_resource_object("window", bar_hwnd)
-            bar.set_wm_transient_for(
-                d.create_resource_object("window", owner_hwnd))
-            d.sync()
-            self.bar_hwnd, self.owner_hwnd = bar_hwnd, owner_hwnd
-            return True
-        except Exception:      # noqa: BLE001
-            return False
-```
-
 - [ ] **Step 4: Run the tests**
 
-Run: `python -m pytest tests/test_window_chrome.py tests/test_windowbar.py -q`
+Run: `python -m pytest tests/test_window_chrome.py -q`
 Expected: all pass.
 
-- [ ] **Step 5: Commit, saying plainly that it is unrun**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add omnidroid/hostwin.py omnidroid/windowbar.py tests/test_window_chrome.py
-git commit -m "Linux X11 chrome and transient-for bar — UNVERIFIED, no Linux host has run this"
+git add omnidroid/hostwin.py tests/test_window_chrome.py
+git commit -m "Linux keeps QEMU's own frame and says why; X11 chrome deferred to a real host"
 ```
 
 ---
@@ -1669,7 +1633,9 @@ git commit -m "Measured: gaming's restyled window on Windows, and the force-kill
 
 ## Self-Review
 
-**Spec coverage.** §3 window model → Tasks 3, 4. §3a ownership → Task 4. §3b per-platform → Tasks 1, 2 (flags), 3 (Windows chrome), 7 (Linux), 8 (macOS). §3c Linux moves off egl-headless → Task 1. §3d `--gpu` profile-directed → Task 1. §4 lifecycle → Tasks 5, 6. §5 degradation → Tasks 3 (chrome reason), 5 (bar failure), 8 (macOS blockers). §6 deletions → Task 5. §7 verification → every task's tests plus Task 9. §8 dependencies → Tasks 7, 8 carry the honesty requirements.
+**Spec coverage.** §3 window model → Tasks 3, 4. §3a ownership → Task 4. §3b per-platform → Tasks 1, 2 (flags), 3 (Windows chrome), 7 (Linux declines), 8 (macOS). §3d `--gpu` profile-directed → Task 1. §4 lifecycle → Tasks 5, 6. §5 degradation → Tasks 3 (chrome reason), 5 (bar failure), 7 (Linux), 8 (macOS blockers). §6 deletions → Task 5. §7 verification → every task's tests plus Task 9. §8 dependencies → Tasks 7, 8 carry the honesty requirements.
+
+**Deliberate deviation from the spec, recorded rather than silent.** §3c has Linux moving off `egl-headless` onto a GL window. **This plan does not do that**, because no Linux host exists to verify it and the switch would drop the VNC server on the way (QEMU refuses `-vnc` beside a GL window) — a Linux user would get a raw QEMU frame with no viewer and no chrome. Linux keeps today's behaviour behind `_WINDOW_PRESENT_PLATFORMS`; §3c becomes a one-line change plus an X11 chrome task once a host is available (2026-08-16).
 
 **Gap found and closed:** §4 says `run.json` gains geometry, and Task 6 only writes `display_kind`. Task 3's `window_geometry()` supplies the read and Task 5's `cmd_view` passes `run.get("geometry")` to `apply_chrome`; the **write** happens when the bar exits. Added to Task 6 as a note here rather than a silent omission: `cmd_windowbar`'s `on_stop`/exit path must persist `hostwin.window_geometry(identity)` into `run.json` before returning, so the next `view` restores position. Implement it in Task 6, Step 4, alongside `display_kind`.
 
