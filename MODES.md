@@ -725,3 +725,55 @@ The Linux code paths themselves are already written and were simply never run:
 `default_accel()` returns `kvm`, `machine_arg()` adds `mem-merge=on` for KSM,
 and `check_accel()` preflights `/dev/kvm`. KSM is available in this kernel, so
 cross-instance dedup stacks on top of the balloon.
+
+## OPEN: the squeeze kills the PS99 client about a minute after it runs
+
+*2026-08-15. This is the most important unresolved thing in farming, and the
+reason it went unnoticed is worth as much attention as the bug itself.*
+
+**Every check a density launch makes runs inside the first minute.** `ok`,
+`delivered`, `played`, and `probe_client_join`'s `in_world` are all sampled
+right after the squeeze — and the client is alive then. It is gone by t+90.
+So the launch has been returning `ok: true, in_world: true` for an instance
+with about a minute to live, for the life of the mode.
+
+| configuration | last seen alive |
+|---|---|
+| full squeeze, 3 GB, GPU | **t+60** |
+| full squeeze, 3 GB, software *(control)* | **t+60** |
+| full squeeze minus `lmkd`, 3 GB | t+90 |
+| full squeeze, **4 GB** | t+151 |
+| **whole squeeze skipped**, 3 GB | **t+421, still alive** |
+
+What the matrix establishes:
+
+* **It is the squeeze.** Skipping it entirely gives 7x the lifetime and the
+  client was still running when the watch ended.
+* **It is not the renderer.** The GPU and software runs died within **0.05 s**
+  of each other. That also means it is a timer, not a crash.
+* **It is not memory exhaustion.** The 4 GB run died with **1604 MB
+  available**. More headroom only moves the deadline.
+* **It is not one lever.** Removing `lmkd` — the obvious suspect, since it is
+  configured `kill_heaviest_task=true` and Roblox is by far the heaviest task —
+  bought 30 seconds.
+
+The client writes **nothing** to its log when this happens, which is what a
+process that is *killed* looks like. Evidence has to come from the killer's
+side: `logcat` for lmkd/ActivityManager, and the guest's memory state at the
+moment of death. `scratchpad/watch_death.py` does both.
+
+**Before any more lmkd bisecting, read `ro.lmk.*` on a FRESH boot.** They read
+`true` after a squeezed run — but that is our own step setting them. If the
+Bliss base already ships them true, then `OMNI_FARM_SKIP=lmkd` never disabled
+anything and that row means something entirely different.
+
+**Related and probably contributing: the settle heuristic fires early.**
+`wait_for_game_settled` declares the client loaded on **two** samples within
+4%, and across three runs it fired at 1241 MB, 1327 MB and 1359 MB — while
+`FOOTPRINT.md` records PS99 reaching ~1528 MB in-world. So the squeeze lands
+on a client that is still growing. Requiring a longer plateau
+(`SETTLE_STABLE_SAMPLES`) is the obvious thing to try, and it is **untested**.
+
+Until it is fixed, `verify_client_survived()` at least makes the failure
+visible: a density launch now watches for 120 s past the squeeze and reports
+`client_died_after_squeeze` instead of `ok: true`.
