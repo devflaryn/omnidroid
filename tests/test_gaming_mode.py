@@ -77,18 +77,31 @@ def _cfg():
 
 
 def _cmd(mode_name, cap=NO_CAP, base="arm", interactive=False, env=None,
-         headless_gl=False):
+         headless_gl=False, platform_key="macos"):
     """The QEMU command for one boot, with the host capability faked.
 
     `cap` is what default_display() would answer, i.e. the WINDOWED tier, and
     it is only consulted when something asks for a window. `headless_gl` fakes
-    a host whose egl-headless can present."""
+    a host whose egl-headless can present.
+
+    `_platform_key` IS MOCKED, and has to be. Every fixture above hands back
+    a `cocoa` display, so this file's whole matrix is a macOS host -- but
+    without this mock `_presents_a_window()` consulted the REAL operating
+    system, and the same assertions passed on Windows and macOS and failed on
+    Linux (verified: 3 failures there, in ArmBootUsesTheHostCapability and
+    X86GetsTheSameTreatment). A Linux host coming to do this branch's
+    deferred work would have opened to three red tests unrelated to its
+    change. Which OS the suite runs on must not decide what the suite
+    asserts; that is exactly the coupling tests/test_gaming_window_policy.py
+    already fixed for its own file by pinning the platform in one place."""
     from pathlib import Path
     environ = {"OMNI_GL_WINDOW": ""} if env is None else env
     hl_cap = {"available": True,
               "gpu_args": ["-device", "virtio-gpu-gl-pci,xres=1280,yres=800"],
               "display_args": ["-display", "egl-headless"], "reason": "egl"}
     with mock.patch.dict(os.environ, environ, clear=False), \
+         mock.patch.object(qemu_proc, "_platform_key",
+                           return_value=platform_key), \
          mock.patch.object(qemu_proc, "default_display", return_value=cap), \
          mock.patch.object(qemu_proc, "_headless_gl_wanted",
                            return_value=headless_gl), \

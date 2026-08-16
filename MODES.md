@@ -736,9 +736,10 @@ headless farm box with no window server, `auto` finds nothing and falls back to
 software, which is the old behaviour.
 
 **What it costs:** QEMU refuses `-vnc` beside a GL context, so `capture` and
-`autocap` are unavailable on a GPU farming boot and `omnidroid view` uses the
-embedded window. **`screenshot` goes through adb and is unaffected** — verified
-against a GPU farming instance.
+`autocap` are unavailable on a GPU farming boot and `omnidroid view` shows
+QEMU's own window, restyled in place, with our title bar above it — no
+reparenting and no copy. **`screenshot` goes through adb and is unaffected** —
+verified against a GPU farming instance.
 
 **Untested:** GPU contention with many concurrent instances. Only one Roblox
 cookie was live when this was measured, so a single instance is the only
