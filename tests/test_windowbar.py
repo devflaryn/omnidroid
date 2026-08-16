@@ -574,6 +574,60 @@ class OwnershipFailureIsLoud(unittest.TestCase):
         self.assertEqual(len({2, 3, 4, 5}), 4)
 
 
+class TheFirstAlignmentUsesTheOwnerHandle(unittest.TestCase):
+    """MEASURED on real windows, 2026-08-16.
+
+    `run_window_bar` used to take its first rect from
+    `hostwin.window_geometry(identity)`, which re-finds the window BY TITLE
+    -- and hostwin matches the title as a SUBSTRING, while our own window by
+    then is called "omni: <identity>", which CONTAINS <identity>. So it could
+    hand back the BAR's own rect and follow() aligned the bar to itself: a
+    216px-wide strip, the exact shape of the 216x239 bug, and now that the
+    bar drags the composite, the guest window got pulled under it too.
+    Reproduced end to end against a real stand-in guest window.
+
+    `view` always passes the QEMU pid, which filters that collision out, so
+    this never fired in the product -- it fired the moment anything called
+    run_window_bar the way its own signature says it may.
+    """
+
+    def test_it_never_re_finds_the_window_by_title(self):
+        if not windowbar.IS_WINDOWS:
+            self.skipTest("run_window_bar returns 3 off Windows")
+        followed = []
+
+        class FakeRoot:
+            def destroy(self):
+                pass
+
+            def protocol(self, *_a):
+                pass
+
+            def bind(self, *_a):
+                pass
+
+            def after(self, *_a):
+                pass
+
+            def mainloop(self):
+                pass
+
+        with mock.patch("omnidroid.hostwin.find_window", return_value=99), \
+             mock.patch("omnidroid.hostwin.window_geometry") as by_title, \
+             mock.patch("omnidroid.hostwin.apply_dwm_style"), \
+             mock.patch.object(windowbar, "_create_bar_window",
+                               return_value=(FakeRoot(), 11)), \
+             mock.patch.object(windowbar, "_window_rect",
+                               side_effect=lambda h: (5, 6, 700, 400)
+                               if h == 99 else None), \
+             mock.patch.object(windowbar.WindowBar, "follow",
+                               side_effect=lambda r: followed.append(r)):
+            windowbar.run_window_bar("omni-farm3")
+        by_title.assert_not_called()
+        # ...and the rect it aligned to came off the OWNER handle (99).
+        self.assertEqual(followed, [(5, 6, 700, 400)])
+
+
 class TheBarCarriesTheDwmStyling(unittest.TestCase):
     """Design spec 3a/3b: QEMU's window gives up its whole caption, so the
     strip is the window that HAS one -- "DWM styling (dark mode, rounded

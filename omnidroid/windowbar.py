@@ -581,7 +581,23 @@ def run_window_bar(identity, title=None, pid=None, on_stop=None):
     # caption, which is chrome, not function.
     hostwin.apply_dwm_style(bar_hwnd)
 
-    rect = hostwin.window_geometry(identity, pid=pid)
+    # The OWNER HANDLE we already resolved, not window_geometry(identity).
+    #
+    # MEASURED on real windows, 2026-08-16: window_geometry() re-finds the
+    # window by title, hostwin matches the title as a SUBSTRING, and by this
+    # point OUR OWN window exists and is called "omni: <identity>" -- which
+    # contains <identity>. It can therefore hand back the BAR's rect, and
+    # follow() then aligns the bar to itself: a 216px-wide strip, the exact
+    # shape of the 216x239 bug task-9-report.md fixed, and (now that the bar
+    # drags the composite) the guest window gets pulled under it as well.
+    # Reproduced by running run_window_bar() against a real stand-in guest
+    # window WITHOUT a pid, which is the case the pid filter cannot save.
+    #
+    # `view` always passes the QEMU pid, so this never fired in the product;
+    # it fired the moment anything called this the way its own signature says
+    # it may. The handle is unambiguous, needs no enumeration at all, and is
+    # what every later re-alignment already uses.
+    rect = bar.owner_rect()
     if rect:
         bar.follow(rect)
 
