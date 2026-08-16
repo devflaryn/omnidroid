@@ -846,14 +846,122 @@ def apply_chrome(identity, pid=None, icon=None, geometry=None,
         return _chrome_result(False, f"could not restyle the window: {e}")
 
 
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x00000010
+LR_DEFAULTSIZE = 0x00008000
+
+
 def _apply_icon(u, hwnd, icon):
-    """Put our icon on the window. Best-effort, like everything here."""
-    import ctypes
-    hicon = ctypes.windll.user32.LoadImageW(
-        None, str(icon), 1, 0, 0, 0x00000010 | 0x00008000)  # IMAGE_ICON
+    """Put our icon on the window (spec §3b: `WM_SETICON`). Best-effort.
+
+    `u` is the `_user32()` handle the caller already has, and BOTH calls go
+    through it -- LoadImageW included. It used to reach for
+    `ctypes.windll.user32` directly for the load and then use `u` for the
+    two SendMessageW calls, which meant a test could stand in for half of
+    this function and the other half went to the real Win32 API. One seam or
+    none.
+
+    NO CALLER PASSES AN ICON TODAY, and that is not an oversight to fix by
+    inventing one: this repository ships no `.ico` (the only icon asset in
+    the product family is `omni-executor/packaging/icon.icns`, a macOS
+    bundle icon that `LoadImageW` cannot read). The function stays because
+    the spec requires the icon and the mechanism is the part worth getting
+    right; point it at a real `.ico` when one is drawn and both QEMU's
+    window and the bar get it from here.
+    """
+    hicon = u.LoadImageW(None, str(icon), IMAGE_ICON, 0, 0,
+                         LR_LOADFROMFILE | LR_DEFAULTSIZE)
     if hicon:
         u.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
         u.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+
+
+# ---------- DWM: the caption is ours, so it should look like ours ----------
+#
+# Design spec §3a: QEMU's window gives up its whole caption and the strip
+# (windowbar.py) becomes the title bar -- "DWM styling (dark mode, rounded
+# corners, border colour) therefore applies to the strip, which is the window
+# that has a caption". §3b lists the same three under Windows' "chrome applied
+# by" column. This is the half of "restyled chrome" that is not geometry.
+#
+# The attribute numbers are DWMWINDOWATTRIBUTE values. They are passed as bare
+# ints rather than through an enum import because there is no such enum in the
+# stdlib and the numbers are the API:
+#
+#   20  DWMWA_USE_IMMERSIVE_DARK_MODE   BOOL   dark caption + dark title text
+#   33  DWMWA_WINDOW_CORNER_PREFERENCE  int    2 = DWMWCP_ROUND
+#   34  DWMWA_BORDER_COLOR              COLORREF (0x00BBGGRR)
+#
+# 33 and 34 are Windows 11 (build 22000) only, and 20 needs Windows 10 2004.
+# An OLDER Windows does not crash on them: DwmSetWindowAttribute returns a
+# non-zero HRESULT (E_INVALIDARG) and changes nothing, which is why each is
+# applied independently and none of them is allowed to abort the others. On
+# Windows 10, 20 lands and 33/34 do not, which is exactly the right outcome --
+# a dark caption with square corners.
+DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWA_BORDER_COLOR = 34
+
+DWMWCP_ROUND = 2
+
+# COLORREF is 0x00BBGGRR, NOT RGB. This is #2B2B2B either way (neutral dark),
+# picked to sit against the dark caption rather than to be a brand colour --
+# there is no brand palette in this repository to draw one from.
+BAR_BORDER_COLOR = 0x002B2B2B
+
+
+def _dwmapi():
+    """dwmapi, imported lazily -- its own seam, like `_user32()`.
+
+    Separate from `_user32()` because it is a different DLL and because a
+    host too old to have it at all (or a non-Windows one reached by mistake)
+    must fail as a False, not as an ImportError out of a window's setup.
+    """
+    import ctypes
+    return ctypes.windll.dwmapi
+
+
+def _set_dwm_attribute(hwnd, attribute, value):
+    """One DwmSetWindowAttribute call. True when DWM accepted it.
+
+    Each attribute is set on its own so one the running Windows does not know
+    (33/34 on Windows 10) cannot take the ones it does know down with it.
+    """
+    import ctypes
+    try:
+        data = ctypes.c_int(int(value))
+        hresult = _dwmapi().DwmSetWindowAttribute(
+            hwnd, ctypes.c_uint(attribute), ctypes.byref(data),
+            ctypes.sizeof(data))
+        return hresult == 0
+    except Exception:      # noqa: BLE001 - chrome never fails anything
+        return False
+
+
+def apply_dwm_style(hwnd, dark=True, rounded=True,
+                    border_color=BAR_BORDER_COLOR):
+    """Dark caption, rounded corners and our border colour on `hwnd`.
+
+    Returns {"dark", "rounded", "border"} -> bool, so a caller (and a test)
+    can see WHICH of the three this Windows accepted rather than one blended
+    answer. Never raises: this is paint, and paint has never been worth a
+    boot or a window.
+
+    Applied to the BAR, not to QEMU's window: QEMU's window no longer has a
+    caption for a dark caption to apply to (apply_chrome strips WS_CAPTION),
+    and its corners are the composite's bottom corners, which the strip does
+    not own.
+    """
+    if backend() != BACKEND_WIN32 or not hwnd:
+        return {"dark": False, "rounded": False, "border": False}
+    return {
+        "dark": bool(dark) and _set_dwm_attribute(
+            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1),
+        "rounded": bool(rounded) and _set_dwm_attribute(
+            hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND),
+        "border": border_color is not None and _set_dwm_attribute(
+            hwnd, DWMWA_BORDER_COLOR, border_color),
+    }
 
 
 def _window_rect(hwnd):

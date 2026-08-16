@@ -60,6 +60,24 @@ SWP_FRAMECHANGED = 0x0020
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 
+# How often the bar re-reads the guest window's rect and re-aligns itself.
+#
+# A POLL, not SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE). The hook is the
+# textbook answer and it is the wrong tool here: it delivers a cross-process
+# callback on a thread of Windows' choosing, which then has to be marshalled
+# into Tk's event loop before it may touch a single widget, and getting that
+# wrong is a class of bug (a Tk call from the wrong thread) that shows up as
+# an intermittent hang rather than an error. What it buys over a poll is
+# sub-frame latency on a title bar.
+#
+# 60 ms (~16 looks a second) is the interval. One GetWindowRect is a few
+# microseconds and the SetWindowPos only happens when the rect actually
+# CHANGED, so an idle bar costs ~16 syscalls a second and nothing else, while
+# a window being dragged or resized keeps its bar within about one frame at
+# 60 Hz. Slower reads as the bar lagging behind the window; faster buys
+# nothing an eye can see.
+FOLLOW_POLL_MS = 60
+
 
 def _user32():
     import ctypes
@@ -193,6 +211,13 @@ class WindowBar:
         self.on_stop = on_stop
         self.owner_hwnd = None
         self.bar_hwnd = None
+        # The owner rect the bar is currently aligned to. It is what stops
+        # the follow poll and the drag handler fighting each other: the poll
+        # re-aligns only when the owner has moved to somewhere this is NOT,
+        # and `drag_owner_to_bar` updates it the instant it moves the owner,
+        # so the owner move the drag itself caused never reads as one the
+        # poll has to chase.
+        self.synced_owner_rect = None
         # Set by on_close() when a "stop" answer's hook raised. The RETURN
         # VALUE of on_close() stays "stop" regardless -- that is the CHOICE
         # the user made, not whether it worked -- so this flag is the only
@@ -246,9 +271,125 @@ class WindowBar:
                     u.SetWindowPos(self.bar_hwnd, 0, x, owner_top - actual_height,
                                   0, 0,
                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE)
+            self.synced_owner_rect = tuple(owner_rect)
             return True
         except Exception:      # noqa: BLE001
             return False
+
+    def owner_rect(self):
+        """The guest window's (x, y, w, h) right now, or None if it is gone.
+
+        Read straight off the owner HWND we already hold, NOT via
+        `hostwin.window_geometry`: that re-finds the window by title/pid on
+        every call, which enumerates every top-level window on the desktop
+        and every one of their children. Fine once at startup, absurd
+        sixteen times a second.
+        """
+        if self.owner_hwnd is None:
+            return None
+        try:
+            return _window_rect(self.owner_hwnd)
+        except Exception:      # noqa: BLE001
+            return None
+
+    def owner_is_alive(self):
+        """False once the guest's window has been destroyed.
+
+        The bar is an OWNED window, so Windows destroys it with its owner and
+        this should never come back False in the normal case. It covers the
+        gap where it does not fire (an owner that vanished without a clean
+        destroy) rather than leaving a title bar captioning nothing.
+        """
+        if self.owner_hwnd is None:
+            return False
+        try:
+            return bool(_user32().IsWindow(self.owner_hwnd))
+        except Exception:      # noqa: BLE001
+            return True     # cannot tell: never close the bar on a guess
+
+    def owner_is_minimised(self):
+        """Whether the guest window is iconic right now.
+
+        A minimised window's GetWindowRect is Windows' off-screen parking
+        position (-32000, -32000), not where the window will be when it comes
+        back, so following it would move the bar somewhere meaningless and
+        then have to undo it on restore. The bar minimises with its owner
+        anyway -- that is one of the three properties ownership buys -- so
+        there is nothing to follow while it is down.
+        """
+        if self.owner_hwnd is None:
+            return False
+        try:
+            return bool(_user32().IsIconic(self.owner_hwnd))
+        except Exception:      # noqa: BLE001
+            return False
+
+    def poll_follow(self):
+        """One tick: re-align the bar if the guest window has moved or resized.
+
+        Returns True when it moved the bar. Cheap on the common tick (one
+        GetWindowRect, no move) -- see FOLLOW_POLL_MS.
+        """
+        if self.bar_hwnd is None or self.owner_is_minimised():
+            return False
+        rect = self.owner_rect()
+        if rect is None or tuple(rect) == self.synced_owner_rect:
+            return False
+        return self.follow(rect)
+
+    def drag_owner_to_bar(self):
+        """The bar was dragged: move the guest window under it. Returns True
+        when it moved something.
+
+        THE BAR IS THE TITLE BAR, so dragging it has to move the window --
+        that is what a title bar is for, and here it is also the only way the
+        window can be moved at all. `apply_chrome` strips WS_CAPTION *and*
+        WS_SYSMENU from QEMU's window, which leaves it with nothing to drag
+        and no Alt+Space -> Move either; without this the composite was
+        nailed to wherever QEMU first put it, and our bar could be dragged
+        off on its own and never came back.
+
+        Called from the bar's own <Configure>, so it runs for a native
+        caption drag (Windows' own move loop, which is what actually moves
+        this window), for a keyboard move, and for anything else that
+        repositions the bar. It compares where the bar IS against where it
+        BELONGS relative to the owner and moves the owner by the difference,
+        which needs no drag-start bookkeeping and cannot drift.
+
+        "Belongs" uses the bar's ACTUAL height, not BAR_HEIGHT: Windows
+        enforces its own minimum caption height (measured 40px against a
+        requested 34), and follow() already lands the bar's BOTTOM edge on
+        the owner's TOP edge. Comparing against the requested height instead
+        would read that correction as a drag of the difference and walk the
+        guest window down the screen a few pixels per tick.
+        """
+        if self.bar_hwnd is None or self.owner_hwnd is None:
+            return False
+        if self.owner_is_minimised():
+            return False
+        try:
+            bar = _window_rect(self.bar_hwnd)
+        except Exception:      # noqa: BLE001
+            return False
+        owner = self.owner_rect()
+        if bar is None or owner is None:
+            return False
+        dx = bar[0] - owner[0]
+        dy = bar[1] - (owner[1] - bar[3])
+        if dx == 0 and dy == 0:
+            return False
+        try:
+            _user32().SetWindowPos(self.owner_hwnd, 0,
+                                   owner[0] + dx, owner[1] + dy, 0, 0,
+                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE)
+        except Exception:      # noqa: BLE001
+            return False
+        # Record where the owner now is BEFORE the poll can look, or the poll
+        # reads the move this drag just made as one it has to chase and
+        # yanks the bar back mid-drag.
+        self.synced_owner_rect = (owner[0] + dx, owner[1] + dy,
+                                  owner[2], owner[3])
+        return True
 
     def on_close(self, parent=None):
         """The X was clicked. Returns "hide", "stop" or "cancel".
@@ -264,7 +405,18 @@ class WindowBar:
         answer = _ask_close(parent)
         self.stop_failed = False
         if answer == "hide":
-            hostwin.hide_qemu_window(self.identity)
+            # `pid`, not the identity alone. hostwin matches the window TITLE
+            # as a SUBSTRING, so "omni-farm3" also matches "omni-farm30" --
+            # with several instances up, the X on one bar hid a different
+            # user's window. Same defect, same fix as `cmd_view`'s own calls;
+            # this one was simply never carried across, which is why
+            # __init__ has stored `self.pid` all along without using it.
+            #
+            # timeout=2, not hostwin's 20 s default: this runs on the bar's
+            # UI thread inside a Tk callback, so the default would freeze the
+            # bar -- unrepaintable, unclickable -- for twenty seconds in
+            # exactly the case where there is no window to find.
+            hostwin.hide_qemu_window(self.identity, pid=self.pid, timeout=2)
         elif answer == "stop" and self.on_stop:
             try:
                 self.on_stop(self.identity)
@@ -329,13 +481,62 @@ def _create_bar_window(title):
     return root, bar_hwnd
 
 
+def attach_follow(root, bar):
+    """Keep the bar and the guest window locked together, both ways.
+
+    Two mechanisms, because the composite can be moved from either end:
+
+      * a `root.after` poll (FOLLOW_POLL_MS) re-aligns the bar when the GUEST
+        window moves or resizes -- dragging its sizing border, a Windows snap,
+        Win+arrow, anything;
+      * the bar's own `<Configure>` moves the GUEST when the BAR is dragged,
+        because the bar IS the title bar (drag_owner_to_bar).
+
+    `<Configure>` rather than Tk button bindings: the bar's client area is
+    ~0px tall (BAR_HEIGHT sits under Windows' own minimum caption height), so
+    there is no widget under the pointer to bind to -- the drag happens on
+    the real Win32 caption and Windows runs its own modal move loop for it.
+    Tk's Windows window procedure calls Tcl_ServiceAll() on every message, so
+    the binding still fires DURING that loop rather than only at the end.
+
+    Returns the tick function, so a test can step the poll by hand instead of
+    running a mainloop.
+    """
+    def tick():
+        # The owner is gone: close, rather than leave a title bar captioning
+        # nothing. Ownership normally does this for us (Windows destroys an
+        # owned window with its owner, which is what lets `stop` clean the
+        # bar up for free); this covers the case where it does not fire.
+        if not bar.owner_is_alive():
+            try:
+                root.destroy()
+            except Exception:      # noqa: BLE001
+                pass
+            return
+        bar.poll_follow()
+        try:
+            root.after(FOLLOW_POLL_MS, tick)
+        except Exception:      # noqa: BLE001 - the window went away mid-tick
+            pass
+
+    def on_configure(event):
+        # Only the toplevel's own Configure, not a child widget's.
+        if event.widget is root:
+            bar.drag_owner_to_bar()
+
+    root.bind("<Configure>", on_configure)
+    root.after(FOLLOW_POLL_MS, tick)
+    return tick
+
+
 def run_window_bar(identity, title=None, pid=None, on_stop=None):
     """Show the guest's window with our bar above it. Blocks until closed.
 
     Returns 0 when the bar ran, 2 when there was no window to attach to, 3 on
-    a host where this is not implemented, and 4 when the bar's own top-level
-    handle could not be resolved (see below) -- a distinct code from 2/3
-    because it is neither "no window" nor "wrong platform".
+    a host where this is not implemented, 4 when the bar's own top-level
+    handle could not be resolved (see below), and 5 when the ownership call
+    itself failed -- each distinct, because "no window", "wrong platform",
+    "no handle" and "handle, but it would not own" need different answers.
     """
     if not IS_WINDOWS:
         sys.stderr.write(
@@ -357,7 +558,28 @@ def run_window_bar(identity, title=None, pid=None, on_stop=None):
             f"for '{identity}' (GetAncestor failed); not attaching a bar "
             f"it could not actually own\n")
         return 4
-    bar.own(bar_hwnd, owner)
+    # own()'s return value is NOT discardable. On failure `bar.bar_hwnd` is
+    # never set, so follow() returns False on its first line and the bar sits
+    # at Tk's own default size -- reproducing the exact 216x239 square
+    # task-9-report.md measured and fixed -- AND it is not owned, so `stop`
+    # destroying QEMU's window no longer takes it with it and the user is
+    # left with an orphan bar over nothing. A failed GetAncestor is already a
+    # hard failure here for precisely those reasons; this is the same failure
+    # one call later and gets the same treatment.
+    if not bar.own(bar_hwnd, owner):
+        root.destroy()
+        sys.stderr.write(
+            f"window bar: could not make the bar an owned window of the "
+            f"QEMU window for '{identity}' (SetWindowLongPtr GWLP_HWNDPARENT "
+            f"failed); not opening a bar that would not float above the "
+            f"guest, would not minimise with it, and would outlive it\n")
+        return 5
+
+    # Design spec 3a/3b: the strip is the window that HAS a caption now, so
+    # the DWM styling the spec asks for belongs on it. Best-effort by
+    # contract -- an older Windows silently keeps square corners and a light
+    # caption, which is chrome, not function.
+    hostwin.apply_dwm_style(bar_hwnd)
 
     rect = hostwin.window_geometry(identity, pid=pid)
     if rect:
@@ -373,5 +595,9 @@ def run_window_bar(identity, title=None, pid=None, on_stop=None):
             root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_delete)
+    # AFTER the first follow(), so the poll's very first tick compares
+    # against a rect the bar is already aligned to and the <Configure> that
+    # follow() itself generated cannot be read as a user drag.
+    attach_follow(root, bar)
     root.mainloop()
     return 0

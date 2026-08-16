@@ -142,5 +142,131 @@ class ChromeOnLinuxIsDeferredAndSaysSo(unittest.TestCase):
         self.assertIn("hwnd", result)
 
 
+class FakeDwmapi:
+    """Records DwmSetWindowAttribute calls, and can refuse the Windows 11
+    attributes the way a Windows 10 host does (E_INVALIDARG)."""
+
+    def __init__(self, refuse=()):
+        self.calls = []
+        self.refuse = set(refuse)
+
+    def DwmSetWindowAttribute(self, hwnd, attribute, _data, _size):
+        attr = attribute.value if hasattr(attribute, "value") else attribute
+        self.calls.append((hwnd, attr))
+        return 0x80070057 if attr in self.refuse else 0     # E_INVALIDARG
+
+
+class TheDwmStylingTheSpecAsksFor(unittest.TestCase):
+    """Design spec 3a/3b: QEMU's window gives up its whole caption, so the
+    strip is the window that HAS one and "DWM styling (dark mode, rounded
+    corners, border colour) therefore applies to the strip". None of it
+    existed -- there was no DwmSetWindowAttribute anywhere in the tree, and
+    what shipped as "restyled chrome" was caption + geometry only.
+    """
+
+    def _apply(self, dwm, **kw):
+        with mock.patch.object(hostwin, "backend",
+                               return_value=hostwin.BACKEND_WIN32), \
+             mock.patch.object(hostwin, "_dwmapi", return_value=dwm):
+            return hostwin.apply_dwm_style(11, **kw)
+
+    def test_all_three_attributes_are_set_on_windows_11(self):
+        dwm = FakeDwmapi()
+        result = self._apply(dwm)
+        self.assertEqual(result, {"dark": True, "rounded": True,
+                                  "border": True})
+        self.assertEqual([a for _h, a in dwm.calls],
+                         [hostwin.DWMWA_USE_IMMERSIVE_DARK_MODE,
+                          hostwin.DWMWA_WINDOW_CORNER_PREFERENCE,
+                          hostwin.DWMWA_BORDER_COLOR])
+
+    def test_the_attribute_numbers_are_the_documented_ones(self):
+        # These ARE the API; a typo here is a silent no-op on real hardware.
+        self.assertEqual(hostwin.DWMWA_USE_IMMERSIVE_DARK_MODE, 20)
+        self.assertEqual(hostwin.DWMWA_WINDOW_CORNER_PREFERENCE, 33)
+        self.assertEqual(hostwin.DWMWA_BORDER_COLOR, 34)
+        self.assertEqual(hostwin.DWMWCP_ROUND, 2)
+
+    def test_a_windows_10_host_still_gets_its_dark_caption(self):
+        # 33 and 34 are Windows 11 (22000) only and come back E_INVALIDARG
+        # there. Each attribute is set independently precisely so one the
+        # running Windows does not know cannot take the others with it.
+        dwm = FakeDwmapi(refuse=(hostwin.DWMWA_WINDOW_CORNER_PREFERENCE,
+                                 hostwin.DWMWA_BORDER_COLOR))
+        self.assertEqual(self._apply(dwm),
+                         {"dark": True, "rounded": False, "border": False})
+
+    def test_a_dwmapi_that_blows_up_is_three_falses_not_an_exception(self):
+        class Boom:
+            def DwmSetWindowAttribute(self, *_a):
+                raise OSError("dwmapi.dll is not here")
+
+        self.assertEqual(self._apply(Boom()),
+                         {"dark": False, "rounded": False, "border": False})
+
+    def test_a_non_windows_host_declines_without_touching_dwmapi(self):
+        dwm = FakeDwmapi()
+        with mock.patch.object(hostwin, "backend",
+                               return_value=hostwin.BACKEND_XDOTOOL), \
+             mock.patch.object(hostwin, "_dwmapi", return_value=dwm):
+            result = hostwin.apply_dwm_style(11)
+        self.assertEqual(result, {"dark": False, "rounded": False,
+                                  "border": False})
+        self.assertEqual(dwm.calls, [])
+
+    def test_the_border_colour_is_a_colorref_not_an_rgb(self):
+        # COLORREF is 0x00BBGGRR. #2B2B2B is symmetric so the value cannot
+        # catch a byte-order slip on its own -- what this pins is that it is
+        # a plain int in COLORREF range rather than a string or a tuple.
+        self.assertIsInstance(hostwin.BAR_BORDER_COLOR, int)
+        self.assertTrue(0 <= hostwin.BAR_BORDER_COLOR <= 0x00FFFFFF)
+
+
+class TheIconGoesThroughTheSameSeamAsEverythingElse(unittest.TestCase):
+    """`_apply_icon` reached for `ctypes.windll.user32` directly for the
+    LoadImageW half and used the injected `u` for the SendMessageW half, so
+    a test could stand in for half the function and the other half went to
+    the real Win32 API. One seam or none.
+
+    NO CALLER PASSES AN ICON TODAY and this suite does not pretend one does:
+    there is no `.ico` in this repository (the only icon asset in the product
+    family is a macOS `.icns`, which LoadImageW cannot read). What is pinned
+    is the mechanism, so pointing it at a real file is the only remaining
+    step.
+    """
+
+    def test_load_and_set_both_go_through_the_injected_user32(self):
+        class FakeIconUser32(FakeUser32):
+            def __init__(self):
+                super().__init__()
+                self.loaded = []
+
+            def LoadImageW(self, inst, name, kind, cx, cy, flags):
+                self.loaded.append((name, kind, flags))
+                return 777
+
+        u = FakeIconUser32()
+        hostwin._apply_icon(u, 4242, "C:/omni.ico")
+        self.assertEqual(len(u.loaded), 1)
+        name, kind, flags = u.loaded[0]
+        self.assertEqual(name, "C:/omni.ico")
+        self.assertEqual(kind, hostwin.IMAGE_ICON)
+        self.assertTrue(flags & hostwin.LR_LOADFROMFILE)
+        # Both sizes, per spec 3b's WM_SETICON.
+        self.assertEqual(
+            u.icons,
+            [(hostwin.WM_SETICON, hostwin.ICON_SMALL, 777),
+             (hostwin.WM_SETICON, hostwin.ICON_BIG, 777)])
+
+    def test_an_icon_that_will_not_load_sets_nothing(self):
+        class NoIconUser32(FakeUser32):
+            def LoadImageW(self, *_a):
+                return 0
+
+        u = NoIconUser32()
+        hostwin._apply_icon(u, 4242, "C:/missing.ico")
+        self.assertEqual(u.icons, [])
+
+
 if __name__ == "__main__":
     unittest.main()
