@@ -331,26 +331,64 @@ _WINDOW_FLAGS = {
 }
 
 
-def window_flags(backend):
+# Platforms whose window suboptions a REAL QEMU BINARY HAS ACCEPTED.
+#
+# Deliberately not _WINDOW_PRESENT_PLATFORMS, and deliberately narrower than
+# it. Those two constants answer different questions: that one is "should this
+# boot present in a window", this one is "have these suboptions been run".
+# QEMU refuses an unknown suboption OUTRIGHT rather than ignoring it, so
+# guessing here does not cost the chrome, it costs the BOOT -- and "a
+# detection bug may cost the GPU; it may never cost a boot" is the rule this
+# file is built on.
+#
+# Windows is the only entry because it is the only host that has run them:
+# gtk with all three, measured on this hardware.
+#
+# LINUX is out for the reason it has always been out -- untested gtk/sdl.
+# MACOS is out as of 2026-08-16 for the SAME reason and it is not
+# hypothetical: today's Homebrew QEMU has no virglrenderer, so a Mac gaming
+# boot lands on the SOFTWARE window tier, and with macOS in this gate that
+# tier emitted `-display cocoa,zoom-to-fit=on` where it used to emit plain
+# `cocoa`. cocoa has never met a real binary in this project. If it refuses
+# the suboption, every Mac gaming boot fails outright rather than degrading.
+# Put "macos" back the day a real Mac QEMU has accepted `zoom-to-fit=on`.
+#
+# NOTE the asymmetry, which is intended: macOS stays in
+# _WINDOW_PRESENT_PLATFORMS. Taking it out of THAT would change which display
+# a Mac gaming boot picks (an explicit `qemu.headless_gl: true` would beat the
+# profile again and land on a non-presenting egl-headless context), which is a
+# policy change nobody asked for and the opposite of a safe one.
+_WINDOW_FLAG_PLATFORMS = ("windows",)
+
+
+def window_flags(backend, policy=None):
     """Comma-joined suboptions for a presented window on `backend`.
 
-    Gated on _WINDOW_PRESENT_PLATFORMS (defined below, near gpu_policy() —
-    resolved at call time, so the forward reference is fine): these
-    suboptions are OUR chrome policy, not QEMU's defaults, and we do not
-    impose chrome on a platform we cannot run. QEMU refuses an unknown
-    suboption OUTRIGHT rather than ignoring it, so if the assumption that
-    Linux's gtk accepts all three turns out wrong, `--gpu window` on Linux
-    (a real, explicit escape hatch -- not just the gated `auto` path) would
-    stop booting entirely rather than degrade, and that assumption is
-    UNTESTED there. Linux therefore keeps QEMU's bare backend/gl argv,
-    unchanged from before this file grew window_flags(), until a Linux host
-    verifies the suboptions -- exactly the same gate _presents_a_window()
-    already applies, and the same flip re-enables both at once.
+    Two gates, and a boot has to clear both.
+
+    PLATFORM (_WINDOW_FLAG_PLATFORMS, defined above): these suboptions are
+    OUR chrome policy, not QEMU's defaults, and QEMU refuses an unknown one
+    outright rather than ignoring it -- so a platform whose backend has not
+    actually been run gets QEMU's bare backend/gl argv instead of a guess
+    that would fail the boot rather than degrade it. See that constant for
+    which platforms are out and why.
+
+    POLICY: `--gpu window` is defined by the design spec (3d) as "always a
+    visible native window, UNSTYLED -- for debugging a GL problem with none
+    of this code in the path", and flags are this code. It was getting
+    `window-close=off` while `_hide_window_if_wanted` deliberately leaves a
+    `window` boot on screen and `view` spawns no bar for it, which left the
+    debug window with an inert X, no bar offering the close prompt, and no
+    way to close it at all short of `omnidroid stop`. The debugging hatch has
+    to be the configuration with the least of our behaviour in it, not the
+    most.
 
     An unrecognised backend gets "" rather than a guess: an unknown suboption
     is a refused boot, and no flag at all is merely a plainer window.
     """
-    if _platform_key() not in _WINDOW_PRESENT_PLATFORMS:
+    if policy == GPU_WINDOW:
+        return ""
+    if _platform_key() not in _WINDOW_FLAG_PLATFORMS:
         return ""
     return ",".join(_WINDOW_FLAGS.get(backend, ()))
 
@@ -411,7 +449,7 @@ def _qemu_help_texts(tool):
 
 
 def default_display(qemu_display_help="", qemu_device_help="", has_gui=True,
-                    panel=None, cfg=None):
+                    panel=None, cfg=None, policy=None):
     """What kind of window this host can open, as a capability descriptor.
 
     Pure: every host fact is an argument, so the whole matrix is unit-testable
@@ -424,6 +462,11 @@ def default_display(qemu_display_help="", qemu_device_help="", has_gui=True,
         display_args  the -display pair to use
         reason        human-readable, and ACTIONABLE when a tier was missed
                       ("your QEMU lacks X") rather than just "unavailable"
+
+    `policy` is this boot's GPU policy, passed through to window_flags():
+    `--gpu window` is specified as an UNSTYLED window and must therefore get
+    none of our suboptions. It defaults to None so every caller that only
+    asks "what can this host do" keeps the styled answer.
     """
     def _none(reason):
         return {"available": False, "tier": "none", "gpu_args": [],
@@ -441,14 +484,18 @@ def default_display(qemu_display_help="", qemu_device_help="", has_gui=True,
         return {"available": True, "tier": "gl",
                 "gpu_args": ["-device", gl_device_arg(panel, cfg)],
                 "display_args": ["-display",
-                                 ",".join(filter(None, (backend, gl,
-                                                        window_flags(backend))))],
+                                 ",".join(filter(None,
+                                                 (backend, gl,
+                                                  window_flags(backend,
+                                                               policy))))],
                 "reason": f"{backend},{gl} + {GL_GPU_DEVICE} (3D accelerated)"}
     return {"available": True, "tier": "window",
             "gpu_args": list(HEADLESS_GPU_ARGS),
             "display_args": ["-display",
                              ",".join(filter(None,
-                                             (backend, window_flags(backend))))],
+                                             (backend,
+                                              window_flags(backend,
+                                                           policy))))],
             "reason": (f"native {backend} window, software rendering — this "
                        f"QEMU has no {GL_GPU_DEVICE} (built without "
                        f"virglrenderer/OpenGL)")}
@@ -1151,6 +1198,12 @@ def gpu_policy(cfg=None, mode=None):
 # beside a GL window. macOS is present and needs no gate: its egl-headless
 # does NOT present (HEADLESS_GL_PRESENTS), so _headless_gl_pair returns None
 # there and the window path is reached anyway.
+#
+# NOT the same list as _WINDOW_FLAG_PLATFORMS, which gates the window
+# SUBOPTIONS. "Should this boot present in a window" and "has a real binary
+# accepted these suboptions" are different questions with different costs for
+# getting them wrong: the first costs the GPU, the second costs the boot. See
+# _WINDOW_FLAG_PLATFORMS for why macOS answers yes here and no there.
 _WINDOW_PRESENT_PLATFORMS = ("windows", "macos")
 
 
@@ -1227,7 +1280,7 @@ def resolve_gpu_display(mode, interactive, tool, cfg=None):
 
     # auto with no headless GL, or an explicit window request.
     cap = default_display(*_qemu_help_texts(tool), has_gui=_host_has_gui(),
-                          panel=panel_for(mode, cfg), cfg=cfg)
+                          panel=panel_for(mode, cfg), cfg=cfg, policy=policy)
     if not cap.get("available"):
         print(f"[gpu] no host window available ({cap.get('reason')}); "
               f"booting headless in software")

@@ -134,18 +134,19 @@ class WindowFlagsAreBackendSpecific(unittest.TestCase):
     -display cocoa takes zoom-to-fit only -- no window-close, which is one
     more reason macOS gets its close behaviour from the QEMU patch.
 
-    window_flags() is gated on _WINDOW_PRESENT_PLATFORMS (see
-    TheFlagsAreGatedToPlatformsThatPresent below for that gate itself), so
-    every test here pins the platform to "windows" -- a window-presenting
-    platform -- to test backend content in isolation from the gate. Without
-    this the suite would pass or fail by accident depending on which OS runs
-    it, exactly the coupling that made the gate's absence hard to catch.
+    window_flags() is gated on _WINDOW_FLAG_PLATFORMS (see
+    TheFlagsAreGatedToPlatformsThatPresent below for the gates themselves),
+    so every test here pins the platform to "windows" -- the one platform
+    whose suboptions a real binary has accepted -- to test backend content in
+    isolation from the gate. Without this the suite would pass or fail by
+    accident depending on which OS runs it, exactly the coupling that made
+    the gate's absence hard to catch.
     """
 
-    def _flags(self, backend, platform_key="windows"):
+    def _flags(self, backend, platform_key="windows", policy=None):
         with mock.patch.object(qemu_proc, "_platform_key",
                                return_value=platform_key):
-            return qemu_proc.window_flags(backend)
+            return qemu_proc.window_flags(backend, policy)
 
     def test_gtk_gets_all_three(self):
         flags = self._flags("gtk")
@@ -159,11 +160,18 @@ class WindowFlagsAreBackendSpecific(unittest.TestCase):
         self.assertNotIn("show-menubar", flags)
         self.assertNotIn("zoom-to-fit", flags)
 
-    def test_cocoa_never_gets_window_close(self):
-        flags = self._flags("cocoa", platform_key="macos")
-        self.assertIn("zoom-to-fit=on", flags)
-        self.assertNotIn("window-close", flags)
-        self.assertNotIn("show-menubar", flags)
+    def test_cocoas_own_entry_never_carries_window_close(self):
+        # The TABLE, not the gated result: macOS is out of
+        # _WINDOW_FLAG_PLATFORMS (see the gate tests below), so
+        # window_flags("cocoa") is "" on every platform today and could not
+        # tell a correct table from an empty one. What must not be lost is
+        # WHY cocoa's row is short -- QEMU's cocoa display takes neither
+        # window-close nor show-menubar, which is one more reason macOS gets
+        # its close behaviour from the QEMU patch rather than from a flag.
+        cocoa = qemu_proc._WINDOW_FLAGS["cocoa"]
+        self.assertIn("zoom-to-fit=on", cocoa)
+        self.assertNotIn("window-close=off", cocoa)
+        self.assertNotIn("show-menubar=off", cocoa)
 
     def test_an_unknown_backend_gets_nothing_rather_than_a_refused_boot(self):
         self.assertEqual(self._flags("wayland-thing"), "")
@@ -188,22 +196,33 @@ class TheFlagsReachTheCommand(unittest.TestCase):
             ["-display", display[1]]))
 
 
-class TheFlagsAreGatedToPlatformsThatPresent(unittest.TestCase):
-    """window_flags() is OUR chrome policy, not QEMU's defaults, and Linux
-    has not verified that its gtk/sdl accept these suboptions --
-    _WINDOW_PRESENT_PLATFORMS is the one gate that already says which
-    platforms have (see ProfileDecidesTheDisplay's Linux test above).
+class TheFlagsAreGatedTwice(unittest.TestCase):
+    """window_flags() is OUR chrome policy, and two separate gates keep it
+    off boots that must not have it.
+
+    PLATFORM (_WINDOW_FLAG_PLATFORMS): QEMU refuses an unknown suboption
+    OUTRIGHT rather than ignoring it, so a platform whose backend has never
+    been run against a real binary must not be guessed at -- getting it wrong
+    does not cost the chrome, it costs the BOOT. Linux's gtk/sdl and macOS's
+    cocoa are both unverified; only Windows has run them.
+
+    POLICY: `--gpu window` is specified as "always a visible native window,
+    UNSTYLED -- for debugging a GL problem with none of this code in the
+    path" (design spec 3d), and flags are this code. It is also the one
+    policy `_hide_window_if_wanted` leaves on screen and `view` spawns no bar
+    for, so `window-close=off` on it produced a window with an inert X, no
+    bar offering the close prompt, and no way to close it at all short of
+    `omnidroid stop`.
 
     `--gpu window` is a real, documented, explicit escape hatch, and unlike
     `auto` -- which _presents_a_window() already keeps off Linux -- it
     reaches default_display() on EVERY platform, Linux included (see
     resolve_gpu_display: the GPU_HEADLESS/no-window-on-auto branch only
     early-returns for GPU_HEADLESS or GPU_AUTO, so GPU_WINDOW falls straight
-    through to default_display() regardless of platform). That is the one
-    path that would otherwise have silently changed Linux's boot argv.
+    through to default_display() regardless of platform).
     """
 
-    def resolve(self, mode, platform_key, cfg):
+    def resolve(self, mode, platform_key, cfg=None):
         return _resolve_display(mode, platform_key, cfg)
 
     def test_explicit_window_policy_on_linux_keeps_qemus_own_argv(self):
@@ -211,12 +230,45 @@ class TheFlagsAreGatedToPlatformsThatPresent(unittest.TestCase):
                                      {"qemu": {"gpu": "window"}})
         self.assertEqual(display, ["-display", "gtk,gl=on"])
 
-    def test_explicit_window_policy_on_windows_still_carries_our_flags(self):
+    def test_explicit_window_policy_on_windows_is_unstyled_too(self):
+        """The debugging hatch has the LEAST of our behaviour in it, not the
+        most. Windows is the one platform whose flags are verified, so this
+        is the policy gate on its own with the platform gate satisfied."""
         _gpu, display = self.resolve(GAMING, "windows",
                                      {"qemu": {"gpu": "window"}})
+        self.assertEqual(display, ["-display", "gtk,gl=on"])
+
+    def test_the_same_windows_boot_on_auto_DOES_carry_our_flags(self):
+        # The control for the test above: without the policy gate firing,
+        # this is the styled window the product path uses.
+        _gpu, display = self.resolve(GAMING, "windows")
         self.assertIn("show-menubar=off", display[1])
         self.assertIn("window-close=off", display[1])
         self.assertIn("zoom-to-fit=on", display[1])
+
+    def test_macos_gets_qemus_own_argv_until_a_real_mac_binary_accepts_ours(self):
+        """Not hypothetical, and not confined to future work: today's
+        Homebrew QEMU has no virglrenderer, so a Mac gaming boot takes the
+        SOFTWARE window tier -- which briefly emitted `-display
+        cocoa,zoom-to-fit=on` where it had always emitted plain `cocoa`. No
+        Mac binary in this project has ever been asked whether cocoa accepts
+        that suboption, and QEMU refuses an unknown one outright, so the
+        downside was every Mac gaming boot failing rather than a plainer
+        window. Same reasoning that keeps Linux out, applied consistently."""
+        _gpu, display = self.resolve(GAMING, "macos")
+        self.assertEqual(display, ["-display", "cocoa,gl=es"])
+
+    def test_macos_still_PRESENTS_a_window_though(self):
+        """The two gates are separate constants on purpose. Taking macOS out
+        of the FLAG gate must not take it out of the PRESENT one: that would
+        change which display a Mac gaming boot picks, which is a policy
+        change nobody asked for."""
+        self.assertIn("macos", qemu_proc._WINDOW_PRESENT_PLATFORMS)
+        self.assertNotIn("macos", qemu_proc._WINDOW_FLAG_PLATFORMS)
+
+    def test_linux_is_in_neither_gate(self):
+        self.assertNotIn("linux", qemu_proc._WINDOW_PRESENT_PLATFORMS)
+        self.assertNotIn("linux", qemu_proc._WINDOW_FLAG_PLATFORMS)
 
 
 class RunRecordSaysWhatTheDisplayIs(unittest.TestCase):

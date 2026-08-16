@@ -92,18 +92,24 @@ class DetectsTheWindowTier(unittest.TestCase):
     """The tier the primary host actually has today."""
 
     def test_macos_without_virgl_still_gets_a_native_window(self):
-        # assertIn rather than an exact string: window_flags() now appends
-        # this backend's suboptions (test_gaming_window_policy.py) — cocoa
-        # gets zoom-to-fit=on. That is a separate concern from what this test
-        # checks, which is the tier and the backend itself.
+        """...and gets it with QEMU's OWN argv, no suboptions of ours.
+
+        THIS IS TODAY'S MAC, not a hypothetical one: Homebrew's QEMU has no
+        virglrenderer, so a Mac gaming boot lands here, on the software
+        window tier. Between 2026-08-15 and 2026-08-16 this test asserted
+        `zoom-to-fit=on` was appended, which meant every Mac gaming boot
+        started emitting `-display cocoa,zoom-to-fit=on` where it had always
+        emitted plain `cocoa`. QEMU refuses an unknown suboption OUTRIGHT,
+        and no Mac binary in this project has ever been asked whether cocoa
+        takes that one -- so the downside was not a plainer window, it was
+        every Mac gaming boot failing to start. macOS is out of
+        _WINDOW_FLAG_PLATFORMS until a real Mac QEMU has accepted it.
+        """
         with _mac():
             cap = omni.default_display(MAC_DISPLAY_HELP, NO_GL_DEVICE_HELP,
                                        has_gui=True)
         self.assertEqual(cap["tier"], "window")
-        self.assertEqual(cap["display_args"][0], "-display")
-        self.assertTrue(cap["display_args"][1].startswith("cocoa"),
-                        cap["display_args"][1])
-        self.assertIn("zoom-to-fit=on", cap["display_args"][1].split(","))
+        self.assertEqual(cap["display_args"], ["-display", "cocoa"])
         self.assertEqual(cap["gpu_args"], HEADLESS_GPU)
 
     def test_the_reason_names_the_missing_piece(self):
