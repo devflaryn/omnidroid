@@ -277,8 +277,26 @@ class BootCap(unittest.TestCase):
     """What the guest is capped at before adb — and so before any poll."""
 
     def test_governor_uses_the_modes_own_floor(self):
-        self.assertEqual(balloon.governor_wanted({"mem": 3072, "balloon_floor": 1536}),
-                         1536)
+        self.assertEqual(balloon.governor_wanted(
+            {"mem": 3072, "balloon_floor": 1536, "profile": "density"}), 1536)
+
+    def test_the_performance_profile_gets_no_governor(self):
+        # A latency decision, not a memory one: an evicted page comes back
+        # from the pagefile, so a trimmed instance can hitch for as long as
+        # that read takes. Farming does not care; `performance` exists for
+        # "frames, resolution, input latency" and the frame-time cost has
+        # never been measured. Gaming keeps the behaviour it has always had.
+        self.assertIsNone(balloon.governor_wanted(
+            {"mem": 4096, "balloon_floor": 1024, "profile": "performance"}))
+
+    def test_a_mode_with_no_profile_gets_no_governor(self):
+        self.assertIsNone(balloon.governor_wanted(
+            {"mem": 4096, "balloon_floor": 1024}))
+
+    def test_the_shipped_modes_land_on_the_right_side(self):
+        from omnidroid.qemu_proc import MODES
+        self.assertIsNone(balloon.governor_wanted(MODES["gaming"]))
+        self.assertEqual(balloon.governor_wanted(MODES["farming"]), 896)
 
     def test_a_host_that_cannot_reclaim_gets_no_governor(self):
         # MEASURED 2026-08-16 on Windows: capping at spawn saved ~60 MB of the
@@ -292,16 +310,17 @@ class BootCap(unittest.TestCase):
 
     def test_no_governor_when_mem_is_below_the_floor(self):
         # `--mem 1024` with a 1536 boot cap is not an error, it is just no cap.
-        self.assertIsNone(balloon.governor_wanted({"mem": 1024, "balloon_floor": 1536}))
+        self.assertIsNone(balloon.governor_wanted({"mem": 1024, "balloon_floor": 1536, "profile": "density"}))
 
     def test_no_governor_when_the_mode_does_not_ask(self):
-        self.assertIsNone(balloon.governor_wanted({"mem": 3072}))
+        self.assertIsNone(balloon.governor_wanted({"mem": 3072, "profile": "density"}))
 
     def test_explicit_balloon_wins_over_the_governor(self):
         # `--balloon N` is a hard user instruction and resolve_mode already
         # marks it; the governor must not talk over it.
         self.assertIsNone(balloon.governor_wanted(
-            {"mem": 3072, "balloon_floor": 1536, "balloon_explicit": True}))
+            {"mem": 3072, "balloon_floor": 1536, "profile": "density",
+             "balloon_explicit": True}))
 
 
 class GrowableMemory(unittest.TestCase):

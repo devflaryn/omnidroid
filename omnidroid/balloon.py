@@ -130,6 +130,16 @@ def governor_wanted(mode, host_can_reclaim=True):
     mode = mode or {}
     if not host_can_reclaim:
         return None
+    # DENSITY ONLY, and this is a latency decision rather than a memory one.
+    # The trim's cost is that an evicted page comes back from the pagefile, so
+    # a trimmed instance can hitch for as long as that read takes. Farming does
+    # not care -- nobody is looking at those frames, and instance COUNT is the
+    # entire point. `performance` is the opposite trade by definition ("frames,
+    # resolution, input latency" -- MODES.md), and the frame-time cost of
+    # trimming it has never been measured. Until it has, gaming keeps the
+    # behaviour it has always had.
+    if mode.get("profile") != "density":
+        return None
     if mode.get("balloon_explicit"):
         return None
     floor = mode.get("balloon_floor")
