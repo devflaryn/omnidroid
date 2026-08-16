@@ -124,6 +124,36 @@ class FollowReadsBackReality(unittest.TestCase):
         self.assertEqual(corrected_x, x)
         self.assertEqual(corrected_y + granted_height, owner_rect[1])
 
+    def test_the_correction_does_not_push_the_bar_off_the_top_of_the_screen(self):
+        """MEASURED on a live instance, 2026-08-16: guest window at y=26,
+        Windows granting a 40px bar -> the correction put the bar at y=-14,
+        with our title, our minimise and our X -- the only close prompt that
+        exists -- hanging off the top of the desktop.
+
+        The correction used to open-code `owner_top - actual_height`, which
+        skips bar_geometry's top-of-screen clamp. It now goes back through
+        bar_geometry with the granted height, so there is ONE rule for where
+        the bar goes rather than two that disagree at the edge of the screen.
+        The clamp is not a fudge now that the bar drags the composite: the
+        <Configure> that pinning generates reads the difference as a drag and
+        nudges the guest down under it, converging in one step.
+        """
+        u = FakeUser32()
+        bar = windowbar.WindowBar("omni-farm3")
+        bar.bar_hwnd = 11
+        owner_rect = (100, 26, 1280, 800)      # near the top of the screen
+        x, y, w, _h = windowbar.bar_geometry(owner_rect)
+        with mock.patch.object(windowbar, "_user32", return_value=u), \
+             mock.patch.object(windowbar, "_window_rect",
+                               return_value=(x, y, w, 40)):
+            self.assertTrue(bar.follow(owner_rect))
+        _hwnd, corrected_x, corrected_y, _cx, _cy = u.positions[1]
+        self.assertEqual(corrected_x, x)
+        self.assertGreaterEqual(
+            corrected_y, 0,
+            "the bar's caption must stay on screen -- it carries the only "
+            "close prompt the composite has")
+
     def test_a_read_back_failure_still_leaves_the_first_move_in_place(self):
         u = FakeUser32()
         bar = windowbar.WindowBar("omni-farm3")

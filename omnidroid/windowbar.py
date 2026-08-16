@@ -267,9 +267,26 @@ class WindowBar:
             if actual is not None:
                 actual_height = actual[3]
                 if actual_height != height:
-                    owner_top = owner_rect[1]
-                    u.SetWindowPos(self.bar_hwnd, 0, x, owner_top - actual_height,
-                                  0, 0,
+                    # bar_geometry AGAIN, with the height Windows actually
+                    # granted, rather than an open-coded `owner_top -
+                    # actual_height`. That open-coded form skipped
+                    # bar_geometry's top-of-screen clamp, and MEASURED on a
+                    # live instance it put the bar at y=-14 against a guest
+                    # window at y=26: the caption -- our title, our minimise,
+                    # our X, the only close prompt that exists -- hanging off
+                    # the top of the screen. One rule for where the bar goes,
+                    # used twice, instead of two rules that disagree at the
+                    # edge of the desktop.
+                    #
+                    # The clamp is not a fudge now that the bar drags the
+                    # composite: it pins the bar at y=0, the <Configure> that
+                    # move generates reads the difference as a drag, and the
+                    # guest is nudged down to sit under it. Converges in one
+                    # step (verified) and leaves the title bar reachable,
+                    # which is the invariant that matters.
+                    cx, cy, _cw, _ch = bar_geometry(owner_rect,
+                                                    bar_height=actual_height)
+                    u.SetWindowPos(self.bar_hwnd, 0, cx, cy, 0, 0,
                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE)
             self.synced_owner_rect = tuple(owner_rect)
             return True
