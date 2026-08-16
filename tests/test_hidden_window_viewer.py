@@ -215,7 +215,9 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
              mock.patch("omnidroid.engine.boot_has_hidden_window",
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value={"identity": "omni-farm3", "pid": 4242,
+                                      "native_window": True,
+                                      "window_hidden": True}), \
              mock.patch("omnidroid.engine._running_window_bar_pid",
                         return_value=None), \
              mock.patch("omnidroid.hostwin.hide_qemu_window",
@@ -266,7 +268,9 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
              mock.patch("omnidroid.engine.boot_has_hidden_window",
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value={"identity": "omni-farm3", "pid": 4242,
+                                      "native_window": True,
+                                      "window_hidden": True}), \
              mock.patch("omnidroid.engine._running_window_bar_pid",
                         return_value=9999), \
              mock.patch("omnidroid.engine._persist_window_bar_geometry",
@@ -298,7 +302,9 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
              mock.patch("omnidroid.engine.boot_has_hidden_window",
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value={"identity": "omni-farm3", "pid": 4242,
+                                      "native_window": True,
+                                      "window_hidden": True}), \
              mock.patch("omnidroid.engine._running_window_bar_pid",
                         return_value=None), \
              mock.patch("omnidroid.hostwin.hide_qemu_window",
@@ -319,7 +325,9 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
              mock.patch("omnidroid.engine.boot_has_hidden_window",
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value={"identity": "omni-farm3", "pid": 4242,
+                                      "native_window": True,
+                                      "window_hidden": True}), \
              mock.patch("omnidroid.engine._running_window_bar_pid",
                         return_value=None), \
              mock.patch("omnidroid.hostwin.hide_qemu_window",
@@ -339,13 +347,356 @@ class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
              mock.patch("omnidroid.engine.boot_has_hidden_window",
                         return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value={"identity": "omni-farm3", "pid": 4242,
+                                      "native_window": True,
+                                      "window_hidden": True}), \
              mock.patch("omnidroid.engine._running_window_bar_pid",
                         return_value=None), \
              mock.patch("omnidroid.hostwin.hide_qemu_window",
                         return_value=True):
             result = engine.cmd_view(_args(name="farm3", hide=True))
         self.assertIsNone(result)
+
+
+class HideNeverOpensAViewer(unittest.TestCase):
+    """`--hide` used to be handled INSIDE the hidden-window branch.
+
+    It is registered globally on the `view` subcommand, so it arrives on
+    every boot -- and on a farming boot, on a gaming boot that degraded to
+    software (the COMMON case on a host without virgl, not an edge one), and
+    on `--gpu window`, it fell straight through that branch into the VNC path
+    and SPAWNED A VIEWER. The opposite of what was asked, reachable from the
+    app's own Hide button. "Hide" can never put a window on screen.
+    """
+
+    def _view(self, run, **kw):
+        """cmd_view --hide with the whole VNC path booby-trapped: anything
+        that would open a viewer records itself instead."""
+        opened = []
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine._run_record", return_value=run), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
+             mock.patch("omnidroid.engine._spawn_builtin_viewer",
+                        side_effect=lambda *a, **k: opened.append("vnc")), \
+             mock.patch("omnidroid.engine._spawn_window_bar",
+                        side_effect=lambda *a, **k: opened.append("bar")), \
+             mock.patch("omnidroid.engine._port_open", return_value=True), \
+             mock.patch("omnidroid.hostwin.show_qemu_window",
+                        side_effect=lambda *a, **k: opened.append("show")), \
+             mock.patch("omnidroid.hostwin.hide_qemu_window",
+                        return_value=True) as hide:
+            try:
+                engine.cmd_view(_args(name="farm3", hide=True, **kw))
+                raised = None
+            except SystemExit as e:
+                raised = e
+        return opened, hide, raised
+
+    FARMING = {"identity": "omni-farm3", "pid": 4242,
+               "native_window": False, "window_hidden": False,
+               "gpu": "software", "display_kind": "vnc"}
+    DEGRADED = {"identity": "omni-farm3", "pid": 4242,
+                "native_window": False, "window_hidden": False,
+                "gpu": "software", "display_kind": "vnc"}
+    GPU_WINDOW = {"identity": "omni-farm3", "pid": 4242,
+                  "native_window": True, "window_hidden": False,
+                  "gpu": "gl", "display_kind": "gl-window"}
+
+    def test_a_farming_boot_gets_no_viewer_and_an_honest_answer(self):
+        opened, hide, raised = self._view(self.FARMING)
+        self.assertEqual(opened, [], "hide must never open anything")
+        hide.assert_not_called()
+        self.assertIsInstance(raised, SystemExit)
+
+    def test_a_software_degraded_gaming_boot_gets_no_viewer_either(self):
+        opened, _hide, raised = self._view(self.DEGRADED)
+        self.assertEqual(opened, [])
+        self.assertIsInstance(raised, SystemExit)
+
+    def test_the_no_window_answer_is_a_typed_error_the_app_can_render(self):
+        codes = []
+        orig = engine.fail
+
+        def _wrapped(code, *a, **k):
+            codes.append(code)
+            return orig(code, *a, **k)
+
+        with mock.patch.object(engine, "fail", side_effect=_wrapped):
+            _opened, _hide, raised = self._view(self.FARMING, json=True)
+        self.assertEqual(codes, ["no_window_to_hide"])
+        self.assertIsInstance(raised, SystemExit)
+
+    def test_a_gpu_window_boot_HAS_a_window_and_it_gets_hidden(self):
+        # `--gpu window` never hid its window (that is what the flag means),
+        # so `boot_has_hidden_window` is False for it -- which is exactly how
+        # it used to fall through to the VNC path. There IS a window here and
+        # hiding it is meaningful, so the predicate is `native_window`.
+        opened, hide, raised = self._view(self.GPU_WINDOW)
+        self.assertEqual(opened, [])
+        self.assertIsNone(raised)
+        hide.assert_called_once_with("omni-farm3", pid=4242, timeout=2)
+
+
+class TheRunRecordIsRewrittenAtomically(unittest.TestCase):
+    """`run.json` is no longer written once at boot before any reader exists.
+
+    `_persist_window_bar_geometry` rewrites it MID-LIFE from a detached bar
+    process this product FORCE-KILLS (`_kill_window_bar`), and `view --hide`
+    rewrites it from a second process moments before killing the first. A
+    plain `write_text` truncates and then fills, so a reader landing in that
+    gap -- or a kill landing there -- leaves a partial file, and
+    `runtime.running_pid` raising JSONDecodeError takes out `list`, `stop`,
+    `view` AND `start` at once: an instance nobody can stop.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self._tmp, ignore_errors=True))
+        self._rt = mock.patch.object(engine, "runtime_dir",
+                                     side_effect=lambda n: self._tmp)
+        self._rt.start()
+        self.addCleanup(self._rt.stop)
+
+    def test_the_new_record_replaces_the_old_one_whole(self):
+        (self._tmp / "run.json").write_text(json.dumps({"pid": 1, "a": "b"}))
+        self.assertTrue(engine._write_run_record("u1", {"pid": 2, "a": "c"}))
+        self.assertEqual(json.loads((self._tmp / "run.json").read_text()),
+                         {"pid": 2, "a": "c"})
+
+    def test_it_goes_through_os_replace_and_leaves_no_temp_behind(self):
+        replaced = []
+        real_replace = os.replace
+
+        def _spy(src, dst):
+            replaced.append((str(src), str(dst)))
+            return real_replace(src, dst)
+
+        with mock.patch.object(engine.os, "replace", side_effect=_spy):
+            engine._write_run_record("u1", {"pid": 3})
+        self.assertEqual(len(replaced), 1,
+                         "a mid-life rewrite must be one atomic replace")
+        self.assertTrue(replaced[0][1].endswith("run.json"))
+        # Same directory: os.replace across filesystems is not atomic.
+        self.assertEqual(os.path.dirname(replaced[0][0]),
+                         os.path.dirname(replaced[0][1]))
+        self.assertFalse((self._tmp / "run.json.tmp").exists())
+
+    def test_the_old_record_survives_a_failed_write(self):
+        (self._tmp / "run.json").write_text(json.dumps({"pid": 1}))
+        with mock.patch.object(engine.os, "replace",
+                               side_effect=OSError("disk full")):
+            self.assertFalse(engine._write_run_record("u1", {"pid": 2}))
+        # Truncate-then-fill would have left nothing readable here.
+        self.assertEqual(json.loads((self._tmp / "run.json").read_text()),
+                         {"pid": 1})
+        self.assertFalse((self._tmp / "run.json.tmp").exists())
+
+    def test_persisting_geometry_uses_it(self):
+        (self._tmp / "run.json").write_text(json.dumps({"pid": 4242}))
+        with mock.patch("omnidroid.hostwin.window_geometry",
+                        return_value=(10, 20, 640, 480)), \
+             mock.patch.object(engine, "_write_run_record") as write:
+            engine._persist_window_bar_geometry("u1", "omni-u1", 4242)
+        write.assert_called_once()
+        self.assertEqual(write.call_args[0][1]["geometry"], [10, 20, 640, 480])
+
+
+class ACorruptRunRecordDoesNotTakeOutEveryCommand(unittest.TestCase):
+    """`running_pid` did `json.loads(p.read_text())` with no guard.
+
+    It is the single most-called predicate in the product: `list`, `stop`,
+    `view` and `start` all go through it, so an exception there does not fail
+    one command, it fails the one that would clean the mess up too.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from omnidroid import runtime as rt
+        self.rt = rt
+        self._tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self._tmp, ignore_errors=True))
+        self._p = mock.patch.object(rt, "runtime_dir",
+                                    side_effect=lambda n: self._tmp)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    def test_a_truncated_record_reads_as_not_running_not_as_a_crash(self):
+        (self._tmp / "run.json").write_text('{"pid": 42, "started": 1')
+        self.assertIsNone(self.rt.running_pid("u1"))
+
+    def test_an_empty_record_reads_as_not_running(self):
+        (self._tmp / "run.json").write_text("")
+        self.assertIsNone(self.rt.running_pid("u1"))
+
+    def test_a_whole_record_is_still_read_normally(self):
+        import os as _os
+        (self._tmp / "run.json").write_text(
+            json.dumps({"pid": _os.getpid(), "started": 1}))
+        self.assertEqual(self.rt.running_pid("u1"), _os.getpid())
+
+
+class TheBarIsVerifiedToHaveComeUp(unittest.TestCase):
+    """The old embedded viewer had an EMBED_VIEWER_SETTLE check ("the viewer
+    exited immediately") and nothing replaced it when that viewer went.
+
+    `run_window_bar` returns 2/3/4/5 with an explanatory stderr line that
+    lands in runtime/<name>/viewer.log, which nobody reads. And the window
+    path printed nothing at all on SUCCESS either, though both other `view`
+    paths do -- so a `view` that opened a window and a `view` whose bar died
+    on the way up looked exactly alike from the terminal.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self._tmp, ignore_errors=True))
+        self._rt = mock.patch.object(engine, "runtime_dir",
+                                     side_effect=lambda n: self._tmp)
+        self._rt.start()
+        self.addCleanup(self._rt.stop)
+
+    class _Proc:
+        def __init__(self, rc, pid=7777):
+            self.rc = rc
+            self.pid = pid
+
+        def wait(self, timeout=None):
+            if self.rc is None:
+                raise __import__("subprocess").TimeoutExpired("bar", timeout)
+            return self.rc
+
+    def test_a_bar_that_is_still_up_after_the_settle_is_a_success(self):
+        import io
+        import contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = engine._window_bar_settled("farm3", self._Proc(None))
+        self.assertTrue(ok)
+        self.assertEqual(out.getvalue(), "",
+                         "a bar that came up has nothing to complain about")
+
+    def test_a_bar_that_died_is_reported_with_its_reason_and_the_log_path(self):
+        import io
+        import contextlib
+        (self._tmp / "viewer.log").write_text(
+            "window bar: no QEMU window for 'omni-farm3'\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = engine._window_bar_settled("farm3", self._Proc(2))
+        self.assertFalse(ok)
+        printed = out.getvalue()
+        self.assertIn("rc=2", printed)
+        self.assertIn("no QEMU window", printed)     # the child's own reason
+        self.assertIn("viewer.log", printed)         # where to read the rest
+
+    def test_a_missing_log_still_reports_the_exit_rather_than_raising(self):
+        import io
+        import contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = engine._window_bar_settled("farm3", self._Proc(4))
+        self.assertFalse(ok)
+        self.assertIn("rc=4", out.getvalue())
+
+    def test_the_settle_is_short_enough_not_to_stall_a_view(self):
+        # Every second of it is a second the user waits for a window that is
+        # already on screen.
+        self.assertLessEqual(engine.WINDOW_BAR_SETTLE, 5)
+        self.assertGreater(engine.WINDOW_BAR_SETTLE, 0)
+
+
+class ViewSaysWhatItDid(unittest.TestCase):
+    """The window path was the only one of `view`'s three that printed
+    nothing on success. A command that opens a window and says nothing is
+    indistinguishable from one that did nothing."""
+
+    def _view(self, settled):
+        import io
+        import contextlib
+        out = io.StringIO()
+        emitted = {}
+        with contextlib.redirect_stdout(out), \
+             mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine.boot_has_hidden_window",
+                        return_value=True), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value={"identity": "omni-farm3", "pid": 4242,
+                                      "native_window": True,
+                                      "window_hidden": True}), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=1), \
+             mock.patch("omnidroid.engine._running_window_bar_pid",
+                        return_value=None), \
+             mock.patch("omnidroid.hostwin.apply_chrome",
+                        return_value={"applied": True, "reason": "",
+                                      "hwnd": 1}), \
+             mock.patch("omnidroid.hostwin.show_qemu_window"), \
+             mock.patch("omnidroid.engine._spawn_window_bar",
+                        return_value=mock.Mock(pid=7777)), \
+             mock.patch("omnidroid.engine._window_bar_settled",
+                        return_value=settled), \
+             mock.patch("omnidroid.engine._write_window_bar_pid") as wrote, \
+             mock.patch("omnidroid.engine.emit_json",
+                        side_effect=lambda d: emitted.update(d)):
+            engine.cmd_view(_args(name="farm3", json=True))
+        return out.getvalue(), emitted, wrote
+
+    def test_a_successful_window_view_says_so_and_names_the_bar(self):
+        printed, emitted, wrote = self._view(True)
+        self.assertIn("[view farm3]", printed)
+        self.assertIn("7777", printed)
+        self.assertTrue(emitted["bar"])
+        wrote.assert_called_once_with("farm3", 7777)
+
+    def test_a_bar_that_died_is_not_reported_as_an_open_window(self):
+        printed, emitted, wrote = self._view(False)
+        self.assertNotIn("live window opened", printed)
+        self.assertFalse(emitted["bar"])
+        # ...and a dead pid must not be recorded as a live bar, or the next
+        # `view` believes one is open and refuses to spawn a real one.
+        wrote.assert_not_called()
+
+
+class TheDebugWindowIsDescribedHonestly(unittest.TestCase):
+    """`vnc_unavailable_reason` told a `--gpu window` user that `view` "shows
+    that same window, restyled, with our own title bar above it" -- while
+    being the very message `view` fails with. `--gpu window` is defined as an
+    UNSTYLED window with none of this code in the path: nothing restyles it,
+    no bar is spawned for it, and it is already on screen."""
+
+    def _reason(self, run):
+        with mock.patch.object(engine, "_run_record", return_value=run):
+            return engine.vnc_unavailable_reason("u1")
+
+    def test_a_hidden_window_boot_is_offered_the_restyled_window(self):
+        why = self._reason({"native_window": True, "gpu": "gl",
+                            "window_hidden": True})
+        self.assertIn("still works", why)
+        self.assertIn("restyled", why)
+        self.assertIn("title bar", why)
+
+    def test_a_gpu_window_boot_is_not_promised_chrome_that_never_runs(self):
+        why = self._reason({"native_window": True, "gpu": "gl",
+                            "window_hidden": False})
+        # The promise the old message made -- and could not keep, since this
+        # message IS what `view` fails with on such a boot.
+        self.assertNotIn("still works", why)
+        self.assertIn("unstyled", why)
+        self.assertIn("already on your screen", why)
+        self.assertIn("nothing for `view` to open", why)
 
 
 class TheBarsPidFileTracksItsLifetime(unittest.TestCase):

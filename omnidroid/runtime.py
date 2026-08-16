@@ -407,10 +407,27 @@ def reconcile_runtime():
 
 
 def running_pid(name):
+    """The live QEMU pid for `name`, or None. NEVER raises on a bad file.
+
+    An unreadable or malformed run.json reads as "not running" rather than
+    propagating a JSONDecodeError. This is the single most-called predicate
+    in the product -- `list`, `stop`, `view` and `start` all go through it --
+    so an exception here does not fail one command, it takes out every
+    command including the one that would clean the mess up, leaving an
+    instance nobody can stop.
+
+    The writer is atomic (engine._write_run_record: tmp + os.replace), so a
+    partial file should not exist in the first place; this guard is the
+    backstop for the cases atomicity cannot cover -- a truncated file left by
+    an older build, a disk that filled mid-write, a half-restored backup.
+    """
     p = runtime_dir(name) / "run.json"
     if not p.exists():
         return None
-    data = json.loads(p.read_text())
+    try:
+        data = json.loads(p.read_text())
+    except Exception:      # noqa: BLE001 - see the docstring
+        return None
     # A reservation (build_acct's pre-spawn run.json, carrying the live LAUNCHER
     # pid) is NOT a running instance: no QEMU exists yet. spawn_qemu overwrites
     # it with the real QEMU pid and no `reserving` flag. Treating a reservation

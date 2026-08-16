@@ -447,6 +447,48 @@ def _run_record(name):
         return {}
 
 
+def _write_run_record(name, run):
+    """Replace this instance's run.json ATOMICALLY. Never raises.
+
+    Not `write_text` on the real path. `run.json` is the file every other
+    command reads to find out whether an instance is alive
+    (`runtime.running_pid`, and through it `list`, `stop`, `view` and
+    `start`), and it is no longer written once at boot before any reader
+    exists: `_persist_window_bar_geometry` rewrites it MID-LIFE, from a
+    detached bar process that this product FORCE-KILLS (`_kill_window_bar`),
+    and `view --hide` rewrites it from a second process moments before
+    killing the first. A `write_text` truncates the file and then fills it,
+    so a reader — or a kill — landing in that gap sees an empty or partial
+    file. `running_pid` guards its own read now (runtime.py), but a guard
+    that reads a half-written record as "not running" would still be an
+    instance nobody can stop.
+
+    tmp + os.replace closes the window instead of surviving it: os.replace is
+    atomic on both POSIX and Windows (MoveFileEx with
+    MOVEFILE_REPLACE_EXISTING), so a reader sees either the whole old record
+    or the whole new one and never a truncated one. The temp file is a
+    sibling, because os.replace across filesystems is not atomic and may not
+    work at all.
+
+    Returns True when the record was replaced. Best-effort like every write
+    in the window path: callers run it from a detached, console-less
+    process's `finally`, where an exception has nowhere to go.
+    """
+    d = runtime_dir(name)
+    tmp = d / "run.json.tmp"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(run))
+        os.replace(tmp, d / "run.json")
+        return True
+    except Exception:      # noqa: BLE001
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:      # noqa: BLE001
+            pass
+        return False
+
+
 def boot_renders_on_gpu(name):
     """Did this instance's CURRENT boot get a virgl-backed GPU?
 
@@ -488,12 +530,29 @@ def vnc_unavailable_reason(name):
     if not run:
         return None
     if run.get("native_window") and run.get("gpu") == "gl":
+        # Which window this boot has decides what to tell the user, and the
+        # two answers are not the same one. A HIDDEN-window boot is the
+        # product path: `view` restyles that window and puts our bar above
+        # it. A VISIBLE-window boot is `--gpu window`, the debugging hatch,
+        # which is defined as "a visible native window, UNSTYLED — for
+        # debugging a GL problem with none of this code in the path" (design
+        # spec §3d): nothing restyles it, no bar is spawned for it, and it is
+        # already on screen. Promising a restyled window with our title bar
+        # there would describe code that deliberately does not run.
+        if run.get("window_hidden"):
+            offer = (f"`omnidroid view {name}` still works: it shows that "
+                     f"same window, restyled, with our own title bar above "
+                     f"it, rather than connecting to a framebuffer.")
+        else:
+            offer = (f"This boot asked for `--gpu window`, so that window is "
+                     f"already on your screen, deliberately unstyled and "
+                     f"with none of this product's window code in the path — "
+                     f"that is what the flag is for. There is nothing for "
+                     f"`view` to open. Boot without `--gpu window` for the "
+                     f"restyled window and its title bar.")
         return (f"this boot took the GPU through a native QEMU window, and "
                 f"QEMU refuses a VNC server beside one — so '{name}' has no "
-                f"framebuffer to attach to. `omnidroid view {name}` still "
-                f"works: it shows that same window, restyled, with our own "
-                f"title bar above it, rather than connecting to a "
-                f"framebuffer. What has no VNC to read "
+                f"framebuffer to attach to. {offer} What has no VNC to read "
                 f"is `capture`/autocap. `omnidroid screenshot {name}` works "
                 f"either way — it goes through adb. Start with "
                 f"`--gpu headless` if you need the VNC framebuffer itself "
@@ -6497,6 +6556,55 @@ def _spawn_window_bar(name, title, identity, pid):
     return subprocess.Popen(cmd, **kwargs)
 
 
+# How long `view` waits to see whether the title bar stayed up.
+#
+# run_window_bar() either reaches mainloop() (and then never returns) or exits
+# within milliseconds with 2 ("no QEMU window"), 3 ("not implemented on this
+# host") or 4 ("could not resolve the bar's own top-level handle"). So this
+# only has to outlast a Tk startup on a loaded host -- and every second of it
+# is a second the user waits for a window that is already on screen. Same
+# value, and the same reasoning, as the EMBED_VIEWER_SETTLE check the deleted
+# embedded viewer had: `view` must not report success for a child that has
+# already died.
+WINDOW_BAR_SETTLE = 2.5
+
+
+def _window_bar_settled(name, proc):
+    """True when the bar process is still alive after WINDOW_BAR_SETTLE.
+
+    When it is not, print WHY -- with the log path, because the bar is
+    spawned detached with its stdio redirected into runtime/<name>/viewer.log
+    and its exit reason has nowhere else to go. Without this, `run_window_bar`
+    returning 2/3/4 with an explanatory stderr line produced a `view` that
+    printed nothing, exited 0, and left the user looking at an uncaptioned
+    window wondering whether that was the design.
+
+    Never raises: this is a report on a window, and cmd_view has already done
+    everything that matters (the guest's window is restyled and on screen)
+    before it is called.
+    """
+    log = runtime_dir(name) / "viewer.log"
+    try:
+        rc = proc.wait(timeout=WINDOW_BAR_SETTLE)
+    except subprocess.TimeoutExpired:
+        return True                     # still up: it attached
+    except Exception:      # noqa: BLE001
+        return True                     # cannot tell; do not cry wolf
+    tail = ""
+    try:
+        lines = log.read_text(errors="replace").strip().splitlines()
+        if lines:
+            tail = lines[-1]
+    except Exception:      # noqa: BLE001
+        pass
+    print(f"[view {name}] the title bar exited immediately (rc={rc})"
+          + (f": {tail}" if tail else "")
+          + f". The window itself is up and rendering; hide or stop it from "
+            f"the app, or with `omnidroid view {name} --hide` / `omnidroid "
+            f"stop {name}`. Full log: {log}")
+    return False
+
+
 def _window_bar_pid_path(name):
     return runtime_dir(name) / "windowbar.pid"
 
@@ -6583,7 +6691,11 @@ def _persist_window_bar_geometry(name, identity, pid):
         if not run:
             return
         run["geometry"] = list(geometry)
-        (runtime_dir(name) / "run.json").write_text(json.dumps(run))
+        # ATOMIC, not write_text: this is a MID-LIFE rewrite of the file
+        # every other command reads to find out whether the instance is
+        # alive, from a process `--hide` is about to force-kill. See
+        # _write_run_record.
+        _write_run_record(name, run)
     except Exception:      # noqa: BLE001
         pass
 
@@ -6597,6 +6709,66 @@ def boot_has_hidden_window(name):
     refuses one beside a GL window."""
     run = _run_record(name)
     return bool(run.get("native_window")) and bool(run.get("window_hidden"))
+
+
+def _view_hide(args):
+    """`omnidroid view <name> --hide`: take this instance's window off the
+    screen without stopping it. NEVER opens anything.
+
+    Split out of cmd_view's hidden-window branch, where it used to live, and
+    called BEFORE any display-kind branching. `--hide` is registered on the
+    `view` subcommand globally and is reachable from the app's Hide button,
+    so it arrives on boots that have no window at all (farming), on a gaming
+    boot that degraded to software on a host without virgl (the COMMON case
+    there, not an edge one), and on `--gpu window`. Inside that branch every
+    one of those fell through to the VNC path and spawned a viewer.
+
+    The predicate is `native_window`, not `boot_has_hidden_window`: a
+    `--gpu window` boot has a real window on screen that was deliberately
+    never hidden, and "hide it" is exactly as meaningful there as on a boot
+    whose window `view` had shown. A boot with no window says so and does
+    nothing -- reporting a successful hide for a window that never existed
+    is the kind of lie this module refuses everywhere else.
+    """
+    from omnidroid import hostwin
+    run = _run_record(args.name)
+    identity = run.get("identity") or f"omni-{args.name}"
+    qemu_pid = run.get("pid")
+
+    if not run.get("native_window"):
+        return fail(
+            "no_window_to_hide",
+            f"'{args.name}' is running, but this boot never opened a window "
+            f"— there is nothing on screen to hide. Its pixels go through the "
+            f"VNC framebuffer instead: `omnidroid view {args.name}` opens a "
+            f"viewer, and closing that viewer is what 'hide' means for this "
+            f"boot.")
+
+    # A live bar is OWNED by QEMU's window, not a CHILD of it -- Windows
+    # only cascades DESTROY to an OWNED window when the OWNER is destroyed
+    # (that is what lets `stop` clean the bar up for free); a bare hide of
+    # the owner gives no such guarantee, so an untouched bar would be left
+    # on screen, captioning nothing. It has to be killed here. And killing
+    # it does NOT run `_run_windowbar`'s `finally` -- Windows does not run
+    # them on termination -- so the geometry that `finally` would have
+    # persisted must be captured and written FIRST, while the window is
+    # still visible, or it is lost for good. Order is load-bearing: persist,
+    # then kill, then clear its pid file (so the next `view` does not
+    # believe a bar only WE just killed is still open), then hide.
+    bar_pid = _running_window_bar_pid(args.name)
+    if bar_pid is not None:
+        _persist_window_bar_geometry(args.name, identity, qemu_pid)
+        _kill_window_bar(bar_pid)
+        _clear_window_bar_pid(args.name)
+    # timeout=2, not hostwin's 20s default: hide_qemu_window() already
+    # treats "no window" as a harmless no-op, so the only thing a long wait
+    # buys is the user staring at a hung command in the one case where there
+    # is nothing to wait for.
+    hidden = hostwin.hide_qemu_window(identity, pid=qemu_pid, timeout=2)
+    if getattr(args, "json", False):
+        emit_json({"name": args.name, "viewer": "window",
+                   "hidden": hidden, "ok": True})
+    return None
 
 
 def cmd_view(args):
@@ -6632,6 +6804,18 @@ def cmd_view(args):
         acct = load_account(args.name)
         port = acct["vnc_port"]
 
+    # --hide FIRST, ahead of every display-kind branch below.
+    #
+    # `--hide` is registered globally on the `view` subcommand, so it arrives
+    # on ANY boot. It used to be handled INSIDE the hidden-window branch,
+    # which meant a farming boot, a software-degraded gaming boot or a
+    # `--gpu window` boot fell straight through it into the VNC path and
+    # SPAWNED A VIEWER -- the exact opposite of what was asked, from the
+    # app's own Hide button, and on a host without virgl that is the common
+    # case rather than the edge one. "Hide" can never open a window.
+    if getattr(args, "hide", False):
+        return _view_hide(args)
+
     # Wait for the QEMU VNC server to accept connections (it binds at process
     # start, so this is quick; generous bound covers a cold spawn).
     # A GPU boot on this host has its pixels in a hidden QEMU window and no VNC
@@ -6646,39 +6830,6 @@ def cmd_view(args):
         run = _run_record(args.name)
         identity = run.get("identity") or f"omni-{args.name}"
         qemu_pid = run.get("pid")
-        # --hide: the same action the window's own X already offers (hide or
-        # stop, windowbar.py) but reachable from the app without the user
-        # finding the window on the desktop first. Deliberately ahead of the
-        # no-window probe below: hide_qemu_window() already treats "no
-        # window" as a harmless no-op (see hostwin.hide_qemu_window), so
-        # there is no honest failure to surface here the probe would add --
-        # only an extra wait for an action that has nothing to wait for
-        # (hence timeout=2 below, not apply_chrome's 20s default).
-        if getattr(args, "hide", False):
-            # A live bar is OWNED by QEMU's window, not a CHILD of it --
-            # Windows only cascades DESTROY to an OWNED window when the
-            # OWNER is destroyed (that is what lets `stop` clean the bar up
-            # for free); a bare hide of the owner gives no such guarantee,
-            # so an untouched bar would be left on screen, captioning
-            # nothing. It has to be killed here. And killing it does NOT
-            # run `_run_windowbar`'s `finally` -- Windows does not run them
-            # on termination -- so the geometry that `finally` would have
-            # persisted must be captured and written FIRST, while the
-            # window is still visible, or it is lost for good. Order is
-            # load-bearing: persist, then kill, then clear its pid file (so
-            # the next `view` does not believe a bar only WE just killed is
-            # still open), then hide.
-            bar_pid = _running_window_bar_pid(args.name)
-            if bar_pid is not None:
-                _persist_window_bar_geometry(args.name, identity, qemu_pid)
-                _kill_window_bar(bar_pid)
-                _clear_window_bar_pid(args.name)
-            hidden = hostwin.hide_qemu_window(identity, pid=qemu_pid,
-                                              timeout=2)
-            if getattr(args, "json", False):
-                emit_json({"name": args.name, "viewer": "window",
-                           "hidden": hidden, "ok": True})
-            return
         # Probe for the window FIRST, with a short timeout, before touching
         # its chrome. A window that genuinely is not there is a different,
         # honest problem from "it's there but restyling it failed" --
@@ -6726,11 +6877,23 @@ def cmd_view(args):
         except Exception as e:      # noqa: BLE001
             print(f"[view {args.name}] the title bar did not start ({e}); the "
                   f"window is usable and the app can still hide or stop it.")
-        if proc is not None:
+        bar_ok = proc is not None and _window_bar_settled(args.name, proc)
+        if bar_ok:
+            # Only a bar that is actually up gets a pid file. Recording a pid
+            # that has already exited invites the next `view` to believe a
+            # bar is open (pid reuse is rare, not impossible) and refuse to
+            # open a real one.
             _write_window_bar_pid(args.name, proc.pid)
+            # The window path was the only one of the three `view` paths that
+            # printed nothing at all on success. A command that opens a window
+            # and says nothing is indistinguishable from one that did nothing.
+            print(f"[view {args.name}] live window opened [QEMU's own, "
+                  f"restyled] - GPU-rendered, native input, no copy; title "
+                  f"bar pid {proc.pid}")
         if getattr(args, "json", False):
             emit_json({"name": args.name, "viewer": "window",
-                       "chrome": chrome["applied"], "vnc_host": None,
+                       "chrome": chrome["applied"], "bar": bar_ok,
+                       "vnc_host": None,
                        "vnc_port": None, "started": started, "ok": True})
         return
 
