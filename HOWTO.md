@@ -307,6 +307,21 @@ foreground state — ads/dialogs/loading don't kill it) and powers the
 instance off after the process is gone `--grace` s (default 20). This is
 the production "game closed → machine off" path.
 
+#### `omnidroid govern <name> [--interval N]`
+The **memory governor**: keeps the guest's RAM ceiling just above what it is
+actually using, so the host pays for what the guest *uses* rather than the
+`--mem` it was offered. `start` launches one automatically (detached; it exits
+with the instance), so this is only for an instance brought up some other way.
+
+It grows the moment the guest's free slack falls below 256 MB, shrinks in
+steps only after usage has plateaued, and never goes below the mode's floor.
+Progress goes to `runtime/<name>/governor.log`.
+
+**It does nothing on Windows, deliberately.** The saving needs QEMU to be able
+to release pages, and on Windows it cannot (no `madvise`) — capping there was
+measured to save ~60 MB of 3.4 GB while making the boot 4x slower. See
+`MODES.md` § *The memory governor*. `OMNI_FORCE_GOVERNOR=1` runs it anyway.
+
 #### `omnidroid awake <name> [--check]`
 Re-apply the **never sleep / never blank** guarantee to a running instance,
 or `--check` to only read it back. Every boot already does this (see

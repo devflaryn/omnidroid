@@ -325,7 +325,9 @@ _GL_OPTION = {"macos": "gl=es", "linux": "gl=on", "windows": "gl=on"}
 #   zoom-to-fit=on     the guest panel is fixed at the base's native mode, so
 #                      the window scales rather than letterboxing
 _WINDOW_FLAGS = {
-    "gtk":   ("show-menubar=off", "window-close=off", "zoom-to-fit=on"),
+    # window-close is NOT disabled any more: our patched QEMU asks
+    # "Stop this instance?" on the X itself, so the close has to reach it.
+    "gtk":   ("show-menubar=off", "zoom-to-fit=on"),
     "sdl":   ("window-close=off",),
     "cocoa": ("zoom-to-fit=on",),
 }
@@ -542,7 +544,23 @@ def x86_cpu_model(accel, cfg=None):
     override = ((cfg or {}).get("qemu") or {}).get("cpu")
     if override:
         return override
-    return "qemu64"
+    # +aes is NOT optional on this base, and it is not a performance tweak.
+    # Roblox ships arm64 only, so every instruction runs through
+    # libndk_translation -- and the translator ASSERTS on a host without
+    # AES-NI the first time the app touches AES, which Roblox does during
+    # startup:
+    #
+    #   CHECK failed: HostPlatform::kHasAES
+    #     libndk_translation.so AesEncode<16>
+    #     Fatal signal 6 (SIGABRT) in tid (AppStartupTaskM)
+    #
+    # The splash appears and the process is gone about two seconds later.
+    # `qemu64` is a K8-era baseline that does not carry AES, so the feature
+    # has to be asked for by name. It cost nothing to leave implicit while
+    # the shipped QEMU happened to include it; a different QEMU build does
+    # not, and then the game dies instantly with no message anywhere in this
+    # engine's own logs.
+    return "qemu64,+aes"
 
 
 def machine_arg(accel):
@@ -681,7 +699,21 @@ MODES = {
     # `panel` is the physical guest display this boot asks for. It is a mode
     # default, not a fixed constant: `--panel 1080p` / OMNI_PANEL / config
     # `qemu.panel` all override it (see panel_for).
+    # `balloon_floor` / `balloon_headroom` are the MEMORY
+    # GOVERNOR's three numbers, and they are a different mechanism from
+    # `balloon` above -- prevention rather than reclaim. See balloon.py for the
+    # measurements; the short version is that a guest offered 4096 MB touches
+    # all of it within ~20 s of spawn (Android page cache), the host's cost is
+    # driven by what the guest TOUCHES, and on Windows nothing that has been
+    # touched is ever given back. Capping at spawn is therefore the only lever
+    # that works there, and it works because the pages are never touched at all.
+    #
+    # Gaming keeps `balloon: None` -- the post-boot reclaim inflate is still
+    # wrong here, for the reason below. The governor is not that: it never
+    # takes memory the guest is using, only memory it never asked for.
     "gaming":  {"mem": 4096, "smp": 4, "balloon": None, "usb": True,
+                "balloon_floor": 1024,
+                "balloon_headroom": 512,
                 "display": lean.NATIVE_DISPLAY, "panel": DEFAULT_PANEL,
                 "gpu": GPU_AUTO,
                 "profile": "performance", "autoscale": True,
@@ -765,8 +797,17 @@ MODES = {
     #
     # The arm base runs Roblox NATIVELY, has no translator to upset, and keeps
     # the aggressive setting.
+    # The governor's floor here is the ZRAM figure (896), not the 1536 above,
+    # and that is safe for a reason the fixed targets could not rely on: the
+    # floor is a BACKSTOP, not a target. The governor only ever descends
+    # towards `used + headroom`, so a guest whose game genuinely needs 1.4 GB
+    # is never taken to 896 whatever the floor says. That is the advantage of
+    # sizing against measured demand instead of a constant chosen in advance --
+    # the constant has to be right for the worst case, the governor does not.
     "farming": {"mem": 2048, "smp": 1, "smp_x86": 2,
                 "balloon": 1536, "balloon_zram": 896,
+                "balloon_floor": 896,
+                "balloon_headroom": 384,
                 "swappiness": 100, "swappiness_x86": 10,
                 "zram": True,
                 "usb": True, "display": lean.FARMING_DISPLAY,
@@ -1535,7 +1576,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         "-accel", accel,          # hvf on Apple Silicon (no translation)
         "-cpu", "host",
         "-smp", smp_arg(smp),
-        "-m", str(mem),
+        *mem_args(mode, mem),
         # UEFI firmware: read-only CODE + per-account writable vars.
         "-drive", (f"if=pflash,unit=0,file={code},file.locking=off,"
                    "format=raw,readonly=on"),
@@ -1723,7 +1764,7 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         "-machine", machine_arg(accel),
         "-cpu", x86_cpu_model(accel, cfg),
         "-smp", smp_arg(smp),
-        "-m", str(mem),
+        *mem_args(mode, mem),
         "-drive", f"file={sys_src}{disk_opts}",
         "-drive", f"file={data_src}{disk_opts}",
         *gpu,
@@ -2044,7 +2085,29 @@ def scratch_env(cfg=None, env=None):
         return base
     for name in ("TMP", "TEMP", "TMPDIR"):
         base[name] = str(d)
+    _apply_window_env(base)
     return base
+
+
+# Our QEMU build reads these three; a stock QEMU ignores them, so setting
+# them unconditionally cannot break a boot on somebody else's binary.
+WINDOW_ICON_NAME = "omni-icon.png"
+
+
+def _apply_window_env(env):
+    """Turn on the patched build's window behaviour: our logo, a resize that
+    keeps the guest's aspect ratio, and a confirmation before the X powers a
+    booted machine off."""
+    # INSIDE the package on purpose: PyInstaller's collect_data_files only
+    # picks up data that lives in the package, so a repo-root assets/ dir
+    # would vanish from the frozen build and the window would silently fall
+    # back to the stock QEMU icon.
+    icon = Path(__file__).resolve().parent / "assets" / WINDOW_ICON_NAME
+    if icon.is_file():
+        env["QEMU_WINDOW_ICON"] = str(icon)
+    env["QEMU_WINDOW_LOCK_ASPECT"] = "1"
+    env["QEMU_WINDOW_CONFIRM_CLOSE"] = "1"
+    return env
 
 
 def scratch_free_mb(cfg=None):
@@ -2134,8 +2197,19 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
         kwargs["start_new_session"] = True
     cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug,
                        warm=warm, bake=bake)
+    qemu_env = scratch_env(cfg)
+    # Tell the patched build what panel the GPU device was ACTUALLY given, so
+    # it reports that to the guest instead of the window's own size. Without
+    # it the guest adopts whatever the window happens to be at startup and
+    # then letterboxes its 1280x800 logical display into that panel itself --
+    # bars that no window-side aspect lock can remove. Read back out of the
+    # argv (gl_panel_size) rather than re-derived, so a config override cannot
+    # make the two disagree.
+    gl_panel = gl_panel_size(cmd)
+    if gl_panel:
+        qemu_env["QEMU_WINDOW_PANEL"] = f"{gl_panel[0]}x{gl_panel[1]}"
     proc = subprocess.Popen(cmd, stdout=log, stderr=log,
-                            env=scratch_env(cfg), **kwargs)
+                            env=qemu_env, **kwargs)
     identity = f"omni-{acct['name']}"
     hidden = _hide_window_if_wanted(cmd, identity, cfg)
     (d / "run.json").write_text(json.dumps(
@@ -2181,3 +2255,54 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
          "adb_port": acct["adb_port"], "qmp_port": acct["qmp_port"],
          "vnc_port": acct["vnc_port"], "warm_key": warm_key}))
     return proc.pid
+
+
+# How many hotplug slots to offer. Each is free until used; four is enough to
+# walk a guest from its boot size to `-m` in sensible steps and still have one
+# spare, and the count is fixed at spawn (slots cannot be added later).
+MEM_SLOTS = 4
+
+
+def mem_args(mode, mem):
+    """The `-m` arguments: a plain size, or a growable one.
+
+    THE POINT OF THE GROWABLE FORM, and why it is not the balloon again.
+
+    A balloon can only take back memory the guest already has, and on Windows
+    QEMU cannot decommit what the guest returns (no `madvise`) -- so the host
+    pays for the union of every page the guest ever touched, and capping at
+    boot was measured to save ~60 MB of 3.4 GB (see balloon.py). Memory that
+    was never PLUGGED IN is a different thing entirely: it is not allocated,
+    not committed, and the guest cannot touch it because it does not exist.
+    There is nothing for the host to fail to give back.
+
+    It also gives back for real, which the balloon cannot do here: unplugging
+    a DIMM frees its whole `memory-backend-ram` object, and freeing an
+    allocation needs no `madvise`.
+
+    `mem` stays the MAXIMUM -- what the guest may grow to, and what every
+    existing caller means by it. `mem_boot` is what it starts with.
+
+    NO MODE SETS `mem_boot` TODAY, and the reason is the guest, not the host.
+    MEASURED 2026-08-16 on the Bliss x86 base: QEMU plugs a DIMM happily under
+    WHPX (`plugged-memory` 0 -> 512 MB) and the guest's `MemTotal` does not
+    move a byte, because the kernel is built `# CONFIG_MEMORY_HOTPLUG is not
+    set` -- there is no `/sys/devices/system/memory` for it to online through.
+    So growth does not work, and a smaller boot size with no way to grow is
+    just `--mem` with extra steps: the same run booted at 1536 MB, cost the
+    host 1800 MB instead of 3414 MB, and PS99's client was killed.
+
+    This function is kept, with a test, because it is the whole host-side
+    half of the feature and it becomes live the moment a base ships a kernel
+    with `CONFIG_MEMORY_HOTPLUG=y` -- which is the cheapest of the two routes
+    to a genuinely elastic instance on Windows (the other being the
+    `docs/windows-ram-discard.md` QEMU patch).
+    """
+    boot = (mode or {}).get("mem_boot")
+    if not boot or not mem or boot >= mem:
+        return ["-m", str(mem)]
+    # maxmem needs an explicit unit. Without one QEMU reads it as BYTES and
+    # refuses with "maximum memory size (0x1000) must be at least the initial
+    # memory size" -- which reads like a sizing mistake rather than a missing
+    # suffix.
+    return ["-m", f"size={int(boot)},slots={MEM_SLOTS},maxmem={int(mem)}M"]

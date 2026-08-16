@@ -2207,6 +2207,13 @@ def cmd_start(args):
         except Exception as e:  # noqa: BLE001 — a window failure must not fail start
             print(f"[{label}] could not open a window: {e}")
 
+    # LAST, and after the density settle on purpose: the governor gives memory
+    # back only once the client has plateaued, and starting it before the
+    # session is delivered would just have it watch an idle guest and conclude
+    # the instance needs nothing moments before the game asks for everything.
+    # The saving up to this point has already been banked by the boot cap.
+    if result.get("ok"):
+        result["governor_pid"] = maybe_start_governor(acct, launch_mode, label)
     result["timings"] = timings.as_dict()
     if json_mode:
         emit_json(result)
@@ -6879,26 +6886,12 @@ def cmd_view(args):
             print(f"[view {args.name}] the window keeps QEMU's own chrome: "
                   f"{chrome['reason']}. Rendering and input are unaffected.")
         hostwin.show_qemu_window(identity, pid=qemu_pid)
-        title = f"omni: {args.name}"
-        proc = None
-        try:
-            proc = _spawn_window_bar(args.name, title, identity, qemu_pid)
-        except Exception as e:      # noqa: BLE001
-            print(f"[view {args.name}] the title bar did not start ({e}); the "
-                  f"window is usable and the app can still hide or stop it.")
-        bar_ok = proc is not None and _window_bar_settled(args.name, proc)
-        if bar_ok:
-            # Only a bar that is actually up gets a pid file. Recording a pid
-            # that has already exited invites the next `view` to believe a
-            # bar is open (pid reuse is rare, not impossible) and refuse to
-            # open a real one.
-            _write_window_bar_pid(args.name, proc.pid)
-            # The window path was the only one of the three `view` paths that
-            # printed nothing at all on success. A command that opens a window
-            # and says nothing is indistinguishable from one that did nothing.
-            print(f"[view {args.name}] live window opened [QEMU's own, "
-                  f"restyled] - GPU-rendered, native input, no copy; title "
-                  f"bar pid {proc.pid}")
+        # No separate title bar any more: the patched QEMU build carries our
+        # title, our icon, the aspect-locked resize and the confirm-on-close
+        # in its OWN native frame, which is what a window is supposed to be.
+        bar_ok = False
+        print(f"[view {args.name}] live window opened [QEMU's own, native "
+              f"frame] - GPU-rendered, native input, no copy")
         if getattr(args, "json", False):
             emit_json({"name": args.name, "viewer": "window",
                        "chrome": chrome["applied"], "bar": bar_ok,
@@ -8767,8 +8760,29 @@ def host_can_reclaim_balloon():
 
     `docs/windows-ram-discard.md` has the patch that would make this True on
     Windows, and the measurement showing it still would not reach the stated
-    fleet size for a heavy place."""
+    fleet size for a heavy place.
+
+    NOTE: this answers for the RECLAIM INFLATE only — `apply_balloon_target`,
+    which inflates once after boot and then walks away. The memory GOVERNOR
+    does not ask this question, because it pairs its inflate with
+    `runtime.trim_working_set()`, and `EmptyWorkingSet` frees on Windows what
+    QEMU cannot. See `governor_can_reclaim()`."""
     return not IS_WINDOWS
+
+
+def governor_can_reclaim():
+    """Can the governor's inflate actually give this host its memory back?
+
+    Broader than `host_can_reclaim_balloon()` and true everywhere, because the
+    governor does not depend on QEMU being able to decommit. On Linux/macOS the
+    balloon's own discard path does the work; on Windows the balloon makes the
+    pages cold and `EmptyWorkingSet` evicts them, which was MEASURED to take a
+    live instance from 1873 MB to 131 MB.
+
+    Kept as its own predicate rather than deleting the older one: the two
+    mechanisms genuinely differ, and a fire-and-forget inflate with nothing to
+    trim afterwards is still useless here."""
+    return True
 
 
 def apply_balloon_target(acct, mode, label=None):
@@ -8799,11 +8813,13 @@ def apply_balloon_target(acct, mode, label=None):
             and not (mode or {}).get("balloon_explicit")
             and not _truthy_env("OMNI_FORCE_BALLOON")):
         if label:
-            print(f"[{label}] balloon: not inflating — this host cannot "
-                  f"return the pages (QEMU has no madvise on Windows), so it "
-                  f"would cost the guest {mode.get('mem', 0) - target_mb} MB "
-                  f"and save the host nothing. Use --mem to cap an instance "
-                  f"here. (OMNI_FORCE_BALLOON=1 overrides.)")
+            print(f"[{label}] balloon: not inflating — a fire-and-forget "
+                  f"inflate cannot return pages on this host (QEMU has no "
+                  f"madvise on Windows), so it would cost the guest "
+                  f"{mode.get('mem', 0) - target_mb} MB and save the host "
+                  f"nothing. The memory GOVERNOR does the same job here and "
+                  f"does work, because it pairs its inflate with a host "
+                  f"working-set trim. (OMNI_FORCE_BALLOON=1 overrides.)")
         return None
     # zram changes which floor is safe, so ASK the guest rather than assume.
     # With lz4 compressing ~3x, the guest survives a third less RAM; without
@@ -8873,6 +8889,291 @@ def apply_balloon_target(acct, mode, label=None):
                   f"guest balloon driver missing? Instance still runs, just "
                   f"fatter.")
     return actual_mb
+
+
+# ---------- the memory governor ----------
+#
+# apply_balloon_target above is RECLAIM: let the guest fill up, then take pages
+# back. The governor is PREVENTION: never let the guest take pages it does not
+# need, so there is nothing to reclaim. On Windows only the second one works at
+# all (QEMU has no madvise there), and it is the difference between a `-m 3072`
+# instance costing the host 3.3 GB and costing it what the game actually uses.
+# balloon.py carries the measurements and the policy; this is the plumbing.
+
+GOVERN_POLL_SECS = 5
+
+# Re-trim a settled instance this often (in polls). 12 x 5 s = once a minute:
+# often enough that the working set cannot creep far, rare enough that the
+# re-faults it costs are lost in the noise of an idle guest.
+TRIM_EVERY_POLLS = 12
+
+
+def guest_used_mb(acct):
+    """What the guest says it is using, in MB, or None if it could not be asked.
+
+    None is a first-class answer, not a failure: an adb hiccup must hold the
+    governor where it is rather than be read as "the guest needs nothing".
+    """
+    from omnidroid import balloon
+    try:
+        r = adb(acct, "shell", "cat", "/proc/meminfo", timeout=8)
+        return balloon.used_mb_from_meminfo(r.stdout)
+    except Exception:      # noqa: BLE001 — see docstring: unknown, not zero
+        return None
+
+
+def current_cap_mb(acct):
+    """The balloon's current view of the guest's size, in MB."""
+    r = qmp(acct, "query-balloon") or {}
+    actual = (r.get("return") or {}).get("actual")
+    return int(actual / (1024 * 1024)) if actual else None
+
+
+def guest_mem_mb(acct, mode=None):
+    """The instance's ACTUAL `-m`, asked of QEMU rather than assumed.
+
+    The mode table's `mem` is only the default: `--mem`, autoscaling and the
+    config all move it, and a governor that used the table's number as its
+    ceiling would refuse to grow a guest back to the size it really has.
+    """
+    r = qmp(acct, "query-memory-size-summary") or {}
+    base = (r.get("return") or {}).get("base-memory")
+    if base:
+        return int(base / (1024 * 1024))
+    return (mode or {}).get("mem")
+
+
+# DIMMs are added in whole steps rather than in exactly the number of MB the
+# guest is short. A hotplugged DIMM is a physical memory range to the guest and
+# it can only be removed as a unit, so lots of small odd-sized ones fragment
+# the address space and make later unplugging much less likely to succeed.
+MEM_STEP_MB = 512
+
+
+def plugged_dimms(acct):
+    """The hotplugged DIMMs we added, newest last."""
+    r = qmp(acct, "query-memory-devices") or {}
+    out = []
+    for d in (r.get("return") or []):
+        data = d.get("data") or {}
+        if d.get("type") == "dimm" and data.get("hotplugged"):
+            out.append({"id": data.get("id"),
+                        "mb": int((data.get("size") or 0) / (1024 * 1024))})
+    return out
+
+
+def plug_mem(acct, mb, label=None):
+    """Hotplug a DIMM of `mb` megabytes. Returns the MB added, or 0.
+
+    This is the growth half of the governor on a host that cannot decommit.
+    A balloon deflate hands back memory QEMU has already allocated and touched;
+    plugging a DIMM allocates it for the first time, which is why the host's
+    cost tracks demand here and does not with the balloon.
+    """
+    mb = int(mb)
+    if mb <= 0:
+        return 0
+    n = len(plugged_dimms(acct))
+    mem_id, dev_id = f"omnimem{n}", f"omnidimm{n}"
+    r = qmp(acct, "object-add", {"qom-type": "memory-backend-ram",
+                                 "id": mem_id, "size": mb * 1024 * 1024})
+    if r is None or "error" in r:
+        if label:
+            print(f"[{label}] governor: could not allocate {mb} MB "
+                  f"({(r or {}).get('error', {}).get('desc', 'no QMP')})")
+        return 0
+    r = qmp(acct, "device_add", {"driver": "pc-dimm", "id": dev_id,
+                                 "memdev": mem_id})
+    if r is None or "error" in r:
+        # Give the backing object back, or the next attempt collides on the
+        # id AND the host keeps paying for an allocation nothing can reach.
+        qmp(acct, "object-del", {"id": mem_id})
+        if label:
+            print(f"[{label}] governor: no free memory slot for {mb} MB "
+                  f"({(r or {}).get('error', {}).get('desc', 'no QMP')})")
+        return 0
+    return mb
+
+
+def unplug_mem(acct, label=None):
+    """Remove the most recently added DIMM. Returns the MB released, or 0.
+
+    Best-effort by nature: the guest has to OFFLINE the range first, and it
+    will refuse if anything unmovable landed there. A refusal is normal and
+    costs nothing -- the instance simply stays its current size.
+    """
+    dimms = plugged_dimms(acct)
+    if not dimms:
+        return 0
+    last = dimms[-1]
+    r = qmp(acct, "device_del", {"id": last["id"]})
+    if r is None or "error" in r:
+        return 0
+    # device_del only REQUESTS removal; the guest offlines the range and QEMU
+    # then emits DEVICE_DELETED. Confirm by polling rather than assuming --
+    # reporting memory as released while the guest still holds it is how a
+    # capacity plan turns into an out-of-memory host.
+    for _ in range(10):
+        time.sleep(1)
+        if last["id"] not in [d["id"] for d in plugged_dimms(acct)]:
+            qmp(acct, "object-del", {"id": last["id"].replace("dimm", "mem")})
+            return last["mb"]
+    if label:
+        print(f"[{label}] governor: guest declined to release {last['mb']} MB "
+              f"(unmovable pages in the range) — staying at this size")
+    return 0
+
+
+def govern_once(acct, mode, state, label=None):
+    """One poll of the memory governor. Mutates `state`, returns a small dict.
+
+    `state` carries the two things the policy cannot derive from a single
+    sample: how many consecutive polls have shown slack, and the recent usage
+    history that says whether the client has finished loading.
+    """
+    from omnidroid import balloon
+    mem_mb = guest_mem_mb(acct, mode)
+    cap_mb = current_cap_mb(acct)
+    if not mem_mb or not cap_mb:
+        return {"ok": False, "reason": "qmp_unreachable"}
+    used_mb = guest_used_mb(acct)
+    state.setdefault("history", []).append(used_mb)
+    # Bounded: this loop runs for the life of the instance, and only the tail
+    # is ever read.
+    del state["history"][:-balloon.PLATEAU_POLLS]
+    may_shrink = balloon.plateaued(state["history"])
+    new_cap, slack, why = balloon.next_cap(
+        used_mb=used_mb, cap_mb=cap_mb, mem_mb=mem_mb,
+        floor_mb=(mode or {}).get("balloon_floor") or balloon.SHRINK_STEP_MB,
+        headroom_mb=((mode or {}).get("balloon_headroom")
+                     or balloon.DEFAULT_HEADROOM_MB),
+        slack_polls=state.get("slack", 0), may_shrink=may_shrink)
+    state["slack"] = slack
+    applied = False
+    trimmed = False
+    # PERIODIC TRIM. Trimming only when the cap moves is not enough: a settled
+    # instance's working set creeps back up as Android touches pages again
+    # (measured climbing 531 -> 858 MB over 30 s after one trim), and for a
+    # farming fleet that creep is the whole budget. A settled guest is by
+    # definition not asking for more, so re-trimming it is cheap -- the pages
+    # it actually needs fault straight back from the standby list.
+    state["since_trim"] = state.get("since_trim", 0) + 1
+    if (may_shrink and new_cap == cap_mb
+            and state["since_trim"] >= TRIM_EVERY_POLLS):
+        pid = running_pid(acct["name"])
+        if pid and trim_working_set(pid):
+            trimmed = True
+            state["since_trim"] = 0
+    if new_cap != cap_mb:
+        applied = qmp(acct, "balloon",
+                      {"value": int(new_cap) * 1024 * 1024}) is not None
+        if applied and new_cap < cap_mb:
+            # SHRINK ONLY, and only after the inflate has been requested. The
+            # inflate is what makes the spare pages cold; the trim is what
+            # actually gets the host to let go of them. Trimming on a GROW
+            # would evict pages the guest is about to use.
+            #
+            # The guest walks its free lists over some seconds, so the trim
+            # lands mid-inflate rather than after it. That is fine and is why
+            # it is not worth waiting for: whatever the guest has already
+            # released gets evicted now, and the next poll's trim catches the
+            # rest.
+            pid = running_pid(acct["name"])
+            if pid and trim_working_set(pid):
+                trimmed = True
+                state["since_trim"] = 0
+        if label and applied:
+            print(f"[{label}] governor: {cap_mb} -> {new_cap} MB ({why})"
+                  + ("  [host working set trimmed]" if trimmed else ""))
+    return {"ok": True, "used_mb": used_mb, "cap_mb": cap_mb,
+            "new_cap_mb": new_cap, "mem_mb": mem_mb, "applied": applied,
+            "trimmed": trimmed, "may_shrink": may_shrink, "reason": why}
+
+
+def cmd_govern(args):
+    """Track this instance's real memory demand for as long as it runs.
+
+    Runs as its own detached process, like the autocap recorder, because
+    `start` exits as soon as the session is delivered while the instance keeps
+    running for hours. Exits when the QEMU process does.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:      # noqa: BLE001
+        pass
+    acct = load_account(args.name)
+    cfg = read_config()
+    rd = runtime_dir(args.name)
+    try:
+        mode_name = json.loads((rd / "run.json").read_text()).get("mode")
+    except Exception:      # noqa: BLE001
+        mode_name = None
+    mode = resolve_mode(cfg, mode_name, arch=acct_arch(acct))
+    label = f"govern {args.name}"
+    poll = getattr(args, "interval", None) or GOVERN_POLL_SECS
+    print(f"[{label}] mode {mode.get('name')} floor "
+          f"{mode.get('balloon_floor')} MB headroom "
+          f"{mode.get('balloon_headroom')} MB poll {poll}s")
+    state = {}
+    while True:
+        if not running_pid(args.name):
+            print(f"[{label}] QEMU process is gone - exiting governor")
+            return
+        try:
+            govern_once(acct, mode, state, label)
+        except Exception as e:      # noqa: BLE001
+            # A governor that dies leaves the instance fat, which is survivable.
+            # A governor that takes the instance with it is not.
+            print(f"[{label}] poll failed ({e}) - holding")
+        time.sleep(poll)
+
+
+def _spawn_governor(name):
+    """Detached self-invocation of `govern <name>` (mirrors _spawn_autocap)."""
+    a = ["govern", name]
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + self_argv_prefix() + a
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())] + a
+    rd = runtime_dir(name)
+    rd.mkdir(parents=True, exist_ok=True)
+    logf = open(rd / "governor.log", "ab")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": logf,
+              "stderr": subprocess.STDOUT}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    finally:
+        logf.close()
+    return proc.pid
+
+
+def maybe_start_governor(acct, mode, label=None):
+    """Best-effort governor start for the boot paths. Never raises into a launch.
+
+    Gated on the mode asking for a boot cap, so a mode with no governor numbers
+    (or an explicit `--balloon`, which governor_wanted() declines) behaves exactly as
+    it did before this existed.
+    """
+    from omnidroid import balloon
+    if not balloon.governor_wanted(
+            mode, host_can_reclaim=governor_can_reclaim()):
+        return None
+    try:
+        pid = _spawn_governor(acct["name"])
+        if label:
+            print(f"[{label}] memory governor ON (pid {pid}) — the guest keeps "
+                  f"~{mode.get('balloon_headroom')} MB spare and the host pays "
+                  f"for what it uses, not the {mode.get('mem')} MB it was "
+                  f"offered")
+        return pid
+    except Exception as e:      # noqa: BLE001
+        if label:
+            print(f"[{label}] memory governor could not start: {e}")
+        return None
 
 
 RESTORE_TIMEOUT = 30       # a healthy warm restore is seconds, not minutes
@@ -10478,6 +10779,18 @@ def build_parser():
                    help="seconds the game process must stay gone "
                         "before shutdown (default 20)")
     w.set_defaults(func=cmd_watch)
+
+    gv = sub.add_parser("govern",
+                        help="track this instance's real memory demand and "
+                             "keep its guest RAM ceiling just above it, so the "
+                             "host pays for what the guest USES rather than "
+                             "the --mem it was offered. Started automatically "
+                             "by `start`; run it by hand to govern an instance "
+                             "that was launched some other way.")
+    gv.add_argument("name")
+    gv.add_argument("--interval", type=int, default=GOVERN_POLL_SECS,
+                    help=f"seconds between polls (default {GOVERN_POLL_SECS})")
+    gv.set_defaults(func=cmd_govern)
 
     bb = sub.add_parser("brand-base",
                         help="bake the Omni loading screen into an arm base "

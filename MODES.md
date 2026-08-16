@@ -22,7 +22,8 @@ the engine branches on:
 | guest panel | 1280x800 (`--panel` overrides) | 640x480, `wm size` 480x270 |
 | engine tick | 240 fps target | 5 fps cap |
 | render quality | `high` — real textures, lighting, post-FX | lowest everything |
-| balloon | none | 896 MB (with zram) / 1536 (without) — **skipped entirely on a host that cannot return the pages; see Farming** |
+| balloon (post-boot reclaim) | none | 896 MB (with zram) / 1536 (without) — **skipped entirely on a host that cannot return the pages; see Farming** |
+| memory governor | boot cap 1536 MB, floor 1024, headroom 512 | boot cap 1024 MB, floor 896, headroom 384 |
 | vCPU / RAM | **sized to the host**, capped 4 GB / 4 vCPU on WHPX | 2048 MB, 1 vCPU (2 on x86) |
 | zram | off | on (baked into the base) |
 | scheduler | game on the `top-app` cpuset | game on `background` |
@@ -355,6 +356,56 @@ Two consequences:
   free-page-reporting decommit for real and KSM dedups identical pages across
   instances, so per-instance cost tracks the 896 MB cap and falls further
   across a fleet. `FOOTPRINT.md` has the full picture.
+
+### The memory governor, and why capping at BOOT does not rescue Windows either
+
+The obvious next idea, once reclaim is known not to work, is **prevention**:
+never let the guest touch the pages in the first place. QEMU's guest RAM is
+committed at spawn but resident only on first touch, and an uncapped guest
+climbs from 38 MB of host RSS at t+10s to the full `-m` by t+29s — Android
+filling every page it is offered with page cache while the client is still on
+its loading screen. Set the balloon target at spawn, before the guest's
+virtio-balloon driver has probed, and the driver inflates on arrival.
+
+That is what `omnidroid/balloon.py` implements: a **boot cap** applied inside
+`spawn_qemu`, plus a **governor** (`omnidroid govern <name>`, started
+automatically by `start`) that then tracks real demand — growing the instant
+the guest's free slack falls below 256 MB, shrinking only in steps, only once
+usage has plateaued, and never below the mode's floor.
+
+**It was measured on Windows and it does not work there.** PS99, `-m 3072`,
+cap 1536, against an uncapped control:
+
+| | uncapped | boot cap 1536 |
+|---|---|---|
+| host RSS at rest | 3403–3414 MB | **3335–3345 MB** |
+| guest cap / actually using | 3072 MB / — | 1536 MB / 862 MB |
+| boot | **0.3 min** | 1.4 min |
+| `qemu.log` | ~0 | **31 MB** |
+
+~60 MB saved for a 4x slower boot and 31 MB of log. The cause is that the host
+pays for the **union of pages ever touched**, and the balloon descends at only
+~25 MB/s — one failed `ram_block_discard_range` and one log line per 4 KB
+page. The descent is therefore still running while Android boots, so the guest
+is handed different physical pages each time and touches nearly all of `-m`
+anyway. **Ballooning during boot increases page-set churn rather than
+preventing the fill.**
+
+A first cut made this worse in an instructive way. With the grow rule written
+as "want > cap" alone, a healthy guest moved its own cap every poll
+(1536 → 1543 → 1585 MB observed) and then oscillated forever. On Windows that
+oscillation *ratchets*: every grow lets the guest touch pages it had given
+back, and a touched page is never released. The oscillating run ended at
+**3412 MB — indistinguishable from the uncapped control.** `GROW_TRIGGER_MB`
+and the band around it exist for this, and `tests/test_balloon_governor.py`
+has the regression tests.
+
+So the governor is gated on the same `host_can_reclaim_balloon()` predicate as
+the reclaim inflate: **on Linux/macOS it runs, on Windows it does not.**
+`OMNI_FORCE_GOVERNOR=1` turns it back on for measuring the
+`docs/windows-ram-discard.md` patch, which fixes both halves at once — the
+missing `madvise` is what makes the descent slow *and* makes reclaim
+impossible.
 
 The user's "~400 MB in the desktop Roblox app" is the closest comparison to the
 **game process** (508 MB PSS here), not to an instance: an instance is that

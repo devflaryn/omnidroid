@@ -6,6 +6,53 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-16 (later still) — the memory governor, and why Windows still cannot have it
+
+**New: a demand-tracking balloon.** `omnidroid/balloon.py` holds the policy,
+`spawn_qemu` applies a **boot cap** before the guest's virtio-balloon driver
+has probed, and `omnidroid govern <name>` — started automatically by `start`,
+detached like the autocap recorder — then tracks real demand: it grows the
+moment the guest's free slack drops below 256 MB, shrinks only in 256 MB
+steps, only after usage has plateaued, and never below the mode's floor. Mode
+defaults: gaming `balloon_boot` 1536 / floor 1024 / headroom 512, farming
+1024 / 896 / 384. 31 unit tests in `tests/test_balloon_governor.py`.
+
+This is **prevention**, not the reclaim that `apply_balloon_target` does. An
+uncapped guest goes from 38 MB of host RSS at t+10s to the full `-m` by t+29s,
+which is Android's page cache filling whatever it is offered while the client
+is still on its loading screen — so the hope was that a host which cannot take
+pages *back* might still avoid ever handing them *out*.
+
+**Measured on Windows, and it does not work there.** PS99, `-m 3072`, cap
+1536, against an uncapped control:
+
+| | uncapped | boot cap 1536 |
+|---|---|---|
+| host RSS at rest | 3403–3414 MB | 3335–3345 MB |
+| guest cap / using | 3072 MB / — | 1536 MB / 862 MB |
+| boot | 0.3 min | 1.4 min |
+| `qemu.log` | ~0 | 31 MB |
+
+~60 MB for a 4x slower boot. The host pays for the **union of pages ever
+touched**, and the balloon descends at only ~25 MB/s (one failed
+`ram_block_discard_range` and one log line per 4 KB page), so it is still
+descending while Android boots and the guest touches nearly all of `-m` on
+*different* pages. Ballooning during boot increases page-set churn.
+
+So the governor is gated on the existing `host_can_reclaim_balloon()`: it runs
+on Linux/macOS, not on Windows. `OMNI_FORCE_GOVERNOR=1` overrides, for
+measuring the `docs/windows-ram-discard.md` patch — the same missing `madvise`
+makes the descent slow *and* makes reclaim impossible, so that patch fixes
+both halves.
+
+**A bug worth keeping.** The first cut's grow rule was `want > cap` alone, so
+a healthy guest moved its cap every poll (observed 1536 → 1543 → 1585 MB) and
+then oscillated against the shrink rule forever. On Windows that *ratchets* —
+each grow lets the guest touch pages it had given back, permanently — and the
+oscillating run ended at **3412 MB, indistinguishable from the uncapped
+control**. `GROW_TRIGGER_MB` plus the band around it is the fix; the
+`Stability` test class is the regression.
+
 ## 2026-08-16 (later) — the bar's geometry fix, and a second stale message
 
 **Both defects the hardware pass below found were fixed the same day**, in
