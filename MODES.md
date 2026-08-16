@@ -257,6 +257,46 @@ connect a viewer over VNC to a windowless guest.**
 
 ---
 
+### Open follow-ups on the window bar
+
+Found by the final review of the window work (2026-08-16) and deliberately
+NOT fixed there. None blocks use; they are listed in the order worth doing.
+
+* **The bar's top-of-screen clamp is measured against the PRIMARY monitor.**
+  `bar_geometry` clamps to `y=0`, so a guest window on a monitor *above* the
+  primary pins the bar to the primary's top edge — and the `<Configure>` that
+  generates makes `drag_owner_to_bar` teleport the whole composite down onto
+  the primary. It triggers on a resize up there, and on `view` restoring a
+  remembered negative `y`, which normal use persists. The right clamp is the
+  guest's own monitor work area (`MonitorFromWindow` + `GetMonitorInfo`), not
+  absolute zero.
+* **`drag_owner_to_bar` predicts the owner's new rect instead of reading it
+  back**, which is the rule `follow()` documents ten lines away. Traced to
+  self-correct within one poll cycle — except in the clamp case above, which
+  is why that one goes first.
+* **The bar drag was verified with `SetWindowPos`, never with a physical
+  mouse.** Whether Tk delivers `<Configure>` *during* Windows' modal move
+  loop is reasoned, not measured. Worst case is cosmetic: the guest snaps to
+  the bar on release rather than tracking during the drag. Five minutes for
+  whoever next has the machine and a mouse.
+* **`attach_follow` has no test**, though it returns its tick function so a
+  test can step the poll by hand. The bindings, the reschedule and the
+  owner-gone teardown are the riskiest new code.
+* **`--gpu window` can be hidden but not re-shown.** `--hide` succeeds on such
+  a boot; `view` then refuses it, saying the window is already on screen —
+  which is false in exactly the state `--hide` just created. Recovery is
+  `stop`/`start`. Debug hatch only.
+* **The spec's window ICON is not implemented.** `hostwin._apply_icon` is
+  correct, seam-clean and tested, and has no caller, because there is no
+  `.ico` anywhere in this tree — the only icon in the product family is
+  `omni-executor/packaging/icon.icns`, which is macOS-only and unreadable by
+  `LoadImageW`. The DWM half of the chrome (dark caption, border colour,
+  rounded corners) IS applied and verified. Ship an `.ico` and pass it.
+* **`run.json`'s atomic write uses a fixed temp name**, so two concurrent
+  writers could interleave and publish garbage. Narrow, and strictly better
+  than the overwrite it replaced.
+
+
 ## Farming
 
 **It reaches the PS99 world.** Measured 2026-08-16, screenshot-verified
