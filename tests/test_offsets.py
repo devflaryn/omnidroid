@@ -237,6 +237,25 @@ class LaunchResolution(unittest.TestCase):
                                                     allow_none=True),
                          (None, None))
 
+    def test_offset_none_boots_game_less_instead_of_reprinting_the_error(self):
+        """`--offset none` is one of the two escape hatches the error above
+        offers by name, and it landed in that same error: `allow_none` is set
+        only by the `--apk` caller, so the flag the message told the user to
+        reach for printed the message again. An EXPLICIT "none" needs no
+        permission from the caller -- the caller's flag covers the case where
+        the user asked for nothing and nothing is baked."""
+        cfg = self._cfg(self.tmp)
+        self.assertEqual(omni.resolve_launch_offset(cfg, "arm", "none"),
+                         (None, None))
+
+    def test_offset_none_is_honoured_even_when_versions_ARE_baked(self):
+        # "boot a deliberately game-less instance" has to mean that on a host
+        # that has baked versions too, or it is only a clean-base command.
+        cfg = self._cfg(self.tmp, offsets={"v1": {"data": "v1.qcow2"}},
+                        default_offset="v1")
+        self.assertEqual(omni.resolve_launch_offset(cfg, "arm", "none"),
+                         (None, None))
+
 
 class OffsetsAreNotPerAccount(unittest.TestCase):
     def test_the_registry_lives_on_the_BASE_not_on_an_account(self):

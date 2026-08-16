@@ -1031,7 +1031,16 @@ def resolve_launch_offset(cfg, tag, requested=None, allow_none=False,
              f"no default. Pick one for this launch with `--offset <name>`, "
              f"or set it once with `omnidroid offset default <name>`.")
     if name is None:
-        if not allow_none:
+        # `--offset none` is the user SAYING "game-less, on purpose", which
+        # resolve_offset reports as why == "explicit". It is one of the two
+        # escape hatches this function's own error message offers and its own
+        # docstring lists ("the `--apk` / `--offset none` paths"), and it was
+        # falling into that error anyway: `allow_none` is only set by the
+        # `--apk` caller, so the flag the message told the user to reach for
+        # printed the same message again. An explicit request needs no
+        # permission from the caller -- the caller's flag exists to cover the
+        # case where the user asked for NOTHING and nothing is baked.
+        if not allow_none and why != "explicit":
             fail("no_offset",
                  f"base '{tag}' has NO Roblox baked (the base ships clean). "
                  f"Bake a version first: `omnidroid offset create <name> "
