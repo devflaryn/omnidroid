@@ -68,20 +68,27 @@ class Quoting(unittest.TestCase):
 
 
 class SqueezeShape(unittest.TestCase):
-    def test_display_is_shrunk_first(self):
-        """Ordering is load-bearing: shrinking after apps have allocated
-        tablet-sized buffers leaves the big buffers around."""
+    def test_the_squeeze_carries_no_panel_at_all(self):
+        """The panel is build_display_sequence now, applied before the client
+        is launched. Emitted from here it reaches a RUNNING Roblox, whose
+        activity is RESIZE_MODE_UNRESIZEABLE, so Android size-compats the
+        window and asks the user to restart the app for a better view —
+        measured 2026-08-17, and reproduced on demand on a live instance."""
         steps = farming.build_squeeze_sequence()
-        self.assertEqual(steps[0], ["shell", "wm", "size", "480x270"])
+        self.assertNotIn("wm", [s[1] for s in steps])
+
+    def test_display_is_its_own_sequence(self):
+        self.assertEqual(farming.build_display_sequence()[0],
+                         ["shell", "wm", "size", "480x270"])
 
     def test_mode_display_override_is_honoured(self):
-        steps = farming.build_squeeze_sequence({"display": (320, 180, 60),
+        steps = farming.build_display_sequence({"display": (320, 180, 60),
                                                 "mem": 2048})
         self.assertEqual(steps[0], ["shell", "wm", "size", "320x180"])
 
     def test_native_display_mode_skips_the_resize(self):
-        steps = farming.build_squeeze_sequence({"display": None, "mem": 2048})
-        self.assertNotIn("wm", [s[1] for s in steps])
+        self.assertEqual(
+            farming.build_display_sequence({"display": None, "mem": 2048}), [])
 
     def test_every_trimmed_package_gets_a_step(self):
         steps = farming.build_squeeze_sequence()

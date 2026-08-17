@@ -417,8 +417,10 @@ game *plus a whole Android* plus QEMU.
   build runs through `libndk_translation` on the x86 base, and the ordered
   `am broadcast` that hands over the session did not return within 45 s — which
   raised `TimeoutExpired` straight out of `cmd_start` as a traceback. Farming
-  now takes `smp_x86: 2`, `kiosk_broadcast` treats a timeout as a RESULT rather
-  than an exception, and its budget is 120 s.
+  took `smp_x86: 2` for that, `kiosk_broadcast` treats a timeout as a RESULT
+  rather than an exception, and its budget is 120 s. **It is `smp_x86: 3`
+  now** — reaching the world was not the only bar; see "The executor needs a
+  vCPU of its own" below.
 * **The balloon was reported as broken when it was merely slow.** At the 30 s
   mark a 2048→896 MB inflation read 1805 MB and the launch printed "guest
   balloon driver missing?"; the same guest read 938 MB a minute later and
@@ -520,6 +522,72 @@ which `cmd_start` calls AFTER the session is delivered and after the client's
 memory has stopped growing (`wait_for_game_settled` — PSS plateau above a
 700 MB floor, so a splash screen never counts as settled). `OMNI_SETTLE_TIMEOUT`
 / config `qemu.settle_timeout` bounds the wait; 0 squeezes immediately.
+
+### AMENDMENT, 2026-08-17: the PANEL goes back to the boot tail
+
+"After the client has loaded" is right for every lever that spends quality to
+buy memory. It is exactly **wrong** for the one lever that is not a memory
+lever at all — `wm size` / `wm density`.
+
+Roblox's activity is `RESIZE_MODE_UNRESIZEABLE`. A display change handed to it
+while it is running is a configuration change it cannot follow, so Android
+puts it in **size compat mode**: it keeps rendering at the panel it launched
+with, gets scaled down and letterboxed, and SystemUI parks **"Tap to restart
+this app for a better view."** over the game. Measured on a live farming
+instance, in-world (`dumpsys activity activities`):
+
+```
+resizeMode=RESIZE_MODE_UNRESIZEABLE
+mSizeCompatScale=0.5584416   mSizeCompatBounds=Rect(62, 0 - 419, 258)
+areBoundsLetterboxed=true    letterboxReason=SIZE_COMPAT_MODE
+```
+
+— a client that launched at 640x480 still rendering 640x462 and being squashed
+into 357x258 of a 480x270 screen. Confirmed by **intervention**, not
+inference: on a live *gaming* instance with the game up and no prompt on
+screen, one `wm size 480x270` + `wm density 80` put the same prompt up within
+20 s, same pid, no relaunch.
+
+So `farming.build_display_sequence` is now its own call, applied by
+`apply_farming_display` in the density branch of `_ensure_booted` — i.e.
+**before the session is delivered**, while there is no client to disturb. This
+is the slot gaming has always used for its own `wm size reset`; farming was
+the odd one out. The client comes up at the final panel, never size-compats,
+and renders 480x270 instead of 640x462 — 39% fewer pixels, for free.
+`OMNI_FARM_SKIP=display` still means "do not touch the panel".
+
+### The executor needs a vCPU of its own (`smp_x86` 2 → 3)
+
+A farming instance could join, farm, and look perfect while the **in-guest
+executor never loaded** — no OMNI-EXEC menu, no auto-exec, ever. Gaming was
+always fine.
+
+The chain is invisible from outside: it writes nothing to logcat and nothing
+to Roblox's client log, so "the executor did not load" and "the executor is
+not installed" look identical. What made it legible was packet-capturing it
+**inside the guest** (`adb shell tcpdump -i eth0 host <exec server>`, root is
+available on the x86 base). The chain is 11 font fetches → `Costumers/arceus.lua`
+→ `/gist` (the menu) → `/omni/exec/claim` → a 1 Hz poll.
+
+MEASURED 2026-08-17, PS99, x86, same account/place/offset:
+
+| farming `smp_x86` | what the capture shows |
+| --- | --- |
+| **2** | 3 fonts in 11 s, then **nothing for the rest of the session**. No `arceus.lua`, no `/gist`, no menu. |
+| **3** | all 11 fonts, `arceus.lua`, `/gist`, claim, polling. Menu on screen. |
+| **4** | same, ~5 s sooner — not worth a fourth vCPU across a fleet. |
+
+The stall is ~85 s **before** the squeeze runs, so the squeeze is not what does
+it; the executor's startup simply loses its race with the place load on two
+translated vCPUs. `--quality balanced` does not help (tested), so it is not the
+5 fps tick either.
+
+**What the third vCPU costs: almost nothing at steady state.**
+`cpu_ceiling_pct: 50` caps the whole QEMU *process* at half a core once the
+client has loaded, and that cap is per-process, not per-vCPU. The extra vCPU is
+spent where the starvation was — startup — and is idle afterwards, which is
+where a farming fleet lives. The arm base runs Roblox natively and keeps
+`smp 1`.
 
 **A density launch is therefore MINUTES rather than seconds**, and that is the
 honest reading of "this instance is ready" — `timings.stages.density_settled`

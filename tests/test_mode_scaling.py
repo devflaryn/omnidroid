@@ -81,7 +81,15 @@ class TheModeTable(unittest.TestCase):
         # vCPU could not get through the session handover (measured: the
         # ordered `am broadcast` did not return in 45 s). The arch override is
         # a requirement, not a preference.
-        self.assertEqual(qp.MODES["farming"]["smp_x86"], 2)
+        #
+        # 3, not 2, and the third vCPU is the IN-GUEST EXECUTOR's. MEASURED
+        # 2026-08-17 by packet-capturing its HTTP chain inside the guest: at
+        # smp 2 it gets 3 of its 11 font fetches away and then stops dead —
+        # never reaching `arceus.lua` or `/gist`, so the OMNI-EXEC menu never
+        # loads and no auto-exec ever runs, on an instance that otherwise
+        # joins and farms perfectly. At 3 the whole chain completes and the
+        # menu is on screen. Lowering this silently disables the executor.
+        self.assertEqual(qp.MODES["farming"]["smp_x86"], 3)
 
     def test_only_gaming_grows_to_the_host(self):
         # Farming's whole point is a fixed small footprint; autoscaling it
@@ -241,7 +249,7 @@ class ResolveMode(unittest.TestCase):
     def test_an_arch_override_applies_and_leaves_no_residue(self):
         x86 = qp.resolve_mode({}, "farming", arch="x86")
         arm = qp.resolve_mode({}, "farming", arch="arm")
-        self.assertEqual(x86["smp"], 2)
+        self.assertEqual(x86["smp"], 3)
         self.assertEqual(arm["smp"], 1)
         for m in (x86, arm):
             self.assertNotIn("smp_x86", m)

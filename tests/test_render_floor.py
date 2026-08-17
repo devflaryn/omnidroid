@@ -159,16 +159,17 @@ class TheRenderStep(unittest.TestCase):
                       farming.parse_skip("doze, RENDER ,zram"))
         self.assertNotIn(farming.STEP_RENDER, farming.parse_skip("renderer"))
 
-    def test_it_sits_with_the_display_step_not_after_the_trim(self):
-        """Ordering rationale (farming.build_squeeze_sequence): the panel is
-        settled before anything else runs, so nothing in between sizes its
-        buffers for a panel this boot is about to abandon."""
+    def test_it_leads_the_squeeze_and_precedes_the_trim(self):
+        """Ordering rationale (farming.build_squeeze_sequence): with the panel
+        moved out to build_display_sequence, the animation scales are what the
+        squeeze now settles first, so everything after is measured against a
+        guest that is no longer animating."""
         steps = self._minimal()
         render = _first(steps, "transition_animation_scale")
-        self.assertGreater(render, _first(steps, "wm size"))
+        self.assertEqual(render, 0)
         self.assertLess(render, _first(steps, "pm disable-user"))
 
-    def test_no_squeeze_ever_shrinks_below_the_modes_own_panel(self):
+    def test_no_panel_sequence_ever_shrinks_below_the_modes_own(self):
         """MEASURED 2026-08-15, PS99, in-world, four runs.
 
         The floor's 320x180 panel KILLS the client. First seen when it arrived
@@ -182,7 +183,7 @@ class TheRenderStep(unittest.TestCase):
         So `minimal` is gone from QUALITY_PROFILES and no quality string --
         including one handed in programmatically -- may shrink the panel."""
         for quality in ("low", "minimal", "balanced", "high", "ultra", None):
-            steps = self._minimal(quality=quality)
+            steps = self._panel(quality=quality)
             sizes = [s for s in steps if s[:3] == ["shell", "wm", "size"]]
             self.assertEqual(sizes, [["shell", "wm", "size", "480x270"]],
                              f"quality={quality!r} resized below the mode")
@@ -190,9 +191,19 @@ class TheRenderStep(unittest.TestCase):
     def test_a_normal_farming_boot_gets_no_second_resize(self):
         """`low` already IS the mode's panel, so the floor must emit nothing
         rather than re-sending the same size."""
-        steps = farming.build_squeeze_sequence(dict(MODES["farming"]))
+        steps = farming.build_display_sequence(dict(MODES["farming"]))
         sizes = [s for s in steps if s[:3] == ["shell", "wm", "size"]]
         self.assertEqual(sizes, [["shell", "wm", "size", "480x270"]])
+
+    def test_the_squeeze_itself_no_longer_carries_a_panel(self):
+        """The panel is a BOOT step now, not a post-load one: delivered to a
+        running Roblox it puts Android's "restart this app for a better view"
+        prompt on screen (measured 2026-08-17 by intervention on a live gaming
+        instance — same pid, prompt within 20 s). See test_farming_apply."""
+        for quality in ("low", "minimal", None):
+            flat = _flat(self._minimal(quality=quality))
+            self.assertNotIn("wm size", flat)
+            self.assertNotIn("wm density", flat)
 
     def test_it_zeroes_the_two_scales_quiesce_does_not(self):
         flat = _flat(self._minimal())
@@ -206,19 +217,19 @@ class TheRenderStep(unittest.TestCase):
         self.assertEqual(flat.count("window_animation_scale"), 1)
 
     def test_skipping_it_leaves_the_mode_s_own_panel(self):
-        steps = self._minimal(skip=("render",))
-        self.assertEqual(steps[0], ["shell", "wm", "size", "480x270"])
-        flat = _flat(steps)
-        self.assertNotIn("320x180", flat)
-        self.assertNotIn("animator_duration_scale", flat)
+        panel = self._panel(skip=("render",))
+        self.assertEqual(panel[0], ["shell", "wm", "size", "480x270"])
+        self.assertNotIn("320x180", _flat(panel))
+        self.assertNotIn("animator_duration_scale",
+                         _flat(self._minimal(skip=("render",))))
 
     def test_skipping_display_means_no_panel_change_at_all(self):
         """`OMNI_FARM_SKIP=display` means 'do not touch the panel'. A render
         floor that resized anyway would make that bisect prove nothing."""
-        flat = _flat(self._minimal(skip=("display",)))
-        self.assertNotIn("wm size", flat)
+        self.assertEqual(self._panel(skip=("display",)), [])
         # ...but the rest of the floor is a different lever and still runs.
-        self.assertIn("animator_duration_scale", flat)
+        self.assertIn("animator_duration_scale",
+                      _flat(self._minimal(skip=("display",))))
 
     def test_it_sets_no_property(self):
         """Every compositing property in lean.py is `ro.*` and init freezes
@@ -248,15 +259,21 @@ class TheRenderStep(unittest.TestCase):
         mode entry carries `quality`, so the sequence can resolve it. It
         resolves to the mode's panel now, because the smaller one is fatal."""
         mode = dict(MODES["farming"], quality="minimal")
-        self.assertIn("480x270", _flat(farming.build_squeeze_sequence(mode)))
-        self.assertNotIn("320x180", _flat(farming.build_squeeze_sequence(mode)))
+        self.assertIn("480x270", _flat(farming.build_display_sequence(mode)))
+        self.assertNotIn("320x180", _flat(farming.build_display_sequence(mode)))
 
     def test_it_is_deterministic(self):
         self.assertEqual(self._minimal(), self._minimal())
+        self.assertEqual(self._panel(), self._panel())
 
     @staticmethod
     def _minimal(skip=(), quality="minimal"):
         return farming.build_squeeze_sequence(dict(MODES["farming"]),
+                                              skip=skip, quality=quality)
+
+    @staticmethod
+    def _panel(skip=(), quality="minimal"):
+        return farming.build_display_sequence(dict(MODES["farming"]),
                                               skip=skip, quality=quality)
 
 

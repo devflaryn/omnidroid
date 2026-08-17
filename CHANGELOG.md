@@ -6,6 +6,68 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-17 (night) — farming's executor never loaded, and Android kept asking to restart the app
+
+Two farming-only defects, both reproduced on a live PS99 instance, both fixed
+and re-verified end to end with default flags. Gaming was never affected.
+
+**1. The OMNI-EXEC menu never appeared in farming (`smp_x86` 2 → 3).**
+A farming instance joined, farmed and looked perfect while the in-guest
+executor had silently never finished starting — so no menu and no auto-exec,
+ever. The chain writes nothing to logcat and nothing to Roblox's client log,
+so from outside "did not load" and "not installed" are the same picture. What
+made it legible was capturing it *inside* the guest:
+
+```
+adb shell setsid tcpdump -i eth0 -s 0 -w /data/local/tmp/exec.pcap host <exec server>
+```
+
+The executor fetches 11 fonts, then `Costumers/arceus.lua`, then `/gist` (the
+menu), then `/omni/exec/claim` and polls at 1 Hz. Same account, place and
+offset, only `smp` varied:
+
+| farming `smp_x86` | capture |
+| --- | --- |
+| **2** | 3 fonts in 11 s, then nothing for the rest of the session — no `arceus.lua`, no `/gist`, no menu |
+| **3** | all 11 fonts → `arceus.lua` → `/gist` → claim → polling; menu on screen |
+| **4** | same, ~5 s sooner |
+
+The stall is ~85 s *before* the squeeze runs, so the squeeze is not the cause,
+and `--quality balanced` does not help — so it is not the 5 fps tick either.
+The executor's startup simply loses its race with the place load on two
+translated vCPUs. The third vCPU is nearly free at steady state:
+`cpu_ceiling_pct: 50` caps the whole QEMU *process* at half a core once the
+client has loaded, per-process rather than per-vCPU. arm keeps `smp 1`.
+
+**2. "Tap to restart this app for a better view." over the game.**
+The farming squeeze runs after the client has loaded, so its `wm size` /
+`wm density` landed on a *running* Roblox — whose activity is
+`RESIZE_MODE_UNRESIZEABLE`. Android answers by size-compatting it:
+
+```
+mSizeCompatScale=0.5584416   mSizeCompatBounds=Rect(62, 0 - 419, 258)
+areBoundsLetterboxed=true    letterboxReason=SIZE_COMPAT_MODE
+```
+
+— a client that launched at 640x480 still rendering 640x462 and being squashed
+into 357x258 of a 480x270 screen, with SystemUI's restart prompt on top. That
+is a menu with a button, i.e. the thing this product promises never to show.
+Confirmed by intervention rather than inference: on a live *gaming* instance
+with no prompt on screen, one `wm size 480x270` + `wm density 80` produced it
+within 20 s, same pid, no relaunch.
+
+The panel is now `farming.build_display_sequence`, applied by
+`apply_farming_display` in the density branch of `_ensure_booted` — before the
+session is delivered, while there is no client to disturb, which is the slot
+gaming has always used for its own `wm size reset`. The client comes up at the
+final panel, never size-compats, and renders 480x270 instead of 640x462 (39%
+fewer pixels). Everything else in the squeeze still waits for the load.
+`OMNI_FARM_SKIP=display` still means "do not touch the panel".
+
+Verified after the fix, farming with no flags: `dumpsys` reports no
+`letterboxReason` and no `mSizeCompatScale`, the capture shows the full exec
+chain with 62 polls, and the screenshot is full-bleed with the OE button on it.
+
 ## 2026-08-17 (evening) — the launch was calling dead instances a success
 
 **`start` returned `ok: true, in_world: true` for a farming instance whose

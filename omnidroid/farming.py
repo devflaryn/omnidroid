@@ -154,6 +154,52 @@ def parse_skip(text):
     return tuple(n for n in STEP_NAMES if n in wanted)
 
 
+def build_display_sequence(mode=None, skip=(), quality=None):
+    """The panel steps ALONE — `wm size` + `wm density`, or [] when skipped.
+
+    Split out of build_squeeze_sequence, and the split is the fix for a bug
+    the rest of that function cannot see. The squeeze runs AFTER the client
+    has loaded (settle_density_instance), so emitting the panel from there
+    delivers a display change to an already-running Roblox. Roblox's activity
+    is `RESIZE_MODE_UNRESIZEABLE`, so Android cannot re-lay it out: it puts it
+    in SIZE COMPAT MODE, scales the old window down and letterboxes it, and
+    WM Shell parks "Tap to restart this app for a better view." on top of the
+    game -- a prompt with a button, i.e. exactly what this product promises
+    never to show.
+
+    MEASURED 2026-08-17, PS99, x86 base (Android 13 / SDK 33). A farming boot,
+    in-world, read back with `dumpsys activity activities`:
+
+        resizeMode=RESIZE_MODE_UNRESIZEABLE
+        mSizeCompatScale=0.5584416  mSizeCompatBounds=Rect(62, 0 - 419, 258)
+        areBoundsLetterboxed=true   letterboxReason=SIZE_COMPAT_MODE
+
+    i.e. a client that launched at 640x480/120dpi was still RENDERING 640x462
+    and being downscaled into 357x258 of a 480x270 screen. Confirmed by
+    INTERVENTION rather than inference: on a live GAMING instance with the
+    game up and no prompt on screen, one `wm size 480x270` + `wm density 80`
+    put the same prompt on screen within 20 s, same pid, no relaunch.
+
+    Applied BEFORE the session is delivered instead, the client starts at the
+    final panel, never enters size compat, and the prompt never appears --
+    and it renders 480x270 rather than 640x462, which is 39% fewer pixels for
+    free. This is the shape gaming has always had (its `wm size reset` runs in
+    the boot tail, before the game exists); farming was the odd one out.
+
+    `skip` still means what it says: OMNI_FARM_SKIP=display leaves the panel
+    entirely alone, and `render` leaves it at the mode's own size.
+    """
+    mode = mode or {}
+    skip = set(skip or ())
+    if STEP_DISPLAY in skip:
+        return []
+    display = mode.get("display", lean.FARMING_DISPLAY)
+    quality = quality if quality is not None else mode.get("quality")
+    floor = lean.display_for_quality(quality, display)
+    panel = display if STEP_RENDER in skip else floor
+    return lean.display_args(panel)
+
+
 def build_squeeze_sequence(mode=None, skip=(), quality=None):
     """Ordered list of adb `shell` argv vectors for the farming squeeze.
 
@@ -165,15 +211,16 @@ def build_squeeze_sequence(mode=None, skip=(), quality=None):
     keeps that resolution in one place; None falls back to the mode's own
     `quality` key so a caller that does not care still gets the right thing.
 
+    THE PANEL IS NOT HERE ANY MORE. It is build_display_sequence, applied
+    before the session is delivered, because a `wm size` handed to a running
+    non-resizable client is what raises Android's "Tap to restart this app for
+    a better view" prompt — see that function for the measurement. What is
+    left here is everything that is genuinely a property of an IDLE joined
+    instance and so has to wait for the load to finish.
+
     Ordering is load-bearing:
-      1. display FIRST — every later step's memory picture is then measured
-         against the small display, and shrinking it after apps have already
-         allocated tablet-sized buffers just leaves the big buffers around;
-      1b. the RENDER FLOOR immediately after, for exactly that reason: it is a
-         second, smaller panel, so it belongs in the same slot as the first
-         one. Putting it later would mean every buffer between here and there
-         is sized for a panel this boot is about to abandon — the same mistake
-         the display step exists to avoid, made twice;
+      1. the RENDER FLOOR's animation scales first, so the steps that follow
+         are measured against a guest that is no longer animating;
       2. package disable before zram, so the pages freed by force-stopping
          those apps are free pages rather than things zram has to compress;
       3. cpuset LAST, because it needs the game's pid, which only exists once
@@ -181,35 +228,10 @@ def build_squeeze_sequence(mode=None, skip=(), quality=None):
     """
     mode = mode or {}
     skip = set(skip or ())
-    display = mode.get("display", lean.FARMING_DISPLAY)
-    quality = quality if quality is not None else mode.get("quality")
-    floor = lean.display_for_quality(quality, display)
     mem_mb = mode.get("mem", 2048)
     zram_mb = zram_size_mb(mem_mb)
 
     steps = []
-
-    # 1) Shrink the display, ONCE. Roblox keeps running and keeps its
-    #    connection; it just composites ~30x fewer pixels.
-    #
-    #    The render floor's panel is folded in here rather than emitted as a
-    #    second resize later, and that is a MEASUREMENT, not tidying.
-    #    2026-08-15, PS99, in-world, `--quality minimal`: a second `wm size`
-    #    (480x270 -> 320x180) delivered to a running client KILLED it --
-    #    process gone, screen black, the guest's MemAvailable jumping 591 MB
-    #    -> 2202 MB as its 1.6 GB was released, and the guest falling to 200%
-    #    idle, which reads exactly like the "engine deadlocks rather than
-    #    crawls" signature and is not it. The same boot with
-    #    `OMNI_FARM_SKIP=render` -- same 3 fps ClientAppSettings, no second
-    #    resize -- stayed alive and in-world (PSS 1349 MB). One configuration
-    #    change to a running Roblox client is survivable; two are not.
-    #
-    #    Both bisect knobs still mean what they say: `OMNI_FARM_SKIP=display`
-    #    leaves the panel entirely alone, and `OMNI_FARM_SKIP=render` leaves
-    #    it at the mode's own size.
-    if STEP_DISPLAY not in skip:
-        panel = display if STEP_RENDER in skip else floor
-        steps += lean.display_args(panel)
 
     # 1b) The RENDER FLOOR. Farming is unattended: no fps requirement, no view
     #     quality requirement, and — because the mode boots `-display none`

@@ -8804,6 +8804,42 @@ def settle_density_instance(acct, mode, label=None, debug=False, wait=True,
     return apply_balloon_target(acct, mode, label)
 
 
+def apply_farming_display(acct, mode=None, label=None, quality=None):
+    """Set farming's panel BEFORE the client starts. Returns the panel, or None.
+
+    The other half of the farming squeeze, and the only half that must NOT
+    wait for the game. Everything in apply_farming_squeeze exists to make an
+    already-loaded, idle instance cheap, and applying it to a loading client
+    starves it -- which is why that call moved into settle_density_instance.
+    The panel is the opposite case: `wm size`/`wm density` delivered to a
+    RUNNING Roblox is a configuration change it cannot follow (its activity is
+    RESIZE_MODE_UNRESIZEABLE), so Android puts it in size compat mode and
+    SystemUI parks "Tap to restart this app for a better view." over the game.
+    See farming.build_display_sequence for the dumpsys read-back and for the
+    live A/B that produced that prompt on demand.
+
+    Applied here it is free of that: the client has not been told which place
+    to load yet -- it has not been launched at all -- so there is no window to
+    disturb, and it comes up at the final panel. Same slot gaming has always
+    used for its own `wm size reset`.
+
+    Fire-and-forget like the squeeze: a panel that could not be set leaves a
+    fatter, uglier instance, never a broken one."""
+    skip = farming.parse_skip(os.environ.get("OMNI_FARM_SKIP"))
+    steps = farming.build_display_sequence(mode, skip=skip, quality=quality)
+    if not steps:
+        return None
+    for cmd in steps:
+        adb(acct, *cmd, timeout=20)
+    panel = (mode or {}).get("display") or lean.FARMING_DISPLAY
+    if label:
+        print(f"[{label}] farming panel: {panel[0]}x{panel[1]} @ {panel[2]} dpi, "
+              f"set BEFORE the client starts (so it never enters Android's "
+              f"size-compat mode, which is what raises the 'restart this app "
+              f"for a better view' prompt)")
+    return panel
+
+
 def apply_farming_squeeze(acct, mode=None, label=None, quality=None):
     """Run the farming runtime squeeze over adb. Called only on a farming boot.
 
@@ -10324,8 +10360,17 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
         # so it is neither the guest size nor the vCPU count. See
         # settle_density_instance(), which cmd_start calls once the client has
         # actually finished loading.
+        #
+        # THE PANEL IS THE ONE EXCEPTION, and it is here rather than in the
+        # squeeze for the opposite reason to the rest: it has to land while
+        # there is still no client to disturb. A `wm size`/`wm density` handed
+        # to a running Roblox is a configuration change its non-resizable
+        # activity cannot follow, so Android size-compats it and asks the user
+        # to "restart this app for a better view" -- measured, and reproduced
+        # on demand against a live gaming instance. See apply_farming_display.
         if settings is not None:
             apply_roblox_settings(acct, label, settings=settings)
+        apply_farming_display(acct, mode, label, quality=quality)
     else:
         # PERFORMANCE (gaming). No zram, no squeeze
         # and no balloon — each of those trades responsiveness for density,

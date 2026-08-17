@@ -66,6 +66,61 @@ class TheRenderFloorReachesTheDevice(unittest.TestCase):
         flat = " ".join(" ".join(c) for c in self._run())
         self.assertIn("animator_duration_scale", flat)
 
+    def test_the_squeeze_never_touches_the_panel(self):
+        """The panel moved OUT of the squeeze, and this is the regression.
+
+        The squeeze runs after the client has loaded, so a `wm size` from here
+        lands on a running Roblox — whose activity is RESIZE_MODE_UNRESIZEABLE,
+        so Android size-compats it and asks the user to "restart this app for a
+        better view". MEASURED 2026-08-17 on a live gaming instance: one
+        `wm size 480x270` + `wm density 80` put that prompt on screen in under
+        20 s, same pid, no relaunch. It belongs before the client exists —
+        apply_farming_display — and must never come back here."""
+        for mode in (None, MODES["farming"],
+                     dict(MODES["farming"], quality="minimal")):
+            flat = " ".join(" ".join(c) for c in self._run(mode))
+            self.assertNotIn("wm size", flat)
+            self.assertNotIn("wm density", flat)
+
+    def test_OMNI_FARM_SKIP_render_removes_exactly_that_step(self):
+        full = self._run()
+        skipped = self._run(env={"OMNI_FARM_SKIP": "render"})
+        self.assertEqual(len(full) - len(skipped), 1)
+        flat = " ".join(" ".join(c) for c in skipped)
+        self.assertNotIn("animator_duration_scale", flat)
+
+    def test_every_step_sent_is_a_quoted_argv_vector(self):
+        """`adb shell` joins argv and lets the guest re-parse it; an unquoted
+        multi-command script silently runs fragments of itself and still
+        reports success. Asserted at the CALL SITE, not just in the builder."""
+        for cmd in self._run(dict(MODES["farming"], quality="minimal")):
+            self.assertEqual(cmd[0], "shell")
+            if cmd[:3] == ["shell", "sh", "-c"]:
+                self.assertEqual(len(cmd), 4)
+                self.assertEqual(cmd[3], shlex.quote(shlex.split(cmd[3])[0]))
+
+
+class TheFarmingPanel(unittest.TestCase):
+    """apply_farming_display: the panel, sent BEFORE the client starts.
+
+    Its own class because it is now its own call, made from a different point
+    in the boot (the density branch of _ensure_booted, above the session
+    delivery) than the squeeze it used to live in."""
+
+    def _run(self, mode=MODES["farming"], env=None, quality=None):
+        acct = {"name": "u1"}
+        env = dict(env or {})
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(omni, "adb") as adb:
+            if "OMNI_FARM_SKIP" not in env:
+                os.environ.pop("OMNI_FARM_SKIP", None)
+            omni.apply_farming_display(acct, mode, quality=quality)
+        return [list(c.args[1:]) for c in adb.call_args_list]
+
+    def test_the_panel_and_the_density_both_reach_the_device(self):
+        self.assertEqual(self._run(), [["shell", "wm", "size", "480x270"],
+                                       ["shell", "wm", "density", "80"]])
+
     def test_a_minimal_quality_mode_no_longer_sends_a_smaller_panel(self):
         """MEASURED 2026-08-15, PS99, in-world: the 320x180 panel KILLS the
         client — process gone, `screencap` solid black, guest MemAvailable
@@ -75,19 +130,17 @@ class TheRenderFloorReachesTheDevice(unittest.TestCase):
 
         Asserted at the ADB layer rather than only on the builder, because the
         thing that must never reach a live guest again is this argv."""
-        mode = dict(MODES["farming"], quality="minimal")
-        flat = " ".join(" ".join(c) for c in self._run(mode))
+        flat = " ".join(" ".join(c) for c in self._run(quality="minimal"))
         self.assertNotIn("320x180", flat)
         self.assertIn("wm size 480x270", flat)
 
-    def test_OMNI_FARM_SKIP_render_removes_exactly_that_step(self):
-        full = self._run()
-        skipped = self._run(env={"OMNI_FARM_SKIP": "render"})
-        self.assertEqual(len(full) - len(skipped), 1)
-        flat = " ".join(" ".join(c) for c in skipped)
-        self.assertNotIn("animator_duration_scale", flat)
-        # ...and the display step, which shares its slot, is untouched.
-        self.assertEqual(skipped[0], ["shell", "wm", "size", "480x270"])
+    def test_OMNI_FARM_SKIP_display_still_means_do_not_touch_the_panel(self):
+        """The bisect knob has to survive the move, or the one lever this
+        project has twice had to bisect stops being removable."""
+        self.assertEqual(self._run(env={"OMNI_FARM_SKIP": "display"}), [])
+
+    def test_a_native_display_mode_sends_nothing(self):
+        self.assertEqual(self._run(dict(MODES["farming"], display=None)), [])
 
     def test_every_step_sent_is_a_quoted_argv_vector(self):
         """`adb shell` joins argv and lets the guest re-parse it; an unquoted
@@ -128,9 +181,25 @@ class FarmingGate(unittest.TestCase):
              mock.patch.object(omni, "apply_roblox_settings"), \
              mock.patch.object(omni, "apply_gaming_tuning"), \
              mock.patch.object(omni, "enable_zram"), \
+             mock.patch.object(omni, "apply_farming_display") as panel, \
              mock.patch.object(omni, "apply_farming_squeeze") as sq:
             omni._ensure_booted(acct, {}, "t", mode_name=mode_name)
-        return sq
+        return sq, panel
+
+    def test_the_boot_sets_the_panel_on_farming_and_only_farming(self):
+        """The one farming lever that MUST happen during the boot.
+
+        Everything else in the squeeze exists to make an idle joined instance
+        cheap and starves a loading client, so it waits. The panel is the
+        opposite: sent later it lands on a running, non-resizable Roblox,
+        which Android answers by size-compatting the window and asking the
+        user to "restart this app for a better view" — measured 2026-08-17,
+        and reproduced on demand against a live gaming instance. Sent here,
+        the client has not been launched at all, so there is nothing to
+        disturb. Gaming resets the panel in its own tune-up and must not get
+        farming's."""
+        self.assertTrue(self._boot("farming")[1].called)
+        self.assertFalse(self._boot("gaming")[1].called)
 
     def test_the_boot_never_squeezes_any_more(self):
         """The squeeze must NOT happen during the boot, in EITHER profile.
@@ -146,8 +215,8 @@ class FarmingGate(unittest.TestCase):
         place. It is `settle_density_instance` that squeezes now, once the
         client has finished loading.
         """
-        self.assertFalse(self._boot("farming").called)
-        self.assertFalse(self._boot("gaming").called)
+        self.assertFalse(self._boot("farming")[0].called)
+        self.assertFalse(self._boot("gaming")[0].called)
 
     def test_debug_boot_never_squeezes(self):
         """Even mode_name='farming', a DEBUG boot must never squeeze (its extra
@@ -169,9 +238,14 @@ class FarmingGate(unittest.TestCase):
              mock.patch.object(omni, "apply_roblox_settings"), \
              mock.patch.object(omni, "apply_gaming_tuning"), \
              mock.patch.object(omni, "enable_zram"), \
+             mock.patch.object(omni, "apply_farming_display") as panel, \
              mock.patch.object(omni, "apply_farming_squeeze") as sq:
             omni._ensure_booted(acct, {}, "t", mode_name="farming", debug=True)
         self.assertFalse(sq.called)
+        # The PANEL still goes on, debug or not: it is not a memory
+        # optimisation whose numbers a devkit boot would distort, it is what
+        # keeps Android from asking to restart the app mid-session.
+        self.assertTrue(panel.called)
 
 
 class SqueezeHappensAfterTheGameHasLoaded(unittest.TestCase):

@@ -293,6 +293,7 @@ class MemPlumbing(unittest.TestCase):
              mock.patch.object(omni, "apply_consent"), \
              mock.patch.object(omni, "apply_awake"), \
              mock.patch.object(omni, "apply_farming_squeeze"), \
+             mock.patch.object(omni, "apply_farming_display"), \
              mock.patch.object(omni, "apply_balloon_target"), \
              mock.patch.object(omni, "apply_roblox_settings"), \
              mock.patch.object(omni, "enable_zram"):

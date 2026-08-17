@@ -799,6 +799,37 @@ MODES = {
     # that makes an x86 farming instance actually reach the game, and a joined
     # idle instance goes back to using almost none of the second one.
     #
+    # IT IS 3 NOW, NOT 2, AND THE THIRD ONE IS NOT FOR THE GAME. Reaching the
+    # world turned out not to be the only bar: the in-guest EXECUTOR (the
+    # patched Arceus APK every production offset ships) has its own startup
+    # chain, and at smp 2 it never finishes it -- so the OMNI-EXEC menu never
+    # appears and no auto-exec ever runs, on an instance that otherwise looks
+    # perfect. Farming was the only mode with the bug; gaming has 4 vCPUs.
+    #
+    # MEASURED 2026-08-17, PS99, x86 base, by packet-capturing the executor's
+    # own HTTP chain inside the guest (`tcpdump host <exec server>`), which is
+    # what made this legible at all -- the chain is silent in logcat and in
+    # Roblox's client log, so from outside it is indistinguishable from "the
+    # executor is not installed". The chain is 11 font fetches, then
+    # `Costumers/arceus.lua`, then `/gist` (the menu), then `/omni/exec/claim`
+    # and a 1 Hz poll. Same account, same place, same offset:
+    #
+    #   smp 2  3 fonts in 11 s, then NOTHING, ever -- capture ran for the whole
+    #          session and saw not one more packet. No arceus.lua, no /gist, no
+    #          menu. (The stall is 85 s BEFORE the squeeze runs, so the squeeze
+    #          is not what does it.)
+    #   smp 3  all 11 fonts, arceus.lua, /gist, claim, 53 polls -- menu on
+    #          screen, verified by screenshot.
+    #   smp 4  same, ~5 s sooner. Not worth a fourth vCPU across a fleet.
+    #
+    # WHAT IT COSTS, which is less than it looks: `cpu_ceiling_pct` below caps
+    # the whole QEMU process at 50% of ONE core once the client has loaded, and
+    # that cap is per-PROCESS, not per-vCPU. So the third vCPU is spent where
+    # the starvation actually was -- startup, while the executor's chain races
+    # the place load -- and buys nothing extra at steady state, which is the
+    # state a farming fleet spends its life in. The arm base runs Roblox
+    # NATIVELY and needs none of this; it keeps smp 1.
+    #
     # `swappiness_x86` is the second arch override, and like the first it is a
     # REQUIREMENT rather than a preference.
     #
@@ -840,7 +871,7 @@ MODES = {
     # is never taken to 896 whatever the floor says. That is the advantage of
     # sizing against measured demand instead of a constant chosen in advance --
     # the constant has to be right for the worst case, the governor does not.
-    "farming": {"mem": 2048, "smp": 1, "smp_x86": 2,
+    "farming": {"mem": 2048, "smp": 1, "smp_x86": 3,
                 "balloon": 1536, "balloon_zram": 896,
                 "balloon_floor": 896,
                 "balloon_headroom": 384,
