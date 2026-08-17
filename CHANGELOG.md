@@ -6,6 +6,188 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-17 (later) — farming stops paying for memory it is not using
+
+**A live instance was being reported as DEAD, and that is why nothing worked.**
+`instance_live()` asked QEMU over QMP with a 0.25 s budget. QMP is served by
+QEMU's main loop, and a guest running a game keeps that loop busy: a live PS99
+farming instance answered `query-name` in **3 s** and was declared dead. So
+`list` showed it stopped, `stop` could not stop it, and — the expensive one —
+**the memory governor exited with "QEMU process is gone" after a single
+shrink**, which is exactly the "it always uses the whole `-m`" symptom. The
+instance was left orphaned at 3.2 GB with its ports still held.
+
+Liveness now uses the pid's **creation time**, recorded at spawn
+(`runtime.process_start_ticks` → `run.json: pid_started`). That is the standard
+durable process identity, costs microseconds, cannot be starved, and is
+definitive in both directions — a match means it is our process, a mismatch
+means the pid was recycled. QMP is now only a fallback for pre-upgrade records,
+and its budget was raised from 0.25 s to 4 s because it is no longer a hot path.
+
+**The governor was the thing wedging guests, and it is a different mechanism
+now.** `EmptyWorkingSet` on a timer never converges: the next trim lands before
+the guest has faulted its live set back. Measured, trimming every 30 s against a
+live PS99 instance — host RSS stuck at 1–37 MB, **adb stopped answering within
+12 s**, the client was killed, and the guest never recovered even after the
+trims stopped. A hard **working-set maximum** asks the memory manager for the
+same thing and lets it choose which pages and when:
+
+| ceiling | host RSS | client | adb round trip |
+|---|---|---|---|
+| none | 3417 MB | alive | 0.05 s |
+| 1000 | 1000 | alive | 0.05 s |
+| 650 | 650 | alive | 0.04 s |
+| 500 | 500 | alive | 0.10 s |
+| 384 | 384 | alive | 0.10 s |
+| 300 | 300 | **dead** | 0.04 s |
+
+At 384 MB the client burned **152% of a guest core** (genuinely playing) and
+QEMU read **0.01 MB/s** off disk — the faults are soft, from the standby list,
+which is why the guest stays responsive at 8.9× less resident memory. The
+governor now walks the ceiling down from this boot's own `-m` while the guest
+is healthy, stops clear of anything that hurt it, and never climbs past `-m`
+(an earlier cut ran away to 4736 MB against a client that had died for its own
+reasons). The right ceiling is a property of **the game**, so it is searched
+for rather than configured.
+
+**CPU is capped the same way, and that is what decides instance count.**
+Farming's cost is the game's own arm64 translation — 148% of a guest core
+against SurfaceFlinger's **6.7%**, so there is nothing to "render less" of;
+blanking the display saves ~7%, not the 4.6× a first measurement suggested
+(that saving was the client dying). A job-object hard cap gives each instance a
+slice instead: 160.9% uncapped → 49.9% at a 50% ceiling, client alive and adb
+answering in 0.06 s. Farming defaults to `cpu_ceiling_pct: 50`; gaming has none
+and no governor at all — `performance` is the opposite trade by definition.
+
+**Per farming instance, measured end to end: 3417 MB → 384 MB, 161% → 50% of a
+core, client in-world throughout.**
+
+**Launches are 2.0–2.6× faster.** The 120 s post-squeeze survival wait was 47%
+of a 257 s launch, spent asleep — and the governor is a process that already
+runs for the instance's life and already asks "is the client alive" on every
+poll. It is now started *before* that wait instead of after, the wait is
+skipped, and a client that dies is recorded into run.json
+(`client_died_after_s`) by the governor instead of by a blocking check.
+`OMNI_SQUEEZE_GRACE` still forces the old behaviour for anyone bisecting.
+
+| | before | cold | warm (pool) |
+|---|---|---|---|
+| boot | 34.5 s | 34.7 s | **0.07 s** |
+| game load + squeeze | 100 s | 88 s | 100 s |
+| survival wait | 120 s | **0 s** | **0 s** |
+| **total** | **257 s** | **126 s** | **101 s** |
+
+All measured through the executor's own argv, with auto-login and auto-join on
+PS99 (place `8737899170`), `in_world: true` every run.
+
+**`doctor` now says how many instances fit and which wall is in the way.**
+Four walls, and on Windows it is usually not the RAM everybody plans for. On
+this box, per farming instance at `-m 3072`: ram 42, cpu 48, disk 13,
+**commit 10**. Windows charges the whole `-m` against RAM+pagefile whether the
+guest touches it or not and no governor can reduce it, so the lever for a
+bigger fleet is a bigger pagefile — not more RAM.
+
+## 2026-08-17 — the window is up for the boot, and it keeps the guest's shape
+
+**The window appears at spawn, not at the end of the launch.** A gaming boot
+opened a QEMU window, hid it, booted for a minute with nothing on screen, and
+showed it once Roblox was already running — so the whole boot looked like the
+app had frozen and the loading animation nobody could see was rendered for
+nobody. `qemu_proc.place_window` now decides at spawn and has three answers:
+**present** it as ours at the panel size (a boot somebody is watching —
+gaming), **hide** it and keep it hidden (farming, fifty at a time), or **leave
+it alone** (`--gpu window`, the debugging hatch, which is specified as having
+none of this code in its path). `OMNI_HIDE_BOOT_WINDOW=1` / config
+`qemu.hide_boot_window` restores the old behaviour.
+
+Measured on a real boot: window exists hidden at 640x505 by t+2.4 s, **visible
+at 1280x800 by t+9.7 s**, and it stays up through Android coming up.
+
+Measured on a clean product boot: the window exists hidden at 640x505 by
+t+3.1 s, GTK shows it at t+3.5 s, and it is **1280x800 and named `omni:
+HezMi_ImYu` by t+3.7 s** — against ~133 s before, which is when `start`
+returned and the app finally called `view`.
+
+**It keeps the aspect ratio at every window size, LIVE**, which took two
+things:
+
+* `-display gtk,...,keep-aspect-ratio=on` — QEMU letterboxes instead of
+  stretching (`ui/gtk.c gd_update_scale`: `MIN(sx, sy)` vs independent
+  `sx`/`sy`). Verified at the pixel level: at 1400x500 the left/right columns
+  read a constant 25.0, at 700x800 the top/bottom rows do, at 1280x800 neither
+  does. ⚠ The suboption is absent from `-display help` (that text is
+  hand-maintained; it lives in the QAPI schema) and QEMU **refuses an unknown
+  suboption rather than ignoring it**, so a wrong guess here costs the boot,
+  not the chrome — it was checked against the shipped binary and there is a
+  test that keeps asking, with a control.
+* `hostwin.aspect_lock`, run as a detached `_windowlock` process, correcting
+  the window's **client** area **while the drag is happening** — not on
+  release. A user resize runs inside `DefWindowProc`'s modal size loop, so an
+  outside `SetWindowPos` "should" be undone by the next mouse move; measured
+  against a real modal drag it is not, because 8 ms is shorter than the gap
+  between mouse moves:
+
+  | corrector | samples off-ratio >2% | final ratio |
+  |---|---|---|
+  | none | 76/246 (31%) | 1.98 (24% off) |
+  | every 8 ms | 2/246 (1%) | 1.600 |
+
+  Idle cost 0.16% of one core. The drag axis is **latched** for the drag —
+  re-deciding per frame makes the lock and the drag argue on an edge drag.
+  Measured across all three: corner 880x550→1482x926 (1.6004, 0/188 off),
+  bottom edge →1264x790 (1.6000), right edge →1200x750 (1.6000), each keeping
+  the dimension the user was dragging. The guest is still told only once,
+  because QEMU coalesces (`timer_mod(ui_timer, now + 1000)`) and the lock stops
+  as soon as the shape is right. With the guest booted, `wm size` read
+  `Physical size: 1280x800` against a 1000x624 window — same 16:10, uniform
+  scale, no distortion.
+
+**Our name and our icon, on QEMU's own window.** `WM_SETTEXT`/`WM_SETICON` are
+marshalled between processes, so `QEMU (omni-<account>)` + the QEMU logo become
+`omni: <account>` + `omnidroid/assets/omni-icon.png` — no patched build, no
+second window stacked on top to caption it. That PNG had been in the tree since
+2026-08-16 with nothing consuming it (it was added for the `QEMU_WINDOW_ICON`
+env var no build reads); `LoadImageW` cannot read a PNG and this repo ships no
+`.ico`, but **`CreateIconFromResourceEx` takes PNG bytes directly**, so no
+conversion and no temp file. QEMU rewrites its caption on run-state changes, so
+the lock re-asserts the name every 2 s if it drifts.
+
+⚠ **Renaming the window broke finding it**, and the fix is not the obvious one.
+`find_window` matched the identity as a title substring, which our title no
+longer contains. Falling back to the pid is necessary but **not sufficient**: a
+QEMU process owns half a dozen windows (the NVIDIA driver's invisible pbuffer,
+GDI+'s 1x1 hook, GDK's display-change listener, IME windows) and its real
+window does not exist until t+0.22 s, while `find_window` runs ~50 ms after
+spawn — so a naive pid fallback returned the pbuffer, and everything downstream
+styled, renamed, resized and watched a window nothing is ever drawn in. A
+pid-only candidate must now *look* like a guest window (top-level, not a known
+decoy class, ≥64x64 client), which restores `find_window`'s "wait for it"
+behaviour.
+
+**Client pixels, not window pixels, everywhere.** QEMU hands the guest the size
+of its drawing area, so sizing the *window* to 1280x800 gives the guest
+1264x761 (the frame is 16x39 on this host). Every size in this path is now the
+client area.
+
+**`window-close=off` is back.** It was dropped because "our patched QEMU asks
+'Stop this instance?' on the X" — there is no such build, so on the shipped
+binary the X killed the guest instantly, no prompt. Survivable while the window
+only appeared at the end; not survivable now it sits there for the whole boot.
+The cost is an X that does nothing, taken deliberately: the window is a view
+onto an instance, and the app now offers **Hide** (put it away, keep playing)
+and **Stop** as separate buttons.
+
+**Bridge (omni-executor).** `account_status` reports `native_window`,
+`window_visible`, `window_client` and `has_vnc`, so the app can draw the right
+button and stop printing a `vnc_port` that nothing is listening on (a GL boot
+has no VNC server at all). The row's viewer button is now a **View/Hide
+toggle** — `engine_hide` existed and nothing had ever called it.
+
+`view` branches on `boot_shows_in_a_window` (are the pixels in a window?)
+rather than `boot_has_hidden_window` (was it hidden?), because the second is
+False on exactly the boots that most need the window path, and an already-open
+window is raised rather than re-set-up.
+
 ## 2026-08-16 (later still) — the memory governor, and why Windows still cannot have it
 
 **New: a demand-tracking balloon.** `omnidroid/balloon.py` holds the policy,

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""QEMU's window is restyled in place -- caption off, sizing border kept.
+"""QEMU's window is restyled IN PLACE, and it keeps its own native frame.
 
     python3 -m pytest tests/test_window_chrome.py -q
 
-The caption goes because the strip IS the title bar; leaving QEMU's would put
-two title bars on screen -- a second one it would be impossible to click.
-WS_THICKFRAME stays so the composite can still be resized by dragging the
-guest window's edges.
+THE CAPTION STAYS, and that is a reversal worth reading before you "fix" it.
+It used to be stripped, because a separate Tk strip (`windowbar.py`) was going
+to be the title bar and two captions on screen is one it is impossible to
+click. That strip is gone -- QEMU's own window IS the window now, which is
+what was asked for -- so stripping the caption would leave a window with no
+title, no icon and nothing to drag it by. WS_THICKFRAME is asserted for the
+same reason it always was: the window has to stay resizable, because holding
+it at the guest's aspect ratio (hostwin.aspect_lock) is only meaningful if the
+user can resize it in the first place.
 
 Nothing here may raise: a host where the chrome cannot be applied gets a plain
 window and a printed reason, never a failed boot.
@@ -64,10 +69,13 @@ class ChromeOnWindows(unittest.TestCase):
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self.patches])
 
-    def test_the_caption_is_removed(self):
+    def test_the_caption_is_kept(self):
+        # See the module docstring: there is no second title bar to replace it
+        # with any more, so taking it away leaves a window with no title, no
+        # icon, and nothing to drag it by.
         result = hostwin.apply_chrome("omni-farm3")
         self.assertTrue(result["applied"], result["reason"])
-        self.assertFalse(self.u.style & hostwin.WS_CAPTION)
+        self.assertTrue(self.u.style & hostwin.WS_CAPTION)
 
     def test_the_sizing_border_is_kept(self):
         hostwin.apply_chrome("omni-farm3")
@@ -104,6 +112,88 @@ class ChromeOnWindows(unittest.TestCase):
                                return_value=(100, 100, 1380, 900)):
             self.assertEqual(hostwin.window_geometry("omni-farm3"),
                              (100, 100, 1280, 800))
+
+
+class PresentingTheWindowAtSpawn(unittest.TestCase):
+    """`present_qemu_window` -- the same restyle, plus a size and a show, run
+    BEFORE anybody has seen the window.
+
+    Order is the point: style, icon, SIZE, and only then show. Sizing after
+    showing puts a 640x480 window on screen and yanks it to 1280x800 a frame
+    later, which reads as a glitch in the product rather than as a window
+    being set up.
+    """
+
+    def setUp(self):
+        self.u = FakeUser32()
+        self.shown = []
+        self.patches = [
+            mock.patch.object(hostwin, "backend",
+                              return_value=hostwin.BACKEND_WIN32),
+            mock.patch.object(hostwin, "find_window", return_value=4242),
+            mock.patch.object(hostwin, "_user32", return_value=self.u),
+            mock.patch.object(hostwin, "_window_rect",
+                              return_value=(0, 0, 656, 519)),
+            mock.patch.object(hostwin, "_client_size",
+                              return_value=(640, 480)),
+            mock.patch.object(hostwin, "apply_dwm_style", return_value={}),
+            mock.patch.object(hostwin, "_show",
+                              side_effect=lambda h, how:
+                                  self.shown.append(how) or True),
+        ]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+
+    def test_it_sizes_the_CLIENT_area_to_the_panel_not_the_window(self):
+        # THE BUG THIS EXISTS TO PREVENT. QEMU hands the guest the size of its
+        # DRAWING AREA, so a window sized to 1280x800 gives the guest
+        # 1280 - 16 x 800 - 39. The frame here is (656-640) x (519-480).
+        hostwin.present_qemu_window("omni-farm3", panel=(1280, 800))
+        self.assertIn((1280 + 16, 800 + 39),
+                      [(p[2], p[3]) for p in self.u.positions])
+
+    def test_it_shows_without_stealing_focus(self):
+        # This fires DURING a launch the user started from the app and is
+        # probably still looking at. A window that grabs the foreground
+        # mid-boot is what makes people click Stop.
+        hostwin.present_qemu_window("omni-farm3", panel=(1280, 800))
+        self.assertEqual(self.shown, [hostwin.SW_SHOWNOACTIVATE])
+
+    def test_it_keeps_the_window_resizable(self):
+        hostwin.present_qemu_window("omni-farm3", panel=(1280, 800))
+        self.assertTrue(self.u.style & hostwin.WS_THICKFRAME)
+
+    def test_a_saved_geometry_beats_the_panel(self):
+        # Where the user last left this window beats re-centring one they had
+        # already placed. Geometry is a WINDOW rect (that is what
+        # window_geometry returns), so it is applied as-is.
+        hostwin.present_qemu_window("omni-farm3", panel=(1280, 800),
+                                    geometry=(10, 20, 900, 600))
+        self.assertIn((10, 20, 900, 600),
+                      [p[:4] for p in self.u.positions])
+
+    def test_a_missing_window_is_a_reason_not_an_exception(self):
+        with mock.patch.object(hostwin, "find_window", return_value=None):
+            result = hostwin.present_qemu_window("omni-gone")
+        self.assertFalse(result["presented"])
+        self.assertIn("no window", result["reason"].lower())
+
+    def test_a_non_win32_backend_declines_with_a_reason(self):
+        with mock.patch.object(hostwin, "backend",
+                               return_value=hostwin.BACKEND_MACOS):
+            result = hostwin.present_qemu_window("omni-farm3")
+        self.assertFalse(result["presented"])
+        self.assertIn("macos", result["reason"].lower())
+
+    def test_a_failing_win32_call_is_a_reason_not_an_exception(self):
+        # A window is never worth a boot: this runs inside spawn_qemu.
+        with mock.patch.object(hostwin, "_user32",
+                               side_effect=OSError("boom")):
+            result = hostwin.present_qemu_window("omni-farm3",
+                                                 panel=(1280, 800))
+        self.assertFalse(result["presented"])
+        self.assertNotEqual(result["reason"], "")
 
 
 class ChromeElsewhere(unittest.TestCase):
@@ -228,11 +318,11 @@ class TheIconGoesThroughTheSameSeamAsEverythingElse(unittest.TestCase):
     a test could stand in for half the function and the other half went to
     the real Win32 API. One seam or none.
 
-    NO CALLER PASSES AN ICON TODAY and this suite does not pretend one does:
-    there is no `.ico` in this repository (the only icon asset in the product
-    family is a macOS `.icns`, which LoadImageW cannot read). What is pinned
-    is the mechanism, so pointing it at a real file is the only remaining
-    step.
+    THE ICON IS REAL NOW. `omnidroid/assets/omni-icon.png` is applied to
+    QEMU's own window at spawn (`present_qemu_window`) and again by `view`;
+    the PNG needs no conversion because `CreateIconFromResourceEx` takes PNG
+    bytes directly. `LoadImageW` is still the path for a `.ico`, which is what
+    this class pins.
     """
 
     def test_load_and_set_both_go_through_the_injected_user32(self):
@@ -242,21 +332,77 @@ class TheIconGoesThroughTheSameSeamAsEverythingElse(unittest.TestCase):
                 self.loaded = []
 
             def LoadImageW(self, inst, name, kind, cx, cy, flags):
-                self.loaded.append((name, kind, flags))
+                self.loaded.append((name, kind, flags, cx, cy))
                 return 777
 
         u = FakeIconUser32()
         hostwin._apply_icon(u, 4242, "C:/omni.ico")
-        self.assertEqual(len(u.loaded), 1)
-        name, kind, flags = u.loaded[0]
-        self.assertEqual(name, "C:/omni.ico")
-        self.assertEqual(kind, hostwin.IMAGE_ICON)
-        self.assertTrue(flags & hostwin.LR_LOADFROMFILE)
-        # Both sizes, per spec 3b's WM_SETICON.
+        # ONE LOAD PER SIZE, not one load reused for both. Windows asks a
+        # window for a 16px icon (the caption) and a 32px one (Alt-Tab, the
+        # taskbar); handing it the same handle for both leaves the shell
+        # scaling one of them, which is the difference between "an app" and
+        # "a script".
+        self.assertEqual(len(u.loaded), 2)
+        self.assertEqual({(cx, cy) for _n, _k, _f, cx, cy in u.loaded},
+                         {(16, 16), (32, 32)})
+        for name, kind, flags, _cx, _cy in u.loaded:
+            self.assertEqual(name, "C:/omni.ico")
+            self.assertEqual(kind, hostwin.IMAGE_ICON)
+            self.assertTrue(flags & hostwin.LR_LOADFROMFILE)
         self.assertEqual(
-            u.icons,
-            [(hostwin.WM_SETICON, hostwin.ICON_SMALL, 777),
-             (hostwin.WM_SETICON, hostwin.ICON_BIG, 777)])
+            sorted(u.icons),
+            sorted([(hostwin.WM_SETICON, hostwin.ICON_SMALL, 777),
+                    (hostwin.WM_SETICON, hostwin.ICON_BIG, 777)]))
+
+    def test_a_png_never_reaches_LoadImageW(self):
+        """LoadImageW cannot read a PNG -- it wants a `.ico`, and this
+        repository ships none. The asset it DOES ship is a 1024x1024 PNG, so
+        sending it down the LoadImageW path would set no icon and report
+        nothing. It goes to CreateIconFromResourceEx instead."""
+        import tempfile
+        from pathlib import Path
+        png = Path(tempfile.mkdtemp()) / "omni-icon.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 64)
+
+        class TrackingUser32(FakeUser32):
+            def __init__(self):
+                super().__init__()
+                self.loaded = []
+                self.from_resource = 0
+
+            def LoadImageW(self, *a):
+                self.loaded.append(a)
+                return 777
+
+            @property
+            def CreateIconFromResourceEx(self):
+                outer = self
+
+                class Fn:
+                    restype = None
+                    argtypes = None
+
+                    def __call__(self, *_a):
+                        outer.from_resource += 1
+                        return 555
+                return Fn()
+
+        u = TrackingUser32()
+        hostwin._apply_icon(u, 4242, str(png))
+        self.assertEqual(u.loaded, [])
+        self.assertEqual(u.from_resource, 2)      # one per size
+
+    def test_the_shipped_asset_really_makes_an_icon(self):
+        """Against the REAL Win32 call and the REAL file, because the whole
+        point of the PNG route is that it works on this platform and the only
+        way to know that is to ask it."""
+        from omnidroid import qemu_proc
+        icon = qemu_proc.window_icon_path()
+        if icon is None:
+            self.skipTest("no icon asset in this checkout")
+        for cx, cy in ((16, 16), (32, 32)):
+            handle = hostwin._load_icon(hostwin._user32(), icon, cx, cy)
+            self.assertTrue(handle, f"no HICON at {cx}x{cy}")
 
     def test_an_icon_that_will_not_load_sets_nothing(self):
         class NoIconUser32(FakeUser32):

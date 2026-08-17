@@ -539,10 +539,16 @@ def vnc_unavailable_reason(name):
         # spec §3d): nothing restyles it, no bar is spawned for it, and it is
         # already on screen. Promising a restyled window with our title bar
         # there would describe code that deliberately does not run.
-        if run.get("window_hidden"):
+        if run.get("window_visible"):
+            offer = (f"That window is ALREADY ON SCREEN — this boot presents "
+                     f"it from the first frame, so you have been watching the "
+                     f"guest since it started booting. `omnidroid view {name}` "
+                     f"brings it forward; `--hide` takes it off the screen "
+                     f"without stopping the instance.")
+        elif run.get("window_hidden"):
             offer = (f"`omnidroid view {name}` still works: it shows that "
-                     f"same window, restyled, with our own title bar above "
-                     f"it, rather than connecting to a framebuffer.")
+                     f"same window, restyled, rather than connecting to a "
+                     f"framebuffer.")
         else:
             offer = (f"This boot asked for `--gpu window`, so that window is "
                      f"already on your screen, deliberately unstyled and "
@@ -2133,16 +2139,40 @@ def cmd_start(args):
         # the client about a minute later while every check above still says
         # the launch went perfectly. An `ok: true` for an instance that is
         # already dying is worse than a slow launch.
-        survived = verify_client_survived(acct, label, cfg=cfg)
-        result["client_survived"] = survived
-        if survived.get("alive") is False:
-            result["ok"] = False
-            result["error"] = "client_died_after_squeeze"
-            result["message"] = (
-                f"the client died {survived['died_after_s']}s after the "
-                f"farming squeeze. The instance is up and answering adb, but "
-                f"Roblox is not running, so it is not farming anything. "
-                f"Bisect the squeeze with OMNI_FARM_SKIP.")
+        #
+        # WHO DOES THE WATCHING IS THE POINT. Blocking here for the full grace
+        # cost 120 s of a 257 s launch -- 47% of it, spent asleep -- and the
+        # memory governor is a process that already runs for the life of the
+        # instance and already asks "is the client alive" on every poll (see
+        # instance_health). So when a governor is going to run, it is started
+        # HERE, before the wait rather than after it, and the wait is skipped:
+        # the same question gets a better answer, for hours instead of two
+        # minutes, and the launch returns as soon as the instance is playing.
+        #
+        # `verify_client_survived` is unchanged and still the answer wherever
+        # no governor will run, and `OMNI_SQUEEZE_GRACE` still forces the
+        # blocking wait for anyone bisecting a squeeze.
+        result["governor_pid"] = maybe_start_governor(acct, launch_mode, label)
+        if result["governor_pid"] and os.environ.get("OMNI_SQUEEZE_GRACE") \
+                is None:
+            result["client_survived"] = {
+                "alive": None, "died_after_s": None, "checked_s": 0,
+                "reason": "watched_by_governor"}
+            if label:
+                print(f"[{label}] the memory governor is watching this client "
+                      f"from here on — not blocking the launch for "
+                      f"{squeeze_grace_s(cfg)}s to do it")
+        else:
+            survived = verify_client_survived(acct, label, cfg=cfg)
+            result["client_survived"] = survived
+            if survived.get("alive") is False:
+                result["ok"] = False
+                result["error"] = "client_died_after_squeeze"
+                result["message"] = (
+                    f"the client died {survived['died_after_s']}s after the "
+                    f"farming squeeze. The instance is up and answering adb, "
+                    f"but Roblox is not running, so it is not farming "
+                    f"anything. Bisect the squeeze with OMNI_FARM_SKIP.")
         timings.mark("squeeze_verified")
     # WHAT THE CLIENT ITSELF SAYS, on every mode and every launch that got as
     # far as delivering a session. Recorded, never asserted: `ok` means the
@@ -2207,12 +2237,16 @@ def cmd_start(args):
         except Exception as e:  # noqa: BLE001 — a window failure must not fail start
             print(f"[{label}] could not open a window: {e}")
 
-    # LAST, and after the density settle on purpose: the governor gives memory
-    # back only once the client has plateaued, and starting it before the
-    # session is delivered would just have it watch an idle guest and conclude
-    # the instance needs nothing moments before the game asks for everything.
-    # The saving up to this point has already been banked by the boot cap.
-    if result.get("ok"):
+    # After the density settle on purpose: the governor gives memory back only
+    # once the client has plateaued, and starting it before the session is
+    # delivered would just have it watch an idle guest and conclude the
+    # instance needs nothing moments before the game asks for everything.
+    #
+    # A density launch has usually started it ALREADY, up at the squeeze --
+    # it is the thing that watches the client, so it has to be running before
+    # the watch would otherwise have blocked. This is the other modes, and the
+    # density launch that did not get one.
+    if result.get("ok") and not result.get("governor_pid"):
         result["governor_pid"] = maybe_start_governor(acct, launch_mode, label)
     result["timings"] = timings.as_dict()
     if json_mode:
@@ -5861,6 +5895,20 @@ def install_readiness():
                (scratch_free_mb(raw) or 0) // SCRATCH_PER_INSTANCE_MB),
            "accounts": len(all_accounts()),
            "ready": base_ready and template_ready and qemu_ok and adb_ok}
+    # HOW MANY MORE INSTANCES FIT, and which wall is the one in the way.
+    # "Why can't I run thirty" has four possible answers and only one of them
+    # is the RAM everybody plans for -- on Windows it is usually COMMIT, which
+    # is charged at the full `-m` however little the guest touches and which
+    # no amount of governing can reduce. Reported here because `doctor` is
+    # where somebody looks when a fleet will not grow. See instance_capacity.
+    try:
+        capacity = instance_capacity(MODES.get("farming"), raw)
+        rep["capacity_farming"] = capacity
+        advice = capacity_advice(capacity)
+        if advice:
+            rep["capacity_hint"] = advice
+    except Exception:      # noqa: BLE001 - a report never fails the report
+        pass
     if not qemu_ok:
         rep["qemu_hint"] = ("run: omnidroid setup (Windows: portable "
                             "download into ./qemu; Linux: sudo apt "
@@ -6139,6 +6187,17 @@ def account_status(a, stats=False):
             rec["mode"] = run.get("mode")
             rec["started"] = run.get("started")
             rec["offset"] = run.get("offset")
+            # WHERE THIS INSTANCE'S PIXELS ARE, which the app has to know
+            # before it can offer the right button. A GL-window boot has no
+            # VNC server at all (QEMU refuses one beside a GL context), so
+            # `vnc_port` is a number nothing is listening on -- and the window
+            # it has instead is on screen from the first frame of the boot,
+            # which means "Hide" is a thing the user needs, not just "View".
+            rec["native_window"] = bool(run.get("native_window"))
+            rec["window_visible"] = bool(run.get("window_visible"))
+            rec["window_client"] = run.get("window_client")
+            rec["has_vnc"] = not (run.get("native_window")
+                                  and run.get("gpu") == "gl")
         except Exception:
             pass
     if pid and stats:
@@ -6572,6 +6631,181 @@ def _spawn_window_bar(name, title, identity, pid):
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _window_lock_pid_path(name):
+    return runtime_dir(name) / "windowlock.pid"
+
+
+def _running_window_lock_pid(name):
+    """The pid of a live aspect lock for this instance, or None.
+
+    Same shape and the same reasoning as `_running_window_bar_pid`: a stale
+    file (the process was killed, the host rebooted) reads as dead, and a
+    missed "already running" costs one harmless duplicate rather than a
+    command that hangs.
+    """
+    try:
+        pid = int(_window_lock_pid_path(name).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid_alive(pid) else None
+
+
+def _spawn_window_lock(name, identity, pid, aspect):
+    """Start the aspect lock in its own detached process.
+
+    WHY A PROCESS AND NOT A THREAD. The lock has to outlive the command that
+    started it: `start` returns the moment the launch is delivered, and the
+    window it opened is on screen for hours after that -- a thread in the
+    engine process dies with it, and the window stops being held the instant
+    the launch reports success, which is the one moment the user starts
+    touching it. Same detached shape as the viewer and the (retired) title
+    bar: frozen-aware argv, a per-instance log, DETACHED_PROCESS on Windows.
+    """
+    a = ["_windowlock", name, "--identity", identity,
+         "--aspect", f"{int(aspect[0])}x{int(aspect[1])}"]
+    if pid:
+        a += ["--pid", str(pid)]
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + self_argv_prefix() + a
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())] + a
+    d = runtime_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    log = open(d / "viewer.log", "a")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(cmd, **kwargs)
+
+
+def _ensure_window_lock(name):
+    """Start this instance's aspect lock unless one is already running.
+
+    Returns the lock's pid (existing or new), or None when there is nothing to
+    hold: no native window, or a software boot with no GL panel to take a
+    ratio from. Never raises -- every caller is a launch or a `view`, and a
+    window that fails to stay proportional is a cosmetic problem.
+    """
+    try:
+        run = _run_record(name)
+        if not run.get("native_window"):
+            return None
+        panel = boot_gl_panel(name)
+        if not panel:
+            return None
+        existing = _running_window_lock_pid(name)
+        if existing is not None:
+            return existing
+        identity = run.get("identity") or f"omni-{name}"
+        proc = _spawn_window_lock(name, identity, run.get("pid"), panel)
+        _write_window_lock_pid(name, proc.pid)
+        return proc.pid
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def maybe_start_window_lock(acct, label):
+    """Hold this instance's window at the guest's aspect ratio, if it has one.
+
+    WHAT THIS IS FOR, because it is not obvious from the outside. QEMU's GTK
+    display tells the guest the size of its drawing area and the guest
+    re-modesets to match (ui/gtk.c `gd_configure`/`gd_resize_event` ->
+    `gd_set_ui_size`), so a window dragged to 900x900 hands Android a 900x900
+    panel -- while the `wm size` override the gaming tune-up sets is still the
+    16:10 panel this boot was configured for. A 16:10 layout rendered onto a
+    1:1 panel is the squashed picture. Holding the WINDOW at the panel's ratio
+    is what keeps those two in agreement at every size the user drags to.
+
+    It costs nothing when there is nothing to hold: no window, no GL panel, or
+    a boot nobody is watching, and this returns None without spawning
+    anything. Never raises -- a window that fails to stay proportional is a
+    cosmetic problem, and this runs inside a launch.
+    """
+    try:
+        name = acct["name"]
+        # `window_visible`, not `native_window`: a farming boot has a window
+        # too, and it is hidden precisely so nobody is looking at it. Holding
+        # the shape of a window nobody can see would spend a process per
+        # instance on nothing, fifty times over.
+        if not _run_record(name).get("window_visible"):
+            return None
+        return _ensure_window_lock(name)
+    except Exception as e:      # noqa: BLE001 - never fail a launch for chrome
+        print(f"[{label}] could not start the window aspect lock: {e}")
+        return None
+
+
+def _write_window_lock_pid(name, pid):
+    """Best-effort: a failed write only means the next launch cannot tell this
+    lock is already running and starts a second one, which is harmless -- both
+    would compute the same correction from the same window."""
+    try:
+        d = runtime_dir(name)
+        d.mkdir(parents=True, exist_ok=True)
+        _window_lock_pid_path(name).write_text(str(pid))
+    except Exception:      # noqa: BLE001
+        pass
+
+
+def _run_windowlock(a):
+    """Hidden subcommand: hold one instance's window at an aspect ratio.
+
+    Runs until the window is destroyed -- which is what stopping the instance
+    does -- so nothing has to remember to tear it down. Not a user-facing
+    command.
+    """
+    from omnidroid import hostwin
+    try:
+        w, _, h = str(a.aspect).lower().partition("x")
+        ratio = (int(w), int(h))
+    except (AttributeError, ValueError):
+        print(f"[_windowlock {a.name}] unusable --aspect {a.aspect!r}")
+        return 2
+    try:
+        held = hostwin.run_aspect_lock(
+            a.identity, ratio, pid=getattr(a, "pid", None),
+            title=window_title(a.name), icon=window_icon_path(),
+            on_change=lambda size: _record_window_client(a.name, size))
+    finally:
+        # However this ends -- the window destroyed, an unexpected failure --
+        # the pid file has to go, or the next `view` believes a lock that is
+        # not running still is and never starts a real one.
+        try:
+            _window_lock_pid_path(a.name).unlink(missing_ok=True)
+        except Exception:      # noqa: BLE001
+            pass
+    if not held:
+        print(f"[_windowlock {a.name}] nothing to hold: no window for "
+              f"'{a.identity}' on backend {hostwin.backend()}")
+        return 3
+    return 0
+
+
+def _record_window_client(name, size):
+    """Keep run.json honest about the size the guest is being shown at.
+
+    Best-effort and atomic (see _write_run_record): this is a MID-LIFE rewrite
+    from a detached process, and `list`/`debug-info`/`view` all read the same
+    file to find out whether the instance is alive.
+    """
+    try:
+        # Never CREATE one -- see _record_window_visible. This runs from a
+        # detached process that outlives the instance's own teardown, so
+        # "the record is gone because `stop` wiped the runtime dir" is the
+        # ordinary way this call ends, not an edge case.
+        if not (runtime_dir(name) / "run.json").exists():
+            return
+        run = _run_record(name)
+        if not run:
+            return
+        run["window_client"] = [int(size[0]), int(size[1])]
+        _write_run_record(name, run)
+    except Exception:      # noqa: BLE001
+        pass
+
+
 # How long `view` waits to see whether the title bar stayed up.
 #
 # run_window_bar() either reaches mainloop() (and then never returns) or exits
@@ -6727,6 +6961,28 @@ def boot_has_hidden_window(name):
     return bool(run.get("native_window")) and bool(run.get("window_hidden"))
 
 
+def boot_shows_in_a_window(name):
+    """Are this instance's pixels in a QEMU WINDOW rather than a framebuffer?
+
+    THE PREDICATE `view` HAS TO BRANCH ON, and it is deliberately not
+    `boot_has_hidden_window`. That one asks "was it hidden", which used to be
+    the same question only because a window this product opened was always
+    hidden. It is not any more: a watched boot presents its window at spawn
+    (qemu_proc.place_window), so `window_hidden` is False on exactly the boots
+    `view` most needs to take the window path for -- and branching on it sent
+    them into the VNC path instead, to fail on a port QEMU never opened with a
+    message about a flag the user did not pass.
+
+    The honest question is where the pixels ARE, and that is answered by the
+    two facts spawn_qemu recorded off its own argv: a native window, taking
+    the GPU. QEMU refuses `-vnc` beside a GL window, so those two together
+    mean there is no framebuffer to attach to and the window is the only way
+    to see this instance -- whether it is currently on screen or not.
+    """
+    run = _run_record(name)
+    return bool(run.get("native_window")) and run.get("gpu") == "gl"
+
+
 def _view_hide(args):
     """`omnidroid view <name> --hide`: take this instance's window off the
     screen without stopping it. NEVER opens anything.
@@ -6781,10 +7037,39 @@ def _view_hide(args):
     # buys is the user staring at a hung command in the one case where there
     # is nothing to wait for.
     hidden = hostwin.hide_qemu_window(identity, pid=qemu_pid, timeout=2)
+    if hidden:
+        # The app draws its View/Hide button off this, so a hide that is not
+        # written down is a button that offers to hide an already-hidden
+        # window and does nothing. `window_visible` is the only field in
+        # run.json that is not a property of the ARGV -- it is the live state
+        # of a window, and it changes while the instance runs.
+        _record_window_visible(args.name, False)
     if getattr(args, "json", False):
         emit_json({"name": args.name, "viewer": "window",
                    "hidden": hidden, "ok": True})
     return None
+
+
+def _record_window_visible(name, visible):
+    """Update run.json's `window_visible`. Best-effort and atomic.
+
+    Atomic because this is a MID-LIFE rewrite of the file every other command
+    reads to decide whether the instance is alive -- see _write_run_record.
+    """
+    try:
+        # Never CREATE one. `_write_run_record` makes the directory it writes
+        # into, so an instance with no record on disk would get a fresh
+        # run.json carrying nothing but this flag -- which `reconcile_runtime`
+        # and `running_instances` both read as an instance.
+        if not (runtime_dir(name) / "run.json").exists():
+            return
+        run = _run_record(name)
+        if not run:
+            return
+        run["window_visible"] = bool(visible)
+        _write_run_record(name, run)
+    except Exception:      # noqa: BLE001
+        pass
 
 
 def cmd_view(args):
@@ -6834,14 +7119,17 @@ def cmd_view(args):
 
     # Wait for the QEMU VNC server to accept connections (it binds at process
     # start, so this is quick; generous bound covers a cold spawn).
-    # A GPU boot on this host has its pixels in a hidden QEMU window and no VNC
+    # A GPU boot on this host has its pixels in a QEMU window and no VNC
     # server at all (QEMU refuses one beside a GL window). Do not connect to a
-    # port nobody is listening on -- RESTYLE and SHOW that same window
-    # instead, with our own bar above it (windowbar.py). Same window to the
-    # user, none of the copy/encode/decode a framebuffer protocol would cost,
-    # and input goes straight into the guest's usb-tablet instead of being
-    # synthesised from RFB.
-    if boot_has_hidden_window(args.name) and not getattr(args, "native", False):
+    # port nobody is listening on -- SHOW that same window instead. Same window
+    # to the user, none of the copy/encode/decode a framebuffer protocol would
+    # cost, and input goes straight into the guest's usb-tablet instead of
+    # being synthesised from RFB.
+    #
+    # `boot_shows_in_a_window`, NOT `boot_has_hidden_window`: on a watched boot
+    # the window went up at spawn and was never hidden, so the old predicate
+    # was False for exactly the instances this branch exists to serve.
+    if boot_shows_in_a_window(args.name) and not getattr(args, "native", False):
         from omnidroid import hostwin
         run = _run_record(args.name)
         identity = run.get("identity") or f"omni-{args.name}"
@@ -6854,7 +7142,8 @@ def cmd_view(args):
         # DEFAULT_TIMEOUT (20s) is sized for "wait for QEMU to map a window
         # at spawn", not for this: a `view` against an instance whose window
         # is simply gone must fail fast, not stall ~20s to discover it.
-        if hostwin.find_window(identity, timeout=2, pid=qemu_pid) is None:
+        hwnd = hostwin.find_window(identity, timeout=2, pid=qemu_pid)
+        if hwnd is None:
             return fail(
                 "no_window",
                 f"'{args.name}' is running, but no window was found for it "
@@ -6863,13 +7152,26 @@ def cmd_view(args):
                 f"). There is nothing to show. Restart it to get a fresh "
                 f"window: `omnidroid stop {args.name} && omnidroid start "
                 f"{args.name}`.")
-        # A bar already open for this instance means bring IT forward, not
-        # stack a second one above the same window.
-        bar_pid = _running_window_bar_pid(args.name)
-        if bar_pid is not None:
-            hostwin.show_qemu_window(identity, pid=qemu_pid)
-            print(f"[view {args.name}] a window is already open for this "
-                  f"instance (bar pid {bar_pid}); bringing it forward.")
+        # ALREADY ON SCREEN is the ordinary case now, not the exception: a
+        # watched boot presented this window at spawn and the app calls `view`
+        # afterwards out of habit. Bring it forward and say so, rather than
+        # re-running the whole setup on a window that is already correct --
+        # re-applying the geometry would yank a window the user has since
+        # moved or resized back to where it started.
+        if hostwin.window_is_visible(identity, pid=qemu_pid):
+            # The name and the icon are re-asserted even here, where nothing
+            # else is touched. QEMU rewrites its own caption whenever the
+            # machine's run state changes (`gd_update_caption`), so a window
+            # that WAS ours can be wearing `QEMU (omni-<account>)` again by
+            # the time anyone clicks View -- and leaving that to the aspect
+            # lock's periodic re-check means a boot with no GL panel, which
+            # starts no lock, never gets its name back at all.
+            hostwin.apply_identity(hwnd, title=window_title(args.name),
+                                   icon=window_icon_path())
+            hostwin.bring_to_front(identity, pid=qemu_pid)
+            _ensure_window_lock(args.name)
+            print(f"[view {args.name}] the window for this instance is "
+                  f"already open; bringing it forward.")
             if getattr(args, "json", False):
                 emit_json({"name": args.name, "viewer": "window",
                            "already_open": True, "vnc_host": None,
@@ -6881,20 +7183,28 @@ def cmd_view(args):
         # up. The window is already confirmed present above, so this is a
         # short re-probe, not the ~20s worst case.
         chrome = hostwin.apply_chrome(identity, pid=qemu_pid, timeout=2,
-                                      geometry=run.get("geometry"))
+                                      geometry=run.get("geometry"),
+                                      title=window_title(args.name),
+                                      icon=window_icon_path())
         if not chrome["applied"]:
             print(f"[view {args.name}] the window keeps QEMU's own chrome: "
                   f"{chrome['reason']}. Rendering and input are unaffected.")
         hostwin.show_qemu_window(identity, pid=qemu_pid)
-        # No separate title bar any more: the patched QEMU build carries our
-        # title, our icon, the aspect-locked resize and the confirm-on-close
-        # in its OWN native frame, which is what a window is supposed to be.
+        _record_window_visible(args.name, True)
+        # It is on screen again, so it has to be held proportional again --
+        # `--hide` does not stop the lock (a hidden window is not resized), but
+        # a lock that died with its instance's last viewer, or was never
+        # started because this boot was not a watched one, has to be picked up
+        # here or the window is free to be dragged out of shape.
+        locked = _ensure_window_lock(args.name)
         bar_ok = False
         print(f"[view {args.name}] live window opened [QEMU's own, native "
-              f"frame] - GPU-rendered, native input, no copy")
+              f"frame] - GPU-rendered, native input, no copy"
+              + (", aspect held" if locked else ""))
         if getattr(args, "json", False):
             emit_json({"name": args.name, "viewer": "window",
                        "chrome": chrome["applied"], "bar": bar_ok,
+                       "aspect_locked": bool(locked),
                        "vnc_host": None,
                        "vnc_port": None, "started": started, "ok": True})
         return
@@ -9024,6 +9334,133 @@ def unplug_mem(acct, label=None):
     return 0
 
 
+def instance_health(acct, timeout=10):
+    """(healthy, adb_seconds, game_alive) for a running instance.
+
+    THE LEADING INDICATOR IS ADB LATENCY, not whether the game is running.
+    MEASURED on an instance squeezed too hard: adb round trips went from
+    0.05 s to 15 s (timeouts) while the client was still alive, and the client
+    died some time after that. A governor that waits for the game to die has
+    already lost the instance; one that watches the round trip backs off while
+    there is still something to save.
+    """
+    started = time.monotonic()
+    try:
+        r = adb_soft(acct, "shell", "pidof", ROBLOX_PACKAGE, timeout=timeout)
+        out = (getattr(r, "stdout", "") or "").strip()
+    except Exception:      # noqa: BLE001 - a probe never fails a governor
+        out = ""
+    seconds = time.monotonic() - started
+    from omnidroid import balloon
+    game = bool(out)
+    return (game and seconds < balloon.ADB_SLOW_SECONDS), seconds, game
+
+
+def _record_client_death(name, lived_seconds):
+    """Write the client's death (or its return) into run.json. Best-effort.
+
+    `list` and the app read run.json, and "the instance is running" is not the
+    same claim as "the instance is farming". Passing None clears it, for a
+    client the kiosk brought back.
+    """
+    try:
+        if not (runtime_dir(name) / "run.json").exists():
+            return
+        run = _run_record(name)
+        if not run:
+            return
+        if lived_seconds is None:
+            run.pop("client_died_after_s", None)
+            run.pop("client_died_at", None)
+        else:
+            run["client_died_after_s"] = int(lived_seconds)
+            run["client_died_at"] = time.time()
+        _write_run_record(name, run)
+    except Exception:      # noqa: BLE001
+        pass
+
+
+def govern_working_set(acct, mode, state, label=None):
+    """One poll of the WINDOWS governor: walk the working-set ceiling down.
+
+    A separate function from `govern_once` because it is a different mechanism
+    answering the same question, not a variant of the same one -- there is no
+    balloon here, no guest cap, and nothing is asked of QEMU at all. See
+    runtime.cap_working_set and balloon.next_ceiling.
+    """
+    from omnidroid import balloon
+    pid = running_pid(acct["name"])
+    if not pid:
+        return {"ok": False, "reason": "not_running"}
+    # THIS BOOT's `-m`, not the mode's default. A place with a measured memory
+    # floor raises it (PS99 boots farming at 3072 against the mode's 2048) and
+    # `--mem` overrides both, so starting the descent from the mode default
+    # would begin it already below the guest's real size -- a 1 GB step down
+    # taken before the search has confirmed anything is safe.
+    mem_mb = (_run_record(acct["name"]).get("mem_mb")
+              or (mode or {}).get("mem") or 2048)
+    ceiling = state.get("ceiling") or balloon.starting_ceiling(mem_mb, mode)
+    healthy, adb_s, game = instance_health(acct)
+    # DO NOT TIGHTEN A GUEST THAT IS STILL LOADING. Before the client is up
+    # there is no game pid, so `healthy` is False and the search would read a
+    # perfectly normal boot as damage and climb away from the floor forever.
+    if not game and not state.get("seen_game"):
+        return {"ok": True, "reason": "waiting_for_game", "ceiling_mb": ceiling,
+                "adb_s": round(adb_s, 2)}
+    if not state.get("seen_game"):
+        state["seen_game"] = True
+        state["game_seen_at"] = time.time()
+    # THE CLIENT DYING IS NEWS, and this is the only process still watching.
+    # `start` no longer blocks for two minutes to find this out (see cmd_start),
+    # so if it is not recorded here nobody ever learns: the instance sits there
+    # answering adb, farming nothing, and `list` calls it running.
+    if not game and not state.get("death_recorded"):
+        state["death_recorded"] = True
+        lived = round(time.time() - state.get("game_seen_at", time.time()))
+        _record_client_death(acct["name"], lived)
+        if label:
+            print(f"[{label}] THE CLIENT IS GONE after {lived}s — the instance "
+                  f"is up and answering adb, but it is not farming anything")
+    elif game and state.get("death_recorded"):
+        # It came back (the kiosk relaunches it). Say so, and start watching
+        # for the next one rather than reporting the old death forever.
+        state["death_recorded"] = False
+        _record_client_death(acct["name"], None)
+    # THE CPU CEILING, applied once and then held. Farming's cost is the
+    # game's own arm64 translation -- 148% of a guest core against
+    # SurfaceFlinger's 6.7%, so there is nothing to render less OF -- and the
+    # only lever left is to give each instance a fixed slice and let them all
+    # make progress. The job object dies with its handle, so the object lives
+    # in `state` for as long as this governor runs (see runtime.CpuCeiling).
+    cpu_pct = (mode or {}).get("cpu_ceiling_pct")
+    if cpu_pct and "cpu" not in state:
+        ceiling_obj = CpuCeiling(pid)
+        state["cpu"] = ceiling_obj
+        if ceiling_obj.set(cpu_pct) and label:
+            print(f"[{label}] governor: CPU held at {cpu_pct}% of one core "
+                  f"({ceiling_obj.cores} logical processors on this host)")
+    new_ceiling, unsafe = balloon.next_ceiling(
+        ceiling_mb=ceiling, healthy=healthy,
+        floor_mb=balloon.ceiling_floor_mb(mode),
+        unsafe_mb=state.get("unsafe"), max_mb=mem_mb)
+    state["unsafe"] = unsafe
+    applied = False
+    if new_ceiling != ceiling or "ceiling" not in state:
+        applied = cap_working_set(pid, new_ceiling)
+        if applied:
+            state["ceiling"] = new_ceiling
+        if label and applied and new_ceiling != ceiling:
+            print(f"[{label}] governor: working set "
+                  f"{ceiling} -> {new_ceiling} MB"
+                  + ("" if healthy else
+                     f" (backing off — adb {adb_s:.1f}s"
+                     f"{'' if game else ', client gone'})"))
+    return {"ok": True, "ceiling_mb": state.get("ceiling", ceiling),
+            "healthy": healthy, "adb_s": round(adb_s, 2), "game": game,
+            "applied": applied, "unsafe_mb": unsafe,
+            "host_rss_mb": host_rss_mb(pid)}
+
+
 def govern_once(acct, mode, state, label=None):
     """One poll of the memory governor. Mutates `state`, returns a small dict.
 
@@ -9032,6 +9469,13 @@ def govern_once(acct, mode, state, label=None):
     history that says whether the client has finished loading.
     """
     from omnidroid import balloon
+    # ON WINDOWS THE BALLOON IS NOT THE MECHANISM. QEMU cannot decommit there,
+    # so an inflate returns nothing to the host and does it at ~0.4 MB/s while
+    # logging a warning per page -- which starved QMP badly enough that
+    # liveness checks timed out and this governor used to kill itself. The
+    # working-set ceiling does the whole job instead.
+    if IS_WINDOWS:
+        return govern_working_set(acct, mode, state, label=label)
     mem_mb = guest_mem_mb(acct, mode)
     cap_mb = current_cap_mb(acct)
     if not mem_mb or not cap_mb:
@@ -9393,6 +9837,7 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             spawn_qemu(acct, cfg, interactive=False, mode=mode, accel=accel,
                        debug=debug, warm=entry, warm_key=key)
             maybe_start_autocap(acct, label)
+            maybe_start_window_lock(acct, label)
             migrated = warmboot.restore_into(acct, entry, label)
             if migrated:
                 warmcache.touch(entry)
@@ -9514,6 +9959,10 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             # Same rule as `start`: the recorder attaches at spawn so a debug
             # session has screenshots of the boot screen itself.
             maybe_start_autocap(acct, label)
+            # ...and for the same reason: the window is on screen for the whole
+            # boot now, so the thing that keeps it proportional has to be up
+            # for the whole boot too, not attached once the launch finishes.
+            maybe_start_window_lock(acct, label)
     if not restored:
         t = timeout or (FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT)
         if not wait_for_boot(acct, t, label, first_boot=first):
@@ -11301,6 +11750,21 @@ def build_parser():
                     help="the QEMU pid, so the window is found even if its "
                          "title is not what we expect")
     wb.set_defaults(func=lambda a: sys.exit(_run_windowbar(a)))
+
+    # Hidden internal: hold one instance's window at the guest's aspect ratio
+    # (hostwin.aspect_lock). Spawned detached by a boot that presents its
+    # window, and exits on its own when that window is destroyed. Not for
+    # direct use.
+    wl = sub.add_parser("_windowlock")
+    wl.add_argument("name")
+    wl.add_argument("--identity", required=True,
+                    help="the QEMU window title, i.e. omni-<account>")
+    wl.add_argument("--aspect", required=True,
+                    help="the ratio to hold, as WxH (e.g. 1280x800)")
+    wl.add_argument("--pid", type=int, default=None,
+                    help="the QEMU pid, so the window is found even if its "
+                         "title is not what we expect")
+    wl.set_defaults(func=lambda a: sys.exit(_run_windowlock(a)))
 
     sc = sub.add_parser("screenshot", help="pull a screenshot (JSON out)")
     sc.add_argument("name")

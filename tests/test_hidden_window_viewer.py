@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The window is hidden at boot, restyled, and shown with OUR bar above it.
+"""Where an instance's pixels are, and what `view` does about it.
 
     python3 -m pytest tests/test_hidden_window_viewer.py -q
 
@@ -7,15 +7,28 @@ On Windows the window is the price of the GPU: every windowless GL display
 there takes its context from ANGLE at ES 2.0 and virglrenderer cannot serve a
 scanout from it (SET_SCANOUT rejected, 602 rejections in one boot,
 totalFrames = 0, screen black), while the GTK path goes through WGL and works.
-So the window exists, it is hidden through the boot (qemu_proc spawns it and
-then hides it -- GTK re-shows it during early boot, so it has to be re-hidden
-for a while), the boot records that it did so (`boot_has_hidden_window`), and
-`view` restyles it and shows it with our bar above it.
+So the window exists on every GPU boot, and the only question is whether it is
+on screen.
+
+THE ANSWER CHANGED, and this file is where the change is pinned down. It used
+to be "hidden, always, until `view` asks" -- so the user stared at nothing for
+the whole boot and the window appeared at the end, when the game was already
+running. Now the boot itself decides (`qemu_proc.place_window`):
+
+  * a WATCHED boot (gaming) presents its window at spawn, sized to the panel,
+    so the loading animation is on screen while Android comes up;
+  * a boot nobody is watching (farming, fifty at a time) is still hidden, and
+    kept hidden -- GTK re-shows it during early boot;
+  * `--gpu window`, the debugging hatch, is left exactly as QEMU made it.
+
+`view` therefore branches on `boot_shows_in_a_window` -- "are the pixels in a
+window rather than a framebuffer" -- and NOT on `boot_has_hidden_window`, which
+is False on precisely the boots that most need the window path.
 
 What is GONE is the reparenting: nothing is ever a child of anything, so the
 force-killed-viewer failure that used to be reported here cannot happen any
 more and is not reported (see TheRemovedFailureModeIsReallyGone below). The
-bar is owned BY the guest window instead -- see tests/test_windowbar.py.
+separate title bar is gone too -- QEMU's own window is the window.
 """
 import json
 import os
@@ -29,22 +42,37 @@ from omnidroid import engine
 from omnidroid import hostwin, qemu_proc
 
 
-class ViewShowsTheWindowAndItsBar(unittest.TestCase):
+def _window_boot(**extra):
+    """A run.json for a GPU boot whose pixels live in a window."""
+    run = {"identity": "omni-farm3", "pid": 4242, "native_window": True,
+           "gpu": "gl", "gl_panel": [1280, 800]}
+    run.update(extra)
+    return run
 
-    def test_view_applies_chrome_then_shows_then_spawns_the_bar(self):
+
+class ViewShowsTheWindow(unittest.TestCase):
+    """A HIDDEN window (farming, or one the user hid) is restyled and shown.
+
+    No bar is spawned any more, and the `--hide`/show pair has to be
+    symmetrical: whatever showed the window writes `window_visible` back, or
+    the app's View/Hide button offers the wrong one of the two.
+    """
+
+    def test_view_applies_chrome_then_shows_and_spawns_no_bar(self):
         calls = []
         with mock.patch("omnidroid.engine.load_config", return_value={}), \
              mock.patch("omnidroid.engine.running_pid", return_value=4242), \
              mock.patch("omnidroid.engine.load_account",
                         return_value={"name": "farm3", "vnc_port": 18001}), \
-             mock.patch("omnidroid.engine.boot_has_hidden_window",
-                        return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242,
-                                      "display_kind": "gl-window"}), \
+                        return_value=_window_boot(window_hidden=True,
+                                                  display_kind="gl-window")), \
+             mock.patch("omnidroid.engine._write_run_record"), \
+             mock.patch("omnidroid.engine._ensure_window_lock",
+                        side_effect=lambda *a, **k: calls.append("lock")), \
              mock.patch("omnidroid.hostwin.find_window", return_value=1), \
-             mock.patch("omnidroid.engine._running_window_bar_pid",
-                        return_value=None), \
+             mock.patch("omnidroid.hostwin.window_is_visible",
+                        return_value=False), \
              mock.patch("omnidroid.hostwin.apply_chrome",
                         side_effect=lambda *a, **k: calls.append("chrome")
                         or {"applied": True, "reason": "", "hwnd": 1}), \
@@ -53,7 +81,7 @@ class ViewShowsTheWindowAndItsBar(unittest.TestCase):
              mock.patch("omnidroid.engine._spawn_window_bar",
                         side_effect=lambda *a, **k: calls.append("bar")):
             engine.cmd_view(_args(name="farm3"))
-        self.assertEqual(calls, ["chrome", "show", "bar"])
+        self.assertEqual(calls, ["chrome", "show", "lock"])
 
     def test_show_is_given_the_pid_so_a_title_substring_cannot_hit_the_wrong_window(self):
         # e.g. omni-farm3 vs omni-farm30 with several gaming instances up.
@@ -62,13 +90,13 @@ class ViewShowsTheWindowAndItsBar(unittest.TestCase):
              mock.patch("omnidroid.engine.running_pid", return_value=4242), \
              mock.patch("omnidroid.engine.load_account",
                         return_value={"name": "farm3", "vnc_port": 18001}), \
-             mock.patch("omnidroid.engine.boot_has_hidden_window",
-                        return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value=_window_boot(window_hidden=True)), \
+             mock.patch("omnidroid.engine._write_run_record"), \
+             mock.patch("omnidroid.engine._ensure_window_lock"), \
              mock.patch("omnidroid.hostwin.find_window", return_value=1), \
-             mock.patch("omnidroid.engine._running_window_bar_pid",
-                        return_value=None), \
+             mock.patch("omnidroid.hostwin.window_is_visible",
+                        return_value=False), \
              mock.patch("omnidroid.hostwin.apply_chrome",
                         return_value={"applied": True, "reason": "",
                                       "hwnd": 1}), \
@@ -78,6 +106,73 @@ class ViewShowsTheWindowAndItsBar(unittest.TestCase):
              mock.patch("omnidroid.engine._spawn_window_bar"):
             engine.cmd_view(_args(name="farm3"))
         self.assertEqual(seen["kwargs"].get("pid"), 4242)
+
+    def test_showing_a_window_records_that_it_is_visible(self):
+        # The app's View/Hide button is drawn off run.json's `window_visible`.
+        # A show that is not written down leaves it offering "View" for a
+        # window already on screen.
+        #
+        # A REAL runtime dir with a REAL run.json in it, because the recorder
+        # refuses to write one that does not already exist -- `_write_run_record`
+        # creates the directory it writes into, and a fresh run.json carrying
+        # nothing but this flag is read by `running_instances` as an instance.
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp,
+                                                            ignore_errors=True))
+        (tmp / "run.json").write_text(_json.dumps(_window_boot()))
+        written = []
+        with mock.patch("omnidroid.engine.runtime_dir", return_value=tmp), \
+             mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value=_window_boot(window_hidden=True)), \
+             mock.patch("omnidroid.engine._write_run_record",
+                        side_effect=lambda n, r: written.append(r)), \
+             mock.patch("omnidroid.engine._ensure_window_lock"), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=1), \
+             mock.patch("omnidroid.hostwin.window_is_visible",
+                        return_value=False), \
+             mock.patch("omnidroid.hostwin.apply_chrome",
+                        return_value={"applied": True, "reason": "",
+                                      "hwnd": 1}), \
+             mock.patch("omnidroid.hostwin.show_qemu_window"):
+            engine.cmd_view(_args(name="farm3"))
+        self.assertTrue(written and written[-1]["window_visible"] is True)
+
+
+class TheWindowPathIsChosenByWhereThePixelsAre(unittest.TestCase):
+    """`boot_shows_in_a_window`, not `boot_has_hidden_window`.
+
+    A watched boot presents its window at spawn and never hides it, so
+    `window_hidden` is False there -- and branching on it sent exactly those
+    instances down the VNC path, to fail on a port QEMU never opened with a
+    message about a flag the user had not passed.
+    """
+
+    def test_a_presented_window_boot_takes_the_window_path(self):
+        self.assertTrue(self._shows(_window_boot(window_hidden=False,
+                                                 window_visible=True)))
+
+    def test_a_hidden_window_boot_still_takes_it(self):
+        self.assertTrue(self._shows(_window_boot(window_hidden=True)))
+
+    def test_a_software_boot_does_not(self):
+        # No GL context, so QEMU served a VNC framebuffer and that is where
+        # the pixels are -- a window here would be a second, laggier view.
+        self.assertFalse(self._shows({"native_window": True,
+                                      "gpu": "software"}))
+
+    def test_a_windowless_boot_does_not(self):
+        self.assertFalse(self._shows({"native_window": False, "gpu": "gl"}))
+
+    def _shows(self, run):
+        with mock.patch.object(engine, "_run_record", return_value=run):
+            return engine.boot_shows_in_a_window("farm3")
 
 
 class AWindowThatIsGenuinelyNotThereFailsFast(unittest.TestCase):
@@ -105,10 +200,8 @@ class AWindowThatIsGenuinelyNotThereFailsFast(unittest.TestCase):
              mock.patch("omnidroid.engine.running_pid", return_value=4242), \
              mock.patch("omnidroid.engine.load_account",
                         return_value={"name": "farm3", "vnc_port": 18001}), \
-             mock.patch("omnidroid.engine.boot_has_hidden_window",
-                        return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value=_window_boot()), \
              mock.patch("omnidroid.hostwin.find_window", return_value=None), \
              mock.patch("omnidroid.hostwin.apply_chrome",
                         side_effect=lambda *a, **k: touched.append("chrome")), \
@@ -136,10 +229,8 @@ class AWindowThatIsGenuinelyNotThereFailsFast(unittest.TestCase):
              mock.patch("omnidroid.engine.running_pid", return_value=4242), \
              mock.patch("omnidroid.engine.load_account",
                         return_value={"name": "farm3", "vnc_port": 18001}), \
-             mock.patch("omnidroid.engine.boot_has_hidden_window",
-                        return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value=_window_boot()), \
              mock.patch("omnidroid.hostwin.find_window",
                         side_effect=fake_find_window):
             with self.assertRaises(SystemExit):
@@ -147,57 +238,79 @@ class AWindowThatIsGenuinelyNotThereFailsFast(unittest.TestCase):
         self.assertEqual(seen.get("timeout"), 2)
 
 
-class ASecondViewDoesNotStackASecondBar(unittest.TestCase):
-    """The old embedded-viewer path answered a second `view` with "a viewer
-    already has this instance's window; bringing it forward" -- removing the
-    reparenting hazard is not a reason to remove that handling."""
+class AWindowAlreadyOnScreenIsBroughtForward(unittest.TestCase):
+    """The ORDINARY case now, not the exception.
 
-    def test_a_live_bar_is_brought_forward_and_no_second_one_spawns(self):
-        shown = []
-        spawned = []
+    A watched boot presents its window at spawn and the app calls `view`
+    afterwards anyway -- the launch flow has always ended with it. Re-running
+    the whole setup on a window that is already correct would re-apply the
+    saved geometry and yank a window the user has since moved or resized back
+    to where it started. The right answer is to raise it and say so.
+
+    The signal is the WINDOW'S OWN VISIBILITY, not a bar's pid file: the bar
+    is gone, and its file could never have described a window it did not own.
+    """
+
+    def test_a_visible_window_is_raised_and_nothing_is_restyled(self):
+        raised = []
         with mock.patch("omnidroid.engine.load_config", return_value={}), \
              mock.patch("omnidroid.engine.running_pid", return_value=4242), \
              mock.patch("omnidroid.engine.load_account",
                         return_value={"name": "farm3", "vnc_port": 18001}), \
-             mock.patch("omnidroid.engine.boot_has_hidden_window",
-                        return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value=_window_boot(window_visible=True)), \
+             mock.patch("omnidroid.engine._ensure_window_lock"), \
              mock.patch("omnidroid.hostwin.find_window", return_value=1), \
-             mock.patch("omnidroid.engine._running_window_bar_pid",
-                        return_value=9999), \
-             mock.patch("omnidroid.hostwin.show_qemu_window",
-                        side_effect=lambda *a, **k: shown.append((a, k))), \
+             mock.patch("omnidroid.hostwin.window_is_visible",
+                        return_value=True), \
+             mock.patch("omnidroid.hostwin.bring_to_front",
+                        side_effect=lambda *a, **k: raised.append((a, k))), \
              mock.patch("omnidroid.hostwin.apply_chrome") as chrome, \
-             mock.patch("omnidroid.engine._spawn_window_bar",
-                        side_effect=lambda *a, **k: spawned.append(1)):
+             mock.patch("omnidroid.hostwin.show_qemu_window") as show:
             engine.cmd_view(_args(name="farm3"))
-        self.assertEqual(len(shown), 1)
-        self.assertEqual(shown[0][1].get("pid"), 4242)
-        self.assertEqual(spawned, [])   # no second bar
-        chrome.assert_not_called()      # no need to restyle an already-open window
+        self.assertEqual(len(raised), 1)
+        self.assertEqual(raised[0][1].get("pid"), 4242)
+        chrome.assert_not_called()
+        show.assert_not_called()
 
-    def test_a_dead_pid_file_falls_through_to_a_normal_spawn(self):
-        spawned = []
+    def test_it_reports_already_open_in_json(self):
         with mock.patch("omnidroid.engine.load_config", return_value={}), \
              mock.patch("omnidroid.engine.running_pid", return_value=4242), \
              mock.patch("omnidroid.engine.load_account",
                         return_value={"name": "farm3", "vnc_port": 18001}), \
-             mock.patch("omnidroid.engine.boot_has_hidden_window",
-                        return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242}), \
+                        return_value=_window_boot(window_visible=True)), \
+             mock.patch("omnidroid.engine._ensure_window_lock"), \
              mock.patch("omnidroid.hostwin.find_window", return_value=1), \
-             mock.patch("omnidroid.engine._running_window_bar_pid",
-                        return_value=None), \
+             mock.patch("omnidroid.hostwin.window_is_visible",
+                        return_value=True), \
+             mock.patch("omnidroid.hostwin.bring_to_front"), \
+             mock.patch("omnidroid.engine.emit_json") as emit:
+            engine.cmd_view(_args(name="farm3", json=True))
+        payload = emit.call_args[0][0]
+        self.assertTrue(payload["already_open"])
+        self.assertEqual(payload["viewer"], "window")
+
+    def test_a_hidden_window_falls_through_to_the_full_setup(self):
+        shown = []
+        with mock.patch("omnidroid.engine.load_config", return_value={}), \
+             mock.patch("omnidroid.engine.running_pid", return_value=4242), \
+             mock.patch("omnidroid.engine.load_account",
+                        return_value={"name": "farm3", "vnc_port": 18001}), \
+             mock.patch("omnidroid.engine._run_record",
+                        return_value=_window_boot(window_hidden=True)), \
+             mock.patch("omnidroid.engine._write_run_record"), \
+             mock.patch("omnidroid.engine._ensure_window_lock"), \
+             mock.patch("omnidroid.hostwin.find_window", return_value=1), \
+             mock.patch("omnidroid.hostwin.window_is_visible",
+                        return_value=False), \
              mock.patch("omnidroid.hostwin.apply_chrome",
                         return_value={"applied": True, "reason": "",
                                       "hwnd": 1}), \
-             mock.patch("omnidroid.hostwin.show_qemu_window"), \
-             mock.patch("omnidroid.engine._spawn_window_bar",
-                        side_effect=lambda *a, **k: spawned.append(1)):
+             mock.patch("omnidroid.hostwin.show_qemu_window",
+                        side_effect=lambda *a, **k: shown.append(1)):
             engine.cmd_view(_args(name="farm3"))
-        self.assertEqual(spawned, [1])
+        self.assertEqual(shown, [1])
 
 
 class TheAppCanHideAWindowWithoutStopping(unittest.TestCase):
@@ -621,7 +734,7 @@ class ViewSaysWhatItDid(unittest.TestCase):
     nothing on success. A command that opens a window and says nothing is
     indistinguishable from one that did nothing."""
 
-    def _view(self, settled):
+    def _view(self, visible, locked=7777):
         import io
         import contextlib
         out = io.StringIO()
@@ -631,43 +744,48 @@ class ViewSaysWhatItDid(unittest.TestCase):
              mock.patch("omnidroid.engine.running_pid", return_value=4242), \
              mock.patch("omnidroid.engine.load_account",
                         return_value={"name": "farm3", "vnc_port": 18001}), \
-             mock.patch("omnidroid.engine.boot_has_hidden_window",
-                        return_value=True), \
              mock.patch("omnidroid.engine._run_record",
-                        return_value={"identity": "omni-farm3", "pid": 4242,
-                                      "native_window": True,
-                                      "window_hidden": True}), \
+                        return_value=_window_boot(
+                            window_hidden=not visible,
+                            window_visible=visible)), \
+             mock.patch("omnidroid.engine._write_run_record"), \
+             mock.patch("omnidroid.engine._ensure_window_lock",
+                        return_value=locked), \
              mock.patch("omnidroid.hostwin.find_window", return_value=1), \
-             mock.patch("omnidroid.engine._running_window_bar_pid",
-                        return_value=None), \
+             mock.patch("omnidroid.hostwin.window_is_visible",
+                        return_value=visible), \
+             mock.patch("omnidroid.hostwin.bring_to_front"), \
              mock.patch("omnidroid.hostwin.apply_chrome",
                         return_value={"applied": True, "reason": "",
                                       "hwnd": 1}), \
              mock.patch("omnidroid.hostwin.show_qemu_window"), \
-             mock.patch("omnidroid.engine._spawn_window_bar",
-                        return_value=mock.Mock(pid=7777)), \
-             mock.patch("omnidroid.engine._window_bar_settled",
-                        return_value=settled), \
-             mock.patch("omnidroid.engine._write_window_bar_pid") as wrote, \
              mock.patch("omnidroid.engine.emit_json",
                         side_effect=lambda d: emitted.update(d)):
             engine.cmd_view(_args(name="farm3", json=True))
-        return out.getvalue(), emitted, wrote
+        return out.getvalue(), emitted
 
-    def test_a_successful_window_view_says_so_and_names_the_bar(self):
-        printed, emitted, wrote = self._view(True)
+    def test_a_successful_window_view_says_so(self):
+        printed, emitted = self._view(visible=False)
         self.assertIn("[view farm3]", printed)
-        self.assertIn("7777", printed)
-        self.assertTrue(emitted["bar"])
-        wrote.assert_called_once_with("farm3", 7777)
+        self.assertIn("live window opened", printed)
+        self.assertTrue(emitted["ok"])
+        # The aspect lock is part of what `view` delivers, so it is part of
+        # what `view` reports: "the window is up" and "the window will stay
+        # the right shape" are separate promises and either can fail alone.
+        self.assertTrue(emitted["aspect_locked"])
+        self.assertIn("aspect held", printed)
 
-    def test_a_bar_that_died_is_not_reported_as_an_open_window(self):
-        printed, emitted, wrote = self._view(False)
-        self.assertNotIn("live window opened", printed)
-        self.assertFalse(emitted["bar"])
-        # ...and a dead pid must not be recorded as a live bar, or the next
-        # `view` believes one is open and refuses to spawn a real one.
-        wrote.assert_not_called()
+    def test_a_window_that_could_not_be_held_still_opens_and_says_so(self):
+        # A lock that would not start (no GL panel, a backend that cannot
+        # size another process's window) must not be reported as one that did.
+        _printed, emitted = self._view(visible=False, locked=None)
+        self.assertTrue(emitted["ok"])
+        self.assertFalse(emitted["aspect_locked"])
+
+    def test_an_already_open_window_says_that_instead(self):
+        printed, emitted = self._view(visible=True)
+        self.assertIn("already open", printed)
+        self.assertTrue(emitted["already_open"])
 
 
 class TheDebugWindowIsDescribedHonestly(unittest.TestCase):
@@ -686,7 +804,18 @@ class TheDebugWindowIsDescribedHonestly(unittest.TestCase):
                             "window_hidden": True})
         self.assertIn("still works", why)
         self.assertIn("restyled", why)
-        self.assertIn("title bar", why)
+
+    def test_a_presented_window_boot_says_it_is_already_on_screen(self):
+        # The third state, and the common one now: the boot presented its own
+        # window at spawn, so it has been visible since before Android
+        # started. Telling that user `view` "still works: it SHOWS that
+        # window" describes work nothing does -- it is already shown -- and
+        # sends them looking for a window they are looking at.
+        why = self._reason({"native_window": True, "gpu": "gl",
+                            "window_hidden": False, "window_visible": True})
+        self.assertIn("ALREADY ON SCREEN", why)
+        self.assertIn("--hide", why)
+        self.assertNotIn("unstyled", why)
 
     def test_a_gpu_window_boot_is_not_promised_chrome_that_never_runs(self):
         why = self._reason({"native_window": True, "gpu": "gl",

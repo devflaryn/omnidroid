@@ -162,6 +162,18 @@ def pid_alive(pid):
             return False
 
 
+# How long the QMP identity probe gets, on the paths that still need one.
+#
+# 0.25 s was measured to be far too short: a QEMU running a game answered
+# `query-name` in 3 s, because QMP is serviced by the same main loop the guest
+# is keeping busy. Reading that as "the instance is dead" orphaned a live
+# 3.2 GB QEMU and stopped its memory governor. Four seconds is slower than
+# anybody wants in a loop, which is exactly why the loop does not use it any
+# more -- `process_start_ticks` does, and this is the fallback for records and
+# platforms that cannot.
+QMP_IDENTITY_TIMEOUT = 4.0
+
+
 def _cmdline_has_token(pid, token):
     """True iff the Linux /proc/<pid>/cmdline arg vector contains `token`.
     Cheap identity confirmation that kills PID-recycle false positives with
@@ -173,9 +185,80 @@ def _cmdline_has_token(pid, token):
     return token.encode() in raw.split(b"\x00")
 
 
-def _qmp_name(qmp_port, timeout=0.25):
+def process_start_ticks(pid):
+    """When `pid` was created, as an opaque integer, or None if unknowable.
+
+    THE POINT OF THIS IS TO KEEP QMP OUT OF THE LIVENESS PATH. A pid alone
+    cannot say "this is still the process we spawned" because pids get
+    recycled -- but a pid PLUS its creation time can, and that pair is what
+    every process table in the world uses as a durable process identity. It
+    costs microseconds, it cannot be starved, and unlike a socket round trip
+    it does not care how busy the process is.
+
+    MEASURED, and this is why it exists: `_qmp_name`'s 0.25 s budget is not
+    enough for a QEMU running a game. On a live PS99 farming instance,
+    `query-name` needed **3 s** -- QMP is serviced by QEMU's main loop, and
+    that loop was busy with the guest and with one warning line per page of
+    balloon traffic. So `instance_live()` said False about a perfectly healthy
+    instance, and everything downstream believed it: `list` reported it
+    stopped, `stop` could not stop it, and the MEMORY GOVERNOR exited with
+    "QEMU process is gone" after a single shrink -- which is precisely the
+    "it always uses the whole -m" symptom, with the instance left orphaned at
+    3.2 GB and its ports still held.
+
+    The value is only ever compared against another value from this same
+    function on this same host, so its units do not matter and are not the
+    same on every platform:
+
+      * Windows -- the process creation FILETIME (100 ns since 1601).
+      * Linux   -- field 22 of /proc/<pid>/stat, `starttime` in clock ticks
+                   since boot.
+      * elsewhere -- None, and callers fall back to the older checks.
+    """
+    if not pid:
+        return None
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k = ctypes.windll.kernel32
+            handle = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                   int(pid))
+            if not handle:
+                return None
+            try:
+                created = wintypes.FILETIME()
+                exited = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                if not k.GetProcessTimes(handle, ctypes.byref(created),
+                                         ctypes.byref(exited),
+                                         ctypes.byref(kernel),
+                                         ctypes.byref(user)):
+                    return None
+                return ((created.dwHighDateTime << 32)
+                        | created.dwLowDateTime)
+            finally:
+                k.CloseHandle(handle)
+        stat = (_PROC / str(pid) / "stat").read_bytes()
+        # The comm field is parenthesised and may itself contain spaces and
+        # parentheses, so split after the LAST ')' rather than on whitespace.
+        fields = stat[stat.rindex(b")") + 2:].split()
+        return int(fields[19])          # field 22 overall == index 19 here
+    except Exception:      # noqa: BLE001 - a probe must never raise
+        return None
+
+
+def _qmp_name(qmp_port, timeout=QMP_IDENTITY_TIMEOUT):
     """The guest name from QMP query-name on qmp_port, or None on any
-    error/refusal. Fast (short timeout) — runs in hot paths."""
+    error/refusal.
+
+    THE TIMEOUT IS NOT A HOT-PATH BUDGET ANY MORE. It used to be 0.25 s
+    because this ran on every liveness check; it now runs only when
+    `process_start_ticks` could not answer (an old run.json, an unsupported
+    platform), so it can afford to be right. See QMP_IDENTITY_TIMEOUT.
+    """
     from omnidroid.qemu_proc import qmp   # lazy: qemu_proc imports runtime_dir
     resp = qmp({"qmp_port": qmp_port}, "query-name", timeout=timeout)
     if not resp:
@@ -188,14 +271,27 @@ def instance_live(rec):
     instance (not a recycled pid, not a stranger)? Cheap-first.
 
     1. pid must be alive at all.
-    2. Legacy records (no identity) fall back to pid-only with a warning.
-    3. Linux cheap path: /proc/<pid>/cmdline carries the -name token -> live.
-    4. Authoritative path: QMP query-name equals the token -> live.
-    Any ambiguity resolves to NOT live (safe direction: frees nothing that
-    is actually answering, and never claims a stranger)."""
+    2. pid + CREATION TIME match what spawn recorded -> live. This is the
+       path that runs in practice, and the only one that cannot be starved
+       by a busy guest -- see process_start_ticks for the measurement that
+       moved it to the front.
+    3. Legacy records (no identity) fall back to pid-only with a warning.
+    4. Linux cheap path: /proc/<pid>/cmdline carries the -name token -> live.
+    5. Last resort: QMP query-name equals the token -> live.
+
+    Ambiguity resolves to NOT live, and that is still the safe direction for
+    the question this was written for (never claim a stranger's pid). It is
+    NOT safe for a false negative on our own process, which is why step 2
+    exists: a mismatch there is definitive (the pid was recycled), and a
+    match is definitive too, so neither answer has to be guessed at."""
     pid = rec.get("pid")
     if not pid_alive(pid):
         return False
+    recorded = rec.get("pid_started")
+    if recorded is not None:
+        actual = process_start_ticks(pid)
+        if actual is not None:
+            return int(actual) == int(recorded)
     token = rec.get("identity")
     if not token:
         import sys
@@ -383,6 +479,234 @@ def trim_working_set(pid):
             ctypes.windll.kernel32.CloseHandle(h)
     except Exception:      # noqa: BLE001 — an optimisation, never a failure
         return False
+
+
+# Flags for SetProcessWorkingSetSizeEx. HARDWS_MAX_ENABLE is the one that
+# matters: without it the maximum is a hint the memory manager may ignore
+# entirely, and the whole point here is that it is not a hint.
+QUOTA_LIMITS_HARDWS_MIN_DISABLE = 0x00000002
+QUOTA_LIMITS_HARDWS_MAX_ENABLE = 0x00000004
+# What the process is always allowed to keep. Small enough to be no constraint
+# at the caps this project sets, present because the API takes a pair.
+WORKING_SET_MIN_MB = 32
+
+
+def cap_working_set(pid, max_mb):
+    """Hold this process's resident memory at or below `max_mb`. True if set.
+
+    THIS REPLACES `trim_working_set` AS THE WAY FARMING GIVES MEMORY BACK, and
+    the difference between them is the difference between a working instance
+    and a wedged one.
+
+    `EmptyWorkingSet` evicts EVERYTHING, in one go. Run once that is merely
+    dramatic -- MEASURED, 3192 MB -> 1 MB, back to ~150 MB in 20 s as the guest
+    re-faults its live set. Run on a TIMER, which is what the governor did, it
+    never converges: the next trim lands before the guest has faulted its set
+    back, so the guest spends all its time faulting. MEASURED 2026-08-17,
+    trimming every 30 s against a live PS99 farming instance:
+    host RSS stuck at 1-37 MB, **adb stopped answering within 12 s**, the game
+    was killed, and the guest never recovered even after the trims stopped.
+
+    A hard working-set MAXIMUM asks the memory manager for the same thing and
+    lets IT choose which pages and when: it trims least-recently-used pages
+    continuously and keeps the process exactly at the ceiling. Same instance,
+    same game, capped instead of trimmed:
+
+        cap      host RSS    game     adb round trip
+        (none)      3417     alive    0.05 s
+        1000        1000     alive    0.05 s
+        800          800     alive    0.05 s
+        650          650     alive    0.04 s
+        500          500     alive    0.10 s
+        384          384     DEAD     0.04 s
+        300          300     DEAD     0.04 s
+
+    -- and at 650 MB, over 90 s: the client burned 149% of a guest core (it is
+    genuinely playing, not merely resident), the host saw 2570 page faults a
+    second, and QEMU read **0.09 MB/s** off disk. That last number is the one
+    that makes this safe: the faults are SOFT, served from the standby list at
+    RAM speed, so the pages come back without touching the pagefile.
+
+    Below ~500 MB PS99 is killed in-guest. The floor is the game's, not the
+    mechanism's.
+
+    Windows only. Linux and macOS decommit for real through the balloon's own
+    discard path, so there is nothing here for them to do -- returns False,
+    and callers treat that as "this host does it another way", never as an
+    error.
+    """
+    if not IS_WINDOWS or not pid or not max_mb:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k = ctypes.windll.kernel32
+        k.SetProcessWorkingSetSizeEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
+        k.SetProcessWorkingSetSizeEx.restype = wintypes.BOOL
+        h = k.OpenProcess(PROCESS_SET_QUOTA
+                          | PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        try:
+            return bool(k.SetProcessWorkingSetSizeEx(
+                h, int(WORKING_SET_MIN_MB) << 20, int(max_mb) << 20,
+                QUOTA_LIMITS_HARDWS_MAX_ENABLE))
+        finally:
+            k.CloseHandle(h)
+    except Exception:      # noqa: BLE001 — an optimisation, never a failure
+        return False
+
+
+def uncap_working_set(pid):
+    """Give the process its memory back: no ceiling, OS defaults.
+
+    The symmetric operation, and it has a real caller: a farming instance the
+    user opens a window on is not a farming instance any more for as long as
+    they are watching it, and a 650 MB ceiling on a window somebody is looking
+    at is frame-time they can see.
+    """
+    if not IS_WINDOWS or not pid:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k = ctypes.windll.kernel32
+        k.SetProcessWorkingSetSizeEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
+        k.SetProcessWorkingSetSizeEx.restype = wintypes.BOOL
+        h = k.OpenProcess(PROCESS_SET_QUOTA
+                          | PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        try:
+            # (size_t)-1 for both is the documented "reset to default" pair.
+            return bool(k.SetProcessWorkingSetSizeEx(
+                h, ctypes.c_size_t(-1).value, ctypes.c_size_t(-1).value, 0))
+        finally:
+            k.CloseHandle(h)
+    except Exception:      # noqa: BLE001
+        return False
+
+
+# Job-object plumbing for the CPU ceiling. The numbers are the Win32 ones and
+# they are the API, so they are written as themselves rather than hidden.
+_JobObjectCpuRateControlInformation = 15
+_JOB_CPU_RATE_CONTROL_ENABLE = 0x1
+_JOB_CPU_RATE_CONTROL_HARD_CAP = 0x4
+# AssignProcessToJobObject needs PROCESS_SET_QUOTA *and* PROCESS_TERMINATE --
+# a job may kill its members, so the caller has to be allowed to. Opening
+# without TERMINATE fails with ACCESS_DENIED and nothing else explains why.
+_PROCESS_QUERY_INFORMATION = 0x0400
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+
+
+class CpuCeiling:
+    """A live CPU ceiling on one process. Holding this object IS the ceiling.
+
+    WHY AN OBJECT AND NOT A FUNCTION. The limit lives on a Windows job object,
+    and a job object dies with its last handle -- so whatever applies the cap
+    has to stay alive to keep it. The memory governor already runs for the
+    life of the instance, which makes it the natural owner; a fire-and-forget
+    `cap_cpu(pid, 50)` would be undone the moment the caller returned, and
+    would look like it worked.
+
+    Closing it (or exiting) removes the limit and leaves the process running:
+    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is deliberately NOT set, because a
+    governor that crashed must never take a farming instance with it.
+    """
+
+    def __init__(self, pid):
+        self._job = None
+        self._proc = None
+        self.cores = 1
+        self.attached = False
+        if not IS_WINDOWS or not pid:
+            return
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            self.cores = max(1, k.GetActiveProcessorCount(0xFFFF))
+            job = k.CreateJobObjectW(None, None)
+            if not job:
+                return
+            proc = k.OpenProcess(
+                _PROCESS_QUERY_INFORMATION | _PROCESS_QUERY_LIMITED_INFORMATION
+                | _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, int(pid))
+            if not proc:
+                k.CloseHandle(job)
+                return
+            if not k.AssignProcessToJobObject(job, proc):
+                k.CloseHandle(proc)
+                k.CloseHandle(job)
+                return
+            self._job, self._proc, self.attached = job, proc, True
+        except Exception:      # noqa: BLE001 - an optimisation, never a failure
+            self._job = self._proc = None
+
+    def set(self, percent_of_one_core):
+        """Hold the process at `percent_of_one_core`% of ONE core. True if set.
+
+        The API takes a share of the WHOLE MACHINE in hundredths of a percent,
+        which is a terrible unit to think in when what you mean is "half a
+        core"; the conversion lives here so every caller can speak in cores.
+
+        MEASURED on a live PS99 farming instance, 24 logical processors:
+
+            cap          host CPU    client   adb
+            (none)         160.9%    alive    0.05 s
+            100% core      102.0%    alive    0.05 s
+            70%             71.9%    alive    0.37 s
+            50%             49.9%    alive    0.06 s
+            35%             35.5%    alive    0.07 s
+
+        The host tracks the cap exactly and the guest stays responsive
+        throughout. This is the lever for instance COUNT: farming's cost is
+        the game's own arm64 translation (148% of a guest core, against
+        SurfaceFlinger's 6.7% -- rendering is not the expense), and that is
+        not something the guest can be asked to do less of.
+        """
+        if not self.attached:
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class RATE(ctypes.Structure):
+                class _U(ctypes.Union):
+                    _fields_ = [("CpuRate", wintypes.DWORD),
+                                ("Weight", wintypes.DWORD)]
+                _anonymous_ = ("u",)
+                _fields_ = [("ControlFlags", wintypes.DWORD), ("u", _U)]
+
+            info = RATE()
+            info.ControlFlags = (_JOB_CPU_RATE_CONTROL_ENABLE
+                                 | _JOB_CPU_RATE_CONTROL_HARD_CAP)
+            share = float(percent_of_one_core) / self.cores
+            # 1..10000, in hundredths of a percent of the whole machine.
+            info.CpuRate = max(1, min(10000, int(round(share * 100))))
+            return bool(ctypes.windll.kernel32.SetInformationJobObject(
+                self._job, _JobObjectCpuRateControlInformation,
+                ctypes.byref(info), ctypes.sizeof(info)))
+        except Exception:      # noqa: BLE001
+            return False
+
+    def close(self):
+        try:
+            import ctypes
+            for handle in (self._proc, self._job):
+                if handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:      # noqa: BLE001
+            pass
+        self._job = self._proc = None
+        self.attached = False
 
 
 def host_mem_available_mb():

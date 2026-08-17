@@ -319,15 +319,51 @@ _GL_OPTION = {"macos": "gl=es", "linux": "gl=on", "windows": "gl=on"}
 # QEMU refuses an unknown suboption outright rather than ignoring it -- so a
 # `show-menubar=off` sent to `cocoa` does not degrade, it fails the boot.
 #
-#   show-menubar=off   QEMU's own View/Machine menus are not our chrome
-#   window-close=off   the X must not quit QEMU: the strip asks first, and a
-#                      window that closes the VM by accident costs a boot
-#   zoom-to-fit=on     the guest panel is fixed at the base's native mode, so
-#                      the window scales rather than letterboxing
+#   show-menubar=off      QEMU's own View/Machine menus are not our chrome
+#   window-close=off      the X must not quit QEMU: the strip asks first, and a
+#                         window that closes the VM by accident costs a boot
+#   zoom-to-fit=on        the guest panel is fixed at the base's native mode, so
+#                         the window scales rather than letterboxing
+#   keep-aspect-ratio=on  and it scales UNIFORMLY. See below.
+#
+# WHY keep-aspect-ratio IS NAMED EXPLICITLY EVEN THOUGH QEMU DEFAULTS IT ON.
+# It is the one flag in this list that decides whether the picture is
+# geometrically correct, and the whole of `zoom-to-fit` funnels through it:
+# ui/gtk.c's `gd_update_scale()` is
+#
+#     if (vc->s->keep_aspect_ratio) { scale_x = scale_y = MIN(sx, sy); }
+#     else                          { scale_x = sx; scale_y = sy;      }
+#
+# so with it off, every window whose shape is not the guest's shape STRETCHES
+# the guest -- and with it on, the guest is letterboxed inside it instead,
+# undistorted at every window size. That matters most in exactly the window
+# this product now shows for the whole boot: the loading animation and the
+# running game are not the same resolution, so one of them is always being
+# fitted into a window sized for the other. Defaults are not a contract, this
+# one is unnamed in `-help` (it lives in the QAPI schema, and an unknown
+# suboption is a REFUSED BOOT, so it was verified against the shipped binary
+# before being added here -- accepted on QEMU 11.0.50, 2026-08-17), and a
+# silent flip upstream would come back as "the picture looks squashed" with
+# nothing in this repo to point at.
+#
+# WHY window-close=off IS BACK. It was dropped on the belief that "our patched
+# QEMU asks 'Stop this instance?' on the X itself" -- there is no such build
+# (see _apply_window_env), so on the binary this actually ships the X quits
+# QEMU on the spot: no prompt, the guest is killed mid-frame, and a launch that
+# took a minute is gone. That was survivable while the window only appeared
+# once the game was already running and the user had deliberately asked for it.
+# It is not survivable now that the window goes up at spawn and sits there for
+# the whole boot, which is exactly the minute the user has nothing to do but
+# look at it.
+#
+# The cost is a window whose X does nothing, and that is a real cost, taken
+# deliberately: the window is a VIEW onto an instance, and the instance is
+# managed from the app, which now offers Hide (put it away, keep playing) and
+# Stop (power it off) as separate buttons. `--gpu window` -- the debugging
+# hatch -- gets none of these flags and keeps a working X.
 _WINDOW_FLAGS = {
-    # window-close is NOT disabled any more: our patched QEMU asks
-    # "Stop this instance?" on the X itself, so the close has to reach it.
-    "gtk":   ("show-menubar=off", "zoom-to-fit=on"),
+    "gtk":   ("show-menubar=off", "zoom-to-fit=on", "keep-aspect-ratio=on",
+              "window-close=off"),
     "sdl":   ("window-close=off",),
     "cocoa": ("zoom-to-fit=on",),
 }
@@ -849,6 +885,28 @@ MODES = {
                 # same window instead. `screenshot` goes through adb and is
                 # unaffected, which is what farming actually needs.
                 "panel": FARMING_PANEL, "gpu": GPU_AUTO,
+                # How little of `-m` the HOST has to keep resident. The
+                # governor walks a working-set ceiling down from `mem` while
+                # the guest stays healthy and stops clear of anything that
+                # hurt it, so this is how far it is ALLOWED to go, not where
+                # it lands. MEASURED on PS99: healthy at a 500 MB ceiling (adb
+                # 0.10 s, client burning 149% of a guest core, QEMU reading
+                # 0.09 MB/s off disk) and the client killed at 384. The search
+                # therefore settles around 640-760 MB for this game, against
+                # 3417 MB uncapped. A different game finds its own number,
+                # which is the point of searching rather than naming one.
+                # See balloon.next_ceiling and runtime.cap_working_set.
+                "ws_floor": 384,
+                # ...and how much CPU one farming instance may take, as a
+                # share of ONE core. This is the lever for instance COUNT:
+                # uncapped, a PS99 farming instance takes 161% of a core, so
+                # 24 logical processors hold about 15 of them. At 50% they
+                # hold about 40, and MEASURED at that cap the client is still
+                # alive and adb still answers in 0.06 s. Rendering is not what
+                # is being cut -- SurfaceFlinger is 6.7% of a guest core
+                # against the client's 148% -- the game simply runs at the
+                # pace it is given. See runtime.CpuCeiling.
+                "cpu_ceiling_pct": 50,
                 "profile": "density", "quality": "low"},
 }
 DEFAULT_MODE = "gaming"
@@ -1327,11 +1385,20 @@ def resolve_gpu_display(mode, interactive, tool, cfg=None):
               f"booting headless in software")
         return list(HEADLESS_GPU_ARGS), list(HEADLESS_DISPLAY_ARGS)
     if cap.get("tier") == "gl":
+        # WHAT HAPPENS TO THAT WINDOW is decided a few lines later, by
+        # place_window, and this line has to agree with it or it is the most
+        # misleading output in the launch: it is the one message a user reads
+        # while waiting, and it used to promise a window "hidden during boot"
+        # on the very boots that now show it for exactly that.
+        watched = window_shown_at_spawn(cfg, mode)
+        fate = ("the window goes up now and stays up, so you can watch the "
+                "boot; hide it any time with `omnidroid view <name> --hide`"
+                if watched else
+                "the window is hidden, and `omnidroid view` shows it when you "
+                "want it")
         print(f"[gpu] {cap['reason']}. This host can only take a GL context "
-              f"through a window, so QEMU serves no VNC on this boot — the "
-              f"window is hidden during boot, and `omnidroid view` shows it "
-              f"restyled, with our own title bar above it (GPU-rendered, "
-              f"native input, no copy). "
+              f"through a window, so QEMU serves no VNC on this boot — "
+              f"{fate} (GPU-rendered, native input, no copy). "
               f"`screenshot` works either way; capture/autocap do not. "
               f"--gpu headless keeps VNC and gives up the GPU.")
     else:
@@ -1970,7 +2037,125 @@ def _stage_warm_efivars(acct, cfg, warm):
         shutil.copyfile(src, d / "efivars.fd")
 
 
-def _hide_window_if_wanted(cmd, identity, cfg):
+def window_shown_at_spawn(cfg=None, mode=None):
+    """Whether THIS boot's window belongs on screen from the first frame.
+
+    The product question this answers: is anybody watching? A gaming launch is
+    one instance a person started and is waiting on, so its window goes up at
+    spawn and stays up through the boot -- they see the Omni loading animation
+    and then Android, which is what "it's working" looks like. A farming launch
+    is fifty instances nobody is watching, and fifty windows appearing across
+    the desktop is not a product; those still open a window (it is the only
+    working GL context on Windows -- see hostwin.py) and still get it hidden.
+
+    That is `_presents_a_window`, which already draws exactly this line for the
+    display argv, so the window's visibility and the display it was chosen for
+    cannot drift apart.
+
+    `OMNI_HIDE_BOOT_WINDOW=1` / config `qemu.hide_boot_window` forces the old
+    behaviour back -- the window hidden until `omnidroid view` asks for it.
+    The escape hatch is here rather than absent because "show me the boot" is a
+    preference, and somebody running a gaming instance on a second machine they
+    are not looking at should not have to take the window.
+    """
+    env = os.environ.get("OMNI_HIDE_BOOT_WINDOW", "").strip()
+    if env:
+        if env not in ("0", "false", "False", "no"):
+            return False
+    else:
+        value = ((cfg or {}).get("qemu") or {}).get("hide_boot_window")
+        if value is not None and bool(value):
+            return False
+    return _presents_a_window(gpu_policy(cfg, mode), mode)
+
+
+def window_icon_path():
+    """Our window icon, or None. INSIDE the package on purpose: PyInstaller's
+    collect_data_files only picks up data that lives in the package, so a
+    repo-root assets/ dir would vanish from the frozen build and the window
+    would silently fall back to QEMU's own logo."""
+    icon = Path(__file__).resolve().parent / "assets" / WINDOW_ICON_NAME
+    return icon if icon.is_file() else None
+
+
+def window_title(name):
+    """What the window is called. `omni: <account>`, matching what every other
+    window this product opens is called (the VNC viewer's title, and the title
+    bar that used to be stacked above this window before QEMU's own frame
+    became the frame).
+
+    Replaces QEMU's `QEMU (omni-<account>)`, which names somebody else's
+    product first and ours in brackets."""
+    return f"omni: {name}"
+
+
+def place_window(cmd, identity, cfg, mode=None, icon=None, geometry=None,
+                 title=None, pid=None):
+    """Decide what happens to the window this spawn just opened. Never raises.
+
+    Returns {"hidden", "visible", "client"} -- `client` is the size the guest
+    is being shown at when we set it, else None. There are exactly THREE
+    answers, and they have not changed shape, only which one is the common one:
+
+      * no window at all (headless/farming on a host with windowless GL)
+        -> nothing to place.
+      * `--gpu window`, the debugging hatch -> LEFT EXACTLY AS QEMU MADE IT.
+        The design spec defines that flag as "a visible native window,
+        UNSTYLED -- for debugging a GL problem with none of this code in the
+        path", and presenting it as ours would put this code straight back in
+        the path it exists to stay out of.
+      * somebody is watching (gaming) -> presented as ours, at the panel size,
+        from the first frame.
+      * nobody is watching (farming) -> hidden, and kept hidden.
+    """
+    if not command_opens_a_window(cmd):
+        return {"hidden": False, "visible": False, "client": None}
+    if gpu_policy(cfg, mode) == GPU_WINDOW:
+        return {"hidden": False, "visible": True, "client": None}
+    if window_shown_at_spawn(cfg, mode):
+        result = _present_window(cmd, identity, cfg, mode=mode, icon=icon,
+                                 geometry=geometry, title=title, pid=pid)
+        return {"hidden": False, "visible": bool(result.get("presented")),
+                "client": result.get("client")}
+    return {"hidden": _hide_window_if_wanted(cmd, identity, cfg, pid=pid),
+            "visible": False, "client": None}
+
+
+def _present_window(cmd, identity, cfg, mode=None, icon=None, geometry=None,
+                    title=None, pid=None):
+    """Put this spawn's window on screen as OURS. Returns the hostwin result.
+
+    Runs INLINE, before spawn_qemu returns, for the same reason the hide does:
+    it costs about as long as QEMU needs to map its window, and doing it here
+    is what makes the window correct the first time anybody sees it rather than
+    a plain GTK window that changes shape and name a moment later.
+    """
+    from omnidroid import hostwin
+    panel = panel_for(mode, cfg)
+    result = hostwin.present_qemu_window(
+        identity, pid=pid, panel=panel, geometry=geometry, title=title,
+        icon=icon if icon is not None else window_icon_path())
+    if result.get("presented"):
+        client = result.get("client")
+        named = result.get("identity") or {}
+        print(f"[gpu] the QEMU window is on screen for this boot"
+              + (f" at {client[0]}x{client[1]}" if client else "") +
+              f" — you will see the loading animation while Android comes up, "
+              f"not a blank desktop. Hide it with `omnidroid view {identity} "
+              f"--hide`.")
+        # Say which half of the naming failed rather than leaving somebody to
+        # wonder whether the QEMU logo in their taskbar is by design.
+        missing = [k for k in ("title", "icon") if not named.get(k)]
+        if missing:
+            print(f"[gpu] the window keeps QEMU's own "
+                  f"{' and '.join(missing)}; everything else is ours.")
+    else:
+        print(f"[gpu] the window came up as QEMU's own, unstyled: "
+              f"{result.get('reason')}. Rendering and input are unaffected.")
+    return result
+
+
+def _hide_window_if_wanted(cmd, identity, cfg, pid=None):
     """Hide the QEMU window this spawn just opened, unless it was asked for.
 
     On Windows the window is the price of the GPU, not a feature (see
@@ -1998,14 +2183,14 @@ def _hide_window_if_wanted(cmd, identity, cfg):
               f"{hostwin.backend_reason()}. Rendering is unaffected, and "
               f"`omnidroid view` still works.")
         return False
-    hidden = hostwin.hide_qemu_window(identity)
+    hidden = hostwin.hide_qemu_window(identity, pid=pid)
     if hidden:
         # ...and KEEP it hidden. GTK re-shows the window during early boot (the
         # GL area being realised, the guest's first modeset), so a single hide
         # at spawn is undone before the guest has even joined a place. The
         # watcher is bounded and stops on its own; after the boot, one hide
         # sticks (measured).
-        hostwin.keep_hidden(identity)
+        hostwin.keep_hidden(identity, pid=pid)
         print(f"[gpu] the QEMU window is hidden — it exists only because it is "
               f"the only working GL context on this host, and it keeps "
               f"rendering while invisible. Watch with `omnidroid view`.")
@@ -2089,15 +2274,23 @@ def scratch_env(cfg=None, env=None):
     return base
 
 
-# Our QEMU build reads these three; a stock QEMU ignores them, so setting
-# them unconditionally cannot break a boot on somebody else's binary.
+# ⚠ NO QEMU READS THESE. They were written for a patched build that does not
+# exist -- verified 2026-08-16 against the shipped binaries, which carry no
+# `QEMU_WINDOW_*` string. They are harmless (a stock QEMU ignores an unknown
+# environment variable, so no boot can break on them) and are kept only as the
+# names such a build would use. THE BEHAVIOUR THEY NAME IS PROVIDED ELSEWHERE
+# AND IS REAL:
+#   icon          -> hostwin.present_qemu_window(icon=...) via WM_SETICON
+#   aspect lock   -> `-display gtk,...,keep-aspect-ratio=on` (QEMU letterboxes
+#                    instead of stretching) plus hostwin.aspect_lock (the
+#                    window itself is held at the guest's ratio)
+#   confirm close -> not implemented; see _WINDOW_FLAGS' window-close note.
 WINDOW_ICON_NAME = "omni-icon.png"
 
 
 def _apply_window_env(env):
-    """Turn on the patched build's window behaviour: our logo, a resize that
-    keeps the guest's aspect ratio, and a confirmation before the X powers a
-    booted machine off."""
+    """Set the QEMU_WINDOW_* names. INERT on every binary this project ships --
+    see the block above before you build anything on top of them."""
     # INSIDE the package on purpose: PyInstaller's collect_data_files only
     # picks up data that lives in the package, so a repo-root assets/ dir
     # would vanish from the frozen build and the window would silently fall
@@ -2177,6 +2370,20 @@ def _scratch_owner(path):
         return None
 
 
+def _pid_started_ticks(pid):
+    """runtime.process_start_ticks, imported lazily.
+
+    Lazily because runtime imports from this module; a top-level import here
+    is a cycle. Never raises -- a record without this key just falls back to
+    the older liveness checks.
+    """
+    try:
+        from omnidroid.runtime import process_start_ticks
+        return process_start_ticks(pid)
+    except Exception:      # noqa: BLE001
+        return None
+
+
 def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
                warm=None, bake=False, warm_key=None):
     from omnidroid.runtime import runtime_dir
@@ -2198,22 +2405,44 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
     cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug,
                        warm=warm, bake=bake)
     qemu_env = scratch_env(cfg)
-    # Tell the patched build what panel the GPU device was ACTUALLY given, so
-    # it reports that to the guest instead of the window's own size. Without
-    # it the guest adopts whatever the window happens to be at startup and
-    # then letterboxes its 1280x800 logical display into that panel itself --
-    # bars that no window-side aspect lock can remove. Read back out of the
-    # argv (gl_panel_size) rather than re-derived, so a config override cannot
-    # make the two disagree.
+    # ⚠ NOTHING READS QEMU_WINDOW_PANEL. It is set for a QEMU build that was
+    # planned and never made; verified 2026-08-16 by byte-scanning the shipped
+    # qemu-system-{x86_64,aarch64}.exe, which contain no `QEMU_WINDOW_*` string
+    # at all. It is left in place because it is inert on a stock binary and
+    # would be the right name if that build ever happens -- but DO NOT add
+    # behaviour behind it, and do not read this as "the guest is told the panel
+    # size". It is not.
+    #
+    # What actually keeps the guest's mode and the window's shape in agreement
+    # is the pair below, and both are real:
+    #   * the window is OPENED at the panel size (place_window -> the client
+    #     area, which is the size QEMU hands the guest), and
+    #   * it is HELD at that aspect ratio afterwards (hostwin.aspect_lock,
+    #     driven by the engine's `_windowlock` helper).
+    # Read back out of the argv (gl_panel_size) rather than re-derived, so a
+    # config override cannot make the two disagree.
     gl_panel = gl_panel_size(cmd)
     if gl_panel:
         qemu_env["QEMU_WINDOW_PANEL"] = f"{gl_panel[0]}x{gl_panel[1]}"
     proc = subprocess.Popen(cmd, stdout=log, stderr=log,
                             env=qemu_env, **kwargs)
     identity = f"omni-{acct['name']}"
-    hidden = _hide_window_if_wanted(cmd, identity, cfg)
+    # Hidden, presented as ours, or left exactly as QEMU made it -- one
+    # decision, taken before spawn_qemu returns so the window is never briefly
+    # wrong on screen. See place_window.
+    placed = place_window(cmd, identity, cfg, mode=mode, pid=proc.pid,
+                          geometry=acct.get("geometry"),
+                          title=window_title(acct["name"]))
+    hidden = placed["hidden"]
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
+         # WHEN that pid was created, which is what makes the pid a durable
+         # identity rather than a number the OS will hand to somebody else.
+         # Every liveness check reads this instead of asking QEMU over QMP --
+         # a busy guest starved that probe and got a live instance declared
+         # dead, its governor stopped and its 3.2 GB orphaned. See
+         # runtime.process_start_ticks.
+         "pid_started": _pid_started_ticks(proc.pid),
          # Whether THIS boot put a real window on the host's screen. Recorded
          # rather than recomputed, so `omnidroid start` can stand its VNC viewer
          # down instead of showing a second, laggier window onto the same
@@ -2226,6 +2455,23 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
          # screen for a user to look at, so the viewer has to come from
          # somewhere else. `omnidroid view` reads this to decide what to say.
          "window_hidden": hidden,
+         # ...and whether it is ON SCREEN RIGHT NOW, which is a third question
+         # again and the one the app asks. `window_hidden` false used to mean
+         # only "`--gpu window`, so it was never hidden"; since a watched boot
+         # presents its window at spawn, false now covers both, and `view` has
+         # to tell "already up, bring it forward" from "up but unstyled,
+         # deliberately". Never inferred from `not window_hidden`.
+         "window_visible": placed["visible"],
+         # The client size the guest is being SHOWN at, when we set it. Not the
+         # same number as gl_panel on a window the user has since resized, and
+         # it is the one that has to stay proportional -- see _windowlock.
+         "window_client": list(placed["client"]) if placed["client"] else None,
+         # What `-m` this boot ACTUALLY got, which is not the mode's default:
+         # a place with a measured floor raises it (PS99 boots at 3072 against
+         # farming's 2048) and `--mem` overrides both. The working-set governor
+         # starts its search at this number, and starting at the mode's default
+         # instead would begin the descent already below the guest's real size.
+         "mem_mb": (mode or {}).get("mem"),
          # Whether THIS boot rendered on the host GPU, and at what panel size.
          # Recorded for the same reason as native_window — the argv is the
          # truth — and read back by _ensure_booted, which cannot otherwise
@@ -2306,3 +2552,152 @@ def mem_args(mode, mem):
     # memory size" -- which reads like a sizing mistake rather than a missing
     # suffix.
     return ["-m", f"size={int(boot)},slots={MEM_SLOTS},maxmem={int(mem)}M"]
+
+
+# ---------------------------------------------------------------------------
+# HOW MANY INSTANCES ACTUALLY FIT, and which wall you hit first.
+#
+# "Why can't I run 30" has four possible answers on Windows and only one of
+# them is the RAM everybody plans for. MEASURED on this project's own box
+# (i7-13700F / 24 threads, 32 GB, RTX 4060) with one PS99 farming instance
+# under the working-set and CPU governors:
+#
+#   resident memory   384 MB   (3417 MB before the ceiling -- 8.9x)
+#   CPU                50%     of one core (161% before the ceiling)
+#   COMMIT           3072 MB   = `-m`, and NOTHING reduces it
+#   scratch          1300 MB   of disk for the ephemeral overlay
+#
+# Commit is the one that surprises people. Windows charges the full `-m`
+# against RAM+pagefile the moment QEMU maps guest memory, whether or not a
+# byte is touched, and there is no way around it in the shipped build:
+# `-object memory-backend-file` is not registered in the Windows QEMU
+# (verified 2026-08-16), so guest RAM cannot be moved off the commit limit.
+# The governors make an instance's RAM and CPU cheap; they cannot make its
+# commit cheap. On a 32 GB box with a same-size pagefile that is a ceiling of
+# roughly a dozen PS99 instances no matter how well everything else behaves,
+# and the fix is disk: a bigger pagefile.
+
+# What one instance costs beyond `-m`, in MB of commit: QEMU itself, its
+# threads, the GL context. Measured at ~90 MB; rounded up because a capacity
+# estimate that is too optimistic is the one that hurts.
+COMMIT_OVERHEAD_MB = 128
+
+
+def _commit_status_mb():
+    """(limit, charged, available) MB of Windows commit, or None off Windows."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        m = _MS()
+        m.dwLength = ctypes.sizeof(_MS)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return None
+        mb = 1024 * 1024
+        return (m.ullTotalPageFile // mb,
+                (m.ullTotalPageFile - m.ullAvailPageFile) // mb,
+                m.ullAvailPageFile // mb)
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def instance_capacity(mode=None, cfg=None, mem_mb=None):
+    """How many more instances of `mode` this host can take, and why not more.
+
+    Returns a dict with one entry per wall and the binding one named. Every
+    number is measured off THIS host now, not assumed: free RAM, free commit,
+    free scratch disk and idle CPU, divided by what one instance of this mode
+    actually costs.
+
+    Never raises. A wall this host cannot measure is reported as None and
+    excluded from the verdict rather than guessed at -- an estimate that
+    silently drops a constraint is how a capacity plan turns into an
+    out-of-memory host.
+    """
+    mode = mode or MODES.get(DEFAULT_MODE) or {}
+    mem = int(mem_mb or mode.get("mem") or 2048)
+    walls = {}
+
+    # RESIDENT MEMORY -- what the governor holds an instance to, not `-m`.
+    ws = int(mode.get("ws_floor") or mem)
+    from omnidroid.runtime import host_mem_available_mb   # lazy: cycle
+    free_ram = host_mem_available_mb()
+    if free_ram:
+        walls["ram"] = {"fits": int(free_ram // max(1, ws)),
+                        "free_mb": int(free_ram), "each_mb": ws}
+
+    # COMMIT -- `-m` plus overhead, and nothing reduces it.
+    commit = _commit_status_mb()
+    if commit:
+        _limit, _charged, avail = commit
+        each = mem + COMMIT_OVERHEAD_MB
+        walls["commit"] = {"fits": int(avail // each), "free_mb": int(avail),
+                           "each_mb": each, "limit_mb": _limit}
+
+    # SCRATCH DISK -- the ephemeral overlay every instance writes into.
+    free_disk = scratch_free_mb(cfg)
+    if free_disk is not None:
+        each = SCRATCH_PER_INSTANCE_MB
+        walls["disk"] = {
+            "fits": int(max(0, free_disk - SCRATCH_FLOOR_MB) // each),
+            "free_mb": int(free_disk), "each_mb": each}
+
+    # CPU -- the ceiling the governor holds a farming instance to, or what one
+    # was measured to take uncapped.
+    _mem, cpus = host_capacity()
+    pct = mode.get("cpu_ceiling_pct")
+    if cpus:
+        each_pct = int(pct or 160)
+        walls["cpu"] = {"fits": int((cpus * 100) // max(1, each_pct)),
+                        "cores": int(cpus), "each_pct": each_pct}
+
+    counted = {k: v["fits"] for k, v in walls.items()}
+    if not counted:
+        return {"walls": walls, "fits": None, "binding": None}
+    binding = min(counted, key=counted.get)
+    return {"walls": walls, "fits": counted[binding], "binding": binding,
+            "mode": mode.get("name"), "mem_mb": mem}
+
+
+def capacity_advice(report):
+    """One line saying what to change to fit more. "" when nothing is binding.
+
+    Names the LEVER, not the number: "you are short on commit" is a fact
+    nobody can act on, and "make the pagefile bigger" is.
+    """
+    binding = (report or {}).get("binding")
+    walls = (report or {}).get("walls") or {}
+    if not binding:
+        return ""
+    wall = walls.get(binding, {})
+    if binding == "commit":
+        return (f"COMMIT is the wall: Windows charges the whole `-m` "
+                f"({wall.get('each_mb')} MB each) against RAM+pagefile whether "
+                f"the guest touches it or not, and the working-set governor "
+                f"cannot help with that. Raise the pagefile (System > About > "
+                f"Advanced system settings > Performance > Virtual memory), or "
+                f"launch with a smaller `--mem`.")
+    if binding == "disk":
+        return (f"DISK is the wall: each instance keeps a ~"
+                f"{wall.get('each_mb')} MB ephemeral overlay in "
+                f"{scratch_dir()}. Free space there, or point "
+                f"qemu.scratch_dir / OMNI_SCRATCH_DIR at a roomier volume.")
+    if binding == "cpu":
+        return (f"CPU is the wall: {wall.get('cores')} logical processors "
+                f"against {wall.get('each_pct')}% of a core each. Lower the "
+                f"mode's cpu_ceiling_pct to fit more (they run slower, and "
+                f"they all keep farming).")
+    return (f"RAM is the wall: {wall.get('free_mb')} MB free against "
+            f"{wall.get('each_mb')} MB resident each.")

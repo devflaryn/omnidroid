@@ -821,16 +821,185 @@ So farming's GPU policy is now `auto`, and the settle also got faster
 decides how many instances a host holds, this roughly doubles the ceiling.
 
 **`auto`, not `window`.** An explicit `window` means "I want to see it", so
-`_hide_window_if_wanted` leaves it on screen — verified. `auto` opens one only
-because this host has no other route to a GL context, then hides it. On a real
-headless farm box with no window server, `auto` finds nothing and falls back to
-software, which is the old behaviour.
+`place_window` leaves it exactly as QEMU made it — unstyled, on screen,
+verified. `auto` opens one only because this host has no other route to a GL
+context. On a real headless farm box with no window server, `auto` finds
+nothing and falls back to software, which is the old behaviour.
+
+**Farming's window is HIDDEN; gaming's is SHOWN.** Same `auto` policy, opposite
+outcome, and `qemu_proc.window_shown_at_spawn` is the one line that decides it.
+Farming is fifty instances nobody is watching and fifty windows across the
+desktop is not a product, so its window is hidden at spawn and kept hidden (GTK
+re-shows it during early boot). Gaming is one instance a person started and is
+waiting on, so its window goes up at spawn — see the next section.
 
 **What it costs:** QEMU refuses `-vnc` beside a GL context, so `capture` and
 `autocap` are unavailable on a GPU farming boot and `omnidroid view` shows
-QEMU's own window, restyled in place, with our title bar above it — no
-reparenting and no copy. **`screenshot` goes through adb and is unaffected** —
-verified against a GPU farming instance.
+QEMU's own window — no reparenting and no copy. **`screenshot` goes through adb
+and is unaffected** — verified against a GPU farming instance.
+
+## The gaming window is on screen for the BOOT
+
+*Built and measured 2026-08-17 on the Windows box, QEMU 11.0.50, x86 base.*
+
+A gaming launch used to open its QEMU window, hide it, boot for a minute with
+nothing on the user's screen, and show the window at the very end — so the
+first thing anyone ever saw was Roblox already running, and the whole boot
+looked like the app had frozen. It now goes up at spawn, at the panel size,
+and stays up:
+
+```
+t+0.0s   no window yet
+t+3.1s   window exists, hidden, 640x505      title 'QEMU (omni-HezMi_ImYu)'
+t+3.5s   window VISIBLE,        640x505      (GTK shows it)
+t+3.7s   window VISIBLE,       1280x800      title 'omni: HezMi_ImYu'
+```
+
+That last line is the whole change: **3.7 s into the launch**, against ~133 s
+before, which is when `start` returned and the app finally called `view`.
+
+`place_window` takes the decision at spawn and has exactly three answers:
+present it (watched), hide it (farming), or leave it untouched (`--gpu window`,
+the debugging hatch, which must have none of this code in its path). Turn it
+off with `OMNI_HIDE_BOOT_WINDOW=1` or config `qemu.hide_boot_window`.
+
+**The size it opens at is the CLIENT size, not the window size**, and that is
+load-bearing rather than pedantic: QEMU hands the guest the size of its drawing
+area, so a window sized to 1280x800 gives the guest 1264x761 once the caption
+and border are taken off it (measured: the frame is 16x39 on this host).
+
+### Keeping the aspect ratio
+
+Two mechanisms, and both are needed.
+
+**QEMU must not stretch.** `-display gtk,...,keep-aspect-ratio=on`, which is
+now named explicitly in `_WINDOW_FLAGS`. `ui/gtk.c`'s `gd_update_scale()` is
+the whole of it — `keep_aspect_ratio` picks `MIN(sx, sy)` over independent
+`sx`/`sy` — so with it off, any window that is not the guest's shape stretches
+the picture. Verified on the shipped binary at the pixel level, by grabbing the
+window's client area at three shapes:
+
+| window client | ratio | what the sampled edges read |
+|---|---|---|
+| 1280x800 | 1.600 | no bars — content everywhere |
+| 1400x500 | 2.800 | left/right columns a constant 25.0 — **pillarboxed** |
+| 700x800 | 0.875 | top/bottom rows a constant 25.0 — **letterboxed** |
+
+⚠ The suboption is **absent from `-display help`'s text** (that text is
+hand-maintained; the option lives in the QAPI schema) and QEMU **refuses an
+unknown suboption outright rather than ignoring it** — so it was verified
+against the real binary before being added, and there is a test that re-asks it
+(`test_window_at_boot.py`) plus a control that proves the probe discriminates.
+
+**The window must not drift off the guest's shape, and it must not drift
+DURING the drag.** `hostwin.aspect_lock`, run as a detached `_windowlock`
+process for the life of the window, corrects the client area **live** — while
+you are still dragging — not when you let go.
+
+The obvious objection is that it cannot work: a user resize runs inside
+`DefWindowProc`'s modal size loop, which recomputes the rect from its own
+tracked state on every mouse move, so an outside `SetWindowPos` ought to be
+undone by the next one. Measured against a real modal drag (`WM_NCLBUTTONDOWN`
++ `HTBOTTOMRIGHT`, then `SendInput` mouse moves), sampling the client rect
+every 10 ms:
+
+| corrector | samples off-ratio by >2% | ratio at the end |
+|---|---|---|
+| none | 76 / 246 (31%) | 1.98 — 24% off 16:10 |
+| every 8 ms | **2 / 246 (1%)** | **1.600** |
+
+The correction wins because a mouse move is milliseconds apart and 8 ms is
+less: what is on screen for almost all of the drag is the corrected shape.
+Idle cost measured at **0.16% of one core**.
+
+Two pieces of state make it stable, and neither is optional:
+
+* **`applied`** — the size *we* last set. Anything else read back is a change
+  the user made, and telling those apart stops the loop reacting to itself.
+* **`axis`** — which dimension the user is dragging, **latched for the drag**.
+  Re-deciding per frame flips it the moment our own correction has moved the
+  other dimension, and then the lock and the drag argue: the user drags the
+  bottom edge, we widen to match, the next mouse move puts the width back
+  (Windows recomputes it from the rect the drag *started* with), and now the
+  width looks like the dimension that moved.
+
+Measured on all three drag kinds, against the real lock:
+
+| drag | start → end | final ratio | off-ratio during |
+|---|---|---|---|
+| corner | 880x550 → 1482x926 | 1.6004 | 0 / 188 |
+| bottom edge | 880x550 → 1264x790 | 1.6000 | 2 / 188 |
+| right edge | 880x550 → 1200x750 | 1.6000 | 3 / 188 |
+
+Each keeps the dimension the user was actually dragging and moves the other.
+The 1–3 stray samples are the first 10–30 ms, before the idle poll notices the
+drag has begun.
+
+**The guest is still only told once.** QEMU coalesces —
+`qemu_console_set_ui_info(..., delay=true)` does `timer_mod(ui_timer, now +
+1000)`, re-armed on every change — so the guest hears one number, a second
+after the drag stops, and by then the shape is already right. The lock stops
+correcting the moment it is (`aspect_is_close`), which is what lets that timer
+fire at all; a corrector that never stopped would re-arm it forever, and that
+is what an earlier 120 ms attempt did before the guest ended up at "Display
+output is not active".
+
+With the guest booted, `wm size` read `Physical size: 1280x800` against a
+1000x624 window — the same 16:10, so QEMU's scale is uniform and nothing is
+distorted at a window size the user chose freely.
+
+### Our name and our icon, on QEMU's own window
+
+QEMU calls its window `QEMU (omni-<account>)` and gives it the QEMU logo. Both
+are replaced from outside, on QEMU's own window, with no patched build and no
+second window stacked on top to caption it: `WM_SETTEXT` and `WM_SETICON` are
+both marshalled between processes.
+
+The icon is `omnidroid/assets/omni-icon.png`, which has been in the tree since
+2026-08-16 and which nothing consumed — it was added for the
+`QEMU_WINDOW_ICON` env var that no build reads. `LoadImageW` cannot read a PNG
+and this repository ships no `.ico`; **`CreateIconFromResourceEx` takes the PNG
+bytes directly** (a PNG-compressed icon image is a documented icon-resource
+form since Vista), so it needs no conversion, no generated `.ico` and no temp
+file. One HICON is loaded per size — 16 for the caption, 32 for the taskbar —
+rather than one stretched for both.
+
+QEMU rewrites its own caption whenever the machine's run state changes
+(`gd_update_caption`), so the aspect lock re-asserts the name every 2 s if it
+has drifted. It is the only long-lived thing watching that window, so it is the
+only place that can notice.
+
+⚠ **RENAMING THE WINDOW BROKE FINDING IT, and the fix is not the obvious one.**
+`find_window` matched the identity as a *title substring*, and our title
+(`omni: farm3`) does not contain the identity (`omni-farm3`), so every later
+`view`/`hide`/lock lookup found nothing. Matching on the pid instead is
+necessary but not sufficient — measured, a QEMU process owns half a dozen
+windows:
+
+```
+gdkWindowToplevel       the one, and the only one, that ever is
+NVOpenGLPbuffer         'NVOGLDC invisible', 1914x994, invisible — the driver's
+GDI+ Hook Window Class  1x1
+GdkDisplayChange        0x0
+Default IME/MSCTFIME UI 0x0
+```
+
+and QEMU's real window does not exist until **t+0.22 s**, while `find_window`
+is called ~50 ms after spawn. A naive pid fallback therefore returned the
+NVIDIA driver's invisible pbuffer, and everything downstream styled, renamed,
+resized and watched a window nothing is ever drawn in — while the real one sat
+on the user's screen at 640x505 wearing QEMU's own name. A pid-only candidate
+now has to *look* like a guest window (top-level, not a known decoy class, a
+client area of at least 64x64), which puts `find_window` back to **waiting**
+for the real window rather than grabbing whatever the process owned first.
+
+**The X no longer quits QEMU** (`window-close=off` is back). It was dropped on
+the belief that a patched QEMU asked "Stop this instance?" on the close — there
+is no such build, so on the shipped binary the X killed the guest instantly. A
+window that is on screen for the whole boot is one the user is looking at with
+nothing else to do, and an accidental click there cost the entire launch. The
+window is now managed from the app: **Hide** puts it away and keeps the game
+running, **Stop** powers it off.
 
 **Untested:** GPU contention with many concurrent instances. Only one Roblox
 cookie was live when this was measured, so a single instance is the only

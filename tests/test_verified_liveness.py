@@ -25,6 +25,74 @@ def test_run_json_records_identity(tmp_path, monkeypatch):
     qemu_proc.spawn_qemu(acct, {"qemu": {}}, interactive=False)
     rj = json.loads((tmp_path / "acc0" / "run.json").read_text())
     assert rj["identity"] == "omni-acc0"
+    # ...and WHEN that pid was created, which is what makes the pid a durable
+    # identity. Liveness reads this instead of asking QEMU over QMP.
+    assert "pid_started" in rj
+
+
+def test_creation_time_is_a_stable_unique_process_identity():
+    """The property the whole check rests on: same process, same value;
+    different process, different value."""
+    import os
+    first = runtime.process_start_ticks(os.getpid())
+    assert first is not None, "this platform cannot answer; liveness falls back"
+    assert runtime.process_start_ticks(os.getpid()) == first
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(20)"])
+    try:
+        assert runtime.process_start_ticks(child.pid) != first
+    finally:
+        child.kill()
+        child.wait()
+    # NOT asserted: that it returns None once the process is dead. On Windows
+    # a terminated process still has a process OBJECT for as long as anyone
+    # holds a handle to it (Popen does), so its creation time is still
+    # readable. That is harmless because `pid_alive` gates the whole check --
+    # this function only ever answers "is it the SAME process", never "is it
+    # running".
+    assert runtime.pid_alive(child.pid) is False
+    assert runtime.instance_live(
+        {"name": "acc0", "identity": "omni-acc0", "pid": child.pid,
+         "pid_started": runtime.process_start_ticks(child.pid)}) is False
+
+
+def test_a_busy_qemu_is_not_declared_dead():
+    """THE BUG THIS REPLACED. `_qmp_name` had a 0.25 s budget and QMP is
+    served by QEMU's main loop, so a guest running a game starved it: a live
+    PS99 farming instance answered `query-name` in 3 s and was declared dead.
+    `list` showed it stopped, `stop` could not stop it, and its memory
+    governor exited with "QEMU process is gone" after one shrink -- leaving
+    3.2 GB orphaned and the ports still held.
+
+    So a record carrying `pid_started` must never reach QMP at all."""
+    import os
+    asked = []
+    real_qmp_name = runtime._qmp_name
+    runtime._qmp_name = lambda *a, **k: asked.append(1)
+    try:
+        rec = {"name": "acc0", "identity": "omni-acc0", "pid": os.getpid(),
+               "qmp_port": 7000,
+               "pid_started": runtime.process_start_ticks(os.getpid())}
+        assert runtime.instance_live(rec) is True
+    finally:
+        runtime._qmp_name = real_qmp_name
+    assert asked == [], "liveness reached for QMP when it did not have to"
+
+
+def test_a_recycled_pid_is_still_rejected():
+    """The failure the identity check was written for in the first place: the
+    recorded pid is dead and the OS reissued it to a stranger."""
+    import os
+    rec = {"name": "acc0", "identity": "omni-acc0", "pid": os.getpid(),
+           "qmp_port": 7000,
+           "pid_started": runtime.process_start_ticks(os.getpid()) + 999}
+    assert runtime.instance_live(rec) is False
+
+
+def test_the_qmp_fallback_is_no_longer_a_hot_path_budget():
+    """0.25 s was chosen when this ran on every liveness check. It does not
+    any more, so it can afford to be long enough to be right."""
+    assert runtime.QMP_IDENTITY_TIMEOUT >= 2.0
 
 import socket
 import threading

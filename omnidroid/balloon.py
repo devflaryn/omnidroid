@@ -275,3 +275,104 @@ def used_mb_from_meminfo(text):
     if total is None or avail is None:
         return None
     return max(0, (total - avail) // 1024)
+
+
+# ---------------------------------------------------------------------------
+# The WORKING-SET CEILING: how a Windows host actually gets farming's memory
+# back. Everything above this line is the balloon, which is the mechanism on
+# hosts where QEMU can decommit; this is the mechanism on the host where it
+# cannot.
+#
+# WHY THIS EXISTS AT ALL. QEMU on Windows has no madvise, so nothing the guest
+# gives back is ever released -- an idle instance costs the host its whole
+# `-m`, which is the entire "30 instances drain the RAM" problem. The balloon
+# does not fix it (measured: a full inflate moved host RSS 3414 -> 3403 MB, and
+# it descends at ~0.4 MB/s, so it never finishes) and `EmptyWorkingSet` on a
+# timer wedges the guest (measured: adb stopped answering, the game was killed,
+# and it never recovered). A hard working-set MAXIMUM does fix it -- see
+# runtime.cap_working_set for the table.
+#
+# WHAT THIS POLICY ADDS is that the right ceiling is not a constant. It is a
+# property of THE GAME: PS99 dies below ~500 MB, another place will differ, and
+# nobody should have to measure each one by hand. So the ceiling walks DOWN
+# while the guest is healthy and jumps UP the moment it is not, and remembers
+# the lowest level that hurt so it never goes back there.
+
+# How far the ceiling moves per step, in MB. Small enough that one step down
+# is never a cliff, large enough to reach the floor from a cold start in a
+# couple of minutes.
+CEILING_STEP_MB = 128
+# Never below this, whatever the search decides. A ceiling under a couple of
+# hundred MB is not a guest any more, it is a thrash.
+CEILING_HARD_FLOOR_MB = 256
+# How much room to leave above the level that hurt. One step is not enough:
+# the level that hurt was measured while the guest was ALREADY under pressure,
+# so the safe level is meaningfully above it.
+CEILING_BACKOFF_STEPS = 2
+
+# What "unhealthy" means, and the order matters: adb latency is the LEADING
+# indicator and the game dying is the lagging one. MEASURED on a wedged
+# instance: adb round trips went from 0.05 s to 15 s (timeouts) while the game
+# was still running, and the game died afterwards. Backing off on latency
+# alone is what keeps the game alive.
+ADB_SLOW_SECONDS = 2.0
+
+
+def next_ceiling(*, ceiling_mb, healthy, floor_mb, unsafe_mb=None,
+                 step_mb=CEILING_STEP_MB, max_mb=None):
+    """The next working-set ceiling, and whether this level is now known bad.
+
+    Returns (ceiling, unsafe) -- `unsafe` is the lowest ceiling that has been
+    observed to hurt, and the search never goes at or below it again.
+
+    `max_mb` is the guest's own `-m` and is a HARD STOP, not a preference.
+    Without it the backoff runs away: an instance whose client had died for
+    reasons of its own read as unhealthy every poll and the ceiling climbed
+    3072 -> 4736 MB and kept going, which is both meaningless (there is
+    nothing above `-m` to hand back) and hides the real problem behind a
+    number that looks like it is still working on it. At the top the search
+    STOPS -- if a guest is unhealthy while holding all the memory it was ever
+    given, memory is not what is wrong with it.
+
+    Pure, because the interesting part is the decision and not the syscall:
+    the caller measures health, this decides the number.
+    """
+    floor = max(int(floor_mb or 0), CEILING_HARD_FLOOR_MB)
+    ceiling = int(ceiling_mb)
+    top = int(max_mb) if max_mb else None
+    if not healthy:
+        # This level hurt. Remember it, and get clear of it -- upward, now.
+        unsafe = ceiling if unsafe_mb is None else max(int(unsafe_mb), ceiling)
+        backed_off = ceiling + CEILING_BACKOFF_STEPS * step_mb
+        if top is not None:
+            backed_off = min(backed_off, top)
+        return backed_off, unsafe
+    lower_bound = floor
+    if unsafe_mb is not None:
+        # Stay a full backoff above anything that has hurt, rather than
+        # creeping back down to it one step at a time and hurting again.
+        lower_bound = max(lower_bound,
+                          int(unsafe_mb) + CEILING_BACKOFF_STEPS * step_mb)
+    if ceiling - step_mb < lower_bound:
+        return max(ceiling, lower_bound), unsafe_mb
+    return ceiling - step_mb, unsafe_mb
+
+
+def starting_ceiling(mem_mb, mode=None):
+    """Where the search begins: the mode's own number, else the guest's `-m`.
+
+    Starting AT `-m` rather than at a guess is deliberate. The ceiling can only
+    hurt the guest by being too low, so the search approaches from the safe
+    side and the first minutes of an instance's life -- when the game is still
+    loading and needs the most -- are spent uncapped.
+    """
+    named = (mode or {}).get("ws_ceiling")
+    if named:
+        return int(named)
+    return int(mem_mb)
+
+
+def ceiling_floor_mb(mode=None):
+    """The lowest ceiling this mode's search may reach."""
+    return max(int((mode or {}).get("ws_floor") or CEILING_HARD_FLOOR_MB),
+               CEILING_HARD_FLOOR_MB)
