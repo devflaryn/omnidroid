@@ -8663,23 +8663,28 @@ def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
     seen = False
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # IS THERE STILL A GAME TO WAIT FOR. `game_pss_mb` reads dumpsys, and a
-        # dead package reads the same as a slow one: nothing. So a client that
-        # was OOM-killed during its load left this loop spinning to the full
-        # 420 s deadline waiting for a plateau a dead process can never reach
-        # -- MEASURED 2026-08-17, twice, and it is the whole difference between
-        # a 478 s launch and the 126 s baseline. Only decisive AFTER the game
-        # has been seen once: before that, "no pid yet" is an ordinary boot.
-        alive = game_is_running(acct)
-        if alive:
+        pss = game_pss_mb(acct)
+        # IS THERE STILL A GAME TO WAIT FOR. A PSS reading IS proof of life --
+        # dumpsys cannot report a package's memory unless it has some -- so the
+        # healthy path costs nothing extra. It is only the ABSENCE of a reading
+        # that is ambiguous: `game_pss_mb` returns None for a dead package and
+        # for a slow one alike, and this loop used to assume the second and
+        # spin out its whole 420 s deadline on the first. MEASURED 2026-08-17,
+        # twice: the difference between a 478 s launch and a 151 s one.
+        #
+        # So the extra round trip is spent ONLY when there is nothing to read,
+        # and only once the game has been seen at all -- before that, "no pid
+        # yet" is an ordinary boot. (Asking every poll instead cost ~80 s per
+        # launch on a 15 s interval; measured, and that is why this is shaped
+        # this way rather than as a straightforward liveness check up front.)
+        if pss:
             seen = True
-        elif alive is False and seen:
+        elif seen and game_is_running(acct) is False:
             if label:
                 print(f"[{label}] the game is GONE ({prev or '?'} MB when last "
                       f"seen) — nothing left to settle, not waiting out the "
                       f"remaining {int(deadline - time.time())}s")
             return False, prev
-        pss = game_pss_mb(acct)
         if pss and prev and pss >= SETTLE_FLOOR_MB:
             if abs(pss - prev) <= prev * SETTLE_TOLERANCE:
                 stable += 1
@@ -9459,6 +9464,86 @@ def instance_health(acct, timeout=10):
     return (game and seconds < balloon.ADB_SLOW_SECONDS), seconds, game
 
 
+# What a client that is actually PLAYING burns, as a share of one guest core.
+# MEASURED 2026-08-17 on this box, `/proc/<pid>/stat` sampled over 3 s:
+#
+#   in PS99, rendering the world      utime 301-388   (109-143% of a core)
+#   on a "Connection Failed" dialog   utime  13-29    (~30%, nearly all system)
+#   on a "restart the game" prompt    utime     29    (~35%)
+#
+# The gap is 10x and it is USER time that separates them -- system time is
+# similar either way, so a total-CPU threshold would not discriminate.
+CLIENT_PLAYING_UTIME_PCT = 60
+
+
+def client_cpu_jiffies(acct):
+    """(utime, stime) of the guest's game process, or None.
+
+    One adb call, no sleep: the CALLER diffs two readings. Anything that polls
+    on a timer -- the governor does, every 5 s -- already has two points in
+    hand and does not need to block for a sampling window.
+    """
+    pkg = acct.get("game_package") or GAME_PACKAGE
+    r = adb_soft(acct, "shell",
+                 f"P=$(pidof {pkg}); [ -n \"$P\" ] && cut -d' ' -f14,15 "
+                 f"/proc/$P/stat", timeout=8)
+    parts = (getattr(r, "stdout", "") or "").split()
+    if len(parts) < 2 or not all(p.isdigit() for p in parts[:2]):
+        return None
+    return int(parts[0]), int(parts[1])
+
+
+def client_is_playing(prev, now, seconds, hz=100):
+    """True/False/None -- was the client WORKING between two jiffie readings?
+
+    THE GAP THIS CLOSES. Nothing in this engine could tell a client that is
+    farming from one sitting on "Connection Failed (Error Code: 279)":
+    `pidof` sees a process either way, and `probe_client_join` reads a log
+    whose join markers scroll out of a 400-line tail within minutes -- it
+    reported `in_world: False` for two instances that were visibly playing and
+    `error: None` for three with the 279 dialog on screen. So four of six
+    instances sat at a perfect 384 MB and 50% CPU, looking healthy in every
+    reading this project takes, farming nothing. Verified against screenshots.
+
+    None when either reading is missing or the window is too short to divide
+    by -- "could not tell", never "not playing", for the same reason
+    game_is_running() is three-state.
+    """
+    if not prev or not now or not seconds or seconds <= 0:
+        return None
+    used = (now[0] - prev[0]) / float(hz)          # user time only; see above
+    if used < 0:                                   # pid recycled between polls
+        return None
+    return (100.0 * used / seconds) >= CLIENT_PLAYING_UTIME_PCT
+
+
+def _record_client_idle(name, idle):
+    """Write "running but not playing" into run.json. Best-effort.
+
+    A SEPARATE FACT FROM DEATH, and the one nothing could see before. A client
+    killed by lmkd is gone and `client_died_after_s` says so; a client parked
+    on "Connection Failed (Error Code: 279)" is a healthy process that will
+    sit there forever, and every reading this project takes -- pidof, host
+    RSS, CPU ceiling, `list` -- calls it running. Four of six instances were
+    in exactly that state on 2026-08-17 while reporting a perfect 384 MB and
+    50%. `list` and the app read run.json, so this is where they can learn the
+    difference.
+    """
+    try:
+        if not (runtime_dir(name) / "run.json").exists():
+            return
+        run = _run_record(name)
+        if not run:
+            return
+        if idle:
+            run["client_idle_since"] = time.time()
+        else:
+            run.pop("client_idle_since", None)
+        _write_run_record(name, run)
+    except Exception:      # noqa: BLE001
+        pass
+
+
 def _record_client_death(name, lived_seconds):
     """Write the client's death (or its return) into run.json. Best-effort.
 
@@ -9529,6 +9614,28 @@ def govern_working_set(acct, mode, state, label=None):
         # for the next one rather than reporting the old death forever.
         state["death_recorded"] = False
         _record_client_death(acct["name"], None)
+    # IS IT PLAYING, or merely running? A client on "Connection Failed" is a
+    # live process burning ~30% of a core; one in the world burns 110-148%.
+    # This governor is the only thing that looks at the instance for its whole
+    # life, so it is the only place that can notice the difference -- and
+    # without it an instance parked on an error dialog reports exactly the
+    # same 384 MB and 50% as one that is farming. Free here: the poll loop
+    # already provides the two readings a CPU delta needs.
+    if game:
+        now_j, now_t = client_cpu_jiffies(acct), time.time()
+        playing = client_is_playing(state.get("cpu_j"), now_j,
+                                    now_t - state.get("cpu_t", now_t))
+        state["cpu_j"], state["cpu_t"] = now_j, now_t
+        if playing is not None and playing != state.get("playing"):
+            state["playing"] = playing
+            _record_client_idle(acct["name"], not playing)
+            if label:
+                print(f"[{label}] the client is "
+                      + ("PLAYING again" if playing else
+                         "RUNNING BUT NOT PLAYING — a live process burning "
+                         "almost no user CPU is a client sitting on a dialog "
+                         "(Connection Failed / restart prompt), not one that "
+                         "is farming"))
     # THE CPU CEILING, applied once and then held. Farming's cost is the
     # game's own arm64 translation -- 148% of a guest core against
     # SurfaceFlinger's 6.7%, so there is nothing to render less OF -- and the

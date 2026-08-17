@@ -70,8 +70,11 @@ class TheReportNamesTheWallNotJustTheNumber(unittest.TestCase):
         r = _with_host(lambda: qemu_proc.instance_capacity(FARMING,
                                                            mem_mb=3072))
         self.assertEqual(r["binding"], "commit")
-        # 37 GB free / (3072 + 192) MB each
-        self.assertEqual(r["fits"], 37000 // (3072 + 192))
+        # 37 GB free / (3072 + the measured overhead) MB each. Derived from
+        # the constant rather than spelled out, so re-measuring the overhead
+        # does not silently turn this into a test of a stale number.
+        self.assertEqual(
+            r["fits"], 37000 // (3072 + qemu_proc.COMMIT_OVERHEAD_MB))
 
     def test_ram_is_no_longer_the_wall_because_of_the_ceiling(self):
         # The governor holds a farming instance at its ws_floor, not at `-m`.
@@ -178,16 +181,33 @@ class TheShortfallIsAShoppingList(unittest.TestCase):
 
 
 class TheOverheadIsTheMeasuredOne(unittest.TestCase):
+    """⚠ THIS CLASS USED TO ASSERT `< 512`, AND THAT BOUND HID A 4x ERROR.
 
-    def test_it_covers_the_gl_window_case(self):
-        # +186 MB measured with gtk,gl=on; a farming instance opens one.
-        self.assertGreaterEqual(qemu_proc.COMMIT_OVERHEAD_MB, 186)
+    The reasoning was: the probe that once read +1070 MB was running TCG,
+    whose default translation buffer is ~1 GB, so a large value means somebody
+    re-measured without `-accel whpx`. Sound as far as it went -- but it
+    silently also pinned the constant to a PAUSED QEMU with no guest in it,
+    which is where 192 came from, and a paused QEMU is a floor rather than a
+    cost. Six live in-world instances measured 993 MB of marginal commit each.
 
-    def test_it_is_not_the_tcg_translation_buffer(self):
-        # The probe that read +1070 MB was running TCG, whose default
-        # translation buffer is ~1 GB. If this constant ever grows to that
-        # size again, somebody has re-measured without `-accel whpx`.
-        self.assertLess(qemu_proc.COMMIT_OVERHEAD_MB, 512)
+    So magnitude alone can no longer tell a real overhead (993) from the TCG
+    artifact (1070) -- they are 77 MB apart. The defence against that mistake
+    is not a number in this file; it is measuring against a LIVE guest with
+    `-accel whpx`, which is now written next to the constant. What these
+    bounds still do is catch a return to the paused-QEMU floor, and catch a
+    value so large it could only be a different bug.
+    """
+
+    def test_it_covers_a_live_guest_and_not_just_a_paused_one(self):
+        # The smallest per-QEMU overhead measured against a RUNNING game was
+        # +722 MB (at -m 2048). Anything under that is the paused-QEMU floor
+        # coming back, and with it capacity answers that are ~2x optimistic.
+        self.assertGreaterEqual(qemu_proc.COMMIT_OVERHEAD_MB, 722)
+
+    def test_it_is_not_absurd(self):
+        # An overhead larger than a small guest itself would mean the probe
+        # measured something other than one instance.
+        self.assertLess(qemu_proc.COMMIT_OVERHEAD_MB, 2048)
 
 
 if __name__ == "__main__":

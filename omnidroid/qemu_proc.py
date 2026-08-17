@@ -2581,19 +2581,47 @@ def mem_args(mode, mem):
 # and the fix is disk: a bigger pagefile.
 
 # What one instance costs beyond `-m`, in MB of commit: QEMU itself, its
-# threads, the GL context. MEASURED on a paused QEMU (no guest running, so
-# this is the floor):
+# threads, the GL context, and the per-instance processes that come with it.
+#
+# ⚠ THIS WAS 192 UNTIL 2026-08-17 AND IT WAS WRONG BY 4x, because it came from
+# the wrong experiment. The old numbers were taken against a PAUSED QEMU with
+# no guest in it:
 #
 #     -m 1024 whpx, -display none      1065 MB   (+41)
 #     -m 2048 whpx, -display none      2092 MB   (+44)
 #     -m 3072 whpx, -display none      3117 MB   (+45)
 #     -m 3072 whpx + gtk,gl=on         3258 MB   (+186)
 #
-# So commit tracks `-m` at 1:1 with a small constant, and the constant is the
-# GL display rather than the guest. ⚠ MEASURE THIS WITH `-accel whpx`: the
-# same probe without it reads +1070 MB, because TCG reserves a ~1 GB
-# translation buffer by default and that has nothing to do with an instance.
-COMMIT_OVERHEAD_MB = 192
+# The source of those said so, and called them a floor. Then this constant
+# used them as the COST, and `instance_capacity` divided free commit by it --
+# so every capacity answer this project gave was 1.8x too optimistic. A guest
+# that is actually running a game maps and touches far more than a paused one:
+# virtio-gpu buffers, the GL driver's own allocations, the translated code
+# buffers, dirty guest pages.
+#
+# MEASURED 2026-08-17 on six live PS99 farming instances, in-world, `-accel
+# whpx` with the hidden GL window farming actually uses:
+#
+#     per QEMU process, -m 3072        3777 / 3904 / 4009 MB   (+825 mean)
+#     per QEMU process, -m 2048                       2770 MB  (+722)
+#     MARGINAL system commit per instance, -m 3072    4065 MB  (+993)
+#
+# THE MARGINAL NUMBER IS THE RIGHT ONE and it is what this constant holds.
+# `instance_capacity` asks "how much of the commit limit does one more
+# instance consume", and the answer includes the governor, the window lock and
+# adb's share -- not just QEMU's own private bytes. Rounded up from 993:
+# being wrong HIGH costs a couple of instances of headroom, being wrong LOW
+# fills the commit limit and the host starts failing allocations, which is the
+# failure that actually hurts.
+#
+# The overhead does grow slightly with `-m` (+722 at 2048, +825 at 3072 --
+# roughly 10% of the guest plus a ~520 MB base), but two points is not a model
+# and a flat conservative constant is honest about that.
+#
+# ⚠ MEASURE THIS WITH `-accel whpx`: the same probe without it reads +1070 MB,
+# because TCG reserves a ~1 GB translation buffer by default and that has
+# nothing to do with an instance.
+COMMIT_OVERHEAD_MB = 1024
 
 
 def _commit_status_mb():

@@ -112,48 +112,61 @@ class TheLaunchFailsWhenTheGameIsGone(unittest.TestCase):
 class TheSettleStopsWaitingForADeadGame(unittest.TestCase):
 
     def _settle(self, running, pss, timeout=999):
-        """Drive the loop with scripted liveness/PSS readings."""
+        """Drive the loop with scripted liveness/PSS readings.
+
+        Returns (result, liveness_mock) so a test can assert HOW OFTEN the
+        liveness probe was asked -- that count is a performance contract, not
+        a detail. See test_the_healthy_path_costs_no_extra_round_trip.
+        """
         with mock.patch.object(engine, "game_is_running",
-                               side_effect=list(running)), \
+                               **running) as live, \
              mock.patch.object(engine, "game_pss_mb", side_effect=list(pss)), \
              mock.patch.object(engine.time, "sleep"):
             return engine.wait_for_game_settled(ACCT, timeout=timeout,
-                                                interval=0)
+                                                interval=0), live
 
     def test_a_game_that_disappears_ends_the_wait(self):
         """It burned the FULL 420 s deadline before this: `game_pss_mb` reads
         dumpsys, and a dead package reads the same as a slow one -- nothing.
-        That is the whole difference between a 478 s launch and the 126 s
-        baseline, measured twice on 2026-08-17."""
-        settled, pss = self._settle(running=[True, True, False],
-                                    pss=[900, 1200, None])
+        That is the whole difference between a 478 s launch and a 151 s one,
+        measured twice on 2026-08-17."""
+        (settled, pss), _live = self._settle({"return_value": False},
+                                             pss=[900, 1200, None])
         self.assertFalse(settled)
         self.assertEqual(pss, 1200, "reports what it saw before it vanished")
 
+    def test_the_healthy_path_costs_no_extra_round_trip(self):
+        """A PSS READING IS PROOF OF LIFE -- dumpsys cannot report a package's
+        memory unless it has some. Asking `pidof` as well on every poll is a
+        second adb round trip on a 15 s loop, and MEASURED it cost ~80 s per
+        launch (151 s -> 234 s). The liveness probe is for the ambiguous case
+        only: no reading at all."""
+        (settled, _pss), live = self._settle({"return_value": True},
+                                             pss=[1000, 1500, 1510, 1515])
+        self.assertTrue(settled)
+        live.assert_not_called()
+
     def test_no_pid_yet_is_an_ordinary_boot_not_a_dead_game(self):
-        """Before the game has EVER been seen, "not running" means it has not
+        """Before the game has EVER been seen, no reading means it has not
         started. Treating that as death would end the wait on every launch,
-        instantly, and squeeze a guest with nothing loaded in it."""
-        settled, _pss = self._settle(
-            running=[False, False, True, True, True],
-            pss=[None, None, 1000, 1010, 1015])
+        instantly, and squeeze a guest with nothing loaded in it -- so the
+        probe is not even asked."""
+        (settled, _pss), live = self._settle(
+            {"return_value": False}, pss=[None, None, 1000, 1010, 1015])
         self.assertTrue(settled, "waited for the game to appear, then settled")
+        live.assert_not_called()
 
     def test_an_unanswered_probe_is_not_a_dead_game(self):
         """None is "could not ask". Ending the wait on it would let one slow
         adb round trip -- routine on a squeezed guest -- cut the settle short
         and squeeze a client in the middle of loading, which is the failure
         this whole wait exists to prevent."""
-        settled, _pss = self._settle(
-            running=[True, None, None, True, True],
-            pss=[1000, 1200, 1400, 1450, 1460])
+        (settled, _pss), live = self._settle(
+            {"return_value": None},
+            pss=[1000, None, None, 1450, 1460, 1465])
         self.assertTrue(settled, "kept waiting through the unanswered probes")
-
-    def test_a_settled_game_still_settles(self):
-        settled, pss = self._settle(running=[True] * 4,
-                                    pss=[1000, 1500, 1510, 1515])
-        self.assertTrue(settled)
-        self.assertGreaterEqual(pss, engine.SETTLE_FLOOR_MB)
+        self.assertEqual(live.call_count, 2, "asked only when there was no "
+                                             "reading to go on")
 
 
 if __name__ == "__main__":
