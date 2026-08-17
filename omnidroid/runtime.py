@@ -337,9 +337,35 @@ def _wipe_runtime(name):
     autocap frames) once an ephemeral instance (build_acct) has stopped.
     Called from cmd_stop (after a successful power-off) and cmd_remove.
     Ephemeral instances write nothing under accounts/<name>/, so this IS
-    the entire teardown -- no folder to remove there."""
+    the entire teardown -- no folder to remove there.
+
+    Returns True only if the directory is REALLY gone. On Windows it often is
+    not: the detached governor still holds `governor.log` open for a moment
+    after the guest powers off, and Windows refuses to unlink an open file.
+    `ignore_errors=True` swallowed that, `cmd_stop` reported
+    `runtime_wiped: true` regardless, and the next launch of the same account
+    inherited the PREVIOUS run's governor.log -- a log with no timestamps in
+    it, describing an instance that no longer exists, sitting in the runtime
+    directory of the one that does. That cost a debugging session on
+    2026-08-17: the stale log's "THE CLIENT IS GONE" was read as the live
+    instance dying. Deleting what can be deleted is still the right
+    behaviour; claiming it all went is not."""
     import shutil
-    shutil.rmtree(runtime_dir(name), ignore_errors=True)
+    d = runtime_dir(name)
+    # Retry briefly rather than giving up on the first locked file. The
+    # governor notices its QEMU is gone within one poll and exits, releasing
+    # the log -- so the window is a second or two, and waiting it out is the
+    # difference between "the directory is gone" and "the directory contains
+    # exactly the one file that misleads the next session". Bounded hard:
+    # `stop` is interactive, and a handle nobody is going to release must not
+    # hold it open. Same shape as cmd_remove's retry, at a tenth the budget.
+    for attempt in range(6):
+        shutil.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            return True
+        if attempt < 5:
+            time.sleep(0.3)
+    return False
 
 
 def running_instances():
@@ -518,7 +544,7 @@ def cap_working_set(pid, max_mb):
         800          800     alive    0.05 s
         650          650     alive    0.04 s
         500          500     alive    0.10 s
-        384          384     DEAD     0.04 s
+        384          384     alive    0.10 s   <- 152% of a guest core
         300          300     DEAD     0.04 s
 
     -- and at 650 MB, over 90 s: the client burned 149% of a guest core (it is
@@ -527,8 +553,17 @@ def cap_working_set(pid, max_mb):
     that makes this safe: the faults are SOFT, served from the standby list at
     RAM speed, so the pages come back without touching the pagefile.
 
-    Below ~500 MB PS99 is killed in-guest. The floor is the game's, not the
+    Below ~384 MB PS99 is killed in-guest. The floor is the game's, not the
     mechanism's.
+
+    ⚠ THIS TABLE SAID "384 DEAD, so ~500 is the floor" until 2026-08-17. That
+    row is from the FIRST pass at the measurement and was already contradicted
+    by the mode farming actually ships (`ws_floor: 384`) and by the table in
+    tests/test_working_set_governor.py. Re-measured on a PS99 farming instance
+    at `-m 2048`: the search walked to 384 MB and held there for 15 minutes,
+    client in-world, 780-810 MB still available inside the guest. A stale row
+    here is not cosmetic -- it is the number somebody raises the floor to the
+    next time instances die for an unrelated reason.
 
     Windows only. Linux and macOS decommit for real through the balloon's own
     discard path, so there is nothing here for them to do -- returns False,

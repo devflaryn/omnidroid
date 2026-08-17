@@ -889,11 +889,14 @@ MODES = {
                 # governor walks a working-set ceiling down from `mem` while
                 # the guest stays healthy and stops clear of anything that
                 # hurt it, so this is how far it is ALLOWED to go, not where
-                # it lands. MEASURED on PS99: healthy at a 500 MB ceiling (adb
-                # 0.10 s, client burning 149% of a guest core, QEMU reading
-                # 0.09 MB/s off disk) and the client killed at 384. The search
-                # therefore settles around 640-760 MB for this game, against
-                # 3417 MB uncapped. A different game finds its own number,
+                # it lands. MEASURED on PS99 at `-m 2048`, 2026-08-17: the
+                # search walked all the way here and HELD, client in-world for
+                # 15 minutes, adb 0.10 s, 780-810 MB still available inside the
+                # guest -- 384 MB against 3417 MB uncapped, 8.9x. 300 MB is
+                # where the client dies. (An earlier pass recorded 384 as fatal
+                # and this comment claimed the search settles at 640-760; both
+                # were wrong, and runtime.cap_working_set carries the retraction
+                # next to its table.) A different game finds its own number,
                 # which is the point of searching rather than naming one.
                 # See balloon.next_ceiling and runtime.cap_working_set.
                 "ws_floor": 384,

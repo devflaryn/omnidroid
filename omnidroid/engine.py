@@ -2186,6 +2186,34 @@ def cmd_start(args):
     # and it is the one a human is watching.
     if result.get("ok"):
         result["client"] = probe_client_join(acct, label)
+        # A LAUNCH WITH NO GAME IN IT IS NOT A SUCCESSFUL LAUNCH. This is the
+        # same judgement `client_died_after_squeeze` already makes, applied to
+        # the case the squeeze is not to blame for: the client was killed
+        # while it was still loading, so it never reached the squeeze at all.
+        # MEASURED 2026-08-17 -- two instances at `-m 2048`, four deaths, and
+        # `start` reported `ok: true, in_world: true` for every one of them,
+        # because success was decided from a delivered session and a log file
+        # rather than from a running process. The governor writes the death
+        # into run.json 11 s later, by which time the caller has been told the
+        # launch worked.
+        #
+        # Re-asked once: `pidof` goes through adb, and a squeezed guest under
+        # load is exactly where a single probe can miss. Two misses 3 s apart
+        # is a dead client, not a slow one.
+        if result["client"].get("game_running") is False:
+            time.sleep(3)
+            result["client"] = probe_client_join(acct, label)
+        if result["client"].get("game_running") is False:
+            result["ok"] = False
+            result["error"] = "client_not_running"
+            result["message"] = (
+                f"the instance is up and answering adb, but no "
+                f"{acct.get('game_package') or GAME_PACKAGE} process is "
+                f"running — it is not farming anything. The usual cause is "
+                f"the guest running out of memory while the client loads: "
+                f"check `logcat | grep 'has died'` for a TOP kill, and raise "
+                f"this place's floor in lean.GUEST_MEM_FLOOR_MB if that is "
+                f"what it says.")
     # The game process exists now, so a renderer mask can be CHECKED rather
     # than assumed. Only asked when one was actually requested: the mask is
     # off by default (it kills the client on the x86 base -- see glmask.py),
@@ -2328,12 +2356,15 @@ def cmd_stop(args):
     stop_autocap(args.name)
     method = _shutdown(acct, f"stop {args.name}", timeout=args.timeout)
     ok = method != "kill-failed"
-    if ok:
-        _wipe_runtime(args.name)
+    # What the wipe ACTUALLY managed, not what it was asked to do. A file the
+    # detached governor still has open survives the rmtree on Windows, and
+    # reporting the wipe as complete is how a previous run's governor.log ends
+    # up read as the current instance's (see _wipe_runtime).
+    wiped = _wipe_runtime(args.name) if ok else False
     if getattr(args, "json", False):
         emit_json({"name": args.name, "was_running": was_running,
                    "stopped": ok, "method": method,
-                   "runtime_wiped": ok, "ok": ok})
+                   "runtime_wiped": wiped, "ok": ok})
     if not ok:
         sys.exit(1)
 
@@ -2393,7 +2424,7 @@ def cmd_remove(args):
         if running_pid(name):
             sys.exit(f"error: '{name}' would not stop; NOT deleting")
     store_removed = _acc.remove_account(_store_root(), name)
-    _wipe_runtime(name)
+    runtime_wiped = _wipe_runtime(name)
     legacy_removed = False
     if has_legacy:
         target = _assert_deletable(legacy_dir)
@@ -2408,13 +2439,14 @@ def cmd_remove(args):
         else:
             sys.exit(f"error: could not delete {target} (files still locked)")
     print(f"[remove {name}] store entry {'cleared' if store_removed else '(none)'}"
-          f", runtime/{name}/ wiped"
+          f", runtime/{name}/ "
+          + ("wiped" if runtime_wiped else "PARTLY wiped (files still open)")
           + (f", legacy folder {target} deleted" if legacy_removed else ""))
     if getattr(args, "json", False):
         emit_json({"name": name, "removed": True,
                    "was_running": was_running,
                    "store_removed": store_removed,
-                   "runtime_wiped": True,
+                   "runtime_wiped": runtime_wiped,
                    "legacy_folder_removed": legacy_removed,
                    "ok": True})
 
@@ -8505,6 +8537,40 @@ CLIENT_REFUSED = (r"Error Code: (\d+)", r"DisconnectReason",
                   r"Failed to connect to the experience")
 
 
+def game_is_running(acct):
+    """Is the guest's game process there? True / False / **None**.
+
+    None means COULD NOT ASK -- this handle carries no adb port, or adb did
+    not answer -- and every caller has to treat it as "no information", never
+    as a death. A probe that cannot tell "gone" apart from "did not answer" is
+    how a slow guest gets reported as a dead one, and density is the mode
+    built for slow guests: a squeezed farming instance running an arm64 build
+    through libndk_translation answers adb in its own time.
+
+    Deliberately NOT `_pidof`. That helper raises SystemExit through `fail()`
+    for a portless handle -- and SystemExit is a BaseException, so its own
+    `except Exception` does not catch it. Calling it from a probe turned "this
+    handle has no port" into the launch process exiting.
+    """
+    if not (acct or {}).get("adb_port"):
+        return None
+    pkg = acct.get("game_package") or GAME_PACKAGE
+    r = adb_soft(acct, "shell", "pidof", pkg, timeout=8)
+    out = (getattr(r, "stdout", "") or "").strip()
+    if out:
+        return True
+    # Empty stdout is "no such process" ONLY if adb itself was talking to a
+    # device. `pidof` exits 1 for a missing package, and so does adb when the
+    # endpoint is offline -- the difference is on stderr, and conflating them
+    # would report every unreachable guest as a dead client.
+    if getattr(r, "returncode", -1) == -1:
+        return None
+    err = (getattr(r, "stderr", "") or "").lower()
+    if "device" in err or "connect" in err or "offline" in err:
+        return None
+    return False
+
+
 def probe_client_join(acct, label=None):
     """What the client itself says about the join: joined, refused, or silent.
 
@@ -8531,8 +8597,21 @@ def probe_client_join(acct, label=None):
             err = m.group(0)
             break
     joined = any(re.search(p, body) for p in CLIENT_JOINED)
-    state = {"in_world": bool(joined and not err), "joined_marker": joined,
-             "error": err}
+    # ...AND IS THE CLIENT STILL THERE. Everything above is read out of a FILE
+    # the client wrote, and the join markers stay in that file after the
+    # process is gone. MEASURED 2026-08-17: a launch reported
+    # `in_world: true` about an instance whose Roblox had been dead for six
+    # minutes, killed by lmkd during its load -- the log was telling the truth
+    # about a join that really happened, to a client that no longer exists.
+    # One `pidof` is the difference between "it joined" and "it is playing",
+    # and only the second one is what a farming instance is for.
+    running = game_is_running(acct)
+    state = {"in_world": bool(joined and not err and running is not False),
+             "joined_marker": joined, "game_running": running, "error": err}
+    if label and joined and not err and running is False:
+        print(f"[{label}] the client JOINED and is now GONE — the log shows a "
+              f"successful join, but no {pkg} process is running. This "
+              f"instance is up and farming nothing.")
     if label and err:
         print(f"[{label}] the client is NOT in the place — it reports "
               f"'{err}'. The session was delivered and the game launched; "
@@ -8581,8 +8660,25 @@ def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
     says so rather than pretending it waited for the right moment."""
     stable = 0
     prev = None
+    seen = False
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # IS THERE STILL A GAME TO WAIT FOR. `game_pss_mb` reads dumpsys, and a
+        # dead package reads the same as a slow one: nothing. So a client that
+        # was OOM-killed during its load left this loop spinning to the full
+        # 420 s deadline waiting for a plateau a dead process can never reach
+        # -- MEASURED 2026-08-17, twice, and it is the whole difference between
+        # a 478 s launch and the 126 s baseline. Only decisive AFTER the game
+        # has been seen once: before that, "no pid yet" is an ordinary boot.
+        alive = game_is_running(acct)
+        if alive:
+            seen = True
+        elif alive is False and seen:
+            if label:
+                print(f"[{label}] the game is GONE ({prev or '?'} MB when last "
+                      f"seen) — nothing left to settle, not waiting out the "
+                      f"remaining {int(deadline - time.time())}s")
+            return False, prev
         pss = game_pss_mb(acct)
         if pss and prev and pss >= SETTLE_FLOOR_MB:
             if abs(pss - prev) <= prev * SETTLE_TOLERANCE:
@@ -9589,6 +9685,16 @@ def _spawn_governor(name):
     rd = runtime_dir(name)
     rd.mkdir(parents=True, exist_ok=True)
     logf = open(rd / "governor.log", "ab")
+    # DATE THE RUN. Nothing else in this log is timestamped, and the file can
+    # outlive the instance it describes: a stop cannot always unlink it (the
+    # governor still has it open -- see runtime._wipe_runtime), so the next
+    # launch of the same account opens the same file and appends. Without this
+    # line the previous instance's "THE CLIENT IS GONE" reads as the current
+    # one's, which is exactly how it was misread on 2026-08-17.
+    logf.write(f"--- governor for {name}, boot at "
+               f"{time.strftime('%Y-%m-%d %H:%M:%S')} (pid {os.getpid()} "
+               f"spawning) ---\n".encode())
+    logf.flush()
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": logf,
               "stderr": subprocess.STDOUT}
     if IS_WINDOWS:
@@ -10277,6 +10383,16 @@ def _pool_adopt_claimed(rec, name, label):
               f"booting normally")
         return None
     pool.mark_adopted(rec["slot"], name)
+    # GIVE THE MEMORY BACK BEFORE THE GAME ASKS FOR IT. `park_slot` held this
+    # guest at farming's idle floor for the whole wait; the next thing that
+    # happens to it is a Roblox client faulting in ~1.5 GB, and a launch that
+    # begins against an idle-sized ceiling is the "squeezed while loading"
+    # failure this project already paid for once. The real governor starts
+    # further down `cmd_start` and searches down from `-m` exactly as it does
+    # on a cold boot -- so the ceiling is not lost, it is re-derived from the
+    # instance this now is instead of the one it was.
+    if run.get("pid"):
+        uncap_working_set(run["pid"])
     # THE CLOCK, before any session is delivered. A pool slot is a live VM, so
     # its clock keeps ticking and the usual answer is "nothing to do" -- which
     # is why this costs one adb round trip and prints nothing when the skew is
@@ -10310,6 +10426,52 @@ def _apply_spec_env(spec):
         os.environ["OMNI_GPU"] = str(spec["gpu"])
     if spec.get("panel"):
         os.environ["OMNI_PANEL"] = str(spec["panel"])
+
+
+def park_slot(slot, spec, cfg, label=None):
+    """Hold a READY, account-free slot at its idle cost until somebody takes it.
+
+    A warm slot is the only thing in this engine that is deliberately kept
+    running while doing nothing, and until now it was also the only running
+    instance nothing governed: `maybe_start_governor` is called from
+    `cmd_start` and from nowhere else, and a slot is booted by
+    `pool_boot_slot`. MEASURED 2026-08-17 across five warm slots, that cost
+    575-747 MB of host RSS each -- a pool of five was 3.4 GB of resident
+    memory for five guests with no game in any of them.
+
+    It does NOT get the governor, and that is the point rather than an
+    omission. The governor SEARCHES: it walks a ceiling down while watching a
+    client, because the safe floor is a property of the game and finding it
+    wrong kills the client. A slot has no client. There is nothing to search
+    for and nothing to lose, so the floor the mode already names is simply
+    applied -- one call, no poll loop, no process to keep alive.
+
+    Applied by hand to the same five slots, farming's own `ws_floor` held them
+    at 384-406 MB and every one still adopted normally.
+
+    The cap is RELEASED AT ADOPTION (`_pool_adopt_claimed`), before any session
+    is delivered: a ceiling sized for an idle Android is the wrong number for a
+    guest about to fault in a gigabyte of Roblox, and the real governor starts
+    a moment later and searches down from `-m` the way it does on a cold boot.
+    """
+    from omnidroid.qemu_proc import resolve_mode
+    pid = running_pid(slot)
+    if not pid or not IS_WINDOWS:
+        return None
+    try:
+        mode = resolve_mode(cfg, spec.get("mode"),
+                            arch=arch_of_base(cfg["bases"][_select_base_tag(cfg)]))
+    except Exception:      # noqa: BLE001 - an unresolvable mode is the pool's
+        return None        # problem to report, not this helper's
+    ceiling = mode.get("ws_floor")
+    if not ceiling:
+        return None
+    before = host_rss_mb(pid)
+    if not cap_working_set(pid, int(ceiling)):
+        return None
+    pool.write_slot_meta(slot, ws_ceiling_mb=int(ceiling),
+                         ws_before_mb=int(before) if before else None)
+    return int(ceiling)
 
 
 def pool_boot_slot(cfg, spec, key, slot=None, label=None):
@@ -10347,9 +10509,16 @@ def pool_boot_slot(cfg, spec, key, slot=None, label=None):
     if not booted:
         pool.write_slot_meta(slot, state="failed", error="boot_timeout")
         return False, slot
+    # PARK IT BEFORE MARKING IT READY. From the `ready` write onwards any
+    # `cmd_start` may claim this slot, and capping a guest that has just been
+    # adopted would put an idle-sized ceiling on a client loading a game --
+    # the exact failure adoption's `uncap_working_set` exists to prevent.
+    # Parking first means a slot is never both claimable and uncapped.
+    ceiling = park_slot(slot, spec, cfg, label)
     pool.write_slot_meta(slot, state="ready", ready_at=time.time(),
                          booted_s=round(time.time() - t0, 1))
-    print(f"[{label}] ready in {time.time() - t0:.1f}s")
+    print(f"[{label}] ready in {time.time() - t0:.1f}s"
+          + (f", parked at {ceiling} MB" if ceiling else ""))
     return True, slot
 
 

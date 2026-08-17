@@ -6,7 +6,175 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-17 (evening) — the launch was calling dead instances a success
+
+**`start` returned `ok: true, in_world: true` for a farming instance whose
+Roblox client was dead.** Not dying — dead, for six minutes, with the launch
+still running. Two instances on PS99 at `-m 2048`, four client deaths between
+them, every one reported as a success:
+
+```
+farm2   14:20:22 start 4600  ->  14:21:31 died  fg  TOP   (69 s)
+        14:27:31 start 7023  ->  14:27:43 died  prcp TOP  (12 s)
+farm3   14:28:11 start 4576  ->  14:29:11 died  fg  TOP   (60 s)
+        14:35:14 start 6376  ->  14:35:27 died  fg  TOP   (13 s)
+```
+
+Three defects had to line up, and every one is a case of believing a REPORT
+instead of asking a PROCESS.
+
+**`in_world` was read out of the client's own log file.** The join markers are
+real — the client genuinely joined — and they stay in that file after lmkd
+kills it. So the log was telling the truth about something that had stopped
+being true minutes earlier. `probe_client_join` now asks whether the process
+exists as well, and `in_world` is the AND of the three. `joined_marker` is
+still reported on its own, because "joined, then was killed" and "never got
+in" are different failures and the second one is somebody else's bug.
+
+**Success was decided before anything had watched the client.** The earlier
+2026-08-17 change was right to stop blocking the launch for 120 s and hand the
+watching to the memory governor — but `start` still returned `ok: true`
+immediately, and the governor wrote `client_died_after_s: 11` into run.json
+*afterwards*, where nothing surfaced it. A launch with no game process in it
+is now a failed launch (`client_not_running`) — the same judgement
+`client_died_after_squeeze` already made for the case the squeeze IS to blame
+for. Re-asked once, three seconds apart: `pidof` goes over adb, and a squeezed
+guest under load is exactly where one probe can miss.
+
+**And `wait_for_game_settled` waited out its whole 420 s deadline for a
+process that no longer existed**, because it reads PSS through dumpsys, where
+a dead package and a slow one both read as nothing. That is the entire
+difference between a **478 s** launch and the **151 s** the same account takes
+with a live client. It stops as soon as the game is gone — but only once the
+game has been SEEN (before that, "no pid" is an ordinary boot), and only on a
+definite answer.
+
+⚠ **THE THREE-STATE PROBE IS LOAD-BEARING.** `game_is_running()` returns
+True / False / **None**, where None means "could not ask". A first cut used
+`_pidof`, which raises SystemExit through `fail()` for a handle with no adb
+port — and SystemExit is a BaseException, so it walks straight through that
+helper's own `except Exception`. A probe that can exit the process is worse
+than no probe. None must never count as a death: density is the mode built for
+guests that answer adb slowly.
+
+### PS99 does not run at `-m 2048`. The floor table was right.
+
+Re-opened because the 3072 floor predates zram and the working-set ceiling,
+and one 15-minute run at 2048 looked like a clean pass — host RSS 384 MB,
+805 MB free in-guest, in-world throughout. It was luck. Across five launches:
+**one survivor, four clients killed** as `TOP` under memory pressure, always
+during the load, always with zram exhausted (`SwapFree: 360 kB`) at the moment
+of death. At 3072 the same guest keeps 350-440 MB of zram free.
+
+**Do not re-open this on a single run.** The failure is probabilistic, and one
+sample cannot see it. That is how it got re-opened this time.
+
+### What an instance costs, and what actually fits
+
+Six PS99 farming instances, `-m 3072`, through the executor's own argv:
+
+```
+commit     4065 MB   mean marginal across six (QEMU alone: 3777-4009 MB)
+RAM         384 MB   resident, exactly, on every governed instance
+CPU          50%     of one core — 44-51% observed, the job cap never slipped
+launch    165.8 s    mean (139-187 s)
+scratch     1.3 GB   ephemeral overlay (the planner budgets 2.0)
+```
+
+⚠ **`COMMIT_OVERHEAD_MB = 192` understates the real cost by 4x.** It was
+measured against a PAUSED QEMU with no guest — the source says so and calls it
+a floor, and then `instance_capacity` uses it as the cost. A live in-world
+instance's QEMU holds ~825 MB beyond its `-m`.
+
+| pagefile | commit limit | instances (host lean) | (host as-is) | disk left | scratch@30 |
+|---|---|---|---|---|---|
+| 30 GB (today) | 63 GB | 13 | 10 | 111 GB | 41 GB |
+| **80 GB** | 113 GB | **25** | 21 | 61.5 GB | 41 GB |
+| 96 GB | 129 GB | 29 | 25 | 45.5 GB | 41 GB |
+| 100 GB | 133 GB | 30 | 26 | 41.5 GB | **no margin** |
+
+**30 is not reachable on this box.** The pagefile that buys the commit takes
+the disk the scratch needs, and the two meet at 30 with nothing left over.
+"Host lean" is worth about four instances on its own — the desktop baseline
+was 25.3 GB of commit, of which Opera alone is 7.4 GB across 62 processes.
+
+### THE OPEN ONE: instances die about 15 minutes in
+
+The costs above hold. Survival does not. Over a 20-minute watch of six:
+
+```
+farm2   survived      0 deaths   guest headroom 1236 MB
+farm3   survived      0 deaths   guest headroom 1306 MB   <- the only one still in-world
+farm9   died t+892s   1 death    guest headroom  680 MB
+farm8   died t+919s   2 deaths   guest headroom  693 MB
+farm6   died t+931s   2 deaths   guest headroom  709 MB
+farm7   died in load  launch correctly reported client_not_running
+```
+
+The three timed deaths cluster at 892-931 s measured from each instance's OWN
+launch, and they split perfectly on guest headroom: everything with ~700 MB
+free inside the guest died at ~15 minutes; everything with ~1250 MB lived.
+
+The two survivors were launched into an empty box. The three that died were
+loading while other instances were also loading, took longer, and finished
+with about half the headroom. **The hypothesis to test next is serialising
+launches** — `pool_boot_slot` already boots one at a time for exactly this
+reason and `cmd_start` does not. NOT MEASURED YET; do not write it up as a
+finding until it is.
+
+### The warm pool stops paying full price, and farming turns it on
+
+A slot is the one instance this engine deliberately keeps running while doing
+nothing, and it was the only running instance nothing governed —
+`maybe_start_governor` is called from `cmd_start` and nowhere else. MEASURED
+across five warm slots: **575-747 MB** of host RSS each.
+
+Slots are PARKED now: the mode's own `ws_floor`, applied once when the slot
+boots, released at adoption. They deliberately do NOT get the governor. The
+governor searches because the safe floor is a property of the game and getting
+it wrong kills the client — and a slot has no client. Nothing to search for,
+nothing to lose.
+
+Parking happens BEFORE the `ready` write. From that write onward any launch
+may claim the slot, and capping a guest that has just been adopted is the
+"squeezed while loading" failure arriving from the other side.
+
+In the app, `keepWarm` is tri-state: untouched follows the MODE (farming on,
+gaming off), read at render time so switching gaming -> farming turns the pool
+on without overwriting a preference, and the toggle still stores a real
+boolean so an explicit off stays off. The pool worked and was off by default,
+which made "it always cold boots" the default experience of the mode built for
+volume — on the one host where a warm pool is the only fast path there is.
+
+### Smaller things, each of which cost real time today
+
+* **`_wipe_runtime` claimed a wipe it had not done.** Windows will not unlink
+  `governor.log` while the detached governor still holds it open, and
+  `ignore_errors=True` swallowed that — so `stop` reported
+  `runtime_wiped: true` and the NEXT launch of the same account inherited the
+  previous run's log. It retries briefly and returns what it actually managed;
+  five of six stops in the fleet run now honestly report `false`.
+* **The governor log had no timestamps in it at all.** Combined with the
+  above, a stopped instance's "THE CLIENT IS GONE" read as the live one's, and
+  cost half an hour chasing a governor bug that did not exist. Every governor
+  now opens its log with a dated banner.
+* **`runtime.cap_working_set`'s table said the client dies at a 384 MB
+  ceiling, and farming's `ws_floor` comment claimed the search settles at
+  640-760 MB.** Both were from the first pass at that measurement, both were
+  contradicted by the mode the code ships (`ws_floor: 384`) and by
+  tests/test_working_set_governor.py, and both are wrong: the search walks to
+  384 MB and holds there, client in-world, 780-810 MB free inside the guest.
+  Corrected, with the retraction kept beside the table.
+* **`pool status` reports `ws_ceiling_mb` / `ws_before_mb`**, because "the pool
+  is on" and "the pool is costing me 3.4 GB" were the same sentence.
+
 ## 2026-08-17 (later) — farming stops paying for memory it is not using
+
+⚠ The launch numbers in this section (126 s cold / 101 s warm) were measured
+through a path that reported success for dead clients and burned its full
+settle timeout on them — see the evening entry above. Treat them as
+provisional until re-measured; the honest figure on six real instances is
+165.8 s mean.
 
 **A live instance was being reported as DEAD, and that is why nothing worked.**
 `instance_live()` asked QEMU over QMP with a 0.25 s budget. QMP is served by

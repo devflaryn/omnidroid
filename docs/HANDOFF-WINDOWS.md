@@ -3,7 +3,13 @@
 Rewritten 2026-08-14, extended 2026-08-15. Everything below was **run on the
 machines named**; where something is unverified it says so.
 
-> **Continuing in a new session? Start at "PICK UP HERE" below.** The newest
+> **Continuing in a new session? Start at "NEXT SESSION STARTS HERE —
+> 2026-08-17 (late evening)".** It supersedes the block after it and carries
+> the warning that matters most: every launch-time measurement older than it
+> was taken through a path that reported success for instances whose client
+> was already dead.
+
+> **Older orientation, kept for the detail:** The newest
 > section (2026-08-17) is the window: it is on screen for the whole boot now
 > and holds the guest's aspect ratio. The 2026-08-15 work — GPU rendering, the
 > DNS block, auto-update, the Mac — is §8, and the four things still open are
@@ -60,7 +66,143 @@ Older installs still need the one manual click to get to 1.0.14. See §8.
 
 ---
 
-## NEXT SESSION STARTS HERE — 2026-08-17 (evening)
+## NEXT SESSION STARTS HERE — 2026-08-17 (late evening)
+
+**This block REPLACES the one below it**, which was written before the launch
+path was found to be reporting success for instances with no game running in
+them. Everything here was measured on this box today. **Nothing is deployed.**
+Code is committed on `gaming-gpu-window` / `slice-c-windows-exe`.
+
+### Read this before trusting any older measurement
+
+**A farming launch reported `ok: true, in_world: true` for an instance whose
+Roblox client was dead** — six minutes dead, with the launch still running.
+Three defects, all fixed today (CHANGELOG, "the launch was calling dead
+instances a success"):
+
+* `in_world` came out of the client's LOG FILE, and join markers outlive the
+  client that wrote them;
+* `start` decided success before anything watched the client — the governor
+  recorded `client_died_after_s` into run.json 11 s later, where nothing
+  surfaced it;
+* `wait_for_game_settled` burned its whole 420 s deadline on a dead process,
+  because dumpsys reads a dead package the same as a slow one.
+
+⚠ **Every launch-time reading this project has ever taken came through that
+path.** `in_world: true` in an older note is not evidence an instance was
+farming, and "126 s cold / 101 s warm" was measured on launches that happened
+to settle fast. Re-measure before quoting.
+
+### PS99 does not run at `-m 2048`. Do not re-open it on one run.
+
+The 3072 floor in `lean.GUEST_MEM_FLOOR_MB` is correct. It was re-opened here
+because it predates zram and the working-set ceiling, and one 15-minute run at
+2048 looked like a clean pass. Across five launches: **1 survivor, 4 clients
+OOM-killed**, always during the load, always with zram exhausted
+(`SwapFree: 360 kB`). The failure is probabilistic; a single sample cannot see
+it, which is exactly how a day got spent on it.
+
+### What one instance costs — and it is NOT what `doctor` thinks
+
+Six PS99 farming instances at `-m 3072`, through the executor's own argv:
+
+```
+commit     4065 MB   mean marginal across six (QEMU alone 3777-4009 MB)
+RAM         384 MB   resident, exactly, every governed instance
+CPU          50%     of one core — 44-51% observed, the cap never slipped
+launch    165.8 s    mean (139-187 s)
+scratch     1.3 GB   overlay per instance (planner budgets 2.0)
+```
+
+⚠ **`COMMIT_OVERHEAD_MB = 192` is wrong by 4x** — it was measured on a PAUSED
+QEMU with no guest (the source says so and calls it a floor), and
+`instance_capacity` then uses it as the cost. Real overhead ~825 MB. **Fixing
+this constant is the first thing on the list below.**
+
+| pagefile | limit | instances (host lean) | (host as-is) | disk left | scratch@30 |
+|---|---|---|---|---|---|
+| 30 GB (today) | 63 GB | 13 | 10 | 111 GB | 41 GB |
+| **80 GB** | 113 GB | **25** | 21 | 61.5 GB | 41 GB |
+| 96 GB | 129 GB | 29 | 25 | 45.5 GB | 41 GB |
+| 100 GB | 133 GB | 30 | 26 | 41.5 GB | **no margin** |
+
+**30 does not fit on this box.** The pagefile that buys the commit takes the
+disk the scratch needs, and they meet at 30 with nothing spare. 25 at an 80 GB
+pagefile is the honest target. The desktop baseline is worth ~4 instances by
+itself (25.3 GB of commit; Opera alone is 7.4 GB across 62 processes).
+
+**The pagefile has NOT been changed** — it needs an elevated shell and a
+reboot, and it is the user's disk. Do not raise it until the item below is
+fixed: buying commit for instances that die is buying the wrong thing.
+
+### ⚠ THE OPEN ONE: instances die about 15 minutes in
+
+The costs above hold all the way through. Survival does not. 20-minute watch,
+six instances:
+
+```
+farm2   survived      0 deaths   guest headroom 1236 MB
+farm3   survived      0 deaths   guest headroom 1306 MB  <- only one still in-world
+farm9   died t+892s   1 death    guest headroom  680 MB
+farm8   died t+919s   2 deaths   guest headroom  693 MB
+farm6   died t+931s   2 deaths   guest headroom  709 MB
+farm7   died in load  launch correctly failed: client_not_running
+```
+
+Deaths cluster at **892-931 s from each instance's OWN launch**, and split
+perfectly on guest headroom: ~700 MB free inside the guest → dead at ~15 min;
+~1250 MB → alive. All are lmkd `TOP` kills.
+
+**Hypothesis, NOT yet measured: serialise the launches.** The two survivors
+were launched into an empty box; the three that died were loading while other
+instances were loading, took longer, and ended with half the headroom.
+`pool_boot_slot` already boots one slot at a time for exactly this reason;
+`cmd_start` does not. Test it before believing it.
+
+### Do these, in this order
+
+1. **Fix `COMMIT_OVERHEAD_MB`** (192 → ~825, measured) so `doctor` and
+   `capacity_shortfall` stop under-counting by 1.8x. Everything anybody plans
+   from those numbers is currently wrong.
+2. **Test the serialised-launch hypothesis** above. Six launches with a
+   wait-for-settled gate between them; watch guest headroom at t+0 and whether
+   the ~15-minute deaths stop. This is the whole goal — "the game should
+   perform as intended, it shouldn't crash".
+3. **If headroom is the cause and serialising is not enough**, the next lever
+   is `-m 3584/4096` for PS99, and it costs instance count directly: at
+   4065 MB/instance today, every extra 512 MB is ~2 instances off the ceiling.
+4. Only then the pagefile (80 GB, script at
+   `scratchpad/set-pagefile-64g.ps1` — **re-size it to 80 GB first**, it was
+   written for the dead 2048 rung), and only then the deploy.
+5. Gaming latency numbers, and the macOS pass.
+
+### Traps that cost time today
+
+* **`OMNI_DATA_DIR` is the other half of `OMNIDROID_CONFIG_PATH`.** The config
+  path selects the IMAGES; `config.data_dir()` decides `runtime/`,
+  `accounts.json` and the scratch, and follows `OMNI_DATA_DIR` (default: the
+  repo). Set BOTH to `%LOCALAPPDATA%\OmniExec` and the repo's engine runs
+  against the app's accounts, runtime and image set. This is the fix for the
+  "two config roots" trap below — no account syncing needed.
+* **A stopped instance leaves its `governor.log` behind** (Windows will not
+  unlink a file the detached governor still holds), and until today that log
+  had no timestamps in it. A previous run's "THE CLIENT IS GONE" read as the
+  live instance's. Now dated, and `stop` reports the wipe honestly.
+* **Do not estimate elapsed time from how much work you have done.** Half an
+  hour went into a nonexistent governor bug because a launch was assumed to be
+  17 minutes old when it was 6. Read the clock.
+* **`_pidof` can exit the process.** It calls `fail()` for a portless handle,
+  which raises SystemExit, which is a BaseException and walks through its own
+  `except Exception`. Use `game_is_running()` in probes.
+* **Measure commit with `-accel whpx`** — without it QEMU reserves a ~1 GB TCG
+  buffer and every per-instance number is wrong by that much.
+* **Python output is buffered when redirected.** Use `-u`, and do not pipe a
+  long probe through `tee` — it buffers too, and the log looks like a hang.
+* **Cookies: 7 of 8 live** (`admn1b12farm4` is expired, HTTP 401). The app's
+  store at `%LOCALAPPDATA%\OmniExec\accounts.json` is the good one and now
+  holds the gaming account too.
+
+## SUPERSEDED — 2026-08-17 (evening)
 
 Read this block, then the two "PICK UP HERE" sections below for the detail.
 **Everything claimed here was measured on this box, and every code change is

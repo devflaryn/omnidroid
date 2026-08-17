@@ -356,6 +356,12 @@ def slot_state(d, now=None):
         "state": state,
         "ready_at": meta.get("ready_at"),
         "booted_s": meta.get("booted_s"),
+        # What this slot is being HELD at while it waits, and what it cost
+        # before that (engine.park_slot). Reported because "the pool is on"
+        # and "the pool is costing me 3.4 GB" were the same sentence until
+        # slots were parked, and a cap nobody can see is a cap nobody trusts.
+        "ws_ceiling_mb": meta.get("ws_ceiling_mb"),
+        "ws_before_mb": meta.get("ws_before_mb"),
         "error": meta.get("error"),
         "owner_pid": owner,
         "age_s": (None if not since
