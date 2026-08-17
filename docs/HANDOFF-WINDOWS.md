@@ -4,10 +4,12 @@ Rewritten 2026-08-14, extended 2026-08-15. Everything below was **run on the
 machines named**; where something is unverified it says so.
 
 > **Continuing in a new session? Start at "NEXT SESSION STARTS HERE —
-> 2026-08-17 (late evening)".** It supersedes the block after it and carries
-> the warning that matters most: every launch-time measurement older than it
-> was taken through a path that reported success for instances whose client
-> was already dead.
+> 2026-08-17 (night)".** It supersedes every block after it and carries the
+> warning that matters most: every launch-time measurement older than it was
+> taken through a path that reported success for instances whose client was
+> already dead — and the separate one that "the client process is running" was
+> being read as "the instance is farming", which for four of six instances was
+> false.
 
 > **Older orientation, kept for the detail:** The newest
 > section (2026-08-17) is the window: it is on screen for the whole boot now
@@ -66,58 +68,108 @@ Older installs still need the one manual click to get to 1.0.14. See §8.
 
 ---
 
-## NEXT SESSION STARTS HERE — 2026-08-17 (late evening)
+## NEXT SESSION STARTS HERE — 2026-08-17 (night)
 
-**This block REPLACES the one below it**, which was written before the launch
-path was found to be reporting success for instances with no game running in
-them. Everything here was measured on this box today. **Nothing is deployed.**
-Code is committed on `gaming-gpu-window` / `slice-c-windows-exe`.
+Read this block, then stop and read the two ⚠ items before you run anything. It REPLACES the
+earlier 2026-08-17 blocks, which were written before the launch path was found to be reporting
+success for instances with no game running in them.
 
-### Read this before trusting any older measurement
+**Deployed.** `app-win 1.0.19` is live and verified end to end (see "What shipped"). Branches:
+`omnidroid@8e1add7` on `gaming-gpu-window`, `omni-executor@33b04f5` on `slice-c-windows-exe`,
+`omni-backend@acc1b39` on `slice-c-win-artifacts`. All pushed, all in sync.
 
-**A farming launch reported `ok: true, in_world: true` for an instance whose
-Roblox client was dead** — six minutes dead, with the launch still running.
-Three defects, all fixed today (CHANGELOG, "the launch was calling dead
-instances a success"):
+---
 
-* `in_world` came out of the client's LOG FILE, and join markers outlive the
-  client that wrote them;
-* `start` decided success before anything watched the client — the governor
-  recorded `client_died_after_s` into run.json 11 s later, where nothing
-  surfaced it;
-* `wait_for_game_settled` burned its whole 420 s deadline on a dead process,
-  because dumpsys reads a dead package the same as a slow one.
+### ⚠ 1. DO NOT TRUST ANY LAUNCH-TIME MEASUREMENT OLDER THAN THIS BLOCK
 
-⚠ **Every launch-time reading this project has ever taken came through that
-path.** `in_world: true` in an older note is not evidence an instance was
-farming, and "126 s cold / 101 s warm" was measured on launches that happened
-to settle fast. Re-measure before quoting.
+Every reading this project has ever taken came through a path that reported
+`ok: true, in_world: true` for instances whose Roblox client was dead. Three defects, all now
+fixed:
 
-### PS99 does not run at `-m 2048`. Do not re-open it on one run.
+* `in_world` was read out of the client's LOG FILE. Join markers are real and they outlive the
+  client that wrote them — and they also scroll out of a 400-line tail within minutes, so the
+  probe was wrong in BOTH directions. It reported `in_world: False` for two instances that were
+  visibly playing and `error: None` for three with a 279 dialog on screen.
+* `start` decided success before anything watched the client. The governor wrote
+  `client_died_after_s: 11` into run.json afterwards, where nothing surfaced it.
+* `wait_for_game_settled` burned its whole 420 s deadline waiting for a dead process to
+  plateau, because dumpsys reads a dead package the same as a slow one. That alone was the
+  difference between a 478 s launch and a 151 s one.
 
-The 3072 floor in `lean.GUEST_MEM_FLOOR_MB` is correct. It was re-opened here
-because it predates zram and the working-set ceiling, and one 15-minute run at
-2048 looked like a clean pass. Across five launches: **1 survivor, 4 clients
-OOM-killed**, always during the load, always with zram exhausted
-(`SwapFree: 360 kB`). The failure is probabilistic; a single sample cannot see
-it, which is exactly how a day got spent on it.
+So "126 s cold / 101 s warm" and every `in_world: true` in an older section are not evidence.
+The honest launch figure on six real instances is **165.8 s mean** (139-197 s).
 
-### What one instance costs — and it is NOT what `doctor` thinks
+### ⚠ 2. RUNNING IS NOT PLAYING, AND ONLY CPU CAN TELL
+
+Screenshots of six farming instances, against every reading the engine takes:
+
+```
+farm8  utime 301  ~109%   in PS99, pets and currency on screen
+farm9  utime 388  ~143%   in PS99
+farm7  utime  29   ~35%   "restart the game" prompt over the world
+farm2  utime  29   ~30%   "Connection Failed (Error Code: 279)"
+farm3  utime  21   ~30%   same
+farm6  utime  13   ~31%   same
+```
+
+**Four of six were farming nothing** while reporting a perfect 384 MB resident and 50% of a
+core. `pidof` finds a process either way. Use `engine.client_is_playing()` (USER time ≥60% of
+one core — system time is ~60-80 jiffies either way, so a total-CPU threshold collapses a 10x
+gap into 3x). It is wired into the governor and recorded as `client_idle_since` in run.json.
+
+**`list` and the app UI do not surface it yet** — a row can still look green for an instance
+farming nothing. That is the cheapest remaining win.
+
+The 279s on this box are **the user's own network** — they said to skip them. Do not spend time
+on MTU: guest eth0 is 1500, host is 1500, and no VPN adapter was up.
+
+---
+
+### ⚠ 3. THE OPEN ONE: an instance that actually farms dies 10-15 minutes in
+
+The costs hold all the way through. Survival does not. Two fleet runs, and once you separate
+playing from stuck the pattern is one thing:
+
+```
+                      guest headroom   outcome
+genuinely playing      660-710 MB      OOM-killed (lmkd TOP) at 10-15 min
+stuck on a dialog     1190-1260 MB     never dies
+```
+
+Run 1 (unserialised, 20 min): 3 timed deaths at 892-931 s measured from each instance's OWN
+launch, plus one killed during load. Run 2 (serialised, settle-gated): `farm8` — one of the
+only two genuinely playing — OOM-killed at t+673 s.
+
+**Serialising launches was tested and did NOT fix it.** `farm8` loaded into a quiet box with
+nothing else settling, settled cleanly at 384 MB, and still died. The headroom correlation is
+real but the causation runs the other way: *actually rendering the game* causes both the low
+headroom and the death. Low headroom does not cause it.
+
+⚠ Do not re-read run 1 as "2 survived, 3 died". The two "survivors" were in the same headroom
+band as the 279 dialogs and were almost certainly not playing. The instances that were working
+are the ones that died.
+
+**Next lever: `-m 3584` then `4096` for PS99** (`lean.GUEST_MEM_FLOOR_MB`). It costs ceiling
+directly — about 2 instances per extra 512 MB at 4065 MB of commit each. Measure with
+`client_is_playing`, not `pidof`, or you will measure dialogs again.
+
+---
+
+### What one instance costs, and what actually fits
 
 Six PS99 farming instances at `-m 3072`, through the executor's own argv:
 
 ```
 commit     4065 MB   mean marginal across six (QEMU alone 3777-4009 MB)
 RAM         384 MB   resident, exactly, every governed instance
-CPU          50%     of one core — 44-51% observed, the cap never slipped
-launch    165.8 s    mean (139-187 s)
-scratch     1.3 GB   overlay per instance (planner budgets 2.0)
+CPU          50%     of one core — 44-51% observed, the job cap never slipped
+launch    165.8 s    mean (139-197 s)
+scratch     1.3 GB   ephemeral overlay per instance (planner budgets 2.0)
 ```
 
-⚠ **`COMMIT_OVERHEAD_MB = 192` is wrong by 4x** — it was measured on a PAUSED
-QEMU with no guest (the source says so and calls it a floor), and
-`instance_capacity` then uses it as the cost. Real overhead ~825 MB. **Fixing
-this constant is the first thing on the list below.**
+`COMMIT_OVERHEAD_MB` was **192 and wrong by 4x** — measured on a PAUSED QEMU with no guest, and
+then used as the cost. Now 1024, from the measured 993. `doctor` says 8 fit at `-m 3072` where
+it used to say 11, and no longer promises 30 at `-m 1024`.
 
 | pagefile | limit | instances (host lean) | (host as-is) | disk left | scratch@30 |
 |---|---|---|---|---|---|
@@ -126,83 +178,89 @@ this constant is the first thing on the list below.**
 | 96 GB | 129 GB | 29 | 25 | 45.5 GB | 41 GB |
 | 100 GB | 133 GB | 30 | 26 | 41.5 GB | **no margin** |
 
-**30 does not fit on this box.** The pagefile that buys the commit takes the
-disk the scratch needs, and they meet at 30 with nothing spare. 25 at an 80 GB
-pagefile is the honest target. The desktop baseline is worth ~4 instances by
-itself (25.3 GB of commit; Opera alone is 7.4 GB across 62 processes).
+**30 does not fit on this box.** The pagefile that buys the commit takes the disk the scratch
+needs. 25 at an 80 GB pagefile is the honest target. The desktop baseline is worth ~4
+instances by itself (25.3 GB of commit; Opera alone is 7.4 GB across 62 processes) — close it
+before a fleet run.
 
-**The pagefile has NOT been changed** — it needs an elevated shell and a
-reboot, and it is the user's disk. Do not raise it until the item below is
-fixed: buying commit for instances that die is buying the wrong thing.
+**The pagefile has NOT been changed.** Script ready at
+`<scratch>/set-pagefile-80g.ps1`; needs an elevated shell and a reboot. Do not run it until
+item 3 is fixed — buying commit for instances that die is buying the wrong thing.
 
-### ⚠ THE OPEN ONE: instances die about 15 minutes in
+### PS99 does not run at `-m 2048`. Do not re-open it on one run.
 
-The costs above hold all the way through. Survival does not. 20-minute watch,
-six instances:
+Re-opened here because the 3072 floor predates zram and the working-set ceiling, and one
+15-minute run at 2048 looked like a clean pass (384 MB resident, 805 MB free in-guest,
+in-world throughout). It was luck. Across five launches: **1 survivor, 4 clients OOM-killed**,
+always during the load, always with zram exhausted (`SwapFree: 360 kB`). At 3072 the same
+guest keeps 350-440 MB of zram free. The failure is probabilistic; one sample cannot see it.
 
-```
-farm2   survived      0 deaths   guest headroom 1236 MB
-farm3   survived      0 deaths   guest headroom 1306 MB  <- only one still in-world
-farm9   died t+892s   1 death    guest headroom  680 MB
-farm8   died t+919s   2 deaths   guest headroom  693 MB
-farm6   died t+931s   2 deaths   guest headroom  709 MB
-farm7   died in load  launch correctly failed: client_not_running
-```
+### What shipped in 1.0.19
 
-Deaths cluster at **892-931 s from each instance's OWN launch**, and split
-perfectly on guest headroom: ~700 MB free inside the guest → dead at ~15 min;
-~1250 MB → alive. All are lmkd `TOP` kills.
+* a launch with no game process fails (`client_not_running`) instead of claiming success;
+* `in_world` needs a live process, not just markers in a log;
+* `wait_for_game_settled` stops when the game is gone;
+* the governor tells playing from merely running, and records `client_idle_since`;
+* farming warms the pool by default (`keepWarm` is tri-state: untouched follows the mode);
+* warm pool slots are parked at farming's `ws_floor` (were 575-747 MB each), released at
+  adoption, capped **before** the `ready` write so a slot is never claimable while uncapped;
+* `COMMIT_OVERHEAD_MB` 192 → 1024;
+* `_wipe_runtime` retries and reports what it actually removed.
 
-**Hypothesis, NOT yet measured: serialise the launches.** The two survivors
-were launched into an empty box; the three that died were loading while other
-instances were loading, took longer, and ended with half the headroom.
-`pool_boot_slot` already boots one slot at a time for exactly this reason;
-`cmd_start` does not. Test it before believing it.
+Verified against the live endpoint, not the publish script's own output: `manifest?os=win`
+serves 1.0.19; the blob downloads to 43,870,511 bytes hashing `ba7b9ddb…4abc`, matching the
+registry; the zip is intact with root `omni-exec`. Then the published
+`OmniExecutorSetup.exe` was downloaded and **actually run** (`--silent --no-launch`): exit 0,
+installed to `%LOCALAPPDATA%\Programs\OmniExecutor`, shortcuts made, all 8 accounts preserved,
+and the installed binary's engine dispatch smoke-tested to exit 0 (that is the check that
+catches the Mark-of-the-Web failure).
 
 ### Do these, in this order
 
-1. **Fix `COMMIT_OVERHEAD_MB`** (192 → ~825, measured) so `doctor` and
-   `capacity_shortfall` stop under-counting by 1.8x. Everything anybody plans
-   from those numbers is currently wrong.
-2. **Test the serialised-launch hypothesis** above. Six launches with a
-   wait-for-settled gate between them; watch guest headroom at t+0 and whether
-   the ~15-minute deaths stop. This is the whole goal — "the game should
-   perform as intended, it shouldn't crash".
-3. **If headroom is the cause and serialising is not enough**, the next lever
-   is `-m 3584/4096` for PS99, and it costs instance count directly: at
-   4065 MB/instance today, every extra 512 MB is ~2 instances off the ceiling.
-4. Only then the pagefile (80 GB, script at
-   `scratchpad/set-pagefile-64g.ps1` — **re-size it to 80 GB first**, it was
-   written for the dead 2048 rung), and only then the deploy.
-5. Gaming latency numbers, and the macOS pass.
+1. **Fix item 3** — `-m 3584`, then `4096` if needed. Measure survival with
+   `client_is_playing` over 30+ minutes. This is the goal; nothing else matters until farming
+   instances stay alive.
+2. **Surface `client_idle_since` in `list` and the app row.** The engine knows; the UI does
+   not show it. Cheap, and it stops the product lying to the user the way it lied to us.
+3. Re-measure the launch ladder on fixed code — the cold/warm numbers in older sections were
+   taken through the broken settle path.
+4. Then the pagefile (80 GB), then gaming latency, then the macOS pass.
+5. Consider merging these branches down to `main`: it is the default branch on all four repos
+   and is 23-67 commits stale on three of them, so a fresh clone lands on old code silently.
 
-### Traps that cost time today
+### Traps that cost real time today
 
-* **`OMNI_DATA_DIR` is the other half of `OMNIDROID_CONFIG_PATH`.** The config
-  path selects the IMAGES; `config.data_dir()` decides `runtime/`,
-  `accounts.json` and the scratch, and follows `OMNI_DATA_DIR` (default: the
-  repo). Set BOTH to `%LOCALAPPDATA%\OmniExec` and the repo's engine runs
-  against the app's accounts, runtime and image set. This is the fix for the
-  "two config roots" trap below — no account syncing needed.
-* **A stopped instance leaves its `governor.log` behind** (Windows will not
-  unlink a file the detached governor still holds), and until today that log
-  had no timestamps in it. A previous run's "THE CLIENT IS GONE" read as the
-  live instance's. Now dated, and `stop` reports the wipe honestly.
-* **Do not estimate elapsed time from how much work you have done.** Half an
-  hour went into a nonexistent governor bug because a launch was assumed to be
+* **`OMNI_DATA_DIR` is the other half of `OMNIDROID_CONFIG_PATH`.** The config path selects the
+  IMAGES; `config.data_dir()` decides `runtime/`, `accounts.json` and the scratch, and follows
+  `OMNI_DATA_DIR` (default: the repo). Set BOTH to `%LOCALAPPDATA%\OmniExec` and the repo's
+  engine runs against the app's accounts, runtime and image set. This dissolves the "two config
+  roots" trap below — no account syncing needed.
+* **A stopped instance leaves its `governor.log` behind** (Windows will not unlink a file the
+  detached governor still holds) and until today that log had no timestamps in it. A previous
+  run's "THE CLIENT IS GONE" read as the live instance's and cost half an hour on a governor
+  bug that did not exist. Now dated, and `stop` reports the wipe honestly.
+* **Do not estimate elapsed time from how much work you have done.** A launch was assumed to be
   17 minutes old when it was 6. Read the clock.
-* **`_pidof` can exit the process.** It calls `fail()` for a portless handle,
-  which raises SystemExit, which is a BaseException and walks through its own
-  `except Exception`. Use `game_is_running()` in probes.
-* **Measure commit with `-accel whpx`** — without it QEMU reserves a ~1 GB TCG
-  buffer and every per-instance number is wrong by that much.
-* **Python output is buffered when redirected.** Use `-u`, and do not pipe a
-  long probe through `tee` — it buffers too, and the log looks like a hang.
-* **Cookies: 7 of 8 live** (`admn1b12farm4` is expired, HTTP 401). The app's
-  store at `%LOCALAPPDATA%\OmniExec\accounts.json` is the good one and now
-  holds the gaming account too.
+* **`_pidof` can exit the process.** It calls `fail()` for a portless handle, which raises
+  SystemExit — a BaseException, so it walks straight through its own `except Exception`. Use
+  `game_is_running()` / `client_is_playing()` in probes, and keep them three-state: None must
+  mean "could not ask", never "dead".
+* **A probe added to a poll loop costs a round trip per poll.** Asking `pidof` on every settle
+  iteration added ~80 s to every launch (151 → 234 s). A PSS reading is already proof of life;
+  only spend the extra call when there is no reading.
+* **Measure commit with `-accel whpx`** — without it QEMU reserves a ~1 GB TCG buffer.
+* **Python output is buffered when redirected.** Use `-u`, and do not pipe a long probe through
+  `tee` — it buffers too, and the log looks like a hang for ten minutes.
+* **Cookies: 7 of 8 live.** `admn1b12farm4` is expired (HTTP 401). The good store is
+  `%LOCALAPPDATA%\OmniExec\accounts.json` and it now holds the gaming account too.
+* **`installed.json`'s `app_version` is a stale first-boot record** (reads 1.0.13). The updater
+  compares against the `APP_VERSION` compiled into the binary. Do not debug from that field.
 
 ## SUPERSEDED — 2026-08-17 (evening)
+
+⚠ **Kept for its measurement history only.** Two claims below are now false: "Nothing is
+deployed" (1.0.19 shipped that night) and the survival readings, which counted client
+PROCESSES rather than clients in a game. Read the night block above for both.
 
 Read this block, then the two "PICK UP HERE" sections below for the detail.
 **Everything claimed here was measured on this box, and every code change is
