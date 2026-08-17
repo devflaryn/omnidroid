@@ -80,12 +80,43 @@ skipped, and a client that dies is recorded into run.json
 All measured through the executor's own argv, with auto-login and auto-join on
 PS99 (place `8737899170`), `in_world: true` every run.
 
-**`doctor` now says how many instances fit and which wall is in the way.**
-Four walls, and on Windows it is usually not the RAM everybody plans for. On
-this box, per farming instance at `-m 3072`: ram 42, cpu 48, disk 13,
-**commit 10**. Windows charges the whole `-m` against RAM+pagefile whether the
-guest touches it or not and no governor can reduce it, so the lever for a
-bigger fleet is a bigger pagefile — not more RAM.
+**`doctor` now says how many instances fit, which wall is in the way, and what
+it would take to move it.** Four walls, and on Windows it is usually not the
+RAM everybody plans for — the governors made RAM and CPU cheap, which moved the
+wall to **commit**.
+
+Commit measured against a paused QEMU (the floor), and the accelerator matters:
+
+```
+-m 1024 whpx, -display none      1065 MB commit   (+41)
+-m 2048 whpx, -display none      2092 MB          (+44)
+-m 3072 whpx, -display none      3117 MB          (+45)
+-m 3072 whpx + gtk,gl=on         3258 MB         (+186)
+```
+
+⚠ The same probe **without `-accel whpx`** reads +1070 MB, because TCG reserves
+a ~1 GB translation buffer by default. That is an artifact of the probe, not a
+cost of an instance, and it is why `COMMIT_OVERHEAD_MB` carries the numbers and
+a warning rather than a rule of thumb. `memory-backend-ram,reserve=off` — which
+would move guest RAM off the commit limit entirely — **is not in this build**
+(`Property 'memory-backend-ram.reserve' not found`), so commit tracks `-m` at
+1:1 and there is no way around it in QEMU.
+
+Because it tracks `-m` 1:1, `-m` is the one lever entirely in the launcher's
+hands, and `capacity_ladder` reports what each size buys. On this box:
+
+| `-m` | instances | wall |
+|---|---|---|
+| 3072 | 9 | commit |
+| 2048 | 13 | commit |
+| 1536 | 13 | **disk** |
+| 1024 | 13 | **disk** |
+
+— so below 2048 shrinking the guest buys nothing, because the scratch reserve
+takes over. `capacity_shortfall(30)` turns that into a shopping list rather
+than a refusal: at `-m 2048`, **35 GB short on commit and 31 GB short on
+disk**. Both are disk (the pagefile lives there too), so the answer is "free
+~66 GB and raise the pagefile", not "buy more RAM".
 
 ## 2026-08-17 — the window is up for the boot, and it keeps the guest's shape
 

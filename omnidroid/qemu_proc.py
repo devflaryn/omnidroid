@@ -2578,9 +2578,19 @@ def mem_args(mode, mem):
 # and the fix is disk: a bigger pagefile.
 
 # What one instance costs beyond `-m`, in MB of commit: QEMU itself, its
-# threads, the GL context. Measured at ~90 MB; rounded up because a capacity
-# estimate that is too optimistic is the one that hurts.
-COMMIT_OVERHEAD_MB = 128
+# threads, the GL context. MEASURED on a paused QEMU (no guest running, so
+# this is the floor):
+#
+#     -m 1024 whpx, -display none      1065 MB   (+41)
+#     -m 2048 whpx, -display none      2092 MB   (+44)
+#     -m 3072 whpx, -display none      3117 MB   (+45)
+#     -m 3072 whpx + gtk,gl=on         3258 MB   (+186)
+#
+# So commit tracks `-m` at 1:1 with a small constant, and the constant is the
+# GL display rather than the guest. ⚠ MEASURE THIS WITH `-accel whpx`: the
+# same probe without it reads +1070 MB, because TCG reserves a ~1 GB
+# translation buffer by default and that has nothing to do with an instance.
+COMMIT_OVERHEAD_MB = 192
 
 
 def _commit_status_mb():
@@ -2669,6 +2679,58 @@ def instance_capacity(mode=None, cfg=None, mem_mb=None):
     binding = min(counted, key=counted.get)
     return {"walls": walls, "fits": counted[binding], "binding": binding,
             "mode": mode.get("name"), "mem_mb": mem}
+
+
+def capacity_ladder(mode=None, cfg=None, want=30,
+                    sizes=(3072, 2048, 1536, 1024)):
+    """How many instances fit at each `-m`, so "how do I get to 30" has an
+    answer rather than only "you cannot".
+
+    Commit tracks `-m` at 1:1 (COMMIT_OVERHEAD_MB), so this is the one lever
+    that is entirely in the launcher's hands -- everything else needs disk or
+    a different machine. Returns [{mem_mb, fits, binding}], smallest guest
+    last, plus the first size that reaches `want`.
+    """
+    rungs = []
+    for mem in sizes:
+        report = instance_capacity(mode, cfg, mem_mb=mem)
+        rungs.append({"mem_mb": mem, "fits": report.get("fits"),
+                      "binding": report.get("binding")})
+    reaches = next((r["mem_mb"] for r in rungs
+                    if (r["fits"] or 0) >= want), None)
+    return {"want": want, "rungs": rungs, "reaches_want_at_mem_mb": reaches}
+
+
+def capacity_shortfall(want, mode=None, cfg=None, mem_mb=None):
+    """What it would take to run `want` instances: the gap on every wall.
+
+    "You cannot" is not an answer anybody can act on. This turns the walls
+    into a shopping list -- how much more commit, how much more disk, how much
+    more RAM -- so the question becomes "free 90 GB and raise the pagefile"
+    rather than "buy a bigger computer".
+
+    Returns {wall: {have, need, short}} in MB, plus a `lines` list of prose.
+    """
+    mode = mode or MODES.get("farming") or {}
+    mem = int(mem_mb or mode.get("mem") or 2048)
+    report = instance_capacity(mode, cfg, mem_mb=mem)
+    gaps, lines = {}, []
+    for wall, w in (report.get("walls") or {}).items():
+        each = w.get("each_mb") or w.get("each_pct")
+        if wall == "cpu":
+            have, need = w["cores"] * 100, want * w["each_pct"]
+        else:
+            have, need = w["free_mb"], want * each
+        gaps[wall] = {"have_mb": have, "need_mb": need,
+                      "short_mb": max(0, need - have)}
+    for wall, g in sorted(gaps.items(), key=lambda kv: -kv[1]["short_mb"]):
+        if not g["short_mb"]:
+            continue
+        lines.append(f"{wall}: {g['short_mb'] // 1024 or 1} GB short "
+                     f"({g['need_mb'] // 1024} GB needed, "
+                     f"{g['have_mb'] // 1024} GB free)")
+    return {"want": want, "mem_mb": mem, "gaps": gaps, "lines": lines,
+            "fits_now": report.get("fits")}
 
 
 def capacity_advice(report):

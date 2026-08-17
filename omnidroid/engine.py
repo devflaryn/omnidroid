@@ -5907,6 +5907,13 @@ def install_readiness():
         advice = capacity_advice(capacity)
         if advice:
             rep["capacity_hint"] = advice
+        # ...and what it would take to run MORE. "You cannot" is not an answer
+        # anybody can act on; "free 66 GB and raise the pagefile" is. The
+        # ladder is here because `-m` is the one lever entirely in the
+        # launcher's hands -- commit tracks it 1:1.
+        rep["capacity_ladder"] = capacity_ladder(MODES.get("farming"), raw)
+        rep["capacity_for_30"] = capacity_shortfall(
+            30, MODES.get("farming"), raw)
     except Exception:      # noqa: BLE001 - a report never fails the report
         pass
     if not qemu_ok:
