@@ -4,12 +4,16 @@ Rewritten 2026-08-14, extended 2026-08-15. Everything below was **run on the
 machines named**; where something is unverified it says so.
 
 > **Continuing in a new session? Start at "NEXT SESSION STARTS HERE —
-> 2026-08-17 (night)".** It supersedes every block after it and carries the
-> warning that matters most: every launch-time measurement older than it was
-> taken through a path that reported success for instances whose client was
-> already dead — and the separate one that "the client process is running" was
-> being read as "the instance is farming", which for four of six instances was
-> false.
+> 2026-08-18".** It is short: two farming defects found, fixed and shipped as
+> `app-win 1.0.20` — the in-guest executor never finished starting (so no
+> OMNI-EXEC menu, ever) and the launch was putting Android's "restart this app
+> for a better view" prompt over the game itself. Then read the
+> 2026-08-17 (night) block, which it does NOT replace and which carries the
+> warning that matters most: every launch-time measurement older than that
+> block was taken through a path that reported success for instances whose
+> client was already dead — and the separate one that "the client process is
+> running" was being read as "the instance is farming", which for four of six
+> instances was false.
 
 > **Older orientation, kept for the detail:** The newest
 > section (2026-08-17) is the window: it is on screen for the whole boot now
@@ -68,9 +72,123 @@ Older installs still need the one manual click to get to 1.0.14. See §8.
 
 ---
 
-## NEXT SESSION STARTS HERE — 2026-08-17 (night)
+## NEXT SESSION STARTS HERE — 2026-08-18
 
-Read this block, then stop and read the two ⚠ items before you run anything. It REPLACES the
+Read this block first. It ADDS to the 2026-08-17 (night) block below rather than replacing it:
+every ⚠ there still stands. What changed is that **two of the symptoms that block records as
+unexplained now have root causes, and both are fixed, verified and deployed.**
+
+**Deployed.** `app-win 1.0.20` is live and verified: the blob downloads from
+`http://72.62.59.232/omni/dist/blob/app-win` with the sha256 in the registry
+(`66b05c01…`), and the live manifest serves `app.version 1.0.20`. Branches — all pushed:
+`omnidroid@68b3731` on `gaming-gpu-window`, `omni-executor@6b45be1` on
+`slice-c-windows-exe`, `omni-backend@2594a8a` on `slice-c-win-artifacts`.
+
+**Verified against the FROZEN build, not just the source.** A farming boot straight out of
+`omni-executor/dist-1020/omni-exec` reports **3 vCPUs inside the guest** (1.0.19 gave 2),
+prints the new pre-launch panel step, and leaves `dumpsys` with no `letterboxReason` and no
+`mSizeCompatScale`. Do not skip this check on the next release — the engine is frozen in from a
+sibling checkout at build time, so "the source is fixed" and "the shipped exe is fixed" are
+genuinely different claims.
+
+**`omni-exec-win-1.0.19.zip` was deliberately NOT deleted**, though `push-app.mjs` reports it
+as unreferenced. It is the rollback for a release that has only just gone out. Clear it — and
+`1.0.16`–`1.0.18`, which were never cleaned up — once 1.0.20 has had some time in users' hands:
+
+```bash
+python scripts/vps.py run "rm -f /root/omni-backend/dist/blobs/omni-exec-win-1.0.1{6,7,8,9}.zip"
+```
+
+### What was wrong, and how it was found
+
+Farming had two defects that gaming never had. Both were reproduced on a live PS99 instance on
+this box, and both were fixed and then re-verified end to end with **no flags**.
+
+**1. The OMNI-EXEC menu never loaded in farming — `smp_x86` was 2, it is 3 now.**
+
+A farming instance joined, farmed and looked perfect while the in-guest executor had silently
+never finished starting. No menu, no auto-exec, ever. This is invisible from outside: the
+executor writes **nothing** to logcat and **nothing** to Roblox's client log, and
+`files/exe/` holds only `ssl/cacert.pem` whether it worked or not — so "stalled" and "never
+installed" are the same picture.
+
+**The technique that cracked it is worth keeping.** Capture the executor's own HTTP chain
+*inside* the guest — `adb shell` is uid 0 on the x86 base and the guest ships `tcpdump`:
+
+```bash
+adb -s 127.0.0.1:<port> shell "setsid tcpdump -i eth0 -s 0 \
+    -w /data/local/tmp/exec.pcap host 72.62.59.232 </dev/null >/dev/null 2>&1 &"
+# `nohup ... &` does NOT survive the shell exiting. `setsid` does.
+# Pull it with MSYS_NO_PATHCONV=1, or Git Bash rewrites the guest path.
+```
+
+The chain is 11 font fetches → `Costumers/arceus.lua` → `/gist` (the menu) →
+`/omni/exec/claim` → a 1 Hz poll. Same account, place and offset:
+
+| farming `smp_x86` | capture |
+| --- | --- |
+| **2** (was) | 3 fonts in 11 s, then **nothing for the rest of the session** |
+| **3** (now) | all 11 fonts → `arceus.lua` → `/gist` → claim → polling; menu on screen |
+| 4 | same, ~5 s sooner — not worth a fourth vCPU across a fleet |
+
+The stall is ~85 s **before** the squeeze runs, so the squeeze is not the cause, and
+`--quality balanced` does not help, so it is not the 5 fps tick either. The executor's startup
+simply loses its race with the place load on two translated vCPUs.
+
+**2. "Tap to restart this app for a better view." — this is `farm7` in ⚠ 2 below.**
+
+That block records `farm7 ... "restart the game" prompt over the world` as one of the four
+instances farming nothing. It is not a Roblox prompt and not a network problem: it is
+**Android's size-compat restart button**, and the launch put it there itself.
+
+The squeeze runs after the client has loaded, so its `wm size` / `wm density` landed on a
+**running** Roblox — whose activity is `RESIZE_MODE_UNRESIZEABLE`. Android cannot re-lay it
+out, so it size-compats it:
+
+```
+mSizeCompatScale=0.5584416   mSizeCompatBounds=Rect(62, 0 - 419, 258)
+areBoundsLetterboxed=true    letterboxReason=SIZE_COMPAT_MODE
+```
+
+— a client that launched at 640x480 still rendering 640x462 and being squashed into 357x258 of
+a 480x270 screen, with the prompt on top. Proven by **intervention**, not inference: on a live
+*gaming* instance with no prompt on screen, one `wm size 480x270` + `wm density 80` produced it
+within 20 s, same pid, no relaunch.
+
+The panel is now `farming.build_display_sequence`, applied by `engine.apply_farming_display` in
+the density branch of `_ensure_booted` — **before the session is delivered**, while there is no
+client to disturb. That is the slot gaming has always used for its own `wm size reset`; farming
+was the odd one out. Side benefit: the client renders 480x270 instead of 640x462, 39% fewer
+pixels. Everything else in the squeeze still waits for the load, and `OMNI_FARM_SKIP=display`
+still means "do not touch the panel".
+
+### Verified after the fix (farming, no flags)
+
+* `dumpsys activity activities` → **no** `letterboxReason`, **no** `mSizeCompatScale`
+* in-guest capture → full exec chain, **62 polls**
+* screenshot → full-bleed 480x270, no letterbox bars, **OE button on screen**
+
+### What this does NOT settle
+
+* **Fleet density at 3 vCPUs is not re-measured.** The third vCPU should be close to free at
+  steady state — `cpu_ceiling_pct: 50` caps the whole QEMU *process* at half a core once the
+  client has loaded, per-process rather than per-vCPU — but the instances-per-host number in
+  the capacity ladder was taken at 2. If density regresses, `smp_x86` is the knob, and **2 is
+  known to disable the executor**, so it cannot simply go back.
+* **⚠ 3 below (instances dying 10-15 min in) is untouched.** One of the six instances in ⚠ 2
+  is now explained (`farm7`), and the three 279s were already attributed to the user's network.
+  Whether the size-compat prompt was also *causing* deaths rather than just sitting on top of
+  them was not tested.
+* 8 test files fail on this box (`test_accounts`, `test_offsets`, `test_warmcache`, …). They
+  fail **identically on a pristine checkout** — verified with `git stash`. They want real
+  images/accounts this box does not have. Do not read them as a regression.
+
+---
+
+## SUPERSEDED HEADER — 2026-08-17 (night)
+
+Still current for everything except the two defects above. Read this block, then stop and read
+the two ⚠ items before you run anything. It REPLACES the
 earlier 2026-08-17 blocks, which were written before the launch path was found to be reporting
 success for instances with no game running in them.
 
