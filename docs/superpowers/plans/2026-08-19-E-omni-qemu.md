@@ -991,6 +991,16 @@ static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
      * block in QEMU would look like it had one. NULL is the natural zero. */
     block->omni_ram_file = fh;
 
+    /* MUST be set. qemu_anon_ram_alloc sets it (util/oslib-win32.c:64-66) and
+     * skipping it leaves mr->align == 0, at which point
+     * hw/mem/memory-device.c:384 evaluates QEMU_IS_ALIGNED(size, 0) -- an
+     * integer divide by zero. MEASURED: with this line absent, a QMP
+     * `device_add pc-dimm` killed the process with 0xC0000094
+     * (STATUS_INTEGER_DIVIDE_BY_ZERO), no message, socket reset. That is a
+     * live path here: engine.plug_mem hot-plugs 512 MB DIMMs. 64 KiB is also
+     * what MapViewOfFile actually guarantees, so the value is honest. */
+    block->mr->align = MAX(get_allocation_granularity(), getpagesize());
+
     return addr;
 }
 #endif /* _WIN32 */
@@ -1022,14 +1032,47 @@ Then the call site, inside `ram_block_add`, replacing the `else` arm at
 ```
 
 Add near the top of `system/physmem.c`, with the other `#ifdef _WIN32`
-includes:
+includes — `<winioctl.h>` only. Do **not** add `<io.h>`: nothing here uses
+`_open_osfhandle`, and an include commented for it misleads the next reader
+into thinking a file descriptor is involved, which is the exact confusion the
+`void *` field exists to prevent.
 
 ```c
 #ifdef _WIN32
-#include <io.h>          /* _open_osfhandle */
-#include <winioctl.h>    /* FSCTL_SET_SPARSE */
+#include <winioctl.h>    /* FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA */
 #endif
 ```
+
+### The free path — do not skip this
+
+An allocator with no matching free leaks the handle, the view, **and** the
+on-disk file. `out_free` (`physmem.c:2414`) and `reclaim_ramblock` (`:2704`)
+both reach `qemu_anon_ram_free` → `VirtualFree(ptr, 0, MEM_RELEASE)`, which
+**fails with `ERROR_INVALID_ADDRESS` on a `MapViewOfFile` address** — a view
+needs `UnmapViewOfFile` — and nothing closes `omni_ram_file`.
+
+MEASURED with this missing: three QMP `object-add`/`object-del` cycles of a
+512 MB backend took the handle count 1013 → 1016 monotonically, leaked three
+512 MB views, and left three sparse files that the `qemu_proc.py` reaper
+**cannot** delete, because `DELETE_ON_CLOSE` keeps them until the process
+exits. `engine.plug_mem`'s own failure path calls `object-del` with the comment
+*"or the host keeps paying for an allocation nothing can reach"* — that
+cleanup becomes a no-op exactly when it is needed.
+
+Both sites branch before the stock free:
+
+```c
+    if (block->omni_ram_file) {
+        UnmapViewOfFile(block->host);
+        CloseHandle(block->omni_ram_file);
+        block->omni_ram_file = NULL;
+    } else {
+        /* ... existing qemu_anon_ram_free path ... */
+    }
+```
+
+This belongs in patch `0007`, not `0008`: `0007` is what creates the resource.
+It also means `omni_ram_file` has two readers, not one.
 
 - [ ] **Step 4: Build it and prove the numbers**
 
