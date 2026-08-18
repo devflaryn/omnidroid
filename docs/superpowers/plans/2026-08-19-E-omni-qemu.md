@@ -41,6 +41,7 @@
 - Create: `qemu-patches/0003-omni-panel-pin.patch`
 - Create: `qemu-patches/0004-omni-confirm-close.patch`
 - Create: `qemu-patches/0005-omni-win32-discard.patch`
+- Create: `qemu-patches/0006-omni-win32-build-no-symlinks.patch`
 - Create: `qemu-patches/SERIES` (ordered list, one filename per line)
 - Create: `qemu-patches/PIN` (one line: `v11.1.0`)
 - Delete: `qemu-patches/0000-omni-all-WIP.patch`
@@ -111,6 +112,8 @@ class SeriesContent(unittest.TestCase):
         "0003-omni-panel-pin.patch": {"ui/gtk.c"},
         "0004-omni-confirm-close.patch": {"ui/gtk.c"},
         "0005-omni-win32-discard.patch": {"system/physmem.c"},
+        "0006-omni-win32-build-no-symlinks.patch":
+            {"scripts/symlink-install-tree.py"},
     }
 
     def test_each_patch_touches_only_its_files(self):
@@ -143,7 +146,9 @@ git diff --stat        # expect: include/ui/gtk.h, scripts/symlink-install-tree.
                        # system/physmem.c, ui/gtk-gl-area.c, ui/gtk.c
 ```
 
-`scripts/symlink-install-tree.py` is **build scaffolding, not an omni patch** — inspect it with `git diff scripts/symlink-install-tree.py` and, if it is only a Windows path fix for the install step, carry it as `0006` later; if it is unrelated local noise, revert it in the series (not in the tree).
+`scripts/symlink-install-tree.py` **is** an omni patch and becomes `0006`. It was nearly written off as scaffolding; it is not. Meson's bundle step calls `os.symlink`, Windows refuses symlinks without Developer Mode or administrator rights (`WinError 1314`), and stock QEMU's answer is to print *"Please enable Developer Mode to support soft link"* and fail the build. The patch skips the bundle tree on Windows instead, which costs nothing here because we install to a prefix rather than running QEMU out of the build directory — and a copy is explicitly **not** a substitute, because meson points those links at files the build has not produced yet.
+
+**Two things to check while lifting it.** The live edit has a mangled continuation on the `if os.name == 'nt' and isinstance(e, OSError) and e.errno != errno.EEXIST:` line — write it as a well-formed multi-line condition. And confirm `errno` is imported at the top of the file; if the stock script imports only `os` and `sys`, the patch must add the import, or the build dies with `NameError` at the first non-`EEXIST` error instead of skipping it.
 
 Produce each patch with an explicit path list and `git diff -- <paths>`, then hand-split `ui/gtk.c` (which carries four of the five) by hunk. The hunk boundaries are unambiguous because each block is prefixed `/* omni: ... */`:
 
@@ -170,6 +175,7 @@ cat > SERIES <<'EOF'
 0003-omni-panel-pin.patch
 0004-omni-confirm-close.patch
 0005-omni-win32-discard.patch
+0006-omni-win32-build-no-symlinks.patch
 EOF
 echo v11.1.0 > PIN
 rm 0000-omni-all-WIP.patch
@@ -193,7 +199,11 @@ git diff --stat                     # must equal the original 320-line stat,
 cd /c && git -C /c/qemubuild worktree remove --force /c/qemu-verify
 ```
 
-Expected: five `OK` lines and a diff stat matching `include/ui/gtk.h | 3 +`, `system/physmem.c | 35 +`, `ui/gtk-gl-area.c | 7 +`, `ui/gtk.c | 269 +`.
+Expected: six `OK` lines, and a diff stat equal to the original 320-insertion
+stat — `include/ui/gtk.h | 3 +`, `scripts/symlink-install-tree.py | 8 +`,
+`system/physmem.c | 35 +`, `ui/gtk-gl-area.c | 7 +`, `ui/gtk.c | 269 +`. A
+smaller total means a hunk was dropped in the split, which is the one failure
+mode of this task that a green test suite will not catch.
 
 - [ ] **Step 6: Run the test to verify it passes**
 
@@ -211,12 +221,20 @@ git add qemu-patches/SERIES qemu-patches/PIN \
         qemu-patches/0003-omni-panel-pin.patch \
         qemu-patches/0004-omni-confirm-close.patch \
         qemu-patches/0005-omni-win32-discard.patch \
+        qemu-patches/0006-omni-win32-build-no-symlinks.patch \
         tests/test_qemu_patch_series.py
 git rm qemu-patches/0000-omni-all-WIP.patch
 git commit -m "qemu: split the rescued diff into a numbered, verified series
 
-Five patches, applied in SERIES order against the tag in PIN, verified to
-apply cleanly to a pristine v11.1.0 worktree. The unsplit snapshot is gone.
+Six patches, applied in SERIES order against the tag in PIN, verified to apply
+cleanly to a pristine v11.1.0 worktree. The unsplit snapshot is gone.
+
+The sixth was nearly discarded as scaffolding. It is not: meson's bundle step
+symlinks, Windows refuses symlinks without Developer Mode, and stock QEMU's
+answer is to fail the build telling you to go and enable it. Skipping the
+bundle tree costs nothing here because we install to a prefix -- but only
+someone who had run the build would know that, which is exactly why it
+belongs in the series instead of in a working directory.
 
 tests/test_qemu_patch_series.py asserts the series is a series -- nothing on
 disk unapplied, nothing named that is missing, numeric order, one pin -- and
@@ -268,8 +286,12 @@ class Series(unittest.TestCase):
     def test_reads_in_order_and_skips_comments(self):
         names = [p.name for p in read_series(PATCHES)]
         self.assertEqual(names[0], "0001-omni-window-icon.patch")
-        self.assertEqual(names[-1], "0005-omni-win32-discard.patch")
+        # Deliberately not asserting names[-1]: the series GROWS in tasks 3
+        # and 4, and a test that has to be edited every time a patch is added
+        # is a test that gets edited without being read.
+        self.assertEqual(names, sorted(names))
         self.assertNotIn("SERIES", names)
+        self.assertNotIn("PIN", names)
 
     def test_pin_is_the_tag(self):
         self.assertEqual(read_pin(PATCHES), "v11.1.0")
@@ -589,10 +611,10 @@ fails configure, which on the Mac would read as a broken patch series."
 
 ---
 
-### Task 3: Patch 0006 — guest RAM from a mapped file on Windows
+### Task 3: Patch 0007 — guest RAM from a mapped file on Windows
 
 **Files:**
-- Create: `qemu-patches/0006-omni-win32-ram-file.patch`
+- Create: `qemu-patches/0007-omni-win32-ram-file.patch`
 - Modify: `qemu-patches/SERIES`
 - Test: `tests/test_qemu_patch_series.py` (extend `SeriesContent.EXPECTED`)
 
@@ -621,14 +643,14 @@ Extend the existing series test rather than adding a file:
         "0003-omni-panel-pin.patch": {"ui/gtk.c"},
         "0004-omni-confirm-close.patch": {"ui/gtk.c"},
         "0005-omni-win32-discard.patch": {"system/physmem.c"},
-        "0006-omni-win32-ram-file.patch": {"system/physmem.c"},
+        "0007-omni-win32-ram-file.patch": {"system/physmem.c"},
     }
 
     def test_ram_file_patch_is_env_gated(self):
         """A build that ships this must behave exactly like stock QEMU until
         the launcher opts in. `omnidroid` is not the only thing that will ever
         run this binary."""
-        text = (PATCHES / "0006-omni-win32-ram-file.patch").read_text(
+        text = (PATCHES / "0007-omni-win32-ram-file.patch").read_text(
             encoding="utf-8")
         self.assertIn("QEMU_RAM_FILE_DIR", text)
         self.assertIn("FILE_ATTRIBUTE_TEMPORARY", text)
@@ -640,7 +662,7 @@ Extend the existing series test rather than adding a file:
 ```bash
 python -m pytest tests/test_qemu_patch_series.py -q
 ```
-Expected: FAIL — `0006-omni-win32-ram-file.patch` is not on disk, so
+Expected: FAIL — `0007-omni-win32-ram-file.patch` is not on disk, so
 `test_every_patch_on_disk_is_named` still passes but `EXPECTED` lookup raises
 `FileNotFoundError`.
 
@@ -669,7 +691,7 @@ In the worktree, add to `system/physmem.c`. Place it immediately above
  *   FSCTL_SET_ZERO_DATA while GPA-mapped -> 1 (err 0), readback 0x00
  *
  * That second block is the one that decided this: WHPX accepts the mapping
- * AND does not pin it, so a discard is a real discard (see patch 0007).
+ * AND does not pin it, so a discard is a real discard (see patch 0008).
  *
  * OFF unless QEMU_RAM_FILE_DIR is set. A stock invocation must be bit-for-bit
  * stock.
@@ -706,7 +728,7 @@ static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
         return NULL;
     }
     /* Sparse, so EndOfFile is the guest's -m while AllocationSize tracks only
-     * what the guest has actually touched -- and so patch 0007 can punch it
+     * what the guest has actually touched -- and so patch 0008 can punch it
      * back down. Without this the file is fully allocated on first write and
      * the disk cost equals -m, which trades one wall for another. */
     if (!DeviceIoControl(fh, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &junk, NULL)) {
@@ -735,7 +757,7 @@ static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
     }
 
     /* Hand the file to the RAMBlock as a CRT fd. ram_block_discard_range()
-     * already branches on `rb->fd >= 0`; patch 0007 gives that branch a
+     * already branches on `rb->fd >= 0`; patch 0008 gives that branch a
      * Windows arm that turns it back into this HANDLE. */
     fd = _open_osfhandle((intptr_t)fh, 0);
     if (fd < 0) {
@@ -820,16 +842,16 @@ RAMBlock path differs from the probe's in some way worth understanding.
 ```bash
 cd /c/qemu-omni-<pin>
 git diff -- system/physmem.c > /tmp/all-physmem.patch
-# 0005 is already in that file; split so 0006 carries ONLY the new hunks
+# 0005 is already in that file; split so 0007 carries ONLY the new hunks
 ```
 
 Split by hand: `0005` is the `#elif defined(_WIN32)` arm inside
-`ram_block_discard_range`; `0006` is the include block, the new function, and
+`ram_block_discard_range`; `0007` is the include block, the new function, and
 the `ram_block_add` call site. Then:
 
 ```bash
 cd "C:/Users/berat/Desktop/Omni Apps/omnidroid/qemu-patches"
-printf '0006-omni-win32-ram-file.patch\n' >> SERIES
+printf '0007-omni-win32-ram-file.patch\n' >> SERIES
 ```
 
 - [ ] **Step 6: Run the tests**
@@ -842,7 +864,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add qemu-patches/0006-omni-win32-ram-file.patch qemu-patches/SERIES \
+git add qemu-patches/0007-omni-win32-ram-file.patch qemu-patches/SERIES \
         tests/test_qemu_patch_series.py
 git commit -m "qemu: guest RAM from a mapped sparse file on Windows
 
@@ -868,22 +890,22 @@ path fails the boot instead."
 
 ---
 
-### Task 4: Patch 0007 — a discard that punches the hole
+### Task 4: Patch 0008 — a discard that punches the hole
 
 **Files:**
-- Create: `qemu-patches/0007-omni-win32-punch-hole.patch`
+- Create: `qemu-patches/0008-omni-win32-punch-hole.patch`
 - Modify: `qemu-patches/SERIES`
 - Test: `tests/test_qemu_patch_series.py` (extend `SeriesContent.EXPECTED`)
 
 **Interfaces:**
-- Consumes: `RAMBlock.fd` set by patch 0006.
+- Consumes: `RAMBlock.fd` set by patch 0007.
 - Produces: `ram_block_discard_range()` returning 0 on Windows for file-backed blocks, having released both the RAM and the disk. Task 7 turns on the guest-side reporting that calls it.
 
 - [ ] **Step 1: Extend the test**
 
 ```python
 # tests/test_qemu_patch_series.py -- add to SeriesContent
-        "0007-omni-win32-punch-hole.patch": {"system/physmem.c"},
+        "0008-omni-win32-punch-hole.patch": {"system/physmem.c"},
 
     def test_punch_hole_precedes_the_private_discard(self):
         """A file-backed block must take FSCTL_SET_ZERO_DATA, not
@@ -891,7 +913,7 @@ path fails the boot instead."
         committed pages; against a mapped view it either fails or drops the
         pages without touching the file, which reclaims the RAM and leaks the
         disk -- and disk is the binding wall once commit is solved."""
-        text = (PATCHES / "0007-omni-win32-punch-hole.patch").read_text(
+        text = (PATCHES / "0008-omni-win32-punch-hole.patch").read_text(
             encoding="utf-8")
         self.assertIn("FSCTL_SET_ZERO_DATA", text)
         self.assertIn("rb->fd >= 0", text)
@@ -913,7 +935,7 @@ file-backed branch ahead of `DiscardVirtualMemory`:
 #elif defined(_WIN32)
             /* omni: two discards, because there are two backings.
              *
-             * A block from omni_win32_file_ram_alloc (patch 0006) has a real
+             * A block from omni_win32_file_ram_alloc (patch 0007) has a real
              * file behind it, and FSCTL_SET_ZERO_DATA is that file's
              * fallocate(PUNCH_HOLE): the frames are freed, the file's
              * AllocationSize drops, and the next touch reads zeroes. MEASURED
@@ -973,9 +995,9 @@ Expected: `Length` equals `-m`, and the allocated size stays well below it and
 - [ ] **Step 5: Export, update SERIES, run tests**
 
 ```bash
-cd /c/qemu-omni-<pin> && git diff -- system/physmem.c   # split 0007 out
+cd /c/qemu-omni-<pin> && git diff -- system/physmem.c   # split 0008 out
 cd "C:/Users/berat/Desktop/Omni Apps/omnidroid/qemu-patches"
-printf '0007-omni-win32-punch-hole.patch\n' >> SERIES
+printf '0008-omni-win32-punch-hole.patch\n' >> SERIES
 cd .. && python -m pytest tests/test_qemu_patch_series.py -q
 ```
 Expected: PASS.
@@ -983,11 +1005,11 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add qemu-patches/0007-omni-win32-punch-hole.patch qemu-patches/SERIES \
+git add qemu-patches/0008-omni-win32-punch-hole.patch qemu-patches/SERIES \
         tests/test_qemu_patch_series.py
 git commit -m "qemu: a discard that gives the disk back too
 
-A block from patch 0006 has a real file behind it, so its discard is
+A block from patch 0007 has a real file behind it, so its discard is
 FSCTL_SET_ZERO_DATA -- the file's fallocate(PUNCH_HOLE). Frames freed,
 AllocationSize down, next touch reads zeroes. Blocks with no file keep
 DiscardVirtualMemory, which is right for private commit and wrong for a
@@ -1145,7 +1167,7 @@ another's WM_CLOSE without injecting a DLL. Verified by clicking all three."
 - Test: `tests/test_qemu_footprint.py` (extend; it already covers per-instance command cost)
 
 **Interfaces:**
-- Consumes: patch 0006's `QEMU_RAM_FILE_DIR` contract.
+- Consumes: patch 0007's `QEMU_RAM_FILE_DIR` contract.
 - Produces: `qemu_proc.ram_file_env(env, cfg, mode) -> dict` — sets `QEMU_RAM_FILE_DIR` to `scratch_dir(cfg)` when the mode's profile is `density`, the host is Windows, and the resolved QEMU advertises the capability; returns `env` unchanged otherwise. Called from `scratch_env` (`qemu_proc.py:2295`). Task 7 consumes `qemu_supports_ram_file(cfg)`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1221,7 +1243,7 @@ and add the new function:
 #   QEMU_WINDOW_LOCK_ASPECT   WM_SIZING filter, client area  (patch 0002)
 #   QEMU_WINDOW_PANEL         ui-info the guest is handed    (patch 0003)
 #   QEMU_WINDOW_CONFIRM_CLOSE the three-option close prompt  (patch 0004)
-#   QEMU_RAM_FILE_DIR         guest RAM from a mapped file   (patch 0006)
+#   QEMU_RAM_FILE_DIR         guest RAM from a mapped file   (patch 0007)
 WINDOW_ICON_NAME = "omni-icon.png"
 RAM_FILE_ENV = "QEMU_RAM_FILE_DIR"
 
@@ -1266,7 +1288,7 @@ def ram_file_env(env, cfg=None, mode=None, is_windows=None, supported=None):
 
 
 def qemu_supports_ram_file(cfg=None):
-    """Does the resolved QEMU carry patch 0006?
+    """Does the resolved QEMU carry patch 0007?
 
     Asked by running it, not by reading a version: the product has shipped
     three different QEMU builds and `--version` distinguishes none of them,
@@ -1276,7 +1298,7 @@ def qemu_supports_ram_file(cfg=None):
 ```
 
 Add the capability probe beside `_qemu_help_texts` (`qemu_proc.py:458`), and
-patch 0001-0007's build to advertise it. The cheapest honest probe is a
+patch 0001-0008's build to advertise it. The cheapest honest probe is a
 version-string suffix, so extend `tools/build_qemu.py`'s configure call with
 `--with-pkgversion=omni-ram-file+omni-window` and parse it:
 
@@ -1370,7 +1392,7 @@ are read now."
 class FreePageReporting(unittest.TestCase):
     """It was dropped on Windows because the discard underneath it did not
     exist: 925 failed ram_block_discard_range calls a minute, 78 KB of
-    qemu.log, nothing reclaimed. With patches 0005+0007 the discard succeeds,
+    qemu.log, nothing reclaimed. With patches 0005+0008 the discard succeeds,
     and the reporting is what keeps the RAM file's ALLOCATED size near the
     guest's live set instead of everything it has ever touched."""
 
@@ -1406,7 +1428,7 @@ def balloon_device(cfg=None, is_windows=None, can_discard=None):
     4 MB block for the life of the instance, and nothing reclaimed. The flag
     was never the problem; the discard under it was.
 
-    Patches 0005 and 0007 give that discard a Windows implementation --
+    Patches 0005 and 0008 give that discard a Windows implementation --
     DiscardVirtualMemory for private blocks, FSCTL_SET_ZERO_DATA for
     file-backed ones -- so the reporting now does what it says. On a
     file-backed guest it is what keeps the RAM file's ALLOCATED size tracking
@@ -1456,7 +1478,7 @@ git commit -m "farming: free-page reporting works on Windows now
 
 It was dropped there when every discard under it returned -ENOSYS -- 925
 failures a minute, 78 KB of qemu.log, nothing reclaimed. The flag was never
-the problem. Patches 0005 and 0007 give the discard a Windows implementation,
+the problem. Patches 0005 and 0008 give the discard a Windows implementation,
 so reporting now punches holes in the RAM file as the guest frees pages,
 which is what keeps its ALLOCATED size near the live set instead of the
 high-water mark.
