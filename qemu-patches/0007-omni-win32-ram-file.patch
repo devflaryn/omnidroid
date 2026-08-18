@@ -1,8 +1,8 @@
 diff --git a/include/system/ramblock.h b/include/system/ramblock.h
-index f0639287bf..9acc3c4466 100644
+index f0639287bf..24f9c20f5d 100644
 --- a/include/system/ramblock.h
 +++ b/include/system/ramblock.h
-@@ -41,6 +41,16 @@ struct RAMBlock {
+@@ -41,6 +41,19 @@ struct RAMBlock {
      int fd;
      uint64_t fd_offset;
      int guest_memfd;
@@ -12,30 +12,32 @@ index f0639287bf..9acc3c4466 100644
 +     * g_malloc0'd, so a new int field would arrive as 0 -- a VALID
 +     * descriptor -- and every block, including every one with no omni file
 +     * behind it, would look like it had one. NULL is the natural zero.
-+     * Set in system/physmem.c (omni_win32_file_ram_alloc), read in the
-+     * Windows arm of ram_block_discard_range.
++     * Set in system/physmem.c (omni_win32_file_ram_alloc). Freed in this
++     * same patch, by reclaim_ramblock() and ram_block_add()'s out_free path
++     * (UnmapViewOfFile + CloseHandle -- qemu_anon_ram_free's VirtualFree
++     * fails with ERROR_INVALID_ADDRESS on a mapped-view pointer). Also read
++     * in the Windows arm of ram_block_discard_range (patch 0008).
 +     */
 +    void *omni_ram_file;
      RamBlockAttributes *attributes;
      size_t page_size;
      /* dirty bitmap used during migration */
 diff --git a/system/physmem.c b/system/physmem.c
-index c21ea92915..7265280348 100644
+index c21ea92915..311ed5df27 100644
 --- a/system/physmem.c
 +++ b/system/physmem.c
-@@ -84,6 +84,11 @@
+@@ -84,6 +84,10 @@
  #include "qemu/mmap-alloc.h"
  #endif
  
 +#ifdef _WIN32
-+#include <io.h>          /* _open_osfhandle */
 +#include <winioctl.h>    /* FSCTL_SET_SPARSE */
 +#endif
 +
  #include "monitor/monitor.h"
  
  #ifdef CONFIG_LIBDAXCTL
-@@ -2146,6 +2151,111 @@ static void dirty_memory_extend(ram_addr_t new_ram_size)
+@@ -2146,6 +2150,147 @@ static void dirty_memory_extend(ram_addr_t new_ram_size)
      ram_list.num_dirty_blocks = new_num_blocks;
  }
  
@@ -73,14 +75,38 @@ index c21ea92915..7265280348 100644
 + * guest and nothing else, with a 4x margin over the largest block it skips. */
 +#define OMNI_RAM_FILE_MIN_BYTES ((size_t)64 << 20)
 +
++/* Win32 has no getpagesize()-covers-it-all constant for the granularity a
++ * MapViewOfFile address is guaranteed to land on; qemu_anon_ram_alloc's own
++ * get_allocation_granularity() (util/oslib-win32.c) is `static` to that file
++ * and not reachable here, so this is the same query, not a copy of a value.
++ * Stock leaves mr->align at its g_malloc0 zero on this path; hw/mem/memory-
++ * device.c:384 does `QEMU_IS_ALIGNED(size, mr->align)`, i.e. `size % 0`, the
++ * first time anything hot-plugs a memory-backend-ram device against a block
++ * this function allocated -- SIGFPE/STATUS_INTEGER_DIVIDE_BY_ZERO, no
++ * message, because align was never wired up on this branch. */
++static uint64_t omni_win32_alloc_granularity(void)
++{
++    SYSTEM_INFO system_info;
++
++    GetSystemInfo(&system_info);
++    return MAX(system_info.dwAllocationGranularity, getpagesize());
++}
++
 +static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
 +                                       Error **errp)
 +{
 +    const char *dir = g_getenv("QEMU_RAM_FILE_DIR");
 +    g_autofree char *path = NULL;
 +    HANDLE fh, mh;
-+    DWORD junk = 0;
++    DWORD junk = 0, mve_err;
 +    void *addr;
++
++    /* RAM_NORESERVE (noreserve) is silently accepted on this path: a file-
++     * backed mapping has nothing resembling POSIX MAP_NORESERVE to opt out
++     * of, so there's no equivalent gap to warn about the way stock
++     * qemu_anon_ram_alloc's `if (noreserve) { error_report(...); }` does.
++     * Worth a second look if -mem-path/-object memory-backend-* ever routes
++     * a noreserve request down this branch expecting the stock error. */
 +
 +    if (!dir || !*dir) {
 +        return NULL;                    /* stock path */
@@ -126,11 +152,16 @@ index c21ea92915..7265280348 100644
 +        return NULL;
 +    }
 +    addr = MapViewOfFile(mh, FILE_MAP_ALL_ACCESS, 0, 0, size);
++    /* Capture the error BEFORE CloseHandle: a successful CloseHandle is not
++     * guaranteed to preserve the thread's last-error value, and this is the
++     * one diagnostic an out-of-address-space MapViewOfFile failure leaves
++     * behind at fleet scale. */
++    mve_err = GetLastError();
 +    /* The section keeps the mapping alive; the handle is not needed again. */
 +    CloseHandle(mh);
 +    if (!addr) {
 +        error_setg(errp, "omni: MapViewOfFile %zu failed (%lu)",
-+                   size, GetLastError());
++                   size, mve_err);
 +        CloseHandle(fh);
 +        return NULL;
 +    }
@@ -140,6 +171,13 @@ index c21ea92915..7265280348 100644
 +     * block in QEMU would look like it had one. NULL is the natural zero. */
 +    block->omni_ram_file = fh;
 +
++    /* Stock qemu_anon_ram_alloc sets this via its `align` out-param
++     * (util/oslib-win32.c:64-66); this branch bypassed that entirely until
++     * a live device_add pc-dimm proved mr->align was still its g_malloc0
++     * zero. 64 KiB (typically) is also what MapViewOfFile actually
++     * guarantees, so this is the honest value, not a borrowed one. */
++    block->mr->align = omni_win32_alloc_granularity();
++
 +    return addr;
 +}
 +#endif /* _WIN32 */
@@ -147,7 +185,7 @@ index c21ea92915..7265280348 100644
  static void ram_block_add(RAMBlock *new_block, Error **errp)
  {
      const bool noreserve = qemu_ram_is_noreserve(new_block);
-@@ -2169,6 +2279,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
+@@ -2169,6 +2314,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
                  return;
              }
          } else {
@@ -168,3 +206,45 @@ index c21ea92915..7265280348 100644
              new_block->host = qemu_anon_ram_alloc(new_block->max_length,
                                                    &new_block->mr->align,
                                                    shared, noreserve);
+@@ -2289,7 +2448,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
+ 
+ out_free:
+     if (free_on_error) {
+-        qemu_anon_ram_free(new_block->host, new_block->max_length);
++#ifdef _WIN32
++        if (new_block->omni_ram_file) {
++            /* Same VirtualFree-on-a-mapped-view mismatch as reclaim_ramblock
++             * below -- this is the error path taken when a LATER step in
++             * ram_block_add (e.g. RAM_GUEST_MEMFD setup) fails after this
++             * function already handed back a file-backed view. */
++            UnmapViewOfFile(new_block->host);
++            CloseHandle(new_block->omni_ram_file);
++            new_block->omni_ram_file = NULL;
++        } else
++#endif
++        {
++            qemu_anon_ram_free(new_block->host, new_block->max_length);
++        }
+         new_block->host = NULL;
+     }
+ }
+@@ -2576,6 +2748,19 @@ static void reclaim_ramblock(RAMBlock *block)
+     } else if (block->fd >= 0) {
+         qemu_ram_munmap(block->fd, block->host, block->max_length);
+         close(block->fd);
++#endif
++#ifdef _WIN32
++    } else if (block->omni_ram_file) {
++        /* qemu_anon_ram_free below is VirtualFree(ptr, 0, MEM_RELEASE), which
++         * fails with ERROR_INVALID_ADDRESS on a MapViewOfFile address -- a
++         * view needs UnmapViewOfFile, and the backing HANDLE (DELETE_ON_CLOSE)
++         * is never closed by anything else, so an unmap-only fix still leaks
++         * the file until process exit. Reproduced live: three object-add /
++         * object-del cycles leaked three views and three files the reaper in
++         * qemu_proc.py could not delete out from under a live handle. */
++        UnmapViewOfFile(block->host);
++        CloseHandle(block->omni_ram_file);
++        block->omni_ram_file = NULL;
+ #endif
+     } else {
+         qemu_anon_ram_free(block->host, block->max_length);

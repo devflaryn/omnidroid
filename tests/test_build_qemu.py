@@ -118,13 +118,25 @@ class EnclosingFunctionIsNotFooled(unittest.TestCase):
                '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n')
         self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
 
-    # test_a_prototype_does_not_become_the_scope was dropped: its fixture put
-    # the needle inside beta's own body, and beta's own name-paren sets
-    # `pending` to "beta" whether or not the "only if pending is None" guard
-    # exists -- an unguarded implementation that always overwrites `pending`
-    # on any depth-0 '(' gets this fixture right too. It proved nothing
-    # about the guard the class docstring says it exists to check; the
-    # guard is what test_attribute_macro_after_the_signature actually pins.
+    def test_a_prototype_does_not_become_the_scope(self):
+        """Restored after fix round 1: mutation-tested against the CURRENT
+        implementation, not just the historical pre-fix one. Deleting the
+        depth-0 ';' clear (the branch that ends a prototype's `pending`)
+        makes this fixture return 'alpha' instead of 'beta' -- because
+        without it, `pending` survives the semicolon, and the "only set
+        pending while it is None" guard then refuses to let beta's own
+        name-paren overwrite the stale value. (An EARLIER version of this
+        test used the same fixture but reasoned about a different, no-
+        longer-current baseline -- an implementation with no such guard at
+        all, which always overwrites `pending` regardless of the ';' clear,
+        so the fixture could not have caught that baseline's absence of a
+        guard. It still catches loss of the ';' clear in the code as it
+        exists today, which is a real and separately mutable piece of
+        behaviour with no other coverage.)"""
+        src = ('static void alpha(void);\n\n'
+               'static void beta(void)\n{\n'
+               '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n')
+        self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
 
 
 class AnchorCheck(unittest.TestCase):
