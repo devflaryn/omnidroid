@@ -131,7 +131,7 @@ them, or clean them up after a crash.
 
 It was dropped there (`qemu_proc.py:1485`) because every discard returned
 `-ENOSYS`: 925 failures a minute, 78 KB of log, nothing reclaimed. With `0005`
-and `0007` the discard succeeds, so the guest reporting a freed page now
+and `0008` the discard succeeds, so the guest reporting a freed page now
 punches a hole in the RAM file. That is what keeps the file's *allocated* size
 near the guest's **live** set instead of everything it has ever touched, and it
 is the difference between a fleet that fits on this disk and one that does not.
