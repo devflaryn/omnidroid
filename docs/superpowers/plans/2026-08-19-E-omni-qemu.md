@@ -914,6 +914,16 @@ In the worktree, add to `system/physmem.c`. Place it immediately above
  * OFF unless QEMU_RAM_FILE_DIR is set. A stock invocation must be bit-for-bit
  * stock.
  */
+/* Only blocks at least this big get a file. MEASURED with `info ramblock` on
+ * a -m 3072 boot of this very binary: NINE RAMBlocks exist, of which pc.ram is
+ * 3072 MiB and the other eight total ~18.7 MiB -- vga.vram at 16 MiB, then
+ * seven ROMs from 2 MiB down to 4 KiB, six of them read-only. Backing all nine
+ * would mean nine files and nine DELETE_ON_CLOSE handles per instance (270
+ * across a 30-instance fleet) to reclaim 0.6% more commit, and would put a
+ * writable temp file behind ROMs that are never discarded. 64 MiB takes the
+ * guest and nothing else, with a 4x margin over the largest block it skips. */
+#define OMNI_RAM_FILE_MIN_BYTES ((size_t)64 << 20)
+
 static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
                                        Error **errp)
 {
@@ -925,6 +935,9 @@ static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
 
     if (!dir || !*dir) {
         return NULL;                    /* stock path */
+    }
+    if (size < OMNI_RAM_FILE_MIN_BYTES) {
+        return NULL;                    /* ROMs and framebuffers stay private */
     }
 
     path = g_strdup_printf("%s%comni-ram-%lu-%p.bin", dir, G_DIR_SEPARATOR,
