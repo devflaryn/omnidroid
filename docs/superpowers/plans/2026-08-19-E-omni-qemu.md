@@ -827,7 +827,18 @@ fails configure, which on the Mac would read as a broken patch series."
 
 **Interfaces:**
 - Consumes: `read_series` from Task 2.
-- Produces: a QEMU that, when `QEMU_RAM_FILE_DIR` is set in its environment, backs every anonymous guest RAM block with a sparse file in that directory and records the file's CRT fd on `RAMBlock.fd`. Task 4 reads that fd. Task 6 sets the env var.
+- Produces: a QEMU that, when `QEMU_RAM_FILE_DIR` is set in its environment, backs every anonymous guest RAM block with a sparse file in that directory and records the file's Win32 `HANDLE` in a new `void *omni_ram_file` field on `RAMBlock` (`include/system/ramblock.h`), NULL when unused. Task 4 reads that handle. Task 6 sets the env var.
+
+**Why a `void *` and not an `int` fd — this is not style.** RAMBlocks are
+`g_malloc0`'d (`physmem.c:2354`, `:2527`), so a new `int` field arrives as
+**0** — and 0 is a valid file descriptor, so `>= 0` would be true for every
+RAM block in QEMU, including every one with no omni file behind it. Task 4
+would then fire `FSCTL_SET_ZERO_DATA` at stdin on every discard. QEMU knows
+this trap and guards it by hand: it writes `new_block->fd = -1` and
+`->guest_memfd = -1` immediately after each `g_malloc0` (`:2532-2533`), and
+the two allocation sites are not symmetric about it. A pointer makes the
+sentinel bug unrepresentable — `g_malloc0` gives NULL — and keeps the CRT fd
+table out of the path entirely.
 
 **Why this shape and not `-object memory-backend-file`.** `backends/hostmem-file.c`
 is excluded on Windows at `backends/meson.build:13` and `file_ram_alloc` sits
@@ -911,7 +922,6 @@ static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
     HANDLE fh, mh;
     DWORD junk = 0;
     void *addr;
-    int fd;
 
     if (!dir || !*dir) {
         return NULL;                    /* stock path */
@@ -963,18 +973,10 @@ static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
         return NULL;
     }
 
-    /* Hand the file to the RAMBlock as a CRT fd. ram_block_discard_range()
-     * already branches on `rb->fd >= 0`; patch 0008 gives that branch a
-     * Windows arm that turns it back into this HANDLE. */
-    fd = _open_osfhandle((intptr_t)fh, 0);
-    if (fd < 0) {
-        error_setg(errp, "omni: _open_osfhandle failed");
-        UnmapViewOfFile(addr);
-        CloseHandle(fh);
-        return NULL;
-    }
-    block->fd = fd;
-    block->flags |= RAM_SHARED;     /* the backing is a file, not private */
+    /* Keep the HANDLE itself. NOT an int fd: RAMBlock is g_malloc0'd, so a
+     * new int field would arrive as 0 -- a VALID descriptor -- and every
+     * block in QEMU would look like it had one. NULL is the natural zero. */
+    block->omni_ram_file = fh;
 
     return addr;
 }
@@ -1101,11 +1103,12 @@ path fails the boot instead."
 
 **Files:**
 - Create: `qemu-patches/0008-omni-win32-punch-hole.patch`
+- Note: `include/system/ramblock.h` is patch 0007's file, not this one.
 - Modify: `qemu-patches/SERIES`
 - Test: `tests/test_qemu_patch_series.py` (extend `SeriesContent.EXPECTED`)
 
 **Interfaces:**
-- Consumes: `RAMBlock.fd` set by patch 0007.
+- Consumes: `RAMBlock.omni_ram_file` (a Win32 `HANDLE`, NULL when unused) set by patch 0007.
 - Produces: `ram_block_discard_range()` returning 0 on Windows for file-backed blocks, having released both the RAM and the disk. Task 7 turns on the guest-side reporting that calls it.
 
 - [ ] **Step 1: Extend the test**
@@ -1123,7 +1126,10 @@ path fails the boot instead."
         text = (PATCHES / "0008-omni-win32-punch-hole.patch").read_text(
             encoding="utf-8")
         self.assertIn("FSCTL_SET_ZERO_DATA", text)
-        self.assertIn("rb->fd >= 0", text)
+        self.assertIn("rb->omni_ram_file", text)
+        # An int fd field would be 0 on a g_malloc0'd block -- a valid
+        # descriptor -- so every block would take this branch.
+        self.assertNotIn("_get_osfhandle", text)
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -1154,8 +1160,8 @@ file-backed branch ahead of `DiscardVirtualMemory`:
              * the reservation, which is right for private memory and wrong
              * for a mapping.
              */
-            if (rb->fd >= 0) {
-                HANDLE fh = (HANDLE)_get_osfhandle(rb->fd);
+            if (rb->omni_ram_file) {
+                HANDLE fh = (HANDLE)rb->omni_ram_file;
                 FILE_ZERO_DATA_INFORMATION zd;
                 DWORD junk = 0;
 
