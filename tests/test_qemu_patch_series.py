@@ -57,6 +57,8 @@ class SeriesContent(unittest.TestCase):
         "0005-omni-win32-discard.patch": {"system/physmem.c"},
         "0006-omni-win32-build-no-symlinks.patch":
             {"scripts/symlink-install-tree.py"},
+        "0007-omni-win32-ram-file.patch":
+            {"system/physmem.c", "include/system/ramblock.h"},
     }
 
     def test_each_patch_touches_only_its_files(self):
@@ -64,6 +66,16 @@ class SeriesContent(unittest.TestCase):
             text = (PATCHES / name).read_text(encoding="utf-8")
             touched = set(re.findall(r"^\+\+\+ b/(.+)$", text, re.M))
             self.assertEqual(touched, expected, f"{name} touches {touched}")
+
+    def test_ram_file_patch_is_env_gated(self):
+        """A build that ships this must behave exactly like stock QEMU until
+        the launcher opts in. `omnidroid` is not the only thing that will
+        ever run this binary."""
+        text = (PATCHES / "0007-omni-win32-ram-file.patch").read_text(
+            encoding="utf-8")
+        self.assertIn("QEMU_RAM_FILE_DIR", text)
+        self.assertIn("FILE_ATTRIBUTE_TEMPORARY", text)
+        self.assertIn("FSCTL_SET_SPARSE", text)
 
     def test_caption_change_is_gated(self):
         """Every omni feature is behind a QEMU_WINDOW_* gate so a stock

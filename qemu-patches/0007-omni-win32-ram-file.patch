@@ -1,0 +1,170 @@
+diff --git a/include/system/ramblock.h b/include/system/ramblock.h
+index f0639287bf..9acc3c4466 100644
+--- a/include/system/ramblock.h
++++ b/include/system/ramblock.h
+@@ -41,6 +41,16 @@ struct RAMBlock {
+     int fd;
+     uint64_t fd_offset;
+     int guest_memfd;
++    /*
++     * omni: Win32 HANDLE of the sparse file backing this block's mapped
++     * view, or NULL. A `void *` and not an `int fd`: RAMBlock is
++     * g_malloc0'd, so a new int field would arrive as 0 -- a VALID
++     * descriptor -- and every block, including every one with no omni file
++     * behind it, would look like it had one. NULL is the natural zero.
++     * Set in system/physmem.c (omni_win32_file_ram_alloc), read in the
++     * Windows arm of ram_block_discard_range.
++     */
++    void *omni_ram_file;
+     RamBlockAttributes *attributes;
+     size_t page_size;
+     /* dirty bitmap used during migration */
+diff --git a/system/physmem.c b/system/physmem.c
+index c21ea92915..7265280348 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -84,6 +84,11 @@
+ #include "qemu/mmap-alloc.h"
+ #endif
+ 
++#ifdef _WIN32
++#include <io.h>          /* _open_osfhandle */
++#include <winioctl.h>    /* FSCTL_SET_SPARSE */
++#endif
++
+ #include "monitor/monitor.h"
+ 
+ #ifdef CONFIG_LIBDAXCTL
+@@ -2146,6 +2151,111 @@ static void dirty_memory_extend(ram_addr_t new_ram_size)
+     ram_list.num_dirty_blocks = new_num_blocks;
+ }
+ 
++#ifdef _WIN32
++/* omni: back guest RAM with a mapped sparse FILE instead of private commit.
++ *
++ * WHY. Windows charges system commit for every privately committed page, and
++ * QEMU allocates the whole of `-m` that way -- so 30 farming instances need
++ * ~92-120 GB of commit, i.e. a ~100 GB pagefile, on a 32 GB host. A mapped
++ * view of a file is backed by THAT FILE, not by the pagefile, and is not
++ * charged.
++ *
++ * MEASURED on the target host before this was written (tools/probes/):
++ *
++ *   3 GiB of guest RAM                       system commit
++ *   VirtualAlloc(MEM_RESERVE|MEM_COMMIT)         +3078 MB
++ *   CreateFileMapping + MapViewOfFile               +12 MB
++ *
++ *   WHvMapGpaRange(file-backed)          -> 0x00000000  OK
++ *   FSCTL_SET_ZERO_DATA while GPA-mapped -> 1 (err 0), readback 0x00
++ *
++ * That second block is the one that decided this: WHPX accepts the mapping
++ * AND does not pin it, so a discard is a real discard (see patch 0008).
++ *
++ * OFF unless QEMU_RAM_FILE_DIR is set. A stock invocation must be bit-for-bit
++ * stock.
++ */
++/* Only blocks at least this big get a file. MEASURED with `info ramblock` on
++ * a -m 3072 boot of this very binary: NINE RAMBlocks exist, of which pc.ram is
++ * 3072 MiB and the other eight total ~18.7 MiB -- vga.vram at 16 MiB, then
++ * seven ROMs from 2 MiB down to 4 KiB, six of them read-only. Backing all nine
++ * would mean nine files and nine DELETE_ON_CLOSE handles per instance (270
++ * across a 30-instance fleet) to reclaim 0.6% more commit, and would put a
++ * writable temp file behind ROMs that are never discarded. 64 MiB takes the
++ * guest and nothing else, with a 4x margin over the largest block it skips. */
++#define OMNI_RAM_FILE_MIN_BYTES ((size_t)64 << 20)
++
++static void *omni_win32_file_ram_alloc(RAMBlock *block, size_t size,
++                                       Error **errp)
++{
++    const char *dir = g_getenv("QEMU_RAM_FILE_DIR");
++    g_autofree char *path = NULL;
++    HANDLE fh, mh;
++    DWORD junk = 0;
++    void *addr;
++
++    if (!dir || !*dir) {
++        return NULL;                    /* stock path */
++    }
++    if (size < OMNI_RAM_FILE_MIN_BYTES) {
++        return NULL;                    /* ROMs and framebuffers stay private */
++    }
++
++    path = g_strdup_printf("%s%comni-ram-%lu-%p.bin", dir, G_DIR_SEPARATOR,
++                           (unsigned long)GetCurrentProcessId(), (void *)block);
++
++    /* DELETE_ON_CLOSE so a killed QEMU cannot leave the file behind, and
++     * TEMPORARY so the cache manager does not eagerly write it out.
++     * FILE_SHARE_* is deliberately wide: the reaper in qemu_proc.py walks
++     * this directory while instances are live. */
++    fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
++                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                     NULL, CREATE_ALWAYS,
++                     FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
++                     NULL);
++    if (fh == INVALID_HANDLE_VALUE) {
++        error_setg(errp, "omni: cannot create RAM file %s (%lu)",
++                   path, GetLastError());
++        return NULL;
++    }
++    /* Sparse, so EndOfFile is the guest's -m while AllocationSize tracks only
++     * what the guest has actually touched -- and so patch 0008 can punch it
++     * back down. Without this the file is fully allocated on first write and
++     * the disk cost equals -m, which trades one wall for another. */
++    if (!DeviceIoControl(fh, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &junk, NULL)) {
++        error_setg(errp, "omni: RAM file is not sparse (%lu)", GetLastError());
++        CloseHandle(fh);
++        return NULL;
++    }
++
++    mh = CreateFileMappingA(fh, NULL, PAGE_READWRITE,
++                            (DWORD)((uint64_t)size >> 32),
++                            (DWORD)((uint64_t)size & 0xFFFFFFFFu), NULL);
++    if (!mh) {
++        error_setg(errp, "omni: CreateFileMapping %zu failed (%lu)",
++                   size, GetLastError());
++        CloseHandle(fh);
++        return NULL;
++    }
++    addr = MapViewOfFile(mh, FILE_MAP_ALL_ACCESS, 0, 0, size);
++    /* The section keeps the mapping alive; the handle is not needed again. */
++    CloseHandle(mh);
++    if (!addr) {
++        error_setg(errp, "omni: MapViewOfFile %zu failed (%lu)",
++                   size, GetLastError());
++        CloseHandle(fh);
++        return NULL;
++    }
++
++    /* Keep the HANDLE itself. NOT an int fd: RAMBlock is g_malloc0'd, so a
++     * new int field would arrive as 0 -- a VALID descriptor -- and every
++     * block in QEMU would look like it had one. NULL is the natural zero. */
++    block->omni_ram_file = fh;
++
++    return addr;
++}
++#endif /* _WIN32 */
++
+ static void ram_block_add(RAMBlock *new_block, Error **errp)
+ {
+     const bool noreserve = qemu_ram_is_noreserve(new_block);
+@@ -2169,6 +2279,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
+                 return;
+             }
+         } else {
++#ifdef _WIN32
++            Error *omni_err = NULL;
++            new_block->host = omni_win32_file_ram_alloc(
++                new_block, new_block->max_length, &omni_err);
++            if (omni_err) {
++                /* Opting in and then silently falling back to private commit
++                 * would look like the feature working and reproduce exactly
++                 * the pagefile this exists to remove. Fail loudly. */
++                error_propagate(errp, omni_err);
++                qemu_mutex_unlock_ramlist();
++                return;
++            }
++            if (!new_block->host)
++#endif
+             new_block->host = qemu_anon_ram_alloc(new_block->max_length,
+                                                   &new_block->mr->align,
+                                                   shared, noreserve);

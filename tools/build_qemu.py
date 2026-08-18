@@ -42,13 +42,13 @@ _TARGET_BINARY = {
 # out of `--version` to detect capabilities, and a second task appending it
 # is how a duplicate lands.
 #
-# It says only "omni-window" because that is all THIS series has: patch
-# 0007 (the RAM file backing) is Task 3's work and does not exist yet. Task
-# 3 appends "+omni-ram-file" here once 0007 lands -- not before, because
-# qemu_supports_ram_file() (Task 6) trusts this string verbatim to decide
-# whether to set QEMU_RAM_FILE_DIR, and a tag that claims a capability the
-# binary does not have is worse than no tag: QEMU would silently ignore the
-# env var while the caller believed file-backed RAM was in effect.
+# It says "omni-window+omni-ram-file" because patch 0007 (the RAM file
+# backing) landed in Task 3. qemu_supports_ram_file() (Task 6) trusts this
+# string verbatim to decide whether to set QEMU_RAM_FILE_DIR, and a tag that
+# claims a capability the binary does not have is worse than no tag: QEMU
+# would silently ignore the env var while the caller believed file-backed
+# RAM was in effect. That is why this became true exactly when 0007 landed
+# and not before.
 _COMMON_FLAGS = (
     "--enable-gtk",
     "--enable-opengl",
@@ -56,7 +56,7 @@ _COMMON_FLAGS = (
     "--enable-slirp",
     "--disable-docs",
     "--disable-werror",
-    "--with-pkgversion=omni-window",
+    "--with-pkgversion=omni-window+omni-ram-file",
 )
 
 _ACCEL_FLAG = {"win32": "--enable-whpx", "darwin": "--enable-hvf",
@@ -153,7 +153,14 @@ _ANCHORS = (
     # patch's own hunk header (`@@ ... ram_block_discard_shared_range`).
     ("system/physmem.c", "DiscardVirtualMemory",
      "ram_block_discard_shared_range", "0005"),
-    ("system/physmem.c", "omni_win32_file_ram_alloc", "ram_block_add", "0007"),
+    # Not "omni_win32_file_ram_alloc": that name's first occurrence is its
+    # own definition (file scope, this same patch adds it just above
+    # ram_block_add), not the call inside ram_block_add -- the exact trap
+    # this module's docstring warns about, and it was live here until
+    # Task 3 actually ran verify_applied() against the built worktree and
+    # got a false violation on a clean apply. "omni_err" is declared and
+    # used only at the call site inside ram_block_add.
+    ("system/physmem.c", "omni_err", "ram_block_add", "0007"),
     ("system/physmem.c", "FSCTL_SET_ZERO_DATA", "ram_block_discard_range",
      "0008"),
 )

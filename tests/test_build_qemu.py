@@ -81,9 +81,14 @@ class EnclosingFunctionIsNotFooled(unittest.TestCase):
     WRONG function is worse than reporting nothing."""
 
     def test_brace_in_a_comment_does_not_shift_scope(self):
+        # The comment's brace is UNBALANCED (opens a scope it never closes).
+        # A balanced pair like `if (x) { y(); }` nets back to the right depth
+        # by literal counting alone, so it would pass even without the
+        # comment-blanking guard this test exists to prove -- this fixture
+        # does not net back, so only real blanking gets "beta" right.
         src = (
             'static void alpha(void)\n{\n'
-            '    /* an example: if (x) { y(); } */\n'
+            '    /* opens a scope: if (x) { */\n'
             '    int a;\n}\n\n'
             'static void beta(void)\n{\n'
             '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n'
@@ -113,11 +118,13 @@ class EnclosingFunctionIsNotFooled(unittest.TestCase):
                '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n')
         self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
 
-    def test_a_prototype_does_not_become_the_scope(self):
-        src = ('static void alpha(void);\n\n'
-               'static void beta(void)\n{\n'
-               '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n')
-        self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
+    # test_a_prototype_does_not_become_the_scope was dropped: its fixture put
+    # the needle inside beta's own body, and beta's own name-paren sets
+    # `pending` to "beta" whether or not the "only if pending is None" guard
+    # exists -- an unguarded implementation that always overwrites `pending`
+    # on any depth-0 '(' gets this fixture right too. It proved nothing
+    # about the guard the class docstring says it exists to check; the
+    # guard is what test_attribute_macro_after_the_signature actually pins.
 
 
 class AnchorCheck(unittest.TestCase):

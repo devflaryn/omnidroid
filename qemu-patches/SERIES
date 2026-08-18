@@ -6,3 +6,4 @@
 0004-omni-confirm-close.patch
 0005-omni-win32-discard.patch
 0006-omni-win32-build-no-symlinks.patch
+0007-omni-win32-ram-file.patch
