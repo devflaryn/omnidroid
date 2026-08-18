@@ -1,0 +1,20 @@
+diff --git a/scripts/symlink-install-tree.py b/scripts/symlink-install-tree.py
+index b72563895c..7675f5ca5c 100644
+--- a/scripts/symlink-install-tree.py
++++ b/scripts/symlink-install-tree.py
+@@ -28,6 +28,15 @@ def destdir_join(d1: str, d2: str) -> str:
+     try:
+         os.symlink(source, bundle_dest)
+     except BaseException as e:
++        # omni: Windows refuses symlinks without Developer Mode or admin
++        # (WinError 1314). This bundle tree only exists to run QEMU from the
++        # build directory; we install to a prefix instead, so skipping it
++        # costs nothing and keeps the build unprivileged. A copy is NOT a
++        # substitute -- meson points these links at files the build has not
++        # produced yet.
++        if (os.name == 'nt' and isinstance(e, OSError)
++                and e.errno != errno.EEXIST):
++            continue
+         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
+             if os.name == 'nt':
+                 print('Please enable Developer Mode to support soft link '

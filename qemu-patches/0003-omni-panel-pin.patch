@@ -1,0 +1,37 @@
+diff --git a/ui/gtk.c b/ui/gtk.c
+index c267eac647..3e876f2c0f 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -944,6 +944,32 @@ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+ {
+     QemuUIInfo info;
+ 
++    /* omni: pin the guest panel to the size the launcher actually asked
++     * for, instead of whatever the window happens to be.
++     *
++     * QEMU opens its window before the guest has set a mode, then reports
++     * that window's client size to the guest as ui-info -- and the guest
++     * adopts it. MEASURED: the window opened 656x544, the guest took
++     * 640x505 (exactly the client area) and kept it, while Android's own
++     * `wm size` override stayed 1280x800. Android then letterboxes a 1.600
++     * logical display into a 1.267 physical panel, so the black bands are
++     * baked into the framebuffer before QEMU ever sees them.
++     *
++     * Suppressing ui-info altogether does NOT work -- MEASURED: the guest
++     * never finishes bringing its display up and the boot times out at
++     * 6 min without adbd. So the handshake stays; only the numbers change.
++     */
++    if (g_getenv("QEMU_WINDOW_LOCK_ASPECT")) {
++        const char *panel = g_getenv("QEMU_WINDOW_PANEL");
++        int pw = 0, ph = 0;
++
++        if (panel && sscanf(panel, "%dx%d", &pw, &ph) == 2 &&
++            pw > 0 && ph > 0) {
++            width = pw;
++            height = ph;
++        }
++    }
++
+     if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
+         return;
+     }

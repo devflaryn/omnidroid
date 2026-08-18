@@ -1,0 +1,46 @@
+diff --git a/system/physmem.c b/system/physmem.c
+index c21ea92915..c160159542 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -4191,6 +4191,41 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
+                              __func__, rb->idstr, offset, length, ret);
+                 goto err;
+             }
++#elif defined(_WIN32)
++            /* omni: Windows has no madvise(), so every discard here used to
++             * return -ENOSYS -- the guest handed its pages back and the host
++             * kept paying for them. DiscardVirtualMemory() is MADV_DONTNEED
++             * in the ways that matter: the pages leave the working set, the
++             * frames are freed, the reservation and protection stay, and the
++             * next touch reads zeroes with no pagefile write.
++             * Resolved dynamically so the build does not depend on the SDK
++             * declaring it. */
++            {
++                typedef DWORD (WINAPI *omni_discard_fn)(PVOID, SIZE_T);
++                static omni_discard_fn omni_discard;
++                static bool omni_discard_resolved;
++
++                if (!omni_discard_resolved) {
++                    omni_discard_resolved = true;
++                    omni_discard = (omni_discard_fn)(void *)GetProcAddress(
++                        GetModuleHandleA("kernel32.dll"),
++                        "DiscardVirtualMemory");
++                }
++                if (!omni_discard) {
++                    ret = -ENOSYS;
++                    error_report("%s: DiscardVirtualMemory unavailable "
++                                 "%s:%" PRIx64 " +%zx", __func__,
++                                 rb->idstr, offset, length);
++                    goto err;
++                }
++                if (omni_discard(host_startaddr, length) != ERROR_SUCCESS) {
++                    ret = -EIO;
++                    error_report("%s: Failed to discard range "
++                                 "%s:%" PRIx64 " +%zx", __func__,
++                                 rb->idstr, offset, length);
++                    goto err;
++                }
++            }
+ #else
+             ret = -ENOSYS;
+             error_report("%s: MADVISE not available %s:%" PRIx64 " +%zx (%d)",

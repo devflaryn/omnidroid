@@ -1,0 +1,40 @@
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 3e876f2c0f..83bbebde17 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -920,6 +920,35 @@ static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
+         allow_close = false;
+     }
+ 
++    if (allow_close && g_getenv("QEMU_WINDOW_CONFIRM_CLOSE")) {
++        /* omni: closing this window powers off a machine that took a minute
++         * to boot. Ask first -- an accidental click is otherwise
++         * unrecoverable. */
++        GtkWidget *omni_dlg;
++        gint omni_resp;
++
++        omni_dlg = gtk_message_dialog_new(GTK_WINDOW(s->window),
++                                          GTK_DIALOG_MODAL |
++                                          GTK_DIALOG_DESTROY_WITH_PARENT,
++                                          GTK_MESSAGE_WARNING,
++                                          GTK_BUTTONS_NONE,
++                                          "Stop this instance?");
++        gtk_message_dialog_format_secondary_text(
++            GTK_MESSAGE_DIALOG(omni_dlg),
++            "It will be powered off, and anything running inside it is lost.");
++        gtk_dialog_add_buttons(GTK_DIALOG(omni_dlg),
++                               "Cancel", GTK_RESPONSE_CANCEL,
++                               "Stop instance", GTK_RESPONSE_ACCEPT, NULL);
++        gtk_dialog_set_default_response(GTK_DIALOG(omni_dlg),
++                                        GTK_RESPONSE_CANCEL);
++        omni_resp = gtk_dialog_run(GTK_DIALOG(omni_dlg));
++        gtk_widget_destroy(omni_dlg);
++        if (omni_resp != GTK_RESPONSE_ACCEPT) {
++            return TRUE;
++        }
++        allow_close = true;
++    }
++
+     if (allow_close) {
+         qmp_quit(NULL);
+     }

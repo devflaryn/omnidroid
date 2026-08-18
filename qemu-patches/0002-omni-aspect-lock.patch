@@ -12,71 +12,6 @@ index 5c9c34a069..183b2b9132 100644
  void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
  void gd_hw_gl_flushed(void *vc);
  
-diff --git a/scripts/symlink-install-tree.py b/scripts/symlink-install-tree.py
-index b72563895c..4c54f7eb42 100644
---- a/scripts/symlink-install-tree.py
-+++ b/scripts/symlink-install-tree.py
-@@ -28,6 +28,14 @@ def destdir_join(d1: str, d2: str) -> str:
-     try:
-         os.symlink(source, bundle_dest)
-     except BaseException as e:
-+        # omni: Windows refuses symlinks without Developer Mode or admin
-+        # (WinError 1314). This bundle tree only exists to run QEMU from the
-+        # build directory; we install to a prefix instead, so skipping it
-+        # costs nothing and keeps the build unprivileged. A copy is NOT a
-+        # substitute -- meson points these links at files the build has not
-+        # produced yet.
-+        if os.name == 'nt' and isinstance(e, OSError) and                 e.errno != errno.EEXIST:
-+            continue
-         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
-             if os.name == 'nt':
-                 print('Please enable Developer Mode to support soft link '
-diff --git a/system/physmem.c b/system/physmem.c
-index c21ea92915..c160159542 100644
---- a/system/physmem.c
-+++ b/system/physmem.c
-@@ -4191,6 +4191,41 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
-                              __func__, rb->idstr, offset, length, ret);
-                 goto err;
-             }
-+#elif defined(_WIN32)
-+            /* omni: Windows has no madvise(), so every discard here used to
-+             * return -ENOSYS -- the guest handed its pages back and the host
-+             * kept paying for them. DiscardVirtualMemory() is MADV_DONTNEED
-+             * in the ways that matter: the pages leave the working set, the
-+             * frames are freed, the reservation and protection stay, and the
-+             * next touch reads zeroes with no pagefile write.
-+             * Resolved dynamically so the build does not depend on the SDK
-+             * declaring it. */
-+            {
-+                typedef DWORD (WINAPI *omni_discard_fn)(PVOID, SIZE_T);
-+                static omni_discard_fn omni_discard;
-+                static bool omni_discard_resolved;
-+
-+                if (!omni_discard_resolved) {
-+                    omni_discard_resolved = true;
-+                    omni_discard = (omni_discard_fn)(void *)GetProcAddress(
-+                        GetModuleHandleA("kernel32.dll"),
-+                        "DiscardVirtualMemory");
-+                }
-+                if (!omni_discard) {
-+                    ret = -ENOSYS;
-+                    error_report("%s: DiscardVirtualMemory unavailable "
-+                                 "%s:%" PRIx64 " +%zx", __func__,
-+                                 rb->idstr, offset, length);
-+                    goto err;
-+                }
-+                if (omni_discard(host_startaddr, length) != ERROR_SUCCESS) {
-+                    ret = -EIO;
-+                    error_report("%s: Failed to discard range "
-+                                 "%s:%" PRIx64 " +%zx", __func__,
-+                                 rb->idstr, offset, length);
-+                    goto err;
-+                }
-+            }
- #else
-             ret = -ENOSYS;
-             error_report("%s: MADVISE not available %s:%" PRIx64 " +%zx (%d)",
 diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
 index 29497019ee..531718870a 100644
 --- a/ui/gtk-gl-area.c
@@ -96,20 +31,10 @@ index 29497019ee..531718870a 100644
  
      gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
 diff --git a/ui/gtk.c b/ui/gtk.c
-index 7078d89d67..83bbebde17 100644
+index 37650292b9..c267eac647 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
-@@ -229,7 +229,8 @@ static void gd_update_caption(GtkDisplayState *s)
-     int i;
- 
-     if (qemu_name) {
--        prefix = g_strdup_printf("QEMU (%s)", qemu_name);
-+        /* omni: the embedder owns the caption; -name is the title. */
-+        prefix = g_strdup_printf("%s", qemu_name);
-     } else {
-         prefix = g_strdup_printf("QEMU");
-     }
-@@ -267,6 +268,166 @@ static void gd_update_caption(GtkDisplayState *s)
+@@ -268,6 +268,166 @@ static void gd_update_caption(GtkDisplayState *s)
      g_free(prefix);
  }
  
@@ -276,7 +201,7 @@ index 7078d89d67..83bbebde17 100644
  static void gd_update_geometry_hints(VirtualConsole *vc)
  {
      GtkDisplayState *s = vc->s;
-@@ -284,6 +445,32 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
+@@ -285,6 +445,32 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
          geo.min_width  = surface_width(vc->gfx.ds) * scale_x;
          geo.min_height = surface_height(vc->gfx.ds) * scale_y;
          mask |= GDK_HINT_MIN_SIZE;
@@ -309,7 +234,7 @@ index 7078d89d67..83bbebde17 100644
          geo_widget = vc->gfx.drawing_area;
          gtk_widget_set_size_request(geo_widget, geo.min_width, geo.min_height);
  
-@@ -336,6 +523,15 @@ void gd_update_windowsize(VirtualConsole *vc)
+@@ -337,6 +523,15 @@ void gd_update_windowsize(VirtualConsole *vc)
  
      gd_update_geometry_hints(vc);
  
@@ -325,95 +250,3 @@ index 7078d89d67..83bbebde17 100644
      if (vc->type == GD_VC_GFX && !s->full_screen && !s->free_scale) {
          gtk_window_resize(GTK_WINDOW(vc->window ? vc->window : s->window),
                            VC_WINDOW_X_MIN, VC_WINDOW_Y_MIN);
-@@ -724,6 +920,35 @@ static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
-         allow_close = false;
-     }
- 
-+    if (allow_close && g_getenv("QEMU_WINDOW_CONFIRM_CLOSE")) {
-+        /* omni: closing this window powers off a machine that took a minute
-+         * to boot. Ask first -- an accidental click is otherwise
-+         * unrecoverable. */
-+        GtkWidget *omni_dlg;
-+        gint omni_resp;
-+
-+        omni_dlg = gtk_message_dialog_new(GTK_WINDOW(s->window),
-+                                          GTK_DIALOG_MODAL |
-+                                          GTK_DIALOG_DESTROY_WITH_PARENT,
-+                                          GTK_MESSAGE_WARNING,
-+                                          GTK_BUTTONS_NONE,
-+                                          "Stop this instance?");
-+        gtk_message_dialog_format_secondary_text(
-+            GTK_MESSAGE_DIALOG(omni_dlg),
-+            "It will be powered off, and anything running inside it is lost.");
-+        gtk_dialog_add_buttons(GTK_DIALOG(omni_dlg),
-+                               "Cancel", GTK_RESPONSE_CANCEL,
-+                               "Stop instance", GTK_RESPONSE_ACCEPT, NULL);
-+        gtk_dialog_set_default_response(GTK_DIALOG(omni_dlg),
-+                                        GTK_RESPONSE_CANCEL);
-+        omni_resp = gtk_dialog_run(GTK_DIALOG(omni_dlg));
-+        gtk_widget_destroy(omni_dlg);
-+        if (omni_resp != GTK_RESPONSE_ACCEPT) {
-+            return TRUE;
-+        }
-+        allow_close = true;
-+    }
-+
-     if (allow_close) {
-         qmp_quit(NULL);
-     }
-@@ -748,6 +973,32 @@ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
- {
-     QemuUIInfo info;
- 
-+    /* omni: pin the guest panel to the size the launcher actually asked
-+     * for, instead of whatever the window happens to be.
-+     *
-+     * QEMU opens its window before the guest has set a mode, then reports
-+     * that window's client size to the guest as ui-info -- and the guest
-+     * adopts it. MEASURED: the window opened 656x544, the guest took
-+     * 640x505 (exactly the client area) and kept it, while Android's own
-+     * `wm size` override stayed 1280x800. Android then letterboxes a 1.600
-+     * logical display into a 1.267 physical panel, so the black bands are
-+     * baked into the framebuffer before QEMU ever sees them.
-+     *
-+     * Suppressing ui-info altogether does NOT work -- MEASURED: the guest
-+     * never finishes bringing its display up and the boot times out at
-+     * 6 min without adbd. So the handshake stays; only the numbers change.
-+     */
-+    if (g_getenv("QEMU_WINDOW_LOCK_ASPECT")) {
-+        const char *panel = g_getenv("QEMU_WINDOW_PANEL");
-+        int pw = 0, ph = 0;
-+
-+        if (panel && sscanf(panel, "%dx%d", &pw, &ph) == 2 &&
-+            pw > 0 && ph > 0) {
-+            width = pw;
-+            height = ph;
-+        }
-+    }
-+
-     if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
-         return;
-     }
-@@ -2759,7 +3010,21 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
-     qemu_add_mouse_mode_change_notifier(&s->mouse_mode_notifier);
-     s->vmse = qemu_add_vm_change_state_handler(gd_change_runstate, s);
- 
--    gtk_window_set_icon_name(GTK_WINDOW(s->window), "qemu");
-+    /* omni: use the embedder's own logo when it points at one. Falls
-+     * back to the stock icon so this build stays a drop-in replacement. */
-+    {
-+        const char *omni_icon = g_getenv("QEMU_WINDOW_ICON");
-+        GError *omni_icon_err = NULL;
-+
-+        if (!omni_icon || !*omni_icon ||
-+            !gtk_window_set_icon_from_file(GTK_WINDOW(s->window), omni_icon,
-+                                           &omni_icon_err)) {
-+            if (omni_icon_err) {
-+                g_error_free(omni_icon_err);
-+            }
-+            gtk_window_set_icon_name(GTK_WINDOW(s->window), "qemu");
-+        }
-+    }
- 
-     gd_create_menus(s, opts);
- 
