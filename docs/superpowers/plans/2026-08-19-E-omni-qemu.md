@@ -1395,6 +1395,33 @@ another's WM_CLOSE without injecting a DLL. Verified by clicking all three."
 **Interfaces:**
 - Consumes: patch 0007's `QEMU_RAM_FILE_DIR` contract.
 - Produces: `qemu_proc.ram_file_env(env, cfg, mode) -> dict` — sets `QEMU_RAM_FILE_DIR` to `scratch_dir(cfg)` when the mode's profile is `density`, the host is Windows, and the resolved QEMU advertises the capability; returns `env` unchanged otherwise. Called from `scratch_env` (`qemu_proc.py:2295`). Task 7 consumes `qemu_supports_ram_file(cfg)`.
+  - `ram_file_reserve_mb(mode, cfg=None) -> int` — the worst-case disk the RAM
+    file can occupy for this mode (`mode["mem"]`), or 0 when file backing is
+    not in play. Added to `scratch_room`'s `want_mb`.
+
+**The disk gate stops being advisory, and this is the load-bearing part of the
+task.** Today, exhausting the scratch disk costs a *failed launch*: the qcow2
+overlay cannot grow, the error is I/O-shaped, and it is attributable to the
+instance that caused it. With guest RAM in a sparse file, exhausting the disk
+means a **running** guest's next page fault cannot be satisfied — on Windows
+that is `STATUS_IN_PAGE_ERROR` against a mapped view, and it takes the VM down
+with no clean error path. Disk exhaustion moves from "the next launch fails" to
+"an arbitrary already-farming instance dies" — which matters precisely because
+this sub-project makes disk the binding wall.
+
+So `scratch_room`'s `want_mb` gains the RAM file's **worst case** (`-m`, not
+its expected allocation), a real reserve stays on top, and a launch that cannot
+prove the room is refused rather than admitted — an admitted launch can kill a
+running neighbour, and a refused one cannot. `SCRATCH_PER_INSTANCE_MB` (2048)
+and `SCRATCH_FLOOR_MB` (2048) at `qemu_proc.py:2272-2275` size the overlay term
+today and are where this is added. `doctor` reports the expected and worst-case
+figures separately, so the gap is visible rather than assumed.
+
+Reaping needs no change, which is worth stating because it looks like it
+would: `reap_scratch` globs `vl.*` only — QEMU's own overlay template — so it
+never sees these files, and never needs to, because
+`FILE_FLAG_DELETE_ON_CLOSE` makes Windows drop them when the process exits,
+crash and `taskkill` included.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1439,6 +1466,22 @@ class RamFileBacking(unittest.TestCase):
         env = qemu_proc.ram_file_env({}, cfg={}, mode=self._mode(),
                                      is_windows=True, supported=False)
         self.assertNotIn("QEMU_RAM_FILE_DIR", env)
+
+    def test_the_disk_gate_accounts_for_the_ram_file(self):
+        """Exhausting the disk used to fail a LAUNCH. With guest RAM in a
+        sparse file it kills a RUNNING guest -- STATUS_IN_PAGE_ERROR on a
+        mapped view, no clean error path. So the gate budgets the worst case
+        (-m), not the expected allocation."""
+        mode = {"profile": "density", "mem": 4096}
+        self.assertEqual(qemu_proc.ram_file_reserve_mb(mode, cfg={},
+                                                       supported=True,
+                                                       is_windows=True), 4096)
+
+    def test_no_reserve_when_the_file_is_not_in_play(self):
+        mode = {"profile": "performance", "mem": 4096}
+        self.assertEqual(qemu_proc.ram_file_reserve_mb(mode, cfg={},
+                                                       supported=True,
+                                                       is_windows=True), 0)
 
     def test_no_scratch_dir_means_no_backing(self):
         env = qemu_proc.ram_file_env({}, cfg={"qemu": {"scratch_dir": ""}},
