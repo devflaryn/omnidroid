@@ -55,18 +55,19 @@ lifted as-is:
 
 | patch | file | what |
 |---|---|---|
-| `0001-omni-window-icon` | `ui/gtk.c` | `QEMU_WINDOW_ICON` |
+| `0001-omni-window-identity` | `ui/gtk.c` | `QEMU_WINDOW_ICON`, and `QEMU_WINDOW_TITLE` — the caption. `-name` stays the window *identity* that `hostwin.find_window` matches on; the *title* is a separate string (`qemu_proc.window_title`), so it gets a separate variable rather than collapsing the two. Supersedes `hostwin._apply_title`, which marshals `WM_SETTEXT` into another process today only because there was no patched build |
 | `0002-omni-aspect-lock` | `ui/gtk.c`, `include/ui/gtk.h`, `ui/gtk-gl-area.c` | `QEMU_WINDOW_LOCK_ASPECT` -> a `WM_SIZING` GDK filter on Windows, `GDK_HINT_ASPECT` elsewhere |
 | `0003-omni-panel-pin` | `ui/gtk.c` | `QEMU_WINDOW_PANEL` — stop the guest adopting the window's startup size as its panel |
 | `0004-omni-confirm-close` | `ui/gtk.c` | `QEMU_WINDOW_CONFIRM_CLOSE` |
 | `0005-omni-win32-discard` | `system/physmem.c` | `DiscardVirtualMemory` as the `_WIN32` arm of `ram_block_discard_range` |
+| `0006-omni-win32-build-no-symlinks` | `scripts/symlink-install-tree.py` | meson's bundle step symlinks; Windows refuses symlinks without Developer Mode, and stock QEMU's handler fails the build telling you to enable it. Skips the bundle tree instead — free here, because we install to a prefix rather than running QEMU out of the build directory. Nearly discarded as scaffolding; the build does not work without it |
 
 Two are new:
 
 | patch | what |
 |---|---|
-| `0006-omni-win32-memory-backend-file` | `backends/hostmem-file.c` + `system/physmem.c` + `backends/meson.build` — guest RAM from a mapped file on Windows |
-| `0007-omni-win32-punch-hole` | `FSCTL_SET_ZERO_DATA` as the file-backed arm of the discard path, so a discard reclaims the *disk* as well as the RAM |
+| `0007-omni-win32-ram-file` | `system/physmem.c` + `include/system/ramblock.h` — guest RAM from a mapped sparse file, env-gated on `QEMU_RAM_FILE_DIR`. **Not** a port of `memory-backend-file`, which this section originally called for: `hostmem-file.c` is excluded on Windows at `backends/meson.build:13` and `file_ram_alloc` sits behind `CONFIG_POSIX`, so that route is QAPI plus meson plus the whole fd allocation path. Backing the *anonymous* allocation instead is one function and one call site at `physmem.c:2171`, needs no new object type, and covers every RAM block rather than only the one the machine type wires up. Same measured numbers, smaller surface. The fd is carried in a dedicated `omni_ram_fd` field rather than `RAMBlock.fd`, so no existing QEMU semantic changes — see the plan's ruling R5 |
+| `0008-omni-win32-punch-hole` | `FSCTL_SET_ZERO_DATA` as the file-backed arm of the discard path, so a discard reclaims the *disk* as well as the RAM |
 
 ### 3b. The close prompt becomes three options
 
