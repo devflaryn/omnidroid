@@ -257,10 +257,23 @@ that each patch touches only the files the design assigns it."
   - `read_pin(patches_dir: Path) -> str`
   - `configure_argv(prefix: Path, targets: list[str], extra: list[str] = ()) -> list[str]`
   - `apply_argv(patch: Path) -> list[str]`
+  - `verify_applied(work: Path, series: list[Path]) -> list[str]`
   - `stage_plan(build_dir: Path, out_dir: Path, targets: list[str]) -> list[tuple[Path, Path]]`
   - `main(argv: list[str] | None = None) -> int`
 
   Task 9 calls `configure_argv` and `stage_plan`.
+
+**Why `verify_applied` exists — read this before writing it.** During Task 1's
+fix round, growing patch `0001` by nine lines caused `git apply` to place
+`0003`'s panel-pin hunk inside `gd_set_ui_refresh_rate` instead of
+`gd_set_ui_size` — **and print `OK`**. Byte count right, location wrong, exit
+status zero. `git apply` matches on surrounding context, so any change to a
+patch's size, any rebase onto a newer upstream tag, and any build on a machine
+whose tree differs slightly can slide a hunk into a neighbouring function and
+report success. The result compiles, runs, and is wrong. A diff-stat comparison
+cannot see it — the byte count was correct. Only an anchor check can, and the
+build script is where it belongs, because the build script is what applies the
+series on every machine including the Mac.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -272,11 +285,12 @@ Everything here is pure: argv construction and plan shape. Nothing compiles.
 The build itself is verified by running it (Task 2 Step 5), because a build
 is not a thing a unit test can pin.
 """
+import tempfile
 import unittest
 from pathlib import Path
 
 from tools.build_qemu import (apply_argv, configure_argv, read_pin,
-                              read_series, stage_plan)
+                              read_series, stage_plan, verify_applied)
 
 REPO = Path(__file__).resolve().parent.parent
 PATCHES = REPO / "qemu-patches"
@@ -330,6 +344,67 @@ class Apply(unittest.TestCase):
         argv = apply_argv(Path("/p/0001.patch"))
         self.assertEqual(argv[:2], ["git", "apply"])
         self.assertIn("--check", apply_argv(Path("/p/0001.patch"), check=True))
+
+
+class AnchorCheck(unittest.TestCase):
+    """A hunk that lands in the wrong function still applies, still compiles,
+    and still reports OK. This happened for real in Task 1's fix round --
+    0003's panel-pin block went into gd_set_ui_refresh_rate instead of
+    gd_set_ui_size when 0001 grew by nine lines. Diff stats cannot see it.
+    """
+
+    GOOD = """
+static void gd_set_ui_refresh_rate(VirtualConsole *vc, int refresh_rate)
+{
+    QemuUIInfo info;
+    info.refresh_rate = refresh_rate;
+}
+
+static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+{
+    if (g_getenv("QEMU_WINDOW_LOCK_ASPECT")) {
+        const char *panel = g_getenv("QEMU_WINDOW_PANEL");
+    }
+}
+"""
+    BAD = """
+static void gd_set_ui_refresh_rate(VirtualConsole *vc, int refresh_rate)
+{
+    QemuUIInfo info;
+    const char *panel = g_getenv("QEMU_WINDOW_PANEL");
+}
+
+static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+{
+    return;
+}
+"""
+
+    def _tree(self, body):
+        d = Path(tempfile.mkdtemp())
+        (d / "ui").mkdir()
+        (d / "ui" / "gtk.c").write_text(body, encoding="utf-8")
+        (d / "system").mkdir()
+        (d / "system" / "physmem.c").write_text("", encoding="utf-8")
+        return d
+
+    def test_clean_tree_reports_no_violations(self):
+        out = verify_applied(self._tree(self.GOOD),
+                             [Path("0003-omni-panel-pin.patch")])
+        self.assertEqual([v for v in out if "QEMU_WINDOW_PANEL" in v], [])
+
+    def test_misplaced_hunk_is_caught(self):
+        out = verify_applied(self._tree(self.BAD),
+                             [Path("0003-omni-panel-pin.patch")])
+        self.assertTrue(any("QEMU_WINDOW_PANEL" in v and "gd_set_ui_size" in v
+                            for v in out),
+                        f"a hunk in the wrong function went unreported: {out}")
+
+    def test_anchors_for_absent_patches_are_not_asserted(self):
+        """0007 and 0008 do not exist until tasks 3 and 4. Their anchors must
+        not fail a build that legitimately has not got them yet."""
+        out = verify_applied(self._tree(self.GOOD), [])
+        self.assertEqual(out, [])
 
 
 class Stage(unittest.TestCase):
@@ -468,6 +543,96 @@ def apply_argv(patch: Path, check: bool = False) -> list[str]:
     return argv
 
 
+# Each omni symbol, and the function whose body it MUST sit inside. See
+# verify_applied() for why this table exists rather than a diff-stat check.
+# The third element is the patch that introduces the symbol; anchors whose
+# patch is not in the series being applied are skipped, so this table can
+# name 0007/0008 before they exist.
+_ANCHORS = (
+    ("ui/gtk.c", "QEMU_WINDOW_TITLE", "gd_update_caption", "0001"),
+    ("ui/gtk.c", "omni_install_aspect_filter", "gd_update_geometry_hints",
+     "0002"),
+    ("ui/gtk.c", "QEMU_WINDOW_PANEL", "gd_set_ui_size", "0003"),
+    ("ui/gtk.c", "QEMU_WINDOW_CONFIRM_CLOSE", "gd_window_close", "0004"),
+    ("system/physmem.c", "DiscardVirtualMemory", "ram_block_discard_range",
+     "0005"),
+    ("system/physmem.c", "omni_win32_file_ram_alloc", "ram_block_add", "0007"),
+    ("system/physmem.c", "FSCTL_SET_ZERO_DATA", "ram_block_discard_range",
+     "0008"),
+)
+
+
+def _enclosing_function(text: str, needle: str):
+    """Name of the C function whose body contains the first `needle`.
+
+    Brace-counting from the top of the file rather than a regex, because the
+    thing being guarded against is a symbol landing in the WRONG function --
+    and a regex that searches backwards for the nearest `foo(...)` finds a
+    call site as readily as a definition. Returns None if `needle` is absent
+    or sits at file scope.
+    """
+    idx = text.find(needle)
+    if idx < 0:
+        return None
+    depth = 0
+    current = None
+    pending = None
+    for pos, ch in enumerate(text):
+        if pos >= idx:
+            break
+        if ch == "\n":
+            pending = None
+        elif ch == "(" and depth == 0:
+            # remember the identifier immediately before this paren
+            j = pos
+            while j > 0 and (text[j - 1].isalnum() or text[j - 1] == "_"):
+                j -= 1
+            pending = text[j:pos] or None
+        elif ch == "{":
+            if depth == 0:
+                current = pending
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                current = None
+    return current
+
+
+def verify_applied(work: Path, series):
+    """Anchor check: did every omni hunk land inside the function it belongs
+    to? Returns a list of human-readable violations, empty when clean.
+
+    THIS IS NOT BELT AND BRACES. In Task 1's fix round, growing patch 0001 by
+    nine lines made `git apply` place 0003's panel-pin block inside
+    gd_set_ui_refresh_rate instead of gd_set_ui_size -- and exit 0. The byte
+    count was right; only the location was wrong, so a diff-stat comparison
+    reported success. `git apply` matches on surrounding context, so every
+    rebase onto a newer tag and every build on a slightly different tree can
+    reproduce it. The result compiles, runs, and is wrong.
+    """
+    have = {p.name[:4] for p in series}
+    out = []
+    for rel, symbol, want_fn, patch_num in _ANCHORS:
+        if patch_num not in have:
+            continue                      # that patch is not in this series
+        path = work / rel
+        if not path.is_file():
+            out.append(f"{rel}: missing, cannot check {symbol}")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if symbol not in text:
+            out.append(f"{rel}: {symbol} not found -- patch {patch_num} "
+                       f"did not apply, or applied somewhere unexpected")
+            continue
+        got = _enclosing_function(text, symbol)
+        if got != want_fn:
+            out.append(f"{rel}: {symbol} is inside {got!r}, expected "
+                       f"{want_fn!r} -- patch {patch_num} landed in the "
+                       f"wrong function and `git apply` did not say so")
+    return out
+
+
 def stage_plan(build_dir: Path, out_dir: Path, targets: list[str]):
     """(src, dst) pairs for the portable bundle. Pure -- touches no disk."""
     exe = ".exe" if _host_key() == "win32" else ""
@@ -508,9 +673,18 @@ def main(argv=None) -> int:
         _run(["git", "-C", str(a.source), "worktree", "add",
               str(work), pin])
 
-    for patch in read_series():
+    series = read_series()
+    for patch in series:
         _run(apply_argv(patch, check=True), cwd=work)
         _run(apply_argv(patch), cwd=work)
+
+    # `git apply` printing OK is not evidence the hunks went where they
+    # belong. See verify_applied().
+    violations = verify_applied(work, series)
+    if violations:
+        for v in violations:
+            print(f"ANCHOR: {v}", file=sys.stderr)
+        raise SystemExit("patches applied to the wrong place; refusing to build")
 
     build = work / "build"
     build.mkdir(exist_ok=True)
@@ -560,7 +734,40 @@ touch tools/__init__.py
 ```bash
 python -m pytest tests/test_build_qemu.py -q
 ```
-Expected: PASS, 9 tests.
+Expected: PASS, 12 tests.
+
+- [ ] **Step 4b: Prove the anchor check bites on the real series**
+
+A guard that has never fired is a guard nobody has tested. Apply the series to
+a throwaway worktree, deliberately break one patch's context, and confirm the
+build refuses:
+
+```bash
+export PATH="/c/msys64/mingw64/bin:$PATH"
+cd "C:/Users/berat/Desktop/Omni Apps/omnidroid"
+# 1. clean series -> no violations
+python -c "
+from pathlib import Path
+from tools.build_qemu import read_series, verify_applied
+import subprocess
+subprocess.run(['git','-C','/c/qemubuild','worktree','add','/c/qemu-anchor','v11.1.0'],check=True)
+for p in read_series():
+    subprocess.run(['git','apply',str(p)],cwd='/c/qemu-anchor',check=True)
+print('violations:', verify_applied(Path('/c/qemu-anchor'), read_series()))
+"
+# expect: violations: []
+# 2. move one omni block into the neighbouring function BY HAND in
+#    /c/qemu-anchor/ui/gtk.c (cut the QEMU_WINDOW_PANEL block out of
+#    gd_set_ui_size and paste it into gd_set_ui_refresh_rate), re-run the
+#    verify_applied call above, and confirm it now reports the violation
+#    naming both functions.
+git -C /c/qemubuild worktree remove --force /c/qemu-anchor
+```
+
+Expected: `[]` first, then a violation string containing `QEMU_WINDOW_PANEL`,
+`gd_set_ui_refresh_rate` and `gd_set_ui_size`. If step 2 still reports `[]`,
+`_enclosing_function` is wrong and the guard is decorative — fix it before
+moving on.
 
 - [ ] **Step 5: Run the real build — x86_64 and aarch64 together**
 
