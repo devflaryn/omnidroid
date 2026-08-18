@@ -8,8 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.build_qemu import (apply_argv, configure_argv, read_pin,
-                              read_series, stage_plan, verify_applied)
+from tools.build_qemu import (_enclosing_function, apply_argv, configure_argv,
+                              read_pin, read_series, stage_plan,
+                              verify_applied)
 
 REPO = Path(__file__).resolve().parent.parent
 PATCHES = REPO / "qemu-patches"
@@ -63,6 +64,60 @@ class Apply(unittest.TestCase):
         argv = apply_argv(Path("/p/0001.patch"))
         self.assertEqual(argv[:2], ["git", "apply"])
         self.assertIn("--check", apply_argv(Path("/p/0001.patch"), check=True))
+
+    def test_reverse_check_argv(self):
+        # main()'s idempotent apply loop uses `--reverse --check` to tell
+        # "already applied" (exit 0) from "not applied yet" (nonzero)
+        # without mutating the tree either way.
+        argv = apply_argv(Path("/p/0001.patch"), check=True, reverse=True)
+        self.assertIn("--check", argv)
+        self.assertIn("--reverse", argv)
+        self.assertEqual(argv[:2], ["git", "apply"])
+
+
+class EnclosingFunctionIsNotFooled(unittest.TestCase):
+    """The guard exists for future rebases, and a rebase is exactly when a
+    comment containing example code with a brace shows up. Reporting the
+    WRONG function is worse than reporting nothing."""
+
+    def test_brace_in_a_comment_does_not_shift_scope(self):
+        src = (
+            'static void alpha(void)\n{\n'
+            '    /* an example: if (x) { y(); } */\n'
+            '    int a;\n}\n\n'
+            'static void beta(void)\n{\n'
+            '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n'
+        )
+        self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
+
+    def test_brace_in_a_string_literal_does_not_shift_scope(self):
+        src = (
+            'static void alpha(void)\n{\n'
+            '    printf("{{{");\n}\n\n'
+            'static void beta(void)\n{\n'
+            '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n'
+        )
+        self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
+
+    def test_brace_in_a_char_literal_does_not_shift_scope(self):
+        src = (
+            "static void alpha(void)\n{\n"
+            "    char c = '{';\n}\n\n"
+            "static void beta(void)\n{\n"
+            '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n'
+        )
+        self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
+
+    def test_attribute_macro_after_the_signature(self):
+        src = ('static void beta(void) QEMU_ATTR(unused)\n{\n'
+               '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n')
+        self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
+
+    def test_a_prototype_does_not_become_the_scope(self):
+        src = ('static void alpha(void);\n\n'
+               'static void beta(void)\n{\n'
+               '    const char *panel = g_getenv("QEMU_WINDOW_PANEL");\n}\n')
+        self.assertEqual(_enclosing_function(src, "QEMU_WINDOW_PANEL"), "beta")
 
 
 class AnchorCheck(unittest.TestCase):

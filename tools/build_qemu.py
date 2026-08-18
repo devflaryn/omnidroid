@@ -105,11 +105,22 @@ def configure_argv(prefix: Path, targets: list[str], extra=(),
     return argv
 
 
-def apply_argv(patch: Path, check: bool = False) -> list[str]:
-    """argv for applying one patch. One invocation, so it is atomic."""
+def apply_argv(patch: Path, check: bool = False,
+               reverse: bool = False) -> list[str]:
+    """argv for applying (or probing) one patch. One invocation, so it is
+    atomic.
+
+    `check=True, reverse=True` together are how main() tests whether a
+    patch is ALREADY applied (`git apply --reverse --check` exits 0 iff
+    reversing it would succeed, i.e. the tree already has it) -- see the
+    idempotent apply loop in main() and Finding 2 of the fix round that
+    added this parameter.
+    """
     argv = ["git", "apply"]
     if check:
         argv.append("--check")
+    if reverse:
+        argv.append("--reverse")
     argv.append(str(patch))
     return argv
 
@@ -148,6 +159,58 @@ _ANCHORS = (
 )
 
 
+def _blank_comments_and_literals(text: str) -> str:
+    """`text` with the contents of `//`/`/* */` comments and `"..."`/'...'
+    string/char literals replaced by spaces, length and newlines preserved.
+
+    A brace inside an example snippet in a comment, or inside a string or
+    char constant, is not a scope boundary -- but `_enclosing_function`'s
+    brace counter cannot tell the difference on its own. This is the guard
+    against exactly that: it exists for a FUTURE rebase, which is precisely
+    the event most likely to introduce a comment with example code in it.
+    Length is preserved (spaces substituted, not deleted) so that offsets
+    computed against the blanked text still line up with the original.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        two = text[i:i + 2]
+        if two == "//":
+            j = i
+            while j < n and text[j] != "\n":
+                out[j] = " "
+                j += 1
+            i = j
+        elif two == "/*":
+            end = text.find("*/", i + 2)
+            end = end + 2 if end != -1 else n
+            for j in range(i, end):
+                if text[j] != "\n":
+                    out[j] = " "
+            i = end
+        elif text[i] in ("\"", "'"):
+            quote = text[i]
+            out[i] = " "
+            j = i + 1
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    out[j] = " "
+                    if text[j + 1] != "\n":
+                        out[j + 1] = " "
+                    j += 2
+                    continue
+                if text[j] != "\n":
+                    out[j] = " "
+                if text[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
 def _enclosing_function(text: str, needle: str):
     """Name of the C function whose body contains the first `needle`.
 
@@ -157,29 +220,45 @@ def _enclosing_function(text: str, needle: str):
     call site as readily as a definition. Returns None if `needle` is absent
     or sits at file scope.
 
+    Comments and string/char literals are blanked first (see
+    `_blank_comments_and_literals`) so a brace inside either of them cannot
+    perturb the depth count -- reporting the WRONG enclosing function is
+    worse than reporting none, and a rebase is exactly the event likely to
+    add a comment containing example code with a brace in it. `needle`
+    ITSELF is located in the original, unblanked text, though: every real
+    anchor symbol here is a string literal's contents
+    (`g_getenv("QEMU_WINDOW_PANEL")`), so blanking would erase the very
+    thing being searched for. Blanking only ever affects which function the
+    brace-counter thinks `idx` falls inside, never whether `idx` is found.
+
     `pending` deliberately survives newlines: QEMU's own style puts a
     function's opening brace on its own line (`foo(...)\n{`), so clearing
     `pending` on '\n' would forget the signature before the brace that
     consumes it -- and every top-level definition in the file would report
-    as file-scope. `pending` is safe to carry across lines because it is
-    only ever read at the next depth-0 '{', and any '(' seen before that at
-    depth 0 (whether on this line or a later one) overwrites it first.
+    as file-scope. `pending` is only set while it is still `None`, and is
+    cleared at every depth-0 '}' (end of a definition) and every depth-0
+    ';' (end of a prototype or a bodyless declaration) -- so the first
+    identifier-before-'(' since the last such boundary wins, which is the
+    function's own name, not an attribute macro
+    (`foo(void) SOME_ATTR(x)\n{`) or a second call on the same line.
     """
     idx = text.find(needle)
     if idx < 0:
         return None
+    scan = _blank_comments_and_literals(text)
     depth = 0
     current = None
     pending = None
-    for pos, ch in enumerate(text):
+    for pos, ch in enumerate(scan):
         if pos >= idx:
             break
         if ch == "(" and depth == 0:
-            # remember the identifier immediately before this paren
-            j = pos
-            while j > 0 and (text[j - 1].isalnum() or text[j - 1] == "_"):
-                j -= 1
-            pending = text[j:pos] or None
+            if pending is None:
+                # remember the identifier immediately before this paren
+                j = pos
+                while j > 0 and (scan[j - 1].isalnum() or scan[j - 1] == "_"):
+                    j -= 1
+                pending = scan[j:pos] or None
         elif ch == "{":
             if depth == 0:
                 current = pending
@@ -188,6 +267,9 @@ def _enclosing_function(text: str, needle: str):
             depth -= 1
             if depth == 0:
                 current = None
+                pending = None
+        elif ch == ";" and depth == 0:
+            pending = None
     return current
 
 
@@ -245,6 +327,19 @@ def _run(argv, cwd=None, env=None):
     subprocess.run(argv, cwd=cwd, env=env, check=True)
 
 
+def _probe(argv, cwd=None) -> bool:
+    """Run argv and report success as a bool, output discarded.
+
+    For probes (`git apply --check`, `... --reverse --check`) where a
+    non-zero exit is an ordinary, expected outcome -- not something that
+    should raise, the way `_run`'s `check=True` deliberately does for a
+    real action.
+    """
+    result = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    return result.returncode == 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source", required=True, type=Path,
@@ -265,9 +360,22 @@ def main(argv=None) -> int:
         _run(["git", "-C", str(a.source), "worktree", "add",
               str(work), pin])
 
+    # Idempotent on purpose: a routine retry after a failed `ninja` is the
+    # normal way anyone re-runs this script, and `work` from a prior run
+    # already has the whole series applied -- re-applying blindly would die
+    # on patch 0001 with an unhandled CalledProcessError. `--reverse
+    # --check` exits 0 iff the patch is ALREADY applied (reversing it would
+    # succeed), so that is checked before ever attempting a forward apply.
     series = read_series()
     for patch in series:
-        _run(apply_argv(patch, check=True), cwd=work)
+        if _probe(apply_argv(patch, check=True, reverse=True), cwd=work):
+            print(f"+ already applied: {patch.name}", flush=True)
+            continue
+        if not _probe(apply_argv(patch, check=True), cwd=work):
+            raise SystemExit(
+                f"{patch.name} neither applies cleanly nor is already "
+                "applied -- the tree is in a state this script does not "
+                "recognize; refusing to guess")
         _run(apply_argv(patch), cwd=work)
 
     # `git apply` printing OK is not evidence the hunks went where they
