@@ -1,0 +1,419 @@
+diff --git a/include/ui/gtk.h b/include/ui/gtk.h
+index 5c9c34a069..183b2b9132 100644
+--- a/include/ui/gtk.h
++++ b/include/ui/gtk.h
+@@ -159,6 +159,9 @@ extern bool gtk_use_gl_area;
+ 
+ /* ui/gtk.c */
+ void gd_update_windowsize(VirtualConsole *vc);
++#ifdef G_OS_WIN32
++void omni_fit_window_to_aspect(VirtualConsole *vc);
++#endif
+ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
+ void gd_hw_gl_flushed(void *vc);
+ 
+diff --git a/scripts/symlink-install-tree.py b/scripts/symlink-install-tree.py
+index b72563895c..4c54f7eb42 100644
+--- a/scripts/symlink-install-tree.py
++++ b/scripts/symlink-install-tree.py
+@@ -28,6 +28,14 @@ def destdir_join(d1: str, d2: str) -> str:
+     try:
+         os.symlink(source, bundle_dest)
+     except BaseException as e:
++        # omni: Windows refuses symlinks without Developer Mode or admin
++        # (WinError 1314). This bundle tree only exists to run QEMU from the
++        # build directory; we install to a prefix instead, so skipping it
++        # costs nothing and keeps the build unprivileged. A copy is NOT a
++        # substitute -- meson points these links at files the build has not
++        # produced yet.
++        if os.name == 'nt' and isinstance(e, OSError) and                 e.errno != errno.EEXIST:
++            continue
+         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
+             if os.name == 'nt':
+                 print('Please enable Developer Mode to support soft link '
+diff --git a/system/physmem.c b/system/physmem.c
+index c21ea92915..c160159542 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -4191,6 +4191,41 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
+                              __func__, rb->idstr, offset, length, ret);
+                 goto err;
+             }
++#elif defined(_WIN32)
++            /* omni: Windows has no madvise(), so every discard here used to
++             * return -ENOSYS -- the guest handed its pages back and the host
++             * kept paying for them. DiscardVirtualMemory() is MADV_DONTNEED
++             * in the ways that matter: the pages leave the working set, the
++             * frames are freed, the reservation and protection stay, and the
++             * next touch reads zeroes with no pagefile write.
++             * Resolved dynamically so the build does not depend on the SDK
++             * declaring it. */
++            {
++                typedef DWORD (WINAPI *omni_discard_fn)(PVOID, SIZE_T);
++                static omni_discard_fn omni_discard;
++                static bool omni_discard_resolved;
++
++                if (!omni_discard_resolved) {
++                    omni_discard_resolved = true;
++                    omni_discard = (omni_discard_fn)(void *)GetProcAddress(
++                        GetModuleHandleA("kernel32.dll"),
++                        "DiscardVirtualMemory");
++                }
++                if (!omni_discard) {
++                    ret = -ENOSYS;
++                    error_report("%s: DiscardVirtualMemory unavailable "
++                                 "%s:%" PRIx64 " +%zx", __func__,
++                                 rb->idstr, offset, length);
++                    goto err;
++                }
++                if (omni_discard(host_startaddr, length) != ERROR_SUCCESS) {
++                    ret = -EIO;
++                    error_report("%s: Failed to discard range "
++                                 "%s:%" PRIx64 " +%zx", __func__,
++                                 rb->idstr, offset, length);
++                    goto err;
++                }
++            }
+ #else
+             ret = -ENOSYS;
+             error_report("%s: MADVISE not available %s:%" PRIx64 " +%zx (%d)",
+diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
+index 29497019ee..531718870a 100644
+--- a/ui/gtk-gl-area.c
++++ b/ui/gtk-gl-area.c
+@@ -299,6 +299,13 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
+     vc->gfx.y = y;
+     vc->gfx.w = w;
+     vc->gfx.h = h;
++#ifdef G_OS_WIN32
++    /* omni: the guest just told us its real resolution -- fit the window to
++     * it. This is the ONLY place that learns it on a GL boot. */
++    if (g_getenv("QEMU_WINDOW_LOCK_ASPECT")) {
++        omni_fit_window_to_aspect(vc);
++    }
++#endif
+     vc->gfx.y0_top = backing_y_0_top;
+ 
+     gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 7078d89d67..83bbebde17 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -229,7 +229,8 @@ static void gd_update_caption(GtkDisplayState *s)
+     int i;
+ 
+     if (qemu_name) {
+-        prefix = g_strdup_printf("QEMU (%s)", qemu_name);
++        /* omni: the embedder owns the caption; -name is the title. */
++        prefix = g_strdup_printf("%s", qemu_name);
+     } else {
+         prefix = g_strdup_printf("QEMU");
+     }
+@@ -267,6 +268,166 @@ static void gd_update_caption(GtkDisplayState *s)
+     g_free(prefix);
+ }
+ 
++#ifdef G_OS_WIN32
++/* omni: the guest's current scanout size.
++ *
++ * On a GL boot the picture never goes through the 2D surface -- it arrives
++ * as a texture via dpy_gl_scanout_texture, which stores the real size in
++ * vc->gfx.w/h. vc->gfx.ds keeps whatever the last 2D surface was, which on
++ * this stack is QEMU's own 640x480 startup mode, FOREVER. Reading ds here
++ * is why the window stayed 4:3 while the guest ran 1280x800, and why
++ * screendump reports "no surface" on these boots.
++ */
++static bool omni_guest_size(VirtualConsole *vc, int *w, int *h)
++{
++    if (vc->gfx.w > 0 && vc->gfx.h > 0) {
++        *w = vc->gfx.w;
++        *h = vc->gfx.h;
++        return true;
++    }
++    if (vc->gfx.ds) {
++        *w = surface_width(vc->gfx.ds);
++        *h = surface_height(vc->gfx.ds);
++        return *w > 0 && *h > 0;
++    }
++    return false;
++}
++
++/* omni: keep the CLIENT area at the guest's aspect ratio while resizing.
++ *
++ * Windows sends WM_SIZING with the proposed OUTER rect while the user drags
++ * an edge, and lets the handler rewrite it. We subtract the chrome, correct
++ * the side that is not leading the drag, and add the chrome back -- so the
++ * picture fills the window edge to edge at every size, with no letterboxing.
++ */
++static GdkFilterReturn omni_aspect_filter(GdkXEvent *xevent, GdkEvent *event,
++                                          gpointer opaque)
++{
++    VirtualConsole *vc = opaque;
++    MSG *msg = (MSG *)xevent;
++    RECT *want, wr, cr;
++    int chrome_w, chrome_h, gw, gh, cw, ch, want_w, want_h;
++
++    if (msg->message != WM_SIZING || !omni_guest_size(vc, &gw, &gh)) {
++        return GDK_FILTER_CONTINUE;
++    }
++    if (!GetWindowRect(msg->hwnd, &wr) || !GetClientRect(msg->hwnd, &cr)) {
++        return GDK_FILTER_CONTINUE;
++    }
++    chrome_w = (wr.right - wr.left) - (cr.right - cr.left);
++    chrome_h = (wr.bottom - wr.top) - (cr.bottom - cr.top);
++
++    want = (RECT *)msg->lParam;
++    cw = (want->right - want->left) - chrome_w;
++    ch = (want->bottom - want->top) - chrome_h;
++    if (cw <= 0 || ch <= 0) {
++        return GDK_FILTER_CONTINUE;
++    }
++
++    switch (msg->wParam) {
++    case WMSZ_LEFT:
++    case WMSZ_RIGHT:
++        ch = cw * gh / gw;              /* width leads, height follows */
++        break;
++    case WMSZ_TOP:
++    case WMSZ_BOTTOM:
++        cw = ch * gw / gh;              /* height leads, width follows */
++        break;
++    default:                            /* a corner: follow the bigger move */
++        if ((int64_t)cw * gh > (int64_t)ch * gw) {
++            ch = cw * gh / gw;
++        } else {
++            cw = ch * gw / gh;
++        }
++        break;
++    }
++
++    want_w = cw + chrome_w;
++    want_h = ch + chrome_h;
++    /* Move the edge the user is actually dragging, so the opposite edge
++     * stays put and the window does not walk across the screen. */
++    switch (msg->wParam) {
++    case WMSZ_LEFT:
++    case WMSZ_TOPLEFT:
++    case WMSZ_BOTTOMLEFT:
++        want->left = want->right - want_w;
++        break;
++    default:
++        want->right = want->left + want_w;
++        break;
++    }
++    switch (msg->wParam) {
++    case WMSZ_TOP:
++    case WMSZ_TOPLEFT:
++    case WMSZ_TOPRIGHT:
++        want->top = want->bottom - want_h;
++        break;
++    default:
++        want->bottom = want->top + want_h;
++        break;
++    }
++    return GDK_FILTER_CONTINUE;
++}
++
++/* omni: make the window's CLIENT area match the guest's aspect ratio.
++ *
++ * Called whenever the surface changes, so the ratio tracks the guest LIVE
++ * rather than being frozen at whatever the display was when the window
++ * opened -- the guest's panel is not up yet at that point, so freezing it
++ * locks in the wrong shape. Keeps the user's current width and moves only
++ * the height, so re-fitting never fights a resize the user just made.
++ */
++void omni_fit_window_to_aspect(VirtualConsole *vc)
++{
++    GtkWidget *win = vc->window ? vc->window : vc->s->window;
++    GdkWindow *gdkwin;
++    HWND hwnd;
++    RECT wr, cr;
++    int chrome_w, chrome_h, gw, gh, cw, want_h;
++
++    if (!win) {
++        return;
++    }
++    gdkwin = gtk_widget_get_window(win);
++    if (!gdkwin) {
++        return;
++    }
++    hwnd = (HWND)gdk_win32_window_get_handle(gdkwin);
++    if (!hwnd || !GetWindowRect(hwnd, &wr) || !GetClientRect(hwnd, &cr)) {
++        return;
++    }
++    cw = cr.right - cr.left;
++    if (!omni_guest_size(vc, &gw, &gh) || cw <= 0) {
++        return;
++    }
++    chrome_w = (wr.right - wr.left) - cw;
++    chrome_h = (wr.bottom - wr.top) - (cr.bottom - cr.top);
++    want_h = cw * gh / gw;
++    if (want_h == cr.bottom - cr.top) {
++        return;                     /* already the right shape */
++    }
++    SetWindowPos(hwnd, NULL, 0, 0, cw + chrome_w, want_h + chrome_h,
++                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
++}
++
++static void omni_install_aspect_filter(VirtualConsole *vc)
++{
++    GtkWidget *win = vc->window ? vc->window : vc->s->window;
++    GdkWindow *gdkwin;
++
++    if (!win || g_object_get_data(G_OBJECT(win), "omni-aspect-filter")) {
++        return;
++    }
++    gtk_widget_realize(win);
++    gdkwin = gtk_widget_get_window(win);
++    if (!gdkwin) {
++        return;
++    }
++    gdk_window_add_filter(gdkwin, omni_aspect_filter, vc);
++    g_object_set_data(G_OBJECT(win), "omni-aspect-filter", GINT_TO_POINTER(1));
++}
++#endif /* G_OS_WIN32 */
++
+ static void gd_update_geometry_hints(VirtualConsole *vc)
+ {
+     GtkDisplayState *s = vc->s;
+@@ -284,6 +445,32 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
+         geo.min_width  = surface_width(vc->gfx.ds) * scale_x;
+         geo.min_height = surface_height(vc->gfx.ds) * scale_y;
+         mask |= GDK_HINT_MIN_SIZE;
++
++        /* omni: lock the window to the guest's aspect ratio, so dragging a
++         * corner cannot letterbox or stretch the picture. Opt-in, so the
++         * stock behaviour is unchanged when the variable is unset. */
++        if (g_getenv("QEMU_WINDOW_LOCK_ASPECT")) {
++#ifdef G_OS_WIN32
++            /* GDK_HINT_ASPECT constrains the WHOLE window, decorations
++             * included -- GTK >= 3.20 ignores the geometry_widget argument
++             * below. MEASURED: a 1280x800 guest ended up with a 1711x1028
++             * client (ratio 1.664 against the guest's 1.600), i.e. 4% too
++             * wide, which QEMU letterboxes into ~33px black bars down each
++             * side. No fixed outer ratio can fix it either: the chrome is a
++             * constant (+16 x +39 here), so the correct outer ratio changes
++             * with the window size. Windows therefore gets a WM_SIZING
++             * filter that constrains the CLIENT area directly. */
++            omni_install_aspect_filter(vc);
++#else
++            int omni_w = surface_width(vc->gfx.ds);
++            int omni_h = surface_height(vc->gfx.ds);
++
++            if (omni_w > 0 && omni_h > 0) {
++                geo.min_aspect = geo.max_aspect = (double)omni_w / omni_h;
++                mask |= GDK_HINT_ASPECT;
++            }
++#endif
++        }
+         geo_widget = vc->gfx.drawing_area;
+         gtk_widget_set_size_request(geo_widget, geo.min_width, geo.min_height);
+ 
+@@ -336,6 +523,15 @@ void gd_update_windowsize(VirtualConsole *vc)
+ 
+     gd_update_geometry_hints(vc);
+ 
++#ifdef G_OS_WIN32
++    /* zoom-to-fit leaves the window at whatever size it already had, so a
++     * guest that changes mode leaves the window at the OLD ratio and QEMU
++     * letterboxes into it. Re-fit instead. */
++    if (vc->type == GD_VC_GFX && g_getenv("QEMU_WINDOW_LOCK_ASPECT")) {
++        omni_fit_window_to_aspect(vc);
++    }
++#endif
++
+     if (vc->type == GD_VC_GFX && !s->full_screen && !s->free_scale) {
+         gtk_window_resize(GTK_WINDOW(vc->window ? vc->window : s->window),
+                           VC_WINDOW_X_MIN, VC_WINDOW_Y_MIN);
+@@ -724,6 +920,35 @@ static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
+         allow_close = false;
+     }
+ 
++    if (allow_close && g_getenv("QEMU_WINDOW_CONFIRM_CLOSE")) {
++        /* omni: closing this window powers off a machine that took a minute
++         * to boot. Ask first -- an accidental click is otherwise
++         * unrecoverable. */
++        GtkWidget *omni_dlg;
++        gint omni_resp;
++
++        omni_dlg = gtk_message_dialog_new(GTK_WINDOW(s->window),
++                                          GTK_DIALOG_MODAL |
++                                          GTK_DIALOG_DESTROY_WITH_PARENT,
++                                          GTK_MESSAGE_WARNING,
++                                          GTK_BUTTONS_NONE,
++                                          "Stop this instance?");
++        gtk_message_dialog_format_secondary_text(
++            GTK_MESSAGE_DIALOG(omni_dlg),
++            "It will be powered off, and anything running inside it is lost.");
++        gtk_dialog_add_buttons(GTK_DIALOG(omni_dlg),
++                               "Cancel", GTK_RESPONSE_CANCEL,
++                               "Stop instance", GTK_RESPONSE_ACCEPT, NULL);
++        gtk_dialog_set_default_response(GTK_DIALOG(omni_dlg),
++                                        GTK_RESPONSE_CANCEL);
++        omni_resp = gtk_dialog_run(GTK_DIALOG(omni_dlg));
++        gtk_widget_destroy(omni_dlg);
++        if (omni_resp != GTK_RESPONSE_ACCEPT) {
++            return TRUE;
++        }
++        allow_close = true;
++    }
++
+     if (allow_close) {
+         qmp_quit(NULL);
+     }
+@@ -748,6 +973,32 @@ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+ {
+     QemuUIInfo info;
+ 
++    /* omni: pin the guest panel to the size the launcher actually asked
++     * for, instead of whatever the window happens to be.
++     *
++     * QEMU opens its window before the guest has set a mode, then reports
++     * that window's client size to the guest as ui-info -- and the guest
++     * adopts it. MEASURED: the window opened 656x544, the guest took
++     * 640x505 (exactly the client area) and kept it, while Android's own
++     * `wm size` override stayed 1280x800. Android then letterboxes a 1.600
++     * logical display into a 1.267 physical panel, so the black bands are
++     * baked into the framebuffer before QEMU ever sees them.
++     *
++     * Suppressing ui-info altogether does NOT work -- MEASURED: the guest
++     * never finishes bringing its display up and the boot times out at
++     * 6 min without adbd. So the handshake stays; only the numbers change.
++     */
++    if (g_getenv("QEMU_WINDOW_LOCK_ASPECT")) {
++        const char *panel = g_getenv("QEMU_WINDOW_PANEL");
++        int pw = 0, ph = 0;
++
++        if (panel && sscanf(panel, "%dx%d", &pw, &ph) == 2 &&
++            pw > 0 && ph > 0) {
++            width = pw;
++            height = ph;
++        }
++    }
++
+     if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
+         return;
+     }
+@@ -2759,7 +3010,21 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
+     qemu_add_mouse_mode_change_notifier(&s->mouse_mode_notifier);
+     s->vmse = qemu_add_vm_change_state_handler(gd_change_runstate, s);
+ 
+-    gtk_window_set_icon_name(GTK_WINDOW(s->window), "qemu");
++    /* omni: use the embedder's own logo when it points at one. Falls
++     * back to the stock icon so this build stays a drop-in replacement. */
++    {
++        const char *omni_icon = g_getenv("QEMU_WINDOW_ICON");
++        GError *omni_icon_err = NULL;
++
++        if (!omni_icon || !*omni_icon ||
++            !gtk_window_set_icon_from_file(GTK_WINDOW(s->window), omni_icon,
++                                           &omni_icon_err)) {
++            if (omni_icon_err) {
++                g_error_free(omni_icon_err);
++            }
++            gtk_window_set_icon_name(GTK_WINDOW(s->window), "qemu");
++        }
++    }
+ 
+     gd_create_menus(s, opts);
+ 
