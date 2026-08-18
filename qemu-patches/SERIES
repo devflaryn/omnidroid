@@ -1,6 +1,6 @@
 # Applied in this order against the tag in PIN. See
 # docs/superpowers/specs/2026-08-19-omni-qemu-and-density-design.md §3a.
-0001-omni-window-icon.patch
+0001-omni-window-identity.patch
 0002-omni-aspect-lock.patch
 0003-omni-panel-pin.patch
 0004-omni-confirm-close.patch

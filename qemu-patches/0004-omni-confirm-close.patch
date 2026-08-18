@@ -1,8 +1,25 @@
 diff --git a/ui/gtk.c b/ui/gtk.c
-index 3e876f2c0f..83bbebde17 100644
+index 8c02415b24..2608f02787 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
-@@ -920,6 +920,35 @@ static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
+@@ -912,40 +912,69 @@ static void gd_mouse_mode_change(Notifier *notify, void *data)
+         }
+     }
+     for (i = 0; i < s->vcs->len; i++) {
+         VirtualConsole *vc = g_ptr_array_index(s->vcs, i);
+         gd_update_cursor(vc);
+     }
+ }
+ 
+ /** GTK Events **/
+ 
+ static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
+                                 void *opaque)
+ {
+     GtkDisplayState *s = opaque;
+     bool allow_close = true;
+ 
+     if (s->opts->has_window_close && !s->opts->window_close) {
          allow_close = false;
      }
  
@@ -38,3 +55,20 @@ index 3e876f2c0f..83bbebde17 100644
      if (allow_close) {
          qmp_quit(NULL);
      }
+ 
+     return TRUE;
+ }
+ 
+ static void gd_set_ui_refresh_rate(VirtualConsole *vc, int refresh_rate)
+ {
+     QemuUIInfo info;
+ 
+     if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
+         return;
+     }
+ 
+     info = *qemu_console_get_ui_info(vc->gfx.dcl.con);
+     info.refresh_rate = refresh_rate;
+     qemu_console_set_ui_info(vc->gfx.dcl.con, &info, true);
+ }
+ 

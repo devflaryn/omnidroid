@@ -2,7 +2,24 @@ diff --git a/include/ui/gtk.h b/include/ui/gtk.h
 index 5c9c34a069..183b2b9132 100644
 --- a/include/ui/gtk.h
 +++ b/include/ui/gtk.h
-@@ -159,6 +159,9 @@ extern bool gtk_use_gl_area;
+@@ -142,40 +142,43 @@ struct GtkDisplayState {
+     Notifier mouse_mode_notifier;
+     VMChangeStateEntry *vmse;
+     Notifier console_notifier;
+     gboolean free_scale;
+     gboolean keep_aspect_ratio;
+ 
+     bool external_pause_update;
+ 
+     QemuClipboardPeer cbpeer;
+     uint32_t cbpending[QEMU_CLIPBOARD_SELECTION__COUNT];
+     GtkClipboard *gtkcb[QEMU_CLIPBOARD_SELECTION__COUNT];
+     bool cbowner[QEMU_CLIPBOARD_SELECTION__COUNT];
+ 
+     DisplayOptions *opts;
+ };
+ 
+ extern bool gtk_use_gl_area;
  
  /* ui/gtk.c */
  void gd_update_windowsize(VirtualConsole *vc);
@@ -12,11 +29,45 @@ index 5c9c34a069..183b2b9132 100644
  void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
  void gd_hw_gl_flushed(void *vc);
  
+ /* ui/gtk-egl.c */
+ void gd_egl_init(VirtualConsole *vc);
+ void gd_egl_draw(VirtualConsole *vc);
+ void gd_egl_update(DisplayChangeListener *dcl,
+                    int x, int y, int w, int h);
+ void gd_egl_refresh(DisplayChangeListener *dcl);
+ void gd_egl_switch(DisplayChangeListener *dcl,
+                    DisplaySurface *surface);
+ QEMUGLContext gd_egl_create_context(DisplayGLCtx *dgc,
+                                     QEMUGLParams *params);
+ void gd_egl_scanout_disable(DisplayChangeListener *dcl);
+ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
+                             uint32_t backing_id,
+                             bool backing_y_0_top,
+                             uint32_t backing_width,
+                             uint32_t backing_height,
+                             uint32_t x, uint32_t y,
 diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
 index 29497019ee..531718870a 100644
 --- a/ui/gtk-gl-area.c
 +++ b/ui/gtk-gl-area.c
-@@ -299,6 +299,13 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
+@@ -282,40 +282,47 @@ void gd_gl_area_destroy_context(DisplayGLCtx *dgc, QEMUGLContext ctx)
+         gdk_gl_context_clear_current();
+     }
+     g_clear_object(&ctx);
+ }
+ 
+ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
+                                 uint32_t backing_id,
+                                 bool backing_y_0_top,
+                                 uint32_t backing_width,
+                                 uint32_t backing_height,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t w, uint32_t h,
+                                 void *d3d_tex2d)
+ {
+     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
+ 
+     vc->gfx.x = x;
      vc->gfx.y = y;
      vc->gfx.w = w;
      vc->gfx.h = h;
@@ -30,11 +81,45 @@ index 29497019ee..531718870a 100644
      vc->gfx.y0_top = backing_y_0_top;
  
      gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
+ 
+     if (backing_id == 0 || vc->gfx.w == 0 || vc->gfx.h == 0) {
+         gtk_gl_area_set_scanout_mode(vc, false);
+         return;
+     }
+ 
+     gtk_gl_area_set_scanout_mode(vc, true);
+     egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
+                          backing_id, false);
+ }
+ 
+ void gd_gl_area_scanout_disable(DisplayChangeListener *dcl)
+ {
+     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
+ 
+     gtk_gl_area_set_scanout_mode(vc, false);
+ }
 diff --git a/ui/gtk.c b/ui/gtk.c
-index 37650292b9..c267eac647 100644
+index 591b2d0494..bf08ed236f 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
-@@ -268,6 +268,166 @@ static void gd_update_caption(GtkDisplayState *s)
+@@ -260,57 +260,243 @@ static void gd_update_caption(GtkDisplayState *s)
+     title = g_strdup_printf("%s%s%s", prefix, status, grab);
+     gtk_window_set_title(GTK_WINDOW(s->window), title);
+     g_free(title);
+ 
+     for (i = 0; i < s->vcs->len; i++) {
+         VirtualConsole *vc = g_ptr_array_index(s->vcs, i);
+ 
+         if (!vc->window) {
+             continue;
+         }
+         title = g_strdup_printf("%s: %s%s%s", prefix, vc->label,
+                                 vc == s->kbd_owner ? " +kbd" : "",
+                                 vc == s->ptr_owner ? " +ptr" : "");
+         gtk_window_set_title(GTK_WINDOW(vc->window), title);
+         g_free(title);
+     }
+ 
      g_free(prefix);
  }
  
@@ -201,7 +286,17 @@ index 37650292b9..c267eac647 100644
  static void gd_update_geometry_hints(VirtualConsole *vc)
  {
      GtkDisplayState *s = vc->s;
-@@ -285,6 +445,32 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
+     GdkWindowHints mask = 0;
+     GdkGeometry geo = {};
+     GtkWidget *geo_widget = NULL;
+     GtkWindow *geo_window;
+ 
+     if (vc->type == GD_VC_GFX) {
+         if (!vc->gfx.ds) {
+             return;
+         }
+         double scale_x = s->free_scale ? VC_SCALE_MIN : vc->gfx.scale_x;
+         double scale_y = s->free_scale ? VC_SCALE_MIN : vc->gfx.scale_y;
          geo.min_width  = surface_width(vc->gfx.ds) * scale_x;
          geo.min_height = surface_height(vc->gfx.ds) * scale_y;
          mask |= GDK_HINT_MIN_SIZE;
@@ -234,7 +329,41 @@ index 37650292b9..c267eac647 100644
          geo_widget = vc->gfx.drawing_area;
          gtk_widget_set_size_request(geo_widget, geo.min_width, geo.min_height);
  
-@@ -337,6 +523,15 @@ void gd_update_windowsize(VirtualConsole *vc)
+ #if defined(CONFIG_VTE)
+     } else if (vc->type == GD_VC_VTE) {
+         VteTerminal *term = VTE_TERMINAL(vc->vte.terminal);
+         GtkBorder padding = { 0 };
+ 
+ #if VTE_CHECK_VERSION(0, 37, 0)
+         gtk_style_context_get_padding(
+                 gtk_widget_get_style_context(vc->vte.terminal),
+                 gtk_widget_get_state_flags(vc->vte.terminal),
+                 &padding);
+ #else
+         {
+             GtkBorder *ib = NULL;
+             gtk_widget_style_get(vc->vte.terminal, "inner-border", &ib, NULL);
+             if (ib) {
+                 padding = *ib;
+                 gtk_border_free(ib);
+@@ -329,40 +515,49 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
+         mask |= GDK_HINT_MIN_SIZE;
+ 
+         geo.base_width  += padding.left + padding.right;
+         geo.base_height += padding.top + padding.bottom;
+         geo.min_width   += padding.left + padding.right;
+         geo.min_height  += padding.top + padding.bottom;
+         geo_widget = vc->vte.terminal;
+ #endif
+     }
+ 
+     geo_window = GTK_WINDOW(vc->window ? vc->window : s->window);
+     gtk_window_set_geometry_hints(geo_window, geo_widget, &geo, mask);
+ }
+ 
+ void gd_update_windowsize(VirtualConsole *vc)
+ {
+     GtkDisplayState *s = vc->s;
  
      gd_update_geometry_hints(vc);
  
@@ -250,3 +379,20 @@ index 37650292b9..c267eac647 100644
      if (vc->type == GD_VC_GFX && !s->full_screen && !s->free_scale) {
          gtk_window_resize(GTK_WINDOW(vc->window ? vc->window : s->window),
                            VC_WINDOW_X_MIN, VC_WINDOW_Y_MIN);
+     }
+ }
+ 
+ static void gd_update_full_redraw(VirtualConsole *vc)
+ {
+     GtkWidget *area = vc->gfx.drawing_area;
+     int ww, wh;
+     ww = gdk_window_get_width(gtk_widget_get_window(area));
+     wh = gdk_window_get_height(gtk_widget_get_window(area));
+ #if defined(CONFIG_OPENGL)
+     if (vc->gfx.gls && gtk_use_gl_area) {
+         gtk_gl_area_queue_render(GTK_GL_AREA(vc->gfx.drawing_area));
+         return;
+     }
+ #endif
+     gtk_widget_queue_draw_area(area, 0, 0, ww, wh);
+ }

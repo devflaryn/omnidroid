@@ -1,0 +1,114 @@
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 7078d89d67..591b2d0494 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -212,41 +212,51 @@ static void gd_update_cursor(VirtualConsole *vc)
+     }
+ 
+     window = gtk_widget_get_window(GTK_WIDGET(vc->gfx.drawing_area));
+     if (s->full_screen || qemu_input_is_absolute(vc->gfx.dcl.con) || s->ptr_owner == vc) {
+         gdk_window_set_cursor(window, s->null_cursor);
+     } else {
+         gdk_window_set_cursor(window, NULL);
+     }
+ }
+ 
+ static void gd_update_caption(GtkDisplayState *s)
+ {
+     const char *status = "";
+     gchar *prefix;
+     gchar *title;
+     const char *grab = "";
+     bool is_paused = !runstate_is_running();
+     int i;
+ 
+     if (qemu_name) {
+-        prefix = g_strdup_printf("QEMU (%s)", qemu_name);
++        /* omni: the embedder owns the caption when it asks to. -name stays
++         * the window IDENTITY (what the launcher finds the window by); the
++         * TITLE is a separate string, so it gets a separate variable rather
++         * than reusing -name and collapsing the two. */
++        const char *omni_title = g_getenv("QEMU_WINDOW_TITLE");
++
++        if (omni_title && *omni_title) {
++            prefix = g_strdup_printf("%s", omni_title);
++        } else {
++            prefix = g_strdup_printf("QEMU (%s)", qemu_name);
++        }
+     } else {
+         prefix = g_strdup_printf("QEMU");
+     }
+ 
+     if (s->ptr_owner != NULL &&
+         s->ptr_owner->window == NULL) {
+         grab = _(" - Press Ctrl+Alt+G to release grab");
+     }
+ 
+     if (is_paused) {
+         status = _(" [Paused]");
+     }
+     s->external_pause_update = true;
+     gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(s->pause_item),
+                                    is_paused);
+     s->external_pause_update = false;
+ 
+     title = g_strdup_printf("%s%s%s", prefix, status, grab);
+     gtk_window_set_title(GTK_WINDOW(s->window), title);
+     g_free(title);
+@@ -2742,41 +2752,55 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
+     setlocale(LC_MESSAGES, "");
+     setlocale(LC_CTYPE, "C.UTF-8");
+     dir = get_relocated_path(CONFIG_QEMU_LOCALEDIR);
+     bindtextdomain("qemu", dir);
+     g_free(dir);
+     bind_textdomain_codeset("qemu", "UTF-8");
+     textdomain("qemu");
+ 
+     window_display = gtk_widget_get_display(s->window);
+     if (s->opts->has_show_cursor && s->opts->show_cursor) {
+         s->null_cursor = NULL; /* default pointer */
+     } else {
+         s->null_cursor = gdk_cursor_new_for_display(window_display,
+                                                     GDK_BLANK_CURSOR);
+     }
+ 
+     s->mouse_mode_notifier.notify = gd_mouse_mode_change;
+     qemu_add_mouse_mode_change_notifier(&s->mouse_mode_notifier);
+     s->vmse = qemu_add_vm_change_state_handler(gd_change_runstate, s);
+ 
+-    gtk_window_set_icon_name(GTK_WINDOW(s->window), "qemu");
++    /* omni: use the embedder's own logo when it points at one. Falls
++     * back to the stock icon so this build stays a drop-in replacement. */
++    {
++        const char *omni_icon = g_getenv("QEMU_WINDOW_ICON");
++        GError *omni_icon_err = NULL;
++
++        if (!omni_icon || !*omni_icon ||
++            !gtk_window_set_icon_from_file(GTK_WINDOW(s->window), omni_icon,
++                                           &omni_icon_err)) {
++            if (omni_icon_err) {
++                g_error_free(omni_icon_err);
++            }
++            gtk_window_set_icon_name(GTK_WINDOW(s->window), "qemu");
++        }
++    }
+ 
+     gd_create_menus(s, opts);
+ 
+     s->console_notifier.notify = gd_console_notify;
+     qemu_console_add_notifier(&s->console_notifier);
+ 
+     gd_connect_signals(s);
+ 
+     gtk_notebook_set_show_tabs(GTK_NOTEBOOK(s->notebook), FALSE);
+     gtk_notebook_set_show_border(GTK_NOTEBOOK(s->notebook), FALSE);
+ 
+     gd_update_caption(s);
+ 
+     gtk_box_pack_start(GTK_BOX(s->vbox), s->menu_bar, FALSE, TRUE, 0);
+     gtk_box_pack_start(GTK_BOX(s->vbox), s->notebook, TRUE, TRUE, 0);
+ 
+     gtk_container_add(GTK_CONTAINER(s->window), s->vbox);
+ 
+     gtk_widget_show_all(s->window);
+ 

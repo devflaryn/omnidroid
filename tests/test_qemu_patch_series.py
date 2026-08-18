@@ -49,7 +49,7 @@ class SeriesContent(unittest.TestCase):
     """Each patch touches the files the design says it touches, and no others."""
 
     EXPECTED = {
-        "0001-omni-window-icon.patch": {"ui/gtk.c"},
+        "0001-omni-window-identity.patch": {"ui/gtk.c"},
         "0002-omni-aspect-lock.patch": {"ui/gtk.c", "include/ui/gtk.h",
                                         "ui/gtk-gl-area.c"},
         "0003-omni-panel-pin.patch": {"ui/gtk.c"},
@@ -64,6 +64,15 @@ class SeriesContent(unittest.TestCase):
             text = (PATCHES / name).read_text(encoding="utf-8")
             touched = set(re.findall(r"^\+\+\+ b/(.+)$", text, re.M))
             self.assertEqual(touched, expected, f"{name} touches {touched}")
+
+    def test_caption_change_is_gated(self):
+        """Every omni feature is behind a QEMU_WINDOW_* gate so a stock
+        invocation stays stock. The caption is not an exception -- a build of
+        ours run by anyone else must still say QEMU."""
+        text = (PATCHES / "0001-omni-window-identity.patch").read_text(
+            encoding="utf-8")
+        self.assertIn("QEMU_WINDOW_TITLE", text)
+        self.assertIn('"QEMU (%s)"', text)   # the stock branch survives
 
 
 if __name__ == "__main__":

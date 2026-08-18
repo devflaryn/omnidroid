@@ -1,8 +1,25 @@
 diff --git a/ui/gtk.c b/ui/gtk.c
-index c267eac647..3e876f2c0f 100644
+index bf08ed236f..8c02415b24 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
-@@ -944,6 +944,32 @@ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+@@ -936,40 +936,66 @@ static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
+     return TRUE;
+ }
+ 
+ static void gd_set_ui_refresh_rate(VirtualConsole *vc, int refresh_rate)
+ {
+     QemuUIInfo info;
+ 
+     if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
+         return;
+     }
+ 
+     info = *qemu_console_get_ui_info(vc->gfx.dcl.con);
+     info.refresh_rate = refresh_rate;
+     qemu_console_set_ui_info(vc->gfx.dcl.con, &info, true);
+ }
+ 
+ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
  {
      QemuUIInfo info;
  
@@ -34,4 +51,21 @@ index c267eac647..3e876f2c0f 100644
 +
      if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
          return;
+     }
+ 
+     info = *qemu_console_get_ui_info(vc->gfx.dcl.con);
+     info.width = width;
+     info.height = height;
+     qemu_console_set_ui_info(vc->gfx.dcl.con, &info, true);
+ }
+ 
+ #if defined(CONFIG_OPENGL)
+ 
+ static gboolean gd_render_event(GtkGLArea *area, GdkGLContext *context,
+                                 void *opaque)
+ {
+     VirtualConsole *vc = opaque;
+ 
+     if (vc->gfx.gls) {
+         gd_gl_area_draw(vc);
      }
