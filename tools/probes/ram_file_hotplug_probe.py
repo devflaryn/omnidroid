@@ -20,25 +20,34 @@ WHAT IT DOES. Boots the target QEMU twice (env unset, then
      offline the range first, which a `-S`-paused guest never will, so that
      part of `unplug_mem`'s real path cannot be probed against a paused
      boot -- this is not attempted here, and is not what Critical 2 is.
+  1a. (env-set run only) Assert at least one *.bin file exists in
+      QEMU_RAM_FILE_DIR right after that plug. Without this, a change that
+      silently disables the file-backing path (env var renamed, the 64 MiB
+      threshold raised past 512 MB, 0007 dropped from SERIES) turns the
+      file-backed run into a second copy of the baseline run -- stock QEMU
+      has no align bug, device_add above still succeeds, file count stays
+      0 either way -- and this whole probe would report PASS while testing
+      nothing. This was found live: an early version of this probe was
+      green against a build with no patch 0007 in it at all.
   2. Three bare object-add/object-del cycles (memory-backend-ram objects
      created and destroyed WITHOUT ever being wired into the guest via
-     device_add) and confirm process handle count and *.bin file count in
-     QEMU_RAM_FILE_DIR both return to baseline rather than climbing -- this
-     is Critical 2's repro. `object-del` on an unattached backend frees the
-     RAMBlock through QOM unref immediately, no guest cooperation needed,
-     which is why this is the shape that actually isolates the allocator's
-     free path from ACPI hot-unplug timing.
+     device_add) and confirm the *.bin file count in QEMU_RAM_FILE_DIR
+     returns to baseline rather than climbing -- Critical 2's repro.
+     `object-del` on an unattached backend frees the RAMBlock through QOM
+     unref immediately, no guest cooperation needed, which is why this is
+     the shape that actually isolates the allocator's free path from ACPI
+     hot-unplug timing. (A process-handle-count check used to sit next to
+     this one; dropped, see the MEM_STEP_MB comment below for why.)
 
 USAGE.
     python tools/probes/ram_file_hotplug_probe.py <path-to-qemu-system-x86_64.exe> <ram-file-dir>
 
-Exit code 0 means both checks passed on both runs. Anything else, plus a
+Exit code 0 means every check passed on both runs. Anything else, plus a
 printed diagnosis, means a regression -- run this before believing patch
 0007 (or anything layered on it, e.g. 0008's discard path) is safe to ship.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import socket
 import subprocess
@@ -50,10 +59,14 @@ REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO))
 from omnidroid.qmpsession import QmpSession  # noqa: E402
 
-kernel32 = ctypes.WinDLL("kernel32")
 MEM_STEP_MB = 512  # omnidroid.engine.MEM_STEP_MB -- kept literal, not
                    # imported, so this probe has no import-time dependency on
                    # engine.py's much larger module graph.
+# Fix round 2 dropped a process-handle-count check that used to live here
+# (ctypes GetProcessHandleCount): its baseline drifted by hundreds of
+# handles across the measurement window from QEMU's own startup churn,
+# swamping the ~3-handle signal Critical 2's leak actually produces. The
+# *.bin file count below is the real detector -- see run_one().
 
 
 def _free_tcp_port() -> int:
@@ -62,19 +75,6 @@ def _free_tcp_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
-
-
-def _handle_count(pid: int) -> int:
-    h = kernel32.OpenProcess(0x0400, False, pid)  # PROCESS_QUERY_INFORMATION
-    if not h:
-        raise ctypes.WinError()
-    try:
-        n = ctypes.c_ulong(0)
-        if not kernel32.GetProcessHandleCount(h, ctypes.byref(n)):
-            raise ctypes.WinError()
-        return n.value
-    finally:
-        kernel32.CloseHandle(h)
 
 
 def _ram_file_count(ram_dir: str) -> int:
@@ -175,10 +175,33 @@ def run_one(tag: str, exe: str, biosdir: str, ram_dir: str | None):
         else:
             print(f"  ok: DIMM plug survived, process alive (pid {proc.pid})")
 
+        if ok and ram_dir:
+            # --- Fix round 2, 1a: the file-backed run must actually BE
+            # file-backed. Without this, a future change that silently turns
+            # the path off (env var renamed, the 64 MiB threshold raised
+            # above 512 MB, 0007 dropped from SERIES) makes this run a
+            # second copy of the baseline run: stock QEMU has no align bug,
+            # device_add above succeeds, base_files/end_files both stay 0,
+            # and the probe reports PASS while testing nothing. The DIMM
+            # plugged above is 512 MB, over the 64 MiB threshold, so at
+            # least one *.bin file (that DIMM's, maybe also pc.ram's) MUST
+            # exist right now if the patch is doing anything at all.
+            base_files = _ram_file_count(ram_dir)
+            if base_files < 1:
+                print(f"  FAIL: QEMU_RAM_FILE_DIR is set and a 512 MB DIMM "
+                      f"is plugged, but 0 *.bin files exist in {ram_dir} -- "
+                      f"the file-backed path is not engaged (check: is 0007 "
+                      f"in SERIES, is QEMU_RAM_FILE_DIR spelled/read "
+                      f"correctly, is OMNI_RAM_FILE_MIN_BYTES still 64 MiB?"
+                      f") -- this run would otherwise silently degrade into "
+                      f"a second baseline run and report PASS regardless")
+                ok = False
+
         if ok:
             # --- Critical 2 repro: leak across object-add/object-del,
             # deliberately NOT wired into the guest (see _add_unattached) ---
-            base_handles = _handle_count(proc.pid)
+            # `base_files` may already be set from the 1a check above (env
+            # set); for the env-unset run it is always 0 and stays 0.
             base_files = _ram_file_count(ram_dir) if ram_dir else 0
             for i in range(1, 4):
                 mem_id, err = _add_unattached(qmp, i)
@@ -196,24 +219,28 @@ def run_one(tag: str, exe: str, biosdir: str, ram_dir: str | None):
                     ok = False
                     break
             if ok:
-                end_handles = _handle_count(proc.pid)
                 end_files = _ram_file_count(ram_dir) if ram_dir else 0
-                print(f"  handles: base={base_handles} end={end_handles}")
                 print(f"  *.bin files in ram dir: base={base_files} "
                       f"end={end_files}")
-                # A little slack: QEMU's own steady-state churn (timers,
-                # short-lived event handles) is not zero-variance. What
-                # matters is NOT climbing by one full HANDLE+FILE pair per
-                # cycle, which is what an unmap/close leak looks like across
-                # three cycles (>= 3 extra of each).
+                # Fix round 2, 1b: a process handle-count check used to sit
+                # here too (>= 6 handles gained across 3 cycles = FAIL).
+                # Measured drift with it in place: -615 (baseline run) and
+                # -671 (file-backed run) across the window it was meant to
+                # guard -- QEMU is still shedding startup handles seconds
+                # into a paused boot, so a genuine 3-handle leak (what
+                # Critical 2 actually produces) is invisible in noise two
+                # orders of magnitude larger than the threshold, and the
+                # check could never fire for the defect it names. Dropped
+                # rather than kept as decoration next to a working check.
+                # The *.bin FILE COUNT is the real detector for Critical 2:
+                # DELETE_ON_CLOSE keeps a leaked view's file alive for as
+                # long as the leaked HANDLE is open, so an unmap/close leak
+                # is visible there with no settling needed (with the leak
+                # present: 5 - 2 >= 3, fires cleanly).
                 if ram_dir and end_files - base_files >= 3:
                     print(f"  FAIL: {end_files - base_files} ram files "
                           f"leaked across 3 object-del cycles -- this is the "
                           f"VirtualFree-on-a-mapped-view leak")
-                    ok = False
-                if end_handles - base_handles >= 6:
-                    print(f"  FAIL: {end_handles - base_handles} handles "
-                          f"leaked across 3 cycles")
                     ok = False
                 if ok:
                     print("  ok: no leak across 3 object-add/object-del cycles")

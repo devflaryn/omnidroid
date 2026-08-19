@@ -56,6 +56,33 @@ class Configure(unittest.TestCase):
         self.assertTrue(argv[0].endswith("configure"))
         self.assertIn("--prefix=/out/pfx", [a.replace("\\", "/") for a in argv])
 
+    def test_pkgversion_is_derived_from_the_series(self):
+        """A capability string that can drift from the patches is worse than
+        none: Task 6 reads it to decide whether to back guest RAM with a
+        file, and Task 7 to decide whether to turn free-page reporting
+        on."""
+        def pv(argv):
+            return next(a.split("=", 1)[1] for a in argv
+                        if a.startswith("--with-pkgversion="))
+        base = [Path("0001-omni-window-identity.patch")]
+        self.assertEqual(pv(configure_argv(Path("/o"), ["x86_64-softmmu"],
+                                           series=base)), "omni-window")
+        with7 = base + [Path("0007-omni-win32-ram-file.patch")]
+        self.assertEqual(pv(configure_argv(Path("/o"), ["x86_64-softmmu"],
+                                           series=with7)),
+                         "omni-window+omni-ram-file")
+        with8 = with7 + [Path("0008-omni-win32-punch-hole.patch")]
+        self.assertEqual(pv(configure_argv(Path("/o"), ["x86_64-softmmu"],
+                                           series=with8)),
+                         "omni-window+omni-ram-file+omni-punch-hole")
+
+    def test_punch_hole_token_cannot_appear_without_its_patch(self):
+        """0005's DiscardVirtualMemory arm fails on a mapped view, so
+        free-page reporting must not be enableable before 0008 lands."""
+        with7 = [Path("0007-omni-win32-ram-file.patch")]
+        argv = configure_argv(Path("/o"), ["x86_64-softmmu"], series=with7)
+        self.assertNotIn("omni-punch-hole", " ".join(argv))
+
 
 class Apply(unittest.TestCase):
     def test_checks_before_it_applies(self):

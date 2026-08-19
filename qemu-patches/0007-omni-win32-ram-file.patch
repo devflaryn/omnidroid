@@ -23,7 +23,7 @@ index f0639287bf..24f9c20f5d 100644
      size_t page_size;
      /* dirty bitmap used during migration */
 diff --git a/system/physmem.c b/system/physmem.c
-index c21ea92915..311ed5df27 100644
+index c21ea92915..45cbd646af 100644
 --- a/system/physmem.c
 +++ b/system/physmem.c
 @@ -84,6 +84,10 @@
@@ -37,7 +37,7 @@ index c21ea92915..311ed5df27 100644
  #include "monitor/monitor.h"
  
  #ifdef CONFIG_LIBDAXCTL
-@@ -2146,6 +2150,147 @@ static void dirty_memory_extend(ram_addr_t new_ram_size)
+@@ -2146,6 +2150,168 @@ static void dirty_memory_extend(ram_addr_t new_ram_size)
      ram_list.num_dirty_blocks = new_num_blocks;
  }
  
@@ -64,6 +64,27 @@ index c21ea92915..311ed5df27 100644
 + *
 + * OFF unless QEMU_RAM_FILE_DIR is set. A stock invocation must be bit-for-bit
 + * stock.
++ *
++ * THE 0005 x 0007 WINDOW. This patch and 0005 must not be enabled together
++ * without 0008. 0005's Win32 discard arm (ram_block_discard_shared_range,
++ * elsewhere in this file -- deliberately not named here by its API symbol;
++ * see tools/build_qemu.py's _ANCHORS if you're wondering why) assumes the
++ * discarded range is privately committed memory, which is true for every
++ * RAMBlock stock QEMU allocates and was true for every RAMBlock this file
++ * produced before this patch. Once QEMU_RAM_FILE_DIR is set, a block THIS
++ * function backed is a MAPPED FILE VIEW instead -- that discard API only
++ * works on private commit, so every discard against such a block fails and
++ * 0005's code path takes `goto err` with `-EIO`, which is a HARDER failure
++ * than the `-ENOSYS` stock QEMU gets with no Win32 discard support at all.
++ * That would reinstate, as an error, the exact "host keeps paying for
++ * memory the guest already freed" problem this whole sub-project exists to
++ * remove. Patch 0008 is what teaches the discard path to punch a hole in
++ * the FILE instead (FSCTL_SET_ZERO_DATA) when `block->omni_ram_file` is
++ * set, closing the window. tools/build_qemu.py's _pkgversion() enforces the
++ * ordering at the advertised-capability level: the `+omni-ram-file` token
++ * appears from 0007 alone, but nothing should ever SET QEMU_RAM_FILE_DIR
++ * (that is Task 6's job) without also checking for a `+omni-punch-hole`
++ * token that only appears once 0008 is in the series too.
 + */
 +/* Only blocks at least this big get a file. MEASURED with `info ramblock` on
 + * a -m 3072 boot of this very binary: NINE RAMBlocks exist, of which pc.ram is
@@ -185,7 +206,7 @@ index c21ea92915..311ed5df27 100644
  static void ram_block_add(RAMBlock *new_block, Error **errp)
  {
      const bool noreserve = qemu_ram_is_noreserve(new_block);
-@@ -2169,6 +2314,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
+@@ -2169,6 +2335,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
                  return;
              }
          } else {
@@ -206,7 +227,7 @@ index c21ea92915..311ed5df27 100644
              new_block->host = qemu_anon_ram_alloc(new_block->max_length,
                                                    &new_block->mr->align,
                                                    shared, noreserve);
-@@ -2289,7 +2448,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
+@@ -2289,7 +2469,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
  
  out_free:
      if (free_on_error) {
@@ -228,7 +249,7 @@ index c21ea92915..311ed5df27 100644
          new_block->host = NULL;
      }
  }
-@@ -2576,6 +2748,19 @@ static void reclaim_ramblock(RAMBlock *block)
+@@ -2576,6 +2769,19 @@ static void reclaim_ramblock(RAMBlock *block)
      } else if (block->fd >= 0) {
          qemu_ram_munmap(block->fd, block->host, block->max_length);
          close(block->fd);

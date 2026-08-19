@@ -38,17 +38,14 @@ _TARGET_BINARY = {
 # Flags recovered from the config.status of the build that worked
 # (C:\qemubuild, 2026-08-16). Do not "tidy" them.
 #
-# --with-pkgversion is set HERE and nowhere else: later tasks read it back
-# out of `--version` to detect capabilities, and a second task appending it
-# is how a duplicate lands.
-#
-# It says "omni-window+omni-ram-file" because patch 0007 (the RAM file
-# backing) landed in Task 3. qemu_supports_ram_file() (Task 6) trusts this
-# string verbatim to decide whether to set QEMU_RAM_FILE_DIR, and a tag that
-# claims a capability the binary does not have is worse than no tag: QEMU
-# would silently ignore the env var while the caller believed file-backed
-# RAM was in effect. That is why this became true exactly when 0007 landed
-# and not before.
+# --with-pkgversion used to live here as a hand-written literal. That was a
+# design error: a second task appending to it by hand is how a duplicate
+# lands, but a FIRST task writing the wrong literal (0007 landed, string
+# still said plain "omni-window"; or the reverse) is exactly as real a
+# failure mode and nothing caught it either time it happened during this
+# series. _pkgversion() computes the string from the series actually being
+# applied instead, so it cannot drift from what the binary has. See
+# _pkgversion()'s docstring for the ordering hazard this closes.
 _COMMON_FLAGS = (
     "--enable-gtk",
     "--enable-opengl",
@@ -56,8 +53,38 @@ _COMMON_FLAGS = (
     "--enable-slirp",
     "--disable-docs",
     "--disable-werror",
-    "--with-pkgversion=omni-window+omni-ram-file",
 )
+
+
+def _pkgversion(series) -> str:
+    """The --with-pkgversion string, derived from the series being applied
+    rather than written by hand -- later tasks read it back out of
+    `--version` to detect capabilities, and a literal that can drift from
+    what actually got patched in is worse than no literal at all.
+
+    qemu_supports_ram_file() (Task 6) trusts the `+omni-ram-file` token to
+    decide whether to set QEMU_RAM_FILE_DIR. A future Task 7 is expected to
+    trust `+omni-punch-hole` the same way for free-page reporting. The two
+    are separate tokens, not one, because of a real ordering hazard: with
+    QEMU_RAM_FILE_DIR set and patch 0007 applied but 0008 NOT applied,
+    0005's DiscardVirtualMemory arm runs against a mapped FILE VIEW instead
+    of private committed pages. DiscardVirtualMemory only works on private
+    commit, so every discard then fails and takes the `-EIO` error path --
+    reinstating the exact host-keeps-paying-for-freed-guest-memory failure
+    this whole sub-project exists to remove, and doing it as a hard error
+    where stock behaviour was merely `-ENOSYS`. Deriving `+omni-ram-file`
+    from 0007's presence and `+omni-punch-hole` from 0008's, off the SAME
+    series, makes "file backing on, punch-hole off" structurally impossible
+    to advertise rather than a thing a reader has to remember not to do.
+    """
+    numbers = {p.name[:4] for p in series}
+    tag = "omni-window"
+    if "0007" in numbers:
+        tag += "+omni-ram-file"
+    if "0008" in numbers:
+        tag += "+omni-punch-hole"
+    return tag
+
 
 _ACCEL_FLAG = {"win32": "--enable-whpx", "darwin": "--enable-hvf",
                "linux": "--enable-kvm"}
@@ -89,17 +116,26 @@ def _host_key(host_os: str | None = None) -> str:
 
 
 def configure_argv(prefix: Path, targets: list[str], extra=(),
-                   host_os: str | None = None, source: Path | None = None):
+                   host_os: str | None = None, source: Path | None = None,
+                   series=()):
     """argv for QEMU's ./configure.
 
     The accelerator flag is host-selected because `--enable-whpx` on a
     non-Windows host does not warn, it FAILS configure -- which on the Mac
     would read as "the patch series is broken".
+
+    `series` is the list of patch Paths actually being applied (typically
+    `read_series()`'s return value), NOT read from disk here -- this
+    function stays pure and testable, callable with a synthetic series a
+    unit test invents, rather than reaching into qemu-patches/SERIES on its
+    own. See `_pkgversion()` for what it does with it and why the resulting
+    --with-pkgversion flag matters beyond cosmetics.
     """
     cfg = (source or Path(".")) / "configure"
     argv = [str(cfg), f"--prefix={prefix.as_posix()}",
             "--target-list=" + ",".join(targets)]
     argv.extend(_COMMON_FLAGS)
+    argv.append(f"--with-pkgversion={_pkgversion(series)}")
     argv.append(_ACCEL_FLAG[_host_key(host_os)])
     argv.extend(extra)
     return argv
@@ -395,7 +431,7 @@ def main(argv=None) -> int:
 
     build = work / "build"
     build.mkdir(exist_ok=True)
-    cfg_argv = configure_argv(a.out, targets, source=work)
+    cfg_argv = configure_argv(a.out, targets, source=work, series=series)
     if sys.platform.startswith("win"):
         # configure is a POSIX shell script (`#!/bin/sh`); Windows'
         # CreateProcess has no shebang support, so invoked bare it fails
