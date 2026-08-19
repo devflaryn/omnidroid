@@ -1,8 +1,8 @@
 diff --git a/system/physmem.c b/system/physmem.c
-index 45cbd64..c318753 100644
+index 45cbd64..eee85eb 100644
 --- a/system/physmem.c
 +++ b/system/physmem.c
-@@ -4398,15 +4398,87 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
+@@ -4398,15 +4398,168 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
                  goto err;
              }
  #elif defined(_WIN32)
@@ -51,15 +51,15 @@ index 45cbd64..c318753 100644
 +                 * the worst case: 2166 real calls against a live guest
 +                 * (Task 4's own measurement) all returned success and
 +                 * reclaimed nothing, because none of them were ever a whole
-+                 * aligned unit. `omni_win32_alloc_granularity()` is the
-+                 * same value Task 3 already computes for `mr->align` (64
-+                 * KiB on the measured host, not hardcoded here either) --
-+                 * the granularity a Windows allocation is guaranteed to
-+                 * land on, and empirically the unit NTFS reclaims at.
++                 * aligned unit. omni_win32_alloc_granularity() is the same
++                 * value Task 3 already computes for mr->align (64 KiB on the
++                 * measured host, not hardcoded here either) -- the
++                 * granularity a Windows allocation is guaranteed to land on,
++                 * and empirically the unit NTFS reclaims at.
 +                 *
 +                 * The bytes outside [punch_start, punch_end) are left
 +                 * un-zeroed on purpose: this is guest RAM the balloon
-+                 * driver has already given up, under virtio-balloon's own
++                 * driver has already given up, under virtio-balloon own
 +                 * contract that the guest will not read it again without a
 +                 * fresh allocation, so a stale byte there costs nothing
 +                 * real. Skipping the ioctl entirely when nothing whole
@@ -69,6 +69,49 @@ index 45cbd64..c318753 100644
 +                 * the calls that can work." See
 +                 * tools/build_qemu.py:aligned_discard_interior() for the
 +                 * tested reference this arithmetic must match.
++                 *
++                 * RULING R17 -- an aligned punch can still fail, and that is
++                 * not a defect. MEASURED against a live free-page-reporting
++                 * farming boot: a mix of ok=1 and ok=0/ERROR_INVALID_PARAMETER
++                 * (87) at IDENTICAL size (4 MiB) and alignment, arriving in
++                 * runs of exactly 64 -- one kernel page-reporting batch --
++                 * which means the outcome is decided by STATE, not by the
++                 * arguments (identical arguments cannot be both valid and
++                 * invalid). Three isolated probes (tools/probes/
++                 * punch_sweep.c, punch_dirty.c, punch_concurrent.c) each
++                 * reproduce every axis that could plausibly explain it --
++                 * offset, size, alignment, an active WHPX GPA mapping, a
++                 * fully-written 3 GiB file, unflushed dirty pages in the
++                 * section, and a second thread writing the mapping
++                 * concurrently -- and every one of them is ok=1, 100% of the
++                 * time, including the exact 4 MiB-at-depth case. The one
++                 * condition none of them reproduce is a RUNNING vCPU
++                 * faulting the range through WHPX EPT, which is exactly
++                 * what free-page-reporting batching implies: it reports
++                 * regions the guest has JUST freed, i.e. ranges still hot in
++                 * EPT. That is the residual, documented suspect, not a
++                 * proven cause -- the next person who touches this should
++                 * reproduce with a running vCPU before assuming anything
++                 * else.
++                 *
++                 * So: ERROR_INVALID_PARAMETER from FSCTL_SET_ZERO_DATA here
++                 * is a MISSED OPTIMISATION, not a correctness fault. The
++                 * range the guest reported is still valid guest memory the
++                 * balloon has already given up; nothing reads it expecting
++                 * zeroes on this path (same contract as the "left un-zeroed
++                 * on purpose" paragraph above, whether the ioctl succeeds or
++                 * not). Failing loudly here is what regressed free-page-
++                 * reporting off Windows in the first place: the pre-punch-
++                 * hole DiscardVirtualMemory arm logged an error_report() per
++                 * failed page, MEASURED at 925 lines in ~60s and 78 KB of
++                 * qemu.log on a normal playable boot, buying zero reclaimed
++                 * memory. Treating every ERROR_INVALID_PARAMETER as -EIO
++                 * would reinstate that regression at a coarser (4 MiB)
++                 * granularity the moment Task 7 turns free-page-reporting
++                 * back on. Skip the range, count it, keep going -- and stay
++                 * loud (goto err) for any OTHER error code, because those
++                 * are not explained by anything measured here and may be
++                 * real.
 +                 */
 +                uint64_t granularity = omni_win32_alloc_granularity();
 +                uint64_t abs_start = rb->fd_offset + offset;
@@ -76,20 +119,58 @@ index 45cbd64..c318753 100644
 +                uint64_t punch_start = QEMU_ALIGN_UP(abs_start, granularity);
 +                uint64_t punch_end = QEMU_ALIGN_DOWN(abs_end, granularity);
 +
++                if (fh == INVALID_HANDLE_VALUE) {
++                    ret = -EIO;
++                    error_report("%s: invalid RAM file handle %s:%" PRIx64
++                                 " +%zx", __func__, rb->idstr, offset,
++                                 length);
++                    goto err;
++                }
++
 +                if (punch_start < punch_end) {
 +                    FILE_ZERO_DATA_INFORMATION zd;
 +                    DWORD junk = 0;
++                    /* Process-wide, not per-block: this Windows-only ioctl
++                     * is only ever issued against the one large file-backed
++                     * block (pc.ram) in practice, and a rough rate-limited
++                     * count is the goal, not per-block precision. */
++                    static uint64_t omni_punch_attempted;
++                    static uint64_t omni_punch_reclaimed;
++                    static uint64_t omni_punch_skipped;
++                    /* One line per ~4 free-page-reporting batches (64 calls
++                     * each, MEASURED above) -- enough to see the trend
++                     * without reproducing the 925-lines-a-minute regression
++                     * a per-call log would be. */
++                    const uint64_t OMNI_PUNCH_REPORT_EVERY = 256;
 +
 +                    zd.FileOffset.QuadPart = (LONGLONG)punch_start;
 +                    zd.BeyondFinalZero.QuadPart = (LONGLONG)punch_end;
-+                    if (fh == INVALID_HANDLE_VALUE ||
-+                        !DeviceIoControl(fh, FSCTL_SET_ZERO_DATA, &zd,
++                    omni_punch_attempted++;
++                    if (!DeviceIoControl(fh, FSCTL_SET_ZERO_DATA, &zd,
 +                                         sizeof(zd), NULL, 0, &junk, NULL)) {
-+                        ret = -EIO;
-+                        error_report("%s: punch-hole failed %s:%" PRIx64
-+                                     " +%zx", __func__, rb->idstr, offset,
-+                                     length);
-+                        goto err;
++                        DWORD omni_gle = GetLastError();
++                        if (omni_gle == ERROR_INVALID_PARAMETER) {
++                            omni_punch_skipped++;
++                        } else {
++                            ret = -EIO;
++                            error_report("%s: punch-hole failed %s:%" PRIx64
++                                         " +%zx (win32 err %lu)", __func__,
++                                         rb->idstr, offset, length,
++                                         (unsigned long)omni_gle);
++                            goto err;
++                        }
++                    } else {
++                        omni_punch_reclaimed++;
++                    }
++                    if (omni_punch_attempted % OMNI_PUNCH_REPORT_EVERY == 0) {
++                        error_report("%s: punch-hole stats attempted=%"
++                                     PRIu64 " reclaimed=%" PRIu64
++                                     " skipped=%" PRIu64 " (skipped =="
++                                     " ERROR_INVALID_PARAMETER, ruling R17"
++                                     " -- not a fault, see comment above)",
++                                     __func__, omni_punch_attempted,
++                                     omni_punch_reclaimed,
++                                     omni_punch_skipped);
 +                    }
 +                }
 +                ret = 0;
