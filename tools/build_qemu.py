@@ -161,6 +161,47 @@ def apply_argv(patch: Path, check: bool = False,
     return argv
 
 
+def aligned_discard_interior(offset: int, length: int, granularity: int):
+    """(aligned_offset, aligned_length) of the largest `granularity`-aligned
+    sub-range fully contained in [offset, offset + length). `aligned_length`
+    is 0 -- an empty interior -- when the range is smaller than one whole
+    unit, or straddles a unit boundary without ever fully covering one.
+
+    This is the reference for patch 0008's C arithmetic (the punch-hole
+    branch of `ram_block_discard_shared_range`'s Win32 arm), not a copy that
+    can drift silently: MEASURED with `tools/probes/sparse_granularity.c`
+    against a live NTFS volume, `FSCTL_SET_ZERO_DATA` reclaims disk ONLY for
+    a punch that is a whole, aligned unit --
+
+        punch 4 KiB  @ 1 MiB (aligned)       ok=1  reclaimed=0.000 MB
+        punch 32 KiB @ 2 MiB (aligned)       ok=1  reclaimed=0.000 MB
+        punch 64 KiB @ 3 MiB (aligned)       ok=1  reclaimed=0.062 MB   <- whole unit
+        punch 64 KiB @ 4 MiB+4K (UNaligned)  ok=1  reclaimed=0.000 MB
+        punch 1 MiB  @ 8 MiB (aligned)       ok=1  reclaimed=1.000 MB
+
+    -- and returns success either way, so a caller cannot tell "reclaimed"
+    from "zero-filled and still allocated" from the return value alone. A
+    per-4-KiB virtio-balloon page discard is exactly the worst case: every
+    one of 2166 real calls against a live guest (Task 4's live-guest
+    measurement) returned success and reclaimed nothing, because none of
+    them were ever a whole aligned unit. Rounding the punch INWARD to what
+    can actually be reclaimed, and skipping the ioctl -- not even
+    attempting it -- when nothing whole remains, is what turns "thousands
+    of syscalls a minute under free-page-reporting that buy nothing" into
+    "only the calls that can work." `granularity` is the caller's own
+    `omni_win32_alloc_granularity()` (64 KiB on the host this was measured
+    on), not a hardcoded 65536 -- it stays right if a volume's allocation
+    unit ever differs.
+    """
+    start = offset
+    end = offset + length
+    aligned_start = ((start + granularity - 1) // granularity) * granularity
+    aligned_end = (end // granularity) * granularity
+    if aligned_start >= aligned_end:
+        return (aligned_start, 0)
+    return (aligned_start, aligned_end - aligned_start)
+
+
 # Each omni symbol, and the function whose body it MUST sit inside. See
 # verify_applied() for why this table exists rather than a diff-stat check.
 # The third element is the patch that introduces the symbol; anchors whose

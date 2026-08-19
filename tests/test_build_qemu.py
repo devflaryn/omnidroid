@@ -8,12 +8,51 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.build_qemu import (_enclosing_function, apply_argv, configure_argv,
-                              read_pin, read_series, stage_plan,
-                              verify_applied)
+from tools.build_qemu import (_enclosing_function, aligned_discard_interior,
+                              apply_argv, configure_argv, read_pin,
+                              read_series, stage_plan, verify_applied)
 
 REPO = Path(__file__).resolve().parent.parent
 PATCHES = REPO / "qemu-patches"
+
+
+class AlignedDiscardInterior(unittest.TestCase):
+    """Pure arithmetic, no I/O -- the reference for patch 0008's C punch-hole
+    rounding. See aligned_discard_interior()'s docstring for the measurement
+    (tools/probes/sparse_granularity.c) that makes this arithmetic load-
+    bearing rather than an optimization: an unaligned or sub-unit punch
+    reclaims 0 bytes on NTFS, confirmed at 4 KiB/32 KiB/unaligned-64 KiB.
+    """
+
+    GRANULARITY = 64 * 1024  # omni_win32_alloc_granularity() on the
+                              # measured host; the function takes it as a
+                              # parameter precisely so it is not baked in.
+
+    def test_sub_unit_range_is_empty(self):
+        # A single 4 KiB balloon page: never a whole aligned unit.
+        offset, length = aligned_discard_interior(0, 4096, self.GRANULARITY)
+        self.assertEqual(length, 0)
+
+    def test_already_aligned_whole_unit_is_itself(self):
+        offset, length = aligned_discard_interior(
+            self.GRANULARITY, self.GRANULARITY, self.GRANULARITY)
+        self.assertEqual((offset, length), (self.GRANULARITY, self.GRANULARITY))
+
+    def test_unaligned_128kib_range_yields_the_64kib_interior(self):
+        # Starts 4 KiB into the first unit, so only the second of the two
+        # units it touches is ever fully covered.
+        offset, length = aligned_discard_interior(
+            4096, 128 * 1024, self.GRANULARITY)
+        self.assertEqual((offset, length),
+                         (self.GRANULARITY, self.GRANULARITY))
+
+    def test_range_starting_and_ending_mid_unit_is_empty(self):
+        # Half of unit 0 plus half of unit 1 -- spans a unit boundary, a
+        # full 64 KiB of bytes, but covers no single whole unit.
+        half = self.GRANULARITY // 2
+        offset, length = aligned_discard_interior(
+            half, self.GRANULARITY, self.GRANULARITY)
+        self.assertEqual(length, 0)
 
 
 class Series(unittest.TestCase):

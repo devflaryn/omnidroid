@@ -1,8 +1,8 @@
 diff --git a/system/physmem.c b/system/physmem.c
-index 45cbd64..7b294fa 100644
+index 45cbd64..c318753 100644
 --- a/system/physmem.c
 +++ b/system/physmem.c
-@@ -4398,15 +4398,43 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
+@@ -4398,15 +4398,87 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
                  goto err;
              }
  #elif defined(_WIN32)
@@ -34,19 +34,63 @@ index 45cbd64..7b294fa 100644
 -            {
 +            if (rb->omni_ram_file) {
 +                HANDLE fh = (HANDLE)rb->omni_ram_file;
-+                FILE_ZERO_DATA_INFORMATION zd;
-+                DWORD junk = 0;
++                /* omni: round the punch INWARD to whole, aligned units
++                 * before ever calling DeviceIoControl.
++                 *
++                 * MEASURED (tools/probes/sparse_granularity.c) against a
++                 * live NTFS volume: FSCTL_SET_ZERO_DATA reclaims disk ONLY
++                 * for a range that is a whole granularity-aligned unit --
++                 *   4 KiB aligned    -> ok=1 reclaimed=0.000 MB
++                 *   32 KiB aligned   -> ok=1 reclaimed=0.000 MB
++                 *   64 KiB aligned   -> ok=1 reclaimed=0.062 MB  (whole unit)
++                 *   64 KiB UNaligned -> ok=1 reclaimed=0.000 MB
++                 * It reports success in every case -- it zero-FILLS what
++                 * it's given -- so a caller cannot tell "reclaimed" from
++                 * "zero-filled and still allocated" from the return value
++                 * alone. A per-4-KiB virtio-balloon page discard is exactly
++                 * the worst case: 2166 real calls against a live guest
++                 * (Task 4's own measurement) all returned success and
++                 * reclaimed nothing, because none of them were ever a whole
++                 * aligned unit. `omni_win32_alloc_granularity()` is the
++                 * same value Task 3 already computes for `mr->align` (64
++                 * KiB on the measured host, not hardcoded here either) --
++                 * the granularity a Windows allocation is guaranteed to
++                 * land on, and empirically the unit NTFS reclaims at.
++                 *
++                 * The bytes outside [punch_start, punch_end) are left
++                 * un-zeroed on purpose: this is guest RAM the balloon
++                 * driver has already given up, under virtio-balloon's own
++                 * contract that the guest will not read it again without a
++                 * fresh allocation, so a stale byte there costs nothing
++                 * real. Skipping the ioctl entirely when nothing whole
++                 * remains -- not attempting it and discarding the result --
++                 * is what turns "thousands of syscalls a minute under
++                 * free-page-reporting that free zero clusters" into "only
++                 * the calls that can work." See
++                 * tools/build_qemu.py:aligned_discard_interior() for the
++                 * tested reference this arithmetic must match.
++                 */
++                uint64_t granularity = omni_win32_alloc_granularity();
++                uint64_t abs_start = rb->fd_offset + offset;
++                uint64_t abs_end = abs_start + length;
++                uint64_t punch_start = QEMU_ALIGN_UP(abs_start, granularity);
++                uint64_t punch_end = QEMU_ALIGN_DOWN(abs_end, granularity);
 +
-+                zd.FileOffset.QuadPart = (LONGLONG)(rb->fd_offset + offset);
-+                zd.BeyondFinalZero.QuadPart = zd.FileOffset.QuadPart
-+                                              + (LONGLONG)length;
-+                if (fh == INVALID_HANDLE_VALUE ||
-+                    !DeviceIoControl(fh, FSCTL_SET_ZERO_DATA, &zd, sizeof(zd),
-+                                     NULL, 0, &junk, NULL)) {
-+                    ret = -EIO;
-+                    error_report("%s: punch-hole failed %s:%" PRIx64 " +%zx",
-+                                 __func__, rb->idstr, offset, length);
-+                    goto err;
++                if (punch_start < punch_end) {
++                    FILE_ZERO_DATA_INFORMATION zd;
++                    DWORD junk = 0;
++
++                    zd.FileOffset.QuadPart = (LONGLONG)punch_start;
++                    zd.BeyondFinalZero.QuadPart = (LONGLONG)punch_end;
++                    if (fh == INVALID_HANDLE_VALUE ||
++                        !DeviceIoControl(fh, FSCTL_SET_ZERO_DATA, &zd,
++                                         sizeof(zd), NULL, 0, &junk, NULL)) {
++                        ret = -EIO;
++                        error_report("%s: punch-hole failed %s:%" PRIx64
++                                     " +%zx", __func__, rb->idstr, offset,
++                                     length);
++                        goto err;
++                    }
 +                }
 +                ret = 0;
 +            } else {
