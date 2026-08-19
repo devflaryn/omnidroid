@@ -346,24 +346,29 @@ _GL_OPTION = {"macos": "gl=es", "linux": "gl=on", "windows": "gl=on"}
 # silent flip upstream would come back as "the picture looks squashed" with
 # nothing in this repo to point at.
 #
-# WHY window-close=off IS BACK. It was dropped on the belief that "our patched
-# QEMU asks 'Stop this instance?' on the X itself" -- there is no such build
-# (see _apply_window_env), so on the binary this actually ships the X quits
-# QEMU on the spot: no prompt, the guest is killed mid-frame, and a launch that
-# took a minute is gone. That was survivable while the window only appeared
-# once the game was already running and the user had deliberately asked for it.
-# It is not survivable now that the window goes up at spawn and sits there for
-# the whole boot, which is exactly the minute the user has nothing to do but
-# look at it.
+# WHY gtk NO LONGER CARRIES window-close=off. It was put back on the belief
+# that "our patched QEMU asks 'Stop this instance?' on the X itself" -- there
+# was no such build at the time (see _apply_window_env's old warning, since
+# corrected), so on the binary that shipped then the X quit QEMU on the spot:
+# no prompt, the guest killed mid-frame, a launch that took a minute gone.
+# window-close=off was the only guard against that, and it worked by refusing
+# the X ANY effect at all.
 #
-# The cost is a window whose X does nothing, and that is a real cost, taken
-# deliberately: the window is a VIEW onto an instance, and the instance is
-# managed from the app, which now offers Hide (put it away, keep playing) and
-# Stop (power it off) as separate buttons. `--gpu window` -- the debugging
-# hatch -- gets none of these flags and keeps a working X.
+# That build now exists. Patch 0004 (qemu-patches/0004-omni-confirm-close.patch)
+# adds a gd_window_close dialog -- Shut down / Hide the viewer / Cancel, with
+# Cancel the default so Enter and Escape are both safe -- gated on
+# QEMU_WINDOW_CONFIRM_CLOSE, which _apply_window_env sets on every launch.
+# `window-close=off` and that dialog cannot coexist: QEMU's gtk backend
+# swallows the X before gd_window_close's own callback runs when the
+# suboption is on, so the flag has to come OFF for the X to reach the prompt
+# at all. The dialog is what replaces the guard now, not `--gpu window`'s
+# absence of one.
+#
+# sdl and cocoa are UNCHANGED -- neither backend has the confirm-close patch,
+# so an X on either of them still has to be swallowed outright or it kills
+# the guest with no prompt, exactly as before.
 _WINDOW_FLAGS = {
-    "gtk":   ("show-menubar=off", "zoom-to-fit=on", "keep-aspect-ratio=on",
-              "window-close=off"),
+    "gtk":   ("show-menubar=off", "zoom-to-fit=on", "keep-aspect-ratio=on"),
     "sdl":   ("window-close=off",),
     "cocoa": ("zoom-to-fit=on",),
 }
@@ -2308,23 +2313,31 @@ def scratch_env(cfg=None, env=None):
     return base
 
 
-# ⚠ NO QEMU READS THESE. They were written for a patched build that does not
-# exist -- verified 2026-08-16 against the shipped binaries, which carry no
-# `QEMU_WINDOW_*` string. They are harmless (a stock QEMU ignores an unknown
-# environment variable, so no boot can break on them) and are kept only as the
-# names such a build would use. THE BEHAVIOUR THEY NAME IS PROVIDED ELSEWHERE
-# AND IS REAL:
-#   icon          -> hostwin.present_qemu_window(icon=...) via WM_SETICON
+# These names ARE read now. They were written 2026-08-16 for a patched build
+# that did not exist yet -- verified then against the shipped binaries, which
+# carried no `QEMU_WINDOW_*` string, and a stock QEMU still ignores an
+# unknown environment variable, so setting them cost nothing on that binary.
+# qemu-patches/0001-0004 (built and staged as of this writing; see
+# tools/build_qemu.py and qemu-patches/SERIES) is what reads them now:
+#   icon          -> hostwin.present_qemu_window(icon=...) via WM_SETICON,
+#                    same as before -- the patched build adds no icon path
+#                    of its own.
 #   aspect lock   -> `-display gtk,...,keep-aspect-ratio=on` (QEMU letterboxes
 #                    instead of stretching) plus hostwin.aspect_lock (the
-#                    window itself is held at the guest's ratio)
-#   confirm close -> not implemented; see _WINDOW_FLAGS' window-close note.
+#                    window itself is held at the guest's ratio) plus
+#                    ui/gtk.c's own QEMU_WINDOW_LOCK_ASPECT-gated live
+#                    re-fit (patch 0002).
+#   confirm close -> ui/gtk.c's gd_window_close (patch 0004): Shut down /
+#                    Hide the viewer / Cancel, Cancel the default. This is
+#                    why `_WINDOW_FLAGS`' gtk entry no longer carries
+#                    `window-close=off` -- that flag swallowed the X before
+#                    gd_window_close ever ran, and the two cannot coexist.
 WINDOW_ICON_NAME = "omni-icon.png"
 
 
 def _apply_window_env(env):
-    """Set the QEMU_WINDOW_* names. INERT on every binary this project ships --
-    see the block above before you build anything on top of them."""
+    """Set the QEMU_WINDOW_* names read by the patched QEMU build (see the
+    block above) -- icon, aspect lock, and the close-confirmation dialog."""
     # INSIDE the package on purpose: PyInstaller's collect_data_files only
     # picks up data that lives in the package, so a repo-root assets/ dir
     # would vanish from the frozen build and the window would silently fall

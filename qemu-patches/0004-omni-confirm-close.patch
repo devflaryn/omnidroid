@@ -2,7 +2,7 @@ diff --git a/ui/gtk.c b/ui/gtk.c
 index 8c02415b24..2608f02787 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
-@@ -912,40 +912,69 @@ static void gd_mouse_mode_change(Notifier *notify, void *data)
+@@ -912,40 +912,107 @@ static void gd_mouse_mode_change(Notifier *notify, void *data)
          }
      }
      for (i = 0; i < s->vcs->len; i++) {
@@ -25,29 +25,67 @@ index 8c02415b24..2608f02787 100644
  
 +    if (allow_close && g_getenv("QEMU_WINDOW_CONFIRM_CLOSE")) {
 +        /* omni: closing this window powers off a machine that took a minute
-+         * to boot. Ask first -- an accidental click is otherwise
-+         * unrecoverable. */
++         * to boot, and the window is a VIEW onto an instance rather than the
++         * instance itself -- so the X has to offer putting the view away as
++         * well as stopping the machine. An accidental click is otherwise
++         * unrecoverable.
++         *
++         * This lives in QEMU rather than in a helper process because one
++         * process cannot intercept another's WM_CLOSE without injecting a
++         * DLL. Every previous attempt at this was a way of losing more
++         * slowly. */
++        enum { OMNI_SHUTDOWN = 1, OMNI_HIDE = 2 };
 +        GtkWidget *omni_dlg;
 +        gint omni_resp;
 +
 +        omni_dlg = gtk_message_dialog_new(GTK_WINDOW(s->window),
 +                                          GTK_DIALOG_MODAL |
 +                                          GTK_DIALOG_DESTROY_WITH_PARENT,
-+                                          GTK_MESSAGE_WARNING,
++                                          GTK_MESSAGE_QUESTION,
 +                                          GTK_BUTTONS_NONE,
-+                                          "Stop this instance?");
++                                          "This machine is running.");
 +        gtk_message_dialog_format_secondary_text(
 +            GTK_MESSAGE_DIALOG(omni_dlg),
-+            "It will be powered off, and anything running inside it is lost.");
++            "Shutting it down powers it off -- everything inside it is "
++            "lost. Hiding the viewer keeps it running; show it again from "
++            "the app.");
 +        gtk_dialog_add_buttons(GTK_DIALOG(omni_dlg),
 +                               "Cancel", GTK_RESPONSE_CANCEL,
-+                               "Stop instance", GTK_RESPONSE_ACCEPT, NULL);
++                               "Hide the viewer", OMNI_HIDE,
++                               "Shut down the machine", OMNI_SHUTDOWN, NULL);
 +        gtk_dialog_set_default_response(GTK_DIALOG(omni_dlg),
 +                                        GTK_RESPONSE_CANCEL);
 +        omni_resp = gtk_dialog_run(GTK_DIALOG(omni_dlg));
 +        gtk_widget_destroy(omni_dlg);
-+        if (omni_resp != GTK_RESPONSE_ACCEPT) {
++
++        if (omni_resp == OMNI_HIDE) {
++            /* The VM keeps running and the GL context is untouched -- this
++             * is a visibility change, nothing more. Hidden at the SAME
++             * level the engine shows it back at
++             * (hostwin.show_qemu_window -> ShowWindow(hwnd, SW_SHOW), what
++             * `omnidroid view <name>` calls), so the two are exact
++             * inverses: gtk_widget_hide() alone would leave GTK believing
++             * the widget unmapped while Win32 puts the HWND back on
++             * screen, and whether it ever repaints again would be a GDK
++             * implementation detail. */
++#ifdef G_OS_WIN32
++            {
++                GdkWindow *omni_gdkwin = gtk_widget_get_window(s->window);
++                HWND omni_hwnd = omni_gdkwin ?
++                    (HWND)gdk_win32_window_get_handle(omni_gdkwin) : NULL;
++                if (omni_hwnd) {
++                    ShowWindow(omni_hwnd, SW_HIDE);
++                } else {
++                    gtk_widget_hide(s->window);
++                }
++            }
++#else
++            gtk_widget_hide(s->window);
++#endif
 +            return TRUE;
++        }
++        if (omni_resp != OMNI_SHUTDOWN) {
++            return TRUE;                /* Cancel, Escape, or the dialog's X */
 +        }
 +        allow_close = true;
 +    }

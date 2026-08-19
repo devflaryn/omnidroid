@@ -159,6 +159,48 @@ class QemuMustNotStretchTheGuest(unittest.TestCase):
         self.assertEqual(
             qemu_proc.window_flags("gtk", policy=qemu_proc.GPU_WINDOW), "")
 
+
+class TheXNowReachesAPromptInsteadOfBeingSwallowed(unittest.TestCase):
+    """`window-close=off` used to be emitted for gtk so that an accidental
+    click on the X could not power a guest off with no prompt -- the only
+    build that existed had no prompt at all. Patch 0004 (see
+    qemu-patches/0004-omni-confirm-close.patch) IS that prompt now, gated on
+    QEMU_WINDOW_CONFIRM_CLOSE, and a `window-close=off` window swallows the X
+    before QEMU's own gd_window_close ever runs -- so the flag and the
+    dialog cannot coexist. Removing it is what lets the X reach the dialog.
+    """
+
+    def test_gtk_no_longer_carries_window_close_off(self):
+        self.assertNotIn("window-close=off", qemu_proc.window_flags("gtk"))
+
+    def test_gtk_still_keeps_the_aspect_lock(self):
+        # Removing window-close=off must not have taken anything else with
+        # it.
+        self.assertIn("keep-aspect-ratio=on", qemu_proc.window_flags("gtk"))
+
+    def test_sdl_is_untouched(self):
+        # sdl has no confirm-close patch behind it -- its X still has to be
+        # swallowed, or the guest dies with no prompt exactly as before.
+        self.assertIn("window-close=off", qemu_proc.window_flags("sdl"))
+
+    def test_cocoa_is_untouched(self):
+        # cocoa never carried the flag and gets no patch either; this is a
+        # regression guard, not a new behaviour.
+        self.assertNotIn("window-close=off", qemu_proc.window_flags("cocoa"))
+
+
+class TheConfirmCloseEnvVarIsActuallySet(unittest.TestCase):
+    """The whole three-option prompt (patch 0004) is inert unless the child
+    process sees QEMU_WINDOW_CONFIRM_CLOSE=1 -- gd_window_close's dialog is
+    gated on `g_getenv("QEMU_WINDOW_CONFIRM_CLOSE")`. Pinned here so a future
+    edit to _apply_window_env cannot silently drop it the way the old
+    "confirm close -> not implemented" comment block once described a
+    feature this code was never actually setting."""
+
+    def test_apply_window_env_sets_confirm_close(self):
+        env = qemu_proc._apply_window_env({})
+        self.assertEqual(env["QEMU_WINDOW_CONFIRM_CLOSE"], "1")
+
     def _display_is_accepted(self, display):
         """Whether the shipped QEMU parses this `-display` argument.
 

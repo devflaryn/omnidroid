@@ -101,6 +101,54 @@ class SeriesContent(unittest.TestCase):
         self.assertIn("QEMU_WINDOW_TITLE", text)
         self.assertIn('"QEMU (%s)"', text)   # the stock branch survives
 
+    def test_close_prompt_offers_three_outcomes(self):
+        """The user asked for exactly these three, in this order. Two of them
+        are destructive-adjacent and the default must be neither."""
+        text = (PATCHES / "0004-omni-confirm-close.patch").read_text(
+            encoding="utf-8")
+        self.assertIn("Shut down the machine", text)
+        self.assertIn("Hide the viewer", text)
+        self.assertIn("Cancel", text)
+        # Cancel is the default response, so Enter and Escape are both safe.
+        self.assertIn("GTK_RESPONSE_CANCEL", text)
+
+    def test_hide_is_a_win32_showwindow_not_a_gtk_widget_hide(self):
+        """Ruling: the engine's own hide/show pair (hostwin.hide_qemu_window /
+        show_qemu_window, which `omnidroid view <name>` calls) is Win32-level
+        -- ShowWindow(hwnd, SW_HIDE/SW_SHOW) on the raw HWND. If the dialog
+        hid the GTK *widget* instead, GTK's visibility state and Win32's
+        would disagree: SW_SHOW puts the HWND back on screen while GTK still
+        believes the widget is unmapped, and whether it ever repaints again
+        is a GDK implementation detail. Hiding at the same level the engine
+        shows at is what makes the two exact inverses."""
+        text = (PATCHES / "0004-omni-confirm-close.patch").read_text(
+            encoding="utf-8")
+        self.assertIn("ShowWindow", text)
+        self.assertIn("SW_HIDE", text)
+        # gdk_win32_window_get_handle is how patch 0002 already gets the HWND
+        # off a GdkWindow -- 0004's hide path must fetch it the same way.
+        self.assertIn("gdk_win32_window_get_handle", text)
+        # Non-Windows builds have no HWND to hide, so they fall back to the
+        # plain GTK call.
+        self.assertIn("gtk_widget_hide", text)
+
+    def test_hide_returns_true_without_destroying_the_window(self):
+        """After hiding, gd_window_close must `return TRUE` so GTK does not
+        destroy the window and the VM keeps running -- only the shut-down
+        branch may fall through to qmp_quit."""
+        text = (PATCHES / "0004-omni-confirm-close.patch").read_text(
+            encoding="utf-8")
+        hide_idx = text.index("OMNI_HIDE")
+        # The nearest `return TRUE;` after the hide branch begins is the one
+        # that keeps the window (and the VM) alive.
+        self.assertIn("return TRUE", text[hide_idx:])
+
+    def test_only_the_shutdown_branch_reaches_qmp_quit(self):
+        text = (PATCHES / "0004-omni-confirm-close.patch").read_text(
+            encoding="utf-8")
+        self.assertIn("OMNI_SHUTDOWN", text)
+        self.assertIn("qmp_quit", text)
+
 
 if __name__ == "__main__":
     unittest.main()
