@@ -1,6 +1,6 @@
 """OmniDroid — multi-account Android (Roblox) instance manager."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Windows + no console of our own (i.e. embedded in the frozen GUI) means
 # every short-lived child -- adb, qemu-img, e2fsprogs -- would otherwise pop

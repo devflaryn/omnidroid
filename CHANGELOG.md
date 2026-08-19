@@ -6,6 +6,65 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-19 — the product builds its own QEMU, and guest RAM stops costing commit
+
+`omnidroid 0.2.0`. QEMU 11.1.0 built from a patch series this repo now owns
+(`qemu-patches/0001`–`0008`, applied by `tools/build-qemu.py`), replacing the
+stock 11.0.50 the product shipped. Both `x86_64` and — for the first time —
+`aarch64`.
+
+**The patches existed only as uncommitted edits in a directory outside any
+repo**, built once, for one architecture, by hand. One `git checkout` there and
+the aspect filter, the close dialog and the discard reclaim were gone.
+`bases.py:120-123` already carried an annotation about a constant lost exactly
+that way. They are a numbered, verified series now, proven to apply cleanly to
+a pristine `v11.1.0` worktree.
+
+**Guest RAM comes from a mapped sparse file (`0007`).** Windows charges system
+commit for every privately committed page and QEMU commits the whole of `-m`,
+which is where a ~100 GB pagefile at 30 instances came from. MEASURED on the
+shipped binary, `-m 3072 -accel whpx`, paused, three times by three parties
+within ~3 MB:
+
+    private commit   3117.8 MB  ->  45.9 MB
+
+`memory-backend-file` was NOT the route: `hostmem-file.c` is excluded on
+Windows at `backends/meson.build:13` and `file_ram_alloc` sits behind
+`CONFIG_POSIX`. Backing the *anonymous* allocation instead is one function and
+one call site, and covers every RAM block rather than only the one the machine
+type wires up. Only blocks ≥ 64 MiB get a file — `info ramblock` on a live
+boot shows nine blocks, of which `pc.ram` is 3072 MiB and the other eight come
+to ~18.7 MiB, six of them read-only.
+
+**A discard punches the hole (`0008`), and NTFS only reclaims 64 KiB units.**
+Measured: a 4 KiB or 32 KiB punch returns success and frees nothing; 64 KiB
+aligned frees 64 KiB; 64 KiB *unaligned* frees nothing. `FSCTL_SET_ZERO_DATA`
+reports success for the zero-*fill* it performs, not for a deallocation it did
+not — which is why 2166 successful per-page balloon discards reclaimed exactly
+zero. Punches are rounded inward now, and the producer that matters is
+free-page reporting (high-order, aligned) rather than a balloon inflate
+(per-page, unreclaimable). On a live farming guest the RAM file went from
+pinned at 100% of `-m` to tracking the live set at 37–51%.
+
+**The X asks before it acts.** Three outcomes — shut down, hide the viewer,
+cancel — with cancel as the default. Hide is a Win32 `SW_HIDE` so it is the
+exact inverse of what `omnidroid view` does to bring the window back.
+`window-close=off` comes off gtk; it existed only because on a stock binary
+the X killed the guest mid-frame with no prompt.
+
+**Three "success" values turned out to mean nothing**, and each cost a real
+defect: `git apply` printed OK while placing a hunk in the wrong function
+(caught by an anchor check that now fails the build); `FSCTL_SET_ZERO_DATA`
+returned success on ranges it could not reclaim; and a diagnostic reported a
+stale `GetLastError`. Every one was found by measuring the effect instead of
+reading the return code.
+
+Also fixed, both from review and both in code this repo wrote: the allocator
+had no matching free (`VirtualFree` fails on a mapped view, so a handle, a
+512 MB view and a sparse file leaked per cycle), and it never set `mr->align`,
+so a `device_add pc-dimm` — which `engine.plug_mem` does — killed QEMU with
+`STATUS_INTEGER_DIVIDE_BY_ZERO`.
+
 ## 2026-08-17 (night) — farming's executor never loaded, and Android kept asking to restart the app
 
 Two farming-only defects, both reproduced on a live PS99 instance, both fixed
