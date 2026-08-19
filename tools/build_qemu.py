@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -500,6 +501,135 @@ def stage_plan(build_dir: Path, out_dir: Path, targets: list[str]):
     return plan
 
 
+_DLL_NAME_RE = re.compile(r"^\s*DLL Name:\s*(\S+)\s*$", re.MULTILINE)
+
+
+def _imports_of(text: str) -> list[str]:
+    """DLL names one PE file imports, from `objdump -p <file>` output, in
+    the order objdump lists them (duplicates possible; the caller dedupes).
+
+    Pure string parsing -- no subprocess, no filesystem -- specifically so
+    it can be pinned against CAPTURED objdump output in a test with no
+    compiler and no real .exe/.dll on disk. `objdump -p` prints one
+    "\tDLL Name: <name>" line per imported library, inside "The Import
+    Tables" section; that exact prefix does not otherwise occur in -p
+    output (the export table has no per-entry DLL name), so a line-anchored
+    regex is enough -- no need to track section headers.
+    """
+    return _DLL_NAME_RE.findall(text)
+
+
+def _objdump_imports(path: Path, objdump: str) -> list[str]:
+    """`_imports_of`, fed by actually running `objdump -p` on `path`."""
+    result = subprocess.run([objdump, "-p", str(path)], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, check=True)
+    return _imports_of(result.stdout.decode("utf-8", errors="replace"))
+
+
+def _index_search_dir(d: Path) -> dict[str, Path]:
+    """lowercase filename -> Path, for the regular files directly inside
+    `d` (non-recursive -- mingw64/bin is flat).
+
+    Lowercased because a PE import record and the Windows filesystem
+    entry for the same DLL are not guaranteed to agree on case (import
+    tables often carry the exact case the *linker* used, which is not
+    necessarily the case the file was installed with), and DLL lookup on
+    Windows is case-insensitive regardless.
+    """
+    out: dict[str, Path] = {}
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if p.is_file():
+                out.setdefault(p.name.lower(), p)
+    return out
+
+
+def collect_runtime_dlls(binaries, search_dirs, out_dir, *, copy=True,
+                         objdump="objdump", _imports_fn=None) -> list[str]:
+    """Third-party runtime DLLs `binaries` need, walked recursively, and
+    (when `copy` is true) copied into `out_dir`. Returns the sorted list of
+    DLL filenames collected.
+
+    WHY THIS EXISTS. `scripts/symlink-install-tree.py` normally assembles
+    QEMU's run tree, including its DLL dependencies, by symlinking from the
+    toolchain's lib dirs -- but patch 0006 disables exactly that on
+    Windows (Developer Mode is not something a customer machine can be
+    assumed to have), and `stage_plan()`'s plain file copies never picked
+    up the slack. A staged bundle that only works on a machine with
+    MSYS2 or Git-for-Windows on PATH is not portable; it happens to run on
+    the machine that built it.
+
+    THE CLASSIFICATION RULE. Each binary's PE import table lists the DLLs
+    it loads by name, with no distinction between "ships with Windows" and
+    "ships with the toolchain" -- that distinction only exists by asking
+    whether a same-named FILE sits in one of `search_dirs` (mingw64/bin in
+    practice). Found there -> third-party, gets copied and its own imports
+    are walked in turn. Not found there -> assumed a genuine Windows
+    system DLL (KERNEL32.dll, ADVAPI32.dll, the api-ms-win-core-*.dll API
+    sets, ...) and left alone -- bundling those is not just wasted size,
+    it risks shipping a copy that fights the real one Windows resolves at
+    a different privilege level.
+
+    `_imports_fn`, when given, replaces the real `objdump -p` invocation
+    with `_imports_fn(path) -> list[str]` -- this is how the tests exercise
+    recursion and classification with small fake dependency graphs instead
+    of compiled PE files; production code never passes it and gets the
+    real `_objdump_imports`.
+
+    Traversal order does not affect the result: `collected` is built as a
+    dict keyed by lowercased name (case-insensitive dedupe -- the same DLL
+    reachable from two different binaries is copied once), and the return
+    value is `sorted()` over the final set, not accumulated in visit order.
+    Two calls against the same inputs therefore produce byte-identical
+    output regardless of which binary's import table happens to mention a
+    shared dependency first.
+    """
+    imports_of = _imports_fn or (lambda p: _objdump_imports(Path(p), objdump))
+
+    index: dict[str, Path] = {}
+    for d in search_dirs:
+        for name, path in _index_search_dir(Path(d)).items():
+            index.setdefault(name, path)
+
+    collected: dict[str, Path] = {}   # lowercased DLL name -> its file
+    visited: set[str] = set()         # files already walked for imports
+    queue = [Path(b) for b in binaries]
+
+    while queue:
+        current = queue.pop(0)
+        vkey = str(current).lower()
+        if vkey in visited:
+            continue
+        visited.add(vkey)
+        for dep in imports_of(current):
+            key = dep.lower()
+            if key in collected:
+                continue          # already found and queued
+            found = index.get(key)
+            if found is None:
+                continue           # a genuine Windows system DLL -- skip it
+            collected[key] = found
+            queue.append(found)   # recurse into the DLL's own imports
+
+    if copy:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for path in collected.values():
+            shutil.copy2(path, out_dir / path.name)
+
+    return sorted(path.name for path in collected.values())
+
+
+def _default_dll_dir() -> Path | None:
+    """Directory to search for third-party runtime DLLs, resolved from
+    whichever `objdump` PATH would actually run -- not a hardcoded MSYS2
+    install location, so a toolchain installed somewhere else still
+    resolves correctly. None if no `objdump` is on PATH; main() then
+    requires an explicit `--dll-dir`."""
+    found = shutil.which("objdump")
+    return Path(found).resolve().parent if found else None
+
+
 def _run(argv, cwd=None, env=None):
     print("+", " ".join(str(a) for a in argv), flush=True)
     subprocess.run(argv, cwd=cwd, env=env, check=True)
@@ -528,6 +658,10 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--skip-build", action="store_true",
                     help="apply and configure only")
+    ap.add_argument("--dll-dir", type=Path, default=None,
+                    help="search dir for third-party runtime DLLs "
+                         "(default: the directory containing the `objdump` "
+                         "found on PATH)")
     a = ap.parse_args(argv)
 
     targets = [t for t in a.targets.split(",") if t]
@@ -581,12 +715,34 @@ def main(argv=None) -> int:
     _run(["ninja", f"-j{a.jobs}"], cwd=build)
 
     a.out.mkdir(parents=True, exist_ok=True)
-    for src, dst in stage_plan(build, a.out, targets):
+    plan = stage_plan(build, a.out, targets)
+    for src, dst in plan:
         if src.is_dir():
             shutil.copytree(src, dst, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dst)
         print(f"staged {dst}", flush=True)
+
+    # The staged binaries above are just files copied out of `build/` --
+    # their DLL dependencies are not among them, because `stage_plan` only
+    # ever knew about the emulator/tool binaries and pc-bios/. On Windows
+    # those binaries need ~50 third-party DLLs from the mingw toolchain
+    # (patch 0006 disables the symlink-install-tree script that would
+    # normally have supplied them -- see collect_runtime_dlls()'s
+    # docstring). Skipped on non-Windows hosts: there is nothing to
+    # collect, and `objdump -p` output is a PE-specific format.
+    if _host_key() == "win32":
+        dll_dir = a.dll_dir or _default_dll_dir()
+        if dll_dir is None:
+            raise SystemExit(
+                "no --dll-dir given and no `objdump` on PATH -- cannot "
+                "resolve where the mingw runtime DLLs live, and the staged "
+                "bundle will not start without them (STATUS_DLL_NOT_FOUND) "
+                "on any machine that lacks MSYS2/Git-for-Windows")
+        staged_binaries = [dst for _, dst in plan if dst.is_file()]
+        dlls = collect_runtime_dlls(staged_binaries, [dll_dir], a.out)
+        print(f"staged {len(dlls)} runtime DLL(s) from {dll_dir}",
+              flush=True)
     return 0
 
 

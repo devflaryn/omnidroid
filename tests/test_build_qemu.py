@@ -8,8 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.build_qemu import (_enclosing_function, aligned_discard_interior,
-                              apply_argv, configure_argv, read_pin,
+from tools.build_qemu import (_enclosing_function, _imports_of,
+                              aligned_discard_interior, apply_argv,
+                              collect_runtime_dlls, configure_argv, read_pin,
                               read_series, stage_plan, verify_applied)
 
 REPO = Path(__file__).resolve().parent.parent
@@ -357,6 +358,138 @@ class Stage(unittest.TestCase):
         self.assertTrue(any(str(src).endswith("pc-bios") for src, _ in plan),
                         "firmware is loaded lazily and BY NAME -- an "
                         "allow-list boots here and fails on a customer's")
+
+
+class ImportsOf(unittest.TestCase):
+    """Pinned against REAL `objdump -p qemu-img.exe` output (captured on
+    the build host against the actual staged binary, 2026-08-19), not a
+    hand-written guess at the format -- so the regex is proven against
+    what objdump actually emits, not what someone remembers it emitting.
+    Trimmed to three import-table blocks (a handful of entries each); the
+    surrounding vma/hint/thunk table rows are kept verbatim specifically
+    to prove they are NOT mistaken for "DLL Name:" lines.
+    """
+
+    CAPTURED = (
+        "There is an import table in .idata at 0x401c3000\n"
+        "\n"
+        "The Import Tables (interpreted .idata section contents)\n"
+        " vma:            Hint    Time      Forward  DLL       First\n"
+        "                 Table   Stamp     Chain    Name      Thunk\n"
+        " 001c3000\t001c30f0 00000000 00000000 001c6e44 001c3fa8\n"
+        "\n"
+        "\tDLL Name: ADVAPI32.dll\n"
+        "\tvma:     Ordinal  Hint  Member-Name  Bound-To\n"
+        "\t001c3fa8  <none>  00c1  CryptAcquireContextA\n"
+        "\t001c3fb0  <none>  00d2  CryptGenRandom\n"
+        "\n"
+        " 001c3014\t001c3108 00000000 00000000 001c6e60 001c3fc0\n"
+        "\n"
+        "\tDLL Name: libbz2-1.dll\n"
+        "\tvma:     Ordinal  Hint  Member-Name  Bound-To\n"
+        "\t001c3fc0  <none>  0007  BZ2_bzDecompress\n"
+        "\t001c3fc8  <none>  0008  BZ2_bzDecompressEnd\n"
+        "\n"
+        " 001c3028\t001c3128 00000000 00000000 001c6fdc 001c3fe0\n"
+        "\n"
+        "\tDLL Name: KERNEL32.dll\n"
+        "\tvma:     Ordinal  Hint  Member-Name  Bound-To\n"
+        "\t001c3fe0  <none>  0000  AcquireSRWLockExclusive\n"
+        "\t001c3fe8  <none>  0025  AreFileApisANSI\n"
+    )
+
+    def test_extracts_every_dll_name_in_order(self):
+        self.assertEqual(_imports_of(self.CAPTURED),
+                         ["ADVAPI32.dll", "libbz2-1.dll", "KERNEL32.dll"])
+
+    def test_member_names_are_not_mistaken_for_dll_names(self):
+        # CryptAcquireContextA, BZ2_bzDecompress etc. sit in the SAME
+        # column layout one line below "DLL Name:" -- a looser regex could
+        # grab them too. Exactly three matches, none of them a symbol name.
+        names = _imports_of(self.CAPTURED)
+        self.assertEqual(len(names), 3)
+        self.assertNotIn("CryptAcquireContextA", names)
+
+    def test_no_import_table_yields_no_names(self):
+        self.assertEqual(_imports_of("nothing relevant here\n"), [])
+
+
+class CollectRuntimeDlls(unittest.TestCase):
+    """`_imports_fn` replaces the real `objdump -p` call, so these fixtures
+    are small fakes -- a dict of basename -> its declared imports -- rather
+    than compiled PE files. The search dir still needs real (empty) files:
+    that half of the classification (found on disk or not) is exactly the
+    behaviour under test, and it costs nothing to fake with zero-byte
+    placeholders instead of a second layer of mocking.
+    """
+
+    def _search_dir(self, tmp, names):
+        d = Path(tmp) / "search"
+        d.mkdir(exist_ok=True)
+        for name in names:
+            (d / name).write_bytes(b"")
+        return d
+
+    def test_a_system_dll_is_not_bundled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            search = self._search_dir(tmp, [])  # nothing third-party exists
+            imports = {"root.exe": ["KERNEL32.dll", "ADVAPI32.dll"]}
+            dlls = collect_runtime_dlls(
+                [Path(tmp) / "root.exe"], [search], Path(tmp) / "out",
+                _imports_fn=lambda p: imports.get(Path(p).name, []))
+            self.assertEqual(dlls, [])
+
+    def test_a_dll_present_in_the_search_dir_is_bundled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            search = self._search_dir(tmp, ["foo.dll"])
+            out = Path(tmp) / "out"
+            imports = {"root.exe": ["foo.dll", "KERNEL32.dll"], "foo.dll": []}
+            dlls = collect_runtime_dlls(
+                [Path(tmp) / "root.exe"], [search], out,
+                _imports_fn=lambda p: imports.get(Path(p).name, []))
+            self.assertEqual(dlls, ["foo.dll"])
+            self.assertTrue((out / "foo.dll").is_file(),
+                            "found-in-search-dir dependency was not copied")
+
+    def test_walk_is_recursive(self):
+        # root -> a.dll -> b.dll -> c.dll, each only named by its parent's
+        # import table -- if the walk stopped after one hop, b.dll and
+        # c.dll would never be discovered at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            search = self._search_dir(tmp, ["a.dll", "b.dll", "c.dll"])
+            imports = {
+                "root.exe": ["a.dll"],
+                "a.dll": ["b.dll"],
+                "b.dll": ["c.dll"],
+                "c.dll": [],
+            }
+            dlls = collect_runtime_dlls(
+                [Path(tmp) / "root.exe"], [search], Path(tmp) / "out",
+                _imports_fn=lambda p: imports.get(Path(p).name, []))
+            self.assertEqual(dlls, ["a.dll", "b.dll", "c.dll"])
+
+    def test_deterministic_across_repeat_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            search = self._search_dir(
+                tmp, ["a.dll", "b.dll", "c.dll", "d.dll"])
+            imports = {
+                "root.exe": ["d.dll", "a.dll", "KERNEL32.dll"],
+                "a.dll": ["b.dll", "c.dll"],
+                "b.dll": [],
+                "c.dll": [],
+                "d.dll": [],
+            }
+            def fake(p):
+                return imports.get(Path(p).name, [])
+
+            first = collect_runtime_dlls(
+                [Path(tmp) / "root.exe"], [search], Path(tmp) / "out",
+                copy=False, _imports_fn=fake)
+            second = collect_runtime_dlls(
+                [Path(tmp) / "root.exe"], [search], Path(tmp) / "out",
+                copy=False, _imports_fn=fake)
+            self.assertEqual(first, second)
+            self.assertEqual(first, ["a.dll", "b.dll", "c.dll", "d.dll"])
 
 
 if __name__ == "__main__":
