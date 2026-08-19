@@ -1,0 +1,55 @@
+diff --git a/system/physmem.c b/system/physmem.c
+index 45cbd64..7b294fa 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -4398,15 +4398,43 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
+                 goto err;
+             }
+ #elif defined(_WIN32)
+-            /* omni: Windows has no madvise(), so every discard here used to
+-             * return -ENOSYS -- the guest handed its pages back and the host
+-             * kept paying for them. DiscardVirtualMemory() is MADV_DONTNEED
+-             * in the ways that matter: the pages leave the working set, the
+-             * frames are freed, the reservation and protection stay, and the
+-             * next touch reads zeroes with no pagefile write.
++            /* omni: two discards, because there are two backings.
++             *
++             * A block from omni_win32_file_ram_alloc (patch 0007) has a real
++             * file behind it, and FSCTL_SET_ZERO_DATA is that file's
++             * fallocate(PUNCH_HOLE): the frames are freed, the file's
++             * AllocationSize drops, and the next touch reads zeroes. MEASURED
++             * (tools/probes/) to work on a range that is LIVE in a WHPX
++             * partition -- the hypervisor does not pin it.
++             *
++             * DiscardVirtualMemory is the private-commit equivalent and is
++             * kept for blocks with no file. It frees the frames but leaves
++             * the reservation, which is right for private memory and wrong
++             * for a mapping: DiscardVirtualMemory operates on privately
++             * committed pages, and against a mapped view it either fails or
++             * drops the pages without touching the file -- reclaiming the
++             * RAM and leaking the disk, which is the wall this patch exists
++             * to remove.
+              * Resolved dynamically so the build does not depend on the SDK
+              * declaring it. */
+-            {
++            if (rb->omni_ram_file) {
++                HANDLE fh = (HANDLE)rb->omni_ram_file;
++                FILE_ZERO_DATA_INFORMATION zd;
++                DWORD junk = 0;
++
++                zd.FileOffset.QuadPart = (LONGLONG)(rb->fd_offset + offset);
++                zd.BeyondFinalZero.QuadPart = zd.FileOffset.QuadPart
++                                              + (LONGLONG)length;
++                if (fh == INVALID_HANDLE_VALUE ||
++                    !DeviceIoControl(fh, FSCTL_SET_ZERO_DATA, &zd, sizeof(zd),
++                                     NULL, 0, &junk, NULL)) {
++                    ret = -EIO;
++                    error_report("%s: punch-hole failed %s:%" PRIx64 " +%zx",
++                                 __func__, rb->idstr, offset, length);
++                    goto err;
++                }
++                ret = 0;
++            } else {
+                 typedef DWORD (WINAPI *omni_discard_fn)(PVOID, SIZE_T);
+                 static omni_discard_fn omni_discard;
+                 static bool omni_discard_resolved;

@@ -177,10 +177,24 @@ def apply_argv(patch: Path, check: bool = False,
 # env var name, a Win32 API name, a macro).
 _ANCHORS = (
     ("ui/gtk.c", "QEMU_WINDOW_TITLE", "gd_update_caption", "0001"),
-    # Not "omni_install_aspect_filter": that name's first occurrence is its
-    # own definition (file scope, added just above gd_update_geometry_hints
-    # by this same patch), not the call inside gd_update_geometry_hints.
-    ("ui/gtk.c", "QEMU_WINDOW_LOCK_ASPECT", "gd_update_geometry_hints",
+    # Revised in Task 4's hardening round. NOT "QEMU_WINDOW_LOCK_ASPECT":
+    # that env var is checked in THREE different ui/gtk.c functions by
+    # design (gd_update_geometry_hints, gd_update_windowsize, and a third
+    # from an unrelated later hunk) -- a real, intentional multi-call-site
+    # feature, not a misplaced hunk. Against the hardened checker (every
+    # occurrence, not just the first) that is correctly reported as an
+    # ambiguous anchor, which it always secretly was; the old first-match
+    # checker just happened to resolve its first occurrence to the right
+    # function and never looked at the other two.
+    # "omni_install_aspect_filter" was rejected here in Task 2 for the
+    # opposite reason: its first occurrence is its own definition (file
+    # scope, added just above gd_update_geometry_hints by this same patch),
+    # which the OLD checker treated as a violation. The hardened checker
+    # ignores file-scope occurrences, so that objection no longer applies,
+    # and the symbol has exactly one non-file-scope occurrence -- the call
+    # inside gd_update_geometry_hints -- making it the actually-unique
+    # anchor Task 2 was looking for.
+    ("ui/gtk.c", "omni_install_aspect_filter", "gd_update_geometry_hints",
      "0002"),
     ("ui/gtk.c", "QEMU_WINDOW_PANEL", "gd_set_ui_size", "0003"),
     ("ui/gtk.c", "QEMU_WINDOW_CONFIRM_CLOSE", "gd_window_close", "0004"),
@@ -197,8 +211,16 @@ _ANCHORS = (
     # got a false violation on a clean apply. "omni_err" is declared and
     # used only at the call site inside ram_block_add.
     ("system/physmem.c", "omni_err", "ram_block_add", "0007"),
-    ("system/physmem.c", "FSCTL_SET_ZERO_DATA", "ram_block_discard_range",
-     "0008"),
+    # Not "ram_block_discard_range": that's the thin public wrapper (calls
+    # ram_block_discard_shared_range, then ram_block_discard_guest_memfd_
+    # range) -- it contains no Win32 code at all. The branch this patch adds
+    # sits in the SAME function 0005's DiscardVirtualMemory arm is already
+    # anchored to, right beside it. Wrong on the first attempt here too:
+    # verified by applying the real patch to the built worktree and reading
+    # back _enclosing_functions() before trusting this row (see Task 4's
+    # report).
+    ("system/physmem.c", "FSCTL_SET_ZERO_DATA",
+     "ram_block_discard_shared_range", "0008"),
 )
 
 
@@ -254,6 +276,57 @@ def _blank_comments_and_literals(text: str) -> str:
     return "".join(out)
 
 
+def _owner_prefix(scan: str):
+    """`prefix` such that `prefix[i]` is the name of the C function whose
+    body encloses offset `i` in `scan` (or None at file scope), for every
+    `i` from 0 through `len(scan)` inclusive.
+
+    One forward brace-counting pass computes the owner at EVERY offset, not
+    just one -- shared by `_enclosing_function` (first occurrence only) and
+    `_enclosing_functions` (every occurrence, see its docstring for why a
+    single first-match resolution is not enough). `scan` must already have
+    comments and string/char literals blanked (`_blank_comments_and_literals`)
+    so a brace inside either cannot perturb the depth count.
+
+    `pending` deliberately survives newlines: QEMU's own style puts a
+    function's opening brace on its own line (`foo(...)\n{`), so clearing
+    `pending` on '\n' would forget the signature before the brace that
+    consumes it -- and every top-level definition in the file would report
+    as file-scope. `pending` is only set while it is still `None`, and is
+    cleared at every depth-0 '}' (end of a definition) and every depth-0
+    ';' (end of a prototype or a bodyless declaration) -- so the first
+    identifier-before-'(' since the last such boundary wins, which is the
+    function's own name, not an attribute macro
+    (`foo(void) SOME_ATTR(x)\n{`) or a second call on the same line.
+    """
+    depth = 0
+    current = None
+    pending = None
+    prefix = [None] * (len(scan) + 1)
+    for pos, ch in enumerate(scan):
+        prefix[pos] = current
+        if ch == "(" and depth == 0:
+            if pending is None:
+                # remember the identifier immediately before this paren
+                j = pos
+                while j > 0 and (scan[j - 1].isalnum() or scan[j - 1] == "_"):
+                    j -= 1
+                pending = scan[j:pos] or None
+        elif ch == "{":
+            if depth == 0:
+                current = pending
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                current = None
+                pending = None
+        elif ch == ";" and depth == 0:
+            pending = None
+    prefix[len(scan)] = current
+    return prefix
+
+
 def _enclosing_function(text: str, needle: str):
     """Name of the C function whose body contains the first `needle`.
 
@@ -274,46 +347,41 @@ def _enclosing_function(text: str, needle: str):
     thing being searched for. Blanking only ever affects which function the
     brace-counter thinks `idx` falls inside, never whether `idx` is found.
 
-    `pending` deliberately survives newlines: QEMU's own style puts a
-    function's opening brace on its own line (`foo(...)\n{`), so clearing
-    `pending` on '\n' would forget the signature before the brace that
-    consumes it -- and every top-level definition in the file would report
-    as file-scope. `pending` is only set while it is still `None`, and is
-    cleared at every depth-0 '}' (end of a definition) and every depth-0
-    ';' (end of a prototype or a bodyless declaration) -- so the first
-    identifier-before-'(' since the last such boundary wins, which is the
-    function's own name, not an attribute macro
-    (`foo(void) SOME_ATTR(x)\n{`) or a second call on the same line.
+    First-occurrence-only: use `_enclosing_functions` (plural) when a symbol
+    might legitimately repeat, which is exactly the case `verify_applied`
+    has to handle -- see that function's docstring.
     """
     idx = text.find(needle)
     if idx < 0:
         return None
-    scan = _blank_comments_and_literals(text)
-    depth = 0
-    current = None
-    pending = None
-    for pos, ch in enumerate(scan):
-        if pos >= idx:
+    return _owner_prefix(_blank_comments_and_literals(text))[idx]
+
+
+def _enclosing_functions(text: str, needle: str):
+    """Enclosing function name (or None for a file-scope occurrence) for
+    EVERY occurrence of `needle` in `text`, in file order.
+
+    Exists because `_enclosing_function`'s first-match resolution has a real
+    false-negative direction: a decoy occurrence sitting EARLIER in the file
+    and INSIDE the expected function, while the real hunk landed LATER, in
+    the wrong function, makes `text.find()` resolve to the decoy, report
+    clean, and never look at the real one. `verify_applied` instead wants
+    every occurrence's owner, so it can tell "some occurrence is in want_fn
+    and nothing is anywhere else" from "an occurrence exists somewhere it
+    shouldn't."
+    """
+    if needle not in text:
+        return []
+    prefix = _owner_prefix(_blank_comments_and_literals(text))
+    out = []
+    start = 0
+    while True:
+        idx = text.find(needle, start)
+        if idx < 0:
             break
-        if ch == "(" and depth == 0:
-            if pending is None:
-                # remember the identifier immediately before this paren
-                j = pos
-                while j > 0 and (scan[j - 1].isalnum() or scan[j - 1] == "_"):
-                    j -= 1
-                pending = scan[j:pos] or None
-        elif ch == "{":
-            if depth == 0:
-                current = pending
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                current = None
-                pending = None
-        elif ch == ";" and depth == 0:
-            pending = None
-    return current
+        out.append(prefix[idx])
+        start = idx + 1
+    return out
 
 
 def verify_applied(work: Path, series):
@@ -327,6 +395,25 @@ def verify_applied(work: Path, series):
     reported success. `git apply` matches on surrounding context, so every
     rebase onto a newer tag and every build on a slightly different tree can
     reproduce it. The result compiles, runs, and is wrong.
+
+    REQUIRED SEMANTICS, and why a plain `text.find()` first-match is not
+    enough: some occurrence of `symbol` must lie inside `want_fn`, AND no
+    occurrence may lie inside a DIFFERENT function. File-scope occurrences
+    (a comment, a symbol's own declaration) are ignored rather than fatal --
+    every one of three real false positives this check has thrown was
+    exactly that, caught by hand: a function's own file-scope definition, an
+    env-var name in a file-scope comment, and an API name in a patch header
+    comment. But the same first-match resolution that produced those false
+    positives also has a false-negative direction, and that one is the
+    dangerous one: a decoy occurrence sitting EARLIER in the file and INSIDE
+    want_fn, while the real hunk landed LATER, in the wrong function, makes
+    `text.find()` resolve to the decoy, report clean, and never look at the
+    real one. So every occurrence is checked (`_enclosing_functions`, not
+    `_enclosing_function`): occurrences spread across two or more different
+    functions are reported as an ambiguous anchor -- naming the real problem
+    (the symbol no longer identifies one call site) instead of pointing at
+    whichever function happened to be found -- rather than silently or
+    misleadingly resolved to a single "wrong" function.
     """
     have = {p.name[:4] for p in series}
     out = []
@@ -342,8 +429,15 @@ def verify_applied(work: Path, series):
             out.append(f"{rel}: {symbol} not found -- patch {patch_num} "
                        f"did not apply, or applied somewhere unexpected")
             continue
-        got = _enclosing_function(text, symbol)
-        if got != want_fn:
+        in_fn = sorted({f for f in _enclosing_functions(text, symbol)
+                        if f is not None})
+        if len(in_fn) > 1:
+            out.append(f"{rel}: {symbol} appears inside multiple functions "
+                       f"{in_fn} -- ambiguous anchor for patch {patch_num}; "
+                       f"it no longer identifies one call site "
+                       f"(expected only {want_fn!r})")
+        elif not in_fn or in_fn[0] != want_fn:
+            got = in_fn[0] if in_fn else None
             out.append(f"{rel}: {symbol} is inside {got!r}, expected "
                        f"{want_fn!r} -- patch {patch_num} landed in the "
                        f"wrong function and `git apply` did not say so")

@@ -77,11 +77,22 @@ def _free_tcp_port() -> int:
     return port
 
 
-def _ram_file_count(ram_dir: str) -> int:
+def _ram_file_count(ram_dir: str, pid: int) -> int:
+    """Count of THIS PROCESS's own *.bin files in `ram_dir`.
+
+    PID-scoped, not a bare `omni-ram-*.bin` glob, because the patch's own
+    filename convention (`omni-ram-<pid>-<ptr>.bin`, set in
+    omni_win32_file_ram_alloc) makes the scoping available for free, and not
+    using it is exactly the vacuousness this probe exists to catch: a stale
+    file left behind by an incomplete PRIOR run of this same probe, or
+    another QEMU instance sharing the same QEMU_RAM_FILE_DIR, would satisfy
+    the 1a assertion below without the binary under test having engaged the
+    file-backed path at all.
+    """
     p = Path(ram_dir)
     if not p.is_dir():
         return 0
-    return len(list(p.glob("omni-ram-*.bin")))
+    return len(list(p.glob(f"omni-ram-{pid}-*.bin")))
 
 
 def _boot(exe: str, biosdir: str, extra_env: dict | None):
@@ -186,7 +197,7 @@ def run_one(tag: str, exe: str, biosdir: str, ram_dir: str | None):
             # plugged above is 512 MB, over the 64 MiB threshold, so at
             # least one *.bin file (that DIMM's, maybe also pc.ram's) MUST
             # exist right now if the patch is doing anything at all.
-            base_files = _ram_file_count(ram_dir)
+            base_files = _ram_file_count(ram_dir, proc.pid)
             if base_files < 1:
                 print(f"  FAIL: QEMU_RAM_FILE_DIR is set and a 512 MB DIMM "
                       f"is plugged, but 0 *.bin files exist in {ram_dir} -- "
@@ -202,7 +213,7 @@ def run_one(tag: str, exe: str, biosdir: str, ram_dir: str | None):
             # deliberately NOT wired into the guest (see _add_unattached) ---
             # `base_files` may already be set from the 1a check above (env
             # set); for the env-unset run it is always 0 and stays 0.
-            base_files = _ram_file_count(ram_dir) if ram_dir else 0
+            base_files = _ram_file_count(ram_dir, proc.pid) if ram_dir else 0
             for i in range(1, 4):
                 mem_id, err = _add_unattached(qmp, i)
                 if err:
@@ -219,7 +230,7 @@ def run_one(tag: str, exe: str, biosdir: str, ram_dir: str | None):
                     ok = False
                     break
             if ok:
-                end_files = _ram_file_count(ram_dir) if ram_dir else 0
+                end_files = _ram_file_count(ram_dir, proc.pid) if ram_dir else 0
                 print(f"  *.bin files in ram dir: base={base_files} "
                       f"end={end_files}")
                 # Fix round 2, 1b: a process handle-count check used to sit
@@ -279,6 +290,20 @@ def main(argv=None):
     biosdir = str(Path(exe).resolve().parent.parent / "pc-bios")
     if not Path(biosdir).is_dir():
         biosdir = str(Path(exe).resolve().parent / "pc-bios")
+
+    # Belt-and-braces alongside the PID scoping in _ram_file_count: a file
+    # left behind by a killed prior run of THIS probe (e.g. a `terminate()`
+    # that raced DELETE_ON_CLOSE) could in principle share a PID with this
+    # run if Windows recycled it, which PID-scoping alone would not catch.
+    # Starting from an empty directory removes that edge case rather than
+    # relying on it never happening.
+    ram_path = Path(ram_dir)
+    if ram_path.is_dir():
+        for stale in ram_path.glob("omni-ram-*.bin"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     results = []
     results.append(("baseline (env unset)",

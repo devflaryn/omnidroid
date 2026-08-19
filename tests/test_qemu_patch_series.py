@@ -59,6 +59,7 @@ class SeriesContent(unittest.TestCase):
             {"scripts/symlink-install-tree.py"},
         "0007-omni-win32-ram-file.patch":
             {"system/physmem.c", "include/system/ramblock.h"},
+        "0008-omni-win32-punch-hole.patch": {"system/physmem.c"},
     }
 
     def test_each_patch_touches_only_its_files(self):
@@ -76,6 +77,20 @@ class SeriesContent(unittest.TestCase):
         self.assertIn("QEMU_RAM_FILE_DIR", text)
         self.assertIn("FILE_ATTRIBUTE_TEMPORARY", text)
         self.assertIn("FSCTL_SET_SPARSE", text)
+
+    def test_punch_hole_precedes_the_private_discard(self):
+        """A file-backed block must take FSCTL_SET_ZERO_DATA, not
+        DiscardVirtualMemory. DiscardVirtualMemory operates on private
+        committed pages; against a mapped view it either fails or drops the
+        pages without touching the file, which reclaims the RAM and leaks the
+        disk -- and disk is the binding wall once commit is solved."""
+        text = (PATCHES / "0008-omni-win32-punch-hole.patch").read_text(
+            encoding="utf-8")
+        self.assertIn("FSCTL_SET_ZERO_DATA", text)
+        self.assertIn("rb->omni_ram_file", text)
+        # An int fd field would be 0 on a g_malloc0'd block -- a valid
+        # descriptor -- so every block would take this branch.
+        self.assertNotIn("_get_osfhandle", text)
 
     def test_caption_change_is_gated(self):
         """Every omni feature is behind a QEMU_WINDOW_* gate so a stock

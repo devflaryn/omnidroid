@@ -220,6 +220,81 @@ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
                             for v in out),
                         f"a hunk in the wrong function went unreported: {out}")
 
+    # omni: a decoy occurrence sitting EARLIER in the file and INSIDE
+    # want_fn (gd_set_ui_size), while the real hunk landed LATER, in the
+    # wrong function (gd_set_ui_refresh_rate). `text.find()` -- the first
+    # occurrence -- resolves to the decoy, reports clean, and never looks at
+    # the real one. This is the false negative the hardened check exists to
+    # close: some real anchor symbol legitimately repeating itself (e.g. as
+    # a second, unrelated `g_getenv()` call) must not let a misplaced hunk
+    # hide behind it.
+    DECOY_THEN_WRONG = """
+static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+{
+    /* decoy: an unrelated read of the same env var, earlier in the file
+     * and inside the function the anchor is supposed to guard. */
+    const char *decoy = g_getenv("QEMU_WINDOW_PANEL");
+}
+
+static void gd_set_ui_refresh_rate(VirtualConsole *vc, int refresh_rate)
+{
+    /* the REAL hunk, landed in the wrong function */
+    const char *panel = g_getenv("QEMU_WINDOW_PANEL");
+}
+"""
+
+    # omni: the exact shape of two of the three real false positives this
+    # hardening round fixed -- an occurrence sitting at FILE SCOPE (a
+    # comment, or a bodyless declaration), plus the real occurrence inside
+    # want_fn. File-scope occurrences must be ignored, not fatal.
+    FILE_SCOPE_DECOY_THEN_REAL = """
+/* example: g_getenv("QEMU_WINDOW_PANEL") controls panel pinning */
+
+static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+{
+    const char *panel = g_getenv("QEMU_WINDOW_PANEL");
+}
+"""
+
+    # omni: the symbol appears inside two different functions, NEITHER of
+    # which is want_fn -- must be reported as an ambiguous anchor, not
+    # silently resolved to whichever the first occurrence happens to sit in.
+    TWO_DIFFERENT_FUNCTIONS = """
+static void gd_update_caption(VirtualConsole *vc)
+{
+    const char *panel = g_getenv("QEMU_WINDOW_PANEL");
+}
+
+static void gd_window_close(VirtualConsole *vc)
+{
+    const char *panel = g_getenv("QEMU_WINDOW_PANEL");
+}
+"""
+
+    def test_decoy_in_want_fn_does_not_hide_a_real_hunk_elsewhere(self):
+        """Must now be caught: a decoy inside want_fn used to let `find()`'s
+        first-match resolve clean while the real hunk sat in the wrong
+        function, unreported."""
+        out = verify_applied(self._tree(self.DECOY_THEN_WRONG),
+                             [Path("0003-omni-panel-pin.patch")])
+        self.assertTrue(any("QEMU_WINDOW_PANEL" in v for v in out),
+                        f"a real hunk in the wrong function, hidden behind "
+                        f"a decoy in want_fn, went unreported: {out}")
+
+    def test_file_scope_decoy_does_not_block_a_clean_apply(self):
+        out = verify_applied(self._tree(self.FILE_SCOPE_DECOY_THEN_REAL),
+                             [Path("0003-omni-panel-pin.patch")])
+        self.assertEqual([v for v in out if "QEMU_WINDOW_PANEL" in v], [])
+
+    def test_occurrences_in_two_functions_are_reported_as_ambiguous(self):
+        out = verify_applied(self._tree(self.TWO_DIFFERENT_FUNCTIONS),
+                             [Path("0003-omni-panel-pin.patch")])
+        matches = [v for v in out if "QEMU_WINDOW_PANEL" in v]
+        self.assertTrue(matches, "two-function occurrence went unreported")
+        self.assertTrue(any("ambig" in v.lower() for v in matches),
+                        f"message should name the real problem (ambiguous "
+                        f"anchor), not point at a wrong function: {matches}")
+
     def test_anchors_for_absent_patches_are_not_asserted(self):
         """0007 and 0008 do not exist until tasks 3 and 4. Their anchors must
         not fail a build that legitimately has not got them yet."""
