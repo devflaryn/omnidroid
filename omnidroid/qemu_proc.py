@@ -585,6 +585,31 @@ def x86_cpu_model(accel, cfg=None):
     override = ((cfg or {}).get("qemu") or {}).get("cpu")
     if override:
         return override
+    # TCG IS A DIFFERENT MACHINE, and the baseline is not survivable on it.
+    # MEASURED on this box, 2026-08-21, same image, same everything else,
+    # kernel log on ttyS0:
+    #
+    #   -accel tcg -cpu qemu64,+aes   0 bytes of kernel log in 240 s. The
+    #                                 kernel never printed line ONE. From
+    #                                 outside this looks exactly like a very
+    #                                 slow boot: QEMU burns 99 % of a core --
+    #                                 and does ZERO disk I/O, which is what
+    #                                 gives it away.
+    #   -accel tcg -cpu max           92 KB of log, Android at `bootcomplete`
+    #                                 in 104 s. Fully usable.
+    #
+    # `qemu64` is a K8-era baseline and this is a clang-LTO xanmod 6.1 kernel;
+    # under WHPX it survives because WHPX's CPUID filtering is limited and the
+    # guest effectively sees the host's features whatever `-cpu` says, so the
+    # baseline was never actually being tested. Under TCG the mask is real and
+    # the kernel dies on it.
+    #
+    # This does NOT touch the WHPX finding above -- `host` there is still
+    # measured-bad and still not the default. `max` is TCG's own "everything
+    # this accelerator can emulate", which is the right answer for the one
+    # configuration where nothing is being passed through.
+    if str(accel or "").split(",")[0].strip().lower() == "tcg":
+        return "max"
     # +aes is NOT optional on this base, and it is not a performance tweak.
     # Roblox ships arm64 only, so every instruction runs through
     # libndk_translation -- and the translator ASSERTS on a host without
@@ -615,9 +640,53 @@ def machine_arg(accel):
     return m
 
 
+def qemu_tool_for(acct, cfg):
+    """Which QEMU system emulator this instance boots on. Best-effort: an
+    unresolvable base answers x86, which is what every call site here already
+    assumed before this existed and is only ever used to pick a binary to
+    interrogate, never to build a boot."""
+    try:
+        if base_type(cfg["bases"][acct["base"]]) == BASE_TYPE_ARM:
+            return "qemu-system-aarch64"
+    except Exception:      # noqa: BLE001 - a probe target, not a boot decision
+        pass
+    return "qemu-system-x86_64"
+
+
+def effective_accel(tool, requested, label="accel"):
+    """The accelerator this host can ACTUALLY use, as opposed to the one the
+    platform would prefer.
+
+    `default_accel()` above is a statement about the platform and is kept
+    probe-free on purpose -- it is called from places with no QEMU binary to
+    interrogate, and it is the input this resolution starts from. THIS is the
+    statement about the MACHINE, and it is the one the warm-cache key and the
+    warm-cache gate both ask, because a migration stream belongs to the
+    accelerator that wrote it. It proves the platform's answer and falls
+    back to software emulation when the host has no hypervisor, rather than
+    letting QEMU exit during machine init with an error that never says the
+    word "virtualization". See accelprobe.py for why that mattered.
+
+    Never raises: any failure inside the probe returns the platform default,
+    which is exactly what this call site used to pass unconditionally.
+    """
+    try:
+        from omnidroid import accelprobe
+        return accelprobe.report(tool, requested, default=default_accel(),
+                                 label=label).accel
+    except Exception:      # noqa: BLE001 - a preflight may never break a boot
+        return requested or default_accel()
+
+
 def check_accel():
-    """Linux preflight: warn loudly if /dev/kvm is unusable (QEMU would
-    fail or crawl under TCG). Windows/WHPX has no equivalent check."""
+    """Linux preflight: warn loudly if /dev/kvm is unusable.
+
+    Kept as-is, and kept SEPARATE from effective_accel() above, because it says
+    something a generic probe cannot: it distinguishes "the device is missing"
+    (BIOS, or the wrong package) from "you are not in the kvm group", and those
+    have different fixes. The probe answers the other question -- whether the
+    accelerator actually initialises -- on every platform.
+    """
     if not IS_LINUX:
         return
     import os
@@ -2434,7 +2503,14 @@ def _pid_started_ticks(pid):
 def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
                warm=None, bake=False, warm_key=None):
     from omnidroid.runtime import runtime_dir
+    # PROVE the hypervisor before spending a boot on it. Resolved here rather
+    # than left to qemu_command() so that EVERY spawn path -- a launch, a pool
+    # slot, a bake, a warm restore, `view --start` -- gets the same answer, and
+    # so a host with no hardware virtualization boots emulated instead of
+    # dying inside machine init with an error that never says why. Cached, so
+    # the second slot of a pool fill pays nothing. See accelprobe.py.
     check_accel()
+    accel = effective_accel(qemu_tool_for(acct, cfg), accel)
     d = runtime_dir(acct["name"])
     d.mkdir(parents=True, exist_ok=True)
     if acct.get("ephemeral"):

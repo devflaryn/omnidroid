@@ -77,9 +77,22 @@ class Escalation(unittest.TestCase):
         # A few offline reads are normal early in a boot, so the soft attempt
         # must not fire immediately, and the server restart must be rarer
         # still -- it drops every other endpoint on the host.
-        self.assertGreater(engine._ADB_SOFT_RECOVER, 3)
-        self.assertGreater(engine._ADB_HARD_RECOVER,
-                           engine._ADB_SOFT_RECOVER * 2)
+        self.assertGreater(engine._ADB_SOFT_RECOVER_S, 15)
+        self.assertGreater(engine._ADB_HARD_RECOVER_S,
+                           engine._ADB_SOFT_RECOVER_S * 2)
+
+    def test_the_thresholds_are_seconds_not_poll_counts(self):
+        """They used to be counts (8 and 25) against a flat 5 s poll, so they
+        MEANT 40 s and 125 s. wait_for_boot polls adaptively now (3 s, then 1 s
+        once adbd is up), which would have quietly turned the hard step -- a
+        host-wide `adb kill-server` that drops every other instance's endpoint
+        -- into something that fires 75 s into a perfectly healthy slow boot.
+        Exactly backwards for the hosts this matters on."""
+        from omnidroid import engine
+        self.assertEqual(engine._ADB_SOFT_RECOVER_S, 40.0)
+        self.assertEqual(engine._ADB_HARD_RECOVER_S, 125.0)
+        self.assertFalse(hasattr(engine, "_ADB_SOFT_RECOVER"),
+                         "the poll-count form is back; it drifts with the poll")
 
 
 

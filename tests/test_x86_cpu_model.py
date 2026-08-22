@@ -26,10 +26,32 @@ from omnidroid import qemu_proc
 
 
 class CpuModel(unittest.TestCase):
-    def test_the_baseline_model_is_the_default(self):
-        # Measured: `host` did not complete a single boot on WHPX.
-        for accel in ("whpx,kernel-irqchip=off", "kvm", "hvf", "tcg"):
-            self.assertEqual(qemu_proc.x86_cpu_model(accel), "qemu64", accel)
+    def test_the_baseline_model_is_the_default_on_a_hypervisor(self):
+        # Measured: `host` did not complete a single boot on WHPX. `+aes` is
+        # not optional -- libndk_translation ASSERTS on a host without AES-NI
+        # the first time Roblox touches AES, and the splash dies two seconds in.
+        for accel in ("whpx,kernel-irqchip=off", "kvm", "hvf"):
+            self.assertEqual(qemu_proc.x86_cpu_model(accel), "qemu64,+aes",
+                             accel)
+
+    def test_tcg_gets_max_because_the_baseline_will_not_boot_on_it(self):
+        """MEASURED 2026-08-21, same image, kernel log on ttyS0:
+
+            -accel tcg -cpu qemu64,+aes   0 bytes in 240 s -- the kernel never
+                                          printed line one
+            -accel tcg -cpu max           Android at bootcomplete in 104 s
+
+        From outside, the first case is indistinguishable from a very slow
+        boot: QEMU burns 99 % of a core. The tell is that it does ZERO disk
+        I/O. Under WHPX the baseline survives only because WHPX's CPUID
+        filtering is limited, so the mask was never really being applied."""
+        for accel in ("tcg", "tcg,thread=multi", "TCG"):
+            self.assertEqual(qemu_proc.x86_cpu_model(accel), "max", accel)
+
+    def test_an_explicit_config_still_wins_even_on_tcg(self):
+        self.assertEqual(
+            qemu_proc.x86_cpu_model("tcg", {"qemu": {"cpu": "Skylake-Client"}}),
+            "Skylake-Client")
 
     def test_config_can_still_ask_for_host(self):
         cfg = {"qemu": {"cpu": "host"}}
@@ -41,10 +63,10 @@ class CpuModel(unittest.TestCase):
                          "Skylake-Client-v4")
 
     def test_a_config_without_a_qemu_block_is_fine(self):
-        self.assertEqual(qemu_proc.x86_cpu_model("whpx", {}), "qemu64")
+        self.assertEqual(qemu_proc.x86_cpu_model("whpx", {}), "qemu64,+aes")
         self.assertEqual(qemu_proc.x86_cpu_model("whpx", {"qemu": None}),
-                         "qemu64")
-        self.assertEqual(qemu_proc.x86_cpu_model("whpx", None), "qemu64")
+                         "qemu64,+aes")
+        self.assertEqual(qemu_proc.x86_cpu_model("whpx", None), "qemu64,+aes")
 
 
 class WhpxCeilings(unittest.TestCase):

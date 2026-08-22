@@ -150,6 +150,13 @@ class _StubbedBoot:
              dict(return_value="9.9.9")),
             (engine, "default_accel", "default_accel",
              dict(return_value="tcg")),
+            # ...and the RESOLVED one, which is what the cache gate and the
+            # cache key ask now. `default_accel` is the platform's preference;
+            # `effective_accel` is what this machine can actually run, and the
+            # two differ on any host that has fallen back to emulation. See
+            # omnidroid/accelprobe.py.
+            (engine, "effective_accel", "effective_accel",
+             dict(return_value="tcg")),
             (engine, "_stage_bake_overlays", "_stage_bake_overlays", {}),
             (runtime_mod, "warm_keys_in_use", "warm_keys_in_use",
              dict(return_value=set())),

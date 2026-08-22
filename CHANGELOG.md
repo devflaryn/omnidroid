@@ -6,6 +6,131 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-08-21 — a slow PC is not a broken PC
+
+Three defects, one shape: **a number measured on this dev box was being enforced
+on every machine**, and every machine slower than it lost boots that were going
+perfectly well.
+
+**1. The boot wait is no longer a deadline.** `wait_for_boot` ran against
+`NORMAL_BOOT_TIMEOUT = 360` / `FIRST_BOOT_TIMEOUT = 1500`, measured on an
+i7-13700F with a working hypervisor and NVMe. A weak CPU, a mechanical disk, a
+throttled laptop, twenty instances on one host, or a PC with no hardware
+virtualization at all was killed mid-boot and reported as `boot_timeout` — and
+since QEMU is spawned DETACHED, that kill *orphaned a live VM*: the launch said
+it failed while the instance stayed up holding its memory.
+
+It waits on PROGRESS now (`omnidroid/bootwait.py`). Five independent signals —
+serial-log growth, QEMU-log growth, the adb endpoint's state, the
+`/data/dalvik-cache` file count on a first boot, and **QEMU's own host CPU
+time** — are sampled each poll; the wait ends on SILENCE, not on duration.
+`--timeout` still caps absolutely for scripts that want a bound;
+`default_boot_cap()` returns None for the product path. The old constants
+survive as the caps the dev/maintenance commands (`rebuild-base`, `bake-game`,
+`bench-ksm`, `test-apk`) still opt into.
+
+> The CPU-time signal is not redundant, and a live TCG boot proved it: on an
+> x86 guest, `serial.log` **does not exist** and `qemu.log` is **0 bytes** for
+> the whole pre-adbd phase. CPU time was the only thing moving (3.98 s of CPU
+> per 4 s of wall clock). Without it the stall watch would have declared a
+> healthy boot dead after four minutes of "silence".
+
+Two backstops replace the safety the deadline was providing by accident, since
+neither failure ever goes quiet: a **reboot loop** is detected directly (adbd
+reached and lost `REBOOT_LOOP_LIMIT` times), and a very generous
+`SANITY_CEILING_S` (3 h, `OMNI_BOOT_SANITY_CEILING_S`) sits underneath
+everything so a pathological guest cannot pin an instance forever.
+
+**2. A host with no hypervisor now boots instead of failing.**
+`default_accel()` returned `whpx,kernel-irqchip=off` on every Windows host and
+nothing checked it was usable. Windows Hypervisor Platform is an OPTIONAL
+Windows feature and VT-x/AMD-V is a BIOS switch, so on such a PC QEMU exited
+during machine init and the user got "QEMU exited before the guest booted" —
+with the word *virtualization* appearing nowhere.
+
+**2a. ...and the emulated guest needs `-cpu max`, which is what actually makes
+the fallback work.** The first version of this fallback did not boot at all, and
+it took a serial console to see why. MEASURED on this box, same image, kernel
+log on `ttyS0`:
+
+| accel | `-cpu` | result |
+|---|---|---|
+| `whpx,kernel-irqchip=off` | `qemu64,+aes` | boots (control: 77 KB of kernel log) |
+| `tcg` | `qemu64,+aes` | **0 bytes in 240 s — the kernel never printed line one** |
+| `tcg` | `max` | 92 KB of log, Android at `bootcomplete` in **104 s** |
+
+`qemu64` is a K8-era baseline and this is a clang-LTO xanmod 6.1 kernel. Under
+WHPX the baseline survives only because WHPX's CPUID filtering is limited and
+the guest effectively sees the host's features whatever `-cpu` says — so the
+mask was never really being tested. Under TCG it is real, and the kernel dies on
+it. `x86_cpu_model()` returns `max` when the accelerator is TCG; the WHPX
+finding above (`host` is measured-bad there) is untouched.
+
+> ⚠ **From outside, that failure was indistinguishable from a very slow boot**:
+> QEMU burned 99 % of a core for 37 minutes. The tell was **zero disk I/O** —
+> 21.3 MiB read in total and not one byte in a 20 s sample. A booting kernel
+> reads continuously. Worth remembering: the CPU-time progress signal cannot
+> tell a spinning guest from a working one, and only the serial console could.
+
+Two more things this exposed, both now fixed: `tcg,thread=multi` is **rejected**
+by QEMU on x86 (`Property 'pc-q35-11.1-machine.thread' not found` — x86 folds
+the accelerator into the *machine* string, where `thread` is not a valid
+property), and the reason that shipped at all is that TCG was being returned
+**unproven** on the grounds it is "always compiled in". Nothing is exempt from
+the probe now; the fallbacks are a candidate list, each proven in turn.
+
+`omnidroid/accelprobe.py` proves the accelerator first, by starting QEMU with
+`-nodefaults -no-user-config -display none -m 64 -S -qmp stdio` and watching for
+the QMP greeting (written after machine init, so it is positive proof).
+**Measured 0.06 s** on this host, cached per binary, and it correctly rejects an
+unavailable accelerator in 0.11 s. On failure it falls back to
+`tcg,thread=multi` and prints the exact BIOS/DISM fix. Slow now boots, because
+of (1). `doctor` reports `accel` / `accel_hardware` / `accel_note` / `accel_fix`.
+
+The EFFECTIVE accelerator is folded into the warm-cache key, so a box that
+gains or loses hardware virtualization misses rather than restoring a migration
+stream its CPU no longer runs the same way.
+
+**2b. The warm cache now reaches the hosts that need it most.**
+`_warm_cache_allowed()` asked `default_accel()` — the platform's *preference* —
+so on Windows it always answered `whpx`, which cannot migrate
+(`migfile.NON_MIGRATABLE_ACCELS`), and refused the cache. But **TCG migrates
+perfectly well**, and a host that has fallen back to TCG is precisely the one
+whose cold boots are unbearable. The gate asks `effective_accel()` now, so an
+unaccelerated PC gets a cache that *replaces* the boot instead of paying a
+multi-minute emulated one every launch. WHPX is still refused, unchanged.
+
+**2c. The adb-offline recovery thresholds are seconds, not poll counts.**
+`_ADB_SOFT_RECOVER = 8` / `_ADB_HARD_RECOVER = 25` were counts against a flat
+5 s poll, so they *meant* 40 s and 125 s. The adaptive poll in (3) would have
+silently rescheduled both — firing the hard step, a host-wide `adb kill-server`
+that drops **every other instance's endpoint**, 75 s into a healthy slow boot.
+They are `_ADB_SOFT_RECOVER_S = 40.0` / `_ADB_HARD_RECOVER_S = 125.0`, measured
+from when the endpoint actually went offline.
+
+**2d. The farming settle waits for the client, not for a clock.**
+`wait_for_game_settled` blocked for `SETTLE_TIMEOUT_S = 420` — measured here,
+against PS99, with a hypervisor — and then squeezed regardless. On a slower host
+the client is still loading at 420 s, and this project has already measured that
+squeezing mid-load **starves the client and stops the instance ever reaching the
+world**. It is the worst version of this bug, because it does not report a
+failure: it produces an instance that farms nothing while every check says fine.
+
+The signal was already being sampled. A new PSS high-water mark is load
+progress, so it pushes the deadline out; `SETTLE_TIMEOUT_S` now bounds how long
+the client may sit NOT growing, under a `SETTLE_CEILING_S = 2400` ceiling.
+Compared against the high water rather than the previous sample, so PSS
+jittering around one value is not mistaken for progress. The dead-client fast
+path and `OMNI_SETTLE_TIMEOUT=0` are unchanged.
+
+**3. Free seconds, on every boot.** The poll slept a flat 5 s, so every launch
+paid up to 5 s of dead time after Android was already up; it is 3 s before adbd
+and 1 s after, when `boot_completed` is imminent. `post_boot` and
+`provision_settings` slept a fixed 3 s / 2 s after `adb root` — a guess that was
+dead time on a fast host and *too short* on a slow one, where the settings that
+follow it were silently written to a down endpoint. Both poll now
+(`wait_adb_ready`).
+
 ## 2026-08-19 — the product builds its own QEMU, and guest RAM stops costing commit
 
 `omnidroid 0.2.0`. QEMU 11.1.0 built from a patch series this repo now owns

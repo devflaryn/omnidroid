@@ -34,8 +34,10 @@ import time
 from pathlib import Path
 
 from omnidroid import awake
+from omnidroid import bootwait
 from omnidroid import config
 from omnidroid import consent
+from omnidroid import execmark
 from omnidroid import farming
 from omnidroid import gaming
 from omnidroid import glmask
@@ -61,6 +63,13 @@ def _store_root():
     return config.data_dir()
 
 
+# ABSOLUTE boot caps. These are no longer the product's boot budget -- a
+# launch waits on PROGRESS now (see wait_for_boot / bootwait.py), because these
+# numbers were measured on one fast machine and then enforced on every machine,
+# and every slower host had healthy boots killed mid-flight. They survive as
+# the caps the DEV/maintenance commands still opt into (rebuild-base, bake-game,
+# bench, test-apk) -- paths where a human is watching, a wedge is a bug in the
+# thing being built, and a bound is genuinely wanted.
 FIRST_BOOT_TIMEOUT = 1500   # first boot runs full dexopt; be patient
 NORMAL_BOOT_TIMEOUT = 360
 
@@ -711,43 +720,330 @@ from omnidroid.qemu_proc import (_gl_window_requested, _assert_port_triple,
 
 # ---------- boot waiting with visible progress ----------
 
-# Consecutive `offline` polls before wait_for_boot tries to unstick the adb
-# endpoint. A few offline reads are NORMAL early in a boot (adbd is not
+# How long the adb endpoint may sit `offline` before wait_for_boot tries to
+# unstick it. A few offline reads are NORMAL early in a boot (adbd is not
 # accepting yet), so the soft attempt waits until the state looks persistent
 # rather than transient, and the server restart waits considerably longer
 # because it drops every other endpoint on the host.
-_ADB_SOFT_RECOVER = 8
-_ADB_HARD_RECOVER = 25
+#
+# SECONDS, not poll counts, and that is the point: these were counts (8 and 25)
+# back when the poll was a flat 5 s, so their real meaning was 40 s and 125 s.
+# The poll is adaptive now, which would have silently rescheduled both — and
+# shortening them is exactly wrong on the hosts this work is for, where an
+# endpoint is legitimately offline for minutes while an emulated guest boots.
+# A host-wide adb-server restart 75 s into a perfectly healthy slow boot is a
+# real cost paid by every other instance on the box.
+_ADB_SOFT_RECOVER_S = 40.0
+_ADB_HARD_RECOVER_S = 125.0
+
+
+def _qemu_log_tail(acct, lines=8):
+    """The last thing QEMU said, as text. Its log is the only place the reason
+    exists — the process is detached, so nothing else ever sees its stderr.
+
+    NEVER returns "" for a QEMU that died. An empty log is not the absence of
+    information, it is a SPECIFIC and nasty diagnosis: QEMU was killed without
+    the chance to write a word. This project has already measured one cause
+    (a full scratch volume — writing the log needs the same disk, see
+    qemu_proc's scratch block) and a hard crash inside a host graphics driver
+    looks identical. A user's fresh install failed exactly this way, and a
+    blank explanation is what made it unreadable from here.
+    """
+    path = None
+    try:
+        path = runtime_dir(acct["name"]) / "qemu.log"
+        text = path.read_text(errors="ignore").strip()
+    except OSError as e:
+        return f"qemu.log could not be read ({e})"
+    if not text:
+        return (f"qemu.log is EMPTY ({path}). QEMU was stopped without being "
+                f"able to write a reason, which narrows it: either the volume "
+                f"it writes to is FULL (writing the log needs that same disk), "
+                f"or the process was killed outright — a crash inside a host "
+                f"graphics driver does this. Check free disk space first.")
+    return "\n".join(text.splitlines()[-lines:])
 
 
 def _print_qemu_log_tail(acct, label, lines=8):
-    """Show why QEMU gave up. Its log is the only place the reason exists —
-    the process is detached, so nothing else ever sees its stderr."""
-    try:
-        log = runtime_dir(acct["name"]) / "qemu.log"
-        text = log.read_text(errors="ignore").strip()
-    except OSError:
-        return
-    for line in text.splitlines()[-lines:]:
+    """Show why QEMU gave up, on the engine's own progress stream."""
+    for line in _qemu_log_tail(acct, lines).splitlines():
         print(f"[{label}] qemu: {line}")
 
 
+# What each failure MEANS, in the words the person looking at it needs. The
+# reason code is for the app; this is for the human, and the difference between
+# them is what "boot_timeout" was flattening.
+_BLANK_LINE = '\n\n'
+
+_BOOT_FAILURE_ADVICE = {
+    bootwait.QEMU_EXITED: (
+        "The virtual machine stopped before Android finished starting. This is "
+        "not a slow PC and not a timeout — the VM process itself exited. The "
+        "usual causes, in order: no free disk space on the drive holding the "
+        "images and the scratch overlays; a host graphics driver that cannot "
+        "carry the GPU display; or not enough memory to back the guest."),
+    bootwait.STALLED: (
+        "The virtual machine stopped responding while booting: its logs, its "
+        "adb endpoint and its CPU usage all froze at once. That is a wedged "
+        "guest rather than a slow one."),
+    bootwait.REBOOT_LOOP: (
+        "The guest reached Android and restarted, repeatedly. That is a boot "
+        "loop — usually a kernel panic or a broken system image."),
+    bootwait.SANITY_CEILING: (
+        "The guest was still doing something, but far past any plausible boot "
+        "time on any hardware."),
+    bootwait.BOOT_TIMEOUT: (
+        "The boot hit the explicit --timeout it was given while it was still "
+        "making progress. Raise it, or drop it and let the boot finish."),
+    bootwait.BOOT_FAILED: "The boot did not complete.",
+}
+
+
+def _apply_boot_failure(result, outcome):
+    """Fill a launch/slot result from a failed boot, naming WHICH failure.
+
+    Every caller that reports a boot failure goes through here, so that the
+    reason `wait_for_boot` determined is the reason the user is told -- rather
+    than the literal "boot_timeout" that both `cmd_start` and `pool_boot_slot`
+    used to hard-code regardless of what actually happened. See
+    bootwait.BootOutcome for the failure this cost.
+
+    Tolerates a bare `False` from a caller that has not been converted: a
+    missing label would be no better than a wrong one.
+    """
+    reason = getattr(outcome, "reason", None) or bootwait.BOOT_FAILED
+    detail = getattr(outcome, "detail", "") or ""
+    advice = _BOOT_FAILURE_ADVICE.get(reason, _BOOT_FAILURE_ADVICE[
+        bootwait.BOOT_FAILED])
+    result.update({"ok": False, "booted": False, "error": reason,
+                   "message": _BLANK_LINE.join(
+                       x for x in (advice, detail) if x)})
+    if detail:
+        result["qemu_log_tail"] = detail
+    return result
+
+
+# --------------------------------------------------- the display fallback
+#
+# A HOST GPU THAT CANNOT CARRY THE GUEST MUST COST THE GPU, NOT THE BOOT.
+#
+# `default_display()` decides a boot renders on the GPU from two things, and
+# neither is a fact about the machine it is running on:
+#
+#     has_gui = _host_has_gui()          # hardcoded True on Windows
+#     GL_GPU_DEVICE in qemu_device_help  # what OUR shipped binary was built
+#                                        # with -- the same on every PC
+#
+# So every Windows host is told it can render on the GPU, because our own
+# binary can. That is exactly the mistake accelprobe.py exists to correct one
+# layer down ("a statement about the platform, not about the machine"), and
+# qemu_proc._host_has_gui's own comment already names the stakes: "a false
+# positive costs a BOOT".
+#
+# MEASURED on a user's fresh install (2026-08-22): a farming slot booted
+# `display_kind: "gl-window"`, `gpu: "gl"`, its window was really opened and
+# hidden -- and QEMU was gone 13.7 s later with a zero-byte log. The window
+# proves display init succeeded; the death after it is where virglrenderer
+# starts driving the host's GL driver in earnest.
+#
+# Probing cannot settle this the way it settles the accelerator: the probe
+# QEMU passes (a window opens) is not the thing that fails (rendering, later).
+# So the fallback is driven by the OUTCOME instead -- one retry, in software,
+# and only when the evidence points at the display.
+
+
+def _boot_used_gpu(acct):
+    """Whether the QEMU this launch spawned is rendering on the host GPU.
+
+    Read back off run.json, which spawn_qemu writes from the ARGV it actually
+    used (`command_renders_on_gpu`), rather than re-deriving the display policy
+    here -- a second copy of that decision could disagree with the process.
+    """
+    return _run_record(acct["name"]).get("gpu") == "gl"
+
+
+def _display_is_implicated(outcome, used_gpu):
+    """Whether giving up the GPU is worth trying after `outcome`.
+
+    Three ways to answer no, and each of them is a bug if answered wrong:
+
+      * the boot SUCCEEDED -- nothing to fix.
+      * the guest STALLED -- it is alive and stuck, so the display is not the
+        suspect, and killing it to retry would throw away a boot that may yet
+        finish. Only a DEAD process implicates the thing that renders it.
+      * the boot was already in SOFTWARE -- there is nothing left to give up,
+        and retrying anyway is an infinite fallback rather than a fallback.
+    """
+    if outcome:
+        return False
+    return bool(used_gpu) and getattr(outcome, "reason", None) == \
+        bootwait.QEMU_EXITED
+
+
+@contextlib.contextmanager
+def _forced_gpu(policy):
+    """Make THIS boot use `policy`, whatever the launch asked for.
+
+    Via OMNI_GPU because that is where `qemu_proc.gpu_policy` looks FIRST --
+    ahead of the config and ahead of the mode. A retry that edited the mode
+    would be silently ignored on precisely the launches the app makes, since
+    the app sets OMNI_GPU from its own --gpu argument. The engine already uses
+    this variable as the transport for this setting (cmd_start and cmd_pool
+    both write it from argv), so this is the existing mechanism, not a new one.
+    """
+    had = os.environ.get("OMNI_GPU")
+    os.environ["OMNI_GPU"] = policy
+    try:
+        yield
+    finally:
+        if had is None:
+            os.environ.pop("OMNI_GPU", None)
+        else:
+            os.environ["OMNI_GPU"] = had
+
+
+def _boot_with_display_fallback(label, attempt, used_gpu):
+    """Boot, and if the GPU killed it, boot again without the GPU.
+
+    `attempt(gpu)` spawns and waits, returning a BootOutcome; it is called with
+    None (the launch's own policy) and then, if that died on a GPU boot, with
+    GPU_OFF. `used_gpu()` is a callable because whether the boot actually took
+    the GPU is only knowable AFTER the spawn -- it is read back off the argv.
+
+    Exactly one retry. Two deaths is not a display problem, and the second
+    outcome is the one reported: it is the attempt that establishes something
+    else is wrong (a full disk kills the software boot too), so its detail is
+    the one worth putting in front of the user.
+    """
+    from omnidroid.qemu_proc import GPU_OFF
+    outcome = attempt(None)
+    if not _display_is_implicated(outcome, used_gpu()):
+        return outcome
+    print(f"[{label}] the virtual machine died while rendering on this PC's "
+          f"GPU. That is a host graphics problem, not a broken install -- "
+          f"retrying WITHOUT the GPU. The guest will render in software: "
+          f"slower, and it works.", flush=True)
+    with _forced_gpu(GPU_OFF):
+        return attempt(GPU_OFF)
+
+
+def default_boot_cap(first_boot=False, requested=None):
+    """The ABSOLUTE budget a boot is held to, and by default there isn't one.
+
+    `--timeout` still means what it says -- a script or a CI job that needs a
+    bound gets one. But the DEFAULT is None, because the fixed budgets this
+    replaces (`NORMAL_BOOT_TIMEOUT`, `FIRST_BOOT_TIMEOUT`) were measured on one
+    fast machine and then enforced on every machine, and every host slower than
+    that one had healthy boots killed mid-flight. What ends a boot now is
+    SILENCE, not duration -- see bootwait.py. The old constants survive as the
+    caps the base-building commands still opt into, where a bound is genuinely
+    wanted because a human is watching.
+    """
+    if requested:
+        return requested
+    return None
+
+
+# The dexopt count goes through adb, so it is the one progress signal that
+# costs a guest round-trip. Sampled on a slow cadence of its own rather than
+# every poll -- the poll is a second long once adbd is up, and a first boot is
+# precisely when the guest can least afford the interruption.
+_DEXOPT_SAMPLE_EVERY_S = 20.0
+
+
+def _boot_signal_sources(acct, d, rd):
+    """The progress signals for THIS instance, cheapest first.
+
+    Each returns a reading or None. `bootwait.sample` swallows anything that
+    raises, so a source may be as naive as it likes.
+    """
+    return {
+        # Firmware and kernel chatter. The ONLY signal that exists before adbd,
+        # and it moves continuously while the kernel is talking. Sampled at
+        # both layouts (arm writes it under runtime_dir, x86 under
+        # account_dir) because a stat is cheaper than deciding which.
+        "serial": lambda: bootwait.file_size(d / "serial.log"),
+        "serial_rt": lambda: bootwait.file_size(rd / "serial.log"),
+        # QEMU's own log grows on device warnings, migration chatter and any
+        # error worth reading -- a second, independent view of the same phase.
+        "qemu_log": lambda: bootwait.file_size(rd / "qemu.log"),
+        # The universal one: a guest executing instructions burns host CPU.
+        # Works from the instant of spawn, needs nothing from the guest, and is
+        # what separates "this PC is slow" from "this guest has wedged".
+        # Rounded to a tenth of a second so scheduler noise on a process that
+        # is alive but idle cannot read as progress forever.
+        "cpu": lambda: _rounded(bootwait.cpu_seconds(running_pid(acct["name"]))),
+    }
+
+
+def _rounded(v, places=1):
+    return None if v is None else round(v, places)
+
+
+def _dexopt_progress(acct):
+    """How many files Android has compiled into /data/dalvik-cache.
+
+    FIRST BOOT'S progress meter. The dexopt phase is why FIRST_BOOT_TIMEOUT was
+    1500 s: it can sit on one large package for minutes, writing nothing to the
+    serial log and answering adb only sluggishly, so from the outside it was
+    indistinguishable from a hang -- which is why it was given a budget nobody
+    could justify instead of a signal. This counts the artifacts as they land,
+    so the wait can be patient exactly as long as compilation is happening.
+
+    Returns None when it cannot be read, which `bootwait` treats as "no
+    reading" rather than as motion.
+    """
+    # shlex.quote, per the rule this project learned the hard way: adb REJOINS
+    # argv with spaces and the guest shell parses the result, so an unquoted
+    # multi-command script silently no-ops while still reporting success.
+    script = "ls /data/dalvik-cache/*/ 2>/dev/null | wc -l"
+    r = adb_soft(acct, "shell", "sh", "-c", shlex.quote(script), timeout=15)
+    if r.returncode != 0:
+        return None
+    for line in reversed((r.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.isdigit():
+            return int(line)
+    return None
+
+
 def wait_for_boot(acct, timeout, label, first_boot=False):
-    """Poll until sys.boot_completed=1, printing honest progress lines."""
+    """Block until sys.boot_completed=1. Give up on SILENCE, not on the clock.
+
+    `timeout` is an optional ABSOLUTE cap (None = none, which is now the
+    product default). What ends an unsuccessful wait is the stall watchdog: if
+    none of the progress signals in `_boot_signal_sources` has moved for the
+    phase's stall window, the guest is not booting slowly -- it has stopped.
+
+    See bootwait.py for the full argument. The short version: the fixed budgets
+    this replaces were one fast machine's measurements applied to every machine,
+    and every slower machine lost boots that were going perfectly well. Since
+    QEMU is spawned DETACHED, those kills also orphaned a live VM -- the launch
+    reported failure while the instance carried on running and charging the host
+    for its memory.
+    """
     # arm's serial.log is written under runtime_dir (see qemu_command_arm);
     # x86's stays under account_dir (qemu_command/x86 is untouched — Task 4
     # retires x86 instances along with the overlay-disk model).
     d = runtime_dir(acct["name"]) if acct_base_is_arm(acct) \
         else account_dir(acct["name"])
+    rd = runtime_dir(acct["name"])
     serial_log = d / "serial.log"
     start = time.time()
     phase = "starting QEMU"
     last_print = 0.0
-    last_change = time.time()
     adbd_seen = False
     initrd_found = False
-    offline_polls = 0
-    while time.time() - start < timeout:
+    offline_since = None
+    recovered = set()
+    sources = _boot_signal_sources(acct, d, rd)
+    watch = bootwait.BootWatch(
+        stall_limit=bootwait.stall_limit(first_boot=first_boot,
+                                         adbd_seen=False),
+        cap=timeout)
+    dexopt_at = 0.0
+    dexopt_files = None
+    while True:
         elapsed = time.time() - start
 
         if not initrd_found and serial_log.exists():
@@ -765,21 +1061,26 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
         pid = running_pid(acct["name"])
         if pid is None and elapsed > 10:
             print(f"[{label}] QEMU exited before the guest booted — "
-                  f"see {d / 'qemu.log'}")
+                  f"see {rd / 'qemu.log'}")
             _print_qemu_log_tail(acct, label)
-            return False
+            # NOT a timeout, and the difference is the whole point: the VM
+            # PROCESS DIED. Reported as one for a long time, which cost a user
+            # a fresh install that failed in 13.7 s and was labelled a boot
+            # timeout. See bootwait.BootOutcome.
+            return bootwait.BootOutcome(False, bootwait.QEMU_EXITED,
+                                        _qemu_log_tail(acct))
 
         adb_connect(acct)
         if adb_getprop(acct, "sys.boot_completed") == "1":
             print(f"[{label}] boot completed after {elapsed/60:.1f} min")
-            return True
+            return bootwait.BootOutcome(True, bootwait.BOOTED)
         # adb_state(), not adb(...).stdout: an OFFLINE endpoint reports itself
         # on stderr and leaves stdout empty, so reading stdout alone saw ""
         # for the one condition the recovery below exists to handle.
         state = adb_state(acct)
+        watch.note_adb_state(state)
         if state == "device":
             adbd_seen = True
-            offline_polls = 0
 
         # An endpoint the host's adb server has stuck in `offline` never
         # heals on its own: `adb connect` just says "already connected", so
@@ -787,16 +1088,45 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
         # fully booted and idle. Escalate instead of spinning -- see
         # adb.adb_recover for why the cheap fix alone is not enough.
         if state == "offline":
-            offline_polls += 1
-            if offline_polls in (_ADB_SOFT_RECOVER, _ADB_HARD_RECOVER):
-                hard = offline_polls >= _ADB_HARD_RECOVER
-                print(f"[{label}] adb endpoint stuck offline; "
-                      f"{'restarting the adb server' if hard else 'reconnecting'}")
-                adb_recover(acct, hard=hard)
+            if offline_since is None:
+                offline_since = time.time()
+            off_for = time.time() - offline_since
+            for threshold, hard in ((_ADB_HARD_RECOVER_S, True),
+                                    (_ADB_SOFT_RECOVER_S, False)):
+                if off_for >= threshold and threshold not in recovered:
+                    recovered.add(threshold)
+                    print(f"[{label}] adb endpoint offline for "
+                          f"{off_for:.0f}s; "
+                          f"{'restarting the adb server' if hard else 'reconnecting'}")
+                    adb_recover(acct, hard=hard)
+                    break
+        else:
+            # An endpoint that came back has earned a fresh escalation ladder:
+            # the old counter reset to 0 on `device` for the same reason, and
+            # without this a boot that stuck once, recovered, and stuck again
+            # would never be unstuck a second time.
+            offline_since = None
+            recovered.clear()
+
+        # THE STALL WATCH. Every cheap signal every poll; the one guest-side
+        # signal is rate-limited, and is only meaningful on a first boot with
+        # adbd up anyway.
+        readings = bootwait.sample(sources)
+        readings["adb"] = state
+        if first_boot and adbd_seen and \
+                time.time() - dexopt_at >= _DEXOPT_SAMPLE_EVERY_S:
+            dexopt_at = time.time()
+            dexopt_files = _dexopt_progress(acct)
+        readings["dexopt"] = dexopt_files
+        watch.set_stall_limit(bootwait.stall_limit(first_boot=first_boot,
+                                                   adbd_seen=adbd_seen))
+        watch.note(tuple(sorted(readings.items(), key=lambda kv: kv[0])))
 
         if adbd_seen and first_boot:
             new_phase = ("Android first boot: app optimization (dexopt), "
-                         "one-time, ~15 min")
+                         "one-time, and slower on a slow PC"
+                         + (f" — {dexopt_files} files compiled so far"
+                            if dexopt_files else ""))
         elif adbd_seen:
             new_phase = "Android booting (adbd up)"
         elif initrd_found:
@@ -804,19 +1134,104 @@ def wait_for_boot(acct, timeout, label, first_boot=False):
         else:
             new_phase = "starting QEMU"
 
-        if new_phase != phase:
-            last_change = time.time()
-        stalled = time.time() - last_change > 600 and not adbd_seen
-        if stalled:
-            new_phase += ("  [WARNING: no progress signal for 10+ min - "
-                          f"check {d / 'serial.log'} and qemu.log]")
+        # WHAT CHANGED vs. WHAT IS PRINTED are two different strings, and
+        # conflating them cost a flood: the warning below carries a live
+        # elapsed time, so folding it into `new_phase` made the phase differ on
+        # EVERY poll and the "print when the phase changes" rule fired once a
+        # second. The phase is the stable description; the warning is decoration
+        # on the line actually printed.
+        quiet = watch.quiet_for()
+        warning = ""
+        if quiet > watch.stall_limit() * 0.6:
+            # SAY IT BEFORE giving up, so the log explains the failure that is
+            # coming rather than merely recording it after the fact.
+            warning = (f"  [WARNING: no sign of life for {quiet/60:.1f} min "
+                       f"— check {serial_log} and {rd / 'qemu.log'}]")
         if new_phase != phase or elapsed - last_print >= 15:
             phase = new_phase
             last_print = elapsed
-            print(f"[{label}] {elapsed/60:.1f} min - {phase}", flush=True)
-        time.sleep(5)
-    print(f"[{label}] TIMED OUT after {timeout/60:.0f} min")
-    return False
+            print(f"[{label}] {elapsed/60:.1f} min - {phase}{warning}",
+                  flush=True)
+
+        if watch.stalled():
+            print(f"[{label}] GIVING UP after {elapsed/60:.1f} min: nothing has "
+                  f"moved for {watch.quiet_for()/60:.1f} min — the serial log, "
+                  f"QEMU's log, the adb endpoint and QEMU's own CPU time are "
+                  f"all frozen. That is a stuck guest, not a slow one.")
+            _print_qemu_log_tail(acct, label)
+            return bootwait.BootOutcome(False, bootwait.STALLED,
+                                        _qemu_log_tail(acct))
+        if watch.looping():
+            # The one failure that keeps every progress signal moving: a guest
+            # that reaches adbd, resets, and does it again. A pure stall watch
+            # would wait for this forever.
+            print(f"[{label}] GIVING UP after {elapsed/60:.1f} min: the guest "
+                  f"has reached adb and lost it {watch.adb_drops} times — it "
+                  f"is rebooting in a loop, not booting. Check "
+                  f"{serial_log} for a kernel panic.")
+            _print_qemu_log_tail(acct, label)
+            return bootwait.BootOutcome(False, bootwait.REBOOT_LOOP,
+                                        _qemu_log_tail(acct))
+        if watch.past_sanity_ceiling():
+            print(f"[{label}] GIVING UP after {elapsed/60:.0f} min. Something "
+                  f"is still moving, so this is not a stall — but no real boot "
+                  f"on any hardware takes this long, so it is not a boot "
+                  f"either. Raise OMNI_BOOT_SANITY_CEILING_S if this machine "
+                  f"genuinely needs longer.")
+            _print_qemu_log_tail(acct, label)
+            return bootwait.BootOutcome(False, bootwait.SANITY_CEILING,
+                                        _qemu_log_tail(acct))
+        if watch.expired():
+            print(f"[{label}] TIMED OUT after {elapsed/60:.0f} min against an "
+                  f"explicit --timeout of {timeout:.0f}s — but the guest was "
+                  f"STILL MAKING PROGRESS. Raise --timeout, or drop it and let "
+                  f"the boot finish at this machine's own speed.")
+            # The ONLY path that is genuinely a timeout: a cap the caller
+            # explicitly asked for, hit while the guest was still moving.
+            return bootwait.BootOutcome(
+                False, bootwait.BOOT_TIMEOUT,
+                f"the guest was still making progress at the "
+                f"--timeout of {timeout:.0f}s")
+        time.sleep(bootwait.poll_interval(adbd_seen))
+
+
+def wait_adb_ready(acct, timeout=45.0, poll=0.25):
+    """Poll until the adb endpoint answers as `device`, or the budget runs out.
+
+    Replaces the fixed `time.sleep(3)` that followed every `adb root`. `adb
+    root` restarts adbd, so the endpoint drops and comes back, and three
+    seconds was a guess that was wrong in both directions: dead time on a fast
+    host (paid on every single launch) and TOO SHORT on a slow one, where the
+    caller then ran its next command against an endpoint that was still down
+    and silently got nothing. That is the boot-timeout mistake in miniature --
+    one machine's measurement enforced on every machine -- and it failed in the
+    same way, on the same hosts.
+
+    Returns True if the endpoint came up. Never raises: a probe that times out
+    or cannot run adb at all counts as "not ready yet", the same as any other
+    unhelpful answer.
+    """
+    deadline = time.monotonic() + timeout
+    first = True
+    while True:
+        try:
+            if adb_state(acct) == "device":
+                return True
+        except Exception:      # noqa: BLE001 - a readiness probe may not raise
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        if first:
+            # One reconnect, not one per poll: `adb connect` against a
+            # not-yet-listening port TIMES OUT on Windows rather than being
+            # refused (see adb.adb_connect), and paying that every 250 ms would
+            # make this slower than the sleep it replaces.
+            first = False
+        try:
+            adb_connect(acct)
+        except Exception:      # noqa: BLE001
+            pass
+        time.sleep(poll)
 
 
 def post_boot(acct, label):
@@ -832,8 +1247,9 @@ def post_boot(acct, label):
               f" {'OK' if ok else '*** NOT arm64-v8a ***'}")
         return ok
     adb(acct, "root")
-    time.sleep(3)
-    adb_connect(acct)
+    # `adb root` restarts adbd; wait for it to answer instead of guessing at
+    # how long that takes on this host. See wait_adb_ready.
+    wait_adb_ready(acct)
     bridge = adb_getprop(acct, "ro.dalvik.vm.native.bridge")
     ok = bridge == "libndk_translation.so"
     print(f"[{label}] native bridge: {bridge or '<unreadable>'}"
@@ -841,12 +1257,75 @@ def post_boot(acct, label):
     return ok
 
 
+# External hosts the deployment must never reach at runtime. Two reasons:
+#  1) The stock LineageOS OTA updater (`org.lineageos.updater`) phones GitHub
+#     Releases (`release-assets.githubusercontent.com`) ~4 s into the FIRST
+#     boot -- before the package trim in lockdown_and_trim() disables it --
+#     and pulls a ~140 MB OS image. Measured live on the x86 base, 2026-08-20.
+#  2) Belt-and-suspenders for the Arceus redirect: the executor's own github
+#     /spdm hops are rewritten to our server by the baked native hook, but a
+#     null-route here guarantees nothing github/spdm ever leaves the guest even
+#     if a component builds such a URL some other way.
+# A /system/etc/hosts null-route is honoured by bionic's resolver BEFORE any
+# DNS lookup -- verified to hold even with Private DNS / DNS-over-TLS active --
+# so it blocks these without touching package state (fully reversible) and
+# without affecting our own server (72.62.59.232) or Roblox's hosts.
+BLOCK_EXTERNAL_HOSTS = (
+    "raw.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "camo.githubusercontent.com",
+    "github.com",
+    "www.github.com",
+    "codeload.github.com",
+    "api.github.com",
+    "spdmteam.com",
+    "www.spdmteam.com",
+)
+
+
+def block_external_hosts(acct, label):
+    """Null-route github/spdm in the guest's /system/etc/hosts (adb is uid 0 on
+    the x86 base; no `su` needed). Idempotent and reversible. See
+    BLOCK_EXTERNAL_HOSTS for why. Best-effort: a base that refuses the remount
+    just leaves the redirect (native hook) as the sole line of defence.
+
+    NOTE: on a cold FIRST boot the OTA updater can fire its GitHub check in the
+    ~4 s before adbd is up and this runs. This per-boot pass covers warm-pool
+    slots (blocked before any session) and every boot after the first. To close
+    that first-4s cold-boot window entirely, bake the same lines into the BASE
+    image's /system/etc/hosts (a `rebuild-base`/`strip-base` step) so they are
+    present from kernel boot -- the block lives in /system, which belongs to the
+    base, not to a per-account offset overlay."""
+    # remount rootfs rw (system-as-root base: /system lives on /), append any
+    # missing entries, then leave it -- the file is tiny and re-provision is rare.
+    lines = "".join(f"127.0.0.1 {h}\\n" for h in BLOCK_EXTERNAL_HOSTS)
+    script = (
+        "mount -o rw,remount / 2>/dev/null; "
+        "mount -o rw,remount /system 2>/dev/null; "
+        "H=/system/etc/hosts; "
+        f"for h in {' '.join(BLOCK_EXTERNAL_HOSTS)}; do "
+        "grep -q \"[[:space:]]$h\\$\" $H 2>/dev/null || echo \"127.0.0.1 $h\" >> $H; "
+        "done; "
+        "ndc resolver flushnetdns 100 2>/dev/null; true"
+    )
+    try:
+        adb(acct, "shell", script, timeout=20)
+        print(f"[{label}] blocked {len(BLOCK_EXTERNAL_HOSTS)} external hosts "
+              f"(github/spdm) in /system/etc/hosts")
+    except Exception as e:
+        print(f"[{label}] host-block skipped ({e}); native-hook redirect still applies")
+
+
 def provision_settings(acct, label):
     """One-time per-account /data settings: kill the lock screen and mark
     setup complete so boot goes straight to HOME. Idempotent."""
     adb(acct, "root")
-    time.sleep(2)
-    adb_connect(acct)
+    # Every `settings put` below is silently lost against an endpoint that has
+    # not finished restarting, and 2 s was not enough for that on a loaded or
+    # emulated host. Poll for it. See wait_adb_ready.
+    wait_adb_ready(acct)
     for args in (
         ("shell", "locksettings", "set-disabled", "true"),
         ("shell", "settings", "put", "secure", "lockscreen.disabled", "1"),
@@ -2077,7 +2556,7 @@ def cmd_start(args):
               "adb_port": acct["adb_port"], "vnc_port": acct["vnc_port"],
               "session": public_session(sess)}
     if not booted:
-        result.update({"ok": False, "booted": False, "error": "boot_timeout"})
+        _apply_boot_failure(result, booted)
         result["timings"] = timings.as_dict()
         if json_mode:
             emit_json(result)
@@ -5859,6 +6338,29 @@ def cmd_qemu_info(args):
     }, indent=2))
 
 
+def _accel_readiness():
+    """The hypervisor half of the readiness report. Never raises, and never
+    makes a deployment un-ready: a host with no hardware virtualization is
+    SLOW, not broken, and reporting it as not-ready would take the product away
+    from exactly the machines this work exists to support."""
+    try:
+        from omnidroid import accelprobe
+        v = accelprobe.resolve(qemu_system_name(), None,
+                               default=default_accel())
+        return {"accel": v.accel,
+                # TRI-STATE, matching the app's own whpx_ok: True (proven),
+                # False (proven not to work), None (could not be asked -- e.g.
+                # QEMU is not installed yet). Reporting None as True was a real
+                # report on the frozen build: `accel_hardware: true` next to
+                # "neither whpx nor tcg initialises". See accelprobe.qemu_runnable.
+                "accel_hardware": None if v.unknown else not v.degraded,
+                "accel_note": v.note,
+                "accel_fix": v.advice}
+    except Exception as e:      # noqa: BLE001 - a report may not fail
+        return {"accel": None, "accel_hardware": None,
+                "accel_note": f"could not be checked: {e}", "accel_fix": ""}
+
+
 def install_readiness():
     """Everything doctor/setup need to say whether THIS deployment can
     create/boot instances: per-file base-asset presence (after auto-
@@ -5914,6 +6416,17 @@ def install_readiness():
            "qemu_present": qemu_ok,
            "qemu": qemu_bin(qemu_system_name()) if qemu_ok else None,
            "adb_present": adb_ok,
+           # WHETHER THIS PC CAN ACCELERATE A GUEST, proven against the real
+           # binary rather than assumed from the platform. This is the single
+           # biggest difference between one host and another, and until it was
+           # measured here it was invisible: a machine without the Windows
+           # Hypervisor Platform feature (or with VT-x off in BIOS) failed
+           # every launch with "QEMU exited before the guest booted" and
+           # nothing anywhere said the word "virtualization". Such a host now
+           # BOOTS, emulated and slow, and doctor is where it finds out why it
+           # is slow and what would fix it. `accel_note`/`accel_fix` are empty
+           # on a healthy host. See accelprobe.py.
+           **_accel_readiness(),
            # THE SCRATCH VOLUME, because it is the resource that decides how
            # many instances a host can actually hold and the only one whose
            # exhaustion is silent. Each ephemeral guest keeps its writes in a
@@ -5980,6 +6493,12 @@ def cmd_doctor(args):
         print(json.dumps(rep, indent=2))
         if not (rep["base_ready"] and rep["data_template_ready"]):
             print(base_setup_help(rep["images_dir"], read_config()))
+        # Out of the JSON and into prose, because this one is addressed to a
+        # person: a host that cannot accelerate still works, and the only thing
+        # standing between it and a fast one is usually a BIOS switch.
+        if rep.get("accel_fix"):
+            print()
+            print(rep["accel_fix"])
     if not rep["ready"]:
         sys.exit(1)
 
@@ -7349,6 +7868,37 @@ def cmd_screenshot(args):
         sys.exit(1)
 
 
+def cmd_exec_mark(args):
+    """Write (and read back) the Omnidroid marker in a live instance.
+
+    THE ONLY ORACLE FOR THE ONE THING execmark.py CANNOT KNOW: which of the
+    candidate roots the executor actually resolves a relative `isfile` against.
+    The boot step writes them all and says how many took; this reads back which
+    of them a process can see, and `--probe` alone reads without writing, so a
+    guest can be asked whether the boot step really landed.
+
+    Prints JSON: {ok, written, attempted, present: [...]}.
+    """
+    acct = load_account(args.name)
+    game = resolve_game_package(acct)
+    written = attempted = 0
+    try:
+        if not args.probe:
+            r = adb(acct, *execmark.build_marker_script(args.mode, game),
+                    timeout=60)
+            written, attempted = execmark.parse_counts(
+                (r.stdout or "") + (r.stderr or ""))
+        r = adb(acct, *execmark.build_marker_probe(game), timeout=60)
+        present = execmark.present_roots((r.stdout or "") + (r.stderr or ""))
+    except Exception as e:      # noqa: BLE001
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
+    print(json.dumps({"ok": bool(present), "written": written,
+                      "attempted": attempted, "present": present}))
+    if not present:
+        sys.exit(1)
+
+
 def cmd_logcat(args):
     """Read guest logcat (raw, machine-parseable). --clear wipes it;
     --tag filters to a tag; otherwise dumps and returns."""
@@ -8518,7 +9068,43 @@ def verify_gl_mask(acct, label=None):
 # put the squeeze back where it was (on top of a loading client) with nothing
 # to show for it. Memory is the thing the squeeze is about anyway.
 SETTLE_INTERVAL_S = 15
+# How long the client may sit NOT GROWING before the squeeze goes ahead anyway.
+# This used to be the whole budget, and 420 s was measured on this dev box
+# against PS99 with a working hypervisor -- so on any slower host the client was
+# still loading when it expired, and the squeeze landed on it. That is not a
+# cosmetic mistake: squeezing a loading client STARVES it and stops the instance
+# ever reaching the world (measured 2026-08-16, and it is why the squeeze was
+# deferred in the first place). The instance then farms nothing while every
+# check says it is fine.
+#
+# Growth extends it now -- see wait_for_game_settled. PSS rising IS load
+# progress, and the loop was already sampling it.
 SETTLE_TIMEOUT_S = 420
+# ...and the ceiling growth cannot buy past, so a client that leaks forever is
+# still eventually squeezed. Generous: a genuinely slow or emulated host has to
+# fit inside it with room to spare (PS99 measured ~111 s here).
+SETTLE_CEILING_S = 2400
+# How long the client gets to APPEAR AT ALL before "there is no game here" is a
+# fair conclusion.
+#
+# READ THE DISTINCTION, because getting it wrong reintroduces the very bug this
+# file is full of. This bounds how long the process takes to EXIST -- `pidof`
+# finds it the moment it is forked -- not how long it takes to LOAD, which is
+# the slow part and is what the growth-extended budget above is for. A client
+# that is going to start is forked within seconds of the kiosk broadcast; one
+# that has not been forked in two minutes was not started at all.
+#
+# The asymmetry still argues for generosity: giving up too early squeezes a
+# client that was about to appear (measured to starve it), while giving up too
+# late merely wastes time. Two safety nets keep that from biting. The check
+# fires only on a DEFINITE `game_is_running(...) is False` -- the probe returns
+# None when it could not ask, which a slow guest under load does produce, and
+# None is never read as absence. And it is only reached once no PSS reading has
+# EVER been seen.
+#
+# Verified on an emulated (TCG) launch, 2026-08-21: fired correctly at 120 s on
+# a launch whose client never started, saving 292 s of the remaining budget.
+NO_GAME_GRACE_S = 120
 # Below this the client is on a splash or a login screen, not in a place. PS99
 # passes it within ~40 s of the session landing (measured: 1173 MB at 111 s).
 SETTLE_FLOOR_MB = 700
@@ -8657,13 +9243,31 @@ def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
     Returns (settled, pss). `settled` False with a real pss means "still
     growing when we ran out of patience" — the caller squeezes anyway, because
     a farming instance that never squeezes is not a farming instance; it just
-    says so rather than pretending it waited for the right moment."""
+    says so rather than pretending it waited for the right moment.
+
+    `timeout` bounds how long the client may sit WITHOUT GROWING, not how long
+    it may take to load. Every meaningful rise in PSS pushes the deadline out
+    again, up to SETTLE_CEILING_S. A slow host loads the same game, just later,
+    and squeezing it on a clock is measured to starve it -- see SETTLE_TIMEOUT_S.
+    """
     stable = 0
     prev = None
     seen = False
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    started = time.time()
+    deadline = started + timeout
+    ceiling = started + SETTLE_CEILING_S
+    high_water = 0.0
+    while time.time() < deadline and time.time() < ceiling:
         pss = game_pss_mb(acct)
+        # GROWTH BUYS TIME. A new high-water mark is the client still pulling
+        # its place in, so the patience resets from here rather than from the
+        # start of the launch. Compared against the high water, not the previous
+        # sample, so PSS jittering down and up around one value is NOT read as
+        # progress -- that is a client that has settled (or wedged), and both
+        # want the deadline to keep running.
+        if pss and pss > high_water * (1 + SETTLE_TOLERANCE):
+            high_water = pss
+            deadline = max(deadline, time.time() + timeout)
         # IS THERE STILL A GAME TO WAIT FOR. A PSS reading IS proof of life --
         # dumpsys cannot report a package's memory unless it has some -- so the
         # healthy path costs nothing extra. It is only the ABSENCE of a reading
@@ -8685,6 +9289,25 @@ def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
                       f"seen) — nothing left to settle, not waiting out the "
                       f"remaining {int(deadline - time.time())}s")
             return False, prev
+        elif not seen and time.time() - started >= NO_GAME_GRACE_S \
+                and game_is_running(acct) is False:
+            # NEVER APPEARED. `seen` guards the branch above because "no pid
+            # yet" is ordinary early in a launch -- but it also meant a launch
+            # with no game to wait for (a `home` session, or a client that
+            # failed to start at all) sat out the ENTIRE budget being asked
+            # about a process that was never going to exist. MEASURED on this
+            # box, 2026-08-21: 421 s of a `--place home` farming launch spent
+            # exactly this way, reported as "never settled (? MB)".
+            #
+            # The grace is what keeps the original guard's intent: only once
+            # the client has had a fair chance to start, and only on a
+            # DEFINITE False (game_is_running returns None when it could not
+            # ask, and None must never be read as a death).
+            if label:
+                print(f"[{label}] no game process after {NO_GAME_GRACE_S}s — "
+                      f"there is nothing to settle, so not waiting out the "
+                      f"remaining {int(deadline - time.time())}s")
+            return False, None
         if pss and prev and pss >= SETTLE_FLOOR_MB:
             if abs(pss - prev) <= prev * SETTLE_TOLERANCE:
                 stable += 1
@@ -8698,8 +9321,9 @@ def wait_for_game_settled(acct, label=None, timeout=SETTLE_TIMEOUT_S,
         prev = pss if pss else prev
         time.sleep(interval)
     if label:
-        print(f"[{label}] the game was still growing after "
-              f"{int(timeout)}s ({prev or '?'} MB) — squeezing anyway")
+        waited = int(time.time() - started)
+        print(f"[{label}] the game stopped making progress and never settled "
+              f"after {waited}s ({prev or '?'} MB) — squeezing anyway")
     return False, prev
 
 
@@ -9199,7 +9823,45 @@ def apply_consent(acct, cfg=None, label=None):
             pass
     if label:
         print(f"[{label}] {consent.summary_line(counts, state)}")
+    # Null-route github/spdm every boot (product path included): kills the stock
+    # OTA updater's GitHub phone-home and hardens the Arceus redirect. Same
+    # per-/data, never-fail-a-boot contract as the consent grants above.
+    block_external_hosts(acct, label)
     return state.get("dialogs_hidden", False)
+
+
+def write_exec_marker(acct, mode=None, cfg=None, label=None):
+    """Drop the marker that tells the in-game executor menu where it is.
+
+    THE ENTIRE OMNIDROID BRANCH OF THE MENU HANGS OFF THIS ONE FILE. Without
+    it `isfile("omni_host.data")` answers false, the payload concludes it is on
+    somebody's phone, and every farming instance ends up with a floating button
+    parked over the game — the one shape the menu was rebuilt to avoid. See
+    omnidroid/execmark.py for why it is written to a LIST of roots.
+
+    Same per-/data, never-fail-a-boot contract as the consent grants: this is
+    guest state, so an offset baked before the feature existed has none of it,
+    and an instance that lost adb mid-sequence is reported rather than raised.
+    """
+    if not execmark.execmark_enabled(os.environ):
+        if label:
+            print(f"[{label}] execmark: SKIPPED "
+                  f"({execmark.NO_EXECMARK_ENV} is set) — the menu will "
+                  f"present itself as a generic device")
+        return False
+    game = resolve_game_package(acct, cfg)
+    try:
+        r = adb(acct, *execmark.build_marker_script(mode, game), timeout=60)
+    except Exception as e:      # noqa: BLE001 — an add-on, never a boot blocker
+        if label:
+            print(f"[{label}] execmark: NOT written "
+                  f"({type(e).__name__}: {e})")
+        return False
+    out = (r.stdout or "") + (r.stderr or "")
+    written, attempted = execmark.parse_counts(out)
+    if label:
+        print(f"[{label}] {execmark.summary_line(written, attempted)}")
+    return written > 0
 
 
 def host_can_reclaim_balloon():
@@ -9876,7 +10538,16 @@ def maybe_start_governor(acct, mode, label=None):
         return None
 
 
-RESTORE_TIMEOUT = 30       # a healthy warm restore is seconds, not minutes
+# A warm restore is a memory image being read back, so a healthy one is seconds
+# rather than minutes -- but "seconds" is a property of the DISK, and 30 was
+# measured on NVMe. On a mechanical disk, or an SSD behind a busy antivirus
+# scanner, a perfectly good 2.4 GiB restore can take longer than this, and
+# blowing the cap does not merely cost time: the fallback KILLS the restored
+# QEMU and cold-boots instead, turning a slow fast-path into a slower slow-path.
+# Tripled, and it is a CAP on top of the stall watch rather than the thing that
+# ends the wait -- a restore that is genuinely wedged is now caught by silence,
+# usually well inside this.
+RESTORE_TIMEOUT = 90
 _QEMU_VERSION_CACHE = {}
 
 
@@ -9935,10 +10606,20 @@ def _warm_cache_allowed(debug, in_use, key, no_warm=False, accel=None):
     error and the measurement), so without it every launch stops the guest,
     stages two qcow2 overlays and drives a migration that is refused -- work
     paid on every boot for a cache that can never hold anything.
+
+    ...and it has to ask what this MACHINE runs, not what the platform prefers.
+    `accel or default_accel()` answered "whpx" on every Windows host, including
+    the ones that have no hypervisor and are running TCG -- and **TCG migrates
+    perfectly well**. That refused the warm cache to exactly the hosts with the
+    most to gain from it: a machine emulating its guest pays minutes for a cold
+    boot, and the cache replaces the boot rather than shortening it. Resolved
+    through the probe (cached, so this is free after the first call).
     """
     if debug or not key or no_warm:
         return False
-    if not migfile.accel_supports_migration(accel or default_accel()):
+    if accel is None:
+        accel = effective_accel(qemu_system_name(), None)
+    if not migfile.accel_supports_migration(accel):
         return False
     return key not in in_use
 
@@ -10021,6 +10702,10 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # equivalent to a cold-booted one, not a stripped-down one that
     # returned early before any of that ran.
     restored = False
+    # Whether THIS call spawned a cold QEMU. Only then may the display fallback
+    # respawn one: an instance that was already up (and merely still booting)
+    # has a running guest that nothing here started and must not be replaced.
+    spawned_here = False
     if running_pid(acct["name"]):
         adb_connect(acct)
         if adb_getprop(acct, "sys.boot_completed") == "1":
@@ -10071,7 +10756,15 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
                     offset_image_stat=offset_image_stat,
                     mode_name=mode["name"], mem_mb=mode["mem"], smp=mode["smp"],
                     machine="virt" if acct_base_is_arm(acct) else "q35",
-                    accel=accel or default_accel(), qemu_version=qver)
+                    # The accelerator this host can ACTUALLY use, not the one
+                    # the platform would prefer. A migration stream is tied to
+                    # the accelerator that wrote it, so a box that has since
+                    # gained (or lost) hardware virtualization must MISS rather
+                    # than restore a stream its CPU no longer runs the same
+                    # way. Cached by accelprobe, so this costs nothing after
+                    # the first call on this host. See accelprobe.py.
+                    accel=effective_accel(qemu_tool_for(acct, cfg), accel),
+                    qemu_version=qver)
             # Inside the same guarded region as the rest of cache-key
             # resolution: a sibling instance's malformed run.json (or any
             # other unexpected failure reading the runtime root) must yield
@@ -10209,20 +10902,65 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             # them unconditionally would change this call's kwargs on EVERY
             # ordinary boot, not just a baking one.
             bake_kwargs = {"bake": True, "warm_key": key} if want_bake else {}
-            spawn_qemu(acct, cfg, interactive=interactive,
-                       mode=None if interactive else mode, accel=accel,
-                       debug=debug, **bake_kwargs)
-            # Same rule as `start`: the recorder attaches at spawn so a debug
-            # session has screenshots of the boot screen itself.
-            maybe_start_autocap(acct, label)
-            # ...and for the same reason: the window is on screen for the whole
-            # boot now, so the thing that keeps it proportional has to be up
-            # for the whole boot too, not attached once the launch finishes.
-            maybe_start_window_lock(acct, label)
+
+            def _cold_spawn(_bake=bake_kwargs):
+                spawn_qemu(acct, cfg, interactive=interactive,
+                           mode=None if interactive else mode, accel=accel,
+                           debug=debug, **_bake)
+                # Same rule as `start`: the recorder attaches at spawn so a
+                # debug session has screenshots of the boot screen itself.
+                maybe_start_autocap(acct, label)
+                # ...and for the same reason: the window is on screen for the
+                # whole boot now, so the thing that keeps it proportional has
+                # to be up for the whole boot too, not attached once the launch
+                # finishes.
+                maybe_start_window_lock(acct, label)
+
+            spawned_here = True
+            _cold_spawn()
     if not restored:
-        t = timeout or (FIRST_BOOT_TIMEOUT if first else NORMAL_BOOT_TIMEOUT)
-        if not wait_for_boot(acct, t, label, first_boot=first):
-            return False, first
+        # THE PRODUCT PATH, and the one that used to fail on a slow PC. No
+        # absolute budget unless the caller explicitly asked for one: what ends
+        # this wait is the guest going silent, not the clock reaching a number
+        # measured on somebody else's machine. See default_boot_cap/bootwait.py.
+        t = default_boot_cap(first_boot=first, requested=timeout)
+
+        # Whether the display fallback actually respawned. Recorded rather
+        # than inferred: the first version of this asked "is this boot NOT on
+        # the GPU", which is also true of every ordinary software boot -- so it
+        # switched baking off for all of them. Caught by test_warm_boot_policy.
+        retried = []
+
+        def _attempt(gpu):
+            # gpu is None on the first attempt -- QEMU is already running, it
+            # was spawned above. A non-None value is the RETRY, which needs a
+            # fresh process: the previous one is dead, and its ports and its
+            # run.json have to be cleared before another takes them.
+            if gpu is not None:
+                retried.append(gpu)
+                _halt_qemu(acct)
+                # No bake on a degraded retry. The warm-cache key does not
+                # include the display, so baking a software boot here would let
+                # a later launch restore it and render in software for no
+                # stated reason -- a silent downgrade that outlives the fault.
+                _cold_spawn(_bake={})
+            return wait_for_boot(acct, t, label, first_boot=first)
+
+        # The OUTCOME travels, not just its truthiness: this is the only place
+        # that knows whether QEMU died or the guest stalled, and every caller
+        # above reports that to a user. Flattening it to False here is what
+        # made every failure read as "boot_timeout".
+        if spawned_here:
+            outcome = _boot_with_display_fallback(
+                label, _attempt, used_gpu=lambda: _boot_used_gpu(acct))
+            if retried:
+                # The fallback respawned without baking; do not let the tail
+                # below try to bake overlays that were never staged.
+                want_bake = False
+        else:
+            outcome = wait_for_boot(acct, t, label, first_boot=first)
+        if not outcome:
+            return outcome, first
         if want_bake:
             meta = {"qemu_version": qver, "mem_mb": mode["mem"],
                     "smp": mode["smp"], "mode": mode["name"],
@@ -10305,6 +11043,13 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # exactly the modal this suppresses. It touches no display or memory
     # lever, so neither profile can disagree with it.
     apply_consent(acct, cfg, label)
+    # EVERY boot: tell the in-game executor menu it is inside Omnidroid, so it
+    # announces itself with a card that leaves and NOT with a button parked
+    # over the game. Immediately after the consent grants because it depends on
+    # one of them -- the marker goes into the game package's private storage,
+    # and on a guest where that write is refused the sdcard roots are the
+    # fallback, which is the half full-disk-access unlocks.
+    write_exec_marker(acct, mode_name, cfg, label)
     # EVERY boot, EVERY mode, and ABOVE the profile branch on purpose: the
     # never-blank guarantee is not a mode trade-off, and applying it before the
     # tuning leaves each mode the last writer on the display levers it
@@ -10659,7 +11404,14 @@ def pool_boot_slot(cfg, spec, key, slot=None, label=None):
         pool.write_slot_meta(slot, state="failed", error=repr(e))
         return False, slot
     if not booted:
-        pool.write_slot_meta(slot, state="failed", error="boot_timeout")
+        # The slot meta is the ONLY durable record of a background failure --
+        # when the machine belongs to somebody else it is the entire forensic
+        # trail, and it used to spend its one field on a guess. Keep QEMU's own
+        # last words beside the reason; there may not be a second chance to ask.
+        verdict = {}
+        _apply_boot_failure(verdict, booted)
+        pool.write_slot_meta(slot, state="failed", error=verdict["error"],
+                             detail=verdict.get("message", ""))
         return False, slot
     # PARK IT BEFORE MARKING IT READY. From the `ready` write onwards any
     # `cmd_start` may claim this slot, and capping a guest that has just been
@@ -12105,6 +12857,17 @@ def build_parser():
     lc.add_argument("--clear", action="store_true")
     lc.add_argument("--timeout", type=int, default=30)
     lc.set_defaults(func=cmd_logcat)
+
+    em = sub.add_parser("exec-mark",
+                        help="write/read the marker that tells the in-game "
+                             "executor menu it is inside Omnidroid")
+    em.add_argument("name")
+    em.add_argument("--mode", default=None,
+                    help="mode label recorded in the marker and shown on the "
+                         "menu's status page")
+    em.add_argument("--probe", action="store_true",
+                    help="read only: report which roots already hold it")
+    em.set_defaults(func=cmd_exec_mark)
 
     cap = sub.add_parser("capture",
                          help="millisecond-precise keyframe capture from the "
