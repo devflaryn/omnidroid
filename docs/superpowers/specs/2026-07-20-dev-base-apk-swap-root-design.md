@@ -54,7 +54,7 @@ gates on proving it on-device the moment root is available; if it fails, fall ba
 
 ## The one required base mutation: root the dev boot
 
-`omni build-dev-base --patch-boot` runs `_patch_dev_boot`: extracts the boot partition from the
+`omnidroid build-dev-base --patch-boot` runs `_patch_dev_boot`: extracts the boot partition from the
 dev system overlay, magiskboot-patches it inside a throwaway arm guest, writes it back. It is
 **brick-risky** (edits ~2 GB image in place) and, as-is, has caveats this plan must handle:
 

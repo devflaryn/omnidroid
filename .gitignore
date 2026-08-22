@@ -17,7 +17,7 @@ work/
 runtime/
 
 # CREDENTIALS — a .ROBLOSECURITY cookie is full access to a Roblox account.
-# Never commit one. `omni login` writes cookies/<label>.json; `omni play
+# Never commit one. `omnidroid login` writes cookies/<label>.json; `omnidroid play
 # --token-file` reads a raw one.
 cookies/
 accounts.json
@@ -65,3 +65,8 @@ desktop.ini
 .pytest_cache/
 .mypy_cache/
 *.log
+
+# Generated knowledge-graph output (/graphify) and throwaway experiments.
+# Both are regenerated on demand and neither is an input to anything.
+graphify-out/
+scratch/

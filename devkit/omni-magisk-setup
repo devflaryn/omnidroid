@@ -32,7 +32,7 @@ for M in /debug_ramdisk/magisk /sbin/magisk magisk; do
 done
 if [ -z "$MAGISK_BIN" ]; then
     echo "omni-magisk-setup: ERROR 'magisk' not found — the dev boot is not "
-    echo "  Magisk-patched (root missing). Build with: omni build-dev-base --patch-boot"
+    echo "  Magisk-patched (root missing). Build with: omnidroid build-dev-base --patch-boot"
     exit 1
 fi
 echo "omni-magisk-setup: Magisk $("$MAGISK_BIN" -c 2>/dev/null)"

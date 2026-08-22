@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (recommended for THIS plan — several tasks are on-device, brick-risky, and need in-session judgment) or superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Make the arm dev base able to install and run a resigned (or unsigned) Roblox build via `omni start --dev --apk`, by rooting the dev boot (Magisk + frida) and force-removing the baked system Roblox at install time on the ephemeral overlay.
+**Goal:** Make the arm dev base able to install and run a resigned (or unsigned) Roblox build via `omnidroid start --dev --apk`, by rooting the dev boot (Magisk + frida) and force-removing the baked system Roblox at install time on the ephemeral overlay.
 
 **Architecture:** One required base mutation (Magisk-patch the dev boot) + a dev-only, root-gated force-install in the engine's install path. The install path, on a rooted dev account, remounts `/product`, removes the baked `com.roblox.client` system app, then installs the given APK regardless of signature. Prod and the non-dev install path are untouched. Everything the guest does is thrown away on stop (`snapshot=on`).
 
@@ -12,7 +12,7 @@
 
 - **This host:** macOS Apple Silicon. Every `omni` invocation for dev needs `OMNI_DEV_MODE=1` and `OMNI_IMAGES_DIR=/Users/berat/OmniImages` (images live there; the darwin config falls back to `~/OmniImages`). Run `omni` as `python3 -m omnidroid` from the repo root, or the installed `omnidroid`.
 - **Base mutations are brick-risky and gated:** never patch a base file that is not first backed up and checksum-verified. `base_arm.qcow2` (the shared immutable base_disk, v1, no Roblox) is NEVER modified.
-- **Dev-gated only:** the force-install path runs solely when `acct_is_dev(acct)` is true AND working `su` is present. Prod (`start` without `--dev`) and the standalone `omni install` command stay byte-identical.
+- **Dev-gated only:** the force-install path runs solely when `acct_is_dev(acct)` is true AND working `su` is present. Prod (`start` without `--dev`) and the standalone `omnidroid install` command stay byte-identical.
 - **Load-bearing assumption, gated in Task 3:** that with root, removing the system Roblox APK + clearing the package lets a *differently-signed* `com.roblox.client` install. If Task 3 disproves it, STOP and switch to the fallback (rebuild the dev system without baked Roblox) — see Task 3.
 - **Ephemeral preserved:** the dev instance boots `snapshot=on`; the force-remove + install are per-boot and discarded on stop.
 - Test (unit): `python3 -m pytest tests/ -q` from the repo root (baseline 131 passing).
@@ -361,7 +361,7 @@ cd omnidroid && git commit --allow-empty -m "test(dev-base): end-to-end dev --ap
 2. `start --dev --apk <bootstrapped>` → `ok:true`, `OmniBootstrap` logcat line, in-game screenshot.
 3. Two successive differently-signed builds both install cleanly (continuous multi-version testing).
 4. Plain Roblox via `--apk` → loud `not_logged_in`.
-5. Unit suite green (133). Prod path + standalone `omni install` unchanged (dev-gated force-remove).
+5. Unit suite green (133). Prod path + standalone `omnidroid install` unchanged (dev-gated force-remove).
 
 ## Follow-on (separate plan)
 

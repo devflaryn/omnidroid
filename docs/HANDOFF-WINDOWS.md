@@ -3,8 +3,175 @@
 Rewritten 2026-08-14, extended 2026-08-15. Everything below was **run on the
 machines named**; where something is unverified it says so.
 
-> **Continuing in a new session? Start at "NEXT SESSION STARTS HERE —
-> 2026-08-18".** It is short: two farming defects found, fixed and shipped as
+> **Continuing in a new session? Start HERE — 2026-08-21 (the product stops
+> failing on slow and unaccelerated PCs).** Then read the 2026-08-20 block
+> below, which is unchanged and still carries the auto-join wall.
+>
+> **The finding that shaped all of it:** three separate ceilings in the boot
+> path were numbers **measured on this dev box** (i7-13700F, WHPX, NVMe) and
+> then enforced on every machine. Every slower machine lost boots that were
+> going perfectly well — and because QEMU is spawned DETACHED, killing the wait
+> *orphaned a live VM*: the UI reported a failed start while the instance stayed
+> up holding 3 GB, with nothing offering to stop it.
+>
+> **What changed (all tested; omnidroid **13 failed / 1511 passed** -- 13 of the
+> pre-existing 15, the two `test_x86_cpu_model` ones fixed on the way since they
+> still expected `qemu64` after `+aes` was added -- and omni-executor 1 failed /
+> 251 passed, its own pre-existing baseline. ~75 new tests, no new failures):**
+>
+> - **The boot wait is progress-driven, not timed** (`omnidroid/bootwait.py`).
+>   `NORMAL_BOOT_TIMEOUT`/`FIRST_BOOT_TIMEOUT` no longer bound a launch;
+>   `default_boot_cap()` returns None and `--timeout` remains an opt-in cap.
+>   Five signals — serial log, qemu log, adb state, `/data/dalvik-cache` count
+>   on a first boot, and **QEMU's host CPU time** — decide whether the guest is
+>   still moving. It gives up on SILENCE.
+> - **⚠ The CPU-time signal is load-bearing on x86, and a live TCG boot proved
+>   it.** During the whole pre-adbd phase of an x86 guest, `serial.log` **does
+>   not exist** and `qemu.log` is **0 bytes**. CPU time was the only thing
+>   moving (3.98 s per 4 s wall). Do not "simplify" it away — without it the
+>   stall watch calls a healthy boot dead after four minutes.
+> - **Two backstops** replace what the deadline was doing by accident, because
+>   neither of these failures ever goes quiet: a **reboot loop** (adbd reached
+>   and lost 4×) is detected directly, and `SANITY_CEILING_S` (3 h,
+>   `OMNI_BOOT_SANITY_CEILING_S`) sits under everything.
+> - **⚠⚠ THE FINDING OF THE SESSION: an emulated x86 guest needs `-cpu max`.**
+>   The first version of the no-hypervisor fallback did not boot AT ALL, and it
+>   took a serial console to see why. Same image, kernel log on `ttyS0`:
+>
+>   | accel | `-cpu` | result |
+>   |---|---|---|
+>   | `whpx,kernel-irqchip=off` | `qemu64,+aes` | boots (control: 77 KB of log) |
+>   | `tcg` | `qemu64,+aes` | **0 bytes in 240 s — the kernel never printed line one** |
+>   | `tcg` | `max` | 92 KB, Android at `bootcomplete` in **104 s** |
+>
+>   `qemu64` is a K8-era baseline against a clang-LTO xanmod 6.1 kernel. Under
+>   WHPX the baseline survives ONLY because WHPX's CPUID filtering is limited
+>   and the guest effectively sees host features whatever `-cpu` says — so that
+>   mask has never really been tested. Under TCG it is real and the kernel dies
+>   on it. Verified end to end through the product path afterwards: `omnidroid
+>   start --accel tcg` reached **adbd at 1.8 min** and `sys.boot_completed=1`.
+>
+>   **The diagnostic technique is the reusable part.** From outside, that
+>   failure is INDISTINGUISHABLE from a very slow boot: QEMU burned 99 % of a
+>   core for 37 minutes. The tell was **zero disk I/O** — 21.3 MiB read in
+>   total, not one byte in a 20 s sample, where a booting kernel reads
+>   continuously (`GetProcessIoCounters`). Then attach `-serial file:` and add
+>   `console=ttyS0 loglevel=7 ignore_loglevel` to `-append`; the x86 path ships
+>   no serial console on a normal boot, which is exactly why this was invisible.
+>   **Always run the working accel as a control first** — a 0-byte log proves
+>   nothing until you have seen the same plumbing produce 77 KB.
+>
+> - **A PC with no hypervisor now BOOTS** (`omnidroid/accelprobe.py`). The
+>   accelerator is proven before it is used — start QEMU `-nodefaults
+>   -no-user-config -display none -m 64 -S -qmp stdio` and watch for the QMP
+>   greeting; **0.06 s** measured here, 0.11 s to reject an unavailable one,
+>   cached per binary. On failure: `tcg,thread=multi` plus the exact BIOS/DISM
+>   fix. `doctor` reports `accel`/`accel_hardware`/`accel_note`/`accel_fix`.
+>   The EFFECTIVE accel is in the warm-cache key, so a box that gains or loses
+>   virtualization misses instead of restoring a stream it cannot run.
+> - **The app stopped killing healthy boots.** `run_engine`'s watchdog was an
+>   absolute `threading.Timer(660, proc.kill)`; it is `IdleWatchdog` now,
+>   rearmed by every line the engine prints, firing only on
+>   `ENGINE_IDLE_TIMEOUT = 180` s of SILENCE. `engine_start` no longer sends
+>   `--timeout` at all. When it does fire the result is `engine_unresponsive`
+>   and it SAYS the instance may still be running.
+> - **The app's own WHPX probe went 6 s → 0.12 s.** It proved success by
+>   *waiting out its whole timeout* ("still alive"); it reads the QMP greeting
+>   first now, keeping the liveness check as a fallback and the tri-state
+>   semantics intact. Its hint no longer says the VM "cannot start" (false —
+>   it emulates now) and finally mentions **the half Windows cannot fix**: if
+>   VT-x is off in BIOS, DISM succeeds, reboots, and WHPX is still off, which
+>   used to loop the user forever against a message insisting it was a Windows
+>   setting.
+> - **Free seconds:** the boot poll was a flat 5 s (now 3 s / 1 s once adbd is
+>   up), and the fixed `sleep(3)`/`sleep(2)` after `adb root` are polls
+>   (`wait_adb_ready`) — that sleep was dead time on a fast host and *too
+>   short* on a slow one, where the `settings put` calls after it were being
+>   written to a down endpoint and silently lost.
+>
+> **Verified live on this box.** Accelerated: warm-restore launch 0.3 min, cold
+> `--no-warm` 0.4 min, both joining PS99; `doctor` reporting
+> `accel_hardware: true`. **Emulated (`--accel tcg`), through the product's own
+> path: adbd at 1.8 min, `sys.boot_completed` at 2.2 min, native bridge OK,
+> session delivered, place joined.** Before this work such a host could not boot
+> at all. The no-game fast path also fired correctly there ("no game process
+> after 120s ... not waiting out the remaining 292s").
+>
+> **SHIPPED as `app-win 1.0.21`** (sha256 `eb6e054b...`, 42 MiB). Live manifest
+> serves `app.version 1.0.21`; the blob was re-downloaded from
+> `http://72.62.59.232/omni/dist/blob/app-win` and its hash verified against the
+> registry independently. **1.0.20 is kept as the rollback.**
+>
+> ⚠ **TWO TRAPS HIT WHILE PUBLISHING, both worth knowing:**
+> 1. **Never run the frozen build in place before publishing it.** A verification
+>    boot through `dist-1021/omni-exec` left a **414 MB `scratch/`** overlay and a
+>    `runtime/` dir inside the build, AND rewrote the shipped
+>    `configs/paths.json` to register base `v6` — which would have shipped a
+>    pre-registered base to every fresh install. First zip was **238 MiB**
+>    against the usual 42. Rebuild clean, then verify on a COPY.
+> 2. `push-images.py` ends with `pm2 restart && curl 127.0.0.1` and that curl
+>    **failed with exit 7** — it looks like the publish failed. It had not: the
+>    registry was live and correct. Check the public manifest before believing it.
+>
+> **NOT done / next:** none of this is committed (commit when asked). The plan
+> file is `docs/superpowers/plans/2026-08-21-boot-on-every-device.md`.
+
+> **Older orientation — 2026-08-20 (Arceus 2.3.1 +
+> de-hosting + the auto-join wall).** Then fall back to the 2026-08-18 block.
+>
+> **What was done and VERIFIED this session:**
+> - **2.3.1 is the latest Arceus** (upstream `SPDM-Team/.../main/version` = 2.3.1;
+>   wraps Roblox 2.733.988). Shipped offset (2.732.1043) was stale.
+> - **2.3.1 bootstrapped**: `arceus-STATIC-REMOTE-231.apk` (OmniKiosk-signed, on
+>   the Mac at `~/Desktop/overnight tests/omni-exec test/work/`). Native hook →
+>   `Luau::compile@0x1e6824 → b 0x9042e0`, unpacker `@0x9042dc → ret`,
+>   `72.62.59.232 ×33`, `spdmteam.com ×0`. **Auto-login VERIFIED** on Windows AND
+>   Linux (`OmniBootstrap: session cookie installed`; on Windows the home screen
+>   loaded fully as HezMi_ImYu). Also fixed an omnidroid bug: `devkit_disk_name("arm")`
+>   omits the `arm/` prefix so vdc never attached (worked around w/ a symlink; source fix still TODO).
+> - **github/spdm removed**: server payloads de-hosted + isText leak fixed
+>   (deployed to VPS, 0 leaks). AND the **hidden github leak FOUND**: the stock
+>   `org.lineageos.updater` (Bliss OTA) pulls ~140 MB from
+>   `release-assets.githubusercontent.com` ~4 s into first boot (it IS in the
+>   farming trim list but disabled too late). **FIXED** in `engine.py`:
+>   `BLOCK_EXTERNAL_HOSTS` + `block_external_hosts()` null-routes 11 github/spdm
+>   hosts in `/system/etc/hosts`, called from `apply_consent()` (runs EVERY boot;
+>   bionic checks /etc/hosts before DNS so it holds under Private DNS/DoT).
+>   VERIFIED live: `raw.githubusercontent.com → 127.0.0.1`, server + Roblox unaffected.
+>   (First-4s cold-boot window still leaks once — bake the same lines into the BASE
+>   `/system/etc/hosts` to close it. NOT committed — commit when the user asks.)
+> - **Arcjet**: it only guards `/api` (NOT the exec/join path); the real client UA
+>   `OmniExecutor/1.0` already passed. Landed a deterministic exemption anyway (deployed/verified).
+> - **SSH is NOT interrupted by either VPN** (both reachable over LAN with tunnels up).
+>
+> **THE WALL — auto-JOIN (entering a live place) could NOT be shown, and it is
+> ENVIRONMENTAL, not a code gap.** Root-caused across all three boxes:
+> - **Windows** (GoodbyeDPI turkey `-5`, no VPN): login/HTTPS works, but the
+>   game-server connection times out (client log: `HttpError: Timedout
+>   url:http://10.110.101.222:5052`). GoodbyeDPI is TCP/HTTPS-only; it can't carry
+>   Roblox's UDP game traffic — matches the user's own "can't join without VPN".
+> - **Ubuntu** (KVM, `omni-run.sh` bwrap wrapper — the ONLY correct launcher there,
+>   gives sudo-free QEMU firmware + GPU; QEMU is `~/qemu-local`, needs
+>   `LD_LIBRARY_PATH=~/qemu-local/usr/lib/x86_64-linux-gnu`): QEMU **does** route
+>   through the VPN (`ip rule`: unmarked → VPN table), but the ProtonVPN is
+>   **FREE-tier** (`NL-FREE`/`US-FREE`) = datacenter exit IP, and **Roblox blocks
+>   datacenter IPs for game joins** — `gamejoin.roblox.com` + `assetgame.roblox.com`
+>   return **000** (host itself, 3/3 samples), while `www.roblox.com` = 200.
+> - **Mac** (proven-working reference box for in-world PS99): ProtonVPN **dead**
+>   (`roblox:000`), GUI-only reconnect (`scutil --nc start` won't negotiate it).
+>
+> **THE ONE UNBLOCK:** a VPN exit Roblox does NOT block for game joins — **paid
+> ProtonVPN (Plus)** or another VPN with **residential/non-datacenter** exits —
+> connected via the app on the Mac or Ubuntu. Free-tier server-switching will NOT
+> help (all free exits are on Roblox's blocklist). Then the existing setup
+> completes the join in one run: `~/omni-run.sh start HezMi_ImYu --offset
+> arceusremote --place 8737899170 --mode farming` (Linux) or the app engine on
+> Windows. Live account = **HezMi_ImYu** (id 4310654763), cookie in the repo
+> `accounts.json`. Traps: `omni stop` can leave an orphan qemu (port then jumps
+> 16001→16002) — `pkill -9 qemu-system` between runs.
+
+> **Older orientation: NEXT SESSION STARTS HERE —
+> 2026-08-18.** It is short: two farming defects found, fixed and shipped as
 > `app-win 1.0.20` — the in-guest executor never finished starting (so no
 > OMNI-EXEC menu, ever) and the launch was putting Android's "restart this app
 > for a better view" prompt over the game itself. Then read the
@@ -29,7 +196,7 @@ machines named**; where something is unverified it says so.
 > (§0c): **http://72.62.59.232/omni/dist/blob/setup-win**
 
 Machines: Windows 11 (i7-13700F, RTX 4060, 32 GB) · Mac mini M1 at
-`berat@192.168.0.30` · VPS `72.62.59.232` (root, password in the `# VPS`
+`berat@192.168.0.24` · VPS `72.62.59.232` (root, password in the `# VPS`
 comment in `omni-backend/.env.development.local`).
 
 ---
@@ -959,7 +1126,7 @@ has no `madvise` there, and PS99 itself needs ~1.5 GB resident in-world. The
   on this base** — the ones with room are `-m` and free scratch disk.
 * **The Mac was unreachable all session.** ProtonVPN's kill switch blocks LAN,
   and the VPN is not optional here (Roblox is blocked on this network without
-  it). Enable "Allow LAN connections" in ProtonVPN to reach `192.168.0.30`.
+  it). Enable "Allow LAN connections" in ProtonVPN to reach `192.168.0.24`.
   No arm base is registered on Windows, so arm was never exercised either.
 * Gaming's `probe_client_join` runs ~1 s after delivery, long before a client
   could have joined, so `in_world: false` on a gaming launch means nothing.
@@ -2594,10 +2761,10 @@ python scripts/vps.py run "<cmd>" # anything on the server (paramiko; ssh here h
 python scripts/push-images.py base-x86 offset-arceus-x86
 
 # the Mac needs Homebrew on PATH over ssh
-ssh berat@192.168.0.30 'export PATH=/opt/homebrew/bin:$PATH; ...'
+ssh berat@192.168.0.24 'export PATH=/opt/homebrew/bin:$PATH; ...'
 
 # the Mac, end to end (its own venv; omnidroid needs no deps of its own)
-ssh berat@192.168.0.30
+ssh berat@192.168.0.24
 cd ~/Desktop/"Omni Apps"/omni-executor
 ./scripts/setup-macos.sh --check          # report only
 ./scripts/setup-macos.sh                  # install everything
@@ -2640,7 +2807,7 @@ omnidroid it needs the lineage reconciliation in the pickup list.
 
 ```bash
 cd omnidroid
-git remote add macmini "berat@192.168.0.30:Desktop/Omni Apps/omnidroid"
+git remote add macmini "berat@192.168.0.24:Desktop/Omni Apps/omnidroid"
 git fetch macmini slice-b-config-path
 git push origin FETCH_HEAD:refs/heads/slice-b-config-path
 git remote remove macmini

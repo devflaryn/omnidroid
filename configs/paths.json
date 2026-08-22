@@ -3,14 +3,14 @@
     "windows": "C:/Users/berat/OmniImages",
     "linux": "~/OmniImages"
   },
-  "current_base": "x86",
-  "data_template": "data-template-8g.qcow2",
+  "current_base": "v6",
+  "data_template": "x86/data-template-8g.qcow2",
   "bases": {
     "x86": {
       "type": "x86-bliss",
-      "disk": "base_x86.qcow2",
-      "kernel": "base_x86.kernel",
-      "initrd": "base_x86.initrd.img",
+      "disk": "x86/base_x86.qcow2",
+      "kernel": "x86/base_x86.kernel",
+      "initrd": "x86/base_x86.initrd.img",
       "version": 5,
       "src": "/android-2024-10-11",
       "notes": "canonical x86_64 base (Bliss 16.9.7). Versionless filename mirrors base_arm; lineage tracked in 'version' + 'changelog' (files were base-v5.* until 2026-07-09).",
@@ -24,29 +24,85 @@
     },
     "arm": {
       "type": "arm-uefi",
-      "base_disk": "base_arm_v2.qcow2",
-      "system": "base_arm_system_rooted.qcow2",
-      "data": "base_arm_data_game.qcow2",
-      "efivars": "base_arm_efivars.fd",
+      "system": "arm/base_arm_system_rooted.qcow2",
+      "data": "arm/base_arm_data_rooted.qcow2",
+      "efivars": "arm/base_arm_efivars.fd",
       "src": "https://github.com/jqssun/android-lineage-qemu (LineageOS 23.2 arm64, virtio_arm64only)",
-      "notes": "arm64/UEFI base (LineageOS 23.2). v2 = branded + silent + insecure_adb + Roblox baked in. base_arm.qcow2 (v1) is kept because existing account overlays are still COW-backed by it. [rooted]",
+      "notes": "arm64/UEFI base (LineageOS 23.2), rooted matched pair. Ships NO game: every Roblox build is an offset overlay of the pristine /data. Images live in the arch subfolder images_dir/arm/. The pre-rooted lineage (base_arm.qcow2 v1, base_arm_v2.qcow2, base_arm_system*.qcow2) is no longer opened at boot -- the rooted system/data pair is standalone -- so base_disk was dropped and those files were archived out of images_dir (2026-08-12). [rooted]",
       "version": 3,
       "changelog": {
         "1": "pristine LineageOS 23.2 arm64 (jqssun virtio) + kiosk/device-owner provisioned pair",
         "2": "v1 + Omni loading screen (product/media), silent boot (quiet/loglevel=0), GRUB menu hidden (no LineageOS logo/countdown), androidboot.insecure_adb=1 (adb reachable on a fresh boot - without it every new account stalls on 'Allow USB debugging?'), and Roblox pre-installed as a system app in /product/app/Roblox with its arm64 native libs (2026-07-17)",
-        "3": "v2 + persist.sys.zram_enabled=1 baked into /product/etc/build.prop, which turns on the zram swap the image already declares in /vendor/etc/fstab.virtio (zramsize=50%, lz4) via the swapon_all trigger in /vendor/etc/init/zram.rc. Measured: lz4 compresses ~3x, the safe balloon cap drops 1536 -> 1024 MB, and a production (non-rooted) instance holds Roblox at that cap with zero kills. base_arm_system_zram.qcow2 is a ~1 MB COW overlay of base_arm_system.qcow2, which is untouched - revert by pointing 'system' back at it. (2026-08-05) NOTE: zstd was tried on top of this (v4) and REVERTED - it is worse. At the 896 MB cap lz4 holds with zero kills, zstd killed the game with 3 mem-pressure kills, and boot went 0.8 min -> 5+ min (timing out `omni start`). zstd wins on compression RATIO but loses on THROUGHPUT, and on one vCPU it is reclaim LATENCY that decides whether an instance survives pressure. Do not retry without more vCPUs."
+        "3": "v2 + persist.sys.zram_enabled=1 baked into /product/etc/build.prop, which turns on the zram swap the image already declares in /vendor/etc/fstab.virtio (zramsize=50%, lz4) via the swapon_all trigger in /vendor/etc/init/zram.rc. Measured: lz4 compresses ~3x, the safe balloon cap drops 1536 -> 1024 MB, and a production (non-rooted) instance holds Roblox at that cap with zero kills. base_arm_system_zram.qcow2 is a ~1 MB COW overlay of base_arm_system.qcow2, which is untouched - revert by pointing 'system' back at it. (2026-08-05) NOTE: zstd was tried on top of this (v4) and REVERTED - it is worse. At the 896 MB cap lz4 holds with zero kills, zstd killed the game with 3 mem-pressure kills, and boot went 0.8 min -> 5+ min (timing out `omnidroid start`). zstd wins on compression RATIO but loses on THROUGHPUT, and on one vCPU it is reclaim LATENCY that decides whether an instance survives pressure. Do not retry without more vCPUs."
       },
       "rooted": true,
       "root_manifest": {
         "magisk_version": "v30.7",
         "frida_version": "17.15.4",
         "frida_port": 27142,
-        "rooted_system": "base_arm_system_rooted.qcow2",
-        "rooted_data": "base_arm_data_rooted.qcow2"
+        "rooted_system": "arm/base_arm_system_rooted.qcow2",
+        "rooted_data": "arm/base_arm_data_rooted.qcow2"
       },
-      "game_baked": {
-        "package": "com.roblox.client",
-        "apk": null
+      "offsets": {
+        "arceusfull": {
+          "data": "arm/base_arm_data_offset_arceusfull.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-local-full.apk",
+          "apk_path": "/Users/berat/Desktop/overnight tests/server test/arceus-local-full.apk",
+          "version_name": "2.731.944",
+          "version_code": 2760,
+          "created": 1786361479,
+          "notes": null
+        },
+        "arceusae": {
+          "data": "arm/base_arm_data_offset_arceusae.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-autoexec.apk",
+          "apk_path": "/Users/berat/Desktop/overnight tests/server test/arceus-autoexec.apk",
+          "version_name": "2.731.944",
+          "version_code": 2760,
+          "created": 1786364701,
+          "notes": null
+        },
+        "arceusremote": {
+          "data": "arm/base_arm_data_offset_arceusremote.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-STATIC-REMOTE-v2.apk",
+          "apk_path": "/Users/berat/Desktop/overnight tests/omni-exec test/work/arceus-STATIC-REMOTE-v2.apk",
+          "version_name": "2.732.1043",
+          "version_code": 2814,
+          "created": 1786583869,
+          "notes": null
+        }
+      },
+      "default_offset": "arceusae"
+    },
+    "v6": {
+      "type": "x86-bliss",
+      "disk": "base-v6.qcow2",
+      "kernel": "base-v6.kernel",
+      "initrd": "base-v6.initrd.img",
+      "version": 6,
+      "src": "/android-2024-10-11",
+      "notes": "updated kiosk (SessionProvider fix; Lock Task lockdown + boot/RAM trims)",
+      "default_offset": "arceusremote",
+      "offsets": {
+        "arceusremote": {
+          "data": "x86/base_x86_data_offset_arceusremote.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-STATIC-REMOTE-v2.apk",
+          "version_name": "2.732.1043",
+          "created": 1787085132,
+          "notes": "Host-patched Arceus X NEO (.so -> 72.62.59.232)."
+        },
+        "arceusremote231": {
+          "data": "x86/base_x86_data_offset_arceusremote231.qcow2",
+          "package": "com.roblox.client",
+          "apk": "Roblox.Arceus.X.NEO.2.3.1-omni-v2.apk",
+          "version_name": "2.733.988",
+          "created": 1787085132,
+          "notes": "Arceus NEO 2.3.1 + omni bootstrap + full redirect (.so darkrai + DEX spdmteam -> 72.62.59.232)."
+        }
       }
     }
   },
@@ -58,8 +114,9 @@
     "qmp_port_start": 17001,
     "vnc_port_start": 18001
   },
-  "notes": "Base images are immutable once any account references them. They live in the external data dir (images_dir; Windows C:/Users/berat/OmniImages, Linux ~/OmniImages) and are NEVER committed. base_x86 + base_arm are the two canonical bases; the host architecture selects between them.",
+  "notes": "Base images are immutable once any account references them. They live in the external data dir (images_dir; Windows C:/Users/berat/OmniImages, Linux/macOS ~/OmniImages) and are NEVER committed. Inside it images are CLASSIFIED BY ARCH: images_dir/arm/ and images_dir/x86/ -- the subfolder is part of every recorded filename here, and an offset always sits in the same folder as the /data it overlays (a qcow2 backing reference resolves relative to the overlay's own directory). base_x86 + base_arm are the two canonical bases; the host architecture selects between them.",
   "base_game": {
-    "arm": "com.roblox.client"
+    "arm": "com.roblox.client",
+    "v6": "com.roblox.client"
   }
 }

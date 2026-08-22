@@ -14,7 +14,7 @@ to be unnecessary because the amended spec's root cause was falsified on-device.
 A dev image that:
 
 1. boots **rooted** — `su` works, so arbitrary commands / frida / file edits are possible; and
-2. accepts **any APK** via `omni start <account> --dev --apk <file>`, replacing the built-in
+2. accepts **any APK** via `omnidroid start <account> --dev --apk <file>`, replacing the built-in
    Roblox **regardless of signing cert**, repeatably across boots.
 
 Both routes below deliver this. Which route we take is an implementation detail.
