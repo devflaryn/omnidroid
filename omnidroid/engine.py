@@ -753,6 +753,20 @@ def _qemu_log_tail(acct, lines=8):
     try:
         path = runtime_dir(acct["name"]) / "qemu.log"
         text = path.read_text(errors="ignore").strip()
+    except FileNotFoundError:
+        # NOT THE SAME AS AN EMPTY LOG. spawn_qemu creates this file before it
+        # starts QEMU, so its absence means the whole instance directory went
+        # away -- which for a long time was something WE did: `reconcile_runtime`
+        # collects a directory whose pid is dead and whose ports are silent,
+        # which is precisely what a boot failure looks like, and the app polls
+        # `list` (which sweeps) every 4 s. A user saw the raw errno for this on
+        # 2026-08-22 and it told them nothing. spawn_qemu now stamps the record
+        # with the launcher's pid and the sweep leaves a live launch alone, so
+        # reaching here should mean the boot never got as far as spawning.
+        return (f"there is no qemu.log at {path}, so this boot never reached "
+                f"the point of starting the virtual machine. Something failed "
+                f"before that -- check the launch output above for the step "
+                f"that did not complete.")
     except OSError as e:
         return f"qemu.log could not be read ({e})"
     if not text:

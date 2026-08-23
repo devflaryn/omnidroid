@@ -2559,6 +2559,20 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
     hidden = placed["hidden"]
     (d / "run.json").write_text(json.dumps(
         {"pid": proc.pid, "started": time.time(),
+         # WHO IS WAITING ON THIS BOOT. `reserving` protected the runtime dir
+         # only up to this point; from here the record carries QEMU's pid, so a
+         # QEMU that dies mid-boot looks exactly like an abandoned instance and
+         # `reconcile_runtime` collects the directory -- while the launch is
+         # still standing in it. `omnidroid list` runs that sweep and the
+         # accounts panel polls `list` every 4 s, so on a real user's failed
+         # launch (2026-08-22) qemu.log was gone before the failure could be
+         # explained ("qemu.log could not be read [Errno 2]") and run.json was
+         # gone before `_boot_used_gpu` could read it -- which silently
+         # disabled the GPU->software retry that exists to rescue exactly that
+         # boot. Same self-healing shape as the reservation: while this pid
+         # lives the directory is in use, and when the launcher exits the
+         # leftovers are collectable again.
+         "launcher_pid": os.getpid(),
          # WHEN that pid was created, which is what makes the pid a durable
          # identity rather than a number the OS will hand to somebody else.
          # Every liveness check reads this instead of asking QEMU over QMP --

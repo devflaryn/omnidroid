@@ -103,6 +103,9 @@
           "created": 1787085132,
           "notes": "Arceus NEO 2.3.1 + omni bootstrap + full redirect (.so darkrai + DEX spdmteam -> 72.62.59.232)."
         }
+      },
+      "root_manifest": {
+        "rooted_data": "x86/data-template-8g.qcow2"
       }
     }
   },

@@ -120,3 +120,42 @@ class TheLaunchReportsWhatHappened(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AMissingLogSaysWhatThatMeans(unittest.TestCase):
+    r""""qemu.log could not be read ([Errno 2] No such file or directory)" is
+    what a user was shown on 2026-08-22, and it is not an explanation.
+
+    An ABSENT log is a different diagnosis from an EMPTY one, and the code
+    already knew what an empty one meant. spawn_qemu opens qemu.log before it
+    starts QEMU, so the file existing is a fact about whether the boot got that
+    far -- worth saying, instead of handing over an errno.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        p = mock.patch.object(engine, "runtime_dir", lambda name: self.root / name)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_no_log_at_all_is_explained_not_reported_as_an_errno(self):
+        text = engine._qemu_log_tail({"name": "acc0"})
+        self.assertNotIn("Errno", text)
+        self.assertIn("never reached", text)
+
+    def test_an_empty_log_still_gets_its_own_much_worse_diagnosis(self):
+        d = self.root / "acc0"
+        d.mkdir(parents=True)
+        (d / "qemu.log").write_text("")
+        text = engine._qemu_log_tail({"name": "acc0"})
+        self.assertIn("EMPTY", text)
+        self.assertIn("FULL", text, "a full disk is the first thing to check")
+
+    def test_a_log_with_words_in_it_hands_those_words_over(self):
+        d = self.root / "acc0"
+        d.mkdir(parents=True)
+        (d / "qemu.log").write_text("qemu: could not open backing file\n")
+        self.assertIn("could not open backing file",
+                      engine._qemu_log_tail({"name": "acc0"}))

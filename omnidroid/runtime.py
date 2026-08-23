@@ -795,6 +795,19 @@ def reconcile_runtime():
             continue
         if instance_live(data):
             continue
+        # A LAUNCH STILL ON ITS FEET OWNS THIS DIRECTORY, whatever its QEMU is
+        # doing. A boot that has just failed looks identical to an abandoned
+        # instance from here -- dead pid, silent ports -- and collecting it
+        # takes `qemu.log`, the only place the reason for a QEMU death exists,
+        # and `run.json`, which the GPU->software retry reads to decide whether
+        # the display is to blame. Measured on a user's failed launch
+        # (2026-08-22): the app polls `list` every 4 s and `cmd_list` runs this
+        # sweep, so the evidence was deleted within four seconds and the user
+        # was told "qemu.log could not be read". A missing launcher_pid (every
+        # record written before this) still collects, or upgrading would strand
+        # every leftover on the machine.
+        if pid_alive(data.get("launcher_pid")):
+            continue
         qmp_port = data.get("qmp_port")
         adb_port = data.get("adb_port")
         silent = not ((qmp_port and _port_answers(qmp_port))
