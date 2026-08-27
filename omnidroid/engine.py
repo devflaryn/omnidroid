@@ -33,6 +33,7 @@ import threading
 import time
 from pathlib import Path
 
+from omnidroid import autoexec
 from omnidroid import awake
 from omnidroid import bootwait
 from omnidroid import config
@@ -1300,36 +1301,110 @@ BLOCK_EXTERNAL_HOSTS = (
 
 
 def block_external_hosts(acct, label):
-    """Null-route github/spdm in the guest's /system/etc/hosts (adb is uid 0 on
-    the x86 base; no `su` needed). Idempotent and reversible. See
-    BLOCK_EXTERNAL_HOSTS for why. Best-effort: a base that refuses the remount
-    just leaves the redirect (native hook) as the sole line of defence.
+    """REDIRECT github/spdm in the guest's /system/etc/hosts to OUR server (adb is
+    uid 0 on the x86 base; no `su` needed). Idempotent and reversible; rewrites any
+    stale entry in place. See BLOCK_EXTERNAL_HOSTS for the host list.
+
+    WHY REDIRECT, NOT NULL-ROUTE. The Arceus executor fetches its version gate and
+    its loader (`raw.githubusercontent.com/SPDM-Team/Arceus-X-NEO-public/main/
+    Costumers/arceus.lua`) over HTTPS. A 127.0.0.1 null-route makes that phone-home
+    die with a RST and the executor never loads our in-game UI. Pointing those
+    hostnames at OUR server -- which terminates TLS into the omniExec middleware --
+    is what makes the executor work. Its TLS backend is wolfSSL and it does NOT
+    validate the certificate, so a self-signed listener suffices and no CA install
+    is needed. The one endpoint the OTA updater wants (release-assets.github...) is
+    on the same list, so it lands on us and gets a 404 -- identical outcome to the
+    old block, no OS image pulled.
 
     NOTE: on a cold FIRST boot the OTA updater can fire its GitHub check in the
     ~4 s before adbd is up and this runs. This per-boot pass covers warm-pool
-    slots (blocked before any session) and every boot after the first. To close
-    that first-4s cold-boot window entirely, bake the same lines into the BASE
-    image's /system/etc/hosts (a `rebuild-base`/`strip-base` step) so they are
-    present from kernel boot -- the block lives in /system, which belongs to the
-    base, not to a per-account offset overlay."""
-    # remount rootfs rw (system-as-root base: /system lives on /), append any
-    # missing entries, then leave it -- the file is tiny and re-provision is rare.
-    lines = "".join(f"127.0.0.1 {h}\\n" for h in BLOCK_EXTERNAL_HOSTS)
+    slots and every boot after the first. To close that first-4s window entirely,
+    bake the same lines into the BASE image's /system/etc/hosts (a
+    `rebuild-base`/`strip-base` step) -- /system belongs to the base, not to a
+    per-account offset overlay."""
+    ip = _executor_redirect_ip()
+    # remount rootfs rw (system-as-root base: /system lives on /); drop any stale
+    # line for each host (so a base baked with the old 127.0.0.1 entries is
+    # corrected), then add our redirect. The file is tiny and re-provision is rare.
     script = (
         "mount -o rw,remount / 2>/dev/null; "
         "mount -o rw,remount /system 2>/dev/null; "
         "H=/system/etc/hosts; "
         f"for h in {' '.join(BLOCK_EXTERNAL_HOSTS)}; do "
-        "grep -q \"[[:space:]]$h\\$\" $H 2>/dev/null || echo \"127.0.0.1 $h\" >> $H; "
+        "sed -i \"/[[:space:]]$h\\$/d\" $H 2>/dev/null; "
+        f"echo \"{ip} $h\" >> $H; "
         "done; "
         "ndc resolver flushnetdns 100 2>/dev/null; true"
     )
     try:
         adb(acct, "shell", script, timeout=20)
-        print(f"[{label}] blocked {len(BLOCK_EXTERNAL_HOSTS)} external hosts "
-              f"(github/spdm) in /system/etc/hosts")
+        print(f"[{label}] redirected {len(BLOCK_EXTERNAL_HOSTS)} executor hosts "
+              f"(github/spdm) -> {ip} in /system/etc/hosts")
     except Exception as e:
-        print(f"[{label}] host-block skipped ({e}); native-hook redirect still applies")
+        print(f"[{label}] host-redirect skipped ({e})")
+
+
+# DEV MODE, ABSENT FROM RELEASE BUILDS. The omni-executor PyInstaller specs --
+# which are what freezes this package for customers -- exclude
+# `omnidroid.devserver`, so a shipped instance has no module to import and
+# apply_dev_redirect() below is a no-op that never touches the guest's network.
+try:
+    from . import devserver as _devserver
+except ImportError:  # pragma: no cover - the production path
+    _devserver = None
+
+
+def _executor_redirect_ip():
+    """IP the executor's github/spdm HTTPS phone-home should land on so it reaches
+    OUR server (TLS-terminated -> omniExec middleware) rather than the real hosts.
+
+    DEV: the host running the local HTTPS terminator, reached from the guest at
+    slirp's host alias (e.g. 10.0.2.2) -- the same host `dev_target()` names.
+    PROD: our server IP. In a release build `_devserver` is excluded, so this is
+    the production constant with no dev machinery imported."""
+    if _devserver is not None:
+        target = _devserver.dev_target()
+        if target:
+            return target.split(":")[0]
+        return _devserver.PROD_IP
+    return "72.62.59.232"
+
+
+def apply_dev_redirect(acct, label):
+    """Send the guest's calls to 72.62.59.232 to a local omni-backend instead.
+
+    Off unless OMNI_DEV_SERVER (or configs/dev.json) says otherwise, so the
+    production path is one dict lookup and no adb at all. See devserver.py for
+    why this has to be a packet-level redirect rather than a setting: the
+    executor's server address is compiled into its native library.
+
+    Best-effort with a LOUD result either way -- a dev session that silently
+    kept talking to the production server would be worse than no dev mode, so
+    both the success and the failure print.
+    """
+    if _devserver is None:
+        return False
+    target = _devserver.dev_target()
+    if not target:
+        return False
+    try:
+        r = adb(acct, "shell", _devserver.dnat_script(target), timeout=20)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:  # noqa: BLE001 — never fail a boot over dev wiring
+        print(f"[{label}] *** DEV REDIRECT FAILED ({e}) — this guest is "
+              f"still calling the PRODUCTION server {_devserver.PROD_IP} ***")
+        return False
+    # The script's last line is the count of matching nat rules. Anything but a
+    # positive number means iptables did not take the rule, whatever it exited.
+    tail = out.splitlines()[-1].strip() if out else ""
+    if not tail.isdigit() or int(tail) < 1:
+        print(f"[{label}] *** DEV REDIRECT FAILED — this guest is still "
+              f"calling the PRODUCTION server {_devserver.PROD_IP}. "
+              f"guest said: {out[-200:] or '<nothing>'} ***")
+        return False
+    print(f"[{label}] DEV MODE: guest calls to {_devserver.PROD_IP} -> "
+          f"{target} (host's local omni-backend)")
+    return True
 
 
 def provision_settings(acct, label):
@@ -4288,6 +4363,35 @@ def bake_offset(cfg, tag, out_name, apk, pkg, label):
                   f"/data. The shipping image is untouched.")
             _shutdown(acct, label)
             return None
+        # Make the kiosk the SOLE home in the baked /data. provision_settings
+        # does this on a dev first boot, but production instances are ephemeral
+        # and never run it (it is dead on the product path), so a bare
+        # `offset create` used to capture a /data with the Bliss launcher still
+        # enabled: two HOME apps, so a production boot showed Android's
+        # "Choose a Home app" chooser and the game did not auto-launch until
+        # someone picked the kiosk. Pinning the kiosk as HOME and disabling the
+        # other launchers HERE bakes that into the offset, so boot goes straight
+        # to the kiosk. Best-effort and skipped cleanly if the base carries no
+        # kiosk (a plain-Roblox base): the offset is still a valid game bake.
+        try:
+            kp = adb(acct, "shell", "pm", "path", "com.omni.kiosk", timeout=10)
+            if "package:" in (kp.stdout or ""):
+                adb(acct, "shell", "cmd", "package", "set-home-activity",
+                    "--user", "0", "com.omni.kiosk/.MainActivity", timeout=15)
+                for hp in BLISS_HOME_PACKAGES:
+                    try:
+                        adb(acct, "shell", "pm", "disable-user", "--user", "0",
+                            hp, timeout=15)
+                    except Exception:  # noqa: BLE001 — a launcher already gone
+                        pass
+                print(f"[{label}] kiosk pinned as the sole HOME "
+                      f"({len(BLISS_HOME_PACKAGES)} competing launchers "
+                      f"disabled) so the game auto-launches on boot")
+            else:
+                print(f"[{label}] no com.omni.kiosk on this base; leaving HOME "
+                      f"as the base ships it")
+        except Exception as e:  # noqa: BLE001 — never fail a good bake over this
+            print(f"[{label}] kiosk HOME pin skipped ({e})")
         _shutdown(acct, label)
         # Keep the overlay itself: it is thin (only the APK + settings differ
         # from the pristine /data). Rewrite its backing reference to a bare
@@ -9841,6 +9945,10 @@ def apply_consent(acct, cfg=None, label=None):
     # OTA updater's GitHub phone-home and hardens the Arceus redirect. Same
     # per-/data, never-fail-a-boot contract as the consent grants above.
     block_external_hosts(acct, label)
+    # AFTER the host block, and on the same never-fail-a-boot contract: in dev
+    # mode, send this guest's calls to our server to the local omni-backend.
+    # No-op (not even an adb round trip) unless dev mode is on.
+    apply_dev_redirect(acct, label)
     return state.get("dialogs_hidden", False)
 
 
@@ -11064,6 +11172,13 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # and on a guest where that write is refused the sdcard roots are the
     # fallback, which is the half full-disk-access unlocks.
     write_exec_marker(acct, mode_name, cfg, label)
+    # EVERY boot: push the host's autoexec scripts (from <data_dir>/autoexec/)
+    # to the exec server for this account, so the in-game menu runs them at
+    # session start. This is a HOST->server HTTP call, not an adb step -- this
+    # build's executor reads its autoexec over game:HttpGet, not from a
+    # workspace file (see autoexec.py / execmark.py). Best-effort; the helper
+    # swallows every error and never fails a boot.
+    autoexec.push_autoexec(acct["name"], cfg, config.data_dir(), label)
     # EVERY boot, EVERY mode, and ABOVE the profile branch on purpose: the
     # never-blank guarantee is not a mode trade-off, and applying it before the
     # tuning leaves each mode the last writer on the display levers it
