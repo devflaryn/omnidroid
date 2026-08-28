@@ -431,6 +431,12 @@ def _driver(browser, profile_dir=None, headless=False):
         return webdriver.Firefox(options=opts)
     opts = webdriver.ChromeOptions()
     opts.add_argument("--window-size=1200,900")
+    # Long automated sessions that take hundreds of screenshots were losing the
+    # tab outright ("tab crashed"). These are the two flags that matter for
+    # that: the default /dev/shm budget is small, and the renderer backgrounding
+    # timers fight a window nobody is touching.
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-backgrounding-occluded-windows")
     if headless:
         # "new" headless mode renders like a real Chrome build; the legacy
         # --headless flag uses a different renderer Roblox is more likely to

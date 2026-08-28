@@ -20,7 +20,23 @@
         "3": "v2 + kiosk with black wallpaper; silent boot moved host-side (2026-07-06)",
         "4": "v3 + pre-installed game com.roblox.client as system app - PRODUCTION (2026-07-06)",
         "5": "updated kiosk (Lock Task lockdown + boot/RAM trims) (2026-07-06)"
-      }
+      },
+      "root_manifest": {
+        "rooted_data": "x86/data-template-8g.qcow2"
+      },
+      "offsets": {
+        "omniexec-2.734.917": {
+          "data": "x86/base_x86_data_offset_omniexec-2.734.917.qcow2",
+          "package": "com.roblox.client",
+          "apk": "omniexec-2.734.917.apk",
+          "apk_path": "C:\\Users\\berat\\Desktop\\Omni Apps\\omniexec-2.734.917.apk",
+          "version_name": "2.734.917",
+          "version_code": 2908,
+          "created": 1787839722,
+          "notes": "Arceus 2.3.2 patched: OmniBootstrap login + omni.webview.debug"
+        }
+      },
+      "default_offset": "omniexec-2.734.917"
     },
     "arm": {
       "type": "arm-uefi",
@@ -102,6 +118,16 @@
           "version_name": "2.733.988",
           "created": 1787085132,
           "notes": "Arceus NEO 2.3.1 + omni bootstrap + full redirect (.so darkrai + DEX spdmteam -> 72.62.59.232)."
+        },
+        "omniexec-2.734.917": {
+          "data": "x86/base_x86_data_offset_omniexec-2.734.917.qcow2",
+          "package": "com.roblox.client",
+          "apk": "omniexec-2.734.917.apk",
+          "apk_path": "C:\\Users\\berat\\Desktop\\Omni Apps\\omniexec-2.734.917.apk",
+          "version_name": "2.734.917",
+          "version_code": 2908,
+          "created": 1787841733,
+          "notes": null
         }
       },
       "root_manifest": {

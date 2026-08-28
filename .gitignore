@@ -70,3 +70,9 @@ desktop.ini
 # Both are regenerated on demand and neither is an input to anything.
 graphify-out/
 scratch/
+
+# DEV MODE switch (configs/dev.json) — points this checkout's guests at a local
+# omni-backend instead of 72.62.59.232. Machine-local by definition, and a
+# committed one would silently redirect somebody else's VMs. See
+# omnidroid/devserver.py.
+configs/dev.json
