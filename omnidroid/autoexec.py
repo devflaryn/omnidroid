@@ -32,7 +32,23 @@ import urllib.request
 from pathlib import Path
 
 # The kill switch, mirroring OMNI_NO_CONSENT / OMNI_NO_EXECMARK.
+#
+# ⚠ IT DOES NOT MEAN "SKIP THE PUSH", and that distinction is the whole
+# difference between a switch that works and one that looks like it does.
+# The scripts do not live on this machine at run time -- they live in the
+# exec server's channel for this account, put there by the LAST launch that
+# pushed. Skipping the push therefore leaves the previous bundle in place and
+# the instance runs it anyway. So "disabled" pushes an EMPTY bundle, which is
+# exactly what an empty folder already does (see push_autoexec's own note:
+# "deleting every file has to actually stop them running, not leave the last
+# set stuck"). Same rule, same code path.
 NO_AUTOEXEC_ENV = "OMNI_NO_AUTOEXEC"
+
+# One script turned off WITHOUT deleting it. A trailing `.disabled` is the
+# marker, chosen over a leading `_` or a subfolder because filename order IS
+# run order here: `20-loot.lua` -> `20-loot.lua.disabled` keeps its place in
+# the sequence, so switching it back on cannot silently reorder the rest.
+DISABLED_SUFFIX = ".disabled"
 
 # The shared secret the /autoexec/set route checks. Must match the backend's
 # OMNI_EXEC_ADMIN_SECRET (same default there, overridable in both places).
@@ -55,6 +71,21 @@ def autoexec_enabled(env=None):
     """False when the kill switch is set to a truthy value."""
     val = (env or os.environ).get(NO_AUTOEXEC_ENV, "")
     return str(val).strip().lower() not in ("1", "true", "yes", "on")
+
+
+def is_disabled(name):
+    """True for a script the user has switched off (see DISABLED_SUFFIX)."""
+    return str(name).lower().endswith(DISABLED_SUFFIX)
+
+
+def enabled_name(name):
+    """`foo.lua.disabled` -> `foo.lua`. Unchanged if it is not disabled."""
+    return str(name)[:-len(DISABLED_SUFFIX)] if is_disabled(name) else str(name)
+
+
+def disabled_name(name):
+    """`foo.lua` -> `foo.lua.disabled`. Unchanged if it already is."""
+    return str(name) if is_disabled(name) else str(name) + DISABLED_SUFFIX
 
 
 def autoexec_dir(data_dir):
@@ -82,6 +113,8 @@ def read_scripts(data_dir):
     except OSError:
         return out
     for p in names:
+        if is_disabled(p.name):            # switched off, not deleted
+            continue
         if p.suffix.lower() in _SKIP_EXT:
             continue
         try:
@@ -127,9 +160,12 @@ def push_autoexec(channel, cfg, data_dir, label, timeout=10):
 
     Prints one line either way. An empty dir is a valid state: it pushes an
     empty list, which clears the channel, and reports '0 scripts (cleared)'."""
-    if not autoexec_enabled():
-        return None
-    scripts = read_scripts(data_dir)
+    # DISABLED PUSHES AN EMPTY BUNDLE rather than returning early -- see
+    # NO_AUTOEXEC_ENV. Returning here would leave the previous launch's
+    # scripts live in the server-side channel, so the switch would appear to
+    # do nothing.
+    off = not autoexec_enabled()
+    scripts = [] if off else read_scripts(data_dir)
     base = server_base(cfg)
     payload = json.dumps({"channel": channel, "scripts": scripts}).encode("utf-8")
     req = urllib.request.Request(
@@ -150,7 +186,11 @@ def push_autoexec(channel, cfg, data_dir, label, timeout=10):
         count = int(data.get("count", len(scripts)))
     except (ValueError, TypeError):
         count = len(scripts)
-    if count == 0:
+    if off:
+        print(f"[{label}] autoexec: OFF — the channel was cleared, so nothing "
+              f"auto-runs this session (turn it back on in the app, or unset "
+              f"{NO_AUTOEXEC_ENV})")
+    elif count == 0:
         print(f"[{label}] autoexec: 0 scripts (cleared) — drop .lua files in "
               f"{autoexec_dir(data_dir)} to auto-run them")
     else:
