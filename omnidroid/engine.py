@@ -12436,13 +12436,17 @@ def build_parser():
                         "on.")
     s.add_argument("--panel", default=None,
                    help="guest display size for this boot: WxH or a name "
-                        "(720p/800p/1080p/1440p). Defaults to the mode's own "
-                        "(gaming 1280x800, farming 640x480). Bigger costs "
-                        "frames — the guest is CPU-bound on arm64 "
-                        "translation, not fill-bound. ABOVE THE BASE'S "
-                        "NATIVE 1280x800 it also does not work: measured, "
-                        "1920x1080 stalled the boot for 3.3+ min and the "
-                        "guest still came up 1280x800. Smaller is fine.")
+                        "(720p/800p/1080p/1440p). Gaming defaults to 1920x1080 "
+                        "where this host's screen can show it, else 1280x800; "
+                        "farming is 640x480. The base is NOT capped at "
+                        "1280x800 (that was one bad boot in 2026-08): measured "
+                        "2026-09-01, 1080p and 1440p both come up at exactly "
+                        "what they were asked for, +2 s of boot. Between 800p "
+                        "and 1080p the frame rate was the same on a real GPU "
+                        "(46.9/45.1 vs 46.7/47.2 fps in PS99), so bigger is "
+                        "not automatically slower — but it is real fill, and "
+                        "`--panel 800p` is how you buy frames back on a weak "
+                        "one.")
     s.add_argument("--mode", choices=MODE_CHOICES, default=None,
                    metavar="{gaming,farming}",
                    help="what this instance is FOR. gaming (DEFAULT) - "
