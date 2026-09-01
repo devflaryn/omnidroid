@@ -70,9 +70,14 @@ class CpuModel(unittest.TestCase):
 
 
 class WhpxCeilings(unittest.TestCase):
-    """WHPX's per-vCPU exit cost means growing an instance to the host's
-    capacity makes it far SLOWER to boot -- the opposite of what autoscaling
-    is for. Capped on Windows only; KVM and HVF scale as expected."""
+    """WHPX gets its own ceilings because it does not scale like KVM/HVF.
+
+    The MEMORY cap is a commit-charge fact (Windows charges `-m` 1:1 and a
+    host pushed into its pagefile misses vCPU deadlines). The vCPU cap was
+    4 until 2026-09-01 on the strength of a reading that moved memory and
+    vCPUs in one step; re-measured with memory held at 4096, smp 8 boots in
+    34.6 s against smp 4's 33.6 s and gives the guest ~5x one vCPU's
+    throughput instead of ~3.1x. See WHPX_SMP_CEIL."""
 
     def _scaled(self, windows, host_mem=32768, host_cpus=16):
         mode = {"name": "playable", "autoscale": True, "mem": 4096, "smp": 4}
@@ -84,15 +89,28 @@ class WhpxCeilings(unittest.TestCase):
         self.assertLessEqual(m["smp"], qemu_proc.WHPX_SMP_CEIL)
         self.assertLessEqual(m["mem"], qemu_proc.WHPX_MEM_CEIL_MB)
 
-    def test_a_big_windows_host_does_not_get_8_vcpu(self):
-        # The regression: 16 logical CPUs used to yield smp 8, which measured
-        # 5.9 min against 0.9 min at smp 4.
-        self.assertEqual(self._scaled(windows=True)["smp"], 4)
+    def test_a_big_windows_host_gets_the_whole_whpx_ceiling(self):
+        """16 logical CPUs yield the ceiling, not the old hardcoded 4.
+
+        Roblox alone was measured using 297% of a core out of the 400% a
+        4-vCPU guest has -- starved, not sated -- and 8 vCPUs cost nothing
+        at the boot (34.6 s vs 33.6 s, memory held constant)."""
+        self.assertEqual(self._scaled(windows=True)["smp"],
+                         qemu_proc.WHPX_SMP_CEIL)
+
+    def test_a_small_windows_host_still_keeps_cores_for_itself(self):
+        """The ceiling is a CEILING. A 6-core host gets 4, not 8:
+        PERF_SMP_HOST_RESERVE is still what decides on a small machine."""
+        self.assertEqual(self._scaled(windows=True, host_cpus=6)["smp"], 4)
 
     def test_other_platforms_still_scale_up(self):
+        """The MEMORY ceiling is the Windows-only one now: KVM/HVF have
+        madvise and a balloon that decommits, so they take the bigger guest.
+        The vCPU ceilings happen to coincide at 8 (PERF_SMP_CEIL), which is
+        why only memory is asserted here."""
         m = self._scaled(windows=False)
-        self.assertGreater(m["smp"], qemu_proc.WHPX_SMP_CEIL)
         self.assertGreater(m["mem"], qemu_proc.WHPX_MEM_CEIL_MB)
+        self.assertEqual(m["smp"], qemu_proc.PERF_SMP_CEIL)
 
     def test_a_non_autoscaling_mode_is_untouched(self):
         fixed = {"name": "brutal", "mem": 2048, "smp": 2}

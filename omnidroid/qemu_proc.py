@@ -1,7 +1,9 @@
 # omnidroid/qemu_proc.py
 """QEMU command construction, process spawn, and QMP monitor access."""
+import functools
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -114,6 +116,35 @@ GL_GPU_DEVICE = "virtio-gpu-gl-pci"          # needs virglrenderer in QEMU
 # them puts the preferred mode where the guest will pick it.
 GL_XRES, GL_YRES = 1280, 800
 DEFAULT_PANEL = (GL_XRES, GL_YRES)
+
+# What `gaming` asks for when nobody has said otherwise, and the ceiling
+# host_panel() will scale UP to.
+#
+# ⚠ THE BASE IS NOT PINNED TO 1280x800 AND NEVER WAS. That belief -- recorded
+# in panel_for()'s old docstring, in MODES.md and in `--panel`'s own help --
+# came from one 2026-08-15 boot that stalled, and it was wrong in a way that
+# capped the product's resolution for two weeks. DISPROVED 2026-09-01 on this
+# box, patched QEMU 11.1.0-omni, same base image, boot to bootcomplete:
+#
+#   --panel 800p    (1280x800)    33.6 s    wm size 1280x800
+#   --panel 1080p   (1920x1080)   35.6 s    wm size 1920x1080   density 240
+#   --panel 1440p   (2560x1440)   35.6 s    wm size 2560x1440   density 240
+#
+# No stall, no fallback, and the guest came up at exactly what it was given.
+# The reason is visible from inside the guest and settles it: the kernel
+# command line carries NO `video=` argument at all, and the DRM connector's
+# own mode list (`/sys/class/drm/card0-Virtual-1/modes`) already reads
+# 1280x800, 5120x2160, 3840x2160, 2560x1080, 1920x1440... The panel was only
+# ever `xres`/`yres` on the virtio-gpu device, which is ours to set.
+#
+# Bigger DOES cost frames -- it is real fill, not a free upgrade -- so this is
+# a default, not a mandate: `--panel 800p` is the max-frames setting and
+# `--panel 1440p` the max-fidelity one.
+PERF_PANEL_CEIL = (1920, 1080)
+# Leave this much of the host's screen for its taskbar/caption before deciding
+# a panel "fits" it. A window bigger than the desktop is worse than a smaller
+# panel, however many pixels it renders.
+HOST_PANEL_MARGIN = (0, 120)
 # Farming draws a postage stamp (lean.FARMING_DISPLAY is 480x270), so the
 # PANEL is sized down with it. This is not cosmetic: the panel decides how big
 # every buffer in the pipeline is -- the guest's own scanout, SurfaceFlinger's
@@ -155,29 +186,84 @@ def parse_panel(text):
     return None
 
 
+def host_screen_size():
+    """(w, h) of the host's primary display in physical pixels, or None.
+
+    Windows only for now; every other platform (and every failure) answers
+    None, which panel_for() reads as "keep the mode's declared panel". Asks
+    for per-monitor DPI awareness first so a 150%-scaled 4K laptop reports
+    3840x2160 rather than the 2560x1440 GetSystemMetrics would otherwise
+    hand back -- getting that wrong picks a panel one tier too small on
+    exactly the machines with the most pixels to give.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        try:                                    # PROCESS_PER_MONITOR_DPI_AWARE
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:                       # noqa: BLE001 - already set, or pre-8.1
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:                   # noqa: BLE001
+                pass
+        w = int(ctypes.windll.user32.GetSystemMetrics(0))   # SM_CXSCREEN
+        h = int(ctypes.windll.user32.GetSystemMetrics(1))   # SM_CYSCREEN
+        return (w, h) if w > 0 and h > 0 else None
+    except Exception:                           # noqa: BLE001 - never cost a boot
+        return None
+
+
+def host_panel(declared, ceiling=PERF_PANEL_CEIL, screen=None):
+    """Grow `declared` toward `ceiling`, but never past this host's screen.
+
+    Pure, so the policy is testable without a display. Returns `declared`
+    unchanged when the screen is unknown, when it is already at or above the
+    ceiling, or when the ceiling would not fit -- an unreadable host costs you
+    the upgrade, never the boot.
+
+    The margin exists because the gaming window is a REAL window on the user's
+    desktop at exactly this size (see place_window): a 1920x1080 panel on a
+    1920x1080 screen is a window whose caption is off the top of the desktop.
+    """
+    try:
+        dw, dh = int(declared[0]), int(declared[1])
+        cw, ch = int(ceiling[0]), int(ceiling[1])
+    except Exception:                           # noqa: BLE001
+        return declared
+    if dw >= cw and dh >= ch:
+        return declared                         # already asking for more
+    screen = screen or host_screen_size()
+    if not screen:
+        return declared
+    mw, mh = HOST_PANEL_MARGIN
+    if int(screen[0]) - mw >= cw and int(screen[1]) - mh >= ch:
+        return (cw, ch)
+    return declared
+
+
 def panel_for(mode=None, cfg=None):
     """The (w, h) panel this boot hands the guest.
 
-    Order: OMNI_PANEL -> config `qemu.panel` -> the mode's own `panel` ->
-    DEFAULT_PANEL. An explicit request wins over the mode because "run it at
-    1080p" is a statement about the product, not about the mode.
+    Order: OMNI_PANEL -> config `qemu.panel` -> the mode's own `panel`, then
+    -- for a `performance` mode only -- grown toward PERF_PANEL_CEIL if this
+    host's screen can show it. An explicit request wins over all of it,
+    because "run it at 1080p" is a statement about the product, not about the
+    mode, and `--panel 800p` has to remain the way to buy frames back.
 
-    ⚠ ASKING FOR MORE THAN THE BASE'S NATIVE MODE COSTS AND BUYS NOTHING.
-    MEASURED 2026-08-15 on the x86 base (native 1280x800), `--panel 1080p`:
-    the boot took **3.3+ minutes without reaching adbd** where the same image
-    at 1280x800 took 0.8, QEMU stayed alive with **no scanout errors at all**,
-    and when the guest finally came up **it was still 1280x800** -- `screencap`
-    returned a 1280x800 image. So the guest ignores a mode its panel does not
-    carry, after paying a long stall trying. Smaller-than-native panels are
-    fine and are what farming uses. Raising the ceiling needs a base whose mode
-    list carries the larger mode, not a bigger number here."""
+    See PERF_PANEL_CEIL for why the old "the base cannot go above 1280x800"
+    finding is not true, and what was measured instead.
+    """
     for candidate in (os.environ.get("OMNI_PANEL"),
                       ((cfg or {}).get("qemu") or {}).get("panel")):
         parsed = parse_panel(candidate)
         if parsed:
             return parsed
     declared = (mode or {}).get("panel")
-    return parse_panel(declared) or tuple(declared or ()) or DEFAULT_PANEL
+    panel = parse_panel(declared) or tuple(declared or ()) or DEFAULT_PANEL
+    if (mode or {}).get("profile") == "performance":
+        panel = host_panel(panel)
+    return panel
 
 
 def display_override(cfg=None):
@@ -1087,11 +1173,43 @@ PERF_SMP_FLOOR = 4
 PERF_SMP_CEIL = 8
 PERF_SMP_HOST_RESERVE = 2
 
-# WHPX-only ceilings. See the comment in autoscale_perf(): on Windows the
-# autoscaled 8192 MB / 8 vCPU booted 6.5x SLOWER than 4096 MB / 4 vCPU on the
-# same host and image, so on WHPX these are caps, not targets.
+# WHPX-only ceilings. The MEMORY cap stands (see autoscale_perf()); the vCPU
+# cap was raised 4 -> 8 on 2026-09-01 after re-measuring it. See
+# WHPX_SMP_CEIL's own note.
 WHPX_MEM_CEIL_MB = 4096
-WHPX_SMP_CEIL = 4
+
+# 4 was wrong, and it was wrong in the direction that cost the product its
+# frames. RE-MEASURED 2026-09-01 on the Windows box (i7-13700F/16C, RTX 4060,
+# QEMU 11.1.0-omni, Bliss 16.9.7 x86_64), holding memory at 4096 MB so the
+# vCPU count was the only variable -- which the 2026-07 measurement that set
+# this to 4 did NOT do (it moved 4096/4 -> 8192/8 in one step and blamed the
+# vCPUs for what may have been the RAM).
+#
+#   cold boot to bootcomplete   smp 4: 33.6 s    smp 8: 34.6 s
+#   ...at --panel 1080p                          smp 8: 35.6 s
+#   ...at --panel 1440p                          smp 8: 35.6 s
+#
+# There is no 6.5x. There is no penalty at all worth the name.
+#
+# And the guest WANTS the cores. Sampled per-process out of /proc/*/stat on a
+# live PS99 session at smp 4, com.roblox.client alone was using **297% of a
+# core out of the 400% the guest had** -- i.e. it was CPU-STARVED at 4, with
+# SurfaceFlinger costing 1.8% and everything else on the guest under 1%. At
+# smp 8 the same session had headroom instead of a ceiling.
+#
+# What 8 actually buys, measured with a hand-assembled static x86-64 loop run
+# 1..8 ways in parallel inside the guest (tools/bench/, wall clock, ms):
+#
+#   parallel copies       1     2     4     6     8
+#   smp 8              223   282   405   420   342-506
+#
+# ...i.e. 8 vCPUs deliver ~5x one vCPU's throughput where 4 deliver ~3.1x.
+# WHPX does not scale linearly -- it never has -- but "sublinear" is not
+# "negative", and 4 was leaving the other 60% on the floor.
+#
+# The floor under this is still PERF_SMP_HOST_RESERVE: a host with 6 cores
+# gets 4, not 8. This is a CEILING, not a target.
+WHPX_SMP_CEIL = 8
 
 
 def autoscale_perf(mode, host_mem_mb=None, host_cpus=None):
@@ -1116,15 +1234,19 @@ def autoscale_perf(mode, host_mem_mb=None, host_cpus=None):
     if host_cpus:
         m["smp"] = max(PERF_SMP_FLOOR,
                        min(PERF_SMP_CEIL, host_cpus - PERF_SMP_HOST_RESERVE))
-    # WHPX does not scale the way KVM/HVF do. Growing an instance to the
-    # host's capacity makes it DRAMATICALLY slower to boot there, which is
-    # the opposite of what autoscaling is for.
+    # WHPX does not scale the way KVM/HVF do, so it keeps its own ceilings.
     #
-    # MEASURED on Windows/WHPX (i7-13700F, 32 GB, Bliss 16.9.7): the very
-    # same image and offset booted in 0.9 min at 4096 MB / 4 vCPU and took
-    # 5.9 min at the autoscaled 8192 MB / 8 vCPU -- 6.5x worse for twice the
-    # resources. The guest sat near-idle while slow, so this is WHPX's
-    # per-vCPU exit/IPI cost rather than the guest wanting more.
+    # MEASURED 2026-07 on Windows/WHPX (i7-13700F, 32 GB, Bliss 16.9.7): the
+    # same image booted in 0.9 min at 4096 MB / 4 vCPU and took 5.9 min at
+    # the autoscaled 8192 MB / 8 vCPU. That reading moved BOTH knobs at once
+    # and the vCPU half of it did not survive re-measurement --
+    # see WHPX_SMP_CEIL, which is 8 now. **The MEMORY half was never
+    # separated out and stands until it is**: on Windows host RSS and commit
+    # charge both track `-m` almost exactly (there is no madvise), so an
+    # 8192 MB guest is 8 GB of host commit whether the guest touches it or
+    # not, and a host pushed into its pagefile misses QEMU's vCPU deadlines.
+    # Roblox itself peaks around 2.4 GB resident in-guest, so 4096 is
+    # headroom rather than a squeeze.
     #
     # Deliberately WHPX-only: KVM and HVF scale as expected and keep the
     # larger ceilings.
@@ -1528,7 +1650,7 @@ def _headless_gl_pair(tool, cfg, mode):
     return list(cap["gpu_args"]), list(cap["display_args"])
 
 
-def balloon_device(mode):
+def balloon_device(mode, cfg=None):
     """The virtio-balloon device args for this mode, or [] when unwanted.
 
     free-page-reporting is the load-bearing flag, not the balloon itself:
@@ -1548,15 +1670,26 @@ def balloon_device(mode):
     balloon inflate. That is why the 50+-instance target is a Linux number;
     macOS runs the 2-3 playable instances and does not pretend otherwise.
 
-    ON WINDOWS free-page-reporting is not merely advisory, it is NEGATIVE, and
-    it is dropped there. QEMU has no madvise on Windows, so every page the
-    guest reports free fails `ram_block_discard_range` and QEMU logs a line
-    about it. MEASURED 2026-08-15 on a normal playable boot: 925 such lines in
-    ~60 s of runtime, 78 KB of qemu.log, and one failed discard attempt per
-    4 MB block for the life of the instance -- all of it buying exactly zero
-    reclaimed memory, since the discard IS the reclaim. The balloon device
-    itself stays, so `apply_balloon_target`'s QMP inflate still exists."""
-    if IS_WINDOWS:
+    ON A STOCK QEMU FOR WINDOWS free-page-reporting is not merely advisory,
+    it is NEGATIVE. QEMU has no madvise there, so every page the guest reports
+    free fails `ram_block_discard_range` and QEMU logs a line about it.
+    MEASURED 2026-08-15 on a normal boot: 925 such lines in ~60 s of runtime,
+    78 KB of qemu.log, and one failed discard attempt per 4 MB block for the
+    life of the instance -- all of it buying exactly zero reclaimed memory,
+    since the discard IS the reclaim.
+
+    ⚠ THAT IS A PROPERTY OF THE BINARY, NOT OF WINDOWS, and the product does
+    not ship that binary any more. `qemu-patches/0005-omni-win32-discard`
+    gives `ram_block_discard_range` a `_WIN32` arm (`DiscardVirtualMemory`)
+    and `0008-omni-win32-punch-hole` gives it a file-backed arm
+    (`FSCTL_SET_ZERO_DATA`) that releases the scratch file's blocks too. With
+    those, a reported free page really is returned -- which is the entire
+    reason the patches exist. So the flag is gated on the CAPABILITY rather
+    than on the platform: a build that advertises `omni-punch-hole` gets it,
+    a stock one still does not, and nobody has to remember which QEMU is
+    installed. The balloon device itself is unconditional either way, so
+    `apply_balloon_target`'s QMP inflate exists on every host."""
+    if IS_WINDOWS and not qemu_supports_punch_hole(cfg):
         return ["-device", "virtio-balloon-pci,id=omniball"]
     return ["-device", "virtio-balloon-pci,free-page-reporting=on,id=omniball"]
 
@@ -1611,21 +1744,76 @@ def smp_arg(smp):
     return f"{n},sockets=1,cores={n},threads=1"
 
 
-def usb_devices(mode, arm):
-    """USB controller + input devices, or [] for a mode that has no hands on
-    it. Two controllers used to be attached on arm (nec-usb-xhci AND
-    qemu-xhci) with the input devices bound only to the first — the second
-    was dead weight on every single arm boot."""
+# How the guest is given a mouse and a keyboard.
+#
+#   "usb"     qemu-xhci + usb-kbd + usb-tablet. What shipped until 2026-09-01.
+#   "virtio"  virtio-keyboard-pci + virtio-tablet-pci, with the USB pair still
+#             attached BEHIND them as the fallback (see input_devices()).
+#
+# WHY IT MATTERS: a USB HID device is POLLED. QEMU's usb-hid advertises a
+# 10 ms interrupt endpoint interval, so a click or a mouse move waits for the
+# next poll window before the guest hears about it -- ~5 ms of latency on
+# average, ~10 ms worst case, on top of the frame pipeline, and it is jitter
+# rather than a constant offset, which is what "input lag" actually feels
+# like. virtio-input has no polling interval at all: the host writes the
+# event into a virtqueue and kicks, and the guest takes an interrupt.
+#
+# The base carries the driver -- `CONFIG_VIRTIO_INPUT=m` with
+# `virtio_input.ko` present under /system/lib/modules/6.1.112-gloria-xanmod1/
+# -- and virtio_gpu/virtio_net already demonstrate that this base autoloads
+# virtio modules when the device appears.
+INPUT_USB = "usb"
+INPUT_VIRTIO = "virtio"
+DEFAULT_INPUT = INPUT_VIRTIO
+
+
+def input_policy(cfg=None):
+    """"usb" or "virtio". OMNI_INPUT -> config `qemu.input` -> DEFAULT_INPUT."""
+    for candidate in (os.environ.get("OMNI_INPUT"),
+                      ((cfg or {}).get("qemu") or {}).get("input")):
+        if candidate:
+            s = str(candidate).strip().lower()
+            if s in (INPUT_USB, INPUT_VIRTIO):
+                return s
+    return DEFAULT_INPUT
+
+
+def usb_devices(mode, arm, cfg=None):
+    """Input devices, or [] for a mode that has no hands on it.
+
+    ORDER IS THE WHOLE SAFETY STORY. QEMU's `qemu_input_find_handler`
+    (ui/input.c) walks its handler list and takes the FIRST whose mask covers
+    the event, and handlers register in command-line order -- so whichever
+    pointer is named first is the one that receives every click, and the other
+    is inert. Naming virtio first and usb second therefore means:
+
+      * virtio-input bound in the guest  -> events arrive with no poll delay
+      * virtio-input did NOT bind        -> the guest simply has no virtio
+        input device driving /dev/input, and the USB pair behind it is still
+        a real, enumerated, working mouse and keyboard
+
+    ...so the worst case of the faster device is the old behaviour, not a
+    guest nobody can click on. That is why the USB pair stays attached rather
+    than being replaced: two idle HID models cost a few KB of host memory,
+    and an instance with no way to dismiss an "Allow USB debugging?" dialog
+    costs the whole instance (see MODES["farming"]'s `usb` note).
+
+    Two controllers used to be attached on arm (nec-usb-xhci AND qemu-xhci)
+    with the input devices bound only to the first -- the second was dead
+    weight on every single arm boot.
+    """
     if not mode.get("usb", True):
         return []
-    if arm:
-        return [
-            "-device", "nec-usb-xhci,id=usb-bus",
-            "-device", "usb-tablet,bus=usb-bus.0",
-            "-device", "usb-kbd,bus=usb-bus.0",
-        ]
-    return ["-device", "qemu-xhci", "-device", "usb-kbd",
-            "-device", "usb-tablet"]
+    usb = ([
+        "-device", "nec-usb-xhci,id=usb-bus",
+        "-device", "usb-tablet,bus=usb-bus.0",
+        "-device", "usb-kbd,bus=usb-bus.0",
+    ] if arm else
+        ["-device", "qemu-xhci", "-device", "usb-kbd", "-device", "usb-tablet"])
+    if input_policy(cfg) != INPUT_VIRTIO:
+        return usb
+    return ["-device", "virtio-keyboard-pci,id=omnikbd",
+            "-device", "virtio-tablet-pci,id=omnitablet"] + usb
 
 
 def _assert_port_triple(acct):
@@ -1766,7 +1954,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         # of the 127.0.0.1 bind — HARD RULE, same as x86; never bind a
         # network interface without adding auth in the same change).
         *vnc_args(display_args, vnc_display),
-        *usb_devices(mode, arm=True),
+        *usb_devices(mode, arm=True, cfg=cfg),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
         "-device", "virtio-net-pci,netdev=net0" + nic_mtu_suffix(cfg),
@@ -1774,7 +1962,7 @@ def qemu_command_arm(acct, cfg, interactive, mode=None, accel=None,
         # from nothing and boot stalls. virtio-serial was dropped — no guest
         # or host component has ever opened a port on it.
         "-device", "virtio-rng-pci",
-        *balloon_device(mode),
+        *balloon_device(mode, cfg),
         "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
         "-name", f"omni-{acct['name']}",
     ]
@@ -1955,11 +2143,11 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         # on costs ~nothing across hours-long headless runs; a viewer
         # disconnecting never affects the instance.
         *vnc_args(display_args, vnc_display),
-        *usb_devices(mode, arm=False),
+        *usb_devices(mode, arm=False, cfg=cfg),
         "-netdev", ("user,id=net0,"
                     f"hostfwd=tcp:127.0.0.1:{acct['adb_port']}-:5555"),
         "-device", nic,
-        *balloon_device(mode),
+        *balloon_device(mode, cfg),
         "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
         "-kernel", str(images / base["kernel"]),
         "-initrd", str(images / base["initrd"]),
@@ -2366,7 +2554,7 @@ def scratch_dir(cfg=None):
     return d
 
 
-def scratch_env(cfg=None, env=None):
+def scratch_env(cfg=None, env=None, mode=None):
     """The child environment that puts QEMU's overlay in `scratch_dir`.
 
     All three names are set on purpose: Windows' GetTempPath reads TMP then
@@ -2379,7 +2567,171 @@ def scratch_env(cfg=None, env=None):
     for name in ("TMP", "TEMP", "TMPDIR"):
         base[name] = str(d)
     _apply_window_env(base)
+    ram_file_env(base, cfg, mode)
     return base
+
+
+def _apply_host_gpu_preference(cmd, label=None):
+    """Pin QEMU to the high-performance adapter, once per process.
+
+    Memoised on the resolved path because `spawn_qemu` runs on every launch
+    and a pool filling ten slots must not do ten registry writes and print
+    ten lines. Never raises: hostgpu degrades to "leave the registry alone".
+    """
+    try:
+        from omnidroid import hostgpu
+        exe = str(cmd[0])
+        if exe in _GPU_PREF_DONE:
+            return
+        _GPU_PREF_DONE.add(exe)
+        if ((os.environ.get("OMNI_NO_GPU_PREF") or "").strip().lower()
+                in ("1", "true", "yes", "on")):
+            return
+        line = hostgpu.describe(hostgpu.apply(exe), exe)
+        if line:
+            print(f"[{label or 'gpu'}] {line}")
+    except Exception:                       # noqa: BLE001 - never cost a boot
+        pass
+
+
+_GPU_PREF_DONE = set()
+
+RAM_FILE_ENV = "QEMU_RAM_FILE_DIR"
+
+
+@functools.lru_cache(maxsize=8)
+def _omni_caps_of(binary):
+    """The `(omni-…)` tokens in `binary --version`. Keyed on the PATH, so a
+    process that switches QEMU (OMNI_QEMU_DIR, `doctor --recheck`, a test)
+    gets the new binary's answer instead of the first one's."""
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True,
+                             text=True, timeout=10,
+                             **_no_window_kwargs()).stdout or ""
+    except Exception:                       # noqa: BLE001 - a probe, not logic
+        return ()
+    m = re.search(r"\(([^)]*omni[^)]*)\)", out)
+    return tuple(m.group(1).split("+")) if m else ()
+
+
+def _qemu_omni_caps(cfg=None):
+    """The omni capability tokens baked into this QEMU's --version string.
+
+    Asked by RUNNING it, not by reading a number: the product has shipped
+    three different QEMU builds and `--version`'s version field distinguishes
+    none of them, because the patches do not bump it. What they do bump is
+    `--with-pkgversion`, which tools/build_qemu.py derives from the patch
+    series actually applied -- so the parenthesised suffix is the honest
+    answer to "what is in this binary".
+
+        QEMU emulator version 11.1.0 (omni-window+omni-ram-file+omni-punch-hole)
+    """
+    try:
+        return _omni_caps_of(str(qemu_bin("qemu-system-x86_64")))
+    except Exception:                       # noqa: BLE001 - a probe, not logic
+        return ()
+
+
+def qemu_supports_ram_file(cfg=None):
+    """Does the resolved QEMU carry patch 0007 (file-backed guest RAM)?"""
+    return "omni-ram-file" in _qemu_omni_caps(cfg)
+
+
+def qemu_supports_punch_hole(cfg=None):
+    """Does the resolved QEMU carry patch 0008 (FSCTL_SET_ZERO_DATA discard)?
+
+    This is the one that makes a guest-reported free page actually give the
+    host back its memory AND its disk. Without it, patch 0007 alone moves the
+    charge off the commit limit but nothing is ever released.
+    """
+    return "omni-punch-hole" in _qemu_omni_caps(cfg)
+
+
+def ram_file_env(env, cfg=None, mode=None, is_windows=None, supported=None):
+    """Point guest RAM at a file in the scratch, for density on Windows.
+
+    FOUR GATES, and every one of them is a measurement rather than a taste.
+
+    WINDOWS ONLY. Linux and macOS have `madvise` and a balloon that decommits
+    for real; this buys them nothing and costs them a file to reap.
+
+    DENSITY ONLY, for now. The commit limit is a FLEET problem -- one gaming
+    instance never approached it. What file-backing trades is commit for soft
+    faults, and a soft fault in the middle of a frame is exactly what gaming
+    is not allowed to have. Gaming moves over when density has held it for a
+    while, not before.
+
+    A PATCHED QEMU ONLY. A stock binary ignores the variable, which is safe
+    but silent -- and `capacity_shortfall` would then plan a fleet against a
+    commit cost that is still being paid. The gate is what the planner reads.
+
+    A SCRATCH THAT EXISTS. `scratch_dir` is already the ephemeral-overlay home
+    and is already reaped, size-checked and redirectable (`qemu.scratch_dir`),
+    so the RAM files inherit all of it.
+
+    WHY IT IS WORTH A PATCH AT ALL -- probed on this host before the patch was
+    written (docs/superpowers/runbooks/2026-08-19-windows-ram-backing.md), for
+    3 GiB of guest RAM:
+
+        VirtualAlloc(MEM_COMMIT)             system commit  +3078 MB
+        CreateFileMapping + MapViewOfFile    system commit     +12 MB
+
+    ...and `WHvMapGpaRange` accepts the file-backed range, so the guest runs
+    out of it and `FSCTL_SET_ZERO_DATA` can still punch pages back out from
+    under a LIVE mapping. Commit -- not RAM -- is what caps this host's fleet
+    (`doctor` -> capacity_farming), so this is the wall moving, not a tweak.
+    """
+    if is_windows is None:
+        is_windows = IS_WINDOWS
+    if not is_windows:
+        return env
+    if ((mode or {}).get("profile")) != "density":
+        return env
+    if supported is None:
+        supported = qemu_supports_ram_file(cfg)
+    if not supported:
+        return env
+    d = scratch_dir(cfg)
+    if d is None:
+        return env
+    env[RAM_FILE_ENV] = str(d)
+    return env
+
+
+def ram_file_reserve_mb(mode, cfg=None, supported=None, is_windows=None):
+    """Worst-case scratch bytes the RAM file can occupy, in MB, or 0.
+
+    THE WORST CASE (`-m`), NOT THE EXPECTED ONE, and that is the whole point.
+    Exhausting the scratch disk used to cost a FAILED LAUNCH: the qcow2
+    overlay could not grow, the error was I/O-shaped, and it was attributable
+    to the instance that caused it. With guest RAM in a sparse file,
+    exhausting the disk means a RUNNING guest's next page fault cannot be
+    satisfied -- on Windows that is STATUS_IN_PAGE_ERROR against a mapped
+    view, and it takes the VM down with no clean error path.
+
+    So disk exhaustion moves from "the next launch fails" to "an arbitrary
+    already-farming instance dies", which is exactly the trade a preflight
+    exists to refuse. A launch that cannot prove the room is turned away.
+    """
+    if is_windows is None:
+        is_windows = IS_WINDOWS
+    if not is_windows:
+        return 0
+    if ((mode or {}).get("profile")) != "density":
+        return 0
+    if supported is None:
+        supported = qemu_supports_ram_file(cfg)
+    if not supported:
+        return 0
+    try:
+        return int((mode or {}).get("mem") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _no_window_kwargs():
+    """Keep a probe from flashing a console window on Windows."""
+    return {"creationflags": 0x08000000} if IS_WINDOWS else {}
 
 
 # These names ARE read now. They were written 2026-08-16 for a patched build
@@ -2527,7 +2879,7 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
         kwargs["start_new_session"] = True
     cmd = qemu_command(acct, cfg, interactive, mode, accel=accel, debug=debug,
                        warm=warm, bake=bake)
-    qemu_env = scratch_env(cfg)
+    qemu_env = scratch_env(cfg, mode=mode)
     # ⚠ NOTHING READS QEMU_WINDOW_PANEL. It is set for a QEMU build that was
     # planned and never made; verified 2026-08-16 by byte-scanning the shipped
     # qemu-system-{x86_64,aarch64}.exe, which contain no `QEMU_WINDOW_*` string
@@ -2547,6 +2899,14 @@ def spawn_qemu(acct, cfg, interactive, mode=None, accel=None, debug=False,
     gl_panel = gl_panel_size(cmd)
     if gl_panel:
         qemu_env["QEMU_WINDOW_PANEL"] = f"{gl_panel[0]}x{gl_panel[1]}"
+    # WHICH GRAPHICS CARD, and it has to be decided BEFORE the process starts:
+    # Windows reads the per-application GPU preference when the adapter is
+    # enumerated. On a hybrid laptop the default for an unknown exe is the
+    # POWER-SAVING adapter, and QEMU is an unknown exe on every machine this
+    # product installs onto. See hostgpu.py -- this is the difference between
+    # the discrete card and the integrated one on the very machines that were
+    # reported as "high-tier and still slow".
+    _apply_host_gpu_preference(cmd, label=acct.get("name"))
     proc = subprocess.Popen(cmd, stdout=log, stderr=log,
                             env=qemu_env, **kwargs)
     identity = f"omni-{acct['name']}"
@@ -2813,21 +3173,47 @@ def instance_capacity(mode=None, cfg=None, mem_mb=None):
         walls["ram"] = {"fits": int(free_ram // max(1, ws)),
                         "free_mb": int(free_ram), "each_mb": ws}
 
-    # COMMIT -- `-m` plus overhead, and nothing reduces it.
+    # COMMIT -- `-m` plus overhead... UNLESS the guest's RAM is in a file.
+    #
+    # "Nothing reduces it" was true of the shipped binary and is not true any
+    # more. With qemu-patches/0007 active (ram_file_env), guest RAM is a
+    # mapped sparse file rather than a private commit, so `-m` drops out of
+    # the charge almost entirely. MEASURED 2026-09-01 on a live in-world PS99
+    # farming instance, `-m 3072`, patched QEMU, `-accel whpx`:
+    #
+    #     system commit, no instances          30787 MB
+    #     ...with one farming instance         31858 MB   -> +1071 MB
+    #     QEMU private bytes                     979-1003 MB
+    #     the RAM file itself                   3072 MB logical, in the scratch
+    #
+    # ...against the +4065 MB the same measurement gave before the patch. So
+    # the whole `-m` term moves from commit to DISK, which is why the disk
+    # wall below has to pick it up in the same breath -- getting one without
+    # the other is how a planner promises a fleet the volume cannot hold.
+    # `mem`, not `mode["mem"]`: capacity_ladder walks `-m` down a rung at a
+    # time and the RAM file is exactly `-m`, so reading the mode's declared
+    # size would make every rung of the ladder report the same answer -- which
+    # is what it did, until this line said `mem`.
+    ram_filed = ram_file_reserve_mb({**mode, "mem": mem}, cfg)
     commit = _commit_status_mb()
     if commit:
         _limit, _charged, avail = commit
-        each = mem + COMMIT_OVERHEAD_MB
+        each = COMMIT_OVERHEAD_MB + (0 if ram_filed else mem)
         walls["commit"] = {"fits": int(avail // each), "free_mb": int(avail),
-                           "each_mb": each, "limit_mb": _limit}
+                           "each_mb": each, "limit_mb": _limit,
+                           "ram_file_backed": bool(ram_filed)}
 
-    # SCRATCH DISK -- the ephemeral overlay every instance writes into.
+    # SCRATCH DISK -- the ephemeral overlay every instance writes into, plus
+    # the guest-RAM file when there is one. The RAM term is the WORST CASE
+    # (`-m`), because running this volume out no longer fails a launch: it
+    # kills whichever already-farming guest faults next.
     free_disk = scratch_free_mb(cfg)
     if free_disk is not None:
-        each = SCRATCH_PER_INSTANCE_MB
+        each = SCRATCH_PER_INSTANCE_MB + ram_filed
         walls["disk"] = {
             "fits": int(max(0, free_disk - SCRATCH_FLOOR_MB) // each),
-            "free_mb": int(free_disk), "each_mb": each}
+            "free_mb": int(free_disk), "each_mb": each,
+            "ram_file_mb": int(ram_filed)}
 
     # CPU -- the ceiling the governor holds a farming instance to, or what one
     # was measured to take uncapped.

@@ -322,8 +322,15 @@ class X86GetsTheSameTreatment(unittest.TestCase):
         self.assertNotIn("video=Virtual-1", cmd)
 
     def test_the_forced_mode_is_still_available_behind_the_flag(self):
+        # OMNI_PANEL is named rather than left to the default on purpose:
+        # gaming's default panel is HOST-AWARE now (panel_for -> host_panel
+        # grows it toward PERF_PANEL_CEIL when the screen can show it), so a
+        # bare default would make this assertion depend on the monitor of
+        # whoever runs the suite. What is under test is that the flag emits a
+        # `video=` arg carrying the panel, not what the panel happens to be.
         cmd = _cmd("gaming", NO_CAP, base="x86",
-                   env={"OMNI_FORCE_VIDEO_MODE": "1"})
+                   env={"OMNI_FORCE_VIDEO_MODE": "1",
+                        "OMNI_PANEL": "1280x800"})
         self.assertIn("video=Virtual-1:1280x800", cmd)
 
     def test_an_explicit_panel_reaches_the_kernel_arg_when_forced(self):

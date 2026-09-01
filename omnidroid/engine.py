@@ -9634,6 +9634,78 @@ def apply_gaming_tuning(acct, mode=None, label=None):
         else:
             print(f"[{label}] gaming tune-up: applied WITHOUT root - skipped "
                   + ", ".join(gaming.root_only_steps()))
+        report_guest_renderer(acct, label)
+
+
+# The renderer string SurfaceFlinger reports once the guest is up, and one
+# line of prose about it.
+#
+# ⚠ THIS IS THE CHECK THAT WAS MISSING, and its absence is the most likely
+# reason this product was reported as "slow on a high-tier computer".
+# `--gpu auto` decides what to ASK for from the host's QEMU capabilities --
+# does this binary have virglrenderer, will this host give a GL context -- and
+# then nothing ever confirmed that the guest ACTUALLY came up on the GPU. When
+# it does not, the failure is completely silent: QEMU starts, the window
+# appears, the game runs, and every frame is rasterised on the CPU by
+# llvmpipe. The difference is not subtle -- measured at 1280x800 on the same
+# account and place:
+#
+#     software (llvmpipe)     95 frames / 30.1 s  ->   3.2 fps
+#     GPU (virgl)                                 ->  16.5-58 fps
+#
+# ...and three quarters of a software instance's whole guest CPU is llvmpipe
+# threads rasterising frames (52.8% + 51.8% of 141.1%). So a user on the
+# software path is not "a bit slower", they are on a different product, and
+# they have no way to find out. Now they are told, in the launch they are
+# already reading, with the two things that actually fix it.
+_GLES_LINE = "dumpsys SurfaceFlinger | grep -m1 'GLES:'"
+
+
+def guest_renderer(acct):
+    """(renderer_string, is_software) for a booted guest, or (None, None).
+
+    None means "could not ask" -- an adb that is not answering yet, a base
+    whose SurfaceFlinger dump is shaped differently -- and is deliberately
+    NOT reported as software: telling somebody with a working GPU that they
+    have none is worse than saying nothing.
+    """
+    r = adb_soft(acct, "shell", _GLES_LINE, timeout=20)
+    out = ((getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")).strip()
+    if "GLES:" not in out:
+        return None, None
+    # First LINE only. `grep -m1` closes the pipe on its match, which makes
+    # dumpsys print "Failed to write while dumping service SurfaceFlinger:
+    # Broken pipe" on stderr -- harmless, and it was landing in the middle of
+    # the renderer line in the launch log.
+    text = out.split("GLES:", 1)[1].splitlines()[0].strip()
+    return text, ("llvmpipe" in text.lower() or "softpipe" in text.lower())
+
+
+def report_guest_renderer(acct, label):
+    """Say which renderer the guest actually got. Never raises."""
+    if not label:
+        return
+    try:
+        text, software = guest_renderer(acct)
+        if text is None:
+            return
+        if not software:
+            print(f"[{label}] renderer: {text}  (GPU-accelerated)")
+            return
+        print(f"[{label}] WARNING: renderer: {text}")
+        print(f"[{label}] WARNING: THIS GUEST IS RENDERING ON THE CPU. Measured, "
+              f"that is ~3 fps against 16-58 on a GPU — it is the single "
+              f"biggest thing that makes an instance feel slow, and it is "
+              f"not a setting inside the game. Two things fix it:")
+        print(f"[{label}]     1. If this PC has more than one graphics "
+              f"adapter, set QEMU to 'High performance' in Windows Settings "
+              f"> Display > Graphics (the launcher tries to do this for you; "
+              f"a preference you set by hand is never overwritten).")
+        print(f"[{label}]     2. Update the graphics driver. QEMU reaches "
+              f"the GPU through OpenGL/ANGLE, and a stale or Basic-Display "
+              f"driver has no GL for it to use.")
+    except Exception:                       # noqa: BLE001 - diagnostics only
+        pass
 
 
 # What a performance mode falls back to when this boot turned out to have no
@@ -11011,7 +11083,26 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
             if gone:
                 print(f"[{label}] scratch: reclaimed {freed_mb} MB from "
                       f"{gone} leaked guest overlay(s)")
-            room, free_mb, need_mb = scratch_room(cfg)
+            # THE RAM FILE COUNTS TOO, and it changes what "not enough disk"
+            # costs. With guest RAM in a sparse file (ram_file_env), a volume
+            # that fills means a RUNNING guest's next page fault cannot be
+            # satisfied — STATUS_IN_PAGE_ERROR against a mapped view, no
+            # clean error path — so the instance that dies is an arbitrary
+            # already-farming neighbour rather than this launch. That is the
+            # one case where admitting a launch is worse than refusing it.
+            ram_mb = ram_file_reserve_mb(mode, cfg)
+            room, free_mb, need_mb = scratch_room(
+                cfg, want_mb=SCRATCH_PER_INSTANCE_MB + ram_mb)
+            if not room and ram_mb:
+                fail("scratch_full",
+                     f"only {free_mb} MB free on the scratch volume and this "
+                     f"instance needs ~{need_mb} MB (a {ram_mb} MB guest-RAM "
+                     f"file plus its disk overlay and reserve). Refusing "
+                     f"rather than warning: this instance's memory lives on "
+                     f"that volume, so filling it kills whichever instance "
+                     f"faults next, not this one. Free some space, or point "
+                     f"config qemu.scratch_dir / OMNI_SCRATCH_DIR at a "
+                     f"roomier volume ({scratch_dir(cfg)}).")
             if not room:
                 print(f"[{label}] WARNING: only {free_mb} MB free on the "
                       f"scratch volume and this instance wants ~{need_mb} MB. "
@@ -13080,7 +13171,32 @@ def build_parser():
     return p
 
 
+def _harden_console_encoding():
+    """A character the console cannot draw must not delete the message.
+
+    Windows hands Python a locale console codepage -- cp1252 here, cp1254 on
+    a Turkish install -- and `print` of anything outside it raises
+    UnicodeEncodeError. That is not a cosmetic failure: the raise happens
+    INSIDE whatever was printing, so a `try/except` one frame up (and every
+    diagnostic in this file is wrapped in one, because a diagnostic may never
+    cost a boot) swallows the whole warning. Caught exactly that way while
+    writing report_guest_renderer: a single U+26A0 turned "this guest is
+    rendering on the CPU" into silence, which is the precise failure that
+    warning exists to end.
+
+    `errors="replace"` degrades the glyph to `?` and keeps the sentence.
+    Never raises; a stream that cannot be reconfigured (a pipe, a frozen
+    build's redirected stdout) is left exactly as it was.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:                   # noqa: BLE001 - best effort only
+            pass
+
+
 def main():
+    _harden_console_encoding()
     p = build_parser()
     args = p.parse_args()
     if getattr(args, "json", False):
