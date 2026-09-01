@@ -6,6 +6,156 @@
 All notable base-image and manager changes. Bases are immutable and
 versioned; each new base is flattened self-contained (no backing file).
 
+## 2026-09-01 — the speed pass, and the number that was never measured
+
+Reported as "OmniDroid is SO SLOW on their machines, even high-tier
+computers", with a hypothesis attached: that the ARM-to-x86 translator is the
+cause. **The translator was measured for the first time today and it is not.**
+Everything else here is what the measurements actually found.
+
+**NOTHING IN THE BASE IMAGE CHANGED.** Every improvement below is host-side —
+QEMU arguments, a registry key, engine policy. The shipped `base_x86.qcow2`
+and its offsets are byte-for-byte what they were, so no image has to be
+re-uploaded.
+
+### 1. The translator costs 1.0–1.5x, not 3x
+
+"The guest is CPU-bound on arm64 translation and no flag removes it" has been
+the standing explanation for every unexplained slowness in this project, in
+four places in `MODES.md`, and it had **never been measured** — because
+measuring it needs the same work compiled for both architectures and there is
+no NDK on the Windows box.
+
+`tools/bench/mkbench.py` emits four static ELFs byte by byte — two aarch64,
+two x86-64 — with no libc, no linker and nothing between the instructions and
+the CPU. Run in-guest through the base's own binfmt handler, 200M iterations,
+process startup subtracted:
+
+| workload | x86-64 native | arm64 translated | tax |
+|---|---|---|---|
+| integer dependency chain | 221 ms | 251 ms | **1.14x** |
+| SIMD (`fmul`/`fadd`, 2x double) | 476 ms | 466 ms | **0.98x** |
+| indirect call through a register | 173 ms | 266 ms | **1.54x** |
+
+ndk_translation 0.2.3 runs vector code at native speed. Swapping it for
+Berberis or Houdini is a base transplant with a version-matching hazard
+(`/system/lib64/arm64/` is a full set of arm64 builds of *this Android's*
+system libraries) against a measured ceiling of ~14–35%. Not where the win
+is. Full method, traps and the Berberis question in `MODES.md`.
+
+Worth having on its own: that x86-64 figure is 200M iterations of a 5-cycle
+chain in 221 ms — an effective **4.3 GHz**. WHPX runs guest x86 at the host's
+real clock.
+
+### 2. Gaming was starved at 4 vCPUs, and capped at 1280x800 for no reason
+
+Both numbers came from readings that moved two variables at once.
+
+**`WHPX_SMP_CEIL` 4 → 8.** The 2026-07 reading went from 4096 MB/4 vCPU to
+8192 MB/8 in one step, measured 0.9 min against 5.9 min, and blamed the vCPUs.
+Held at 4096 MB, `--smp 8` boots in **34.6 s against smp 4's 33.6 s**. And the
+guest wanted them: sampled per-process on a live in-world PS99 session at
+smp 4, `com.roblox.client` alone was using **297% of a core out of 400%**,
+with SurfaceFlinger at 1.8%. In-guest parallel throughput: 8 vCPUs give ~5x
+one vCPU where 4 give ~3.1x. The MEMORY half of that old reading stands and is
+still capped at 4096.
+
+**The panel is host-aware, up to 1920x1080.** "Above the base's native
+1280x800 it does not work" was one stalled boot in 2026-08. Re-measured:
+`--panel 1080p` and `--panel 1440p` both come up at exactly what they were
+asked for (`wm size` read back `1920x1080` / `2560x1440`), boot 35.6 s against
+800p's 33.6 s. There is **no `video=` on the base's kernel command line** and
+the DRM connector already advertises 1920x1440 and 3840x2160 — the panel was
+only ever `xres`/`yres` on the virtio-gpu device. `--panel 800p` remains how
+you buy frames back; density is never grown.
+
+**`kernel-irqchip` was also never measured** — `whpx,kernel-irqchip=off` has
+been hardcoded since PLAN.md, copied from a recipe, and QEMU's WHPX backend
+does support the in-hypervisor X2APIC. Measured both ways at smp 8: inside the
+noise. Left alone, but recorded so nobody spends another session on it.
+
+### 3. Input is virtio-first
+
+`usb-hid` advertises a 10 ms interrupt interval, so every click waited for a
+poll window. 40 events sent 4 ms apart and timed on the guest's own
+`/dev/input` node: worst-case delivery **9.53 ms → 6.20 ms**, and the polling
+quantisation is gone. The USB pair stays attached BEHIND the virtio devices,
+so if `virtio_input` ever fails to bind the worst case is the old behaviour
+rather than an instance nobody can click on. The base already carries
+`virtio_input.ko` and autoloads it.
+
+### 4. Farming: guest RAM is a file, and commit stops being the wall
+
+The shipped QEMU has carried `0007-omni-win32-ram-file` and
+`0008-omni-win32-punch-hole` for two weeks and **nothing ever set
+`QEMU_RAM_FILE_DIR`** (plan E, tasks 6 and 7, written and never executed).
+Now density does. Measured on a live in-world PS99 farming instance, `-m 3072`:
+
+| | |
+|---|---|
+| marginal system commit | **+1071 MB** (was +4065) |
+| QEMU private bytes | 979–1003 MB |
+| the RAM file | 3072 MB logical, **0 MB allocated** |
+
+`doctor`'s commit rung goes **5 → 17 instances**; the binding wall moves to
+disk. `scratch_room` budgets the RAM file at its worst case (`-m`) and now
+**refuses** rather than warns, because running that volume out no longer fails
+the launch — a mapped view that cannot fault in is `STATUS_IN_PAGE_ERROR` and
+it kills whichever already-farming guest touches a cold page next.
+
+`free-page-reporting=on` returns to Windows by the same gate:
+`qemu_supports_punch_hole()`, read off the binary's own `--version` suffix.
+It was dropped because the SHIPPED QEMU logged 925 failed discards a minute;
+that was a property of the build, not of Windows.
+
+### 5. Boot: the app warms the pool by itself now
+
+The warm pool has worked since 2026-08-15 and **nothing in the executor ever
+started one** — `startPool` was exposed on the engine hook and no component
+called it. So every launch cold-booted, which is the "it takes too long to
+start" complaint exactly. A launch now records what it used and the heartbeat
+warms one slot for it. Re-verified end to end: **`boot` 0.078 s, whole launch
+1.66 s**, against 33–39 s cold.
+
+Three gates, each a cost it must not impose on somebody who did not ask: the
+engine must advertise `pool`, the user must not have turned it off, and the
+host must still have 3 GB of RAM free with the slot counted — a pool that
+pushes the machine into its pagefile makes the instance being PLAYED slower to
+make the next launch faster.
+
+### 6. Two silent failures that could BE the reported slowness
+
+Neither is measurable from here, and both are the shape of "fast machine, slow
+product".
+
+**Windows was giving QEMU the wrong graphics card.** The per-application GPU
+preference defaults to the power-saving adapter for an unknown executable, and
+QEMU is unknown on every machine this installs onto. `omnidroid/hostgpu.py`
+writes `GpuPreference=2` under `HKCU` before spawn — the same key Settings
+writes — and never overwrites a preference the user set by hand.
+
+**Nothing ever checked that the guest reached the GPU.** `--gpu auto` decides
+what to ASK for; when virgl does not take, QEMU starts, the window appears,
+the game runs, and every frame is rasterised by llvmpipe at ~3 fps, silently.
+`report_guest_renderer()` reads SurfaceFlinger's `GLES:` line and says so.
+
+...and writing that warning found a third: one `U+26A0` raised
+`UnicodeEncodeError` on a cp1252 console *inside* the `print`, and the
+`try/except` that keeps a diagnostic from costing a boot swallowed the whole
+warning. `_harden_console_encoding()` now reconfigures stdout/stderr with
+`errors="replace"`.
+
+### What was NOT done, and why
+
+* **The translator was not swapped.** Measured at 1.0–1.5x; the android-36
+  emulator images with Berberis are on this disk if it is ever wanted, but
+  `/system/lib64/arm64/` has to match the framework version and the base is
+  Android 13.
+* **No base image changed**, so nothing needs re-uploading.
+* PS99 fps is not a usable A/B metric on this stack — two 30 s samples of the
+  same instance minutes apart read 56.8 and 34.8 fps. Recorded in `MODES.md`
+  so the next session does not try.
+
 ## 2026-08-21 — a slow PC is not a broken PC
 
 Three defects, one shape: **a number measured on this dev box was being enforced

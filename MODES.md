@@ -17,14 +17,14 @@ the engine branches on:
 | what matters | frames, resolution, input latency | RAM and CPU per instance |
 | what does not | density, host footprint | speed, quality, anything visual |
 | instances per host | 1–2 | many (see the footprint note below) |
-| host window | hidden through boot; `omnidroid view` restyles QEMU's own window in place and adds our bar (see **The GPU**) | never |
+| host window | on screen from spawn; QEMU's own window, restyled in place (see **The GPU**) | never |
 | guest MTU | matched to the host's egress (see **Farming**) — both modes | same |
-| guest panel | 1280x800 (`--panel` overrides) | 640x480, `wm size` 480x270 |
+| guest panel | **1920x1080 where the host's screen can show it**, else 1280x800 (`--panel` overrides) | 640x480, `wm size` 480x270 |
 | engine tick | 240 fps target | 5 fps cap |
 | render quality | `high` — real textures, lighting, post-FX | lowest everything |
 | balloon (post-boot reclaim) | none | 896 MB (with zram) / 1536 (without) — **skipped entirely on a host that cannot return the pages; see Farming** |
 | memory governor | boot cap 1536 MB, floor 1024, headroom 512 | boot cap 1024 MB, floor 896, headroom 384 |
-| vCPU / RAM | **sized to the host**, capped 4 GB / 4 vCPU on WHPX | 2048 MB, 1 vCPU (2 on x86) |
+| vCPU / RAM | **sized to the host**, capped 4 GB / **8 vCPU** on WHPX | 2048 MB, 1 vCPU (3 on x86) |
 | zram | off | on (baked into the base) |
 | scheduler | game on the `top-app` cpuset | game on `background` |
 | GPU policy | `auto` | `headless` |
@@ -54,9 +54,67 @@ mem  = clamp(min(host_ram/2, host_ram - 6 GB), 4096 MB, 8192 MB)   # 512 MB step
 smp  = clamp(host_cores - 2, 4, 8)
 ```
 
-...then capped at **4096 MB / 4 vCPU on WHPX**, because on Windows the
-autoscaled 8192/8 booted 6.5x SLOWER than 4096/4 on the same image (0.9 min vs
-5.9 min). KVM and HVF keep the larger ceilings.
+...then capped at **4096 MB on WHPX**. KVM and HVF keep the larger memory
+ceiling.
+
+### CORRECTION, 2026-09-01: the vCPU cap was 4 and it should never have been
+
+The 2026-07 reading behind "4096/4 or else" moved **memory and vCPUs in one
+step** — 4096 MB/4 vCPU against 8192 MB/8 vCPU — measured 0.9 min against
+5.9 min, and attributed all of it to the vCPUs. Re-measured with memory held
+constant at 4096 MB:
+
+| | boot to bootcomplete |
+|---|---|
+| `--smp 4` | 33.6 s |
+| `--smp 8` | 34.6 s |
+| `--smp 8 --panel 1080p` | 35.6 s |
+| `--smp 8 --panel 1440p` | 35.6 s |
+
+**There is no 6.5x.** There is no penalty worth the name. Whatever the 2026-07
+run measured, it was not the vCPU count — the obvious suspect is the 8192 MB
+half, on a host where commit charge tracks `-m` at 1:1.
+
+**And the guest was starved at 4.** Sampled per-process out of `/proc/*/stat`
+on a live in-world PS99 session at `--smp 4`:
+
+```
+297.3%  com.roblox.client        <- of the 400% a 4-vCPU guest has
+  1.8%  surfaceflinger
+  0.9%  composer@2.4
+        everything else under 1%
+```
+
+Roblox alone was using three of the four vCPUs. SurfaceFlinger — the whole
+render path — was 1.8%.
+
+**What 8 buys.** Measured with a hand-assembled static x86-64 dependency-chain
+loop (`tools/bench/`, see "The translator is not the wall" below) run 1..8 ways
+in parallel inside the guest, wall clock:
+
+| parallel copies | 1 | 2 | 4 | 6 | 8 |
+|---|---|---|---|---|---|
+| ms | 223 | 282 | 405 | 420 | 342–506 |
+
+8 vCPUs deliver **~5x** one vCPU's throughput where 4 deliver **~3.1x**. WHPX
+does not scale linearly and never has; "sublinear" is not "negative", and 4 was
+leaving the rest on the floor. `WHPX_SMP_CEIL` is 8. `PERF_SMP_HOST_RESERVE`
+still applies underneath it, so a 6-core host gets 4, not 8.
+
+**`kernel-irqchip` makes no difference and was also never measured.**
+`default_accel()` has returned `whpx,kernel-irqchip=off` since PLAN.md, copied
+from a recipe. QEMU's WHPX backend does support the in-hypervisor X2APIC
+(`WHvX64LocalApicEmulationModeX2Apic`, `target/i386/whpx/whpx-all.c:3152`), and
+turning it on looked like the obvious fix for the poor SMP scaling. Measured at
+`--smp 8`, same image, same everything:
+
+| parallel copies | 1 | 2 | 4 | 6 | 8 |
+|---|---|---|---|---|---|
+| `kernel-irqchip=off` | 223 | 282 | 405 | 420 | 506 |
+| default (on) | 268 | 270 | 348 | 459 | 526 |
+
+Inside the noise. The guest logs `x2apic enabled` either way. **Left alone** —
+but do not spend a session on it again.
 
 "As much as it safely can" is the load-bearing half: a guest sized past the
 host's spare RAM makes the **host** swap, and a swapping host misses QEMU's
@@ -66,12 +124,242 @@ vCPU deadlines — slower than the smaller guest would have been. An explicit
 ### Resolution
 
 `--panel WxH` (or `720p`/`800p`/`1080p`/`1440p`), config `qemu.panel`, env
-`OMNI_PANEL`. Defaults to the mode's own.
+`OMNI_PANEL`. Gaming's default is now **host-aware**: `panel_for` grows the
+mode's declared panel toward `PERF_PANEL_CEIL` (1920x1080) when this machine's
+primary screen can show it with room for the window's own frame, and leaves it
+alone otherwise. Density is never grown — farming's 640x480 is the point of
+farming.
 
-Bigger costs frames, and not for the reason you would guess: the guest is
-**CPU-bound on arm64 translation, not fill-bound**. Measured on the x86 base,
-640x480 gave 19 fps against 14 at 1280x800 — a 4.2x pixel cut for 33% more
-frames. `libndk_translation` is the wall and no flag removes it.
+#### CORRECTION, 2026-09-01: the base was never capped at 1280x800
+
+The old text here said, in bold, that asking for more than 1280x800 "costs and
+buys nothing" — that `--panel 1080p` stalled a boot for 3.3+ minutes and the
+guest came up 1280x800 anyway. That was one boot in 2026-08 and it is **not
+true**. Re-measured on the current QEMU and the same base image, reading
+`wm size` back out of the guest:
+
+| | boot | `wm size` reported |
+|---|---|---|
+| `--panel 800p` | 33.6 s | `1280x800` |
+| `--panel 1080p` | 35.6 s | `1920x1080`, density 240 |
+| `--panel 1440p` | 35.6 s | `2560x1440`, density 240 |
+
+No stall, no fallback, exactly what was asked for. Two things inside the guest
+say why it was always going to work:
+
+* **there is no `video=` on the base's kernel command line.** The whole of it
+  is `stack_depot_disable=on cgroup_disable=pressure root=/dev/ram0 noexec=off
+  SRC=... DATA=vdb quiet loglevel=0 console=null vt.global_cursor_default=0
+  SETUPWIZARD=0`. Nothing pins a mode.
+* **the DRM connector already advertises the bigger modes.**
+  `/sys/class/drm/card0-Virtual-1/modes` reads `1280x800, 5120x2160, 4096x2160,
+  3840x2160, 1920x1440, 2560x1080, 1856x1392, 1792x1344, ...`
+
+The panel was only ever `xres`/`yres` on the virtio-gpu device, which is ours
+to set. **No base change is needed for high resolution.**
+
+Bigger does cost frames — it is real fill — so `--panel 800p` is the way to buy
+them back, and that is why the ceiling is 1080p rather than the largest mode
+the connector will take.
+
+---
+
+## Input latency: virtio, not USB
+
+*Measured 2026-09-01, host to guest, on the guest's own `/dev/input` node.*
+
+The guest was given `qemu-xhci` + `usb-kbd` + `usb-tablet` from the first
+commit in this repo and nobody ever asked what that costs. **A USB HID device
+is polled**: QEMU's `usb-hid` advertises a 10 ms interrupt endpoint interval,
+so every click and every mouse move waits for the next poll window.
+
+Method: 40 QMP `input-send-event` absolute-motion events, 4 ms apart, timed by
+the guest's own `getevent -t` on the device that received them.
+
+| | p50 | p90 | **max** | lost |
+|---|---|---|---|---|
+| `usb-tablet` | 3.84 ms | 5.31 ms | **9.53 ms** | 0 |
+| `virtio-tablet-pci` | 4.01 ms | 6.02 ms | **6.20 ms** | 0 |
+
+The medians are the same — at a 4 ms send rate the poll window averages out —
+and **the tail is where it shows**: USB's worst case is the 10 ms polling
+ceiling, virtio's is not. Jitter, not mean latency, is what "input lag" feels
+like, so this is worth having; it is also a smaller win than it sounds and is
+recorded as such.
+
+`virtio-keyboard-pci` + `virtio-tablet-pci` are named FIRST on the command
+line and **the USB pair stays attached behind them**. That ordering is the
+whole safety story: `qemu_input_find_handler` (`ui/input.c`) walks its handler
+list and takes the first whose mask covers the event, and handlers register in
+command-line order. So if `virtio_input` ever fails to bind in some future
+guest, the USB mouse and keyboard behind it are still real, enumerated and
+working — the worst case of the faster device is the old behaviour, not an
+instance nobody can click on (which `MODES["farming"]`'s `usb` note already
+records the cost of).
+
+Verified on hardware, not reasoned: with both attached, `input-send-event` at
+x=5000/25000/12000 landed on `QEMU Virtio Tablet` (`/dev/input/event6`) with
+those exact values and **nothing** reached the USB tablet.
+
+The base carries the driver — `CONFIG_VIRTIO_INPUT=m`, `virtio_input.ko` under
+`/system/lib/modules/6.1.112-gloria-xanmod1/` — and autoloads it when the
+device appears, the same way it already does for `virtio_gpu` and `virtio_net`.
+**No base change was needed.** `OMNI_INPUT=usb` / config `qemu.input` is the
+way back.
+
+---
+
+## Which graphics card the HOST gives QEMU
+
+*The most likely answer to "it is slow on a high-tier computer".*
+
+Everything this project measured about the GPU — 3.2 fps in software against
+16.5–58 with virgl — assumed that once QEMU has a GL context, the context is on
+the good adapter. On a desktop with one card that is true. **On a laptop it is
+not**, and a laptop is what most of the people this ships to are using.
+
+Windows decides which adapter an application gets from a per-application **GPU
+preference**, and the default for an unknown executable is "let Windows
+decide", which in practice is the **power-saving** adapter. QEMU is an unknown
+executable on every machine this installs onto: it is downloaded into
+`%LOCALAPPDATA%`, it is on no vendor's optimisation list, and it renders
+through ANGLE/WGL rather than through anything a driver profile recognises as
+a game. So the guest gets composited on an iGPU while the discrete card sits
+idle — and a "high-tier computer" is precisely the machine where the gap
+between its two GPUs is widest.
+
+`omnidroid/hostgpu.py` writes the same key the Settings app writes, under the
+current user, before QEMU starts (the preference is read when the adapter is
+enumerated):
+
+    HKCU\Software\Microsoft\DirectX\UserGpuPreferences
+        "<full path to qemu-system-x86_64.exe>" = "GpuPreference=2;"
+
+**A preference the user set by hand is never overwritten** — the one
+legitimate reason to pin QEMU to the integrated adapter is a laptop on battery
+or a broken discrete driver, and someone who has been into
+*Settings > Display > Graphics* has made that choice about this exact
+executable. `OMNI_NO_GPU_PREF=1` turns the whole thing off.
+
+### ...and the check that was missing entirely
+
+`--gpu auto` decides what to ASK the host for. **Nothing ever confirmed the
+guest actually came up on the GPU**, and when it does not the failure is
+completely silent: QEMU starts, the window appears, the game runs, and every
+frame is rasterised by llvmpipe. A user on that path is not "a bit slower",
+they are on a different product, and they had no way to find out.
+
+`report_guest_renderer()` reads SurfaceFlinger's own `GLES:` line after the
+tuning step and says which renderer the guest got:
+
+    [start acct] renderer: Mesa, virgl (NVIDIA GeForce RTX 4060/PCIe/SSE2),
+                 OpenGL ES 3.2 Mesa 24.0.8  (GPU-accelerated)
+
+...or, on the software path, a loud warning naming the two things that fix it.
+"Could not ask" is reported as nothing at all, never as software: telling
+somebody with a working GPU that they have none is worse than silence.
+
+⚠ **Writing that warning is how `_harden_console_encoding()` got written.** One
+`U+26A0` raised `UnicodeEncodeError` on a cp1252 console *inside* the `print`,
+and the `try/except` that keeps a diagnostic from ever costing a boot swallowed
+the entire warning. The message that exists to end a silent failure failed
+silently. `main()` reconfigures stdout/stderr with `errors="replace"` now.
+
+---
+
+## The translator is not the wall
+
+*Measured 2026-09-01 on the x86 base, inside a live guest.*
+
+Every performance note in this file that could not explain itself has reached
+for `libndk_translation`, and the belief hardened into "the guest is CPU-bound
+on arm64 translation and no flag removes it". **It was never measured**, and it
+is mostly wrong.
+
+### What the base actually ships
+
+```
+ro.dalvik.vm.native.bridge   libndk_translation.so
+ro.ndk_translation.version   0.2.3
+ro.dalvik.vm.isa.arm64       x86_64
+/system/lib64/libndk_translation.so          2.5 MB, 2024-10-12
+/system/lib64/arm64/                         the guest-side arm64 system libs
+/system/etc/binfmt_misc/{arm,arm64}_{exe,dyn}
+```
+
+Google's ndk_translation, not Intel's Houdini.
+
+### How it was measured
+
+There is no arm64 benchmark on this machine and no NDK to build one, so the
+benchmark is four hand-assembled **static ELFs** — two aarch64, two x86-64 —
+emitted byte by byte from Python (`tools/bench/mkbench.py`): a 200,000,000-
+iteration loop over a register dependency chain, then `exit(0)`. No libc, no
+linker, no allocator, nothing but the instructions under test. The arm64 pair
+runs through the native bridge's own program runner
+(`/system/bin/ndk_translation_program_runner_binfmt_misc_arm64`), which needs
+`binfmt_misc` mounted and the base's own handler registered:
+
+```
+mount -t binfmt_misc none /proc/sys/fs/binfmt_misc
+cat /system/etc/binfmt_misc/arm64_exe > /proc/sys/fs/binfmt_misc/register
+```
+
+⚠ The runner rejects a hand-made ELF with `has invalid e_shstrndx` unless it
+carries a real section-header table — a NULL section, `.text` and `.shstrtab`
+with `e_shstrndx` pointing at the last. A program header alone is not enough.
+
+Each figure below is the loop's wall time **minus** the same binary built with
+a single iteration, so the native bridge's ~70 ms of process startup is out of
+the number.
+
+### The result
+
+| workload | x86-64 native | arm64 translated | tax |
+|---|---|---|---|
+| integer chain (`mul`/`add`/`eor`) | 221 ms | 251 ms | **1.14x** |
+| SIMD chain (`fmul`/`fadd` on 2x double) | 476 ms | 466 ms | **0.98x** |
+| indirect call through a register | 173 ms | 266 ms | **1.54x** |
+
+**A translator that runs vector code at native speed and a dependency chain at
+1.14x is not a 3x tax on anything.** The one place it does lose is the indirect
+call — the classic weak spot of binary translation, since every `blr` has to
+resolve a translated target — and even that is 1.5x, not 10x.
+
+For scale, the x86-64 integer figure is 200M iterations of a 5-cycle chain in
+221 ms, i.e. an effective **4.3 GHz** — so the WHPX guest is also running x86
+code at the host's real clock, which is worth knowing on its own.
+
+### What this means for the "use a modern translator" question
+
+Swapping ndk_translation 0.2.3 for a newer translator — Google's **Berberis**
+(present in the android-36 emulator system images alongside ndk_translation) or
+Intel's **Houdini** — is a real option and the images are already on this disk,
+but it is a **base transplant with a version-matching hazard**, not a drop-in:
+`/system/lib64/arm64/` is a full set of arm64 builds of *this Android's* system
+libraries (libc, libandroid_runtime, ...), and they have to match the framework
+they call into. Android 13 base, Android 16 translator.
+
+Against a measured ceiling of ~14% on integer code and ~35% on indirect calls,
+that is not where the next win is. **The measured wins were elsewhere** — the
+vCPU ceiling (starved at 4 of 4), the panel (capped for no reason), the host
+GPU preference, and, for farming, the commit charge. Revisit the translator
+when something measures it as the binding constraint.
+
+### And a caution about measuring Roblox at all
+
+PS99 fps readings on this stack are close to useless for A/B. Two 30-second
+samples of the same instance, same account, same place, minutes apart:
+
+```
+1710 frames / 30.1 s = 56.8 fps     guest 138% of 400%
+1047 frames / 30.1 s = 34.8 fps     guest 220% of 400%
+```
+
+It is a busy server-authoritative place, the autoexec script puts a full-screen
+GUI up, and how much is streaming in when the sample is taken moves the number
+further than any change in this repo does. `--timestats` after confirming the
+client is in-world is still the right method; **one run of it is not a result**.
 
 ---
 
@@ -322,6 +610,45 @@ Two things that had to be true first, and neither is a knob in this table:
 
 And one number that is a property of the GAME rather than of this mode:
 **PS99 needs `--mem 3072`.** At the mode's own 2048 the client is OOM-killed.
+
+### CORRECTION, 2026-09-01: guest RAM is a FILE now, and commit stops mattering
+
+Everything below this line about Windows is still true of a **stock** QEMU and
+is no longer true of the one the product ships. The binary carries
+`qemu-patches/0007-omni-win32-ram-file` and `0008-omni-win32-punch-hole`, and
+as of today the engine actually turns them on: `ram_file_env()` sets
+`QEMU_RAM_FILE_DIR` for the density profile, so every guest RAM block comes
+from a **mapped sparse file in the scratch** instead of from private,
+committed memory.
+
+MEASURED on a live in-world PS99 farming instance, `-m 3072`, `-accel whpx`:
+
+| | |
+|---|---|
+| system commit with no instances | 30787 MB |
+| ...with one farming instance | 31858 MB — **+1071 MB** |
+| the same, before the patch (2026-08-17) | **+4065 MB** |
+| QEMU private bytes | 979–1003 MB |
+| the RAM file | 3072 MB logical, **0 MB allocated** (`fsutil file queryallocatedranges`) |
+
+`doctor`'s commit rung goes from **5 instances to 17**, and the binding wall on
+this box moves to **disk**. The whole `-m` term moved from commit to the
+scratch volume, so `scratch_room` budgets it too — at the WORST case (`-m`),
+and it **refuses** a launch rather than warning, because running that volume
+out no longer fails the launch: a mapped view that cannot fault in is
+`STATUS_IN_PAGE_ERROR`, and it kills whichever already-farming guest touches a
+cold page next.
+
+`free-page-reporting=on` is back on Windows for the same reason and by the same
+gate — `qemu_supports_punch_hole()`, the binary's own `--version` suffix, not
+the platform. It was dropped because the SHIPPED QEMU logged 925 failed
+discards a minute and reclaimed nothing; that was a property of the build.
+
+The three levers now stack: the working-set ceiling holds host RSS at ~384 MB,
+the job-object cap holds CPU at 50% of a core, and the RAM file takes `-m` off
+the commit limit.
+
+---
 
 The stated target is ~400 MB per instance. **On Windows that is not reachable,
 and the reason is the host side rather than the guest.** Measured on PS99,
@@ -624,6 +951,18 @@ game), `pin_game_to_top_app` moves it onto the `top-app` cpuset.
 
 ### The warm POOL — the fast path that does work on Windows
 
+**As of 2026-09-01 the app warms it by itself.** The pool has worked since
+2026-08-15 and nothing in the executor ever started one: `startPool` was
+exposed on the engine hook and no component called it, so every launch
+cold-booted — which is the "it takes too long to start" complaint, exactly.
+`Api._autowarm_after_launch` records what the launch just used and the
+HEARTBEAT warms one slot for it, gated on the engine advertising `pool`, on
+the user not having turned it off (`pool_set_auto_warm`), and on the host
+still having 3 GB of RAM free with the slot counted — a pool that pushes the
+machine into its pagefile makes the instance being PLAYED slower to make the
+next launch faster. Re-verified end to end today: `boot` 0.078 s, whole launch
+1.66 s, against 33-39 s cold.
+
 ```
 omnidroid pool start --size 2 --mode gaming     # keep 2 warm, in the background
 omnidroid pool fill  --size 1 --mode gaming     # boot them now, in this process
@@ -845,7 +1184,9 @@ repeatedly and is fine.
 3 fps (19-27%) is indistinguishable from idle at 5 fps (24-35%) — if anything
 it is worse, which is noise. That is consistent with what the resolution
 section already says: **the guest is CPU-bound on arm64 translation, not
-fill-bound.** Roblox running through `libndk_translation` is where the 150%
+fill-bound.** (That reading is corrected twice over — once immediately below,
+and once by measurement in "The translator is not the wall", where the
+translator's tax is 1.0-1.5x rather than the wall it is called here.) Roblox running through `libndk_translation` is where the 150%
 goes, and no render setting reaches it.
 
 So `minimal` is a profile whose only measured effects are "no saving" and
@@ -864,7 +1205,9 @@ settings.
 
 Two sections above say the guest is "CPU-bound on arm64 translation, not
 fill-bound". **That is wrong**, and it was inference from two null results
-rather than a measurement. Attributing the CPU per thread settles it:
+rather than a measurement. (Wrong twice, in fact: this section shows the CPU
+was llvmpipe rather than the translator, and "The translator is not the wall"
+later measured the translator itself at 1.0-1.5x.) Attributing the CPU per thread settles it:
 
 | software (`--gpu headless`) | | GPU (hidden GL window) | |
 |---|---|---|---|
