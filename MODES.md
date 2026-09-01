@@ -101,6 +101,23 @@ does not scale linearly and never has; "sublinear" is not "negative", and 4 was
 leaving the rest on the floor. `WHPX_SMP_CEIL` is 8. `PERF_SMP_HOST_RESERVE`
 still applies underneath it, so a 6-core host gets 4, not 8.
 
+**QEMU's process priority makes no reliable difference either, and this is
+how nearly-shipping a placebo looked.** A 13th-gen host has P-cores and
+E-cores, and vCPU threads landing on E-cores is a plausible explanation for
+sublinear scaling. First measurement at `--smp 8`, in-guest parallel loop:
+
+| parallel copies | 1 | 2 | 4 | 6 | 8 |
+|---|---|---|---|---|---|
+| Normal (first reading) | 321 | 328 | 353 | 521 | **576** |
+| High | 334 | 279 | 298 | 377 | **451** |
+| AboveNormal | 263 | 273 | 297 | 376 | **416** |
+| **Normal again (control)** | 284 | 265 | 271 | 349 | **426** |
+
+That last row is the whole result: repeated, Normal is indistinguishable from
+AboveNormal and High. **The 576 was the outlier**, not the 451 — the host had
+other work on it. Priority is NOT changed. One A/B pair on a machine you are
+also working on is not a measurement.
+
 **`kernel-irqchip` makes no difference and was also never measured.**
 `default_accel()` has returned `whpx,kernel-irqchip=off` since PLAN.md, copied
 from a recipe. QEMU's WHPX backend does support the in-hypervisor X2APIC
@@ -161,6 +178,49 @@ to set. **No base change is needed for high resolution.**
 Bigger does cost frames — it is real fill — so `--panel 800p` is the way to buy
 them back, and that is why the ceiling is 1080p rather than the largest mode
 the connector will take.
+
+#### And 1080p turned out to be FREE — measured properly, with the GUI out of the way
+
+*2026-09-01, PS99, in-world, `--smp 8`, GPU, two 30 s `--timestats` samples each.*
+
+⚠ **The autoexec script has to come out first, and this is the trap that
+invalidated three earlier readings.** `%LOCALAPPDATA%\OmniExec\autoexec\`
+carries `zaphub.lua`, which puts a full-screen opaque GUI over the game. With
+it up, SurfaceFlinger reports a clean 60 fps at 6% of the guest's CPU — a
+number that says nothing about this stack, because there is almost nothing
+being drawn. Every fps figure in this file has to state whether the world was
+actually visible; these were taken with `zaphub.lua` moved aside and confirmed
+by screenshot.
+
+| | frames / 30 s | fps | guest CPU (of 800%) |
+|---|---|---|---|
+| `--panel 800p` (1280x800) | 1407 / 1352 | 46.9 / 45.1 | 196% / 224% |
+| `--panel 1080p` (1920x1080) | 1404 / 1421 | **46.7 / 47.2** | 185% / **135%** |
+| 1080p + `blob=true,hostmem=1G` | 1349 / 1291 | 44.8 / 42.9 | 181% / 164% |
+
+**2.25x the pixels for the same frame rate, and less guest CPU.** At these
+sizes the guest is not fill-bound — the GPU absorbs the extra pixels and the
+client does the same work either way — so the old "bigger costs frames"
+warning does not apply between 800p and 1080p on a machine with a real GPU.
+That is what makes 1080p a safe default rather than a trade. `--panel 800p` is
+kept as the escape hatch for a host where it is NOT free (a weak iGPU), where
+the same table would look different.
+
+**`blob=true` is not a win and is NOT shipped.** Blob resources looked like the
+obvious next lever once the guest stopped being CPU-bound. Measured
+uncontrolled — with the ZapHub GUI up on the blob run and not on the control —
+it read as +33%, which is exactly the placebo this section exists to warn
+about. Controlled, it is 42.9-44.8 against 46.7-47.2: **slightly worse.**
+`gpu_extra_opts` (`OMNI_GPU_OPTS` / config `qemu.gpu_opts`) is still the hatch
+for trying it on another host.
+
+**Where the remaining frames actually go is now an open question, and it is
+not any of the usual suspects.** At 1080p the guest sits at 135-185% of the
+800% it has (5.5 cores idle), SurfaceFlinger costs ~2%, the translator is
+1.0-1.5x, and dropping to 800p changes nothing. So the ceiling is the host GL
+path or Roblox's own frame pacing, and neither has been instrumented.
+
+
 
 ---
 
@@ -356,10 +416,15 @@ samples of the same instance, same account, same place, minutes apart:
 1047 frames / 30.1 s = 34.8 fps     guest 220% of 400%
 ```
 
-It is a busy server-authoritative place, the autoexec script puts a full-screen
-GUI up, and how much is streaming in when the sample is taken moves the number
-further than any change in this repo does. `--timestats` after confirming the
-client is in-world is still the right method; **one run of it is not a result**.
+It is a busy server-authoritative place and how much is streaming in when the
+sample is taken moves the number further than any change in this repo does.
+
+**And the biggest single confounder is ours**: the executor's `autoexec/zaphub.lua` puts a full-screen opaque GUI over the game, and with it
+up SurfaceFlinger reports a flat 60 fps at ~6% of the guest's CPU no matter
+what the stack underneath is doing. Three readings in this session were that
+GUI. **Move the autoexec scripts aside before benchmarking and confirm the
+world is on screen with a screenshot** — `--timestats` on a client that is
+merely "in world" is not enough.
 
 ---
 

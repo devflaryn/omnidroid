@@ -7266,7 +7266,8 @@ def _spawn_builtin_viewer(name, host, port, title):
     d = runtime_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "viewer.log", "a")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
+              "env": _child_env()}
     if IS_WINDOWS:
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
     else:
@@ -7299,7 +7300,8 @@ def _spawn_window_bar(name, title, identity, pid):
     d = runtime_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "viewer.log", "a")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
+              "env": _child_env()}
     if IS_WINDOWS:
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
     else:
@@ -7348,7 +7350,8 @@ def _spawn_window_lock(name, identity, pid, aspect):
     d = runtime_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "viewer.log", "a")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
+              "env": _child_env()}
     if IS_WINDOWS:
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
     else:
@@ -8370,6 +8373,44 @@ def _autocap_state(name):
     return None, None
 
 
+def _child_env():
+    """Environment for a DETACHED self-invocation running from SOURCE.
+
+    ⚠ THIS IS WHY THE MEMORY GOVERNOR NEVER RAN FROM A REPO CHECKOUT, and the
+    failure was silent in the worst way: `maybe_start_governor` reported a pid
+    and printed "memory governor ON", the process started, and it died one
+    import in --
+
+        File "omnidroid/engine.py", line 36, in <module>
+          from omnidroid import autoexec
+        ModuleNotFoundError: No module named 'omnidroid'
+
+    ...into `governor.log`, which nothing reads. Every non-frozen spawn here is
+    `[sys.executable, <abs path to engine.py>, ...]`, and running a file
+    directly puts THAT FILE'S directory on sys.path -- so the child gets
+    `omnidroid/` and not the repo root that contains the `omnidroid` package.
+    A frozen build has the package baked in and an installed one has it on the
+    path, which is why this survived: it breaks only where the product is
+    developed and measured, and the symptom is "farming still uses all its
+    memory".
+
+    Caught 2026-09-01 by reading governor.log after a farming instance sat at
+    3431 MB of host working set with a governor pid that had been dead for
+    three minutes.
+
+    Returns None when there is nothing to fix (frozen), so callers pass it
+    straight through as `env=`.
+    """
+    if getattr(sys, "frozen", False):
+        return None
+    root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    if root not in existing.split(os.pathsep):
+        env["PYTHONPATH"] = (root + os.pathsep + existing) if existing else root
+    return env
+
+
 def _spawn_autocap(name, out_dir, package=None, max_keyframes=AUTOCAP_MAX_KEYFRAMES):
     """Detached self-invocation of `capture <name> --auto` (mirrors _spawn_view):
     the recorder outlives the start/resume process that launched it."""
@@ -8387,7 +8428,7 @@ def _spawn_autocap(name, out_dir, package=None, max_keyframes=AUTOCAP_MAX_KEYFRA
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     logf = open(Path(out_dir) / "autocap_engine.log", "ab")
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": logf,
-              "stderr": subprocess.STDOUT}
+              "stderr": subprocess.STDOUT, "env": _child_env()}
     if IS_WINDOWS:
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
     else:
@@ -10695,7 +10736,7 @@ def _spawn_governor(name):
                f"spawning) ---\n".encode())
     logf.flush()
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": logf,
-              "stderr": subprocess.STDOUT}
+              "stderr": subprocess.STDOUT, "env": _child_env()}
     if IS_WINDOWS:
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
     else:
@@ -11787,7 +11828,8 @@ def _spawn_pool_manager():
     d = config.runtime_root()
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "pool.log", "a")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log}
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
+              "env": _child_env()}
     if IS_WINDOWS:
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED|NEW_GRP
     else:
