@@ -84,6 +84,8 @@ def _pkgversion(series) -> str:
         tag += "+omni-ram-file"
     if "0008" in numbers:
         tag += "+omni-punch-hole"
+    if "0009" in numbers:
+        tag += "+omni-refresh"
     return tag
 
 

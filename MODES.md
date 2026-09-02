@@ -413,6 +413,90 @@ raise it.** Getting past it needs a display backend that is not GTK:
 * Anything else means patching how QEMU drives GTK, and the clock being
   hardcoded is inside GDK, not QEMU.
 
+### The fix is written and is NOT built yet: qemu-patches/0009
+
+`0009-omni-win32-refresh-rate.patch` makes
+`gd_update_monitor_refresh_rate()` ask **Windows** for the refresh rate
+(`MonitorFromWindow` -> `GetMonitorInfoW` -> `EnumDisplaySettingsW` ->
+`dmDisplayFrequency`) and take it when it beats GDK's answer, plus a
+`QEMU_UI_REFRESH_HZ` env override for measurement and for hosts that would
+rather spend the CPU elsewhere. `update_interval` is integer milliseconds, so
+144 Hz becomes 6 ms -> ~166 Hz of headroom, and 100/120 Hz are exactly
+reachable.
+
+It applies cleanly to the pinned tree (all nine patches do, verified) and
+`_pkgversion()` advertises it as `+omni-refresh`. **It has not been compiled**,
+so nothing above is a measured result yet — the frame-rate claim is a
+prediction from the timer arithmetic, and the honest test is a build.
+
+
+### Building QEMU on this box: three traps, all hit on 2026-09-02
+
+`tools/build_qemu.py` is correct and the patch series applies cleanly. The
+BUILD ENVIRONMENT is what stops it, and none of the three failures says what
+is actually wrong. Recorded here because each one costs an hour to rediscover.
+
+**1. There are two `git`s, and only one can apply these patches.**
+
+```
+Git for Windows   /mingw64/bin/git      2.52.0.windows.1   core.autocrlf true
+msys2             /usr/bin/git          2.55.0             core.autocrlf false
+```
+
+The worktree is checked out by Git for Windows, so every file on disk is
+CRLF. The patch files in `qemu-patches/` are LF. msys2's git, with
+`autocrlf=false`, compares them literally and every patch fails:
+
+```
+error: patch failed: ui/gtk.c:212
+error: ui/gtk.c: patch does not apply
+```
+
+...which `build_qemu.py` reports as *"neither applies cleanly nor is already
+applied — refusing to guess"*. That message is right and the tree is fine;
+the wrong `git` is first on PATH. **Putting `/c/msys64/usr/bin` ahead of
+Git-for-Windows breaks the patch stage.** It also breaks the idempotency
+check, so a half-built tree cannot be resumed either.
+
+**2. ...but the CONFIGURE stage needs the msys2 shell, for the opposite
+reason.** Git-for-Windows' `sh` hands msys2's `python3` a POSIX path, and
+msys2's python reads `/c/...` as a path relative to the current drive:
+
+```
+C:/msys64/mingw64/bin/python3.exe: can't open file
+  'C:/c/qemu-omni-v11.1.0/python/scripts/mkvenv.py'
+ERROR: python venv creation failed
+```
+
+So the two stages want opposite PATHs. Do the patch stage with
+Git-for-Windows' git and the configure/build stage in a real msys2 MINGW64
+environment.
+
+**3. `cc` and `TMP` both resolve somewhere useless.**
+
+* msys2's mingw64 ships `gcc.exe` but no `cc`; configure's default is `cc`,
+  and if any Git-for-Windows directory is on PATH it finds *Git's*
+  `/mingw64/bin/cc`, which is not a working compiler here. Pass `--cc=` /
+  `--cxx=` explicitly.
+* With a hand-built PATH that inherits no `TMP`, gcc falls back to
+  `C:\WINDOWS` and every probe dies:
+
+  ```
+  Cannot create temporary file in C:\WINDOWS\: Permission denied
+  ```
+
+  configure reports that as **"C compiler does not work"**, which sends you
+  looking at the compiler instead of at the environment. `TMP`/`TEMP` must be
+  set AND must be Windows-form (`C:\path`) — gcc.exe cannot read `/c/path`.
+
+**The shape of the answer** is a build run from an actual msys2 MINGW64 shell
+(`msys2_shell.cmd -mingw64 -defterm -no-start -c ...`) for configure/ninja,
+with the patch stage run separately under Git-for-Windows. Getting
+`msys2_shell.cmd -c` to run a script through `cmd //c` from Git Bash was not
+solved here — it silently ran nothing, which is worth knowing before trying
+the same wrapper again.
+
+
 Worth knowing before anyone spends a week on it: at 1080p in-world the guest
 is at **135-185% of the 800% it has** (5.5 cores idle), SurfaceFlinger is
 ~2%, the translator is 1.0-1.5x, and 800p renders at the same frame rate as

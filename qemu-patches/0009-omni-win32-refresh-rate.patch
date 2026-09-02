@@ -1,0 +1,89 @@
+diff --git a/ui/gtk.c b/ui/gtk.c
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -1045,6 +1045,53 @@
+ 
+ #endif
+ 
++
++#ifdef G_OS_WIN32
++/*
++ * omni: the REAL refresh rate of the monitor this window is on.
++ *
++ * GDK-Win32 answers 60 Hz for every monitor -- gdk_monitor_get_refresh_rate()
++ * returned 60000 mHz for a 144 Hz primary display, measured 2026-09-02 -- and
++ * gd_update_monitor_refresh_rate() turns that straight into
++ * dcl.update_interval, which is the timer deciding how often QEMU presents.
++ * So every guest on Windows was pinned near 60 fps whatever the monitor could
++ * do, and no QEMU option existed to say otherwise.
++ *
++ * Windows knows; ask it. EnumDisplaySettingsW on the device name of the
++ * monitor under the window gives dmDisplayFrequency in whole Hz.
++ */
++static int omni_win32_monitor_hz(GdkWindow *win)
++{
++    HWND hwnd;
++    HMONITOR mon;
++    MONITORINFOEXW mi;
++    DEVMODEW dm;
++
++    if (!win) {
++        return 0;
++    }
++    hwnd = (HWND) gdk_win32_window_get_handle(win);
++    if (!hwnd) {
++        return 0;
++    }
++    mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
++    if (!mon) {
++        return 0;
++    }
++    memset(&mi, 0, sizeof(mi));
++    mi.cbSize = sizeof(mi);
++    if (!GetMonitorInfoW(mon, (MONITORINFO *) &mi)) {
++        return 0;
++    }
++    memset(&dm, 0, sizeof(dm));
++    dm.dmSize = sizeof(dm);
++    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
++        return 0;
++    }
++    return (int) dm.dmDisplayFrequency;
++}
++#endif /* G_OS_WIN32 */
++
+ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget)
+ {
+ #ifdef GDK_VERSION_3_22
+@@ -1059,6 +1106,31 @@
+         refresh_rate = 0;
+     }
+ 
++#ifdef G_OS_WIN32
++    /* omni: prefer what Windows says over GDK's flat 60. Never lower it. */
++    {
++        int omni_real_hz = omni_win32_monitor_hz(win);
++        if (omni_real_hz > 0 && omni_real_hz * 1000 > refresh_rate) {
++            refresh_rate = omni_real_hz * 1000;
++        }
++    }
++#endif
++
++    /*
++     * omni: QEMU_UI_REFRESH_HZ pins the present rate outright -- the
++     * measurement hatch for the above, and the way to ask for LESS on a host
++     * that would rather spend the CPU elsewhere.
++     */
++    {
++        const char *omni_hz = getenv("QEMU_UI_REFRESH_HZ");
++        if (omni_hz && *omni_hz) {
++            int hz = atoi(omni_hz);
++            if (hz > 0) {
++                refresh_rate = hz * 1000;
++            }
++        }
++    }
++
+     gd_set_ui_refresh_rate(vc, refresh_rate);
+ 
+     /* T = 1 / f = 1 [s*Hz] / f = 1000*1000 [ms*mHz] / f */
