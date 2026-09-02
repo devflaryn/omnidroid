@@ -186,9 +186,32 @@
           "version_code": 2924,
           "created": 1788207921,
           "notes": null
+        },
+        "omniexec-2.735.1138-lock": {
+          "data": "x86/base_x86_data_offset_omniexec-2.735.1138-lock.qcow2",
+          "package": "com.roblox.client",
+          "apk": "omniexec-2.735.1138-lock.apk",
+          "apk_path": "C:\\Users\\berat\\Desktop\\Omni Apps\\omni-exec-android\\omniexec-2.735.1138-lock.apk",
+          "version_name": "2.735.1138",
+          "version_code": 2924,
+          "created": 1788382958,
+          "notes": "2.735.1138 + Java pointer-capture gate on omni.mouse.lock (mouselock.py)"
+        },
+        "omniexec-2.735.1138-lock2": {
+          "data": "x86/base_x86_data_offset_omniexec-2.735.1138-lock2.qcow2",
+          "package": "com.roblox.client",
+          "apk": "omniexec-2.735.1138-lock2.apk",
+          "apk_path": "C:\\Users\\berat\\Desktop\\Omni Apps\\omni-exec-android\\omniexec-2.735.1138-lock2.apk",
+          "version_name": "2.735.1138",
+          "version_code": 2924,
+          "created": 1788385128,
+          "notes": "lock + constant abs position while captured (cursor stays at the drag origin)"
         }
       },
-      "default_offset": "omniexec-2.735.1138"
+      "default_offset": "omniexec-2.735.1138-lock2",
+      "root_manifest": {
+        "rooted_data": "x86/data-template-8g.qcow2"
+      }
     }
   },
   "qemu": {

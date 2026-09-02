@@ -10,3 +10,7 @@
 0008-omni-win32-punch-hole.patch
 0009-omni-win32-refresh-rate.patch
 0010-omni-host-cursor.patch
+0011-omni-input-uncompressed.patch
+0012-omni-present-now.patch
+0013-omni-pointer-lock.patch
+0014-omni-virgl-fence-poll-env.patch

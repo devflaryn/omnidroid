@@ -1,0 +1,533 @@
+diff --git a/include/ui/gtk.h b/include/ui/gtk.h
+index 4a7c192cae..2aa95332da 100644
+--- a/include/ui/gtk.h
++++ b/include/ui/gtk.h
+@@ -143,6 +143,10 @@ struct GtkDisplayState {
+      * gd_update_cursor() and qmp_omni_host_cursor() in ui/gtk.c. */
+     gboolean omni_cursor_hidden;
+     GdkCursor *omni_blank_cursor;
++    /* omni: QMP pointer lock -- the display acts as a RELATIVE pointer
++     * whatever qemu_input_is_absolute() says, host pointer hidden, grabbed
++     * and pinned to the drawing area. See qmp_omni_pointer_lock(). */
++    gboolean omni_ptr_lock;
+     Notifier mouse_mode_notifier;
+     VMChangeStateEntry *vmse;
+     Notifier console_notifier;
+diff --git a/qapi/ui.json b/qapi/ui.json
+index d3535ee8fe..db624af1df 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1716,6 +1716,43 @@
+   'data': { 'visible': 'bool' },
+   'if': 'CONFIG_GTK' }
+ 
++##
++# @omni-pointer-lock:
++#
++# Lock the host pointer to the gtk guest window.  Omni addition: a
++# guest game in mouse-look (Roblox with the right button held, or a
++# first-person camera) needs unbounded relative motion, but the
++# guest's input device is an absolute tablet, so the host pointer
++# walks to the window edge and stops.  While locked the display
++# feeds the guest RELATIVE deltas whatever the input device reports
++# itself as, hides the host pointer, grabs it, and keeps re-centring
++# it inside the drawing area (on Windows it is also clipped to the
++# drawing area).
++#
++# @enabled: true to lock, false to release
++#
++# @warp-x: on release, x of the guest framebuffer pixel to put the
++#     host pointer on, so it reappears where the guest's own pointer
++#     is
++#
++# @warp-y: on release, y of that guest pixel
++#
++# Since: 11.1 (omni)
++#
++# .. qmp-example::
++#
++#     -> { "execute": "omni-pointer-lock",
++#          "arguments": { "enabled": true } }
++#     <- { "return": {} }
++#     -> { "execute": "omni-pointer-lock",
++#          "arguments": { "enabled": false,
++#                         "warp-x": 960, "warp-y": 540 } }
++#     <- { "return": {} }
++##
++{ 'command': 'omni-pointer-lock',
++  'data': { 'enabled': 'bool', '*warp-x': 'int', '*warp-y': 'int' },
++  'if': 'CONFIG_GTK' }
++
+ ##
+ # @client_migrate_info:
+ #
+diff --git a/ui/gtk.c b/ui/gtk.c
+index b2c93cedcf..f7049e12a6 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -141,6 +141,11 @@ bool gtk_use_gl_area;
+ 
+ static void gd_grab_pointer(VirtualConsole *vc, const char *reason);
+ static void gd_ungrab_pointer(GtkDisplayState *s);
++/* omni: pointer lock helpers, see qmp_omni_pointer_lock() */
++static void omni_ptr_warp_widget(VirtualConsole *vc, int wx, int wy);
++#ifdef G_OS_WIN32
++static void omni_ptr_clip(VirtualConsole *vc, bool clip);
++#endif
+ static void gd_grab_keyboard(VirtualConsole *vc, const char *reason);
+ static void gd_ungrab_keyboard(GtkDisplayState *s);
+ static void gd_rebuild_vc_menu(GtkDisplayState *s);
+@@ -213,7 +218,7 @@ static void gd_update_cursor(VirtualConsole *vc)
+     }
+ 
+     window = gtk_widget_get_window(GTK_WIDGET(vc->gfx.drawing_area));
+-    if (s->omni_cursor_hidden) {
++    if (s->omni_cursor_hidden || s->omni_ptr_lock) {
+         /* omni: the guest is drawing its own pointer (Roblox in a place),
+          * so the host's must not be on top of it. Beats show-cursor=on,
+          * which is what makes the host pointer the ONLY pointer the rest
+@@ -664,6 +669,90 @@ static GdkDevice *gd_get_pointer(GdkDisplay *dpy)
+     return gdk_seat_get_pointer(gdk_display_get_default_seat(dpy));
+ }
+ 
++/*
++ * omni: widget-relative (wx, wy) of the drawing area -> coordinates in the
++ * toplevel GtkWindow. Needed because a GtkGLArea has no GdkWindow of its own:
++ * gtk_widget_get_window() hands back the TOPLEVEL's window, so feeding it
++ * drawing-area coordinates is only right while the area sits at (0, 0).
++ */
++static GtkWidget *omni_ptr_to_toplevel(VirtualConsole *vc, int wx, int wy,
++                                       int *tx, int *ty)
++{
++    GtkWidget *top = gtk_widget_get_toplevel(vc->gfx.drawing_area);
++
++    if (!top || !gtk_widget_translate_coordinates(vc->gfx.drawing_area, top,
++                                                  wx, wy, tx, ty)) {
++        *tx = wx;
++        *ty = wy;
++        top = vc->gfx.drawing_area;
++    }
++    return top;
++}
++
++/* omni: put the host pointer on drawing-area pixel (wx, wy) */
++static void omni_ptr_warp_widget(VirtualConsole *vc, int wx, int wy)
++{
++    GtkWidget *top;
++    GdkDisplay *dpy;
++    gint tx, ty, x_root, y_root;
++
++    if (!gtk_widget_get_realized(vc->gfx.drawing_area)) {
++        return;
++    }
++    top = omni_ptr_to_toplevel(vc, wx, wy, &tx, &ty);
++    dpy = gtk_widget_get_display(vc->gfx.drawing_area);
++    gdk_window_get_root_coords(gtk_widget_get_window(top), tx, ty,
++                               &x_root, &y_root);
++    gdk_device_warp(gd_get_pointer(dpy),
++                    gtk_widget_get_screen(vc->gfx.drawing_area),
++                    x_root, y_root);
++}
++
++#ifdef G_OS_WIN32
++/*
++ * omni: ClipCursor to the drawing area's screen rectangle, in device pixels
++ * (the HWND's client origin plus the widget's allocation times the GDK
++ * scale). Windows clears the clip on its own whenever focus changes or the
++ * window moves, so callers re-arm it rather than assume it holds.
++ */
++static void omni_ptr_clip(VirtualConsole *vc, bool clip)
++{
++    GtkWidget *top;
++    GdkWindow *gdkwin;
++    HWND hwnd;
++    POINT p0, p1;
++    RECT r;
++    int tx, ty, scale;
++
++    if (!clip) {
++        ClipCursor(NULL);
++        return;
++    }
++    if (!gtk_widget_get_realized(vc->gfx.drawing_area)) {
++        return;
++    }
++    top = omni_ptr_to_toplevel(vc, 0, 0, &tx, &ty);
++    gdkwin = gtk_widget_get_window(top);
++    hwnd = gdkwin ? (HWND)gdk_win32_window_get_handle(gdkwin) : NULL;
++    if (!hwnd) {
++        return;
++    }
++    scale = gtk_widget_get_scale_factor(vc->gfx.drawing_area);
++    p0.x = tx * scale;
++    p0.y = ty * scale;
++    p1.x = (tx + gtk_widget_get_allocated_width(vc->gfx.drawing_area)) * scale;
++    p1.y = (ty + gtk_widget_get_allocated_height(vc->gfx.drawing_area)) * scale;
++    if (!ClientToScreen(hwnd, &p0) || !ClientToScreen(hwnd, &p1)) {
++        return;
++    }
++    r.left = p0.x;
++    r.top = p0.y;
++    r.right = p1.x;
++    r.bottom = p1.y;
++    ClipCursor(&r);
++}
++#endif /* G_OS_WIN32 */
++
+ static void gd_mouse_set(DisplayChangeListener *dcl,
+                          int x, int y, bool visible)
+ {
+@@ -912,7 +1001,10 @@ static void gd_mouse_mode_change(Notifier *notify, void *data)
+ 
+     s = container_of(notify, GtkDisplayState, mouse_mode_notifier);
+     /* release the grab at switching to absolute mode */
+-    if (s->ptr_owner && qemu_input_is_absolute(s->ptr_owner->gfx.dcl.con)) {
++    /* omni: ...unless the grab is ours -- the pointer lock is relative by
++     * decree, whatever device the guest happens to have. */
++    if (s->ptr_owner && !s->omni_ptr_lock &&
++        qemu_input_is_absolute(s->ptr_owner->gfx.dcl.con)) {
+         if (!s->ptr_owner->window) {
+             gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(s->grab_item),
+                                            FALSE);
+@@ -1055,6 +1147,53 @@ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
+         }
+     }
+ 
++    if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
++        return;
++    }
++
++    info = *qemu_console_get_ui_info(vc->gfx.dcl.con);
++    info.width = width;
++    info.height = height;
++    qemu_console_set_ui_info(vc->gfx.dcl.con, &info, true);
++}
++
++#if defined(CONFIG_OPENGL)
++
++static gboolean gd_render_event(GtkGLArea *area, GdkGLContext *context,
++                                void *opaque)
++{
++    VirtualConsole *vc = opaque;
++
++    if (vc->gfx.gls) {
++        gd_gl_area_draw(vc);
++    }
++    return TRUE;
++}
++
++static void gd_resize_event(GtkGLArea *area,
++                            gint width, gint height, gpointer opaque)
++{
++    VirtualConsole *vc = opaque;
++    double pw = width, ph = height;
++    double sx = vc->gfx.scale_x, sy = vc->gfx.scale_y;
++    GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(area));
++    const int gs = gdk_window_get_scale_factor(window);
++
++    if (!vc->s->free_scale && !vc->s->full_screen) {
++        pw /= sx;
++        ph /= sy;
++    }
++
++    /**
++     * width and height here are in pixel coordinate, so we must divide it
++     * by global window scale (gs)
++     */
++    gd_set_ui_size(vc, pw / gs, ph / gs);
++}
++
++#endif
++
++
+ #ifdef G_OS_WIN32
+ /*
+  * omni: the REAL refresh rate of the monitor this window is on.
+@@ -1101,20 +1240,20 @@ static int omni_win32_monitor_hz(GdkWindow *win)
+ }
+ #endif /* G_OS_WIN32 */
+ 
++void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget)
++{
++#ifdef GDK_VERSION_3_22
++    GdkWindow *win = gtk_widget_get_window(widget);
++    int refresh_rate;
+ 
+-    if (!qemu_console_ui_info_supported(vc->gfx.dcl.con)) {
+-        return;
++    if (win) {
++        GdkDisplay *dpy = gtk_widget_get_display(widget);
++        GdkMonitor *monitor = gdk_display_get_monitor_at_window(dpy, win);
++        refresh_rate = gdk_monitor_get_refresh_rate(monitor); /* [mHz] */
++    } else {
++        refresh_rate = 0;
+     }
+ 
+-    info = *qemu_console_get_ui_info(vc->gfx.dcl.con);
+-    info.width = width;
+-    info.height = height;
+-    qemu_console_set_ui_info(vc->gfx.dcl.con, &info, true);
+-}
+-
+-#if defined(CONFIG_OPENGL)
+-
+-static gboolean gd_render_event(GtkGLArea *area, GdkGLContext *context,
+ #ifdef G_OS_WIN32
+     /* omni: prefer what Windows says over GDK's flat 60. Never lower it. */
+     {
+@@ -1140,53 +1279,6 @@ static gboolean gd_render_event(GtkGLArea *area, GdkGLContext *context,
+         }
+     }
+ 
+-                                void *opaque)
+-{
+-    VirtualConsole *vc = opaque;
+-
+-    if (vc->gfx.gls) {
+-        gd_gl_area_draw(vc);
+-    }
+-    return TRUE;
+-}
+-
+-static void gd_resize_event(GtkGLArea *area,
+-                            gint width, gint height, gpointer opaque)
+-{
+-    VirtualConsole *vc = opaque;
+-    double pw = width, ph = height;
+-    double sx = vc->gfx.scale_x, sy = vc->gfx.scale_y;
+-    GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(area));
+-    const int gs = gdk_window_get_scale_factor(window);
+-
+-    if (!vc->s->free_scale && !vc->s->full_screen) {
+-        pw /= sx;
+-        ph /= sy;
+-    }
+-
+-    /**
+-     * width and height here are in pixel coordinate, so we must divide it
+-     * by global window scale (gs)
+-     */
+-    gd_set_ui_size(vc, pw / gs, ph / gs);
+-}
+-
+-#endif
+-
+-void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget)
+-{
+-#ifdef GDK_VERSION_3_22
+-    GdkWindow *win = gtk_widget_get_window(widget);
+-    int refresh_rate;
+-
+-    if (win) {
+-        GdkDisplay *dpy = gtk_widget_get_display(widget);
+-        GdkMonitor *monitor = gdk_display_get_monitor_at_window(dpy, win);
+-        refresh_rate = gdk_monitor_get_refresh_rate(monitor); /* [mHz] */
+-    } else {
+-        refresh_rate = 0;
+-    }
+-
+     gd_set_ui_refresh_rate(vc, refresh_rate);
+ 
+     /* T = 1 / f = 1 [s*Hz] / f = 1000*1000 [ms*mHz] / f */
+@@ -1401,7 +1493,8 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
+     trace_gd_motion_event(ww_widget, wh_widget,
+                           gtk_widget_get_scale_factor(widget), fbx, fby);
+ 
+-    if (qemu_input_is_absolute(vc->gfx.dcl.con)) {
++    /* omni: the pointer lock makes this a relative pointer, full stop. */
++    if (qemu_input_is_absolute(vc->gfx.dcl.con) && !s->omni_ptr_lock) {
+         if (fbx < 0 || fby < 0 ||
+             fbx >= surface_width(vc->gfx.ds) ||
+             fby >= surface_height(vc->gfx.ds)) {
+@@ -1417,10 +1510,41 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
+         qemu_input_queue_rel(vc->gfx.dcl.con, INPUT_AXIS_Y, fby - s->last_y);
+         qemu_input_event_sync();
+     }
++    if (getenv("QEMU_UI_LOCK_DEBUG")) {
++        fprintf(stderr, "omni-lock: motion lock=%d fb=%d,%d last_set=%d owner=%d "
++                "d=%d,%d\n", (int)s->omni_ptr_lock, fbx, fby,
++                (int)s->last_set,
++                (int)(s->ptr_owner == vc),
++                s->last_set ? fbx - s->last_x : 0,
++                s->last_set ? fby - s->last_y : 0);
++    }
+     s->last_x = fbx;
+     s->last_y = fby;
+     s->last_set = TRUE;
+ 
++    if (s->omni_ptr_lock && s->ptr_owner == vc) {
++        /*
++         * omni: same idea as the monitor-edge warp below, but against the
++         * WIDGET, and early: the pointer must never reach the window edge,
++         * because there it stops (or leaves), and the guest's camera stops
++         * with it. A 10% margin gives the fastest flick room to land.
++         */
++        int mx = ww_widget / 10;
++        int my = wh_widget / 10;
++
++        if (motion->x <= mx || motion->x >= ww_widget - mx ||
++            motion->y <= my || motion->y >= wh_widget - my) {
++            omni_ptr_warp_widget(vc, ww_widget / 2, wh_widget / 2);
++#ifdef G_OS_WIN32
++            /* the clip is dropped by Windows on focus/move; re-arm it */
++            omni_ptr_clip(vc, true);
++#endif
++            s->last_set = FALSE;
++            return FALSE;
++        }
++        return TRUE;
++    }
++
+     if (!qemu_input_is_absolute(vc->gfx.dcl.con) && s->ptr_owner == vc) {
+         GdkScreen *screen = gtk_widget_get_screen(vc->gfx.drawing_area);
+         GdkDisplay *dpy = gtk_widget_get_display(widget);
+@@ -2254,6 +2378,12 @@ static gboolean gd_focus_in_event(GtkWidget *widget,
+     VirtualConsole *vc = opaque;
+ 
+     win32_kbd_set_window(gd_win32_get_hwnd(vc));
++#ifdef G_OS_WIN32
++    /* omni: Windows drops ClipCursor with the focus; put it back */
++    if (vc->s->omni_ptr_lock && vc->s->ptr_owner == vc) {
++        omni_ptr_clip(vc, true);
++    }
++#endif
+     return TRUE;
+ }
+ 
+@@ -2265,6 +2395,12 @@ static gboolean gd_focus_out_event(GtkWidget *widget,
+ 
+     win32_kbd_set_window(NULL);
+     gtk_release_modifiers(s);
++#ifdef G_OS_WIN32
++    /* omni: never hold the user's pointer inside a window they left */
++    if (s->omni_ptr_lock) {
++        omni_ptr_clip(vc, false);
++    }
++#endif
+     return TRUE;
+ }
+ 
+@@ -3372,3 +3508,123 @@ void qmp_omni_host_cursor(bool visible, Error **errp)
+         gd_update_cursor(g_ptr_array_index(s->vcs, i));
+     }
+ }
++
++/*
++ * omni: lock the host pointer to the guest window and feed the guest
++ * relative motion.
++ *
++ * The guest's pointing device is an absolute tablet (virtio-tablet-pci), so
++ * the host pointer maps 1:1 onto the guest screen with zero latency -- right
++ * for everything except mouse-look, where the game wants unbounded deltas
++ * and the host pointer instead walks to the window edge and stops. While
++ * locked the GTK display takes the relative branch of gd_motion_event()
++ * whatever qemu_input_is_absolute() says (the deltas land on a
++ * virtio-mouse-pci if one is attached, see qemu_input_queue_rel), hides the
++ * host pointer, grabs it, keeps re-centring it inside the drawing area and,
++ * on Windows, clips it there too. The engine flips this on when the guest
++ * enters mouse-look and off when it leaves, handing back the guest pixel the
++ * host pointer should reappear on so the two never visibly diverge.
++ *
++ * QMP runs on the main loop thread, which is also GTK's thread here.
++ */
++void qmp_omni_pointer_lock(bool enabled,
++                           bool has_warp_x, int64_t warp_x,
++                           bool has_warp_y, int64_t warp_y,
++                           Error **errp)
++{
++    GtkDisplayState *s = gtk_display_state;
++    VirtualConsole *vc;
++    int ww_widget, wh_widget;
++
++    if (!s) {
++        error_setg(errp, "no gtk display is up");
++        return;
++    }
++    vc = gd_vc_find_current(s);
++    if (!vc || vc->type != GD_VC_GFX ||
++        !qemu_console_is_graphic(vc->gfx.dcl.con) ||
++        !gtk_widget_get_realized(vc->gfx.drawing_area)) {
++        error_setg(errp, "current console is not a realized graphic console");
++        return;
++    }
++    ww_widget = gtk_widget_get_allocated_width(vc->gfx.drawing_area);
++    wh_widget = gtk_widget_get_allocated_height(vc->gfx.drawing_area);
++
++    if (enabled) {
++        s->omni_ptr_lock = TRUE;
++#ifdef G_OS_WIN32
++        /*
++         * No GDK seat grab on Windows. Measured: a gdk_seat_grab() taken
++         * from QMP (outside any input event) leaves the window receiving
++         * NO motion at all -- the warp's own event arrives and then
++         * nothing, while the pointer visibly moves. ClipCursor already does
++         * the confining here, so the lock just takes ownership the way the
++         * grab would have (ptr_owner + the origin to warp back to).
++         */
++        if (s->ptr_owner && s->ptr_owner != vc) {
++            gd_ungrab_pointer(s);
++        }
++        gdk_device_get_position(gd_get_pointer(gtk_widget_get_display(
++                                    vc->gfx.drawing_area)),
++                                NULL, &s->grab_x_root, &s->grab_y_root);
++        s->ptr_owner = vc;
++#else
++        gd_grab_pointer(vc, "omni-pointer-lock");
++#endif
++        omni_ptr_warp_widget(vc, ww_widget / 2, wh_widget / 2);
++        /* the warp's own motion event must not become a delta */
++        s->last_set = FALSE;
++#ifdef G_OS_WIN32
++        omni_ptr_clip(vc, true);
++#endif
++        gd_update_cursor(vc);
++        if (getenv("QEMU_UI_LOCK_DEBUG")) {
++            fprintf(stderr, "omni-lock: ON owner=%d origin=%d,%d\n",
++                    (int)(s->ptr_owner == vc), s->grab_x_root,
++                    s->grab_y_root);
++        }
++        return;
++    }
++
++    s->omni_ptr_lock = FALSE;
++#ifdef G_OS_WIN32
++    omni_ptr_clip(vc, false);
++    /* the mirror of the ownership taken above: no GDK grab to release,
++     * just the pointer back where the lock found it */
++    if (s->ptr_owner == vc) {
++        s->ptr_owner = NULL;
++        gdk_device_warp(gd_get_pointer(gtk_widget_get_display(
++                            vc->gfx.drawing_area)),
++                        gtk_widget_get_screen(vc->gfx.drawing_area),
++                        s->grab_x_root, s->grab_y_root);
++    }
++#else
++    /* puts the pointer back where the grab found it; overridden below */
++    gd_ungrab_pointer(s);
++#endif
++    if (getenv("QEMU_UI_LOCK_DEBUG")) {
++        fprintf(stderr, "omni-lock: OFF\n");
++    }
++    if (has_warp_x && has_warp_y && vc->gfx.ds) {
++        /*
++         * Guest framebuffer pixel -> drawing-area pixel: the inverse of
++         * what gd_motion_event() does, letterbox offsets included.
++         */
++        int ww_surface = surface_width(vc->gfx.ds) * vc->gfx.scale_x;
++        int wh_surface = surface_height(vc->gfx.ds) * vc->gfx.scale_y;
++        int wx_offset = 0, wy_offset = 0;
++        int wx, wy;
++
++        if (ww_widget > ww_surface) {
++            wx_offset = (ww_widget - ww_surface) / 2;
++        }
++        if (wh_widget > wh_surface) {
++            wy_offset = (wh_widget - wh_surface) / 2;
++        }
++        wx = warp_x * vc->gfx.scale_x + wx_offset;
++        wy = warp_y * vc->gfx.scale_y + wy_offset;
++        omni_ptr_warp_widget(vc, wx, wy);
++    }
++    s->last_set = FALSE;
++    gd_update_cursor(vc);
++}

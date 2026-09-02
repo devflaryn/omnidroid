@@ -26,36 +26,29 @@ from omnidroid import qemu_proc
 
 
 class CpuModel(unittest.TestCase):
-    def test_the_baseline_model_is_the_default_on_a_hypervisor(self):
-        # Measured: `host` did not complete a single boot on WHPX. `+aes` is
-        # not optional -- libndk_translation ASSERTS on a host without AES-NI
-        # the first time Roblox touches AES, and the splash dies two seconds in.
-        for accel in ("whpx,kernel-irqchip=off", "kvm", "hvf"):
-            self.assertEqual(qemu_proc.x86_cpu_model(accel), "qemu64,+aes",
-                             accel)
+    def test_a_named_model_is_the_default_on_whpx_and_kvm(self):
+        # CORRECTION 2026-09-02: qemu64 really is what the guest sees under
+        # WHPX (no XSAVE, no AVX -- `dmesg`: "x87 FPU will use FXSAVE"), and
+        # +avx on qemu64 breaks XSAVE and kills Roblox at start. A named
+        # model carries a consistent CPUID; Skylake-Client-v4 measured
+        # 38/38 -> 42/47 fps in PS99. `host` is still the measured-bad one.
+        for accel in ("whpx,kernel-irqchip=off", "kvm"):
+            self.assertEqual(qemu_proc.x86_cpu_model(accel),
+                             qemu_proc.WHPX_KVM_CPU_MODEL, accel)
+        self.assertEqual(qemu_proc.WHPX_KVM_CPU_MODEL, "Skylake-Client-v4")
 
-    def test_tcg_gets_max_because_the_baseline_will_not_boot_on_it(self):
-        """MEASURED 2026-08-21, same image, kernel log on ttyS0:
+    def test_other_hypervisors_keep_the_baseline(self):
+        # `+aes` is not optional -- libndk_translation ASSERTS on a host
+        # without AES-NI the first time Roblox touches AES.
+        self.assertEqual(qemu_proc.x86_cpu_model("hvf"), "qemu64,+aes")
 
-            -accel tcg -cpu qemu64,+aes   0 bytes in 240 s -- the kernel never
-                                          printed line one
-            -accel tcg -cpu max           Android at bootcomplete in 104 s
-
-        From outside, the first case is indistinguishable from a very slow
-        boot: QEMU burns 99 % of a core. The tell is that it does ZERO disk
-        I/O. Under WHPX the baseline survives only because WHPX's CPUID
-        filtering is limited, so the mask was never really being applied."""
-        for accel in ("tcg", "tcg,thread=multi", "TCG"):
-            self.assertEqual(qemu_proc.x86_cpu_model(accel), "max", accel)
-
-    def test_an_explicit_config_still_wins_even_on_tcg(self):
-        self.assertEqual(
-            qemu_proc.x86_cpu_model("tcg", {"qemu": {"cpu": "Skylake-Client"}}),
-            "Skylake-Client")
-
-    def test_config_can_still_ask_for_host(self):
-        cfg = {"qemu": {"cpu": "host"}}
-        self.assertEqual(qemu_proc.x86_cpu_model("whpx", cfg), "host")
+    def test_env_override_wins_for_an_ab(self):
+        import os
+        os.environ["OMNI_CPU"] = "Haswell-v4"
+        try:
+            self.assertEqual(qemu_proc.x86_cpu_model("whpx"), "Haswell-v4")
+        finally:
+            del os.environ["OMNI_CPU"]
 
     def test_config_can_pin_any_model(self):
         cfg = {"qemu": {"cpu": "Skylake-Client-v4"}}
@@ -63,10 +56,10 @@ class CpuModel(unittest.TestCase):
                          "Skylake-Client-v4")
 
     def test_a_config_without_a_qemu_block_is_fine(self):
-        self.assertEqual(qemu_proc.x86_cpu_model("whpx", {}), "qemu64,+aes")
-        self.assertEqual(qemu_proc.x86_cpu_model("whpx", {"qemu": None}),
-                         "qemu64,+aes")
-        self.assertEqual(qemu_proc.x86_cpu_model("whpx", None), "qemu64,+aes")
+        m = qemu_proc.WHPX_KVM_CPU_MODEL
+        self.assertEqual(qemu_proc.x86_cpu_model("whpx", {}), m)
+        self.assertEqual(qemu_proc.x86_cpu_model("whpx", {"qemu": None}), m)
+        self.assertEqual(qemu_proc.x86_cpu_model("whpx", None), m)
 
 
 class WhpxCeilings(unittest.TestCase):

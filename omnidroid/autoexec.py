@@ -154,7 +154,7 @@ def admin_secret():
     return os.environ.get(ADMIN_SECRET_ENV) or _DEFAULT_ADMIN_SECRET
 
 
-def push_autoexec(channel, cfg, data_dir, label, timeout=10):
+def push_autoexec(channel, cfg, data_dir, label, timeout=10, extra=()):
     """POST the host autoexec bundle for `channel`. Returns the count pushed, or
     None on failure. Never raises -- a boot must not fail over autoexec wiring.
 
@@ -165,7 +165,10 @@ def push_autoexec(channel, cfg, data_dir, label, timeout=10):
     # scripts live in the server-side channel, so the switch would appear to
     # do nothing.
     off = not autoexec_enabled()
-    scripts = [] if off else read_scripts(data_dir)
+    # `extra` is the engine's own per-launch scripts (mouselock.script_for);
+    # they run FIRST and are exempt from the user's kill switch, which is
+    # about the user's files -- an engine script is part of the launch.
+    scripts = list(extra) + ([] if off else read_scripts(data_dir))
     base = server_base(cfg)
     payload = json.dumps({"channel": channel, "scripts": scripts}).encode("utf-8")
     req = urllib.request.Request(

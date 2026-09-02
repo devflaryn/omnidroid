@@ -681,7 +681,8 @@ def x86_cpu_model(accel, cfg=None):
     that wants it via config qemu.cpu. Revisit with a newer base kernel;
     do NOT flip this back on reasoning alone -- re-measure.
     """
-    override = ((cfg or {}).get("qemu") or {}).get("cpu")
+    override = (os.environ.get("OMNI_CPU")
+                or ((cfg or {}).get("qemu") or {}).get("cpu"))
     if override:
         return override
     # TCG IS A DIFFERENT MACHINE, and the baseline is not survivable on it.
@@ -709,6 +710,24 @@ def x86_cpu_model(accel, cfg=None):
     # configuration where nothing is being passed through.
     if str(accel or "").split(",")[0].strip().lower() == "tcg":
         return "max"
+    # CORRECTION, 2026-09-02: "under WHPX the guest effectively sees the
+    # host's features whatever -cpu says" (above) is FALSE. The guest kernel
+    # under qemu64 logs `x87 FPU will use FXSAVE` and identifies the CPU as
+    # `QEMU Virtual CPU version 2.5+ (family 0xf)`: no XSAVE, no AVX, no
+    # SSE4, and every NEON instruction Roblox executes is translated onto
+    # SSE2. (The guest's /proc/cpuinfo is the native bridge's FAKE arm64
+    # one -- `dmesg | grep x86/fpu` is where the truth is.) Bolting
+    # `+xsave,+avx2,...` onto qemu64 does not work either: the kernel reports
+    # `XSAVE consistency problem: size 832 != kernel_size 576`, disables
+    # xsave, and Roblox dies at start on the first AVX instruction
+    # (`ndk_translation: Undefined instruction`). A NAMED model carries a
+    # consistent CPUID: Skylake-Client-v4 (no TSX) boots, the kernel enables
+    # xstate 0x7, and PS99 in-world went 38/38 -> 42/47 fps with the p10
+    # frame time 19-20 -> 12-13 ms, same night, same account. `host` stays
+    # measured-bad (hybrid topology). Under KVM the same named model is the
+    # standard choice, so this is not a Windows special case.
+    if str(accel or "").split(",")[0].strip().lower() in ("whpx", "kvm"):
+        return WHPX_KVM_CPU_MODEL
     # +aes is NOT optional on this base, and it is not a performance tweak.
     # Roblox ships arm64 only, so every instruction runs through
     # libndk_translation -- and the translator ASSERTS on a host without
@@ -1775,6 +1794,9 @@ def smp_arg(smp):
 # `virtio_input.ko` present under /system/lib/modules/6.1.112-gloria-xanmod1/
 # -- and virtio_gpu/virtio_net already demonstrate that this base autoloads
 # virtio modules when the device appears.
+# The named model for hardware-accelerated x86 guests; see x86_cpu_model().
+WHPX_KVM_CPU_MODEL = "Skylake-Client-v4"
+
 INPUT_USB = "usb"
 INPUT_VIRTIO = "virtio"
 DEFAULT_INPUT = INPUT_VIRTIO
@@ -1825,7 +1847,15 @@ def usb_devices(mode, arm, cfg=None):
         ["-device", "qemu-xhci", "-device", "usb-kbd", "-device", "usb-tablet"])
     if input_policy(cfg) != INPUT_VIRTIO:
         return usb
+    # omni: a RELATIVE pointer beside the absolute tablet. Nothing routes to
+    # it in normal use -- the tablet is named after it, so the guest activates
+    # the tablet last and `qemu_input_is_absolute` stays true -- but while the
+    # engine holds the QMP pointer lock (`omni-pointer-lock`, patch 0013) the
+    # gtk display sends mouse-look deltas, and `qemu_input_queue_rel` lands
+    # them on the first REL-capable handler: this device. Without it the lock
+    # would rotate nothing.
     return ["-device", "virtio-keyboard-pci,id=omnikbd",
+            "-device", "virtio-mouse-pci,id=omnimouse",
             "-device", "virtio-tablet-pci,id=omnitablet"] + usb
 
 
@@ -2164,7 +2194,8 @@ def qemu_command(acct, cfg, interactive, mode=None, accel=None, debug=False,
         "-qmp", f"tcp:127.0.0.1:{acct['qmp_port']},server=on,wait=off",
         "-kernel", str(images / base["kernel"]),
         "-initrd", str(images / base["initrd"]),
-        "-append", append,
+        "-append", (append + " " + os.environ["OMNI_KERNEL_APPEND"]
+                    if os.environ.get("OMNI_KERNEL_APPEND") else append),
         "-name", f"omni-{acct['name']}",
     ]
     cmd += devkit_drive_args(acct, cfg, debug, ",format=qcow2")
@@ -2658,6 +2689,14 @@ def qemu_supports_host_cursor(cfg=None):
     failure. So callers degrade to "leave it visible", never to "no pointer".
     """
     return "omni-host-cursor" in _qemu_omni_caps(cfg)
+
+
+def qemu_supports_pointer_lock(cfg=None):
+    """Does the resolved QEMU carry patch 0013 (`omni-pointer-lock` QMP)?
+
+    Without it mouse-look keeps the pre-fix behaviour -- an absolute pointer
+    that can walk out of the window -- never a stuck grab."""
+    return "omni-pointer-lock" in _qemu_omni_caps(cfg)
 
 
 def set_host_cursor(acct, visible, timeout=4):

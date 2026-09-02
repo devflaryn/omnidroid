@@ -71,17 +71,35 @@ class Probe(unittest.TestCase):
         self.assertNotIn("pidof bad name;", s)
 
     def test_parse_running_and_tail(self):
-        running, tail = parse_probe("1234\n__OMNI_SEP__\nlog line\n")
+        running, seen, tail = parse_probe(
+            "1234\n__OMNI_SEP__\nplayer.log 4096\nlog line\n")
         self.assertTrue(running)
+        self.assertEqual(seen, ("player.log", 4096))
         self.assertEqual(tail, "log line")
 
     def test_parse_gone(self):
-        running, tail = parse_probe("\n__OMNI_SEP__\nlog line\n")
+        running, seen, tail = parse_probe(
+            "\n__OMNI_SEP__\nplayer.log 10\nlog line\n")
         self.assertFalse(running)
 
+    def test_parse_no_log_yet(self):
+        running, seen, tail = parse_probe("1234\n__OMNI_SEP__\n")
+        self.assertTrue(running)
+        self.assertIsNone(seen)
+        self.assertEqual(tail, "")
+
     def test_parse_no_answer_is_unknown(self):
-        self.assertEqual(parse_probe(""), (None, ""))
-        self.assertEqual(parse_probe("garbage"), (None, ""))
+        self.assertEqual(parse_probe(""), (None, None, ""))
+        self.assertEqual(parse_probe("garbage"), (None, None, ""))
+
+    def test_script_reads_only_what_is_new(self):
+        """Markers scroll out of any fixed tail within minutes of joining;
+        the probe therefore reads from where it left off, and a rotated or
+        shorter file falls back to its tail."""
+        s = probe_script("com.roblox.client", "/logs", seen=("a.log", 5000))
+        self.assertIn("tail -c +5001", s)
+        self.assertIn('"$L" = a.log', s)
+        self.assertIn("tail -c 48000", s)      # the fallback branch
 
 
 class EngineSide(unittest.TestCase):

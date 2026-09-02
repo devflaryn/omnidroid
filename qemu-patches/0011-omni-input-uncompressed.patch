@@ -1,0 +1,51 @@
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 8308583..3dab2d9 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -2268,6 +2268,36 @@ static gboolean gd_focus_out_event(GtkWidget *widget,
+     return TRUE;
+ }
+ 
++/*
++ * omni: deliver every host mouse report to the guest.
++ *
++ * GDK3 compresses motion events by default: everything the mouse reported
++ * between two frame-clock ticks is folded into ONE motion event, so the guest
++ * sees at most one pointer update per host frame -- 60 Hz on Win32, where the
++ * backend never fills in the monitor's refresh interval. A game that reads
++ * raw deltas (Roblox's camera) then gets a 60 Hz staircase from a 1000 Hz
++ * mouse. Compression is per GdkWindow and can only be switched off once the
++ * widget has one, hence the realize hook.
++ *
++ * QEMU_UI_MOTION_COMPRESSION=1 restores GDK's default, for A/B.
++ */
++static void omni_realize_event(GtkWidget *widget, gpointer opaque)
++{
++    static bool announced;
++    const char *env = getenv("QEMU_UI_MOTION_COMPRESSION");
++    gboolean compress = env && strcmp(env, "1") == 0;
++    GdkWindow *window = gtk_widget_get_window(widget);
++
++    if (window) {
++        gdk_window_set_event_compression(window, compress);
++    }
++    if (!announced) {
++        announced = true;
++        fprintf(stderr, "omni-input: motion compression %s\n",
++                compress ? "on" : "off");
++    }
++}
++
+ static gboolean gd_configure(GtkWidget *widget,
+                              GdkEventConfigure *cfg, gpointer opaque)
+ {
+@@ -2615,6 +2645,9 @@ static void gd_connect_vc_gfx_signals(VirtualConsole *vc)
+                          G_CALLBACK(gd_configure), vc);
+         g_signal_connect(vc->gfx.drawing_area, "grab-broken-event",
+                          G_CALLBACK(gd_grab_broken_event), vc);
++        /* omni: switch GDK motion compression off once there is a window */
++        g_signal_connect(vc->gfx.drawing_area, "realize",
++                         G_CALLBACK(omni_realize_event), vc);
+     } else {
+         g_signal_connect(vc->gfx.drawing_area, "key-press-event",
+                          G_CALLBACK(gd_text_key_down), vc);

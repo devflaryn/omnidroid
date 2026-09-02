@@ -7510,6 +7510,14 @@ def _run_windowlock(a):
     command.
     """
     from omnidroid import hostwin
+    # This process's stdout is a log file; block buffering would keep the
+    # pointer-policy and mouse-lock lines out of it until exit, which is
+    # exactly when nobody needs them any more.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
     try:
         w, _, h = str(a.aspect).lower().partition("x")
         ratio = (int(w), int(h))
@@ -7525,6 +7533,18 @@ def _run_windowlock(a):
         hostcursor.start_thread(a.name)
     except Exception as e:      # noqa: BLE001 -- cosmetic, never the lock
         print(f"[_windowlock {a.name}] no pointer policy: {e}")
+    # ...and mouse-look confinement (omnidroid/mouselock.py), same lifetime:
+    # the in-game script calls this process over HTTP when the game locks
+    # the mouse, and QEMU's pointer lock has no meaning without the window.
+    try:
+        from omnidroid import mouselock, qemu_proc as _qp
+        if _qp.qemu_supports_pointer_lock():
+            mouselock.start_thread(a.name)
+        else:
+            print(f"[_windowlock {a.name}] this QEMU has no omni-pointer-lock "
+                  f"(patch 0013); mouse-look is not confined")
+    except Exception as e:      # noqa: BLE001
+        print(f"[_windowlock {a.name}] no mouse lock: {e}")
     try:
         held = hostwin.run_aspect_lock(
             a.identity, ratio, pid=getattr(a, "pid", None),
@@ -11393,7 +11413,12 @@ def _ensure_booted(acct, cfg, label, timeout=None, accel=None, mode_name=None,
     # build's executor reads its autoexec over game:HttpGet, not from a
     # workspace file (see autoexec.py / execmark.py). Best-effort; the helper
     # swallows every error and never fails a boot.
-    autoexec.push_autoexec(acct["name"], cfg, config.data_dir(), label)
+    extra = ()
+    from omnidroid import mouselock, qemu_proc as _qp
+    if _qp.qemu_supports_pointer_lock(cfg):
+        extra = (mouselock.script_for(acct),)
+    autoexec.push_autoexec(acct["name"], cfg, config.data_dir(), label,
+                           extra=extra)
     # EVERY boot, EVERY mode, and ABOVE the profile branch on purpose: the
     # never-blank guarantee is not a mode trade-off, and applying it before the
     # tuning leaves each mode the last writer on the display levers it

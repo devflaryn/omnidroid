@@ -457,6 +457,27 @@ So there are two numbers now and they must never be quoted as one:
 Going past 60 *visibly* needs a frame-clock bypass, which 0009 is not. Over
 Parsec (remote desktop) you are capped at 60 regardless of any of this.
 
+### CORRECTION, 2026-09-03: in-world fps is the TRANSLATED GAME, and the CPU model moves it
+
+The open question in HANDOFF-FPS.md is answered. Measured on `admn1b12farm2`
+in PS99 with two 30 s samples per setting (see HANDOFF-WINDOWS.md "PICK UP
+HERE — 2026-09-03"): the virgl fence poll (10 -> 1 ms), `idle=poll`, the GPU
+(19-47 % util) and QEMU's host threads (24-37 % each) are all cleared;
+`simpleperf` in the guest puts **79 % of CPU in ndk_translation's JIT
+output** across a three-thread relay (FunctionMarshal / RBX Worker A / B),
+Mesa at 0.2 %. The frame is a ~21 ms critical path of translated code, so
+the 60 Hz host draw cap does not bite until the game exceeds 60 — which it
+does not.
+
+What did move it: **`-cpu qemu64` really is what the guest gets under WHPX**
+(the docstring in `qemu_proc.x86_cpu_model` claiming otherwise was wrong —
+`dmesg` says `x87 FPU will use FXSAVE`, no XSAVE, no AVX). `+avx` on qemu64
+breaks XSAVE and kills Roblox at start; the named **`Skylake-Client-v4`**
+boots, enables xstate 0x7 and took PS99 from 38/38 to 42-48 fps with the p10
+frame time 19-20 -> 12-13 ms. It is the whpx/kvm default now
+(`WHPX_KVM_CPU_MODEL`, `OMNI_CPU` to override). The guest's `/proc/cpuinfo`
+is the native bridge's fake arm64 one; do not read CPU features from it.
+
 ### What 0009 is still good for
 
 The `QEMU_UI_REFRESH_HZ` pin, and mostly for asking for LESS: a host that

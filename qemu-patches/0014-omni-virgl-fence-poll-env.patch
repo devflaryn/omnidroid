@@ -1,0 +1,36 @@
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 6e298f997d..7960c5b06b 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1377,6 +1377,22 @@ static void virtio_gpu_print_stats(void *opaque)
+     timer_mod(gl->print_stats, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+ }
+ 
++/* omni: the fence poll interval. On a host with no EGL display (the WGL
++ * window path on Windows) virglrenderer has no async fence callback, so a
++ * fence the guest waits on is only noticed on this timer -- 10 ms of added
++ * latency per wait, straight into the frame time. Overridable for A/B. */
++static int omni_fence_poll_ms(void)
++{
++    static int ms = -1;
++    if (ms < 0) {
++        const char *e = getenv("QEMU_VIRGL_FENCE_POLL_MS");
++        ms = e ? atoi(e) : 10;
++        if (ms < 1) ms = 1;
++        fprintf(stderr, "omni-virgl: fence poll %d ms\n", ms);
++    }
++    return ms;
++}
++
+ static void virtio_gpu_fence_poll(void *opaque)
+ {
+     VirtIOGPU *g = opaque;
+@@ -1389,7 +1405,7 @@ static void virtio_gpu_fence_poll(void *opaque)
+     virgl_renderer_poll();
+     virtio_gpu_process_cmdq(g);
+     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
+-        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
++        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + omni_fence_poll_ms());
+     }
+ }
+ 

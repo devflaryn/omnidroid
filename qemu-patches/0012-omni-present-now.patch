@@ -1,0 +1,55 @@
+diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
+index 20ae10c..68f6b82 100644
+--- a/ui/gtk-gl-area.c
++++ b/ui/gtk-gl-area.c
+@@ -331,6 +331,24 @@ void gd_gl_area_scanout_flush(DisplayChangeListener *dcl,
+                           uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {
+     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
++    /*
++     * omni: present at the guest's rate, not GDK's.
++     *
++     * gtk_gl_area_queue_render() only marks the widget dirty; the actual
++     * draw (and the SwapBuffers behind it) waits for the next tick of GDK's
++     * frame clock, which on Win32 runs at a flat 60 Hz whatever the monitor
++     * does (see gd_update_monitor_refresh_rate in gtk.c). So a guest that
++     * flushes at 144 Hz is shown at 60 and every frame waits up to 16 ms.
++     * gdk_window_process_updates() runs the pending draw right here, on the
++     * flush, so each guest frame is on the glass as soon as it exists.
++     *
++     * Off by default -- QEMU_UI_PRESENT_NOW=1 enables -- so the two can be
++     * A/B'd on the same build. The re-entrancy guard is because the draw
++     * unblocks the guest's GL (graphic_hw_gl_block), and that can push the
++     * next flush before this one has returned.
++     */
++    static int omni_present_now = -1;
++    static bool omni_presenting;
+ 
+     if (vc->gfx.guest_fb.dmabuf &&
+         !qemu_dmabuf_get_draw_submitted(vc->gfx.guest_fb.dmabuf)) {
+@@ -338,6 +356,25 @@ void gd_gl_area_scanout_flush(DisplayChangeListener *dcl,
+         gtk_gl_area_set_scanout_mode(vc, true);
+     }
+     gtk_gl_area_queue_render(GTK_GL_AREA(vc->gfx.drawing_area));
++
++    if (omni_present_now < 0) {
++        const char *env = getenv("QEMU_UI_PRESENT_NOW");
++        omni_present_now = (env && strcmp(env, "1") == 0) ? 1 : 0;
++        fprintf(stderr, "omni-present: now=%d\n", omni_present_now);
++    }
++    if (!omni_present_now || omni_presenting || !vc->gfx.scanout_mode ||
++        !gtk_widget_get_realized(vc->gfx.drawing_area)) {
++        return;
++    }
++    omni_presenting = true;
++    /* deprecated since 3.22 in favour of the frame clock, which is the
++     * very thing we are stepping around */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++    gdk_window_process_updates(gtk_widget_get_window(vc->gfx.drawing_area),
++                               FALSE);
++#pragma GCC diagnostic pop
++    omni_presenting = false;
+ }
+ 
+ void gd_gl_area_scanout_dmabuf(DisplayChangeListener *dcl,
