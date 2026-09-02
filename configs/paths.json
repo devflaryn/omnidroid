@@ -3,7 +3,7 @@
     "windows": "C:/Users/berat/OmniImages",
     "linux": "~/OmniImages"
   },
-  "current_base": "v6",
+  "current_base": "v7",
   "data_template": "x86/data-template-8g.qcow2",
   "bases": {
     "x86": {
@@ -101,7 +101,7 @@
       "version": 6,
       "src": "/android-2024-10-11",
       "notes": "updated kiosk (SessionProvider fix; Lock Task lockdown + boot/RAM trims)",
-      "default_offset": "arceusremote",
+      "default_offset": "omniexec-2.735.1138",
       "offsets": {
         "arceusremote": {
           "data": "x86/base_x86_data_offset_arceusremote.qcow2",
@@ -109,7 +109,7 @@
           "apk": "arceus-STATIC-REMOTE-v2.apk",
           "version_name": "2.732.1043",
           "created": 1787085132,
-          "notes": "Host-patched Arceus X NEO (.so -> 72.62.59.232)."
+          "notes": "Host-patched Arceus X NEO (.so -> 179.198.197.7)."
         },
         "arceusremote231": {
           "data": "x86/base_x86_data_offset_arceusremote231.qcow2",
@@ -117,7 +117,7 @@
           "apk": "Roblox.Arceus.X.NEO.2.3.1-omni-v2.apk",
           "version_name": "2.733.988",
           "created": 1787085132,
-          "notes": "Arceus NEO 2.3.1 + omni bootstrap + full redirect (.so darkrai + DEX spdmteam -> 72.62.59.232)."
+          "notes": "Arceus NEO 2.3.1 + omni bootstrap + full redirect (.so darkrai + DEX spdmteam -> 179.198.197.7)."
         },
         "omniexec-2.734.917": {
           "data": "x86/base_x86_data_offset_omniexec-2.734.917.qcow2",
@@ -143,6 +143,52 @@
       "root_manifest": {
         "rooted_data": "x86/data-template-8g.qcow2"
       }
+    },
+    "v7": {
+      "disk": "base-v7.qcow2",
+      "kernel": "base-v7.kernel",
+      "initrd": "base-v7.initrd.img",
+      "src": "/android-2024-10-11",
+      "notes": "static framework overlay OmniPointerOverlay.apk (/system/product/overlay/OmniPointerOverlay/OmniPointerOverlay.apk)",
+      "offsets": {
+        "arceusremote": {
+          "data": "x86/base_x86_data_offset_arceusremote.qcow2",
+          "package": "com.roblox.client",
+          "apk": "arceus-STATIC-REMOTE-v2.apk",
+          "version_name": "2.732.1043",
+          "created": 1787085132,
+          "notes": "Host-patched Arceus X NEO (.so -> 179.198.197.7)."
+        },
+        "arceusremote231": {
+          "data": "x86/base_x86_data_offset_arceusremote231.qcow2",
+          "package": "com.roblox.client",
+          "apk": "Roblox.Arceus.X.NEO.2.3.1-omni-v2.apk",
+          "version_name": "2.733.988",
+          "created": 1787085132,
+          "notes": "Arceus NEO 2.3.1 + omni bootstrap + full redirect (.so darkrai + DEX spdmteam -> 179.198.197.7)."
+        },
+        "omniexec-2.734.917": {
+          "data": "x86/base_x86_data_offset_omniexec-2.734.917.qcow2",
+          "package": "com.roblox.client",
+          "apk": "omniexec-2.734.917.apk",
+          "apk_path": "C:\\Users\\berat\\Desktop\\Omni Apps\\omniexec-2.734.917.apk",
+          "version_name": "2.734.917",
+          "version_code": 2908,
+          "created": 1787841733,
+          "notes": null
+        },
+        "omniexec-2.735.1138": {
+          "data": "x86/base_x86_data_offset_omniexec-2.735.1138.qcow2",
+          "package": "com.roblox.client",
+          "apk": "omniexec-2.735.1138.apk",
+          "apk_path": "C:\\Users\\berat\\Desktop\\Omni Apps\\omni-exec-android\\omniexec-2.735.1138.apk",
+          "version_name": "2.735.1138",
+          "version_code": 2924,
+          "created": 1788207921,
+          "notes": null
+        }
+      },
+      "default_offset": "omniexec-2.735.1138"
     }
   },
   "qemu": {
@@ -156,6 +202,7 @@
   "notes": "Base images are immutable once any account references them. They live in the external data dir (images_dir; Windows C:/Users/berat/OmniImages, Linux/macOS ~/OmniImages) and are NEVER committed. Inside it images are CLASSIFIED BY ARCH: images_dir/arm/ and images_dir/x86/ -- the subfolder is part of every recorded filename here, and an offset always sits in the same folder as the /data it overlays (a qcow2 backing reference resolves relative to the overlay's own directory). base_x86 + base_arm are the two canonical bases; the host architecture selects between them.",
   "base_game": {
     "arm": "com.roblox.client",
-    "v6": "com.roblox.client"
+    "v6": "com.roblox.client",
+    "v7": "com.roblox.client"
   }
 }

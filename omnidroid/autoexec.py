@@ -147,7 +147,7 @@ def server_base(cfg):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}"
-    return "http://72.62.59.232"
+    return "http://179.198.197.7"
 
 
 def admin_secret():

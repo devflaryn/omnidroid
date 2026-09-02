@@ -22,6 +22,7 @@ import contextlib
 import json
 import os
 import platform
+import copy
 import re
 import shlex
 import shutil
@@ -1284,7 +1285,7 @@ def post_boot(acct, label):
 # A /system/etc/hosts null-route is honoured by bionic's resolver BEFORE any
 # DNS lookup -- verified to hold even with Private DNS / DNS-over-TLS active --
 # so it blocks these without touching package state (fully reversible) and
-# without affecting our own server (72.62.59.232) or Roblox's hosts.
+# without affecting our own server (179.198.197.7) or Roblox's hosts.
 BLOCK_EXTERNAL_HOSTS = (
     "raw.githubusercontent.com",
     "release-assets.githubusercontent.com",
@@ -1367,11 +1368,11 @@ def _executor_redirect_ip():
         if target:
             return target.split(":")[0]
         return _devserver.PROD_IP
-    return "72.62.59.232"
+    return "179.198.197.7"
 
 
 def apply_dev_redirect(acct, label):
-    """Send the guest's calls to 72.62.59.232 to a local omni-backend instead.
+    """Send the guest's calls to 179.198.197.7 to a local omni-backend instead.
 
     Off unless OMNI_DEV_SERVER (or configs/dev.json) says otherwise, so the
     production path is one dict lookup and no adb at all. See devserver.py for
@@ -3201,6 +3202,15 @@ def _build_next_base(cfg, mutate, notes, base_game=None):
             raw.setdefault("base_game", {})[nxt] = base_game
         elif prior_game:
             raw.setdefault("base_game", {})[nxt] = prior_game
+        # CARRY THE OFFSETS FORWARD. An offset is a /data overlay carrying one
+        # Roblox build; it is compatible with any x86 system base, and it is
+        # registered on the base TAG. A new tag with no offsets orphaned
+        # every launch (`no_offset`) the first time this ran (2026-08-18) --
+        # the fix was done by hand in configs/paths.json then, and here now.
+        prior = raw["bases"].get(cur) or {}
+        for key in ("offsets", "default_offset"):
+            if key in prior and key not in raw["bases"][nxt]:
+                raw["bases"][nxt][key] = copy.deepcopy(prior[key])
         raw["current_base"] = nxt
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
         print(f"[{label}] base {nxt} built and current. "
@@ -3270,6 +3280,70 @@ def cmd_rebuild_base(args):
     ensure_qemu()
     cfg = load_config()
     rebuild_base(cfg, args.game)
+
+
+# Where a static framework overlay lives in the x86 guest. One directory per
+# overlay, the way Bliss ships its own (/system/product/overlay/<Name>/).
+# tools/build_pointer_overlay.py is the only overlay so far and says why it
+# has to be STATIC and on a system partition -- a mutable one installed to
+# /data resolves but never reaches the pointer bitmaps.
+OVERLAY_GUEST_ROOT = "/system/product/overlay"
+
+
+def overlay_guest_paths(apk):
+    """(guest dir, guest apk path) for a static overlay APK. Pure."""
+    stem = Path(apk).stem
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", stem):
+        raise ValueError(f"overlay file name must be plain ASCII: {stem!r}")
+    d = f"{OVERLAY_GUEST_ROOT}/{stem}"
+    return d, f"{d}/{stem}.apk"
+
+
+def overlay_bake_script(apk, tmp="/data/local/tmp/overlay.apk"):
+    """The guest shell that installs a pushed overlay APK as a static system
+    overlay. Pure; the caller pushes to `tmp` first. Ends in OVERLAY_OK so a
+    partial failure cannot read as success."""
+    d, dst = overlay_guest_paths(apk)
+    return (f"rm -rf {d} && mkdir -p {d} && cp {tmp} {dst} && "
+            f"chmod 755 {d} && chmod 644 {dst} && "
+            f"chcon u:object_r:system_file:s0 {d} && "
+            f"chcon u:object_r:system_file:s0 {dst} && "
+            f"rm {tmp} && echo OVERLAY_OK")
+
+
+def bake_overlay_base(cfg, apk):
+    """Bake a static framework overlay into a NEW x86 base version.
+
+    The first user is the pointer overlay (tools/build_pointer_overlay.py):
+    it blanks the guest's own mouse pointer so the host pointer is the only
+    one the user sees. Static overlays are read by zygote at boot, so this
+    cannot be an install into a running instance -- it is a base change,
+    the same shape as `update-kiosk`.
+    """
+    apk = Path(apk)
+    if not apk.exists():
+        sys.exit(f"overlay apk not found: {apk}")
+    d, dst = overlay_guest_paths(apk)
+
+    def mutate(acct, label):
+        adb(acct, "push", str(apk), "/data/local/tmp/overlay.apk",
+            timeout=120)
+        r = adb(acct, "shell", overlay_bake_script(apk), timeout=60)
+        if "OVERLAY_OK" not in (r.stdout or ""):
+            sys.exit(f"[{label}] overlay bake failed: {r.stdout}{r.stderr}")
+        print(f"[{label}] baked static overlay {dst}")
+
+    return _build_next_base(cfg, mutate,
+                            notes=f"static framework overlay {apk.name} "
+                                  f"({dst})")
+
+
+def cmd_bake_overlay(args):
+    ensure_qemu()
+    cfg = load_config()
+    tag = bake_overlay_base(cfg, args.apk)
+    if getattr(args, "json", False):
+        emit_json({"ok": True, "base": tag, "apk": str(args.apk)})
 
 
 def update_kiosk_arm(cfg, kiosk_apk, tag, label=None):
@@ -7442,6 +7516,15 @@ def _run_windowlock(a):
     except (AttributeError, ValueError):
         print(f"[_windowlock {a.name}] unusable --aspect {a.aspect!r}")
         return 2
+    # The pointer policy rides in this process because it has exactly the
+    # window's lifetime and no other: show the host pointer, blank it while
+    # Roblox paints its own (omnidroid/hostcursor.py). A daemon thread, so a
+    # window that closes ends it and it can never hold the process open.
+    try:
+        from omnidroid import hostcursor
+        hostcursor.start_thread(a.name)
+    except Exception as e:      # noqa: BLE001 -- cosmetic, never the lock
+        print(f"[_windowlock {a.name}] no pointer policy: {e}")
     try:
         held = hostwin.run_aspect_lock(
             a.identity, ratio, pid=getattr(a, "pid", None),
@@ -12938,6 +13021,16 @@ def build_parser():
                          "(e.g. arm, dev). Omit for the legacy x86 flow")
     uk.add_argument("--json", action="store_true")
     uk.set_defaults(func=cmd_update_kiosk)
+
+    bo = sub.add_parser("bake-overlay",
+                        help="bake a static framework overlay APK into a new "
+                             "x86 base version (then update-all). The pointer "
+                             "overlay from tools/build_pointer_overlay.py is "
+                             "what blanks the guest's own mouse pointer")
+    bo.add_argument("--apk", default=str(REPO / "overlay" / "build"
+                                         / "OmniPointerOverlay.apk"))
+    bo.add_argument("--json", action="store_true")
+    bo.set_defaults(func=cmd_bake_overlay)
 
     bdk = sub.add_parser("build-devkit",
                          help="build the attachable devkit disk "

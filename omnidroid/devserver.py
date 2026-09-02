@@ -3,16 +3,16 @@
 The host side of this lives in omni-executor (devserver.py there): it swaps the
 origin of every URL the desktop app builds. That is only half the loop. The
 other half runs INSIDE the VM: the patched executor's server address is baked
-into its native library (spdmteam/github hops rewritten to 72.62.59.232 at bake
+into its native library (spdmteam/github hops rewritten to 179.198.197.7 at bake
 time -- see engine.BLOCK_EXTERNAL_HOSTS), so no host-side setting can move it.
 It is a compiled-in constant, and rebaking an APK per dev session is not a
 "small networking change".
 
 So we move the PACKETS instead of the address. One netfilter rule in the guest:
 
-    iptables -t nat -A OUTPUT -p tcp -d 72.62.59.232 -j DNAT --to-destination 10.0.2.2:5500
+    iptables -t nat -A OUTPUT -p tcp -d 179.198.197.7 -j DNAT --to-destination 10.0.2.2:5500
 
-Everything in the guest still believes it is talking to 72.62.59.232 -- the URL,
+Everything in the guest still believes it is talking to 179.198.197.7 -- the URL,
 the Host header, the executor's own logging are all unchanged -- but the
 connection lands on omni-backend running on the host. 10.0.2.2 is QEMU slirp's
 alias for the host's loopback (see qemu_proc.py: `-netdev user,id=net0`), which
@@ -40,7 +40,7 @@ import os
 import urllib.parse
 
 # The baked-in production address. This is the only destination we rewrite.
-PROD_IP = "72.62.59.232"
+PROD_IP = "179.198.197.7"
 
 # QEMU slirp's alias for the HOST's loopback, as seen from the guest. A dev
 # server bound to 127.0.0.1 on the host is 10.0.2.2 from in here; the guest's

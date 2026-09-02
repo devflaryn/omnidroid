@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Omni pointer overlay: every framework pointer bitmap replaced by a fully
+  transparent one, so the guest never paints a pointer of its own. The host
+  window shows the host's pointer instead (zero latency), and hides it while
+  Roblox paints its in-game cursor. See tools/build_pointer_overlay.py for
+  why it is STATIC and platform-signed, and omnidroid/hostcursor.py for the
+  host half.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.omni.pointeroverlay"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <application android:hasCode="false" android:label="Omni pointer overlay"/>
+    <overlay android:targetPackage="android"
+             android:priority="1"
+             android:isStatic="true"/>
+</manifest>

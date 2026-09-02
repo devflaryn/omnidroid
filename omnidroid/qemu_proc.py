@@ -453,8 +453,21 @@ _GL_OPTION = {"macos": "gl=es", "linux": "gl=on", "windows": "gl=on"}
 # sdl and cocoa are UNCHANGED -- neither backend has the confirm-close patch,
 # so an X on either of them still has to be swallowed outright or it kills
 # the guest with no prompt, exactly as before.
+# WHY gtk CARRIES show-cursor=on. QEMU's gtk backend blanks the HOST pointer
+# over the guest whenever the guest's pointing device is absolute (ours is a
+# tablet), on the theory that the guest draws one. Ours no longer does: the
+# x86 base carries a static overlay that makes every Android pointer bitmap
+# transparent (tools/build_pointer_overlay.py), because a pointer painted by
+# the guest lags the real one by the whole input->guest->scanout pipeline
+# and doubled up with Roblox's own in-game cursor. So the host pointer is THE
+# pointer -- zero latency, the OS's own shape -- and while Roblox paints its
+# in-game cursor the engine hides it over QMP (`omni-host-cursor`, patch
+# 0010; omnidroid/hostcursor.py). show-cursor is a stock suboption, accepted
+# by every build we ship (verified against 11.1.0 with `-M help`), so it does
+# not wait on the patched binary the way the hide does.
 _WINDOW_FLAGS = {
-    "gtk":   ("show-menubar=off", "zoom-to-fit=on", "keep-aspect-ratio=on"),
+    "gtk":   ("show-menubar=off", "zoom-to-fit=on", "keep-aspect-ratio=on",
+              "show-cursor=on"),
     "sdl":   ("window-close=off",),
     "cocoa": ("zoom-to-fit=on",),
 }
@@ -2635,6 +2648,28 @@ def _qemu_omni_caps(cfg=None):
 def qemu_supports_ram_file(cfg=None):
     """Does the resolved QEMU carry patch 0007 (file-backed guest RAM)?"""
     return "omni-ram-file" in _qemu_omni_caps(cfg)
+
+
+def qemu_supports_host_cursor(cfg=None):
+    """Does the resolved QEMU carry patch 0010 (`omni-host-cursor` QMP)?
+
+    Without it the host pointer stays on screen inside a place -- on top of
+    Roblox's own -- which is the pre-fix picture minus the lag, not a
+    failure. So callers degrade to "leave it visible", never to "no pointer".
+    """
+    return "omni-host-cursor" in _qemu_omni_caps(cfg)
+
+
+def set_host_cursor(acct, visible, timeout=4):
+    """Show or blank the host pointer over this instance's window.
+
+    True when QEMU acknowledged it, False otherwise (no window, an unpatched
+    binary, a busy main loop -- QMP is served by the same loop that runs the
+    guest, and a game keeps it busy, so the caller retries on its next tick
+    rather than trusting one answer)."""
+    r = qmp(acct, "omni-host-cursor", {"visible": bool(visible)},
+            timeout=timeout)
+    return bool(r) and "return" in r
 
 
 def qemu_supports_punch_hole(cfg=None):

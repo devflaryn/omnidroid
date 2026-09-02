@@ -1,0 +1,123 @@
+diff --git a/include/ui/gtk.h b/include/ui/gtk.h
+index 183b2b9..4a7c192 100644
+--- a/include/ui/gtk.h
++++ b/include/ui/gtk.h
+@@ -139,6 +139,10 @@ struct GtkDisplayState {
+     gboolean full_screen;
+ 
+     GdkCursor *null_cursor;
++    /* omni: the host pointer over the guest, forced blank by QMP. See
++     * gd_update_cursor() and qmp_omni_host_cursor() in ui/gtk.c. */
++    gboolean omni_cursor_hidden;
++    GdkCursor *omni_blank_cursor;
+     Notifier mouse_mode_notifier;
+     VMChangeStateEntry *vmse;
+     Notifier console_notifier;
+diff --git a/ui/gtk.c b/ui/gtk.c
+index b854647..1745a0f 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -35,6 +35,7 @@
+ #include "qapi/qapi-commands-control.h"
+ #include "qapi/qapi-commands-machine.h"
+ #include "qapi/qapi-commands-misc.h"
++#include "qapi/qapi-commands-ui.h"
+ #include "qemu/cutils.h"
+ #include "qemu/error-report.h"
+ #include "qemu/main-loop.h"
+@@ -212,6 +213,14 @@ static void gd_update_cursor(VirtualConsole *vc)
+     }
+ 
+     window = gtk_widget_get_window(GTK_WIDGET(vc->gfx.drawing_area));
++    if (s->omni_cursor_hidden) {
++        /* omni: the guest is drawing its own pointer (Roblox in a place),
++         * so the host's must not be on top of it. Beats show-cursor=on,
++         * which is what makes the host pointer the ONLY pointer the rest
++         * of the time -- the guest's own is blanked by an overlay. */
++        gdk_window_set_cursor(window, s->omni_blank_cursor);
++        return;
++    }
+     if (s->full_screen || qemu_input_is_absolute(vc->gfx.dcl.con) || s->ptr_owner == vc) {
+         gdk_window_set_cursor(window, s->null_cursor);
+     } else {
+@@ -3124,6 +3133,8 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
+         s->null_cursor = gdk_cursor_new_for_display(window_display,
+                                                     GDK_BLANK_CURSOR);
+     }
++    s->omni_blank_cursor = gdk_cursor_new_for_display(window_display,
++                                                      GDK_BLANK_CURSOR);
+ 
+     s->mouse_mode_notifier.notify = gd_mouse_mode_change;
+     qemu_add_mouse_mode_change_notifier(&s->mouse_mode_notifier);
+@@ -3278,6 +3289,7 @@ static void gtk_display_cleanup(void)
+     g_clear_pointer(&s->vcs, g_ptr_array_unref);
+     g_clear_pointer(&s->window, gtk_widget_destroy);
+     g_clear_object(&s->null_cursor);
++    g_clear_object(&s->omni_blank_cursor);
+     g_clear_pointer(&gtk_display_state, g_free);
+ }
+ 
+@@ -3299,3 +3311,31 @@ type_init(register_gtk);
+ #ifdef CONFIG_OPENGL
+ module_dep("ui-opengl");
+ #endif
++
++/*
++ * omni: show or hide the host pointer over the guest window at run time.
++ *
++ * With `-display gtk,show-cursor=on` the host's own pointer is what the user
++ * sees over the guest -- zero latency, and the guest's software-drawn Android
++ * pointer is blanked by a resource overlay in the image. The one time that is
++ * wrong is when the guest application paints a pointer of its own (Roblox
++ * inside a place): two arrows on screen. The engine watches for that state
++ * and flips this, so exactly one pointer is ever visible.
++ *
++ * QMP runs on the main loop thread, which is also GTK's thread here, so
++ * touching the GdkWindow directly is safe.
++ */
++void qmp_omni_host_cursor(bool visible, Error **errp)
++{
++    GtkDisplayState *s = gtk_display_state;
++    int i;
++
++    if (!s) {
++        error_setg(errp, "no gtk display is up");
++        return;
++    }
++    s->omni_cursor_hidden = !visible;
++    for (i = 0; i < s->vcs->len; i++) {
++        gd_update_cursor(g_ptr_array_index(s->vcs, i));
++    }
++}
+diff --git a/qapi/ui.json b/qapi/ui.json
+index b2c42a7..d3535ee 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1695,6 +1695,27 @@
+   'data': 'DisplayUpdateOptions',
+   'boxed' : true }
+ 
++##
++# @omni-host-cursor:
++#
++# Show or hide the host pointer over the gtk guest window.  Omni
++# addition: with `show-cursor=on` the host pointer is the only pointer
++# the user sees, until the guest application paints one of its own --
++# then the engine hides the host's with this.
++#
++# @visible: true to show the host pointer, false to blank it
++#
++# Since: 11.1 (omni)
++#
++# .. qmp-example::
++#
++#     -> { "execute": "omni-host-cursor", "arguments": { "visible": false } }
++#     <- { "return": {} }
++##
++{ 'command': 'omni-host-cursor',
++  'data': { 'visible': 'bool' },
++  'if': 'CONFIG_GTK' }
++
+ ##
+ # @client_migrate_info:
+ #

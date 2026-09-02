@@ -99,7 +99,7 @@ machines named**; where something is unverified it says so.
 >
 > **SHIPPED as `app-win 1.0.21`** (sha256 `eb6e054b...`, 42 MiB). Live manifest
 > serves `app.version 1.0.21`; the blob was re-downloaded from
-> `http://72.62.59.232/omni/dist/blob/app-win` and its hash verified against the
+> `http://179.198.197.7/omni/dist/blob/app-win` and its hash verified against the
 > registry independently. **1.0.20 is kept as the rollback.**
 >
 > ⚠ **TWO TRAPS HIT WHILE PUBLISHING, both worth knowing:**
@@ -125,7 +125,7 @@ machines named**; where something is unverified it says so.
 > - **2.3.1 bootstrapped**: `arceus-STATIC-REMOTE-231.apk` (OmniKiosk-signed, on
 >   the Mac at `~/Desktop/overnight tests/omni-exec test/work/`). Native hook →
 >   `Luau::compile@0x1e6824 → b 0x9042e0`, unpacker `@0x9042dc → ret`,
->   `72.62.59.232 ×33`, `spdmteam.com ×0`. **Auto-login VERIFIED** on Windows AND
+>   `179.198.197.7 ×33`, `spdmteam.com ×0`. **Auto-login VERIFIED** on Windows AND
 >   Linux (`OmniBootstrap: session cookie installed`; on Windows the home screen
 >   loaded fully as HezMi_ImYu). Also fixed an omnidroid bug: `devkit_disk_name("arm")`
 >   omits the `arm/` prefix so vdc never attached (worked around w/ a symlink; source fix still TODO).
@@ -193,10 +193,10 @@ machines named**; where something is unverified it says so.
 > screen refused to begin without them (§0); separately, the downloaded .zip
 > carried Windows' Mark-of-the-Web, which killed the app on launch before any
 > of that could run (§0b). Both fixed, and there is now a real installer
-> (§0c): **http://72.62.59.232/omni/dist/blob/setup-win**
+> (§0c): **http://179.198.197.7/omni/dist/blob/setup-win**
 
 Machines: Windows 11 (i7-13700F, RTX 4060, 32 GB) · Mac mini M1 at
-`berat@192.168.0.24` · VPS `72.62.59.232` (root, password in the `# VPS`
+`berat@192.168.0.24` · VPS `179.198.197.7` (root, password in the `# VPS`
 comment in `omni-backend/.env.development.local`).
 
 ---
@@ -206,7 +206,7 @@ comment in `omni-backend/.env.development.local`).
 **Give users this link. Nothing else.**
 
 ```
-http://72.62.59.232/omni/dist/blob/setup-win
+http://179.198.197.7/omni/dist/blob/setup-win
 ```
 
 It is a 12 MB stub installer. It downloads the current build, verifies it by
@@ -246,7 +246,7 @@ every ⚠ there still stands. What changed is that **two of the symptoms that bl
 unexplained now have root causes, and both are fixed, verified and deployed.**
 
 **Deployed.** `app-win 1.0.20` is live and verified: the blob downloads from
-`http://72.62.59.232/omni/dist/blob/app-win` with the sha256 in the registry
+`http://179.198.197.7/omni/dist/blob/app-win` with the sha256 in the registry
 (`66b05c01…`), and the live manifest serves `app.version 1.0.20`. Branches — all pushed:
 `omnidroid@68b3731` on `gaming-gpu-window`, `omni-executor@6b45be1` on
 `slice-c-windows-exe`, `omni-backend@2594a8a` on `slice-c-win-artifacts`.
@@ -284,7 +284,7 @@ installed" are the same picture.
 
 ```bash
 adb -s 127.0.0.1:<port> shell "setsid tcpdump -i eth0 -s 0 \
-    -w /data/local/tmp/exec.pcap host 72.62.59.232 </dev/null >/dev/null 2>&1 &"
+    -w /data/local/tmp/exec.pcap host 179.198.197.7 </dev/null >/dev/null 2>&1 &"
 # `nohup ... &` does NOT survive the shell exiting. `setsid` does.
 # Pull it with MSYS_NO_PATHCONV=1, or Git Bash rewrites the guest path.
 ```
@@ -1708,7 +1708,7 @@ and the marks cleared.
 
 ## 0c. The installer — `OmniExecutorSetup.exe`
 
-**Download link (permanent):** `http://72.62.59.232/omni/dist/blob/setup-win`
+**Download link (permanent):** `http://179.198.197.7/omni/dist/blob/setup-win`
 
 Built by `.\build-windows.ps1 -Installer` from `installer.py` +
 `OmniExecutorSetup.spec`. **12.4 MB, one file.**
@@ -2711,7 +2711,7 @@ Both have regression tests.
    | | |
    |---|---|
    | installed at | `%LOCALAPPDATA%\Programs\OmniExecutor` — **1.0.13**, and it will offer 1.0.14 |
-   | installed by | `http://72.62.59.232/omni/dist/blob/setup-win` |
+   | installed by | `http://179.198.197.7/omni/dist/blob/setup-win` |
    | updates | in-app banner / Settings → Updates, **or** re-run the installer |
 
    Re-running the installer over an existing install is the supported repair:

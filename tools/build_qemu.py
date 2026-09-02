@@ -86,6 +86,11 @@ def _pkgversion(series) -> str:
         tag += "+omni-punch-hole"
     if "0009" in numbers:
         tag += "+omni-refresh"
+    if "0010" in numbers:
+        # qemu_proc.qemu_supports_host_cursor() reads this one: it is what
+        # says the `omni-host-cursor` QMP command exists, so the engine can
+        # hide the host pointer while Roblox paints its own.
+        tag += "+omni-host-cursor"
     return tag
 
 

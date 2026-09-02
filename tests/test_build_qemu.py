@@ -96,6 +96,22 @@ class Configure(unittest.TestCase):
         self.assertTrue(argv[0].endswith("configure"))
         self.assertIn("--prefix=/out/pfx", [a.replace("\\", "/") for a in argv])
 
+    def test_pkgversion_advertises_host_cursor_from_0010(self):
+        """`+omni-host-cursor` is the token qemu_proc reads to know the
+        omni-host-cursor QMP command is there; it must come from 0010's
+        presence and nothing else."""
+        def pv(argv):
+            return next(a.split("=", 1)[1] for a in argv
+                        if a.startswith("--with-pkgversion="))
+        base = [Path("0001-omni-window-identity.patch")]
+        self.assertNotIn("omni-host-cursor",
+                         pv(configure_argv(Path("/o"), ["x86_64-softmmu"],
+                                           series=base)))
+        with10 = base + [Path("0010-omni-host-cursor.patch")]
+        self.assertTrue(pv(configure_argv(Path("/o"), ["x86_64-softmmu"],
+                                          series=with10))
+                        .endswith("+omni-host-cursor"))
+
     def test_pkgversion_is_derived_from_the_series(self):
         """A capability string that can drift from the patches is worse than
         none: Task 6 reads it to decide whether to back guest RAM with a
