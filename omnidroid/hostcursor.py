@@ -45,9 +45,15 @@ import threading
 # show the host pointer on top of Roblox's -- the pre-fix picture, not a
 # window with no pointer. Checked against a real 2.735 client log on the x86
 # guest; see the note at the bottom of this file for what was observed.
-CLIENT_LEFT = (r"Client:Disconnect", r"Sending disconnect",
-               r"leaveGame", r"Leaving game", r"doDataModelClose",
-               r"TeleportService", r"Teleporting")
+#
+# MEASURED 2026-09-03 on a 2.735 client: a real leave (roblox://navigation/
+# home, the menu's Leave) logs `nativeAppBridgeV2LeaveGame` and
+# `leaveUGCGame` first, then `Client:Disconnect` / `Sending disconnect`.
+# A PS99 TELEPORT logs those last two as well -- for the OLD server, AFTER
+# the new one's `Connection accepted` -- so counting them read "left" in
+# the middle of a join. Only the app-level leave markers are trusted now.
+CLIENT_LEFT = (r"nativeAppBridgeV2LeaveGame", r"leaveUGCGame",
+               r"LeaveGame:", r"doDataModelClose")
 
 POLL_SECS = 2.0
 # The log tail that is read each tick. Roblox writes a few KB a second in a

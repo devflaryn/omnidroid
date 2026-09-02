@@ -40,20 +40,34 @@ class LogReading(unittest.TestCase):
         self.assertTrue(in_place_from_log(log, JOINED))
 
     def test_join_then_leave_is_out(self):
+        # what a real leave logs on a 2.735 client (measured 2026-09-03)
         log = ("[FLog::Network] Connection accepted from 1.2.3.4\n"
+               "[FLog::JNIAppBridge] nativeAppBridgeV2LeaveGame:\n"
+               "[FLog::SingleSurfaceApp] leaveUGCGame: (stage:UGCGame)\n"
                "[FLog::Network] Client:Disconnect\n")
         self.assertFalse(in_place_from_log(log, JOINED))
 
+    def test_a_teleport_is_not_a_leave(self):
+        """PS99 teleports: the OLD server's disconnect is logged AFTER the new
+        server's `Connection accepted`. That used to read as 'left' in the
+        middle of a join and put the host pointer back over the game."""
+        log = ("[FLog::Network] Connection accepted from 1.2.3.4\n"
+               "[FLog::Network] Sending disconnect with reason: 285\n"
+               "[FLog::Network] Connection accepted from 5.6.7.8\n"
+               "[FLog::Network] Client:Disconnect\n"
+               "[FLog::Network] Sending disconnect with reason: 285\n")
+        self.assertTrue(in_place_from_log(log, JOINED))
+
     def test_leave_then_rejoin_is_in_place_again(self):
         log = ("[FLog::Network] Connection accepted from 1.2.3.4\n"
-               "[FLog::Network] Sending disconnect with reason: 1\n"
+               "[FLog::JNIAppBridge] nativeAppBridgeV2LeaveGame:\n"
                "[FLog::Network] Connection accepted from 5.6.7.8\n")
         self.assertTrue(in_place_from_log(log, JOINED))
 
     def test_position_not_count_decides(self):
         """Three old joins do not outvote one recent leave."""
         log = ("Connection accepted\nConnection accepted\n"
-               "Connection accepted\nClient:Disconnect\n")
+               "Connection accepted\nleaveUGCGame: (stage:UGCGame)\n")
         self.assertFalse(in_place_from_log(log, JOINED))
 
 
