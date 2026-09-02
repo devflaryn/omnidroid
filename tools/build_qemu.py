@@ -488,17 +488,44 @@ def verify_applied(work: Path, series):
     return out
 
 
-def stage_plan(build_dir: Path, out_dir: Path, targets: list[str]):
-    """(src, dst) pairs for the portable bundle. Pure -- touches no disk."""
+def stage_plan(build_dir: Path, out_dir: Path, targets: list[str],
+               source_dir: Path | None = None):
+    """(src, dst) pairs for the portable bundle. Pure -- touches no disk.
+
+    `source_dir` is the QEMU SOURCE tree (the worktree the series was applied
+    to). It defaults to `build_dir.parent`, which is where `configure` is run
+    from in every path this script takes, so existing callers keep working.
+    """
     exe = ".exe" if _host_key() == "win32" else ""
+    source_dir = source_dir or build_dir.parent
     plan: list[tuple[Path, Path]] = []
     for t in targets:
         name = _TARGET_BINARY[t] + exe
         plan.append((build_dir / name, out_dir / name))
     for tool in STAGED_TOOLS:
         plan.append((build_dir / f"{tool}{exe}", out_dir / f"{tool}{exe}"))
-    # Firmware, wholesale. See the module docstring for why this is not
-    # an allow-list.
+    # Firmware, wholesale, from BOTH trees. See the module docstring for why
+    # this is not an allow-list.
+    #
+    # ⚠ THE SOURCE TREE'S pc-bios IS NOT OPTIONAL and staging only the build
+    # dir's silently produces a bundle that cannot boot anything. QEMU ships
+    # the x86 firmware PREBUILT in the source tree -- `bios-256k.bin`,
+    # `vgabios-*.bin`, `kvmvapic.bin`, 28 blobs in all -- and never copies
+    # them into the build directory. `build/pc-bios` holds only what the
+    # build itself generates (the edk2 .fd images, descriptors, dtb). So a
+    # bundle staged from the build dir alone has every UEFI blob and no BIOS.
+    #
+    # What that looks like is the reason it is worth this much comment: QEMU
+    # exits with **"could not load PC BIOS"** the instant it starts, before
+    # anything is logged, which on this engine's boot path reads exactly like
+    # a GPU that killed the guest -- and the GPU is what gets blamed and
+    # disabled. Found 2026-09-02 by a build that staged clean and then could
+    # not boot a single instance.
+    #
+    # Source first, build dir second: the build's generated blobs win where
+    # the two overlap, which is the correct precedence for anything the build
+    # regenerated.
+    plan.append((source_dir / "pc-bios", out_dir / "share"))
     plan.append((build_dir / "pc-bios", out_dir / "share"))
     return plan
 
@@ -681,16 +708,39 @@ def main(argv=None) -> int:
     # --check` exits 0 iff the patch is ALREADY applied (reversing it would
     # succeed), so that is checked before ever attempting a forward apply.
     series = read_series()
-    for patch in series:
-        if _probe(apply_argv(patch, check=True, reverse=True), cwd=work):
-            print(f"+ already applied: {patch.name}", flush=True)
-            continue
-        if not _probe(apply_argv(patch, check=True), cwd=work):
-            raise SystemExit(
-                f"{patch.name} neither applies cleanly nor is already "
-                "applied -- the tree is in a state this script does not "
-                "recognize; refusing to guess")
-        _run(apply_argv(patch), cwd=work)
+
+    # ⚠ THE "ALREADY APPLIED" TEST HAS TO RUN BACKWARDS, and getting that
+    # wrong is why a fully patched tree used to be un-resumable.
+    #
+    # The per-patch probe below asks `git apply --reverse --check <patch>`,
+    # which means "would undoing this patch succeed" -- a fine question for a
+    # patch nothing else has touched, and the WRONG question here, because
+    # the series is not independent: 0008 edits the very hunk 0005 added. On a
+    # tree carrying the whole series, reverse-checking 0005 fails (its text is
+    # no longer what 0005 wrote), and so does the forward check (it IS
+    # applied) -- so the loop hit "neither applies cleanly nor is already
+    # applied" and refused, on a tree that was perfectly correct.
+    #
+    # Undo order is the reverse of apply order. Reverse-checking the series
+    # from the END asks a question that is actually true of a fully patched
+    # tree, and it is all-or-nothing on purpose: a PARTIALLY applied tree
+    # still falls through to the per-patch loop and its refusal, which is the
+    # state nobody should be guessing about.
+    if series and all(_probe(apply_argv(p, check=True, reverse=True), cwd=work)
+                      for p in reversed(series)):
+        print(f"+ whole series already applied ({len(series)} patches)",
+              flush=True)
+    else:
+        for patch in series:
+            if _probe(apply_argv(patch, check=True, reverse=True), cwd=work):
+                print(f"+ already applied: {patch.name}", flush=True)
+                continue
+            if not _probe(apply_argv(patch, check=True), cwd=work):
+                raise SystemExit(
+                    f"{patch.name} neither applies cleanly nor is already "
+                    "applied -- the tree is in a state this script does not "
+                    "recognize; refusing to guess")
+            _run(apply_argv(patch), cwd=work)
 
     # `git apply` printing OK is not evidence the hunks went where they
     # belong. See verify_applied().
@@ -717,7 +767,7 @@ def main(argv=None) -> int:
     _run(["ninja", f"-j{a.jobs}"], cwd=build)
 
     a.out.mkdir(parents=True, exist_ok=True)
-    plan = stage_plan(build, a.out, targets)
+    plan = stage_plan(build, a.out, targets, source_dir=work)
     for src, dst in plan:
         if src.is_dir():
             shutil.copytree(src, dst, dirs_exist_ok=True)

@@ -1,0 +1,6 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width"><style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}#t{position:fixed;left:20px;top:20px;color:#fff;font:bold 72px monospace;text-shadow:0 0 8px #000}</style></head><body><canvas id="c"></canvas><div id="t">fps</div><script>
+const c=document.getElementById('c'),g=c.getContext('2d');function rs(){c.width=innerWidth;c.height=innerHeight}rs();addEventListener('resize',rs);
+let n=0,t0=performance.now(),hist=[],x=0;const el=document.getElementById('t');
+function f(t){n++;x=(x+6)%c.width;g.fillStyle='#101820';g.fillRect(0,0,c.width,c.height);for(let i=0;i<8;i++){g.fillStyle='hsl('+((t/20+i*45)%360)+',80%,55%)';g.fillRect((x+i*160)%c.width,80+i*100,120,80)}
+if(t-t0>=1000){const fps=n*1000/(t-t0);hist.push(fps);if(hist.length>5)hist.shift();el.textContent='rAF '+fps.toFixed(1)+' fps  avg5 '+(hist.reduce((a,b)=>a+b,0)/hist.length).toFixed(1);n=0;t0=t}
+requestAnimationFrame(f)}requestAnimationFrame(f);</script></body></html>

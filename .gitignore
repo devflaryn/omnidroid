@@ -76,3 +76,4 @@ scratch/
 # committed one would silently redirect somebody else's VMs. See
 # omnidroid/devserver.py.
 configs/dev.json
+bench-runs/

@@ -391,29 +391,80 @@ dumpsys SurfaceFlinger --latency <game layer>
   present -> present  p50  16.51 ms   (60.6 fps)   min 2.09   p90 26.62
 ```
 
-SurfaceFlinger believes it is on 144 Hz and is being handed frames at 60. The
-throttle is below it, and it is **not** in this repo and not in QEMU's virtio
-path: `virtio_gpu_fence_poll` runs on a 10 ms timer, and
-`gd_gl_area_scanout_flush` (`ui/gtk-gl-area.c:182`) just calls
-`gtk_gl_area_queue_render()`. GTK then renders on **GDK3's frame clock, which
-is a hardcoded 16667 µs — 60 Hz — on Windows** regardless of the monitor.
-The host's primary display here is 144 Hz and it makes no difference.
+SurfaceFlinger believes it is on 144 Hz and is being handed frames at 60.
 
-**So the presentation cadence is 60 Hz, and no setting in this project can
-raise it.** Getting past it needs a display backend that is not GTK:
+### CORRECTION, 2026-09-02 (build session): it was the MONITOR, not GDK
 
-* `-display sdl,gl=on` is the candidate. Our own QEMU is **not built with
-  SDL** (`-display help` lists gtk/egl-headless/curses/dbus only) — the
-  msys2 build environment had no SDL2 dev package. The stock 11.0.50 bundle
-  DOES have it, and was tried: the guest never reached adbd in 10 minutes,
-  the same "GL window that never scans out" shape as `egl-headless` on
-  Windows. So SDL is a build-AND-debug task, not a config flip, and it would
-  cost the four `ui/gtk.c` patches (window identity, aspect lock, panel pin,
-  close prompt) which are GTK-only.
-* Anything else means patching how QEMU drives GTK, and the clock being
-  hardcoded is inside GDK, not QEMU.
+The paragraph that used to stand here blamed GDK — "GDK3's frame clock is a
+hardcoded 16667 µs on Windows regardless of the monitor" — and said the
+host's 144 Hz primary "makes no difference". **That is wrong, and the way it
+was got wrong is worth more than the claim was.**
 
-### The fix is written and is NOT built yet: qemu-patches/0009
+Traced from inside a build of patch 0009, printing what QEMU actually reads:
+
+```
+window on the NVIDIA panel    gdk_mhz=144001  win32_hz=144  interval_ms=6
+window on the Parsec display  gdk_mhz=60000   win32_hz=60   interval_ms=16
+```
+
+**GDK 3.24.52 reports 144 Hz correctly.** The 60 Hz readings — including the
+16.51 ms p50 above — are all explained by the QEMU window sitting on the
+**Parsec Virtual Display Adapter**, a real 60 Hz monitor at x = -1920 that
+this box has alongside the 144 Hz panel.
+
+The methodological error: the present-interval measurement and the
+window-position check were taken on **different boots**, minutes and several
+restarts apart, and correlated as though they were one observation. The
+window position was verified once, found on the primary, and then assumed for
+every earlier reading. One `EnumWindows` at the same moment as the
+`--latency` dump would have killed the theory on the spot.
+
+### What is actually true
+
+**Which monitor the window is on is worth 60 → 92 fps, for free.** Measured
+on a controlled load (a `requestAnimationFrame` canvas page in the guest —
+`tools/bench/rAF-fps.html`), SurfaceFlinger timestats, two 30 s samples each:
+
+| build / setting | guest present fps | p50 present→present |
+|---|---|---|
+| `QEMU_UI_REFRESH_HZ=60` | 59.4 / 59.0 | 16.5 ms |
+| `QEMU_UI_REFRESH_HZ=100` | 77.6 / 89.8 | 12.7 / 11.3 ms |
+| `QEMU_UI_REFRESH_HZ=120` | 79.5 / 95.5 | 11.4 / 11.1 ms |
+| `QEMU_UI_REFRESH_HZ=144` | 84.1 / 99.8 | 10.9 / 10.6 ms |
+| **shipped 1.0.37, no 0009, window on the 144 Hz panel** | **92.3 / 92.5** | 11.5 / 11.2 ms |
+| new build, window on the Parsec display | 62.4 / 62.6 | 16.3 / 15.1 ms |
+
+Read the fifth row against the fourth: **the shipped build already does 92 fps
+with no patch at all**, and pinning 144 with 0009 lands in the same band.
+0009's Win32 branch cannot help, because both it and GDK follow the monitor
+*under the window* and they now agree. **The whole 60-vs-92 difference is
+which display the window happens to be on.**
+
+### ⚠ AND THE GUEST'S PRESENT RATE IS NO LONGER WHAT YOU SEE
+
+The same trace logged **60.0 host draws per second while the guest presented
+86 fps.** *That* is GDK3's 16667 µs frame clock — the claim above was right
+about the mechanism and wrong about where it bites. The Win32 GDK backend
+never fills `refresh_interval`, so `gtk_gl_area_queue_render()` cannot draw
+faster than 60 no matter what the guest produces.
+
+So there are two numbers now and they must never be quoted as one:
+
+* **guest present rate** — what `--timestats` counts. Raising it is real: the
+  frames are fresher, so input latency and staleness improve.
+* **host draws/s** — what a person actually sees. Capped at 60 by GDK.
+
+Going past 60 *visibly* needs a frame-clock bypass, which 0009 is not. Over
+Parsec (remote desktop) you are capped at 60 regardless of any of this.
+
+### What 0009 is still good for
+
+The `QEMU_UI_REFRESH_HZ` pin, and mostly for asking for LESS: a host that
+would rather spend the CPU elsewhere has no other way to say so. The Win32
+detection branch is inert on this machine and harmless. Keep it; do not
+expect frames from it.
+
+### qemu-patches/0009 — built and measured 2026-09-02
 
 `0009-omni-win32-refresh-rate.patch` makes
 `gd_update_monitor_refresh_rate()` ask **Windows** for the refresh rate
@@ -425,9 +476,11 @@ rather spend the CPU elsewhere. `update_interval` is integer milliseconds, so
 reachable.
 
 It applies cleanly to the pinned tree (all nine patches do, verified) and
-`_pkgversion()` advertises it as `+omni-refresh`. **It has not been compiled**,
-so nothing above is a measured result yet — the frame-rate claim is a
-prediction from the timer arithmetic, and the honest test is a build.
+`_pkgversion()` advertises it as `+omni-refresh`. **It has since been built**
+(bundle at `C:\qemu-omni-refresh`) and measured — see the correction above.
+The prediction was wrong in the direction that mattered: the Win32 branch is
+inert here because GDK was already right, and the visible cap is the frame
+clock, not the interval. Nothing from it is deployed.
 
 
 ### Building QEMU on this box: three traps, all hit on 2026-09-02

@@ -342,6 +342,43 @@ static void gd_window_close(VirtualConsole *vc)
         self.assertEqual(out, [])
 
 
+class ResumingAFullyPatchedTree(unittest.TestCase):
+    """⚠ A tree carrying the WHOLE series must be resumable.
+
+    The per-patch probe asks `git apply --reverse --check <patch>` -- "would
+    undoing this patch succeed" -- which is the right question only if the
+    patches are independent. They are not: 0008 edits the very hunk 0005
+    added. So on a fully patched tree, reverse-checking 0005 fails (its text
+    is no longer what 0005 wrote) AND the forward check fails (it IS applied),
+    and the loop refused with "neither applies cleanly nor is already
+    applied" on a tree that was perfectly correct. Re-running after a failed
+    ninja -- the normal way anyone uses this script -- was impossible.
+
+    Undo order is the reverse of apply order, so the all-or-nothing probe
+    walks the series BACKWARDS. Asserted here on order alone, with no git and
+    no tree, because that is the whole of the fix.
+    """
+
+    def test_the_series_is_probed_backwards(self):
+        import inspect
+        from tools import build_qemu
+        src = inspect.getsource(build_qemu.main)
+        self.assertIn("reversed(series)", src,
+                      "the already-applied probe must walk the series in "
+                      "UNDO order, or an interdependent patch pair makes a "
+                      "correct tree unresumable")
+
+    def test_a_partial_tree_still_falls_through_to_the_refusal(self):
+        """All-or-nothing on purpose. A HALF-applied tree is the state nobody
+        should be guessing about, and it must still reach the per-patch loop
+        and its SystemExit rather than being waved through."""
+        import inspect
+        from tools import build_qemu
+        src = inspect.getsource(build_qemu.main)
+        self.assertIn("neither applies cleanly nor is already", src)
+        self.assertIn("all(", src)
+
+
 class Stage(unittest.TestCase):
     def test_stages_only_the_emulators_the_engine_invokes(self):
         plan = stage_plan(Path("/b"), Path("/out"),
@@ -358,6 +395,38 @@ class Stage(unittest.TestCase):
         self.assertTrue(any(str(src).endswith("pc-bios") for src, _ in plan),
                         "firmware is loaded lazily and BY NAME -- an "
                         "allow-list boots here and fails on a customer's")
+
+    def test_firmware_comes_from_the_SOURCE_tree_as_well(self):
+        """⚠ THE BUNDLE CANNOT BOOT WITHOUT THIS.
+
+        QEMU ships the x86 firmware PREBUILT in the source tree -- 28 blobs,
+        bios-256k.bin / vgabios-*.bin / kvmvapic.bin -- and never copies them
+        into the build directory; `build/pc-bios` holds only what the build
+        generates (edk2 .fd images, descriptors, dtb). Staged from the build
+        dir alone the bundle has every UEFI blob and NO BIOS, and QEMU exits
+        with "could not load PC BIOS" before it logs anything -- which on
+        this engine's boot path reads exactly like a GPU that killed the
+        guest, so the GPU gets blamed and disabled. Cost a build to find on
+        2026-09-02.
+        """
+        plan = stage_plan(Path("/src/build"), Path("/out"), ["x86_64-softmmu"],
+                          source_dir=Path("/src"))
+        shares = [src for src, dst in plan if dst.name == "share"]
+        self.assertEqual(len(shares), 2, "both pc-bios trees must be staged")
+        self.assertIn(Path("/src/pc-bios"), shares)
+        self.assertIn(Path("/src/build/pc-bios"), shares)
+        # Source first: the build's generated blobs must WIN where they
+        # overlap, and the copy is dirs_exist_ok so later entries overlay.
+        self.assertLess(shares.index(Path("/src/pc-bios")),
+                        shares.index(Path("/src/build/pc-bios")))
+
+    def test_source_dir_defaults_to_the_build_parent(self):
+        """Every path in this script runs configure from <source>/build, so
+        the default keeps older callers correct rather than silently staging
+        nothing."""
+        plan = stage_plan(Path("/src/build"), Path("/out"), ["x86_64-softmmu"])
+        shares = [src for src, dst in plan if dst.name == "share"]
+        self.assertIn(Path("/src/pc-bios"), shares)
 
 
 class ImportsOf(unittest.TestCase):
