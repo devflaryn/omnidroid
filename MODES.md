@@ -327,6 +327,100 @@ silently. `main()` reconfigures stdout/stderr with `errors="replace"` now.
 
 ---
 
+## The 60 fps ceiling, and the layer that was costing two thirds of the frames
+
+*Measured 2026-09-02, PS99 in-world, 1080p, `--smp 8`, autoexec GUI removed,
+30 s of `dumpsys SurfaceFlinger --timestats` per reading.*
+
+"45 fps in the emulator when the same PC runs the same game at 170" is two
+separate problems, and neither of them is the translator or the GPU.
+
+### 1. Every frame was CLIENT composited, and one stray dialog caused it
+
+```
+totalFrames             1664        (51.8 fps)
+clientCompositionFrames 1667        <- 100%
+missedFrames            1209/1805   <- 67%
+```
+
+`clientCompositionFrames == totalFrames` means SurfaceFlinger did a
+**full-screen GPU blend in the guest, through virgl, on every single frame**
+instead of handing the game's buffer to the display controller.
+
+The cause is one layer. Android shows **"Viewing full screen — to exit, swipe
+down from the top"** the first time an app goes immersive and leaves it up
+until somebody taps "Got it". Nobody ever does: farming has no hands on it,
+and on gaming it looks like a harmless toast. It is not harmless — it is a
+THIRD composited layer over the game's SurfaceView and the app's own window,
+and this guest's hwcomposer (`drm_minigbm_celadon` on virtio-gpu) has **one
+plane**. Three layers is one more than it can place, so the whole frame falls
+back to client composition.
+
+`settings put secure immersive_mode_confirmations confirmed` removes it
+(that is the value the platform itself writes when a user taps "Got it"), and
+it is in `consent.SETTINGS` now, so every boot gets it:
+
+| | with the toast | without |
+|---|---|---|
+| clientCompositionFrames | 1667 (100%) | **0** |
+| missedFrames | 1209 / 1805 (67%) | **8 / 1710 (0.5%)** |
+| frames / 30 s | 1664 (51.8 fps) | 1710 (53.3 fps) |
+
+**The frame rate barely moves and that is not the point.** Two thirds of
+frames were missing their deadline and now essentially none are: the number
+is the same and the judder is gone. It is also the difference between the GPU
+doing one full-screen blend per frame and doing none.
+
+### 2. The ceiling is 60, and it is GTK's frame clock
+
+The guest is not capped by anything of Roblox's — `ClientAppSettings.json`
+really does carry `DFIntTaskSchedulerTargetFps: 240`, read back off the live
+instance — and the guest display is a genuine 144 Hz mode:
+
+```
+displayModes = {id=0, resolution=1920x1080, refreshRate=144.00 Hz}
+VSYNC period: 6944411 ns
+```
+
+...yet a cheap scene renders at **exactly 60.0 fps** (1805 frames / 30.065 s)
+and the layer's own present timestamps say why:
+
+```
+dumpsys SurfaceFlinger --latency <game layer>
+  refresh period reported   6.94 ms   (144 Hz)
+  present -> present  p50  16.51 ms   (60.6 fps)   min 2.09   p90 26.62
+```
+
+SurfaceFlinger believes it is on 144 Hz and is being handed frames at 60. The
+throttle is below it, and it is **not** in this repo and not in QEMU's virtio
+path: `virtio_gpu_fence_poll` runs on a 10 ms timer, and
+`gd_gl_area_scanout_flush` (`ui/gtk-gl-area.c:182`) just calls
+`gtk_gl_area_queue_render()`. GTK then renders on **GDK3's frame clock, which
+is a hardcoded 16667 µs — 60 Hz — on Windows** regardless of the monitor.
+The host's primary display here is 144 Hz and it makes no difference.
+
+**So the presentation cadence is 60 Hz, and no setting in this project can
+raise it.** Getting past it needs a display backend that is not GTK:
+
+* `-display sdl,gl=on` is the candidate. Our own QEMU is **not built with
+  SDL** (`-display help` lists gtk/egl-headless/curses/dbus only) — the
+  msys2 build environment had no SDL2 dev package. The stock 11.0.50 bundle
+  DOES have it, and was tried: the guest never reached adbd in 10 minutes,
+  the same "GL window that never scans out" shape as `egl-headless` on
+  Windows. So SDL is a build-AND-debug task, not a config flip, and it would
+  cost the four `ui/gtk.c` patches (window identity, aspect lock, panel pin,
+  close prompt) which are GTK-only.
+* Anything else means patching how QEMU drives GTK, and the clock being
+  hardcoded is inside GDK, not QEMU.
+
+Worth knowing before anyone spends a week on it: at 1080p in-world the guest
+is at **135-185% of the 800% it has** (5.5 cores idle), SurfaceFlinger is
+~2%, the translator is 1.0-1.5x, and 800p renders at the same frame rate as
+1080p. Nothing downstream of the cadence is saturated. The 60 Hz cap is the
+whole remaining story on this host.
+
+---
+
 ## The translator is not the wall
 
 *Measured 2026-09-01 on the x86 base, inside a live guest.*

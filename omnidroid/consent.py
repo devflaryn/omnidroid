@@ -68,6 +68,40 @@ SETTINGS = (
     # The legacy unknown-sources master switch. Already 1 on the shipped base;
     # written anyway so the policy is self-contained on a base that lacks it.
     ("secure", "install_non_market_apps", 1),
+    # ⚠ THIS ONE IS A FRAME-RATE FIX, NOT A COSMETIC ONE, and it is the single
+    # largest smoothness win measured on this stack.
+    #
+    # Android shows "Viewing full screen — to exit, swipe down from the top"
+    # the first time an app goes immersive, and it stays on screen until it is
+    # dismissed. Nobody dismisses it: farming has no hands on it, and on a
+    # gaming instance it sits in the corner looking like a harmless toast.
+    #
+    # It is not harmless. It is a THIRD composited layer over the game's
+    # SurfaceView and the app's own window, and this guest's hwcomposer
+    # (`drm_minigbm_celadon` on virtio-gpu) has one plane. Three layers is one
+    # more than it can put on that plane, so SurfaceFlinger falls back to
+    # CLIENT composition -- a full-screen GPU blend, in the guest, through
+    # virgl, on every single frame.
+    #
+    # MEASURED 2026-09-02 on a live in-world PS99 gaming instance at 1080p,
+    # 30 s of `dumpsys SurfaceFlinger --timestats`, nothing else changed:
+    #
+    #                            with the toast      after this setting
+    #   clientCompositionFrames    1667 (100%)          0  (0%)
+    #   missedFrames               1209/1805 (67%)      8/1710 (0.5%)
+    #   frames / 30 s              1664 (51.8 fps)      1710 (53.3 fps)
+    #
+    # The frame rate barely moves because the presentation cadence is capped
+    # elsewhere (QEMU presents through GTK, whose frame clock is 60 Hz on
+    # Windows -- see MODES.md). What moves is JANK: two thirds of frames were
+    # missing their deadline and now essentially none are, which is the
+    # difference between judder and smooth at the same number.
+    #
+    # `confirmed` is the value the platform itself writes once a user taps
+    # "Got it" (ImmersiveModeConfirmation reads it as a package list, and this
+    # sentinel means "never ask again"), so this is the supported way to say
+    # it rather than a trick.
+    ("secure", "immersive_mode_confirmations", "confirmed"),
 )
 
 
