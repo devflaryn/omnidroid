@@ -14,3 +14,4 @@
 0012-omni-present-now.patch
 0013-omni-pointer-lock.patch
 0014-omni-virgl-fence-poll-env.patch
+0015-omni-win32-fence-watch.patch

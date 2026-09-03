@@ -1,0 +1,236 @@
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1032,6 +1032,209 @@
+ static void virtio_gpu_virgl_process_cmd_inner(VirtIOGPU *g,
+                                                struct virtio_gpu_ctrl_command *cmd);
+ static int64_t omni_fence_created[256];
++static void virtio_gpu_fence_poll(void *opaque);
++
++#ifdef _WIN32
++#include <epoxy/gl.h>
++#include <epoxy/wgl.h>
++#include "qemu/thread.h"
++#include "qemu/main-loop.h"
++
++/* omni: event-driven fence completion on Windows.
++ *
++ * On the GTK/WGL path there is no EGL display, so QEMU never asks
++ * virglrenderer for its sync thread (and the mingw virglrenderer has no
++ * eventfd to run one anyway). A fence the guest blocks on -- Mesa's
++ * get_query_result(wait) for an occlusion query, the swap in Present --
++ * is therefore only discovered when virgl_renderer_poll() happens to run:
++ * after some other guest command batch, or on the 10 ms fence_poll timer.
++ * While the guest's render thread is the one blocked, nobody else submits,
++ * so every such wait costs a timer period. Roblox's profiler showed it:
++ * queryOcclusion + Present = 12-13 ms of a 38 ms frame with the GPU 15%
++ * busy.
++ *
++ * Fix: right after virglrenderer creates its fence (same thread, same
++ * current GL context, so ours lands after its in the command stream), put
++ * our own glFenceSync into a queue. A watcher thread with a second WGL
++ * context in the same share group blocks in glClientWaitSync on it and,
++ * when it signals, schedules a bottom half that runs the normal fence poll
++ * on the main loop. Latency goes from "next timer tick" to "GPU done".
++ * The timer stays as the fallback. OMNI_FENCE_WATCH=0 disables it. */
++typedef struct OmniFenceWatch {
++    GLsync sync;
++    QSIMPLEQ_ENTRY(OmniFenceWatch) next;
++} OmniFenceWatch;
++
++static struct {
++    int state;              /* 0 untried, 1 running, -1 off */
++    int attempts;
++    HGLRC rc;
++    HWND hwnd;
++    QemuThread thread;
++    QemuMutex lock;
++    QemuCond cond;
++    QSIMPLEQ_HEAD(, OmniFenceWatch) q;
++    QEMUBH *bh;
++    int64_t armed, fired, bhs;
++} omni_fw;
++
++static void omni_fence_watch_bh(void *opaque)
++{
++    VirtIOGPU *g = opaque;
++
++    omni_fw.bhs++;
++    virtio_gpu_fence_poll(g);
++}
++
++static void *omni_fence_watch_thread(void *arg)
++{
++    OmniFenceWatch *w;
++    GLenum r;
++    HDC dc = GetDC(omni_fw.hwnd);
++
++    if (!dc || !wglMakeCurrent(dc, omni_fw.rc)) {
++        fprintf(stderr, "omni-fence-watch: watcher wglMakeCurrent failed "
++                "(%lu); falling back to the timer\n", GetLastError());
++        omni_fw.state = -1;
++        return NULL;
++    }
++
++    qemu_mutex_lock(&omni_fw.lock);
++    for (;;) {
++        while (QSIMPLEQ_EMPTY(&omni_fw.q)) {
++            qemu_cond_wait(&omni_fw.cond, &omni_fw.lock);
++        }
++        w = QSIMPLEQ_FIRST(&omni_fw.q);
++        QSIMPLEQ_REMOVE_HEAD(&omni_fw.q, next);
++        qemu_mutex_unlock(&omni_fw.lock);
++
++        do {
++            r = glClientWaitSync(w->sync, 0, 20 * 1000 * 1000);
++        } while (r == GL_TIMEOUT_EXPIRED);
++        glDeleteSync(w->sync);
++        g_free(w);
++
++        qemu_mutex_lock(&omni_fw.lock);
++        omni_fw.fired++;
++        /* drain whatever else has already signalled: one wake-up for all */
++        while (!QSIMPLEQ_EMPTY(&omni_fw.q)) {
++            w = QSIMPLEQ_FIRST(&omni_fw.q);
++            r = glClientWaitSync(w->sync, 0, 0);
++            if (r == GL_TIMEOUT_EXPIRED) {
++                break;
++            }
++            QSIMPLEQ_REMOVE_HEAD(&omni_fw.q, next);
++            glDeleteSync(w->sync);
++            g_free(w);
++            omni_fw.fired++;
++        }
++        qemu_bh_schedule(omni_fw.bh);
++    }
++    return NULL;
++}
++
++static bool omni_fence_watch_init(VirtIOGPU *g)
++{
++    HGLRC cur = wglGetCurrentContext();
++    HDC dc = wglGetCurrentDC();
++    HWND hwnd;
++    HGLRC rc = NULL;
++
++    if (!cur || !dc) {
++        return false;
++    }
++    hwnd = WindowFromDC(dc);
++    if (!hwnd) {
++        return false;
++    }
++    if (epoxy_has_wgl_extension(dc, "WGL_ARB_create_context")) {
++        int attribs[] = {
++            WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
++            WGL_CONTEXT_MINOR_VERSION_ARB, 2,
++            WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
++            0
++        };
++        rc = wglCreateContextAttribsARB(dc, cur, attribs);
++    }
++    if (!rc) {
++        rc = wglCreateContext(dc);
++        if (rc && !wglShareLists(cur, rc)) {
++            wglDeleteContext(rc);
++            rc = NULL;
++        }
++    }
++    if (!rc) {
++        fprintf(stderr, "omni-fence-watch: no shared WGL context (%lu)\n",
++                GetLastError());
++        return false;
++    }
++
++    omni_fw.rc = rc;
++    omni_fw.hwnd = hwnd;
++    qemu_mutex_init(&omni_fw.lock);
++    qemu_cond_init(&omni_fw.cond);
++    QSIMPLEQ_INIT(&omni_fw.q);
++    omni_fw.bh = virtio_bh_io_new_guarded(DEVICE(g), omni_fence_watch_bh, g);
++    qemu_thread_create(&omni_fw.thread, "omni-fence-watch",
++                       omni_fence_watch_thread, NULL, QEMU_THREAD_DETACHED);
++    return true;
++}
++
++static void omni_fence_watch_arm(VirtIOGPU *g)
++{
++    OmniFenceWatch *w;
++    GLsync s;
++
++    if (omni_fw.state < 0) {
++        return;
++    }
++    if (omni_fw.state == 0) {
++        const char *e = getenv("OMNI_FENCE_WATCH");
++        if (e && *e == '0') {
++            omni_fw.state = -1;
++            fprintf(stderr, "omni-fence-watch: disabled by env\n");
++            return;
++        }
++        if (!omni_fence_watch_init(g)) {
++            if (++omni_fw.attempts > 256) {
++                omni_fw.state = -1;
++                fprintf(stderr, "omni-fence-watch: giving up; timer only\n");
++            }
++            return;
++        }
++        omni_fw.state = 1;
++        fprintf(stderr, "omni-fence-watch: on (hwnd %p)\n", (void *)omni_fw.hwnd);
++    }
++    if (!wglGetCurrentContext()) {
++        return;
++    }
++    s = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    if (!s) {
++        return;
++    }
++    glFlush();
++    w = g_new0(OmniFenceWatch, 1);
++    w->sync = s;
++    qemu_mutex_lock(&omni_fw.lock);
++    QSIMPLEQ_INSERT_TAIL(&omni_fw.q, w, next);
++    omni_fw.armed++;
++    qemu_cond_signal(&omni_fw.cond);
++    qemu_mutex_unlock(&omni_fw.lock);
++}
++
++static void omni_fence_watch_stat(void)
++{
++    if (omni_fw.state == 1) {
++        fprintf(stderr, "omni-fence-watch: armed %" PRId64 " fired %" PRId64
++                " wakeups %" PRId64 "\n", omni_fw.armed, omni_fw.fired,
++                omni_fw.bhs);
++        omni_fw.armed = omni_fw.fired = omni_fw.bhs = 0;
++    }
++}
++#else
++static void omni_fence_watch_arm(VirtIOGPU *g) { }
++static void omni_fence_watch_stat(void) { }
++#endif
+ 
+ /* omni: QEMU_VIRGL_STATS=1 prints, once a second, how much MAIN-THREAD
+  * time the virgl command processing took, by command class. This is the
+@@ -1198,6 +1401,7 @@
+                           "%s: virgl_renderer_context_create_fence error: %s",
+                           __func__, strerror(-ret));
+         }
++        omni_fence_watch_arm(g);
+         return;
+     }
+ #endif
+@@ -1214,6 +1418,7 @@
+     }
+     omni_fence_created[cmd->cmd_hdr.fence_id & 255] =
+         qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    omni_fence_watch_arm(g);
+ }
+ 
+ /* omni: QEMU_VIRGL_STATS=1 -- fence creation-to-signal latency, i.e. how
+@@ -1246,6 +1451,7 @@
+             fprintf(stderr, "omni-fence-stats: %4" PRId64 " fences, latency "
+                     "avg %6.2f ms max %6.2f ms\n", n, sum_ns / 1e6 / n,
+                     max_ns / 1e6);
++            omni_fence_watch_stat();
+         }
+         last_print = now; sum_ns = max_ns = n = 0;
+     }
