@@ -551,8 +551,19 @@ def client_settings_json(settings=None):
     Sorted so the file is byte-stable across runs — it lands inside an image
     or a diff often enough that churn would be noise."""
     import json as _json
-    return _json.dumps(settings or CLIENT_APP_SETTINGS,
-                       indent=2, sort_keys=True)
+    import os as _os
+    merged = dict(settings or CLIENT_APP_SETTINGS)
+    # OMNI_APP_SETTINGS_EXTRA: a JSON object of extra FFlags merged OVER the
+    # profile, for A/B runs against a live game without editing a profile
+    # (2026-09-03: occlusion-query and present flags found with the
+    # MicroProfiler). Never used by a production launch.
+    extra = _os.environ.get("OMNI_APP_SETTINGS_EXTRA")
+    if extra:
+        try:
+            merged.update(_json.loads(extra))
+        except ValueError:
+            pass
+    return _json.dumps(merged, indent=2, sort_keys=True)
 
 
 # --------------------------------------------------- per-game memory floor

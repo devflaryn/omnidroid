@@ -1324,6 +1324,17 @@ def block_external_hosts(acct, label):
     `rebuild-base`/`strip-base` step) -- /system belongs to the base, not to a
     per-account offset overlay."""
     ip = _executor_redirect_ip()
+    # OMNI_EXTRA_HOSTS="host=ip host2=ip": more redirects, for experiments
+    # (2026-09-03: standing in for clientsettingscdn.roblox.com to flip
+    # fast flags the allowlist ignores). Never set by a production launch.
+    extra = []
+    for item in (os.environ.get("OMNI_EXTRA_HOSTS") or "").split():
+        host, _, eip = item.partition("=")
+        if host and eip:
+            extra.append((host, eip))
+    extra_lines = "".join(
+        f"sed -i \"/[[:space:]]{h}\\$/d\" $H 2>/dev/null; echo \"{e} {h}\" >> $H; "
+        for h, e in extra)
     # remount rootfs rw (system-as-root base: /system lives on /); drop any stale
     # line for each host (so a base baked with the old 127.0.0.1 entries is
     # corrected), then add our redirect. The file is tiny and re-provision is rare.
@@ -1335,6 +1346,7 @@ def block_external_hosts(acct, label):
         "sed -i \"/[[:space:]]$h\\$/d\" $H 2>/dev/null; "
         f"echo \"{ip} $h\" >> $H; "
         "done; "
+        + extra_lines +
         "ndc resolver flushnetdns 100 2>/dev/null; true"
     )
     try:

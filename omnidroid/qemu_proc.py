@@ -2634,6 +2634,12 @@ def _apply_host_gpu_preference(cmd, label=None):
         line = hostgpu.describe(hostgpu.apply(exe), exe)
         if line:
             print(f"[{label or 'gpu'}] {line}")
+        # ...and, on an NVIDIA host, the driver's per-app power mode: the
+        # card otherwise idles at a fifth of its clock under a virgl guest's
+        # bursty load and every GPU wait in the frame is five times longer
+        # (omnidroid/nvprofile.py; measured +20% in PS99).
+        from omnidroid import nvprofile
+        print(f"[{label or 'gpu'}] {nvprofile.describe(nvprofile.apply(exe))}")
     except Exception:                       # noqa: BLE001 - never cost a boot
         pass
 
