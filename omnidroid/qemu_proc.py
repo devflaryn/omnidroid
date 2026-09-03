@@ -287,7 +287,10 @@ def display_override(cfg=None):
 
 # venus REQUIRES blob=true and a hostmem window to init at all -- without
 # both, virtio-gpu accepts the option and the guest's Vulkan driver still
-# never comes up. See HANDOFF-VENUS.md.
+# never comes up. Measured 2026-09-03: on a Windows host virglrenderer's
+# venus needs the POSIX render server (fork/socketpair/epoll) and fd/dma_buf
+# memory export; with venus=on virgl_renderer_init fails and the guest boots
+# with no GPU at all. See docs/bench-2026-09-03.md third pass, HANDOFF-VENUS.md.
 VENUS_GPU_OPTS = "venus=on,blob=true,hostmem=1G"
 
 

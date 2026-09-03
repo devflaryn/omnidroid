@@ -1,0 +1,198 @@
+diff --git a/meson.build b/meson.build
+index 69c1bb8..58471d0 100644
+--- a/meson.build
++++ b/meson.build
+@@ -346,7 +346,10 @@ if with_check_gl_errors
+ endif
+ 
+ with_venus = get_option('venus')
+-with_render_server = with_venus
++# mingw/Windows: the render server is a separate fork()ed process using
++# socketpair()/SCM_RIGHTS/epoll; it has no Windows equivalent.  Venus works
++# in-process (vkr_*), which is what QEMU uses by default, so build only that.
++with_render_server = with_venus and not with_host_windows
+ with_render_server_worker = get_option('render-server-worker')
+ render_server_install_dir = get_option('prefix') / get_option('libexecdir')
+ if with_venus
+@@ -366,6 +369,9 @@ if with_venus
+    endif
+ 
+    conf_data.set('ENABLE_VENUS', 1)
++endif
++
++if with_render_server
+    conf_data.set('ENABLE_RENDER_SERVER', 1)
+    conf_data.set('RENDER_SERVER_EXEC_PATH',
+                  '"' + render_server_install_dir / 'virgl_render_server' + '"')
+diff --git a/src/drm/drm-uapi/drm.h b/src/drm/drm-uapi/drm.h
+index c5bd3e9..8ac9df3 100644
+--- a/src/drm/drm-uapi/drm.h
++++ b/src/drm/drm-uapi/drm.h
+@@ -44,7 +44,9 @@ typedef unsigned int drm_handle_t;
+ #else /* One of the BSDs */
+ 
+ #include <stdint.h>
++#ifndef WIN32
+ #include <sys/ioccom.h>
++#endif
+ #include <sys/types.h>
+ typedef int8_t   __s8;
+ typedef uint8_t  __u8;
+diff --git a/src/mesa/compat/c11/threads_win32.h b/src/mesa/compat/c11/threads_win32.h
+index 9f00d44..4c93d94 100644
+--- a/src/mesa/compat/c11/threads_win32.h
++++ b/src/mesa/compat/c11/threads_win32.h
+@@ -175,7 +175,7 @@ static int impl_tss_dtor_register(tss_t key, tss_dtor_t dtor)
+     return 0;
+ }
+ 
+-static void impl_tss_dtor_invoke()
++static void impl_tss_dtor_invoke(void)
+ {
+     int i;
+     for (i = 0; i < EMULATED_THREADS_TSS_DTOR_SLOTNUM; i++) {
+diff --git a/src/mman_win32.c b/src/mman_win32.c
+index 9f3eab4..8349059 100644
+--- a/src/mman_win32.c
++++ b/src/mman_win32.c
+@@ -198,3 +198,10 @@ int munlock(const void *addr, size_t len)
+ 
+    return -1;
+ }
++
++int getpagesize(void)
++{
++   SYSTEM_INFO si;
++   GetSystemInfo(&si);
++   return (int)si.dwPageSize;
++}
+diff --git a/src/mman_win32.h b/src/mman_win32.h
+index 0916f17..29a5e00 100644
+--- a/src/mman_win32.h
++++ b/src/mman_win32.h
+@@ -55,5 +55,6 @@ int _mprotect(void *addr, size_t len, int prot);
+ int msync(void *addr, size_t len, int flags);
+ int mlock(const void *addr, size_t len);
+ int munlock(const void *addr, size_t len);
++int getpagesize(void);
+ 
+ #endif /* _MMAN_WIN32_H_ */
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 4bf526a..07e9157 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -5,7 +5,11 @@
+ 
+ #include "vkr_context.h"
+ 
++#ifndef _WIN32
+ #include <sys/mman.h>
++#else
++#include "mman_win32.h"
++#endif
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index ffe621b..864fe8c 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -5,6 +5,11 @@
+ 
+ #include "vkr_device_memory.h"
+ 
++#ifdef _WIN32
++/* mingw has no getpagesize(); mman_win32.h provides a GetSystemInfo-based one */
++#include "mman_win32.h"
++#endif
++
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
+ #include "vkr_device_memory_gen.h"
+diff --git a/src/venus/vkr_library.c b/src/venus/vkr_library.c
+index 5cd3996..6a5c512 100644
+--- a/src/venus/vkr_library.c
++++ b/src/venus/vkr_library.c
+@@ -6,7 +6,9 @@
+ #include "vkr_common.h"
+ #include "vkr_library.h"
+ 
++#if defined(ENABLE_VULKAN_DLOAD)
+ #include <dlfcn.h>
++#endif
+ 
+ void
+ vkr_library_preload_icd(void)
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 0e46df8..40b5b4a 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -6,7 +6,11 @@
+ #include "vkr_ring.h"
+ 
+ #include <stdio.h>
++#ifndef _WIN32
+ #include <sys/resource.h>
++#else
++#include <windows.h>
++#endif
+ #include <time.h>
+ 
+ #include "venus-protocol/vn_protocol_renderer_dispatches.h"
+@@ -240,6 +244,30 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
+    return true;
+ }
+ 
++#ifdef _WIN32
++/* Windows has no setpriority(PRIO_PROCESS, ...) per-thread nice value.  Map the
++ * POSIX nice range (-20 highest .. 19 lowest) onto Windows thread priorities.
++ * Returns 0 on success like setpriority().
++ */
++static int
++vkr_ring_set_thread_priority(int prio)
++{
++   int win_prio;
++   if (prio <= -10)
++      win_prio = THREAD_PRIORITY_HIGHEST;
++   else if (prio < 0)
++      win_prio = THREAD_PRIORITY_ABOVE_NORMAL;
++   else if (prio == 0)
++      win_prio = THREAD_PRIORITY_NORMAL;
++   else if (prio < 10)
++      win_prio = THREAD_PRIORITY_BELOW_NORMAL;
++   else
++      win_prio = THREAD_PRIORITY_LOWEST;
++
++   return SetThreadPriority(GetCurrentThread(), win_prio) ? 0 : -1;
++}
++#endif
++
+ static int
+ vkr_ring_thread(void *arg)
+ {
+@@ -249,7 +277,11 @@ vkr_ring_thread(void *arg)
+ 
+    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
+    u_thread_setname(thread_name);
++#ifdef _WIN32
++   if (ring->prio_valid && vkr_ring_set_thread_priority(ring->prio)) {
++#else
+    if (ring->prio_valid && setpriority(PRIO_PROCESS, 0, ring->prio)) {
++#endif
+ #ifdef DEBUG
+       /* Currently venus doesn't forward the CAP_SYS_NICE request upon forking, so
+        * requesting a high priority outside of the normal range would be at the best
+@@ -352,7 +384,13 @@ bool
+ vkr_ring_stop(struct vkr_ring *ring)
+ {
+    mtx_lock(&ring->mutex);
++#ifdef _WIN32
++   /* mesa's c11 win32 shim intentionally has no thrd_current() (thrd_t is a
++    * HANDLE; only thread ids may be compared) -- compare ids directly. */
++   if (GetThreadId(ring->thread) == GetCurrentThreadId()) {
++#else
+    if (thrd_equal(ring->thread, thrd_current())) {
++#endif
+       mtx_unlock(&ring->mutex);
+       return false;
+    }
