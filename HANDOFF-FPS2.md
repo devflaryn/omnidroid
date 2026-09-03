@@ -56,42 +56,91 @@ thread waits on is a CPU→GPU→CPU round-trip. ~8 per frame, and they serializ
   `venus-cannot-work-on-windows-host` memory). Quality level, thread pinning,
   affinity, Berberis, power plan: all null (`docs/bench-2026-09-03.md`).
 
-## THE JOB: get to 60 (stretch 75)
+## THE JOB: get the most fps possible WITHOUT anything Roblox can detect (≥60, stretch 75)
 
 Two independent tracks. **Track A is reachable and the place to start.**
 
-### Track A — async occlusion (kills the 7.3 ms queryOcclusion stall) → ~58-62 fps
+### The guardrail — why this is undetectable, and the one rule
+
+The user's hard constraint: **no client modification, nothing Roblox's
+anti-cheat (Hyperion/Byfron) can flag.** Every lever in this handoff obeys it
+by construction, because of one architectural fact:
+
+**Roblox runs INSIDE the guest Android; every change here is HOST-side (QEMU /
+virglrenderer / kernel cmdline / launch config), OUTSIDE the guest.** Roblox's
+anti-cheat can only inspect its own process — the client binary, its loaded
+libraries, injected hooks, and client files. It cannot see the host QEMU
+process, the virgl GPU renderer, or the hypervisor, exactly as a PC game cannot
+read its graphics driver's internals. So:
+
+* Async/instant occlusion (Track A) returns query results that are
+  **indistinguishable from ordinary GPU/driver timing** — occlusion queries are
+  asynchronous by spec and drivers legitimately return results with varying
+  latency or "not occluded" when culling is off. It touches no guest byte. It
+  also does not produce see-through/ESP visuals (the depth test still hides
+  occluded pixels), so it does not even LOOK like a cheat.
+* Occlusion results are **never sent to the server** — they are pure client-side
+  render culling. No server-side signal exists.
+* The fence watcher (0015), CPU model, GPU clock, kernel args, present path:
+  all host-side, all invisible to the guest.
+
+**THE RULE — do not cross into the guest for performance.** Never edit the
+client APK, never write Roblox FFlags / `ClientAppSettings.json`, never inject
+or hook client code, never use executor functions (`setfpscap`, etc.) as a
+"fix". Those ARE things Roblox can detect. Keep every optimization in QEMU /
+virglrenderer / the kernel cmdline / the launch config. (Note: the base already
+runs a patched executor APK — that is the user's existing, separate risk
+surface; do not add to it. Your fps work must not touch the client.)
+
+### Track A — kill the 7.3 ms queryOcclusion stall → ~58-62 fps
 
 Roblox reads occlusion queries back on the render thread, same frame. Each read
-blocks until the GPU finishes the depth pass. Return the **previous frame's**
-result instead (standard temporal-occlusion technique; every AAA engine does
-it). Quality cost: 1 frame of culling latency → at worst a rare edge-pop on a
-fast camera cut, imperceptible in a pet-sim. Confirm with the user that this
-counts as "no quality loss" for them.
+blocks until the GPU finishes the depth pass — that is the 7.3 ms. Two ways to
+stop the render thread waiting, **try A1 first (it is provably pixel-identical):**
+
+**A1 — return the query as "visible" INSTANTLY (strictly zero visible change).**
+Make the query result available immediately with a large sample count so Mesa's
+`resource_wait` returns at once and Roblox reads "not occluded". Roblox then
+DRAWS every object, including the hidden ones — but the depth test discards the
+hidden pixels, so the **final image is pixel-for-pixel identical**. The only
+cost is the GPU draws more geometry; the RTX 4060 is at 15% util so it likely
+absorbs it, but MEASURE — if the extra overdraw costs more than the 7.3 ms it
+saves, it is a wash. This is the option that cannot look wrong, so it is the one
+to land if it holds. (It effectively disables occlusion culling; the queries
+still run, they just never stall and never hide anything.)
+
+**A2 — return the PREVIOUS frame's real result (temporal occlusion).** Keeps
+culling (less GPU work than A1) but reads the query one frame late so the render
+thread never waits. Quality cost: an object becoming visible THIS frame was
+"hidden" last frame, so for one frame (~17 ms) it can pop in late — only on fast
+camera whips, invisible in a pet-sim, and the technique every console game
+ships. Use A2 only if A1's extra GPU cost is too high. Confirm with the user
+that a 1-frame edge-pop counts as "no quality loss" before shipping A2.
 
 **Do it host-side in virglrenderer (recommended — build tooling exists, no base
-image change):** in `src/vrend/vrend_renderer.c`, the occlusion query result is
+image change):** in `src/vrend/vrend_renderer.c` the occlusion query result is
 written to a coherent guest buffer by `vrend_check_query` only after the GL
-query is available (post-GPU). The guest Mesa (`virgl_get_query_result`,
+query is available (post-GPU); the guest Mesa (`virgl_get_query_result`,
 wait=true → `resource_wait` → `DRM_IOCTL_VIRTGPU_WAIT`) blocks on that buffer's
-busy state. Make the query result buffer report `VIRGL_QUERY_STATE_DONE` with
-the last-known sample count **immediately** at query-end (so the guest's wait
-returns at once and reads the stale-but-valid result), and update the cached
-value when the GPU actually finishes, for the next frame. The busy/fence
-tracking for that specific buffer is the tricky part — study `vrend_check_query`
-/ `vrend_get_query_result` / `vrend_get_one_query_result` and how the query
-buffer resource's busy flag is set. Gate behind an env var
-(`OMNI_ASYNC_OCCLUSION=1`), build the DLL with `omnidroid/tools/virglrenderer-venus/build.sh`
-minus `-Dvenus=true` (i.e. `meson setup build --buildtype=release`), drop it
-into a copy of `C:\qemu-omni-next`, and A/B.
+busy state. For A1: write a DONE result with a large sample count immediately at
+query-end and never mark that buffer busy for the readback. For A2: same, but
+write the last-known real value and refresh it when the GPU finishes. Study
+`vrend_check_query` / `vrend_get_query_result` / `vrend_get_one_query_result`
+and the query buffer's busy flag; the busy/fence tracking for that specific
+buffer is the fiddly part. Gate behind `OMNI_ASYNC_OCCLUSION=1`, build the DLL
+with `omnidroid/tools/virglrenderer-venus/build.sh` minus `-Dvenus=true`
+(i.e. `meson setup build --buildtype=release`), drop it into a copy of
+`C:\qemu-omni-next`, and A/B. Note: query results also feed Roblox visual
+effects that use occlusion (e.g. sun-glare fades) — PS99 shows none, but sanity
+-check the scene looks right, not just the fps.
 
 **Alternative (guest-side, cleaner logic but touches the base image — ask
 first):** patch Mesa's `virgl_get_query_result` to call with wait=false and
-return the last result. That means building Android x86_64 Mesa and swapping
-`libgallium_dri.so` in the base — higher risk, base-image change.
+return the last/"visible" result. That means building Android x86_64 Mesa and
+swapping `libgallium_dri.so` in the base — higher risk, base-image change.
 
-Reality check: async occlusion removes ~7 ms of a ~21 ms frame → ~14 ms →
-~58-70 fps depending on how Present then overlaps. That alone should clear 60.
+Reality check: removing ~7 ms of a ~21 ms frame → ~14 ms → ~58-70 fps depending
+on how Present then overlaps. A1 or A2 alone should clear 60.
 
 ### Track B — MuMu parity via gfxstream (the real 75+ path; large effort)
 
@@ -187,13 +236,25 @@ before trusting any fps.
 > 15% busy and the guest 70% idle. MuMu gets 75 on the same PC/APK/game because
 > it uses an in-process gfxstream renderer with no such round-trips.
 >
-> Your job: get PS99 to at least 60 fps at the same resolution and no
-> perceptible quality loss. Start with Track A in the handoff — async occlusion
-> (return the previous frame's occlusion-query result so the render thread stops
-> waiting for the depth pass), done host-side in virglrenderer behind
-> OMNI_ASYNC_OCCLUSION=1, then A/B it. That removes ~7 ms of a ~21 ms frame and
-> should clear 60. Track B (gfxstream, the real MuMu-parity path to 75+) is a
-> larger spike — scope it only if the user wants beyond 60.
+> Your job: get PS99 to the highest fps possible (at least 60, same resolution)
+> with NO quality loss and — the user's hard constraint — NOTHING Roblox's
+> anti-cheat can detect. The guardrail that makes this safe: keep EVERY change
+> host-side (QEMU / virglrenderer / kernel cmdline / launch config), never touch
+> the guest client — no APK edits, no FFlags, no client hooks, no executor
+> "fixes". Roblox runs inside the guest and cannot see the host renderer, so
+> host-side changes are invisible to it.
+>
+> Start with Track A → A1 in the handoff: make the occlusion-query readback
+> return "visible" INSTANTLY host-side in virglrenderer (behind
+> OMNI_ASYNC_OCCLUSION=1). Roblox then draws every object but the depth test
+> discards the hidden pixels, so the image is PIXEL-IDENTICAL and it is
+> indistinguishable from a GPU with culling off — zero quality loss, zero
+> detection surface. Measure whether the extra overdraw fits (GPU is 15% busy,
+> it probably does). Only if it costs too much GPU, fall back to A2 (previous
+> frame's result; 1-frame edge-pop, ask the user first). Removing that ~7 ms of
+> a ~21 ms frame should clear 60. Track B (gfxstream, the real MuMu-parity path
+> to 75+) is a larger host-side spike — scope it only if the user wants beyond
+> 60.
 >
 > The measurement protocol in the handoff is not optional: spare account
 > admn1b12farm2, place 8737899170, offset omniexec-2.735.1138-lock2, QEMU at
