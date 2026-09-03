@@ -285,6 +285,26 @@ def display_override(cfg=None):
     return ""
 
 
+# venus REQUIRES blob=true and a hostmem window to init at all -- without
+# both, virtio-gpu accepts the option and the guest's Vulkan driver still
+# never comes up. See HANDOFF-VENUS.md.
+VENUS_GPU_OPTS = "venus=on,blob=true,hostmem=1G"
+
+
+def venus_enabled(cfg=None):
+    """Whether to add the venus/Vulkan suboptions to the GL device line.
+
+    OFF by default -- this is an A/B testing hatch, not a product default;
+    see HANDOFF-VENUS.md. Env OMNI_VENUS first, then config `qemu.venus`,
+    same truthiness style as force_video_mode().
+    """
+    env = os.environ.get("OMNI_VENUS", "").strip()
+    if env:
+        return env not in ("0", "false", "False", "no")
+    value = ((cfg or {}).get("qemu") or {}).get("venus")
+    return False if value is None else bool(value)
+
+
 def gpu_extra_opts(cfg=None):
     """Extra `-device virtio-gpu-gl-pci` suboptions, from config or env.
 
@@ -294,12 +314,20 @@ def gpu_extra_opts(cfg=None):
     host-driver dependent in ways no capability probe can answer: they either
     fix the scanout or break the boot, and which one it is has to be measured
     per host. A bad value costs one boot and is undone by unsetting it.
+
+    When venus_enabled(cfg), VENUS_GPU_OPTS is prepended ahead of whatever the
+    user gave explicitly -- dedupe is NOT attempted; a repeated key is a user
+    misconfiguration and QEMU errors on it clearly.
     """
+    user = ""
     for candidate in (os.environ.get("OMNI_GPU_OPTS"),
                       ((cfg or {}).get("qemu") or {}).get("gpu_opts")):
         if candidate:
-            return str(candidate).strip().strip(",")
-    return ""
+            user = str(candidate).strip().strip(",")
+            break
+    if venus_enabled(cfg):
+        return f"{VENUS_GPU_OPTS},{user}".strip(",") if user else VENUS_GPU_OPTS
+    return user
 
 
 def force_video_mode(cfg=None):
