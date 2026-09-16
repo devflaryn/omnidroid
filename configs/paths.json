@@ -206,6 +206,16 @@
           "version_code": 2924,
           "created": 1788385128,
           "notes": "lock + constant abs position while captured (cursor stays at the drag origin)"
+        },
+        "omniexec-2.735.1138-lock3": {
+          "data": "x86/base_x86_data_offset_omniexec-2.735.1138-lock3.qcow2",
+          "package": "com.roblox.client",
+          "apk": "omniexec-2.735.1138-lock3.apk",
+          "apk_path": "C:\\Users\\berat\\Desktop\\Omni Apps\\omni-exec-android\\omniexec-2.735.1138-lock3.apk",
+          "version_name": "2.735.1138",
+          "version_code": 2924,
+          "created": 1788405707,
+          "notes": "lock2 + Omni Local CA in assets/ssl/cacert.pem (clientsettings stand-in experiment)"
         }
       },
       "default_offset": "omniexec-2.735.1138-lock2",

@@ -210,6 +210,14 @@ def serve(name, stop=None, log=print):
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
+            # /note?msg=... : a line from an in-game script into this log
+            # (diagnostics only; the game can say what it sees, we cannot).
+            if self.path.startswith("/note"):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                log(f"[note {name}] {q.get('msg', [''])[0][:400]}")
+                self.send_response(200)
+                self.send_header("Content-Length", "2"); self.end_headers()
+                self.wfile.write(b"ok"); return
             want, alive = parse_request(self.path)
             if want is None and not alive:
                 self.send_response(404); self.end_headers(); return
