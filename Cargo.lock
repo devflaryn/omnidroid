@@ -144,6 +144,12 @@ version = "0.1.0"
 [[package]]
 name = "omni-elf"
 version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "flate2",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "omni-gfx"

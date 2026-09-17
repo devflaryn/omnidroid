@@ -7,5 +7,16 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
+description = "AArch64 ELF64 parsing and the Android APS2 packed-relocation decoder (D9)."
 
+# No OS-specific crates: this crate works entirely from a `&[u8]`. Global Constraint 4 is
+# satisfied structurally rather than by discipline.
 [dependencies]
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Test-only. The golden fixtures are the ARM64 `.so` entries inside the real APK, which are
+# DEFLATE-compressed; `omni-apk` is not yet available so the test harness inflates them itself.
+flate2 = { workspace = true }
