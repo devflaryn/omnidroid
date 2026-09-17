@@ -259,20 +259,53 @@ pub enum VmError {
         len: u64,
     },
 
-    /// `unmap` was asked to unmap something other than a whole view.
+    /// `unmap` was given an address inside a view rather than the base of one.
     ///
     /// Windows unmaps an entire view from its base address; there is no partial unmap. Silently
-    /// unmapping more than the caller asked for would corrupt a neighbouring mapping, so this is
+    /// unmapping more than the caller asked for would destroy a neighbouring mapping, so this is
     /// refused.
+    ///
+    /// The view's real base and length are both carried, because the caller that has to emulate a
+    /// partial unmap — unmap the whole view, then re-map the pieces that survive — needs exactly
+    /// those two numbers, and making it go and find them again is how this error gets ignored.
     #[error(
-        "`unmap`: {address:#x} is not the base of a mapped view (the view containing it starts \
-         at {view_base:#x}); Windows cannot partially unmap a view"
+        "`unmap`: {address:#x} is not the base of a mapped view; it is {offset} bytes into the \
+         view at {view_base:#x}, which is {view_len} bytes long. Windows cannot partially unmap a \
+         view: unmap {view_base:#x} for {view_len} bytes and re-map the pieces that survive"
     )]
     NotViewBase {
         /// The address the caller passed.
         address: usize,
         /// The base of the view that actually contains it.
         view_base: usize,
+        /// The full length of that view, across every protection sub-range it has been split into.
+        view_len: usize,
+        /// `address - view_base`.
+        offset: usize,
+    },
+
+    /// `unmap` was given a view's base address but the wrong length.
+    ///
+    /// The same refusal as [`VmError::NotViewBase`] seen from the other direction, and the more
+    /// dangerous of the two: unmapping a view's head is exactly what a guest partial `munmap`
+    /// looks like, and `UnmapViewOfFile2` takes no length, so honouring the request literally
+    /// would tear down the whole view while reporting success.
+    #[error(
+        "`{operation}`: the view at {address:#x} is {view_len} bytes long but {requested} bytes \
+         were requested. Windows unmaps a whole view and cannot partially unmap one: unmap all \
+         {view_len} bytes and re-map the {surviving} bytes that survive"
+    )]
+    ViewSizeMismatch {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The view's base address, which is what the caller passed.
+        address: usize,
+        /// The length the caller asked for.
+        requested: usize,
+        /// The view's real length, across every protection sub-range it has been split into.
+        view_len: usize,
+        /// `view_len - requested`: how much would have been destroyed silently.
+        surviving: usize,
     },
 
     /// A plain OS failure with the operation and arguments that produced it.
@@ -311,7 +344,8 @@ impl VmError {
             | VmError::UnsupportedViewProtection { .. }
             | VmError::EmptyFile { .. }
             | VmError::ViewPastEndOfFile { .. }
-            | VmError::NotViewBase { .. } => None,
+            | VmError::NotViewBase { .. }
+            | VmError::ViewSizeMismatch { .. } => None,
         }
     }
 

@@ -50,6 +50,21 @@
 //! `EmptyWorkingSet` all measured as returning exactly 0 bytes of commit and are therefore not
 //! exposed here as reclamation at all (Global Constraint 6).
 //!
+//! # Note for whoever builds the D12 dual-mapped code arena
+//!
+//! [`Protection::ReadWrite`] means *writable, and writes go wherever writes to that region are
+//! supposed to go*. For private memory that is the memory; for a file-backed view it is a private
+//! copy-on-write page, so writes never reach the file; and for a **shared-writable** view, such as
+//! the arena's RW view of a pagefile-backed section, it stays shared so that writes are visible
+//! through the paired RX view.
+//!
+//! [`protect`] gets this right by reading back the protection the view was *created* with, so you
+//! do not have to do anything — but know that the distinction exists and is load-bearing, because
+//! the failure mode if it were ever collapsed is silent: the emitter would write happily, every
+//! write would land on a privatised page, and nothing would ever appear through the RX view. There
+//! is a unit test in the Windows backend pinning the decision table, including the shared case that
+//! no public operation can currently produce. Extend it when you add the arena.
+//!
 //! There are two flavours of reservation, and they are not interchangeable:
 //!
 //! * [`reserve`] — an ordinary reservation. Commit into it with [`commit`]. It cannot be
@@ -259,7 +274,7 @@ impl Reservation {
     ///
     /// Getting it wrong is not silently destructive: [`release`] releases exactly the allocation
     /// that *starts* at the given base, so a descriptor that does not name a real allocation base
-    /// is rejected with `ERROR_INVALID_PARAMETER` (87) rather than freeing a neighbour.
+    /// is rejected with `ERROR_INVALID_ADDRESS` (487, measured) rather than freeing a neighbour.
     ///
     /// # Errors
     ///
@@ -550,10 +565,17 @@ pub unsafe fn decommit_to_placeholder(ptr: *mut u8, size: usize) -> VmResult<()>
 /// Change the protection of a page range. 4 KB-granular.
 ///
 /// A single page in the middle of a run can be changed while its neighbours keep their
-/// protection, including a single page of a file-backed view. On a view of an executable section,
-/// the measured legal transitions are to read-only, to copy-on-write, to read-execute and to no
-/// access; a transition to writable-and-executable is rejected by the OS, and there is no
-/// [`Protection`] variant that could ask for it.
+/// protection, including a single page of a file-backed view. On a view mapped
+/// [`Protection::ReadExecute`], the measured legal transitions are to read-only, to
+/// [`Protection::ReadWrite`], back to [`Protection::ReadExecute`] and to [`Protection::None`]; a
+/// transition to writable-and-executable is rejected by the OS, and there is no [`Protection`]
+/// variant that could ask for it.
+///
+/// [`Protection::ReadWrite`] resolves to whatever "writable" means for what is actually at `ptr`,
+/// which the implementation determines rather than guessing: private memory becomes plainly
+/// writable, a private file view becomes copy-on-write so writes never reach the file, and a
+/// shared-writable view stays shared. The range must be homogeneous — one protect call should not
+/// span both a view and private memory.
 ///
 /// # Errors
 ///
@@ -687,8 +709,10 @@ pub unsafe fn map_file(
 ///
 /// # Errors
 ///
-/// [`VmError::NotViewBase`] if `ptr` is not the base of a view, [`VmError::MissingSymbol`], or
-/// [`VmError::Os`].
+/// [`VmError::NotViewBase`] if `ptr` is inside a view rather than at its base, or
+/// [`VmError::ViewSizeMismatch`] if `ptr` is a view base but `size` is not the view's whole
+/// length. Both carry the view's real base and length, which is what a caller emulating a partial
+/// unmap needs. Also [`VmError::MissingSymbol`] or [`VmError::Os`].
 ///
 /// # Safety
 ///
@@ -731,8 +755,12 @@ pub unsafe fn unmap_and_release(ptr: *mut u8, size: usize) -> VmResult<()> {
 ///
 /// # Errors
 ///
-/// [`VmError::Os`] — `ERROR_INVALID_PARAMETER` (87) if the range is not a whole live
-/// reservation, which is what a double release or a release of a split parent looks like.
+/// [`VmError::Os`], carrying whichever code the OS reports. Measured on Windows: an address that
+/// is not the base of a live reservation — a double release, or a release of a placeholder parent
+/// that has been split — gives `ERROR_INVALID_ADDRESS` (**487**, *not* 87), while a partial
+/// release of a live reservation gives `ERROR_INVALID_PARAMETER` (87). 487 is therefore the code
+/// to look for after a double free, and it is also the exact-size-placeholder code, so key
+/// diagnostics on the [`VmError`] variant rather than on the number alone.
 pub fn release(reservation: Reservation) -> VmResult<()> {
     backend::release(reservation.base, reservation.len, reservation.kind)
 }

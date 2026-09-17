@@ -601,14 +601,119 @@ fn unmap_refuses_an_address_that_is_not_the_base_of_a_view() {
         let interior = reservation.as_ptr().add(PAGE);
         let err = vm::unmap(interior, PAGE).expect_err("a partial unmap must be refused");
         match err {
-            VmError::NotViewBase { address, view_base } => {
+            VmError::NotViewBase { address, view_base, view_len, offset } => {
                 assert_eq!(address, interior as usize);
                 assert_eq!(view_base, reservation.base());
+                // The error must hand back the numbers needed to emulate a partial unmap.
+                assert_eq!(view_len, span);
+                assert_eq!(offset, PAGE);
             }
             other => panic!("expected NotViewBase, got {other}"),
         }
+        assert!(err.to_string().contains(&span.to_string()), "{err} should state the view length");
         // The view is untouched, so the whole thing still unmaps cleanly.
         vm::unmap_and_release(reservation.as_ptr(), span).expect("unmap and release");
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn unmap_refuses_a_view_base_with_a_size_shorter_than_the_view() {
+    // The dangerous direction, and the one a guest partial munmap of a mapping's *head* produces.
+    // UnmapViewOfFile2 takes no length, so honouring this literally would tear down the whole view
+    // and report success. Both unmap flavours must refuse it.
+    let path = fixture(16);
+    let file = vm::open_file_for_mapping(&path, MapExecutability::NonExecutable).expect("open");
+    let span = 8 * PAGE;
+
+    for (label, short) in [("one page", PAGE), ("all but one page", span - PAGE)] {
+        let reservation = vm::reserve_placeholder(span, GRANULARITY).expect("reserve");
+        // SAFETY: the reservation is a live exact-size placeholder; the refused calls dereference
+        // nothing and the whole view is unmapped at the end of each iteration.
+        unsafe {
+            vm::map_file(&file, 0, span, reservation.as_ptr(), Protection::Read).expect("map");
+
+            for operation in ["unmap", "unmap_and_release"] {
+                let result = if operation == "unmap" {
+                    vm::unmap(reservation.as_ptr(), short)
+                } else {
+                    vm::unmap_and_release(reservation.as_ptr(), short)
+                };
+                let err = match result {
+                    Ok(()) => panic!(
+                        "{operation} of {label} out of a {span}-byte view must be refused"
+                    ),
+                    Err(err) => err,
+                };
+                match err {
+                    VmError::ViewSizeMismatch {
+                        operation: reported,
+                        address,
+                        requested,
+                        view_len,
+                        surviving,
+                    } => {
+                        assert_eq!(reported, operation);
+                        assert_eq!(address, reservation.base());
+                        assert_eq!(requested, short);
+                        assert_eq!(view_len, span);
+                        assert_eq!(surviving, span - short);
+                    }
+                    other => panic!("expected ViewSizeMismatch, got {other}"),
+                }
+            }
+
+            // Nothing was unmapped by the refusals: every page of the view is still readable and
+            // still holds the right file bytes. This is what makes the refusal meaningful rather
+            // than cosmetic.
+            for page in 0..8 {
+                assert_eq!(
+                    read_mapped(reservation.as_ptr().add(page * PAGE), PAGE),
+                    expected_page(page),
+                    "page {page} was disturbed by a refused unmap"
+                );
+            }
+
+            vm::unmap_and_release(reservation.as_ptr(), span).expect("the whole view unmaps");
+        }
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn a_views_extent_survives_being_split_into_several_protection_regions() {
+    // `protect` on part of a view splits it into several MEMORY_BASIC_INFORMATION regions that all
+    // keep the view's AllocationBase, so a single RegionSize understates the view. If the extent
+    // check used one query, the short-size refusal above would stop working the moment anything
+    // had called protect — which, for a loaded ELF segment, is always.
+    let path = fixture(16);
+    let file = vm::open_file_for_mapping(&path, MapExecutability::NonExecutable).expect("open");
+    let span = 8 * PAGE;
+    let reservation = vm::reserve_placeholder(span, GRANULARITY).expect("reserve");
+    // SAFETY: the reservation is a live exact-size placeholder and the whole view is unmapped at
+    // the end.
+    unsafe {
+        vm::map_file(&file, 0, span, reservation.as_ptr(), Protection::Read).expect("map");
+
+        // Chop the view into at least five distinct protection regions.
+        vm::protect(reservation.as_ptr().add(PAGE), PAGE, Protection::None).expect("page 1 none");
+        vm::protect(reservation.as_ptr().add(3 * PAGE), PAGE, Protection::ReadWrite)
+            .expect("page 3 copy-on-write");
+        vm::protect(reservation.as_ptr().add(6 * PAGE), PAGE, Protection::None).expect("page 6");
+
+        // A short unmap is still refused, and still knows the view's full length.
+        let err = vm::unmap(reservation.as_ptr(), PAGE)
+            .expect_err("a short unmap of a split view must still be refused");
+        match err {
+            VmError::ViewSizeMismatch { view_len, .. } => assert_eq!(
+                view_len, span,
+                "the extent walk did not cross the protection regions"
+            ),
+            other => panic!("expected ViewSizeMismatch, got {other}"),
+        }
+
+        // And the whole view, split or not, unmaps in one call.
+        vm::unmap_and_release(reservation.as_ptr(), span).expect("the whole split view unmaps");
     }
     let _ = fs::remove_file(&path);
 }

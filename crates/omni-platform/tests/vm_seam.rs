@@ -116,7 +116,6 @@ fn errors_name_the_operation_and_the_offending_values() {
     let not_exec = VmError::FileNotOpenedExecutable {
         operation: "map_file",
         path: r"C:\cache\libroblox.so".to_string(),
-
     };
     let text = not_exec.to_string();
     assert!(text.contains(r"C:\cache\libroblox.so"), "{text}");
@@ -129,6 +128,38 @@ fn errors_name_the_operation_and_the_offending_values() {
     assert!(text.contains("map_file"), "{text}");
     assert!(text.contains("linux"), "{text}");
     assert!(!misaligned.is_unsupported());
+}
+
+#[test]
+fn the_two_partial_unmap_refusals_hand_back_the_numbers_needed_to_emulate_one() {
+    // A caller that has to emulate a guest partial munmap must unmap the whole view and re-map the
+    // survivors, so both refusals have to state the view's real base and length. If they did not,
+    // the caller would go and work it out itself, which is how the refusal gets bypassed.
+    let not_base = VmError::NotViewBase {
+        address: 0x7ff6_0000_2000,
+        view_base: 0x7ff6_0000_0000,
+        view_len: 0x10_000,
+        offset: 0x2000,
+    };
+    let text = not_base.to_string();
+    for fragment in ["7ff600002000", "7ff600000000", "65536", "8192"] {
+        assert!(text.contains(fragment), "{text} should contain {fragment}");
+    }
+    assert_eq!(not_base.os_error(), None);
+    assert!(!not_base.is_unsupported());
+
+    let mismatch = VmError::ViewSizeMismatch {
+        operation: "unmap",
+        address: 0x7ff6_0000_0000,
+        requested: 4096,
+        view_len: 0x10_000,
+        surviving: 0x10_000 - 4096,
+    };
+    let text = mismatch.to_string();
+    for fragment in ["unmap", "7ff600000000", "4096", "65536", "61440"] {
+        assert!(text.contains(fragment), "{text} should contain {fragment}");
+    }
+    assert_eq!(mismatch.os_error(), None);
 }
 
 #[test]

@@ -35,9 +35,9 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
     MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, MEM_MAPPED, MEM_PRESERVE_PLACEHOLDER,
-    MEM_RELEASE,
-    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_EXECUTE_READ,
-    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_WRITECOPY,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
@@ -217,6 +217,24 @@ fn os(operation: &'static str, address: usize, size: usize) -> VmError {
     VmError::Os { operation, address, size, source: OsError(last_error()) }
 }
 
+/// What is actually at an address, to the extent it changes which Win32 flag a [`Protection`]
+/// has to become.
+///
+/// There are three cases, not two, and conflating the last two is the trap described on
+/// [`resolved_protection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionFlavour {
+    /// Private committed memory, from `commit` or `commit_placeholder`.
+    Private,
+    /// A view created with a protection that keeps writes private to this mapping:
+    /// `PAGE_READONLY`, `PAGE_WRITECOPY` or `PAGE_EXECUTE_READ`. Every view `map_file` can
+    /// currently produce is one of these.
+    PrivateView,
+    /// A view created `PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`, where writes are shared with
+    /// every other view of the same section.
+    SharedWritableView,
+}
+
 /// The page protection a *private* page gets for a given [`Protection`].
 fn private_protection(protection: Protection) -> u32 {
     match protection {
@@ -268,6 +286,94 @@ struct SystemInfoCell(SYSTEM_INFO);
 unsafe impl Send for SystemInfoCell {}
 // SAFETY: as above; the value is immutable after initialisation.
 unsafe impl Sync for SystemInfoCell {}
+
+/// The Win32 flag a [`Protection`] must become, given what is actually at the address.
+///
+/// A pure function so that the decision can be tested exhaustively without having to construct
+/// every kind of region first — see the tests at the bottom of this module.
+///
+/// # The `ReadWrite` case, which is the only interesting one
+///
+/// `PAGE_READWRITE` and `PAGE_WRITECOPY` are not interchangeable and picking the wrong one is
+/// rejected in both directions:
+///
+/// * [`RegionFlavour::Private`] needs `PAGE_READWRITE`; `PAGE_WRITECOPY` is refused.
+/// * [`RegionFlavour::PrivateView`] needs `PAGE_WRITECOPY`; `PAGE_READWRITE` is refused with
+///   `ERROR_ACCESS_DENIED` (5), because the file is opened without `GENERIC_WRITE`.
+/// * [`RegionFlavour::SharedWritableView`] needs `PAGE_READWRITE`, and this case is a **trap**.
+///
+/// The trap: a D12 dual-mapped code arena is two views of one pagefile-backed section, one
+/// `PAGE_READWRITE` and one `PAGE_EXECUTE_READ`. Its RW view is `MEM_MAPPED`, so a rule that said
+/// "mapped means copy-on-write" would quietly turn the arena's writable view into a private one.
+/// The emitter would keep writing happily, every write would land on a privatised page, and
+/// **nothing would ever appear through the RX view** — a fault or a stale instruction stream far
+/// from the cause, with no error anywhere. So the flavour is taken from the view's
+/// `AllocationProtect` (the protection it was *created* with, which Windows preserves for the life
+/// of the view) and a shared-writable view stays shared.
+fn resolved_protection(protection: Protection, flavour: RegionFlavour) -> u32 {
+    match flavour {
+        RegionFlavour::Private | RegionFlavour::SharedWritableView => {
+            private_protection(protection)
+        }
+        RegionFlavour::PrivateView => view_protection(protection),
+    }
+}
+
+/// Classify what is at `address`, for [`resolved_protection`].
+///
+/// Anything that is not a mapped view — including an address `VirtualQuery` cannot describe — is
+/// treated as private, which leaves the OS to reject a genuinely bad address rather than
+/// second-guessing it here.
+fn region_flavour(address: usize) -> RegionFlavour {
+    let Some(mbi) = query(address) else {
+        return RegionFlavour::Private;
+    };
+    if mbi.Type != MEM_MAPPED {
+        return RegionFlavour::Private;
+    }
+    if mbi.AllocationProtect == PAGE_READWRITE || mbi.AllocationProtect == PAGE_EXECUTE_READWRITE {
+        RegionFlavour::SharedWritableView
+    } else {
+        RegionFlavour::PrivateView
+    }
+}
+
+/// The base and total length of the mapped view containing `address`.
+///
+/// A view is **not** one `MEMORY_BASIC_INFORMATION` region. Changing the protection of some of its
+/// pages splits it into several regions, all of which keep the view's `AllocationBase`, so a single
+/// `RegionSize` understates the view as soon as anything has called `protect` on part of it. The
+/// walk below follows the regions forward from the allocation base for as long as they still belong
+/// to the same view, which is the only way to learn a view's real extent after that has happened.
+///
+/// Returns `None` if `address` is not inside a mapped view at all.
+fn view_extent(address: usize) -> Option<(usize, usize)> {
+    let first = query(address)?;
+    if first.Type != MEM_MAPPED {
+        return None;
+    }
+    let base = first.AllocationBase as usize;
+    if base == 0 {
+        return None;
+    }
+
+    let mut end = base;
+    loop {
+        let Some(mbi) = query(end) else { break };
+        // A different allocation base, or private memory, means we have walked off the end of this
+        // view and into whatever was mapped next to it.
+        if mbi.AllocationBase as usize != base || mbi.Type != MEM_MAPPED || mbi.RegionSize == 0 {
+            break;
+        }
+        let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+        if region_end <= end {
+            // Cannot happen for a well-formed region, but never spin on a malformed one.
+            break;
+        }
+        end = region_end;
+    }
+    Some((base, end - base))
+}
 
 fn query(address: usize) -> Option<MEMORY_BASIC_INFORMATION> {
     let mut mbi = MEMORY_BASIC_INFORMATION::default();
@@ -480,21 +586,19 @@ pub(super) fn decommit_to_placeholder(address: usize, size: usize) -> VmResult<(
 
 /// Change protection, choosing the right Win32 flag for what is actually at `address`.
 ///
-/// `Protection::ReadWrite` is `PAGE_READWRITE` for private memory and `PAGE_WRITECOPY` for a
-/// file-backed view — the two are not interchangeable and the wrong one is rejected with
-/// `ERROR_INVALID_PARAMETER` (87) in both directions. Rather than push that distinction onto
-/// callers, the region type is read back with `VirtualQuery`, which costs one extra call and keeps
-/// `Protection::ReadWrite` meaning the same thing everywhere: writable, and writes never reach the
-/// file. That is also exactly what `mprotect(PROT_READ | PROT_WRITE)` does to a `MAP_PRIVATE` file
-/// mapping on unix, so the abstraction stays faithful rather than Windows-shaped.
+/// The region is classified with `VirtualQuery` and the flag chosen by [`resolved_protection`],
+/// which costs one extra call and keeps `Protection::ReadWrite` meaning the same thing everywhere:
+/// *writable, and writes go wherever writes to that region are supposed to go*. For a file view
+/// that means copy-on-write, which is also exactly what `mprotect(PROT_READ | PROT_WRITE)` does to
+/// a `MAP_PRIVATE` file mapping on unix — so the abstraction stays faithful rather than
+/// Windows-shaped. For a shared-writable view, such as a dual-mapped code arena's RW view, it
+/// stays shared; see [`resolved_protection`] for why that distinction is not optional.
 ///
 /// This is what the ELF loader needs in order to apply relocations to file-backed `.text`: map the
 /// segment `ReadExecute`, drop the affected pages to `ReadWrite` (privatising just those pages),
 /// write, and raise them back to `ReadExecute`.
 pub(super) fn protect(address: usize, size: usize, protection: Protection) -> VmResult<()> {
-    let is_view = query(address).is_some_and(|mbi| mbi.Type == MEM_MAPPED);
-    let flags =
-        if is_view { view_protection(protection) } else { private_protection(protection) };
+    let flags = resolved_protection(protection, region_flavour(address));
     let mut old = 0u32;
     // SAFETY: the caller's contract is that the range is committed or mapped memory it owns.
     // `old` is a live u32 that receives the previous protection.
@@ -523,12 +627,28 @@ fn unmap_inner(
 ) -> VmResult<()> {
     let unmap2 = unmap_view_of_file2()?;
 
-    // Windows unmaps a whole view from its base; there is no partial unmap. Refuse a request that
-    // is not a view base rather than unmapping more than was asked for.
-    if let Some(mbi) = query(address) {
-        let view_base = mbi.AllocationBase as usize;
-        if view_base != 0 && view_base != address {
-            return Err(VmError::NotViewBase { address, view_base });
+    // `UnmapViewOfFile2` takes no length: it unmaps the entire view that starts at the address it
+    // is given. So `size` cannot be passed through to it and must be *checked* against the view's
+    // real extent here, or a caller asking to unmap four pages of a hundred-page view would tear
+    // down all hundred and be told it succeeded. Both directions of that mistake are refused:
+    // an address inside a view, and a view base with the wrong length.
+    if let Some((view_base, view_len)) = view_extent(address) {
+        if view_base != address {
+            return Err(VmError::NotViewBase {
+                address,
+                view_base,
+                view_len,
+                offset: address - view_base,
+            });
+        }
+        if view_len != size {
+            return Err(VmError::ViewSizeMismatch {
+                operation,
+                address,
+                requested: size,
+                view_len,
+                surviving: view_len.saturating_sub(size),
+            });
         }
     }
 
@@ -545,8 +665,8 @@ fn unmap_inner(
 
 pub(super) fn release(base: usize, len: usize, _kind: ReservationKind) -> VmResult<()> {
     // SAFETY: MEM_RELEASE with a size of 0 releases exactly the reservation that starts at `base`
-    // and nothing else; a range that is not the start of a live reservation is rejected with
-    // ERROR_INVALID_PARAMETER rather than freeing a neighbour.
+    // and nothing else; an address that is not the base of a live reservation is rejected with
+    // ERROR_INVALID_ADDRESS (487, measured) rather than freeing a neighbour.
     let ok = unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
     if ok == 0 {
         return Err(os("release", base, len));
@@ -796,5 +916,63 @@ impl Drop for HandleGuard {
     fn drop(&mut self) {
         // SAFETY: the guard owns exactly this handle, which is live and closed once.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Unit tests for the decisions that cannot be reached through the public seam yet
+// -------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exhaustive table for [`resolved_protection`]. This is a unit test rather than an
+    /// integration test because the shared-writable case needs a pagefile-backed section with two
+    /// views, which is the D12 code arena and is deliberately not implemented yet. The decision it
+    /// depends on can still be pinned down now, so that the arena does not have to discover it.
+    #[test]
+    fn read_write_stays_shared_on_a_shared_view_and_becomes_copy_on_write_on_a_private_one() {
+        use RegionFlavour::{Private, PrivateView, SharedWritableView};
+
+        // The case that matters: ReadWrite must not become PAGE_WRITECOPY on a shared view, or a
+        // dual-mapped code arena's writes would be privatised and never reach its RX view.
+        assert_eq!(resolved_protection(Protection::ReadWrite, SharedWritableView), PAGE_READWRITE);
+        assert_eq!(resolved_protection(Protection::ReadWrite, PrivateView), PAGE_WRITECOPY);
+        assert_eq!(resolved_protection(Protection::ReadWrite, Private), PAGE_READWRITE);
+
+        // Every other variant is the same whatever the region is.
+        for flavour in [Private, PrivateView, SharedWritableView] {
+            assert_eq!(resolved_protection(Protection::None, flavour), PAGE_NOACCESS, "{flavour:?}");
+            assert_eq!(resolved_protection(Protection::Read, flavour), PAGE_READONLY, "{flavour:?}");
+            assert_eq!(
+                resolved_protection(Protection::ReadExecute, flavour),
+                PAGE_EXECUTE_READ,
+                "{flavour:?}"
+            );
+        }
+
+        // And no Protection can ever resolve to a writable *and* executable Win32 flag, whatever
+        // the region is. This is the W^X invariant restated at the layer that actually talks to
+        // the OS, where a mis-mapped flag could reintroduce it without any API change.
+        for protection in Protection::ALL {
+            for flavour in [Private, PrivateView, SharedWritableView] {
+                let flags = resolved_protection(protection, flavour);
+                assert_ne!(flags, PAGE_EXECUTE_READWRITE, "{protection} on {flavour:?}");
+                assert_ne!(flags, PAGE_EXECUTE_WRITECOPY, "{protection} on {flavour:?}");
+            }
+        }
+    }
+
+    /// `PAGE_EXECUTE_WRITECOPY`, referenced only to assert that nothing ever resolves to it.
+    const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+    /// A region we cannot describe is treated as private, so that the OS gets to reject a bad
+    /// address instead of this module guessing at it.
+    #[test]
+    fn an_undescribable_address_is_classified_private() {
+        // Address 0 is never mapped, and VirtualQuery describes it as FREE rather than failing,
+        // so this pins the behaviour of both branches of `region_flavour`'s fallback.
+        assert_eq!(region_flavour(0), RegionFlavour::Private);
     }
 }
