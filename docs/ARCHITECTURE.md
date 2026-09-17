@@ -105,9 +105,11 @@ A bionic-compatible loader written from scratch, since no permissively-licensed 
 Requirements are taken from the actual binary rather than from the ELF spec in general:
 
 1. **APS2 packed relocations are mandatory.** `libroblox.so` carries `DT_ANDROID_RELA` and has
-   **no `DT_RELA` and no `DT_RELR`**. Its 568,272 relocations (568,194 `R_AARCH64_RELATIVE`, 534
-   `JUMP_SLOT`) are SLEB128-delta-encoded in a group-based format. A loader without APS2 applies
-   *zero* relocations. This is the highest-risk piece of the loader and gets the most testing.
+   **no `DT_RELA` and no `DT_RELR`**. Its APS2 blob is 2,100,778 bytes holding **568,272**
+   relocations (568,194 `R_AARCH64_RELATIVE`, 56 `GLOB_DAT`, 22 `ABS32`), SLEB128-delta-encoded in a
+   group-based format. A further **534** `JUMP_SLOT` relocations arrive **separately** via
+   `DT_JMPREL`, for a grand total of 568,806. A loader without APS2 applies *zero* relocations. This
+   is the highest-risk piece of the loader and gets the most testing.
 2. **Segment mapping** via placeholder split plus `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` at 4 KB
    granularity, honouring `p_align` (4 KB here; 16 KB for newer NDKs, also supported).
 3. **Symbol resolution** against Omnidroid's own provided libraries (section 5), using the ELF or
@@ -147,11 +149,19 @@ implementation, and returns. Callbacks in the other direction, host to guest, su
 allocator callback or a pthread entry point, use the mirror mechanism. On ARM64 hosts the ABI
 already matches and the thunk reduces to close to a direct call.
 
-**JNI without a JVM** (D7). Omnidroid implements `JavaVM` and `JNIEnv` as host-native function
-tables. `FindClass`, `GetMethodID` and the `Call*Method` family resolve against native
-implementations of the small set of Java classes the engine actually touches. This is plausible
-because only about 636 of the APK's 26,620 dex classes are Roblox's own and essentially all logic
-is native, but *how* small that set is, is being measured before code is written against it.
+**JNI without a JVM, and no dex interpreter** (D7, now verified). Omnidroid implements `JavaVM` and
+`JNIEnv` as host-native function tables. The measured surface is small and lopsided: only **59 of
+233** `JNINativeInterface` slots are ever dereferenced, `JavaVM` needs just **2** (`GetEnv` and
+`AttachCurrentThread`), the engine **only reads Java fields and never writes them**, and every
+`CallXxxMethod` funnels through the `...MethodV` slot — so the `va_list` forms must be right and the
+convenience forms need not exist at all. Of 409 referenced Java members across 104 classes, roughly
+**120 are needed for a first frame**.
+
+The real work is not interpretation but **orchestration**: `libroblox.so` does not bootstrap itself.
+Flags, client settings, base URLs, directories, device parameters and `InitParams` all arrive from
+Java, and `NativeEngine` waits for them, so Omnidroid supplies a native shell that issues that
+ordered sequence. A failed class or method lookup must return `NULL` with a pending exception rather
+than aborting, because 5 referenced members do not exist in this APK's dex at all.
 
 **Startup is AGDK `GameActivity`, not `NativeActivity`.** The entry point is
 `Java_com_google_androidgamesdk_GameActivity_initializeNativeCode`, with
@@ -292,7 +302,7 @@ milestones**, each a checkpoint that either passes against the real binary or do
 | # | Milestone | Verified by |
 |---|---|---|
 | M0 | APK parsed; `.so` extracted to the 4 KB-aligned cache | entry list and hashes match the forensic report |
-| M1 | ELF loaded; **all 568,272** APS2 relocations applied; symbols resolved | exact relocation count; zero unresolved imports out of 669 |
+| M1 | ELF loaded; **all 568,806** relocations applied (568,272 APS2 + 534 `DT_JMPREL`); imports enumerated | exact per-type relocation counts; all 565 `libroblox.so` imports accounted for |
 | M2 | A trivial ARM64 function from `libroblox.so` executes and returns | known input and output |
 | M3 | All **3,594** `init_array` entries complete | counter reaches 3,594 with no fault |
 | M4 | `JNI_OnLoad` returns successfully | return value is a valid JNI version |
@@ -306,6 +316,10 @@ Alongside that:
 - **Golden-data unit tests** taken from the real binary. The APS2 decoder is tested against
   `libroblox.so`'s own 568,272 relocations, which is a far stronger test than synthetic input; the
   reference decoder used during analysis consumed 2,100,778 of 2,100,778 bytes exactly.
+- **A guest thread is not runnable until `TPIDR_EL0` points at a bionic-layout TLS block** with a
+  stack guard at offset 0x28 (D13). 1,276 of the engine's 1,282 thread-pointer reads want exactly
+  that slot, and they happen before `JNI_OnLoad` and before the first static initializer, so this is
+  asserted in thread bring-up rather than discovered at M3.
 - **Differential CPU tests** for the translation backend: instruction sequences run through the
   backend and compared against a reference model, focused on flags, shifted operands, NEON, and
   atomics.

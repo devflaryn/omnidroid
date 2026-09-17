@@ -7,5 +7,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
+description = "APK/zip reading and the content-addressed, 4 KB-aligned native-library extraction cache (D11)."
 
+# Portable crates only. omni-apk is pure file and compute work: it never touches an OS API, so it
+# needs neither omni-platform nor (per Global Constraint 4) any OS-specific crate.
 [dependencies]
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+rustc-hash = { workspace = true }
+crc32fast = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }

@@ -29,6 +29,12 @@ parking_lot = "0.12.5"
 tracing = "0.1.44"
 rustc-hash = "2.1.3"
 
+# APK reading (omni-apk). `flate2` uses the pure-Rust `miniz_oxide` backend: the zlib and
+# zlib-ng backends need a C compiler, which is not a build requirement we are willing to take on.
+crc32fast = "1.5.0"
+sha2 = "0.10.9"
+flate2 = { version = "1.1.5", default-features = false, features = ["rust_backend"] }
+
 # OS bindings. Per Global Constraint 4 this may only ever appear in omni-platform's
 # own [dependencies]; listing the version here does not grant any other crate access.
 windows-sys = "0.61.2"

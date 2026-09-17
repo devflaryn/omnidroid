@@ -46,12 +46,17 @@ not a stock Roblox build** (D6). A stock Play-signed APK is needed before the AP
 | Area | Finding |
 |---|---|
 | ABI | `lib/arm64-v8a/` only, 11 `.so`, all DEFLATED and 4-byte aligned |
-| Relocations | `DT_ANDROID_RELA` (APS2) **exclusively**: 568,272 relocations, no `DT_RELA`, no `DT_RELR` |
+| Relocations | `DT_ANDROID_RELA` (APS2): 568,272 (568,194 RELATIVE + 56 GLOB_DAT + 22 ABS32), plus 534 JUMP_SLOT from a separate `DT_JMPREL`, total 568,806. No `DT_RELA`, no `DT_RELR` |
+| Imports | 565 undefined symbols in `libroblox.so`; 669 in the union across all 11 libraries |
+| JNI surface | Only 59 of 233 `JNINativeInterface` slots used; `JavaVM` needs 2; fields are read but never written; all `CallXxxMethod` go via the `...MethodV` slot |
+| Dex execution | **Not required.** No reflection, no `dalvik/system/*`, no Java-side HTTP or file I/O; both `RegisterNatives` sites are native-driven |
+| Java surface size | 409 members / 104 classes referenced; ~120 members needed for a first frame |
+| Thread prerequisite | `TPIDR_EL0` must point at a bionic TLS block with a stack guard at +0x28 before any guest code runs (1,276 of 1,282 reads target that slot) |
+| AGDK | Statically linked into `libroblox.so`; 21-slot callback map recovered, 19 of 21 individually verified; `android_main` at 0x2bcc6a4 |
 | TLS | **None.** No `PT_TLS`, no `STT_TLS` anywhere. `pthread_key_*` only |
 | Hardening | No ifunc, no BTI/PAC/MTE, no `DT_TEXTREL` |
 | Initializers | 3,594 `init_array` entries before `JNI_OnLoad`; RELRO covers 5,205,568 bytes |
 | C++ runtime | Statically linked; in-guest unwinder over 11.5 MB `.eh_frame`, needs real `dl_iterate_phdr` |
-| Imports | 669 distinct undefined symbols, enumerated in `research/apk-undefined-symbols.txt` |
 | Startup | AGDK `GameActivity`, not `NativeActivity` |
 | Graphics | Vulkan `dlopen`-only with 1,364 shipped SPIR-V modules; EGL/GLESv2 hard-linked |
 
@@ -74,6 +79,7 @@ milestone ladder in `ARCHITECTURE.md` section 9 is the progress measure.
 
 ## Open decisions
 
+None blocking. Both D5 (CPU backend) and D7 (JNI without a JVM) are resolved.
+
 | # | Decision | Blocked on |
 |---|---|---|
-| D7 | JNI without a JVM, or is a dex interpreter unavoidable | JNI surface extraction, running |

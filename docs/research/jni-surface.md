@@ -206,10 +206,11 @@ Only **2 slots**, 5 sites:
 * **135 descriptor literals** (Section C).
 * **64 `FindClass` sites** with a literal class name (direct), plus **58** more via the Djinni
   `jniFindClass` helpers.
-* By package: `com/roblox/protocols/*` 46 · `com/roblox/engine/*` 13 · `com/roblox/universalapp/*` 8 ·
-  `com/roblox/client/*` 9 · `java/*` 16 · `android/*` 10 · `androidx/*` 2 ·
-  `com/google/androidgamesdk/*` 3 · `org/fmod/*` 3 · `org/webrtc/*` 1 · `com/snapchat/djinni` 1 ·
-  `com/roblox/audio`/`com/roblox/platform` 2.
+* By package (the 128 class-name literals, VERIFIED counts):
+  `com/roblox/protocols/*` **59** · `java/*` **18** · `com/roblox/engine/*` **12** ·
+  `android/*` **10** · `com/roblox/client/*` **10** · `com/roblox/universalapp/*` **7** ·
+  `com/google/androidgamesdk/*` **3** · `org/fmod/*` **3** · `androidx/*` **2** ·
+  `com/roblox/{audio,platform}` **2** · `com/snapchat/djinni` **1** · `org/webrtc/*` **1**.
 
 ---
 
@@ -622,7 +623,7 @@ and a Vulkan/GLES instance". **V** = VERIFIED, **I** = INFERRED.
 | 4 | **Program `TPIDR_EL0` for every guest thread with a bionic TLS block; slot 5 (`+0x28`) = stack guard** | per-thread TLS area | **V** (1,276 of 1,282 `MRS` sites read `+0x28`) |
 | 5 | Run the **3,594 `DT_INIT_ARRAY`** entries | working `__cxa_atexit`, `malloc`, `pthread_key_*`, `__stack_chk_guard` | **V** |
 | 6 | Call `JNI_OnLoad(JavaVM*, void*)` @`0x2173ff4`, expect `0x00010006` | `JavaVM` whose vtable has **`GetEnv`(0x30) and `AttachCurrentThread`(0x20)** at minimum | **V** |
-| 6a | Inside it: a `GetEnv`-shaped helper (`0x2174c04`) hands the engine a `JNIEnv*`; then `FindClass("com/roblox/universalapp/logging/LoggingProtocol")` + `NewGlobalRef` + `GetStaticMethodID("getProcessTimestamp","()J")` + `ExceptionCheck` | `FindClass`, `NewGlobalRef`, `GetStaticMethodID`, `ExceptionCheck`, `ExceptionClear` | **V** (pcs `0x2174074`/`0x2174090`/`0x21740c0`/`0x2174108`/`0x2174138`) |
+| 6a | `JNI_OnLoad` caches the `JavaVM*` in the global at `0x07275550` (helper `0x1db2cf0`), then the scoped-attach helper `0x2174c04` does `ldar` on that global → `vm->GetEnv(&env, 0x00010006)`; on `JNI_EDETACHED` (`cmn w0,#2`) it attaches via `0x2173f48` and records "must detach". It yields a `{bool attached; JNIEnv* env;}` pair. Then `FindClass("com/roblox/universalapp/logging/LoggingProtocol")` + `NewGlobalRef` + `GetStaticMethodID("getProcessTimestamp","()J")` + `ExceptionCheck` | `FindClass`, `NewGlobalRef`, `GetStaticMethodID`, `ExceptionCheck`, `ExceptionClear` | **V** (pcs `0x2174028`, `0x2174c28`–`0x2174c44`, `0x2174074`, `0x2174090`, `0x21740c0`, `0x2174108`, `0x2174138`) |
 | 6b | Three more registration helpers run with `x0 = JavaVM*` (`0x2174c90`, `0x2174e58`, `0x2175128`) and batch-resolve `NativeGLJavaInterface`, `NativeUserJavaInterface`, `NativeLocaleJavaInterface`, `SessionReporterJavaInterface`, `ClientLocalFlags`, … (161 `GetMethodID` + 84 `GetStaticMethodID` + 69 `GetFieldID` sites total) | the Tier 0/Tier 1 classes of §3.1, resolvable **now** | **V** |
 | 7 | Simulate `RobloxApplication.onCreate`: `JNIBaseUrlProtocol.init(Context)`, `JNIWebLoginProtocol.init(Context)` | a `Context`-shaped object | **V** |
 | 8 | Simulate `ActivitySplash.onCreate`: `NativeReportingInterface.initAppShellReporter()` | — | **V** |

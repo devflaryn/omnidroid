@@ -3,7 +3,7 @@
 Spec: `docs/ARCHITECTURE.md`. Rationale: `docs/DECISIONS.md`. Measurements: `docs/research/`.
 
 Scope: everything needed to reach **M1** — the real `libroblox.so` loaded into memory with all
-568,272 APS2 relocations applied and its 669 imports accounted for. Deliberately excludes the CPU
+568,272 APS2 relocations applied and its 565 imports accounted for. Deliberately excludes the CPU
 backend (decision D5 open) and the JNI layer (decision D7 open), so no task here depends on either.
 
 ## Global Constraints
@@ -16,10 +16,23 @@ These bind every task. A reviewer should treat a violation as a defect.
 2. **Tests use the real APK.** `Roblox-2.738.1397.apk` in the repo root is the test fixture. Tests
    that can assert against it must, using the exact numbers from `docs/research/apk-analysis.md`.
    Tests must **skip gracefully rather than fail** when the APK is absent, since it is git-ignored.
-3. **Exact values are mandatory.** 568,272 total relocations; 568,194 `R_AARCH64_RELATIVE`; 534
-   `R_AARCH64_JUMP_SLOT`; 3,594 `init_array` entries; `PT_GNU_RELRO` covers 5,205,568 bytes;
-   `libroblox.so` is 109,193,800 bytes; 11 `.so` under `lib/arm64-v8a/`; 669 distinct undefined
-   symbols. A test asserting a rounded or approximate version of these is a defect.
+3. **Exact values are mandatory.** For `libroblox.so`:
+   - The `DT_ANDROID_RELA` blob is **2,100,778 bytes**, magic `APS2`, and a correct decoder consumes
+     **all** of it.
+   - That blob declares and yields **568,272** relocations: **568,194** `R_AARCH64_RELATIVE` (1027)
+     + **56** `R_AARCH64_GLOB_DAT` (1025) + **22** `R_AARCH64_ABS32` (258). Exactly **78** carry a
+     non-zero `r_sym`.
+   - **Separately**, `.rela.plt` via `DT_JMPREL` holds **534** `R_AARCH64_JUMP_SLOT` (1026). These
+     are **not** part of the APS2 blob. Grand total across both: **568,806**.
+   - **3,594** `init_array` entries; `PT_GNU_RELRO` covers **5,205,568** bytes; the file is
+     **109,193,800** bytes; **565** undefined symbols in this library alone.
+   - Across all 11 `.so` under `lib/arm64-v8a/`, the **union** of undefined symbols is **669**.
+     565 and 669 are both correct and not in conflict: 565 is `libroblox.so` alone, 669 is the union
+     over all eleven libraries (which includes the injected one).
+   - No library in the APK uses `DT_RELR` or `DT_ANDROID_REL`; the other ten use plain `DT_RELA`
+     plus `DT_JMPREL`.
+
+   A test asserting a rounded or approximate version of any of these is a defect.
 4. **Platform code is confined.** `#[cfg(target_os)]` and OS APIs appear **only** in
    `omni-platform`. Every other crate must compile for all five targets without `cfg`. Do not add
    `windows-sys`, `libc`, or any OS-specific crate as a dependency of any crate other than
@@ -277,14 +290,20 @@ These are golden-data tests against a 109 MB real binary, far stronger than synt
 
 - Header: `ET_DYN`, `EM_AARCH64`, `ELFCLASS64`.
 - `DT_ANDROID_RELA` is **present**, and `DT_RELA` and `DT_RELR` are **absent**. Assert all three.
-- The APS2 decoder yields exactly **568,272** relocations, of which exactly **568,194** are
-  `R_AARCH64_RELATIVE` (1027) and exactly **534** are `R_AARCH64_JUMP_SLOT` (1026).
+- The APS2 decoder yields exactly **568,272** relocations: exactly **568,194**
+  `R_AARCH64_RELATIVE` (1027), **56** `R_AARCH64_GLOB_DAT` (1025), and **22** `R_AARCH64_ABS32`
+  (258), with exactly **78** carrying a non-zero `r_sym`. Assert all five numbers.
+- The **534** `R_AARCH64_JUMP_SLOT` (1026) relocations come from `.rela.plt` via `DT_JMPREL` and are
+  **not** in the APS2 blob. Assert that separately, and assert the grand total is **568,806**. An
+  earlier draft of this plan wrongly folded the 534 into the APS2 count; do not reproduce that.
 - The decoder consumes exactly **2,100,778 of 2,100,778** bytes — byte-exact, no remainder.
 - `DT_INIT_ARRAY` has exactly **3,594** entries.
 - `PT_GNU_RELRO` covers exactly **5,205,568** bytes.
 - **No `PT_TLS` segment** exists, and no symbol has type `STT_TLS`.
-- Exactly **669** distinct undefined symbols across all 11 libraries, cross-checked against
-  `docs/research/apk-undefined-symbols.txt`.
+- Exactly **565** undefined symbols in `libroblox.so` alone, and exactly **669** in the union across
+  all 11 libraries, cross-checked against `docs/research/apk-undefined-symbols.txt`. Assert both.
+- The other ten libraries use plain `DT_RELA` plus `DT_JMPREL`, and **no** library uses `DT_RELR` or
+  `DT_ANDROID_REL`, so the parser must handle both relocation styles.
 - SLEB128 round-trip unit tests including negative values and multi-byte boundaries.
 - Truncated and corrupt APS2 blobs produce typed errors, never panics and never silent success.
 
@@ -310,15 +329,16 @@ if one is genuinely unfit, say so in the report instead of working around it sil
   `omni-mem`, and map each `PT_LOAD` at `base + p_vaddr` from the cache file at 4 KB granularity,
   honouring `p_align` (4 KB here, 16 KB for newer NDKs).
 - Zero the `p_memsz > p_filesz` tail (`.bss`) without disturbing file-backed pages.
-- Apply relocations: `R_AARCH64_RELATIVE` (1027) as `*target = base + addend`, `R_AARCH64_GLOB_DAT`
-  (1025) and `R_AARCH64_JUMP_SLOT` (1026) and `R_AARCH64_ABS64` (257) as symbol resolution.
+- Apply relocations: `R_AARCH64_RELATIVE` (1027) as `*target = base + addend`, and
+  `R_AARCH64_GLOB_DAT` (1025), `R_AARCH64_JUMP_SLOT` (1026) and `R_AARCH64_ABS32` (258) as symbol
+  resolution. The 534 `JUMP_SLOT`s come from `DT_JMPREL`, separately from the APS2 blob.
   Relocation targets land in pages that must be **private and writable** at that moment — this is
   where the file-backed mapping needs copy-on-write or a private overlay, so be deliberate about it
   and explain the choice in the report.
 - **Symbol resolution** against a provider registry: a trait through which `omni-android` will later
   supply host implementations. In this task, register a provider that supplies **nothing** and
   report every unresolved symbol. Reaching M1 does not require any import to resolve; it requires
-  all 669 to be *enumerated and accounted for*.
+  all 565 to be *enumerated and accounted for*.
 - Apply `PT_GNU_RELRO` read-only protection **after** relocations, and assert it covers 5,205,568
   bytes.
 - Record the loaded-object metadata that `dl_iterate_phdr` will need (base, phdr pointer, phnum,
@@ -331,12 +351,14 @@ if one is genuinely unfit, say so in the report instead of working around it sil
 
 - The real `libroblox.so` loads: all `PT_LOAD` segments mapped at their expected addresses, total
   span matching the program headers.
-- All **568,272** relocations apply without error, and a sample of `R_AARCH64_RELATIVE` targets
+- All **568,806** relocations apply without error (568,272 from APS2 plus 534 from `DT_JMPREL`), and
+  a sample of `R_AARCH64_RELATIVE` targets
   verifiably contains `base + addend` afterwards. Assert on actual memory contents, not on a
   counter — a counter alone cannot distinguish applied from skipped.
 - RELRO is read-only afterwards, covering exactly 5,205,568 bytes, and a write attempt to it fails.
-- Exactly **669** distinct unresolved imports are reported with the empty provider, and the report
-  distinguishes `STT_FUNC` from `STT_OBJECT`.
+- Exactly **565** distinct unresolved imports are reported for `libroblox.so` with the empty
+  provider, and the report distinguishes `STT_FUNC` from `STT_OBJECT`. 565 is this library alone;
+  the 669 union figure is a different assertion belonging to Task 4.
 - Exactly **3,594** `init_array` entries are collected, in order, each a plausible in-range address.
 - Loading is idempotent and leak-free: load and unload repeatedly, and assert commit charge returns
   to baseline. This catches the class of bug where relocation privatizes pages that are never
@@ -350,4 +372,4 @@ if one is genuinely unfit, say so in the report instead of working around it sil
 
 The measured peak and steady-state commit charge for a loaded `libroblox.so`, compared against the
 D11 prediction; how relocation-target privatization was handled; load wall-time; and the full
-breakdown of the 669 unresolved imports by provider library.
+breakdown of the 565 unresolved imports by provider library.

@@ -178,9 +178,19 @@ Evidence: `research/apk-analysis.md`, `research/graphics-spike.md`.
 ---
 
 ## D9 — ELF loader must implement Android packed relocations (APS2)
-**Fact, not a choice.** `libroblox.so` uses `DT_ANDROID_RELA` (APS2, SLEB128-packed) **exclusively**:
-568,272 packed relocations (568,194 `R_AARCH64_RELATIVE` + 534 `JUMP_SLOT`), and has **no `DT_RELA`
-and no `DT_RELR`**. A loader that handles only standard or `RELR` relocations applies literally zero
+**Fact, not a choice.** `libroblox.so` uses `DT_ANDROID_RELA` (APS2, SLEB128-packed) for its main
+relocations and has **no `DT_RELA` and no `DT_RELR`**. The exact breakdown, corrected after an
+earlier draft of this file folded the `JUMP_SLOT`s into the packed count:
+
+| Source | Count | Types |
+|---|---|---|
+| `DT_ANDROID_RELA` blob (2,100,778 B, magic `APS2`) | **568,272** | 568,194 `R_AARCH64_RELATIVE` + 56 `R_AARCH64_GLOB_DAT` + 22 `R_AARCH64_ABS32` (78 with non-zero `r_sym`) |
+| `.rela.plt` via `DT_JMPREL` — **separate** | **534** | `R_AARCH64_JUMP_SLOT` |
+| Grand total | **568,806** | |
+
+The 534 `JUMP_SLOT` relocations are **not** inside the APS2 blob. The other ten libraries use plain
+`DT_RELA` plus `DT_JMPREL`, and no library in the APK uses `DT_RELR` or `DT_ANDROID_REL`, so the
+loader must handle both styles. A loader that handles only standard or `RELR` relocations applies literally zero
 relocations to Roblox and cannot work at all.
 
 Other loader requirements measured from the same binary:
@@ -191,6 +201,8 @@ Other loader requirements measured from the same binary:
   **not needed**, which is a meaningful saving; that effort belongs in `pthread_key_*` performance
   instead.
 - No ifunc, no BTI/PAC/MTE, no `DT_TEXTREL`.
+- `libroblox.so` imports **565** undefined symbols; the **union** across all 11 libraries is 669.
+  Both figures are correct and are not in conflict, since the union includes the injected library.
 - The C++ runtime is **statically linked** (no `libc++_shared.so`), so the unwinder lives inside the
   guest and reads 11.5 MB of `.eh_frame`. It resolves frames via **`dl_iterate_phdr`**, so that
   function must be faithful, not a stub — C++ exceptions will not work otherwise.
@@ -440,3 +452,107 @@ unfixable under real Roblox thread counts, the x64 backend replacement moves fro
 change from touching the rest of the runtime.
 
 Evidence: `research/dynarmic-spike.md`.
+
+---
+
+## D7 (resolved) — No JVM, no ART, and no dex interpreter. Confirmed.
+**Verified.** Every mechanism that would have forced real dex execution was searched for in
+`libroblox.so` and is **absent**: zero `dalvik/system/*`, zero `java/lang/reflect`, zero
+`Class.forName`/`getDeclaredMethod`/`defineClass`, zero `java/lang/invoke`, zero Java-side HTTP
+(`java/net/*`, `okhttp3`), zero `java/io/File`, zero `android/webkit`, zero
+`android/database/sqlite`. `JNIEnv::DefineClass` is never dereferenced. Only 2 `RegisterNatives`
+sites exist and both are native-driven (AGDK's own `GameActivity_register`), not driven from Java
+static initializers.
+
+The one reflective-looking item — `ClassLoader.loadClass`/`findClass` reached via
+`com/snapchat/djinni/NativeObjectManager.getClassLoader()` — is the standard "cache the app
+ClassLoader so `FindClass` works on native threads" pattern, about 20 lines to satisfy.
+
+**A dex interpreter would be strictly worse, not merely unnecessary.** Running
+`MainGameActivity.onCreate` for real drags in the full 26,620-class closure: AndroidX lifecycle,
+Kotlin coroutines, OkHttp, Dagger, Play Services. `NativeHelper.n0` alone takes
+`(int, android/view/SurfaceView, com/roblox/client/RbxKeyboard, vk/e$f)`.
+
+**How the JNI surface was actually measured**, since the binary is stripped: function boundaries
+came from `.eh_frame_hdr` (**245,117 exact function starts** across 18,153,537 instructions, no
+symbols needed), then `JNIEnv` was identified by interprocedural taint from the 539 `Java_*`
+exports plus `JNI_OnLoad` plus the 26 `RegisterNatives` function pointers. A JNI call has the shape
+`ldr Xb,[ENV]; ldr Xt,[Xb,#imm]; blr Xt`, which is what distinguishes it from the roughly one
+million identically-shaped C++ vtable calls. The offset table self-validated: every literal-string
+call site landed on exactly one of the six lookup offsets with the right argument shape.
+
+**The surface is small and the shape is favourable:**
+
+| Fact | Value |
+|---|---|
+| `JNINativeInterface` slots actually dereferenced | **59 of 233** (943 call sites); 170 never used |
+| `JavaVM` slots used | **2** — `GetEnv` and `AttachCurrentThread` only |
+| Distinct Java members referenced | **409** (296 methods + 113 fields) across **104** classes |
+| Of those, lazy Djinni bridges no first frame touches | 109 members / 26 classes |
+| Real surface | **300 members / 78 classes** |
+| **Needed for a first frame** | **~120 distinct Java members** |
+
+Three implementation details that matter more than their size suggests:
+- **Every `CallXxxMethod` funnels through the `...MethodV` slot** — exactly one site each, zero
+  non-`V` sites, because the C++ `jni.h` inline wrappers got ICF-merged. So the **`va_list` forms
+  must be correct**; the convenience forms are never called and need not exist.
+- **The engine only ever reads Java fields, never writes them.** All 18 `Set*Field` and
+  `SetStatic*Field` slots are unused, as are `DefineClass`, `IsInstanceOf`, `GetSuperclass`,
+  `AllocObject`, `NewObject`, local frame management, monitors, and the reflection converters.
+- **5 referenced Java members do not exist in this APK's dex** (`DeviceUtils.
+  getScreenPhysicalSizeInMillimeters`, `signalVideo*`). The shim must therefore return `NULL` plus a
+  pending exception on a failed lookup, **not abort**.
+
+**The real cost is different from what was feared.** `libroblox.so` does not bootstrap itself: flags,
+client settings, base URLs, directories, device parameters and `InitParams` all arrive *from Java*,
+and `NativeEngine` waits for them. Omnidroid must therefore write a native shell that issues that
+whole sequence. That is **orchestration, not interpretation** — a long, ordered, verifiable script
+rather than an interpreter. It is recorded step by step in `research/jni-surface.md`.
+
+AGDK is **statically linked into `libroblox.so`** (verified: a 24-entry `JNINativeMethod` table at
+`.data.rel.ro 0x062dc1c8`, `!gGameActivityClassInfo.*` assert strings, `android_native_app_glue` and
+`GameTextInput` strings, and no separate `.so`). The contract was recovered field by field: the
+`GameActivity` struct, a **21-slot `GameActivityCallbacks`** map with 19 of 21 individually verified,
+a 632-byte `NativeCode`, a 384-byte `android_app`, `android_main` at `0x2bcc6a4` leading to
+`new NativeEngine` and `GameLoop()` at `0x2bcd5d0`. The AGDK version cannot be pinned exactly
+(Roblox vendored and modified it) but is bounded to **game-activity 2.0.x or later**.
+
+Two abort traps to respect: `initializeNativeCode` **aborts** unless
+`GameActivity.{finish,setWindowFlags,getWindowInsets,getWaterfallInsets,setImeEditorInfoFields}`,
+`Insets.{l,t,r,b}` and 9 `WindowInsetsCompat$Type` statics all resolve; and `ALooper_forThread` must
+not return NULL or it returns 0 and dies.
+
+Cost if wrong: if some later Roblox version adds Java-side logic the engine depends on, the shim
+grows. The measurement method is repeatable against a new APK, so this is detectable rather than
+surprising.
+
+Evidence: `research/jni-surface.md`, `research/jni-surface-lists.txt`.
+
+---
+
+## D13 — `TPIDR_EL0` must be programmed with a bionic TLS block before **any** guest code runs
+**Hard prerequisite, discovered late and easy to miss entirely.**
+
+`libroblox.so` contains **1,282 `MRS Xt, TPIDR_EL0` instructions, and 1,276 of them read
+`[Xt, #0x28]`** — which is bionic's `TLS_SLOT_STACK_GUARD` (slot 5, at offset 5 × 8 = 0x28). Every
+stack-protected function in the engine reads the bionic thread pointer *directly*, without going
+through libc.
+
+The consequence is ordering, and it is severe: this happens **before JNI matters, before
+`JNI_OnLoad`, and before the first of the 3,594 static initializers**. If `TPIDR_EL0` does not point
+at a valid bionic-layout TLS block with a stack guard at +0x28, the very first stack-protected
+function crashes. No amount of correct loading, relocation, or symbol resolution gets past it.
+
+So the guest-thread bring-up sequence is: allocate a bionic-layout TLS block per guest thread,
+populate at minimum slot 5 with a stack-guard value, set `TPIDR_EL0` to it, **and only then** run any
+guest code. This applies to every guest thread, not just the first.
+
+This is implementable: the dynarmic spike separately confirmed that `TPIDR_EL0` and `TPIDRRO_EL0`
+are **fully supported** by the A64 frontend (D5), so the register is real and writable rather than
+trapped.
+
+Cost if wrong: an immediate, near-inexplicable crash at the first initializer, with a symptom
+(faulting on a load from a small offset off a zero register) that looks like a loader bug rather than
+a missing thread pointer. Recording it here is what prevents a long debugging session at M3.
+
+Evidence: `research/jni-surface.md` finding 14.
