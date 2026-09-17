@@ -19,3 +19,11 @@ rustc-hash = { workspace = true }
 crc32fast = { workspace = true }
 sha2 = { workspace = true }
 flate2 = { workspace = true }
+
+# The synthetic-zip tests build archives byte by byte (they need a deflate *compressor*, which the
+# crate itself never uses), and the fixture tests re-hash a cache file independently of the code
+# under test.
+[dev-dependencies]
+crc32fast = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
