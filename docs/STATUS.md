@@ -31,6 +31,12 @@ Last updated: 2026-09-18
 | Memory: placeholders | `MapViewOfFile3` gives real `MAP_FIXED` at **4 KB** base and file-offset granularity (512/512 verified) |
 | JIT memory | Dual-mapped section: 162 ns per emit-and-execute cycle versus 2259 ns for `VirtualProtect` |
 | Multi-instance | 4 concurrent Vulkan instances independent, about 52 MiB VRAM and 110 to 160 MB host RAM each |
+| CPU: identity mapping | Guest VA == host VA verified at a 47-bit address with zero slow-path callbacks; costs one folded SIB base |
+| CPU: correctness | dynarmic builds in 49 s; all 202,200 of its test assertions pass; 37/37 hand-encoded A64 checks correct |
+| CPU: throughput | About 2.0x native on memory-heavy code, 2.2x on NEON/FP, about 33x on register-bound integer code |
+| CPU: fastmem gain | 5,207 Mguest-insn/s fastmem versus 396 through callbacks, a 13.2x difference |
+| CPU: cold translation | 0.15 to 0.31 Mguest-insn/s, implying 7 to 25 s to warm a Roblox-sized working set |
+| CPU: per-thread cost | 20 to 35 MiB committed per guest thread, code caches not shared between threads |
 
 ## Verified about the test APK
 
@@ -70,5 +76,4 @@ milestone ladder in `ARCHITECTURE.md` section 9 is the progress measure.
 
 | # | Decision | Blocked on |
 |---|---|---|
-| D5 | CPU backend: adopt dynarmic, adopt then replace, or write a custom translator | Build and performance spike, running |
 | D7 | JNI without a JVM, or is a dex interpreter unavoidable | JNI surface extraction, running |

@@ -310,3 +310,100 @@ Cost if wrong: the approach is Windows-specific in its mechanics. The same patte
 Linux (`memfd_create` plus two `mmap`s) and macOS (`MAP_JIT` with
 `pthread_jit_write_protect_np`, which behaves differently and will need its own measurement), so
 this sits behind the platform abstraction rather than in shared code.
+
+---
+
+## D4 (resolved) — Identity mapping confirmed: guest VA == host VA, at zero cost
+**Was provisional, now verified.** The spike configured dynarmic with `fastmem_pointer = Some(0)`
+and `fastmem_address_space_bits = 64`, which emits `mov reg, [r13 + vaddr]` with `r13 = 0` — a
+single instruction with the base folded into the SIB byte. Verified executing at host VA
+**0x7F00_0000_0000** (bit 46) with **zero** slow-path callbacks taken.
+
+So the central architectural bet in `ARCHITECTURE.md` section 1 holds: there is no address
+translation on the memory path, and it costs not even a register add. Measured consequence: the
+memory-heavy loop runs at **5,207 Mguest-insn/s** on the fastmem path versus **396 Mguest-insn/s**
+through memory callbacks — a **13.2x** difference. This single configuration choice is the
+difference between a viable runtime and an unusable one.
+
+**Two footguns to guard against in code, not comments:**
+- The default `fastmem_address_space_bits` is **36**, and a high guest VA silently degrades to the
+  callback path rather than erroring. A 13x performance loss that produces correct results is the
+  worst possible failure mode, so Omnidroid must assert this configuration at startup.
+- Guest PC is truncated to a sign-extended **56 bits**. Harmless for Windows and Android user-space
+  addresses, but it is a real cap and is recorded here so nobody is surprised by it later.
+
+Windows fault handling inside dynarmic is **frame-based SEH scoped to its code cache**, which means
+an Omnidroid-installed **vectored** exception handler runs first. Verified: Omnidroid's VEH took the
+fault (`veh_hits=1`) and dynarmic's slow path was never entered. Omnidroid therefore keeps ownership
+of guest demand paging, which D10 requires.
+
+---
+
+## D5 (resolved) — CPU core: adopt dynarmic as a pinned fork, plan to replace the x64 backend
+**Ruling.** Adopt dynarmic now, pinned as a fork we carry patches against, behind the `GuestCpu`
+trait. Plan for eventual replacement of its x64 backend rather than treating it as permanent.
+
+`merryhime/dynarmic` **404s**; the spike used mirror `yuzu-mirror/dynarmic@9d45823` (v6.7.0,
+2024-03-05, ISC/0BSD, externals vendored as git subtrees rather than submodules). That is the pin.
+
+**It clears the bar.** Builds clean in 49 s with `-j24`, and **all 202,200 test assertions pass**.
+A64 execution verified correct across 37 hand-encoded checks covering shifted ALU operands,
+load/store including pair and register-offset forms, loops, `BL`+`RET`, NEON, FP, and `LDXR`/`STXR`.
+Rust FFI demonstrated end to end — 18 `extern "C"` entry points plus 17 callback pointers, with
+guest code writing directly into a Rust `Vec<u64>` at 5,566 Mguest-insn/s.
+
+**Build requirements the prior-art survey missed:** an **undeclared Boost dependency** (icl and
+variant), `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (robin-map still declares `VERSION 3.1`, which
+CMake 4.x rejects), and short build paths (MSVC `C1083` otherwise). Worth recording because the
+survey listed the dependency set as fmt/mcl/xbyak/zydis/robin-map and Boost was not in it.
+
+**Why not a custom translator now:** estimated ~45,000 LOC and 2-4 engineer-years for A64 integer
+plus NEON plus FP, against a component that already passes 202,200 assertions. That trade is not
+close today.
+
+**Why "plan to replace the backend":** measured performance is uneven.
+
+| Workload | Throughput | vs native |
+|---|---|---|
+| Memory-heavy (fastmem) | 5,207 Mguest-insn/s | ~2.0x |
+| NEON / FP | 1,626 Mguest-insn/s | ~2.2x |
+| Register-bound integer | 603 Mguest-insn/s | **~33x** |
+
+The 33x case is not inherent to translation — the host dump shows per-block register allocation
+spilling every guest register to `JitState` each iteration, plus `lahf`/`sahf` round-trips for NZCV.
+That is a backend quality problem with a known cause, which is exactly the kind of thing a
+replacement backend fixes while keeping the frontend.
+
+**Risks we now carry, with the mitigation each needs:**
+
+1. **Cold translation is the weak spot.** 0.15-0.31 Mguest-insn/s, producing 12-30 bytes of host
+   code per guest instruction, implying **7-25 s** to warm a Roblox-sized working set. Mitigations
+   to build: parallel translation across the 24 available cores, and a persistent on-disk code
+   cache keyed by library content hash so the cost is paid once rather than per launch.
+2. **Per-thread memory conflicts with the memory goal.** One `Jit` per guest thread with **fully
+   duplicated** code caches, committing **20-35 MiB per thread regardless of code volume** —
+   0.6-1.1 GiB for 32 threads. Roblox is heavily multithreaded, so this directly threatens D10.
+   Needs investigation into cache sharing; if dynarmic cannot share, this becomes the strongest
+   argument for a replacement backend.
+3. **`ExclusiveMonitor` anti-scales 21x from 1 to 16 threads** — one global spinlock per
+   `LDXR`/`STXR`. `fastmem_exclusive_access` is the untested mitigation. This compounds with risk 4.
+4. **231 of 874 decoder entries are unimplemented**: LSE atomics (`CAS`/`LDADD`/`SWP`), FP16
+   arithmetic, BF16, i8mm, `FJCVTZS`, `CNTVCT_EL0`, and `MIDR_EL1`/`ID_AA64*` system registers.
+   They surface cleanly via `InterpreterFallback` at ~87 ns per trap, so they are correct but slow.
+   Note the interaction: because Omnidroid implements bionic, it controls `getauxval(AT_HWCAP)` and
+   can decline to advertise LSE — but that steers the engine onto `LDXR`/`STXR`, straight into
+   risk 3's global spinlock. The two must be resolved together, not separately.
+
+**Good news worth recording:** `TPIDR_EL0`/`TPIDRRO_EL0` are fully supported, which is essential
+given Android TLS depends on the thread pointer. PAC/BTI hint-space forms no-op correctly, crypto,
+CRC32 and SDOT work, unaligned access just works, and `SVC` reaches a clean `CallSVC` hook.
+
+**A real dynarmic bug found:** `hook_hint_instructions` is never plumbed into the A64 frontend, so
+every `YIELD` exits the JIT. One-line fix, and a patch we carry on the fork.
+
+Cost if wrong: if the per-thread memory cost or the exclusive-monitor contention proves
+unfixable under real Roblox thread counts, the x64 backend replacement moves from "later" to
+"required", which is a large but bounded piece of work. The `GuestCpu` trait is what keeps that
+change from touching the rest of the runtime.
+
+Evidence: `research/dynarmic-spike.md`.

@@ -180,12 +180,36 @@ Translated code lives in a **dual-mapped arena**, one RW view for emission and o
 execution of the same pages, measured at 162 ns per emit-and-execute cycle versus 2259 ns for
 `VirtualProtect` flipping, and never holding a W+X page (D12).
 
-**The backend choice is not yet made.** Prior art established dynarmic as the only permissively
-licensed, direction-correct A64-to-x86-64 JIT, but adopting it depends on whether it builds here,
-whether it tolerates identity-mapped memory, whether it assumes a bounded guest address space, and
-its real throughput. That spike is running, and no code is written against either option until it
-reports. If dynarmic proves unsuitable the alternative is a purpose-built translator, and the trait
-boundary is what keeps that decision cheap.
+**The backend is dynarmic, pinned as a fork** (D5), behind the `GuestCpu` trait. The spike
+confirmed the central bet: `fastmem_pointer = 0` with `fastmem_address_space_bits = 64` emits
+`mov reg, [r13 + vaddr]` with `r13 = 0` — identity mapping at **zero** runtime cost, verified at a
+47-bit host VA with no slow-path callbacks. That path measured **13.2x** faster than routing memory
+through callbacks, so Omnidroid asserts this configuration at startup rather than trusting the
+default (which is 36 bits and silently degrades high addresses to the slow path while still
+producing correct results).
+
+Measured throughput is uneven and shapes what comes next: about **2.0x native** on memory-heavy
+code and **2.2x** on NEON/FP, but about **33x** on register-bound integer code, caused by per-block
+register allocation spilling every guest register to `JitState` each iteration plus `lahf`/`sahf`
+NZCV round-trips. That is a fixable backend-quality problem, which is why the plan is to replace the
+x64 backend eventually while keeping the A64 frontend.
+
+Three consequences the rest of the design must absorb:
+
+- **Cold translation is slow** (0.15-0.31 Mguest-insn/s, implying 7-25 s to warm a Roblox-sized
+  working set), so translation is parallelized across cores and backed by a persistent on-disk code
+  cache keyed by library content hash.
+- **Code caches are per-thread and not shared**, committing 20-35 MiB per guest thread regardless of
+  code volume. This is in direct tension with D10 and is tracked as a primary risk.
+- **`ExclusiveMonitor` uses one global spinlock** and anti-scales 21x from 1 to 16 threads. Since
+  Omnidroid implements bionic it controls `getauxval(AT_HWCAP)` and could decline to advertise LSE
+  atomics — but that steers the engine onto `LDXR`/`STXR` and into this very lock, so the two are
+  resolved together.
+
+`TPIDR_EL0` is fully supported, which matters because Android TLS depends on the thread pointer.
+Unimplemented instructions (LSE atomics, FP16 arithmetic, `CNTVCT_EL0`, `ID_AA64*`) surface cleanly
+through an interpreter fallback at about 87 ns per trap, so they are correct but slow, and are
+patches we carry on the fork.
 
 ---
 
