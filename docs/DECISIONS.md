@@ -294,6 +294,39 @@ Two mechanical requirements found the hard way: the APK or cache file must be op
 `GENERIC_READ | GENERIC_EXECUTE` and the section created `PAGE_EXECUTE_READ`, or `.text` can never
 be made executable afterwards; and a misaligned offset fails with `ERROR_MAPPED_ALIGNMENT`.
 
+### Correction (found during Task 1 implementation)
+
+The paragraph above was **incomplete in a way that would have caused a confusing failure at M2
+rather than M1**. Opening the file and creating the section for execute is necessary but *not
+sufficient*: **the view protection caps executability too.** A view mapped `PAGE_READONLY` out of a
+`PAGE_EXECUTE_READ` section **cannot later be raised** to `PAGE_EXECUTE_READ` — it fails with
+error 87, the same error as the read-only-section case, which is what makes the two easy to
+conflate.
+
+So executability must be chosen **twice**: once when opening the file and creating the section, and
+again at **every** `map_file` call. `.text` must be mapped `ReadExecute` from the outset; it cannot
+be mapped read-only and promoted later.
+
+This directly shapes how the ELF loader applies relocations, since relocation targets must be
+writable at that moment while the same pages must end up executable. The working sequence, verified
+byte-exact in Task 1's tests, is: **map `ReadExecute` → drop to `ReadWrite` → write → restore
+`ReadExecute`.** Mapping read-only first and hoping to promote does not work.
+
+Two further measured corrections from the same work:
+- Double release reports error **487**, not 87.
+- `Protection::ReadWrite` requires `PAGE_WRITECOPY` for a *view* but `PAGE_READWRITE` for *private*
+  memory, so the protect operation performs a `VirtualQuery` to determine which applies rather than
+  assuming.
+
+### Confirmed prediction
+
+The same tests confirmed the multi-instance premise of this decision: a 4 MiB shared read-only view
+cost **+0.008 MiB** of commit charge, and that figure was **unchanged after reading every byte of
+it**. File-backed pages genuinely do not consume commit charge, which is what allows instances to
+share `libroblox.so`'s ~109 MB of text at near-zero marginal cost. Committed private memory
+behaved as D10 predicted: 64 MiB committed cost +64.125 MiB, i.e. the size plus size/512 of page
+tables, and decommit returned exactly that.
+
 ---
 
 ## D12 — JIT code memory: dual-mapped section, not `VirtualProtect` flipping
