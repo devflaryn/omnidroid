@@ -1,0 +1,24 @@
+# Build output
+/target/
+**/target/
+/build/
+*.pdb
+
+# The test APK and anything extracted from it (large binary, not ours to redistribute)
+*.apk
+/apk-extracted/
+/testdata/apk/
+
+# Per-instance runtime state
+/instances/
+/run/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# SDD workspace (git-ignored scratch)
+/.superpowers/
