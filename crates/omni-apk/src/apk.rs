@@ -37,15 +37,26 @@ const STREAM_BUFFER: usize = 256 * 1024;
 /// buys a fully-resolved, immutable entry table that can then be shared and queried without
 /// touching the disk again.
 ///
-/// `Apk` is `Send + Sync`. One APK is one file handle, and a read is a seek followed by a stream,
-/// so reads are serialised on that handle: concurrent readers are correct but do not overlap. That
-/// is a deliberate trade. Positional reads (`pread`, or `ReadFile` with an `OVERLAPPED` offset)
-/// would let them overlap, but they are only reachable through `std::os::unix` /
-/// `std::os::windows`, and Global Constraint 4 keeps OS-specific code out of every crate but
-/// `omni-platform`.
+/// # Concurrency, and the latency hazard in it
+///
+/// `Apk` is `Send + Sync`, but one APK is one file handle, and a read is a seek followed by a
+/// stream, so **the handle's lock is held for the whole of a read, not just the seek**. Reads are
+/// therefore fully serialised: concurrent readers are correct but do not overlap, and a reader that
+/// arrives while `lib/arm64-v8a/libroblox.so` is being inflated waits for all 109 MB of it — about
+/// 413 ms in a release build, several seconds in a debug one. Nothing here is fair or preemptible
+/// either, so that wait is unbounded in the presence of a steady stream of large reads.
+///
+/// A caller that needs a small read not to queue behind a big one should **open a second `Apk`**;
+/// opening costs about 6.4 ms including all 2,365 local file headers, so a reader per thread is
+/// cheap. Positional reads (`pread`, or `ReadFile` with an `OVERLAPPED` offset) would remove the
+/// lock entirely, but they are only reachable through `std::os::unix` / `std::os::windows`, and
+/// Global Constraint 4 keeps OS-specific code out of every crate but `omni-platform`; widening that
+/// crate's surface for a bottleneck nobody has measured in anger is not a trade worth making yet.
 pub struct Apk {
     path: PathBuf,
+    canonical_path: PathBuf,
     len: u64,
+    modified: Option<std::time::SystemTime>,
     file: Mutex<File>,
     eocd: EndOfCentralDirectory,
     entries: Vec<ZipEntry>,
@@ -71,10 +82,15 @@ impl Apk {
     pub fn open(path: impl Into<PathBuf>) -> ApkResult<Self> {
         let path = path.into();
         let mut file = File::open(&path).map_err(|e| ApkError::io("opening the APK", &path, e))?;
-        let len = file
+        let metadata = file
             .metadata()
-            .map_err(|e| ApkError::io("reading the length of the APK", &path, e))?
-            .len();
+            .map_err(|e| ApkError::io("reading the metadata of the APK", &path, e))?;
+        let len = metadata.len();
+        // Identity of *this* archive, for the extraction cache's probe key. Taken here because the
+        // stat has already happened, and kept for the lifetime of the `Apk` so that the key a
+        // lookup computes and the key the following extraction writes cannot disagree.
+        let modified = metadata.modified().ok();
+        let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
 
         if len < EOCD_LEN as u64 {
             return Err(ApkError::TooShort {
@@ -106,7 +122,16 @@ impl Apk {
                 pointer_width: usize::BITS,
             }
         })?;
-        let mut cd = vec![0u8; cd_size];
+        // Bounded by the file (`cd_end > len` was refused above), but still fallible: a 4 GB
+        // central directory in a 4 GB archive must be an error, not an abort.
+        let mut cd = Vec::new();
+        cd.try_reserve_exact(cd_size)
+            .map_err(|source| ApkError::Allocation {
+                name: "the central directory".to_owned(),
+                bytes: cd_size,
+                source,
+            })?;
+        cd.resize(cd_size, 0);
         read_exact_at(
             &mut file,
             eocd.central_directory_offset,
@@ -141,7 +166,9 @@ impl Apk {
 
         Ok(Self {
             path,
+            canonical_path,
             len,
+            modified,
             file: Mutex::new(file),
             eocd,
             entries,
@@ -155,10 +182,31 @@ impl Apk {
         &self.path
     }
 
+    /// The path the APK was opened from, with symlinks and relative components resolved.
+    ///
+    /// Resolved once at open time. Part of the extraction cache's identity for this archive, so that
+    /// a hint index entry written while reading one APK is never consulted while reading another —
+    /// see [`LibraryCache`](crate::LibraryCache). Falls back to the path as given if the platform
+    /// refuses to canonicalise it.
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
     /// The length of the APK file in bytes.
     #[must_use]
     pub const fn file_len(&self) -> u64 {
         self.len
+    }
+
+    /// The APK's last-modified time, as reported when it was opened.
+    ///
+    /// `None` where the platform does not report one. Also part of the cache's identity for this
+    /// archive: replacing an APK's contents changes this, and so invalidates every cache hint
+    /// derived from the old contents.
+    #[must_use]
+    pub const fn modified(&self) -> Option<std::time::SystemTime> {
+        self.modified
     }
 
     /// The located end-of-central-directory record.
@@ -193,17 +241,31 @@ impl Apk {
 
     /// Read an entry into memory, verifying its CRC-32.
     ///
-    /// Fails rather than truncating when the entry does not fit in this target's address space;
-    /// use [`copy_entry_to`](Self::copy_entry_to) for anything that large.
+    /// Fails rather than truncating when the entry does not fit in this target's address space; use
+    /// [`copy_entry_to`](Self::copy_entry_to) for anything that large.
+    ///
+    /// # Hostile sizes
+    ///
+    /// The buffer is sized from [`ZipEntry::plausible_uncompressed_size`] — the declared size
+    /// clamped to what the payload that is actually present could produce — and reserved with
+    /// `try_reserve_exact`, so a declared size of 70 TB out of a 200-byte archive returns
+    /// [`ApkError::Allocation`] or [`ApkError::UncompressedSizeMismatch`] rather than aborting the
+    /// process. That distinction matters: an allocation failure in Rust is an **abort**, not a
+    /// panic, so no caller could catch it.
     pub fn read_entry(&self, entry: &ZipEntry) -> ApkResult<Vec<u8>> {
-        let capacity = usize::try_from(entry.uncompressed_size()).map_err(|_| {
-            ApkError::TooLargeForAddressSpace {
-                name: entry.name().to_owned(),
-                size: entry.uncompressed_size(),
-                pointer_width: usize::BITS,
-            }
+        let plausible = entry.plausible_uncompressed_size();
+        let capacity = usize::try_from(plausible).map_err(|_| ApkError::TooLargeForAddressSpace {
+            name: entry.name().to_owned(),
+            size: plausible,
+            pointer_width: usize::BITS,
         })?;
-        let mut out = Vec::with_capacity(capacity);
+        let mut out = Vec::new();
+        out.try_reserve_exact(capacity)
+            .map_err(|source| ApkError::Allocation {
+                name: entry.name().to_owned(),
+                bytes: capacity,
+                source,
+            })?;
         self.stream(entry, &mut out, "an in-memory buffer", None)?;
         Ok(out)
     }

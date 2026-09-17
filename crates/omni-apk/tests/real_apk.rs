@@ -548,7 +548,7 @@ fn extracting_libroblox_produces_an_aligned_content_addressed_file_then_hits() {
         .expect("libroblox.so");
 
     assert!(
-        cache.lookup(entry).expect("an empty cache must look up cleanly").is_none(),
+        cache.lookup(&apk, entry).expect("an empty cache must look up cleanly").is_none(),
         "an empty cache cannot have a hit"
     );
 
@@ -612,7 +612,7 @@ fn extracting_libroblox_produces_an_aligned_content_addressed_file_then_hits() {
 
     // And `lookup` alone sees it, without extracting.
     let looked_up = cache
-        .lookup(entry)
+        .lookup(&apk, entry)
         .expect("lookup must succeed")
         .expect("the entry must now be cached");
     assert_eq!(looked_up.path(), cached.path());
@@ -634,7 +634,7 @@ fn a_cache_entry_of_the_wrong_size_is_not_reused() {
     // Truncate the cache file, as an interrupted writer that did *not* use temp-then-rename would
     // have left it.
     fs::write(first.path(), b"partial").expect("truncating the cache file");
-    match cache.lookup(entry) {
+    match cache.lookup(&apk, entry) {
         Err(ApkError::CacheSizeMismatch {
             expected, actual, ..
         }) => {
@@ -670,7 +670,7 @@ fn a_missing_cache_file_behind_a_live_index_is_re_extracted() {
     let first = cache.extract(&apk, entry).expect("first extraction");
     fs::remove_file(first.path()).expect("deleting the cache file");
     assert!(
-        cache.lookup(entry).expect("lookup must not fail").is_none(),
+        cache.lookup(&apk, entry).expect("lookup must not fail").is_none(),
         "an index entry pointing at nothing is not a hit"
     );
     let second = cache.extract(&apk, entry).expect("re-extraction");
@@ -753,7 +753,7 @@ fn the_cache_refuses_entries_that_are_not_native_libraries() {
             Ok(cached) => panic!("{name} was extracted as a library: {cached:?}"),
         }
         assert!(matches!(
-            cache.lookup(entry),
+            cache.lookup(&apk, entry),
             Err(ApkError::NotANativeLibrary { .. })
         ));
     }

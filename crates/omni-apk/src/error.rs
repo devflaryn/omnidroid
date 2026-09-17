@@ -334,6 +334,24 @@ pub enum ApkError {
         pointer_width: u32,
     },
 
+    /// Memory to hold an entry could not be reserved.
+    ///
+    /// A declared uncompressed size is attacker-controlled input, so it is never handed to an
+    /// infallible allocator. Between the plausibility ceiling that bounds the request and
+    /// `Vec::try_reserve_exact`, a lying archive produces this error instead of aborting the
+    /// process — which matters because an allocation abort is not a panic and no caller can
+    /// contain it.
+    #[error("could not reserve {bytes} bytes to hold `{name}`: {source}")]
+    Allocation {
+        /// The entry being read.
+        name: String,
+        /// How many bytes were asked for.
+        bytes: usize,
+        /// The allocator's complaint.
+        #[source]
+        source: std::collections::TryReserveError,
+    },
+
     /// The deflate stream was malformed.
     #[error("inflating `{name}` failed after producing {produced} of {expected} bytes: {source}")]
     Inflate {

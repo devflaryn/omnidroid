@@ -52,6 +52,15 @@ pub(crate) const ZIP64_LOCATOR_LEN: usize = 20;
 pub(crate) const ZIP64_EOCD_LEN: usize = 56;
 pub(crate) const LOCAL_FILE_HEADER_LEN: usize = 30;
 
+/// The fixed part of a central-directory record. A record is never shorter than this, which makes
+/// it the divisor that bounds how many records a given number of bytes can hold.
+pub(crate) const CENTRAL_RECORD_LEN: usize = 46;
+
+/// The most one byte of a deflate stream can expand to, from RFC 1951's maximum match length and
+/// minimum encoding: 1032:1. Nothing legitimate exceeds it, so it is the ceiling that turns a
+/// declared uncompressed size into a bounded allocation request.
+pub const MAX_DEFLATE_EXPANSION: u64 = 1032;
+
 /// The longest possible zip comment, and therefore the furthest the EOCD can be from the end.
 pub(crate) const MAX_COMMENT_LEN: u64 = u16::MAX as u64;
 
@@ -450,12 +459,21 @@ pub(crate) struct CentralRecord {
 }
 
 /// Parse `count` central-directory records out of `bytes`, which start at file offset `base`.
+///
+/// `count` is attacker-controlled and, on the zip64 path, is a full `u64` rather than something the
+/// format caps at 65,535 — so it is never used as an allocation size directly. A record cannot be
+/// shorter than its 46 fixed bytes, so `bytes.len() / 46` is a hard ceiling on how many can
+/// actually be there, and reserving beyond that could only ever be wasted. A `count` that exceeds
+/// the ceiling still fails, one line later, with [`ApkError::CentralDirectoryEntryCount`] naming
+/// both numbers.
 pub(crate) fn parse_central_directory(
     bytes: &[u8],
     base: u64,
     count: u64,
 ) -> ApkResult<Vec<CentralRecord>> {
-    let mut records = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    let ceiling = bytes.len() / CENTRAL_RECORD_LEN;
+    let capacity = usize::try_from(count).unwrap_or(usize::MAX).min(ceiling);
+    let mut records = Vec::with_capacity(capacity);
     let mut f = Fields::new(bytes, base, "central-directory record");
 
     while records.len() as u64 != count {
@@ -783,9 +801,31 @@ impl ZipEntry {
     }
 
     /// How many bytes the entry is once decompressed.
+    ///
+    /// This is a *claim* made by the central directory, not a measurement. It is checked against
+    /// what the payload actually produces on every read, and
+    /// [`plausible_uncompressed_size`](Self::plausible_uncompressed_size) is what should be used to
+    /// size a buffer.
     #[must_use]
     pub const fn uncompressed_size(&self) -> u64 {
         self.uncompressed_size
+    }
+
+    /// The declared uncompressed size, clamped to what the payload that is actually present could
+    /// possibly produce.
+    ///
+    /// A hostile archive can declare any size it likes in 8 bytes of central directory —
+    /// 70,368,744,177,664 out of a 200-byte file, say — so the declared size must never reach an
+    /// allocator unclamped. A STORED entry can only produce its own payload; a DEFLATED one can
+    /// produce at most [`MAX_DEFLATE_EXPANSION`] times it. Since the payload is bounds-checked
+    /// against the file length when the archive is opened, this is bounded by the file that exists.
+    #[must_use]
+    pub fn plausible_uncompressed_size(&self) -> u64 {
+        let ceiling = match self.method {
+            CompressionMethod::Stored => self.compressed_size,
+            _ => self.compressed_size.saturating_mul(MAX_DEFLATE_EXPANSION),
+        };
+        self.uncompressed_size.min(ceiling)
     }
 
     /// File offset of the entry's local file header.

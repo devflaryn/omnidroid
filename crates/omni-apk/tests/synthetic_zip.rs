@@ -7,10 +7,27 @@
 //! The builder here is deliberately dumb: it writes the fields out longhand rather than sharing any
 //! code with the parser, so a misreading of APPNOTE.TXT cannot cancel itself out.
 
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
-use omni_apk::{Apk, ApkError, CompressionMethod, MAPPING_ALIGNMENT};
+use omni_apk::{
+    Apk, ApkError, CacheOutcome, CompressionMethod, LibraryCache, MAPPING_ALIGNMENT,
+    MAX_DEFLATE_EXPANSION,
+};
+
+/// Counts every temporary path this process makes, so nothing collides.
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn temp_path(label: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "omni-apk-synthetic-{label}-{}-{}{extension}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 // -------------------------------------------------------------------------------------------
 // A minimal zip writer
@@ -106,8 +123,15 @@ fn build(entries: &[Entry], zip64_eocd: bool) -> Vec<u8> {
         out.extend_from_slice(&0u16.to_le_bytes()); // time
         out.extend_from_slice(&0u16.to_le_bytes()); // date
         out.extend_from_slice(&entry.crc32.to_le_bytes());
-        out.extend_from_slice(&(entry.stored.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(entry.uncompressed_size as u32).to_le_bytes());
+        if entry.zip64 {
+            // What a real zip64 writer puts here: the 32-bit fields are saturated and the true
+            // values live in the extra fields, so a reader must not compare against them.
+            out.extend_from_slice(&u32::MAX.to_le_bytes());
+            out.extend_from_slice(&u32::MAX.to_le_bytes());
+        } else {
+            out.extend_from_slice(&(entry.stored.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(entry.uncompressed_size as u32).to_le_bytes());
+        }
         out.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
         out.extend_from_slice(&entry.local_padding.to_le_bytes());
         out.extend_from_slice(entry.name.as_bytes());
@@ -205,13 +229,8 @@ struct TempZip {
 
 impl TempZip {
     fn new(label: &str, bytes: &[u8]) -> Self {
-        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "omni-apk-synthetic-{label}-{}-{}.apk",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::write(&path, bytes).expect("writing a synthetic zip");
+        let path = temp_path(label, ".apk");
+        fs::write(&path, bytes).expect("writing a synthetic zip");
         Self { path }
     }
 
@@ -226,8 +245,58 @@ impl TempZip {
 
 impl Drop for TempZip {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.path);
     }
+}
+
+/// A throwaway cache root that removes itself.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let path = temp_path(label, "");
+        fs::create_dir_all(&path).expect("creating a temporary directory");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The name every cache test uses, so `LibraryCache` accepts the entry.
+const LIBRARY: &str = "lib/arm64-v8a/libfake.so";
+
+/// An archive holding one DEFLATED native library with these contents.
+fn library_archive(contents: &[u8]) -> Vec<u8> {
+    build(&[Entry::deflated(LIBRARY, contents)], false)
+}
+
+/// Plausible-looking library contents: compressible, but not trivially so.
+fn library_contents() -> Vec<u8> {
+    let mut bytes = b"\x7fELF".to_vec();
+    for index in 0..8192u32 {
+        bytes.extend_from_slice(&index.to_le_bytes());
+    }
+    bytes
+}
+
+/// The single file in the cache's hint-index directory.
+fn sole_index_file(cache_root: &Path) -> PathBuf {
+    let mut files: Vec<PathBuf> = fs::read_dir(cache_root.join("index"))
+        .expect("the index directory must exist")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    assert_eq!(files.len(), 1, "expected exactly one index file, got {files:?}");
+    files.pop().expect("one index file")
 }
 
 // -------------------------------------------------------------------------------------------
@@ -547,6 +616,311 @@ fn an_archive_comment_does_not_hide_the_end_record() {
         apk.read_named("payload.bin").expect("reading the entry"),
         payload
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// Hostile sizes and counts: an error, never an abort
+// -------------------------------------------------------------------------------------------
+
+/// A declared uncompressed size is 8 bytes of attacker-controlled central directory. Sizing a
+/// buffer from it directly means a tiny archive can request an allocation no machine can serve, and
+/// an allocation failure in Rust is an **abort**, not a panic — nothing can catch it, so it must
+/// never be reached.
+#[test]
+fn a_declared_size_far_larger_than_the_payload_is_an_error_not_an_abort() {
+    let payload = b"twelve bytes".to_vec();
+
+    // 4 GB out of a 200-byte file, without needing zip64: still representable in the 32-bit field.
+    let zip = TempZip::new(
+        "huge-32",
+        &build(
+            &[Entry::stored("payload.bin", &payload).with_uncompressed_size(4_000_000_000)],
+            false,
+        ),
+    );
+    let apk = zip.open().expect("the archive itself is well formed");
+    assert!(apk.file_len() < 200, "the whole archive is {} bytes", apk.file_len());
+    let entry = apk.require_entry("payload.bin").expect("payload.bin");
+    assert_eq!(entry.uncompressed_size(), 4_000_000_000, "as declared");
+    assert_eq!(
+        entry.plausible_uncompressed_size(),
+        payload.len() as u64,
+        "a STORED entry can only ever produce its own payload, so that is the clamp"
+    );
+    match apk.read_entry(entry) {
+        Err(ApkError::UncompressedSizeMismatch {
+            expected, actual, ..
+        }) => {
+            assert_eq!(expected, 4_000_000_000);
+            assert_eq!(actual, payload.len() as u64);
+        }
+        Err(other) => panic!("wrong error: {other}"),
+        Ok(_) => panic!("a 4 GB claim over 12 bytes was accepted"),
+    }
+
+    // And the same thing through zip64, where the declared size is a full u64: 2^46 bytes, which is
+    // the shape that was observed aborting with `memory allocation of 70368744177664 bytes failed`.
+    let zip = TempZip::new(
+        "huge-64",
+        &build(
+            &[Entry::deflated("payload.bin", &payload)
+                .with_uncompressed_size(70_368_744_177_664)
+                .saturating_to_zip64()],
+            true,
+        ),
+    );
+    let apk = zip.open().expect("the archive itself is well formed");
+    assert!(apk.file_len() < 300, "the whole archive is {} bytes", apk.file_len());
+    let entry = apk.require_entry("payload.bin").expect("payload.bin");
+    assert_eq!(entry.uncompressed_size(), 70_368_744_177_664, "as declared");
+    assert_eq!(
+        entry.plausible_uncompressed_size(),
+        entry.compressed_size() * MAX_DEFLATE_EXPANSION,
+        "clamped to the most this many bytes of deflate could possibly produce"
+    );
+    assert!(
+        entry.plausible_uncompressed_size() < 100_000,
+        "the clamp must be small: {} bytes",
+        entry.plausible_uncompressed_size()
+    );
+    match apk.read_entry(entry) {
+        Err(ApkError::UncompressedSizeMismatch { expected, .. }) => {
+            assert_eq!(expected, 70_368_744_177_664);
+        }
+        Err(other) => panic!("wrong error: {other}"),
+        Ok(_) => panic!("a 70 TB claim over 12 bytes was accepted"),
+    }
+}
+
+/// A zip64 end record's entry count is also a full `u64`, and it is read before any record is
+/// parsed — so this one is reachable straight through `Apk::open`, in a 98-byte file.
+#[test]
+fn a_zip64_entry_count_lie_is_an_error_not_an_abort() {
+    /// A zip64 end record and locator with no entries at all, declaring `count` of them.
+    fn archive_declaring(count: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        out.extend_from_slice(&44u64.to_le_bytes());
+        out.extend_from_slice(&45u16.to_le_bytes());
+        out.extend_from_slice(&45u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // this disk
+        out.extend_from_slice(&0u32.to_le_bytes()); // disk of central directory
+        out.extend_from_slice(&count.to_le_bytes()); // entries on this disk
+        out.extend_from_slice(&count.to_le_bytes()); // entries in total
+        out.extend_from_slice(&0u64.to_le_bytes()); // central directory size
+        out.extend_from_slice(&0u64.to_le_bytes()); // central directory offset
+
+        out.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes()); // the zip64 record is at offset 0
+        out.extend_from_slice(&1u32.to_le_bytes());
+
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&u16::MAX.to_le_bytes());
+        out.extend_from_slice(&u16::MAX.to_le_bytes());
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    let bytes = archive_declaring(70_368_744_177_664);
+    assert_eq!(bytes.len(), 98, "the whole hostile archive");
+    let zip = TempZip::new("count-lie", &bytes);
+    match zip.open() {
+        Err(ApkError::CentralDirectoryEntryCount {
+            declared,
+            parsed,
+            size,
+            ..
+        }) => {
+            assert_eq!(declared, 70_368_744_177_664);
+            assert_eq!(parsed, 0, "an empty central directory holds no records");
+            assert_eq!(size, 0);
+        }
+        Err(other) => panic!("wrong error: {other}"),
+        Ok(apk) => panic!("a 98-byte file claiming 2^46 entries opened: {apk:?}"),
+    }
+
+    // A count that is merely wrong, rather than absurd, fails the same way.
+    let zip = TempZip::new("count-lie-small", &archive_declaring(3));
+    assert!(matches!(
+        zip.open(),
+        Err(ApkError::CentralDirectoryEntryCount { declared: 3, parsed: 0, .. })
+    ));
+}
+
+// -------------------------------------------------------------------------------------------
+// The extraction cache, without needing the 160 MB fixture
+// -------------------------------------------------------------------------------------------
+
+/// The hint index must be scoped to one archive, or it is a CRC-32-keyed lookup shared by every APK
+/// on the machine — and CRC-32 is linear, so a tampered library can be padded and tuned to match a
+/// legitimate one's name, both lengths and CRC-32. Running the attacker's APK once would then poison
+/// the hint, and a later run of a **stock** APK would be served the attacker's file as a cache hit.
+///
+/// Here both archives hold byte-identical libraries, which is the strongest possible version of the
+/// collision: everything a size-and-CRC key hashes is equal. The second archive must still miss.
+#[test]
+fn the_hint_index_is_scoped_to_one_archive() {
+    let contents = library_contents();
+    let bytes = library_archive(&contents);
+    let first_zip = TempZip::new("scope-a", &bytes);
+    let second_zip = TempZip::new("scope-b", &bytes);
+    let cache_root = TempDir::new("scope");
+    let cache = LibraryCache::new(cache_root.path());
+
+    let first_apk = first_zip.open().expect("the first archive must open");
+    let second_apk = second_zip.open().expect("the second archive must open");
+    let first_entry = first_apk.require_entry(LIBRARY).expect(LIBRARY);
+    let second_entry = second_apk.require_entry(LIBRARY).expect(LIBRARY);
+
+    // Everything a weak key would hash is identical between the two.
+    assert_eq!(first_entry.name(), second_entry.name());
+    assert_eq!(first_entry.crc32(), second_entry.crc32());
+    assert_eq!(
+        first_entry.uncompressed_size(),
+        second_entry.uncompressed_size()
+    );
+    assert_eq!(first_entry.compressed_size(), second_entry.compressed_size());
+    assert_eq!(first_entry.method(), second_entry.method());
+    assert_ne!(
+        first_apk.canonical_path(),
+        second_apk.canonical_path(),
+        "but they are different files"
+    );
+
+    let first = cache
+        .extract(&first_apk, first_entry)
+        .expect("the first extraction");
+    assert_eq!(first.outcome(), CacheOutcome::Extracted);
+
+    assert!(
+        cache
+            .lookup(&second_apk, second_entry)
+            .expect("the lookup must not fail")
+            .is_none(),
+        "the second archive must not inherit the first archive's hint"
+    );
+    let second = cache
+        .extract(&second_apk, second_entry)
+        .expect("the second extraction");
+    assert_ne!(
+        second.outcome(),
+        CacheOutcome::Reused,
+        "the second archive was served the first archive's hint"
+    );
+    assert!(second.outcome().did_work());
+
+    // Storage sharing is untouched: the destination is still the content hash, so the second
+    // archive's extraction lands on the file the first one published.
+    assert_eq!(second.path(), first.path());
+    assert_eq!(second.sha256(), first.sha256());
+
+    // And each archive now hits on its own key.
+    assert_eq!(
+        cache
+            .extract(&first_apk, first_entry)
+            .expect("re-extract the first")
+            .outcome(),
+        CacheOutcome::Reused
+    );
+    assert_eq!(
+        cache
+            .extract(&second_apk, second_entry)
+            .expect("re-extract the second")
+            .outcome(),
+        CacheOutcome::Reused
+    );
+}
+
+/// The other half of the archive's identity: replacing an APK's contents changes its mtime, which
+/// must invalidate every hint derived from the old contents even though the path is the same.
+#[test]
+fn a_changed_archive_mtime_invalidates_the_hint() {
+    let contents = library_contents();
+    let zip = TempZip::new("mtime", &library_archive(&contents));
+    let cache_root = TempDir::new("mtime");
+    let cache = LibraryCache::new(cache_root.path());
+
+    {
+        let apk = zip.open().expect("open");
+        let entry = apk.require_entry(LIBRARY).expect(LIBRARY);
+        assert_eq!(
+            cache.extract(&apk, entry).expect("first").outcome(),
+            CacheOutcome::Extracted
+        );
+        assert_eq!(
+            cache.extract(&apk, entry).expect("second").outcome(),
+            CacheOutcome::Reused,
+            "the same archive must hit"
+        );
+    }
+
+    // Move the archive's mtime, leaving its path, length and contents alone. Set explicitly rather
+    // than by rewriting the file, so the test cannot depend on filesystem timestamp resolution.
+    let moved = SystemTime::now() + Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(zip.path())
+        .expect("reopening the archive to touch it")
+        .set_modified(moved)
+        .expect("setting the modified time");
+
+    let reopened = Apk::open(zip.path()).expect("reopen");
+    let entry = reopened.require_entry(LIBRARY).expect(LIBRARY);
+    assert!(
+        cache
+            .lookup(&reopened, entry)
+            .expect("the lookup must not fail")
+            .is_none(),
+        "a changed mtime must invalidate the hint"
+    );
+    let again = cache.extract(&reopened, entry).expect("re-extract");
+    assert!(again.outcome().did_work());
+}
+
+/// An index file holds whatever is on disk, which may be arbitrary bytes. None of them may make the
+/// cache permanently unusable — which reading it as UTF-8 with `?` would.
+#[test]
+fn an_unparseable_index_file_is_ignored_rather_than_fatal() {
+    let contents = library_contents();
+    let zip = TempZip::new("junk-index", &library_archive(&contents));
+    let cache_root = TempDir::new("junk-index");
+    let cache = LibraryCache::new(cache_root.path());
+    let apk = zip.open().expect("open");
+    let entry = apk.require_entry(LIBRARY).expect(LIBRARY);
+
+    let first = cache.extract(&apk, entry).expect("the first extraction");
+    let index_file = sole_index_file(cache_root.path());
+
+    // Three ways for an index file to be useless: not UTF-8 at all, UTF-8 that is not hex, and
+    // empty. Each must be a miss that repairs itself, not an error.
+    for junk in [
+        &[0xff, 0xfe, 0x00, 0x80][..],
+        b"this is not a sha-256",
+        b"",
+    ] {
+        fs::write(&index_file, junk).expect("writing junk into the index");
+        assert!(
+            cache
+                .lookup(&apk, entry)
+                .unwrap_or_else(|e| panic!("lookup must not fail on junk {junk:?}: {e}"))
+                .is_none(),
+            "junk {junk:?} was accepted as a hint"
+        );
+
+        let repaired = cache.extract(&apk, entry).expect("extraction must still work");
+        assert!(repaired.outcome().did_work());
+        assert_eq!(repaired.path(), first.path());
+        // And the index is rewritten, so the next call hits again.
+        assert_eq!(
+            cache.extract(&apk, entry).expect("after repair").outcome(),
+            CacheOutcome::Reused
+        );
+    }
 }
 
 #[test]

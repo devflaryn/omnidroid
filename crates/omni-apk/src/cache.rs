@@ -20,15 +20,47 @@
 //!
 //! The content hash is only knowable after decompressing, so a lookup keyed on it alone would
 //! decompress 109 MB to discover it did not need to. A small hint index closes the loop:
-//! `<root>/index/<hash of (entry name, uncompressed size, CRC-32, method)>.sha256` holds the
-//! content hash. All four inputs come from the central directory, so the probe costs one `open`.
+//! `<root>/index/<probe key>.sha256` holds the content hash, so a probe costs one `open`.
 //!
-//! The index is a **hint**, never an authority. Its value is verified against the file it names
-//! (which must exist and be exactly the right length), and the file is still named by its own
-//! content. The residual risk is two *different* libraries agreeing on name, exact uncompressed
-//! size and CRC-32 — a deliberate CRC-32 collision under a size constraint. That is acceptable for
-//! a local extraction cache and is called out here rather than hidden; a caller that cannot accept
-//! it can re-verify with [`ZipEntry::verify_crc32`] after mapping.
+//! The probe key is a SHA-256 over two things, and it needs both:
+//!
+//! 1. **Which archive.** Its canonicalised path, its length, and its last-modified time.
+//! 2. **Which entry in that archive.** Its name, its local-header offset, its compressed and
+//!    uncompressed sizes, its CRC-32, and its compression method.
+//!
+//! Everything in both groups is already in hand — `Apk::open` stats the file and parses the central
+//! directory — so the key costs no extra I/O.
+//!
+//! # Why the key is scoped to one archive
+//!
+//! Without group 1 the index is a CRC-32-keyed lookup shared by every APK on the machine, and
+//! **CRC-32 is linear**: given a tampered library, four bytes anywhere in it can be tuned to
+//! restore any target CRC-32, and it can be padded to match the original's compressed and
+//! uncompressed lengths exactly. Running the attacker's APK once would then overwrite the hint for
+//! that (name, size, CRC-32) triple, and a later run of a **stock** APK would be handed the
+//! attacker's file as a cache hit, with length the only thing checked. That would defeat the
+//! property this cache exists to provide.
+//!
+//! Note what does *not* fix it. Re-verifying with [`ZipEntry::verify_crc32`] after mapping checks
+//! the very CRC-32 the attacker matched. Hashing a bounded prefix and suffix of the cache file does
+//! not work either: a length-matched forgery leaves the middle free, which is exactly where
+//! injected code goes. Scoping the key to the archive does fix it — poisoning now requires
+//! overwriting the victim's own APK, in place, at an identical length and mtime.
+//!
+//! Storage sharing is untouched, because the *destination* is still the content hash. Two APKs
+//! shipping the same library have different probe keys, so the second one decompresses once and
+//! then lands on the file the first one published, through the same race path as any other
+//! concurrent extractor.
+//!
+//! The index remains a **hint**, never an authority: its value must name a file that exists and is
+//! exactly the right length, an unparseable or stale entry is ignored, and the file is still named
+//! by its own content.
+//!
+//! Two residual weaknesses, stated rather than hidden. An attacker who can overwrite the victim's
+//! APK in place at the same length and mtime can still poison a hint — but such an attacker can
+//! simply edit the library in the APK instead, so this is not the weakest link. And on a platform
+//! that reports no mtime, or with a path that does not survive `to_string_lossy` injectively, the
+//! key degrades to path-and-length.
 //!
 //! # Atomicity
 //!
@@ -62,8 +94,16 @@ const TMP_DIR: &str = "tmp";
 /// Extension of a hint-index file.
 const INDEX_SUFFIX: &str = ".sha256";
 
-/// Domain separator for the probe key, so the key can be versioned if its inputs ever change.
-const PROBE_DOMAIN: &[u8] = b"omni-apk extraction-cache probe v1\0";
+/// Domain separator for the probe key, so the key can be versioned when its inputs change.
+///
+/// v2 added the archive's identity — path, length, mtime — and the entry's local-header offset. v1
+/// keys are simply never looked up again; a stale v1 index file is inert, and the extraction it
+/// pointed at is still a valid, correctly named cache file that a v2 key will find again.
+const PROBE_DOMAIN: &[u8] = b"omni-apk extraction-cache probe v2\0";
+
+/// The most an index file may be; 64 hex digits and a newline is 65. Reading a little more means a
+/// longer file is recognised as wrong rather than silently truncated to something that parses.
+const MAX_INDEX_BYTES: u64 = 128;
 
 /// Write buffer for an extraction. One megabyte, because the interesting case is 109 MB.
 const WRITE_BUFFER: usize = 1024 * 1024;
@@ -214,9 +254,13 @@ impl LibraryCache {
     /// `Ok(None)` means "no, extract it". [`ApkError::CacheSizeMismatch`] means an entry was found
     /// but is the wrong length and so cannot be trusted; [`extract`](Self::extract) treats that as
     /// a miss, while a caller that only wants to inspect the cache sees why it was unusable.
-    pub fn lookup(&self, entry: &ZipEntry) -> ApkResult<Option<CachedLibrary>> {
+    ///
+    /// `apk` is required, and is not merely where `entry` came from: the archive's identity is part
+    /// of the probe key, so a hint written while reading one APK is invisible while reading another.
+    /// See the module documentation for why that is load-bearing rather than tidy.
+    pub fn lookup(&self, apk: &Apk, entry: &ZipEntry) -> ApkResult<Option<CachedLibrary>> {
         let file_name = native_library_file_name(entry)?;
-        let index_path = self.index_path(&probe_key(entry));
+        let index_path = self.index_path(&probe_key(apk, entry));
 
         let Some(sha256) = read_index(&index_path)? else {
             return Ok(None);
@@ -253,7 +297,7 @@ impl LibraryCache {
     pub fn extract(&self, apk: &Apk, entry: &ZipEntry) -> ApkResult<CachedLibrary> {
         let file_name = native_library_file_name(entry)?;
 
-        match self.lookup(entry) {
+        match self.lookup(apk, entry) {
             Ok(Some(hit)) => {
                 tracing::debug!(
                     entry = entry.name(),
@@ -270,7 +314,7 @@ impl LibraryCache {
         }
 
         let started = Instant::now();
-        let probe = probe_key(entry);
+        let probe = probe_key(apk, entry);
         let tmp_dir = self.root.join(TMP_DIR);
         create_dir_all(&tmp_dir)?;
         // Unique among live processes: no two live processes share a pid, and no two calls in one
@@ -416,42 +460,76 @@ fn native_library_file_name(entry: &ZipEntry) -> ApkResult<&str> {
         })
 }
 
-/// The hint-index key: a hash of everything the central directory knows about the entry.
+/// The hint-index key: which archive, and which entry inside it.
 ///
 /// Hashed rather than concatenated so the key is a fixed-length, filesystem-safe name whatever the
-/// entry is called.
-fn probe_key(entry: &ZipEntry) -> String {
+/// archive and entry are called. Variable-length fields are length-prefixed, so no two different
+/// inputs can serialise to the same byte string.
+///
+/// Every input is already in memory — `Apk::open` stats the file and parses the central directory —
+/// so this costs no I/O. See the module documentation for why the archive's identity is in here.
+fn probe_key(apk: &Apk, entry: &ZipEntry) -> String {
     let mut hasher = Sha256::new();
     hasher.update(PROBE_DOMAIN);
+
+    // Which archive.
+    let path = apk.canonical_path().to_string_lossy();
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update(apk.file_len().to_le_bytes());
+    match apk
+        .modified()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        Some(since_epoch) => {
+            hasher.update([1u8]);
+            hasher.update(since_epoch.as_secs().to_le_bytes());
+            hasher.update(since_epoch.subsec_nanos().to_le_bytes());
+        }
+        // No mtime, or one before the epoch. Distinguished from every real timestamp by the tag
+        // byte, so "unknown" can never be confused with a particular time.
+        None => hasher.update([0u8]),
+    }
+
+    // Which entry inside it.
+    hasher.update((entry.name().len() as u64).to_le_bytes());
     hasher.update(entry.name().as_bytes());
-    hasher.update([0]);
+    hasher.update(entry.local_header_offset().to_le_bytes());
     hasher.update(entry.uncompressed_size().to_le_bytes());
     hasher.update(entry.compressed_size().to_le_bytes());
     hasher.update(entry.crc32().to_le_bytes());
     hasher.update(entry.method().code().to_le_bytes());
+
     let digest: [u8; 32] = hasher.finalize().into();
     Hex32(&digest).to_string()
 }
 
 /// Read a hint-index file, treating anything unparseable as an absent hint.
+///
+/// "Unparseable" includes *not being text at all*. The contents of this file are whatever is on
+/// disk, so they may be arbitrary bytes — truncated by a crash, replaced by something else, or
+/// simply junk — and none of that may make the cache permanently unusable. Only an I/O failure that
+/// is not "absent" is an error.
 fn read_index(path: &Path) -> ApkResult<Option<[u8; 32]>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ApkError::io("opening a cache index entry", path, error)),
     };
-    // 64 hex digits and a newline. Read a little more so a longer file is recognised as wrong
-    // rather than silently truncated to something that parses.
-    let mut text = String::new();
-    file.take(128)
-        .read_to_string(&mut text)
+    let mut bytes = Vec::new();
+    file.take(MAX_INDEX_BYTES)
+        .read_to_end(&mut bytes)
         .map_err(|e| ApkError::io("reading a cache index entry", path, e))?;
 
-    match parse_hex32(text.trim()) {
+    let hash = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| parse_hex32(text.trim()));
+    match hash {
         Some(sha256) => Ok(Some(sha256)),
         None => {
             tracing::warn!(
                 path = %path.display(),
+                bytes = bytes.len(),
                 "ignoring an unparseable extraction cache index entry"
             );
             Ok(None)
