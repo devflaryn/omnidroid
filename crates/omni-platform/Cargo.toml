@@ -1,0 +1,29 @@
+[package]
+name = "omni-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "OS primitives for Omnidroid. The only crate permitted to use cfg(target_os) or OS APIs."
+
+[dependencies]
+thiserror = { workspace = true }
+
+# Structural unix backends only need sysconf(_SC_PAGESIZE); see src/vm/unix.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
