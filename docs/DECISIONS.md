@@ -203,3 +203,110 @@ Other loader requirements measured from the same binary:
 
 Evidence: `research/apk-analysis.md`. The APS2 decoder used was validated byte-exact: it consumed
 2,100,778 of 2,100,778 bytes and produced exactly the 568,272 declared relocations.
+
+---
+
+## D10 — Memory model: free address space, lazily committed, decommit to reclaim
+**Decided from measurements**, not assumption. Every number below was produced by a probe program
+run on this machine; see `research/windows-memory-model.md`.
+
+The requirement was: isolated guest address spaces, no large fixed RAM reservation, demand-driven
+usage, reclaimable, and many instances without a huge pagefile. The measurements show exactly how
+to satisfy it, and also which plausible approaches silently fail.
+
+**What is free:** address space. A pure `MEM_RESERVE` costs **0 bytes** of commit charge and 0
+working set — verified at 1, 4, 16, 64 and 256 GB, and at 97.7 TB in a single call (largest single
+successful reserve: 125.57 TB). 64 processes each reserving 16 GB — 1 TB of guest address space in
+total — cost **240.8 MB** of system commit between them. So reserving a generous per-instance guest
+address space is not the thing to economize on.
+
+**What is scarce:** commit charge. `MEM_COMMIT` debits the system commit limit **immediately on
+commit, not on first touch** — 1024 MB committed showed up as 1026.66 MB of commit charge while the
+working set was only 4.68 MB. This is the key asymmetry: a design that commits a multi-GB region
+per instance fails the requirement even though its working set looks small. Commit must therefore
+be lazy and granular.
+
+**Reclamation — only one primitive actually works.** Measured effect on commit charge:
+
+| Primitive | Frees commit? | Frees working set? | Address stays reserved? | Data |
+|---|---|---|---|---|
+| `VirtualFree(MEM_DECOMMIT)` | **yes, 256.50 MB returned** | yes | yes | zero-filled on re-commit |
+| `MEM_RESET` | **no, 0.00 MB** | no | yes | may be discarded |
+| `MEM_RESET_UNDO` | no | no | yes | restores |
+| `DiscardVirtualMemory` | **no, 0.00 MB** | yes | yes | discarded |
+| `OfferVirtualMemory` | **no, 0.00 MB** | yes | yes | recoverable |
+| `EmptyWorkingSet` | **no, 0.00 MB** | yes | yes | preserved |
+
+`MEM_DECOMMIT` is the only primitive that returns the scarce resource, and it gives Linux
+`munmap`/`MADV_DONTNEED` semantics. `MEM_RESET` is an outright trap: it is the cheapest call
+(32.5 ns/page) and frees nothing. `EmptyWorkingSet` is a useful *secondary* lever for backgrounded
+instances — it preserves data and costs 913 ns/page to fault back in — but it must never be
+mistaken for reclamation.
+
+**End-to-end validation of the requirement:** an instance holding a **4 GB guest address space
+costs 37.25 MB of commit charge**. Grown to 3 GB of live use and then released, it fell back to
+513.656 MB of commit and 0.148 MB of working set *with the 4 GB reservation still intact*. The
+"several GB at startup, ~500 MB later" scenario in the project goal is therefore directly
+achievable, and ~32,700 separate 4 GB guest spaces fit in one 128 TB address space.
+
+**Do not use per-page fault-driven paging.** A VEH-based demand-pager was measured 100% reliable
+(0 bad resumes across 65,536 faults) but costs **2053 ns/fault**, versus 398 ns for a kernel soft
+fault and **3 ns/page** for bulk commit. Commit in 64 KB to 1 MB blocks ahead of use; reserve VEH
+for correctness edge cases, never as the hot path.
+
+**Large pages are unavailable** (`SeLockMemoryPrivilege` not held, `err 1314`), so 2 MB pages are
+not part of the design.
+
+---
+
+## D11 — Guest libraries are mapped from a 4 KB-aligned extraction cache, not from the APK
+**Decided from measurements.** `VirtualAlloc2`, `MapViewOfFile3` and `UnmapViewOfFile2` exist and
+give genuine `mmap(MAP_FIXED)` semantics — but they live **only in `kernelbase.dll`**, not
+`kernel32.dll`, so they must be resolved with `GetProcAddress`.
+
+The decisive measurement: when replacing a placeholder, **both the base address and the file offset
+are constrained to 4 KB, not 64 KB**. Proven by 512/512 successful maps at 4 KB file-offset steps
+with content verification, against only 4/64 successes on the `BaseAddress=NULL` path
+(`err 1132`). Sub-page offsets always fail. This 4 KB capability is placeholder-only — it is not
+reachable through plain `MapViewOfFile`.
+
+So the sequence is: reserve with `MEM_RESERVE | MEM_RESERVE_PLACEHOLDER`, split at 4 KB with
+`MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER`, then `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` for
+file-backed segments and `VirtualAlloc2(MEM_REPLACE_PLACEHOLDER)` for private commit. Replacement
+requires an **exact-size** placeholder or it fails with `err 487`. Cost is about 1 microsecond per
+operation; 24 real ELF segments mapped in 167 microseconds for 0.566 MB of commit.
+
+**Why an extraction cache rather than the APK directly:** zero-copy mapping straight out of an APK
+is possible, but only for **STORED** entries whose payload begins at a 4 KB-aligned offset — i.e.
+what `zipalign 4` / `zipalign -P 16` produces. Our APK's 11 `.so` are **DEFLATED and only 4-byte
+aligned**, so none of them qualify. The measured fallback of copying into private memory costs
+about 1 ms and about 4 MB of **permanent** commit per 4 MB, per launch — unacceptable for a 109 MB
+library across multiple instances.
+
+Therefore: **decompress each `.so` once into a shared, content-addressed, 4 KB-aligned cache file,
+and map that.** This turns a per-launch cost into a one-time cost, and has a large second benefit
+for the multi-instance requirement: file-backed read-only and execute mappings of the shared cache
+are backed by the file rather than by commit charge, so the roughly 109 MB of `libroblox.so` text
+and rodata is shared between instances at near-zero marginal commit. Only genuinely private pages —
+the 5.2 MB RELRO region after relocation, `.data`, `.bss`, and heap — cost per-instance commit.
+
+Two mechanical requirements found the hard way: the APK or cache file must be opened
+`GENERIC_READ | GENERIC_EXECUTE` and the section created `PAGE_EXECUTE_READ`, or `.text` can never
+be made executable afterwards; and a misaligned offset fails with `ERROR_MAPPED_ALIGNMENT`.
+
+---
+
+## D12 — JIT code memory: dual-mapped section, not `VirtualProtect` flipping
+**Decided from measurements.** Emitting and then executing code via a dual-mapped pagefile-backed
+section (one RW view, one RX view of the same pages) costs **162 ns** per emit+execute cycle with
+**0 mismatches across 200,000 trials** and needs no instruction-cache flush on x86-64. The
+conventional `VirtualProtect` RW to RX and back cycle costs **2259 ns** — about 14 times worse.
+
+Why it matters: the translator writes code constantly, so this is a hot path, and the dual mapping
+also avoids ever holding a page that is simultaneously writable and executable. It is both the
+faster and the safer option, which is a rare combination.
+
+Cost if wrong: the approach is Windows-specific in its mechanics. The same pattern is available on
+Linux (`memfd_create` plus two `mmap`s) and macOS (`MAP_JIT` with
+`pthread_jit_write_protect_np`, which behaves differently and will need its own measurement), so
+this sits behind the platform abstraction rather than in shared code.
