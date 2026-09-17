@@ -62,8 +62,25 @@ not a stock Roblox build** (D6). A stock Play-signed APK is needed before the AP
 
 ## Runtime implementation
 
-Nothing is implemented yet. Research and architecture are complete enough to begin; the boot
-milestone ladder in `ARCHITECTURE.md` section 9 is the progress measure.
+The boot milestone ladder in `ARCHITECTURE.md` section 9 is the progress measure. Infrastructure
+below a milestone is tracked separately, since a milestone only counts when it passes against the
+real APK.
+
+**Infrastructure**
+
+| Component | Status |
+|---|---|
+| Cargo workspace, nine crates | **Done** |
+| `omni-platform` virtual-memory seam (Windows) | **Done, reviewed.** 37 tests. Reserve / placeholder split at 4 KB / commit / decommit / protect / file-backed map / commit-charge measurement. Verified: 4 GiB reserve costs 0.000 MiB; 64 MiB commit costs +64.125 MiB and decommit returns it; a 4 MiB shared read-only view costs +0.008 MiB and stays there after reading every byte |
+| `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
+| `omni-platform` dual-mapped JIT arena | Not started (D12). Protection-resolution hazard already handled so it cannot silently privatise writes |
+| `omni-apk` | In progress |
+| `omni-elf` parser + APS2 decoder | In progress |
+| `omni-mem`, `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
+
+**Known gap:** Windows `unmap` is whole-view-only, so a guest partial `munmap` cannot be serviced by
+the platform layer directly. The seam refuses it with a typed error carrying the view extent rather
+than over-unmapping, and emulation (unmap the view, re-map the survivors) is owed by `omni-mem`.
 
 | Milestone | Status |
 |---|---|
