@@ -106,14 +106,17 @@ Requirements are taken from the actual binary rather than from the ELF spec in g
 
 1. **APS2 packed relocations are mandatory.** `libroblox.so` carries `DT_ANDROID_RELA` and has
    **no `DT_RELA` and no `DT_RELR`**. Its APS2 blob is 2,100,778 bytes holding **568,272**
-   relocations (568,194 `R_AARCH64_RELATIVE`, 56 `GLOB_DAT`, 22 `ABS32`), SLEB128-delta-encoded in a
+   relocations (568,194 `R_AARCH64_RELATIVE`, 56 `GLOB_DAT`, 22 **`ABS64`**), SLEB128-delta-encoded in a
    group-based format. A further **534** `JUMP_SLOT` relocations arrive **separately** via
    `DT_JMPREL`, for a grand total of 568,806. A loader without APS2 applies *zero* relocations. This
    is the highest-risk piece of the loader and gets the most testing.
 2. **Segment mapping** via placeholder split plus `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` at 4 KB
-   granularity, honouring `p_align` (4 KB here; 16 KB for newer NDKs, also supported).
-3. **Symbol resolution** against Omnidroid's own provided libraries (section 5), using the ELF or
-   GNU hash tables in the guest object.
+   granularity, honouring `p_align`, which for `libroblox.so` is **0x4000 (16 KiB)** on every
+   `PT_LOAD` — not the 4 KiB an earlier draft assumed. Windows splits placeholders at 4 KiB, so 16 KiB
+   is satisfiable, but the segment arithmetic must use the real `p_align`.
+3. **Symbol resolution** against Omnidroid's own provided libraries (section 5). `libroblox.so` has
+   **only `DT_GNU_HASH`** — there is no `DT_HASH` fallback — though other libraries in the APK carry
+   both, and where both exist they were verified to agree exactly.
 4. **RELRO**: make the 5,205,568-byte `PT_GNU_RELRO` region read-only after relocation.
 5. **`init_array`**: run all 3,594 entries in order. All must succeed.
 6. **`dl_iterate_phdr` must be faithful.** The C++ runtime is statically linked, so the unwinder

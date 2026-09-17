@@ -184,7 +184,7 @@ earlier draft of this file folded the `JUMP_SLOT`s into the packed count:
 
 | Source | Count | Types |
 |---|---|---|
-| `DT_ANDROID_RELA` blob (2,100,778 B, magic `APS2`) | **568,272** | 568,194 `R_AARCH64_RELATIVE` + 56 `R_AARCH64_GLOB_DAT` + 22 `R_AARCH64_ABS32` (78 with non-zero `r_sym`) |
+| `DT_ANDROID_RELA` blob (2,100,778 B, magic `APS2`) | **568,272** | 568,194 `R_AARCH64_RELATIVE` (1027) + 56 `R_AARCH64_GLOB_DAT` (1025) + 22 `R_AARCH64_ABS64` (**257**) — 78 with non-zero `r_sym` |
 | `.rela.plt` via `DT_JMPREL` — **separate** | **534** | `R_AARCH64_JUMP_SLOT` |
 | Grand total | **568,806** | |
 
@@ -210,8 +210,8 @@ Other loader requirements measured from the same binary:
   APK. They must be decompressed, which makes `extractNativeLibs` effectively true and rules out
   zero-copy segment mapping for this APK.
 - Two `DT_NEEDED` libraries (`libOpenSLES.so`, `libOpenMAXAL.so`) import **zero** symbols but must
-  still exist as loadable objects, and 10 `AMEDIAFORMAT_KEY_*` imports are **data** objects rather
-  than functions — both are failure modes with no symbol name to guide diagnosis.
+  still exist as loadable objects, and **23** imports are `STT_OBJECT` **data** symbols rather than
+  functions (the 10 `AMEDIAFORMAT_KEY_*` are only a subset of those 23) — both are failure modes with no symbol name to guide diagnosis.
 
 Evidence: `research/apk-analysis.md`. The APS2 decoder used was validated byte-exact: it consumed
 2,100,778 of 2,100,778 bytes and produced exactly the 568,272 declared relocations.

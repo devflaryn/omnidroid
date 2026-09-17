@@ -20,8 +20,14 @@ These bind every task. A reviewer should treat a violation as a defect.
    - The `DT_ANDROID_RELA` blob is **2,100,778 bytes**, magic `APS2`, and a correct decoder consumes
      **all** of it.
    - That blob declares and yields **568,272** relocations: **568,194** `R_AARCH64_RELATIVE` (1027)
-     + **56** `R_AARCH64_GLOB_DAT` (1025) + **22** `R_AARCH64_ABS32` (258). Exactly **78** carry a
-     non-zero `r_sym`.
+     + **56** `R_AARCH64_GLOB_DAT` (1025) + **22** `R_AARCH64_ABS64` (**257**). Exactly **78** carry a
+     non-zero `r_sym`. The type is `ABS64`, **not** `ABS32` (258) — an earlier draft had the wrong
+     name, which would have written 4 bytes where 8 are required.
+   - The dynamic tags are **`DT_ANDROID_RELA` = 0x60000011** and **`DT_ANDROID_RELASZ` = 0x60000012**.
+     `0x6000000F`/`0x60000010` are `DT_ANDROID_REL`/`RELSZ`, a *different* pair this binary does not
+     use; looking for those finds zero packed relocations.
+   - Every `PT_LOAD` has **`p_align = 0x4000` (16 KiB)**, not 4 KiB.
+   - `libroblox.so` has **only `DT_GNU_HASH`** — there is no `DT_HASH` to fall back on.
    - **Separately**, `.rela.plt` via `DT_JMPREL` holds **534** `R_AARCH64_JUMP_SLOT` (1026). These
      are **not** part of the APS2 blob. Grand total across both: **568,806**.
    - **3,594** `init_array` entries; `PT_GNU_RELRO` covers **5,205,568** bytes; the file is
@@ -262,8 +268,9 @@ Parsing and decoding only — no mapping, no relocation application. That is Tas
 - The dynamic section: `DT_NEEDED`, `DT_SONAME`, `DT_INIT`, `DT_FINI`, `DT_INIT_ARRAY(SZ)`,
   `DT_FINI_ARRAY(SZ)`, `DT_SYMTAB`, `DT_STRTAB`, `DT_HASH`, `DT_GNU_HASH`, `DT_PLTGOT`,
   `DT_JMPREL`, `DT_PLTRELSZ`, `DT_RELA(SZ/ENT)`, `DT_REL(SZ/ENT)`, `DT_RELR(SZ/ENT)`, and the
-  Android tags **`DT_ANDROID_RELA` (0x6000000F)** and **`DT_ANDROID_RELASZ` (0x60000010)**
-  (also accept the `DT_ANDROID_REL` pair 0x6000000D/0x6000000E for completeness).
+  Android tags **`DT_ANDROID_RELA` (0x60000011)** and **`DT_ANDROID_RELASZ` (0x60000012)**. Also
+  accept the `DT_ANDROID_REL`/`RELSZ` pair (`0x6000000F`/`0x60000010`) for completeness, but note this
+  binary uses the **RELA** pair; searching for the REL pair finds zero packed relocations.
 - Dynamic symbol table and string table access; symbol lookup via both `DT_HASH` and `DT_GNU_HASH`.
 - Enumerate undefined symbols (imports) and exported symbols, distinguishing `STT_FUNC` from
   `STT_OBJECT` — 10 of Roblox's imports are **data** objects, not functions, and conflating them
@@ -291,8 +298,9 @@ These are golden-data tests against a 109 MB real binary, far stronger than synt
 - Header: `ET_DYN`, `EM_AARCH64`, `ELFCLASS64`.
 - `DT_ANDROID_RELA` is **present**, and `DT_RELA` and `DT_RELR` are **absent**. Assert all three.
 - The APS2 decoder yields exactly **568,272** relocations: exactly **568,194**
-  `R_AARCH64_RELATIVE` (1027), **56** `R_AARCH64_GLOB_DAT` (1025), and **22** `R_AARCH64_ABS32`
-  (258), with exactly **78** carrying a non-zero `r_sym`. Assert all five numbers.
+  `R_AARCH64_RELATIVE` (1027), **56** `R_AARCH64_GLOB_DAT` (1025), and **22** `R_AARCH64_ABS64`
+  (**257**, not `ABS32`/258), with exactly **78** carrying a non-zero `r_sym`. Assert all five, and
+  assert **zero** relocations of type 258 so the off-by-one cannot creep back.
 - The **534** `R_AARCH64_JUMP_SLOT` (1026) relocations come from `.rela.plt` via `DT_JMPREL` and are
   **not** in the APS2 blob. Assert that separately, and assert the grand total is **568,806**. An
   earlier draft of this plan wrongly folded the 534 into the APS2 count; do not reproduce that.
@@ -330,8 +338,13 @@ if one is genuinely unfit, say so in the report instead of working around it sil
   honouring `p_align` (4 KB here, 16 KB for newer NDKs).
 - Zero the `p_memsz > p_filesz` tail (`.bss`) without disturbing file-backed pages.
 - Apply relocations: `R_AARCH64_RELATIVE` (1027) as `*target = base + addend`, and
-  `R_AARCH64_GLOB_DAT` (1025), `R_AARCH64_JUMP_SLOT` (1026) and `R_AARCH64_ABS32` (258) as symbol
+  `R_AARCH64_GLOB_DAT` (1025), `R_AARCH64_JUMP_SLOT` (1026) and **`R_AARCH64_ABS64` (257)** as symbol
   resolution. The 534 `JUMP_SLOT`s come from `DT_JMPREL`, separately from the APS2 blob.
+  **`ABS64` is a 64-bit store.** An earlier draft of this plan said `ABS32` (258); writing 4 bytes
+  where 8 are required would corrupt 22 pointers in ways that surface arbitrarily far away.
+- **Honour `p_align = 0x4000` (16 KiB).** Every `PT_LOAD` in `libroblox.so` is 16 KiB-aligned, not
+  4 KiB. Windows placeholder splitting works at 4 KiB so 16 KiB is satisfiable, but the segment base
+  arithmetic must use the real `p_align`.
   Relocation targets land in pages that must be **private and writable** at that moment — this is
   where the file-backed mapping needs copy-on-write or a private overlay, so be deliberate about it
   and explain the choice in the report.
