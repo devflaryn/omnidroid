@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+authors = ["berat <beratbadem00.mc@gmail.com>"]
+repository = "https://github.com/berat/omnidroid"
+publish = false
+
+[workspace.dependencies]
+# Internal crates. Dependency direction is strictly downward (ARCHITECTURE.md section 2).
+omni-platform = { path = "crates/omni-platform" }
+omni-mem = { path = "crates/omni-mem" }
+omni-apk = { path = "crates/omni-apk" }
+omni-elf = { path = "crates/omni-elf" }
+omni-cpu = { path = "crates/omni-cpu" }
+omni-android = { path = "crates/omni-android" }
+omni-gfx = { path = "crates/omni-gfx" }
+omni-core = { path = "crates/omni-core" }
+
+# Shared third-party versions. Pinned here so every crate agrees.
+thiserror = "2.0.20"
+bitflags = "2.13.2"
+parking_lot = "0.12.5"
+tracing = "0.1.44"
+rustc-hash = "2.1.3"
+
+# OS bindings. Per Global Constraint 4 this may only ever appear in omni-platform's
+# own [dependencies]; listing the version here does not grant any other crate access.
+windows-sys = "0.61.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
