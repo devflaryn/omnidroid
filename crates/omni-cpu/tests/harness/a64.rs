@@ -141,7 +141,8 @@ mod tests {
         assert_eq!(movz(0, 0x1234, 0), 0xD282_4680);
         assert_eq!(add_imm(1, 1, 1), 0x9100_0421);
         assert_eq!(subs_imm(2, 2, 1), 0xF100_0442);
-        assert_eq!(b(-1), 0x17FF_FFFF, "B . is a branch to itself");
+        assert_eq!(b(0), 0x1400_0000, "B . -- offset 0 is a branch to the branch itself");
+        assert_eq!(b(-1), 0x17FF_FFFF, "B #-4, one instruction back");
         assert_eq!(b_cond(1, -2), 0x54FF_FFC1, "B.NE -8");
         assert_eq!(br(30), 0xD61F_03C0);
         assert_eq!(ret(30), 0xD65F_03C0);

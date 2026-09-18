@@ -20,8 +20,9 @@
 //!
 //! `dynarmic-sys` states them; this is where they are paid for.
 //!
-//! 1. **Re-entrancy.** [`CpuCtx`] is a separate heap allocation from [`DynarmicCpu`], reached only
-//!    through a raw pointer, so no `&mut CpuCtx` exists at an `od_jit_run` call site. Every callback
+//! 1. **Re-entrancy.** The callback context is a separate heap allocation from [`DynarmicCpu`],
+//!    reached only
+//!    through a raw pointer, so no `&mut` to it exists at an `od_jit_run` call site. Every callback
 //!    forms its `&mut` for the body of that callback and never stores it.
 //! 2. **Unwinding.** Every callback body runs inside [`catch_unwind`]. A panic is recorded, the jit
 //!    is halted, and the panic is re-raised by `run` *after* the generated frames are gone.

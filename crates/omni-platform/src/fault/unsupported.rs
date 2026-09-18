@@ -1,8 +1,9 @@
 //! Linux and macOS backend for the guest-fault seam.
 //!
 //! **Structural only: unverified and not implemented.** Every entry point returns
-//! [`FaultError::Unsupported`], so a build for those targets fails honestly at the first call
-//! rather than appearing to work. This mirrors [`vm::unix`](crate::vm) exactly, and for the same
+//! [`FaultError::Unsupported`](super::FaultError::Unsupported), so a build for those targets
+//! fails honestly at the first call
+//! rather than appearing to work. This mirrors [`crate::vm`]'s unix backend exactly, and for the same
 //! reason: a seam whose unimplemented half returns `Ok` is worse than no seam.
 //!
 //! What has to be decided by measurement before this is written:

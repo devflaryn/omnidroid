@@ -230,7 +230,9 @@ mod tests {
     /// what the message says is the only thing that will make anyone act on it.
     #[test]
     fn every_setting_that_breaks_d4_is_refused_by_name() {
-        let cases: [(&str, fn(&mut MemoryMapping), &str); 6] = [
+        /// A named way of breaking the configuration, and the word its refusal must carry.
+        type Case = (&'static str, fn(&mut MemoryMapping), &'static str);
+        let cases: [Case; 6] = [
             ("fastmem off", |m| m.direct_access = false, "13.2x"),
             ("relocated base", |m| m.host_base = 0x1_0000, "guest VA is not host VA"),
             ("dynarmic's default width", |m| m.address_bits = 36, "default here is 36"),

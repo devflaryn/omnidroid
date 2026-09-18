@@ -214,6 +214,9 @@ macro_rules! exclusive_cb {
                     let Some(ptr) = c.data_ptr(vaddr, $n, Protection::ReadWrite) else {
                         return 0;
                     };
+                    #[allow(clippy::modulo_one)] // `$n` is 1 for the byte-wide instantiation,
+                    // where the check is vacuously true; writing it out uniformly is what keeps the
+                    // 16-, 32- and 64-bit cases from being the exception rather than the rule.
                     if ptr as usize % $n != 0 {
                         // An unaligned exclusive is `UNPREDICTABLE` in the architecture and cannot
                         // be done atomically on the host either. Fail the store, which is a legal

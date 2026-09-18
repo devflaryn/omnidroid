@@ -89,7 +89,7 @@ impl Guest {
             .regions()
             .into_iter()
             .find(|r| r.is_free() && r.len >= space.page_size())
-            .map(|r| r.start + r.len / 2 & !7)
+            .map(|r| (r.start + r.len / 2) & !7)
             .expect("some free address space");
 
         let backend = DynarmicBackend::new(Arc::clone(&space), options).expect("a backend");

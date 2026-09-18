@@ -38,7 +38,7 @@
 //! # Scope
 //!
 //! Implemented and measured on Windows. On Linux and macOS every entry point returns
-//! [`VmError::Unsupported`](vm::VmError::Unsupported), exactly as [`vm`](crate::vm) does, so a build
+//! [`FaultError::Unsupported`], exactly as [`vm`](crate::vm) does, so a build
 //! for those targets fails at the first call rather than appearing to work. The POSIX shape is a
 //! `SIGSEGV` handler with `SA_SIGINFO` reading `si_addr`, which is a different enough mechanism —
 //! signal-safety rules, no equivalent of "continue execution" beyond returning from the handler,
@@ -209,7 +209,7 @@ pub fn stats() -> FaultStats {
 }
 
 /// Whether this target has a real implementation. `false` means every call returns
-/// [`VmError::Unsupported`].
+/// [`FaultError::Unsupported`].
 #[must_use]
 pub fn available() -> bool {
     backend::AVAILABLE

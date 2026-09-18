@@ -224,6 +224,7 @@ mod tests {
         assert_eq!(AV_PARAMETERS, 2);
         assert_eq!((AV_READ, AV_WRITE, AV_EXECUTE), (0, 1, 8));
         // `CLAIMING` must not be mistakable for a real function pointer.
-        assert!(CLAIMING < 4096, "a claimed-but-unpublished slot must be an impossible code address");
+        // A claimed-but-unpublished slot must never be mistakable for a function pointer.
+        const _: () = assert!(CLAIMING < 4096);
     }
 }
