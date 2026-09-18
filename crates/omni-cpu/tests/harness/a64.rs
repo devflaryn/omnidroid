@@ -97,7 +97,7 @@ pub const fn str_reg(rt: u32, rn: u32, rm: u32) -> u32 {
 
 /// `LDAR Xt, [Xn]` — load-acquire. `11 001000 1 1 0 11111 1 11111 Rn Rt`.
 ///
-/// The dominant atomic-ish class in `libroblox.so`: 15,516 sites, against 130 exclusives and 51
+/// The dominant atomic-ish class in `libroblox.so`: 15,516 sites, against 128 exclusives and 53
 /// LSE (`tools/atomic_mix.py`). It is an ordinary load with ordering, not a read-modify-write, and
 /// it touches no exclusive monitor — which is exactly why the first version of the Task 4 report
 /// miscounted it as `LDAXR`.

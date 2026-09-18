@@ -16,9 +16,12 @@ decision should go is a property of `libroblox.so`, and this measures it.
 
 It also exists because the first version of this count, in the Task 4 report, was **wrong**. It
 classified ``LDAR``/``STLR`` -- acquire/release *ordered* accesses, which touch no monitor -- as
-``LDAXR``/``STLXR``, and reported 15,646 exclusive sites where there are 130. The three encodings
-differ only in bits 23 and 21 of the same top-level class, which is exactly the kind of thing that
-should be pinned by a self-checking script rather than by a one-off command.
+``LDAXR``/``STLXR``, and reported 15,646 exclusive sites where there are 128. A review then found a
+second one: ``CASP`` shares ``o2 = 0, o1 = 1`` with ``LDXP``/``STXP`` and is discriminated by bit 31
+alone, so two more sites were on the exclusive side of the ratio instead of the LSE side. Both
+errors ran the same way -- away from LSE, the direction that makes D5's risk 4 look smaller -- and
+the encodings differ only in single bits of one top-level class, which is exactly the kind of thing
+that should be pinned by a self-checking script rather than by a one-off command.
 
 What it counts
 --------------
@@ -28,10 +31,15 @@ Bits 29:24 == ``001000`` is the *Load/store exclusive* top-level class, and insi
 ``o2`` (23)  ``o1`` (21)  Instructions
 ===========  ===========  =========================================================
 0            0            ``LDXR``/``STXR``/``LDAXR``/``STLXR`` -- **exclusive monitor**
-0            1            ``LDXP``/``STXP``/``LDAXP``/``STLXP`` -- **exclusive monitor**
+0            1            ``LDXP``/``STXP`` if bit 31 is set, else ``CASP`` -- see below
 1            0            ``LDAR``/``STLR``/``LDLAR``/``STLLR`` -- ordered, **no monitor**
-1            1            ``CAS``/``CASP`` -- **LSE**
+1            1            ``CAS`` -- **LSE**
 ===========  ===========  =========================================================
+
+The ``o2 = 0, o1 = 1`` row is not one instruction family but two, told apart by **bit 31 alone**:
+set means ``LDXP``/``STXP`` (exclusive monitor), clear means ``CASP`` (LSE). Missing that put two
+LSE sites on the wrong side of the ratio this tool exists to report, which is why it is spelled out
+rather than left to the table.
 
 Separately, bits 29:24 == ``111000`` with bit 21 set and bits 11:10 == ``00`` is *Atomic memory
 operations*: ``LDADD``/``LDCLR``/``LDEOR``/``LDSET``/``LDSMAX``/``LDSMIN``/``LDUMAX``/``LDUMIN`` and
@@ -85,15 +93,27 @@ ATOMIC_MEMORY_OP = (0x3F20_0C00, 0x3820_0000)
 
 
 def exclusive_class(word: int) -> str | None:
-    """Which row of the ``o2``/``o1`` table above `word` is, or ``None``."""
+    """Which row of the ``o2``/``o1`` table above `word` is, or ``None``.
+
+    One extra discrimination the table does not show, and it caught this tool out once:
+    ``CASP``/``CASPA``/``CASPL``/``CASPAL`` share ``o2 = 0, o1 = 1`` with ``LDXP``/``STXP`` and are
+    told apart by **bit 31 alone** — the exclusive-pair forms have it set (``1 0`` in bits 31:30),
+    while ``CASP`` uses bit 31 as a fixed 0 and bit 30 as its size. ``libroblox.so`` has two of them,
+    ``0x48607c82`` (``CASPA``) at ``0x4d905d0`` and ``0x4820fc82`` (``CASPL``) at ``0x52db1d0``, and
+    counting them as exclusives put two LSE sites on the wrong side of the one ratio this tool
+    exists to report.
+    """
     mask, value = LOAD_STORE_EXCLUSIVE
     if word & mask != value:
         return None
     o2 = (word >> 23) & 1
     o1 = (word >> 21) & 1
-    if o2 == 0:
-        return "exclusive_pair" if o1 else "exclusive_single"
-    return "cas" if o1 else "ordered"
+    if o2 == 1:
+        return "cas" if o1 else "ordered"
+    if o1 == 0:
+        return "exclusive_single"
+    # `o2 = 0, o1 = 1`: an exclusive pair only if bit 31 is set; otherwise CASP, which is LSE.
+    return "exclusive_pair" if (word >> 31) & 1 else "casp"
 
 
 def atomic_memory_class(word: int) -> str | None:
@@ -115,12 +135,13 @@ def is_mrs_tpidr_el0(word: int) -> bool:
     return (word & 0xFFFF_FFE0) == 0xD53B_D040
 
 
-CLASSES = ("exclusive_single", "exclusive_pair", "ordered", "cas", "lse_rmw", "ldapr")
+CLASSES = ("exclusive_single", "exclusive_pair", "ordered", "cas", "casp", "lse_rmw", "ldapr")
 
 LABELS = {
     "exclusive_single": "LDXR / STXR / LDAXR / STLXR   (exclusive monitor)",
     "exclusive_pair": "LDXP / STXP / LDAXP / STLXP   (exclusive monitor)",
-    "cas": "CAS / CASP                    (LSE)",
+    "cas": "CAS                           (LSE)",
+    "casp": "CASP / CASPA / CASPL / CASPAL (LSE)",
     "lse_rmw": "LDADD / SWP / LDCLR / ...     (LSE)",
     "ordered": "LDAR / STLR / LDLAR / STLLR   (ordered, no monitor)",
     "ldapr": "LDAPR                         (ordered load, not an RMW)",
@@ -233,7 +254,7 @@ def count(data: bytes, spans) -> dict[str, int]:
 
 def report(title: str, counts: dict[str, int]) -> tuple[int, int]:
     exclusive = counts["exclusive_single"] + counts["exclusive_pair"]
-    lse = counts["cas"] + counts["lse_rmw"]
+    lse = counts["cas"] + counts["casp"] + counts["lse_rmw"]
     print(f"{title}: {counts['words']:,} words ({counts['words'] * 4:,} bytes)")
     for key in CLASSES:
         print(f"    {LABELS[key]:<48} {counts[key]:>8,}")
@@ -255,18 +276,20 @@ def report(title: str, counts: dict[str, int]) -> tuple[int, int]:
 RECORDED_FUNCTIONS = {
     "words": 17_485_957,
     "exclusive_single": 108,
-    "exclusive_pair": 22,
+    "exclusive_pair": 20,
     "ordered": 15_516,
     "cas": 14,
+    "casp": 2,
     "lse_rmw": 37,
     "ldapr": 0,
 }
 RECORDED_SECTIONS = {
     "words": 18_156_033,
     "exclusive_single": 567,
-    "exclusive_pair": 22,
+    "exclusive_pair": 20,
     "ordered": 15_580,
     "cas": 14,
+    "casp": 2,
     "lse_rmw": 37,
     "ldapr": 0,
     "mrs_tpidr": 1_282,
@@ -371,7 +394,7 @@ def main() -> int:
         "a program spends its time in a small part of its text. D5's risk 3 is a contention cost "
         "per execution and risk 4 is a hard stop per execution, so both depend on the dynamic mix, "
         "which only a trace settles. What the static count does settle is that neither risk is "
-        "absent: 130 exclusive sites and 51 LSE sites are both non-zero, and the LSE ones cannot "
+        "absent: 128 exclusive sites and 53 LSE sites are both non-zero, and the LSE ones cannot "
         "be run at all on this pin."
     )
     return 0

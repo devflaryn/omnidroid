@@ -173,6 +173,16 @@ impl Roblox {
 
         let backend =
             DynarmicBackend::new(Arc::clone(&space), options).expect("a translating backend");
+        // **The same assertion `harness/mod.rs` makes, and it matters more here.** A backend with no
+        // demand pager silently *disarms the per-slice callback invariant* — `armed` is
+        // `assert_callback_free_slices && owns_guest_paging` — and that invariant is the M2 gate's
+        // only defence against a degradation no functional test can see. Every test in this binary
+        // is `serialized()`, so the window is narrow; leaving it disarmable on the gate that proves
+        // the milestone is the wrong place to economise.
+        assert!(
+            backend.owns_guest_paging(),
+            "the M2 guest has no demand pager, so the per-slice callback invariant is disarmed and              every guest fault goes to dynarmic's own handler and the 30-49x path. The gate would              pass and prove less than it claims"
+        );
         let base = object.base;
         Some(Self {
             space,

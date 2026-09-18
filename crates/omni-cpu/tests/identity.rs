@@ -371,8 +371,8 @@ fn a_real_memory_fault_increments_the_counter_and_is_not_a_violation() {
 /// **Which atomic classes stay on D4's fast path, and which leave it.**
 ///
 /// This exists because the Task 4 report asserted an answer it had not measured. Having corrected
-/// the static count — `libroblox.so` has **15,516** `LDAR`/`STLR` sites against **130** exclusives
-/// and **51** LSE (`tools/atomic_mix.py`) — the report went on to say that the ordered accesses
+/// the static count — `libroblox.so` has **15,516** `LDAR`/`STLR` sites against **128** exclusives
+/// and **53** LSE (`tools/atomic_mix.py`) — the report went on to say that the ordered accesses
 /// "stay on the fastmem path". That was a guess: not one of the 870 leaf functions M2 executes
 /// contains an `LDAR`, so nothing in the gate touched the question.
 ///
