@@ -100,6 +100,22 @@ impl Guest {
             .expect("some free address space");
 
         let backend = DynarmicBackend::new(Arc::clone(&space), options).expect("a backend");
+        // **Every guest in these suites owns guest paging, and that is asserted rather than
+        // assumed.** Before Task 4 the vectored-handler table held 8 slots and
+        // `DynarmicBackend::new` swallowed `HandlerTableFull`, so a binary with more than eight
+        // tests running in parallel could hand out a backend with no pager — which puts every guest
+        // fault on dynarmic's own handler and the 30-49x recompiled callback path. The tests would
+        // still pass; they would just have stopped testing the path they name. `hostile.rs` has 14
+        // such tests and was the suite that could reach it.
+        //
+        // The table is 32 now and the refusal is loud, so this is belt and braces. It stays because
+        // the failure it guards against is a *coverage* failure, and a coverage failure is invisible
+        // by construction.
+        assert!(
+            backend.owns_guest_paging(),
+            "this guest has no demand pager, so every fault it takes goes to dynarmic's own \
+             handler and permanently deoptimizes the block. The test would pass and prove nothing"
+        );
         Self { space, backend, code, data, readonly, lazy, unmapped }
     }
 
