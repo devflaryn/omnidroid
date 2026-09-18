@@ -708,6 +708,7 @@ fn every_library_in_the_apk_loads() {
     let mut total_relocations = 0usize;
     let mut total_imports = 0usize;
     let mut tail_copies = 0usize;
+    let mut worst_anonymous = 0usize;
     eprintln!("\n{:<40} {:>10} {:>8} {:>8} {:>7}", "library", "relocs", "imports", "init", "span");
     for name in common::libraries().expect("the APK is present").keys() {
         let path = common::cached_library(name).expect("in the cache");
@@ -733,6 +734,7 @@ fn every_library_in_the_apk_loads() {
         assert_eq!(object.stats.relocations.applied + object.stats.relocations.none, object.stats.relocations.total);
         total_relocations += object.stats.relocations.applied;
         total_imports += object.imports.total();
+        worst_anonymous = worst_anonymous.max(object.stats.anonymous_bytes);
         if object.stats.anonymous_bytes > 0 && object.span() < 0x10000 {
             tail_copies += 1;
         }
@@ -747,6 +749,22 @@ fn every_library_in_the_apk_loads() {
          accounted for, {tail_copies} needed a private final page"
     );
     assert!(total_relocations > 568_806, "the main library alone has 568,806");
+
+    // The margin under `LoaderConfig::max_anonymous_bytes`, asserted rather than assumed, for the
+    // same reason `Aps2Limits`' margin is: a chosen limit has to be visibly far from every real
+    // value, or the first thing anyone learns about it is a legitimate library being rejected. The
+    // worst of the eleven is `libroblox.so` at 11,575,296 bytes: its `.bss` plus partial final pages.
+    let margin = omni_elf::DEFAULT_MAX_ANONYMOUS_BYTES / worst_anonymous.max(1);
+    eprintln!(
+        "worst private anonymous memory across the 11 libraries: {worst_anonymous} bytes, \
+         {margin}x below the {} byte limit",
+        omni_elf::DEFAULT_MAX_ANONYMOUS_BYTES
+    );
+    assert!(
+        margin >= 16,
+        "the anonymous-memory limit is only {margin}x the largest real library's {worst_anonymous} \
+         bytes; either a library grew or the limit is too tight to be safe"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------

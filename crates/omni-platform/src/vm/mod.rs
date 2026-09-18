@@ -208,6 +208,26 @@ pub enum ReservationKind {
 /// currently is. Call [`release`] for ranges that are still plain reservations or unreplaced
 /// placeholders, [`unmap`]/[`unmap_and_release`] for file views, and
 /// [`decommit`]/[`decommit_to_placeholder`] for private commit.
+///
+/// # Addresses are integers here, and the provenance model that makes that sound
+///
+/// A reservation holds a `usize`, and [`as_ptr`](Self::as_ptr) and [`offset_ptr`](Self::offset_ptr)
+/// cast it back to a pointer. That is an integer-to-pointer round trip, and it is deliberate: the
+/// backends work in `usize` so that these descriptors are plain data and stay `Send + Sync`, and
+/// guest addresses *are* host addresses (ARCHITECTURE section 1), so an address is the value the
+/// whole design is built on.
+///
+/// Soundness rests on the **exposed-provenance** model rather than on strict provenance. The
+/// allocation is created by the OS — `VirtualAlloc2`, `MapViewOfFile3` — which is precisely the case
+/// that model exists for: the kernel exposes the provenance of the range it hands back, and an
+/// integer naming an address inside it reconstitutes that provenance on cast. Nothing here derives a
+/// pointer from an integer the process never received from the OS.
+///
+/// Spelling the casts as `std::ptr::with_exposed_provenance_mut` would say all of this to the
+/// compiler as well as to a reader, and is the right change if Omnidroid ever runs under Miri with
+/// strict provenance. It is not worth doing in `Reservation` alone: `omni-mem` and the arena cast
+/// addresses in the same way at every `unsafe` block, and converting one type of the several would
+/// suggest an assurance that does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[must_use = "a Reservation is not released on drop; hand it to release() or to omni-mem"]
 pub struct Reservation {

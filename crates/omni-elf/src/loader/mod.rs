@@ -122,10 +122,11 @@ pub struct LoaderConfig {
 
 /// The default ceiling on a plan's private anonymous memory: 256 MiB.
 ///
-/// Chosen, not derived, and the margin is asserted rather than asserted-to. `libroblox.so` needs
-/// 11,632,640 bytes of anonymous memory — 11.6 MB of `.bss` — which is the largest figure across all
-/// eleven libraries in the APK by two orders of magnitude, and `all_libraries.rs` pins the margin so
-/// that drift shows up long before a real object is rejected.
+/// Chosen, not derived, and the margin is asserted rather than assumed. `libroblox.so` needs
+/// **11,575,296 bytes** of private anonymous memory — its `.bss`, plus the partial final page of each
+/// segment — which is the largest figure across all eleven libraries in the APK by two orders of
+/// magnitude. That is a **23x** margin, and `loader_hostile.rs`'s `every_library_in_the_apk_loads`
+/// pins it, so drift shows up long before a real object is rejected.
 ///
 /// It bounds a quantity that comes straight from `p_memsz`, which is a file field: D6 records that
 /// this project's own test APK is adversarially modified, and an eight-byte edit to that field was

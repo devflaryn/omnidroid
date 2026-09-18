@@ -21,6 +21,17 @@ pub struct BackingId(pub u64);
 /// comes from the same extraction-cache entry — and because the guest address space must keep the
 /// backing alive for as long as any view of it exists.
 ///
+/// # There is one way to make one, deliberately
+///
+/// [`open`](Backing::open) and nothing else. A `from_mappable` constructor existed, justified by
+/// `omni-apk` opening extraction-cache entries itself and handing over the open handle — an
+/// arrangement that does not exist and never did: `omni-apk` produces *paths* to immutable
+/// content-addressed files and has no way to produce an
+/// [`MappableFile`](omni_platform::vm::MappableFile), which only `omni-platform` can mint. It had
+/// zero callers in the workspace. Dead public API justified by a fiction is worse than no API, and if
+/// something ever does need to adopt an already-open handle it is four lines to add back with a true
+/// reason attached.
+///
 /// # Executability is decided here, not at map time
 ///
 /// [`open`](Backing::open) takes a [`MapExecutability`], and passing
@@ -45,15 +56,6 @@ impl Backing {
         let file = vm::open_file_for_mapping(path, executability)
             .map_err(platform("Backing::open", 0, 0))?;
         Ok(Arc::new(Self::from_file(file, path.display().to_string())))
-    }
-
-    /// Wrap a file that has already been opened for mapping.
-    ///
-    /// `omni-apk` opens extraction-cache entries itself, and re-opening them here would mean a
-    /// second handle on the same immutable file for no reason.
-    #[must_use]
-    pub fn from_mappable(file: MappableFile, name: impl Into<String>) -> Arc<Self> {
-        Arc::new(Self::from_file(file, name.into()))
     }
 
     fn from_file(file: MappableFile, name: String) -> Self {

@@ -510,12 +510,7 @@ impl CodeArena {
             chunk: block.chunk,
             chunks: chunks.len(),
         })?;
-        let outside = block.write < chunk.write
-            || block
-                .write
-                .checked_add(block.len)
-                .is_none_or(|end| end > chunk.write + chunk.len);
-        if outside {
+        if !block_fits_chunk(block.write, block.len, chunk.write, chunk.len) {
             return Err(MemError::BlockOutsideChunk {
                 write: block.write,
                 len: block.len,
@@ -533,6 +528,21 @@ impl CodeArena {
         unsafe { vm::protect(start as *mut u8, end - start, protection) }
             .map_err(platform("CodeArena::seal", start, end - start))
     }
+}
+
+/// Whether a block's writable range lies wholly inside a chunk's writable view.
+///
+/// A free function so that it can be tested without an arena, and therefore without an OS: the
+/// property it guards is pure arithmetic, and the way it used to fail was pure arithmetic too.
+/// `reprotect` computed `end - start` behind a `debug_assert!`, so in a **release** build a `write`
+/// below `chunk.write` underflowed that subtraction into a huge page-aligned length which was then
+/// handed to `vm::protect`. Unreachable for a block the arena minted — `check_own` establishes that
+/// first — so this is the second line, and the only way to exercise it is to ask it directly.
+fn block_fits_chunk(write: usize, len: usize, chunk_write: usize, chunk_len: usize) -> bool {
+    write >= chunk_write
+        && write
+            .checked_add(len)
+            .is_some_and(|end| end <= chunk_write.saturating_add(chunk_len))
 }
 
 impl core::fmt::Debug for CodeArena {
@@ -564,5 +574,42 @@ impl Drop for CodeArena {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_fits_chunk;
+
+    /// The containment check that stands between a foreign `CodeBlock` and `vm::protect`.
+    ///
+    /// Pure arithmetic, tested as such, because the failure it guards is arithmetic: the previous
+    /// code subtracted a chunk base from a block address with only a `debug_assert!` in the way, so
+    /// in a release build an address *below* the chunk wrapped into a length of nearly the whole
+    /// address space. Every case here is one the identity check now makes unreachable through the
+    /// public API, which is exactly why the arithmetic has to be asked directly.
+    #[test]
+    fn a_block_only_fits_a_chunk_that_really_contains_it() {
+        let (chunk, len) = (0x1_0000usize, 0x1000usize);
+
+        // Inside, at both ends and exactly filling it.
+        assert!(block_fits_chunk(chunk, 16, chunk, len));
+        assert!(block_fits_chunk(chunk + len - 16, 16, chunk, len));
+        assert!(block_fits_chunk(chunk, len, chunk, len));
+
+        // Below the chunk: the underflow case. One byte below is enough.
+        assert!(!block_fits_chunk(chunk - 1, 16, chunk, len));
+        assert!(!block_fits_chunk(0, 16, chunk, len));
+        // Above it, and straddling its end.
+        assert!(!block_fits_chunk(chunk + len, 16, chunk, len));
+        assert!(!block_fits_chunk(chunk + len - 8, 16, chunk, len));
+        assert!(!block_fits_chunk(chunk, len + 1, chunk, len));
+
+        // A length that overflows when added to the address, which is what a `Copy` value carrying
+        // a garbage `len` looks like.
+        assert!(!block_fits_chunk(chunk, usize::MAX, chunk, len));
+        assert!(!block_fits_chunk(usize::MAX, 1, chunk, len));
+        // And a chunk extent that would itself overflow is not a licence to accept anything.
+        assert!(!block_fits_chunk(0, 1, usize::MAX - 1, 16));
     }
 }
