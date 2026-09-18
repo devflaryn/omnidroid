@@ -356,6 +356,17 @@ void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);
 
+/* Just `stats.slow_path_total`, as one load rather than a 72-byte struct copy.
+ *
+ * It exists because Omnidroid checks this counter's delta around **every** run
+ * slice, not only at the end of a benchmark: the startup assertion defends the
+ * configuration, and Task 3 found two ways the memory path degrades at
+ * *runtime*, after that assertion has passed, leaving the runtime 30-49x slower
+ * with correct results. The per-slice check is the class-level answer to that,
+ * and it is only affordable if reading the counter is a load. Non-atomic, and
+ * read on the jit's own thread, which is the only thread that writes it. */
+uint64_t od_jit_slow_path_total(void* jit);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

@@ -624,4 +624,17 @@ extern "C" {
     /// # Safety
     /// `jit` must be live.
     pub fn od_jit_reset_stats(jit: *mut c_void);
+
+    /// Just [`OdStats::slow_path_total`], as one load rather than a 72-byte struct copy.
+    ///
+    /// Omnidroid reads this around **every** run slice, not only at the end of a benchmark:
+    /// the startup assertion defends the *configuration*, and Task 3 found two ways the memory
+    /// path degrades at **runtime**, after that assertion has passed, leaving the runtime 30-49x
+    /// slower with correct results and no functional symptom at all. Checking the delta per slice
+    /// is the class-level answer, and it is only affordable if reading the counter is a load.
+    ///
+    /// # Safety
+    /// `jit` must be live, and this must be called from the thread that owns it — the counter is
+    /// non-atomic and that thread is the only writer.
+    pub fn od_jit_slow_path_total(jit: *mut c_void) -> u64;
 }

@@ -522,4 +522,8 @@ void od_jit_reset_stats(void* p) {
     as_jit(p)->callbacks.stats = od_stats{};
 }
 
+uint64_t od_jit_slow_path_total(void* p) {
+    return as_jit(p)->callbacks.stats.slow_path_total;
+}
+
 }  // extern "C"

@@ -103,6 +103,35 @@ pub enum CpuError {
         consequence: &'static str,
     },
 
+    /// The guest memory path was D4's at startup and **stopped being** D4's while running.
+    ///
+    /// [`MisconfiguredMemoryPath`](CpuError::MisconfiguredMemoryPath) defends the *configuration*,
+    /// once, before any guest code runs. Task 3 found two paths that degrade **afterwards**, so
+    /// that check passes and the runtime is quietly 30-49x slower with correct results: two guest
+    /// threads faulting on one commit granule made the second decline, handing the block to
+    /// dynarmic's own handler, which recompiled it with fastmem off **permanently**; and a panic
+    /// inside the fault handler declined a resolvable fault while incrementing no counter at all.
+    ///
+    /// Both are invisible to every functional test, and both are instances of one class: guest
+    /// memory that should have reached memory directly went through a host callback instead. So
+    /// the check is on the class, not on the two paths — **per run slice, the callback-path
+    /// counter's delta must be zero unless that slice ended in a memory-fault exit**. It cannot be
+    /// "the counter stays at zero", because a legitimate [`ExitReason::MemoryFault`] increments it
+    /// too, and a check that fires on the normal case gets disabled.
+    ///
+    /// [`ExitReason::MemoryFault`]: crate::ExitReason::MemoryFault
+    #[error(
+        "the guest memory path degraded while running: the slice ending at {pc:#x} took          {callbacks} callback-path entries and stopped for a reason that is not a memory fault          ({exit}). Under D4's identity mapping a guest access reaches memory with no callback at          all, so a non-zero delta here means blocks have been recompiled onto the callback path --          measured 30-49x slower (n = 31, two loop shapes), with correct results throughout"
+    )]
+    DegradedMemoryPath {
+        /// Where the slice stopped.
+        pc: GuestAddr,
+        /// How many callback-path entries the slice took.
+        callbacks: u64,
+        /// How the slice ended, so the exemption that did not apply is visible.
+        exit: &'static str,
+    },
+
     /// This backend cannot do what was asked, and says so rather than pretending.
     ///
     /// The shape that forced this variant: [`RunLimit::Instructions`](crate::RunLimit) is a

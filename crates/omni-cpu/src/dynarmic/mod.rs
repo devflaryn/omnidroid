@@ -47,7 +47,8 @@ use dynarmic_sys::{
     optimization, od_jit_clear_halt, od_jit_effective_config, od_jit_free, od_jit_get_pc,
     od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec, od_jit_halt,
     od_jit_invalidate_range, od_jit_new, od_jit_reset_stats, od_jit_run, od_jit_set_pc,
-    od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec, od_jit_stats, od_monitor_free,
+    od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec, od_jit_slow_path_total,
+    od_jit_stats, od_monitor_free,
     od_monitor_new, OdConfig, OdEffectiveConfig, OdStats, OD_DYNARMIC_ABI_VERSION,
     OD_HALT_CACHE_INVALIDATION, OD_HALT_MEMORY_ABORT, OD_HALT_SHIM_REENTERED, OD_HALT_SHIM_THREW,
     OD_HALT_USER1, OD_HALT_USER8,
@@ -131,6 +132,18 @@ pub struct DynarmicOptions {
     /// It is not free, though: `A64::Jit::Impl` skips `GetSetElimination` entirely when this is set.
     /// The measured cost of that is in the Task 3 report.
     pub check_halt_on_memory_access: bool,
+    /// Whether to check, **per run slice**, that guest memory never went through a host callback
+    /// unless the slice ended in a memory fault.
+    ///
+    /// **Default `true`.** See [`CpuError::DegradedMemoryPath`] for the defect class this exists
+    /// for and why it is stated per slice rather than as "the counter stays at zero". The cost is
+    /// one load per slice — [`od_jit_slow_path_total`] rather than a 72-byte struct copy — and a
+    /// slice is a million guest instructions by default, so it is not a hot path.
+    ///
+    /// It is **automatically disarmed** when this backend does not own guest paging, because the
+    /// callback path is then the designed route for a first touch rather than a degradation.
+    /// [`DynarmicBackend::slice_invariant_armed`] reports what is actually in force.
+    pub assert_callback_free_slices: bool,
 }
 
 impl Default for DynarmicOptions {
@@ -142,6 +155,7 @@ impl Default for DynarmicOptions {
             max_threads: 32,
             interruptible: true,
             check_halt_on_memory_access: true,
+            assert_callback_free_slices: true,
         }
     }
 }
@@ -353,6 +367,16 @@ impl DynarmicBackend {
     #[must_use]
     pub fn pager_stats(&self) -> Option<PagerStats> {
         self.shared._pager.as_ref().map(DemandPager::stats)
+    }
+
+    /// Whether the per-slice callback invariant is actually in force.
+    ///
+    /// Both halves must hold: the option must be on, *and* this backend must own guest paging. It
+    /// is reported rather than inferred because a check that has been disarmed by a platform
+    /// detail is not a check, and the difference has to be visible to the test that claims it.
+    #[must_use]
+    pub fn slice_invariant_armed(&self) -> bool {
+        self.shared.options.assert_callback_free_slices && self.shared.owns_guest_paging
     }
 
     /// Build a context with a **deliberately broken** memory path, handing back both the context and
@@ -574,6 +598,11 @@ pub struct DynarmicCpu {
     processor_id: u32,
     halt: HaltHandle,
     cost: ContextCost,
+    /// Slices whose callback-path delta broke the invariant. See [`Self::degraded_slices`].
+    degraded_slices: u64,
+    /// Whether the invariant is armed for this context. Copied from the backend at construction
+    /// so the hot path does not chase an `Arc` per slice.
+    slice_invariant_armed: bool,
 }
 
 // SAFETY: `GuestCpu` is `Send` and not `Sync`, which is exactly this type's contract: one context
@@ -696,6 +725,8 @@ impl DynarmicCpu {
             (*ctx.get()).jit = jit;
         }
 
+        let armed = options.assert_callback_free_slices && shared.owns_guest_paging;
+
         Ok(Self {
             jit,
             ctx,
@@ -709,6 +740,8 @@ impl DynarmicCpu {
             tls,
             processor_id,
             halt: HaltHandle::new(),
+            degraded_slices: 0,
+            slice_invariant_armed: armed,
         })
     }
 
@@ -750,6 +783,27 @@ impl DynarmicCpu {
     pub fn reset_stats(&self) {
         // SAFETY: as `effective_config`.
         unsafe { od_jit_reset_stats(self.jit) };
+    }
+
+    /// How many times generated code has entered a data-memory callback.
+    ///
+    /// One load, not a struct copy, because [`run`](GuestCpu::run) reads it twice per slice. Under
+    /// D4's identity mapping this stays at zero for guest code that only touches mapped memory:
+    /// see [`CpuError::DegradedMemoryPath`].
+    #[must_use]
+    pub fn slow_path_entries(&self) -> u64 {
+        // SAFETY: the jit is live, and `&self` cannot overlap a `run` — `run` takes `&mut self`.
+        // The counter is non-atomic and written only by callbacks, which run on this thread.
+        unsafe { od_jit_slow_path_total(self.jit) }
+    }
+
+    /// How many run slices were found to have degraded onto the callback path.
+    ///
+    /// Non-zero only when the invariant is disarmed, since an armed one turns the first violation
+    /// into [`CpuError::DegradedMemoryPath`] and there is no second.
+    #[must_use]
+    pub fn degraded_slices(&self) -> u64 {
+        self.degraded_slices
     }
 
     /// Arm a sentinel return address: when the guest branches to `address`, `run` returns
@@ -878,6 +932,11 @@ impl GuestCpu for DynarmicCpu {
                 ctx.ticks_used = 0;
             });
 
+            // The per-slice callback invariant (`CpuError::DegradedMemoryPath`). One load before
+            // and one after, on the jit's own thread, around a slice that is a million guest
+            // instructions by default.
+            let callbacks_before = self.slice_invariant_armed.then(|| self.slow_path_entries());
+
             // SAFETY: the jit is live; `&mut self` means no `&mut CpuCtx` is outstanding at this
             // call site; every callback contains its own panics. This executes attacker-controlled
             // guest code, which is the point: the memory it can reach is the guest space plus
@@ -888,6 +947,34 @@ impl GuestCpu for DynarmicCpu {
             let used = self.with_ctx(|ctx| ctx.ticks_used);
             budget.charge(used);
             self.take_panic()?;
+
+            if let Some(before) = callbacks_before {
+                let delta = self.slow_path_entries().saturating_sub(before);
+                if delta != 0 {
+                    // The one exemption, and it is narrow on purpose: a genuine guest fault
+                    // *arrives* through the callback, so it increments the counter. Anything else
+                    // that increments it is a block that used to reach memory directly and no
+                    // longer does.
+                    let exit = self.with_ctx(|ctx| match ctx.pending {
+                        Some(PendingExit::Fault { .. }) => None,
+                        Some(PendingExit::Returned { .. }) => Some("the guest returned"),
+                        Some(PendingExit::Thunk { .. }) => Some("the guest reached a thunk"),
+                        Some(PendingExit::Unsupported { .. }) => {
+                            Some("an unsupported instruction")
+                        }
+                        Some(PendingExit::Breakpoint { .. }) => Some("a breakpoint"),
+                        None => Some("the slice ran to the end of its budget"),
+                    });
+                    if let Some(exit) = exit {
+                        self.degraded_slices += 1;
+                        return Err(CpuError::DegradedMemoryPath {
+                            pc: self.pc(),
+                            callbacks: delta,
+                            exit,
+                        });
+                    }
+                }
+            }
 
             if halt_reason & OD_HALT_SHIM_REENTERED != 0 {
                 return Err(CpuError::Backend {

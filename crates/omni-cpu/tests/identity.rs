@@ -118,7 +118,16 @@ fn the_effective_configuration_is_the_one_d4_requires() {
 /// prevented: a configuration that produces identical results at a fraction of the speed.
 #[test]
 fn the_startup_assertion_fires_on_dynarmics_default_width_and_the_default_is_really_slower() {
-    let guest = Guest::new();
+    // The per-slice callback invariant is off for this guest, and that is the point of the test
+    // rather than a workaround: with it on, the degraded context cannot be *run* at all, because
+    // the first slice raises `DegradedMemoryPath` — which is asserted by
+    // `the_per_slice_invariant_stops_a_degraded_context_from_running_at_all` below. Half two here
+    // has to run it to measure what the assertion prevented, so it turns the invariant off and
+    // says so.
+    let guest = Guest::with_options(DynarmicOptions {
+        assert_callback_free_slices: false,
+        ..Default::default()
+    });
     guest.assert_high_addresses();
 
     const ITERATIONS: u64 = 10_000;
@@ -279,4 +288,82 @@ fn the_guest_pc_round_trips_for_every_address_in_the_space() {
     // And the band that does not survive, so the constant is not vacuous.
     assert!(!omni_cpu::pc_is_representable(1 << 55));
     assert_eq!(omni_cpu::truncate_pc(1 << 55), 0xFF80_0000_0000_0000);
+}
+
+/// **The per-slice callback invariant, fired.** Global Constraint 13's other direction for
+/// `CpuError::DegradedMemoryPath`: a check that has never been seen to fire is not a check.
+///
+/// The startup assertion defends the configuration once. This defends the *behaviour*, every
+/// slice. The two are shown to be different things here by giving the invariant a context the
+/// startup assertion already refused, and watching it refuse to run it: the degradation is real,
+/// the results would have been correct, and the only symptom is the counter.
+#[test]
+fn the_per_slice_invariant_stops_a_degraded_context_from_running_at_all() {
+    let guest = Guest::new();
+    guest.assert_high_addresses();
+    assert!(
+        guest.backend.slice_invariant_armed(),
+        "the invariant must be on by default, and it must really be on for this backend — it          disarms itself when the backend does not own guest paging, and a disarmed check proves          nothing"
+    );
+
+    const ITERATIONS: u64 = 1_000;
+    let entry = guest.load(&memory_loop(guest.data, ITERATIONS));
+    guest.write_u64(guest.data, 3);
+    let sentinel = guest.code + harness::CODE_BYTES - 4;
+
+    let (mut cpu, _refusal) = guest
+        .backend
+        .create_misconfigured_thread(MemoryPathOverrides {
+            address_space_bits: Some(36),
+            ..Default::default()
+        })
+        .expect("a deliberately misconfigured context");
+    cpu.set_return_sentinel(sentinel).expect("arm the sentinel");
+    cpu.set_x(x(30), sentinel as u64);
+
+    match cpu.run(entry, RunLimit::Unlimited) {
+        Err(CpuError::DegradedMemoryPath { callbacks, exit, .. }) => {
+            assert!(callbacks > 0, "the violation must carry the delta that caused it");
+            assert_eq!(
+                exit, "the guest returned",
+                "and it must name the exit that did not qualify for the memory-fault exemption"
+            );
+        }
+        other => panic!(
+            "a context whose every access takes the callback path must be caught by the per-slice              invariant, got {other:?}"
+        ),
+    }
+    assert_eq!(cpu.degraded_slices(), 1);
+}
+
+/// The invariant's one exemption, and the reason it cannot be phrased as "the counter stays at
+/// zero": a **legitimate** memory fault arrives through the same callback and increments the same
+/// counter. If the exemption were missing, every typed `MemoryFault` would become a spurious
+/// `DegradedMemoryPath`, and the check would be turned off within a day.
+#[test]
+fn a_real_memory_fault_increments_the_counter_and_is_not_a_violation() {
+    let guest = Guest::new();
+    guest.assert_high_addresses();
+    assert!(guest.backend.slice_invariant_armed());
+
+    // LDR X1, [X0] where X0 is an address inside the space with nothing mapped at it.
+    let mut program = mov64(0, guest.unmapped as u64);
+    program.push(ldr_imm(1, 0, 0));
+    program.push(ret(30));
+    let entry = guest.load(&program);
+
+    let (mut cpu, _sentinel) = guest.thread();
+    let before = cpu.slow_path_entries();
+    let exit = cpu.run(entry, RunLimit::Unlimited).expect("a guest fault is an exit, not an error");
+    let after = cpu.slow_path_entries();
+
+    match exit {
+        ExitReason::MemoryFault { address, .. } => assert_eq!(address, guest.unmapped),
+        other => panic!("expected a typed memory fault, got {other}"),
+    }
+    assert!(
+        after > before,
+        "a fault reaches the guest through the slow-path callback, so it MUST increment the          counter — if it did not, the exemption in the invariant would be dead code and the test          above it would prove nothing"
+    );
+    assert_eq!(cpu.degraded_slices(), 0, "and it must not count as a degradation");
 }

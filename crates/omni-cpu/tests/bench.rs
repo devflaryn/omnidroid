@@ -118,7 +118,13 @@ const LOOP_INSTRUCTIONS: u64 = ITERATIONS * 5;
 #[ignore = "measurement, not a test"]
 fn identity_mapping_against_the_default_width() {
     let _serial = serialized();
-    let guest = Guest::new();
+    // The per-slice callback invariant is off here because this benchmark's whole purpose is to
+    // *run* the degraded configuration and time it; with the invariant on, the first slice raises
+    // `DegradedMemoryPath` instead, which is asserted in `tests/identity.rs`.
+    let guest = Guest::with_options(DynarmicOptions {
+        assert_callback_free_slices: false,
+        ..Default::default()
+    });
     guest.assert_high_addresses();
     let entry = guest.load(&memory_loop(guest.data, ITERATIONS));
     guest.write_u64(guest.data, 1);
@@ -360,5 +366,83 @@ fn the_cost_of_slicing_the_run_loop() {
         "  Instructions(u64::MAX) vs Unlimited: {:.3}x. Without the clamp in `run::slice_budget` \
          this would be two orders of magnitude, because the emitted cycle comparison is signed.\n",
         counted.median.as_secs_f64() / unlimited.median.as_secs_f64()
+    );
+}
+
+/// **What the per-slice callback invariant costs.**
+///
+/// Task 4 added it because the D4 startup assertion structurally cannot see a memory path that
+/// degrades *after* it has passed. The check is two reads of a non-atomic counter on the jit's own
+/// thread, around a slice that is [`omni_cpu::run::SLICE_INSTRUCTIONS`] guest instructions — so the
+/// claim is that it is free, and a claim like that should be a number.
+///
+/// Two measurements, because the end-to-end one alone would be indistinguishable from noise and
+/// therefore would not say what the check costs, only that the workload is long:
+///
+/// 1. the whole workload, invariant on against off, which is the figure that matters;
+/// 2. the cost of one counter read on its own, which is what multiplies by the slice count.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_the_per_slice_callback_invariant() {
+    let _serial = serialized();
+    let mut rows = Vec::new();
+    for armed in [false, true] {
+        let guest = Guest::with_options(DynarmicOptions {
+            assert_callback_free_slices: armed,
+            ..Default::default()
+        });
+        let entry = guest.load(&memory_loop(guest.data, ITERATIONS));
+        guest.write_u64(guest.data, 1);
+        let (mut cpu, sentinel) = guest.thread();
+        rows.push(measure(|| {
+            cpu.set_x(x(30), sentinel as u64);
+            let exit = cpu.run(entry, RunLimit::Unlimited).expect("the loop runs");
+            assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+        }));
+    }
+
+    // The cost of the read itself. `slow_path_entries` is `od_jit_slow_path_total`, one load
+    // across the FFI boundary; the loop is `black_box`ed so it is not optimized away.
+    const READS: u64 = 10_000_000;
+    let guest = Guest::new();
+    let (cpu, _) = guest.thread();
+    let mut read_samples = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..READS {
+            acc = acc.wrapping_add(std::hint::black_box(cpu.slow_path_entries()));
+        }
+        std::hint::black_box(acc);
+        read_samples.push(t.elapsed());
+    }
+    let read = Summary::of(read_samples);
+    let ns_per_read = read.median.as_secs_f64() * 1e9 / READS as f64;
+
+    let slices = LOOP_INSTRUCTIONS.div_ceil(omni_cpu::run::SLICE_INSTRUCTIONS);
+    println!("\n== the per-slice callback invariant (n = {N} per configuration) ==");
+    println!(
+        "{LOOP_INSTRUCTIONS} guest instructions, slice = {}, so {slices} slices and {} counter \
+         reads per run",
+        omni_cpu::run::SLICE_INSTRUCTIONS,
+        slices * 2
+    );
+    for (name, summary) in [("disarmed", &rows[0]), ("armed", &rows[1])] {
+        println!(
+            "  {name:9} : {:7.3} ms median  [{:7.3} .. {:7.3}]",
+            ms(summary.median),
+            ms(summary.min),
+            ms(summary.max)
+        );
+    }
+    println!(
+        "  ratio     : {:.4}x",
+        rows[1].median.as_secs_f64() / rows[0].median.as_secs_f64()
+    );
+    println!(
+        "  one counter read: {ns_per_read:.3} ns (median of {N} runs of {READS} reads), so \
+         {:.3} ns per slice and {:.6} ms across the whole run",
+        ns_per_read * 2.0,
+        ns_per_read * 2.0 * slices as f64 / 1e6
     );
 }
