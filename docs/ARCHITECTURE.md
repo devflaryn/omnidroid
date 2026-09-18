@@ -233,9 +233,10 @@ Three consequences the rest of the design must absorb:
 - **Cold translation is slow** (0.15-0.31 Mguest-insn/s on synthetic loops, implying 7-25 s to warm
   a Roblox-sized working set), so translation is parallelized across cores and backed by a
   persistent on-disk code cache keyed by library content hash. Measured on **870 real
-  `libroblox.so` leaf functions** it is **0.486 Mguest-insn/s** — better than the synthetic figure,
-  because short functions give the IR optimizer less to work over than a tight loop does, so the
-  synthetic number remains the right one for loop-shaped code (D5 amendment 2).
+  `libroblox.so` leaf functions** it is **0.516 Mguest-insn/s** (n = 11, median, a fresh context
+  each) — better than the synthetic figure, so the synthetic number remains the right one for
+  loop-shaped code. *Why* real code is faster is a hypothesis rather than a result; see D5
+  amendment 2.
 - **Code caches are per-thread and not shared**, committing 20-35 MiB per guest thread regardless of
   code volume. This is in direct tension with D10 and is tracked as a primary risk.
 - **`ExclusiveMonitor` uses one global spinlock** and anti-scales 21x from 1 to 16 threads. Since

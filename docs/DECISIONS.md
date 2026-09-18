@@ -991,28 +991,53 @@ backend with a bionic TLS block and a guest stack.
 
 | Quantity | Synthetic (D5) | Real Roblox leaves |
 |---|---|---|
-| cold translation | 0.15-0.31 Mguest-insn/s | **0.486 Mguest-insn/s** (n = 1 pass, 870 functions, 8,679 guest instructions) |
-| warm | — | 155.0 Mguest-insn/s (n = 31 passes, median) |
+| cold translation | 0.15-0.31 Mguest-insn/s | **0.516 Mguest-insn/s** (n = 11 passes, median, a fresh context each; 870 functions, 8,679 guest instructions) |
+| warm | — | 156.7 Mguest-insn/s (n = 31 passes, median) |
 | per-thread commit | 20-35 MiB | **24.5 MiB** (n = 8 threads, serialized) |
 
-**Cold translation is 1.6-3.2x *better* than the synthetic figure, not worse.** The reason is
-visible in the shape: the synthetic benchmark measured translating a tight loop, where nearly every
-translated instruction is a loop body that dynarmic's IR optimizer works over repeatedly; the real
-leaves are short straight-line-plus-branch functions, 9.98 executed instructions on average, where
-the optimizer has much less to chew on. So D5's 0.15-0.31 remains the right figure for *loop-shaped*
-code and the 7-25 s warm-up estimate that follows from it is not improved; what is new is that the
-long tail of small functions costs less than the estimate assumed.
+**Cold translation is 1.7-3.4x *better* than the synthetic figure, not worse.** That much is
+measured. The *explanation* — that the synthetic benchmark translated a tight loop, where nearly
+every translated instruction is a loop body dynarmic's IR optimizer works over repeatedly, while the
+real leaves are short straight-line-plus-branch functions averaging 9.98 executed instructions where
+the optimizer has much less to chew on — is a **hypothesis the figures are consistent with, not one
+they establish**. The one testable half is measured: per-instruction cold cost **rises** with
+function length, 0.698 Mguest-insn/s for the shortest third of the leaves against 0.494 for the
+longest, which is the opposite of a per-function-overhead model and the direction the hypothesis
+needs. It is still not a test of it; the same curve would appear if any optimizer pass were
+superlinear in block size for unrelated reasons. Settling it means instrumenting those passes, or
+translating the same instruction count once as a loop and once as straight-line code.
+
+So D5's 0.15-0.31 remains the right figure for *loop-shaped* code and the 7-25 s warm-up estimate
+that follows from it is not improved; what is new is that the long tail of small functions costs
+less than the estimate assumed.
 
 **The warm figure is not a steady-state throughput and must not be read as one.** A warm pass is 870
-entries to and exits from `od_jit_run` around 8,679 instructions of work, so it measures **64.4 ns
-per call** — the run loop plus the dispatcher round trip — and not translated code. The steady-state
+entries to and exits from `od_jit_run` around 8,679 instructions of work, so it measures the *call*
+and not translated code. And the per-call figure is itself a **ceiling** rather than the boundary:
+of 63.7 ns per timed iteration, 10.7 ns is the harness's own eight `set_x` calls plus `rearm`
+(measured directly, by running the same loop with the `run` removed), and the remaining **53.0 ns**
+still contains about ten guest instructions of real work. So the call boundary costs **under 53 ns**,
+and that is the number M3 should plan against — every imported symbol becomes a thunk exit and a
+re-entry. Isolating it exactly would need a guest function of zero instructions. The steady-state
 comparison point remains D5's table.
 
 **Where the per-thread cost comes from.** It tracks `code_cache_size` plus a fixed term and not
 translated volume: 24.5 MiB at this backend's 8 MiB cache, of which 16 MiB is
 `A64EmitX64`'s `std::array<FastDispatchEntry, 0x100000>`, constructed and zeroed by the constructor
 whether or not the FastDispatch optimization is enabled — and this backend disables it (D16). The
-figure is now **asserted against a 32 MiB ceiling** rather than merely printed.
+figure is now **asserted against a 32 MiB ceiling** rather than merely printed — a ceiling that is
+fitted, with the measurement plus about 30% of headroom, and that sits below the top of D5's band so
+the 128 MiB-cache configuration would fail it.
+
+`GuestCpu::cost()` reports **16.004 MiB** of the 24.525, from two *derived* terms: the guest's TLS
+page, and the 16 MiB `FastDispatchEntry` table this pin allocates per jit whether or not the
+optimization that uses it is enabled. What it still misses is the code cache's committed high-water
+mark, a private member of `BlockOfCode` that `A64::Jit` does not expose, and that omission is
+**bounded and asserted** rather than admitted: the gate checks that `cost()` never exceeds what was
+measured and that the gap stays under `code_cache_size` plus a named 2 MiB allowance. Writing that
+bound as an assertion is what showed that `code_cache_size` alone does *not* bound it — the gap is
+8.521 MiB against an 8 MiB cache, so about 536 KiB per jit is `JitState`, the block-range map,
+xbyak's labels and the two shim allocations.
 
 ---
 
