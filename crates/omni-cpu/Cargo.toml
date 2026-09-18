@@ -9,3 +9,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# `omni-mem` for `GuestAddr` and `GuestSpace`: the CPU is handed a guest address space, and the two
+# crates must agree on what an address is. Nothing else. In particular there is deliberately **no**
+# build script and no C or C++ dependency here (preflight ruling P1): the dynarmic FFI lives in
+# `dynarmic-sys`, so this crate — and therefore the `GuestCpu` trait — compiles on a host with no
+# C++ toolchain at all, which is what the ARM64-native path (ARCHITECTURE.md section 6) needs.
+omni-mem = { workspace = true }
+thiserror = { workspace = true }

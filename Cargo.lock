@@ -141,6 +141,10 @@ version = "0.1.0"
 [[package]]
 name = "omni-cpu"
 version = "0.1.0"
+dependencies = [
+ "omni-mem",
+ "thiserror",
+]
 
 [[package]]
 name = "omni-elf"
