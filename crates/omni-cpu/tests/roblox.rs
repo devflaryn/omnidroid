@@ -698,10 +698,39 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
     let reported: usize = threads.iter().map(|c| c.cost().total()).sum::<usize>() / THREADS;
     println!(
         "per guest thread (n = {THREADS} threads, 1 measurement): {:.3} MiB at creation, \
-         {:.3} MiB after translating real Roblox code; GuestCpu::cost() reports {reported} bytes \
-         (the TLS block only)",
+         {:.3} MiB after translating real Roblox code; GuestCpu::cost() reports {:.3} MiB \
+         (the TLS page plus the pin's fixed 16 MiB per-jit table)",
         per_thread_created as f64 / 1048576.0,
         per_thread_warm as f64 / 1048576.0,
+        reported as f64 / 1048576.0,
+    );
+
+    // **The omission is bounded, not merely admitted.** `cost()` reports two derived terms and
+    // leaves out the code cache's committed high-water mark, which this pin gives no way to read.
+    // Both ends of that are asserted here: the reported figure never exceeds what was measured, and
+    // what it misses never exceeds `code_cache_size`, which is the public ceiling on the missing
+    // term. Without the second half, "we omit the cache" would be compatible with omitting anything
+    // at all.
+    let options = roblox.backend.options();
+    assert!(
+        reported as u64 <= per_thread_warm,
+        "cost() reports {reported} bytes per thread but only {per_thread_warm} were measured, so \
+         it is no longer a floor"
+    );
+    let missing = per_thread_warm - reported as u64;
+    assert!(
+        missing <= options.code_cache_size + MAX_OTHER_PER_JIT_BYTES,
+        "cost() misses {missing} bytes per thread, past the {} bytes of code cache plus the \
+         {MAX_OTHER_PER_JIT_BYTES}-byte allowance for dynarmic's other per-jit state -- so \
+         something else grew",
+        options.code_cache_size
+    );
+    println!(
+        "  cost() is a floor: it misses {:.3} MiB, of which at most {:.3} MiB is the code cache \
+         and the remaining {:.3} MiB is dynarmic's other per-jit state plus the counter's noise",
+        missing as f64 / 1048576.0,
+        options.code_cache_size as f64 / 1048576.0,
+        missing.saturating_sub(options.code_cache_size) as f64 / 1048576.0,
     );
 
     assert!(
@@ -721,6 +750,20 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
     );
     drop(threads);
 }
+
+/// What dynarmic's per-jit state may cost **beyond** the code cache and the fixed table.
+///
+/// **Fitted, not derived, and it is here because the obvious bound turned out to be wrong.** The
+/// first version of this assertion bounded the term `GuestCpu::cost()` omits by `code_cache_size`
+/// alone, on the reasoning that the cache is the one thing it knowingly leaves out. It is not:
+/// measured, the gap is **8.52 MiB** against an 8 MiB cache, so about **536 KiB per jit** is
+/// something else — `JitState`, the block-range map, xbyak's labels, the shim's own allocation and
+/// ours, plus whatever the process-global counter picked up in the window.
+///
+/// 2 MiB is that 536 KiB with roughly 3.8x of headroom. It bounds "something else grew" without
+/// pretending the residue is understood; naming it is the point, because a gap that is merely
+/// admitted can absorb any regression at all.
+const MAX_OTHER_PER_JIT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The ceiling one guest thread's CPU context may cost in commit charge.
 ///

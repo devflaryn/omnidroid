@@ -211,7 +211,14 @@ fn the_per_thread_tls_cost_is_one_page() {
         "n = {THREADS} threads: each block is exactly one page of commit charge"
     );
     for cpu in &threads {
-        assert_eq!(cpu.cost().private_committed, omni_cpu::TLS_BLOCK_BYTES);
+        // Two derived terms: the TLS page, and the 16 MiB `FastDispatchEntry` table this pin
+        // allocates per jit whether or not the optimization that uses it is on. Asserted as a sum
+        // of two named quantities rather than as a literal, so which one moved is visible when it
+        // fails.
+        assert_eq!(
+            cpu.cost().private_committed,
+            omni_cpu::TLS_BLOCK_BYTES + dynarmic_sys::OD_FIXED_PER_JIT_BYTES
+        );
         assert_eq!(
             cpu.cost().shared_committed,
             0,

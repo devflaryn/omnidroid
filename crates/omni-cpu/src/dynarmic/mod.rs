@@ -51,7 +51,7 @@ use dynarmic_sys::{
     od_jit_stats, od_monitor_free,
     od_monitor_new, OdConfig, OdEffectiveConfig, OdStats, OD_DYNARMIC_ABI_VERSION,
     OD_HALT_CACHE_INVALIDATION, OD_HALT_MEMORY_ABORT, OD_HALT_SHIM_REENTERED, OD_HALT_SHIM_THREW,
-    OD_HALT_USER1, OD_HALT_USER8,
+    OD_HALT_USER1, OD_HALT_USER8, OD_FIXED_PER_JIT_BYTES,
 };
 use omni_mem::{DemandPager, GuestAddr, GuestSpace, PagerStats, Protection, RegionKind};
 
@@ -760,7 +760,15 @@ impl DynarmicCpu {
             tpidrro_el0,
             shared,
             cost: ContextCost {
-                private_committed: tls.as_ref().map_or(0, GuestTls::len),
+                // The guest's TLS block, plus the per-jit state this pin allocates unconditionally.
+                // Both are derived rather than measured: the first is one page by construction, the
+                // second is `sizeof(FastDispatchEntry) * fast_dispatch_table_size` from the pin,
+                // checked against the vendored header by `dynarmic-sys`'s `pin_constants` test. The
+                // code cache's committed high-water mark is still missing; see `cost`.
+                private_committed: tls
+                    .as_ref()
+                    .map_or(0, GuestTls::len)
+                    .saturating_add(OD_FIXED_PER_JIT_BYTES),
                 shared_committed: 0,
             },
             tls,
@@ -1198,21 +1206,28 @@ impl GuestCpu for DynarmicCpu {
         Ok(had)
     }
 
-    /// What this context costs, **and what this figure does not include**.
+    /// What this context costs, **and what this figure still does not include**.
     ///
-    /// It reports the guest TLS block, which is the only per-context allocation this backend makes
-    /// and owns. It does **not** include dynarmic's code cache, and that is a real omission rather
-    /// than a rounding: on Windows the cache is committed incrementally as code is emitted
-    /// (`BlockOfCode::EnsureMemoryCommitted`), so the figure that matters is a high-water mark that
-    /// grows with translated volume — and this pin exposes no way to read it. `code_cache_size` is a
-    /// reservation ceiling, not a charge, so reporting it here would overstate a fresh context by
-    /// three orders of magnitude and understate nothing.
+    /// Two terms, both *derived* rather than measured, so this is a floor that does not depend on
+    /// what the guest has done:
     ///
-    /// D5 measured **20-35 MiB committed per guest thread** against the 128 MiB default cache, so
-    /// the omitted term is the dominant one. The measured per-context commit charge for this
-    /// backend's defaults is in the Task 3 report and in `tests/bench.rs`; closing the gap properly
-    /// means exposing `committed_size` through the shim, which is `dynarmic-sys`'s to do and is
-    /// what Task 4's per-thread ceiling assertion needs.
+    /// * the guest's bionic TLS block — one page, by construction;
+    /// * [`OD_FIXED_PER_JIT_BYTES`], the 16 MiB `FastDispatchEntry` table `A64EmitX64` holds as a
+    ///   by-value member, constructed and zeroed whether or not the optimization that uses it is
+    ///   enabled, which this backend disables (D16). `dynarmic-sys`'s `pin_constants` test reads
+    ///   both factors back out of the vendored header, so a re-pin cannot move it silently.
+    ///
+    /// **The missing term is dynarmic's code cache**, which on Windows commits incrementally as code
+    /// is emitted (`BlockOfCode::EnsureMemoryCommitted`), so the figure that matters is a high-water
+    /// mark. It is a private member of `BlockOfCode` that `A64::Jit` does not expose, and reading it
+    /// would mean patching the vendored pin. It is **bounded above** by
+    /// [`DynarmicOptions::code_cache_size`], and M2's gate asserts both ends: the measured
+    /// per-thread charge is under a ceiling, and the gap between it and this figure is under
+    /// `code_cache_size`. So the omission is bounded and asserted rather than merely admitted.
+    ///
+    /// Measured against this: **24.5 MiB** per guest thread at the 8 MiB default cache (n = 8
+    /// threads, serialized), of which this reports 16.004 MiB. D5's 20-35 MiB band was measured
+    /// against the 128 MiB default.
     fn cost(&self) -> ContextCost {
         self.cost
     }
