@@ -44,11 +44,16 @@ use crate::reloc::{Rela, RelocationTable};
 /// is the cost of the two `protect` calls per window. Measured on `libroblox.so`, whose 568,806
 /// relocations fall in 5.5 MB of writable image:
 ///
-/// | window | windows | relocate wall-time | peak transient charge |
+/// | window | windows opened | relocate wall-time | peak transient charge |
 /// |---|---|---|---|
-/// | 4 KiB | 1,352 | see the task report | 4 KiB |
-/// | **64 KiB** | **86** | see the task report | **64 KiB** |
-/// | 1 MiB | 8 | see the task report | 1 MiB |
+/// | 4 KiB | 2,438 | 20.9 ms | 4 KiB |
+/// | 16 KiB | 646 | 14.9 ms | 16 KiB |
+/// | **64 KiB** | **171** | **11.6 ms** | **64 KiB** |
+/// | 256 KiB | 47 | 10.4 ms | 256 KiB |
+/// | 1 MiB | 15 | 10.3 ms | 1 MiB |
+///
+/// (Release build, this machine, streaming the packed blob; see the Task 5 report for the full
+/// table and the matching commit-charge column.)
 ///
 /// 64 KiB is chosen because it is also [`omni_mem::DEFAULT_COMMIT_GRANULE`], so a window that lands
 /// in `.bss` needs exactly one commit granule and never straddles two, and because it is the
@@ -114,8 +119,16 @@ struct OpenWindow {
 /// table and the `APS2` blob streamed straight out of the decoder. A window stays open until a
 /// relocation arrives that does not fit in it, which makes the window count a function of how sorted
 /// the input is rather than a requirement on it: `libroblox.so`'s blob is emitted in ascending target
-/// order apart from **two** descents out of 568,272, so streaming it costs 89 windows where sorting
-/// it first would cost 87. Sorting is therefore an optimisation, and not worth 13.6 MB of `Vec`.
+/// order apart from **two** descents out of 568,272.
+///
+/// Two descents are not two extra windows. A descent rewinds the cursor, so every window between the
+/// descent's target and the point it came from is opened a second time: measured, streaming
+/// `libroblox.so` opens **171** windows where sorting it first opens **87**. That is the honest cost
+/// of not buffering — one descent early in the blob replays most of the writable image. The peak is
+/// unaffected, because one window is writable at a time either way, and the measured wall-time is
+/// better regardless, so sorting remains an optimisation rather than a requirement. If the ratio
+/// ever matters, a chunked sort — buffer a bounded run, sort it, feed it — is the cheaper structure
+/// than either extreme.
 pub(crate) struct Relocator<'a> {
     space: &'a GuestSpace,
     base: usize,

@@ -678,8 +678,10 @@ fn load_into(
     // The packed blob is **streamed**, not materialised. 568,272 `Elf64_Rela` records are 13.6 MB
     // of host `Vec`, and because it grows by doubling it measured 36.8 MB of commit charge at its
     // peak — more than the entire rest of the load. The window machinery does not need the input
-    // sorted, only mostly-sorted, and the blob is: two descents out of 568,272, so streaming it
-    // costs 89 windows where sorting it first cost 87.
+    // sorted, only mostly-sorted, and the blob is: two descents out of 568,272. Measured, that
+    // costs 171 windows against 87 for the sorted path, because a descent replays every window
+    // between where it lands and where it came from. One window is writable at a time either way,
+    // so the peak is unchanged and the wall-time is better.
     let decode_started = Instant::now();
     let mut tables = elf.unpacked_relocations()?;
     let decode_time = decode_started.elapsed();

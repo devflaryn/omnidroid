@@ -881,3 +881,115 @@ fn data_and_bss_stay_writable_after_the_load() {
     }
     object.unload(&f.space).expect("unload");
 }
+
+/// Every `JUMP_SLOT` is written *before* relro seals the page it lives on.
+///
+/// This is an ordering constraint, not a placement one, and the placement test above does not cover
+/// it. `DT_PLTGOT` is inside `PT_GNU_RELRO` and `DT_FLAGS` carries `DF_BIND_NOW`, so all 534
+/// `JUMP_SLOT` targets end up on read-only pages. Today that is safe only because the loader seals
+/// relro by *never raising* those pages — the relocation windows raise and restore them, and the
+/// final protection pass has nothing left to do. It stops being safe the moment somebody converts
+/// sealing into a protect-at-the-end that runs before, or instead of, the relocation pass: the
+/// relocations would then be silently lost or refused, and the guest would jump through a GOT full
+/// of nulls into nothing.
+///
+/// So the assertion is made against **content**, twice, with a provider that supplies every import
+/// at a unique non-zero address: sealed and unsealed loads must write the same 534 values. If
+/// sealing ever prevents or alters a `JUMP_SLOT` store, the two disagree and this fails loudly.
+#[test]
+fn every_jump_slot_is_written_before_relro_seals_its_page() {
+    let Some(f) = fixture() else { return };
+    let tables = f.elf.relocations().expect("decode");
+    let plt = tables.plt.as_ref().expect("DT_JMPREL");
+    assert_eq!(plt.relocations.len(), PLT_TOTAL);
+
+    let read_slots = |seal: bool| -> (Vec<u64>, Option<Protection>, usize, usize) {
+        let space = omni_mem::GuestSpace::new().expect("space");
+        let object = loader::load(
+            &space,
+            &f.backing,
+            &f.elf,
+            &stub_registry(),
+            &LoaderConfig { seal_relro: seal, ..LoaderConfig::default() },
+        )
+        .expect("load");
+        let values = plt
+            .relocations
+            .iter()
+            .map(|r| unsafe {
+                space
+                    .ptr(object.base + r.r_offset as usize, 8)
+                    .expect("in the space")
+                    .cast::<u64>()
+                    .read_unaligned()
+            })
+            .collect();
+        let protection = object
+            .range_at(object.base + plt.relocations[0].r_offset as usize)
+            .map(|r| r.rest);
+        let applied = object.stats.relocations.applied;
+        let base = object.base;
+        object.unload(&space).expect("unload");
+        space.close().expect("close");
+        (values, protection, applied, base)
+    };
+
+    let (sealed, sealed_protection, sealed_applied, sealed_base) = read_slots(true);
+    let (unsealed, unsealed_protection, unsealed_applied, unsealed_base) = read_slots(false);
+
+    assert_eq!(sealed_protection, Some(Protection::Read), "the PLT GOT is sealed by relro");
+    assert_eq!(
+        unsealed_protection,
+        Some(Protection::ReadWrite),
+        "without the seal the same pages rest writable, so the two loads really do differ"
+    );
+    assert_eq!(sealed_applied, GRAND_TOTAL, "sealing must not cost a single relocation");
+    assert_eq!(unsealed_applied, GRAND_TOTAL);
+    assert_eq!(sealed.len(), PLT_TOTAL, "534 JUMP_SLOT slots read back from the sealed load");
+
+    // Each load is compared against an expectation computed for **its own** base, from the file and
+    // the provider rather than from anything the loader produced. Comparing the two loads' raw
+    // values directly does not work and the difference is instructive: 533 of the 534 slots hold a
+    // provider address, which is base-independent, but one holds `base + st_value` for a symbol
+    // `libroblox.so` both imports and exports, and the two loads land at different bases.
+    let mut relative = 0usize;
+    for (load, base) in [(&sealed, sealed_base), (&unsealed, unsealed_base)] {
+        let expected = expected_values(&f, base);
+        for (r, got) in plt.relocations.iter().zip(load) {
+            let want = expected[&r.r_offset];
+            assert_ne!(want, 0, "every JUMP_SLOT must have a non-zero expectation");
+            assert_eq!(
+                *got, want,
+                "JUMP_SLOT at r_offset {:#x} holds {got:#x}, expected {want:#x} at base {base:#x}",
+                r.r_offset
+            );
+        }
+    }
+    let bias = (sealed_base as u64).wrapping_sub(unsealed_base as u64);
+    for (i, (a, b)) in sealed.iter().zip(&unsealed).enumerate() {
+        if a != b {
+            // The one self-bound slot, when the two loads did not happen to land at the same base:
+            // it must differ by exactly the bias and by nothing else.
+            assert_eq!(
+                a.wrapping_sub(*b),
+                bias,
+                "JUMP_SLOT {i} differs between the two loads by something other than the load bias"
+            );
+            relative += 1;
+        }
+    }
+    // The guest space is closed between the two loads, so the OS may hand back the same base. Which
+    // slots differ therefore depends on that, and only the *reason* they differ is asserted: a
+    // non-zero bias moves exactly the one base-relative slot, and nothing else ever moves.
+    assert_eq!(
+        relative,
+        usize::from(bias != 0),
+        "with a load bias of {bias:#x}, {relative} of the 534 JUMP_SLOTs moved between loads"
+    );
+
+    eprintln!(
+        "534 JUMP_SLOTs inside sealed PT_GNU_RELRO all hold the value their provider supplied; \
+         first {:#x}, and the one base-relative slot tracks the load bias",
+        sealed[0]
+    );
+}
