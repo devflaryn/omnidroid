@@ -56,6 +56,32 @@ These bind every task. A reviewer should treat a violation as a defect.
    pass, and leaving compiler warnings in our own crates is a defect.
 10. **Document discoveries.** If implementation reveals that the research got something wrong or
     missed something, say so in the task report. Never silently work around a documented fact.
+11. **Hostile input is the expected case, and you must test it yourself.** Decision D6 records that
+    this project's own primary test APK is adversarially modified, so malformed and malicious input
+    is normal input here. Every task so far — four for four — shipped a defect in this class that its
+    own passing test suite could not see: two process **aborts** (a 98-byte file killed `Apk::open`),
+    an arena overflow that wrapped past its own limit check in release, and a bound derived from
+    unvalidated attacker-controlled data. Each was found only because a reviewer *constructed* hostile
+    input rather than reading code.
+
+    So, before you report done, construct and run hostile inputs against your own work, and put the
+    results in your report. At minimum: a field that drives an allocation or a loop count set absurdly
+    large; sizes and offsets at and past `usize::MAX`/`u64::MAX`; a length that overflows when added
+    to a base or rounded up to alignment; zero-length and one-byte inputs; truncated structures; and a
+    value that is internally inconsistent with another (a declared size disagreeing with an actual
+    size). A panic or abort reachable from untrusted input is a **Critical** defect, not a robustness
+    nicety — an abort in particular cannot be contained by any caller. Remember also that **a bound is
+    only as trustworthy as its least-validated input**, and that **saturating arithmetic on a limit
+    turns hostile input into a larger permission**, which is backwards.
+12. **A test that cannot fail is worse than no test.** Prefer assertions that pin values against an
+    independent source over ones that check a call succeeded. Where a test guards a specific bug,
+    verify by mutation that reverting the fix actually makes that test fail, and say so in your report.
+    Watch for the two directions: a test can fail to catch the bug, and it can also fail to catch a
+    *fix that goes too far* — Task 2's copy-on-write work needed assertions in both directions, because
+    the obvious over-broad fix would have passed every correctness test while silently destroying the
+    multi-instance sharing property. Concrete precedents worth internalising: removing SLEB128 sign
+    extension still passed byte-exact blob consumption *and* every per-type relocation count; and a
+    `GROUPED_BY_ADDEND` test starting from addend 0 could not distinguish `+= delta` from `= delta`.
 
 ---
 
