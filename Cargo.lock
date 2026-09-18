@@ -166,7 +166,9 @@ name = "omni-cpu"
 version = "0.1.0"
 dependencies = [
  "dynarmic-sys",
+ "omni-apk",
  "omni-cpu",
+ "omni-elf",
  "omni-mem",
  "omni-platform",
  "parking_lot",

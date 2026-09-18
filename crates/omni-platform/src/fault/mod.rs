@@ -122,7 +122,15 @@ pub type FaultHandler = fn(context: usize, fault: &Fault) -> FaultOutcome;
 /// One per guest address space, and `ARCHITECTURE.md` §7 gives each guest *instance* its own
 /// process, so in production this is 1. The slack is for tests, which build several spaces in one
 /// process. A fixed array is what lets the dispatch path be a lock-free scan of a few atomics.
-pub const MAX_HANDLERS: usize = 8;
+///
+/// **Raised from 8 to 32 in Task 4**, because 8 was not in fact enough slack for the thing the
+/// slack exists for: `libtest` runs a binary's tests in parallel, and `omni-cpu`'s suites build one
+/// guest address space per test, so a binary with ten tests could exhaust the table. The symptom
+/// was the worst available — the ninth backend silently ran without demand paging, which puts every
+/// guest fault on dynarmic's own handler and its 30-49x recompiled callback path — and it was
+/// intermittent, because it depended on how libtest happened to schedule. The table is now refused
+/// rather than swallowed by `omni-cpu` as well; see `DynarmicBackend::new`.
+pub const MAX_HANDLERS: usize = 32;
 
 /// Counters for the dispatch path, so the ordering claim above can be tested rather than asserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

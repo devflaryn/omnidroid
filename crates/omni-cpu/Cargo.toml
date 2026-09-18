@@ -56,6 +56,16 @@ omni-platform = { workspace = true }
 # exists to prove neither is needed.
 omni-cpu = { path = ".", default-features = false, features = ["test-support"] }
 
+# **Test targets only**, for the M2 gate: it runs a function out of the real `libroblox.so`, which
+# has to be extracted from the real APK (`omni-apk`) and loaded, relocated and RELRO-sealed
+# (`omni-elf`) first. Neither is a dependency of this crate's own code, and neither may become one:
+# `ARCHITECTURE.md` section 2 puts `omni-cpu` and `omni-elf` side by side with nothing between
+# them, and a runtime edge either way would invert that. A dev-dependency is test-only by
+# construction, and `omni-elf` already carries the mirror image of this arrangement with
+# `omni-apk`.
+omni-elf = { workspace = true }
+omni-apk = { workspace = true }
+
 [features]
 default = ["dynarmic"]
 # The translating backend. See the dependency comment above.

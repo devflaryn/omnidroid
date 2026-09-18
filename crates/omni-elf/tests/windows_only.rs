@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 const WINDOWS_ONLY: [&str; 1] = ["loader_commit.rs"];
 
 /// Test files in this crate that are *not* gated, and so really do run everywhere.
-const PORTABLE: [&str; 6] = [
+const PORTABLE: [&str; 7] = [
     "all_libraries.rs",
     "aps2_errors.rs",
+    "eh_frame_golden.rs",
     "libroblox_golden.rs",
     "loader_hostile.rs",
     "loader_m1.rs",

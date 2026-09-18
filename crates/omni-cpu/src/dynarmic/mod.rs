@@ -323,7 +323,30 @@ impl DynarmicBackend {
             });
         }
 
-        let pager = DemandPager::install(Arc::clone(&space)).ok();
+        // D10 requires Omnidroid to own guest page faults. Two failures, and they are not the
+        // same failure: a platform with **no vectored-handler implementation** is a known,
+        // documented state the backend still works in, while a platform that *has* one and could
+        // not give us a slot is a resource exhaustion whose only symptom would be that every guest
+        // fault goes to dynarmic's own handler and permanently recompiles the block onto the
+        // 30-49x callback path. Swallowing the second was a real defect — it made `omni-cpu`'s own
+        // suite intermittently run without a pager — so it is refused.
+        let pager = match DemandPager::install(Arc::clone(&space)) {
+            Ok(pager) => Some(pager),
+            Err(e) if e.is_unsupported() => None,
+            Err(e) => {
+                // SAFETY-adjacent note: the monitor allocated above has not been wrapped in a
+                // `Monitor` yet, so it would leak on this path. Free it here.
+                // SAFETY: `raw` came from `od_monitor_new` and no jit references it.
+                unsafe { od_monitor_free(raw) };
+                return Err(CpuError::Backend {
+                    backend: BACKEND_NAME,
+                    operation: "install the guest demand pager",
+                    detail: format!(
+                        "{e}. D10 requires Omnidroid to take guest faults ahead of dynarmic's own                          handler; without that every guest fault recompiles its block onto the                          callback path, measured 30-49x slower with correct results"
+                    ),
+                });
+            }
+        };
         let owns_guest_paging = pager.is_some();
 
         Ok(Self {
@@ -600,6 +623,9 @@ pub struct DynarmicCpu {
     cost: ContextCost,
     /// Slices whose callback-path delta broke the invariant. See [`Self::degraded_slices`].
     degraded_slices: u64,
+    /// Guest instructions the most recent [`GuestCpu::run`] executed. See
+    /// [`Self::last_run_instructions`].
+    last_run_instructions: u64,
     /// Whether the invariant is armed for this context. Copied from the backend at construction
     /// so the hot path does not chase an `Arc` per slice.
     slice_invariant_armed: bool,
@@ -741,6 +767,7 @@ impl DynarmicCpu {
             processor_id,
             halt: HaltHandle::new(),
             degraded_slices: 0,
+            last_run_instructions: 0,
             slice_invariant_armed: armed,
         })
     }
@@ -795,6 +822,20 @@ impl DynarmicCpu {
         // SAFETY: the jit is live, and `&self` cannot overlap a `run` — `run` takes `&mut self`.
         // The counter is non-atomic and written only by callbacks, which run on this thread.
         unsafe { od_jit_slow_path_total(self.jit) }
+    }
+
+    /// How many guest instructions the most recent [`GuestCpu::run`] executed.
+    ///
+    /// [`ExitReason::StepLimitReached`] carries this already, because a caller bounding untrusted
+    /// code needs it at the moment the bound is hit. Every *other* exit drops it, and that makes
+    /// throughput unmeasurable on any workload that ends by returning — which is every real
+    /// function. So it is kept here as well.
+    ///
+    /// Same caveat as the exit's field: a backend counts at the end of a unit it handles as a
+    /// whole, so this is what really executed and may exceed a budget.
+    #[must_use]
+    pub fn last_run_instructions(&self) -> u64 {
+        self.last_run_instructions
     }
 
     /// How many run slices were found to have degraded onto the callback path.
@@ -917,6 +958,7 @@ impl GuestCpu for DynarmicCpu {
         }
 
         let mut budget = Budget::new(limit);
+        self.last_run_instructions = 0;
         loop {
             if self.halt.is_requested() {
                 return Ok(ExitReason::Halted { pc: self.pc() });
@@ -946,6 +988,7 @@ impl GuestCpu for DynarmicCpu {
 
             let used = self.with_ctx(|ctx| ctx.ticks_used);
             budget.charge(used);
+            self.last_run_instructions = budget.executed();
             self.take_panic()?;
 
             if let Some(before) = callbacks_before {

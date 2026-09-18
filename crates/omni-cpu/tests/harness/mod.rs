@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod a64;
+pub mod roblox;
 
 use std::sync::Arc;
 
