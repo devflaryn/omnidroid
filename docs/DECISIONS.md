@@ -664,3 +664,35 @@ Cost if wrong: an immediate, near-inexplicable crash at the first initializer, w
 a missing thread pointer. Recording it here is what prevents a long debugging session at M3.
 
 Evidence: `research/jni-surface.md` finding 14.
+
+---
+
+## D14 — `.bss` is committed eagerly: a deliberate, temporary exception to "never commit speculatively"
+**Ruling.** The loader commits `.bss` eagerly (11.6 MB for `libroblox.so`), which is the majority of the
++16.7 MiB per-instance commit charge. This knowingly contradicts D10's "never commit speculatively"
+constraint, so it is recorded as an exception rather than left to be discovered later as an
+inconsistency.
+
+Why eager, for now:
+- **Lazy `.bss` would be a latent fault with nothing driving it.** Committing on demand requires
+  something to catch the first touch of a page, and D10 already rejected fault-driven paging on
+  measurement: a VEH fault costs **2053 ns** against **3 ns/page** for bulk commit. Building a
+  fault-driven path here would reintroduce exactly the mechanism that measurement ruled out.
+- **Nothing yet drives lazy commit.** Until the CPU backend runs guest code, there is no execution to
+  hang demand-commit off. Committing eagerly now and adding a driver later is reversible; building a
+  speculative demand-commit path first is not obviously so.
+- **Eager `.bss` is pagefile charge, not resident pages.** The working-set cost stays demand-driven
+  because untouched committed pages are never faulted in; only the commit *charge* is taken up front.
+  That is the less harmful half of the cost.
+
+The lazy path is implemented and measured at **+5.395 MiB** — roughly 6 MiB per instance cheaper — and
+is one field away.
+
+**This exception expires when a commit driver lands.** Once the CPU backend is executing guest code
+there is a natural place to hang demand-commit, and the measured 6 MiB per instance is worth taking
+back, especially multiplied across instances.
+
+Cost if wrong: about 6 MiB of unnecessary commit charge per instance. It is visible — the per-instance
+figure is now pinned by an assertion rather than merely printed — and reversible by flipping one field.
+
+Evidence: `research/` measurements recorded in D10; loader figures in the Task 5 report.

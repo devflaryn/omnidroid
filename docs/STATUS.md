@@ -80,6 +80,7 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
 | `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
+| `omni-elf` — loader: map, relocate, resolve, seal | **Pending final review.** Milestone **M1** |
 | `omni-elf` — the loader: map, relocate, resolve, RELRO, `init_array`, `dl_iterate_phdr` state | **Done, pending review.** 129 tests across the crate, 251 workspace-wide. Milestone **M1** |
 | `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
 | `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
@@ -96,6 +97,9 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | JIT arena | Dual-mapped, W+X unrepresentable in the API; a child process storing through the execute pointer dies with `0xC0000005` |
 | Partial unmap | Copy-on-write content preserved in survivors, verified in the loader's exact relocation shape; sharing preserved at +0.008 MiB across a partial unmap of a clean 8 MiB view |
 | CoW charging | Charged at `protect` time, not write time: +8.020 MiB the instant an 8 MiB view becomes writable, refunded on restore |
+| **`libroblox.so` loaded, per instance** | **+16.7 MiB** commit (11.04 `.bss` + 4.97 RELRO + 0.33 `.data`); **104.14 MiB stays file-backed and shared**; peak equals steady, so windowed relocation produces no spike |
+| **Three concurrent instances** | **+50.270 MiB total** (16.757 MiB each), 312.422 MiB mapped file-backed. Marginal cost asserted per instance, so sharing cannot be first-instance-only or decay with count |
+| Load wall-time | 11.8 ms release for a 109 MB library |
 | `libroblox.so` extraction | 413 ms once (release), 130 us on a cache hit |
 | `libroblox.so` load, end to end | **11.8 ms** release / 77.5 ms debug: map 32 us, bind 1,109 symbols 83 us, relocate 568,806 in 171 windows 11.7 ms, protect 13 us |
 | `libroblox.so` loaded, commit charge | **+16.668 MiB** steady **and peak**, against 104.141 MiB mapped file-backed and shared. 11.039 `.bss` + 4.965 RELRO + 0.328 `.data` + page tables. With lazy `.bss`, +5.602 MiB |
