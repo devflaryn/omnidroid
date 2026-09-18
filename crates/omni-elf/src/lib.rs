@@ -1,11 +1,16 @@
-//! AArch64 ELF64 parsing and the Android `APS2` packed-relocation decoder.
+//! The bionic-compatible ELF loader: AArch64 ELF64 parsing, the Android `APS2` packed-relocation
+//! decoder, and the loader that maps, relocates and resolves.
 //!
-//! # Scope
+//! # Two halves, deliberately separable
 //!
-//! This crate **parses and decodes only**. It never maps memory, never applies a relocation and
-//! never binds a symbol to an implementation; those belong to the loader built on top of it. The
-//! whole crate works from a `&[u8]` of the file, which is why it needs no OS-specific
-//! dependency at all.
+//! Everything outside [`loader`] **parses and decodes only**: it works from a `&[u8]` of the file,
+//! never touches memory, never applies a relocation and never binds a symbol. [`ElfImage`] is that
+//! half's entry point, and it is usable on its own — the analysis tooling and every golden test
+//! depend on that.
+//!
+//! [`loader`] is the half that maps memory. It reaches it only through [`omni_mem::GuestSpace`],
+//! which reaches the OS only through `omni-platform`, so there is still no `cfg(target_os)` and no
+//! OS crate anywhere in this crate (Global Constraint 4). [`load`] is its entry point.
 //!
 //! # Why it exists in this shape
 //!
@@ -23,6 +28,12 @@
 //! from file data is fallible, and the packed-relocation count is bounded by the object's own
 //! loadable size — a fully-grouped `APS2` group costs zero bytes per relocation, so an
 //! unvalidated count lets thirty bytes ask for terabytes. See [`Aps2Limits`].
+//!
+//! The loader adds two more obligations, because it is the part that writes into mapped memory
+//! inside a 109 MB binary. Every relocation target is checked against the mapped ranges before the
+//! store, and **a load that fails releases the whole reserved span**, so a rejected library leaves
+//! no mapping and no commit charge behind. `tests/loader_hostile.rs` asserts both, and flips every
+//! byte of a synthetic library's metadata one at a time to look for a third.
 //!
 //! # Entry point
 //!
@@ -47,11 +58,13 @@ pub mod dynamic;
 pub mod error;
 pub mod header;
 pub mod image;
+pub mod loader;
 pub mod notes;
 pub mod reader;
 pub mod reloc;
 pub mod segment;
 pub mod symbols;
+pub mod version;
 
 pub use crate::aps2::{Aps2Limits, Aps2Summary, PackedFormat, PackedRelocations, Sleb128Decoder};
 pub use crate::dynamic::{DynArray, DynEntry, DynTable, Dynamic};
@@ -62,7 +75,14 @@ pub use crate::notes::{AndroidIdent, GnuProperties, Note};
 pub use crate::reader::View;
 pub use crate::reloc::{RelocEncoding, Rela, RelocationTable, Relocations};
 pub use crate::segment::{Section, Segment, SegmentFlags};
+pub use crate::loader::{
+    load, DlPhdrInfo, EmptyProvider, Imports, LoadError, LoadPlan, LoadResult, LoadStats,
+    LoadedObject, LoaderConfig, MappedRange, ProviderRegistry, RelocationStats, RelroRegion,
+    ResolvedImport, SymbolKind, SymbolProvider, SymbolRequest, SymbolValue, UnresolvedImport,
+    UnresolvedPolicy, DEFAULT_RELOCATION_WINDOW,
+};
 pub use crate::symbols::{GnuHash, StrTab, Sym, SymbolTable, SysvHash};
+pub use crate::version::{SymbolRequirement, VersionInfo, VersionNeed, VersionNeedAux};
 
 use crate::consts::*;
 
@@ -366,6 +386,37 @@ impl<'a> ElfImage<'a> {
             return g.derive_symbol_count();
         }
         Err(ElfError::NoSymbolCountSource)
+    }
+
+    /// The object's symbol-versioning tables: `DT_VERNEED` plus `DT_VERSYM`.
+    ///
+    /// This is how an undefined symbol is attributed to a provider library. `libroblox.so`'s 565
+    /// imports carry no other record of where they should come from, and `DT_VERNEED` names
+    /// `libc.so`, `libm.so` and `libdl.so` for 407 of them; see [`version`] for why the remaining
+    /// 158 are honestly unattributed rather than guessed at from their names.
+    pub fn version_info(&self) -> Result<VersionInfo<'a>> {
+        let needs = match self.dynamic.verneed {
+            Some(vaddr) => {
+                // A `DT_VERNEED` with no `DT_VERNEEDNUM` is refused rather than read as empty: the
+                // table declares no size of its own, so the count is the only bound there is.
+                let num = self
+                    .dynamic
+                    .verneednum
+                    .ok_or(ElfError::MissingDynamicTag("DT_VERNEEDNUM"))?;
+                let view = self.view_to_segment_end("DT_VERNEED", vaddr)?;
+                version::parse_verneed(&view, num, &self.strtab()?)?
+            }
+            None => Vec::new(),
+        };
+        let versym = match self.dynamic.versym {
+            Some(vaddr) => Some(self.slice_at_vaddr(
+                "DT_VERSYM",
+                vaddr,
+                u64::from(self.symbol_count) * 2,
+            )?),
+            None => None,
+        };
+        Ok(VersionInfo::new(needs, versym, self.symbol_count))
     }
 
     /// The dynamic symbol table.

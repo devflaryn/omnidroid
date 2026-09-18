@@ -315,4 +315,16 @@ pub enum ElfError {
     /// when the allocator refuses.
     #[error("could not allocate {bytes} bytes while decoding relocations")]
     AllocationFailed { bytes: usize },
+
+    // -----------------------------------------------------------------------------------------
+    // Symbol versioning
+    // -----------------------------------------------------------------------------------------
+    /// `DT_VERNEEDNUM` and `vn_cnt` are file-controlled counts, so they are bounded by the bytes
+    /// that actually exist before either is allowed to size an allocation. Same discipline as the
+    /// relocation counts, for the same reason.
+    #[error(
+        "{what} declares {count} records, but at most {max} can fit in the bytes that follow \
+         the table"
+    )]
+    VersionCountExceedsTable { what: What, count: u64, max: u64 },
 }

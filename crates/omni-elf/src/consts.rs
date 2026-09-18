@@ -199,6 +199,18 @@ pub const SIZEOF_SHDR: usize = 64;
 pub const SIZEOF_EHDR: usize = 64;
 /// Size of one pointer-sized `init_array` / `fini_array` slot.
 pub const SIZEOF_PTR: usize = 8;
+/// Size of one `Elf64_Verneed`.
+pub const SIZEOF_VERNEED: usize = 16;
+/// Size of one `Elf64_Vernaux`.
+pub const SIZEOF_VERNAUX: usize = 16;
+
+/// `DT_VERSYM` index for a symbol that is local to the object.
+pub const VER_NDX_LOCAL: u16 = 0;
+/// `DT_VERSYM` index for a symbol that is global and carries no version. For an *undefined*
+/// symbol this is the file saying nothing about which library provides it.
+pub const VER_NDX_GLOBAL: u16 = 1;
+/// The top bit of a `DT_VERSYM` entry: the reference is hidden. Not part of the index.
+pub const VERSYM_HIDDEN: u16 = 0x8000;
 
 // ---------------------------------------------------------------------------------------------
 // AArch64 dynamic relocation types (AAELF64 section 5.7.13)

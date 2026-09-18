@@ -11,6 +11,9 @@
 
 #![allow(dead_code)]
 
+pub mod fixture;
+pub mod synth;
+
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -296,4 +299,65 @@ fn inflate_entry(apk: &[u8], e: &Entry) -> std::io::Result<Vec<u8>> {
 
 fn err(msg: &str) -> std::io::Error {
     std::io::Error::other(msg.to_owned())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The real extraction cache, for the loader tests
+// ---------------------------------------------------------------------------------------------
+//
+// The parsing tests above work from a `Vec<u8>`, which is all a parser needs. The loader needs the
+// library as a **file on disk whose payload starts at offset 0**, because a placeholder-replacing
+// view needs a 4 KB-aligned file offset and the APK's entries are DEFLATED and 4-byte aligned
+// (D11). That is exactly what `omni-apk`'s content-addressed cache produces, so the loader tests go
+// through the real thing rather than a second copy of it — this is also the first time Tasks 1
+// through 4 are exercised end to end, which is the point of M1.
+
+/// Extract every ARM64 library into the real `omni-apk` extraction cache, and return the cache path
+/// of one of them. `None` when the APK is absent.
+pub fn cached_library(file_name: &str) -> Option<std::path::PathBuf> {
+    static CACHE: OnceLock<Option<BTreeMap<String, PathBuf>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if !apk_available() {
+                return None;
+            }
+            let apk = omni_apk::Apk::open(apk_path()).expect("the real APK must open");
+            let cache = omni_apk::LibraryCache::new(cache_dir().join("extraction-cache"));
+            let mut out = BTreeMap::new();
+            for library in apk.native_libraries_for_abi("arm64-v8a") {
+                let cached = cache
+                    .extract(&apk, library.entry())
+                    .unwrap_or_else(|e| panic!("extracting {}: {e}", library.file_name()));
+                assert!(
+                    cached.is_directly_mappable(),
+                    "{} must be page-aligned in the cache",
+                    library.file_name()
+                );
+                out.insert(library.file_name().to_owned(), cached.path().to_path_buf());
+            }
+            assert_eq!(out.len(), EXPECTED_LIB_COUNT);
+            Some(out)
+        })
+        .as_ref()
+        .map(|m| {
+            m.get(file_name)
+                .unwrap_or_else(|| panic!("{file_name} is not in the APK"))
+                .clone()
+        })
+}
+
+/// `libroblox.so` in the extraction cache, or `None` when the APK is absent.
+pub fn cached_main_lib() -> Option<std::path::PathBuf> {
+    cached_library(MAIN_LIB)
+}
+
+/// The bytes of `libroblox.so` **as they sit in the extraction cache**, so that a test which both
+/// parses the image and maps the file is provably working from one set of bytes.
+pub fn cached_main_lib_bytes() -> Option<&'static [u8]> {
+    static BYTES: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    BYTES
+        .get_or_init(|| {
+            cached_main_lib().map(|p| std::fs::read(p).expect("read the extraction-cache entry"))
+        })
+        .as_deref()
 }

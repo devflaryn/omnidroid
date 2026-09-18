@@ -147,6 +147,9 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "flate2",
+ "omni-apk",
+ "omni-mem",
+ "omni-platform",
  "thiserror",
  "tracing",
 ]

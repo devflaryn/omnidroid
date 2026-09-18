@@ -9,14 +9,19 @@ repository.workspace = true
 publish = false
 description = "AArch64 ELF64 parsing and the Android APS2 packed-relocation decoder (D9)."
 
-# No OS-specific crates: this crate works entirely from a `&[u8]`. Global Constraint 4 is
-# satisfied structurally rather than by discipline.
+# No OS-specific crates and no `cfg(target_os)`: the parser works entirely from a `&[u8]` and the
+# loader reaches memory only through `omni-mem`, which reaches the OS only through `omni-platform`.
+# Global Constraint 4 is satisfied structurally rather than by discipline.
 [dependencies]
 thiserror = { workspace = true }
 bitflags = { workspace = true }
 tracing = { workspace = true }
+omni-mem = { workspace = true }
+omni-platform = { workspace = true }
 
 [dev-dependencies]
 # Test-only. The golden fixtures are the ARM64 `.so` entries inside the real APK, which are
-# DEFLATE-compressed; `omni-apk` is not yet available so the test harness inflates them itself.
+# DEFLATE-compressed; the parsing tests inflate them in-process, while the loader tests need them
+# as 4 KB-aligned files on disk and so go through the real extraction cache.
 flate2 = { workspace = true }
+omni-apk = { workspace = true }
