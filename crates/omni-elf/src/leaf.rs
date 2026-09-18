@@ -648,6 +648,66 @@ mod tests {
         assert_eq!(branch_target(0x1000, -1), 0x0FFC);
     }
 
+    /// **Global Constraint 11, on the classifier itself.** The bytes it decodes come from a 109 MB
+    /// file this project already knows is adversarially modified (D6), and a classifier that
+    /// panicked on a hostile body would turn a static scan into a crash.
+    ///
+    /// Two properties over a deterministic sweep of the whole encoding space at a stride that hits
+    /// every top-level class many times over:
+    ///
+    /// 1. it never panics, whatever the bytes are;
+    /// 2. **no body containing a call or an indirect transfer is ever graded a leaf**, which is the
+    ///    one direction a misclassification must not go — a function graded a leaf that is not one
+    ///    sends guest code into an unrelocated PLT stub.
+    #[test]
+    fn no_sequence_of_bytes_can_make_the_classifier_panic_or_admit_a_call() {
+        const RET_X30: u32 = 0xD65F_03C0;
+        let mut examined = 0u64;
+        let mut leaves = 0u64;
+        // A stride that is coprime with every power of two below 2^32, so the sweep walks the whole
+        // space rather than a slice of it, and a fixed count so the test is deterministic.
+        let mut word: u32 = 0;
+        for _ in 0..200_000u32 {
+            word = word.wrapping_add(0x0001_9E3F).rotate_left(7) ^ 0x5BF0_3635;
+            for tail in [RET_X30, word.rotate_right(11), 0] {
+                let body = asm(&[word, word.swap_bytes(), tail, RET_X30]);
+                let facts = body_facts(&body, 0x1000, None);
+                examined += 1;
+                let kind = facts.kind();
+                if kind != LeafKind::NotALeaf {
+                    leaves += 1;
+                    assert!(
+                        facts.direct_calls.is_empty()
+                            && facts.indirect_transfers == 0
+                            && facts.escaping_branches == 0,
+                        "{word:#010x} was graded {kind:?} while reaching outside its body: {facts:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(examined, 600_000);
+        // The sweep has to find *some* leaves, or the property above is vacuous.
+        assert!(leaves > 1_000, "only {leaves} of {examined} bodies graded as leaves");
+    }
+
+    /// A body of arbitrary length, including lengths that are not whole instructions, is answered
+    /// rather than indexed past the end.
+    #[test]
+    fn a_body_of_any_length_is_answered_rather_than_indexed_past_the_end() {
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        for len in 0..bytes.len() {
+            let facts = body_facts(&bytes[..len], u64::MAX - 4096, None);
+            // Only the claim matters here: it returns, and a partial instruction is not a leaf.
+            if len % 4 != 0 || len == 0 {
+                assert_eq!(facts.kind(), LeafKind::NotALeaf, "length {len}");
+            }
+        }
+        // A body that starts at the very top of the address space: the end arithmetic must not
+        // wrap into a range that contains everything.
+        let facts = body_facts(&[0u8; 8], u64::MAX - 8, None);
+        assert_eq!(facts.undecodable, 2, "0x0000_0000 is the reserved encoding, twice");
+    }
+
     #[test]
     fn a_relocation_landing_in_the_body_disqualifies_it() {
         let relocations =

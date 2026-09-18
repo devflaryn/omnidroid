@@ -759,3 +759,167 @@ fn the_per_slice_invariant_is_armed_and_real_roblox_code_never_trips_it() {
     assert_eq!(cpu.slow_path_entries(), 0, "no guest access left the fast path");
     assert_eq!(cpu.degraded_slices(), 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Measurements. `#[ignore]`d so an ordinary `cargo test` does not pay for them:
+//
+//   cargo test -p omni-cpu --release --test roblox -- --ignored --nocapture
+//
+// Release only; a debug build measures the harness rather than the jit.
+// ---------------------------------------------------------------------------------------------
+
+/// **Cold and warm translation throughput on real Roblox code.**
+///
+/// Every measurement in this project so far has been synthetic: hand-written loops of four to eight
+/// instructions, chosen to isolate one effect. This one runs the engine's own code — every leaf the
+/// scan found that needs nothing but registers, a stack and a thread pointer — which is a different
+/// shape in three ways that matter, and the differences are what the Task 4 report is for.
+///
+/// The figures to compare against are D5's: **0.15-0.31 Mguest-insn/s cold**, and a steady state of
+/// about 2.0x native on memory-heavy code, 2.2x on NEON/FP and **33x on register-bound integer
+/// code**. These functions are overwhelmingly the third kind, so 33x is the row they belong in.
+#[test]
+#[ignore = "measurement, not a test"]
+fn cold_and_warm_translation_throughput_on_real_roblox_code() {
+    use std::time::{Duration, Instant};
+
+    let _serial = serialized();
+    let Some(roblox) = Roblox::load() else { return };
+    let bytes = harness::roblox::main_lib_bytes().expect("the library bytes");
+    let elf = omni_elf::ElfImage::parse(bytes).expect("parse libroblox.so");
+
+    let scan_started = Instant::now();
+    let leaves = omni_elf::leaf::find_leaves(&elf).expect("scan for leaves");
+    let scan_elapsed = scan_started.elapsed();
+
+    // Everything the scan graded as runnable. `LeafKind::NotALeaf` never appears here.
+    let entries: Vec<(GuestAddr, u64)> =
+        leaves.iter().map(|l| (roblox.at(l.bounds.start), l.bounds.len)).collect();
+    let body_bytes: u64 = leaves.iter().map(|l| l.bounds.len).sum();
+
+    /// One pass over every candidate, on one context. Returns the wall time, the guest instructions
+    /// executed, and how each function ended.
+    fn pass(
+        roblox: &Roblox,
+        cpu: &mut DynarmicCpu,
+        entries: &[(GuestAddr, u64)],
+        keep: &mut [bool],
+    ) -> (Duration, u64, [usize; 4]) {
+        let mut executed = 0u64;
+        let mut outcomes = [0usize; 4];
+        let started = Instant::now();
+        for (i, &(entry, _)) in entries.iter().enumerate() {
+            if !keep[i] {
+                continue;
+            }
+            // A fixed, arbitrary argument pattern. These are real functions with real argument
+            // conventions we do not know, so the inputs are not meaningful — what is being measured
+            // is translation and execution, not results, and the results are checked elsewhere.
+            for r in 0..8u8 {
+                cpu.set_x(x(r), 0x0101_0101_0101_0101u64.wrapping_mul(u64::from(r) + 1));
+            }
+            roblox.rearm(cpu);
+            match cpu.run(entry, RunLimit::Instructions(200_000)) {
+                Ok(ExitReason::Returned { .. }) => outcomes[0] += 1,
+                Ok(ExitReason::UnsupportedInstruction { .. }) => {
+                    outcomes[1] += 1;
+                    keep[i] = false;
+                }
+                Ok(_) => {
+                    outcomes[2] += 1;
+                    keep[i] = false;
+                }
+                Err(_) => {
+                    outcomes[3] += 1;
+                    keep[i] = false;
+                }
+            }
+            executed += cpu.last_run_instructions();
+        }
+        (started.elapsed(), executed, outcomes)
+    }
+
+    // A dry pass on a throwaway context, to find the functions that do not simply return. They are
+    // excluded from the timed passes so that cold and warm measure the same work; how many there
+    // are, and why, is itself a finding.
+    let mut keep = vec![true; entries.len()];
+    {
+        let mut probe = roblox.thread();
+        let (_, _, outcomes) = pass(&roblox, &mut probe, &entries, &mut keep);
+        println!("\n== real libroblox.so leaf functions ==");
+        println!(
+            "  .eh_frame_hdr names 245,117 functions; the scan took {:.3} s and graded {} of them \
+             runnable ({} bytes of body)",
+            scan_elapsed.as_secs_f64(),
+            entries.len(),
+            body_bytes
+        );
+        println!(
+            "  first (untimed) pass: {} returned, {} hit an unimplemented instruction, {} ended \
+             another way, {} errored",
+            outcomes[0], outcomes[1], outcomes[2], outcomes[3]
+        );
+    }
+    let kept = keep.iter().filter(|k| **k).count();
+
+    // Cold: a brand-new context, so every block is translated for the first time.
+    let mut cold_keep = keep.clone();
+    let mut cpu = roblox.thread();
+    let (cold, cold_executed, _) = pass(&roblox, &mut cpu, &entries, &mut cold_keep);
+
+    // Warm: the same context, so nothing is translated at all.
+    const N: usize = 31;
+    let mut samples = Vec::with_capacity(N);
+    let mut warm_executed = 0u64;
+    for _ in 0..N {
+        let mut k = keep.clone();
+        let (elapsed, executed, _) = pass(&roblox, &mut cpu, &entries, &mut k);
+        warm_executed = executed;
+        samples.push(elapsed);
+    }
+    samples.sort_unstable();
+    let warm = samples[N / 2];
+
+    let m = |insns: u64, d: Duration| insns as f64 / d.as_secs_f64() / 1e6;
+    println!(
+        "  {kept} functions run to completion, {cold_executed} guest instructions per pass \
+         ({:.2} per function)",
+        cold_executed as f64 / kept as f64
+    );
+    println!(
+        "  cold (n = 1 pass, every block translated) : {:8.3} ms, {:8.3} Mguest-insn/s",
+        cold.as_secs_f64() * 1e3,
+        m(cold_executed, cold)
+    );
+    println!(
+        "  warm (n = {N} passes, median, no translation) : {:8.3} ms, {:8.1} Mguest-insn/s",
+        warm.as_secs_f64() * 1e3,
+        m(warm_executed, warm)
+    );
+    let translation = cold.saturating_sub(warm);
+    println!(
+        "  translation alone (cold - warm)           : {:8.3} ms for {cold_executed} guest \
+         instructions, {:8.3} Mguest-insn/s",
+        translation.as_secs_f64() * 1e3,
+        m(cold_executed, translation)
+    );
+    println!(
+        "  cold/warm ratio: {:.1}x. D5 measured cold translation at 0.15-0.31 Mguest-insn/s on \
+         synthetic code.",
+        cold.as_secs_f64() / warm.as_secs_f64()
+    );
+    // The warm figure is NOT a steady-state translated-code throughput and must not be read as
+    // one. The average function here is ten instructions long, so a warm pass is 870 entries to
+    // and exits from `od_jit_run` around 8,679 instructions of work: it measures the *call*, not
+    // the code. Saying so with the number attached is the point.
+    println!(
+        "  warm per call: {:6.1} ns for {:.2} guest instructions -- so the warm figure above is          dominated by the run-loop and dispatcher round trip, not by translated code",
+        warm.as_secs_f64() * 1e9 / kept as f64,
+        cold_executed as f64 / kept as f64
+    );
+    println!(
+        "  callback-path entries across every pass: {} (D4 says this must be 0 for code that \
+         only touches its own stack)",
+        cpu.slow_path_entries()
+    );
+}

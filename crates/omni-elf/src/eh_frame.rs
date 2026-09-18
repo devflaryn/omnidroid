@@ -613,6 +613,213 @@ mod tests {
         assert_eq!((aug, len), (b"zPLR".as_slice(), 5));
     }
 
+    /// A minimal, valid `.eh_frame`: one CIE with a `zR` augmentation declaring
+    /// `DW_EH_PE_pcrel | DW_EH_PE_sdata4`, and one FDE after it describing a 64-byte function.
+    ///
+    /// Built by hand so that the hostile sweeps below have something whose *correct* reading is
+    /// known, which is the only way a sweep can tell "refused because it is malformed" from
+    /// "refused because the reader is broken".
+    fn one_cie_and_one_fde(base_vaddr: u64) -> (Vec<u8>, FunctionBounds) {
+        let mut out = Vec::new();
+        let cie_body: Vec<u8> = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_le_bytes()); // CIE id
+            b.push(1); // version
+            b.extend_from_slice(b"zR\0");
+            b.push(0x01); // code_alignment_factor, ULEB 1
+            b.push(0x78); // data_alignment_factor, SLEB -8
+            b.push(30); // return_address_register, one byte at version 1
+            b.push(0x01); // augmentation data length
+            b.push(0x1B); // DW_EH_PE_pcrel | sdata4
+            while b.len() % 4 != 0 {
+                b.push(0); // DW_CFA_nop padding
+            }
+            b
+        };
+        out.extend_from_slice(&(cie_body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cie_body);
+
+        let fde_at = out.len();
+        let fde_body: Vec<u8> = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&((fde_at + 4) as u32).to_le_bytes()); // CIE_pointer, backwards
+            // `pc_begin` is pcrel from its own position, which is `fde_at + 8`.
+            b.extend_from_slice(&0x1000i32.to_le_bytes());
+            b.extend_from_slice(&64u32.to_le_bytes()); // pc_range
+            while b.len() % 4 != 0 {
+                b.push(0);
+            }
+            b
+        };
+        out.extend_from_slice(&(fde_body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fde_body);
+
+        let expected = FunctionBounds { start: base_vaddr + (fde_at as u64) + 8 + 0x1000, len: 64 };
+        (out, expected)
+    }
+
+    fn reader(bytes: &[u8], base_vaddr: u64) -> FrameReader<'_> {
+        FrameReader { view: View::new(bytes), base_vaddr }
+    }
+
+    /// Where the hand-built FDE starts, in the same arithmetic the reader uses.
+    fn fde_offset(bytes: &[u8]) -> usize {
+        4 + u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes")) as usize
+    }
+
+    #[test]
+    fn a_hand_built_cie_and_fde_read_back_exactly() {
+        const BASE: u64 = 0x4000;
+        let (bytes, expected) = one_cie_and_one_fde(BASE);
+        let fde_vaddr = BASE + fde_offset(&bytes) as u64;
+        assert_eq!(reader(&bytes, BASE).fde_bounds(fde_vaddr).expect("a valid FDE"), expected);
+    }
+
+    /// **Global Constraint 11.** Every truncation of a valid `.eh_frame` is a typed error, never a
+    /// panic and never a plausible-looking function.
+    ///
+    /// The header is attacker-controlled (D6), and a 109 MB file gives an attacker a lot of room;
+    /// "it would never be truncated there" is not a property, it is a hope.
+    #[test]
+    fn every_truncation_of_a_valid_frame_is_an_error_and_never_a_panic() {
+        const BASE: u64 = 0x4000;
+        let (bytes, _) = one_cie_and_one_fde(BASE);
+        let fde_vaddr = BASE + fde_offset(&bytes) as u64;
+        for cut in 0..bytes.len() {
+            assert!(
+                reader(&bytes[..cut], BASE).fde_bounds(fde_vaddr).is_err(),
+                "a frame truncated to {cut} of {} bytes was accepted",
+                bytes.len()
+            );
+        }
+        // And the whole thing is still fine, so the sweep is not passing because everything fails.
+        assert!(reader(&bytes, BASE).fde_bounds(fde_vaddr).is_ok());
+    }
+
+    /// Every single-byte corruption either reads back differently or is refused.
+    ///
+    /// A byte that changes nothing is a byte the reader is not looking at, and in this format
+    /// every byte decides a length, an encoding or an address. The two genuine exceptions are
+    /// named rather than skipped by a tolerance: the CIE's own length field, which this FDE reaches
+    /// its CIE without consulting, and the `DW_CFA_nop` padding.
+    #[test]
+    fn every_single_byte_corruption_is_seen() {
+        const BASE: u64 = 0x4000;
+        let (bytes, expected) = one_cie_and_one_fde(BASE);
+        let fde_at = fde_offset(&bytes);
+        let fde_vaddr = BASE + fde_at as u64;
+        // The bytes this FDE genuinely does not consult, named one by one rather than covered by a
+        // tolerance:
+        //   0..4    the CIE's own length -- the FDE reaches its CIE through `CIE_pointer`;
+        //   12..16  code_alignment_factor, data_alignment_factor, return_address_register and the
+        //           augmentation-data length, all of which are *walked over* to reach `R` and
+        //           whose values decide nothing about a function's bounds;
+        //   padding the trailing DW_CFA_nops;
+        //   fde..+4 the FDE's own length, which decides nothing about the bounds -- only its two
+        //           sentinel values, 0 and 0xFFFFFFFF, are checked, and both are provoked in
+        //           `each_structural_impossibility_is_refused_by_name`.
+        // Their *lengths* are consulted, though, and that is checked separately below.
+        let padding_starts = fde_at - 3;
+        let ignorable = |i: usize| {
+            i < 4
+                || (12..16).contains(&i)
+                || (i >= padding_starts && i < fde_at)
+                || (fde_at..fde_at + 4).contains(&i)
+        };
+        let mut seen = 0usize;
+        for i in 0..bytes.len() {
+            if ignorable(i) {
+                continue;
+            }
+            for delta in [1u8, 0x80, 0xFF] {
+                let mut corrupt = bytes.clone();
+                corrupt[i] = corrupt[i].wrapping_add(delta);
+                if corrupt == bytes {
+                    continue;
+                }
+                let got = reader(&corrupt, BASE).fde_bounds(fde_vaddr);
+                assert!(
+                    !got.as_ref().is_ok_and(|b| *b == expected),
+                    "byte {i} += {delta:#x} changed nothing the reader looks at"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen > 20, "the sweep must actually have corrupted something: {seen}");
+
+        // The four walked-over bytes decide nothing by value, but they decide where `R` is by
+        // *length*. Setting the continuation bit on the first LEB lengthens it, which moves every
+        // later field -- and that must not be silently absorbed.
+        let mut lengthened = bytes.clone();
+        lengthened[12] |= 0x80;
+        let got = reader(&lengthened, BASE).fde_bounds(fde_vaddr);
+        assert!(
+            !got.as_ref().is_ok_and(|b| *b == expected),
+            "lengthening the CIE's code_alignment_factor moves the FDE pointer encoding, so it              cannot read back the same function"
+        );
+    }
+
+    /// The structural refusals, each provoked on its own so that a passing sweep cannot hide one of
+    /// them never firing.
+    #[test]
+    fn each_structural_impossibility_is_refused_by_name() {
+        const BASE: u64 = 0x4000;
+        let (bytes, _) = one_cie_and_one_fde(BASE);
+        let fde_at = fde_offset(&bytes);
+        let fde_vaddr = BASE + fde_at as u64;
+
+        let refusal = |edit: &dyn Fn(&mut Vec<u8>)| -> String {
+            let mut b = bytes.clone();
+            edit(&mut b);
+            format!(
+                "{}",
+                reader(&b, BASE).fde_bounds(fde_vaddr).expect_err("this must be refused")
+            )
+        };
+
+        // A zero length is `.eh_frame`'s terminator, not an FDE.
+        let e = refusal(&|b| b[fde_at..fde_at + 4].copy_from_slice(&0u32.to_le_bytes()));
+        assert!(e.contains("end of .eh_frame"), "{e}");
+
+        // 64-bit DWARF, which no AArch64 toolchain emits and which would shift every field by
+        // eight bytes -- producing addresses rather than an error.
+        let e = refusal(&|b| b[fde_at..fde_at + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()));
+        assert!(e.contains("64-bit DWARF"), "{e}");
+
+        // A zero `CIE_pointer` makes the entry a CIE.
+        let e = refusal(&|b| b[fde_at + 4..fde_at + 8].copy_from_slice(&0u32.to_le_bytes()));
+        assert!(e.contains("not an FDE"), "{e}");
+
+        // A `CIE_pointer` reaching back past the start of the section.
+        let e = refusal(&|b| {
+            b[fde_at + 4..fde_at + 8].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+        });
+        assert!(e.contains("before the start"), "{e}");
+
+        // A CIE whose id is not zero is not a CIE.
+        let e = refusal(&|b| b[4..8].copy_from_slice(&1u32.to_le_bytes()));
+        assert!(e.contains("not zero"), "{e}");
+
+        // A CIE version nothing implements.
+        let e = refusal(&|b| b[8] = 4);
+        assert!(e.contains("versions 1 and 3"), "{e}");
+
+        // An augmentation character the walker cannot step over: it would have to guess how many
+        // bytes of augmentation data it consumes, and a wrong guess finds `R` in the wrong place.
+        let e = refusal(&|b| b[10] = b'Q');
+        assert!(e.contains("augmentation"), "{e}");
+
+        // An FDE pointer encoding this module does not implement. The `R` byte is the last one
+        // before the `DW_CFA_nop` padding.
+        let e = refusal(&|b| b[padding_start(&bytes) - 1] = 0x01);
+        assert!(e.contains("not implemented"), "{e}");
+    }
+
+    /// Where the CIE's `DW_CFA_nop` padding begins: three bytes before the FDE.
+    fn padding_start(bytes: &[u8]) -> usize {
+        fde_offset(bytes) - 3
+    }
+
     #[test]
     fn function_bounds_do_not_wrap() {
         let f = FunctionBounds { start: 0x1000, len: 0x40 };
