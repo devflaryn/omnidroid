@@ -20,8 +20,9 @@
 //!   thing here that can be relied on without measurement.
 
 pub(super) use super::unix::{
-    allocation_granularity, commit, commit_placeholder, decommit, decommit_to_placeholder,
-    map_file, open_file_for_mapping, page_size, process_commit_charge, process_working_set,
-    protect, release, reserve, reserve_placeholder, split_placeholder, unmap, unmap_and_release,
-    MappableFile, MISALIGNED_OS_ERROR,
+    allocation_granularity, coalesce_placeholders, commit, commit_placeholder,
+    create_shared_section, decommit, decommit_to_placeholder, map_file, map_section,
+    open_file_for_mapping, page_size, process_commit_charge, process_working_set, protect, release,
+    reserve, reserve_placeholder, split_placeholder, unmap, unmap_and_release, MappableFile,
+    SharedSection, MISALIGNED_OS_ERROR,
 };

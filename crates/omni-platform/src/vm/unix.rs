@@ -88,6 +88,14 @@ pub(super) fn split_placeholder(_piece_base: usize, _size: usize) -> VmResult<()
     unsupported("split_placeholder")
 }
 
+/// Intended: a no-op, as [`split_placeholder`] is — `mmap(MAP_FIXED)` needs no placeholder and
+/// therefore never fragments one, so there is nothing to merge back. Returns `Unsupported` for the
+/// same reason as [`split_placeholder`]: an unimplemented backend must not have any operation that
+/// succeeds.
+pub(super) fn coalesce_placeholders(_address: usize, _size: usize) -> VmResult<()> {
+    unsupported("coalesce_placeholders")
+}
+
 /// Intended: `mprotect(ptr, size, prot)` on a `PROT_NONE` reservation.
 pub(super) fn commit(_address: usize, _size: usize, _protection: Protection) -> VmResult<()> {
     unsupported("commit")
@@ -170,6 +178,49 @@ pub(super) fn process_commit_charge() -> VmResult<u64> {
 /// Intended: `VmRSS` from `/proc/self/status` on Linux, `TASK_BASIC_INFO.resident_size` on macOS.
 pub(super) fn process_working_set() -> VmResult<u64> {
     unsupported("process_working_set")
+}
+
+/// The unix stand-in for a pagefile-backed section.
+///
+/// Unconstructible: [`create_shared_section`] never returns one.
+pub struct SharedSection {
+    /// Would hold the descriptor from `memfd_create` on Linux, or from `shm_open` where that is
+    /// unavailable. macOS has neither and needs `MAP_JIT`, which is a different design (D12).
+    fd: i32,
+    len: u64,
+}
+
+impl SharedSection {
+    pub(super) fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl Drop for SharedSection {
+    fn drop(&mut self) {
+        // SAFETY: unreachable in practice, because no SharedSection can be constructed on this
+        // platform. Written out so that an implementation does not silently leak the descriptor.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// Intended on Linux: `memfd_create` plus `ftruncate`, which needs Linux 3.17 or later and is
+/// refused an executable mapping by some hardened configurations. On macOS the dual-mapped section
+/// has no direct equivalent: `MAP_JIT` with `pthread_jit_write_protect_np` is per-*thread* state
+/// rather than a second mapping, behaves quite differently, and needs its own measurement (D12).
+pub(super) fn create_shared_section(_size: u64) -> VmResult<SharedSection> {
+    unsupported("create_shared_section")
+}
+
+/// Intended: `mmap(NULL, size, prot, MAP_SHARED, fd, offset)` — `MAP_SHARED`, not `MAP_PRIVATE`,
+/// or writes through the writable view would never reach the executable one.
+pub(super) fn map_section(
+    _section: &SharedSection,
+    _offset: u64,
+    _size: usize,
+    _protection: Protection,
+) -> VmResult<usize> {
+    unsupported("map_section")
 }
 
 /// The unix stand-in for a file opened for mapping.

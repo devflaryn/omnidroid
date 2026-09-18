@@ -24,6 +24,7 @@
 //! reserve(size, align) -> VmResult<usize>
 //! reserve_placeholder(size, align) -> VmResult<usize>
 //! split_placeholder(piece_base, size) -> VmResult<()>
+//! coalesce_placeholders(ptr, size) -> VmResult<()>
 //! commit(ptr, size, prot) -> VmResult<()>
 //! commit_placeholder(ptr, size, prot) -> VmResult<()>
 //! decommit(ptr, size) -> VmResult<()>
@@ -31,6 +32,8 @@
 //! protect(ptr, size, prot) -> VmResult<()>
 //! open_file_for_mapping(path, exec) -> VmResult<MappableFile>
 //! map_file(&MappableFile, file_offset, size, ptr, prot) -> VmResult<()>
+//! create_shared_section(size) -> VmResult<SharedSection>
+//! map_section(&SharedSection, offset, size, prot) -> VmResult<usize>
 //! unmap(ptr, size) -> VmResult<()>
 //! unmap_and_release(ptr, size) -> VmResult<()>
 //! release(base, len, kind) -> VmResult<()>
@@ -50,7 +53,12 @@
 //! `EmptyWorkingSet` all measured as returning exactly 0 bytes of commit and are therefore not
 //! exposed here as reclamation at all (Global Constraint 6).
 //!
-//! # Note for whoever builds the D12 dual-mapped code arena
+//! # The D12 dual-mapped code arena
+//!
+//! [`create_shared_section`] and [`map_section`] are the *mechanism*: a pagefile-backed section
+//! mapped twice, once [`Protection::ReadWrite`] for emission and once [`Protection::ReadExecute`]
+//! for execution, so that no page is ever both. The *policy* — how big a chunk is, how blocks are
+//! carved out of it, when a block is sealed — lives in `omni-mem`'s `CodeArena`.
 //!
 //! [`Protection::ReadWrite`] means *writable, and writes go wherever writes to that region are
 //! supposed to go*. For private memory that is the memory; for a file-backed view it is a private
@@ -461,6 +469,36 @@ pub fn split_placeholder(
     Ok(Reservation { base, len: size, kind: ReservationKind::Placeholder })
 }
 
+/// Merge a run of adjacent placeholders back into a single placeholder.
+///
+/// The inverse of [`split_placeholder`], and the operation that makes a guest address space
+/// survive contact with a guest. Splitting is one-way at the OS level: once a placeholder has been
+/// carved into pieces — by mapping a segment, or by the guest unmapping part of a range — those
+/// pieces stay separate, and replacing a placeholder needs one placeholder of exactly the target
+/// size. So a guest that unmaps two adjacent mappings and then maps one larger range across both
+/// cannot be served without this call.
+///
+/// `[ptr, ptr + size)` must contain nothing but placeholders. A range that still holds a view or
+/// private commit is rejected by the kernel with `ERROR_INVALID_PARAMETER` (87) rather than being
+/// partially merged.
+///
+/// # Errors
+///
+/// [`VmError::ZeroSize`], [`VmError::Misaligned`], or [`VmError::Os`].
+///
+/// # Safety
+///
+/// `[ptr, ptr + size)` must be a run of adjacent placeholders this process owns, and nothing may
+/// rely on their individual boundaries afterwards — after this call there is exactly one
+/// placeholder covering the whole range.
+pub unsafe fn coalesce_placeholders(ptr: *mut u8, size: usize) -> VmResult<()> {
+    const OP: &str = "coalesce_placeholders";
+    check_size(OP, size)?;
+    check_page_multiple(OP, "address", ptr as usize as u64)?;
+    check_page_multiple(OP, "size", size as u64)?;
+    backend::coalesce_placeholders(ptr as usize, size)
+}
+
 /// Commit pages inside a plain reservation, spending commit charge.
 ///
 /// Commit charge is debited **immediately, at commit, not at first touch** — 1024 MB committed
@@ -696,6 +734,129 @@ pub unsafe fn map_file(
     backend::map_file(&file.0, file_offset, size, ptr as usize, protection)
 }
 
+/// A pagefile-backed section that can be mapped more than once, for the D12 code arena.
+///
+/// Anonymous shared memory with no file behind it. The only thing to do with one is pass it to
+/// [`map_section`], twice: once [`Protection::ReadWrite`] and once [`Protection::ReadExecute`]. The
+/// two views are two sets of page-table entries over the *same* physical pages, so a write through
+/// the first is visible through the second immediately and with no instruction-cache flush on
+/// x86-64 — measured at 162 ns per emit-and-execute cycle against 2259 ns for flipping one mapping
+/// with `VirtualProtect`, across 200,000 trials with 0 mismatches (D12).
+///
+/// Dropping it closes the section handle but does **not** unmap views already made from it; the
+/// kernel keeps the section alive until the last view goes. Views are given back with
+/// [`unmap_and_release`].
+pub struct SharedSection(backend::SharedSection);
+
+impl SharedSection {
+    /// The section's size in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    /// Whether the section is empty. Always false: a zero-length section cannot be created.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+}
+
+impl fmt::Debug for SharedSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedSection").field("len", &self.len()).finish()
+    }
+}
+
+/// Create a pagefile-backed section whose views may be writable *or* executable.
+///
+/// The section is created with a maximum protection that allows both, because a section's
+/// protection caps every view's protection for the life of the mapping (D11) and the arena needs
+/// one writable view and one executable view. That is a property of the *section*, which is a
+/// capability rather than a mapping: no page is ever both, and [`Protection`] has no variant that
+/// could ask for one.
+///
+/// # Cost
+///
+/// A pagefile-backed section is committed at creation, not on first touch, so `size` is charged
+/// against the system commit limit immediately — the same asymmetry [`commit`] has (D10). Create
+/// sections in modest chunks as the arena fills rather than one large one up front.
+///
+/// # Errors
+///
+/// [`VmError::ZeroSize`] or [`VmError::SectionCreate`].
+pub fn create_shared_section(size: u64) -> VmResult<SharedSection> {
+    if size == 0 {
+        return Err(VmError::ZeroSize { operation: "create_shared_section" });
+    }
+    backend::create_shared_section(size).map(SharedSection)
+}
+
+/// Map a view of a section at an address the OS chooses.
+///
+/// `offset` must be a multiple of [`allocation_granularity`], not of [`page_size`]: this is the
+/// `BaseAddress = NULL` path, which measured only 4 successes in 64 at consecutive 4 KB offsets
+/// against 512 in 512 for the placeholder path (D11). The arena maps whole sections from offset 0,
+/// so the restriction never binds in practice.
+///
+/// [`Protection::ReadWrite`] gives a genuinely *shared* writable view — `PAGE_READWRITE`, not
+/// `PAGE_WRITECOPY`. That distinction is the whole point: a copy-on-write view would privatise
+/// every write, the emitter would see its own stores, and the executable view would never change.
+///
+/// Give the view back with [`unmap_and_release`], passing the size it was mapped with.
+///
+/// # Errors
+///
+/// [`VmError::ZeroSize`], [`VmError::Misaligned`], [`VmError::UnsupportedViewProtection`] for
+/// [`Protection::None`], [`VmError::ViewPastEndOfFile`] if the view runs past the end of the
+/// section, [`VmError::MissingSymbol`], or [`VmError::Os`].
+///
+/// # Safety
+///
+/// The returned address is a live mapping of `size` bytes that the caller becomes responsible for
+/// unmapping. Nothing else in the process may map over it.
+pub unsafe fn map_section(
+    section: &SharedSection,
+    offset: u64,
+    size: usize,
+    protection: Protection,
+) -> VmResult<*mut u8> {
+    const OP: &str = "map_section";
+    check_size(OP, size)?;
+    check_page_multiple(OP, "size", size as u64)?;
+
+    let granularity = allocation_granularity() as u64;
+    if offset % granularity != 0 {
+        return Err(VmError::Misaligned {
+            operation: OP,
+            what: "section offset",
+            value: offset,
+            required: granularity,
+            os_equivalent: OsError(backend::MISALIGNED_OS_ERROR),
+        });
+    }
+    if protection == Protection::None {
+        return Err(VmError::UnsupportedViewProtection {
+            operation: OP,
+            protection,
+            path: "<pagefile>".to_string(),
+            reason: "a view cannot be created with no access; map it Protection::Read and then \
+                     protect() the pages down to Protection::None",
+        });
+    }
+    let end = offset.saturating_add(size as u64);
+    if end > section.len() {
+        return Err(VmError::ViewPastEndOfFile {
+            path: "<pagefile>".to_string(),
+            file_offset: offset,
+            size,
+            end,
+            len: section.len(),
+        });
+    }
+    backend::map_section(&section.0, offset, size, protection).map(|address| address as *mut u8)
+}
+
 /// Unmap a file-backed view, leaving the address range as a placeholder.
 ///
 /// The range goes back to being an unreplaced placeholder, so a later [`map_file`] or
@@ -726,11 +887,15 @@ pub unsafe fn unmap(ptr: *mut u8, size: usize) -> VmResult<()> {
     backend::unmap(ptr as usize, size)
 }
 
-/// Unmap a file-backed view and give the address range back to the OS.
+/// Unmap a view and give the address range back to the OS.
 ///
 /// The counterpart of [`unmap`] for teardown: after this the range is free and another
 /// reservation may be placed there, so it must not be used for a guest `munmap` of a range the
 /// guest address space still claims to own.
+///
+/// This is also how a [`map_section`] view is released: such a view is not a placeholder
+/// replacement, so there is no placeholder to preserve and [`unmap`] would have nothing to leave
+/// behind.
 ///
 /// # Errors
 ///

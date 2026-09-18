@@ -52,6 +52,14 @@ pub(super) const MISALIGNED_OS_ERROR: u32 = 1132; // ERROR_MAPPED_ALIGNMENT
 
 const ERROR_INVALID_ADDRESS: u32 = 487;
 
+/// `MEM_COALESCE_PLACEHOLDERS`, declared here because `windows-sys` 0.61 does not export it.
+///
+/// The value is from `memoryapi.h`. It is passed to `VirtualFree` together with `MEM_RELEASE` and
+/// merges a run of adjacent placeholders back into one, which is the inverse of
+/// [`split_placeholder`] and the only way to satisfy a mapping that spans two ranges the guest
+/// freed separately.
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
+
 // -------------------------------------------------------------------------------------------
 // Dynamic symbols from kernelbase.dll
 // -------------------------------------------------------------------------------------------
@@ -568,6 +576,24 @@ pub(super) fn decommit(address: usize, size: usize) -> VmResult<()> {
     Ok(())
 }
 
+pub(super) fn coalesce_placeholders(address: usize, size: usize) -> VmResult<()> {
+    // SAFETY: MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS frees no address space. It merges the
+    // adjacent placeholders covering `[address, address + size)` into a single placeholder, and is
+    // rejected by the kernel if the range contains anything that is not a placeholder. Nothing is
+    // dereferenced.
+    let ok = unsafe {
+        VirtualFree(
+            address as *mut c_void,
+            size,
+            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+        )
+    };
+    if ok == 0 {
+        return Err(os("coalesce_placeholders", address, size));
+    }
+    Ok(())
+}
+
 pub(super) fn decommit_to_placeholder(address: usize, size: usize) -> VmResult<()> {
     // SAFETY: as `split_placeholder`: MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER returns the range to
     // placeholder state and keeps the address space owned by this process.
@@ -898,6 +924,118 @@ pub(super) fn map_file(
         "MapViewOfFile3 into a placeholder must return the requested base"
     );
     Ok(())
+}
+
+// -------------------------------------------------------------------------------------------
+// Pagefile-backed sections, for the D12 dual-mapped code arena
+// -------------------------------------------------------------------------------------------
+
+/// A pagefile-backed section that can be mapped more than once.
+///
+/// Created `PAGE_EXECUTE_READWRITE`, which is the *section's* maximum protection and not any
+/// page's protection: it is what allows one view to be `PAGE_READWRITE` and another
+/// `PAGE_EXECUTE_READ`. No view this module can produce is ever both, because [`Protection`] has
+/// no writable-and-executable variant.
+pub struct SharedSection {
+    section: HANDLE,
+    len: u64,
+}
+
+// SAFETY: a Win32 HANDLE is process-wide, not thread-owned, and every API this type passes it to
+// is callable from any thread. Both fields are immutable after construction.
+unsafe impl Send for SharedSection {}
+// SAFETY: as above.
+unsafe impl Sync for SharedSection {}
+
+impl SharedSection {
+    pub(super) fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl Drop for SharedSection {
+    fn drop(&mut self) {
+        // SAFETY: the handle was created by `create_shared_section` and is closed exactly once,
+        // here. Closing it does not invalidate views already mapped from it: the kernel keeps the
+        // section alive until the last view is unmapped.
+        unsafe { CloseHandle(self.section) };
+    }
+}
+
+pub(super) fn create_shared_section(size: u64) -> VmResult<SharedSection> {
+    let high = (size >> 32) as u32;
+    let low = (size & 0xFFFF_FFFF) as u32;
+
+    // SAFETY: INVALID_HANDLE_VALUE as the file handle asks for a pagefile-backed section, which is
+    // the documented way to get anonymous shared memory. A NULL security descriptor and name are
+    // the documented defaults, and the maximum size is given explicitly because there is no file
+    // to take it from.
+    let section = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_EXECUTE_READWRITE,
+            high,
+            low,
+            std::ptr::null(),
+        )
+    };
+    if section.is_null() {
+        return Err(VmError::SectionCreate {
+            path: "<pagefile>".to_string(),
+            len: size,
+            section_protection: "PAGE_EXECUTE_READWRITE",
+            source: OsError(last_error()),
+        });
+    }
+    Ok(SharedSection { section, len: size })
+}
+
+pub(super) fn map_section(
+    section: &SharedSection,
+    offset: u64,
+    size: usize,
+    protection: Protection,
+) -> VmResult<usize> {
+    let map3 = map_view_of_file3()?;
+    // The view is *shared*, so `Protection::ReadWrite` must become `PAGE_READWRITE` and never
+    // `PAGE_WRITECOPY`: copy-on-write would privatise every write and nothing would ever reach the
+    // paired executable view. That is the same decision `resolved_protection` makes for an
+    // existing shared view, restated here for the moment of creation, where there is no
+    // `AllocationProtect` to read back yet.
+    let flags = private_protection(protection);
+
+    // SAFETY: `map3` is the resolved `MapViewOfFile3`, called with its documented signature and no
+    // extended parameters. `section.section` is a live section object; a NULL base asks the OS to
+    // choose the address, and an allocation type of 0 asks for an ordinary view rather than a
+    // placeholder replacement. The return value is checked before anything is read through it.
+    let view = unsafe {
+        map3(
+            section.section,
+            GetCurrentProcess(),
+            std::ptr::null(),
+            offset,
+            size,
+            0,
+            flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if view.is_null() {
+        let code = last_error();
+        return Err(match code {
+            MISALIGNED_OS_ERROR => VmError::Misaligned {
+                operation: "map_section",
+                what: "section offset",
+                value: offset,
+                required: allocation_granularity() as u64,
+                os_equivalent: OsError(code),
+            },
+            _ => VmError::Os { operation: "map_section", address: 0, size, source: OsError(code) },
+        });
+    }
+    Ok(view as usize)
 }
 
 /// Closes a handle unless ownership is taken out of it. Keeps the error paths of
