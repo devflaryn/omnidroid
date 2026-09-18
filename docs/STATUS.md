@@ -79,7 +79,7 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-platform` dual-mapped sections + placeholder coalescing | **Pending review** |
 | `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
 | `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
-| `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 83 tests. One closing doc-accuracy pass outstanding |
+| `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
 | `omni-mem` — guest address space + JIT arena | **Pending review.** 42 new tests |
 | `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
