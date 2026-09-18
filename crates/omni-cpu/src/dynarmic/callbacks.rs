@@ -27,7 +27,7 @@ use dynarmic_sys::{exception, OdCallbacks};
 use omni_mem::{GuestAddr, Protection};
 
 use crate::dynarmic::{
-    stop, with, CpuCtx, PendingExit, BREAKPOINT_BRK, HALT_EXIT, STOP_SVC,
+    stop, with, CpuCtx, InlineThunkCall, PendingExit, BREAKPOINT_BRK, HALT_EXIT, STOP_SVC,
 };
 use crate::exit::AccessKind;
 
@@ -111,7 +111,10 @@ unsafe extern "C" fn cb_read_code(ctx: *mut c_void, vaddr: u64, out: *mut u32) -
             // Order matters. The sentinel and thunks are addresses Omnidroid planted, so they win
             // over whatever the guest has there; a breakpoint is a debugging overlay on a real
             // instruction, so it comes next; and only then is guest memory read.
-            if c.sentinel == Some(address) || c.thunks.contains(&address) {
+            if c.sentinel == Some(address)
+                || c.thunks.contains(&address)
+                || c.inline_thunks.contains_key(&address)
+            {
                 *out = STOP_SVC;
                 return 1;
             }
@@ -319,6 +322,19 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
             // guest code may execute any `SVC` it likes, and only Omnidroid can have registered an
             // address.
             let site = (dynarmic_sys::od_jit_get_pc(c.jit) as GuestAddr).wrapping_sub(4);
+            // Serviced here and resumed here: no halt is raised, so `CheckHalt` falls through into
+            // `PopRSBHint`, which with `ReturnStackBuffer` cleared is the emitted dispatcher loop
+            // and not a return to the caller. See `DynarmicCpu::add_inline_thunk`.
+            if let Some(handler) = c.inline_thunks.get(&site).copied() {
+                c.inline_calls += 1;
+                let mut call = InlineThunkCall::new(c.jit);
+                handler(&mut call);
+                // A `BL` into the thunk region left the return address in `X30`. Writing `PC` is
+                // what the dispatcher reads on its way to the next block.
+                let resume = dynarmic_sys::od_jit_get_reg(c.jit, 30);
+                dynarmic_sys::od_jit_set_pc(c.jit, resume);
+                return;
+            }
             let exit = if c.sentinel == Some(site) {
                 PendingExit::Returned { pc: site }
             } else if c.thunks.contains(&site) {

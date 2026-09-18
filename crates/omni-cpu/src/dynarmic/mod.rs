@@ -37,7 +37,7 @@
 //! The watchdog is therefore a short budget expiring, checked in Rust between slices.
 
 use std::cell::UnsafeCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -578,6 +578,42 @@ pub(crate) enum PendingExit {
     Breakpoint { pc: GuestAddr },
 }
 
+/// A host function servicing a guest call from **inside** generated code.
+///
+/// See [`DynarmicCpu::add_inline_thunk`]. A bare `fn` rather than a boxed closure deliberately: the
+/// question this exists to answer is what the boundary costs, and a boxed closure would add an
+/// indirection to the thing being measured.
+pub type InlineThunkFn = fn(&mut InlineThunkCall<'_>);
+
+/// The guest register file, as an [`InlineThunkFn`] sees it while the guest is suspended mid-block.
+///
+/// Reads and writes go straight to `JitState`, which is where the A64 emitter keeps guest registers
+/// at every callback boundary, so a write here is what the resumed guest sees.
+pub struct InlineThunkCall<'a> {
+    jit: *mut c_void,
+    _borrow: core::marker::PhantomData<&'a mut ()>,
+}
+
+impl InlineThunkCall<'_> {
+    pub(crate) fn new(jit: *mut c_void) -> Self {
+        Self { jit, _borrow: core::marker::PhantomData }
+    }
+
+    /// Read `X{index}`. An index above 30 reads zero, which the shim enforces.
+    #[must_use]
+    pub fn x(&self, index: u32) -> u64 {
+        // SAFETY: the jit is live -- this runs inside one of its own callbacks -- and the shim
+        // bounds-checks the index.
+        unsafe { od_jit_get_reg(self.jit, index) }
+    }
+
+    /// Write `X{index}`. An index above 30 is ignored.
+    pub fn set_x(&mut self, index: u32, value: u64) {
+        // SAFETY: as `x`.
+        unsafe { od_jit_set_reg(self.jit, index, value) }
+    }
+}
+
 /// Host state reachable from generated guest code.
 ///
 /// A separate allocation from [`DynarmicCpu`] on purpose: see the module docs on re-entrancy.
@@ -605,6 +641,11 @@ pub(crate) struct CpuCtx {
     pub(crate) executable_cache: Option<(GuestAddr, GuestAddr, bool)>,
 
     pub(crate) thunks: BTreeSet<GuestAddr>,
+    /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
+    /// [`DynarmicCpu::add_inline_thunk`].
+    pub(crate) inline_thunks: BTreeMap<GuestAddr, InlineThunkFn>,
+    /// How many inline thunks have been serviced, so a measurement can prove the path ran.
+    pub(crate) inline_calls: u64,
     pub(crate) breakpoints: BTreeSet<GuestAddr>,
     /// The sentinel return address planted in `X30`, if one is armed.
     pub(crate) sentinel: Option<GuestAddr>,
@@ -714,6 +755,8 @@ impl DynarmicCpu {
             jit: core::ptr::null_mut(),
             executable_cache: None,
             thunks: BTreeSet::new(),
+            inline_thunks: BTreeMap::new(),
+            inline_calls: 0,
             breakpoints: BTreeSet::new(),
             sentinel: None,
             suppressed_breakpoint: None,
@@ -917,6 +960,64 @@ impl DynarmicCpu {
     pub fn set_return_sentinel(&mut self, address: GuestAddr) -> CpuResult<()> {
         self.with_ctx(|ctx| ctx.sentinel = Some(address));
         self.invalidate_word(address)
+    }
+
+    /// Service a thunk at `address` **inside** the run loop, with `handler`, instead of returning
+    /// [`ExitReason::Thunk`] to the caller.
+    ///
+    /// # What this is for
+    ///
+    /// M3 task 1 had to decide between two shapes for the imported-symbol boundary -- exit to Rust
+    /// per call, or dispatch without leaving the backend -- and the project rule is that a shape is
+    /// measured before it is built. This is the second shape, reduced to the smallest thing that can
+    /// be timed against the first. It is a **measurement probe**: the real boundary, with AAPCS64
+    /// marshalling, a symbol table and the host-to-guest direction, belongs to tasks 2 and 3.
+    ///
+    /// # Why the backend permits it at all
+    ///
+    /// Because a thunk is a planted `SVC` ([`STOP_SVC`]) and `SVC`'s terminal in dynarmic's A64
+    /// frontend is `CheckHalt{PopRSBHint}`. A callback that does **not** raise a halt falls through
+    /// `CheckHalt` into `PopRSBHint`, which with `ReturnStackBuffer` cleared --
+    /// `optimization::INTERRUPTIBLE`, which this backend sets by default (D16) -- emits
+    /// `ReturnFromRunCode`. And `ReturnFromRunCode` is **not** a return to the caller: it is the top
+    /// of the emitted dispatcher loop (`block_of_code.cpp`, `GenRunCode`), which re-reads
+    /// `halt_reason` and `cycles_remaining`, calls `LookupBlock` and jumps straight to the next
+    /// block. So writing the guest `PC` from inside the callback and returning quietly resumes the
+    /// guest without unwinding the generated frame, without the `AddTicks`/`GetTicksRemaining`
+    /// callbacks, without the `lock xchg` on `halt_reason`, and without re-entering `Jit::Run`.
+    ///
+    /// Guest registers are coherent in `JitState` at every callback -- the A64 emitter stores each
+    /// guest register write straight to memory -- so the handler reads and writes them through
+    /// [`InlineThunkCall`] and the resumed guest sees them.
+    ///
+    /// The guest resumes at `X30`, which is what a `BL` into the thunk region leaves there.
+    ///
+    /// # Errors
+    ///
+    /// [`CpuError::Backend`] if the translation covering `address` could not be dropped.
+    pub fn add_inline_thunk(&mut self, address: GuestAddr, handler: InlineThunkFn) -> CpuResult<()> {
+        self.with_ctx(|ctx| ctx.inline_thunks.insert(address, handler));
+        self.invalidate_word(address)
+    }
+
+    /// Stop servicing `address` inline. Returns whether it was.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_inline_thunk`](Self::add_inline_thunk).
+    pub fn remove_inline_thunk(&mut self, address: GuestAddr) -> CpuResult<bool> {
+        let had = self.with_ctx(|ctx| ctx.inline_thunks.remove(&address).is_some());
+        self.invalidate_word(address)?;
+        Ok(had)
+    }
+
+    /// How many inline thunks this context has serviced.
+    ///
+    /// Exists so a measurement can show the path really ran, rather than timing a loop that silently
+    /// took the ordinary exit (Global Constraint 13).
+    #[must_use]
+    pub fn inline_calls(&self) -> u64 {
+        self.with_ctx(|ctx| ctx.inline_calls)
     }
 
     /// Read `TPIDRRO_EL0`, the read-only alias of the thread pointer.
