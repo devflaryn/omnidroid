@@ -632,16 +632,38 @@ fn the_relocation_count_limit_has_two_orders_of_magnitude_of_headroom() {
     let Some(bytes) = common::main_lib() else { return };
     let elf = image(bytes);
 
-    // The ceiling is derived from the object's own loadable size, so it is worth pinning both
-    // the derivation and the margin: if a future library ever came close to its own cap, this
+    // The ceiling is derived from the object's own *validated* image, so it is worth pinning the
+    // derivation as well as the margin: if a future library ever came close to its own cap, this
     // number would shrink long before anything was rejected.
-    assert_eq!(elf.loadable_size(), 120_767_564, "sum of PT_LOAD p_memsz");
+    let img = elf.load_image();
+    assert_eq!(img.base_vaddr, 0);
+    assert_eq!(img.end_vaddr, 0x0733_3c3c);
+    assert_eq!(img.span, 0x0733_3c3c, "image span");
+    assert_eq!(
+        img.mapped_bytes, 120_767_564,
+        "measure of the union of the PT_LOAD memory ranges"
+    );
+    assert_eq!(img.segment_count, 3);
+    assert_eq!(img.max_align, 0x4000);
+    // The three segments do not overlap, so the union happens to equal the sum. It is still
+    // computed as a union, because an overlap would otherwise inflate the figure the bound rests
+    // on — and inflating it is the unsafe direction.
+    assert_eq!(
+        elf.load_segments().map(|s| s.p_memsz).sum::<u64>(),
+        img.mapped_bytes
+    );
+    assert!(
+        img.mapped_bytes <= img.span,
+        "mapped bytes can never exceed the span"
+    );
+    assert_eq!(elf.loadable_size(), img.mapped_bytes);
+
     let limits = elf.aps2_limits();
     assert_eq!(limits.max_relocations, 60_383_782);
-    assert_eq!(
-        limits,
-        omni_elf::Aps2Limits::for_loadable_size(elf.loadable_size())
-    );
+    assert_eq!(limits.image_span, 0x0733_3c3c);
+    assert_eq!(limits, omni_elf::Aps2Limits::for_image(img));
+    // For this object the derived figure binds, not the flat ceiling.
+    assert!(limits.max_relocations < omni_elf::Aps2Limits::MAX_RELOCATIONS);
     let headroom = limits.max_relocations / GRAND_TOTAL as u64;
     assert!(
         headroom >= 100,
@@ -710,4 +732,194 @@ fn a_tampered_declared_count_is_refused_through_elfimage_rather_than_hanging() {
         elapsed < std::time::Duration::from_secs(1),
         "refusing a tampered count took {elapsed:?}"
     );
+}
+
+/// File offset of the first `PT_LOAD` program header in the real file, for the tamper tests below.
+fn first_load_phdr_offset(bytes: &[u8]) -> usize {
+    let elf = image(bytes);
+    let phoff = usize::try_from(elf.header().e_phoff).unwrap();
+    for i in 0..elf.header().e_phnum as usize {
+        let at = phoff + i * SIZEOF_PHDR;
+        if u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) == PT_LOAD {
+            return at;
+        }
+    }
+    panic!("libroblox.so has a PT_LOAD");
+}
+
+/// Same, but for a `PT_LOAD` whose `p_vaddr` is non-zero, so that adding to `p_memsz` can overflow.
+fn load_phdr_offset_with_nonzero_vaddr(bytes: &[u8]) -> usize {
+    let elf = image(bytes);
+    let phoff = usize::try_from(elf.header().e_phoff).unwrap();
+    for i in 0..elf.header().e_phnum as usize {
+        let at = phoff + i * SIZEOF_PHDR;
+        let is_load = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) == PT_LOAD;
+        let vaddr = u64::from_le_bytes(bytes[at + 16..at + 24].try_into().unwrap());
+        if is_load && vaddr != 0 {
+            return at;
+        }
+    }
+    panic!("libroblox.so has a PT_LOAD at a non-zero vaddr");
+}
+
+#[test]
+fn a_forged_p_memsz_cannot_buy_a_larger_relocation_budget() {
+    let Some(bytes) = common::main_lib() else { return };
+    let at = first_load_phdr_offset(bytes);
+
+    // The eight-byte attack: p_memsz = u64::MAX on one PT_LOAD. Before PT_LOAD validation this
+    // raised the derived cap to 2^63-1, and the count check then waved a 2^62 declaration through.
+    //
+    // On the *first* PT_LOAD, whose p_vaddr is 0, `0 + u64::MAX` does not overflow, so it is the
+    // span ceiling that catches it rather than the overflow check. Both are refusals naming the
+    // value, and the two are asserted separately below so neither is assumed to cover the other.
+    let mut mutated = bytes.to_vec();
+    mutated[at + 40..at + 48].copy_from_slice(&u64::MAX.to_le_bytes());
+    let err = ElfImage::parse(&mutated).expect_err("a p_memsz of u64::MAX must be refused");
+    assert!(
+        matches!(
+            err,
+            omni_elf::ElfError::ImageSpanTooLarge {
+                span: u64::MAX,
+                limit: omni_elf::MAX_IMAGE_SPAN
+            }
+        ),
+        "expected ImageSpanTooLarge, got {err}"
+    );
+
+    // And on a PT_LOAD with a non-zero p_vaddr the same value overflows the address space, which
+    // must be an error rather than a saturated (i.e. larger) figure.
+    let mut mutated = bytes.to_vec();
+    let at_nonzero = load_phdr_offset_with_nonzero_vaddr(bytes);
+    mutated[at_nonzero + 40..at_nonzero + 48].copy_from_slice(&u64::MAX.to_le_bytes());
+    let err = ElfImage::parse(&mutated).expect_err("an overflowing p_memsz must be refused");
+    assert!(
+        matches!(
+            err,
+            omni_elf::ElfError::SegmentMemRangeOverflow {
+                memsz: u64::MAX,
+                ..
+            }
+        ),
+        "expected SegmentMemRangeOverflow, got {err}"
+    );
+
+    // And a *plausible* lie, which overflows nothing and contradicts no other header field: 1 TiB.
+    // This is the case a pure overflow check would miss, which is why there is a span ceiling too.
+    let mut mutated = bytes.to_vec();
+    mutated[at + 40..at + 48].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    let err = ElfImage::parse(&mutated).expect_err("a 1 TiB p_memsz must be refused");
+    assert!(
+        matches!(
+            err,
+            omni_elf::ElfError::ImageSpanTooLarge {
+                limit: omni_elf::MAX_IMAGE_SPAN,
+                ..
+            }
+        ),
+        "expected ImageSpanTooLarge, got {err}"
+    );
+
+    // A p_memsz that is merely larger but still under the span ceiling is accepted, and the cap
+    // then rises only as far as the flat ceiling allows. This is the honest boundary of the
+    // defence, asserted rather than hidden: header validation removes the absurd values, the span
+    // ceiling bounds the plausible ones, and the flat relocation ceiling bounds what is left.
+    let mut mutated = bytes.to_vec();
+    mutated[at + 40..at + 48].copy_from_slice(&(3u64 << 30).to_le_bytes()); // 3 GiB
+    let widened = ElfImage::parse(&mutated).expect("3 GiB is under the span ceiling");
+    // Exactly 3 GiB, not 3 GiB plus the other two segments: widening the first PT_LOAD swallowed
+    // them, and the union counts the overlap once. A naive sum would have reported 3 GiB + 17 MB,
+    // which is the double-counting that would inflate the bound.
+    assert_eq!(widened.load_image().mapped_bytes, 3 << 30);
+    assert_eq!(widened.load_image().span, 3 << 30);
+    assert!(
+        widened.load_segments().map(|s| s.p_memsz).sum::<u64>() > widened.load_image().mapped_bytes,
+        "the sum over-counts here, which is why mapped_bytes is a union"
+    );
+    assert_eq!(
+        widened.aps2_limits().max_relocations,
+        omni_elf::Aps2Limits::MAX_RELOCATIONS,
+        "the flat ceiling, not the forged image, is what binds now"
+    );
+    assert_eq!(omni_elf::Aps2Limits::MAX_RELOCATIONS, 67_108_864);
+
+    // With the forged-but-accepted image, a 2^62 declaration is still refused — by the ceiling
+    // rather than by the derived figure, which is the point of having both.
+    let table = widened.dynamic().android_rela.expect("DT_ANDROID_RELA");
+    let blob_at = widened.vaddr_to_offset(table.vaddr).expect("blob offset");
+    let mut header = Vec::from(*b"APS2");
+    omni_elf::aps2::encode_sleb128(1 << 62, &mut header);
+    let mut both = mutated.clone();
+    both[blob_at..blob_at + header.len()].copy_from_slice(&header);
+    let tampered = ElfImage::parse(&both).expect("only headers and the blob were touched");
+    let mut produced = 0u64;
+    let err = tampered
+        .decode_packed_with(|_| {
+            produced += 1;
+            Ok(())
+        })
+        .expect_err("2^62 must be refused even with an inflated image");
+    assert_eq!(
+        err,
+        omni_elf::ElfError::Aps2CountExceedsLimit {
+            declared: 1 << 62,
+            limit: 67_108_864,
+        }
+    );
+    assert_eq!(produced, 0);
+}
+
+#[test]
+fn other_forged_pt_load_fields_are_refused_on_the_real_file() {
+    let Some(bytes) = common::main_lib() else { return };
+    let at = first_load_phdr_offset(bytes);
+
+    // p_filesz running past the end of the file.
+    let mut mutated = bytes.to_vec();
+    mutated[at + 32..at + 40].copy_from_slice(&(bytes.len() as u64 + 1).to_le_bytes());
+    let err = ElfImage::parse(&mutated).expect_err("a p_filesz past EOF must be refused");
+    assert!(
+        matches!(err, omni_elf::ElfError::SegmentOutsideFile { .. }),
+        "got {err}"
+    );
+
+    // p_filesz greater than p_memsz.
+    let mut mutated = bytes.to_vec();
+    let memsz = u64::from_le_bytes(mutated[at + 40..at + 48].try_into().unwrap());
+    mutated[at + 32..at + 40].copy_from_slice(&(memsz + 8).to_le_bytes());
+    let err = ElfImage::parse(&mutated).expect_err("p_filesz > p_memsz must be refused");
+    assert!(
+        matches!(
+            err,
+            omni_elf::ElfError::SegmentFileSizeExceedsMemSize { .. }
+                | omni_elf::ElfError::SegmentOutsideFile { .. }
+        ),
+        "got {err}"
+    );
+
+    // p_vaddr moved off its alignment congruence with p_offset.
+    let mut mutated = bytes.to_vec();
+    let vaddr = u64::from_le_bytes(mutated[at + 16..at + 24].try_into().unwrap());
+    mutated[at + 16..at + 24].copy_from_slice(&(vaddr + 1).to_le_bytes());
+    let err = ElfImage::parse(&mutated).expect_err("a non-congruent p_vaddr must be refused");
+    assert!(
+        matches!(err, omni_elf::ElfError::SegmentAlignMismatch { .. }),
+        "got {err}"
+    );
+
+    // A p_align that is not a power of two.
+    let mut mutated = bytes.to_vec();
+    mutated[at + 48..at + 56].copy_from_slice(&3u64.to_le_bytes());
+    let err = ElfImage::parse(&mutated).expect_err("a non-power-of-two p_align must be refused");
+    assert!(
+        matches!(
+            err,
+            omni_elf::ElfError::SegmentAlignNotPowerOfTwo { align: 3, .. }
+        ),
+        "got {err}"
+    );
+
+    // The untampered file still parses, so each rejection above was about the mutation rather than
+    // about something incidental to the validator.
+    assert!(ElfImage::parse(bytes).is_ok());
 }

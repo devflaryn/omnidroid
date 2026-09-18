@@ -24,7 +24,7 @@ fn rela(offset: u64, sym: u32, ty: u32, addend: i64) -> Rela {
 /// A ceiling far above anything these hand-built blobs declare, so the limit never masks the
 /// behaviour under test. The limit itself is tested separately, and against the real binary.
 fn generous() -> Aps2Limits {
-    Aps2Limits::new(1_000_000)
+    Aps2Limits::new(1_000_000, u64::MAX)
 }
 
 fn sample() -> Vec<Rela> {
@@ -98,6 +98,9 @@ fn truncation_at_every_length_is_an_error_and_never_a_panic() {
                     | ElfError::Aps2BadMagic(_)
                     | ElfError::Aps2CountMismatch { .. }
                     | ElfError::Aps2GroupOverrun { .. }
+                    // Layer 1 often notices the truncation from the group header alone, before
+                    // the SLEB128 reader runs out. That is a better error, not a worse one.
+                    | ElfError::Aps2GroupLargerThanStream { .. }
             ),
             "prefix of length {cut} gave an unexpected error: {err}"
         );
@@ -444,6 +447,28 @@ fn minimal_header(class: u8, data: u8, e_type: u16, machine: u16) -> Vec<u8> {
     v
 }
 
+/// A valid AArch64 `ET_DYN` header with exactly one `PT_LOAD` covering the whole file, and no
+/// `PT_DYNAMIC`. Used to reach gates that sit after `PT_LOAD` validation.
+fn one_load_segment_object() -> Vec<u8> {
+    const PHOFF: usize = SIZEOF_EHDR;
+    let len = PHOFF + SIZEOF_PHDR;
+    let mut v = minimal_header(ELFCLASS64, ELFDATA2LSB, ET_DYN, EM_AARCH64);
+    v.resize(len, 0);
+    v[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes()); // e_phoff
+    v[54..56].copy_from_slice(&(SIZEOF_PHDR as u16).to_le_bytes()); // e_phentsize
+    v[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    let p = PHOFF;
+    v[p..p + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+    v[p + 4..p + 8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+    v[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+    v[p + 16..p + 24].copy_from_slice(&0u64.to_le_bytes()); // p_vaddr
+    v[p + 24..p + 32].copy_from_slice(&0u64.to_le_bytes()); // p_paddr
+    v[p + 32..p + 40].copy_from_slice(&(len as u64).to_le_bytes()); // p_filesz
+    v[p + 40..p + 48].copy_from_slice(&(len as u64).to_le_bytes()); // p_memsz
+    v[p + 48..p + 56].copy_from_slice(&1u64.to_le_bytes()); // p_align
+    v
+}
+
 #[test]
 fn header_validation_names_the_offending_value() {
     use omni_elf::ElfImage;
@@ -478,9 +503,16 @@ fn header_validation_names_the_offending_value() {
         ElfImage::parse(&minimal_header(ELFCLASS64, ELFDATA2LSB, ET_DYN, 40)).unwrap_err(),
         ElfError::UnsupportedMachine(40)
     );
-    // A valid header with no program headers has no PT_DYNAMIC.
+    // A valid header with no program headers has no loadable image. PT_LOAD validation runs
+    // before the dynamic section is read, deliberately: everything downstream derives bounds from
+    // the segments, so they are checked first.
     assert_eq!(
         ElfImage::parse(&minimal_header(ELFCLASS64, ELFDATA2LSB, ET_DYN, EM_AARCH64)).unwrap_err(),
+        ElfError::NoLoadSegments
+    );
+    // With a valid PT_LOAD but no PT_DYNAMIC, the next gate fires instead.
+    assert_eq!(
+        ElfImage::parse(&one_load_segment_object()).unwrap_err(),
         ElfError::NoDynamicSegment
     );
     // A bad e_ident[EI_VERSION].
@@ -543,8 +575,7 @@ fn a_tiny_blob_declaring_an_astronomical_count_is_refused_immediately() {
         blob.len()
     );
 
-    let limits = Aps2Limits::for_loadable_size(120_767_564); // libroblox.so's own loadable size
-    assert_eq!(limits.max_relocations, 60_383_782);
+    let limits = Aps2Limits::new(60_383_782, 120_798_268); // libroblox.so's own validated image
 
     // Streaming: rejected before the sink is called even once, and in negligible time.
     let mut produced = 0u64;
@@ -600,7 +631,7 @@ fn the_limit_does_not_reject_the_legitimate_zero_cost_encoding() {
     let count = 250_000i64;
     let blob = zero_cost_blob(count);
     assert!(blob.len() < 40);
-    let decoded = aps2::decode_rela(&blob, Aps2Limits::new(1_000_000)).unwrap();
+    let decoded = aps2::decode_rela(&blob, Aps2Limits::new(1_000_000, u64::MAX)).unwrap();
     assert_eq!(decoded.relocations.len() as i64, count);
     assert_eq!(decoded.summary.decoded_count as i64, count);
     assert_eq!(decoded.summary.bytes_consumed, blob.len());
@@ -614,7 +645,7 @@ fn the_limit_does_not_reject_the_legitimate_zero_cost_encoding() {
         rela(0x1000 + 8 * count as u64, 0, R_AARCH64_RELATIVE, 0)
     );
     // Exactly at the limit is accepted; the boundary is inclusive.
-    assert!(aps2::decode_rela(&blob, Aps2Limits::new(count as u64)).is_ok());
+    assert!(aps2::decode_rela(&blob, Aps2Limits::new(count as u64, u64::MAX)).is_ok());
 }
 
 #[test]
@@ -623,7 +654,7 @@ fn a_sink_error_stops_the_decode() {
     // what will let the applying loader reject a relocation target without decoding the rest.
     let blob = zero_cost_blob(100_000);
     let mut produced = 0u64;
-    let err = aps2::decode_with(&blob, PackedFormat::Rela, Aps2Limits::new(1_000_000), |_| {
+    let err = aps2::decode_with(&blob, PackedFormat::Rela, Aps2Limits::new(1_000_000, u64::MAX), |_| {
         produced += 1;
         if produced == 17 {
             Err(ElfError::AllocationFailed { bytes: 42 })
@@ -652,14 +683,14 @@ fn relr_amplification_is_counted_before_it_is_allocated() {
     let expected = 1 + (words - 1) * 63;
 
     // Under a limit that allows it, the expansion is exact.
-    let relocs = parse_relr_table(&view, buf.len() as u64, Some(8), Aps2Limits::new(1 << 20))
+    let relocs = parse_relr_table(&view, buf.len() as u64, Some(8), Aps2Limits::new(1 << 20, u64::MAX))
         .expect("a RELR table below the limit must decode");
     assert_eq!(relocs.len(), expected);
     assert!(relocs.iter().all(|r| r.r_type() == R_AARCH64_RELATIVE));
 
     // Over the limit it is refused by counting, before a single Rela is allocated.
     assert_eq!(
-        parse_relr_table(&view, buf.len() as u64, Some(8), Aps2Limits::new(100)).unwrap_err(),
+        parse_relr_table(&view, buf.len() as u64, Some(8), Aps2Limits::new(100, u64::MAX)).unwrap_err(),
         ElfError::RelocationCountExceedsLimit {
             what: "DT_RELR",
             count: expected as u64,
@@ -671,7 +702,167 @@ fn relr_amplification_is_counted_before_it_is_allocated() {
         &view,
         buf.len() as u64,
         Some(8),
-        Aps2Limits::for_loadable_size(expected as u64 * 8)
+        Aps2Limits::new(expected as u64, u64::MAX)
     )
     .is_ok());
+}
+
+#[test]
+fn a_zero_stride_group_cannot_declare_more_than_one_relocation() {
+    // The reviewer's second probe: fifteen bytes, a shared offset delta of zero, a thousand
+    // relocations at one address. Every one of those addresses is valid, so no amount of
+    // per-relocation offset checking rejects it — but they are bit-identical, so all but the
+    // first are dead. This is layer 2, and it needs no external information at all.
+    let mut blob = Vec::from(APS2_MAGIC);
+    encode_sleb128(1000, &mut blob);
+    encode_sleb128(0x1000, &mut blob);
+    encode_sleb128(1000, &mut blob);
+    encode_sleb128(
+        (RELOCATION_GROUPED_BY_INFO_FLAG
+            | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
+            | RELOCATION_GROUPED_BY_ADDEND_FLAG
+            | RELOCATION_GROUP_HAS_ADDEND_FLAG) as i64,
+        &mut blob,
+    );
+    encode_sleb128(0, &mut blob); // the shared stride
+    encode_sleb128(R_AARCH64_RELATIVE as i64, &mut blob);
+    encode_sleb128(0, &mut blob);
+    assert!(blob.len() <= 16, "the probe blob is {} bytes", blob.len());
+
+    // Refused even with no image bound and a limit that would otherwise permit all 1,000.
+    assert_eq!(
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
+        ElfError::Aps2DeadGroup {
+            group_index: 0,
+            size: 1000,
+        }
+    );
+    // A single relocation with a zero stride is fine: there is nothing dead about it.
+    let mut ok = Vec::from(APS2_MAGIC);
+    encode_sleb128(1, &mut ok);
+    encode_sleb128(0x1000, &mut ok);
+    encode_sleb128(1, &mut ok);
+    encode_sleb128(
+        (RELOCATION_GROUPED_BY_INFO_FLAG | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) as i64,
+        &mut ok,
+    );
+    encode_sleb128(0, &mut ok);
+    encode_sleb128(R_AARCH64_RELATIVE as i64, &mut ok);
+    let decoded = aps2::decode_rela(&ok, generous()).unwrap();
+    assert_eq!(
+        decoded.relocations,
+        vec![rela(0x1000, 0, R_AARCH64_RELATIVE, 0)]
+    );
+}
+
+#[test]
+fn a_zero_cost_group_must_fit_inside_the_image() {
+    // Layer 3: with a non-zero stride the targets march across the image, so
+    // (size - 1) * |stride| must fit in it. A 0x4000-byte image at an 8-byte stride holds 2,048.
+    let build = |size: i64, stride: i64| {
+        let mut blob = Vec::from(APS2_MAGIC);
+        encode_sleb128(size, &mut blob);
+        encode_sleb128(0, &mut blob);
+        encode_sleb128(size, &mut blob);
+        encode_sleb128(
+            (RELOCATION_GROUPED_BY_INFO_FLAG | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) as i64,
+            &mut blob,
+        );
+        encode_sleb128(stride, &mut blob);
+        encode_sleb128(R_AARCH64_RELATIVE as i64, &mut blob);
+        blob
+    };
+    let limits = Aps2Limits::new(1 << 40, 0x4000);
+
+    assert!(
+        aps2::decode_rela(&build(2049, 8), limits).is_ok(),
+        "2049 relocations reach exactly 0x4000 bytes, which fits"
+    );
+    assert_eq!(
+        aps2::decode_rela(&build(2050, 8), limits).unwrap_err(),
+        ElfError::Aps2GroupExceedsImage {
+            group_index: 0,
+            size: 2050,
+            stride: 8,
+            reach: 2049 * 8,
+            image_span: 0x4000,
+        }
+    );
+    // A negative stride is bounded by its magnitude, not waved through.
+    assert_eq!(
+        aps2::decode_rela(&build(2050, -8), limits).unwrap_err(),
+        ElfError::Aps2GroupExceedsImage {
+            group_index: 0,
+            size: 2050,
+            stride: 8,
+            reach: 2049 * 8,
+            image_span: 0x4000,
+        }
+    );
+    // And a stride whose product overflows is an error rather than a wrap into a small reach.
+    assert!(matches!(
+        aps2::decode_rela(&build(1 << 32, 1 << 32), limits).unwrap_err(),
+        ElfError::Aps2GroupExceedsImage { .. }
+    ));
+}
+
+#[test]
+fn a_group_that_pays_bytes_cannot_exceed_the_bytes_left() {
+    // Layer 1: the group claims 10,000 relocations each needing at least one addend byte, but
+    // the blob ends. Bounded by the blob alone, with no image or count limit involved.
+    let mut blob = Vec::from(APS2_MAGIC);
+    encode_sleb128(10_000, &mut blob);
+    encode_sleb128(0x1000, &mut blob);
+    encode_sleb128(10_000, &mut blob);
+    encode_sleb128(
+        (RELOCATION_GROUPED_BY_INFO_FLAG
+            | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
+            | RELOCATION_GROUP_HAS_ADDEND_FLAG) as i64,
+        &mut blob,
+    );
+    encode_sleb128(8, &mut blob);
+    encode_sleb128(R_AARCH64_RELATIVE as i64, &mut blob);
+    encode_sleb128(0, &mut blob); // one addend byte, 9,999 short
+    assert_eq!(
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
+        ElfError::Aps2GroupLargerThanStream {
+            group_index: 0,
+            size: 10_000,
+            min_bytes_each: 1,
+            needed: 10_000,
+            remaining: 1,
+        }
+    );
+}
+
+#[test]
+fn the_flat_ceiling_applies_even_to_an_enormous_validated_image() {
+    // The derived bound comes from validated header fields, but validation only removes absurd
+    // values. The flat ceiling depends on no file data at all, so it still holds when the image
+    // is as large as the crate will ever accept.
+    use omni_elf::{LoadImage, MAX_IMAGE_SPAN};
+    assert_eq!(MAX_IMAGE_SPAN, 4 * 1024 * 1024 * 1024);
+    let huge = LoadImage {
+        base_vaddr: 0,
+        end_vaddr: MAX_IMAGE_SPAN,
+        span: MAX_IMAGE_SPAN,
+        mapped_bytes: MAX_IMAGE_SPAN,
+        max_align: 0x1000,
+        segment_count: 1,
+    };
+    let limits = Aps2Limits::for_image(&huge);
+    // Unclamped the derived figure would be 2^31; the ceiling holds it to 64 Mi.
+    assert_eq!(
+        huge.mapped_bytes / Aps2Limits::MIN_RELOCATION_FOOTPRINT,
+        2_147_483_648
+    );
+    assert_eq!(limits.max_relocations, Aps2Limits::MAX_RELOCATIONS);
+    assert_eq!(limits.max_relocations, 67_108_864);
+    assert_eq!(
+        aps2::decode_rela(&zero_cost_blob(67_108_865), limits).unwrap_err(),
+        ElfError::Aps2CountExceedsLimit {
+            declared: 67_108_865,
+            limit: 67_108_864,
+        }
+    );
 }

@@ -67,6 +67,70 @@ pub enum ElfError {
     #[error("no PT_DYNAMIC segment: this is not a dynamically linked object")]
     NoDynamicSegment,
 
+    #[error("no PT_LOAD segment: this object has no loadable image")]
+    NoLoadSegments,
+
+    #[error(
+        "PT_LOAD {index}: p_offset {offset} + p_filesz {filesz} overflows a 64-bit file offset"
+    )]
+    SegmentFileRangeOverflow {
+        index: usize,
+        offset: u64,
+        filesz: u64,
+    },
+
+    #[error(
+        "PT_LOAD {index}: p_offset {offset} + p_filesz {filesz} runs past the end of the \
+         {file_len}-byte file"
+    )]
+    SegmentOutsideFile {
+        index: usize,
+        offset: u64,
+        filesz: u64,
+        file_len: u64,
+    },
+
+    #[error("PT_LOAD {index}: p_filesz {filesz} exceeds p_memsz {memsz}")]
+    SegmentFileSizeExceedsMemSize {
+        index: usize,
+        filesz: u64,
+        memsz: u64,
+    },
+
+    #[error(
+        "PT_LOAD {index}: p_vaddr {vaddr:#x} + p_memsz {memsz} overflows the 64-bit address space"
+    )]
+    SegmentMemRangeOverflow {
+        index: usize,
+        vaddr: u64,
+        memsz: u64,
+    },
+
+    #[error("PT_LOAD {index}: p_align {align} is not a power of two")]
+    SegmentAlignNotPowerOfTwo { index: usize, align: u64 },
+
+    #[error(
+        "PT_LOAD {index}: p_vaddr {vaddr:#x} and p_offset {offset:#x} are not congruent modulo \
+         p_align {align:#x}, so the segment cannot be mapped from the file"
+    )]
+    SegmentAlignMismatch {
+        index: usize,
+        vaddr: u64,
+        offset: u64,
+        align: u64,
+    },
+
+    #[error("the loadable image spans {base_vaddr:#x}..{end_vaddr:#x}, which is not a valid range")]
+    ImageSpanOverflow { base_vaddr: u64, end_vaddr: u64 },
+
+    /// Refused rather than clamped: limits derived from the image would otherwise grow with a
+    /// forged `p_memsz`. See `image::MAX_IMAGE_SPAN`.
+    #[error(
+        "the loadable image spans {span} bytes, past the {limit}-byte maximum this runtime can \
+         load; a forged p_memsz looks exactly like this"
+    )]
+    ImageSpanTooLarge { span: u64, limit: u64 },
+
     #[error("{count} PT_DYNAMIC segments found; exactly one is expected")]
     MultipleDynamicSegments { count: usize },
 
@@ -187,6 +251,46 @@ pub enum ElfError {
 
     #[error("packed relocation group {group_index} has unknown group flag bits {unknown:#x} set")]
     Aps2UnknownGroupFlags { group_index: usize, unknown: u64 },
+
+    /// Every relocation in the group consumes at least `min_bytes_each` bytes from the stream, and
+    /// the stream does not contain them. Bounds a byte-paying group without needing any external
+    /// information, and cannot reject a valid blob: a valid blob really does contain those bytes.
+    #[error(
+        "packed relocation group {group_index} of size {size} needs at least {needed} more bytes \
+         ({min_bytes_each} per relocation) but only {remaining} remain in the blob"
+    )]
+    Aps2GroupLargerThanStream {
+        group_index: usize,
+        size: u64,
+        min_bytes_each: u64,
+        needed: u64,
+        remaining: u64,
+    },
+
+    /// A group sharing its offset delta, `r_info` and addend whose shared delta is **zero** emits
+    /// bit-identical relocations: same target, same symbol, same addend. Every one after the first
+    /// is overwritten by its successor, so it is dead, and no encoder emits it. Refusing it is what
+    /// stops a fifteen-byte blob describing a billion relocations at one address.
+    #[error(
+        "packed relocation group {group_index} declares {size} relocations sharing an offset delta \
+         of zero, so all but the first would be bit-identical and dead"
+    )]
+    Aps2DeadGroup { group_index: usize, size: u64 },
+
+    /// A group that spends no bytes per relocation still has to land its relocations inside the
+    /// image: `(size - 1) * |delta|` cannot exceed the image span.
+    #[error(
+        "packed relocation group {group_index} of size {size} strides {stride} bytes at a time, \
+         reaching {reach} bytes past its first target, which does not fit in the {image_span}-byte \
+         loadable image"
+    )]
+    Aps2GroupExceedsImage {
+        group_index: usize,
+        size: u64,
+        stride: u64,
+        reach: u64,
+        image_span: u64,
+    },
 
     /// A fully-grouped group spends zero bytes per relocation, so a tiny blob can declare an
     /// astronomical count. See `aps2::Aps2Limits` for why the bound is both necessary and safe.

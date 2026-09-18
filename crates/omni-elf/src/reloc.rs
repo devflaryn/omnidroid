@@ -261,7 +261,10 @@ pub fn parse_relr_table(
     // Pass two: expand.
     let r_info = (R_AARCH64_RELATIVE as u64) & 0xffff_ffff;
     let mut out = Vec::new();
-    try_reserve(&mut out, count as usize)?;
+    let count = usize::try_from(count).map_err(|_| ElfError::AllocationFailed {
+        bytes: usize::MAX,
+    })?;
+    try_reserve(&mut out, count)?;
     let mut where_: u64 = 0;
     for i in 0..words {
         let entry = view.u64("DT_RELR entry", i * WORD)?;
@@ -292,7 +295,7 @@ pub fn parse_relr_table(
             where_ = where_.wrapping_add(63 * WORD as u64);
         }
     }
-    debug_assert_eq!(out.len() as u64, count, "the two RELR passes must agree");
+    debug_assert_eq!(out.len(), count, "the two RELR passes must agree");
     Ok(out)
 }
 
@@ -331,7 +334,7 @@ mod tests {
         let bitmap = (((1u64 << 0) | (1u64 << 2)) << 1) | 1;
         buf.extend_from_slice(&bitmap.to_le_bytes());
         let view = View::new(&buf);
-        let limits = crate::aps2::Aps2Limits::new(1 << 20);
+        let limits = crate::aps2::Aps2Limits::new(1 << 20, u64::MAX);
         let relocs = parse_relr_table(&view, buf.len() as u64, Some(8), limits).unwrap();
         let offsets: Vec<u64> = relocs.iter().map(|r| r.r_offset).collect();
         assert_eq!(offsets, vec![0x2000, 0x2008, 0x2018]);

@@ -207,7 +207,7 @@ pub struct PackedRelocations {
     pub summary: Aps2Summary,
 }
 
-/// How many relocations a blob is allowed to declare.
+/// The resource bounds a packed-relocation decode is held to.
 ///
 /// # Why a limit is unavoidable
 ///
@@ -218,48 +218,103 @@ pub struct PackedRelocations {
 /// distinguish that from a valid encoding. Without a limit, the streaming decoder runs
 /// essentially forever and the `Vec` decoder tries to allocate terabytes.
 ///
-/// # The bound, and why it cannot reject a real binary
+/// # How the decoder is bounded, in four layers
+///
+/// Three of them need no external information at all, which matters because anything derived from
+/// a header is only as trustworthy as the header:
+///
+/// 1. **A group whose relocations each consume bytes is bounded by the bytes that remain.** From
+///    the group flags the decoder knows the minimum bytes each relocation must read; if
+///    `size × min_bytes` exceeds what is left in the blob, the group is refused
+///    ([`crate::ElfError::Aps2GroupLargerThanStream`]). This cannot reject a valid blob, because a
+///    valid blob contains those bytes. Every group in `libroblox.so` is of this kind.
+/// 2. **A zero-cost group whose shared offset delta is zero may hold one relocation.** All of its
+///    relocations would be bit-identical — same target, same `r_info`, same addend — so every one
+///    after the first is dead ([`crate::ElfError::Aps2DeadGroup`]).
+/// 3. **A zero-cost group with a non-zero stride must fit in the image.** Its targets are
+///    `o, o+d, …, o+(size-1)d`, and all must be mapped, so `(size-1) × |d| ≤ image_span`
+///    ([`crate::ElfError::Aps2GroupExceedsImage`]). This is the only layer that needs the image,
+///    and it is O(1) per group rather than per relocation.
+/// 4. **The declared count itself**, checked before a single group is read, against
+///    [`Self::max_relocations`].
+///
+/// # The count bound, and why it cannot reject a real binary
 ///
 /// Every relocation must be *applied*, which means writing at least
-/// [`Self::MIN_RELOCATION_FOOTPRINT`] bytes somewhere inside the object's loadable image. So the
-/// number of relocations whose writes are all distinct is at most
-/// `sum(PT_LOAD p_memsz) / MIN_RELOCATION_FOOTPRINT`. Exceeding that is a pigeonhole argument:
-/// at least two relocations must write the same bytes, so one of them is dead — its effect is
-/// entirely overwritten by the other. No linker emits a dead relocation, and a blob that
-/// contains one is not a minimal relocation set for the image it ships in.
+/// [`Self::MIN_RELOCATION_FOOTPRINT`] bytes to a **mapped** byte of the object's image. So the
+/// number of relocations with pairwise-distinct writes is at most
+/// `LoadImage::mapped_bytes / MIN_RELOCATION_FOOTPRINT`. Exceeding that is a pigeonhole argument:
+/// two relocations must write the same bytes, so one of them is dead — its effect entirely
+/// overwritten by the other. No linker emits a dead relocation.
 ///
-/// The bound is derived from the binary rather than invented, and it is generous: across the
-/// eleven ARM64 libraries in `Roblox-2.738.1397.apk` the headroom between the real relocation
-/// count and this cap ranges from **75×** (`libeigen_blas.so`) to **341×** (`libyuv_shared.so`),
-/// with `libroblox.so`'s 568,806 relocations sitting 106× below its cap of 60,383,782. An
-/// assertion in the test suite pins that margin, so a future library that came anywhere near the
-/// cap would be visible long before it was rejected.
+/// Two literal exceptions exist and are worth naming rather than glossing: `R_AARCH64_NONE` writes
+/// nothing, and `R_AARCH64_COPY` writes `st_size`, which may be 0 or 1. Both may legally appear in
+/// a dynamic table, so the bound is on *effective* relocations rather than on entries. At the
+/// measured margins — 74× to 341× across the eleven ARM64 libraries in `Roblox-2.738.1397.apk`,
+/// with `libroblox.so` 106× below its cap — a handful of no-op entries is immaterial. The test
+/// suite asserts the margin for all eleven, so drift becomes visible long before anything is
+/// rejected.
+///
+/// # And why there is also a flat ceiling
+///
+/// [`Self::MAX_RELOCATIONS`] caps the derived figure. The derived figure comes from validated
+/// header fields — but validation only removes the *absurd* values. A plausible lie
+/// (`p_memsz = 2^40`, overflowing nothing, contradicting nothing) would still buy a ceiling of
+/// half a trillion, and a bound whose worst case is minutes of CPU is not a bound. The flat
+/// ceiling depends on no file data at all. `image::MAX_IMAGE_SPAN` closes the same hole from the
+/// other side; either alone would be enough, and having both means a mistake in one is not fatal.
 ///
 /// Note that validating each decoded `r_offset` against the loadable segments — a check the
-/// applying loader wants anyway — is *not* a substitute: a group with a shared offset delta of
-/// zero repeats one perfectly valid offset indefinitely. Only a count bound terminates.
+/// applying loader wants anyway — is *not* a substitute for any of this: a group with a shared
+/// offset delta of zero repeats one perfectly valid offset indefinitely. Layer 2 is the O(1)
+/// version of that observation; a per-relocation check would not terminate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aps2Limits {
     /// Reject a blob declaring more relocations than this.
     pub max_relocations: u64,
+    /// The validated span of the loadable image, used by layer 3 above.
+    pub image_span: u64,
 }
 
 impl Aps2Limits {
-    /// The fewest bytes any AArch64 dynamic relocation writes to its target.
+    /// The fewest bytes any AArch64 relocation writes to its target.
     ///
-    /// `R_AARCH64_ABS16` is the narrowest type in the ABI at two bytes. Every type that actually
-    /// appears in a dynamic table is four or eight, so using two errs towards accepting input.
+    /// `R_AARCH64_ABS16` is the narrowest writing type in the ABI at two bytes — there is no
+    /// `ABS8`, instruction-patching types write four and `TLSDESC` sixteen. Every type that
+    /// actually appears in a dynamic table writes four or eight, so using two errs towards
+    /// accepting input. See the struct docs for the two no-op exceptions.
     pub const MIN_RELOCATION_FOOTPRINT: u64 = 2;
 
-    /// An explicit ceiling, for callers that know their own bound.
-    pub const fn new(max_relocations: u64) -> Self {
-        Self { max_relocations }
+    /// The flat ceiling on the derived count bound: 64 Mi relocations.
+    ///
+    /// Chosen, not derived — see the struct docs for why one chosen number is necessary. It is
+    /// 118× `libroblox.so`'s 568,806, by far the largest count in the target APK, and at the
+    /// measured ~320 million relocations per second it bounds a hostile decode to about 0.2 s.
+    /// A caller with a bigger object can raise it through [`Self::new`].
+    pub const MAX_RELOCATIONS: u64 = 64 * 1024 * 1024;
+
+    /// An explicit bound, for callers that know their own.
+    pub const fn new(max_relocations: u64, image_span: u64) -> Self {
+        Self {
+            max_relocations,
+            image_span,
+        }
     }
 
-    /// Derive the ceiling from the total `p_memsz` of the object's `PT_LOAD` segments.
-    pub const fn for_loadable_size(loadable_bytes: u64) -> Self {
+    /// Derive the bounds from a **validated** [`crate::image::LoadImage`].
+    ///
+    /// Taking the whole `LoadImage` rather than a bare integer is deliberate: the type can only be
+    /// produced by `LoadImage::validate`, so it is not possible to derive a limit from unchecked
+    /// header fields by accident.
+    pub const fn for_image(image: &crate::image::LoadImage) -> Self {
+        let derived = image.mapped_bytes / Self::MIN_RELOCATION_FOOTPRINT;
         Self {
-            max_relocations: loadable_bytes / Self::MIN_RELOCATION_FOOTPRINT,
+            max_relocations: if derived < Self::MAX_RELOCATIONS {
+                derived
+            } else {
+                Self::MAX_RELOCATIONS
+            },
+            image_span: image.span,
         }
     }
 }
@@ -387,9 +442,9 @@ where
         let grouped_by_offset_delta = group_flags & RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG != 0;
         let grouped_by_info = group_flags & RELOCATION_GROUPED_BY_INFO_FLAG != 0;
 
-        let mut group_offset_delta: u64 = 0;
+        let mut group_offset_delta: i64 = 0;
         if grouped_by_offset_delta {
-            group_offset_delta = dec.pop_front()? as u64;
+            group_offset_delta = dec.pop_front()?;
         }
         if grouped_by_info {
             r_info = dec.pop_front()? as u64;
@@ -415,9 +470,58 @@ where
             r_addend = 0;
         }
 
+        // Layers 1 to 3 (see `Aps2Limits`). The group header has been fully read at this point,
+        // so `dec.remaining()` is exactly the budget the per-relocation fields have to live in.
+        let min_bytes_each = u64::from(!grouped_by_offset_delta)
+            + u64::from(!grouped_by_info)
+            + u64::from(per_reloc_addend);
+        if min_bytes_each > 0 {
+            // Layer 1: bounded by the blob alone, and sound — a valid blob holds these bytes.
+            let needed = group_size.saturating_mul(min_bytes_each);
+            if needed > dec.remaining() as u64 {
+                return Err(ElfError::Aps2GroupLargerThanStream {
+                    group_index,
+                    size: group_size,
+                    min_bytes_each,
+                    needed,
+                    remaining: dec.remaining() as u64,
+                });
+            }
+        } else if group_offset_delta == 0 {
+            // Layer 2: every relocation here would be bit-identical, so all but one are dead.
+            if group_size > 1 {
+                return Err(ElfError::Aps2DeadGroup {
+                    group_index,
+                    size: group_size,
+                });
+            }
+        } else {
+            // Layer 3: the targets stride across the image, so the reach must fit inside it.
+            let stride = group_offset_delta.unsigned_abs();
+            let reach = group_size
+                .saturating_sub(1)
+                .checked_mul(stride)
+                .ok_or(ElfError::Aps2GroupExceedsImage {
+                    group_index,
+                    size: group_size,
+                    stride,
+                    reach: u64::MAX,
+                    image_span: limits.image_span,
+                })?;
+            if reach > limits.image_span {
+                return Err(ElfError::Aps2GroupExceedsImage {
+                    group_index,
+                    size: group_size,
+                    stride,
+                    reach,
+                    image_span: limits.image_span,
+                });
+            }
+        }
+
         for _ in 0..group_size {
             if grouped_by_offset_delta {
-                r_offset = r_offset.wrapping_add(group_offset_delta);
+                r_offset = r_offset.wrapping_add(group_offset_delta as u64);
             } else {
                 r_offset = r_offset.wrapping_add(dec.pop_front()? as u64);
             }

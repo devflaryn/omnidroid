@@ -10,7 +10,7 @@ mod common;
 use std::collections::BTreeSet;
 
 use omni_elf::consts::*;
-use omni_elf::{ElfImage, RelocEncoding};
+use omni_elf::{Aps2Limits, ElfImage, RelocEncoding};
 
 /// One row of D9's per-library relocation table, plus the other measured per-library facts.
 ///
@@ -304,6 +304,72 @@ fn per_library_relocations_and_layout_match_d9() {
         );
         assert!(!elf.dynamic().wants_textrel(), "{}: no DT_TEXTREL", e.name);
     }
+}
+
+/// The image-derived relocation ceiling, and the margin over the real count, for every library.
+///
+/// One library does not establish a range, and the margin assertion is what makes drift visible,
+/// so this covers all eleven. The worst case in the whole APK is `libeigen_blas.so` at 74x.
+const MARGINS: &[(&str, u64, u64, u64)] = &[
+    // (library, mapped_bytes, image-derived cap, minimum headroom over its real count)
+    ("libroblox.so", 120_767_564, 60_383_782, 106),
+    ("libzstd-jni-1.5.7-6.so", 18_499_192, 9_249_596, 269),
+    ("libbacktrace-native.so", 5_359_936, 2_679_968, 118),
+    ("librenderscript-toolkit.so", 397_792, 198_896, 96),
+    ("libeigen_blas.so", 252_800, 126_400, 74),
+    ("libimage_processing_util_jni.so", 32_772, 16_386, 268),
+    ("libdatastore_shared_counter.so", 5_161, 2_580, 143),
+    ("libsurface_util_jni.so", 4_096, 2_048, 170),
+    ("libtrampoline.so", 4_128, 2_064, 187),
+    ("libeigen_lapack.so", 4_104, 2_052, 293),
+    ("libyuv_shared.so", 4_096, 2_048, 341),
+];
+
+#[test]
+fn every_library_sits_far_below_its_own_relocation_ceiling() {
+    let Some(libs) = common::require_libs() else { return };
+    assert_eq!(MARGINS.len(), common::EXPECTED_LIB_COUNT);
+
+    let mut worst = (u64::MAX, "");
+    for &(name, mapped_bytes, cap, min_headroom) in MARGINS {
+        let bytes = &libs[name];
+        let elf = ElfImage::parse(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let img = elf.load_image();
+
+        // The image measurement the bound rests on, pinned per library.
+        assert_eq!(img.mapped_bytes, mapped_bytes, "{name}: mapped bytes");
+        assert!(
+            img.mapped_bytes <= img.span,
+            "{name}: mapped bytes cannot exceed the span"
+        );
+        assert!(img.span <= omni_elf::MAX_IMAGE_SPAN, "{name}: span ceiling");
+        assert!(img.segment_count >= 1, "{name}: at least one PT_LOAD");
+
+        let limits = elf.aps2_limits();
+        assert_eq!(limits.max_relocations, cap, "{name}: derived cap");
+        assert!(
+            limits.max_relocations < Aps2Limits::MAX_RELOCATIONS,
+            "{name}: the derived cap should bind, not the flat ceiling"
+        );
+
+        let total = elf.relocations().unwrap().total() as u64;
+        let headroom = limits.max_relocations / total;
+        assert_eq!(
+            headroom, min_headroom,
+            "{name}: {total} relocations against a cap of {}",
+            limits.max_relocations
+        );
+        if headroom < worst.0 {
+            worst = (headroom, name);
+        }
+    }
+    // Pinned so that a future library eating into the margin is a test failure rather than a
+    // silent narrowing of the safety factor.
+    assert_eq!(
+        worst,
+        (74, "libeigen_blas.so"),
+        "worst-case headroom across the APK"
+    );
 }
 
 #[test]

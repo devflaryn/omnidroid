@@ -46,6 +46,7 @@ pub mod consts;
 pub mod dynamic;
 pub mod error;
 pub mod header;
+pub mod image;
 pub mod notes;
 pub mod reader;
 pub mod reloc;
@@ -56,6 +57,7 @@ pub use crate::aps2::{Aps2Limits, Aps2Summary, PackedFormat, PackedRelocations, 
 pub use crate::dynamic::{DynArray, DynEntry, DynTable, Dynamic};
 pub use crate::error::{ElfError, Result};
 pub use crate::header::{FileHeader, Ident};
+pub use crate::image::{LoadImage, MAX_IMAGE_SPAN};
 pub use crate::notes::{AndroidIdent, GnuProperties, Note};
 pub use crate::reader::View;
 pub use crate::reloc::{RelocEncoding, Rela, RelocationTable, Relocations};
@@ -71,6 +73,8 @@ pub struct ElfImage<'a> {
     segments: Vec<Segment>,
     sections: Vec<Section>,
     dynamic: Dynamic,
+    /// Validated before anything derives a limit from it; see [`image`].
+    load_image: LoadImage,
     /// Cached because both the symbol table and the exports walk need it.
     symbol_count: u32,
 }
@@ -108,6 +112,10 @@ impl<'a> ElfImage<'a> {
                 align: tls.p_align,
             });
         }
+
+        // Validate the PT_LOAD set now, before anything derives a bound from it. This must come
+        // before the dynamic section is read, because `vaddr_to_offset` walks the same segments.
+        let load_image = LoadImage::validate(&segments, view.len() as u64)?;
 
         // Section headers are optional and diagnostics-only; a missing or truncated table must
         // not stop a loadable object from parsing.
@@ -148,6 +156,7 @@ impl<'a> ElfImage<'a> {
             segments,
             sections,
             dynamic,
+            load_image,
             symbol_count: 0,
         };
         image.symbol_count = image.compute_symbol_count()?;
@@ -212,31 +221,33 @@ impl<'a> ElfImage<'a> {
     ///
     /// This is the size a loader must reserve. Returns `None` if there is no `PT_LOAD`.
     pub fn load_span(&self) -> Option<(u64, u64)> {
-        let mut min = u64::MAX;
-        let mut max = 0u64;
-        for s in self.load_segments() {
-            min = min.min(s.p_vaddr);
-            max = max.max(s.vaddr_end());
-        }
-        (min != u64::MAX).then_some((min, max - min))
+        Some((self.load_image.base_vaddr, self.load_image.span))
     }
 
-    /// Total `p_memsz` across every `PT_LOAD` segment: the bytes this object can ever write to.
+    /// The validated extent of the loadable image.
     ///
-    /// Saturating rather than wrapping, so a malformed header inflates the figure instead of
-    /// collapsing it — a bound derived from this must fail safe towards *accepting* input.
+    /// Produced by [`LoadImage::validate`] during [`Self::parse`], so every limit derived from it
+    /// rests on checked arithmetic and on fields that have been sanity-checked against the real
+    /// length of the file. Nothing here saturates: an overflowing or implausible segment is a
+    /// typed error, because saturating would turn hostile input into a *larger* permission.
+    #[inline]
+    pub fn load_image(&self) -> &LoadImage {
+        &self.load_image
+    }
+
+    /// Bytes actually mapped by the `PT_LOAD` set, gaps excluded and overlaps counted once.
+    #[inline]
     pub fn loadable_size(&self) -> u64 {
-        self.load_segments()
-            .fold(0u64, |acc, s| acc.saturating_add(s.p_memsz))
+        self.load_image.mapped_bytes
     }
 
-    /// The relocation-count ceiling this object's own size justifies.
+    /// The relocation bounds this object's own validated image justifies.
     ///
-    /// See [`Aps2Limits`] for the argument that this cannot reject a real binary. It is exposed
-    /// so a caller can inspect the bound it is being held to, and so tests can assert the margin
-    /// between the real relocation count and the cap.
+    /// See [`Aps2Limits`] for the four layers and for the argument that none of them can reject a
+    /// real binary. Exposed so a caller can inspect the bound it is being held to, and so tests
+    /// can assert the margin between the real relocation count and the cap.
     pub fn aps2_limits(&self) -> Aps2Limits {
-        Aps2Limits::for_loadable_size(self.loadable_size())
+        Aps2Limits::for_image(&self.load_image)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -697,6 +708,7 @@ impl core::fmt::Debug for ElfImage<'_> {
             .field("segments", &self.segments.len())
             .field("sections", &self.sections.len())
             .field("dynamic_entries", &self.dynamic.entries.len())
+            .field("load_image", &self.load_image)
             .field("symbol_count", &self.symbol_count)
             .finish()
     }
