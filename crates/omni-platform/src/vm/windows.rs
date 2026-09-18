@@ -194,19 +194,18 @@ fn unmap_view_of_file2() -> VmResult<FnUnmapViewOfFile2> {
 
 /// Whether all three placeholder entry points resolved.
 ///
-/// Public so that a test or a diagnostic can report the state of the seam's one runtime
-/// dependency instead of inferring it from a failure.
-#[must_use]
-pub fn placeholder_api_available() -> bool {
+/// Reached through [`vm::placeholder_api_available`](super::placeholder_api_available), which is
+/// `cfg`-free, so that a test or a diagnostic can report the state of the seam's one runtime
+/// dependency instead of inferring it from a failure — and can do so without naming a platform.
+pub(super) fn placeholder_api_available() -> bool {
     let kb = kernelbase();
     kb.virtual_alloc2.is_ok() && kb.map_view_of_file3.is_ok() && kb.unmap_view_of_file2.is_ok()
 }
 
 /// The names of the symbols resolved from `kernelbase.dll`, paired with whether each resolved.
-#[must_use]
-pub fn placeholder_api_symbols() -> [(&'static str, bool); 3] {
+pub(super) fn placeholder_api_symbols() -> Vec<(&'static str, bool)> {
     let kb = kernelbase();
-    [
+    vec![
         ("VirtualAlloc2", kb.virtual_alloc2.is_ok()),
         ("MapViewOfFile3", kb.map_view_of_file3.is_ok()),
         ("UnmapViewOfFile2", kb.unmap_view_of_file2.is_ok()),

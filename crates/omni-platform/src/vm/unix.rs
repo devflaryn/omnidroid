@@ -170,6 +170,20 @@ pub(super) fn release(_base: usize, _len: usize, _kind: ReservationKind) -> VmRe
     unsupported("release")
 }
 
+/// `false`: the placeholder path is not implemented here, so this process cannot place a mapping at
+/// an address of its choosing. Reported rather than left to be discovered at the first
+/// [`map_file`] failure. Nothing is resolved dynamically on unix — `mmap(MAP_FIXED)` is a libc
+/// symbol linked at build time — so the answer is a constant rather than a probe, and it is `false`
+/// because the operation is missing, not because a symbol is.
+pub(super) fn placeholder_api_available() -> bool {
+    false
+}
+
+/// Empty: no symbol is resolved at runtime on unix, so there is nothing to report the state of.
+pub(super) fn placeholder_api_symbols() -> Vec<(&'static str, bool)> {
+    Vec::new()
+}
+
 /// No faithful equivalent exists; see the module documentation.
 pub(super) fn process_commit_charge() -> VmResult<u64> {
     unsupported("process_commit_charge")

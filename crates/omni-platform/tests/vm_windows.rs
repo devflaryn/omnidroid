@@ -83,10 +83,10 @@ fn the_three_kernelbase_symbols_resolve() {
     // D11: VirtualAlloc2, MapViewOfFile3 and UnmapViewOfFile2 are not exported from kernel32.dll.
     // Everything placeholder-related depends on resolving them from kernelbase.dll, so the seam
     // reports the result rather than leaving it to be inferred from a later failure.
-    for (symbol, resolved) in vm::windows::placeholder_api_symbols() {
+    for (symbol, resolved) in vm::placeholder_api_symbols() {
         assert!(resolved, "{symbol} did not resolve from kernelbase.dll");
     }
-    assert!(vm::windows::placeholder_api_available());
+    assert!(vm::placeholder_api_available());
 }
 
 // -------------------------------------------------------------------------------------------
@@ -800,4 +800,41 @@ fn releasing_a_reservation_whose_size_was_rounded_up_still_works() {
     let reservation = vm::reserve(PAGE + 1, GRANULARITY).expect("reserve a page and one byte");
     assert_eq!(reservation.len(), PAGE + 1, "the descriptor keeps the requested length");
     vm::release(reservation).expect("release a reservation the OS rounded up");
+}
+
+/// The `Reservation` descriptor's edge cases are refused rather than answered wrongly.
+///
+/// Each of these is a *descriptor* question with no OS call behind it, which is exactly why they
+/// went unnoticed: a wrong answer here does not fail, it produces a descriptor that a later
+/// `release` or bounds check takes at face value.
+#[test]
+fn reservation_edges_are_refused_rather_than_answered_wrongly() {
+    let reservation = vm::reserve_placeholder(2 * GRANULARITY, GRANULARITY).expect("reserve");
+
+    // A zero-length subrange used to succeed, producing a reservation whose `is_empty()` is true —
+    // contradicting that method's own documentation — and which `release` would then hand to
+    // `MEM_RELEASE`, whose size argument is 0 anyway: it would free whatever allocation starts at
+    // that base. That is the whole reservation when the offset is 0.
+    let err = reservation
+        .subrange(0, 0, ReservationKind::Placeholder)
+        .expect_err("a zero-length subrange must be refused");
+    assert!(matches!(err, VmError::ZeroSize { operation: "subrange" }), "{err}");
+    assert!(reservation.subrange(GRANULARITY, 0, ReservationKind::Placeholder).is_err());
+
+    // `is_empty()` can therefore keep its promise.
+    assert!(!reservation.is_empty(), "no reservation this seam produces is empty");
+
+    // `end()` is exclusive, and `contains` must not admit it. With `len == 0` the arithmetic alone
+    // says yes, which would report the first address *past* the reservation as inside it.
+    let one_past = reservation.end() as *const u8;
+    assert!(!reservation.contains(one_past, 0), "end() is not inside the reservation");
+    assert!(!reservation.contains(one_past, 1));
+    assert!(!reservation.contains(reservation.as_ptr(), 0), "a zero-length range is nowhere");
+    assert!(reservation.contains(reservation.as_ptr(), 1));
+    assert!(reservation.contains(reservation.as_ptr(), 2 * GRANULARITY), "the whole extent");
+    assert!(!reservation.contains(reservation.as_ptr(), 2 * GRANULARITY + 1), "one byte too many");
+    // The last byte is inside; one past it is not.
+    assert!(reservation.contains((reservation.end() - 1) as *const u8, 1));
+
+    vm::release(reservation).expect("release");
 }

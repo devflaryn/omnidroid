@@ -90,8 +90,13 @@ mod error;
 
 pub use error::{OsError, VmError, VmResult};
 
+// The backend modules are **private**. Everything a caller may use is re-exported from this module
+// by a `cfg`-free name, because a `pub mod windows` is a public API surface no other crate can name
+// without writing `#[cfg(target_os = "windows")]` itself — which Global Constraint 4 forbids
+// everywhere but here. The capability probes that used to live behind `vm::windows::` are
+// [`placeholder_api_available`] and [`placeholder_api_symbols`] below.
 #[cfg(target_os = "windows")]
-pub mod windows;
+mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
@@ -99,12 +104,12 @@ use windows as backend;
 mod unix;
 
 #[cfg(target_os = "linux")]
-pub mod linux;
+mod linux;
 #[cfg(target_os = "linux")]
 use linux as backend;
 
 #[cfg(target_os = "macos")]
-pub mod macos;
+mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
 
@@ -234,16 +239,26 @@ impl Reservation {
         self.len
     }
 
-    /// Whether the reservation is empty. Always false: a zero-size reservation is rejected.
+    /// Whether the reservation is empty. Always false: a zero-size reservation is rejected, by
+    /// [`reserve`], [`reserve_placeholder`], [`split_placeholder`] and [`subrange`](Self::subrange)
+    /// alike.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// End address, exclusive.
+    ///
+    /// Saturating, and deliberately so. Every bounds check in this type routes through it, and a
+    /// wrapped end would make a range that runs off the top of the address space look *smaller*
+    /// than it is — which is the direction that turns a bad argument into a permission. It cannot
+    /// actually saturate for a reservation this module produced, because one is only ever built
+    /// from a successful OS reservation or from a bounds-checked
+    /// [`subrange`](Self::subrange) of one; saturation is here so that the invariant does not have
+    /// to be re-derived at every call site.
     #[must_use]
     pub const fn end(&self) -> usize {
-        self.base + self.len
+        self.base.saturating_add(self.len)
     }
 
     /// Whether this is a plain reservation or a placeholder.
@@ -286,17 +301,28 @@ impl Reservation {
     ///
     /// # Errors
     ///
+    /// [`VmError::ZeroSize`] for `len == 0` — a zero-length reservation is not a thing this seam
+    /// has, and one built here would contradict [`is_empty`](Self::is_empty) and then be *accepted*
+    /// by [`release`], which would free whatever allocation happens to start at its base. Also
     /// [`VmError::OutsideReservation`] if the sub-range is not within this reservation.
     pub fn subrange(&self, offset: usize, len: usize, kind: ReservationKind) -> VmResult<Self> {
+        check_size("subrange", len)?;
         let base = self.offset_ptr(offset, len)? as usize;
         Ok(Reservation { base, len, kind })
     }
 
     /// Whether `[ptr, ptr + len)` lies inside this reservation.
+    ///
+    /// `len == 0` is **false** for every address, including one inside the reservation: a
+    /// zero-length range is not anywhere, and answering `true` for `ptr == end()` — which the
+    /// arithmetic alone does — would report an address one past the reservation as being inside it.
     #[must_use]
     pub fn contains(&self, ptr: *const u8, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
         let address = ptr as usize;
-        address >= self.base && address <= self.end() && len <= self.end() - address
+        address >= self.base && address < self.end() && len <= self.end() - address
     }
 }
 
@@ -601,6 +627,23 @@ pub unsafe fn decommit_to_placeholder(ptr: *mut u8, size: usize) -> VmResult<()>
 }
 
 /// Change the protection of a page range. 4 KB-granular.
+///
+/// # Do not call this on a guest mapping
+///
+/// **This is the raw primitive, and it is invisible to the region map.** `omni-mem` records, per
+/// sub-range of every view, whether that range has ever been writable, because a partial unmap on
+/// Windows has to unmap the whole view and re-map the survivors — and a survivor that has held a
+/// copy-on-write write must have its privatised pages carried across that re-map or the content is
+/// silently lost (D11, measured: the relocated byte read back `0x0`). That flag is set by
+/// [`GuestSpace::protect`](../../omni_mem/struct.GuestSpace.html#method.protect) and by nothing
+/// else. Calling this function directly on an address inside a guest view therefore makes the range
+/// writable *without* arming the preservation, and the loss that follows is silent and arbitrarily
+/// far away.
+///
+/// So: anything that owns a region map calls it (that is `omni-mem`, and its own calls all sit on
+/// ranges already marked or on a [`Protection::None`] view that can hold no content). Anything that
+/// does not own a region map must go through `omni-mem` instead — which is also why no crate but
+/// `omni-mem` depends on `omni-platform` for memory operations.
 ///
 /// A single page in the middle of a run can be changed while its neighbours keep their
 /// protection, including a single page of a file-backed view. On a view mapped
@@ -927,6 +970,8 @@ pub unsafe fn unmap_and_release(ptr: *mut u8, size: usize) -> VmResult<()> {
 ///
 /// # Errors
 ///
+/// [`VmError::ZeroSize`] for a zero-length reservation, which `MEM_RELEASE` would otherwise accept
+/// and turn into "free whatever allocation starts at this base"; otherwise
 /// [`VmError::Os`], carrying whichever code the OS reports. Measured on Windows: an address that
 /// is not the base of a live reservation — a double release, or a release of a placeholder parent
 /// that has been split — gives `ERROR_INVALID_ADDRESS` (**487**, *not* 87), while a partial
@@ -934,7 +979,31 @@ pub unsafe fn unmap_and_release(ptr: *mut u8, size: usize) -> VmResult<()> {
 /// to look for after a double free, and it is also the exact-size-placeholder code, so key
 /// diagnostics on the [`VmError`] variant rather than on the number alone.
 pub fn release(reservation: Reservation) -> VmResult<()> {
+    check_size("release", reservation.len)?;
     backend::release(reservation.base, reservation.len, reservation.kind)
+}
+
+/// Whether every OS entry point the placeholder mapping path needs is present.
+///
+/// `cfg`-free by design: this is the seam's one runtime dependency, and a caller must be able to
+/// report on it without naming a platform. On Windows it says whether `VirtualAlloc2`,
+/// `MapViewOfFile3` and `UnmapViewOfFile2` all resolved from `kernelbase.dll` — they are not
+/// exported from `kernel32.dll` (D11), so this is a real question with a real answer. On a backend
+/// where the placeholder path is not implemented it is `false`, because the honest answer to "can
+/// this process place a mapping at a chosen address" there is no.
+#[must_use]
+pub fn placeholder_api_available() -> bool {
+    backend::placeholder_api_available()
+}
+
+/// The OS entry points the placeholder mapping path depends on, each paired with whether it
+/// resolved.
+///
+/// For a diagnostic that says *which* symbol is missing rather than only that something is. Empty
+/// on a backend that resolves nothing dynamically.
+#[must_use]
+pub fn placeholder_api_symbols() -> Vec<(&'static str, bool)> {
+    backend::placeholder_api_symbols()
 }
 
 /// This process's commit charge, in bytes.
