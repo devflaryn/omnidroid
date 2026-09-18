@@ -101,6 +101,15 @@ struct PagerInner {
 ///
 /// Drop order is load-bearing: the registration field is declared first, so it is released — and
 /// the handler therefore stops being callable — before the state it reads is freed.
+///
+/// **That field order was necessary and was never sufficient**, and the whole-branch review is what
+/// showed it. Releasing a slot stops calls that have not started; it cannot stop one already in
+/// flight, because the vectored dispatcher is process-wide and can be preempted between loading the
+/// handler and calling it. Nothing this type can do about its own fields closes that window. It is
+/// closed on the other side instead: dropping a `FaultRegistration` now blocks until every dispatch
+/// inside the handler has returned, so by the time `inner` is freed here, no frame can be holding
+/// its address. The ordering below still matters — it is what makes the drain *start* before the
+/// free — but the guarantee it rests on is `omni-platform`'s, and is documented there.
 pub struct DemandPager {
     registration: FaultRegistration,
     inner: Box<PagerInner>,
@@ -129,10 +138,13 @@ impl DemandPager {
         // SAFETY: `fault::install`'s four conditions, in order.
         //
         // * `context` is the address of a `Box` this `DemandPager` owns and never moves out of, and
-        //   `registration` is declared before `inner` so it is dropped -- and the slot cleared with
-        //   a release store -- before the box is freed.
+        //   `registration` is declared before `inner`, so it is dropped first -- and that drop is a
+        //   quiescence point: it clears the slot and then waits for every dispatch already inside
+        //   `handle_fault` to return. So the box is freed only once no frame can hold its address.
+        //   Field order alone would not be enough, and used not to be; see the type docs.
         // * `handle_fault` wraps its whole body in `catch_unwind` and reports a panic as
-        //   `NotOurs`, so nothing unwinds into the dispatcher.
+        //   `NotOurs`, so nothing unwinds into the dispatcher, and it always returns: its longest
+        //   path is one region lookup plus one `ensure_committed`, both bounded.
         // * It takes this space's internal lock, and the module docs state the matching invariant:
         //   the thread running guest code never holds it. A thread-local guard breaks the
         //   single-thread version of a violation.
@@ -198,8 +210,9 @@ fn handle_fault(context: usize, fault: &Fault) -> FaultOutcome {
     }
     // SAFETY: `context` is the address of the `Box<PagerInner>` owned by the `DemandPager` whose
     // registration published it. The registration is dropped before the box (field order in
-    // `DemandPager`), and `release` clears the slot with a release store before returning, so no
-    // call can begin after the box is freed.
+    // `DemandPager`), and that drop clears the slot and then **waits for this function to return**
+    // on every thread already inside it. So neither a call that has begun nor one about to begin can
+    // outlive the box: the first is drained, the second never starts.
     let inner: &PagerInner = unsafe { &*inner };
 
     // A cheap bounds check before anything else: every access violation in the process arrives

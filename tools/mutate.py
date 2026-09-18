@@ -49,6 +49,7 @@ CPU_RUN = "crates/omni-cpu/src/run.rs"
 CPU_TLS = "crates/omni-cpu/src/tls.rs"
 CPU_DYN = "crates/omni-cpu/src/dynarmic/mod.rs"
 PAGER = "crates/omni-mem/src/pager.rs"
+FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
 LEAF = "crates/omni-elf/src/leaf.rs"
 
@@ -415,6 +416,50 @@ MUTATIONS = [
      """    match inner.space.ensure_committed(region.start, region.len) {""",
      MEM_AND_CPU),
     # ---- .eh_frame: the function map M2's whole choice of code rests on -------------------------
+    # ---- C1: the handler slot is drained, not merely cleared -------------------------------------
+    # Two rows on the quiescence protocol and two on what it must NOT cost. There is deliberately no
+    # row weakening the `SeqCst` accesses to acquire/release: the pair is the Dekker shape, so the
+    # weakening is genuinely wrong, but x86-64 is TSO and the only reordering that exposes it is one
+    # the hardware does not perform. A row that cannot fail is worse than no row (Task 1), and the
+    # argument lives in the module docs instead. There is likewise no row for taking the in-flight
+    # reference *after* the handler load rather than before: the window it opens is between two
+    # instructions, and no deterministic test can land in it.
+    ("plat-A3", "A", "the drain removed, so release returns with a dispatch still in the handler",
+     FAULT,
+     """    if slot.active.load(Ordering::SeqCst) != 0 {
+        DRAINED.fetch_add(1, Ordering::Relaxed);""",
+     """    if false && slot.active.load(Ordering::SeqCst) != 0 {
+        DRAINED.fetch_add(1, Ordering::Relaxed);""",
+     PLATFORM),
+
+    ("plat-A4", "A", "the in-flight reference dropped before the handler call instead of after",
+     FAULT,
+     """        let handler: FaultHandler = unsafe { core::mem::transmute::<usize, FaultHandler>(handler) };
+        let outcome = handler(context, fault);
+        drop(guard);""",
+     """        let handler: FaultHandler = unsafe { core::mem::transmute::<usize, FaultHandler>(handler) };
+        drop(guard);
+        let outcome = handler(context, fault);""",
+     PLATFORM),
+
+    ("plat-B7", "B", "the drain made a whole-table barrier, so one space waits on another's fault",
+     FAULT,
+     """    if slot.active.load(Ordering::SeqCst) != 0 {
+        DRAINED.fetch_add(1, Ordering::Relaxed);
+        let mut spins: u32 = 0;
+        while slot.active.load(Ordering::SeqCst) != 0 {""",
+     """    if SLOTS.iter().any(|s| s.active.load(Ordering::SeqCst) != 0) {
+        DRAINED.fetch_add(1, Ordering::Relaxed);
+        let mut spins: u32 = 0;
+        while SLOTS.iter().any(|s| s.active.load(Ordering::SeqCst) != 0) {""",
+     PLATFORM),
+
+    ("plat-B8", "B", "slots retired rather than reused, the cheaper C1 fix the review offered",
+     FAULT,
+     """    slot.handler.store(0, Ordering::SeqCst);""",
+     """    slot.handler.store(CLAIMING, Ordering::SeqCst);""",
+     PLATFORM),
+
     ("elf-A20", "A", "the table's datarel base dropped, so every function start is wrong",
      EH_FRAME,
      """        Apply::DataRelative => hdr_vaddr,""",

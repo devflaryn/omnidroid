@@ -34,6 +34,26 @@
 //!   passes through here, including ones belonging to other code entirely. A handler that cannot
 //!   immediately recognise the address as its own returns [`FaultOutcome::NotOurs`], which lets
 //!   normal dispatch continue as though this module were not installed.
+//! * **It must return.** Dropping a [`FaultRegistration`] waits for every dispatch already inside
+//!   that slot's handler to come back before it lets the registrant free the context, so a handler
+//!   that never returns turns a teardown into a hang. That is the price of the guarantee below, and
+//!   it is the right way round: the failure it replaces was a use-after-free inside an exception
+//!   dispatcher.
+//!
+//! # The guarantee a registrant gets back
+//!
+//! **When the registration's `drop` returns, no dispatch is inside that handler and none can
+//! start.** The registrant may then free the context, and a slot the table hands out afterwards
+//! cannot be paired with the old one.
+//!
+//! This is stated here because the earlier version of this contract was **insufficient rather than
+//! violated**, which is why no review of either side alone could see it. It asked only that the
+//! context stay valid "until the registration is dropped", and `omni-mem` satisfied that exactly —
+//! it declared the registration field before the state, so the slot was cleared first. But clearing
+//! a slot only stops calls that have not yet read it. A vectored handler is **process-wide**: it
+//! runs on whatever thread faulted, for whatever reason, and can be preempted between loading a
+//! handler pointer and calling it. Nothing a registrant can write makes that window safe, so the
+//! window is closed here instead. See `windows.rs` for the mechanism and its ordering argument.
 //!
 //! # Scope
 //!
@@ -115,6 +135,9 @@ pub enum FaultOutcome {
 /// module owns, and must not touch anything whose validity depends on a `Drop` having not yet run.
 /// A raw `fn` and a `usize` are the smallest thing that can be published to the handler table with a
 /// single atomic store.
+///
+/// The "`Drop` having not yet run" clause is now *enforced* for the context rather than merely
+/// asked for: dropping a [`FaultRegistration`] does not return until this handler is quiescent.
 pub type FaultHandler = fn(context: usize, fault: &Fault) -> FaultOutcome;
 
 /// How many handlers can be installed at once.
@@ -141,6 +164,12 @@ pub struct FaultStats {
     pub resolved: u64,
     /// Of those, how many every handler declined, so that dispatch continued elsewhere.
     pub declined: u64,
+    /// Releases that found a dispatch still inside the handler and waited for it to return.
+    ///
+    /// Every one of these would have been a use-after-free under the pre-quiescence contract, so it
+    /// is the one counter here that measures a *hazard avoided* rather than work done. It is
+    /// legitimately zero on a quiet run, and a non-zero value is not a defect.
+    pub drained: u64,
 }
 
 /// Result alias for this module.
@@ -189,7 +218,8 @@ impl FaultError {
     }
 }
 
-/// Install a fault handler. It is removed when the returned registration is dropped.
+/// Install a fault handler. It is removed when the returned registration is dropped, and **the drop
+/// does not return until the handler is quiescent**.
 ///
 /// The process-wide vectored handler is installed on the first call and is **never removed**, even
 /// after the last registration is dropped: removing it would open a window in which a fault could
@@ -206,12 +236,17 @@ impl FaultError {
 /// * **`context` stays valid and pinned** until the returned [`FaultRegistration`] is dropped.
 ///   Nothing here can check that — the whole point of a `usize` is that this module never looks at
 ///   it — and a handler reading a freed context is a use-after-free inside an exception dispatcher.
+///   Dropping the registration is a **quiescence point**: it blocks until every dispatch already
+///   inside `handler` has returned, so freeing the context immediately afterwards is sound. Before
+///   the drop it is not, whatever the caller's field order is, because the dispatcher is
+///   process-wide and a call can be in flight on a thread the caller knows nothing about.
 /// * **`handler` does not unwind.** It runs inside the OS exception dispatcher, across a frame
 ///   boundary with no unwind tables. A Rust panic escaping it is undefined behaviour, not a crash
 ///   that can be caught, so a handler that can panic must contain its own panics.
-/// * **`handler` does not take a lock that the faulting thread might already hold**, and does not
-///   block. An access violation arrives at an arbitrary instruction, so any lock it takes must be
-///   one that is never held across the work that can fault.
+/// * **`handler` does not take a lock that the faulting thread might already hold**, does not
+///   block, and **returns**. An access violation arrives at an arbitrary instruction, so any lock it
+///   takes must be one that is never held across the work that can fault; and since a teardown waits
+///   for it, a handler that does not return converts that teardown into a hang.
 /// * **`handler` returns [`FaultOutcome::Resolved`] only if the address really was made
 ///   accessible.** Resolving without fixing anything produces an infinite fault loop rather than a
 ///   crash, which is the harder of the two to diagnose.
@@ -238,7 +273,8 @@ pub fn available() -> bool {
     backend::AVAILABLE
 }
 
-/// A live handler registration. Dropping it stops the handler being called.
+/// A live handler registration. Dropping it stops the handler being called **and waits for any call
+/// already in flight to return**.
 ///
 /// Not `Clone`: the slot is released exactly once.
 #[derive(Debug)]
@@ -255,6 +291,10 @@ impl FaultRegistration {
 }
 
 impl Drop for FaultRegistration {
+    /// Unpublishes the slot and then **waits until the handler is quiescent**.
+    ///
+    /// The wait is the whole point, and it is why this is not just a store: see the module docs. The
+    /// registrant's `context` may be freed the instant this returns, and may not be freed before it.
     fn drop(&mut self) {
         backend::release(self.slot);
     }
