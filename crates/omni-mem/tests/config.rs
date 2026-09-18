@@ -20,24 +20,47 @@ fn the_defaults_are_the_measured_ones() {
     assert_eq!(config.commit_granule, DEFAULT_COMMIT_GRANULE);
     assert_eq!(config.commit_granule, 64 * 1024, "the low end of D10's 64 KB to 1 MB range");
     assert!(config.base_alignment.is_power_of_two());
-    // The commit ceilings. These are the bound on the *scarce* resource, so they are pinned here
-    // rather than left to drift: a ceiling at or above the space size would be no ceiling at all,
-    // because total commit can never exceed the space anyway.
+    // The two commit ceilings, pinned here because they are the bound on the *scarce* resource and
+    // because the pair only works if each stays on its own side of the gap between legitimate use
+    // and the demonstrated attack.
     assert_eq!(config.max_committed, DEFAULT_MAX_COMMITTED);
-    assert_eq!(config.max_committed, 2 * 1024 * 1024 * 1024, "half of the default 4 GiB space");
+    assert_eq!(config.max_commit_request, DEFAULT_MAX_COMMIT_REQUEST);
+    assert!(config.max_commit_request <= config.max_committed);
+
+    // The loose one. It must clear D10's measured 3 GB of live use plus its page-table charge
+    // (size/512), because the project goal has an instance legitimately needing several GB during
+    // startup — a default that refuses that has broken the feature in the name of fixing the hole.
+    const THREE_GB: usize = 3 * 1024 * 1024 * 1024;
+    assert!(
+        config.max_committed >= THREE_GB + THREE_GB / 512,
+        "the total ceiling must permit D10's validated 3 GB of live use at the defaults"
+    );
+    // And it must stay below the space, or it bounds nothing: total commit can never exceed the
+    // space's own size anyway.
     assert!(
         config.max_committed < config.size,
         "a commit ceiling at or above the space size bounds nothing"
     );
-    assert_eq!(config.max_commit_request, DEFAULT_MAX_COMMIT_REQUEST);
-    assert_eq!(config.max_commit_request, 256 * 1024 * 1024);
-    assert!(config.max_commit_request <= config.max_committed);
-    // And the margin over what a real load actually costs: `libroblox.so` is 16.7 MiB of commit
-    // charge in total and 11.6 MB of that is the one eager `.bss` mapping, which is what the
-    // per-request ceiling is really about.
+
+    // The tight one, which is what actually refuses the attack. Bracketed on both sides by measured
+    // values: above the largest eager mapping anywhere in the workspace (the D10 requirement test's
+    // 64 MiB chunk) and far below the smaller demonstrated tamper (+1026.004 MiB from a 1 GiB
+    // `p_memsz`). The largest private anonymous piece any real library asks for is `libroblox.so`'s
+    // 11,575,296-byte `.bss`; the next largest across the eleven is 61,440 bytes.
+    const LARGEST_REAL_SEGMENT: usize = 11_575_296;
+    const LARGEST_EAGER_MAPPING_IN_THE_SUITE: usize = 64 * 1024 * 1024;
+    const SMALLER_DEMONSTRATED_ATTACK: usize = 1_076_000_000;
     assert!(
-        config.max_commit_request > 20 * 11_600_000,
-        "the per-request ceiling should leave a wide margin over the 11.6 MB of .bss a real load          commits eagerly"
+        config.max_commit_request >= 2 * LARGEST_EAGER_MAPPING_IN_THE_SUITE,
+        "the per-request ceiling must leave room for the largest eager mapping the suite makes"
+    );
+    assert!(
+        config.max_commit_request >= 8 * LARGEST_REAL_SEGMENT,
+        "and a wide margin over the largest segment any real library asks to be committed at once"
+    );
+    assert!(
+        config.max_commit_request * 8 <= SMALLER_DEMONSTRATED_ATTACK,
+        "and it must refuse the measured tampered `p_memsz` with room to spare, or the pair does          not separate the attack from legitimate growth"
     );
 
     let arena = ArenaConfig::default();

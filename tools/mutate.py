@@ -85,6 +85,20 @@ MUTATIONS = [
      """                if let Err(rollback) = (if true { Ok(()) } else { inner.unmap_range(OP, address, size) }) {""",
      MEM),
 
+    # ---- the ceilings must separate the attack from legitimate growth ---------------------------
+    # The pair only works if each stays on its own side of the gap, so both sides are mutated. A1-A3
+    # above prove the attack is refused; these two prove the legitimate case is not, which is the
+    # direction that would let a security fix quietly break the feature.
+    ("mem-B2", "B", "the per-request ceiling tightened below a legitimate eager mapping", SPACE,
+     """pub const DEFAULT_MAX_COMMIT_REQUEST: usize = 128 * 1024 * 1024;""",
+     """pub const DEFAULT_MAX_COMMIT_REQUEST: usize = 32 * 1024 * 1024;""",
+     MEM),
+
+    ("mem-B3", "B", "the total ceiling lowered below D10's validated 3 GB of live use", SPACE,
+     """pub const DEFAULT_MAX_COMMITTED: usize = 3584 * 1024 * 1024;""",
+     """pub const DEFAULT_MAX_COMMITTED: usize = 2048 * 1024 * 1024;""",
+     MEM),
+
     # ---- the ceiling must not bind on the lazy path (direction B) -------------------------------
     ("mem-B1", "B", "lazy commit made eager: a granule becomes the whole mapping", SPACE,
      """                CommitPolicy::Lazy => owner.granule,""",

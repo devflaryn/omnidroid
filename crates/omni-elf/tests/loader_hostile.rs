@@ -22,7 +22,7 @@ mod common;
 use common::synth;
 use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
 use omni_elf::{ElfError, ElfImage, LoadError};
-use omni_mem::{Backing, GuestSpace, MapExecutability, Protection};
+use omni_mem::{Backing, GuestSpace, MapExecutability, MemError, Protection};
 
 /// Load a tampered synthetic library, and assert that whatever happened left nothing behind.
 fn attempt(label: &str, edit: impl FnOnce(&mut Vec<u8>)) -> Result<(), LoadError> {
@@ -698,6 +698,11 @@ fn tampering_the_real_librarys_packed_relocation_targets_is_refused() {
     }
 }
 
+/// The host page size, from a live space.
+fn f_page(space: &GuestSpace) -> usize {
+    space.page_size()
+}
+
 #[test]
 fn every_library_in_the_apk_loads() {
     // The other ten use plain `DT_RELA` plus `DT_JMPREL` rather than `APS2`, and several are small
@@ -709,6 +714,7 @@ fn every_library_in_the_apk_loads() {
     let mut total_imports = 0usize;
     let mut tail_copies = 0usize;
     let mut worst_anonymous = 0usize;
+    let mut worst_piece = (0usize, String::new());
     eprintln!("\n{:<40} {:>10} {:>8} {:>8} {:>7}", "library", "relocs", "imports", "init", "span");
     for name in common::libraries().expect("the APK is present").keys() {
         let path = common::cached_library(name).expect("in the cache");
@@ -735,6 +741,18 @@ fn every_library_in_the_apk_loads() {
         total_relocations += object.stats.relocations.applied;
         total_imports += object.imports.total();
         worst_anonymous = worst_anonymous.max(object.stats.anonymous_bytes);
+        // The largest *single* anonymous piece, which is what one eager commit call asks for and
+        // therefore what `GuestSpaceConfig::max_commit_request` has to sit above.
+        let page = f_page(&space);
+        let plan = omni_elf::LoadPlan::build(&elf, backing.len(), page).expect("plan");
+        let mut here = 0usize;
+        for piece in plan.pieces.iter().filter(|p| p.anonymous) {
+            here = here.max(piece.len);
+            if piece.len > worst_piece.0 {
+                worst_piece = (piece.len, name.clone());
+            }
+        }
+        eprintln!("{name:<40} largest single anonymous piece {here:>10} bytes");
         if object.stats.anonymous_bytes > 0 && object.span() < 0x10000 {
             tail_copies += 1;
         }
@@ -749,6 +767,24 @@ fn every_library_in_the_apk_loads() {
          accounted for, {tail_copies} needed a private final page"
     );
     assert!(total_relocations > 568_806, "the main library alone has 568,806");
+    // The largest single anonymous piece any real library asks for. This is the quantity
+    // `GuestSpaceConfig::max_commit_request` is bracketed against on the legitimate side — one eager
+    // commit call asks for exactly this — so it is asserted here rather than quoted in a doc comment
+    // and left to drift. Measured: 11,575,296 bytes in `libroblox.so`; the next largest across the
+    // eleven is 61,440, which is 188x smaller.
+    eprintln!(
+        "largest single anonymous piece across the 11 libraries: {} bytes in {}, {}x below the          {} byte per-request commit ceiling",
+        worst_piece.0,
+        worst_piece.1,
+        omni_mem::DEFAULT_MAX_COMMIT_REQUEST / worst_piece.0.max(1),
+        omni_mem::DEFAULT_MAX_COMMIT_REQUEST
+    );
+    assert!(
+        worst_piece.0 * 8 <= omni_mem::DEFAULT_MAX_COMMIT_REQUEST,
+        "the largest single segment a real library asks to be committed at once is          {} bytes, which leaves less than 8x under the {} byte per-request ceiling; either a          library grew or the ceiling is too tight to be safe",
+        worst_piece.0,
+        omni_mem::DEFAULT_MAX_COMMIT_REQUEST
+    );
 
     // The margin under `LoaderConfig::max_anonymous_bytes`, asserted rather than assumed, for the
     // same reason `Aps2Limits`' margin is: a chosen limit has to be visibly far from every real
@@ -832,15 +868,23 @@ fn the_guest_spaces_commit_ceiling_refuses_a_gigabyte_of_bss_on_its_own() {
     let err = loader::load(&space, &backing, &elf, &ProviderRegistry::empty_provider(), &config)
         .expect_err("omni-mem must refuse to commit a gigabyte");
     match &err {
-        LoadError::Memory(inner) => {
-            let text = inner.to_string();
+        // Specifically the **per-request** ceiling, not the total one. That distinction is the whole
+        // design: the total ceiling is 3.5 GiB precisely so that D10's validated 3 GB of legitimate
+        // growth passes at the defaults, so it cannot and must not be what refuses a 1 GiB request.
+        // What separates the attack from legitimate growth is shape — one mapping in one call —
+        // and this asserts that the shape is what caught it.
+        LoadError::Memory(MemError::CommitRequestTooLarge { requested, limit, .. }) => {
+            // The whole tampered `.bss` in one call: `p_memsz` of 0x4000_0000 less the one page of
+            // the segment that is file-backed. One call, one gigabyte — which is the shape, not the
+            // size, that the per-request ceiling exists to catch.
+            assert_eq!(*requested, 0x4000_0000 - 0x1000, "the whole tampered .bss, in one call");
+            assert_eq!(*limit, omni_mem::DEFAULT_MAX_COMMIT_REQUEST);
             assert!(
-                text.contains("per-request ceiling") || text.contains("commit charge"),
-                "the refusal must be the commit ceiling, got {text}"
+                err.to_string().contains(&omni_mem::DEFAULT_MAX_COMMIT_REQUEST.to_string()),
+                "and the message names the limit: {err}"
             );
-            assert!(text.contains("268435456"), "and must name the limit: {text}");
         }
-        other => panic!("expected a memory error, got {other}"),
+        other => panic!("expected CommitRequestTooLarge, got {other}"),
     }
     eprintln!("p_memsz 1 GiB, loader limit lifted           -> {err}");
 

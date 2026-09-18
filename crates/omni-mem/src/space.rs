@@ -61,11 +61,11 @@ pub const DEFAULT_SPACE_SIZE: usize = 4 * 1024 * 1024 * 1024;
 /// [`GuestSpaceConfig::commit_granule`] overrides it for a region known to be densely used.
 pub const DEFAULT_COMMIT_GRANULE: usize = 64 * 1024;
 
-/// The default ceiling on total commit charge one guest address space may hold: 2 GiB.
+/// The default ceiling on total commit charge one guest address space may hold: 3.5 GiB.
 ///
-/// # Why a ceiling exists at all
+/// # Why there are two ceilings and not one
 ///
-/// Because commit charge is the scarce resource (D10, Global Constraint 6) and *every* quantity that
+/// Commit charge is the scarce resource (D10, Global Constraint 6), and *every* quantity that
 /// decides how much of it to spend arrives, somewhere up the stack, from a file. The measured case:
 /// `p_memsz` of a `PT_LOAD` is attacker-controlled (D6 says a tampered library is the expected
 /// input), the ELF loader turns the part of it past `p_filesz` into an anonymous `.bss` mapping, and
@@ -73,45 +73,75 @@ pub const DEFAULT_COMMIT_GRANULE: usize = 64 * 1024;
 /// `p_memsz` was measured to take +1026.004 MiB of commit charge at 1 GiB and **+3406.664 MiB at
 /// 3.3 GiB, with the load reporting success**, against the 16.7 MiB a stock load costs.
 ///
-/// `omni-elf` bounds the image *span* against 4 GiB — but D10 measured address space as free, so
-/// that check guards the abundant resource and left the scarce one open. The bound belongs here
-/// instead, at the one place commit is actually performed, because every future consumer needs it:
-/// D5 measured dynarmic's per-thread code caches at 20–35 MiB **each** with no sharing between
-/// threads, and a loader-only fix would not cover them.
+/// But the project goal has Roblox *legitimately* needing several GB during startup before settling
+/// near 500 MB, and D10 validated exactly that: an instance grown to **3 GB of live use** and then
+/// released, falling back to 513.656 MiB with its 4 GiB reservation intact. So a single ceiling
+/// cannot do the job. Any number loose enough to permit 3 GB of legitimate growth is also loose
+/// enough to permit a 3.3 GiB attack: **the two are separated by shape, not by size.** One is many
+/// mappings growing over time; the other is *one* mapping committed in *one* call.
 ///
-/// # Why 2 GiB
+/// Hence the pair. [`DEFAULT_MAX_COMMIT_REQUEST`] is tight and does the security work, because
+/// nothing legitimate commits a multi-gigabyte mapping in a single call. This constant is loose and
+/// exists so that no single instance can turn its whole address space into commit charge.
 ///
-/// Chosen, not derived, and deliberately stated as a choice. It is half of
-/// [`DEFAULT_SPACE_SIZE`], which is what makes it a real bound: total commit can never exceed the
-/// space's own size anyway, so a ceiling at or above that size would be no ceiling at all. Above it
-/// sits everything measured: a whole `libroblox.so` costs 16.7 MiB, the largest legitimate figure in
-/// the foundation is the 1 GiB the D10 requirement test grows to, and a 32-thread guest's code
-/// caches would be 0.6–1.1 GiB — though those are arena sections and are charged elsewhere. Below it
-/// sits the tampered case, refused with a 1.6x margin at 1 GiB and a 5.3x margin at 3.3 GiB.
+/// The bound lives here, at the one place commit is actually performed, rather than in the loader,
+/// because every future consumer needs it: D5 measured dynarmic's per-thread code caches at
+/// 20–35 MiB **each** with no sharing between threads, and a loader-only fix would not cover them.
 ///
-/// An instance that legitimately needs more says so in [`GuestSpaceConfig::max_committed`], and
-/// finds out by a typed [`MemError::CommitCeiling`] naming the request, the total and the limit
-/// rather than by taking the machine's commit limit with it.
-pub const DEFAULT_MAX_COMMITTED: usize = 2 * 1024 * 1024 * 1024;
+/// # Why 3.5 GiB
+///
+/// It is bracketed, not picked. The floor is the requirement: D10's measured 3 GB of live use has to
+/// pass **at the defaults**, or the fix for the attack has broken the feature, so the ceiling must
+/// clear 3 GB plus its page-table charge (`size / 512`, measured) — about 3078 MiB. The cap is
+/// [`DEFAULT_SPACE_SIZE`]: total commit can never exceed the space's own size anyway, so a ceiling
+/// at or above 4 GiB would be no ceiling at all. 3.5 GiB sits between them, leaving 512 MiB of
+/// headroom over the validated scenario while still refusing to commit the whole space.
+///
+/// Within a 4 GiB space that is deliberately a **weak** bound, and it is meant to be: it is not what
+/// stops the attack. It is what stops one instance from spending its entire address space, and it is
+/// the per-instance budget to lower for a host running many instances. Scale it with
+/// [`GuestSpaceConfig::size`] rather than inheriting this default for a much larger space.
+pub const DEFAULT_MAX_COMMITTED: usize = 3584 * 1024 * 1024;
 
-/// The default ceiling on a single commit request: 256 MiB.
+/// The default ceiling on a single commit request: 128 MiB.
 ///
-/// The sharper half of the pair, and the one that catches the tampered `p_memsz` on its own. A
+/// **The tight half of the pair, and the one that refuses the tampered `p_memsz`.** A
 /// [`CommitPolicy::Lazy`] mapping commits one granule — 64 KiB by default — per call, so this never
-/// binds on the lazy path however large the mapping is. A [`CommitPolicy::Eager`] mapping commits
-/// its **whole length in one call** by construction, so in practice this is the ceiling on how large
-/// an eagerly-committed mapping may be.
+/// binds on the lazy path however large the mapping is, which is what lets an instance grow to
+/// gigabytes under [`DEFAULT_MAX_COMMITTED`]. A [`CommitPolicy::Eager`] mapping commits its **whole
+/// length in one call** by construction, so in practice this is the ceiling on how large an
+/// eagerly-committed mapping may be — and a multi-gigabyte one is absurd for any real library.
 ///
-/// Chosen, not derived. Every eager mapping the foundation makes is far below it: `libroblox.so`'s
-/// `.bss` is 11.6 MB, its `.data` tail copies are a page or two each, and the largest eager mapping
-/// in any test is the 64 MiB chunk of the D10 requirement test. 256 MiB is 22x the real `.bss` and
-/// 4x the largest test mapping, and it refuses the measured 1 GiB tamper four times over.
+/// # Why 128 MiB
+///
+/// Bracketed by measurement rather than rounded to taste. The largest private anonymous piece any
+/// real library asks for, across all eleven `.so` in the APK:
+///
+/// | library | largest single anonymous piece |
+/// |---|---|
+/// | `libroblox.so` | **11,575,296 B** (11.04 MiB) — its `.bss` |
+/// | `libzstd-jni-1.5.7-6.so` | 61,440 B |
+/// | `libbacktrace-native.so` | 24,576 B |
+/// | six others | 4,096 B |
+/// | two others | 0 |
+///
+/// So the real corpus has exactly one segment above 64 KiB, and the second-largest is **188x
+/// smaller** than it. The other legitimate constraint is not a library at all: the D10 requirement
+/// test grows an instance in eager 64 MiB chunks, which is the largest single eager commit anywhere
+/// in the workspace and stands in for a guest asking for a large region up front.
+///
+/// That brackets the value between **64 MiB** (must pass) and **1,026 MiB** (the smaller demonstrated
+/// attack; must fail). 128 MiB is the smallest power of two clear of the legitimate side with a
+/// factor of two in hand. Margins: **11.6x** the largest real segment, 2185x the second-largest
+/// library's, 2x the largest eager mapping in the suite; **8.4x** below the 1 GiB tamper and **27x**
+/// below the 3.3 GiB one. Nothing measured lies between 64 MiB and 1 GiB, which is why a looser
+/// value would buy nothing and a tighter one would start colliding with legitimate use.
 ///
 /// It is the per-*request* limit and not a per-mapping one because a per-mapping total would have to
 /// be recomputed by walking that mapping's entries on every granule commit, which is quadratic in
 /// exactly the case lazy commit exists for. What a mapping accumulates over many granules is bounded
 /// by [`DEFAULT_MAX_COMMITTED`] instead.
-pub const DEFAULT_MAX_COMMIT_REQUEST: usize = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_COMMIT_REQUEST: usize = 128 * 1024 * 1024;
 
 /// Whether a mapping's pages are committed up front or on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

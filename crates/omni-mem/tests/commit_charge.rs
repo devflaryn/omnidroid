@@ -33,7 +33,7 @@ use std::time::Instant;
 use common::{KIB, MIB};
 use omni_mem::{
     ArenaConfig, Backing, CodeArena, CommitBudget, CommitPolicy, GuestSpace, GuestSpaceConfig,
-    MapExecutability, Placement, Protection,
+    MapExecutability, MemError, Placement, Protection,
 };
 use omni_platform::vm;
 
@@ -705,4 +705,152 @@ fn the_commit_budget_reports_the_arena_memory_the_process_counter_cannot_see() {
 
     space.unmap(address, guest).expect("unmap");
     space.close().expect("close");
+}
+
+/// **The other half of the requirement.** An instance grows to 3 GiB of committed guest memory at
+/// the *default* ceilings, with no configuration at all, and gets every byte of it back.
+///
+/// This is the test that proves the commit ceiling did not fix a security hole by breaking the
+/// feature. The project goal has Roblox legitimately needing several GB during startup before
+/// settling near 500 MB, and D10 validated exactly that shape: an instance grown to 3 GB of live use
+/// and then released, falling back to 513.656 MiB with its 4 GiB reservation intact. A ceiling that
+/// refuses it is not a fix.
+///
+/// It is also why there are *two* ceilings. The tampered `p_memsz` the whole-branch review measured
+/// asked for 3.3 GiB — more than this test commits — so no single number separates them. What
+/// separates them is shape: this is 48 mappings growing over time, each well inside
+/// `max_commit_request`; that was **one** mapping committed in **one** call. The sibling test
+/// `an_eager_mapping_past_the_per_request_ceiling_is_refused` in `space.rs` is this test's other
+/// half, and neither is evidence without the other.
+#[test]
+fn an_instance_grows_to_three_gibibytes_at_the_default_ceilings() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    // Deliberately `new()`: the point is that this needs no configuration.
+    let space = GuestSpace::new().expect("reserve a 4 GiB guest address space");
+    let baseline = charge();
+    let chunk = 64 * MIB;
+    let chunks = 48;
+    let total = chunk * chunks;
+    assert_eq!(total, 3 * 1024 * MIB, "3 GiB, in the D10 requirement test's 64 MiB chunks");
+
+    let mut addresses = Vec::new();
+    for index in 0..chunks {
+        match space.map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            chunk,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        ) {
+            Ok(address) => addresses.push(address),
+            Err(error) => {
+                // A machine without 3 GiB of commit available is an environment limit, not a defect
+                // — but it must not look like a pass. Say so on the real stderr, which libtest does
+                // not discard, and give back what was taken.
+                let is_commitment_limit = error
+                    .platform_error()
+                    .and_then(|platform| platform.os_error())
+                    .is_some_and(|os| os.code() == 1455);
+                assert!(
+                    is_commitment_limit,
+                    "mapping {index} of {chunks} was refused by something other than the system \
+                     commit limit, which is the defect this test exists to catch: {error}"
+                );
+                use std::io::Write;
+                let notice = format!(
+                    "\n!! SKIPPED an_instance_grows_to_three_gibibytes_at_the_default_ceilings: \
+                     this machine ran out of system commit charge after {} of {total} bytes. The \
+                     ceilings were NOT exercised.\n",
+                    index * chunk
+                );
+                let _ = std::io::stderr().write_all(notice.as_bytes());
+                for address in addresses {
+                    space.unmap(address, chunk).expect("unmap");
+                }
+                return;
+            }
+        }
+    }
+
+    let peak = charge() - baseline;
+    eprintln!(
+        "grown to {} MiB at the default ceilings (max_committed {} MiB, max_commit_request {} MiB): \
+         commit {}",
+        total / MIB,
+        omni_mem::DEFAULT_MAX_COMMITTED / MIB,
+        omni_mem::DEFAULT_MAX_COMMIT_REQUEST / MIB,
+        mib(peak)
+    );
+    // Against the size **plus its page-table charge**, which D10 measured as `size / 512` and Task 2
+    // confirmed independently two orders of magnitude away (64 MiB committed cost +64.125 MiB). At
+    // 3 GiB that is 6 MiB — larger than the shared tolerance, so asserting against the bare size
+    // would need the tolerance loosened. Pinning the model instead is stricter, not looser.
+    let page_tables = (total / 512) as i64;
+    assert_close(
+        peak,
+        total as i64 + page_tables,
+        "3 GiB of live guest mappings at the defaults, plus size/512 of page tables",
+    );
+    assert_eq!(space.stats().committed, total, "the space agrees with the OS");
+
+    // The mappings are real and distinct, not one range handed out 48 times: a byte at the first and
+    // last page of each, read back.
+    for (index, &address) in addresses.iter().enumerate() {
+        // SAFETY: the whole range is mapped ReadWrite and committed.
+        unsafe {
+            let pointer = space.ptr(address, chunk).expect("in the space");
+            pointer.write(index as u8);
+            pointer.add(chunk - 4096).write(index as u8);
+        }
+    }
+    for (index, &address) in addresses.iter().enumerate() {
+        // SAFETY: as above.
+        unsafe {
+            let pointer = space.ptr(address, chunk).expect("in the space");
+            assert_eq!(pointer.read(), index as u8, "mapping {index} holds the wrong byte");
+            assert_eq!(pointer.add(chunk - 4096).read(), index as u8);
+        }
+    }
+
+    // One more chunk past the ceiling is refused, so the bound is real rather than merely distant:
+    // 3072 + 64 MiB is still under 3.5 GiB, so this walks up to it rather than leaping past it.
+    let mut extra = Vec::new();
+    let mut refusal = None;
+    for _ in 0..16 {
+        match space.map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            chunk,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        ) {
+            Ok(address) => extra.push(address),
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
+    let refusal = refusal.expect("the total ceiling must eventually refuse");
+    assert!(
+        matches!(refusal, MemError::CommitCeiling { .. }),
+        "expected CommitCeiling, got {refusal}"
+    );
+    eprintln!(
+        "after {} further 64 MiB chunks the total ceiling refused: {refusal}",
+        extra.len()
+    );
+    assert_eq!(
+        space.stats().committed,
+        total + extra.len() * chunk,
+        "the refusal changed nothing"
+    );
+
+    // And all of it comes back. This is D10's "grown to 3 GB and then released" end to end.
+    for address in addresses.into_iter().chain(extra) {
+        space.unmap(address, chunk).expect("unmap");
+    }
+    let after = charge() - baseline;
+    eprintln!("after releasing everything: commit {} (page tables were {})", mib(after), mib(page_tables));
+    assert_close(after, 0, "releasing 3 GiB of guest mappings");
+    assert_eq!(space.stats().committed, 0);
+    space.close().expect("close the guest space");
 }
