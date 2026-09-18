@@ -44,11 +44,21 @@ LOADER = "crates/omni-elf/src/loader/mod.rs"
 ZIP = "crates/omni-apk/src/zip.rs"
 CPU_CONTEXT = "crates/omni-cpu/src/context.rs"
 CPU_REGS = "crates/omni-cpu/src/regs.rs"
+CPU_FASTMEM = "crates/omni-cpu/src/fastmem.rs"
+CPU_RUN = "crates/omni-cpu/src/run.rs"
+CPU_TLS = "crates/omni-cpu/src/tls.rs"
+CPU_DYN = "crates/omni-cpu/src/dynarmic/mod.rs"
+PAGER = "crates/omni-mem/src/pager.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
 CPU = ["cargo", "test", "-p", "omni-cpu", "--no-fail-fast"]
 PLATFORM = ["cargo", "test", "-p", "omni-platform", "--no-fail-fast"]
+# The demand pager is policy in `omni-mem` driven by execution in `omni-cpu`, so a mutation of it
+# has to run both: its unit tests live with the code and its behavioural tests live with the guest
+# that provokes the faults. A row scoped to one of the two reported a MISS that was a gap in the
+# harness rather than in the tests, which is worth leaving written down.
+MEM_AND_CPU = ["cargo", "test", "-p", "omni-mem", "-p", "omni-cpu", "--no-fail-fast"]
 ELF = ["cargo", "test", "-p", "omni-elf", "--no-fail-fast"]
 APK = ["cargo", "test", "-p", "omni-apk", "--no-fail-fast"]
 # The commit-charge figures are only meaningful in a release build.
@@ -260,6 +270,126 @@ MUTATIONS = [
      """    if local_name != record.name {""",
      """    if false && local_name != record.name {""",
      APK),
+
+    # ---- D4: identity mapping, and the assertion that is its entire defence -----------------------
+    ("cpu-A15", "A", "the D4 startup assertion cannot refuse anything", CPU_FASTMEM,
+     """    let refuse = |setting, expected: u64, actual: u64, consequence| {
+        Err(CpuError::MisconfiguredMemoryPath { setting, expected, actual, consequence })
+    };""",
+     """    let refuse = |_setting, _expected: u64, _actual: u64, _consequence| Ok(());""",
+     CPU),
+
+    ("cpu-A16", "A", "the fastmem width is no longer required to be 64", CPU_FASTMEM,
+     """    if observed.address_bits != 64 {""",
+     """    if false && observed.address_bits != 64 {""",
+     CPU),
+
+    ("cpu-A17", "A", "a wild guest address may be mirrored into range again", CPU_FASTMEM,
+     """    if observed.mirrors_out_of_range {""",
+     """    if false && observed.mirrors_out_of_range {""",
+     CPU),
+
+    # ---- the run loop: the watchdog and the signed-comparison footgun -----------------------------
+    ("cpu-A18", "A", "a budget reaches the backend unclamped, so u64::MAX reads as negative",
+     CPU_RUN,
+     """    if wanted == 0 {
+        1
+    } else if wanted > MAX_SLICE_INSTRUCTIONS {
+        MAX_SLICE_INSTRUCTIONS
+    } else {
+        wanted
+    }""",
+     """    wanted""",
+     CPU),
+
+    ("cpu-A19", "A", "a zero budget becomes run-forever instead of one instruction", CPU_RUN,
+     """    if wanted == 0 {
+        1
+    } else if""",
+     """    if wanted == 0 {
+        0
+    } else if""",
+     CPU),
+
+    # ---- D13: the bionic thread pointer ----------------------------------------------------------
+    ("cpu-A20", "A", "the stack guard is never written into slot 5", CPU_TLS,
+     """            ptr.add(TLS_SLOT_STACK_GUARD_OFFSET)
+                .cast::<u64>()
+                .write_unaligned(self.guard);""",
+     """            let _ = TLS_SLOT_STACK_GUARD_OFFSET;""",
+     CPU),
+
+    ("cpu-A21", "A", "a recycled TLS block keeps the previous thread's contents", CPU_TLS,
+     """            core::ptr::write_bytes(ptr, 0, self.block_bytes);""",
+     """            if false { core::ptr::write_bytes(ptr, 0, self.block_bytes); }""",
+     CPU),
+
+    ("cpu-A22", "A", "the stack guard may be zero, which equals a zeroed stack slot", CPU_TLS,
+     """        let value = hasher.finish();
+        if value != 0 {
+            return value;
+        }""",
+     """        let value = hasher.finish();
+        if value != 0 {
+            return value & 0;
+        }""",
+     CPU),
+
+    # ---- the backend's own bookkeeping -----------------------------------------------------------
+    ("cpu-A23", "A", "a processor id is never recycled, so threads exhaust the monitor", CPU_DYN,
+     """        self.shared.release_processor_id(self.processor_id);""",
+     """        let _ = self.processor_id;""",
+     CPU),
+
+    ("cpu-A24", "A", "a guest access is served without checking the region's protection", CPU_DYN,
+     """        if !allowed {""",
+     """        if false && !allowed {""",
+     CPU),
+
+    # ---- direction B: over-corrections that read as more careful ----------------------------------
+    ("cpu-B2", "B", "TLS blocks committed eagerly so no guest thread ever faults", CPU_TLS,
+     """                CommitPolicy::Lazy,""",
+     """                CommitPolicy::Eager,""",
+     CPU),
+
+    ("cpu-B3", "B", "block linking turned off as well, for a second escape D16 prices at 7x",
+     CPU_DYN,
+     """        if self.interruptible {
+            optimization::INTERRUPTIBLE
+        } else {""",
+     """        if self.interruptible {
+            optimization::INTERRUPTIBLE & !optimization::BLOCK_LINKING
+        } else {""",
+     CPU),
+
+    ("cpu-B4", "B", "code invalidation refuses a range outside the guest address space", CPU_DYN,
+     """    fn invalidate_code(&mut self, range: GuestRange) -> CpuResult<()> {
+        self.with_ctx(|ctx| ctx.executable_cache = None);""",
+     """    fn invalidate_code(&mut self, range: GuestRange) -> CpuResult<()> {
+        if !self.shared.extent.contains(range.start()) {
+            return Err(CpuError::Unsupported {
+                backend: BACKEND_NAME,
+                operation: "invalidate code outside the guest address space",
+                reason: "over-correction: the trait says such a range is not an error",
+            });
+        }
+        self.with_ctx(|ctx| ctx.executable_cache = None);""",
+     CPU),
+
+    # ---- the demand pager ------------------------------------------------------------------------
+    ("mem-A15", "A", "the pager commits a page the guest may not write", PAGER,
+     """        FaultAccess::Write => protection.is_writable(),""",
+     """        FaultAccess::Write => protection.is_readable(),""",
+     MEM),
+
+    ("mem-A16", "A", "the pager claims faults from outside its own address space", PAGER,
+     """    if fault.address < inner.base || fault.address >= inner.end {
+        return FaultOutcome::NotOurs;
+    }""",
+     """    if false {
+        return FaultOutcome::NotOurs;
+    }""",
+     MEM_AND_CPU),
 ]
 
 
