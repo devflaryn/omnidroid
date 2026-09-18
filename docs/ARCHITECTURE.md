@@ -218,8 +218,9 @@ path while still producing correct results** — a loss no functional test can d
 That assertion defends the *configuration*, once. It structurally cannot see a memory path that
 degrades at **runtime**, after it has passed, which Task 3 found two ways to do. So the runtime also
 checks the behaviour: **per run slice, the callback-path counter's delta must be zero unless that
-slice ended in a memory-fault exit** (D4 amendment 2). It costs one load per slice — 0.430 ns,
-median of n = 31 runs of 10,000,000 reads — against a slice of a million guest instructions.
+slice ended in a memory-fault exit** (D4 amendment 2). It costs one load per slice — 0.396-0.430 ns
+across two runs, each the median of n = 31 runs of 10,000,000 reads — against a slice of a million
+guest instructions.
 
 Measured throughput is uneven and shapes what comes next: about **2.0x native** on memory-heavy
 code and **2.2x** on NEON/FP, but about **33x** on register-bound integer code, caused by per-block

@@ -943,9 +943,9 @@ host, release:
 
 | Quantity | Figure |
 |---|---|
-| one counter read | **0.430 ns** (median of n = 31 runs of 10,000,000 reads) |
-| per slice (two reads) | 0.859 ns |
-| a 5,000,000-instruction workload, armed vs disarmed | **0.9906x** (n = 31 per configuration) |
+| one counter read | **0.396-0.430 ns** (two runs, median of n = 31 runs of 10,000,000 reads each) |
+| per slice (two reads) | 0.79-0.86 ns |
+| a 5,000,000-instruction workload, armed vs disarmed | **0.9906x** and **0.9989x** (two runs, n = 31 per configuration each) |
 
 A slice is 1,000,000 guest instructions by default, so the whole check costs about 4 nanoseconds
 across a five-million-instruction run. The end-to-end ratio is below the noise floor, which is why
