@@ -22,3 +22,6 @@ Thumbs.db
 
 # SDD workspace (git-ignored scratch)
 /.superpowers/
+
+# Mutation-harness backups (crates/dynarmic-sys/tools/mutate_shim.py)
+*.mutate-orig
