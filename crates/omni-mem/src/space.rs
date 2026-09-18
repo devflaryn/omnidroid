@@ -389,7 +389,8 @@ impl GuestSpace {
         inner.map.replace(
             address,
             size,
-            Entry { len: size, os: OsState::Placeholder, owner: Some(owner) },
+            // Anonymous memory is never a view, so there is no copy-on-write content to lose.
+            Entry { len: size, os: OsState::Placeholder, owner: Some(owner), ever_writable: false },
         );
 
         if commit == CommitPolicy::Eager && protection != Protection::None {
@@ -461,9 +462,18 @@ impl GuestSpace {
             backing: Some(Arc::clone(backing)),
             file_offset,
         };
-        inner
-            .map
-            .replace(address, size, Entry { len: size, os: OsState::View { view }, owner: Some(owner) });
+        inner.map.replace(
+            address,
+            size,
+            Entry {
+                len: size,
+                os: OsState::View { view },
+                owner: Some(owner),
+                // A ReadWrite view is PAGE_WRITECOPY, so it can hold privatised content from its
+                // first write onwards.
+                ever_writable: protection.is_writable(),
+            },
+        );
         inner.validate();
         tracing::debug!(
             address = format_args!("{address:#x}"),
@@ -962,7 +972,12 @@ impl Inner {
             self.map.replace(
                 union_start,
                 union_len,
-                Entry { len: union_len, os: OsState::Placeholder, owner: merged.owner },
+                Entry {
+                    len: union_len,
+                    os: OsState::Placeholder,
+                    owner: merged.owner,
+                    ever_writable: false,
+                },
             );
         }
 
@@ -1129,7 +1144,14 @@ impl Inner {
                         .map_err(platform(operation, start, entry_len))?;
                 }
             }
-            if let Some(owner) = self.map.get_mut(start).expect("entry vanished").owner.as_mut() {
+            let entry = self.map.get_mut(start).expect("entry vanished");
+            if protection.is_writable() && matches!(entry.os, OsState::View { .. }) {
+                // From here on, this range may hold copy-on-write content that is not in the file,
+                // and `unmap` has to preserve it across the re-map a partial unmap requires. Sticky:
+                // lowering the protection again does not un-privatise a page that was written.
+                entry.ever_writable = true;
+            }
+            if let Some(owner) = entry.owner.as_mut() {
                 owner.protection = protection;
             }
         }
@@ -1185,6 +1207,24 @@ impl Inner {
     /// Windows unmaps a whole view from its base and cannot do less, so the whole view goes and the
     /// surviving pieces are mapped again from the same file at the same addresses. Returns the
     /// address to continue the unmap walk from.
+    ///
+    /// # Copy-on-write content has to be carried across the re-map
+    ///
+    /// A survivor that is mapped again comes back **from the file**, so anything written into it
+    /// through a copy-on-write protection — every relocation the ELF loader applies, and every guest
+    /// write to a private file mapping — would be silently lost. So before the view is destroyed,
+    /// each survivor that has ever been writable is compared against a pristine view of the same file
+    /// bytes, and the pages that differ are copied out; after the re-map they are written back, which
+    /// privatises exactly those pages again and no others.
+    ///
+    /// Two things make that affordable. The `ever_writable` flag skips the comparison entirely for
+    /// views that cannot hold privatised content, which is nearly all of them. And comparing rather
+    /// than copying wholesale is what keeps file-backed sharing intact: copying a whole survivor back
+    /// would privatise pages that are currently clean and shared, and D11's multi-instance argument
+    /// rests on the guest library's text staying shared at near-zero commit charge.
+    ///
+    /// The comparison runs **before** anything is unmapped, so a failure there leaves the view
+    /// untouched rather than half destroyed.
     fn unmap_view(
         &mut self,
         operation: &'static str,
@@ -1198,19 +1238,66 @@ impl Inner {
         // it is the number that makes the emulation possible.
         let mut view_start = touched;
         let mut view_end = touched + self.map.get(touched).expect("entry vanished").len;
-        let pieces: Vec<(GuestAddr, usize, Owner)> = {
+        let pieces: Vec<(GuestAddr, usize, Owner, bool)> = {
             let mut pieces = Vec::new();
             for (start, entry) in self.map.iter() {
                 if entry.os == (OsState::View { view }) {
                     let owner = entry.owner.clone().expect("a view always has an owner");
                     view_start = view_start.min(start);
                     view_end = view_end.max(start + entry.len);
-                    pieces.push((start, entry.len, owner));
+                    pieces.push((start, entry.len, owner, entry.ever_writable));
                 }
             }
             pieces
         };
         let view_len = view_end - view_start;
+
+        // What survives the request, piece by piece. Each survivor becomes a view of its own, which
+        // is what keeps a view that had been protected in parts from losing those protections.
+        let mut survivors: Vec<Survivor> = Vec::new();
+        for (start, len, owner, ever_writable) in pieces {
+            for (piece_start, piece_len) in subtract(start, len, keep_out_start, keep_out_end) {
+                survivors.push(Survivor {
+                    start: piece_start,
+                    len: piece_len,
+                    owner: owner.clone(),
+                    ever_writable,
+                    preserved: Vec::new(),
+                });
+            }
+        }
+
+        // Before anything is destroyed: find the bytes that exist only in copy-on-write pages.
+        for survivor in &mut survivors {
+            if !survivor.ever_writable {
+                continue;
+            }
+            if !survivor.owner.protection.is_readable() {
+                // The comparison has to read the live pages. Raising a PROT_NONE survivor loses
+                // nothing — it is about to be unmapped either way, and it is mapped again with its
+                // own protection below.
+                // SAFETY: the range is a live view this process owns.
+                unsafe { vm::protect(survivor.start as *mut u8, survivor.len, Protection::Read) }
+                    .map_err(platform(operation, survivor.start, survivor.len))?;
+            }
+            survivor.preserved = scan_for_copy_on_write(
+                operation,
+                survivor.start,
+                survivor.len,
+                &survivor.owner,
+                self.page,
+            )?;
+            let bytes: usize = survivor.preserved.iter().map(|run| run.bytes.len()).sum();
+            if bytes > 0 {
+                tracing::debug!(
+                    address = format_args!("{:#x}", survivor.start),
+                    len = survivor.len,
+                    runs = survivor.preserved.len(),
+                    bytes,
+                    "preserving copy-on-write content across a partial unmap"
+                );
+            }
+        }
 
         // SAFETY: `[view_start, view_len)` is exactly one whole view produced by `map_file` — the
         // region map tracks which entries belong to which view — and the guest has asked for part
@@ -1221,33 +1308,29 @@ impl Inner {
             .map_err(platform(operation, view_start, view_len))?;
         self.map.replace(view_start, view_len, Entry::free(view_len));
 
-        // Re-map what survives. Each surviving piece becomes a view of its own, which is what keeps
-        // a view that had been protected in parts from losing those protections.
-        for (start, len, owner) in pieces {
-            for (piece_start, piece_len) in
-                subtract(start, len, keep_out_start, keep_out_end)
-            {
-                self.make_exact_placeholder(operation, piece_start, piece_len, true)?;
-                let backing = owner.backing.clone().expect("a view always has a backing");
-                let file_offset = owner.offset_at(piece_start);
-                let view = self.map_view(
-                    operation,
-                    &backing,
-                    file_offset,
-                    piece_start,
-                    piece_len,
-                    owner.protection,
-                )?;
-                self.map.replace(
-                    piece_start,
-                    piece_len,
-                    Entry {
-                        len: piece_len,
-                        os: OsState::View { view },
-                        owner: Some(owner.clone()),
-                    },
-                );
-            }
+        for survivor in &survivors {
+            self.make_exact_placeholder(operation, survivor.start, survivor.len, true)?;
+            let backing = survivor.owner.backing.clone().expect("a view always has a backing");
+            let file_offset = survivor.owner.offset_at(survivor.start);
+            let view = self.map_view(
+                operation,
+                &backing,
+                file_offset,
+                survivor.start,
+                survivor.len,
+                survivor.owner.protection,
+            )?;
+            self.map.replace(
+                survivor.start,
+                survivor.len,
+                Entry {
+                    len: survivor.len,
+                    os: OsState::View { view },
+                    owner: Some(survivor.owner.clone()),
+                    ever_writable: survivor.ever_writable,
+                },
+            );
+            restore_copy_on_write(operation, &survivor.preserved, survivor.owner.protection)?;
         }
         // Everything of this view that fell inside the request is free now, so the unmap walk
         // continues past it. The view may have extended beyond the request in either direction;
@@ -1462,6 +1545,200 @@ impl Inner {
             None => Ok(()),
         }
     }
+}
+
+/// How much of a survivor is compared against the file at a time.
+///
+/// 1 MiB bounds the temporary mapping, costs three kernel calls per megabyte, and is a multiple of
+/// the allocation granularity so that the placeholder the comparison view needs is exact.
+const SCAN_WINDOW: usize = 1024 * 1024;
+
+/// A piece of a view that survives a partial unmap, and the content that has to survive with it.
+struct Survivor {
+    start: GuestAddr,
+    len: usize,
+    owner: Owner,
+    ever_writable: bool,
+    preserved: Vec<Dirty>,
+}
+
+/// A run of bytes that exists only in a copy-on-write page, and that re-mapping would lose.
+struct Dirty {
+    address: GuestAddr,
+    bytes: Vec<u8>,
+}
+
+/// A temporary read-only view of a backing file's bytes *as they are on disk*, mapped outside the
+/// guest address space purely to compare against.
+///
+/// Mapping the same section again is the only way to get an authoritative answer to "what would a
+/// fresh `map_file` of this range produce", which is exactly the question that decides whether a
+/// page holds privatised content. Reading the file through an ordinary file handle would answer a
+/// subtly different question and would need a second I/O path.
+struct PristineView {
+    reservation: Reservation,
+    len: usize,
+    mapped: bool,
+}
+
+impl PristineView {
+    fn map(
+        operation: &'static str,
+        backing: &Backing,
+        file_offset: u64,
+        len: usize,
+    ) -> MemResult<Self> {
+        let granularity = vm::allocation_granularity();
+        let reserve_len = len.div_ceil(granularity) * granularity;
+        let reservation = vm::reserve_placeholder(reserve_len, granularity)
+            .map_err(platform(operation, 0, reserve_len))?;
+        let mut view = Self { reservation, len, mapped: false };
+        if reserve_len > len {
+            // A view needs a placeholder of exactly its own size.
+            let piece = vm::split_placeholder(&reservation, 0, len)
+                .map_err(platform(operation, reservation.base(), len))?;
+            debug_assert_eq!(piece.base(), reservation.base());
+        }
+        // SAFETY: `[base, base + len)` is exactly one unreplaced placeholder piece, reserved by this
+        // call and split to size, so nothing else in the process can be using it. The view is
+        // read-only, so it cannot modify the file or privatise anything.
+        unsafe {
+            vm::map_file(backing.file(), file_offset, len, view.as_mut_ptr(), Protection::Read)
+        }
+        .map_err(platform(operation, reservation.base(), len))?;
+        view.mapped = true;
+        Ok(view)
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.reservation.base() as *const u8
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.reservation.base() as *mut u8
+    }
+}
+
+impl Drop for PristineView {
+    fn drop(&mut self) {
+        let granularity = vm::allocation_granularity();
+        let reserve_len = self.len.div_ceil(granularity) * granularity;
+        let split = reserve_len > self.len;
+
+        if self.mapped {
+            // SAFETY: one whole view, mapped by `map` and unmapped exactly once here. The
+            // comparison has finished, so nothing holds a reference into it.
+            if let Err(error) = unsafe { vm::unmap_and_release(self.as_mut_ptr(), self.len) } {
+                tracing::error!(%error, "releasing a pristine comparison view failed");
+            }
+        } else {
+            let head = if split {
+                self.reservation.subrange(0, self.len, vm::ReservationKind::Placeholder).ok()
+            } else {
+                Some(self.reservation)
+            };
+            if let Some(head) = head {
+                if let Err(error) = vm::release(head) {
+                    tracing::error!(%error, "releasing a pristine comparison placeholder failed");
+                }
+            }
+        }
+        if split {
+            match self.reservation.subrange(
+                self.len,
+                reserve_len - self.len,
+                vm::ReservationKind::Placeholder,
+            ) {
+                Ok(rest) => {
+                    if let Err(error) = vm::release(rest) {
+                        tracing::error!(%error, "releasing a comparison view's tail failed");
+                    }
+                }
+                Err(error) => tracing::error!(%error, "naming a comparison view's tail failed"),
+            }
+        }
+    }
+}
+
+/// The pages of `[address, address + len)` whose contents differ from the backing file.
+///
+/// Those are the pages a copy-on-write write has privatised. Comparing content answers the question
+/// exactly, and it answers it in the direction that matters: a page that happens to equal the file
+/// needs no preserving, because re-mapping produces the same bytes. Detecting privatisation directly
+/// would be cheaper but is not reliable — a privatised page still reports `MEM_MAPPED` (Task 1), and
+/// `QueryWorkingSetEx`'s shared bit only means anything for pages that are resident at the moment it
+/// is asked.
+fn scan_for_copy_on_write(
+    operation: &'static str,
+    address: GuestAddr,
+    len: usize,
+    owner: &Owner,
+    page: usize,
+) -> MemResult<Vec<Dirty>> {
+    let backing = owner.backing.as_ref().expect("a view always has a backing");
+    let mut dirty: Vec<Dirty> = Vec::new();
+    let mut offset = 0;
+    while offset < len {
+        let window = SCAN_WINDOW.min(len - offset);
+        let live = address + offset;
+        let pristine = PristineView::map(operation, backing, owner.offset_at(live), window)?;
+
+        let mut position = 0;
+        while position < window {
+            let step = page.min(window - position);
+            // SAFETY: both are live mappings of at least `step` bytes from `position` — the live view
+            // because the caller owns it and has made it readable, and the pristine one because it
+            // was just mapped over `window` bytes.
+            let (live_page, file_page) = unsafe {
+                (
+                    std::slice::from_raw_parts((live + position) as *const u8, step),
+                    std::slice::from_raw_parts(pristine.as_ptr().add(position), step),
+                )
+            };
+            if live_page != file_page {
+                match dirty.last_mut() {
+                    // Adjacent dirty pages become one run, so a large privatised region costs one
+                    // buffer and one protect-write-protect cycle rather than one per page.
+                    Some(last) if last.address + last.bytes.len() == live + position => {
+                        last.bytes.extend_from_slice(live_page);
+                    }
+                    _ => dirty.push(Dirty { address: live + position, bytes: live_page.to_vec() }),
+                }
+            }
+            position += step;
+        }
+        drop(pristine);
+        offset += window;
+    }
+    Ok(dirty)
+}
+
+/// Write preserved copy-on-write content back into a re-mapped survivor.
+///
+/// Each run is made writable, written, and returned to the protection the piece is recorded with.
+/// Writing through `Protection::ReadWrite` on a private file view is a copy-on-write write, so this
+/// privatises exactly the pages that were privatised before and leaves every clean page shared.
+fn restore_copy_on_write(
+    operation: &'static str,
+    preserved: &[Dirty],
+    protection: Protection,
+) -> MemResult<()> {
+    for run in preserved {
+        let len = run.bytes.len();
+        // SAFETY: the range is part of a live view this process has just mapped, and is page-aligned
+        // and a whole number of pages because every mapping length here is.
+        unsafe { vm::protect(run.address as *mut u8, len, Protection::ReadWrite) }
+            .map_err(platform(operation, run.address, len))?;
+        // SAFETY: the range is now writable and `len` bytes long, and the source is a heap buffer
+        // that cannot overlap a mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(run.bytes.as_ptr(), run.address as *mut u8, len);
+        }
+        // SAFETY: as above. Restoring the recorded protection keeps the region map truthful.
+        unsafe { vm::protect(run.address as *mut u8, len, protection) }
+            .map_err(platform(operation, run.address, len))?;
+    }
+    Ok(())
 }
 
 /// `[start, start + len)` minus `[hole_start, hole_end)`, as up to two surviving pieces.

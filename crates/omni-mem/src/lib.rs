@@ -31,6 +31,10 @@
 //! * [`CodeArena`] — the JIT code arena. One writable view and one executable view of the same
 //!   pages, so that emitting code never requires a page to be writable and executable at the same
 //!   time (D12).
+//! * [`CommitBudget`] — what an instance is costing. It exists because the arena's memory is
+//!   *shared* commit, so it is charged against the system commit limit while being invisible to
+//!   `process_commit_charge`, which is the counter everything else is budgeted against. Measured:
+//!   a 4 MiB section mapped twice, every page written, moved that counter by 20480 bytes.
 //!
 //! # Two things that are not obvious and are load-bearing
 //!
@@ -51,6 +55,7 @@
 
 mod arena;
 mod backing;
+mod budget;
 mod entry;
 mod error;
 mod region;
@@ -61,6 +66,7 @@ pub use arena::{
     DEFAULT_MAX_TOTAL,
 };
 pub use backing::{Backing, BackingId};
+pub use budget::CommitBudget;
 pub use error::{MemError, MemResult};
 pub use region::{RegionInfo, RegionKind};
 pub use space::{

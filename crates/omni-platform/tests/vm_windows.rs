@@ -747,3 +747,57 @@ fn a_zero_length_file_cannot_be_mapped() {
     assert!(err.to_string().contains("0 bytes"), "{err}");
     let _ = fs::remove_file(&path);
 }
+
+/// Releasing a split placeholder's parent must be refused, not silently freed in part.
+///
+/// `MEM_RELEASE` takes no length and frees the allocation that starts at the address it is given. A
+/// split placeholder is several allocations, so a release of the parent's base address frees only
+/// the first piece — and returns success, leaving the rest of the range reserved for the life of the
+/// process with nothing pointing at it. This pins the refusal, and pins that the pieces can still be
+/// given back the two legitimate ways: individually, or coalesced back into one.
+#[test]
+fn releasing_a_split_placeholder_by_its_parent_is_refused_with_both_extents() {
+    let span = 4 * GRANULARITY;
+    let reservation = vm::reserve_placeholder(span, GRANULARITY).expect("reserve a placeholder");
+    let piece = vm::split_placeholder(&reservation, 0, GRANULARITY).expect("split the first piece");
+    assert_eq!(piece.base(), reservation.base());
+
+    let err = vm::release(reservation).expect_err("releasing the split parent must be refused");
+    match err {
+        VmError::ReleaseExtentMismatch { address, requested, actual } => {
+            assert_eq!(address, reservation.base());
+            assert_eq!(requested, span, "the caller asked for the whole span");
+            assert_eq!(actual, GRANULARITY, "only the first piece starts at that address");
+        }
+        other => panic!("expected ReleaseExtentMismatch, got {other}"),
+    }
+    let text = vm::release(reservation).expect_err("still refused").to_string();
+    assert!(text.contains(&format!("{span}")), "{text}");
+    assert!(text.contains(&format!("{GRANULARITY}")), "{text}");
+
+    // Both legitimate ways still work. First, piece by piece.
+    vm::release(piece).expect("release the first piece on its own");
+    let rest = reservation
+        .subrange(GRANULARITY, span - GRANULARITY, ReservationKind::Placeholder)
+        .expect("name the remainder");
+    vm::release(rest).expect("release the remainder on its own");
+
+    // Second, merged back together. The merged placeholder's extent is the whole span again, so the
+    // extent check passes and one release frees all of it.
+    let reservation = vm::reserve_placeholder(span, GRANULARITY).expect("reserve");
+    let _piece = vm::split_placeholder(&reservation, GRANULARITY, GRANULARITY).expect("split");
+    // SAFETY: the whole span is placeholders this process owns, none of them replaced.
+    unsafe { vm::coalesce_placeholders(reservation.as_ptr(), span) }.expect("coalesce");
+    vm::release(reservation).expect("one release frees a coalesced placeholder");
+}
+
+/// A reservation whose size was not a whole number of pages is still released as a whole.
+///
+/// The OS rounds a reservation up to a page, so the extent check has to compare against the rounded
+/// length or it would refuse every release of an odd-sized reservation.
+#[test]
+fn releasing_a_reservation_whose_size_was_rounded_up_still_works() {
+    let reservation = vm::reserve(PAGE + 1, GRANULARITY).expect("reserve a page and one byte");
+    assert_eq!(reservation.len(), PAGE + 1, "the descriptor keeps the requested length");
+    vm::release(reservation).expect("release a reservation the OS rounded up");
+}

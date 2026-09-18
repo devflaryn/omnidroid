@@ -916,7 +916,14 @@ pub unsafe fn unmap_and_release(ptr: *mut u8, size: usize) -> VmResult<()> {
 ///
 /// Releases the whole reservation; there is no partial release (a partial `MEM_RELEASE` fails
 /// with `ERROR_INVALID_PARAMETER`, 87). A placeholder that has been split must have its pieces
-/// released individually — see [`Reservation`].
+/// released individually — see [`Reservation`] — or be merged back into one placeholder with
+/// [`coalesce_placeholders`] first.
+///
+/// The reservation's extent is checked against what is really at its base before anything is freed,
+/// because `MEM_RELEASE` takes no length and frees whatever allocation starts at the address it is
+/// given: a release of a split placeholder's parent would otherwise free only the first piece and
+/// report success. That is [`VmError::ReleaseExtentMismatch`], and it is a refusal rather than a
+/// partial free precisely because the partial free is silent.
 ///
 /// # Errors
 ///

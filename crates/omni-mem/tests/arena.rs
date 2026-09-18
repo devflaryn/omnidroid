@@ -337,3 +337,33 @@ fn the_arena_reports_what_it_mapped_even_though_commit_charge_cannot_see_it() {
     );
     assert!(after.abs() < chunk as i64 / 4, "dropping the arena left {after} bytes behind");
 }
+
+
+/// **I2 regression.** An absurd allocation size must be refused, not wrap past the limit check.
+///
+/// `mapped + chunk_len` overflowed: in a debug build that panicked, and in a release build it wrapped
+/// to a small number, passed the ceiling check, and went on to try to map something — which is the
+/// one outcome worse than refusing.
+#[test]
+fn an_absurd_allocation_size_is_refused_rather_than_overflowing_the_limit_check() {
+    let arena = CodeArena::new().expect("create the arena");
+    let first = arena.alloc(64).expect("one real block, so a chunk exists to add to");
+
+    for size in [usize::MAX, usize::MAX - 65535, usize::MAX / 2, isize::MAX as usize] {
+        match arena.alloc(size) {
+            Err(MemError::ArenaFull { requested, limit, .. }) => {
+                assert_eq!(requested, size);
+                assert_eq!(limit, arena.config().max_total);
+            }
+            Err(other) => panic!("expected ArenaFull for {size:#x}, got {other}"),
+            Ok(_) => panic!("a block of {size:#x} bytes cannot possibly have been allocated"),
+        }
+    }
+
+    // The arena is still usable afterwards, and the block from before is untouched.
+    arena.write(&first, 0, &[0x42]).expect("write");
+    // SAFETY: the block is at least one byte of live mapping.
+    unsafe { assert_eq!(*first.exec_ptr(), 0x42) };
+    arena.alloc(64).expect("the arena still works");
+    assert_eq!(arena.stats().chunks, 1, "no chunk should have been created for a refused request");
+}

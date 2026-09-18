@@ -869,10 +869,54 @@ fn the_cost_of_emulating_a_partial_unmap_is_measured() {
     let carved = started.elapsed();
     space.unmap(address, len).expect("clean up");
 
+    // Now the same hole on views that have been writable, where the copy-on-write comparison pass
+    // runs. Two cases, because the gate is per *entry* and not per view: making one page writable
+    // makes one page comparable, while making the whole view writable makes all of it comparable.
+    let address = map();
+    space.protect(address, page, Protection::ReadWrite).expect("make one page writable");
+    // SAFETY: the first page is a copy-on-write view and is writable.
+    unsafe { *(address as *mut u8) = 0xD1 };
+    space.protect(address, page, Protection::Read).expect("restore");
+    let started = Instant::now();
+    space.unmap(address + MIB, MIB).expect("punch a hole through a partly writable view");
+    let one_page_writable = started.elapsed();
+    // SAFETY: the head survivor is a live view.
+    unsafe { assert_eq!(*(address as *const u8), 0xD1, "the written byte was lost") };
+    space.unmap(address, len).expect("clean up");
+
+    let address = map();
+    space.protect(address, len, Protection::ReadWrite).expect("make the whole view writable");
+    // SAFETY: the whole view is copy-on-write and writable.
+    unsafe { *(address as *mut u8) = 0xD2 };
+    space.protect(address, len, Protection::Read).expect("restore");
+    let started = Instant::now();
+    space.unmap(address + MIB, MIB).expect("punch a hole through a wholly writable view");
+    let all_writable = started.elapsed();
+    // SAFETY: the head survivor is a live view.
+    unsafe { assert_eq!(*(address as *const u8), 0xD2, "the written byte was lost") };
+    space.unmap(address, len).expect("clean up");
+
     eprintln!(
         "a {} MiB view: whole unmap {whole:?}; hole punched through one piece {hole:?}; \
-         hole punched through a view carved into 16 pieces {carved:?}",
+         hole punched through a view carved into 16 pieces {carved:?}; \
+         hole punched after one page was made writable {one_page_writable:?}; \
+         hole punched after all of it was made writable {all_writable:?}",
         len / MIB
+    );
+    // The gate is the point, and it is worth two assertions. A view that has never been writable is
+    // not compared against the file at all; and because the flag lives on the *entry*, making one
+    // page writable does not make the whole view expensive to unmap. If the first ever fails, the
+    // comparison has started running on clean views, which would mean reading a 109 MB library's
+    // text twice on every guest `munmap`.
+    assert!(
+        hole * 4 < all_writable,
+        "a clean hole punch took {hole:?} and a fully compared one {all_writable:?}: the \
+         ever_writable gate is not doing anything"
+    );
+    assert!(
+        one_page_writable * 4 < all_writable,
+        "comparing one page took {one_page_writable:?} and comparing the whole view took \
+         {all_writable:?}: the gate is not per entry"
     );
     // Loose on purpose: this is a cost report, not a performance gate, and a gate tuned to this
     // machine would fail on a slower one for no useful reason. What it does rule out is the
@@ -880,5 +924,155 @@ fn the_cost_of_emulating_a_partial_unmap_is_measured() {
     // when only two survive.
     assert!(hole < std::time::Duration::from_millis(20), "punching a hole took {hole:?}");
     assert!(carved < std::time::Duration::from_millis(50), "punching a hole took {carved:?}");
+    assert_tiles_the_space(&space);
+}
+
+
+/// **C1 regression.** A partial unmap must not lose copy-on-write content in the pieces that survive.
+///
+/// The shape is the D11 relocation sequence — map `ReadExecute`, drop a page to `ReadWrite`, write,
+/// restore `ReadExecute` — followed by unmapping a range *elsewhere in the same view*. Windows cannot
+/// partially unmap a view, so the survivors are mapped again from the file, and before this was fixed
+/// the relocated bytes came back as the file's own contents while `unmap` returned `Ok(())`. Silent
+/// data loss in exactly Task 5's RELRO path and in the guest's `munmap`.
+///
+/// Note what the earlier tests could not see: they check that a survivor holds the right *file* bytes
+/// and they never write to a survivor first, which is the one case that cannot detect this.
+#[test]
+fn a_partial_unmap_preserves_copy_on_write_content_in_the_survivors() {
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let (file, backing) = backing("relro.bin", MIB, page, MapExecutability::Executable);
+    let len = 256 * KIB;
+    let address = space
+        .map_file(
+            &backing,
+            0,
+            Placement::Anywhere { align: 64 * KIB },
+            len,
+            Protection::ReadExecute,
+        )
+        .expect("map executable");
+
+    // Relocate one page near the start, the D11 way.
+    space.protect(address, page, Protection::ReadWrite).expect("drop to ReadWrite");
+    // SAFETY: the first page is a copy-on-write view and is writable.
+    unsafe {
+        fill(address, 16, 0xEE);
+        *(address as *mut u8).add(page - 1) = 0xED;
+    }
+    space.protect(address, page, Protection::ReadExecute).expect("restore ReadExecute");
+
+    // And one page at the very end, so that a survivor on the far side of the hole is covered too.
+    let tail = address + len - page;
+    space.protect(tail, page, Protection::ReadWrite).expect("drop to ReadWrite");
+    // SAFETY: the last page is a copy-on-write view and is writable.
+    unsafe { fill(tail, 8, 0xAB) };
+    space.protect(tail, page, Protection::ReadExecute).expect("restore ReadExecute");
+
+    // Now unmap 64 KiB from the middle: nowhere near either written page, but it destroys the whole
+    // view because that is the only thing Windows can do.
+    space.unmap(address + 96 * KIB, 64 * KIB).expect("punch a hole");
+    assert_tiles_the_space(&space);
+
+    // SAFETY: both survivors are live views again.
+    unsafe {
+        assert_eq!(read(address), 0xEE, "the relocated byte was lost");
+        assert_eq!(read(address + 15), 0xEE, "the relocated bytes were lost");
+        assert_eq!(read(address + page - 1), 0xED, "the last byte of the relocated page was lost");
+        assert_eq!(read(tail), 0xAB, "the relocated byte in the tail survivor was lost");
+        // A page that was never written still reads the file, so the preservation did not smear the
+        // written page over its neighbours.
+        assert_eq!(read(address + page), file.byte_at(page as u64));
+        assert_eq!(read(address + 160 * KIB), file.byte_at(160 * KIB as u64));
+    }
+    // And copy-on-write still means what it says: the file on disk was never modified.
+    let on_disk = std::fs::read(file.path()).expect("read the file back");
+    assert_eq!(on_disk[0], file.byte_at(0), "the write reached the file");
+
+    // Once more, to show the preserved content survives repeated partial unmaps rather than only the
+    // first one.
+    space.unmap(address + 32 * KIB, 16 * KIB).expect("punch a second hole");
+    // SAFETY: the head survivor is still a live view.
+    unsafe {
+        assert_eq!(read(address), 0xEE, "the relocated byte was lost by the second unmap");
+        assert_eq!(read(tail), 0xAB);
+    }
+    assert_tiles_the_space(&space);
+}
+
+/// The same guarantee for a view that was mapped `ReadWrite` in the first place, where the pages are
+/// copy-on-write from the moment they are mapped rather than from a later `protect`.
+#[test]
+fn a_partial_unmap_preserves_writes_to_a_read_write_view() {
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let (file, backing) = backing("data.bin", MIB, page, MapExecutability::NonExecutable);
+    let len = 128 * KIB;
+    let address = space
+        .map_file(
+            &backing,
+            0,
+            Placement::Anywhere { align: 64 * KIB },
+            len,
+            Protection::ReadWrite,
+        )
+        .expect("map writable");
+
+    // SAFETY: the whole view is copy-on-write and writable.
+    unsafe {
+        fill(address, page, 0x5C);
+        fill(address + 64 * KIB, page, 0x6D);
+    }
+    // Unmap the last 32 KiB. The written pages are both in the survivor.
+    space.unmap(address + 96 * KIB, 32 * KIB).expect("unmap the tail");
+    // SAFETY: the survivor is a live view.
+    unsafe {
+        assert_eq!(read(address), 0x5C, "a write to a ReadWrite view was lost");
+        assert_eq!(read(address + page - 1), 0x5C);
+        assert_eq!(read(address + 64 * KIB), 0x6D);
+        assert_eq!(read(address + page), file.byte_at(page as u64), "a clean page was disturbed");
+    }
+    assert_eq!(
+        space.region_at(address).expect("mapped").protection,
+        Protection::ReadWrite,
+        "the survivor kept its protection"
+    );
+    assert_tiles_the_space(&space);
+}
+
+/// Content written into the part that is being unmapped is *meant* to disappear, and the survivor
+/// must come back clean from the file rather than inheriting it.
+#[test]
+fn a_partial_unmap_does_not_preserve_content_in_the_part_it_unmaps() {
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let (file, backing) = backing("discard.bin", MIB, page, MapExecutability::NonExecutable);
+    let len = 128 * KIB;
+    let address = space
+        .map_file(&backing, 0, Placement::Anywhere { align: 64 * KIB }, len, Protection::ReadWrite)
+        .expect("map writable");
+    // SAFETY: the whole view is copy-on-write and writable.
+    unsafe { fill(address + 64 * KIB, page, 0x77) };
+
+    space.unmap(address + 64 * KIB, 64 * KIB).expect("unmap the written half");
+    // Map the same file range again over the freed address space.
+    let again = space
+        .map_file(
+            &backing,
+            64 * KIB as u64,
+            Placement::Fixed(address + 64 * KIB),
+            64 * KIB,
+            Protection::Read,
+        )
+        .expect("map the same range again");
+    // SAFETY: a live read-only view.
+    unsafe {
+        assert_eq!(
+            read(again),
+            file.byte_at(64 * KIB as u64),
+            "a discarded copy-on-write page came back from somewhere"
+        );
+    }
     assert_tiles_the_space(&space);
 }

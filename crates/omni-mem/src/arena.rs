@@ -247,21 +247,21 @@ impl CodeArena {
         }
 
         let mapped: usize = chunks.iter().map(|chunk| chunk.len).sum();
+        let full = || MemError::ArenaFull {
+            requested: size,
+            in_use: mapped,
+            limit: self.config.max_total,
+        };
+        // Every step is checked, because each of them can overflow on a hostile or simply wrong
+        // `size`, and in a release build an overflow would *wrap past* the limit check below and go
+        // on to map something — the one outcome worse than refusing the request.
         let want = size.max(self.config.chunk_size);
         let chunk_len = want
             .checked_add(self.granularity - 1)
             .map(|len| len & !(self.granularity - 1))
-            .ok_or(MemError::ArenaFull {
-                requested: size,
-                in_use: mapped,
-                limit: self.config.max_total,
-            })?;
-        if mapped + chunk_len > self.config.max_total {
-            return Err(MemError::ArenaFull {
-                requested: size,
-                in_use: mapped,
-                limit: self.config.max_total,
-            });
+            .ok_or_else(full)?;
+        if mapped.checked_add(chunk_len).is_none_or(|total| total > self.config.max_total) {
+            return Err(full());
         }
 
         let mut chunk = self.new_chunk(chunk_len)?;
@@ -272,6 +272,9 @@ impl CodeArena {
         tracing::debug!(
             chunk = index,
             len = chunk_len,
+            // The cumulative figure, because this is the arena's contribution to the system commit
+            // limit and it is invisible to `process_commit_charge` — see `CommitBudget`.
+            arena_mapped = mapped + chunk_len,
             write = format_args!("{:#x}", block.write),
             exec = format_args!("{:#x}", block.exec),
             "grew the code arena"

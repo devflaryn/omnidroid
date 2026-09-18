@@ -34,7 +34,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
-    MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, MEM_MAPPED, MEM_PRESERVE_PLACEHOLDER,
+    MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_MAPPED,
+    MEM_PRESERVE_PLACEHOLDER,
     MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
     PAGE_WRITECOPY,
@@ -383,6 +384,40 @@ fn view_extent(address: usize) -> Option<(usize, usize)> {
     Some((base, end - base))
 }
 
+/// Total extent of the allocation that *starts* at `address`, or `None` if `address` is not an
+/// allocation base.
+///
+/// Needed because `MEM_RELEASE` takes no length and frees the allocation at the address it is given,
+/// whatever its size. A placeholder that has been split is several allocations, so releasing its
+/// parent's base address frees only the **first piece** and reports success — measured, and a silent
+/// partial free is exactly the shape of bug that surfaces as a leak nobody can attribute. Like
+/// [`view_extent`], this walks forward rather than trusting one `RegionSize`, because committing or
+/// protecting part of a reservation splits it into several regions that all keep the same
+/// `AllocationBase`.
+fn allocation_extent(address: usize) -> Option<usize> {
+    let first = query(address)?;
+    if first.State == MEM_FREE || first.AllocationBase as usize != address {
+        return None;
+    }
+    let mut end = address;
+    loop {
+        let Some(mbi) = query(end) else { break };
+        if mbi.State == MEM_FREE
+            || mbi.AllocationBase as usize != address
+            || mbi.RegionSize == 0
+        {
+            break;
+        }
+        let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+        if region_end <= end {
+            // Cannot happen for a well-formed region, but never spin on a malformed one.
+            break;
+        }
+        end = region_end;
+    }
+    Some(end - address)
+}
+
 fn query(address: usize) -> Option<MEMORY_BASIC_INFORMATION> {
     let mut mbi = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: `mbi` is a live, correctly sized MEMORY_BASIC_INFORMATION. VirtualQuery accepts any
@@ -690,9 +725,30 @@ fn unmap_inner(
 }
 
 pub(super) fn release(base: usize, len: usize, _kind: ReservationKind) -> VmResult<()> {
-    // SAFETY: MEM_RELEASE with a size of 0 releases exactly the reservation that starts at `base`
-    // and nothing else; an address that is not the base of a live reservation is rejected with
-    // ERROR_INVALID_ADDRESS (487, measured) rather than freeing a neighbour.
+    // `MEM_RELEASE` must be given a size of 0, and then frees *the allocation that starts at `base`*
+    // — which is not necessarily the range the caller's descriptor names. A placeholder that has
+    // been split is several allocations, so a release of the parent base frees only the first piece
+    // and returns success. That is checked here rather than left to the caller, because the failure
+    // is silent: address space stays reserved for the life of the process with nothing pointing at
+    // it. The OS rounds a reservation up to a whole page, so that is what the requested length is
+    // compared as.
+    let page = page_size();
+    let requested = len.div_ceil(page) * page;
+    if let Some(actual) = allocation_extent(base) {
+        if actual != requested {
+            return Err(VmError::ReleaseExtentMismatch {
+                address: base,
+                requested,
+                actual,
+            });
+        }
+    }
+    // An address that is not an allocation base at all is left to the kernel, which rejects it with
+    // ERROR_INVALID_ADDRESS (487, measured) — the code to look for after a double release.
+
+    // SAFETY: MEM_RELEASE with a size of 0 releases the allocation that starts at `base`, whose
+    // extent has just been checked against what the caller asked to release. Nothing is
+    // dereferenced.
     let ok = unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
     if ok == 0 {
         return Err(os("release", base, len));

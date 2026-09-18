@@ -31,7 +31,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use common::{KIB, MIB};
-use omni_mem::{CommitPolicy, GuestSpace, GuestSpaceConfig, Placement, Protection};
+use omni_mem::{
+    ArenaConfig, Backing, CodeArena, CommitBudget, CommitPolicy, GuestSpace, GuestSpaceConfig,
+    MapExecutability, Placement, Protection,
+};
 use omni_platform::vm;
 
 /// Held for the whole of each test, so only one test is mapping at a time.
@@ -540,4 +543,164 @@ fn a_larger_commit_granule_is_dramatically_cheaper_per_page() {
          64 KiB granules ({sixty_four_kib:.0} ns/page); if it is not, the granule is not earning \
          its complexity"
     );
+}
+
+
+/// Preserving copy-on-write content across a partial unmap must not privatise the clean pages.
+///
+/// This is the test that pins the *sharing* half of the C1 fix. Copying a survivor back wholesale
+/// would keep the content correct and quietly privatise every page of it — which would satisfy every
+/// functional test while destroying the property D11's multi-instance argument rests on, namely that
+/// a guest library's text stays file-backed and shared at near-zero commit charge. So the assertion
+/// is on the commit charge **across the unmap**: the whole view is made writable, two pages of it are
+/// actually written, and the partial unmap must move the charge by kilobytes rather than by the 8 MiB
+/// it would move if the comparison were skipped.
+#[test]
+fn preserving_copy_on_write_content_does_not_privatise_the_clean_pages_of_a_survivor() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let space = space(64 * MIB);
+    let page = vm::page_size();
+    let view_len = 8 * MIB;
+
+    let directory = std::env::temp_dir().join(format!("omni-mem-sharing-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create the test directory");
+    let path = directory.join("shared.bin");
+    let contents: Vec<u8> = (0..view_len).map(|offset| ((offset / page) & 0xff) as u8).collect();
+    std::fs::write(&path, &contents).expect("write the test file");
+    let backing = Backing::open(&path, MapExecutability::Executable).expect("open the backing");
+
+    let baseline = charge();
+    let address = space
+        .map_file(
+            &backing,
+            0,
+            Placement::Anywhere { align: 64 * KIB },
+            view_len,
+            Protection::ReadExecute,
+        )
+        .expect("map 8 MiB execute-read");
+    let mapped = charge() - baseline;
+
+    // Make the *whole* view writable, then write only two pages of it. This is the case that
+    // distinguishes comparing from copying: every page of the survivor is a candidate, and only two
+    // of them actually hold anything the file does not.
+    space.protect(address, view_len, Protection::ReadWrite).expect("drop to ReadWrite");
+    let writable = charge() - baseline;
+    let dirty_pages = [0usize, 1000];
+    for index in dirty_pages {
+        // SAFETY: the whole view is copy-on-write and writable.
+        unsafe { std::ptr::write_bytes((address + index * page) as *mut u8, 0xC5, 32) };
+    }
+    space.protect(address, view_len, Protection::ReadExecute).expect("restore ReadExecute");
+    let dirtied = charge() - baseline;
+
+    let before_unmap = charge();
+    space.unmap(address + 4 * MIB, 64 * KIB).expect("punch a hole");
+    let across = charge() - before_unmap;
+    eprintln!(
+        "an 8 MiB execute-read view: commit after mapping {}, after making all of it writable {}, \
+         after writing two pages and restoring the protection {}; the partial unmap that preserved \
+         them moved it by {}",
+        mib(mapped),
+        mib(writable),
+        mib(dirtied),
+        mib(across)
+    );
+
+    // SAFETY: both preserved pages are in the head survivor, which is a live view.
+    unsafe {
+        for index in dirty_pages {
+            assert_eq!(
+                *((address + index * page) as *const u8),
+                0xC5,
+                "the content written into page {index} was lost"
+            );
+        }
+        // And a clean page still reads the file.
+        assert_eq!(*((address + 2 * page) as *const u8), 2);
+    }
+
+    // Re-privatising two pages costs 8 KiB. Copying the survivor back wholesale would cost about
+    // 8 MiB, which is three orders of magnitude away from this bound.
+    assert!(
+        across < MIB as i64,
+        "preserving two dirty pages of an 8 MiB view moved the commit charge by {}, which means \
+         clean pages were privatised and file-backed sharing was destroyed",
+        mib(across)
+    );
+    assert_eq!(space.stats().file_backed, view_len - 64 * KIB);
+
+    space.unmap(address, view_len).expect("unmap the rest");
+    let released = charge() - baseline;
+    eprintln!("after unmapping the whole view: commit {}", mib(released));
+    assert_close(released, 0, "unmapping a view whose pages were partly privatised");
+    space.close().expect("close");
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+
+/// The code arena's memory is charged against the system commit limit and is invisible to
+/// `process_commit_charge`, so `CommitBudget` reports it explicitly.
+///
+/// Instrumentation rather than a budget assertion: the number this pins is the *gap* between what the
+/// OS counter sees and what the machine is actually paying, because the translator's code cache is
+/// expected to become the fastest-growing consumer (tens of MiB per guest thread) and a budget
+/// watching only `PrivateUsage` would show a flat line while it grew.
+#[test]
+fn the_commit_budget_reports_the_arena_memory_the_process_counter_cannot_see() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let space = space(256 * MIB);
+    let arena = CodeArena::with_config(ArenaConfig {
+        chunk_size: 4 * MIB,
+        max_total: 32 * MIB,
+        block_alignment: 16,
+    })
+    .expect("create the arena");
+
+    let empty = CommitBudget::measure([&space], [&arena]).expect("measure");
+    assert_eq!(empty.arena_mapped, 0, "an arena maps nothing until it is asked for a block");
+    assert_eq!(empty.guest_committed, 0);
+    assert_eq!(empty.invisible_to_process_counter(), 0);
+    assert_eq!(empty.total_system_commit(), empty.process_private);
+
+    // Commit 32 MiB of guest memory: this the process counter does see.
+    let guest = 32 * MIB;
+    let address = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            guest,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("map");
+    // And 8 MiB of code arena, in two chunks: this it does not.
+    let mut blocks = Vec::new();
+    for _ in 0..2 {
+        blocks.push(arena.alloc(4 * MIB).expect("allocate a chunk's worth"));
+    }
+
+    let budget = CommitBudget::measure([&space], [&arena]).expect("measure");
+    eprintln!("{budget}");
+    assert_eq!(budget.guest_committed, guest, "the guest mapping is reported");
+    assert_eq!(budget.arena_mapped, 8 * MIB, "the arena's two chunks are reported");
+    assert_eq!(budget.arena_mapped, arena.stats().mapped);
+    assert_eq!(
+        budget.total_system_commit(),
+        budget.process_private + 8 * MIB as u64,
+        "the total has to add the invisible part, or it is not a total"
+    );
+
+    // The gap is real, and this is the assertion that says so: the process counter moved by about the
+    // guest mapping alone, while 8 MiB of arena went uncounted.
+    let counted = budget.process_private as i64 - empty.process_private as i64;
+    eprintln!(
+        "committing {} MiB of guest memory and mapping {} MiB of code arena moved PrivateUsage by {}",
+        guest / MIB,
+        8,
+        mib(counted)
+    );
+    assert_close(counted, guest as i64, "PrivateUsage counts the guest mapping and not the arena");
+
+    space.unmap(address, guest).expect("unmap");
+    space.close().expect("close");
 }

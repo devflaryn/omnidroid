@@ -308,6 +308,28 @@ pub enum VmError {
         surviving: usize,
     },
 
+    /// `release` was given an address whose allocation is not the size it was asked to release.
+    ///
+    /// `MEM_RELEASE` takes no length: it frees the allocation that starts at the address it is
+    /// given. A placeholder that has been split is several allocations, so releasing its parent's
+    /// base would free only the **first piece** and report success — measured. Releasing less than
+    /// the caller believes it released leaks address space for the life of the process with nothing
+    /// pointing at it, so it is refused instead.
+    ///
+    /// Release the pieces individually, or merge them back into one placeholder with
+    /// [`coalesce_placeholders`](super::coalesce_placeholders) first.
+    #[error(
+        "`release`: the allocation at {address:#x} is {actual} bytes, but {requested} bytes were          requested. MEM_RELEASE frees the whole allocation at an address and cannot free part of          one: release each piece of a split placeholder individually, or coalesce them first"
+    )]
+    ReleaseExtentMismatch {
+        /// The address that was to be released.
+        address: usize,
+        /// The length the caller asked for, rounded up to a page.
+        requested: usize,
+        /// The real extent of the allocation starting at that address.
+        actual: usize,
+    },
+
     /// A plain OS failure with the operation and arguments that produced it.
     #[error("`{operation}` at {address:#x} for {size} bytes failed: {source}")]
     Os {
@@ -345,7 +367,8 @@ impl VmError {
             | VmError::EmptyFile { .. }
             | VmError::ViewPastEndOfFile { .. }
             | VmError::NotViewBase { .. }
-            | VmError::ViewSizeMismatch { .. } => None,
+            | VmError::ViewSizeMismatch { .. }
+            | VmError::ReleaseExtentMismatch { .. } => None,
         }
     }
 

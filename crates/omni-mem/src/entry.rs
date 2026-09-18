@@ -131,11 +131,26 @@ pub(crate) struct Entry {
     pub(crate) os: OsState,
     /// `None` means free address space: an unreplaced placeholder no guest mapping claims.
     pub(crate) owner: Option<Owner>,
+    /// Whether these pages have ever been writable, and so may hold copy-on-write content that is
+    /// **not** in the backing file.
+    ///
+    /// Only meaningful for [`OsState::View`] entries, and it is sticky: once a view's pages have been
+    /// writable, Windows gives no reliable way to find out afterwards whether they were actually
+    /// written — a privatised page still reports `MEM_MAPPED` (Task 1), and `QueryWorkingSetEx`'s
+    /// shared bit is only meaningful for pages that are currently resident.
+    ///
+    /// It exists because [`crate::GuestSpace::unmap`] has to unmap a whole view to unmap part of one,
+    /// and re-mapping a survivor brings it back *from the file* — so anything written into it through
+    /// a copy-on-write protection would be lost. The flag is what lets that content be preserved
+    /// without a comparison pass over views that cannot possibly hold any, which is the overwhelming
+    /// majority of them: `libroblox.so`'s ~104 MB of text is mapped `ReadExecute` and never made
+    /// writable at all.
+    pub(crate) ever_writable: bool,
 }
 
 impl Entry {
     pub(crate) fn free(len: usize) -> Self {
-        Self { len, os: OsState::Placeholder, owner: None }
+        Self { len, os: OsState::Placeholder, owner: None, ever_writable: false }
     }
 
     pub(crate) fn is_free(&self) -> bool {
@@ -234,7 +249,15 @@ impl EntryMap {
         assert!(at > start && at < start + entry.len, "split at {at:#x} is not inside the entry");
         let tail_len = start + entry.len - at;
         entry.len = at - start;
-        let tail = Entry { len: tail_len, os: entry.os, owner: entry.owner.clone() };
+        let tail = Entry {
+            len: tail_len,
+            os: entry.os,
+            owner: entry.owner.clone(),
+            // Conservative on purpose: if either half could hold copy-on-write content, both halves
+            // are treated as if they might, because the flag records what was *permitted* rather
+            // than what was written.
+            ever_writable: entry.ever_writable,
+        };
         self.entries.insert(at, tail);
     }
 
@@ -259,6 +282,7 @@ impl EntryMap {
             debug_assert!(s >= start && s + entry.len <= start + len);
             entry.owner = None;
             entry.os = OsState::Placeholder;
+            entry.ever_writable = false;
         }
     }
 
