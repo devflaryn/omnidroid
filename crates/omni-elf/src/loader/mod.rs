@@ -105,11 +105,34 @@ pub struct LoaderConfig {
     /// Whether to make `PT_GNU_RELRO` read-only at the end of the load. Only ever false for a test
     /// that needs to write to the region afterwards.
     pub seal_relro: bool,
-    /// Sample [`omni_platform::vm::process_commit_charge`] at each window boundary and report the
+    /// Sample [`omni_mem::process_commit_charge`] at each window boundary and report the
     /// peak. Costs one kernel call per window, so it is off by default and on in the tests that
     /// assert the number.
     pub measure_commit: bool,
+    /// The most private anonymous memory this loader will plan for: `.bss` plus any final page the
+    /// file does not cover, summed over every `PT_LOAD`.
+    ///
+    /// Defaults to [`DEFAULT_MAX_ANONYMOUS_BYTES`]. Checked before the span is reserved, so a
+    /// tampered library is refused without taking any address space; the bound that protects the
+    /// scarce resource itself is
+    /// [`GuestSpaceConfig::max_committed`](omni_mem::GuestSpaceConfig::max_committed), and this is
+    /// the earlier, more specific refusal rather than a replacement for it.
+    pub max_anonymous_bytes: usize,
 }
+
+/// The default ceiling on a plan's private anonymous memory: 256 MiB.
+///
+/// Chosen, not derived, and the margin is asserted rather than asserted-to. `libroblox.so` needs
+/// 11,632,640 bytes of anonymous memory — 11.6 MB of `.bss` — which is the largest figure across all
+/// eleven libraries in the APK by two orders of magnitude, and `all_libraries.rs` pins the margin so
+/// that drift shows up long before a real object is rejected.
+///
+/// It bounds a quantity that comes straight from `p_memsz`, which is a file field: D6 records that
+/// this project's own test APK is adversarially modified, and an eight-byte edit to that field was
+/// measured to turn a 16.7 MiB load into a 3.4 GiB one. Note what the limit is *not* derived from:
+/// the image span, which `omni-elf` already bounds at 4 GiB and which D10 measured as free. A bound
+/// on the abundant resource is not a bound on the scarce one.
+pub const DEFAULT_MAX_ANONYMOUS_BYTES: usize = 256 * 1024 * 1024;
 
 impl Default for LoaderConfig {
     fn default() -> Self {
@@ -120,6 +143,7 @@ impl Default for LoaderConfig {
             unresolved: UnresolvedPolicy::Record,
             seal_relro: true,
             measure_commit: false,
+            max_anonymous_bytes: DEFAULT_MAX_ANONYMOUS_BYTES,
         }
     }
 }
@@ -438,7 +462,7 @@ impl LoadedObject {
 
 /// Load an object into a guest address space.
 ///
-/// `backing` must have been opened [`MapExecutability::Executable`](omni_platform::vm::MapExecutability::Executable)
+/// `backing` must have been opened [`MapExecutability::Executable`](omni_mem::MapExecutability::Executable)
 /// if the object has an executable `PT_LOAD`, which every real library does: the section protection
 /// caps every view's protection for the life of the mapping and cannot be raised afterwards (D11).
 ///
@@ -457,10 +481,37 @@ pub fn load(
 ) -> LoadResult<LoadedObject> {
     let started = Instant::now();
     let page = space.page_size();
+
+    // The two arguments must be the same file. The plan below is built from `backing.len()` while
+    // `PieceSource::FileTailCopy` copies out of `elf.data()`, so a backing longer than the parsed
+    // slice maps and relocates file pages the parser never validated, and a shorter one substitutes
+    // parsed bytes for the mapped file's. Nothing tied them together — not the signature, not the
+    // doc comment, not a runtime check — and the invariant was enforced only by a *test helper*,
+    // which is not enforcement.
+    if backing.len() != elf.data().len() as u64 {
+        return Err(LoadError::BackingLengthMismatch {
+            backing: backing.len(),
+            parsed: elf.data().len() as u64,
+            name: backing.name().to_string(),
+        });
+    }
+
     let plan = LoadPlan::build(elf, backing.len(), page)?;
 
+    // Refused before anything is reserved. `p_memsz` is a file field and the part of it past
+    // `p_filesz` becomes private anonymous memory, so this is the one plan quantity an attacker can
+    // inflate without limit. `omni-mem`'s commit ceiling catches it too, and deliberately: this one
+    // refuses earlier and names the ELF-level quantity, that one protects the resource.
+    let anonymous = plan.anonymous_bytes();
+    if anonymous > config.max_anonymous_bytes {
+        return Err(LoadError::AnonymousMemoryTooLarge {
+            requested: anonymous,
+            limit: config.max_anonymous_bytes,
+        });
+    }
+
     let commit_before = if config.measure_commit {
-        omni_platform::vm::process_commit_charge().ok()
+        omni_mem::process_commit_charge().ok()
     } else {
         None
     };
@@ -686,7 +737,7 @@ fn load_into(
     let mut tables = elf.unpacked_relocations()?;
     let decode_time = decode_started.elapsed();
     let commit_after_decode = if config.measure_commit {
-        omni_platform::vm::process_commit_charge().ok()
+        omni_mem::process_commit_charge().ok()
     } else {
         None
     };
@@ -782,7 +833,7 @@ fn load_into(
 
     let phdr = phdr_address(elf, base, &live)?;
     let commit_after = if config.measure_commit {
-        omni_platform::vm::process_commit_charge().ok()
+        omni_mem::process_commit_charge().ok()
     } else {
         None
     };

@@ -17,10 +17,15 @@ thiserror = { workspace = true }
 bitflags = { workspace = true }
 tracing = { workspace = true }
 omni-mem = { workspace = true }
-omni-platform = { workspace = true }
 
 [dev-dependencies]
-# Test-only. The golden fixtures are the ARM64 `.so` entries inside the real APK, which are
+# Test-only, and deliberately not a real dependency. The loader needs `process_commit_charge` and
+# nothing else from the platform seam, and `omni-mem` re-exports it — because a crate that holds
+# `omni_platform::vm` in scope also holds `vm::protect`, `vm::unmap` and `vm::map_file`, which are
+# unsafe to call on a guest address without the region map that only `omni-mem` has. The
+# commit-charge test binary measures the process directly, which is what a test is for.
+omni-platform = { workspace = true }
+# The golden fixtures are the ARM64 `.so` entries inside the real APK, which are
 # DEFLATE-compressed; the parsing tests inflate them in-process, while the loader tests need them
 # as 4 KB-aligned files on disk and so go through the real extraction cache.
 flate2 = { workspace = true }

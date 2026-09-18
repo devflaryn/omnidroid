@@ -26,12 +26,28 @@ use common::fixture::{
 use omni_elf::loader::{self, LoaderConfig, ProviderRegistry, SymbolKind, UnresolvedPolicy};
 use omni_mem::Protection;
 
+/// Held for the whole of each test, so only one test is mapping at a time.
+///
+/// Every test here maps the real 109 MB library, and `cargo test` runs a binary's tests as parallel
+/// threads: eight concurrent loads stack more than a gigabyte of mappings and their relocation
+/// windows, which is a flaky out-of-memory failure waiting for a loaded machine rather than a real
+/// defect. `loader_commit.rs` has had this since it was written, for the related reason that commit
+/// charge is a per-process quantity.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the serialising lock, ignoring poisoning: a panic in one test must not cascade into every
+/// other test reporting a lock error instead of its own result.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // -------------------------------------------------------------------------------------------------
 // 1. Mapping
 // -------------------------------------------------------------------------------------------------
 
 #[test]
 fn every_pt_load_lands_at_base_plus_p_vaddr() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let page = f.space.page_size() as u64;
     let targets = relocation_targets(&f);
@@ -200,6 +216,7 @@ fn expected_values(f: &Fixture, base: usize) -> BTreeMap<u64, u64> {
 
 #[test]
 fn every_import_binds_to_its_provider_and_every_slot_holds_the_expected_value() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let object = loader::load(
         &f.space,
@@ -258,6 +275,7 @@ fn every_import_binds_to_its_provider_and_every_slot_holds_the_expected_value() 
 
 #[test]
 fn the_bss_tail_of_the_last_file_page_is_zeroed_without_disturbing_file_pages() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let page = f.space.page_size() as u64;
     // Loaded with the resolving provider so that every relocated slot has a non-zero expected
@@ -341,6 +359,7 @@ fn the_bss_tail_of_the_last_file_page_is_zeroed_without_disturbing_file_pages() 
 
 #[test]
 fn all_568806_relocations_are_applied() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let object = load(&f, &measuring());
     let s = &object.stats.relocations;
@@ -406,6 +425,7 @@ fn all_568806_relocations_are_applied() {
 
 #[test]
 fn relative_relocations_really_contain_base_plus_addend() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let object = load(&f, &LoaderConfig::default());
 
@@ -469,6 +489,7 @@ fn relative_relocations_really_contain_base_plus_addend() {
 
 #[test]
 fn the_534_jump_slots_come_from_dt_jmprel_and_land_in_the_plt_got() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let tables = f.elf.relocations().expect("decode");
     let plt = tables.plt.as_ref().expect("DT_JMPREL");
@@ -558,6 +579,7 @@ fn untouched_window(targets: &[u64], seg: &omni_elf::Segment, len: u64) -> Optio
 
 #[test]
 fn relro_covers_5205568_bytes_and_is_read_only_afterwards() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let object = load(&f, &LoaderConfig::default());
     let page = f.space.page_size();
@@ -608,6 +630,7 @@ fn relro_covers_5205568_bytes_and_is_read_only_afterwards() {
 /// same shape `omni-mem` uses for the JIT arena's W^X guarantee.
 #[test]
 fn writing_to_sealed_relro_faults() {
+    let _serial = serial();
     const CHILD: &str = "OMNI_ELF_RELRO_WRITE_CHILD";
     const NO_FAULT: i32 = 7;
     const SKIPPED: i32 = 9;
@@ -652,6 +675,7 @@ fn writing_to_sealed_relro_faults() {
 
 #[test]
 fn exactly_565_imports_are_unresolved_and_classified() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let object = load(&f, &LoaderConfig::default());
 
@@ -750,6 +774,7 @@ fn guess_library(name: &str) -> &'static str {
 
 #[test]
 fn an_unresolved_strong_import_can_be_made_fatal() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let config =
         LoaderConfig { unresolved: UnresolvedPolicy::Fail, ..LoaderConfig::default() };
@@ -777,6 +802,7 @@ fn an_unresolved_strong_import_can_be_made_fatal() {
 
 #[test]
 fn exactly_3594_init_array_entries_in_order_and_in_range() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let object = load(&f, &LoaderConfig::default());
 
@@ -837,6 +863,7 @@ fn exactly_3594_init_array_entries_in_order_and_in_range() {
 /// writable **is** writable, by writing to it.
 #[test]
 fn data_and_bss_stay_writable_after_the_load() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let object = load(&f, &LoaderConfig::default());
     let relro = object.relro.expect("PT_GNU_RELRO");
@@ -898,6 +925,7 @@ fn data_and_bss_stay_writable_after_the_load() {
 /// sealing ever prevents or alters a `JUMP_SLOT` store, the two disagree and this fails loudly.
 #[test]
 fn every_jump_slot_is_written_before_relro_seals_its_page() {
+    let _serial = serial();
     let Some(f) = fixture() else { return };
     let tables = f.elf.relocations().expect("decode");
     let plt = tables.plt.as_ref().expect("DT_JMPREL");

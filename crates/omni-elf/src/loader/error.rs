@@ -303,4 +303,53 @@ pub enum LoadError {
         /// Why it is invalid.
         why: &'static str,
     },
+
+    /// The file that was parsed and the file that would be mapped are not the same length, so they
+    /// are not the same file.
+    ///
+    /// [`load`](crate::loader::load) takes a `Backing` and an `ElfImage` as independent arguments and
+    /// uses **both**: the mapping plan is built from the backing's length, while the `.bss` tail copy
+    /// reads from the parsed slice. Nothing tied them together, so a backing *longer* than the parsed
+    /// bytes made the plan map and relocate file pages the parser never validated, and a shorter one
+    /// substituted parsed bytes for the mapped file's. The invariant was known — a test helper
+    /// asserted it, with a comment saying exactly why — which is the definition of an invariant the
+    /// API does not enforce.
+    ///
+    /// Equal lengths do not prove equal bytes. It is the strongest check available without hashing
+    /// 109 MB on every load, and it turns the common way to get this wrong from silent into loud.
+    #[error(
+        "the parsed image is {parsed} bytes but the file to be mapped is {backing} bytes ({name}): \
+         these must be the same file, because the mapping plan is derived from the file's length \
+         while segment tail bytes are copied from the parsed slice"
+    )]
+    BackingLengthMismatch {
+        /// Length of the file the mapping would come from.
+        backing: u64,
+        /// Length of the byte slice that was parsed.
+        parsed: u64,
+        /// The backing's name, for diagnostics.
+        name: String,
+    },
+
+    /// The plan's private anonymous memory — `.bss` plus any partial final page — is larger than the
+    /// loader is configured to allow.
+    ///
+    /// The loader's own line of defence, checked **before** anything is reserved, so a tampered
+    /// library is refused without taking address space. `omni-mem`'s commit ceiling is the one that
+    /// actually protects the scarce resource and would catch this anyway; this exists because it can
+    /// refuse earlier and name the ELF-level quantity that is wrong. Both are deliberate: the
+    /// measured defect was an eight-byte `p_memsz` edit that became 3.4 GiB of eager commit charge
+    /// with the load reporting success, and a limit derived in one layer from data the other layer
+    /// never bounded is exactly what let it through.
+    #[error(
+        "this object's PT_LOAD set needs {requested} bytes of private anonymous memory (.bss and \
+         partial final pages), past the configured limit of {limit}; p_memsz is a file field and a \
+         single edit to it is the difference between 11.6 MB of .bss and gigabytes"
+    )]
+    AnonymousMemoryTooLarge {
+        /// Bytes of anonymous memory the plan calls for.
+        requested: usize,
+        /// The configured limit.
+        limit: usize,
+    },
 }

@@ -79,7 +79,7 @@ pub use crate::loader::{
     load, DlPhdrInfo, EmptyProvider, Imports, LoadError, LoadPlan, LoadResult, LoadStats,
     LoadedObject, LoaderConfig, MappedRange, ProviderRegistry, RelocationStats, RelroRegion,
     ResolvedImport, SymbolKind, SymbolProvider, SymbolRequest, SymbolValue, UnresolvedImport,
-    UnresolvedPolicy, DEFAULT_RELOCATION_WINDOW,
+    UnresolvedPolicy, DEFAULT_MAX_ANONYMOUS_BYTES, DEFAULT_RELOCATION_WINDOW,
 };
 pub use crate::symbols::{GnuHash, StrTab, Sym, SymbolTable, SysvHash};
 pub use crate::version::{SymbolRequirement, VersionInfo, VersionNeed, VersionNeedAux};

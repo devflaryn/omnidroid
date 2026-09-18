@@ -38,6 +38,22 @@ const DEFAULT_WINDOW: usize = omni_elf::DEFAULT_RELOCATION_WINDOW;
 /// and a loose bound would let it drift.
 const STEADY_CEILING: i64 = 20 * 1024 * 1024;
 
+/// The ceiling on steady-state commit charge for one `libroblox.so` loaded with **lazy** `.bss`.
+///
+/// Measured at **~5.4 MiB** across release runs; the ceiling is 8 MiB. The eager figure was pinned
+/// first and this one was not, which is how three different three-decimal numbers for the same
+/// quantity came to be published across two documents and a fresh run: +5.602, +5.395 and +5.363
+/// MiB. A number quoted to a thousandth of a MiB that no test pins is the same defect as a test that
+/// asserts a rounded value, pointed the other way — so the lazy path is now pinned exactly as the
+/// eager one is, and the prose can quote an approximation honestly.
+const LAZY_STEADY_CEILING: i64 = 8 * 1024 * 1024;
+
+/// And the floor. Lazy `.bss` costs nothing, but the relro region (4.97 MiB) and `.data` (0.33 MiB)
+/// are privatised by relocation whatever the `.bss` policy is, so a figure *below* this means those
+/// pages stopped being private — which would mean the relocations went somewhere else. A ceiling on
+/// its own would pass happily if the load stopped committing anything at all.
+const LAZY_STEADY_FLOOR: i64 = 4 * 1024 * 1024;
+
 #[test]
 fn peak_and_steady_commit_charge_are_measured_and_reported() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -215,8 +231,38 @@ fn lazy_bss_costs_nothing_until_something_touches_it() {
             object.stats.relocations.committed_for_relocation, 0,
             "no relocation of libroblox.so targets .bss"
         );
-        deltas.push(after - before);
-        eprintln!("bss {policy:?}: steady commit {:+.3} MiB", mib(after - before));
+        let steady = after - before;
+        let peak = object.stats.peak_commit_delta().expect("measured");
+        deltas.push(steady);
+        eprintln!(
+            "bss {policy:?}: steady commit {:+.3} MiB, peak {:+.3} MiB",
+            mib(steady),
+            mib(peak)
+        );
+        if policy == CommitPolicy::Lazy {
+            // Pinned, not printed. D14 records the lazy path as "one field away" and quotes a
+            // figure for it; an unasserted figure drifts, and this one had already been published
+            // three different ways.
+            assert!(
+                (LAZY_STEADY_FLOOR..=LAZY_STEADY_CEILING).contains(&steady),
+                "lazy .bss steady-state commit charge was {:.3} MiB, outside the {:.3}..{:.3} MiB \
+                 band; the load should cost the relro region (4.97) plus .data (0.33) and nothing \
+                 for .bss",
+                mib(steady),
+                mib(LAZY_STEADY_FLOOR),
+                mib(LAZY_STEADY_CEILING)
+            );
+            // And the same peak-versus-steady guard the eager path has: this is what catches a
+            // change that transiently privatises memory the guest does not keep, which no
+            // correctness test can see.
+            assert!(
+                (peak - steady).abs() <= 1024 * 1024,
+                "lazy .bss: peak commit charge {:.3} MiB differs from steady-state {:.3} MiB by \
+                 more than 1 MiB",
+                mib(peak),
+                mib(steady)
+            );
+        }
         object.unload(&f.space).expect("unload");
     }
     assert!(
@@ -224,6 +270,13 @@ fn lazy_bss_costs_nothing_until_something_touches_it() {
         "eager .bss must cost about 11.6 MB more than lazy: {:+.3} vs {:+.3} MiB",
         mib(deltas[0]),
         mib(deltas[1])
+    );
+    // Both halves of D14's trade, stated as one line for the record.
+    eprintln!(
+        "D14: eager .bss {:+.3} MiB, lazy {:+.3} MiB, difference {:.3} MiB",
+        mib(deltas[0]),
+        mib(deltas[1]),
+        mib(deltas[0] - deltas[1])
     );
 }
 

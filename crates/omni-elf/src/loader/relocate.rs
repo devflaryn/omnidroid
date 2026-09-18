@@ -280,7 +280,7 @@ impl<'a> Relocator<'a> {
         self.stats.largest_window = self.stats.largest_window.max(win_len);
         self.stats.windowed_bytes += win_len;
         if self.measure_commit {
-            if let Ok(charge) = omni_platform::vm::process_commit_charge() {
+            if let Ok(charge) = omni_mem::process_commit_charge() {
                 self.stats.peak_commit_charge =
                     Some(self.stats.peak_commit_charge.unwrap_or(0).max(charge));
             }

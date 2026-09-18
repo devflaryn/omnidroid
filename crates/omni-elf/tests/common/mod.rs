@@ -1,9 +1,15 @@
 //! Golden-fixture plumbing: get the real ARM64 `.so` files out of the real APK.
 //!
-//! Global Constraint 2 says tests run against the real APK. `omni-apk` is not available to this
-//! crate (it is a sibling, not a dependency, and depending on it would invert the crate order),
-//! so this harness does the minimum ZIP work itself: read the end-of-central-directory record,
-//! walk the central directory, and inflate the `lib/arm64-v8a/*.so` entries.
+//! Global Constraint 2 says tests run against the real APK. The *parsing* fixtures do the minimum
+//! ZIP work themselves — read the end-of-central-directory record, walk the central directory,
+//! inflate the `lib/arm64-v8a/*.so` entries — because they only need bytes, and because a parser
+//! test that depended on the extraction cache would be testing two crates at once.
+//!
+//! The *loader* fixtures go through the real `omni-apk` extraction cache instead, because a view
+//! needs a page-aligned file offset that only the cache produces. `omni-apk` is a **dev**-dependency
+//! for exactly that, so the crate order is not inverted: nothing in `omni-elf`'s own code depends on
+//! it. (An earlier version of this comment said `omni-apk` was not available here at all, which
+//! stopped being true when the loader landed.)
 //!
 //! Extracted libraries are cached under `target/`, never committed (the repo `.gitignore` covers
 //! `/target/` and `*.apk`). When the APK is absent every golden test **skips** rather than

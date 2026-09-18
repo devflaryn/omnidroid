@@ -392,12 +392,12 @@ fn segments_match_the_measured_layout() {
     let (base, span) = elf.load_span();
     assert_eq!(base, 0, "the image starts at vaddr 0");
     assert_eq!(span, 0x0733_3c3c, "total loadable span");
-    // Max p_align across PT_LOAD is 16 KiB: this is a 16 KiB-page binary.
-    assert_eq!(
-        elf.load_segments().map(|s| s.p_align).max(),
-        Some(0x4000),
-        "PT_LOAD alignment"
-    );
+    // **Every** PT_LOAD has p_align = 0x4000: this is a 16 KiB-page binary. Global Constraint 3 asks
+    // for the exact value for every PT_LOAD, and asserting only the maximum would pass for a file
+    // whose other two segments claimed 4 KiB — which is the value an earlier draft of the research
+    // recorded, and the one that would make the segment arithmetic wrong.
+    let aligns: Vec<u64> = elf.load_segments().map(|s| s.p_align).collect();
+    assert_eq!(aligns, vec![0x4000, 0x4000, 0x4000], "every PT_LOAD's p_align");
     assert_eq!(elf.note_segments().count(), 1);
 }
 

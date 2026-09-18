@@ -598,7 +598,15 @@ fn attempt_real(label: &str, edit: impl FnOnce(&mut Vec<u8>)) -> Option<Result<(
     let bytes = common::cached_main_lib_bytes()?;
     let mut mutated = bytes.to_vec();
     edit(&mut mutated);
-    let dir = std::env::temp_dir().join(format!("omni-elf-tamper-{}", std::process::id()));
+    // One directory per call, not per process: `cargo test` runs this binary's tests as parallel
+    // threads, and two of them call this function. Sharing a path meant one test deleting the file
+    // another had just written — observed as `Backing::open` failing, and, worse, reachable as one
+    // test mapping the *other's* tampered library while parsing its own bytes. That is precisely the
+    // parsed-bytes-versus-mapped-bytes confusion `LoadError::BackingLengthMismatch` now refuses.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("omni-elf-tamper-{}-{serial}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the directory");
     let path = dir.join("libroblox.so");
     std::fs::write(&path, &mutated).expect("write the tampered library");
@@ -739,4 +747,174 @@ fn every_library_in_the_apk_loads() {
          accounted for, {tail_copies} needed a private final page"
     );
     assert!(total_relocations > 568_806, "the main library alone has 568,806");
+}
+
+// -------------------------------------------------------------------------------------------------
+// `p_memsz`: the field that decides how much commit charge a load spends
+// -------------------------------------------------------------------------------------------------
+
+/// A `p_memsz` inflated to a gigabyte is refused by the loader, before anything is reserved.
+///
+/// The bytes past `p_filesz` become private anonymous memory, and `LoaderConfig::bss_commit`
+/// defaults to `CommitPolicy::Eager` (D14), which charges a mapping its full size the moment it is
+/// made. So this one file field decides the load's commit charge, and it had no bound at all: the
+/// whole-branch review measured an **eight-byte** edit to the real `libroblox.so` producing
+/// +1026.004 MiB at 1 GiB and +3406.664 MiB at 3.3 GiB, **with the load succeeding**, against 16.7
+/// MiB for a stock load.
+#[test]
+fn a_gigabyte_of_bss_is_refused_before_anything_is_reserved() {
+    let at = synth::PHOFF + synth::PH_LOAD_DATA * synth::PHENTSIZE + synth::P_MEMSZ;
+    for (label, memsz) in [
+        ("p_memsz 1 GiB", 0x4000_0000u64),
+        ("p_memsz 3.3 GiB", 0xd400_0000),
+        ("p_memsz 257 MiB, just past the limit", 257 * 1024 * 1024 + synth::DATA_VADDR),
+    ] {
+        let err = refuse(label, |b| synth::put_u64(b, at, memsz));
+        match err {
+            LoadError::AnonymousMemoryTooLarge { requested, limit } => {
+                assert!(
+                    requested as u64 >= memsz - synth::DATA_VADDR - synth::DATA_FILESZ,
+                    "{label}: the error must name the real size, got {requested}"
+                );
+                assert_eq!(limit, omni_elf::DEFAULT_MAX_ANONYMOUS_BYTES, "{label}");
+            }
+            other => panic!("{label}: expected AnonymousMemoryTooLarge, got {other}"),
+        }
+    }
+
+    // And the limit does not reject what it is supposed to allow: 16 MiB of `.bss` is more than the
+    // real `libroblox.so` has and loads without complaint.
+    attempt("p_memsz 16 MiB of .bss", |b| {
+        synth::put_u64(b, at, synth::DATA_VADDR + 16 * 1024 * 1024);
+    })
+    .expect("16 MiB of .bss is a legitimate library");
+}
+
+/// With the loader's own limit lifted, `omni-mem`'s commit ceiling refuses the same file.
+///
+/// The two are deliberately separate layers and this asserts the lower one on its own, because the
+/// lesson the branch keeps relearning is that a bound is only as trustworthy as its least-validated
+/// input: a loader-level cap protects loads, and the ceiling in `omni-mem` protects *commit*, which
+/// is what M2's per-thread code caches (D5: 20-35 MiB each) will spend without going near a loader.
+#[test]
+fn the_guest_spaces_commit_ceiling_refuses_a_gigabyte_of_bss_on_its_own() {
+    let at = synth::PHOFF + synth::PH_LOAD_DATA * synth::PHENTSIZE + synth::P_MEMSZ;
+    let file = synth::SynthFile::tampered("p_memsz 1 GiB, loader limit lifted", |b| {
+        synth::put_u64(b, at, 0x4000_0000);
+    });
+    let space = GuestSpace::new().expect("space");
+    let backing = Backing::open(file.path(), MapExecutability::Executable).expect("open");
+    let elf = ElfImage::parse(&file.bytes).expect("parse");
+    let config = LoaderConfig {
+        // Exactly the mistake the layering exists to survive: a caller that does not set, or wrongly
+        // raises, its own limit.
+        max_anonymous_bytes: usize::MAX,
+        ..LoaderConfig::default()
+    };
+    let err = loader::load(&space, &backing, &elf, &ProviderRegistry::empty_provider(), &config)
+        .expect_err("omni-mem must refuse to commit a gigabyte");
+    match &err {
+        LoadError::Memory(inner) => {
+            let text = inner.to_string();
+            assert!(
+                text.contains("per-request ceiling") || text.contains("commit charge"),
+                "the refusal must be the commit ceiling, got {text}"
+            );
+            assert!(text.contains("268435456"), "and must name the limit: {text}");
+        }
+        other => panic!("expected a memory error, got {other}"),
+    }
+    eprintln!("p_memsz 1 GiB, loader limit lifted           -> {err}");
+
+    // And it left nothing behind: no mapping, and above all no commit charge.
+    let stats = space.stats();
+    assert_eq!(stats.mapped, 0, "a mapping survived the refusal");
+    assert_eq!(stats.committed, 0, "commit charge survived the refusal");
+    space.close().expect("close");
+}
+
+/// The same edit, eight bytes, in the **real** 109 MB library.
+///
+/// The synthetic cases above are the ones that assert the refusal precisely; this is the one that
+/// asserts it against the binary the measurement was taken from, because the synthetic library
+/// shares none of its structure.
+#[test]
+fn tampering_the_real_librarys_p_memsz_is_refused() {
+    let Some(bytes) = common::cached_main_lib_bytes() else { return };
+    // Program header 3 is the writable PT_LOAD: the one that owns `.data` and `.bss`.
+    let at = real_phdr(bytes, 3);
+    assert_eq!(
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+        1,
+        "program header 3 is PT_LOAD"
+    );
+    let filesz = u64::from_le_bytes(bytes[at + 32..at + 40].try_into().unwrap());
+    let memsz = u64::from_le_bytes(bytes[at + 40..at + 48].try_into().unwrap());
+    assert!(memsz > filesz, "this segment has .bss: filesz {filesz}, memsz {memsz}");
+
+    for (label, grown) in [
+        ("real p_memsz -> 1 GiB", 0x4000_0000u64),
+        ("real p_memsz -> 3.3 GiB", 0xd400_0000),
+    ] {
+        let outcome = attempt_real(label, |b| synth::put_u64(b, at + 40, grown))
+            .expect("the APK is present");
+        let err = outcome.expect_err("an inflated p_memsz must be refused, not loaded");
+        assert!(
+            matches!(err, LoadError::AnonymousMemoryTooLarge { .. }),
+            "{label}: expected AnonymousMemoryTooLarge, got {err}"
+        );
+    }
+}
+
+/// The parsed bytes and the mapped file must be the same file, and the loader — not a test helper —
+/// is what says so.
+///
+/// `load` takes a `Backing` and an `ElfImage` as independent arguments and uses both: the plan comes
+/// from `backing.len()`, while a segment's tail bytes are copied out of `elf.data()`. A backing
+/// *longer* than the parsed slice therefore maps and relocates file pages the parser never
+/// validated; a shorter one substitutes parsed bytes for the mapped file's.
+#[test]
+fn a_backing_that_is_not_the_parsed_file_is_refused() {
+    let pristine = synth::SynthFile::pristine();
+    for (label, edit) in [
+        (
+            "backing one page longer than the parsed image",
+            Box::new(|b: &mut Vec<u8>| b.extend_from_slice(&[0u8; 0x1000]))
+                as Box<dyn FnOnce(&mut Vec<u8>)>,
+        ),
+        (
+            "backing truncated below the parsed image",
+            Box::new(|b: &mut Vec<u8>| b.truncate(0x1000)),
+        ),
+    ] {
+        let other = synth::SynthFile::tampered(label, edit);
+        let space = GuestSpace::new().expect("space");
+        let backing = Backing::open(other.path(), MapExecutability::Executable).expect("open");
+        let elf = ElfImage::parse(&pristine.bytes).expect("the pristine bytes still parse");
+        let err = loader::load(
+            &space,
+            &backing,
+            &elf,
+            &ProviderRegistry::empty_provider(),
+            &LoaderConfig::default(),
+        )
+        .expect_err("a backing that is not the parsed file must be refused");
+        match err {
+            LoadError::BackingLengthMismatch { backing: b, parsed, .. } => {
+                assert_eq!(b, other.bytes.len() as u64, "{label}");
+                assert_eq!(parsed, pristine.bytes.len() as u64, "{label}");
+            }
+            other => panic!("{label}: expected BackingLengthMismatch, got {other}"),
+        }
+        assert_eq!(space.stats().mapped, 0, "{label}: nothing may be mapped");
+        space.close().expect("close");
+    }
+
+    // The matching pair still loads, so the check is not simply refusing everything.
+    let space = GuestSpace::new().expect("space");
+    let backing = Backing::open(pristine.path(), MapExecutability::Executable).expect("open");
+    let elf = ElfImage::parse(&pristine.bytes).expect("parse");
+    loader::load(&space, &backing, &elf, &ProviderRegistry::empty_provider(), &LoaderConfig::default())
+        .expect("the same file parsed and mapped must load");
+    space.close().expect("close");
 }
