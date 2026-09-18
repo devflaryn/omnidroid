@@ -123,7 +123,7 @@ fn load_store_pair_and_register_offset() {
     });
 
     // D4: with identity-style fastmem, not one of those accesses may reach a
-    // memory callback. A run that is merely *correct* can still be 13.2x slow,
+    // memory callback. A run that is merely *correct* can still be 30-49x slow,
     // and this counter is the only thing that can tell.
     let stats = vm.stats();
     assert_eq!(stats.slow_path_total, 0, "fastmem was bypassed: {stats:?}");
@@ -398,7 +398,7 @@ fn tpidr_el0_is_readable_with_a_bionic_stack_guard() {
 #[test]
 fn effective_config_reports_what_was_asked_for() {
     // P2: the default `fastmem_address_space_bits` is 36 and a guest address
-    // above it silently degrades to the callback path at 13.2x the cost. An
+    // above it silently degrades to the callback path at 30-49x the cost. An
     // assertion that cannot read the setting is not an assertion, so this is
     // the entry point that makes Task 3's startup check possible.
     let vm = Vm::new(vec![a64::svc(0)], VmOptions::default());

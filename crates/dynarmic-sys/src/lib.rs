@@ -78,7 +78,7 @@
 //!
 //! D4 measured identity mapping (`fastmem_pointer = 0`,
 //! `fastmem_address_space_bits = 64`) at 5,207 Mguest-insn/s against 396 for
-//! the callback path — 13.2x. dynarmic's default
+//! the callback path — 30-49x. dynarmic's default
 //! `fastmem_address_space_bits` is **36**, and a guest address above that
 //! silently falls back to callbacks *while still producing correct results*.
 //! No functional test can see that. [`od_jit_effective_config`] and
@@ -233,7 +233,7 @@ pub struct OdConfig {
     /// Where `TPIDRRO_EL0` lives; same pinning requirement.
     pub tpidrro_el0: *const u64,
     /// 0 routes every guest memory access through the callbacks: correct, and
-    /// 13.2x slower (D4).
+    /// 30-49x slower (D4).
     pub fastmem_enabled: i32,
     /// Host base address for guest address 0. 0 means identity mapping.
     pub fastmem_pointer: u64,
@@ -389,7 +389,7 @@ pub struct OdStats {
     /// Instruction-cache maintenance operations.
     pub icache_ops: u64,
     /// `slow_path_reads + slow_path_writes + slow_path_exclusive`. Under
-    /// identity fastmem this must stay 0; anything else is the silent 13.2x
+    /// identity fastmem this must stay 0; anything else is the silent 30-49x
     /// regression D4 warns about.
     pub slow_path_total: u64,
 }

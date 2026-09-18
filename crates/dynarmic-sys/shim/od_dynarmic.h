@@ -175,7 +175,7 @@ typedef struct od_config {
     const uint64_t* tpidrro_el0;
 
     /* D4: identity mapping. `fastmem_enabled` 0 routes every guest access
-     * through the callbacks above -- measured 13.2x slower. When 1,
+     * through the callbacks above -- measured 30-49x slower. When 1,
      * `fastmem_pointer` is the host base (0 for identity) and
      * `fastmem_address_space_bits` must be 64 for a full-width guest address
      * space. dynarmic's own default is 36, which silently degrades a high
@@ -262,7 +262,7 @@ typedef struct od_effective_config {
 /* Callback-entry counters. Plain `uint64_t`, incremented on the thread that
  * owns the jit, so they cost one non-atomic increment. Task 3 asserts
  * `slow_path_total == 0` for a memory-heavy loop under identity fastmem; that
- * assertion is the only defence against a silent 13.2x regression, and it
+ * assertion is the only defence against a silent 30-49x regression, and it
  * cannot be written unless the count is reachable. */
 typedef struct od_stats {
     uint64_t read_code;

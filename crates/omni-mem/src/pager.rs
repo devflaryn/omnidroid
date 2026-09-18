@@ -216,8 +216,20 @@ fn handle_fault(context: usize, fault: &Fault) -> FaultOutcome {
         return FaultOutcome::NotOurs;
     }
 
-    let outcome = catch_unwind(AssertUnwindSafe(|| resolve(inner, fault)))
-        .unwrap_or(FaultOutcome::NotOurs);
+    // A panic in the handler declines, because unwinding into the OS exception dispatcher is
+    // undefined behaviour and declining always is safe. But it must be **counted**: a
+    // resolvable fault declined here goes to dynarmic's frame-based handler, which
+    // recompiles the block with fastmem off and puts it on the 30-49x path for good. That is
+    // the same silent deoptimization the concurrent-granule bug caused, and worse, because
+    // an uncounted decline is invisible even in `PagerStats` -- there would be nothing to
+    // look at.
+    let outcome = match catch_unwind(AssertUnwindSafe(|| resolve(inner, fault))) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            inner.declined.fetch_add(1, Ordering::Relaxed);
+            FaultOutcome::NotOurs
+        }
+    };
 
     IN_HANDLER.with(|flag| flag.set(false));
     outcome
@@ -334,7 +346,8 @@ mod tests {
         assert_eq!(
             outcome,
             FaultOutcome::NotOurs,
-            "a fault raised inside the handler must decline, or the handler re-enters itself for              every level of a recursion that has no bottom"
+            "a fault raised inside the handler must decline, or the handler re-enters itself \
+             for every level of a recursion that has no bottom"
         );
         assert_eq!(
             inner.declined.load(Ordering::Relaxed),

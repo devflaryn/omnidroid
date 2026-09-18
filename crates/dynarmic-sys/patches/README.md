@@ -67,9 +67,17 @@ block length rather than with branch mix: **7.08x** on a workload with
 4-instruction blocks and no indirect branches at all (0.079 -> 0.561 ms, n=31,
 release), 7.11x and 7.43x on the two indirect mixes. The Task 2 re-review
 measured 6.6x (0.084 -> 0.551 ms, n=31) on its own 4-instruction-per-block
-workload -- the two agree within about 7%. Four-instruction blocks are close to
-the worst case, so treat 7x as an **upper bound**: real code has longer blocks
-and pays less, and neither figure has been measured against `libroblox.so`.
+workload -- the two agree within about 7%.
+
+**Both halves of the qualification that used to follow were wrong, and Task 3
+measured the thing that settles it.** D16 called 7x an upper bound on the
+grounds that real code has longer blocks, and recorded that neither figure had
+been measured against `libroblox.so`. `tools/branch_mix.py` now measures it:
+4,225,706 control transfers in 18,156,033 words of executable sections, a mean
+of **4.30 instructions per basic block** -- essentially the length these
+workloads used. So 7x is not loose for this guest, and the upper-bound framing
+is withdrawn. The estimate is static rather than traced, so it says which end of
+the band to expect and not what a run will cost.
 
 A runtime that does not want to pay that can instead run under `INTERRUPTIBLE`
 with cycle counting on and a **short** budget, so `Run` returns on its own every

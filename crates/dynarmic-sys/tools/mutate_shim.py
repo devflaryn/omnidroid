@@ -15,7 +15,7 @@ reverted is not evidence. Both directions are here, and the second is the point:
 * **A** reverts a guard. Something must fail.
 * **B** over-corrects -- substitutes a safer-looking default, clamps instead of
   refusing, invalidates more than asked. These read as improvements and destroy
-  a measured property. D4's 13.2x fastmem cliff is exactly this shape: correct
+  a measured property. D4's 30-49x fastmem cliff is exactly this shape: correct
   results, 13x slower, invisible to every functional test.
 
 Statuses: `caught` (a test failed, the process aborted, or the suite hung),

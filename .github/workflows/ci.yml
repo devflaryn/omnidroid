@@ -52,13 +52,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `-e normal` excludes dev- and build-dependencies, which is the question being asked: does a
-      # *consumer* of omni-cpu pull dynarmic in? `findstr` exits 0 on a match, so a match fails the
-      # step.
-      - name: no dynarmic-sys in the dependency graph
+      # **Do not add `-e normal` here.** It excludes dev-dependencies, which is exactly where the
+      # re-enabling lives: `omni-cpu` dev-depends on itself to switch `test-support` on, and a
+      # missing `default-features = false` on that line brings the backend back for the whole
+      # package. With `-e normal` the tree looks clean while `cargo test --no-run` compiles
+      # dynarmic, so the job passes and the property is gone -- verified by reinstating the bug:
+      # 1 hit without the fix, 0 with it, and no false positive either way.
+      #
+      # `findstr` exits 0 on a match, so a match fails the step.
+      - name: no dynarmic-sys anywhere in the graph, dev-dependencies included
         shell: cmd
         run: |
-          cargo tree -p omni-cpu --no-default-features -e normal > tree.txt || exit /b 1
+          cargo tree -p omni-cpu --no-default-features > tree.txt || exit /b 1
           findstr /C:"dynarmic-sys" tree.txt && exit /b 1
           exit /b 0
       - run: cargo test -p omni-cpu --no-default-features

@@ -57,7 +57,7 @@ both are load-bearing.
    any instruction boundary. The context pointer must not be the object through
    which `od_jit_run` was reached, `run` must take `&self`, and callbacks must
    not unwind. `tests/harness/mod.rs` is the worked example.
-2. **Configuration that is not optional.** Identity fastmem is 13.2x faster than
+2. **Configuration that is not optional.** Identity fastmem is 30-49x faster than
    the callback path (D4) and degrades to it *silently*.
    `od_jit_effective_config` and `od_jit_stats` exist so that can be asserted
    rather than assumed.

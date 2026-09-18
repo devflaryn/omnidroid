@@ -206,7 +206,11 @@ fn the_vectored_handler_takes_a_guest_fault_before_dynarmic_does() {
     assert_eq!(
         after.bytes_committed - before.bytes_committed,
         guest.space.commit_granule() as u64,
-        "exactly one commit granule, and no more. The four pages share one 64 KiB granule, so one          fault serves all four -- which is D10's measured granule choice working. A pager that          committed the whole mapping instead would also pass every functional assertion here, and          would give back D10's whole reason for lazy commit"
+        "exactly one commit granule, and no more. The four pages share one 64 KiB granule, \
+         so one fault serves all four -- which is D10's measured granule choice working. \
+         A pager that committed the whole mapping instead would also pass every \
+         functional assertion here, and would give back D10's whole reason for lazy \
+         commit"
     );
     assert_eq!(
         cpu.stats().slow_path_total,
