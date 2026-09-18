@@ -693,7 +693,8 @@ fn tampering_the_real_librarys_packed_relocation_targets_is_refused() {
             "expected a typed refusal, got {e}"
         ),
         Ok(()) => eprintln!(
-            "real APS2 blob byte flipped             -> still loadable: the flip stayed inside the image"
+            "real APS2 blob byte flipped \
+             -> still loadable: the flip stayed inside the image"
         ),
     }
 }
@@ -773,7 +774,8 @@ fn every_library_in_the_apk_loads() {
     // and left to drift. Measured: 11,575,296 bytes in `libroblox.so`; the next largest across the
     // eleven is 61,440, which is 188x smaller.
     eprintln!(
-        "largest single anonymous piece across the 11 libraries: {} bytes in {}, {}x below the          {} byte per-request commit ceiling",
+        "largest single anonymous piece across the 11 libraries: {} bytes in {}, {}x below the \
+         {} byte per-request commit ceiling",
         worst_piece.0,
         worst_piece.1,
         omni_mem::DEFAULT_MAX_COMMIT_REQUEST / worst_piece.0.max(1),
@@ -781,7 +783,9 @@ fn every_library_in_the_apk_loads() {
     );
     assert!(
         worst_piece.0 * 8 <= omni_mem::DEFAULT_MAX_COMMIT_REQUEST,
-        "the largest single segment a real library asks to be committed at once is          {} bytes, which leaves less than 8x under the {} byte per-request ceiling; either a          library grew or the ceiling is too tight to be safe",
+        "the largest single segment a real library asks to be committed at once is \
+         {} bytes, which leaves less than 8x under the {} byte per-request ceiling; either a \
+         library grew or the ceiling is too tight to be safe",
         worst_piece.0,
         omni_mem::DEFAULT_MAX_COMMIT_REQUEST
     );
@@ -886,7 +890,8 @@ fn the_guest_spaces_commit_ceiling_refuses_a_gigabyte_of_bss_on_its_own() {
         }
         other => panic!("expected CommitRequestTooLarge, got {other}"),
     }
-    eprintln!("p_memsz 1 GiB, loader limit lifted           -> {err}");
+    eprintln!("p_memsz 1 GiB, loader limit lifted \
+               -> {err}");
 
     // And it left nothing behind: no mapping, and above all no commit charge.
     let stats = space.stats();

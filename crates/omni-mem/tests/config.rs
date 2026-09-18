@@ -60,7 +60,8 @@ fn the_defaults_are_the_measured_ones() {
     );
     assert!(
         config.max_commit_request * 8 <= SMALLER_DEMONSTRATED_ATTACK,
-        "and it must refuse the measured tampered `p_memsz` with room to spare, or the pair does          not separate the attack from legitimate growth"
+        "and it must refuse the measured tampered `p_memsz` with room to spare, or the pair does \
+         not separate the attack from legitimate growth"
     );
 
     let arena = ArenaConfig::default();

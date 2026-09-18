@@ -490,7 +490,9 @@ fn a_larger_commit_granule_is_dramatically_cheaper_per_page() {
 
     if cfg!(debug_assertions) {
         eprintln!(
-            "note: this is a debug build, where the region map's O(n) invariant check runs after              every mutation. The ratio below still holds, but the absolute figures quoted in the              task report come from `cargo test --release`."
+            "note: this is a debug build, where the region map's O(n) invariant check runs after \
+             every mutation. The ratio below still holds, but the absolute figures quoted in the \
+             task report come from `cargo test --release`."
         );
     }
     for granule in [4 * KIB, 16 * KIB, 64 * KIB, 256 * KIB, MIB] {

@@ -48,6 +48,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use omni_mem::{CommitPolicy, GuestAddr, GuestSpace, Placement, Protection};
 
@@ -111,12 +112,59 @@ pub const TLS_CONTROL_BLOCK_BYTES: usize = TLS_SLOT_COUNT * core::mem::size_of::
 /// task report.
 pub const TLS_BLOCK_BYTES: usize = 4096;
 
+/// The list a freed block goes back on.
+///
+/// Held behind an [`Arc`] by both the arena and every block it has handed out, which is what lets a
+/// [`GuestTls`] free *itself*. A back-reference to the whole [`TlsArena`] would have done as well,
+/// but this is the smallest thing that has to outlive the arena, and it must outlive it: a block
+/// dropped after the last handle to its arena is gone then returns to a list nobody will read again,
+/// which is inert, where a dangling arena pointer would not be.
+type FreeList = parking_lot::Mutex<Vec<GuestAddr>>;
+
 /// A live guest TLS block. Freed back to its [`TlsArena`] when dropped.
-#[derive(Debug)]
+///
+/// # Why this has a `Drop` and did not
+///
+/// That doc line was written before the impl and the whole-branch review found the gap. There were
+/// three paths that dropped a block without returning it — two where `GuestThreadConfig::new`
+/// refused after the block had been handed out, and the one that matters, `od_jit_new` returning
+/// null on code-cache allocation failure after the block had already been moved into the context
+/// being built. Each cost one of the arena's blocks permanently, and the symptom arrived much later
+/// and somewhere else: `create_thread_with_tls` failing with "the TLS arena is full", which points
+/// at the guest's thread count rather than at a failed jit.
+///
+/// The fix is a real `Drop` rather than a free on each exit, because the exits are the problem: the
+/// next one added would leak again, and would look exactly like the code around it.
 pub struct GuestTls {
     base: GuestAddr,
     len: usize,
     guard: u64,
+    /// Where this block goes when it is dropped.
+    free: Arc<FreeList>,
+}
+
+impl core::fmt::Debug for GuestTls {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GuestTls")
+            .field("base", &format_args!("{:#x}", self.base))
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for GuestTls {
+    /// Return the block for reuse.
+    ///
+    /// Does **not** decommit: a guest thread exiting is usually followed by another starting, and
+    /// D10 makes commit charge the thing to husband, not the thing to churn. The whole arena's
+    /// charge comes back when the space is closed.
+    ///
+    /// The lock here is `parking_lot`'s and is taken for a `Vec::push`. It is never taken on the
+    /// fault path and never held across guest execution, so it cannot be the lock a faulting thread
+    /// already holds.
+    fn drop(&mut self) {
+        self.free.lock().push(self.base);
+    }
 }
 
 impl GuestTls {
@@ -177,7 +225,7 @@ pub struct TlsArena {
     block_bytes: usize,
     guard: u64,
     next: AtomicUsize,
-    free: parking_lot::Mutex<Vec<GuestAddr>>,
+    free: Arc<FreeList>,
     committed: AtomicU64,
 }
 
@@ -243,7 +291,7 @@ impl TlsArena {
             block_bytes,
             guard: generate_stack_guard(),
             next: AtomicUsize::new(0),
-            free: parking_lot::Mutex::new(Vec::new()),
+            free: Arc::new(parking_lot::Mutex::new(Vec::new())),
             committed: AtomicU64::new(0),
         })
     }
@@ -335,17 +383,12 @@ impl TlsArena {
                 .write_unaligned(self.guard);
         }
 
-        Ok(GuestTls { base, len: self.block_bytes, guard: self.guard })
-    }
-
-    /// Return a block for reuse.
-    ///
-    /// Takes the block by value so it cannot be used afterwards, and does **not** decommit: a guest
-    /// thread exiting is usually followed by another starting, and D10 makes commit charge the thing
-    /// to husband, not the thing to churn. The whole arena's charge is returned when the space is
-    /// closed.
-    pub fn free(&self, block: GuestTls) {
-        self.free.lock().push(block.base);
+        Ok(GuestTls {
+            base,
+            len: self.block_bytes,
+            guard: self.guard,
+            free: Arc::clone(&self.free),
+        })
     }
 
     /// What the arena costs, for [`ContextCost`] accounting. All private commit.
@@ -405,6 +448,62 @@ mod tests {
         assert!(
             TLS_CONTROL_BLOCK_BYTES > TlsSlot::BionicTls.offset(),
             "the control block must hold every named slot"
+        );
+    }
+
+    /// **I1.** A block that is dropped without anyone calling anything returns to the arena.
+    ///
+    /// The arena is sized at creation, so a leak is not a slow drift: it is `capacity` failures
+    /// away from refusing every further guest thread, with a message that names the thread count.
+    /// Three paths used to drop a block on the floor, and the realistic one — `od_jit_new`
+    /// returning null — is not reachable from a unit test, which is exactly why the property is
+    /// pinned on `GuestTls` itself rather than on any of the three callers.
+    #[test]
+    fn a_dropped_block_comes_back_to_the_arena_with_its_commit_intact() {
+        let space = GuestSpace::new().expect("a guest address space");
+        let arena = TlsArena::with_block_size(&space, 4, TLS_BLOCK_BYTES)
+            .expect("an arena for four blocks");
+        assert_eq!(arena.capacity(), 4);
+
+        // Fill it, and record what the blocks cost.
+        let mut blocks = Vec::new();
+        let mut bases = std::collections::HashSet::new();
+        for _ in 0..arena.capacity() {
+            let block = arena.allocate(&space).expect("a block out of an arena with room");
+            assert!(bases.insert(block.thread_pointer()), "two live blocks share a base");
+            blocks.push(block);
+        }
+        let committed = arena.committed();
+        assert!(committed > 0, "n = 4 blocks must have taken some commit charge");
+        assert!(arena.allocate(&space).is_err(), "a full arena refuses");
+
+        // Drop them with no `free` call anywhere. This is the line that had no implementation.
+        drop(blocks);
+
+        // Held for the whole round, not dropped per iteration: a block that went straight back on
+        // the free list would be handed out again on the very next turn of this loop, and the
+        // duplicate check below would be measuring nothing but its own bug. It measured exactly
+        // that on the first draft, which is the cheapest possible reminder that `Drop` is now the
+        // thing returning these.
+        let mut second_round = Vec::new();
+        let mut reused = std::collections::HashSet::new();
+        for _ in 0..arena.capacity() {
+            let block = arena
+                .allocate(&space)
+                .expect("a block that was dropped must be handed out again, or the arena leaks");
+            assert!(
+                reused.insert(block.thread_pointer()),
+                "the same base was handed out twice while both blocks were live, which is two \
+                 guest threads sharing one stack-guard slot"
+            );
+            second_round.push(block);
+        }
+        assert_eq!(reused, bases, "the second round must be exactly the first round's blocks");
+        assert_eq!(
+            arena.committed(),
+            committed,
+            "reuse must not take commit charge again, and freeing must not give it back: D10 \
+             makes commit charge the thing to husband, not the thing to churn"
         );
     }
 

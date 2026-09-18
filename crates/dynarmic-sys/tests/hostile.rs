@@ -1041,7 +1041,8 @@ fn the_stoppability_matrix() {
             Some(0) => wrong.push(format!("  {spec}: expected wedged, was stopped")),
             Some(EXIT_WEDGED) => wrong.push(format!("  {spec}: expected stopped, wedged")),
             other => wrong.push(format!(
-                "  {spec}: neither stopped nor wedged (exit {other:?}): the escape                  under test did not fire, but something else ended the run"
+                "  {spec}: neither stopped nor wedged (exit {other:?}): the escape \
+                 under test did not fire, but something else ended the run"
             )),
         }
     }

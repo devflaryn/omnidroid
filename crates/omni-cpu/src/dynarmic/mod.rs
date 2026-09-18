@@ -40,7 +40,7 @@ use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dynarmic_sys::{
@@ -92,6 +92,7 @@ const HALT_PANIC: u32 = OD_HALT_USER8;
 /// Every halt bit this backend raises or expects, for clearing between slices.
 const HALT_OURS: u32 =
     HALT_EXIT | HALT_PANIC | OD_HALT_MEMORY_ABORT | OD_HALT_CACHE_INVALIDATION;
+
 
 /// How the translating backend is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +269,16 @@ struct Shared {
     /// for a reason unrelated to how many threads are actually live.
     free_processors: parking_lot::Mutex<Vec<u32>>,
     next_processor: AtomicU32,
+    /// Processor ids handed back while the jit that held them was still alive. **Always 0.**
+    ///
+    /// A witness, not a statistic. `release_processor_id` cannot check the ordering itself — it is
+    /// handed an integer — so the caller passes what it knows, and this counts the times that claim
+    /// was false. It exists because the failure it guards has no symptom of its own: an id recycled
+    /// early lets another thread build a jit against the *same* entry of the shared
+    /// `ExclusiveMonitor` as a jit that is still live, and two guest threads on one monitor entry
+    /// makes `STXR` succeed where the architecture requires it to fail. Correct-looking results,
+    /// silently wrong, in D5's risk 3.
+    ids_released_early: AtomicU64,
 }
 
 impl Shared {
@@ -283,7 +294,17 @@ impl Shared {
         Some(id)
     }
 
-    fn release_processor_id(&self, id: u32) {
+    /// Hand a processor id back for reuse.
+    ///
+    /// `no_jit_holds_it` is the caller's statement that nothing can still be pointed at this entry
+    /// of the shared exclusive monitor: either the jit has been freed, or it was never created. It
+    /// is recorded rather than asserted — an `assert!` in a `Drop` would turn a bookkeeping mistake
+    /// into a panic during unwinding — and `DynarmicBackend::processor_ids_released_early` is what
+    /// a test reads.
+    fn release_processor_id(&self, id: u32, no_jit_holds_it: bool) {
+        if !no_jit_holds_it {
+            self.ids_released_early.fetch_add(1, Ordering::Relaxed);
+        }
         self.free_processors.lock().push(id);
     }
 }
@@ -342,7 +363,9 @@ impl DynarmicBackend {
                     backend: BACKEND_NAME,
                     operation: "install the guest demand pager",
                     detail: format!(
-                        "{e}. D10 requires Omnidroid to take guest faults ahead of dynarmic's own                          handler; without that every guest fault recompiles its block onto the                          callback path, measured 30-49x slower with correct results"
+                        "{e}. D10 requires Omnidroid to take guest faults ahead of dynarmic's own \
+                         handler; without that every guest fault recompiles its block onto the \
+                         callback path, measured 30-49x slower with correct results"
                     ),
                 });
             }
@@ -360,8 +383,18 @@ impl DynarmicBackend {
                 owns_guest_paging,
                 free_processors: parking_lot::Mutex::new(Vec::new()),
                 next_processor: AtomicU32::new(0),
+                ids_released_early: AtomicU64::new(0),
             }),
         })
+    }
+
+    /// Processor ids that were handed back while a jit still referenced their monitor entry.
+    ///
+    /// **Always 0**, and it is a test's job to keep saying so. See `Shared::ids_released_early` for
+    /// why the thing being counted has no other symptom.
+    #[must_use]
+    pub fn processor_ids_released_early(&self) -> u64 {
+        self.shared.ids_released_early.load(Ordering::Relaxed)
     }
 
     /// Whether this backend took ownership of guest page faults, as D10 requires.
@@ -452,7 +485,8 @@ impl DynarmicBackend {
         let cpu = match built {
             Ok(cpu) => cpu,
             Err(error) => {
-                self.shared.release_processor_id(processor_id);
+                // `build_unchecked` failed, so no jit was ever created against this id.
+                self.shared.release_processor_id(processor_id, true);
                 return Err(error);
             }
         };
@@ -497,7 +531,9 @@ impl DynarmicBackend {
                      guest thread needs a distinct processor id within it",
         })?;
         DynarmicCpu::new(Arc::clone(&self.shared), config, tls, processor_id).inspect_err(|_| {
-            self.shared.release_processor_id(processor_id);
+            // Either the jit was never created or `DynarmicCpu::drop` has already freed it: an
+            // `Err` out of `new` leaves no live jit holding this id either way.
+            self.shared.release_processor_id(processor_id, true);
         })
     }
 }
@@ -916,15 +952,30 @@ impl DynarmicCpu {
 }
 
 impl Drop for DynarmicCpu {
+    /// **Order is load-bearing, and it was wrong.**
+    ///
+    /// The jit is freed *first*, and only then is the processor id given back. The other order is
+    /// what this used to do, and it opens a window: `release_processor_id` puts the id on the free
+    /// list, another thread's `build` takes it, and for as long as `od_jit_free` has not run there
+    /// are two live jits pointed at the **same entry of the shared `ExclusiveMonitor`**. Two guest
+    /// threads on one monitor entry makes `STXR` succeed where the architecture requires it to fail
+    /// — a silent wrong answer in the subsystem D5 lists as risk 3 of 4, with no error anywhere.
+    ///
+    /// The TLS block needs no statement here and that is the point: `tls` is a field, so it is
+    /// dropped after this body, and [`GuestTls`]'s own `Drop` returns it to the arena. It used to be
+    /// freed explicitly at the top, which is both the earliest safe moment and the one that stopped
+    /// being reached when a constructor failed halfway.
     fn drop(&mut self) {
-        if let Some(tls) = self.tls.take() {
-            self.shared.tls.free(tls);
-        }
-        self.shared.release_processor_id(self.processor_id);
         // SAFETY: `&mut self` means nothing is executing, and the jit is freed exactly once. It is
         // freed before `ctx`, `tpidr_el0` and `tpidrro_el0` — which are dropped after this — and
         // before the `Arc<Shared>` that owns the monitor it points at.
         unsafe { od_jit_free(self.jit) };
+        // Nulled so that `self.jit.is_null()` below *is* the statement "the jit is gone" rather
+        // than a comment claiming it, and so a use-after-free of this field would be a null
+        // dereference rather than a dangling one.
+        self.jit = core::ptr::null_mut();
+        // Only now: no jit can reference this processor's monitor entry any more.
+        self.shared.release_processor_id(self.processor_id, self.jit.is_null());
     }
 }
 
@@ -965,6 +1016,30 @@ impl GuestCpu for DynarmicCpu {
             self.invalidate_word(from)?;
         }
 
+        // **On the early returns below, and why there is no halt-clearing here.**
+        //
+        // Four exits from the loop return before the `od_jit_clear_halt` further down —
+        // `take_panic`, the two shim failures and `DegradedMemoryPath` — and the whole-branch review
+        // read that as leaving the context poisoned: the next `run` would return from `od_jit_run`
+        // having executed nothing, and the classifier at the bottom of this loop would report it as
+        // "halted with reason … which this backend does not raise and cannot classify", blaming
+        // dynarmic for a bit this backend left behind.
+        //
+        // **That does not hold on this pin, and the emitted dispatcher is where to see it.**
+        // `BlockOfCode::GenRunCode` ends every return path with `xor eax, eax; lock xchg
+        // [r15 + halt_reason], eax` (`block_of_code.cpp:403-405`): the halt reason is read *and
+        // cleared*, atomically, by the generated code, and handed back as `Run`'s return value. So a
+        // context always re-enters `Jit::Run` with `halt_reason == 0` however this loop left it, and
+        // `tests/lifecycle.rs` runs a context twice across a `DegradedMemoryPath` to keep saying so.
+        //
+        // An entry clear was written, measured against that, and removed. It changed no behaviour,
+        // and it is not free: it is a lock-prefixed RMW on the per-call path, and the guest call
+        // boundary M3 budgets against is under 53 ns in total.
+        //
+        // The residual, stated rather than swept up: `OD_HALT_SHIM_REENTERED` and
+        // `OD_HALT_SHIM_THREW` never reach that `xchg` — the first never calls `Run`, and the second
+        // unwinds out of it — so a bit set before either can survive. Both already declare the jit
+        // uncharacterised and not to be reused, which is a stronger statement than a stale halt bit.
         let mut budget = Budget::new(limit);
         self.last_run_instructions = 0;
         loop {

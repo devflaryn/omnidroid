@@ -208,7 +208,8 @@ fn movz_movk_immediate(words: &[u32]) -> u64 {
         assert_eq!(
             w & 0xFF80_0000,
             want,
-            "word {i} of the immediate sequence is {w:#010x}, which is not the              {} this decoding assumes",
+            "word {i} of the immediate sequence is {w:#010x}, which is not the \
+             {} this decoding assumes",
             if i == 0 { "MOVZ" } else { "MOVK" }
         );
         let hw = (w >> 21) & 0x3;
@@ -230,7 +231,8 @@ fn seconds_limit() -> i64 {
     assert_eq!(
         decoded,
         (i64::MAX - 1000) / 1000,
-        "the guest's saturation bound must be the largest second-difference whose millisecond form          leaves room for the up-to-1000 ms the microsecond term can add"
+        "the guest's saturation bound must be the largest second-difference whose millisecond form \
+         leaves room for the up-to-1000 ms the microsecond term can add"
     );
     assert_eq!(decoded, 9_223_372_036_854_774);
     // The negative bound is built the same way, out of words 9..13, and must be its negation.
@@ -1004,14 +1006,16 @@ fn cold_and_warm_translation_throughput_on_real_roblox_code() {
         cold_samples[COLD_N - 1].as_secs_f64() * 1e3,
     );
     println!(
-        "  warm (n = {N} passes, median, no translation)                : {:8.3} ms, \
+        "  warm (n = {N} passes, median, no translation) \
+         : {:8.3} ms, \
          {:8.1} Mguest-insn/s",
         warm.as_secs_f64() * 1e3,
         m(warm_executed, warm)
     );
     let translation = cold.saturating_sub(warm);
     println!(
-        "  translation alone (cold - warm)                             : {:8.3} ms for \
+        "  translation alone (cold - warm) \
+         : {:8.3} ms for \
          {cold_executed} guest instructions, {:8.3} Mguest-insn/s",
         translation.as_secs_f64() * 1e3,
         m(cold_executed, translation)

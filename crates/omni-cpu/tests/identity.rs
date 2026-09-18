@@ -303,7 +303,9 @@ fn the_per_slice_invariant_stops_a_degraded_context_from_running_at_all() {
     guest.assert_high_addresses();
     assert!(
         guest.backend.slice_invariant_armed(),
-        "the invariant must be on by default, and it must really be on for this backend — it          disarms itself when the backend does not own guest paging, and a disarmed check proves          nothing"
+        "the invariant must be on by default, and it must really be on for this backend — it \
+         disarms itself when the backend does not own guest paging, and a disarmed check proves \
+         nothing"
     );
 
     const ITERATIONS: u64 = 1_000;
@@ -330,7 +332,8 @@ fn the_per_slice_invariant_stops_a_degraded_context_from_running_at_all() {
             );
         }
         other => panic!(
-            "a context whose every access takes the callback path must be caught by the per-slice              invariant, got {other:?}"
+            "a context whose every access takes the callback path must be caught by the per-slice \
+             invariant, got {other:?}"
         ),
     }
     assert_eq!(cpu.degraded_slices(), 1);
@@ -363,7 +366,9 @@ fn a_real_memory_fault_increments_the_counter_and_is_not_a_violation() {
     }
     assert!(
         after > before,
-        "a fault reaches the guest through the slow-path callback, so it MUST increment the          counter — if it did not, the exemption in the invariant would be dead code and the test          above it would prove nothing"
+        "a fault reaches the guest through the slow-path callback, so it MUST increment the \
+         counter — if it did not, the exemption in the invariant would be dead code and the test \
+         above it would prove nothing"
     );
     assert_eq!(cpu.degraded_slices(), 0, "and it must not count as a degradation");
 }

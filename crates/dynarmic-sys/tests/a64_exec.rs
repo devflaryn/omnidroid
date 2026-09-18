@@ -554,7 +554,8 @@ fn invalidating_a_range_spares_the_translations_outside_it() {
     assert!(after > 0, "the invalidated block was retranslated");
     assert!(
         after < first,
-        "invalidating 8 bytes retranslated as much as a cold start          ({after} fetches against {first}): the range was ignored"
+        "invalidating 8 bytes retranslated as much as a cold start \
+         ({after} fetches against {first}): the range was ignored"
     );
 }
 
@@ -580,6 +581,66 @@ fn the_code_cache_is_writable_and_executable_at_once() {
     assert_eq!(
         vm.effective_config().code_cache_w_xor_x,
         0,
-        "dynarmic's code cache is now W^X -- D12's exception can be withdrawn,          and crates/dynarmic-sys/patches/README.md updated"
+        "dynarmic's code cache is now W^X -- D12's exception can be withdrawn, \
+         and crates/dynarmic-sys/patches/README.md updated"
+    );
+}
+
+/// **The pin reads and clears its own halt reason, and a whole run loop rests on it.**
+///
+/// `BlockOfCode::GenRunCode` ends every return path out of the dispatcher with
+/// `xor eax, eax; lock xchg [r15 + halt_reason], eax` (`block_of_code.cpp:403-405`),
+/// so `Jit::Run` hands the reason back *and* leaves the jit with none.
+///
+/// Why that is worth a test rather than a comment: `omni-cpu`'s run loop has four
+/// exits that return before its own `od_jit_clear_halt`, and the whole-branch review
+/// read them as leaving the context poisoned for the next `run`. They do not, and the
+/// reason is this behaviour and nothing `omni-cpu` does. An entry clear was written
+/// against that reading and then removed, because it changed nothing and cost a
+/// lock-prefixed RMW on the per-guest-call path M3 budgets against. So the property
+/// moved from "something we do" to "something the pin does", and a property nobody
+/// owns is one nobody notices losing.
+///
+/// There is deliberately no mutation row: the code that would have to be reverted is
+/// vendored dynarmic, and the pin is not ours to mutate.
+#[test]
+fn a_halt_reason_is_read_and_cleared_by_the_dispatcher() {
+    // `MOVZ X0, #1; SVC #0`. The `SVC` halts with `HALT_DONE` through the harness's callback.
+    let code = assemble(&[(a64::movz(0, 1, 0), 0xD280_0020), (a64::svc(0), 0xD400_0001)]);
+    let vm = Vm::new(code, VmOptions::default());
+
+    // Halt it from outside before it has run a single instruction, with a bit the
+    // guest program never raises, so what comes back is unambiguously this one.
+    // SAFETY: the jit is live and not executing.
+    unsafe { dynarmic_sys::od_jit_halt(vm.raw(), dynarmic_sys::OD_HALT_USER6) };
+
+    vm.start(1_000_000);
+    let first = vm.run();
+    assert_eq!(
+        first, dynarmic_sys::OD_HALT_USER6,
+        "a pending halt must come back from the run it stopped, and must come back alone"
+    );
+    assert_eq!(
+        vm.reg(0),
+        0,
+        "and it must have stopped the run before any guest instruction executed: the program's          first instruction is `MOVZ X0, #1`, so a non-zero X0 means it ran"
+    );
+
+    // The jit must now be clean. Nothing cleared it but the dispatcher itself: no
+    // `od_jit_clear_halt` has been called on this jit at any point.
+    vm.start(1_000_000);
+    let second = vm.run_to_completion(64);
+    assert_eq!(
+        second & HALT_DONE,
+        HALT_DONE,
+        "the next run must execute guest code. If it returns {:#010X} again, `Jit::Run` has \
+         stopped clearing `halt_reason`, and every early return in omni-cpu's run loop now \
+         poisons its context for the next call",
+        dynarmic_sys::OD_HALT_USER6
+    );
+    assert_eq!(
+        vm.reg(0),
+        1,
+        "the second run must have executed guest code, not returned on a stale bit"
     );
 }

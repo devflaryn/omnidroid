@@ -181,7 +181,9 @@ impl Roblox {
         // the milestone is the wrong place to economise.
         assert!(
             backend.owns_guest_paging(),
-            "the M2 guest has no demand pager, so the per-slice callback invariant is disarmed and              every guest fault goes to dynarmic's own handler and the 30-49x path. The gate would              pass and prove less than it claims"
+            "the M2 guest has no demand pager, so the per-slice callback invariant is disarmed and \
+             every guest fault goes to dynarmic's own handler and the 30-49x path. The gate would \
+             pass and prove less than it claims"
         );
         let base = object.base;
         Some(Self {

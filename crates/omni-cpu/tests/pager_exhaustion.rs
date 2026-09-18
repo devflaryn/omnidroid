@@ -52,6 +52,17 @@ fn a_backend_that_cannot_install_a_demand_pager_is_refused() {
                 detail.contains("30-49x"),
                 "and it must say what carrying on would have cost, or nobody acts on it: {detail}"
             );
+            // **M1's defect class, pinned.** A lost line continuation in a multi-line string
+            // literal does not fail to compile: it silently folds the next line's indentation into
+            // the message, so the operator reads this sentence with a 26-space hole in the middle
+            // of it. Nothing else in the suite would notice, because every `contains` check still
+            // passes. Thirteen literals across the workspace carried it, including this one and
+            // `CpuError::DegradedMemoryPath`'s -- the two messages a human reads when D10's and
+            // D4's central requirements fail.
+            assert!(
+                !detail.contains("  "),
+                "the refusal contains a run of spaces, which is what a lost line continuation                  looks like at runtime: {detail:?}"
+            );
         }
         Err(other) => panic!("expected a pager refusal, got {other}"),
         Ok(backend) => panic!(

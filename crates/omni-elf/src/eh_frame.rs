@@ -784,7 +784,8 @@ mod tests {
         let got = reader(&lengthened, BASE).fde_bounds(fde_vaddr);
         assert!(
             !got.as_ref().is_ok_and(|b| *b == expected),
-            "lengthening the CIE's code_alignment_factor moves the FDE pointer encoding, so it              cannot read back the same function"
+            "lengthening the CIE's code_alignment_factor moves the FDE pointer encoding, so it \
+             cannot read back the same function"
         );
     }
 

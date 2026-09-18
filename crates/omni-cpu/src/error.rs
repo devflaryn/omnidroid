@@ -121,7 +121,11 @@ pub enum CpuError {
     ///
     /// [`ExitReason::MemoryFault`]: crate::ExitReason::MemoryFault
     #[error(
-        "the guest memory path degraded while running: the slice ending at {pc:#x} took          {callbacks} callback-path entries and stopped for a reason that is not a memory fault          ({exit}). Under D4's identity mapping a guest access reaches memory with no callback at          all, so a non-zero delta here means blocks have been recompiled onto the callback path --          measured 30-49x slower (n = 31, two loop shapes), with correct results throughout"
+        "the guest memory path degraded while running: the slice ending at {pc:#x} took \
+         {callbacks} callback-path entries and stopped for a reason that is not a memory fault \
+         ({exit}). Under D4's identity mapping a guest access reaches memory with no callback at \
+         all, so a non-zero delta here means blocks have been recompiled onto the callback path -- \
+         measured 30-49x slower (n = 31, two loop shapes), with correct results throughout"
     )]
     DegradedMemoryPath {
         /// Where the slice stopped.

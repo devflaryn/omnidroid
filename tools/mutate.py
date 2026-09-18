@@ -386,6 +386,53 @@ MUTATIONS = [
         self.with_ctx(|ctx| ctx.executable_cache = None);""",
      CPU),
 
+    # ---- teardown: the three defects with no symptom where they happen ---------------------------
+    ("cpu-A25", "A", "GuestTls no longer frees itself, so a failed construction leaks a block",
+     CPU_TLS,
+     """    fn drop(&mut self) {
+        self.free.lock().push(self.base);
+    }""",
+     """    fn drop(&mut self) {
+        let _ = self.base;
+    }""",
+     CPU),
+
+    ("cpu-B7", "B", "a block is returned twice, so two live guest threads share one stack guard",
+     CPU_TLS,
+     """        self.free.lock().push(self.base);""",
+     """        self.free.lock().push(self.base);
+        self.free.lock().push(self.base);""",
+     CPU),
+
+    ("cpu-A26", "A", "the processor id is recycled before the jit that holds its monitor entry",
+     CPU_DYN,
+     """        unsafe { od_jit_free(self.jit) };
+        // Nulled so that `self.jit.is_null()` below *is* the statement "the jit is gone" rather
+        // than a comment claiming it, and so a use-after-free of this field would be a null
+        // dereference rather than a dangling one.
+        self.jit = core::ptr::null_mut();
+        // Only now: no jit can reference this processor's monitor entry any more.
+        self.shared.release_processor_id(self.processor_id, self.jit.is_null());""",
+     """        self.shared.release_processor_id(self.processor_id, self.jit.is_null());
+        unsafe { od_jit_free(self.jit) };
+        self.jit = core::ptr::null_mut();""",
+     CPU),
+
+    # There is no row for "run clears a stale halt bit on entry", because there is no such line to
+    # revert. The review's M2 asked for one; the emitted dispatcher already does it
+    # (`block_of_code.cpp:403-405` ends every return path with `lock xchg` on `halt_reason`), so an
+    # entry clear changed nothing and was removed. What replaced it is a row against the pin itself,
+    # in `shim-A*`: if dynarmic ever stopped reading-and-clearing, M2 would become real, and that is
+    # the thing worth detecting.
+
+    ("cpu-A33", "A", "the pager refusal loses its line continuation again (M1's defect class)",
+     CPU_DYN,
+     """                        "{e}. D10 requires Omnidroid to take guest faults ahead of dynarmic's own \\
+                         handler; without that every guest fault recompiles its block onto the \\
+                         callback path, measured 30-49x slower with correct results""",
+     """                        "{e}. D10 requires Omnidroid to take guest faults ahead of dynarmic's own                          handler; without that every guest fault recompiles its block onto the                          callback path, measured 30-49x slower with correct results""",
+     CPU),
+
     # ---- the demand pager ------------------------------------------------------------------------
     ("mem-A15", "A", "the pager commits a page the guest may not write", PAGER,
      """        FaultAccess::Write => protection.is_writable(),""",
