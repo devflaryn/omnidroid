@@ -178,6 +178,24 @@ pub enum ElfError {
     #[error("DT_PLTREL is {0}, expected DT_REL (17) or DT_RELA (7)")]
     BadPltRel(u64),
 
+    /// A `DW_EH_PE_*` byte naming a pointer format this runtime does not implement.
+    ///
+    /// Refused by name rather than guessed at: every encoding is a *different width*, so reading
+    /// one as another does not fail, it produces a function map that is plausible and wrong.
+    #[error(
+        "{what}: DWARF pointer encoding {encoding:#04x} is not implemented; reading it as some \
+         other encoding would silently produce wrong addresses"
+    )]
+    UnsupportedEhFrameEncoding { what: What, encoding: u8 },
+
+    /// A structurally impossible `.eh_frame_hdr` or `.eh_frame` entry.
+    #[error("{what} at {offset:#x}: {reason}")]
+    MalformedEhFrame {
+        what: What,
+        offset: u64,
+        reason: &'static str,
+    },
+
     #[error("symbol index {index} is out of range for a {count}-entry dynamic symbol table")]
     SymbolIndexOutOfBounds { index: u32, count: u32 },
 

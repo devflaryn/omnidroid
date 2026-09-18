@@ -55,9 +55,11 @@
 pub mod aps2;
 pub mod consts;
 pub mod dynamic;
+pub mod eh_frame;
 pub mod error;
 pub mod header;
 pub mod image;
+pub mod leaf;
 pub mod loader;
 pub mod notes;
 pub mod reader;
@@ -68,6 +70,8 @@ pub mod version;
 
 pub use crate::aps2::{Aps2Limits, Aps2Summary, PackedFormat, PackedRelocations, Sleb128Decoder};
 pub use crate::dynamic::{DynArray, DynEntry, DynTable, Dynamic};
+pub use crate::eh_frame::{EhFrameHdr, FunctionBounds};
+pub use crate::leaf::{BodyFacts, LeafFunction, LeafKind, TextRelocations};
 pub use crate::error::{ElfError, Result};
 pub use crate::header::{FileHeader, Ident};
 pub use crate::image::{LoadImage, MAX_IMAGE_SPAN};
