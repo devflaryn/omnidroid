@@ -27,6 +27,13 @@ Two directions, and the second is the point:
   design commits lazily. These read as correct and destroy a measured property, and they are the
   direction that is normally missing.
 
+**Do not stage or commit while this is running, and do not run two copies of it.** It mutates files
+in the working tree in place, so `git add` during a run can capture a mutation, and the commit then
+looks like ordinary work with every test passing — the mutation is restored before the suite next
+runs. That happened once, in M3 task 1: `XReg::new`'s bound came back as `>` instead of `>=`, which
+admits `X31`, and it was found by reading the commit rather than by running anything. The pre-flight
+below catches a *killed* run on the next invocation; it cannot see a concurrent one.
+
 `--no-fail-fast` is not optional: without it `cargo test` stops after the first failing binary and
 silently attributes every mutation to whichever binary happened to run first.
 """
