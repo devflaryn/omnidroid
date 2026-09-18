@@ -1141,3 +1141,89 @@ of their lengths cannot exceed the executable segments they live in: **69,943,82
 is cost rather than correctness — a corrupted `.eh_frame` whose lengths decode to a few kilobytes
 each turns a quarter-second scan of 245,117 entries into gigabytes of decoding that produces
 nothing, which is a denial of service on an analysis tool from exactly the input D6 says to expect.
+---
+
+## D10 (correction 2) — the fault-handler contract was insufficient, not violated
+
+**Found by the whole-branch review at M2, at the seam between `omni-platform` and `omni-mem`.**
+
+`fault::install` asked callers to keep the handler's `context` valid "until the returned
+registration is dropped", and `release` cleared the slot with a release store and returned.
+`omni-mem`'s `DemandPager` satisfied that exactly: it declares its registration field before the
+state the handler reads, so the slot is cleared first. The contract was still not enough, and
+neither side alone could show it.
+
+A vectored handler is **process-wide**. It runs on whichever thread faulted, for whatever reason —
+another guest instance, the host allocator, a stack probe — and it can be preempted between loading
+the handler pointer and calling it. Clearing a slot stops calls that have not read it yet; it cannot
+stop one already in flight. So `handle_fault` could read `base`/`end` out of a freed `Box`, inside
+the OS exception dispatcher. Slot reuse compounded it: a stale in-flight call could be paired with a
+**new** registrant's context.
+
+Nothing a caller writes closes that window, so it is closed at the seam. `release` is now a
+**quiescence point**: a per-slot in-flight count is taken before the handler pointer is read and
+released after the handler returns, and `release` unpublishes the slot and then waits for the count
+to drain. All four accesses are `SeqCst`, deliberately — each side writes one location and reads the
+other, which is the store-buffer shape that acquire/release does not order, and the argument is
+written out in `fault/windows.rs`. Quiescence subsumes a generation tag: a stale pairing is not
+detected, it is unrepresentable, so slots are still reused and `MAX_HANDLERS` still means a capacity.
+
+**The race was reachable in-tree, and is measured.** `omni-platform/tests/fault_teardown_race.rs`
+tears a handler down under load — n = 24 rounds x 4 threads x 48 pages — and **6 of the 24 releases
+had to wait for a dispatch that was already inside the handler**. Zero handler frames observed their
+context after the release returned; under the previous contract the same test reports non-zero.
+
+The general lesson, and it is the third of this shape in the project: **a contract that every caller
+satisfies can still be the defect.** The two per-task reviews each saw one side and each concluded
+correctly about it.
+
+---
+
+## D5 (amendment 3) — a processor id must outlive the jit that holds its monitor entry
+
+`DynarmicCpu::drop` released the processor id and then freed the jit. In that window another
+thread's `build` can take the id and construct a jit against the **same entry of the shared
+`ExclusiveMonitor`** as a jit that is still alive. Two guest threads on one entry makes `STXR`
+succeed where the architecture requires it to fail — a silent wrong answer in the subsystem this
+decision already lists as risk 3 of 4, with no error anywhere and no test that would notice.
+
+The statements are swapped. Because the failure has no symptom of its own, the order is pinned by a
+witness rather than by a comment: `release_processor_id` is told whether the jit is already gone, and
+`DynarmicBackend::processor_ids_released_early` counts the times that claim was false. It must stay
+0, and `tests/lifecycle.rs` says so over ordinary create/drop churn and over the construction
+failures that release an id without a jit ever existing.
+
+---
+
+## D5 (amendment 4) — `CNTPCT_EL0` was the instruction counter, and the guest reads it as a clock
+
+The `GetCNTPCT` callback returned the backend's per-slice guest-instruction count. `run` zeroes that
+at the top of **every slice** — a million instructions by default — and again at the start of every
+run, so the counter a guest reads as a monotonic clock sawtooths. Two reads and a subtraction give a
+negative interval, and a spin-until-deadline loop never terminates; it is eventually stopped by the
+step budget and reported as `StepLimitReached`, which points at the budget. The comment above the
+callback said "monotonic". The units were wrong in the same place: one tick per guest instruction
+against the 600 MHz `CNTFRQ_EL0` dynarmic advertises by default.
+
+It is now the host's monotonic clock scaled to `CNTFRQ_EL0`, from one process-wide epoch, and
+`cntfrq_el0` is programmed from the same constant that scales it rather than left at 0 to pick up
+dynarmic's default — two defaults that happen to agree is not one constant used twice. The value is
+unchanged at **600 MHz**.
+
+The alternative the review offered — an accumulator of guest instructions that slices do not reset —
+was rejected for a reason worth recording: it cannot be given honest units. Guest instructions per
+second is not a constant, so no value of `CNTFRQ_EL0` makes `ticks / CNTFRQ` a time, and this is the
+counter behind `clock_gettime(CLOCK_MONOTONIC)` on AArch64 Android. Determinism was the thing given
+up, and it was not the thing a guest clock is for.
+
+Measured: **12,006,840 ticks over 20.0175 ms** of wall clock at 600 MHz (n = 1 interval, busy-waited
+rather than slept because Windows' sleep granularity is ~15 ms), and monotonic over n = 100,000
+consecutive reads. Bounded in both directions on purpose — the upper bound is what pins the units,
+and it needed a warm-up run before the window to be tight enough to catch "the counter returns
+nanoseconds".
+
+**Carried into M3, unchanged by this:** `ARCHITECTURE.md` section 6 records that `CNTVCT_EL0` is not
+implemented on this pin and surfaces through the interpreter fallback, and Android's `clock_gettime`
+vDSO reads `CNTVCT_EL0`, not `CNTPCT_EL0`. So the engine's real clock path still traps. Fixing
+`CNTPCT_EL0` was necessary and is not sufficient.
+

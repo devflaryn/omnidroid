@@ -70,7 +70,11 @@
 //!   and one a debugger can read.
 //! * It takes **no lock**, which is the other rule: the faulting thread cannot already hold a lock
 //!   this module owns, because this module owns none on the fault path. `INSTALL_LOCK` is taken only
-//!   by `install`, which no faulting thread is inside.
+//!   by `install`, which no faulting thread is inside. And because there is no lock, a fault that
+//!   arrives *on the releasing thread itself* while it is spinning — a stack probe, or an access
+//!   violation belonging to some other part of the process — is served normally: the scan finds this
+//!   slot's handler already zero and skips it, and any other slot's handler runs and returns. The
+//!   spin cannot deadlock against itself.
 //! * The in-flight reference is released by a guard with a `Drop`, so even a handler that violates
 //!   its no-unwind contract cannot leave a slot permanently un-drainable.
 //!
@@ -181,12 +185,14 @@ pub(super) fn install(handler: FaultHandler, context: usize) -> FaultResult<Faul
         // registration's `release` returned, no dispatch held a reference to this slot, and the
         // handler has read zero ever since. So a dispatch cannot be carrying the old context into a
         // call that lands on the new one.
-        debug_assert_eq!(
-            slot.active.load(Ordering::SeqCst),
-            0,
-            "a slot was claimed while a dispatch still held a reference to it, which means \
-             `release` returned without draining",
-        );
+        // There is deliberately **no** assertion here that `active` is 0, although it is tempting and
+        // was written first. It would be wrong and it would be flaky: a dispatch that peeks a
+        // non-zero `handler` takes its reference before re-reading, and the `CLAIMING` marker stored
+        // a line above is non-zero, so a scanner arriving in this window legitimately holds a
+        // transient reference to a slot nobody has published yet. It decrements again immediately
+        // without calling anything. What quiescence guarantees is that no reference from the
+        // *previous* registration survives, and that is guaranteed by `release` having drained, not
+        // by anything observable from here.
         slot.context.store(context, Ordering::Relaxed);
         slot.handler.store(handler_addr, Ordering::Release);
         return Ok(registration(index));

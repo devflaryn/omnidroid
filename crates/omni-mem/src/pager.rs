@@ -239,8 +239,10 @@ impl DemandPager {
         //   single-thread version of a violation.
         // * It returns `Resolved` only when the page really is accessible afterwards: either this
         //   call committed it, or another thread committed the same granule a moment earlier. The
-        //   second case is bounded to one retry per thread per address, so a disagreement between
-        //   the region map and the OS becomes a typed guest fault rather than a fault loop.
+        //   second case is bounded twice -- one retry per thread per commit **granule**, and a
+        //   ceiling on consecutive zero-commit resolutions -- so a disagreement between the region
+        //   map and the OS becomes a typed guest fault rather than a fault loop. It used to be
+        //   bounded per *address*, which two addresses in one granule defeated.
         let registration = unsafe { fault::install(handle_fault, context)? };
         Ok(Self { registration, inner })
     }
