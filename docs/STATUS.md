@@ -36,7 +36,7 @@ Last updated: 2026-09-18
 | CPU: throughput | About 2.0x native on memory-heavy code, 2.2x on NEON/FP, about 33x on register-bound integer code |
 | CPU: fastmem gain | Losing identity mapping costs **30-49x** (n=31, through the runtime's real callback path, two loop shapes, both degraded mechanisms). An earlier 13.2x figure measured a bare stub and is a floor, not the runtime's cost |
 | CPU: silent degradation | Under the default 36-bit width a memory-heavy loop takes **20,000 of 20,000** callback-path entries and **still returns the right answer**; with identity mapping it takes **0**. Asserted at startup |
-| CPU: per-thread cost | 24.43 MiB/thread at an 8 MiB code cache, 34.65 at 32 MiB and at 128 MiB — 16 MiB of it a fixed array written by the constructor even when its feature is disabled. Shrinking the cache does not help |
+| CPU: per-thread cost, by cache size | 24.5 MiB at an 8 MiB code cache, 34.65 at 32 MiB and **34.65 at 128 MiB** (n = 8 threads, serialized) — **shrinking the cache does not help**, because 16 MiB of it is a fixed array the constructor writes even when its feature is disabled |
 | Roblox branch shape | 2.27% indirect, one indirect transfer every 44 words; mean **4.30** instructions per basic block. Both **static** mixes, used as proxies for per-executed-transfer cost models |
 | CPU: cold translation | 0.15 to 0.31 Mguest-insn/s on synthetic loops, implying 7 to 25 s to warm a Roblox-sized working set. On **870 real `libroblox.so` leaf functions**: **0.516 Mguest-insn/s** (n = 11 passes, median, a fresh context each; 8,679 guest instructions) — 1.7 to 3.4x *better*. Per-instruction cost **rises** with function length (0.698 for the shortest third against 0.494 for the longest), which is the direction the "short functions give the IR optimizer less to work over" explanation needs; that explanation is a **hypothesis**, not established |
 | CPU: per-thread cost | 20 to 35 MiB committed per guest thread, code caches not shared between threads. Measured at **24.5 MiB** for this backend's 8 MiB cache (n = 8 threads, serialized) and **asserted against a 32 MiB ceiling**. `GuestCpu::cost()` reports **16.004 MiB** of it from two derived terms — the TLS page and the pin's fixed 16 MiB `FastDispatchEntry` table — and the 8.52 MiB it still misses is itself bounded and asserted |
@@ -87,9 +87,9 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
 | `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
-| `omni-elf` — loader: map, relocate, resolve, seal | **Pending final review.** Milestone **M1** |
+| `omni-elf` — loader: map, relocate, resolve, seal | **Done, reviewed.** Milestone **M1** |
 | `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
-| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Pending final review.** Milestone **M2**. 441 `#[test]` functions across the workspace, 65/65 mutations caught |
+| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Pending final review.** Milestone **M2**. 444 `#[test]` functions and 462 passing test cases across the workspace; mutation tables 66/66, 45/45 and 23/23 |
 | `omni-elf` — `.eh_frame_hdr` function map + leaf classifier | **Pending final review.** The selection tool M2 chose its code with |
 | `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
@@ -164,3 +164,15 @@ prevent: a documented number being read later as a measured fact.
 
 The rule applied here: quote approximate values in prose, and state separately what is actually
 **pinned by an assertion**, because only the pinned values will still be true after the next change.
+
+
+## Why two rows disagreed about the same number
+
+An earlier revision of this file carried the per-thread CPU cost twice, with two values for the same
+quantity at the same cache size, and the first of them carried **no sample size** — in the document
+whose own closing note describes exactly that failure. The M2 whole-branch review caught it.
+
+That is the third time in this project a measured figure has been recorded in two places and drifted,
+and the pattern is consistent: the duplicate is always added later, by someone summarising a result
+rather than measuring it. So the rule tightened here is not "check the figures" but **a measured
+quantity appears once, with its sample size, and everything else links to it**.
