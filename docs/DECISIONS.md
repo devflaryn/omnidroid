@@ -913,14 +913,16 @@ self-checking tool:
 | Class | Sites | Exclusive monitor? |
 |---|---|---|
 | `LDXR`/`STXR`/`LDAXR`/`STLXR` | 108 | yes |
-| `LDXP`/`STXP`/`LDAXP`/`STLXP` | 22 | yes |
-| `CAS`/`CASP` | 14 | LSE |
+| `LDXP`/`STXP`/`LDAXP`/`STLXP` | 20 | yes |
+| `CAS`/`CASP` | 16 | LSE |
 | `LDADD`/`SWP`/… | 37 | LSE |
 | `LDAR`/`STLR`/`LDLAR`/`STLLR` | 15,516 | **no** — ordered, not exclusive |
 | `LDAPR` | 0 | no |
 
-So **130 exclusive-monitor sites against 51 LSE**, with LSE making up **28.2% of atomic
-read-modify-write sites**.
+So **128 exclusive-monitor sites against 53 LSE**, with LSE making up **29.3% of atomic
+read-modify-write sites**. (Two words first classified as `LDXP` are `CASPA`/`CASPL`: `CASP` shares
+`o2=0, o1=1` with the exclusive-pair encoding and is discriminated by bit 31 alone. Verified by an
+independent decoder plus a capstone cross-check over all 15,697 classified words.)
 
 This corrects a figure that briefly claimed 15,646 exclusive sites by counting the acquire/release
 class as exclusives. The conclusions that followed from it were all wrong and are withdrawn: risk 4
@@ -937,6 +939,26 @@ Separately measured, and worth keeping because it was nearly asserted instead: t
 accesses **do** stay on the fastmem path — measured at n = 1,000 per class, `LDR`/`STR`, `LDAR`/`STLR`
 and `LDXR`/`STXR` all take **0** callback entries, with a mutation row that turns
 `fastmem_exclusive_access` off and is caught by it.
+
+### The finding that resolves the coupling: `AT_HWCAP` is not merely live, it is the control
+
+All 53 LSE sites reference **one byte** — `0x683ba58`, compiler-rt's `__aarch64_have_lse_atomics` —
+through **outline atomics**, and **106 of the 128 exclusive sites are those same helpers' fallback
+arms**. So Roblox does not contain two independent populations of atomic code. It contains one
+population behind a runtime branch on a single flag, and **Omnidroid owns that flag**, because it
+implements `getauxval(AT_HWCAP)`.
+
+That turns D5's "these two risks must be decided together" from a coupling into a **switch**:
+
+- **Advertise `HWCAP_ATOMICS`** → the 53 LSE sites are taken, and each is a hard halt into the
+  interpreter on this pin (risk 4).
+- **Decline it** → the 106 fallback arms are taken instead, into the global exclusive-monitor
+  spinlock that anti-scales 21x from 1 to 16 threads (risk 3).
+
+Neither is free, but the choice is now a single bit we set, with both arms measured rather than
+guessed, and it is mechanically pinned by a test. The earlier claim that "each LSE site is a hard
+halt" is therefore true **only if we advertise the capability** — which is exactly the decision this
+amendment leaves open for M3, now with the evidence to make it.
 
 ---
 
