@@ -76,11 +76,11 @@ has confirmed it yet — on this project that distinction has mattered every sin
 |---|---|
 | Cargo workspace, nine crates | **Done** |
 | `omni-platform` virtual-memory seam (Windows) | **Done, reviewed.** Reserve, 4 KB placeholder split, commit, decommit, protect, file-backed map, commit-charge measurement |
-| `omni-platform` dual-mapped sections + placeholder coalescing | **Pending review** |
+| `omni-platform` dual-mapped sections + placeholder coalescing | **Done, reviewed** |
 | `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
 | `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
-| `omni-mem` — guest address space + JIT arena | **Pending review.** 42 new tests |
+| `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform`; 207 workspace-wide |
 | `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
 **Measured, not assumed**
@@ -93,14 +93,21 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | Shared read-only file view | 4 MiB costs **+0.008 MiB**, unchanged after reading every byte, so instances share `libroblox.so` text for free |
 | Commit granule | 64 KiB. Measured 2414 ns/page at 4 KiB (worse than the 2053 ns VEH fault D10 rejected), 150 ns/page at 64 KiB, against an unavoidable 381 ns first-touch fault |
 | JIT arena | Dual-mapped, W+X unrepresentable in the API; a child process storing through the execute pointer dies with `0xC0000005` |
+| Partial unmap | Copy-on-write content preserved in survivors, verified in the loader's exact relocation shape; sharing preserved at +0.008 MiB across a partial unmap of a clean 8 MiB view |
+| CoW charging | Charged at `protect` time, not write time: +8.020 MiB the instant an 8 MiB view becomes writable, refunded on restore |
 | `libroblox.so` extraction | 413 ms once (release), 130 us on a cache hit |
 | APS2 decode | 568,272 relocations from 46,184 groups in ~2 ms, consuming 2,100,778 of 2,100,778 bytes |
 
-**Known accounting gap (unconfirmed, under review):** a pagefile-backed section reportedly does not
-appear in `PrivateUsage`, which would make the JIT arena's cost invisible to
-`process_commit_charge`. This matters more than it sounds: the chosen CPU core commits 20-35 MiB per
-guest thread, so if true, the largest per-thread cost is the one our accounting cannot see. Being
-verified before it is written into the decisions.
+**Known accounting gap (confirmed):** a pagefile-backed section does not appear in `PrivateUsage`, so
+the JIT arena's cost is invisible to per-process commit-charge measurement. It invalidates no recorded
+measurement — every commit-charge figure here concerns private memory — but the budgeting diagnostic
+cannot see its fastest-growing consumer, since the CPU core commits 20-35 MiB per guest thread. The
+arena's mapped size is now reported as a first-class figure alongside private usage.
+
+**Confirmed constraint for the loader:** copy-on-write is charged at `protect` time, not write time.
+Protecting an 8 MiB `ReadExecute` view to `ReadWrite` costs +8.020 MiB of commit immediately, before
+any byte is written, and is refunded on restore. So relocation must proceed in windows — dropping the
+whole 109 MB library to writable would transiently charge 109 MB per instance.
 
 **Known gap:** Windows `unmap` is whole-view-only, so a guest partial `munmap` cannot be serviced by
 the platform layer directly. The seam refuses it with a typed error carrying the view extent rather

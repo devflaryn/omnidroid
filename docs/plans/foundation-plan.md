@@ -363,6 +363,16 @@ if one is genuinely unfit, say so in the report instead of working around it sil
   `omni-mem`, and map each `PT_LOAD` at `base + p_vaddr` from the cache file at 4 KB granularity,
   honouring `p_align` (4 KB here, 16 KB for newer NDKs).
 - Zero the `p_memsz > p_filesz` tail (`.bss`) without disturbing file-backed pages.
+- **Relocate in windows, never whole-library.** Copy-on-write is charged at `protect` time, not write
+  time (measured twice: an 8 MiB `ReadExecute` view costs +8.020 MiB of commit the instant it is
+  protected to `ReadWrite`, before any byte is written, and is refunded on restore). Dropping the whole
+  109 MB library to `ReadWrite` would transiently charge 109 MB **per instance** and defeat the memory
+  requirement. Protect a window, apply the relocations landing in it, restore its protection, move on.
+  Choose the window size deliberately and report the measured peak commit it produces.
+- **`omni-mem` preserves copy-on-write content across a partial unmap**, so you may rely on that — but
+  note the cost model: a survivor that has ever been writable is compared page-by-page against a
+  pristine view (~0.5 ms per MiB compared), while a never-written survivor is free. Keeping the
+  writable window small therefore helps twice.
 - Apply relocations: `R_AARCH64_RELATIVE` (1027) as `*target = base + addend`, and
   `R_AARCH64_GLOB_DAT` (1025), `R_AARCH64_JUMP_SLOT` (1026) and **`R_AARCH64_ABS64` (257)** as symbol
   resolution. The 534 `JUMP_SLOT`s come from `DT_JMPREL`, separately from the APS2 blob.

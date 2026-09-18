@@ -330,6 +330,50 @@ Two further measured corrections from the same work:
   memory, so the protect operation performs a `VirtualQuery` to determine which applies rather than
   assuming.
 
+
+### Further corrections from building on it (Task 2)
+
+**Copy-on-write is charged at `protect` time, not at write time.** Measured twice independently:
+mapping an 8 MiB `ReadExecute` view costs +0.020 MiB; protecting it to `ReadWrite` costs
+**+8.020 MiB immediately**, before a single byte is written; writing two pages adds nothing further;
+restoring `ReadExecute` refunds it down to +0.027 MiB.
+
+The consequence is a hard constraint on the ELF loader: **relocation must proceed in windows.** A
+loader that drops the whole 109 MB library to `ReadWrite` in order to relocate it would transiently
+charge 109 MB of commit *per instance* — which, multiplied across concurrent instances, defeats the
+memory requirement at precisely the worst moment. Protect a window, relocate within it, restore it,
+move on.
+
+**Partial unmap of a file view must preserve copy-on-write content in the surviving pieces.** On
+Windows a view can only be unmapped whole, so a partial unmap is emulated by unmapping the view and
+re-mapping the survivors — and a naive implementation re-maps them *fresh from the backing file*,
+silently discarding any relocated content while returning success. This is not hypothetical: it was
+reproduced in exactly the relocation shape above, reading back `0x0` instead of the written byte.
+
+The working approach preserves both correctness and sharing: compare each survivor that has **ever
+been writable** page-by-page against a pristine second view of the same section, streaming in
+windows, and write back **only the pages that differ**. Measured cost: clean views are never compared
+at all (11.8 us per hole punch), one dirty page costs 38 us, a fully-writable 4 MiB view costs
+1.51 ms (~0.5 ms/MiB, so ~2.6 ms for RELRO). Sharing lost: **none** — commit charge across the unmap
+is +0.000 MiB, confirmed by re-measurement.
+
+Two approaches that look right and are not: wholesale snapshot-and-restore privatises clean pages
+(measured +8.453 MiB on an 8 MiB case, i.e. the multi-instance property visibly failing), and
+`QueryWorkingSetEx`-based privatisation detection is unreliable because **its shared bit is only
+meaningful for resident pages** — it would lose data precisely under the memory pressure that causes
+instances to be backgrounded.
+
+**A pagefile-backed section does not appear in `PrivateUsage`.** The JIT arena's cost is therefore
+invisible to per-process commit-charge measurement. This invalidates no existing measurement, since
+every commit-charge figure recorded here concerns private memory — but it means the budgeting
+diagnostic cannot see its fastest-growing consumer, given D5 measured 20-35 MiB of code cache **per
+guest thread**. The arena's mapped size is therefore reported as a first-class figure alongside
+private usage.
+
+**`release` must walk an allocation's real extent.** Passing a zero size released only the first
+piece of a split reservation and returned success — a latent trap, harmless only because the one
+existing caller happened to coalesce first.
+
 ### Confirmed prediction
 
 The same tests confirmed the multi-instance premise of this decision: a 4 MiB shared read-only view
