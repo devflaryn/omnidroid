@@ -157,7 +157,7 @@ Two settings decide whether this runtime is fast or unusable, and one decides wh
 
 `fastmem_pointer = Some(0)` with `fastmem_address_space_bits = 64` emits `mov reg, [r13 + vaddr]`
 with `r13 = 0` — a single instruction, base folded into the SIB byte. Verified executing at host VA
-`0x7F00_0000_0000` with **zero** slow-path callbacks, and measuring **13.2x** faster than routing
+`0x7F00_0000_0000` with **zero** slow-path callbacks, and measuring **30-49x** faster than routing
 memory through callbacks (5,207 versus 396 Mguest-insn/s).
 
 **Assert this configuration at startup and fail loudly if it is not in effect.** The default

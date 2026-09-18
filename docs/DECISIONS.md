@@ -478,8 +478,9 @@ single instruction with the base folded into the SIB byte. Verified executing at
 So the central architectural bet in `ARCHITECTURE.md` section 1 holds: there is no address
 translation on the memory path, and it costs not even a register add. Measured consequence: the
 memory-heavy loop runs at **5,207 Mguest-insn/s** on the fastmem path versus **396 Mguest-insn/s**
-through memory callbacks — a **13.2x** difference. This single configuration choice is the
-difference between a viable runtime and an unusable one.
+through memory callbacks — a 13.2x difference *as measured by the spike*. **See the Task 3 correction
+below: the real cost is 30-49x, and 13.2x is a floor.** Either way, this single configuration choice is
+the difference between a viable runtime and an unusable one.
 
 **Two footguns to guard against in code, not comments:**
 - The default `fastmem_address_space_bits` is **36**, and a high guest VA silently degrades to the

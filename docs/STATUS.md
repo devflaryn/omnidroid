@@ -34,7 +34,10 @@ Last updated: 2026-09-18
 | CPU: identity mapping | Guest VA == host VA verified at a 47-bit address with zero slow-path callbacks; costs one folded SIB base |
 | CPU: correctness | dynarmic builds in 49 s; all 202,200 of its test assertions pass; 37/37 hand-encoded A64 checks correct |
 | CPU: throughput | About 2.0x native on memory-heavy code, 2.2x on NEON/FP, about 33x on register-bound integer code |
-| CPU: fastmem gain | 5,207 Mguest-insn/s fastmem versus 396 through callbacks, a 13.2x difference |
+| CPU: fastmem gain | Losing identity mapping costs **30-49x** (n=31, through the runtime's real callback path, two loop shapes, both degraded mechanisms). An earlier 13.2x figure measured a bare stub and is a floor, not the runtime's cost |
+| CPU: silent degradation | Under the default 36-bit width a memory-heavy loop takes **20,000 of 20,000** callback-path entries and **still returns the right answer**; with identity mapping it takes **0**. Asserted at startup |
+| CPU: per-thread cost | 24.43 MiB/thread at an 8 MiB code cache, 34.65 at 32 MiB and at 128 MiB — 16 MiB of it a fixed array written by the constructor even when its feature is disabled. Shrinking the cache does not help |
+| Roblox branch shape | 2.27% indirect, one indirect transfer every 44 words; mean **4.30** instructions per basic block. Both **static** mixes, used as proxies for per-executed-transfer cost models |
 | CPU: cold translation | 0.15 to 0.31 Mguest-insn/s, implying 7 to 25 s to warm a Roblox-sized working set |
 | CPU: per-thread cost | 20 to 35 MiB committed per guest thread, code caches not shared between threads |
 
