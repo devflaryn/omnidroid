@@ -170,6 +170,25 @@ pub const fn mrs(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u
         | rt
 }
 
+/// `MSR <system register>, Xt` — as [`mrs`] with bit 21 clear (`L = 0`, a write rather than a read).
+pub const fn msr(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+    mrs(rt, op0, op1, crn, crm, op2) & !(1 << 21)
+}
+
+/// `MSR FPCR, Xt` — `S3_3_C4_C4_0`.
+///
+/// Used to make the guest's floating-point control state differ from the host's, which is how the
+/// MXCSR question is asked: dynarmic maps `FPCR` onto `guest_MXCSR` in `A64JitState::SetFpcr`, and
+/// whether that mapping is live inside a host callback is a property of the emitter, not of us.
+pub const fn msr_fpcr(rt: u32) -> u32 {
+    msr(rt, 3, 3, 4, 4, 0)
+}
+
+/// `MRS Xt, FPCR`.
+pub const fn mrs_fpcr(rt: u32) -> u32 {
+    mrs(rt, 3, 3, 4, 4, 0)
+}
+
 /// `MRS Xt, CNTFRQ_EL0` — `S3_3_C14_C0_0`. The frequency the counter below ticks at.
 pub const fn mrs_cntfrq_el0(rt: u32) -> u32 {
     mrs(rt, 3, 3, 14, 0, 0)
@@ -212,6 +231,11 @@ mod tests {
         assert_eq!((ldar(1, 0) >> 23) & 1, 1, "LDAR is o2 = 1: ordered");
         assert_eq!((ldxr(1, 0) >> 23) & 1, 0, "LDXR is o2 = 0: exclusive");
         assert_eq!(svc(0xFFFF), 0xD41F_FFE1);
+        // `MRS X0, FPCR` is 0xd53b4400 and `MSR FPCR, X0` is 0xd51b4400 -- one bit apart, and it is
+        // the bit that decides which direction the transfer goes.
+        assert_eq!(mrs_fpcr(0), 0xD53B_4400);
+        assert_eq!(msr_fpcr(0), 0xD51B_4400);
+        assert_eq!(mrs_fpcr(0) ^ msr_fpcr(0), 1 << 21);
         assert_eq!(brk(0), 0xD420_0000);
         assert_eq!(mov64(3, 0x1_0000_0000), vec![movz(3, 1, 2)]);
     }

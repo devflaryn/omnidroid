@@ -147,6 +147,15 @@ fn plt_stub(stub_at: GuestAddr, got_slot: GuestAddr) -> Vec<u32> {
 /// against. A real imported symbol adds its own body on top.
 fn nothing(_call: &mut InlineThunkCall<'_>) {}
 
+/// `STMXCSR` into a `u32`. `_mm_getcsr` is deprecated in favour of exactly this.
+fn read_mxcsr() -> u32 {
+    let mut out: u32 = 0;
+    // SAFETY: SSE2 is baseline on x86-64 and this file is `cfg(target_arch = "x86_64")`.
+    // `stmxcsr` writes four bytes to a `u32` this frame owns.
+    unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut out, options(nostack)) };
+    out
+}
+
 /// A representative AAPCS64 marshal: read the eight integer argument registers, combine them so the
 /// optimizer cannot delete the reads, write the result register.
 ///
@@ -482,6 +491,89 @@ fn a_counted_budget_still_stops_a_guest_looping_through_an_inline_thunk() {
         Ok(ExitReason::Halted { .. }) => {}
         other => panic!("an outstanding halt must be honoured, got {other:?}"),
     }
+}
+
+/// **An inline handler runs with the GUEST's MXCSR loaded, and design A's does not.**
+///
+/// Found by reading `A64EmitX64::EmitA64CallSupervisor`, which calls `Devirtualize<CallSVC>::EmitCall`
+/// **without** a preceding `code.SwitchMxcsrOnExit()` — the only terminal in the A64 emitter that
+/// does switch is `IR::Term::Interpret`. `BlockOfCode::GenRunCode` loads `guest_MXCSR` on entry and
+/// restores the host's only on the `FORCE_RETURN` paths. So a handler called from inside generated
+/// code inherits the guest's rounding mode and its flush-to-zero / denormals-are-zero bits, while
+/// design A services the call after `run` has returned and the host MXCSR is back.
+///
+/// **This matters for task 3, not for the benchmark.** `exp`, `log`, `powf` and `sincosf` are all in
+/// the set of imports the 3,594 initializers reach, and Rust's `f32`/`f64` compile to SSE. A host
+/// `powf` serviced inline would run under whatever FPCR the guest last set — silently, with no error
+/// and a plausible answer. Either such a handler saves and restores MXCSR itself, or symbols that do
+/// host floating point stay on the exiting thunk.
+///
+/// Asserted rather than left as a code reading, because a code reading is not a measurement.
+#[test]
+fn an_inline_handler_inherits_the_guest_mxcsr() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+
+
+    /// What `_mm_getcsr()` read inside the handler.
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    fn record_mxcsr(_call: &mut InlineThunkCall<'_>) {
+        SEEN.store(read_mxcsr(), Ordering::Relaxed);
+    }
+
+    let _serial = serialized();
+    let guest = Guest::new();
+    let thunk = guest.code + THUNK_AT;
+
+    // The host's own MXCSR, for the comparison. 0x1F80 on a default Windows x64 thread.
+    let host = read_mxcsr();
+
+    // MOV X21, X30 ; MOVZ X0, #0x0100, LSL #16  (FPCR.FZ, bit 24) ; MSR FPCR, X0 ; BL thunk ; RET X21
+    let mut program = vec![mov_reg(21, 30), movz(0, 0x0100, 1), msr_fpcr(0)];
+    program.push(bl(THUNK_AT as i32 / 4 - program.len() as i32));
+    program.push(ret(21));
+    let entry = guest.load_at(0, &program);
+
+    let (mut cpu, sentinel) = guest.thread();
+    cpu.add_inline_thunk(thunk, record_mxcsr).expect("an inline thunk");
+    rearm(&mut cpu, sentinel);
+    match cpu.run(entry, RunLimit::Unlimited).expect("run") {
+        ExitReason::Returned { pc } => assert_eq!(pc, sentinel),
+        other => panic!("expected the sentinel, got {other}"),
+    }
+    assert_eq!(cpu.inline_calls(), 1, "the handler must have run");
+
+    let seen = SEEN.load(Ordering::Relaxed);
+    assert_ne!(seen, 0, "the handler did not record anything");
+    // FPCR.FZ makes dynarmic set SSE flush-to-zero (bit 15) and denormals-are-zero (bit 6);
+    // `A64JitState::SetFpcr` is where that mapping lives.
+    const FTZ: u32 = 1 << 15;
+    const DAZ: u32 = 1 << 6;
+    assert_eq!(
+        seen & (FTZ | DAZ),
+        FTZ | DAZ,
+        "the handler saw MXCSR {seen:#06x} with the host's at {host:#06x}. If the flush-to-zero and          denormals-are-zero bits are clear, the guest's MXCSR is NOT live inside an inline handler          and this finding should be withdrawn from the task 1 report"
+    );
+    // And the host's own MXCSR does not have them, which is what makes the assertion above a
+    // difference rather than a coincidence.
+    assert_eq!(host & (FTZ | DAZ), 0, "the host thread already had FTZ/DAZ set; test is void");
+
+    // Design A services the call *after* `run` returns, so the host MXCSR is back by then. The same
+    // program, the same guest FPCR, an exiting thunk.
+    SEEN.store(0, Ordering::Relaxed);
+    let (mut cpu, _sentinel) = guest.thread();
+    cpu.add_thunk(thunk).expect("an exiting thunk");
+    rearm(&mut cpu, sentinel);
+    match cpu.run(entry, RunLimit::Unlimited).expect("run") {
+        ExitReason::Thunk { .. } => {}
+        other => panic!("expected the thunk exit, got {other}"),
+    }
+    let after_exit = read_mxcsr();
+    assert_eq!(
+        after_exit, host,
+        "design A must hand control back with the HOST MXCSR restored; got {after_exit:#06x}          against {host:#06x}. If this fails, the difference between the two designs is smaller than          the report claims and both need the save/restore"
+    );
 }
 
 /// **The measurement.** Both designs, with and without a representative marshal, plus the PLT-stub
