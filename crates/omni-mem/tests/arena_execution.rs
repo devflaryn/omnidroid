@@ -61,7 +61,18 @@ mod x86_64 {
 
     const MIB: usize = 1024 * 1024;
 
-    /// `CommitBudget` reads a per-process counter, so the tests that measure it run one at a time.
+    /// **Every** test in this binary takes this, not just the two that measure.
+    ///
+    /// `CommitBudget::process_private` is `PrivateUsage`, which is **process-global**: it counts
+    /// every allocation any thread in this process makes. libtest runs these four tests in parallel
+    /// by default, so serialising only the measuring tests left the other two churning the heap
+    /// underneath the measurement — and the real signal turned out to be **4-16 KiB**, far smaller
+    /// than that churn. That reproduced as `private_delta` going *negative* in roughly one run in
+    /// ten.
+    ///
+    /// It mattered more than a flaky test usually would: a spurious failure here appears in
+    /// `tools/mutate.py`'s output as a mutation "caught" by a test that has nothing to do with it,
+    /// which silently corrupts the one table Global Constraint 12 asks us to trust.
     static SERIAL: Mutex<()> = Mutex::new(());
 
     /// No guest address spaces are involved here; only arenas are.
@@ -107,12 +118,10 @@ mod x86_64 {
     ///
     /// `69 /r id` is `imul r32, r/m32, imm32` with ModRM `C0` selecting `eax, eax`; `05 id` is
     /// `add eax, imm32`. Both wrap on overflow, which is why [`predict`] uses `wrapping_*`.
-    fn affine(m: u32, a: u32) -> Vec<u8> {
-        let mut code = Vec::with_capacity(11);
-        code.extend_from_slice(&[0x69, 0xC0]);
-        code.extend_from_slice(&m.to_le_bytes());
-        code.push(0x05);
-        code.extend_from_slice(&a.to_le_bytes());
+    fn affine(m: u32, a: u32) -> [u8; 11] {
+        let mut code = [0x69, 0xC0, 0, 0, 0, 0, 0x05, 0, 0, 0, 0];
+        code[2..6].copy_from_slice(&m.to_le_bytes());
+        code[7..11].copy_from_slice(&a.to_le_bytes());
         code
     }
 
@@ -121,10 +130,16 @@ mod x86_64 {
     /// `89 C8` is `mov eax, ecx` — the Microsoft x64 ABI passes the first integer argument in `RCX`
     /// and returns in `EAX` — and `C3` is `ret`. No prologue, no stack use, no callee-saved register
     /// touched, so it is callable directly from Rust.
-    fn standalone(m: u32, a: u32) -> Vec<u8> {
-        let mut code = vec![0x89, 0xC8];
-        code.extend_from_slice(&affine(m, a));
-        code.push(0xC3);
+    ///
+    /// Returns an array rather than a `Vec` on purpose: the cost measurement emits 65,536 of these
+    /// *between* its two `PrivateUsage` readings, and 65,536 heap allocations inside the window is
+    /// the measurement measuring itself. It was — the delta fell from about 102,400 bytes to 4-16
+    /// KiB once this stopped allocating.
+    fn standalone(m: u32, a: u32) -> [u8; 14] {
+        let mut code = [0u8; 14];
+        code[0..2].copy_from_slice(&[0x89, 0xC8]); // mov eax, ecx
+        code[2..13].copy_from_slice(&affine(m, a));
+        code[13] = 0xC3; // ret
         code
     }
 
@@ -371,9 +386,12 @@ mod x86_64 {
         // exists to take.
         const SAMPLE_EVERY: usize = 512;
 
-        let mut samples: Vec<Vec<(CodeBlock, Step)>> = Vec::new();
+        // Reserved rather than grown. Everything emitted between the two readings is built in
+        // fixed-size arrays (see `standalone`) and every container is sized up front, so the only
+        // thing that moves `PrivateUsage` inside the measurement window is the arenas themselves.
+        let mut samples: Vec<Vec<(CodeBlock, Step)>> = Vec::with_capacity(arenas.len());
         for (arena_index, arena) in arenas.iter().enumerate() {
-            let mut kept = Vec::new();
+            let mut kept = Vec::with_capacity(BLOCKS_PER_ARENA / SAMPLE_EVERY + 2);
             for index in 0..BLOCKS_PER_ARENA {
                 // Constants unique to (arena, block), so an aliased or stale block is a wrong
                 // number rather than a lucky coincidence.
@@ -438,15 +456,32 @@ mod x86_64 {
             private_delta,
             full.invisible_to_process_counter(),
         );
+        // **One two-sided bound, not a lower bound at zero.**
+        //
+        // The first version of this asserted `private_delta > 0`, reasoning that two views must at
+        // least cost page tables at D10's measured `size/512` — 65,536 bytes for 32 MiB of mapping.
+        // Two things were wrong. It had no margin at all on the side it actually failed on. And it
+        // was measuring the wrong thing: once this binary was serialised and the emission loop
+        // stopped allocating, the delta collapsed from about 102,400 bytes to **4,096-16,384**, one
+        // to four pages, across twelve runs. Almost all of the original figure was this test's own
+        // heap, and reporting it as the arena's cost was false precision.
+        //
+        // Two conclusions, both recorded rather than smoothed over. D10's `size/512` page-table
+        // model was measured on committed *anonymous* memory and does not transfer to a mapped
+        // section view. And one to four pages is indistinguishable from allocator granularity, so
+        // asserting that it *is* page tables would be inventing a mechanism from noise.
+        //
+        // What the measurement does support — and what D15 actually needs — is a two-sided bound:
+        // whatever `PrivateUsage` does in either direction, it is negligible beside the bytes
+        // charged against the system commit limit. `mapped / 128` sits 8x above the largest movement
+        // observed and 128x below what was mapped, and unlike a bound at zero it cannot be failed by
+        // noise going the wrong way.
         assert!(
-            private_delta < mapped as i64 / 8,
-            "the arena's {mapped} bytes must be invisible to process_commit_charge (D15); \
-             PrivateUsage moved by {private_delta} bytes, which is too much to be page tables"
-        );
-        assert!(
-            private_delta > 0,
-            "two views of {mapped} bytes cost page tables, so PrivateUsage must move a little; it \
-             moved by {private_delta}"
+            private_delta.unsigned_abs() as usize <= mapped / 128,
+            "the arena's {mapped} bytes must be invisible to process_commit_charge (D15): \
+             PrivateUsage moved by {private_delta} bytes, more than the {} that would still count \
+             as negligible",
+            mapped / 128
         );
 
         drop(arenas);
@@ -472,6 +507,9 @@ mod x86_64 {
     /// Run in a child process, because the whole point is that the store is not survivable.
     #[test]
     fn the_executable_view_is_still_not_writable_after_a_seal_and_unseal_cycle() {
+        // Serialised with every other test in this binary: it spawns a child and allocates, both of
+        // which move the process-global `PrivateUsage` the cost tests read. See `SERIAL`.
+        let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
         const CHILD: &str = "OMNI_MEM_ARENA_PATCHED_EXEC_WRITE_CHILD";
         const NO_FAULT: i32 = 7;
         /// `STATUS_ACCESS_VIOLATION`.
@@ -524,6 +562,9 @@ mod x86_64 {
     /// refusal.
     #[test]
     fn hostile_arena_inputs_are_refused_and_the_arena_still_works_afterwards() {
+        // Serialised for the reason given on `SERIAL`: this test maps arenas and allocates, and
+        // `PrivateUsage` is process-global.
+        let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
         let arena = CodeArena::new().expect("arena");
         let block = arena.alloc(CHAIN_BLOCK).expect("a real block");
 

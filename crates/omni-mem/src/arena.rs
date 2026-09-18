@@ -411,15 +411,31 @@ impl CodeArena {
     /// [`MemError::BlockOverflow`] if the write would run past the end of the block, or
     /// [`MemError::BlockSealed`] if any page it would touch is sealed.
     ///
-    /// # What the sealed check does and does not promise
+    /// # What the sealed check promises, exactly
     ///
-    /// It is exact for one thread, and for the arena-per-guest-thread shape D5 describes. It is a
-    /// check, not a lock held across the store: another thread that seals a page-mate *between* this
-    /// check and the store below still produces a fault. That window is not new and is not closable
-    /// here — the whole design of `write` is that it does not hold the arena lock while copying —
-    /// and it is the same class of problem as two threads emitting into the same block, which this
-    /// type has always left to the translator to sequence. What the check removes is the case that
-    /// needs no concurrency at all: sealing a block and then writing to it.
+    /// Once anything in this arena is sealed, the check **and the store** happen under the arena
+    /// lock, so a concurrent [`seal`](CodeArena::seal) — which takes the same lock — cannot change a
+    /// page's protection between them. That closes the hazard completely for an arena that has ever
+    /// sealed, and it costs the lock-free path nothing.
+    ///
+    /// One window remains, and it is worth naming rather than waving at: the **first** seal in an
+    /// arena, racing a write that has already read `sealed_pages` as zero and taken the fast path.
+    /// Closing that would mean taking the lock on every write, including in the arena of a
+    /// translator that never seals, which is the one path D12 measured as hot.
+    ///
+    /// It is deliberately *not* the same class as two threads emitting into one block. That is a
+    /// race between a caller and itself over memory it asked for. This one couples **two unrelated
+    /// blocks** through a page neither of them named — with the default 16-byte alignment, up to 256
+    /// blocks share a page, and sealing any of them seals the rest. That is a genuinely surprising
+    /// coupling, which is why it is stated here in full rather than folded into a general warning.
+    ///
+    /// For M2's expected shape it does not arise at all: D5 gives each guest thread its own code
+    /// cache, so an arena has one writer.
+    ///
+    /// The cost of the closure: while anything is sealed, writes to this arena serialise against
+    /// each other and against `alloc`. One arena per guest thread means no contention; an arena
+    /// shared between threads would feel it, and would be choosing safety over throughput, which is
+    /// the right way round for a page that may be read-only.
     pub fn write(&self, block: &CodeBlock, offset: usize, bytes: &[u8]) -> MemResult<()> {
         self.check_own(block)?;
         if offset > block.len || bytes.len() > block.len - offset {
@@ -437,7 +453,12 @@ impl CodeArena {
         // that matters, because the pages really are read-only and this is a *safe* function —
         // without the check, the `copy_nonoverlapping` below is an access violation reachable from
         // entirely safe code.
-        if self.sealed_pages.load(Ordering::Acquire) != 0 {
+        //
+        // The guard is *held across the store*, not dropped after the check. `seal` takes the same
+        // lock, so while it is held no page's protection can change underneath the copy. Keeping it
+        // is what turns the check from "usually right" into a guarantee, and it costs the fast path
+        // nothing because the fast path never takes it.
+        let _sealed_guard = if self.sealed_pages.load(Ordering::Acquire) != 0 {
             let chunks = self.inner.lock();
             let chunk = chunks.get(block.chunk).ok_or(MemError::BlockOutsideChunk {
                 write: block.write,
@@ -454,11 +475,16 @@ impl CodeArena {
                     page: chunk.write + index * self.page,
                 });
             }
-        }
+            Some(chunks)
+        } else {
+            None
+        };
         // SAFETY: `[block.write + offset, + bytes.len())` is inside the block, which is inside the
         // chunk's writable view — checked above — and the arena never hands the same range out
         // twice, so this is an exclusive write to memory the arena owns. The source and destination
-        // cannot overlap: `bytes` is the caller's memory and this range is the arena's.
+        // cannot overlap: `bytes` is the caller's memory and this range is the arena's. If anything
+        // in this arena is sealed, `_sealed_guard` still holds the arena lock, so the protection of
+        // these pages cannot have changed since it was checked.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -466,6 +492,7 @@ impl CodeArena {
                 bytes.len(),
             );
         }
+        drop(_sealed_guard);
         Ok(())
     }
 

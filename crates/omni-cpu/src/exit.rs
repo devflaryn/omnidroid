@@ -102,9 +102,14 @@ pub enum ExitReason {
     StepLimitReached {
         /// Where execution stopped.
         pc: GuestAddr,
-        /// How many guest instructions were executed. May exceed the budget by less than one
-        /// translated block: a counted budget is checked at block boundaries, not between every pair
-        /// of instructions, and a backend that pretended otherwise would be lying about a number.
+        /// How many guest instructions were executed.
+        ///
+        /// May exceed the budget. A backend counts wherever counting is cheap for it — at the end
+        /// of a run of instructions it handles as a unit — rather than between every pair, so the
+        /// budget is a ceiling on when it *checks*, not on the exact instruction it stops at. The
+        /// overshoot is bounded by whatever that unit is for the backend in question, and this field
+        /// reports what really happened; a backend that clamped this to the budget would be lying
+        /// about a number the caller is using to bound untrusted code.
         executed: u64,
     },
 

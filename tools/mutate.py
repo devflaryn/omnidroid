@@ -143,8 +143,8 @@ MUTATIONS = [
     # test process with an access violation, which is exactly the point — that is what safe code
     # could reach before it existed.
     ("mem-A11", "A", "the sealed-page check removed, so a safe write faults the process", ARENA,
-     """        if self.sealed_pages.load(Ordering::Acquire) != 0 {""",
-     """        if false && self.sealed_pages.load(Ordering::Relaxed) != 0 {""",
+     """        let _sealed_guard = if self.sealed_pages.load(Ordering::Acquire) != 0 {""",
+     """        let _sealed_guard = if false && self.sealed_pages.load(Ordering::Acquire) != 0 {""",
      MEM),
 
     ("mem-A12", "A", "the budget stops adding the arena's invisible commit to the total", BUDGET,
@@ -244,6 +244,41 @@ MUTATIONS = [
 ]
 
 
+def read_exactly(path):
+    """Read a file without touching its line endings.
+
+    `open(path)` in text mode is universal-newlines: it turns CRLF into LF on the way in, and on
+    Windows turns LF back into CRLF on the way out. So a mutation applied to an LF file used to
+    restore it as CRLF -- every line of it reported as changed by `git diff`, and the "always
+    restored" promise in this module's docstring quietly untrue. `newline=""` on both halves makes
+    the round trip exact, which is the only version of that promise worth making.
+    """
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def write_exactly(path, text):
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
+def as_written(pattern, text):
+    """Re-express a table pattern in the line ending the target file actually uses.
+
+    The two halves of the restore fix have to be done together, and doing only the first is a trap I
+    walked straight into. Reading with `newline=""` stops the harness rewriting a file's line
+    endings -- but it also means a CRLF file now contains CRLF, while every `old`/`new` string in the
+    table above is written with LF, because it lives in a Python source file. Six multi-line patterns
+    silently stopped matching and were reported as MISS.
+
+    They were reported, though, which is the only reason this was caught: a MISS is never a pass.
+    That is worth more than the bug cost.
+    """
+    crlf = '\r\n' in text
+    normalised = pattern.replace('\r\n', '\n')
+    return normalised.replace('\n', '\r\n') if crlf else normalised
+
+
 def run(command):
     started = time.time()
     proc = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
@@ -276,8 +311,9 @@ def main():
     print(f"{len(selected)} mutations\n")
     results = []
     for mid, direction, description, path, old, new, command in selected:
-        with open(path, encoding="utf-8") as handle:
-            original = handle.read()
+        original = read_exactly(path)
+        old = as_written(old, original)
+        new = as_written(new, original)
         if old not in original:
             print(f"{mid:<9} MISS  pattern not found in {path}")
             results.append((mid, direction, description, "MISS", "pattern not found"))
@@ -287,13 +323,17 @@ def main():
             results.append((mid, direction, description, "MISS", "pattern not unique"))
             continue
         try:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(original.replace(old, new))
+            write_exactly(path, original.replace(old, new))
             code, output, seconds = run(command)
             caught = failing_tests(output)
             if code == 0:
                 status, detail = "NOT CAUGHT", "every test still passed"
-            elif not caught and "error[" in output or "could not compile" in output:
+            # Parenthesised. Without them this read as
+            # `(not caught and "error[" in output) or ("could not compile" in output)`, so any run
+            # whose output happened to contain "could not compile" -- including one where a mutation
+            # was genuinely caught by a failing test -- was filed as MISS. A harness that
+            # misclassifies its own results is worse than no harness.
+            elif not caught and ("error[" in output or "could not compile" in output):
                 status, detail = "MISS", "did not compile"
             elif caught:
                 status = "caught"
@@ -305,8 +345,12 @@ def main():
             print(f"{mid:<9} {status:<10} {description} -> {detail} ({seconds:.0f}s)")
             results.append((mid, direction, description, status, detail))
         finally:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(original)
+            write_exactly(path, original)
+            if read_exactly(path) != original:
+                # The restore is the one thing this harness must never get wrong: a file left
+                # mutated silently poisons every later row and, worse, the repository.
+                print(f"{mid:<9} FATAL restoring {path} did not reproduce the original")
+                return 2
 
     print()
     caught = sum(1 for r in results if r[3] == "caught")

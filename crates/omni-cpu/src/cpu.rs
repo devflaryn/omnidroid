@@ -196,6 +196,18 @@ pub trait GuestCpu: Send {
     /// error anywhere). Callers are the guest's `mprotect`, `munmap`, `dlclose`, and the guest's own
     /// cache-maintenance instructions.
     ///
+    /// # Scope
+    ///
+    /// Declared per context, because a context is what a caller holds. Whether it *takes effect*
+    /// per context or across the whole process is the backend's business and genuinely differs: a
+    /// translating backend with unshared per-thread code caches (D5) must be told once per thread,
+    /// while on an ARM64 host the instruction cache is a property of the machine, so one context's
+    /// `IC IVAU` serves every thread and the others' calls are redundant rather than wrong. A caller
+    /// must therefore call it on every context it wants invalidated, and a backend must tolerate
+    /// being told something it already knows. The same is true of
+    /// [`add_thunk`](GuestCpu::add_thunk) and [`add_breakpoint`](GuestCpu::add_breakpoint), which a
+    /// native backend implements by patching guest memory that every context shares.
+    ///
     /// # Errors
     ///
     /// [`CpuError::Backend`](crate::CpuError::Backend) if the backend could not carry it out. Note
@@ -205,7 +217,9 @@ pub trait GuestCpu: Send {
 
     /// Stop with [`ExitReason::Thunk`] when the guest reaches `address`.
     ///
-    /// The boundary M3's imported-symbol layer is built on. Idempotent.
+    /// The boundary M3's imported-symbol layer is built on. Idempotent, and per context in the same
+    /// qualified sense as [`invalidate_code`](GuestCpu::invalidate_code): a native backend plants a
+    /// veneer in guest memory, which every context of that guest sees.
     ///
     /// # Errors
     ///
@@ -220,7 +234,9 @@ pub trait GuestCpu: Send {
     fn remove_thunk(&mut self, address: GuestAddr) -> CpuResult<bool>;
 
     /// Stop with [`ExitReason::Breakpoint`] when the guest reaches `address`, without executing the
-    /// instruction there. Idempotent.
+    /// instruction there. Idempotent, and per context with the same qualification as
+    /// [`add_thunk`](GuestCpu::add_thunk): a backend that implements breakpoints by writing `BRK`
+    /// into guest memory is writing memory every context shares.
     ///
     /// # Errors
     ///
