@@ -84,13 +84,14 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | Cargo workspace, nine crates | **Done** |
 | `omni-platform` virtual-memory seam (Windows) | **Done, reviewed.** Reserve, 4 KB placeholder split, commit, decommit, protect, file-backed map, commit-charge measurement |
 | `omni-platform` dual-mapped sections + placeholder coalescing | **Done, reviewed** |
+| `omni-platform` vectored fault seam | **Done, reviewed.** Releasing a handler slot is a quiescence point: the slot is marked draining before the drain and zeroed only afterwards, so a new registrant cannot claim it mid-drain. Took four iterations; the last two defects were found by measurement, not inspection |
 | `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
 | `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
 | `omni-elf` — loader: map, relocate, resolve, seal | **Done, reviewed.** Milestone **M1** |
 | `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
-| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Pending final review.** Milestone **M2**. 468 `#[test]` functions and 488 passing test cases across the workspace; mutation tables 85/85, 45/45 and 23/23 |
-| `omni-elf` — `.eh_frame_hdr` function map + leaf classifier | **Pending final review.** The selection tool M2 chose its code with |
+| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Done, reviewed.** Milestone **M2**. 489 passing test cases and 8 ignored across the workspace; mutation tables 87/87, 45/45 and 23/23 |
+| `omni-elf` — `.eh_frame_hdr` function map + leaf classifier | **Done, reviewed.** 245,117 exact function bounds recovered and graded; the tool M2 chose its code with |
 | `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
 **Measured, not assumed**
