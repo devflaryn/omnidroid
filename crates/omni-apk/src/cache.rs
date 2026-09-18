@@ -5,9 +5,11 @@
 //! Omnidroid wants to map a guest `.so` from a file so that its read-only and executable pages are
 //! backed by the page cache and shared between instances, instead of costing private commit per
 //! launch. Mapping straight out of the APK needs the entry to be STORED at a
-//! [`MAPPING_ALIGNMENT`]-aligned offset. In `Roblox-2.738.1397.apk` all 11 libraries are DEFLATED
-//! and 4-byte aligned, so not one qualifies. So each library is inflated **once** into a file of
-//! its own, where its bytes start at offset 0 and every page-size question answers itself.
+//! [`mapping_alignment()`]-aligned offset — the host page size, which is 4096 on Windows and Linux
+//! and 16384 on Apple silicon. In `Roblox-2.738.1397.apk` all 11 libraries are DEFLATED and 4-byte
+//! aligned, so not one qualifies on any host. So each library is inflated **once** into a file of
+//! its own, where its bytes start at offset 0 — and *there* every page-size question really does
+//! answer itself, because zero is a multiple of everything.
 //!
 //! # Why the key is a content hash
 //!
@@ -28,8 +30,11 @@
 //! 2. **Which entry in that archive.** Its name, its local-header offset, its compressed and
 //!    uncompressed sizes, its CRC-32, and its compression method.
 //!
-//! Everything in both groups is already in hand — `Apk::open` stats the file and parses the central
-//! directory — so the key costs no extra I/O.
+//! Almost everything in both groups is already in hand: `Apk::open` parses the central directory and
+//! the length and mtime come from the `metadata()` call it already made. The **canonical path does
+//! not** — `Apk::open` calls `std::fs::canonicalize`, which is a new syscall. So the key is not free,
+//! as this comment once claimed; it costs one path resolution per archive *opened*, once, against a
+//! 413 ms extraction and a 130 µs cache hit. Nothing extra is paid per entry or per probe.
 //!
 //! # Why the key is scoped to one archive
 //!
@@ -37,8 +42,10 @@
 //! **CRC-32 is linear**: given a tampered library, four bytes anywhere in it can be tuned to
 //! restore any target CRC-32, and it can be padded to match the original's compressed and
 //! uncompressed lengths exactly. Running the attacker's APK once would then overwrite the hint for
-//! that (name, size, CRC-32) triple, and a later run of a **stock** APK would be handed the
-//! attacker's file as a cache hit, with length the only thing checked. That would defeat the
+//! that entry — keyed on its name, its local-header offset, **both** its sizes, its CRC-32 and its
+//! method, every one of which a length-matched CRC-32 forgery reproduces — and a later run of a
+//! **stock** APK would be handed the attacker's file as a cache hit, with length the only thing
+//! checked. That would defeat the
 //! property this cache exists to provide.
 //!
 //! Note what does *not* fix it. Re-verifying with [`ZipEntry::verify_crc32`] after mapping checks
@@ -80,7 +87,7 @@ use sha2::{Digest, Sha256};
 
 use crate::apk::{split_lib_path, Apk};
 use crate::error::{show, ApkError, ApkResult, Hex32};
-use crate::zip::{ZipEntry, MAPPING_ALIGNMENT};
+use crate::zip::{mapping_alignment, ZipEntry};
 
 /// Subdirectory of the cache root holding the extracted libraries.
 pub const LIBS_DIR: &str = "libs";
@@ -211,10 +218,11 @@ impl CachedLibrary {
         self.payload_offset() % alignment == 0
     }
 
-    /// True: a cache file is always mappable at [`MAPPING_ALIGNMENT`], which is why it exists.
+    /// True, on any host: a cache file's payload starts at offset 0, so it is mappable at whatever
+    /// [`mapping_alignment()`] turns out to be. That is why the cache exists.
     #[must_use]
-    pub const fn is_directly_mappable(&self) -> bool {
-        self.is_payload_aligned(MAPPING_ALIGNMENT)
+    pub fn is_directly_mappable(&self) -> bool {
+        self.is_payload_aligned(mapping_alignment())
     }
 }
 
@@ -466,8 +474,11 @@ fn native_library_file_name(entry: &ZipEntry) -> ApkResult<&str> {
 /// archive and entry are called. Variable-length fields are length-prefixed, so no two different
 /// inputs can serialise to the same byte string.
 ///
-/// Every input is already in memory — `Apk::open` stats the file and parses the central directory —
-/// so this costs no I/O. See the module documentation for why the archive's identity is in here.
+/// Every input is already in memory by the time this is called — the archive's identity was captured
+/// in `Apk::open` and the entry's fields came from the central directory — so *this function* costs
+/// no I/O. It is not free overall: capturing the canonical path in `Apk::open` is one
+/// `canonicalize` syscall per archive. See the module documentation for the accounting, and for why
+/// the archive's identity is in here at all.
 fn probe_key(apk: &Apk, entry: &ZipEntry) -> String {
     let mut hasher = Sha256::new();
     hasher.update(PROBE_DOMAIN);

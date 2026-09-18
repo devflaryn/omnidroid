@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use omni_apk::{
-    Apk, ApkError, CacheOutcome, CompressionMethod, LibraryCache, MAPPING_ALIGNMENT,
+    mapping_alignment, Apk, ApkError, CacheOutcome, CompressionMethod, LibraryCache,
     MAX_DEFLATE_EXPANSION,
 };
 
@@ -360,7 +360,7 @@ fn a_page_aligned_stored_entry_is_directly_mappable() {
     assert_eq!(entry.payload_offset(), 4096, "payload offset");
     assert_eq!(entry.local_extra_len(), padding);
     assert!(entry.is_stored());
-    assert!(entry.is_payload_aligned(MAPPING_ALIGNMENT));
+    assert!(entry.is_payload_aligned(mapping_alignment()));
     assert!(entry.is_payload_aligned(4096));
     assert!(
         entry.is_directly_mappable(),
@@ -370,7 +370,7 @@ fn a_page_aligned_stored_entry_is_directly_mappable() {
 
     // And its map window is degenerate, because there is nothing to skip.
     let window = entry
-        .stored_map_window(MAPPING_ALIGNMENT)
+        .stored_map_window(mapping_alignment())
         .expect("a STORED entry has a window");
     assert_eq!(window.file_offset, 4096);
     assert_eq!(window.payload_delta, 0);
@@ -387,7 +387,7 @@ fn a_page_aligned_stored_entry_is_directly_mappable() {
     let apk = zip.open().expect("the synthetic zip must open");
     let entry = apk.require_entry(name).expect("the aligned entry");
     assert_eq!(entry.payload_offset(), 4096);
-    assert!(entry.is_payload_aligned(MAPPING_ALIGNMENT));
+    assert!(entry.is_payload_aligned(mapping_alignment()));
     assert!(
         !entry.is_directly_mappable(),
         "alignment alone is not enough: compressed bytes are not the file's bytes"
@@ -570,6 +570,44 @@ fn a_local_header_that_contradicts_the_central_directory_is_refused() {
         Err(other) => panic!("wrong error: {other}"),
         Ok(_) => panic!("a contradictory local header was accepted"),
     }
+}
+
+/// A local file header that names a different entry than the central-directory record pointing at
+/// it is refused.
+///
+/// The name is what ties a central-directory record to the bytes it describes, and the payload
+/// offset is computed from the local header the record points at. So a record whose local header
+/// names something else means the reader is about to take *this* entry's sizes, CRC-32 and method
+/// and apply them to *that* entry's payload. `LocalNameMismatch` existed for this and had no test,
+/// which under D6 — where a tampered archive is the expected input — is a hostile-input path with
+/// nothing holding it.
+#[test]
+fn a_local_header_naming_a_different_entry_is_refused() {
+    let payload = b"mismatched".to_vec();
+    let mut bytes = build(&[Entry::stored("payload.bin", &payload)], false);
+    // The first local file header starts at 0; its 30 fixed bytes are followed by the name. Change
+    // one byte of it, keeping the length — a shorter or longer name would move the payload and be
+    // caught as something else entirely, and the interesting case is the one that still parses.
+    let name_at = 30;
+    assert_eq!(&bytes[name_at..name_at + 11], b"payload.bin");
+    bytes[name_at] = b'P';
+    let zip = TempZip::new("local-name-mismatch", &bytes);
+    match zip.open() {
+        Err(ApkError::LocalNameMismatch { name, local_name, offset }) => {
+            assert_eq!(name, "payload.bin", "the central directory's name");
+            assert_eq!(local_name, "Payload.bin", "and the local header's");
+            assert_eq!(offset, 0, "and where the local header is");
+        }
+        Err(other) => panic!("wrong error: {other}"),
+        Ok(_) => panic!("a local header naming a different entry was accepted"),
+    }
+
+    // A local name that is not UTF-8 at all is refused too, rather than being lossily converted into
+    // something that might compare equal.
+    let mut bytes = build(&[Entry::stored("payload.bin", &payload)], false);
+    bytes[name_at] = 0xff;
+    let zip = TempZip::new("local-name-not-utf8", &bytes);
+    assert!(zip.open().is_err(), "a non-UTF-8 local name must not be accepted");
 }
 
 #[test]

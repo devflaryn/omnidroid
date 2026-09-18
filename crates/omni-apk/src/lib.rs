@@ -62,6 +62,6 @@ pub use crate::apk::{
 pub use crate::cache::{CacheOutcome, CachedLibrary, LibraryCache, LIBS_DIR};
 pub use crate::error::{compression_method_name, ApkError, ApkResult};
 pub use crate::zip::{
-    CompressionMethod, EndOfCentralDirectory, MapWindow, ZipEntry, MAPPING_ALIGNMENT,
+    mapping_alignment, CompressionMethod, EndOfCentralDirectory, MapWindow, ZipEntry,
     MAX_DEFLATE_EXPANSION, MAX_INTERESTING_ALIGNMENT,
 };

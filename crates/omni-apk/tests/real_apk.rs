@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use omni_apk::{
-    Apk, ApkError, CacheOutcome, CompressionMethod, LibraryCache, MAPPING_ALIGNMENT, LIBS_DIR,
+    mapping_alignment, Apk, ApkError, CacheOutcome, CompressionMethod, LibraryCache, LIBS_DIR,
 };
 use sha2::{Digest, Sha256};
 
@@ -191,7 +191,7 @@ fn exactly_one_entry_in_the_whole_apk_is_directly_mappable() {
         .expect("the one mappable entry");
     assert!(png.is_stored());
     assert_eq!(png.payload_offset(), 5_042_176);
-    assert_eq!(png.payload_offset() % MAPPING_ALIGNMENT, 0);
+    assert_eq!(png.payload_offset() % mapping_alignment(), 0);
     assert_eq!(png.uncompressed_size(), 1_447);
 }
 
@@ -335,7 +335,7 @@ fn no_native_library_can_be_mapped_out_of_the_apk() {
             entry.name()
         );
         assert!(
-            !entry.is_payload_aligned(MAPPING_ALIGNMENT),
+            !entry.is_payload_aligned(mapping_alignment()),
             "{} payload offset {} must not be 4 KB aligned",
             entry.name(),
             entry.payload_offset()
@@ -455,9 +455,9 @@ fn stored_assets_and_dex_files_are_where_the_analysis_says() {
     // not need to be. Map the aligned window below it and skip the delta.
     assert!(!pack.is_directly_mappable());
     let window = pack
-        .stored_map_window(MAPPING_ALIGNMENT)
+        .stored_map_window(mapping_alignment())
         .expect("a STORED entry always has a map window");
-    assert_eq!(window.file_offset % MAPPING_ALIGNMENT, 0);
+    assert_eq!(window.file_offset % mapping_alignment(), 0);
     assert_eq!(window.file_offset, 83_247_104);
     assert_eq!(window.payload_delta, 1_124);
     assert_eq!(
@@ -472,7 +472,7 @@ fn stored_assets_and_dex_files_are_where_the_analysis_says() {
 
     // A DEFLATED entry has no such window; there is nothing to map.
     let manifest = apk.manifest_entry().expect("AndroidManifest.xml");
-    assert!(manifest.stored_map_window(MAPPING_ALIGNMENT).is_none());
+    assert!(manifest.stored_map_window(mapping_alignment()).is_none());
     // Neither does a nonsensical alignment.
     assert!(pack.stored_map_window(0).is_none());
     assert!(pack.stored_map_window(3000).is_none());
@@ -568,7 +568,7 @@ fn extracting_libroblox_produces_an_aligned_content_addressed_file_then_hits() {
         0,
         "the cache file is the library and nothing else"
     );
-    assert!(cached.is_payload_aligned(MAPPING_ALIGNMENT), "4 KB aligned");
+    assert!(cached.is_payload_aligned(mapping_alignment()), "4 KB aligned");
     assert!(cached.is_payload_aligned(16_384), "and 16 KB aligned");
     assert!(cached.is_directly_mappable());
 

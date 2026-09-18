@@ -28,12 +28,27 @@
 
 use crate::error::{compression_method_name, ApkError, ApkResult};
 
-/// The page size Omnidroid maps at, and therefore the alignment that decides direct mappability.
+/// The alignment that decides whether an entry can be mapped straight out of the APK: the **host
+/// page size**.
 ///
-/// 4 KB, not 64 KB: the placeholder-based mapping path measured in D11 constrains both the base
-/// address and the file offset to 4 KB, not to the 64 KB allocation granularity that plain
-/// `MapViewOfFile` would impose.
-pub const MAPPING_ALIGNMENT: u64 = 4096;
+/// Not a constant, and that is the point. It was 4096, which is right on Windows and Linux and wrong
+/// on Apple silicon, where the page size is 16384 (`omni-platform`'s unix backend documents it). The
+/// seam enforces the real value — `vm::map_file` rejects a file offset that is not a multiple of
+/// `vm::page_size()` — so a hardcoded 4096 here was a genuine apk-to-mem contract mismatch, and the
+/// nearby remark that "every page-size question answers itself" was only true for a 4 KB host.
+///
+/// It is the page size and not the 64 KB allocation granularity: the placeholder-based mapping path
+/// measured in D11 constrains both the base address and the file offset to a page, not to the
+/// granularity that plain `MapViewOfFile` would impose.
+///
+/// This is the one thing `omni-apk` asks the platform for. It asks through `omni-platform`, which is
+/// the seam working as intended — Global Constraint 4 forbids *OS* crates outside `omni-platform`,
+/// not `omni-platform` itself — and the alternative was for this crate to keep answering a
+/// host-dependent question with a guess.
+#[must_use]
+pub fn mapping_alignment() -> u64 {
+    omni_platform::vm::page_size() as u64
+}
 
 /// The largest page size Omnidroid may ever have to satisfy (Android's 16 KB page mode).
 ///
@@ -882,15 +897,20 @@ impl ZipEntry {
     /// **Whether this entry can be mapped straight out of the APK** (D11).
     ///
     /// True only when the entry is STORED *and* its payload begins on a
-    /// [`MAPPING_ALIGNMENT`]-byte boundary. That is what `zipalign -p -f 4` produces and it is the
-    /// fast path: such an entry needs no extraction cache at all, because a file-backed view of
-    /// the APK itself already presents its bytes at the right offsets.
+    /// [`mapping_alignment()`]-byte boundary — the host page size. That is what `zipalign -p -f 4`
+    /// produces on a 4 KB host, and it is the fast path: such an entry needs no extraction cache at
+    /// all, because a file-backed view of the APK itself already presents its bytes at the right
+    /// offsets.
     ///
-    /// None of the 11 `.so` in `Roblox-2.738.1397.apk` satisfies this — they are DEFLATED and only
-    /// 4-byte aligned — which is the measurement that forced the extraction cache.
+    /// Host-dependent, deliberately: an APK aligned for a 4 KB page is *not* directly mappable on a
+    /// 16 KB-page host, and answering otherwise would fail later, inside `vm::map_file`, with an
+    /// alignment error far from its cause.
+    ///
+    /// None of the 11 `.so` in `Roblox-2.738.1397.apk` satisfies this on any host — they are DEFLATED
+    /// and only 4-byte aligned — which is the measurement that forced the extraction cache.
     #[must_use]
-    pub const fn is_directly_mappable(&self) -> bool {
-        self.is_stored() && self.is_payload_aligned(MAPPING_ALIGNMENT)
+    pub fn is_directly_mappable(&self) -> bool {
+        self.is_stored() && self.is_payload_aligned(mapping_alignment())
     }
 
     /// Verify a buffer against this entry's recorded CRC-32.
