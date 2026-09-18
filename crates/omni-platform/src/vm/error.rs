@@ -319,7 +319,9 @@ pub enum VmError {
     /// Release the pieces individually, or merge them back into one placeholder with
     /// [`coalesce_placeholders`](super::coalesce_placeholders) first.
     #[error(
-        "`release`: the allocation at {address:#x} is {actual} bytes, but {requested} bytes were          requested. MEM_RELEASE frees the whole allocation at an address and cannot free part of          one: release each piece of a split placeholder individually, or coalesce them first"
+        "`release`: the allocation at {address:#x} is {actual} bytes, but {requested} bytes were \
+         requested. MEM_RELEASE frees the whole allocation at an address and cannot free part of \
+         one: release each piece of a split placeholder individually, or coalesce them first"
     )]
     ReleaseExtentMismatch {
         /// The address that was to be released.

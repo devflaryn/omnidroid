@@ -25,6 +25,12 @@ use omni_mem::{CommitPolicy, GuestSpace, Placement, Protection};
 pub const CODE_BYTES: usize = 64 * 1024;
 /// Bytes of guest data region.
 pub const DATA_BYTES: usize = 64 * 1024;
+/// Bytes of the lazily-committed region.
+///
+/// Larger than the eager one because the demand-paging tests want a page per guest thread, and it
+/// costs nothing to reserve: the mapping is `CommitPolicy::Lazy`, so its charge is whatever the
+/// guest actually touches (D10).
+pub const LAZY_BYTES: usize = 512 * 1024;
 
 /// A guest address space with a code region, a data region and a backend over it.
 pub struct Guest {
@@ -77,7 +83,7 @@ impl Guest {
         let lazy = space
             .map_anonymous(
                 Placement::Anywhere { align: space.page_size() },
-                DATA_BYTES,
+                LAZY_BYTES,
                 Protection::ReadWrite,
                 CommitPolicy::Lazy,
             )

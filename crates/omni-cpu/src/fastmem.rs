@@ -16,9 +16,22 @@
 //! | anything less, not mirroring | `mov`/`shr`/`jnz` — and every address above `2^bits` leaves the fast path for a callback |
 //!
 //! dynarmic's own default is **36**. A guest address above 64 GiB then takes the callback path,
-//! which the D4 spike measured at **396 Mguest-insn/s** against **5,207** on the fast path — a
-//! **13.2x** loss that produces *correct results*. No functional test can see it. `libroblox.so`
-//! loads high, so this is not a hypothetical.
+//! and every access pays for it while still producing *correct results*. No functional test can
+//! see that, and `libroblox.so` loads high, so it is not a hypothetical.
+//!
+//! **How much it costs, measured through this runtime rather than through a stub.** Two loop
+//! shapes, both degraded configurations, n = 31 per cell, release:
+//!
+//! | loop | fast path | 36-bit window | fastmem off |
+//! |---|---|---|---|
+//! | 5 instructions, 2 accesses (40% dense) | 4,204 Mguest-insn/s | 129 (**32.6x**) | 141 (**29.9x**) |
+//! | 8 instructions, 4 accesses (50% dense) | 5,055 Mguest-insn/s | 103 (**49.1x**) | 114 (**44.5x**) |
+//!
+//! So **30-49x**, and the loss *rises* with memory density. D4's spike reported 13.2x
+//! (5,207 against 396 Mguest-insn/s); the fast path here reproduces it to within 3%, but the
+//! callback path is 3.5x worse than the spike's, because the spike's callbacks were bare stubs
+//! while these do a `catch_unwind` and an uncached `GuestSpace` region lookup on every access.
+//! **396 Mguest-insn/s is a floor, not the runtime's cost.**
 //!
 //! Hence [`require_identity_mapping`]: it is checked once per CPU context against what the backend
 //! reports it is *actually* configured with, before any guest code runs, and a mismatch is a loud
@@ -134,8 +147,9 @@ pub fn require_identity_mapping(
             "direct guest memory access (fastmem)",
             1,
             0,
-            "every guest load and store would go through a host callback: 396 against 5,207 \
-             Mguest-insn/s in the D4 spike, a 13.2x loss, with correct results throughout",
+            "every guest load and store would go through a host callback, measured at 30-49x \
+             slower through this runtime's own callbacks (n = 31, two loop shapes), with correct \
+             results throughout",
         );
     }
     if observed.host_base != 0 {
@@ -155,8 +169,8 @@ pub fn require_identity_mapping(
             observed.address_bits,
             "below 64 the backend emits a mask or a bounds check on every access instead of \
              folding the base into the addressing mode, and every guest address above the limit \
-             silently takes the 13.2x-slower callback path while still producing correct results. \
-             dynarmic's own default here is 36",
+             silently takes the callback path -- measured 30-49x slower (n = 31, two loop shapes) \
+             while still producing correct results. dynarmic's own default here is 36",
         );
     }
     if observed.mirrors_out_of_range {
@@ -233,7 +247,7 @@ mod tests {
         /// A named way of breaking the configuration, and the word its refusal must carry.
         type Case = (&'static str, fn(&mut MemoryMapping), &'static str);
         let cases: [Case; 6] = [
-            ("fastmem off", |m| m.direct_access = false, "13.2x"),
+            ("fastmem off", |m| m.direct_access = false, "30-49x"),
             ("relocated base", |m| m.host_base = 0x1_0000, "guest VA is not host VA"),
             ("dynarmic's default width", |m| m.address_bits = 36, "default here is 36"),
             ("mirroring on", |m| m.mirrors_out_of_range = true, "alias a valid page"),

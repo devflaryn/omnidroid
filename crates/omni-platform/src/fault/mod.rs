@@ -190,16 +190,31 @@ impl FaultError {
 /// wrong. Individual slots are cleared on drop, so a dropped registration stops receiving faults
 /// immediately.
 ///
+/// # Safety
+///
+/// This is `unsafe` because `context` is an opaque `usize` that `handler` will dereference, and
+/// because of *when* `handler` runs. The caller guarantees all of:
+///
+/// * **`context` stays valid and pinned** until the returned [`FaultRegistration`] is dropped.
+///   Nothing here can check that — the whole point of a `usize` is that this module never looks at
+///   it — and a handler reading a freed context is a use-after-free inside an exception dispatcher.
+/// * **`handler` does not unwind.** It runs inside the OS exception dispatcher, across a frame
+///   boundary with no unwind tables. A Rust panic escaping it is undefined behaviour, not a crash
+///   that can be caught, so a handler that can panic must contain its own panics.
+/// * **`handler` does not take a lock that the faulting thread might already hold**, and does not
+///   block. An access violation arrives at an arbitrary instruction, so any lock it takes must be
+///   one that is never held across the work that can fault.
+/// * **`handler` returns [`FaultOutcome::Resolved`] only if the address really was made
+///   accessible.** Resolving without fixing anything produces an infinite fault loop rather than a
+///   crash, which is the harder of the two to diagnose.
+///
 /// # Errors
 ///
-/// [`FaultError::Unsupported`] on a target with no implementation, [`FaultError::HandlerTableFull`]
-/// if [`MAX_HANDLERS`] are already installed, or [`FaultError::Os`] if the OS refused the handler.
-///
-/// # Panics
-///
-/// Never. But `handler` itself must not panic: it runs inside the OS exception dispatcher, where
-/// unwinding is undefined behaviour.
-pub fn install(handler: FaultHandler, context: usize) -> FaultResult<FaultRegistration> {
+/// [`FaultError::Unsupported`], [`FaultError::HandlerTableFull`] or [`FaultError::Os`].
+pub unsafe fn install(
+    handler: FaultHandler,
+    context: usize,
+) -> FaultResult<FaultRegistration> {
     backend::install(handler, context)
 }
 

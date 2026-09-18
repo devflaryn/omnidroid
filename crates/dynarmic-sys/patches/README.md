@@ -145,3 +145,66 @@ with `silently_mirror_fastmem`, so every guest address is masked into a 1 MiB
 arena and a wild store cannot reach anything. That is the right shape for
 testing the decoder and the wrong shape for reasoning about exposure, and the
 difference is exactly the configuration D4 commits production to.
+
+### 4. `A64EmitX64` holds a 16 MiB fast-dispatch table by value, and fills it even when fast dispatch is off
+
+**The largest single per-guest-thread cost in the runtime, and it is unconditional.**
+
+`backend/x64/a64_emit_x64.h:59-66`:
+
+```cpp
+struct FastDispatchEntry {
+    u64 location_descriptor = 0xFFFF'FFFF'FFFF'FFFFull;
+    const void* code_ptr = nullptr;
+};
+static_assert(sizeof(FastDispatchEntry) == 0x10);
+static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
+static constexpr size_t fast_dispatch_table_size = 0x100000;
+std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+```
+
+1,048,576 entries at 16 bytes each: **16 MiB, held by value inside `A64EmitX64`**, which is held by
+value inside the `Jit::Impl`. So it is one allocation per guest thread, and because the members carry
+non-static data-member initialisers, constructing it **writes every byte** — this is resident working
+set from the moment the jit exists, not merely reserved address space. `ClearFastDispatchTable()`
+writes it again on every cache clear.
+
+Nothing reads it unless `FastDispatch` is on. Every use is already guarded:
+
+- `A64EmitX64::A64EmitX64` calls `ClearFastDispatchTable()` unconditionally, and
+  `EmitTerminalImpl(IR::Term::FastDispatchHint)` returns early when
+  `!conf.HasOptimization(OptimizationFlag::FastDispatch)`;
+- `GenTerminalHandlers` emits `terminal_handler_fast_dispatch_hint` and `fast_dispatch_table_lookup`
+  behind the same `HasOptimization` test.
+
+**Omnidroid runs with `FastDispatch` cleared.** D16 settled on `0x0000_FFF9` (`INTERRUPTIBLE`)
+because `PopRSBHint` and `FastDispatchHint` check neither the cycle counter nor the halt flag, so a
+guest `BR X30` branching to itself is stoppable by nothing at all while they are on. So the runtime
+pays 16 MiB per guest thread, and touches it, for a table it has disabled.
+
+**Measured** (`omni-cpu/tests/bench.rs::the_commit_charge_of_a_guest_thread`, serialized, n = 1 run
+of 8 contexts, release, D2 host):
+
+| `code_cache_size` | commit charge per guest thread |
+|---|---|
+| 8 MiB | 24.56 MiB |
+| 32 MiB | 34.61 MiB |
+| 128 MiB | 34.61 MiB |
+
+Flat from 32 MiB upwards, and 24.56 MiB at the floor — so the per-thread cost is mostly **not** the
+code cache, which is the mitigation D5's risk 2 assumes. At 32 guest threads that is about 781 MiB,
+against D10's whole budget.
+
+**The patch.** Replace the by-value array with a lazily-allocated
+`std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>>`, allocated in
+`GenTerminalHandlers` only when `conf.HasOptimization(OptimizationFlag::FastDispatch)`, and make
+`ClearFastDispatchTable()` a no-op when the pointer is null. Contained: the guards that decide
+whether it is read already exist, so the change is the allocation and the null checks, not the
+control flow. Worth **16 MiB per guest thread, about 512 MiB at 32 threads**, and more in working set
+than in commit charge because the constructor writes it.
+
+**Not applied.** It changes a hot structure's indirection on the path that *is* enabled upstream, so
+it needs the 202,200-assertion suite run against it with `FastDispatch` both on and off before it can
+be carried — and, per this directory's rule, the pristine-tree claim given up deliberately rather
+than by accident. Recorded now because it was found by measurement during Task 3 and the number is
+large enough that it should not wait to be rediscovered.

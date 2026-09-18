@@ -9,7 +9,7 @@
 //! Three questions Task 3 owes a number to, each of which was a configuration choice made on a
 //! reasoned argument that then needed checking:
 //!
-//! 1. **What does identity mapping actually buy, here, on this guest?** D4 measured 13.2x in the
+//! 1. **What does identity mapping actually buy, here, on this guest?** D4's spike measured 13.2x
 //!    spike. This measures the same thing through the real backend, against the configuration the
 //!    startup assertion refuses — which is the honest way to say what the assertion is worth.
 //! 2. **What does `check_halt_on_memory_access` cost?** It is what makes a guest fault stop at the
@@ -28,11 +28,25 @@ use std::time::{Duration, Instant};
 
 use harness::a64::*;
 use harness::{x, Guest};
-use omni_cpu::dynarmic::{DynarmicOptions, FastmemOverrides};
+use omni_cpu::dynarmic::{DynarmicOptions, MemoryPathOverrides};
 use omni_cpu::{ExitReason, GuestCpu, RunLimit};
 
 /// Samples per configuration. Odd, so the median is an observation rather than an average of two.
 const N: usize = 31;
+
+/// Serializes every measurement in this binary.
+///
+/// Two reasons, and the second is not optional. Timings taken while a sibling benchmark is running
+/// measure the scheduler; and `the_commit_charge_of_a_guest_thread` reads
+/// `process_commit_charge`, which is **process-global**, so a concurrent benchmark creating jits
+/// moves it underneath the measurement. Unserialized it read 34.057 MiB/thread against 24.562
+/// serialized — a 39% error in a figure that is supposed to say what a guest thread costs. This is
+/// the same trap Task 1 hit with `PrivateUsage`, and the same fix.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialized() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct Summary {
     min: Duration,
@@ -103,6 +117,7 @@ const LOOP_INSTRUCTIONS: u64 = ITERATIONS * 5;
 #[test]
 #[ignore = "measurement, not a test"]
 fn identity_mapping_against_the_default_width() {
+    let _serial = serialized();
     let guest = Guest::new();
     guest.assert_high_addresses();
     let entry = guest.load(&memory_loop(guest.data, ITERATIONS));
@@ -125,7 +140,7 @@ fn identity_mapping_against_the_default_width() {
     let (degraded, degraded_callbacks) = {
         let (cpu, _why) = guest
             .backend
-            .create_misconfigured_thread(FastmemOverrides {
+            .create_misconfigured_thread(MemoryPathOverrides {
                 address_space_bits: Some(36),
                 ..Default::default()
             })
@@ -152,7 +167,7 @@ fn identity_mapping_against_the_default_width() {
         LOOP_INSTRUCTIONS as f64 / degraded.median.as_secs_f64() / 1e6,
     );
     println!(
-        "  ratio           : {:.2}x  (D4's spike measured 13.2x on a different loop shape)",
+        "  ratio           : {:.2}x  (D4's spike measured 13.2x against bare-stub callbacks)",
         degraded.median.as_secs_f64() / identity.median.as_secs_f64()
     );
     println!("  Both produce identical results. That is the whole reason the check exists.\n");
@@ -165,6 +180,7 @@ fn identity_mapping_against_the_default_width() {
 #[test]
 #[ignore = "measurement, not a test"]
 fn the_cost_of_stopping_at_the_faulting_instruction() {
+    let _serial = serialized();
     println!("\n== check_halt_on_memory_access (n = {N} per configuration) ==");
     println!("{LOOP_INSTRUCTIONS} guest instructions per workload");
 
@@ -228,6 +244,7 @@ fn the_cost_of_stopping_at_the_faulting_instruction() {
 #[test]
 #[ignore = "measurement, not a test"]
 fn the_commit_charge_of_a_guest_thread() {
+    let _serial = serialized();
     const THREADS: usize = 8;
     let guest = Guest::with_options(DynarmicOptions {
         max_threads: THREADS as u32,
@@ -270,7 +287,9 @@ fn the_commit_charge_of_a_guest_thread() {
         reported / THREADS);
     println!("  after dropping them           : {:+} bytes", after_drop as i64 - baseline as i64);
     println!(
-        "  The gap between the middle two lines is dynarmic's per-jit state, which this pin gives          no way to read. D5 measured 20-35 MiB/thread against the 128 MiB default cache; this          backend defaults to 8 MiB."
+        "  The gap between the middle two lines is dynarmic's per-jit state, which this pin gives \
+         no way to read. D5 measured 20-35 MiB/thread against the 128 MiB default cache; this \
+         backend defaults to 8 MiB."
     );
 
     // Does the code cache size actually drive it? D5's risk 2 -- per-thread memory -- is recorded
@@ -295,7 +314,10 @@ fn the_commit_charge_of_a_guest_thread() {
         drop(held);
     }
     println!(
-        "  If those figures do not track the cache size, the per-thread cost is not the cache.          `A64EmitX64` holds a `std::array<FastDispatchEntry, 0x100000>` -- a flat 16 MiB per jit,          allocated and zeroed in the constructor whether or not the FastDispatch optimization is          enabled, and this backend disables it.
+        "  If those figures do not track the cache size, the per-thread cost is not the cache. \
+         `A64EmitX64` holds a `std::array<FastDispatchEntry, 0x100000>` -- a flat 16 MiB per jit, \
+         allocated and zeroed in the constructor whether or not the FastDispatch optimization is \
+         enabled, and this backend disables it.
 "
     );
 }
@@ -305,6 +327,7 @@ fn the_commit_charge_of_a_guest_thread() {
 #[test]
 #[ignore = "measurement, not a test"]
 fn the_cost_of_slicing_the_run_loop() {
+    let _serial = serialized();
     let guest = Guest::new();
     let entry = guest.load(&memory_loop(guest.data, ITERATIONS));
     guest.write_u64(guest.data, 1);

@@ -286,17 +286,31 @@ impl TlsArena {
         let base = match self.free.lock().pop() {
             Some(reused) => reused,
             None => {
-                let index = self.next.fetch_add(1, Ordering::Relaxed);
-                if index >= self.capacity() {
-                    // Undo, so a full arena does not run the counter away and make a later `free`
-                    // followed by `allocate` fail for the wrong reason.
-                    self.next.fetch_sub(1, Ordering::Relaxed);
-                    return Err(CpuError::Unsupported {
-                        backend: "tls",
-                        operation: "allocate another guest thread's TLS block",
-                        reason: "the TLS arena is full; it is sized at creation from the maximum \
-                                 guest thread count",
-                    });
+                // A compare-exchange loop rather than `fetch_add` and an undo. The undo was wrong
+                // under contention: two threads arriving at a full arena both increment, both
+                // decrement, and the counter ends below where it started — so the *next* caller is
+                // handed an index that is already in use, which is two guest threads sharing one
+                // TLS block and therefore one stack guard slot. The refusal was also spurious one
+                // slot early whenever a concurrent caller had incremented in between.
+                let mut index = self.next.load(Ordering::Relaxed);
+                loop {
+                    if index >= self.capacity() {
+                        return Err(CpuError::Unsupported {
+                            backend: "tls",
+                            operation: "allocate another guest thread's TLS block",
+                            reason: "the TLS arena is full; it is sized at creation from the \
+                                     maximum guest thread count",
+                        });
+                    }
+                    match self.next.compare_exchange_weak(
+                        index,
+                        index + 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => index = observed,
+                    }
                 }
                 self.base + index * self.block_bytes
             }

@@ -8,7 +8,8 @@
 //!
 //! * **Identity mapping** (D4). `fastmem_pointer = 0` with `fastmem_address_space_bits = 64` emits
 //!   `mov reg, [r13 + vaddr]` with `r13 = 0`. The default width is 36, which still produces correct
-//!   results while costing **13.2x**. [`crate::require_identity_mapping`] runs against what dynarmic
+//!   results while costing **30-49x** (n = 31, two loop shapes). [`crate::require_identity_mapping`]
+//!   runs against what dynarmic
 //!   reports back, once per context, in [`DynarmicBackend::create_thread`].
 //! * **The bionic thread pointer** (D13). Every context gets a [`crate::GuestTls`] block with a
 //!   stack guard at `+0x28` and `TPIDR_EL0` pointing at it, before it can run an instruction.
@@ -157,14 +158,21 @@ impl DynarmicOptions {
     }
 }
 
-/// Deliberate breakages of the D4 memory path, for [`DynarmicBackend::create_misconfigured_thread`].
+/// Deliberate breakages of the guest memory path, for
+/// [`DynarmicBackend::create_misconfigured_thread`].
 ///
-/// Every field is `None` in [`Default`], which is the conforming configuration — so the only way to
-/// build a broken context is to say, field by field, exactly what is being broken.
+/// Every field is `None` or `false` in [`Default`], which is the conforming configuration — so the
+/// only way to build a broken context is to say, field by field, exactly what is being broken.
+///
+/// **Behind the non-default `test-support` feature**, and `#[doc(hidden)]`, because the thing it
+/// configures is a bypass of the startup assertion. A production build cannot reach it at all. See
+/// [`DynarmicBackend::create_misconfigured_thread`] for why it exists.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FastmemOverrides {
+pub struct MemoryPathOverrides {
     /// Override `fastmem_address_space_bits`. **36** is dynarmic's own default, and the value D4
-    /// says degrades a high guest address onto the 13.2x-slower callback path while still producing
+    /// says degrades a high guest address onto the 30-49x-slower callback path while still producing
     /// correct results.
     pub address_space_bits: Option<u32>,
     /// Override `fastmem_enabled`. `Some(false)` routes every guest access through a callback.
@@ -172,6 +180,37 @@ pub struct FastmemOverrides {
     /// Override `silently_mirror_fastmem`. `Some(true)` masks a wild guest address into range
     /// instead of faulting.
     pub mirrors_out_of_range: Option<bool>,
+    /// Hand dynarmic a **null** `TPIDR_EL0` pointer, so guest code cannot read the thread pointer
+    /// at all.
+    ///
+    /// This is the one D13 is about, and it is here because without it the assertion's seventh
+    /// check could never fire in this backend: `DynarmicCpu` always passes the address of a `Box`,
+    /// which is never null, so the check was unreachable and therefore unproven. The shim accepts a
+    /// null pointer (its header says the guest read then faults into `exception_raised`), so this
+    /// is a configuration a backend could really reach by mistake.
+    pub null_thread_pointer: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl MemoryPathOverrides {
+    fn into_internal(self) -> Overrides {
+        Overrides {
+            address_space_bits: self.address_space_bits,
+            direct_access: self.direct_access,
+            mirrors_out_of_range: self.mirrors_out_of_range,
+            null_thread_pointer: self.null_thread_pointer,
+        }
+    }
+}
+
+/// The always-compiled form of the above. Private, and `Default` is the only value the normal
+/// construction path can produce.
+#[derive(Debug, Clone, Copy, Default)]
+struct Overrides {
+    address_space_bits: Option<u32>,
+    direct_access: Option<bool>,
+    mirrors_out_of_range: Option<bool>,
+    null_thread_pointer: bool,
 }
 
 /// Owns the exclusive monitor, which every guest thread of one address space shares.
@@ -320,44 +359,67 @@ impl DynarmicBackend {
     /// the refusal [`create_thread`](GuestCpuBackend::create_thread) would have produced for it.
     ///
     /// This exists for one reason, and it is Global Constraint 13: a test that cannot fail is worse
-    /// than no test. The D4 startup assertion is the *entire* defence against a silent 13.2x
+    /// than no test. The D4 startup assertion is the *entire* defence against a silent 30-49x
     /// regression, so it has to be shown to fire — and, separately, shown to be guarding something
     /// real, which needs a misconfigured context that can actually be run and measured.
     ///
     /// Both halves come back together on purpose. There is no way to obtain a context this way
-    /// without also obtaining the error saying why it should not exist, so it cannot be mistaken
-    /// for a supported configuration, and a caller that ignores the error has visibly ignored it.
+    /// without also obtaining the error saying why it should not exist.
+    ///
+    /// **That is not enough on its own, and this is gated because of it.** `CpuError` is not
+    /// `#[must_use]`, so `let (cpu, _) = …` hands back a runnable context the startup assertion
+    /// refused, with the refusal dropped on the floor — a real bypass rather than a theoretical one.
+    /// `#[cfg(test)]` cannot close it, because integration tests are separate crates and would lose
+    /// access along with everyone else, so it sits behind the non-default `test-support` feature,
+    /// which this crate turns on for its own test targets through a dev-dependency on itself. A
+    /// production build cannot call it.
     ///
     /// # Errors
     ///
     /// [`CpuError::Unsupported`] if `overrides` would have produced a **conforming** configuration —
     /// this is not a back door to building an ordinary context — plus everything
     /// [`create_thread`](GuestCpuBackend::create_thread) can fail with.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
     pub fn create_misconfigured_thread(
         &self,
-        overrides: FastmemOverrides,
+        overrides: MemoryPathOverrides,
     ) -> CpuResult<(DynarmicCpu, CpuError)> {
         let tls = self.shared.tls.allocate(&self.shared.space)?;
         let config = GuestThreadConfig::new(self.shared.extent, tls.thread_pointer())?;
         let processor_id = self.shared.take_processor_id().ok_or(CpuError::Unsupported {
             backend: BACKEND_NAME,
             operation: "create another guest thread",
-            reason: "the shared exclusive monitor is sized at backend creation and every live \n                     guest thread needs a distinct processor id within it",
+            reason: "the shared exclusive monitor is sized at backend creation and every live \
+                     guest thread needs a distinct processor id within it",
         })?;
-        let cpu = DynarmicCpu::build_unchecked(
+        // Every exit from here on has to give the id back. `build` does this with `inspect_err`;
+        // this path has two failure exits rather than one, so it is written out.
+        let built = DynarmicCpu::build_unchecked(
             Arc::clone(&self.shared),
             config,
             Some(tls),
             processor_id,
-            overrides,
-        )?;
+            overrides.into_internal(),
+        );
+        let cpu = match built {
+            Ok(cpu) => cpu,
+            Err(error) => {
+                self.shared.release_processor_id(processor_id);
+                return Err(error);
+            }
+        };
         match require_identity_mapping(&cpu.memory_mapping(), self.shared.extent) {
             Err(error) => Ok((cpu, error)),
-            Ok(()) => Err(CpuError::Unsupported {
-                backend: BACKEND_NAME,
-                operation: "build a deliberately misconfigured context",
-                reason: "the overrides produced a configuration that satisfies D4, so there is                          nothing for the startup assertion to refuse and nothing to measure",
-            }),
+            Ok(()) => {
+                // `cpu` is dropped here, and `DynarmicCpu::drop` returns the id and the TLS block.
+                Err(CpuError::Unsupported {
+                    backend: BACKEND_NAME,
+                    operation: "build a deliberately misconfigured context",
+                    reason: "the overrides produced a configuration that satisfies D4, so there is \
+                             nothing for the startup assertion to refuse and nothing to measure",
+                })
+            }
         }
     }
 
@@ -384,7 +446,8 @@ impl DynarmicBackend {
         let processor_id = self.shared.take_processor_id().ok_or(CpuError::Unsupported {
             backend: BACKEND_NAME,
             operation: "create another guest thread",
-            reason: "the shared exclusive monitor is sized at backend creation and every live \n                     guest thread needs a distinct processor id within it",
+            reason: "the shared exclusive monitor is sized at backend creation and every live \
+                     guest thread needs a distinct processor id within it",
         })?;
         DynarmicCpu::new(Arc::clone(&self.shared), config, tls, processor_id).inspect_err(|_| {
             self.shared.release_processor_id(processor_id);
@@ -529,7 +592,7 @@ impl DynarmicCpu {
     ) -> CpuResult<Self> {
         let extent = shared.extent;
         let cpu =
-            Self::build_unchecked(shared, config, tls, processor_id, FastmemOverrides::default())?;
+            Self::build_unchecked(shared, config, tls, processor_id, Overrides::default())?;
         // **The startup assertion.** Read back from the live `UserConfig` rather than echoed from
         // what was asked for, and run before the context is handed to anyone, so a context that
         // exists is a context whose memory path is D4's.
@@ -542,7 +605,7 @@ impl DynarmicCpu {
         config: GuestThreadConfig,
         tls: Option<GuestTls>,
         processor_id: u32,
-        overrides: FastmemOverrides,
+        overrides: Overrides,
     ) -> CpuResult<Self> {
         let ctx = Box::new(UnsafeCell::new(CpuCtx {
             space: Arc::clone(&shared.space),
@@ -569,8 +632,20 @@ impl DynarmicCpu {
             abi_version: OD_DYNARMIC_ABI_VERSION,
             callbacks: &callbacks::CALLBACKS,
             ctx: ctx.get().cast::<c_void>(),
-            tpidr_el0: &mut *tpidr_el0,
-            tpidrro_el0: &*tpidrro_el0,
+            // D13. The shim accepts a null pointer here — its header says the guest's read then
+            // faults into `exception_raised` — which is precisely the configuration the startup
+            // assertion's `TPIDR_EL0 storage` check exists to refuse, so it has to be reachable for
+            // that check to be provable. Only `create_misconfigured_thread` can ask for it.
+            tpidr_el0: if overrides.null_thread_pointer {
+                core::ptr::null_mut()
+            } else {
+                &mut *tpidr_el0
+            },
+            tpidrro_el0: if overrides.null_thread_pointer {
+                core::ptr::null()
+            } else {
+                &*tpidrro_el0
+            },
             // D4, all four fields together. `fastmem_pointer = 0` with 64 bits is the identity
             // mapping; mirroring is off so a wild guest address faults instead of aliasing a valid
             // page; recompiling on a fastmem failure is what routes a declined fault to the slow

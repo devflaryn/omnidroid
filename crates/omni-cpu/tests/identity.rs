@@ -9,7 +9,7 @@ mod harness;
 
 use harness::a64::*;
 use harness::{x, Guest};
-use omni_cpu::dynarmic::{DynarmicOptions, FastmemOverrides};
+use omni_cpu::dynarmic::{DynarmicOptions, MemoryPathOverrides};
 use omni_cpu::{CpuError, ExitReason, GuestCpu, RunLimit};
 
 /// A loop that loads and stores `iterations` times through the data region.
@@ -46,7 +46,7 @@ fn memory_loop(data: usize, iterations: u64) -> Vec<u32> {
 ///
 /// Why the count is exact rather than "small": the callback counters are incremented once per entry
 /// on the jit's own thread, so they are deterministic, not sampled. A tolerance here would be the
-/// thing that let a 13.2x regression through.
+/// thing that let a 30-49x regression through.
 #[test]
 fn a_memory_heavy_loop_takes_zero_callback_path_entries() {
     let guest = Guest::new();
@@ -71,7 +71,7 @@ fn a_memory_heavy_loop_takes_zero_callback_path_entries() {
         stats.slow_path_total, 0,
         "identity fastmem must take the callback path zero times, and this run took it \
          {} times ({} reads, {} writes, {} exclusives) over {ITERATIONS} iterations \
-         (200,000 guest memory accesses). D4 measured that path at 13.2x slower",
+         (200,000 guest memory accesses). That path is measured 30-49x slower",
         stats.slow_path_total,
         stats.slow_path_reads,
         stats.slow_path_writes,
@@ -126,7 +126,7 @@ fn the_startup_assertion_fires_on_dynarmics_default_width_and_the_default_is_rea
     guest.write_u64(guest.data, 7);
 
     // Half one: the assertion refuses it, and for the right reason.
-    let overrides = FastmemOverrides { address_space_bits: Some(36), ..Default::default() };
+    let overrides = MemoryPathOverrides { address_space_bits: Some(36), ..Default::default() };
     let (mut cpu, error) = guest
         .backend
         .create_misconfigured_thread(overrides)
@@ -139,7 +139,7 @@ fn the_startup_assertion_fires_on_dynarmics_default_width_and_the_default_is_rea
         other => panic!("the wrong width must be refused as a memory-path failure, got {other}"),
     }
     assert!(
-        error.to_string().contains("13.2x-slower") && error.to_string().contains("default here is 36"),
+        error.to_string().contains("30-49x slower") && error.to_string().contains("default here is 36"),
         "the message has to say what going ahead would cost, or nobody acts on it: {error}"
     );
 
@@ -185,12 +185,12 @@ fn every_other_broken_memory_path_is_refused_too() {
     for (why, overrides, expected) in [
         (
             "fastmem off entirely",
-            FastmemOverrides { direct_access: Some(false), ..Default::default() },
-            "13.2x",
+            MemoryPathOverrides { direct_access: Some(false), ..Default::default() },
+            "30-49x",
         ),
         (
             "mirroring on",
-            FastmemOverrides {
+            MemoryPathOverrides {
                 address_space_bits: Some(36),
                 mirrors_out_of_range: Some(true),
                 ..Default::default()
@@ -210,9 +210,43 @@ fn every_other_broken_memory_path_is_refused_too() {
     // And the door is not a back door: asking for a *conforming* configuration through it fails.
     let error = guest
         .backend
-        .create_misconfigured_thread(FastmemOverrides::default())
+        .create_misconfigured_thread(MemoryPathOverrides::default())
         .expect_err("a conforming configuration must not come back through this path");
     assert!(error.to_string().contains("nothing for the startup assertion to refuse"), "{error}");
+}
+
+/// **D13's half of the assertion, and the check that could not previously fire.**
+///
+/// `MemoryMapping::tpidr_el0_slot` is the *host storage address* dynarmic bakes into generated code.
+/// `DynarmicCpu` always passes the address of a `Box`, which is never null, so until
+/// `MemoryPathOverrides::null_thread_pointer` existed the seventh check was unreachable — present,
+/// documented, and unproven. The shim accepts a null pointer (its header says the guest's read then
+/// faults into `exception_raised`), so this is a configuration a backend could really reach.
+#[test]
+fn a_context_with_no_thread_pointer_storage_is_refused() {
+    let guest = Guest::new();
+    let overrides = MemoryPathOverrides { null_thread_pointer: true, ..Default::default() };
+    let (cpu, error) = guest
+        .backend
+        .create_misconfigured_thread(overrides)
+        .expect("a context with no thread-pointer storage");
+
+    match &error {
+        CpuError::MisconfiguredMemoryPath { setting, expected, actual, .. } => {
+            assert_eq!(*setting, "TPIDR_EL0 storage");
+            assert_eq!((*expected, *actual), (1, 0));
+        }
+        other => panic!("a null TPIDR_EL0 must be refused as a memory-path failure, got {other}"),
+    }
+    assert!(
+        error.to_string().contains("1,276") && error.to_string().contains("JNI_OnLoad"),
+        "the message has to say what breaks and when: {error}"
+    );
+    assert_eq!(
+        cpu.effective_config().tpidr_el0_ptr,
+        0,
+        "and dynarmic must really be holding a null pointer, not merely be reported as doing so"
+    );
 }
 
 /// A context that the assertion refuses is never handed out. The refusal happens before

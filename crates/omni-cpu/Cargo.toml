@@ -43,7 +43,23 @@ dynarmic-sys = { workspace = true, optional = true }
 # `windows-sys`/`libc` outside it.
 omni-platform = { workspace = true }
 
+# A dev-dependency on ourselves, which is how a crate turns a feature on for its own test targets
+# without turning it on for anybody who depends on it. `test-support` gates
+# `DynarmicBackend::create_misconfigured_thread`, whose whole job is to bypass the D4 startup
+# assertion; `#[cfg(test)]` cannot gate it, because integration tests are separate crates and would
+# lose access along with production code. With this, the integration tests can reach it and a
+# release build of the runtime cannot.
+#
+# `default-features = false` is load-bearing: without it this dependency switches the default
+# features back on for the whole package, and `--no-default-features` silently stops meaning
+# anything — the backend gets compiled and the C++ toolchain gets invoked by the one command that
+# exists to prove neither is needed.
+omni-cpu = { path = ".", default-features = false, features = ["test-support"] }
+
 [features]
 default = ["dynarmic"]
 # The translating backend. See the dependency comment above.
 dynarmic = ["dep:dynarmic-sys"]
+# Exposes the deliberate-misconfiguration constructor that proves the D4 startup assertion fires.
+# **Never enable this outside a test target.** See `dynarmic::DynarmicBackend`.
+test-support = []

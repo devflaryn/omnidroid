@@ -9,6 +9,19 @@ use harness::{x, Guest};
 use omni_cpu::{AccessKind, ExitReason, GuestCpu, RunLimit};
 use omni_platform::fault;
 
+/// Serializes the tests that read **process-wide** fault counters.
+///
+/// `fault::stats()` counts every access violation in the process, so two of these running at once
+/// move each other's numbers — which is exactly what happened the first time the concurrency test
+/// below was added, and is the same process-global-counter trap Task 1 spent three review rounds on.
+/// The per-pager counters in `PagerStats` are per address space and need no lock; only the host-wide
+/// ones do.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialized() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// **The one the brief asks for.** A guest load from an address nothing is mapped at must produce a
 /// clean typed exit naming the address, not a host access violation.
 #[test]
@@ -138,10 +151,11 @@ fn a_guest_branch_into_non_executable_memory_is_a_typed_exit() {
 ///
 /// If Omnidroid did *not* take it, the run would still produce the right answer: dynarmic would
 /// recompile the block with fastmem off and route the access through a callback. That is the whole
-/// hazard — correct results, 13.2x slower — which is why the assertion is on the counter and not on
+/// hazard — correct results, 30-49x slower — which is why the assertion is on the counter and not on
 /// the value.
 #[test]
 fn the_vectored_handler_takes_a_guest_fault_before_dynarmic_does() {
+    let _serial = serialized();
     if !fault::available() {
         println!(
             "SKIPPED: omni-platform has no vectored-handler implementation on this target, so \
@@ -193,7 +207,7 @@ fn the_vectored_handler_takes_a_guest_fault_before_dynarmic_does() {
         cpu.stats().slow_path_total,
         0,
         "dynarmic's slow path must never have been entered: if it was, the block was recompiled \
-         with fastmem off and every later access to it pays 13.2x"
+         with fastmem off and every later access to it pays 30-49x"
     );
     println!(
         "demand paging over {PAGES} untouched guest pages (1 run, deterministic counters): \
@@ -208,6 +222,7 @@ fn the_vectored_handler_takes_a_guest_fault_before_dynarmic_does() {
 /// rest of the process. An address outside the guest space is the clearest case.
 #[test]
 fn the_pager_declines_faults_outside_its_own_address_space() {
+    let _serial = serialized();
     if !fault::available() {
         println!("SKIPPED: no vectored-handler implementation on this target.");
         return;
@@ -258,4 +273,98 @@ fn a_context_survives_a_fault_and_runs_again() {
     let exit = cpu.run(good, RunLimit::Unlimited).expect("the good program runs");
     assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "{exit}");
     assert_eq!(cpu.x(x(0)), 0x2A);
+}
+
+/// **Several guest threads faulting at once.**
+///
+/// The vectored handler is process-wide and the pager takes the guest space's lock inside it, so the
+/// interesting case is not one fault but many, arriving on different threads at the same instant.
+/// Each guest thread here writes to its own page of a lazily-committed region, all starting
+/// together, so the faults genuinely overlap rather than queueing behind one another.
+///
+/// What this pins: no deadlock (the pager's lock is never held by a thread that is about to fault),
+/// no lost commit (every store lands), no double-service (the pager's counters add up), and
+/// dynarmic's slow path still never entered on any thread.
+#[test]
+fn several_guest_threads_can_fault_at_the_same_time() {
+    let _serial = serialized();
+    if !fault::available() {
+        println!("SKIPPED: no vectored-handler implementation on this target.");
+        return;
+    }
+    const THREADS: usize = 8;
+    const PAGES_EACH: usize = 4;
+
+    let guest = Guest::with_options(omni_cpu::dynarmic::DynarmicOptions {
+        max_threads: THREADS as u32,
+        ..Default::default()
+    });
+    let page = guest.space.page_size();
+    assert!(
+        harness::LAZY_BYTES >= THREADS * PAGES_EACH * page,
+        "the lazy region has to be big enough for every thread to get its own pages"
+    );
+
+    // One program per thread, each writing its own marker into its own pages.
+    let sentinel = guest.code + harness::CODE_BYTES - 4;
+    let mut entries = Vec::new();
+    for thread in 0..THREADS {
+        let marker = 0xC0DE_0000_0000_0000u64 | thread as u64;
+        let mut program = mov64(1, marker);
+        for slot in 0..PAGES_EACH {
+            let address = guest.lazy + (thread * PAGES_EACH + slot) * page;
+            program.extend(mov64(0, address as u64));
+            program.push(str_imm(1, 0, 0));
+        }
+        program.push(ret(30));
+        // Programs are laid out back to back; 512 bytes each is ample for 4 pages of stores.
+        entries.push((guest.load_at(thread * 512, &program), marker));
+    }
+
+    let before = guest.backend.pager_stats().expect("pager stats");
+
+    // Contexts are `Send`, so each moves to its own thread. A barrier makes them start together.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let mut running = Vec::new();
+    for (entry, marker) in entries {
+        let mut cpu = guest.backend.create_thread_with_tls().expect("a guest thread");
+        cpu.set_return_sentinel(sentinel).expect("arm the sentinel");
+        cpu.set_x(x(30), sentinel as u64);
+        let barrier = std::sync::Arc::clone(&barrier);
+        running.push(std::thread::spawn(move || {
+            barrier.wait();
+            let exit = cpu.run(entry, RunLimit::Unlimited).expect("the stores run");
+            (exit, cpu.stats().slow_path_total, marker)
+        }));
+    }
+
+    for (index, handle) in running.into_iter().enumerate() {
+        let (exit, slow_path, marker) = handle.join().expect("a guest thread finished");
+        assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "thread {index}: {exit}");
+        assert_eq!(slow_path, 0, "thread {index} took dynarmic's slow path {slow_path} times");
+        for slot in 0..PAGES_EACH {
+            let address = guest.lazy + (index * PAGES_EACH + slot) * page;
+            assert_eq!(
+                guest.read_u64(address),
+                marker,
+                "thread {index}'s store to page {slot} did not land"
+            );
+        }
+    }
+
+    let after = guest.backend.pager_stats().expect("pager stats");
+    let resolved = after.resolved - before.resolved;
+    let examined = after.examined - before.examined;
+    assert!(resolved >= 1, "the pager must have served these faults; it resolved {resolved}");
+    assert_eq!(
+        examined,
+        resolved + (after.declined - before.declined),
+        "every fault the pager examined must be accounted for as resolved or declined"
+    );
+    println!(
+        "concurrent demand paging, n = {THREADS} guest threads x {PAGES_EACH} pages (1 run): \
+         {examined} faults examined, {resolved} resolved, {} bytes committed, 0 dynarmic \
+         slow-path entries on every thread",
+        after.bytes_committed - before.bytes_committed
+    );
 }

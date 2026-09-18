@@ -14,7 +14,7 @@
 //!
 //! Under D4's identity mapping they should run **never**. A guest load compiles to
 //! `mov reg, [r13 + vaddr]` with `r13 = 0`, so it reaches memory with no callback at all — that is
-//! what `slow_path_total == 0` measures and what the 13.2x is. They are reached only when that
+//! what `slow_path_total == 0` measures, and what the 30-49x is. They are reached only when that
 //! instruction *faults*: the vectored handler gets it first (D10), and if Omnidroid's pager declines
 //! it, dynarmic's frame-based handler redirects the access here with `recompile_on_fastmem_failure`.
 //! So an entry to one of these is either a genuine guest fault or a regression in the configuration,

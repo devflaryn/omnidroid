@@ -445,6 +445,44 @@ def failing_tests(output):
     return names
 
 
+def aborted_test(output):
+    """The test that was running when a test binary died, from a `--test-threads=1` run.
+
+    Some mutations are caught by a **crash** rather than by an assertion -- removing a bounds check
+    that guest code reaches, for instance, turns a checked refusal into a wild dereference. libtest
+    never prints a result line for those, so the harness could only say "the suite failed without
+    naming a test", which is caught but useless: it does not say *what* noticed, and the whole value
+    of this table is the mapping from a fix to the test that pins it.
+
+    With `--test-threads=1` libtest prints `test <name> ... ` **before** running each one and
+    completes the line afterwards, so an *orphan* -- a start with no matching completion -- is a test
+    that died. Matching by name matters: `--no-fail-fast` means later binaries keep running and
+    completing their own tests, and a naive "last dangling line" is cleared by the first of them.
+    """
+    orphans = []
+    pending = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("test "):
+            continue
+        body = stripped[len("test "):]
+        if body.endswith("..."):
+            # A start. Anything still pending never completed.
+            if pending is not None:
+                orphans.append(pending)
+            pending = body[: -len("...")].strip()
+        elif " ... " in body:
+            name = body.split(" ... ", 1)[0].strip()
+            if pending == name:
+                pending = None
+            elif pending is not None:
+                orphans.append(pending)
+                pending = None
+    if pending is not None:
+        orphans.append(pending)
+    return orphans[0] if orphans else None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", default=None, help="run mutations whose id starts with this")
@@ -510,7 +548,19 @@ def main():
                 if len(caught) > 3:
                     detail += f", +{len(caught) - 3} more"
             else:
-                status, detail = "caught", "the suite failed without naming a test"
+                # Caught by a crash. Re-run serially to find out which test was on the stack --
+                # see `aborted_test`.
+                serial_code, serial_output, serial_seconds = run(
+                    list(command) + ["--", "--test-threads=1"]
+                )
+                seconds += serial_seconds
+                named = aborted_test(serial_output) if serial_code != 0 else None
+                if named:
+                    status = "caught"
+                    detail = f"1 test(s), by abort: {named}"
+                else:
+                    status = "caught"
+                    detail = "the suite failed without naming a test, in parallel and serially"
             print(f"{mid:<9} {status:<10} {description} -> {detail} ({seconds:.0f}s)")
             results.append((mid, direction, description, status, detail))
         finally:

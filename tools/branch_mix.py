@@ -22,11 +22,21 @@ encodings:
 
 What it does **not** claim
 --------------------------
-This is a static count over section bytes, not a dynamic trace. `.text` in a stripped release binary
-holds literal pools and padding as well as instructions, and any 4-byte constant can look like a
-branch. So the figures are an **upper bound on density**, and the ratio between the two classes is
-sounder than either absolute count. What a real workload executes is weighted by hot loops, which
-only a trace would give. Both caveats belong in any report that quotes this.
+Two limits, and neither is a bound in the mathematical sense -- the first version of this file called
+them an "upper bound on density", which was wrong in both directions and is corrected here.
+
+1. **It is a static count over section bytes, not a disassembly.** `.text` in a stripped release
+   binary holds literal pools, jump tables and padding as well as instructions, and any 4-byte
+   constant can alias a branch encoding. That inflates the counts. But the same non-instruction words
+   are also counted in the denominator, and a genuine branch can be missed only if it is not one of
+   the encodings above -- so the error runs in both directions and the figures are an **estimate**,
+   not a bound. The ratio between the classes is sounder than either absolute, because both are
+   inflated by the same noise.
+2. **It is a static instruction mix, and D16's cost model is per transfer *executed*.** A program
+   spends its time in a small part of its text, and Roblox's hot paths -- Luau's interpreter
+   dispatch, C++ virtual calls -- are exactly the shapes that are indirect-heavy. So a static average
+   is a **proxy** for the dynamic mix, and it can only be checked by a trace. Anything derived from
+   it is an indication of which end of D16's band to expect, never a bound on the cost.
 
 Usage
 -----
@@ -220,6 +230,7 @@ def main() -> int:
     direct = totals["b_bl"] + totals["b_cond"] + totals["cbz"] + totals["tbz"]
     indirect = totals["indirect"]
     words = totals["words"]
+    transfers = direct + indirect
 
     print(f"{member} from {apk}")
     print(f"executable sections: {', '.join(n for n, _ in per_section)}")
@@ -231,6 +242,17 @@ def main() -> int:
     print(f"    CBZ / CBNZ          {totals['cbz']:>10,}")
     print(f"    TBZ / TBNZ          {totals['tbz']:>10,}")
     print(f"  indirect transfers    {indirect:>10,}  ({indirect / words:7.3%} of words)")
+    print(f"  ALL control transfers {transfers:>10,}  ({transfers / words:7.3%} of words)")
+    print()
+    # The figure D16's *other* cost model needs. `BlockLinking` off costs a dispatcher round trip
+    # per basic block, so its cost tracks block LENGTH, and a control transfer ends a block.
+    print(f"  mean instructions per basic block   {words / transfers:6.2f}")
+    print(
+        "  D16 measured 7.08x on 4-instruction blocks and called that an upper bound because"
+    )
+    print(
+        "  real code has longer blocks. On this estimate Roblox's do not."
+    )
     print()
     if direct:
         print(f"  indirect : direct     1 : {direct / indirect:.2f}")
@@ -244,10 +266,13 @@ def main() -> int:
     )
     print()
     print(
-        "NOTE: a static count over section bytes. Literal pools and padding are counted as words "
-        "and can alias branch encodings, so these are upper bounds on density; the ratio is sounder "
-        "than either absolute. What a workload executes is weighted by its hot loops, which needs a "
-        "trace, not a scan."
+        "NOTE: an estimate, not a bound. Literal pools, jump tables and padding are counted as "
+        "words and can alias branch encodings, which inflates both the counts and the denominator, "
+        "so the error runs in BOTH directions; the ratio is sounder than either absolute. And this "
+        "is the STATIC mix, while D16's cost model is per transfer EXECUTED -- a program spends its "
+        "time in a small part of its text, and Roblox's hot paths (Luau dispatch, C++ virtual "
+        "calls) are the indirect-heavy ones. Treat these as an indication of which end of D16's "
+        "band to expect. Only a trace settles it."
     )
     return 0
 

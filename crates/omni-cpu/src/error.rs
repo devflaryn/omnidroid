@@ -77,18 +77,20 @@ pub enum CpuError {
     /// The guest memory path is not D4's identity mapping, and every one of these failures
     /// produces **correct results**.
     ///
-    /// That is what makes it a refusal instead of a warning. D4 measured the fast path at 5,207
-    /// Mguest-insn/s against 396 through callbacks — 13.2x — and the setting that decides it,
+    /// That is what makes it a refusal instead of a warning. The setting that decides it,
     /// `fastmem_address_space_bits`, defaults to 36 and silently degrades a high guest address onto
-    /// the slow path. There is no functional test that can see a 13x slowdown, so this check, run
-    /// once per context before any guest code, is the entire defence. See
+    /// the callback path, measured at **30-49x** slower through this runtime's own callbacks
+    /// (n = 31, two loop shapes, both degraded configurations). There is no functional test that
+    /// can see a 30x slowdown that produces the right answer, so this check, run once per context
+    /// before any guest code, is the entire defence. See
     /// [`require_identity_mapping`](crate::require_identity_mapping).
     ///
     /// `consequence` is carried because the other four fields do not explain why anyone should
     /// care: "36 instead of 64" is not actionable, and "every guest address above the limit
-    /// silently takes the 13.2x-slower path" is.
+    /// silently takes a path measured 30-49x slower" is.
     #[error(
-        "the guest memory path is misconfigured: {setting} is {actual} but D4 requires          {expected}. {consequence}"
+        "the guest memory path is misconfigured: {setting} is {actual} but D4 requires \
+         {expected}. {consequence}"
     )]
     MisconfiguredMemoryPath {
         /// Which setting is wrong, in Omnidroid's vocabulary rather than a backend's.

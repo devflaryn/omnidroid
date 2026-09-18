@@ -1,0 +1,65 @@
+# The workspace gate.
+#
+# Two jobs, and the second is the reason this file exists now rather than later.
+#
+# `check` is the ordinary gate: build, test, clippy, doc, on the one platform the memory and CPU
+# work has been measured on (D10, D11, D12 are all Windows measurements; the Linux and macOS
+# backends are structural and return typed `Unsupported` errors by design).
+#
+# `no-default-features` guards a property that is otherwise invisible. Preflight ruling P1 put the
+# dynarmic FFI in its own crate so that `omni-cpu` — and therefore the `GuestCpu` trait — compiles
+# on a host with no C++ toolchain at all, which is what the ARM64-native path in
+# `ARCHITECTURE.md` §6 needs. Task 3 made `dynarmic-sys` an optional, x86-64-only dependency of
+# `omni-cpu` to keep that true. Nothing in a normal build would notice if it stopped being true:
+# the default features pull the backend in, everything passes, and the property is quietly gone.
+# The job below is what notices.
+#
+# It also catches the specific way it was nearly lost during Task 3. `omni-cpu` has a
+# dev-dependency on itself to enable `test-support` for its own test targets, and without
+# `default-features = false` on that line the default features came back on for the whole package —
+# so `--no-default-features` compiled the backend anyway and meant nothing.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: build, test, clippy, doc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The APK is git-ignored (Global Constraint 2), so the tests that use it skip visibly.
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo doc --workspace --no-deps
+
+  no-default-features:
+    name: omni-cpu builds with no backend and no C++ toolchain
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `-e normal` excludes dev- and build-dependencies, which is the question being asked: does a
+      # *consumer* of omni-cpu pull dynarmic in? `findstr` exits 0 on a match, so a match fails the
+      # step.
+      - name: no dynarmic-sys in the dependency graph
+        shell: cmd
+        run: |
+          cargo tree -p omni-cpu --no-default-features -e normal > tree.txt || exit /b 1
+          findstr /C:"dynarmic-sys" tree.txt && exit /b 1
+          exit /b 0
+      - run: cargo test -p omni-cpu --no-default-features
+      - run: cargo clippy -p omni-cpu --no-default-features --all-targets

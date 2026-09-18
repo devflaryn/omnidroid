@@ -79,7 +79,7 @@ impl GuestRange {
 ///
 /// Because guest VA == host VA (D4, measured: `fastmem_pointer = 0` with
 /// `fastmem_address_space_bits = 64` emits `mov reg, [r13 + vaddr]` with `r13 = 0`, folding the base
-/// into the SIB byte at **zero** cost, and measuring **13.2x** faster than routing memory through
+/// into the SIB byte at **zero** cost, and measured **30-49x** faster than routing memory through
 /// callbacks). There is no translation on the memory path, so a CPU context needs nothing from the
 /// address space in order to *resolve* an address — only to know which addresses are guest
 /// addresses at all, for diagnostics and for configuration checks.
@@ -161,7 +161,7 @@ impl GuestAddressSpace {
     /// Reported rather than enforced. A translating backend needs it to configure its fast memory
     /// path and to *assert* that configuration at startup — D4's second footgun is that the default
     /// `fastmem_address_space_bits` is **36**, so a high guest address silently degrades to the slow
-    /// path while still producing correct results, which is a 13.2x loss no functional test can see.
+    /// path while still producing correct results, which is a 30-49x loss no functional test can see.
     /// That assertion is Task 3's, and belongs to the backend that has the setting; this is the
     /// number it checks against.
     #[must_use]
@@ -351,7 +351,7 @@ mod tests {
 
         // D4 ran at host VA 0x7F00_0000_0000, bit 46. A space reaching it must report 47 bits, which
         // is the number a translating backend's fastmem configuration is asserted against — the
-        // default of 36 would silently take the 13.2x-slower path.
+        // default of 36 would silently take the 30-49x-slower path.
         let high = GuestAddressSpace::new(0x7F00_0000_0000, 0x1_0000_0000).expect("a high space");
         assert_eq!(high.address_bits(), 47);
     }
