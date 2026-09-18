@@ -216,6 +216,33 @@ Other loader requirements measured from the same binary:
 Evidence: `research/apk-analysis.md`. The APS2 decoder used was validated byte-exact: it consumed
 2,100,778 of 2,100,778 bytes and produced exactly the 568,272 declared relocations.
 
+### Corrections from building the loader on it (Task 5)
+
+All 568,806 relocations now apply to the real binary and the results are read back out of mapped
+memory. Four things the loader measured that this entry did not say, or said differently:
+
+- **`DT_PLTGOT` is *inside* `PT_GNU_RELRO`, and `DT_FLAGS` carries `DF_BIND_NOW`.** The PLT GOT sits
+  at `0x67d16f8`, inside the relro region `0x62dc1c0..0x67d3000`, and all 534 `JUMP_SLOT` targets are
+  in there with it. So **lazy PLT binding is impossible for this library**: the whole GOT is sealed
+  read-only at the end of the load. Every `JUMP_SLOT` must therefore be applied *before* relro is
+  sealed, which fixes the order of the entire load. The task brief assumed the opposite, and so did
+  the first draft of the test.
+- **The 565 imports split 539 `STT_FUNC` / 23 `STT_OBJECT` / 3 `STT_NOTYPE`, and 4 are weak.** The 3
+  `STT_NOTYPE` are a third bucket that a `func`-versus-`object` binary split loses.
+- **`DT_VERNEED` is what attributes an import to a library.** `libroblox.so` has three `Elf64_Verneed`
+  records, and `DT_VERSYM` attributes **407 of the 565** to `libc.so` (345), `libm.so` (56) and
+  `libdl.so` (6) straight out of the file. The other **158** reference `VER_NDX_GLOBAL`, because the
+  Android libraries providing them ship no version definitions, so the file records no provider for
+  them and a loader must not invent one. Without this, "565 imports" cannot be turned into a
+  per-library work list at all.
+- **Exactly one of the 612 symbolic relocations resolves inside the object**, not zero: a `JUMP_SLOT`
+  for `Java_com_roblox_client_purchase_IAPPurchaseManager_nativeFinishPaymentsProtocolPurchaseWithReturn`,
+  which `libroblox.so` both imports and exports. A loader that consulted its provider registry before
+  the object's own symbol table would leave that one null.
+- **All 3,594 `DT_INIT_ARRAY` slots are zero in the file.** The pointers are produced by
+  `R_AARCH64_RELATIVE` relocations, so the array must be read from *relocated memory*. A loader that
+  reads the file image collects 3,594 null pointers and has no way to notice.
+
 ---
 
 ## D10 — Memory model: free address space, lazily committed, decommit to reclaim
@@ -373,6 +400,43 @@ private usage.
 **`release` must walk an allocation's real extent.** Passing a zero size released only the first
 piece of a split reservation and returned success — a latent trap, harmless only because the one
 existing caller happened to coalesce first.
+
+### Further corrections from building the loader on it (Task 5)
+
+**A view mapped `Read` out of an executable section *can* be dropped to `ReadWrite` and raised back.**
+The correction above established that `Read → ReadExecute` fails with error 87; it did not say whether
+`Read → ReadWrite → Read` works, and the loader depends on it, because a writable segment must be
+mapped `Read` (a copy-on-write view is charged its full size the moment it is mapped) and raised only
+in windows. Measured: it works, a 64 KiB window of an 8 MiB view costs **+0.062 MiB** while open and
+refunds to **+0.004 MiB** on restore with one page written, and the written bytes survive the restore.
+
+**`PT_GNU_RELRO` routinely runs past the end of its own segment's memory image.**
+`libdatastore_shared_counter.so` has a writable `PT_LOAD` ending at `0x5428` and a relro segment
+ending at `0x6000` — the page boundary above it. A loader that validates the relro range against
+`p_vaddr + p_memsz` of a containing `PT_LOAD` rejects that library outright. The check has to be
+against the **mapped pages**. Found by loading all eleven libraries, not by the main one.
+
+**The loader's own scratch memory was the largest single consumer of commit charge.** Measured before
+it was fixed: **+36.8 MiB** for the `Vec<Rela>` holding 568,272 relocations (13.6 MB of data, peaking
+at ~2.7× that because the `Vec` grows by doubling), against **+16.7 MiB** for everything the guest
+actually gets. Streaming the packed blob straight into the relocation pass removed it, bringing the
+peak down to equal the steady state. The general lesson: when the design question is "how much commit
+charge does one instance cost", the loader's own transient allocations are in the same budget as the
+guest's, and they are not automatically smaller.
+
+**Windowing bounds the worst case, not this case.** All 568,806 of `libroblox.so`'s relocations land
+in the 5.5 MB writable part of its image, which becomes private regardless, so the measured peak is
+almost independent of window size (16.79 MiB at 64 KiB against 16.79 MiB at a whole 5.2 MB segment).
+The window is what keeps a `DT_TEXTREL` binary — or a tampered one aiming relocations into the 103 MB
+`r-x` segment — from charging 99 MiB per instance. That is still worth the measured 1.4 ms, but the
+justification is the adversarial case and not the stock one, and this entry previously implied
+otherwise.
+
+**Measured end to end, for the record.** Loading `libroblox.so` costs **+16.668 MiB** of commit charge,
+peak and steady, of which 11.039 MiB is `.bss` committed eagerly, 4.965 MiB is the relro region after
+relocation and 0.328 MiB is `.data`. The 103,649,280 bytes of text and rodata cost nothing and are
+shared. Load wall-time is 11.8 ms in release. Four load/unload cycles return commit charge to baseline
+each time.
 
 ### Confirmed prediction
 

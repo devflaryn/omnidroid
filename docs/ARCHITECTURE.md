@@ -110,22 +110,35 @@ Requirements are taken from the actual binary rather than from the ELF spec in g
    group-based format. A further **534** `JUMP_SLOT` relocations arrive **separately** via
    `DT_JMPREL`, for a grand total of 568,806. A loader without APS2 applies *zero* relocations. This
    is the highest-risk piece of the loader and gets the most testing.
-2. **Segment mapping** via placeholder split plus `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` at 4 KB
+2. **Relocation proceeds in windows**, because copy-on-write is charged at `protect` time and not at
+   write time (D11). A window is 64 KiB, equal to the commit granule, so a window landing in `.bss`
+   needs exactly one commit. Executability is chosen at map time and can never be raised; writability
+   is *not*, because a copy-on-write view is charged its full size the instant it is mapped, so a
+   writable segment is mapped read-only and raised in windows and once at the end.
+3. **Segment mapping** via placeholder split plus `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` at 4 KB
    granularity, honouring `p_align`, which for `libroblox.so` is **0x4000 (16 KiB)** on every
    `PT_LOAD` — not the 4 KiB an earlier draft assumed. Windows splits placeholders at 4 KiB, so 16 KiB
    is satisfiable, but the segment arithmetic must use the real `p_align`.
-3. **Symbol resolution** against Omnidroid's own provided libraries (section 5). `libroblox.so` has
+4. **Symbol resolution** against Omnidroid's own provided libraries (section 5). `libroblox.so` has
    **only `DT_GNU_HASH`** — there is no `DT_HASH` fallback — though other libraries in the APK carry
-   both, and where both exist they were verified to agree exactly.
-4. **RELRO**: make the 5,205,568-byte `PT_GNU_RELRO` region read-only after relocation.
-5. **`init_array`**: run all 3,594 entries in order. All must succeed.
-6. **`dl_iterate_phdr` must be faithful.** The C++ runtime is statically linked, so the unwinder
+   both, and where both exist they were verified to agree exactly. Which library an import is expected
+   to come from is recorded only in `DT_VERNEED` + `DT_VERSYM`, which names `libc.so`, `libm.so` and
+   `libdl.so` for 407 of the 565; the other 158 are unversioned and the file says nothing, so the
+   loader reports them as unattributed rather than guessing from their names.
+5. **RELRO**: make the 5,205,568-byte `PT_GNU_RELRO` region read-only after relocation — and note
+   that `DT_PLTGOT` is **inside** it and `DT_FLAGS` carries `DF_BIND_NOW`, so all 534 `JUMP_SLOT`
+   relocations are sealed with it and lazy PLT binding is impossible. They must be applied before the
+   seal, which fixes the order of the whole load.
+6. **`init_array`**: run all 3,594 entries in order. All must succeed. The array must be read from
+   **relocated memory**: every slot is zero in the file, because the pointers are produced by
+   `R_AARCH64_RELATIVE` relocations, so reading the file image yields 3,594 null pointers.
+7. **`dl_iterate_phdr` must be faithful.** The C++ runtime is statically linked, so the unwinder
    lives inside the guest and walks 11.5 MB of `.eh_frame` using this call. A stub breaks every C++
    exception, and Roblox will throw.
-7. **Deliberately not implemented**, because the APK contains none of it: ELF TLS (no `PT_TLS` and
+8. **Deliberately not implemented**, because the APK contains none of it: ELF TLS (no `PT_TLS` and
    no `STT_TLS` anywhere), ifuncs, BTI/PAC/MTE, `DT_TEXTREL`. Thread-local storage is
    `pthread_key_*` only. This is a real saving, recorded so nobody adds it speculatively.
-8. Two `DT_NEEDED` libraries (`libOpenSLES.so`, `libOpenMAXAL.so`) import zero symbols but must
+9. Two `DT_NEEDED` libraries (`libOpenSLES.so`, `libOpenMAXAL.so`) import zero symbols but must
    still resolve as loadable objects, and 10 `AMEDIAFORMAT_KEY_*` imports are **data** symbols, not
    functions. Both fail in ways that name no symbol, so the loader reports unresolved objects and
    data-versus-function mismatches explicitly.
