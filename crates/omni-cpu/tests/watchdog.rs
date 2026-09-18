@@ -10,18 +10,22 @@
 //! | Configuration | Direct-branch loop | Indirect-branch loop | Cost |
 //! |---|---|---|---|
 //! | `ALL_SAFE`, cycle counting | budget stops it | **nothing stops it** | baseline |
-//! | `INTERRUPTIBLE`, cycle counting | budget stops it | budget stops it | ~3.9 ns per indirect transfer (n = 31): 0x on code with no indirect branches, up to ~5x on indirect-saturated code |
-//! | `BlockLinking` off | both escapes work on both | both escapes work on both | **~6.6x** on a 4-instruction-per-block workload (n = 31) |
+//! | `INTERRUPTIBLE` (`0xFFF9`), cycle counting | budget stops it | budget stops it | ~3.9 ns per indirect transfer (n = 31): **1.00x** on code with no indirect branches, 4.56x-4.71x on indirect-saturated code |
+//! | `BlockLinking` off (`0xFFF8`) | both escapes work on both | both escapes work on both | **7.08x-7.43x** across D16's three workloads (n = 31) |
 //!
-//! **`INTERRUPTIBLE` with block linking left on.** The third row buys a second escape that is not
-//! needed: once the budget stops every guest shape, the halt flag is redundant *inside* a slice,
-//! because the run loop checks it in Rust between slices and a slice is about 200 µs of guest time.
-//! Paying 6.6x for a mechanism whose only advantage is latency the caller cannot perceive is the
-//! wrong trade — and 6.6x is an upper bound driven by block length, which makes it worst on exactly
-//! the register-bound code D5 already measured at 33x native.
+//! **`INTERRUPTIBLE` with block linking left on** (D16's `0xFFF9`). The third row buys a second
+//! escape that is not needed: once the budget stops every guest shape, the halt flag is redundant
+//! *inside* a slice, because the run loop checks it in Rust between slices and a slice is about
+//! 200 µs of guest time. Paying 7x for a mechanism whose only advantage is latency no caller can
+//! perceive is the wrong trade — and D16 records that 7x as an **upper bound** driven by block
+//! length, measured on 4-instruction blocks, which makes it worst on exactly the register-bound
+//! code D5 already measured at 33x native.
 //!
-//! What that costs instead is the second row's 0x-to-5x band, which is why `libroblox.so`'s real
-//! branch mix is measured and reported rather than guessed at.
+//! What that costs instead is the second row's band, which is why `libroblox.so`'s branch mix was
+//! measured rather than guessed at: `tools/branch_mix.py` counts **412,601 indirect transfers in
+//! 18,156,033 words of executable sections — one every 44.0 instructions, 2.27%** — against D16's
+//! indirect-saturated workloads at 16.7% and 50%. Static density, not a trace; see the tool for
+//! what that does and does not license.
 //!
 //! # What is not tested here
 //!
