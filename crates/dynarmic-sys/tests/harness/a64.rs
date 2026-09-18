@@ -129,6 +129,11 @@ pub const fn br(rn: u32) -> u32 {
     0xD61F_0000 | (rn << 5)
 }
 
+/// `BLR Xn` -- an indirect call; writes the return address to `X30`.
+pub const fn blr(rn: u32) -> u32 {
+    0xD63F_0000 | (rn << 5)
+}
+
 /// `LDR Xt, [Xn, #imm12*8]` — load/store unsigned immediate, `size=11 opc=01`.
 pub const fn ldr_imm(rt: u32, rn: u32, byte_offset: u32) -> u32 {
     0xF940_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt

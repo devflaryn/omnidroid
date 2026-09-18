@@ -66,16 +66,20 @@ MUTATIONS = [
      """    if (self->jit->IsExecuting()) {
         return OD_HALT_SHIM_REENTERED;
     }
-    return static_cast<uint32_t>(self->jit->Run());""",
-     """    return static_cast<uint32_t>(self->jit->Run());""",
+    try {
+        return static_cast<uint32_t>(self->jit->Run());""",
+     """    try {
+        return static_cast<uint32_t>(self->jit->Run());""",
      SYS),
 
     ("sys-A2", "A", "od_jit_step re-entry guard removed", SHIM,
      """    if (self->jit->IsExecuting()) {
         return OD_HALT_SHIM_REENTERED;
     }
-    return static_cast<uint32_t>(self->jit->Step());""",
-     """    return static_cast<uint32_t>(self->jit->Step());""",
+    try {
+        return static_cast<uint32_t>(self->jit->Step());""",
+     """    try {
+        return static_cast<uint32_t>(self->jit->Step());""",
      SYS),
 
     # ---- configuration that dynarmic asserts on rather than refusing ----------------------------
@@ -129,10 +133,24 @@ MUTATIONS = [
      SYS),
 
     ("sys-A10", "A", "invalidation length overflow no longer clamped (invalidates nothing)", SHIM,
-     """    if (len > max_len) {
-        len = max_len;
+     """    if (len - 1 > room) {
+        len = room + 1;
     }""",
      """    if (false) {
+        len = room + 1;
+    }""",
+     SYS),
+
+    # `sys-A10` proves the clamp is load-bearing. It does not prove the clamp is
+    # correct, and it was not: this is the arithmetic that shipped, and it turns
+    # a four-byte invalidation at guest address 0 into a whole-cache flush.
+    ("sys-A17", "A", "the clamp written so it overflows at addr 0 (the original defect)", SHIM,
+     """    const uint64_t room = std::numeric_limits<uint64_t>::max() - addr;
+    if (len - 1 > room) {
+        len = room + 1;
+    }""",
+     """    const uint64_t max_len = std::numeric_limits<uint64_t>::max() - addr + 1;
+    if (len > max_len) {
         len = max_len;
     }""",
      SYS),
@@ -231,10 +249,25 @@ MUTATIONS = [
     }""",
      SYS),
 
-    ("sys-B6", "B", "the effective config echoes the request instead of reading dynarmic's state",
+    # Not `= 64` or any other literal: a wrong constant is a different and much
+    # less interesting mutation. What is worth catching is the effective config
+    # reporting something other than the state that was actually installed --
+    # here by never recording it, so it answers from the struct's defaults
+    # (fastmem off, 36 bits, 128 MiB) while dynarmic runs with what was asked
+    # for. That is D4's silent-substitution shape pointed at the instrument
+    # rather than at the engine.
+    #
+    # Note what this cannot reach: a shim that echoed the caller's own
+    # `od_config` would be indistinguishable by any test, because that struct
+    # and the saved `UserConfig` hold the same values by construction. The
+    # equivalence rests on dynarmic's own copy being `const UserConfig conf`
+    # (`a64_interface.cpp:317`) for the jit's whole life, which is stated where
+    # the function is defined and would have to be rechecked on a re-pin.
+    ("sys-B6", "B", "the effective config is never recorded, so it reports struct defaults",
      SHIM,
-     """    out->fastmem_address_space_bits = static_cast<uint64_t>(uc.fastmem_address_space_bits);""",
-     """    out->fastmem_address_space_bits = 64;""",
+     """        self->conf = uc;
+        self->jit = new A64::Jit{uc};""",
+     """        self->jit = new A64::Jit{uc};""",
      SYS),
 ]
 
@@ -330,6 +363,29 @@ def main():
         return 0
 
     restore_stale_backups()
+
+    # Pre-flight: every selected pattern must match its file exactly once
+    # *before* anything is mutated or any cargo is run. `tools/mutate.py` grew
+    # this after a stale row surfaced as a MISS forty minutes into a run. The
+    # same thing happened here twice -- once because a comment the pattern
+    # quoted had been reworded, once because a run killed mid-flight left a
+    # mutant behind. The per-row check below is still needed, because a row can
+    # go stale between this pass and its turn; this is the one-second version
+    # that says so before the wait rather than after it.
+    stale = []
+    for mid, _, _, path, old, _, _ in selected:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        found = text.count(old)
+        if found != 1:
+            stale.append(f"  {mid}: pattern matches {found} times in {path}")
+    if stale:
+        print(f"pre-flight failed: {len(stale)} of {len(selected)} patterns do not "
+              "match exactly once. Nothing was mutated and nothing was run.")
+        print("\n".join(stale))
+        return 2
+    print(f"pre-flight: {len(selected)}/{len(selected)} patterns match exactly once")
+
     print(f"{len(selected)} mutations\n")
     results = []
     for mid, direction, description, path, old, new, command in selected:

@@ -557,3 +557,25 @@ fn invalidating_a_range_spares_the_translations_outside_it() {
         "invalidating 8 bytes retranslated as much as a cold start          ({after} fetches against {first}): the range was ignored"
     );
 }
+
+#[test]
+fn the_code_cache_is_writable_and_executable_at_once() {
+    // This asserts something Omnidroid does not want, on purpose.
+    //
+    // D12 rules that Omnidroid never holds a page that is simultaneously
+    // writable and executable, and `omni-mem`'s `CodeArena` is built that way.
+    // dynarmic's code cache is not: upstream commits it
+    // `PAGE_EXECUTE_READWRITE` (`block_of_code.cpp:280`), so the region holding
+    // *all* generated guest code is W+X. The upstream option that would change
+    // it segfaults on this pin, including in dynarmic's own test suite, so the
+    // exception is real and cannot be closed by configuration.
+    //
+    // Asserting it keeps the contradiction from going quiet. When a re-pin or a
+    // carried patch fixes it, this test fails and says so.
+    let vm = Vm::new(vec![a64::svc(0)], VmOptions::default());
+    assert_eq!(
+        vm.effective_config().code_cache_w_xor_x,
+        0,
+        "dynarmic's code cache is now W^X -- D12's exception can be withdrawn,          and crates/dynarmic-sys/patches/README.md updated"
+    );
+}

@@ -12,7 +12,7 @@ so this file is an index, not a substitute.
 | fmt | bundled subtree | MIT | `vendor/dynarmic/externals/fmt/LICENSE.rst` |
 | mcl | bundled subtree | MIT | `vendor/dynarmic/externals/mcl/LICENSE` |
 | Zydis | bundled subtree | MIT | `vendor/dynarmic/externals/zydis/LICENSE` |
-| Zycore | bundled subtree | MIT | `vendor/dynarmic/externals/zydis/zycore/LICENSE` |
+| Zycore | bundled subtree | MIT | `vendor/dynarmic/externals/zycore/LICENSE` |
 | xbyak | bundled subtree, header-only | BSD-3-Clause | `vendor/dynarmic/externals/xbyak/COPYRIGHT` |
 | robin-map | bundled subtree, header-only | MIT | `vendor/dynarmic/externals/robin-map/LICENSE` |
 | Boost (headers) | 1.88.0, 1,786-file subset | BSL-1.0 | `vendor/boost/LICENSE_1_0.txt` |
@@ -24,6 +24,34 @@ so this file is an index, not a substitute.
 | oaknut | MIT (`vendor/dynarmic/externals/oaknut/LICENSE`) | the ARM64 host backend; built only on an `aarch64` host |
 | biscuit | MIT (`vendor/dynarmic/externals/biscuit/LICENSE.md`) | the RISC-V host backend; never built here |
 | Catch2 | BSL-1.0 (`vendor/dynarmic/externals/catch/LICENSE.txt`) | dynarmic's own test suite; `DYNARMIC_TESTS=OFF` in our build, and it is kept only so the upstream suite stays reproducible on a re-pin |
+| CPython documentation tooling | **PSF-2.0** (`vendor/dynarmic/externals/fmt/doc/python-license.txt`) | vendored inside fmt's `doc/` for building fmt's documentation. Not compiled, not linked, and not run by anything here |
+
+## Enumerated, not assumed
+
+SPDX tags in the vendored tree, counted per component with
+
+```sh
+grep -rho "SPDX-License-Identifier: [^ ]*" <dir> | sort | uniq -c
+```
+
+| Component | Tags |
+|---|---|
+| `src/` (dynarmic itself) | 378 × 0BSD |
+| `externals/catch` | 418 × BSL-1.0 |
+| `externals/mcl` | 69 × MIT |
+| `externals/oaknut` | 40 × MIT |
+| `externals/biscuit` | 1 × BSL-1.0 |
+| `externals/xbyak` | 1 × BSD-3-Clause (`meson.build`) |
+| `externals/fmt` | 1 × `MIT OR CC0-1.0` (`support/cmake/JoinPaths.cmake`) |
+| `externals/zydis`, `externals/zycore`, `externals/robin-map` | none; licence files only, MIT |
+
+Tree-wide that is 411 × 0BSD, 419 × BSL-1.0 and 109 × MIT, the extra 0BSD tags
+being under `tests/` and `CMakeModules/`. The Task 2 review counted
+376 / 214 / 12, which is the same tree under a narrower scope; the numbers here
+are reproducible with the command above.
+
+**No reciprocal licence anywhere** — no GPL, LGPL, MPL, EPL or CDDL tag, and no
+such licence file. That is the conclusion both counts support.
 
 ## A note on BSL-1.0, which D3 does not name
 

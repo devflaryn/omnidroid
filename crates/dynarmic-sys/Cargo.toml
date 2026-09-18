@@ -13,6 +13,12 @@ description = "Raw FFI bindings to the pinned dynarmic A64 JIT (yuzu-mirror/dyna
 links = "od_dynarmic"
 build = "build.rs"
 
+[features]
+# Build dynarmic's code cache W^X rather than PAGE_EXECUTE_READWRITE. Off by
+# default because it is off upstream; see `README.md` for what it costs and
+# what leaving it off contradicts.
+w-xor-x = []
+
 [build-dependencies]
 cc = "1.4.6"
 

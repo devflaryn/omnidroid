@@ -147,6 +147,14 @@ typedef struct od_callbacks {
  * the shim refuses instead. Deliberately distinct from every HaltReason bit. */
 #define OD_HALT_SHIM_REENTERED 0x00800000u
 
+/* Also not a dynarmic halt reason. Returned when a C++ exception escaped
+ * `Jit::Run`/`Jit::Step` and was caught here. xbyak throws `Xbyak::Error` when
+ * the code cache runs out of room, and translation happens inside `Run`, so
+ * this is reachable -- and an exception unwinding into Rust is undefined
+ * behaviour, so it has to stop at the boundary. The jit is in an
+ * uncharacterised state afterwards; free it. */
+#define OD_HALT_SHIM_THREW 0x00400000u
+
 /* Configuration handed to `od_jit_new`. Copied on entry; the struct itself
  * need not outlive the call. The pointers in it must outlive the jit. */
 typedef struct od_config {
@@ -232,6 +240,13 @@ typedef struct od_effective_config {
     int hook_hint_instructions;
     uint32_t optimizations;
     uint32_t unsafe_optimizations;
+    /* 1 if dynarmic's code cache is W^X. **0 on this pin**: upstream's default
+     * commits it `PAGE_EXECUTE_READWRITE` (`block_of_code.cpp:280`), so the
+     * region holding every byte of generated guest code is writable and
+     * executable at once -- which is what D12 says Omnidroid never does. The
+     * upstream switch for it crashes; see `build.rs`. Reported rather than
+     * assumed so the contradiction is a checked fact and flips loudly. */
+    int code_cache_w_xor_x;
     uint64_t tpidr_el0_ptr;
     uint64_t tpidrro_el0_ptr;
 } od_effective_config;

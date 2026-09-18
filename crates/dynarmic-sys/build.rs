@@ -50,6 +50,11 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/od_dynarmic.h");
     println!("cargo:rerun-if-changed=vendor/PIN.txt");
     println!("cargo:rerun-if-env-changed=OMNIDROID_DYNARMIC_BUILD_DIR");
+    // These pick a different compiler or a different CMake, which changes the
+    // object files without changing a single watched source file.
+    println!("cargo:rerun-if-env-changed=CMAKE");
+    println!("cargo:rerun-if-env-changed=CXX");
+    println!("cargo:rerun-if-env-changed=CC");
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch != "x86_64" && target_arch != "aarch64" {
@@ -103,7 +108,10 @@ fn main() {
         .include(dynarmic_src.join("externals/fmt/include"))
         .include(&boost_include)
         .define("NOMINMAX", None)
-        .define("WIN32_LEAN_AND_MEAN", None);
+        .define("WIN32_LEAN_AND_MEAN", None)
+        // The same answer CMake was given, so `od_jit_effective_config` reports
+        // the protection the code cache actually has rather than a guess.
+        .define("OD_DYNARMIC_W_XOR_X", if want_w_xor_x() { "1" } else { "0" });
     if compiler.is_like_msvc() {
         shim.flag("/std:c++20").flag("/EHsc");
     } else {
@@ -118,6 +126,47 @@ fn main() {
     });
 
     emit_link_directives(&build_dir);
+}
+
+/// Whether `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT` was asked for, having first
+/// refused to hand back `true` on a pin where it does not work.
+///
+/// D12 says Omnidroid never holds a page that is writable and executable at
+/// once. dynarmic's default leaves its code cache `PAGE_EXECUTE_READWRITE`
+/// (`block_of_code.cpp:280`), so that is false for the component holding every
+/// byte of generated guest code, and this option is the upstream switch for it.
+///
+/// It does not work. On this pin, on Windows x86-64, a build with it on
+/// segfaults immediately -- **including dynarmic's own test suite**, which is
+/// how we know it is the option and not our integration:
+///
+/// ```text
+/// cmake -S crates/dynarmic-sys/vendor/dynarmic -B <build> -DDYNARMIC_TESTS=ON \
+///       -DDYNARMIC_ENABLE_NO_EXECUTE_SUPPORT=ON
+/// <build>/tests/dynarmic_tests.exe "[a64]"   # SIGSEGV on the first test
+/// ```
+///
+/// The feature is kept so the next re-pin can retest in one flag, and the
+/// escape hatch is kept so that retest does not need a code change. Turning it
+/// on without the escape hatch is a clear stop rather than an access violation
+/// in every test.
+fn want_w_xor_x() -> bool {
+    if env::var_os("CARGO_FEATURE_W_XOR_X").is_none() {
+        return false;
+    }
+    if env::var_os("OMNIDROID_DYNARMIC_ALLOW_BROKEN_WX").is_some() {
+        println!("cargo:warning=dynarmic-sys: W^X code cache enabled; it crashes on this pin");
+        return true;
+    }
+    fail(&[
+        s("The `w-xor-x` feature is enabled, and it does not work on this pin."),
+        s("dynarmic built with DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT=ON segfaults"),
+        s("immediately on Windows x86-64 -- its own test suite included, so this"),
+        s("is upstream and not the Omnidroid shim."),
+        s("See crates/dynarmic-sys/patches/README.md."),
+        s("To retest it on a new pin anyway, set"),
+        s("OMNIDROID_DYNARMIC_ALLOW_BROKEN_WX=1."),
+    ])
 }
 
 /// Refuses to start a build that MSVC will abandon with `C1083` a minute in.
@@ -237,6 +286,15 @@ fn configure(
     // but DYNARMIC_IGNORE_ASSERTS replaces them with undefined behaviour, which
     // is worse. The shim's job is to make the reachable ones unreachable.
     c.arg("-DDYNARMIC_IGNORE_ASSERTS=OFF");
+    // D12 says Omnidroid never holds a page that is writable and executable at
+    // once. Upstream's default leaves dynarmic's code cache
+    // `PAGE_EXECUTE_READWRITE`, which makes that false for the component that
+    // holds every byte of generated guest code. The `w-xor-x` feature turns it
+    // on; `README.md` records the measured cost of doing so.
+    c.arg(format!(
+        "-DDYNARMIC_ENABLE_NO_EXECUTE_SUPPORT={}",
+        if want_w_xor_x() { "ON" } else { "OFF" }
+    ));
     c.arg(format!("-DCMAKE_C_COMPILER={}", cmake_path(compiler.path())));
     c.arg(format!("-DCMAKE_CXX_COMPILER={}", cmake_path(compiler.path())));
 

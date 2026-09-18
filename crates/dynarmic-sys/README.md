@@ -58,6 +58,22 @@ both are load-bearing.
    which `od_jit_run` was reached, `run` must take `&self`, and callbacks must
    not unwind. `tests/harness/mod.rs` is the worked example.
 2. **Configuration that is not optional.** Identity fastmem is 13.2x faster than
-   the callback path (D4) and degrades to it *silently*; a runaway guest is
-   unstoppable with dynarmic's default optimization flags. `od_jit_effective_config`
-   and `od_jit_stats` exist so both can be asserted rather than assumed.
+   the callback path (D4) and degrades to it *silently*.
+   `od_jit_effective_config` and `od_jit_stats` exist so that can be asserted
+   rather than assumed.
+3. **Two limits of the pin that configuration cannot remove.** No setting makes
+   every runaway guest stoppable — `the_stoppability_matrix` in
+   `tests/hostile.rs` is the table, and `patches/README.md` §2 is the
+   explanation. And dynarmic's code cache is writable and executable at once,
+   which contradicts D12; `patches/README.md` §3 has the evidence that the
+   upstream switch for it crashes.
+
+Measured costs, all n=31 in release, on the host in `docs/research/host-environment.md`:
+
+| | |
+|---|---|
+| `optimization::INTERRUPTIBLE` | ~3.9 ns per indirect transfer: 1.00x for a guest with no indirect branches, 4.58x at two transfers per twelve instructions, 5.03x at two per four |
+| cold translation | 7.2 us per basic block (2,000 blocks, 64 MiB cache) |
+
+Reproduce with
+`cargo test -p dynarmic-sys --release --test bench -- --ignored --nocapture`.

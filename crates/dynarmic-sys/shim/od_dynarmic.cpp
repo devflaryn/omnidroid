@@ -48,7 +48,14 @@ static_assert(static_cast<u32>(HaltReason::Step) == OD_HALT_STEP, "");
 static_assert(static_cast<u32>(HaltReason::CacheInvalidation) == OD_HALT_CACHE_INVALIDATION, "");
 static_assert(static_cast<u32>(HaltReason::MemoryAbort) == OD_HALT_MEMORY_ABORT, "");
 static_assert(static_cast<u32>(HaltReason::UserDefined8) == OD_HALT_USER8, "");
-/* The shim's own return value must not collide with any dynarmic halt bit. */
+/* The shim's own return values must not collide with any dynarmic halt bit. */
+static_assert((OD_HALT_SHIM_THREW
+               & (OD_HALT_STEP | OD_HALT_CACHE_INVALIDATION | OD_HALT_MEMORY_ABORT
+                  | OD_HALT_USER1 | OD_HALT_USER2 | OD_HALT_USER3 | OD_HALT_USER4
+                  | OD_HALT_USER5 | OD_HALT_USER6 | OD_HALT_USER7 | OD_HALT_USER8
+                  | OD_HALT_SHIM_REENTERED))
+                  == 0u,
+              "OD_HALT_SHIM_THREW overlaps another halt bit");
 static_assert((OD_HALT_SHIM_REENTERED
                & (OD_HALT_STEP | OD_HALT_CACHE_INVALIDATION | OD_HALT_MEMORY_ABORT
                   | OD_HALT_USER1 | OD_HALT_USER2 | OD_HALT_USER3 | OD_HALT_USER4
@@ -354,7 +361,16 @@ uint32_t od_jit_run(void* p) {
     if (self->jit->IsExecuting()) {
         return OD_HALT_SHIM_REENTERED;
     }
-    return static_cast<uint32_t>(self->jit->Run());
+    try {
+        return static_cast<uint32_t>(self->jit->Run());
+    } catch (...) {
+        /* Low reachability, but not zero: xbyak throws `Xbyak::Error` from
+         * `block_of_code.cpp` when the code cache runs out of room, and
+         * translation happens inside `Run`. A C++ exception unwinding into
+         * Rust is undefined behaviour, so it stops here and becomes a halt
+         * reason the caller can see. */
+        return OD_HALT_SHIM_THREW;
+    }
 }
 
 uint32_t od_jit_step(void* p) {
@@ -362,7 +378,11 @@ uint32_t od_jit_step(void* p) {
     if (self->jit->IsExecuting()) {
         return OD_HALT_SHIM_REENTERED;
     }
-    return static_cast<uint32_t>(self->jit->Step());
+    try {
+        return static_cast<uint32_t>(self->jit->Step());
+    } catch (...) {
+        return OD_HALT_SHIM_THREW;
+    }
 }
 
 void od_jit_halt(void* p, uint32_t reason) {
@@ -437,9 +457,22 @@ void od_jit_invalidate_range(void* p, uint64_t addr, uint64_t len) {
     if (len == 0) {
         return;
     }
-    const uint64_t max_len = std::numeric_limits<uint64_t>::max() - addr + 1;
-    if (len > max_len) {
-        len = max_len;
+    /* Clamp so `addr + len - 1` cannot wrap. `room` is the number of bytes
+     * above `addr`, so the largest valid length is `room + 1` -- which is
+     * representable for every `addr` except 0, where it would be 2^64.
+     *
+     * Writing this as `max_len = UINT64_MAX - addr + 1` instead is wrong in a
+     * way that is easy to miss and expensive to hit: at `addr == 0` it wraps to
+     * 0, every length compares greater, and a four-byte invalidation at guest
+     * address 0 clamps to `len = 0`, which dynarmic turns into
+     * `closed(0, UINT64_MAX)` -- the entire code cache, thrown away by a guest
+     * that asked to invalidate one instruction. Guest code chooses the address.
+     *
+     * Comparing `len - 1` against `room` never overflows: `len >= 1` here, and
+     * `room <= UINT64_MAX`. */
+    const uint64_t room = std::numeric_limits<uint64_t>::max() - addr;
+    if (len - 1 > room) {
+        len = room + 1;
     }
     as_jit(p)->jit->InvalidateCacheRange(addr, static_cast<std::size_t>(len));
 }
@@ -448,6 +481,13 @@ void od_jit_clear_cache(void* p) { as_jit(p)->jit->ClearCache(); }
 void od_jit_clear_exclusive(void* p) { as_jit(p)->jit->ClearExclusiveState(); }
 
 void od_jit_effective_config(void* p, od_effective_config* out) {
+    /* This reads the shim's saved `UserConfig`, not dynarmic's. They are the
+     * same object by value and dynarmic's copy is `const` for its whole life on
+     * this pin -- `A64::Jit::Impl` holds `const UserConfig conf` and nothing
+     * assigns to it -- so reading ours cannot disagree with reading theirs.
+     * dynarmic exposes no accessor, so this is the only way to answer the
+     * question at all; if a future pin makes its copy mutable, this stops being
+     * equivalent and the check Task 3 builds on it stops being worth anything. */
     const OdJit* self = as_jit(p);
     const A64::UserConfig& uc = self->conf;
     std::memset(out, 0, sizeof(*out));
@@ -465,6 +505,11 @@ void od_jit_effective_config(void* p, od_effective_config* out) {
     out->hook_hint_instructions = uc.hook_hint_instructions ? 1 : 0;
     out->optimizations = static_cast<uint32_t>(uc.optimizations);
     out->unsafe_optimizations = uc.unsafe_optimizations ? 1u : 0u;
+#if defined(OD_DYNARMIC_W_XOR_X) && OD_DYNARMIC_W_XOR_X
+    out->code_cache_w_xor_x = 1;
+#else
+    out->code_cache_w_xor_x = 0;
+#endif
     out->tpidr_el0_ptr = reinterpret_cast<uint64_t>(uc.tpidr_el0);
     out->tpidrro_el0_ptr = reinterpret_cast<uint64_t>(uc.tpidrro_el0);
 }

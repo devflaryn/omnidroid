@@ -406,6 +406,39 @@ fn a_zero_length_invalidation_does_not_interrupt_the_guest() {
 }
 
 #[test]
+fn a_small_invalidation_at_guest_address_zero_is_not_a_cache_flush() {
+    // The clamp that keeps `addr + len - 1` from wrapping used to be written
+    // `max_len = UINT64_MAX - addr + 1`, which at `addr == 0` wraps to 0. Every
+    // length then compared greater, clamped to 0, and dynarmic turned that into
+    // `closed(0, UINT64_MAX)`: a four-byte invalidation at guest address 0
+    // threw away every translation in the process.
+    //
+    // Guest code picks the address, and `IC IVAU` at a low address is not
+    // exotic. The cost is not a wrong answer, it is 0.15-0.31 Mguest-insn/s of
+    // retranslation, on demand, as often as the guest likes.
+    let code = vec![a64::movz(0, 5, 0), a64::svc(0)];
+    let vm = Vm::new(code, VmOptions::default());
+    let jit = vm.raw();
+
+    vm.start(10_000);
+    assert_ne!(vm.run_to_completion(16) & harness::HALT_DONE, 0);
+
+    for addr in [0u64, 4, 8] {
+        vm.reset_stats();
+        // SAFETY: `jit` is live and not executing.
+        unsafe { od_jit_invalidate_range(jit, addr, 4) };
+        vm.start(10_000);
+        assert_ne!(vm.run_to_completion(16) & harness::HALT_DONE, 0);
+        assert_eq!(
+            vm.stats().read_code,
+            0,
+            "invalidating 4 bytes at guest {addr:#x} retranslated the program"
+        );
+    }
+    assert_eq!(vm.reg(0), 5);
+}
+
+#[test]
 fn register_indices_are_bounds_checked() {
     // dynarmic indexes its register array unchecked; the shim does not.
     let vm = Vm::new(vec![a64::svc(0)], VmOptions::default());
@@ -677,12 +710,20 @@ fn fuzz_random_words(fastmem: bool) {
 
 /// Spawns `name` as a child of this test binary without waiting for it.
 fn spawn_child(name: &str) -> std::process::Child {
+    spawn_child_with(name, &[])
+}
+
+/// As [`spawn_child`], with extra environment for the child.
+fn spawn_child_with(name: &str, env: &[(&str, &str)]) -> std::process::Child {
     let exe = std::env::current_exe().expect("current_exe");
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .args(["--exact", name, "--nocapture", "--test-threads", "1"])
-        .env("OD_HOSTILE_CHILD", "1")
-        .spawn()
-        .expect("spawn child")
+        .env("OD_HOSTILE_CHILD", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.spawn().expect("spawn child")
 }
 
 /// Waits up to `secs` for `child`, killing it and returning `None` on timeout.
@@ -701,107 +742,338 @@ fn wait_up_to(child: &mut std::process::Child, secs: u64) -> Option<std::process
     }
 }
 
-/// Exit code the runaway child uses when neither escape worked.
+/// Exit code the runaway child uses when the escape under test did not fire.
 const EXIT_WEDGED: i32 = 9;
 
-/// A one-instruction guest loop: `BR X30` with `X30` pointing at itself.
-/// Runs with a 2,000-cycle budget and a watchdog that halts from another
-/// thread after 300 ms -- both of the escapes a host has.
-///
-/// If neither works the main thread never comes back, so a second watchdog
-/// ends the process with [`EXIT_WEDGED`]. Without it the wedged child outlives
-/// whatever spawned it, and on Windows an orphan that inherited a pipe holds
-/// that pipe open for good -- which is how a mutation run stops dead.
-fn runaway_guest(optimizations: u32) {
-    // BR X30                            D61F03C0
-    let code = vec![a64::br(30)];
-    assert_eq!(code[0], 0xD61F_03C0);
+/// The guest shapes a runaway loop can take. The distinction is not cosmetic:
+/// they leave a translated block through different terminals, and the two
+/// terminals check different things.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    /// `B .` -- a direct branch to itself, an otherwise empty block.
+    DirectEmpty,
+    /// `ADD X0, X0, #1; B -1` -- a direct branch with a body.
+    DirectBody,
+    /// `BR X30` with `X30` pointing at itself.
+    Indirect,
+}
 
+impl Shape {
+    fn code(self) -> Vec<u32> {
+        match self {
+            // B .                               14000000
+            Self::DirectEmpty => vec![a64::b(0)],
+            // ADD X0, X0, #1                    91000400
+            // B  -1                             17FFFFFF
+            Self::DirectBody => vec![a64::add_imm(0, 0, 1), a64::b(-1)],
+            // BR X30                            D61F03C0
+            Self::Indirect => vec![a64::br(30)],
+        }
+    }
+}
+
+/// The ways a host has of stopping a guest that will not stop itself. The third
+/// is the one a real runtime wants -- a step budget *and* a watchdog that can
+/// interrupt before it expires -- and it is the one that does not work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Escape {
+    /// `enable_cycle_counting` with a finite budget, and no halt.
+    Budget,
+    /// `od_jit_halt` from another thread, with cycle counting **off**, so the
+    /// budget cannot be what stopped it.
+    Halt,
+    /// `od_jit_halt` from another thread with cycle counting **on** and a budget
+    /// that will not expire. Both mechanisms are armed; only one can be
+    /// checked.
+    HaltWithBudget,
+}
+
+impl Escape {
+    fn cycle_counting(self) -> bool {
+        self != Self::Halt
+    }
+
+    fn budget(self) -> u64 {
+        if self == Self::Budget {
+            2_000
+        } else {
+            // "Effectively unlimited", but NOT `u64::MAX`: dynarmic compares
+            // `cycles_remaining` with a signed `cmp`/`jg`, so any budget above
+            // `i64::MAX` reads as already exhausted and every block returns to
+            // the dispatcher. See
+            // `a_cycle_budget_above_i64_max_reads_as_already_spent`.
+            i64::MAX as u64
+        }
+    }
+
+    fn halts(self) -> bool {
+        self != Self::Budget
+    }
+}
+
+/// Runs one cell of the stoppability matrix and exits 0 if the guest was
+/// stopped by the escape under test, [`EXIT_WEDGED`] if it was not.
+///
+/// A watchdog thread ends the process either way. Without it a wedged child
+/// outlives whatever spawned it, and on Windows an orphan that inherited a pipe
+/// holds that pipe open for good -- which is how a mutation run stops dead.
+fn runaway_case(shape: Shape, optimizations: u32, escape: Escape) {
     let vm = Vm::new(
-        code,
+        shape.code(),
         VmOptions {
-            cycle_counting: true,
+            cycle_counting: escape.cycle_counting(),
             optimizations,
             ..VmOptions::default()
         },
     );
-    vm.set_reg(30, CODE_BASE);
-    vm.start(2_000);
+    if shape == Shape::Indirect {
+        vm.set_reg(30, CODE_BASE);
+    }
+    vm.start(escape.budget());
 
-    let jit = vm.raw() as usize;
+    if escape.halts() {
+        let jit = vm.raw() as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            // SAFETY: the jit outlives this thread -- the main thread is
+            // blocked inside `od_jit_run` on it, and `od_jit_halt` only sets an
+            // atomic flag, which dynarmic documents as safe from any thread.
+            unsafe { od_jit_halt(jit as *mut std::ffi::c_void, OD_HALT_USER5) };
+        });
+    }
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        // SAFETY: the jit outlives this thread -- the main thread is blocked
-        // inside `od_jit_run` on it, and `od_jit_halt` only sets an atomic
-        // flag, which dynarmic documents as safe from any thread.
-        unsafe { od_jit_halt(jit as *mut std::ffi::c_void, OD_HALT_USER5) };
-    });
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        println!("runaway: neither the cycle budget nor od_jit_halt was honoured");
+        // Generous: every cell that does come back does so inside 350 ms.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        println!("{shape:?}/{optimizations:#06X}/{escape:?}: not stopped");
         std::process::exit(EXIT_WEDGED);
     });
 
-    // SAFETY: `vm.raw()` is live.
+    // SAFETY: `vm.raw()` is live and not executing.
     let hr = unsafe { od_jit_run(vm.raw()) };
     let remaining = vm.with_ctx(|c| c.ticks_remaining);
-    println!(
-        "runaway(optimizations={optimizations:#06X}) returned {hr:#010X},          {remaining} cycles left"
-    );
-    // Returning at all is the point. Either escape counts: a halt bit means the
-    // watchdog's `od_jit_halt` was seen, and an exhausted budget means the
-    // cycle counter was.
+    println!("{shape:?}/{optimizations:#06X}/{escape:?}: returned {hr:#010X}, {remaining} left");
+
+    // Each escape is checked on its own. A disjunction here would pass on
+    // whichever one happened to fire, which is how "stoppable" came to be
+    // claimed for a configuration in which only the budget worked.
+    match escape {
+        Escape::Budget => assert_eq!(
+            remaining, 0,
+            "the run returned, but not because the cycle budget ran out"
+        ),
+        Escape::Halt | Escape::HaltWithBudget => assert_eq!(
+            hr & OD_HALT_USER5,
+            OD_HALT_USER5,
+            "the run returned, but not because of od_jit_halt ({hr:#010X})"
+        ),
+    }
+}
+
+/// `OD_RUNAWAY_CASE`, as `<shape>:<optimizations hex>:<escape>`.
+fn runaway_case_from_env() -> (Shape, u32, Escape) {
+    let spec = std::env::var("OD_RUNAWAY_CASE").expect("OD_RUNAWAY_CASE");
+    let mut parts = spec.split(':');
+    let shape = match parts.next().unwrap() {
+        "direct-empty" => Shape::DirectEmpty,
+        "direct-body" => Shape::DirectBody,
+        "indirect" => Shape::Indirect,
+        other => panic!("unknown shape {other}"),
+    };
+    let optimizations = u32::from_str_radix(parts.next().unwrap(), 16).unwrap();
+    let escape = match parts.next().unwrap() {
+        "budget" => Escape::Budget,
+        "halt" => Escape::Halt,
+        "halt+budget" => Escape::HaltWithBudget,
+        other => panic!("unknown escape {other}"),
+    };
+    (shape, optimizations, escape)
+}
+
+#[test]
+fn a_cycle_budget_above_i64_max_reads_as_already_spent() {
+    // `EmitTerminalImpl(IR::Term::LinkBlock)` emits
+    // `cmp qword[... cycles_remaining], 0` followed by `jg`, and `jg` is the
+    // **signed** conditional. `GetTicksRemaining` returns a `u64`, so a caller
+    // that means "no limit" and returns `u64::MAX` hands dynarmic a value that
+    // compares as -1: every block falls through to `ForceReturnFromRunCode`
+    // and the guest is stopped after each one.
+    //
+    // That is correct and roughly two orders of magnitude slower, which is the
+    // failure mode this crate exists to make visible. `u64::MAX` is the
+    // obvious thing to write for "unlimited".
+    //
+    // MOVZ X0, #0                       D2800000
+    // ADD  X0, X0, #1                   91000400
+    // B    -1                           17FFFFFF
+    let code = vec![a64::movz(0, 0, 0), a64::add_imm(0, 0, 1), a64::b(-1)];
+
+    let progress = |budget: u64| -> u64 {
+        let vm = Vm::new(
+            code.clone(),
+            VmOptions {
+                cycle_counting: true,
+                ..VmOptions::default()
+            },
+        );
+        vm.start(budget);
+        // SAFETY: `vm.raw()` is live and not executing.
+        let hr = unsafe { od_jit_run(vm.raw()) };
+        assert_eq!(hr, 0, "no halt was requested");
+        vm.with_ctx(|c| c.ticks_used)
+    };
+
+    // One block's worth, then straight back out.
+    let over = progress(u64::MAX);
+    // A budget that reads as positive is spent in full. Five million rather
+    // than `i64::MAX`, because this guest never stops on its own and the test
+    // has to.
+    let under = progress(5_000_000);
+
     assert!(
-        hr != 0 || remaining == 0,
-        "the run returned without either escape firing"
+        over <= 4,
+        "a u64::MAX budget executed {over} cycles; the signed comparison \
+         appears to have been fixed, and the workaround can go"
+    );
+    // Spent in full, and then some: the cycle check is at the end of a block,
+    // so the block that crosses zero still runs.
+    assert!(
+        (5_000_000..5_000_016).contains(&under),
+        "a budget that reads as positive should be spent in full, got {under}"
     );
 }
 
 #[test]
-fn a_runaway_guest_is_stoppable_without_the_two_unchecked_terminal_handlers() {
+fn the_stoppability_matrix() {
+    // Which runaway guests a host can stop, by which mechanism, under which
+    // optimization flags. This is a defect report about the pin written as a
+    // table, and every cell is executed.
+    //
+    // Two places in dynarmic decide it, and they behave differently:
+    //
+    //  * `EmitTerminalImpl(IR::Term::LinkBlock)` (`a64_emit_x64.cpp:612-642`)
+    //    ends a **direct** branch. With `enable_cycle_counting` it compares
+    //    `cycles_remaining` and nothing else; without it, `halt_reason` and
+    //    nothing else. Exclusive: no configuration checks both.
+    //  * `PopRSBHint` and `FastDispatchHint` end an **indirect** branch. Their
+    //    handlers (`GenTerminalHandlers`, `a64_emit_x64.cpp:169`) compute a
+    //    location descriptor and jump, reading neither. Clearing
+    //    `ReturnStackBuffer` and `FastDispatch` sends them through
+    //    `ReturnFromRunCode` instead, which returns to the dispatcher, which
+    //    checks both.
+    //
+    // The A64 frontend only ever emits `LinkBlock`, never `LinkBlockFast`
+    // (`frontend/A64/translate/impl/a64_branch.cpp`), so a direct branch always
+    // takes the first path.
+    //
+    // When a cell stops matching, the pin has been fixed or patched and this
+    // table -- and `optimization::INTERRUPTIBLE` -- should be revisited.
+    let cases: [(&str, bool); 18] = [
+        // Direct branches. The optimization flags make no difference at all --
+        // both columns are identical -- and cycle counting picks which single
+        // escape exists. Arming both leaves the halt unchecked, so the third
+        // row of each pair is the guest a runtime cannot interrupt.
+        ("direct-empty:0000FFFF:budget", true),
+        ("direct-empty:0000FFFF:halt", true),
+        ("direct-empty:0000FFFF:halt+budget", false),
+        ("direct-empty:0000FFF9:budget", true),
+        ("direct-empty:0000FFF9:halt", true),
+        ("direct-empty:0000FFF9:halt+budget", false),
+        ("direct-body:0000FFFF:budget", true),
+        ("direct-body:0000FFFF:halt", true),
+        ("direct-body:0000FFFF:halt+budget", false),
+        ("direct-body:0000FFF9:budget", true),
+        ("direct-body:0000FFF9:halt", true),
+        ("direct-body:0000FFF9:halt+budget", false),
+        // Indirect branches. Nothing works under the defaults; everything works
+        // once the two unchecked handlers are out of the way, including the
+        // combination direct branches cannot do -- the dispatcher checks both.
+        ("indirect:0000FFFF:budget", false),
+        ("indirect:0000FFFF:halt", false),
+        ("indirect:0000FFFF:halt+budget", false),
+        ("indirect:0000FFF9:budget", true),
+        ("indirect:0000FFF9:halt", true),
+        ("indirect:0000FFF9:halt+budget", true),
+    ];
+    assert_eq!(optimization::ALL_SAFE, 0x0000_FFFF);
+    assert_eq!(optimization::INTERRUPTIBLE, 0x0000_FFF9);
+
     if is_child() {
-        runaway_guest(optimization::INTERRUPTIBLE);
+        let (shape, optimizations, escape) = runaway_case_from_env();
+        runaway_case(shape, optimizations, escape);
         return;
     }
-    let mut child =
-        spawn_child("a_runaway_guest_is_stoppable_without_the_two_unchecked_terminal_handlers");
-    let st = wait_up_to(&mut child, 60).expect("the child never exited at all");
-    assert_ne!(
-        st.code(),
-        Some(EXIT_WEDGED),
-        "with ReturnStackBuffer and FastDispatch cleared, a BR-to-self loop \
-         must be stopped by the cycle budget or by od_jit_halt"
+
+    let mut wrong = Vec::new();
+    for (spec, expected_stopped) in cases {
+        let mut child = spawn_child_with("the_stoppability_matrix", &[("OD_RUNAWAY_CASE", spec)]);
+        let st = wait_up_to(&mut child, 60).expect("the child never exited at all");
+        let stopped = st.success();
+        if stopped != expected_stopped {
+            wrong.push(format!(
+                "  {spec}: expected {}, got {} (exit {:?})",
+                if expected_stopped { "stopped" } else { "wedged" },
+                if stopped { "stopped" } else { "wedged" },
+                st.code()
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "stoppability changed:\n{}",
+        wrong.join("\n")
     );
-    assert!(st.success(), "the child failed for some other reason: {st}");
 }
 
 #[test]
-fn a_runaway_guest_is_unstoppable_with_dynarmics_default_optimizations() {
-    // This documents a defect in the pin, not a property we want.
+fn unbounded_guest_recursion_does_not_take_the_process_down() {
+    // Global Constraint 11 names three guest shapes -- unmapped jumps, garbage,
+    // and recursion without bound. This is the third.
     //
-    // `EmitTerminalImpl(IR::Term::PopRSBHint)` and
-    // `EmitTerminalImpl(IR::Term::FastDispatchHint)` jump to terminal handlers
-    // (`a64_emit_x64.cpp`, `GenTerminalHandlers`) that transfer straight to the
-    // next block's entry point. Neither handler reads `cycles_remaining` and
-    // neither reads `halt_reason`. So a guest `BR`/`RET` loop whose target
-    // stays in the return-stack buffer or the fast-dispatch cache ignores the
-    // step budget *and* ignores `od_jit_halt` from another thread, and the host
-    // thread is lost for good. Global Constraint 11: guest code is untrusted,
-    // and this is a denial of service it can reach in one instruction.
+    // `BL` to itself recurses without bound in the guest: it writes X30 and
+    // jumps, and nothing on the host side grows. The interesting version also
+    // pushes a frame each time, so the guest stack pointer walks down through
+    // the arena until it runs off the bottom -- which, with
+    // `silently_mirror_fastmem`, wraps rather than escaping the allocation.
     //
-    // If this test ever starts failing, the pin has been fixed or patched and
-    // `optimization::INTERRUPTIBLE` can be retired.
+    // 0: SUB  SP, SP, #16               D10043FF
+    // 1: STR  X30, [SP]                 F90003FE
+    // 2: BL   0  (to itself)            94000000
+    let code = vec![
+        a64::sub_imm(31, 31, 16),
+        a64::str_imm(30, 31, 0),
+        a64::bl(0),
+    ];
+    assert_eq!(code[0], 0xD100_43FF);
+    assert_eq!(code[1], 0xF900_03FE);
+    assert_eq!(code[2], 0x9400_0000);
+
     if is_child() {
-        runaway_guest(optimization::ALL_SAFE);
+        let vm = Vm::new(
+            code,
+            VmOptions {
+                cycle_counting: true,
+                // `BL` leaves through an indirect-dispatch terminal, so under
+                // the defaults the budget would not be honoured and this would
+                // wedge rather than testing anything. `the_stoppability_matrix`
+                // is where that is asserted; here the subject is the recursion.
+                optimizations: optimization::INTERRUPTIBLE,
+                ..VmOptions::default()
+            },
+        );
+        vm.set_sp(0xF_0000);
+        vm.start(200_000);
+        // SAFETY: `vm.raw()` is live and not executing.
+        let hr = unsafe { od_jit_run(vm.raw()) };
+        let remaining = vm.with_ctx(|c| c.ticks_remaining);
+        println!("recursion: hr {hr:#010X}, {remaining} cycles left");
+        assert_eq!(remaining, 0, "the cycle budget is what ended it");
         return;
     }
-    let mut child =
-        spawn_child("a_runaway_guest_is_unstoppable_with_dynarmics_default_optimizations");
+
+    let mut child = spawn_child("unbounded_guest_recursion_does_not_take_the_process_down");
     let st = wait_up_to(&mut child, 60).expect("the child never exited at all");
-    assert_eq!(
-        st.code(),
-        Some(EXIT_WEDGED),
-        "the runaway guest returned: the pin's unchecked terminal handlers \
-         appear to be fixed, so optimization::INTERRUPTIBLE is no longer needed"
+    assert!(
+        st.success(),
+        "200,000 guest calls, each pushing a frame, took the process down: {st}"
     );
 }
