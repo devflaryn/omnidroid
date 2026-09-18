@@ -488,6 +488,20 @@ difference between a viable runtime and an unusable one.
 - Guest PC is truncated to a sign-extended **56 bits**. Harmless for Windows and Android user-space
   addresses, but it is a real cap and is recorded here so nobody is surprised by it later.
 
+**Correction (Task 3): the cost of losing identity mapping is larger than first recorded, and the
+original figure measured the wrong thing.** This decision recorded 13.2x, from 5,207 versus 396
+Mguest-insn/s. Re-measured through Omnidroid's *real* callback path (n=31, release, two loop shapes,
+both degraded mechanisms): **30-49x**. Specifically 32.62x and 29.90x on a 40%-memory-dense loop, and
+49.06x and 44.45x on the 50%-dense loop the original figure used.
+
+The fast path reproduces the original within 3% (5,055 versus 5,207); it is the **callback** path that
+differs, by 3.5x (114 versus 396), because the original spike's callbacks were bare stubs while the
+runtime's do a `catch_unwind` plus a `GuestSpace` lookup per access. So **13.2x measured a floor, not
+the runtime's cost**, and the loss *rises* with memory density rather than falling.
+
+The practical consequence is that the startup assertion defends against a larger loss than this
+decision first claimed, which makes it more valuable, not less.
+
 Windows fault handling inside dynarmic is **frame-based SEH scoped to its code cache**, which means
 an Omnidroid-installed **vectored** exception handler runs first. Verified: Omnidroid's VEH took the
 fault (`veh_hits=1`) and dynarmic's slow path was never entered. Omnidroid therefore keeps ownership
@@ -790,9 +804,19 @@ Cost, **n=31**, release, on the D2 host:
 
 **The two costs scale differently, and that is the part to carry forward.** `0xFFF9`'s cost is **per
 indirect transfer** (about 3.9 ns), so it tracks branch mix and is **zero** for a guest with no
-indirect branches. `0xFFF8`'s additional cost is **per basic block**, so it tracks block *length* —
-these workloads use 4-instruction blocks, close to the worst case, so **7x is an upper bound** and real
-code with longer blocks pays less. Neither has been measured against `libroblox.so`.
+indirect branches. `0xFFF8`'s additional cost is **per basic block**, so it tracks block *length*.
+
+**Correction (Task 3).** This decision originally called 7x an upper bound, reasoning that the
+benchmarks used 4-instruction blocks while "real code has longer blocks". A static scan of
+`libroblox.so` shows **one control transfer every 4.30 words** — Roblox's blocks are *not* longer, they
+are the benchmark's length. So **7x is the expected cost for this guest, not a loose upper bound**, and
+the grounds for discounting it are withdrawn. That strengthens the case for `0xFFF9` over `0xFFF8`
+wherever `0xFFF9` suffices.
+
+For the other axis, `libroblox.so` measures **2.27% indirect, one indirect transfer every 44 words**.
+Both figures are **static instruction mixes**, while the cost model is per transfer *executed*, so they
+are proxies rather than measurements of the real cost: a static average cannot see the hot loop, which
+for Roblox means Luau dispatch and C++ virtual calls. Treat them as informative, not as bounds.
 
 **The practical consequence for the runtime:** under `0xFFFF` or `0xFFF9` with cycle counting on, a
 cross-thread halt of a direct-branch loop is not ignored forever — it is honoured **when the budget

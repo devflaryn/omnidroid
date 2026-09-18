@@ -209,10 +209,11 @@ execution of the same pages, measured at 162 ns per emit-and-execute cycle versu
 **The backend is dynarmic, pinned as a fork** (D5), behind the `GuestCpu` trait. The spike
 confirmed the central bet: `fastmem_pointer = 0` with `fastmem_address_space_bits = 64` emits
 `mov reg, [r13 + vaddr]` with `r13 = 0` — identity mapping at **zero** runtime cost, verified at a
-47-bit host VA with no slow-path callbacks. That path measured **13.2x** faster than routing memory
-through callbacks, so Omnidroid asserts this configuration at startup rather than trusting the
-default (which is 36 bits and silently degrades high addresses to the slow path while still
-producing correct results).
+47-bit host VA with no slow-path callbacks. Losing it costs **30-49x** (n=31, measured through the
+runtime's real callback path across two loop shapes and both degraded mechanisms; an earlier 13.2x
+figure measured a bare stub and is a floor). Omnidroid therefore asserts this configuration at startup
+rather than trusting the default, which is 36 bits and **silently degrades high addresses to the slow
+path while still producing correct results** — a loss no functional test can detect.
 
 Measured throughput is uneven and shapes what comes next: about **2.0x native** on memory-heavy
 code and **2.2x** on NEON/FP, but about **33x** on register-bound integer code, caused by per-block
