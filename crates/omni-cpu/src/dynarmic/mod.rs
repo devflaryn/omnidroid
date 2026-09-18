@@ -990,6 +990,21 @@ impl GuestCpu for DynarmicCpu {
         Ok(had)
     }
 
+    /// What this context costs, **and what this figure does not include**.
+    ///
+    /// It reports the guest TLS block, which is the only per-context allocation this backend makes
+    /// and owns. It does **not** include dynarmic's code cache, and that is a real omission rather
+    /// than a rounding: on Windows the cache is committed incrementally as code is emitted
+    /// (`BlockOfCode::EnsureMemoryCommitted`), so the figure that matters is a high-water mark that
+    /// grows with translated volume — and this pin exposes no way to read it. `code_cache_size` is a
+    /// reservation ceiling, not a charge, so reporting it here would overstate a fresh context by
+    /// three orders of magnitude and understate nothing.
+    ///
+    /// D5 measured **20-35 MiB committed per guest thread** against the 128 MiB default cache, so
+    /// the omitted term is the dominant one. The measured per-context commit charge for this
+    /// backend's defaults is in the Task 3 report and in `tests/bench.rs`; closing the gap properly
+    /// means exposing `committed_size` through the shim, which is `dynarmic-sys`'s to do and is
+    /// what Task 4's per-thread ceiling assertion needs.
     fn cost(&self) -> ContextCost {
         self.cost
     }

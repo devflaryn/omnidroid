@@ -215,6 +215,91 @@ fn the_cost_of_stopping_at_the_faulting_instruction() {
     );
 }
 
+/// **What a guest thread really costs in commit charge**, as against what [`GuestCpu::cost`]
+/// reports.
+///
+/// `cost()` reports the TLS block and says plainly that it omits dynarmic's code cache, because
+/// this pin exposes no way to read the cache's committed high-water mark. This measures the whole
+/// thing from the outside, which is the only way to say how large the omission is.
+///
+/// The counter is process-global, so the window is kept as narrow as the work allows and the figure
+/// is reported as a range rather than a point. Task 1 spent three rounds learning that lesson about
+/// this exact counter.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_commit_charge_of_a_guest_thread() {
+    const THREADS: usize = 8;
+    let guest = Guest::with_options(DynarmicOptions {
+        max_threads: THREADS as u32,
+        ..Default::default()
+    });
+    let entry = guest.load(&memory_loop(guest.data, 10_000));
+    guest.write_u64(guest.data, 1);
+    let sentinel = guest.code + harness::CODE_BYTES - 4;
+
+    let baseline = omni_mem::process_commit_charge().expect("commit charge");
+    let mut threads = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        threads.push(guest.backend.create_thread_with_tls().expect("a guest thread"));
+    }
+    let created = omni_mem::process_commit_charge().expect("commit charge");
+
+    // Now make each one translate something, since the cache commits as code is emitted.
+    for cpu in &mut threads {
+        cpu.set_return_sentinel(sentinel).expect("sentinel");
+        cpu.set_x(x(30), sentinel as u64);
+        cpu.run(entry, RunLimit::Unlimited).expect("the loop runs");
+    }
+    let warm = omni_mem::process_commit_charge().expect("commit charge");
+
+    let reported: usize = threads.iter().map(|c| c.cost().total()).sum();
+    drop(threads);
+    let after_drop = omni_mem::process_commit_charge().expect("commit charge");
+
+    println!("
+== per-guest-thread commit charge (n = 1 run, {THREADS} threads) ==");
+    println!("  after creating {THREADS} contexts : {:+} bytes ({:.3} MiB), {:.3} MiB/thread",
+        created as i64 - baseline as i64,
+        (created - baseline) as f64 / 1048576.0,
+        (created - baseline) as f64 / 1048576.0 / THREADS as f64);
+    println!("  after each has translated     : {:+} bytes ({:.3} MiB), {:.3} MiB/thread",
+        warm as i64 - baseline as i64,
+        (warm - baseline) as f64 / 1048576.0,
+        (warm - baseline) as f64 / 1048576.0 / THREADS as f64);
+    println!("  GuestCpu::cost() reports      : {reported} bytes total, {} per thread",
+        reported / THREADS);
+    println!("  after dropping them           : {:+} bytes", after_drop as i64 - baseline as i64);
+    println!(
+        "  The gap between the middle two lines is dynarmic's per-jit state, which this pin gives          no way to read. D5 measured 20-35 MiB/thread against the 128 MiB default cache; this          backend defaults to 8 MiB."
+    );
+
+    // Does the code cache size actually drive it? D5's risk 2 -- per-thread memory -- is recorded
+    // as a consequence of the code cache, and the obvious mitigation is a smaller one. This is the
+    // measurement that says whether that mitigation works.
+    println!("  per-thread charge against code_cache_size (4 contexts each, 1 run):");
+    for cache in [8u64 << 20, 32 << 20, 128 << 20] {
+        let guest = Guest::with_options(DynarmicOptions {
+            max_threads: 4,
+            code_cache_size: cache,
+            ..Default::default()
+        });
+        let before = omni_mem::process_commit_charge().expect("commit charge");
+        let held: Vec<_> =
+            (0..4).map(|_| guest.backend.create_thread_with_tls().expect("a thread")).collect();
+        let after = omni_mem::process_commit_charge().expect("commit charge");
+        println!(
+            "    code_cache_size {:>4} MiB : {:7.3} MiB/thread",
+            cache >> 20,
+            (after - before) as f64 / 1048576.0 / 4.0
+        );
+        drop(held);
+    }
+    println!(
+        "  If those figures do not track the cache size, the per-thread cost is not the cache.          `A64EmitX64` holds a `std::array<FastDispatchEntry, 0x100000>` -- a flat 16 MiB per jit,          allocated and zeroed in the constructor whether or not the FastDispatch optimization is          enabled, and this backend disables it.
+"
+    );
+}
+
 /// **What the sliced run loop costs.** The watchdog returns to the dispatcher every
 /// `SLICE_INSTRUCTIONS`; a short slice makes that visible and is the control.
 #[test]
