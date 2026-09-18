@@ -139,6 +139,148 @@ pub enum MemError {
         unmapped_end: GuestAddr,
     },
 
+    /// An alignment argument was larger than the guest address space, so no address could satisfy
+    /// it.
+    ///
+    /// Separate from [`MemError::Misaligned`] because the value is a perfectly good power of two and
+    /// the problem is its magnitude: the free-range search rounds up to it, which panics in a debug
+    /// build and wraps to a spurious "no space" in release.
+    #[error(
+        "`{operation}`: alignment {align:#x} is larger than the {space_len}-byte guest address \
+         space, so no address in it can satisfy the request"
+    )]
+    AlignmentTooLarge {
+        /// The operation that was called.
+        operation: &'static str,
+        /// The alignment that was asked for.
+        align: usize,
+        /// Length of the guest address space.
+        space_len: usize,
+    },
+
+    /// A commit would take this guest address space past its configured commit ceiling.
+    ///
+    /// Commit charge is the scarce resource (D10, Global Constraint 6), and every quantity that
+    /// decides how much to spend ultimately comes from a file: an eight-byte edit to a `PT_LOAD`'s
+    /// `p_memsz` was measured to turn a 16.7 MiB load into a 3.4 GiB one. This is the refusal that
+    /// stops it, and it names all four numbers so that a caller can tell "the limit is too low" from
+    /// "the request is absurd".
+    ///
+    /// Raise [`GuestSpaceConfig::max_committed`](crate::GuestSpaceConfig::max_committed) if the
+    /// instance legitimately needs more.
+    #[error(
+        "`{operation}`: committing {requested} bytes at {address:#x} would take this guest address \
+         space to {would_total} bytes of commit charge, past its ceiling of {limit} \
+         ({committed} bytes are committed now); commit charge is the scarce resource — raise \
+         GuestSpaceConfig::max_committed if this is legitimate"
+    )]
+    CommitCeiling {
+        /// The operation that was called.
+        operation: &'static str,
+        /// Start of the range whose commit was refused.
+        address: GuestAddr,
+        /// Bytes this single request asked to commit.
+        requested: usize,
+        /// Bytes already committed in this space.
+        committed: usize,
+        /// What the total would have become.
+        would_total: usize,
+        /// The configured ceiling.
+        limit: usize,
+    },
+
+    /// One commit request was larger than the per-request ceiling.
+    ///
+    /// A [`CommitPolicy::Eager`](crate::CommitPolicy::Eager) mapping commits its whole length in one
+    /// call, so in practice this is the refusal an oversized eager mapping gets — including the one
+    /// an attacker-controlled `p_memsz` produces. A
+    /// [`CommitPolicy::Lazy`](crate::CommitPolicy::Lazy) mapping commits one granule per call and
+    /// never reaches this, however large it is.
+    #[error(
+        "`{operation}`: a single commit of {requested} bytes at {address:#x} exceeds the \
+         {limit}-byte per-request ceiling; an eagerly-committed mapping is charged its whole length \
+         at once — map it lazily, or raise GuestSpaceConfig::max_commit_request"
+    )]
+    CommitRequestTooLarge {
+        /// The operation that was called.
+        operation: &'static str,
+        /// Start of the range whose commit was refused.
+        address: GuestAddr,
+        /// Bytes this single request asked to commit.
+        requested: usize,
+        /// The configured per-request ceiling.
+        limit: usize,
+    },
+
+    /// A [`CodeBlock`](crate::CodeBlock) minted by one arena was passed to another.
+    ///
+    /// The arena hands out plain `Copy` values that hold addresses rather than borrows, so a block
+    /// outlives the arena that made it as a *value* even though the memory it names does not. Without
+    /// an identity check, `let b = a.alloc(16)?; drop(a); other.write(&b, 0, &bytes)` would be a
+    /// write through an unmapped address expressible in entirely safe code — and per-thread code
+    /// caches (D5: 20–35 MiB each, not shared between threads) mean several live arenas is the
+    /// expected shape.
+    #[error(
+        "code arena: a block minted by arena {block_arena} was passed to arena {arena}; a block \
+         belongs to the arena that allocated it and names memory only that arena owns"
+    )]
+    ForeignBlock {
+        /// Identity of the arena the call was made on.
+        arena: u64,
+        /// Identity of the arena that minted the block.
+        block_arena: u64,
+    },
+
+    /// A block's recorded chunk does not hold it.
+    ///
+    /// Unreachable for a block this arena minted, and returned rather than asserted because the
+    /// alternative was an index panic and a `end - start` underflow that in a release build became a
+    /// huge page-aligned length handed to the OS.
+    #[error(
+        "code arena: a block at {write:#x}+{len:#x} names chunk {chunk} of {chunks}, which does not \
+         contain it"
+    )]
+    BlockOutsideChunk {
+        /// The block's writable address.
+        write: usize,
+        /// The block's length.
+        len: usize,
+        /// The chunk index the block records.
+        chunk: usize,
+        /// How many chunks the arena has.
+        chunks: usize,
+    },
+
+    /// A partial unmap of a file-backed view could not re-map a surviving piece, and the
+    /// copy-on-write content that piece held is gone.
+    ///
+    /// Windows cannot partially unmap a view, so the emulation unmaps the whole view and maps the
+    /// survivors again. Once the view is gone there is no way back: the survivors that were re-mapped
+    /// are intact, and a survivor whose re-map failed is free address space whose privatised pages
+    /// existed only in memory. The re-map is attempted for **every** survivor before this is
+    /// returned, so the loss is confined to the pieces named here, and the ranges are logged at
+    /// `error` level as well as carried in this variant. There is nothing to retry: the content is
+    /// not recoverable, and reporting that plainly is the only honest option.
+    #[error(
+        "`{operation}`: emulating a partial unmap of the view at {view_start:#x}+{view_len:#x} \
+         failed to re-map {lost_ranges} surviving range(s) holding {lost_bytes} bytes of \
+         copy-on-write content, which is unrecoverable; first failure: {source}"
+    )]
+    UnmapEmulationLostContent {
+        /// The operation that was called.
+        operation: &'static str,
+        /// Base of the view that was being partially unmapped.
+        view_start: GuestAddr,
+        /// Length of that view.
+        view_len: usize,
+        /// How many surviving ranges could not be re-mapped.
+        lost_ranges: usize,
+        /// How many bytes of preserved copy-on-write content were in them.
+        lost_bytes: usize,
+        /// The first failure, which is why the emulation could not finish.
+        source: Box<MemError>,
+    },
+
     /// The guest address space configuration is not usable.
     #[error("guest address space configuration: {field} is {value:#x}, which {reason}")]
     InvalidConfig {

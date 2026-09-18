@@ -61,6 +61,58 @@ pub const DEFAULT_SPACE_SIZE: usize = 4 * 1024 * 1024 * 1024;
 /// [`GuestSpaceConfig::commit_granule`] overrides it for a region known to be densely used.
 pub const DEFAULT_COMMIT_GRANULE: usize = 64 * 1024;
 
+/// The default ceiling on total commit charge one guest address space may hold: 2 GiB.
+///
+/// # Why a ceiling exists at all
+///
+/// Because commit charge is the scarce resource (D10, Global Constraint 6) and *every* quantity that
+/// decides how much of it to spend arrives, somewhere up the stack, from a file. The measured case:
+/// `p_memsz` of a `PT_LOAD` is attacker-controlled (D6 says a tampered library is the expected
+/// input), the ELF loader turns the part of it past `p_filesz` into an anonymous `.bss` mapping, and
+/// [`CommitPolicy::Eager`] commits a mapping in full. An **eight-byte** edit to `libroblox.so`'s
+/// `p_memsz` was measured to take +1026.004 MiB of commit charge at 1 GiB and **+3406.664 MiB at
+/// 3.3 GiB, with the load reporting success**, against the 16.7 MiB a stock load costs.
+///
+/// `omni-elf` bounds the image *span* against 4 GiB — but D10 measured address space as free, so
+/// that check guards the abundant resource and left the scarce one open. The bound belongs here
+/// instead, at the one place commit is actually performed, because every future consumer needs it:
+/// D5 measured dynarmic's per-thread code caches at 20–35 MiB **each** with no sharing between
+/// threads, and a loader-only fix would not cover them.
+///
+/// # Why 2 GiB
+///
+/// Chosen, not derived, and deliberately stated as a choice. It is half of
+/// [`DEFAULT_SPACE_SIZE`], which is what makes it a real bound: total commit can never exceed the
+/// space's own size anyway, so a ceiling at or above that size would be no ceiling at all. Above it
+/// sits everything measured: a whole `libroblox.so` costs 16.7 MiB, the largest legitimate figure in
+/// the foundation is the 1 GiB the D10 requirement test grows to, and a 32-thread guest's code
+/// caches would be 0.6–1.1 GiB — though those are arena sections and are charged elsewhere. Below it
+/// sits the tampered case, refused with a 1.6x margin at 1 GiB and a 5.3x margin at 3.3 GiB.
+///
+/// An instance that legitimately needs more says so in [`GuestSpaceConfig::max_committed`], and
+/// finds out by a typed [`MemError::CommitCeiling`] naming the request, the total and the limit
+/// rather than by taking the machine's commit limit with it.
+pub const DEFAULT_MAX_COMMITTED: usize = 2 * 1024 * 1024 * 1024;
+
+/// The default ceiling on a single commit request: 256 MiB.
+///
+/// The sharper half of the pair, and the one that catches the tampered `p_memsz` on its own. A
+/// [`CommitPolicy::Lazy`] mapping commits one granule — 64 KiB by default — per call, so this never
+/// binds on the lazy path however large the mapping is. A [`CommitPolicy::Eager`] mapping commits
+/// its **whole length in one call** by construction, so in practice this is the ceiling on how large
+/// an eagerly-committed mapping may be.
+///
+/// Chosen, not derived. Every eager mapping the foundation makes is far below it: `libroblox.so`'s
+/// `.bss` is 11.6 MB, its `.data` tail copies are a page or two each, and the largest eager mapping
+/// in any test is the 64 MiB chunk of the D10 requirement test. 256 MiB is 22x the real `.bss` and
+/// 4x the largest test mapping, and it refuses the measured 1 GiB tamper four times over.
+///
+/// It is the per-*request* limit and not a per-mapping one because a per-mapping total would have to
+/// be recomputed by walking that mapping's entries on every granule commit, which is quadratic in
+/// exactly the case lazy commit exists for. What a mapping accumulates over many granules is bounded
+/// by [`DEFAULT_MAX_COMMITTED`] instead.
+pub const DEFAULT_MAX_COMMIT_REQUEST: usize = 256 * 1024 * 1024;
+
 /// Whether a mapping's pages are committed up front or on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitPolicy {
@@ -113,6 +165,19 @@ pub struct GuestSpaceConfig {
     /// The lazy-commit granule. See [`DEFAULT_COMMIT_GRANULE`] for the measurements behind the
     /// default. Must be a non-zero multiple of the page size.
     pub commit_granule: usize,
+    /// Ceiling on the total commit charge this space may hold at once, in bytes. Non-zero.
+    ///
+    /// **This is the bound on the scarce resource**, and unlike [`size`](Self::size) it is very much
+    /// the number to economize on. See [`DEFAULT_MAX_COMMITTED`] for why it exists, what it is
+    /// measured against, and why the default is what it is. Reaching it is
+    /// [`MemError::CommitCeiling`].
+    pub max_committed: usize,
+    /// Ceiling on a single commit request, in bytes. Non-zero.
+    ///
+    /// See [`DEFAULT_MAX_COMMIT_REQUEST`]. In practice this is the ceiling on the size of an
+    /// eagerly-committed mapping, because [`CommitPolicy::Eager`] commits a mapping's whole length in
+    /// one call. Reaching it is [`MemError::CommitRequestTooLarge`].
+    pub max_commit_request: usize,
 }
 
 impl Default for GuestSpaceConfig {
@@ -121,6 +186,8 @@ impl Default for GuestSpaceConfig {
             size: DEFAULT_SPACE_SIZE,
             base_alignment: vm::allocation_granularity(),
             commit_granule: DEFAULT_COMMIT_GRANULE,
+            max_committed: DEFAULT_MAX_COMMITTED,
+            max_commit_request: DEFAULT_MAX_COMMIT_REQUEST,
         }
     }
 }
@@ -201,6 +268,13 @@ struct Inner {
     granule: usize,
     cursor: GuestAddr,
     released: bool,
+    /// Bytes of private committed memory this space currently holds, maintained incrementally
+    /// because [`Inner::commit_range`] has to know it on every granule and walking the map there
+    /// would make lazy commit quadratic. `validate` asserts it against a walk in debug builds, so a
+    /// drift is a failing test rather than a ceiling that quietly stops binding.
+    committed: usize,
+    max_committed: usize,
+    max_commit_request: usize,
 }
 
 static NEXT_MAPPING: AtomicU64 = AtomicU64::new(1);
@@ -263,6 +337,33 @@ impl GuestSpace {
                 reason: "must be a power of two",
             });
         }
+        // A ceiling of zero would refuse every commit, which is not a usable space; and there is no
+        // "unlimited" value, deliberately. Saturating or absent limits are how hostile input turns
+        // into a larger permission, which is backwards.
+        if config.max_committed == 0 {
+            return Err(MemError::InvalidConfig {
+                field: "max_committed",
+                value: 0,
+                reason: "must be greater than zero; commit charge is the scarce resource and this \
+                         space would be unable to commit anything",
+            });
+        }
+        if config.max_commit_request == 0 {
+            return Err(MemError::InvalidConfig {
+                field: "max_commit_request",
+                value: 0,
+                reason: "must be greater than zero; commit charge is the scarce resource and this \
+                         space would be unable to commit anything",
+            });
+        }
+        if config.max_commit_request > config.max_committed {
+            return Err(MemError::InvalidConfig {
+                field: "max_commit_request",
+                value: config.max_commit_request as u64,
+                reason: "must not exceed max_committed; a single request the total ceiling would \
+                         refuse anyway is a limit that never binds",
+            });
+        }
 
         let reservation = vm::reserve_placeholder(config.size, config.base_alignment)
             .map_err(platform("GuestSpace::with_config", 0, config.size))?;
@@ -285,6 +386,9 @@ impl GuestSpace {
                 granule: config.commit_granule,
                 cursor: base,
                 released: false,
+                committed: 0,
+                max_committed: config.max_committed,
+                max_commit_request: config.max_commit_request,
             }),
         })
     }
@@ -394,7 +498,23 @@ impl GuestSpace {
         );
 
         if commit == CommitPolicy::Eager && protection != Protection::None {
-            inner.commit_range(OP, address, size)?;
+            if let Err(error) = inner.commit_range(OP, address, size) {
+                // The mapping exists in the map and in the OS by now, so a failed commit has to
+                // undo it or the caller is handed an error *and* a mapping. That matters most for
+                // the case this path exists to refuse: a rejected commit ceiling must leave no
+                // address space claimed, or refusing a tampered library would itself become the
+                // denial of service.
+                if let Err(rollback) = inner.unmap_range(OP, address, size) {
+                    tracing::error!(
+                        %rollback,
+                        address = format_args!("{address:#x}"),
+                        size,
+                        "could not undo a mapping whose eager commit failed"
+                    );
+                }
+                inner.validate();
+                return Err(error);
+            }
         }
         inner.validate();
         tracing::debug!(
@@ -489,9 +609,10 @@ impl GuestSpace {
     /// Commit the granules covering `[address, address + len)` that are not committed yet.
     ///
     /// The lazy-commit driver. The request is expanded outwards to whole commit granules — measured
-    /// at 124 ns/page against 1810 ns/page for per-page commit and 381 ns for the unavoidable first
-    /// touch (see [`DEFAULT_COMMIT_GRANULE`]) — and clipped to the mapping, so committing one byte
-    /// of a mapping commits one granule of it and no more.
+    /// at 150 ns/page at the default 64 KiB granule against 2414 ns/page for per-page commit, and
+    /// 381 ns for the unavoidable first touch (see [`DEFAULT_COMMIT_GRANULE`] for the whole table) —
+    /// and clipped to the mapping, so committing one byte of a mapping commits one granule of it and
+    /// no more.
     ///
     /// Ranges that are already committed, are file-backed, hold a [`Protection::None`] mapping, or
     /// are free address space are skipped rather than rejected, so a caller serving a guest fault
@@ -788,6 +909,17 @@ impl GuestSpace {
                 required: 2,
             });
         }
+        // An alignment larger than the space cannot be satisfied by any address in it, and
+        // `find_free` rounds up to it: at `1 << 63` that computation panics in a debug build and
+        // wraps to a spurious `NoSpace` in release. Refused here with the value, which is the only
+        // answer that says what was wrong.
+        if align > self.len {
+            return Err(MemError::AlignmentTooLarge {
+                operation,
+                align,
+                space_len: self.len,
+            });
+        }
         Ok(())
     }
 }
@@ -821,7 +953,23 @@ impl Inner {
     #[inline]
     fn validate(&self) {
         #[cfg(debug_assertions)]
-        self.map.check_invariants();
+        {
+            self.map.check_invariants();
+            // The commit ceiling is only as good as the running total it is compared against, and
+            // that total is maintained by hand at four places. Asserting it against a walk of the
+            // map is what stops a missed decrement from quietly turning the ceiling off — or a
+            // missed increment from making it refuse legitimate commits later.
+            let walked: usize = self
+                .map
+                .iter()
+                .filter(|(_, entry)| matches!(entry.os, OsState::Private { .. }))
+                .map(|(_, entry)| entry.len)
+                .sum();
+            assert_eq!(
+                walked, self.committed,
+                "the running committed total drifted from the region map"
+            );
+        }
     }
 
     fn require_free(
@@ -896,7 +1044,11 @@ impl Inner {
         let fits = |run_start: GuestAddr, run_len: usize, lower: GuestAddr| -> Option<GuestAddr> {
             let run_end = run_start + run_len;
             let from = run_start.max(lower);
-            let candidate = (from + align - 1) & !(align - 1);
+            // Checked: rounding up to a large alignment near the top of the address space overflows,
+            // and the wrapped result would be a *lower* address that passes the range test below.
+            // `check_align_argument` already caps `align` at the space length, so this is the second
+            // line rather than the only one.
+            let candidate = from.checked_add(align - 1)? & !(align - 1);
             if candidate >= run_start && candidate < run_end && run_end - candidate >= len {
                 Some(candidate)
             } else {
@@ -1032,6 +1184,50 @@ impl Inner {
         Ok(())
     }
 
+    /// Refuse a commit that would break either ceiling.
+    ///
+    /// Called from [`Inner::commit_range`] immediately before the `vm::commit_placeholder` that would
+    /// spend the charge, which is the only place in this crate that spends any. Put here rather than
+    /// in a caller because every caller — the ELF loader today, the CPU backend's per-thread code
+    /// caches at M2 — needs the same bound, and a bound enforced by each caller separately is a bound
+    /// the next caller forgets.
+    fn check_commit_allowed(
+        &self,
+        operation: &'static str,
+        address: GuestAddr,
+        len: usize,
+    ) -> MemResult<()> {
+        if len > self.max_commit_request {
+            return Err(MemError::CommitRequestTooLarge {
+                operation,
+                address,
+                requested: len,
+                limit: self.max_commit_request,
+            });
+        }
+        // `committed` never exceeds the space size and `len` never exceeds `max_commit_request`, so
+        // this cannot overflow; `checked_add` says so rather than relying on it.
+        let would_total = self.committed.checked_add(len).ok_or(MemError::CommitCeiling {
+            operation,
+            address,
+            requested: len,
+            committed: self.committed,
+            would_total: usize::MAX,
+            limit: self.max_committed,
+        })?;
+        if would_total > self.max_committed {
+            return Err(MemError::CommitCeiling {
+                operation,
+                address,
+                requested: len,
+                committed: self.committed,
+                would_total,
+                limit: self.max_committed,
+            });
+        }
+        Ok(())
+    }
+
     /// Commit the granules covering `[address, address + len)` that are not committed yet.
     fn commit_range(
         &mut self,
@@ -1075,6 +1271,12 @@ impl Inner {
             let from = granule_start.max(start);
             let to = granule_end.min(entry_end);
 
+            // The ceilings, checked **before** the kernel call and before the placeholder is
+            // carved, because after either of those the charge has already been taken or the map has
+            // already been changed. Both are plain comparisons on `usize` with no saturation
+            // anywhere: a saturating limit converts hostile input into a larger permission.
+            self.check_commit_allowed(operation, from, to - from)?;
+
             self.make_exact_placeholder(operation, from, to - from, false)?;
             // SAFETY: `[from, to)` is now exactly one unreplaced placeholder piece, which is the
             // contract of `commit_placeholder`. It is inside this process's reservation and no
@@ -1086,6 +1288,7 @@ impl Inner {
                 .get_mut(from)
                 .expect("entry vanished")
                 .os = OsState::Private { idle: false };
+            self.committed += to - from;
             committed += to - from;
             position = to;
         }
@@ -1190,6 +1393,7 @@ impl Inner {
                     // and was measured to leave its neighbours' contents intact.
                     unsafe { vm::decommit_to_placeholder(start as *mut u8, entry.len) }
                         .map_err(platform(operation, start, entry.len))?;
+                    self.committed -= entry.len;
                     self.map.free_range(start, entry.len);
                     position = entry_end;
                 }
@@ -1223,8 +1427,25 @@ impl Inner {
     /// would privatise pages that are currently clean and shared, and D11's multi-instance argument
     /// rests on the guest library's text staying shared at near-zero commit charge.
     ///
-    /// The comparison runs **before** anything is unmapped, so a failure there leaves the view
-    /// untouched rather than half destroyed.
+    /// # What a failure costs, at each of the three stages
+    ///
+    /// The comparison runs **before** anything is unmapped, so a failure *there* leaves the view
+    /// untouched. That is the only stage with that property, and this comment used to claim it for the
+    /// whole operation.
+    ///
+    /// Once the view is unmapped there is no way back, because the pages that held the privatised
+    /// content are gone: the OS destroyed them with the view. So the two later stages are best-effort
+    /// and loud rather than transactional.
+    ///
+    /// * **A survivor cannot be re-mapped.** Its preserved content is unrecoverable. The remaining
+    ///   survivors are still attempted, so the loss is confined to that one piece, every lost range is
+    ///   logged at `error` level, and the call returns
+    ///   [`MemError::UnmapEmulationLostContent`] naming how many ranges and bytes went. The region map
+    ///   stays truthful — the range reads as free placeholder, which is what it is.
+    /// * **A survivor is re-mapped but its content cannot be protected back.** The content is intact
+    ///   and the range is left *writable*, so the region map is updated to record `ReadWrite` before
+    ///   the error is returned. A map that claimed the old protection would be a map that lies about
+    ///   protection, which is exactly what `validate` exists to prevent.
     fn unmap_view(
         &mut self,
         operation: &'static str,
@@ -1308,34 +1529,123 @@ impl Inner {
             .map_err(platform(operation, view_start, view_len))?;
         self.map.replace(view_start, view_len, Entry::free(view_len));
 
+        let mut first_error: Option<MemError> = None;
+        let mut lost_ranges = 0usize;
+        let mut lost_bytes = 0usize;
         for survivor in &survivors {
-            self.make_exact_placeholder(operation, survivor.start, survivor.len, true)?;
-            let backing = survivor.owner.backing.clone().expect("a view always has a backing");
-            let file_offset = survivor.owner.offset_at(survivor.start);
-            let view = self.map_view(
-                operation,
-                &backing,
-                file_offset,
-                survivor.start,
-                survivor.len,
-                survivor.owner.protection,
-            )?;
-            self.map.replace(
-                survivor.start,
-                survivor.len,
-                Entry {
-                    len: survivor.len,
-                    os: OsState::View { view },
-                    owner: Some(survivor.owner.clone()),
-                    ever_writable: survivor.ever_writable,
-                },
-            );
-            restore_copy_on_write(operation, &survivor.preserved, survivor.owner.protection)?;
+            let preserved_bytes: usize =
+                survivor.preserved.iter().map(|run| run.bytes.len()).sum();
+            match self.remap_survivor(operation, survivor) {
+                Ok(()) => {
+                    if let Err(failure) = restore_copy_on_write(
+                        operation,
+                        &survivor.preserved,
+                        survivor.owner.protection,
+                    ) {
+                        for &(address, len) in &failure.left_writable {
+                            tracing::error!(
+                                address = format_args!("{address:#x}"),
+                                len,
+                                wanted = %survivor.owner.protection,
+                                "a re-mapped range could not be protected back and is left \
+                                 writable; the region map now records that rather than what was \
+                                 asked for"
+                            );
+                            self.record_protection(operation, address, len, Protection::ReadWrite);
+                        }
+                        if first_error.is_none() {
+                            first_error = Some(failure.source);
+                        }
+                    }
+                }
+                Err(error) => {
+                    // The view is already gone, so the privatised pages this piece held no longer
+                    // exist anywhere. Nothing can recover them; the remaining survivors are still
+                    // attempted so the loss stays confined to this one.
+                    lost_ranges += 1;
+                    lost_bytes += preserved_bytes;
+                    tracing::error!(
+                        %error,
+                        address = format_args!("{:#x}", survivor.start),
+                        len = survivor.len,
+                        preserved_bytes,
+                        "a surviving piece of a partially unmapped view could not be mapped again; \
+                         any copy-on-write content it held is unrecoverable"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(source) = first_error {
+            if lost_ranges > 0 {
+                return Err(MemError::UnmapEmulationLostContent {
+                    operation,
+                    view_start,
+                    view_len,
+                    lost_ranges,
+                    lost_bytes,
+                    source: Box::new(source),
+                });
+            }
+            return Err(source);
         }
         // Everything of this view that fell inside the request is free now, so the unmap walk
         // continues past it. The view may have extended beyond the request in either direction;
         // those parts have been mapped again and must not be revisited.
         Ok(view_end.min(keep_out_end))
+    }
+
+    /// Map one surviving piece of a partially-unmapped view again, at the same address.
+    fn remap_survivor(&mut self, operation: &'static str, survivor: &Survivor) -> MemResult<()> {
+        self.make_exact_placeholder(operation, survivor.start, survivor.len, true)?;
+        let backing = survivor.owner.backing.clone().expect("a view always has a backing");
+        let file_offset = survivor.owner.offset_at(survivor.start);
+        let view = self.map_view(
+            operation,
+            &backing,
+            file_offset,
+            survivor.start,
+            survivor.len,
+            survivor.owner.protection,
+        )?;
+        self.map.replace(
+            survivor.start,
+            survivor.len,
+            Entry {
+                len: survivor.len,
+                os: OsState::View { view },
+                owner: Some(survivor.owner.clone()),
+                ever_writable: survivor.ever_writable,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record a protection the OS already has, without calling the OS.
+    ///
+    /// For the one case where the two have diverged and the OS is right: a protect that failed on the
+    /// way *back* from a copy-on-write write-back left the range writable. Boundary changes here are
+    /// bookkeeping splits of a live view, so they cannot fail.
+    fn record_protection(
+        &mut self,
+        operation: &'static str,
+        address: GuestAddr,
+        len: usize,
+        protection: Protection,
+    ) {
+        let _ = self.ensure_boundary(operation, address);
+        let _ = self.ensure_boundary(operation, address + len);
+        for start in self.map.starts_overlapping(address, len) {
+            let entry = self.map.get_mut(start).expect("entry vanished");
+            if start < address || start + entry.len > address + len {
+                continue;
+            }
+            if let Some(owner) = entry.owner.as_mut() {
+                owner.protection = protection;
+            }
+        }
     }
 
     fn mark_idle(&mut self, address: GuestAddr, len: usize) -> usize {
@@ -1377,6 +1687,7 @@ impl Inner {
                 .map_err(platform("reclaim_idle", start, len))?;
             let entry = self.map.get_mut(start).expect("entry vanished");
             entry.os = OsState::Placeholder;
+            self.committed -= len;
             reclaimed.bytes += len;
             reclaimed.granules += 1;
         }
@@ -1485,6 +1796,7 @@ impl Inner {
                     if let Err(error) = result {
                         fail(platform("close", start, entry.len)(error));
                     }
+                    self.committed -= entry.len;
                     self.map.free_range(start, entry.len);
                 }
                 OsState::View { view } => {
@@ -1713,32 +2025,63 @@ fn scan_for_copy_on_write(
     Ok(dirty)
 }
 
+/// What a failed write-back left behind.
+struct RestoreFailure {
+    /// The first failure, which is what the caller propagates.
+    source: MemError,
+    /// Ranges that are now *writable* although the caller asked for something else, because the
+    /// protect on the way back failed. The caller must record this in the region map: a map that
+    /// claims a protection the OS does not have is the thing `validate` exists to prevent.
+    left_writable: Vec<(GuestAddr, usize)>,
+}
+
 /// Write preserved copy-on-write content back into a re-mapped survivor.
 ///
 /// Each run is made writable, written, and returned to the protection the piece is recorded with.
 /// Writing through `Protection::ReadWrite` on a private file view is a copy-on-write write, so this
 /// privatises exactly the pages that were privatised before and leaves every clean page shared.
+///
+/// Best-effort across runs: the content is only in these heap buffers, so stopping at the first
+/// failure would throw away the runs after it. Every run is attempted, the first error is kept, and
+/// any range left writable is reported so the map can be told the truth.
 fn restore_copy_on_write(
     operation: &'static str,
     preserved: &[Dirty],
     protection: Protection,
-) -> MemResult<()> {
+) -> Result<(), Box<RestoreFailure>> {
+    let mut source: Option<MemError> = None;
+    let mut left_writable: Vec<(GuestAddr, usize)> = Vec::new();
     for run in preserved {
         let len = run.bytes.len();
         // SAFETY: the range is part of a live view this process has just mapped, and is page-aligned
         // and a whole number of pages because every mapping length here is.
-        unsafe { vm::protect(run.address as *mut u8, len, Protection::ReadWrite) }
-            .map_err(platform(operation, run.address, len))?;
+        if let Err(error) = unsafe { vm::protect(run.address as *mut u8, len, Protection::ReadWrite) }
+        {
+            // Nothing was written and nothing was changed, so this run is still at the protection the
+            // map records; only the content is lost.
+            if source.is_none() {
+                source = Some(platform(operation, run.address, len)(error));
+            }
+            continue;
+        }
         // SAFETY: the range is now writable and `len` bytes long, and the source is a heap buffer
         // that cannot overlap a mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(run.bytes.as_ptr(), run.address as *mut u8, len);
         }
-        // SAFETY: as above. Restoring the recorded protection keeps the region map truthful.
-        unsafe { vm::protect(run.address as *mut u8, len, protection) }
-            .map_err(platform(operation, run.address, len))?;
+        // SAFETY: as above. Restoring the recorded protection keeps the region map truthful — and
+        // when it fails, the map has to be corrected instead, which is what `left_writable` is for.
+        if let Err(error) = unsafe { vm::protect(run.address as *mut u8, len, protection) } {
+            left_writable.push((run.address, len));
+            if source.is_none() {
+                source = Some(platform(operation, run.address, len)(error));
+            }
+        }
     }
-    Ok(())
+    match source {
+        Some(source) => Err(Box::new(RestoreFailure { source, left_writable })),
+        None => Ok(()),
+    }
 }
 
 /// `[start, start + len)` minus `[hole_start, hole_end)`, as up to two surviving pieces.

@@ -322,6 +322,16 @@ impl EntryMap {
         // decides how large a map a development build keeps checking, and every test in this crate
         // works well below it.
         if self.entries.len() > 4096 {
+            // Visible rather than silent. A check that switches itself off is a check that stops
+            // holding exactly when the map is most fragmented, which is the state it exists to catch,
+            // so the fact that it has switched off has to appear in the log rather than be inferred
+            // from the code.
+            tracing::warn!(
+                entries = self.entries.len(),
+                limit = 4096,
+                "the region map's structural invariant check is being skipped: the map has more \
+                 entries than the O(n)-per-mutation walk is affordable for"
+            );
             return;
         }
         let mut expected = self.base;

@@ -62,8 +62,8 @@ mod region;
 mod space;
 
 pub use arena::{
-    ArenaConfig, ArenaStats, CodeArena, CodeBlock, DEFAULT_BLOCK_ALIGNMENT, DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_TOTAL,
+    ArenaConfig, ArenaId, ArenaStats, CodeArena, CodeBlock, DEFAULT_BLOCK_ALIGNMENT,
+    DEFAULT_CHUNK_SIZE, DEFAULT_MAX_TOTAL,
 };
 pub use backing::{Backing, BackingId};
 pub use budget::CommitBudget;
@@ -71,9 +71,24 @@ pub use error::{MemError, MemResult};
 pub use region::{RegionInfo, RegionKind};
 pub use space::{
     CommitPolicy, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId, Placement, Reclaimed,
-    SpaceStats, DEFAULT_COMMIT_GRANULE, DEFAULT_SPACE_SIZE,
+    SpaceStats, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED, DEFAULT_MAX_COMMIT_REQUEST,
+    DEFAULT_SPACE_SIZE,
 };
 
 /// Re-exported from `omni-platform` so that callers do not need to depend on it directly to name a
 /// protection. There is deliberately no writable-and-executable variant.
 pub use omni_platform::vm::{MapExecutability, Protection};
+
+/// This process's commit charge and working set, re-exported.
+///
+/// They are here so that a crate which only needs to *measure* memory does not have to depend on
+/// `omni-platform` to do it. That is not a convenience: a crate holding `omni_platform::vm` in scope
+/// also holds `vm::protect`, `vm::unmap` and `vm::map_file`, and those are unsafe to call on a guest
+/// address without the region map that only this crate has — `vm::protect` in particular bypasses
+/// the `ever_writable` gate that makes copy-on-write content survive a partial unmap. `omni-elf`
+/// wanted `process_commit_charge` and nothing else, and paid for it with the whole seam in reach.
+///
+/// Commit charge is the number the memory design budgets against (D10, Global Constraint 6), so
+/// tests assert what an operation actually cost rather than assuming; working set is exposed beside
+/// it so the difference between *committed* and *touched* can be demonstrated rather than argued.
+pub use omni_platform::vm::{process_commit_charge, process_working_set};

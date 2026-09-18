@@ -1076,3 +1076,246 @@ fn a_partial_unmap_does_not_preserve_content_in_the_part_it_unmaps() {
     }
     assert_tiles_the_space(&space);
 }
+
+// -------------------------------------------------------------------------------------------
+// The commit ceilings. Commit charge is the scarce resource (D10, Global Constraint 6), and every
+// quantity that decides how much of it to spend arrives, somewhere up the stack, from a file.
+// -------------------------------------------------------------------------------------------
+
+/// An eager mapping larger than the per-request ceiling is refused, and nothing is left behind.
+///
+/// This is the shape of the Critical defect it exists to stop: an eight-byte edit to a `PT_LOAD`'s
+/// `p_memsz` in `libroblox.so` became a `.bss` mapping of 1 GiB and then of 3.3 GiB, committed
+/// eagerly, measured at **+1026.004 MiB** and **+3406.664 MiB** of commit charge — with the load
+/// returning success. `omni-elf` bounded the image *span*, but D10 measured address space as free, so
+/// that check guarded the abundant resource and left the scarce one open.
+#[test]
+fn an_eager_mapping_past_the_per_request_ceiling_is_refused() {
+    let space = GuestSpace::with_config(GuestSpaceConfig {
+        size: 64 * MIB,
+        max_committed: 32 * MIB,
+        max_commit_request: 4 * MIB,
+        ..GuestSpaceConfig::default()
+    })
+    .expect("reserve");
+
+    let error = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            8 * MIB,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect_err("an eager mapping twice the per-request ceiling must be refused");
+    match error {
+        MemError::CommitRequestTooLarge { requested, limit, .. } => {
+            assert_eq!(requested, 8 * MIB, "the error names what was asked for");
+            assert_eq!(limit, 4 * MIB, "and what is permitted");
+        }
+        other => panic!("expected CommitRequestTooLarge, got {other}"),
+    }
+    // Refusing must not itself leak: a loader that reserved 109 MB per rejected library would be its
+    // own denial of service, so the failed mapping is rolled back rather than left claimed.
+    let stats = space.stats();
+    assert_eq!(stats.mapped, 0, "the refused mapping is not left claimed");
+    assert_eq!(stats.committed, 0, "and nothing is committed");
+    assert_tiles_the_space(&space);
+
+    // The same size lazily is fine, because a lazy mapping commits one granule per call. Address
+    // space is free; commit charge is not.
+    space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            8 * MIB,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("the same mapping lazily costs nothing and is allowed");
+    assert_eq!(space.stats().committed, 0);
+    space.close().expect("close");
+}
+
+/// The total ceiling bounds what many mappings accumulate, which is what the per-request ceiling
+/// cannot see: sixteen mappings each just under the per-request limit would otherwise add up.
+#[test]
+fn the_total_ceiling_bounds_what_many_mappings_accumulate() {
+    let space = GuestSpace::with_config(GuestSpaceConfig {
+        size: 64 * MIB,
+        max_committed: 8 * MIB,
+        max_commit_request: 4 * MIB,
+        ..GuestSpaceConfig::default()
+    })
+    .expect("reserve");
+
+    for round in 0..2 {
+        space
+            .map_anonymous(
+                Placement::Anywhere { align: 64 * KIB },
+                4 * MIB,
+                Protection::ReadWrite,
+                CommitPolicy::Eager,
+            )
+            .unwrap_or_else(|e| panic!("round {round} is within both ceilings: {e}"));
+    }
+    assert_eq!(space.stats().committed, 8 * MIB, "the ceiling is reached exactly");
+
+    let error = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            4 * MIB,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect_err("the third mapping passes the total ceiling");
+    match error {
+        MemError::CommitCeiling { requested, committed, would_total, limit, .. } => {
+            assert_eq!(requested, 4 * MIB);
+            assert_eq!(committed, 8 * MIB, "the error names what is already committed");
+            assert_eq!(would_total, 12 * MIB, "and what the total would have become");
+            assert_eq!(limit, 8 * MIB, "and the limit");
+        }
+        other => panic!("expected CommitCeiling, got {other}"),
+    }
+    assert_eq!(space.stats().committed, 8 * MIB, "the refusal changed nothing");
+    assert_tiles_the_space(&space);
+    space.close().expect("close");
+}
+
+/// The total ceiling is enforced against a running total that comes *back down* when memory is
+/// released, so it bounds what is held rather than what has ever been committed.
+#[test]
+fn releasing_memory_gives_the_commit_ceiling_back() {
+    let space = GuestSpace::with_config(GuestSpaceConfig {
+        size: 64 * MIB,
+        max_committed: 4 * MIB,
+        max_commit_request: 4 * MIB,
+        ..GuestSpaceConfig::default()
+    })
+    .expect("reserve");
+
+    for round in 0..4 {
+        let address = space
+            .map_anonymous(
+                Placement::Anywhere { align: 64 * KIB },
+                4 * MIB,
+                Protection::ReadWrite,
+                CommitPolicy::Eager,
+            )
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        assert_eq!(space.stats().committed, 4 * MIB, "round {round}");
+        space.unmap(address, 4 * MIB).expect("unmap");
+        assert_eq!(space.stats().committed, 0, "round {round}: the total came back down");
+    }
+
+    // And `advise_idle` + `reclaim_idle`, the other path that returns commit charge.
+    let address = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            4 * MIB,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("map");
+    space.advise_idle(address, 4 * MIB).expect("advise");
+    let reclaimed = space.reclaim_idle().expect("reclaim");
+    assert_eq!(reclaimed.bytes, 4 * MIB);
+    assert_eq!(space.stats().committed, 0, "reclaim_idle returns the ceiling too");
+    space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            4 * MIB,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("the ceiling is available again");
+    space.close().expect("close");
+}
+
+/// Lazy commit accumulates against the total ceiling one granule at a time, and is refused when it
+/// arrives — not before, because a lazy mapping that is never touched costs nothing.
+#[test]
+fn lazy_commit_is_refused_when_it_reaches_the_total_ceiling() {
+    let granule = 64 * KIB;
+    let space = GuestSpace::with_config(GuestSpaceConfig {
+        size: 64 * MIB,
+        commit_granule: granule,
+        max_committed: 4 * granule,
+        max_commit_request: 4 * granule,
+        ..GuestSpaceConfig::default()
+    })
+    .expect("reserve");
+    let address = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            MIB,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a 1 MiB lazy mapping costs nothing, whatever the ceiling is");
+
+    for index in 0..4 {
+        let committed = space
+            .ensure_committed(address + index * granule, 1)
+            .unwrap_or_else(|e| panic!("granule {index}: {e}"));
+        assert_eq!(committed, granule, "granule {index}");
+    }
+    let error = space
+        .ensure_committed(address + 4 * granule, 1)
+        .expect_err("the fifth granule passes the ceiling");
+    assert!(
+        matches!(error, MemError::CommitCeiling { .. }),
+        "expected CommitCeiling, got {error}"
+    );
+    assert_eq!(space.stats().committed, 4 * granule);
+    assert_tiles_the_space(&space);
+    space.close().expect("close");
+}
+
+/// An alignment larger than the space is refused instead of overflowing the free-range search.
+///
+/// `check_align_argument` accepted any power of two, and the search then computed
+/// `(from + align - 1) & !(align - 1)`: at `1 << 63` that panics in a debug build and wraps to a
+/// spurious `NoSpace` in release, which is a wrong answer rather than a refusal.
+#[test]
+fn an_absurd_alignment_is_refused_rather_than_wrapping() {
+    let space = space(4 * MIB);
+    for align in [1usize << 62, 1usize << 63, 8 * MIB] {
+        let error = space
+            .map_anonymous(
+                Placement::Anywhere { align },
+                4 * KIB,
+                Protection::ReadWrite,
+                CommitPolicy::Lazy,
+            )
+            .expect_err("an alignment larger than the space cannot be satisfied");
+        match error {
+            MemError::AlignmentTooLarge { align: reported, space_len, .. } => {
+                assert_eq!(reported, align);
+                assert_eq!(space_len, 4 * MIB);
+            }
+            other => panic!("expected AlignmentTooLarge for {align:#x}, got {other}"),
+        }
+        // A `Hint` placement routes through the same check.
+        assert!(matches!(
+            space
+                .map_anonymous(
+                    Placement::Hint { address: space.base(), align },
+                    4 * KIB,
+                    Protection::ReadWrite,
+                    CommitPolicy::Lazy,
+                )
+                .expect_err("as does a hint"),
+            MemError::AlignmentTooLarge { .. }
+        ));
+    }
+    // The largest alignment that *is* satisfiable still works.
+    space
+        .map_anonymous(
+            Placement::Anywhere { align: 4 * MIB },
+            4 * KIB,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("an alignment equal to the space is satisfiable at its base");
+    space.close().expect("close");
+}

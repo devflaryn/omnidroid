@@ -1,5 +1,7 @@
 //! The JIT code arena: dual-mapped, so no page is ever writable and executable at once.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use omni_platform::vm::{self, Protection, SharedSection};
 use parking_lot::Mutex;
 
@@ -61,6 +63,18 @@ pub struct ArenaStats {
     pub wasted: usize,
 }
 
+/// Identity of a [`CodeArena`], carried by every [`CodeBlock`] it mints.
+///
+/// It exists because a block is a plain `Copy` value holding addresses rather than a borrow, so the
+/// compiler cannot tell one arena's block from another's — and per-thread code caches mean several
+/// live arenas is the expected shape (D5 measured 20–35 MiB of code cache per guest thread, not
+/// shared between threads). Every arena operation that dereferences a block's address checks this
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArenaId(pub u64);
+
+static NEXT_ARENA: AtomicU64 = AtomicU64::new(1);
+
 /// A block of code memory, addressable for writing and for execution at two different addresses.
 ///
 /// The two addresses are views of the same physical pages: a store through
@@ -71,8 +85,19 @@ pub struct ArenaStats {
 ///
 /// `Send + Sync`, and a plain value: it holds addresses, not borrows. The arena owns the memory and
 /// keeps it alive for its own lifetime, and nothing frees an individual block.
+///
+/// # Why it carries an arena identity
+///
+/// Because it holds addresses rather than borrows, nothing in the type system ties a block to the
+/// arena that made it. So every operation that dereferences one — [`CodeArena::write`],
+/// [`CodeArena::seal`], [`CodeArena::unseal`] — checks [`arena`](CodeBlock::arena) against the
+/// arena it was called on and refuses a foreign block with [`MemError::ForeignBlock`]. Without that
+/// check `let b = a.alloc(16)?; drop(a); other.write(&b, 0, &bytes)` is expressible in safe Rust and
+/// writes through an unmapped address. The fields are private and there is no public constructor, so
+/// a block can only come from an [`alloc`](CodeArena::alloc) and its identity cannot be forged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeBlock {
+    arena: ArenaId,
     chunk: usize,
     write: usize,
     exec: usize,
@@ -80,6 +105,12 @@ pub struct CodeBlock {
 }
 
 impl CodeBlock {
+    /// Which arena minted this block.
+    #[must_use]
+    pub fn arena(&self) -> ArenaId {
+        self.arena
+    }
+
     /// Where to write the code. Writable, never executable.
     ///
     /// # Safety
@@ -165,6 +196,7 @@ struct Chunk {
 /// `Send + Sync`. [`alloc`](CodeArena::alloc) takes a short lock; writing into a block afterwards
 /// takes none, because a block is a private range of memory that no other allocation can overlap.
 pub struct CodeArena {
+    id: ArenaId,
     config: ArenaConfig,
     page: usize,
     granularity: usize,
@@ -210,12 +242,31 @@ impl CodeArena {
                 reason: "must be at least one chunk",
             });
         }
+        // An alignment larger than a chunk can never be satisfied inside one, so every allocation
+        // would get a chunk of its own — `1 << 62` was accepted and then produced exactly that, which
+        // looks like it works and is a 4 EiB-per-block arena. It also overflows the round-up in
+        // `carve`. Refused with the value, rather than silently degrading.
+        if config.block_alignment > config.chunk_size {
+            return Err(MemError::InvalidConfig {
+                field: "block_alignment",
+                value: config.block_alignment as u64,
+                reason: "must not exceed chunk_size; no address inside a chunk could satisfy it, so \
+                         every block would take a chunk of its own",
+            });
+        }
         Ok(Self {
+            id: ArenaId(NEXT_ARENA.fetch_add(1, Ordering::Relaxed)),
             config,
             page: vm::page_size(),
             granularity: vm::allocation_granularity(),
             inner: Mutex::new(Vec::new()),
         })
+    }
+
+    /// This arena's identity, as carried by every [`CodeBlock`] it mints.
+    #[must_use]
+    pub fn id(&self) -> ArenaId {
+        self.id
     }
 
     /// The configuration in force.
@@ -241,7 +292,7 @@ impl CodeArena {
         // Fit into an existing chunk if one has room. Most recent first: the translator emits in
         // bursts, so the newest chunk is almost always the one with space.
         for index in (0..chunks.len()).rev() {
-            if let Some(block) = Self::carve(&mut chunks[index], index, size, align) {
+            if let Some(block) = self.carve(&mut chunks[index], index, size, align) {
                 return Ok(block);
             }
         }
@@ -266,7 +317,8 @@ impl CodeArena {
 
         let mut chunk = self.new_chunk(chunk_len)?;
         let index = chunks.len();
-        let block = Self::carve(&mut chunk, index, size, align)
+        let block = self
+            .carve(&mut chunk, index, size, align)
             .expect("a fresh chunk is at least as large as the block that asked for it");
         chunks.push(chunk);
         tracing::debug!(
@@ -286,13 +338,18 @@ impl CodeArena {
     ///
     /// Writes go through the writable view, so they are visible through
     /// [`CodeBlock::exec_ptr`](CodeBlock::exec_ptr) as soon as the store retires. Safe, because the
-    /// bounds are checked against the block and a block is memory the arena owns and never hands
-    /// out twice.
+    /// block belongs to this arena — checked — and because the bounds are checked against the block,
+    /// which is memory the arena owns and never hands out twice.
+    ///
+    /// Takes no lock: the identity check is a field comparison, and a block of *this* arena always
+    /// names memory this arena has mapped for as long as it lives.
     ///
     /// # Errors
     ///
+    /// [`MemError::ForeignBlock`] if the block was minted by a different arena, or
     /// [`MemError::BlockOverflow`] if the write would run past the end of the block.
     pub fn write(&self, block: &CodeBlock, offset: usize, bytes: &[u8]) -> MemResult<()> {
+        self.check_own(block)?;
         if offset > block.len || bytes.len() > block.len - offset {
             return Err(MemError::BlockOverflow {
                 offset,
@@ -328,6 +385,7 @@ impl CodeArena {
     ///
     /// # Errors
     ///
+    /// [`MemError::ForeignBlock`] if the block was minted by a different arena, or
     /// [`MemError::Platform`] if the protection change fails.
     pub fn seal(&self, block: &CodeBlock) -> MemResult<()> {
         self.reprotect(block, Protection::Read)
@@ -344,6 +402,7 @@ impl CodeArena {
     ///
     /// # Errors
     ///
+    /// [`MemError::ForeignBlock`] if the block was minted by a different arena, or
     /// [`MemError::Platform`] if the protection change fails.
     pub fn unseal(&self, block: &CodeBlock) -> MemResult<()> {
         self.reprotect(block, Protection::ReadWrite)
@@ -364,18 +423,43 @@ impl CodeArena {
 
     // -------------------------------------------------------------------------------------------
 
-    fn carve(chunk: &mut Chunk, index: usize, size: usize, align: usize) -> Option<CodeBlock> {
-        let start = (chunk.used + align - 1) & !(align - 1);
+    fn carve(
+        &self,
+        chunk: &mut Chunk,
+        index: usize,
+        size: usize,
+        align: usize,
+    ) -> Option<CodeBlock> {
+        // Checked: `block_alignment` is capped at `chunk_size` by `with_config`, so this cannot
+        // overflow today, but the round-up is the exact shape that wrapped past the limit check in
+        // `alloc` before it was made checked.
+        let start = chunk.used.checked_add(align - 1)? & !(align - 1);
         if start >= chunk.len || chunk.len - start < size {
             return None;
         }
         chunk.used = start + size;
         Some(CodeBlock {
+            arena: self.id,
             chunk: index,
             write: chunk.write + start,
             exec: chunk.exec + start,
             len: size,
         })
+    }
+
+    /// Refuse a block another arena minted.
+    ///
+    /// The whole soundness of the safe [`write`](CodeArena::write) rests on this: a block's addresses
+    /// are only live for as long as *its* arena is, and a block is otherwise indistinguishable from
+    /// one of ours.
+    fn check_own(&self, block: &CodeBlock) -> MemResult<()> {
+        if block.arena != self.id {
+            return Err(MemError::ForeignBlock {
+                arena: self.id.0,
+                block_arena: block.arena.0,
+            });
+        }
+        Ok(())
     }
 
     fn new_chunk(&self, len: usize) -> MemResult<Chunk> {
@@ -413,8 +497,32 @@ impl CodeArena {
     }
 
     fn reprotect(&self, block: &CodeBlock, protection: Protection) -> MemResult<()> {
+        self.check_own(block)?;
         let chunks = self.inner.lock();
-        let chunk = &chunks[block.chunk];
+        // Was `chunks[block.chunk]`, which panicked for an out-of-range index, and then computed
+        // `end - start` guarded only by a `debug_assert!` — so in a release build a block whose
+        // `write` sat below `chunk.write` underflowed that subtraction into a huge page-aligned
+        // length and handed it to `vm::protect`. Both are now refusals. Unreachable for a block this
+        // arena minted, which is what `check_own` above establishes; this is the second line.
+        let chunk = chunks.get(block.chunk).ok_or(MemError::BlockOutsideChunk {
+            write: block.write,
+            len: block.len,
+            chunk: block.chunk,
+            chunks: chunks.len(),
+        })?;
+        let outside = block.write < chunk.write
+            || block
+                .write
+                .checked_add(block.len)
+                .is_none_or(|end| end > chunk.write + chunk.len);
+        if outside {
+            return Err(MemError::BlockOutsideChunk {
+                write: block.write,
+                len: block.len,
+                chunk: block.chunk,
+                chunks: chunks.len(),
+            });
+        }
         let start = (block.write & !(self.page - 1)).max(chunk.write);
         let end = ((block.write + block.len + self.page - 1) & !(self.page - 1))
             .min(chunk.write + chunk.len);

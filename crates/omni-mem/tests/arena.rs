@@ -367,3 +367,118 @@ fn an_absurd_allocation_size_is_refused_rather_than_overflowing_the_limit_check(
     arena.alloc(64).expect("the arena still works");
     assert_eq!(arena.stats().chunks, 1, "no chunk should have been created for a refused request");
 }
+
+// -------------------------------------------------------------------------------------------
+// Arena identity. A `CodeBlock` is a plain `Copy` value holding addresses rather than a borrow, so
+// nothing in the type system tied one to the arena that made it — and per-thread code caches (D5:
+// 20-35 MiB each, not shared between threads) mean several live arenas is M2's expected shape.
+// -------------------------------------------------------------------------------------------
+
+/// A block minted by one arena is refused by another, through every operation that dereferences it.
+///
+/// Without this check `let b = a.alloc(16)?; drop(a); other.write(&b, 0, &bytes)` is expressible in
+/// **safe** Rust and writes through an unmapped address: `write` bounds-checks only against
+/// `block.len` and then stores at `block.write + offset`, which it never verifies belongs to this
+/// arena. `reprotect` was worse — it indexed `chunks[block.chunk]`, which panics for an out-of-range
+/// index, and then computed `end - start` behind a `debug_assert!`, so in a release build a foreign
+/// address below `chunk.write` underflowed into a huge page-aligned length handed to `vm::protect`.
+#[test]
+fn a_block_from_another_arena_is_refused_by_every_operation() {
+    let one = CodeArena::new().expect("arena one");
+    let two = CodeArena::with_config(ArenaConfig {
+        // A different chunk size, so the two arenas cannot accidentally agree on anything.
+        chunk_size: 2 * MIB,
+        ..ArenaConfig::default()
+    })
+    .expect("arena two");
+    assert_ne!(one.id(), two.id(), "each arena has its own identity");
+
+    let block = one.alloc(64).expect("allocate from arena one");
+    assert_eq!(block.arena(), one.id(), "a block carries the identity of its arena");
+    assert_ne!(block.arena(), two.id());
+
+    // Its own arena accepts it.
+    one.write(&block, 0, &[0xCC; 64]).expect("its own arena writes it");
+    one.seal(&block).expect("its own arena seals it");
+    one.unseal(&block).expect("and unseals it");
+
+    // The other refuses it, and says whose block it is.
+    for (label, result) in [
+        ("write", two.write(&block, 0, &[0xCC; 64])),
+        ("seal", two.seal(&block)),
+        ("unseal", two.unseal(&block)),
+    ] {
+        match result {
+            Err(MemError::ForeignBlock { arena, block_arena }) => {
+                assert_eq!(arena, two.id().0, "{label}: the arena that refused");
+                assert_eq!(block_arena, one.id().0, "{label}: the arena that minted the block");
+            }
+            Err(other) => panic!("{label}: expected ForeignBlock, got {other}"),
+            Ok(()) => panic!("{label} accepted a block from another arena"),
+        }
+    }
+
+    // A zero-length write is refused for a foreign block too: the identity check comes before the
+    // early return, because "nothing happened" is not a reason to accept a block that is not ours.
+    assert!(matches!(two.write(&block, 0, &[]), Err(MemError::ForeignBlock { .. })));
+
+    // And the refusals cost the refusing arena nothing: it never touched a chunk.
+    assert_eq!(two.stats().chunks, 0, "arena two never allocated anything");
+}
+
+/// The block of a *dropped* arena is refused by a surviving one, which is the use-after-free the
+/// identity check exists to stop. Nothing here dereferences the stale address.
+#[test]
+fn a_block_outliving_its_arena_cannot_be_used_through_a_different_arena() {
+    let survivor = CodeArena::new().expect("survivor");
+    let stale = {
+        let short_lived = CodeArena::new().expect("short-lived");
+        short_lived.alloc(4096).expect("allocate")
+        // `short_lived` is dropped here, and its two views are unmapped. `stale` is still a
+        // perfectly good value naming addresses that no longer exist.
+    };
+    assert_ne!(stale.arena(), survivor.id());
+    assert!(
+        matches!(survivor.write(&stale, 0, &[0x90; 16]), Err(MemError::ForeignBlock { .. })),
+        "a write through a dropped arena's block must be refused, not attempted"
+    );
+    assert!(matches!(survivor.seal(&stale), Err(MemError::ForeignBlock { .. })));
+    assert!(matches!(survivor.unseal(&stale), Err(MemError::ForeignBlock { .. })));
+}
+
+/// Two arenas emit and execute code at once, each keeping W^X, which is the shape per-thread code
+/// caches will have.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn two_arenas_emit_and_execute_independently_and_both_keep_w_xor_x() {
+    let arenas = [CodeArena::new().expect("one"), CodeArena::new().expect("two")];
+    let mut blocks = Vec::new();
+    for (index, arena) in arenas.iter().enumerate() {
+        let block = arena.alloc(16).expect("allocate");
+        arena
+            .write(&block, 0, &returns_constant(0x1000 + index as u32))
+            .expect("emit through the writable view");
+        // The two views are distinct address ranges in every arena, so no single address is ever
+        // both writable and executable.
+        assert_ne!(block.view_distance(), 0, "arena {index} has overlapping views");
+        blocks.push(block);
+    }
+    for (index, block) in blocks.iter().enumerate() {
+        // SAFETY: the block holds six bytes of `mov eax, imm32; ret`, emitted just above through the
+        // writable view of the same pages, and the executable view is `PAGE_EXECUTE_READ`. The
+        // function takes no arguments, touches no stack and returns in a register.
+        let f: extern "C" fn() -> u32 = unsafe { std::mem::transmute(block.exec_ptr()) };
+        assert_eq!(f(), 0x1000 + index as u32, "arena {index} executed its own code");
+    }
+    // Sealing one arena's block leaves the other arena's block writable: they share nothing.
+    arenas[0].seal(&blocks[0]).expect("seal");
+    arenas[1].write(&blocks[1], 0, &returns_constant(0x2001)).expect("the other is unaffected");
+    // SAFETY: as above; the block was just rewritten with a valid six-byte function.
+    let f: extern "C" fn() -> u32 = unsafe { std::mem::transmute(blocks[1].exec_ptr()) };
+    assert_eq!(f(), 0x2001, "the patched code runs through the executable view");
+    arenas[0].unseal(&blocks[0]).expect("unseal");
+    arenas[0].write(&blocks[0], 0, &returns_constant(0x3001)).expect("patch after unseal");
+    // SAFETY: as above.
+    let f: extern "C" fn() -> u32 = unsafe { std::mem::transmute(blocks[0].exec_ptr()) };
+    assert_eq!(f(), 0x3001);
+}

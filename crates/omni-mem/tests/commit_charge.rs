@@ -532,8 +532,10 @@ fn a_larger_commit_granule_is_dramatically_cheaper_per_page() {
 
     let four_kib = per_page[0].1;
     let sixty_four_kib = per_page[2].1;
-    // Measured on this machine: 1810 ns/page at a 4 KiB granule against 124 ns/page at 64 KiB, a
-    // factor of 15. The assertion is deliberately loose — it is testing the shape of the curve, not
+    // Measured on this machine: 2414 ns/page at a 4 KiB granule against 150 ns/page at 64 KiB, a
+    // factor of 16. (An earlier revision of this comment quoted 1810 and 124, from a run that
+    // predates the final commit path; `DEFAULT_COMMIT_GRANULE`'s table is the authority and these are
+    // its 4 KiB and 64 KiB rows.) The assertion is deliberately loose — it is testing the shape of the curve, not
     // the machine — but it is the reason the default is not the page size. For context, a page's
     // first touch costs about 381 ns here whatever the granule, and D10 measured a VEH demand-pager
     // at 2053 ns/fault.
