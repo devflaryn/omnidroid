@@ -391,10 +391,20 @@ unsafe extern "C" fn cb_icache_op(ctx: *mut c_void, op: u32, vaddr: u64) {
     }
 }
 
-/// `CNTPCT_EL0`. Monotonic and cheap; the guest uses it for timing, not for correctness.
+/// `CNTPCT_EL0`: the architectural counter, in `CNTFRQ_EL0` ticks since the process epoch.
+///
+/// **This returned `ctx.ticks_used` and was documented as monotonic.** It is not: `run` resets that
+/// counter at the top of every slice, so the value sawtoothed every million guest instructions, and
+/// its units were guest instructions against an advertised 600 MHz. See [`crate::clock`] for what a
+/// guest does with the difference; the short version is that a guest clock running backwards
+/// produces bugs that look like anything but a clock.
+///
+/// The context is not read at all now, which is why this takes no lock and cannot be affected by a
+/// slice boundary. It still goes through [`with`] so that the FFI discipline is uniform and a panic
+/// from `Instant::now` -- which does not panic -- could not unwind into generated code.
 unsafe extern "C" fn cb_get_cntpct(ctx: *mut c_void) -> u64 {
     // SAFETY: `ctx` is this backend's context.
-    unsafe { with(ctx, 0, |c| c.ticks_used) }
+    unsafe { with(ctx, 0, |_| crate::clock::cntpct()) }
 }
 
 /// Charge a slice's worth of guest instructions.

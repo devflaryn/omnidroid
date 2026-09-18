@@ -156,6 +156,30 @@ pub const NOP: u32 = 0xD503_201F;
 /// `UnallocatedEncoding`.
 pub const UNALLOCATED: u32 = 0x0000_0001;
 
+
+/// `MRS Xt, <system register>` — `1101 0101 0011 o0 op1:3 CRn:4 CRm:4 op2:3 Rt:5`, where
+/// `o0 = op0 - 2`. Spelled out rather than given as a constant so the two below can be checked
+/// against the ARM ARM field by field.
+pub const fn mrs(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+    0xD530_0000
+        | ((op0 - 2) << 19)
+        | (op1 << 16)
+        | (crn << 12)
+        | (crm << 8)
+        | (op2 << 5)
+        | rt
+}
+
+/// `MRS Xt, CNTFRQ_EL0` — `S3_3_C14_C0_0`. The frequency the counter below ticks at.
+pub const fn mrs_cntfrq_el0(rt: u32) -> u32 {
+    mrs(rt, 3, 3, 14, 0, 0)
+}
+
+/// `MRS Xt, CNTPCT_EL0` — `S3_3_C14_C0_1`. The architectural counter itself.
+pub const fn mrs_cntpct_el0(rt: u32) -> u32 {
+    mrs(rt, 3, 3, 14, 0, 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

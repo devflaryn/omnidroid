@@ -753,7 +753,11 @@ impl DynarmicCpu {
             monitor: shared.monitor.0,
             processor_id,
             code_cache_size: options.code_cache_size,
-            cntfrq_el0: 0,
+            // Programmed rather than left at 0, which would select dynarmic's own default. The
+            // default is the same 600 MHz, so nothing a guest can read changes -- but the counter
+            // `cb_get_cntpct` returns is scaled by this same constant, and two defaults that happen
+            // to agree is not the same thing as one constant used twice. See `crate::clock`.
+            cntfrq_el0: crate::clock::CNTFRQ_HZ,
             ctr_el0: 0,
             dczid_el0: 4,
             // The watchdog. See `crate::run`.

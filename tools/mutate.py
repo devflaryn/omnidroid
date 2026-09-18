@@ -47,6 +47,8 @@ CPU_REGS = "crates/omni-cpu/src/regs.rs"
 CPU_FASTMEM = "crates/omni-cpu/src/fastmem.rs"
 CPU_RUN = "crates/omni-cpu/src/run.rs"
 CPU_TLS = "crates/omni-cpu/src/tls.rs"
+CPU_CLOCK = "crates/omni-cpu/src/clock.rs"
+CPU_CALLBACKS = "crates/omni-cpu/src/dynarmic/callbacks.rs"
 CPU_DYN = "crates/omni-cpu/src/dynarmic/mod.rs"
 PAGER = "crates/omni-mem/src/pager.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
@@ -384,6 +386,32 @@ MUTATIONS = [
             });
         }
         self.with_ctx(|ctx| ctx.executable_cache = None);""",
+     CPU),
+
+    # ---- I3: the guest's architectural counter ---------------------------------------------------
+    # There is deliberately no row for leaving `cntfrq_el0` at 0 rather than programming
+    # `clock::CNTFRQ_HZ`. dynarmic's default for 0 is the same 600 MHz, so the mutation is a no-op on
+    # this pin and would MISS -- and a row that cannot fail is worse than no row. What the explicit
+    # programming buys is that the frequency and the scale are one constant; if either moves, the
+    # guest-side `the_guest_reads_the_frequency_the_backend_advertises` fails on the exact value.
+    ("cpu-A27", "A", "CNTPCT_EL0 goes back to the per-slice instruction counter", CPU_CALLBACKS,
+     """    unsafe { with(ctx, 0, |_| crate::clock::cntpct()) }""",
+     """    unsafe { with(ctx, 0, |c| c.ticks_used) }""",
+     CPU),
+
+    ("cpu-A34", "A", "the counter returns nanoseconds, so its units are not the advertised CNTFRQ",
+     CPU_CLOCK,
+     """    let ticks = nanos.saturating_mul(u128::from(CNTFRQ_HZ)) / NANOS_PER_SECOND;""",
+     """    let ticks = nanos;""",
+     CPU),
+
+    ("cpu-B8", "B", "the counter epoch made per host thread, so two guest threads disagree",
+     CPU_CLOCK,
+     """    let epoch = *EPOCH.get_or_init(Instant::now);""",
+     """    thread_local! {
+        static THREAD_EPOCH: Instant = Instant::now();
+    }
+    let epoch = THREAD_EPOCH.with(|e| *e);""",
      CPU),
 
     # ---- teardown: the three defects with no symptom where they happen ---------------------------

@@ -47,6 +47,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+mod clock;
 mod context;
 mod cpu;
 mod error;
@@ -58,6 +59,7 @@ mod regs;
 pub mod run;
 mod tls;
 
+pub use clock::{cntpct, CNTFRQ_HZ};
 pub use context::{
     ContextCost, GuestAddressSpace, GuestRange, GuestThreadConfig, TLS_SLOT_STACK_GUARD_OFFSET,
 };
