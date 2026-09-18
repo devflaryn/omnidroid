@@ -354,6 +354,78 @@ mod tests {
         assert_eq!(inner.examined.load(Ordering::Relaxed), 1, "this one did reach `resolve`");
     }
 
+    /// The zero-commit decision, driven directly so that it is **deterministic**.
+    ///
+    /// The concurrency test in `omni-cpu` found this bug, but it cannot be what pins it: it depends
+    /// on two guest threads faulting on the same 64 KiB granule in the same instant, which happens
+    /// often enough to find a defect and not often enough to be evidence. A mutation row backed by
+    /// it passed and failed on alternate runs — and Task 1's lesson is that a flaky test in a
+    /// mutation table is worse than no row, because it attributes a mutation to the wrong detector.
+    ///
+    /// So the decision function is called directly, with the two region kinds and the repeat.
+    #[test]
+    fn a_commit_that_committed_nothing_is_resolved_once_for_anonymous_memory() {
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let base = space.base();
+        let inner = PagerInner {
+            base,
+            end: space.end(),
+            space,
+            examined: AtomicU64::new(0),
+            resolved: AtomicU64::new(0),
+            bytes_committed: AtomicU64::new(0),
+            declined: AtomicU64::new(0),
+        };
+        let fault = Fault {
+            address: base + 0x2000,
+            access: FaultAccess::Write,
+            instruction_pointer: 0,
+        };
+        let region = |kind| crate::RegionInfo {
+            start: base,
+            len: 0x10000,
+            protection: Protection::ReadWrite,
+            kind,
+            committed: 0x10000,
+            mapping: None,
+            mapping_start: base,
+            mapping_len: 0x10000,
+        };
+
+        LAST_ZERO_COMMIT.with(|cell| cell.set(0));
+
+        // Anonymous, first time at this address: another thread committed the granule a moment ago,
+        // so the page IS accessible and retrying the instruction succeeds. Declining here is what
+        // handed the fault to dynarmic and put the block permanently on the callback path.
+        assert_eq!(
+            resolve_without_committing(&inner, &fault, &region(RegionKind::Anonymous)),
+            FaultOutcome::Resolved
+        );
+        assert_eq!(inner.resolved.load(Ordering::Relaxed), 1);
+
+        // Same address again on this thread: retrying did not help, so it becomes a typed guest
+        // fault rather than a loop. This is the bound on the one case that could otherwise spin.
+        assert_eq!(
+            resolve_without_committing(&inner, &fault, &region(RegionKind::Anonymous)),
+            FaultOutcome::NotOurs
+        );
+        assert_eq!(inner.declined.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.resolved.load(Ordering::Relaxed), 1, "and it is not counted twice");
+
+        // File-backed: no commit is owed, so a fault there means something this pager cannot fix.
+        LAST_ZERO_COMMIT.with(|cell| cell.set(0));
+        let file = RegionKind::File {
+            backing: crate::BackingId(1),
+            name: "libroblox.so".into(),
+            file_offset: 0,
+        };
+        assert_eq!(
+            resolve_without_committing(&inner, &fault, &region(file)),
+            FaultOutcome::NotOurs
+        );
+        assert_eq!(inner.declined.load(Ordering::Relaxed), 2);
+    }
+
     /// The permission table, pinned. Getting `Write` wrong here would make the pager commit a page
     /// the guest is not allowed to write, which is a silently granted permission rather than a
     /// crash — the exact shape Global Constraint 11 warns about.

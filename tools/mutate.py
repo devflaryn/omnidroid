@@ -390,6 +390,21 @@ MUTATIONS = [
         return FaultOutcome::NotOurs;
     }""",
      MEM_AND_CPU),
+
+    ("mem-A17", "A", "a zero-byte commit is declined again, so a concurrent fault leaves fastmem",
+     PAGER,
+     """    let anonymous = matches!(region.kind, RegionKind::Anonymous);
+    let repeated = LAST_ZERO_COMMIT.with(|cell| cell.replace(fault.address)) == fault.address;
+    if anonymous && !repeated {""",
+     """    let anonymous = matches!(region.kind, RegionKind::Anonymous);
+    let repeated = LAST_ZERO_COMMIT.with(|cell| cell.replace(fault.address)) == fault.address;
+    if false && anonymous && !repeated {""",
+     MEM_AND_CPU),
+
+    ("mem-B6", "B", "the pager commits the whole mapping so a page never faults twice", PAGER,
+     """    match inner.space.ensure_committed(fault.address, 1) {""",
+     """    match inner.space.ensure_committed(region.start, region.len) {""",
+     MEM_AND_CPU),
 ]
 
 
