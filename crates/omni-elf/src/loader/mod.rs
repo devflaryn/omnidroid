@@ -286,7 +286,9 @@ pub struct LoadStats {
     pub map_time: Duration,
     /// Binding every symbol in `.dynsym`.
     pub bind_time: Duration,
-    /// Decoding the relocation tables. For `libroblox.so` this is the `APS2` blob.
+    /// Decoding the relocation tables that are **materialised**: the plain `DT_RELA`, `DT_REL`,
+    /// `DT_RELR` and `DT_JMPREL` tables. The `APS2` blob is streamed into the relocation pass rather
+    /// than materialised, so its decode cost is inside [`Self::relocate_time`].
     pub decode_time: Duration,
     /// Applying relocations, windows included.
     pub relocate_time: Duration,
@@ -301,12 +303,13 @@ pub struct LoadStats {
     pub anonymous_bytes: usize,
     /// Process commit charge before the load, when measurement was enabled.
     pub commit_before: Option<u64>,
-    /// Process commit charge once the relocation tables are decoded and before any window is
-    /// opened.
+    /// Process commit charge once everything is mapped and the materialised relocation tables are
+    /// decoded, and before any relocation window is opened.
     ///
-    /// Measured separately because it is not guest memory: 568,806 `Elf64_Rela` records are 13.0 MB
-    /// of *host* `Vec`, and without this point the peak below cannot be told apart from the guest's
-    /// copy-on-write charge — which is the number the multi-instance requirement is about.
+    /// Measured separately so that the peak below can be told apart from the cost of mapping: the
+    /// difference between this and [`Self::commit_peak`] is the relocation pass's own copy-on-write
+    /// charge, which is the number the multi-instance requirement is about. For `libroblox.so` it is
+    /// 5.4 MiB — the relro region, which becomes private either way — against a 64 KiB window.
     pub commit_after_decode: Option<u64>,
     /// Peak process commit charge observed during the load.
     pub commit_peak: Option<u64>,
@@ -672,8 +675,13 @@ fn load_into(
     // -------------------------------------------------------------------------------------------
     // Relocate, in windows.
     // -------------------------------------------------------------------------------------------
+    // The packed blob is **streamed**, not materialised. 568,272 `Elf64_Rela` records are 13.6 MB
+    // of host `Vec`, and because it grows by doubling it measured 36.8 MB of commit charge at its
+    // peak — more than the entire rest of the load. The window machinery does not need the input
+    // sorted, only mostly-sorted, and the blob is: two descents out of 568,272, so streaming it
+    // costs 89 windows where sorting it first cost 87.
     let decode_started = Instant::now();
-    let mut tables = elf.relocations()?;
+    let mut tables = elf.unpacked_relocations()?;
     let decode_time = decode_started.elapsed();
     let commit_after_decode = if config.measure_commit {
         omni_platform::vm::process_commit_charge().ok()
@@ -690,12 +698,42 @@ fn load_into(
         config.relocation_window,
         config.measure_commit,
     )?;
-    for table in &mut tables.general {
-        relocator.apply_table(table)?;
-    }
-    if let Some(plt) = tables.plt.as_mut() {
-        relocator.apply_table(plt)?;
-    }
+    let applied = (|| -> LoadResult<()> {
+        if let Some(implicit) = elf.packed_has_implicit_addend() {
+            // The sink's error type is fixed to `ElfError`, so a loader-level refusal has to travel
+            // out of band. Anything else would throw away which relocation was refused and why.
+            let mut stopped: Option<LoadError> = None;
+            let summary = elf.decode_packed_with(|r| match relocator.feed(r, implicit, false) {
+                Ok(()) => Ok(()),
+                Err(LoadError::Elf(e)) => Err(e),
+                Err(other) => {
+                    stopped = Some(other);
+                    Err(crate::error::ElfError::RelocationSinkStopped)
+                }
+            });
+            if let Some(e) = stopped {
+                return Err(e);
+            }
+            let summary = summary?;
+            relocator.close()?;
+            tracing::debug!(
+                relocations = relocator.stats.packed,
+                bytes_consumed = summary.as_ref().map(|s| s.bytes_consumed),
+                "streamed the packed relocation blob"
+            );
+        }
+        for table in &mut tables.general {
+            relocator.apply_table(table)?;
+        }
+        if let Some(plt) = tables.plt.as_mut() {
+            relocator.apply_table(plt)?;
+        }
+        Ok(())
+    })();
+    // Always restore an open window's protection, even on the way out of a refusal.
+    let closed = relocator.close();
+    applied?;
+    closed?;
     let relocation_stats = relocator.stats;
     let relocate_time = relocate_started.elapsed();
     drop(tables);

@@ -98,7 +98,24 @@ impl RelocationStats {
     }
 }
 
+/// A window that is open right now: writable, waiting for the relocations that land in it.
+#[derive(Debug, Clone, Copy)]
+struct OpenWindow {
+    start: usize,
+    end: usize,
+    /// The protection to restore, or `None` if the range was already writable and nothing was
+    /// changed.
+    restore: Option<Protection>,
+}
+
 /// The windowed relocation engine.
+///
+/// Relocations are fed in **one at a time**, so the same window logic serves both a materialised
+/// table and the `APS2` blob streamed straight out of the decoder. A window stays open until a
+/// relocation arrives that does not fit in it, which makes the window count a function of how sorted
+/// the input is rather than a requirement on it: `libroblox.so`'s blob is emitted in ascending target
+/// order apart from **two** descents out of 568,272, so streaming it costs 89 windows where sorting
+/// it first would cost 87. Sorting is therefore an optimisation, and not worth 13.6 MB of `Vec`.
 pub(crate) struct Relocator<'a> {
     space: &'a GuestSpace,
     base: usize,
@@ -111,6 +128,7 @@ pub(crate) struct Relocator<'a> {
     window: usize,
     page: usize,
     measure_commit: bool,
+    open: Option<OpenWindow>,
     pub(crate) stats: RelocationStats,
 }
 
@@ -138,147 +156,121 @@ impl<'a> Relocator<'a> {
             window,
             page,
             measure_commit,
+            open: None,
             stats: RelocationStats::default(),
         })
     }
 
-    /// Apply one table. `relocations` is sorted in place by target, which is what makes the windows
-    /// disjoint and ascending.
+    /// Apply one materialised table, sorting it first so the windows come out disjoint and ascending.
+    ///
+    /// Used for the plain `DT_RELA` / `DT_REL` / `DT_RELR` / `DT_JMPREL` tables, which the parser
+    /// materialises anyway and which are small — the largest in the APK is 22,578 entries.
     pub(crate) fn apply_table(&mut self, table: &mut RelocationTable) -> LoadResult<()> {
         let from_plt = table.tag == "DT_JMPREL";
         let implicit = table.implicit_addend();
         // Stable, so two relocations on one target keep their file order — which is the only case
         // where order could matter, and reordering it would be a silent behaviour change.
         table.relocations.sort_by_key(|r| r.r_offset);
+        for r in &table.relocations {
+            self.feed(*r, implicit, from_plt)?;
+        }
+        self.close()
+    }
 
-        let count = table.relocations.len();
-        self.stats.total += count;
+    /// Apply one relocation, opening and closing windows as needed.
+    pub(crate) fn feed(&mut self, r: Rela, implicit: bool, from_plt: bool) -> LoadResult<()> {
+        self.stats.total += 1;
         if from_plt {
-            self.stats.plt += count;
+            self.stats.plt += 1;
         } else {
-            self.stats.packed += count;
+            self.stats.packed += 1;
         }
 
-        let mut i = 0usize;
-        while i < count {
-            let r = table.relocations[i];
-            let size = match store_size(r.r_type()) {
-                Some(s) => s,
-                None => {
-                    // Not a store at all: R_AARCH64_NONE is padding. Anything else is refused.
-                    if r.r_type() == R_AARCH64_NONE {
-                        self.count(r.r_type());
-                        self.stats.none += 1;
-                        i += 1;
-                        continue;
-                    }
-                    return Err(unsupported(&r));
-                }
-            };
-            let (target, end) = self.target_range(&r, size)?;
-            let range = self.range_for(target, end, &r)?;
+        let ty = r.r_type();
+        let Some(size) = store_size(ty) else {
+            // R_AARCH64_NONE is padding and writes nothing. Anything else is refused rather than
+            // skipped: a skipped relocation leaves a pointer unrelocated and the crash happens
+            // somewhere else entirely.
+            if ty == R_AARCH64_NONE {
+                self.count(ty);
+                self.stats.none += 1;
+                return Ok(());
+            }
+            return Err(unsupported(&r));
+        };
+        let (target, end) = self.target_range(&r, size)?;
 
-            // The window starts at the page holding the first pending target and runs for
-            // `window` bytes, clipped to the mapped range — a window may never span two ranges,
-            // because restoring protection has to restore each range's own.
-            let win_start = target & !(self.page - 1);
-            let mut win_end = win_start.saturating_add(self.window).min(range.end);
-            if win_end < end {
-                // A single relocation wider than the window, or one straddling the window's last
-                // page. Grow to cover it rather than looping forever on a window it cannot fit.
-                win_end = end
-                    .checked_next_multiple_of(self.page)
-                    .ok_or(LoadError::AddressOverflow {
-                        what: "relocation window end",
-                        base: self.base,
-                        vaddr: r.r_offset,
-                    })?
-                    .min(range.end);
-            }
-            if win_end < end {
-                return Err(LoadError::RelocationTargetSpansRanges {
-                    ty: r.r_type(),
-                    r_offset: r.r_offset,
-                    target,
-                    end,
-                    range_end: range.end,
-                });
-            }
-            let win_len = win_end - win_start;
+        if !self.open.is_some_and(|w| target >= w.start && end <= w.end) {
+            self.close()?;
+            self.open_window(&r, target, end)?;
+        }
+        self.apply_one(&r, target, size, implicit)
+    }
 
-            // Anonymous `.bss` is mapped lazily when the caller asks for it, so a relocation into
-            // it has to pay for its granule; a file view needs a copy-on-write protect instead.
-            if range.anonymous {
-                self.stats.committed_for_relocation +=
-                    self.space.ensure_committed(win_start, win_len)?;
-            }
-            let needs_protect = !range.protection.is_writable();
-            if needs_protect {
-                self.space.protect(win_start, win_len, Protection::ReadWrite)?;
-            }
-            self.stats.windows += 1;
-            self.stats.largest_window = self.stats.largest_window.max(win_len);
-            self.stats.windowed_bytes += win_len;
-            if self.measure_commit {
-                if let Ok(charge) = omni_platform::vm::process_commit_charge() {
-                    self.stats.peak_commit_charge =
-                        Some(self.stats.peak_commit_charge.unwrap_or(0).max(charge));
-                }
-            }
+    /// Restore the open window's protection, if there is one.
+    ///
+    /// Called between windows, at the end of every table, and once more on the way out of a failed
+    /// load — leaving `.text` writable on an error path would be worse than the error itself.
+    pub(crate) fn close(&mut self) -> LoadResult<()> {
+        let Some(w) = self.open.take() else { return Ok(()) };
+        if let Some(restore) = w.restore {
+            self.space.protect(w.start, w.end - w.start, restore)?;
+        }
+        Ok(())
+    }
 
-            // Apply every relocation that fits entirely inside the window. The result is carried
-            // rather than propagated so that the window's protection is always restored, even on a
-            // hostile relocation in the middle of it: leaving `.text` writable on the way out of an
-            // error path would be a worse outcome than the error itself.
-            let mut outcome = Ok(());
-            while i < count {
-                let r = table.relocations[i];
-                let ty = r.r_type();
-                if ty == R_AARCH64_NONE {
-                    self.count(ty);
-                    self.stats.none += 1;
-                    i += 1;
-                    continue;
-                }
-                let Some(size) = store_size(ty) else {
-                    outcome = Err(unsupported(&r));
-                    break;
-                };
-                let (target, end) = match self.target_range(&r, size) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
-                };
-                if target < win_start || end > win_end {
-                    break;
-                }
-                match self.apply_one(&r, target, size, implicit) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
-                }
-                i += 1;
-            }
+    fn open_window(&mut self, r: &Rela, target: usize, end: usize) -> LoadResult<()> {
+        let range = *self.range_for(target, end, r)?;
 
-            if needs_protect {
-                let restore = self.space.protect(win_start, win_len, range.protection);
-                // A failed restore is the more serious of the two failures, so it wins.
-                if outcome.is_ok() {
-                    restore?;
-                } else if let Err(e) = restore {
-                    tracing::error!(
-                        address = format_args!("{win_start:#x}"),
-                        len = win_len,
-                        %e,
-                        "could not restore a relocation window's protection"
-                    );
-                }
+        // The window starts at the page holding this target and runs for `window` bytes, clipped to
+        // the mapped range — a window may never span two ranges, because restoring protection has to
+        // restore each range's own.
+        let win_start = target & !(self.page - 1);
+        let mut win_end = win_start.saturating_add(self.window).min(range.end);
+        if win_end < end {
+            // A relocation wider than the window, or one straddling the window's last page. Grow to
+            // cover it rather than failing to make progress on a window it cannot fit.
+            win_end = end
+                .checked_next_multiple_of(self.page)
+                .ok_or(LoadError::AddressOverflow {
+                    what: "relocation window end",
+                    base: self.base,
+                    vaddr: r.r_offset,
+                })?
+                .min(range.end);
+        }
+        if win_end < end {
+            return Err(LoadError::RelocationTargetSpansRanges {
+                ty: r.r_type(),
+                r_offset: r.r_offset,
+                target,
+                end,
+                range_end: range.end,
+            });
+        }
+        let win_len = win_end - win_start;
+
+        // Anonymous `.bss` is committed lazily when the caller asks for it, so a relocation into it
+        // has to pay for its granule; a file view needs a copy-on-write protect instead.
+        if range.anonymous {
+            self.stats.committed_for_relocation += self.space.ensure_committed(win_start, win_len)?;
+        }
+        let restore = if range.protection.is_writable() {
+            None
+        } else {
+            self.space.protect(win_start, win_len, Protection::ReadWrite)?;
+            Some(range.protection)
+        };
+        self.open = Some(OpenWindow { start: win_start, end: win_end, restore });
+
+        self.stats.windows += 1;
+        self.stats.largest_window = self.stats.largest_window.max(win_len);
+        self.stats.windowed_bytes += win_len;
+        if self.measure_commit {
+            if let Ok(charge) = omni_platform::vm::process_commit_charge() {
+                self.stats.peak_commit_charge =
+                    Some(self.stats.peak_commit_charge.unwrap_or(0).max(charge));
             }
-            outcome?;
         }
         Ok(())
     }

@@ -823,3 +823,61 @@ fn exactly_3594_init_array_entries_in_order_and_in_range() {
 
     object.unload(&f.space).expect("unload");
 }
+
+// -------------------------------------------------------------------------------------------------
+// 6. The properties an over-zealous fix would destroy
+// -------------------------------------------------------------------------------------------------
+
+/// Sealing too much passes every correctness test above and then crashes the guest.
+///
+/// A loader that made the whole writable region read-only — the obvious over-correction from
+/// "`PT_GNU_RELRO` must be read-only" — would map correctly, relocate correctly, collect the right
+/// initializers and satisfy every relro assertion. It would fail the first time guest code stored to
+/// a global. So the complement is asserted directly: everything outside relro that should be
+/// writable **is** writable, by writing to it.
+#[test]
+fn data_and_bss_stay_writable_after_the_load() {
+    let Some(f) = fixture() else { return };
+    let object = load(&f, &LoaderConfig::default());
+    let relro = object.relro.expect("PT_GNU_RELRO");
+
+    let mut written = Vec::new();
+    for r in &object.ranges {
+        let inside_relro = r.start >= relro.start && r.end <= relro.end;
+        if inside_relro {
+            assert_eq!(r.rest, Protection::Read, "{:#x} is inside relro", r.start);
+            continue;
+        }
+        if r.rest != Protection::ReadWrite {
+            continue;
+        }
+        let at = (r.start + r.len() / 2) & !7;
+        // SAFETY: the range rests ReadWrite and, with the default eager `.bss` policy, is committed.
+        unsafe {
+            let p = f.space.ptr(at, 8).expect("in the space").cast::<u64>();
+            let before = p.read_unaligned();
+            p.write_unaligned(0x0bad_f00d_dead_beef);
+            assert_eq!(p.read_unaligned(), 0x0bad_f00d_dead_beef, "{at:#x} is not writable");
+            p.write_unaligned(before);
+        }
+        written.push((r.segment, r.len(), r.anonymous));
+    }
+    assert!(
+        written.len() >= 2,
+        "both .data and .bss must remain writable after the load, wrote to {written:?}"
+    );
+    assert!(written.iter().any(|&(_, _, anon)| anon), "one of them is .bss");
+    assert!(written.iter().any(|&(_, _, anon)| !anon), "one of them is file-backed .data");
+
+    // And the whole image is accounted for: every range rests at exactly one of three protections,
+    // and nothing is left writable-and-executable or inaccessible.
+    for r in &object.ranges {
+        assert!(
+            matches!(r.rest, Protection::Read | Protection::ReadWrite | Protection::ReadExecute),
+            "{:#x} rests {}",
+            r.start,
+            r.rest
+        );
+    }
+    object.unload(&f.space).expect("unload");
+}

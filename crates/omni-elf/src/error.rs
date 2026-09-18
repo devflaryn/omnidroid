@@ -316,6 +316,16 @@ pub enum ElfError {
     #[error("could not allocate {bytes} bytes while decoding relocations")]
     AllocationFailed { bytes: usize },
 
+    /// The consumer of [`ElfImage::decode_packed_with`](crate::ElfImage::decode_packed_with)
+    /// stopped the decode.
+    ///
+    /// Carries no detail on purpose. The sink's error type is this crate's, so a consumer with a
+    /// richer error of its own — the loader, refusing a relocation target — cannot return it
+    /// directly; it returns this and hands back its own error separately. Discarding the real reason
+    /// instead would turn "relocation 412,003 targets an unmapped address" into "decode failed".
+    #[error("the relocation consumer stopped the decode")]
+    RelocationSinkStopped,
+
     // -----------------------------------------------------------------------------------------
     // Symbol versioning
     // -----------------------------------------------------------------------------------------

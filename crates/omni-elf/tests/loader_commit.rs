@@ -47,7 +47,7 @@ fn peak_and_steady_commit_charge_are_measured_and_reported() {
     eprintln!("  file-backed mapped   {:>10.3} MiB", mib(s.file_backed_bytes as i64));
     eprintln!("  private anonymous    {:>10.3} MiB", mib(s.anonymous_bytes as i64));
     eprintln!(
-        "  decode commit delta  {:>10.3} MiB  (host-side Elf64_Rela records, not guest memory)",
+        "  after map + decode   {:>10.3} MiB  (mapping plus the unpacked relocation tables)",
         mib(s.decode_commit_delta().expect("measured"))
     );
     eprintln!("  peak commit delta    {:>10.3} MiB", mib(peak));
@@ -80,6 +80,19 @@ fn peak_and_steady_commit_charge_are_measured_and_reported() {
         s.relocations.largest_window <= DEFAULT_WINDOW,
         "a window of {} bytes exceeds the configured {DEFAULT_WINDOW}",
         s.relocations.largest_window
+    );
+    // And the *transient* charge the sweep adds is bounded by the writable image, not by the
+    // library. Measured from the point where the relocation tables are already decoded, so the
+    // loader's own 13 MB of host `Elf64_Rela` records are excluded and what is left is the guest's
+    // copy-on-write charge. A loader that protected the whole 109 MB library at once would show
+    // about 104 MiB here while passing every correctness test in `loader_m1.rs`.
+    let transient = s.commit_peak.expect("measured") as i64
+        - s.commit_after_decode.expect("measured") as i64;
+    eprintln!("  transient (post-decode) {:>7.3} MiB", mib(transient));
+    assert!(
+        transient < 8 * 1024 * 1024,
+        "the relocation sweep transiently charged {:.3} MiB of commit; windows are not bounding it",
+        mib(transient)
     );
 
     object.unload(&f.space).expect("unload");

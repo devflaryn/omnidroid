@@ -571,9 +571,36 @@ impl<'a> ElfImage<'a> {
     /// General relocations (`DT_RELA`, `DT_REL`, `DT_RELR`, `DT_ANDROID_REL(A)`) and PLT
     /// relocations (`DT_JMPREL`) are kept separate, because they *are* separate in the file.
     pub fn relocations(&self) -> Result<Relocations> {
+        self.relocation_tables(true)
+    }
+
+    /// Every relocation table **except** the Android packed ones.
+    ///
+    /// Exists for the loader. `libroblox.so`'s packed blob holds 568,272 relocations, which is
+    /// 13.6 MB of `Vec<Rela>` — and, because the `Vec` grows by doubling, up to 36.8 MB of measured
+    /// commit charge at its peak, which is more than the *whole* rest of the load costs. The loader
+    /// streams that blob through [`Self::decode_packed_with`] instead and materialises only these
+    /// tables, which are small: the largest plain table in the target APK has 22,578 entries.
+    pub fn unpacked_relocations(&self) -> Result<Relocations> {
+        self.relocation_tables(false)
+    }
+
+    /// Whether the object's packed relocations carry their addends implicitly, which is a property
+    /// of which Android tag it used. `None` when it has no packed table at all.
+    pub fn packed_has_implicit_addend(&self) -> Option<bool> {
+        if self.dynamic.android_rela.is_some() {
+            Some(RelocEncoding::AndroidPackedRela.implicit_addend())
+        } else if self.dynamic.android_rel.is_some() {
+            Some(RelocEncoding::AndroidPackedRel.implicit_addend())
+        } else {
+            None
+        }
+    }
+
+    fn relocation_tables(&self, packed: bool) -> Result<Relocations> {
         let mut out = Relocations::default();
 
-        if let Some(t) = self.dynamic.android_rela {
+        if let Some(t) = self.dynamic.android_rela.filter(|_| packed) {
             out.general.push(self.decode_packed(
                 "DT_ANDROID_RELA",
                 RelocEncoding::AndroidPackedRela,
@@ -581,7 +608,7 @@ impl<'a> ElfImage<'a> {
                 PackedFormat::Rela,
             )?);
         }
-        if let Some(t) = self.dynamic.android_rel {
+        if let Some(t) = self.dynamic.android_rel.filter(|_| packed) {
             out.general.push(self.decode_packed(
                 "DT_ANDROID_REL",
                 RelocEncoding::AndroidPackedRel,
