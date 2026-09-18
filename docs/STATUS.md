@@ -68,15 +68,39 @@ real APK.
 
 **Infrastructure**
 
+"Reviewed" means an independent reviewer verified it and every Critical and Important finding was
+fixed and re-verified. "Pending review" means the implementer's tests pass but nothing independent
+has confirmed it yet — on this project that distinction has mattered every single time.
+
 | Component | Status |
 |---|---|
 | Cargo workspace, nine crates | **Done** |
-| `omni-platform` virtual-memory seam (Windows) | **Done, reviewed.** 37 tests. Reserve / placeholder split at 4 KB / commit / decommit / protect / file-backed map / commit-charge measurement. Verified: 4 GiB reserve costs 0.000 MiB; 64 MiB commit costs +64.125 MiB and decommit returns it; a 4 MiB shared read-only view costs +0.008 MiB and stays there after reading every byte |
+| `omni-platform` virtual-memory seam (Windows) | **Done, reviewed.** Reserve, 4 KB placeholder split, commit, decommit, protect, file-backed map, commit-charge measurement |
+| `omni-platform` dual-mapped sections + placeholder coalescing | **Pending review** |
 | `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
-| `omni-platform` dual-mapped JIT arena | Not started (D12). Protection-resolution hazard already handled so it cannot silently privatise writes |
-| `omni-apk` | In progress |
-| `omni-elf` parser + APS2 decoder | In progress |
-| `omni-mem`, `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
+| `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
+| `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 83 tests. One closing doc-accuracy pass outstanding |
+| `omni-mem` — guest address space + JIT arena | **Pending review.** 42 new tests |
+| `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
+
+**Measured, not assumed**
+
+| Property | Measurement |
+|---|---|
+| Guest address space reservation | 4 GiB costs **0.000 MiB** of commit charge |
+| Grown to 1 GiB, written through | **+1026.004 MiB** (+2.004 is page tables at size/512) |
+| Everything unmapped, instance closed | back to **+0.000 MiB** — the project's memory requirement, as an assertion |
+| Shared read-only file view | 4 MiB costs **+0.008 MiB**, unchanged after reading every byte, so instances share `libroblox.so` text for free |
+| Commit granule | 64 KiB. Measured 2414 ns/page at 4 KiB (worse than the 2053 ns VEH fault D10 rejected), 150 ns/page at 64 KiB, against an unavoidable 381 ns first-touch fault |
+| JIT arena | Dual-mapped, W+X unrepresentable in the API; a child process storing through the execute pointer dies with `0xC0000005` |
+| `libroblox.so` extraction | 413 ms once (release), 130 us on a cache hit |
+| APS2 decode | 568,272 relocations from 46,184 groups in ~2 ms, consuming 2,100,778 of 2,100,778 bytes |
+
+**Known accounting gap (unconfirmed, under review):** a pagefile-backed section reportedly does not
+appear in `PrivateUsage`, which would make the JIT arena's cost invisible to
+`process_commit_charge`. This matters more than it sounds: the chosen CPU core commits 20-35 MiB per
+guest thread, so if true, the largest per-thread cost is the one our accounting cannot see. Being
+verified before it is written into the decisions.
 
 **Known gap:** Windows `unmap` is whole-view-only, so a guest partial `munmap` cannot be serviced by
 the platform layer directly. The seam refuses it with a typed error carrying the view extent rather
