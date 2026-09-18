@@ -227,7 +227,13 @@ pub struct PackedRelocations {
 ///    the group flags the decoder knows the minimum bytes each relocation must read; if
 ///    `size × min_bytes` exceeds what is left in the blob, the group is refused
 ///    ([`crate::ElfError::Aps2GroupLargerThanStream`]). This cannot reject a valid blob, because a
-///    valid blob contains those bytes. Every group in `libroblox.so` is of this kind.
+///    valid blob contains those bytes.
+///
+///    **Every one of `libroblox.so`'s 46,184 groups is of this kind**, so the real binary is
+///    bounded without its headers being consulted at all. That is established by decoding it
+///    with `image_span = 0` — which makes layers 2 and 3 reject any zero-cost group outright —
+///    and still getting all 568,272 relocations. `observed_group_flags` cannot show this: it is
+///    a union, and a union over groups says nothing about every group.
 /// 2. **A zero-cost group whose shared offset delta is zero may hold one relocation.** All of its
 ///    relocations would be bit-identical — same target, same `r_info`, same addend — so every one
 ///    after the first is dead ([`crate::ElfError::Aps2DeadGroup`]).
@@ -260,9 +266,12 @@ pub struct PackedRelocations {
 /// [`Self::MAX_RELOCATIONS`] caps the derived figure. The derived figure comes from validated
 /// header fields — but validation only removes the *absurd* values. A plausible lie
 /// (`p_memsz = 2^40`, overflowing nothing, contradicting nothing) would still buy a ceiling of
-/// half a trillion, and a bound whose worst case is minutes of CPU is not a bound. The flat
-/// ceiling depends on no file data at all. `image::MAX_IMAGE_SPAN` closes the same hole from the
-/// other side; either alone would be enough, and having both means a mistake in one is not fatal.
+/// half a trillion, and a bound whose worst case is minutes of CPU and terabytes of requested
+/// memory is not a bound. The flat ceiling depends on no file data at all.
+/// `image::MAX_IMAGE_SPAN` closes the same hole from the other side by capping a forgeable input
+/// back down to a bounded one; either alone would be enough, and having both means a mistake in
+/// one is not fatal. [`Self::MAX_RELOCATIONS`] documents both the time and the memory it permits,
+/// since quoting only the time would understate the price.
 ///
 /// Note that validating each decoded `r_offset` against the loadable segments — a check the
 /// applying loader wants anyway — is *not* a substitute for any of this: a group with a shared
@@ -288,9 +297,23 @@ impl Aps2Limits {
     /// The flat ceiling on the derived count bound: 64 Mi relocations.
     ///
     /// Chosen, not derived — see the struct docs for why one chosen number is necessary. It is
-    /// 118× `libroblox.so`'s 568,806, by far the largest count in the target APK, and at the
-    /// measured ~320 million relocations per second it bounds a hostile decode to about 0.2 s.
-    /// A caller with a bigger object can raise it through [`Self::new`].
+    /// 118× `libroblox.so`'s 568,806, by far the largest count in the target APK.
+    ///
+    /// What the ceiling authorises, both halves of it, because quoting only the time would
+    /// understate the cost:
+    ///
+    /// * **Time.** At the measured ~275–320 million relocations per second, 64 Mi bounds a hostile
+    ///   streaming decode to roughly 0.2 s. Measured worst case for a blob that actually reaches
+    ///   the ceiling is 33.5 ms, so the 0.2 s figure is conservative.
+    /// * **Memory.** 64 Mi × `size_of::<Rela>()` = **1,536 MiB**, and an eighteen-byte blob is
+    ///   enough to ask for all of it through [`decode`], because a fully-grouped group spends no
+    ///   bytes per relocation. That request is *fallible* — it grows by `try_reserve` and returns
+    ///   [`crate::ElfError::AllocationFailed`] rather than aborting — and [`decode_with`] allocates
+    ///   nothing at all, which is why the streaming path is the one to prefer for untrusted input.
+    ///   But 1.5 GiB is what this constant permits, and it should be read as part of its price.
+    ///
+    /// A caller with a bigger object, or a tighter memory budget, can set its own through
+    /// [`Self::new`].
     pub const MAX_RELOCATIONS: u64 = 64 * 1024 * 1024;
 
     /// An explicit bound, for callers that know their own.
@@ -603,6 +626,79 @@ mod tests {
         let mut dec = Sleb128Decoder::new(&buf);
         assert_eq!(dec.pop_front().unwrap(), v, "round-trip of {v} via {buf:02x?}");
         assert_eq!(dec.remaining(), 0, "encoding of {v} had trailing bytes");
+    }
+
+    #[test]
+    fn the_flat_ceiling_applies_even_to_an_enormous_validated_image() {
+        // Lives here rather than in the integration suite because it needs a synthetic
+        // `LoadImage`, and `LoadImage` is `#[non_exhaustive]` precisely so that no code outside
+        // this crate can build one. Keeping the test in-crate is what lets that guarantee be real
+        // instead of documented-but-bypassed.
+        //
+        // The derived bound comes from validated header fields, but validation only removes absurd
+        // values. The flat ceiling depends on no file data at all, so it still holds when the image
+        // is as large as the crate will ever accept.
+        use crate::image::{LoadImage, MAX_IMAGE_SPAN};
+        assert_eq!(MAX_IMAGE_SPAN, 4 * 1024 * 1024 * 1024);
+        let huge = LoadImage {
+            base_vaddr: 0,
+            end_vaddr: MAX_IMAGE_SPAN,
+            span: MAX_IMAGE_SPAN,
+            mapped_bytes: MAX_IMAGE_SPAN,
+            max_align: 0x1000,
+            segment_count: 1,
+        };
+        // Unclamped the derived figure would be 2^31; the ceiling holds it to 64 Mi.
+        assert_eq!(
+            huge.mapped_bytes / Aps2Limits::MIN_RELOCATION_FOOTPRINT,
+            2_147_483_648
+        );
+        let limits = Aps2Limits::for_image(&huge);
+        assert_eq!(limits.max_relocations, Aps2Limits::MAX_RELOCATIONS);
+        assert_eq!(limits.max_relocations, 67_108_864);
+        assert_eq!(limits.image_span, MAX_IMAGE_SPAN);
+
+        // And the memory that ceiling authorises, stated as a number so the doc comment on
+        // MAX_RELOCATIONS cannot drift away from it.
+        assert_eq!(
+            Aps2Limits::MAX_RELOCATIONS * core::mem::size_of::<Rela>() as u64,
+            1_610_612_736,
+            "64 Mi relocations is 1,536 MiB of Rela"
+        );
+
+        // A blob one past the ceiling is refused, and it is tiny: eighteen bytes, which is the
+        // measured size of the smallest input that would ask `decode` for the full 1,536 MiB.
+        let mut blob = Vec::from(APS2_MAGIC);
+        encode_sleb128(67_108_865, &mut blob);
+        encode_sleb128(0x1000, &mut blob);
+        encode_sleb128(67_108_865, &mut blob);
+        encode_sleb128(
+            (RELOCATION_GROUPED_BY_INFO_FLAG | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) as i64,
+            &mut blob,
+        );
+        encode_sleb128(8, &mut blob);
+        encode_sleb128(crate::consts::R_AARCH64_RELATIVE as i64, &mut blob);
+        assert_eq!(blob.len(), 18, "the blob that would ask for 1.5 GiB");
+        assert_eq!(
+            decode_rela(&blob, limits).unwrap_err(),
+            ElfError::Aps2CountExceedsLimit {
+                declared: 67_108_865,
+                limit: 67_108_864,
+            }
+        );
+        // One below the ceiling passes the count check, so the refusal above really is the
+        // ceiling firing rather than something incidental to the blob's shape.
+        let mut ok = Vec::from(APS2_MAGIC);
+        encode_sleb128(1, &mut ok);
+        encode_sleb128(0x1000, &mut ok);
+        encode_sleb128(1, &mut ok);
+        encode_sleb128(
+            (RELOCATION_GROUPED_BY_INFO_FLAG | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) as i64,
+            &mut ok,
+        );
+        encode_sleb128(8, &mut ok);
+        encode_sleb128(crate::consts::R_AARCH64_RELATIVE as i64, &mut ok);
+        assert_eq!(decode_rela(&ok, limits).unwrap().relocations.len(), 1);
     }
 
     #[test]

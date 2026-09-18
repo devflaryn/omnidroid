@@ -560,9 +560,11 @@ fn dt_hash_and_dt_gnu_hash_agree_wherever_both_exist() {
         ],
         "libraries carrying both hash tables"
     );
-    assert!(
-        checked > 10_000,
-        "expected thousands of two-table lookups, did {checked}"
+    // Exact, not a lower bound: 10,994 + 9 + 0 exported symbols, each resolved through both
+    // tables. A loose bound here would not notice a library's exports vanishing.
+    assert_eq!(
+        checked, 11_003,
+        "exported symbols resolved through both DT_HASH and DT_GNU_HASH"
     );
 }
 

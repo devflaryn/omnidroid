@@ -836,33 +836,44 @@ fn a_group_that_pays_bytes_cannot_exceed_the_bytes_left() {
 }
 
 #[test]
-fn the_flat_ceiling_applies_even_to_an_enormous_validated_image() {
-    // The derived bound comes from validated header fields, but validation only removes absurd
-    // values. The flat ceiling depends on no file data at all, so it still holds when the image
-    // is as large as the crate will ever accept.
-    use omni_elf::{LoadImage, MAX_IMAGE_SPAN};
-    assert_eq!(MAX_IMAGE_SPAN, 4 * 1024 * 1024 * 1024);
-    let huge = LoadImage {
-        base_vaddr: 0,
-        end_vaddr: MAX_IMAGE_SPAN,
-        span: MAX_IMAGE_SPAN,
-        mapped_bytes: MAX_IMAGE_SPAN,
-        max_align: 0x1000,
-        segment_count: 1,
+fn a_load_image_can_only_be_obtained_by_validating_segments() {
+    // `LoadImage` is `#[non_exhaustive]`, so from outside the crate the only way to obtain one is
+    // `LoadImage::validate`. That is what makes `Aps2Limits::for_image` impossible to feed with
+    // unchecked header fields — the guarantee the library documents, asserted from the outside,
+    // where it actually has to hold.
+    //
+    // This line is the bypass the attribute forbids; uncommenting it must not compile (E0639):
+    //
+    //   let forged = LoadImage { base_vaddr: 0, end_vaddr: u64::MAX, span: u64::MAX,
+    //                            mapped_bytes: u64::MAX, max_align: 1, segment_count: 1 };
+    //
+    // Reading the fields is still allowed, which is why they stay public.
+    use omni_elf::{LoadImage, Segment, SegmentFlags};
+
+    let load = |vaddr: u64, memsz: u64| Segment {
+        p_type: PT_LOAD,
+        p_flags: SegmentFlags::READ | SegmentFlags::WRITE,
+        p_offset: 0,
+        p_vaddr: vaddr,
+        p_paddr: vaddr,
+        p_filesz: 0,
+        p_memsz: memsz,
+        p_align: 1,
     };
-    let limits = Aps2Limits::for_image(&huge);
-    // Unclamped the derived figure would be 2^31; the ceiling holds it to 64 Mi.
-    assert_eq!(
-        huge.mapped_bytes / Aps2Limits::MIN_RELOCATION_FOOTPRINT,
-        2_147_483_648
-    );
-    assert_eq!(limits.max_relocations, Aps2Limits::MAX_RELOCATIONS);
-    assert_eq!(limits.max_relocations, 67_108_864);
-    assert_eq!(
-        aps2::decode_rela(&zero_cost_blob(67_108_865), limits).unwrap_err(),
-        ElfError::Aps2CountExceedsLimit {
-            declared: 67_108_865,
-            limit: 67_108_864,
-        }
-    );
+
+    let img = LoadImage::validate(&[load(0, 0x2000), load(0x4000, 0x1000)], 0x1000)
+        .expect("a well-formed PT_LOAD set validates");
+    assert_eq!(img.span, 0x5000);
+    assert_eq!(img.mapped_bytes, 0x3000, "the 0x2000 gap is not mapped");
+    assert_eq!(Aps2Limits::for_image(&img).max_relocations, 0x3000 / 2);
+
+    // And the same entry point refuses what it should, so the only door is also a locked one.
+    assert!(matches!(
+        LoadImage::validate(&[load(0x1000, u64::MAX)], 0x1000),
+        Err(ElfError::SegmentMemRangeOverflow { .. })
+    ));
+    assert!(matches!(
+        LoadImage::validate(&[load(0, 1 << 40)], 0x1000),
+        Err(ElfError::ImageSpanTooLarge { .. })
+    ));
 }

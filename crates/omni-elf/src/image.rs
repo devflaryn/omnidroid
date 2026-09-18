@@ -18,7 +18,15 @@ use crate::segment::Segment;
 /// The measured, validated extent of an object's loadable image.
 ///
 /// Every field here has survived [`LoadImage::validate`], so a consumer may derive limits from it.
+///
+/// `#[non_exhaustive]` is load-bearing, not tidiness: it is what makes "only `validate` can produce
+/// one" true for code outside this crate, so a caller cannot assemble a flattering image by struct
+/// literal and hand it to [`crate::aps2::Aps2Limits::for_image`]. Fields stay `pub` because reading
+/// them is the point; only construction is restricted. In-crate tests may still build one
+/// directly — `#[non_exhaustive]` does not apply within the defining crate — which is why the test
+/// that needs a synthetic 4 GiB image lives in `aps2.rs` rather than in the integration suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LoadImage {
     /// Lowest `p_vaddr` of any `PT_LOAD`.
     pub base_vaddr: u64,
@@ -43,17 +51,24 @@ pub struct LoadImage {
 
 /// The largest loadable image this crate will accept.
 ///
-/// Unlike the rest of [`LoadImage`], this is **chosen rather than derived**, and it is the one
-/// number in the limit chain that is. It exists because every field a bound could be derived from
-/// is a field an attacker types: validating them removes the absurd values, but a *plausible* lie
-/// — `p_memsz = 2^40`, which overflows nothing and contradicts no other header — would still buy
-/// a terabyte-wide image and a correspondingly useless ceiling.
+/// Unlike the rest of [`LoadImage`], this is **chosen rather than derived**. It exists because
+/// every field a bound could be derived from is a field an attacker types: validating them removes
+/// the absurd values, but a *plausible* lie — `p_memsz = 2^40`, which overflows nothing and
+/// contradicts no other header — would still buy a terabyte-wide image and a correspondingly
+/// useless relocation ceiling. Its whole job is to **cap a forgeable input back down to a bounded
+/// one**, so that everything derived from the image is derived from something bounded.
 ///
-/// 4 GiB is 35× the largest image in the target APK (`libroblox.so`, 120,798,268 bytes of span),
-/// and an object this runtime could not load anyway — the loader has to reserve the span, and
-/// `docs/DECISIONS.md` D10 does not contemplate a single shared object of that size. Refusing it
-/// here reports a real limitation of the runtime instead of accepting the object and failing in
-/// `omni-mem` much later, which is the whole reason this check is not left to the caller.
+/// Why 4 GiB is safe for real input:
+///
+/// * It is 35× the largest image in the target APK (`libroblox.so`, 120,798,268 bytes of span).
+/// * An AArch64 shared object larger than 4 GiB is not linkable in the first place. `ADRP`+`ADD`
+///   reaches ±4 GiB, so both the small and large code models cap intra-object PC-relative
+///   addressing there; a linker cannot emit a working `.so` past it.
+///
+/// Note what is *not* the reason: this is **not** about the cost of reserving the span.
+/// `docs/DECISIONS.md` D10 measured that address-space reservation is free — 0 bytes of commit
+/// charge, verified out to 97.7 TB — and says in as many words that it is not the thing to
+/// economize on. A rationale resting on reservation cost would argue against its own constant.
 pub const MAX_IMAGE_SPAN: u64 = 4 * 1024 * 1024 * 1024;
 
 impl LoadImage {

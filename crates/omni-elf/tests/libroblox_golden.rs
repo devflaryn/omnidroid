@@ -389,7 +389,7 @@ fn segments_match_the_measured_layout() {
     assert_eq!(relro.p_vaddr, 0x062d_c1c0);
 
     assert_eq!(elf.load_segments().count(), 3, "three PT_LOAD segments");
-    let (base, span) = elf.load_span().unwrap();
+    let (base, span) = elf.load_span();
     assert_eq!(base, 0, "the image starts at vaddr 0");
     assert_eq!(span, 0x0733_3c3c, "total loadable span");
     // Max p_align across PT_LOAD is 16 KiB: this is a 16 KiB-page binary.
@@ -922,4 +922,58 @@ fn other_forged_pt_load_fields_are_refused_on_the_real_file() {
     // The untampered file still parses, so each rejection above was about the mutation rather than
     // about something incidental to the validator.
     assert!(ElfImage::parse(bytes).is_ok());
+}
+
+#[test]
+fn every_group_in_the_real_blob_pays_bytes_per_relocation() {
+    let Some(bytes) = common::main_lib() else { return };
+    let elf = image(bytes);
+    let table = elf.dynamic().android_rela.expect("DT_ANDROID_RELA");
+    let blob = elf
+        .slice_at_vaddr("DT_ANDROID_RELA", table.vaddr, table.size)
+        .unwrap();
+
+    // Decode with `image_span = 0`, which makes layers 2 and 3 reject *any* group that spends no
+    // bytes per relocation: a zero stride is refused outright, and a non-zero stride cannot fit a
+    // zero-byte image. Getting all 568,272 relocations out anyway proves every one of the 46,184
+    // groups is byte-paying — so layer 1 alone bounds this binary and no header field is consulted
+    // to do it.
+    //
+    // `observed_group_flags` cannot establish this. It is a union over groups, and a union says
+    // nothing about *every* group: flags 11, 9 and 8 all happen to be byte-paying, but a union of
+    // {11, 9, 8} is equally consistent with a fourth group of flags 3 that is not.
+    let mut count = 0usize;
+    let summary = omni_elf::aps2::decode_with(
+        blob,
+        omni_elf::PackedFormat::Rela,
+        omni_elf::Aps2Limits::new(u64::MAX, 0),
+        |_| {
+            count += 1;
+            Ok(())
+        },
+    )
+    .expect("every group must be byte-paying, so a zero image span changes nothing");
+    assert_eq!(count, APS2_TOTAL);
+    assert_eq!(summary.group_count, 46_184);
+    assert_eq!(summary.bytes_consumed, APS2_BLOB_BYTES);
+    assert_eq!(summary.bytes_consumed, summary.bytes_total);
+
+    // Sanity check on the probe itself: a zero-cost group really is refused at this image span,
+    // so the decode above succeeded because of the blob's shape and not because the layers are
+    // inert when `image_span` is zero.
+    let mut zero_cost = Vec::from(*b"APS2");
+    omni_elf::aps2::encode_sleb128(2, &mut zero_cost);
+    omni_elf::aps2::encode_sleb128(0x1000, &mut zero_cost);
+    omni_elf::aps2::encode_sleb128(2, &mut zero_cost);
+    omni_elf::aps2::encode_sleb128(
+        (omni_elf::aps2::RELOCATION_GROUPED_BY_INFO_FLAG
+            | omni_elf::aps2::RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) as i64,
+        &mut zero_cost,
+    );
+    omni_elf::aps2::encode_sleb128(8, &mut zero_cost);
+    omni_elf::aps2::encode_sleb128(R_AARCH64_RELATIVE as i64, &mut zero_cost);
+    assert!(matches!(
+        omni_elf::aps2::decode_rela(&zero_cost, omni_elf::Aps2Limits::new(u64::MAX, 0)).unwrap_err(),
+        omni_elf::ElfError::Aps2GroupExceedsImage { image_span: 0, .. }
+    ));
 }

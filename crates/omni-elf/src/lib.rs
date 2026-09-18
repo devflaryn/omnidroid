@@ -217,11 +217,13 @@ impl<'a> ElfImage<'a> {
         self.segments.iter().filter(|s| s.p_type == PT_NOTE)
     }
 
-    /// Total span of the loadable image in virtual address space: `max(vaddr_end) - min(vaddr)`.
+    /// `(base_vaddr, span)` of the loadable image: the size a loader must reserve, and where.
     ///
-    /// This is the size a loader must reserve. Returns `None` if there is no `PT_LOAD`.
-    pub fn load_span(&self) -> Option<(u64, u64)> {
-        Some((self.load_image.base_vaddr, self.load_image.span))
+    /// Infallible. It used to return an `Option` for the no-`PT_LOAD` case, which
+    /// [`LoadImage::validate`] now rejects at parse time, so the `None` arm was unreachable and
+    /// documenting it was misleading.
+    pub fn load_span(&self) -> (u64, u64) {
+        (self.load_image.base_vaddr, self.load_image.span)
     }
 
     /// The validated extent of the loadable image.
