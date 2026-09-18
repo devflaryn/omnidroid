@@ -89,7 +89,7 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
 | `omni-elf` — loader: map, relocate, resolve, seal | **Pending final review.** Milestone **M1** |
 | `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
-| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Pending final review.** Milestone **M2** |
+| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Pending final review.** Milestone **M2**. 441 `#[test]` functions across the workspace, 65/65 mutations caught |
 | `omni-elf` — `.eh_frame_hdr` function map + leaf classifier | **Pending final review.** The selection tool M2 chose its code with |
 | `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
