@@ -10,9 +10,15 @@ generalisation the whole-branch review asked for — it takes a table of (file, 
 rather than being loader-shaped, so a new fix anywhere in the workspace costs one table row.
 
 Each mutation is applied on its own, the named test command is run, the result is recorded, and the
-file is **always** restored, including on a crash, via `try`/`finally`. A mutation that does not
-compile, does not match its pattern, or is caught by nothing is reported as `MISS`, never as a pass:
-a mutation nothing notices means the fix has no test behind it.
+file is restored via `try`/`finally` -- including on a crash, but **not** if the interpreter is
+killed. That gap is real and has been hit: a run killed mid-row left `arena.rs` carrying its
+mutation, and `git status` showed only "modified", which is what the file looks like during ordinary
+work. The pre-flight below is what turns that from a silent corruption into a one-second refusal on
+the next run, because a stale tree makes some pattern fail to match. If a run is ever killed, check
+`git diff` before trusting the tree.
+
+A mutation that does not compile, does not match its pattern, or is caught by nothing is reported as
+`MISS`, never as a pass: a mutation nothing notices means the fix has no test behind it.
 
 Two directions, and the second is the point:
 
@@ -143,8 +149,21 @@ MUTATIONS = [
     # test process with an access violation, which is exactly the point — that is what safe code
     # could reach before it existed.
     ("mem-A11", "A", "the sealed-page check removed, so a safe write faults the process", ARENA,
-     """        let _sealed_guard = if self.sealed_pages.load(Ordering::Acquire) != 0 {""",
-     """        let _sealed_guard = if false && self.sealed_pages.load(Ordering::Acquire) != 0 {""",
+     """        let sealed_path = self.sealed_pages.load(Ordering::Acquire) != 0;""",
+     """        let sealed_path = false && self.sealed_pages.load(Ordering::Acquire) != 0;""",
+     MEM),
+
+    # The guard held across the store (the review's I1). Previously unpinnable without a racing
+    # test, which was rightly refused: a test that has to lose a race to fail corrupts this very
+    # table. `debug_assert!(!sealed_path || self.inner.is_locked())` makes it deterministic instead,
+    # and the slow path's success-path test is what executes it.
+    # `let _ = expr` drops the temporary at the end of *that statement*, while `let _name = expr`
+    # holds it to the end of scope. So this one-character edit is the real shape of the bug, and it
+    # compiles -- `drop(chunks); None` does not, because both arms would then be `None` and the
+    # guard type becomes uninferable.
+    ("mem-A14", "A", "the arena guard dropped before the store instead of held across it", ARENA,
+     """        let _sealed_guard = if sealed_path {""",
+     """        let _ = if sealed_path {""",
      MEM),
 
     ("mem-A12", "A", "the budget stops adding the arena's invisible commit to the total", BUDGET,
@@ -307,6 +326,26 @@ def main():
         for mid, direction, description, path, _, _, _ in selected:
             print(f"{mid:<9} {direction}  {description}  [{path}]")
         return 0
+
+    # Pre-flight: every selected pattern must match its file exactly once *before* anything is
+    # mutated or any `cargo` is run.
+    #
+    # This exists because the Task 1 report claimed it existed when it did not -- the check was
+    # per-row, inside the loop, so a stale pattern surfaced as a MISS forty minutes into a run,
+    # mixed in with real results. Per-row checking is still there and still needed (a row can go
+    # stale between this pass and its turn); this is the cheap pass that says so in one second.
+    stale = []
+    for mid, _, _, path, old, _, _ in selected:
+        text = read_exactly(path)
+        found = text.count(as_written(old, text))
+        if found != 1:
+            stale.append(f"  {mid}: pattern matches {found} times in {path}")
+    if stale:
+        print(f"pre-flight failed: {len(stale)} of {len(selected)} patterns do not match "
+              f"exactly once. Nothing was mutated and nothing was run.")
+        print(chr(10).join(stale))
+        return 2
+    print(f"pre-flight: {len(selected)}/{len(selected)} patterns match exactly once")
 
     print(f"{len(selected)} mutations\n")
     results = []

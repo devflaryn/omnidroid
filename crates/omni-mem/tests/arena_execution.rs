@@ -66,13 +66,18 @@ mod x86_64 {
     /// `CommitBudget::process_private` is `PrivateUsage`, which is **process-global**: it counts
     /// every allocation any thread in this process makes. libtest runs these four tests in parallel
     /// by default, so serialising only the measuring tests left the other two churning the heap
-    /// underneath the measurement — and the real signal turned out to be **4-16 KiB**, far smaller
-    /// than that churn. That reproduced as `private_delta` going *negative* in roughly one run in
-    /// ten.
+    /// underneath the measurement — and the real signal is **4-52 KiB** (n = 90, see the bound in
+    /// `the_measured_cost_of_a_realistic_amount_of_generated_code`), far smaller than that churn.
+    /// That reproduced as `private_delta` going *negative* in roughly one run in ten.
     ///
     /// It mattered more than a flaky test usually would: a spurious failure here appears in
     /// `tools/mutate.py`'s output as a mutation "caught" by a test that has nothing to do with it,
     /// which silently corrupts the one table Global Constraint 12 asks us to trust.
+    ///
+    /// It does **not** remove all of the noise, and the limit is worth knowing: this serialises test
+    /// *bodies*, not libtest's thread creation, so thread stacks still move a process-global counter
+    /// inside the measurement window. That is the most likely source of the residual spread, and it
+    /// is why the bound there is two-sided rather than tight.
     static SERIAL: Mutex<()> = Mutex::new(());
 
     /// No guest address spaces are involved here; only arenas are.
@@ -133,8 +138,8 @@ mod x86_64 {
     ///
     /// Returns an array rather than a `Vec` on purpose: the cost measurement emits 65,536 of these
     /// *between* its two `PrivateUsage` readings, and 65,536 heap allocations inside the window is
-    /// the measurement measuring itself. It was — the delta fell from about 102,400 bytes to 4-16
-    /// KiB once this stopped allocating.
+    /// the measurement measuring itself. It was — the delta fell from about 102,400 bytes to a
+    /// 4-52 KiB spread (n = 90) once this stopped allocating.
     fn standalone(m: u32, a: u32) -> [u8; 14] {
         let mut code = [0u8; 14];
         code[0..2].copy_from_slice(&[0x89, 0xC8]); // mov eax, ecx
@@ -458,24 +463,39 @@ mod x86_64 {
         );
         // **One two-sided bound, not a lower bound at zero.**
         //
-        // The first version of this asserted `private_delta > 0`, reasoning that two views must at
-        // least cost page tables at D10's measured `size/512` — 65,536 bytes for 32 MiB of mapping.
-        // Two things were wrong. It had no margin at all on the side it actually failed on. And it
-        // was measuring the wrong thing: once this binary was serialised and the emission loop
-        // stopped allocating, the delta collapsed from about 102,400 bytes to **4,096-16,384**, one
-        // to four pages, across twelve runs. Almost all of the original figure was this test's own
-        // heap, and reporting it as the arena's cost was false precision.
+        // The first version asserted `private_delta > 0`, reasoning that two views must at least
+        // cost page tables. It had no margin on the side it failed on, and it was measuring the
+        // wrong thing: about 102,400 of the 102,400 bytes it saw was this test's own heap, since the
+        // emission loop allocated 65,536 `Vec`s inside the measurement window.
         //
-        // Two conclusions, both recorded rather than smoothed over. D10's `size/512` page-table
-        // model was measured on committed *anonymous* memory and does not transfer to a mapped
-        // section view. And one to four pages is indistinguishable from allocator granularity, so
-        // asserting that it *is* page tables would be inventing a mechanism from noise.
+        // **Every figure below is from a real sample, and each says how large.** The first
+        // correction was written from twelve printed deltas and was wrong in four separate ways;
+        // the numbers here are the union of two independent 45-run samples (n = 90).
         //
-        // What the measurement does support — and what D15 actually needs — is a two-sided bound:
-        // whatever `PrivateUsage` does in either direction, it is negligible beside the bytes
-        // charged against the system commit limit. `mapped / 128` sits 8x above the largest movement
-        // observed and 128x below what was mapped, and unlike a bound at zero it cannot be failed by
-        // noise going the wrong way.
+        // * `private_delta` observed: **4,096 to 53,248 bytes — 1 to 13 pages** (n = 90; one 45-run
+        //   sample on this machine ranged 4,096-28,672, another reached 53,248).
+        // * The bound, `mapped / 128` = 131,072, therefore sits **2.46x** above the largest movement
+        //   observed — not the 8x an earlier version of this comment claimed from the smaller sample.
+        // * The invisibility gap is **128x asserted**; **315x to 4,096x observed**. "At least 1,024x"
+        //   was arithmetic on the largest of twelve printed deltas and did not follow from the bound.
+        //
+        // **What the residual spread is, and what it is not.** `SERIAL` serialises test *bodies*, not
+        // libtest's thread creation, so thread stacks still move a process-global counter inside this
+        // window; that is the most likely source of the 1-13 page range. It is *not* evidence about
+        // sections: D10's `size/512` predicts 65,536 bytes for 32 MiB of mapping and the observed
+        // maximum is 53,248, **within 20% of it**. So whether that model transfers to a mapped
+        // section view is **unverified here**, not refuted — D10 and D15 measured fully-touched
+        // anonymous commit, whereas here only the RW view is fully touched and the RX view is read at
+        // 130 sampled blocks. Separating page tables from allocator noise needs an experiment this
+        // test does not perform.
+        //
+        // **`mapped / 128` is a fitted constant, not a principled one.** It was chosen to clear the
+        // observed spread with room, and it is honest to say so. What makes it sound is the shape
+        // rather than the value: it is two-sided, so noise in either direction cannot fail it the way
+        // a bound at zero did; the dominant noise source was removed rather than tolerated; and
+        // `PrivateUsage` is per-process, so no other crate's tests can breach it. The claim it
+        // encodes is "16 MiB of arena is negligible in this process's private commit", which is what
+        // D15 needs — not a measurement of page tables, which this test cannot make.
         assert!(
             private_delta.unsigned_abs() as usize <= mapped / 128,
             "the arena's {mapped} bytes must be invisible to process_commit_charge (D15): \
@@ -493,6 +513,66 @@ mod x86_64 {
             left_behind.abs() < mapped as i64 / 8,
             "dropping the arenas left {left_behind} bytes behind"
         );
+    }
+
+    /// The sealed check's **success** path: a write to an unsealed page, while another page in the
+    /// same arena is sealed.
+    ///
+    /// This is the case nothing covered. Every other test of the sealed check asserts a *refusal*,
+    /// so an implementation that simply refused every write once anything was sealed would have
+    /// passed all of them — and it would have made the arena useless the first time a translator
+    /// sealed a block, which is a JIT's normal steady state.
+    ///
+    /// It is also the test that executes the `debug_assert!` guarding the arena lock across the
+    /// store, because it is the only one that reaches the slow path and gets through it. `cargo
+    /// test` builds with debug assertions on, so dropping that guard early is caught here
+    /// deterministically, with no race and no flake.
+    #[test]
+    fn a_write_to_an_unsealed_page_succeeds_while_another_page_is_sealed() {
+        let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        let arena = CodeArena::new().expect("arena");
+
+        // Page-sized blocks, so the two live on different pages and sealing one leaves the other
+        // genuinely writable rather than incidentally so.
+        let sealed = arena.alloc(page_size()).expect("a block to seal");
+        let live = arena.alloc(page_size()).expect("a block to keep patching");
+        arena.write(&sealed, 0, &standalone(3, 4)).expect("emit");
+        arena.write(&live, 0, &standalone(5, 6)).expect("emit");
+        // SAFETY: each block holds the 14-byte `standalone` function just written.
+        assert_eq!(unsafe { call(&sealed, 10) }, 34);
+        // SAFETY: as above.
+        assert_eq!(unsafe { call(&live, 10) }, 56);
+
+        arena.seal(&sealed).expect("seal one of them");
+        assert_eq!(
+            arena.stats().sealed,
+            page_size(),
+            "exactly one page is sealed, so the other block's page is not"
+        );
+
+        // The slow path, succeeding. Every write from here on takes the lock, checks the bitmap,
+        // finds nothing sealed in range, and stores — which is what a translator does for the whole
+        // rest of its life once it has sealed its first block.
+        for (m, a, argument, expected) in [(7u32, 1u32, 6u32, 43u32), (2, 100, 21, 142)] {
+            arena.write(&live, 0, &standalone(m, a)).expect("a write to an unsealed page");
+            // SAFETY: the block was just rewritten with a complete 14-byte function.
+            assert_eq!(unsafe { call(&live, argument) }, expected, "{argument} * {m} + {a}");
+        }
+
+        // And the sealed block is still refused, so the check is discriminating rather than absent.
+        assert!(matches!(
+            arena.write(&sealed, 0, &standalone(9, 9)),
+            Err(MemError::BlockSealed { .. })
+        ));
+        // SAFETY: unchanged since it was sealed.
+        assert_eq!(unsafe { call(&sealed, 10) }, 34, "a refused write must not have landed");
+
+        // Unsealing brings it back, and the arena leaves the slow path entirely.
+        arena.unseal(&sealed).expect("unseal");
+        assert_eq!(arena.stats().sealed, 0);
+        arena.write(&sealed, 0, &standalone(11, 2)).expect("patch after unseal");
+        // SAFETY: as above.
+        assert_eq!(unsafe { call(&sealed, 4) }, 46);
     }
 
     /// The executable view is still not writable after a seal-and-unseal cycle.

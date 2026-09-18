@@ -458,7 +458,8 @@ impl CodeArena {
         // lock, so while it is held no page's protection can change underneath the copy. Keeping it
         // is what turns the check from "usually right" into a guarantee, and it costs the fast path
         // nothing because the fast path never takes it.
-        let _sealed_guard = if self.sealed_pages.load(Ordering::Acquire) != 0 {
+        let sealed_path = self.sealed_pages.load(Ordering::Acquire) != 0;
+        let _sealed_guard = if sealed_path {
             let chunks = self.inner.lock();
             let chunk = chunks.get(block.chunk).ok_or(MemError::BlockOutsideChunk {
                 write: block.write,
@@ -479,6 +480,21 @@ impl CodeArena {
         } else {
             None
         };
+        // The guard's whole purpose, pinned deterministically rather than argued for.
+        //
+        // It would be easy to believe this holds while quietly dropping the guard after the check —
+        // the code still compiles, every test still passes, and only a race would ever notice. A
+        // racing test would notice it at some rate, which is worse than not testing it (that is what
+        // `arena_execution.rs`'s `SERIAL` comment is about). This is the third option: it is exact,
+        // it cannot flake, and it fires on the *slow path flag* rather than on the guard, so
+        // turning the binding below into `let _ =` is caught rather than satisfied vacuously.
+        // (That is mutation `mem-A14`. `drop(chunks); None` would be the obvious mutation and does
+        // not compile: both arms become `None` and the guard type stops being inferable.)
+        debug_assert!(
+            !sealed_path || self.inner.is_locked(),
+            "the arena lock must still be held across this store: it is what stops a concurrent \
+             seal changing these pages' protection between the check above and the copy below"
+        );
         // SAFETY: `[block.write + offset, + bytes.len())` is inside the block, which is inside the
         // chunk's writable view — checked above — and the arena never hands the same range out
         // twice, so this is an exclusive write to memory the arena owns. The source and destination
@@ -492,7 +508,11 @@ impl CodeArena {
                 bytes.len(),
             );
         }
-        drop(_sealed_guard);
+        // `_sealed_guard` falls out of scope here, which is the point: a leading underscore in a
+        // *binding* still holds the value to the end of the block, and it is that binding — not an
+        // explicit `drop` — that keeps the lock across the store above. Writing `let _ =` instead
+        // would drop it at the end of its own statement and silently reopen the race, which is what
+        // mutation `mem-A14` does and what the `debug_assert!` above catches.
         Ok(())
     }
 
