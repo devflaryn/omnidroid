@@ -557,9 +557,15 @@ MUTATIONS = [
     # There is deliberately no row for dropping the `&& owns_guest_paging` term from the arming
     # condition. Since `DynarmicBackend::new` now *refuses* a platform that has a vectored handler
     # and could not give us one, `owns_guest_paging` is false only where there is no handler
-    # implementation at all -- Linux and macOS -- so on this host the term cannot be made to differ
-    # and the row would MISS. A row that cannot fail is worse than no row (Task 1), so the gap is
-    # written down here instead.
+    # implementation at all -- Linux and macOS -- so on this host the term is hard to make differ
+    # and a row written today would MISS. A row that cannot fail is worse than no row (Task 1).
+    #
+    # It is *closable*, though, and saying otherwise would overstate the obstacle: the precedent is
+    # `create_misconfigured_thread`, a `test-support`-gated constructor that builds a context the
+    # production path refuses precisely so an unreachable check can be shown to fire. A test-only
+    # option that declines to install the pager would do the same here. It is not done because the
+    # check is a platform guard rather than a defect anyone has hit, and a new bypass of a safety
+    # property is not free -- a judgement about priority, not about possibility.
 ]
 
 

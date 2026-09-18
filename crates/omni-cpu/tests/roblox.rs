@@ -183,10 +183,19 @@ fn predicted_sextet(c: u8) -> i32 {
 /// leave room for the *microsecond* term as well, which contributes up to ±1000 ms, so it is
 /// `(i64::MAX - 1000) / 1000`.
 ///
-/// Rather than quietly editing the constant to match the run — which is precisely the fitting this
-/// gate exists to rule out — the bound is now decoded from the four instruction words the test
-/// already asserts byte-for-byte, and *then* cross-checked against the derivation. Both have to
-/// agree, so neither the binary nor the reasoning can drift on its own.
+/// Rather than quietly editing the constant to match the run — which *would* be fitting, and is what
+/// this gate exists to rule out — the bound is decoded from the four instruction words the test
+/// already asserts byte-for-byte, and *then* cross-checked against the derivation.
+///
+/// **Decoding it is not fitting, and three properties are what make the difference.** The decoded
+/// value is checked against an independently stated closed form, `(i64::MAX - 1000) / 1000`, which
+/// is the unique largest `L` with `L * 1000 + 1000 <= i64::MAX` rather than a number chosen to fit.
+/// [`movz_movk_immediate`] refuses anything that is not a `MOVZ`/`MOVK`, so what is read is the ARM
+/// ARM's meaning of fixed bits and not an arbitrary word. And the decoded constant drives the test's
+/// **inputs** as well as its expectations, so a wrong decode desynchronises the two and fails rather
+/// than agreeing with itself. It would be fitting if the value came from the *run*, if the
+/// closed-form check were dropped, or if the whole model were decoded rather than this one
+/// parameter.
 fn movz_movk_immediate(words: &[u32]) -> u64 {
     // `sf opc:2 100101 hw:2 imm16:16 Rd:5`, with `sf = 1` for the 64-bit forms and
     // `opc = 10` for MOVZ, `11` for MOVK. So a 64-bit MOVZ is `0xD280_0000` and a MOVK
