@@ -1,0 +1,42 @@
+Vendored sources for dynarmic-sys.  Touch this file after editing anything
+under vendor/; it is the only thing under vendor/ that the build script tells
+Cargo to watch.
+
+dynarmic/
+    upstream   https://github.com/yuzu-mirror/dynarmic.git
+    revision   9d4582339990d4eae53f1dc7160686920fc2075c
+    version    6.7.0 (2024-03-05)
+    licence    ISC / 0BSD  (see dynarmic/LICENSE.txt)
+    state      pristine at that revision; no Omnidroid patches applied yet
+    removed    .git/, .github/, docs/  -- build inputs only
+
+    Why a vendored tree and not a submodule: `merryhime/dynarmic`, the
+    original, already 404s (D5).  yuzu-mirror is itself a mirror of a
+    repository that disappeared, and a mirror of a dead upstream is exactly
+    the kind of dependency that vanishes next.  A submodule would make a
+    fresh clone depend on it still existing; a vendored tree does not.  It
+    also satisfies Global Constraint 8 outright rather than conditionally:
+    there is nothing to fetch, at build time or at test time.
+
+    externals/ are vendored by upstream as git subtrees, not submodules, so
+    the revision above pins them too.
+
+boost/
+    upstream   Boost 1.88.0, headers only
+    licence    Boost Software License 1.0 (see boost/LICENSE_1_0.txt)
+    contents   a 1,786-file subset, not all of Boost (which is 185 MiB)
+
+    Boost is an *undeclared* dynarmic dependency.  The prior-art survey listed
+    fmt / mcl / xbyak / zydis / robin-map and Boost was not in it; dynarmic in
+    fact needs boost::icl (interval_set, interval_map -- code-cache
+    invalidation ranges) and boost::variant (the IR terminal type).
+
+    The subset is derived, not curated: see ../tools/derive_boost_subset.py.
+    It is the transitive closure of what MSVC actually opened while building
+    the pin, unioned with boost/preprocessor/** and
+    boost/mpl/aux_/preprocessed/** in full, because those are reached through
+    macro-built #include directives that no textual scan can follow and whose
+    contents differ per compiler.
+
+    Note for a future non-MSVC build: the closure was measured with MSVC.  Re-run
+    the derivation script when adding a toolchain rather than guessing.
