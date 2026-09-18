@@ -2,6 +2,9 @@
 //!
 //! Every read names what it was reading, so an out-of-bounds error in a 109 MB file says which
 //! structure was truncated rather than only that something was.
+//!
+//! [`View`] is public because the table parsers in [`crate::reloc`] take one, and a public
+//! function whose parameter type cannot be constructed is not actually callable.
 
 use crate::error::{ElfError, Result, What};
 

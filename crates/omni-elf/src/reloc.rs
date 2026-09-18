@@ -184,12 +184,23 @@ fn parse_plain(
             entsize: expected as u64,
         });
     }
+    // `view` is already a slice of the file, so `count` is bounded by the bytes that really
+    // exist: a plain table cannot amplify. The reservation is still fallible, because the one
+    // thing this crate must never do to a caller is abort the process.
     let count = (size / expected as u64) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::new();
+    try_reserve(&mut out, count)?;
     for i in 0..count {
         out.push(parse_one(view, i * expected)?);
     }
     Ok(out)
+}
+
+fn try_reserve(out: &mut Vec<Rela>, count: usize) -> Result<()> {
+    out.try_reserve_exact(count)
+        .map_err(|_| ElfError::AllocationFailed {
+            bytes: count.saturating_mul(core::mem::size_of::<Rela>()),
+        })
 }
 
 /// Decode a `DT_RELR` bitmap into explicit `R_AARCH64_RELATIVE` relocations.
@@ -197,7 +208,18 @@ fn parse_plain(
 /// No library in the target APK uses `RELR` (see D9), but a table that exists and is ignored
 /// applies zero relocations silently, so it is decoded rather than skipped. `RELR` carries no
 /// addend: the value already at `r_offset` is the addend.
-pub fn parse_relr_table(view: &View<'_>, size: u64, entsize: Option<u64>) -> Result<Vec<Rela>> {
+///
+/// A `RELR` bitmap amplifies: each eight-byte word can carry 63 relocations, so 8 bytes of input
+/// can become 63 × 24 = 1,512 bytes of output, a 189× expansion. Unlike `APS2` the expansion is
+/// bounded by the input size, so it cannot run forever — but it can still ask for a great deal of
+/// memory, so the count is computed first (allocating nothing), checked against `limits`, and only
+/// then reserved, fallibly.
+pub fn parse_relr_table(
+    view: &View<'_>,
+    size: u64,
+    entsize: Option<u64>,
+    limits: crate::aps2::Aps2Limits,
+) -> Result<Vec<Rela>> {
     const WORD: usize = 8;
     if let Some(actual) = entsize {
         if actual != WORD as u64 {
@@ -215,11 +237,33 @@ pub fn parse_relr_table(view: &View<'_>, size: u64, entsize: Option<u64>) -> Res
             entsize: WORD as u64,
         });
     }
-    let count = (size / WORD as u64) as usize;
+    let words = (size / WORD as u64) as usize;
+
+    // Pass one: how many relocations does the bitmap describe? No allocation happens here, so a
+    // hostile table is rejected before a single byte is reserved.
+    let mut count: u64 = 0;
+    for i in 0..words {
+        let entry = view.u64("DT_RELR entry", i * WORD)?;
+        count = count.saturating_add(if entry & 1 == 0 {
+            1
+        } else {
+            (entry >> 1).count_ones() as u64
+        });
+    }
+    if count > limits.max_relocations {
+        return Err(ElfError::RelocationCountExceedsLimit {
+            what: "DT_RELR",
+            count,
+            limit: limits.max_relocations,
+        });
+    }
+
+    // Pass two: expand.
     let r_info = (R_AARCH64_RELATIVE as u64) & 0xffff_ffff;
     let mut out = Vec::new();
+    try_reserve(&mut out, count as usize)?;
     let mut where_: u64 = 0;
-    for i in 0..count {
+    for i in 0..words {
         let entry = view.u64("DT_RELR entry", i * WORD)?;
         if entry & 1 == 0 {
             // An even word is an address, and the next relocation slot follows it.
@@ -248,6 +292,7 @@ pub fn parse_relr_table(view: &View<'_>, size: u64, entsize: Option<u64>) -> Res
             where_ = where_.wrapping_add(63 * WORD as u64);
         }
     }
+    debug_assert_eq!(out.len() as u64, count, "the two RELR passes must agree");
     Ok(out)
 }
 
@@ -286,7 +331,8 @@ mod tests {
         let bitmap = (((1u64 << 0) | (1u64 << 2)) << 1) | 1;
         buf.extend_from_slice(&bitmap.to_le_bytes());
         let view = View::new(&buf);
-        let relocs = parse_relr_table(&view, buf.len() as u64, Some(8)).unwrap();
+        let limits = crate::aps2::Aps2Limits::new(1 << 20);
+        let relocs = parse_relr_table(&view, buf.len() as u64, Some(8), limits).unwrap();
         let offsets: Vec<u64> = relocs.iter().map(|r| r.r_offset).collect();
         assert_eq!(offsets, vec![0x2000, 0x2008, 0x2018]);
         assert!(relocs.iter().all(|r| r.r_type() == R_AARCH64_RELATIVE));

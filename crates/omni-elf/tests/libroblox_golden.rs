@@ -301,6 +301,7 @@ fn streaming_decode_agrees_with_the_vec_decode() {
             count += 1;
             sum_offset = sum_offset.wrapping_add(r.r_offset);
             sum_addend += r.r_addend as i128;
+            Ok(())
         })
         .unwrap()
         .expect("libroblox.so has a packed table");
@@ -321,7 +322,13 @@ fn decoding_the_whole_relocation_set_is_not_accidentally_quadratic() {
     // inside this bound.
     let start = std::time::Instant::now();
     let mut count = 0usize;
-    let summary = elf.decode_packed_with(|_| count += 1).unwrap().unwrap();
+    let summary = elf
+        .decode_packed_with(|_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
     let streaming = start.elapsed();
 
     let start = std::time::Instant::now();
@@ -618,4 +625,89 @@ fn notes_report_the_ndk_and_no_hardening_features() {
         "no PT_GNU_PROPERTY segment"
     );
     assert_eq!(elf.build_id().unwrap().map(|b| b.len()), Some(20));
+}
+
+#[test]
+fn the_relocation_count_limit_has_two_orders_of_magnitude_of_headroom() {
+    let Some(bytes) = common::main_lib() else { return };
+    let elf = image(bytes);
+
+    // The ceiling is derived from the object's own loadable size, so it is worth pinning both
+    // the derivation and the margin: if a future library ever came close to its own cap, this
+    // number would shrink long before anything was rejected.
+    assert_eq!(elf.loadable_size(), 120_767_564, "sum of PT_LOAD p_memsz");
+    let limits = elf.aps2_limits();
+    assert_eq!(limits.max_relocations, 60_383_782);
+    assert_eq!(
+        limits,
+        omni_elf::Aps2Limits::for_loadable_size(elf.loadable_size())
+    );
+    let headroom = limits.max_relocations / GRAND_TOTAL as u64;
+    assert!(
+        headroom >= 100,
+        "only {headroom}x headroom between {GRAND_TOTAL} relocations and the {} cap",
+        limits.max_relocations
+    );
+    // And the blob's own declared count is of course far below it, which is why the real decode
+    // in the other tests never touches the limit.
+    let relocs = elf.relocations().unwrap();
+    let packed = relocs
+        .general_with(RelocEncoding::AndroidPackedRela)
+        .unwrap();
+    assert!(packed.packed.unwrap().declared_count < limits.max_relocations);
+}
+
+#[test]
+fn a_tampered_declared_count_is_refused_through_elfimage_rather_than_hanging() {
+    let Some(bytes) = common::main_lib() else { return };
+    let elf = image(bytes);
+    let table = elf.dynamic().android_rela.expect("DT_ANDROID_RELA");
+    let blob_at = elf
+        .vaddr_to_offset(table.vaddr)
+        .expect("the blob has a file offset");
+
+    // Overwrite the real blob's header in place with the magic followed by a 2^62 relocation
+    // count, leaving the remaining ~2.1 MB of the blob untouched. This is D6's expected case: a
+    // tampered binary. Done on the real 109 MB file so the check is proven to be on the real
+    // ElfImage path, not only on a synthetic blob handed straight to the decoder.
+    let mut mutated = bytes.to_vec();
+    let mut header = Vec::from(*b"APS2");
+    omni_elf::aps2::encode_sleb128(1 << 62, &mut header);
+    mutated[blob_at..blob_at + header.len()].copy_from_slice(&header);
+
+    let tampered = ElfImage::parse(&mutated).expect("only the blob was touched");
+    assert_eq!(tampered.aps2_limits().max_relocations, 60_383_782);
+
+    // Both entry points, both bounded, both fast. Before the fix, `relocations()` aborted the
+    // process on a failed 12 GB allocation and `decode_packed_with` streamed hundreds of
+    // millions of relocations without stopping.
+    let start = std::time::Instant::now();
+    let err = tampered
+        .relocations()
+        .expect_err("a 2^62 declared count must be refused");
+    assert_eq!(
+        err,
+        omni_elf::ElfError::Aps2CountExceedsLimit {
+            declared: 1 << 62,
+            limit: 60_383_782,
+        }
+    );
+
+    let mut produced = 0u64;
+    let err = tampered
+        .decode_packed_with(|_| {
+            produced += 1;
+            Ok(())
+        })
+        .expect_err("the streaming path must be refused too");
+    assert!(matches!(
+        err,
+        omni_elf::ElfError::Aps2CountExceedsLimit { .. }
+    ));
+    assert_eq!(produced, 0, "nothing may be produced");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "refusing a tampered count took {elapsed:?}"
+    );
 }

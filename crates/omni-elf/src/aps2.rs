@@ -47,6 +47,12 @@
 //! trailing bytes, a non-positive group size (which in bionic's loop shape cannot terminate),
 //! a group that would overrun the declared count, unknown group-flag bits, and a truncated
 //! stream (bionic aborts the process instead).
+//!
+//! We also bound the declared relocation count against the object's own loadable size, because a
+//! fully-grouped group spends **zero** bytes per relocation and so a thirty-byte blob can declare
+//! 2⁶². See [`Aps2Limits`] for the bound and the argument that it cannot reject a real binary.
+//! Allocation is fallible throughout: this crate never aborts the host process on malformed
+//! input, however hostile.
 
 use crate::error::{ElfError, Result};
 use crate::reloc::Rela;
@@ -201,23 +207,96 @@ pub struct PackedRelocations {
     pub summary: Aps2Summary,
 }
 
+/// How many relocations a blob is allowed to declare.
+///
+/// # Why a limit is unavoidable
+///
+/// A group whose flags share the offset delta, the `r_info` **and** the addend spends **zero**
+/// bytes per relocation: all of its per-relocation fields live in the group header. That is not a
+/// defect, it is the point of the format. The consequence is that a thirty-byte blob can
+/// legitimately declare 2⁶² relocations, and no bound derived only from `blob.len()` can
+/// distinguish that from a valid encoding. Without a limit, the streaming decoder runs
+/// essentially forever and the `Vec` decoder tries to allocate terabytes.
+///
+/// # The bound, and why it cannot reject a real binary
+///
+/// Every relocation must be *applied*, which means writing at least
+/// [`Self::MIN_RELOCATION_FOOTPRINT`] bytes somewhere inside the object's loadable image. So the
+/// number of relocations whose writes are all distinct is at most
+/// `sum(PT_LOAD p_memsz) / MIN_RELOCATION_FOOTPRINT`. Exceeding that is a pigeonhole argument:
+/// at least two relocations must write the same bytes, so one of them is dead — its effect is
+/// entirely overwritten by the other. No linker emits a dead relocation, and a blob that
+/// contains one is not a minimal relocation set for the image it ships in.
+///
+/// The bound is derived from the binary rather than invented, and it is generous: across the
+/// eleven ARM64 libraries in `Roblox-2.738.1397.apk` the headroom between the real relocation
+/// count and this cap ranges from **75×** (`libeigen_blas.so`) to **341×** (`libyuv_shared.so`),
+/// with `libroblox.so`'s 568,806 relocations sitting 106× below its cap of 60,383,782. An
+/// assertion in the test suite pins that margin, so a future library that came anywhere near the
+/// cap would be visible long before it was rejected.
+///
+/// Note that validating each decoded `r_offset` against the loadable segments — a check the
+/// applying loader wants anyway — is *not* a substitute: a group with a shared offset delta of
+/// zero repeats one perfectly valid offset indefinitely. Only a count bound terminates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aps2Limits {
+    /// Reject a blob declaring more relocations than this.
+    pub max_relocations: u64,
+}
+
+impl Aps2Limits {
+    /// The fewest bytes any AArch64 dynamic relocation writes to its target.
+    ///
+    /// `R_AARCH64_ABS16` is the narrowest type in the ABI at two bytes. Every type that actually
+    /// appears in a dynamic table is four or eight, so using two errs towards accepting input.
+    pub const MIN_RELOCATION_FOOTPRINT: u64 = 2;
+
+    /// An explicit ceiling, for callers that know their own bound.
+    pub const fn new(max_relocations: u64) -> Self {
+        Self { max_relocations }
+    }
+
+    /// Derive the ceiling from the total `p_memsz` of the object's `PT_LOAD` segments.
+    pub const fn for_loadable_size(loadable_bytes: u64) -> Self {
+        Self {
+            max_relocations: loadable_bytes / Self::MIN_RELOCATION_FOOTPRINT,
+        }
+    }
+}
+
 /// Decode a `DT_ANDROID_RELA` blob into a `Vec`.
-pub fn decode_rela(blob: &[u8]) -> Result<PackedRelocations> {
-    decode(blob, PackedFormat::Rela)
+pub fn decode_rela(blob: &[u8], limits: Aps2Limits) -> Result<PackedRelocations> {
+    decode(blob, PackedFormat::Rela, limits)
 }
 
 /// Decode a `DT_ANDROID_REL` blob into a `Vec`.
-pub fn decode_rel(blob: &[u8]) -> Result<PackedRelocations> {
-    decode(blob, PackedFormat::Rel)
+pub fn decode_rel(blob: &[u8], limits: Aps2Limits) -> Result<PackedRelocations> {
+    decode(blob, PackedFormat::Rel, limits)
 }
 
 /// Decode a packed blob into a `Vec`, with the format given explicitly.
-pub fn decode(blob: &[u8], format: PackedFormat) -> Result<PackedRelocations> {
-    // The declared count is read before any allocation, but it is attacker-controlled data in
-    // the general case, so the vector is grown as relocations arrive rather than reserved to a
-    // declared size that could be 2^63.
-    let mut relocations = Vec::new();
-    let summary = decode_with(blob, format, |r| relocations.push(r))?;
+///
+/// Allocation is fallible throughout: a blob that declares more relocations than the process can
+/// hold produces [`ElfError::AllocationFailed`] rather than aborting, and the vector grows
+/// incrementally so a large declared count cannot cause a huge speculative reservation that a
+/// later truncation error then throws away.
+pub fn decode(
+    blob: &[u8],
+    format: PackedFormat,
+    limits: Aps2Limits,
+) -> Result<PackedRelocations> {
+    let mut relocations: Vec<Rela> = Vec::new();
+    let summary = decode_with(blob, format, limits, |r| {
+        // `try_reserve(1)` is a length check when there is spare capacity and an amortised
+        // (doubling) fallible growth when there is not. `push` alone aborts the process on OOM.
+        relocations
+            .try_reserve(1)
+            .map_err(|_| ElfError::AllocationFailed {
+                bytes: (relocations.len() + 1).saturating_mul(core::mem::size_of::<Rela>()),
+            })?;
+        relocations.push(r);
+        Ok(())
+    })?;
     Ok(PackedRelocations {
         relocations,
         summary,
@@ -226,11 +305,18 @@ pub fn decode(blob: &[u8], format: PackedFormat) -> Result<PackedRelocations> {
 
 /// Decode a packed blob, handing each relocation to `sink` as it is produced.
 ///
-/// This is the allocation-free entry point; Task 5 can apply relocations straight from here
-/// without materialising 568,272 × 24 bytes.
-pub fn decode_with<F>(blob: &[u8], format: PackedFormat, mut sink: F) -> Result<Aps2Summary>
+/// This is the allocation-free entry point; a loader can apply relocations straight from here
+/// without materialising 568,272 × 24 bytes. The sink returns a [`Result`] so it can stop the
+/// decode on the first relocation it rejects — checking `r_offset` against the loadable segments,
+/// for instance — and so that the `Vec` wrapper above can fail on allocation instead of aborting.
+pub fn decode_with<F>(
+    blob: &[u8],
+    format: PackedFormat,
+    limits: Aps2Limits,
+    mut sink: F,
+) -> Result<Aps2Summary>
 where
-    F: FnMut(Rela),
+    F: FnMut(Rela) -> Result<()>,
 {
     if blob.len() < APS2_MAGIC.len() {
         return Err(ElfError::Aps2TooShort(blob.len()));
@@ -247,6 +333,14 @@ where
         return Err(ElfError::Aps2NegativeCount(declared));
     }
     let declared = declared as u64;
+    // Checked here, before a single group is read, so a hostile count costs one SLEB128 read and
+    // produces nothing. See `Aps2Limits` for why the bound is necessary and why it is safe.
+    if declared > limits.max_relocations {
+        return Err(ElfError::Aps2CountExceedsLimit {
+            declared,
+            limit: limits.max_relocations,
+        });
+    }
 
     let initial_offset = dec.pop_front()?;
     let mut r_offset = initial_offset as u64;
@@ -337,7 +431,7 @@ where
                 r_offset,
                 r_info,
                 r_addend,
-            });
+            })?;
         }
         decoded += group_size;
     }

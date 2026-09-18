@@ -16,6 +16,14 @@
 //! The other ten libraries in the same APK use plain `DT_RELA` + `DT_JMPREL`, so both styles are
 //! supported. See [`aps2`] for the format and for the deliberate divergences from bionic.
 //!
+//! # Hostile input
+//!
+//! A tampered or corrupt library is an expected case, not an exceptional one (D6). Nothing here
+//! panics, and nothing aborts the process: every read is bounds-checked, every allocation sized
+//! from file data is fallible, and the packed-relocation count is bounded by the object's own
+//! loadable size — a fully-grouped `APS2` group costs zero bytes per relocation, so an
+//! unvalidated count lets thirty bytes ask for terabytes. See [`Aps2Limits`].
+//!
 //! # Entry point
 //!
 //! ```no_run
@@ -39,22 +47,22 @@ pub mod dynamic;
 pub mod error;
 pub mod header;
 pub mod notes;
-mod reader;
+pub mod reader;
 pub mod reloc;
 pub mod segment;
 pub mod symbols;
 
-pub use crate::aps2::{Aps2Summary, PackedFormat, PackedRelocations, Sleb128Decoder};
+pub use crate::aps2::{Aps2Limits, Aps2Summary, PackedFormat, PackedRelocations, Sleb128Decoder};
 pub use crate::dynamic::{DynArray, DynEntry, DynTable, Dynamic};
 pub use crate::error::{ElfError, Result};
 pub use crate::header::{FileHeader, Ident};
 pub use crate::notes::{AndroidIdent, GnuProperties, Note};
+pub use crate::reader::View;
 pub use crate::reloc::{RelocEncoding, Rela, RelocationTable, Relocations};
 pub use crate::segment::{Section, Segment, SegmentFlags};
 pub use crate::symbols::{GnuHash, StrTab, Sym, SymbolTable, SysvHash};
 
 use crate::consts::*;
-use crate::reader::View;
 
 /// A parsed, validated AArch64 ELF64 shared object, borrowing the file bytes.
 pub struct ElfImage<'a> {
@@ -211,6 +219,24 @@ impl<'a> ElfImage<'a> {
             max = max.max(s.vaddr_end());
         }
         (min != u64::MAX).then_some((min, max - min))
+    }
+
+    /// Total `p_memsz` across every `PT_LOAD` segment: the bytes this object can ever write to.
+    ///
+    /// Saturating rather than wrapping, so a malformed header inflates the figure instead of
+    /// collapsing it — a bound derived from this must fail safe towards *accepting* input.
+    pub fn loadable_size(&self) -> u64 {
+        self.load_segments()
+            .fold(0u64, |acc, s| acc.saturating_add(s.p_memsz))
+    }
+
+    /// The relocation-count ceiling this object's own size justifies.
+    ///
+    /// See [`Aps2Limits`] for the argument that this cannot reject a real binary. It is exposed
+    /// so a caller can inspect the bound it is being held to, and so tests can assert the margin
+    /// between the real relocation count and the cap.
+    pub fn aps2_limits(&self) -> Aps2Limits {
+        Aps2Limits::for_loadable_size(self.loadable_size())
     }
 
     // -----------------------------------------------------------------------------------------
@@ -528,7 +554,7 @@ impl<'a> ElfImage<'a> {
                 encoding: RelocEncoding::Relr,
                 vaddr: t.vaddr,
                 size: t.size,
-                relocations: reloc::parse_relr_table(&view, t.size, t.entsize)?,
+                relocations: reloc::parse_relr_table(&view, t.size, t.entsize, self.aps2_limits())?,
                 packed: None,
             });
         }
@@ -574,7 +600,7 @@ impl<'a> ElfImage<'a> {
         format: PackedFormat,
     ) -> Result<RelocationTable> {
         let blob = self.slice_at_vaddr(tag, t.vaddr, t.size)?;
-        let decoded = aps2::decode(blob, format)?;
+        let decoded = aps2::decode(blob, format, self.aps2_limits())?;
         tracing::debug!(
             tag,
             relocations = decoded.relocations.len(),
@@ -598,7 +624,7 @@ impl<'a> ElfImage<'a> {
     /// Returns `Ok(None)` when the object has neither Android packed-relocation tag.
     pub fn decode_packed_with<F>(&self, sink: F) -> Result<Option<Aps2Summary>>
     where
-        F: FnMut(Rela),
+        F: FnMut(Rela) -> Result<()>,
     {
         let (tag, table, format) = if let Some(t) = self.dynamic.android_rela {
             ("DT_ANDROID_RELA", t, PackedFormat::Rela)
@@ -608,7 +634,7 @@ impl<'a> ElfImage<'a> {
             return Ok(None);
         };
         let blob = self.slice_at_vaddr(tag, table.vaddr, table.size)?;
-        Ok(Some(aps2::decode_with(blob, format, sink)?))
+        Ok(Some(aps2::decode_with(blob, format, self.aps2_limits(), sink)?))
     }
 
     // -----------------------------------------------------------------------------------------

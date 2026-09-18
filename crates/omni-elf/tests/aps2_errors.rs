@@ -6,8 +6,8 @@
 //! this crate exists to prevent.
 
 use omni_elf::aps2::{
-    self, encode_rela_ungrouped, encode_sleb128, PackedFormat, Sleb128Decoder, APS2_MAGIC,
-    RELOCATION_GROUPED_BY_ADDEND_FLAG, RELOCATION_GROUPED_BY_INFO_FLAG,
+    self, encode_rela_ungrouped, encode_sleb128, Aps2Limits, PackedFormat, Sleb128Decoder,
+    APS2_MAGIC, RELOCATION_GROUPED_BY_ADDEND_FLAG, RELOCATION_GROUPED_BY_INFO_FLAG,
     RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG, RELOCATION_GROUP_HAS_ADDEND_FLAG,
 };
 use omni_elf::consts::*;
@@ -19,6 +19,12 @@ fn rela(offset: u64, sym: u32, ty: u32, addend: i64) -> Rela {
         r_info: ((sym as u64) << 32) | ty as u64,
         r_addend: addend,
     }
+}
+
+/// A ceiling far above anything these hand-built blobs declare, so the limit never masks the
+/// behaviour under test. The limit itself is tested separately, and against the real binary.
+fn generous() -> Aps2Limits {
+    Aps2Limits::new(1_000_000)
 }
 
 fn sample() -> Vec<Rela> {
@@ -37,7 +43,8 @@ fn sample() -> Vec<Rela> {
 fn a_well_formed_blob_round_trips_exactly() {
     let relocs = sample();
     let blob = encode_rela_ungrouped(&relocs);
-    let decoded = aps2::decode_rela(&blob).expect("the encoder must produce a decodable blob");
+    let decoded =
+        aps2::decode_rela(&blob, generous()).expect("the encoder must produce a decodable blob");
     assert_eq!(decoded.relocations, relocs);
     assert_eq!(decoded.summary.declared_count, relocs.len() as u64);
     assert_eq!(decoded.summary.decoded_count, relocs.len() as u64);
@@ -53,7 +60,7 @@ fn a_well_formed_blob_round_trips_exactly() {
 #[test]
 fn an_empty_relocation_set_is_legal() {
     let blob = encode_rela_ungrouped(&[]);
-    let decoded = aps2::decode_rela(&blob).unwrap();
+    let decoded = aps2::decode_rela(&blob, generous()).unwrap();
     assert!(decoded.relocations.is_empty());
     assert_eq!(decoded.summary.bytes_consumed, blob.len());
     assert_eq!(decoded.summary.group_count, 0);
@@ -64,15 +71,15 @@ fn bad_magic_is_rejected() {
     let mut blob = encode_rela_ungrouped(&sample());
     blob[3] = b'1'; // "APS1"
     assert_eq!(
-        aps2::decode_rela(&blob).unwrap_err(),
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
         ElfError::Aps2BadMagic(*b"APS1")
     );
     // And a blob shorter than the magic.
     assert_eq!(
-        aps2::decode_rela(b"AP").unwrap_err(),
+        aps2::decode_rela(b"AP", generous()).unwrap_err(),
         ElfError::Aps2TooShort(2)
     );
-    assert_eq!(aps2::decode_rela(&[]).unwrap_err(), ElfError::Aps2TooShort(0));
+    assert_eq!(aps2::decode_rela(&[], generous()).unwrap_err(), ElfError::Aps2TooShort(0));
 }
 
 #[test]
@@ -81,7 +88,7 @@ fn truncation_at_every_length_is_an_error_and_never_a_panic() {
     // Every proper prefix must fail. Chopping one byte at a time walks the truncation point
     // through the count, the initial offset, the group header and every per-relocation field.
     for cut in 0..blob.len() {
-        let err = aps2::decode_rela(&blob[..cut])
+        let err = aps2::decode_rela(&blob[..cut], generous())
             .unwrap_err_or_else(|| panic!("prefix of length {cut} must not decode"));
         assert!(
             matches!(
@@ -96,7 +103,7 @@ fn truncation_at_every_length_is_an_error_and_never_a_panic() {
         );
     }
     // And the whole thing still decodes, so the loop above was testing something.
-    assert!(aps2::decode_rela(&blob).is_ok());
+    assert!(aps2::decode_rela(&blob, generous()).is_ok());
 }
 
 /// `Result::unwrap_err` needs `T: Debug`; this keeps the message specific without that bound.
@@ -119,7 +126,7 @@ fn trailing_bytes_are_an_error() {
     let good = blob.len();
     blob.push(0);
     assert_eq!(
-        aps2::decode_rela(&blob).unwrap_err(),
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
         ElfError::Aps2TrailingBytes {
             consumed: good,
             total: good + 1,
@@ -129,7 +136,7 @@ fn trailing_bytes_are_an_error() {
     // A whole extra group's worth of junk must not be mistaken for more relocations either.
     blob.extend_from_slice(&[0x7f, 0x01, 0x02, 0x03]);
     assert!(matches!(
-        aps2::decode_rela(&blob).unwrap_err(),
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
         ElfError::Aps2TrailingBytes { .. }
     ));
 }
@@ -154,7 +161,7 @@ fn a_declared_count_larger_than_the_stream_is_an_error() {
     }
     // The stream ends after five, so the decoder runs out looking for a sixth group.
     assert!(matches!(
-        aps2::decode_rela(&blob).unwrap_err(),
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
         ElfError::Aps2Truncated { .. }
     ));
 }
@@ -173,7 +180,7 @@ fn a_declared_count_smaller_than_the_stream_is_an_error() {
         encode_sleb128(0, &mut blob);
     }
     assert_eq!(
-        aps2::decode_rela(&blob).unwrap_err(),
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
         ElfError::Aps2GroupOverrun {
             group_index: 0,
             size: 5,
@@ -193,7 +200,7 @@ fn a_zero_or_negative_group_size_is_an_error_rather_than_a_hang() {
         encode_sleb128(RELOCATION_GROUPED_BY_INFO_FLAG as i64, &mut blob);
         encode_sleb128(R_AARCH64_RELATIVE as i64, &mut blob);
         assert_eq!(
-            aps2::decode_rela(&blob).unwrap_err(),
+            aps2::decode_rela(&blob, generous()).unwrap_err(),
             ElfError::Aps2BadGroupSize {
                 group_index: 0,
                 size,
@@ -209,7 +216,7 @@ fn a_negative_relocation_count_is_an_error() {
     encode_sleb128(-5, &mut blob);
     encode_sleb128(0, &mut blob);
     assert_eq!(
-        aps2::decode_rela(&blob).unwrap_err(),
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
         ElfError::Aps2NegativeCount(-5)
     );
 }
@@ -222,7 +229,7 @@ fn unknown_group_flag_bits_are_an_error() {
     encode_sleb128(1, &mut blob);
     encode_sleb128(0x30, &mut blob); // bits 4 and 5 are not defined
     assert_eq!(
-        aps2::decode_rela(&blob).unwrap_err(),
+        aps2::decode_rela(&blob, generous()).unwrap_err(),
         ElfError::Aps2UnknownGroupFlags {
             group_index: 0,
             unknown: 0x30,
@@ -236,41 +243,68 @@ fn addends_in_a_dt_android_rel_blob_are_an_error() {
     // The same bytes read as DT_ANDROID_REL must be refused: REL has no addend field, so
     // accepting the stream would silently shift every subsequent value.
     assert_eq!(
-        aps2::decode_rel(&blob).unwrap_err(),
+        aps2::decode_rel(&blob, generous()).unwrap_err(),
         ElfError::Aps2AddendInRelFormat { group_index: 0 }
     );
-    assert!(aps2::decode(&blob, PackedFormat::Rela).is_ok());
+    assert!(aps2::decode(&blob, PackedFormat::Rela, generous()).is_ok());
 }
 
 #[test]
-fn grouped_by_addend_applies_one_delta_to_the_whole_group() {
-    // Hand-built, because no library in the target APK exercises this flag and the two plausible
-    // readings of the format differ here: bionic's `for_all_packed_relocs` reads the delta once
-    // per *group*, not once per relocation.
+fn grouped_by_addend_applies_one_delta_per_group_and_accumulates_across_groups() {
+    // Hand-built, because no library in the target APK exercises this flag, so this test is the
+    // only guard on the branch. Two things have to be distinguishable here and a single group
+    // starting from zero distinguishes neither:
+    //
+    //   * per-group vs per-relocation: a group of three with one delta must not triple it;
+    //   * `r_addend += delta` (bionic) vs `r_addend = delta`: only visible once a *second*
+    //     grouped-addend group runs with a non-zero running total behind it.
+    //
+    // So: group one establishes a running addend of 0x4242 across three relocations, group two
+    // adds 0x100 to it, giving 0x4342 rather than 0x100.
     let mut blob = Vec::from(APS2_MAGIC);
-    encode_sleb128(3, &mut blob);
+    encode_sleb128(5, &mut blob);
     encode_sleb128(0x1000, &mut blob); // initial r_offset
-    encode_sleb128(3, &mut blob); // group_size
-    encode_sleb128(
-        (RELOCATION_GROUPED_BY_INFO_FLAG
-            | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
-            | RELOCATION_GROUPED_BY_ADDEND_FLAG
-            | RELOCATION_GROUP_HAS_ADDEND_FLAG) as i64,
-        &mut blob,
-    );
+    let flags = (RELOCATION_GROUPED_BY_INFO_FLAG
+        | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
+        | RELOCATION_GROUPED_BY_ADDEND_FLAG
+        | RELOCATION_GROUP_HAS_ADDEND_FLAG) as i64;
+
+    encode_sleb128(3, &mut blob); // group one: three relocations
+    encode_sleb128(flags, &mut blob);
     encode_sleb128(8, &mut blob); // shared offset delta
     encode_sleb128(R_AARCH64_RELATIVE as i64, &mut blob); // shared r_info
     encode_sleb128(0x4242, &mut blob); // one shared addend delta
-    let decoded = aps2::decode_rela(&blob).unwrap();
+
+    encode_sleb128(2, &mut blob); // group two: two more
+    encode_sleb128(flags, &mut blob);
+    encode_sleb128(16, &mut blob);
+    encode_sleb128(R_AARCH64_GLOB_DAT as i64, &mut blob);
+    encode_sleb128(0x100, &mut blob); // accumulates onto 0x4242
+
+    let decoded = aps2::decode_rela(&blob, generous()).unwrap();
     assert_eq!(decoded.summary.bytes_consumed, blob.len());
     assert_eq!(
         decoded.relocations,
         vec![
+            // Group one: one delta shared by all three, not applied three times.
             rela(0x1008, 0, R_AARCH64_RELATIVE, 0x4242),
             rela(0x1010, 0, R_AARCH64_RELATIVE, 0x4242),
             rela(0x1018, 0, R_AARCH64_RELATIVE, 0x4242),
+            // Group two: 0x4242 + 0x100, so the running total carried across the group boundary.
+            rela(0x1028, 0, R_AARCH64_GLOB_DAT, 0x4342),
+            rela(0x1038, 0, R_AARCH64_GLOB_DAT, 0x4342),
         ],
-        "all three relocations share the single group addend"
+        "one delta per group, accumulated onto the running addend"
+    );
+    // Spelled out so the two failure modes are named rather than buried in the vector compare.
+    assert_eq!(
+        decoded.relocations[2].r_addend, 0x4242,
+        "a per-relocation application would have produced 0x{:x}",
+        0x4242 * 3
+    );
+    assert_eq!(
+        decoded.relocations[3].r_addend, 0x4342,
+        "`r_addend = delta` instead of `+=` would have produced 0x100"
     );
 }
 
@@ -301,7 +335,7 @@ fn a_group_without_has_addend_resets_the_running_addend_to_zero() {
     encode_sleb128(8, &mut blob);
     encode_sleb128(R_AARCH64_GLOB_DAT as i64, &mut blob);
 
-    let decoded = aps2::decode_rela(&blob).unwrap();
+    let decoded = aps2::decode_rela(&blob, generous()).unwrap();
     assert_eq!(decoded.summary.bytes_consumed, blob.len());
     assert_eq!(
         decoded.relocations,
@@ -325,7 +359,7 @@ fn a_group_without_has_addend_resets_the_running_addend_to_zero() {
     );
     encode_sleb128(8, &mut blob);
     encode_sleb128(R_AARCH64_RELATIVE as i64, &mut blob);
-    let decoded = aps2::decode_rela(&blob).unwrap();
+    let decoded = aps2::decode_rela(&blob, generous()).unwrap();
     assert_eq!(decoded.summary.bytes_consumed, blob.len());
     assert_eq!(
         decoded.relocations,
@@ -341,7 +375,7 @@ fn offset_deltas_may_be_negative() {
         rela(0x3000, 0, R_AARCH64_RELATIVE, 0),
     ];
     let blob = encode_rela_ungrouped(&relocs);
-    assert_eq!(aps2::decode_rela(&blob).unwrap().relocations, relocs);
+    assert_eq!(aps2::decode_rela(&blob, generous()).unwrap().relocations, relocs);
 }
 
 #[test]
@@ -358,7 +392,7 @@ fn every_single_byte_corruption_either_decodes_differently_or_errors() {
             bad[i] ^= 1 << bit;
             // An error is a perfectly good outcome; what matters is that a success stays
             // self-consistent and that corruption is not silently invisible.
-            if let Ok(d) = aps2::decode_rela(&bad) {
+            if let Ok(d) = aps2::decode_rela(&bad, generous()) {
                 if d.relocations == relocs {
                     silent_identical += 1;
                 }
@@ -470,4 +504,174 @@ fn a_bad_phentsize_is_rejected() {
     v[54..56].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize
     v[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
     assert_eq!(ElfImage::parse(&v).unwrap_err(), ElfError::BadPhentsize(32));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hostile input: unbounded counts and amplification
+// ---------------------------------------------------------------------------------------------
+
+/// A blob whose single group spends **zero** bytes per relocation, declaring `count` of them.
+///
+/// This shape is legal — sharing the offset delta, the `r_info` and the addend is exactly what
+/// the grouping flags are for — which is why the count cannot be bounded from `blob.len()`.
+fn zero_cost_blob(count: i64) -> Vec<u8> {
+    let mut blob = Vec::from(APS2_MAGIC);
+    encode_sleb128(count, &mut blob);
+    encode_sleb128(0x1000, &mut blob); // initial r_offset
+    encode_sleb128(count, &mut blob); // one group holding all of them
+    encode_sleb128(
+        (RELOCATION_GROUPED_BY_INFO_FLAG
+            | RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
+            | RELOCATION_GROUPED_BY_ADDEND_FLAG
+            | RELOCATION_GROUP_HAS_ADDEND_FLAG) as i64,
+        &mut blob,
+    );
+    encode_sleb128(8, &mut blob); // shared offset delta
+    encode_sleb128(R_AARCH64_RELATIVE as i64, &mut blob); // shared r_info
+    encode_sleb128(0, &mut blob); // shared addend delta
+    blob
+}
+
+#[test]
+fn a_tiny_blob_declaring_an_astronomical_count_is_refused_immediately() {
+    // Thirty-odd bytes declaring 2^62 relocations. Without a count bound the streaming decoder
+    // runs for the rest of the decade and the Vec decoder asks the allocator for 110 exabytes.
+    let blob = zero_cost_blob(1 << 62);
+    assert!(
+        blob.len() < 40,
+        "the whole hostile blob is {} bytes",
+        blob.len()
+    );
+
+    let limits = Aps2Limits::for_loadable_size(120_767_564); // libroblox.so's own loadable size
+    assert_eq!(limits.max_relocations, 60_383_782);
+
+    // Streaming: rejected before the sink is called even once, and in negligible time.
+    let mut produced = 0u64;
+    let start = std::time::Instant::now();
+    let err = aps2::decode_with(&blob, PackedFormat::Rela, limits, |_| {
+        produced += 1;
+        Ok(())
+    })
+    .unwrap_err_or_else(|| panic!("a 2^62 count must be refused"));
+    let elapsed = start.elapsed();
+    assert_eq!(
+        err,
+        ElfError::Aps2CountExceedsLimit {
+            declared: 1 << 62,
+            limit: 60_383_782,
+        }
+    );
+    assert_eq!(produced, 0, "nothing may be produced before the count check");
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "refusal took {elapsed:?}; the check must happen before decoding, not during"
+    );
+
+    // And the Vec path, which is the one that used to abort the process on allocation failure.
+    assert_eq!(
+        aps2::decode_rela(&blob, limits).unwrap_err(),
+        ElfError::Aps2CountExceedsLimit {
+            declared: 1 << 62,
+            limit: 60_383_782,
+        }
+    );
+
+    // i64::MAX and a count just one past the limit are refused the same way — no off-by-one
+    // that lets `limit + 1` through.
+    assert!(matches!(
+        aps2::decode_rela(&zero_cost_blob(i64::MAX), limits).unwrap_err(),
+        ElfError::Aps2CountExceedsLimit { .. }
+    ));
+    assert!(matches!(
+        aps2::decode_rela(&zero_cost_blob(60_383_783), limits).unwrap_err(),
+        ElfError::Aps2CountExceedsLimit {
+            declared: 60_383_783,
+            limit: 60_383_782
+        }
+    ));
+}
+
+#[test]
+fn the_limit_does_not_reject_the_legitimate_zero_cost_encoding() {
+    // The point of the bound is that it constrains the *count*, never the encoding. A 31-byte
+    // blob describing 250,000 real relocations at zero bytes each still decodes, in full, with
+    // correct values — so nothing a linker could legally emit is lost.
+    let count = 250_000i64;
+    let blob = zero_cost_blob(count);
+    assert!(blob.len() < 40);
+    let decoded = aps2::decode_rela(&blob, Aps2Limits::new(1_000_000)).unwrap();
+    assert_eq!(decoded.relocations.len() as i64, count);
+    assert_eq!(decoded.summary.decoded_count as i64, count);
+    assert_eq!(decoded.summary.bytes_consumed, blob.len());
+    assert_eq!(decoded.summary.bytes_consumed, decoded.summary.bytes_total);
+    assert_eq!(
+        decoded.relocations[0],
+        rela(0x1008, 0, R_AARCH64_RELATIVE, 0)
+    );
+    assert_eq!(
+        decoded.relocations[(count - 1) as usize],
+        rela(0x1000 + 8 * count as u64, 0, R_AARCH64_RELATIVE, 0)
+    );
+    // Exactly at the limit is accepted; the boundary is inclusive.
+    assert!(aps2::decode_rela(&blob, Aps2Limits::new(count as u64)).is_ok());
+}
+
+#[test]
+fn a_sink_error_stops_the_decode() {
+    // The fallible sink is what lets the `Vec` wrapper fail on allocation rather than abort, and
+    // what will let the applying loader reject a relocation target without decoding the rest.
+    let blob = zero_cost_blob(100_000);
+    let mut produced = 0u64;
+    let err = aps2::decode_with(&blob, PackedFormat::Rela, Aps2Limits::new(1_000_000), |_| {
+        produced += 1;
+        if produced == 17 {
+            Err(ElfError::AllocationFailed { bytes: 42 })
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err_or_else(|| panic!("the sink error must propagate"));
+    assert_eq!(err, ElfError::AllocationFailed { bytes: 42 });
+    assert_eq!(produced, 17, "the decode must stop at the rejected relocation");
+}
+
+#[test]
+fn relr_amplification_is_counted_before_it_is_allocated() {
+    use omni_elf::reloc::parse_relr_table;
+
+    // Each odd word is a bitmap of 63 relocations, so 8 bytes of input become 63 * 24 = 1512
+    // bytes of output: 189x. 800 bytes of table therefore describes 6,300 relocations.
+    let words = 100usize;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&0x1000u64.to_le_bytes()); // one address word
+    for _ in 0..words - 1 {
+        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // all 63 bits set
+    }
+    let view = omni_elf::View::new(&buf);
+    let expected = 1 + (words - 1) * 63;
+
+    // Under a limit that allows it, the expansion is exact.
+    let relocs = parse_relr_table(&view, buf.len() as u64, Some(8), Aps2Limits::new(1 << 20))
+        .expect("a RELR table below the limit must decode");
+    assert_eq!(relocs.len(), expected);
+    assert!(relocs.iter().all(|r| r.r_type() == R_AARCH64_RELATIVE));
+
+    // Over the limit it is refused by counting, before a single Rela is allocated.
+    assert_eq!(
+        parse_relr_table(&view, buf.len() as u64, Some(8), Aps2Limits::new(100)).unwrap_err(),
+        ElfError::RelocationCountExceedsLimit {
+            what: "DT_RELR",
+            count: expected as u64,
+            limit: 100,
+        }
+    );
+    // The limit derived from a loadable image large enough to hold them all still accepts.
+    assert!(parse_relr_table(
+        &view,
+        buf.len() as u64,
+        Some(8),
+        Aps2Limits::for_loadable_size(expected as u64 * 8)
+    )
+    .is_ok());
 }

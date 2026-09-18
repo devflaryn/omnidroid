@@ -187,4 +187,28 @@ pub enum ElfError {
 
     #[error("packed relocation group {group_index} has unknown group flag bits {unknown:#x} set")]
     Aps2UnknownGroupFlags { group_index: usize, unknown: u64 },
+
+    /// A fully-grouped group spends zero bytes per relocation, so a tiny blob can declare an
+    /// astronomical count. See `aps2::Aps2Limits` for why the bound is both necessary and safe.
+    #[error(
+        "packed relocation stream declares {declared} relocations, past the limit of {limit} \
+         derived from the object's own loadable size; a blob this small cannot describe that \
+         many distinct relocations"
+    )]
+    Aps2CountExceedsLimit { declared: u64, limit: u64 },
+
+    #[error(
+        "{what} would expand to {count} relocations, past the limit of {limit} derived from the \
+         object's own loadable size"
+    )]
+    RelocationCountExceedsLimit {
+        what: What,
+        count: u64,
+        limit: u64,
+    },
+
+    /// Returned instead of aborting the process, which is what an infallible `Vec` growth does
+    /// when the allocator refuses.
+    #[error("could not allocate {bytes} bytes while decoding relocations")]
+    AllocationFailed { bytes: usize },
 }
