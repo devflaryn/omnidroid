@@ -907,6 +907,37 @@ The interaction D5 already flagged still stands: declining to advertise LSE atom
 `getauxval(AT_HWCAP)` steers the engine onto `LDXR`/`STXR` — straight into this path — so the two must
 be decided together, not separately.
 
+**The scale, measured (M2).** A static scan of `libroblox.so` over 17,485,957 words, pinned by a
+self-checking tool:
+
+| Class | Sites | Exclusive monitor? |
+|---|---|---|
+| `LDXR`/`STXR`/`LDAXR`/`STLXR` | 108 | yes |
+| `LDXP`/`STXP`/`LDAXP`/`STLXP` | 22 | yes |
+| `CAS`/`CASP` | 14 | LSE |
+| `LDADD`/`SWP`/… | 37 | LSE |
+| `LDAR`/`STLR`/`LDLAR`/`STLLR` | 15,516 | **no** — ordered, not exclusive |
+| `LDAPR` | 0 | no |
+
+So **130 exclusive-monitor sites against 51 LSE**, with LSE making up **28.2% of atomic
+read-modify-write sites**.
+
+This corrects a figure that briefly claimed 15,646 exclusive sites by counting the acquire/release
+class as exclusives. The conclusions that followed from it were all wrong and are withdrawn: risk 4
+is **not** moot — each of the 51 LSE sites is a hard halt into the interpreter — risk 3 is **not**
+backed by tens of thousands of call sites, the `AT_HWCAP` question is **live** rather than empty, and
+`fastmem_exclusive_access`'s benefit was overstated by two orders of magnitude.
+
+The wrong version never entered this file, because a figure is recorded here only after someone other
+than its author reproduces it. This is the fourth time that rule has caught a wrong number in two
+milestones, and the most clear-cut: the mistaken figure was the *convenient* one, since it closed an
+open question rather than keeping it open.
+
+Separately measured, and worth keeping because it was nearly asserted instead: the 15,516 ordered
+accesses **do** stay on the fastmem path — measured at n = 1,000 per class, `LDR`/`STR`, `LDAR`/`STLR`
+and `LDXR`/`STXR` all take **0** callback entries, with a mutation row that turns
+`fastmem_exclusive_access` off and is caught by it.
+
 ---
 
 ## D4 (amendment 2) — the startup assertion defends the configuration; a second check defends the behaviour
