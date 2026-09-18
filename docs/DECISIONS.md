@@ -259,7 +259,10 @@ successful reserve: 125.57 TB). 64 processes each reserving 16 GB — 1 TB of gu
 total — cost **240.8 MB** of system commit between them. So reserving a generous per-instance guest
 address space is not the thing to economize on.
 
-**What is scarce:** commit charge. `MEM_COMMIT` debits the system commit limit **immediately on
+**What is scarce:** commit charge. All figures in this decision were measured on **fully-touched,
+privately-committed anonymous memory**; they are not established for file- or section-backed views,
+and an attempt during M2 to extend the `size/512` page-table model to a section view was retracted as
+unverified rather than confirmed. `MEM_COMMIT` debits the system commit limit **immediately on
 commit, not on first touch** — 1024 MB committed showed up as 1026.66 MB of commit charge while the
 working set was only 4.68 MB. This is the key asymmetry: a design that commits a multi-GB region
 per instance fails the requirement even though its working set looks small. Commit must therefore

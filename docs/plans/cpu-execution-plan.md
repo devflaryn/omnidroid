@@ -45,7 +45,13 @@ earned; constraints 11 and 12 in particular caught defects in four of five found
     permission**. **New for this milestone:** guest code is the ultimate untrusted input. It will
     jump to unmapped addresses, execute garbage, and recurse without bound. None of that may take
     down the host process.
-12. **A test that cannot fail is worse than no test.** Verify by mutation that reverting a fix makes
+12. **Every figure carries its sample size.** A measurement reported without the number of runs
+    behind it is an anecdote formatted as a fact. This is not hypothetical here: one quantity in this
+    milestone was reported three times — first from a measurement dominated by the test's own heap,
+    then "corrected" from twelve runs with equal confidence, and only settled at n=90. Two of the
+    false figures shipped as code comments in the interim. So: state n beside every measured number,
+    prefer a range to a point estimate, and if a constant is fitted rather than derived, say so.
+13. **A test that cannot fail is worse than no test.** Verify by mutation that reverting a fix makes
     its test fail, and check **both directions** — a fix that goes too far can pass every correctness
     test while destroying a property the design depends on. Two committed harnesses exist
     (`tools/mutate.py`, `crates/omni-elf/tools/mutate_loader.py`); extend them or add a sibling.
