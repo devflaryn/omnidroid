@@ -570,14 +570,25 @@ MUTATIONS = [
      """const MAX_ZERO_COMMIT_STREAK: u32 = 1;""",
      MEM_AND_CPU),
     # ---- .eh_frame: the function map M2's whole choice of code rests on -------------------------
-    # ---- C1: the handler slot is drained, not merely cleared -------------------------------------
-    # Two rows on the quiescence protocol and two on what it must NOT cost. There is deliberately no
-    # row weakening the `SeqCst` accesses to acquire/release: the pair is the Dekker shape, so the
-    # weakening is genuinely wrong, but x86-64 is TSO and the only reordering that exposes it is one
-    # the hardware does not perform. A row that cannot fail is worse than no row (Task 1), and the
-    # argument lives in the module docs instead. There is likewise no row for taking the in-flight
-    # reference *after* the handler load rather than before: the window it opens is between two
-    # instructions, and no deterministic test can land in it.
+    # ---- C1: the slot is drained, and not reclaimable until the drain finishes -------------------
+    # Four rows on the two hazards -- calls in flight, and the slot itself -- and two on what the fix
+    # must NOT cost.
+    #
+    # There is deliberately no row weakening the `SeqCst` accesses to acquire/release, and the reason
+    # is NOT that the weakening is safe. It is unsound on this host: the pair is `W(active);R(handler)`
+    # against `W(handler);R(active)`, the store-buffer shape, and **StoreLoad is precisely the one
+    # reordering x86-64's TSO permits** -- `release`'s plain store to `handler` may sit in the store
+    # buffer while its plain load of `active` executes, and a dispatch that has already read the live
+    # handler is missed. (`dispatch`'s own side happens to be fenced regardless, because a locked
+    # read-modify-write is a full barrier on x86, but that is an accident of the target.) The row is
+    # absent because the defect is a *race*: reverting it does not make a test fail, it makes a test
+    # fail sometimes, and a flaky row attributes a mutation to the wrong detector (Task 1). An earlier
+    # version of this comment said the hardware does not perform that reordering, which was wrong in
+    # the reassuring direction -- exactly how the next person weakens it with a clean conscience.
+    #
+    # There is likewise no row for taking the in-flight reference *after* the handler load rather than
+    # before: the window it opens is between two instructions, and no deterministic test can land in
+    # it.
     ("plat-A3", "A", "the drain removed, so release returns with a dispatch still in the handler",
      FAULT,
      """    if slot.active.load(Ordering::SeqCst) != 0 {
@@ -596,6 +607,19 @@ MUTATIONS = [
         let outcome = handler(context, fault);""",
      PLATFORM),
 
+    ("plat-A5", "A", "a draining slot is unpublished with zero, so install can take it mid-drain",
+     FAULT,
+     """    slot.handler.store(DRAINING, Ordering::SeqCst);""",
+     """    slot.handler.store(0, Ordering::SeqCst);""",
+     PLATFORM),
+
+    ("plat-A6", "A", "the context is cleared before the drain rather than after it", FAULT,
+     """    // 2. No call is still *running* after this loop.""",
+     """    slot.context.store(0, Ordering::Relaxed);
+
+    // 2. No call is still *running* after this loop.""",
+     PLATFORM),
+
     ("plat-B7", "B", "the drain made a whole-table barrier, so one space waits on another's fault",
      FAULT,
      """    if slot.active.load(Ordering::SeqCst) != 0 {
@@ -610,8 +634,8 @@ MUTATIONS = [
 
     ("plat-B8", "B", "slots retired rather than reused, the cheaper C1 fix the review offered",
      FAULT,
-     """    slot.handler.store(0, Ordering::SeqCst);""",
-     """    slot.handler.store(CLAIMING, Ordering::SeqCst);""",
+     """    slot.handler.store(0, Ordering::Release);""",
+     """    slot.handler.store(DRAINING, Ordering::Release);""",
      PLATFORM),
 
     ("elf-A20", "A", "the table's datarel base dropped, so every function start is wrong",

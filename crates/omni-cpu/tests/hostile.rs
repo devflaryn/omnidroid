@@ -359,7 +359,8 @@ fn a_guest_load_that_straddles_the_end_of_its_mapping_is_a_typed_fault() {
         .expect("a readable mapping with free address space after it");
     assert!(
         guest.space.region_at(straddle + 4).is_none_or(|r| r.is_free()),
-        "the second half of the load must land in free address space, or this measures a read of          the next mapping rather than a read of nothing"
+        "the second half of the load must land in free address space, or this measures a read of \
+         the next mapping rather than a read of nothing"
     );
 
     let mut program = mov64(0, straddle as u64);

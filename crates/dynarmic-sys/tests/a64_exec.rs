@@ -623,7 +623,8 @@ fn a_halt_reason_is_read_and_cleared_by_the_dispatcher() {
     assert_eq!(
         vm.reg(0),
         0,
-        "and it must have stopped the run before any guest instruction executed: the program's          first instruction is `MOVZ X0, #1`, so a non-zero X0 means it ran"
+        "and it must have stopped the run before any guest instruction executed: the program's \
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          first instruction is `MOVZ X0, #1`, so a non-zero X0 means it ran"
     );
 
     // The jit must now be clean. Nothing cleared it but the dispatcher itself: no

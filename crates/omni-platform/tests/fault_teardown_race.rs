@@ -30,7 +30,8 @@
 
 #![cfg(target_os = "windows")]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use omni_platform::fault::{self, Fault, FaultOutcome, FaultRegistration};
 use omni_platform::vm::{self, Protection};
@@ -55,6 +56,29 @@ struct Served {
     after_release: AtomicU64,
 }
 
+/// Dispatches that entered a handler with a context of zero.
+///
+/// This is the second defect at this seam. The first version of the quiescence fix unpublished a slot
+/// by storing zero into `handler` — which is exactly the value `install`'s compare-exchange waits for
+/// — so the slot could be claimed and republished while the drain was still spinning, and `release`
+/// then cleared a `context` the *new* registrant had written. The re-review measured **646**
+/// dispatches entering a live handler that way.
+///
+/// Counted rather than dereferenced, so the failure reports a number instead of killing the process
+/// on a null pointer; a test that can only crash cannot tell you how often.
+///
+/// **It is a standing watch and not the detector, and saying otherwise would be the kind of
+/// overstatement this project keeps catching.** Reverting the fix does *not* make this counter move
+/// here: reaching it needs a fault to land in the one slot a churned registration holds, during the
+/// nanoseconds between that registration publishing its context and the draining `release` clearing
+/// it, and nothing in this test steers faults at churned slots. The detector is
+/// `a_slot_being_drained_cannot_be_handed_out_or_have_its_context_cleared`, which makes that window
+/// arbitrarily wide by parking a dispatch inside the handler and a `release` inside its drain, and it
+/// is what mutation rows `plat-A5` and `plat-A6` are caught by. What this counter buys is a standing
+/// assertion over a real workload — 9,600 slot claims against live teardowns per run — that the
+/// window is not being entered in practice either.
+static NULL_CONTEXTS: AtomicU64 = AtomicU64::new(0);
+
 /// Serializes the two tests below.
 ///
 /// Both reason about which slots they hold: the first needs its primary to be scanned before its
@@ -67,6 +91,13 @@ fn serialized() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn serve(context: usize, fault: &Fault) -> FaultOutcome {
+    // A handler is only ever called with the context its own `install` published, so this cannot
+    // happen — and it is checked rather than assumed, because the version of `release` that cleared
+    // `context` while the slot was still draining made it happen 646 times.
+    if context == 0 {
+        NULL_CONTEXTS.fetch_add(1, Ordering::Relaxed);
+        return FaultOutcome::NotOurs;
+    }
     // SAFETY: `context` is the address of a `Served` that was leaked with `Box::leak` and is never
     // freed, so this reference is valid for the whole process. That is the point: the detector must
     // not itself be the undefined behaviour it is looking for.
@@ -108,6 +139,13 @@ fn leak(base: usize, len: usize) -> &'static Served {
     }))
 }
 
+/// [`install`], for the churn thread, which races a full table and must not turn that into a
+/// failure: `HandlerTableFull` is the expected answer sometimes, and it is not what is under test.
+fn try_install(context: &'static Served) -> Option<FaultRegistration> {
+    // SAFETY: as `install` below.
+    unsafe { fault::install(serve, context as *const Served as usize) }.ok()
+}
+
 fn install(context: &'static Served) -> FaultRegistration {
     // SAFETY: `fault::install`'s four conditions. The context is leaked and therefore pinned and
     // immortal; `serve` cannot unwind (it contains no panicking operation — every fallible call is
@@ -123,6 +161,17 @@ const ROUNDS: usize = 24;
 const THREADS: usize = 4;
 /// Pages each thread touches. One access violation each, the first time round.
 const PAGES: usize = 48;
+/// Install/release cycles the churn thread runs while the primary is being torn down.
+///
+/// This is what puts pressure on the *reuse* half rather than only the in-flight half. Without a
+/// thread trying to **claim** a slot while a `release` is draining it, nothing is even in a position
+/// to take the slot the pre-fix `release` freed mid-drain: the main thread's `drop` blocks until the
+/// drain finishes. Measured effect of adding it: releases that had to wait went from 5 to 27 and
+/// dispatches reaching the handler under teardown from 96 to 314, over the same n.
+///
+/// It does not turn this test into a detector for the reuse defect — see `NULL_CONTEXTS` for why, and
+/// for which test is.
+const CHURN_PER_ROUND: usize = 400;
 
 #[test]
 fn tearing_a_handler_down_under_load_never_lets_a_dispatch_outlive_the_release() {
@@ -131,10 +180,12 @@ fn tearing_a_handler_down_under_load_never_lets_a_dispatch_outlive_the_release()
     let bytes = PAGES * page;
 
     let before = fault::stats();
+    NULL_CONTEXTS.store(0, Ordering::Relaxed);
     let mut total_entered = 0u64;
     let mut total_resolved = 0u64;
     let mut total_after_release = 0u64;
     let mut rounds_with_concurrency = 0usize;
+    let mut churn_installs = 0usize;
 
     for _ in 0..ROUNDS {
         let reservation = vm::reserve(bytes, page).expect("a reservation to fault into");
@@ -172,8 +223,29 @@ fn tearing_a_handler_down_under_load_never_lets_a_dispatch_outlive_the_release()
             })
             .collect();
 
-        // Tear the primary down *now*, with the workers mid-flight. Nothing is synchronised: the
-        // race is the input.
+        // A thread doing nothing but claiming and releasing slots, for as long as the round lasts.
+        // It is what turns "a dispatch is in flight" into "a dispatch is in flight **and** somebody
+        // wants this slot".
+        let churn_stop = Arc::new(AtomicBool::new(false));
+        let churner = {
+            let stop = Arc::clone(&churn_stop);
+            std::thread::spawn(move || {
+                let mut taken = 0usize;
+                for _ in 0..CHURN_PER_ROUND {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(registration) = try_install(leak(0, 0)) {
+                        taken += 1;
+                        drop(registration);
+                    }
+                }
+                taken
+            })
+        };
+
+        // Tear the primary down *now*, with the workers mid-flight and the churner competing for the
+        // slot it is about to free. Nothing is synchronised: the race is the input.
         drop(primary_reg);
         // From here a registrant would be free to release the context. We mark instead.
         primary.state.store(DEAD, Ordering::Release);
@@ -181,6 +253,8 @@ fn tearing_a_handler_down_under_load_never_lets_a_dispatch_outlive_the_release()
         for worker in workers {
             worker.join().expect("a worker thread");
         }
+        churn_stop.store(true, Ordering::Relaxed);
+        churn_installs += churner.join().expect("the churn thread");
         drop(net_reg);
 
         let entered = primary.entered.load(Ordering::Relaxed);
@@ -206,9 +280,20 @@ fn tearing_a_handler_down_under_load_never_lets_a_dispatch_outlive_the_release()
         "teardown race: n = {ROUNDS} rounds x {THREADS} threads x {PAGES} pages; \
          {examined} access violations examined, {total_entered} reached the primary handler \
          ({total_resolved} resolved by it), {rounds_with_concurrency}/{ROUNDS} rounds had the \
-         teardown land mid-load, {drained} releases had to wait for an in-flight dispatch"
+         teardown land mid-load, {drained} releases had to wait for an in-flight dispatch, \
+         {churn_installs} slots claimed by the churn thread while teardowns were in progress"
     );
 
+    assert_eq!(
+        NULL_CONTEXTS.load(Ordering::Relaxed),
+        0,
+        "{} dispatches entered a handler holding a context of zero, over n = {ROUNDS} rounds with \
+         {churn_installs} slot claims against live teardowns. That is a slot reclaimed and then \
+         cleared while a dispatch was still inside it: the drain was running, `install` took the \
+         slot because `handler` had been set to zero, and `release` went on to clear the field the \
+         new registrant had just written",
+        NULL_CONTEXTS.load(Ordering::Relaxed)
+    );
     assert_eq!(
         total_after_release, 0,
         "{total_after_release} handler frames were still running after their registration's `drop` \
@@ -238,6 +323,7 @@ fn tearing_a_handler_down_under_load_never_lets_a_dispatch_outlive_the_release()
 #[test]
 fn concurrent_install_and_release_churn_never_hands_out_an_occupied_slot() {
     let _serial = serialized();
+    NULL_CONTEXTS.store(0, Ordering::Relaxed);
     const CHURN_THREADS: usize = 8;
     const CHURN_ROUNDS: usize = 200;
 
@@ -266,5 +352,11 @@ fn concurrent_install_and_release_churn_never_hands_out_an_occupied_slot() {
         total,
         CHURN_THREADS * CHURN_ROUNDS,
         "every install must have succeeded: n = {CHURN_THREADS} threads x {CHURN_ROUNDS} rounds"
+    );
+    assert_eq!(
+        NULL_CONTEXTS.load(Ordering::Relaxed),
+        0,
+        "a dispatch was handed a zero context during n = {CHURN_THREADS} x {CHURN_ROUNDS} \
+         install/release rounds, which is a slot cleared while somebody was inside it"
     );
 }

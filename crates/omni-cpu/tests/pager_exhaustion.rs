@@ -61,7 +61,8 @@ fn a_backend_that_cannot_install_a_demand_pager_is_refused() {
             // D4's central requirements fail.
             assert!(
                 !detail.contains("  "),
-                "the refusal contains a run of spaces, which is what a lost line continuation                  looks like at runtime: {detail:?}"
+                "the refusal contains a run of spaces, which is what a lost line continuation \
+                 looks like at runtime: {detail:?}"
             );
         }
         Err(other) => panic!("expected a pager refusal, got {other}"),

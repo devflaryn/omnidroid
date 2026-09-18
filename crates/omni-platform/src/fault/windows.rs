@@ -41,18 +41,33 @@
 //!
 //! * [`dispatch`] increments `active` **before** it loads `handler`, and decrements it **after** the
 //!   handler returns. So for the whole interval in which a call can be in flight, `active >= 1`.
-//! * [`release`] stores 0 into `handler` **first**, then waits for `active` to read 0, and only then
-//!   clears `context`.
+//! * [`release`] stores [`DRAINING`] into `handler` **first**, then waits for `active` to read 0,
+//!   then clears `context`, and only as its **last** action stores 0.
+//!
+//! The last clause is the second half of the fix and it took a second review to find. Draining is
+//! about calls; **reuse** is about the slot, and they are different hazards. The first version
+//! unpublished by storing 0 — which is exactly the value `install`'s compare-exchange waits for — so
+//! the slot could be claimed and republished *while the drain was still spinning*, and `release` then
+//! went on to clear a `context` the new registrant had already written. That is not a narrow window:
+//! it is the whole drain. Measured at **646 dispatches that entered a live handler with
+//! `context == 0`**.
+//!
+//! With `DRAINING`, reuse is not unlikely, it is **unrepresentable**: the only write of 0 to
+//! `handler` is `release`'s last action, sequenced after the drain, and `install` claims a slot only
+//! by exchanging against 0. There is no interleaving in which that exchange succeeds mid-drain,
+//! because the value it needs is never there.
 //!
 //! The ordering is the Dekker/store-buffer shape — each side writes one location and reads the other
 //! — so it is **`SeqCst` on all four accesses, deliberately**, because acquire/release is provably
 //! insufficient for it. The argument, in the single total order `S` that `SeqCst` gives:
 //!
-//! 1. Suppose a dispatch actually calls the handler. Then its `handler` load read a non-zero value,
-//!    so that load precedes `release`'s store of 0 in `S` (after that store the slot stays 0 until an
-//!    `install`, which cannot happen while this `release` is still running).
+//! 1. Suppose a dispatch actually calls the handler. Then its `handler` load read a value above
+//!    [`MAX_MARKER`], so that load precedes `release`'s store of `DRAINING` in `S` — and it is the
+//!    `DRAINING` marker that makes this step airtight rather than merely true, because after that
+//!    store the field holds `DRAINING` until `release`'s own final store, with no `install` able to
+//!    put a handler back in between.
 //! 2. The dispatch's `fetch_add` precedes its own `handler` load in `S` (program order), so the
-//!    `fetch_add` precedes the store of 0, which precedes `release`'s first `active` load.
+//!    `fetch_add` precedes the store of `DRAINING`, which precedes `release`'s first `active` load.
 //! 3. `active` therefore carries that increment at `release`'s first load, and the only thing that
 //!    can cancel it is the matching `fetch_sub` — which the dispatch performs only *after* the
 //!    handler has returned. So `release` observes 0 only once every call that could be in flight has
@@ -77,6 +92,14 @@
 //!   spin cannot deadlock against itself.
 //! * The in-flight reference is released by a guard with a `Drop`, so even a handler that violates
 //!   its no-unwind contract cannot leave a slot permanently un-drainable.
+//!
+//! The `SeqCst` is necessary and not belt-and-braces, and it is worth being precise about why,
+//! because the first version of this comment got it backwards. On x86-64 the weakening to
+//! acquire/release is **unsound**, not merely unproven: StoreLoad is precisely the one reordering TSO
+//! permits, so `release`'s plain store to `handler` may sit in the store buffer while its plain load
+//! of `active` executes, and a dispatch that has already read the live handler is then missed.
+//! (`dispatch`'s side happens to be fenced regardless, because a locked read-modify-write is a full
+//! barrier on x86 — but that is an accident of the target, not something the code may rest on.)
 //!
 //! Quiescence subsumes the alternative of a generation/epoch tag: a stale pairing is not *detected*,
 //! it is made unrepresentable, because the slot cannot be re-published until the previous
@@ -138,6 +161,23 @@ impl Slot {
 /// Claimed-but-not-yet-published marker, so two concurrent `install` calls cannot take one slot.
 const CLAIMING: usize = 1;
 
+/// **Being drained.** [`release`] stores this instead of zero, and stores zero only once the drain is
+/// finished — so the slot is unpublished (no `dispatch` will call it) and simultaneously
+/// unclaimable (`install`'s compare-exchange expects zero and fails).
+///
+/// Without it the drain was correct and the *reuse* was not: clearing `handler` to zero freed the
+/// slot for `install` while the drain was still running, and `release` then went on to clear a field
+/// the new registrant had already filled in. Measured by the re-review at **646 dispatches that
+/// entered a live handler with `context == 0`**.
+const DRAINING: usize = 2;
+
+/// Every slot value at or below this is a state marker rather than a handler pointer.
+///
+/// A function pointer is never a small integer, so a scanner tells the two apart by magnitude and
+/// needs no separate state word — which is what keeps a slot to three atomics and the scan to a load
+/// and a compare for a slot it does not care about.
+const MAX_MARKER: usize = DRAINING;
+
 /// Spins before `release` starts yielding instead. A handler's body is short — a bounds check and,
 /// at worst, one `VirtualAlloc` — so the common wait is a few hundred nanoseconds and never reaches
 /// the yield. The number is a choice, not a measurement.
@@ -167,7 +207,7 @@ pub(super) fn install(handler: FaultHandler, context: usize) -> FaultResult<Faul
     ensure_veh_installed()?;
 
     let handler_addr = handler as usize;
-    debug_assert!(handler_addr > CLAIMING, "a function pointer is never a small integer");
+    debug_assert!(handler_addr > MAX_MARKER, "a function pointer is never a small integer");
 
     for (index, slot) in SLOTS.iter().enumerate() {
         if slot
@@ -177,22 +217,24 @@ pub(super) fn install(handler: FaultHandler, context: usize) -> FaultResult<Faul
         {
             continue;
         }
-        // The slot is ours and no scanner will call it: `CLAIMING` is not a function pointer and
-        // `dispatch` skips anything that is not a published handler. Publish the context first, then
-        // the handler, so a scanner that sees the handler is guaranteed to see the matching context.
+        // The slot is ours and no scanner will call it: `CLAIMING` is below `MAX_MARKER` and
+        // `dispatch` skips every marker. Publish the context first, then the handler, so a scanner
+        // that sees the handler is guaranteed to see the matching context.
         //
-        // Reusing a slot is safe here *because* `release` drained it: when the previous
-        // registration's `release` returned, no dispatch held a reference to this slot, and the
-        // handler has read zero ever since. So a dispatch cannot be carrying the old context into a
-        // call that lands on the new one.
-        // There is deliberately **no** assertion here that `active` is 0, although it is tempting and
-        // was written first. It would be wrong and it would be flaky: a dispatch that peeks a
-        // non-zero `handler` takes its reference before re-reading, and the `CLAIMING` marker stored
-        // a line above is non-zero, so a scanner arriving in this window legitimately holds a
-        // transient reference to a slot nobody has published yet. It decrements again immediately
-        // without calling anything. What quiescence guarantees is that no reference from the
-        // *previous* registration survives, and that is guaranteed by `release` having drained, not
-        // by anything observable from here.
+        // **Why this cannot be the previous registration's slot.** The compare-exchange above
+        // succeeds only against zero, and the only write of zero to this field is the **last** action
+        // of `release`, sequenced after its drain. In the whole interval between the unpublish and
+        // the end of the drain the field holds `DRAINING`, so there is no interleaving in which this
+        // exchange succeeds — the window is not narrow, it does not exist. And `release` is the only
+        // writer of those two values, once per registration, because `FaultRegistration` is not
+        // `Clone`.
+        //
+        // There is deliberately **no** assertion here that `active` is 0. It is *nearly* an
+        // invariant and it would be flaky: a scanner that has already loaded a live handler, but has
+        // not yet taken its reference, can take it after the previous drain observed zero. Such a
+        // scanner then re-reads the field — which no longer holds that handler — and returns without
+        // calling anything, so it is harmless; but it is observable from here, and a `debug_assert`
+        // over it would fail once in a very long while for no defect at all.
         slot.context.store(context, Ordering::Relaxed);
         slot.handler.store(handler_addr, Ordering::Release);
         return Ok(registration(index));
@@ -201,18 +243,28 @@ pub(super) fn install(handler: FaultHandler, context: usize) -> FaultResult<Faul
     Err(FaultError::HandlerTableFull { capacity: MAX_HANDLERS })
 }
 
-/// Unpublish a slot and **wait until no dispatch is inside its handler**.
+/// Unpublish a slot, **wait until no dispatch is inside its handler**, and only then free it for
+/// reuse.
 ///
-/// The wait is the point. See the module docs for the ordering argument; the short version is that
-/// clearing `handler` stops new calls and draining `active` ends the ones already in flight, and
-/// `SeqCst` on both sides of both locations is what makes "no new calls" and "none in flight" hold
-/// at the same instant rather than one after the other.
+/// Three steps in this order, and each one is load-bearing:
+///
+/// 1. `handler` becomes [`DRAINING`], which stops new calls *and* stops `install` claiming the slot.
+/// 2. `active` is drained, which ends the calls already in flight.
+/// 3. `context` is cleared and `handler` becomes zero — the single transition that makes the slot
+///    claimable again, and the last thing this function does.
+///
+/// The first version did step 1 by storing **zero**, which is where the re-review found a second
+/// defect behind the first: the drain was correct and the reuse was not. Zero is exactly the value
+/// `install`'s compare-exchange waits for, so the slot could be claimed and republished while this
+/// function was still spinning, and step 3 then cleared a context the *new* registrant had written.
+/// Measured: 646 dispatches entered a live handler holding `context == 0`.
 pub(super) fn release(slot: usize) {
     let Some(slot) = SLOTS.get(slot) else { return };
 
-    // 1. No call can *start* after this store: `dispatch` re-reads `handler` under its reference and
-    //    skips a zero.
-    slot.handler.store(0, Ordering::SeqCst);
+    // 1. No call can *start* after this store — `dispatch` re-reads `handler` under its reference and
+    //    skips every marker — and no `install` can take the slot, because its compare-exchange
+    //    expects zero and this is not zero.
+    slot.handler.store(DRAINING, Ordering::SeqCst);
 
     // 2. No call is still *running* after this loop. `SeqCst`, and ordered after the store above by
     //    program order, is what the argument in the module docs needs.
@@ -233,8 +285,15 @@ pub(super) fn release(slot: usize) {
     }
 
     // 3. Only now is the context unreachable, so only now may it be cleared — and only now may the
-    //    registrant free what `context` pointed at, which is the guarantee `install` sells.
+    //    registrant free what `context` pointed at, which is the guarantee `install` sells. Clearing
+    //    it is hygiene rather than safety: no dispatch can reach it, and a zero left published is a
+    //    null dereference rather than a stale one if anything ever did.
     slot.context.store(0, Ordering::Relaxed);
+    // 4. And the slot is free. `Release`, so that the `Acquire` half of `install`'s successful
+    //    compare-exchange is ordered after the store above: the next registrant must not be able to
+    //    publish a context that this store then overwrites, which is the whole of the defect this
+    //    step exists to close.
+    slot.handler.store(0, Ordering::Release);
 }
 
 pub(super) fn stats() -> FaultStats {
@@ -293,10 +352,15 @@ impl Drop for InFlight {
 /// numbers other tests assert deltas on.
 fn dispatch(fault: &Fault) -> FaultOutcome {
     for slot in &SLOTS {
-        // A peek, purely so an empty slot costs one relaxed load instead of two locked RMWs. It is
-        // an optimization and nothing rests on it: the load that decides whether to call is the one
-        // below, taken *under* the in-flight reference.
-        if slot.handler.load(Ordering::Relaxed) == 0 {
+        // A peek, so a slot that is empty, being claimed or being drained costs one relaxed load
+        // instead of two locked RMWs. It is an optimization for correctness purposes — the load that
+        // decides whether to call is the one below, taken *under* the in-flight reference — but it
+        // also gives the drain a termination argument it would not otherwise have. Once `release` has
+        // stored `DRAINING`, every scanner that reaches this line skips the slot **without touching
+        // `active`**, so the only threads that can still increment it are the finite set that had
+        // already passed this point. `active` therefore falls to zero and stays there, rather than
+        // being held up indefinitely by new arrivals under a fault storm.
+        if slot.handler.load(Ordering::Relaxed) <= MAX_MARKER {
             continue;
         }
 
@@ -307,7 +371,7 @@ fn dispatch(fault: &Fault) -> FaultOutcome {
         slot.active.fetch_add(1, Ordering::SeqCst);
         let guard = InFlight { slot };
         let handler = slot.handler.load(Ordering::SeqCst);
-        if handler == 0 || handler == CLAIMING {
+        if handler <= MAX_MARKER {
             drop(guard);
             continue;
         }
@@ -588,6 +652,125 @@ mod tests {
             "releasing an idle slot waited for a dispatch that was inside a different slot's \
              handler"
         );
+    }
+
+    // --- C1's third test: a slot being drained is not a slot that can be handed out -------------
+
+    const REUSE_MAGIC: usize = 0x5AFE_0003;
+    /// The context the draining registration published. Distinctive on purpose: the defect this pins
+    /// showed up as a live handler being called with `context == 0`, so the test has to be able to
+    /// tell "mine" from "cleared" from "somebody else's".
+    const REUSE_CONTEXT: usize = 0xBEEF_BEEF;
+    /// What an intruding `install` publishes, so a stolen slot is identifiable rather than merely
+    /// wrong.
+    const INTRUDER_CONTEXT: usize = 0xFACE_FACE;
+    static REUSE_ENTERED: AtomicBool = AtomicBool::new(false);
+    static REUSE_GATE: AtomicBool = AtomicBool::new(false);
+    static REUSE_SEEN_CONTEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn reuse_handler(context: usize, fault: &Fault) -> FaultOutcome {
+        if fault.address != REUSE_MAGIC {
+            return FaultOutcome::NotOurs;
+        }
+        REUSE_ENTERED.store(true, Ordering::SeqCst);
+        while !REUSE_GATE.load(Ordering::SeqCst) {
+            core::hint::spin_loop();
+        }
+        // The observation. A handler that is still running must still be holding its own context.
+        REUSE_SEEN_CONTEXT.store(context, Ordering::SeqCst);
+        FaultOutcome::NotOurs
+    }
+
+    /// **C1, the reuse half.** Draining is about calls; reuse is about the slot, and the first
+    /// version of this fix closed only the first hazard.
+    ///
+    /// Unpublishing by storing zero freed the slot for `install` *while the drain was still
+    /// spinning*, and `release` then cleared a `context` the new registrant had already written — so
+    /// a handler that was mid-call could find its context replaced or zeroed underneath it. The
+    /// re-review measured 646 dispatches entering a live handler with `context == 0`.
+    ///
+    /// Everything here is observed from inside the module, at an instant the test chooses: the slot's
+    /// own fields, while a dispatch is parked inside the handler and a `release` is parked in its
+    /// drain. Nothing about it is timing-dependent except waiting for those two states to be reached,
+    /// and both are waited for by condition rather than by duration.
+    #[test]
+    fn a_slot_being_drained_cannot_be_handed_out_or_have_its_context_cleared() {
+        let _serial = serialized();
+        REUSE_ENTERED.store(false, Ordering::SeqCst);
+        REUSE_GATE.store(false, Ordering::SeqCst);
+        REUSE_SEEN_CONTEXT.store(0, Ordering::SeqCst);
+
+        let registration = install(reuse_handler, REUSE_CONTEXT).expect("a free handler slot");
+        let index = registration.slot();
+
+        // Park a dispatch inside the handler.
+        let faulter = std::thread::spawn(|| dispatch(&synthetic(REUSE_MAGIC)));
+        let deadline = std::time::Instant::now() + EVENTUALLY;
+        while !REUSE_ENTERED.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the handler was never entered");
+            std::thread::yield_now();
+        }
+
+        // And park a `release` inside its drain.
+        let (tx, rx) = mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            drop(registration);
+            let _ = tx.send(());
+        });
+        let handler_address = reuse_handler as usize;
+        while SLOTS[index].handler.load(Ordering::SeqCst) == handler_address {
+            assert!(std::time::Instant::now() < deadline, "`release` never unpublished the slot");
+            std::thread::yield_now();
+        }
+
+        // Everything below happens with the handler live and the drain in progress. Collected first
+        // and asserted after the threads are released, so a failure is a failure and not a hang.
+        let marker = SLOTS[index].handler.load(Ordering::SeqCst);
+        let intruder = install(inert_handler, INTRUDER_CONTEXT).expect("some other free slot");
+        let intruder_slot = intruder.slot();
+        let context_during_drain = SLOTS[index].context.load(Ordering::Relaxed);
+        let released_early = rx.recv_timeout(NOT_YET).is_ok();
+
+        REUSE_GATE.store(true, Ordering::SeqCst);
+        assert_eq!(faulter.join().expect("the faulting thread"), FaultOutcome::NotOurs);
+        releaser.join().expect("the releasing thread");
+
+        assert_eq!(
+            marker, DRAINING,
+            "a slot whose drain is in progress must be marked as such. Zero is the value \
+             `install`'s compare-exchange waits for, so unpublishing with zero hands the slot to \
+             the next registrant mid-drain"
+        );
+        assert_ne!(
+            intruder_slot, index,
+            "`install` took slot {index} while a dispatch was still inside its handler and its \
+             `release` had not returned. The next thing that `release` does is clear `context`, \
+             which is now the intruder's"
+        );
+        assert_eq!(
+            context_during_drain, REUSE_CONTEXT,
+            "the draining slot's context changed while a dispatch was inside its handler: expected \
+             {REUSE_CONTEXT:#x}, found {context_during_drain:#x}. {:#x} is the intruder's and 0 is \
+             `release` having cleared it too early",
+            INTRUDER_CONTEXT
+        );
+        assert!(!released_early, "`release` returned while the handler was still running");
+        assert_eq!(
+            REUSE_SEEN_CONTEXT.load(Ordering::SeqCst),
+            REUSE_CONTEXT,
+            "the handler was still running and no longer holding its own context, which is the \
+             use-after-free with an extra step: the value it dereferences belongs to somebody else"
+        );
+
+        // And once the drain has finished, the slot really is free again.
+        drop(intruder);
+        assert_eq!(
+            SLOTS[index].handler.load(Ordering::SeqCst),
+            0,
+            "a finished drain must leave the slot claimable, or `MAX_HANDLERS` becomes a lifetime \
+             budget"
+        );
+        assert_eq!(SLOTS[index].context.load(Ordering::Relaxed), 0);
     }
 
     /// A drained slot is reusable, and the reuse is what makes `MAX_HANDLERS` a capacity rather
