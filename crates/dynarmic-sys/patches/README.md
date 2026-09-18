@@ -28,9 +28,13 @@ code that depends on the new behaviour.
 
 ### 2. Terminals that check the cycle counter and the halt flag exclusively
 
-Three separate gaps, all measured by `the_stoppability_matrix` in
-`tests/hostile.rs`. Together they mean **no configuration lets a host stop every
-runaway guest**.
+All measured by `the_stoppability_matrix` in `tests/hostile.rs`, 27 cells.
+**A configuration that stops every runaway guest does exist** — `0x0000_FFF8`,
+which is `ALL_SAFE` without `BlockLinking`, `ReturnStackBuffer` or
+`FastDispatch` — because it routes every terminal through `ReturnFromRunCode`
+(`block_of_code.cpp:362`), the one path that checks `halt_reason`
+unconditionally and then `cycles_remaining` when cycle counting is on. What
+follows is what each flag buys and what it costs.
 
 **2a. The indirect-branch handlers check nothing.**
 `EmitTerminalImpl(IR::Term::PopRSBHint)` and
@@ -49,14 +53,28 @@ returns to the dispatcher, which checks both. Measured cost: **about 3.9 ns per
 indirect transfer**, which is nothing for a guest with no indirect branches and
 5.0x for one where half the instructions are indirect transfers (n=31, release).
 
-**2b. `LinkBlock` checks one or the other, never both.**
-`EmitTerminalImpl(IR::Term::LinkBlock)` (`a64_emit_x64.cpp:612-642`) compares
-`cycles_remaining` when `enable_cycle_counting` is set and `halt_reason` when it
-is not. A **direct**-branch loop therefore honours a step budget or a
-cross-thread halt, never both — and unlike 2a this is not affected by the
-optimization flags, so `INTERRUPTIBLE` does not help. A runtime that wants a
-budget *and* a watchdog has to get the watchdog from the budget expiring, by
-running in short windows.
+**2b. `LinkBlock` checks one or the other, unless `BlockLinking` is clear.**
+`EmitTerminalImpl(IR::Term::LinkBlock)` (`a64_emit_x64.cpp:612`) opens with an
+early-out: with `BlockLinking` **clear** it emits `ReturnFromRunCode()` and
+returns. With it set, it compares `cycles_remaining` when
+`enable_cycle_counting` is set and `halt_reason` when it is not — one or the
+other, never both.
+
+So a **direct**-branch loop under `ALL_SAFE` or `INTERRUPTIBLE` honours a step
+budget or a cross-thread halt, but not both; clearing `BlockLinking` gives both.
+The cost is a dispatcher round trip at every block boundary, so it scales with
+block length rather than with branch mix: **7.08x** on a workload with
+4-instruction blocks and no indirect branches at all (0.079 -> 0.561 ms, n=31,
+release), 7.11x and 7.43x on the two indirect mixes. The Task 2 re-review
+measured 6.6x (0.084 -> 0.551 ms, n=31) on its own 4-instruction-per-block
+workload -- the two agree within about 7%. Four-instruction blocks are close to
+the worst case, so treat 7x as an **upper bound**: real code has longer blocks
+and pays less, and neither figure has been measured against `libroblox.so`.
+
+A runtime that does not want to pay that can instead run under `INTERRUPTIBLE`
+with cycle counting on and a **short** budget, so `Run` returns on its own every
+few thousand instructions and each return is a decision point. A cross-thread
+halt is then honoured at the next window boundary rather than immediately.
 
 **2c. The cycle comparison is signed.**
 The same terminal emits `cmp qword[... cycles_remaining], 0` followed by `jg`.
@@ -99,8 +117,31 @@ region and its failure is discarded — a plausible starting point, not a
 diagnosis.
 
 So the D12 exception cannot be closed by configuration. Until a patch exists it
-is reported instead: `od_effective_config::code_cache_w_xor_x` carries it, and
+is reported instead: `od_effective_config::code_cache_w_xor_x` carries it (it
+echoes the build flag — querying the actual page protection would mean
+`VirtualQuery`, and Global Constraint 4 keeps OS calls in `omni-platform`), and
 `the_code_cache_is_writable_and_executable_at_once` asserts it, so the day it
 changes a test says so. The `w-xor-x` cargo feature exists to make the retest on
 a re-pin a single flag, and the build script refuses it — with the evidence
 above — rather than handing back a build that access-violates in every test.
+
+**What this exposes, stated properly.** The code cache is a `VirtualAlloc`
+region in the runtime's own address space. Under D4's identity mapping —
+`fastmem_pointer = 0`, `fastmem_address_space_bits = 64`, which
+`ARCHITECTURE.md` §1 makes the central bet — `EmitFastmemVAddr`
+(`backend/x64/emit_x64_memory.h:165-167`) takes the `unused_top_bits == 0`
+branch and returns `r13 + vaddr` with **no mask and no bounds test**. Guest
+address *is* host address: that is the point of the bet, and it is why the
+memory path costs nothing. It also means **the W+X code cache is guest-writable
+in principle**, with nothing between a guest and it but not knowing where it is
+— that is, ASLR.
+
+W^X is therefore a mitigation the identity-mapping bet gives up, not a property
+that survives because the guest is boxed in. There is no guest/host address
+separation to fall back on; by construction there is one address space.
+
+The test suite cannot see this. It runs at `fastmem_address_space_bits = 20`
+with `silently_mirror_fastmem`, so every guest address is masked into a 1 MiB
+arena and a wild store cannot reach anything. That is the right shape for
+testing the decoder and the wrong shape for reasoning about exposure, and the
+difference is exactly the configuration D4 commits production to.

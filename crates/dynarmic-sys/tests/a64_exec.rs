@@ -570,6 +570,10 @@ fn the_code_cache_is_writable_and_executable_at_once() {
     // it segfaults on this pin, including in dynarmic's own test suite, so the
     // exception is real and cannot be closed by configuration.
     //
+    // What is asserted is the build flag, not a `VirtualQuery` of the pages --
+    // Global Constraint 4 keeps OS calls in `omni-platform` -- so this says
+    // "W^X was not asked for", and the pages follow from that.
+    //
     // Asserting it keeps the contradiction from going quiet. When a re-pin or a
     // carried patch fixes it, this test fails and says so.
     let vm = Vm::new(vec![a64::svc(0)], VmOptions::default());

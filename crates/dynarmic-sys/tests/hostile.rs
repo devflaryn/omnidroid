@@ -948,18 +948,25 @@ fn the_stoppability_matrix() {
     // optimization flags. This is a defect report about the pin written as a
     // table, and every cell is executed.
     //
-    // Two places in dynarmic decide it, and they behave differently:
+    // Three terminals decide it, and each one is governed by a flag:
     //
-    //  * `EmitTerminalImpl(IR::Term::LinkBlock)` (`a64_emit_x64.cpp:612-642`)
-    //    ends a **direct** branch. With `enable_cycle_counting` it compares
-    //    `cycles_remaining` and nothing else; without it, `halt_reason` and
-    //    nothing else. Exclusive: no configuration checks both.
+    //  * `EmitTerminalImpl(IR::Term::LinkBlock)` (`a64_emit_x64.cpp:612`) ends
+    //    a **direct** branch. Its first statement is an early-out: with
+    //    `BlockLinking` **clear** it emits `ReturnFromRunCode()` and stops
+    //    there. Otherwise it compares `cycles_remaining` when
+    //    `enable_cycle_counting` is set and `halt_reason` when it is not --
+    //    one or the other, never both.
     //  * `PopRSBHint` and `FastDispatchHint` end an **indirect** branch. Their
     //    handlers (`GenTerminalHandlers`, `a64_emit_x64.cpp:169`) compute a
     //    location descriptor and jump, reading neither. Clearing
-    //    `ReturnStackBuffer` and `FastDispatch` sends them through
-    //    `ReturnFromRunCode` instead, which returns to the dispatcher, which
-    //    checks both.
+    //    `ReturnStackBuffer` and `FastDispatch` sends them to
+    //    `ReturnFromRunCode` instead.
+    //
+    // `ReturnFromRunCode` (`block_of_code.cpp:362`) is the one path that checks
+    // everything: `halt_reason` unconditionally, then `cycles_remaining` when
+    // cycle counting is on. So a flag set that routes *every* terminal through
+    // it -- `ALL_SAFE` minus BlockLinking, ReturnStackBuffer and FastDispatch,
+    // which is `0x0000_FFF8` -- is stoppable in every cell.
     //
     // The A64 frontend only ever emits `LinkBlock`, never `LinkBlockFast`
     // (`frontend/A64/translate/impl/a64_branch.cpp`), so a direct branch always
@@ -967,11 +974,15 @@ fn the_stoppability_matrix() {
     //
     // When a cell stops matching, the pin has been fixed or patched and this
     // table -- and `optimization::INTERRUPTIBLE` -- should be revisited.
-    let cases: [(&str, bool); 18] = [
-        // Direct branches. The optimization flags make no difference at all --
-        // both columns are identical -- and cycle counting picks which single
-        // escape exists. Arming both leaves the halt unchecked, so the third
-        // row of each pair is the guest a runtime cannot interrupt.
+    // `halt+budget` arms both mechanisms with a budget deliberately set not to
+    // expire (`i64::MAX`), so the cell isolates one question: **is the halt
+    // honoured?** A `false` there does not mean arming both is worse than
+    // arming either alone -- it means the halt contributes nothing, and the
+    // budget is then the only thing that could have stopped this guest.
+    let cases: [(&str, bool); 27] = [
+        // Direct branches, `ALL_SAFE` and `INTERRUPTIBLE`: identical, because
+        // neither clears `BlockLinking`. Cycle counting picks which single
+        // escape exists, and with it on the halt is not honoured.
         ("direct-empty:0000FFFF:budget", true),
         ("direct-empty:0000FFFF:halt", true),
         ("direct-empty:0000FFFF:halt+budget", false),
@@ -986,13 +997,26 @@ fn the_stoppability_matrix() {
         ("direct-body:0000FFF9:halt+budget", false),
         // Indirect branches. Nothing works under the defaults; everything works
         // once the two unchecked handlers are out of the way, including the
-        // combination direct branches cannot do -- the dispatcher checks both.
+        // both-armed combination, because their fallback is the dispatcher.
         ("indirect:0000FFFF:budget", false),
         ("indirect:0000FFFF:halt", false),
         ("indirect:0000FFFF:halt+budget", false),
         ("indirect:0000FFF9:budget", true),
         ("indirect:0000FFF9:halt", true),
         ("indirect:0000FFF9:halt+budget", true),
+        // `BlockLinking` cleared as well. Every terminal now falls back to
+        // `ReturnFromRunCode`, which checks the halt flag unconditionally and
+        // the cycle counter when it is enabled -- so every cell stops,
+        // including the three a runtime actually wants.
+        ("direct-empty:0000FFF8:budget", true),
+        ("direct-empty:0000FFF8:halt", true),
+        ("direct-empty:0000FFF8:halt+budget", true),
+        ("direct-body:0000FFF8:budget", true),
+        ("direct-body:0000FFF8:halt", true),
+        ("direct-body:0000FFF8:halt+budget", true),
+        ("indirect:0000FFF8:budget", true),
+        ("indirect:0000FFF8:halt", true),
+        ("indirect:0000FFF8:halt+budget", true),
     ];
     assert_eq!(optimization::ALL_SAFE, 0x0000_FFFF);
     assert_eq!(optimization::INTERRUPTIBLE, 0x0000_FFF9);
@@ -1007,14 +1031,18 @@ fn the_stoppability_matrix() {
     for (spec, expected_stopped) in cases {
         let mut child = spawn_child_with("the_stoppability_matrix", &[("OD_RUNAWAY_CASE", spec)]);
         let st = wait_up_to(&mut child, 60).expect("the child never exited at all");
-        let stopped = st.success();
-        if stopped != expected_stopped {
-            wrong.push(format!(
-                "  {spec}: expected {}, got {} (exit {:?})",
-                if expected_stopped { "stopped" } else { "wedged" },
-                if stopped { "stopped" } else { "wedged" },
-                st.code()
-            ));
+        // Only two exit codes are answers. Anything else -- a panic from the
+        // child's own assertion, which is what the *wrong* escape firing looks
+        // like -- is a third outcome and must not be filed under "wedged", or a
+        // cell that starts returning for the wrong reason keeps passing.
+        match st.code() {
+            Some(0) if expected_stopped => {}
+            Some(EXIT_WEDGED) if !expected_stopped => {}
+            Some(0) => wrong.push(format!("  {spec}: expected wedged, was stopped")),
+            Some(EXIT_WEDGED) => wrong.push(format!("  {spec}: expected stopped, wedged")),
+            other => wrong.push(format!(
+                "  {spec}: neither stopped nor wedged (exit {other:?}): the escape                  under test did not fire, but something else ended the run"
+            )),
         }
     }
     assert!(
@@ -1061,6 +1089,8 @@ fn unbounded_guest_recursion_does_not_take_the_process_down() {
             },
         );
         vm.set_sp(0xF_0000);
+        // Cycles, not calls: the loop is three instructions, so this is about
+        // 66,600 nested calls, each having pushed a frame.
         vm.start(200_000);
         // SAFETY: `vm.raw()` is live and not executing.
         let hr = unsafe { od_jit_run(vm.raw()) };
@@ -1074,6 +1104,6 @@ fn unbounded_guest_recursion_does_not_take_the_process_down() {
     let st = wait_up_to(&mut child, 60).expect("the child never exited at all");
     assert!(
         st.success(),
-        "200,000 guest calls, each pushing a frame, took the process down: {st}"
+        "~66,600 nested guest calls, each pushing a frame, took the process down: {st}"
     );
 }

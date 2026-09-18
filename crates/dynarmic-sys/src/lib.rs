@@ -346,12 +346,19 @@ pub struct OdEffectiveConfig {
     pub optimizations: u32,
     /// 1 if accuracy-reducing optimizations were permitted.
     pub unsafe_optimizations: u32,
-    /// 1 if dynarmic's code cache is W^X. **0 on this pin.** Upstream commits
-    /// it `PAGE_EXECUTE_READWRITE`, so the region holding every byte of
-    /// generated guest code is writable and executable at once — which D12 says
-    /// Omnidroid never does. The upstream switch for it crashes on this pin
-    /// (see `build.rs`), so the contradiction stands and is reported here
-    /// rather than left silent.
+    /// 1 if dynarmic was *built* with `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT`.
+    ///
+    /// This echoes the build flag; it does **not** query the page protection.
+    /// Querying means `VirtualQuery`, and Global Constraint 4 keeps OS calls in
+    /// `omni-platform`. So it answers "was W^X asked for at compile time",
+    /// which is one inference away from "are these pages W^X".
+    ///
+    /// **0 on this pin.** Upstream commits the code cache
+    /// `PAGE_EXECUTE_READWRITE`, so the region holding every byte of generated
+    /// guest code is writable and executable at once — which D12 says Omnidroid
+    /// never does. The upstream switch for it crashes on this pin (see
+    /// `build.rs`), so the contradiction stands and is reported here rather
+    /// than left silent.
     pub code_cache_w_xor_x: i32,
     /// Address of the `TPIDR_EL0` slot baked into generated code; 0 means the
     /// guest cannot read it, which D13 says breaks every stack-protected

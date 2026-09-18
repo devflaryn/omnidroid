@@ -158,8 +158,16 @@ fn cost_of_interruptible_dispatch() {
     println!("n={N} per configuration, release, {ITERATIONS} iterations");
     for (name, code, insns) in cases {
         let all = steady_state(code.clone(), optimization::ALL_SAFE);
-        let interruptible = steady_state(code, optimization::INTERRUPTIBLE);
+        let interruptible = steady_state(code.clone(), optimization::INTERRUPTIBLE);
+        // `INTERRUPTIBLE` with `BlockLinking` cleared too: the only flag set in
+        // which every runaway shape is stoppable by both mechanisms. Its cost
+        // is driven by how long the average basic block is, not by branch mix,
+        // so it is reported for every workload rather than folded into the
+        // ratio above.
+        let stoppable =
+            steady_state(code, optimization::INTERRUPTIBLE & !optimization::BLOCK_LINKING);
         let ratio = interruptible.median.as_secs_f64() / all.median.as_secs_f64();
+        let stoppable_ratio = stoppable.median.as_secs_f64() / all.median.as_secs_f64();
         println!(
             "{name:22} ALL_SAFE      {:6.3}-{:6.3} ms (median {:6.3}, {:7.1} Mguest-insn/s)",
             ms(all.min),
@@ -174,7 +182,16 @@ fn cost_of_interruptible_dispatch() {
             ms(interruptible.median),
             interruptible.rate(insns)
         );
-        println!("{name:22} ratio         {ratio:.2}x");
+        println!(
+            "{name:22} no-BlockLink  {:6.3}-{:6.3} ms (median {:6.3}, {:7.1} Mguest-insn/s)",
+            ms(stoppable.min),
+            ms(stoppable.max),
+            ms(stoppable.median),
+            stoppable.rate(insns)
+        );
+        println!(
+            "{name:22} ratio         {ratio:.2}x INTERRUPTIBLE,              {stoppable_ratio:.2}x no-BlockLink"
+        );
         if name != "no indirect" {
             // The ratio is a property of the mix; the per-transfer cost is a
             // property of the change, and it is the number that transfers to

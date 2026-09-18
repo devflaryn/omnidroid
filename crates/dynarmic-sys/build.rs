@@ -55,6 +55,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CMAKE");
     println!("cargo:rerun-if-env-changed=CXX");
     println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=OMNIDROID_DYNARMIC_ALLOW_BROKEN_WX");
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch != "x86_64" && target_arch != "aarch64" {

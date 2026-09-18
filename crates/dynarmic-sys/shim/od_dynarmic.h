@@ -240,12 +240,20 @@ typedef struct od_effective_config {
     int hook_hint_instructions;
     uint32_t optimizations;
     uint32_t unsafe_optimizations;
-    /* 1 if dynarmic's code cache is W^X. **0 on this pin**: upstream's default
-     * commits it `PAGE_EXECUTE_READWRITE` (`block_of_code.cpp:280`), so the
-     * region holding every byte of generated guest code is writable and
-     * executable at once -- which is what D12 says Omnidroid never does. The
-     * upstream switch for it crashes; see `build.rs`. Reported rather than
-     * assumed so the contradiction is a checked fact and flips loudly. */
+    /* 1 if dynarmic was *built* with `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT`.
+     *
+     * This echoes the build flag. It does **not** query the page protection:
+     * doing that means `VirtualQuery`, and Global Constraint 4 keeps OS calls
+     * in `omni-platform`. So it answers "was W^X asked for at compile time",
+     * which is one inference away from "are these pages W^X" -- the inference
+     * being that the flag does what it says.
+     *
+     * **0 on this pin.** Upstream's default commits the code cache
+     * `PAGE_EXECUTE_READWRITE` (`block_of_code.cpp:280`), so the region holding
+     * every byte of generated guest code is writable and executable at once,
+     * which is what D12 says Omnidroid never does. The upstream switch for it
+     * crashes; see `build.rs`. Reported rather than assumed so the
+     * contradiction is a checked fact and flips loudly when it changes. */
     int code_cache_w_xor_x;
     uint64_t tpidr_el0_ptr;
     uint64_t tpidrro_el0_ptr;
