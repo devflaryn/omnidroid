@@ -367,3 +367,84 @@ fn a_real_memory_fault_increments_the_counter_and_is_not_a_violation() {
     );
     assert_eq!(cpu.degraded_slices(), 0, "and it must not count as a degradation");
 }
+
+/// **Which atomic classes stay on D4's fast path, and which leave it.**
+///
+/// This exists because the Task 4 report asserted an answer it had not measured. Having corrected
+/// the static count — `libroblox.so` has **15,516** `LDAR`/`STLR` sites against **130** exclusives
+/// and **51** LSE (`tools/atomic_mix.py`) — the report went on to say that the ordered accesses
+/// "stay on the fastmem path". That was a guess: not one of the 870 leaf functions M2 executes
+/// contains an `LDAR`, so nothing in the gate touched the question.
+///
+/// It matters more than the exclusives do, because it is the class the engine is actually built
+/// out of. If ordered accesses left the fast path, 15,516 sites would be paying the 30-49x, and no
+/// functional test anywhere would show it.
+///
+/// D5's amendment already measured the exclusive half — `LDXR` leaves the fast path unless
+/// `fastmem_exclusive_access` is on, which this backend sets — and that half is re-measured here
+/// beside it, so the comparison is between two numbers taken the same way rather than between a
+/// number and a recollection.
+#[test]
+fn ordered_accesses_stay_on_the_fast_path_and_exclusives_are_kept_on_it() {
+    let guest = Guest::new();
+    guest.assert_high_addresses();
+
+    const ITERATIONS: u64 = 1_000;
+
+    // Each program loops `ITERATIONS` times over one guest word, doing one load and one store of
+    // the class under test. The loop control is register-only, so every callback entry counted is a
+    // data access.
+    let program = |access: &dyn Fn(usize) -> Vec<u32>| {
+        let mut p = mov64(0, guest.data as u64);
+        p.extend(mov64(1, ITERATIONS));
+        let start = p.len();
+        p.extend(access(p.len()));
+        p.push(subs_imm(1, 1, 1));
+        let here = p.len();
+        p.push(b_cond(1, start as i32 - here as i32));
+        p.push(ret(30));
+        p
+    };
+
+    let measure = |name: &str, body: &dyn Fn(usize) -> Vec<u32>| -> u64 {
+        let entry = guest.load(&program(body));
+        let (mut cpu, sentinel) = guest.thread();
+        guest.write_u64(guest.data, 1);
+        cpu.reset_stats();
+        let exit = cpu.run(entry, RunLimit::Unlimited).expect("the loop runs");
+        assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "{name}: {exit}");
+        let entries = cpu.stats().slow_path_total;
+        println!("  {name:<28} {entries:>6} callback entries for {} accesses", ITERATIONS * 2);
+        entries
+    };
+
+    println!("\ncallback-path entries by atomic class (n = {ITERATIONS} iterations each):");
+
+    // Plain load/store, the control: D4 says zero.
+    let plain = measure("LDR / STR", &|_| vec![ldr_imm(2, 0, 0), str_imm(2, 0, 8)]);
+    assert_eq!(plain, 0, "the control must take no callbacks, or nothing below means anything");
+
+    // The class `libroblox.so` is built out of.
+    let ordered = measure("LDAR / STLR", &|_| vec![ldar(2, 0), stlr(2, 0)]);
+    assert_eq!(
+        ordered, 0,
+        "15,516 sites in libroblox.so are LDAR/STLR. If they left the fast path they would pay the \
+         30-49x with correct results and no functional symptom anywhere -- which is precisely the \
+         class of defect this branch exists to make visible"
+    );
+
+    // The exclusive half, which D5's amendment says `fastmem_exclusive_access` rescues. Measured
+    // here rather than recalled, so the two classes are compared on equal terms.
+    let exclusive = measure("LDXR / STXR", &|_| vec![ldxr(2, 0), stxr(3, 2, 0)]);
+    assert_eq!(
+        exclusive, 0,
+        "D5's amendment records that LDXR leaves the fast path with fastmem_exclusive_access off \
+         and takes 0 callbacks with it on. This backend sets it on; if this is non-zero the setting \
+         has been lost"
+    );
+
+    println!(
+        "  So all three classes reach memory with no callback under this configuration. The one \
+         that matters most is the middle row: it is 99% of the engine's atomic-ish accesses."
+    );
+}

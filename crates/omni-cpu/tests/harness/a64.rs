@@ -95,6 +95,31 @@ pub const fn str_reg(rt: u32, rn: u32, rm: u32) -> u32 {
     0xF820_6800 | (rm << 16) | (rn << 5) | rt
 }
 
+/// `LDAR Xt, [Xn]` — load-acquire. `11 001000 1 1 0 11111 1 11111 Rn Rt`.
+///
+/// The dominant atomic-ish class in `libroblox.so`: 15,516 sites, against 130 exclusives and 51
+/// LSE (`tools/atomic_mix.py`). It is an ordinary load with ordering, not a read-modify-write, and
+/// it touches no exclusive monitor — which is exactly why the first version of the Task 4 report
+/// miscounted it as `LDAXR`.
+pub const fn ldar(rt: u32, rn: u32) -> u32 {
+    0xC8DF_FC00 | (rn << 5) | rt
+}
+
+/// `STLR Xt, [Xn]` — store-release. As `LDAR` with `L = 0`.
+pub const fn stlr(rt: u32, rn: u32) -> u32 {
+    0xC89F_FC00 | (rn << 5) | rt
+}
+
+/// `LDXR Xt, [Xn]` — load-exclusive, which *does* take the monitor.
+pub const fn ldxr(rt: u32, rn: u32) -> u32 {
+    0xC85F_7C00 | (rn << 5) | rt
+}
+
+/// `STXR Ws, Xt, [Xn]` — store-exclusive. `Ws` receives 0 on success.
+pub const fn stxr(rs: u32, rt: u32, rn: u32) -> u32 {
+    0xC800_7C00 | (rs << 16) | (rn << 5) | rt
+}
+
 /// `MRS Xt, TPIDR_EL0` — `1101 0101 0011 1101 1101 0000 011 Rt`, i.e. `op0=3 op1=3 CRn=13 CRm=0
 /// op2=2`.
 pub const fn mrs_tpidr_el0(rt: u32) -> u32 {
@@ -148,6 +173,20 @@ mod tests {
         assert_eq!(ret(30), 0xD65F_03C0);
         assert_eq!(ldr_imm(1, 0, 0x28), 0xF940_1401, "LDR X1, [X0, #0x28]");
         assert_eq!(mrs_tpidr_el0(0), 0xD53B_D040);
+        // `STLR XZR, [X21]` is word 0xc89ffebf, taken straight out of `libroblox.so` -- the exact
+        // word the first atomics count misread as a store-exclusive. Checking the helper against a
+        // word from the real binary is the only way to be sure these are the engine's encodings
+        // and not merely ones that assemble.
+        assert_eq!(stlr(31, 21), 0xC89F_FEBF);
+        assert_eq!(ldar(1, 0), 0xC8DF_FC01);
+        assert_eq!(ldxr(1, 0), 0xC85F_7C01);
+        assert_eq!(stxr(2, 1, 0), 0xC802_7C01);
+        // `LDAR` and `LDXR` differ only in bit 23 (`o2`, which decides ordered versus exclusive)
+        // and bit 15 (`o0`, the acquire flag). Bit 23 is the one the first atomics count did not
+        // read, and it is the whole difference between "takes the global monitor" and "does not".
+        assert_eq!(ldar(1, 0) ^ ldxr(1, 0), 0x0080_8000);
+        assert_eq!((ldar(1, 0) >> 23) & 1, 1, "LDAR is o2 = 1: ordered");
+        assert_eq!((ldxr(1, 0) >> 23) & 1, 0, "LDXR is o2 = 0: exclusive");
         assert_eq!(svc(0xFFFF), 0xD41F_FFE1);
         assert_eq!(brk(0), 0xD420_0000);
         assert_eq!(mov64(3, 0x1_0000_0000), vec![movz(3, 1, 2)]);

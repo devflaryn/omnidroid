@@ -525,6 +525,11 @@ MUTATIONS = [
      ELF_SCAN),
 
     # ---- the per-slice callback invariant ---------------------------------------------------------
+    ("cpu-A32", "A", "fastmem_exclusive_access lost, so every LDXR leaves the fast path", CPU_DYN,
+     """            fastmem_exclusive_access: 1,""",
+     """            fastmem_exclusive_access: 0,""",
+     CPU),
+
     ("cpu-A28", "A", "the per-slice callback delta is no longer checked", CPU_DYN,
      """                let delta = self.slow_path_entries().saturating_sub(before);
                 if delta != 0 {""",
