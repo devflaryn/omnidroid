@@ -1,0 +1,543 @@
+//! What guest memory actually *costs*.
+//!
+//! These are the tests that decide whether `omni-mem` satisfies the requirement D10 was written to
+//! answer: isolated guest address spaces, no large fixed RAM reservation, demand-driven usage,
+//! genuinely reclaimable, many instances without a huge pagefile. Every one of them asserts against
+//! a **measured** commit charge rather than against a successful return, because that is the only
+//! thing that can tell real reclamation from apparent reclamation: `MEM_RESET` is the cheapest call
+//! Windows offers, it frees exactly 0 bytes, and no functional test can distinguish it from
+//! `MEM_DECOMMIT` (D10).
+//!
+//! Every observed number is printed. Run with `cargo test -p omni-mem --test commit_charge --
+//! --nocapture` to read them.
+//!
+//! # Why this is a separate test binary
+//!
+//! Commit charge is a *per-process* quantity and `cargo test` runs one binary's tests as parallel
+//! threads, so a mapping made by one test would appear in another's delta. These tests are in their
+//! own binary and serialise against each other with [`SERIAL`].
+//!
+//! # Tolerance
+//!
+//! 4 MiB, and the reason is arithmetic rather than superstition: page tables are charged at 8 bytes
+//! per committed 4 KiB page, which is 2 MiB for the 1 GiB case — D10 measured exactly this, 256 MiB
+//! committed costing 256.50 MiB — and the test harness allocates a little around each test. It is
+//! far below every effect being measured here (0 against 4 GiB reserved, 1 GiB against 0 committed).
+#![cfg(target_os = "windows")]
+
+mod common;
+
+use std::sync::Mutex;
+use std::time::Instant;
+
+use common::{KIB, MIB};
+use omni_mem::{CommitPolicy, GuestSpace, GuestSpaceConfig, Placement, Protection};
+use omni_platform::vm;
+
+/// Held for the whole of each test, so only one test is mapping at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+const TOLERANCE: i64 = 4 * MIB as i64;
+
+fn charge() -> i64 {
+    vm::process_commit_charge().expect("read the process commit charge") as i64
+}
+
+fn working_set() -> i64 {
+    vm::process_working_set().expect("read the process working set") as i64
+}
+
+fn mib(bytes: i64) -> String {
+    format!("{:+.3} MiB", bytes as f64 / MIB as f64)
+}
+
+fn assert_close(actual: i64, expected: i64, what: &str) {
+    assert!(
+        (actual - expected).abs() <= TOLERANCE,
+        "{what}: expected {} +/- {}, observed {}",
+        mib(expected),
+        mib(TOLERANCE),
+        mib(actual)
+    );
+}
+
+fn space(size: usize) -> GuestSpace {
+    GuestSpace::with_config(GuestSpaceConfig { size, ..GuestSpaceConfig::default() })
+        .expect("reserve a guest address space")
+}
+
+#[test]
+fn reserving_a_four_gibibyte_guest_space_costs_no_commit_charge() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+
+    let before = charge();
+    let before_ws = working_set();
+    let space = GuestSpace::new().expect("reserve the default guest address space");
+    let after = charge();
+    let delta = after - before;
+    eprintln!(
+        "reserve a {} GiB guest space: commit {} (working set {}), base {:#x}",
+        space.len() / (1024 * MIB),
+        mib(delta),
+        mib(working_set() - before_ws),
+        space.base()
+    );
+    assert_eq!(space.len(), 4 * 1024 * MIB, "the default guest space should be 4 GiB");
+
+    // The whole memory design rests on this: address space is free, and only commit costs anything.
+    // If this ever stops holding, no amount of lazy committing elsewhere can save the design.
+    assert_close(delta, 0, "a 4 GiB guest address space reservation");
+    assert_eq!(space.stats().committed, 0);
+    assert_eq!(space.stats().free, space.len());
+
+    space.close().expect("close");
+    let released = charge() - before;
+    eprintln!("after closing it: commit {}", mib(released));
+    assert_close(released, 0, "closing an untouched guest space");
+}
+
+#[test]
+fn eight_guest_spaces_cost_no_more_than_one() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+
+    // The multi-instance premise, stated as a test: 32 GiB of guest address space across eight
+    // instances must cost essentially nothing until something is committed in it. D10 measured 64
+    // processes reserving 16 GB each — 1 TB in total — for 240.8 MB of *system* commit between them.
+    let before = charge();
+    let spaces: Vec<GuestSpace> = (0..8).map(|_| GuestSpace::new().expect("reserve")).collect();
+    let delta = charge() - before;
+    let total: usize = spaces.iter().map(|space| space.len()).sum();
+    eprintln!("8 guest spaces totalling {} GiB: commit {}", total / (1024 * MIB), mib(delta));
+    assert_eq!(total, 32 * 1024 * MIB);
+    assert_close(delta, 0, "eight 4 GiB guest address spaces");
+
+    drop(spaces);
+    assert_close(charge() - before, 0, "dropping eight guest address spaces");
+}
+
+#[test]
+fn mapping_writing_reading_and_unmapping_returns_the_commit_charge() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let space = space(256 * MIB);
+    let size = 64 * MIB;
+
+    let baseline = charge();
+    let address = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            size,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("map 64 MiB");
+    let mapped = charge() - baseline;
+
+    // SAFETY: the whole range is mapped ReadWrite and committed eagerly.
+    unsafe {
+        let pointer = space.ptr(address, size).expect("in the space");
+        for offset in (0..size).step_by(4096) {
+            pointer.add(offset).write(0xA5);
+        }
+        for offset in (0..size).step_by(4096) {
+            assert_eq!(pointer.add(offset).read(), 0xA5, "wrong byte at {offset:#x}");
+        }
+    }
+    let touched = charge() - baseline;
+
+    space.unmap(address, size).expect("unmap");
+    let released = charge() - baseline;
+    eprintln!(
+        "64 MiB eager mapping: commit after map {}, after touching every page {}, after unmap {}",
+        mib(mapped),
+        mib(touched),
+        mib(released)
+    );
+
+    // Commit charge is debited at commit, not at first touch: the whole size is charged before a
+    // single byte has been written, and touching every page adds nothing but page tables.
+    assert_close(mapped, size as i64, "committing 64 MiB");
+    assert_close(touched, size as i64, "touching 64 MiB that was already committed");
+    assert_close(released, 0, "unmapping 64 MiB");
+    assert_eq!(space.stats().committed, 0);
+}
+
+/// **The requirement, expressed as a test.** Grow to 1 GiB of live guest mappings, then release
+/// everything, and assert that the commit charge comes back to the baseline while the guest address
+/// space reservation stays intact.
+///
+/// This is the test that D10 exists to make possible, and the one that fails if reclamation is only
+/// apparent. Each of the numbers it prints is reported in the task report.
+#[test]
+fn growing_to_a_gibibyte_and_releasing_everything_returns_commit_charge_to_baseline() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let space = GuestSpace::new().expect("reserve a 4 GiB guest address space");
+    let baseline = charge();
+    let baseline_ws = working_set();
+    let chunk = 64 * MIB;
+    let chunks = 16;
+    let total = chunk * chunks;
+
+    let mut addresses = Vec::new();
+    for index in 0..chunks {
+        let address = space
+            .map_anonymous(
+                Placement::Anywhere { align: 64 * KIB },
+                chunk,
+                Protection::ReadWrite,
+                CommitPolicy::Eager,
+            )
+            .unwrap_or_else(|error| panic!("mapping {index}: {error}"));
+        // Write one byte per page, so the pages are genuinely in the working set and not merely
+        // committed. This is what makes the release meaningful: a reclamation that only dropped
+        // untouched pages would be no reclamation at all.
+        // SAFETY: the whole range is mapped ReadWrite and committed.
+        unsafe {
+            let pointer = space.ptr(address, chunk).expect("in the space");
+            for offset in (0..chunk).step_by(4096) {
+                pointer.add(offset).write(index as u8);
+            }
+        }
+        addresses.push(address);
+    }
+
+    let peak = charge() - baseline;
+    let peak_ws = working_set() - baseline_ws;
+    eprintln!(
+        "grown to {} MiB of live guest mappings: commit {}, working set {}",
+        total / MIB,
+        mib(peak),
+        mib(peak_ws)
+    );
+    assert_close(peak, total as i64, "1 GiB of live guest mappings");
+    assert_eq!(space.stats().committed, total);
+    assert_eq!(space.stats().mapped, total);
+
+    // Verify the contents before releasing: if a mapping had landed on top of another, this is where
+    // it would show, and the release numbers below would be measuring the wrong thing.
+    for (index, &address) in addresses.iter().enumerate() {
+        // SAFETY: every range is still mapped and committed.
+        unsafe {
+            let pointer = space.ptr(address, chunk).expect("in the space");
+            assert_eq!(pointer.read(), index as u8, "mapping {index} holds the wrong byte");
+            assert_eq!(pointer.add(chunk - 4096).read(), index as u8);
+        }
+    }
+
+    for (index, address) in addresses.into_iter().enumerate() {
+        space.unmap(address, chunk).unwrap_or_else(|error| panic!("unmapping {index}: {error}"));
+    }
+    let after = charge() - baseline;
+    let after_ws = working_set() - baseline_ws;
+    eprintln!(
+        "after unmapping all {} MiB: commit {}, working set {}",
+        total / MIB,
+        mib(after),
+        mib(after_ws)
+    );
+
+    // This is the assertion the requirement reduces to.
+    assert_close(after, 0, "releasing 1 GiB of guest mappings");
+    assert_eq!(space.stats().committed, 0);
+    assert_eq!(space.stats().mapped, 0);
+
+    // And the address space is still ours: the reservation was never released, so the same addresses
+    // are still available and nothing else in the process can have been given them.
+    assert_eq!(space.len(), 4 * 1024 * MIB);
+    assert_eq!(space.stats().free, space.len());
+    let reused = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            chunk,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("the space is still usable after being emptied");
+    // A recommitted page reads back zero, matching anonymous mmap and MADV_DONTNEED.
+    // SAFETY: the range was just mapped and committed.
+    unsafe {
+        let pointer = space.ptr(reused, chunk).expect("in the space");
+        assert_eq!(pointer.read(), 0, "a recommitted page must read back zero");
+    }
+    space.unmap(reused, chunk).expect("unmap");
+
+    space.close().expect("close");
+    let closed = charge() - baseline;
+    eprintln!("after closing the guest space: commit {}", mib(closed));
+    assert_close(closed, 0, "closing the guest space");
+}
+
+#[test]
+fn a_lazy_mapping_of_a_gibibyte_costs_nothing_until_it_is_reached() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let space = GuestSpace::new().expect("reserve");
+    let granule = space.commit_granule();
+    let size = 1024 * MIB;
+
+    let baseline = charge();
+    let address = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            size,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("map 1 GiB lazily");
+    let mapped = charge() - baseline;
+    eprintln!("a 1 GiB lazy mapping: commit {}", mib(mapped));
+    // The guest can hold a gigabyte of address space for nothing. This is the other half of the
+    // requirement: demand-driven usage, not a preallocated guest RAM blob.
+    assert_close(mapped, 0, "a 1 GiB lazy mapping");
+    assert_eq!(space.stats().mapped, size);
+    assert_eq!(space.stats().committed, 0);
+
+    // Reaching one byte commits one granule and no more.
+    let committed = space.ensure_committed(address + 512 * MIB, 1).expect("commit one granule");
+    let one = charge() - baseline;
+    eprintln!("after reaching one byte in the middle of it: commit {}", mib(one));
+    assert_eq!(committed, granule, "one byte must commit exactly one granule");
+    // The number that matters is that reaching one byte did not cost anything like the mapping: a
+    // granule is 1/16384th of it. The exact figure is not asserted tightly because a 64 KiB delta is
+    // within the noise of the test process's own heap — the byte count returned above is the precise
+    // statement, and it is exact.
+    assert!(
+        one < TOLERANCE,
+        "reaching one byte of a 1 GiB lazy mapping cost {}, which is far too much",
+        mib(one)
+    );
+    // SAFETY: the granule containing this address is now committed and writable.
+    unsafe {
+        space.ptr(address + 512 * MIB, 1).expect("in the space").write(0x42);
+    }
+
+    // Walking a 16 MiB window commits exactly that window's granules, not the whole mapping.
+    let window = 16 * MIB;
+    let committed = space.ensure_committed(address, window).expect("commit a window");
+    let walked = charge() - baseline;
+    eprintln!("after committing a {} MiB window: commit {}", window / MIB, mib(walked));
+    assert_eq!(committed, window, "a window must commit exactly its own granules");
+    assert_close(walked, (window + granule) as i64, "a 16 MiB window of a 1 GiB lazy mapping");
+
+    space.unmap(address, size).expect("unmap");
+    let released = charge() - baseline;
+    eprintln!("after unmapping the whole lazy mapping: commit {}", mib(released));
+    assert_close(released, 0, "unmapping a partly committed 1 GiB lazy mapping");
+    space.close().expect("close");
+}
+
+/// `reclaim_idle` must return what it says it returned.
+///
+/// The test is written to fail if reclamation were built on `MEM_RESET`, `DiscardVirtualMemory`,
+/// `OfferVirtualMemory` or `EmptyWorkingSet`: each of those measured **exactly 0.00 MB** of commit
+/// charge returned (D10), and each would let `reclaim_idle` report a large `bytes` while the process
+/// still held the charge. So the reported figure is compared against the *measured* drop, not merely
+/// asserted to be non-zero.
+#[test]
+fn reclaim_idle_returns_the_commit_charge_it_claims_to_have_returned() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let space = space(1024 * MIB);
+    let size = 256 * MIB;
+
+    let baseline = charge();
+    // Lazy, then committed granule by granule, so that reclamation has thousands of separate
+    // granules to give back rather than one large region — which is the shape a long-running guest
+    // actually produces.
+    let address = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            size,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("map 256 MiB");
+    // Granule by granule, the way a guest arrives at its memory, so that reclamation has thousands
+    // of separate committed granules to give back rather than one large region.
+    let granule = space.commit_granule();
+    let mut offset = 0;
+    while offset < size {
+        assert_eq!(
+            space.ensure_committed(address + offset, 1).expect("commit a granule"),
+            granule
+        );
+        offset += granule;
+    }
+    // SAFETY: the whole range is mapped ReadWrite and committed.
+    unsafe {
+        let pointer = space.ptr(address, size).expect("in the space");
+        for offset in (0..size).step_by(4096) {
+            pointer.add(offset).write(0x3C);
+        }
+    }
+    let committed = charge() - baseline;
+    assert_close(committed, size as i64, "committing 256 MiB");
+
+    let marked = space.advise_idle(address, size).expect("advise idle");
+    let advised = charge() - baseline;
+    eprintln!("256 MiB committed: {}; after advise_idle: {}", mib(committed), mib(advised));
+    assert_eq!(marked, size, "the whole range should have been marked");
+    assert_eq!(space.stats().idle, size);
+    // Advising is not reclaiming. Marking must cost nothing and free nothing — if this dropped, the
+    // implementation would be decommitting behind the caller's back and losing data it promised to
+    // keep.
+    assert_close(advised, committed, "advise_idle must not change the commit charge");
+    // SAFETY: the range is still committed; advise_idle keeps the contents until reclaim.
+    unsafe {
+        assert_eq!(space.ptr(address, 1).expect("in the space").read(), 0x3C);
+    }
+
+    let before_reclaim = charge();
+    let reclaimed = space.reclaim_idle().expect("reclaim");
+    let measured_drop = before_reclaim - charge();
+    eprintln!(
+        "reclaim_idle reported {} in {} granules; the process's commit charge dropped by {}",
+        mib(reclaimed.bytes as i64),
+        reclaimed.granules,
+        mib(measured_drop)
+    );
+    assert_eq!(reclaimed.bytes, size, "the whole range should have been reclaimed");
+    assert_eq!(
+        reclaimed.granules,
+        size / granule,
+        "every granule of the mapping should have been decommitted"
+    );
+    // The claim and the measurement have to agree. This is the assertion that a MEM_RESET-based
+    // implementation cannot pass.
+    assert_close(
+        measured_drop,
+        reclaimed.bytes as i64,
+        "the measured drop must match what reclaim_idle reported",
+    );
+    assert_close(charge() - baseline, 0, "after reclaiming everything");
+    assert_eq!(space.stats().committed, 0);
+    assert_eq!(space.stats().idle, 0);
+
+    // The mapping is still there and still usable: reclamation returns the resource without taking
+    // the guest's address space away. Its contents are gone, which is exactly MADV_DONTNEED.
+    assert_eq!(space.stats().mapped, size);
+    assert_eq!(space.ensure_committed(address, 1).expect("recommit"), granule);
+    // SAFETY: the first granule has just been committed again.
+    unsafe {
+        assert_eq!(
+            space.ptr(address, 1).expect("in the space").read(),
+            0,
+            "a reclaimed and recommitted page must read back zero"
+        );
+    }
+    space.unmap(address, size).expect("unmap");
+    space.close().expect("close");
+}
+
+#[test]
+fn a_partial_unmap_returns_exactly_the_commit_charge_of_what_it_unmapped() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let space = space(1024 * MIB);
+    let size = 128 * MIB;
+    let hole = 64 * MIB;
+
+    let baseline = charge();
+    let address = space
+        .map_anonymous(
+            Placement::Anywhere { align: 64 * KIB },
+            size,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("map");
+    // SAFETY: the whole range is mapped ReadWrite and committed.
+    unsafe {
+        let pointer = space.ptr(address, size).expect("in the space");
+        for offset in (0..size).step_by(4096) {
+            pointer.add(offset).write(0x5E);
+        }
+    }
+    let committed = charge() - baseline;
+
+    // Punch the middle out. The surviving halves must keep both their contents and their charge.
+    space.unmap(address + 32 * MIB, hole).expect("punch a hole");
+    let after = charge() - baseline;
+    eprintln!(
+        "128 MiB committed {}, after unmapping 64 MiB from the middle {}",
+        mib(committed),
+        mib(after)
+    );
+    assert_close(after, (size - hole) as i64, "the surviving halves of a partial unmap");
+    assert_eq!(space.stats().committed, size - hole);
+    // SAFETY: both surviving halves are still mapped and committed.
+    unsafe {
+        assert_eq!(space.ptr(address, 1).expect("in the space").read(), 0x5E);
+        assert_eq!(space.ptr(address + 96 * MIB, 1).expect("in the space").read(), 0x5E);
+    }
+
+    space.unmap(address, size).expect("unmap the rest");
+    assert_close(charge() - baseline, 0, "unmapping the survivors");
+    space.close().expect("close");
+}
+
+/// The commit granule, measured rather than asserted.
+///
+/// This is the evidence behind `DEFAULT_COMMIT_GRANULE`. It prints the cost per page at several
+/// granule sizes and asserts the relationship that decides the default: per-page commit is an order
+/// of magnitude worse, because the cost of committing a granule is two kernel calls and barely
+/// depends on how big the granule is.
+#[test]
+fn a_larger_commit_granule_is_dramatically_cheaper_per_page() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let span = 64 * MIB;
+    let page = vm::page_size();
+    let mut per_page = Vec::new();
+
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "note: this is a debug build, where the region map's O(n) invariant check runs after              every mutation. The ratio below still holds, but the absolute figures quoted in the              task report come from `cargo test --release`."
+        );
+    }
+    for granule in [4 * KIB, 16 * KIB, 64 * KIB, 256 * KIB, MIB] {
+        let space = GuestSpace::with_config(GuestSpaceConfig {
+            size: 256 * MIB,
+            commit_granule: granule,
+            ..GuestSpaceConfig::default()
+        })
+        .expect("reserve");
+        let address = space
+            .map_anonymous(
+                Placement::Anywhere { align: 64 * KIB },
+                span,
+                Protection::ReadWrite,
+                CommitPolicy::Lazy,
+            )
+            .expect("map lazily");
+
+        let started = Instant::now();
+        let mut offset = 0;
+        while offset < span {
+            space.ensure_committed(address + offset, 1).expect("commit a granule");
+            offset += granule;
+        }
+        let elapsed = started.elapsed();
+        let nanos_per_page = elapsed.as_nanos() as f64 / (span / page) as f64;
+        eprintln!(
+            "granule {:>5} KiB: {:>9.2?} to commit {} MiB = {:>7.1} ns/page, {:>7.0} ns/granule",
+            granule / KIB,
+            elapsed,
+            span / MIB,
+            nanos_per_page,
+            elapsed.as_nanos() as f64 / (span / granule) as f64,
+        );
+        assert_eq!(space.stats().committed, span, "the whole span should be committed");
+        per_page.push((granule, nanos_per_page));
+        space.close().expect("close");
+    }
+
+    let four_kib = per_page[0].1;
+    let sixty_four_kib = per_page[2].1;
+    // Measured on this machine: 1810 ns/page at a 4 KiB granule against 124 ns/page at 64 KiB, a
+    // factor of 15. The assertion is deliberately loose — it is testing the shape of the curve, not
+    // the machine — but it is the reason the default is not the page size. For context, a page's
+    // first touch costs about 381 ns here whatever the granule, and D10 measured a VEH demand-pager
+    // at 2053 ns/fault.
+    assert!(
+        four_kib > 4.0 * sixty_four_kib,
+        "committing page by page ({four_kib:.0} ns/page) should be far worse than committing in \
+         64 KiB granules ({sixty_four_kib:.0} ns/page); if it is not, the granule is not earning \
+         its complexity"
+    );
+}

@@ -9,3 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+omni-platform = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

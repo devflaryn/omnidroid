@@ -158,6 +158,12 @@ version = "0.1.0"
 [[package]]
 name = "omni-mem"
 version = "0.1.0"
+dependencies = [
+ "omni-platform",
+ "parking_lot",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "omni-platform"

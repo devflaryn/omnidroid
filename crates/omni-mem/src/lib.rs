@@ -1,6 +1,73 @@
-//! Guest address-space manager: reservation, lazy commit, decommit, placeholder mapping and the
-//! JIT code arena, built on top of [`omni-platform`]'s virtual-memory seam.
+//! Guest address-space management: reservation, lazy commit, decommit, fixed-address mapping, and
+//! the dual-mapped JIT code arena. Built entirely on [`omni_platform::vm`]; there is no OS call and
+//! no `cfg(target_os)` in this crate (Global Constraint 4).
 //!
-//! Empty by design: this crate is created by Task 1 so later tasks have somewhere to land. It
-//! must compile for all five targets without `cfg` (Global Constraint 4).
-#![forbid(unsafe_code)]
+//! # The requirement this crate exists to satisfy
+//!
+//! Isolated guest address spaces, no large fixed RAM reservation, demand-driven usage, genuinely
+//! reclaimable, and many instances without a huge pagefile. D10 established that this is achievable
+//! and exactly how, by measurement:
+//!
+//! * **Address space is free.** A reservation costs 0 bytes of commit charge and 0 bytes of working
+//!   set, verified to 97.7 TB. So [`GuestSpace`] reserves generously and never economizes here.
+//! * **Commit charge is scarce**, and it is debited at commit, not at first touch: 1024 MB committed
+//!   and never touched measured 1026.66 MB of commit charge against a 4.68 MB working set. So
+//!   nothing here commits speculatively, and commit happens in granules as the guest arrives
+//!   (see [`DEFAULT_COMMIT_GRANULE`] for the measurements that set the granule).
+//! * **Only `MEM_DECOMMIT` reclaims.** `MEM_RESET`, `DiscardVirtualMemory`, `OfferVirtualMemory` and
+//!   `EmptyWorkingSet` each measured **exactly 0.00 MB** of commit charge returned. `MEM_RESET` is
+//!   also the cheapest of them, at 32.5 ns/page, so a reclamation path built on it would be fast,
+//!   look correct in every functional test, and free nothing at all. [`GuestSpace::unmap`] and
+//!   [`GuestSpace::reclaim_idle`] decommit, and the tests assert on measured commit charge rather
+//!   than on a successful return.
+//!
+//! # What is here
+//!
+//! * [`GuestSpace`] — one instance's address space: [`map_anonymous`](GuestSpace::map_anonymous),
+//!   [`map_file`](GuestSpace::map_file), [`unmap`](GuestSpace::unmap),
+//!   [`protect`](GuestSpace::protect), [`ensure_committed`](GuestSpace::ensure_committed),
+//!   [`reclaim_idle`](GuestSpace::reclaim_idle) and the [`regions`](GuestSpace::regions)
+//!   enumeration.
+//! * [`CodeArena`] — the JIT code arena. One writable view and one executable view of the same
+//!   pages, so that emitting code never requires a page to be writable and executable at the same
+//!   time (D12).
+//!
+//! # Two things that are not obvious and are load-bearing
+//!
+//! **Windows cannot partially unmap a view, and Android guests do partial `munmap`.** A view is
+//! unmapped from its base address with no length, so [`GuestSpace::unmap`] emulates a partial unmap:
+//! it unmaps the whole view and maps the surviving head and tail again from the same file at the
+//! same addresses. Head, tail and a hole through the middle are all handled, and each surviving
+//! piece keeps its own protection.
+//!
+//! **A placeholder cannot be split arbitrarily.** Measured: splitting a range that is already
+//! exactly one placeholder fails (487), splitting a range that spans two adjacent placeholders fails
+//! (87), and merging a range that holds only one placeholder fails (487). So the region map tracks
+//! placeholder extents exactly and every boundary change is paired with the matching kernel call.
+//! `crate::entry` documents the resulting invariant.
+
+#![warn(missing_docs)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+mod arena;
+mod backing;
+mod entry;
+mod error;
+mod region;
+mod space;
+
+pub use arena::{
+    ArenaConfig, ArenaStats, CodeArena, CodeBlock, DEFAULT_BLOCK_ALIGNMENT, DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_TOTAL,
+};
+pub use backing::{Backing, BackingId};
+pub use error::{MemError, MemResult};
+pub use region::{RegionInfo, RegionKind};
+pub use space::{
+    CommitPolicy, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId, Placement, Reclaimed,
+    SpaceStats, DEFAULT_COMMIT_GRANULE, DEFAULT_SPACE_SIZE,
+};
+
+/// Re-exported from `omni-platform` so that callers do not need to depend on it directly to name a
+/// protection. There is deliberately no writable-and-executable variant.
+pub use omni_platform::vm::{MapExecutability, Protection};
