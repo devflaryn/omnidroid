@@ -165,7 +165,10 @@ version = "0.1.0"
 name = "omni-cpu"
 version = "0.1.0"
 dependencies = [
+ "dynarmic-sys",
  "omni-mem",
+ "omni-platform",
+ "parking_lot",
  "thiserror",
 ]
 

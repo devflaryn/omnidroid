@@ -51,13 +51,25 @@ mod context;
 mod cpu;
 mod error;
 mod exit;
+#[cfg(all(feature = "dynarmic", target_arch = "x86_64"))]
+pub mod dynarmic;
+mod fastmem;
 mod regs;
+pub mod run;
+mod tls;
 
 pub use context::{
     ContextCost, GuestAddressSpace, GuestRange, GuestThreadConfig, TLS_SLOT_STACK_GUARD_OFFSET,
 };
 pub use cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle};
 pub use error::{CpuError, CpuResult};
+pub use fastmem::{
+    identity_mapping, pc_is_representable, require_identity_mapping, truncate_pc, MemoryMapping,
+    GUEST_PC_BITS,
+};
+pub use tls::{
+    GuestTls, TlsArena, TlsSlot, TLS_BLOCK_BYTES, TLS_CONTROL_BLOCK_BYTES, TLS_SLOT_COUNT,
+};
 pub use exit::{AccessKind, ExitReason, RunLimit};
 pub use regs::{Nzcv, VReg, XReg};
 

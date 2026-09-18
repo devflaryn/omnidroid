@@ -21,6 +21,10 @@ omni-cpu = { path = "crates/omni-cpu" }
 omni-android = { path = "crates/omni-android" }
 omni-gfx = { path = "crates/omni-gfx" }
 omni-core = { path = "crates/omni-core" }
+# The dynarmic FFI (preflight ruling P1). Only `omni-cpu` depends on it, and only on an x86-64
+# host: on an ARM64 host `ARCHITECTURE.md` section 6 runs guest code natively and there is no
+# translator to build.
+dynarmic-sys = { path = "crates/dynarmic-sys" }
 
 # Shared third-party versions. Pinned here so every crate agrees.
 thiserror = "2.0.20"

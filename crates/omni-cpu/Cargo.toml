@@ -16,3 +16,34 @@ publish = false
 # C++ toolchain at all, which is what the ARM64-native path (ARCHITECTURE.md section 6) needs.
 omni-mem = { workspace = true }
 thiserror = { workspace = true }
+# `TlsArena` hands blocks out from several guest threads at once; its free list needs a lock.
+parking_lot = { workspace = true }
+
+# The translating backend needs the guest address space itself, not just its extent: to decide
+# whether a guest address is executable before fetching an instruction from it, and to own guest
+# demand paging (D10) through omni-mem's `DemandPager`.
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# **Optional, and target-gated, so preflight ruling P1 still holds where it was aimed.** P1 put the
+# dynarmic FFI in its own crate so that `omni-cpu` — and therefore the `GuestCpu` trait — compiles
+# on a host with no C++ toolchain, which is what the ARM64-native path needs. That property is
+# unchanged: on an `aarch64` host this dependency does not exist at all, and on any host
+# `--no-default-features` gives the trait with no backend.
+#
+# It is a dependency here, rather than in a later task, because Task 3's deliverables are
+# *assertions about a live configuration* — zero callback-path entries, a startup check that fires,
+# a thread pointer guest code can read — and none of them can be written against a backend that
+# does not exist.
+dynarmic-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Tests only. `omni-platform` is where the vectored-handler seam lives, and the fault tests assert
+# that Omnidroid's handler really ran (D10) rather than inferring it. Depending on `omni-platform`
+# is the seam working as intended, not a Global Constraint 4 violation — the constraint forbids
+# `windows-sys`/`libc` outside it.
+omni-platform = { workspace = true }
+
+[features]
+default = ["dynarmic"]
+# The translating backend. See the dependency comment above.
+dynarmic = ["dep:dynarmic-sys"]
