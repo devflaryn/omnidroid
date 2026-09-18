@@ -217,6 +217,24 @@ Join Tasks 1-3 to the foundation's loader and run genuine Roblox code.
 - Report translation throughput and cold-translation time for the code actually executed, against
   D5's measured 0.15-0.31 Mguest-insn/s cold and ~2.0x native steady state on memory-heavy code.
 
+### The per-slice callback invariant (added after Task 3)
+
+Task 3 found a defect that the startup assertion **structurally cannot see**: two guest threads
+faulting on one granule caused the second to decline, handing the block to dynarmic and permanently
+deoptimizing it onto the 30-49x path — correct results, timing-only, silent. A second path of the same
+shape was then found where a panic declined a resolvable fault and incremented no counter at all.
+
+The startup assertion defends the *configuration*. These are *runtime* degradations, so the assertion
+passes and the runtime is quietly 30-49x slower. Implement the class-level answer:
+
+**Per run slice, the callback-path counter's delta must be zero unless that slice ended in a
+memory-fault exit.** Note it cannot be "the counter stays at zero" — a legitimate typed `MemoryFault`
+increments it too, so that phrasing would either fire spuriously or be disabled.
+
+The run loop already returns to Rust every slice and the counter is non-atomic on the JIT's own
+thread, so this costs one load per slice. Measure that cost and report it with its n. This catches the
+two known paths and any future cause, which is why it belongs here rather than as more special cases.
+
 ### Tests — the M2 gate
 - A real function from `libroblox.so` executes and returns a **correct, independently-predicted
   result**. A test asserting only that execution completed is vacuous: predict the value from the
