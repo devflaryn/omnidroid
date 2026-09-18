@@ -1,0 +1,90 @@
+lib/arm64-v8a/libroblox.so from C:\Users\berat\Desktop\Omni Apps\omnidroid\Roblox-2.738.1397.apk
+109,193,800 bytes, DT_NEEDED: libOpenMAXAL.so, libmediandk.so, libandroid.so, libm.so, libOpenSLES.so, libGLESv2.so, libEGL.so, liblog.so, libdl.so, libc.so
+
+SELF-CHECK
+  ok   .eh_frame_hdr FDEs                                                         245117   (expected 245117)
+  ok   FDE pc_begin vs search-table initial_location                                   0   (expected 0)
+  ok   undefined (imported) .dynsym entries                                          565   (expected 565)
+  ok   DT_INIT_ARRAY slots                                                          3594   (expected 3594)
+  ok   APS2 R_AARCH64_RELATIVE                                                    568194   (expected 568194)
+  ok   APS2 R_AARCH64_GLOB_DAT                                                        56   (expected 56)
+  ok   APS2 R_AARCH64_ABS64                                                           22   (expected 22)
+  ok   DT_INIT_ARRAY slots carrying a RELATIVE relocation                           3594   (expected 3594)
+  ok   DT_INIT_ARRAY in-place file words (RELA, so all zero)                           1   (expected 1)
+  ok   DT_JMPREL entries                                                             534   (expected 534)
+  ok   DT_JMPREL all R_AARCH64_JUMP_SLOT                                            True   (expected True)
+  ok   PLT stubs whose decoded GOT slot matches DT_JMPREL                            534   (expected 534)
+  ok   PLT stubs that disagreed                                                        0   (expected 0)
+
+import binding sites: 534 PLT/GOT via DT_JMPREL, 78 via symbol-bearing GLOB_DAT/ABS64 in the packed table, 612 distinct slots
+PLT stubs: 534, of which imports: 533; non-import PLT symbols: Java_com_roblox_client_purchase_IAPPurchaseManager_nativeFinishPaymentsProtocolPurchaseWithReturn
+imports with a PLT stub: 533; without: 32
+  without a stub: AMEDIAFORMAT_KEY_BIT_RATE, AMEDIAFORMAT_KEY_CHANNEL_COUNT, AMEDIAFORMAT_KEY_COLOR_FORMAT, AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, AMEDIAFORMAT_KEY_MIME, AMEDIAFORMAT_KEY_SAMPLE_RATE, AMEDIAFORMAT_KEY_STRIDE, AMEDIAFORMAT_KEY_WIDTH, AMediaCodec_delete, AMediaFormat_delete, __sF, __stack_chk_guard, daylight, environ, fchmod, fchown, glGetProgramInfoLog, glGetShaderInfoLog, in6addr_any, in6addr_loopback, mremap, optarg, optind, pwrite, round, stderr, stdin, stdout, timezone, tzname
+
+ROOTS
+  DT_INIT_ARRAY slots                               3,594
+  distinct target addresses                         3,594
+  landing exactly on an .eh_frame_hdr function      3,593
+  landing inside one but not at its start               0
+  landing in no FDE at all                              1
+
+TIER A0 -- BL edges only (the sensitivity floor)
+  functions in the closure                         10,786 of 245,117 (4.40%)
+  instruction words scanned                     1,137,333
+  imports reached by a direct branch to a stub         99
+  imports whose GOT slot is materialised               17
+  union                                               113 of 565
+  indirect call sites (BLR) -- unresolvable        14,688
+  indirect branch sites (BR) -- unresolvable           25
+  direct targets in no FDE (distinct)                   0
+  direct targets inside, not at, a function             0
+  FDE-less targets given a synthesised extent           2 (61 words)
+
+TIER A -- direct control transfers only (the lower bound)
+  functions in the closure                         15,779 of 245,117 (6.44%)
+  instruction words scanned                     1,542,223
+  imports reached by a direct branch to a stub        170
+  imports whose GOT slot is materialised               24
+  union                                               188 of 565
+  indirect call sites (BLR) -- unresolvable        17,698
+  indirect branch sites (BR) -- unresolvable          149
+  direct targets in no FDE (distinct)                   0
+  direct targets inside, not at, a function           738
+  FDE-less targets given a synthesised extent         678 (35,600 words)
+
+TIER C -- also following every address-taken function (the ceiling)
+  functions in the closure                         58,623 of 245,117 (23.92%)
+  instruction words scanned                     3,634,594
+  imports reached by a direct branch to a stub        228
+  imports whose GOT slot is materialised               25
+  union                                               246 of 565
+  indirect call sites (BLR) -- unresolvable        39,064
+  indirect branch sites (BR) -- unresolvable        1,766
+  direct targets in no FDE (distinct)                   0
+  direct targets inside, not at, a function           738
+  FDE-less targets given a synthesised extent       1,128 (58,133 words)
+  functions added by an address-taken edge         24,606
+
+THE CEILING NO CLOSURE CAN EXCEED
+  imports declared                                    565
+  function starts named by an R_AARCH64_RELATIVE relocation    106,899 of 245,117
+  (that last figure is the population an indirect call can land on, so it is the
+   size of limitation 3 -- vtables and pointer tables are not followed)
+
+TIER A REACHABLE IMPORTS BY PROVIDING LIBRARY  (188 symbols)
+  libc.so                                               156
+  libm.so                                                14
+  libmediandk                                            10
+  libdl.so                                                5
+  libc/bionic (BIONIC-SPECIFIC)                           2
+  liblog                                                  1
+
+  Tier C adds 58 more, for 246: (see --list)
+
+provider grouping cross-check: .gnu.version_r attributes 407 of 565 imports; the committed appendix agrees on 404
+  disagreement: ldexp: .gnu.version_r says libc.so, the appendix says 'libm'
+  disagreement: erff: .gnu.version_r says libm.so, the appendix says 'libc/bionic'
+  disagreement: erfcf: .gnu.version_r says libm.so, the appendix says 'libc/bionic'
+
+written: .superpowers/sdd/android-abi-plan/task-1-reachable-imports.txt
+NOTE: Tier A is a LOWER BOUND on reachability. A static call graph over a stripped binary cannot see an indirect call, and the closure contains the BLR/BR counts above. Tier A0 is the same closure with BL edges only, so the A0-to-A gap is how much of the answer rests on tail-call and cold-split edges. Tier C is an over-approximation in the other direction: it follows every materialised function address as if it were called. The true set lies between A and C, and only a run of the initializers settles it (Task 4).
