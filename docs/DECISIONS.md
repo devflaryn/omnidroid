@@ -696,3 +696,50 @@ Cost if wrong: about 6 MiB of unnecessary commit charge per instance. It is visi
 figure is now pinned by an assertion rather than merely printed — and reversible by flipping one field.
 
 Evidence: `research/` measurements recorded in D10; loader figures in the Task 5 report.
+
+---
+
+## D15 — The commit ceiling is two bounds, and it covers anonymous commit only
+**Decided from measurement, after the whole-branch review found a tampered `p_memsz` producing
++3406.664 MiB of eager commit from an 8-byte edit, with the load reporting success.**
+
+Why one number could not work: the attack committed 3.3 GiB, while D10's validated scenario and the
+project goal both require an instance to reach **several GB during startup**. Any single ceiling
+loose enough to permit the latter also permits the former. The two cases differ in **shape**, not
+size — one absurd request versus many ordinary ones — so the bound must too.
+
+| Bound | Default | Role |
+|---|---|---|
+| `max_commit_request` | **128 MiB** | The tight one. This is what refuses the attack. |
+| `max_committed` | **3.5 GiB** | The loose one. Stops an instance spending its whole address space; deliberately weak. |
+
+**The tight bound is bracketed by measurement, not chosen.** The largest single private anonymous
+request any real library makes is `libroblox.so`'s `.bss` at **11,575,296 bytes**; the next largest
+across all eleven `.so` is **61,440 bytes**, 188x smaller. Nothing in the workspace can issue a single
+request between 64 MiB and 1 GiB. So 128 MiB sits 11.6x above the largest real segment and 27x below
+the demonstrated 3.3 GiB tamper, with nothing measured in between.
+
+One honest qualification, from the re-review: the 64 MiB lower endpoint is a test's chunk size rather
+than a requirement, so that endpoint is **soft** — but it is soft in the conservative direction, since
+the hard floor is 11.04 MiB. It means 128 MiB could be lower, never that it is too low.
+
+**The loose bound is floored by the requirement it must not break**: D10's 3 GB of live use plus its
+measured `size/512` page-table charge, about 3078 MiB. It is capped below `DEFAULT_SPACE_SIZE`,
+because a 4 GiB ceiling inside a 4 GiB space would bound nothing.
+
+**Both halves are tested, and the second half is the one usually forgotten.** The tampered `p_memsz`
+is asserted to be refused by `CommitRequestTooLarge` **specifically**, with the exact requested size,
+so it cannot pass for the wrong reason via the total ceiling. And a legitimate 3 GB growth is asserted
+to still succeed at the defaults — measured at +3078.020 MiB, i.e. size plus exactly `size/512`,
+pinning D10's model rather than loosening a tolerance. Mutation rows in both directions exist:
+tightening the per-request bound to 32 MiB and lowering the total to 2 GiB both fail the growth test.
+
+**What these ceilings do not cover.** Copy-on-write charge raised by `protect`, and page-table charge,
+sit outside **both**. Neither is an amplification vector today, because copy-on-write charge is
+bounded by the size of the file being mapped — but a tampered binary can still provoke roughly
+127 MiB per segment, up to the loader's own 256 MiB cap. That is bounded rather than unbounded, and it
+is recorded here rather than left for someone to rediscover.
+
+Cost if wrong: a per-request bound set too tight refuses a legitimate segment, which fails loudly and
+immediately with both the requested and permitted sizes named — the opposite of the silent failure it
+replaced.

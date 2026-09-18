@@ -26,7 +26,12 @@
 //! # Portability
 //!
 //! Pure file and compute work: no `cfg(target_os)`, no OS crate, no `unsafe` anywhere (Global
-//! Constraints 4 and 5). It does not even depend on `omni-platform`.
+//! Constraints 4 and 5).
+//!
+//! It does depend on `omni-platform`, for one thing only: the host page size. A hardcoded 4096 is
+//! not a missing answer but a wrong one — macOS on Apple Silicon uses 16 KiB pages, and the
+//! extraction cache exists so its payloads can be mapped. Global Constraint 4 forbids external OS
+//! crates and `cfg(target_os)`, neither of which this introduces.
 //!
 //! # Example
 //!

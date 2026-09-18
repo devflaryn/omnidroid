@@ -195,12 +195,20 @@ pub struct GuestSpaceConfig {
     /// The lazy-commit granule. See [`DEFAULT_COMMIT_GRANULE`] for the measurements behind the
     /// default. Must be a non-zero multiple of the page size.
     pub commit_granule: usize,
-    /// Ceiling on the total commit charge this space may hold at once, in bytes. Non-zero.
+    /// Ceiling on the total *anonymous* commit charge this space may hold at once, in bytes.
+    /// Non-zero.
     ///
-    /// **This is the bound on the scarce resource**, and unlike [`size`](Self::size) it is very much
-    /// the number to economize on. See [`DEFAULT_MAX_COMMITTED`] for why it exists, what it is
-    /// measured against, and why the default is what it is. Reaching it is
-    /// [`MemError::CommitCeiling`].
+    /// Unlike [`size`](Self::size), which costs nothing, this bounds a scarce resource. See
+    /// [`DEFAULT_MAX_COMMITTED`] for why it exists, what it is measured against, and why the default
+    /// is what it is. Reaching it is [`MemError::CommitCeiling`].
+    ///
+    /// **What it does not cover.** Copy-on-write charge raised by [`GuestSpace::protect`] and
+    /// page-table charge both sit outside this ceiling *and* outside
+    /// [`max_commit_request`](Self::max_commit_request). Neither is an amplification vector today,
+    /// because copy-on-write charge is bounded by the size of the file being mapped, but a tampered
+    /// binary can still provoke roughly 127 MiB per segment up to the loader's own 256 MiB cap. That
+    /// is bounded, not unbounded — and it is the tight per-request bound, not this one, that refuses
+    /// the unbounded case.
     pub max_committed: usize,
     /// Ceiling on a single commit request, in bytes. Non-zero.
     ///
