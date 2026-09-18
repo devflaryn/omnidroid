@@ -83,6 +83,18 @@ fn the_function_map_is_exact_sorted_and_complete() {
     let empty: Vec<_> = funcs.iter().filter(|f| f.len == 0).map(|f| f.start).collect();
     assert_eq!(empty, vec![0x364_f404]);
 
+    // The map describes less code than the object holds, which is the derived bound
+    // `leaf::find_leaves` enforces. Stated with both numbers so the margin is visible rather than
+    // implied: a bound with no headroom would be a bound that rejects the next build of the engine.
+    let described: u64 = funcs.iter().map(|f| f.len).sum();
+    let executable: u64 = elf
+        .load_segments()
+        .filter(|s| s.p_flags.contains(omni_elf::SegmentFlags::EXEC))
+        .map(|s| s.p_memsz)
+        .sum();
+    assert_eq!((described, executable), (69_943_828, 103_645_584));
+    assert!(described < executable);
+
     // Every non-empty function is a whole number of instructions and lies inside the file image.
     assert!(funcs.iter().all(|f| f.len % 4 == 0));
     assert!(funcs

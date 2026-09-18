@@ -194,6 +194,28 @@ fn augmentation<'a>(view: &View<'a>, offset: usize) -> Result<(&'a [u8], usize)>
     })
 }
 
+/// Refuse a `fde_count` the segment cannot hold.
+///
+/// The declared count is attacker-controlled (D6) and the bytes present are not. A table entry is
+/// two encoded values of the same width, so this is an exact bound rather than a heuristic: a
+/// header claiming 2^32 functions in a 4 KiB segment is refused here rather than turned into
+/// 2^32 bounds-check failures, or worse into a 64 GiB allocation.
+fn require_table_fits(
+    fde_count: u64,
+    entry_bytes: u64,
+    available: u64,
+    table_offset: u64,
+) -> Result<()> {
+    if entry_bytes == 0 || fde_count > available / entry_bytes {
+        return Err(ElfError::MalformedEhFrame {
+            what: ".eh_frame_hdr binary-search table",
+            offset: table_offset,
+            reason: "fde_count declares more entries than the segment has bytes for",
+        });
+    }
+    Ok(())
+}
+
 impl EhFrameHdr {
     /// Parse the `PT_GNU_EH_FRAME` segment's header.
     ///
@@ -249,18 +271,9 @@ impl EhFrameHdr {
         let table_offset = 4 + ptr_len + count_len;
         let table_vaddr = hdr_vaddr.wrapping_add(table_offset as u64);
 
-        // The declared count is attacker-controlled; the bytes present are not. A table entry is
-        // two encoded values of the same width, so the bound is exact rather than approximate.
         let entry_bytes = 2 * format_of(table_encoding, ".eh_frame_hdr table")?.bytes as u64;
         let available = (bytes.len() as u64).saturating_sub(table_offset as u64);
-        let fits = available / entry_bytes;
-        if fde_count > fits {
-            return Err(ElfError::MalformedEhFrame {
-                what: ".eh_frame_hdr binary-search table",
-                offset: table_offset as u64,
-                reason: "fde_count declares more entries than the segment has bytes for",
-            });
-        }
+        require_table_fits(fde_count, entry_bytes, available, table_offset as u64)?;
 
         Ok(Some(Self { hdr_vaddr, eh_frame_vaddr, fde_count, table_vaddr, table_encoding }))
     }
@@ -292,6 +305,22 @@ impl EhFrameHdr {
         // start to the end of the segment that contains it.
         let frame = FrameReader::new(elf, self.eh_frame_vaddr)?;
 
+        self.functions_from(&table, &frame)
+    }
+
+    /// The table walk itself, over a table and an `.eh_frame` the caller supplies.
+    ///
+    /// Split out from [`functions`](Self::functions) so that the cross-check below can be
+    /// *provoked*: it compares two independent encodings of the same fact, and a check that has
+    /// never been seen to fire is not a check (Global Constraint 13).
+    fn functions_from(
+        &self,
+        table: &View<'_>,
+        frame: &FrameReader<'_>,
+    ) -> Result<Vec<FunctionBounds>> {
+        let table_format = format_of(self.table_encoding, ".eh_frame_hdr table")?;
+        let entry_bytes = 2 * table_format.bytes;
+
         let mut out = Vec::new();
         out.try_reserve(usize::try_from(self.fde_count).unwrap_or(0)).map_err(|_| {
             ElfError::MalformedEhFrame {
@@ -304,7 +333,7 @@ impl EhFrameHdr {
         for i in 0..self.fde_count {
             let at = (i as usize) * entry_bytes;
             let (initial_location, _) = read_encoded(
-                &table,
+                table,
                 self.table_vaddr,
                 at,
                 self.table_encoding,
@@ -312,7 +341,7 @@ impl EhFrameHdr {
                 ".eh_frame_hdr table initial_location",
             )?;
             let (fde_vaddr, _) = read_encoded(
-                &table,
+                table,
                 self.table_vaddr,
                 at + table_format.bytes,
                 self.table_encoding,
@@ -818,6 +847,69 @@ mod tests {
     /// Where the CIE's `DW_CFA_nop` padding begins: three bytes before the FDE.
     fn padding_start(bytes: &[u8]) -> usize {
         fde_offset(bytes) - 3
+    }
+
+    /// A `fde_count` larger than the segment can hold is refused rather than turned into that many
+    /// bounds-check failures — or into a `Vec` reservation sized by an attacker.
+    #[test]
+    fn a_declared_entry_count_larger_than_the_segment_is_refused() {
+        // 245,117 entries of 8 bytes each: exactly the real header, which must be accepted.
+        require_table_fits(245_117, 8, 245_117 * 8, 12).expect("the real header");
+        // One byte short of holding them.
+        assert!(require_table_fits(245_117, 8, 245_117 * 8 - 1, 12).is_err());
+        // The shapes a forged header takes.
+        assert!(require_table_fits(u64::MAX, 8, 4096, 12).is_err());
+        assert!(require_table_fits(1, 8, 0, 12).is_err());
+        // A zero entry width would make the division a panic rather than a refusal.
+        assert!(require_table_fits(1, 0, 4096, 12).is_err());
+        // Zero entries in an empty table is vacuously fine.
+        require_table_fits(0, 8, 0, 12).expect("an empty table");
+    }
+
+    /// **The cross-check, fired.** The table's `initial_location` and the FDE's `pc_begin` are two
+    /// independent encodings of the same address. They agree in every real object, so the only way
+    /// to know the check works is to make them disagree.
+    #[test]
+    fn a_table_entry_that_disagrees_with_its_own_fde_is_refused() {
+        const BASE: u64 = 0x4000;
+        let (frame_bytes, expected) = one_cie_and_one_fde(BASE);
+        let fde_vaddr = BASE + fde_offset(&frame_bytes) as u64;
+        let frame = reader(&frame_bytes, BASE);
+
+        // A one-entry `datarel | sdata4` table at 0x8000, with the header at 0x8000 too, so the
+        // datarel base is the table's own address and the entries are plain offsets from it.
+        const TABLE_VADDR: u64 = 0x8000;
+        let hdr = EhFrameHdr {
+            hdr_vaddr: TABLE_VADDR,
+            eh_frame_vaddr: BASE,
+            fde_count: 1,
+            table_vaddr: TABLE_VADDR,
+            table_encoding: 0x3B,
+        };
+        let entry = |location: u64| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&((location.wrapping_sub(TABLE_VADDR)) as i32).to_le_bytes());
+            b.extend_from_slice(&((fde_vaddr.wrapping_sub(TABLE_VADDR)) as i32).to_le_bytes());
+            b
+        };
+
+        // Agreeing: one function, read back exactly.
+        let good = entry(expected.start);
+        assert_eq!(
+            hdr.functions_from(&View::new(&good), &frame).expect("agreeing entries"),
+            vec![expected]
+        );
+
+        // Disagreeing by a single instruction, which is the realistic corruption: a header and an
+        // `.eh_frame` that do not describe the same binary.
+        let bad = entry(expected.start + 4);
+        let error = hdr
+            .functions_from(&View::new(&bad), &frame)
+            .expect_err("a table entry that disagrees with its FDE must be refused");
+        assert!(
+            error.to_string().contains("disagrees with the FDE"),
+            "and it must say which two things disagree: {error}"
+        );
     }
 
     #[test]

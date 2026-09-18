@@ -43,7 +43,7 @@
 use std::collections::BTreeSet;
 
 use crate::eh_frame::FunctionBounds;
-use crate::error::Result;
+use crate::error::{ElfError, Result};
 use crate::segment::SegmentFlags;
 use crate::ElfImage;
 
@@ -434,20 +434,56 @@ fn imm14(w: u32) -> i64 {
     ((raw as i32) << 18 >> 18) as i64
 }
 
+/// Refuse a function map that describes more code than the object contains.
+///
+/// **A derived bound, not a fitted one.** An object's functions do not overlap, so the sum of their
+/// lengths cannot exceed the bytes of executable segment they live in. That makes this a property
+/// of any honest map rather than a number somebody chose.
+///
+/// It is here because a forged or corrupted `.eh_frame` is not merely wrong, it is *expensive*:
+/// 245,117 entries whose lengths decode to a few kilobytes each is several gigabytes of decoding
+/// that produces nothing. Found the hard way — a mutation-testing row that changed one encoding
+/// mask turned a quarter-second scan into a multi-minute one, which is a denial of service on the
+/// analysis tool from exactly the kind of input D6 says to expect.
+///
+/// `libroblox.so`'s real margin: 69,943,828 bytes of function body against 103,645,584 bytes of
+/// executable segment, so a genuine object sits comfortably inside.
+fn require_map_fits(decoded: u64, executable_bytes: u64) -> Result<()> {
+    if decoded > executable_bytes {
+        return Err(ElfError::MalformedEhFrame {
+            what: ".eh_frame function map",
+            offset: decoded,
+            reason: "the function bounds sum to more code than the object's executable segments \
+                     hold, so they do not describe this object",
+        });
+    }
+    Ok(())
+}
+
 /// Decode every function `.eh_frame_hdr` names and keep the ones that are leaves.
 ///
 /// Returns them in address order, with the facts that justify the grade.
 ///
 /// # Errors
 ///
-/// Whatever [`ElfImage::eh_frame_functions`] and [`TextRelocations::collect`] fail with.
+/// Whatever [`ElfImage::eh_frame_functions`] and [`TextRelocations::collect`] fail with, plus
+/// [`ElfError::MalformedEhFrame`] for a map that describes more code than the object holds: an
+/// object's functions do not overlap, so their lengths cannot sum past its executable segments.
 pub fn find_leaves(elf: &ElfImage<'_>) -> Result<Vec<LeafFunction>> {
     let Some(bounds) = elf.eh_frame_functions()? else {
         return Ok(Vec::new());
     };
+    let executable_bytes: u64 = elf
+        .load_segments()
+        .filter(|s| s.p_flags.contains(SegmentFlags::EXEC))
+        .map(|s| s.p_memsz)
+        .sum();
     let relocations = TextRelocations::collect(elf)?;
     let mut out = Vec::new();
+    let mut decoded = 0u64;
     for b in bounds {
+        decoded = decoded.saturating_add(b.len);
+        require_map_fits(decoded, executable_bytes)?;
         let Ok(code) = elf.slice_at_vaddr("function body", b.start, b.len) else {
             // A function whose bytes are not in the file image — `.eh_frame` can describe one, and
             // it is not a candidate.
@@ -706,6 +742,22 @@ mod tests {
         // wrap into a range that contains everything.
         let facts = body_facts(&[0u8; 8], u64::MAX - 8, None);
         assert_eq!(facts.undecodable, 2, "0x0000_0000 is the reserved encoding, twice");
+    }
+
+    /// The derived bound on the whole map, and the margin a real object has under it.
+    #[test]
+    fn a_function_map_describing_more_code_than_the_object_holds_is_refused() {
+        // `libroblox.so`'s real figures: the map must fit, with room to spare.
+        require_map_fits(69_943_828, 103_645_584).expect("a real object");
+        // Exactly full is fine; one byte more is not.
+        require_map_fits(103_645_584, 103_645_584).expect("exactly full");
+        let error = require_map_fits(103_645_585, 103_645_584).expect_err("one byte over");
+        assert!(error.to_string().contains("do not describe this object"), "{error}");
+        // The shape a corrupted encoding produces: lengths that are really addresses.
+        assert!(require_map_fits(u64::MAX, 103_645_584).is_err());
+        // An object with no executable segment has no room for any function at all.
+        assert!(require_map_fits(1, 0).is_err());
+        require_map_fits(0, 0).expect("an empty map in an empty object");
     }
 
     #[test]

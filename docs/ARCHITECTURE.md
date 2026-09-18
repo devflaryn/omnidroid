@@ -215,6 +215,12 @@ figure measured a bare stub and is a floor). Omnidroid therefore asserts this co
 rather than trusting the default, which is 36 bits and **silently degrades high addresses to the slow
 path while still producing correct results** — a loss no functional test can detect.
 
+That assertion defends the *configuration*, once. It structurally cannot see a memory path that
+degrades at **runtime**, after it has passed, which Task 3 found two ways to do. So the runtime also
+checks the behaviour: **per run slice, the callback-path counter's delta must be zero unless that
+slice ended in a memory-fault exit** (D4 amendment 2). It costs one load per slice — 0.430 ns,
+median of n = 31 runs of 10,000,000 reads — against a slice of a million guest instructions.
+
 Measured throughput is uneven and shapes what comes next: about **2.0x native** on memory-heavy
 code and **2.2x** on NEON/FP, but about **33x** on register-bound integer code, caused by per-block
 register allocation spilling every guest register to `JitState` each iteration plus `lahf`/`sahf`
@@ -223,9 +229,12 @@ x64 backend eventually while keeping the A64 frontend.
 
 Three consequences the rest of the design must absorb:
 
-- **Cold translation is slow** (0.15-0.31 Mguest-insn/s, implying 7-25 s to warm a Roblox-sized
-  working set), so translation is parallelized across cores and backed by a persistent on-disk code
-  cache keyed by library content hash.
+- **Cold translation is slow** (0.15-0.31 Mguest-insn/s on synthetic loops, implying 7-25 s to warm
+  a Roblox-sized working set), so translation is parallelized across cores and backed by a
+  persistent on-disk code cache keyed by library content hash. Measured on **870 real
+  `libroblox.so` leaf functions** it is **0.486 Mguest-insn/s** — better than the synthetic figure,
+  because short functions give the IR optimizer less to work over than a tight loop does, so the
+  synthetic number remains the right one for loop-shaped code (D5 amendment 2).
 - **Code caches are per-thread and not shared**, committing 20-35 MiB per guest thread regardless of
   code volume. This is in direct tension with D10 and is tracked as a primary risk.
 - **`ExclusiveMonitor` uses one global spinlock** and anti-scales 21x from 1 to 16 threads. Since

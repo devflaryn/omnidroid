@@ -38,8 +38,12 @@ Last updated: 2026-09-18
 | CPU: silent degradation | Under the default 36-bit width a memory-heavy loop takes **20,000 of 20,000** callback-path entries and **still returns the right answer**; with identity mapping it takes **0**. Asserted at startup |
 | CPU: per-thread cost | 24.43 MiB/thread at an 8 MiB code cache, 34.65 at 32 MiB and at 128 MiB — 16 MiB of it a fixed array written by the constructor even when its feature is disabled. Shrinking the cache does not help |
 | Roblox branch shape | 2.27% indirect, one indirect transfer every 44 words; mean **4.30** instructions per basic block. Both **static** mixes, used as proxies for per-executed-transfer cost models |
-| CPU: cold translation | 0.15 to 0.31 Mguest-insn/s, implying 7 to 25 s to warm a Roblox-sized working set |
-| CPU: per-thread cost | 20 to 35 MiB committed per guest thread, code caches not shared between threads |
+| CPU: cold translation | 0.15 to 0.31 Mguest-insn/s on synthetic loops, implying 7 to 25 s to warm a Roblox-sized working set. On **870 real `libroblox.so` leaf functions**: **0.486 Mguest-insn/s** (n = 1 pass, 8,679 guest instructions) — 1.6 to 3.2x *better*, because short functions give the IR optimizer less to work over than a tight loop does |
+| CPU: per-thread cost | 20 to 35 MiB committed per guest thread, code caches not shared between threads. Measured at **24.5 MiB** for this backend's 8 MiB cache (n = 8 threads, serialized) and **asserted against a 32 MiB ceiling** |
+| CPU: call overhead | **64.4 ns** per entry to and exit from the guest, measured over 870 real leaf functions averaging 9.98 instructions each (n = 31 passes, median) |
+| CPU: runtime degradation | The startup assertion cannot see a memory path that degrades *after* it passes. Per run slice the callback-path counter's delta must be zero unless the slice ended in a memory fault; measured at **0.430 ns per counter read** (median of n = 31 runs of 10,000,000) and **0.9906x** end to end on a 5,000,000-instruction workload (n = 31) |
+| Roblox function map | `.eh_frame_hdr` names **245,117** functions with exact bounds, cross-checked against their FDEs. **0 of 568,806 relocations** land in an executable segment, so the bytes in the file at a function's address are the bytes that execute |
+| Roblox leaf functions | 819 pure-register, 6 stack-only, 45 stack-guard-protected — 870 of 245,117 are self-contained enough to run before the imported-symbol layer exists |
 
 ## Verified about the test APK
 
@@ -85,7 +89,9 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
 | `omni-elf` — loader: map, relocate, resolve, seal | **Pending final review.** Milestone **M1** |
 | `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
-| `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
+| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Pending final review.** Milestone **M2** |
+| `omni-elf` — `.eh_frame_hdr` function map + leaf classifier | **Pending final review.** The selection tool M2 chose its code with |
+| `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
 **Measured, not assumed**
 
@@ -107,6 +113,7 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | Relocation window | 64 KiB, equal to the commit granule. Transient copy-on-write charge 5.285 MiB, all of it the RELRO region becoming private anyway. 4 KiB costs 9 ms more for no saving; past 64 KiB the curve is flat |
 | Loader hostile input | 21 tamper cases each refused with a typed error and zero residue, plus 920 single-byte corruptions of a synthetic library: 447 loaded, 473 refused, 0 panics, 0 leaks, 1.8 s |
 | Loader mutation testing | 18 mutations of the loader logic, 15 reverting it and 3 over-correcting it; every one caught by at least one test |
+| Workspace mutation testing | See `tools/mutate.py`. Every row is caught by at least one named test, in both directions |
 | APS2 decode | 568,272 relocations from 46,184 groups in ~2 ms, consuming 2,100,778 of 2,100,778 bytes |
 
 **Known accounting gap (confirmed):** a pagefile-backed section does not appear in `PrivateUsage`, so
@@ -128,7 +135,7 @@ than over-unmapping, and emulation (unmap the view, re-map the survivors) is owe
 |---|---|
 | M0 APK parsed, libraries extracted to aligned cache | **Reached.** All 11 ARM64 libraries extracted into the content-addressed 4 KB-aligned cache and then mapped from it, end to end |
 | M1 ELF loaded, all 568,806 relocations applied, symbols resolved | **Reached.** 568,806 relocations applied and read back from mapped memory, RELRO sealed over 5,205,568 bytes, 565 imports enumerated and attributed, 3,594 initializers collected. ~16.7 MiB commit per instance (≈11 `.bss` + ≈5 RELRO + ≈0.3 `.data` + page tables), against ~104 MiB mapped file-backed and shared |
-| M2 ARM64 function from `libroblox.so` executes | Not started |
+| M2 ARM64 function from `libroblox.so` executes | **Reached.** Three real functions run out of the loaded, relocated, RELRO-sealed image with `init_array` deliberately not run. `+0x2c11e34` maps a base64 character to its sextet: **256 predicted values**, one per byte value, predicted from RFC 4648's alphabet rather than from the run, all 256 correct. `+0x2227844` converts a saturating `(seconds, microseconds)` difference to milliseconds across 18 vectors including both saturation bounds exactly. `+0x2872aac` is a stack-protected leaf and is D13's proof in three directions: it returns with the guard matching, it calls `__stack_chk_fail` when the guard is changed between the two reads, and it faults at exactly `TPIDR_EL0 + 0x28` when the thread pointer is unmapped |
 | M3 All 3,594 initializers complete | Not started |
 | M4 `JNI_OnLoad` succeeds | Not started |
 | M5 `initializeNativeCode` runs, surface requested | Not started |

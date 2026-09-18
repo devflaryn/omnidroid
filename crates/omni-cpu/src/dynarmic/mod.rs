@@ -991,6 +991,25 @@ impl GuestCpu for DynarmicCpu {
             self.last_run_instructions = budget.executed();
             self.take_panic()?;
 
+            if halt_reason & OD_HALT_SHIM_REENTERED != 0 {
+                return Err(CpuError::Backend {
+                    backend: BACKEND_NAME,
+                    operation: "run guest code",
+                    detail: "od_jit_run was called while this jit was already executing".into(),
+                });
+            }
+            if halt_reason & OD_HALT_SHIM_THREW != 0 {
+                return Err(CpuError::Backend {
+                    backend: BACKEND_NAME,
+                    operation: "run guest code",
+                    detail: "a C++ exception escaped Jit::Run and was caught at the shim; the jit \
+                             is in an uncharacterised state and must not be reused"
+                        .into(),
+                });
+            }
+            // The per-slice callback invariant, checked **after** the two shim failures above:
+            // a re-entered jit and an escaped C++ exception both mean the jit is in an
+            // uncharacterised state, which subsumes anything this could say about it.
             if let Some(before) = callbacks_before {
                 let delta = self.slow_path_entries().saturating_sub(before);
                 if delta != 0 {
@@ -1019,22 +1038,6 @@ impl GuestCpu for DynarmicCpu {
                 }
             }
 
-            if halt_reason & OD_HALT_SHIM_REENTERED != 0 {
-                return Err(CpuError::Backend {
-                    backend: BACKEND_NAME,
-                    operation: "run guest code",
-                    detail: "od_jit_run was called while this jit was already executing".into(),
-                });
-            }
-            if halt_reason & OD_HALT_SHIM_THREW != 0 {
-                return Err(CpuError::Backend {
-                    backend: BACKEND_NAME,
-                    operation: "run guest code",
-                    detail: "a C++ exception escaped Jit::Run and was caught at the shim; the jit \
-                             is in an uncharacterised state and must not be reused"
-                        .into(),
-                });
-            }
             if halt_reason & HALT_OURS != 0 {
                 // SAFETY: the jit is live and not executing.
                 unsafe { od_jit_clear_halt(self.jit, HALT_OURS) };

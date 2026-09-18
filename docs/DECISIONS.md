@@ -906,3 +906,160 @@ fast path before contention is even considered. The mitigation works and should 
 The interaction D5 already flagged still stands: declining to advertise LSE atomics via
 `getauxval(AT_HWCAP)` steers the engine onto `LDXR`/`STXR` — straight into this path — so the two must
 be decided together, not separately.
+
+---
+
+## D4 (amendment 2) — the startup assertion defends the configuration; a second check defends the behaviour
+
+**Added at M2, from a defect class Task 3 found and could not close.**
+
+D4's startup assertion reads back dynarmic's live `UserConfig` once per context, before any guest
+code runs, and refuses anything that is not identity mapping. That is the right check and it is
+worth what D4 says it is worth. But it is a check on a **configuration**, and Task 3 found two ways
+the memory path degrades *after* it has passed:
+
+1. two guest threads faulting on pages of one 64 KiB commit granule made the second decline, which
+   handed the fault to dynarmic's frame-based handler, which recompiled the block with fastmem off
+   **permanently**;
+2. a panic inside the fault handler declined a resolvable fault while incrementing no counter at
+   all.
+
+Both leave correct results and a runtime 30-49x slower on the affected blocks. The startup
+assertion structurally cannot see either, because nothing about the configuration changed.
+
+**The class-level answer, which is now implemented:**
+
+> Per run slice, the callback-path counter's delta must be zero unless that slice ended in a
+> memory-fault exit.
+
+It cannot be phrased as "the counter stays at zero". A legitimate typed `MemoryFault` *arrives*
+through that same callback and increments the same counter, so that phrasing would fire on the
+normal case and be turned off within a day. The exemption is exactly one exit kind, and it has its
+own test so that it cannot silently become dead code.
+
+**What it costs.** `dynarmic-sys` gained `od_jit_slow_path_total`, which is one load rather than
+`od_jit_stats`'s 72-byte struct copy, and the run loop reads it twice per slice. Measured on the D2
+host, release:
+
+| Quantity | Figure |
+|---|---|
+| one counter read | **0.430 ns** (median of n = 31 runs of 10,000,000 reads) |
+| per slice (two reads) | 0.859 ns |
+| a 5,000,000-instruction workload, armed vs disarmed | **0.9906x** (n = 31 per configuration) |
+
+A slice is 1,000,000 guest instructions by default, so the whole check costs about 4 nanoseconds
+across a five-million-instruction run. The end-to-end ratio is below the noise floor, which is why
+the per-read figure is given as well: a ratio of 1.00x on its own would not distinguish "free" from
+"not measured".
+
+**Where it is disarmed, and why that is reported rather than assumed.** The check is off when the
+backend does not own guest paging, because the callback path is then the *designed* route for a
+first touch rather than a degradation. `DynarmicBackend::slice_invariant_armed()` reports what is
+really in force, so a test cannot claim a check that is switched off.
+
+---
+
+## D10 (correction) — a demand pager that could not be installed was silently accepted
+
+**Found at M2, and it is the same shape as the defect above.**
+
+`DynarmicBackend::new` installed the demand pager with `.ok()`, which flattened two different
+failures into one. `FaultError::Unsupported` means *this platform has no vectored-handler
+implementation* — a documented state the backend still works in. `FaultError::HandlerTableFull`
+means the platform has one and could not give us a slot, and a backend that carries on from there
+sends every guest fault to dynarmic's own frame-based handler, which recompiles the block with
+fastmem off for good: 30-49x, correct results, no error anywhere.
+
+It was not hypothetical. `MAX_HANDLERS` was **8**, and its own documentation said the slack existed
+for tests that build several address spaces in one process — but `omni-cpu`'s suites build one per
+test and `libtest` runs them in parallel, so a binary with ten tests could exhaust the table. The
+symptom was intermittent and depended on how libtest happened to schedule.
+
+Two changes: `MAX_HANDLERS` is **32**, and `DynarmicBackend::new` refuses anything but
+`Unsupported`, with a message naming both the resource that ran out and the 30-49x that carrying on
+would have cost. `crates/omni-cpu/tests/pager_exhaustion.rs` fills the table on purpose — in its own
+process, because otherwise it would starve its neighbours — and pins the refusal.
+
+---
+
+## D5 (amendment 2) — cold translation and per-thread cost, measured on real Roblox code
+
+Every CPU figure in this document before M2 came from synthetic loops of four to eight instructions
+written to isolate one effect. These are from **870 real `libroblox.so` leaf functions**, selected
+by `omni-elf`'s `leaf-scan` out of the 245,117 that `.eh_frame_hdr` names, executed through the
+backend with a bionic TLS block and a guest stack.
+
+| Quantity | Synthetic (D5) | Real Roblox leaves |
+|---|---|---|
+| cold translation | 0.15-0.31 Mguest-insn/s | **0.486 Mguest-insn/s** (n = 1 pass, 870 functions, 8,679 guest instructions) |
+| warm | — | 155.0 Mguest-insn/s (n = 31 passes, median) |
+| per-thread commit | 20-35 MiB | **24.5 MiB** (n = 8 threads, serialized) |
+
+**Cold translation is 1.6-3.2x *better* than the synthetic figure, not worse.** The reason is
+visible in the shape: the synthetic benchmark measured translating a tight loop, where nearly every
+translated instruction is a loop body that dynarmic's IR optimizer works over repeatedly; the real
+leaves are short straight-line-plus-branch functions, 9.98 executed instructions on average, where
+the optimizer has much less to chew on. So D5's 0.15-0.31 remains the right figure for *loop-shaped*
+code and the 7-25 s warm-up estimate that follows from it is not improved; what is new is that the
+long tail of small functions costs less than the estimate assumed.
+
+**The warm figure is not a steady-state throughput and must not be read as one.** A warm pass is 870
+entries to and exits from `od_jit_run` around 8,679 instructions of work, so it measures **64.4 ns
+per call** — the run loop plus the dispatcher round trip — and not translated code. The steady-state
+comparison point remains D5's table.
+
+**Where the per-thread cost comes from.** It tracks `code_cache_size` plus a fixed term and not
+translated volume: 24.5 MiB at this backend's 8 MiB cache, of which 16 MiB is
+`A64EmitX64`'s `std::array<FastDispatchEntry, 0x100000>`, constructed and zeroed by the constructor
+whether or not the FastDispatch optimization is enabled — and this backend disables it (D16). The
+figure is now **asserted against a 32 MiB ceiling** rather than merely printed.
+
+---
+
+## D13 (confirmed) — verified on real engine code, in both directions
+
+D13 was inferred from a static count: 1,282 `MRS Xt, TPIDR_EL0` instructions, 1,276 of them loading
+`[Xt, #0x28]`. M2 ran one of them.
+
+`libroblox.so + 0x2872aac` is one of **45** stack-guard-protected leaves the scan found. With a
+bionic TLS block programmed it reads the guard, stores the canary on its frame, reads the guard
+again, compares, and returns `0x20000`. Three directions are asserted, because the positive one
+alone would pass on a runtime that never executed the comparison:
+
+* with the guard matching, it returns — and the `BL __stack_chk_fail` in its failure tail is
+  registered as a **thunk**, so a taken call would be a typed exit rather than something invisible;
+* with the guard changed in guest memory **between the two reads** — through a breakpoint on the
+  reload — real engine code calls `__stack_chk_fail`, which is what proves the value it compared
+  came from `[TPIDR_EL0, #0x28]`;
+* with `TPIDR_EL0` pointed at an unmapped address, the fault is at **exactly** thread pointer plus
+  `0x28`, which pins the offset itself.
+
+One correction to the phrasing D13 uses: the guard is read through a register the function keeps,
+not re-read from `TPIDR_EL0`, so a guest that re-points its thread pointer mid-function still
+compares the old block's guard. That is bionic's own behaviour and not a runtime concern; it is
+recorded because the obvious test — change `TPIDR_EL0` between the reads — does not work, and the
+next person will try it.
+
+---
+
+## D9 (correction) — `.eh_frame_hdr` is an exact function map, and nothing relocates into the text
+
+Two facts M2 needed and measured, recorded here because both were assumptions before.
+
+**The function map is exact and complete enough to select from.** `PT_GNU_EH_FRAME`'s binary-search
+table names **245,117** functions with their exact lengths, read back and cross-checked against the
+FDEs they point at. Exactly **one** describes an empty range, at `0x364f404`; it is kept rather than
+refused, because rejecting a 245,117-entry map over one entry would be the wrong trade and dropping
+it silently would make the count disagree with `fde_count`.
+
+**Not one of the 568,806 relocations lands in an executable segment.** D9 already recorded that
+there is no `DT_TEXTREL`; this is the stronger statement, measured rather than inferred, and it is
+what makes "no relocation-bearing loads" checkable rather than a hope — the bytes in the file at a
+function's address really are the bytes that execute.
+
+**And a bound on the map that is derived rather than chosen.** Functions do not overlap, so the sum
+of their lengths cannot exceed the executable segments they live in: **69,943,828 against
+103,645,584**, 48% of headroom for a real object. The scan refuses a map that breaks it. The reason
+is cost rather than correctness — a corrupted `.eh_frame` whose lengths decode to a few kilobytes
+each turns a quarter-second scan of 245,117 entries into gigabytes of decoding that produces
+nothing, which is a denial of service on an analysis tool from exactly the input D6 says to expect.

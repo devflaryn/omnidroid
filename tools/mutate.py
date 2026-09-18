@@ -49,6 +49,8 @@ CPU_RUN = "crates/omni-cpu/src/run.rs"
 CPU_TLS = "crates/omni-cpu/src/tls.rs"
 CPU_DYN = "crates/omni-cpu/src/dynarmic/mod.rs"
 PAGER = "crates/omni-mem/src/pager.rs"
+EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
+LEAF = "crates/omni-elf/src/leaf.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
@@ -61,6 +63,13 @@ PLATFORM = ["cargo", "test", "-p", "omni-platform", "--no-fail-fast"]
 MEM_AND_CPU = ["cargo", "test", "-p", "omni-mem", "-p", "omni-cpu", "--no-fail-fast"]
 ELF = ["cargo", "test", "-p", "omni-elf", "--no-fail-fast"]
 APK = ["cargo", "test", "-p", "omni-apk", "--no-fail-fast"]
+# The leaf scan decodes 245,117 function bodies, which is minutes in a debug build and a quarter of
+# a second in release. Its own command rather than widening `ELF`, so the rest of the ELF rows keep
+# running against the build everything else uses.
+ELF_SCAN = [
+    "cargo", "test", "-p", "omni-elf", "--release", "--lib", "--test", "eh_frame_golden",
+    "--no-fail-fast",
+]
 # The commit-charge figures are only meaningful in a release build.
 ELF_RELEASE = [
     "cargo", "test", "-p", "omni-elf", "--release", "--test", "loader_commit", "--no-fail-fast",
@@ -405,6 +414,152 @@ MUTATIONS = [
      """    match inner.space.ensure_committed(fault.address, 1) {""",
      """    match inner.space.ensure_committed(region.start, region.len) {""",
      MEM_AND_CPU),
+    # ---- .eh_frame: the function map M2's whole choice of code rests on -------------------------
+    ("elf-A20", "A", "the table's datarel base dropped, so every function start is wrong",
+     EH_FRAME,
+     """        Apply::DataRelative => hdr_vaddr,""",
+     """        Apply::DataRelative => 0,""",
+     ELF_SCAN),
+
+    ("elf-A21", "A", "pc_range read with the pointer's base applied, so lengths become addresses",
+     EH_FRAME,
+     """            fde_encoding & 0x0F,
+            0,
+            "FDE pc_range",""",
+     """            fde_encoding,
+            0,
+            "FDE pc_range",""",
+     ELF_SCAN),
+
+    ("elf-A22", "A", "the table's initial_location is no longer checked against the FDE's pc_begin",
+     EH_FRAME,
+     """            if bounds.start != initial_location {""",
+     """            if false && bounds.start != initial_location {""",
+     ELF_SCAN),
+
+    ("elf-A23", "A", "fde_count trusted rather than bounded by the bytes present", EH_FRAME,
+     """    if entry_bytes == 0 || fde_count > available / entry_bytes {""",
+     """    if false {""",
+     ELF_SCAN),
+
+    ("elf-A24", "A", "an unimplemented DWARF pointer encoding is read as udata4 instead of refused",
+     EH_FRAME,
+     """        _ => {
+            return Err(ElfError::UnsupportedEhFrameEncoding { what, encoding });
+        }""",
+     """        _ => Format { bytes: 4, signed: false },""",
+     ELF_SCAN),
+
+    ("elf-A25", "A", "a LEB128 with no terminator is walked without a bound", EH_FRAME,
+     """        if used >= 10 {""",
+     """        if false {""",
+     ELF_SCAN),
+
+    # Direction B: over-corrections that read as more careful and destroy the map.
+    ("elf-B10", "B", "a zero-length FDE refused again, so one entry rejects all 245,117", EH_FRAME,
+     """        if start.checked_add(len).is_none() {""",
+     """        if len == 0 || start.checked_add(len).is_none() {""",
+     ELF_SCAN),
+
+    # ---- the leaf classifier ---------------------------------------------------------------------
+    ("elf-A26", "A", "a BL is no longer recorded, so a function that calls out grades as a leaf",
+     LEAF,
+     """        if w & 0xFC00_0000 == 0x9400_0000 {
+            facts.direct_calls.insert(branch_target(at, imm26(w)));""",
+     """        if w & 0xFC00_0000 == 0x9400_0000 {
+            let _ = branch_target(at, imm26(w));""",
+     ELF_SCAN),
+
+    ("elf-A27", "A", "a call before the last RET is counted as if it were in the failure tail",
+     LEAF,
+     """            if last_return.is_none_or(|last| i < last) {
+                facts.calls_before_last_return += 1;
+            }""",
+     """            if false {
+                facts.calls_before_last_return += 1;
+            }""",
+     ELF_SCAN),
+
+    ("elf-A28", "A", "a memory base that is neither SP nor a thread pointer is not recorded", LEAF,
+     """                if rn != 31 && !thread_pointer_regs[rn as usize] {
+                    facts.foreign_memory_bases.insert(rn);
+                }""",
+     """                if false {
+                    facts.foreign_memory_bases.insert(rn);
+                }""",
+     ELF_SCAN),
+
+    ("elf-A29", "A", "a thread-pointer register stays one after being redefined", LEAF,
+     """            0b1000 | 0b1001 | 0b0101 | 0b1101 => {
+                thread_pointer_regs[(w & 0x1F) as usize] = false;
+            }""",
+     """            0b1000 | 0b1001 | 0b0101 | 0b1101 => {}""",
+     ELF_SCAN),
+
+    ("elf-A30", "A", "an undecodable word no longer disqualifies a body", LEAF,
+     """        if !self.fully_decoded()""",
+     """        if false""",
+     ELF_SCAN),
+
+    ("elf-A31", "A", "a function map claiming more code than the object holds is scanned anyway",
+     LEAF,
+     """    if decoded > executable_bytes {""",
+     """    if false {""",
+     ELF_SCAN),
+
+    ("elf-B11", "B", "the hint space refused again, losing every padded candidate", LEAF,
+     """        if w & 0xFFFF_F01F == 0xD503_201F {
+            facts.hints += 1;
+            continue;
+        }""",
+     """        if w & 0xFFFF_F01F == 0xD503_201F {
+            facts.system_instructions += 1;
+            continue;
+        }""",
+     ELF_SCAN),
+
+    ("elf-B12", "B", "a stack-guard tail past the last RET refused, so only unprotected code runs",
+     LEAF,
+     """        if !self.direct_calls.is_empty() {""",
+     """        if true {""",
+     ELF_SCAN),
+
+    # ---- the per-slice callback invariant ---------------------------------------------------------
+    ("cpu-A28", "A", "the per-slice callback delta is no longer checked", CPU_DYN,
+     """                let delta = self.slow_path_entries().saturating_sub(before);
+                if delta != 0 {""",
+     """                let delta = self.slow_path_entries().saturating_sub(before);
+                if false && delta != 0 {""",
+     CPU),
+
+    ("cpu-A29", "A", "the invariant is never armed, so it can only ever pass", CPU_DYN,
+     """        let armed = options.assert_callback_free_slices && shared.owns_guest_paging;""",
+     """        let armed = false;""",
+     CPU),
+
+    ("cpu-A30", "A", "the exemption widened to every exit, so only a budget expiry can violate it",
+     CPU_DYN,
+     """                        Some(PendingExit::Returned { .. }) => Some("the guest returned"),""",
+     """                        Some(PendingExit::Returned { .. }) => None,""",
+     CPU),
+
+    ("cpu-A31", "A", "a failed demand-pager install is swallowed again", CPU_DYN,
+     """            Err(e) if e.is_unsupported() => None,""",
+     """            Err(e) if true || e.is_unsupported() => None,""",
+     CPU),
+
+    ("cpu-B6", "B", "the memory-fault exemption removed, so every real guest fault is a violation",
+     CPU_DYN,
+     """                        Some(PendingExit::Fault { .. }) => None,""",
+     """                        Some(PendingExit::Fault { .. }) => Some("a memory fault"),""",
+     CPU),
+
+    # There is deliberately no row for dropping the `&& owns_guest_paging` term from the arming
+    # condition. Since `DynarmicBackend::new` now *refuses* a platform that has a vectored handler
+    # and could not give us one, `owns_guest_paging` is false only where there is no handler
+    # implementation at all -- Linux and macOS -- so on this host the term cannot be made to differ
+    # and the row would MISS. A row that cannot fail is worse than no row (Task 1), so the gap is
+    # written down here instead.
 ]
 
 

@@ -727,9 +727,9 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
 /// 4 KiB TLS page, and therefore tracks `code_cache_size` rather than translated volume.
 ///
 /// 32 MiB is that figure with about 30% of headroom, chosen so that ordinary variation in the
-/// process-global counter cannot fail the test while a real regression — another per-jit table, or
-/// the 128 MiB default cache coming back — cannot pass it. It is the top of D5's measured 20-35 MiB
-/// band, which is the number this ceiling exists to stop the runtime drifting into.
+/// process-global counter cannot fail the test while a real regression cannot pass it. It sits
+/// inside D5's measured 20-35 MiB band and **below** its top, which is what gives it teeth: the
+/// 128 MiB-cache configuration `STATUS.md` records at 34.65 MiB per thread would fail this.
 const MAX_THREAD_COMMIT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The per-slice callback invariant, on real engine code: armed, and clean across a whole sweep.
