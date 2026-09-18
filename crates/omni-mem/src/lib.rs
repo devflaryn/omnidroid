@@ -53,6 +53,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod access;
 mod arena;
 mod backing;
 mod budget;
@@ -69,6 +70,7 @@ pub use arena::{
 pub use backing::{Backing, BackingId};
 pub use budget::CommitBudget;
 pub use error::{MemError, MemResult};
+pub use access::{admit, admits_region, permits, Admitted, Refusal};
 pub use pager::{DemandPager, PagerStats};
 pub use region::{RegionInfo, RegionKind};
 pub use space::{
@@ -79,6 +81,7 @@ pub use space::{
 
 /// Re-exported from `omni-platform` so that callers do not need to depend on it directly to name a
 /// protection. There is deliberately no writable-and-executable variant.
+pub use omni_platform::fault::FaultAccess;
 pub use omni_platform::vm::{MapExecutability, Protection};
 
 /// This process's commit charge and working set, re-exported.

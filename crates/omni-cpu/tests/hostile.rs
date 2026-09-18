@@ -327,3 +327,66 @@ fn a_context_survives_every_hostile_shape_in_sequence() {
     assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "{exit}");
     assert_eq!(cpu.x(x(0)), 0x5A);
 }
+
+/// **An access whose tail leaves its mapping.** The guest loads eight bytes from four bytes before
+/// the end of a region, so half of it is in the next region — which is free address space.
+///
+/// This is the rule the two access policies used to disagree about, and it is the side the pager
+/// cannot cover: an access violation names one address, so the pager can only ever ask about one
+/// byte, while dynarmic's callback is handed the real length and must check it. With the check gone,
+/// the callback performs an eight-byte read from *Rust* across the boundary and the second half
+/// touches a page nothing is mapped at — a host access violation with no handler that owns it.
+///
+/// So the two possible outcomes are a typed exit and a dead process, which is what makes this a
+/// Global Constraint 11 test rather than a unit test about arithmetic.
+#[test]
+fn a_guest_load_that_straddles_the_end_of_its_mapping_is_a_typed_fault() {
+    let guest = Guest::new();
+
+    // A readable mapping whose successor is free address space, taken from the region map rather
+    // than assumed: `Placement::Anywhere` packs mappings, so which one has a hole after it is not
+    // something a test may guess at. Four bytes before its end, `LDR X1, [X0]` reads eight.
+    let regions = guest.space.regions();
+    let straddle = regions
+        .windows(2)
+        .find(|pair| {
+            !pair[0].is_free()
+                && pair[0].protection.is_readable()
+                && pair[0].len >= 8
+                && pair[1].is_free()
+        })
+        .map(|pair| pair[0].end() - 4)
+        .expect("a readable mapping with free address space after it");
+    assert!(
+        guest.space.region_at(straddle + 4).is_none_or(|r| r.is_free()),
+        "the second half of the load must land in free address space, or this measures a read of          the next mapping rather than a read of nothing"
+    );
+
+    let mut program = mov64(0, straddle as u64);
+    program.push(ldr_imm(1, 0, 0));
+    program.push(ret(30));
+    let entry = guest.load(&program);
+
+    let (mut cpu, _) = guest.thread();
+    let exit = cpu.run(entry, RunLimit::Unlimited).expect("a straddling load is an exit");
+    match exit {
+        ExitReason::MemoryFault { address, access: AccessKind::Read, .. } => {
+            // dynarmic reports the access's own address, which is where the load started.
+            assert_eq!(
+                address, straddle,
+                "the exit must name the address the guest asked for, not the page that faulted"
+            );
+        }
+        other => panic!(
+            "an access running off the end of its mapping must be refused whole, not served \
+             partly: got {other}"
+        ),
+    }
+
+    // And the context is still usable, which is the other half of every test in this file.
+    let after = guest.load_at(0x800, &[movz(0, 7, 0), ret(30)]);
+    cpu.set_x(x(30), (guest.code + harness::CODE_BYTES - 4) as u64);
+    let exit = cpu.run(after, RunLimit::Unlimited).expect("the context still runs");
+    assert!(matches!(exit, ExitReason::Returned { .. }), "{exit}");
+    assert_eq!(cpu.x(x(0)), 7);
+}

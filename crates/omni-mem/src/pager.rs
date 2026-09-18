@@ -44,29 +44,71 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use omni_platform::fault::{
-    self, Fault, FaultAccess, FaultError, FaultOutcome, FaultRegistration,
+    self, Fault, FaultError, FaultOutcome, FaultRegistration,
 };
 
 use crate::space::{GuestAddr, GuestSpace};
-use crate::{Protection, RegionKind};
 
 /// What a [`DemandPager`] has done since it was installed.
+///
+/// # The invariant
+///
+/// **`examined == resolved + declined`**, always. It did not hold before: `examined` was incremented
+/// inside `resolve`, while two paths that return *before* `resolve` — a nested fault and a contained
+/// panic — incremented `declined`, so `declined > examined` was representable and nothing said it
+/// should not be. A counter set with no stated relationship to its siblings is a number nobody can
+/// check, which is the opposite of what these exist for.
+///
+/// [`DemandPager::stats_are_consistent`] is the assertion, and `reentered` is what let the invariant
+/// be made true rather than merely documented: the nested-fault path is now counted like any other
+/// examination, and the thing it used to be the only witness of has a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PagerStats {
-    /// Faults whose address fell inside this space, so the pager actually looked at them.
+    /// Faults whose address fell inside this space, so the pager looked at them.
     ///
     /// Faults outside the space are declined before anything is counted: they belong to some other
     /// part of the process and counting them would make this number a property of the whole
     /// process rather than of the guest.
     pub examined: u64,
-    /// Faults the pager resolved by committing memory.
+    /// Faults the pager resolved, either by committing memory or by finding the page already
+    /// accessible.
     pub resolved: u64,
     /// Bytes of commit charge the pager has taken. This is the number D10 cares about.
     pub bytes_committed: u64,
     /// Faults inside the space that the pager declined — an unmapped address, a protection the
-    /// access is not allowed by, or a commit that failed. Each of these goes on to become a typed
-    /// CPU exit rather than being resolved here.
+    /// access is not allowed by, a commit that failed, a nested fault, or a contained panic. Each of
+    /// these goes on to become a typed CPU exit rather than being resolved here.
     pub declined: u64,
+    /// Declines that happened because the fault arrived while this thread was already inside the
+    /// handler.
+    ///
+    /// A subset of `declined`, not an addition to it. Non-zero means the pager faulted on itself,
+    /// which is a defect in Omnidroid rather than anything guest code can provoke — so it is the one
+    /// counter here whose expected value is exactly zero.
+    pub reentered: u64,
+    /// Zero-commit resolutions declined because this thread had already retried the same commit
+    /// granule.
+    ///
+    /// The bound in `resolve_without_committing`, made visible. A non-zero value means a fault the
+    /// pager believed it had fixed came back, which is a disagreement between the region map and the
+    /// OS; the decline is what turns that into a typed guest fault instead of a spin.
+    pub retries_exhausted: u64,
+}
+
+impl PagerStats {
+    /// Whether the invariant in this type's docs holds: every examined fault was either resolved or
+    /// declined, exactly once, and the two named subsets of `declined` fit inside it.
+    ///
+    /// A method rather than an internal assertion, because these counters are `Relaxed` and read
+    /// without a lock: a reader that catches a handler mid-flight can legitimately see `examined`
+    /// incremented before its outcome. So this is for a caller that knows nothing is running — every
+    /// test that uses it joins its guest threads first — and for that caller it is exact.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.examined == self.resolved + self.declined
+            && self.reentered <= self.declined
+            && self.retries_exhausted <= self.declined
+    }
 }
 
 thread_local! {
@@ -74,15 +116,39 @@ thread_local! {
     /// immediately instead of recursing forever.
     static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
 
-    /// The last address this thread resolved *without* committing anything, or 0.
+    /// The last commit **granule** this thread resolved without committing anything, or 0.
     ///
-    /// The bound on the one case that could otherwise loop: see `resolve_without_committing`. Two
-    /// faults running at the same address on one thread means retrying did not help, so the second
-    /// declines and the fault becomes a typed guest exit. Per thread rather than shared, because
-    /// the whole point of the path is that two *different* threads legitimately see the same
-    /// granule.
-    static LAST_ZERO_COMMIT: Cell<usize> = const { Cell::new(0) };
+    /// Two changes from the address it used to hold, both from the whole-branch review.
+    ///
+    /// **A granule, not an address.** The documented bound was "one retry per thread per address",
+    /// and a fault alternating between two addresses *in the same granule* defeated it exactly: each
+    /// arrival saw a different address, so neither was ever a repeat, and the pair looped. The unit
+    /// the decision is about was always the granule — `ensure_committed` commits granules — so
+    /// that is what is remembered, and the two-address alternation collapses to one entry.
+    ///
+    /// **Per thread, still.** The whole point of the zero-commit path is that two *different*
+    /// threads legitimately see the same granule at the same instant.
+    static LAST_ZERO_COMMIT_GRANULE: Cell<usize> = const { Cell::new(0) };
+
+    /// Consecutive zero-commit resolutions on this thread, with no real commit in between.
+    ///
+    /// The granule record above is precise and is not a *bound*: a fault cycling across three or
+    /// more distinct granules repeats none of them consecutively. This is the bound. It is generous
+    /// on purpose, because the legitimate case is unbounded in principle — a thread can race ahead
+    /// of another that is committing granules and see a long run of "somebody else got there first"
+    /// — and declining one of those costs the 30-49x deoptimization this whole module exists to
+    /// avoid. A run of [`MAX_ZERO_COMMIT_STREAK`] is two milliseconds of solid faulting at D10's
+    /// measured 2053 ns per fault, and the decline that ends it ends the loop: a declined fault
+    /// leaves the pager and becomes a typed exit or a deoptimized-but-correct access.
+    static ZERO_COMMIT_STREAK: Cell<u32> = const { Cell::new(0) };
 }
+
+/// Consecutive zero-commit resolutions one thread may take before the next is declined.
+///
+/// A fitted constant, not a derived one (Global Constraint 12): it is chosen to be far above any
+/// legitimate run and far below a hang. At D10's measured 2053 ns per vectored fault, 1024 of them is
+/// about 2.1 ms.
+const MAX_ZERO_COMMIT_STREAK: u32 = 1024;
 
 /// Per-pager state the fault handler reaches through an opaque `usize`.
 ///
@@ -91,10 +157,30 @@ struct PagerInner {
     space: Arc<GuestSpace>,
     base: GuestAddr,
     end: GuestAddr,
+    /// The space's commit granule, copied here so the handler does not take the space's lock to ask
+    /// for it. It is fixed at construction, so a copy cannot go stale.
+    granule: usize,
     examined: AtomicU64,
     resolved: AtomicU64,
     bytes_committed: AtomicU64,
     declined: AtomicU64,
+    reentered: AtomicU64,
+    retries_exhausted: AtomicU64,
+}
+
+impl PagerInner {
+    /// Count one examined fault and its outcome, in one place.
+    ///
+    /// Every in-space fault goes through here exactly once, which is what makes
+    /// `examined == resolved + declined` true by construction rather than by inspection.
+    fn record(&self, outcome: FaultOutcome) -> FaultOutcome {
+        self.examined.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            FaultOutcome::Resolved => self.resolved.fetch_add(1, Ordering::Relaxed),
+            FaultOutcome::NotOurs => self.declined.fetch_add(1, Ordering::Relaxed),
+        };
+        outcome
+    }
 }
 
 /// Serves guest access violations for one [`GuestSpace`] for as long as it is alive.
@@ -126,11 +212,14 @@ impl DemandPager {
         let inner = Box::new(PagerInner {
             base: space.base(),
             end: space.end(),
+            granule: space.commit_granule(),
             space,
             examined: AtomicU64::new(0),
             resolved: AtomicU64::new(0),
             bytes_committed: AtomicU64::new(0),
             declined: AtomicU64::new(0),
+            reentered: AtomicU64::new(0),
+            retries_exhausted: AtomicU64::new(0),
         });
         // The address is stable for as long as the box is: `inner` is never moved out of, and the
         // registration that publishes this address is dropped before the box is.
@@ -164,7 +253,15 @@ impl DemandPager {
             resolved: self.inner.resolved.load(Ordering::Relaxed),
             bytes_committed: self.inner.bytes_committed.load(Ordering::Relaxed),
             declined: self.inner.declined.load(Ordering::Relaxed),
+            reentered: self.inner.reentered.load(Ordering::Relaxed),
+            retries_exhausted: self.inner.retries_exhausted.load(Ordering::Relaxed),
         }
+    }
+
+    /// Whether [`PagerStats::is_consistent`] holds for this pager right now.
+    #[must_use]
+    pub fn stats_are_consistent(&self) -> bool {
+        self.stats().is_consistent()
     }
 
     /// Which handler slot this pager holds, for diagnostics.
@@ -182,19 +279,6 @@ impl core::fmt::Debug for DemandPager {
             .field("slot", &self.registration.slot())
             .field("stats", &self.stats())
             .finish()
-    }
-}
-
-/// Whether `protection` permits `access`.
-///
-/// A write to a read-only guest page is *not* something to commit our way out of: committing it
-/// would silently give the guest a permission it does not have. It is declined, and becomes a typed
-/// memory-fault exit naming the address — which is what a real kernel would deliver to the guest.
-fn permits(protection: Protection, access: FaultAccess) -> bool {
-    match access {
-        FaultAccess::Read => protection.is_readable(),
-        FaultAccess::Write => protection.is_writable(),
-        FaultAccess::Execute => protection.is_executable(),
     }
 }
 
@@ -225,8 +309,12 @@ fn handle_fault(context: usize, fault: &Fault) -> FaultOutcome {
     if reentered {
         // A fault inside the handler. Declining breaks the recursion; resolving could not, because
         // whatever the inner fault was, this frame has not finished the work that would fix it.
-        inner.declined.fetch_add(1, Ordering::Relaxed);
-        return FaultOutcome::NotOurs;
+        //
+        // Counted as an examination *and* a decline, which is what keeps `PagerStats`'s invariant
+        // true. `reentered` is the separate witness that this path was the one taken — it used to be
+        // inferable only from `examined` staying at zero, which is what made the invariant false.
+        inner.reentered.fetch_add(1, Ordering::Relaxed);
+        return inner.record(FaultOutcome::NotOurs);
     }
 
     // A panic in the handler declines, because unwinding into the OS exception dispatcher is
@@ -238,46 +326,46 @@ fn handle_fault(context: usize, fault: &Fault) -> FaultOutcome {
     // look at.
     let outcome = match catch_unwind(AssertUnwindSafe(|| resolve(inner, fault))) {
         Ok(outcome) => outcome,
-        Err(_) => {
-            inner.declined.fetch_add(1, Ordering::Relaxed);
-            FaultOutcome::NotOurs
-        }
+        Err(_) => FaultOutcome::NotOurs,
     };
+    let outcome = inner.record(outcome);
 
     IN_HANDLER.with(|flag| flag.set(false));
     outcome
 }
 
+/// Ask the shared policy, and turn its answer into a dispatch outcome.
+///
+/// The policy itself is [`crate::access::admit`] and is the *same* function `omni-cpu`'s slow-path
+/// callback calls — see that module for why there used to be two of them with different rules. What
+/// is left here is the part that is genuinely the pager's: one byte, because that is what an access
+/// violation reports, and the zero-commit decision below, which only a fault handler has to make.
 fn resolve(inner: &PagerInner, fault: &Fault) -> FaultOutcome {
-    inner.examined.fetch_add(1, Ordering::Relaxed);
-
-    let Some(region) = inner.space.region_at(fault.address) else {
-        inner.declined.fetch_add(1, Ordering::Relaxed);
-        return FaultOutcome::NotOurs;
-    };
-    if region.is_free() || !permits(region.protection, fault.access) {
-        inner.declined.fetch_add(1, Ordering::Relaxed);
-        return FaultOutcome::NotOurs;
-    }
-
-    // One byte is the right request: `ensure_committed` expands outwards to whole commit granules
-    // and clips to the mapping, so this commits exactly one granule of the mapping that was
-    // touched, and D10's measured 150 ns/page at the 64 KiB granule is what it costs.
-    match inner.space.ensure_committed(fault.address, 1) {
-        Ok(0) => resolve_without_committing(inner, fault, &region),
-        Ok(bytes) => {
-            inner.resolved.fetch_add(1, Ordering::Relaxed);
-            inner.bytes_committed.fetch_add(bytes as u64, Ordering::Relaxed);
-            LAST_ZERO_COMMIT.with(|cell| cell.set(0));
+    // One byte is the right request, and it is the whole of the divergence from the CPU side: the
+    // hardware names the address that could not be reached, and an access straddling a page boundary
+    // faults again on the second page. `ensure_committed` inside `admit` expands outwards to whole
+    // commit granules and clips to the mapping, so this commits exactly one granule of the mapping
+    // that was touched — D10's measured 150 ns/page at the 64 KiB granule.
+    match crate::access::admit(&inner.space, fault.address, 1, fault.access) {
+        Ok(admitted) if admitted.committed > 0 => {
+            inner
+                .bytes_committed
+                .fetch_add(admitted.committed as u64, Ordering::Relaxed);
+            // A real commit clears the retry record: progress was made, so whatever the thread sees
+            // next is a new question rather than the same one again.
+            LAST_ZERO_COMMIT_GRANULE.with(|cell| cell.set(0));
+            ZERO_COMMIT_STREAK.with(|cell| cell.set(0));
             FaultOutcome::Resolved
         }
-        Err(_) => {
-            // Commit failed — `ERROR_COMMITMENT_LIMIT`, or this space's own ceiling (D15). Declining
-            // turns it into a typed guest memory fault instead of an infinite fault loop. The error
-            // is not logged here: this is an exception handler, and formatting allocates.
-            inner.declined.fetch_add(1, Ordering::Relaxed);
-            FaultOutcome::NotOurs
-        }
+        Ok(admitted) => resolve_without_committing(inner, fault, admitted.anonymous),
+        // Unmapped, or a protection the access is not allowed by. A write to a read-only guest page
+        // is not something to commit our way out of: it becomes a typed memory fault naming the
+        // address, which is what a real kernel would deliver to the guest.
+        //
+        // Or the commit failed — `ERROR_COMMITMENT_LIMIT`, or this space's own ceiling (D15).
+        // Declining turns that into a typed guest memory fault instead of an infinite fault loop.
+        // The refusal is not logged: this is an exception handler, and formatting allocates.
+        Err(_) => FaultOutcome::NotOurs,
     }
 }
 
@@ -301,23 +389,80 @@ fn resolve(inner: &PagerInner, fault: &Fault) -> FaultOutcome {
 fn resolve_without_committing(
     inner: &PagerInner,
     fault: &Fault,
-    region: &crate::RegionInfo,
+    anonymous: bool,
 ) -> FaultOutcome {
-    let anonymous = matches!(region.kind, RegionKind::Anonymous);
-    let repeated = LAST_ZERO_COMMIT.with(|cell| cell.replace(fault.address)) == fault.address;
-    if anonymous && !repeated {
-        inner.resolved.fetch_add(1, Ordering::Relaxed);
+    // Both bounds, and they answer different questions. The granule record catches the shape the
+    // review found — a fault alternating between two addresses of one granule, which the old
+    // per-address record could never see as a repeat — and the streak is the bound proper, for a
+    // cycle across three or more granules that the record alone would never call repeated.
+    let granule = fault.address - fault.address % inner.granule.max(1);
+    let repeated = LAST_ZERO_COMMIT_GRANULE.with(|cell| cell.replace(granule)) == granule;
+    let streak = ZERO_COMMIT_STREAK.with(|cell| {
+        let next = cell.get().saturating_add(1);
+        cell.set(next);
+        next
+    });
+    let exhausted = repeated || streak > MAX_ZERO_COMMIT_STREAK;
+
+    if anonymous && !exhausted {
         return FaultOutcome::Resolved;
     }
-    // Either file-backed — where no commit is owed and a fault means something else entirely — or
-    // the same address a second time running on this thread, which means retrying did not help.
-    inner.declined.fetch_add(1, Ordering::Relaxed);
+    if anonymous {
+        // The bound fired. Counted separately, because "the pager believed it had fixed this and it
+        // came back" is a disagreement between the region map and the OS — a defect here rather than
+        // a guest input — and it must not be invisible.
+        inner.retries_exhausted.fetch_add(1, Ordering::Relaxed);
+        ZERO_COMMIT_STREAK.with(|cell| cell.set(0));
+    }
+    // Either file-backed — where no commit is owed and a fault means something else entirely — or a
+    // retry that did not help.
     FaultOutcome::NotOurs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::Protection;
+    use omni_platform::fault::FaultAccess;
+
+    /// A `PagerInner` with no registration behind it, for driving the decision functions directly.
+    ///
+    /// Deliberate: every test below is about a decision, and a decision is testable without a real
+    /// access violation. The concurrency test in `omni-cpu` that first found the zero-commit bug
+    /// cannot be what *pins* it — a mutation row backed by it passed and failed on alternate runs,
+    /// and Task 1's lesson is that a flaky row attributes a mutation to the wrong detector.
+    fn inner_over(space: Arc<GuestSpace>) -> PagerInner {
+        PagerInner {
+            base: space.base(),
+            end: space.end(),
+            granule: space.commit_granule(),
+            space,
+            examined: AtomicU64::new(0),
+            resolved: AtomicU64::new(0),
+            bytes_committed: AtomicU64::new(0),
+            declined: AtomicU64::new(0),
+            reentered: AtomicU64::new(0),
+            retries_exhausted: AtomicU64::new(0),
+        }
+    }
+
+    fn stats_of(inner: &PagerInner) -> PagerStats {
+        PagerStats {
+            examined: inner.examined.load(Ordering::Relaxed),
+            resolved: inner.resolved.load(Ordering::Relaxed),
+            bytes_committed: inner.bytes_committed.load(Ordering::Relaxed),
+            declined: inner.declined.load(Ordering::Relaxed),
+            reentered: inner.reentered.load(Ordering::Relaxed),
+            retries_exhausted: inner.retries_exhausted.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset_thread_state() {
+        IN_HANDLER.with(|flag| flag.set(false));
+        LAST_ZERO_COMMIT_GRANULE.with(|cell| cell.set(0));
+        ZERO_COMMIT_STREAK.with(|cell| cell.set(0));
+    }
 
     /// A fault raised **inside the handler**, on the same thread.
     ///
@@ -333,17 +478,10 @@ mod tests {
     /// silent loop.
     #[test]
     fn a_fault_raised_inside_the_handler_declines_instead_of_recursing() {
+        reset_thread_state();
         let space = Arc::new(GuestSpace::new().expect("a guest address space"));
         let base = space.base();
-        let inner = PagerInner {
-            base,
-            end: space.end(),
-            space,
-            examined: AtomicU64::new(0),
-            resolved: AtomicU64::new(0),
-            bytes_committed: AtomicU64::new(0),
-            declined: AtomicU64::new(0),
-        };
+        let inner = inner_over(space);
         let context = (&inner) as *const PagerInner as usize;
         let fault = Fault {
             address: base + 0x1000,
@@ -362,111 +500,203 @@ mod tests {
             "a fault raised inside the handler must decline, or the handler re-enters itself \
              for every level of a recursion that has no bottom"
         );
+        let nested = stats_of(&inner);
         assert_eq!(
-            inner.declined.load(Ordering::Relaxed),
-            1,
+            nested.declined, 1,
             "and it must be counted, so a pager that is faulting on itself is visible"
         );
         assert_eq!(
-            inner.examined.load(Ordering::Relaxed),
-            0,
-            "the nested call must not have reached `resolve`, which is where the space lock is taken"
+            nested.reentered, 1,
+            "the nested path must be identifiable on its own. This is the witness that used to be \
+             `examined == 0`, which is the same statement -- the nested call returns before \
+             `resolve`, which is where the space lock is taken -- but which made \
+             `declined > examined` representable and the stats invariant false"
+        );
+        assert_eq!(nested.resolved, 0);
+        assert_eq!(
+            nested.examined,
+            nested.resolved + nested.declined,
+            "examined == resolved + declined, on the path that used to break it"
         );
 
         // And the flag is left clear afterwards, so one nested fault does not wedge the thread out
         // of ever serving another.
         assert!(!IN_HANDLER.with(Cell::get));
         assert_eq!(handle_fault(context, &fault), FaultOutcome::NotOurs, "no mapping there");
-        assert_eq!(inner.examined.load(Ordering::Relaxed), 1, "this one did reach `resolve`");
+        let after = stats_of(&inner);
+        assert_eq!(after.examined, 2, "this one did reach `resolve`");
+        assert_eq!(after.reentered, 1, "and it was not a re-entry");
+        assert_eq!(after.examined, after.resolved + after.declined);
     }
 
     /// The zero-commit decision, driven directly so that it is **deterministic**.
     ///
-    /// The concurrency test in `omni-cpu` found this bug, but it cannot be what pins it: it depends
-    /// on two guest threads faulting on the same 64 KiB granule in the same instant, which happens
-    /// often enough to find a defect and not often enough to be evidence. A mutation row backed by
-    /// it passed and failed on alternate runs — and Task 1's lesson is that a flaky test in a
-    /// mutation table is worse than no row, because it attributes a mutation to the wrong detector.
-    ///
-    /// So the decision function is called directly, with the two region kinds and the repeat.
+    /// `ensure_committed` returning 0 means "nothing was owed". Under several guest threads that is
+    /// common and does *not* mean the fault is unfixable: two threads fault on pages of the same
+    /// 64 KiB commit granule at the same moment, the first commits it, and the second's request
+    /// correctly commits nothing — the page *is* now accessible, and retrying the instruction
+    /// succeeds. Declining instead handed the fault to dynarmic's frame-based handler, which
+    /// recompiled the block with fastmem off and put it permanently on the callback path (measured
+    /// 30-49x). Correct results, silently slower, triggered only by timing.
     #[test]
-    fn a_commit_that_committed_nothing_is_resolved_once_for_anonymous_memory() {
+    fn a_commit_that_committed_nothing_is_resolved_once_per_granule() {
+        reset_thread_state();
         let space = Arc::new(GuestSpace::new().expect("a guest address space"));
         let base = space.base();
-        let inner = PagerInner {
-            base,
-            end: space.end(),
-            space,
-            examined: AtomicU64::new(0),
-            resolved: AtomicU64::new(0),
-            bytes_committed: AtomicU64::new(0),
-            declined: AtomicU64::new(0),
+        let granule = space.commit_granule();
+        let inner = inner_over(space);
+        let fault_at = |address| Fault {
+            address,
+            access: FaultAccess::Write,
+            instruction_pointer: 0,
         };
+
+        // Anonymous, first time in this granule: another thread committed it a moment ago, so the
+        // page IS accessible and retrying the instruction succeeds.
+        assert_eq!(
+            resolve_without_committing(&inner, &fault_at(base + 0x2000), true),
+            FaultOutcome::Resolved
+        );
+
+        // **The defect the review found.** A second fault at a *different address in the same
+        // granule* is the same question asked again, so it must be refused. The record used to hold
+        // an address, so this arrived as a first-time address and was resolved again — and a fault
+        // alternating between two such addresses looped, with the bound documented as holding.
+        assert_eq!(
+            resolve_without_committing(&inner, &fault_at(base + 0x3000), true),
+            FaultOutcome::NotOurs,
+            "two addresses in one commit granule are one retry, not two: the unit the decision is \
+             about is the granule, because that is what `ensure_committed` commits"
+        );
+        assert_eq!(stats_of(&inner).retries_exhausted, 1, "and the bound firing is visible");
+
+        // A *different* granule is a new question, and is resolved once.
+        assert_eq!(
+            resolve_without_committing(&inner, &fault_at(base + granule + 0x2000), true),
+            FaultOutcome::Resolved,
+            "a genuinely different granule must not be refused by another granule's retry"
+        );
+
+        // File-backed: no commit is owed, so a fault there means something this pager cannot fix.
+        // It is not a retry, so it must not be counted as one.
+        reset_thread_state();
+        let before = stats_of(&inner).retries_exhausted;
+        assert_eq!(
+            resolve_without_committing(&inner, &fault_at(base + 0x2000), false),
+            FaultOutcome::NotOurs
+        );
+        assert_eq!(
+            stats_of(&inner).retries_exhausted,
+            before,
+            "a file-backed decline is not an exhausted retry"
+        );
+    }
+
+    /// The **bound**, as opposed to the granule record: a cycle across more granules than the record
+    /// can remember must still terminate.
+    ///
+    /// The record holds one granule, so a fault walking three or more of them in a ring repeats none
+    /// of them consecutively and would be resolved every time — the loop the review's "one retry per
+    /// thread per address" was supposed to have ruled out, arriving by a slightly longer route. The
+    /// streak counter is what actually bounds it, and this is the test that says the bound exists at
+    /// all rather than that it is tight.
+    #[test]
+    fn a_long_cycle_of_distinct_granules_is_still_bounded() {
+        reset_thread_state();
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let base = space.base();
+        let granule = space.commit_granule();
+        let inner = inner_over(space);
+
+        // Four distinct granules, walked in a ring so that no two consecutive faults share one.
+        const RING: usize = 4;
+        let mut resolved = 0u32;
+        let mut declined = 0u32;
+        for i in 0..(MAX_ZERO_COMMIT_STREAK as usize + RING * 2) {
+            let fault = Fault {
+                address: base + (i % RING) * granule + 0x1000,
+                access: FaultAccess::Write,
+                instruction_pointer: 0,
+            };
+            match resolve_without_committing(&inner, &fault, true) {
+                FaultOutcome::Resolved => resolved += 1,
+                FaultOutcome::NotOurs => declined += 1,
+            }
+        }
+        assert!(
+            declined > 0,
+            "n = {} faults across {RING} distinct granules, none consecutive: every one was \
+             resolved, so nothing bounds the loop and a guest thread in this state never makes \
+             progress",
+            MAX_ZERO_COMMIT_STREAK as usize + RING * 2
+        );
+        assert_eq!(
+            stats_of(&inner).retries_exhausted,
+            u64::from(declined),
+            "every decline on this path is an exhausted retry and must be counted as one"
+        );
+        // **An absolute floor, deliberately not `MAX_ZERO_COMMIT_STREAK`.** A bound stated relative
+        // to the constant it is bounding cannot notice the constant moving, which is the row
+        // `mem-B8` exists to prove: tightening the streak to 1 passes a relative check and destroys
+        // the property. So the floor is a number of its own — a thread racing another that is
+        // committing granules ahead of it must be allowed a long run of these, because declining one
+        // costs the 30-49x deoptimization this whole module exists to avoid, and the observed race
+        // involves a handful of granules against this two-orders-of-magnitude headroom.
+        const LEGITIMATE_RUN: u32 = 256;
+        assert!(
+            resolved >= LEGITIMATE_RUN,
+            "the bound must be loose enough to leave the legitimate case alone: only {resolved} of \
+             the run were resolved, against a floor of {LEGITIMATE_RUN} consecutive zero-commit \
+             resolutions one thread must be allowed"
+        );
+    }
+
+    /// A real commit resets both bounds, because progress was made.
+    ///
+    /// Without this, a thread that legitimately alternates between committing a granule and racing
+    /// another thread for the next one would accumulate a streak and eventually be refused.
+    #[test]
+    fn a_real_commit_clears_the_retry_record() {
+        reset_thread_state();
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let base = space.base();
+        let inner = inner_over(space);
         let fault = Fault {
             address: base + 0x2000,
             access: FaultAccess::Write,
             instruction_pointer: 0,
         };
-        let region = |kind| crate::RegionInfo {
-            start: base,
-            len: 0x10000,
-            protection: Protection::ReadWrite,
-            kind,
-            committed: 0x10000,
-            mapping: None,
-            mapping_start: base,
-            mapping_len: 0x10000,
-        };
 
-        LAST_ZERO_COMMIT.with(|cell| cell.set(0));
-
-        // Anonymous, first time at this address: another thread committed the granule a moment ago,
-        // so the page IS accessible and retrying the instruction succeeds. Declining here is what
-        // handed the fault to dynarmic and put the block permanently on the callback path.
+        assert_eq!(resolve_without_committing(&inner, &fault, true), FaultOutcome::Resolved);
+        // Exactly what `resolve` does on a commit of non-zero size.
+        LAST_ZERO_COMMIT_GRANULE.with(|cell| cell.set(0));
+        ZERO_COMMIT_STREAK.with(|cell| cell.set(0));
         assert_eq!(
-            resolve_without_committing(&inner, &fault, &region(RegionKind::Anonymous)),
-            FaultOutcome::Resolved
+            resolve_without_committing(&inner, &fault, true),
+            FaultOutcome::Resolved,
+            "the same granule after a real commit is a new question, not a repeat"
         );
-        assert_eq!(inner.resolved.load(Ordering::Relaxed), 1);
-
-        // Same address again on this thread: retrying did not help, so it becomes a typed guest
-        // fault rather than a loop. This is the bound on the one case that could otherwise spin.
-        assert_eq!(
-            resolve_without_committing(&inner, &fault, &region(RegionKind::Anonymous)),
-            FaultOutcome::NotOurs
-        );
-        assert_eq!(inner.declined.load(Ordering::Relaxed), 1);
-        assert_eq!(inner.resolved.load(Ordering::Relaxed), 1, "and it is not counted twice");
-
-        // File-backed: no commit is owed, so a fault there means something this pager cannot fix.
-        LAST_ZERO_COMMIT.with(|cell| cell.set(0));
-        let file = RegionKind::File {
-            backing: crate::BackingId(1),
-            name: "libroblox.so".into(),
-            file_offset: 0,
-        };
-        assert_eq!(
-            resolve_without_committing(&inner, &fault, &region(file)),
-            FaultOutcome::NotOurs
-        );
-        assert_eq!(inner.declined.load(Ordering::Relaxed), 2);
+        assert_eq!(stats_of(&inner).retries_exhausted, 0);
     }
 
-    /// The permission table, pinned. Getting `Write` wrong here would make the pager commit a page
-    /// the guest is not allowed to write, which is a silently granted permission rather than a
-    /// crash — the exact shape Global Constraint 11 warns about.
+    /// The permission table lives in [`crate::access`] now, with both crates' rules, and is pinned
+    /// there over every protection and every access. What is checked here is that this module still
+    /// asks *that* predicate — a local copy reappearing is the defect the review named.
     #[test]
-    fn a_fault_is_only_ours_if_the_protection_already_allowed_it() {
+    fn the_pager_uses_the_shared_access_policy() {
         use FaultAccess::{Execute, Read, Write};
-        for (protection, read, write, exec) in [
-            (Protection::None, false, false, false),
-            (Protection::Read, true, false, false),
-            (Protection::ReadWrite, true, true, false),
-            (Protection::ReadExecute, true, false, true),
-        ] {
-            assert_eq!(permits(protection, Read), read, "{protection} read");
-            assert_eq!(permits(protection, Write), write, "{protection} write");
-            assert_eq!(permits(protection, Execute), exec, "{protection} execute");
+        for protection in Protection::ALL {
+            for access in [Read, Write, Execute] {
+                assert_eq!(
+                    crate::access::permits(protection, access),
+                    match access {
+                        Read => protection.is_readable(),
+                        Write => protection.is_writable(),
+                        Execute => protection.is_executable(),
+                    },
+                    "{protection} {access}"
+                );
+            }
         }
     }
 }

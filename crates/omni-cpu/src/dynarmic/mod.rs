@@ -53,7 +53,7 @@ use dynarmic_sys::{
     OD_HALT_CACHE_INVALIDATION, OD_HALT_MEMORY_ABORT, OD_HALT_SHIM_REENTERED, OD_HALT_SHIM_THREW,
     OD_HALT_USER1, OD_HALT_USER8, OD_FIXED_PER_JIT_BYTES,
 };
-use omni_mem::{DemandPager, GuestAddr, GuestSpace, PagerStats, Protection, RegionKind};
+use omni_mem::{DemandPager, FaultAccess, GuestAddr, GuestSpace, PagerStats, Protection};
 
 use crate::context::{ContextCost, GuestAddressSpace, GuestRange, GuestThreadConfig};
 use crate::cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle};
@@ -593,6 +593,15 @@ pub(crate) struct CpuCtx {
     /// moments the guest's own mappings can have changed underneath it. A stale entry here would
     /// mean fetching an instruction from a range that has since been unmapped, so it is cleared
     /// eagerly rather than validated lazily.
+    ///
+    /// The third element is **whether the region was committed end to end** when it was cached, and
+    /// it is the one thing that makes the cache safe to use. Without it the cache short-circuited
+    /// `ensure_committed` for every fetch after the first inside a region, so a lazily-committed
+    /// anonymous executable region larger than the 64 KiB commit granule would be read from *Rust*
+    /// code at an uncommitted address — which dynarmic's frame-based handler does not cover, so it
+    /// would rely on the demand pager existing, and `owns_guest_paging()` can be false. Not reachable
+    /// for M2's file-backed image; reachable the moment a guest JIT exists. It was also written and
+    /// never read, which is how it survived review.
     pub(crate) executable_cache: Option<(GuestAddr, GuestAddr, bool)>,
 
     pub(crate) thunks: BTreeSet<GuestAddr>,
@@ -613,35 +622,36 @@ impl CpuCtx {
     /// Whether `address` is in a mapped region this access is allowed by, committing it if the
     /// mapping is lazy and the granule is not committed yet.
     ///
-    /// Returns the region's extent so the caller can cache it.
+    /// **The policy is not here.** It is [`omni_mem::admit`], which is the same function the demand
+    /// pager asks — see that module for the two divergent copies this replaced and for the one place
+    /// the callers still legitimately differ. What is left here is translating dynarmic's vocabulary
+    /// into the policy's, and the decision about what to cache.
+    ///
+    /// Returns the region's extent, and **whether the region was already committed end to end**. The
+    /// second element is what makes caching sound: see [`CpuCtx::fetch`].
     pub(crate) fn resolve(
         &self,
         address: GuestAddr,
         len: usize,
         want: Protection,
-    ) -> Option<(GuestAddr, GuestAddr)> {
+    ) -> Option<(GuestAddr, GuestAddr, bool)> {
+        // Kept, and redundant on purpose. `admit`'s first rule refuses an unmapped address from the
+        // region map, which is authoritative; this is the cheap reject for an address that cannot
+        // possibly be in the space, on a path every guest fault takes.
         if !self.extent.contains(address) {
             return None;
         }
-        let region = self.space.region_at(address)?;
-        if region.is_free() || region.end() < address.checked_add(len)? {
-            return None;
-        }
-        let allowed = match want {
-            Protection::ReadExecute => region.protection.is_executable(),
-            Protection::ReadWrite => region.protection.is_writable(),
-            _ => region.protection.is_readable(),
+        // dynarmic asks in terms of the protection it wants; the policy asks in terms of the access
+        // being attempted. The mapping is total and is the only translation between the two.
+        let access = match want {
+            Protection::ReadExecute => FaultAccess::Execute,
+            Protection::ReadWrite => FaultAccess::Write,
+            Protection::Read | Protection::None => FaultAccess::Read,
         };
-        if !allowed {
-            return None;
-        }
-        if matches!(region.kind, RegionKind::Anonymous) && !region.is_committed() {
-            // A lazy mapping whose granule may not be committed. Committing here rather than
-            // relying on the fault handler keeps this path working on a platform with no vectored
-            // handler, and costs a lock only while a mapping is still filling in.
-            self.space.ensure_committed(address, len).ok()?;
-        }
-        Some((region.start, region.end()))
+        // Committing here rather than leaving it to the fault handler keeps this path working on a
+        // platform with no vectored-handler implementation, where `owns_guest_paging()` is false.
+        let admitted = omni_mem::admit(&self.space, address, len, access).ok()?;
+        Some((admitted.start, admitted.end, admitted.fully_committed))
     }
 }
 

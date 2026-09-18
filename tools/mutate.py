@@ -51,6 +51,7 @@ CPU_CLOCK = "crates/omni-cpu/src/clock.rs"
 CPU_CALLBACKS = "crates/omni-cpu/src/dynarmic/callbacks.rs"
 CPU_DYN = "crates/omni-cpu/src/dynarmic/mod.rs"
 PAGER = "crates/omni-mem/src/pager.rs"
+ACCESS = "crates/omni-mem/src/access.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
 LEAF = "crates/omni-elf/src/leaf.rs"
@@ -349,14 +350,18 @@ MUTATIONS = [
 
     # ---- the backend's own bookkeeping -----------------------------------------------------------
     ("cpu-A23", "A", "a processor id is never recycled, so threads exhaust the monitor", CPU_DYN,
-     """        self.shared.release_processor_id(self.processor_id);""",
+     """        self.shared.release_processor_id(self.processor_id, self.jit.is_null());""",
      """        let _ = self.processor_id;""",
      CPU),
 
-    ("cpu-A24", "A", "a guest access is served without checking the region's protection", CPU_DYN,
-     """        if !allowed {""",
-     """        if false && !allowed {""",
-     CPU),
+    ("cpu-A24", "A", "a guest access is served without checking the region's protection", ACCESS,
+     """    if !permits(region.protection, access) {
+        return Err(Refusal::Protection);
+    }""",
+     """    if false && !permits(region.protection, access) {
+        return Err(Refusal::Protection);
+    }""",
+     MEM_AND_CPU),
 
     # ---- direction B: over-corrections that read as more careful ----------------------------------
     ("cpu-B2", "B", "TLS blocks committed eagerly so no guest thread ever faults", CPU_TLS,
@@ -386,6 +391,17 @@ MUTATIONS = [
             });
         }
         self.with_ctx(|ctx| ctx.executable_cache = None);""",
+     CPU),
+
+    ("cpu-A35", "A", "the fetch cache ignores whether the region is committed (M5)",
+     CPU_CALLBACKS,
+     """            .is_some_and(|(start, end, committed)| {
+                committed && address >= start && address + 4 <= end
+            });""",
+     """            .is_some_and(|(start, end, committed)| {
+                let _ = committed;
+                address >= start && address + 4 <= end
+            });""",
      CPU),
 
     # ---- I3: the guest's architectural counter ---------------------------------------------------
@@ -462,10 +478,46 @@ MUTATIONS = [
      CPU),
 
     # ---- the demand pager ------------------------------------------------------------------------
-    ("mem-A15", "A", "the pager commits a page the guest may not write", PAGER,
+    # ---- the shared access policy (M4) -----------------------------------------------------------
+    # These four rows are the ones the review asked for: before the policy was unified, no row could
+    # flip a rule on one side and check that the other caught it, because there were two rules. Now
+    # there is one, and each of these runs BOTH suites, so a row that only one crate notices is
+    # visible as such in the "N test(s)" column.
+    ("mem-A15", "A", "the shared policy commits a page the guest may not write", ACCESS,
      """        FaultAccess::Write => protection.is_writable(),""",
      """        FaultAccess::Write => protection.is_readable(),""",
-     MEM),
+     MEM_AND_CPU),
+
+    ("mem-A18", "A", "the length check dropped, so an access may run off the end of its region",
+     ACCESS,
+     """    if access_end > region.end() {
+        return Err(Refusal::NotMapped);
+    }
+    if !permits(region.protection, access) {""",
+     """    if false && access_end > region.end() {
+        return Err(Refusal::NotMapped);
+    }
+    if !permits(region.protection, access) {""",
+     MEM_AND_CPU),
+
+    ("mem-A19", "A", "free address space is admitted, so a wild guest address resolves", ACCESS,
+     """) -> Result<(), Refusal> {
+    if region.is_free() {""",
+     """) -> Result<(), Refusal> {
+    if false && region.is_free() {""",
+     MEM_AND_CPU),
+
+    # There is no row for dropping the `anonymous &&` from rule 4, and the reason is a finding
+    # rather than an omission: it is **inert**. `Inner::commit_range` skips any entry whose OS state
+    # is not a placeholder, and a file-backed view never is, so committing "for any kind" commits
+    # nothing extra and returns the same 0. The check stays as an early-out and a statement of
+    # intent, and it is now written down that the layer below is what enforces it. A row would MISS,
+    # and a row that cannot fail is worse than no row.
+    ("mem-B7", "B", "rule 4 commits the whole mapping rather than the granule that was touched",
+     ACCESS,
+     """        match space.ensure_committed(address, len.max(1)) {""",
+     """        match space.ensure_committed(region.mapping_start, region.mapping_len) {""",
+     MEM_AND_CPU),
 
     ("mem-A16", "A", "the pager claims faults from outside its own address space", PAGER,
      """    if fault.address < inner.base || fault.address >= inner.end {
@@ -478,17 +530,44 @@ MUTATIONS = [
 
     ("mem-A17", "A", "a zero-byte commit is declined again, so a concurrent fault leaves fastmem",
      PAGER,
-     """    let anonymous = matches!(region.kind, RegionKind::Anonymous);
-    let repeated = LAST_ZERO_COMMIT.with(|cell| cell.replace(fault.address)) == fault.address;
-    if anonymous && !repeated {""",
-     """    let anonymous = matches!(region.kind, RegionKind::Anonymous);
-    let repeated = LAST_ZERO_COMMIT.with(|cell| cell.replace(fault.address)) == fault.address;
-    if false && anonymous && !repeated {""",
+     """    if anonymous && !exhausted {
+        return FaultOutcome::Resolved;
+    }""",
+     """    if false && anonymous && !exhausted {
+        return FaultOutcome::Resolved;
+    }""",
      MEM_AND_CPU),
 
-    ("mem-B6", "B", "the pager commits the whole mapping so a page never faults twice", PAGER,
-     """    match inner.space.ensure_committed(fault.address, 1) {""",
-     """    match inner.space.ensure_committed(region.start, region.len) {""",
+    ("mem-A20", "A", "the retry record goes back to one address, so two in a granule loop", PAGER,
+     """    let granule = fault.address - fault.address % inner.granule.max(1);
+    let repeated = LAST_ZERO_COMMIT_GRANULE.with(|cell| cell.replace(granule)) == granule;""",
+     """    let granule = fault.address;
+    let repeated = LAST_ZERO_COMMIT_GRANULE.with(|cell| cell.replace(granule)) == granule;""",
+     MEM_AND_CPU),
+
+    ("mem-A21", "A", "the streak bound removed, so a cycle of distinct granules never terminates",
+     PAGER,
+     """    let exhausted = repeated || streak > MAX_ZERO_COMMIT_STREAK;""",
+     """    let exhausted = repeated;""",
+     MEM_AND_CPU),
+
+    ("mem-A22", "A", "examined stops counting the outcome, so declined > examined again", PAGER,
+     """        self.examined.fetch_add(1, Ordering::Relaxed);
+        match outcome {""",
+     """        if !matches!(outcome, FaultOutcome::NotOurs) {
+            self.examined.fetch_add(1, Ordering::Relaxed);
+        }
+        match outcome {""",
+     MEM_AND_CPU),
+
+    ("mem-A23", "A", "the pager invents an access length it was never told", PAGER,
+     """    match crate::access::admit(&inner.space, fault.address, 1, fault.access) {""",
+     """    match crate::access::admit(&inner.space, fault.address, usize::MAX, fault.access) {""",
+     MEM_AND_CPU),
+
+    ("mem-B8", "B", "the retry bound tightened to one zero-commit per thread for all time", PAGER,
+     """const MAX_ZERO_COMMIT_STREAK: u32 = 1024;""",
+     """const MAX_ZERO_COMMIT_STREAK: u32 = 1;""",
      MEM_AND_CPU),
     # ---- .eh_frame: the function map M2's whole choice of code rests on -------------------------
     # ---- C1: the handler slot is drained, not merely cleared -------------------------------------

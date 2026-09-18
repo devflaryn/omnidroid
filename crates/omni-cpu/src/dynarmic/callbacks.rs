@@ -43,12 +43,23 @@ impl CpuCtx {
         if address % 4 != 0 {
             return None;
         }
+        // `committed` is load-bearing and used to be written `true` and never read. The cache exists
+        // so that translating a run of instructions in one function does not take the space's lock
+        // once per instruction — but skipping `resolve` also skips `ensure_committed`, and that is
+        // only harmless when there is nothing left to commit. For a lazily-committed anonymous
+        // executable region larger than the commit granule it is not: the read below would touch an
+        // uncommitted page from *Rust*, where dynarmic's frame-based handler does not reach, leaving
+        // only the demand pager — which `owns_guest_paging()` may report absent. So a region that is
+        // not fully committed is re-resolved on every fetch, which is correct and slower, and a fully
+        // committed one keeps the fast path.
         let cached = self
             .executable_cache
-            .is_some_and(|(start, end, _)| address >= start && address + 4 <= end);
+            .is_some_and(|(start, end, committed)| {
+                committed && address >= start && address + 4 <= end
+            });
         if !cached {
-            let (start, end) = self.resolve(address, 4, Protection::ReadExecute)?;
-            self.executable_cache = Some((start, end, true));
+            let (start, end, committed) = self.resolve(address, 4, Protection::ReadExecute)?;
+            self.executable_cache = Some((start, end, committed));
         }
         // SAFETY: `resolve` established that `[address, address + 4)` lies inside a mapped,
         // executable region of this guest space, and committed it if the mapping was lazy. D4's

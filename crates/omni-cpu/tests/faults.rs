@@ -194,6 +194,9 @@ fn the_vectored_handler_takes_a_guest_fault_before_dynarmic_does() {
     }
 
     let after = guest.backend.pager_stats().expect("pager stats");
+    // `PagerStats`'s invariant, checked where it is cheapest to check: every guest thread has
+    // been joined, so nothing can be mid-handler and the counters are quiescent.
+    assert!(after.is_consistent(), "examined == resolved + declined; got {after:?}");
     let host_after = fault::stats();
     let resolved = after.resolved - before.resolved;
     assert!(
@@ -255,6 +258,9 @@ fn the_pager_declines_faults_outside_its_own_address_space() {
     );
 
     let after = guest.backend.pager_stats().expect("pager stats");
+    // `PagerStats`'s invariant, checked where it is cheapest to check: every guest thread has
+    // been joined, so nothing can be mid-handler and the counters are quiescent.
+    assert!(after.is_consistent(), "examined == resolved + declined; got {after:?}");
     assert_eq!(
         after.examined, before.examined,
         "an address outside the guest space must be declined before the pager even examines it"
@@ -362,6 +368,9 @@ fn several_guest_threads_can_fault_at_the_same_time() {
     }
 
     let after = guest.backend.pager_stats().expect("pager stats");
+    // `PagerStats`'s invariant, checked where it is cheapest to check: every guest thread has
+    // been joined, so nothing can be mid-handler and the counters are quiescent.
+    assert!(after.is_consistent(), "examined == resolved + declined; got {after:?}");
     let resolved = after.resolved - before.resolved;
     let examined = after.examined - before.examined;
     assert!(resolved >= 1, "the pager must have served these faults; it resolved {resolved}");
@@ -375,5 +384,102 @@ fn several_guest_threads_can_fault_at_the_same_time() {
          {examined} faults examined, {resolved} resolved, {} bytes committed, 0 dynarmic \
          slow-path entries on every thread",
         after.bytes_committed - before.bytes_committed
+    );
+}
+
+/// **M5: the instruction-fetch cache may not short-circuit a commit that has not happened.**
+///
+/// `CpuCtx::fetch` caches the region a fetch resolved to, so translating a run of instructions in one
+/// function does not take the space's lock once per instruction. Skipping `resolve` also skips
+/// `ensure_committed`, and that is only harmless while there is nothing left to commit. For a
+/// **lazily-committed anonymous executable** region larger than the commit granule it is not: the
+/// fetch reads the instruction from Rust, at an address the region map says is mapped and the OS says
+/// is not committed.
+///
+/// What made it a real hazard rather than a slow path is *who catches that*. It is a fault inside
+/// Rust, not inside generated code, so dynarmic's frame-based handler — which only covers its own
+/// code cache — is not in the picture at all. The only thing that can resolve it is Omnidroid's
+/// vectored handler, and `owns_guest_paging()` is allowed to be `false` (Linux, macOS, or a full
+/// handler table). On such a platform this is a crash rather than a commit.
+///
+/// The third element of the cached tuple was written `true` and never read, which is how it survived
+/// two reviews.
+///
+/// The measurement is the pager's own counter: with the cache gated on commitment, the fetch commits
+/// the granule itself and **no fault happens at all**. With the gate missing, the granule is
+/// committed by the fault handler instead, and `examined` moves. Both produce the same guest-visible
+/// exit, which is exactly why a test that only looked at the exit could not see this.
+#[test]
+fn an_instruction_fetch_commits_its_own_granule_rather_than_faulting_for_it() {
+    use omni_mem::{CommitPolicy, Placement, Protection};
+
+    let guest = Guest::new();
+    let granule = guest.space.commit_granule();
+
+    // Four granules, lazily committed, so the region is never "fully committed" and the fetch cache
+    // must keep asking.
+    let code = guest
+        .space
+        .map_anonymous(
+            Placement::Anywhere { align: guest.space.page_size() },
+            4 * granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a lazily-committed region to put code in");
+
+    // The first granule is committed because the program is written into it. The third is not, and
+    // that is where the guest branches.
+    let target = code + 2 * granule;
+    let hop = i32::try_from((target - code) / 4).expect("a branch offset in range");
+    guest.space.ensure_committed(code, 4).expect("commit the first granule");
+    let ptr = guest.space.ptr(code, 4).expect("a host pointer for the first instruction");
+    // SAFETY: the range was just committed `ReadWrite` and identity mapping (D4) makes the guest
+    // address a host address. No guest thread is running.
+    unsafe { ptr.cast::<u32>().write_unaligned(b(hop)) };
+    guest
+        .space
+        .protect(code, 4 * granule, Protection::ReadExecute)
+        .expect("a lazy mapping records a protection for granules it has not committed yet");
+
+    let region = guest.space.region_at(target).expect("the region covers the branch target");
+    assert!(
+        !region.is_committed(),
+        "the branch target's region must still be partly uncommitted, or there is nothing for the \
+         fetch to commit and this test measures nothing"
+    );
+
+    let before = guest.backend.pager_stats().expect("this backend owns guest paging");
+    let (mut cpu, sentinel) = guest.thread();
+    cpu.set_x(x(30), sentinel as u64);
+    let exit = cpu.run(code, RunLimit::Unlimited).expect("a branch into zeroed memory is an exit");
+    let after = guest.backend.pager_stats().expect("this backend owns guest paging");
+
+    // Zeroed memory is `UDF #0`, which is the honest outcome: the guest branched somewhere with no
+    // code in it.
+    match exit {
+        ExitReason::UnsupportedInstruction { pc, encoding } => {
+            assert_eq!(pc, target, "the exit must name the address the guest branched to");
+            assert_eq!(encoding, 0, "a freshly committed granule reads back as zeroes");
+        }
+        other => panic!("expected the zeroed granule to decode as an unallocated encoding: {other}"),
+    }
+
+    assert_eq!(
+        after.examined - before.examined,
+        0,
+        "the fetch took {} page fault(s) to read an instruction from a granule it could have \
+         committed itself. That works here only because this backend owns guest paging; where it \
+         does not, the same read is an unhandled access violation inside Rust, which dynarmic's \
+         frame-based handler does not cover",
+        after.examined - before.examined
+    );
+    assert!(
+        after.is_consistent(),
+        "PagerStats invariant: examined == resolved + declined. Got {after:?}"
+    );
+    assert!(
+        guest.space.region_at(target).is_some_and(|r| r.committed >= granule),
+        "and the granule really was committed, by the fetch"
     );
 }
