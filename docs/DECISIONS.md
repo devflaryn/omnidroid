@@ -432,7 +432,7 @@ The window is what keeps a `DT_TEXTREL` binary — or a tampered one aiming relo
 justification is the adversarial case and not the stock one, and this entry previously implied
 otherwise.
 
-**Measured end to end, for the record.** Loading `libroblox.so` costs **+16.668 MiB** of commit charge,
+**Measured end to end, for the record.** Loading `libroblox.so` costs **about +16.7 MiB** of commit charge,
 peak and steady, of which 11.039 MiB is `.bss` committed eagerly, 4.965 MiB is the relro region after
 relocation and 0.328 MiB is `.data`. The 103,649,280 bytes of text and rodata cost nothing and are
 shared. Load wall-time is 11.8 ms in release. Four load/unload cycles return commit charge to baseline
@@ -685,7 +685,7 @@ Why eager, for now:
   because untouched committed pages are never faulted in; only the commit *charge* is taken up front.
   That is the less harmful half of the cost.
 
-The lazy path is implemented and measured at **+5.395 MiB** — roughly 6 MiB per instance cheaper — and
+The lazy path is implemented and measures **around +5.4 MiB** — roughly 11 MiB per instance cheaper — and
 is one field away.
 
 **This exception expires when a commit driver lands.** Once the CPU backend is executing guest code

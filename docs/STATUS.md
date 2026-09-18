@@ -81,7 +81,6 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
 | `omni-elf` — loader: map, relocate, resolve, seal | **Pending final review.** Milestone **M1** |
-| `omni-elf` — the loader: map, relocate, resolve, RELRO, `init_array`, `dl_iterate_phdr` state | **Done, pending review.** 129 tests across the crate, 251 workspace-wide. Milestone **M1** |
 | `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
 | `omni-cpu`, `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
@@ -97,12 +96,11 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | JIT arena | Dual-mapped, W+X unrepresentable in the API; a child process storing through the execute pointer dies with `0xC0000005` |
 | Partial unmap | Copy-on-write content preserved in survivors, verified in the loader's exact relocation shape; sharing preserved at +0.008 MiB across a partial unmap of a clean 8 MiB view |
 | CoW charging | Charged at `protect` time, not write time: +8.020 MiB the instant an 8 MiB view becomes writable, refunded on restore |
-| **`libroblox.so` loaded, per instance** | **+16.7 MiB** commit (11.04 `.bss` + 4.97 RELRO + 0.33 `.data`); **104.14 MiB stays file-backed and shared**; peak equals steady, so windowed relocation produces no spike |
-| **Three concurrent instances** | **+50.270 MiB total** (16.757 MiB each), 312.422 MiB mapped file-backed. Marginal cost asserted per instance, so sharing cannot be first-instance-only or decay with count |
+| **`libroblox.so` loaded, per instance** | ~16.7 MiB commit per instance (≈11 `.bss` + ≈5 RELRO + ≈0.3 `.data` + page tables), against ~104 MiB mapped file-backed and shared. Peak equals steady, so windowed relocation produces no transient spike. **What is pinned by assertion: steady ≤ 20 MiB and \|peak − steady\| ≤ 1 MiB.** The component figures vary by fractions of a MiB between runs and are indicative, not exact |
+| **Three concurrent instances** | ~50 MiB total, ~16.7 MiB each, ~312 MiB mapped file-backed. **Each instance's marginal cost is asserted separately**, so sharing cannot be first-instance-only nor decay with instance count; anything privatising more than ~3.3 MiB per instance fails the test |
 | Load wall-time | 11.8 ms release for a 109 MB library |
 | `libroblox.so` extraction | 413 ms once (release), 130 us on a cache hit |
 | `libroblox.so` load, end to end | **11.8 ms** release / 77.5 ms debug: map 32 us, bind 1,109 symbols 83 us, relocate 568,806 in 171 windows 11.7 ms, protect 13 us |
-| `libroblox.so` loaded, commit charge | **+16.668 MiB** steady **and peak**, against 104.141 MiB mapped file-backed and shared. 11.039 `.bss` + 4.965 RELRO + 0.328 `.data` + page tables. With lazy `.bss`, +5.602 MiB |
 | Relocation window | 64 KiB, equal to the commit granule. Transient copy-on-write charge 5.285 MiB, all of it the RELRO region becoming private anyway. 4 KiB costs 9 ms more for no saving; past 64 KiB the curve is flat |
 | Loader hostile input | 21 tamper cases each refused with a typed error and zero residue, plus 920 single-byte corruptions of a synthetic library: 447 loaded, 473 refused, 0 panics, 0 leaks, 1.8 s |
 | Loader mutation testing | 18 mutations of the loader logic, 15 reverting it and 3 over-correcting it; every one caught by at least one test |
@@ -126,7 +124,7 @@ than over-unmapping, and emulation (unmap the view, re-map the survivors) is owe
 | Milestone | Status |
 |---|---|
 | M0 APK parsed, libraries extracted to aligned cache | **Reached.** All 11 ARM64 libraries extracted into the content-addressed 4 KB-aligned cache and then mapped from it, end to end |
-| M1 ELF loaded, all 568,806 relocations applied, symbols resolved | **Reached.** 568,806 relocations applied and read back from mapped memory, RELRO sealed over 5,205,568 bytes, 565 imports enumerated and attributed, 3,594 initializers collected. 16.668 MiB of commit charge per instance |
+| M1 ELF loaded, all 568,806 relocations applied, symbols resolved | **Reached.** 568,806 relocations applied and read back from mapped memory, RELRO sealed over 5,205,568 bytes, 565 imports enumerated and attributed, 3,594 initializers collected. ~16.7 MiB commit per instance (≈11 `.bss` + ≈5 RELRO + ≈0.3 `.data` + page tables), against ~104 MiB mapped file-backed and shared |
 | M2 ARM64 function from `libroblox.so` executes | Not started |
 | M3 All 3,594 initializers complete | Not started |
 | M4 `JNI_OnLoad` succeeds | Not started |
@@ -141,3 +139,18 @@ None blocking. Both D5 (CPU backend) and D7 (JNI without a JVM) are resolved.
 
 | # | Decision | Blocked on |
 |---|---|---|
+
+## A note on the numbers in this document
+
+Figures here are **indicative unless stated as pinned**. Commit-charge measurements vary between runs
+by fractions of a MiB — page-table overhead, allocator state and measurement timing all move them —
+so quoting them to three decimal places implies a precision that does not exist.
+
+This was not a hypothetical concern: an earlier revision of this file recorded lazy `.bss` at
++5.602 MiB while `DECISIONS.md` recorded +5.395 MiB and a fresh release run produced +5.363 MiB.
+Three values, two documents, all written to three decimals, **none of them asserted by any test**.
+The whole-branch review caught it, and it is exactly the failure this project's discipline exists to
+prevent: a documented number being read later as a measured fact.
+
+The rule applied here: quote approximate values in prose, and state separately what is actually
+**pinned by an assertion**, because only the pinned values will still be true after the next change.
