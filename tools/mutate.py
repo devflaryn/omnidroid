@@ -33,11 +33,15 @@ import time
 PLAT = "crates/omni-platform/src/vm/mod.rs"
 SPACE = "crates/omni-mem/src/space.rs"
 ARENA = "crates/omni-mem/src/arena.rs"
+BUDGET = "crates/omni-mem/src/budget.rs"
 LOADER = "crates/omni-elf/src/loader/mod.rs"
 ZIP = "crates/omni-apk/src/zip.rs"
+CPU_CONTEXT = "crates/omni-cpu/src/context.rs"
+CPU_REGS = "crates/omni-cpu/src/regs.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
+CPU = ["cargo", "test", "-p", "omni-cpu", "--no-fail-fast"]
 PLATFORM = ["cargo", "test", "-p", "omni-platform", "--no-fail-fast"]
 ELF = ["cargo", "test", "-p", "omni-elf", "--no-fail-fast"]
 APK = ["cargo", "test", "-p", "omni-apk", "--no-fail-fast"]
@@ -132,6 +136,72 @@ MUTATIONS = [
      """        if config.block_alignment > config.chunk_size {""",
      """        if false && config.block_alignment > config.chunk_size {""",
      MEM),
+
+    # ---- the arena's sealed pages, and the budget that instruments what the OS counter cannot see -
+    # `CodeArena::write` is a *safe* function that stores through the writable view, and `seal` makes
+    # that view PAGE_READONLY. Reverting the check does not make a test fail politely: it kills the
+    # test process with an access violation, which is exactly the point — that is what safe code
+    # could reach before it existed.
+    ("mem-A11", "A", "the sealed-page check removed, so a safe write faults the process", ARENA,
+     """        if self.sealed_pages.load(Ordering::Acquire) != 0 {""",
+     """        if false && self.sealed_pages.load(Ordering::Relaxed) != 0 {""",
+     MEM),
+
+    ("mem-A12", "A", "the budget stops adding the arena's invisible commit to the total", BUDGET,
+     """        self.process_private + self.arena_mapped as u64""",
+     """        self.process_private""",
+     MEM),
+
+    ("mem-A13", "A", "the budget reports nothing as invisible to the process counter", BUDGET,
+     """    pub fn invisible_to_process_counter(&self) -> usize {
+        self.arena_mapped
+    }""",
+     """    pub fn invisible_to_process_counter(&self) -> usize {
+        0
+    }""",
+     MEM),
+
+    # Direction B for the arena, and the reason chunking exists at all. A pagefile-backed section is
+    # charged against the system commit limit when it is *created* (D15), so an arena that maps its
+    # whole 256 MiB ceiling up front is correct in every functional sense and thirty-two times more
+    # expensive for the 8 MiB of code that was actually emitted.
+    ("mem-B4", "B", "the arena maps its whole ceiling up front instead of growing a chunk at a time",
+     ARENA,
+     """pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;""",
+     """pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024 * 1024;""",
+     MEM),
+
+    # Direction B for the sealed-page fix itself: a refusal that goes too far. Every hostile-input
+    # test still passes — more of them pass, in fact — and the arena can never patch a block again,
+    # which is the one thing a JIT must be able to do on invalidation.
+    ("mem-B5", "B", "unseal leaves the pages marked sealed, so no block can ever be patched", ARENA,
+     """        let changed = chunk.set_sealed(pages, protection == Protection::Read);""",
+     """        let changed = chunk.set_sealed(pages, true);""",
+     MEM),
+
+    # ---- the CPU seam ----------------------------------------------------------------------------
+    # D13: 1,276 of libroblox.so's 1,282 MRS TPIDR_EL0 instructions load [Xt, #0x28], and the first
+    # runs before the first static initializer. A thread that can be created without a thread pointer
+    # is a thread that crashes inexplicably later.
+    ("cpu-A1", "A", "a guest thread may be created with a null TPIDR_EL0 again", CPU_CONTEXT,
+     """        if tpidr_el0 == 0 {""",
+     """        if false && tpidr_el0 == 0 {""",
+     CPU),
+
+    ("cpu-A2", "A", "X31 becomes a general-purpose register again", CPU_REGS,
+     """        if index as usize >= Self::COUNT {
+            return Err(CpuError::NoSuchRegister { class: "X", index: index as u32, count: 31 });""",
+     """        if index as usize > Self::COUNT {
+            return Err(CpuError::NoSuchRegister { class: "X", index: index as u32, count: 31 });""",
+     CPU),
+
+    # Direction B for the thread-pointer check: a stricter rule that is not required by anything.
+    # bionic's TLS block is not page-aligned in general, so this refuses legitimate threads while
+    # every "hostile input is rejected" assertion keeps passing.
+    ("cpu-B1", "B", "the thread pointer is additionally required to be page-aligned", CPU_CONTEXT,
+     """        if tpidr_el0 == 0 {""",
+     """        if tpidr_el0 == 0 || tpidr_el0 % 4096 != 0 {""",
+     CPU),
 
     # ---- the guest space's other edges -----------------------------------------------------------
     ("mem-A10", "A", "an alignment larger than the space accepted again", SPACE,

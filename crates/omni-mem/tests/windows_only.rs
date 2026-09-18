@@ -23,7 +23,16 @@ use std::path::{Path, PathBuf};
 const WINDOWS_ONLY: [&str; 3] = ["arena.rs", "commit_charge.rs", "space.rs"];
 
 /// Test files in this crate that are *not* gated, and so really do run everywhere.
-const PORTABLE: [&str; 2] = ["config.rs", "windows_only.rs"];
+///
+/// `arena_execution.rs` is in this list rather than the one above although it can only *execute* on
+/// Windows x86-64: it gates at the item level instead of the file level, precisely so that it still
+/// compiles everywhere and reports a named `#[ignore]`d test with the reason attached. That is the
+/// shape this whole file argues for — a skip that appears where a pass would — so it is checked
+/// below rather than merely permitted.
+const PORTABLE: [&str; 3] = ["arena_execution.rs", "config.rs", "windows_only.rs"];
+
+/// Files that gate at the item level and must therefore announce their skip.
+const ITEM_GATED: [&str; 1] = ["arena_execution.rs"];
 
 const GATE: &str = r#"#![cfg(target_os = "windows")]"#;
 
@@ -55,6 +64,21 @@ fn the_windows_only_list_is_accurate() {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert!(!is_gated(&text), "{name} is listed as portable but carries `{GATE}`");
+    }
+
+    // A file that gates its tests one at a time is fine, and is in fact better than a file-level
+    // gate — but only if it leaves something behind that says so. `#[ignore = "..."]` is printed by
+    // libtest next to the test's name in the default output, which is the whole point; a bare
+    // `#[ignore]` or a `cfg` with nothing behind it is the silent vanishing this file exists about.
+    for name in ITEM_GATED {
+        let path = tests_dir().join(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            text.contains("#[ignore = \""),
+            "{name} gates its tests at the item level but leaves no `#[ignore = \"...\"]` behind, \
+             so on a host it cannot run on it reports nothing at all"
+        );
     }
 
     // And the lists together cover every test file, so a new gated file cannot be added silently.
@@ -92,11 +116,13 @@ fn the_windows_only_suites_did_not_run_on_this_target() {
          They are gated to Windows because omni-platform's unix backend returns\n\
          `Unsupported` from every virtual-memory operation. A green run of this\n\
          workspace on this target does NOT mean the memory layer works here.\n\
+         Also skipped, but visibly, as `ignored` with a reason: {}\n\
          ============================================================================\n",
         WINDOWS_ONLY.len(),
         WINDOWS_ONLY.len() + PORTABLE.len(),
         std::env::consts::OS,
         WINDOWS_ONLY.join(", "),
+        ITEM_GATED.join(", "),
     );
     let _ = std::io::stderr().write_all(notice.as_bytes());
     let _ = std::io::stderr().flush();

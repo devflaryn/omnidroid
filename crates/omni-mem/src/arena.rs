@@ -61,6 +61,13 @@ pub struct ArenaStats {
     pub used: usize,
     /// Bytes lost to block alignment and to the tails of chunks that could not fit the next block.
     pub wasted: usize,
+    /// Bytes of writable view currently sealed, rounded outwards to whole pages.
+    ///
+    /// Reported because sealing is page-granular while the API that requests it is block-granular,
+    /// so the amount actually sealed is not something a caller can work out from the blocks it
+    /// sealed. A translator that seals every 256-byte block on a 4 KiB page seals the page sixteen
+    /// times over and this says so.
+    pub sealed: usize,
 }
 
 /// Identity of a [`CodeArena`], carried by every [`CodeBlock`] it mints.
@@ -164,6 +171,47 @@ struct Chunk {
     exec: usize,
     len: usize,
     used: usize,
+    /// One bit per page of the writable view: set when the page is sealed.
+    ///
+    /// A bitmap rather than a set of ranges because sealing is page-granular at the OS and mirroring
+    /// it exactly is the only representation that cannot drift from it: sealing two blocks that
+    /// share a page sets the same bit twice, and unsealing either clears it, which is precisely what
+    /// `VirtualProtect` does to the page. A 1 MiB chunk of 4 KiB pages needs 256 bits — four `u64`s.
+    sealed: Vec<u64>,
+}
+
+impl Chunk {
+    /// Page indices `[address, address + len)` covers, clamped to this chunk.
+    fn pages(&self, page: usize, address: usize, len: usize) -> core::ops::Range<usize> {
+        let start = address.max(self.write);
+        let end = address.saturating_add(len).min(self.write + self.len);
+        if end <= start {
+            return 0..0;
+        }
+        ((start - self.write) / page)..((end - 1 - self.write) / page + 1)
+    }
+
+    /// Mark pages sealed or unsealed. Returns how many pages actually changed state, which is what
+    /// keeps the arena-level counter — and therefore [`CodeArena::write`]'s lock-free fast path —
+    /// exact rather than approximate.
+    fn set_sealed(&mut self, pages: core::ops::Range<usize>, sealed: bool) -> isize {
+        let mut changed = 0isize;
+        for index in pages {
+            let (word, bit) = (index / 64, 1u64 << (index % 64));
+            let was = self.sealed[word] & bit != 0;
+            if was == sealed {
+                continue;
+            }
+            self.sealed[word] ^= bit;
+            changed += if sealed { 1 } else { -1 };
+        }
+        changed
+    }
+
+    /// Whether any page in the range is sealed. Returns the first one that is.
+    fn first_sealed(&self, pages: core::ops::Range<usize>) -> Option<usize> {
+        pages.into_iter().find(|index| self.sealed[index / 64] & (1u64 << (index % 64)) != 0)
+    }
 }
 
 /// A dual-mapped arena for emitted code.
@@ -194,12 +242,22 @@ struct Chunk {
 /// # Thread safety
 ///
 /// `Send + Sync`. [`alloc`](CodeArena::alloc) takes a short lock; writing into a block afterwards
-/// takes none, because a block is a private range of memory that no other allocation can overlap.
+/// takes none, because a block is a private range of memory that no other allocation can overlap —
+/// unless something in this arena has been [`seal`](CodeArena::seal)ed, in which case
+/// [`write`](CodeArena::write) takes the lock long enough to refuse a store to a read-only page.
+/// An arena that only ever emits never pays for that.
 pub struct CodeArena {
     id: ArenaId,
     config: ArenaConfig,
     page: usize,
     granularity: usize,
+    /// How many pages across all chunks are sealed.
+    ///
+    /// It exists so that [`write`](CodeArena::write) can stay lock-free while nothing is sealed,
+    /// which is the state a translator emitting a fresh block is always in. Only when something has
+    /// been sealed does `write` take the lock to find out whether this write is the one that would
+    /// have faulted.
+    sealed_pages: AtomicU64,
     inner: Mutex<Vec<Chunk>>,
 }
 
@@ -259,6 +317,7 @@ impl CodeArena {
             config,
             page: vm::page_size(),
             granularity: vm::allocation_granularity(),
+            sealed_pages: AtomicU64::new(0),
             inner: Mutex::new(Vec::new()),
         })
     }
@@ -341,13 +400,26 @@ impl CodeArena {
     /// block belongs to this arena — checked — and because the bounds are checked against the block,
     /// which is memory the arena owns and never hands out twice.
     ///
-    /// Takes no lock: the identity check is a field comparison, and a block of *this* arena always
-    /// names memory this arena has mapped for as long as it lives.
+    /// Takes no lock while nothing in the arena is sealed: the identity check is a field comparison,
+    /// and a block of *this* arena always names memory this arena has mapped for as long as it
+    /// lives. Once anything has been sealed it takes the lock for long enough to refuse a write to a
+    /// sealed page — see [`MemError::BlockSealed`] for why that check has to exist.
     ///
     /// # Errors
     ///
-    /// [`MemError::ForeignBlock`] if the block was minted by a different arena, or
-    /// [`MemError::BlockOverflow`] if the write would run past the end of the block.
+    /// [`MemError::ForeignBlock`] if the block was minted by a different arena,
+    /// [`MemError::BlockOverflow`] if the write would run past the end of the block, or
+    /// [`MemError::BlockSealed`] if any page it would touch is sealed.
+    ///
+    /// # What the sealed check does and does not promise
+    ///
+    /// It is exact for one thread, and for the arena-per-guest-thread shape D5 describes. It is a
+    /// check, not a lock held across the store: another thread that seals a page-mate *between* this
+    /// check and the store below still produces a fault. That window is not new and is not closable
+    /// here — the whole design of `write` is that it does not hold the arena lock while copying —
+    /// and it is the same class of problem as two threads emitting into the same block, which this
+    /// type has always left to the translator to sequence. What the check removes is the case that
+    /// needs no concurrency at all: sealing a block and then writing to it.
     pub fn write(&self, block: &CodeBlock, offset: usize, bytes: &[u8]) -> MemResult<()> {
         self.check_own(block)?;
         if offset > block.len || bytes.len() > block.len - offset {
@@ -359,6 +431,29 @@ impl CodeArena {
         }
         if bytes.is_empty() {
             return Ok(());
+        }
+        // The fast path is the common one: a translator emitting a block has sealed nothing, and
+        // this is one acquire load of a counter that is almost always zero. The slow path is the one
+        // that matters, because the pages really are read-only and this is a *safe* function —
+        // without the check, the `copy_nonoverlapping` below is an access violation reachable from
+        // entirely safe code.
+        if self.sealed_pages.load(Ordering::Acquire) != 0 {
+            let chunks = self.inner.lock();
+            let chunk = chunks.get(block.chunk).ok_or(MemError::BlockOutsideChunk {
+                write: block.write,
+                len: block.len,
+                chunk: block.chunk,
+                chunks: chunks.len(),
+            })?;
+            let pages = chunk.pages(self.page, block.write + offset, bytes.len());
+            if let Some(index) = chunk.first_sealed(pages) {
+                return Err(MemError::BlockSealed {
+                    write: block.write,
+                    offset,
+                    len: bytes.len(),
+                    page: chunk.write + index * self.page,
+                });
+            }
         }
         // SAFETY: `[block.write + offset, + bytes.len())` is inside the block, which is inside the
         // chunk's writable view — checked above — and the arena never hands the same range out
@@ -381,7 +476,9 @@ impl CodeArena {
     ///
     /// Page-granular, and it rounds **outwards**: blocks are 16-byte aligned by default, so several
     /// share a page, and sealing one seals its page-mates. Allocate a block of at least a page if it
-    /// must be sealed independently.
+    /// must be sealed independently. A [`write`](CodeArena::write) to any of those page-mates is
+    /// then refused with [`MemError::BlockSealed`], which names the page so the cause is visible —
+    /// rather than faulting, which is what a safe `write` to a read-only page would otherwise do.
     ///
     /// # Errors
     ///
@@ -418,6 +515,7 @@ impl CodeArena {
             stats.used += chunk.used;
         }
         stats.wasted = stats.mapped - stats.used;
+        stats.sealed = self.sealed_pages.load(Ordering::Acquire) as usize * self.page;
         stats
     }
 
@@ -493,29 +591,38 @@ impl CodeArena {
             "the arena's writable view {write:#x}+{len:#x} overlaps its executable view {exec:#x}"
         );
 
-        Ok(Chunk { _section: section, write, exec, len, used: 0 })
+        let pages = len.div_ceil(self.page);
+        Ok(Chunk {
+            _section: section,
+            write,
+            exec,
+            len,
+            used: 0,
+            sealed: vec![0; pages.div_ceil(64)],
+        })
     }
 
     fn reprotect(&self, block: &CodeBlock, protection: Protection) -> MemResult<()> {
         self.check_own(block)?;
-        let chunks = self.inner.lock();
+        let mut chunks = self.inner.lock();
         // Was `chunks[block.chunk]`, which panicked for an out-of-range index, and then computed
         // `end - start` guarded only by a `debug_assert!` — so in a release build a block whose
         // `write` sat below `chunk.write` underflowed that subtraction into a huge page-aligned
         // length and handed it to `vm::protect`. Both are now refusals. Unreachable for a block this
         // arena minted, which is what `check_own` above establishes; this is the second line.
-        let chunk = chunks.get(block.chunk).ok_or(MemError::BlockOutsideChunk {
+        let count = chunks.len();
+        let chunk = chunks.get_mut(block.chunk).ok_or(MemError::BlockOutsideChunk {
             write: block.write,
             len: block.len,
             chunk: block.chunk,
-            chunks: chunks.len(),
+            chunks: count,
         })?;
         if !block_fits_chunk(block.write, block.len, chunk.write, chunk.len) {
             return Err(MemError::BlockOutsideChunk {
                 write: block.write,
                 len: block.len,
                 chunk: block.chunk,
-                chunks: chunks.len(),
+                chunks: count,
             });
         }
         let start = (block.write & !(self.page - 1)).max(chunk.write);
@@ -526,7 +633,23 @@ impl CodeArena {
         // live for as long as the arena is. The range is only ever the writable view, so this cannot
         // make executable pages writable.
         unsafe { vm::protect(start as *mut u8, end - start, protection) }
-            .map_err(platform("CodeArena::seal", start, end - start))
+            .map_err(platform("CodeArena::seal", start, end - start))?;
+
+        // Record it only after the OS has agreed, so the bitmap never claims a protection the pages
+        // do not have. Page-granular and outward-rounded, exactly as the call above was: a block
+        // that shares a page with another is sealed together with it, and this mirrors that rather
+        // than pretending blocks are independent.
+        let pages = chunk.pages(self.page, start, end - start);
+        let changed = chunk.set_sealed(pages, protection == Protection::Read);
+        if changed != 0 {
+            let magnitude = changed.unsigned_abs() as u64;
+            if changed > 0 {
+                self.sealed_pages.fetch_add(magnitude, Ordering::Release);
+            } else {
+                self.sealed_pages.fetch_sub(magnitude, Ordering::Release);
+            }
+        }
+        Ok(())
     }
 }
 

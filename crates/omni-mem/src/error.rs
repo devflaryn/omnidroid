@@ -306,6 +306,35 @@ pub enum MemError {
         limit: usize,
     },
 
+    /// A write into a code block would have touched a sealed page.
+    ///
+    /// This is a refusal rather than a fault, and the distinction is the whole reason the variant
+    /// exists. [`CodeArena::write`](crate::CodeArena::write) is a **safe** function that stores
+    /// through the writable view; [`CodeArena::seal`](crate::CodeArena::seal) makes that view
+    /// `PAGE_READONLY`. So without this check `let b = a.alloc(64)?; a.seal(&b)?; a.write(&b, 0,
+    /// &code)?` is an access violation reachable from entirely safe code, and an access violation
+    /// cannot be contained by any caller.
+    ///
+    /// It names the page, not just the block, because sealing is **page-granular** while the call
+    /// that requests it is block-granular: with the default 16-byte block alignment, sealing one
+    /// block seals up to 255 of its page-mates, and a translator patching one of *those* is the way
+    /// this is most likely to be hit. Unseal the block that covers `page` first.
+    #[error(
+        "code arena: a write of {len} bytes at offset {offset} into the block at {write:#x} covers \
+         the sealed page {page:#x}; sealing is page-granular, so this block may have been sealed by \
+         a page-mate — unseal it before writing"
+    )]
+    BlockSealed {
+        /// The block's writable address.
+        write: usize,
+        /// Offset within the block the write started at.
+        offset: usize,
+        /// Length of the attempted write.
+        len: usize,
+        /// The first sealed page the write would have touched.
+        page: usize,
+    },
+
     /// A write into a code block ran past its end.
     #[error(
         "code arena: a write of {len} bytes at offset {offset} runs past the end of a \
