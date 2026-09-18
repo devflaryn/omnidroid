@@ -368,6 +368,25 @@ pub struct OdEffectiveConfig {
     pub tpidrro_el0_ptr: u64,
 }
 
+/// Bytes of per-jit state this pin allocates **unconditionally**, whatever the code cache size and
+/// whatever the guest does.
+///
+/// `A64EmitX64` holds `std::array<FastDispatchEntry, fast_dispatch_table_size>` as a member, with
+/// `sizeof(FastDispatchEntry) == 0x10` and `fast_dispatch_table_size == 0x100000` — a flat
+/// **16 MiB**, constructed and value-initialised by the constructor whether or not the
+/// `FastDispatch` optimization is enabled, which Omnidroid disables (D16).
+///
+/// It is a constant rather than a call because it is a property of the *pin*, not of a live jit:
+/// there is no accessor for it and adding one would mean patching the vendored tree. What keeps it
+/// honest is `tests/pin_constants.rs`, which reads the two declarations out of the vendored header
+/// and fails if a re-pin moves either.
+///
+/// This is **not** the whole per-thread cost. The code cache commits incrementally as code is
+/// emitted, and its high-water mark is a private member of `BlockOfCode` that `A64::Jit` does not
+/// expose; that term is bounded above by [`OdConfig::code_cache_size`] and measured from the
+/// outside in `omni-cpu`'s M2 gate.
+pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;
+
 /// Callback-entry counters, maintained by the shim on the jit's own thread.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

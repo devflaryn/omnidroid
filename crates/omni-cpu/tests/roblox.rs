@@ -83,8 +83,11 @@ const BASE64_SEXTET_WORDS: [u32; 26] = [
 /// ```
 ///
 /// The two saturation bounds are not arbitrary and are not read off the run: `0x20c49ba5e353f6` is
-/// **9,223,372,036,854,775**, which is `i64::MAX / 1000` — the largest second-difference whose
-/// millisecond form still fits. `0x1062_4dd3` with a 38-bit arithmetic shift is the standard signed
+/// **9,223,372,036,854,774**, which is `(i64::MAX - 1000) / 1000` — the largest second-difference
+/// whose millisecond form leaves room for the up-to-1000 ms the microsecond term can still add. It
+/// is decoded from the instruction words rather than written down here; see [`seconds_limit`], which
+/// also records that the obvious reading, `i64::MAX / 1000`, is one too large and was this test's
+/// first (wrong) prediction. `0x1062_4dd3` with a 38-bit arithmetic shift is the standard signed
 /// magic-number division by 1000 (Hacker's Delight), which is exact for every `i32`, so the model
 /// below uses Rust's own truncating `/` and is not a transcription of the shift sequence.
 const TIMEVAL_TO_MILLIS: u64 = 0x222_7844;
@@ -862,23 +865,77 @@ fn cold_and_warm_translation_throughput_on_real_roblox_code() {
     }
     let kept = keep.iter().filter(|k| **k).count();
 
-    // Cold: a brand-new context, so every block is translated for the first time.
-    let mut cold_keep = keep.clone();
-    let mut cpu = roblox.thread();
-    let (cold, cold_executed, _) = pass(&roblox, &mut cpu, &entries, &mut cold_keep);
+    // Cold: **n passes, each on a brand-new context**, so every block is translated for the first
+    // time in every sample. The first version of this measurement was n = 1, which is not a
+    // measurement of anything repeatable.
+    const COLD_N: usize = 11;
+    let mut cold_samples = Vec::with_capacity(COLD_N);
+    let mut cold_executed = 0u64;
+    for _ in 0..COLD_N {
+        let mut fresh = roblox.thread();
+        let mut k = keep.to_vec();
+        let (elapsed, executed, _) = pass(&roblox, &mut fresh, &entries, &mut k);
+        cold_executed = executed;
+        cold_samples.push(elapsed);
+    }
+    cold_samples.sort_unstable();
+    let cold = cold_samples[COLD_N / 2];
 
-    // Warm: the same context, so nothing is translated at all.
+    // Warm: one context, run repeatedly, so nothing is translated at all.
     const N: usize = 31;
+    let mut cpu = roblox.thread();
     let mut samples = Vec::with_capacity(N);
     let mut warm_executed = 0u64;
-    for _ in 0..N {
-        let mut k = keep.clone();
+    for _ in 0..N + 1 {
+        let mut k = keep.to_vec();
         let (elapsed, executed, _) = pass(&roblox, &mut cpu, &entries, &mut k);
         warm_executed = executed;
         samples.push(elapsed);
     }
+    // Drop the first, which is this context's cold pass.
+    samples.remove(0);
     samples.sort_unstable();
     let warm = samples[N / 2];
+
+    // **What fraction of the "per call" figure is the call?** The timed region also holds eight
+    // `set_x` calls, `rearm`, and about ten guest instructions of real work, so the per-call number
+    // is an upper bound on the boundary and not the boundary. This measures the harness half of it
+    // directly, by doing everything except the `run`.
+    let mut setup_samples = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        for _ in 0..kept {
+            for r in 0..8u8 {
+                cpu.set_x(x(r), 0x0101_0101_0101_0101u64.wrapping_mul(u64::from(r) + 1));
+            }
+            roblox.rearm(&mut cpu);
+        }
+        setup_samples.push(t.elapsed());
+    }
+    setup_samples.sort_unstable();
+    let setup = setup_samples[N / 2];
+
+    // And how cold translation scales with function length, which is one testable half of the
+    // "short functions are cheaper per instruction" hypothesis: if translation cost were dominated
+    // by a per-function overhead, the short third would be far worse per instruction.
+    let mut by_length: Vec<usize> = (0..entries.len()).filter(|&i| keep[i]).collect();
+    by_length.sort_by_key(|&i| entries[i].1);
+    let third = by_length.len() / 3;
+    let mut thirds = Vec::new();
+    for (name, slice) in [
+        ("shortest third", &by_length[..third]),
+        ("longest third", &by_length[by_length.len() - third..]),
+    ] {
+        let mut only = vec![false; entries.len()];
+        for &i in slice {
+            only[i] = true;
+        }
+        let mut fresh = roblox.thread();
+        let mut k = only.clone();
+        let (elapsed, executed, _) = pass(&roblox, &mut fresh, &entries, &mut k);
+        let bytes: u64 = slice.iter().map(|&i| entries[i].1).sum();
+        thirds.push((name, elapsed, executed, bytes, slice.len()));
+    }
 
     let m = |insns: u64, d: Duration| insns as f64 / d.as_secs_f64() / 1e6;
     println!(
@@ -887,19 +944,23 @@ fn cold_and_warm_translation_throughput_on_real_roblox_code() {
         cold_executed as f64 / kept as f64
     );
     println!(
-        "  cold (n = 1 pass, every block translated) : {:8.3} ms, {:8.3} Mguest-insn/s",
+        "  cold (n = {COLD_N} passes, median, a fresh context each time) : {:8.3} ms, \
+         {:8.3} Mguest-insn/s  [{:7.3} .. {:7.3}]",
         cold.as_secs_f64() * 1e3,
-        m(cold_executed, cold)
+        m(cold_executed, cold),
+        cold_samples[0].as_secs_f64() * 1e3,
+        cold_samples[COLD_N - 1].as_secs_f64() * 1e3,
     );
     println!(
-        "  warm (n = {N} passes, median, no translation) : {:8.3} ms, {:8.1} Mguest-insn/s",
+        "  warm (n = {N} passes, median, no translation)                : {:8.3} ms, \
+         {:8.1} Mguest-insn/s",
         warm.as_secs_f64() * 1e3,
         m(warm_executed, warm)
     );
     let translation = cold.saturating_sub(warm);
     println!(
-        "  translation alone (cold - warm)           : {:8.3} ms for {cold_executed} guest \
-         instructions, {:8.3} Mguest-insn/s",
+        "  translation alone (cold - warm)                             : {:8.3} ms for \
+         {cold_executed} guest instructions, {:8.3} Mguest-insn/s",
         translation.as_secs_f64() * 1e3,
         m(cold_executed, translation)
     );
@@ -910,12 +971,36 @@ fn cold_and_warm_translation_throughput_on_real_roblox_code() {
     );
     // The warm figure is NOT a steady-state translated-code throughput and must not be read as
     // one. The average function here is ten instructions long, so a warm pass is 870 entries to
-    // and exits from `od_jit_run` around 8,679 instructions of work: it measures the *call*, not
-    // the code. Saying so with the number attached is the point.
+    // and exits from `od_jit_run` around 8,679 instructions of work. And even *that* is an upper
+    // bound on the boundary, because the timed region also holds the register setup measured
+    // above.
+    let per_call_ns = warm.as_secs_f64() * 1e9 / kept as f64;
+    let setup_ns = setup.as_secs_f64() * 1e9 / kept as f64;
     println!(
-        "  warm per call: {:6.1} ns for {:.2} guest instructions -- so the warm figure above is          dominated by the run-loop and dispatcher round trip, not by translated code",
-        warm.as_secs_f64() * 1e9 / kept as f64,
-        cold_executed as f64 / kept as f64
+        "  warm per iteration: {per_call_ns:6.1} ns, of which {setup_ns:5.1} ns is 8 set_x plus \
+         rearm, leaving {:5.1} ns for the run loop, the dispatcher round trip AND ~{:.0} guest \
+         instructions -- so THAT is the upper bound on the call boundary itself, not the {:.1} ns",
+        per_call_ns - setup_ns,
+        cold_executed as f64 / kept as f64,
+        per_call_ns,
+    );
+    println!("  cold translation against function length (n = 1 pass each, fresh context):");
+    for (name, elapsed, executed, bytes, count) in &thirds {
+        println!(
+            "    {name:<15} {count:>4} functions, {:>6} body bytes, {executed:>6} insns : \
+             {:8.3} ms, {:7.3} Mguest-insn/s",
+            bytes,
+            elapsed.as_secs_f64() * 1e3,
+            m(*executed, *elapsed)
+        );
+    }
+    println!(
+        "    If translation were dominated by a per-function overhead the shortest third would be \
+         far worse per instruction. **The causal claim in the report -- that short functions \
+         translate faster per instruction than loop bodies because the IR optimizer has less to \
+         work over -- is a HYPOTHESIS these figures are consistent with, not one they establish.** \
+         Testing it properly means instrumenting dynarmic's optimization passes, or translating the \
+         same instruction count as a loop and as straight-line code in this harness."
     );
     println!(
         "  callback-path entries across every pass: {} (D4 says this must be 0 for code that \
