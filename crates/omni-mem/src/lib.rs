@@ -58,6 +58,7 @@ mod backing;
 mod budget;
 mod entry;
 mod error;
+mod pager;
 mod region;
 mod space;
 
@@ -68,6 +69,7 @@ pub use arena::{
 pub use backing::{Backing, BackingId};
 pub use budget::CommitBudget;
 pub use error::{MemError, MemResult};
+pub use pager::{DemandPager, PagerStats};
 pub use region::{RegionInfo, RegionKind};
 pub use space::{
     CommitPolicy, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId, Placement, Reclaimed,

@@ -15,6 +15,10 @@
 //!   splitting and file-backed mapping. Implemented and measured on Windows; structural on Linux
 //!   and macOS, where every operation returns a typed
 //!   [`Unsupported`](vm::VmError::Unsupported) error.
+//! * [`fault`] — guest memory faults: one process-wide **vectored** exception handler, so that
+//!   Omnidroid sees an access violation in JIT-generated guest code before dynarmic's frame-based
+//!   SEH does. D4 verified the ordering (`veh_hits = 1`, dynarmic's slow path never entered) and
+//!   D10 requires it, because whoever handles the fault owns guest demand paging.
 //!
 //! Threads, clocks, dynamic loading and windowing will arrive as sibling modules in later tasks.
 //!
@@ -28,4 +32,5 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod fault;
 pub mod vm;
