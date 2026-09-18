@@ -434,6 +434,56 @@ fn inline_dispatch_works_through_a_plt_stub_bound_to_the_thunk() {
     assert_eq!(cpu.x(x(16)), got_slot as u64, "and left the slot address in X16");
 }
 
+/// **Inline dispatch must not create a guest shape the runtime cannot stop.** (Global Constraint 11.)
+///
+/// This is the question D16 exists to answer, asked again about a new terminal. Inline dispatch keeps
+/// the guest inside `od_jit_run` across every import call, so if the `SVC` terminal reached the next
+/// block without checking anything, a guest looping on an imported symbol would ignore both the step
+/// budget and a cross-thread halt — the same trap `PopRSBHint` and `FastDispatchHint` set under
+/// dynarmic's default flags, which is why this backend clears them.
+///
+/// It does not, and the reason is structural rather than lucky: `CheckHalt{PopRSBHint}` with
+/// `ReturnStackBuffer` cleared lands on `ReturnFromRunCode`, which D16 identified as **the only path
+/// that checks both** the halt flag and the cycle counter. So an inline thunk call is one of the few
+/// points in translated code where both escapes are live. Asserted, because "the emitted code happens
+/// to check" is exactly the kind of claim that stops being true on a re-pin.
+#[test]
+fn a_counted_budget_still_stops_a_guest_looping_through_an_inline_thunk() {
+    let _serial = serialized();
+    let guest = Guest::new();
+    let thunk = guest.code + THUNK_AT;
+    // Effectively endless: 2^40 calls is more than any budget here will reach.
+    let entry = guest.load_at(DIRECT_AT, &call_loop(1 << 40, DIRECT_AT, Some(THUNK_AT)));
+
+    let (mut cpu, sentinel) = guest.thread();
+    cpu.add_inline_thunk(thunk, nothing).expect("an inline thunk");
+    rearm(&mut cpu, sentinel);
+
+    const BUDGET: u64 = 50_000;
+    match cpu.run(entry, RunLimit::Instructions(BUDGET)) {
+        Ok(ExitReason::StepLimitReached { executed, .. }) => {
+            assert!(
+                executed >= BUDGET,
+                "the budget must be spent, not merely declared: {executed} of {BUDGET}"
+            );
+        }
+        other => panic!("a counted budget must stop this loop, got {other:?}"),
+    }
+    assert!(
+        cpu.inline_calls() > 0,
+        "the loop must have been going through the inline thunk, or this test bounds nothing"
+    );
+
+    // And a cross-thread halt, which reaches it at the next slice boundary (that is D16's ruling:
+    // the watchdog is the budget, and a halt is honoured between slices).
+    let handle = cpu.halt_handle();
+    handle.request();
+    match cpu.run(entry, RunLimit::Unlimited) {
+        Ok(ExitReason::Halted { .. }) => {}
+        other => panic!("an outstanding halt must be honoured, got {other:?}"),
+    }
+}
+
 /// **The measurement.** Both designs, with and without a representative marshal, plus the PLT-stub
 /// shape, against a baseline that is the same guest loop with the call removed.
 ///
@@ -531,6 +581,18 @@ fn the_thunk_round_trip() {
         measure(|| assert_eq!(run_exiting(&mut cpu, via_stub, sentinel, true), CALLS))
     };
     report("A: exit + marshal, through a real PLT stub", &exiting_via_stub, Some(&baseline));
+
+    // **A repeat of the direct cell, last.** The stub cells came out *faster* than the direct ones
+    // for design A, which is the wrong direction -- the stub is four more guest instructions and an
+    // indirect terminal. Either the stub really helps design A, or the figure depends on where in the
+    // matrix a cell runs. Re-measuring the direct cell at the end is what tells the two apart, and it
+    // costs one more cell.
+    let exiting_marshal_again = {
+        let (mut cpu, sentinel) = guest.thread();
+        cpu.add_thunk(thunk).expect("a thunk");
+        measure(|| assert_eq!(run_exiting(&mut cpu, entry, sentinel, true), CALLS))
+    };
+    report("A: exit + marshal, direct, re-measured last", &exiting_marshal_again, Some(&baseline));
 
     let base = baseline.ns_per_call();
     let a = exiting.ns_per_call() - base;

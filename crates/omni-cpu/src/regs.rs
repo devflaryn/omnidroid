@@ -40,7 +40,7 @@ impl XReg {
     /// [`CpuError::NoSuchRegister`] for 31 or above — see the type's documentation for why 31 in
     /// particular is refused rather than mapped to `XZR` or `SP`.
     pub const fn new(index: u8) -> CpuResult<Self> {
-        if index as usize >= Self::COUNT {
+        if index as usize > Self::COUNT {
             return Err(CpuError::NoSuchRegister { class: "X", index: index as u32, count: 31 });
         }
         Ok(Self(index))

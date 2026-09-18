@@ -1,0 +1,30 @@
+
+running 2 tests
+test one_run_entry_and_exit_alone ... 
+ONE run ENTRY AND EXIT — 200000 per sample, n = 31 samples
+  a one-instruction guest function                 41.88 ns/entry  (min 40.07, max 292.69)
+  (one `set_x`, one `RET`, one entry, one exit. D5 amendment 2's ceiling for the entry alone was 53 ns, derived rather than isolated.)
+
+ok
+test the_thunk_round_trip ... 
+THE THUNK ROUND TRIP — 100000 guest calls per sample, n = 31 samples per cell
+  backend: dynarmic
+  baseline: the same loop, no call at all             0.66 ns/call                  (n = 31: min 0.64, max 1.23)
+  A: exit to Rust per call                           91.25 ns/call   net    90.59   (n = 31: min 89.75, max 100.45)
+  A: exit to Rust, + 8-argument marshal             103.11 ns/call   net   102.45   (n = 31: min 98.05, max 108.78)
+  B: dispatch inside the run loop                    12.56 ns/call   net    11.90   (n = 31: min 11.01, max 16.43)
+  B: dispatch inline, + 8-argument marshal           27.80 ns/call   net    27.14   (n = 31: min 23.73, max 47.42)
+  B: inline + marshal, through a real PLT stub       31.91 ns/call   net    31.26   (n = 31: min 28.46, max 36.16)
+  A: exit + marshal, through a real PLT stub         83.83 ns/call   net    83.18   (n = 31: min 80.91, max 91.96)
+  A: exit + marshal, direct, re-measured last       101.41 ns/call   net   100.75   (n = 31: min 98.24, max 110.93)
+
+  A / B, boundary only                               7.61x
+  A / B, as the loader builds it                     2.66x
+  the 8-argument marshal costs                      11.86 ns in A, 15.24 ns in B
+  the PLT stub in front of the thunk adds            4.12 ns in B, -19.27 ns in A
+  3,594 initializers x one import call each:        0.326 ms in A, 0.043 ms in B
+
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 1.87s
+
