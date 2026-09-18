@@ -746,3 +746,138 @@ is recorded here rather than left for someone to rediscover.
 Cost if wrong: a per-request bound set too tight refuses a legitimate segment, which fails loudly and
 immediately with both the requested and permitted sizes named — the opposite of the silent failure it
 replaced.
+
+---
+
+## D16 — Stopping a runaway guest: which flag set, and what it costs
+**Measured, then independently reproduced.** Guest code is untrusted by construction (D6) and
+`libroblox.so` is a 109 MB binary we do not control, so a guest thread that will not stop itself must
+be stoppable from outside. That is not automatic, and dynarmic's default configuration leaves guest
+shapes that **no** mechanism can stop.
+
+A runaway guest is stopped by one of two host mechanisms: a **cycle budget**, or a **cross-thread
+halt**. Which one works depends on the terminal the guest's loop leaves its block through, and each
+terminal is governed by an optimization flag:
+
+- `LinkBlock` ends a **direct** branch. With `BlockLinking` **clear** it emits `ReturnFromRunCode` and
+  stops there. With it set, it compares the cycle counter when cycle counting is on, and the halt flag
+  when it is off — **one or the other, never both**.
+- `PopRSBHint` and `FastDispatchHint` end an **indirect** branch (`BR`, `BLR`, `RET`). Their handlers
+  compute a location descriptor and jump straight to the next block, reading **neither** the cycle
+  counter nor the halt flag. Clearing `ReturnStackBuffer` and `FastDispatch` routes them to
+  `ReturnFromRunCode` instead.
+- `ReturnFromRunCode` is the **only** path that checks both.
+
+Measured across three guest shapes, three flag sets and three escape configurations — **27 cells, each
+in its own process**:
+
+| Flags | direct-branch loop | indirect-branch loop | budget and halt both armed |
+|---|---|---|---|
+| `0x0000_FFFF` — dynarmic's default | one escape, chosen by cycle counting | **neither** | no |
+| `0x0000_FFF9` — no RSB, no FastDispatch | one escape, chosen by cycle counting | both | indirect shapes only |
+| `0x0000_FFF8` — also no `BlockLinking` | both | both | **yes, every shape** |
+
+**A configuration in which every runaway guest is stoppable does exist: `0x0000_FFF8`.** It costs a
+dispatcher round trip at every block boundary.
+
+Cost, **n=31**, release, on the D2 host:
+
+| Workload | `0xFFFF` | `0xFFF9` | `0xFFF8` |
+|---|---|---|---|
+| no indirect branches, 4-instruction blocks | 0.079 ms | 0.079 ms (1.00x) | 0.561 ms (**7.08x**) |
+| 2 indirect transfers per 12 instructions | 0.217 ms | 0.988 ms (4.56x) | 1.541 ms (7.11x) |
+| 2 indirect transfers per 4 instructions | 0.213 ms | 1.003 ms (4.71x) | 1.581 ms (7.43x) |
+
+**The two costs scale differently, and that is the part to carry forward.** `0xFFF9`'s cost is **per
+indirect transfer** (about 3.9 ns), so it tracks branch mix and is **zero** for a guest with no
+indirect branches. `0xFFF8`'s additional cost is **per basic block**, so it tracks block *length* —
+these workloads use 4-instruction blocks, close to the worst case, so **7x is an upper bound** and real
+code with longer blocks pays less. Neither has been measured against `libroblox.so`.
+
+**The practical consequence for the runtime:** under `0xFFFF` or `0xFFF9` with cycle counting on, a
+cross-thread halt of a direct-branch loop is not ignored forever — it is honoured **when the budget
+expires**. So a watchdog built on **short budget windows works at every flag set**, while one built on
+a cross-thread halt alone does not. Build the watchdog from budgets.
+
+**A footgun in the same code, reachable by accident:** the cycle comparison is **signed**, while the
+budget is a `u64`. Any budget above `i64::MAX` — including the obvious `u64::MAX` for "no limit" —
+reads as already spent, so every block returns to the dispatcher. Results stay correct; throughput
+falls by roughly two orders of magnitude.
+
+Cost if wrong: too permissive a flag set leaves a guest shape that can spin a host thread forever,
+which for a multi-instance runtime is a denial of service. Choosing `0xFFF8` unnecessarily costs up to
+7x on short-block code. The flag set is therefore configuration, not a constant.
+
+Evidence: `crates/dynarmic-sys` tests and report; reproduced independently twice, cost figures agreeing
+to within 7%.
+
+---
+
+## D12 (exception) — W^X does not hold for the translator's code cache
+**Recorded because D12 claims something no longer true everywhere.** D12 states Omnidroid never holds a
+page simultaneously writable and executable, enforced by the dual-mapped JIT arena. That remains true of
+**our** arena. It is **not** true of dynarmic's own code cache.
+
+That cache is a `VirtualAlloc` region in the runtime's address space, committed
+`PAGE_EXECUTE_READWRITE`. Building the pin with `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT=ON` **makes
+upstream's own test suite segfault** on the first A64 test, while `OFF` passes all 202,200 assertions —
+verified by rebuilding upstream's suite both ways. The cost of W^X here is therefore not throughput; it
+is that the component does not run.
+
+**The exposure, stated honestly rather than comfortingly:**
+
+> Under identity mapping there is no guest/host address separation to fall back on — by construction
+> there is one address space — so **the W+X code cache is guest-writable in principle**, with nothing
+> between a guest and it but not knowing where it is. That is ASLR, and ASLR is the only thing.
+>
+> **W^X is a mitigation the identity-mapping bet gives up**, not a property that survives because the
+> guest is boxed in.
+
+This is a previously unrecorded consequence of **D4**, the project's central architectural decision, and
+belongs beside it rather than buried in a build flag.
+
+Mitigations in place, none of which is W^X: the effective configuration reports the state; a test
+asserts it and instructs withdrawal of this exception when it flips; a feature flag lets the next re-pin
+retest; and the build script refuses the option with a reproduction rather than silently producing a
+binary that crashes.
+
+Cost if wrong: a guest able to write the code cache can execute arbitrary host code. The honest position
+is that this is gated by ASLR alone, and fixing it needs either an upstream fix to the no-execute path
+or a backend that never holds W+X pages.
+
+---
+
+## D3 (amendment) — the permissive set also includes BSL-1.0 and PSF-2.0
+D3 required MIT / BSD / Apache-2.0 / ISC / 0BSD. Vendoring dynarmic brought in two licences D3 did not
+name, both permissive, and they arrived because Boost was an **undeclared** dependency.
+
+A full enumeration of the vendored tree found **376 files 0BSD, 214 BSL-1.0, 12 MIT** by SPDX tag, with
+licence files covering ISC/0BSD, MIT, BSD-3-Clause and BSL-1.0, plus a **PSF-2.0** in fmt's
+documentation that the crate's own licence inventory had missed. **No reciprocal licence appears
+anywhere in the tree.**
+
+**BSL-1.0** (Boost, Catch2) is permissive and explicitly **waives the notice requirement for object
+code**, so it asks strictly less of us than MIT. **PSF-2.0** is likewise permissive. Both join the
+permitted set.
+
+The wider lesson: the dependency that brought them in was not declared by the component we adopted, so
+the licence surface was wider than the adoption decision assumed. **Licence enumeration belongs in the
+vendoring step, not in the decision that precedes it.**
+
+---
+
+## D5 (amendment) — risk 3 is worse than recorded, and has a working fix
+D5 recorded that `ExclusiveMonitor` anti-scales 21x from 1 to 16 threads on a global spinlock, with
+`fastmem_exclusive_access` as an **untested** mitigation.
+
+Both halves are now verified on our pin. `LDXR` **leaves the fast path even with fastmem enabled**:
+with `fastmem_exclusive_access` off, a single exclusive load costs 1 slow-path read plus 1 exclusive
+callback — 2 callbacks. With it on, **0**. The counters are deterministic, so a sample size is not
+meaningful here.
+
+The risk therefore compounds exactly as D5 feared, and slightly worse: the engine's atomics leave the
+fast path before contention is even considered. The mitigation works and should be enabled.
+
+The interaction D5 already flagged still stands: declining to advertise LSE atomics via
+`getauxval(AT_HWCAP)` steers the engine onto `LDXR`/`STXR` — straight into this path — so the two must
+be decided together, not separately.
