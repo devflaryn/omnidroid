@@ -168,7 +168,7 @@ struct BuilderInner {
 /// The boundary under construction: slots are allocated here, and bound here.
 ///
 /// Two phases rather than one because the *loader* is what assigns addresses — it asks a
-/// [`SymbolProvider`](omni_elf::loader::SymbolProvider) for each of the 565 imports from `&self`,
+/// [`SymbolProvider`] for each of the 565 imports from `&self`,
 /// while relocating — and dispatch afterwards must take no lock at all. So allocation is behind a
 /// mutex and [`finish`](BoundaryBuilder::finish) hands out an immutable [`Boundary`].
 pub struct BoundaryBuilder {
@@ -484,6 +484,21 @@ impl Boundary {
         let halt = cpu.halt_handle();
         let mut pc = from;
         let mut crossings = 0u64;
+        // **The caller's budget, spent down across crossings rather than handed out afresh to each
+        // one.** Every exit-path crossing returns to Rust and the next `cpu.run` starts a new counted
+        // run, so passing `limit` unchanged would give a guest that crosses N times N times the
+        // allowance the caller asked for — and Global Constraint 11's point is that a bound is only as
+        // trustworthy as its least-validated input. Found by the mutation harness *hanging* rather
+        // than failing: with `Binding::Unbound` mutated to return quietly, a two-instruction guest loop
+        // through the boundary ran for ever under a counted budget.
+        //
+        // Only ever shrinks, so it cannot grow past what the caller passed and cannot reach the value
+        // D16 warns about — `GuestCpu::run` clamps its own slices below `i64::MAX` in any case.
+        let mut remaining = limit;
+        // What the whole run has executed, across every segment. The backend's own
+        // `StepLimitReached` carries one segment's count, and a caller that asked for a budget over
+        // the run wants it over the run.
+        let mut spent = 0u64;
         loop {
             // The containment for a guest that loops through the *exit* path: each crossing returns
             // to Rust, so the backend's own budget never expires. Checked before the run rather than
@@ -499,7 +514,11 @@ impl Boundary {
                     pc,
                 });
             }
-            let exit = cpu.run(pc, limit)?;
+            let exit = cpu.run(pc, remaining)?;
+            // Saturating, because a backend counts at the end of a unit it handles as a whole and may
+            // overshoot its slice. A counter that wrapped here would turn a bounded run into an
+            // unbounded one.
+            spent = spent.saturating_add(cpu.last_run_instructions());
             let site = match exit {
                 ExitReason::Thunk { pc: site } => site,
                 // **A branch into the region that was not a call to a slot's first instruction.**
@@ -524,8 +543,28 @@ impl Boundary {
                         }
                     }));
                 }
+                // **Charged only on the exits that end the run**, so that a terminal exit landing on
+                // the budget's last instruction is reported as what it is. The first version charged
+                // immediately after `cpu.run` and pre-empted whenever the allowance had run out, which
+                // turned a `Returned` into a `StepLimitReached` — and, worse, a `MemoryFault` into one
+                // too, since a fault is *not* resumable and a step limit is, so a caller would have
+                // resumed a faulting guest.
+                ExitReason::StepLimitReached { pc: at, .. } => {
+                    return Ok(ExitReason::StepLimitReached { pc: at, executed: spent })
+                }
                 other => return Ok(other),
             };
+            // Only now, having decided to go round again, is the allowance spent down. A budget that
+            // has run out stops the guest *at the thunk*, unserviced and resumable, which is the
+            // honest stop: servicing the call and then refusing to resume would leave the caller
+            // unable to say what happened.
+            if let RunLimit::Instructions(allowance) = remaining {
+                let left = allowance.saturating_sub(cpu.last_run_instructions());
+                if left == 0 {
+                    return Ok(ExitReason::StepLimitReached { pc: site, executed: spent });
+                }
+                remaining = RunLimit::Instructions(left);
+            }
             crossings += 1;
             // An inline handler that failed left its reason here and deferred. Checked first, because
             // the slot lookup below would otherwise report the symbol as merely unbound.

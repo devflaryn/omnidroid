@@ -670,7 +670,7 @@ pub fn mxcsr_guard_for_measurement(host_mxcsr: u32) -> impl Drop {
 ///
 /// Reads and writes go straight to `JitState`, which is where the A64 emitter keeps guest registers
 /// at every callback boundary, so a write here is what the resumed guest sees. It is the translating
-/// backend's [`ThunkRegs`] and is handed to a handler as a [`ThunkCall`], which is the shape the
+/// backend's [`ThunkRegs`] and is handed to a handler as a [`ThunkCall`](crate::ThunkCall), which is the shape the
 /// compatibility layer is written against — see `crate::thunk` for why that indirection is not
 /// optional.
 pub struct JitRegs<'a> {
@@ -1056,20 +1056,6 @@ impl DynarmicCpu {
         unsafe { od_jit_slow_path_total(self.jit) }
     }
 
-    /// How many guest instructions the most recent [`GuestCpu::run`] executed.
-    ///
-    /// [`ExitReason::StepLimitReached`] carries this already, because a caller bounding untrusted
-    /// code needs it at the moment the bound is hit. Every *other* exit drops it, and that makes
-    /// throughput unmeasurable on any workload that ends by returning — which is every real
-    /// function. So it is kept here as well.
-    ///
-    /// Same caveat as the exit's field: a backend counts at the end of a unit it handles as a
-    /// whole, so this is what really executed and may exceed a budget.
-    #[must_use]
-    pub fn last_run_instructions(&self) -> u64 {
-        self.last_run_instructions
-    }
-
     /// How many run slices were found to have degraded onto the callback path.
     ///
     /// Non-zero only when the invariant is disarmed, since an armed one turns the first violation
@@ -1361,6 +1347,10 @@ impl GuestCpu for DynarmicCpu {
         }
     }
 
+    fn last_run_instructions(&self) -> u64 {
+        self.last_run_instructions
+    }
+
     fn halt_handle(&self) -> HaltHandle {
         self.halt.clone()
     }
@@ -1460,7 +1450,8 @@ impl GuestCpu for DynarmicCpu {
 
     /// # Why this backend can service a thunk without leaving the run loop
     ///
-    /// Because a thunk is a planted `SVC` ([`STOP_SVC`]) and `SVC`'s terminal in dynarmic's A64
+    /// Because a thunk is a planted `SVC` (`STOP_SVC`, this module's own constant) and `SVC`'s
+    /// terminal in dynarmic's A64
     /// frontend is `CheckHalt{PopRSBHint}`. A callback that does **not** raise a halt falls through
     /// `CheckHalt` into `PopRSBHint`, which with `ReturnStackBuffer` cleared —
     /// `optimization::INTERRUPTIBLE`, which this backend sets by default (D16) — emits

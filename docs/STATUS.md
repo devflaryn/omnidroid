@@ -3,7 +3,7 @@
 The honest capability record. A thing is **Verified** only if it was run and observed. Nothing is
 claimed for Linux or macOS, because nothing has been tested there.
 
-Last updated: 2026-09-18
+Last updated: 2026-09-19
 
 ## Platforms
 
@@ -38,6 +38,9 @@ Last updated: 2026-09-18
 | CPU: silent degradation | Under the default 36-bit width a memory-heavy loop takes **20,000 of 20,000** callback-path entries and **still returns the right answer**; with identity mapping it takes **0**. Asserted at startup |
 | CPU: per-thread cost, by cache size | 24.5 MiB at an 8 MiB code cache, 34.65 at 32 MiB and **34.65 at 128 MiB** (n = 8 threads, serialized) — **shrinking the cache does not help**, because 16 MiB of it is a fixed array the constructor writes even when its feature is disabled |
 | Roblox branch shape | 2.27% indirect, one indirect transfer every 44 words; mean **4.30** instructions per basic block. Both **static** mixes, used as proxies for per-executed-transfer cost models |
+| Thunk boundary: cost | **26.7-31.0 ns** per call dispatched inside the run loop, against **81-101 ns** for exiting to Rust (n = 31 per cell per process, 45 processes: 15 rounds × 3 code placements, `tools/thunk_sweep.py`). A band across three inline cells rather than a point; it is the boundary every imported call crosses. See D17 and D18 |
+| Thunk boundary: binding | All **565** of `libroblox.so`'s undefined symbols bind to a named slot in a reserved region, verified through the real loader; **560 of 560** thunk addresses found in the relocated image. Every unresolved import is `STT_OBJECT`, so **no function is bound to null**. Nothing is implemented yet: calling one names the symbol and the guest address |
+| Thunk boundary: `STT_OBJECT` split | **23** data imports across the library, **18** of them in the 188 the initializers reach. Two figures that looked like a drifted duplicate and are not: measured and asserted in `omni-android/tests/libroblox.rs` |
 | CPU: cold translation | 0.15 to 0.31 Mguest-insn/s on synthetic loops, implying 7 to 25 s to warm a Roblox-sized working set. On **870 real `libroblox.so` leaf functions**: **0.516 Mguest-insn/s** (n = 11 passes, median, a fresh context each; 8,679 guest instructions) — 1.7 to 3.4x *better*. Per-instruction cost **rises** with function length (0.698 for the shortest third against 0.494 for the longest), which is the direction the "short functions give the IR optimizer less to work over" explanation needs; that explanation is a **hypothesis**, not established |
 | CPU: per-thread cost | 20 to 35 MiB committed per guest thread, code caches not shared between threads. Measured at **24.5 MiB** for this backend's 8 MiB cache (n = 8 threads, serialized) and **asserted against a 32 MiB ceiling**. `GuestCpu::cost()` reports **16.004 MiB** of it from two derived terms — the TLS page and the pin's fixed 16 MiB `FastDispatchEntry` table — and the 8.52 MiB it still misses is itself bounded and asserted |
 | CPU: call overhead | **under 53 ns** per entry to and exit from the guest — a ceiling, not the boundary. 63.7 ns per timed iteration (n = 31 passes, median, 870 real leaf functions), of which 10.7 ns is the harness's own register setup and the remaining 53.0 ns still contains ~10 guest instructions of real work |

@@ -161,6 +161,20 @@ pub trait GuestCpu: Send {
     /// [`ExitReason`], not an error.
     fn run(&mut self, from: GuestAddr, limit: RunLimit) -> CpuResult<ExitReason>;
 
+    /// How many guest instructions the most recent [`run`](GuestCpu::run) executed.
+    ///
+    /// [`ExitReason::StepLimitReached`] carries this already, because a caller bounding untrusted code
+    /// needs it at the moment the bound is hit. Every *other* exit drops it — and a caller that has to
+    /// re-enter `run` repeatedly, which the thunk boundary does once per exit-path crossing, cannot
+    /// otherwise subtract what has been spent. Without it a counted budget bounds each *segment* of a
+    /// run rather than the run, and a guest that crosses the boundary N times gets N times the
+    /// allowance the caller asked for.
+    ///
+    /// A backend counts at the end of a unit it handles as a whole, so this is what really executed and
+    /// may exceed a budget. A backend with no counter — [`Capabilities::counted_step_limit`] `false` —
+    /// returns 0, which is honest: it has nothing to report, and it also refuses counted budgets.
+    fn last_run_instructions(&self) -> u64;
+
     /// A handle with which another thread can stop this one. See [`HaltHandle`].
     fn halt_handle(&self) -> HaltHandle;
 

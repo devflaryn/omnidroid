@@ -1294,3 +1294,122 @@ and 2 are `STT_NOTYPE`, so the thunk surface is **170 functions plus 18 data obj
 sites**, and the function map has a **2,670,684-byte region with no unwind information** that hides
 one initializer entry point — recovering it is worth exactly 67 of the 188. Treat the figure as a
 superset prediction to scope work against, never as a completion criterion.
+
+---
+
+## D18 — The thunk boundary's shape, and the four places the ARM64 path nearly closed
+
+D17 decided *where* a thunk is dispatched. This is what the crossing itself is, built in M3 task 2.
+
+### The two paths, and why the type system separates them
+
+| Path | Handler | May run guest code | Cost |
+|---|---|---|---|
+| inside the run loop | `ImportFn` over `ImportCall` | **no — structurally** | **26.7-31.0 ns** |
+| out through `ExitReason::Thunk` | `ReentrantFn` over `ReentrantCall` | yes | 80-102 ns |
+
+Re-measured after the mechanism changed, with `tools/thunk_sweep.py` unchanged: **15 rounds × 3 code
+placements = 45 processes, n = 31 per cell per process.** The inline figure is a band across three
+cells (26.69 / 28.73 / 30.96 ns medians; bare, with an eight-argument marshal, and through a real PLT
+stub) rather than a point, and it supersedes D17's "≈33 ns" without contradicting it. Design A in the
+same processes: 81.36 / 91.31 / 100.31 / 100.53 ns. **The 3x ratio D17 planned against is unchanged**,
+and D17's open question about A's bimodality is untouched — every A cell came out stable again, and
+the entry/exit probe still measures 41.4 ns for what a design-A round trip *is*.
+
+**An inline handler cannot reach a `GuestCpu`**, because `ImportCall` does not contain one. That is
+not a convention: an inline handler runs inside one of the translating backend's own callbacks, where
+a `&mut CpuCtx` is live, so re-entering `od_jit_run` from there would form a second one — undefined
+behaviour. A handler that needs guest code run, or that has a typed error and no return channel, calls
+`ThunkCall::defer_to_caller()` and the call becomes an ordinary `ExitReason::Thunk` at the same
+address with the guest `PC` left on the thunk. One mechanism for both escalations.
+
+### The region: two areas, and a slot that is four times wider than it needs to be here
+
+The **function** area is mapped `Protection::Read` — deliberately not executable — and lazily
+committed, so it costs no commit charge and a branch into the middle of a slot is refused on
+protection *before* `admit`'s commit rule. `Boundary::run` then re-describes that execute fault
+through the symbol table, so the error names the symbol whose slot it was inside and the offset. The
+**data** area is `ReadWrite`, because the 18 `STT_OBJECT` imports are loaded from and two of them are
+written.
+
+A slot is **16 bytes**, derived from `VENEER_INSTRUCTIONS = 4` rather than chosen. On the translating
+backend one word would do, or none; on an ARM64 host the backend plants a veneer and the guest's `BL`
+really executes it, and the smallest veneer that reaches an arbitrary 64-bit host address is
+`LDR X16, #8` / `BR X16` / `.quad host_entry`. The slot size is baked into every address the loader
+writes into a relocated `GOT` slot, so a 4-byte layout would have had to change after 568,806
+relocations already referenced it. The cost is 2,720 bytes of address space that is never read.
+
+### Four places the ARM64-native path nearly got foreclosed, two of which already had
+
+1. **The handler signature was dynarmic-only.** Task 1's probe took `fn(&mut InlineThunkCall)`, and
+   that type lives in `omni-cpu::dynarmic`, which does not exist on an ARM64 host at all. `ThunkRegs`
+   is a trait now and `ThunkCall` is backend-neutral.
+2. **`set_return_sentinel` was on `DynarmicCpu`, not `GuestCpu`.** Section 5 promises the host-to-guest
+   direction; the mechanism that makes a call *into* guest code finish was reachable only through one
+   backend's concrete type, and the compatibility layer holds `&mut dyn GuestCpu`. On the trait now,
+   with `return_sentinel()` beside it because a nested call must restore what the outer one armed.
+3. **A 4-byte slot.** See above.
+4. **`Capabilities::inline_thunks`.** A backend answering `false` gets every call through the exit
+   path — three times slower and identical in behaviour — and `add_inline_thunk` *refuses* rather than
+   registering a handler that would never run and return a fabricated zero for every import.
+
+**None of this is evidence the ARM64 path works, and it is not claimed to.** What is established is
+that no type in `omni-android` names a backend, that the crate builds with `--no-default-features`
+with no `dynarmic-sys` in its normal dependency tree, and that the slot fits the veneer.
+
+### Variadics: thirteen of the reachable 188, and three ways to be silently wrong
+
+**Nine true variadic** — `fprintf`, `fscanf`, `snprintf`, `sscanf`, `syslog`, `open`, `prctl`,
+`syscall`, `__android_log_print` — and **four `va_list` consumers** — `vsnprintf`, `vfprintf`,
+`vasprintf`, `__vsnprintf_chk`. Note that `printf` itself is **not** reachable and `fprintf` is;
+`vsscanf` is not and `sscanf` is; and `__open_2` looks variadic and is not.
+
+AAPCS64 passes variadic floating point in **`V0`-`V7`**, exactly as it passes named arguments. Apple's
+arm64 puts *all* variadic arguments on the stack and Windows on ARM64 puts variadic floating point in
+the general-purpose registers, so an implementation written from either rule reads the wrong bytes and
+returns a plausible number. The evidence for the first is bionic's own `va_list`, which has `__vr_top`
+and `__vr_offs`: a structure with nowhere to record a floating-point save area would describe a
+platform that does not have one.
+
+Three silent-wrong-number classes, each pinned by a mutation row:
+
+* a variadic `float` has been **promoted to `double`** by the caller, so reading it back as a `float`
+  reads the low 32 bits of a `double`'s pattern — for `1.0` that is exactly `0.0`;
+* the **SIMD save area's slot is 16 bytes**, because it holds `Q` registers, and a walker stepping by
+  8 lands in the previous argument's zeroed upper lanes and also returns `0.0`;
+* `va_list` is **32 bytes**, so AAPCS64 passes it *indirectly* — `X3` for `vsnprintf` holds a pointer
+  to the record, and a marshaller reading 32 bytes out of `X3`-`X6` reads something else entirely.
+
+A `va_list` is guest-written state, so both offsets are range-checked *and* every read goes through
+`GuestMem`. Neither check is redundant: the first says which field was wrong, the second is what
+catches a wild `__gr_top`. A **positive** offset is legal and means the registers are spent, and is
+normalised rather than refused.
+
+**A fourth register the boundary needs.** `mallinfo` returns 80 bytes, so AAPCS64 returns it
+**indirectly through `X8`** — neither an argument register nor a return register. One import of 188,
+and a marshaller built to "returns in `X0`/`X1`/`V0`" would have had no way to reach it.
+
+### Re-entrancy, and a bound that was not one
+
+Depth is capped at **8** (`AbiError::TooDeep`) because the alternative bound is the host's stack, which
+is an abort reachable from guest data. `call_guest` saves and restores the whole architectural state;
+the callee-saved half is load-bearing and pinned, and the caller-saved half is **defence in depth with
+no test that can distinguish it**, recorded as a watch rather than a detector. The outer call's
+arguments are snapshotted before the handler runs, so a handler that reads its third argument after
+invoking a comparator gets the argument rather than the comparator's leftovers.
+
+**A defect the mutation harness found by hanging rather than failing.** The driver passed the caller's
+`RunLimit` to *every* `cpu.run`, so a counted budget bounded each exit-path segment rather than the
+run: a guest crossing N times got N times the allowance it was given. `GuestCpu::last_run_instructions`
+is on the trait now and the budget is spent down. The exit path also has its own crossing cap
+(`AbiError::CrossingLimit`), because a guest looping through it returns to Rust before any block
+finishes and the backend's budget never expires — which is *not* true of the inline path, where every
+iteration costs counted guest instructions.
+
+### Scope note that reconciles two figures
+
+The M3 plan says 23 imports are `STT_OBJECT`; D17 says 18. **Both are right and they count different
+sets: 23 of the 565 across the library, 18 of the 188 the initializers reach.** Measured, not argued —
+`crates/omni-android/tests/libroblox.rs` declares exactly D17's eighteen and asserts that the five
+`STT_OBJECT` imports left unresolved are the difference. Every unresolved import is `STT_OBJECT`; no
+function is left bound to null.

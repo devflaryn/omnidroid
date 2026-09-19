@@ -166,12 +166,27 @@ So the heap seam is the **demand pager**, not `malloc`. That is arguably a bette
 documented design, since every guest allocation arrives as a mapping request we already reserve lazily
 and commit in granules — but the previous claim was wrong and is withdrawn rather than reinterpreted.
 
-**The thunk boundary.** Guest code is ARM64; host code is x86-64 on x86-64 hosts. The loader binds
-each undefined symbol to a synthetic guest address inside a reserved *thunk region*. When the CPU
-backend reaches a branch into that region, it marshals AAPCS64 into the host ABI, calls the Rust
-implementation, and returns. Callbacks in the other direction, host to guest, such as a Vulkan
-allocator callback or a pthread entry point, use the mirror mechanism. On ARM64 hosts the ABI
-already matches and the thunk reduces to close to a direct call.
+**The thunk boundary** (built in M3 task 2; rationale in D17 and D18). Guest code is ARM64; host
+code is x86-64 on x86-64 hosts. Every undefined symbol gets a slot at a synthetic guest address in a
+reserved *thunk region*, which `omni-android` reserves and hands out and which the loader binds
+through a `SymbolProvider`. A branch into that region marshals AAPCS64 into the host ABI, calls the
+Rust implementation, and returns. Callbacks in the other direction, host to guest — a `pthread` entry
+point, an `atexit` handler, a `qsort` comparator — re-enter the guest with a sentinel return address
+and read the answer out of `X0`/`V0`. On ARM64 hosts the ABI already matches and the thunk reduces to
+close to a direct call; the slot is 16 bytes wide precisely so that path stays open, because there
+the backend plants a real four-instruction veneer rather than recognising an address.
+
+**Correction (M3 task 2): the call does not exit to Rust.** An earlier draft of this paragraph said
+the backend "marshals ... calls the Rust implementation, and returns", which is the exit-to-Rust shape
+at 80-102 ns per call. D17 measured in-loop dispatch at 26.7-31.0 ns — a factor of 3 — and chose it,
+keeping the exit only for unresolved imports and for handlers that must call back into guest code.
+Both paths exist and `Capabilities::inline_thunks` decides which a given backend gets, so the
+description above is the *contract* and the exit is the fallback rather than the mechanism.
+
+**Also corrected: the loader did not already do this.** Until M3 task 2 the workspace had a
+`SymbolProvider` trait and an `EmptyProvider` that resolves nothing, and no region, no address
+assignment and no allocator anywhere. The M3 plan described the region as existing code; it was a
+design statement, exactly as this section's `malloc`-is-the-host-allocator model was.
 
 **JNI without a JVM, and no dex interpreter** (D7, now verified). Omnidroid implements `JavaVM` and
 `JNIEnv` as host-native function tables. The measured surface is small and lopsided: only **59 of

@@ -112,6 +112,12 @@ impl GuestCpu for RegisterFile {
         })
     }
 
+    /// Zero, and honest: this implementation executes nothing, and it refuses counted budgets for
+    /// the same reason.
+    fn last_run_instructions(&self) -> u64 {
+        0
+    }
+
     fn halt_handle(&self) -> HaltHandle {
         self.halt.clone()
     }

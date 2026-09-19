@@ -10,7 +10,7 @@ plan and ledger, and git history.
 |---|---|
 | Current branch | **`android-abi`** (M3 work) |
 | Working tree | **clean**, nothing uncommitted |
-| HEAD | `eb3c442` |
+| HEAD | see `git log` — M3 task 2 complete |
 | Other branches | `cpu-execution` (M2, complete), `foundation` (M0/M1, complete), `main` (behind — holds only early docs) |
 | Remotes | **none configured** |
 | Merge state | Nothing has been merged to `main`. Each milestone branched from the previous one. **The user has never been asked to approve a merge; do not merge without asking.** |
@@ -19,15 +19,18 @@ Branch lineage: `main` → `foundation` → `cpu-execution` → `android-abi`.
 
 ## Verification state
 
-496 passing, 0 failing, 12 ignored (`cargo test --workspace --release`). Clippy clean on
-`--all-targets`, `cargo doc` clean, `--no-default-features` builds.
+**608 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`). Clippy clean on
+`--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
+*verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
+With `workspace = true` a member's `default-features = false` is **ignored**, so the omni-android
+dependency on omni-cpu spells its path out; see the comment in that manifest.
 
 Three committed mutation harnesses, all restoring the tree byte-for-byte and all with a pre-flight
 gate that refuses to run against a modified tree:
 
 | Harness | Rows |
 |---|---|
-| `tools/mutate.py` (workspace) | 88 |
+| `tools/mutate.py` (workspace) | **118** |
 | `crates/dynarmic-sys/tools/mutate_shim.py` | 23 |
 | `crates/omni-elf/tools/mutate_loader.py` | 18 |
 

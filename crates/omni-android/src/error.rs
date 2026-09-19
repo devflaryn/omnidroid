@@ -256,7 +256,7 @@ pub enum AbiError {
     /// *inline* thunk spends guest instructions and the backend's own budget stops it; each exit-path
     /// crossing returns to Rust, so the budget never expires and the loop would be a hang in host
     /// code rather than in guest code. Reported rather than folded into
-    /// [`ExitReason::Halted`](omni_cpu::ExitReason::Halted), because a caller has to be able to tell
+    /// [`ExitReason::Halted`], because a caller has to be able to tell
     /// "my watchdog fired" from "the guest is spinning through the boundary".
     #[error(
         "the guest crossed the thunk boundary's exit path {crossings} times in one run, at the          limit of {limit}, most recently at {pc:#x}"

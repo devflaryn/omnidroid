@@ -1058,19 +1058,50 @@ MUTATIONS = [
                         || self.region.holds_data(address)) =>""",
      ANDROID),
 
-    # The over-correction: treating a call to a slot's first instruction as a branch into its middle
-    # refuses every legitimate imported call.
+    # The over-correction: the exact-address lookup removed, so every legitimate imported call falls
+    # through into the mid-slot machinery and is refused.
+    #
+    # This replaced a row that was an **equivalent mutant** and correctly reported NOT CAUGHT: turning
+    # `if offset != 0` into `if true` changes nothing, because a call to a slot's own address is
+    # answered by the exact lookup above and never reaches the guard. The harness was right and the row
+    # was wrong, which is the distinction Global Constraint 13 asks for.
     ("boundary-B1", "B",
-     "a call to a slot's own address reported as a branch into its middle",
+     "the exact slot lookup removed, so a legitimate call is treated as a branch into a slot",
      BOUNDARY,
-     """            Some((slot, offset)) if offset != 0 => match self.slots.get(&slot) {""",
-     """            Some((slot, offset)) if true => match self.slots.get(&slot) {""",
+     """        if let Some(slot) = self.slots.get(&address) {
+            return Ok(slot);
+        }""",
+     """        if let Some(slot) = self.slots.get(&address) {
+            let _ = slot;
+        }""",
+     ANDROID),
+
+    ("boundary-A10", "A",
+     "the caller's budget handed afresh to every crossing instead of spent down",
+     BOUNDARY,
+     """if let RunLimit::Instructions(allowance) = remaining {""",
+     """if let RunLimit::Instructions(allowance) = RunLimit::Unlimited {""",
+     ANDROID),
+
+    # The defect the first version of the budget accounting had: charging the allowance after every
+    # `cpu.run` and pre-empting on any exit, which turns a `MemoryFault` -- not resumable -- into a
+    # `StepLimitReached`, which is.
+    ("boundary-A11", "A",
+     "the budget pre-empts any exit that lands on its last instruction, not only a crossing",
+     BOUNDARY,
+     """                other => return Ok(other),""",
+     """                other if matches!(remaining, RunLimit::Instructions(n)
+                    if n <= cpu.last_run_instructions()) =>
+                {
+                    return Ok(ExitReason::StepLimitReached { pc: other.pc(), executed: spent })
+                }
+                other => return Ok(other),""",
      ANDROID),
 
     # ---- the seam the boundary rests on ----------------------------------------------------------
     ("cpu-A38", "A",
      "a deferred inline thunk resumes the guest anyway instead of exiting",
-     CPU_DYN,
+     CPU_CALLBACKS,
      """                if deferred {""",
      """                if false && deferred {""",
      ANDROID),

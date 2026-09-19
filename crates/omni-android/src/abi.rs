@@ -48,7 +48,7 @@
 //! * **Composites get no HFA treatment.** An argument in the variadic part is never passed as a
 //!   homogeneous float aggregate in up to four `V` registers, because the callee's save area has no
 //!   way to describe that. None of the nine reachable variadic imports passes a composite, and one
-//!   that did would be [`AbiError::UnsupportedShape`](crate::AbiError::UnsupportedShape).
+//!   that did would be [`AbiError::UnsupportedShape`].
 //! * **Slot sizes in the save area**, which are 8 bytes per integer and a full **16** per
 //!   floating-point value even though a `double` is 8 — the `V` save area is `Q` registers.
 //!

@@ -617,12 +617,12 @@ fn a_guest_spinning_through_the_exit_path_is_stopped_by_the_boundarys_own_cap() 
     guest.load(asm.words());
 
     let mut cpu = guest.thread(&boundary);
-    let error = boundary.run(&mut cpu, entry, RunLimit::Unlimited).expect_err("the first one fails");
+    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("the first one fails");
     assert!(matches!(error, AbiError::Unbound { .. }), "{error:?}");
 
-    // The cap itself is exercised through the halt handle instead, which is the mechanism a watchdog
-    // uses and the one that does *not* need the guest to be making progress. A halt requested before
-    // the run is sticky, so the boundary must honour it before letting the guest go at all.
+    // The halt handle is the other containment, and the one a watchdog uses: it does not need the
+    // guest to be making progress. A halt requested before the run is sticky, so the boundary must
+    // honour it before letting the guest go at all.
     let mut cpu = guest.thread(&boundary);
     cpu.halt_handle().request();
     let exit = boundary
@@ -630,6 +630,59 @@ fn a_guest_spinning_through_the_exit_path_is_stopped_by_the_boundarys_own_cap() 
         .expect("a halt is not an error");
     assert!(matches!(exit, ExitReason::Halted { .. }), "{exit:?}");
     assert_eq!(boundary.crossings().exits, 1, "the second run never crossed at all");
+}
+
+/// **A handler that fails runs exactly once.**
+///
+/// An inline handler with no return channel records its error and defers, and the exit path reports the
+/// recorded error. It *could* instead let the exit path re-run the handler over the CPU's register file
+/// and take the error from there — the values are the same — and the mutation harness showed that
+/// removing the recorded-error check leaves every other test passing for exactly that reason. It is not
+/// equivalent: a handler that had already written half its output before failing would write it twice.
+/// So the property is that the handler is entered once, and this is what says so.
+static ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn always_fails(call: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Fails on the argument, which is the ordinary way a handler fails.
+    let pointer = call.args().next_pointer()?;
+    call.mem().cstr(pointer, call.blame(0))?;
+    Ok(())
+}
+
+#[test]
+fn a_handler_that_fails_is_entered_once_and_not_re_run_on_the_exit_path() {
+    let _guard = serialized();
+    let guest = Guest::new();
+    let builder = guest.boundary(8);
+    let thunk = builder.bind_inline("strlen", always_fails).expect("bind");
+    let boundary = builder.finish();
+
+    ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let entry = guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, 0);
+    asm.bl(thunk);
+    asm.push(ret(21));
+    guest.load(asm.words());
+
+    let mut cpu = guest.thread(&boundary);
+    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("it always fails");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert_eq!(
+        ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the handler must be entered once: a handler that had written half its output before failing          would otherwise write it twice"
+    );
+    // And the inline path is what entered it — once, and once deferred — so this is not passing because
+    // the fast path was skipped and the exit path did the work.
+    assert_eq!(cpu.inline_thunk_calls().serviced, 1);
+    assert_eq!(cpu.inline_thunk_calls().deferred, 1);
+    // `exits` stays at zero on purpose: the recorded error is read *before* the slot is serviced, so a
+    // deferred failure never reaches `service_exit` at all. That is the property the mutation row
+    // removes.
+    assert_eq!(boundary.crossings().exits, 0);
 }
 
 /// **The exit-path crossing cap, reached.**
@@ -659,9 +712,13 @@ fn a_guest_that_keeps_crossing_the_exit_path_hits_the_cap_with_a_typed_error() {
     asm.b(loop_at);
     guest.load(asm.words());
 
+    // **A counted budget as well as the cap**, so that a build in which the cap does not work *fails*
+    // rather than hanging. That is not hypothetical: two mutation rows remove or defeat the cap, and
+    // with `RunLimit::Unlimited` they made the harness hang instead of reporting a catch — which is
+    // how the budget-per-crossing defect below was found in the first place.
     let mut cpu = guest.thread(&boundary);
     let error = boundary
-        .run(&mut cpu, entry, RunLimit::Unlimited)
+        .run(&mut cpu, entry, RunLimit::Instructions(1_000))
         .expect_err("the cap must stop it, and must say so");
     let text = format!("{error:?}");
     match error {
@@ -675,6 +732,99 @@ fn a_guest_that_keeps_crossing_the_exit_path_hits_the_cap_with_a_typed_error() {
     // And it is **not** an `ExitReason::Halted`, which is what a watchdog firing looks like. A caller
     // has to be able to tell "my halt fired" from "the guest is spinning through the boundary".
     assert!(!text.contains("Halted"), "{text}");
+}
+
+/// **A counted budget must bound the whole run, not each crossing of it.**
+///
+/// The exit path returns to Rust before any block finishes, so each `cpu.run` starts a new counted run.
+/// A driver that handed the caller's `limit` to every segment would give a guest that crosses N times N
+/// times the allowance it asked for — and Global Constraint 11's point is that a bound is only as
+/// trustworthy as its least-validated input. Found by the mutation harness hanging rather than failing.
+#[test]
+fn a_counted_budget_is_spent_down_across_crossings_and_not_handed_out_afresh() {
+    let _guard = serialized();
+    let guest = Guest::new();
+    let builder = guest.boundary(8);
+    let thunk = builder.bind_reentrant("pthread_once", call_the_target).expect("bind");
+    // High enough that the cap is not what stops this: the budget has to be.
+    builder.with_exit_crossing_limit(1_000_000);
+    let boundary = builder.finish();
+
+    let nothing_at = guest.next_entry();
+    guest.load(&[ret(30)]);
+    set_target(nothing_at);
+
+    // Two guest instructions per crossing, so a budget of `n` permits about `n / 2` crossings in total
+    // — and *many* times that if the budget is re-handed to each one.
+    let entry = guest.next_entry();
+    let mut asm = Asm::at(entry);
+    let loop_at = asm.pc();
+    asm.bl(thunk);
+    asm.b(loop_at);
+    guest.load(asm.words());
+
+    let budget = 2_000u64;
+    let mut cpu = guest.thread(&boundary);
+    let exit = boundary
+        .run(&mut cpu, entry, RunLimit::Instructions(budget))
+        .expect("a budget expiring is not an error");
+    assert!(matches!(exit, ExitReason::StepLimitReached { .. }), "{exit:?}");
+    let crossings = boundary.crossings().exits;
+    assert!(crossings > 1, "it must really have crossed more than once; it crossed {crossings}");
+    // The arithmetic that matters. Each crossing costs at least the `BL` and the `B`, so the whole run
+    // cannot have crossed more than `budget` times however the segments were sliced. A driver that
+    // re-handed the budget would run until the crossing cap, which is 500x higher.
+    assert!(
+        crossings <= budget,
+        "{crossings} crossings under a budget of {budget} guest instructions: the budget is being          handed out per crossing rather than spent down"
+    );
+}
+
+/// **A budget that is exactly enough must not turn a return into a step limit.**
+///
+/// The first version of the budget accounting charged the allowance immediately after every `cpu.run`
+/// and pre-empted whenever it had run out — so *any* terminal exit landing on the budget's last
+/// instruction was reported as `StepLimitReached`. For `Returned` that loses the return. For
+/// `MemoryFault` it is worse: a fault is **not** resumable and a step limit is, so a caller acting on
+/// the exit would have resumed a faulting guest.
+///
+/// The budget is self-calibrating rather than guessed, because how many instructions a program charges
+/// is the backend's business: the same program is run once unbounded to find out, and then again with
+/// exactly that many.
+#[test]
+fn a_budget_that_is_exactly_spent_still_reports_the_exit_that_happened() {
+    let _guard = serialized();
+    let guest = Guest::new();
+    let builder = guest.boundary(8);
+    let thunk = builder.bind_inline("strlen", len).expect("bind");
+    let boundary = builder.finish();
+
+    guest.write_bytes(guest.data + 0x100, b"hi ");
+    let entry = guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, (guest.data + 0x100) as u64);
+    asm.bl(thunk);
+    asm.push(ret(21));
+    guest.load(asm.words());
+
+    let mut cpu = guest.thread(&boundary);
+    let exit = boundary.run(&mut cpu, entry, RunLimit::Unlimited).expect("an unbounded run");
+    assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    let charged = cpu.last_run_instructions();
+    assert!(charged > 0, "the backend must charge something for a program that ran");
+
+    // Exactly the allowance the program needs for its final segment. `saturating_sub` then leaves
+    // nothing, which is the condition the old accounting pre-empted on.
+    let mut cpu = guest.thread(&boundary);
+    let exit = boundary
+        .run(&mut cpu, entry, RunLimit::Instructions(charged))
+        .expect("a budget that is exactly enough");
+    assert!(
+        matches!(exit, ExitReason::Returned { .. }),
+        "a return that lands on the budget's last instruction is a return, not a step limit: {exit:?}"
+    );
+    assert_eq!(guest.read_u64(guest.data + 0x100) & 0xFF, u64::from(b'h'), "and it really ran");
 }
 
 /// Nothing above may have left the host in a state where the next guest can misbehave differently.

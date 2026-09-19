@@ -859,6 +859,11 @@ fn a_callback_leaves_the_outer_guests_registers_and_stack_exactly_as_it_found_th
     for index in 0..=28u32 {
         callback.mov(index, 0xBAD0_0000_0000_0000 + u64::from(index));
     }
+    // **And it leaves `SP` 64 bytes lower than it found it**, which is what makes restoring `SP`
+    // testable at all. A callback that balanced its own frame would leave `SP` correct however the
+    // boundary behaved, and the assertion below would pass against a boundary that never restored it —
+    // which is exactly what the mutation harness found.
+    callback.push(sub_imm(31, 31, 64));
     callback.mov(0, 0x600D);
     callback.push(ret(30));
     guest.load(callback.words());
