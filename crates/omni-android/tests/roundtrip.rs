@@ -57,12 +57,14 @@ fn with_seen<R>(f: impl FnOnce(&mut Seen) -> R) -> R {
 
 /// `long eight_ints(long, long, long, long, long, long, long, long)`.
 fn eight_ints(call: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    let mut args = call.args();
-    let mut values = Vec::new();
-    for _ in 0..8 {
-        values.push(args.next_u64()?);
-    }
-    drop(args);
+    let values = {
+        let mut args = call.args();
+        let mut values = Vec::new();
+        for _ in 0..8 {
+            values.push(args.next_u64()?);
+        }
+        values
+    };
     let sum = values.iter().copied().fold(0u64, u64::wrapping_add);
     with_seen(|seen| seen.ints = values);
     call.ret().u64(sum);
@@ -163,12 +165,14 @@ fn a_pointer_argument_reaches_real_guest_memory_in_both_directions() {
 
 /// `double eight_doubles(double, double, double, double, double, double, double, double)`.
 fn eight_doubles(call: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    let mut args = call.args();
-    let mut values = Vec::new();
-    for _ in 0..8 {
-        values.push(args.next_f64()?);
-    }
-    drop(args);
+    let values = {
+        let mut args = call.args();
+        let mut values = Vec::new();
+        for _ in 0..8 {
+            values.push(args.next_f64()?);
+        }
+        values
+    };
     let sum: f64 = values.iter().sum();
     with_seen(|seen| seen.floats = values);
     call.ret().f64(sum);
@@ -283,13 +287,15 @@ fn integers_and_doubles_interleaved_advance_their_own_banks() {
 
 /// `long ten_ints(long × 10)` — two of them on the stack.
 fn ten_ints(call: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    let mut args = call.args();
-    let mut values = Vec::new();
-    for _ in 0..10 {
-        values.push(args.next_u64()?);
-    }
-    let overflow = args.overflow();
-    drop(args);
+    let (values, overflow) = {
+        let mut args = call.args();
+        let mut values = Vec::new();
+        for _ in 0..10 {
+            values.push(args.next_u64()?);
+        }
+        let overflow = args.overflow();
+        (values, overflow)
+    };
     with_seen(|seen| {
         seen.ints = values.clone();
         seen.returned = vec![overflow as u64];

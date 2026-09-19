@@ -44,6 +44,7 @@ use omni_cpu::{
     AccessKind, ExitReason, GuestCpu, Nzcv, RunLimit, ThunkCall, ThunkContext, ThunkRegs, VReg,
     XReg,
 };
+use omni_elf::loader::{SymbolKind, SymbolProvider, SymbolRequest, SymbolValue};
 use omni_mem::{GuestAddr, GuestSpace};
 use parking_lot::Mutex;
 
@@ -161,6 +162,7 @@ struct BuilderInner {
     slots: BTreeMap<GuestAddr, Slot>,
     by_name: BTreeMap<String, GuestAddr>,
     sentinel: GuestAddr,
+    exit_crossings: u64,
 }
 
 /// The boundary under construction: slots are allocated here, and bound here.
@@ -196,6 +198,7 @@ impl BoundaryBuilder {
                 slots: BTreeMap::new(),
                 by_name: BTreeMap::new(),
                 sentinel,
+                exit_crossings: MAX_EXIT_CROSSINGS,
             }),
             space,
         })
@@ -275,6 +278,17 @@ impl BoundaryBuilder {
         Ok(address)
     }
 
+    /// Lower the exit-path crossing cap from [`MAX_EXIT_CROSSINGS`].
+    ///
+    /// **Exists so the cap can be tested.** 2^32 crossings is far too many to reach in a test, and a
+    /// limit no test reaches is a limit nobody knows works — Global Constraint 13's distinction
+    /// between code that is exercised and a bug that is detected. Zero is clamped to one, since a cap
+    /// of zero would refuse the first legitimate call.
+    pub fn with_exit_crossing_limit(&self, limit: u64) -> &Self {
+        self.inner.lock().exit_crossings = limit.clamp(1, MAX_EXIT_CROSSINGS);
+        self
+    }
+
     /// The address a symbol was given, if it has one.
     #[must_use]
     pub fn address_of(&self, symbol: &str) -> Option<GuestAddr> {
@@ -291,8 +305,50 @@ impl BoundaryBuilder {
             slots: inner.slots,
             by_name: inner.by_name,
             sentinel: inner.sentinel,
+            exit_crossings: inner.exit_crossings,
             crossings: Mutex::new(Crossings::default()),
         })
+    }
+}
+
+/// **How the loader binds imports to thunk addresses.**
+///
+/// The loader asks about each of `libroblox.so`'s 565 undefined symbols while it relocates, from
+/// `&self`, which is why allocation is behind a mutex.
+///
+/// Two deliberate asymmetries between functions and data:
+///
+/// * **Every function gets a slot, whether or not anything implements it.** A function nothing
+///   implements is bound to a real address whose call produces [`AbiError::Unbound`] naming it — which
+///   is strictly better than leaving it unresolved and bound to null, where the guest's call becomes a
+///   branch to address zero with no symbol attached to it.
+/// * **A data symbol gets one only if it was declared with a size.** There is no size in a
+///   [`SymbolRequest`], and `__sF` is an array of three `FILE`s that the guest reaches as
+///   `__sF + addend`, so a default pointer-sized cell would be silently too small and the guest's
+///   `stderr` would be some other object's bytes. An undeclared data import therefore stays
+///   unresolved, which the loader already reports by name in [`Imports::unresolved`].
+///
+/// [`SymbolRequest`]: omni_elf::loader::SymbolRequest
+/// [`Imports::unresolved`]: omni_elf::loader::Imports
+impl SymbolProvider for BoundaryBuilder {
+    fn name(&self) -> &str {
+        "omnidroid-thunks"
+    }
+
+    fn resolve(&self, request: &SymbolRequest<'_>) -> Option<SymbolValue> {
+        match request.kind {
+            SymbolKind::Function | SymbolKind::Unspecified => {
+                // A failure here is the region running out, which the loader has no channel for. It
+                // is reported as "nothing supplied this symbol" rather than swallowed, and the
+                // loader's unresolved list then names every symbol that missed out.
+                let address = self.declare_function(request.name).ok()?;
+                Some(SymbolValue { address: address as u64, kind: SymbolKind::Function })
+            }
+            SymbolKind::Object => self.address_of(request.name).map(|address| SymbolValue {
+                address: address as u64,
+                kind: SymbolKind::Object,
+            }),
+        }
     }
 }
 
@@ -316,6 +372,7 @@ pub struct Boundary {
     slots: BTreeMap<GuestAddr, Slot>,
     by_name: BTreeMap<String, GuestAddr>,
     sentinel: GuestAddr,
+    exit_crossings: u64,
     crossings: Mutex<Crossings>,
 }
 
@@ -435,10 +492,10 @@ impl Boundary {
             if halt.is_requested() {
                 return Ok(ExitReason::Halted { pc });
             }
-            if crossings >= MAX_EXIT_CROSSINGS {
+            if crossings >= self.exit_crossings {
                 return Err(AbiError::CrossingLimit {
                     crossings,
-                    limit: MAX_EXIT_CROSSINGS,
+                    limit: self.exit_crossings,
                     pc,
                 });
             }
@@ -891,21 +948,21 @@ impl ReentrantCall<'_> {
             match *arg {
                 GuestArg::Int(value) => {
                     if ngrn >= ARG_REGISTERS {
-                        return self.too_many(target, "integer");
+                        return self.too_many(target, Bank::Integer);
                     }
                     self.cpu.set_x(XReg::new(ngrn as u8).expect("X0-X7 exist"), value);
                     ngrn += 1;
                 }
                 GuestArg::Pointer(value) => {
                     if ngrn >= ARG_REGISTERS {
-                        return self.too_many(target, "integer");
+                        return self.too_many(target, Bank::Integer);
                     }
                     self.cpu.set_x(XReg::new(ngrn as u8).expect("X0-X7 exist"), value as u64);
                     ngrn += 1;
                 }
                 GuestArg::Double(value) => {
                     if nsrn >= ARG_REGISTERS {
-                        return self.too_many(target, "floating-point");
+                        return self.too_many(target, Bank::FloatingPoint);
                     }
                     self.cpu
                         .set_v(VReg::new(nsrn as u8).expect("V0-V7 exist"), u128::from(value.to_bits()));
@@ -913,7 +970,7 @@ impl ReentrantCall<'_> {
                 }
                 GuestArg::Float(value) => {
                     if nsrn >= ARG_REGISTERS {
-                        return self.too_many(target, "floating-point");
+                        return self.too_many(target, Bank::FloatingPoint);
                     }
                     self.cpu
                         .set_v(VReg::new(nsrn as u8).expect("V0-V7 exist"), u128::from(value.to_bits()));
@@ -924,16 +981,34 @@ impl ReentrantCall<'_> {
         Ok(())
     }
 
-    fn too_many(&self, target: GuestAddr, bank: &'static str) -> AbiResult<()> {
-        let _ = bank;
+    fn too_many(&self, target: GuestAddr, bank: Bank) -> AbiResult<()> {
         Err(AbiError::BadCallbackStack {
             symbol: self.symbol.to_string(),
             target,
             sp: self.cpu.sp(),
-            why: "more than eight arguments in one bank would have to go on the guest's stack, which \
-                  the host-to-guest direction does not write to",
+            why: match bank {
+                Bank::Integer => {
+                    "more than eight integer arguments would have to go on the guest's stack, which \
+                     the host-to-guest direction does not write to"
+                }
+                Bank::FloatingPoint => {
+                    "more than eight floating-point arguments would have to go on the guest's \
+                     stack, which the host-to-guest direction does not write to"
+                }
+            },
         })
     }
+}
+
+/// Which of AAPCS64's two argument register banks ran out.
+///
+/// An enum rather than a `&'static str`, because the string form was written once and then discarded
+/// with a `let _ = bank;`, which made both messages the generic one and made the test asserting on
+/// them pass against the wrong text. A type cannot be ignored that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bank {
+    Integer,
+    FloatingPoint,
 }
 
 /// One argument to a guest callback.
