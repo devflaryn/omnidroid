@@ -62,6 +62,11 @@ ACCESS = "crates/omni-mem/src/access.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
 LEAF = "crates/omni-elf/src/leaf.rs"
+ABI = "crates/omni-android/src/abi.rs"
+VARARGS = "crates/omni-android/src/varargs.rs"
+ANDROID_MEM = "crates/omni-android/src/mem.rs"
+REGION = "crates/omni-android/src/region.rs"
+BOUNDARY = "crates/omni-android/src/boundary.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
@@ -84,6 +89,15 @@ ELF_SCAN = [
 # The commit-charge figures are only meaningful in a release build.
 ELF_RELEASE = [
     "cargo", "test", "-p", "omni-elf", "--release", "--test", "loader_commit", "--no-fail-fast",
+]
+
+# The thunk boundary. Scoped to the three fast targets rather than the whole package: the
+# `libroblox` target loads 109 MB and applies 568,806 relocations, and it asserts about the
+# *loader's* binding rather than about the marshalling these rows mutate, so including it would
+# multiply every row's cost by that load for no extra detection.
+ANDROID = [
+    "cargo", "test", "-p", "omni-android", "--lib", "--test", "roundtrip", "--test", "hostile",
+    "--no-fail-fast",
 ]
 
 # (id, direction, description, file, old, new, command)
@@ -827,6 +841,251 @@ MUTATIONS = [
     # option that declines to install the pager would do the same here. It is not done because the
     # check is a platform guard rather than a defect anyone has hit, and a new bypass of a safety
     # property is not free -- a judgement about priority, not about possibility.
+
+    # ---- AAPCS64 marshalling (M3 task 2) ---------------------------------------------------------
+    # Every row here is a way to be *silently* wrong: each produces a plausible number rather than an
+    # error, which is the failure shape 3,594 initializers hide (Global Constraint 1).
+    ("abi-A1", "A",
+     "the integer bank back-fills after spilling to the stack",
+     ABI,
+     """        let value = if self.ngrn < ARG_REGISTERS {""",
+     """        let value = if self.ngrn <= ARG_REGISTERS {""",
+     ANDROID),
+
+    ("abi-A2", "A",
+     "the two argument banks share one counter, so a double lands in an X register",
+     ABI,
+     """        let bits = if self.nsrn < ARG_REGISTERS {
+            let value = self.call.v(self.nsrn);
+            self.nsrn += 1;""",
+     """        let bits = if self.nsrn < ARG_REGISTERS {
+            let value = u128::from(self.call.x(self.nsrn));
+            self.nsrn += 1;""",
+     ANDROID),
+
+    ("abi-A3", "A",
+     "an int return zero-extended, so every libc -1 reads as success",
+     ABI,
+     """        self.call.set_x(0, i64::from(value) as u64);""",
+     """        self.call.set_x(0, u64::from(value as u32));""",
+     ANDROID),
+
+    ("abi-A4", "A",
+     "a float return written as a double's bit pattern",
+     ABI,
+     """    pub fn f32(&mut self, value: f32) {
+        self.call.set_v(0, u128::from(value.to_bits()));
+    }""",
+     """    pub fn f32(&mut self, value: f32) {
+        self.call.set_v(0, u128::from(f64::from(value).to_bits()));
+    }""",
+     ANDROID),
+
+    ("abi-A5", "A",
+     "a stack argument read without checking that the guest's stack is there",
+     ABI,
+     """            let at = self.align_nsaa(8);
+            let value = self.mem.read_u64(at, self.blame())?;""",
+     """            let at = self.align_nsaa(8);
+            let value = self.mem.read_u64(at, self.blame()).unwrap_or(0);""",
+     ANDROID),
+
+    # The over-correction: a boundary that refused a zero-length access would refuse
+    # `memcpy(dst, src, 0)`, which is legal C and which the engine emits.
+    ("abi-B1", "B",
+     "a zero-length guest access refused instead of being a no-op",
+     ANDROID_MEM,
+     """        if len == 0 {""",
+     """        if false && len == 0 {""",
+     ANDROID),
+
+    # ---- the variadic rules, which are not the fixed rules ---------------------------------------
+    ("varargs-A1", "A",
+     "the SIMD save area stepped by 8 bytes instead of 16",
+     VARARGS,
+     """pub const VR_SLOT: usize = 16;""",
+     """pub const VR_SLOT: usize = 8;""",
+     ANDROID),
+
+    ("varargs-A2", "A",
+     "variadic floating point read from the integer registers, which is Windows-on-ARM64's rule",
+     VARARGS,
+     """        let bits = if self.nsrn < ARG_REGISTERS {
+            let value = self.call.v(self.nsrn) as u64;
+            self.nsrn += 1;""",
+     """        let bits = if self.nsrn < ARG_REGISTERS {
+            let value = self.call.x(self.nsrn);
+            self.nsrn += 1;""",
+     ANDROID),
+
+    ("varargs-A3", "A",
+     "the guest va_list's offsets no longer range-checked",
+     VARARGS,
+     """        if value < low || value > high {""",
+     """        if false && (value < low || value > high) {""",
+     ANDROID),
+
+    ("varargs-A4", "A",
+     "a save-area pointer plus a negative offset allowed to wrap into the top of the address space",
+     VARARGS,
+     """        let sum = i128::from(top as u64) + i128::from(offs);""",
+     """        let sum = i128::from((top as u64).wrapping_add(offs as u64));""",
+     ANDROID),
+
+    # The over-correction: a positive offset is legal and means "the registers are spent", so
+    # refusing one refuses a correct guest.
+    ("varargs-B1", "B",
+     "a positive va_list offset refused instead of normalised",
+     VARARGS,
+     """        let high = save_bytes as i64;""",
+     """        let high = -1;""",
+     ANDROID),
+
+    # ---- guest memory, which is hostile by assumption --------------------------------------------
+    ("android-mem-A1", "A",
+     "a guest string walk no longer bounded by its region's end",
+     ANDROID_MEM,
+     """        let reach = region_end.saturating_sub(address).min(Self::STRING_LIMIT);""",
+     """        let reach = Self::STRING_LIMIT;""",
+     ANDROID),
+
+    ("android-mem-A2", "A",
+     "guest memory read without admitting the range at all",
+     ANDROID_MEM,
+     """        self.check(address, len, FaultAccess::Read, blame)?;
+        let mut out = vec![0u8; len];""",
+     """        let mut out = vec![0u8; len];""",
+     ANDROID),
+
+    # ---- the thunk region ------------------------------------------------------------------------
+    ("region-A1", "A",
+     "the function area made executable, so a mid-slot branch runs whatever is there",
+     REGION,
+     """            // Not executable, and lazily committed. See the module docs: this is what turns a branch
+            // into the middle of a slot into a typed fault instead of four bytes of something.
+            Protection::Read,""",
+     """            Protection::ReadExecute,""",
+     ANDROID),
+
+    # The over-correction, against Global Constraint 6: the function area is never read on the path
+    # that works, so committing it up front is commit charge paid for nothing.
+    ("region-B1", "B",
+     "the function area committed eagerly instead of lazily",
+     REGION,
+     """            Protection::Read,
+            CommitPolicy::Lazy,""",
+     """            Protection::Read,
+            CommitPolicy::Eager,""",
+     ANDROID),
+
+    # ---- the boundary itself ---------------------------------------------------------------------
+    ("boundary-A1", "A",
+     "an unbound symbol returns quietly instead of naming itself, which is Constraint 1's shape",
+     BOUNDARY,
+     """            Binding::Unbound => Err(AbiError::Unbound {
+                symbol: slot.symbol.clone(),
+                address: slot.address,
+            }),""",
+     """            Binding::Unbound => Ok(resume),""",
+     ANDROID),
+
+    ("boundary-A2", "A",
+     "the host-to-guest recursion depth no longer capped",
+     BOUNDARY,
+     """        if depth > MAX_GUEST_DEPTH {""",
+     """        if false && depth > MAX_GUEST_DEPTH {""",
+     ANDROID),
+
+    ("boundary-A3", "A",
+     "a callback restores only the caller-saved registers, leaving X19-X28 clobbered",
+     BOUNDARY,
+     """        for (index, &value) in self.x.iter().enumerate() {
+            cpu.set_x(XReg::new(index as u8).expect("X0-X30 exist"), value);
+        }""",
+     """        for (index, &value) in self.x.iter().enumerate().take(19) {
+            cpu.set_x(XReg::new(index as u8).expect("X0-X30 exist"), value);
+        }""",
+     ANDROID),
+
+    ("boundary-A4", "A",
+     "SP not restored after a call into guest code",
+     BOUNDARY,
+     """        cpu.set_sp(self.sp);
+        cpu.set_pc(self.pc);""",
+     """        cpu.set_pc(self.pc);""",
+     ANDROID),
+
+    ("boundary-A5", "A",
+     "a failing inline handler records its error and lets the guest carry on anyway",
+     BOUNDARY,
+     """            record_pending(error);
+            import.call.defer_to_caller();""",
+     """            record_pending(error);""",
+     ANDROID),
+
+    ("boundary-A6", "A",
+     "the exit path stops reading a deferred error, so it reports the symbol as unbound",
+     BOUNDARY,
+     """            if let Some(error) = take_pending() {
+                return Err(error);
+            }""",
+     """            if let Some(error) = take_pending() {
+                let _ = error;
+            }""",
+     ANDROID),
+
+    ("boundary-A7", "A",
+     "a callback entered on a stack pointer AArch64 forbids",
+     BOUNDARY,
+     """        if sp % 16 != 0 {""",
+     """        if false && sp % 16 != 0 {""",
+     ANDROID),
+
+    ("boundary-A8", "A",
+     "the exit-path crossing cap removed",
+     BOUNDARY,
+     """            if crossings >= self.exit_crossings {""",
+     """            if false && crossings >= self.exit_crossings {""",
+     ANDROID),
+
+    ("boundary-A9", "A",
+     "an execute fault inside the region no longer re-described, so a mid-slot branch loses its symbol",
+     BOUNDARY,
+     """                ExitReason::MemoryFault { address, access: AccessKind::Execute, .. }
+                    if self.region.holds_function(address) || self.region.holds_data(address) =>""",
+     """                ExitReason::MemoryFault { address, access: AccessKind::Execute, .. }
+                    if false && (self.region.holds_function(address)
+                        || self.region.holds_data(address)) =>""",
+     ANDROID),
+
+    # The over-correction: treating a call to a slot's first instruction as a branch into its middle
+    # refuses every legitimate imported call.
+    ("boundary-B1", "B",
+     "a call to a slot's own address reported as a branch into its middle",
+     BOUNDARY,
+     """            Some((slot, offset)) if offset != 0 => match self.slots.get(&slot) {""",
+     """            Some((slot, offset)) if true => match self.slots.get(&slot) {""",
+     ANDROID),
+
+    # ---- the seam the boundary rests on ----------------------------------------------------------
+    ("cpu-A38", "A",
+     "a deferred inline thunk resumes the guest anyway instead of exiting",
+     CPU_DYN,
+     """                if deferred {""",
+     """                if false && deferred {""",
+     ANDROID),
+
+    ("cpu-A39", "A",
+     "SP missing from the register file a thunk handler sees",
+     CPU_DYN,
+     """    fn sp(&self) -> GuestAddr {
+        // SAFETY: as `x`. `SP` is a field of `JitState` like any other.
+        unsafe { od_jit_get_sp(self.jit) as GuestAddr }
+    }""",
+     """    fn sp(&self) -> GuestAddr {
+        0
+    }""",
+     ANDROID),
 ]
 
 
