@@ -49,7 +49,11 @@ Other committed tools, each self-checking against a known count: `tools/thunk_sw
 Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-plan/progress.md`.
 
 - **Task 1 (measure before building) — complete, reviewed, approved.** Commits `d44a516`..`672ddc2`.
-- **Task 2 (the thunk boundary) — not started. This is what to do next.**
+- **Task 2 (the thunk boundary) — IN FLIGHT** as of this writing, dispatched from `c553177`. A
+  subagent is implementing it in the session that wrote this handoff. **Subagents do not survive a
+  session change**, so if you are reading this in a fresh session, check `git log` first: if Task 2
+  has commits, review them; if it has none, simply re-dispatch it. Nothing is lost either way, because
+  the task's requirements are fully specified in the plan and in D17.
 - Task 3 (the bionic subset) — not started. Scope is fixed at **170 thunk functions + 18 data objects**.
 - Task 4 (all 3,594 initializers, the M3 gate) — not started.
 
@@ -202,9 +206,13 @@ Read in this order:
 7. **`.superpowers/sdd/android-abi-plan/task-1-report.md`** and **`task-1-review.md`** — only if Task
    2 needs the measurement detail behind D17.
 
-**First concrete action:** generate the Task 2 brief with the subagent-driven-development skill's
-`scripts/task-brief docs/plans/android-abi-plan.md 2`, then dispatch one implementer for the thunk
-boundary. Carry into its dispatch: D17's in-loop dispatch decision, that the dispatcher-side MXCSR
+**First concrete action:** check `git log --oneline c553177..HEAD` for Task 2 commits.
+
+- **If there are none**, generate the Task 2 brief with the subagent-driven-development skill's
+  `scripts/task-brief docs/plans/android-abi-plan.md 2` and dispatch one implementer. The brief already
+  exists at `.superpowers/sdd/android-abi-plan/task-2-brief.md` if the workspace survived.
+- **If there are commits**, Task 2 got partway in the previous session. Read its report if present,
+  then review what landed before continuing — do not assume it is complete just because commits exist. Carry into its dispatch: D17's in-loop dispatch decision, that the dispatcher-side MXCSR
 guard already exists and must not be moved or removed, and that an unbound symbol must fail with a
 typed error naming the symbol and guest address.
 
