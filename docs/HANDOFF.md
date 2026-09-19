@@ -52,11 +52,11 @@ Other committed tools, each self-checking against a known count: `tools/thunk_sw
 Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-plan/progress.md`.
 
 - **Task 1 (measure before building) — complete, reviewed, approved.** Commits `d44a516`..`672ddc2`.
-- **Task 2 (the thunk boundary) — IN FLIGHT** as of this writing, dispatched from `c553177`. A
-  subagent is implementing it in the session that wrote this handoff. **Subagents do not survive a
-  session change**, so if you are reading this in a fresh session, check `git log` first: if Task 2
-  has commits, review them; if it has none, simply re-dispatch it. Nothing is lost either way, because
-  the task's requirements are fully specified in the plan and in D17.
+- **Task 2 (the thunk boundary) — implemented, commits `04186ed`..`e245bfe`. REVIEW NOT YET DONE.**
+  Spec ✅ per the implementer; durable record is **D18**. It built the region, AAPCS64 marshalling both
+  ways, the variadic rules and a guest `va_list` walk, checked guest memory, the symbol table, and
+  host→guest re-entry. **No symbol is implemented** — all 565 slots are `Unbound` and name themselves
+  when called. Tests went 496 → 608, mutation 88 → 118 rows, all caught.
 - Task 3 (the bionic subset) — not started. Scope is fixed at **170 thunk functions + 18 data objects**.
 - Task 4 (all 3,594 initializers, the M3 gate) — not started.
 
@@ -86,6 +86,29 @@ X0-X7, floats in V0-V7, stack arguments beyond that, returns in X0/X1/V0, and **
 several libc imports need); host → guest callbacks (a `pthread` entry, an `atexit` handler, a `qsort`
 comparator); an ARM64-host path that stays expressible though untestable here; and an unbound symbol
 failing with a **typed error naming the symbol and guest address**, never a crash or a silent zero.
+
+## What Task 2's reviewer should know before starting
+
+The implementer reported these against its own work; they are the highest-value things to verify.
+
+- **Two defects it found late, both now pinned.** The driver handed the caller's `RunLimit` to *every*
+  exit-path crossing, so a guest crossing N times got **N times its allowance** — found because two
+  mutation rows **hung instead of failing**. The fix then mis-reported any terminal exit landing on the
+  budget's last instruction as `StepLimitReached`, **including `MemoryFault`**, which is not resumable
+  where a step limit is — so a caller would have resumed a faulting guest. Check both fixes are complete.
+- **13 of the reachable 188 are variadic** — 9 true (`fprintf`, `fscanf`, `snprintf`, `sscanf`,
+  `syslog`, `open`, `prctl`, `syscall`, `__android_log_print`) plus 4 `va_list` forms. `printf` is
+  **not** reachable and `__open_2` is **not** variadic. Also: **`mallinfo` returns in `X8`**, which the
+  brief's "returns in X0/X1/V0" omitted — check nothing else needs an indirect result register.
+- **An inline handler holding no CPU is a *type* property, not a rule**, which is how re-entrancy is
+  prevented. Verify a handler genuinely cannot obtain two live mutable CPU references.
+- **One guard is labelled a watch, not a detector** — the caller-saved half of the callback state
+  restore has no test that can distinguish it. That labelling is correct practice here; confirm the
+  label rather than asking for a test that cannot exist.
+- The **ARM64-host path is expressible but untested and not claimed to work.**
+
+Round trip re-measured after the mechanism changed: **26.7-31.0 ns against 81-101 ns**
+(n=31/cell/process, 45 processes). D17's 3x holds; its bimodality open question is untouched.
 
 ## Blockers and risks
 
@@ -209,13 +232,21 @@ Read in this order:
 7. **`.superpowers/sdd/android-abi-plan/task-1-report.md`** and **`task-1-review.md`** — only if Task
    2 needs the measurement detail behind D17.
 
-**First concrete action:** check `git log --oneline c553177..HEAD` for Task 2 commits.
+**First concrete action: review Task 2.** It is implemented and unreviewed, which is the one gap in
+the chain — every other completed task in this project was reviewed, and reviews have caught a Critical
+or a wrong figure in almost every one, including a use-after-free and four wrong numbers that had
+already been written down as fact.
 
-- **If there are none**, generate the Task 2 brief with the subagent-driven-development skill's
-  `scripts/task-brief docs/plans/android-abi-plan.md 2` and dispatch one implementer. The brief already
-  exists at `.superpowers/sdd/android-abi-plan/task-2-brief.md` if the workspace survived.
-- **If there are commits**, Task 2 got partway in the previous session. Read its report if present,
-  then review what landed before continuing — do not assume it is complete just because commits exist. Carry into its dispatch: D17's in-loop dispatch decision, that the dispatcher-side MXCSR
+Build the package as `git diff -U10 c553177..e245bfe -- crates/ tools/ ':!crates/dynarmic-sys/vendor'`
+and dispatch a reviewer against `.superpowers/sdd/android-abi-plan/task-2-brief.md`,
+`task-2-report.md`, and D18. Ask it specifically to check: the AAPCS64 **variadic** rules (they differ
+from the fixed-argument rules, and 13 of the reachable 188 are variadic); the guest `va_list` walk
+against hostile input; that an inline handler genuinely cannot re-enter the guest, which the
+implementer made a *type* property rather than a rule; and the two late defects it found in its own
+code (see below) for whether their fixes are complete.
+
+Then Task 3 — the bionic subset, 170 functions + 18 data objects. Do not start it before Task 2's
+review closes; it consumes that boundary directly. Carry into its dispatch: D17's in-loop dispatch decision, that the dispatcher-side MXCSR
 guard already exists and must not be moved or removed, and that an unbound symbol must fail with a
 typed error naming the symbol and guest address.
 
