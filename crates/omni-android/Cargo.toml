@@ -9,3 +9,26 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# The guest address space, and `admit` — the one copy of "may guest code touch this range". The
+# thunk boundary validates every pointer the guest hands it through that function rather than
+# through a second copy of the rules (Global Constraint 11, and the reason M4 deduplicated them).
+omni-mem = { workspace = true }
+# `GuestCpu` and the thunk seam. Note what is **not** here: no `dynarmic-sys`, and nothing
+# target-gated. This crate must compile for all five targets without `cfg`
+# (`ARCHITECTURE.md` section 2), which is exactly why the boundary is written against
+# `ThunkCall`/`ThunkRegs` and not against the translating backend's types.
+omni-cpu = { workspace = true }
+# The loader's `SymbolProvider`, which is how imports get bound to thunk addresses at load time.
+omni-elf = { workspace = true }
+thiserror = { workspace = true }
+# The thunk table is built while the loader resolves symbols, from `&self`, and dispatched from
+# guest threads afterwards.
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+# Tests only, and for the same reason `omni-cpu`'s suites carry them: the boundary's assertions are
+# about a **live** guest — real translated ARM64 code branching into a real thunk region — and a
+# mock would assert facts about the mock. `omni-apk` is for the real-APK fixture (Global
+# Constraint 2).
+omni-apk = { workspace = true }
+omni-platform = { workspace = true }
