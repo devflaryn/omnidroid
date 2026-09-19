@@ -15,7 +15,7 @@
 | 3 — string functions | done (commit `1335aeb`) |
 | 4 — ctype + numeric conversion | done (commit `06d332b`) |
 | 5 — libm | done (this commit) |
-| 6 — printf core (stretch) | pending |
+| 6 — printf core (stretch) | done (this commit) |
 | 7 — verification | pending |
 
 ---
@@ -488,6 +488,45 @@ should sanity-check against the NDK headers.
 this crate treats a null pointer as "skip the write" — a documented divergence (on device a
 null output would crash; here the guest's null cannot crash the host, and skipping is the
 least surprising non-crashing behaviour).
+
+### 2.5 Phase 6 — printf formatting core (commit of this section)
+
+**Shape:** [`printf::format(fmt: &str, args: &[FormatArg], out: &mut String) ->
+Result<usize, FormatError>`] — the snprintf *engine* over an explicit argument list, no
+variadics, no guest memory. The adapter marshals the guest's `va_list` into `&[FormatArg]`
+and copies the format string out; `FormatArg::Str` carries already-copied string content.
+Return value is the would-be snprintf length (excludes the NUL); truncation is the
+adapter's job (it owns the guest buffer size — `__vsnprintf_chk`'s extra argument lives
+there, and `__builtin___snprintf_chk` overflow must abort *there*, not here).
+
+**Implemented:** conversions `d i u o x X c s p e E f F g G a A %%`; flags `- + space # 0`;
+width incl. `*` (negative width → left-justify per C), precision incl. `.*` (negative →
+omitted per C); length modifiers `hh h l ll z j t q L` parsed and recorded, with `hh`/`h`
+actually truncating the printed value to `signed char`/`short` (and unsigned forms) as C
+does. `%n` **rejected unconditionally** with `FormatError::NNotSupported` before any
+output — Android forbids it and it is an exploit primitive. Unknown specifiers error
+*before* consuming an argument, so argument-stream state stays meaningful. `%p` prints
+`0x` + lowercase hex, `(nil)` for NULL; `%s` prints `(null)` for a null `FormatArg::Ptr`.
+Zero-padding respects sign/`0x` prefixes and is suppressed when a precision is set (C11
+7.21.6.1p6) and for inf/nan/`(nil)`. Integer precision-0 on a zero value prints nothing.
+`%e` exponents always have ≥2 digits (C standard — Windows CRT prints 3, a divergence
+recorded in §4). `%g` threshold `< -4 || >= precision`, trailing zeros stripped unless
+`#`. `%a/%A` prints minimal nibbles with `0X`-style uppercase prefixes (`0x1p+0`,
+`0X1.8P+1`), via exact bit decomposition.
+
+**Known gaps (documented, per the partial-is-acceptable rule):** positional `%n$`,
+thousands grouping `'`, wide `%ls/%lc`, locale decimal point (always `.`); the format
+string is expected ASCII (bytes ≥0x80 are copied verbatim). Not oracle-tested against the
+host CRT — expectations derive from the C standard and bionic's documented behaviour
+(§7.21.6.1 of C11 and the NDK docs), and the Windows CRT was deliberately NOT consulted.
+
+**Bugs the tests caught this phase (VERIFIED failing first, then fixed):** `%a` printed
+13 fixed nibbles + 2-digit exponent (`0x1.0000000000000p+00`) instead of minimal form;
+unknown-specifier check ran *after* argument consumption, breaking pre-scan semantics;
+an unreachable duplicate `o|x|X` match arm (dead code left by an earlier edit) that also
+referenced a moved variable — caught by `cargo build`, not tests.
+
+Suite: 163 tests (11 printf), clippy clean.
 
 ---
 
