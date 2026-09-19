@@ -12,8 +12,8 @@
 | 0 — scope | done (commit `f228384`) |
 | 1 — foundation | done (commit `ac023fb`) |
 | 2 — memory functions | done (commit `f434809`) |
-| 3 — string functions | done (this commit) |
-| 4 — ctype + numeric conversion | pending |
+| 3 — string functions | done (commit `1335aeb`) |
+| 4 — ctype + numeric conversion | done (this commit) |
 | 5 — libm | pending |
 | 6 — printf core (stretch) | pending |
 | 7 — verification | pending |
@@ -400,6 +400,50 @@ alignment) is documented on the module. `newlocale`/`uselocale` return/accept a 
 `locale_t` (`freelocale` frees nothing — nothing was allocated, argued in the module docs).
 `uselocale` takes the adapter's current-locale slot address explicitly rather than adding a
 trait method — same reasoning as `scratch`.
+
+### 2.3 Phase 4 — numeric conversion, qsort/bsearch (commit of this section)
+
+9 conversions (`strtol`, `strtoll`, `strtoul`, `strtoull`, `atoi`, `atoll`, `atof`, `strtod`,
+`strtof`) + `rand`/`srand` + `qsort`/`bsearch`. 20 numerics tests + 7 sort tests + 1 added atof
+test; suite 135.
+
+**ABI decisions exercised (the LP64 trap):** every `long`-shaped boundary value is written as an
+explicit 64-bit literal in tests — `LONG_MAX = 9223372036854775807` (clamped overflow,
+ERANGE), `LONG_MIN = -9223372036854775808` (both exact and `-9223372036854775809` → ERANGE),
+`ULONG_MAX = 18446744073709551615` (exact fit) and `18446744073709551616` → ERANGE. A host
+`long` (32-bit on LLP64 Windows) would silently produce 2147483647-clamped results; the tests
+would fail loudly. `strtoul("-1") == u64::MAX` (the unsigned-negation quirk) is tested.
+
+**endptr contract:** tested for the three C-mandated cases — after digits, at the ORIGINAL
+string when no digits were consumed, and untouched/`EINVAL` for an invalid base (POSIX
+refinement). The bare `"0x"` prefix case parses the `"0"` and stops before `x` (C's longest-
+valid-prefix rule), tested for both strtol and strtod.
+
+**Bugs the tests caught this phase (VERIFIED failing first, then fixed):**
+1. `strtod("inf")`/`"nan"`: the inf/nan word reader advanced `cursor` past the word and the
+   endptr computation added the word length *again*, faulting 3 bytes past a short mapping.
+2. `strtod("1e400")`: the exponent clamp (`clamp(-310, 308)`) silently produced a *finite*
+   1e308 instead of `HUGE_VAL`+ERANGE; overflow/underflow is now decided on the actual decimal
+   magnitude `lg10(mantissa) + exp10` before evaluation.
+3. The `rand` test's initial oracle was wrong: I quoted glibc's TYPE_3 sequence
+   (`1804289383...`) for what is a TYPE_0-style LCG. Hand-recomputation
+   (`(1103515245*1+12345) mod 2^31 = 1103527590`) fixed the test, not the code; the sequence
+   tested is 1103527590, 377401575, 662824084, 1147902781, 2035015474. The
+   C-specified part (same seed → same sequence) is also tested.
+
+**strtod precision statement (documented limitation):** the parser accumulates the decimal
+mantissa into `u128` (≈ 38 significant digits; further digits shift the exponent, which is
+value-preserving for zeros but drops non-zero rounding surface) and evaluates
+`mantissa * 10^exp10` through `f64::powi` products. For exponents in `[-22, 22]` the result is
+correctly rounded (10^22 is exact in f64); outside that window the error is at most 1–2 ulp.
+Bit-exactness with glibc's arbitrary-precision `strtod` is NOT claimed — flagged in §6, with the
+mitigation that the engine's initializers parse short, well-behaved numbers.
+
+**qsort implementation choice:** heapsort (in-place, deterministic, no guest allocation).
+C leaves the order of equal elements unspecified, so no stability promise is made. The
+comparator runs through the `GuestCompare` callback trait (the adapter will perform the guest
+call); a comparator fault propagates as `Fault`. Verified against Rust's `sort_unstable` as an
+independent reference on 100 pseudo-random elements.
 
 ## 3. ABI decisions (long / wchar_t / long double / errno / layouts)
 
