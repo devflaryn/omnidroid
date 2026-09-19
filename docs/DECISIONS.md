@@ -1066,7 +1066,9 @@ less than the estimate assumed.
 
 **The warm figure is not a steady-state throughput and must not be read as one.** A warm pass is 870
 entries to and exits from `od_jit_run` around 8,679 instructions of work, so it measures the *call*
-and not translated code. And the per-call figure is itself a **ceiling** rather than the boundary:
+and not translated code. Note this **is** an entry-and-exit figure; a later brief of mine described it
+as "an entry ceiling excluding the exit", which is wrong and was propagated into an M3 report and three
+code comments before being caught. And the per-call figure is itself a **ceiling** rather than the boundary:
 of 63.7 ns per timed iteration, 10.7 ns is the harness's own eight `set_x` calls plus `rearm`
 (measured directly, by running the same loop with the `run` removed), and the remaining **53.0 ns**
 still contains about ten guest instructions of real work. So the call boundary costs **under 53 ns**,
@@ -1227,3 +1229,68 @@ implemented on this pin and surfaces through the interpreter fallback, and Andro
 vDSO reads `CNTVCT_EL0`, not `CNTPCT_EL0`. So the engine's real clock path still traps. Fixing
 `CNTPCT_EL0` was necessary and is not sufficient.
 
+
+---
+
+## D17 — The thunk boundary dispatches inside the run loop
+**Measured before building, which is the point.** M3 needs every imported symbol to cross from guest
+ARM64 into host Rust, and the two candidate designs differ by more than the difference between
+convenient and inconvenient.
+
+| Design | Cost per call | Notes |
+|---|---|---|
+| **A — exit to Rust per call** | **≈ 80-105 ns** (81.2 via a PLT stub, 102.8 direct) | **Unstable by about 2x**; see the open question below |
+| **B — dispatch inside the run loop** | **≈ 33 ns**, including the floating-point guard | Stable across every cell measured |
+| Ratio to plan against | **3x** | Measured 2.5-3.1x here, 3.00x independently |
+
+Method: 15 processes × 3 code placements, n = 31 per cell per process, committed as
+`tools/thunk_sweep.py` — which **refuses to print when a load-bearing cell is unstable**, judging on
+the interquartile ratio, because one preempted round and a genuine second mode look identical to a
+max/min check.
+
+**Decision: dispatch inside the run loop, per symbol**, keeping the exit path for unresolved imports
+and for anything that must call back into guest code. Verified not to weaken the runaway-guest
+defence: the halt check lands on `ReturnFromRunCode`, which D16 established is the only path that
+tests both the halt flag and the cycle counter.
+
+**A silent-corruption class the faster design brings with it.** An inline handler runs with the
+**guest's MXCSR**, because dynarmic's supervisor-call emitter omits the control-word switch that the
+exit path performs — verified line by line in the pin. Host floating-point code would then execute
+under guest rounding and denormal settings, and `exp`, `log`, `powf` and `sincosf` are all among the
+reachable imports, so the corruption would be numerical and silent.
+
+The guard costs **1.1 ns**, about 3% of design B, and belongs in the **dispatcher rather than each
+handler** — a forgotten guard is invisible — and must restore the *guest's* word on the way out, not
+only set the host's on the way in. It is asserted **from inside the guest**: a denormal multiply after
+the call must flush to +0 under `FPCR.FZ`, in both directions, with both halves ablated and pinned by
+mutation rows. Worth recording why it is nearly free: `switched` is false by default, so it reduces to
+a single `stmxcsr` that stalls only on in-flight SSE and otherwise hides behind independent work.
+
+### Open question, recorded rather than resolved
+
+Two figures from the same tree do not reconcile. An `od_jit_run` entry-and-exit measures **≈ 41 ns**,
+and a design-A round trip **is** one entry and one exit — yet it measures **81-103 ns**. During review
+the entry/exit path was directly observed to be **bimodal** on this host: the same context and cell
+gave 41.8 / 89.0 / 91.7 ns across three rounds, with host frequency, thermal drift, live contexts,
+code placement, entry count and exit reason all ruled out, and design B immune at 24.9 / 25.2 / 25.2.
+
+A later attempt to make that bimodality a committed measurement — two tests named to sort at opposite
+ends of the run order — **did not reproduce it**: 41.38 ns first, 41.27 ns last, ratio 1.00 across 15
+processes. The original observation was direct, so it stands, and design A is therefore quoted as a
+band on its strength rather than as a point. But the discrepancy is unexplained, and the sweep tool
+now prints both positions and their ratio on every run so that the next sighting arrives with numbers
+instead of a recollection.
+
+This is recorded as an open question because design B is chosen under every regime measured, so the
+ambiguity changes no decision — but it would change the cost of ever going back to A.
+
+### Scope this sets for the rest of M3
+
+Of `libroblox.so`'s 565 imports, **188 are statically reachable** from the 3,594 `init_array` roots
+(band 113 / 188 / 246 / 565; closure 15,779 of 245,117 functions). Of those, 18 are `STT_OBJECT` data
+and 2 are `STT_NOTYPE`, so the thunk surface is **170 functions plus 18 data objects**.
+
+188 is a **lower bound**, and honestly so: the closure contains **17,698 unresolvable indirect call
+sites**, and the function map has a **2,670,684-byte region with no unwind information** that hides
+one initializer entry point — recovering it is worth exactly 67 of the 188. Treat the figure as a
+superset prediction to scope work against, never as a completion criterion.

@@ -154,9 +154,17 @@ import list *is* the specification, so the stub surface is generated from the EL
 hand-maintained, and a missing symbol becomes a build-time fact instead of a runtime surprise.
 
 **Host-native, not guest-compiled.** Every one of these is a Rust function running as native host
-code. `malloc` is the host allocator, so the guest heap *is* the host heap, which is what makes the
-memory model work and what "use host resources directly" means in practice. It also means libc runs
-at full native speed on x86-64 hosts instead of being translated.
+code, so libc runs at full native speed on x86-64 hosts instead of being translated.
+
+**Correction (M3 task 1): `libroblox.so` imports no allocator at all.** An earlier draft of this
+section claimed `malloc` would be the host allocator, so that the guest heap *is* the host heap. That
+is not how this binary works: it imports **zero** allocator symbols of any kind — only `__cxa_atexit`,
+`__cxa_finalize` and `__cxa_thread_atexit_impl` — and carries its own allocator internally, reaching
+the host through **guest `mmap`**.
+
+So the heap seam is the **demand pager**, not `malloc`. That is arguably a better fit for D10 than the
+documented design, since every guest allocation arrives as a mapping request we already reserve lazily
+and commit in granules — but the previous claim was wrong and is withdrawn rather than reinterpreted.
 
 **The thunk boundary.** Guest code is ARM64; host code is x86-64 on x86-64 hosts. The loader binds
 each undefined symbol to a synthetic guest address inside a reserved *thunk region*. When the CPU
