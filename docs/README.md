@@ -1,5 +1,9 @@
 # Omnidroid documentation
 
+## Start here
+- `HANDOFF.md` — session handoff: git state, milestone status, exact M3 progress, what to do next,
+  and the list of conclusions that were later withdrawn so they are not repeated.
+
 ## Design
 - `ARCHITECTURE.md` — runtime core, APK/ELF loading, Android compatibility layer, ARM64
   execution, memory model, isolation, graphics, platform abstraction, testing strategy.
