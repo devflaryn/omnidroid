@@ -188,6 +188,11 @@ fn mbrtowc_overlong_and_surrogate_rejected() {
     // Overlong U+0000 as C0 80 — invalid lead.
     ctx.mem.map(0x1200, b"\xC0\x80");
     assert!(mbrtowc(&mut ctx, 0, 0x1200, 2, 0).is_err());
+    // Broken continuation: C3 28 ("é" lead + a non-continuation) must be EILSEQ,
+    // not decoded as garbage.
+    ctx.mem.map(0x1300, b"\xC3\x28");
+    assert!(mbrtowc(&mut ctx, 0, 0x1300, 2, 0).is_err());
+    assert_eq!(ctx.errno(), 84);
 }
 
 #[test]

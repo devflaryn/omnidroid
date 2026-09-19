@@ -236,20 +236,24 @@ fn walk_pair(
 /// `int strcmp(const char *a, const char *b)`
 ///
 /// Lexicographic comparison as unsigned chars, up to and including the first NUL.
-/// **Only the sign is specified by C**; this returns the conventional `-1/0/1`.
+/// **Only the sign is specified by C**; bionic returns the byte difference and we
+/// match bionic (see the comment in the body).
 ///
 /// Errors: `Err(Fault)` when either string is null or runs into unmapped memory.
 pub fn strcmp(mem: &impl GuestMemory, a: u64, b: u64) -> Result<i32, Fault> {
     match walk_pair(mem, a, b, u64::MAX, |b| b)? {
         None => Ok(0),
-        Some((ca, cb)) => Ok(if ca < cb { -1 } else { 1 }),
+        // Bionic's strcmp returns the byte difference (c - d), not glibc's ±1. The C
+        // standard only fixes the SIGN; bionic fixes the magnitude. We match bionic.
+        Some((ca, cb)) => Ok(ca as i32 - cb as i32),
     }
 }
 
 /// `int strncmp(const char *a, const char *b, size_t n)`
 ///
 /// Like [`strcmp`] but compares at most `n` bytes. `n == 0` returns `0` without touching
-/// memory (valid C even for null pointers).
+/// memory (valid C even for null pointers). Result convention matches bionic (byte
+/// difference) — see [`strcmp`].
 ///
 /// Errors: `Err(Fault)` when a scanned byte is unmapped or either pointer is null and
 /// `n != 0`.
@@ -259,7 +263,8 @@ pub fn strncmp(mem: &impl GuestMemory, a: u64, b: u64, n: u64) -> Result<i32, Fa
     }
     match walk_pair(mem, a, b, n, |b| b)? {
         None => Ok(0),
-        Some((ca, cb)) => Ok(if ca < cb { -1 } else { 1 }),
+        // Same bionic byte-difference convention as strcmp.
+        Some((ca, cb)) => Ok(ca as i32 - cb as i32),
     }
 }
 

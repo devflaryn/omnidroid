@@ -33,6 +33,8 @@ fn d_i_signed_forms() {
     assert_eq!(fmt("%+d", &[FormatArg::Int(-42)]), "-42");
     assert_eq!(fmt("% d", &[FormatArg::Int(42)]), " 42");
     assert_eq!(fmt("% d", &[FormatArg::Int(-42)]), "-42");
+    // C11 7.21.6.1p5: the space flag is IGNORED when + is present — never "+ 42".
+    assert_eq!(fmt("%+ d", &[FormatArg::Int(42)]), "+42");
     // Width and zero padding.
     assert_eq!(fmt("%5d", &[FormatArg::Int(42)]), "   42");
     assert_eq!(fmt("%-5d|", &[FormatArg::Int(42)]), "42   |");

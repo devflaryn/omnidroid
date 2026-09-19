@@ -141,8 +141,10 @@ pub fn memcmp(mem: &impl GuestMemory, a: u64, b: u64, n: u64) -> Result<i32, Fau
         mem.read(b + done, &mut buf_b[..chunk])?;
         for i in 0..chunk {
             if buf_a[i] != buf_b[i] {
-                // Unsigned-char comparison semantics; sign-only result.
-                return Ok(if buf_a[i] < buf_b[i] { -1 } else { 1 });
+                // Unsigned-char comparison; bionic returns the byte difference
+                // (unsigned values), glibc returns ±1. Sign-only is all C requires, but
+                // we match bionic's magnitude.
+                return Ok(buf_a[i] as i32 - buf_b[i] as i32);
             }
         }
         done += chunk as u64;

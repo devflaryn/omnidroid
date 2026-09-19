@@ -187,6 +187,21 @@ fn memmove_forward_overlap_matches_reference() {
 }
 
 #[test]
+fn memmove_backward_overlap_multi_chunk_matches_reference() {
+    // n > 256 forces multiple chunks: only a true back-to-front walk survives
+    // dst > src overlap here (a single-chunk copy is snapshot-equivalent by luck).
+    let mut mem = MockMemory::new();
+    mem.map(0x1000, vec![0u8; 1024].as_slice());
+    let data: Vec<u8> = (0..600u32).map(|i| (i * 7 + 3) as u8).collect();
+    mem.write(0x1000, &data).unwrap();
+    assert_eq!(memmove(&mut mem, 0x1042, 0x1000, 600), Ok(0x1042));
+    let mut out = vec![0u8; 600];
+    mem.read(0x1042, &mut out).unwrap();
+    // Oracle: the source data itself (back-to-front copy preserves every byte).
+    assert_eq!(out, data);
+}
+
+#[test]
 fn memmove_exact_overlap_is_identity() {
     let mut mem = mapped();
     mem.write(0x1000, &[4, 5, 6]).unwrap();

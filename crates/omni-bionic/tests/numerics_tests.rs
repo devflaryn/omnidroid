@@ -147,6 +147,11 @@ fn strtol_64bit_long_min_and_negative_overflow() {
     let (mut c, s) = ctx("-9223372036854775809");
     assert_eq!(strtol(&mut c, s, 0, 10), Ok(LONG_MIN));
     assert_eq!(c.errno(), ERANGE);
+    // Way over even u64: the u64 accumulator itself overflows (overflow flag set);
+    // the clamp must still be LONG_MIN, never LONG_MAX.
+    let (mut c, s) = ctx("-99999999999999999999999");
+    assert_eq!(strtol(&mut c, s, 0, 10), Ok(LONG_MIN));
+    assert_eq!(c.errno(), ERANGE);
 }
 
 #[test]

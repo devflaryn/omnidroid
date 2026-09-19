@@ -109,6 +109,11 @@ fn strcmp_sign_only() {
     assert!(strcmp(&mem2, 0x1000, 0x2000).unwrap() < 0);
     // NUL vs byte: "app\0..." vs "appX..." — NUL sorts first.
     assert!(strcmp(&mem2, 0x1000, 0x2000).unwrap() < 0);
+    // Sign-only, but the magnitude must be plausible for bionic: bionic returns the
+    // byte difference, and byte differences are bounded by ±255 ('a'=97 vs 'z'=122 → -25).
+    let mem3 = two_strings("a", 0x1000, "z", 0x2000);
+    let d = strcmp(&mem3, 0x1000, 0x2000).unwrap();
+    assert_eq!(d, -25, "bionic strcmp returns the byte difference 'a' - 'z'");
 }
 
 #[test]
