@@ -11,8 +11,8 @@
 |---|---|
 | 0 — scope | done (commit `f228384`) |
 | 1 — foundation | done (commit `ac023fb`) |
-| 2 — memory functions | done (this commit) |
-| 3 — string functions | pending |
+| 2 — memory functions | done (commit `f434809`) |
+| 3 — string functions | done (this commit) |
 | 4 — ctype + numeric conversion | pending |
 | 5 — libm | pending |
 | 6 — printf core (stretch) | pending |
@@ -347,6 +347,59 @@ Design points:
   region end (exact fault address asserted), `addr+len` overflowing `u64` (fault, no wraparound —
   including a range ending at `u64::MAX` which is *representable* and proceeds to a normal
   unmapped fault at its first unmapped byte), self-copy, exact overlap.
+
+### 2.2 Phase 3 — string functions (commit of this section)
+
+19 libc + 1 wide-adjacent function group implemented: `strlen`, `__strlen_chk`, `strnlen`,
+`strcmp`, `strncmp`, `strcasecmp`, `strncasecmp`, `strcpy`, `strncpy`, `__strncpy_chk`,
+`__strncpy_chk2`, `strcat`, `strncat`, `__strcat_chk`, `strchr`, `strrchr`, `strstr`, `strspn`,
+`strcspn`, `__gnu_strerror_r`; plus `wcslen`, `wmemchr`, `wmemcmp`, `wctob`, `mbrtowc`,
+`mbsrtowcs` (wide/multibyte, `wchar_t` = 32-bit) and the locale-handle functions `newlocale`,
+`freelocale`, `uselocale`, `localeconv` (values; the guest struct composition lands with the
+adapter's scratch buffer). 38 string tests + 18 wide tests + 3 ctype tests (in-module); suite
+107.
+
+**One-byte-per-trait-call scanning (design note, applies crate-wide).** A bulk `read(256)` over
+a mapping overreads past a region end the *string* never crosses — a NUL on the last mapped byte
+must be findable, and a generic `GuestMemory` cannot be asked how far its mapping extends. All
+scans (`find_nul`, `find_nul_bounded`, `strchr`, `walk_pair`, `span_walk`, `strstr`, wide scans)
+therefore read exactly one byte per trait call: termination guaranteed, no false faults, and a
+string ending exactly at a mapping boundary works.
+
+**Mapping probe for no-partial-write copies.** `checked_range` proves address-space
+representability, not mapping. `strcpy`/`strncpy`/`strcat`/`strncat` read (probe) the entire
+destination range before the first write, so a faulting destination is detected with zero bytes
+written. Cost: destination bytes are read twice. Caught by
+`strcat_unmapped_dst_tail_faults_before_writing`, which failed before the probe existed.
+
+**Bugs the tests caught during this phase (both real, both fixed, both VERIFIED failing first):**
+1. `strcat` returned the append position instead of `dst` (C contract: returns `dst`).
+2. `strcasecmp`/`strncasecmp` folded case *after* the byte walk, so a raw-case difference at
+   position 0 produced a wrong sign; the fold now happens inside the walk loop.
+3. `mbrtowc` initially treated structurally-invalid sequences with valid lead bytes (surrogates,
+   > U+10FFFF) as merely incomplete; the decoder now distinguishes `Invalid`/`Incomplete`.
+4. `wmemchr`/`wmemcmp` shadowed the element count with the byte count after range-checking,
+   scanning `n*4` elements; fixed to keep counts separate.
+
+**Bionic-vs-POSIX semantics recorded:** `__strlen_chk` fails when `strlen(s) >= size` (the
+`>=`, not `>`, is bionic's documented check); `__strcat_chk` fails when
+`strlen(dst) + strlen(src) + 1 > dst_size`; `__strncpy_chk2` checks both `n > dst_size` and
+`n > src_size`; `__gnu_strerror_r` follows GNU semantics (returns `buf`, truncates to
+`buflen-1` + NUL, never touches errno), with bionic's `Unknown error <n>` fallback for
+unknown codes (glibc's `<n>: Unknown error` is NOT used).
+
+**mbrtowc/mbsrtowcs errno:** `EILSEQ` is 84 in Linux numbering (kernel UAPI; VERIFIED against
+`include/uapi/asm-generic/errno.h`) — not the Windows value (42), so the host's constant is
+wrong by construction here.
+
+**`localeconv` note:** the C-locale `lconv` *values* (POSIX-fixed: ".", "", CHAR_MAX=127
+monetary fields) are implemented in `locale::LCONV_C_VALUES`; composing the guest-visible arm64
+struct requires the adapter's scratch buffer, so the struct-writing half lands with the adapter.
+The struct layout (pointer fields first, then `char`s, per POSIX declaration order at 8-byte
+alignment) is documented on the module. `newlocale`/`uselocale` return/accept a static sentinel
+`locale_t` (`freelocale` frees nothing — nothing was allocated, argued in the module docs).
+`uselocale` takes the adapter's current-locale slot address explicitly rather than adding a
+trait method — same reasoning as `scratch`.
 
 ## 3. ABI decisions (long / wchar_t / long double / errno / layouts)
 
