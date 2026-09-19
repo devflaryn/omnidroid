@@ -17,7 +17,15 @@ omni-mem = { workspace = true }
 # target-gated. This crate must compile for all five targets without `cfg`
 # (`ARCHITECTURE.md` section 2), which is exactly why the boundary is written against
 # `ThunkCall`/`ThunkRegs` and not against the translating backend's types.
-omni-cpu = { workspace = true }
+#
+# `default-features = false` is load-bearing, and the **path is spelled out rather than inherited**
+# because of a Cargo rule that is easy to miss: with `workspace = true`, a member's
+# `default-features = false` is *ignored* — Cargo says so in a warning — so inheriting here would have
+# switched the translating backend on for the whole workspace. That would have made
+# `cargo build --workspace --no-default-features`, the one command that proves no C++ toolchain is
+# needed, silently stop meaning anything. `omni-cpu` carries the mirror image of this arrangement in
+# its dev-dependency on itself, for the same reason.
+omni-cpu = { path = "../omni-cpu", default-features = false }
 # The loader's `SymbolProvider`, which is how imports get bound to thunk addresses at load time.
 omni-elf = { workspace = true }
 thiserror = { workspace = true }
@@ -26,6 +34,11 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+# The translating backend, **for test targets only**. The boundary's assertions are about real
+# translated ARM64 code branching into a real thunk region; a mock would assert facts about the
+# mock. With resolver = "2" a dev-dependency's features reach only the test targets, so the
+# `--no-default-features` guarantee above survives.
+omni-cpu = { path = "../omni-cpu", default-features = false, features = ["dynarmic"] }
 # Tests only, and for the same reason `omni-cpu`'s suites carry them: the boundary's assertions are
 # about a **live** guest — real translated ARM64 code branching into a real thunk region — and a
 # mock would assert facts about the mock. `omni-apk` is for the real-APK fixture (Global

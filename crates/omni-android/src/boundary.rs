@@ -41,7 +41,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use omni_cpu::{
-    ExitReason, GuestCpu, Nzcv, RunLimit, ThunkCall, ThunkContext, ThunkRegs, VReg, XReg,
+    AccessKind, ExitReason, GuestCpu, Nzcv, RunLimit, ThunkCall, ThunkContext, ThunkRegs, VReg,
+    XReg,
 };
 use omni_mem::{GuestAddr, GuestSpace};
 use parking_lot::Mutex;
@@ -50,6 +51,7 @@ use crate::abi::{ArgRegs, Args, Ret, RetSink, ARG_REGISTERS};
 use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
 use crate::region::ThunkRegion;
+use crate::varargs::VarArgs;
 
 /// How many levels of guest → host → guest the boundary allows.
 ///
@@ -434,11 +436,38 @@ impl Boundary {
                 return Ok(ExitReason::Halted { pc });
             }
             if crossings >= MAX_EXIT_CROSSINGS {
-                return Ok(ExitReason::Halted { pc });
+                return Err(AbiError::CrossingLimit {
+                    crossings,
+                    limit: MAX_EXIT_CROSSINGS,
+                    pc,
+                });
             }
             let exit = cpu.run(pc, limit)?;
-            let ExitReason::Thunk { pc: site } = exit else {
-                return Ok(exit);
+            let site = match exit {
+                ExitReason::Thunk { pc: site } => site,
+                // **A branch into the region that was not a call to a slot's first instruction.**
+                //
+                // The function area is not executable (see `crate::region`), so the backend refuses
+                // the fetch and this is what the guest gets: a typed fault naming the address. It is
+                // the *right* stop and the wrong *message* — "a guest read fault at 0x…" tells a
+                // reader nothing about which symbol's slot it was four bytes into. So it is
+                // re-described here, where the table can say.
+                //
+                // Doing it this way rather than by registering all four words of every slot is what
+                // makes the answer exact for an address that is not even word-aligned, and it costs
+                // no registrations at all.
+                ExitReason::MemoryFault { address, access: AccessKind::Execute, .. }
+                    if self.region.holds_function(address) || self.region.holds_data(address) =>
+                {
+                    return Err(self.slot_at(address).err().unwrap_or_else(|| {
+                        AbiError::NoSuchThunk {
+                            address,
+                            start: self.region.functions_start(),
+                            end: self.region.functions_end(),
+                        }
+                    }));
+                }
+                other => return Ok(other),
             };
             crossings += 1;
             // An inline handler that failed left its reason here and deferred. Checked first, because
@@ -510,6 +539,23 @@ impl Boundary {
     fn slot_at(&self, address: GuestAddr) -> AbiResult<&Slot> {
         if let Some(slot) = self.slots.get(&address) {
             return Ok(slot);
+        }
+        // An address inside a data object rather than at its start: the guest branched into
+        // `__sF + 8`, or a relocation went in at the wrong width. Named against the object it is
+        // inside, which is the only thing that identifies it.
+        if self.region.holds_data(address) {
+            if let Some(slot) = self
+                .slots
+                .range(..=address)
+                .next_back()
+                .map(|(_, slot)| slot)
+                .filter(|slot| matches!(slot.binding, Binding::Data))
+            {
+                return Err(AbiError::DataSymbolCalled {
+                    symbol: slot.symbol.clone(),
+                    address,
+                });
+            }
         }
         match self.region.slot_of(address) {
             Some((slot, offset)) if offset != 0 => match self.slots.get(&slot) {
@@ -623,6 +669,21 @@ impl ImportCall<'_, '_> {
         Args::new(&*self.call, self.mem, self.blame(0))
     }
 
+    /// Continue into the variadic part, where the named arguments stopped.
+    ///
+    /// `consumed` and `overflow` come from [`Args::consumed`] and [`Args::overflow`] on the cursor
+    /// that read the named arguments, so a handler cannot get the split point wrong by counting its
+    /// own parameters. `first_variadic` is the argument index the errors should blame.
+    #[must_use]
+    pub fn varargs(
+        &self,
+        consumed: (u32, u32),
+        overflow: GuestAddr,
+        first_variadic: usize,
+    ) -> VarArgs<'_> {
+        VarArgs::new(&*self.call, self.mem, self.blame(first_variadic), consumed, overflow)
+    }
+
     /// Start writing the return value. Take this *after* the arguments have been read.
     #[must_use]
     pub fn ret(&mut self) -> Ret<'_> {
@@ -673,6 +734,23 @@ impl ReentrantCall<'_> {
     #[must_use]
     pub fn args(&self) -> Args<'_> {
         Args::new(&self.args, &self.boundary.mem, self.blame(0))
+    }
+
+    /// Continue into the variadic part. As [`ImportCall::varargs`], over the argument snapshot.
+    #[must_use]
+    pub fn varargs(
+        &self,
+        consumed: (u32, u32),
+        overflow: GuestAddr,
+        first_variadic: usize,
+    ) -> VarArgs<'_> {
+        VarArgs::new(
+            &self.args,
+            &self.boundary.mem,
+            self.blame(first_variadic),
+            consumed,
+            overflow,
+        )
     }
 
     /// Write the return value.

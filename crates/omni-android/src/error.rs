@@ -250,6 +250,26 @@ pub enum AbiError {
         why: &'static str,
     },
 
+    /// One [`run`](crate::Boundary::run) crossed the exit path more times than the boundary allows.
+    ///
+    /// The containment for a guest that loops through the **exit** path. A guest looping through an
+    /// *inline* thunk spends guest instructions and the backend's own budget stops it; each exit-path
+    /// crossing returns to Rust, so the budget never expires and the loop would be a hang in host
+    /// code rather than in guest code. Reported rather than folded into
+    /// [`ExitReason::Halted`](omni_cpu::ExitReason::Halted), because a caller has to be able to tell
+    /// "my watchdog fired" from "the guest is spinning through the boundary".
+    #[error(
+        "the guest crossed the thunk boundary's exit path {crossings} times in one run, at the          limit of {limit}, most recently at {pc:#x}"
+    )]
+    CrossingLimit {
+        /// How many crossings there were.
+        crossings: u64,
+        /// The limit.
+        limit: u64,
+        /// Where the guest was about to resume.
+        pc: GuestAddr,
+    },
+
     /// The thunk region could not be reserved or has run out of slots.
     #[error("the thunk region cannot hold another {what}: {detail}")]
     RegionFull {
@@ -285,6 +305,7 @@ impl AbiError {
             | AbiError::GuestCallbackStopped { symbol, .. }
             | AbiError::BadCallbackStack { symbol, .. } => Some(symbol),
             AbiError::NoSuchThunk { .. }
+            | AbiError::CrossingLimit { .. }
             | AbiError::RegionFull { .. }
             | AbiError::Memory(_)
             | AbiError::Cpu(_) => None,
@@ -314,6 +335,7 @@ impl AbiError {
             }
             AbiError::GuestCallbackStopped { target, .. }
             | AbiError::BadCallbackStack { target, .. } => Some(target),
+            AbiError::CrossingLimit { pc, .. } => Some(pc),
             AbiError::RegionFull { .. } | AbiError::Memory(_) | AbiError::Cpu(_) => None,
         }
     }
