@@ -24,12 +24,30 @@ pub mod consts {
     pub const ENOMEM: i32 = 12;
     /// Permission denied.
     pub const EACCES: i32 = 13;
+    /// Resource temporarily unavailable (EWOULDBLOCK); sem_trywait on zero, futex
+    /// on a non-matching value.
+    pub const EAGAIN: i32 = 11;
+    /// Device or resource busy: pthread_mutex_trylock on a held mutex.
+    pub const EBUSY: i32 = 16;
     /// Invalid argument.
     pub const EINVAL: i32 = 22;
     /// Numerical argument out of domain.
     pub const EDOM: i32 = 33;
     /// Result too large (range error).
     pub const ERANGE: i32 = 34;
+    /// Resource deadlock avoided: ERRORCHECK relock by the owner.
+    pub const EDEADLK: i32 = 35;
     /// Function not implemented.
     pub const ENOSYS: i32 = 38;
+    /// Operation not supported (Linux: 95 on most architectures; arm64 uses the
+    /// asm-generic numbering where ENOTSUP == EOPNOTSUPP == 95).
+    pub const ENOTSUP: i32 = 95;
+    /// Operation timed out: POSIX timed-lock/cond waits. LINUX VALUE (110);
+    /// Windows' WSAETIMEDOUT is 10060 and its ERROR_SEM_TIMEOUT is 121 — both
+    /// different, which is exactly why the constant is defined here.
+    pub const ETIMEDOUT: i32 = 110;
+    /// Owner died (robust mutexes; defined for completeness of the mutex error set).
+    pub const EOWNERDEAD: i32 = 130;
+    /// State not recoverable (robust mutexes).
+    pub const ENOTRECOVERABLE: i32 = 131;
 }
