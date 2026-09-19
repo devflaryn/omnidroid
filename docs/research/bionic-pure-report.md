@@ -9,8 +9,8 @@
 
 | phase | status |
 |---|---|
-| 0 — scope | done (this commit) |
-| 1 — foundation | pending |
+| 0 — scope | done (commit `f228384`) |
+| 1 — foundation | done (this commit) |
 | 2 — memory functions | pending |
 | 3 — string functions | pending |
 | 4 — ctype + numeric conversion | pending |
@@ -286,6 +286,32 @@ with reasons, finalised in phase 1:
    storage without knowing how they are placed.
 4. **Scanning loops** read at least one byte through the trait per iteration (task rule), so every
    loop terminates at a terminator or a `Fault`; no scan is unbounded.
+
+### 1.6 Phase 1 — what was built and verified
+
+* `memory::Fault` (newtype over the faulting address, `Eq`/`Hash` for exact-address test
+  assertions), `memory::GuestMemory` (`read`/`write`, both fallible), and
+  `memory::checked_range`.
+* **`checked_range` end-inclusive decision (VERIFIED by test):** a range's validity invariant is
+  that its *last byte address* `addr + len - 1` fits in `u64` — not that the exclusive end
+  `addr + len` fits. An exclusive-end check wrongly rejects a one-byte range at `u64::MAX`, which
+  is a representable guest address; the end-inclusive rule accepts `[u64::MAX, 1]` and rejects
+  `[u64::MAX, 2]`. Tested in `checked_range_rejects_null_and_overflow`.
+* `error::BionicError` with `Memory(Fault)` / `CheckFailed(name)` / `Unimplemented(name)` /
+  `InvalidArgument(name)` — every variant's `Display` names the function or check responsible.
+* `errno::consts` — Linux numbering only (EINVAL 22, EDOM 33, ERANGE 34, ENOMEM 12, ENOSYS 38,
+  EACCES 13, EPERM 1, ENOENT 2, EINTR 4, EBADF 9), each checked against the kernel UAPI
+  numbering bionic uses on arm64. The host's errno values are never referenced.
+* `context::GuestContext: GuestMemory` — errno get/set, `rand` state, and a `scratch()` hook
+  returning `Option<(addr, capacity)>`. No blanket `GuestMemory` impl: the supertrait bound means
+  any context already is a `GuestMemory` (a delegating blanket impl would recurse into itself;
+  caught before committing and removed — noted here because the first draft had it).
+* `mock::MockMemory` — disjoint regions over `Vec<u8>`, byte-granular access, fault at the first
+  unmapped byte touched; documented that a faulting access may have already moved the bytes
+  before the fault (callers validate whole ranges via `checked_range` first).
+* Tests: `tests/mock_tests.rs` (12) and `tests/context_mock_tests.rs` (5) — **17 tests, all
+  passing** (VERIFIED: `cargo test -p omni-bionic`); `cargo clippy -p omni-bionic --all-targets`
+  reports no warnings (VERIFIED).
 
 ---
 
