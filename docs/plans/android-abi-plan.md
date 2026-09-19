@@ -88,8 +88,10 @@ the M2 documents get wrong.
 
 Bind the guest's undefined symbols to host implementations, in both directions.
 
-- The loader already enumerates imports (M1) and binds them to synthetic guest addresses in a
-  reserved **thunk region**. Make a branch into that region resolve to a host call.
+- **Correction (Task 2): there was no thunk region.** This plan and its brief both said the loader
+  already bound imports into a reserved region; it enumerated them but there was no region, no
+  allocator and no provider, and building them was part of Task 2. That is the second time this
+  plan described a design statement as existing code — check before relying on such a sentence.
 - **AAPCS64 → host ABI marshalling.** Integer and pointer arguments in `X0`-`X7`, floating point in
   `V0`-`V7`, stack arguments beyond that, return values in `X0`/`X1`/`V0`. Variadics are the hard
   case and several libc functions need them.
@@ -114,8 +116,10 @@ Implement exactly the set Task 1 found — no more. `ARCHITECTURE.md` §5 is exp
 list *is* the specification, and D7 established there is no JVM and no dex interpreter.
 
 Guidance that is already established and should not be rediscovered:
-- **`malloc` is the host allocator.** The guest heap *is* the host heap; that is what makes D10's
-  memory model work and what "use host resources directly" means.
+- **`libroblox.so` imports no allocator at all** — corrected in Task 1, and the opposite of what an
+  earlier draft of this plan said. It carries its own allocator and reaches the host through guest
+  `mmap`, so the heap seam is the **demand pager**, not `malloc`. Do not implement `malloc`; check the
+  reachable set for what the engine actually asks for.
 - **TLS is `pthread_key_*` only** — no ELF TLS anywhere in this APK (D9). `TPIDR_EL0` is already
   programmed per guest thread with a bionic-layout block and a stack guard at `+0x28` (D13).
 - **`dl_iterate_phdr` must be faithful, not a stub.** The C++ runtime is statically linked, so the
