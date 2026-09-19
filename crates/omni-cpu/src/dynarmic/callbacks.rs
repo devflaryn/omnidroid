@@ -27,9 +27,10 @@ use dynarmic_sys::{exception, OdCallbacks};
 use omni_mem::{GuestAddr, Protection};
 
 use crate::dynarmic::{
-    mxcsr, stop, with, CpuCtx, InlineThunkCall, PendingExit, BREAKPOINT_BRK, HALT_EXIT, STOP_SVC,
+    mxcsr, stop, with, CpuCtx, JitRegs, PendingExit, BREAKPOINT_BRK, HALT_EXIT, STOP_SVC,
 };
 use crate::exit::AccessKind;
+use crate::thunk::ThunkCall;
 
 use dynarmic_sys::OD_HALT_MEMORY_ABORT;
 
@@ -325,16 +326,28 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
             // Serviced here and resumed here: no halt is raised, so `CheckHalt` falls through into
             // `PopRSBHint`, which with `ReturnStackBuffer` cleared is the emitted dispatcher loop
             // and not a return to the caller. See `DynarmicCpu::add_inline_thunk`.
-            if let Some(handler) = c.inline_thunks.get(&site).copied() {
+            if let Some((handler, context)) = c.inline_thunks.get(&site).copied() {
                 c.inline_calls += 1;
                 // The guest's SSE control word is live here -- generated code is still running and
                 // `EmitA64CallSupervisor` does not switch it -- and everything the handler runs is
                 // host code. See `dynarmic::mxcsr`. The guard is here, once, rather than in each
                 // handler, because a forgotten guard is silent.
                 let guard = mxcsr::Guard::enter(c.host_mxcsr);
-                let mut call = InlineThunkCall::new(c.jit);
+                let mut regs = JitRegs::new(c.jit);
+                let mut call = ThunkCall::new(&mut regs, site, context);
                 handler(&mut call);
+                let deferred = call.is_deferred();
                 drop(guard);
+                if deferred {
+                    // The handler could not finish here: it needs guest code run for it, or it has a
+                    // typed error to report and no channel to report it on. The guest `PC` is left at
+                    // the `SVC`, so the caller sees the thunk's own address and the exit is
+                    // resumable — a handler that deferred because it has to call into the guest
+                    // resumes past the thunk itself once the caller has serviced it.
+                    c.inline_deferred += 1;
+                    stop(c, PendingExit::Thunk { pc: site }, HALT_EXIT);
+                    return;
+                }
                 // A `BL` into the thunk region left the return address in `X30`. Writing `PC` is
                 // what the dispatcher reads on its way to the next block.
                 let resume = dynarmic_sys::od_jit_get_reg(c.jit, 30);

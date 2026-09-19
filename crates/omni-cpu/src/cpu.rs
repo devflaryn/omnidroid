@@ -9,6 +9,22 @@ use crate::context::{ContextCost, GuestAddressSpace, GuestRange, GuestThreadConf
 use crate::error::CpuResult;
 use crate::exit::{ExitReason, RunLimit};
 use crate::regs::{Nzcv, VReg, XReg};
+use crate::thunk::{ThunkContext, ThunkFn};
+
+/// What the inline half of the thunk boundary has actually done, per context.
+///
+/// Two counters rather than one, because they answer different questions and a single total answers
+/// neither: `serviced` says the fast path ran at all, and `deferred` says how many of those calls
+/// escalated to the exit path. A boundary whose `deferred` count equals its `serviced` count is
+/// paying for a dispatcher it is not using.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InlineThunkCounts {
+    /// Calls that entered an inline handler.
+    pub serviced: u64,
+    /// Of those, how many asked to be handed back to the caller through
+    /// [`ThunkCall::defer_to_caller`](crate::ThunkCall::defer_to_caller).
+    pub deferred: u64,
+}
 
 /// A way to stop a running guest thread from another thread.
 ///
@@ -81,6 +97,16 @@ pub struct Capabilities {
     pub asynchronous_halt: bool,
     /// Whether [`GuestCpu::add_breakpoint`] is implemented.
     pub breakpoints: bool,
+    /// Whether [`GuestCpu::add_inline_thunk`] dispatches a thunk **without leaving the run loop**.
+    ///
+    /// D17 measured the two shapes at ≈33 ns and 80-105 ns per call, a factor of 3, so this is not a
+    /// cosmetic difference — but it is also not something every backend can offer, and a boundary
+    /// that assumed it would be a boundary that only works on one host. A backend answering `false`
+    /// refuses [`add_inline_thunk`](GuestCpu::add_inline_thunk) with
+    /// [`CpuError::Unsupported`](crate::CpuError::Unsupported), and the compatibility layer falls
+    /// back to servicing every call through [`ExitReason::Thunk`](crate::ExitReason::Thunk) — slower,
+    /// and correct.
+    pub inline_thunks: bool,
 }
 
 /// One guest thread's ARM64 CPU.
@@ -232,6 +258,72 @@ pub trait GuestCpu: Send {
     ///
     /// [`CpuError::Backend`](crate::CpuError::Backend) if the backend could not remove it.
     fn remove_thunk(&mut self, address: GuestAddr) -> CpuResult<bool>;
+
+    /// Service the thunk at `address` with `handler`, **inside** the run loop, instead of returning
+    /// [`ExitReason::Thunk`] to the caller.
+    ///
+    /// This is the fast half of the boundary: D17 measured ≈33 ns against 80-105 ns for exiting to
+    /// Rust per call, a factor of 3 paid by every one of the imported symbols all 3,594 static
+    /// initializers reach. `context` is handed back to the handler at every call and is how a bare
+    /// `fn` finds shared state; see [`ThunkContext`].
+    ///
+    /// A handler that cannot finish the call here — because it needs guest code run, or because it
+    /// has a typed error to report — calls
+    /// [`ThunkCall::defer_to_caller`](crate::ThunkCall::defer_to_caller), and the call becomes an
+    /// ordinary [`ExitReason::Thunk`] at the same address.
+    ///
+    /// Idempotent, and per context in the same qualified sense as
+    /// [`add_thunk`](GuestCpu::add_thunk).
+    ///
+    /// # Errors
+    ///
+    /// [`CpuError::Unsupported`](crate::CpuError::Unsupported) if
+    /// [`Capabilities::inline_thunks`] is `false` — it refuses rather than silently registering a
+    /// handler that never runs, which would return a fabricated zero to the guest for every imported
+    /// call. [`CpuError::Backend`](crate::CpuError::Backend) if the backend could not install it.
+    fn add_inline_thunk(
+        &mut self,
+        address: GuestAddr,
+        handler: ThunkFn,
+        context: ThunkContext,
+    ) -> CpuResult<()>;
+
+    /// Stop servicing `address` inline. Returns whether it was.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_inline_thunk`](GuestCpu::add_inline_thunk).
+    fn remove_inline_thunk(&mut self, address: GuestAddr) -> CpuResult<bool>;
+
+    /// How many inline thunks this context has serviced, of which how many were deferred.
+    ///
+    /// Not a statistic: it is what lets a test tell *dispatched inline* apart from *took the exit
+    /// path and produced the same answer more slowly*, which is a distinction the whole of D17 rests
+    /// on and which no assertion about the guest's result can make (Global Constraint 13).
+    fn inline_thunk_calls(&self) -> InlineThunkCounts;
+
+    /// Arm a sentinel return address: when the guest branches to `address`,
+    /// [`run`](GuestCpu::run) returns [`ExitReason::Returned`].
+    ///
+    /// This is how a *call into* guest code finishes, and therefore how the host-to-guest half of the
+    /// thunk boundary works at all — a `qsort` comparator, an `atexit` handler, a `pthread` entry
+    /// point. The caller puts `address` in `X30` and the guest's own `RET` lands there.
+    ///
+    /// On the trait rather than on one backend because the compatibility layer needs it, and the
+    /// compatibility layer holds `&mut dyn GuestCpu`. An ARM64-native backend implements it by
+    /// planting a veneer at `address`, exactly as it does for a thunk.
+    ///
+    /// # Errors
+    ///
+    /// [`CpuError::Backend`](crate::CpuError::Backend) if the backend could not install it.
+    fn set_return_sentinel(&mut self, address: GuestAddr) -> CpuResult<()>;
+
+    /// The armed sentinel, if there is one.
+    ///
+    /// Exists because a nested call into guest code has to put back whatever the outer call armed:
+    /// without this the inner call's sentinel would still be armed when the outer guest frame
+    /// returned, and the outer return would be reported at an address the caller no longer expects.
+    fn return_sentinel(&self) -> Option<GuestAddr>;
 
     /// Stop with [`ExitReason::Breakpoint`] when the guest reaches `address`, without executing the
     /// instruction there. Idempotent, and per context with the same qualification as

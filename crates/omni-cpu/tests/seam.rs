@@ -42,6 +42,7 @@ struct RegisterFile {
     tpidr_el0: GuestAddr,
     halt: HaltHandle,
     thunks: Vec<GuestAddr>,
+    sentinel: Option<GuestAddr>,
     breakpoints: Vec<GuestAddr>,
     invalidated: Vec<GuestRange>,
 }
@@ -61,6 +62,7 @@ impl RegisterFile {
             tpidr_el0: config.tpidr_el0(),
             halt: HaltHandle::new(),
             thunks: Vec::new(),
+            sentinel: None,
             breakpoints: Vec::new(),
             invalidated: Vec::new(),
         }
@@ -76,7 +78,15 @@ impl GuestCpu for RegisterFile {
         // Exactly what this implementation can do. `counted_step_limit: false` is the honest answer
         // for a backend with no translator to count in, and it is what makes `run` refuse a counted
         // budget below instead of ignoring it.
-        Capabilities { counted_step_limit: false, asynchronous_halt: true, breakpoints: true }
+        Capabilities {
+            counted_step_limit: false,
+            asynchronous_halt: true,
+            breakpoints: true,
+            // The point of this stand-in: a backend with no translator in the loop can still offer
+            // the boundary, over whatever frame its veneer saved. It answers `false` here only
+            // because it executes nothing at all.
+            inline_thunks: false,
+        }
     }
 
     fn space(&self) -> GuestAddressSpace {
@@ -170,6 +180,41 @@ impl GuestCpu for RegisterFile {
         let before = self.thunks.len();
         self.thunks.retain(|&thunk| thunk != address);
         Ok(self.thunks.len() != before)
+    }
+
+    /// **Refused, because this implementation executes nothing.** The refusal is the interesting
+    /// part: a backend that cannot dispatch inside its run loop must say so, and the compatibility
+    /// layer then services every imported call through [`ExitReason::Thunk`] — three times slower
+    /// (D17) and correct. Registering a handler that would never run would return a fabricated zero
+    /// to the guest for every import instead.
+    fn add_inline_thunk(
+        &mut self,
+        _address: GuestAddr,
+        _handler: omni_cpu::ThunkFn,
+        _context: omni_cpu::ThunkContext,
+    ) -> CpuResult<()> {
+        Err(CpuError::Unsupported {
+            backend: Self::NAME,
+            operation: "dispatch a thunk inside the run loop",
+            reason: "it holds architectural state only; there is no run loop to dispatch inside",
+        })
+    }
+
+    fn remove_inline_thunk(&mut self, _address: GuestAddr) -> CpuResult<bool> {
+        Ok(false)
+    }
+
+    fn inline_thunk_calls(&self) -> omni_cpu::InlineThunkCounts {
+        omni_cpu::InlineThunkCounts::default()
+    }
+
+    fn set_return_sentinel(&mut self, address: GuestAddr) -> CpuResult<()> {
+        self.sentinel = Some(address);
+        Ok(())
+    }
+
+    fn return_sentinel(&self) -> Option<GuestAddr> {
+        self.sentinel
     }
 
     fn add_breakpoint(&mut self, address: GuestAddr) -> CpuResult<()> {

@@ -20,7 +20,7 @@
 //! * **Exit to Rust per call.** [`ExitReason::Thunk`] comes back out of [`GuestCpu::run`], the caller
 //!   services the symbol and calls `run` again at the link register. Simple, and it pays a full
 //!   unwind of the generated frame plus a full re-entry every time.
-//! * **Dispatch inside the run loop.** `DynarmicCpu::add_inline_thunk` services the call in the `SVC`
+//! * **Dispatch inside the run loop.** `GuestCpu::add_inline_thunk` services the call in the `SVC`
 //!   callback and writes the guest `PC`, and the backend's own dispatcher loop picks the guest back
 //!   up. Nothing returns to Rust at all.
 //!
@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
 
 use harness::a64::*;
 use harness::{x, Guest};
-use omni_cpu::dynarmic::{DynarmicCpu, InlineThunkCall};
-use omni_cpu::{ExitReason, GuestAddr, GuestCpu, GuestCpuBackend, RunLimit};
+use omni_cpu::dynarmic::DynarmicCpu;
+use omni_cpu::{ExitReason, GuestAddr, GuestCpu, GuestCpuBackend, RunLimit, ThunkCall, ThunkContext};
 
 /// Samples per configuration. Odd, so the median is an observation and not an average of two.
 const N: usize = 31;
@@ -179,7 +179,7 @@ fn plt_stub(stub_at: GuestAddr, got_slot: GuestAddr) -> Vec<u32> {
 ///
 /// This is the *boundary* and nothing else, which is what makes it the right thing to compare
 /// against. A real imported symbol adds its own body on top.
-fn nothing(_call: &mut InlineThunkCall<'_>) {}
+fn nothing(_call: &mut ThunkCall<'_>) {}
 
 /// `LDMXCSR` from a `u32`.
 fn write_mxcsr(value: u32) {
@@ -203,7 +203,7 @@ fn read_mxcsr() -> u32 {
 /// Eight and one because that is AAPCS64's integer argument set plus its return register. The cost is
 /// the same nine `JitState` accesses in either design, so reporting it separately keeps the comparison
 /// about *dispatch* and hands the marshal cost to task 2 as a number of its own.
-fn marshal_eight_arguments(call: &mut InlineThunkCall<'_>) {
+fn marshal_eight_arguments(call: &mut ThunkCall<'_>) {
     let mut sum = 0u64;
     for i in 0..8 {
         sum = sum.wrapping_add(call.x(i));
@@ -370,7 +370,7 @@ fn inline_dispatch_services_every_call_without_leaving_the_run_loop() {
 
     // Design B: the same program, the same arguments, serviced inline.
     let (mut cpu, sentinel) = guest.thread();
-    cpu.add_inline_thunk(thunk, marshal_eight_arguments).expect("an inline thunk");
+    cpu.add_inline_thunk(thunk, marshal_eight_arguments, ThunkContext::default()).expect("an inline thunk");
     arm_arguments(&mut cpu);
     let entries = run_inline(&mut cpu, entry, sentinel);
     assert_eq!(
@@ -380,7 +380,7 @@ fn inline_dispatch_services_every_call_without_leaving_the_run_loop() {
          B's timing is then measuring design A"
     );
     assert_eq!(
-        cpu.inline_calls(),
+        cpu.inline_thunk_calls().serviced,
         CHECK_CALLS,
         "the inline path must have run {CHECK_CALLS} times. A zero here with a passing timing is \
          the failure this assertion exists for: the loop would have been executing nothing"
@@ -398,13 +398,13 @@ fn inline_dispatch_services_every_call_without_leaving_the_run_loop() {
     assert!(cpu.remove_inline_thunk(thunk).expect("remove"), "it was registered");
     assert!(!cpu.remove_inline_thunk(thunk).expect("remove again"), "and now it is not");
     cpu.add_thunk(thunk).expect("an ordinary thunk at the same address");
-    let before = cpu.inline_calls();
+    let before = cpu.inline_thunk_calls().serviced;
     rearm(&mut cpu, sentinel);
     match cpu.run(entry, RunLimit::Unlimited).expect("a run after removal") {
         ExitReason::Thunk { pc } => assert_eq!(pc, thunk),
         other => panic!("after removal the address must exit, got {other}"),
     }
-    assert_eq!(cpu.inline_calls(), before, "a removed inline thunk must not still be serviced");
+    assert_eq!(cpu.inline_thunk_calls().serviced, before, "a removed inline thunk must not still be serviced");
 }
 
 /// An inline thunk and an exiting thunk must coexist, because M3 wants both: a resolved import
@@ -424,7 +424,7 @@ fn an_inline_thunk_and_an_exiting_thunk_coexist_at_different_addresses() {
     let entry = guest.load_at(0, &program);
 
     let (mut cpu, sentinel) = guest.thread();
-    cpu.add_inline_thunk(guest.code + inline_at, marshal_eight_arguments).expect("inline");
+    cpu.add_inline_thunk(guest.code + inline_at, marshal_eight_arguments, ThunkContext::default()).expect("inline");
     cpu.add_thunk(guest.code + exiting_at).expect("exiting");
     cpu.set_x(x(0), 7);
     for i in 1..8 {
@@ -440,7 +440,7 @@ fn an_inline_thunk_and_an_exiting_thunk_coexist_at_different_addresses() {
         ),
         other => panic!("expected the exiting thunk, got {other}"),
     }
-    assert_eq!(cpu.inline_calls(), 1, "the inline thunk must have been serviced on the way past");
+    assert_eq!(cpu.inline_thunk_calls().serviced, 1, "the inline thunk must have been serviced on the way past");
     assert_eq!(cpu.x(x(0)), 7, "and its marshal must have written X0");
 
     let resume = cpu.x(x(30)) as GuestAddr;
@@ -469,14 +469,14 @@ fn inline_dispatch_works_through_a_plt_stub_bound_to_the_thunk() {
     guest.load_at(STUB_AT, &plt_stub(stub, got_slot));
 
     let (mut cpu, sentinel) = guest.thread();
-    cpu.add_inline_thunk(thunk, marshal_eight_arguments).expect("an inline thunk");
+    cpu.add_inline_thunk(thunk, marshal_eight_arguments, ThunkContext::default()).expect("an inline thunk");
     arm_arguments(&mut cpu);
     assert_eq!(
         run_inline(&mut cpu, entry, sentinel),
         1,
         "a call through the stub must not leave the run loop either"
     );
-    assert_eq!(cpu.inline_calls(), CHECK_CALLS);
+    assert_eq!(cpu.inline_thunk_calls().serviced, CHECK_CALLS);
     assert_eq!(cpu.x(x(0)), marshal_result(CHECK_CALLS));
     // `X16`/`X17` are the stub's scratch registers and the guest wrote them, which is the evidence
     // that the stub really executed rather than the `BL` reaching the thunk some other way.
@@ -506,7 +506,7 @@ fn a_counted_budget_still_stops_a_guest_looping_through_an_inline_thunk() {
     let entry = guest.load_at(direct_at(), &call_loop(1 << 40, direct_at(), Some(THUNK_AT)));
 
     let (mut cpu, sentinel) = guest.thread();
-    cpu.add_inline_thunk(thunk, nothing).expect("an inline thunk");
+    cpu.add_inline_thunk(thunk, nothing, ThunkContext::default()).expect("an inline thunk");
     rearm(&mut cpu, sentinel);
 
     const BUDGET: u64 = 50_000;
@@ -520,7 +520,7 @@ fn a_counted_budget_still_stops_a_guest_looping_through_an_inline_thunk() {
         other => panic!("a counted budget must stop this loop, got {other:?}"),
     }
     assert!(
-        cpu.inline_calls() > 0,
+        cpu.inline_thunk_calls().serviced > 0,
         "the loop must have been going through the inline thunk, or this test bounds nothing"
     );
 
@@ -560,7 +560,7 @@ fn the_dispatcher_puts_the_host_mxcsr_under_a_handler_and_the_guest_s_back() {
     /// What the handler read out of `MXCSR`.
     static SEEN: AtomicU32 = AtomicU32::new(0);
 
-    fn record_mxcsr(_call: &mut InlineThunkCall<'_>) {
+    fn record_mxcsr(_call: &mut ThunkCall<'_>) {
         SEEN.store(read_mxcsr(), Ordering::Relaxed);
     }
 
@@ -602,13 +602,13 @@ fn the_dispatcher_puts_the_host_mxcsr_under_a_handler_and_the_guest_s_back() {
         let entry = guest.load_at(0, &program);
 
         let (mut cpu, sentinel) = guest.thread();
-        cpu.add_inline_thunk(thunk, record_mxcsr).expect("an inline thunk");
+        cpu.add_inline_thunk(thunk, record_mxcsr, ThunkContext::default()).expect("an inline thunk");
         rearm(&mut cpu, sentinel);
         match cpu.run(entry, RunLimit::Unlimited).expect("run") {
             ExitReason::Returned { pc } => assert_eq!(pc, sentinel),
             other => panic!("{label}: expected the sentinel, got {other}"),
         }
-        assert_eq!(cpu.inline_calls(), 1, "{label}: the handler must have run");
+        assert_eq!(cpu.inline_thunk_calls().serviced, 1, "{label}: the handler must have run");
 
         // 1. The handler saw the host's word.
         let seen = SEEN.load(Ordering::Relaxed);
@@ -661,7 +661,7 @@ fn an_inline_handler_sees_and_writes_the_guest_vector_file() {
     /// What the handler returns. Not `!ARGUMENT`, so a handler that did nothing at all cannot pass.
     const RESULT: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
 
-    fn vector_marshal(call: &mut InlineThunkCall<'_>) {
+    fn vector_marshal(call: &mut ThunkCall<'_>) {
         let seen = call.v(0);
         SEEN_LO.store(seen as u64, Ordering::Relaxed);
         SEEN_HI.store((seen >> 64) as u64, Ordering::Relaxed);
@@ -687,13 +687,13 @@ fn an_inline_handler_sees_and_writes_the_guest_vector_file() {
     let entry = guest.load_at(0, &program);
 
     let (mut cpu, sentinel) = guest.thread();
-    cpu.add_inline_thunk(thunk, vector_marshal).expect("an inline thunk");
+    cpu.add_inline_thunk(thunk, vector_marshal, ThunkContext::default()).expect("an inline thunk");
     rearm(&mut cpu, sentinel);
     match cpu.run(entry, RunLimit::Unlimited).expect("run") {
         ExitReason::Returned { pc } => assert_eq!(pc, sentinel),
         other => panic!("expected the sentinel, got {other}"),
     }
-    assert_eq!(cpu.inline_calls(), 1, "the handler must have run");
+    assert_eq!(cpu.inline_thunk_calls().serviced, 1, "the handler must have run");
 
     let seen = u128::from(SEEN_LO.load(Ordering::Relaxed))
         | (u128::from(SEEN_HI.load(Ordering::Relaxed)) << 64);
@@ -766,22 +766,22 @@ fn the_thunk_round_trip() {
 
     let inline = {
         let (mut cpu, sentinel) = guest.thread();
-        cpu.add_inline_thunk(thunk, nothing).expect("an inline thunk");
+        cpu.add_inline_thunk(thunk, nothing, ThunkContext::default()).expect("an inline thunk");
         let summary = measure(|| {
             assert_eq!(run_inline(&mut cpu, entry, sentinel), 1, "design B must stay in the loop");
         });
-        assert!(cpu.inline_calls() >= CALLS, "the inline path must have run");
+        assert!(cpu.inline_thunk_calls().serviced >= CALLS, "the inline path must have run");
         summary
     };
     report("B: dispatch inside the run loop", &inline, Some(&baseline));
 
     let inline_marshal = {
         let (mut cpu, sentinel) = guest.thread();
-        cpu.add_inline_thunk(thunk, marshal_eight_arguments).expect("an inline thunk");
+        cpu.add_inline_thunk(thunk, marshal_eight_arguments, ThunkContext::default()).expect("an inline thunk");
         let summary = measure(|| {
             assert_eq!(run_inline(&mut cpu, entry, sentinel), 1, "design B must stay in the loop");
         });
-        assert!(cpu.inline_calls() >= CALLS, "the inline path must have run");
+        assert!(cpu.inline_thunk_calls().serviced >= CALLS, "the inline path must have run");
         summary
     };
     report("B: dispatch inline, + 8-argument marshal", &inline_marshal, Some(&baseline));
@@ -796,7 +796,7 @@ fn the_thunk_round_trip() {
 
     let inline_via_stub = {
         let (mut cpu, sentinel) = guest.thread();
-        cpu.add_inline_thunk(thunk, marshal_eight_arguments).expect("an inline thunk");
+        cpu.add_inline_thunk(thunk, marshal_eight_arguments, ThunkContext::default()).expect("an inline thunk");
         let summary = measure(|| {
             assert_eq!(
                 run_inline(&mut cpu, via_stub, sentinel),
@@ -804,7 +804,7 @@ fn the_thunk_round_trip() {
                 "design B must stay in the loop"
             );
         });
-        assert!(cpu.inline_calls() >= CALLS, "the inline path must have run");
+        assert!(cpu.inline_thunk_calls().serviced >= CALLS, "the inline path must have run");
         summary
     };
     report("B: inline + marshal, through a real PLT stub", &inline_via_stub, Some(&baseline));

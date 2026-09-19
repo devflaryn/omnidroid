@@ -56,12 +56,13 @@ use dynarmic_sys::{
 use omni_mem::{DemandPager, FaultAccess, GuestAddr, GuestSpace, PagerStats, Protection};
 
 use crate::context::{ContextCost, GuestAddressSpace, GuestRange, GuestThreadConfig};
-use crate::cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle};
+use crate::cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle, InlineThunkCounts};
 use crate::error::{CpuError, CpuResult};
 use crate::exit::{AccessKind, ExitReason, RunLimit};
 use crate::fastmem::{require_identity_mapping, MemoryMapping};
 use crate::regs::{Nzcv, VReg, XReg};
 use crate::run::Budget;
+use crate::thunk::{ThunkContext, ThunkFn, ThunkRegs};
 use crate::tls::{GuestTls, TlsArena};
 
 mod callbacks;
@@ -665,37 +666,34 @@ pub fn mxcsr_guard_for_measurement(host_mxcsr: u32) -> impl Drop {
     mxcsr::Guard::enter(host_mxcsr)
 }
 
-/// A host function servicing a guest call from **inside** generated code.
-///
-/// See [`DynarmicCpu::add_inline_thunk`]. A bare `fn` rather than a boxed closure deliberately: the
-/// question this exists to answer is what the boundary costs, and a boxed closure would add an
-/// indirection to the thing being measured.
-pub type InlineThunkFn = fn(&mut InlineThunkCall<'_>);
-
-/// The guest register file, as an [`InlineThunkFn`] sees it while the guest is suspended mid-block.
+/// The guest register file at a thunk, over dynarmic's `JitState`.
 ///
 /// Reads and writes go straight to `JitState`, which is where the A64 emitter keeps guest registers
-/// at every callback boundary, so a write here is what the resumed guest sees.
-pub struct InlineThunkCall<'a> {
+/// at every callback boundary, so a write here is what the resumed guest sees. It is the translating
+/// backend's [`ThunkRegs`] and is handed to a handler as a [`ThunkCall`], which is the shape the
+/// compatibility layer is written against — see `crate::thunk` for why that indirection is not
+/// optional.
+pub struct JitRegs<'a> {
     jit: *mut c_void,
     _borrow: core::marker::PhantomData<&'a mut ()>,
 }
 
-impl InlineThunkCall<'_> {
+impl JitRegs<'_> {
     pub(crate) fn new(jit: *mut c_void) -> Self {
         Self { jit, _borrow: core::marker::PhantomData }
     }
+}
 
+impl ThunkRegs for JitRegs<'_> {
     /// Read `X{index}`. An index above 30 reads zero, which the shim enforces.
-    #[must_use]
-    pub fn x(&self, index: u32) -> u64 {
+    fn x(&self, index: u32) -> u64 {
         // SAFETY: the jit is live -- this runs inside one of its own callbacks -- and the shim
         // bounds-checks the index.
         unsafe { od_jit_get_reg(self.jit, index) }
     }
 
     /// Write `X{index}`. An index above 30 is ignored.
-    pub fn set_x(&mut self, index: u32, value: u64) {
+    fn set_x(&mut self, index: u32, value: u64) {
         // SAFETY: as `x`.
         unsafe { od_jit_set_reg(self.jit, index, value) }
     }
@@ -709,8 +707,7 @@ impl InlineThunkCall<'_> {
     /// file is coherent at a callback for the same reason the integer file is — and
     /// `an_inline_handler_sees_and_writes_the_guest_vector_file` establishes it rather than trusting
     /// the symmetry.
-    #[must_use]
-    pub fn v(&self, index: u32) -> u128 {
+    fn v(&self, index: u32) -> u128 {
         let mut halves = [0u64; 2];
         // SAFETY: the jit is live and the shim bounds-checks the index and writes both halves.
         unsafe { od_jit_get_vec(self.jit, index, halves.as_mut_ptr()) };
@@ -718,10 +715,26 @@ impl InlineThunkCall<'_> {
     }
 
     /// Write `V{index}`. An index above 31 is ignored.
-    pub fn set_v(&mut self, index: u32, value: u128) {
+    fn set_v(&mut self, index: u32, value: u128) {
         let halves = [value as u64, (value >> 64) as u64];
         // SAFETY: as `v`.
         unsafe { od_jit_set_vec(self.jit, index, halves.as_ptr()) };
+    }
+
+    /// Read `SP`.
+    ///
+    /// The ninth and later AAPCS64 arguments live at `[SP]` upward, and a variadic call's overflow
+    /// area is there too, so a register file without this could marshal at most eight arguments —
+    /// and would do it silently, reading whatever `X0`-`X7` happened to hold for the ninth.
+    fn sp(&self) -> GuestAddr {
+        // SAFETY: as `x`. `SP` is a field of `JitState` like any other.
+        unsafe { od_jit_get_sp(self.jit) as GuestAddr }
+    }
+
+    /// Write `SP`.
+    fn set_sp(&mut self, value: GuestAddr) {
+        // SAFETY: as `x`.
+        unsafe { od_jit_set_sp(self.jit, value as u64) }
     }
 }
 
@@ -754,9 +767,12 @@ pub(crate) struct CpuCtx {
     pub(crate) thunks: BTreeSet<GuestAddr>,
     /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
     /// [`DynarmicCpu::add_inline_thunk`].
-    pub(crate) inline_thunks: BTreeMap<GuestAddr, InlineThunkFn>,
+    pub(crate) inline_thunks: BTreeMap<GuestAddr, (ThunkFn, ThunkContext)>,
     /// How many inline thunks have been serviced, so a measurement can prove the path ran.
     pub(crate) inline_calls: u64,
+    /// How many of those asked to be handed back to the caller. See
+    /// [`ThunkCall::defer_to_caller`].
+    pub(crate) inline_deferred: u64,
     /// The host thread's `MXCSR`, captured at the top of every `run`. See [`mxcsr`].
     pub(crate) host_mxcsr: u32,
     pub(crate) breakpoints: BTreeSet<GuestAddr>,
@@ -870,6 +886,7 @@ impl DynarmicCpu {
             thunks: BTreeSet::new(),
             inline_thunks: BTreeMap::new(),
             inline_calls: 0,
+            inline_deferred: 0,
             host_mxcsr: mxcsr::read(),
             breakpoints: BTreeSet::new(),
             sentinel: None,
@@ -1062,78 +1079,6 @@ impl DynarmicCpu {
         self.degraded_slices
     }
 
-    /// Arm a sentinel return address: when the guest branches to `address`, `run` returns
-    /// [`ExitReason::Returned`].
-    ///
-    /// This is how a *call into* guest code finishes. The caller puts `address` in `X30` and the
-    /// guest's own `RET` lands there.
-    ///
-    /// # Errors
-    ///
-    /// [`CpuError::Backend`] if the translation covering `address` could not be dropped.
-    pub fn set_return_sentinel(&mut self, address: GuestAddr) -> CpuResult<()> {
-        self.with_ctx(|ctx| ctx.sentinel = Some(address));
-        self.invalidate_word(address)
-    }
-
-    /// Service a thunk at `address` **inside** the run loop, with `handler`, instead of returning
-    /// [`ExitReason::Thunk`] to the caller.
-    ///
-    /// # What this is for
-    ///
-    /// M3 task 1 had to decide between two shapes for the imported-symbol boundary -- exit to Rust
-    /// per call, or dispatch without leaving the backend -- and the project rule is that a shape is
-    /// measured before it is built. This is the second shape, reduced to the smallest thing that can
-    /// be timed against the first. It is a **measurement probe**: the real boundary, with AAPCS64
-    /// marshalling, a symbol table and the host-to-guest direction, belongs to tasks 2 and 3.
-    ///
-    /// # Why the backend permits it at all
-    ///
-    /// Because a thunk is a planted `SVC` ([`STOP_SVC`]) and `SVC`'s terminal in dynarmic's A64
-    /// frontend is `CheckHalt{PopRSBHint}`. A callback that does **not** raise a halt falls through
-    /// `CheckHalt` into `PopRSBHint`, which with `ReturnStackBuffer` cleared --
-    /// `optimization::INTERRUPTIBLE`, which this backend sets by default (D16) -- emits
-    /// `ReturnFromRunCode`. And `ReturnFromRunCode` is **not** a return to the caller: it is the top
-    /// of the emitted dispatcher loop (`block_of_code.cpp`, `GenRunCode`), which re-reads
-    /// `halt_reason` and `cycles_remaining`, calls `LookupBlock` and jumps straight to the next
-    /// block. So writing the guest `PC` from inside the callback and returning quietly resumes the
-    /// guest without unwinding the generated frame, without the `AddTicks`/`GetTicksRemaining`
-    /// callbacks, without the `lock xchg` on `halt_reason`, and without re-entering `Jit::Run`.
-    ///
-    /// Guest registers are coherent in `JitState` at every callback -- the A64 emitter stores each
-    /// guest register write straight to memory -- so the handler reads and writes them through
-    /// [`InlineThunkCall`] and the resumed guest sees them.
-    ///
-    /// The guest resumes at `X30`, which is what a `BL` into the thunk region leaves there.
-    ///
-    /// # Errors
-    ///
-    /// [`CpuError::Backend`] if the translation covering `address` could not be dropped.
-    pub fn add_inline_thunk(&mut self, address: GuestAddr, handler: InlineThunkFn) -> CpuResult<()> {
-        self.with_ctx(|ctx| ctx.inline_thunks.insert(address, handler));
-        self.invalidate_word(address)
-    }
-
-    /// Stop servicing `address` inline. Returns whether it was.
-    ///
-    /// # Errors
-    ///
-    /// As [`add_inline_thunk`](Self::add_inline_thunk).
-    pub fn remove_inline_thunk(&mut self, address: GuestAddr) -> CpuResult<bool> {
-        let had = self.with_ctx(|ctx| ctx.inline_thunks.remove(&address).is_some());
-        self.invalidate_word(address)?;
-        Ok(had)
-    }
-
-    /// How many inline thunks this context has serviced.
-    ///
-    /// Exists so a measurement can show the path really ran, rather than timing a loop that silently
-    /// took the ordinary exit (Global Constraint 13).
-    #[must_use]
-    pub fn inline_calls(&self) -> u64 {
-        self.with_ctx(|ctx| ctx.inline_calls)
-    }
-
     /// Read `TPIDRRO_EL0`, the read-only alias of the thread pointer.
     ///
     /// Bionic gives both registers the same value on AArch64, and D5 confirmed dynarmic supports
@@ -1223,6 +1168,11 @@ impl GuestCpu for DynarmicCpu {
             // is computed rather than hard-coded to `true`.
             asynchronous_halt: self.shared.options.interruptible,
             breakpoints: true,
+            // See `add_inline_thunk`: the `SVC` terminal's `CheckHalt{PopRSBHint}` is what makes it
+            // possible, and `INTERRUPTIBLE` is what makes `PopRSBHint` reach the dispatcher rather
+            // than a return-stack-buffer guess. With the flag cleared the resume would be to
+            // whatever the RSB predicted, which is not the address the handler wrote.
+            inline_thunks: self.shared.options.interruptible,
         }
     }
 
@@ -1506,6 +1456,70 @@ impl GuestCpu for DynarmicCpu {
         let had = self.with_ctx(|ctx| ctx.thunks.remove(&address));
         self.invalidate_word(address)?;
         Ok(had)
+    }
+
+    /// # Why this backend can service a thunk without leaving the run loop
+    ///
+    /// Because a thunk is a planted `SVC` ([`STOP_SVC`]) and `SVC`'s terminal in dynarmic's A64
+    /// frontend is `CheckHalt{PopRSBHint}`. A callback that does **not** raise a halt falls through
+    /// `CheckHalt` into `PopRSBHint`, which with `ReturnStackBuffer` cleared —
+    /// `optimization::INTERRUPTIBLE`, which this backend sets by default (D16) — emits
+    /// `ReturnFromRunCode`. And `ReturnFromRunCode` is **not** a return to the caller: it is the top
+    /// of the emitted dispatcher loop (`block_of_code.cpp`, `GenRunCode`), which re-reads
+    /// `halt_reason` and `cycles_remaining`, calls `LookupBlock` and jumps straight to the next
+    /// block. So writing the guest `PC` from inside the callback and returning quietly resumes the
+    /// guest without unwinding the generated frame, without the `AddTicks`/`GetTicksRemaining`
+    /// callbacks, without the `lock xchg` on `halt_reason`, and without re-entering `Jit::Run`.
+    ///
+    /// Guest registers are coherent in `JitState` at every callback — the A64 emitter stores each
+    /// guest register write straight to memory — so the handler reads and writes them through
+    /// [`JitRegs`] and the resumed guest sees them.
+    ///
+    /// The guest resumes at `X30`, which is what a `BL` into the thunk region leaves there.
+    fn add_inline_thunk(
+        &mut self,
+        address: GuestAddr,
+        handler: ThunkFn,
+        context: ThunkContext,
+    ) -> CpuResult<()> {
+        // **Refused rather than registered when the flag is clear**, because the resume would be a
+        // return-stack-buffer prediction rather than the address the handler wrote: the guest would
+        // carry on somewhere plausible with a register file the handler had already changed. That is
+        // Global Constraint 1's failure shape exactly, so the capability is checked here and not only
+        // advertised.
+        if !self.shared.options.interruptible {
+            return Err(CpuError::Unsupported {
+                backend: BACKEND_NAME,
+                operation: "dispatch a thunk inside the run loop",
+                reason: "`DynarmicOptions::interruptible` is false, so `PopRSBHint` does not reach \
+                         the emitted dispatcher and the guest would not resume at the address the \
+                         handler wrote",
+            });
+        }
+        self.with_ctx(|ctx| ctx.inline_thunks.insert(address, (handler, context)));
+        self.invalidate_word(address)
+    }
+
+    fn remove_inline_thunk(&mut self, address: GuestAddr) -> CpuResult<bool> {
+        let had = self.with_ctx(|ctx| ctx.inline_thunks.remove(&address).is_some());
+        self.invalidate_word(address)?;
+        Ok(had)
+    }
+
+    fn inline_thunk_calls(&self) -> InlineThunkCounts {
+        self.with_ctx(|ctx| InlineThunkCounts {
+            serviced: ctx.inline_calls,
+            deferred: ctx.inline_deferred,
+        })
+    }
+
+    fn set_return_sentinel(&mut self, address: GuestAddr) -> CpuResult<()> {
+        self.with_ctx(|ctx| ctx.sentinel = Some(address));
+        self.invalidate_word(address)
+    }
+
+    fn return_sentinel(&self) -> Option<GuestAddr> {
+        self.with_ctx(|ctx| ctx.sentinel)
     }
 
     fn add_breakpoint(&mut self, address: GuestAddr) -> CpuResult<()> {
