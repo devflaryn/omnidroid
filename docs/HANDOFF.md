@@ -37,6 +37,53 @@ gate that refuses to run against a modified tree:
 Other committed tools, each self-checking against a known count: `tools/thunk_sweep.py`,
 `tools/init_reach.py`, `tools/atomic_mix.py`, `tools/branch_mix.py`.
 
+## The five-target requirement — read this before writing any code
+
+The project must support **Windows x86-64, Linux x86-64, Linux ARM64, macOS ARM64, macOS x86-64**.
+Everything built so far runs and is tested on **Windows x86-64 only**, and the other four are
+**deliberately not claimed** anywhere. That asymmetry is the single easiest thing to erode by accident,
+because every task so far has been able to ignore it and still pass.
+
+Two rules make the difference, and both have already been enforced against real attempts to break them:
+
+**1. Keep the door open, and say when you nearly closed it.** On ARM64 hosts there is **no translator
+at all** — the loader maps guest code executable and calls it, so a guest pointer, a guest register and
+a guest call are all native. Any abstraction that assumes translation silently makes those two hosts
+unreachable. This has genuinely nearly happened:
+
+- The `GuestCpu` trait was reviewed specifically for it, by sketching how a native backend would
+  implement every method. The subtle one went the *other* way: dynarmic truncates guest PC to 56 bits,
+  and encoding that in the shared address type would have bound the **native** path to a *translator's*
+  limit. It reports a queryable address width instead.
+- D18 records **four places the thunk boundary nearly foreclosed it, two of which already had** — and
+  notes that AArch64 variadic rules differ by platform (Apple arm64 puts *all* variadic arguments on
+  the stack; Windows on ARM64 puts variadic floating point in integer registers). Getting that wrong
+  is a silent wrong-answer class, not a compile error.
+
+**2. Never claim a platform works.** Non-Windows paths return typed *unsupported* errors that name the
+POSIX call they intend to make (`omni-platform/src/fault/unsupported.rs`, `vm/error.rs`). One refuses
+an operation **even though the correct Unix implementation is a no-op**, which is the right direction
+to err. A hypothetical Linux build degrades to a reported "no guest paging" state with the runtime
+invariant auto-disarmed, rather than being silently wrong.
+
+**What is structurally ready versus what is genuinely untested:**
+
+| | |
+|---|---|
+| OS surface confined to `omni-platform` | Verified across all six crates — no `cfg(target_os)` or OS crate escapes it |
+| `omni-cpu` builds with **no C++ toolchain at all** (`--no-default-features`) | Guarded by a CI job. That guard was itself found blind once and fixed — read its comment before touching it |
+| ARM64-native CPU path | **Expressible, untested, not claimed.** No trait method requires emitting a byte |
+| ARM64-native thunk veneer | Designed (four instructions, 16-byte slots sized for it), untested |
+| Linux / macOS virtual memory, faults, JIT arena | **Not implemented.** The JIT arena's dual-mapping is Windows-specific in mechanics; Linux has `memfd_create` + two `mmap`s, macOS has `MAP_JIT` with `pthread_jit_write_protect_np` which behaves differently and needs its own measurement |
+| Graphics | Vulkan verified on this host only (native resizable window, real triangle). D3D12/Metal are a renderer-trait seam that does not exist yet — graphics starts at M6 |
+| One Windows-only *gap* worth knowing | `unmap` is whole-view-only on Windows and must be emulated; Linux does not have this restriction, so that emulation is Windows-specific complexity, not shared design |
+
+**Practical guidance:** when a task adds a platform primitive, add the Linux and macOS signatures as
+honest `unsupported` returns at the same time, naming the intended syscall. It costs minutes, it keeps
+the seam shaped correctly, and it is how the non-Windows bring-up later becomes a fill-in rather than a
+redesign. Do **not** write speculative `mmap` bodies — that was ruled against deliberately, because an
+unverified body can misbehave silently where a typed error fails immediately and visibly.
+
 ## Milestones
 
 | | Status | Evidence |
