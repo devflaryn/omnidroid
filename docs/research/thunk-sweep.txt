@@ -1,34 +1,41 @@
 binary:     C:\Users\berat\Desktop\Omni Apps\omnidroid\target\release\deps\thunk-52fc34d401324c1c.exe
 rounds:     5 per placement, each in its own process
 placements: 0x400, 0xc00, 0x1400
-  round 1 at 0x400: 8 cells
-  round 2 at 0x400: 8 cells
-  round 3 at 0x400: 8 cells
-  round 4 at 0x400: 8 cells
-  round 5 at 0x400: 8 cells
-  round 1 at 0xc00: 8 cells
-  round 2 at 0xc00: 8 cells
-  round 3 at 0xc00: 8 cells
-  round 4 at 0xc00: 8 cells
-  round 5 at 0xc00: 8 cells
-  round 1 at 0x1400: 8 cells
-  round 2 at 0x1400: 8 cells
-  round 3 at 0x1400: 8 cells
-  round 4 at 0x1400: 8 cells
-  round 5 at 0x1400: 8 cells
+  round 1 at 0x400: 8 cells, 2 entry/exit positions
+  round 2 at 0x400: 8 cells, 2 entry/exit positions
+  round 3 at 0x400: 8 cells, 2 entry/exit positions
+  round 4 at 0x400: 8 cells, 2 entry/exit positions
+  round 5 at 0x400: 8 cells, 2 entry/exit positions
+  round 1 at 0xc00: 8 cells, 2 entry/exit positions
+  round 2 at 0xc00: 8 cells, 2 entry/exit positions
+  round 3 at 0xc00: 8 cells, 2 entry/exit positions
+  round 4 at 0xc00: 8 cells, 2 entry/exit positions
+  round 5 at 0xc00: 8 cells, 2 entry/exit positions
+  round 1 at 0x1400: 8 cells, 2 entry/exit positions
+  round 2 at 0x1400: 8 cells, 2 entry/exit positions
+  round 3 at 0x1400: 8 cells, 2 entry/exit positions
+  round 4 at 0x1400: 8 cells, 2 entry/exit positions
+  round 5 at 0x1400: 8 cells, 2 entry/exit positions
 
 cell                                               median      min      max  max/min   q3/q1  stability
 -------------------------------------------------------------------------------------------------------
-baseline: the same loop, no call at all              0.79     0.66     0.79     1.20    1.20  stable
-A: exit to Rust per call                            91.62    90.68    92.72     1.02    1.01  stable
-A: exit to Rust, + 8-argument marshal              100.36    98.70   108.67     1.10    1.01  stable
-B: dispatch inside the run loop                     19.30    16.77    27.23     1.62    1.10  stable
-B: dispatch inline, + 8-argument marshal            26.50    24.47    27.50     1.12    1.05  stable
-B: inline + marshal, through a real PLT stub        31.71    29.61    33.10     1.12    1.01  stable
-A: exit + marshal, through a real PLT stub          82.19    80.04    87.58     1.09    1.03  stable
-A: exit + marshal, direct, re-measured last         99.91    97.96   101.56     1.04    1.01  stable
+baseline: the same loop, no call at all              0.66     0.66     0.79     1.20    1.00  stable
+A: exit to Rust per call                            92.49    89.49    97.93     1.09    1.03  stable
+A: exit to Rust, + 8-argument marshal              102.48   100.53   104.67     1.04    1.02  stable
+B: dispatch inside the run loop                     15.65    14.58    28.60     1.96    1.05  stable
+B: dispatch inline, + 8-argument marshal            28.34    25.46    28.89     1.13    1.03  stable
+B: inline + marshal, through a real PLT stub        32.87    30.76    33.92     1.10    1.03  stable
+A: exit + marshal, through a real PLT stub          81.15    78.80    97.74     1.24    1.02  stable
+A: exit + marshal, direct, re-measured last        102.75    99.48   105.48     1.06    1.02  stable
 -------------------------------------------------------------------------------------------------------
-one run entry and exit (ns/entry)                   41.34    40.77    44.95     1.10    1.02  stable
+one run entry+exit, first in the process            41.38    40.73    42.39     1.04    1.01  stable
+one run entry+exit, last in the process             41.27    40.44    42.10     1.04    1.01  stable
+
+NOT BIMODAL in this sweep: entry-and-exit costs 41.27 ns last against 41.38 ns first, a ratio of 1.00.
+         The review observed 41.8 / 89.0 / 91.7 ns for this probe on this host, so the mode exists and this sweep did not reach it.
+         And note what that leaves open: design A's round trip measures 80-102 ns in these same processes against ~41 ns for one entry and one exit,
+         and a design-A round trip IS one entry and one exit. That gap is unexplained, so design A is quoted as a band on the strength of the review's
+         direct observation rather than on a mechanism this tool has reproduced.
 
 NOTE: every design-A cell came out stable in this sweep. The review found A's entry/exit path bimodal on this host (about 42 ns in a pristine process, 85-100 ns
       afterwards). Either this host does not show it or the sweep did not reach the second mode -- try more rounds. Do NOT downgrade the report's correction 1 on the

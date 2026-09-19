@@ -145,7 +145,9 @@ fn a_failed_thread_construction_does_not_consume_a_tls_block() {
 /// the halt bit survives the early return; the emitted dispatcher clears it on the way out of every
 /// `Run`, so it does not. An entry clear was written, measured against exactly this test, found to
 /// change nothing, and removed — it is a lock-prefixed RMW on the per-guest-call path, and the
-/// boundary M3 budgets against is under 53 ns in total.
+/// boundary M3 budgets against is about 33 ns in total for an inline thunk (`tests/thunk.rs`, which
+/// replaced D5 amendment 2's "under 53 ns" with a measured round trip), and a lock-prefixed RMW is a
+/// material fraction of that.
 ///
 /// So this is a *characterisation* test, not a regression test for a fix: it pins a property of the
 /// pin that `omni-cpu`'s error handling silently depends on. If dynarmic ever stops reading and

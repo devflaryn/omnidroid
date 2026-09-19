@@ -90,7 +90,10 @@ MUST_BE_STABLE = (
 )
 
 LINE = re.compile(r"^\s{2}(?P<label>.+?)\s{2,}(?P<ns>\d+\.\d+) ns/call")
-ENTRY = re.compile(r"^\s+a one-instruction guest function\s+(?P<ns>\d+\.\d+) ns/entry")
+#: The two entry-and-exit cells, whose only difference is where in the process they run. Matching
+#: both is how the sweep reports the bimodality instead of sampling one side of it.
+ENTRY = re.compile(r"^\s{2}(?P<label>(?:first|last) in the process)\s+(?P<ns>\d+\.\d+) ns/entry")
+ENTRY_CELLS = ("first in the process", "last in the process")
 
 
 def find_binary(root: Path) -> Path:
@@ -110,11 +113,12 @@ def find_binary(root: Path) -> Path:
     )
 
 
-def run_once(binary: Path, placement: int) -> tuple[dict[str, float], float | None]:
+def run_once(binary: Path, placement: int) -> tuple[dict[str, float], dict[str, float]]:
     env = dict(os.environ, OMNI_THUNK_DIRECT_AT=hex(placement))
     out = subprocess.run(
+        # No filter: the harness picks the order, and the order is the variable under study.
         [str(binary), "--ignored", "--nocapture", "--test-threads=1",
-         "the_thunk_round_trip", "one_run_entry_and_exit_alone"],
+         "--skip", "what_the_mxcsr_guard_costs"],
         capture_output=True,
         text=True,
         env=env,
@@ -124,16 +128,16 @@ def run_once(binary: Path, placement: int) -> tuple[dict[str, float], float | No
         sys.stderr.write(out.stdout + out.stderr)
         raise SystemExit(f"ERROR: the benchmark exited {out.returncode}")
     cells: dict[str, float] = {}
-    entry: float | None = None
+    entries: dict[str, float] = {}
     for line in out.stdout.splitlines():
+        m = ENTRY.match(line)
+        if m:
+            entries[m.group("label")] = float(m.group("ns"))
+            continue
         m = LINE.match(line)
         if m:
             cells[m.group("label").strip()] = float(m.group("ns"))
-            continue
-        m = ENTRY.match(line)
-        if m:
-            entry = float(m.group("ns"))
-    return cells, entry
+    return cells, entries
 
 
 def spread(values: list[float]) -> tuple[float, float, float, float, float]:
@@ -148,7 +152,7 @@ def spread(values: list[float]) -> tuple[float, float, float, float, float]:
     return median, lo, hi, (hi / lo if lo else float("inf")), (q3 / q1 if q1 else float("inf"))
 
 
-def report(samples: dict[str, list[float]], entries: list[float], rounds: int) -> int:
+def report(samples: dict[str, list[float]], entries: dict[str, list[float]], rounds: int) -> int:
     failures: list[str] = []
     print()
     header = f"{'cell':<48} {'median':>8} {'min':>8} {'max':>8} {'max/min':>8} {'q3/q1':>7}  stability"
@@ -168,14 +172,55 @@ def report(samples: dict[str, list[float]], entries: list[float], rounds: int) -
             f"{'stable' if ok else 'UNSTABLE -- quote as a band'}"
         )
 
+    medians: dict[str, float] = {}
     if entries:
-        median, lo, hi, range_ratio, iqr_ratio = spread(entries)
         print("-" * len(header))
-        print(
-            f"{'one run entry and exit (ns/entry)':<48} {median:>8.2f} {lo:>8.2f} {hi:>8.2f} "
-            f"{range_ratio:>8.2f} {iqr_ratio:>7.2f}  "
-            f"{'stable' if iqr_ratio <= UNSTABLE_RATIO else 'UNSTABLE -- the bimodality'}"
-        )
+        for cell in ENTRY_CELLS:
+            values = entries.get(cell, [])
+            if len(values) != rounds:
+                failures.append(f"entry cell {cell!r} appeared in {len(values)} of {rounds} rounds")
+                continue
+            median, lo, hi, range_ratio, iqr_ratio = spread(values)
+            medians[cell] = median
+            print(
+                f"{'one run entry+exit, ' + cell:<48} {median:>8.2f} {lo:>8.2f} {hi:>8.2f} "
+                f"{range_ratio:>8.2f} {iqr_ratio:>7.2f}  "
+                f"{'stable' if iqr_ratio <= UNSTABLE_RATIO else 'UNSTABLE'}"
+            )
+        if len(medians) == 2:
+            first, last = medians[ENTRY_CELLS[0]], medians[ENTRY_CELLS[1]]
+            ratio = last / first if first else float("inf")
+            print()
+            if ratio >= UNSTABLE_RATIO:
+                print(
+                    f"BIMODAL: the same entry-and-exit measurement costs {ratio:.2f}x more running "
+                    f"LAST in the process than FIRST ({last:.2f} against {first:.2f} ns)."
+                )
+                print(
+                    "         Every design-A figure must be quoted as a band, and D5 amendment 2's "
+                    "53 ns is a ceiling only for the first measurement in a pristine process."
+                )
+            else:
+                print(
+                    f"NOT BIMODAL in this sweep: entry-and-exit costs {last:.2f} ns last against "
+                    f"{first:.2f} ns first, a ratio of {ratio:.2f}."
+                )
+                print(
+                    "         The review observed 41.8 / 89.0 / 91.7 ns for this probe on this host, "
+                    "so the mode exists and this sweep did not reach it."
+                )
+                print(
+                    "         And note what that leaves open: design A's round trip measures 80-102 "
+                    f"ns in these same processes against ~{first:.0f} ns for one entry and one exit,"
+                )
+                print(
+                    "         and a design-A round trip IS one entry and one exit. That gap is "
+                    "unexplained, so design A is quoted as a band on the strength of the review's"
+                )
+                print(
+                    "         direct observation rather than on a mechanism this tool has "
+                    "reproduced."
+                )
 
     print()
     for cell in MUST_BE_STABLE:
@@ -230,17 +275,21 @@ def main() -> int:
     print(f"placements: {', '.join(hex(p) for p in placements)}")
 
     samples: dict[str, list[float]] = {}
-    entries: list[float] = []
+    entries: dict[str, list[float]] = {}
     total = 0
     for placement in placements:
         for round_index in range(args.rounds):
-            cells, entry = run_once(binary, placement)
+            cells, entry_cells = run_once(binary, placement)
             total += 1
-            print(f"  round {round_index + 1} at {placement:#x}: {len(cells)} cells", flush=True)
+            print(
+                f"  round {round_index + 1} at {placement:#x}: "
+                f"{len(cells)} cells, {len(entry_cells)} entry/exit positions",
+                flush=True,
+            )
             for label, ns in cells.items():
                 samples.setdefault(label, []).append(ns)
-            if entry is not None:
-                entries.append(entry)
+            for label, ns in entry_cells.items():
+                entries.setdefault(label, []).append(ns)
 
     code = report(samples, entries, args.rounds * len(placements))
     if args.json:

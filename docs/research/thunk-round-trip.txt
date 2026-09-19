@@ -1,30 +1,41 @@
 
-running 2 tests
-test one_run_entry_and_exit_alone ... 
+running 4 tests
+test a_one_run_entry_and_exit_measured_first ... 
 ONE run ENTRY AND EXIT — 200000 per sample, n = 31 samples
-  a one-instruction guest function                 41.88 ns/entry  (min 40.07, max 292.69)
-  (one `set_x`, one `RET`, one entry, one exit. D5 amendment 2's ceiling for the entry alone was 53 ns, derived rather than isolated.)
+  first in the process                             41.32 ns/entry   (n = 31: min 40.12, max 314.18)
 
 ok
 test the_thunk_round_trip ... 
 THE THUNK ROUND TRIP — 100000 guest calls per sample, n = 31 samples per cell
   backend: dynarmic
-  baseline: the same loop, no call at all             0.66 ns/call                  (n = 31: min 0.64, max 1.23)
-  A: exit to Rust per call                           91.25 ns/call   net    90.59   (n = 31: min 89.75, max 100.45)
-  A: exit to Rust, + 8-argument marshal             103.11 ns/call   net   102.45   (n = 31: min 98.05, max 108.78)
-  B: dispatch inside the run loop                    12.56 ns/call   net    11.90   (n = 31: min 11.01, max 16.43)
-  B: dispatch inline, + 8-argument marshal           27.80 ns/call   net    27.14   (n = 31: min 23.73, max 47.42)
-  B: inline + marshal, through a real PLT stub       31.91 ns/call   net    31.26   (n = 31: min 28.46, max 36.16)
-  A: exit + marshal, through a real PLT stub         83.83 ns/call   net    83.18   (n = 31: min 80.91, max 91.96)
-  A: exit + marshal, direct, re-measured last       101.41 ns/call   net   100.75   (n = 31: min 98.24, max 110.93)
+  baseline: the same loop, no call at all             0.66 ns/call                  (n = 31: min 0.62, max 0.76)
+  A: exit to Rust per call                           91.64 ns/call   net    90.99   (n = 31: min 90.62, max 94.02)
+  A: exit to Rust, + 8-argument marshal             100.68 ns/call   net   100.02   (n = 31: min 98.33, max 104.78)
+  B: dispatch inside the run loop                    14.93 ns/call   net    14.27   (n = 31: min 12.96, max 20.70)
+  B: dispatch inline, + 8-argument marshal           27.89 ns/call   net    27.23   (n = 31: min 25.66, max 32.08)
+  B: inline + marshal, through a real PLT stub       33.34 ns/call   net    32.69   (n = 31: min 29.63, max 49.16)
+  A: exit + marshal, through a real PLT stub         82.07 ns/call   net    81.41   (n = 31: min 77.95, max 89.36)
+  A: exit + marshal, direct, re-measured last       101.02 ns/call   net   100.36   (n = 31: min 99.49, max 107.81)
 
-  A / B, boundary only                               7.61x
-  A / B, as the loader builds it                     2.66x
-  the 8-argument marshal costs                      11.86 ns in A, 15.24 ns in B
-  the PLT stub in front of the thunk adds            4.12 ns in B, -19.27 ns in A
-  3,594 initializers x one import call each:        0.326 ms in A, 0.043 ms in B
+  A / B, boundary only                               6.38x
+  A / B, as the loader builds it                     2.49x
+  the 8-argument marshal costs                       9.04 ns in A, 12.96 ns in B
+  the PLT stub in front of the thunk adds            5.45 ns in B, -18.61 ns in A
+  3,594 initializers x one import call each:        0.327 ms in A, 0.051 ms in B
+
+ok
+test what_the_mxcsr_guard_costs ... 
+THE MXCSR GUARD — 2000000 enter/exit pairs per sample, n = 31 samples
+  words already equal (the common case)               0.20 ns   (gross 1.60, loop 1.39)
+  words differ                                        2.50 ns   (gross 3.89, loop 1.39)
+
+ok
+test z_the_same_entry_and_exit_measured_last ... 
+THE SAME ENTRY AND EXIT, LATER IN THE PROCESS
+  last in the process                              40.36 ns/entry   (n = 31: min 40.08, max 41.67)
+  If this is roughly twice the figure above, `od_jit_run`'s entry/exit path is bimodal on this host and every design-A number must be quoted as a band. `tools/thunk_sweep.py` reports both and computes the ratio.
 
 ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 1.87s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 2.65s
 

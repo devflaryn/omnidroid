@@ -1,11 +1,19 @@
 //! **The thunk round trip**: what it costs for the guest to call out of its world and come back,
 //! measured two ways, because the two ways are M3's actual design decision.
 //!
-//! The only cost figure on the branch before this was "under 53 ns", and it is an **entry** ceiling
-//! (D5 amendment 2) — what one `od_jit_run` call costs, explicitly excluding the exit and the
-//! re-entry. M3 needs the round trip: the guest branches into the thunk region, the host services the
-//! call, the guest resumes. Every one of `libroblox.so`'s imported symbols crosses this boundary, and
-//! it is crossed from all 3,594 static initializers before a frame is ever drawn.
+//! The only cost figure on the branch before this was "under 53 ns" (D5 amendment 2), and **two
+//! things about it were wrong**. The M3 brief described it as an *entry* ceiling excluding the exit;
+//! `DECISIONS.md:1064-1074` measures "870 entries to **and exits from** `od_jit_run`", so it was
+//! already an entry-and-exit figure. And it is not a ceiling that holds: review measured the same path
+//! at **41.8 / 89.0 / 91.7 ns** in one process, so 53 ns describes the first measurement in a pristine
+//! process and not the ordinary cost. See `z_the_same_entry_and_exit_measured_last`.
+//!
+//! What M3 needs either way is the **round trip**: the guest branches into the thunk region, the host
+//! services the call, the guest resumes. Every one of `libroblox.so`'s imported symbols crosses this
+//! boundary, and it is crossed from all 3,594 static initializers before a frame is ever drawn. The
+//! budget that came out of this file is **about 33 ns per call for design B against 80-105 ns for
+//! design A, a factor of 3**, measured through a real PLT stub because that is the shape the loader
+//! produces.
 //!
 //! Two shapes, and the measurement decides between them:
 //!
@@ -713,10 +721,10 @@ fn an_inline_handler_sees_and_writes_the_guest_vector_file() {
 /// **The measurement.** Both designs, with and without a representative marshal, plus the PLT-stub
 /// shape, against a baseline that is the same guest loop with the call removed.
 ///
-/// The baseline is measured rather than assumed, which is the one thing D5 amendment 2's "under
-/// 53 ns" got right and the reason it is a ceiling rather than a number: subtracting a loop cost that
-/// has not been measured is how a figure ends up containing ten guest instructions of somebody
-/// else's work.
+/// The baseline is measured rather than assumed, which is the one thing D5 amendment 2 got right:
+/// subtracting a loop cost that has not been measured is how a figure ends up containing ten guest
+/// instructions of somebody else's work. `tools/thunk_sweep.py` runs this across processes and
+/// placements and reports which cells are stable enough to quote a median from — design A's are not.
 #[test]
 #[ignore = "measurement, not a test"]
 fn the_thunk_round_trip() {
@@ -941,9 +949,10 @@ fn measure_one_entry_and_exit(label: &str) {
 
 /// **One `od_jit_run` entry and exit, measured FIRST in the process.**
 ///
-/// D5 amendment 2 derived "under 53 ns" for this and said isolating it exactly would need a guest
-/// function of zero instructions. This is as close as the architecture allows: a single `RET` to the
-/// sentinel, so the timed body is one `set_x`, one entry, one guest instruction and one exit.
+/// D5 amendment 2 derived "under 53 ns" for this from a warm pass over 870 real Roblox leaves and said
+/// isolating it exactly would need a guest function of zero instructions. This is as close as the
+/// architecture allows: a single `RET` to the sentinel, so the timed body is one `set_x`, one entry,
+/// one guest instruction and one exit.
 ///
 /// **Read it with its twin below.** The name is chosen so this sorts *before* `the_thunk_round_trip`
 /// and its twin sorts *after*, because the whole point is that the figure depends on that.

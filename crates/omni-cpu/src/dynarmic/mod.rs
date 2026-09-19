@@ -1263,7 +1263,9 @@ impl GuestCpu for DynarmicCpu {
         //
         // An entry clear was written, measured against that, and removed. It changed no behaviour,
         // and it is not free: it is a lock-prefixed RMW on the per-call path, and the guest call
-        // boundary M3 budgets against is under 53 ns in total.
+        // boundary M3 budgets against is about 33 ns in total for an inline thunk -- see
+        // `tests/thunk.rs`, which replaced D5 amendment 2's "under 53 ns" with a measured round trip.
+        // A lock-prefixed RMW is a material fraction of that, which is why this stayed removed.
         //
         // The residual, stated rather than swept up: `OD_HALT_SHIM_REENTERED` and
         // `OD_HALT_SHIM_THREW` never reach that `xchg` — the first never calls `Run`, and the second
