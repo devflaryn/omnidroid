@@ -33,6 +33,8 @@ pub mod ctype;
 pub mod errno;
 pub mod error;
 pub mod guestcmp;
+pub mod guard;
+pub mod layouts;
 pub mod libm;
 pub mod locale;
 pub mod mem;
