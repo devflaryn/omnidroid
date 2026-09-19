@@ -13,8 +13,8 @@
 | 1 — foundation | done (commit `ac023fb`) |
 | 2 — memory functions | done (commit `f434809`) |
 | 3 — string functions | done (commit `1335aeb`) |
-| 4 — ctype + numeric conversion | done (this commit) |
-| 5 — libm | pending |
+| 4 — ctype + numeric conversion | done (commit `06d332b`) |
+| 5 — libm | done (this commit) |
 | 6 — printf core (stretch) | pending |
 | 7 — verification | pending |
 
@@ -445,9 +445,64 @@ comparator runs through the `GuestCompare` callback trait (the adapter will perf
 call); a comparator fault propagates as `Fault`. Verified against Rust's `sort_unstable` as an
 independent reference on 100 pseudo-random elements.
 
+### 2.4 Phase 5 — libm (commit of this section)
+
+34 libm functions (see the phase 0 table). 18 libm tests; suite 152.
+
+**Implementation policy held:** no transcendental function was reimplemented — Rust's
+`f64`/`f32` methods provide the math; this crate's work is the POSIX/C11-Annex-F edge-case
+contract: NaN propagation, ±inf, ±0 sign preservation, domain errors (log of negative,
+acos/asin outside [-1,1], pow(negative, non-integer) → NaN + EDOM), and range errors
+(exp/pow/sinh/cosh/ldexp overflow → ±HUGE_VAL + ERANGE; true underflow to 0 → +ERANGE per
+bionic's choice among C11's options).
+
+**Precision classes honoured in tests:** exact-IEEE functions (`fmodf`, `frexp`, `ldexp`,
+`modff`, `ilogb`) tested **bit-for-bit** via `to_bits()` including signed zeros;
+transcendental functions tested within **1 ULP** (stated tolerance) against Rust's own
+independently-computed results; cases C fixes exactly (pow(x, ±0) = 1, pow(±0, odd y) =
+±0, sin 0 = 0, cos 0 = 1, pow(2, 10) = 1024, cbrtf(±8) = ±2) tested exact.
+
+**Bugs the tests caught this phase (VERIFIED failing first, then fixed):**
+1. `ilogb` of subnormals: the fraction's MSB position subtracted the full 64-bit leading-
+   zero count instead of the 52-bit fraction's (12-bit offset error) → wrong exponent
+   (-1086 vs -1074 for the smallest subnormal).
+2. `pow(-0.0, 2.0)` returned `-0.0`; Annex F requires `+0` (sign of x survives only for
+   odd integral y).
+3. Two test fixtures called functions through fresh contexts without mapping the output
+   slots (fault at the mapped address) — test-only, not implementation.
+
+**`frexp` without a std helper:** Rust 1.89 has no `frexp`; the implementation is pure
+bit manipulation (`to_bits`/`from_bits`, safe code): normal path rewrites the biased
+exponent to 1022; the subnormal path shifts the fraction's MSB into the normal slot and
+compensates the exponent — exact by construction, verified by round-trip over
+1e-300…1e300 and `f64::MIN_POSITIVE`.
+
+**`ilogb` special values:** bionic's `FP_ILOGB0`/`FP_ILOGBNAN` are `INT_MIN`,
+`FP_ILOGBINTB` is `INT_MAX` (VERIFIED against bionic `libm/include/math.h`); this differs
+from glibc's `FP_ILOGBNAN = INT_MAX` choice — POSIX permits both, and the guest is bionic,
+so `INT_MIN` is implemented for 0/NaN. Recorded as a bionic-vs-glibc divergence reviewers
+should sanity-check against the NDK headers.
+
+**`sincosf` returns through guest pointers:** both results are written through the context
+(4 bytes each, little-endian). GNU/bionic dereference the output pointers unconditionally;
+this crate treats a null pointer as "skip the write" — a documented divergence (on device a
+null output would crash; here the guest's null cannot crash the host, and skipping is the
+least surprising non-crashing behaviour).
+
+---
+
 ## 3. ABI decisions (long / wchar_t / long double / errno / layouts)
 
-*(filled per phase)*
+*(accumulated per phase; summary here)*
+
+| topic | decision | where |
+|---|---|---|
+| `long` / `unsigned long` | 64-bit everywhere; `strtol`/`strtoll` share limits, `strtoul`/`strtoull` share `u64`; overflow clamps at 64-bit bounds + ERANGE | `numerics.rs` |
+| `wchar_t` | 32-bit UTF-32 elements, little-endian; `wmemcmp` unsigned ordering | `wide.rs` |
+| `long double` | **not reachable**: no `strtold`/`fabsl`-family function is both imported and reachable (`strtold_l` is never-referenced). Nothing in the crate computes in 64-bit `double` where 128-bit quad is required — the case simply does not arise in scope | report §1.3 |
+| errno numbering | Linux values only, defined in `errno::consts` (EINVAL 22, EDOM 33, ERANGE 34, EILSEQ 84, ...); host errno never referenced | `errno.rs`, `wide.rs`, `numerics.rs`, `libm.rs` |
+| struct layouts | `lconv` per POSIX declaration order at LP64 alignment (pointers first, then `char`s; CHAR_MAX = 127 = signed-char max on arm64) | `locale.rs` |
+| `mbstate_t` | treated as always-initial (UTF-8 is stateless); a non-initial state is rejected as `Unimplemented`, never guessed | `wide.rs` |
 
 ## 4. Bionic vs host-C divergences found
 
