@@ -54,13 +54,39 @@ const CHECK_CALLS: u64 = 1_000;
 /// Layout inside the 64 KiB guest code region. Distinct offsets, so loading one program never
 /// overwrites another whose context is still alive.
 const BASELINE_AT: usize = 0x0000;
-const DIRECT_AT: usize = 0x0400;
+const DEFAULT_DIRECT_AT: usize = 0x0400;
 const VIA_STUB_AT: usize = 0x0800;
 /// The thunk itself. Inside the code region on purpose: the real loader gives imported symbols a
 /// reserved region (`ARCHITECTURE.md` section 5), but what the backend sees is a branch to an address
 /// it was told about, and `read_code` plants the stop there whatever guest memory holds.
 const THUNK_AT: usize = 0x2000;
 const STUB_AT: usize = 0x4000;
+
+/// Where the direct call loop is placed, overridable through `OMNI_THUNK_DIRECT_AT`.
+///
+/// Configurable **because the sweep needs it**. Design A's round trip came out 19-24 ns cheaper
+/// through a PLT stub than through a direct `BL`, and the first check anyone makes on a result like
+/// that is whether the guest program's address moved it. Doing that by editing a constant and
+/// rebuilding measures four binaries; reading it from the environment measures one, which is the
+/// point. `tools/thunk_sweep.py` drives it.
+fn direct_at() -> usize {
+    match std::env::var("OMNI_THUNK_DIRECT_AT") {
+        Ok(value) => {
+            let text = value.trim();
+            let parsed = text
+                .strip_prefix("0x")
+                .map_or_else(|| text.parse::<usize>(), |hex| usize::from_str_radix(hex, 16))
+                .unwrap_or_else(|e| panic!("OMNI_THUNK_DIRECT_AT={value:?} is not a number: {e}"));
+            assert!(
+                parsed % 4 == 0 && parsed + 64 <= THUNK_AT,
+                "OMNI_THUNK_DIRECT_AT={parsed:#x} must be word-aligned and leave room before the \
+                 thunk at {THUNK_AT:#x}"
+            );
+            parsed
+        }
+        Err(_) => DEFAULT_DIRECT_AT,
+    }
+}
 
 /// Serializes the measurements. A timing taken while a sibling runs measures the scheduler.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -146,6 +172,13 @@ fn plt_stub(stub_at: GuestAddr, got_slot: GuestAddr) -> Vec<u32> {
 /// This is the *boundary* and nothing else, which is what makes it the right thing to compare
 /// against. A real imported symbol adds its own body on top.
 fn nothing(_call: &mut InlineThunkCall<'_>) {}
+
+/// `LDMXCSR` from a `u32`.
+fn write_mxcsr(value: u32) {
+    // SAFETY: SSE2 is baseline on x86-64 and this file is `cfg(target_arch = "x86_64")`. Every value
+    // this is called with was read out of `MXCSR` or is one of its documented bits.
+    unsafe { core::arch::asm!("ldmxcsr [{}]", in(reg) &value, options(nostack)) };
+}
 
 /// `STMXCSR` into a `u32`. `_mm_getcsr` is deprecated in favour of exactly this.
 fn read_mxcsr() -> u32 {
@@ -306,7 +339,7 @@ fn inline_dispatch_services_every_call_without_leaving_the_run_loop() {
     let guest = Guest::new();
     guest.assert_high_addresses();
     let thunk = guest.code + THUNK_AT;
-    let entry = guest.load_at(DIRECT_AT, &call_loop(CHECK_CALLS, DIRECT_AT, Some(THUNK_AT)));
+    let entry = guest.load_at(direct_at(), &call_loop(CHECK_CALLS, direct_at(), Some(THUNK_AT)));
 
     // Design A, for the reference answer.
     let (mut cpu, sentinel) = guest.thread();
@@ -462,7 +495,7 @@ fn a_counted_budget_still_stops_a_guest_looping_through_an_inline_thunk() {
     let guest = Guest::new();
     let thunk = guest.code + THUNK_AT;
     // Effectively endless: 2^40 calls is more than any budget here will reach.
-    let entry = guest.load_at(DIRECT_AT, &call_loop(1 << 40, DIRECT_AT, Some(THUNK_AT)));
+    let entry = guest.load_at(direct_at(), &call_loop(1 << 40, direct_at(), Some(THUNK_AT)));
 
     let (mut cpu, sentinel) = guest.thread();
     cpu.add_inline_thunk(thunk, nothing).expect("an inline thunk");
@@ -493,29 +526,30 @@ fn a_counted_budget_still_stops_a_guest_looping_through_an_inline_thunk() {
     }
 }
 
-/// **An inline handler runs with the GUEST's MXCSR loaded, and design A's does not.**
+/// **The dispatcher's MXCSR guard, in both directions.**
 ///
-/// Found by reading `A64EmitX64::EmitA64CallSupervisor`, which calls `Devirtualize<CallSVC>::EmitCall`
-/// **without** a preceding `code.SwitchMxcsrOnExit()` — the only terminal in the A64 emitter that
-/// does switch is `IR::Term::Interpret`. `BlockOfCode::GenRunCode` loads `guest_MXCSR` on entry and
-/// restores the host's only on the `FORCE_RETURN` paths. So a handler called from inside generated
-/// code inherits the guest's rounding mode and its flush-to-zero / denormals-are-zero bits, while
-/// design A services the call after `run` has returned and the host MXCSR is back.
+/// The hazard, found by reading the vendored emitter and confirmed by measuring it before the guard
+/// existed: `A64EmitX64::EmitA64CallSupervisor` calls `Devirtualize<CallSVC>::EmitCall` with **no**
+/// `code.SwitchMxcsrOnExit()` in front of it, and `BlockOfCode::GenRunCode` restores the host's word
+/// only on the two `FORCE_RETURN` paths. So before the guard, a handler ran with the guest's rounding
+/// mode and its flush-to-zero and denormals-are-zero bits. Rust's `f32`/`f64` compile to SSE and
+/// `exp`, `log`, `powf` and `sincosf` are all among the imports the 3,594 initializers reach, so a
+/// host `powf` serviced inline would have computed with denormals flushed and returned a plausible
+/// number.
 ///
-/// **This matters for task 3, not for the benchmark.** `exp`, `log`, `powf` and `sincosf` are all in
-/// the set of imports the 3,594 initializers reach, and Rust's `f32`/`f64` compile to SSE. A host
-/// `powf` serviced inline would run under whatever FPCR the guest last set — silently, with no error
-/// and a plausible answer. Either such a handler saves and restores MXCSR itself, or symbols that do
-/// host floating point stay on the exiting thunk.
+/// `dynarmic::mxcsr::Guard` closes it **in the dispatcher**, at the one point every inline handler
+/// passes through, rather than in the handlers — a guard a handler has to remember is silently absent
+/// from the handler that forgot it. This test asserts both halves of it, because a guard that installs
+/// the host's word and does not put the guest's back has merely moved the corruption into the guest:
 ///
-/// Asserted rather than left as a code reading, because a code reading is not a measurement.
+/// 1. the handler sees the **host's** `MXCSR`, not the guest's;
+/// 2. the guest's floating-point control state is **still in force after the call returns**, observed
+///    from guest code by a denormal multiply, which is the only way guest code can see `FPCR.FZ`.
 #[test]
-fn an_inline_handler_inherits_the_guest_mxcsr() {
+fn the_dispatcher_puts_the_host_mxcsr_under_a_handler_and_the_guest_s_back() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-
-
-    /// What `_mm_getcsr()` read inside the handler.
+    /// What the handler read out of `MXCSR`.
     static SEEN: AtomicU32 = AtomicU32::new(0);
 
     fn record_mxcsr(_call: &mut InlineThunkCall<'_>) {
@@ -525,18 +559,127 @@ fn an_inline_handler_inherits_the_guest_mxcsr() {
     let _serial = serialized();
     let guest = Guest::new();
     let thunk = guest.code + THUNK_AT;
-
-    // The host's own MXCSR, for the comparison. 0x1F80 on a default Windows x64 thread.
     let host = read_mxcsr();
+    const FTZ: u32 = 1 << 15;
+    const DAZ: u32 = 1 << 6;
+    assert_eq!(host & (FTZ | DAZ), 0, "the host thread already had FTZ/DAZ set; this test is void");
 
-    // MOV X21, X30 ; MOVZ X0, #0x0100, LSL #16  (FPCR.FZ, bit 24) ; MSR FPCR, X0 ; BL thunk ; RET X21
-    let mut program = vec![mov_reg(21, 30), movz(0, 0x0100, 1), msr_fpcr(0)];
+    // The smallest positive double subnormal, and 1.0. Under `FPCR.FZ` the multiply flushes to +0;
+    // without it the result is the subnormal itself.
+    const SUBNORMAL: u64 = 1;
+    const ONE: u64 = 0x3FF0_0000_0000_0000;
+
+    // Run the same program twice, once with FPCR.FZ set and once with FPCR clear, and compare what
+    // the guest computes *after* the call. Two directions, because a test of a guard that only ever
+    // sees one control word cannot tell a restore from a no-op.
+    for (label, fpcr_fz) in [("FPCR.FZ set", true), ("FPCR clear", false)] {
+        guest.write_u64(guest.data, SUBNORMAL);
+        guest.write_u64(guest.data + 8, ONE);
+        guest.write_u64(guest.data + 16, 0xDEAD_BEEF);
+        SEEN.store(0, Ordering::Relaxed);
+
+        // MOV X21, X30 ; MOV X1, #data ; MOVZ X0, #FZ ; MSR FPCR, X0 ; BL thunk
+        //   ; LDR D0,[X1] ; LDR D1,[X1,#8] ; FMUL D2, D0, D1 ; STR D2,[X1,#16] ; RET X21
+        let mut program = vec![mov_reg(21, 30)];
+        program.extend(mov64(1, guest.data as u64));
+        // `FPCR.FZ` is bit 24, i.e. 0x0100 shifted left by 16.
+        program.push(if fpcr_fz { movz(0, 0x0100, 1) } else { movz(0, 0, 0) });
+        program.push(msr_fpcr(0));
+        program.push(bl(THUNK_AT as i32 / 4 - program.len() as i32));
+        program.push(ldr_d(0, 1, 0));
+        program.push(ldr_d(1, 1, 8));
+        program.push(fmul_d(2, 0, 1));
+        program.push(str_d(2, 1, 16));
+        program.push(ret(21));
+        let entry = guest.load_at(0, &program);
+
+        let (mut cpu, sentinel) = guest.thread();
+        cpu.add_inline_thunk(thunk, record_mxcsr).expect("an inline thunk");
+        rearm(&mut cpu, sentinel);
+        match cpu.run(entry, RunLimit::Unlimited).expect("run") {
+            ExitReason::Returned { pc } => assert_eq!(pc, sentinel),
+            other => panic!("{label}: expected the sentinel, got {other}"),
+        }
+        assert_eq!(cpu.inline_calls(), 1, "{label}: the handler must have run");
+
+        // 1. The handler saw the host's word.
+        let seen = SEEN.load(Ordering::Relaxed);
+        assert_eq!(
+            seen, host,
+            "{label}: the handler saw MXCSR {seen:#06x} against the host's {host:#06x}. Without the \
+             dispatcher's guard it sees the GUEST's word, and any host floating point in a handler -- \
+             `powf`, `exp`, `log`, `sincosf`, all of which the initializers reach -- computes under \
+             the guest's rounding mode and denormal control"
+        );
+
+        // 2. The guest's word survived the call, observed by the guest itself.
+        let product = guest.read_u64(guest.data + 16);
+        let expected = if fpcr_fz { 0 } else { SUBNORMAL };
+        assert_eq!(
+            product, expected,
+            "{label}: the guest multiplied the smallest subnormal by 1.0 after the call and got \
+             {product:#018x}, wanted {expected:#018x}. A guard that installs the host's MXCSR and \
+             does not restore the guest's has only moved the corruption into the guest, where no \
+             host-side assertion can see it"
+        );
+    }
+}
+
+/// **The guest's vector file is coherent at an inline callback, and a handler's writes reach the
+/// resumed guest.**
+///
+/// The review asked for this, and it is the right thing to ask: `add_inline_thunk`'s documentation
+/// claims "guest registers are coherent in `JitState` at every callback", and the evidence offered
+/// was the integer file. AAPCS64 passes floating-point and vector arguments in `V0`-`V7` and returns
+/// in `V0`, so a marshal that could only reach `X0`-`X7` would silently drop every `double`
+/// argument — a whole class of imported symbols returning plausible garbage. `exp`, `log`, `powf` and
+/// `sincosf` are in the reachable set and every one of them takes and returns a `double` or a `float`.
+///
+/// `A64EmitX64::EmitA64SetQ` stores to `JitState.vec` with a `movaps`, exactly as the integer setters
+/// store to `JitState.reg`, so the symmetry is real. This asserts it instead of relying on it, in both
+/// directions: the handler must *read* what the guest put in `V0`, and what the handler *writes* to
+/// `V1` must be what the guest then stores to memory.
+#[test]
+fn an_inline_handler_sees_and_writes_the_guest_vector_file() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The two halves of `V0` as the handler saw them.
+    static SEEN_LO: AtomicU64 = AtomicU64::new(0);
+    static SEEN_HI: AtomicU64 = AtomicU64::new(0);
+
+    /// A 128-bit pattern with every byte distinct, so a half-swap or a truncation to 64 bits is
+    /// visible rather than plausible.
+    const ARGUMENT: u128 = 0x0F1E_2D3C_4B5A_6978_8796_A5B4_C3D2_E1F0;
+    /// What the handler returns. Not `!ARGUMENT`, so a handler that did nothing at all cannot pass.
+    const RESULT: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+
+    fn vector_marshal(call: &mut InlineThunkCall<'_>) {
+        let seen = call.v(0);
+        SEEN_LO.store(seen as u64, Ordering::Relaxed);
+        SEEN_HI.store((seen >> 64) as u64, Ordering::Relaxed);
+        call.set_v(1, RESULT);
+    }
+
+    let _serial = serialized();
+    let guest = Guest::new();
+    let thunk = guest.code + THUNK_AT;
+
+    guest.write_u64(guest.data, ARGUMENT as u64);
+    guest.write_u64(guest.data + 8, (ARGUMENT >> 64) as u64);
+    guest.write_u64(guest.data + 16, 0);
+    guest.write_u64(guest.data + 24, 0);
+
+    // MOV X21, X30 ; MOV X1, #data ; LDR Q0, [X1] ; BL thunk ; STR Q1, [X1, #16] ; RET X21
+    let mut program = vec![mov_reg(21, 30)];
+    program.extend(mov64(1, guest.data as u64));
+    program.push(ldr_q(0, 1, 0));
     program.push(bl(THUNK_AT as i32 / 4 - program.len() as i32));
+    program.push(str_q(1, 1, 16));
     program.push(ret(21));
     let entry = guest.load_at(0, &program);
 
     let (mut cpu, sentinel) = guest.thread();
-    cpu.add_inline_thunk(thunk, record_mxcsr).expect("an inline thunk");
+    cpu.add_inline_thunk(thunk, vector_marshal).expect("an inline thunk");
     rearm(&mut cpu, sentinel);
     match cpu.run(entry, RunLimit::Unlimited).expect("run") {
         ExitReason::Returned { pc } => assert_eq!(pc, sentinel),
@@ -544,36 +687,27 @@ fn an_inline_handler_inherits_the_guest_mxcsr() {
     }
     assert_eq!(cpu.inline_calls(), 1, "the handler must have run");
 
-    let seen = SEEN.load(Ordering::Relaxed);
-    assert_ne!(seen, 0, "the handler did not record anything");
-    // FPCR.FZ makes dynarmic set SSE flush-to-zero (bit 15) and denormals-are-zero (bit 6);
-    // `A64JitState::SetFpcr` is where that mapping lives.
-    const FTZ: u32 = 1 << 15;
-    const DAZ: u32 = 1 << 6;
+    let seen = u128::from(SEEN_LO.load(Ordering::Relaxed))
+        | (u128::from(SEEN_HI.load(Ordering::Relaxed)) << 64);
     assert_eq!(
-        seen & (FTZ | DAZ),
-        FTZ | DAZ,
-        "the handler saw MXCSR {seen:#06x} with the host's at {host:#06x}. If the flush-to-zero and          denormals-are-zero bits are clear, the guest's MXCSR is NOT live inside an inline handler          and this finding should be withdrawn from the task 1 report"
+        seen, ARGUMENT,
+        "the handler read V0 as {seen:#034x}, wanted {ARGUMENT:#034x}. If the low half is right and \
+         the high half is zero, the vector file is only half coherent at a callback and a marshal \
+         must not read 128-bit arguments through it"
     );
-    // And the host's own MXCSR does not have them, which is what makes the assertion above a
-    // difference rather than a coincidence.
-    assert_eq!(host & (FTZ | DAZ), 0, "the host thread already had FTZ/DAZ set; test is void");
 
-    // Design A services the call *after* `run` returns, so the host MXCSR is back by then. The same
-    // program, the same guest FPCR, an exiting thunk.
-    SEEN.store(0, Ordering::Relaxed);
-    let (mut cpu, _sentinel) = guest.thread();
-    cpu.add_thunk(thunk).expect("an exiting thunk");
-    rearm(&mut cpu, sentinel);
-    match cpu.run(entry, RunLimit::Unlimited).expect("run") {
-        ExitReason::Thunk { .. } => {}
-        other => panic!("expected the thunk exit, got {other}"),
-    }
-    let after_exit = read_mxcsr();
+    let written = u128::from(guest.read_u64(guest.data + 16))
+        | (u128::from(guest.read_u64(guest.data + 24)) << 64);
     assert_eq!(
-        after_exit, host,
-        "design A must hand control back with the HOST MXCSR restored; got {after_exit:#06x}          against {host:#06x}. If this fails, the difference between the two designs is smaller than          the report claims and both need the save/restore"
+        written, RESULT,
+        "the guest stored {written:#034x} from V1 after the call, wanted the {RESULT:#034x} the \
+         handler wrote. A handler that cannot return a value in the vector file cannot implement any \
+         imported symbol that returns a double"
     );
+
+    // And the register file the runtime reads afterwards agrees with what the guest saw, so a caller
+    // does not get a third answer.
+    assert_eq!(cpu.v(omni_cpu::VReg::new(1).expect("V1")), RESULT);
 }
 
 /// **The measurement.** Both designs, with and without a representative marshal, plus the PLT-stub
@@ -606,7 +740,7 @@ fn the_thunk_round_trip() {
 
     // The direct shape: `BL` straight into the thunk region, which is what `ARCHITECTURE.md`
     // section 5 describes.
-    let entry = guest.load_at(DIRECT_AT, &call_loop(CALLS, DIRECT_AT, Some(THUNK_AT)));
+    let entry = guest.load_at(direct_at(), &call_loop(CALLS, direct_at(), Some(THUNK_AT)));
 
     let exiting = {
         let (mut cpu, sentinel) = guest.thread();
@@ -713,17 +847,67 @@ fn the_thunk_round_trip() {
     println!();
 }
 
-/// **What one `od_jit_run` entry costs, separated from the round trip.**
+/// **What the dispatcher's MXCSR guard costs**, measured on its own.
 ///
-/// D5 amendment 2 derived "under 53 ns" for this from a warm pass over 870 real Roblox leaves, and
-/// said isolating it exactly would need a guest function of zero instructions. This is as close as
-/// the architecture allows: a single `RET` to the sentinel, so the timed body is one entry, one exit
-/// and one guest instruction. It is here because it is the *floor* under design A — design A cannot
-/// cost less than one entry plus one exit — and because it is the figure M3 was told to plan against.
+/// Reported separately from the boundary because it is the price of correction 1 — the guest's SSE
+/// control word being live inside a host callback — and a correctness fix whose cost is unknown is an
+/// argument waiting to be had. Two cases, because the guard branches on them: the guest has not
+/// touched `FPCR`, so the words match and the guard is one `stmxcsr` and a compare; and the guest has,
+/// so it is that plus two `ldmxcsr`.
+///
+/// Measured in host code rather than through the guest, on purpose. Against design B's ~30 ns the
+/// guard is a couple of nanoseconds, which is inside the spread of the B cells, so a before-and-after
+/// of the boundary could not resolve it. This can.
 #[test]
 #[ignore = "measurement, not a test"]
-fn one_run_entry_and_exit_alone() {
+fn what_the_mxcsr_guard_costs() {
     let _serial = serialized();
+    const ROUNDS: u64 = 2_000_000;
+    let host = read_mxcsr();
+
+    println!();
+    println!("THE MXCSR GUARD — {ROUNDS} enter/exit pairs per sample, n = {N} samples");
+    for (label, guest_word) in [("words already equal (the common case)", host), ("words differ", host | (1 << 15) | (1 << 6))] {
+        let summary = Summary::of(
+            (0..N)
+                .map(|_| {
+                    let t = Instant::now();
+                    for _ in 0..ROUNDS {
+                        // Stand the guest's word up, then do exactly what the dispatcher does.
+                        write_mxcsr(guest_word);
+                        let guard = omni_cpu::dynarmic::mxcsr_guard_for_measurement(host);
+                        core::hint::black_box(&guard);
+                        drop(guard);
+                    }
+                    t.elapsed()
+                })
+                .collect(),
+        );
+        // Net of the `write_mxcsr` the loop needs to set the scene, which the guard does not pay.
+        let setup = Summary::of(
+            (0..N)
+                .map(|_| {
+                    let t = Instant::now();
+                    for _ in 0..ROUNDS {
+                        write_mxcsr(guest_word);
+                        core::hint::black_box(&guest_word);
+                    }
+                    t.elapsed()
+                })
+                .collect(),
+        );
+        let gross = summary.median.as_secs_f64() * 1e9 / ROUNDS as f64;
+        let base = setup.median.as_secs_f64() * 1e9 / ROUNDS as f64;
+        println!("  {label:<46} {:>9.2} ns   (gross {gross:.2}, loop {base:.2})", gross - base);
+    }
+    write_mxcsr(host);
+    println!();
+}
+
+/// One `od_jit_run` entry and exit, on a one-instruction guest function.
+///
+/// Shared by the two tests below, whose only difference is **where in the process they run**.
+fn measure_one_entry_and_exit(label: &str) {
     let guest = Guest::new();
     guest.assert_high_addresses();
     let entry = guest.load_at(BASELINE_AT, &[ret(30)]);
@@ -746,18 +930,62 @@ fn one_run_entry_and_exit_alone() {
             })
             .collect(),
     );
-    let per_entry = summary.median.as_secs_f64() * 1e9 / ENTRIES as f64;
-    let min = summary.min.as_secs_f64() * 1e9 / ENTRIES as f64;
-    let max = summary.max.as_secs_f64() * 1e9 / ENTRIES as f64;
-    println!();
-    println!("ONE run ENTRY AND EXIT — {ENTRIES} per sample, n = {N} samples");
+    let per = |d: Duration| d.as_secs_f64() * 1e9 / ENTRIES as f64;
     println!(
-        "  a one-instruction guest function             {per_entry:>9.2} ns/entry  \
-         (min {min:.2}, max {max:.2})"
+        "  {label:<44} {:>9.2} ns/entry   (n = {N}: min {:.2}, max {:.2})",
+        per(summary.median),
+        per(summary.min),
+        per(summary.max)
     );
+}
+
+/// **One `od_jit_run` entry and exit, measured FIRST in the process.**
+///
+/// D5 amendment 2 derived "under 53 ns" for this and said isolating it exactly would need a guest
+/// function of zero instructions. This is as close as the architecture allows: a single `RET` to the
+/// sentinel, so the timed body is one `set_x`, one entry, one guest instruction and one exit.
+///
+/// **Read it with its twin below.** The name is chosen so this sorts *before* `the_thunk_round_trip`
+/// and its twin sorts *after*, because the whole point is that the figure depends on that.
+#[test]
+#[ignore = "measurement, not a test"]
+fn a_one_run_entry_and_exit_measured_first() {
+    let _serial = serialized();
+    println!();
+    println!("ONE run ENTRY AND EXIT — 200000 per sample, n = {N} samples");
+    measure_one_entry_and_exit("first in the process");
+    println!();
+}
+
+/// **The same entry and exit, measured LAST in the process — and it is roughly twice as expensive.**
+///
+/// This is the review's central correction, made reproducible. `od_jit_run`'s entry-and-exit path is
+/// **bimodal on this host**: about 40 ns for the first measurement in a pristine process and 85-100 ns
+/// afterwards, with host frequency, thermal state, live contexts, code placement, entry count and the
+/// exit reason all ruled out. A fresh `Guest`, a fresh backend and a fresh context each time, so it is
+/// not a property of the objects.
+///
+/// **Why it matters more than a curiosity.** The first version of the task 1 report put design A's
+/// round trip at 90.6 ns and this figure at 41.9 ns and concluded the round trip was "2.2x an entry
+/// and exit" — which cannot be true, because a design-A round trip *is* one entry and one exit. The
+/// two numbers were simply measured in different modes: the entry/exit cell always ran first in its
+/// process and the round-trip cells always ran after it. Same-mode, they agree.
+///
+/// Two consequences the report carries: D5 amendment 2's 53 ns is **not** a ceiling that holds in
+/// general, only for the first measurement in a pristine process; and every design-A figure has to be
+/// quoted as a band, because it is unstable by a factor of about two. Design B is immune — it does not
+/// leave the run loop — and measures the same in either position.
+#[test]
+#[ignore = "measurement, not a test"]
+fn z_the_same_entry_and_exit_measured_last() {
+    let _serial = serialized();
+    println!();
+    println!("THE SAME ENTRY AND EXIT, LATER IN THE PROCESS");
+    measure_one_entry_and_exit("last in the process");
     println!(
-        "  (one `set_x`, one `RET`, one entry, one exit. D5 amendment 2's ceiling for the entry \
-         alone was 53 ns, derived rather than isolated.)"
+        "  If this is roughly twice the figure above, `od_jit_run`'s entry/exit path is bimodal on \
+         this host and every design-A number must be quoted as a band. `tools/thunk_sweep.py` \
+         reports both and computes the ratio."
     );
     println!();
 }

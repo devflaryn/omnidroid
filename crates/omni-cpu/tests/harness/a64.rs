@@ -170,6 +170,39 @@ pub const fn mrs(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u
         | rt
 }
 
+/// `LDR Qt, [Xn, #byte_offset]` — SIMD&FP load, unsigned immediate, **128-bit**.
+///
+/// `size:2 111 V=1 01 opc:2 imm12 Rn Rt`, with `size = 00` and `opc = 11` selecting the 128-bit form
+/// and `imm12` scaled by 16. Spelled out because the width lives in two separate fields and getting
+/// it wrong produces a legal instruction of the wrong size.
+pub const fn ldr_q(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+    0x3DC0_0000 | ((byte_offset / 16) << 10) | (rn << 5) | rt
+}
+
+/// `STR Qt, [Xn, #byte_offset]` — as [`ldr_q`] with `opc = 10`.
+pub const fn str_q(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+    0x3D80_0000 | ((byte_offset / 16) << 10) | (rn << 5) | rt
+}
+
+/// `LDR Dt, [Xn, #byte_offset]` — SIMD&FP load, 64-bit: `size = 11`, `opc = 01`, `imm12` scaled by 8.
+pub const fn ldr_d(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+    0xFD40_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
+}
+
+/// `STR Dt, [Xn, #byte_offset]` — as [`ldr_d`] with `opc = 00`.
+pub const fn str_d(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+    0xFD00_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
+}
+
+/// `FMUL Dd, Dn, Dm` — floating-point data processing, two source, double precision.
+///
+/// `0001 1110 type:2 1 Rm:5 0000 10 Rn:5 Rd:5`, `type = 01` for double. Used to ask a
+/// *denormal-sensitive* question of the guest's `FPCR`, which is the only way to observe from guest
+/// code whether its floating-point control state survived a call out of the guest world.
+pub const fn fmul_d(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x1E60_0800 | (rm << 16) | (rn << 5) | rd
+}
+
 /// `MSR <system register>, Xt` — as [`mrs`] with bit 21 clear (`L = 0`, a write rather than a read).
 pub const fn msr(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
     mrs(rt, op0, op1, crn, crm, op2) & !(1 << 21)
@@ -236,6 +269,13 @@ mod tests {
         assert_eq!(mrs_fpcr(0), 0xD53B_4400);
         assert_eq!(msr_fpcr(0), 0xD51B_4400);
         assert_eq!(mrs_fpcr(0) ^ msr_fpcr(0), 1 << 21);
+        // The two SIMD&FP widths, whose size field is split across two places in the encoding.
+        assert_eq!(ldr_q(0, 1, 0), 0x3DC0_0020, "LDR Q0, [X1]");
+        assert_eq!(str_q(1, 0, 16), 0x3D80_0401, "STR Q1, [X0, #16]");
+        assert_eq!(ldr_d(0, 1, 0), 0xFD40_0020, "LDR D0, [X1]");
+        assert_eq!(str_d(2, 1, 16), 0xFD00_0822, "STR D2, [X1, #16]");
+        assert_eq!(ldr_q(0, 1, 0) ^ str_q(0, 1, 0), 0x0040_0000, "load vs store is opc bit 22");
+        assert_eq!(fmul_d(2, 0, 1), 0x1E61_0802, "FMUL D2, D0, D1");
         assert_eq!(brk(0), 0xD420_0000);
         assert_eq!(mov64(3, 0x1_0000_0000), vec![movz(3, 1, 2)]);
     }

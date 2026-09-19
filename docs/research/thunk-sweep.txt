@@ -1,0 +1,36 @@
+binary:     C:\Users\berat\Desktop\Omni Apps\omnidroid\target\release\deps\thunk-52fc34d401324c1c.exe
+rounds:     5 per placement, each in its own process
+placements: 0x400, 0xc00, 0x1400
+  round 1 at 0x400: 8 cells
+  round 2 at 0x400: 8 cells
+  round 3 at 0x400: 8 cells
+  round 4 at 0x400: 8 cells
+  round 5 at 0x400: 8 cells
+  round 1 at 0xc00: 8 cells
+  round 2 at 0xc00: 8 cells
+  round 3 at 0xc00: 8 cells
+  round 4 at 0xc00: 8 cells
+  round 5 at 0xc00: 8 cells
+  round 1 at 0x1400: 8 cells
+  round 2 at 0x1400: 8 cells
+  round 3 at 0x1400: 8 cells
+  round 4 at 0x1400: 8 cells
+  round 5 at 0x1400: 8 cells
+
+cell                                               median      min      max  max/min   q3/q1  stability
+-------------------------------------------------------------------------------------------------------
+baseline: the same loop, no call at all              0.79     0.66     0.79     1.20    1.20  stable
+A: exit to Rust per call                            91.62    90.68    92.72     1.02    1.01  stable
+A: exit to Rust, + 8-argument marshal              100.36    98.70   108.67     1.10    1.01  stable
+B: dispatch inside the run loop                     19.30    16.77    27.23     1.62    1.10  stable
+B: dispatch inline, + 8-argument marshal            26.50    24.47    27.50     1.12    1.05  stable
+B: inline + marshal, through a real PLT stub        31.71    29.61    33.10     1.12    1.01  stable
+A: exit + marshal, through a real PLT stub          82.19    80.04    87.58     1.09    1.03  stable
+A: exit + marshal, direct, re-measured last         99.91    97.96   101.56     1.04    1.01  stable
+-------------------------------------------------------------------------------------------------------
+one run entry and exit (ns/entry)                   41.34    40.77    44.95     1.10    1.02  stable
+
+NOTE: every design-A cell came out stable in this sweep. The review found A's entry/exit path bimodal on this host (about 42 ns in a pristine process, 85-100 ns
+      afterwards). Either this host does not show it or the sweep did not reach the second mode -- try more rounds. Do NOT downgrade the report's correction 1 on the
+      strength of one stable sweep; it was established by a direct probe, not by this.
+written: docs/research/thunk-sweep.json

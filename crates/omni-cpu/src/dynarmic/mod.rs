@@ -578,6 +578,93 @@ pub(crate) enum PendingExit {
     Breakpoint { pc: GuestAddr },
 }
 
+/// The SSE control word, and the guard that keeps the guest's out of host code.
+///
+/// # Why this is in the dispatcher and not in each handler
+///
+/// `BlockOfCode::GenRunCode` does `stmxcsr` of the host's word and `ldmxcsr` of `guest_MXCSR` before
+/// jumping into translated code, and restores the host's **only** on the two `FORCE_RETURN` paths.
+/// `A64EmitX64::EmitA64CallSupervisor` calls `Devirtualize<CallSVC>::EmitCall` with no
+/// `code.SwitchMxcsrOnExit()` in front of it — the only terminal in the whole A64 emitter that
+/// switches before a host call is `IR::Term::Interpret` — and `return_from_run_code[0]`, the
+/// dispatcher an inline thunk returns through, never touches it either.
+///
+/// So a host callback reached from generated code inherits the guest's rounding mode and its
+/// flush-to-zero and denormals-are-zero bits, which `A64JitState::SetFpcr` maps out of `FPCR`. Rust's
+/// `f32`/`f64` compile to SSE, and `exp`, `log`, `powf` and `sincosf` are all among the imports the
+/// 3,594 static initializers reach — so a host `powf` serviced inline would compute with denormals
+/// flushed and return a plausible number, with no error anywhere.
+///
+/// **The guard therefore lives here, at the one place every inline handler passes through, and not in
+/// the handlers.** A guard a handler is supposed to remember is a guard that is silently absent from
+/// the handler that forgot it, and that is exactly the defect class this one exists to close. It
+/// restores the **guest's** word on the way out as well as installing the host's on the way in,
+/// because the guest resumes inside the same `od_jit_run` and nothing else will put it back.
+///
+/// Not covered, and stated rather than implied: the x87 control word. Neither dynarmic nor Rust's
+/// `f32`/`f64` codegen uses x87 on x86-64, so there is nothing to switch; if that ever stops being
+/// true this is where it goes.
+pub(crate) mod mxcsr {
+    /// Read `MXCSR`.
+    ///
+    /// `_mm_getcsr` is deprecated in favour of exactly this instruction.
+    #[must_use]
+    pub(crate) fn read() -> u32 {
+        let mut out: u32 = 0;
+        // SAFETY: SSE2 is baseline on x86-64, and this module is only compiled there. `stmxcsr`
+        // writes four bytes to a `u32` this frame owns.
+        unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut out, options(nostack)) };
+        out
+    }
+
+    /// Write `MXCSR`.
+    pub(crate) fn write(value: u32) {
+        // SAFETY: as `read`. `ldmxcsr` reads four bytes from a `u32` this frame owns. A reserved bit
+        // would fault, and every value written here was read out of `MXCSR` in the first place.
+        unsafe { core::arch::asm!("ldmxcsr [{}]", in(reg) &value, options(nostack)) };
+    }
+
+    /// Installs the host's `MXCSR` for the body of a host callback and puts the guest's back.
+    ///
+    /// Nothing is switched when the two words are already equal, which is the common case — the guest
+    /// has not touched `FPCR` — so the guard costs one `stmxcsr` and a compare on that path.
+    pub(crate) struct Guard {
+        guest: u32,
+        switched: bool,
+    }
+
+    impl Guard {
+        pub(crate) fn enter(host: u32) -> Self {
+            let guest = read();
+            let switched = guest != host;
+            if switched {
+                write(host);
+            }
+            Self { guest, switched }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.switched {
+                write(self.guest);
+            }
+        }
+    }
+}
+
+/// [`mxcsr::Guard`], for the benchmark that prices it.
+///
+/// The guard itself stays crate-private — it is the dispatcher's business and nothing else should be
+/// constructing one — but "a correctness fix whose cost is unknown" is how an argument gets had
+/// later, so `tests/thunk.rs` is given a door to measure it through. It is `#[doc(hidden)]` and named
+/// after what it is for.
+#[doc(hidden)]
+#[must_use]
+pub fn mxcsr_guard_for_measurement(host_mxcsr: u32) -> impl Drop {
+    mxcsr::Guard::enter(host_mxcsr)
+}
+
 /// A host function servicing a guest call from **inside** generated code.
 ///
 /// See [`DynarmicCpu::add_inline_thunk`]. A bare `fn` rather than a boxed closure deliberately: the
@@ -611,6 +698,30 @@ impl InlineThunkCall<'_> {
     pub fn set_x(&mut self, index: u32, value: u64) {
         // SAFETY: as `x`.
         unsafe { od_jit_set_reg(self.jit, index, value) }
+    }
+
+    /// Read `V{index}` as its full 128 bits. An index above 31 reads zero.
+    ///
+    /// Needed as much as [`x`](Self::x): AAPCS64 passes floating-point and vector arguments in
+    /// `V0`-`V7` and returns in `V0`, so a marshal that could only reach the general-purpose
+    /// registers would silently drop every `double` argument. `A64EmitX64::EmitA64SetQ` stores to
+    /// `JitState.vec` with a `movaps` exactly as `EmitA64SetX` stores to `JitState.reg`, so the vector
+    /// file is coherent at a callback for the same reason the integer file is — and
+    /// `an_inline_handler_sees_and_writes_the_guest_vector_file` establishes it rather than trusting
+    /// the symmetry.
+    #[must_use]
+    pub fn v(&self, index: u32) -> u128 {
+        let mut halves = [0u64; 2];
+        // SAFETY: the jit is live and the shim bounds-checks the index and writes both halves.
+        unsafe { od_jit_get_vec(self.jit, index, halves.as_mut_ptr()) };
+        u128::from(halves[0]) | (u128::from(halves[1]) << 64)
+    }
+
+    /// Write `V{index}`. An index above 31 is ignored.
+    pub fn set_v(&mut self, index: u32, value: u128) {
+        let halves = [value as u64, (value >> 64) as u64];
+        // SAFETY: as `v`.
+        unsafe { od_jit_set_vec(self.jit, index, halves.as_ptr()) };
     }
 }
 
@@ -646,6 +757,8 @@ pub(crate) struct CpuCtx {
     pub(crate) inline_thunks: BTreeMap<GuestAddr, InlineThunkFn>,
     /// How many inline thunks have been serviced, so a measurement can prove the path ran.
     pub(crate) inline_calls: u64,
+    /// The host thread's `MXCSR`, captured at the top of every `run`. See [`mxcsr`].
+    pub(crate) host_mxcsr: u32,
     pub(crate) breakpoints: BTreeSet<GuestAddr>,
     /// The sentinel return address planted in `X30`, if one is armed.
     pub(crate) sentinel: Option<GuestAddr>,
@@ -757,6 +870,7 @@ impl DynarmicCpu {
             thunks: BTreeSet::new(),
             inline_thunks: BTreeMap::new(),
             inline_calls: 0,
+            host_mxcsr: mxcsr::read(),
             breakpoints: BTreeSet::new(),
             sentinel: None,
             suppressed_breakpoint: None,
@@ -1155,6 +1269,13 @@ impl GuestCpu for DynarmicCpu {
         // `OD_HALT_SHIM_THREW` never reach that `xchg` — the first never calls `Run`, and the second
         // unwinds out of it — so a bit set before either can survive. Both already declare the jit
         // uncharacterised and not to be reused, which is a stronger statement than a stale halt bit.
+        // The host thread's SSE control word, captured **here** rather than at construction,
+        // because a context is created on whichever thread brings the guest thread up and moved to
+        // the one that runs it, and the two can have different words. Everything an inline thunk
+        // handler runs is host code, and [`mxcsr::Guard`] puts this back for it.
+        let host_mxcsr = mxcsr::read();
+        self.with_ctx(|ctx| ctx.host_mxcsr = host_mxcsr);
+
         let mut budget = Budget::new(limit);
         self.last_run_instructions = 0;
         loop {

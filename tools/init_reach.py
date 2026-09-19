@@ -32,7 +32,9 @@ Four nested answers, because one number would be dishonest:
 
 * **The whole binary.** All 565 imports, the ceiling no reachability argument can exceed.
 
-On `libroblox.so` these come out at **113 / 188 / 246 / 565**.
+On `libroblox.so` these come out at **113 / 188 / 246 / 565**. Of Tier A's 188, **170 are thunks and
+18 are data objects** (`STT_OBJECT`), which is the split task 3 is scoped from — a data import is an
+address with host storage behind it, never a branch target.
 
 What this method cannot see, stated plainly
 -------------------------------------------
@@ -1013,10 +1015,32 @@ def main() -> int:
     for name in sorted(tier_a):
         by_group[groups.get(name, "UNGROUPED")].append(name)
 
+    # The split that decides task 3's scope. A thunk is a *branch target*; a data object is an
+    # address with host storage behind it and must never be branched to, so counting them together
+    # overstates the number of thunks to write. `__stack_chk_guard` is in the data column and D13 says
+    # the very first stack-protected function reads it.
+    kinds = {elf.symbols[i]["name"]: elf.symbols[i]["kind"] for i in imports}
+    KIND = {0: "NOTYPE", 1: "OBJECT", 2: "FUNC"}
+    header = f"  {'providing library':<44} {'total':>6} {'thunks':>7} {'data':>6}"
     print(f"TIER A REACHABLE IMPORTS BY PROVIDING LIBRARY  ({len(tier_a)} symbols)")
+    print(header)
     for group in sorted(by_group, key=lambda g: (-len(by_group[g]), g)):
         names = by_group[group]
-        print(f"  {group:<52} {len(names):>4}")
+        data_objects = sum(1 for n in names if kinds[n] == 1)
+        print(f"  {group:<44} {len(names):>6} {len(names) - data_objects:>7} {data_objects:>6}")
+    all_data = sum(1 for n in tier_a if kinds[n] == 1)
+    print(f"  {'TOTAL':<44} {len(tier_a):>6} {len(tier_a) - all_data:>7} {all_data:>6}")
+    print(
+        f"  by symbol type: "
+        + ", ".join(
+            f"{KIND[k]} {sum(1 for n in tier_a if kinds[n] == k)}" for k in (2, 1, 0)
+        )
+    )
+    print(
+        f"  **Task 3's thunk scope is {len(tier_a) - all_data}, not {len(tier_a)}.** The other "
+        f"{all_data} are `STT_OBJECT` -- data the loader binds to an address with host storage "
+        f"behind it, never a branch target."
+    )
     print()
     print(f"  Tier C adds {len(tier_c - tier_a)} more, for {len(tier_c)}: "
           f"{', '.join(sorted(tier_c - tier_a)) if len(tier_c - tier_a) <= 40 else '(see --list)'}")

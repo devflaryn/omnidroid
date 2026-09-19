@@ -789,6 +789,32 @@ MUTATIONS = [
      """                        Some(PendingExit::Fault { .. }) => Some("a memory fault"),""",
      CPU),
 
+    # ---- the inline thunk boundary (M3 task 1) ---------------------------------------------------
+    ("cpu-A36", "A",
+     "the dispatcher stops installing the host MXCSR under an inline thunk handler", CPU_DYN,
+     """            let switched = guest != host;
+            if switched {
+                write(host);
+            }""",
+     """            let switched = guest != host;""",
+     CPU),
+
+    ("cpu-A37", "A",
+     "the guard installs the host MXCSR but never puts the guest's back", CPU_DYN,
+     """    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.switched {
+                write(self.guest);
+            }
+        }
+    }""",
+     """    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.guest;
+        }
+    }""",
+     CPU),
+
     # There is deliberately no row for dropping the `&& owns_guest_paging` term from the arming
     # condition. Since `DynarmicBackend::new` now *refuses* a platform that has a vectored handler
     # and could not give us one, `owns_guest_paging` is false only where there is no handler

@@ -72,12 +72,16 @@ THE CEILING NO CLOSURE CAN EXCEED
    size of limitation 3 -- vtables and pointer tables are not followed)
 
 TIER A REACHABLE IMPORTS BY PROVIDING LIBRARY  (188 symbols)
-  libc.so                                               156
-  libm.so                                                14
-  libmediandk                                            10
-  libdl.so                                                5
-  libc/bionic (BIONIC-SPECIFIC)                           2
-  liblog                                                  1
+  providing library                             total  thunks   data
+  libc.so                                         156     148      8
+  libm.so                                          14      14      0
+  libmediandk                                      10       0     10
+  libdl.so                                          5       5      0
+  libc/bionic (BIONIC-SPECIFIC)                     2       2      0
+  liblog                                            1       1      0
+  TOTAL                                           188     170     18
+  by symbol type: FUNC 168, OBJECT 18, NOTYPE 2
+  **Task 3's thunk scope is 170, not 188.** The other 18 are `STT_OBJECT` -- data the loader binds to an address with host storage behind it, never a branch target.
 
   Tier C adds 58 more, for 246: (see --list)
 
@@ -86,5 +90,5 @@ provider grouping cross-check: .gnu.version_r attributes 407 of 565 imports; the
   disagreement: erff: .gnu.version_r says libm.so, the appendix says 'libc/bionic'
   disagreement: erfcf: .gnu.version_r says libm.so, the appendix says 'libc/bionic'
 
-written: .superpowers/sdd/android-abi-plan/task-1-reachable-imports.txt
+written: docs/research/init-reachable-imports.txt
 NOTE: Tier A is a LOWER BOUND on reachability. A static call graph over a stripped binary cannot see an indirect call, and the closure contains the BLR/BR counts above. Tier A0 is the same closure with BL edges only, so the A0-to-A gap is how much of the answer rests on tail-call and cold-split edges. Tier C is an over-approximation in the other direction: it follows every materialised function address as if it were called. The true set lies between A and C, and only a run of the initializers settles it (Task 4).

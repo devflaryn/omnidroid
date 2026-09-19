@@ -27,7 +27,7 @@ use dynarmic_sys::{exception, OdCallbacks};
 use omni_mem::{GuestAddr, Protection};
 
 use crate::dynarmic::{
-    stop, with, CpuCtx, InlineThunkCall, PendingExit, BREAKPOINT_BRK, HALT_EXIT, STOP_SVC,
+    mxcsr, stop, with, CpuCtx, InlineThunkCall, PendingExit, BREAKPOINT_BRK, HALT_EXIT, STOP_SVC,
 };
 use crate::exit::AccessKind;
 
@@ -327,8 +327,14 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
             // and not a return to the caller. See `DynarmicCpu::add_inline_thunk`.
             if let Some(handler) = c.inline_thunks.get(&site).copied() {
                 c.inline_calls += 1;
+                // The guest's SSE control word is live here -- generated code is still running and
+                // `EmitA64CallSupervisor` does not switch it -- and everything the handler runs is
+                // host code. See `dynarmic::mxcsr`. The guard is here, once, rather than in each
+                // handler, because a forgotten guard is silent.
+                let guard = mxcsr::Guard::enter(c.host_mxcsr);
                 let mut call = InlineThunkCall::new(c.jit);
                 handler(&mut call);
+                drop(guard);
                 // A `BL` into the thunk region left the return address in `X30`. Writing `PC` is
                 // what the dispatcher reads on its way to the next block.
                 let resume = dynarmic_sys::od_jit_get_reg(c.jit, 30);
