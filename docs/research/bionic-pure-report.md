@@ -10,8 +10,8 @@
 | phase | status |
 |---|---|
 | 0 — scope | done (commit `f228384`) |
-| 1 — foundation | done (this commit) |
-| 2 — memory functions | pending |
+| 1 — foundation | done (commit `ac023fb`) |
+| 2 — memory functions | done (this commit) |
 | 3 — string functions | pending |
 | 4 — ctype + numeric conversion | pending |
 | 5 — libm | pending |
@@ -317,7 +317,36 @@ with reasons, finalised in phase 1:
 
 ## 2. Implementation table
 
-*(filled per phase; final version in §2 of the final report)*
+*(grows per phase; per-phase notes below, consolidated table in §2 of the final report)*
+
+### 2.1 Phase 2 — memory functions (commit of this section)
+
+7 functions: `memcpy`, `memmove`, `memset`, `memcmp`, `memchr`, `__memcpy_chk`, `__memset_chk`.
+31 new tests in `tests/mem_tests.rs`, all passing; suite total 48.
+
+Design points:
+* **All-or-nothing on fault.** Both ranges are validated with `checked_range` before the first
+  byte moves, so a faulting copy never leaves a partial write behind. (The mock itself may move
+  bytes before faulting; the functions never let it happen by validating first.)
+* **Chunked transfers** (256-byte host stack buffers): a guest `memcpy` of 100 MB must not
+  allocate 100 MB on the host.
+* **`memcpy` overlap decision:** overlap is UB in C. This implementation copies forward
+  (byte 0 first), deterministically and host-safe. Pinned by
+  `memcpy_overlapping_forward_bias_documented_semantics` so a change is a conscious one.
+* **`memmove` overlap:** back-to-front when `dst` lies inside `(src, src+n)`, forward otherwise;
+  verified against a snapshot-copy reference for both directions (oracle: a trivially-correct
+  host-side reference, not the function under test).
+* **`memcmp`** returns `-1/0/1`; tests assert sign only (C specifies sign); unsigned-char
+  ordering tested with `0xFF` vs `0x01`.
+* **`_chk` variants** return `CheckFailed("__memcpy_chk")` / `CheckFailed("__memset_chk")` on
+  destination overflow — never a host abort (bionic would abort). `n == dst_size` is allowed
+  (exactly full is legal); `n > dst_size` fails; `memset_chk` with `dst_size == 0` accepts only
+  `n == 0`.
+* Hostile inputs covered per function: null with nonzero length (fault at 0), zero length at any
+  address (success, no access — valid C), unmapped source/destination, range running past a
+  region end (exact fault address asserted), `addr+len` overflowing `u64` (fault, no wraparound —
+  including a range ending at `u64::MAX` which is *representable* and proceeds to a normal
+  unmapped fault at its first unmapped byte), self-copy, exact overlap.
 
 ## 3. ABI decisions (long / wchar_t / long double / errno / layouts)
 
