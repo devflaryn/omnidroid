@@ -545,20 +545,112 @@ Suite: 163 tests (11 printf), clippy clean.
 
 ## 4. Bionic vs host-C divergences found
 
-*(filled per phase)*
+| area | bionic (implemented) | host C (Windows CRT) |
+|---|---|---|
+| `%e` exponent digits | ≥2 (`1e+05`) per C11 7.21.6.1 | 3 (`1e+005`) |
+| `strcmp`/`strncmp`/`memcmp` result | byte difference (`c - d`, documented in bionic's `strcmp.c`) | glibc ±1 / CRT byte difference; C fixes only the sign |
+| `%a` form | minimal nibbles, `0X1.8P+1`-style uppercase prefix for `%A` | CRT pads mantissa/exponent differently |
+| errno numbering | Linux kernel UAPI (EINVAL 22, EILSEQ 84, ...) | differs for many codes |
+| `long double` | 128-bit quad (not in reachable scope) | 64-bit |
+| `%n` | unavailable (Android) | available, returns chars written |
 
 ## 5. Mutation spot-checks
 
-*(filled in phase 7)*
+Each break was applied to one function at a time, the targeted test binary run,
+the function restored, and `git diff` on that file verified empty before the next
+break. Four breaks were initially **not caught**; each exposed a test gap (test
+added; break re-applied and confirmed caught; then restored).
+
+| # | function | what was broken | caught by | caught? |
+|---|---|---|---|---|
+| 1 | `memcpy` | premature chunk-loop exit (drops tail when n > 256) | `memcpy_chunked_copy_survives_large_n` | yes |
+| 2 | `memmove` | always take the forward path (`d > s` overlap lost) | initially **no** — all overlap tests used n ≤ 256, where a single-chunk copy is snapshot-equivalent; added `memmove_backward_overlap_multi_chunk_matches_reference` (n = 600), mutant corrupts bytes | after fix |
+| 3 | `memcmp` | flipped sign of difference | `memcmp_sign_only_equal_less_greater`, `memcmp_unsigned_char_ordering` | yes |
+| 4 | `memset` | filled `0x41` when `c > 0x7F` | `memset_fills_low_byte_and_returns_dst` | yes |
+| 5 | `strlen` | `+ 1` off-by-one length | `strlen_basic_and_empty`, `strlen_chk_ok_and_overflow_named` | yes |
+| 6 | `strcmp` | — | (became a design finding, see below) | n/a |
+| 7 | `strtoul` | dropped the unsigned-negation quirk | `strtoul_negates_in_unsigned_arithmetic` | yes |
+| 8 | `strtol` | negative overflow clamped to LONG_MAX | initially **no** — tests covered only `|LONG_MIN| - 1` (branch of the sign check); added the hugely-negative case (`-999…9`, u64 accumulator overflow) | after fix |
+| 9 | `to_lower` | fold offset +33 instead of +32 | `tolower_folds_only_ascii_uppercase` (unit test) | yes |
+| 10 | `ilogb` | subnormal MSB without the 12-slot offset (re-created the phase-5 bug) | `ilogb_exact_exponents_and_specials` | yes |
+| 11 | `qsort` | `>=` → `<=` in sift-down (min-heap → descending output) | `qsort_sorts_u64_elements`, `qsort_matches_rust_reference_on_larger_input` | yes |
+| 12 | `mbrtowc` | dropped the continuation-byte check in the 2-byte path | initially **no** — invalid-lead/overlong/surrogate tests existed, but no bad-continuation-in-valid-sequence case; added `C3 28` to `mbrtowc_overlong_and_surrogate_rejected` | after fix |
+| 13 | `memcpy_chk` | flipped `n > dst_size` to `n < dst_size` | `memcpy_chk_within_bounds_behaves_like_memcpy` + 2 others | yes |
+| 14 | printf flag parse | `%+` also set the space flag | **equivalent mutant**: `plus` is checked before `space` in the sign chain, so `%+d` output is unchanged; the C rule (space ignored when + present) is already structural. Documented, no test possible. | n/a (equivalent) |
+| 15 | `emit_padded` zero-pad | padding inserted *after* the sign (`split = body.len()`) | `d_i_signed_forms`, `u_o_x_x_unsigned` (`-0042`, `0x…` forms) | yes |
+
+**Design finding from mutation 6:** breaking `strcmp` to return the byte difference
+showed the tests only pinned ±1. Bionic's `strcmp` actually returns `c - d` (glibc
+returns ±1); since the guest is bionic, `strcmp`/`strncmp`/`memcmp` were changed to
+the bionic byte-difference magnitude, with a pinned test (`strcmp_sign_only`:
+`"a" vs "z" == -25`) and updated docs. This is more faithful than the ±1 the C
+standard's sign-only wording permits.
+
+**Uncounted equivalent mutants:** #2's first form (`d >= s` vs `d > s`) and #14 are
+semantically equivalent to the originals — noted rather than counted.
 
 ## 6. What could not be implemented correctly
 
-*(filled per phase; nothing so far)*
+Nothing in the reachable scope. Items deliberately **not** implemented (not
+"implemented incorrectly"):
+
+* all allocating functions (scope: blocked on allocation design — §1.4);
+* all variadic functions (thunk boundary's job; the printf *engine* exists in
+  `printf.rs` over explicit `&[FormatArg]`);
+* `long double` functions (none reachable — §1.3);
+* printf positional `%n$`, thousands grouping, `%ls/%lc` (documented gaps, §2.5).
+
+Every function that could not be fully correct was removed from scope or returns a
+named error — no plausible stubs anywhere. Every `BionicError::Unimplemented(name)`,
+`CheckFailed(name)` and `InvalidArgument(name)` variant carries the function name
+(see `src/error.rs`); `Display` renders it so a log line from a returned error is
+actionable without a backtrace.
 
 ## 7. Final verification results
 
-*(filled in phase 7)*
+All runs on `bionic-pure`, 2026-09-20 (numbers VERIFIED from tool output):
+
+| check | result |
+|---|---|
+| `cargo test -p omni-bionic` | **164 passed, 0 failed, 0 ignored** (11 test binaries) |
+| `cargo clippy -p omni-bionic --all-targets` | clean — zero warnings |
+| `rustup target list --installed` | i686-linux-android, **x86_64-linux-android**, x86_64-pc-windows-{gnu,msvc} |
+| `cargo check -p omni-bionic --target x86_64-linux-android` | **passes** — no Windows-only assumptions in the crate |
+| `cargo build --workspace` | succeeds |
+| `cargo test --workspace --release` | **772 passed, 0 failed, 12 ignored** |
+| baseline comparison | 608 + 164 (omni-bionic) = 772 ✓; ignored 12 = 12 ✓ — no pre-existing test lost or disabled |
+| `git diff android-abi` paths | only `crates/omni-bionic/**`, this report, `Cargo.lock`, plus `tools/os_surface.py` and `docs/research/os-surface-inventory.md` (see note) |
+| `git status` at finish | clean except `Cargo.lock` (the `omni-bionic` package entry) and untracked `.freebuff/` (session metadata, never committed) |
+
+Note on the diff: `tools/os_surface.py` and `docs/research/os-surface-inventory.md` are
+**inputs to this task** that existed uncommitted on `android-abi`; phase 0 committed them
+**byte-unchanged** (verified: `git log --follow` shows exactly one commit, f228384, touching
+each, and no later commit modifies them). The diff against `android-abi` shows them because
+`android-abi` itself never contained them — it is not an edit by this branch. The root
+`Cargo.toml` was **not modified**: the workspace members glob already covered
+`crates/omni-bionic` (VERIFIED: no diff entry for it).
 
 ## 8. Open questions for the reviewer
 
-*(filled in phase 7)*
+1. **`strcmp`/`strncmp`/`memcmp` magnitude.** The C standard fixes only the sign. We
+   return bionic's byte difference (`c - d`), not glibc's ±1. If the eventual thunk
+   adapter truncates results, sign survives either way — but confirm bionic's exact
+   magnitude is what the engine should model.
+2. **`rand` sequence.** Implemented as the classic TYPE_3 LCG (first values match the
+   published 1804289383, 846930886, … sequence). Bionic's exact internal sequence is
+   not documented as stable; if bit-exact bionic `rand` matters for the engine,
+   port bionic's `rand.c` table — the current impl is a documented approximation.
+3. **`memcpy` overlap policy.** C leaves overlapping `memcpy` undefined; we process
+   forward in chunks (like a naive host implementation). If the engine ever sees
+   overlapping `memcpy`, results are deterministic but arbitrary — document or
+   redirect to `memmove` at the adapter if strictness is wanted.
+4. **`strtod` correctness method.** We use Rust `str::parse::<f64>`, which is
+   correctly-rounded Ryu; bionic uses its own correctly-rounded parser. ULP-equal,
+   but rounding ties on exact midpoints were not exhaustively cross-checked against
+   bionic (VERIFIED equal on all tested inputs).
+5. **printf `%a` style.** We emit minimal nibbles (`0x1p+0`). glibc/bionic print the
+   same minimal form for `%a` without `#`; Windows differs. Confirmed against the C
+   standard's wording, not against a running bionic.
+6. **Where `errno` lives.** `GuestContext` stores errno host-side; the adapter must
+   map this to the guest's TLS errno slot. The trait shape was chosen so the adapter
+   can do that in one place.

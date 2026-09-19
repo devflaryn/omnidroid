@@ -163,6 +163,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-bionic"
+version = "0.1.0"
+
+[[package]]
 name = "omni-cli"
 version = "0.1.0"
 
