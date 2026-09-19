@@ -40,10 +40,12 @@ pub mod locale;
 pub mod mem;
 pub mod memory;
 pub mod mock;
+pub mod mock_threads;
 pub mod numerics;
 pub mod printf;
 pub mod sort;
 pub mod string;
+pub mod threads;
 pub mod wide;
 
 pub use context::GuestContext;
