@@ -140,11 +140,13 @@ name = "omni-android"
 version = "0.1.0"
 dependencies = [
  "omni-apk",
+ "omni-bionic",
  "omni-cpu",
  "omni-elf",
  "omni-mem",
  "omni-platform",
  "parking_lot",
+ "parking_lot_core",
  "thiserror",
 ]
 

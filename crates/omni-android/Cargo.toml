@@ -28,10 +28,19 @@ omni-mem = { workspace = true }
 omni-cpu = { path = "../omni-cpu", default-features = false }
 # The loader's `SymbolProvider`, which is how imports get bound to thunk addresses at load time.
 omni-elf = { workspace = true }
+# The bionic libc/libm implementations themselves (D19). The dependency direction is
+# `omni-android` -> `omni-bionic`, which is downward, and `omni-bionic` depends on nothing at
+# all -- so nothing here can reach the OS through it.
+omni-bionic = { workspace = true }
 thiserror = { workspace = true }
 # The thunk table is built while the loader resolves symbols, from `&self`, and dispatched from
 # guest threads afterwards.
 parking_lot = { workspace = true }
+# `omni-bionic`'s `Futex` trait wants "block on a guest address until woken", which is a parking
+# lot keyed by that address. Writing a second one out of a HashMap of Condvars would be
+# re-deriving the registration/sleep window, and the one defect already found in the sync layer
+# was a lost wake.
+parking_lot_core = { workspace = true }
 
 [dev-dependencies]
 # The translating backend, **for test targets only**. The boundary's assertions are about real

@@ -270,6 +270,41 @@ pub enum AbiError {
         pc: GuestAddr,
     },
 
+    /// The compatibility layer implements the symbol, and refuses **this** call.
+    ///
+    /// The difference from [`Unbound`](AbiError::Unbound) is the whole point: `Unbound` means
+    /// nothing implements the symbol, and this means something does but will not guess at the
+    /// case in front of it — a `%Lf` whose 128-bit quad has no correct 8-byte read, a FORTIFY
+    /// `_chk` whose destination is too small, a `sscanf` whose scanning engine does not exist.
+    /// Every one of those has a believable wrong answer available (0, -1, the truncated value)
+    /// and Global Constraint 1 forbids all of them.
+    #[error("`{symbol}` at {address:#x} refused this call: {why}")]
+    Refused {
+        /// The symbol.
+        symbol: String,
+        /// Its thunk address.
+        address: GuestAddr,
+        /// What it would have had to guess at.
+        why: String,
+    },
+
+    /// A bionic handler ran on a thread with no compatibility-layer state installed.
+    ///
+    /// A **host** mistake rather than a guest one: `Bionic::activate` was not held across
+    /// `Boundary::run`, so the handler has no errno slot, no thread identity and no futex. It
+    /// is an error rather than a default-constructed state because a per-call default would
+    /// give every guest thread its own private mutex table, and two guest threads that each
+    /// believe they hold the same mutex is precisely the failure no later test can see.
+    #[error(
+        "`{symbol}` at {address:#x} was serviced on a thread with no bionic state:          `Bionic::activate` must be held across `Boundary::run`"
+    )]
+    BionicNotActive {
+        /// The symbol being serviced.
+        symbol: String,
+        /// Its thunk address.
+        address: GuestAddr,
+    },
+
     /// The thunk region could not be reserved or has run out of slots.
     #[error("the thunk region cannot hold another {what}: {detail}")]
     RegionFull {
@@ -303,7 +338,9 @@ impl AbiError {
             | AbiError::VarArgsExhausted { symbol, .. }
             | AbiError::TooDeep { symbol, .. }
             | AbiError::GuestCallbackStopped { symbol, .. }
-            | AbiError::BadCallbackStack { symbol, .. } => Some(symbol),
+            | AbiError::BadCallbackStack { symbol, .. }
+            | AbiError::Refused { symbol, .. }
+            | AbiError::BionicNotActive { symbol, .. } => Some(symbol),
             AbiError::NoSuchThunk { .. }
             | AbiError::CrossingLimit { .. }
             | AbiError::RegionFull { .. }
@@ -327,7 +364,9 @@ impl AbiError {
             | AbiError::UnsupportedShape { address, .. }
             | AbiError::BadVaList { address, .. }
             | AbiError::VarArgsExhausted { address, .. }
-            | AbiError::TooDeep { address, .. } => Some(address),
+            | AbiError::TooDeep { address, .. }
+            | AbiError::Refused { address, .. }
+            | AbiError::BionicNotActive { address, .. } => Some(address),
             // The address the *guest* branched to, not the slot it landed in: the whole point of the
             // variant is that those differ.
             AbiError::MidThunk { address, .. } | AbiError::NoSuchThunk { address, .. } => {

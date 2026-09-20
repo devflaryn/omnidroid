@@ -19,6 +19,10 @@ omni-apk = { path = "crates/omni-apk" }
 omni-elf = { path = "crates/omni-elf" }
 omni-cpu = { path = "crates/omni-cpu" }
 omni-android = { path = "crates/omni-android" }
+# The pure bionic libc/libm subset. Zero dependencies, and D19 records that as load-bearing:
+# `cargo tree -p omni-bionic -e normal` being one line is what makes "no OS access" checkable
+# rather than a rule a reviewer has to remember.
+omni-bionic = { path = "crates/omni-bionic" }
 omni-gfx = { path = "crates/omni-gfx" }
 omni-core = { path = "crates/omni-core" }
 # The dynarmic FFI (preflight ruling P1). Only `omni-cpu` depends on it, and only on an x86-64
@@ -30,6 +34,9 @@ dynarmic-sys = { path = "crates/dynarmic-sys" }
 thiserror = "2.0.20"
 bitflags = "2.13.2"
 parking_lot = "0.12.5"
+# The parking lot itself: a wait queue keyed by an integer, which is what a futex is. The bionic
+# adapter keys it by GUEST address (D4 identity mapping) to back `omni-bionic`'s `Futex` trait.
+parking_lot_core = "0.9.12"
 tracing = "0.1.44"
 rustc-hash = "2.1.3"
 

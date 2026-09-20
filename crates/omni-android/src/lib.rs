@@ -47,12 +47,14 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod abi;
+pub mod bionic;
 pub mod boundary;
 pub mod error;
 pub mod mem;
 pub mod region;
 pub mod varargs;
 
+pub use bionic::{Activation, Bionic};
 pub use abi::{ArgRegs, ArgSource, Args, Ret, RetSink, ARG_REGISTERS};
 pub use boundary::{
     Binding, Boundary, BoundaryBuilder, Crossings, GuestArg, GuestReturn, ImportCall, ImportFn,
