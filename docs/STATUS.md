@@ -95,7 +95,11 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
 | `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Done, reviewed.** Milestone **M2**. 489 passing test cases and 8 ignored across the workspace; mutation tables 87/87, 45/45 and 23/23 |
 | `omni-elf` — `.eh_frame_hdr` function map + leaf classifier | **Done, reviewed.** 245,117 exact function bounds recovered and graded; the tool M2 chose its code with |
-| `omni-android`, `omni-gfx`, `omni-core`, `omni-cli` | Not started |
+| `omni-android` — the thunk boundary | **Done, reviewed.** M3 task 2. Region, AAPCS64 marshalling both ways, the variadic rules and a guest `va_list` walk, host → guest re-entry. **No symbol is implemented**: all 565 slots are `Unbound` and name themselves when called. Review found three defects, all fixed |
+| `omni-bionic` — the pure libc/libm subset | **Done, reviewed.** Strings, wide/multibyte, ctype, locale, numeric conversion, `printf` formatting, libm. Verified by mutation (11 rows, 11/11) after review found its errno constants had no test at all |
+| `omni-bionic` — pthread / sync / TLS | **Done for its scope, reviewed.** 42 of the 51 reachable thread symbols; 1 excluded; 8 need host → guest re-entry or the OS and belong to the adapter (D19). Review found a `sem_post` lost wakeup — **1.0104 s** measured — and three timing flakes |
+| `omni-android` — the adapter, and all 3,594 initializers | **Not started.** M3 tasks 3 and 4 |
+| `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
 **Measured, not assumed**
 

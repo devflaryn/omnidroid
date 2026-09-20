@@ -1413,3 +1413,44 @@ sets: 23 of the 565 across the library, 18 of the 188 the initializers reach.** 
 `crates/omni-android/tests/libroblox.rs` declares exactly D17's eighteen and asserts that the five
 `STT_OBJECT` imports left unresolved are the difference. Every unresolved import is `STT_OBJECT`; no
 function is left bound to null.
+
+---
+
+## D19 — `omni-bionic` stays a separate crate, because "no OS access" should be checkable
+
+**Decision.** The bionic libc/libm implementation stays in its own crate, `omni-bionic`, rather than
+folding into `omni-android`. `omni-android` depends on it. ARCHITECTURE §2 is amended to list it.
+
+**Why this was open.** The crate was created only to isolate 12,543 lines of unreviewed work during
+review, and §2 assigns "bionic libc/libm" to `omni-android`. With the review finished, the reason to
+keep it separate had expired and the question was whether to fold it back.
+
+**The argument that decided it, and it is structural rather than aesthetic.** `omni-bionic` has
+**zero dependencies** — verified, `cargo tree -p omni-bionic -e normal` is one line. It is the only
+crate in the workspace of which that is true. Its own design rules claim "No OS access. The crate has
+zero dependencies, no `cfg(target_os)`, and compiles unchanged on every host", and today that claim
+is not a convention anyone has to remember: the crate **cannot** reach an OS primitive, because it has
+nothing to call.
+
+`omni-android` pulls `omni-cpu` → `omni-mem` → `omni-platform`, and `omni-platform` is where
+`windows-sys` lives. Folding bionic in would put 12,543 lines of pure computation inside a crate that
+transitively links the OS bindings, and the portability guarantee would downgrade from *impossible*
+to *against the rules*. Given the five-target requirement, and that this project has twice come close
+to foreclosing the ARM64 hosts by accident (D18 records four such places, two of which had already
+happened), a guarantee that `cargo tree` can check beats one a reviewer has to notice.
+
+**An argument that was considered and is WRONG, recorded so it is not made again.** "Folding it in
+would couple the libc tests to the C++ translator build." It would not: `cargo tree -p omni-android
+-e normal` contains **no `dynarmic-sys`**, which is the `--no-default-features` property HANDOFF
+already records as verified. `omni-android` is dynarmic-free. The build-time argument does not exist;
+the dependency-surface argument above is the whole case.
+
+**Cost if wrong.** Low and reversible. One extra crate in the workspace and one more line in the
+dependency graph. If a later task needs bionic and the thunk boundary to share a private type, the
+fold is a mechanical move — the dependency direction is already `omni-android` → `omni-bionic`, which
+is downward, so nothing about D-record's "strictly downward" rule has to change to undo this.
+
+**What this does not decide.** Where the *adapter* lives. The adapter binds bionic's functions to the
+thunk boundary and needs both, so it belongs in `omni-android` — that is where the boundary is, and it
+is the crate §2 already names for the compatibility layer.
+

@@ -57,13 +57,16 @@ backends implement them, and nothing in the core knows which backend it has.
 | `omni-apk` | APK reading, zip parsing, and the content-addressed 4 KB-aligned extraction cache | no |
 | `omni-elf` | Bionic-compatible ELF loader: program headers, APS2 packed relocations, symbol resolution, `init_array`, RELRO, `dl_iterate_phdr` state | no |
 | `omni-cpu` | `GuestCpu` trait plus backends: native execution on ARM64 hosts, binary translation on x86-64 hosts | backend-specific |
-| `omni-android` | The compatibility layer: bionic libc/libm, `libdl`, `liblog`, JNI without a JVM, GameActivity, `ALooper`, `AAssetManager`, `ANativeWindow` | no |
+| `omni-bionic` | Bionic libc/libm as pure computation over a guest-memory trait: strings, wide/multibyte, ctype, locale, numeric conversion, `printf` formatting, libm, and the pthread/sync/TLS layer. **Zero dependencies** — see D19 | no |
+| `omni-android` | The compatibility layer: the thunk boundary, the adapter binding `omni-bionic` to it, `libdl`, `liblog`, JNI without a JVM, GameActivity, `ALooper`, `AAssetManager`, `ANativeWindow` | no |
 | `omni-gfx` | Renderer abstraction and the guest-facing `libvulkan.so`/EGL/GLES surfaces; Vulkan backend now, D3D12/Metal later | backend-specific |
 | `omni-core` | Instance lifecycle, orchestration, configuration, diagnostics; owns the traits | no |
 | `omni-cli` | Command-line host, the first deliverable. Execution before UI. | no |
 
 **Portability rule.** Anything that is not `omni-platform` or a named backend must compile for all
-five targets without `cfg`. Linux and macOS support is *structural* until it is actually tested on
+five targets without `cfg`. `omni-bionic` makes its half of that rule *structural* rather than
+conventional: with no dependencies at all it cannot reach an OS primitive, which is the argument D19
+turns on. Linux and macOS support is *structural* until it is actually tested on
 those systems; nothing will be described as working there before then.
 
 ---
