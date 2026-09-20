@@ -2216,7 +2216,7 @@ fn code_at_a_reused_address_is_retranslated_rather_than_run_from_the_cache() {
             at as usize,
             &[movz(0, answer, 0).to_le_bytes(), ret(30).to_le_bytes()].concat(),
         );
-        let protect = call_one(&f, "mprotect", |asm| {
+        let protect = call_one(f, "mprotect", |asm| {
             asm.mov(0, at);
             asm.mov(1, length);
             asm.mov(2, 5); // PROT_READ | PROT_EXEC
@@ -2227,7 +2227,7 @@ fn code_at_a_reused_address_is_retranslated_rather_than_run_from_the_cache() {
 
         // A fresh caller each time, so what is under test is the cached translation of the callee
         // at `at` rather than of the caller.
-        let caller = program(&f, |asm| {
+        let caller = program(f, |asm| {
             asm.mov(9, at);
             asm.mov(10, out as u64);
             asm.push(blr(9));
