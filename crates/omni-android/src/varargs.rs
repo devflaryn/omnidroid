@@ -54,7 +54,7 @@
 use crate::abi::{ArgSource, ARG_REGISTERS};
 use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
-use omni_mem::GuestAddr;
+use omni_mem::{GuestAddr, Refusal};
 
 /// Bytes an integer occupies in a register save area, and in the overflow area.
 pub const GR_SLOT: usize = 8;
@@ -150,9 +150,9 @@ impl<'a> VarArgs<'a> {
             self.ngrn += 1;
             value
         } else {
-            let at = align_up(self.overflow, GR_SLOT);
+            let at = self.aligned_overflow(GR_SLOT)?;
             let value = self.mem.read_u64(at, self.blame())?;
-            self.overflow = at + GR_SLOT;
+            self.overflow = self.advance_overflow(at, GR_SLOT)?;
             value
         };
         self.index += 1;
@@ -197,13 +197,41 @@ impl<'a> VarArgs<'a> {
             self.nsrn += 1;
             value
         } else {
-            let at = align_up(self.overflow, GR_SLOT);
+            let at = self.aligned_overflow(GR_SLOT)?;
             let value = self.mem.read_u64(at, self.blame())?;
-            self.overflow = at + GR_SLOT;
+            self.overflow = self.advance_overflow(at, GR_SLOT)?;
             value
         };
         self.index += 1;
         Ok(f64::from_bits(bits))
+    }
+
+    /// `self.overflow` rounded up to `align`, refusing a round-up that leaves the address space.
+    ///
+    /// The overflow area starts from the guest's `SP`, so this is arithmetic on a guest-chosen
+    /// value. See [`GuestVaList::aligned_stack`] for why a wrap is the worse of the two outcomes.
+    fn aligned_overflow(&self, align: usize) -> AbiResult<GuestAddr> {
+        self.overflow
+            .checked_add(align - 1)
+            .map(|sum| sum & !(align - 1))
+            .ok_or_else(|| self.overflow_out_of_space(self.overflow, align))
+    }
+
+    /// `at + step`, refusing a sum that leaves the address space.
+    fn advance_overflow(&self, at: GuestAddr, step: usize) -> AbiResult<GuestAddr> {
+        at.checked_add(step).ok_or_else(|| self.overflow_out_of_space(at, step))
+    }
+
+    fn overflow_out_of_space(&self, pointer: GuestAddr, len: usize) -> AbiError {
+        AbiError::BadPointer {
+            symbol: self.blame.symbol.to_string(),
+            address: self.blame.address,
+            argument: self.index,
+            pointer,
+            len,
+            access: "reading",
+            refusal: Refusal::NotMapped.into(),
+        }
     }
 }
 
@@ -322,14 +350,14 @@ impl<'a> GuestVaList<'a> {
             // `__gr_top + __gr_offs` with `__gr_offs` negative. Done in signed arithmetic and then
             // range-checked back into a `usize`, so a `__gr_top` small enough that the sum is
             // negative is a refusal rather than a wrap into the top of the address space.
-            let at = self.offset_from(self.gr_top, self.gr_offs)?;
+            let at = self.offset_from(self.gr_top, self.gr_offs, SaveBank::General)?;
             let value = self.mem.read_u64(at, self.blame())?;
             self.gr_offs += GR_SLOT as i64;
             value
         } else {
-            let at = align_up(self.stack, GR_SLOT);
+            let at = self.aligned_stack(GR_SLOT)?;
             let value = self.mem.read_u64(at, self.blame())?;
-            self.stack = at + GR_SLOT;
+            self.stack = self.advance_stack(at, GR_SLOT)?;
             value
         };
         self.index += 1;
@@ -364,15 +392,15 @@ impl<'a> GuestVaList<'a> {
     /// As [`next_u64`](GuestVaList::next_u64).
     pub fn next_f64(&mut self) -> AbiResult<f64> {
         let bits = if self.vr_offs < 0 {
-            let at = self.offset_from(self.vr_top, self.vr_offs)?;
+            let at = self.offset_from(self.vr_top, self.vr_offs, SaveBank::Simd)?;
             // The low 8 bytes of the 16-byte slot: little-endian, so the `double` is at the bottom.
             let value = self.mem.read_u64(at, self.blame())?;
             self.vr_offs += VR_SLOT as i64;
             value
         } else {
-            let at = align_up(self.stack, GR_SLOT);
+            let at = self.aligned_stack(GR_SLOT)?;
             let value = self.mem.read_u64(at, self.blame())?;
-            self.stack = at + GR_SLOT;
+            self.stack = self.advance_stack(at, GR_SLOT)?;
             value
         };
         self.index += 1;
@@ -380,7 +408,14 @@ impl<'a> GuestVaList<'a> {
     }
 
     /// `top + offs` with `offs` negative, refusing a sum that leaves the address space.
-    fn offset_from(&self, top: GuestAddr, offs: i64) -> AbiResult<GuestAddr> {
+    ///
+    /// `bank` names the field for the error message and carries its own lower bound. It is passed in
+    /// rather than derived: the previous form asked `core::ptr::eq(&self.gr_top, &top)`, and because
+    /// `top` arrives **by value** that compares the address of a stack local against a field of
+    /// `self` and is therefore always false. Every `__gr_top` refusal was reported as `__vr_top`,
+    /// with the VR bounds — and the only test on this path asserts just
+    /// `matches!(error, AbiError::BadVaList { .. })`, so it could not fail on it.
+    fn offset_from(&self, top: GuestAddr, offs: i64, bank: SaveBank) -> AbiResult<GuestAddr> {
         let sum = i128::from(top as u64) + i128::from(offs);
         u64::try_from(sum)
             .ok()
@@ -389,11 +424,72 @@ impl<'a> GuestVaList<'a> {
                 symbol: self.blame.symbol.to_string(),
                 address: self.blame.address,
                 pointer: self.at,
-                field: if core::ptr::eq(&self.gr_top, &top) { "__gr_top" } else { "__vr_top" },
+                field: bank.field(),
                 value: offs,
-                low: -(VR_SAVE_BYTES as i64),
+                low: -(bank.save_bytes() as i64),
                 high: 0,
             })
+    }
+
+    /// `self.stack` rounded up to `align`, refusing a round-up that leaves the address space.
+    ///
+    /// `__stack` is read verbatim out of guest memory and gets no range check — only the two `int`
+    /// offsets do — so this arithmetic is on a value the guest chose. `(x + align - 1)` on
+    /// `GuestAddr::MAX` is an overflow: a panic in a build with overflow checks on, and a wrap to a
+    /// small address in one without. Both are wrong; a typed refusal is the answer.
+    fn aligned_stack(&self, align: usize) -> AbiResult<GuestAddr> {
+        self.stack
+            .checked_add(align - 1)
+            .map(|sum| sum & !(align - 1))
+            .ok_or_else(|| self.stack_out_of_space(self.stack, align))
+    }
+
+    /// `at + step`, refusing a sum that leaves the address space.
+    fn advance_stack(&self, at: GuestAddr, step: usize) -> AbiResult<GuestAddr> {
+        at.checked_add(step).ok_or_else(|| self.stack_out_of_space(at, step))
+    }
+
+    fn stack_out_of_space(&self, pointer: GuestAddr, len: usize) -> AbiError {
+        AbiError::BadPointer {
+            symbol: self.blame.symbol.to_string(),
+            address: self.blame.address,
+            argument: self.index,
+            pointer,
+            len,
+            access: "reading",
+            refusal: Refusal::NotMapped.into(),
+        }
+    }
+}
+
+/// Which register save area an offset belongs to.
+///
+/// Exists so the field name and its lower bound travel together: they are two halves of one fact and
+/// were previously computed independently, which is how the name came to be wrong while the bound
+/// stayed right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveBank {
+    /// `X0`-`X7`, stepped by [`GR_SLOT`].
+    General,
+    /// `Q0`-`Q7`, stepped by [`VR_SLOT`].
+    Simd,
+}
+
+impl SaveBank {
+    /// The `va_list` field this bank's top pointer lives in.
+    fn field(self) -> &'static str {
+        match self {
+            SaveBank::General => "__gr_top",
+            SaveBank::Simd => "__vr_top",
+        }
+    }
+
+    /// How far below the top this bank's offsets may legally reach.
+    fn save_bytes(self) -> usize {
+        match self {
+            SaveBank::General => GR_SAVE_BYTES,
+            SaveBank::Simd => VR_SAVE_BYTES,
+        }
     }
 }
 
@@ -411,9 +507,6 @@ impl core::fmt::Debug for GuestVaList<'_> {
     }
 }
 
-fn align_up(address: GuestAddr, align: usize) -> GuestAddr {
-    (address + align - 1) & !(align - 1)
-}
 
 #[cfg(test)]
 mod tests {
@@ -734,6 +827,83 @@ mod tests {
         let mut va = GuestVaList::read(&f.mem, va_at, blame()).expect("offsets fine");
         let error = va.next_u64().expect_err("8 - 64 must not become 0xFFFF_FFFF_FFFF_FFC8");
         assert!(matches!(error, AbiError::BadVaList { .. }), "{error:?}");
+    }
+
+    /// A `__stack` at the very top of the address space must be refused, not aligned into a wrap.
+    ///
+    /// `__stack` is read verbatim out of guest memory and, unlike the two `int` offsets, gets no
+    /// range check — so `align_up(__stack, 8)` was arithmetic on a guest-chosen value.
+    /// `usize::MAX + 7` panics where overflow checks are on and wraps to `6` where they are not, and
+    /// the wrap is the worse half: it turns a variadic argument read into a read near address zero.
+    #[test]
+    fn a_stack_pointer_at_the_top_of_the_address_space_is_refused_rather_than_overflowing() {
+        let f = fixture();
+        let va_at = f.scratch;
+        // named_gr/named_vr = 8: every argument register is spent, so the walk must use `__stack`.
+        write_va_list(&f, va_at, f.scratch + 64, f.scratch + 256, f.scratch + 1024, 8, 8);
+        f.mem.write_u64(va_at + field::STACK, u64::MAX, blame()).expect("__stack = MAX");
+        let mut va = GuestVaList::read(&f.mem, va_at, blame()).expect("the offsets are still fine");
+        let error = va.next_u64().expect_err("aligning MAX up to 8 must be refused");
+        assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    }
+
+    /// The same, on the floating-point taker, which reaches `__stack` by its own route.
+    #[test]
+    fn a_stack_pointer_at_the_top_of_the_address_space_is_refused_for_doubles_too() {
+        let f = fixture();
+        let va_at = f.scratch;
+        write_va_list(&f, va_at, f.scratch + 64, f.scratch + 256, f.scratch + 1024, 8, 8);
+        f.mem.write_u64(va_at + field::STACK, u64::MAX, blame()).expect("__stack = MAX");
+        let mut va = GuestVaList::read(&f.mem, va_at, blame()).expect("the offsets are still fine");
+        let error = va.next_f64().expect_err("aligning MAX up to 8 must be refused");
+        assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    }
+
+    /// An underflowing `__gr_top` must NAME `__gr_top` and carry the GENERAL bank's bound.
+    ///
+    /// The refusal used to select its field name with `core::ptr::eq(&self.gr_top, &top)`, and
+    /// because `top` arrives by value that compares a stack local's address against a field of
+    /// `self` — always false. Every general-bank refusal was reported as `__vr_top`, with the VR
+    /// bounds. The existing underflow test asserts only `matches!(error, BadVaList { .. })`, so it
+    /// could not fail on it; this one inspects the field.
+    #[test]
+    fn an_underflowing_gr_top_names_the_general_bank_and_not_the_simd_one() {
+        let f = fixture();
+        let va_at = f.scratch;
+        write_va_list(&f, va_at, f.scratch + 64, f.scratch + 256, f.scratch + 1024, 0, 0);
+        f.mem.write_u64(va_at + field::GR_TOP, 8, blame()).expect("__gr_top = 8");
+        let mut va = GuestVaList::read(&f.mem, va_at, blame()).expect("offsets fine");
+        let error = va.next_u64().expect_err("8 - 64 underflows");
+        match error {
+            AbiError::BadVaList { field, low, .. } => {
+                assert_eq!(field, "__gr_top", "the general bank must name itself");
+                assert_eq!(
+                    low,
+                    -(GR_SAVE_BYTES as i64),
+                    "and must carry the general bank's bound, not the SIMD one",
+                );
+            }
+            other => panic!("expected BadVaList, got {other:?}"),
+        }
+    }
+
+    /// And the SIMD bank still names itself — so the fix did not simply swap one wrong answer for
+    /// another.
+    #[test]
+    fn an_underflowing_vr_top_names_the_simd_bank() {
+        let f = fixture();
+        let va_at = f.scratch;
+        write_va_list(&f, va_at, f.scratch + 64, f.scratch + 256, f.scratch + 1024, 0, 0);
+        f.mem.write_u64(va_at + field::VR_TOP, 8, blame()).expect("__vr_top = 8");
+        let mut va = GuestVaList::read(&f.mem, va_at, blame()).expect("offsets fine");
+        let error = va.next_f64().expect_err("8 - 128 underflows");
+        match error {
+            AbiError::BadVaList { field, low, .. } => {
+                assert_eq!(field, "__vr_top");
+                assert_eq!(low, -(VR_SAVE_BYTES as i64));
+            }
+            other => panic!("expected BadVaList, got {other:?}"),
+        }
     }
 
     #[test]

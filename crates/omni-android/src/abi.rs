@@ -60,7 +60,7 @@
 //! that only knew about `X0`-`X7` would have no way to reach it, so [`Args::indirect_result`] exists.
 
 use omni_cpu::ThunkCall;
-use omni_mem::GuestAddr;
+use omni_mem::{GuestAddr, Refusal};
 
 use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
@@ -221,9 +221,9 @@ impl<'a> Args<'a> {
         } else {
             // Rule C.13/C.14: 8-byte alignment, one 8-byte slot, and **the bank stays spent** — the
             // `ngrn = 8` above is never walked back, because AAPCS64 does not back-fill.
-            let at = self.align_nsaa(8);
+            let at = self.align_nsaa(8)?;
             let value = self.mem.read_u64(at, self.blame())?;
-            self.nsaa = at + 8;
+            self.nsaa = self.advance_nsaa(at, 8)?;
             value
         };
         self.taken += 1;
@@ -288,11 +288,11 @@ impl<'a> Args<'a> {
             self.nsrn += 1;
             value
         } else {
-            let at = self.align_nsaa(size.max(8));
+            let at = self.align_nsaa(size.max(8))?;
             let bytes = self.mem.read_bytes(at, size, self.blame())?;
             let mut buf = [0u8; 16];
             buf[..size].copy_from_slice(&bytes);
-            self.nsaa = at + size.max(8);
+            self.nsaa = self.advance_nsaa(at, size.max(8))?;
             u128::from_le_bytes(buf)
         };
         self.taken += 1;
@@ -324,10 +324,36 @@ impl<'a> Args<'a> {
         })
     }
 
-    fn align_nsaa(&self, align: usize) -> usize {
-        // Rule C.12: round the NSAA up to the argument's alignment, minimum 8.
+    /// Rule C.12: round the NSAA up to the argument's alignment, minimum 8.
+    ///
+    /// The NSAA starts at the guest's `SP`, which is a value the guest chose, so this arithmetic is
+    /// on untrusted input. `(x + align - 1)` near `usize::MAX` overflows: a panic where overflow
+    /// checks are on, a wrap to a small address where they are not. A wrap is the worse half — it
+    /// turns a stack argument read into a read of whatever is mapped near zero — so both are refused
+    /// here with a typed error instead.
+    fn align_nsaa(&self, align: usize) -> AbiResult<usize> {
         let align = align.max(8);
-        (self.nsaa + align - 1) & !(align - 1)
+        self.nsaa
+            .checked_add(align - 1)
+            .map(|sum| sum & !(align - 1))
+            .ok_or_else(|| self.nsaa_out_of_space(self.nsaa, align))
+    }
+
+    /// `at + step` for the NSAA, refusing a sum that leaves the address space.
+    fn advance_nsaa(&self, at: usize, step: usize) -> AbiResult<usize> {
+        at.checked_add(step).ok_or_else(|| self.nsaa_out_of_space(at, step))
+    }
+
+    fn nsaa_out_of_space(&self, pointer: usize, len: usize) -> AbiError {
+        AbiError::BadPointer {
+            symbol: self.blame.symbol.to_string(),
+            address: self.blame.address,
+            argument: self.taken,
+            pointer,
+            len,
+            access: "reading",
+            refusal: Refusal::NotMapped.into(),
+        }
     }
 }
 
