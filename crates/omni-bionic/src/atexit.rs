@@ -20,7 +20,6 @@
 //! This crate produces the ORDERED list; invoking a guest function pointer is
 //! the adapter's job.
 
-use std::collections::HashMap;
 use std::sync::Mutex as HostMutex;
 
 /// One registered handler.
