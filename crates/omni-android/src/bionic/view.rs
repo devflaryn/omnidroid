@@ -44,6 +44,41 @@ use super::Active;
 /// truncated `strerror` is a plausible wrong answer.
 pub const SCRATCH_BYTES: usize = 256;
 
+/// Bytes of one guest `struct dl_phdr_info`.
+///
+/// **LP64 bionic's layout, field by field**, because getting it wrong hands the in-guest unwinder
+/// a `dlpi_phdr` read out of the middle of `dlpi_name`:
+///
+/// | offset | bytes | field |
+/// |---|---|---|
+/// | 0 | 8 | `ElfW(Addr) dlpi_addr` |
+/// | 8 | 8 | `const char *dlpi_name` |
+/// | 16 | 8 | `const ElfW(Phdr) *dlpi_phdr` |
+/// | 24 | 2 | `ElfW(Half) dlpi_phnum` |
+/// | 26 | 6 | padding to the next 8-byte field |
+/// | 32 | 8 | `unsigned long long dlpi_adds` |
+/// | 40 | 8 | `unsigned long long dlpi_subs` |
+/// | 48 | 8 | `size_t dlpi_tls_modid` |
+/// | 56 | 8 | `void *dlpi_tls_data` |
+///
+/// **Derived from bionic's `link.h`, not verified against an NDK** — there is none on this
+/// machine, which is the same gap `omni-bionic`'s `layouts.rs` records for `pthread_mutex_t`. Two
+/// things make the derivation safe rather than merely plausible. The last four fields were added
+/// in Android R and nothing has been added since, so 64 is the *largest* this structure has ever
+/// been: a guest built against an older header reads a prefix of what is written here and never
+/// reads past its own end. And `dl_iterate_phdr` passes this number to the callback as its `size`
+/// argument, so a callback that checks before reading is told exactly how much is there.
+pub const DL_PHDR_INFO_BYTES: usize = 64;
+
+/// How many `dl_phdr_info` records one thread block holds.
+///
+/// One per level of boundary nesting, because the record is live *while the guest callback runs*
+/// and that callback may call `dl_iterate_phdr` again. A single per-thread record would then be
+/// overwritten underneath the outer iteration, which is a wrong answer rather than a crash — the
+/// failure shape Global Constraint 1 is about. [`MAX_GUEST_DEPTH`](crate::MAX_GUEST_DEPTH) is the
+/// cap on that nesting, and the `+ 1` is for depth zero.
+pub const DL_INFO_SLOTS: usize = crate::boundary::MAX_GUEST_DEPTH + 1;
+
 /// One guest thread's private block in the adapter's arena.
 ///
 /// | offset | bytes | what |
@@ -51,12 +86,16 @@ pub const SCRATCH_BYTES: usize = 256;
 /// | 0 | 4 | `errno`, an `int` |
 /// | 4 | 12 | padding, so the scratch starts 16-byte aligned |
 /// | 16 | [`SCRATCH_BYTES`] | scratch for a returned string |
-pub const THREAD_BLOCK_BYTES: usize = 16 + SCRATCH_BYTES;
+/// | 16 + [`SCRATCH_BYTES`] | [`DL_INFO_SLOTS`] × [`DL_PHDR_INFO_BYTES`] | one `dl_phdr_info` per nesting level |
+pub const THREAD_BLOCK_BYTES: usize =
+    16 + SCRATCH_BYTES + DL_INFO_SLOTS * DL_PHDR_INFO_BYTES;
 
 /// Offset of `errno` inside a thread block.
 pub const ERRNO_OFFSET: usize = 0;
 /// Offset of the scratch buffer inside a thread block.
 pub const SCRATCH_OFFSET: usize = 16;
+/// Offset of the first `dl_phdr_info` record inside a thread block.
+pub const DL_INFO_OFFSET: usize = 16 + SCRATCH_BYTES;
 
 /// Guest memory and guest process state, as one bionic call sees them.
 pub struct GuestView<'a> {
@@ -174,6 +213,24 @@ impl<'a> GuestView<'a> {
     #[must_use]
     pub fn scratch_address(&self) -> GuestAddr {
         self.active.block + SCRATCH_OFFSET
+    }
+
+    /// This thread's `dl_phdr_info` record for boundary nesting level `depth`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] for a depth past [`DL_INFO_SLOTS`], which
+    /// [`MAX_GUEST_DEPTH`](crate::MAX_GUEST_DEPTH) already makes unreachable — checked rather than
+    /// asserted because an index computed from a depth is exactly the kind of arithmetic that
+    /// stops being true when the cap moves.
+    pub fn dl_info_address(&self, depth: usize) -> AbiResult<GuestAddr> {
+        if depth >= DL_INFO_SLOTS {
+            return Err(self.refusal(format!(
+                "boundary nesting level {depth} has no dl_phdr_info record: the arena holds \
+                 {DL_INFO_SLOTS} per thread"
+            )));
+        }
+        Ok(self.active.block + DL_INFO_OFFSET + depth * DL_PHDR_INFO_BYTES)
     }
 
     /// Copy `bytes` plus a NUL into this thread's scratch, returning its guest address.

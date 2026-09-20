@@ -147,7 +147,47 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 86, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 96, "bound symbols: {symbols:?}");
+    // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 adds ten: the four `dl*` refusals
+    // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path.
+    assert_eq!(Bionic::inline_symbols().count(), 88);
+    assert_eq!(Bionic::reentrant_symbols().count(), 8);
+    // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
+    // handler at all. 96 + 18 = 114 of the 188 the initializers reach.
+    assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
+}
+
+/// **Task 2 review finding F9, asserted rather than trusted to a comment.**
+///
+/// `ImportCall::mem()` reaches the whole `GuestSpace`, and an inline handler runs inside one of the
+/// translating backend's own callbacks with generated code live — where the pager's "the thread
+/// running guest code must not hold this space's lock" invariant is reachable and where unmapping
+/// or reprotecting a range invalidates memory live translations reference. Nothing in the types
+/// prevents `mmap` being moved into the inline table; this is what notices.
+///
+/// The converse matters too: a symbol on the exit path costs three times as much per call (D17),
+/// so the list is pinned in both directions.
+#[test]
+fn dispatch_paths_are_what_f9_requires() {
+    let reentrant: std::collections::BTreeSet<&str> = Bionic::reentrant_symbols().collect();
+    for symbol in ["mmap", "munmap", "mprotect", "madvise", "mlock"] {
+        assert!(
+            reentrant.contains(symbol),
+            "`{symbol}` reaches GuestSpace and must be serviced on the exit path (F9)"
+        );
+    }
+    // These three call guest code, which an inline handler structurally cannot (D18).
+    for symbol in ["pthread_once", "qsort", "dl_iterate_phdr"] {
+        assert!(reentrant.contains(symbol), "`{symbol}` calls guest code");
+    }
+    assert_eq!(reentrant.len(), 8, "nothing else belongs on the slow path: {reentrant:?}");
+    let inline: std::collections::BTreeSet<&str> = Bionic::inline_symbols().collect();
+    // The four `dl*` refusals touch no address space and run no guest code, so they stay on the
+    // fast path even though their sibling does not.
+    for symbol in ["dlopen", "dlsym", "dlclose", "dlerror"] {
+        assert!(inline.contains(symbol), "`{symbol}` has no reason to exit the run loop");
+    }
+    assert!(inline.is_disjoint(&reentrant));
 }
 
 /// Parse the first six sections of the reachable-import list: the 188 symbols that are

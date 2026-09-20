@@ -36,7 +36,10 @@
 //! must not hold this space's lock" invariant does not allow. Nothing in this phase maps from a
 //! handler. The one mapping this module performs happens before any CPU exists, let alone runs.
 
+mod data;
+mod dl;
 mod format;
+mod guestmem;
 mod handlers;
 mod runtime;
 mod view;
@@ -51,13 +54,20 @@ use omni_bionic::metadata::NameRegistry;
 use omni_bionic::mutex::OwnerTable;
 use omni_bionic::threads::GuestThreadId;
 use omni_bionic::tls::TlsRegistry;
+use omni_elf::loader::DlPhdrInfo;
 use omni_mem::{CommitPolicy, GuestAddr, GuestSpace, Placement, Protection};
+use parking_lot::Mutex;
 
 use crate::boundary::{BoundaryBuilder, ImportCall, ImportFn, ReentrantFn};
 use crate::error::{AbiError, AbiResult};
+use crate::mem::{Blame, GuestMem};
 
+pub use data::{DataObject, GuestProcess, DATA_OBJECTS, FILE_BYTES};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
-pub use view::{GuestView, ERRNO_OFFSET, SCRATCH_BYTES, SCRATCH_OFFSET, THREAD_BLOCK_BYTES};
+pub use view::{
+    GuestView, DL_INFO_OFFSET, DL_INFO_SLOTS, DL_PHDR_INFO_BYTES, ERRNO_OFFSET, SCRATCH_BYTES,
+    SCRATCH_OFFSET, THREAD_BLOCK_BYTES,
+};
 
 /// How many guest threads one instance can give a block to.
 ///
@@ -68,8 +78,21 @@ pub use view::{GuestView, ERRNO_OFFSET, SCRATCH_BYTES, SCRATCH_OFFSET, THREAD_BL
 /// writing the first one's `errno`.
 pub const MAX_GUEST_THREADS: usize = 64;
 
-/// Bytes of guest address space the per-thread arena occupies.
-pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES;
+/// Bytes of the arena set aside for objects that outlive a call and belong to no thread.
+///
+/// The `AMEDIAFORMAT_KEY_*` strings, `environ`'s empty vector, and one copy of each loaded
+/// image's `dlpi_name`. All of it is written **before guest code runs** — by
+/// [`Bionic::declare_data_into`] and [`Bionic::register_image`], both of which a host calls while
+/// setting up — so nothing here maps or writes from inside a handler. That is F9's constraint,
+/// and it is the same reason [`Bionic::new`] maps the arena rather than a handler doing it.
+///
+/// One page. The ten media keys are 104 bytes with their terminators, `environ`'s vector is eight,
+/// and eleven library paths at `PATH_MAX`-ish lengths are the rest. A pool that fills is a
+/// refusal naming the symbol, never a silent overwrite.
+pub const POOL_BYTES: usize = 4096;
+
+/// Bytes of guest address space the arena occupies: the per-thread blocks, then the pool.
+pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES + POOL_BYTES;
 
 /// One guest instance's bionic state.
 ///
@@ -103,6 +126,26 @@ pub struct Bionic {
     atexit: AtexitRegistry,
     /// The `rand` sequence's state. Process-wide, as C says it is.
     rand: AtomicU32,
+    /// The bump allocator for [`POOL_BYTES`], and what has been handed out of it.
+    pool: Mutex<usize>,
+    /// Every loaded image `dl_iterate_phdr` must enumerate, in the order it was registered.
+    images: Mutex<Vec<GuestImage>>,
+}
+
+/// One loaded image, as `dl_iterate_phdr` reports it.
+///
+/// The guest-side form of [`DlPhdrInfo`]: the name has been copied into the pool and is a guest
+/// address, because a callback receives `dlpi_name` as a `const char *` and dereferences it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestImage {
+    /// `dlpi_addr`: the load bias.
+    pub addr: GuestAddr,
+    /// `dlpi_name`: a guest pointer to a NUL-terminated copy of the name, in the pool.
+    pub name: GuestAddr,
+    /// `dlpi_phdr`: the guest address of the program header table.
+    pub phdr: GuestAddr,
+    /// `dlpi_phnum`.
+    pub phnum: u16,
 }
 
 impl core::fmt::Debug for Bionic {
@@ -147,7 +190,96 @@ impl Bionic {
             // Seeded as C's `rand` is before any `srand`: the standard says the sequence is as
             // if `srand(1)` had been called.
             rand: AtomicU32::new(1),
+            pool: Mutex::new(0),
+            images: Mutex::new(Vec::new()),
         }))
+    }
+
+    /// First address of the static pool.
+    #[must_use]
+    pub fn pool(&self) -> GuestAddr {
+        self.arena + MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
+    }
+
+    /// Take `len` zeroed, 8-byte-aligned bytes out of the pool.
+    ///
+    /// Called from host setup, never from a handler: see [`POOL_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when the pool is full, naming `symbol` — a refusal rather than a
+    /// wrapped bump pointer overwriting somebody else's object.
+    pub fn reserve(&self, symbol: &str, len: usize) -> AbiResult<GuestAddr> {
+        let mut used = self.pool.lock();
+        // Eight-byte aligned, because the pool holds `environ`'s vector of pointers as well as
+        // strings, and a misaligned pointer array is not something to hand a guest.
+        let start = (*used + 7) & !7;
+        if len == 0 || start.saturating_add(len) > POOL_BYTES {
+            return Err(AbiError::Refused {
+                symbol: symbol.to_string(),
+                address: self.pool(),
+                why: format!(
+                    "the adapter's {POOL_BYTES}-byte static pool has {} bytes left and this needs \
+                     {len}",
+                    POOL_BYTES.saturating_sub(start)
+                ),
+            });
+        }
+        let at = self.pool() + start;
+        let mem = GuestMem::new(Arc::clone(&self.space));
+        mem.write_bytes(at, &vec![0u8; len], Blame::new(symbol, self.pool(), 0))?;
+        *used = start + len;
+        Ok(at)
+    }
+
+    /// Copy `bytes` plus a NUL into the pool and return its guest address.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when the pool is full.
+    pub fn intern(&self, symbol: &str, bytes: &[u8]) -> AbiResult<GuestAddr> {
+        let at = self.reserve(symbol, bytes.len() + 1)?;
+        if !bytes.is_empty() {
+            let mem = GuestMem::new(Arc::clone(&self.space));
+            mem.write_bytes(at, bytes, Blame::new(symbol, self.pool(), 0))?;
+        }
+        Ok(at)
+    }
+
+    /// How many bytes of [`POOL_BYTES`] have been handed out.
+    #[must_use]
+    pub fn pool_used(&self) -> usize {
+        *self.pool.lock()
+    }
+
+    /// Tell the adapter about a loaded image, so `dl_iterate_phdr` enumerates it.
+    ///
+    /// **`dl_iterate_phdr` is not a stub and cannot become one**: the C++ runtime in
+    /// `libroblox.so` is statically linked, so the in-guest unwinder walks 11.5 MB of `.eh_frame`
+    /// through this call and C++ exceptions break without it. An adapter with no image registered
+    /// therefore *refuses* the call rather than reporting an empty process.
+    ///
+    /// Registration order is iteration order, which is what a dynamic linker reports: the main
+    /// object first, then its dependencies in link order. Nothing here sorts.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] if the name does not fit the pool.
+    pub fn register_image(&self, info: &DlPhdrInfo) -> AbiResult<()> {
+        let name = self.intern("dl_iterate_phdr", info.name.as_bytes())?;
+        self.images.lock().push(GuestImage {
+            addr: info.addr,
+            name,
+            phdr: info.phdr,
+            phnum: info.phnum,
+        });
+        Ok(())
+    }
+
+    /// Every registered image, in registration order.
+    #[must_use]
+    pub fn images(&self) -> Vec<GuestImage> {
+        self.images.lock().clone()
     }
 
     /// Publish this instance to the calling thread, and attach the thread if it is new.
@@ -256,6 +388,41 @@ impl Bionic {
     /// Every symbol this phase binds, in table order.
     pub fn bound_symbols() -> impl Iterator<Item = &'static str> {
         INLINE.iter().map(|(s, _)| *s).chain(REENTRANT.iter().map(|(s, _)| *s))
+    }
+
+    /// Every symbol serviced **inside** the run loop, in table order.
+    pub fn inline_symbols() -> impl Iterator<Item = &'static str> {
+        INLINE.iter().map(|(s, _)| *s)
+    }
+
+    /// Every symbol serviced on the **exit** path, in table order.
+    pub fn reentrant_symbols() -> impl Iterator<Item = &'static str> {
+        REENTRANT.iter().map(|(s, _)| *s)
+    }
+
+    /// Declare the eighteen `STT_OBJECT` imports into `builder` and fill them in.
+    ///
+    /// **Call this before the loader resolves symbols**, because a data import only gets an
+    /// address if it was declared with a size — [`BoundaryBuilder::declare_data`] is explicit that
+    /// there is no default — and the loader's answer is what the guest's `GOT` ends up holding.
+    ///
+    /// Returns how many were declared. `builder` must be over the same [`GuestSpace`] this
+    /// instance was built on; one over a different space produces a typed
+    /// [`AbiError::BadPointer`] out of the first write rather than a
+    /// silently unfilled object.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::RegionFull`] if the data area cannot hold them, [`AbiError::Refused`] for a
+    /// zero [`stack_guard`](data::GuestProcess::stack_guard), and
+    /// [`AbiError::BadPointer`] if a write into the data area or the
+    /// pool is refused.
+    pub fn declare_data_into(
+        &self,
+        builder: &BoundaryBuilder,
+        process: &GuestProcess,
+    ) -> AbiResult<usize> {
+        data::install(self, builder, process)
     }
 }
 

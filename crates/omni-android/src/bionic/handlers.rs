@@ -42,7 +42,7 @@ use crate::boundary::{ImportCall, ImportFn, ReentrantCall, ReentrantFn};
 use crate::error::{AbiError, AbiResult};
 
 use super::view::GuestView;
-use super::{active, enter, format, runtime::CallThreads};
+use super::{active, dl, enter, format, guestmem, runtime::CallThreads};
 
 // ------------------------------------------------------------------ result lifting
 
@@ -827,6 +827,12 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // C++ runtime
     ("__cxa_atexit", cxa_atexit),
     ("__cxa_thread_atexit_impl", cxa_thread_atexit),
+    // libdl: four that refuse by name rather than issue a handle they cannot honour.
+    // `dl_iterate_phdr` is the fifth and is on the exit path, because it calls a guest callback.
+    ("dlopen", dl::dlopen),
+    ("dlsym", dl::dlsym),
+    ("dlclose", dl::dlclose),
+    ("dlerror", dl::dlerror),
     // the printf family
     ("snprintf", format::snprintf),
     ("vsnprintf", format::vsnprintf),
@@ -838,6 +844,25 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("fscanf", format::fscanf),
 ];
 
-/// Serviced on the **exit** path, because each one calls guest code back: 80-102 ns per call.
-pub(super) static REENTRANT: &[(&str, ReentrantFn)] =
-    &[("pthread_once", pthread_once), ("qsort", qsort)];
+/// Serviced on the **exit** path: 80-102 ns per call.
+///
+/// Two reasons a symbol is here, and only one of them is about guest code.
+///
+/// * **It calls a guest callback.** `pthread_once`'s initialiser, `qsort`'s comparator and
+///   `dl_iterate_phdr`'s per-object callback are all guest functions, and D18 makes "may run guest
+///   code" a property of the type rather than a rule.
+/// * **It changes the guest's address space** — task 2 review finding **F9**. `mmap`, `munmap`,
+///   `mprotect`, `madvise` and `mlock` reach `GuestSpace`, and an inline handler runs inside one
+///   of the translating backend's own callbacks with generated code live. Nothing in the types
+///   says so; see `guestmem`'s module documentation and
+///   `dispatch_paths_are_what_f9_requires` in `tests/bionic.rs`.
+pub(super) static REENTRANT: &[(&str, ReentrantFn)] = &[
+    ("pthread_once", pthread_once),
+    ("qsort", qsort),
+    ("dl_iterate_phdr", dl::dl_iterate_phdr),
+    ("mmap", guestmem::mmap),
+    ("munmap", guestmem::munmap),
+    ("mprotect", guestmem::mprotect),
+    ("madvise", guestmem::madvise),
+    ("mlock", guestmem::mlock),
+];

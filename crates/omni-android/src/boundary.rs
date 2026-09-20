@@ -879,6 +879,36 @@ impl ReentrantCall<'_> {
         self.depth
     }
 
+    /// Discard any translated code covering `[address, address + len)`.
+    ///
+    /// **Only reachable from the exit path, and that is the point.** A handler that changes what
+    /// is mapped at a guest address — `munmap`, `mprotect`, an `mmap` reusing addresses a previous
+    /// mapping held — leaves the backend holding translations of bytes that are no longer there.
+    /// [`ImportCall`] has no CPU at all, deliberately (see the module docs), so an inline handler
+    /// could not do this even if it were safe for one to change the address space, which task 2's
+    /// review finding F9 establishes it is not.
+    ///
+    /// A zero length is a no-op rather than an error: a caller that has just rounded a guest's
+    /// length to pages may legitimately have nothing to invalidate, and
+    /// [`GuestRange`](omni_cpu::GuestRange) refuses an empty range.
+    ///
+    /// **Per context, and the limitation is real.**
+    /// [`GuestCpu::invalidate_code`] is documented as a
+    /// per-context operation, and this reaches the one context the calling guest thread is on.
+    /// Another guest thread that had already translated the same range keeps its translation.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Cpu`] if the range is unusable or the backend refused.
+    pub fn invalidate_code(&mut self, address: GuestAddr, len: usize) -> AbiResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let range = omni_cpu::GuestRange::new(address, len)?;
+        self.cpu.invalidate_code(range)?;
+        Ok(())
+    }
+
     /// Call a guest function, AAPCS64, and come back with its return value.
     ///
     /// The mirror direction: a `qsort` comparator, an `__cxa_atexit` handler, a `pthread_once`

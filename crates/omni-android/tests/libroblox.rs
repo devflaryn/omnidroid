@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use omni_android::bionic::DATA_OBJECTS;
 use omni_android::{AbiError, Binding, BoundaryBuilder, SLOT_BYTES};
 use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
 use omni_elf::{ElfImage, LoadedObject};
@@ -108,10 +109,11 @@ fn load() -> Option<Loaded> {
     // outside the prediction must get a named slot rather than a null.
     let builder = BoundaryBuilder::new(Arc::clone(&space), TOTAL_IMPORTS, 4096)
         .expect("a thunk region for 565 imports");
-    // The 18 `STT_OBJECT` imports need a size, which `.dynsym` has and `SymbolRequest` does not carry.
-    // Declared here at their real widths so this test can assert the split; Task 3 owns the contents.
-    for name in DATA_SYMBOLS {
-        builder.declare_data(name, 8, 8).expect("a data object");
+    // The 18 `STT_OBJECT` imports need a size, which `.dynsym` has and `SymbolRequest` does not
+    // carry. Task 3 phase 2 owns both the sizes and the contents, so they come from there rather
+    // than from a second list that could drift away from it.
+    for object in DATA_OBJECTS {
+        builder.declare_data(object.symbol, object.len, object.align).expect("a data object");
     }
 
     // The registry takes a provider by value, and `finish` needs the builder back, so the builder is
@@ -144,31 +146,122 @@ impl omni_elf::loader::SymbolProvider for ProviderHandle {
     }
 }
 
-/// The eighteen `STT_OBJECT` imports the 3,594 initializers reach (D17's scope figure).
+/// Whether `name` is one of the eighteen the adapter places.
+fn is_declared_data(name: &str) -> bool {
+    DATA_OBJECTS.iter().any(|object| object.symbol == name)
+}
+
+/// The first six sections of the reachable-import list: the 188 the initializers statically reach.
+fn reachable_imports() -> std::collections::BTreeSet<String> {
+    let path =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/research/init-reachable-imports.txt");
+    let text = std::fs::read_to_string(path).expect("the reachable-import list");
+    let mut out = std::collections::BTreeSet::new();
+    let mut section = 0usize;
+    for line in text.lines() {
+        if line.starts_with("###") {
+            section += 1;
+            continue;
+        }
+        let symbol = line.trim();
+        if symbol.is_empty() || section == 0 || section > 6 {
+            continue;
+        }
+        out.insert(symbol.to_string());
+    }
+    assert_eq!(out.len(), 188, "the reachable set's first six sections are 188 symbols");
+    out
+}
+
+/// **The eighteen are derived from the real library, not copied from a list — and the list they
+/// used to be copied from was wrong.**
 ///
-/// Listed rather than derived so that the count is checked against the decision that produced it: if
-/// the reachable set is ever re-measured and this list disagrees, the test says so instead of quietly
-/// agreeing with whatever the new number is.
-const DATA_SYMBOLS: [&str; REACHABLE_DATA] = [
-    "__sF",
-    "__stack_chk_guard",
-    "environ",
-    "in6addr_any",
-    "in6addr_loopback",
-    "stderr",
-    "stdin",
-    "stdout",
-    "timezone",
-    "tzname",
-    "AMEDIAFORMAT_KEY_BIT_RATE",
-    "AMEDIAFORMAT_KEY_CHANNEL_COUNT",
-    "AMEDIAFORMAT_KEY_COLOR_FORMAT",
-    "AMEDIAFORMAT_KEY_FRAME_RATE",
-    "AMEDIAFORMAT_KEY_HEIGHT",
-    "AMEDIAFORMAT_KEY_I_FRAME_INTERVAL",
-    "AMEDIAFORMAT_KEY_MIME",
-    "AMEDIAFORMAT_KEY_SAMPLE_RATE",
-];
+/// D17's *count* of 18 is right. The membership this file carried was not: it named `timezone` and
+/// `tzname`, which `init-reachable-imports.txt` puts in its "never referenced from the Tier C
+/// closure at all" section, and it omitted `AMEDIAFORMAT_KEY_STRIDE` and `AMEDIAFORMAT_KEY_WIDTH`,
+/// which are in the reachable `libmediandk` group. Two wrong and two missing, so the count stayed
+/// at eighteen and nothing noticed — the exact shape of error this project has now made five
+/// times, and the reason a count is not a specification.
+///
+/// It was invisible because the assertions around it were about *counts*: `timezone` and `tzname`
+/// really are `STT_OBJECT` imports of `libroblox.so`, so declaring them still produced eighteen
+/// resolved data symbols and five unresolved ones. This test is the one that cannot be satisfied
+/// by the wrong set.
+#[test]
+fn the_eighteen_data_symbols_are_derived_from_the_real_library_and_not_from_a_list() {
+    let _guard = serialized();
+    let Some(path) = cached_main_lib() else { return };
+    let bytes = std::fs::read(path).expect("read the cache entry");
+    let elf = ElfImage::parse(&bytes).expect("parse libroblox.so");
+    let reachable = reachable_imports();
+
+    let derived: std::collections::BTreeSet<String> = elf
+        .undefined_symbols()
+        .expect("the undefined symbols")
+        .into_iter()
+        .filter(|s| s.sym.is_object() && reachable.contains(s.name))
+        .map(|s| s.name.to_string())
+        .collect();
+
+    let declared: std::collections::BTreeSet<String> =
+        DATA_OBJECTS.iter().map(|o| o.symbol.to_string()).collect();
+    assert_eq!(derived, declared, "the adapter's data table must be the derived set exactly");
+    assert_eq!(derived.len(), REACHABLE_DATA, "D17's count, re-derived");
+    for withdrawn in ["timezone", "tzname"] {
+        assert!(!derived.contains(withdrawn), "`{withdrawn}` is not reachable");
+    }
+    for missed in ["AMEDIAFORMAT_KEY_STRIDE", "AMEDIAFORMAT_KEY_WIDTH"] {
+        assert!(derived.contains(missed), "`{missed}` is reachable and was omitted");
+    }
+}
+
+/// **Every reference to a data import is `R_AARCH64_GLOB_DAT` with a zero addend.**
+///
+/// `BoundaryBuilder::declare_data` is documented against the worry that "`__sF` is an array of
+/// three `FILE`s that the guest reaches as `__sF + addend`". Measured here: it is not, and neither
+/// is anything else — each of the eighteen has exactly one relocation and every addend is zero.
+/// The size still matters, because `&__sF[2]` is arithmetic guest code does at run time rather
+/// than arithmetic the loader does; what changes is the *evidence*, and a documented reason that
+/// rests on a wrong measurement is worth correcting even when its conclusion survives.
+#[test]
+fn every_data_import_is_referenced_with_a_zero_addend() {
+    let _guard = serialized();
+    let Some(path) = cached_main_lib() else { return };
+    let bytes = std::fs::read(path).expect("read the cache entry");
+    let elf = ElfImage::parse(&bytes).expect("parse libroblox.so");
+
+    let indices: std::collections::BTreeMap<u32, String> = elf
+        .undefined_symbols()
+        .expect("undefined symbols")
+        .into_iter()
+        .filter(|s| is_declared_data(s.name))
+        .map(|s| (s.index, s.name.to_string()))
+        .collect();
+    assert_eq!(indices.len(), REACHABLE_DATA);
+
+    let relocations = elf.relocations().expect("relocations");
+    let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let tables = relocations.general.iter().chain(relocations.plt.iter());
+    for table in tables {
+        for entry in &table.relocations {
+            let Some(name) = indices.get(&entry.r_sym()) else { continue };
+            assert_eq!(
+                entry.r_addend, 0,
+                "`{name}` is referenced as {name} + {}, so its object must be at least that \
+                 wide and the sizes in `bionic::DATA_OBJECTS` have to account for it",
+                entry.r_addend
+            );
+            // 1025 is `R_AARCH64_GLOB_DAT`: the loader writes the symbol's address into a GOT
+            // slot and the guest loads it from there.
+            assert_eq!(entry.r_type(), 1025, "`{name}`");
+            *seen.entry(name.as_str()).or_default() += 1;
+        }
+    }
+    assert_eq!(seen.len(), REACHABLE_DATA, "every one is referenced: {seen:?}");
+    for (name, count) in &seen {
+        assert_eq!(*count, 1, "`{name}` has {count} relocations, not one");
+    }
+}
 
 /// The loader binds every one of the real library's imports into the thunk region.
 ///
@@ -188,7 +281,7 @@ fn every_import_of_the_real_library_gets_a_named_thunk_address() {
     // got a slot.
     for name in &unresolved {
         assert!(
-            !DATA_SYMBOLS.contains(name),
+            !is_declared_data(name),
             "`{name}` was declared with a size and should have bound"
         );
     }
