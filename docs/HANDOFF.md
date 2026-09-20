@@ -27,9 +27,9 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
-**924 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was 877
-before M3 task 3 phase 1, and 608
-before `omni-bionic` existed, so the two are not comparable). Clippy clean on
+**926 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was 877
+before M3 task 3 phase 1, and 608 before `omni-bionic` existed, so those are not comparable).
+**The whole mutation table has been run on the committed tree: 155/155 caught.** Clippy clean on
 `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
 With `workspace = true` a member's `default-features = false` is **ignored**, so the omni-android
@@ -40,7 +40,7 @@ gate that refuses to run against a modified tree:
 
 | Harness | Rows |
 |---|---|
-| `tools/mutate.py` (workspace) | **153** |
+| `tools/mutate.py` (workspace) | **155**, all caught on a full run |
 | `crates/dynarmic-sys/tools/mutate_shim.py` | 23 |
 | `crates/omni-elf/tools/mutate_loader.py` | 18 |
 
@@ -167,7 +167,7 @@ said 9 missing and 42 present and **both were wrong**: `pthread_cond_timedwait` 
 it is `cond::wait_end` with `timeout: Some(..)`, and only the C symbol is unspelled — and
 `pthread_sigmask` was counted present because a grep matched the comment that **excludes** it.
 
-**Confirmed defects found in GLM's work so far**, both now fixed:
+**Confirmed defects found in GLM's work so far**, all now fixed:
 
 1. **`sem_post` consumed the waiter flag other waiters still needed.** `post` computed
    `(word & !WAITERS) + 1` under a comment reading "keep flag state" — the opposite of what it does;
@@ -175,7 +175,26 @@ it is `cond::wait_end` with `timeout: Some(..)`, and only the C symbol is unspel
    futex wake. **Measured: 1.0104 s** for a posted token to reach a blocked waiter. The suite could
    not see it — every `sem_wait` loops on a bounded slice, so a lost wake always *eventually* healed.
    Exercising, not detecting.
-2. **Three timing flakes**, two root causes: six wall-clock assertions with zero headroom (a 150 ms
+2. **The `rwlock` and `sem` handed the futex a placeholder `expected` of `0`**, which the word can
+   never be at that point — the rwlock word is `WRITER` or a reader count, and a sem waiter has just
+   set its waiter flag. `mutex` and `once` pass real words; only these four sites did not. The value
+   check is the whole point of a futex: one that performs it would answer `WouldBlock` to every such
+   waiter and the `continue` would busy-spin. Invisible because the crate's mock ignores `expected`
+   by design **and the new adapter's futex parks unconditionally for that stated reason** — the
+   placeholder had propagated into an accommodation. Fixed; rows `bionic-A11`/`B2`.
+3. **`rwlock` healed a lost wake with 1,000 ms slices.** `sem`'s were cut to 50 ms when its
+   waiter-flag bug was fixed; `rwlock`'s were missed. MEASURED at 19,200 acquisitions per version
+   (8 threads × 400 × 6 runs): **44 stalls >100 ms (0.23%), worst 2.0169 s** against **2 (0.010%),
+   worst 119.7 ms**. The fix *bounds* the stall; eliminating it needs a futex that honours
+   `expected`, which item 2 enables and the adapter does not yet do.
+
+   **A first measurement of this was wrong, recorded so the method is not repeated.** One run showed
+   1.0115 s and a patched run 1.8 µs, which looked like a 500,000× win. It was not: the pristine
+   build also measures 1.5–3.5 µs in most runs, because the stall is a rare race, and eight runs per
+   version separated them not at all. Both regression tests are therefore **structural** — a
+   recording futex, and a bound on the constant — because a latency test for a 0.23% race would be
+   flaky in both directions.
+4. **Three timing flakes**, two root causes: six wall-clock assertions with zero headroom (a 150 ms
    wait measured returning at 149.9569 ms), and a probabilistic `observed_max > 1` guard on a
    writer-preferring rwlock (~12% failure, 4 in 33 runs). Both fixed and mutation-verified.
 
