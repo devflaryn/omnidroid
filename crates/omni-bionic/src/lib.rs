@@ -53,6 +53,7 @@ pub mod sem;
 pub mod sort;
 pub mod string;
 pub mod threads;
+pub mod tls;
 pub mod wide;
 
 pub use context::GuestContext;
