@@ -370,3 +370,84 @@ fn a_saturated_width_is_planned_but_not_honoured_here() {
     assert_eq!(plan(&f).unwrap(), vec![ArgKind::Int]);
     // Deliberately not calling `format` with it: that is the adapter's bound, tested there.
 }
+
+/// **Critical, and reachable from a guest format string.** `emit_padded` pads with
+/// `repeat_n(' ', width - body.len())`, so a width of thirty nines saturates to `usize::MAX`
+/// and the pad becomes an allocation that aborts. An abort cannot be contained by any caller.
+///
+/// Both forms are tested, because they arrive by different routes: the width written in the
+/// format string, and the width taken from a `*` argument, which no pre-scan of the format
+/// string can see.
+#[test]
+fn a_hostile_width_is_refused_rather_than_allocated() {
+    let huge = format!("%{}d", "9".repeat(30));
+    assert!(matches!(
+        format(&huge, &[FormatArg::Int(1)], &mut String::new()),
+        Err(FormatError::FieldTooWide { conversion: 'd', .. })
+    ));
+    // The `*` form: the width is an argument, so the format string looks harmless.
+    assert!(matches!(
+        format("%*d", &[FormatArg::Int(i64::MAX), FormatArg::Int(1)], &mut String::new()),
+        Err(FormatError::FieldTooWide { conversion: 'd', .. })
+    ));
+    // A negative `*` width is left-justification with the magnitude, which is the same hazard.
+    assert!(matches!(
+        format("%*d", &[FormatArg::Int(i64::MIN + 1), FormatArg::Int(1)], &mut String::new()),
+        Err(FormatError::FieldTooWide { conversion: 'd', .. })
+    ));
+    // Precision, too: `%.*f` builds that many digits.
+    assert!(matches!(
+        format("%.*f", &[FormatArg::Int(i64::MAX), FormatArg::Double(1.0)], &mut String::new()),
+        Err(FormatError::FieldTooWide { conversion: 'f', .. })
+    ));
+    // And nothing was written on the way to the refusal.
+    let mut out = String::new();
+    let _ = format(&huge, &[FormatArg::Int(1)], &mut out);
+    assert_eq!(out, "");
+}
+
+/// The over-correction: a width a real program uses must still work, and the cap must be
+/// exactly where it says it is. A bound that refused `%80s` would break a correct caller.
+#[test]
+fn the_width_cap_admits_every_width_below_it() {
+    use omni_bionic::printf::MAX_FIELD_WIDTH;
+    assert_eq!(fmt("%8d", &[FormatArg::Int(42)]).len(), 8);
+    assert_eq!(fmt("%80s", &[FormatArg::Str("x")]).len(), 80);
+    let at_limit = format!("%{MAX_FIELD_WIDTH}d");
+    assert_eq!(fmt(&at_limit, &[FormatArg::Int(1)]).len(), MAX_FIELD_WIDTH);
+    let past_limit = format!("%{}d", MAX_FIELD_WIDTH + 1);
+    assert!(matches!(
+        format(&past_limit, &[FormatArg::Int(1)], &mut String::new()),
+        Err(FormatError::FieldTooWide { .. })
+    ));
+}
+
+/// Capping one field is not enough on its own: a format string may repeat a wide conversion
+/// until the total is a gigabyte. The total cap stops that, and stops it *before* the
+/// allocation rather than after it.
+#[test]
+fn a_repeated_wide_field_is_stopped_by_the_total_cap() {
+    use omni_bionic::printf::{MAX_FIELD_WIDTH, MAX_OUTPUT};
+    let wide = format!("%{}d", MAX_FIELD_WIDTH);
+    let repeated = wide.repeat(64); // 64 x 64 KiB = 4 MiB, past the 1 MiB total
+    let args: Vec<FormatArg> = (0..64).map(|_| FormatArg::Int(1)).collect();
+    let mut out = String::new();
+    assert!(matches!(
+        format(&repeated, &args, &mut out),
+        Err(FormatError::OutputTooLarge { .. })
+    ));
+    // It stopped near the cap rather than after building the whole 4 MiB.
+    assert!(
+        out.len() <= MAX_OUTPUT + MAX_FIELD_WIDTH,
+        "output grew to {} before stopping, past the {} + {} bound",
+        out.len(),
+        MAX_OUTPUT,
+        MAX_FIELD_WIDTH
+    );
+    // A long run of plain literal bytes is bounded by the same check.
+    let literals = "x".repeat(MAX_OUTPUT + 16);
+    assert!(matches!(
+        format(&literals, &[], &mut String::new()),
+        Err(FormatError::OutputTooLarge { .. })
+    ));
+}

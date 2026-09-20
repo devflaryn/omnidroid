@@ -30,6 +30,20 @@
 //! first; passing a `FormatArg::Str` covers the reachable initializers' needs), and
 //! locale-dependent decimal points (always `.` in the C locale).
 
+/// The widest field one conversion will produce.
+///
+/// **A policy number, stated as one.** 64 KiB matches the boundary's own `STRING_LIMIT`, which
+/// is set where it is because nothing bionic's interfaces produce is longer — `PATH_MAX` is
+/// 4096, a log line is 4096. It is not a correctness bound: it is the point past which honouring
+/// a guest-chosen width stops being formatting and starts being an allocation the guest picked.
+pub const MAX_FIELD_WIDTH: usize = 64 * 1024;
+
+/// The most one [`format`] call will produce.
+///
+/// Capping a single field is not enough on its own: a format string may repeat a wide
+/// conversion. Checked once per loop iteration, which also bounds the literal bytes.
+pub const MAX_OUTPUT: usize = 1024 * 1024;
+
 /// One printf argument. The adapter builds these from the guest's va_list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FormatArg<'a> {
@@ -66,6 +80,29 @@ pub enum FormatError {
     /// the wrong half of it — a plausible wrong answer propagating through the rest of the
     /// format. The `char` is the conversion that asked.
     LongDoubleUnsupported(char),
+    /// One conversion asked for a field wider than [`MAX_FIELD_WIDTH`].
+    ///
+    /// **Hostile input, not a limitation.** A width is guest-controlled — `%999999999d` in a
+    /// format string, or a `*` width taken from an argument — and honouring one would make
+    /// `emit_padded` push that many characters. At `usize::MAX` that is an allocation failure,
+    /// which aborts, and Global Constraint 11 calls an abort reachable from untrusted input
+    /// Critical because no caller can contain it.
+    FieldTooWide {
+        /// The conversion that asked.
+        conversion: char,
+        /// What it asked for.
+        requested: usize,
+        /// The cap it passed.
+        limit: usize,
+    },
+    /// The formatted output passed [`MAX_OUTPUT`].
+    ///
+    /// The companion bound to [`FieldTooWide`](FormatError::FieldTooWide): capping one field
+    /// still leaves a format string free to repeat a wide conversion thousands of times.
+    OutputTooLarge {
+        /// The cap that was passed.
+        limit: usize,
+    },
     /// A wide conversion (`%ls`, `%lc`) was requested.
     ///
     /// Refused rather than treated as its narrow form: on Android `wchar_t` is **32 bits**,
@@ -85,6 +122,13 @@ impl core::fmt::Display for FormatError {
                 f,
                 "%L{c}: long double is a 128-bit quad on Android and is not formatted here"
             ),
+            FormatError::FieldTooWide { conversion, requested, limit } => write!(
+                f,
+                "%{conversion} asked for a field {requested} characters wide, past the {limit}                  this formatter will produce for one conversion"
+            ),
+            FormatError::OutputTooLarge { limit } => {
+                write!(f, "the formatted output passed {limit} bytes and was stopped")
+            }
             FormatError::WideUnsupported(c) => {
                 write!(f, "%l{c}: wide characters (32-bit wchar_t) are not formatted here")
             }
@@ -124,6 +168,12 @@ pub fn format(
     let mut i = 0usize;
 
     while i < bytes.len() {
+        // Checked here rather than at each push: every path through the loop body appends at
+        // most one field, and a field is capped below, so one test per iteration bounds the
+        // whole call at MAX_OUTPUT + MAX_FIELD_WIDTH.
+        if out.len() - start_len > MAX_OUTPUT {
+            return Err(FormatError::OutputTooLarge { limit: MAX_OUTPUT });
+        }
         let b = bytes[i];
         if b != b'%' {
             out.push(b as char); // format strings with %s args stay ASCII-safe in practice;
@@ -168,6 +218,21 @@ pub fn format(
                 _ => return Err(FormatError::MalformedFormat("'*' precision needs an int")),
             },
         };
+        // Both the literal `%999999999d` and the `*` form arrive here, which is why the check is
+        // after the fetch rather than in `plan`: a `*` width is an argument and the format string
+        // alone cannot be scanned for it.
+        for (requested, what) in [(width, "width"), (precision, "precision")] {
+            let _ = what;
+            if let Some(n) = requested {
+                if n > MAX_FIELD_WIDTH {
+                    return Err(FormatError::FieldTooWide {
+                        conversion: spec,
+                        requested: n,
+                        limit: MAX_FIELD_WIDTH,
+                    });
+                }
+            }
+        }
         let arg = match spec {
             '%' => {
                 out.push('%');
