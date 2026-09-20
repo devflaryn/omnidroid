@@ -1319,3 +1319,101 @@ fn an_absurd_alignment_is_refused_rather_than_wrapping() {
         .expect("an alignment equal to the space is satisfiable at its base");
     space.close().expect("close");
 }
+
+/// **An access may straddle a commit-granule boundary inside one mapping.**
+///
+/// A commit carves the map into entries that are each exactly one OS placeholder — `commit_range`
+/// requires that, because a commit may not cross a placeholder — and adjacent committed granules are
+/// never coalesced. So a lazily-committed mapping becomes a run of entries, and an access crossing a
+/// granule boundary lands in two of them while being, to the guest, one ordinary access inside one
+/// `mmap`.
+///
+/// Checking only the first entry refused every such access as `NotMapped` even with both granules
+/// committed. MEASURED before the fix: an 8-byte read inside the first granule succeeded, a 16-byte
+/// read straddling the boundary was refused.
+///
+/// Invisible until now because every other fixture is `CommitPolicy::Eager`, which is one entry that
+/// is never split.
+#[test]
+fn an_access_may_straddle_a_commit_granule_boundary_within_one_mapping() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let base = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            4 * granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a lazily-committed mapping");
+    let boundary = base + granule;
+
+    // Commit the two granules either side of the boundary, in separate calls, so the entries stay
+    // split exactly as the demand pager would leave them.
+    space.ensure_committed(base, 1).expect("commit the first granule");
+    space.ensure_committed(boundary, 1).expect("commit the second granule");
+
+    // The entries really are still separate: this is the precondition the test is about.
+    let first = space.region_at(boundary - 8).expect("mapped");
+    assert_eq!(
+        first.end(),
+        boundary,
+        "adjacent committed granules are expected to stay separate entries",
+    );
+
+    // Wholly inside one entry: allowed before and after.
+    omni_mem::admit(&space, boundary - 16, 8, omni_mem::FaultAccess::Read)
+        .expect("an access inside one granule");
+
+    // Straddling: this is the one that was refused.
+    let admitted = omni_mem::admit(&space, boundary - 8, 16, omni_mem::FaultAccess::Read)
+        .expect("an access straddling the boundary, inside one mapping");
+    assert!(
+        admitted.end >= boundary + 8,
+        "the admitted extent must cover the whole access, got {:#x}",
+        admitted.end,
+    );
+    assert_tiles_the_space(&space);
+}
+
+/// **...but it may not straddle out of its mapping.**
+///
+/// The over-correction a span fix invites: letting the walk run past the end of the mapping into
+/// whatever happens to be next. Two mappings placed adjacently are still two mappings, and an access
+/// that crosses from one into the other is a refusal, not a long access.
+#[test]
+fn an_access_may_not_straddle_from_one_mapping_into_another() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let first = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("the first mapping");
+    // Place a second mapping immediately after the first, so the two are contiguous addresses but
+    // distinct mappings.
+    let second = space
+        .map_anonymous(
+            Placement::Fixed(first + granule),
+            granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a second mapping butted against the first");
+    assert_eq!(second, first + granule, "the two mappings must be adjacent");
+
+    space.ensure_committed(first, 1).expect("commit the first");
+    space.ensure_committed(second, 1).expect("commit the second");
+
+    // Inside either one: fine.
+    omni_mem::admit(&space, second, 8, omni_mem::FaultAccess::Read).expect("inside the second");
+
+    // Across the seam between them: refused, even though both are mapped, committed and readable.
+    let refusal = omni_mem::admit(&space, second - 8, 16, omni_mem::FaultAccess::Read)
+        .expect_err("an access crossing from one mapping into another must be refused");
+    assert_eq!(refusal, omni_mem::Refusal::NotMapped);
+    assert_tiles_the_space(&space);
+}

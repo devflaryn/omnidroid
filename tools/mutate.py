@@ -1226,6 +1226,26 @@ MUTATIONS = [
                 return Err(error);
             }""",
      ANDROID),
+
+    # ---- an access may span entries of one mapping, and only of one mapping --------------------
+    # A commit carves the map into entries that are each exactly one OS placeholder, and adjacent
+    # committed granules are never coalesced -- so a lazily-committed mapping is a run of entries and
+    # an ordinary access can straddle two of them. A1 restores the single-entry check that refused
+    # every such access as NotMapped; B1 is the over-correction, letting the walk run out of its
+    # mapping into whatever is next.
+    ("access-A1", "A",
+     "only the first entry is checked, so an access straddling a granule boundary is refused",
+     ACCESS,
+     """    admits_region(&region, address, access_end.min(covered_end) - address, access)?;""",
+     """    admits_region(&region, address, len, access)?;""",
+     MEM_AND_CPU),
+
+    ("access-B1", "B",
+     "the span walk crosses out of its mapping into whatever is mapped next",
+     ACCESS,
+     """        if next.start != covered_end || next.mapping.is_none() || next.mapping != region.mapping {""",
+     """        if next.start != covered_end || next.is_free() {""",
+     MEM_AND_CPU),
 ]
 
 

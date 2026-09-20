@@ -117,16 +117,52 @@ pub fn admit(
     let Some(region) = space.region_at(address) else {
         return Err(Refusal::NotMapped);
     };
-    // Rules 1-3. Delegated rather than repeated: `admits_region` is the only copy of them, which is
-    // what lets one mutation row flip a rule and be checked against both crates' suites at once.
-    admits_region(&region, address, len, access)?;
-    // Rule 4.
+    let Some(access_end) = address.checked_add(len.max(1)) else {
+        return Err(Refusal::NotMapped);
+    };
+
+    // Rules 1-3, over every entry the access touches.
+    //
+    // **An access may span entries, provided they are one mapping.** A commit carves the map into
+    // entries that are each exactly one OS placeholder -- `commit_range` requires that, because a
+    // commit may not cross a placeholder -- and adjacent committed granules are never coalesced back
+    // together. So a lazily-committed mapping ends up as a run of entries, and an access that
+    // straddles a granule boundary lands in two of them while being, to the guest, one perfectly
+    // ordinary access inside one `mmap`.
+    //
+    // Checking only the first entry refused every such access as `NotMapped` even when both granules
+    // were committed. MEASURED: on a 1 MiB lazy mapping with two neighbouring granules committed, an
+    // 8-byte read inside the first granule succeeded and a 16-byte read straddling the boundary was
+    // refused. Every existing fixture is `CommitPolicy::Eager`, which is one entry that is never
+    // split, which is why nothing saw it.
+    //
+    // The walk stops at the mapping, not at the entry: crossing into a *different* mapping is a real
+    // refusal, and so is crossing free space.
     let anonymous = matches!(region.kind, RegionKind::Anonymous);
-    let fully_committed = region.is_committed();
+    let mut covered_end = region.end();
+    let mut fully_committed = region.is_committed();
+    admits_region(&region, address, access_end.min(covered_end) - address, access)?;
+
+    while covered_end < access_end {
+        let Some(next) = space.region_at(covered_end) else {
+            return Err(Refusal::NotMapped);
+        };
+        // Contiguous, and the same mapping. `mapping` is `None` for free space, so a `None == None`
+        // comparison must not be allowed to pass for two unrelated holes.
+        if next.start != covered_end || next.mapping.is_none() || next.mapping != region.mapping {
+            return Err(Refusal::NotMapped);
+        }
+        admits_region(&next, covered_end, access_end.min(next.end()) - covered_end, access)?;
+        fully_committed &= next.is_committed();
+        covered_end = next.end();
+    }
+
+    // Rule 4.
     let committed = if anonymous && !fully_committed {
         // One byte would do for a fault, but the CPU callback knows the real length and a commit
         // that covered only the first byte of a straddling access would fault again immediately.
-        // `ensure_committed` expands outwards to whole granules and clips to the mapping.
+        // `ensure_committed` expands outwards to whole granules and clips to the mapping, and
+        // `commit_range` already walks entries, so a straddling commit is one call.
         match space.ensure_committed(address, len.max(1)) {
             Ok(bytes) => bytes,
             Err(_) => return Err(Refusal::Commit),
@@ -137,7 +173,10 @@ pub fn admit(
 
     Ok(Admitted {
         start: region.start,
-        end: region.end(),
+        // The end of the last entry needed to cover the access, which for an access inside one entry
+        // is that entry's end exactly as before. `fully_committed` is the AND over those entries, so
+        // `omni-cpu`'s fetch cache keeps its contract: it only trusts `end` when that flag is set.
+        end: covered_end,
         committed,
         fully_committed,
         anonymous,
