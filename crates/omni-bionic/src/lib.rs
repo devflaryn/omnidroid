@@ -48,6 +48,8 @@ pub mod numerics;
 pub mod once;
 pub mod shared_mem;
 pub mod printf;
+pub mod rwlock;
+pub mod sem;
 pub mod sort;
 pub mod string;
 pub mod threads;
