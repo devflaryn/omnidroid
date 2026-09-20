@@ -1586,3 +1586,237 @@ at the same time. This phase extended `omni-platform` not at all.
 **Cost if wrong.** The thread-local is the one piece that would be expensive to change, because every
 handler reads it. It is one function (`bionic::active`) and one type, so a move to a
 `ThunkContext`-style user-data channel — if the boundary ever grows one — is mechanical.
+
+---
+
+## D21 — Phase 2: `dl*`, guest memory and the data symbols, and a data list wrong by two in each direction
+
+D20 is the adapter and phase 1. This is phase 2 of M3 task 3: the three groups that needed no new
+`omni-platform` surface. It extends D20 rather than replacing it, and it extends `omni-platform`
+not at all.
+
+### What is bound now
+
+| | count | what |
+|---|---|---|
+| serviced inside the run loop | **88** | phase 1's 84, plus `dlopen`, `dlsym`, `dlclose`, `dlerror` |
+| serviced on the exit path | **8** | `pthread_once`, `qsort`, `dl_iterate_phdr`, and the five guest-memory calls |
+| `STT_OBJECT` data objects placed and filled | **18** | all of them |
+| **of the 188 reachable imports** | **114** | 96 thunk functions and the 18 data objects |
+| left `Unbound` | 74 | files, directories, clocks, process info, sockets, logging, thread lifecycle |
+
+Pinned exactly by `the_bound_count_is_exactly_what_this_phase_claims`, which now asserts the two
+tables separately, and by `dispatch_paths_are_what_f9_requires`, which asserts membership of each.
+
+### The count was right and the membership was wrong, in both directions at once
+
+D17 scopes the reachable `STT_OBJECT` imports at **18**. That number is correct and is re-derived
+here. The *list* that stood beside it — `crates/omni-android/tests/libroblox.rs`'s `DATA_SYMBOLS` —
+was not:
+
+| | |
+|---|---|
+| Named but **not reachable** | `timezone`, `tzname` — `init-reachable-imports.txt` puts both in its "never referenced from the Tier C closure at all" section |
+| Reachable but **omitted** | `AMEDIAFORMAT_KEY_STRIDE`, `AMEDIAFORMAT_KEY_WIDTH` — both in the reachable `libmediandk` group |
+
+Two wrong and two missing, so the count stayed at eighteen. **Every assertion around it still
+passed**, and that is the interesting part rather than the error: `timezone` and `tzname` really are
+`STT_OBJECT` imports of `libroblox.so`, so declaring them produced eighteen resolved data symbols and
+five unresolved ones exactly as the reconciliation of 23-against-18 required. A count-based test
+cannot see a substitution.
+
+It is derived now, from the real `.dynsym` intersected with the reachable list, by
+`the_eighteen_data_symbols_are_derived_from_the_real_library_and_not_from_a_list`. That is the sixth
+wrong number this project has recorded, and the first whose error was in membership rather than in
+magnitude.
+
+### Measured: nothing reaches a data import with a non-zero addend
+
+`BoundaryBuilder::declare_data` requires a size and has no default, justified in its own
+documentation by "`__sF` is an array of three `FILE` structures that the guest reaches as
+`__sF + addend`, so a pointer-sized cell would be silently too small".
+
+**Measured against the real library, and the evidence is wrong.** Each of the eighteen has exactly
+**one** relocation against it, every one `R_AARCH64_GLOB_DAT` (type 1025), and every addend is
+**zero**. The `GOT` holds the object's base; any subscripting is an instruction the guest executes.
+`every_data_import_is_referenced_with_a_zero_addend` asserts it and will fail if that ever changes.
+
+The *conclusion* survives intact — `&__sF[2]` is `__sF + 2 * sizeof(FILE)` computed at run time, so
+the object still has to be three `FILE`s wide — and the requirement to state a size is still right.
+Only the reason given for it was not true of this binary. Recorded rather than quietly fixed,
+because a correct conclusion resting on a wrong measurement is how the next one gets believed.
+
+### `sizeof(FILE) = 152`: derived, not verified, and why that is acceptable here
+
+`__sF` is `FILE __sF[3]`, so it needs three times whatever a bionic LP64 `FILE` is. There is no NDK
+on this machine — the same gap `omni-bionic`'s `layouts.rs` records for `pthread_mutex_t` — so the
+number comes from `struct __sFILE`'s fields laid out by hand, and the arithmetic is written out in
+`bionic::data::FILE_BYTES`.
+
+**ASSUMED, and it is safe to assume only because nothing can read a field out of it.** A `FILE` is
+opaque: every function that would interpret one is `Unbound` or refuses by name — `fopen`, `fclose`,
+`fread`, `fwrite`, `fdopen`, `fileno` are unbound, and `fprintf` refuses while naming the guest
+`FILE *` it was handed. The single observable a wrong stride can reach is the arithmetic
+`stdout == &__sF[1]`, and that arithmetic is wrong **consistently**: this module places `stdout` at
+`__sF + FILE_BYTES` with the same number guest code would use, so the two agree with each other
+whatever the truth is. **The phase that implements stdio must confirm it against a real header
+before reading a field**, and that obligation is written in the constant's own documentation.
+
+### The contents, and the two that are facts rather than placeholders
+
+* **`__stack_chk_guard`** carries D13's canary — the same value programmed into `TPIDR_EL0 + 0x28`
+  for every thread of this guest, taken from the backend's TLS arena rather than chosen here. A
+  function that loads the global form and one that loads the TLS form must see the same number, and
+  1,276 of `libroblox.so`'s 1,282 thread-pointer reads are the second kind. **A zero is refused**,
+  not stored: a zero canary compares equal to a zeroed stack slot, so a stack overflow that wrote
+  zeroes would pass every check, and `omni-cpu` already refuses to *generate* one for that reason.
+* **`environ`** points at a vector of one terminating null — an empty environment. This is a fact
+  about a process started with none, and it is the answer that is *not* a stub: `environ = NULL`
+  would be wrong, because POSIX-shaped code walks the vector without checking the pointer first, so
+  a null there is a crash in guest code rather than a refusal here.
+* `in6addr_any` is sixteen zero bytes and `in6addr_loopback` is `::1`, both fixed by RFC 4291.
+* The ten `AMEDIAFORMAT_KEY_*` point at the published `android.media.MediaFormat` key strings. Every
+  `AMediaFormat_*` function is `Unbound`, so the *use* fails by name; the strings still have to be
+  right and non-null, because a `strcmp` or a hash of one fails silently.
+* **A data symbol that is *called* is still `DataSymbolCalled`**, now that there are contents to
+  execute. Asserted from real guest code with `BLR` into `__sF`, `environ` and a media key.
+
+### `dl_iterate_phdr` is faithful, and the refusal is the load-bearing part
+
+The C++ runtime in `libroblox.so` is statically linked, so the in-guest unwinder walks 11.5 MB of
+`.eh_frame` through this call. It enumerates the images a host registered with
+`Bionic::register_image`, in registration order, filling a real `struct dl_phdr_info` in guest memory
+and calling the guest callback once per object, stopping at the first non-zero answer — which is the
+contract the unwinder depends on, since it answers non-zero the moment it finds the object holding
+the address it wants.
+
+**An adapter with no image registered refuses, and that decision is the whole of why this is not a
+stub.** Reporting an empty process is a *success*: the call returns zero, which is exactly what it
+returns when every callback declined. Every C++ `throw` in the engine would then fail to find a
+landing pad, thousands of initializers from the mistake. The refusal names `Bionic::register_image`
+and says why.
+
+`dlpi_adds` is the number of registered objects and `dlpi_subs` is zero, and both are facts rather
+than placeholders: nothing in this layer can `dlopen` or `dlclose`, so the pair the unwinder caches
+on is valid for the life of the process. `dlpi_tls_modid` and `dlpi_tls_data` are zero because D9
+established there is no `PT_TLS` anywhere in this APK and `ElfImage::parse` refuses one.
+
+The struct is **64 bytes**, derived from bionic's `link.h` and, like `FILE_BYTES`, not verified
+against an NDK. Two things make that safe. The last four fields were added in Android R and nothing
+has been added since, so 64 is the largest this structure has ever been and a guest built against an
+older header reads a prefix. And the `size` argument passed to the callback *is* that number, so a
+callback that checks before reading is told exactly how much is there.
+
+### `dlopen`, `dlsym`, `dlclose` refuse; `dlerror` answers
+
+Bound rather than left `Unbound`, for D20's reason: `Unbound` says "nothing implements this" and a
+refusal says *which missing piece*, with the guest's own argument quoted. `dlopen` names the library
+path it was handed, `dlsym` names the symbol and the handle.
+
+The instruction this follows is blunt and correct: **returning a plausible handle you cannot honour
+is worse than refusing.** A guest given a non-null `dlopen` result will `dlsym` it, store what comes
+back and call it thousands of initializers later. `dlsym` returning null is worse still, because null
+is `dlsym`'s ordinary "not found" and the guest would treat a missing capability as an absent
+optional one.
+
+`dlerror` returns null and that is **true**, not convenient: null means "no error since the last
+call", and the three calls that could leave one refuse instead of returning. The common idiom —
+`dlerror(); p = dlsym(...); if (dlerror())` — reaches the first call legitimately and never reaches
+the second.
+
+### The guest-memory group, and F9 honoured
+
+`libroblox.so` imports **no allocator at all**. It carries its own and reaches the host through guest
+`mmap`, so these five are where the engine's heap comes from.
+
+**All five are `bind_reentrant`, and task 2's review finding F9 is why.** `ImportCall::mem()` reaches
+`GuestMem::space()` and therefore the whole `GuestSpace`, and an inline handler runs inside one of
+the translating backend's own callbacks with generated code live and a `&mut CpuCtx` on the stack.
+Two things go wrong there, neither a type error: the pager's documented "the thread running guest
+code must not hold this space's lock" invariant becomes reachable, and unmapping or reprotecting a
+range invalidates memory the live translations reference from inside the callback executing them.
+Phase 1 avoided it by mapping exactly once in `Bionic::new`; phase 2 cannot, because `mmap` is a
+guest call.
+
+**Nothing in the types says so**, and the naive move is caught only by accident — `ImportFn` and
+`ReentrantFn` have different signatures, so moving a row between the tables does not compile, but
+rewriting a handler against `ImportCall` would. So it is asserted instead, in both directions, by
+`dispatch_paths_are_what_f9_requires`.
+
+The exit path is also the only one that can reach a CPU, which is what makes the new
+`ReentrantCall::invalidate_code` possible. `munmap` and `mprotect` must discard translations of the
+memory they are about to change, or a guest that unmaps code and maps different code at the same
+address runs the old one. **It is per context, and that is a narrowing of the window rather than a
+closing of it**: a second guest thread that had already translated the same range keeps its
+translation, and closing that needs a registry of live contexts the boundary does not have. Labelled
+as a narrowing rather than described as complete.
+
+### The split between a refusal and a `-1`, which is the whole risk in this group
+
+* **Cannot be carried out correctly → `AbiError::Refused`**, naming the symbol and the argument:
+  a file-backed `mmap`, `MAP_FIXED`, an unimplemented flag, a protection AArch64 can express and
+  `omni_mem::Protection` cannot, `MADV_DONTNEED`, `mlock`. `MAP_FAILED` is the *believable* answer
+  here — the guest's allocator handles it by trying something else, and the real failure would
+  surface later as an allocation pattern with no explanation.
+* **Well-formed and legitimately failed → what Linux returns, with `errno` set.** A length of zero
+  is `EINVAL`, a length that cannot be page-rounded is `ENOMEM`, an occupied `MAP_FIXED_NOREPLACE`
+  address is `ENOMEM`. That is the contract, not a stub: an allocator that cannot handle a failing
+  `mmap` is broken on a real device too.
+
+Four decisions inside that split are worth recording:
+
+1. **`MAP_FIXED` is refused and `MAP_FIXED_NOREPLACE` is implemented.** Linux's `MAP_FIXED` silently
+   unmaps whatever is already there; `Placement::Fixed` deliberately refuses an occupied range. The
+   two spellings are kept apart and only the one with the checkable meaning is honoured.
+2. **`MADV_FREE` is implemented and `MADV_DONTNEED` is refused**, and the difference is their
+   contracts rather than their difficulty. `MADV_FREE` promises "the old contents or zeroes", which
+   is exactly `advise_idle` plus a later `reclaim_idle`. `MADV_DONTNEED` promises **zero,
+   immediately**, and meeting that would mean writing zeroes across the range — which commits every
+   lazy granule the call was asking to release, the opposite of the point. `MADV_REMOVE` is refused
+   for the same reason. The purely advisory advices return 0, because every one of them leaves the
+   contents of the range untouched by definition, which is what makes ignoring them conforming
+   rather than convenient. An advice nobody defined is `EINVAL`, as on Linux.
+3. **`mlock` is refused, and `-1`/`ENOMEM` was considered and rejected.** It is the most tempting
+   wrong answer in the group: a failing `mlock` is ordinary on a real device, `RLIMIT_MEMLOCK` is
+   small, and well-written code handles it — which is precisely the problem. The guest would record
+   a refusal by policy for a request nobody made. Nothing in `omni-platform` can promise residency
+   that *stays*, and committing through the pager gives the first half of the contract only.
+4. **`MAP_SHARED` on anonymous memory is accepted.** It differs from `MAP_PRIVATE` only across a
+   `fork`, and there is none — `fork` is not in the reachable set and there is no process surface to
+   build one on. Refusing it would be an over-correction that fails a correct program, which is what
+   mutation row `guestmem-B1` exists for.
+
+A guest `mmap` is `CommitPolicy::Lazy`, so the demand pager stays the heap seam (D10: never commit
+speculatively). MEASURED, n=1 per side and structural rather than statistical: a 16 MiB guest `mmap`
+adds 16 MiB to `SpaceStats::mapped` and **zero** to `SpaceStats::committed`, and one guest store then
+adds exactly one 64 KiB granule.
+
+### Verification
+
+* `cargo test --workspace --release`: **959 passed, 0 failed, 12 ignored**, from 926.
+* `tools/mutate.py`: **155 → 175 rows**, twenty new, **20/20 caught** after one MISS was closed.
+* Clippy clean on `--all-targets`, `cargo doc` clean, `cargo tree -p omni-bionic -e normal` still one
+  line (D19).
+
+**The MISS is the finding worth keeping.** `guestmem-A1` — removing the code invalidation from
+`munmap`/`mprotect` — came back NOT CAUGHT. The test was structurally incapable of seeing it: it
+took a fresh guest thread for each step through the `value_of` helper, and the translating backend's
+code cache is **per context** (D5: unshared per-thread code caches), so every step translated afresh
+and the test could not tell an invalidated cache from an empty one. One context across the whole
+sequence — map, write, protect, call, unmap, remap, write, protect, call — and the row is caught. A
+test that runs the code and cannot fail is the thing Global Constraint 13 is about, and the mutation
+harness is the only thing that found it.
+
+### Two open items carried forward
+
+* `sizeof(FILE) = 152` and `sizeof(struct dl_phdr_info) = 64` are both derived from bionic's headers
+  and **not verified against an NDK**, which this machine does not have. Both are stated where they
+  are used, both are safe for the reasons above, and the first must be confirmed by whichever phase
+  first reads a field out of a `FILE`.
+* `ReentrantCall::invalidate_code` reaches one context. The thread-lifecycle phase is where a
+  registry of live contexts would go.
+
+**Cost if wrong.** The data objects' contents are one function and are cheap to change. The refusals
+are cheap to turn into implementations when the surface exists. The one expensive thing to get wrong
+is `FILE_BYTES`, and it is expensive only from the phase that first interprets a `FILE` — which is
+why the obligation is recorded in the constant rather than in a report.
