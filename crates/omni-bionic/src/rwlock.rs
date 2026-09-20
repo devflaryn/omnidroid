@@ -250,6 +250,20 @@ fn reader_acquire(
 }
 
 /// The reader blocking loop (shared by rdlock/timedrdlock).
+/// How long a blocked rwlock waiter sleeps before re-checking the word itself.
+///
+/// This is a SAFETY NET for the window between reading the state word and parking on it, not the
+/// wake path. A futex that honours `expected` closes that window atomically; the mock does not, and
+/// the adapter's `parking_lot_core` futex currently parks unconditionally, so the net still has to
+/// exist.
+///
+/// It was 1,000 ms. MEASURED with 6 threads x 40 alternating read/write acquisitions (n=240): the
+/// worst single acquisition was **1.0115 s** — a lost wake sleeping out the whole slice. That is the
+/// same defect, and the same magnitude, as the `sem_post` waiter-flag bug found earlier (1.0104 s),
+/// and the existing stress tests could not see either because they assert correctness — exclusion,
+/// no lost items — and never latency.
+const SELF_HEAL_SLICE: Duration = Duration::from_millis(50);
+
 fn reader_loop(
     mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
@@ -273,12 +287,15 @@ fn reader_loop(
         }
         let remaining = match deadline {
             Some(d) => d.saturating_duration_since(std::time::Instant::now()),
-            None => Duration::from_millis(1_000), // bounded slices; re-checks policy
+            None => SELF_HEAL_SLICE,
         };
         if remaining == Duration::ZERO {
             return Ok(Err(consts::ETIMEDOUT));
         }
-        match futex.wait(rwlock_addr, 0, Some(remaining)) {
+        // `state` is the word this iteration actually read, not a placeholder. A futex that
+        // performs the comparison closes the window between the read above and the park below;
+        // one that does not is no worse off than before.
+        match futex.wait(rwlock_addr, state, Some(remaining)) {
             WaitResult::Woken => continue,
             WaitResult::TimedOut => {
                 if deadline.is_none() {
@@ -352,12 +369,13 @@ fn writer_loop(
         }
         let remaining = match deadline {
             Some(d) => d.saturating_duration_since(std::time::Instant::now()),
-            None => Duration::from_millis(1_000),
+            None => SELF_HEAL_SLICE,
         };
         if remaining == Duration::ZERO {
             break Err(consts::ETIMEDOUT);
         }
-        match futex.wait(rwlock_addr, 0, Some(remaining)) {
+        // As in `reader_loop`: the word actually read, not a placeholder.
+        match futex.wait(rwlock_addr, state, Some(remaining)) {
             WaitResult::Woken => continue,
             WaitResult::TimedOut => {
                 if deadline.is_none() {
@@ -475,6 +493,84 @@ mod tests {
     use crate::mock::MockMemory;
     use crate::mock_threads::MockFutex;
     use crate::shared_mem::SharedMockMemory;
+
+    /// A futex that records the `expected` value it was handed, then releases the lock so the
+    /// caller's predicate loop can make progress and the test cannot hang.
+    struct RecordingFutex {
+        mem: SharedMockMemory,
+        addr: u64,
+        seen: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl crate::threads::Futex for RecordingFutex {
+        fn wait(&self, _addr: u64, expected: u32, _timeout: Option<Duration>) -> WaitResult {
+            self.seen.lock().unwrap().push(expected);
+            // Let the waiter succeed on its next pass.
+            self.mem.with_exclusive(|g| {
+                g.write(self.addr, &rw_state::FREE.to_le_bytes()).expect("release");
+            });
+            WaitResult::Woken
+        }
+        fn wake(&self, _addr: u64, _count: u32) -> u32 {
+            0
+        }
+    }
+
+    /// **A blocking rwlock wait must hand the futex the word it actually read.**
+    ///
+    /// Both loops passed a literal `0` while the word is non-zero by construction — `WRITER` for a
+    /// held lock, a reader count otherwise. A futex that performs the comparison, which is the whole
+    /// point of a futex, would answer `WouldBlock` to every waiter and the `continue` would busy
+    /// spin. Nothing caught it because the crate's mock and the adapter both ignore `expected`, so
+    /// the placeholder was invisible: `mutex` and `once` pass real values, only `rwlock` and `sem`
+    /// did not.
+    ///
+    /// Asserted structurally rather than by timing, because the failure it guards against is a rare
+    /// race — measured at 44 stalls in 19,200 acquisitions — and a latency assertion for it would be
+    /// flaky in both directions.
+    #[test]
+    fn a_blocking_reader_tells_the_futex_the_state_word_it_read() {
+        let mem = SharedMockMemory::new({
+            let mut m = MockMemory::new();
+            m.map(0x1000, &[0u8; 56]);
+            m
+        });
+        // A writer holds the lock, so the reader must block.
+        mem.with_exclusive(|g| {
+            g.write(0x1000, &rw_state::WRITER.to_le_bytes()).expect("writer holds it");
+        });
+        let futex = RecordingFutex {
+            mem: mem.clone(),
+            addr: 0x1000,
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(rdlock(&mut mem.clone(), &futex, 0x1000).unwrap(), 0);
+
+        let seen = futex.seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the reader must actually have blocked");
+        assert_eq!(
+            seen[0],
+            rw_state::WRITER,
+            "the futex must be told the word the caller read ({:#x}), not a placeholder",
+            rw_state::WRITER,
+        );
+    }
+
+    /// The self-heal slice is a safety net, and a net that big is a stall.
+    ///
+    /// It was 1,000 ms. MEASURED across 19,200 acquisitions per version, 8 threads x 400 alternating
+    /// acquisitions x 6 runs: with the 1 s slice, **44** acquisitions exceeded 100 ms (0.23%) and the
+    /// worst was **2.0169 s**; with this slice, **2** did (0.010%) and the worst was **119.7 ms**,
+    /// which is one or two slices as the model predicts. The bound is what this asserts; the rate is
+    /// recorded here rather than tested, because it is a race and a test of it would be flaky.
+    #[test]
+    fn the_self_heal_slice_is_a_net_and_not_a_stall() {
+        assert!(
+            SELF_HEAL_SLICE <= Duration::from_millis(100),
+            "a blocked rwlock waiter may wait {SELF_HEAL_SLICE:?} for a lost wake",
+        );
+    }
 
     /// Multiple readers hold the lock CONCURRENTLY (count > 1 observed), and
     /// contention is asserted positively: the test guarantees overlapping

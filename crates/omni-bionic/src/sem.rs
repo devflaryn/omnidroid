@@ -123,7 +123,12 @@ pub fn wait(
         // `post`, a blocked waiter is woken directly. The slice is short because a
         // real futex checks the value atomically with the block and this mock cannot,
         // so the residual registration race must cost milliseconds, not a second.
-        match futex.wait(sem_addr, 0, Some(SELF_HEAL_SLICE)) {
+        // The word this thread expects to still be parked on: the value it read with the waiter
+        // flag set. A futex that performs the comparison closes the window between the CAS above
+        // and the park below; one that ignores it is no worse off. `mutex` and `once` already pass
+        // real values here -- only `rwlock` and this file passed a placeholder `0`, which the word
+        // can never be at this point, because the waiter flag has just been set.
+        match futex.wait(sem_addr, word | sem_bits::WAITERS, Some(SELF_HEAL_SLICE)) {
             WaitResult::Woken => continue,
             WaitResult::TimedOut => continue,
             WaitResult::WouldBlock => continue,
@@ -181,7 +186,8 @@ pub fn timedwait(
             let _ = mem.cas_u32(sem_addr, w, w & !sem_bits::WAITERS);
             return errno_result(mem, consts::ETIMEDOUT);
         }
-        match futex.wait(sem_addr, 0, Some(remaining)) {
+        // As in `wait`: the word read, with the waiter flag set, never a placeholder.
+        match futex.wait(sem_addr, word | sem_bits::WAITERS, Some(remaining)) {
             WaitResult::Woken => continue,
             WaitResult::TimedOut => {
                 let w = read_word(mem, sem_addr)?;

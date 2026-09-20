@@ -66,6 +66,7 @@ BIONIC_WIDE = "crates/omni-bionic/src/wide.rs"
 BIONIC_SEM = "crates/omni-bionic/src/sem.rs"
 BIONIC_MUTEX = "crates/omni-bionic/src/mutex.rs"
 BIONIC_NUMERICS = "crates/omni-bionic/src/numerics.rs"
+BIONIC_RWLOCK = "crates/omni-bionic/src/rwlock.rs"
 BIONIC_PRINTF = "crates/omni-bionic/src/printf.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
@@ -1531,6 +1532,36 @@ MUTATIONS = [
                 Owned::Str(read_latin1(view.blaming(argument), pointer, argument)?)""",
      ANDROID),
 
+
+    # ---- the rwlock's futex contract ------------------------------------------------------------
+    # Both loops used to hand the futex a literal 0 while the word is non-zero by construction. The
+    # crate's mock and the adapter both ignore `expected`, so the placeholder was invisible --
+    # `mutex` and `once` pass real values, only `rwlock` and `sem` did not. A futex that DOES compare
+    # would answer WouldBlock to every waiter and the `continue` would busy spin.
+    ("bionic-A11", "A",
+     "a blocking reader hands the futex a placeholder instead of the word it read",
+     BIONIC_RWLOCK,
+     """        match futex.wait(rwlock_addr, state, Some(remaining)) {
+            WaitResult::Woken => continue,
+            WaitResult::TimedOut => {
+                if deadline.is_none() {
+                    continue; // protocol re-check (no lost wake under the policy)
+                }""",
+     """        match futex.wait(rwlock_addr, 0, Some(remaining)) {
+            WaitResult::Woken => continue,
+            WaitResult::TimedOut => {
+                if deadline.is_none() {
+                    continue; // protocol re-check (no lost wake under the policy)
+                }""",
+     BIONIC),
+
+    # The over-correction is the ORIGINAL value: a net so wide it is itself the stall.
+    ("bionic-B2", "B",
+     "the self-heal slice widened back to a second, so a lost wake is a one-second stall",
+     BIONIC_RWLOCK,
+     """const SELF_HEAL_SLICE: Duration = Duration::from_millis(50);""",
+     """const SELF_HEAL_SLICE: Duration = Duration::from_millis(1_000);""",
+     BIONIC),
 ]
 
 
