@@ -1454,3 +1454,135 @@ is downward, so nothing about D-record's "strictly downward" rule has to change 
 thunk boundary and needs both, so it belongs in `omni-android` — that is where the boundary is, and it
 is the crate §2 already names for the compatibility layer.
 
+---
+
+## D20 — The bionic adapter's shape, and a count that was wrong by nine in the convenient direction
+
+D19 decided that `omni-bionic` stays a zero-dependency crate and that the **adapter** binding it to
+the thunk boundary belongs in `omni-android`. This is that adapter, built in M3 task 3 phase 1.
+
+### The count first, because it was wrong
+
+HANDOFF said **"of the 188 reachable imports, 88 are already implemented in `omni-bionic`"**, with
+the method stated as "a symbol counts as implemented when a doc comment naming it sits above a
+`pub fn`", and with a warning that a naive grep over-counts because `pthread_sigmask` appears in a
+comment that *excludes* it.
+
+Re-measured by running that method rather than approximating it:
+
+| method | count |
+|---|---|
+| any mention of the symbol anywhere in `crates/omni-bionic/src/**.rs` | **89** |
+| the same, minus the one known excluding comment (`pthread_sigmask`) — **how 88 was produced** | 88 |
+| a doc comment naming the symbol directly above a `pub fn` — **the documented method, run** | **82** |
+| the same, minus five where the "symbol" is an ordinary English word in unrelated prose | **77** |
+| plus two implemented under a name that does not spell the C symbol | **79** |
+
+The five prose false positives are `abort`, `access`, `clock`, `read` and `time`: each matched a doc
+comment above a `pub fn` that has nothing to do with it (`access` alone matched five different
+functions' prose). The two under-counts are `strerror`, which is `string::strerror_message` plus an
+adapter-supplied buffer, and `__vsnprintf_chk`, which is `printf::format` plus the boundary's
+`va_list` walk — the same shape as `pthread_cond_timedwait`, which HANDOFF already records as
+implemented-but-unspelled.
+
+**79, not 88.** The error is nine symbols and it makes the remaining work look smaller, which is the
+direction this project has been wrong in before (D5's exclusive-monitor miscount, twice). The
+documented method is itself the weak link: matching a symbol name inside prose is not distinguishable
+from matching a declaration, and no mechanical rule will be, which is why the adapter now carries a
+**test** that parses `init-reachable-imports.txt` and asserts every bound symbol is in it.
+
+### What phase 1 binds
+
+**86 of the 188**, asserted exactly by `the_bound_count_is_exactly_what_this_phase_claims`:
+
+| | count | what |
+|---|---|---|
+| serviced | **81** | 79 backed by `omni-bionic`, plus `__errno` and `vsnprintf` which the adapter composes |
+| refused by name | **5** | `fprintf`, `vfprintf`, `vasprintf`, `sscanf`, `fscanf` |
+| left `Unbound` | 102 | files, clocks, process info, sockets, logging, thread lifecycle, `dl*`, the data symbols |
+
+84 are serviced **inside** the run loop; two — `pthread_once` and `qsort` — are on the exit path,
+because both call guest code and D18 makes that a type property rather than a rule.
+
+The five refusals are **bound rather than left `Unbound`** deliberately. `Unbound` says "nothing
+implements this"; a refusal says *which missing piece*, and three thousand initializers deep that is
+the difference between a lead and a shrug. `fprintf` names the guest `FILE *` it was handed and says
+`omni-platform` is virtual memory and faults only; `vasprintf` says the result must come from the
+guest's heap and that `libroblox.so` imports no allocator; `sscanf` says there is no scanning engine
+and that every partial answer would write a wrong value through the guest's output pointers.
+
+### Three things the adapter had to decide
+
+**1. A handler is a bare `fn`, so the per-instance state lives in a thread-local.** `ImportCall`
+carries no user data. A process-wide `static` would be wrong rather than merely ugly: the runtime is
+designed for three concurrent guest instances (D10's measured ~50 MiB for three), and one static
+would give them one `pthread_key` table and one mutex owner table. So `Bionic` is per-instance and a
+caller holds an `Activation` across `Boundary::run`. A handler that finds none returns
+`AbiError::BionicNotActive` naming the symbol; it does **not** construct a default, because a
+per-call default would give two guest threads their own private copy of the same mutex, and two
+threads that each believe they hold it is the failure no later test can see.
+
+**2. `errno` is guest-visible storage, so the adapter maps an arena — before any CPU exists.**
+`__errno()` returns a pointer the guest dereferences and `strerror` returns a pointer to a per-thread
+buffer, so both need memory the guest can read. One 17 KiB mapping, one 272-byte block per thread, 64
+blocks, and a 65th thread is a refusal rather than two threads sharing an `errno` slot. The mapping
+happens in `Bionic::new`. That is **task 2 review F9's constraint**: `ImportCall::mem()` reaches the
+whole `GuestSpace`, so a handler *could* map while generated code is live, and nothing in this phase
+does.
+
+**3. The futex ignores `expected`, and that is measured rather than convenient.** Linux's
+`FUTEX_WAIT` compares `*addr` with `expected` atomically with the decision to block. This one does
+not, because **`omni-bionic`'s own callers do not all pass a meaningful `expected`**: `mutex::lock`
+passes `LOCKED_WITH_WAITERS`, which is right, but `rwlock`'s reader and writer waits both pass `0`
+(`rwlock.rs:281`, `rwlock.rs:360`) while the word they wait on is, by construction, not zero — a
+rwlock with waiters is held. A futex honouring `expected` would return `WouldBlock` to every rwlock
+waiter and the caller's `continue` would turn blocking contention into a busy spin.
+
+**Recorded as a finding about `omni-bionic`, not patched there.** Those constants are in a reviewed
+crate with its own mutation harness and changing them changes what `wait` means for every caller at
+once. The lost-wake window is closed the way that crate's callers already close it: every waiter
+re-checks its predicate after every return, and every `wake` is issued after the state change the
+waiter will observe. The implementation is `parking_lot_core`'s parking lot — a wait queue keyed by
+an integer, which is what a futex is — rather than a hand-rolled `HashMap<u64, Condvar>`, because the
+registration/sleep window is exactly where the one defect already found in this layer (`sem_post`
+consuming the waiter flag, **1.0104 s** measured) lived.
+
+### A Critical defect this work reached, in code that had never seen guest input
+
+`printf::emit_padded` pads with `repeat_n(' ', width - body.len())`. A width is guest-controlled —
+`%999999999d` in the format string, or a `*` width taken from an argument — and the digits were
+accumulated without saturating, so thirty nines produced `usize::MAX` and the pad became an
+allocation. Global Constraint 11 calls an abort reachable from untrusted input Critical.
+
+It had never been reachable: nothing had ever handed that engine a guest format string, and the
+adapter is the first thing that does. Two bounds now, both typed refusals: `MAX_FIELD_WIDTH` (64 KiB,
+the same number and the same reasoning as the boundary's `GuestMem::STRING_LIMIT`) per conversion,
+checked **after** the `*` arguments are fetched because no scan of the format string can see one; and
+`MAX_OUTPUT` (1 MiB) per call, because capping one field leaves a format string free to repeat a wide
+conversion. Peak allocation is therefore bounded at `MAX_OUTPUT + MAX_FIELD_WIDTH`, and the test
+asserts the output really stopped near the cap rather than being built and then rejected.
+
+### One walk that is bounded only by the address space, stated rather than fixed
+
+`omni-bionic`'s `strlen` reads one byte at a time until it finds a NUL or faults, exactly as the real
+one does. The first attempt at a hostile test for it **walked out of the data region into the
+adjacent read-only page and returned 4096** — correct behaviour, and the reason the test now maps an
+island with free space after it.
+
+The consequence: a guest that passes an unterminated pointer into a large mapped region makes one
+handler scan that whole region, one `admit` per byte. It terminates and it cannot abort, so it is not
+Critical, but it is unbounded work the guest chooses. Not capped, because a cap would give a wrong
+answer for a legitimately long string and bionic's own `strlen` has none. The bounded forms exist and
+are used where they can be: `__strlen_chk` takes the object size, and `GuestMem::cstr` — which the
+whole `printf` family goes through — carries the boundary's 64 KiB `STRING_LIMIT`.
+
+### What is deliberately not decided here
+
+Where the OS-dependent remainder goes. Files, directories, clocks, process information, sockets,
+logging, thread lifecycle and `dl*` all need surface `omni-platform` does not have, and the plan's
+guidance is that adding it comes with the Linux and macOS signatures as honest `unsupported` returns
+at the same time. This phase extended `omni-platform` not at all.
+
+**Cost if wrong.** The thread-local is the one piece that would be expensive to change, because every
+handler reads it. It is one function (`bionic::active`) and one type, so a move to a
+`ThunkContext`-style user-data channel — if the boundary ever grows one — is mechanical.

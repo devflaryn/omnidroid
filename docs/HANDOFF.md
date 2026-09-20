@@ -27,7 +27,8 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
-**877 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-20 — was 608
+**924 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was 877
+before M3 task 3 phase 1, and 608
 before `omni-bionic` existed, so the two are not comparable). Clippy clean on
 `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
@@ -39,7 +40,7 @@ gate that refuses to run against a modified tree:
 
 | Harness | Rows |
 |---|---|
-| `tools/mutate.py` (workspace) | **137** |
+| `tools/mutate.py` (workspace) | **153** |
 | `crates/dynarmic-sys/tools/mutate_shim.py` | 23 |
 | `crates/omni-elf/tools/mutate_loader.py` | 18 |
 
@@ -114,7 +115,11 @@ Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-pl
   ways, the variadic rules and a guest `va_list` walk, checked guest memory, the symbol table, and
   host→guest re-entry. **No symbol is implemented** — all 565 slots are `Unbound` and name themselves
   when called. Tests went 496 → 608, mutation **89 → 118** rows (29 new), all caught.
-- Task 3 (the bionic subset) — not started. Scope is fixed at **170 thunk functions + 18 data objects**.
+- **Task 3 (the bionic subset) — phase 1 complete**, commits `fd3b6f4`..`b9cdf69`. The adapter, 86
+  of the 188 reachable imports bound (81 serviced, 5 refused by name), the `printf` family, 37 tests
+  against real translated ARM64 code, mutation **137 → 153** (16 new, 16/16 caught, plus one stale
+  pre-existing row repaired). Durable record is **D20**. Phases 2 and 3 remain; scope for the whole
+  task is **170 thunk functions + 18 data objects**.
 - Task 4 (all 3,594 initializers, the M3 gate) — not started.
 
 ### What Task 1 established
@@ -228,17 +233,19 @@ two mappings at adjacent addresses: contiguous addresses are not the same mappin
 Task 3 is "the bionic subset", scoped at **170 thunk functions + 18 data objects** from the 188
 statically-reachable imports. Measuring what already exists changes how it should be split.
 
-**Of the 188 reachable imports, 88 are already implemented in `omni-bionic` and 100 are not.**
-(Method: a symbol counts as implemented when a doc comment naming it sits above a `pub fn`; a comment
-that *excludes* it does not count. The naive grep over-counted — it scored `pthread_sigmask` as
-present because it matched the comment excluding it.)
+**CORRECTED — it is 79, not 88.** The method was stated but not run: 88 is the naive any-mention
+grep (89) minus the one known excluding comment. Running the stated method gives 82, and five of
+those are ordinary English words matching unrelated prose (`abort`, `access`, `clock`, `read`,
+`time`), leaving 77; two more are implemented under a name that does not spell the C symbol
+(`strerror`, `__vsnprintf_chk`), giving **79**. The error is nine symbols and it makes the remaining
+work look smaller. Full table and method in **D20**.
 
 The 100 do **not** form one job. They split by what they depend on:
 
 | Group | Needs | Blocked? |
 |---|---|---|
-| Wiring the 88 that exist onto the boundary | Nothing new — `omni-bionic` traits over `GuestMem` | **No** |
-| `printf` family (`fprintf`, `vfprintf`, `vsnprintf`, `vasprintf`, `sscanf`, `fscanf`, `__vsnprintf_chk`) | The boundary's `VarArgs`/`va_list` walk, already built | **No** |
+| ~~Wiring the 79 that exist onto the boundary~~ | **DONE** — phase 1, D20 | — |
+| ~~`printf` family~~ | **DONE** — three implemented, five refused by name (D20) | — |
 | Guest memory (`mmap`, `munmap`, `mprotect`, `madvise`, `mlock`) | `omni-mem`, which has them | **No** |
 | `dl*` (`dl_iterate_phdr`, `dlopen`, `dlsym`, `dlclose`, `dlerror`) | `omni-elf`'s loader state | **No** |
 | ~19 data symbols (`AMEDIAFORMAT_KEY_*`, `__sF`, `environ`, `stdin`/`stdout`/`stderr`, `in6addr_*`, `__stack_chk_guard`) | Placement, not code | **No** |
@@ -258,15 +265,39 @@ those targets — that was ruled against deliberately.
 
 **Suggested order**, unblocked work first so the seam is proved end to end before the OS surface grows:
 
-1. The adapter skeleton + the 88 that already exist + the `printf` family. This is item 5's "write the
-   adapter" and it proves the whole seam.
-2. The data symbols, `dl*`, and the guest-memory group.
+1. ~~The adapter skeleton + the ones that already exist + the `printf` family.~~ **Done** (D20): 86
+   of the 188 bound, 81 serviced and 5 refused by name; 37 new tests; 16 new mutation rows, 16/16
+   caught. The seam is proved end to end against real translated ARM64 code.
+2. **Next:** the data symbols, `dl*`, and the guest-memory group.
 3. Extend `omni-platform`, then the OS-dependent remainder.
 
 ## Next action
 
-**Start M3 Task 3, the bionic subset** — 170 thunk functions + 18 data objects. Everything that was
-blocking it is cleared:
+**M3 Task 3 phase 2: the data symbols, `dl*`, and the guest-memory group.** Phase 1 is complete and
+committed (D20): the adapter exists, 86 of the 188 reachable imports are bound, and the seam is
+proved end to end. What phase 2 needs and phase 1 deliberately did not touch:
+
+- **The ~19 data symbols** (`AMEDIAFORMAT_KEY_*`, `__sF`, `environ`, `stdin`/`stdout`/`stderr`,
+  `in6addr_*`, `__stack_chk_guard`). `BoundaryBuilder::declare_data` takes a size and there is no
+  default, on purpose: `__sF` is three `FILE`s reached as `__sF + addend` and a pointer-sized cell
+  would silently be somebody else's object.
+- **`dl_iterate_phdr`** — faithful, not a stub. The C++ runtime is statically linked, so the in-guest
+  unwinder walks 11.5 MB of `.eh_frame` through it and C++ exceptions break without it. It calls a
+  guest callback, so it is `bind_reentrant`, like `pthread_once` and `qsort`.
+- **`mmap`/`munmap`/`mprotect`/`madvise`/`mlock`** — `omni-mem` has all of them, but **task 2 review
+  F9 applies directly**: `ImportCall::mem()` reaches the whole `GuestSpace`, so these must be
+  `bind_reentrant` and nothing in the types says so. Phase 1 maps guest memory exactly once, in
+  `Bionic::new`, before any CPU exists.
+
+Two open items phase 1 found and left:
+
+- **`omni-bionic`'s `rwlock` passes a placeholder `expected` of `0` to `futex.wait`** while the word
+  it waits on is non-zero by construction. The adapter's futex therefore ignores `expected`, like the
+  crate's own mock. A futex that honoured it would busy-spin every rwlock waiter. D20 has the detail.
+- **`strerror`'s message table holds ten errno codes**, so `ETIMEDOUT` and most of `errno.rs` answer
+  `Unknown error`. Correct fallback shape, incomplete table.
+
+Everything that was blocking Task 3 was already cleared before phase 1:
 
 | Blocker | State |
 |---|---|
@@ -289,15 +320,13 @@ Carry into the dispatch as before: D17's in-loop dispatch decision, that the dis
 guard already exists and must not be moved or removed, and that an unbound symbol must fail with a
 typed error naming the symbol and guest address.
 
-Then: decide whether `omni-bionic` folds into `omni-android` (ARCHITECTURE §2 puts bionic there; the
-separate crate was only for isolation during review), write the adapter binding the bionic layer to
-the thunk boundary, and run M3's gate — all 3,594 static initializers complete, **verified by reading
-back state they actually wrote**, not by a counter reaching 3,594.
-
-Then: decide whether `omni-bionic` folds into `omni-android` (ARCHITECTURE §2 puts bionic there; the
-separate crate was only for isolation during review), write the adapter binding the bionic layer to
-the thunk boundary, and run M3's gate — all 3,594 static initializers complete, **verified by reading
-back state they actually wrote**, not by a counter reaching 3,594.
+Both halves of that sentence are now settled, and the paragraph was duplicated verbatim here —
+replaced rather than deleted so the answers are on the record. **`omni-bionic` stays a separate
+crate** (D19: its zero-dependency property is what makes "no OS access" checkable by `cargo tree`
+rather than a rule a reviewer has to notice), and **the adapter is written** (D20), in
+`omni-android` where D19 said it belongs. What remains of Task 3 is phases 2 and 3; after them comes
+M3's gate — all 3,594 static initializers complete, **verified by reading back state they actually
+wrote**, not by a counter reaching 3,594.
 
 **The `omni-bionic` mutation harness now exists** (`90693bf`): 11 rows, 11/11 caught. Its first run
 caught 9 — the two misses were the errno constants, which had no test at all, and that is closed.
@@ -392,6 +421,7 @@ Each of these was recorded, then disproved by someone other than its author. Sev
 | `size/512` page tables applies to section views | **Retracted as unverified**, not softened. D10 measured fully-touched anonymous commit |
 | D16's 7x is an upper bound because real code has longer blocks | Roblox's blocks are **4.30 instructions** — the benchmark's length. 7x is the expected cost |
 | Losing identity mapping costs 13.2x | **30-49x** (n=31). 13.2x measured a bare stub and is a floor |
+| 88 of the 188 reachable imports are implemented in `omni-bionic` | **79.** 88 was the naive any-mention grep minus one known exclusion; the stated method, run, gives 82, of which five are English words in unrelated prose. Wrong by nine, in the direction that makes the remaining work look smaller (D20) |
 | `malloc` is the host allocator, so the guest heap is the host heap | `libroblox.so` imports **no allocator at all**; the seam is guest `mmap` through the demand pager |
 | D5's warm figure is an entry ceiling excluding the exit | It was always entry-**and**-exit. This error was the controller's, and it propagated into a report and three code comments |
 | Thunk design ratio is 7.6x | **3x** loader-shaped. 7.6x holds the PLT stub out |
