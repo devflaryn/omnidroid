@@ -1261,3 +1261,817 @@ fn rand_produces_the_documented_lcg_sequence_which_is_not_bionics() {
     );
     assert!(first >= 0 && second >= 0, "rand returns [0, RAND_MAX], never a negative int");
 }
+
+// ================================================= phase 2: data symbols, dl*, guest memory
+
+use omni_android::bionic::{GuestProcess, DATA_OBJECTS, DL_PHDR_INFO_BYTES, FILE_BYTES};
+use omni_elf::loader::DlPhdrInfo;
+
+/// One synthetic loaded image, as a host would describe a real one.
+struct Image {
+    name: &'static str,
+    addr: omni_cpu::GuestAddr,
+    phdr: omni_cpu::GuestAddr,
+    phnum: u16,
+}
+
+/// A fixture with the handlers bound **and** the eighteen data objects placed, plus whatever
+/// images the test wants `dl_iterate_phdr` to enumerate.
+///
+/// The stack canary comes from the backend's own TLS arena rather than from a number this file
+/// chose, which is the whole point of `__stack_chk_guard`: a function that loads the global must
+/// see what `[TPIDR_EL0, #0x28]` holds (D13).
+fn fixture_with(images: &[Image]) -> Fixture {
+    let guest = Guest::new();
+    let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
+    let builder = guest.boundary(256);
+    bionic.bind_into(&builder).expect("bind every handler");
+    let stack_guard = guest.backend.tls().stack_guard();
+    bionic
+        .declare_data_into(&builder, &GuestProcess { stack_guard })
+        .expect("declare and fill the eighteen data objects");
+    for image in images {
+        bionic
+            .register_image(&DlPhdrInfo {
+                name: image.name.to_string(),
+                addr: image.addr,
+                phdr: image.phdr,
+                phnum: image.phnum,
+            })
+            .expect("register an image");
+    }
+    let boundary = builder.finish();
+    Fixture { guest, bionic, boundary }
+}
+
+/// Assemble a program with `X21` holding the caller's return address, and run it.
+fn program(f: &Fixture, build: impl FnOnce(&mut Asm)) -> omni_cpu::GuestAddr {
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    build(&mut asm);
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    entry
+}
+
+fn run_program(f: &Fixture, entry: omni_cpu::GuestAddr) -> Result<ExitReason, AbiError> {
+    let mut cpu = f.guest.thread(&f.boundary);
+    f.run(&mut cpu, entry)
+}
+
+// ------------------------------------------------------------------ the data symbols
+
+/// **The eighteen are placed, sized and filled**, read back through the boundary's own memory.
+///
+/// Asserted on contents rather than on addresses, because an address proves only that
+/// `declare_data` was called and every one of these has a value guest code will act on.
+#[test]
+fn the_data_objects_hold_the_values_the_guest_will_read() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let guard = f.guest.backend.tls().stack_guard();
+
+    // `__stack_chk_guard` must be the canary D13 programmed, or a stack-protected function that
+    // loads the global form and one that loads `[TPIDR_EL0, #0x28]` disagree — and the second
+    // kind is 1,276 of `libroblox.so`'s 1,282 thread-pointer reads.
+    assert_ne!(guard, 0);
+    assert_eq!(f.guest.read_u64(f.thunk("__stack_chk_guard")), guard);
+
+    // `stdin`/`stdout`/`stderr` are `FILE *` into `__sF`, one `FILE` apart.
+    let sf = f.thunk("__sF");
+    for (index, symbol) in ["stdin", "stdout", "stderr"].into_iter().enumerate() {
+        assert_eq!(
+            f.guest.read_u64(f.thunk(symbol)) as usize,
+            sf + index * FILE_BYTES,
+            "`{symbol}` must point at __sF[{index}]"
+        );
+    }
+    // And the three do not overlap: the object is three `FILE`s wide.
+    let sf_object = DATA_OBJECTS.iter().find(|o| o.symbol == "__sF").expect("__sF");
+    assert_eq!(sf_object.len, 3 * FILE_BYTES);
+
+    // `environ` points at a vector whose first entry is the terminating null: an empty
+    // environment, which is a fact about this process rather than a placeholder. A null
+    // `environ` would be the wrong answer — POSIX-shaped code walks it without checking.
+    let vector = f.guest.read_u64(f.thunk("environ")) as usize;
+    assert_ne!(vector, 0, "environ itself must not be null");
+    assert_eq!(f.guest.read_u64(vector), 0, "the vector is one terminating null");
+
+    // `in6addr_any` is `::` and `in6addr_loopback` is `::1`.
+    let any = f.thunk("in6addr_any");
+    assert_eq!(f.guest.read_u64(any), 0);
+    assert_eq!(f.guest.read_u64(any + 8), 0);
+    let loopback = f.thunk("in6addr_loopback");
+    assert_eq!(f.guest.read_u64(loopback), 0);
+    assert_eq!(
+        f.guest.read_u64(loopback + 8).to_be(),
+        1,
+        "::1 is fifteen zero bytes and then a one, in network order"
+    );
+    assert_ne!(f.guest.read_u64(loopback + 8), f.guest.read_u64(any + 8));
+
+    // Every `AMEDIAFORMAT_KEY_*` points at a distinct non-empty string.
+    let mut keys = std::collections::BTreeSet::new();
+    for object in DATA_OBJECTS.iter().filter(|o| o.symbol.starts_with("AMEDIAFORMAT_KEY_")) {
+        let string = f.guest.read_u64(f.thunk(object.symbol)) as usize;
+        assert_ne!(string, 0, "`{}` must not be null: the engine strcmps it", object.symbol);
+        let text = f.read_cstring(string);
+        assert!(!text.is_empty(), "`{}` points at an empty string", object.symbol);
+        assert!(keys.insert(text.clone()), "two keys share {:?}", String::from_utf8_lossy(&text));
+    }
+    assert_eq!(keys.len(), 10);
+    assert_eq!(f.guest.read_u64(f.thunk("AMEDIAFORMAT_KEY_MIME")) as usize, {
+        let at = f.guest.read_u64(f.thunk("AMEDIAFORMAT_KEY_MIME")) as usize;
+        assert_eq!(f.read_cstring(at), b"mime");
+        at
+    });
+}
+
+/// A zero canary compares equal to a zeroed stack slot, so a guest stack overflow that wrote
+/// zeroes would pass every `__stack_chk_fail` check. `omni-cpu` refuses to *generate* one; this
+/// refuses to *store* one, and the two refusals have to agree or the global and the TLS copy
+/// diverge in the one case that matters.
+#[test]
+fn a_zero_stack_canary_is_refused_rather_than_stored() {
+    let _guard = serialized();
+    let guest = Guest::new();
+    let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
+    let builder = guest.boundary(256);
+    let error = bionic
+        .declare_data_into(&builder, &GuestProcess { stack_guard: 0 })
+        .expect_err("a zero canary must be refused");
+    assert_eq!(error.symbol(), Some("__stack_chk_guard"));
+    assert!(error.to_string().contains("zero"), "{error}");
+}
+
+/// **A data symbol that is *called* is still `DataSymbolCalled`.** The eighteen are addresses to
+/// load from; executing whatever `__sF` holds is the one response that must not happen, and now
+/// that the objects have contents there is something there to execute.
+#[test]
+fn calling_a_filled_data_symbol_is_still_refused_by_name() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    for symbol in ["__sF", "environ", "AMEDIAFORMAT_KEY_MIME"] {
+        let target = f.thunk(symbol);
+        // `BLR` rather than `BL`: the data area is nowhere near the code region and a `BL`
+        // displacement is +/-128 MB.
+        let entry = program(&f, |asm| {
+            asm.mov(9, target as u64);
+            asm.push(blr(9));
+        });
+        match run_program(&f, entry) {
+            Err(AbiError::DataSymbolCalled { symbol: named, address }) => {
+                assert_eq!(named, symbol);
+                assert_eq!(address, target);
+            }
+            other => panic!("`{symbol}`: {other:?}"),
+        }
+    }
+}
+
+// ------------------------------------------------------------------ dl_iterate_phdr
+
+/// Bytes of one record the guest callback writes out.
+const RECORD_BYTES: usize = 48;
+
+/// A guest `int (*)(struct dl_phdr_info *, size_t, void *)` that copies six fields of every
+/// object it is handed into a cursor the third argument points at, and returns `answer`.
+///
+/// **This is what makes the test about the struct layout rather than about the handler.** The
+/// callback reads `dlpi_addr` at `+0`, `dlpi_name` at `+8`, `dlpi_phdr` at `+16`, `dlpi_phnum` at
+/// `+24` and `dlpi_adds` at `+32` with real `LDR` instructions, exactly as a guest unwinder does.
+/// A handler that wrote the fields in the wrong order would put the name where the bias belongs
+/// and this would see it.
+fn dl_callback(guest: &Guest, answer: i64) -> omni_cpu::GuestAddr {
+    let entry = guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(ldr_imm(3, 2, 0)); // X3 = cursor
+    asm.push(str_imm(1, 3, 0)); // the `size` argument
+    asm.push(ldr_imm(4, 0, 0));
+    asm.push(str_imm(4, 3, 8)); // dlpi_addr
+    asm.push(ldr_imm(4, 0, 8));
+    asm.push(str_imm(4, 3, 16)); // dlpi_name
+    asm.push(ldr_imm(4, 0, 16));
+    asm.push(str_imm(4, 3, 24)); // dlpi_phdr
+    asm.push(ldr_w(4, 0, 24));
+    asm.push(str_imm(4, 3, 32)); // dlpi_phnum, zero-extended
+    asm.push(ldr_imm(4, 0, 32));
+    asm.push(str_imm(4, 3, 40)); // dlpi_adds
+    asm.push(add_imm(3, 3, RECORD_BYTES as u32));
+    asm.push(str_imm(3, 2, 0));
+    asm.mov(0, answer as u64);
+    asm.push(ret(30));
+    guest.load(asm.words())
+}
+
+/// `dl_iterate_phdr` enumerates every registered image, in registration order, with the fields
+/// where AArch64 bionic puts them.
+#[test]
+fn dl_iterate_phdr_enumerates_the_real_loaded_image() {
+    let _guard = serialized();
+    let images = [
+        Image { name: "libroblox.so", addr: 0x1234_0000, phdr: 0x1234_0040, phnum: 9 },
+        Image { name: "libzstd-jni.so", addr: 0x5000_0000, phdr: 0x5000_0040, phnum: 7 },
+    ];
+    let f = fixture_with(&images);
+
+    let cursor = f.guest.data + 0x400;
+    let records = f.guest.data + 0x800;
+    f.guest.write_u64(cursor, records as u64);
+    let callback = dl_callback(&f.guest, 0);
+
+    let returned = value_of(&f, "dl_iterate_phdr", |asm| {
+        asm.mov(0, callback as u64);
+        asm.mov(1, cursor as u64);
+    });
+    assert_eq!(returned, 0, "every callback returned zero, so the walk completes and returns zero");
+    assert_eq!(
+        f.guest.read_u64(cursor) as usize,
+        records + images.len() * RECORD_BYTES,
+        "the callback must have run once per registered image"
+    );
+
+    for (index, image) in images.iter().enumerate() {
+        let at = records + index * RECORD_BYTES;
+        assert_eq!(
+            f.guest.read_u64(at) as usize,
+            DL_PHDR_INFO_BYTES,
+            "the `size` argument is sizeof(struct dl_phdr_info)"
+        );
+        assert_eq!(f.guest.read_u64(at + 8) as usize, image.addr, "dlpi_addr is the load bias");
+        let name = f.guest.read_u64(at + 16) as usize;
+        assert_ne!(name, 0, "dlpi_name is a pointer the callback dereferences");
+        assert_eq!(f.read_cstring(name), image.name.as_bytes());
+        assert_eq!(f.guest.read_u64(at + 24) as usize, image.phdr, "dlpi_phdr");
+        assert_eq!(f.guest.read_u64(at + 32), u64::from(image.phnum), "dlpi_phnum");
+        assert_eq!(
+            f.guest.read_u64(at + 40),
+            images.len() as u64,
+            "dlpi_adds is how many objects have ever been added; nothing here can dlopen"
+        );
+    }
+    // The walk really left the run loop once per object plus once for the call itself.
+    assert!(f.boundary.crossings().guest_calls >= images.len() as u64);
+}
+
+/// A callback that answers non-zero stops the walk and its value is returned — which is the
+/// contract the unwinder relies on: it answers non-zero the moment it finds the object holding
+/// the address it is looking for.
+#[test]
+fn a_callback_that_answers_non_zero_stops_the_walk() {
+    let _guard = serialized();
+    let images = [
+        Image { name: "first.so", addr: 0x1000_0000, phdr: 0x1000_0040, phnum: 4 },
+        Image { name: "second.so", addr: 0x2000_0000, phdr: 0x2000_0040, phnum: 4 },
+        Image { name: "third.so", addr: 0x3000_0000, phdr: 0x3000_0040, phnum: 4 },
+    ];
+    let f = fixture_with(&images);
+    let cursor = f.guest.data + 0x400;
+    let records = f.guest.data + 0x800;
+    f.guest.write_u64(cursor, records as u64);
+    let callback = dl_callback(&f.guest, 7);
+
+    let returned = value_of(&f, "dl_iterate_phdr", |asm| {
+        asm.mov(0, callback as u64);
+        asm.mov(1, cursor as u64);
+    });
+    assert_eq!(returned as i64 as i32, 7, "the callback's own answer is returned");
+    assert_eq!(
+        f.guest.read_u64(cursor) as usize,
+        records + RECORD_BYTES,
+        "exactly one object was reported before the walk stopped"
+    );
+    assert_eq!(f.guest.read_u64(records + 8) as usize, images[0].addr, "and it was the first");
+}
+
+/// **The refusal that keeps `dl_iterate_phdr` from becoming a stub.**
+///
+/// Reporting a process with no objects is a *success*: the call returns zero, which is what it
+/// returns when every callback declined. The guest's statically-linked unwinder would then find
+/// no `.eh_frame` and every `throw` would fail to find a landing pad, thousands of initializers
+/// from here. So an adapter with nothing registered refuses and says what to call.
+#[test]
+fn dl_iterate_phdr_with_no_registered_image_refuses_rather_than_reporting_an_empty_process() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let callback = dl_callback(&f.guest, 0);
+    let cursor = f.guest.data + 0x400;
+    let error = refusal_of(&f, "dl_iterate_phdr", |asm| {
+        asm.mov(0, callback as u64);
+        asm.mov(1, cursor as u64);
+    });
+    assert_eq!(error.symbol(), Some("dl_iterate_phdr"));
+    let text = error.to_string();
+    assert!(text.contains("register_image"), "the refusal must say what to call: {text}");
+    assert!(text.contains("eh_frame"), "and why it matters: {text}");
+}
+
+/// Hostile: a null callback, and a callback pointing at memory nothing has mapped. Neither may
+/// panic, and the two are told apart — one is a refusal, the other is a stopped guest callback.
+#[test]
+fn a_hostile_dl_iterate_phdr_callback_is_a_typed_error_and_not_a_panic() {
+    let _guard = serialized();
+    let images = [Image { name: "only.so", addr: 0x1000_0000, phdr: 0x1000_0040, phnum: 4 }];
+    let f = fixture_with(&images);
+    let cursor = f.guest.data + 0x400;
+    f.guest.write_u64(cursor, (f.guest.data + 0x800) as u64);
+
+    let null = refusal_of(&f, "dl_iterate_phdr", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, cursor as u64);
+    });
+    assert!(matches!(null, AbiError::Refused { .. }), "{null:?}");
+    assert!(null.to_string().contains("0x0"), "{null}");
+
+    let wild = refusal_of(&f, "dl_iterate_phdr", |asm| {
+        asm.mov(0, f.guest.unmapped as u64);
+        asm.mov(1, cursor as u64);
+    });
+    assert!(
+        matches!(wild, AbiError::GuestCallbackStopped { .. }),
+        "an unmapped callback is the guest's own fault and is reported as one: {wild:?}"
+    );
+
+    // And a `data` pointer the callback will fault on is the callback's failure too, not ours.
+    // Assembled first: `call_one` fixes its own entry address before the setup closure runs, so a
+    // closure that loaded another program would move the code out from under its own branches.
+    let callback = dl_callback(&f.guest, 0);
+    let bad_data = refusal_of(&f, "dl_iterate_phdr", |asm| {
+        asm.mov(0, callback as u64);
+        asm.mov(1, f.guest.unmapped as u64);
+    });
+    assert!(matches!(bad_data, AbiError::GuestCallbackStopped { .. }), "{bad_data:?}");
+}
+
+// ------------------------------------------------------------------ dlopen and friends
+
+/// `dlopen`, `dlsym` and `dlclose` refuse **by name, quoting the guest's own argument**, and
+/// `dlerror` answers null.
+///
+/// A plausible handle is the worst outcome available here: the guest would `dlsym` it, store what
+/// came back, and call it thousands of initializers later. A refusal naming the library is a lead.
+#[test]
+fn the_dl_family_refuses_by_name_rather_than_issuing_a_handle_it_cannot_honour() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let path = f.cstring(f.guest.data + 0x100, b"libvulkan.so");
+    let wanted = f.cstring(f.guest.data + 0x180, b"vkGetInstanceProcAddr");
+
+    let open = refusal_of(&f, "dlopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, 2); // RTLD_NOW
+    });
+    assert_eq!(open.symbol(), Some("dlopen"));
+    assert!(open.to_string().contains("libvulkan.so"), "{open}");
+
+    let sym = refusal_of(&f, "dlsym", |asm| {
+        asm.mov(0, 0x1234);
+        asm.mov(1, wanted as u64);
+    });
+    assert_eq!(sym.symbol(), Some("dlsym"));
+    assert!(sym.to_string().contains("vkGetInstanceProcAddr"), "{sym}");
+    assert!(sym.to_string().contains("0x1234"), "{sym}");
+
+    let close = refusal_of(&f, "dlclose", |asm| {
+        asm.mov(0, 0x1234);
+    });
+    assert_eq!(close.symbol(), Some("dlclose"));
+
+    // `dlerror` is the one that answers, and null is the true answer: nothing above it can leave
+    // an error behind, because none of the three returns at all.
+    assert_eq!(value_of(&f, "dlerror", |_| {}), 0);
+}
+
+/// Hostile: `dlopen(NULL)`, an unterminated name, and a wild pointer. All three are refused and
+/// none of them is a panic — the refusal *describes* the bad pointer rather than replacing the
+/// useful message with a bad-pointer error.
+#[test]
+fn a_hostile_dlopen_argument_is_described_rather_than_crashing() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+
+    let null = refusal_of(&f, "dlopen", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 2);
+    });
+    assert!(null.to_string().contains("NULL"), "{null}");
+
+    let wild = refusal_of(&f, "dlopen", |asm| {
+        asm.mov(0, f.guest.unmapped as u64);
+        asm.mov(1, 2);
+    });
+    assert_eq!(wild.symbol(), Some("dlopen"), "still dlopen's refusal, not a bare bad pointer");
+    assert!(wild.to_string().contains("unreadable"), "{wild}");
+
+    // A string with no NUL anywhere in its region.
+    let island = f.guest.readonly;
+    let unterminated = refusal_of(&f, "dlsym", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, island as u64);
+    });
+    assert_eq!(unterminated.symbol(), Some("dlsym"));
+}
+
+// ------------------------------------------------------------------ the guest-memory group
+
+/// `PROT_READ | PROT_WRITE`.
+const PROT_RW: u64 = 3;
+/// `MAP_PRIVATE | MAP_ANONYMOUS`.
+const MAP_ANON_PRIVATE: u64 = 0x22;
+
+/// Call `mmap(addr, length, prot, flags, fd, offset)` from real guest code.
+fn guest_mmap(
+    f: &Fixture,
+    addr: u64,
+    length: u64,
+    prot: u64,
+    flags: u64,
+    fd: i64,
+    offset: u64,
+) -> u64 {
+    value_of(f, "mmap", |asm| {
+        asm.mov(0, addr);
+        asm.mov(1, length);
+        asm.mov(2, prot);
+        asm.mov(3, flags);
+        asm.mov(4, fd as u64);
+        asm.mov(5, offset);
+    })
+}
+
+/// The refusal form of [`guest_mmap`].
+fn guest_mmap_refusal(
+    f: &Fixture,
+    addr: u64,
+    length: u64,
+    prot: u64,
+    flags: u64,
+    fd: i64,
+) -> AbiError {
+    refusal_of(f, "mmap", |asm| {
+        asm.mov(0, addr);
+        asm.mov(1, length);
+        asm.mov(2, prot);
+        asm.mov(3, flags);
+        asm.mov(4, fd as u64);
+        asm.mov(5, 0);
+    })
+}
+
+/// **The heap seam.** The guest asks for anonymous memory, writes to it, and reads it back — all
+/// in translated ARM64, so the mapping the handler made is the one the demand pager serves.
+#[test]
+fn a_guest_mmap_returns_memory_the_guest_can_write_and_read_back() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 128 * 1024;
+    let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX, "MAP_FAILED");
+    assert_ne!(at, 0);
+    assert_eq!(at % f.guest.space.page_size() as u64, 0, "mmap returns page-aligned memory");
+
+    // Fresh anonymous memory reads as zero, which the allocator this feeds depends on.
+    let probe = f.guest.data + 0x400;
+    let entry = program(&f, |asm| {
+        asm.mov(9, at);
+        asm.mov(10, probe as u64);
+        asm.push(ldr_imm(11, 9, 0));
+        asm.push(str_imm(11, 10, 0)); // what was there before any write
+        asm.mov(11, 0x0BAD_F00D_DEAD_BEEF);
+        asm.push(str_imm(11, 9, 0));
+        asm.push(ldr_imm(12, 9, 0));
+        asm.push(str_imm(12, 10, 8));
+        // And the last page of the mapping, so the whole length is really there.
+        asm.mov(13, at + length - 8);
+        asm.push(str_imm(11, 13, 0));
+        asm.push(ldr_imm(14, 13, 0));
+        asm.push(str_imm(14, 10, 16));
+    });
+    let exit = run_program(&f, entry).expect("the guest must be able to use what mmap gave it");
+    assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    assert_eq!(f.guest.read_u64(probe), 0, "anonymous memory arrives zeroed");
+    assert_eq!(f.guest.read_u64(probe + 8), 0x0BAD_F00D_DEAD_BEEF);
+    assert_eq!(f.guest.read_u64(probe + 16), 0x0BAD_F00D_DEAD_BEEF, "the last page is mapped too");
+    // Mapped, not free. **Not** a length assertion: `region_at` reports the *entry*, and a lazily
+    // committed mapping is split at every granule it commits, so the entry at `at` is one 64 KiB
+    // granule rather than the whole 128 KiB. That is the shape the straddling-access fix records.
+    assert!(f.guest.space.region_at(at as usize).is_some_and(|r| !r.is_free()));
+}
+
+/// `munmap` really takes the memory away: the same guest instruction that worked before the call
+/// faults after it.
+#[test]
+fn munmap_takes_the_mapping_away_and_a_later_guest_access_faults() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX);
+
+    let code = value_of(&f, "munmap", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+    });
+    assert_eq!(code as i64 as i32, 0, "munmap succeeded");
+    assert!(f.guest.space.region_at(at as usize).is_none_or(|r| r.is_free()));
+
+    let entry = program(&f, |asm| {
+        asm.mov(9, at);
+        asm.push(ldr_imm(10, 9, 0));
+    });
+    let exit = run_program(&f, entry).expect("the run itself must not fail");
+    match exit {
+        ExitReason::MemoryFault { address, .. } => assert_eq!(address as u64, at),
+        other => panic!("reading unmapped memory must fault: {other:?}"),
+    }
+}
+
+/// `mprotect` really changes what the guest may do: a store that worked is refused after it.
+#[test]
+fn mprotect_drops_a_mapping_to_read_only_and_the_guest_store_faults() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX);
+
+    let write = program(&f, |asm| {
+        asm.mov(9, at);
+        asm.mov(10, 0x11);
+        asm.push(str_imm(10, 9, 0));
+    });
+    assert!(matches!(
+        run_program(&f, write).expect("writable"),
+        ExitReason::Returned { .. }
+    ));
+
+    let code = value_of(&f, "mprotect", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+        asm.mov(2, 1); // PROT_READ
+    });
+    assert_eq!(code as i64 as i32, 0);
+
+    let again = program(&f, |asm| {
+        asm.mov(9, at);
+        asm.mov(10, 0x22);
+        asm.push(str_imm(10, 9, 0));
+    });
+    match run_program(&f, again).expect("the run itself must not fail") {
+        ExitReason::MemoryFault { address, .. } => assert_eq!(address as u64, at),
+        other => panic!("a store to a read-only mapping must fault: {other:?}"),
+    }
+    // Reading still works, so the protection changed rather than the mapping disappearing.
+    let read = program(&f, |asm| {
+        asm.mov(9, at);
+        asm.push(ldr_imm(10, 9, 0));
+    });
+    assert!(matches!(run_program(&f, read).expect("readable"), ExitReason::Returned { .. }));
+}
+
+/// **Every `mmap` shape this layer will not carry out is a refusal, and none of them is
+/// `MAP_FAILED`.**
+///
+/// `MAP_FAILED` is the believable wrong answer: the guest's allocator handles it by trying
+/// something else, and the real failure would surface later as an allocation pattern nobody could
+/// explain.
+#[test]
+fn every_unimplementable_mmap_shape_is_refused_by_name() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let page = f.guest.space.page_size() as u64;
+
+    // A real file descriptor.
+    let file = guest_mmap_refusal(&f, 0, page, PROT_RW, MAP_PRIVATE_ONLY, 7);
+    assert_eq!(file.symbol(), Some("mmap"));
+    assert!(file.to_string().contains("file-backed"), "{file}");
+
+    // No MAP_ANONYMOUS, even with fd = -1.
+    let not_anon = guest_mmap_refusal(&f, 0, page, PROT_RW, MAP_PRIVATE_ONLY, -1);
+    assert!(not_anon.to_string().contains("file-backed"), "{not_anon}");
+
+    // MAP_FIXED, which Linux implements by destroying whatever is already there.
+    let fixed = guest_mmap_refusal(&f, 0x4000_0000, page, PROT_RW, MAP_ANON_PRIVATE | 0x10, -1);
+    assert!(fixed.to_string().contains("MAP_FIXED"), "{fixed}");
+    assert!(fixed.to_string().contains("NOREPLACE"), "{fixed}");
+
+    // A flag nobody implemented: MAP_GROWSDOWN.
+    let unknown = guest_mmap_refusal(&f, 0, page, PROT_RW, MAP_ANON_PRIVATE | 0x0100, -1);
+    assert!(unknown.to_string().contains("0x100"), "{unknown}");
+
+    // Write without read, and write with execute.
+    for prot in [2u64, 4, 6, 7] {
+        let error = guest_mmap_refusal(&f, 0, page, prot, MAP_ANON_PRIVATE, -1);
+        assert_eq!(error.symbol(), Some("mmap"), "prot {prot:#x}");
+        assert!(error.to_string().contains(&format!("{prot:#x}")), "{error}");
+    }
+}
+
+/// `MAP_PRIVATE` with no `MAP_ANONYMOUS`.
+const MAP_PRIVATE_ONLY: u64 = 0x02;
+
+/// A well-formed call that legitimately fails returns `MAP_FAILED` **and sets `errno`** — which is
+/// the contract, not a stub. The guest reads `errno` through `__errno`, exactly as it would.
+#[test]
+fn a_legitimate_mmap_failure_is_map_failed_with_errno_and_not_a_refusal() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let out = f.guest.data + 0x400;
+
+    // Length zero: EINVAL, which is what Linux answers.
+    let entry = program(&f, |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, PROT_RW);
+        asm.mov(3, MAP_ANON_PRIVATE);
+        asm.mov(4, u64::MAX);
+        asm.mov(5, 0);
+        asm.bl(f.thunk("mmap"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out), u64::MAX, "MAP_FAILED is (void *) -1, not NULL");
+    assert_eq!(f.guest.read_u64(out + 8), 22, "EINVAL is Linux's 22");
+
+    // A length that would wrap when rounded up to a page must not become a small one.
+    let wrapped = guest_mmap(&f, 0, u64::MAX, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_eq!(wrapped, u64::MAX, "MAP_FAILED, not a mapping");
+
+    // And a length larger than the guest address space is ENOMEM rather than a panic.
+    let huge = guest_mmap(&f, 0, 1 << 40, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_eq!(huge, u64::MAX);
+}
+
+/// `MAP_FIXED_NOREPLACE` is honoured because `Placement::Fixed` means exactly that, and a second
+/// request for the same address fails rather than destroying the first mapping.
+#[test]
+fn map_fixed_noreplace_is_honoured_and_refuses_an_occupied_address() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let page = f.guest.space.page_size() as u64;
+    let length = 64 * 1024;
+
+    let first = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(first, u64::MAX);
+    let second =
+        guest_mmap(&f, first, length, PROT_RW, MAP_ANON_PRIVATE | 0x10_0000, -1, 0);
+    assert_eq!(second, u64::MAX, "the address is taken, and MAP_FIXED_NOREPLACE must not replace");
+
+    // A misaligned fixed address is EINVAL rather than a rounded-down mapping.
+    let misaligned =
+        guest_mmap(&f, page + 1, length, PROT_RW, MAP_ANON_PRIVATE | 0x10_0000, -1, 0);
+    assert_eq!(misaligned, u64::MAX);
+}
+
+/// **`MADV_FREE` is implemented and `MADV_DONTNEED` is refused**, and the difference is their
+/// contracts: `MADV_FREE` promises "the old contents or zeroes", which `advise_idle` gives, and
+/// `MADV_DONTNEED` promises "zero, immediately", which it does not.
+#[test]
+fn madvise_implements_the_advice_it_can_honour_and_refuses_the_one_it_cannot() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX);
+    // Touch it, so there is a committed granule for the advice to be about.
+    let touch = program(&f, |asm| {
+        asm.mov(9, at);
+        asm.mov(10, 0x55);
+        asm.push(str_imm(10, 9, 0));
+    });
+    run_program(&f, touch).expect("writable");
+
+    let freed = value_of(&f, "madvise", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+        asm.mov(2, 8); // MADV_FREE
+    });
+    assert_eq!(freed as i64 as i32, 0);
+
+    let dontneed = refusal_of(&f, "madvise", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+        asm.mov(2, 4); // MADV_DONTNEED
+    });
+    assert_eq!(dontneed.symbol(), Some("madvise"));
+    let text = dontneed.to_string();
+    assert!(text.contains("MADV_DONTNEED"), "{text}");
+    assert!(text.contains("zero"), "the refusal must name the guarantee it cannot meet: {text}");
+    assert!(text.contains("MADV_FREE"), "and what is implemented instead: {text}");
+
+    // The purely advisory ones succeed, because ignoring a hint that cannot change what a read
+    // returns is the latitude the interface gives.
+    for advice in [0u64, 1, 2, 3, 14, 15] {
+        let code = value_of(&f, "madvise", |asm| {
+            asm.mov(0, at);
+            asm.mov(1, length);
+            asm.mov(2, advice);
+        });
+        assert_eq!(code as i64 as i32, 0, "advice {advice}");
+    }
+    // And an advice nobody defined is EINVAL, which is what Linux answers.
+    let unknown = value_of(&f, "madvise", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+        asm.mov(2, 999);
+    });
+    assert_eq!(unknown as i64 as i32, -1);
+}
+
+/// `mlock` is refused, and the refusal says why `-1`/`ENOMEM` was rejected — it is the most
+/// tempting wrong answer in the group, because a failing `mlock` is ordinary on a real device.
+#[test]
+fn mlock_is_refused_rather_than_answered_with_a_believable_failure() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let error = refusal_of(&f, "mlock", |asm| {
+        asm.mov(0, f.guest.data as u64);
+        asm.mov(1, 4096);
+    });
+    assert_eq!(error.symbol(), Some("mlock"));
+    let text = error.to_string();
+    assert!(text.contains("resident"), "{text}");
+    assert!(text.contains("ENOMEM"), "the rejected alternative is named: {text}");
+}
+
+/// Hostile arguments to every one of the five: null, unaligned, wild, and lengths that would wrap.
+/// None may panic, and each must be a typed error or a documented `-1`.
+#[test]
+fn hostile_arguments_to_the_guest_memory_group_are_typed_errors_and_not_panics() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let wild = f.guest.unmapped as u64;
+
+    for (symbol, args) in [
+        ("munmap", vec![0u64, 0]),
+        ("munmap", vec![1, 4096]),
+        ("munmap", vec![wild, u64::MAX]),
+        ("munmap", vec![u64::MAX, u64::MAX]),
+        ("mprotect", vec![1, 4096, 1]),
+        ("mprotect", vec![wild, u64::MAX, 1]),
+        ("mprotect", vec![0, 0, 0]),
+        ("madvise", vec![1, 4096, 8]),
+        ("madvise", vec![wild, u64::MAX, 8]),
+        ("madvise", vec![0, 0, 3]),
+    ] {
+        let entry = call_one(&f, symbol, |asm| {
+            for (index, value) in args.iter().enumerate() {
+                asm.mov(index as u32, *value);
+            }
+        });
+        let mut cpu = f.guest.thread(&f.boundary);
+        match f.run(&mut cpu, entry) {
+            // Either it completed with a `-1`/`0`, or it refused by name. Both are fine; a panic
+            // or a silent success that changed something is not.
+            Ok(exit) => {
+                assert!(matches!(exit, ExitReason::Returned { .. }), "`{symbol}` {args:?}: {exit:?}");
+                let code = f.guest.read_u64(f.guest.data) as i64 as i32;
+                assert!(code == 0 || code == -1, "`{symbol}` {args:?} returned {code}");
+            }
+            Err(error) => {
+                assert_eq!(error.symbol(), Some(symbol), "{error:?}");
+            }
+        }
+    }
+
+    // `mmap` with every argument hostile at once.
+    let hostile = guest_mmap(&f, u64::MAX, u64::MAX, PROT_RW, MAP_ANON_PRIVATE, -1, u64::MAX);
+    assert_eq!(hostile, u64::MAX);
+    // `mlock` refuses whatever it is handed, including a wrapping length.
+    let locked = refusal_of(&f, "mlock", |asm| {
+        asm.mov(0, wild);
+        asm.mov(1, u64::MAX);
+    });
+    assert_eq!(locked.symbol(), Some("mlock"));
+}
+
+/// The adapter's static pool refuses rather than wrapping its bump pointer, which would put one
+/// image's `dlpi_name` on top of an `AMEDIAFORMAT_KEY_*` string.
+#[test]
+fn a_full_static_pool_is_a_refusal_and_not_an_overwrite() {
+    use omni_android::bionic::POOL_BYTES;
+    let _guard = serialized();
+    let guest = Guest::new();
+    let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
+    let mut interned = Vec::new();
+    let chunk = vec![b'x'; 255];
+    loop {
+        match bionic.intern("dl_iterate_phdr", &chunk) {
+            Ok(at) => interned.push(at),
+            Err(error) => {
+                assert!(error.to_string().contains("static pool"), "{error}");
+                break;
+            }
+        }
+        assert!(interned.len() < POOL_BYTES, "the pool must run out");
+    }
+    assert!(!interned.is_empty());
+    let unique: std::collections::BTreeSet<_> = interned.iter().collect();
+    assert_eq!(unique.len(), interned.len(), "no two allocations share an address");
+    assert!(bionic.pool_used() <= POOL_BYTES);
+}
