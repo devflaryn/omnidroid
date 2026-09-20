@@ -28,6 +28,14 @@ use crate::memory::GuestMemory;
 use crate::threads::{Futex, WaitResult};
 use core::time::Duration;
 
+/// How long a blocked waiter sleeps before re-checking the semaphore word itself.
+///
+/// This is a safety net for the one race a real Linux futex closes and a
+/// non-atomic mock cannot: a waiter that has published the WAITERS flag but has
+/// not yet registered with the futex. With `post` preserving the flag, the normal
+/// path is a direct wake and this timer never fires.
+const SELF_HEAL_SLICE: Duration = Duration::from_millis(50);
+
 /// The waiter-present flag in the high bit.
 mod sem_bits {
     /// Waiter flag (bionic: bit 31 of the sem word).
@@ -68,10 +76,16 @@ pub fn destroy(
     check_addr(sem_addr)?;
     let word = read_word(mem, sem_addr)?;
     if word & sem_bits::WAITERS != 0 {
-        return errno_result(mem, consts::EBUSY);
+        // The flag is conservative -- it means "a waiter MAY be blocked" -- so it
+        // cannot by itself justify EBUSY. Probe: a broadcast wake reports how many
+        // were actually queued. Waking threads we are about to refuse is harmless;
+        // they re-check their predicate and block again.
+        if futex.wake(sem_addr, u32::MAX) > 0 {
+            return errno_result(mem, consts::EBUSY);
+        }
+        // Nobody was queued: the flag was stale, so drop it and destroy.
     }
     mem.write(sem_addr, &0u32.to_le_bytes())?;
-    let _ = futex;
     Ok(0)
 }
 
@@ -91,7 +105,10 @@ pub fn wait(
         let word = read_word(mem, sem_addr)?;
         let value = word & sem_bits::VALUE_MASK;
         if value > 0 {
-            if mem.cas_u32(sem_addr, word, (word - 1) & !sem_bits::WAITERS)? {
+            // `value > 0` means no borrow into bit 31, so `word - 1` decrements the
+            // count and PRESERVES the waiter flag. This thread cannot know whether
+            // other threads are still blocked, so it must not clear it.
+            if mem.cas_u32(sem_addr, word, word - 1)? {
                 return Ok(0);
             }
             continue; // raced another waiter: re-read
@@ -101,8 +118,12 @@ pub fn wait(
         if word & sem_bits::WAITERS == 0 {
             let _ = mem.cas_u32(sem_addr, word, word | sem_bits::WAITERS);
         }
-        // Bounded slices so a lost wake self-heals (spurious re-sleeps legal).
-        match futex.wait(sem_addr, 0, Some(Duration::from_millis(1_000))) {
+        // Bounded slices so a lost wake self-heals (spurious re-sleeps legal). This
+        // is a SAFETY NET, not the wake path: with the waiter flag preserved by
+        // `post`, a blocked waiter is woken directly. The slice is short because a
+        // real futex checks the value atomically with the block and this mock cannot,
+        // so the residual registration race must cost milliseconds, not a second.
+        match futex.wait(sem_addr, 0, Some(SELF_HEAL_SLICE)) {
             WaitResult::Woken => continue,
             WaitResult::TimedOut => continue,
             WaitResult::WouldBlock => continue,
@@ -122,7 +143,9 @@ pub fn trywait(
         if value == 0 {
             return errno_result(mem, consts::EAGAIN);
         }
-        if mem.cas_u32(sem_addr, word, (word - 1) & !sem_bits::WAITERS)? {
+        // Preserve the waiter flag: see `wait`. A successful trywait says nothing
+        // about whether other threads are blocked.
+        if mem.cas_u32(sem_addr, word, word - 1)? {
             return Ok(0);
         }
         // raced: re-read
@@ -185,10 +208,20 @@ pub fn post(
             return errno_result(mem, consts::EINVAL); // overflow past SEM_VALUE_MAX
         }
         let waiters = word & sem_bits::WAITERS != 0;
-        let next = (word & !sem_bits::WAITERS) + 1; // increment, keep flag state
+        // The flag is PRESERVED here. `value < VALUE_MASK` was checked above, so
+        // `word + 1` cannot carry into bit 31: the count increments and the flag
+        // survives. Clearing it here is what caused a posted token to take a full
+        // second to reach a second blocked waiter -- the wake was skipped because
+        // the flag had already been consumed by the first post.
+        let next = word + 1;
         if mem.cas_u32(sem_addr, word, next)? {
             if waiters {
-                futex.wake(sem_addr, 1);
+                // A wake that reports zero woken proves the queue was empty at that
+                // instant, and only then is it safe to drop the flag. Anything else
+                // leaves it set: an extra wake is free, a missed one is a stall.
+                if futex.wake(sem_addr, 1) == 0 {
+                    clear_waiters_flag(mem, sem_addr)?;
+                }
             }
             return Ok(0);
         }
@@ -211,6 +244,23 @@ pub fn getvalue(
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Drop the waiter flag, leaving the count alone. Used only where a wake has just
+/// proved the futex queue empty.
+fn clear_waiters_flag(
+    mem: &mut (impl GuestMemory + GuestAtomic),
+    addr: u64,
+) -> Result<(), crate::memory::Fault> {
+    loop {
+        let word = read_word(mem, addr)?;
+        if word & sem_bits::WAITERS == 0 {
+            return Ok(());
+        }
+        if mem.cas_u32(addr, word, word & !sem_bits::WAITERS)? {
+            return Ok(());
+        }
+    }
+}
 
 fn read_word(mem: &impl GuestMemory, addr: u64) -> Result<u32, crate::memory::Fault> {
     let mut b = [0u8; 4];
@@ -354,20 +404,61 @@ mod tests {
         assert_eq!(init(&mut m, 0x1000, 0, sem_bits::VALUE_MASK).unwrap(), 0);
     }
 
-    /// post overflow past SEM_VALUE_MAX: -1/EINVAL; destroy refuses EBUSY when
-    /// waiters are flagged.
+    /// post overflow past SEM_VALUE_MAX is -1/EINVAL.
     #[test]
-    fn post_overflow_and_destroy() {
+    fn post_overflow() {
         let mem = placed();
         let mut m = mem.clone();
         init(&mut m, 0x1000, 0, sem_bits::VALUE_MASK).unwrap();
         assert_eq!(post(&mut m, &MockFutex::new(), 0x1000).unwrap(), -1);
-        // Waiter flag set: destroy is EBUSY.
+    }
+
+    /// A STALE waiter flag -- set, but with nothing actually blocked -- must NOT
+    /// refuse `sem_destroy`. The flag is conservative by design (`post` preserves
+    /// it so a second waiter cannot be stranded), so it outlives the waiters that
+    /// set it; treating it as proof of a waiter turns every previously-contended
+    /// semaphore into one that can never be destroyed.
+    #[test]
+    fn destroy_succeeds_when_the_waiter_flag_is_stale() {
+        let mem = placed();
+        let mut m = mem.clone();
+        init(&mut m, 0x1000, 0, 1).unwrap();
         let mut b = [0u8; 4];
         m.read(0x1000, &mut b).unwrap();
         let word = u32::from_le_bytes(b) | sem_bits::WAITERS;
         m.write(0x1000, &word.to_le_bytes()).unwrap();
-        assert_eq!(destroy(&mut m, &MockFutex::new(), 0x1000).unwrap(), -1);
+        // Nothing is blocked on this address.
+        assert_eq!(destroy(&mut m, &MockFutex::new(), 0x1000).unwrap(), 0);
+    }
+
+    /// ...but a REAL blocked waiter still refuses EBUSY. This is the property the
+    /// stale-flag fix must not destroy, so it is asserted against a thread that is
+    /// genuinely parked on the futex rather than against a hand-set bit.
+    #[test]
+    fn destroy_refuses_ebusy_with_a_real_blocked_waiter() {
+        use std::sync::Arc;
+        let mem = placed();
+        let futex = Arc::new(MockFutex::new());
+        init(&mut mem.clone(), 0x1000, 0, 0).unwrap();
+
+        let (m2, f2) = (mem.clone(), futex.clone());
+        let waiter = std::thread::spawn(move || {
+            let mut m = m2.clone();
+            wait(&mut m, &*f2, 0x1000).unwrap()
+        });
+        // Let it genuinely park on the futex.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut m = mem.clone();
+        assert_eq!(
+            destroy(&mut m, &*futex, 0x1000).unwrap(),
+            -1,
+            "destroy must refuse while a thread is really blocked",
+        );
+
+        // Release the waiter so the test cannot hang.
+        post(&mut m, &*futex, 0x1000).unwrap();
+        assert_eq!(waiter.join().unwrap(), 0);
     }
 
     /// Many posts/waiters: N tokens satisfy N waits with none lost (no dup).
