@@ -51,3 +51,62 @@ pub mod consts {
     /// State not recoverable (robust mutexes).
     pub const ENOTRECOVERABLE: i32 = 131;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::consts::*;
+
+    /// Every errno constant, pinned to its Linux value.
+    ///
+    /// **This module had no test at all**, which a mutation run found: renumbering `ETIMEDOUT` to
+    /// Windows' `ERROR_SEM_TIMEOUT` (121) and `EAGAIN` off the kernel's value both left the whole
+    /// suite passing. The values were right; nothing said so.
+    ///
+    /// That is the worst shape for this particular module. These numbers reach the guest, the
+    /// development host is Windows — whose numbering is different, and whose `WSAETIMEDOUT` is
+    /// 10060 and `ERROR_SEM_TIMEOUT` 121 — and a wrong one produces a guest that takes the wrong
+    /// branch rather than a build that fails. A test that asserts the numbers one by one is dull,
+    /// and it is the only thing that can detect this.
+    ///
+    /// Values are the Linux kernel UAPI numbering (`asm-generic/errno-base.h` for 1-34,
+    /// `asm-generic/errno.h` above it), which is what bionic exposes on arm64. Written as literals
+    /// on purpose: comparing a constant to itself would pass against any value.
+    #[test]
+    fn every_errno_is_the_linux_number() {
+        // errno-base.h
+        assert_eq!(EPERM, 1);
+        assert_eq!(ENOENT, 2);
+        assert_eq!(EINTR, 4);
+        assert_eq!(EBADF, 9);
+        assert_eq!(EAGAIN, 11, "EAGAIN == EWOULDBLOCK == 11 on Linux");
+        assert_eq!(ENOMEM, 12);
+        assert_eq!(EACCES, 13);
+        assert_eq!(EBUSY, 16);
+        assert_eq!(EINVAL, 22);
+        assert_eq!(EDOM, 33);
+        assert_eq!(ERANGE, 34);
+        // errno.h
+        assert_eq!(EDEADLK, 35);
+        assert_eq!(ENOSYS, 38);
+        assert_eq!(ENOTSUP, 95, "ENOTSUP == EOPNOTSUPP == 95 in the asm-generic numbering");
+        assert_eq!(ETIMEDOUT, 110, "the LINUX value; Windows' ERROR_SEM_TIMEOUT is 121");
+        assert_eq!(EOWNERDEAD, 130);
+        assert_eq!(ENOTRECOVERABLE, 131);
+    }
+
+    /// The codes this crate returns must be distinguishable from each other.
+    ///
+    /// A renumbering that collided two of them would let a caller take the wrong branch while every
+    /// individual assertion above still held for the others.
+    #[test]
+    fn the_errno_values_are_all_distinct() {
+        let all = [
+            EPERM, ENOENT, EINTR, EBADF, EAGAIN, ENOMEM, EACCES, EBUSY, EINVAL, EDOM, ERANGE,
+            EDEADLK, ENOSYS, ENOTSUP, ETIMEDOUT, EOWNERDEAD, ENOTRECOVERABLE,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "two errno constants collide");
+    }
+}

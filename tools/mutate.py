@@ -59,6 +59,13 @@ CPU_CALLBACKS = "crates/omni-cpu/src/dynarmic/callbacks.rs"
 CPU_DYN = "crates/omni-cpu/src/dynarmic/mod.rs"
 PAGER = "crates/omni-mem/src/pager.rs"
 ACCESS = "crates/omni-mem/src/access.rs"
+BIONIC_ERRNO = "crates/omni-bionic/src/errno.rs"
+BIONIC_LAYOUTS = "crates/omni-bionic/src/layouts.rs"
+BIONIC_STRING = "crates/omni-bionic/src/string.rs"
+BIONIC_WIDE = "crates/omni-bionic/src/wide.rs"
+BIONIC_SEM = "crates/omni-bionic/src/sem.rs"
+BIONIC_MUTEX = "crates/omni-bionic/src/mutex.rs"
+BIONIC_NUMERICS = "crates/omni-bionic/src/numerics.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
 LEAF = "crates/omni-elf/src/leaf.rs"
@@ -70,6 +77,16 @@ BOUNDARY = "crates/omni-android/src/boundary.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
+# `omni-bionic` has no dependencies at all, so it builds in seconds. The targets are named rather
+# than taking the whole package because `tests/stress.rs` runs 8 threads x 12,500 rounds and is
+# minutes in a debug build, while asserting nothing these rows touch -- the same reasoning as
+# `ANDROID` above. `sem_wakeup` IS named: the waiter-flag row is what it exists for.
+BIONIC = [
+    "cargo", "test", "-p", "omni-bionic", "--lib",
+    "--test", "string_tests", "--test", "wide_tests", "--test", "numerics_tests",
+    "--test", "mem_tests", "--test", "sem_wakeup",
+    "--no-fail-fast",
+]
 CPU = ["cargo", "test", "-p", "omni-cpu", "--no-fail-fast"]
 PLATFORM = ["cargo", "test", "-p", "omni-platform", "--no-fail-fast"]
 # The demand pager is policy in `omni-mem` driven by execution in `omni-cpu`, so a mutation of it
@@ -1246,6 +1263,109 @@ MUTATIONS = [
      """        if next.start != covered_end || next.mapping.is_none() || next.mapping != region.mapping {""",
      """        if next.start != covered_end || next.is_free() {""",
      MEM_AND_CPU),
+
+    # ---- omni-bionic ----------------------------------------------------------------------------
+    # The crate had 126 rows' worth of workspace mutation coverage around it and NONE of its own,
+    # across 12,543 lines. These rows target the claims that would be silently wrong rather than
+    # loudly broken: the guest ABI's widths, the Linux errno numbering, and the two error-reporting
+    # conventions that are opposites of each other.
+
+    # The guest's errno numbers are LINUX numbers. The development host is Windows, whose numbering
+    # is different, so a value quietly taken from the host is the classic silent-wrong-answer here.
+    ("bionic-A1", "A",
+     "ETIMEDOUT becomes Windows' ERROR_SEM_TIMEOUT instead of the Linux value",
+     BIONIC_ERRNO,
+     """    pub const ETIMEDOUT: i32 = 110;""",
+     """    pub const ETIMEDOUT: i32 = 121;""",
+     BIONIC),
+
+    ("bionic-A2", "A",
+     "EAGAIN renumbered off the kernel's value",
+     BIONIC_ERRNO,
+     """    pub const EAGAIN: i32 = 11;""",
+     """    pub const EAGAIN: i32 = 35;""",
+     BIONIC),
+
+    # Guest struct widths. Over-declaring a size is how a write lands past the end of a guest object.
+    ("bionic-A3", "A",
+     "pthread_mutex_t declared 32 bytes, as if bionic used the glibc-shaped layout",
+     BIONIC_LAYOUTS,
+     """    pub const PTHREAD_MUTEX_T: u64 = 40;""",
+     """    pub const PTHREAD_MUTEX_T: u64 = 32;""",
+     BIONIC),
+
+    ("bionic-A4", "A",
+     "timespec declared 8 bytes, as if time_t were 32-bit",
+     BIONIC_LAYOUTS,
+     """    pub const TIMESPEC: u64 = 16;""",
+     """    pub const TIMESPEC: u64 = 8;""",
+     BIONIC),
+
+    ("bionic-A5", "A",
+     "pthread_t declared 32-bit, as if a host thread id could carry it",
+     BIONIC_LAYOUTS,
+     """    pub const PTHREAD_T: u64 = 8;""",
+     """    pub const PTHREAD_T: u64 = 4;""",
+     BIONIC),
+
+    # wchar_t is 32-bit on Android, not the 16 bits a Windows-shaped assumption would give it.
+    ("bionic-A6", "A",
+     "the wide-string walk steps by 2, as if wchar_t were 16-bit",
+     BIONIC_WIDE,
+     """        count += 1;
+        cursor = cursor.checked_add(4).ok_or(Fault(cursor))?;""",
+     """        count += 1;
+        cursor = cursor.checked_add(2).ok_or(Fault(cursor))?;""",
+     BIONIC),
+
+    # The FORTIFY check is an off-by-one away from accepting a string with no room for its NUL.
+    ("bionic-A7", "A",
+     "__strlen_chk accepts a string exactly filling its object, leaving no room for the NUL",
+     BIONIC_STRING,
+     """    if len >= size {
+        return Err(crate::error::BionicError::CheckFailed("__strlen_chk"));""",
+     """    if len > size {
+        return Err(crate::error::BionicError::CheckFailed("__strlen_chk"));""",
+     BIONIC),
+
+    # The sem waiter-flag protocol. A1 restores the defect that stalled a blocked waiter for a full
+    # second; the suite could not see it because every sem_wait loops on a bounded slice.
+    ("bionic-A8", "A",
+     "sem_post consumes the waiter flag other waiters still need",
+     BIONIC_SEM,
+     """        let next = word + 1;""",
+     """        let next = (word & !sem_bits::WAITERS) + 1;""",
+     BIONIC),
+
+    # strtol's overflow reporting: the value clamps AND errno is set. Dropping either is silent.
+    ("bionic-A9", "A",
+     "strtol overflow clamps but does not report ERANGE",
+     BIONIC_NUMERICS,
+     """    if overflow {
+        ctx.set_errno(crate::errno::consts::ERANGE);
+        return Ok(Ok(if negative { i64::MIN } else { i64::MAX }));""",
+     """    if overflow {
+        return Ok(Ok(if negative { i64::MIN } else { i64::MAX }));""",
+     BIONIC),
+
+    ("bionic-A10", "A",
+     "strtol overflow clamps to LONG_MAX regardless of sign",
+     BIONIC_NUMERICS,
+     """        return Ok(Ok(if negative { i64::MIN } else { i64::MAX }));""",
+     """        return Ok(Ok(i64::MAX));""",
+     BIONIC),
+
+    # The over-correction: bionic's compare functions return the BYTE DIFFERENCE, not glibc's plus or
+    # minus one. Only the sign is specified by C, so this reads as a harmless normalisation -- which
+    # is exactly why it needs a row.
+    ("bionic-B1", "B",
+     "strcmp normalised to glibc's plus-or-minus one instead of bionic's byte difference",
+     BIONIC_STRING,
+     """        // Bionic's strcmp returns the byte difference (c - d), not glibc's ±1. The C
+        // standard only fixes the SIGN; bionic fixes the magnitude. We match bionic.
+        Some((ca, cb)) => Ok(ca as i32 - cb as i32),""",
+     """        Some((ca, cb)) => Ok(if ca > cb { 1 } else { -1 }),""",
+     BIONIC),
 ]
 
 
