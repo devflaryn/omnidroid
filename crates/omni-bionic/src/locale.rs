@@ -72,7 +72,7 @@ pub fn freelocale(_locobj: u64) {}
 
 /// `locale_t uselocale(locale_t newloc)` — POSIX: install `newloc` for the calling thread
 /// and return the previous handle; `LC_GLOBAL_LOCALE` (0) restores the global locale.
-/// The "thread state" is one handle stored via [`GuestContext::set_locale_slot`]-shaped
+/// The "thread state" is one handle stored via a `GuestContext::set_locale_slot`-shaped
 /// access: this crate defines no new trait method — the current handle is kept *in the
 /// caller-provided slot* (a guest address the adapter chooses, passed in), so the function
 /// stays a pure computation.

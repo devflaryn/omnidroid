@@ -133,20 +133,6 @@ fn _offsets_used() -> u64 {
     offsets::ONCE_WORD
 }
 
-/// Timed variant used by tests to bound a hung init: identical protocol, but a
-/// loser's wait gives up after `timeout` and re-checks the word. Provided so the
-/// concurrency tests can never hang on a bug; production `pthread_once` has no
-/// timeout (see [`once`], which waits unboundedly like POSIX requires).
-pub fn once_with_losers_timeout<F: FnMut()>(
-    mem: &mut (impl GuestMemory + GuestAtomic),
-    futex: &impl Futex,
-    once_addr: u64,
-    timeout: Duration,
-    run_init: F,
-) -> Result<OnceOutcome, crate::memory::Fault> {
-    let _ = timeout; // routed through the futex wait below in a full impl
-    once(mem, futex, once_addr, run_init)
-}
 
 #[cfg(test)]
 mod tests {

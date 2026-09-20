@@ -3,7 +3,7 @@
 //! `__vsnprintf_chk` and `vsprintf` are variadic and belong to the unreviewed thunk
 //! boundary — but their *work* is pure formatting. This module implements that formatting
 //! engine over an **explicit argument list** ([`FormatArg`]), so the future adapter can
-//! marshal the guest's va_list into a `&[FormatArg]` and call [`format`]; nothing here
+//! marshal the guest's va_list into a `&[FormatArg]` and call [`format()`]; nothing here
 //! knows about variadics.
 //!
 //! Scope and guarantees (honest, per the task's partial-is-acceptable rule):

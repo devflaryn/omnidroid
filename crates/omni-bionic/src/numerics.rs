@@ -722,7 +722,7 @@ pub fn atof(ctx: &mut impl GuestContext, s: u64) -> Result<f64, BionicError> {
 /// bionic's `rand` is a thin wrapper over `arc4random`-backed state in modern versions...
 /// actually no: bionic's `rand`/`srand` are the OpenBSD `arc4random`-seeded pair only for
 /// `rand_r`; the classic bionic `rand` is a *linear congruential generator identical to
-/// glibc's TYPE_3* (the documented r[i] = 1103515245*r[i-1] + 12345 family). The exact
+/// glibc's TYPE_3* (the documented `r[i] = 1103515245*r[i-1] + 12345` family). The exact
 /// sequence is NOT specified by any standard; what IS specified: `srand(1)` followed by
 /// `rand()` gives the same sequence on every run (C11 7.22.2.1). Divergence note: this
 /// crate implements the glibc/bionic-compatible LCG with the TYPE_0-style 32-bit update

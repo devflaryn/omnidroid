@@ -10,7 +10,7 @@
 //! waiter registry ([`CondWaiters`]): `wait_begin` inserts the calling thread's
 //! notify entry BEFORE releasing the mutex; `signal`/`broadcast` mark entries
 //! and wake them; `wait_end` sleeps on the thread's own entry until marked (or
-//! timed out), removes it, and reacquires the mutex. The [`Futex`] trait keeps
+//! timed out), removes it, and reacquires the mutex. The [`crate::threads::Futex`] trait keeps
 //! exactly the pinned shape (`wait`/`wake` on an address) and is used to sleep.
 //!
 //! ## Semantics pinned by tests
@@ -292,9 +292,12 @@ thread_local! {
 /// 0 (signalled or spuriously woken) or ETIMEDOUT — with the mutex held in
 /// every case.
 ///
-/// `timeout == None` blocks until signalled. A registered-but-unmarked waiter
-/// re-sleeps in 1 s slices on timeout so a lost wake cannot hang forever; a
-/// marked waiter returns immediately.
+/// `timeout == None` blocks until signalled, unboundedly, as POSIX requires — and
+/// it is safe to do so because there is no lost-wake window to heal. The mark and
+/// the notify both happen under the waiter's OWN entry mutex (see `CondWaiters::wake`)
+/// and the sleeper re-checks the flag under that same
+/// mutex before every sleep, so a wake that lands before the sleep is observed
+/// rather than missed. A marked waiter returns immediately.
 #[allow(clippy::too_many_arguments)]
 pub fn wait_end(
     threads: &impl crate::threads::ThreadRegistry,

@@ -24,6 +24,30 @@
 //! memory trait; every scan therefore terminates at a terminator or a fault, and no test run
 //! can hang on an unterminated guest string.
 
+//! ## Coverage, and where this crate deliberately stops
+//!
+//! Of the **51** thread / synchronisation / TLS symbols the 3,594 initializers statically reach
+//! (`docs/research/init-reachable-imports.txt`):
+//!
+//! * **42 are implemented here.** Note `pthread_cond_timedwait` is [`cond::wait_end`] with
+//!   `timeout: Some(..)` — the C symbol is not spelled on a function of its own.
+//! * **1 is explicitly excluded**: `pthread_sigmask`, which needs the guest's real signal state.
+//! * **8 are NOT here, and cannot be**, because each needs either host → guest re-entry or the
+//!   operating system, and this crate has neither by design:
+//!
+//!   | symbol | what it needs |
+//!   |---|---|
+//!   | `pthread_create` | spawn a host thread **and** re-enter guest code at the start routine |
+//!   | `pthread_join` / `pthread_detach` | host thread lifetime |
+//!   | `pthread_exit` | unwind a guest thread through the boundary |
+//!   | `pthread_getattr_np` | the live thread's real stack bounds |
+//!   | `pthread_attr_setschedparam`, `pthread_getschedparam`, `pthread_setschedparam` | host scheduling policy |
+//!
+//! Those eight belong to the **adapter**, not here. This is a scope boundary, not an unfinished
+//! edge: a zero-dependency crate with no OS access and no way to call back into the guest cannot
+//! implement any of them, and a stub that pretended to would be exactly the "plausible stub" the
+//! design rules above forbid.
+//!
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![warn(clippy::all)]
