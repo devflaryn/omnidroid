@@ -554,6 +554,24 @@ impl Boundary {
                 }
                 other => return Ok(other),
             };
+            // An inline handler that failed left its reason here and deferred.
+            //
+            // Checked BEFORE the budget, and that order is load-bearing. A handler that has already
+            // run and failed is not "unserviced and resumable": if the allowance happened to run out
+            // on the same crossing, the budget arm below would return `StepLimitReached` and this
+            // error would be left in the thread-local for the next `Boundary::run` to drop on the
+            // floor. The caller would be told "budget expired, resumable" when an imported call had
+            // actually failed — and resuming would enter the handler a SECOND time, which is exactly
+            // the once-only property `boundary-A6` exists to protect.
+            //
+            // This is the same class as the defect the late budget fix was itself for: a
+            // non-resumable condition reported as a resumable one.
+            //
+            // It is also checked before the slot lookup in `service_exit`, which would otherwise
+            // report the symbol as merely unbound.
+            if let Some(error) = take_pending() {
+                return Err(error);
+            }
             // Only now, having decided to go round again, is the allowance spent down. A budget that
             // has run out stops the guest *at the thunk*, unserviced and resumable, which is the
             // honest stop: servicing the call and then refusing to resume would leave the caller
@@ -566,11 +584,6 @@ impl Boundary {
                 remaining = RunLimit::Instructions(left);
             }
             crossings += 1;
-            // An inline handler that failed left its reason here and deferred. Checked first, because
-            // the slot lookup below would otherwise report the symbol as merely unbound.
-            if let Some(error) = take_pending() {
-                return Err(error);
-            }
             pc = self.service_exit(cpu, site, depth)?;
         }
     }

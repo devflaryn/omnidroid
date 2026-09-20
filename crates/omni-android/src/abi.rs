@@ -504,6 +504,50 @@ mod tests {
         assert_eq!(args.consumed(), (8, 0), "eight X registers spent, no V registers");
     }
 
+    /// The NSAA starts at the guest's `SP`, so a guest that points `SP` at the top of the address
+    /// space makes the round-up overflow.
+    ///
+    /// The refused POINTER is asserted, not just the variant: unchecked, `MAX + 7` wraps to a small
+    /// address and the following read fails with `BadPointer` anyway, so a test that checked only
+    /// the variant would pass against the defect in any profile with overflow checks off.
+    #[test]
+    fn a_stack_pointer_at_the_top_of_the_address_space_is_refused_rather_than_overflowing() {
+        let f = fixture();
+        let mut frame = Frame { sp: GuestAddr::MAX, ..Frame::default() };
+        let call = ThunkCall::new(&mut frame, 0x1000, ThunkContext::default());
+        let mut args = Args::new(&call, &f.mem, blame());
+        // Spend X0-X7 so the ninth argument has to come off the stack.
+        for _ in 0..ARG_REGISTERS {
+            args.next_u64().expect("a register argument");
+        }
+        let error = args.next_u64().expect_err("the ninth argument must be refused");
+        match error {
+            AbiError::BadPointer { pointer, .. } => assert_eq!(
+                pointer,
+                GuestAddr::MAX,
+                "the refusal must name the address the guest gave, not a wrapped one",
+            ),
+            other => panic!("expected BadPointer, got {other:?}"),
+        }
+    }
+
+    /// The same, through the floating-point taker, which reaches the NSAA by its own route.
+    #[test]
+    fn a_stack_pointer_at_the_top_is_refused_for_floating_point_arguments_too() {
+        let f = fixture();
+        let mut frame = Frame { sp: GuestAddr::MAX, ..Frame::default() };
+        let call = ThunkCall::new(&mut frame, 0x1000, ThunkContext::default());
+        let mut args = Args::new(&call, &f.mem, blame());
+        for _ in 0..ARG_REGISTERS {
+            args.next_f64().expect("a register argument");
+        }
+        let error = args.next_f64().expect_err("the ninth double must be refused");
+        match error {
+            AbiError::BadPointer { pointer, .. } => assert_eq!(pointer, GuestAddr::MAX),
+            other => panic!("expected BadPointer, got {other:?}"),
+        }
+    }
+
     /// The ninth argument onward is on the stack, and each one takes a whole 8-byte slot.
     #[test]
     fn arguments_past_the_eighth_come_off_the_stack_in_eight_byte_slots() {

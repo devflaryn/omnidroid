@@ -685,6 +685,63 @@ fn a_handler_that_fails_is_entered_once_and_not_re_run_on_the_exit_path() {
     assert_eq!(boundary.crossings().exits, 0);
 }
 
+/// **A handler that fails on the budget's last instruction reports the FAILURE, not a step limit.**
+///
+/// The late-budget fix moved the charge below the `match` so a terminal exit landing on the budget's
+/// last instruction is reported as what it is. But it left the budget arm ABOVE the pending-error
+/// check, which introduced a new misclassification of the same class it had just fixed.
+///
+/// The interleaving: an inline handler fails, records its typed error and defers; on that same
+/// crossing the counted budget is exactly exhausted. The budget arm returned
+/// `Ok(ExitReason::StepLimitReached)`, and the `AbiError` was left in the thread-local for the next
+/// `Boundary::run` to drop with `let _ = take_pending()`.
+///
+/// Two things go wrong at once. The caller is told "budget expired, resumable" when an imported call
+/// actually failed; and a caller that acts on that and resumes enters the handler a SECOND time —
+/// exactly the once-only property `a_handler_that_fails_is_entered_once_and_not_re_run_on_the_exit_path`
+/// and row `boundary-A6` exist to protect.
+///
+/// Self-calibrating for the same reason the exact-budget test is: how many instructions a program
+/// charges is the backend's business.
+#[test]
+fn a_handler_that_fails_on_the_budgets_last_instruction_reports_the_failure_not_a_step_limit() {
+    let _guard = serialized();
+    let guest = Guest::new();
+    let builder = guest.boundary(8);
+    let thunk = builder.bind_inline("strlen", always_fails).expect("bind");
+    let boundary = builder.finish();
+
+    let entry = guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, 0); // a null pointer: the handler fails on its argument
+    asm.bl(thunk);
+    asm.push(ret(21));
+    guest.load(asm.words());
+
+    // How many instructions does the backend charge to reach the crossing?
+    ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut cpu = guest.thread(&boundary);
+    let error = boundary.run(&mut cpu, entry, RunLimit::Unlimited).expect_err("it always fails");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    let charged = cpu.last_run_instructions();
+    assert!(charged > 0, "the backend must charge something for a program that ran");
+
+    // The same program with EXACTLY that allowance, so the budget runs out on the very crossing the
+    // handler failed on.
+    ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut cpu = guest.thread(&boundary);
+    let error = boundary.run(&mut cpu, entry, RunLimit::Instructions(charged)).expect_err(
+        "a handler that has already run and failed is not unserviced and resumable: reporting a step          limit here both drops the typed error and invites the caller to resume into a second entry",
+    );
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert_eq!(
+        ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "and it was still entered exactly once",
+    );
+}
+
 /// **The exit-path crossing cap, reached.**
 ///
 /// `MAX_EXIT_CROSSINGS` is 2^32, which no test can reach, so the cap is lowered for this one. A limit

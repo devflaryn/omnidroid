@@ -829,6 +829,40 @@ mod tests {
         assert!(matches!(error, AbiError::BadVaList { .. }), "{error:?}");
     }
 
+    /// The `VarArgs` overflow area starts from the guest's `SP` too, and had the same unchecked
+    /// round-up as the `va_list` walk.
+    #[test]
+    fn a_varargs_overflow_area_at_the_top_of_the_address_space_is_refused() {
+        let f = fixture();
+        let mut frame = Frame { sp: f.scratch, ..Frame::default() };
+        let call = ThunkCall::new(&mut frame, 0x4000, ThunkContext::default());
+        // (8, 8): every argument register is spent, so the next one must come from the overflow area.
+        let mut va = VarArgs::new(&call, &f.mem, blame(), (8, 8), GuestAddr::MAX);
+        let error = va.next_u64().expect_err("aligning MAX up to 8 must be refused");
+        match error {
+            AbiError::BadPointer { pointer, .. } => assert_eq!(
+                pointer,
+                GuestAddr::MAX,
+                "the refusal must name the address the guest gave, not a wrapped one",
+            ),
+            other => panic!("expected BadPointer, got {other:?}"),
+        }
+    }
+
+    /// And through the floating-point taker, which reaches the overflow area by its own route.
+    #[test]
+    fn a_varargs_overflow_area_at_the_top_is_refused_for_doubles_too() {
+        let f = fixture();
+        let mut frame = Frame { sp: f.scratch, ..Frame::default() };
+        let call = ThunkCall::new(&mut frame, 0x4000, ThunkContext::default());
+        let mut va = VarArgs::new(&call, &f.mem, blame(), (8, 8), GuestAddr::MAX);
+        let error = va.next_f64().expect_err("aligning MAX up to 8 must be refused");
+        match error {
+            AbiError::BadPointer { pointer, .. } => assert_eq!(pointer, GuestAddr::MAX),
+            other => panic!("expected BadPointer, got {other:?}"),
+        }
+    }
+
     /// A `__stack` at the very top of the address space must be refused, not aligned into a wrap.
     ///
     /// `__stack` is read verbatim out of guest memory and, unlike the two `int` offsets, gets no
@@ -844,7 +878,18 @@ mod tests {
         f.mem.write_u64(va_at + field::STACK, u64::MAX, blame()).expect("__stack = MAX");
         let mut va = GuestVaList::read(&f.mem, va_at, blame()).expect("the offsets are still fine");
         let error = va.next_u64().expect_err("aligning MAX up to 8 must be refused");
-        assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+        // The POINTER is asserted, not just the variant. Unchecked, `MAX + 7` wraps to 6 and the
+        // subsequent `read_u64(6)` fails with `BadPointer` too — so a test that checked only the
+        // variant would pass against the defect in any profile with overflow checks off, which is
+        // this one's release profile. The wrapped address is small; the refused one is `MAX`.
+        match error {
+            AbiError::BadPointer { pointer, .. } => assert_eq!(
+                pointer,
+                GuestAddr::MAX,
+                "the refusal must name the address the guest gave, not a wrapped one",
+            ),
+            other => panic!("expected BadPointer, got {other:?}"),
+        }
     }
 
     /// The same, on the floating-point taker, which reaches `__stack` by its own route.
@@ -856,7 +901,10 @@ mod tests {
         f.mem.write_u64(va_at + field::STACK, u64::MAX, blame()).expect("__stack = MAX");
         let mut va = GuestVaList::read(&f.mem, va_at, blame()).expect("the offsets are still fine");
         let error = va.next_f64().expect_err("aligning MAX up to 8 must be refused");
-        assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+        match error {
+            AbiError::BadPointer { pointer, .. } => assert_eq!(pointer, GuestAddr::MAX),
+            other => panic!("expected BadPointer, got {other:?}"),
+        }
     }
 
     /// An underflowing `__gr_top` must NAME `__gr_top` and carry the GENERAL bank's bound.

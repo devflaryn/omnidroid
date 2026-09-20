@@ -1117,6 +1117,115 @@ MUTATIONS = [
         0
     }""",
      ANDROID),
+    # ---- Task 2 review: the address arithmetic the guest controls (F1) --------------------------
+    # Each of these reverts a `checked_add` to the unchecked round-up. In a profile with overflow
+    # checks OFF the unchecked form wraps rather than panicking, and the following read then fails
+    # with `BadPointer` anyway — so every one of these tests asserts the refused POINTER, not just
+    # the variant. A row that only removed the check would otherwise be a MISS in release.
+    ("varargs-A5", "A",
+     "the va_list __stack round-up is unchecked again, so a top-of-space __stack wraps",
+     VARARGS,
+     """    fn aligned_stack(&self, align: usize) -> AbiResult<GuestAddr> {
+        self.stack
+            .checked_add(align - 1)
+            .map(|sum| sum & !(align - 1))
+            .ok_or_else(|| self.stack_out_of_space(self.stack, align))
+    }""",
+     """    fn aligned_stack(&self, align: usize) -> AbiResult<GuestAddr> {
+        Ok((self.stack + align - 1) & !(align - 1))
+    }""",
+     ANDROID),
+
+    ("varargs-A6", "A",
+     "the VarArgs overflow-area round-up is unchecked again",
+     VARARGS,
+     """    fn aligned_overflow(&self, align: usize) -> AbiResult<GuestAddr> {
+        self.overflow
+            .checked_add(align - 1)
+            .map(|sum| sum & !(align - 1))
+            .ok_or_else(|| self.overflow_out_of_space(self.overflow, align))
+    }""",
+     """    fn aligned_overflow(&self, align: usize) -> AbiResult<GuestAddr> {
+        Ok((self.overflow + align - 1) & !(align - 1))
+    }""",
+     ANDROID),
+
+    ("abi-A6", "A",
+     "the NSAA round-up is unchecked again, so a top-of-space SP wraps",
+     ABI,
+     """        self.nsaa
+            .checked_add(align - 1)
+            .map(|sum| sum & !(align - 1))
+            .ok_or_else(|| self.nsaa_out_of_space(self.nsaa, align))""",
+     """        Ok((self.nsaa + align - 1) & !(align - 1))""",
+     ANDROID),
+
+    # ---- Task 2 review: the va_list bank names itself (F5) --------------------------------------
+    # The original defect: `core::ptr::eq(&self.gr_top, &top)` with `top` by value is always false,
+    # so every general-bank refusal was reported as `__vr_top` with the VR bound. Two rows, because
+    # the name and the bound are two separable halves of the same fact.
+    ("varargs-A7", "A",
+     "every save-area refusal names __vr_top again, whichever bank it came from",
+     VARARGS,
+     """    fn field(self) -> &'static str {
+        match self {
+            SaveBank::General => "__gr_top",
+            SaveBank::Simd => "__vr_top",
+        }
+    }""",
+     """    fn field(self) -> &'static str {
+        "__vr_top"
+    }""",
+     ANDROID),
+
+    ("varargs-A8", "A",
+     "every save-area refusal carries the SIMD bound again, whichever bank it came from",
+     VARARGS,
+     """    fn save_bytes(self) -> usize {
+        match self {
+            SaveBank::General => GR_SAVE_BYTES,
+            SaveBank::Simd => VR_SAVE_BYTES,
+        }
+    }""",
+     """    fn save_bytes(self) -> usize {
+        VR_SAVE_BYTES
+    }""",
+     ANDROID),
+
+    # ---- Task 2 review: a failed handler is not a step limit (F3) -------------------------------
+    # Restores the ordering the late-budget fix left behind: the budget arm above the pending-error
+    # check, so a handler that failed on the budget's last instruction is reported as a resumable
+    # StepLimitReached and its typed error is dropped by the next run's `let _ = take_pending()`.
+    ("boundary-A12", "A",
+     "the counted budget is checked before the pending handler error, so a failure is lost",
+     BOUNDARY,
+     """            if let Some(error) = take_pending() {
+                return Err(error);
+            }
+            // Only now, having decided to go round again, is the allowance spent down. A budget that
+            // has run out stops the guest *at the thunk*, unserviced and resumable, which is the
+            // honest stop: servicing the call and then refusing to resume would leave the caller
+            // unable to say what happened.
+            if let RunLimit::Instructions(allowance) = remaining {
+                let left = allowance.saturating_sub(cpu.last_run_instructions());
+                if left == 0 {
+                    return Ok(ExitReason::StepLimitReached { pc: site, executed: spent });
+                }
+                remaining = RunLimit::Instructions(left);
+            }
+            crossings += 1;""",
+     """            if let RunLimit::Instructions(allowance) = remaining {
+                let left = allowance.saturating_sub(cpu.last_run_instructions());
+                if left == 0 {
+                    return Ok(ExitReason::StepLimitReached { pc: site, executed: spent });
+                }
+                remaining = RunLimit::Instructions(left);
+            }
+            crossings += 1;
+            if let Some(error) = take_pending() {
+                return Err(error);
+            }""",
+     ANDROID),
 ]
 
 
