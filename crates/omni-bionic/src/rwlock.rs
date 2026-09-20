@@ -194,6 +194,8 @@ pub fn tryrdlock(
     if writers > 0 || state == rw_state::WRITER {
         return Ok(consts::EBUSY);
     }
+    // A writer may still win between the check and the CAS; reader_acquire
+    // reports that as EBUSY, which IS the correct tryrdlock answer.
     reader_acquire(mem, rwlock_addr)
 }
 
@@ -211,30 +213,38 @@ pub fn timedrdlock(
         })
 }
 
-/// Reader acquire: bump the reader count atomically; EAGAIN on overflow.
+/// Reader acquire: bump the reader count atomically; EAGAIN ONLY on genuine
+/// reader-count overflow.
+///
+/// A writer winning the word between the caller's policy check and this CAS is
+/// ordinary contention, NOT overflow: POSIX permits EAGAIN only when the reader
+/// count is exhausted, so a WRITER sentinel seen here must make the reader
+/// report EBUSY — the blocking loops translate that into another policy wait.
 fn reader_acquire(
     mem: &mut (impl GuestMemory + GuestAtomic),
     rwlock_addr: u64,
 ) -> Result<i32, crate::memory::Fault> {
-    // Try to bump FREE->1? No: 1 is a reader count of 1; the first reader's CAS
-    // is FREE -> 1, subsequent readers CAS n -> n+1. To keep it simple and
-    // atomic we spin a bounded CAS-retry on the observed count (the count only
-    // changes via atomic CASes by others, so a retry is bounded in practice).
     loop {
         let state = read_word(mem, rwlock_addr)?;
         if state == rw_state::FREE {
             if mem.cas_u32(rwlock_addr, rw_state::FREE, 1)? {
                 return Ok(0);
             }
-        } else if state < rw_state::MAX_READERS {
-            // Readers hold it; a new reader just increments (allowed: no writer
-            // waiting — the caller checked, and checks inside the loop via the
-            // policy decision).
+        } else if state == rw_state::WRITER || state >= rw_state::MAX_READERS {
+            // A writer holds the word (we lost the race with a writer that
+            // acquired after our caller's check), or the reader count is
+            // genuinely exhausted. Distinguish the two: writer => EBUSY
+            // (contention), overflow => EAGAIN (POSIX's only legal EAGAIN).
+            return Ok(if state == rw_state::WRITER {
+                consts::EBUSY
+            } else {
+                consts::EAGAIN
+            });
+        } else {
+            // Readers hold it; a new reader just increments.
             if mem.cas_u32(rwlock_addr, state, state + 1)? {
                 return Ok(0);
             }
-        } else {
-            return Ok(consts::EAGAIN); // WRITER sentinel or overflow
         }
     }
 }
@@ -251,9 +261,15 @@ fn reader_loop(
         let writers = read_word(mem, rwlock_addr + 4)?;
         let state = read_word(mem, rwlock_addr)?;
         if state != rw_state::WRITER && writers == 0 {
-            // No writer holds or waits: acquire.
+            // No writer holds or waits: try to acquire. EBUSY here means a
+            // writer won the word between our check and the CAS — ordinary
+            // contention: fall into the wait below rather than returning it.
             let r = reader_acquire(mem, rwlock_addr)?;
-            return Ok(if r == 0 { Ok(()) } else { Err(r) });
+            match r {
+                0 => return Ok(Ok(())),
+                consts::EBUSY => {}
+                code => return Ok(Err(code)),
+            }
         }
         let remaining = match deadline {
             Some(d) => d.saturating_duration_since(std::time::Instant::now()),

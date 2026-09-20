@@ -10,6 +10,7 @@
 //! same protocol bionic uses (futex wait on the control word while the winner runs
 //! the routine).
 
+use crate::atomics::GuestAtomic;
 use crate::layouts::{offsets, sizes};
 use crate::memory::GuestMemory;
 use crate::threads::{Futex, WaitResult};
@@ -41,10 +42,17 @@ pub enum OnceOutcome {
 /// winner stores DONE — *not* merely until it observes a non-NEVER value — so the
 /// ordering guarantee holds: no caller returns before the routine has completed.
 ///
+/// The race is resolved by a TRUE atomic CAS (`GuestAtomic::cas_u32`) on the
+/// control word: exactly one caller transitions NEVER -> IN_PROGRESS and only
+/// that caller runs the routine. (An earlier read-then-write "CAS" here was
+/// detection-after-the-fact, not atomicity: two racing threads could both write
+/// IN_PROGRESS, both re-read IN_PROGRESS, and both run the init — a real
+/// double-run the concurrent stress suite caught.)
+///
 /// Errors: a guest-memory fault on the 4-byte control word (nothing else can fail;
 /// `init_routine` faults are the adapter's to report).
 pub fn once<F: FnMut()>(
-    mem: &mut impl GuestMemory,
+    mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
     once_addr: u64,
     mut run_init: F,
@@ -60,26 +68,35 @@ pub fn once<F: FnMut()>(
         match current {
             state::DONE => return Ok(OnceOutcome::AlreadyDone),
             state::IN_PROGRESS => {
-                // Someone else is running it: block until DONE. Bounded spurious-
-                // wakeup safety: re-read the word on every wake.
-                let r = futex.wait(once_addr, state::IN_PROGRESS, None);
-                match r {
-                    WaitResult::Woken => continue,      // re-check the word
-                    WaitResult::TimedOut => continue,   // no timeout given; retry
-                    WaitResult::WouldBlock => continue, // value already re-checked below
+                // Someone else is running it: block until the word is DONE.
+                // The wait is in bounded slices with a word re-check per wake:
+                // a wake delivered between our read and the futex registration
+                // is then reaped by the NEXT slice's re-check instead of being
+                // lost forever (an unbounded sleep here would hang on exactly
+                // that lost wake). Correctness is unaffected: we only return
+                // when the word IS DONE, never on a mere timeout.
+                loop {
+                    let r = futex.wait(once_addr, state::IN_PROGRESS, Some(Duration::from_secs(1)));
+                    match r {
+                        WaitResult::Woken => {}
+                        WaitResult::TimedOut => {}
+                        WaitResult::WouldBlock => {}
+                    }
+                    let mut word = [0u8; 4];
+                    mem.read(once_addr, &mut word)?;
+                    match u32::from_le_bytes(word) {
+                        state::DONE => return Ok(OnceOutcome::AlreadyDone),
+                        // Still in progress (or raced back through a re-init):
+                        // sleep again.
+                        _ => continue,
+                    }
                 }
             }
             state::NEVER => {
-                // Try to win the race: CAS NEVER -> IN_PROGRESS via write. The
-                // crate cannot do a true atomic CAS through the byte-wise memory
-                // trait, so the write is unconditional; correctness across
-                // *guest* threads comes from the adapter running this function
-                // under the guest's own atomicity for the winner — but note this
-                // crate's callers are host threads driving separate guest
-                // threads, each through its own CPU, and the adapter serialises
-                // the CAS by passing a compare-and-swap callback. Without one we
-                // still hold the protocol: see `cas_write` below.
-                if cas_write(mem, futex, once_addr, state::NEVER, state::IN_PROGRESS)? {
+                // Win the race with a TRUE atomic CAS: NEVER -> IN_PROGRESS.
+                // Exactly one caller can succeed; the loser re-loops and observes
+                // IN_PROGRESS (or DONE).
+                if mem.cas_u32(once_addr, state::NEVER, state::IN_PROGRESS)? {
                     // We won: run the routine.
                     run_init();
                     // Publish DONE, then wake every waiter on the word.
@@ -96,33 +113,7 @@ pub fn once<F: FnMut()>(
     }
 }
 
-/// Attempt a compare-and-swap through the memory trait.
-///
-/// The honest contract: a plain read-then-write through a byte-wise trait is not
-/// atomic across concurrent writers. The adapter MUST supply real atomicity by
-/// serialising `write` of the 4-byte control word (it owns the CPU/memory lock).
-/// This crate documents the requirement and detects the loss: if the value at the
-/// address is no longer `expect` when the write lands, the write is abandoned.
-fn cas_write(
-    mem: &mut impl GuestMemory,
-    futex: &impl Futex,
-    addr: u64,
-    expect: u32,
-    new: u32,
-) -> Result<bool, crate::memory::Fault> {
-    let _ = futex;
-    let mut word = [0u8; 4];
-    mem.read(addr, &mut word)?;
-    if u32::from_le_bytes(word) != expect {
-        return Ok(false);
-    }
-    mem.write(addr, &new.to_le_bytes())?;
-    // Re-read: if another thread's IN_PROGRESS/DONE overwrote us between the
-    // write and now, we did not win. (Detection, not prevention — see doc.)
-    let mut word2 = [0u8; 4];
-    mem.read(addr, &mut word2)?;
-    Ok(u32::from_le_bytes(word2) == new)
-}
+
 
 /// Validate the `pthread_once_t` address (4 bytes, no wraparound).
 fn check_addr(addr: u64) -> Result<(), crate::memory::Fault> {
@@ -147,7 +138,7 @@ fn _offsets_used() -> u64 {
 /// concurrency tests can never hang on a bug; production `pthread_once` has no
 /// timeout (see [`once`], which waits unboundedly like POSIX requires).
 pub fn once_with_losers_timeout<F: FnMut()>(
-    mem: &mut impl GuestMemory,
+    mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
     once_addr: u64,
     timeout: Duration,
@@ -162,6 +153,7 @@ mod tests {
     use super::*;
     use crate::mock::MockMemory;
     use crate::mock_threads::MockFutex;
+    use crate::shared_mem::SharedMockMemory;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -169,19 +161,27 @@ mod tests {
         mem.map(addr, &[0u8; 4]); // PTHREAD_ONCE_INIT = all zero
     }
 
+    /// A shared-CAS memory with a mapped 4-byte once control at `addr`.
+    fn smem(addr: u64) -> SharedMockMemory {
+        SharedMockMemory::new({
+            let mut m = MockMemory::new();
+            place(&mut m, addr);
+            m
+        })
+    }
+
     /// The winner runs the routine exactly once; a second caller observes DONE
     /// without running it.
     #[test]
     fn runs_exactly_once_sequential() {
-        let mut mem = MockMemory::new();
-        place(&mut mem, 0x1000);
+        let mem = smem(0x1000);
         let futex = MockFutex::new();
         let count = AtomicUsize::new(0);
         let mut run = || {
             count.fetch_add(1, Ordering::SeqCst);
         };
-        assert_eq!(once(&mut mem, &futex, 0x1000, &mut run).unwrap(), OnceOutcome::Ran);
-        assert_eq!(once(&mut mem, &futex, 0x1000, &mut run).unwrap(), OnceOutcome::AlreadyDone);
+        assert_eq!(once(&mut { mem.clone() }, &futex, 0x1000, &mut run).unwrap(), OnceOutcome::Ran);
+        assert_eq!(once(&mut { mem.clone() }, &futex, 0x1000, &mut run).unwrap(), OnceOutcome::AlreadyDone);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -189,8 +189,7 @@ mod tests {
     /// writes a flag LAST, and losers assert they observe it set when they return.
     #[test]
     fn losers_return_after_completion() {
-        let mem = Arc::new(std::sync::Mutex::new(MockMemory::new()));
-        mem.lock().unwrap().map(0x1000, &[0u8; 4]);
+        let mem = Arc::new(smem(0x1000));
         let futex = Arc::new(MockFutex::new());
         let routine_running = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
@@ -202,14 +201,14 @@ mod tests {
             let running = routine_running.clone();
             let completed = completed.clone();
             handles.push(std::thread::spawn(move || {
-                let mut mem = mem.lock().unwrap();
+                let mut m = (*mem).clone();
                 let mut run = || {
                     running.fetch_add(1, Ordering::SeqCst);
                     // Simulate slow init: the winner sleeps INSIDE the routine.
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     completed.fetch_add(1, Ordering::SeqCst);
                 };
-                let r = once(&mut *mem, &*futex, 0x1000, &mut run).unwrap();
+                let r = once(&mut m, &*futex, 0x1000, &mut run).unwrap();
                 // By the time ANY caller returns, the routine must have completed.
                 assert_eq!(completed.load(Ordering::SeqCst), 1, "ordering guarantee");
                 r
@@ -226,8 +225,7 @@ mod tests {
     /// runs exactly once.
     #[test]
     fn concurrent_hammer_runs_once() {
-        let mem = Arc::new(std::sync::Mutex::new(MockMemory::new()));
-        mem.lock().unwrap().map(0x2000, &[0u8; 4]);
+        let mem = Arc::new(smem(0x2000));
         let futex = Arc::new(MockFutex::new());
         let count = Arc::new(AtomicUsize::new(0));
 
@@ -240,11 +238,11 @@ mod tests {
             let barrier = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 barrier.wait(); // maximise contention
-                let mut mem = mem.lock().unwrap();
+                let mut m = (*mem).clone();
                 let mut run = || {
                     count.fetch_add(1, Ordering::SeqCst);
                 };
-                once(&mut *mem, &*futex, 0x2000, &mut run).unwrap()
+                once(&mut m, &*futex, 0x2000, &mut run).unwrap()
             }));
         }
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -255,13 +253,16 @@ mod tests {
     /// A done-once word is 4 bytes and leaves neighbours alone (guard check).
     #[test]
     fn control_word_stays_in_bounds() {
-        let mut mem = MockMemory::new();
-        // Guards around the 4-byte once control.
-        mem.map(0x0FF0, &[0xA5; 16]);
-        mem.map(0x1000, &[0u8; 4]);
-        mem.map(0x1004, &[0xA5; 16]);
+        let mem = SharedMockMemory::new({
+            let mut m = MockMemory::new();
+            // Guards around the 4-byte once control.
+            m.map(0x0FF0, &[0xA5; 16]);
+            m.map(0x1000, &[0u8; 4]);
+            m.map(0x1004, &[0xA5; 16]);
+            m
+        });
         let futex = MockFutex::new();
-        once(&mut mem, &futex, 0x1000, || {}).unwrap();
+        once(&mut { mem.clone() }, &futex, 0x1000, || {}).unwrap();
         let mut lo = [0u8; 16];
         mem.read(0x0FF0, &mut lo).unwrap();
         let mut hi = [0u8; 16];
@@ -276,11 +277,20 @@ mod tests {
     /// faults at the address.
     #[test]
     fn hostile_addresses() {
-        let mut mem = MockMemory::new();
+        let mem = MockMemory::new();
         let futex = MockFutex::new();
-        assert_eq!(once(&mut mem, &futex, 0, || {}).unwrap_err().addr(), 0);
+        // Null/wraparound faults are detected before any memory access, so the
+        // single-threaded MockMemory (no CAS) is fine here.
         assert_eq!(
-            once(&mut mem, &futex, u64::MAX - 2, || {}).unwrap_err().addr(),
+            once(&mut SharedMockMemory::new(mem.clone()), &futex, 0, || {})
+                .unwrap_err()
+                .addr(),
+            0
+        );
+        assert_eq!(
+            once(&mut SharedMockMemory::new(mem), &futex, u64::MAX - 2, || {})
+                .unwrap_err()
+                .addr(),
             u64::MAX - 2
         );
     }
@@ -296,16 +306,16 @@ mod tests {
         let mut run = || {
             ran.fetch_add(1, Ordering::SeqCst);
         };
-        assert!(once(&mut mem, &futex, 0x1000, &mut run).is_err());
+        assert!(once(&mut SharedMockMemory::new(mem), &futex, 0x1000, &mut run).is_err());
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
     /// An unmapped control word faults at the address.
     #[test]
     fn unmapped_control_word_faults() {
-        let mut mem = MockMemory::new();
+        let mem = MockMemory::new();
         let futex = MockFutex::new();
-        let err = once(&mut mem, &futex, 0x9999_0000, || {}).unwrap_err();
+        let err = once(&mut SharedMockMemory::new(mem), &futex, 0x9999_0000, || {}).unwrap_err();
         assert_eq!(err.addr(), 0x9999_0000);
     }
 }

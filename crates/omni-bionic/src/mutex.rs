@@ -264,8 +264,16 @@ pub fn lock(
             }
             if cas_acquire(mem, mutex_addr)? {
                 owners.set(mutex_addr, me);
+                Ok(0)
+            } else {
+                // Lost the free-acquire race: another thread won the word. Block
+                // on the contention path — returning 0 here would be a FALSE
+                // acquire (two threads inside at once).
+                contend(mem, futex, owners, threads, mutex_addr, None).map(|r| match r {
+                    Ok(()) => 0,
+                    Err(code) => code,
+                })
             }
-            Ok(0)
         }
         mutex_type::ERRORCHECK => {
             let state = read_state(mem, mutex_addr)?;
@@ -275,8 +283,13 @@ pub fn lock(
             if state == 0 {
                 if cas_acquire(mem, mutex_addr)? {
                     owners.set(mutex_addr, me);
+                    return Ok(0);
                 }
-                return Ok(0);
+                // Lost the race: contend (see RECURSIVE arm).
+                return contend(mem, futex, owners, threads, mutex_addr, None).map(|r| match r {
+                    Ok(()) => 0,
+                    Err(code) => code,
+                });
             }
             contend(mem, futex, owners, threads, mutex_addr, None).map(|r| match r {
                 Ok(()) => 0,
@@ -321,8 +334,10 @@ pub fn trylock(
             if state == 0 {
                 if cas_acquire(mem, mutex_addr)? {
                     owners.set(mutex_addr, me);
+                    Ok(0)
+                } else {
+                    Ok(consts::EBUSY) // lost the free race: someone else holds it
                 }
-                Ok(0)
             } else if owners.get(mutex_addr) == Some(me) {
                 if state == u32::MAX {
                     Ok(consts::EAGAIN)
@@ -338,8 +353,10 @@ pub fn trylock(
             if state == 0 {
                 if cas_acquire(mem, mutex_addr)? {
                     owners.set(mutex_addr, me);
+                    Ok(0)
+                } else {
+                    Ok(consts::EBUSY) // lost the free race
                 }
-                Ok(0)
             } else {
                 Ok(consts::EBUSY) // held, even by self: EBUSY, not EDEADLK
             }
@@ -375,8 +392,15 @@ pub fn timedlock(
             if state == 0 {
                 if cas_acquire(mem, mutex_addr)? {
                     owners.set(mutex_addr, me);
+                    Ok(0)
+                } else {
+                    // Lost the free race: block up to the timeout.
+                    contend(mem, futex, owners, threads, mutex_addr, Some(timeout))
+                        .map(|r| match r {
+                            Ok(()) => 0,
+                            Err(code) => code,
+                        })
                 }
-                Ok(0)
             } else if owners.get(mutex_addr) == Some(me) {
                 if state == u32::MAX {
                     Ok(consts::EAGAIN)
@@ -399,8 +423,15 @@ pub fn timedlock(
             } else if state == 0 {
                 if cas_acquire(mem, mutex_addr)? {
                     owners.set(mutex_addr, me);
+                    Ok(0)
+                } else {
+                    // Lost the free race: block up to the timeout.
+                    contend(mem, futex, owners, threads, mutex_addr, Some(timeout))
+                        .map(|r| match r {
+                            Ok(()) => 0,
+                            Err(code) => code,
+                        })
                 }
-                Ok(0)
             } else {
                 contend(mem, futex, owners, threads, mutex_addr, Some(timeout))
                     .map(|r| match r {
@@ -450,8 +481,12 @@ pub fn unlock(
             if owners.get(mutex_addr) != Some(me) {
                 return Ok(consts::EPERM); // not the owner
             }
-            write_state(mem, mutex_addr, 0)?;
+            // Clear the owner BEFORE publishing the released word: an acquirer
+            // that wins the word in between registers as the new owner, and a
+            // late `clear` here would delete the NEW owner's entry — the next
+            // unlock would then fail EPERM with the mutex genuinely held.
             owners.clear(mutex_addr);
+            write_state(mem, mutex_addr, 0)?;
             futex.wake(mutex_addr, 1);
             Ok(0)
         }
@@ -463,10 +498,13 @@ pub fn unlock(
                 return Ok(consts::EPERM);
             }
             let new = state - 1;
-            write_state(mem, mutex_addr, new)?;
             if new == 0 {
+                // Same ordering discipline as ERRORCHECK: clear before publish.
                 owners.clear(mutex_addr);
+                write_state(mem, mutex_addr, new)?;
                 futex.wake(mutex_addr, 1);
+            } else {
+                write_state(mem, mutex_addr, new)?;
             }
             Ok(0)
         }
@@ -480,14 +518,19 @@ pub fn unlock(
             }
             // Release atomically: 1->0 or 2->0 (2 = had waiters). The owner
             // table is the host-side authority for WHO may unlock; the CAS
-            // keeps the guest word consistent under concurrent releases.
+            // keeps the guest word consistent under concurrent releases. The
+            // clear happens BEFORE the CAS publish (matching ERRORCHECK/
+            // RECURSIVE): once the word is 0 a new acquirer may register as
+            // owner, and a late clear would delete the new owner's entry.
+            owners.clear(mutex_addr);
             let released = mem.cas_u32(mutex_addr, lock_state::LOCKED, lock_state::UNLOCKED)?
                 || mem.cas_u32(mutex_addr, lock_state::LOCKED_WITH_WAITERS, lock_state::UNLOCKED)?;
             if !released {
-                // State changed under us: another thread released first.
+                // State changed under us: another thread released first. Our
+                // clear was a no-op (the table entry was already theirs or
+                // absent), so nothing to restore.
                 return Ok(consts::EPERM);
             }
-            owners.clear(mutex_addr);
             futex.wake(mutex_addr, 1);
             Ok(0)
         }
@@ -529,10 +572,21 @@ fn contend(
             return Ok(Ok(()));
         }
         // Mark waiters present (LOCKED_WITH_WAITERS) so the unlock wakes us even
-        // if the state was plain LOCKED when we registered — preventing the lost
-        // wakeup between our value-read and our futex sleep.
-        if state == lock_state::LOCKED {
-            write_state(mem, mutex_addr, lock_state::LOCKED_WITH_WAITERS)?;
+        // if the state was plain LOCKED when we registered. This MUST be a CAS,
+        // not a write: if the holder released between our read and our mark, the
+        // blind write would clobber the published UNLOCKED word and the mutex
+        // would be stuck at 2 with no owner and no pending wake (a real hang).
+        // CAS LOCKED -> LOCKED_WITH_WAITERS: success means the word is still
+        // held and our wake is guaranteed; failure means the state moved under
+        // us, so re-run the acquire protocol instead of sleeping.
+        // RECURSIVE stores its COUNT in this word (2 = held twice), so the
+        // waiter-flag state is meaningless there; its unlock only wakes on the
+        // count->0 transition, which is exactly when the last hold releases.
+        if type_ != mutex_type::RECURSIVE
+            && state == lock_state::LOCKED
+            && !mem.cas_u32(mutex_addr, lock_state::LOCKED, lock_state::LOCKED_WITH_WAITERS)?
+        {
+            continue;
         }
         // Expected value: LOCKED_WITH_WAITERS (the value WE just wrote). A wake
         // targets the address; the futex compares against this expected value.
