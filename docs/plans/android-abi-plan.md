@@ -136,6 +136,47 @@ that takes a pointer or a length.
 
 ---
 
+### Task 3 phase 3 — the OS surface, specified before it is built
+
+**Derived, not guessed.** Method: classify the 188 statically-reachable imports with
+`tools/os_surface.py` (the tool whose totals reproduce: 565 classified, exit 0), intersect with the
+reachable set, then remove everything already implemented in `omni-bionic` by the strict test — a doc
+comment naming the symbol **in backticks** above a `pub fn`. The loose version of that test is what
+produced the withdrawn "88 already implemented"; the strict one gives 79.
+
+The 188 classify as: `pure` 50, `threads-sync` 37, `file-io` 35, `data-object` **18**, `process-env`
+15, `network` 8, `memory` 7, `time-clocks` 7, `dynamic-link` 5, `logging` 4, `unclear` 2. That sums to
+188, and the `data-object` count of **18 independently reproduces D17's figure from a third tool**.
+
+**63 of the 188 need OS surface `omni-platform` does not have**, plus the **9** thread-lifecycle and
+scheduling symbols `omni-bionic` cannot own (D19) — **72 in total**. (The classifier files
+`snprintf` and `vsnprintf` under `file-io`, but they format into a caller's buffer and are already
+serviced; they are excluded from the 63. `fprintf`, `vfprintf`, `vasprintf` and `fscanf` are bound
+and **refused by name** today, and are counted as blocked because each needs a destination that does
+not exist yet.)
+
+| `omni-platform` must grow | for |
+|---|---|
+| **Files** — open/close/read/pread/write, stat/fstat/lstat/statvfs, rename/unlink/mkdir/rmdir, opendir/readdir/closedir | 33 `file-io` symbols. Bionic's `FILE*` layer (`fopen`, `fgets`, `fputs`, `fflush`, `feof`, `fileno`, `fdopen`, `fread`, `fwrite`) then belongs in `omni-bionic` **on top of** the fd primitives, not in the platform crate |
+| **Clocks** — monotonic and realtime now, and sleep | `clock_gettime`, `gettimeofday`, `gmtime_r`, `nanosleep`, `usleep`. The `Clock` trait `omni-bionic` already defines is the shape the adapter implements |
+| **Process and environment** — pid, environment block, auxv, sysconf/sysinfo, abort/exit, cpu id, random bytes | 13 `process-env` symbols. `getauxval` is where the **`AT_HWCAP` decision** lands — still open, both arms measured, see the blockers table |
+| **Sockets and polling** — socket, poll/select, getaddrinfo | 8 `network` symbols |
+| **A log sink** | `__android_log_print`, `syslog`, `openlog`, `closelog` |
+| **Threads** — spawn, join, detach, attributes, scheduling | the 9 lifecycle/scheduling symbols |
+
+**The five-target rule applies to every one of these.** When a platform primitive is added, add the
+Linux and macOS signatures **at the same time** as honest `unsupported` returns naming the POSIX call
+they intend to make. It costs minutes and it is what makes the non-Windows bring-up a fill-in rather
+than a redesign. Do **not** write speculative `open`/`mmap` bodies for those targets — that was ruled
+against deliberately, because an unverified body misbehaves silently where a typed error fails
+immediately and visibly.
+
+**Sequencing note.** `dl_iterate_phdr` is *not* in this phase — it needs `omni-elf`'s loader state,
+not the OS — and it is the highest-value single item in Task 3, because the statically-linked C++
+runtime walks 11.5 MB of `.eh_frame` through it and **C++ exceptions break without it**.
+
+---
+
 ## Task 4: All 3,594 initializers — milestone M3
 
 Run them, in order, from the real loaded image.
