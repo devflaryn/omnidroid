@@ -19,8 +19,29 @@
 //!   Omnidroid sees an access violation in JIT-generated guest code before dynarmic's frame-based
 //!   SEH does. D4 verified the ordering (`veh_hits = 1`, dynarmic's slow path never entered) and
 //!   D10 requires it, because whoever handles the fault owns guest demand paging.
+//! * [`clock`] — monotonic time, wall time and sleeping. One process-wide monotonic epoch.
+//! * [`process`] — pid, cpu count, entropy and the current processor number. Implemented and run
+//!   on Windows; the entropy and cpu-id halves are structural on Linux and macOS, where they
+//!   return [`ProcessError::Unsupported`](process::ProcessError::Unsupported) naming the POSIX
+//!   call they intend to make.
+//! * [`log`] — a sink for a line the guest wrote, with Android's and syslog's priority scales.
 //!
-//! Threads, clocks, dynamic loading and windowing will arrive as sibling modules in later tasks.
+//! Files, directories, sockets, threads, dynamic loading and windowing will arrive as sibling
+//! modules in later tasks.
+//!
+//! # Not every primitive needs a `cfg`, and saying which is part of the seam
+//!
+//! [`vm`] and [`fault`] are OS APIs end to end, so both have a Windows backend and a structural
+//! unix one. [`clock`], [`log`], and half of [`process`] are **portable standard library** —
+//! `Instant`, `SystemTime`, `thread::sleep`, `stderr`, `process::id`, `available_parallelism` —
+//! and they are implemented once, with no backend and no `cfg`.
+//!
+//! That asymmetry is deliberate and is written out in each module. The five-target rule this
+//! project enforces is *never claim a platform works*, and a fabricated `Unsupported` return for
+//! something `std` already does correctly on all five targets would be a false claim in the other
+//! direction: it would assert that a clock this process can read cannot be read, and it would make
+//! the non-Windows bring-up harder rather than easier. What stays unclaimed is what has been
+//! **run**: nothing outside Windows x86-64 has been.
 //!
 //! # Diagnostics are part of the API
 //!
@@ -32,5 +53,8 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod clock;
 pub mod fault;
+pub mod log;
+pub mod process;
 pub mod vm;

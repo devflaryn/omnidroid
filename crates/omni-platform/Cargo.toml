@@ -20,6 +20,9 @@ libc = "0.2"
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    # `BCryptGenRandom` for the process seam's entropy. The system-preferred RNG rather than an
+    # algorithm handle this crate would have to open and hold; see src/process/windows.rs.
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
