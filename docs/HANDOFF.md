@@ -118,7 +118,7 @@ Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-pl
 - **Task 3 (the bionic subset) — phases 1 and 2 complete.** Phase 1, commits `fd3b6f4`..`b9cdf69`:
   the adapter, 86 of the 188 reachable imports bound (81 serviced, 5 refused by name), the `printf`
   family, 37 tests against real translated ARM64 code, mutation **137 → 153**. Durable record is
-  **D20**. Phase 2, commits `9878e79`..: the `dl*` family, the guest-memory group and all 18 data
+  **D20**. Phase 2, commits `9878e79`..`4545ef5`: the `dl*` family, the guest-memory group and all 18 data
   objects — **114 of the 188** now covered (96 thunk functions + 18 data objects), 30 new tests,
   mutation **155 → 175** (20 new, 20/20 caught after one MISS was closed). Durable record is
   **D21**. Phase 3 remains; scope for the whole task is **170 thunk functions + 18 data objects**.
