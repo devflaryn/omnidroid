@@ -64,6 +64,8 @@ impl MockMemory {
     fn region_containing(&self, addr: u64) -> Option<&Region> {
         self.regions.iter().find(|r| r.contains(addr))
     }
+
+
 }
 
 impl Region {

@@ -21,6 +21,7 @@
 //! memory — that is the entire point, and it matches how the adapter's memory will
 //! behave (shared hardware under the crate's protocol-level atomicity).
 
+use crate::atomics::GuestAtomic;
 use crate::memory::{Fault, GuestMemory};
 use crate::mock::MockMemory;
 use std::sync::{Arc, Mutex};
@@ -65,6 +66,29 @@ impl GuestMemory for SharedMockMemory {
         self.inner.mem.lock().unwrap().write(addr, buf)
     }
 }
+
+impl GuestAtomic for SharedMockMemory {
+    /// Atomic because the whole read-compare-write happens under one hold of
+    /// the inner host lock — exactly the guarantee the sync primitives need.
+    fn cas_u32(&self, addr: u64, expect: u32, new: u32) -> Result<bool, Fault> {
+        let mut mem = self.inner.mem.lock().unwrap();
+        let mut b = [0u8; 4];
+        mem.read(addr, &mut b)?;
+        if u32::from_le_bytes(b) == expect {
+            mem.write(addr, &new.to_le_bytes())?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+// NOTE: there is deliberately NO `GuestAtomic` impl for single-threaded
+// `MockMemory`: a CAS needs interior mutation through `&self`, which plain
+// Vec storage cannot provide in safe code (the crate forbids `unsafe`). Any
+// test that exercises the sync primitives wraps its memory in
+// [`SharedMockMemory`], whose CAS is atomic under its inner lock.
+// The cell mirror once planned for this was removed as redundant complexity.
 
 #[cfg(test)]
 mod tests {

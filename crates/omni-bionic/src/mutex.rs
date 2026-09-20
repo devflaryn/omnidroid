@@ -41,6 +41,7 @@
 //! * ERRORCHECK relock by the owner: EDEADLK, no state change.
 //! * RECURSIVE relock by the owner: count += 1.
 
+use crate::atomics::GuestAtomic;
 use crate::errno::consts;
 use crate::layouts::{offsets, sizes};
 use crate::memory::GuestMemory;
@@ -233,7 +234,7 @@ pub fn destroy(
 ///   A relock by the owner deadlocks (POSIX); the futex wait has no timeout and
 ///   nobody will wake this thread — tests never exercise that path by hanging.
 pub fn lock(
-    mem: &mut impl GuestMemory,
+    mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
     owners: &OwnerTable,
     threads: &impl ThreadRegistry,
@@ -261,8 +262,9 @@ pub fn lock(
                         Err(code) => code,
                     });
             }
-            write_state(mem, mutex_addr, 1)?;
-            owners.set(mutex_addr, me);
+            if cas_acquire(mem, mutex_addr)? {
+                owners.set(mutex_addr, me);
+            }
             Ok(0)
         }
         mutex_type::ERRORCHECK => {
@@ -271,8 +273,9 @@ pub fn lock(
                 return Ok(consts::EDEADLK);
             }
             if state == 0 {
-                write_state(mem, mutex_addr, 1)?;
-                owners.set(mutex_addr, me);
+                if cas_acquire(mem, mutex_addr)? {
+                    owners.set(mutex_addr, me);
+                }
                 return Ok(0);
             }
             contend(mem, futex, owners, threads, mutex_addr, None).map(|r| match r {
@@ -284,12 +287,12 @@ pub fn lock(
         _ => {
             let state = read_state(mem, mutex_addr)?;
             if state == lock_state::UNLOCKED {
-                // Try to take it: 0 -> 1. (Not atomic across host threads through
-                // the byte trait; contention resolves through the futex protocol:
-                // a loser re-reads, sees locked, and waits.)
-                write_state(mem, mutex_addr, lock_state::LOCKED)?;
-                owners.set(mutex_addr, me);
-                return Ok(0);
+                // Try to take it: 0 -> 1, atomically. A loser's CAS fails and it
+                // falls through to contend().
+                if cas_acquire(mem, mutex_addr)? {
+                    owners.set(mutex_addr, me);
+                    return Ok(0);
+                }
             }
             contend(mem, futex, owners, threads, mutex_addr, None).map(|r| match r {
                 Ok(()) => 0,
@@ -303,7 +306,7 @@ pub fn lock(
 /// the caller for NORMAL — POSIX leaves NORMAL self-trylock UB, and bionic's
 /// trylock returns EBUSY for any held state; that is the behaviour here).
 pub fn trylock(
-    mem: &mut impl GuestMemory,
+    mem: &mut (impl GuestMemory + GuestAtomic),
     owners: &OwnerTable,
     threads: &impl ThreadRegistry,
     mutex_addr: u64,
@@ -316,8 +319,9 @@ pub fn trylock(
     match type_ {
         mutex_type::RECURSIVE => {
             if state == 0 {
-                write_state(mem, mutex_addr, 1)?;
-                owners.set(mutex_addr, me);
+                if cas_acquire(mem, mutex_addr)? {
+                    owners.set(mutex_addr, me);
+                }
                 Ok(0)
             } else if owners.get(mutex_addr) == Some(me) {
                 if state == u32::MAX {
@@ -332,16 +336,16 @@ pub fn trylock(
         }
         mutex_type::ERRORCHECK => {
             if state == 0 {
-                write_state(mem, mutex_addr, 1)?;
-                owners.set(mutex_addr, me);
+                if cas_acquire(mem, mutex_addr)? {
+                    owners.set(mutex_addr, me);
+                }
                 Ok(0)
             } else {
                 Ok(consts::EBUSY) // held, even by self: EBUSY, not EDEADLK
             }
         }
         _ => {
-            if state == lock_state::UNLOCKED {
-                write_state(mem, mutex_addr, lock_state::LOCKED)?;
+            if state == lock_state::UNLOCKED && cas_acquire(mem, mutex_addr)? {
                 owners.set(mutex_addr, me);
                 Ok(0)
             } else {
@@ -354,7 +358,7 @@ pub fn trylock(
 /// `pthread_mutex_timedlock`. Blocks up to `timeout` on contention. Returns 0,
 /// ETIMEDOUT, or the ERRORCHECK/RECURSIVE codes as `lock` does.
 pub fn timedlock(
-    mem: &mut impl GuestMemory,
+    mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
     owners: &OwnerTable,
     threads: &impl ThreadRegistry,
@@ -369,8 +373,9 @@ pub fn timedlock(
         mutex_type::RECURSIVE => {
             let state = read_state(mem, mutex_addr)?;
             if state == 0 {
-                write_state(mem, mutex_addr, 1)?;
-                owners.set(mutex_addr, me);
+                if cas_acquire(mem, mutex_addr)? {
+                    owners.set(mutex_addr, me);
+                }
                 Ok(0)
             } else if owners.get(mutex_addr) == Some(me) {
                 if state == u32::MAX {
@@ -392,8 +397,9 @@ pub fn timedlock(
             if state != 0 && owners.get(mutex_addr) == Some(me) {
                 Ok(consts::EDEADLK)
             } else if state == 0 {
-                write_state(mem, mutex_addr, 1)?;
-                owners.set(mutex_addr, me);
+                if cas_acquire(mem, mutex_addr)? {
+                    owners.set(mutex_addr, me);
+                }
                 Ok(0)
             } else {
                 contend(mem, futex, owners, threads, mutex_addr, Some(timeout))
@@ -405,8 +411,7 @@ pub fn timedlock(
         }
         _ => {
             let state = read_state(mem, mutex_addr)?;
-            if state == lock_state::UNLOCKED {
-                write_state(mem, mutex_addr, lock_state::LOCKED)?;
+            if state == lock_state::UNLOCKED && cas_acquire(mem, mutex_addr)? {
                 owners.set(mutex_addr, me);
                 Ok(0)
             } else {
@@ -426,7 +431,7 @@ pub fn timedlock(
 /// word was LOCKED_WITH_WAITERS; wake 1; else wake 0 — a wake with no waiter is
 /// free, so always attempting one wake is correct and simpler).
 pub fn unlock(
-    mem: &mut impl GuestMemory,
+    mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
     owners: &OwnerTable,
     threads: &impl ThreadRegistry,
@@ -473,7 +478,15 @@ pub fn unlock(
                 // strictly safer: the engine should never do this).
                 return Ok(consts::EPERM);
             }
-            write_state(mem, mutex_addr, 0)?;
+            // Release atomically: 1->0 or 2->0 (2 = had waiters). The owner
+            // table is the host-side authority for WHO may unlock; the CAS
+            // keeps the guest word consistent under concurrent releases.
+            let released = mem.cas_u32(mutex_addr, lock_state::LOCKED, lock_state::UNLOCKED)?
+                || mem.cas_u32(mutex_addr, lock_state::LOCKED_WITH_WAITERS, lock_state::UNLOCKED)?;
+            if !released {
+                // State changed under us: another thread released first.
+                return Ok(consts::EPERM);
+            }
             owners.clear(mutex_addr);
             futex.wake(mutex_addr, 1);
             Ok(0)
@@ -489,7 +502,7 @@ pub fn unlock(
 /// state word as the expected value, then re-run the acquire protocol. Returns
 /// Ok(()) on eventual acquisition, Err(code) on timeout (ETIMEDOUT).
 fn contend(
-    mem: &mut impl GuestMemory,
+    mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
     owners: &OwnerTable,
     threads: &impl ThreadRegistry,
@@ -503,9 +516,11 @@ fn contend(
     loop {
         let state = read_state(mem, mutex_addr)?;
         if state == lock_state::UNLOCKED {
-            write_state(mem, mutex_addr, lock_state::LOCKED)?;
-            owners.set(mutex_addr, me);
-            return Ok(Ok(()));
+            if cas_acquire(mem, mutex_addr)? {
+                owners.set(mutex_addr, me);
+                return Ok(Ok(()));
+            }
+            continue; // lost the race: re-read
         }
         if type_ == mutex_type::RECURSIVE && owners.get(mutex_addr) == Some(me) {
             // Lost the mutex then got it back via recursion window — treat as
@@ -547,8 +562,7 @@ fn contend(
             WaitResult::TimedOut => {
                 // One last chance: maybe the wake raced our deregistration.
                 let state = read_state(mem, mutex_addr)?;
-                if state == lock_state::UNLOCKED {
-                    write_state(mem, mutex_addr, lock_state::LOCKED)?;
+                if state == lock_state::UNLOCKED && cas_acquire(mem, mutex_addr)? {
                     owners.set(mutex_addr, me);
                     return Ok(Ok(()));
                 }
@@ -582,6 +596,17 @@ fn read_type(mem: &impl GuestMemory, addr: u64) -> Result<i32, crate::memory::Fa
     Ok(i32::from_le_bytes(b))
 }
 
+/// Atomic acquire: 0 -> LOCKED (1) via CAS. Returns true if THIS caller won.
+/// A failed CAS means another thread holds the mutex (or won the race).
+fn cas_acquire(
+    mem: &(impl GuestMemory + GuestAtomic),
+    mutex_addr: u64,
+) -> Result<bool, crate::memory::Fault> {
+    // The whole 4-byte word is the state; LOCKED and LOCKED_WITH_WAITERS are
+    // both "held", so the only acquirable value is UNLOCKED (0).
+    mem.cas_u32(mutex_addr, lock_state::UNLOCKED, lock_state::LOCKED)
+}
+
 fn check_range(addr: u64, len: u64) -> Result<(), crate::memory::Fault> {
     if addr == 0 {
         return Err(crate::memory::Fault(0));
@@ -604,10 +629,20 @@ mod tests {
     use crate::mock::MockMemory;
     use crate::mock_threads::{MockFutex, MockThreads};
 
-    fn setup(addr: u64) -> (MockMemory, MockFutex, OwnerTable, MockThreads) {
+    fn setup(addr: u64) -> (
+        crate::shared_mem::SharedMockMemory,
+        MockFutex,
+        OwnerTable,
+        MockThreads,
+    ) {
         let mut mem = MockMemory::new();
         mem.map(addr, &[0u8; 40]);
-        (mem, MockFutex::new(), OwnerTable::new(), MockThreads::new())
+        (
+            crate::shared_mem::SharedMockMemory::new(mem),
+            MockFutex::new(),
+            OwnerTable::new(),
+            MockThreads::new(),
+        )
     }
 
     /// All-zero struct (PTHREAD_MUTEX_INITIALIZER) is a valid unlocked DEFAULT.
@@ -628,13 +663,13 @@ mod tests {
             let (mut mem, f, o, t) = setup(0x1000);
             init(&mut mem, 0x1000, 0).unwrap();
             // Set the type through the attr path.
-            mem.map(0x2000, &ty.to_le_bytes());
+            mem.with_exclusive(|g| g.map(0x2000, &ty.to_le_bytes()));
             init(&mut mem, 0x1000, 0x2000).unwrap();
-            assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), 0, "type {ty}");
-            assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), consts::EBUSY, "type {ty}");
-            assert_eq!(unlock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+            assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), 0, "type {ty}");
+            assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), consts::EBUSY, "type {ty}");
+            assert_eq!(unlock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
             // After unlock, trylock works again.
-            assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), 0);
+            assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), 0);
         }
     }
 
@@ -644,12 +679,12 @@ mod tests {
     fn trylock_recursive_self_increments() {
         let (mut mem, f, o, t) = setup(0x1000);
         set_type(&mut mem, 0x1000, mutex_type::RECURSIVE);
-        assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), 0);
-        assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), 0, "self trylock counts");
+        assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), 0, "self trylock counts");
         assert_eq!(read_state(&mem, 0x1000).unwrap(), 2);
-        assert_eq!(unlock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(unlock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
         assert_eq!(read_state(&mem, 0x1000).unwrap(), 1, "still held once");
-        assert_eq!(unlock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(unlock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
         assert_eq!(read_state(&mem, 0x1000).unwrap(), 0);
     }
 
@@ -664,7 +699,7 @@ mod tests {
             m
         };
         let mem = SharedMockMemory::new(base);
-        mem.with_exclusive(|g| set_type(g, 0x1000, mutex_type::ERRORCHECK));
+        set_type(&mut { mem.clone() }, 0x1000, mutex_type::ERRORCHECK);
         let f = std::sync::Arc::new(MockFutex::new());
         let o = std::sync::Arc::new(OwnerTable::new());
         let t = std::sync::Arc::new(MockThreads::new());
@@ -701,19 +736,19 @@ mod tests {
         let (mut mem, f, o, t) = setup(0x1000);
         set_type(&mut mem, 0x1000, mutex_type::RECURSIVE);
         for i in 1..=5 {
-            assert_eq!(lock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0, "lock {i}");
+            assert_eq!(lock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0, "lock {i}");
             assert_eq!(read_state(&mem, 0x1000).unwrap(), i, "count after lock {i}");
         }
         // While held, the owner still holds the count (state != 0) but its own
         // trylock would only count up; nothing else to assert there — instead
         // verify the OTHER-thread view through a second registry identity.
         for i in (1..=4).rev() {
-            assert_eq!(unlock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+            assert_eq!(unlock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
             assert_eq!(read_state(&mem, 0x1000).unwrap(), i, "after unlock");
         }
-        assert_eq!(unlock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(unlock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
         assert_eq!(read_state(&mem, 0x1000).unwrap(), 0);
-        assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), 0, "released at zero");
+        assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), 0, "released at zero");
     }
 
     /// NORMAL relock by the owner is a deadlock — tested via trylock (EBUSY),
@@ -722,20 +757,20 @@ mod tests {
     fn normal_relock_documented_via_trylock() {
         let (mut mem, f, o, t) = setup(0x1000);
         set_type(&mut mem, 0x1000, mutex_type::NORMAL);
-        assert_eq!(lock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(lock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
         // POSIX: lock() again would deadlock. trylock() must report EBUSY:
-        assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), consts::EBUSY);
+        assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), consts::EBUSY);
     }
 
     /// destroy on a locked mutex returns EBUSY; on an unlocked one, 0, and the
     /// struct reads back all-zero.
     #[test]
     fn destroy_semantics() {
-        let (mut mem, f, o, t) = setup(0x1000);
-        assert_eq!(lock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
-        assert_eq!(destroy(&mut mem, &o, 0x1000).unwrap(), consts::EBUSY);
-        assert_eq!(unlock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
-        assert_eq!(destroy(&mut mem, &o, 0x1000).unwrap(), 0);
+        let (mem, f, o, t) = setup(0x1000);
+        assert_eq!(lock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(destroy(&mut mem.clone(), &o, 0x1000).unwrap(), consts::EBUSY);
+        assert_eq!(unlock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(destroy(&mut mem.clone(), &o, 0x1000).unwrap(), 0);
         let mut bytes = [0u8; 40];
         mem.read(0x1000, &mut bytes).unwrap();
         assert!(bytes.iter().all(|&b| b == 0));
@@ -747,14 +782,14 @@ mod tests {
     fn timedlock_times_out() {
         let (mut mem, f, o, t) = setup(0x1000);
         set_type(&mut mem, 0x1000, mutex_type::NORMAL);
-        assert_eq!(lock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+        assert_eq!(lock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap(), 0);
         let start = std::time::Instant::now();
-        let r = timedlock(&mut mem, &f, &o, &t, 0x1000, std::time::Duration::from_millis(120)).unwrap();
+        let r = timedlock(&mut mem.clone(), &f, &o, &t, 0x1000, std::time::Duration::from_millis(120)).unwrap();
         let elapsed = start.elapsed();
         assert_eq!(r, consts::ETIMEDOUT);
         assert!(elapsed >= std::time::Duration::from_millis(120), "{elapsed:?}");
         // And the mutex is still locked by the owner.
-        assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), consts::EBUSY);
+        assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), consts::EBUSY);
     }
 
     /// timedlock acquires when the holder releases in time: the holder holds for
@@ -772,7 +807,7 @@ mod tests {
             m
         };
         let mem = SharedMockMemory::new(base);
-        mem.with_exclusive(|g| set_type(g, 0x1000, mutex_type::NORMAL));
+        set_type(&mut { mem.clone() }, 0x1000, mutex_type::NORMAL);
         let futex = std::sync::Arc::new(MockFutex::new());
         let owners = std::sync::Arc::new(OwnerTable::new());
         let threads = std::sync::Arc::new(MockThreads::new());
@@ -811,14 +846,14 @@ mod tests {
     #[test]
     fn init_sets_type_from_attr() {
         let (mut mem, _f, _o, _t) = setup(0x1000);
-        mem.map(0x2000, &[0u8; 8]);
+        mem.with_exclusive(|g| g.map(0x2000, &[0u8; 8]));
         attr_init(&mut mem, 0x2000).unwrap();
         assert_eq!(attr_settype(&mut mem, 0x2000, mutex_type::RECURSIVE).unwrap(), 0);
         assert_eq!(init(&mut mem, 0x1000, 0x2000).unwrap(), 0);
         assert_eq!(read_type(&mem, 0x1000).unwrap(), mutex_type::RECURSIVE);
 
         // NULL attr => DEFAULT (3).
-        mem.map(0x3000, &[0u8; 40]);
+        mem.with_exclusive(|g| g.map(0x3000, &[0u8; 40]));
         init(&mut mem, 0x3000, 0).unwrap();
         assert_eq!(read_type(&mem, 0x3000).unwrap(), mutex_type::DEFAULT);
 
@@ -829,22 +864,25 @@ mod tests {
     /// Guard regions: no operation writes outside the 40 bytes.
     #[test]
     fn writes_stay_in_struct() {
-        let mut mem = MockMemory::new();
-        mem.map(0x0F00, &[0xA5; 32]); // low guard
-        mem.map(0x1000, &[0u8; 40]);
-        mem.map(0x1028, &[0xA5; 32]); // high guard
+        let mem = crate::shared_mem::SharedMockMemory::new({
+            let mut m = MockMemory::new();
+            m.map(0x0F00, &[0xA5; 32]); // low guard
+            m.map(0x1000, &[0u8; 40]);
+            m.map(0x1028, &[0xA5; 32]); // high guard
+            m
+        });
         let f = MockFutex::new();
         let o = OwnerTable::new();
         let t = MockThreads::new();
-        set_type(&mut mem, 0x1000, mutex_type::RECURSIVE);
+        set_type(&mut mem.clone(), 0x1000, mutex_type::RECURSIVE);
         for _ in 0..3 {
-            lock(&mut mem, &f, &o, &t, 0x1000).unwrap();
+            lock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap();
         }
-        trylock(&mut mem, &o, &t, 0x1000).unwrap();
+        trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap();
         for _ in 0..4 {
-            unlock(&mut mem, &f, &o, &t, 0x1000).unwrap();
+            unlock(&mut mem.clone(), &f, &o, &t, 0x1000).unwrap();
         }
-        destroy(&mut mem, &o, 0x1000).unwrap();
+        destroy(&mut mem.clone(), &o, 0x1000).unwrap();
         for range in [(0x0F00u64, 32usize), (0x1028, 32)] {
             let mut buf = vec![0u8; range.1];
             mem.read(range.0, &mut buf).unwrap();
@@ -857,18 +895,18 @@ mod tests {
     /// path is identical, and the type word is only ever written by init).
     #[test]
     fn hostile_inputs() {
-        let (mut mem, f, o, t) = setup(0x1000);
-        assert!(lock(&mut mem, &f, &o, &t, 0).is_err());
-        assert!(unlock(&mut mem, &f, &o, &t, 0).is_err());
-        assert!(trylock(&mut mem, &o, &t, 0).is_err());
-        assert!(destroy(&mut mem, &o, 0).is_err());
+        let (mem, f, o, t) = setup(0x1000);
+        assert!(lock(&mut mem.clone(), &f, &o, &t, 0).is_err());
+        assert!(unlock(&mut mem.clone(), &f, &o, &t, 0).is_err());
+        assert!(trylock(&mut mem.clone(), &o, &t, 0).is_err());
+        assert!(destroy(&mut mem.clone(), &o, 0).is_err());
         // Address range past u64::MAX:
-        assert!(lock(&mut mem, &f, &o, &t, u64::MAX - 20).is_err());
+        assert!(lock(&mut mem.clone(), &f, &o, &t, u64::MAX - 20).is_err());
         // Unmapped:
-        assert!(lock(&mut mem, &f, &o, &t, 0xdead_0000).is_err());
+        assert!(lock(&mut mem.clone(), &f, &o, &t, 0xdead_0000).is_err());
     }
 
-    fn set_type(mem: &mut MockMemory, addr: u64, ty: i32) {
-        mem.write(addr + 8, &ty.to_le_bytes()).unwrap();
+    fn set_type(mem: &mut crate::shared_mem::SharedMockMemory, addr: u64, ty: i32) {
+        mem.with_exclusive(|g| g.write(addr + 8, &ty.to_le_bytes()).unwrap());
     }
 }

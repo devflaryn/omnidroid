@@ -28,6 +28,8 @@
 #![deny(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod atomics;
+pub mod cond;
 pub mod context;
 pub mod ctype;
 pub mod errno;
