@@ -27,7 +27,7 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
-**864 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-20 — was 608
+**877 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-20 — was 608
 before `omni-bionic` existed, so the two are not comparable). Clippy clean on
 `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
@@ -39,7 +39,7 @@ gate that refuses to run against a modified tree:
 
 | Harness | Rows |
 |---|---|
-| `tools/mutate.py` (workspace) | **118** |
+| `tools/mutate.py` (workspace) | **137** |
 | `crates/dynarmic-sys/tools/mutate_shim.py` | 23 |
 | `crates/omni-elf/tools/mutate_loader.py` | 18 |
 
@@ -141,8 +141,8 @@ complete.**
 | Piece | State |
 |---|---|
 | `android-abi` M3 Task 2 (Claude) | **Reviewed.** F1/F2/F3 to fix before Task 3 — see `task-2-review.md` |
-| `bionic-pure` (GLM) — 83 pure libc/libm functions | **Partially verified.** errno constants and the bionic byte-difference compare convention check out; the `tools/mutate.py` table has **zero** rows for `omni-bionic` |
-| `bionic-threads` (GLM) — pthread/sync/TLS | **Partially verified.** One real defect found and fixed (`sem_post` consumed the waiter flag; 1.0104 s stall measured); three timing flakes fixed |
+| `bionic-pure` (GLM) — 83 pure libc/libm functions | **Verified by mutation.** 11 rows, 11/11 caught. errno values were right but **untested** — that gap is closed. The bionic byte-difference compare convention is pinned, including the glibc over-correction |
+| `bionic-threads` (GLM) — pthread/sync/TLS | **Verified by mutation** for the sem waiter protocol and the layout widths. One real defect found and fixed (`sem_post` consumed the waiter flag; **1.0104 s** stall measured); three timing flakes fixed |
 | `os-surface-inventory.md` + `tools/os_surface.py` (GLM) | **Not yet reviewed.** |
 
 **Confirmed defects found in GLM's work so far**, both now fixed:
@@ -168,7 +168,7 @@ says `operator new size 0x180 = 384`. `SEM_T = 4` is likely an under-declaration
 bytes. No write in the crate exceeds a declared size — `pthread_attr_init` and the rwlock initialisers
 are the only bulk zeroes, both at 56 bytes, and 56 is confirmed by field-by-field arithmetic.
 
-## The straddling-access defect — fix this before Task 3
+## The straddling-access defect — FIXED (`97e12b7`)
 
 **Any guest access that straddles a commit-granule boundary in a lazily-committed mapping is refused
 as `NotMapped`, even when both granules are committed and both belong to the same mapping.**
@@ -197,20 +197,53 @@ This was found while investigating Task 2's F2, which claimed the opposite — t
 *out* of the committed granule. That claim is **disproved**: `admit().end` is the split entry's end,
 so the walk was already bounded by committed memory. Do not resurrect it.
 
+**Fixed in `97e12b7`.** `admit` now walks the entries an access touches, requiring each to be
+contiguous, to belong to the **same mapping**, and to permit the access. `admits_region` is untouched
+and is still the single copy of rules 1-3 — it is called once per entry instead of once per access.
+`Admitted.end` is the end of the last entry needed, which for an access inside one entry is exactly
+what it was, and `fully_committed` is the AND over those entries, so `omni-cpu`'s fetch cache keeps
+its contract. Rows `access-A1` (restores the defect) and `access-B1` (the over-correction: the walk
+running out of its mapping), both caught. The over-correction row is guarded by a test that places
+two mappings at adjacent addresses: contiguous addresses are not the same mapping.
+
 ## Next action
 
-**Fix the straddling-access defect above, then start Task 3 (the bionic subset).** F1, F5 and F3 are
-already fixed, with hostile tests and mutation rows (`varargs-A5`..`A8`, `abi-A6`, `boundary-A12`,
-6/6 caught). F4 and F6-F10 from the review remain open and are not blockers.
+**Start M3 Task 3, the bionic subset** — 170 thunk functions + 18 data objects. Everything that was
+blocking it is cleared:
+
+| Blocker | State |
+|---|---|
+| Task 2 unreviewed | Reviewed; `task-2-review.md` |
+| F1, F5, F3 | Fixed, with hostile tests and rows `varargs-A5`..`A8`, `abi-A6`, `boundary-A12` (6/6 caught) |
+| F2 | Disproved — see above — but it found the straddling-access defect, now fixed (`access-A1`/`B1` caught) |
+| `omni-bionic` had no mutation rows | 11 rows added, 11/11 caught; the two misses it found are closed |
+
+F4 and F6-F10 from the review remain **open and are not blockers**. The two worth carrying into
+Task 3's dispatch:
+
+- **F6** — there is no 16-byte variadic slot and, unlike `Args::unsupported`, `VarArgs` has **no
+  refusal API at all**. A `fprintf("%Lf", …)` handler has no correct call and no way to say "I will
+  not guess" — Global Constraint 1's exact failure shape. `long double` is 128-bit quad on the guest.
+- **F9** — `ImportCall::mem()` reaches `GuestMem::space()` and therefore the whole `GuestSpace`, so a
+  handler can `map_anonymous`/`unmap`/`protect` while generated code is live. Task 3's `mmap`,
+  `munmap` and `mprotect` must be `Reentrant`, and nothing in the types says so.
+
+Carry into the dispatch as before: D17's in-loop dispatch decision, that the dispatcher-side MXCSR
+guard already exists and must not be moved or removed, and that an unbound symbol must fail with a
+typed error naming the symbol and guest address.
 
 Then: decide whether `omni-bionic` folds into `omni-android` (ARCHITECTURE §2 puts bionic there; the
 separate crate was only for isolation during review), write the adapter binding the bionic layer to
 the thunk boundary, and run M3's gate — all 3,594 static initializers complete, **verified by reading
 back state they actually wrote**, not by a counter reaching 3,594.
 
-**A mutation harness for `omni-bionic` is still owed.** `tools/mutate.py` has 118 rows and **none**
-of them touch the 12,543 lines of bionic code; every other crate has one. GLM did hand spot-checks
-(commit `26b3a1c`) but left nothing durable.
+Then: decide whether `omni-bionic` folds into `omni-android` (ARCHITECTURE §2 puts bionic there; the
+separate crate was only for isolation during review), write the adapter binding the bionic layer to
+the thunk boundary, and run M3's gate — all 3,594 static initializers complete, **verified by reading
+back state they actually wrote**, not by a counter reaching 3,594.
+
+**The `omni-bionic` mutation harness now exists** (`90693bf`): 11 rows, 11/11 caught. Its first run
+caught 9 — the two misses were the errno constants, which had no test at all, and that is closed.
 
 ## What Task 2's reviewer was asked to check (kept for the record)
 
