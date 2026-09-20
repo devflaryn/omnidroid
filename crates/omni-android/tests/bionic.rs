@@ -2176,6 +2176,12 @@ fn an_anonymous_map_shared_is_accepted_because_there_is_no_fork_to_share_with() 
 /// the exit path in the first place: `ImportCall` holds no CPU, so an inline handler could not
 /// invalidate anything even if changing the address space were safe from one.
 ///
+/// **One CPU context for the whole test, and that is what makes it a detector.** The translating
+/// backend's code cache is per context (D5: unshared per-thread code caches), so a version that
+/// took a fresh context for each step translated everything afresh every time and could not tell
+/// an invalidated cache from an empty one. That version passed with the invalidation removed —
+/// mutation row `guestmem-A1` came back NOT CAUGHT, which is what found it.
+///
 /// Both programs are two instructions and differ only in the constant they return, so a failure
 /// here is unambiguous: `0xAA` where `0xBB` belongs is the old translation.
 #[test]
@@ -2183,50 +2189,89 @@ fn code_at_a_reused_address_is_retranslated_rather_than_run_from_the_cache() {
     let _guard = serialized();
     let f = fixture_with(&[]);
     let length = 64 * 1024;
-    let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
-    assert_ne!(at, u64::MAX);
     let out = f.guest.data + 0x400;
+    let mut cpu = f.guest.thread(&f.boundary);
 
-    let install_and_call = |answer: u16, slot: usize| {
+    let at = {
+        let entry = call_one(&f, "mmap", |asm| {
+            asm.mov(0, 0);
+            asm.mov(1, length);
+            asm.mov(2, PROT_RW);
+            asm.mov(3, MAP_ANON_PRIVATE);
+            asm.mov(4, u64::MAX);
+            asm.mov(5, 0);
+        });
+        f.guest.rearm(&mut cpu, &f.boundary);
+        f.run(&mut cpu, entry).expect("mmap");
+        f.guest.read_u64(f.guest.data)
+    };
+    assert_ne!(at, u64::MAX);
+
+    // Write a two-instruction program at `at`, make it executable through the guest's own
+    // `mprotect`, call it, and store what it answered.
+    let install_and_call =
+        |f: &Fixture, cpu: &mut omni_cpu::dynarmic::DynarmicCpu, answer: u16, slot: u32| {
+        f.guest.space.ensure_committed(at as usize, 16).expect("the first page of the mapping");
         f.guest.write_bytes(
             at as usize,
             &[movz(0, answer, 0).to_le_bytes(), ret(30).to_le_bytes()].concat(),
         );
-        let code = value_of(&f, "mprotect", |asm| {
+        let protect = call_one(&f, "mprotect", |asm| {
             asm.mov(0, at);
             asm.mov(1, length);
             asm.mov(2, 5); // PROT_READ | PROT_EXEC
         });
-        assert_eq!(code as i64 as i32, 0);
-        let entry = program(&f, |asm| {
+        f.guest.rearm(cpu, &f.boundary);
+        f.run(cpu, protect).expect("mprotect");
+        assert_eq!(f.guest.read_u64(f.guest.data) as i64 as i32, 0);
+
+        // A fresh caller each time, so what is under test is the cached translation of the callee
+        // at `at` rather than of the caller.
+        let caller = program(&f, |asm| {
             asm.mov(9, at);
             asm.mov(10, out as u64);
             asm.push(blr(9));
-            asm.push(str_imm(0, 10, slot as u32));
+            asm.push(str_imm(0, 10, slot));
         });
-        let exit = run_program(&f, entry).expect("the guest runs what it mapped");
+        f.guest.rearm(cpu, &f.boundary);
+        let exit = f.run(cpu, caller).expect("the guest runs what it mapped");
         assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
     };
 
-    install_and_call(0xAA, 0);
+    install_and_call(&f, &mut cpu, 0xAA, 0);
     assert_eq!(f.guest.read_u64(out), 0xAA);
 
     // Give the range back and take it again at the same address, then put a different program
     // there. Without the invalidation in `munmap`/`mprotect` the cached translation of the first
     // one still answers.
-    let code = value_of(&f, "munmap", |asm| {
+    let unmap = call_one(&f, "munmap", |asm| {
         asm.mov(0, at);
         asm.mov(1, length);
     });
-    assert_eq!(code as i64 as i32, 0);
-    let again = guest_mmap(&f, at, length, PROT_RW, MAP_ANON_PRIVATE | 0x10_0000, -1, 0);
-    assert_eq!(again, at, "MAP_FIXED_NOREPLACE must give the address back");
+    f.guest.rearm(&mut cpu, &f.boundary);
+    f.run(&mut cpu, unmap).expect("munmap");
+    assert_eq!(f.guest.read_u64(f.guest.data) as i64 as i32, 0);
 
-    install_and_call(0xBB, 8);
+    let remap = call_one(&f, "mmap", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+        asm.mov(2, PROT_RW);
+        asm.mov(3, MAP_ANON_PRIVATE | 0x10_0000);
+        asm.mov(4, u64::MAX);
+        asm.mov(5, 0);
+    });
+    f.guest.rearm(&mut cpu, &f.boundary);
+    f.run(&mut cpu, remap).expect("mmap");
+    assert_eq!(
+        f.guest.read_u64(f.guest.data),
+        at,
+        "MAP_FIXED_NOREPLACE must give the address back"
+    );
+
+    install_and_call(&f, &mut cpu, 0xBB, 8);
     assert_eq!(
         f.guest.read_u64(out + 8),
         0xBB,
-        "0xAA here is the first program's translation, served out of the code cache after the \
-         memory it was translated from was unmapped"
+        "0xAA here is the first program's translation, served out of the code cache after the          memory it was translated from was unmapped"
     );
 }
