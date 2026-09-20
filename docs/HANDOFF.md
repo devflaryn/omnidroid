@@ -134,16 +134,15 @@ Full record in **D17**. The three things that matter for Task 2:
 
 ## GLM work — review state
 
-Four pieces of work arrived unreviewed; three from GLM 5.3 Flash. Review is in progress and its
-findings are recorded as they land. **Nothing here has been accepted because it reports itself
-complete.**
+Four pieces of work arrived unreviewed; three from GLM 5.3 Flash. **All four are now reviewed.**
+Nothing was accepted because it reported itself complete.
 
 | Piece | State |
 |---|---|
 | `android-abi` M3 Task 2 (Claude) | **Reviewed.** F1/F2/F3 to fix before Task 3 — see `task-2-review.md` |
 | `bionic-pure` (GLM) — 83 pure libc/libm functions | **Verified by mutation.** 11 rows, 11/11 caught. errno values were right but **untested** — that gap is closed. The bionic byte-difference compare convention is pinned, including the glibc over-correction |
 | `bionic-threads` (GLM) — pthread/sync/TLS | **Complete for its scope, and reviewed.** See the coverage row below. One real defect found and fixed (`sem_post` consumed the waiter flag; **1.0104 s** stall measured); three timing flakes fixed; one plausible stub deleted |
-| `os-surface-inventory.md` + `tools/os_surface.py` (GLM) | **Not yet reviewed.** |
+| `os-surface-inventory.md` + `tools/os_surface.py` (GLM) | **Reviewed, and it reproduces.** `python tools/os_surface.py --check` gives the report's table exactly (sums to 565), census `FUNC=539 NOTYPE=3 OBJECT=23`, exit 0; its `data-object` count of 23 independently matches D17's figure from a different tool. One sentence corrected — §1.1 claimed both `__gcov_*` symbols were `process-env` while the tool leaves them `unclear`, which §1.3 and §5.2 already said |
 
 **`omni-bionic`'s coverage, measured against the reachable import list.** Of the **51** thread /
 synchronisation / TLS symbols the 3,594 initializers statically reach:
