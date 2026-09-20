@@ -66,6 +66,7 @@ BIONIC_WIDE = "crates/omni-bionic/src/wide.rs"
 BIONIC_SEM = "crates/omni-bionic/src/sem.rs"
 BIONIC_MUTEX = "crates/omni-bionic/src/mutex.rs"
 BIONIC_NUMERICS = "crates/omni-bionic/src/numerics.rs"
+BIONIC_PRINTF = "crates/omni-bionic/src/printf.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
 LEAF = "crates/omni-elf/src/leaf.rs"
@@ -74,6 +75,11 @@ VARARGS = "crates/omni-android/src/varargs.rs"
 ANDROID_MEM = "crates/omni-android/src/mem.rs"
 REGION = "crates/omni-android/src/region.rs"
 BOUNDARY = "crates/omni-android/src/boundary.rs"
+# The bionic adapter: `omni-bionic`'s functions bound onto the boundary.
+ADAPTER_VIEW = "crates/omni-android/src/bionic/view.rs"
+ADAPTER_MOD = "crates/omni-android/src/bionic/mod.rs"
+ADAPTER_HANDLERS = "crates/omni-android/src/bionic/handlers.rs"
+ADAPTER_FORMAT = "crates/omni-android/src/bionic/format.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
@@ -85,6 +91,9 @@ BIONIC = [
     "cargo", "test", "-p", "omni-bionic", "--lib",
     "--test", "string_tests", "--test", "wide_tests", "--test", "numerics_tests",
     "--test", "mem_tests", "--test", "sem_wakeup",
+    # `printf_tests` is named because the field-width and output caps live there, and they are
+    # the only bound in this crate that a guest-chosen value can push against.
+    "--test", "printf_tests",
     "--no-fail-fast",
 ]
 CPU = ["cargo", "test", "-p", "omni-cpu", "--no-fail-fast"]
@@ -114,6 +123,11 @@ ELF_RELEASE = [
 # multiply every row's cost by that load for no extra detection.
 ANDROID = [
     "cargo", "test", "-p", "omni-android", "--lib", "--test", "roundtrip", "--test", "hostile",
+    # The bionic adapter's own target. Added when the adapter was written: every row below that
+    # names an `ADAPTER_*` file is detected here and nowhere else, so leaving it out would have
+    # turned each of them into a MISS that looked like a missing test rather than a missing
+    # target.
+    "--test", "bionic",
     "--no-fail-fast",
 ]
 
@@ -901,9 +915,13 @@ MUTATIONS = [
     ("abi-A5", "A",
      "a stack argument read without checking that the guest's stack is there",
      ABI,
-     """            let at = self.align_nsaa(8);
+     # STALE PATTERN REPAIRED. F1's fix made `align_nsaa` fallible, so the `;` in the original
+     # pattern stopped matching the source and this row had been silently reporting a MISS for a
+     # reason that had nothing to do with the test it names. Found by a pattern check over the
+     # whole table; the row's intent is unchanged.
+     """            let at = self.align_nsaa(8)?;
             let value = self.mem.read_u64(at, self.blame())?;""",
-     """            let at = self.align_nsaa(8);
+     """            let at = self.align_nsaa(8)?;
             let value = self.mem.read_u64(at, self.blame()).unwrap_or(0);""",
      ANDROID),
 
@@ -1366,6 +1384,153 @@ MUTATIONS = [
         Some((ca, cb)) => Ok(ca as i32 - cb as i32),""",
      """        Some((ca, cb)) => Ok(if ca > cb { 1 } else { -1 }),""",
      BIONIC),
+    # ---- the printf engine's two bounds on guest-chosen sizes ----------------------------------
+    # A width is guest-controlled and `emit_padded` pads with `repeat_n`, so an unbounded one is an
+    # allocation the guest picked. These four rows are the pair of bounds in both directions.
+    ("printf-A1", "A", "the per-conversion field-width cap removed", BIONIC_PRINTF,
+     """                if n > MAX_FIELD_WIDTH {""",
+     """                if false && n > MAX_FIELD_WIDTH {""",
+     BIONIC),
+
+    ("printf-B1", "B", "the field-width cap tightened below a width real code uses", BIONIC_PRINTF,
+     """pub const MAX_FIELD_WIDTH: usize = 64 * 1024;""",
+     """pub const MAX_FIELD_WIDTH: usize = 64;""",
+     BIONIC),
+
+    ("printf-A2", "A", "the total-output cap removed, so a repeated wide field is unbounded",
+     BIONIC_PRINTF,
+     """        if out.len() - start_len > MAX_OUTPUT {""",
+     """        if false && out.len() - start_len > MAX_OUTPUT {""",
+     BIONIC),
+
+    ("printf-B2", "B", "the total-output cap lowered below an ordinary formatted result",
+     BIONIC_PRINTF,
+     """pub const MAX_OUTPUT: usize = 1024 * 1024;""",
+     """pub const MAX_OUTPUT: usize = 8;""",
+     BIONIC),
+
+    # ---- F6: the long double refusal, which must fire and must not over-fire -------------------
+    ("printf-A3", "A", "the %Lf refusal removed, so a 128-bit quad is read as a double",
+     BIONIC_PRINTF,
+     """            if length == "L" {""",
+     """            if false && length == "L" {""",
+     BIONIC),
+
+    ("printf-B3", "B", "the %Lf refusal widened to `l`, refusing the legal %lf", BIONIC_PRINTF,
+     """            if length == "L" {""",
+     """            if length == "L" || length == "l" {""",
+     BIONIC),
+
+    # ---- the one parser: plan and format must agree argument for argument ----------------------
+    # `format` fetches a `*` width before it looks at the conversion character, `%%` included. A
+    # planner that skipped it diverges by one argument and every later conversion prints the NEXT
+    # argument -- a plausible wrong answer, not an error.
+    ("printf-A4", "A", "plan skips a `*` width on %%, diverging from format by one argument",
+     BIONIC_PRINTF,
+     """        if spec.width == Count::Star {
+            kinds.push(ArgKind::Int);
+        }
+        if spec.precision == Count::Star {
+            kinds.push(ArgKind::Int);
+        }
+        if spec.conv == '%' {
+            continue;
+        }""",
+     """        if spec.conv == '%' {
+            continue;
+        }
+        if spec.width == Count::Star {
+            kinds.push(ArgKind::Int);
+        }
+        if spec.precision == Count::Star {
+            kinds.push(ArgKind::Int);
+        }""",
+     BIONIC),
+
+    # ---- the adapter: the guest's atomics ------------------------------------------------------
+    # A 32-bit atomic on an unaligned address is undefined behaviour in Rust, and AArch64's
+    # LDXR/STXR fault there too -- so the refusal is what the guest would see on a real device.
+    # Note what A1 does: with the check gone the mutated build performs an unaligned atomic, which
+    # is exactly the undefined behaviour the check exists to prevent. It is detected by the
+    # refusal test, not by the access misbehaving.
+    ("adapter-A1", "A", "the compare-and-swap alignment refusal removed", ADAPTER_VIEW,
+     """        if at % 4 != 0 {""",
+     """        if false && at % 4 != 0 {""",
+     ANDROID),
+
+    ("adapter-B1", "B", "the CAS alignment tightened to 8, refusing a legal 4-aligned mutex",
+     ADAPTER_VIEW,
+     """        if at % 4 != 0 {""",
+     """        if at % 8 != 0 {""",
+     ANDROID),
+
+    # ---- the adapter: the LP64 return traps ----------------------------------------------------
+    ("adapter-A2", "A", "an int return zero-extended instead of sign-extended", ADAPTER_HANDLERS,
+     """    ($c:ident, i32, $v:expr) => {
+        $c.ret().i32($v)
+    };""",
+     """    ($c:ident, i32, $v:expr) => {
+        $c.ret().u64($v as u32 as u64)
+    };""",
+     ANDROID),
+
+    # The over-correction, and it is the one that reads as correct: the C standard fixes only the
+    # SIGN of a comparison, so clamping to -1/0/1 looks defensible. bionic fixes the magnitude and
+    # guest code can see it.
+    ("adapter-B2", "B", "the compare result normalised to its sign, losing bionic's magnitude",
+     ADAPTER_HANDLERS,
+     """    fn strcmp(a: ptr, b: ptr) -> i32 = |v| omni_bionic::string::strcmp(&v, a, b);""",
+     """    fn strcmp(a: ptr, b: ptr) -> i32 =
+        |v| omni_bionic::string::strcmp(&v, a, b).map(|d| d.signum());""",
+     ANDROID),
+
+    # ---- the adapter: per-thread state ---------------------------------------------------------
+    ("adapter-A3", "A", "__errno points at the scratch buffer instead of the errno cell",
+     ADAPTER_VIEW,
+     """    pub fn errno_address(&self) -> GuestAddr {
+        self.active.block + ERRNO_OFFSET
+    }""",
+     """    pub fn errno_address(&self) -> GuestAddr {
+        self.active.block + SCRATCH_OFFSET
+    }""",
+     ANDROID),
+
+    ("adapter-B3", "B", "the thread arena tightened below a thread count the runtime uses",
+     ADAPTER_MOD,
+     """pub const MAX_GUEST_THREADS: usize = 64;""",
+     """pub const MAX_GUEST_THREADS: usize = 4;""",
+     ANDROID),
+
+    # ---- the adapter: the printf family --------------------------------------------------------
+    # snprintf returns what WOULD have been written. A handler returning the truncated length makes
+    # every caller that grows its buffer on overflow loop forever, and every short result is
+    # identical either way -- so the defect is invisible until a result is truncated.
+    ("adapter-A4", "A", "snprintf returns the truncated length instead of the full one",
+     ADAPTER_FORMAT,
+     """    view.mem().write_bytes(at, &write, Blame::new(view.symbol(), view.address(), argument))?;
+    Ok(full)""",
+     """    view.mem().write_bytes(at, &write, Blame::new(view.symbol(), view.address(), argument))?;
+    Ok(i32::try_from(room).unwrap_or(full))""",
+     ANDROID),
+
+    ("adapter-A5", "A", "a variadic int taken as 64 bits instead of narrowed to its own width",
+     ADAPTER_FORMAT,
+     """            ArgKind::Int => Owned::Int(source.next_u64()? as u32 as i32 as i64),""",
+     """            ArgKind::Int => Owned::Int(source.next_u64()? as i64),""",
+     ANDROID),
+
+    ("adapter-A6", "A", "a null %s argument dereferenced instead of printing (null)",
+     ADAPTER_FORMAT,
+     """                let pointer = source.next_u64()?;
+                if pointer == 0 {
+                    Owned::NullStr
+                } else {
+                    Owned::Str(read_latin1(view.blaming(argument), pointer, argument)?)
+                }""",
+     """                let pointer = source.next_u64()?;
+                Owned::Str(read_latin1(view.blaming(argument), pointer, argument)?)""",
+     ANDROID),
+
 ]
 
 
