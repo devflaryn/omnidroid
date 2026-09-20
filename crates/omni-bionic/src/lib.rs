@@ -29,6 +29,7 @@
 #![warn(clippy::all)]
 
 pub mod atomics;
+pub mod atexit;
 pub mod cond;
 pub mod context;
 pub mod ctype;
