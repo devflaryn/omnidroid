@@ -42,7 +42,9 @@ Counts below are produced by `tools/os_surface.py` parsing lines 729–1295 of t
 
 **The counts sum to 565** — VERIFIED (`tools/os_surface.py --check` exits 0; `150+10+73+39+56+17+41+6+7+141+23+2 = 565`).
 
-Rule set: STT_OBJECT symbols are `data-object` by type before any name rule; the 3 NOTYPE symbols are `__gcov_dump`, `__gcov_flush` (→ process-env, coverage hooks) and `getentropy` (→ process-env). Judgment calls are listed in §5.2; the full lists are in §1.3.
+Rule set: STT_OBJECT symbols are `data-object` by type before any name rule; the 3 NOTYPE symbols are `__gcov_dump` and `__gcov_flush`, which the tool leaves in **`unclear`** (see §1.3 and §5.2 for why: their kind is the reason, their placement would be a judgment call), and `getentropy` (→ process-env). Judgment calls are listed in §5.2; the full lists are in §1.3.
+
+> **Reviewer's note (2026-09-20).** This sentence previously read that both `__gcov_*` symbols were classified `process-env`, which contradicted the tool and this document's own §1.3 and §5.2. The tool is right and is what the counts above come from. Everything else here reproduced exactly: running `python tools/os_surface.py --check` gives `150+10+73+39+56+17+41+6+7+141+23+2 = 565`, a census of `FUNC=539, NOTYPE=3, OBJECT=23`, and exit 0. The `data-object` count of **23** independently matches the figure D17 records from a different tool.
 
 ### 1.2 Rule-order note
 
