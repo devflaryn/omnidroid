@@ -8,18 +8,27 @@ plan and ledger, and git history.
 
 | | |
 |---|---|
-| Current branch | **`android-abi`** (M3 work) |
-| Working tree | **clean**, nothing uncommitted |
-| HEAD | see `git log` — M3 task 2 complete |
-| Other branches | `cpu-execution` (M2, complete), `foundation` (M0/M1, complete), `main` (behind — holds only early docs) |
+| Current branch | **`bionic-threads`** (M3 task 3 work) |
+| Working tree | **clean**, nothing uncommitted (`.freebuff/` is untracked scratch) |
+| HEAD | see `git log` |
+| Other branches | `android-abi` (M3 tasks 1-2), `bionic-pure` (the pure libc/libm subset), `cpu-execution` (M2), `foundation` (M0/M1), `main` (behind — holds only early docs) |
 | Remotes | **none configured** |
 | Merge state | Nothing has been merged to `main`. Each milestone branched from the previous one. **The user has never been asked to approve a merge; do not merge without asking.** |
 
-Branch lineage: `main` → `foundation` → `cpu-execution` → `android-abi`.
+Branch lineage: `main` → `foundation` → `cpu-execution` → `android-abi` → `bionic-pure` →
+`bionic-threads`. It is a single linear chain, so `bionic-threads` contains everything.
+
+**Provenance warning.** `bionic-pure`, `bionic-threads` and
+`docs/research/os-surface-inventory.md` + `tools/os_surface.py` were produced by **GLM 5.3 Flash**,
+a much weaker model; its commits are marked `Produced-By: GLM 5.3 Flash`. That work is under review;
+see "GLM work — review state" below. The `bionic-threads` session was cut off mid-turn, so the tree
+was checked for a live mutation before anything was run: **it was clean**, and `cargo test
+--workspace --release` passed from HEAD.
 
 ## Verification state
 
-**608 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`). Clippy clean on
+**864 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-20 — was 608
+before `omni-bionic` existed, so the two are not comparable). Clippy clean on
 `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
 With `workspace = true` a member's `default-features = false` is **ignored**, so the omni-android
@@ -99,11 +108,12 @@ unverified body can misbehave silently where a typed error fails immediately and
 Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-plan/progress.md`.
 
 - **Task 1 (measure before building) — complete, reviewed, approved.** Commits `d44a516`..`672ddc2`.
-- **Task 2 (the thunk boundary) — implemented, commits `04186ed`..`e245bfe`. REVIEW NOT YET DONE.**
+- **Task 2 (the thunk boundary) — implemented, commits `04186ed`..`e245bfe`. REVIEWED 2026-09-20;
+  three defects to fix before Task 3** (`.superpowers/sdd/android-abi-plan/task-2-review.md`).
   Spec ✅ per the implementer; durable record is **D18**. It built the region, AAPCS64 marshalling both
   ways, the variadic rules and a guest `va_list` walk, checked guest memory, the symbol table, and
   host→guest re-entry. **No symbol is implemented** — all 565 slots are `Unbound` and name themselves
-  when called. Tests went 496 → 608, mutation 88 → 118 rows, all caught.
+  when called. Tests went 496 → 608, mutation **89 → 118** rows (29 new), all caught.
 - Task 3 (the bionic subset) — not started. Scope is fixed at **170 thunk functions + 18 data objects**.
 - Task 4 (all 3,594 initializers, the M3 gate) — not started.
 
@@ -122,21 +132,60 @@ Full record in **D17**. The three things that matter for Task 2:
    imports of 565. A **lower bound** — 17,698 unresolvable indirect call sites, and a 2,670,684-byte
    region with no unwind info hides one initializer entry point worth exactly 67 of the 188.
 
+## GLM work — review state
+
+Four pieces of work arrived unreviewed; three from GLM 5.3 Flash. Review is in progress and its
+findings are recorded as they land. **Nothing here has been accepted because it reports itself
+complete.**
+
+| Piece | State |
+|---|---|
+| `android-abi` M3 Task 2 (Claude) | **Reviewed.** F1/F2/F3 to fix before Task 3 — see `task-2-review.md` |
+| `bionic-pure` (GLM) — 83 pure libc/libm functions | **Partially verified.** errno constants and the bionic byte-difference compare convention check out; the `tools/mutate.py` table has **zero** rows for `omni-bionic` |
+| `bionic-threads` (GLM) — pthread/sync/TLS | **Partially verified.** One real defect found and fixed (`sem_post` consumed the waiter flag; 1.0104 s stall measured); three timing flakes fixed |
+| `os-surface-inventory.md` + `tools/os_surface.py` (GLM) | **Not yet reviewed.** |
+
+**Confirmed defects found in GLM's work so far**, both now fixed:
+
+1. **`sem_post` consumed the waiter flag other waiters still needed.** `post` computed
+   `(word & !WAITERS) + 1` under a comment reading "keep flag state" — the opposite of what it does;
+   `wait`/`trywait` cleared it too. The first post consumed the flag, so a second post skipped its
+   futex wake. **Measured: 1.0104 s** for a posted token to reach a blocked waiter. The suite could
+   not see it — every `sem_wait` loops on a bounded slice, so a lost wake always *eventually* healed.
+   Exercising, not detecting.
+2. **Three timing flakes**, two root causes: six wall-clock assertions with zero headroom (a 150 ms
+   wait measured returning at 149.9569 ms), and a probabilistic `observed_max > 1` guard on a
+   writer-preferring rwlock (~12% failure, 4 in 33 runs). Both fixed and mutation-verified.
+
+**Open question on GLM's layout constants.** `layouts.rs` claims `PTHREAD_MUTEX_T = 40` on
+"NDK header arithmetic + a VERIFIED 40-byte gap". No NDK is on this machine, so the header arithmetic
+was not actually performed. The gap evidence is real but not by itself conclusive — the observed
+`android_app` map has other unaccounted gaps. It is **corroborated independently** by `pthread_cond_t`
+= 48 landing exactly on `msgread` at `+0x120` (`0xf0 + 48`), which is a second exact hit, so 40/48/56
+are probably right. Note GLM's own test comment cites the struct as 256 bytes when the research file
+says `operator new size 0x180 = 384`. `SEM_T = 4` is likely an under-declaration (bionic's LP64
+`sem_t` carries `int __reserved[3]`), which is the **safe** direction: nothing writes more than 4
+bytes. No write in the crate exceeds a declared size — `pthread_attr_init` and the rwlock initialisers
+are the only bulk zeroes, both at 56 bytes, and 56 is confirmed by field-by-field arithmetic.
+
 ## Next action
 
-**Start M3 Task 2, the thunk boundary.** Generate its brief with
-`scripts/task-brief docs/plans/android-abi-plan.md 2` from the subagent-driven-development skill, and
-dispatch an implementer. The plan's Task 2 section is the spec; D17 is the design.
+**Fix Task 2's F1, F2 and F3, then start Task 3 (the bionic subset).** All three are in the API Task 3
+consumes on every one of its 170 handlers, and F2 is a repeat of a defect this codebase has already
+diagnosed and fixed one crate over. F5 is a five-minute fix plus one assertion.
 
-Task 2 must deliver: AAPCS64 ↔ host ABI marshalling in both directions (integers and pointers in
-X0-X7, floats in V0-V7, stack arguments beyond that, returns in X0/X1/V0, and **variadics**, which
-several libc imports need); host → guest callbacks (a `pthread` entry, an `atexit` handler, a `qsort`
-comparator); an ARM64-host path that stays expressible though untestable here; and an unbound symbol
-failing with a **typed error naming the symbol and guest address**, never a crash or a silent zero.
+Then: decide whether `omni-bionic` folds into `omni-android` (ARCHITECTURE §2 puts bionic there; the
+separate crate was only for isolation during review), write the adapter binding the bionic layer to
+the thunk boundary, and run M3's gate — all 3,594 static initializers complete, **verified by reading
+back state they actually wrote**, not by a counter reaching 3,594.
 
-## What Task 2's reviewer should know before starting
+**A mutation harness for `omni-bionic` is still owed.** `tools/mutate.py` has 118 rows and **none**
+of them touch the 12,543 lines of bionic code; every other crate has one. GLM did hand spot-checks
+(commit `26b3a1c`) but left nothing durable.
 
-The implementer reported these against its own work; they are the highest-value things to verify.
+## What Task 2's reviewer was asked to check (kept for the record)
+
+The implementer reported these against its own work; they were the highest-value things to verify.
 
 - **Two defects it found late, both now pinned.** The driver handed the caller's `RunLimit` to *every*
   exit-path crossing, so a guest crossing N times got **N times its allowance** — found because two
