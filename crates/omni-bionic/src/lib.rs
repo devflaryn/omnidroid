@@ -61,3 +61,36 @@ pub mod wide;
 pub use context::GuestContext;
 pub use error::BionicError;
 pub use memory::{Fault, GuestMemory};
+
+/// Timing tolerance for the unit tests that assert a wait really blocked.
+///
+/// A timed wait may return marginally EARLY. The host's timer has finite
+/// granularity and the deadline is rounded to it, so `wait_timeout(150ms)` can
+/// return at 149.96 ms — which is exactly what was observed here, on Windows,
+/// against an `elapsed >= 150ms` assertion. Six such assertions in this crate had
+/// zero headroom and failed intermittently under load; two others already allowed
+/// slack, so the hazard was known but applied inconsistently.
+///
+/// The property these tests are for is "it blocked for about the timeout rather
+/// than returning immediately". [`TIMER_SLACK`] is small enough that no immediate
+/// return can pass and large enough to absorb host timer rounding.
+#[cfg(test)]
+pub(crate) mod timing {
+    use core::time::Duration;
+
+    /// Slack allowed below a timed wait's nominal duration. Covers host timer
+    /// granularity and deadline rounding, not scheduling delay — a wait that
+    /// returns early by more than this is a real defect.
+    pub(crate) const TIMER_SLACK: Duration = Duration::from_millis(5);
+
+    /// Assert `elapsed` shows a genuine block of about `target`, allowing
+    /// [`TIMER_SLACK`] for the host timer returning marginally early.
+    #[track_caller]
+    pub(crate) fn assert_blocked_for(elapsed: Duration, target: Duration, what: &str) {
+        let floor = target.saturating_sub(TIMER_SLACK);
+        assert!(
+            elapsed >= floor,
+            "{what}: expected a block of about {target:?} (floor {floor:?} after {TIMER_SLACK:?} timer slack), but it returned after {elapsed:?}",
+        );
+    }
+}

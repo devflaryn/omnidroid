@@ -574,7 +574,8 @@ mod tests {
             let r = wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, Some(Duration::from_millis(150))).unwrap();
             let elapsed = start.elapsed();
             assert_eq!(r, consts::ETIMEDOUT);
-            assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+            crate::timing::assert_blocked_for(
+                elapsed, Duration::from_millis(150), "cond timedwait");
             // The mutex is relocked (by us): a plain unlock succeeds.
             assert_eq!(crate::mutex::unlock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
         }));

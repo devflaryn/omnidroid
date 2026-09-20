@@ -343,11 +343,72 @@ fn stress_readers_writers_overlap_and_exclusion() {
         0,
         "reader/writer exclusion violated"
     );
+    // Reader overlap is REPORTED here, not asserted. Under the writer preference
+    // this rwlock documents, two writers hammering the lock can admit readers one
+    // at a time, so overlap is genuinely probabilistic: measured over n=20 runs the
+    // observed maximum was {1,2,3,4}, and it was 1 twice — a ~12% failure rate for
+    // an assertion that the design does not guarantee. The property it was trying
+    // to state is pinned deterministically by
+    // `rwlock_readers_genuinely_hold_the_lock_at_the_same_time` below; what THIS
+    // test is for is the exclusion invariant asserted above.
     let observed_max = max_readers.load(Ordering::SeqCst);
-    println!("rwlock: max observed concurrent readers = {observed_max}");
+    println!("rwlock: max observed concurrent readers = {observed_max} (diagnostic)");
+}
+
+/// Readers genuinely hold the lock at the same time — deterministically.
+///
+/// Four threads take a read lock and then refuse to leave until all four are
+/// inside. If the rwlock serialised readers this could not complete, so the test
+/// is bounded by a deadline rather than a barrier: a serialising bug FAILS here
+/// instead of hanging. No writers take part, so nothing here is probabilistic.
+#[test]
+fn rwlock_readers_genuinely_hold_the_lock_at_the_same_time() {
+    use std::sync::atomic::Ordering;
+
+    const READERS: usize = 4;
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    let mem = guest_mem();
+    mem.with_exclusive(|g| {
+        g.map(0x1000, &[0u8; 56]); // rwlock
+    });
+    let futex = Arc::new(MockFutex::new());
+    let inside = Arc::new(AtomicUsize::new(0));
+    let all_arrived = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..READERS {
+        let (mem, futex, inside, all_arrived) =
+            (mem.clone(), futex.clone(), inside.clone(), all_arrived.clone());
+        handles.push(std::thread::spawn(move || {
+            let mut m = mem.clone();
+            assert_eq!(rwlock::rdlock(&mut m, &*futex, 0x1000).unwrap(), 0);
+
+            // Announce arrival, then hold the read lock until everyone is in.
+            inside.fetch_add(1, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            let mut saw_all = false;
+            while start.elapsed() < DEADLINE {
+                if inside.load(Ordering::SeqCst) == READERS {
+                    saw_all = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if saw_all {
+                all_arrived.fetch_add(1, Ordering::SeqCst);
+            }
+
+            assert_eq!(rwlock::unlock(&mut m, &*futex, 0x1000).unwrap(), 0);
+            saw_all
+        }));
+    }
+
+    let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert!(
-        observed_max > 1,
-        "readers never overlapped — this is not a concurrency test"
+        results.iter().all(|&ok| ok),
+        "readers did not overlap: {} of {READERS} threads observed all {READERS} holding the read lock at once within {DEADLINE:?}. A writer-preferring rwlock may delay readers, but with no writer present it must not serialise them.",
+        all_arrived.load(Ordering::SeqCst),
     );
 }
 

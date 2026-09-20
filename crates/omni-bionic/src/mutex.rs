@@ -841,7 +841,8 @@ mod tests {
         let r = timedlock(&mut mem.clone(), &f, &o, &t, 0x1000, std::time::Duration::from_millis(120)).unwrap();
         let elapsed = start.elapsed();
         assert_eq!(r, consts::ETIMEDOUT);
-        assert!(elapsed >= std::time::Duration::from_millis(120), "{elapsed:?}");
+        crate::timing::assert_blocked_for(
+            elapsed, std::time::Duration::from_millis(120), "mutex timedlock");
         // And the mutex is still locked by the owner.
         assert_eq!(trylock(&mut mem.clone(), &o, &t, 0x1000).unwrap(), consts::EBUSY);
     }
@@ -892,7 +893,8 @@ mod tests {
         let elapsed = start.elapsed();
         h.join().unwrap();
         assert_eq!(r, 0, "timedlock must acquire after release");
-        assert!(elapsed >= std::time::Duration::from_millis(100), "must have waited: {elapsed:?}");
+        crate::timing::assert_blocked_for(
+            elapsed, std::time::Duration::from_millis(100), "mutex timedlock waits for the holder");
         assert!(elapsed < std::time::Duration::from_secs(2), "must not hit the budget: {elapsed:?}");
     }
 

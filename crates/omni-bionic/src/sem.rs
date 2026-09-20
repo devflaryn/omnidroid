@@ -371,7 +371,8 @@ mod tests {
         let elapsed = start.elapsed();
         waker.join().unwrap();
         assert_eq!(r, 0);
-        assert!(elapsed >= Duration::from_millis(120), "{elapsed:?}");
+        crate::timing::assert_blocked_for(
+            elapsed, Duration::from_millis(120), "sem_wait blocks until the post");
         assert_eq!(getvalue(&mut mem.clone(), 0x1000).unwrap(), 0);
     }
 
@@ -386,7 +387,8 @@ mod tests {
         let r = timedwait(&mut m, &futex, 0x1000, Duration::from_millis(140)).unwrap();
         let elapsed = start.elapsed();
         assert_eq!(r, -1, "timedwait expiry: -1 with errno ETIMEDOUT (adapter)");
-        assert!(elapsed >= Duration::from_millis(140), "{elapsed:?}");
+        crate::timing::assert_blocked_for(
+            elapsed, Duration::from_millis(140), "sem_timedwait");
         // Waiter flag cleared: a subsequent post does not need a wake.
         let mut b = [0u8; 4];
         mem.read(0x1000, &mut b).unwrap();

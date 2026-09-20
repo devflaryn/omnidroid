@@ -383,7 +383,8 @@ mod tests {
         let r = futex.wait(0x2000, 0, Some(Duration::from_millis(150)));
         let elapsed = start.elapsed();
         assert_eq!(r, WaitResult::TimedOut);
-        assert!(elapsed >= Duration::from_millis(150), "elapsed {elapsed:?}");
+        crate::timing::assert_blocked_for(
+            elapsed, Duration::from_millis(150), "futex wait timeout");
         // And the queue drained after the timeout.
         assert_eq!(futex.live_queues(), 0);
     }
