@@ -42,6 +42,7 @@ pub mod libm;
 pub mod locale;
 pub mod mem;
 pub mod memory;
+pub mod metadata;
 pub mod mock;
 pub mod mock_threads;
 pub mod mutex;
