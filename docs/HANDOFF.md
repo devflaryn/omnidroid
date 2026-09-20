@@ -168,11 +168,40 @@ says `operator new size 0x180 = 384`. `SEM_T = 4` is likely an under-declaration
 bytes. No write in the crate exceeds a declared size — `pthread_attr_init` and the rwlock initialisers
 are the only bulk zeroes, both at 56 bytes, and 56 is confirmed by field-by-field arithmetic.
 
+## The straddling-access defect — fix this before Task 3
+
+**Any guest access that straddles a commit-granule boundary in a lazily-committed mapping is refused
+as `NotMapped`, even when both granules are committed and both belong to the same mapping.**
+
+MEASURED on a 1 MiB `CommitPolicy::Lazy` mapping with both granules committed:
+
+| access | result |
+|---|---|
+| 8 bytes wholly inside granule 0 | `Ok` |
+| 16 bytes straddling the boundary | `Err(BadPointer { refusal: NotMapped })` |
+
+Cause: omni-mem's entry map splits the entry at each granule it commits and **never coalesces
+adjacent committed granules** (`region_at` reports 65,536 after committing two neighbours, not
+131,072), and `admits_region` refuses any access whose end passes the entry's end. So this is
+`admit`/`admits_region`, not a string-walk problem: it applies to `read_u64`, `read_bytes`,
+`write_bytes` and every other boundary access.
+
+Reachable wherever the guest heap lives — guest `mmap` through the demand pager, committing granule
+by granule — for any string or struct that happens to cross a 64 KiB boundary. It would surface as
+rare, position-dependent failures deep into Task 3's 170 handlers and Task 4's 3,594 initializers.
+
+Invisible to every existing suite because **every test mapping is `CommitPolicy::Eager`**, and an
+eager mapping is one entry that is never split. Any fix must add a lazy fixture.
+
+This was found while investigating Task 2's F2, which claimed the opposite — that `cstr` could scan
+*out* of the committed granule. That claim is **disproved**: `admit().end` is the split entry's end,
+so the walk was already bounded by committed memory. Do not resurrect it.
+
 ## Next action
 
-**Fix Task 2's F1, F2 and F3, then start Task 3 (the bionic subset).** All three are in the API Task 3
-consumes on every one of its 170 handlers, and F2 is a repeat of a defect this codebase has already
-diagnosed and fixed one crate over. F5 is a five-minute fix plus one assertion.
+**Fix the straddling-access defect above, then start Task 3 (the bionic subset).** F1, F5 and F3 are
+already fixed, with hostile tests and mutation rows (`varargs-A5`..`A8`, `abi-A6`, `boundary-A12`,
+6/6 caught). F4 and F6-F10 from the review remain open and are not blockers.
 
 Then: decide whether `omni-bionic` folds into `omni-android` (ARCHITECTURE §2 puts bionic there; the
 separate crate was only for isolation during review), write the adapter binding the bionic layer to
