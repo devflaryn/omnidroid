@@ -142,8 +142,26 @@ complete.**
 |---|---|
 | `android-abi` M3 Task 2 (Claude) | **Reviewed.** F1/F2/F3 to fix before Task 3 — see `task-2-review.md` |
 | `bionic-pure` (GLM) — 83 pure libc/libm functions | **Verified by mutation.** 11 rows, 11/11 caught. errno values were right but **untested** — that gap is closed. The bionic byte-difference compare convention is pinned, including the glibc over-correction |
-| `bionic-threads` (GLM) — pthread/sync/TLS | **Verified by mutation** for the sem waiter protocol and the layout widths. One real defect found and fixed (`sem_post` consumed the waiter flag; **1.0104 s** stall measured); three timing flakes fixed |
+| `bionic-threads` (GLM) — pthread/sync/TLS | **Complete for its scope, and reviewed.** See the coverage row below. One real defect found and fixed (`sem_post` consumed the waiter flag; **1.0104 s** stall measured); three timing flakes fixed; one plausible stub deleted |
 | `os-surface-inventory.md` + `tools/os_surface.py` (GLM) | **Not yet reviewed.** |
+
+**`omni-bionic`'s coverage, measured against the reachable import list.** Of the **51** thread /
+synchronisation / TLS symbols the 3,594 initializers statically reach:
+
+| | |
+|---|---|
+| Implemented here | **42** |
+| Explicitly excluded | **1** — `pthread_sigmask`, which needs the guest's real signal state |
+| Not here, and cannot be | **8** — `pthread_create`, `join`, `detach`, `exit`, `getattr_np`, and the three sched-param functions |
+
+The eight are a coherent group, not a ragged edge: each needs host → guest re-entry or the operating
+system, and the crate has zero dependencies and no OS access by design. **They belong to the
+adapter.** `lib.rs` now states this so the layer is not read as half-finished.
+
+Two counting notes, because this project has had four wrong numbers reach its record. A first pass
+said 9 missing and 42 present and **both were wrong**: `pthread_cond_timedwait` *is* implemented —
+it is `cond::wait_end` with `timeout: Some(..)`, and only the C symbol is unspelled — and
+`pthread_sigmask` was counted present because a grep matched the comment that **excludes** it.
 
 **Confirmed defects found in GLM's work so far**, both now fixed:
 
