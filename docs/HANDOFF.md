@@ -224,6 +224,46 @@ its contract. Rows `access-A1` (restores the defect) and `access-B1` (the over-c
 running out of its mapping), both caught. The over-correction row is guarded by a test that places
 two mappings at adjacent addresses: contiguous addresses are not the same mapping.
 
+## Task 3's real shape — measured before dispatching it
+
+Task 3 is "the bionic subset", scoped at **170 thunk functions + 18 data objects** from the 188
+statically-reachable imports. Measuring what already exists changes how it should be split.
+
+**Of the 188 reachable imports, 88 are already implemented in `omni-bionic` and 100 are not.**
+(Method: a symbol counts as implemented when a doc comment naming it sits above a `pub fn`; a comment
+that *excludes* it does not count. The naive grep over-counted — it scored `pthread_sigmask` as
+present because it matched the comment excluding it.)
+
+The 100 do **not** form one job. They split by what they depend on:
+
+| Group | Needs | Blocked? |
+|---|---|---|
+| Wiring the 88 that exist onto the boundary | Nothing new — `omni-bionic` traits over `GuestMem` | **No** |
+| `printf` family (`fprintf`, `vfprintf`, `vsnprintf`, `vasprintf`, `sscanf`, `fscanf`, `__vsnprintf_chk`) | The boundary's `VarArgs`/`va_list` walk, already built | **No** |
+| Guest memory (`mmap`, `munmap`, `mprotect`, `madvise`, `mlock`) | `omni-mem`, which has them | **No** |
+| `dl*` (`dl_iterate_phdr`, `dlopen`, `dlsym`, `dlclose`, `dlerror`) | `omni-elf`'s loader state | **No** |
+| ~19 data symbols (`AMEDIAFORMAT_KEY_*`, `__sF`, `environ`, `stdin`/`stdout`/`stderr`, `in6addr_*`, `__stack_chk_guard`) | Placement, not code | **No** |
+| Files, directories, clocks, process info, sockets, logging, thread lifecycle | **New `omni-platform` surface** | **YES** |
+
+**The blocker, stated plainly: `omni-platform` today is `vm` and `fault` and nothing else.** No files,
+no directories, no clocks, no process info, no sockets, no dynamic loading — although ARCHITECTURE §2
+describes the crate as covering "virtual memory, threads, files, dynamic loading, clocks, windowing".
+That description is aspirational and always has been; the portability invariant itself is intact
+(verified: every `cfg(target_os)` mention outside `omni-platform` is a doc comment stating the rule,
+not an escape from it).
+
+So the last group cannot be written without extending `omni-platform` first, and per the five-target
+guidance that extension must add the **Linux and macOS signatures as honest `unsupported` returns at
+the same time, naming the intended POSIX call**. Do not write speculative `mmap`/`open` bodies for
+those targets — that was ruled against deliberately.
+
+**Suggested order**, unblocked work first so the seam is proved end to end before the OS surface grows:
+
+1. The adapter skeleton + the 88 that already exist + the `printf` family. This is item 5's "write the
+   adapter" and it proves the whole seam.
+2. The data symbols, `dl*`, and the guest-memory group.
+3. Extend `omni-platform`, then the OS-dependent remainder.
+
 ## Next action
 
 **Start M3 Task 3, the bionic subset** — 170 thunk functions + 18 data objects. Everything that was
