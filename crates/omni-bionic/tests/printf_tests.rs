@@ -9,7 +9,7 @@
 //! * `#` forms: `0x` prefix, forced decimal point;
 //! * zero-padding places zeros after sign/prefix.
 
-use omni_bionic::printf::{format, FormatArg, FormatError};
+use omni_bionic::printf::{format, plan, ArgKind, FormatArg, FormatError};
 
 fn fmt(fmt_str: &str, args: &[FormatArg]) -> String {
     let mut out = String::new();
@@ -178,4 +178,195 @@ fn length_modifiers_parse_and_pass_through() {
     assert_eq!(fmt("%zd", &[FormatArg::Int(7)]), "7");
     assert_eq!(fmt("%jd", &[FormatArg::Int(7)]), "7");
     assert_eq!(fmt("%td", &[FormatArg::Int(7)]), "7");
+}
+
+// ---------------------------------------------------------------------------
+// `plan`: the pre-scan an ABI adapter needs, and the two refusals it owes F6
+// ---------------------------------------------------------------------------
+
+/// Build one argument of each planned kind, so a planned call can actually be formatted.
+fn sample(kind: ArgKind) -> FormatArg<'static> {
+    match kind {
+        ArgKind::Int => FormatArg::Int(3),
+        ArgKind::UInt => FormatArg::UInt(3),
+        ArgKind::Ptr => FormatArg::Ptr(0x1000),
+        ArgKind::Double => FormatArg::Double(1.5),
+        ArgKind::Str => FormatArg::Str("xy"),
+    }
+}
+
+/// **The property the adapter depends on.** `plan` and `format` walk the same parser, so
+/// for every format string the number and order of arguments `plan` reports is exactly what
+/// `format` asks for: supplying that list succeeds, and supplying one fewer fails.
+///
+/// A silent disagreement of one argument here does not error — it prints the *next*
+/// argument for every conversion after the divergence, which is the plausible wrong answer
+/// Global Constraint 1 exists for.
+#[test]
+fn plan_and_format_agree_on_every_argument() {
+    let corpus = [
+        "",
+        "no conversions at all",
+        "100%%",
+        "%d",
+        "%d %d %d",
+        "%s=%d",
+        "%-8.3f|%+d|% i|%#x|%#o",
+        "%u %o %x %X",
+        "%p and %s",
+        "%e %E %f %F %g %G %a %A",
+        "%*d",
+        "%.*f",
+        "%*.*s",
+        "%*%",
+        "%lld %zu %jd %td %hhd %hd %qd",
+        "%c%c%c",
+        "%10s%-10s",
+        "mixed %d %f %s %p %x done",
+    ];
+    for fmt_str in corpus {
+        let kinds = plan(fmt_str).unwrap_or_else(|e| panic!("plan({fmt_str:?}) failed: {e}"));
+        let args: Vec<FormatArg> = kinds.iter().copied().map(sample).collect();
+
+        let mut out = String::new();
+        format(fmt_str, &args, &mut out)
+            .unwrap_or_else(|e| panic!("format({fmt_str:?}) with the planned args failed: {e}"));
+
+        // One fewer argument must be detected, which is what proves the count is exact
+        // rather than merely sufficient. (A format string needing none is exempt.)
+        if !args.is_empty() {
+            let short = &args[..args.len() - 1];
+            assert_eq!(
+                format(fmt_str, short, &mut String::new()),
+                Err(FormatError::MissingArgument),
+                "{fmt_str:?}: plan said {} arguments, but format was satisfied by {}",
+                args.len(),
+                short.len()
+            );
+        }
+
+        // One extra argument must be ignored, not consumed early: the output is unchanged.
+        let mut long = args.clone();
+        long.push(FormatArg::Int(99));
+        let mut out_long = String::new();
+        format(fmt_str, &long, &mut out_long).expect("a spare argument is not an error");
+        assert_eq!(out, out_long, "{fmt_str:?}: a spare argument changed the output");
+    }
+}
+
+/// `plan` reports the *kinds*, not just a count: a `%f` must be fetched from the
+/// floating-point bank and a `%d` from the integer bank, and an adapter that mixed them up
+/// would read a number rather than fail.
+#[test]
+fn plan_reports_the_bank_each_argument_comes_from() {
+    assert_eq!(plan("%d").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%i").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%c").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%u").unwrap(), vec![ArgKind::UInt]);
+    assert_eq!(plan("%o").unwrap(), vec![ArgKind::UInt]);
+    assert_eq!(plan("%x").unwrap(), vec![ArgKind::UInt]);
+    assert_eq!(plan("%X").unwrap(), vec![ArgKind::UInt]);
+    assert_eq!(plan("%p").unwrap(), vec![ArgKind::Ptr]);
+    assert_eq!(plan("%s").unwrap(), vec![ArgKind::Str]);
+    for spec in ['e', 'E', 'f', 'F', 'g', 'G', 'a', 'A'] {
+        assert_eq!(plan(&format!("%{spec}")).unwrap(), vec![ArgKind::Double], "%{spec}");
+    }
+    // `*` width and precision are integers, and they come *before* the conversion's own
+    // argument.
+    assert_eq!(plan("%*.*f").unwrap(), vec![ArgKind::Int, ArgKind::Int, ArgKind::Double]);
+    // `%%` takes no argument of its own but still consumes a `*` width, because `format`
+    // fetches the width before it looks at the conversion character.
+    assert_eq!(plan("%*%").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%%").unwrap(), Vec::new());
+}
+
+/// **F6's refusal.** `long double` is a 128-bit quad on Android/LP64 with a 16-byte variadic
+/// slot; nothing in this stack can read one. `plan` refuses **before** the caller reads an
+/// argument, so no wrong value is ever fetched, let alone printed.
+#[test]
+fn plan_refuses_long_double_before_any_argument_is_read() {
+    for spec in ['e', 'E', 'f', 'F', 'g', 'G', 'a', 'A'] {
+        assert_eq!(
+            plan(&format!("%L{spec}")),
+            Err(FormatError::LongDoubleUnsupported(spec)),
+            "%L{spec} must be refused, not guessed at"
+        );
+    }
+    // The refusal survives flags, width and precision, and it names the conversion.
+    assert_eq!(plan("%-+#012.7Lf"), Err(FormatError::LongDoubleUnsupported('f')));
+    // It is refused even when it is not the first conversion, so a format string cannot
+    // smuggle one in behind a conversion that plans cleanly.
+    assert_eq!(plan("%d then %Lg"), Err(FormatError::LongDoubleUnsupported('g')));
+    // And the message names it, because a refusal nobody can act on is not much better
+    // than a wrong number.
+    assert!(FormatError::LongDoubleUnsupported('f').to_string().contains("%Lf"));
+}
+
+/// `L` on an integer conversion is not a `long double` and is not refused: C says the
+/// modifier only applies to floating point, and bionic's own `printf` ignores it there.
+/// The over-correction — refusing every `L` — would break a legal format string.
+#[test]
+fn plan_refuses_long_double_only_where_the_argument_really_is_one() {
+    assert_eq!(plan("%Ld").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%Lu").unwrap(), vec![ArgKind::UInt]);
+    // `q` is BSD's spelling of `ll` — a 64-bit integer, not a quad — so it is not refused.
+    assert_eq!(plan("%qd").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%qf").unwrap(), vec![ArgKind::Double]);
+}
+
+/// `wchar_t` is **32 bits** on Android, so `%ls`/`%lc` are not their narrow forms with an
+/// extra letter: reading one as a byte string prints the first character and then garbage.
+#[test]
+fn plan_refuses_wide_conversions() {
+    assert_eq!(plan("%ls"), Err(FormatError::WideUnsupported('s')));
+    assert_eq!(plan("%lc"), Err(FormatError::WideUnsupported('c')));
+    // `ll` is not `l`: `%lld` is an ordinary 64-bit integer.
+    assert_eq!(plan("%lld").unwrap(), vec![ArgKind::Int]);
+    // And `l` on the conversions where it means "64-bit" is fine.
+    assert_eq!(plan("%ld").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%lx").unwrap(), vec![ArgKind::UInt]);
+    assert_eq!(plan("%lf").unwrap(), vec![ArgKind::Double]);
+}
+
+/// Hostile format strings: the guest chooses these bytes, so every one of them has to be a
+/// returned error rather than a panic, a hang, or an allocation the length of the width.
+#[test]
+fn plan_survives_hostile_format_strings() {
+    // Truncated specifications.
+    assert!(plan("%").is_err());
+    assert!(plan("abc%").is_err());
+    assert!(plan("%-").is_err());
+    assert!(plan("%12").is_err());
+    assert!(plan("%.").is_err());
+    assert!(plan("%.*").is_err());
+    assert!(plan("%l").is_err());
+    assert!(plan("%hh").is_err());
+    // `%n` is an exploit primitive and is refused by name.
+    assert_eq!(plan("%n"), Err(FormatError::NNotSupported));
+    assert_eq!(plan("write here: %n"), Err(FormatError::NNotSupported));
+    // Unknown conversions.
+    assert_eq!(plan("%y"), Err(FormatError::UnknownSpecifier('y')));
+    assert_eq!(plan("%\0"), Err(FormatError::UnknownSpecifier('\0')));
+    // A width of thirty nines must saturate rather than wrap or panic. The plan itself is
+    // fine — it is one integer — and nothing is allocated here.
+    assert_eq!(plan(&format!("%{}d", "9".repeat(30))).unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan(&format!("%.{}f", "9".repeat(30))).unwrap(), vec![ArgKind::Double]);
+    // A long run of conversions terminates and reports all of them.
+    let many = "%d".repeat(4096);
+    assert_eq!(plan(&many).unwrap().len(), 4096);
+    // Flags with nothing after them, repeated flags, and every flag at once.
+    assert!(plan("%-+ #0").is_err());
+    assert_eq!(plan("%-+ #0d").unwrap(), vec![ArgKind::Int]);
+    assert_eq!(plan("%-----d").unwrap(), vec![ArgKind::Int]);
+}
+
+/// A saturated width does not become a 2 GB allocation. The guest picks the width, so the
+/// cost of honouring it is the guest's choice unless something bounds it — this records
+/// where the bound is **not**: `format` will try to pad, so the adapter caps the output
+/// buffer, and this test pins that `plan` itself neither allocates nor refuses.
+#[test]
+fn a_saturated_width_is_planned_but_not_honoured_here() {
+    let f = format!("%{}d", "9".repeat(30));
+    assert_eq!(plan(&f).unwrap(), vec![ArgKind::Int]);
+    // Deliberately not calling `format` with it: that is the adapter's bound, tested there.
 }

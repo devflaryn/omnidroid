@@ -57,6 +57,21 @@ pub enum FormatError {
     UnknownSpecifier(char),
     /// The format string itself is malformed (e.g. a trailing `%`).
     MalformedFormat(&'static str),
+    /// A `long double` conversion (`%Lf`, `%Le`, `%La`, `%Lg`) was requested.
+    ///
+    /// **Refused before any argument is read, on purpose.** On Android/LP64 a `long double`
+    /// is a 128-bit quad passed in a 16-byte variadic slot, and every argument walker this
+    /// crate is used with steps in 8-byte units. Reading one as a `double` would return a
+    /// number that is wrong rather than imprecise, and the next conversion would then read
+    /// the wrong half of it — a plausible wrong answer propagating through the rest of the
+    /// format. The `char` is the conversion that asked.
+    LongDoubleUnsupported(char),
+    /// A wide conversion (`%ls`, `%lc`) was requested.
+    ///
+    /// Refused rather than treated as its narrow form: on Android `wchar_t` is **32 bits**,
+    /// so the argument is a `wchar_t*`/`wint_t` and reading it as a byte string or a byte
+    /// would print the first character followed by garbage. The `char` is the conversion.
+    WideUnsupported(char),
 }
 
 impl core::fmt::Display for FormatError {
@@ -66,6 +81,13 @@ impl core::fmt::Display for FormatError {
             FormatError::MissingArgument => write!(f, "format references a missing argument"),
             FormatError::UnknownSpecifier(c) => write!(f, "unknown conversion '%{c}'"),
             FormatError::MalformedFormat(why) => write!(f, "malformed format: {why}"),
+            FormatError::LongDoubleUnsupported(c) => write!(
+                f,
+                "%L{c}: long double is a 128-bit quad on Android and is not formatted here"
+            ),
+            FormatError::WideUnsupported(c) => {
+                write!(f, "%l{c}: wide characters (32-bit wchar_t) are not formatted here")
+            }
         }
     }
 }
@@ -112,114 +134,40 @@ pub fn format(
         if i >= bytes.len() {
             return Err(FormatError::MalformedFormat("trailing %"));
         }
-        // Flags (in C's parse order, repetitions allowed).
-        let mut flags = Flags::default();
-        loop {
-            match bytes[i] {
-                b'-' => flags.left = true,
-                b'+' => flags.plus = true,
-                b' ' => flags.space = true,
-                b'#' => flags.alt = true,
-                b'0' => flags.zero = true,
-                _ => break,
-            }
-            i += 1;
-            if i >= bytes.len() {
-                return Err(FormatError::MalformedFormat("flags run to end"));
-            }
-        }
-        // Width (digits or '*').
-        let mut width: Option<usize> = None;
-        if bytes[i] == b'*' {
-            i += 1;
-            let a = next_arg(args, &mut arg_idx)?;
-            match a {
-                FormatArg::Int(n) if n >= &0 => width = Some(*n as usize),
+        // One parser, shared with [`plan`]. Two copies of this would be two chances to
+        // disagree about where an argument sits, and a `printf` whose planner and whose
+        // formatter disagree by one argument prints the *next* argument for every
+        // conversion after the first — a plausible wrong answer, which is the one outcome
+        // this crate forbids.
+        let (parsed, next) = parse_spec(bytes, i)?;
+        i = next;
+        let mut flags = parsed.flags;
+        let length = parsed.length;
+        let spec = parsed.conv;
+        // `*` width and precision consume their argument BEFORE the conversion character is
+        // acted on — including for `%%` — which is what `plan` mirrors.
+        let width: Option<usize> = match parsed.width {
+            Count::Absent => None,
+            Count::Fixed(n) => Some(n),
+            Count::Star => match next_arg(args, &mut arg_idx)? {
+                FormatArg::Int(n) if *n >= 0 => Some(*n as usize),
                 FormatArg::Int(n) => {
                     // Negative width: left-justify with magnitude (C behaviour).
-                    width = Some(n.unsigned_abs() as usize);
                     flags.left = true;
+                    Some(n.unsigned_abs() as usize)
                 }
                 _ => return Err(FormatError::MalformedFormat("'*' width needs an int")),
-            }
-        } else {
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                width = Some(width.unwrap_or(0) * 10 + (bytes[i] - b'0') as usize);
-                i += 1;
-            }
-        }
-        if i >= bytes.len() {
-            return Err(FormatError::MalformedFormat("width runs to end"));
-        }
-        // Precision ('.' then digits or '*'; '.' alone means precision 0).
-        let mut precision: Option<usize> = None;
-        if bytes[i] == b'.' {
-            i += 1;
-            if i >= bytes.len() {
-                return Err(FormatError::MalformedFormat("precision runs to end"));
-            }
-            if bytes[i] == b'*' {
-                i += 1;
-                let a = next_arg(args, &mut arg_idx)?;
-                match a {
-                    FormatArg::Int(n) if n >= &0 => precision = Some(*n as usize),
-                    FormatArg::Int(_) => precision = None, // negative precision = omitted
-                    _ => return Err(FormatError::MalformedFormat("'*' precision needs an int")),
-                }
-            } else {
-                precision = Some(0);
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    precision = Some(precision.unwrap_or(0) * 10 + (bytes[i] - b'0') as usize);
-                    i += 1;
-                }
-            }
-        }
-        if i >= bytes.len() {
-            return Err(FormatError::MalformedFormat("spec runs to end"));
-        }
-        // Length modifier (validated; the value's width comes from the FormatArg itself).
-        let mut length = "";
-        while let b'h' | b'l' | b'z' | b'j' | b't' | b'q' | b'L' = bytes[i] {
-            if (bytes[i] == b'h' || bytes[i] == b'l')
-                && i + 1 < bytes.len()
-                && bytes[i + 1] == bytes[i]
-            {
-                length = if bytes[i] == b'h' { "hh" } else { "ll" };
-                i += 1;
-            } else {
-                length = match bytes[i] {
-                    b'h' => "h",
-                    b'l' => "l",
-                    b'z' => "z",
-                    b'j' => "j",
-                    b't' => "t",
-                    b'q' => "q",
-                    _ => "L",
-                };
-            }
-            i += 1;
-            if i >= bytes.len() {
-                return Err(FormatError::MalformedFormat("length runs to end"));
-            }
-        }
-        let _ = length; // recorded for the adapter; the FormatArg carries the value's width
-        // Conversion.
-        let spec = bytes[i] as char;
-        i += 1;
-        if spec == 'n' {
-            return Err(FormatError::NNotSupported);
-        }
-        // Unknown specifiers are rejected BEFORE any argument is consumed (the argument
-        // count stays meaningful for callers that pre-scan) and before any output.
-        if spec != '%'
-            && !matches!(
-                spec,
-                'd' | 'i' | 'u' | 'o' | 'x' | 'X' | 'c' | 's' | 'p' | 'e' | 'E' | 'f' | 'F'
-                    | 'g' | 'G' | 'a' | 'A'
-            )
-        {
-            return Err(FormatError::UnknownSpecifier(spec));
-        }
+            },
+        };
+        let precision: Option<usize> = match parsed.precision {
+            Count::Absent => None,
+            Count::Fixed(n) => Some(n),
+            Count::Star => match next_arg(args, &mut arg_idx)? {
+                FormatArg::Int(n) if *n >= 0 => Some(*n as usize),
+                FormatArg::Int(_) => None, // negative precision = omitted
+                _ => return Err(FormatError::MalformedFormat("'*' precision needs an int")),
+            },
+        };
         let arg = match spec {
             '%' => {
                 out.push('%');
@@ -339,6 +287,257 @@ pub fn format(
         }
     }
     Ok(out.len() - start_len)
+}
+
+// ---------------------------------------------------------------------------
+// The shared specification parser, and the pre-scan the adapter needs
+// ---------------------------------------------------------------------------
+
+/// A width or precision, before any `*` argument has been fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Count {
+    /// Not written at all.
+    Absent,
+    /// Written as digits.
+    Fixed(usize),
+    /// Written as `*`: it comes from an argument.
+    Star,
+}
+
+/// One parsed conversion specification, with no argument fetched yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Spec {
+    flags: Flags,
+    width: Count,
+    precision: Count,
+    length: &'static str,
+    conv: char,
+}
+
+/// Parse the conversion specification whose `%` has already been consumed, starting at
+/// `bytes[at]`. Returns the specification and the index one past the conversion character.
+///
+/// This is the **only** parser: [`format`] and [`plan`] both go through it, so the count and
+/// the order of the arguments a format string needs cannot differ between planning the call
+/// and performing it.
+fn parse_spec(bytes: &[u8], at: usize) -> Result<(Spec, usize), FormatError> {
+    let mut i = at;
+    // Flags (in C's parse order, repetitions allowed).
+    let mut flags = Flags::default();
+    loop {
+        if i >= bytes.len() {
+            return Err(FormatError::MalformedFormat("flags run to end"));
+        }
+        match bytes[i] {
+            b'-' => flags.left = true,
+            b'+' => flags.plus = true,
+            b' ' => flags.space = true,
+            b'#' => flags.alt = true,
+            b'0' => flags.zero = true,
+            _ => break,
+        }
+        i += 1;
+    }
+    // Width (digits or '*').
+    let mut width = Count::Absent;
+    if bytes[i] == b'*' {
+        i += 1;
+        width = Count::Star;
+    } else {
+        let mut digits: Option<usize> = None;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            // Saturating, not wrapping: a hostile format string of thirty nines must not wrap
+            // a width into a small number, nor panic in a debug build. A saturated width is
+            // refused downstream by the padding it would need, and never silently becomes a
+            // *different* width.
+            digits = Some(
+                digits
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add((bytes[i] - b'0') as usize),
+            );
+            i += 1;
+        }
+        if let Some(n) = digits {
+            width = Count::Fixed(n);
+        }
+    }
+    if i >= bytes.len() {
+        return Err(FormatError::MalformedFormat("width runs to end"));
+    }
+    // Precision ('.' then digits or '*'; '.' alone means precision 0).
+    let mut precision = Count::Absent;
+    if bytes[i] == b'.' {
+        i += 1;
+        if i >= bytes.len() {
+            return Err(FormatError::MalformedFormat("precision runs to end"));
+        }
+        if bytes[i] == b'*' {
+            i += 1;
+            precision = Count::Star;
+        } else {
+            let mut digits = 0usize;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                digits = digits.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
+                i += 1;
+            }
+            precision = Count::Fixed(digits);
+        }
+    }
+    if i >= bytes.len() {
+        return Err(FormatError::MalformedFormat("spec runs to end"));
+    }
+    // Length modifier (validated; the value's width comes from the FormatArg itself).
+    let mut length = "";
+    while let b'h' | b'l' | b'z' | b'j' | b't' | b'q' | b'L' = bytes[i] {
+        if (bytes[i] == b'h' || bytes[i] == b'l') && i + 1 < bytes.len() && bytes[i + 1] == bytes[i]
+        {
+            length = if bytes[i] == b'h' { "hh" } else { "ll" };
+            i += 1;
+        } else {
+            length = match bytes[i] {
+                b'h' => "h",
+                b'l' => "l",
+                b'z' => "z",
+                b'j' => "j",
+                b't' => "t",
+                b'q' => "q",
+                _ => "L",
+            };
+        }
+        i += 1;
+        if i >= bytes.len() {
+            return Err(FormatError::MalformedFormat("length runs to end"));
+        }
+    }
+    // Conversion.
+    let conv = bytes[i] as char;
+    i += 1;
+    if conv == 'n' {
+        return Err(FormatError::NNotSupported);
+    }
+    // Unknown specifiers are rejected BEFORE any argument is consumed (the argument
+    // count stays meaningful for callers that pre-scan) and before any output.
+    if conv != '%'
+        && !matches!(
+            conv,
+            'd' | 'i'
+                | 'u'
+                | 'o'
+                | 'x'
+                | 'X'
+                | 'c'
+                | 's'
+                | 'p'
+                | 'e'
+                | 'E'
+                | 'f'
+                | 'F'
+                | 'g'
+                | 'G'
+                | 'a'
+                | 'A'
+        )
+    {
+        return Err(FormatError::UnknownSpecifier(conv));
+    }
+    Ok((Spec { flags, width, precision, length, conv }, i))
+}
+
+/// The kind of value one variadic argument must be fetched as.
+///
+/// A C variadic call carries no type information, so the *format string* is the only
+/// description of its own arguments. An adapter marshalling a guest `printf` has to know
+/// which register bank each argument sits in **before** it reads one, because reading a
+/// `double` out of the integer bank does not fail — it returns a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    /// A signed integer: `d i c`, and every `*` width or precision.
+    Int,
+    /// An unsigned integer: `u o x X`.
+    UInt,
+    /// A pointer: `p`.
+    Ptr,
+    /// A `double`, from the floating-point bank: `e E f F g G a A`.
+    Double,
+    /// A `const char *` whose bytes the adapter reads out of guest memory for `%s`.
+    Str,
+}
+
+/// Walk `fmt` and report, in order, the kind of every argument it will consume.
+///
+/// The counterpart to [`format()`]: an adapter calls `plan` first, fetches exactly these
+/// arguments from wherever its ABI keeps them, and then calls `format` with the resulting
+/// slice. Both walk the format string through the same parser, so the list `plan` returns
+/// is exactly the list `format` will ask for.
+///
+/// # Errors
+///
+/// Every [`FormatError`] the parser can raise, plus
+/// [`FormatError::LongDoubleUnsupported`] and [`FormatError::WideUnsupported`] — both
+/// raised **here**, before the caller reads anything, because neither has a correct
+/// 8-byte read and a guess would be a plausible wrong number.
+pub fn plan(fmt: &str) -> Result<Vec<ArgKind>, FormatError> {
+    let bytes = fmt.as_bytes();
+    let mut i = 0usize;
+    let mut kinds = Vec::new();
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            return Err(FormatError::MalformedFormat("trailing %"));
+        }
+        let (spec, next) = parse_spec(bytes, i)?;
+        i = next;
+        // `format` fetches the `*` arguments before it looks at the conversion character,
+        // `%%` included, so the pre-scan has to do the same or the two walks diverge by one
+        // argument on `%*%`.
+        if spec.width == Count::Star {
+            kinds.push(ArgKind::Int);
+        }
+        if spec.precision == Count::Star {
+            kinds.push(ArgKind::Int);
+        }
+        if spec.conv == '%' {
+            continue;
+        }
+        kinds.push(kind_of(spec.conv, spec.length)?);
+    }
+    Ok(kinds)
+}
+
+/// The argument kind one conversion needs, refusing the two shapes that have no correct
+/// 8-byte read on Android/LP64.
+fn kind_of(conv: char, length: &str) -> Result<ArgKind, FormatError> {
+    match conv {
+        'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A' => {
+            if length == "L" {
+                // AAPCS64 gives a 128-bit quad a 16-byte slot; there is no 16-byte variadic
+                // read anywhere in this stack, so the only honest answer is a refusal.
+                return Err(FormatError::LongDoubleUnsupported(conv));
+            }
+            Ok(ArgKind::Double)
+        }
+        's' => {
+            if length == "l" {
+                return Err(FormatError::WideUnsupported(conv));
+            }
+            Ok(ArgKind::Str)
+        }
+        'c' => {
+            if length == "l" {
+                return Err(FormatError::WideUnsupported(conv));
+            }
+            Ok(ArgKind::Int)
+        }
+        'd' | 'i' => Ok(ArgKind::Int),
+        'u' | 'o' | 'x' | 'X' => Ok(ArgKind::UInt),
+        'p' => Ok(ArgKind::Ptr),
+        other => Err(FormatError::UnknownSpecifier(other)),
+    }
 }
 
 /// Fetch the next variadic argument.
