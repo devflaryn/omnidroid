@@ -38,7 +38,7 @@
 /// a guest-chosen width stops being formatting and starts being an allocation the guest picked.
 pub const MAX_FIELD_WIDTH: usize = 64 * 1024;
 
-/// The most one [`format`] call will produce.
+/// The most one [`format()`] call will produce.
 ///
 /// Capping a single field is not enough on its own: a format string may repeat a wide
 /// conversion. Checked once per loop iteration, which also bounds the literal bytes.
