@@ -288,8 +288,16 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     }
 
     let mut view = call.view();
-    let Some(len) = pages(length, page).filter(|&n| n != 0) else {
+    // **Linux's two answers, kept apart.** A length of zero is `EINVAL`; a length that cannot be
+    // rounded up to a page — because it would wrap, or because it is wider than this host's
+    // `usize` — is `ENOMEM`, which is what `PAGE_ALIGN(len) == 0` gives there.
+    if length == 0 {
         fail(&mut view, consts::EINVAL);
+        c.ret(|mut r| r.u64(MAP_FAILED));
+        return Ok(());
+    }
+    let Some(len) = pages(length, page) else {
+        fail(&mut view, consts::ENOMEM);
         c.ret(|mut r| r.u64(MAP_FAILED));
         return Ok(());
     };
@@ -397,6 +405,12 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         Err(why) => return call.refuse(why),
     };
 
+    // `mprotect` over zero bytes is a no-op that succeeds, which is what Linux answers; only a
+    // misaligned address or an unusable length is an error.
+    if length == 0 && at % page == 0 {
+        c.ret(|mut r| r.i32(0));
+        return Ok(());
+    }
     let Some(len) = pages(length, page).filter(|&n| n != 0 && at % page == 0) else {
         let mut view = call.view();
         fail(&mut view, consts::EINVAL);

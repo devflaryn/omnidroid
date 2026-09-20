@@ -1898,9 +1898,32 @@ fn a_legitimate_mmap_failure_is_map_failed_with_errno_and_not_a_refusal() {
     assert_eq!(f.guest.read_u64(out), u64::MAX, "MAP_FAILED is (void *) -1, not NULL");
     assert_eq!(f.guest.read_u64(out + 8), 22, "EINVAL is Linux's 22");
 
-    // A length that would wrap when rounded up to a page must not become a small one.
-    let wrapped = guest_mmap(&f, 0, u64::MAX, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
-    assert_eq!(wrapped, u64::MAX, "MAP_FAILED, not a mapping");
+    // A length that would wrap when rounded up to a page must not become a small one. **The
+    // errno is asserted, not only the return**, because both a wrap and an ordinary too-large
+    // request answer MAP_FAILED: saturating the round-up rather than checking it would turn this
+    // into an ENOMEM for a mapping of `usize::MAX & !4095` bytes, and the return value alone
+    // cannot tell the two apart.
+    let entry = program(&f, |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, u64::MAX);
+        asm.mov(2, PROT_RW);
+        asm.mov(3, MAP_ANON_PRIVATE);
+        asm.mov(4, u64::MAX);
+        asm.mov(5, 0);
+        asm.bl(f.thunk("mmap"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 16));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 24));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 16), u64::MAX, "MAP_FAILED, not a mapping");
+    assert_eq!(
+        f.guest.read_u64(out + 24),
+        12,
+        "ENOMEM is Linux's 12, and it is what PAGE_ALIGN(len) == 0 answers there"
+    );
 
     // And a length larger than the guest address space is ENOMEM rather than a panic.
     let huge = guest_mmap(&f, 0, 1 << 40, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
@@ -2074,4 +2097,136 @@ fn a_full_static_pool_is_a_refusal_and_not_an_overwrite() {
     let unique: std::collections::BTreeSet<_> = interned.iter().collect();
     assert_eq!(unique.len(), interned.len(), "no two allocations share an address");
     assert!(bionic.pool_used() <= POOL_BYTES);
+}
+
+/// **The demand pager is the heap seam (D10), and this is what says so.** A guest `mmap` is
+/// `CommitPolicy::Lazy`, so 16 MiB of address space costs no commit charge until the guest touches
+/// it — and then one granule, not sixteen megabytes.
+///
+/// `libroblox.so` carries its own allocator and reaches the host only through this call, so an
+/// eager `mmap` would charge the whole of every arena the engine reserves.
+#[test]
+fn a_guest_mmap_costs_no_commit_charge_until_the_guest_touches_it() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let granule = f.guest.space.commit_granule();
+    let length = 16 * 1024 * 1024;
+    // **A warm-up call first, and it is not tidiness.** Every `value_of` creates a guest thread,
+    // and the first one takes a TLS block out of `omni-cpu`'s lazily-committed arena — which is a
+    // granule of commit charge that has nothing to do with `mmap`. Measuring from before it would
+    // have attributed 64 KiB of somebody else's charge to this call, in the direction that makes
+    // a lazy mapping look eager.
+    let warmup = guest_mmap(&f, 0, 4096, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(warmup, u64::MAX);
+    let before = f.guest.space.stats();
+
+    let at = guest_mmap(&f, 0, length as u64, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX);
+    let mapped = f.guest.space.stats();
+    assert_eq!(mapped.mapped - before.mapped, length, "the address space really was claimed");
+    assert_eq!(mapped.free, before.free - length, "and it came out of the free space");
+    assert_eq!(
+        mapped.committed, before.committed,
+        "and none of it was committed: address space is free, commit charge is not (D10)"
+    );
+
+    let touch = program(&f, |asm| {
+        asm.mov(9, at);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
+    });
+    run_program(&f, touch).expect("the guest can write to it");
+    let touched = f.guest.space.stats();
+    assert_eq!(
+        touched.committed - mapped.committed,
+        granule,
+        "one granule, committed on demand — not the whole mapping"
+    );
+}
+
+/// `MAP_SHARED` on anonymous memory is accepted, and is the same thing as `MAP_PRIVATE` here.
+///
+/// The two differ only across a `fork`, and there is no `fork`: it is not in the reachable set and
+/// there is no process surface to build one on. Refusing `MAP_SHARED` would be an over-correction
+/// that fails a correct program, which is the direction mutation row `guestmem-B1` exists for.
+#[test]
+fn an_anonymous_map_shared_is_accepted_because_there_is_no_fork_to_share_with() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    let shared = guest_mmap(&f, 0, length, PROT_RW, 0x21, -1, 0);
+    assert_ne!(shared, u64::MAX, "MAP_SHARED | MAP_ANONYMOUS is a legitimate request");
+    let entry = program(&f, |asm| {
+        asm.mov(9, shared);
+        asm.mov(10, 0x5A);
+        asm.push(str_imm(10, 9, 0));
+    });
+    assert!(matches!(run_program(&f, entry).expect("usable"), ExitReason::Returned { .. }));
+
+    // A sharing mode that is neither is EINVAL, which is what Linux answers — `MAP_TYPE` is a
+    // three-bit field and `3` is `MAP_SHARED_VALIDATE`, which this layer does not implement.
+    let neither = guest_mmap(&f, 0, length, PROT_RW, 0x20, -1, 0);
+    assert_eq!(neither, u64::MAX, "no sharing mode at all is EINVAL");
+}
+
+/// **A guest that unmaps code and maps different code at the same address must run the new code.**
+///
+/// The backend caches translations by guest address, so `munmap` and `mprotect` have to discard
+/// them or the second call runs the first program. This is the reason the guest-memory group is on
+/// the exit path in the first place: `ImportCall` holds no CPU, so an inline handler could not
+/// invalidate anything even if changing the address space were safe from one.
+///
+/// Both programs are two instructions and differ only in the constant they return, so a failure
+/// here is unambiguous: `0xAA` where `0xBB` belongs is the old translation.
+#[test]
+fn code_at_a_reused_address_is_retranslated_rather_than_run_from_the_cache() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX);
+    let out = f.guest.data + 0x400;
+
+    let install_and_call = |answer: u16, slot: usize| {
+        f.guest.write_bytes(
+            at as usize,
+            &[movz(0, answer, 0).to_le_bytes(), ret(30).to_le_bytes()].concat(),
+        );
+        let code = value_of(&f, "mprotect", |asm| {
+            asm.mov(0, at);
+            asm.mov(1, length);
+            asm.mov(2, 5); // PROT_READ | PROT_EXEC
+        });
+        assert_eq!(code as i64 as i32, 0);
+        let entry = program(&f, |asm| {
+            asm.mov(9, at);
+            asm.mov(10, out as u64);
+            asm.push(blr(9));
+            asm.push(str_imm(0, 10, slot as u32));
+        });
+        let exit = run_program(&f, entry).expect("the guest runs what it mapped");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    };
+
+    install_and_call(0xAA, 0);
+    assert_eq!(f.guest.read_u64(out), 0xAA);
+
+    // Give the range back and take it again at the same address, then put a different program
+    // there. Without the invalidation in `munmap`/`mprotect` the cached translation of the first
+    // one still answers.
+    let code = value_of(&f, "munmap", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+    });
+    assert_eq!(code as i64 as i32, 0);
+    let again = guest_mmap(&f, at, length, PROT_RW, MAP_ANON_PRIVATE | 0x10_0000, -1, 0);
+    assert_eq!(again, at, "MAP_FIXED_NOREPLACE must give the address back");
+
+    install_and_call(0xBB, 8);
+    assert_eq!(
+        f.guest.read_u64(out + 8),
+        0xBB,
+        "0xAA here is the first program's translation, served out of the code cache after the \
+         memory it was translated from was unmapped"
+    );
 }

@@ -81,6 +81,9 @@ ADAPTER_VIEW = "crates/omni-android/src/bionic/view.rs"
 ADAPTER_MOD = "crates/omni-android/src/bionic/mod.rs"
 ADAPTER_HANDLERS = "crates/omni-android/src/bionic/handlers.rs"
 ADAPTER_FORMAT = "crates/omni-android/src/bionic/format.rs"
+ADAPTER_DATA = "crates/omni-android/src/bionic/data.rs"
+ADAPTER_DL = "crates/omni-android/src/bionic/dl.rs"
+ADAPTER_GUESTMEM = "crates/omni-android/src/bionic/guestmem.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
@@ -1562,6 +1565,168 @@ MUTATIONS = [
      """const SELF_HEAL_SLICE: Duration = Duration::from_millis(50);""",
      """const SELF_HEAL_SLICE: Duration = Duration::from_millis(1_000);""",
      BIONIC),
+
+    # ---- M3 task 3 phase 2: the dl* family ------------------------------------------------------
+    #
+    # `dl_iterate_phdr` is the one import in this phase that cannot be a stub: the C++ runtime in
+    # `libroblox.so` is statically linked, so the in-guest unwinder walks 11.5 MB of `.eh_frame`
+    # through it and every `throw` depends on the answer.
+    ("dl-A1", "A",
+     "dl_iterate_phdr reports an empty process instead of refusing when nothing is registered",
+     ADAPTER_DL,
+     """    if images.is_empty() {""",
+     """    if false && images.is_empty() {""",
+     ANDROID),
+
+    # The struct layout, which is the silently-wrong class here: a callback reading `dlpi_phdr` out
+    # of where `dlpi_name` was written gets a pointer that is not a program header table.
+    ("dl-A2", "A", "dl_phdr_info's dlpi_phdr written at +8, on top of dlpi_name", ADAPTER_DL,
+     """    pub(super) const PHDR: usize = 16;""",
+     """    pub(super) const PHDR: usize = 8;""",
+     ANDROID),
+
+    ("dl-A3", "A", "the walk does not stop when a callback answers non-zero", ADAPTER_DL,
+     """        if returned != 0 {
+            result = returned;
+            break;
+        }""",
+     """        if returned != 0 {
+            result = returned;
+        }""",
+     ANDROID),
+
+    ("dl-A4", "A", "a null dl_iterate_phdr callback is called instead of refused", ADAPTER_DL,
+     """    let target = usize::try_from(callback).ok().filter(|&t| t != 0).ok_or_else(|| {""",
+     """    let target = usize::try_from(callback).ok().ok_or_else(|| {""",
+     ANDROID),
+
+    # The over-correction: a walk that always stops after one object. The unwinder would then never
+    # see any library but the first, which is a *success* returning the first callback's answer.
+    ("dl-B1", "B", "the walk stops after the first object whatever the callback answered",
+     ADAPTER_DL,
+     """        if returned != 0 {
+            result = returned;
+            break;
+        }""",
+     """        {
+            result = returned;
+            break;
+        }""",
+     ANDROID),
+
+    # ---- M3 task 3 phase 2: the eighteen data objects -------------------------------------------
+    ("data-A1", "A", "stdin/stdout/stderr spaced by a pointer instead of by a whole FILE",
+     ADAPTER_DATA,
+     """        mem.write_u64(cell, (sf + index * FILE_BYTES) as u64, blame(symbol, cell))?;""",
+     """        mem.write_u64(cell, (sf + index * 8) as u64, blame(symbol, cell))?;""",
+     ANDROID),
+
+    ("data-A2", "A", "in6addr_loopback is 1:: rather than ::1", ADAPTER_DATA,
+     """    ones[15] = 1;""",
+     """    ones[0] = 1;""",
+     ANDROID),
+
+    # A zero canary compares equal to a zeroed stack slot, so a stack overflow that wrote zeroes
+    # passes every `__stack_chk_fail` check. `omni-cpu` refuses to generate one; this is the other
+    # half of that refusal.
+    ("data-A3", "A", "a zero stack canary is stored instead of refused", ADAPTER_DATA,
+     """    if process.stack_guard == 0 {""",
+     """    if false && process.stack_guard == 0 {""",
+     ANDROID),
+
+    ("data-A4", "A", "environ is null rather than pointing at an empty vector", ADAPTER_DATA,
+     """    mem.write_u64(environ, empty_environ as u64, blame("environ", environ))?;""",
+     """    mem.write_u64(environ, 0, blame("environ", environ))?;""",
+     ANDROID),
+
+    ("data-A5", "A", "__sF is one FILE wide, so stdout and stderr are somebody else's object",
+     ADAPTER_DATA,
+     """    DataObject { symbol: "__sF", len: 3 * FILE_BYTES, align: 8 },""",
+     """    DataObject { symbol: "__sF", len: FILE_BYTES, align: 8 },""",
+     ANDROID),
+
+    # The over-correction: the static pool tightened until the data the phase actually places no
+    # longer fits. A bound that refuses correct input is as wrong as no bound.
+    ("data-B1", "B", "the static pool tightened below what the eighteen data objects need",
+     ADAPTER_MOD,
+     """pub const POOL_BYTES: usize = 4096;""",
+     """pub const POOL_BYTES: usize = 64;""",
+     ANDROID),
+
+    # ---- M3 task 3 phase 2: the guest-memory group ----------------------------------------------
+    #
+    # Task 2 review F9: these five reach the whole `GuestSpace`, so they are on the exit path. That
+    # is also the only path that can reach a CPU, which is what `invalidate` needs.
+    ("guestmem-A1", "A",
+     "translated code is not discarded when the memory it came from is unmapped or reprotected",
+     ADAPTER_GUESTMEM,
+     """    if len == 0 {
+        return Ok(());
+    }
+    c.invalidate_code(address, len)""",
+     """    if true || len == 0 {
+        return Ok(());
+    }
+    c.invalidate_code(address, len)""",
+     ANDROID),
+
+    ("guestmem-A2", "A", "MADV_DONTNEED is answered instead of refused", ADAPTER_GUESTMEM,
+     """    if advice == MADV_DONTNEED || advice == MADV_REMOVE {""",
+     """    if false && (advice == MADV_DONTNEED || advice == MADV_REMOVE) {""",
+     ANDROID),
+
+    ("guestmem-A3", "A", "a file-backed mmap is served as anonymous memory", ADAPTER_GUESTMEM,
+     """    if fd != -1 || flags & MAP_ANONYMOUS == 0 {""",
+     """    if false && (fd != -1 || flags & MAP_ANONYMOUS == 0) {""",
+     ANDROID),
+
+    # Widening rather than refusing: the guest asked for write-only and is given read as well.
+    ("guestmem-A4", "A", "PROT_WRITE alone widened to ReadWrite instead of refused",
+     ADAPTER_GUESTMEM,
+     """        p if p == PROT_READ | PROT_WRITE => Ok(Protection::ReadWrite),""",
+     """        p if p == PROT_READ | PROT_WRITE || p == PROT_WRITE => Ok(Protection::ReadWrite),""",
+     ANDROID),
+
+    # Global Constraint 11's "saturating arithmetic on a limit turns hostile input into a larger
+    # permission", in the one place in this phase where a guest length is rounded up.
+    ("guestmem-A5", "A", "a length rounded up to a page saturates instead of being checked",
+     ADAPTER_GUESTMEM,
+     """    len.checked_add(mask).map(|n| n & !mask)""",
+     """    Some(len.saturating_add(mask) & !mask)""",
+     ANDROID),
+
+    ("guestmem-A6", "A", "mlock answers 0, which is the believable wrong answer", ADAPTER_GUESTMEM,
+     """    let call = Call::begin(c)?;
+    call.refuse(format!(
+        "the guest asked to lock {len} bytes at {addr:#x} into memory.""",
+     """    let call = Call::begin(c)?;
+    c.ret(|mut r| r.i32(0));
+    return Ok(());
+    #[allow(unreachable_code)]
+    call.refuse(format!(
+        "the guest asked to lock {len} bytes at {addr:#x} into memory.""",
+     ANDROID),
+
+    # The over-correction: refusing a request that is correct here. MAP_SHARED on anonymous memory
+    # differs from MAP_PRIVATE only across a `fork`, and there is none.
+    ("guestmem-B1", "B", "an anonymous MAP_SHARED refused although there is no fork to share with",
+     ADAPTER_GUESTMEM,
+     """    if !matches!(flags & MAP_TYPE, MAP_PRIVATE | MAP_SHARED) {""",
+     """    if !matches!(flags & MAP_TYPE, MAP_PRIVATE) {""",
+     ANDROID),
+
+    # The over-correction that destroys the measured design property: D10's "never commit
+    # speculatively", and the demand pager being the heap seam rather than `malloc`.
+    ("guestmem-B2", "B", "a guest mmap commits eagerly, so the heap seam stops being the pager",
+     ADAPTER_GUESTMEM,
+     """    match space.map_anonymous(placement, len, protection, CommitPolicy::Lazy) {""",
+     """    match space.map_anonymous(placement, len, protection, CommitPolicy::Eager) {""",
+     ANDROID),
+
+    ("guestmem-B3", "B", "the purely advisory madvise hints refused as well", ADAPTER_GUESTMEM,
+     """    if ADVISORY.contains(&advice) {""",
+     """    if false && ADVISORY.contains(&advice) {""",
+     ANDROID),
 ]
 
 
