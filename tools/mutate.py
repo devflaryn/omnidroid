@@ -2765,6 +2765,36 @@ directory", ADAPTER_FILES,
     }""",
      ANDROID),
 
+
+    # POSIX: "on failure, the objects pointed to by the readfds, writefds, and errorfds arguments
+    # are not modified". With the sets rewritten before the timeout is read, a `tv_usec` of
+    # 1,000,000 answers -1/EINVAL **and takes the guest's sets with it**, so a caller that retried
+    # the call would retry it with nothing. This was a real defect in the first version of this
+    # module, found by re-reading the code rather than by a failing test; `net-A9` is the row that
+    # keeps it found.
+    ("net-A9", "A", "select zeroes the guest's sets before it validates the timeout",
+     ADAPTER_NET,
+     """    // Refused before anything is written, for the same reason.
+    let wait = bounded_wait(c, duration)?;
+    // Nothing is ready and the wait is going to happen, so on return every set must be empty:
+    // POSIX requires the sets to be zeroed when `select` times out, and a guest that read a stale
+    // bit would act on a descriptor this call did not report.
+    for set in &mut sets {
+        set.clear();
+    }
+    for set in &sets {
+        set.write_back(view)?;
+    }
+    Ok(Outcome::Sleep(wait))""",
+     """    for set in &mut sets {
+        set.clear();
+    }
+    for set in &sets {
+        set.write_back(view)?;
+    }
+    Ok(Outcome::Sleep(bounded_wait(c, duration)?))""",
+     ANDROID),
+
     # ---- the over-corrections ------------------------------------------------------------------
 
     # The cap on a wait applied to every wait, so a `poll` with a thirty-millisecond timeout is

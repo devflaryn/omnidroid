@@ -27,13 +27,13 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
-**1133 passing, 0 failing, 13 ignored** (`cargo test --workspace --release`, 2026-09-21 — was
+**1134 passing, 0 failing, 13 ignored** (`cargo test --workspace --release`, 2026-09-21 — was
 1,093 before M3 task 3 phases 3d+3e, 1,059 before phase 3c, 1,004 before phase 3b, 959 before
 phase 3a, 926 before phase 2, 877 before phase 1, and 608 before `omni-bionic` existed, so those
 are not comparable). The thirteenth ignored test is phase 3c's per-guest-thread memory
 measurement, which is `#[ignore]`d because `process_commit_charge` is process-global. **The whole
-mutation table has been run on the committed tree: 283/283 caught**, with both pre-flight gates
-passing (283/283 patterns match exactly once; 12/12 commands pass on the unmutated tree). Clippy
+mutation table has been run on the committed tree: 284/284 caught**, with both pre-flight gates
+passing (284/284 patterns match exactly once; 12/12 commands pass on the unmutated tree). Clippy
 clean on `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
 With `workspace = true` a member's `default-features = false` is **ignored**, so the omni-android
@@ -44,7 +44,7 @@ gate that refuses to run against a modified tree:
 
 | Harness | Rows |
 |---|---|
-| `tools/mutate.py` (workspace) | **283**, all caught on a full run |
+| `tools/mutate.py` (workspace) | **284**, all caught on a full run |
 | `crates/dynarmic-sys/tools/mutate_shim.py` | 23 |
 | `crates/omni-elf/tools/mutate_loader.py` | 18 |
 
@@ -163,7 +163,7 @@ Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-pl
   phase**: the eight network symbols and the six nothing else claimed. **All 188 reachable imports
   are now accounted for** — 143 answered, 22 refused by name, 3 reporting a guest termination, 18
   data objects and **2 deliberately absent**. `omni-platform` gained exactly one primitive
-  (process CPU time) and **no socket seam at all**; mutation **255 → 283** (25 new, 25/25 caught).
+  (process CPU time) and **no socket seam at all**; mutation **255 → 284** (26 new, 26/26 caught).
   Durable record is **D25**.
 - **Task 4 (all 3,594 initializers, the M3 gate) — not started, and no import work blocks it.**
 
@@ -349,7 +349,7 @@ a fabricated `unsupported` arm either.
 5. ~~Thread lifecycle and signals.~~ **Done** (D24): 174 of the 188 covered, 16 new mutation
    rows. It needed no new `omni-platform` surface at all.
 6. ~~Sockets and polling, then the six the plan's `3e` row collects.~~ **Done** (D25): **all 188
-   accounted for**, 40 new tests, 25 new mutation rows, 25/25 caught. One new platform primitive
+   accounted for**, 41 new tests, 26 new mutation rows, 26/26 caught. One new platform primitive
    and no socket seam.
 
 ## Next action

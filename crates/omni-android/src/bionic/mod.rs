@@ -1303,19 +1303,35 @@ impl Bionic {
     ///
     /// [`AbiError::RegionFull`] if the thunk region cannot hold another slot.
     pub fn bind_into(&self, builder: &BoundaryBuilder) -> AbiResult<usize> {
+        // **The absent list is declared here rather than left to the caller**, and that is a
+        // decision rather than convenience: a host that bound every handler and forgot
+        // `declare_absent_into` would give `__gcov_dump` a thunk address, the guest's own null
+        // test would fall through, and the run would fail on a path a real device never takes.
+        // The failure would name the symbol, so it would not be silent — but it would be a
+        // failure caused by omitting a call, which is the kind of thing a later phase adds and
+        // nobody notices. Declaring absence is idempotent, so a caller that also calls
+        // `declare_absent_into` itself is fine.
+        Self::declare_absent_into(builder)?;
         for (symbol, handler) in INLINE {
             builder.bind_inline(symbol, *handler)?;
         }
         for (symbol, handler) in REENTRANT {
             builder.bind_reentrant(symbol, *handler)?;
         }
+        // The absent symbols are **not** counted: they are not bound to anything, which is the
+        // whole point of them.
         Ok(INLINE.len() + REENTRANT.len())
     }
 
     /// Declare the imports this layer deliberately supplies **nothing** for, so that a weak
     /// reference to one resolves to null exactly as it does on a device.
     ///
-    /// **Call this before the loader resolves symbols**, like
+    /// **[`bind_into`](Bionic::bind_into) already calls this**, so a host that binds the handlers
+    /// gets it for free; it is public because a host that wants the absent declarations without
+    /// the handlers — a loader-only harness, for instance — should not have to build a `Bionic`
+    /// instance for them. Declaring the same symbol twice is not an error.
+    ///
+    /// **Call it before the loader resolves symbols**, like
     /// [`declare_data_into`](Bionic::declare_data_into) and for the same reason: the loader asks
     /// about each import once, while it relocates, and an answer that arrives afterwards changes
     /// nothing. Returns how many were declared.

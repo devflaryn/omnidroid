@@ -6153,6 +6153,100 @@ fn select_with_a_hostile_timeval_is_einval_and_a_null_timeout_is_refused() {
     assert!(error.to_string().contains("indefinitely"), "{error}");
 }
 
+/// **A failed `select` leaves the guest's sets exactly as it found them.**
+///
+/// POSIX: "on failure, the objects pointed to by the readfds, writefds, and errorfds arguments
+/// are not modified". The three ways this call fails after it has already read the sets are a
+/// malformed `struct timeval`, a `timeout` pointer that is not readable, and a wait past the cap
+/// — and in every one of them a guest that retries the call has to still have its sets.
+///
+/// **This is a defect the first version of the module had**, found by re-reading it rather than
+/// by a failing test: the sets were zeroed and written back *before* the timeout was read, so a
+/// `tv_usec` of 1,000,000 returned `-1`/`EINVAL` and took the guest's sets with it. The sentinel
+/// bits below are what notices; without them, the `-1` and the errno are identical either way.
+#[test]
+fn a_failed_select_does_not_modify_the_guests_sets() {
+    let _guard = serialized();
+    // A filesystem root, because the set below names descriptor 0: `select` consults the
+    // descriptor table for every descriptor any set mentions, and an instance with no root has
+    // no table to consult.
+    let (f, _scratch) = rooted("select-fail");
+    let exceptfds = f.guest.data + 0x600;
+    let tv = f.guest.data + 0x700;
+
+    // Only the exception set has bits, so nothing is ready and the call reaches its timeout —
+    // which is the path that used to zero the sets before it looked at the `timeval`.
+    let mut bits = vec![0u8; 128];
+    bits[0] = 0b0000_0001; // descriptor 0, which is stdin and is always open
+    f.guest.write_bytes(exceptfds, &bits);
+
+    let run = |setup: &dyn Fn(&mut Asm)| {
+        let out = f.guest.data + 0x300;
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, 8);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, exceptfds as u64);
+        setup(&mut asm);
+        asm.bl(f.thunk("select"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        let mut cpu = f.guest.thread(&f.boundary);
+        let result = f.run(&mut cpu, entry);
+        (result, f.guest.read_u64(out) as i64, f.guest.read_u64(out + 8))
+    };
+
+    // A malformed `timeval`: `-1`, `EINVAL`, and the set untouched.
+    f.guest.write_u64(tv, 0);
+    f.guest.write_u64(tv + 8, 1_000_000);
+    let (result, returned, errno) = run(&|asm| {
+        asm.mov(4, tv as u64);
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(returned, -1);
+    assert_eq!(errno, EINVAL_NET);
+    assert_eq!(read_guest(&f, exceptfds, 8), bits[..8], "a failed select modified the set");
+
+    // A `timeout` pointer the guest has not mapped: a typed refusal, and the set untouched.
+    let (result, _, _) = run(&|asm| {
+        asm.mov(4, f.guest.unmapped as u64);
+    });
+    let error = result.expect_err("an unreadable timeval");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert_eq!(read_guest(&f, exceptfds, 8), bits[..8], "a refused select modified the set");
+
+    // A wait past the cap: a refusal naming the cap, and the set untouched.
+    f.guest.write_u64(tv, 61);
+    f.guest.write_u64(tv + 8, 0);
+    let (result, _, _) = run(&|asm| {
+        asm.mov(4, tv as u64);
+    });
+    let error = result.expect_err("a wait past the cap");
+    assert!(error.to_string().contains("60 seconds"), "{error}");
+    assert_eq!(read_guest(&f, exceptfds, 8), bits[..8], "a refused select modified the set");
+
+    // And the arm that must still zero it: a wait inside the cap, carried out.
+    f.guest.write_u64(tv, 0);
+    f.guest.write_u64(tv + 8, 1_000);
+    let (result, returned, _) = run(&|asm| {
+        asm.mov(4, tv as u64);
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(returned, 0);
+    assert_eq!(
+        read_guest(&f, exceptfds, 8),
+        vec![0u8; 8],
+        "a select that really timed out must zero the sets"
+    );
+}
+
 /// **The four network refusals name themselves, their argument, and the missing piece.**
 ///
 /// Not just that they fail: each message has to carry the thing a reader three thousand

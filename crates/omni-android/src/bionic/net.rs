@@ -69,6 +69,11 @@
 //! branch for each. `poll` reports the same bad descriptor as `POLLNVAL` in that entry's
 //! `revents` rather than as `-1`, because that is what `poll` does and the two calls genuinely
 //! differ here.
+//!
+//! **And on any of those failures the guest's own objects are left alone.** POSIX says a failed
+//! `select` does not modify the sets, and `poll` answers its whole array or none of it. Both are
+//! the direction review finding M1 says to err in, and `select`'s ordering — validate the
+//! timeout, then rewrite the sets — was wrong in the first version of this module.
 
 use std::time::Duration;
 
@@ -382,15 +387,14 @@ fn select_outcome(
         }
         return Ok(Outcome::Value(ready));
     }
-    // Nothing is ready, so on return every set must be empty: POSIX requires the sets to be
-    // zeroed when `select` times out, and a guest that read a stale bit would act on a descriptor
-    // this call did not report.
-    for set in &mut sets {
-        set.clear();
-    }
-    for set in &sets {
-        set.write_back(view)?;
-    }
+    // **The timeout is read and validated BEFORE any set is modified**, and that ordering is the
+    // contract rather than tidiness: POSIX says that on failure "the objects pointed to by the
+    // readfds, writefds, and errorfds arguments are not modified". Zeroing them and then
+    // answering `-1`/`EINVAL` for a malformed `timeval` would leave a guest that retried the call
+    // with sets it had already lost — the shape of review findings M1 and M5, one call along.
+    //
+    // A first version of this function did exactly that, and it was found by re-reading the code
+    // with the question "what does a guest-chosen number do here" rather than by a failing test.
     let duration = if timeout == 0 {
         // A null `timeout` is "wait indefinitely".
         None
@@ -411,7 +415,18 @@ fn select_outcome(
         // the cap `bounded_wait` applies next.
         Some(Duration::from_secs(seconds as u64) + Duration::from_micros(micros as u64))
     };
-    Ok(Outcome::Sleep(bounded_wait(c, duration)?))
+    // Refused before anything is written, for the same reason.
+    let wait = bounded_wait(c, duration)?;
+    // Nothing is ready and the wait is going to happen, so on return every set must be empty:
+    // POSIX requires the sets to be zeroed when `select` times out, and a guest that read a stale
+    // bit would act on a descriptor this call did not report.
+    for set in &mut sets {
+        set.clear();
+    }
+    for set in &sets {
+        set.write_back(view)?;
+    }
+    Ok(Outcome::Sleep(wait))
 }
 
 /// One guest `fd_set`, read out of guest memory and written back to the same place.

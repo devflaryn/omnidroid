@@ -3192,6 +3192,27 @@ against each other, and the tolerance is what makes it a unit check: **50 ms**, 
 quantum over the drift between the two calls, against a `CLOCKS_PER_SEC` of a million. A first
 version allowed 5 seconds, which a **thousand-fold** unit error passes.
 
+### A defect in this phase's own code, found by re-reading it before reporting
+
+**`select` zeroed the guest's sets before it validated the timeout.** POSIX is explicit that "on
+failure, the objects pointed to by the readfds, writefds, and errorfds arguments are not
+modified", and three failures come *after* the sets have been read: a malformed `struct timeval`,
+a `timeout` pointer that is not readable, and a wait past the cap. In the first version all three
+answered `-1`/`EINVAL` or a refusal having already emptied the sets, so a guest that retried the
+call would have retried it with nothing.
+
+It is the same shape as review finding **M1** — a side effect kept behind a reported failure — one
+call along from where M1 found it, and it is worth recording that this phase's `poll` had been
+written the *right* way round (read whole, decide, write whole) while its `select` had not. The
+fix is an ordering: read and validate the timeout, take the wait decision, and only then clear and
+write back.
+
+**Found by reading the code again with the question "what does a guest-chosen number do here",
+not by a test failing** — the same method that produced phase 3c's three (D24), and the third time
+in this project it has been the thing that worked. `a_failed_select_does_not_modify_the_guests_sets`
+asserts all three failure paths against sentinel bits, plus the fourth arm that must still zero
+them; row `net-A9` restores the old ordering and is caught by it.
+
 ### Three test defects this phase found in its own tests, and the method that found them
 
 Recorded because the *method* is the reusable part: two were found by the whole-workspace run
@@ -3222,17 +3243,18 @@ buffers the guest supplied, and `gai_strerror`'s table is in the pool, which is 
 
 ### Verification
 
-* `cargo test --workspace --release`: **1,133 passed, 0 failed, 13 ignored**, from 1,093 and 13.
-  The 40 new tests are **2** in `omni-platform`'s lib (38 → 40), **9** in `omni-bionic`'s lib
-  (112 → 121), **5** in `omni-android`'s lib (103 → 108), **23** in `omni-android`'s `bionic`
-  target (114 → 137) and **1** in its `libroblox` target (6 → 7). `omni-android`, `omni-bionic`
+* `cargo test --workspace --release`: **1,134 passed, 0 failed, 13 ignored**, from 1,093 and 13.
+  The 41 new tests are **2** in `omni-platform`'s lib (38 → 40), **9** in `omni-bionic`'s lib
+  (112 → 121), **5** in `omni-android`'s lib (103 → 108), **24** in `omni-android`'s `bionic`
+  target (114 → 138) and **1** in its `libroblox` target (6 → 7). `omni-android`, `omni-bionic`
   and `omni-platform` were also run in **debug**, per the working agreement about overflow, and
   pass there — which is where `poll`'s guest-supplied `nfds` arithmetic and `select`'s
   guest-supplied `timeval` arithmetic are checked.
-* `tools/mutate.py`: **258 → 283 rows**, 25 new — 21 direction A and 4 direction B — and the new
-  rows are **25/25 caught** (net 18/18, gcov 2/2, clocks 2/2, guestmem 1/1, signals 1/1, plat
+* `tools/mutate.py`: **258 → 284 rows**, 26 new — 22 direction A and 4 direction B — and the new
+  rows are **26/26 caught** (net 19/19, gcov 2/2, clocks 2/2, guestmem 1/1, signals 1/1, plat
   1/1). `net-A8` was verified as a *detector* before its row was written, by injecting the
-  per-entry implementation and watching the sentinel change.
+  per-entry implementation and watching the sentinel change; `net-A9` is the row for the `select`
+  ordering defect above and restores it exactly.
 * Clippy clean on `--all-targets --release`, `cargo doc --workspace --no-deps` clean,
   `cargo build --workspace --release --no-default-features` builds.
 * `cargo tree -p omni-bionic -e normal` is still one line (D19) — this phase put `inet_ntop` and
@@ -3244,7 +3266,10 @@ buffers the guest supplied, and `gai_strerror`'s table is in the pool, which is 
 
 ### Cost if wrong
 
-The expensive thing to get wrong is the `__gcov_*` decision, and it is expensive in a direction
+The `select` ordering defect is the cheapest thing here to have got wrong and the one most worth
+noting, because it was **not** caught by anything: the suite was green, every mutation row was
+caught, and the defect sat behind a failure path that reports `-1` either way. Only re-reading
+found it. The expensive thing to get wrong is the `__gcov_*` decision, and it is expensive in a direction
 that would have been very hard to find: a no-op stub there is followed four bytes later by the
 guest's own `BL abort`, so the symptom is a *termination* during initialisation with no
 relationship to the symbol that caused it. It is settled by decoding the guest's own instructions
