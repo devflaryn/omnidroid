@@ -38,7 +38,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use omni_cpu::{
@@ -118,7 +118,7 @@ impl core::fmt::Debug for Binding {
 }
 
 /// One symbol's slot.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Slot {
     /// The symbol name, exactly as `.dynstr` spells it.
     pub symbol: String,
@@ -126,6 +126,35 @@ pub struct Slot {
     pub address: GuestAddr,
     /// Who services it.
     pub binding: Binding,
+    /// The library the **guest's own `DT_VERNEED`** attributes this import to, when it records
+    /// one.
+    ///
+    /// Not a list this layer keeps: it arrives in [`SymbolRequest::library`] while the loader
+    /// relocates, so it is the importing binary's own statement about where the symbol comes from.
+    /// `libroblox.so` attributes 345 of its 565 imports to `libc.so`, 56 to `libm.so` and 6 to
+    /// `libdl.so`, and leaves 158 unversioned — see `omni_elf::version` for why unversioned is
+    /// honest rather than missing.
+    ///
+    /// It is what makes `dlopen`/`dlsym` answerable: a guest that asks `libc.so` for `getauxval`
+    /// is asking for a symbol its own file says lives there.
+    ///
+    /// [`SymbolRequest::library`]: omni_elf::loader::SymbolRequest::library
+    pub library: Option<String>,
+    /// How many times the guest has branched here **while the census was on**. See
+    /// [`Boundary::start_census`].
+    calls: AtomicU64,
+}
+
+impl Slot {
+    /// How many times the guest has called this symbol since the census was started.
+    ///
+    /// Zero when the census has never been on, which is not the same statement as "never called" —
+    /// [`Boundary::census`] is what tells the two apart, because it refuses to report at all
+    /// unless the census was running.
+    #[must_use]
+    pub fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
 }
 
 // The per-thread error channel between an inline handler and `Boundary::run`.
@@ -226,7 +255,13 @@ impl BoundaryBuilder {
         inner.by_name.insert(symbol.to_string(), address);
         inner.slots.insert(
             address,
-            Slot { symbol: symbol.to_string(), address, binding: Binding::Unbound },
+            Slot {
+                symbol: symbol.to_string(),
+                address,
+                binding: Binding::Unbound,
+                library: None,
+                calls: AtomicU64::new(0),
+            },
         );
         Ok(address)
     }
@@ -250,7 +285,16 @@ impl BoundaryBuilder {
         inner.by_name.insert(symbol.to_string(), address);
         inner
             .slots
-            .insert(address, Slot { symbol: symbol.to_string(), address, binding: Binding::Data });
+            .insert(
+                address,
+                Slot {
+                    symbol: symbol.to_string(),
+                    address,
+                    binding: Binding::Data,
+                    library: None,
+                    calls: AtomicU64::new(0),
+                },
+            );
         Ok(address)
     }
 
@@ -346,6 +390,17 @@ impl BoundaryBuilder {
         self
     }
 
+    /// Record which library the importing binary attributes a slot to.
+    ///
+    /// Idempotent and last-writer-wins, which cannot differ: `.gnu.version_r` gives one symbol one
+    /// version record, and the loader asks about a symbol once.
+    fn attribute(&self, address: GuestAddr, library: Option<&str>) {
+        let Some(library) = library else { return };
+        if let Some(slot) = self.inner.lock().slots.get_mut(&address) {
+            slot.library = Some(library.to_string());
+        }
+    }
+
     /// The address a symbol was given, if it has one.
     #[must_use]
     pub fn address_of(&self, symbol: &str) -> Option<GuestAddr> {
@@ -365,6 +420,7 @@ impl BoundaryBuilder {
             exit_crossings: inner.exit_crossings,
             crossings: Mutex::new(Crossings::default()),
             code_watch: CodeWatch::default(),
+            census: AtomicBool::new(false),
         })
     }
 }
@@ -411,11 +467,12 @@ impl SymbolProvider for BoundaryBuilder {
                 // is reported as "nothing supplied this symbol" rather than swallowed, and the
                 // loader's unresolved list then names every symbol that missed out.
                 let address = self.declare_function(request.name).ok()?;
+                self.attribute(address, request.library);
                 Some(SymbolValue { address: address as u64, kind: SymbolKind::Function })
             }
-            SymbolKind::Object => self.address_of(request.name).map(|address| SymbolValue {
-                address: address as u64,
-                kind: SymbolKind::Object,
+            SymbolKind::Object => self.address_of(request.name).map(|address| {
+                self.attribute(address, request.library);
+                SymbolValue { address: address as u64, kind: SymbolKind::Object }
             }),
         }
     }
@@ -620,6 +677,8 @@ pub struct Boundary {
     crossings: Mutex<Crossings>,
     /// The live contexts, and what each of them still has to invalidate. See [`CodeWatch`].
     code_watch: CodeWatch,
+    /// Whether every crossing counts itself. See [`Boundary::start_census`].
+    census: AtomicBool,
 }
 
 impl Boundary {
@@ -652,6 +711,39 @@ impl Boundary {
         self.by_name.get(symbol).and_then(|address| self.slots.get(address))
     }
 
+    /// Every library the importing binary attributes at least one of its imports to.
+    ///
+    /// What `dlopen` will and will not issue a handle for. Derived from the guest's own
+    /// `DT_VERNEED` while the loader relocated — see [`Slot::library`].
+    #[must_use]
+    pub fn libraries(&self) -> BTreeSet<&str> {
+        self.slots.values().filter_map(|slot| slot.library.as_deref()).collect()
+    }
+
+    /// The slot `dlsym(handle, symbol)` should answer with.
+    ///
+    /// `library` is the scope: `None` is the global one, which searches everything this layer
+    /// supplies, and `Some(name)` searches only the imports the guest's own file attributes to
+    /// that library. A symbol nothing here supplies answers `None`, which is `dlsym`'s ordinary
+    /// "not found" and which the caller is required to test for.
+    ///
+    /// **A [`Binding::Unbound`] slot is deliberately *not* a hit.** Its address exists so that a
+    /// direct call names the symbol; handing it back through `dlsym` would turn a lookup the guest
+    /// is prepared to see fail into a pointer it will call later, and the failure would arrive
+    /// somewhere unrelated. A data object is a hit: its address is a real object.
+    #[must_use]
+    pub fn lookup(&self, library: Option<&str>, symbol: &str) -> Option<&Slot> {
+        let slot = self.slot_named(symbol)?;
+        if matches!(slot.binding, Binding::Unbound) {
+            return None;
+        }
+        match library {
+            None => Some(slot),
+            Some(name) if slot.library.as_deref() == Some(name) => Some(slot),
+            Some(_) => None,
+        }
+    }
+
     /// How many times each path has been taken.
     #[must_use]
     pub fn crossings(&self) -> Crossings {
@@ -663,6 +755,65 @@ impl Boundary {
     #[must_use]
     pub fn code_invalidations(&self) -> CodeInvalidations {
         self.code_watch.counts()
+    }
+
+    /// Count every crossing **per symbol**, from now until [`stop_census`](Boundary::stop_census).
+    ///
+    /// # Why this is switched on rather than always on
+    ///
+    /// The question it answers is the most valuable output M3 has: *which* imports the guest
+    /// actually calls, against the 188 a static closure predicted. D17 is explicit that 188 is a
+    /// **lower bound** — 17,698 indirect call sites could not be followed — so the only way to
+    /// know what the engine really reaches is to watch it reach.
+    ///
+    /// But the counter sits on the hot path. D17 measured an inline crossing at **≈33 ns**, and an
+    /// unconditional `lock xadd` there is a real fraction of that on every one of the imported
+    /// calls all 3,594 initializers make. So the fast path pays a relaxed load of one `bool` and a
+    /// branch that predicts perfectly, and the increment happens only for a host that asked for
+    /// it. A timing run and a census run are then two different runs, which is the honest
+    /// arrangement: a figure measured with the census on is a figure about the census.
+    ///
+    /// Counts are **not** reset — a host that wants a delta takes a [`census`](Boundary::census)
+    /// before and after — so starting it twice resumes rather than restarts.
+    pub fn start_census(&self) {
+        self.census.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop counting. Whatever was counted stays readable.
+    pub fn stop_census(&self) {
+        self.census.store(false, Ordering::Relaxed);
+    }
+
+    /// Every symbol the guest has called since the census was started, with its count.
+    ///
+    /// `None` when the census has never been started, because "no symbol was called" and "nobody
+    /// was counting" are different statements and a caller that could not tell them apart would
+    /// report an empty census as a finding.
+    #[must_use]
+    pub fn census(&self) -> Option<BTreeMap<&str, u64>> {
+        if !self.census.load(Ordering::Relaxed) {
+            // Started at least once leaves a count behind; never started leaves every slot at
+            // zero. Distinguished by the flag being *currently* off with nothing counted, which
+            // is why `stop_census` does not clear the counts.
+            if self.slots.values().all(|slot| slot.calls() == 0) {
+                return None;
+            }
+        }
+        Some(
+            self.slots
+                .values()
+                .filter(|slot| slot.calls() > 0)
+                .map(|slot| (slot.symbol.as_str(), slot.calls()))
+                .collect(),
+        )
+    }
+
+    /// Charge one crossing to a slot, if a host asked for the census.
+    #[inline]
+    fn count(&self, slot: &Slot) {
+        if self.census.load(Ordering::Relaxed) {
+            slot.calls.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The token an inline thunk is registered with: this boundary's own address.
@@ -734,6 +885,89 @@ impl Boundary {
             Some(self.watch_context())
         };
         self.run_at_depth(cpu, from, limit, 0)
+    }
+
+    /// Call a guest function **from the host**, AAPCS64, and come back with its return value.
+    ///
+    /// # Why this exists, and why it is not [`run`](Boundary::run)
+    ///
+    /// [`run`](Boundary::run) enters guest code at an address and reports why it stopped. That is
+    /// enough to *start* a guest function and not enough to *call* one: the caller still has to
+    /// arm the return sentinel in `X30`, place AAPCS64 arguments, tell a return through the
+    /// sentinel apart from a return somewhere else, and put the context back afterwards. Every
+    /// caller that wants a call rather than a run would write those four things again, and
+    /// [`ReentrantCall::call_guest`] already had them — but only from *inside* a thunk crossing.
+    ///
+    /// Two callers want the host-initiated direction and neither is inside one:
+    ///
+    /// * **The M3 gate**, which runs 3,594 `init_array` entries in order with nothing having
+    ///   crossed the boundary yet.
+    /// * **`pthread_key` destructors at thread exit** (D24), which run after the guest thread's
+    ///   entry point has returned, so there is no crossing left to be inside of. That is still
+    ///   not wired up; this is the API it was missing.
+    ///
+    /// `caller` names whoever is asking, and it is what the errors carry — `init_array[1729]`
+    /// tells a reader which of 3,594 stopped, where a bare guest address does not.
+    ///
+    /// # It does not weaken the re-entrancy property, and that is checkable rather than asserted
+    ///
+    /// D18 makes "a handler cannot re-enter its own thread's guest" a **type** property, and task
+    /// 2's review verified it by trying to obtain two live mutable CPU references. This method
+    /// takes a `&mut dyn GuestCpu` **the caller already owns**, exactly as
+    /// [`run`](Boundary::run) does, so it can only be reached by something holding one:
+    ///
+    /// * [`ImportCall`] has no CPU and no boundary at all, so nothing on the inline path can
+    ///   reach this.
+    /// * [`ReentrantCall`] holds the only `&mut dyn GuestCpu` for the calling thread, and the
+    ///   borrow checker will not produce a second — which is the same argument
+    ///   [`ReentrantCall::boundary`] rests on, and the reason `pthread_create` could be given the
+    ///   whole boundary without widening anything.
+    ///
+    /// The body it shares with [`ReentrantCall::call_guest`] is a private function, so this adds
+    /// no way to enter guest code that did not already exist; it adds a *caller* that is the host.
+    ///
+    /// # What is saved and restored
+    ///
+    /// As [`ReentrantCall::call_guest`]: all of `X0`-`X30`, `SP`, `PC`, the condition flags,
+    /// `V0`-`V31`, and whatever sentinel was armed. A caller making a sequence of these — the
+    /// gate makes 3,594 — therefore gets each one starting from the register state it set up,
+    /// rather than from the leftovers of the previous initializer.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::BadCallbackStack`] if `SP` is not usable or more than eight arguments of one
+    /// bank were passed; [`AbiError::GuestCallbackStopped`] if the guest did not return through
+    /// the sentinel — a fault, an unsupported instruction, a budget running out; and anything the
+    /// guest's own imported calls raise, which propagates with the *import's* symbol named rather
+    /// than with `caller`.
+    pub fn call_guest(
+        self: &Arc<Self>,
+        cpu: &mut dyn GuestCpu,
+        caller: &str,
+        target: GuestAddr,
+        args: &[GuestArg],
+        limit: RunLimit,
+    ) -> AbiResult<GuestReturn> {
+        // As `run`: anything left in the channel is from an earlier run on this thread that did
+        // not consume it, and reporting it here would blame this call for another one's failure.
+        let _ = take_pending();
+        let _context = if CONTEXT.with(|cell| cell.borrow().is_some()) {
+            None
+        } else {
+            Some(self.watch_context())
+        };
+        {
+            let mut crossings = self.crossings.lock();
+            crossings.guest_calls += 1;
+        }
+        let saved = SavedState::capture(cpu);
+        // Depth zero, the same depth `run` enters at: this call is not nested inside a thunk
+        // crossing, so a handler it reaches gets depth 1 exactly as one reached from `run` does.
+        // Giving the host entry a depth of its own would spend one of `MAX_GUEST_DEPTH`'s levels
+        // on the outermost frame and make the two entry points disagree about how deep a guest is.
+        let result = enter_guest(self, cpu, caller, target, args, limit, 0);
+        saved.restore(cpu);
+        result
     }
 
     /// Keep this thread's CPU context in the registry until the returned guard is dropped.
@@ -911,6 +1145,10 @@ impl Boundary {
         let slot = self.slot_at(site)?;
         let resume = cpu.x(XReg::new(30).expect("X30 exists")) as GuestAddr;
         self.crossings.lock().exits += 1;
+        // Charged before the binding is looked at, so that an `Unbound` symbol the guest really
+        // reached appears in the census. That one is the whole point: an import nobody predicted,
+        // named by the guest having branched to it.
+        self.count(slot);
         match slot.binding {
             Binding::Unbound => Err(AbiError::Unbound {
                 symbol: slot.symbol.clone(),
@@ -1010,6 +1248,7 @@ impl Boundary {
             call.defer_to_caller();
             return;
         };
+        self.count(slot);
         let Binding::Inline(handler) = slot.binding else {
             call.defer_to_caller();
             return;
@@ -1287,7 +1526,8 @@ impl ReentrantCall<'_> {
         }
 
         let saved = SavedState::capture(self.cpu);
-        let result = self.call_guest_inner(target, args, limit, depth);
+        let result =
+            enter_guest(self.boundary, self.cpu, self.symbol, target, args, limit, depth);
         // Restored on every path, including the error ones: a handler that reports a failed callback
         // still leaves the outer guest frame runnable, and a caller that decides to carry on must not
         // be carrying on with the callback's registers.
@@ -1295,129 +1535,152 @@ impl ReentrantCall<'_> {
         result
     }
 
-    fn call_guest_inner(
-        &mut self,
-        target: GuestAddr,
-        args: &[GuestArg],
-        limit: RunLimit,
-        depth: usize,
-    ) -> AbiResult<GuestReturn> {
-        let sp = self.cpu.sp();
-        if sp % 16 != 0 {
-            return Err(AbiError::BadCallbackStack {
-                symbol: self.symbol.to_string(),
-                target,
-                sp,
-                why: "AArch64 requires SP to be 16-byte aligned at a public interface, and every \
-                      SP-relative access in the callee's prologue assumes it",
-            });
-        }
-        // The callee's prologue will push below `SP`, so the stack has to be there. Checked rather
-        // than assumed: a guest whose stack has overflowed would otherwise have its callback fault at
-        // an address nothing here chose, and the failure would be reported as the callback's.
-        self.boundary
-            .mem
-            .checked_ptr(sp.saturating_sub(16), 16, true, self.blame(0))
-            .map_err(|_| AbiError::BadCallbackStack {
-                symbol: self.symbol.to_string(),
-                target,
-                sp,
-                why: "the 16 bytes below SP are not writable guest memory, so the callee's own \
-                      prologue would fault",
-            })?;
+}
 
-        self.place_arguments(target, args)?;
-        let sentinel = self.boundary.sentinel;
-        let previous = self.cpu.return_sentinel();
-        self.cpu.set_return_sentinel(sentinel)?;
-        self.cpu.set_x(XReg::new(30).expect("X30 exists"), sentinel as u64);
+// ------------------------------------------------- one crossing into guest code, from either side
 
-        let outcome = self.boundary.run_at_depth(self.cpu, target, limit, depth);
-
-        // Put the outer sentinel back before anything else can go wrong, so an error path cannot
-        // leave the context armed on the callback's sentinel.
-        if let Some(previous) = previous {
-            self.cpu.set_return_sentinel(previous)?;
-        }
-        match outcome? {
-            ExitReason::Returned { pc } if pc == sentinel => Ok(GuestReturn {
-                x0: self.cpu.x(XReg::new(0).expect("X0 exists")),
-                x1: self.cpu.x(XReg::new(1).expect("X1 exists")),
-                v0: self.cpu.v(VReg::new(0).expect("V0 exists")),
-            }),
-            exit => Err(AbiError::GuestCallbackStopped {
-                symbol: self.symbol.to_string(),
-                target,
-                exit,
-            }),
-        }
+/// The body of a host-to-guest call, shared by [`ReentrantCall::call_guest`] and
+/// [`Boundary::call_guest`].
+///
+/// **One copy, because the two entry points differ only in who is asking.** A second
+/// implementation for the host-initiated path is how the two would come to disagree about the
+/// sentinel, the stack check or which register a `double` goes in — and the whole reason the exit
+/// path and the inline path share [`Ret`] is that a boundary with two marshallers has two answers.
+///
+/// `caller` and `caller_address` are what the errors name: a thunk's symbol and slot for the
+/// re-entrant path, and whatever the host called itself for the other one.
+fn enter_guest(
+    boundary: &Arc<Boundary>,
+    cpu: &mut dyn GuestCpu,
+    caller: &str,
+    target: GuestAddr,
+    args: &[GuestArg],
+    limit: RunLimit,
+    depth: usize,
+) -> AbiResult<GuestReturn> {
+    let sp = cpu.sp();
+    if sp % 16 != 0 {
+        return Err(AbiError::BadCallbackStack {
+            symbol: caller.to_string(),
+            target,
+            sp,
+            why: "AArch64 requires SP to be 16-byte aligned at a public interface, and every \
+                  SP-relative access in the callee's prologue assumes it",
+        });
     }
+    // The callee's prologue will push below `SP`, so the stack has to be there. Checked rather
+    // than assumed: a guest whose stack has overflowed would otherwise have its callback fault at
+    // an address nothing here chose, and the failure would be reported as the callback's.
+    boundary
+        .mem
+        .checked_ptr(sp.saturating_sub(16), 16, true, Blame::new(caller, target, 0))
+        .map_err(|_| AbiError::BadCallbackStack {
+            symbol: caller.to_string(),
+            target,
+            sp,
+            why: "the 16 bytes below SP are not writable guest memory, so the callee's own \
+                  prologue would fault",
+        })?;
 
-    /// AAPCS64 in the outgoing direction: integers in `X0`-`X7`, floating point in `V0`-`V7`.
-    ///
-    /// **Nothing goes on the stack.** Every callback shape in the reachable set takes at most three
-    /// arguments — a comparator takes two pointers, a `dl_iterate_phdr` callback takes three, a
-    /// thread entry point takes one — so the stack path would be code with no caller, and pushing
-    /// arguments below a guest `SP` the boundary does not own raises a question about the guest's red
-    /// zone that AArch64 does not have but that would need answering anyway. A call that needs more
-    /// is refused by name.
-    fn place_arguments(&mut self, target: GuestAddr, args: &[GuestArg]) -> AbiResult<()> {
-        let mut ngrn = 0u32;
-        let mut nsrn = 0u32;
-        for arg in args {
-            match *arg {
-                GuestArg::Int(value) => {
-                    if ngrn >= ARG_REGISTERS {
-                        return self.too_many(target, Bank::Integer);
-                    }
-                    self.cpu.set_x(XReg::new(ngrn as u8).expect("X0-X7 exist"), value);
-                    ngrn += 1;
+    place_arguments(cpu, caller, target, args)?;
+    let sentinel = boundary.sentinel;
+    let previous = cpu.return_sentinel();
+    cpu.set_return_sentinel(sentinel)?;
+    cpu.set_x(XReg::new(30).expect("X30 exists"), sentinel as u64);
+
+    let outcome = boundary.run_at_depth(cpu, target, limit, depth);
+
+    // Put the outer sentinel back before anything else can go wrong, so an error path cannot
+    // leave the context armed on the callback's sentinel.
+    if let Some(previous) = previous {
+        cpu.set_return_sentinel(previous)?;
+    }
+    match outcome? {
+        ExitReason::Returned { pc } if pc == sentinel => Ok(GuestReturn {
+            x0: cpu.x(XReg::new(0).expect("X0 exists")),
+            x1: cpu.x(XReg::new(1).expect("X1 exists")),
+            v0: cpu.v(VReg::new(0).expect("V0 exists")),
+        }),
+        exit => Err(AbiError::GuestCallbackStopped {
+            symbol: caller.to_string(),
+            target,
+            exit,
+        }),
+    }
+}
+
+/// AAPCS64 in the outgoing direction: integers in `X0`-`X7`, floating point in `V0`-`V7`.
+///
+/// **Nothing goes on the stack.** Every callback shape in the reachable set takes at most three
+/// arguments — a comparator takes two pointers, a `dl_iterate_phdr` callback takes three, a
+/// thread entry point takes one, an `init_array` entry takes `(argc, argv, envp)` — so the stack
+/// path would be code with no caller, and pushing arguments below a guest `SP` the boundary does
+/// not own raises a question about the guest's red zone that AArch64 does not have but that would
+/// need answering anyway. A call that needs more is refused by name.
+fn place_arguments(
+    cpu: &mut dyn GuestCpu,
+    caller: &str,
+    target: GuestAddr,
+    args: &[GuestArg],
+) -> AbiResult<()> {
+    let mut ngrn = 0u32;
+    let mut nsrn = 0u32;
+    for arg in args {
+        match *arg {
+            GuestArg::Int(value) => {
+                if ngrn >= ARG_REGISTERS {
+                    return too_many(cpu, caller, target, Bank::Integer);
                 }
-                GuestArg::Pointer(value) => {
-                    if ngrn >= ARG_REGISTERS {
-                        return self.too_many(target, Bank::Integer);
-                    }
-                    self.cpu.set_x(XReg::new(ngrn as u8).expect("X0-X7 exist"), value as u64);
-                    ngrn += 1;
+                cpu.set_x(XReg::new(ngrn as u8).expect("X0-X7 exist"), value);
+                ngrn += 1;
+            }
+            GuestArg::Pointer(value) => {
+                if ngrn >= ARG_REGISTERS {
+                    return too_many(cpu, caller, target, Bank::Integer);
                 }
-                GuestArg::Double(value) => {
-                    if nsrn >= ARG_REGISTERS {
-                        return self.too_many(target, Bank::FloatingPoint);
-                    }
-                    self.cpu
-                        .set_v(VReg::new(nsrn as u8).expect("V0-V7 exist"), u128::from(value.to_bits()));
-                    nsrn += 1;
+                cpu.set_x(XReg::new(ngrn as u8).expect("X0-X7 exist"), value as u64);
+                ngrn += 1;
+            }
+            GuestArg::Double(value) => {
+                if nsrn >= ARG_REGISTERS {
+                    return too_many(cpu, caller, target, Bank::FloatingPoint);
                 }
-                GuestArg::Float(value) => {
-                    if nsrn >= ARG_REGISTERS {
-                        return self.too_many(target, Bank::FloatingPoint);
-                    }
-                    self.cpu
-                        .set_v(VReg::new(nsrn as u8).expect("V0-V7 exist"), u128::from(value.to_bits()));
-                    nsrn += 1;
+                cpu.set_v(VReg::new(nsrn as u8).expect("V0-V7 exist"), u128::from(value.to_bits()));
+                nsrn += 1;
+            }
+            GuestArg::Float(value) => {
+                if nsrn >= ARG_REGISTERS {
+                    return too_many(cpu, caller, target, Bank::FloatingPoint);
                 }
+                cpu.set_v(VReg::new(nsrn as u8).expect("V0-V7 exist"), u128::from(value.to_bits()));
+                nsrn += 1;
             }
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    fn too_many(&self, target: GuestAddr, bank: Bank) -> AbiResult<()> {
-        Err(AbiError::BadCallbackStack {
-            symbol: self.symbol.to_string(),
-            target,
-            sp: self.cpu.sp(),
-            why: match bank {
-                Bank::Integer => {
-                    "more than eight integer arguments would have to go on the guest's stack, which \
-                     the host-to-guest direction does not write to"
-                }
-                Bank::FloatingPoint => {
-                    "more than eight floating-point arguments would have to go on the guest's \
-                     stack, which the host-to-guest direction does not write to"
-                }
-            },
-        })
-    }
+fn too_many(
+    cpu: &dyn GuestCpu,
+    caller: &str,
+    target: GuestAddr,
+    bank: Bank,
+) -> AbiResult<()> {
+    Err(AbiError::BadCallbackStack {
+        symbol: caller.to_string(),
+        target,
+        sp: cpu.sp(),
+        why: match bank {
+            Bank::Integer => {
+                "more than eight integer arguments would have to go on the guest's stack, which \
+                 the host-to-guest direction does not write to"
+            }
+            Bank::FloatingPoint => {
+                "more than eight floating-point arguments would have to go on the guest's \
+                 stack, which the host-to-guest direction does not write to"
+            }
+        },
+    })
 }
 
 /// Which of AAPCS64's two argument register banks ran out.
