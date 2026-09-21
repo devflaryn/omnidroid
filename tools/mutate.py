@@ -67,6 +67,7 @@ BIONIC_SEM = "crates/omni-bionic/src/sem.rs"
 BIONIC_MUTEX = "crates/omni-bionic/src/mutex.rs"
 BIONIC_NUMERICS = "crates/omni-bionic/src/numerics.rs"
 BIONIC_RWLOCK = "crates/omni-bionic/src/rwlock.rs"
+BIONIC_COND = "crates/omni-bionic/src/cond.rs"
 BIONIC_PRINTF = "crates/omni-bionic/src/printf.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
@@ -2071,6 +2072,20 @@ MUTATIONS = [
      """pub const LOG_CAPTURE_MAX: usize = 256;""",
      """pub const LOG_CAPTURE_MAX: usize = 4;""",
      ANDROID),
+
+    # ---- the cond test's hang guard must stay a hang guard ---------------------------------------
+    # `signal_wakes_exactly_one` counts how many waiters finished after one signal. Each waiter's
+    # timeout is a HANG GUARD; when it was 400 ms it could fire inside the observation window --
+    # registration polls four threads at 10 ms a turn -- and a second thread finished on its own
+    # timeout rather than on the signal. Seen three times, once laundering itself into a `wcslen`
+    # mutation's catch list. The row restores the racing value; the in-test relation catches it
+    # deterministically, with no timing dependence of its own.
+    ("bionic-B3", "B",
+     "the cond hang guard shrunk back to a value that can fire while the count is taken",
+     BIONIC_COND,
+     """    const WAITER_HANG_GUARD: Duration = Duration::from_secs(5);""",
+     """    const WAITER_HANG_GUARD: Duration = Duration::from_millis(400);""",
+     BIONIC),
 ]
 
 

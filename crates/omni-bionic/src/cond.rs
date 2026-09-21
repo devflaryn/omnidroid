@@ -669,7 +669,16 @@ mod tests {
                 with_owners(owners.clone(), || with_registry(&*threads, || {
                     assert_eq!(crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
                     wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
-                    wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, Some(Duration::from_millis(400))).unwrap();
+                    // A HANG GUARD, deliberately far longer than the observation window below.
+                    // It was 400 ms, which raced the test: a waiter's clock starts here, but the
+                    // main thread only begins observing after polling all four registrations at
+                    // 10 ms a turn and then sleeping 300 ms. Once registration took ~100 ms -- and
+                    // it does under the seven binaries the mutation harness runs at once -- a
+                    // waiter's own timeout expired INSIDE the observation window, a second thread
+                    // finished, and `finished == 1` failed. Seen three times: twice directly, and
+                    // once inflating a `wcslen` mutation's catch list, which is how a flake
+                    // launders itself into evidence.
+                    wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, Some(WAITER_HANG_GUARD)).unwrap();
                     crate::mutex::unlock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap()
                 }));
             }));
@@ -680,15 +689,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(signal(&waiters, 0x1000).unwrap(), 0);
-        std::thread::sleep(Duration::from_millis(300));
+
+        // Wait for the signalled thread rather than sleeping a guessed interval, and bound the
+        // wait far below WAITER_HANG_GUARD so no timeout can contaminate the count.
+        let observe_until = std::time::Instant::now() + OBSERVATION_WINDOW;
+        while ws.iter().filter(|w| w.is_finished()).count() < 1
+            && std::time::Instant::now() < observe_until
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let finished = ws.iter().filter(|w| w.is_finished()).count();
         assert_eq!(finished, 1, "exactly one waiter may be woken by one signal");
-        // Release the rest so the test ends cleanly (their timeouts expire).
-        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            OBSERVATION_WINDOW.saturating_mul(2) < WAITER_HANG_GUARD,
+            "the hang guard must not be able to fire while the count is being taken",
+        );
+
+        // Release the rest explicitly instead of waiting out their timeouts.
+        assert_eq!(broadcast(&waiters, 0x1000).unwrap(), 0);
         for w in ws {
             w.join().unwrap();
         }
     }
+
+    /// A waiter's timeout in [`signal_wakes_exactly_one`] is a hang guard, nothing more.
+    const WAITER_HANG_GUARD: Duration = Duration::from_secs(5);
+    /// How long the test will wait for the signalled thread to finish.
+    const OBSERVATION_WINDOW: Duration = Duration::from_millis(500);
 
     /// Guard regions: writes stay inside the 48-byte struct.
     #[test]
