@@ -48,7 +48,7 @@ use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
 use omni_mem::{CommitPolicy, GuestAddr, MemError, Placement, Protection};
 
-use crate::boundary::ReentrantCall;
+use crate::boundary::{ImportCall, ReentrantCall};
 use crate::error::{AbiError, AbiResult};
 
 use super::view::GuestView;
@@ -523,6 +523,56 @@ pub(super) fn mlock(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
          failed mlock is ordinary on a real device, so the guest would record a refusal by policy \
          for a request nobody made"
     ))
+}
+
+// ================================================================== the allocator that is not here
+
+/// Bytes of a guest `struct mallinfo`: ten `size_t` fields on LP64.
+///
+/// **Stated so the refusal can name it**, not so anything can write one. Bionic's `mallinfo` is
+/// `size_t arena, ordblks, smblks, hblks, hblkhd, usmblks, fsmblks, uordblks, fordblks,
+/// keepcost` — ten machine words, which is 80 bytes on LP64 and is why this is the only reachable
+/// import that returns through `X8` (task 2's review found the brief's "returns in X0/X1/V0"
+/// omitted the indirect result register; [`Args::indirect_result`](crate::Args::indirect_result)
+/// is what would read it).
+pub const MALLINFO_BYTES: usize = 80;
+
+/// `struct mallinfo mallinfo(void)`
+///
+/// Refused, and the reason is not that the marshalling is hard. `X8` is marshalled — it is the
+/// one thing about this symbol task 2 built for — and eighty bytes of zeroes could be written
+/// into it in three lines. **The reason is that there is no heap for the answer to describe.**
+///
+/// `libroblox.so` **imports no allocator at all** (D17, and the correction to this plan's own
+/// earlier text): no `malloc`, no `free`, no `calloc`, no `realloc`. It carries its own allocator
+/// and reaches the host through guest `mmap`, which is the seam this module is. So a `mallinfo`
+/// here would be describing libc's heap — and libc's heap in this process has no relationship to
+/// the guest's memory at all. Every field would be a fact about something the guest does not use.
+///
+/// **Eighty bytes of zeroes is the believable wrong answer**, and it is believable precisely
+/// because it is *arithmetically true* of a libc heap nothing has allocated from: zero arena,
+/// zero free blocks, zero in use. A guest that logs its memory usage during initialisation would
+/// print a consistent, self-consistent, entirely fictional zero and carry on — and the same
+/// number is what a leak detector would read at both ends of the run.
+///
+/// The other available lie is worse: reporting this *process's* commit charge as the arena would
+/// be a real number, from the right process, describing the wrong allocator.
+pub(super) fn mallinfo(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let out = c.args().indirect_result();
+    Err(AbiError::Refused {
+        symbol: c.symbol().to_string(),
+        address: c.address(),
+        why: format!(
+            "the guest called mallinfo(), which returns {MALLINFO_BYTES} bytes indirectly \
+             through X8 (here, {out:#x}). There is no libc heap for it to describe: \
+             `libroblox.so` imports no allocator at all -- no malloc, no free, no calloc, no \
+             realloc -- and carries its own, reaching the host through guest `mmap` (D17). \
+             Writing ten zeroed size_t fields was rejected, and it is the most believable wrong \
+             answer this phase had: it is arithmetically TRUE of a libc heap nothing has \
+             allocated from, so a guest that logs its memory usage would print a consistent, \
+             self-consistent, fictional zero at both ends of the run"
+        ),
+    })
 }
 
 #[cfg(test)]

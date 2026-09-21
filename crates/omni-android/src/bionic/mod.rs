@@ -45,6 +45,7 @@ mod format;
 mod guestmem;
 mod handlers;
 mod logging;
+mod net;
 mod procenv;
 mod runtime;
 mod signals;
@@ -81,6 +82,7 @@ pub use files::{
     errno_for, DIRENT_BYTES, STATVFS_BYTES, STAT_BYTES, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
 pub use logging::LogRecord;
+pub use net::{FD_SETSIZE, MAX_POLL_FDS};
 pub use omni_platform::log::Priority as LogPriority;
 pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
@@ -223,6 +225,14 @@ pub struct Bionic {
     // ---------------------------------------------------------------- phase 3a: the OS surface
     /// `"UTC"` in the pool, for `gmtime_r`'s `tm_zone`. Interned once in [`Bionic::new`].
     utc_zone: OnceLock<GuestAddr>,
+    /// `gai_strerror`'s messages, interned in the pool in [`Bionic::new`].
+    ///
+    /// **In the pool rather than the per-thread scratch**, because C says the string
+    /// `gai_strerror` returns stays valid indefinitely, and the scratch is overwritten by the
+    /// next `strerror` on that thread. The table is `omni_bionic::net::GAI_MESSAGES` rows plus
+    /// one for every code outside it, and all of it is written before any guest code runs, which
+    /// is F9's constraint.
+    gai_messages: OnceLock<Vec<GuestAddr>>,
     /// The guest's environment: the name, and the value interned in the pool.
     ///
     /// **Empty by default and that is a fact, not a gap** — this guest process was started with no
@@ -389,6 +399,7 @@ impl Bionic {
             pool: Mutex::new(0),
             images: Mutex::new(Vec::new()),
             utc_zone: OnceLock::new(),
+            gai_messages: OnceLock::new(),
             env: Mutex::new(Vec::new()),
             properties: Mutex::new(Vec::new()),
             // Spelled out rather than reached by `Default`, because this is the open `AT_HWCAP`
@@ -415,6 +426,17 @@ impl Bionic {
         // by the time a handler could reach it.
         let utc = bionic.intern("gmtime_r", b"UTC")?;
         let _ = bionic.utc_zone.set(utc);
+        // `gai_strerror` returns a pointer C says stays valid for ever, so the whole table is
+        // interned here -- before any guest code runs, which is F9's constraint, and in the pool
+        // rather than the per-thread scratch, which the next `strerror` would overwrite. The
+        // last row is the "Unknown error" every code outside the table shares, so a guest that
+        // calls `gai_strerror` in a loop with a wild number allocates nothing.
+        let mut messages = Vec::with_capacity(omni_bionic::net::GAI_MESSAGES + 1);
+        for code in 0..=omni_bionic::net::GAI_MESSAGES as i32 {
+            let message = omni_bionic::net::gai_strerror_message(code);
+            messages.push(bionic.intern("gai_strerror", message.as_bytes())?);
+        }
+        let _ = bionic.gai_messages.set(messages);
         Ok(bionic)
     }
 
@@ -427,6 +449,26 @@ impl Bionic {
         // Unreachable: `new` sets it and nothing clears it. Falling back to the pool's base rather
         // than panicking, because a panic in a handler is reachable from guest code.
         *self.utc_zone.get().unwrap_or(&self.arena)
+    }
+
+    /// The pooled `gai_strerror` message for `ecode`.
+    ///
+    /// Every code outside `omni_bionic::net::GAI_MESSAGES` shares the one "Unknown error" row, so
+    /// a hostile `gai_strerror(INT_MIN)` allocates nothing and returns a real string.
+    #[must_use]
+    pub fn gai_message(&self, ecode: i32) -> GuestAddr {
+        let Some(messages) = self.gai_messages.get() else {
+            // Unreachable: `new` fills it and nothing clears it. The pool's own base rather than
+            // a panic, because a panic in a handler is reachable from guest code.
+            return self.pool();
+        };
+        let known = omni_bionic::net::GAI_MESSAGES;
+        let index = match usize::try_from(ecode) {
+            Ok(index) if index < known => index,
+            // The fallback row, which is the last one.
+            _ => known,
+        };
+        messages.get(index).copied().unwrap_or_else(|| self.pool())
     }
 
     /// The page size the guest's own address space works at, which is what `AT_PAGESZ` answers.

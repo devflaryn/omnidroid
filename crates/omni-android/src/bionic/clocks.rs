@@ -1,4 +1,4 @@
-//! `clock_gettime`, `gettimeofday`, `gmtime_r`, `nanosleep`, `usleep`.
+//! `clock_gettime`, `gettimeofday`, `gmtime_r`, `nanosleep`, `usleep`, `time`, `clock`.
 //!
 //! # Where the answers come from
 //!
@@ -22,9 +22,22 @@
 //! | 4 `CLOCK_MONOTONIC_RAW` | monotonic, not NTP-slewed | answered, same source |
 //! | 5 `CLOCK_REALTIME_COARSE` | wall clock, cheaper and coarser | answered, same source |
 //! | 6 `CLOCK_MONOTONIC_COARSE` | monotonic, cheaper and coarser | answered, same source |
-//! | 2 `CLOCK_PROCESS_CPUTIME_ID` | CPU time of the process | **refused** |
+//! | 2 `CLOCK_PROCESS_CPUTIME_ID` | CPU time of the process | answered, **as of phase 3e** |
 //! | 3 `CLOCK_THREAD_CPUTIME_ID` | CPU time of the thread | **refused** |
 //! | 7 `CLOCK_BOOTTIME` | monotonic **including** suspend | **refused** |
+//!
+//! **`CLOCK_PROCESS_CPUTIME_ID` was refused and is now answered, and that is a correction to
+//! D22 rather than a change of mind.** Phase 3a refused it because this layer had no process CPU
+//! accounting; phase 3e added [`omni_platform::process::cpu_time`] for the guest's `clock()`, and
+//! leaving the refusal in place would have meant answering one question two ways — `clock()`
+//! reporting a real figure while `clock_gettime` said the figure could not be had. The refusal's
+//! stated reason had become false, which is the same shape as `fprintf`'s refusal text claiming
+//! `omni-platform` had no file surface after phase 3b gave it one (D23).
+//!
+//! `CLOCK_THREAD_CPUTIME_ID` stays refused, and the distinction is real rather than tidy: a
+//! per-thread figure needs `GetThreadTimes`, which is a different primitive that does not exist,
+//! and answering it with the *process* figure would report every thread as having consumed the
+//! whole program's CPU.
 //!
 //! The three "same source" rows are answers rather than approximations, and the difference
 //! matters. `_COARSE` differs from its base clock only in *resolution*, and a clock that is more
@@ -97,6 +110,14 @@ const CLOCK_BOOTTIME: i32 = 7;
 
 /// Nanoseconds in a second, as the bound `tv_nsec` must respect.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// `CLOCKS_PER_SEC`, the unit `clock()` reports in.
+///
+/// **A million, fixed by POSIX for every conforming system**, and bionic defines it so. It is not
+/// the resolution of anything: the host's process-time accounting is far coarser (see
+/// [`omni_platform::process::cpu_time`]) and that changes the granularity of the answer without
+/// changing its unit.
+const CLOCKS_PER_SEC: i64 = 1_000_000;
 
 /// Bytes of a guest `struct timespec` and `struct timeval`: two `long`-sized fields on LP64.
 const PAIR_BYTES: usize = 16;
@@ -181,15 +202,20 @@ pub(super) fn clock_gettime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
                 omni_platform::clock::monotonic_now()
             }
+            CLOCK_PROCESS_CPUTIME_ID => process_cpu_time(&view)?,
             other => {
                 let named = clock_name(other)
                     .map_or_else(|| "no clock this layer has a name for".to_string(), |name| format!("`{name}`"));
                 return Err(view.refusal(format!(
                     "the guest asked for clockid_t {other} ({named}). This layer models the \
-                     realtime and monotonic clocks and nothing else: it has no process or thread \
-                     CPU accounting, and no way to know how long the host was suspended. \
-                     Answering with wall time would be a plausible number of seconds and would \
-                     not be what was asked for"
+                     realtime and monotonic clocks and the PROCESS cpu clock, and nothing else: \
+                     it has no per-thread CPU accounting -- that is `GetThreadTimes`, a \
+                     primitive `omni-platform` does not have, and answering it with the process \
+                     figure would report every thread as having burned the whole program's CPU \
+                     -- and no way to know how long the host was suspended, which is what \
+                     CLOCK_BOOTTIME counts and the monotonic clock does not. Answering with wall \
+                     time would be a plausible number of seconds and would not be what was asked \
+                     for"
                 )));
             }
         };
@@ -370,6 +396,97 @@ pub(super) fn usleep(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         sleep_for(&view, Duration::from_micros(micros), &format!("{micros} us"))?;
     }
     c.ret().i32(0);
+    Ok(())
+}
+
+// ================================================================== phase 3e: the two left behind
+
+/// This process's consumed CPU time, or a refusal naming the platform's own reason.
+///
+/// The refusal is what a Linux or macOS build produces today, and it names
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` because [`omni_platform::process::cpu_time`]'s
+/// structural backend does. Nothing here invents a figure when the seam has none: `clock()`
+/// answering `0` would say the process has used no CPU, which is a number a profiler divides by.
+fn process_cpu_time(view: &GuestView<'_>) -> AbiResult<Duration> {
+    omni_platform::process::cpu_time().map_err(|error| {
+        view.refusal(format!(
+            "this layer cannot read the process's consumed CPU time: {error}"
+        ))
+    })
+}
+
+/// `time_t time(time_t *tloc)`
+///
+/// **One line over the wall clock, and it is deliberately the same source `gettimeofday` uses.**
+/// A guest that called both and compared them would otherwise be able to see two clocks where a
+/// device has one.
+///
+/// `tloc` may be null, which is the ordinary form (`time(NULL)`); a non-null one receives the same
+/// value that is returned. The write happens **before** the value is returned, so a `tloc` that is
+/// not writable guest memory fails the call rather than returning a time the guest then believes
+/// it also stored.
+pub(super) fn time(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let tloc = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let seconds = {
+        let view = enter(c, &state);
+        let (seconds, _nanos) = split(&view, omni_platform::clock::realtime_now())?;
+        if tloc != 0 {
+            let at = guest_address(&view, tloc)?;
+            view.mem().write_u64(
+                at,
+                seconds as u64,
+                Blame::new(view.symbol(), view.address(), 0),
+            )?;
+        }
+        seconds
+    };
+    // `time_t` is a signed 64-bit value on LP64, so the whole register is the answer.
+    c.ret().u64(seconds as u64);
+    Ok(())
+}
+
+/// `clock_t clock(void)`
+///
+/// Processor time this **process** has consumed, in units of `CLOCKS_PER_SEC`.
+///
+/// # Three ways to get this wrong, and what each would look like
+///
+/// **`CLOCKS_PER_SEC` is 1,000,000 and is not the host's.** It is fixed at a million by POSIX for
+/// every conforming system and bionic defines it so; the granularity of the underlying clock has
+/// nothing to do with it. A `clock()` scaled to anything else divides by the wrong number
+/// everywhere `clock()` is used, which is always a ratio of two readings, so the error is a
+/// constant factor that never looks like a units bug.
+///
+/// **It is CPU time, not wall time.** `omni_platform::process::cpu_time` is `GetProcessTimes`
+/// here; using `monotonic_now` would produce a monotonic, plausible, wrong number that a guest
+/// benchmark would report as CPU seconds.
+///
+/// **`clock_t` is signed and 64-bit on LP64**, so the value is returned as the whole of `X0`.
+/// Truncating to 32 bits would wrap after about 36 minutes of CPU time, and the wrap would look
+/// like the process suddenly running backwards.
+///
+/// A host that cannot report the figure is a **refusal**, not `(clock_t)-1`. `-1` is C's own
+/// error return and would be the defensible answer if this layer had *asked* and been refused by
+/// the OS — but on Linux and macOS the seam has no implementation at all, and a guest that reads
+/// `-1` learns that the call failed rather than that Omnidroid has not built this yet.
+pub(super) fn clock(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let state = active(c.symbol(), c.address())?;
+    let ticks = {
+        let view = enter(c, &state);
+        let cpu = process_cpu_time(&view)?;
+        // `CLOCKS_PER_SEC` is a million, so this is whole microseconds. `as_micros` is a `u128`
+        // and the conversion is checked rather than cast: 2^63 microseconds is 292,000 years of
+        // CPU time, so the failure is unreachable, and a cast that wrapped would hand the guest a
+        // negative `clock_t`.
+        i64::try_from(cpu.as_micros()).map_err(|_| {
+            view.refusal(format!(
+                "the process has consumed {cpu:?} of CPU time, which does not fit the guest's \
+                 signed 64-bit clock_t at CLOCKS_PER_SEC = {CLOCKS_PER_SEC}"
+            ))
+        })?
+    };
+    c.ret().u64(ticks as u64);
     Ok(())
 }
 

@@ -198,23 +198,26 @@ mod tests {
         random_bytes(&mut nothing).expect("an empty request is a no-op");
     }
 
-    /// Process CPU time advances under work, never goes backwards, and is not wall time.
+    /// Process CPU time advances under work, never goes backwards, and **is not wall time**.
     ///
-    /// **The three ways this returns a plausible wrong number, each asserted separately.** A
-    /// backend that read the *creation* `FILETIME` instead of the kernel and user ones would
-    /// report about 420 years (1601 to now) and would still be monotonic — so the reading is
-    /// bounded above by something no real process reaches. A backend that returned wall time
-    /// would advance across a sleep — so a sleep is timed and the CPU reading must **not**
-    /// follow it. And a backend that returned a constant would pass both of those — so a busy
-    /// loop must move it.
+    /// **The obvious version of the third assertion is wrong here, and the first attempt at it
+    /// failed for exactly that reason.** "A sleep charges no CPU" is true of a *thread* clock and
+    /// false of a process one: this figure covers every thread of the process, and in the
+    /// whole-workspace run libtest has several other tests executing while this one sleeps.
+    /// MEASURED, on the run that caught it: a 50 ms sleep was charged **93.75 ms** of process CPU
+    /// time, which is not a defect in the primitive but the primitive working as documented.
     ///
-    /// n = one busy loop of at least 50 ms of real arithmetic, which is several Windows
-    /// scheduler quanta (~15.6 ms), plus one 50 ms sleep. The busy-loop assertion is one-sided
-    /// and the bound is the accounting quantum rather than the elapsed time: the OS charges in
-    /// ticks, so asserting "at least as much CPU as wall time" would be flaky by construction.
+    /// So the discrimination is made the other way, and it is one a wall clock cannot fake:
+    /// **several threads burning CPU for one interval of wall time advance a process CPU clock by
+    /// MORE than that interval.** Interference from other threads only makes the assertion easier,
+    /// which is the direction a shared-process measurement has to be robust in.
+    ///
+    /// n = one 50 ms busy loop for the advance, plus `min(4, available_parallelism)` threads
+    /// burning one 100 ms wall interval for the discrimination. The busy-loop bound is the OS's
+    /// accounting quantum rather than the elapsed time, because the charge arrives in ticks.
     #[test]
     #[cfg_attr(not(target_os = "windows"), ignore = "no process-cpu-time backend on this target")]
-    fn process_cpu_time_advances_with_work_and_not_with_sleeping() {
+    fn process_cpu_time_advances_with_work_and_outruns_the_wall_clock() {
         use std::time::Instant;
 
         let first = cpu_time().expect("the host's process times");
@@ -239,18 +242,42 @@ mod tests {
             "50 ms of arithmetic moved the process CPU clock not at all: {first:?} -> \
              {after_work:?}"
         );
+        assert!(after_work >= first, "process CPU time went backwards");
 
-        // A sleep consumes wall time and no CPU. The bound is one scheduler quantum, because the
-        // test harness's other threads are in this same process and are charged to it too.
-        let before_sleep = cpu_time().expect("the host's process times");
-        crate::clock::sleep(Duration::from_millis(50));
-        let after_sleep = cpu_time().expect("the host's process times");
-        assert!(after_sleep >= before_sleep, "process CPU time went backwards");
+        // The discrimination. A wall clock advances by the interval no matter how many threads
+        // are running; a process CPU clock advances by the interval times the number of threads
+        // that were on a core.
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        if threads < 2 {
+            // Stated rather than skipped silently: on a single-core host the two clocks cannot be
+            // separated this way, and inventing a weaker assertion would be worse than saying so.
+            eprintln!("one logical processor: the CPU-versus-wall discrimination cannot be made");
+            return;
+        }
+        let busy = threads.min(4);
+        let before = cpu_time().expect("the host's process times");
+        let wall = Instant::now();
+        let handles: Vec<_> = (0..busy)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let started = Instant::now();
+                    let mut acc: u64 = 1;
+                    while started.elapsed() < Duration::from_millis(100) {
+                        acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    }
+                    acc
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_ne!(handle.join().expect("a busy thread"), 0);
+        }
+        let elapsed = wall.elapsed();
+        let charged = cpu_time().expect("the host's process times") - before;
         assert!(
-            after_sleep - before_sleep < Duration::from_millis(40),
-            "a 50 ms sleep charged {:?} of CPU time, which is wall time wearing a CPU clock's \
-             name",
-            after_sleep - before_sleep
+            charged > elapsed,
+            "{busy} threads burned {elapsed:?} of wall time and the process CPU clock advanced by \
+             only {charged:?}: a clock that cannot exceed wall time is a wall clock"
         );
     }
 

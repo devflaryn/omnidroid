@@ -54,8 +54,8 @@ use crate::error::{AbiError, AbiResult};
 
 use super::view::GuestView;
 use super::{
-    active, clocks, dl, enter, files, format, guestmem, logging, procenv, runtime::CallThreads,
-    signals, stdio, threads,
+    active, clocks, dl, enter, files, format, guestmem, logging, net, procenv,
+    runtime::CallThreads, signals, stdio, threads,
 };
 
 // ------------------------------------------------------------------ result lifting
@@ -933,6 +933,30 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // ---- phase 3c: the one thread symbol that runs no guest code and touches no mapping, so
     // the exit path would cost it 3x per call for nothing.
     ("pthread_getschedparam", threads::pthread_getschedparam),
+    // ---- phase 3d: the network group. Two are answered out of `omni-bionic` (pure computation),
+    // two are answered here over the descriptor table `files` already has -- with **no new
+    // `omni-platform` surface at all**, which is the third phase running whose five-target
+    // prediction over-estimated the OS -- and four refuse by name. `net`'s module documentation
+    // has the closed argument for why `poll` and `select` need no operating system, and the
+    // believable wrong answer each refusal declines to give.
+    ("inet_ntop", net::inet_ntop),
+    ("gai_strerror", net::gai_strerror),
+    ("poll", net::poll),
+    ("select", net::select),
+    ("socket", net::socket),
+    ("eventfd", net::eventfd),
+    ("getaddrinfo", net::getaddrinfo),
+    ("freeaddrinfo", net::freeaddrinfo),
+    // ---- phase 3e: the six nothing else claimed. Two are answered -- `time` over the same wall
+    // clock `gettimeofday` reads, and `clock` over the one new `omni-platform` primitive this
+    // combined phase needed -- and two refuse by name. The other two of the six are
+    // `__gcov_dump` and `__gcov_flush`, which are **not here at all**: they are declared
+    // ABSENT, so a weak reference to either resolves to null and the guest's own null test
+    // skips the call. `bionic::absent` has the decoded guest instructions.
+    ("time", clocks::time),
+    ("clock", clocks::clock),
+    ("mallinfo", guestmem::mallinfo),
+    ("longjmp", signals::longjmp),
 ];
 
 /// Serviced on the **exit** path: 80-102 ns per call.

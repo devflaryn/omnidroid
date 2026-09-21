@@ -1,5 +1,11 @@
-//! `sigfillset`, and the three signal symbols that are **refused by name**: `sigaction`,
-//! `raise`, `pthread_sigmask`.
+//! Non-local control flow: `sigfillset`, the three signal symbols that are **refused by name** --
+//! `sigaction`, `raise`, `pthread_sigmask` -- and `longjmp`, which is refused with them.
+//!
+//! The four refusals here are one family rather than a bucket. Each is a way of transferring
+//! control somewhere the ordinary call and return does not reach: a signal handler, or a stack
+//! frame that has already been left. Omnidroid has a mechanism for neither, and in both cases the
+//! believable wrong answer is the one that lets the guest **carry on past a point it expected not
+//! to reach**.
 //!
 //! # There is no guest signal delivery here, and this module is where that is said out loud
 //!
@@ -196,6 +202,68 @@ pub(super) fn pthread_sigmask(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
              `sigaction`, refused for the same reason. This is the one symbol `omni-bionic` \
              excluded by name rather than left out (D19), because a mask that reports success \
              without blocking anything is invisible for exactly as long as nothing depends on it"
+        ),
+    ))
+}
+
+// ================================================================== the fourth refusal
+
+/// `void longjmp(jmp_buf env, int val)`
+///
+/// Refused. It needs **no operating system** — which is why it fell through every phase of this
+/// task's OS-surface plan and had to be collected by the last one — and it needs something this
+/// layer does not have either: a way to put a saved guest CPU state back.
+///
+/// # What restoring a `jmp_buf` would take
+///
+/// AArch64's `setjmp` saves the callee-saved registers `X19`-`X28`, the frame pointer `X29`, the
+/// link register `X30`, the stack pointer, and the low 64 bits of `D8`-`D15`; `longjmp` writes all
+/// of them back and then *does not return* — it resumes at the saved `LR` with the saved `SP`.
+/// Every one of those is a **guest** register, and the thunk boundary does not offer a handler a
+/// way to write one: [`ImportCall`] exposes the AAPCS64 argument registers and one return value,
+/// and that is by design (D18 makes "cannot reach the CPU" a type property, which is what stops an
+/// inline handler re-entering the guest). A `longjmp` would need the opposite capability, on the
+/// calling thread's own context.
+///
+/// # And there is no `jmp_buf` here for it to restore
+///
+/// `setjmp` is **not among the 188** the initializers reach — it is in the reachable file's Tier C
+/// section, reached only through an address-taken edge — so it is not bound, and a guest that
+/// calls it gets [`AbiError::Unbound`](crate::AbiError::Unbound) naming it. Nothing in this
+/// runtime can therefore have *filled* a `jmp_buf`, and the bytes at the pointer that arrives here
+/// are whatever the guest last left there.
+///
+/// Bionic's own layout makes that worse rather than better: its `setjmp` mangles the saved `SP`
+/// and `LR` with a per-process cookie and stores a checksum, so even a byte-for-byte copy of a
+/// `jmp_buf` from a real device would not be restorable by anything that did not share the cookie.
+///
+/// **The believable wrong answer is to return.** `longjmp` is declared `noreturn` and its whole
+/// contract is that control arrives back at the `setjmp`; a handler that quietly returned to the
+/// instruction after the call would resume the guest in the frame it was trying to escape, with
+/// whatever error condition made it call. That is the same failure `raise` declines, one frame
+/// further in.
+pub(super) fn longjmp(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (env, val) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_i32()?)
+    };
+    // C says a `val` of 0 is delivered to the caller as 1, which is the one piece of this
+    // function's contract that can be stated without restoring anything.
+    let delivered = if val == 0 { 1 } else { val };
+    Err(refuse(
+        c,
+        format!(
+            "the guest called longjmp({env:#x}, {val}) -- a non-local jump that must restore \
+             X19-X28, X29, X30, SP and the low halves of D8-D15 from that jmp_buf and resume \
+             there, delivering {delivered} at the matching setjmp. The thunk boundary gives a \
+             handler the AAPCS64 argument registers and one return value and deliberately no way \
+             to write the calling thread's guest state (D18 makes that a type property, which is \
+             what stops an inline handler re-entering the guest). And nothing here can have \
+             filled that jmp_buf: `setjmp` is not among the 188 imports the initializers reach, \
+             so it is not bound, and bionic mangles the saved SP and LR with a per-process cookie \
+             besides. Returning normally was rejected -- longjmp is noreturn, and a return would \
+             resume the guest in the frame it was trying to escape, carrying the condition that \
+             made it jump"
         ),
     ))
 }

@@ -151,17 +151,21 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 156, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 168, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
     // Phase 3b adds 29, all inline: eighteen descriptor symbols and eleven `FILE *` ones.
     // Phase 3c adds 4 inline (the signal family) and 4 re-entrant (thread lifecycle).
-    assert_eq!(Bionic::inline_symbols().count(), 145);
+    // Phase 3d adds 8 inline (the network group) and phase 3e 4 more, for 168.
+    assert_eq!(Bionic::inline_symbols().count(), 157);
     assert_eq!(Bionic::reentrant_symbols().count(), 11);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
-    // handler at all. 156 + 18 = 174 of the 188 the initializers reach.
+    // handler at all, and the two **declared absent** — a weak reference to either resolves to
+    // null, which is what the guest's own null test expects. 168 + 18 + 2 = 188, which is every
+    // one of the imports the initializers reach.
     assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
+    assert_eq!(omni_android::bionic::ABSENT_SYMBOLS.len(), 2);
 
     // **Membership, not just a total** — a count cannot see a substitution, and this project has
     // had a list whose count stayed right while two members were wrong and two were missing. The
@@ -270,11 +274,10 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         assert!(!reentrant.contains(symbol), "`{symbol}` holds no CPU and belongs inline");
     }
 
-    // And the complement: the groups phase 3b deliberately does not touch stay `Unbound`, so that
-    // "not done yet" and "done" cannot be confused by anyone reading the count. These are the
-    // remaining 22 — eight sockets, eight threads and signals, and the six nothing else claims.
-    let still_unbound = [
-        // network (3c in the plan's table)
+    // **Phase 3d's eight, named one by one**, derived the same way and exactly the plan's `3d`
+    // row. Two are answered out of `omni-bionic`, two are implemented over the descriptor table
+    // that already existed, and four refuse by name.
+    let phase_3d = [
         "eventfd",
         "freeaddrinfo",
         "gai_strerror",
@@ -283,36 +286,54 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         "poll",
         "select",
         "socket",
-        // the remainder nothing else claims
-        "clock",
-        "time",
-        "mallinfo",
-        "longjmp",
-        "__gcov_dump",
-        "__gcov_flush",
     ];
-    assert_eq!(still_unbound.len(), 14, "188 - 156 bound - 18 data objects");
-    for symbol in still_unbound {
-        assert!(
-            !bound.contains(symbol),
-            "`{symbol}` belongs to a later phase and must still name itself when called"
-        );
+    assert_eq!(phase_3d.len(), 8);
+    for symbol in phase_3d {
+        assert!(bound.contains(symbol), "`{symbol}` is in phase 3d's scope and is not bound");
     }
 
-    // The two lists together are the whole remainder, asserted as a **set difference against the
-    // reachable file** rather than as a total: a count cannot see a substitution, and this project
-    // has had a list whose count stayed right while two members were wrong and two were missing.
+    // **Phase 3e's six**, of which four are bound and **two are not bound at all**: a weak
+    // reference to `__gcov_dump` or `__gcov_flush` resolves to null, because the guest's own code
+    // tests the address before calling and no Android libc supplies either. `bionic::absent` has
+    // the decoded instructions and `tests/libroblox.rs` asserts them against the real library.
+    let phase_3e_bound = ["clock", "time", "mallinfo", "longjmp"];
+    for symbol in phase_3e_bound {
+        assert!(bound.contains(symbol), "`{symbol}` is in phase 3e's scope and is not bound");
+    }
+    let absent: std::collections::BTreeSet<&str> =
+        omni_android::bionic::ABSENT_SYMBOLS.iter().map(|a| a.symbol).collect();
+    assert_eq!(
+        absent,
+        ["__gcov_dump", "__gcov_flush"].into_iter().collect::<std::collections::BTreeSet<_>>()
+    );
+    for symbol in &absent {
+        assert!(
+            !bound.contains(symbol),
+            "`{symbol}` is declared absent and must not also have a handler: a weak reference to \
+             it has to resolve to null, and a bound symbol has an address"
+        );
+    }
+    assert_eq!(phase_3e_bound.len() + absent.len(), 6, "the plan's `3e` row");
+
+    // **Nothing is left.** The remainder is asserted as a **set difference against the reachable
+    // file** rather than as a total — a count cannot see a substitution, and this project has had
+    // a list whose count stayed right while two members were wrong and two were missing — and
+    // what it must now equal is exactly the two deliberately-absent symbols.
     let reachable = reachable_imports();
     let data: std::collections::BTreeSet<&str> =
         omni_android::bionic::DATA_OBJECTS.iter().map(|o| o.symbol).collect();
-    let remainder: std::collections::BTreeSet<String> = reachable
+    let remainder: std::collections::BTreeSet<&str> = reachable
         .iter()
-        .filter(|symbol| !bound.contains(symbol.as_str()) && !data.contains(symbol.as_str()))
-        .cloned()
+        .map(String::as_str)
+        .filter(|symbol| !bound.contains(symbol) && !data.contains(symbol))
         .collect();
-    let expected: std::collections::BTreeSet<String> =
-        still_unbound.iter().map(|s| (*s).to_string()).collect();
-    assert_eq!(remainder, expected, "the unbound remainder is not the list above");
+    assert_eq!(
+        remainder, absent,
+        "every one of the 188 reachable imports is now serviced, refused by name, placed as a \
+         data object, or deliberately absent -- and the only members of that last category are \
+         the two `__gcov_*`"
+    );
+    assert_eq!(bound.len() + data.len() + absent.len(), 188, "the whole reachable set");
 }
 
 /// **Task 2 review finding F9, asserted rather than trusted to a comment.**
@@ -349,6 +370,30 @@ fn dispatch_paths_are_what_f9_requires() {
         !reentrant.contains("pthread_getschedparam"),
         "`pthread_getschedparam` runs no guest code and touches no mapping (D17)"
     );
+    // Phases 3d and 3e added twelve handlers and **not one of them is re-entrant**: none runs
+    // guest code and none reaches `GuestSpace`. `poll` and `select` read and write guest memory,
+    // which `memcpy` already does from the fast path, and they sleep, which `nanosleep` already
+    // does there too. Pinned in this direction as well as the other, because moving one here
+    // would cost it 3x per call for nothing (D17).
+    for symbol in [
+        "inet_ntop",
+        "gai_strerror",
+        "poll",
+        "select",
+        "socket",
+        "eventfd",
+        "getaddrinfo",
+        "freeaddrinfo",
+        "time",
+        "clock",
+        "mallinfo",
+        "longjmp",
+    ] {
+        assert!(
+            !reentrant.contains(symbol),
+            "`{symbol}` runs no guest code and touches no mapping (D17)"
+        );
+    }
     assert_eq!(reentrant.len(), 11, "nothing else belongs on the slow path: {reentrant:?}");
     let inline: std::collections::BTreeSet<&str> = Bionic::inline_symbols().collect();
     // The four `dl*` refusals touch no address space and run no guest code, so they stay on the
@@ -901,18 +946,25 @@ fn a_long_double_conversion_is_refused_and_names_itself() {
     assert!(text.contains("long double"), "{text}");
 }
 
-/// Every symbol this phase deliberately does not implement stays `Unbound`, and its call names
-/// itself. That is the design, not a gap: a `socket` bound to a stub returning a plausible
-/// descriptor would surface three thousand initializers later somewhere unrelated.
+/// A symbol this layer does not implement stays `Unbound`, and its call names itself. That is the
+/// design, not a gap: a `setjmp` bound to a stub returning a plausible zero would surface three
+/// thousand initializers later somewhere unrelated.
 ///
-/// The symbol here was `fopen` until phase 3b bound it; it is `socket` now, which phase 3c will
-/// bind and which will move it on again. That churn is the test working.
+/// **The symbol here has moved three times, and that churn is the test working.** It was `fopen`
+/// until phase 3b bound it, then `socket` until phase 3d bound it — as a refusal, which is a
+/// *different* statement from `Unbound`. Every one of the 188 the initializers reach is now
+/// serviced, refused by name, placed as a data object or deliberately absent, so the example is
+/// now one of the 377 imports **outside** the reachable set: `setjmp`, which `libroblox.so`
+/// imports and which only an address-taken edge reaches. Those are exactly the calls
+/// `Binding::Unbound` exists for — D17 records 188 as a *lower bound* with 17,698 unresolvable
+/// indirect call sites behind it, so a symbol outside the prediction must name itself rather than
+/// branch to zero.
 #[test]
 fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     let _guard = serialized();
     let f = fixture();
-    let thunk = f.boundary.slot_named("socket").map(|s| s.address);
-    assert!(thunk.is_none(), "socket must not be bound by this phase");
+    let thunk = f.boundary.slot_named("setjmp").map(|s| s.address);
+    assert!(thunk.is_none(), "setjmp is outside the reachable 188 and must not be bound");
 
     // One that *is* declared, because the loader would have asked for it: bind it as the loader
     // would and confirm the call names it.
@@ -920,7 +972,7 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
     let builder = guest.boundary(256);
     bionic.bind_into(&builder).expect("bind");
-    let unbound = builder.declare_function("socket").expect("a slot");
+    let unbound = builder.declare_function("setjmp").expect("a slot");
     let boundary = builder.finish();
     let entry = guest.next_entry();
     let mut asm = Asm::at(entry);
@@ -930,9 +982,9 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     guest.load(asm.words());
     let mut cpu = guest.thread(&boundary);
     let _active = bionic.activate().expect("a thread block");
-    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("socket is not implemented");
+    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("setjmp is not implemented");
     assert!(matches!(error, AbiError::Unbound { .. }), "{error:?}");
-    assert_eq!(error.symbol(), Some("socket"));
+    assert_eq!(error.symbol(), Some("setjmp"));
     assert_eq!(error.guest_address(), Some(unbound));
 }
 
@@ -2599,14 +2651,14 @@ fn read_i32(f: &Fixture, at: omni_cpu::GuestAddr) -> i32 {
 
 // ------------------------------------------------------------------ clocks
 
-/// **Both clocks are answered from the platform seam, and the ids this layer does not model are
-/// refused by number.**
+/// **The clocks this layer models are answered from the platform seam, and the ids it does not
+/// model are refused by number.**
 ///
 /// The refusal half is the part that matters. `clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)`
 /// answered with wall time is a plausible, monotonic number of seconds that is not what was asked
 /// for, and a guest profiler built on it would report wall time as CPU time forever.
 #[test]
-fn clock_gettime_answers_the_two_clocks_and_refuses_the_ones_it_does_not_model() {
+fn clock_gettime_answers_the_clocks_it_models_and_refuses_the_ones_it_does_not() {
     let _guard = serialized();
     let f = fixture();
     let ts = f.guest.data + 0x200;
@@ -2657,8 +2709,17 @@ fn clock_gettime_answers_the_two_clocks_and_refuses_the_ones_it_does_not_model()
         assert!(f.guest.read_u64(ts) > 1_577_836_800, "clock {id} is not a wall clock");
     }
 
+    // **`CLOCK_PROCESS_CPUTIME_ID` was refused here until phase 3e and is answered now**, which
+    // is a correction to D22 rather than a change of mind: that phase added
+    // `omni_platform::process::cpu_time` for the guest's `clock()`, and a layer that reported the
+    // figure through one symbol while saying it could not be had through another would be giving
+    // one question two answers. `the_process_cpu_clock_is_answered_and_the_thread_cpu_clock_is_
+    // still_refused` asserts the two against each other.
+    //
+    // The two that are still refused are refused for reasons that did **not** go away: a
+    // per-thread figure is `GetThreadTimes`, a primitive that does not exist, and `CLOCK_BOOTTIME`
+    // counts time spent suspended, which nothing here can know.
     for (id, name) in [
-        (CLOCK_PROCESS_CPUTIME_ID, "CLOCK_PROCESS_CPUTIME_ID"),
         (CLOCK_THREAD_CPUTIME_ID, "CLOCK_THREAD_CPUTIME_ID"),
         (CLOCK_BOOTTIME, "CLOCK_BOOTTIME"),
     ] {
@@ -5441,4 +5502,917 @@ fn a_thread_that_exits_does_not_give_its_block_to_a_live_thread() {
     assert!(matches!(run_program(&f, join_rest).expect("completes"), ExitReason::Returned { .. }));
     assert_eq!(f.bionic.live_guest_threads(), 0);
     assert!(f.bionic.guest_thread_failures().is_empty());
+}
+
+// =================================================================== phase 3d: the network group
+//
+// `socket`, `poll`, `select`, `eventfd`, `getaddrinfo`, `freeaddrinfo`, `gai_strerror`,
+// `inet_ntop`. Two answered out of `omni-bionic`, two implemented over the descriptor table that
+// already existed, four refused by name.
+
+/// The guest's `AF_INET`/`AF_INET6`, spelled again here so that `omni-bionic`'s constants are
+/// compared against a second copy rather than against themselves.
+const AF_INET: u64 = 2;
+const AF_INET6: u64 = 10;
+/// Linux's `EAFNOSUPPORT`, `ENOSPC`, `EINVAL`, `EBADF`, spelled again for the same reason.
+const EAFNOSUPPORT: u64 = 97;
+const ENOSPC: u64 = 28;
+const EINVAL_NET: u64 = 22;
+const EBADF_NET: u64 = 9;
+
+/// Build one `struct pollfd` as the guest lays it out: `int fd; short events; short revents;`.
+fn pollfd(fd: i32, events: i16) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&fd.to_le_bytes());
+    bytes[4..6].copy_from_slice(&events.to_le_bytes());
+    bytes
+}
+
+/// `revents` of the `index`-th entry of an array at `at`.
+fn revents_of(f: &Fixture, at: omni_cpu::GuestAddr, index: usize) -> i16 {
+    let bytes = read_guest(f, at + index * 8 + 6, 2);
+    i16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+/// Open a file through real guest code and return the descriptor.
+fn open_through_guest(f: &Fixture, path: &str, flags: u64) -> i32 {
+    let at = f.cstring(f.guest.data + 0x80, path.as_bytes());
+    value_of(f, "open", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, flags);
+        asm.mov(2, 0o644);
+    }) as i32
+}
+
+/// **`inet_ntop` formats both families through a real thunk**, and the string is read back out of
+/// guest memory rather than inferred from the return value.
+///
+/// A handler that returned `dst` without writing anything would pass an assertion on the return
+/// value alone, which is why the bytes are what is checked.
+#[test]
+fn inet_ntop_formats_both_families_through_a_real_thunk() {
+    let _guard = serialized();
+    let f = fixture();
+    let src = f.guest.data + 0x100;
+    let dst = f.guest.data + 0x200;
+
+    f.guest.write_bytes(src, &[10, 0, 0, 1]);
+    let returned = value_of(&f, "inet_ntop", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, src as u64);
+        asm.mov(2, dst as u64);
+        asm.mov(3, 64);
+    });
+    assert_eq!(returned, dst as u64, "inet_ntop returns its destination");
+    assert_eq!(f.read_cstring(dst), b"10.0.0.1");
+
+    // `2001:db8::1`, in network byte order.
+    let mut v6 = [0u8; 16];
+    v6[..2].copy_from_slice(&0x2001u16.to_be_bytes());
+    v6[2..4].copy_from_slice(&0x0db8u16.to_be_bytes());
+    v6[15] = 1;
+    f.guest.write_bytes(src, &v6);
+    let returned = value_of(&f, "inet_ntop", |asm| {
+        asm.mov(0, AF_INET6);
+        asm.mov(1, src as u64);
+        asm.mov(2, dst as u64);
+        asm.mov(3, 64);
+    });
+    assert_eq!(returned, dst as u64);
+    assert_eq!(f.read_cstring(dst), b"2001:db8::1");
+}
+
+/// **A `size` that cannot hold the result is `NULL` with `ENOSPC`, and nothing is written.**
+///
+/// The `socklen_t` is read from `W3`, not `X3`: the test deliberately leaves rubbish in the high
+/// half of `X3`, which is what AAPCS64 permits a caller to do for a 32-bit parameter. A handler
+/// that read the whole register would see an enormous `size` and write the address into a buffer
+/// the guest said was eight bytes.
+#[test]
+fn inet_ntop_reads_a_32_bit_socklen_and_refuses_a_short_buffer_without_writing() {
+    let _guard = serialized();
+    let f = fixture();
+    let src = f.guest.data + 0x100;
+    let dst = f.guest.data + 0x200;
+    f.guest.write_bytes(src, &[10, 0, 0, 1]);
+    // A sentinel the call must not disturb.
+    f.guest.write_bytes(dst, &[0xAB; 16]);
+
+    let out = f.guest.data + 0x300;
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, AF_INET);
+    asm.mov(1, src as u64);
+    asm.mov(2, dst as u64);
+    // "10.0.0.1" is eight bytes and needs nine. The high half of X3 is 0xFFFF_FFFF, which a
+    // handler reading `X3` rather than `W3` would take as part of the size.
+    asm.mov(3, 0xFFFF_FFFF_0000_0008);
+    asm.bl(f.thunk("inet_ntop"));
+    asm.mov(22, out as u64);
+    asm.push(str_imm(0, 22, 0));
+    asm.bl(f.thunk("__errno"));
+    asm.push(ldr_w(1, 0, 0));
+    asm.push(str_imm(1, 22, 8));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(f.guest.read_u64(out), 0, "a short buffer is NULL");
+    assert_eq!(f.guest.read_u64(out + 8), ENOSPC, "with ENOSPC");
+    assert_eq!(
+        read_guest(&f, dst, 16),
+        vec![0xAB; 16],
+        "a refused conversion must not leave a truncated address behind"
+    );
+}
+
+/// An address family this layer does not format is `EAFNOSUPPORT`, not a refusal and not a fault.
+#[test]
+fn inet_ntop_with_an_unknown_family_is_eafnosupport() {
+    let _guard = serialized();
+    let f = fixture();
+    let out = f.guest.data + 0x300;
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    // AF_UNIX, with a null source: the family must be checked first, so this is not a fault.
+    asm.mov(0, 1);
+    asm.mov(1, 0);
+    asm.mov(2, (f.guest.data + 0x200) as u64);
+    asm.mov(3, 64);
+    asm.bl(f.thunk("inet_ntop"));
+    asm.mov(22, out as u64);
+    asm.push(str_imm(0, 22, 0));
+    asm.bl(f.thunk("__errno"));
+    asm.push(ldr_w(1, 0, 0));
+    asm.push(str_imm(1, 22, 8));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out), 0);
+    assert_eq!(f.guest.read_u64(out + 8), EAFNOSUPPORT);
+}
+
+/// **`gai_strerror` returns a pointer that stays valid**, which is the whole of its contract.
+///
+/// Two calls with the same code return the **same** address, and a `strerror` in between does not
+/// change what it points at. That is the assertion the per-thread scratch would fail: `strerror`
+/// writes there, so a `gai_strerror` built on it would hand back a pointer whose bytes the next
+/// `strerror` overwrites, and nothing about either call would say so.
+#[test]
+fn gai_strerror_returns_a_stable_pooled_string() {
+    let _guard = serialized();
+    let f = fixture();
+    let first = value_of(&f, "gai_strerror", |asm| {
+        asm.mov(0, 8);
+    });
+    assert_eq!(f.read_cstring(first as omni_cpu::GuestAddr), b"Name or service not known");
+
+    // A `strerror` on this thread, which writes the per-thread scratch.
+    let scratch = value_of(&f, "strerror", |asm| {
+        asm.mov(0, 2);
+    });
+    assert_ne!(scratch, first, "gai_strerror must not share strerror's scratch");
+
+    let again = value_of(&f, "gai_strerror", |asm| {
+        asm.mov(0, 8);
+    });
+    assert_eq!(again, first, "the same code must return the same pointer");
+    assert_eq!(
+        f.read_cstring(first as omni_cpu::GuestAddr),
+        b"Name or service not known",
+        "and the bytes must survive an intervening strerror"
+    );
+
+    // Every code outside the table shares one row, so a hostile code allocates nothing.
+    let unknown = value_of(&f, "gai_strerror", |asm| {
+        asm.mov(0, 0xFFFF_FFFF_8000_0000);
+    });
+    assert_eq!(f.read_cstring(unknown as omni_cpu::GuestAddr), b"Unknown error");
+    let unknown_again = value_of(&f, "gai_strerror", |asm| {
+        asm.mov(0, 99);
+    });
+    assert_eq!(unknown_again, unknown, "the fallback row is interned once");
+}
+
+/// **`poll` answers every entry and counts only the ready ones**, over a real descriptor.
+///
+/// Four entries in one array, each a different rule: an open descriptor gets what it asked for, a
+/// descriptor that is not open gets `POLLNVAL` whether or not it asked for anything, a negative
+/// descriptor is ignored with a zeroed `revents`, and an open descriptor that asked only for
+/// `POLLPRI` gets nothing — because out-of-band data is a socket concept and there are no
+/// sockets here.
+#[test]
+fn poll_answers_every_entry_and_counts_only_the_ready_ones() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("poll");
+    std::fs::write(scratch.path("a.bin"), b"hello").expect("a file to poll");
+    let fd = open_through_guest(&f, "/a.bin", O_RDONLY);
+    assert!(fd >= 3, "a real descriptor: {fd}");
+
+    const POLLIN: i16 = 0x001;
+    const POLLPRI: i16 = 0x002;
+    const POLLOUT: i16 = 0x004;
+    const POLLNVAL: i16 = 0x020;
+    const POLLRDNORM: i16 = 0x040;
+
+    let at = f.guest.data + 0x400;
+    let mut array = Vec::new();
+    array.extend_from_slice(&pollfd(fd, POLLIN | POLLOUT));
+    array.extend_from_slice(&pollfd(fd, POLLPRI));
+    array.extend_from_slice(&pollfd(61, POLLIN));
+    array.extend_from_slice(&pollfd(-1, POLLIN));
+    // A sentinel in every `revents`, so "wrote nothing" and "wrote zero" are distinguishable.
+    for index in 0..4 {
+        array[index * 8 + 6] = 0x5A;
+        array[index * 8 + 7] = 0x5A;
+    }
+    f.guest.write_bytes(at, &array);
+
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 4);
+        asm.mov(2, 0);
+    });
+    assert_eq!(returned as i64, 2, "the open descriptor and the invalid one are ready");
+    assert_eq!(revents_of(&f, at, 0), POLLIN | POLLOUT, "a regular file is ready for both");
+    assert_eq!(revents_of(&f, at, 1), 0, "nothing here can ever report POLLPRI");
+    assert_eq!(revents_of(&f, at, 2), POLLNVAL, "a descriptor that is not open");
+    assert_eq!(revents_of(&f, at, 3), 0, "a negative descriptor is ignored, not POLLNVAL");
+
+    // `POLLRDNORM` is the same condition as `POLLIN` here, and asking for it alone gets it alone —
+    // the mask is applied to what was asked for rather than returned wholesale.
+    f.guest.write_bytes(at, &pollfd(fd, POLLRDNORM));
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 0);
+    });
+    assert_eq!(returned as i64, 1);
+    assert_eq!(revents_of(&f, at, 0), POLLRDNORM, "only what was asked for");
+}
+
+/// The three standard streams are pollable, because they are descriptors this runtime has.
+///
+/// stdin answers `POLLIN` — reading it here is an immediate end of file, which *is* readable —
+/// and stdout answers `POLLOUT`. The consistency criterion the module documents is that `poll`
+/// predicts what `read` and `write` on that descriptor do **in this runtime**.
+#[test]
+fn the_standard_streams_are_pollable_because_they_are_descriptors_here() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("poll-std");
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    let at = f.guest.data + 0x400;
+    let mut array = Vec::new();
+    array.extend_from_slice(&pollfd(0, POLLIN));
+    array.extend_from_slice(&pollfd(1, POLLOUT));
+    array.extend_from_slice(&pollfd(2, POLLOUT));
+    f.guest.write_bytes(at, &array);
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 3);
+        asm.mov(2, 0);
+    });
+    assert_eq!(returned as i64, 3);
+    assert_eq!(revents_of(&f, at, 0), POLLIN);
+    assert_eq!(revents_of(&f, at, 1), POLLOUT);
+    assert_eq!(revents_of(&f, at, 2), POLLOUT);
+}
+
+/// **`poll` with nothing to wait for sleeps for its timeout and returns zero**, and with no
+/// descriptors at all it does not need a filesystem to do it.
+///
+/// The sleep is measured with a one-sided assertion — Windows' ~15.6 ms timer tick means the
+/// upper bound is the fidelity gap `omni_platform::clock` documents, and a test that pinned one
+/// would be flaky by design.
+#[test]
+fn poll_with_nothing_ready_sleeps_for_its_timeout_and_returns_zero() {
+    let _guard = serialized();
+    // No filesystem root at all: `poll(NULL, 0, ms)` is the portable sleep idiom and must not
+    // need a descriptor table to answer.
+    let f = fixture();
+    let started = std::time::Instant::now();
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 30);
+    });
+    let elapsed = started.elapsed();
+    assert_eq!(returned as i64, 0, "a timeout with nothing ready is zero, not -1");
+    assert!(elapsed >= std::time::Duration::from_millis(30), "it slept {elapsed:?}");
+
+    // And a zero timeout returns at once rather than sleeping.
+    let started = std::time::Instant::now();
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+    });
+    assert_eq!(returned as i64, 0);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500), "a zero timeout blocked");
+}
+
+/// **An unbounded wait and an over-long one are refused by name, and a bounded one is not.**
+///
+/// All three arms, because a refusal that was widened to cover the third would stop a correct
+/// guest and a refusal that was narrowed to cover neither would hang the run. The refusal text
+/// has to name why nothing can become ready, since that is the fact a reader three thousand
+/// initializers deep needs.
+#[test]
+fn poll_refuses_a_wait_that_nothing_can_end() {
+    let _guard = serialized();
+    let f = fixture();
+
+    let error = refusal_of(&f, "poll", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0xFFFF_FFFF_FFFF_FFFF); // -1: wait indefinitely
+    });
+    assert_eq!(error.symbol(), Some("poll"), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("indefinitely"), "{text}");
+    assert!(text.contains("socket"), "the refusal must say why nothing can become ready: {text}");
+
+    // 61 seconds, one past the cap.
+    let error = refusal_of(&f, "poll", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 61_000);
+    });
+    assert_eq!(error.symbol(), Some("poll"));
+    assert!(error.to_string().contains("60 seconds"), "{error}");
+
+    // And the arm that must not be refused: a wait inside the cap.
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 1);
+    });
+    assert_eq!(returned as i64, 0, "a wait inside the cap is carried out, not refused");
+}
+
+/// A hostile `nfds` is `EINVAL` rather than a request to read 147 exabytes of guest memory.
+#[test]
+fn poll_with_a_hostile_nfds_is_einval() {
+    let _guard = serialized();
+    let f = fixture();
+    let out = f.guest.data + 0x300;
+    for nfds in [u64::MAX, 1025, 0x8000_0000_0000_0000] {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, (f.guest.data + 0x400) as u64);
+        asm.mov(1, nfds);
+        asm.mov(2, 0);
+        asm.bl(f.thunk("poll"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        let mut cpu = f.guest.thread(&f.boundary);
+        assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(f.guest.read_u64(out) as i64, -1, "nfds {nfds}");
+        assert_eq!(f.guest.read_u64(out + 8), EINVAL_NET, "nfds {nfds}");
+    }
+}
+
+/// **A `pollfd` array that is not wholly readable leaves the guest's `revents` untouched, and
+/// this is a detector rather than a watch.**
+///
+/// Review finding **M1**'s direction, applied to this group: decide first, then write once. The
+/// array is placed so that its **first** entry is inside the data mapping and its **second** runs
+/// off the end of it. A per-entry implementation would answer entry 0 and write its `revents`
+/// before it reached the entry that fails; this one reads the whole array first, so entry 0's
+/// sentinel has to survive.
+///
+/// The sentinel is what makes it a detector: the failing entry is unreachable memory in both
+/// implementations, so nothing about the *error* distinguishes them — only the byte that the
+/// wrong one would have written.
+#[test]
+fn a_poll_array_that_runs_off_its_mapping_leaves_the_first_entry_untouched() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("poll-straddle");
+    std::fs::write(scratch.path("a.bin"), b"hello").expect("a file");
+    let fd = open_through_guest(&f, "/a.bin", O_RDONLY);
+    const POLLIN: i16 = 0x001;
+
+    // The last eight bytes of the 64 KiB data mapping: entry 0 fits exactly and entry 1 is past
+    // the end.
+    let at = f.guest.data + harness::DATA_BYTES - 8;
+    let mut entry = pollfd(fd, POLLIN);
+    entry[6] = 0x5A;
+    entry[7] = 0x5A;
+    f.guest.write_bytes(at, &entry);
+
+    let error = refusal_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 2);
+        asm.mov(2, 0);
+    });
+    assert_eq!(error.symbol(), Some("poll"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert_eq!(
+        revents_of(&f, at, 0),
+        0x5A5A,
+        "the first entry was answered and written before the call failed, which is the half-\
+         updated buffer review finding M1 is about"
+    );
+
+    // And the same array with an `nfds` of one — wholly inside the mapping — is answered, so the
+    // refusal above is about the range and not about the address.
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 0);
+    });
+    assert_eq!(returned as i64, 1);
+    assert_eq!(revents_of(&f, at, 0), POLLIN);
+}
+
+/// **`select` counts a descriptor once per set it is ready in, and zeroes the exception set.**
+///
+/// POSIX: the return value is the total number of bits set across all the masks, so a descriptor
+/// in both the read and the write set counts **twice**. An implementation that counted
+/// descriptors rather than bits returns 1 here and looks entirely reasonable.
+#[test]
+fn select_counts_bits_rather_than_descriptors_and_clears_the_exception_set() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("select");
+    std::fs::write(scratch.path("a.bin"), b"hello").expect("a file");
+    let fd = open_through_guest(&f, "/a.bin", O_RDONLY);
+
+    let readfds = f.guest.data + 0x400;
+    let writefds = f.guest.data + 0x500;
+    let exceptfds = f.guest.data + 0x600;
+    let mut bits = vec![0u8; 128];
+    bits[(fd / 8) as usize] = 1 << (fd % 8);
+    f.guest.write_bytes(readfds, &bits);
+    f.guest.write_bytes(writefds, &bits);
+    f.guest.write_bytes(exceptfds, &bits);
+
+    let returned = value_of(&f, "select", |asm| {
+        asm.mov(0, (fd + 1) as u64);
+        asm.mov(1, readfds as u64);
+        asm.mov(2, writefds as u64);
+        asm.mov(3, exceptfds as u64);
+        asm.mov(4, 0);
+    });
+    assert_eq!(returned as i64, 2, "one descriptor, ready in two sets, is two bits");
+    assert_ne!(read_guest(&f, readfds, 8), vec![0u8; 8], "the read set keeps its bit");
+    assert_ne!(read_guest(&f, writefds, 8), vec![0u8; 8], "so does the write set");
+    assert_eq!(
+        read_guest(&f, exceptfds, 8),
+        vec![0u8; 8],
+        "nothing here can raise an exception condition, so that set is emptied"
+    );
+}
+
+/// **`select` reports a bad descriptor as `EBADF` for the whole call and rewrites nothing.**
+///
+/// The bad descriptor is in the *third* set, so an implementation that answered set by set would
+/// already have rewritten the first two by the time it found it. The sentinel bits in the first
+/// two sets are what notices.
+#[test]
+fn select_with_a_bad_descriptor_is_ebadf_and_leaves_every_set_alone() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("select-ebadf");
+    std::fs::write(scratch.path("a.bin"), b"hello").expect("a file");
+    let fd = open_through_guest(&f, "/a.bin", O_RDONLY);
+
+    let readfds = f.guest.data + 0x400;
+    let writefds = f.guest.data + 0x500;
+    let exceptfds = f.guest.data + 0x600;
+    let mut good = vec![0u8; 128];
+    good[(fd / 8) as usize] = 1 << (fd % 8);
+    let mut bad = vec![0u8; 128];
+    bad[7] = 0x80; // descriptor 63, which nothing opened
+    f.guest.write_bytes(readfds, &good);
+    f.guest.write_bytes(writefds, &good);
+    f.guest.write_bytes(exceptfds, &bad);
+
+    let out = f.guest.data + 0x300;
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, 64);
+    asm.mov(1, readfds as u64);
+    asm.mov(2, writefds as u64);
+    asm.mov(3, exceptfds as u64);
+    asm.mov(4, 0);
+    asm.bl(f.thunk("select"));
+    asm.mov(22, out as u64);
+    asm.push(str_imm(0, 22, 0));
+    asm.bl(f.thunk("__errno"));
+    asm.push(ldr_w(1, 0, 0));
+    asm.push(str_imm(1, 22, 8));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i64, -1);
+    assert_eq!(f.guest.read_u64(out + 8), EBADF_NET);
+    assert_eq!(read_guest(&f, readfds, 8), good[..8], "no set may be rewritten before the check");
+    assert_eq!(read_guest(&f, writefds, 8), good[..8]);
+    assert_eq!(read_guest(&f, exceptfds, 8), bad[..8]);
+}
+
+/// An `nfds` outside `[0, FD_SETSIZE]` is `EINVAL`, in both directions.
+///
+/// Past `FD_SETSIZE` this is stricter than Linux, which clamps; the module documentation says so
+/// and says why — a guest `fd_set` is 128 bytes, and honouring a larger `nfds` would read bits out
+/// of whatever the guest put after it. The refusal is of the whole call, which is the opposite of
+/// silently reading less than was asked for.
+#[test]
+fn select_with_an_nfds_outside_fd_setsize_is_einval() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("select-nfds");
+    let out = f.guest.data + 0x300;
+    for nfds in [0xFFFF_FFFF_FFFF_FFFFu64, 1025, 0x8000_0000] {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, nfds);
+        asm.mov(1, (f.guest.data + 0x400) as u64);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+        asm.mov(4, 0);
+        asm.bl(f.thunk("select"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        let mut cpu = f.guest.thread(&f.boundary);
+        assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(f.guest.read_u64(out) as i64, -1, "nfds {nfds:#x}");
+        assert_eq!(f.guest.read_u64(out + 8), EINVAL_NET, "nfds {nfds:#x}");
+    }
+    // `nfds` of exactly FD_SETSIZE is the last legal value and must not be refused.
+    let returned = value_of(&f, "select", |asm| {
+        asm.mov(0, 1024);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+        asm.mov(4, (f.guest.data + 0x700) as u64);
+    });
+    assert_eq!(returned as i64, 0, "an empty select with a zero timeout is zero");
+}
+
+/// A `struct timeval` the guest filled with absurd fields is `EINVAL`, and an unbounded wait is
+/// refused by name.
+#[test]
+fn select_with_a_hostile_timeval_is_einval_and_a_null_timeout_is_refused() {
+    let _guard = serialized();
+    let f = fixture();
+    let tv = f.guest.data + 0x700;
+    let out = f.guest.data + 0x300;
+
+    for (seconds, micros) in [(0i64, 1_000_000i64), (0, -1), (-1, 0), (i64::MIN, i64::MIN)] {
+        f.guest.write_u64(tv, seconds as u64);
+        f.guest.write_u64(tv + 8, micros as u64);
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+        asm.mov(4, tv as u64);
+        asm.bl(f.thunk("select"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        let mut cpu = f.guest.thread(&f.boundary);
+        assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(f.guest.read_u64(out) as i64, -1, "timeval {{{seconds}, {micros}}}");
+        assert_eq!(f.guest.read_u64(out + 8), EINVAL_NET, "timeval {{{seconds}, {micros}}}");
+    }
+
+    // A `tv_sec` past the cap is a refusal rather than an errno: it is well formed and this layer
+    // is declining to carry it out.
+    f.guest.write_u64(tv, 61);
+    f.guest.write_u64(tv + 8, 0);
+    let error = refusal_of(&f, "select", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+        asm.mov(4, tv as u64);
+    });
+    assert_eq!(error.symbol(), Some("select"));
+    assert!(error.to_string().contains("60 seconds"), "{error}");
+
+    // And a null timeout is the unbounded wait.
+    let error = refusal_of(&f, "select", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+        asm.mov(4, 0);
+    });
+    assert_eq!(error.symbol(), Some("select"));
+    assert!(error.to_string().contains("indefinitely"), "{error}");
+}
+
+/// **The four network refusals name themselves, their argument, and the missing piece.**
+///
+/// Not just that they fail: each message has to carry the thing a reader three thousand
+/// initializers deep needs, which is *what is missing* rather than *that something is*.
+#[test]
+fn the_four_network_refusals_name_the_missing_piece() {
+    let _guard = serialized();
+    let f = fixture();
+
+    let error = refusal_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 1); // SOCK_STREAM
+        asm.mov(2, 0);
+    });
+    assert_eq!(error.symbol(), Some("socket"), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("AF_INET"), "the family, named: {text}");
+    assert!(text.contains("EAFNOSUPPORT"), "the wrong answer it declines: {text}");
+
+    let error = refusal_of(&f, "eventfd", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+    });
+    assert_eq!(error.symbol(), Some("eventfd"));
+    assert!(error.to_string().contains("descriptor"), "{error}");
+
+    let error = refusal_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+    });
+    assert_eq!(error.symbol(), Some("getaddrinfo"));
+    let text = error.to_string();
+    assert!(text.contains("GUEST memory"), "where the answer would have to live: {text}");
+
+    let error = refusal_of(&f, "freeaddrinfo", |asm| {
+        asm.mov(0, 0x1234);
+    });
+    assert_eq!(error.symbol(), Some("freeaddrinfo"));
+    assert!(error.to_string().contains("void"), "{error}");
+}
+
+/// **The descriptor space `poll` and `select` answer over is closed, asserted mechanically.**
+///
+/// This is the paragraph to invalidate, written as a test. `poll` reports every open descriptor
+/// as ready because every descriptor in this runtime is a regular file, a directory or a standard
+/// stream — and that is true only while nothing binds a symbol that produces a descriptor which
+/// can block. The day a phase binds `socket`, `eventfd`, `pipe` or `epoll_create` for real, this
+/// fails, and `net`'s always-ready rule has to grow a real readiness source with it.
+#[test]
+fn the_descriptor_space_poll_answers_over_is_closed() {
+    let bound: std::collections::BTreeSet<&str> = Bionic::bound_symbols().collect();
+    // Every POSIX symbol that hands out a descriptor, whether or not it is in the reachable 188.
+    let descriptor_makers = [
+        "accept", "accept4", "creat", "dup", "dup2", "dup3", "epoll_create", "epoll_create1",
+        "eventfd", "inotify_init", "inotify_init1", "memfd_create", "open", "openat", "__open_2",
+        "opendir", "pipe", "pipe2", "signalfd", "socket", "socketpair", "timerfd_create",
+    ];
+    let present: Vec<&str> =
+        descriptor_makers.iter().copied().filter(|s| bound.contains(s)).collect();
+    assert_eq!(
+        present,
+        vec!["eventfd", "open", "__open_2", "opendir", "socket"],
+        "a symbol that produces a descriptor was bound without `poll` being told about it"
+    );
+    // And of those five, the two that would produce a descriptor which can block are refusals —
+    // asserted by calling them, because a comment saying so is not a fact.
+    let _guard = serialized();
+    let f = fixture();
+    for symbol in ["socket", "eventfd"] {
+        let error = refusal_of(&f, symbol, |asm| {
+            asm.mov(0, 2);
+            asm.mov(1, 1);
+            asm.mov(2, 0);
+        });
+        assert!(
+            matches!(error, AbiError::Refused { .. }),
+            "`{symbol}` must refuse for `poll`'s always-ready rule to hold: {error:?}"
+        );
+    }
+}
+
+// =================================================================== phase 3e: the last four
+//
+// `time`, `clock`, `mallinfo`, `longjmp`. The other two of the six — `__gcov_dump` and
+// `__gcov_flush` — are not bound at all: they are declared **absent**, and
+// `crates/omni-android/tests/libroblox.rs` asserts that against the real library.
+
+/// **`time` is the same wall clock `gettimeofday` reads**, and it writes its argument.
+///
+/// A guest that called both and compared them would otherwise be able to see two clocks where a
+/// device has one. The `tloc` write is checked against a sentinel, because a handler that
+/// returned the right value and wrote nothing is the failure this test exists for.
+#[test]
+fn time_is_the_same_wall_clock_gettimeofday_reads_and_writes_its_argument() {
+    let _guard = serialized();
+    let f = fixture();
+    let tloc = f.guest.data + 0x100;
+    f.guest.write_u64(tloc, 0xDEAD_BEEF_DEAD_BEEF);
+
+    let returned = value_of(&f, "time", |asm| {
+        asm.mov(0, tloc as u64);
+    }) as i64;
+    // 2020-01-01 .. 2100-01-01, the same bound `omni_platform::clock`'s own test uses: wide
+    // enough that only a wrong unit or a wrong epoch can fail it.
+    assert!((1_577_836_800..4_102_444_800).contains(&returned), "time() returned {returned}");
+    assert_eq!(f.guest.read_u64(tloc) as i64, returned, "tloc receives what was returned");
+
+    // The same second, through a different symbol.
+    let tv = f.guest.data + 0x200;
+    let ok = value_of(&f, "gettimeofday", |asm| {
+        asm.mov(0, tv as u64);
+        asm.mov(1, 0);
+    });
+    assert_eq!(ok, 0);
+    let from_gettimeofday = f.guest.read_u64(tv) as i64;
+    assert!(
+        (from_gettimeofday - returned).abs() <= 2,
+        "time() said {returned} and gettimeofday() said {from_gettimeofday}: two clocks where a \
+         device has one"
+    );
+
+    // A null `tloc` is the ordinary form and must not fault.
+    let again = value_of(&f, "time", |asm| {
+        asm.mov(0, 0);
+    }) as i64;
+    assert!(again >= returned, "the wall clock does not run backwards over one test");
+}
+
+/// A `tloc` this guest cannot write is a typed refusal, and the call does **not** report a time.
+#[test]
+fn time_with_an_unwritable_tloc_refuses_rather_than_reporting_a_time_it_did_not_store() {
+    let _guard = serialized();
+    let f = fixture();
+    let error = refusal_of(&f, "time", |asm| {
+        asm.mov(0, f.guest.readonly as u64);
+    });
+    assert_eq!(error.symbol(), Some("time"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+}
+
+/// **`clock` is process CPU time in microseconds, and it advances with real guest work.**
+///
+/// Two assertions here, one per way this symbol can be plausibly wrong *at the guest boundary*.
+/// It must advance under work the translator really executed, which is what a constant or a
+/// zero fails. And it must be small enough that it cannot be a wall-clock timestamp scaled to
+/// microseconds — this process has run for seconds, not for fifty-six years — which is what a
+/// `realtime_now` mistake fails.
+///
+/// **The wall-versus-CPU discrimination is not made here, and that is deliberate.** It belongs to
+/// the primitive rather than to the binding, it needs several threads burning one interval of
+/// wall time to be made without flaking, and it is made once in
+/// `omni_platform::process`'s own suite — Global Constraint 14: a measured quantity appears once.
+/// A first attempt at it *here* asserted "a sleep charges no CPU", which is true of a thread
+/// clock and false of the process clock this reports; it failed in the whole-workspace run, where
+/// other tests were executing during the sleep (MEASURED: 93.75 ms charged across a 50 ms sleep).
+#[test]
+fn clock_is_process_cpu_time_in_microseconds_rather_than_wall_time() {
+    let _guard = serialized();
+    let f = fixture();
+    let first = value_of(&f, "clock", |_asm| {}) as i64;
+    assert!(first >= 0, "clock() returned {first}");
+    assert!(
+        first < 60 * 60 * 24 * 1_000_000,
+        "clock() returned {first} microseconds, which is more than a day of CPU: that is a wall \
+         clock, not a process clock"
+    );
+
+    // Real work, in the guest: a loop of a few million instructions through the translator.
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, 3_000_000);
+    asm.push(subs_imm(0, 0, 1));
+    asm.push(b_cond(1, -1)); // b.ne back one instruction
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    let after_work = value_of(&f, "clock", |_asm| {}) as i64;
+    assert!(
+        after_work > first,
+        "three million guest instructions moved the process CPU clock not at all: {first} -> \
+         {after_work}"
+    );
+
+    // It never goes backwards across two calls through the boundary.
+    let last = value_of(&f, "clock", |_asm| {}) as i64;
+    assert!(last >= after_work, "process CPU time went backwards: {after_work} -> {last}");
+}
+
+/// **`clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` answers, and the thread clock still refuses.**
+///
+/// The correction to D22, asserted in both directions. Answering the process clock is now
+/// required — refusing it would mean this layer gave two different answers to one question, since
+/// `clock()` reports the figure — and answering the *thread* clock is still forbidden, because
+/// the process figure would report every thread as having consumed the whole program's CPU.
+#[test]
+fn the_process_cpu_clock_is_answered_and_the_thread_cpu_clock_is_still_refused() {
+    let _guard = serialized();
+    let f = fixture();
+    let ts = f.guest.data + 0x100;
+    f.guest.write_u64(ts, 0xDEAD_BEEF);
+    f.guest.write_u64(ts + 8, 0xDEAD_BEEF);
+
+    let ok = value_of(&f, "clock_gettime", |asm| {
+        asm.mov(0, CLOCK_PROCESS_CPUTIME_ID);
+        asm.mov(1, ts as u64);
+    });
+    assert_eq!(ok, 0);
+    let seconds = f.guest.read_u64(ts) as i64;
+    let nanos = f.guest.read_u64(ts + 8) as i64;
+    assert!((0..86_400).contains(&seconds), "{seconds} seconds of process CPU time");
+    assert!((0..1_000_000_000).contains(&nanos), "tv_nsec must be normalised: {nanos}");
+
+    // It must agree with `clock()`, which is the whole reason the refusal had to go.
+    let from_clock = value_of(&f, "clock", |_asm| {}) as i64;
+    let from_clock_gettime = seconds * 1_000_000 + nanos / 1_000;
+    assert!(
+        (from_clock - from_clock_gettime).abs() < 5_000_000,
+        "clock() said {from_clock} microseconds and clock_gettime said {from_clock_gettime}: one \
+         question, two answers"
+    );
+
+    // And the thread clock, which is a different fact this layer does not have.
+    let error = refusal_of(&f, "clock_gettime", |asm| {
+        asm.mov(0, CLOCK_THREAD_CPUTIME_ID);
+        asm.mov(1, ts as u64);
+    });
+    assert_eq!(error.symbol(), Some("clock_gettime"));
+    let text = error.to_string();
+    assert!(text.contains("CLOCK_THREAD_CPUTIME_ID"), "{text}");
+    assert!(text.contains("GetThreadTimes"), "it must name the missing primitive: {text}");
+}
+
+/// **`mallinfo` refuses, and its refusal names the heap that is not there.**
+///
+/// The one reachable import that returns through `X8`, and the refusal reports that register's
+/// value — so a reader can see the guest really did pass a result buffer and that the marshalling
+/// is not what failed.
+#[test]
+fn mallinfo_refuses_and_names_the_allocator_that_is_not_here() {
+    let _guard = serialized();
+    let f = fixture();
+    let out = f.guest.data + 0x500;
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    // `X8` is the indirect result register: the caller allocates the 80 bytes and passes their
+    // address there. Nothing else in the reachable set does this.
+    asm.mov(8, out as u64);
+    asm.bl(f.thunk("mallinfo"));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    let error = match f.run(&mut cpu, entry) {
+        Err(error) => error,
+        Ok(exit) => panic!("mallinfo completed with {exit:?}"),
+    };
+    assert_eq!(error.symbol(), Some("mallinfo"), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains(&format!("{out:#x}")), "the X8 the guest passed, read back: {text}");
+    assert!(text.contains("imports no allocator"), "{text}");
+    // And nothing was written into the result buffer.
+    assert_eq!(f.guest.read_u64(out), 0, "a refused mallinfo must not write a fictional zero");
+}
+
+/// **`longjmp` refuses**, and the refusal names what restoring a `jmp_buf` would take.
+///
+/// It also states the `val` the matching `setjmp` would have seen, including C's rule that a zero
+/// is delivered as one — the one part of this function's contract that can be honoured without
+/// restoring anything, and worth carrying because it is the value a reader will be looking for.
+#[test]
+fn longjmp_refuses_and_names_what_restoring_a_jmp_buf_would_take() {
+    let _guard = serialized();
+    let f = fixture();
+    let env = f.guest.data + 0x100;
+    let error = refusal_of(&f, "longjmp", |asm| {
+        asm.mov(0, env as u64);
+        asm.mov(1, 0);
+    });
+    assert_eq!(error.symbol(), Some("longjmp"), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("X19-X28"), "the registers it would restore: {text}");
+    assert!(text.contains("delivering 1"), "C's zero-becomes-one rule: {text}");
+    assert!(text.contains("setjmp"), "and that nothing here can have filled the jmp_buf: {text}");
 }
