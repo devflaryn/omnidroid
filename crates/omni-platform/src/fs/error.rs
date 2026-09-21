@@ -57,6 +57,18 @@ pub enum FsErrorKind {
     BadDescriptor,
     /// A path, or one component of it, is longer than the guest's own limit — `ENAMETOOLONG`.
     NameTooLong,
+    /// The call would have had to wait — `EAGAIN`, which on Linux is `EWOULDBLOCK`.
+    ///
+    /// **Produced by pipes and by nothing else here**, because a pipe is the only thing on this
+    /// seam whose readiness depends on another descriptor. It is reported for a *blocking*
+    /// descriptor as well as a non-blocking one: this seam never waits, and the caller decides
+    /// what a blocking descriptor does about it (see [`pipe`](super::pipe)).
+    WouldBlock,
+    /// A write to a pipe whose every read end is closed — `EPIPE`.
+    ///
+    /// On a device this also raises `SIGPIPE`. There is no signal delivery in this runtime
+    /// (D24), so the errno is the whole of what the guest receives.
+    BrokenPipe,
     /// The host reported a failure [`std::io::ErrorKind`] does not classify.
     ///
     /// **Not mapped to an errno by the caller.** See the module documentation: a call that fails
@@ -83,6 +95,8 @@ impl FsErrorKind {
             FsErrorKind::ReadOnlyFilesystem => "read-only filesystem",
             FsErrorKind::BadDescriptor => "bad file descriptor",
             FsErrorKind::NameTooLong => "file name too long",
+            FsErrorKind::WouldBlock => "resource temporarily unavailable",
+            FsErrorKind::BrokenPipe => "broken pipe",
             FsErrorKind::Other => "an unclassified host error",
         }
     }
@@ -105,6 +119,8 @@ impl FsErrorKind {
             K::StorageFull => FsErrorKind::StorageFull,
             K::FileTooLarge => FsErrorKind::FileTooLarge,
             K::ReadOnlyFilesystem => FsErrorKind::ReadOnlyFilesystem,
+            K::WouldBlock => FsErrorKind::WouldBlock,
+            K::BrokenPipe => FsErrorKind::BrokenPipe,
             _ => FsErrorKind::Other,
         }
     }
@@ -261,6 +277,8 @@ mod tests {
             FsErrorKind::ReadOnlyFilesystem,
             FsErrorKind::BadDescriptor,
             FsErrorKind::NameTooLong,
+            FsErrorKind::WouldBlock,
+            FsErrorKind::BrokenPipe,
             FsErrorKind::Other,
         ];
         let mut names: Vec<&str> = all.iter().map(|k| k.as_str()).collect();

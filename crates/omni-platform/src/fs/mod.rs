@@ -63,9 +63,11 @@
 
 mod error;
 pub mod path;
+pub mod pipe;
 
 pub use error::{FsError, FsErrorKind, FsResult};
 pub use path::{FinalLink, Resolved, NAME_MAX, PATH_MAX};
+pub use pipe::{PipeEnd, Readiness, ReadyGate, PIPE_BUF, PIPE_CAPACITY};
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -89,7 +91,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The lowest descriptor number [`Filesystem::open`] hands out.
@@ -318,6 +320,31 @@ enum Entry {
     /// [`crate::process::random_bytes`] already provides, and it is not a path that can be
     /// confined into a host directory because it is not a file.
     Device(Device),
+    /// One end of a pipe — the first kind here whose readiness depends on another descriptor.
+    ///
+    /// See [`pipe`]. It is in this table rather than in a namespace of its own because `poll` and
+    /// `select` observe one descriptor space, and two allocators can hand out the same number.
+    Pipe(pipe::PipeHandle),
+}
+
+impl Entry {
+    /// What this descriptor would do right now.
+    ///
+    /// **A total function over the table**, which is the successor to the argument
+    /// `omni-android`'s `net` module used to make: `poll` reported every open descriptor as ready
+    /// because every descriptor was a regular file, a directory or a standard stream, and that
+    /// stopped being true the moment `pipe` was bound. Making readiness a `match` with no default
+    /// arm means a sixth kind cannot be added without deciding its answer.
+    fn readiness(&self) -> Readiness {
+        match self {
+            // A regular file, a directory, a character device and a standard stream can none of
+            // them block. `Readiness::ALWAYS` says why that is Linux's answer too.
+            Entry::File { .. } | Entry::Directory { .. } | Entry::Standard(_) | Entry::Device(_) => {
+                Readiness::ALWAYS
+            }
+            Entry::Pipe(handle) => handle.readiness(),
+        }
+    }
 }
 
 /// A character device the guest can open by its POSIX path.
@@ -436,6 +463,9 @@ struct DirStream {
 pub struct Filesystem {
     root: PathBuf,
     table: Mutex<Table>,
+    /// Rises whenever any pipe in this instance changes state. See [`pipe::ReadyGate`]: it is how
+    /// a caller waits for readiness without this seam ever choosing how long to wait.
+    gate: Arc<ReadyGate>,
 }
 
 #[derive(Debug)]
@@ -489,6 +519,7 @@ impl Filesystem {
                 dirs: BTreeMap::new(),
                 next_dir: 1,
             }),
+            gate: Arc::new(ReadyGate::default()),
         })
     }
 
@@ -641,6 +672,131 @@ impl Filesystem {
         self.table().open.contains_key(&fd)
     }
 
+    // ---------------------------------------------------------------- pipes and readiness
+
+    /// `pipe(2)`: a read end and a write end, in that order.
+    ///
+    /// **Both descriptors are allocated or neither is.** A `pipe` that took the last free slot
+    /// for its read end and then failed on its write end would leave the guest a descriptor it
+    /// never learned the number of, which is a leak it cannot close.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::TooManyOpenFiles`] when two more descriptors would take this instance past
+    /// [`MAX_OPEN_FILES`].
+    pub fn pipe(&self) -> FsResult<(i32, i32)> {
+        const OP: &str = "pipe";
+        let mut table = self.table();
+        if table.open.len() + 2 > MAX_OPEN_FILES {
+            return Err(FsError::kinded(
+                OP,
+                "a pipe",
+                FsErrorKind::TooManyOpenFiles,
+                format!(
+                    "this guest instance holds {} of {MAX_OPEN_FILES} descriptors and a pipe \
+                     needs two more",
+                    table.open.len()
+                ),
+            ));
+        }
+        let (read_end, write_end) = pipe::create(Arc::clone(&self.gate));
+        let read_fd = table.lowest_free_fd();
+        table.open.insert(read_fd, Entry::Pipe(read_end));
+        let write_fd = table.lowest_free_fd();
+        table.open.insert(write_fd, Entry::Pipe(write_end));
+        Ok((read_fd, write_fd))
+    }
+
+    /// What `fd` would do right now, as `poll` and `select` ask it.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold.
+    pub fn readiness(&self, fd: i32) -> FsResult<Readiness> {
+        match self.table().open.get(&fd) {
+            None => Err(bad_fd("readiness", fd)),
+            Some(entry) => Ok(entry.readiness()),
+        }
+    }
+
+    /// Whether `fd` is one end of a pipe, and which end.
+    ///
+    /// `None` for every other kind, including a descriptor that is not open — a caller that needs
+    /// to distinguish those two asks [`is_open`](Self::is_open).
+    #[must_use]
+    pub fn pipe_end(&self, fd: i32) -> Option<PipeEnd> {
+        match self.table().open.get(&fd) {
+            Some(Entry::Pipe(handle)) => Some(handle.end()),
+            _ => None,
+        }
+    }
+
+    /// Whether `O_NONBLOCK` is set on `fd`.
+    ///
+    /// Only a pipe can carry the flag here, because only a pipe can block. For every other kind
+    /// this answers `false`, which is the truth rather than a default: a regular file is never
+    /// non-blocking because it never blocks.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold.
+    pub fn is_nonblocking(&self, fd: i32) -> FsResult<bool> {
+        match self.table().open.get(&fd) {
+            None => Err(bad_fd("is_nonblocking", fd)),
+            Some(Entry::Pipe(handle)) => Ok(handle.nonblocking()),
+            Some(_) => Ok(false),
+        }
+    }
+
+    /// Set or clear `O_NONBLOCK` on `fd`.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold, and
+    /// [`FsError::Refused`] for one that cannot carry the flag. **Refused rather than ignored**:
+    /// a caller that set `O_NONBLOCK` on a regular file and was told it worked would believe a
+    /// read could report `EAGAIN`, and this seam would never produce one.
+    pub fn set_nonblocking(&self, fd: i32, nonblocking: bool) -> FsResult<()> {
+        const OP: &str = "set_nonblocking";
+        let mut table = self.table();
+        match table.open.get_mut(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::Pipe(handle)) => {
+                handle.set_nonblocking(nonblocking);
+                Ok(())
+            }
+            // A file, a directory, a device and a standard stream all answer `Readiness::ALWAYS`,
+            // so `O_NONBLOCK` on one is a request with nothing to change. Linux accepts it there;
+            // this seam does not pretend to, because accepting it would be this layer claiming a
+            // behaviour it cannot produce.
+            Some(_) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "O_NONBLOCK is only meaningful on a descriptor that can block, and the only kind \
+                 here that can is a pipe",
+            )),
+        }
+    }
+
+    /// The readiness generation, read **before** testing readiness so that a change arriving
+    /// between the test and the wait cannot be missed.
+    #[must_use]
+    pub fn ready_generation(&self) -> u64 {
+        self.gate.generation()
+    }
+
+    /// Wait until some pipe in this instance changes state, or until `timeout` elapses.
+    ///
+    /// Returns whether anything changed. `seen` is a generation from
+    /// [`ready_generation`](Self::ready_generation) taken before the caller tested readiness.
+    ///
+    /// **The caller supplies the bound and there is no overload that does not.** D16's
+    /// runaway-guest defence is built from step budgets a sleeping thread does not consume, so how
+    /// long a guest may block is the adapter's policy, not this seam's.
+    pub fn wait_for_readiness(&self, seen: u64, timeout: Duration) -> bool {
+        self.gate.wait(seen, timeout)
+    }
+
     /// How many descriptors this instance holds, standard streams included.
     #[must_use]
     pub fn open_count(&self) -> usize {
@@ -704,6 +860,12 @@ impl Filesystem {
                     Ok(buf.len())
                 }
             },
+            // **Holding the table lock across a pipe operation is safe because nothing in `pipe`
+            // waits.** The lock order is one edge — the table, then that pipe's own state, then
+            // the ready gate — and no path takes them the other way round: a thread waiting for
+            // readiness holds only the gate. See `pipe`'s module documentation for why the wait
+            // belongs to the caller and not to this seam.
+            Some(Entry::Pipe(handle)) => handle.read(buf),
             Some(Entry::File { file, readable, guest, .. }) => {
                 if !*readable {
                     return Err(FsError::kinded(
@@ -746,6 +908,14 @@ impl Filesystem {
                 format!("fd {fd}"),
                 FsErrorKind::InvalidInput,
                 "a standard stream is a pipe: it has no offset to read at (ESPIPE)",
+            )),
+            // `ESPIPE` for real this time, and for the reason the arm above borrows: a pipe is a
+            // queue and there is no position in it to read from.
+            Some(Entry::Pipe(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a pipe has no offset to read at (ESPIPE)",
             )),
             Some(Entry::Directory { guest, .. }) => Err(FsError::kinded(
                 OP,
@@ -808,6 +978,8 @@ impl Filesystem {
                 FsErrorKind::IsADirectory,
                 "a directory descriptor cannot be written",
             )),
+            // See the note in `read`: one lock order, and nothing in `pipe` waits.
+            Some(Entry::Pipe(handle)) => handle.write(buf),
             Some(Entry::File { file, writable, guest, .. }) => {
                 if !*writable {
                     return Err(FsError::kinded(
@@ -930,6 +1102,23 @@ impl Filesystem {
                     STDIN_FD => "/dev/stdin",
                     STDOUT_FD => "/dev/stdout",
                     _ => "/dev/stderr",
+                })),
+            }),
+            // A FIFO, which is what `S_ISFIFO` tests for and what `fstat` on a pipe reports on a
+            // device. **The size is the bytes currently buffered**, which is what Linux puts in
+            // `st_size` for a pipe — not zero, and not the capacity. The identity distinguishes
+            // the two ends, because they are two descriptions of one object and a guest that
+            // compared them is entitled to see that they differ.
+            Some(Entry::Pipe(handle)) => Ok(FileStat {
+                kind: FileKind::Other,
+                size: handle.pipe().buffered() as u64,
+                read_only: handle.end() == PipeEnd::Read,
+                accessed: None,
+                modified: None,
+                created: None,
+                identity: identity(Path::new(match handle.end() {
+                    PipeEnd::Read => "/proc/self/fd/pipe:read",
+                    PipeEnd::Write => "/proc/self/fd/pipe:write",
                 })),
             }),
             Some(Entry::Directory { host, .. }) => {
@@ -1899,6 +2088,241 @@ mod tests {
                 path::display(path)
             );
         }
+    }
+
+    // ============================================================== pipes
+
+    /// Bytes go in one end and come out of the other, in order, and the queue empties.
+    #[test]
+    fn a_pipe_carries_bytes_from_the_write_end_to_the_read_end_in_order() {
+        let scratch = Scratch::new("pipe-roundtrip");
+        let fs = scratch.fs();
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+        assert!(read_fd >= FIRST_FD && write_fd > read_fd, "{read_fd} and {write_fd}");
+        assert_eq!(fs.pipe_end(read_fd), Some(PipeEnd::Read));
+        assert_eq!(fs.pipe_end(write_fd), Some(PipeEnd::Write));
+
+        assert_eq!(fs.write(write_fd, b"abc").expect("write"), 3);
+        assert_eq!(fs.write(write_fd, b"de").expect("write"), 2);
+        let mut buf = [0u8; 8];
+        assert_eq!(fs.read(read_fd, &mut buf).expect("read"), 5);
+        assert_eq!(&buf[..5], b"abcde", "the bytes arrive in the order they were written");
+        // And the queue is empty again, which `fstat`'s size reports.
+        assert_eq!(fs.fstat(read_fd).expect("fstat").size, 0);
+    }
+
+    /// The ends are not interchangeable: reading the write end and writing the read end both fail.
+    #[test]
+    fn each_end_of_a_pipe_refuses_the_other_ends_operation() {
+        let scratch = Scratch::new("pipe-ends");
+        let fs = scratch.fs();
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+        let mut buf = [0u8; 4];
+        let error = fs.read(write_fd, &mut buf).expect_err("the write end is not readable");
+        assert_eq!(error.kind(), Some(FsErrorKind::BadDescriptor), "{error}");
+        let error = fs.write(read_fd, b"x").expect_err("the read end is not writable");
+        assert_eq!(error.kind(), Some(FsErrorKind::BadDescriptor), "{error}");
+    }
+
+    /// An empty pipe with a live writer reports `WouldBlock`; this seam never waits.
+    #[test]
+    fn an_empty_pipe_reports_would_block_rather_than_waiting() {
+        let scratch = Scratch::new("pipe-empty");
+        let fs = scratch.fs();
+        let (read_fd, _write_fd) = fs.pipe().expect("a pipe");
+        let mut buf = [0u8; 4];
+        let error = fs.read(read_fd, &mut buf).expect_err("nothing has been written");
+        assert_eq!(error.kind(), Some(FsErrorKind::WouldBlock), "{error}");
+    }
+
+    /// **The clause end-of-file depends on.** With every write end closed, the read end is
+    /// *readable* and reads zero — for ever, not once.
+    #[test]
+    fn a_pipe_whose_writers_have_all_closed_reads_end_of_file_and_reports_itself_readable() {
+        let scratch = Scratch::new("pipe-eof");
+        let fs = scratch.fs();
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+        assert_eq!(fs.write(write_fd, b"tail").expect("write"), 4);
+        fs.close(write_fd).expect("close the write end");
+
+        // The buffered bytes still come out: closing a writer does not discard them.
+        let mut buf = [0u8; 8];
+        assert_eq!(fs.read(read_fd, &mut buf).expect("read"), 4);
+        assert_eq!(&buf[..4], b"tail");
+
+        let readiness = fs.readiness(read_fd).expect("readiness");
+        assert!(
+            readiness.readable,
+            "a reader with no writers left must be readable, or a poll loop parks on it for ever"
+        );
+        assert!(readiness.hangup, "POLLHUP is what an emptied, writerless pipe reports");
+        // Twice, because end of file is a state and not an event.
+        assert_eq!(fs.read(read_fd, &mut buf).expect("read at EOF"), 0);
+        assert_eq!(fs.read(read_fd, &mut buf).expect("read at EOF again"), 0);
+    }
+
+    /// A write with no reader left is `EPIPE`, and the write end reports `POLLERR`.
+    #[test]
+    fn a_write_to_a_pipe_with_no_readers_is_a_broken_pipe() {
+        let scratch = Scratch::new("pipe-broken");
+        let fs = scratch.fs();
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+        fs.close(read_fd).expect("close the read end");
+        let error = fs.write(write_fd, b"x").expect_err("no reader is left");
+        assert_eq!(error.kind(), Some(FsErrorKind::BrokenPipe), "{error}");
+        let readiness = fs.readiness(write_fd).expect("readiness");
+        assert!(readiness.error, "POLLERR is what a writer with no readers reports");
+        assert!(!readiness.writable);
+    }
+
+    /// A full pipe takes **what fits** rather than refusing the whole write.
+    ///
+    /// The believable wrong answer here is `WouldBlock` whenever the whole buffer does not fit,
+    /// which makes a guest writing a large buffer spin against a pipe that is draining. POSIX
+    /// guarantees atomicity only up to [`PIPE_BUF`]; past it a write may be split.
+    #[test]
+    fn a_write_larger_than_the_free_space_takes_what_fits_and_says_how_much() {
+        let scratch = Scratch::new("pipe-full");
+        let fs = scratch.fs();
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+        let big = vec![0x5Au8; PIPE_CAPACITY + 4096];
+        assert_eq!(
+            fs.write(write_fd, &big).expect("write"),
+            PIPE_CAPACITY,
+            "a write past the capacity takes exactly the capacity"
+        );
+        assert!(!fs.readiness(write_fd).expect("readiness").writable, "the pipe is full");
+        let error = fs.write(write_fd, b"more").expect_err("the pipe is full");
+        assert_eq!(error.kind(), Some(FsErrorKind::WouldBlock), "{error}");
+
+        // Drain one byte and exactly one byte's worth of room appears.
+        let mut one = [0u8; 1];
+        assert_eq!(fs.read(read_fd, &mut one).expect("read"), 1);
+        assert!(fs.readiness(write_fd).expect("readiness").writable);
+        assert_eq!(fs.write(write_fd, b"more").expect("write into the freed byte"), 1);
+    }
+
+    /// `O_NONBLOCK` is carried by a pipe and **refused** on anything that cannot block.
+    #[test]
+    fn only_a_pipe_carries_o_nonblock_and_the_others_refuse_it_rather_than_ignoring_it() {
+        let scratch = Scratch::new("pipe-nonblock");
+        let fs = scratch.fs();
+        let (read_fd, _write_fd) = fs.pipe().expect("a pipe");
+        assert!(!fs.is_nonblocking(read_fd).expect("a pipe answers"));
+        fs.set_nonblocking(read_fd, true).expect("a pipe takes the flag");
+        assert!(fs.is_nonblocking(read_fd).expect("a pipe answers"));
+        fs.set_nonblocking(read_fd, false).expect("and gives it up");
+        assert!(!fs.is_nonblocking(read_fd).expect("a pipe answers"));
+
+        let fd = fs.open(b"/f.txt", write_flags()).expect("a file");
+        assert!(!fs.is_nonblocking(fd).expect("a file answers false"));
+        let error = fs.set_nonblocking(fd, true).expect_err("a file cannot block");
+        assert!(matches!(error, FsError::Refused { .. }), "{error}");
+        let error = fs.set_nonblocking(STDOUT_FD, true).expect_err("nor can a standard stream");
+        assert!(matches!(error, FsError::Refused { .. }), "{error}");
+    }
+
+    /// Readiness is a **total function over the table**: every kind answers, and the kinds that
+    /// cannot block answer `ALWAYS`.
+    ///
+    /// The successor to the closed-descriptor-space argument: `poll`'s old rule was "every open
+    /// descriptor is ready", and this is the rule that replaced it.
+    #[test]
+    fn every_descriptor_kind_answers_a_readiness_and_only_a_pipe_can_be_unready() {
+        let scratch = Scratch::new("pipe-total");
+        let fs = scratch.fs();
+        let file = fs.open(b"/f.txt", write_flags()).expect("a file");
+        let dir = fs
+            .open(b"/", OpenFlags { read: true, directory: true, ..OpenFlags::default() })
+            .expect("a directory");
+        let device = fs.open(b"/dev/null", read_flags()).expect("a device");
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+
+        for (what, fd) in [("a file", file), ("a directory", dir), ("a device", device),
+                           ("stdin", STDIN_FD), ("stdout", STDOUT_FD), ("stderr", STDERR_FD)] {
+            assert_eq!(
+                fs.readiness(fd).expect("every open descriptor answers"),
+                Readiness::ALWAYS,
+                "{what} cannot block, so it is always ready"
+            );
+        }
+        // The pipe is the one that is not.
+        assert!(!fs.readiness(read_fd).expect("readiness").readable, "an empty pipe is not readable");
+        assert!(fs.readiness(write_fd).expect("readiness").writable, "an empty pipe is writable");
+
+        let error = fs.readiness(4096).expect_err("a descriptor nobody opened");
+        assert_eq!(error.kind(), Some(FsErrorKind::BadDescriptor), "{error}");
+    }
+
+    /// The ready gate rises when a pipe changes and a waiter with a deadline gives up on time.
+    ///
+    /// **Structural rather than timed.** The assertion is on the generation counter and on the
+    /// boolean the wait returns, not on how long it took: `VERIFICATION.md` entry 6 is what a
+    /// timing assertion here would become.
+    #[test]
+    fn the_ready_gate_rises_on_a_write_and_a_bounded_wait_gives_up() {
+        let scratch = Scratch::new("pipe-gate");
+        let fs = scratch.fs();
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+
+        let before = fs.ready_generation();
+        assert!(
+            !fs.wait_for_readiness(before, Duration::from_millis(1)),
+            "nothing changed, so the wait reports no change"
+        );
+        assert_eq!(fs.ready_generation(), before, "and an expired wait changes nothing");
+
+        fs.write(write_fd, b"x").expect("write");
+        assert_ne!(fs.ready_generation(), before, "a write is a readiness change");
+        assert!(
+            fs.wait_for_readiness(before, Duration::from_millis(1)),
+            "a generation older than the current one returns immediately"
+        );
+
+        // And closing an end is a change too, which is what stops a waiter parking on a pipe
+        // that can never produce another byte.
+        let seen = fs.ready_generation();
+        let mut buf = [0u8; 4];
+        fs.read(read_fd, &mut buf).expect("drain");
+        let seen_after_drain = fs.ready_generation();
+        assert_ne!(seen_after_drain, seen, "a read frees room, which is a change for the writer");
+        fs.close(write_fd).expect("close the write end");
+        assert_ne!(fs.ready_generation(), seen_after_drain, "closing an end is a change");
+    }
+
+    /// A pipe needs two descriptors and takes neither when only one is free.
+    #[test]
+    fn a_pipe_is_all_or_nothing_against_the_descriptor_ceiling() {
+        let scratch = Scratch::new("pipe-ceiling");
+        let fs = scratch.fs();
+        // Three standard streams are already in the table; fill it to one short of the ceiling.
+        let mut held = Vec::new();
+        while fs.open_count() < MAX_OPEN_FILES - 1 {
+            held.push(fs.open(b"/dev/null", read_flags()).expect("a device descriptor"));
+        }
+        let at_ceiling = fs.open_count();
+        let error = fs.pipe().expect_err("one free slot is not two");
+        assert_eq!(error.kind(), Some(FsErrorKind::TooManyOpenFiles), "{error}");
+        assert_eq!(fs.open_count(), at_ceiling, "a refused pipe leaks no descriptor");
+
+        // One more freed slot and it fits exactly.
+        fs.close(held.pop().expect("a held descriptor")).expect("close");
+        let (read_fd, write_fd) = fs.pipe().expect("two free slots");
+        assert_eq!(fs.open_count(), MAX_OPEN_FILES);
+        assert_ne!(read_fd, write_fd);
+    }
+
+    /// `pread` on a pipe is `ESPIPE`, not a read from position zero.
+    #[test]
+    fn a_pipe_has_no_offset_to_pread_at() {
+        let scratch = Scratch::new("pipe-pread");
+        let fs = scratch.fs();
+        let (read_fd, write_fd) = fs.pipe().expect("a pipe");
+        fs.write(write_fd, b"abc").expect("write");
+        let mut buf = [0u8; 3];
+        let error = fs.pread(read_fd, &mut buf, 0).expect_err("a pipe has no offset");
+        assert_eq!(error.kind(), Some(FsErrorKind::InvalidInput), "{error}");
+        assert_eq!(buf, [0, 0, 0], "and it read nothing");
     }
 
     /// A root that is not a directory, or is not there, is refused when the filesystem is built.
