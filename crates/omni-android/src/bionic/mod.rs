@@ -1403,18 +1403,81 @@ mod tests {
             "the arena is {ARENA_BYTES} bytes against a commit granule of {granule}: eagerly \
              committing it is no longer free, and `Bionic::new`'s exception to D10 no longer holds"
         );
-        // And the four tables that make it up are each non-empty and in the order the accessors
-        // assume: thread blocks, pool, FILE objects, dirent slots.
-        assert_eq!(
-            ARENA_BYTES,
-            MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
-                + POOL_BYTES
-                + MAX_GUEST_FILES * FILE_BYTES
-                + MAX_GUEST_DIRS * DIRENT_BYTES
-        );
         // The two ceiling relations are compile-time assertions beside the constants they
         // relate, because both sides are constants; see `MAX_GUEST_DIRS` and the `const _` under
-        // it. What is left here is the one relation that is genuinely arithmetic over four of
-        // them.
+        // it. Whether the *accessors* agree with this arithmetic is a separate question and is
+        // the next test.
+    }
+
+    /// **The four tables are where the accessors say they are**, in order, adjacent, and inside
+    /// the arena.
+    ///
+    /// # This replaces an assertion that could not fail
+    ///
+    /// `the_arena_fits_in_one_commit_granule` used to end with
+    /// `assert_eq!(ARENA_BYTES, MAX_GUEST_THREADS * THREAD_BLOCK_BYTES + POOL_BYTES + ...)`,
+    /// which is a character-for-character restatement of [`ARENA_BYTES`]'s own definition. D23
+    /// claimed that test pinned "the four tables against the order the accessors assume"; it did
+    /// not, and **nothing did**. Swapping the bodies of [`Bionic::files_base`] and
+    /// [`Bionic::dirents_base`], or dropping [`POOL_BYTES`] from the first of them, left the
+    /// whole workspace suite passing while `fopen` handed out `FILE` objects on top of the pool's
+    /// interned strings. Found by an independent review of phase 3c, and it is the second time in
+    /// this project a *total* has been consistent while its *membership* was not.
+    ///
+    /// So this walks the bases **out of the accessors themselves** and checks that each region
+    /// starts exactly where the previous one ends and that the last one ends exactly at the end
+    /// of the arena. Restating the sum would reproduce the same defect one term wider, which is
+    /// why the sum is not restated here either: every address below is read back from the object.
+    #[test]
+    fn the_arena_tables_are_where_the_accessors_say_they_are() {
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let bionic = Bionic::new(space).expect("a bionic instance");
+
+        // Read out of the object, never recomputed: an accessor that disagrees with the layout is
+        // exactly what this is for.
+        let arena = bionic.arena();
+        let regions: [(&str, GuestAddr, usize); 4] = [
+            ("thread blocks", arena, MAX_GUEST_THREADS * THREAD_BLOCK_BYTES),
+            ("pool", bionic.pool(), POOL_BYTES),
+            ("FILE objects", bionic.files_base(), MAX_GUEST_FILES * FILE_BYTES),
+            ("dirent slots", bionic.dirents_base(), MAX_GUEST_DIRS * DIRENT_BYTES),
+        ];
+
+        let mut cursor = arena;
+        for (name, start, len) in regions {
+            assert!(len > 0, "the {name} table is empty, so nothing can come out of it");
+            assert_eq!(
+                start, cursor,
+                "the {name} table starts at {start:#x} and the previous one ends at                  {cursor:#x}: the accessors and the layout disagree, so two tables overlap or a                  gap of the arena is unreachable"
+            );
+            cursor += len;
+        }
+        assert_eq!(
+            cursor,
+            arena + ARENA_BYTES,
+            "the four tables do not fill the arena exactly: {} bytes of it are named by no              accessor, or an accessor names memory past its end",
+            (arena + ARENA_BYTES).abs_diff(cursor)
+        );
+
+        // And the two objects the guest is actually handed come out of the tables they belong
+        // to, rather than out of whatever the arithmetic happened to produce. `open_stream` and
+        // `attach_dir` are the only two allocators over these tables.
+        let mem = GuestMem::new(Arc::clone(&bionic.space));
+        let state = Active {
+            bionic: Arc::clone(&bionic),
+            thread: GuestThreadId(1),
+            block: arena,
+        };
+        let view = GuestView::new(&mem, "fopen", arena, &state);
+        let file = bionic.open_stream(&view, 3).expect("a FILE object").expect("a free slot");
+        assert!(
+            file >= bionic.files_base() && file + FILE_BYTES <= bionic.dirents_base(),
+            "a FILE object at {file:#x} is outside the FILE table"
+        );
+        let dir = bionic.attach_dir(7).expect("a dirent slot");
+        assert!(
+            dir >= bionic.dirents_base() && dir + DIRENT_BYTES <= arena + ARENA_BYTES,
+            "a dirent slot at {dir:#x} is outside the dirent table"
+        );
     }
 }

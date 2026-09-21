@@ -3448,6 +3448,93 @@ fn hostile_arguments_to_the_clock_and_process_group_are_typed_errors_and_not_pan
     }
 }
 
+/// **Hostile arguments to every symbol phase 3c binds**, including the ones that create threads.
+///
+/// A guest that creates threads is a new hostile surface, and the shapes are its own: a null or
+/// wild `pthread_t *`, an attribute object that is not readable, a `pthread_t` nobody handed out,
+/// and a `sigset_t` that is not writable. Every one of them has to be a typed error naming the
+/// symbol or a defined return, never a host access violation and never a panic.
+///
+/// **No thread host here**, deliberately: this fixture cannot create a thread at all, so every
+/// `pthread_create` case exercises the argument handling and the refusal rather than spawning 30
+/// host threads with wild arguments. The cases that need a live thread are the tests above.
+#[test]
+fn hostile_arguments_to_the_thread_and_signal_group_are_typed_errors_and_not_panics() {
+    let _guard = serialized();
+    let f = fixture();
+    let wild = f.guest.unmapped as u64;
+    let readonly = f.guest.readonly as u64;
+
+    let cases: &[(&str, &[u64])] = &[
+        // `pthread_create(thread, attr, start, arg)`
+        ("pthread_create", &[0, 0, 1, 0]),
+        ("pthread_create", &[wild, 0, 1, 0]),
+        ("pthread_create", &[u64::MAX, 0, 1, 0]),
+        ("pthread_create", &[readonly, 0, 1, 0]),
+        ("pthread_create", &[0, 0, 0, 0]),
+        ("pthread_create", &[wild, wild, wild, wild]),
+        ("pthread_create", &[u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
+        // `pthread_join(thread, retval)`
+        ("pthread_join", &[0, 0]),
+        ("pthread_join", &[u64::MAX, 0]),
+        ("pthread_join", &[0, wild]),
+        ("pthread_join", &[u64::MAX, u64::MAX]),
+        ("pthread_join", &[0xDEAD_BEEF, readonly]),
+        // `pthread_detach(thread)`
+        ("pthread_detach", &[0]),
+        ("pthread_detach", &[u64::MAX]),
+        // `pthread_getschedparam(thread, policy, param)`
+        ("pthread_getschedparam", &[0, 0, 0]),
+        ("pthread_getschedparam", &[u64::MAX, wild, wild]),
+        ("pthread_getschedparam", &[0xDEAD_BEEF, u64::MAX, u64::MAX]),
+        // the signal family
+        ("sigfillset", &[0]),
+        ("sigfillset", &[wild]),
+        ("sigfillset", &[u64::MAX]),
+        ("sigfillset", &[u64::MAX - 4]),
+        ("sigfillset", &[readonly]),
+        ("sigaction", &[0, 0, 0]),
+        ("sigaction", &[u64::MAX, wild, wild]),
+        ("raise", &[0]),
+        ("raise", &[u64::MAX]),
+        ("pthread_sigmask", &[u64::MAX, wild, wild]),
+        ("pthread_sigmask", &[0, 0, 0]),
+    ];
+
+    for (symbol, args) in cases {
+        let entry = call_one(&f, symbol, |asm| {
+            for (index, value) in args.iter().enumerate() {
+                asm.mov(index as u32, *value);
+            }
+        });
+        let mut cpu = f.guest.thread(&f.boundary);
+        match f.run(&mut cpu, entry) {
+            Ok(exit) => {
+                assert!(
+                    matches!(exit, ExitReason::Returned { .. }),
+                    "`{symbol}` {args:x?}: {exit:?}"
+                );
+                let code = f.guest.read_u64(f.guest.data) as i64 as i32;
+                // The pthread functions return their error as the value, so the defined set here
+                // is wider than the errno group's: 0, -1, or one of the four POSIX numbers this
+                // group answers with. Anything else is a number nobody decided on.
+                assert!(
+                    code == 0 || code == -1 || [3, 11, 22, 35].contains(&code),
+                    "`{symbol}` {args:x?} completed with {code}, which is neither a success nor \
+                     a defined failure"
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.symbol(), Some(*symbol), "{error:?}");
+                assert!(error.guest_address().is_some(), "{error}");
+            }
+        }
+    }
+    // Nothing above may have created a thread: the fixture has no thread host at all.
+    assert_eq!(f.bionic.guest_thread_records(), 0);
+    assert!(f.bionic.guest_thread_failures().is_empty());
+}
+
 // =================================================================== phase 3b: files
 
 /// A host directory that removes itself, for the guest's filesystem root.
