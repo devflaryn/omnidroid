@@ -385,9 +385,24 @@ mod tests {
     /// wrapped and produced a time of day from nonsense. The whole workspace suite runs
     /// `--release`, which is exactly why it never saw it.
     ///
-    /// The boundaries are enumerated rather than sampled: the two extremes, the two values one
-    /// step inside them, and the two day boundaries nearest `i64::MIN`, because the overflow is a
-    /// property of the multiplication rather than of any particular date.
+    /// **This is a sample, not an enumeration, and it is not the detector for the wrap.** An
+    /// earlier version of this comment claimed otherwise; a review found the claim false and the
+    /// test nearly empty, so both are written down here.
+    ///
+    /// Why the wrap cannot be caught from a return value: `days * SECONDS_PER_DAY` can only exceed
+    /// `i64` near `i64::MIN`, where the floor pushes the product below the input by up to
+    /// `SECONDS_PER_DAY - 1`. Every such timestamp falls in a year around -2.9e11, so
+    /// `i32::try_from(year - 1900)` refuses it **whatever `second_of_day` holds**. In a release
+    /// build the product wraps, the garbage is discarded by that refusal, and the observable
+    /// behaviour is correct by accident. So no assertion here can see it.
+    ///
+    /// The detector is the **debug** build's panic on the multiplication, and the thing that runs
+    /// this in debug is `tools/mutate.py`. Row `time-A7` restores the unchecked expression for
+    /// exactly that reason; without the row, nothing at all detects a regression.
+    ///
+    /// What this test does assert is the total function: every `i64` returns, none panics, an `Ok`
+    /// carries fields inside their ranges, and an `Err` carries a year that genuinely does not fit
+    /// — that last one so the refusal arm cannot be satisfied by refusing everything.
     #[test]
     fn no_timestamp_at_all_can_make_this_panic_or_wrap() {
         let edges = [
@@ -415,7 +430,14 @@ mod tests {
                     assert!((1..=31).contains(&tm.mday), "{timestamp}: day {}", tm.mday);
                     assert!((0..12).contains(&tm.mon), "{timestamp}: month {}", tm.mon);
                 }
-                Err(GmtimeError::YearOutOfRange { .. }) => {}
+                // NOT an empty arm. Six of the ten edges land here, and an empty arm would let
+                // this whole test pass against an implementation that refused every input.
+                Err(GmtimeError::YearOutOfRange { year }) => {
+                    assert!(
+                        i32::try_from(year - 1900).is_err(),
+                        "{timestamp}: refused with year {year}, which does fit `int tm_year` —                          a refusal is only correct when the year is genuinely out of range",
+                    );
+                }
             }
         }
     }

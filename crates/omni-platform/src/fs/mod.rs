@@ -1294,9 +1294,29 @@ mod tests {
         let made = std::os::windows::fs::symlink_file(outer.0.join("secret.txt"), &link).is_ok();
         #[cfg(unix)]
         let made = std::os::unix::fs::symlink(outer.0.join("secret.txt"), &link).is_ok();
+        // A file symlink needs SeCreateSymbolicLinkPrivilege, which an unelevated Windows session
+        // without Developer Mode does not have -- MEASURED on this host: `WinError 1314`. That made
+        // this test SILENTLY SKIP, so rules 5 and 6 had never executed here at all, on the machine
+        // whose green suite was the evidence for them. A directory JUNCTION needs no privilege and
+        // is a reparse point that Rust's `is_symlink` reports true for, so it exercises the same
+        // branch. Falling back to one is what makes this test a test on this host.
+        #[cfg(target_os = "windows")]
+        let made = made || {
+            let target = outer.0.join("linked");
+            std::fs::create_dir_all(&target).expect("the junction target");
+            std::fs::write(target.join("secret.txt"), b"HOST SECRET").expect("the bait");
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
         if !made {
-            eprintln!("skipped: this host will not create a symbolic link");
-            return;
+            panic!(
+                "this host can create neither a symbolic link nor a directory junction, so rules 5                  and 6 cannot be exercised. Failing loudly rather than skipping: a silent skip is                  how these two rules came to have no coverage at all."
+            );
         }
         let fs = Filesystem::new(&inner).expect("a filesystem");
         let error = fs.open(b"/escape", read_flags()).expect_err("a symlink is not followed");

@@ -316,6 +316,39 @@ pub fn locate(
 mod tests {
     use super::*;
 
+    /// **Rule 6, reached directly — the one rule rules 3 and 4 are supposed to make unreachable.**
+    ///
+    /// A review found rules 5 and 6 had no mutation row and no test that executes on this host.
+    /// This is rule 6's, and reaching it needs care, because the obvious attempt does not work:
+    /// `starts_with` is **lexical**, so `root/../secret` still starts with `root` and a `..`
+    /// component would sail straight past it.
+    ///
+    /// What rule 6 actually guards is `PathBuf::push` with an **absolute** component, which
+    /// **replaces the whole path** rather than appending to it. That is a genuine Rust footgun:
+    /// one absolute component anywhere in the list and the host path is no longer under the root
+    /// at all. `hostile_component` rejects the shapes that produce one, so this builds the
+    /// `Resolved` by hand — which is exactly the "rules 3 and 4 already make this impossible"
+    /// case the comment on rule 6 describes, tested rather than asserted.
+    #[test]
+    fn an_absolute_component_is_refused_by_the_containment_check() {
+        let root = std::path::Path::new(if cfg!(windows) { r"C:\omnidroid-root" } else { "/omnidroid-root" });
+        let escape = if cfg!(windows) { r"C:\Windows" } else { "/etc" };
+
+        // Built by hand: `hostile_component` would never let this through, which is the point.
+        let resolved = Resolved { components: vec![escape.to_string(), "secret.txt".to_string()] };
+        let error = locate("test", root, &resolved, FinalLink::Refuse)
+            .expect_err("an absolute component replaces the path and leaves the root");
+        assert!(
+            matches!(error, FsError::Confined { .. }),
+            "an escape must be Confined, not {error}",
+        );
+
+        // And the ordinary case still resolves, so the rule is not simply refusing everything.
+        let ok = Resolved { components: vec!["data".to_string(), "f.txt".to_string()] };
+        let host = locate("test", root, &ok, FinalLink::Refuse).expect("an ordinary path resolves");
+        assert!(host.starts_with(root), "{host:?}");
+    }
+
     fn components(path: &str) -> Vec<String> {
         resolve_lexically("test", path.as_bytes()).expect(path).components
     }

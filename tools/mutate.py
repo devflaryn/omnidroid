@@ -2556,6 +2556,43 @@ directory", ADAPTER_FILES,
         self.pool()
     }""",
      ANDROID_LIB),
+
+    # ---- the gmtime wrap: a defect only a DEBUG build can see -----------------------------------
+    # `days * SECONDS_PER_DAY` exceeds i64 only near i64::MIN, and every such timestamp is in a year
+    # around -2.9e11, which `i32::try_from(year - 1900)` refuses whatever `second_of_day` holds. So
+    # in release the product wraps, the garbage is discarded by that refusal, and the behaviour is
+    # correct BY ACCIDENT -- which is why the whole workspace suite stayed green while the Critical
+    # was live, and why its regression test could assert nothing and still look like a guard.
+    # This row is the detector: `mutate.py` runs debug, where the multiplication panics.
+    ("time-A7", "A",
+     "the day remainder goes back to a subtraction that overflows near i64::MIN",
+     BIONIC_TIME,
+     """    let second_of_day = timestamp.rem_euclid(SECONDS_PER_DAY);""",
+     """    let second_of_day = timestamp - floor_div(timestamp, SECONDS_PER_DAY) * SECONDS_PER_DAY;""",
+     BIONIC),
+
+    # ---- the confinement's last two rules, which had no row at all ------------------------------
+    # A review found rules 5 and 6 covered by exactly one test, which SILENTLY SKIPPED on this host:
+    # an unelevated Windows session cannot create a symbolic link (MEASURED: WinError 1314). So on
+    # the machine whose green suite was the evidence for them, neither rule had ever executed, and
+    # fs-A1..A4/B1..B3 all sit in rules 1-4. The test now falls back to a directory junction, which
+    # needs no privilege, and FAILS LOUDLY rather than skipping if it can make neither.
+    ("fs-A7", "A",
+     "the symlink refusal never fires, so a link inside the root is followed out of it",
+     PLAT_FS_PATH,
+     """            Ok(metadata) if metadata.file_type().is_symlink() => {""",
+     """            Ok(metadata) if false && metadata.file_type().is_symlink() => {""",
+     PLATFORM),
+
+    # Rule 6 guards `PathBuf::push` with an ABSOLUTE component, which replaces the path rather than
+    # appending. `starts_with` is lexical, so a `..` component would never reach this -- which is
+    # why the test builds its `Resolved` by hand.
+    ("fs-A8", "A",
+     "the containment check never fires, so an absolute component escapes the root",
+     PLAT_FS_PATH,
+     """    if !host.starts_with(root) {""",
+     """    if false && !host.starts_with(root) {""",
+     PLATFORM),
 ]
 
 
