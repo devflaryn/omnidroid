@@ -102,6 +102,8 @@ PLAT_FS_PATH = "crates/omni-platform/src/fs/path.rs"
 # M5: the pipe. An in-process byte queue with two ends, and the first descriptor kind whose
 # readiness depends on another descriptor.
 PLAT_FS_PIPE = "crates/omni-platform/src/fs/pipe.rs"
+# M5: the NDK surface. `ALooper` is the first of the four families.
+NDK_LOOPER = "crates/omni-android/src/ndk/looper.rs"
 PLAT_FS_WINDOWS = "crates/omni-platform/src/fs/windows.rs"
 BIONIC_STDIO = "crates/omni-bionic/src/stdio.rs"
 ADAPTER_FILES = "crates/omni-android/src/bionic/files.rs"
@@ -176,6 +178,9 @@ ANDROID = [
     # turned each of them into a MISS that looked like a missing test rather than a missing
     # target.
     "--test", "bionic",
+    # The NDK surface's own target, added in M5 for exactly the same reason: every `NDK_*` row is
+    # detected here and nowhere else.
+    "--test", "ndk",
     "--no-fail-fast",
 ]
 
@@ -3692,6 +3697,150 @@ directory", ADAPTER_FILES,
             return Err(FsError::kinded(
                 "read",""",
      PLATFORM),
+
+    # ================================================================== M5: the ALooper
+    #
+    # §8.1's **fourth** failure mode is that `ALooper_forThread()` returning NULL makes
+    # `initializeNativeCode` return 0 and Java-side startup fail silently. Every row here is about
+    # one of the ways this layer could produce that silently, or produce a looper that answers
+    # something a device would not.
+
+    # The null that IS the answer, turned into a non-null. §5.2 decodes the constructor logging
+    # "Unable to retrieve native ALooper" and returning zero on exactly this, so a layer that
+    # always produced a looper would make the host's own precondition untestable.
+    ("looper-A1", "A", "ALooper_forThread answers something rather than NULL when there is none",
+     NDK_LOOPER,
+     """    c.ret().u64(found.unwrap_or(0) as u64);""",
+     """    c.ret().u64(found.unwrap_or(1) as u64);""",
+     ANDROID),
+
+    # Callbacks run before an ident is reported. AOSP reports idents first, and the glue depends
+    # on it: `android_app_entry` registers its command pipe with LOOPER_ID_MAIN and no callback,
+    # and `GameLoop` switches on the return.
+    ("looper-A2", "A", "a callback is run where an ident should have been reported",
+     NDK_LOOPER,
+     """            match ident {
+                Some(found) => found,
+                None if callbacks.is_empty() => Pass::Idle,
+                None => Pass::Callbacks(callbacks),
+            }""",
+     """            match ident {
+                _ if !callbacks.is_empty() => Pass::Callbacks(callbacks),
+                Some(found) => found,
+                None => Pass::Idle,
+            }""",
+     ANDROID),
+
+    # A registration with a callback keeping the caller's ident. §5.2's constructor passes
+    # `ident = 0` **and** a callback, so this makes `pollOnce` report ident 0 -- a legal-looking
+    # answer the glue has no branch for.
+    ("looper-A3", "A", "a callback registration keeps an ident that can never be reported",
+     NDK_LOOPER,
+     """        ident: if callback == 0 { ident } else { ALOOPER_POLL_CALLBACK },""",
+     """        ident,""",
+     ANDROID),
+
+    # A callback returning zero no longer removes its registration, which is the NDK's documented
+    # contract and the mechanism by which the glue detaches its pipe.
+    ("looper-A4", "A", "a callback returning zero does not remove its registration",
+     NDK_LOOPER,
+     """                if returned == 0 {""",
+     """                if false && returned == 0 {""",
+     ANDROID),
+
+    # The last release no longer destroys the looper, so the thread keeps one for ever and
+    # `ALooper_forThread` can never answer NULL again -- which removes the very condition §8.1's
+    # fourth failure mode is about.
+    ("looper-A5", "A", "the last release leaves the looper alive",
+     NDK_LOOPER,
+     """    if references == 0 {
+        // The last reference""",
+     """    if false {
+        // The last reference""",
+     ANDROID),
+
+    # A descriptor the instance does not hold accepted into a looper. Its readiness would then
+    # have to be invented, which is the whole reason the check is there.
+    ("looper-A6", "A", "a looper accepts a descriptor this runtime does not have",
+     NDK_LOOPER,
+     """        if !fs.is_open(fd) {""",
+     """        if false {""",
+     ANDROID),
+
+    # `pollOnce` returns the right ident and writes no `outFd`. A caller that read the stale value
+    # acts on whatever descriptor was there last.
+    ("looper-A7", "A", "pollOnce reports an ident and writes no out-parameter",
+     NDK_LOOPER,
+     """            if out_fd != 0 {""",
+     """            if false {""",
+     ANDROID),
+
+    # The wait removed: `pollOnce` answers POLL_TIMEOUT immediately for any timeout. A game loop
+    # would spin at whatever rate the run budget allowed instead of waiting for its pipe.
+    ("looper-A8", "A", "pollOnce never waits, and times out at once",
+     NDK_LOOPER,
+     """        let now = Instant::now();
+        if now >= deadline {
+            break Pass::Idle;
+        }""",
+     """        let now = Instant::now();
+        if true {
+            break Pass::Idle;
+        }""",
+     ANDROID),
+
+    # ---- the over-corrections ----
+
+    # `ALooper_prepare` taking a reference for its caller as well as the thread's. It reads as the
+    # careful thing -- the caller has a pointer, so surely it holds a reference -- and it leaves
+    # the count one too high for ever, so the looper outlives the thread that owns it.
+    ("looper-B1", "B", "prepare takes a reference for the caller as well as the thread",
+     NDK_LOOPER,
+     """        Looper { thread, opts, references: 1, fds: Vec::new() }""",
+     """        Looper { thread, opts, references: 2, fds: Vec::new() }""",
+     ANDROID),
+
+    # The indefinite-wait refusal widened to every non-positive timeout. It reads as stricter, and
+    # `ALooper_pollOnce(0, ..)` is the ordinary non-blocking poll a game loop makes every frame.
+    ("looper-B2", "B", "a zero timeout is refused along with an indefinite one",
+     NDK_LOOPER,
+     """    let budget = if timeout_millis < 0 {""",
+     """    let budget = if timeout_millis <= 0 {""",
+     ANDROID),
+
+    # A second `addFd` for one descriptor keeping both registrations. It reads as losing nothing,
+    # and it reports one descriptor twice -- so a `pollOnce` that should answer one ident answers
+    # a callback as well.
+    ("looper-B3", "B", "a second addFd for one descriptor keeps both registrations",
+     NDK_LOOPER,
+     """    entry.fds.retain(|held| held.fd != fd);
+    if entry.fds.len() >= MAX_LOOPER_FDS {""",
+     """    if entry.fds.len() >= MAX_LOOPER_FDS {""",
+     ANDROID),
+
+    # ---- the park witness, for §8 row 14 ----
+
+    # The guard stops removing its entry. A stale park makes a run that finished look like the
+    # deadlock the witness exists to find, which is worse than having no witness at all.
+    ("park-A1", "A", "a thread that finished waiting stays recorded as parked",
+     ADAPTER_MOD,
+     """        if let Some(index) = parked.iter().position(|held| held.started == self.token) {
+            parked.remove(index);
+        }""",
+     """        if let Some(index) = parked.iter().position(|held| held.started == self.token) {
+            let _ = index;
+        }""",
+     ANDROID),
+
+    # The witness records the mutex where the condition variable belongs. **A substitution, not a
+    # count**: the number of parked threads is right, every total is right, and the object named
+    # is the wrong one -- which is this project's first verification lesson, applied to its own
+    # newest instrument.
+    ("park-A2", "A", "the park witness names the mutex as the condition variable",
+     ADAPTER_HANDLERS,
+     """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex);""",
+     """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, mutex, mutex);""",
+     ANDROID),
 ]
 
 
