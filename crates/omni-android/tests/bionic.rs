@@ -1088,6 +1088,65 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     assert_eq!(error.guest_address(), Some(unbound));
 }
 
+/// One symbol counted as an answer, with the argument it answers for.
+type Answer<'a> = (&'a str, &'a dyn Fn(&mut Asm));
+
+/// **`fprintf` and `vfprintf` write through a real stream**, which is what M3's gate needed and
+/// what HANDOFF called "one binding away" for three phases.
+///
+/// Asserted on the **bytes in the file**, not on the return value: a handler that returned a
+/// plausible length and wrote nothing would satisfy any assertion about the result, and the
+/// formatted text is the whole point. The `%d`/`%s` conversions go through the same
+/// `format::render` `snprintf` uses, so what is new here is only the destination.
+#[test]
+fn fprintf_and_vfprintf_write_through_a_real_stream() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("fprintf");
+    let path = f.cstring(f.guest.data + 0x100, b"out.txt");
+    let mode = f.cstring(f.guest.data + 0x140, b"w");
+    let fmt = f.cstring(f.guest.data + 0x180, b"[%s=%d]");
+    let word = f.cstring(f.guest.data + 0x1C0, b"answer");
+
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, mode as u64);
+    });
+    assert_ne!(stream, 0, "fopen must give a stream to write through");
+
+    let written = value_of(&f, "fprintf", |asm| {
+        asm.mov(0, stream);
+        asm.mov(1, fmt as u64);
+        asm.mov(2, word as u64);
+        asm.mov(3, 42);
+    });
+    assert_eq!(written as i64 as i32, 11, "`[answer=42]` is eleven bytes, and fprintf returns how many it wrote");
+
+    // The `v` form over a guest `va_list` the test builds, which is the half `snprintf` cannot
+    // exercise: `X3` holds a *pointer* to the 32-byte record, not the record.
+    let va = f.guest.data + 0x200;
+    let overflow = f.guest.data + 0x280;
+    f.guest.write_u64(overflow, word as u64);
+    f.guest.write_u64(overflow + 8, 7);
+    f.guest.write_u64(va, overflow as u64); // __stack
+    f.guest.write_u64(va + 8, 0); // __gr_top
+    f.guest.write_u64(va + 16, 0); // __vr_top
+    f.guest.write_u64(va + 24, 0); // __gr_offs / __vr_offs, both exhausted
+    let written = value_of(&f, "vfprintf", |asm| {
+        asm.mov(0, stream);
+        asm.mov(1, fmt as u64);
+        asm.mov(2, va as u64);
+    });
+    assert_eq!(written as i64 as i32, 10, "`[answer=7]` through a va_list");
+
+    assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64 as i32, 0);
+    let contents = std::fs::read(scratch.path("out.txt")).expect("the file the guest wrote");
+    assert_eq!(
+        String::from_utf8_lossy(&contents),
+        "[answer=42][answer=7]",
+        "both calls formatted host-side and the bytes reached the file"
+    );
+}
+
 /// The five printf-family symbols that are *bound* but cannot be serviced refuse by name, and the
 /// reason says which missing piece. `Unbound` would have said only "not implemented".
 #[test]
@@ -6873,16 +6932,35 @@ fn longjmp_refuses_and_names_what_restoring_a_jmp_buf_would_take() {
 /// list wrong by two in each direction, D24's arena test restating its own definition). So the
 /// split is derived by **calling** each symbol and seeing what it does, not by reading a table:
 ///
-/// * **22 refuse by name.** Each is called with zeroed arguments, which every one of them refuses
-///   on, and the refusal has to be `AbiError::Refused` — not `Unbound`, which would mean nothing
-///   implements it, and not a plausible value.
+/// * **13 refuse by name, whatever they are passed.** Each is called with zeroed arguments, the
+///   refusal has to be `AbiError::Refused` — not `Unbound`, which would mean nothing implements
+///   it, and not a plausible value — and it must **still** refuse when it is given something
+///   plausible, which is the half that keeps a conditional answer out of this list.
 /// * **3 report a guest termination**, which is a third outcome rather than a refusal: `abort`
 ///   and `__stack_chk_fail` report `GuestAborted` and `_exit` reports `GuestExited`, because this
 ///   process hosts several guest instances and a host `abort()` would take all of them (D22).
-/// * **143 answer**, which is what is left of the 168 bound.
+/// * **152 answer**, which is what is left of the 168 bound.
 /// * **18** are data objects and **2** are deliberately absent.
 ///
-/// 143 + 22 + 3 + 18 + 2 = 188.
+/// 152 + 13 + 3 + 18 + 2 = 188.
+///
+/// # It was 143 + 22 until M3's gate, and SIX symbols changed category
+///
+/// **The category is "refuses whatever it is passed", and the comment below has said so since
+/// phase 3a — while the list did not obey it.** Task 4 made six symbols answer *some* arguments,
+/// and leaving them in a list whose own rule excludes them would have been this project's most
+/// repeated mistake once more: a total that stays right because the membership was adjusted to
+/// keep it right.
+///
+/// | symbol | what it answers now |
+/// |---|---|
+/// | `sysconf` | the page size and the processor count (D27) |
+/// | `sysinfo` | the guest's own world, once the embedding states its memory budget |
+/// | `prctl` | `PR_SET_VMA`, and `EINVAL` for the two transparent-huge-page options |
+/// | `syscall` | `gettid`, and `rt_sigprocmask` — which the engine uses as a pointer probe |
+/// | `dlsym`, `dlclose` | a handle this layer issued |
+///
+/// `dlopen`, `fprintf` and `vfprintf` left the list outright: they answer for everything.
 #[test]
 fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
     let _guard = serialized();
@@ -6891,7 +6969,8 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
     // Every symbol that refuses **whatever it is passed**. A conditional refusal is not in this
     // list: `getauxval` refuses only while the `AT_HWCAP` decision is open, `sched_getcpu` only
     // on a target whose process backend is structural, and `mmap` only for a shape it cannot
-    // honour — each of those answers on some path, so each is an answer.
+    // honour — each of those answers on some path, so each is an answer. Six symbols joined them
+    // in M3's gate; see this test's documentation.
     let refusals = [
         // phase 1: the printf family that cannot be serviced. **Three left, not five**:
         // `fprintf` and `vfprintf` are bound as of M3's gate -- phase 3b built the stream layer
@@ -6899,20 +6978,8 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         "vasprintf",
         "sscanf",
         "fscanf",
-        // phase 2: libdl. `dlerror` is NOT here — it answers NULL, which is true. **Nor is
-        // `dlopen` any more**: M3's gate found the engine using it to look up `getauxval` in
-        // `libc.so`, which this layer *is*, so it answers a handle for a library it supplies and
-        // NULL for one it does not. `dlsym` and `dlclose` still refuse a handle this layer never
-        // issued, which is a different statement from "no such symbol".
-        "dlsym",
-        "dlclose",
         // phase 2: the one guest-memory call whose guarantee cannot be met
         "mlock",
-        // phase 3a: the process facts this layer will not guess at
-        "sysconf",
-        "sysinfo",
-        "prctl",
-        "syscall",
         // phase 3c: the signal family, which needs delivery that does not exist
         "sigaction",
         "raise",
@@ -6926,7 +6993,7 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         "mallinfo",
         "longjmp",
     ];
-    assert_eq!(refusals.len(), 19);
+    assert_eq!(refusals.len(), 13);
     for symbol in refusals {
         let error = refusal_of(&f, symbol, |asm| {
             for register in 0..6 {
@@ -6939,6 +7006,56 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         );
         assert_eq!(error.symbol(), Some(symbol), "{error:?}");
         assert_eq!(error.guest_address(), Some(f.thunk(symbol)), "{error:?}");
+        // **And it still refuses when it is given something plausible.** Zeroed arguments alone
+        // would let a symbol that merely rejects nulls sit in a list whose category is
+        // "refuses whatever it is passed" -- which is exactly how six symbols stayed here after
+        // they had started answering.
+        let with_arguments = refusal_of(&f, symbol, |asm| {
+            asm.mov(0, (f.guest.data + 0x600) as u64);
+            for register in 1..6 {
+                asm.mov(register, 1);
+            }
+        });
+        assert!(
+            matches!(with_arguments, AbiError::Refused { .. }),
+            "`{symbol}` must refuse whatever it is passed, and with arguments it produced \
+             {with_arguments:?}"
+        );
+    }
+
+    // **The six that changed category in M3's gate**, asserted as answers rather than trusted to
+    // the comment above. Each is called with the argument it answers for, and each must come back
+    // without a refusal -- which is what stops this list and the one above from drifting apart.
+    let _active = f.bionic.activate().expect("a thread block");
+    f.bionic.set_memory_budget(1 << 31);
+    //
+    // `dlsym`, `dlclose`, `fprintf` and `vfprintf` are not here because each needs a value only
+    // another call can produce -- a handle, or a registered stream -- and each has a test of its
+    // own that asserts it answers: `the_dl_family_answers_for_the_libraries_this_layer_supplies`
+    // and `fprintf_and_vfprintf_write_through_a_real_stream`.
+    let answers: [Answer<'_>; 5] = [
+        ("sysconf", &|asm: &mut Asm| { asm.mov(0, 0x27); }),
+        ("sysinfo", &|asm: &mut Asm| { asm.mov(0, (f.guest.data + 0x600) as u64); }),
+        ("prctl", &|asm: &mut Asm| {
+            asm.mov(0, 42); // PR_GET_THP_DISABLE
+            asm.mov(1, 0);
+        }),
+        ("syscall", &|asm: &mut Asm| { asm.mov(0, 178); }), // gettid
+        ("dlopen", &|asm: &mut Asm| {
+            asm.mov(0, 0); // the global scope
+            asm.mov(1, 2);
+        }),
+    ];
+    for (symbol, setup) in answers {
+        let entry = call_one(&f, symbol, |asm| setup(asm));
+        let mut cpu = f.guest.thread(&f.boundary);
+        match f.boundary.run(&mut cpu, entry, BUDGET) {
+            Ok(_) => {}
+            Err(AbiError::Refused { symbol: named, .. }) if named == symbol => {
+                panic!("`{symbol}` is counted as an answer and refused the argument it answers for")
+            }
+            Err(other) => panic!("`{symbol}`: {other:?}"),
+        }
     }
 
     // The three terminations, which are reported rather than performed.
@@ -6960,7 +7077,7 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
     let bound = Bionic::bound_symbols().count() - BEYOND_THE_PREDICTION.len();
     assert_eq!(bound, 168);
     let answered = bound - refusals.len() - 3;
-    assert_eq!(answered, 146, "146 answer, 19 refuse by name, 3 report a termination");
+    assert_eq!(answered, 152, "152 answer, 13 refuse by name, 3 report a termination");
     assert_eq!(
         answered + refusals.len() + 3 + omni_android::bionic::DATA_OBJECTS.len()
             + omni_android::bionic::ABSENT_SYMBOLS.len(),
