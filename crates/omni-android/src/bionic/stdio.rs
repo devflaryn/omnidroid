@@ -248,6 +248,33 @@ fn with_stream<T>(
     produced
 }
 
+/// Format-and-write: push bytes the **host** already holds at a guest stream.
+///
+/// **The binding HANDOFF called "one binding away" for three phases.** Both halves existed from
+/// phase 3b — `format::render` formats and this module has the streams — and what was missing was
+/// that the formatted text lives *host*-side, so [`fwrite`](omni_bionic::stdio::fwrite)'s
+/// guest-pointer source is the wrong shape for it. `omni_bionic::stdio::write_host_bytes` is the
+/// same short-write, error-flag and `errno` bookkeeping with the source replaced.
+///
+/// Returns what C's `fprintf` returns: how many bytes were written.
+pub(super) fn print_to_stream(
+    c: &mut ImportCall<'_, '_>,
+    file: u64,
+    text: &str,
+) -> AbiResult<i32> {
+    let bytes = text.as_bytes().to_vec();
+    let written = with_stream(c, file, |view, descriptors, stream| {
+        let produced =
+            omni_bionic::stdio::write_host_bytes(view, descriptors, stream, &bytes);
+        lift(view, produced)
+    })?;
+    i32::try_from(written).map_err(|_| crate::AbiError::Refused {
+        symbol: c.symbol().to_string(),
+        address: c.address(),
+        why: "more bytes were written than an int can report".to_string(),
+    })
+}
+
 // ================================================================== opening and closing
 
 /// `FILE *fopen(const char *pathname, const char *mode)`

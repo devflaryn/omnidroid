@@ -18,23 +18,65 @@
 //! It is on the exit path ([`ReentrantFn`](crate::ReentrantFn)) because it calls a guest callback
 //! once per object, and D18 makes that a property of the type rather than a rule.
 //!
-//! # The other four, and why a handle is the worst thing to hand back
+//! # `dlopen` and `dlsym` answer for the libraries **this layer is**, and refuse to load a file
 //!
-//! `dlopen`, `dlsym` and `dlclose` need surface `omni-platform` does not have: opening a file,
-//! mapping it, running a second loader over it. The brief's instruction is blunt and it is the
-//! right one — *returning a plausible handle you cannot honour is worse than refusing*. A guest
-//! that gets a non-null `dlopen` result will call `dlsym` on it, store what comes back, and call
-//! it thousands of initializers later; a guest that gets a *refusal naming the library it asked
-//! for* tells whoever reads it which missing piece to build.
+//! Phase 2 refused all three, on the argument that "returning a plausible handle you cannot
+//! honour is worse than refusing". That argument is right about a handle to a **file**, and it is
+//! wrong about the case the engine actually exercises, which M3's gate found at
+//! `init_array[3096]`:
 //!
-//! They are bound rather than left [`Unbound`](crate::Binding::Unbound) for the reason D20 gives
-//! for `fprintf`: `Unbound` says "nothing implements this", and a refusal says *which missing
-//! piece*, with the guest's own argument in it.
+//! ```text
+//! h = dlopen("libc.so", RTLD_NOW);      // 0x2112eac
+//! if (h) {                              // CBZ x0
+//!     f = dlsym(h, "getauxval");        // 0x2112ec0
+//!     if (f) f(AT_HWCAP);               // MOV x0, #0x10 ; BLR x8
+//! }
+//! ```
 //!
-//! `dlerror` is the exception and it is not a stub either. It returns null, which means "no error
-//! since the last call" — and that is **true**, because the three calls that could set one refuse
-//! instead of returning. The idiom `dlerror(); p = dlsym(...); if (dlerror())` reaches the first
-//! call legitimately and never reaches the second.
+//! That is not loading anything. `libc.so` is already loaded on a device and `dlopen` of it is a
+//! lookup, not a load — and here, *this layer is `libc.so`*: it supplies `getauxval`, at an
+//! address the guest can branch to, because every bound import has a thunk slot and the backend
+//! dispatches a `BLR` to one exactly as it dispatches a `BL`. Refusing turned the engine's
+//! **atomics feature detection** (D26, and the `AT_HWCAP` argument in `procenv`) into a stopped
+//! run, and returning null would have made it silently take the no-LSE arm without anything
+//! recording that a choice had been made — the same failure D22 refused to let a `Default` make.
+//!
+//! So:
+//!
+//! | call | answer |
+//! |---|---|
+//! | `dlopen(NULL, ..)` | a handle for the **global** scope, which is what `dlopen(NULL)` means |
+//! | `dlopen("libc.so", ..)` and the other libraries the guest's own `DT_VERNEED` names | a handle for that library |
+//! | `dlopen` of anything else | **NULL**, with `dlerror` set — this runtime does not have that library, which is a fact, and the guest's own null test is what the compiler emitted for it |
+//! | `dlsym(handle, name)` | the thunk address of `name`, if this layer supplies it *in that handle's scope*; NULL otherwise |
+//! | `dlclose(handle)` | 0. Nothing was loaded, so nothing is unloaded, and the libraries this layer is cannot be unloaded |
+//!
+//! **The scope is the guest's own statement, not a list here.** `.gnu.version_r` attributes 345
+//! of `libroblox.so`'s 565 imports to `libc.so`, 56 to `libm.so`, 6 to `libdl.so` and leaves 158
+//! unversioned; that attribution arrives with each [`SymbolRequest`] while the loader relocates
+//! and is kept on the slot ([`Slot::library`](crate::Slot::library)). So
+//! `dlsym(libc_handle, "getauxval")` succeeds because *this binary says* `getauxval` comes from
+//! `libc.so`, and `dlsym(libc_handle, "eglGetProcAddress")` fails for the same reason.
+//!
+//! **An [`Unbound`](crate::Binding::Unbound) slot is not a `dlsym` hit**, and that is where phase
+//! 2's argument survives intact: its address exists so a *direct call* names the symbol, and
+//! handing it back through `dlsym` would convert a lookup the guest is prepared to see fail into a
+//! pointer it will call thousands of initializers later.
+//!
+//! **What is still refused is loading a file.** A `dlopen` of a path this layer does not supply
+//! answers NULL rather than a refusal, because NULL is the *true* answer — the library is not
+//! here — and because every caller of `dlopen` has a null test. The engine's own
+//! `dlopen("libcamera2ndk.so")` at `0x243883c` is exactly that shape.
+//!
+//! `dlerror` is per **thread**, as bionic's is, and is cleared by reading — the idiom
+//! `dlerror(); p = dlsym(..); if (dlerror())` depends on both halves.
+//!
+//! These three are on the **exit path** rather than the fast one, because each needs the
+//! boundary's symbol table and [`ImportCall`] deliberately cannot reach it (D18 makes that a type
+//! property). None of them calls guest code. They are not hot: the engine makes fourteen direct
+//! `dlopen` calls in the whole image.
+//!
+//! [`SymbolRequest`]: omni_elf::loader::SymbolRequest
 
 use omni_mem::GuestAddr;
 
@@ -45,86 +87,200 @@ use crate::mem::{Blame, GuestMem};
 use super::active;
 use super::view::{GuestView, DL_PHDR_INFO_BYTES};
 
-/// Read a guest C string for an error message, without ever failing.
+/// The tag every handle this layer issues carries in its top bits.
 ///
-/// A refusal that is *about* an argument must be able to quote it, and the argument is a guest
-/// pointer that may be null, wild or unterminated. Every one of those is a description rather
-/// than a second error: the call is being refused either way, and replacing "the library
-/// `libfoo.so`" with a bad-pointer error would lose the only useful thing in the message.
-fn describe(mem: &GuestMem, pointer: u64, blame: Blame<'_>) -> String {
-    if pointer == 0 {
-        return "NULL".to_string();
+/// **Not a plausible pointer, on purpose.** A guest that passes a `dlopen` handle somewhere a
+/// pointer was expected must fault rather than read something, and a guest that hands this layer
+/// a handle it did not issue must be told so rather than having an index read out of it. The
+/// low bits are an index into [`SCOPES`]-shaped space: 0 is the global scope and *n* is the
+/// *n*-th library in the boundary's sorted library list.
+const HANDLE_TAG: u64 = 0xD10D_0000_0000_0000;
+/// The mask that separates the tag from the scope index.
+const HANDLE_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+thread_local! {
+    // A `thread_local!` invocation carries no rustdoc, so the documentation is here: bionic keeps
+    // the `dlerror` string in thread-local storage, and the idiom `dlerror(); p = dlsym(..); if
+    // (dlerror())` is only correct if two threads cannot see each other's message.
+    static DL_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn set_dlerror(message: String) {
+    DL_ERROR.with(|slot| *slot.borrow_mut() = Some(message));
+}
+
+fn take_dlerror() -> Option<String> {
+    DL_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+/// The scope a handle names, or `None` if it names nothing this layer issued.
+fn scope_of(boundary: &crate::Boundary, handle: u64) -> Option<Option<String>> {
+    if handle & !HANDLE_MASK != HANDLE_TAG {
+        return None;
     }
-    let Ok(at) = usize::try_from(pointer) else {
-        return format!("a pointer at {pointer:#x}, wider than the host's usize");
-    };
-    match mem.cstr(at, blame) {
-        Ok(bytes) => format!("`{}`", String::from_utf8_lossy(&bytes)),
-        Err(error) => format!("an unreadable string at {at:#x} ({error})"),
+    let index = handle & HANDLE_MASK;
+    if index == 0 {
+        return Some(None);
     }
+    let libraries: Vec<&str> = boundary.libraries().into_iter().collect();
+    libraries.get(index as usize - 1).map(|name| Some((*name).to_string()))
+}
+
+/// Read a guest C string, or `None` when it is null, wild or unterminated.
+fn read_name(mem: &GuestMem, pointer: u64, blame: Blame<'_>) -> Option<String> {
+    let at = usize::try_from(pointer).ok().filter(|&p| p != 0)?;
+    let bytes = mem.cstr(at, blame).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `void *dlopen(const char *filename, int flags)`
-pub(super) fn dlopen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+///
+/// See the module documentation. On the exit path because it needs the boundary's symbol table.
+pub(super) fn dlopen(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let (filename, flags) = {
         let mut a = c.args();
         (a.next_u64()?, a.next_i32()?)
     };
-    let what = describe(c.mem(), filename, c.blame(0));
-    Err(AbiError::Refused {
-        symbol: c.symbol().to_string(),
-        address: c.address(),
-        why: format!(
-            "the guest asked to load {what} with flags {flags:#x}. Loading a library at run time \
-             needs a file opened by path and a second run of the ELF loader, and `omni-platform` \
-             is virtual memory and faults only — it has no files. A handle is refused rather than \
-             invented, because a non-null handle would be used for `dlsym` and the value that \
-             came back would be carried thousands of initializers past the point it was wrong"
-        ),
-    })
+    let _ = flags; // `RTLD_NOW`/`RTLD_LAZY` describe when to bind; everything here is already bound
+    let symbol = c.symbol().to_string();
+    let address = c.address();
+    let _state = active(&symbol, address)?;
+    let blame = Blame::new(&symbol, address, 0);
+    let mem = c.mem().clone();
+    let boundary = std::sync::Arc::clone(c.boundary());
+
+    let handle = if filename == 0 {
+        // `dlopen(NULL)` is the global scope, and it is what `RTLD_DEFAULT` means too.
+        HANDLE_TAG
+    } else {
+        match read_name(&mem, filename, blame) {
+            None => {
+                set_dlerror(format!(
+                    "dlopen: the library name at {filename:#x} is not a readable string"
+                ));
+                0
+            }
+            Some(name) => {
+                let libraries: Vec<&str> = boundary.libraries().into_iter().collect();
+                match libraries.iter().position(|candidate| *candidate == name) {
+                    Some(index) => HANDLE_TAG | (index as u64 + 1),
+                    None => {
+                        // **NULL, not a refusal.** This runtime does not have that library, which
+                        // is a fact about it, and `dlopen` returning NULL for a library that is
+                        // not present is the answer every caller has a branch for.
+                        set_dlerror(format!(
+                            "dlopen failed: library \"{name}\" not found. This runtime supplies \
+                             {}, which are the libraries libroblox.so's own DT_VERNEED names",
+                            libraries.join(", ")
+                        ));
+                        0
+                    }
+                }
+            }
+        }
+    };
+    c.ret(|mut r| r.u64(handle));
+    Ok(())
 }
 
 /// `void *dlsym(void *handle, const char *symbol)`
-pub(super) fn dlsym(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+///
+/// Returns the symbol's **thunk address**, which is an address the guest can branch to: the
+/// boundary registers every slot with the CPU context, and a `BLR` to one is dispatched exactly
+/// as a `BL` to one is. That is what makes this an implementation rather than a handle nobody can
+/// honour.
+pub(super) fn dlsym(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let (handle, name) = {
         let mut a = c.args();
         (a.next_u64()?, a.next_u64()?)
     };
-    let what = describe(c.mem(), name, c.blame(1));
-    Err(AbiError::Refused {
-        symbol: c.symbol().to_string(),
-        address: c.address(),
-        why: format!(
-            "the guest asked for {what} in the handle {handle:#x}. No handle can exist: `dlopen` \
-             refuses, and the loaded objects keep no runtime symbol index to search. Returning \
-             null would be worse than this error — null is `dlsym`'s ordinary \"not found\", so \
-             the guest would treat a missing capability as an absent optional one"
-        ),
-    })
+    let symbol = c.symbol().to_string();
+    let address = c.address();
+    let _state = active(&symbol, address)?;
+    let blame = Blame::new(&symbol, address, 1);
+    let mem = c.mem().clone();
+    let boundary = std::sync::Arc::clone(c.boundary());
+
+    let Some(scope) = scope_of(&boundary, handle) else {
+        // **A refusal, not NULL.** A handle this layer never issued is not "symbol not found":
+        // it is the guest passing something that is not a handle, or a handle from a `dlopen`
+        // this layer refused, and answering NULL would let that be read as an absent optional
+        // capability.
+        return Err(AbiError::Refused {
+            symbol,
+            address,
+            why: format!(
+                "the guest passed the handle {handle:#x} to `dlsym`, and this layer never issued \
+                 it. Every handle it issues carries the tag {HANDLE_TAG:#x}; a value without it \
+                 came from somewhere else, and NULL would be indistinguishable from `dlsym`'s \
+                 ordinary \"no such symbol\""
+            ),
+        });
+    };
+    let Some(wanted) = read_name(&mem, name, blame) else {
+        set_dlerror(format!("dlsym: the symbol name at {name:#x} is not a readable string"));
+        c.ret(|mut r| r.u64(0));
+        return Ok(());
+    };
+    let found = boundary.lookup(scope.as_deref(), &wanted).map(|slot| slot.address as u64);
+    match found {
+        Some(at) => {
+            c.ret(|mut r| r.u64(at));
+        }
+        None => {
+            set_dlerror(format!(
+                "dlsym failed: undefined symbol \"{wanted}\"{}",
+                scope.map_or(String::new(), |lib| format!(" in \"{lib}\""))
+            ));
+            c.ret(|mut r| r.u64(0));
+        }
+    }
+    Ok(())
 }
 
 /// `int dlclose(void *handle)`
-pub(super) fn dlclose(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+///
+/// Zero, meaning success. Nothing was opened, so nothing is closed — and the libraries this layer
+/// *is* cannot be unloaded, which is also true of `libc.so` on a device, where `dlclose` on it
+/// decrements a reference count that never reaches zero.
+pub(super) fn dlclose(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let handle = c.args().next_u64()?;
-    Err(AbiError::Refused {
-        symbol: c.symbol().to_string(),
-        address: c.address(),
-        why: format!(
-            "the guest asked to close the handle {handle:#x}, and no handle was ever issued — \
-             `dlopen` refuses. Unmapping an object this layer did not open would be a guess about \
-             what the guest thinks it holds"
-        ),
-    })
+    let symbol = c.symbol().to_string();
+    let address = c.address();
+    let _state = active(&symbol, address)?;
+    let boundary = std::sync::Arc::clone(c.boundary());
+    if scope_of(&boundary, handle).is_none() {
+        return Err(AbiError::Refused {
+            symbol,
+            address,
+            why: format!(
+                "the guest asked to close the handle {handle:#x}, which this layer never issued. \
+                 Answering 0 would tell the guest a handle it holds has been released"
+            ),
+        });
+    }
+    c.ret(|mut r| r.i32(0));
+    Ok(())
 }
 
 /// `char *dlerror(void)`
 ///
-/// Null, meaning "no error since the last call to `dlerror`", which is true: see the module note.
+/// The last failure on **this thread**, cleared by reading, as bionic's is. NULL when there has
+/// not been one. The message is interned in this thread's scratch buffer, so it stays valid until
+/// the next call that uses the scratch — which is the same lifetime bionic gives it.
 pub(super) fn dlerror(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    // Nothing is read, but the state has to exist: a handler that ran with no instance published
-    // is a host mistake and is reported as one everywhere else in this layer.
-    let _ = active(c.symbol(), c.address())?;
-    c.ret().u64(0);
+    let state = active(c.symbol(), c.address())?;
+    let Some(message) = take_dlerror() else {
+        c.ret().u64(0);
+        return Ok(());
+    };
+    let at = {
+        let view = super::enter(c, &state);
+        // A message longer than the scratch is refused rather than truncated -- a truncated
+        // diagnostic is a believable wrong answer, and `put_scratch` already says so.
+        view.put_scratch(message.as_bytes())?
+    };
+    c.ret().u64(at as u64);
     Ok(())
 }
 

@@ -323,36 +323,43 @@ fn refuse(c: &mut ImportCall<'_, '_>, why: &str) -> AbiResult<()> {
 }
 
 /// `int fprintf(FILE *stream, const char *fmt, ...)`
-///
-/// The formatting half is implemented and the destination half is not: a `FILE *` is host file
-/// surface, and `omni-platform` has virtual memory and faults and nothing else. Refused with the
-/// stream pointer named, rather than formatted into a buffer nobody reads.
 pub(super) fn fprintf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let text = {
+        let state = active(c.symbol(), c.address())?;
+        let (fmt, consumed, overflow) = {
+            let mut a = c.args();
+            let _stream = a.next_u64()?;
+            let fmt = a.next_u64()?;
+            (fmt, a.consumed(), a.overflow())
+        };
+        let mut source = c.varargs(consumed, overflow, 2);
+        let view = enter(c, &state);
+        render(&view, fmt, 1, &mut source)?
+    };
     let stream = c.args().next_u64()?;
-    refuse(
-        c,
-        &format!(
-            "writing to the guest FILE * at {stream:#x} means formatting into a stream, and \
-             this layer has not bound the printf family onto one. **Both halves now exist**: the \
-             formatting is `format::render`, which `snprintf` and `__android_log_print` already \
-             go through, and the stream is phase 3b's `stdio`. What is missing is only the \
-             binding, which phase 3b deliberately left out of its scope of the 29 file-io \
-             symbols. NOTE: this refusal used to say `omni-platform has no file surface`, which \
-             was true until phase 3b and is not any more"
-        ),
-    )
+    let written = super::stdio::print_to_stream(c, stream, &text)?;
+    c.ret().i32(written);
+    Ok(())
 }
 
 /// `int vfprintf(FILE *stream, const char *fmt, va_list ap)` — as [`fprintf`].
 pub(super) fn vfprintf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    let stream = c.args().next_u64()?;
-    refuse(
-        c,
-        &format!(
-            "writing to the guest FILE * at {stream:#x} means formatting into a stream. As \
-             `fprintf`: both halves exist as of phase 3b and only the binding is missing"
-        ),
-    )
+    let (stream, fmt, va_list) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
+    let text = {
+        let state = active(c.symbol(), c.address())?;
+        let view = enter(c, &state);
+        let at = usize::try_from(va_list)
+            .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))?;
+        let mut source =
+            GuestVaList::read(view.mem(), at, Blame::new(view.symbol(), view.address(), 2))?;
+        render(&view, fmt, 1, &mut source)?
+    };
+    let written = super::stdio::print_to_stream(c, stream, &text)?;
+    c.ret().i32(written);
+    Ok(())
 }
 
 /// `int vasprintf(char **strp, const char *fmt, va_list ap)`
