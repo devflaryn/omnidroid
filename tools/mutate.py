@@ -2738,10 +2738,14 @@ directory", ADAPTER_FILES,
 
     # A descriptor nothing opened reported as ready. The guest then reads it and gets EBADF from a
     # call `poll` had just said would not block.
+    # **RE-ANCHORED in M5**, when `poll` stopped answering "open, therefore ready" and started
+    # asking `Filesystem::readiness`. The property is unchanged and so is the detector; what moved
+    # is the line that holds it. The pre-flight is what found the staleness, which is what it is
+    # for — six rows went stale the same way once before.
     ("net-A7", "A", "a descriptor that is not open is reported ready rather than POLLNVAL",
      ADAPTER_NET,
-     """        } else if fs.is_some_and(|fs| fs.is_open(fd)) {""",
-     """        } else if fs.is_some() {""",
+     """                _ => POLLNVAL,""",
+     """                _ => events & READY_MASK,""",
      ANDROID),
 
     # **Review finding M1's shape, in this group.** Read the whole array, decide, write it once --
@@ -2786,21 +2790,24 @@ directory", ADAPTER_FILES,
     # POSIX: `select` returns the total number of bits set across all the masks, so one descriptor
     # ready in two sets is two. Counting descriptors instead returns one -- a smaller, entirely
     # reasonable-looking number.
+    # **RE-ANCHORED in M5.** `sets[2].clear()` moved into `answer_sets` and the count moved into
+    # `ready_bits`, which the first evaluation and every pass of the wait now share — so the row
+    # anchors on the function rather than on one of two identical expressions.
     ("net-A12", "A", "select counts ready descriptors instead of ready bits",
      ADAPTER_NET,
-     """    let ready: i32 = sets[0].count(nfds) + sets[1].count(nfds);
-    sets[2].clear();""",
-     """    let ready: i32 = sets[0].count(nfds).max(sets[1].count(nfds));
-    sets[2].clear();""",
+     """    sets[0].count(nfds) + sets[1].count(nfds)""",
+     """    sets[0].count(nfds).max(sets[1].count(nfds))""",
      ANDROID),
 
     # Nothing in this runtime can raise an exception condition, so the exception set comes back
     # empty. Leaving the guest's own bits in it says every descriptor it asked about has one.
+    # **RE-ANCHORED in M5**: the clear moved into `answer_sets`, which is now the one place any
+    # set is answered.
     ("net-A13", "A", "select leaves the guest's bits in the exception set",
      ADAPTER_NET,
      """    sets[2].clear();
-    if ready > 0 {""",
-     """    if ready > 0 {""",
+}""",
+     """}""",
      ANDROID),
 
     # Bionic converts the `timeval` before the syscall and reports a `tv_usec` outside [0, 1e6) as
@@ -2849,27 +2856,20 @@ directory", ADAPTER_FILES,
     # the call would retry it with nothing. This was a real defect in the first version of this
     # module, found by re-reading the code rather than by a failing test; `net-A9` is the row that
     # keeps it found.
+    # **RE-ANCHORED in M5**, when the sleep became a wait that re-asks the question. The mutation
+    # is the same one — zero and write back the guest's sets *before* the timeout is validated —
+    # expressed against the new shape: the `timeout == 0` branch is where the parse begins, so
+    # clearing and writing there puts the whole rest of the validation after the damage.
     ("net-A9", "A", "select zeroes the guest's sets before it validates the timeout",
      ADAPTER_NET,
-     """    // Refused before anything is written, for the same reason.
-    let wait = bounded_wait(c, duration)?;
-    // Nothing is ready and the wait is going to happen, so on return every set must be empty:
-    // POSIX requires the sets to be zeroed when `select` times out, and a guest that read a stale
-    // bit would act on a descriptor this call did not report.
-    for set in &mut sets {
-        set.clear();
-    }
-    for set in &sets {
-        set.write_back(view)?;
-    }
-    Ok(Outcome::Sleep(wait))""",
+     """    let duration = if timeout == 0 {""",
      """    for set in &mut sets {
         set.clear();
     }
     for set in &sets {
         set.write_back(view)?;
     }
-    Ok(Outcome::Sleep(bounded_wait(c, duration)?))""",
+    let duration = if timeout == 0 {""",
      ANDROID),
 
     # ---- the over-corrections ------------------------------------------------------------------

@@ -131,11 +131,20 @@ const POLLRDNORM: i16 = 0x040;
 /// `POLLWRNORM`: normal data may be written.
 const POLLWRNORM: i16 = 0x100;
 
+/// What a **readable** descriptor answers, masked by what was asked for.
+const READABLE_MASK: i16 = POLLIN | POLLRDNORM;
+/// What a **writable** descriptor answers, masked by what was asked for.
+const WRITABLE_MASK: i16 = POLLOUT | POLLWRNORM;
+
 /// What an always-ready descriptor answers, masked by what was asked for.
 ///
 /// Linux's `DEFAULT_POLLMASK`, which is what its `poll` returns for a regular file. `POLLPRI` is
 /// deliberately absent: out-of-band data is a socket concept and nothing here has any.
-const READY_MASK: i16 = POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM;
+///
+/// **Since M5 it is the union of the two halves rather than the thing handlers use**, because a
+/// pipe is readable or writable and rarely both. It is still the answer for every descriptor kind
+/// that cannot block, and the compile-time assertion below is still about it.
+const READY_MASK: i16 = READABLE_MASK | WRITABLE_MASK;
 
 /// The ready mask contains no condition this runtime cannot produce, and none that `poll` reports
 /// whether or not it was asked for.
@@ -394,10 +403,10 @@ fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<i32> 
 fn revents_for(readiness: Readiness, events: i16) -> i16 {
     let mut revents = 0i16;
     if readiness.readable {
-        revents |= events & (POLLIN | POLLRDNORM);
+        revents |= events & READABLE_MASK;
     }
     if readiness.writable {
-        revents |= events & (POLLOUT | POLLWRNORM);
+        revents |= events & WRITABLE_MASK;
     }
     if readiness.hangup {
         revents |= POLLHUP;
@@ -467,7 +476,7 @@ fn select_outcome(
     // sets are about to be overwritten with the answer.
     let asked: [Set; 3] = [sets[0].copy(), sets[1].copy(), sets[2].copy()];
     answer_sets(view, &asked, &mut sets, nfds);
-    let ready: i32 = sets[0].count(nfds) + sets[1].count(nfds);
+    let ready = ready_bits(&sets, nfds);
     if ready > 0 {
         for set in &sets {
             set.write_back(view)?;
@@ -515,7 +524,7 @@ fn select_outcome(
         // between — `VERIFICATION.md` entry 11, measured at 1.0104 s.
         let seen = view.active.bionic.filesystem().map(omni_platform::fs::Filesystem::ready_generation);
         answer_sets(view, &asked, &mut sets, nfds);
-        let ready: i32 = sets[0].count(nfds) + sets[1].count(nfds);
+        let ready = ready_bits(&sets, nfds);
         if ready > 0 {
             for set in &sets {
                 set.write_back(view)?;
@@ -560,6 +569,18 @@ fn select_outcome(
 /// conditions on character devices, and this runtime produces neither. A pipe with no readers
 /// reports `POLLERR` to `poll`, and `select`'s `exceptfds` is deliberately **not** where Linux
 /// reports that either.
+/// What `select` returns: **the number of bits set across all the masks**, not the number of
+/// distinct descriptors.
+///
+/// POSIX is explicit, and the difference is invisible until one descriptor is ready in two sets:
+/// counting descriptors then returns one where the call must return two — a smaller and entirely
+/// reasonable-looking number. A function rather than an expression because both the first
+/// evaluation and every pass of the wait need it, and a second copy is a second thing to get
+/// wrong.
+fn ready_bits(sets: &[Set; 3], nfds: i32) -> i32 {
+    sets[0].count(nfds) + sets[1].count(nfds)
+}
+
 fn answer_sets(view: &GuestView<'_>, asked: &[Set; 3], sets: &mut [Set; 3], nfds: i32) {
     let readiness = |fd: i32| {
         view.active.bionic.filesystem().and_then(|fs| fs.readiness(fd).ok())
