@@ -37,7 +37,7 @@
 //!    around the nested run.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -162,6 +162,9 @@ struct BuilderInner {
     region: ThunkRegion,
     slots: BTreeMap<GuestAddr, Slot>,
     by_name: BTreeMap<String, GuestAddr>,
+    /// Symbols a **weak** reference to must resolve to nothing. See
+    /// [`BoundaryBuilder::declare_absent`].
+    absent: BTreeSet<String>,
     sentinel: GuestAddr,
     exit_crossings: u64,
 }
@@ -198,6 +201,7 @@ impl BoundaryBuilder {
                 region,
                 slots: BTreeMap::new(),
                 by_name: BTreeMap::new(),
+                absent: BTreeSet::new(),
                 sentinel,
                 exit_crossings: MAX_EXIT_CROSSINGS,
             }),
@@ -248,6 +252,58 @@ impl BoundaryBuilder {
             .slots
             .insert(address, Slot { symbol: symbol.to_string(), address, binding: Binding::Data });
         Ok(address)
+    }
+
+    /// State that a **weak** reference to `symbol` must resolve to **nothing**, as a real device's
+    /// dynamic linker would resolve it.
+    ///
+    /// # This is the one place a thunk address is the wrong answer, and it is a narrow one
+    ///
+    /// Every other import gets a slot whose call names it ([`Binding::Unbound`]), because a named
+    /// refusal beats a branch to address zero. **A weak undefined symbol inverts that argument**,
+    /// and the inversion is a property of what `STB_WEAK` *means*: the reference compiles to a
+    /// null test, the guest is required to make it, and zero is the specified answer for "nothing
+    /// supplies this". Handing out an address turns a branch the guest was going to skip into a
+    /// branch it takes.
+    ///
+    /// It is therefore not a blanket rule about weak symbols — a weak import a real Android libc
+    /// *does* supply should still get a slot, because the guest would have called it on a device.
+    /// It is a per-symbol declaration by the compatibility layer, saying **this symbol does not
+    /// exist on the platform we are modelling**.
+    ///
+    /// A **strong** reference to a symbol declared absent still gets a slot. Zero there is a
+    /// branch to address zero with no symbol attached to it, which is the failure shape the whole
+    /// region exists to replace, and a strong reference means the guest never tests for null.
+    ///
+    /// `omni_android::bionic::ABSENT_SYMBOLS` is the list, with the guest instructions that
+    /// justify it.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] if `symbol` already has a slot. A symbol cannot be both bound and
+    /// absent: the loader asks once, and two answers means one of them was written by someone who
+    /// had not read the other.
+    pub fn declare_absent(&self, symbol: &str) -> AbiResult<()> {
+        let mut inner = self.inner.lock();
+        if let Some(&address) = inner.by_name.get(symbol) {
+            return Err(AbiError::Refused {
+                symbol: symbol.to_string(),
+                address,
+                why: format!(
+                    "`{symbol}` already has a thunk slot at {address:#x} and cannot also be \
+                     declared absent: the loader asks about a symbol once, so this layer would be \
+                     giving it two different answers"
+                ),
+            });
+        }
+        inner.absent.insert(symbol.to_string());
+        Ok(())
+    }
+
+    /// Whether a weak reference to `symbol` will be left unresolved.
+    #[must_use]
+    pub fn is_absent(&self, symbol: &str) -> bool {
+        self.inner.lock().absent.contains(symbol)
     }
 
     /// Bind `symbol` to a handler that runs inside the run loop.
@@ -323,7 +379,10 @@ impl BoundaryBuilder {
 /// * **Every function gets a slot, whether or not anything implements it.** A function nothing
 ///   implements is bound to a real address whose call produces [`AbiError::Unbound`] naming it — which
 ///   is strictly better than leaving it unresolved and bound to null, where the guest's call becomes a
-///   branch to address zero with no symbol attached to it.
+///   branch to address zero with no symbol attached to it. **The one exception is a *weak* reference
+///   to a symbol [`declare_absent`](BoundaryBuilder::declare_absent) named**, where zero is not a
+///   missing answer but the specified one; that method's documentation has the argument and
+///   `omni_android::bionic::ABSENT_SYMBOLS` has the list.
 /// * **A data symbol gets one only if it was declared with a size.** There is no size in a
 ///   [`SymbolRequest`], and `__sF` is an array of three `FILE`s that the guest reaches as
 ///   `__sF + addend`, so a default pointer-sized cell would be silently too small and the guest's
@@ -340,6 +399,14 @@ impl SymbolProvider for BoundaryBuilder {
     fn resolve(&self, request: &SymbolRequest<'_>) -> Option<SymbolValue> {
         match request.kind {
             SymbolKind::Function | SymbolKind::Unspecified => {
+                // A **weak** reference to a symbol this layer has declared absent resolves to
+                // nothing, which the loader writes as a null and the guest's own null test then
+                // skips. See `declare_absent`. The weakness is checked as well as the name: a
+                // strong reference still gets a named slot, because a strong reference has no
+                // null test in front of it.
+                if request.weak && self.is_absent(request.name) {
+                    return None;
+                }
                 // A failure here is the region running out, which the loader has no channel for. It
                 // is reported as "nothing supplied this symbol" rather than swallowed, and the
                 // loader's unresolved list then names every symbol that missed out.
@@ -1552,6 +1619,57 @@ mod tests {
         assert!(matches!(slot.binding, Binding::Unbound));
         assert_ne!(slot.address, 0, "and it has a real guest address");
         assert!(boundary.region().holds_function(slot.address));
+    }
+
+    /// **`declare_absent` in both directions**, which is the whole of the mechanism.
+    ///
+    /// A **weak** reference to a declared-absent symbol resolves to nothing, so the loader writes
+    /// a null and the guest's own null test decides. A **strong** reference to the same symbol
+    /// still gets a named slot, because a strong reference has no null test in front of it and a
+    /// null there is a branch to address zero with no symbol attached. Both halves are asserted:
+    /// a mechanism that returned `None` for every weak symbol would pass the first and fail the
+    /// second, and it would take `gettid` and `getentropy` — weak imports a real bionic *does*
+    /// supply — down with it.
+    #[test]
+    fn an_absent_symbol_resolves_to_nothing_only_for_a_weak_reference() {
+        let b = builder();
+        b.declare_absent("__gcov_dump").expect("declared absent");
+        assert!(b.is_absent("__gcov_dump"));
+        assert!(!b.is_absent("gettid"));
+
+        let request = |name: &'static str, weak: bool| SymbolRequest {
+            name,
+            kind: SymbolKind::Unspecified,
+            library: None,
+            version: None,
+            weak,
+        };
+        assert!(
+            b.resolve(&request("__gcov_dump", true)).is_none(),
+            "a weak reference to an absent symbol must resolve to nothing"
+        );
+        assert_eq!(b.address_of("__gcov_dump"), None, "and must not have consumed a slot");
+
+        let strong = b.resolve(&request("__gcov_dump", false)).expect("a strong reference binds");
+        assert_ne!(strong.address, 0, "a strong reference gets a named slot even so");
+
+        // Another weak symbol, not declared absent, still binds: this is not a rule about
+        // weakness.
+        let other = b.resolve(&request("gettid", true)).expect("an ordinary weak import binds");
+        assert_ne!(other.address, strong.address);
+    }
+
+    /// A symbol cannot be both bound and absent, and saying so is refused rather than resolved
+    /// silently in one direction.
+    #[test]
+    fn a_symbol_that_already_has_a_slot_cannot_be_declared_absent() {
+        let b = builder();
+        b.bind_inline("__gcov_dump", noop).expect("bound");
+        let error = b.declare_absent("__gcov_dump").expect_err("a contradiction");
+        let text = error.to_string();
+        assert!(text.contains("__gcov_dump"), "{text}");
+        assert!(text.contains("two different answers"), "{text}");
+        assert!(!b.is_absent("__gcov_dump"), "the refusal must not half-apply");
     }
 
     #[test]

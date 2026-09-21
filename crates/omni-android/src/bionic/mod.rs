@@ -36,6 +36,7 @@
 //! must not hold this space's lock" invariant does not allow. Nothing in this phase maps from a
 //! handler. The one mapping this module performs happens before any CPU exists, let alone runs.
 
+mod absent;
 mod clocks;
 mod data;
 mod dl;
@@ -74,6 +75,7 @@ use threads::JoinOutcome;
 use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
 
+pub use absent::{AbsentSymbol, ABSENT_SYMBOLS};
 pub use data::{DataObject, GuestProcess, DATA_OBJECTS, FILE_BYTES};
 pub use files::{
     errno_for, DIRENT_BYTES, STATVFS_BYTES, STAT_BYTES, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
@@ -1266,6 +1268,28 @@ impl Bionic {
             builder.bind_reentrant(symbol, *handler)?;
         }
         Ok(INLINE.len() + REENTRANT.len())
+    }
+
+    /// Declare the imports this layer deliberately supplies **nothing** for, so that a weak
+    /// reference to one resolves to null exactly as it does on a device.
+    ///
+    /// **Call this before the loader resolves symbols**, like
+    /// [`declare_data_into`](Bionic::declare_data_into) and for the same reason: the loader asks
+    /// about each import once, while it relocates, and an answer that arrives afterwards changes
+    /// nothing. Returns how many were declared.
+    ///
+    /// `absent`'s module documentation has the decoded guest instructions that justify the list,
+    /// including the `BL abort` four bytes past the call a plausible stub would have answered.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] if one of them already has a thunk slot, which would mean this layer
+    /// was giving the loader two answers about one symbol.
+    pub fn declare_absent_into(builder: &BoundaryBuilder) -> AbiResult<usize> {
+        for absent in ABSENT_SYMBOLS {
+            builder.declare_absent(absent.symbol)?;
+        }
+        Ok(ABSENT_SYMBOLS.len())
     }
 
     /// Every symbol this phase binds, in table order.

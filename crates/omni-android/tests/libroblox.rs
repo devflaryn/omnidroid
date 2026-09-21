@@ -18,10 +18,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use omni_android::bionic::DATA_OBJECTS;
-use omni_android::{AbiError, Binding, BoundaryBuilder, SLOT_BYTES};
+use omni_android::bionic::{ABSENT_SYMBOLS, DATA_OBJECTS};
+use omni_android::{AbiError, Binding, Bionic, BoundaryBuilder, SLOT_BYTES};
 use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
 use omni_elf::{ElfImage, LoadedObject};
+use omni_elf::SegmentFlags;
 use omni_mem::{Backing, GuestSpace, MapExecutability};
 
 /// The APK every golden assertion in this project is about.
@@ -115,6 +116,11 @@ fn load() -> Option<Loaded> {
     for object in DATA_OBJECTS {
         builder.declare_data(object.symbol, object.len, object.align).expect("a data object");
     }
+    // The two `__gcov_*` imports are declared **absent**, so that the weak references to them
+    // resolve to null exactly as they do on a device. `bionic::absent`'s documentation has the
+    // decoded guest instructions; `the_two_gcov_imports_are_weak_null_tested_and_left_unresolved`
+    // below is where they are asserted against the real library rather than quoted.
+    Bionic::declare_absent_into(&builder).expect("the absent list");
 
     // The registry takes a provider by value, and `finish` needs the builder back, so the builder is
     // shared and the registry is dropped before it is reclaimed. `declare_*` taking `&self` is what
@@ -301,6 +307,12 @@ fn every_import_of_the_real_library_gets_a_named_thunk_address() {
         .map(|import| (import.name.as_str(), import.kind))
         .collect();
     for (name, kind) in &unresolved_kinds {
+        if ABSENT_SYMBOLS.iter().any(|absent| absent.symbol == *name) {
+            // The two deliberate ones. A null in *their* GOT slots is the answer, not a gap: the
+            // guest tests them for null before calling, and a real device's linker leaves them
+            // null too. See `bionic::absent` and the test below.
+            continue;
+        }
         assert_eq!(
             *kind,
             omni_elf::loader::SymbolKind::Object,
@@ -310,9 +322,16 @@ fn every_import_of_the_real_library_gets_a_named_thunk_address() {
     }
     assert_eq!(
         unresolved_kinds.len(),
-        TOTAL_DATA - REACHABLE_DATA,
-        "the STT_OBJECT imports outside D17's reachable eighteen: {unresolved_kinds:?}"
+        TOTAL_DATA - REACHABLE_DATA + ABSENT_SYMBOLS.len(),
+        "the STT_OBJECT imports outside D17's reachable eighteen, plus the two deliberately          absent weak imports: {unresolved_kinds:?}"
     );
+    for absent in ABSENT_SYMBOLS {
+        assert!(
+            unresolved.contains(&absent.symbol),
+            "`{}` was declared absent and still bound to an address",
+            absent.symbol
+        );
+    }
 
     // Every address the loader handed out is inside the region, at a slot boundary, and named.
     let region = loaded.boundary.region();
@@ -366,12 +385,12 @@ fn the_data_symbols_land_in_the_data_area_and_the_functions_in_the_function_area
     assert_eq!(data, REACHABLE_DATA, "the eighteen STT_OBJECT imports D17 counted");
     assert_eq!(
         functions,
-        TOTAL_IMPORTS - TOTAL_DATA,
-        "a function slot for every import that is not STT_OBJECT — 565 less the 23 data ones, not          less D17's reachable 18"
+        TOTAL_IMPORTS - TOTAL_DATA - ABSENT_SYMBOLS.len(),
+        "a function slot for every import that is not STT_OBJECT and is not deliberately absent —          565 less the 23 data ones and the two weak `__gcov_*`, not less D17's reachable 18"
     );
     // One slot per function, plus the callback sentinel. Sized against the whole import list rather
     // than the function count, since the loader is asked about all 565 and the region has to answer.
-    assert_eq!(region.slots_used(), TOTAL_IMPORTS - TOTAL_DATA + 1);
+    assert_eq!(region.slots_used(), TOTAL_IMPORTS - TOTAL_DATA - ABSENT_SYMBOLS.len() + 1);
     assert_eq!((TOTAL_IMPORTS + 1) * SLOT_BYTES, 9_056, "566 slots of 16 bytes: three pages");
 }
 
@@ -462,4 +481,147 @@ fn the_relocated_image_really_holds_the_thunk_addresses() {
         missing.iter().take(5).collect::<Vec<_>>()
     );
     assert!(found.len() > 400, "only {} thunk addresses appear in the image", found.len());
+}
+
+/// **The two `__gcov_*` imports are weak, are null-tested by the guest's own code, and are left
+/// unresolved — asserted against the real library rather than quoted from a comment.**
+///
+/// This is the evidence behind `bionic::absent`, and it is the reason those two symbols are the
+/// only ones in the reachable 188 that get no thunk address. Four facts, each of which has to
+/// hold for "resolve them to nothing" to be right:
+///
+/// 1. both are **weak** undefined symbols, so a null is a legal resolution rather than a link
+///    error;
+/// 2. each has a `GLOB_DAT` relocation as well as a `JUMP_SLOT`, so the guest materialises the
+///    address rather than only branching through the PLT;
+/// 3. the instruction immediately after the `LDR` of that GOT slot is a **`CBZ` on the register
+///    the `LDR` wrote** — the guest tests for null before calling;
+/// 4. after a real load with the boundary as the only provider, the GOT slot holds **zero**.
+///
+/// Fact 3 is the one that inverts `Binding::Unbound`'s usual argument. Without it, absence would
+/// be a branch to address zero; with it, absence is the path the guest already has.
+#[test]
+fn the_two_gcov_imports_are_weak_null_tested_and_left_unresolved() {
+    let _guard = serialized();
+    let Some(path) = cached_main_lib() else { return };
+    let bytes = std::fs::read(path).expect("read the cache entry");
+    let elf = ElfImage::parse(&bytes).expect("parse libroblox.so");
+
+    // (1) weak, undefined, and `STT_NOTYPE` — which is why the boundary's provider sees them as
+    // `SymbolKind::Unspecified` and would otherwise hand them a function slot.
+    let indices: std::collections::BTreeMap<u32, &str> = elf
+        .undefined_symbols()
+        .expect("undefined symbols")
+        .into_iter()
+        .filter(|s| ABSENT_SYMBOLS.iter().any(|absent| absent.symbol == s.name))
+        .map(|s| {
+            assert!(s.sym.is_weak(), "`{}` must be a weak reference for a null to be legal", s.name);
+            assert!(!s.sym.is_func() && !s.sym.is_object(), "`{}` is STT_NOTYPE", s.name);
+            (s.index, s.name)
+        })
+        .collect();
+    assert_eq!(indices.len(), ABSENT_SYMBOLS.len(), "both must be in .dynsym: {indices:?}");
+
+    // (2) one `GLOB_DAT` and one `JUMP_SLOT` each: the address is taken *and* there is a PLT stub
+    // for the guarded call to go through.
+    let relocations = elf.relocations().expect("relocations");
+    let mut got_slots: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    let mut plt_entries: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for table in relocations.general.iter().chain(relocations.plt.iter()) {
+        for entry in &table.relocations {
+            let Some(name) = indices.get(&entry.r_sym()) else { continue };
+            match entry.r_type() {
+                1025 => assert!(
+                    got_slots.insert(name, entry.r_offset).is_none(),
+                    "`{name}` has two GLOB_DAT relocations"
+                ),
+                1026 => *plt_entries.entry(name).or_default() += 1,
+                other => panic!("`{name}` has an unexpected relocation type {other}"),
+            }
+        }
+    }
+    assert_eq!(got_slots.len(), ABSENT_SYMBOLS.len(), "the address of each is taken: {got_slots:?}");
+    for (name, count) in &plt_entries {
+        assert_eq!(*count, 1, "`{name}` has {count} JUMP_SLOT relocations");
+    }
+
+    // (3) the guarding `CBZ`. Scan every executable `PT_LOAD` for an `ADRP` whose page, combined
+    // with a following `LDR (unsigned offset, 64-bit)` on the same base register, names one of
+    // those GOT slots — the same windowed pairing `tools/init_reach.py` uses — and require the
+    // very next instruction to be a `CBZ` on the register the `LDR` wrote.
+    const WINDOW: usize = 8;
+    let mut guarded: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut materialised: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for segment in elf.load_segments().filter(|s| s.p_flags.contains(SegmentFlags::EXEC)) {
+        let start = segment.p_offset as usize;
+        let len = segment.p_filesz as usize;
+        let code = &bytes[start..start + len];
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for (i, word) in words.iter().enumerate() {
+            if word & 0x9F00_0000 != 0x9000_0000 {
+                continue; // not an ADRP
+            }
+            let pc = segment.p_vaddr + (i as u64) * 4;
+            let page = adrp_page(*word, pc);
+            let base = word & 31;
+            for step in 1..=WINDOW {
+                let Some(next) = words.get(i + step) else { break };
+                // `LDR Xt, [Xn, #imm12*8]`
+                if next & 0xFFC0_0000 != 0xF940_0000 || (next >> 5) & 31 != base {
+                    continue;
+                }
+                let target = page.wrapping_add(u64::from((next >> 10) & 0xFFF) * 8);
+                let Some((name, _)) = got_slots.iter().find(|(_, slot)| **slot == target) else {
+                    break;
+                };
+                materialised.insert(name);
+                let destination = next & 31;
+                if let Some(after) = words.get(i + step + 1) {
+                    if after & 0xFF00_0000 == 0xB400_0000 && after & 31 == destination {
+                        guarded.insert(name);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let expected: std::collections::BTreeSet<&str> =
+        ABSENT_SYMBOLS.iter().map(|a| a.symbol).collect();
+    assert_eq!(materialised, expected, "each GOT slot must be loaded by real guest code");
+    assert_eq!(
+        guarded, expected,
+        "every materialisation of a deliberately-absent symbol must be followed by a CBZ on the \
+         loaded register. Without that test in the guest, a null is a branch to address zero and \
+         `declare_absent` would be the wrong answer for it"
+    );
+
+    // (4) and after a real load, the slot holds zero.
+    let Some(loaded) = load() else { return };
+    let bias = loaded.object.base;
+    for (name, slot) in &got_slots {
+        let at = bias.wrapping_add(*slot as usize);
+        let word = loaded
+            .boundary
+            .mem()
+            .read_u64(at, omni_android::Blame::new("__gcov", 0, 0))
+            .expect("the GOT slot is mapped");
+        assert_eq!(
+            word, 0,
+            "`{name}`'s GOT slot at {at:#x} must hold null, which is what the guest's CBZ tests"
+        );
+    }
+}
+
+/// The page an `ADRP` names, from its two immediate fields.
+fn adrp_page(word: u32, pc: u64) -> u64 {
+    let immlo = u64::from((word >> 29) & 3);
+    let immhi = u64::from((word >> 5) & 0x7FFFF);
+    let imm = (immhi << 2) | immlo;
+    // 21-bit signed.
+    let imm = if imm & (1 << 20) != 0 { imm as i64 - (1 << 21) } else { imm as i64 };
+    (pc & !0xFFF).wrapping_add((imm * 4096) as u64)
 }
