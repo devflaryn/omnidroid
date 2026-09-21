@@ -5253,3 +5253,109 @@ fn a_range_one_guest_thread_unmaps_reaches_another_threads_context() {
     assert!(matches!(run_program(&f, join).expect("completes"), ExitReason::Returned { .. }));
     assert_eq!(f.guest.read_u64(out + 24), 0, "the join succeeded");
 }
+
+/// **A thread that exits must not hand its arena block to a thread that is still using one.**
+///
+/// The block index used to come from the table's length, which is exact only for a table nothing
+/// is ever removed from — and until this phase nothing was. Remove the entry holding index 1 from
+/// a table of three and the length is 2, so the next thread is handed index 2, which is live.
+/// Two guest threads would then share one `errno` cell and one `strerror` buffer, and the only
+/// symptom would be an occasional wrong error number in a thread that did nothing wrong.
+///
+/// The sequence is the one that produces the collision, not the one that is easiest to write:
+/// start two threads, let the **first** exit, then start a third while the second is still
+/// running, and compare the third's `errno` cell with the second's.
+#[test]
+fn a_thread_that_exits_does_not_give_its_block_to_a_live_thread() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0xD80;
+    // Three records of { gate, errno }, one per thread.
+    let rec = |n: usize| f.guest.data + 0xD00 + n * 16;
+    for n in 0..3 {
+        f.guest.write_u64(rec(n), 0);
+        f.guest.write_u64(rec(n) + 8, 0);
+    }
+
+    // `X0` is this thread's record: publish `__errno()` into it, then spin until its gate opens.
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.push(mov_reg(20, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(str_imm(0, 20, 8));
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(10, 20, 0));
+        asm.push(subs_imm(10, 10, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+
+    // Every program up front: `Guest::load` reprotects the shared code region, and doing that
+    // while a guest thread is fetching from it faults that thread.
+    let create_two = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, rec(0) as u64);
+        create_call(&f, asm, out + 32, 0, start, rec(1) as u64);
+    });
+    let join_first = program(&f, |asm| {
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 16));
+    });
+    let create_third = program(&f, |asm| {
+        create_call(&f, asm, out + 64, 0, start, rec(2) as u64);
+    });
+    let join_rest = program(&f, |asm| {
+        for slot in [1u64, 2] {
+            asm.mov(22, out as u64 + slot * 32);
+            asm.push(ldr_imm(0, 22, 0));
+            asm.mov(1, 0);
+            asm.bl(f.thunk("pthread_join"));
+            asm.push(str_imm(0, 22, 16));
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let wait_for = |at: omni_cpu::GuestAddr| {
+        while f.guest.read_u64(at) == 0 {
+            assert!(std::time::Instant::now() < deadline, "a guest thread never published {at:#x}");
+            std::thread::yield_now();
+        }
+        f.guest.read_u64(at)
+    };
+
+    assert!(matches!(run_program(&f, create_two).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8), 0);
+    assert_eq!(f.guest.read_u64(out + 40), 0);
+    let first = wait_for(rec(0) + 8);
+    let second = wait_for(rec(1) + 8);
+    assert_ne!(first, second, "two live threads already share an errno cell");
+
+    // Let the FIRST one go and reap it, leaving a hole in the middle of the table.
+    f.guest.write_u64(rec(0), 1);
+    assert!(matches!(run_program(&f, join_first).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 16), 0, "the first join succeeded");
+
+    // Now a third, which must be given the hole and not the block the second is using.
+    assert!(matches!(
+        run_program(&f, create_third).expect("completes"),
+        ExitReason::Returned { .. }
+    ));
+    assert_eq!(f.guest.read_u64(out + 72), 0, "the third was created");
+    let third = wait_for(rec(2) + 8);
+    assert_ne!(
+        third, second,
+        "the third guest thread was handed the block the second is still using: two threads \
+         sharing one errno cell is the failure the arena exists to prevent"
+    );
+    assert_eq!(third, first, "and it should be the block the first one gave back");
+
+    f.guest.write_u64(rec(1), 1);
+    f.guest.write_u64(rec(2), 1);
+    assert!(matches!(run_program(&f, join_rest).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.bionic.live_guest_threads(), 0);
+    assert!(f.bionic.guest_thread_failures().is_empty());
+}

@@ -104,6 +104,13 @@ BIONIC_STDIO = "crates/omni-bionic/src/stdio.rs"
 ADAPTER_FILES = "crates/omni-android/src/bionic/files.rs"
 ADAPTER_STDIO = "crates/omni-android/src/bionic/stdio.rs"
 
+# Phase 3c: threads and signals.
+BIONIC_SIGNAL = "crates/omni-bionic/src/signal.rs"
+BIONIC_LAYOUTS = "crates/omni-bionic/src/layouts.rs"
+ADAPTER_SIGNALS = "crates/omni-android/src/bionic/signals.rs"
+ADAPTER_THREADS = "crates/omni-android/src/bionic/threads.rs"
+ADAPTER_RUNTIME = "crates/omni-android/src/bionic/runtime.rs"
+
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
 # `omni-bionic` has no dependencies at all, so it builds in seconds. The targets are named rather
@@ -2363,6 +2370,192 @@ directory", ADAPTER_FILES,
                 let _ = (slot, stream);
             }""",
      ANDROID),
+
+    # ---------------------------------------------------------------- phase 3c: signals
+
+    # `sigfillset` is the one signal symbol that can be answered exactly, and what it answers is
+    # the bits. A set of zeroes is an EMPTY set: every range check, every return value and every
+    # errno stays exactly as it was, and the guest is told the opposite of what it asked for.
+    ("signals-A1", "A", "sigfillset produces an empty set instead of a full one", BIONIC_SIGNAL,
+     """pub const FILLED_BYTE: u8 = 0xFF;""",
+     """pub const FILLED_BYTE: u8 = 0x00;""",
+     BIONIC),
+
+    # The size is the other half. bionic's LP64 `sigset_t` is one `unsigned long`; a four-byte
+    # write leaves signals 33-64 clear in a set the guest was told was full.
+    ("signals-A2", "A", "sigfillset fills half the set, leaving signals 33-64 clear",
+     BIONIC_LAYOUTS,
+     """    pub const SIGSET_T: u64 = 8;""",
+     """    pub const SIGSET_T: u64 = 4;""",
+     BIONIC),
+
+    # The plausible stub this phase exists to refuse: `sigaction` returning 0 tells the guest a
+    # handler is installed, and nothing is observable until the fault it registered for happens.
+    ("signals-A3", "A", "sigaction reports that a handler was installed", ADAPTER_SIGNALS,
+     """    let shape = if act == 0 {""",
+     """    if act != u64::MAX {
+        c.ret().i32(0);
+        return Ok(());
+    }
+    let shape = if act == 0 {""",
+     ANDROID),
+
+    # The over-correction: refusing `sigfillset` too, on the same "there is no signal delivery
+    # here" argument. It is the same argument and it is wrong there, because `sigfillset` is a
+    # total function of its one argument and needs no signal state at all.
+    ("signals-B1", "B", "sigfillset is refused along with the rest of the family",
+     ADAPTER_SIGNALS,
+     """    let set = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;""",
+     """    let set = c.args().next_u64()?;
+    if set != u64::MAX {
+        return Err(refuse(c, "there is no signal delivery here".to_string()));
+    }
+    let state = active(c.symbol(), c.address())?;""",
+     ANDROID),
+
+    # ---------------------------------------------------------------- phase 3c: thread lifecycle
+
+    # An instance with no thread host was never configured. EAGAIN says a resource ran out, which
+    # is a condition a correct guest retries -- for ever, because nothing will ever free it.
+    ("threads-A1", "A", "pthread_create with no thread host reports EAGAIN instead of refusing",
+     ADAPTER_THREADS,
+     """    let Some(host) = bionic.thread_host() else {
+        return call.refuse(""",
+     """    let Some(host) = bionic.thread_host() else {
+        c.ret(|mut r| r.i32(consts::EAGAIN));
+        return Ok(());
+        #[allow(unreachable_code)]
+        return call.refuse(""",
+     ANDROID),
+
+    # **The defect thread lifecycle created and nothing else would have noticed.** Taking the
+    # block index from the table's LENGTH is exact only while nothing is ever removed, and this
+    # phase removes one at every thread exit: remove the entry holding index 1 from a table of
+    # three and the next thread is handed index 2, which is live. Two guest threads then share
+    # one `errno` cell, and the symptom is an occasional wrong error number in a thread that did
+    # nothing wrong.
+    ("threads-A2", "A", "an exited thread's block is handed to a thread that is still using one",
+     ADAPTER_RUNTIME,
+     """        if let Some(index) = self.free.pop() {
+            return Some(index);
+        }
+        if self.high_water >= capacity {
+            return None;
+        }
+        let index = self.high_water;
+        self.high_water += 1;
+        Some(index)""",
+     """        let index = self.slots.len();
+        if index >= capacity {
+            return None;
+        }
+        self.high_water = self.high_water.max(index + 1);
+        Some(index)""",
+     ANDROID),
+
+    # A thread that stopped without returning produced no `void *`. Reporting 0 with an untouched
+    # `retval` is indistinguishable from a thread that returned NULL, which is the one answer the
+    # guest cannot tell apart from success.
+    ("threads-A3", "A", "joining a thread that faulted reports success", ADAPTER_MOD,
+     """            GuestThreadState::Failed(why) => Err(format!(""",
+     """            GuestThreadState::Failed(_why) if start_routine != usize::MAX => {
+                Ok(JoinOutcome::Returned(0))
+            }
+            GuestThreadState::Failed(why) => Err(format!(""",
+     ANDROID),
+
+    # `pthread_attr_setstacksize(attr, SIZE_MAX)` is two guest numbers meeting a page size. The
+    # masked round-up wraps to ZERO, silently in release, and the thread gets a stack made
+    # entirely of its guard page.
+    ("threads-A4", "A", "a SIZE_MAX stack request wraps to a zero-byte stack", ADAPTER_THREADS,
+     """    value.checked_add(to - remainder)""",
+     """    Some(value.wrapping_add(to - remainder))""",
+     ANDROID),
+
+    # Without the thunk table on the new context, the new thread's first imported call branches
+    # into a region that is not executable. The thread dies rather than calling anything, which
+    # nothing about `pthread_create`'s own return value would show.
+    ("threads-A5", "A", "the thunk table is not installed on the new thread's context",
+     ADAPTER_THREADS,
+     """    if let Err(error) = boundary.install(&mut *cpu) {""",
+     """    if let Err(error) = (if entry == usize::MAX { boundary.install(&mut *cpu) } else { Ok(()) }) {""",
+     ANDROID),
+
+    # The start routine's own `RET` is what ends a guest thread, and it ends it by landing on the
+    # boundary's sentinel. Without it the thread returns to whatever `X30` held and runs off.
+    ("threads-A6", "A", "the new thread's X30 is not the boundary's sentinel", ADAPTER_THREADS,
+     """        cpu.set_x(XReg::new(30).expect("X30 exists"), boundary.sentinel() as u64);""",
+     """        cpu.set_x(XReg::new(30).expect("X30 exists"), 0);""",
+     ANDROID),
+
+    # A thread that exits without giving its block back leaks one per thread, so a guest that
+    # creates and joins in a loop stops being able to create threads after 64 of them -- with a
+    # refusal that names the thread count and points at the guest rather than at this line.
+    ("threads-A7", "A", "an exited guest thread never gives its arena block back",
+     ADAPTER_THREADS,
+     """    let _ = bionic.threads_table().detach_current();""",
+     """    let _ = ();""",
+     ANDROID),
+
+    # The over-correction on `pthread_detach`: treating the FIRST detach as the one that is not
+    # joinable. A guest that detaches once and never joins then leaks a record for every thread.
+    ("threads-B1", "B", "the first pthread_detach is refused as well as the second", ADAPTER_MOD,
+     """        if record.detached {
+            // POSIX: "the value specified by thread does not refer to a joinable thread". A""",
+     """        if !record.detached {
+            // POSIX: "the value specified by thread does not refer to a joinable thread". A""",
+     ANDROID),
+
+    # The over-correction on `pthread_getschedparam`: refusing it along with the signal family,
+    # on a "this runtime does not model scheduling" argument. Nothing in the reachable 188 can
+    # SET a policy, so the default is forced rather than approximated, and refusing it stops a
+    # correct guest over a field it is only reading.
+    ("threads-B2", "B", "pthread_getschedparam refuses instead of answering the forced default",
+     ADAPTER_THREADS,
+     """    let call = Call::inline(c)?;
+    if !call.bionic().knows_guest_thread(thread) {""",
+     """    let call = Call::inline(c)?;
+    if thread != u64::MAX {
+        return call.refuse("this runtime does not model scheduling policy");
+    }
+    if !call.bionic().knows_guest_thread(thread) {""",
+     ANDROID),
+
+    # ------------------------------------------------ phase 3c: cross-context code invalidation
+
+    # The state phase 2 left: `invalidate_code` reaching ONE context, so a second guest thread
+    # that had translated the same range keeps executing bytes that are no longer mapped.
+    ("watch-A1", "A", "an unmap reaches only the calling thread's context", BOUNDARY,
+     """        let me = CONTEXT.with(|cell| cell.borrow().as_ref().map(|(token, _)| *token));
+        self.boundary.code_watch.broadcast(me.unwrap_or(u64::MAX), (address, len));""",
+     """        let me = CONTEXT.with(|cell| cell.borrow().as_ref().map(|(token, _)| *token));
+        let _ = (me, address, len);""",
+     ANDROID),
+
+    # The over-correction: collapsing to the whole address space on the first range rather than
+    # on a full queue. It is always *safe* -- over-invalidating costs translation and nothing
+    # else -- which is exactly why nothing but a counter can see it.
+    ("watch-B1", "B", "every cross-context invalidation collapses to the whole address space",
+     BOUNDARY,
+     """            if inner.ranges.len() >= MAX_PENDING_INVALIDATIONS {""",
+     """            if inner.ranges.len() < MAX_PENDING_INVALIDATIONS {""",
+     ANDROID),
+
+    # ---------------------------------------------------------------- phase 3c: the arena's bases
+
+    # The accessor/layout disagreement an independent review found: the arena test restated
+    # `ARENA_BYTES`'s own definition, which cannot fail, so nothing checked that the four
+    # accessors agreed with it. With this applied, `fopen` hands out `FILE` objects on top of the
+    # pool's interned strings.
+    ("arena-A1", "A", "the FILE table starts on top of the pool", ADAPTER_MOD,
+     """    pub fn files_base(&self) -> GuestAddr {
+        self.pool() + POOL_BYTES
+    }""",
+     """    pub fn files_base(&self) -> GuestAddr {
+        self.pool()
+    }""",
+     ANDROID_LIB),
 ]
 
 
