@@ -405,6 +405,15 @@ impl Registry {
         self.class(id.class)?.fields.get(usize::from(id.member))
     }
 
+    /// The member behind a [`FieldId`], mutably, so a host can decide what it answers.
+    #[must_use]
+    pub fn field_mut(&mut self, id: FieldId) -> Option<&mut Member> {
+        self.classes
+            .get_mut(usize::from(id.class.0))?
+            .fields
+            .get_mut(usize::from(id.member))
+    }
+
     /// Record a lookup nothing here answers. See the module docs for why this exists.
     pub fn record_miss(&mut self, miss: Miss) {
         // Bounded, because a guest in a loop looking up a member that does not exist would
@@ -533,6 +542,67 @@ static WINDOW_INSETS_TYPE: &[MemberSpec] = &[
 /// measurement. It is declared `F` here. If the engine asks for `fontScale` as `I` the lookup
 /// misses, and the miss is recorded with the descriptor it asked for — which is the measurement
 /// that settles it, and is why a miss is recorded rather than silently answered.
+/// `android.view.MotionEvent`, as the GameActivity glue reads it — **twenty-two methods,
+/// MEASURED**.
+///
+/// Every entry was read out of M5's gate's own miss log: the class was declared empty, the run
+/// asked for a member, `Jni::misses` recorded it *with the descriptor it asked for*, and the
+/// entry was written from that. **Not transcribed from the Android API**, which would be a claim
+/// about a surface nobody measured — and which would have got `getClassification` and
+/// `getActionButton` wrong, since both are API-29-and-later and a transcription from an older
+/// reference would have omitted them.
+///
+/// It is independent confirmation of `apk-analysis.md` §4.4's finding that the **buffered** input
+/// model is in use: the glue reads these twenty-two off the *Java* `MotionEvent` and packs them
+/// into its own `GameActivityMotionEvent`, which is why `AMotionEvent_*` is absent from the whole
+/// APK.
+///
+/// **All `Unanswered`, deliberately.** Step 13 only *resolves* these; nothing calls one until an
+/// input event arrives, which is M8. A `GetMethodID` that missed would be a null `jmethodID`
+/// handed straight to `CallIntMethodV` — which is how this list was found — so the lookup must
+/// succeed. Calling one refuses by name, which is where the answer will have to be decided.
+static MOTION_EVENT: &[MemberSpec] = &[
+    m("getDeviceId", "()I", Answer::Unanswered),
+    m("getSource", "()I", Answer::Unanswered),
+    m("getAction", "()I", Answer::Unanswered),
+    m("getEventTime", "()J", Answer::Unanswered),
+    m("getDownTime", "()J", Answer::Unanswered),
+    m("getFlags", "()I", Answer::Unanswered),
+    m("getMetaState", "()I", Answer::Unanswered),
+    m("getActionButton", "()I", Answer::Unanswered),
+    m("getButtonState", "()I", Answer::Unanswered),
+    m("getClassification", "()I", Answer::Unanswered),
+    m("getEdgeFlags", "()I", Answer::Unanswered),
+    m("getHistorySize", "()I", Answer::Unanswered),
+    m("getHistoricalEventTime", "(I)J", Answer::Unanswered),
+    m("getPointerCount", "()I", Answer::Unanswered),
+    m("getPointerId", "(I)I", Answer::Unanswered),
+    m("getToolType", "(I)I", Answer::Unanswered),
+    m("getRawX", "(I)F", Answer::Unanswered),
+    m("getRawY", "(I)F", Answer::Unanswered),
+    m("getXPrecision", "()F", Answer::Unanswered),
+    m("getYPrecision", "()F", Answer::Unanswered),
+    m("getAxisValue", "(II)F", Answer::Unanswered),
+    m("getHistoricalAxisValue", "(III)F", Answer::Unanswered),
+];
+
+/// `android.view.KeyEvent` — **eleven methods, MEASURED** the same way as [`MOTION_EVENT`], from
+/// the same run's miss log.
+static KEY_EVENT: &[MemberSpec] = &[
+    m("getDeviceId", "()I", Answer::Unanswered),
+    m("getSource", "()I", Answer::Unanswered),
+    m("getAction", "()I", Answer::Unanswered),
+    m("getEventTime", "()J", Answer::Unanswered),
+    m("getDownTime", "()J", Answer::Unanswered),
+    m("getFlags", "()I", Answer::Unanswered),
+    m("getMetaState", "()I", Answer::Unanswered),
+    m("getModifiers", "()I", Answer::Unanswered),
+    m("getRepeatCount", "()I", Answer::Unanswered),
+    m("getKeyCode", "()I", Answer::Unanswered),
+    m("getScanCode", "()I", Answer::Unanswered),
+    m("getUnicodeChar", "()I", Answer::Unanswered),
+];
+
 static CONFIGURATION: &[MemberSpec] = &[
     f("mcc", "I", Answer::Int(0)),
     f("mnc", "I", Answer::Int(0)),
@@ -584,6 +654,35 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "androidx/core/view/WindowInsetsCompat$Type",
         tier: Tier::Zero,
         methods: WINDOW_INSETS_TYPE,
+        fields: NONE,
+    },
+    // **`MotionEvent` and `KeyEvent`, which §3.1's Tier 0 does not name.**
+    //
+    // MEASURED by M5's gate: step 13 does `FindClass("android/view/MotionEvent")`, gets null
+    // because nothing declared it, and hands the null straight to `GetMethodID` — which is §8.1's
+    // **third** failure mode happening for real, one class further on than §3.1 predicted. On a
+    // device the null would be a `CHECK_NOT_NULL` abort or a JNI warning and a crash; here it is a
+    // refusal naming the call, which is how it was found.
+    //
+    // They are the GameActivity glue's, not Roblox's: `GameActivity_onCreate` fills all 21
+    // callback slots and the glue converts Java input events into its own
+    // `GameActivityMotionEvent`/`GameActivityKeyEvent` buffers. `apk-analysis.md` §4.4 records
+    // that `AMotionEvent_*` and `AKeyEvent_*` are absent from the whole APK, which is independent
+    // confirmation of that buffered model — the glue reads the *Java* objects through JNI rather
+    // than the NDK's input API.
+    //
+    // Declared with the members the run asks for and **nothing else**: a member nobody looks up is
+    // a claim about a surface this layer has not measured.
+    ClassSpec {
+        name: "android/view/MotionEvent",
+        tier: Tier::Zero,
+        methods: MOTION_EVENT,
+        fields: NONE,
+    },
+    ClassSpec {
+        name: "android/view/KeyEvent",
+        tier: Tier::Zero,
+        methods: KEY_EVENT,
         fields: NONE,
     },
     // **`AssetManager` has no members and that is the whole of it.** §8 step 13 receives one as an

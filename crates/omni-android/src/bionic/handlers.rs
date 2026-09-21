@@ -418,6 +418,20 @@ handlers! {
     fn pthread_attr_setstacksize(attr: ptr, size: u64) -> i32 =
         |v| omni_bionic::metadata::attr_setstacksize(&mut v, attr, size);
 
+    /// `int pthread_attr_setdetachstate(pthread_attr_t *attr, int state)`
+    ///
+    /// **Bound in M5, and it was a pure binding gap**: `omni_bionic::metadata::attr_setdetachstate`
+    /// has existed since phase 3c and nothing called it. M5's gate found it —
+    /// `GameActivity_onCreate` step 3 sets `PTHREAD_CREATE_DETACHED` on the game thread's
+    /// attributes before `pthread_create`, and the run stopped there with `Unbound` naming the
+    /// symbol, which is exactly the failure that shape is supposed to produce.
+    ///
+    /// `pthread_create` already reads the detach state out of the attribute object at
+    /// `threads::ATTR_DETACH_STATE`, so binding this is the whole of what was missing: without it
+    /// the glue's game thread would have been created **joinable**, and nothing joins it.
+    fn pthread_attr_setdetachstate(attr: ptr, state: i32) -> i32 =
+        |v| omni_bionic::metadata::attr_setdetachstate(&mut v, attr, state);
+
     // ---------------------------------------------------------- pthread: mutex
 
     /// `int pthread_mutexattr_init(pthread_mutexattr_t *attr)`
@@ -877,6 +891,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pthread_attr_init", pthread_attr_init),
     ("pthread_attr_destroy", pthread_attr_destroy),
     ("pthread_attr_setstacksize", pthread_attr_setstacksize),
+    ("pthread_attr_setdetachstate", pthread_attr_setdetachstate),
     // pthread mutex
     ("pthread_mutexattr_init", pthread_mutexattr_init),
     ("pthread_mutexattr_destroy", pthread_mutexattr_destroy),

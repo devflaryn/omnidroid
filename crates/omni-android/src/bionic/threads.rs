@@ -179,6 +179,54 @@ pub struct ThreadHost {
     stack_bytes: usize,
     /// Guest instructions per run window.
     window: u64,
+    /// Everything besides the bionic instance that a created guest thread must also carry.
+    ///
+    /// See [`ThreadLocalInstance`]. Empty by default, because an instance with only the bionic
+    /// surface needs nothing else — and because a default that guessed would be this layer
+    /// deciding which of the embedding's instances a guest thread belongs to.
+    also: Vec<Arc<dyn ThreadLocalInstance>>,
+}
+
+/// Something a **created guest thread** must have published to it, besides the bionic instance.
+///
+/// # Why this exists, and what it cost to find out
+///
+/// Every per-instance state in this crate is published to a thread by a guard held across
+/// [`Boundary::run`](crate::Boundary::run) — `Bionic::activate`, `Jni::activate`,
+/// `Ndk::activate` — because an [`ImportFn`](crate::ImportFn) is a bare `fn` pointer with no user
+/// data. A guest thread that `pthread_create` starts runs on a **new host thread**, and a
+/// thread-local published on the creating thread is not there.
+///
+/// The adapter has always published the bionic instance for such a thread. It published nothing
+/// else, because until M5 there was nothing else — and **M5's gate found it the expensive way**:
+/// `GameActivity_onCreate` spawned the game thread, that thread called `AConfiguration_new`, the
+/// handler found no NDK instance and refused, the thread died, `app->running` was never set, and
+/// the calling thread waited on its condition variable **for ever**. That is §8 row 14 and §8.1's
+/// fifth failure mode happening together, and the only reason it was diagnosable in three minutes
+/// rather than three days is that `Bionic::parked()` named the parked thread, the condition
+/// variable and the mutex, and `Boundary::last_call` named `AConfiguration_new`.
+///
+/// **It belongs to the embedding rather than to `Bionic`.** `Bionic` must not learn that `Jni` or
+/// `Ndk` exist — the crate's modules are deliberately independent — so what a guest thread carries
+/// is named at the call site that builds the thread host, where the embedding already decides
+/// everything else about the instance.
+pub trait ThreadLocalInstance: Send + Sync {
+    /// A name for a diagnostic, so a failure to publish says *which* instance.
+    fn name(&self) -> &'static str;
+
+    /// Publish this instance to the calling thread.
+    ///
+    /// The returned guard un-publishes on drop, so the thread's whole life is covered by holding
+    /// it. It is `Box<dyn Any>` because each instance's guard is its own type and the only thing
+    /// this layer does with one is keep it alive.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the instance's own `activate` refuses — `Jni::activate` refuses past
+    /// `MAX_JNI_THREADS`, for instance. **Reported as a thread failure rather than ignored**: a
+    /// guest thread missing an instance it needs does not fail where it is missing, it fails
+    /// thousands of instructions later, and the failure this one produced was a permanent hang.
+    fn publish(&self) -> AbiResult<Box<dyn core::any::Any>>;
 }
 
 impl core::fmt::Debug for ThreadHost {
@@ -206,7 +254,25 @@ impl ThreadHost {
             limit: MAX_GUEST_THREADS,
             stack_bytes: DEFAULT_GUEST_STACK_BYTES,
             window: GUEST_THREAD_STEP_WINDOW,
+            also: Vec::new(),
         }
+    }
+
+    /// Also publish `instance` to every guest thread this host creates.
+    ///
+    /// See [`ThreadLocalInstance`] for what this is and what its absence cost. An embedding that
+    /// has a `Jni` or an `Ndk` **must** name it here, or the first guest thread that reaches one
+    /// of their handlers refuses and dies.
+    #[must_use]
+    pub fn with_instance(mut self, instance: Arc<dyn ThreadLocalInstance>) -> Self {
+        self.also.push(instance);
+        self
+    }
+
+    /// Everything besides the bionic instance a created guest thread will carry.
+    #[must_use]
+    pub fn instances(&self) -> &[Arc<dyn ThreadLocalInstance>] {
+        &self.also
     }
 
     /// Cap how many guest threads this instance will have running at once.
@@ -388,6 +454,9 @@ struct Spawn {
     /// `SP` at entry: the top of the stack, 16-byte aligned as AAPCS64 requires.
     stack_top: GuestAddr,
     window: u64,
+    /// Everything besides the bionic instance this thread must carry. See
+    /// [`ThreadLocalInstance`].
+    also: Vec<Arc<dyn ThreadLocalInstance>>,
 }
 
 /// `int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
@@ -612,6 +681,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         stack: (stack_base, total),
         stack_top,
         window: host.step_window(),
+        also: host.instances().to_vec(),
     };
     match std::thread::Builder::new()
         .name(format!("omnidroid-guest-{:#x}", slot.id.0))
@@ -663,8 +733,18 @@ fn round_up(value: usize, to: usize) -> Option<usize> {
 /// Constraint 11 makes a panic reachable from guest input Critical; this turns one into a
 /// reported thread failure, which a caller can see and act on.
 fn run_guest_thread(spawn: Spawn) {
-    let Spawn { bionic, boundary, mut cpu, slot, entry, argument, stack, stack_top, window } =
-        spawn;
+    let Spawn {
+        bionic,
+        boundary,
+        mut cpu,
+        slot,
+        entry,
+        argument,
+        stack,
+        stack_top,
+        window,
+        also,
+    } = spawn;
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // D13 again, from the other side: the context already has its thread pointer, which is
         // what makes it legal to run guest code at all on this thread.
@@ -676,6 +756,22 @@ fn run_guest_thread(spawn: Spawn) {
             );
         }
         let _activation = bionic.activate_slot(slot);
+        // **Everything else the embedding said this thread carries**, published for the thread's
+        // whole life. A guest thread missing one does not fail where it is missing: M5's gate
+        // measured the game thread dying on `AConfiguration_new` with no NDK instance, which
+        // showed up as `initializeNativeCode` waiting on its condition variable for ever.
+        let mut published: Vec<Box<dyn core::any::Any>> = Vec::with_capacity(also.len());
+        for instance in &also {
+            match instance.publish() {
+                Ok(guard) => published.push(guard),
+                Err(error) => {
+                    return GuestThreadState::Failed(format!(
+                        "this guest thread could not be given the `{}` instance it needs, so it                          would have failed on the first call into it: {error}",
+                        instance.name()
+                    ))
+                }
+            }
+        }
         // Keep this context in the boundary's registry for the whole of its life rather than for
         // one run window. A guest thread runs in many short windows, and a range another thread
         // unmapped between two of them has to reach this one — see `Boundary::watch_context`.

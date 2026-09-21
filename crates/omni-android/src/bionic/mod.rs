@@ -54,7 +54,7 @@ mod threads;
 mod view;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -81,14 +81,15 @@ pub use data::{DataObject, GuestProcess, DATA_OBJECTS, FILE_BYTES};
 pub use files::{
     errno_for, DIRENT_BYTES, STATVFS_BYTES, STAT_BYTES, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
-pub use logging::LogRecord;
+pub use logging::{LogRecord, LogRing, LOG_CAPTURE_MAX_BYTES, RECORD_MAX_FOOTPRINT};
+pub use omni_platform::log::Truncation;
 pub use net::{FD_SETSIZE, MAX_POLL_FDS};
 pub use omni_platform::log::Priority as LogPriority;
 pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
 pub use threads::{
-    GuestThreadFailure, GuestThreadState, ThreadHost, DEFAULT_GUEST_STACK_BYTES,
-    GUEST_THREAD_STEP_WINDOW, MIN_GUEST_STACK_BYTES, SCHED_OTHER,
+    GuestThreadFailure, GuestThreadState, ThreadHost, ThreadLocalInstance,
+    DEFAULT_GUEST_STACK_BYTES, GUEST_THREAD_STEP_WINDOW, MIN_GUEST_STACK_BYTES, SCHED_OTHER,
 };
 pub use view::{
     GuestView, DL_INFO_OFFSET, DL_INFO_SLOTS, DL_PHDR_INFO_BYTES, ERRNO_OFFSET, SCRATCH_BYTES,
@@ -184,6 +185,10 @@ pub const MAX_SLEEP_SECONDS: u64 = 60;
 /// an unbounded ring is a host allocation a guest can drive in a loop. Records past the cap are
 /// dropped oldest-first and counted, so [`Bionic::log_dropped`] can say the ring wrapped rather
 /// than the ring quietly pretending it did not.
+///
+/// **This is one of the ring's two bounds and not the one that bounds memory.** The guest chooses
+/// the length of every record, so a count of records says nothing about bytes; that is
+/// [`LOG_CAPTURE_MAX_BYTES`], and `logging`'s module documentation records why both are needed.
 pub const LOG_CAPTURE_MAX: usize = 256;
 
 /// One guest instance's bionic state.
@@ -270,10 +275,11 @@ pub struct Bionic {
     abort_message: Mutex<Option<String>>,
     /// `openlog`'s ident, which tags later `syslog` lines.
     syslog_ident: Mutex<Option<String>>,
-    /// The last [`LOG_CAPTURE_MAX`] records, for inspection.
-    log_ring: Mutex<VecDeque<LogRecord>>,
-    /// How many records the ring dropped, so a wrap is visible rather than silent.
-    log_dropped: AtomicU64,
+    /// The capture ring: the last [`LOG_CAPTURE_MAX`] records and at most
+    /// [`LOG_CAPTURE_MAX_BYTES`] of them, with its own drop and truncation counters. Both bounds
+    /// and both counters live inside [`LogRing`] because they have to move together; see
+    /// `logging`'s module documentation.
+    log_ring: LogRing,
     /// Whether records also reach the host's standard error. On by default: that is what a real
     /// run wants, and a suite that does not want it says so.
     log_to_stderr: AtomicBool,
@@ -502,8 +508,7 @@ impl Bionic {
             hwcap: Mutex::new(HwcapPolicy::Undecided),
             abort_message: Mutex::new(None),
             syslog_ident: Mutex::new(None),
-            log_ring: Mutex::new(VecDeque::new()),
-            log_dropped: AtomicU64::new(0),
+            log_ring: LogRing::new(),
             log_to_stderr: AtomicBool::new(true),
             fs: OnceLock::new(),
             fs_device: OnceLock::new(),
@@ -696,28 +701,53 @@ impl Bionic {
     }
 
     /// Record one log line, and emit it if this instance is emitting.
+    ///
+    /// The record arrives with the platform's caps already applied — `logging::capped_record` is
+    /// where that happens, because it is where the guest's bytes are — so this is the ring's
+    /// admission and nothing else.
     pub(crate) fn log(&self, record: LogRecord) {
         if self.log_to_stderr.load(Ordering::Relaxed) {
             logging::emit(&record);
         }
-        let mut ring = self.log_ring.lock();
-        if ring.len() == LOG_CAPTURE_MAX {
-            ring.pop_front();
-            self.log_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-        ring.push_back(record);
+        self.log_ring.push(record);
     }
 
     /// Every log record still in the ring, oldest first.
     #[must_use]
     pub fn log_records(&self) -> Vec<LogRecord> {
-        self.log_ring.lock().iter().cloned().collect()
+        self.log_ring.records()
     }
 
-    /// How many records the ring has dropped, so a wrap is visible.
+    /// How many whole records the ring has **evicted**, by either of its two bounds.
+    ///
+    /// Distinct from [`Bionic::log_truncated`], and the distinction is the point: an evicted line
+    /// is gone, a truncated one is present and short, and a host that cannot tell them apart
+    /// cannot tell "the guest logged more than the ring holds" from "the guest logged lines
+    /// longer than a device would have carried".
     #[must_use]
     pub fn log_dropped(&self) -> u64 {
-        self.log_dropped.load(Ordering::Relaxed)
+        self.log_ring.dropped()
+    }
+
+    /// How many host bytes those evicted records were holding.
+    #[must_use]
+    pub fn log_dropped_bytes(&self) -> u64 {
+        self.log_ring.dropped_bytes()
+    }
+
+    /// How many records entered the ring **shortened** by `liblog`'s caps.
+    ///
+    /// The per-record detail is on the record itself, as `LogRecord::truncated`; this is the
+    /// count, for a host that wants to know whether to look.
+    #[must_use]
+    pub fn log_truncated(&self) -> u64 {
+        self.log_ring.truncated()
+    }
+
+    /// How many host bytes of log records the ring is holding right now.
+    #[must_use]
+    pub fn log_bytes(&self) -> usize {
+        self.log_ring.bytes()
     }
 
     /// Whether log records also reach the host's standard error. On by default.

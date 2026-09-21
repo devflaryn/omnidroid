@@ -521,3 +521,43 @@ pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<Arc<Ndk>> {
         AbiError::NdkNotActive { symbol: symbol.to_string(), address }
     })
 }
+
+/// An [`Ndk`] as something a **created guest thread** carries.
+///
+/// See [`ThreadLocalInstance`](crate::bionic::ThreadLocalInstance) for what this is and what its
+/// absence cost. A wrapper rather than an impl on `Ndk` itself because
+/// [`Ndk::activate`] takes `&Arc<Self>` — publishing an instance means cloning the `Arc`, and a
+/// `&self` cannot produce one.
+pub struct NdkThreadInstance(Arc<Ndk>);
+
+impl core::fmt::Debug for NdkThreadInstance {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("NdkThreadInstance")
+    }
+}
+
+impl crate::bionic::ThreadLocalInstance for NdkThreadInstance {
+    fn name(&self) -> &'static str {
+        "Ndk"
+    }
+
+    fn publish(&self) -> AbiResult<Box<dyn core::any::Any>> {
+        Ok(Box::new(self.0.activate()))
+    }
+}
+
+impl Ndk {
+    /// This instance, as something a created guest thread carries.
+    ///
+    /// **An embedding with an `Ndk` must pass this to
+    /// [`ThreadHost::with_instance`](crate::bionic::ThreadHost::with_instance)**, or the first
+    /// guest thread that reaches an NDK handler refuses and dies. M5's gate measured exactly that:
+    /// the game thread `GameActivity_onCreate` spawns calls `AConfiguration_new` before it does
+    /// anything else, and without the instance it died there — leaving `initializeNativeCode`
+    /// parked on its condition variable for ever, which is §8 row 14 and §8.1's fifth failure
+    /// mode happening together.
+    #[must_use]
+    pub fn thread_instance(self: &Arc<Self>) -> Arc<dyn crate::bionic::ThreadLocalInstance> {
+        Arc::new(NdkThreadInstance(Arc::clone(self)))
+    }
+}

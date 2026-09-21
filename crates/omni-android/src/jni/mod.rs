@@ -684,6 +684,48 @@ impl Jni {
         Ok(())
     }
 
+    /// Decide what a **field** answers, as [`define`](Jni::define) decides a method.
+    ///
+    /// Two calls rather than one because a class may declare a field and a method under the same
+    /// name — Java allows it and `jni-surface.md` §3.1's `Configuration` nearly does, with
+    /// `getLocales()` beside eighteen fields — so a single `define` would have to guess which was
+    /// meant.
+    ///
+    /// **What needs it:** `AConfiguration` and the Java `Configuration` object answer the same
+    /// question, and a host that decided one and left the other at its declared default would
+    /// have the engine reading two different screen widths. Making both the host's decision is
+    /// the only way they cannot disagree.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] if the class or the field is not declared, naming both.
+    pub fn define_field(
+        &self,
+        class: &str,
+        field: &str,
+        descriptor: &str,
+        is_static: bool,
+        answer: classes::Answer,
+    ) -> AbiResult<()> {
+        let mut state = self.state.lock();
+        let refuse = |detail: String| AbiError::JniRefused {
+            function: "Jni::define_field".to_string(),
+            address: self.arena,
+            detail,
+        };
+        let Some(id) = state.registry.find(class) else {
+            return Err(refuse(format!("`{class}` is not declared")));
+        };
+        let Some(found) = state.registry.field(id, field, descriptor, is_static) else {
+            return Err(refuse(format!(
+                "`{class}` declares no {}field `{field}` of type `{descriptor}`",
+                if is_static { "static " } else { "" }
+            )));
+        };
+        state.registry.field_mut(found).expect("just resolved").answer = answer;
+        Ok(())
+    }
+
     /// The class registry, for a host that wants to declare more classes before running.
     pub fn with_registry<T>(&self, f: impl FnOnce(&mut Registry) -> T) -> T {
         f(&mut self.state.lock().registry)
@@ -935,6 +977,48 @@ pub(crate) fn active_opt() -> Option<(Arc<Jni>, usize)> {
 /// This thread's `JNIEnv` slot, or a refusal.
 fn current_thread(function: &str, address: GuestAddr) -> AbiResult<usize> {
     active(function, address).map(|(_, index)| index)
+}
+
+/// A [`Jni`] as something a **created guest thread** carries.
+///
+/// See [`ThreadLocalInstance`](crate::bionic::ThreadLocalInstance). A wrapper rather than an impl
+/// on `Jni` itself because [`Jni::activate`] takes `&Arc<Self>`.
+///
+/// Publishing this to a guest thread is what gives that thread **its own `JNIEnv`**: `activate`
+/// assigns the thread the next free slot of [`MAX_JNI_THREADS`], so the game thread's pending
+/// exception and its local references are its own. It refuses past that cap rather than handing
+/// out a second thread's env, and the refusal is reported as a thread failure — which is the
+/// right direction: two threads sharing one pending exception is the failure no later test sees.
+pub struct JniThreadInstance(Arc<Jni>);
+
+impl core::fmt::Debug for JniThreadInstance {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("JniThreadInstance")
+    }
+}
+
+impl crate::bionic::ThreadLocalInstance for JniThreadInstance {
+    fn name(&self) -> &'static str {
+        "Jni"
+    }
+
+    fn publish(&self) -> AbiResult<Box<dyn core::any::Any>> {
+        Ok(Box::new(self.0.activate()?))
+    }
+}
+
+impl Jni {
+    /// This instance, as something a created guest thread carries.
+    ///
+    /// **An embedding with a `Jni` must pass this to
+    /// [`ThreadHost::with_instance`](crate::bionic::ThreadHost::with_instance)**, or a guest
+    /// thread that reaches any JNI function refuses and dies. The GameActivity glue's game thread
+    /// does: `android_app_entry` runs on it and the engine's own scoped-attach helper calls
+    /// `GetEnv` from it.
+    #[must_use]
+    pub fn thread_instance(self: &Arc<Self>) -> Arc<dyn crate::bionic::ThreadLocalInstance> {
+        Arc::new(JniThreadInstance(Arc::clone(self)))
+    }
 }
 
 #[cfg(test)]
