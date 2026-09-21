@@ -3748,6 +3748,17 @@ None of them blocks M5: step 13 returns before any of them happens.
 * **§4.4's "ANativeWindow (9)" is the APK's count, not `libroblox.so`'s.** That binary imports
   five: `_acquire`, `_fromSurface`, `_getWidth`, `_getHeight`, `_release`. The other four belong to
   `libimage_processing_util_jni` and `libsurface_util_jni`.
+
+  **Reproduced twice since, by two readers who were not its author, and by a different method the
+  second time** — attributing every `ANativeWindow_*` line to the per-library section it falls in,
+  rather than reading the cited line numbers. Both witnesses agree: **9** distinct names across the
+  APK, **5** in `libroblox.so`. The full attribution, which neither earlier reading had:
+  `libimage_processing_util_jni.so` 5, `libsurface_util_jni.so` 5, `libzstd-jni-1.5.7-6.so` 4 --
+  the four importers overlap, which is why summing them does not give 9 and why "the APK's count"
+  is the only reading of §4.4 that is arithmetically possible.
+
+  The same walk confirms M6's other standing figure: **17** `egl*` symbols in `libroblox.so`, as
+  §8 row 25 and `HANDOFF.md` both say. That one now has a second witness too.
 * **`sched_yield` was called 22,387,975 times** in one run — the AT_HWCAP decline's fallback path
   (D26) spinning. It is not a correctness problem and it is a large number; D26's "revisit at M8
   under real thread load" now has a figure attached to it.
