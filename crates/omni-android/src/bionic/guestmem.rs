@@ -258,8 +258,21 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let space = call.mem.space();
     let page = space.page_size();
 
-    // A file-backed mapping, whether it says so by `fd` or by the absence of `MAP_ANONYMOUS`.
-    if fd != -1 || flags & MAP_ANONYMOUS == 0 {
+    // **A file-backed mapping is one without `MAP_ANONYMOUS`, and `fd` says nothing.**
+    //
+    // This used to read `if fd != -1 || flags & MAP_ANONYMOUS == 0`, and that extra clause was
+    // wrong: Linux **ignores `fd` entirely** when `MAP_ANONYMOUS` is set. `mmap(2)` says so — "the
+    // fd argument is ignored; however, some implementations require fd to be -1 ... portable
+    // applications should ensure this" — and the kernel's anonymous path never looks at it.
+    // Passing `0` is legal and ordinary.
+    //
+    // **M3's gate is what found it, at `init_array[188]`**, where the engine's own allocator asks
+    // for `mmap(NULL, len, prot, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0)`. Every such call was refused as
+    // "file-backed" — which is the guest **heap seam** refusing every allocation, since
+    // `libroblox.so` imports no allocator at all and guest `mmap` is where its heap comes from. No
+    // test here could see it: every one of them passes `-1`, which is what the manual page tells
+    // applications to do and what nothing is obliged to do.
+    if flags & MAP_ANONYMOUS == 0 {
         return call.refuse(format!(
             "the guest asked for a file-backed mapping — fd {fd}, flags {flags:#x}, offset \
              {offset:#x}. `omni-mem` can map a file, but only from a `Backing` opened by the host, \
