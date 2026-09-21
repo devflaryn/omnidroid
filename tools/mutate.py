@@ -130,6 +130,8 @@ ADAPTER_RUNTIME = "crates/omni-android/src/bionic/runtime.rs"
 JNI_ENV = "crates/omni-android/src/jni/env.rs"
 JNI_REFS = "crates/omni-android/src/jni/refs.rs"
 JNI_CLASSES = "crates/omni-android/src/jni/classes.rs"
+# M6: the startup gate itself. Two `jmid-` rows are anchored in it.
+GATE_ACTIVITY_FILE = "crates/omni-android/tests/gameactivity.rs"
 JNI_VALUES = "crates/omni-android/src/jni/values.rs"
 JNI_POOL = "crates/omni-android/src/jni/pool.rs"
 JNI_SLOTS = "crates/omni-android/src/jni/slots.rs"
@@ -203,6 +205,14 @@ ANDROID = [
 # task 2. Its detector is the unit test on `clocks::capped`, which is why that predicate is a
 # function rather than an inline comparison.
 ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
+
+# The startup gate, FILTERED to one test by name. `ANDROID` deliberately does not name
+# `--test gameactivity`: that target runs the real APK end to end and takes ~50 s, which is
+# the same reasoning that keeps `tests/stress.rs` out of `BIONIC`. The two rows that need it
+# are detected by `the_activity_class_answers_every_member_row_23_looks_up_on_it`, which needs
+# neither the APK nor a guest run -- so this costs a build and not a run.
+GATE_ACTIVITY = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
+                 "--no-fail-fast", "the_activity_class"]
 
 # M6 groundwork: runtime texture transcoding (`omni-texture`). Zero dependencies and `#![no_std]`,
 # so its command builds in about a second.
@@ -3473,7 +3483,7 @@ directory", ADAPTER_FILES,
     # not a detector -- and a row that looked like one would have been evidence for nothing.
     ("jni-A9", "A", "the generated surface wins over a decided answer",
      JNI_CLASSES,
-     """            if self.method(id, member.name, member.descriptor, member.is_static).is_none() {
+     """            if self.declared_method(id, member.name, member.descriptor, member.is_static).is_none() {
                 let class = &mut self.classes[usize::from(id.0)];
                 if class.methods.len() < usize::from(u16::MAX) {
                     class.methods.push(Member {""",
@@ -4773,6 +4783,88 @@ directory", ADAPTER_FILES,
      """        admit_transfer(view, s, size as u64, true, 0)?;
 """,
      ANDROID),
+
+    # ---- The null `jmethodID` on the game thread (M6). ----------------------------------------
+    #
+    # MEASURED: `CallObjectMethodV` was handed 0x0 at guest pc 0x02bd8cac, from a `GetMethodID`
+    # at 0x02bdad0c asking `com/google/androidgamesdk/GameActivity` for
+    # `getResources()Landroid/content/res/Resources;`. There is NO `cbz` between the two -- the
+    # engine does not check. The member is declared on `android/content/Context` and the registry
+    # had no superclass chain, so it answered null for a member the class genuinely has.
+    #
+    # The premise this was chased under was itself wrong and is worth recording: `Jni::misses` was
+    # empty, which read as "the member IS declared". It was empty because `report()` ran the
+    # instant step 13 returned -- BEFORE `android_main` had run at all. Measured after
+    # `join_guest_threads`, misses = 1 and it named the member. **A census taken before the work
+    # happens is not evidence that the work succeeded** (VERIFICATION entry 11, one layer up).
+
+    # The defect the gate found for real: `getResources()` is declared on `Context` and asked of
+    # `GameActivity`, so a flat registry answers null and the guest hands that null straight to
+    # `CallObjectMethodV` with no `cbz` in between -- section 8.1 failure mode 3, at guest pc
+    # 0x02bdad0c.
+    ("jmid-A1", "A", "the member lookup stops walking the superclass chain",
+     JNI_CLASSES,
+     """        self.ancestry(class).find_map(|at| self.declared_method(at, name, descriptor, is_static))""",
+     """        self.declared_method(class, name, descriptor, is_static)""",
+     ANDROID_LIB),
+    ("jmid-A2", "A", "the superclass edges are resolved and then thrown away",
+     JNI_CLASSES,
+     """            self.classes[usize::from(sub.0)].superclass = Some(sup);""",
+     """            self.classes[usize::from(sub.0)].superclass = None;""",
+     ANDROID_LIB),
+
+    # This edge is the one that cannot be recovered by inspection: `MainGameActivity`'s name
+    # appears in ZERO .rodata string literals, because the engine only ever reaches the class
+    # through `GetObjectClass`. A registry that learned its edges from `FindClass` arguments would
+    # never see it.
+    ("jmid-A3", "A", "the MainGameActivity edge -- the one no FindClass can reveal -- is dropped",
+     JNI_CLASSES,
+     """    ("com/roblox/client/startup/MainGameActivity", "com/google/androidgamesdk/GameActivity"),""",
+     """""",
+     GATE_ACTIVITY),
+    ("jmid-A4", "A", "the gate calls step 13 on a bare GameActivity again",
+     GATE_ACTIVITY_FILE,
+     """const ACTIVITY_CLASS: &str = "com/roblox/client/startup/MainGameActivity";""",
+     """const ACTIVITY_CLASS: &str = "com/google/androidgamesdk/GameActivity";""",
+     GATE_ACTIVITY),
+    ("jmid-A5", "A", "a static call's receiver is reported as java/lang/Class instead of itself",
+     JNI_ENV,
+     """                Some(Object::Class(class)) => {""",
+     """                Some(Object::Class(class)) if false => {""",
+     ANDROID_LIB),
+
+    # The generous answer, which is worse than the null. Answering from ANY class that happens to
+    # declare the member makes a wrong receiver into a working call, and the mistake surfaces as
+    # wrong behaviour thousands of instructions later rather than as a refusal here.
+    ("jmid-B1", "B", "the lookup falls back to any class that declares the member",
+     JNI_CLASSES,
+     """        self.ancestry(class).find_map(|at| self.declared_method(at, name, descriptor, is_static))""",
+     """        self.ancestry(class)
+            .find_map(|at| self.declared_method(at, name, descriptor, is_static))
+            .or_else(|| {
+                (0..self.classes.len()).find_map(|at| {
+                    self.declared_method(ClassId(at as u16), name, descriptor, is_static)
+                })
+            })""",
+     GATE_ACTIVITY),
+
+    # The tempting consistency. `declared_method` is what `RegisterNatives` and the
+    # generated-surface merge use, and both mean "declared on THIS class": making it walk would
+    # let a native registered on a superclass satisfy a subclass binding.
+    ("jmid-B2", "B", "declared_method walks the chain too, superclass first",
+     JNI_CLASSES,
+     """    pub fn declared_method(&self, class: ClassId, name: &str, descriptor: &str, is_static: bool) -> Option<MethodId> {
+        let declared = self.class(class)?;""",
+     """    pub fn declared_method(&self, class: ClassId, name: &str, descriptor: &str, is_static: bool) -> Option<MethodId> {
+        if let Some(found) = self
+            .class(class)?
+            .superclass
+            .and_then(|sup| self.declared_method(sup, name, descriptor, is_static))
+        {
+            return Some(found);
+        }
+        let declared = self.class(class)?;""",
+     ANDROID_LIB),
 ]
 
 

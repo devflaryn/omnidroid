@@ -261,6 +261,14 @@ may call before returning the 0 that asks for its own registration to be removed
    > byte-for-byte and says so with a hash; the committer reads the staged diff before every
    > commit. Both halves happened here, which is the only reason the correct bytes were never
    > lost.
+
+   And a third angle on the same rule, met immediately afterwards: **importing a proposal is
+   running it.** An agent's row file was imported to read its `ROWS` table, and its verification
+   loop was not behind `if __name__ == "__main__"` -- so the import applied all seven mutations to
+   the working tree and ran the suite. It restored correctly, from a `finally`, and the tree was
+   checked byte-identical against `HEAD` straight after. The habit that makes that check automatic
+   is the whole defence: **after anything that could have touched the tree, `git diff --exit-code`
+   the source directories before doing anything else.**
 4. **Let a killed harness run exit rather than killing it again.** Its restore is a `finally`; a
    killed interpreter skips it and leaves a mutation live.
 5. **Edit `tools/mutate.py` by inserting before the list terminator, never by slicing it.** Slicing
