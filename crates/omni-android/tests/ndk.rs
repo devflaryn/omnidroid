@@ -539,6 +539,89 @@ fn poll_once_calls_a_guest_callback_with_its_arguments_and_zero_removes_it() {
     );
 }
 
+/// **A callback that destroys its own looper and then asks to be removed is answered, not a
+/// panic.**
+///
+/// This is not a race and there is no timing in it. The callback is *guest code*, and
+/// `pollOnce` runs it with the state lock released — it has to, because the callback may call
+/// back into this layer. `ALooper_release` is one of the things it may call, and the NDK's
+/// documented contract is that returning `0` asks for the registration to be removed. A guest
+/// that does both, in that order, is a single-threaded, fully determined sequence: the slot is
+/// freed by the release, and the removal that follows names a looper that is gone.
+///
+/// The old code re-locked and wrote `state.loopers.get_mut(looper).expect("the slot was checked
+/// live")`. The slot *was* checked live — before the callback ran. What this asserts is that the
+/// call still returns `ALOOPER_POLL_CALLBACK` through the guest's own `X0`, because a removal
+/// request against a registration that no longer exists is the request **already satisfied**, and
+/// that the looper really is gone afterwards — which is what makes the `expect` unreachable
+/// rather than merely untaken. `VERIFICATION.md` entry 12 is about the other direction of the
+/// same question; here the branch *is* reachable, and by ordinary guest code.
+#[test]
+fn a_callback_that_releases_its_own_looper_and_asks_to_be_removed_is_answered() {
+    let _guard = serialized();
+    let f = fixture("callback-self-release");
+    let looper = f.prepare();
+    let (read_fd, write_fd) = f.pipe();
+
+    // int callback(int fd, int events, void *data) {
+    //     ALooper_release(looper);   // creation's reference is the only one: this frees the slot
+    //     return 0;                  // "remove my registration", over a looper that is gone
+    // }
+    let release = f.thunk("ALooper_release");
+    let callback = f.guest.next_entry();
+    let mut asm = Asm::at(callback);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, looper);
+    asm.bl(release);
+    asm.mov(0, 0);
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+
+    assert_eq!(f.add_fd(looper, read_fd, 0, ALOOPER_EVENT_INPUT, callback as u64, 0), 1);
+    assert_eq!(f.ndk.live_loopers(), 1, "the looper is live before the poll");
+
+    // One byte, so the descriptor is ready and the callback is the pass `pollOnce` takes.
+    let source = f.guest.data + 0x200;
+    f.guest.write_u64(source, 0x42);
+    assert_eq!(
+        f.value_of("write", |asm| {
+            asm.mov(0, i64::from(write_fd) as u64);
+            asm.mov(1, source as u64);
+            asm.mov(2, 1);
+        }) as i64,
+        1
+    );
+
+    let returned = f.value_of("ALooper_pollOnce", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+    });
+    assert_eq!(
+        returned as i32,
+        ALOOPER_POLL_CALLBACK,
+        "the callback ran and the call completed, so the guest is told a callback ran"
+    );
+
+    // **The release really did take effect**, which is what puts the removal past a live slot.
+    // Asserted three ways rather than on the count alone: a count cannot tell this looper's
+    // destruction from some other slot's (`VERIFICATION.md` entry 1).
+    assert_eq!(f.ndk.live_loopers(), 0, "the callback's release took the last reference");
+    assert_eq!(f.ndk.looper_for_current_thread(), None, "and the thread's binding went with it");
+    assert!(
+        f.ndk.registrations(looper as omni_cpu::GuestAddr).is_empty(),
+        "there is no registration left, because there is no looper left to hold one"
+    );
+
+    // And the freed address is refused by name afterwards rather than answered.
+    let error = f.refusal_of("ALooper_release", |asm| {
+        asm.mov(0, looper);
+    });
+    assert_eq!(error.symbol(), Some("ALooper_release"));
+    assert!(error.to_string().contains("not live"), "{error}");
+}
+
 /// **An ident is reported before any callback runs**, which is AOSP's order and the one the glue
 /// depends on.
 ///
