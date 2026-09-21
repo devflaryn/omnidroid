@@ -69,7 +69,7 @@ pub const PIPE_CAPACITY: usize = 65_536;
 ///
 /// POSIX fixes this at 512 minimum and Linux uses 4,096. It is not a capacity: it is the bound
 /// **below which** a write either happens entirely or not at all when several writers share a
-/// pipe. Above it a write may be split, which is why [`Pipe::write`] reports how many bytes it
+/// pipe. Above it a write may be split, which is why a pipe write reports how many bytes it
 /// took rather than promising to take them all.
 pub const PIPE_BUF: usize = 4_096;
 
@@ -373,7 +373,7 @@ impl PipeHandle {
     ///
     /// # Errors
     ///
-    /// [`FsErrorKind::BadDescriptor`] on the write end, and whatever [`Pipe::read`] reports.
+    /// [`FsErrorKind::BadDescriptor`] on the write end, and whatever the pipe's own read reports.
     pub fn read(&self, buf: &mut [u8]) -> FsResult<usize> {
         if self.end != PipeEnd::Read {
             return Err(FsError::kinded(
@@ -390,7 +390,7 @@ impl PipeHandle {
     ///
     /// # Errors
     ///
-    /// [`FsErrorKind::BadDescriptor`] on the read end, and whatever [`Pipe::write`] reports.
+    /// [`FsErrorKind::BadDescriptor`] on the read end, and whatever the pipe's own write reports.
     pub fn write(&self, buf: &[u8]) -> FsResult<usize> {
         if self.end != PipeEnd::Write {
             return Err(FsError::kinded(
