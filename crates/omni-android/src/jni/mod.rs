@@ -21,7 +21,7 @@
 //! | [`values`] | Java strings, modified UTF-8, and the descriptor grammar |
 //! | [`classes`] | the class registry, and why 409 members is not a JVM |
 //! | [`pool`] | pinned guest buffers for `GetStringUTFChars` and the array families |
-//! | [`env`] | the `JNIEnv` handlers, and the refusal every unimplemented slot gets |
+//! | [`mod@env`] | the `JNIEnv` handlers, and the refusal every unimplemented slot gets |
 //! | [`script`] | §8 steps 7-12, as an ordered list of downcalls a host can run |
 //!
 //! # Only what the engine uses, and the rest refuse by name

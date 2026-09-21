@@ -117,6 +117,14 @@ BIONIC_LAYOUTS = "crates/omni-bionic/src/layouts.rs"
 ADAPTER_SIGNALS = "crates/omni-android/src/bionic/signals.rs"
 ADAPTER_THREADS = "crates/omni-android/src/bionic/threads.rs"
 ADAPTER_RUNTIME = "crates/omni-android/src/bionic/runtime.rs"
+# M4: JNI without a JVM. The JNI modules, and the two bionic files M4's gate corrected.
+JNI_ENV = "crates/omni-android/src/jni/env.rs"
+JNI_REFS = "crates/omni-android/src/jni/refs.rs"
+JNI_CLASSES = "crates/omni-android/src/jni/classes.rs"
+JNI_VALUES = "crates/omni-android/src/jni/values.rs"
+JNI_POOL = "crates/omni-android/src/jni/pool.rs"
+JNI_SLOTS = "crates/omni-android/src/jni/slots.rs"
+
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
@@ -3298,6 +3306,202 @@ directory", ADAPTER_FILES,
     }""",
      TEXTURE),
 
+
+    # ======================================================================= M4: JNI without a JVM
+    #
+    # Every row below is a property jni-surface.md or this milestone's own measurements
+    # established. The A rows revert a fix and something must fail; the B rows over-correct --
+    # they read as more careful and destroy a property the design depends on.
+
+    # **The defect M4's gate found.** A `jclass` is an instance of `java.lang.Class`, and
+    # `JvmClassLoaderHelper` takes the class of a class and asks *that* for `getClassLoader`.
+    # Answering the class itself makes the lookup ask `NativeGLJavaInterface.getClassLoader`,
+    # which does not exist, and the null `jmethodID` goes straight into `CallObjectMethodV`.
+    ("jni-A1", "A", "GetObjectClass on a jclass answers the class itself",
+     JNI_ENV,
+     """        Object::Class(_) => registry.find("java/lang/Class"),""",
+     """        Object::Class(class) => Some(*class),""",
+     ANDROID_LIB),
+
+    # The handle check word ignored. A `jobject` the guest deleted and used again resolves to
+    # whatever took its slot -- and `DeleteLocalRef` has 45 call sites, so that is a shape the
+    # engine produces in the ordinary course of running.
+    ("jni-A2", "A", "a stale or forged jobject is not caught by its check word",
+     JNI_REFS,
+     """        if (handle >> 28) & CHECK_MASK != self.check_word(slot.generation) {""",
+     """        if false {""",
+     ANDROID_LIB),
+
+    # `DeleteLocalRef` on a global reference performed rather than reported. The two have
+    # different lifetimes, and deleting the wrong one leaves a later call holding a handle it was
+    # entitled to keep.
+    ("jni-A3", "A", "a reference is deleted through the wrong kind of DeleteRef",
+     JNI_REFS,
+     """        if actual != expected {""",
+     """        if false {""",
+     ANDROID_LIB),
+
+    # `Answer::Unanswered` evaluating to a value. This is Global Constraint 1's failure shape
+    # exactly: a Java getter nobody decided the answer for returning a believable zero.
+    ("jni-A4", "A", "a member nobody decided the answer for returns zero",
+     JNI_CLASSES,
+     """            Answer::Sink => Value::Void,""",
+     """            Answer::Unanswered => Value::Int(0),
+            Answer::Sink => Value::Void,""",
+     ANDROID_LIB),
+
+    # Modified UTF-8's first divergence from UTF-8: U+0000 is `C0 80`, never a zero byte. Writing
+    # it as one byte terminates the string the guest is about to read at the first NUL character
+    # in it.
+    ("jni-A5", "A", "modified UTF-8 writes U+0000 as a single zero byte",
+     JNI_VALUES,
+     """                0x0000 | 0x0080..=0x07ff => {""",
+     """                0x0000 => out.push(0),
+                0x0080..=0x07ff => {""",
+     ANDROID_LIB),
+
+    # One entry of `JNINativeInterface` transposed. Every slot at or after it moves by one, so the
+    # guest's `ldr Xt,[Xb,#imm]` reaches a different function than the one the offset names.
+    ("jni-A6", "A", "two JNINativeInterface entries are transposed",
+     JNI_SLOTS,
+     """    "GetStringUTFLength",
+    "GetStringUTFChars",""",
+     """    "GetStringUTFChars",
+    "GetStringUTFLength",""",
+     ANDROID_LIB),
+
+    # A `Release…` given a pointer that is not a live pin silently doing nothing. The buffer stays
+    # pinned and the guest reads through a pointer it believes it has given back.
+    ("jni-A7", "A", "releasing a pointer that was never pinned is a silent no-op",
+     JNI_POOL,
+     """        self.live.get(&at).copied().ok_or_else(|| AbiError::JniRefused {""",
+     """        self.live.get(&at).copied().or(self.live.values().next().copied()).ok_or_else(|| AbiError::JniRefused {""",
+     ANDROID_LIB),
+
+    # The array-region bound removed. `GetByteArrayRegion` and `SetLongArrayRegion` take a
+    # guest-chosen start and length, and without this the host reads or writes outside the
+    # object's own storage.
+    #
+    # **This row was `wrapping_add` instead of `checked_add` and nothing caught it**, correctly:
+    # both values have come through `usize::try_from` of an `i32`, so on a 64-bit host the sum
+    # cannot overflow and the two are the same function. The comment on `region` says so now.
+    ("jni-A8", "A", "an array region is not bounds-checked against its array",
+     JNI_ENV,
+     """    if end > len {""",
+     """    if false {""",
+     ANDROID_LIB),
+
+    # The generated dex surface put **ahead** of the hand-written members instead of after them.
+    # `Registry::method` takes the first match, so every decided answer is shadowed by the
+    # generated `Unanswered` copy of the same member and the engine's first call to one refuses.
+    #
+    # The first attempt at this row made `extend_with` add a member it already had, and nothing
+    # caught it -- correctly: a duplicate appended *after* the hand-written one is never reached.
+    # Which is the property worth pinning, and it is the order and not the duplication.
+    # **Precedence between the two class tables**: a hand-written decided answer must win over
+    # the generated `Unanswered` copy of the same member. This replaces the guard *and* the
+    # append with an unconditional front-insert, so the generated copy is what `Registry::method`
+    # finds.
+    #
+    # It takes both halves because either one alone is behaviour-preserving, which two earlier
+    # attempts at this row found the expensive way: a duplicate appended after the hand-written
+    # member is never reached, and a front-insert alone never runs for a member that is already
+    # there. The property is held by two independent things, so a row that breaks one of them is
+    # not a detector -- and a row that looked like one would have been evidence for nothing.
+    ("jni-A9", "A", "the generated surface wins over a decided answer",
+     JNI_CLASSES,
+     """            if self.method(id, member.name, member.descriptor, member.is_static).is_none() {
+                let class = &mut self.classes[usize::from(id.0)];
+                if class.methods.len() < usize::from(u16::MAX) {
+                    class.methods.push(Member {""",
+     """            {
+                let class = &mut self.classes[usize::from(id.0)];
+                if class.methods.len() < usize::from(u16::MAX) {
+                    class.methods.insert(0, Member {""",
+     ANDROID_LIB),
+
+    # `__strncpy_chk2`'s source check back to `n > src_size`, which aborts
+    # `strncpy(dst, src, sizeof dst)` with a shorter source -- the commonest FORTIFY shape there
+    # is, and what stopped jni-surface.md section 8 step 6 on the real engine.
+    ("jni-A10", "A", "__strncpy_chk2 fails whenever n exceeds the source object",
+     BIONIC_STRING,
+     """    let readable = n.min(src_size);""",
+     """    if n > src_size {
+        return Err(crate::error::BionicError::CheckFailed("__strncpy_chk2"));
+    }
+    let readable = n.min(src_size);""",
+     BIONIC),
+
+    # `MADV_DONTNEED` degraded to `MADV_FREE`: marked idle and never reclaimed, so the old
+    # contents survive a guarantee that says a later read is zero.
+    ("jni-A11", "A", "MADV_DONTNEED marks the range idle and never reclaims it",
+     ADAPTER_GUESTMEM,
+     """        if let Err(error) = space.reclaim_idle() {""",
+     """        if let Ok(()) = Ok::<(), omni_mem::MemError>(()) {
+            c.invalidate_code(at, len)?;
+            c.ret(|mut r| r.i32(0));
+            return Ok(());
+        }
+        if let Err(error) = space.reclaim_idle() {""",
+     ANDROID),
+
+    # ---- B: the over-corrections -----------------------------------------------------------
+
+    # Every JNI slot on the exit path. It reads as safer -- a handler that *may* call guest code
+    # cannot then be on a path that structurally cannot -- and it destroys D17's measured split,
+    # putting all 943 call sites on the 80-105 ns path instead of the 33 ns one.
+    ("jni-B1", "B", "every JNIEnv slot is serviced on the exit path",
+     JNI_ENV,
+     """    name.starts_with("Call")
+        || matches!(""",
+     """    let _ = name;
+    true
+        || matches!(""",
+     ANDROID_LIB),
+
+    # The pinned pool committed eagerly. Four megabytes of commit charge per instance for a pool
+    # that is empty until the engine asks for a string -- and this runtime hosts three concurrent
+    # instances (Global Constraint 6, D10).
+    ("jni-B2", "B", "the pinned pool is committed when it is reserved",
+     JNI_POOL,
+     """            CommitPolicy::Lazy,""",
+     """            CommitPolicy::Eager,""",
+     ANDROID_LIB),
+
+    # `MADV_DONTNEED` unmapping the range. It is the *immediate* semantics taken one step too far:
+    # the contents really do read as zero afterwards, and the mapping the guest still owns is
+    # gone, so its next write faults.
+    ("jni-B3", "B", "MADV_DONTNEED releases the mapping and not only the contents",
+     ADAPTER_GUESTMEM,
+     """        if let Err(error) = space.advise_idle(at, len) {""",
+     """        if let Err(error) = space.unmap(at, len) {""",
+     ANDROID),
+
+    # The miss log bounded to one entry. It reads as tighter and it turns the measurement M5 is
+    # built on into a sample of size one: a run that asked for forty members nobody declared
+    # reports the first.
+    ("jni-B4", "B", "the miss log keeps one entry instead of a thousand",
+     JNI_CLASSES,
+     """        if self.misses.len() < MAX_MISSES && !self.misses.contains(&miss) {""",
+     """        if self.misses.len() < 1 && !self.misses.contains(&miss) {""",
+     ANDROID_LIB),
+
+    # Array types refused by the descriptor grammar. It reads as stricter -- an array is not a
+    # class type -- and `[B`, `[I` and `[Ljava/lang/Object;` are all over the measured surface,
+    # `showKeyboard` and `nativePassInputBatch` among them.
+    ("jni-B5", "B", "the descriptor grammar refuses array types",
+     JNI_VALUES,
+     """            Some(b'[') => {""",
+     """            Some(b'[') if false => {""",
+     ANDROID_LIB),
+
+    # The pinned-pool cap dropped to nothing. It reads as the safest possible bound and it makes
+    # every `GetStringUTFChars` refuse, which is 45 of them on the startup path alone.
+    ("jni-B6", "B", "the pinned pool refuses every pin",
+     JNI_POOL,
+     """        if self.pinned_bytes + need > MAX_PINNED_BYTES {""",
+     """        if true {""",
+     ANDROID_LIB),
 ]
 
 

@@ -6,7 +6,7 @@
 //! ```
 //!
 //! Do not edit by hand. The generator has why this exists, what the
-//! [`Answer::Unanswered`](super::classes::Answer::Unanswered) on every member means, and
+//! [`Answer::Unanswered`] on every member means, and
 //! why a hand-written declaration in [`super::classes::DECLARED`] wins over it.
 //!
 //! **Provenance.** 98 classes and 1526 members, from the class-name string literals in

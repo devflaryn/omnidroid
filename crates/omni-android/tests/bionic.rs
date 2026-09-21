@@ -118,7 +118,7 @@ fn refusal_of(f: &Fixture, symbol: &str, setup: impl FnOnce(&mut Asm)) -> AbiErr
 
 // =================================================================== the tables
 
-/// The five symbols bound here that Task 1's 188 does **not** contain, and the evidence for each.
+/// The eight symbols bound here that Task 1's 188 does **not** contain, and the evidence for each.
 ///
 /// # Task 1's prediction was a lower bound, and M3's gate is what measured by how much
 ///
@@ -158,6 +158,18 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
         "M3 gate, reached at init_array[3118] on libc++'s verbose-abort path, before \
          /dev/urandom existed; not called once that path is gone. The POSIX spelling of a symbol \
          whose GNU spelling IS in the 188, and the two differ in what they return",
+    ),
+    (
+        "strnlen",
+        "M4 gate, called from JNI_OnLoad's registration helpers. Nothing before step 6 reached it.",
+    ),
+    (
+        "gmtime",
+        "M4 gate, called by nativeInitFastLog. gmtime_r IS in the 188; this spelling is not, and the two differ in who owns the struct tm.",
+    ),
+    (
+        "getcwd",
+        "M4 gate, called three times by nativeSetAssetPath while the engine canonicalises the asset directory.",
     ),
 ];
 
@@ -209,7 +221,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 173, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 176, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -220,7 +232,10 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // `dlopen`, `dlsym` and `dlclose` from the fast path to the exit path, because answering them
     // needs the boundary's symbol table and `ImportCall` deliberately cannot reach it. So
     // 157 + 5 - 3 = 159 inline and 11 + 3 = 14 re-entrant.
-    assert_eq!(Bionic::inline_symbols().count(), 159);
+    // **M4's gate adds three more** -- `strnlen`, `gmtime`, `getcwd` -- all inline, for 162.
+    // Each of the eight is a symbol `libroblox.so` imports that the static closure did not
+    // predict. D17 says 188 is a lower bound; this is by how much, so far.
+    assert_eq!(Bionic::inline_symbols().count(), 162);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -7123,10 +7138,10 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         );
     }
 
-    // **The split is over the 188 the static closure predicted**, so the five symbols M3's gate
-    // found outside it are subtracted rather than folded in: they are not part of what Task 1
-    // predicted and counting them here would make the total right for the wrong reason, which is
-    // the exact failure shape this project has made five times.
+    // **The split is over the 188 the static closure predicted**, so the eight symbols M3's and
+    // M4's gates found outside it are subtracted rather than folded in: they are not part of
+    // what Task 1 predicted, and counting them here would make the total right for the wrong
+    // reason -- the exact failure shape this project has made five times.
     let bound = Bionic::bound_symbols().count() - BEYOND_THE_PREDICTION.len();
     assert_eq!(bound, 168);
     let answered = bound - refusals.len() - 3;

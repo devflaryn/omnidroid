@@ -34,7 +34,12 @@ pub struct JavaString {
 
 impl JavaString {
     /// From Rust text.
+    ///
+    /// Named `from_str` and deliberately **not** `std::str::FromStr`: that trait is fallible and
+    /// this conversion cannot fail, so implementing it would add an `Err` arm no caller can
+    /// reach and a `parse()` spelling that reads as parsing rather than as re-encoding.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         Self { units: text.encode_utf16().collect() }
     }
@@ -392,7 +397,7 @@ mod tests {
         assert_eq!(emoji.len(), 2, "one supplementary character is two UTF-16 units");
         let bytes = emoji.to_modified_utf8();
         assert_eq!(bytes.len(), 6, "six bytes, not the four UTF-8 would use");
-        assert_eq!("\u{1f600}".as_bytes().len(), 4, "which is what UTF-8 does with it");
+        assert_eq!("\u{1f600}".len(), 4, "which is the four bytes UTF-8 uses");
         assert_eq!(
             JavaString::from_modified_utf8("NewStringUTF", 0, &bytes).expect("decodes"),
             emoji

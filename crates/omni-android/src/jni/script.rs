@@ -358,7 +358,7 @@ pub fn declare_script_classes(jni: &Jni) {
             // excluded above. The result is dropped rather than unwrapped so that a host with
             // 65,536 classes gets a registry that is short rather than a panic.
             let _ = registry.declare(&super::classes::ClassSpec {
-                name: *name,
+                name,
                 tier: super::classes::Tier::Support,
                 methods: &[],
                 fields: &[],

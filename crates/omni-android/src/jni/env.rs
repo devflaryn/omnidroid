@@ -12,7 +12,7 @@
 //! [`is_reentrant`] answers it, and the rule is *can this reach guest code*: the whole
 //! `Call…Method…` family, `NewObject…`, `AllocObject` and `RegisterNatives`. A Java method may be
 //! `native`, in which case calling it means calling back into the guest, and
-//! [`ImportCall`](crate::ImportCall) structurally cannot (D18). Nothing on §8 steps 6-12 takes
+//! [`ImportCall`] structurally cannot (D18). Nothing on §8 steps 6-12 takes
 //! that path — the Java side there is all host-defined — but the boundary is chosen by what the
 //! call *may* do, not by what this milestone happens to need, because changing it later would
 //! mean changing which dispatch path a live call site is on.
@@ -39,6 +39,7 @@ use crate::mem::{Blame, GuestMem};
 use crate::varargs::GuestVaList;
 
 use super::classes::{Answer, ClassId, FieldId, Member, MethodId, Miss, Registry};
+use super::refs::Handles;
 use super::pool::PinKind;
 use super::refs::{Object, ObjectId, RefKind};
 use super::slots::{
@@ -328,7 +329,8 @@ fn env_call(
             let object = args.next_u64()?;
             let mut state = jni.state();
             let id = state.handles.resolve_id(name, address, object)?;
-            let class = class_of(&state, id).ok_or_else(|| AbiError::JniRefused {
+            let class = class_of(&state.handles, &state.registry, id)
+                .ok_or_else(|| AbiError::JniRefused {
                 function: name.to_string(),
                 address,
                 detail: "this object has no declared class: it is an array or a string, and \
@@ -980,10 +982,10 @@ fn read_cstr(mem: &GuestMem, at: GuestAddr, blame: Blame<'_>) -> AbiResult<Strin
 /// describes. Answering the class itself makes that lookup ask
 /// `NativeGLJavaInterface.getClassLoader`, which does not exist, and the null `jmethodID` goes
 /// straight into `CallObjectMethodV`. MEASURED: that is exactly what it did.
-fn class_of(state: &JniState, id: ObjectId) -> Option<ClassId> {
-    match state.handles.object_of(id)? {
-        Object::Class(_) => state.registry.find("java/lang/Class"),
-        Object::String(_) => state.registry.find("java/lang/String"),
+fn class_of(handles: &Handles, registry: &Registry, id: ObjectId) -> Option<ClassId> {
+    match handles.object_of(id)? {
+        Object::Class(_) => registry.find("java/lang/Class"),
+        Object::String(_) => registry.find("java/lang/String"),
         Object::Instance { class, .. } | Object::Throwable { class, .. } => Some(*class),
         // An array's class is `[B`, `[I`, `[Ljava/lang/Object;` and so on, and a direct
         // `ByteBuffer`'s is a framework class with no dex declaration. Nothing on the measured
@@ -1046,9 +1048,15 @@ fn freed(name: &str, address: GuestAddr) -> AbiError {
     }
 }
 
-/// Bounds-check an array region. **A guest-chosen start and length**, so the check is written as
-/// two `checked_add`s rather than as `start + len <= n`, which overflows in release and panics in
-/// debug — the profile difference Global Constraint 4 is about.
+/// Bounds-check an array region.
+///
+/// **A guest-chosen start and length**, and the two `try_from`s are what bound them: an `i32`
+/// that survives `usize::try_from` is in `0..=i32::MAX`, so on a 64-bit host the sum of two of
+/// them cannot overflow a `usize` and the `checked_add` is belt-and-braces rather than the bound.
+/// That is stated rather than implied because mutation row `jni-A8` originally injected
+/// `wrapping_add` here and **nothing caught it** — correctly, since on this host the two are the
+/// same function. The bound that does the work is `end > len`, which `jni-A8` injects instead.
+/// The `checked_add` stays for a 32-bit host, where it would not be the same function.
 fn region(name: &str, address: GuestAddr, len: usize, start: i32, count: i32) -> AbiResult<()> {
     let refuse = || AbiError::JniRefused {
         function: name.to_string(),
@@ -1624,6 +1632,54 @@ mod tests {
         "GetJavaVM",
         "NewDirectByteBuffer",
     ];
+
+    /// **`GetObjectClass(jclass)` answers `java.lang.Class`, not the class itself.**
+    ///
+    /// The detector for the defect M4's gate found. `JvmClassLoaderHelper` takes the class of a
+    /// `jclass` and asks *that* for `getClassLoader()Ljava/lang/ClassLoader;`. Answering the
+    /// class itself makes the lookup ask `NativeGLJavaInterface.getClassLoader`, which does not
+    /// exist, and the null `jmethodID` goes straight into `CallObjectMethodV`.
+    #[test]
+    fn the_class_of_a_jclass_is_java_lang_class_and_not_the_class_itself() {
+        let registry = Registry::with_declared();
+        let mut handles = Handles::new(0x1234);
+        let subject = registry
+            .find("com/roblox/engine/jni/NativeGLJavaInterface")
+            .expect("declared");
+        let handle = handles
+            .new_local("FindClass", 0, Object::Class(subject))
+            .expect("a reference");
+        let id = handles.resolve_id("GetObjectClass", 0, handle).expect("live");
+        let answered = class_of(&handles, &registry, id).expect("a class");
+        assert_eq!(registry.class_name(answered), "java/lang/Class");
+        assert_ne!(answered, subject, "a jclass is not an instance of itself");
+        // And `java.lang.Class` is the one that declares `getClassLoader`, which is what the
+        // engine asks it for next.
+        assert!(
+            registry
+                .method(answered, "getClassLoader", "()Ljava/lang/ClassLoader;", false)
+                .is_some()
+        );
+
+        // A string's class is `java.lang.String`, and an instance's is its own.
+        let text = handles
+            .new_local("NewStringUTF", 0, Object::String(JavaString::from_str("x")))
+            .expect("a reference");
+        let id = handles.resolve_id("GetObjectClass", 0, text).expect("live");
+        assert_eq!(
+            registry.class_name(class_of(&handles, &registry, id).expect("a class")),
+            "java/lang/String"
+        );
+        let instance = handles
+            .new_local(
+                "NewObjectV",
+                0,
+                Object::Instance { class: subject, fields: std::collections::BTreeMap::new() },
+            )
+            .expect("a reference");
+        let id = handles.resolve_id("GetObjectClass", 0, instance).expect("live");
+        assert_eq!(class_of(&handles, &registry, id), Some(subject));
+    }
 
     /// **The arithmetic that wraps in release and panics in debug** (Global Constraint 4). A
     /// guest-chosen `start` and `len` whose sum overflows must be refused, not admitted by a

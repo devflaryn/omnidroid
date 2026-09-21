@@ -191,7 +191,7 @@ def main():
     w('//! ```\n')
     w('//!\n')
     w('//! Do not edit by hand. The generator has why this exists, what the\n')
-    w('//! [`Answer::Unanswered`](super::classes::Answer::Unanswered) on every member means, and\n')
+    w('//! [`Answer::Unanswered`] on every member means, and\n')
     w('//! why a hand-written declaration in [`super::classes::DECLARED`] wins over it.\n')
     w('//!\n')
     w('//! **Provenance.** %d classes and %d members, from the class-name string literals in\n'
