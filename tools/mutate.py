@@ -95,6 +95,14 @@ BIONIC_TIME = "crates/omni-bionic/src/time.rs"
 ADAPTER_CLOCKS = "crates/omni-android/src/bionic/clocks.rs"
 ADAPTER_PROCENV = "crates/omni-android/src/bionic/procenv.rs"
 ADAPTER_LOGGING = "crates/omni-android/src/bionic/logging.rs"
+# M3 task 3 phase 3b: files and directories. `omni-platform` gains a ROOTED filesystem, the
+# `FILE *` layer lands in `omni-bionic` over a trait, and the adapter binds the 29 file-io symbols.
+PLAT_FS = "crates/omni-platform/src/fs/mod.rs"
+PLAT_FS_PATH = "crates/omni-platform/src/fs/path.rs"
+PLAT_FS_WINDOWS = "crates/omni-platform/src/fs/windows.rs"
+BIONIC_STDIO = "crates/omni-bionic/src/stdio.rs"
+ADAPTER_FILES = "crates/omni-android/src/bionic/files.rs"
+ADAPTER_STDIO = "crates/omni-android/src/bionic/stdio.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
@@ -2086,6 +2094,269 @@ MUTATIONS = [
      """    const WAITER_HANG_GUARD: Duration = Duration::from_secs(5);""",
      """    const WAITER_HANG_GUARD: Duration = Duration::from_millis(400);""",
      BIONIC),
+    # ---- phase 3b: the confinement -------------------------------------------------------------
+    # The rules in `fs::path` are the whole of what stops a guest opening an arbitrary host file,
+    # and the APK under test is cheat-injected (D6). Each row removes one of them.
+
+    ("fs-A1", "A", "the lexical `..` pop removed, so a traversal reaches the host", PLAT_FS_PATH,
+     """                components.pop();""",
+     """                components.push(String::from(".."));""",
+     PLATFORM),
+
+    ("fs-A2", "A", "component hygiene accepts everything: backslashes, drives, device names",
+     PLAT_FS_PATH,
+     """pub fn hostile_component(name: &str) -> Option<String> {
+    if let Some(bad) = name.chars().find(|c| c.is_control()) {""",
+     """pub fn hostile_component(name: &str) -> Option<String> {
+    if true {
+        return None;
+    }
+    if let Some(bad) = name.chars().find(|c| c.is_control()) {""",
+     PLATFORM),
+
+    # The over-correction, and it is the one a "be strict" instinct produces: refusing every path
+    # that contains `..` rather than absorbing it. `/a/../b` is an ordinary path a compiler emits.
+    ("fs-B1", "B", "a path containing `..` is refused outright rather than absorbed",
+     PLAT_FS_PATH,
+     """            ".." => {""",
+     """            ".." => {
+                return Err(FsError::confined(operation, &shown, "no dot-dot"));""",
+     PLATFORM),
+
+    # The other over-correction: a rule wide enough to refuse `libroblox.so`.
+    ("fs-B2", "B", "component hygiene widened until an ordinary filename is refused",
+     PLAT_FS_PATH,
+     """    if name.ends_with('.') || name.ends_with(' ') {""",
+     """    if name.contains('.') || name.ends_with(' ') {""",
+     PLATFORM),
+
+    # ---- phase 3b: the platform seam ------------------------------------------------------------
+
+    # MEASURED and this row is the defect itself: `FileExt::seek_read` on Windows MOVES the file
+    # pointer, so a `pread` built on it alone leaves the next sequential read at end of file --
+    # every call `Ok`, nothing reported.
+    ("fs-A3", "A", "pread stops restoring the descriptor's own offset", PLAT_FS_WINDOWS,
+     """    let restored = handle.seek(SeekFrom::Start(saved));""",
+     """    let restored = if true { Ok(0u64) } else { handle.seek(SeekFrom::Start(saved)) };""",
+     PLATFORM),
+
+    # `st_ino` zero makes every `(st_dev, st_ino)` identity test answer "the same file", which is
+    # the worst answer a `stat` has available.
+    ("fs-A4", "A", "st_ino becomes a constant, so every file is the same file", PLAT_FS,
+     """    if hash == 0 {
+        1
+    } else {
+        hash
+    }""",
+     """    let _ = hash;
+    0""",
+     PLATFORM),
+
+    ("fs-A5", "A", "the descriptor ceiling removed, so a leaking guest holds host handles",
+     PLAT_FS,
+     """        if table.open.len() >= MAX_OPEN_FILES {""",
+     """        if false && table.open.len() >= MAX_OPEN_FILES {""",
+     PLATFORM),
+
+    ("fs-A6", "A", "unlink removes a directory, which is rmdir's job", PLAT_FS,
+     """        if metadata.is_dir() {
+            return Err(FsError::kinded(
+                OP,
+                host.display().to_string(),
+                FsErrorKind::IsADirectory,
+                "unlink does not remove directories; rmdir does",
+            ));
+        }""",
+     """        if false {
+            return Err(FsError::kinded(
+                OP,
+                host.display().to_string(),
+                FsErrorKind::IsADirectory,
+                "unlink does not remove directories; rmdir does",
+            ));
+        }""",
+     PLATFORM),
+
+    # The over-correction: a directory bound small enough to refuse an ordinary directory.
+    ("fs-B3", "B", "the directory-entry ceiling tightened to two entries", PLAT_FS,
+     """pub const MAX_DIR_ENTRIES: usize = 65_536;""",
+     """pub const MAX_DIR_ENTRIES: usize = 2;""",
+     PLATFORM),
+
+    # ---- phase 3b: the `FILE *` layer in omni-bionic ---------------------------------------------
+
+    # `size * nmemb` is two guest numbers. A release build WRAPS, and the wrapped value (zero)
+    # still satisfies "fewer items than asked for" -- so the detector is the errno, not the count.
+    ("stdio-A1", "A", "fread's size*nmemb multiplication wraps instead of being checked",
+     BIONIC_STDIO,
+     """    let Some(total) = size.checked_mul(nmemb) else {
+        stream.error = true;
+        ctx.set_errno(consts::EINVAL);
+        return Ok(0);
+    };
+    if total == 0 {
+        // C: zero items, and the stream is untouched. Not an error, and `size == 0` is the case
+        // that would divide by zero below.
+        return Ok(0);
+    }""",
+     """    let total = size.wrapping_mul(nmemb);
+    if total == 0 {
+        return Ok(0);
+    }""",
+     BIONIC),
+
+    ("stdio-A2", "A", "fgets reads past its newline instead of stopping on it", BIONIC_STDIO,
+     """                if byte[0] == b'\n' {
+                    break;
+                }""",
+     """                if false {
+                    break;
+                }""",
+     BIONIC),
+
+    ("stdio-A3", "A", "fgets turns an end of file into an empty line", BIONIC_STDIO,
+     """    if written == 0 && stream.eof {""",
+     """    if false && written == 0 && stream.eof {""",
+     BIONIC),
+
+    ("stdio-A4", "A", "fputc returns the argument, so writing 0xff reads as EOF", BIONIC_STDIO,
+     """        Ok(1) => i32::from(byte),""",
+     """        Ok(1) => c,""",
+     BIONIC),
+
+    ("stdio-A5", "A", "a short read no longer sets the end-of-file flag", BIONIC_STDIO,
+     """            Ok(0) => {
+                stream.eof = true;
+                break;
+            }
+            Ok(got) => {""",
+     """            Ok(0) => {
+                break;
+            }
+            Ok(got) => {""",
+     BIONIC),
+
+    # The over-correction: bounding `fgets` by the transfer chunk rather than chunking through it,
+    # which silently truncates any line longer than 4 KiB.
+    ("stdio-B4", "B", "fgets truncates at one transfer chunk instead of chunking through it",
+     BIONIC_STDIO,
+     """    let capacity = (size as u32 - 1) as u64;""",
+     """    let capacity = ((size as u32 - 1) as u64).min(TRANSFER_CHUNK as u64);""",
+     BIONIC),
+
+    # And the other one: refusing `fflush` because this layer cannot promise durability. It can
+    # not promise durability, and `fflush` does not ask it to -- that is `fsync`.
+    ("stdio-B5", "B", "fflush refuses rather than reporting the contract it does meet",
+     BIONIC_STDIO,
+     """    match descriptors.flush(stream.fd) {
+        Ok(()) => 0,""",
+     """    match descriptors.flush(stream.fd) {
+        Ok(()) => EOF,""",
+     BIONIC),
+
+    # ---- phase 3b: the adapter -------------------------------------------------------------------
+
+    # An unclassified host failure given a specific errno is the plausible-wrong-answer class:
+    # guest code retries EIO and moves on, and nothing anywhere says what really happened.
+    ("files-A1", "A", "an unclassified host failure is given EIO instead of refusing by name",
+     ADAPTER_FILES,
+     """        _ => return None,
+    })
+}""",
+     """        _ => consts::EIO,
+    })
+}""",
+     ANDROID),
+
+    ("files-A2", "A", "struct stat's st_size moves onto __pad1", ADAPTER_FILES,
+     """    put64(48, stat.size, &mut out);""",
+     """    put64(40, stat.size, &mut out);""",
+     ANDROID),
+
+    ("files-A3", "A", "access(X_OK) answers 0 instead of refusing", ADAPTER_FILES,
+     """        if mode & X_OK != 0 {
+            return Err(view.refusal(""",
+     """        if false {
+            return Err(view.refusal(""",
+     ANDROID),
+
+    ("files-A4", "A", "the open flags whose guarantees cannot be met are accepted silently",
+     ADAPTER_FILES,
+     """        if flags & bit == bit {
+            return Err(view.refusal(format!(""",
+     """        if false && flags & bit == bit {
+            return Err(view.refusal(format!(""",
+     ANDROID),
+
+    ("files-A5", "A", "__open_2 stops refusing O_CREAT, which bionic's FORTIFY build aborts on",
+     ADAPTER_FILES,
+     """        if flags & O_CREAT != 0 || flags & O_TMPFILE == O_TMPFILE {""",
+     """        if false {""",
+     ANDROID),
+
+    ("files-A6", "A", "readdir answers NULL for a wild DIR pointer, which reads as an empty \
+directory", ADAPTER_FILES,
+     """        let Some(id) = state.bionic.dir_for(dirp) else {""",
+     """        let Some(id) = state.bionic.dir_for(dirp).or(Some(-1)) else {""",
+     ANDROID),
+
+    # The over-correction: refusing W_OK as well as X_OK, on the same "Windows has no POSIX
+    # permissions" argument. It is the same argument and it is wrong there, because a write probe
+    # is an exact answer where an execute probe has none.
+    ("files-B6", "B", "access refuses W_OK as well as X_OK", ADAPTER_FILES,
+     """        if mode & X_OK != 0 {""",
+     """        if mode & (X_OK | W_OK) != 0 {""",
+     ANDROID),
+
+    # And the one a "mode is not applied" worry produces: refusing every mkdir that asks for
+    # permissions this layer cannot set, which stops the engine creating any directory.
+    ("files-B7", "B", "mkdir refuses a mode it cannot apply instead of recording that it cannot",
+     ADAPTER_FILES,
+     """    let (path, _mode) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let bytes = path_for(view.blaming(0), path, 0)?;
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.mkdir(&bytes))? {""",
+     """    let (path, mode) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        if mode != 0o777 {
+            return Err(view.refusal("a mode this layer cannot apply"));
+        }
+        let bytes = path_for(view.blaming(0), path, 0)?;
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.mkdir(&bytes))? {""",
+     ANDROID),
+
+    # A `FILE *` this instance never handed out is a wild pointer, a use-after-fclose, or the
+    # `&__sF[n]` arithmetic an unverified `sizeof(FILE)` would get wrong. Answering it as an
+    # ordinary invalid stream lets guest code route around all three.
+    ("stdio-A6", "A", "an unknown FILE pointer is answered instead of refused", ADAPTER_STDIO,
+     """    view.active.bionic.stream_of(file).ok_or_else(|| {""",
+     """    view.active.bionic.stream_of(file).or(Some(Stream::new(-1))).ok_or_else(|| {""",
+     ANDROID),
+
+    # The stream's flags live host-side and have to be written back, or `feof` answers false
+    # forever after an end of file. The failure is invisible to anything that does not read the
+    # flag after an operation changed it.
+    ("stdio-A7", "A", "a stream's flags are never written back, so feof never becomes true",
+     ADAPTER_MOD,
+     """            if let Some(slot) = self.streams.lock().get_mut(&at) {
+                *slot = stream;
+            }""",
+     """            if let Some(slot) = self.streams.lock().get_mut(&at) {
+                let _ = (slot, stream);
+            }""",
+     ANDROID),
 ]
 
 
