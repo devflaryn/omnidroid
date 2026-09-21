@@ -124,6 +124,11 @@ const SYSLOG_SEVERITY_MASK: i32 = 0x07;
 /// numbers for the same loss. A smaller one would shorten lines a device carries whole.
 const FORMAT_BUDGET: usize = MAX_MESSAGE_BYTES;
 
+/// The budget alone is never what cuts the **tag**: the payload cap does that, and the two are
+/// independent numbers. A compile-time assertion rather than a test, because it is a relation
+/// between two constants that no input can make false at run time (`VERIFICATION.md` entry 12).
+const _: () = assert!(FORMAT_BUDGET < MAX_TAG_AND_MESSAGE_BYTES);
+
 /// One line the guest logged, as the instance's ring keeps it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRecord {
@@ -900,9 +905,6 @@ mod tests {
             "`vsnprintf(buf, LOG_BUF_SIZE, ...)` writes LOG_BUF_SIZE - 1 characters and a NUL"
         );
         assert_eq!(FORMAT_BUDGET, 1023);
-        // And the budget alone is never what cuts the *tag*: the payload cap does that, and the
-        // two are independent numbers.
-        assert!(FORMAT_BUDGET < MAX_TAG_AND_MESSAGE_BYTES);
     }
 
     /// **A message the *formatter* cut is still reported as truncated, on all three channels.**
