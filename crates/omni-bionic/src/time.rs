@@ -1,4 +1,4 @@
-//! `gmtime_r`: a Unix timestamp as broken-down UTC.
+//! `gmtime_r`: a Unix timestamp as broken-down UTC, and `strftime`: broken-down time as text.
 //!
 //! # Why this is in the pure crate and not in the adapter
 //!
@@ -42,6 +42,26 @@
 //! this one has an independent check available to whoever gets an NDK — every field is an `int`
 //! except the last two, so the layout is forced by the C rules once the field *order* is right, and
 //! the field order is published in POSIX plus two BSD extensions bionic inherits.
+
+//! # `strftime`, and why it is here rather than in the adapter
+//!
+//! `strftime` is the other half of the same shape: it needs no clock, no timezone database and
+//! no locale table beyond the one bionic has (the C locale — see [`crate::locale`]). What it
+//! needs is a `struct tm` and a format string, both of which the caller already holds, so all
+//! that is left is text assembly over integers.
+//!
+//! It is written here **whole or not at all**, per conversion. `docs/HANDOFF.md` records why:
+//! it is "a full C library function with a format language, and a partial one is the
+//! plausible-stub shape — an unimplemented specifier produces wrong *text*, which nothing
+//! downstream can tell from right text". So every conversion this module cannot derive from C99
+//! or POSIX is a named [`StrftimeError`], and none of them is copied through as literal text the
+//! way a tzcode-derived `strftime` copies an unknown one. [`strftime`]'s own documentation lists
+//! the implemented set and every refusal by name.
+//!
+//! Two of its conversions read fields that are **not** POSIX: `%z` reads `tm_gmtoff` and `%Z`
+//! reads `tm_zone`, the two BSD extensions at the end of bionic's `struct tm`. The layout they
+//! live at is [`TM_BYTES`]'s, which was derived for `gmtime` and is reused rather than restated —
+//! two derivations of one layout are two chances to disagree about offset 40.
 
 use crate::memory::{checked_range, Fault, GuestMemory};
 
@@ -275,6 +295,871 @@ pub fn read_time_t(mem: &impl GuestMemory, at: u64) -> Result<i64, Fault> {
     let mut bytes = [0u8; 8];
     mem.read(at, &mut bytes)?;
     Ok(i64::from_le_bytes(bytes))
+}
+
+/// The most bytes one [`strftime`] call will produce before it refuses.
+///
+/// **A policy number, stated as one**, and the companion to [`crate::printf::MAX_OUTPUT`].
+/// `strftime`'s expansion factor is bounded — the widest specifier this implementation emits is
+/// `%c`, which is 24 bytes from a 2-byte specification, so a 64 KiB format string (the thunk
+/// boundary's `STRING_LIMIT`) cannot produce more than about 768 KiB. The cap is above that on
+/// purpose: it is not reachable from the boundary, it is reachable from *this function's own
+/// argument*, which is a `&[u8]` any caller may make as long as it likes. Without it a caller
+/// could ask for an allocation it did not size, and an allocation failure aborts.
+///
+/// One specifier is **not** bounded by the format string: `%Z` emits `tm_zone`'s bytes, whose
+/// length the caller chose. The cap is therefore checked once per format-string byte and the
+/// overshoot is bounded by one zone name, which is stated here rather than silently true.
+pub const MAX_STRFTIME_OUTPUT: usize = 1024 * 1024;
+
+/// Abbreviated weekday names, `%a`, Sunday first because `tm_wday` counts Sunday as 0.
+///
+/// POSIX's C locale fixes these exactly (`abday` in the POSIX locale definition). A believable
+/// wrong answer would have been the host's names, which are the host's locale's.
+const WEEKDAY_ABBREVIATED: [&[u8]; 7] =
+    [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+
+/// Full weekday names, `%A`. POSIX C locale `day`.
+const WEEKDAY_FULL: [&[u8]; 7] = [
+    b"Sunday",
+    b"Monday",
+    b"Tuesday",
+    b"Wednesday",
+    b"Thursday",
+    b"Friday",
+    b"Saturday",
+];
+
+/// Abbreviated month names, `%b` and `%h`. POSIX C locale `abmon`.
+const MONTH_ABBREVIATED: [&[u8]; 12] = [
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+    b"Dec",
+];
+
+/// Full month names, `%B`. POSIX C locale `mon`.
+const MONTH_FULL: [&[u8]; 12] = [
+    b"January",
+    b"February",
+    b"March",
+    b"April",
+    b"May",
+    b"June",
+    b"July",
+    b"August",
+    b"September",
+    b"October",
+    b"November",
+    b"December",
+];
+
+/// A `struct tm` as [`strftime`] reads it: the nine POSIX fields plus the two BSD extensions
+/// bionic's `struct tm` carries.
+///
+/// The fields are the **guest's** and are not validated on construction — `tm_year` may be any
+/// `i32`, `tm_mon` may be 10,000 and `tm_wday` may be -5. Each specifier checks the fields it
+/// actually reads, so a `tm` that is nonsense in a field nobody looks at still formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrftimeTm<'a> {
+    /// The nine POSIX fields, in [`Tm`]'s spelling of them.
+    pub tm: Tm,
+    /// `tm_gmtoff`: seconds **east** of UTC. Read by `%z` and by nothing else.
+    ///
+    /// `i64` because the guest field is a `long` and LP64's `long` is 64 bits. Narrowing it to
+    /// `i32` here would silently reinterpret half of the values a guest can store.
+    pub gmtoff: i64,
+    /// `tm_zone`: the zone abbreviation's bytes, or `None` when the guest's pointer was NULL.
+    ///
+    /// The bytes, not a `&str`: this is guest memory and nothing guarantees it is UTF-8. Read by
+    /// `%Z` and by nothing else.
+    pub zone: Option<&'a [u8]>,
+}
+
+/// What [`strftime`] produced, in the two shapes C's return value distinguishes.
+///
+/// # Why this is an enum and not a `usize`
+///
+/// C99 7.23.3.5: `strftime` returns the number of bytes written, not counting the terminating
+/// NUL — **or zero, in which case "the contents of the array are indeterminate"**. That is not
+/// the same as "wrote a truncated string": a caller that treats a zero return as truncation
+/// reads bytes the standard does not define. Returning a `usize` alone would let that mistake
+/// happen silently; returning [`StrftimeOutput::DoesNotFit`] with **no text in it at all** makes
+/// it impossible — there is nothing to copy, so nothing can be copied by accident.
+///
+/// Note that `strftime` also returns 0 when the format string legitimately produces an empty
+/// result and `max >= 1`. That case is [`StrftimeOutput::Fits`] with an empty `Vec`, and it is
+/// the reason C's own interface is famously unable to distinguish the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrftimeOutput {
+    /// The result and its NUL fit in `max`. The `Vec` is the bytes **without** the NUL, and its
+    /// length is what C returns.
+    Fits(Vec<u8>),
+    /// The result including its NUL would not fit in `max`. C returns **0** here and leaves the
+    /// destination buffer indeterminate; the caller must not write anything to the guest.
+    DoesNotFit {
+        /// How many bytes the result would have been, not counting the NUL. So `needed + 1` is
+        /// the `max` that would have been enough. Diagnostic only — C gives the caller no way to
+        /// learn this.
+        needed: usize,
+    },
+}
+
+/// Why [`strftime`] refused.
+///
+/// Every variant **names** what could not be done. There is no variant that means "emitted
+/// something plausible": a specifier this implementation cannot produce correctly is an error,
+/// not literal text, because an unimplemented specifier's wrong output is indistinguishable
+/// downstream from right output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrftimeError {
+    /// The format string ended inside a conversion specification: a trailing `%`, or a trailing
+    /// `%E`/`%O` with nothing after the modifier.
+    IncompleteSpecifier,
+    /// A conversion this implementation does not know.
+    ///
+    /// C99 7.23.3.5 makes any specifier outside its list **undefined behaviour**, and
+    /// implementations differ: tzcode-derived libraries copy the two bytes through, others drop
+    /// them. Copying them through is the tempting choice and it is the one this crate forbids —
+    /// the guest asked for a time and got the literal text `%Q`, which no downstream check can
+    /// tell from a time.
+    UnknownSpecifier {
+        /// The byte that followed the `%`.
+        specifier: u8,
+    },
+    /// A conversion that exists in GNU/BSD `strftime` but in neither C99 nor POSIX.
+    ///
+    /// Refused rather than implemented because the only specification for it is another
+    /// implementation's documentation, and **whether bionic accepts it has not been verified
+    /// here**. Both possible bionic behaviours — expanding it, or copying it through literally —
+    /// produce text this crate cannot confirm, so it produces none.
+    ExtensionSpecifier {
+        /// The byte that followed the `%`.
+        specifier: u8,
+        /// What that extension means where it exists.
+        what: &'static str,
+    },
+    /// `%s`, seconds since the Epoch, which is `mktime()` of the broken-down time.
+    ///
+    /// **Not implementable here, and the near miss is worth naming.** `timegm(tm) - tm_gmtoff`
+    /// looks like the answer and is only the answer when two things the guest controls are
+    /// already true: that the fields are normalised (`mktime` normalises `tm_mon = 14` into the
+    /// next year, and the caller may not have) and that `tm_gmtoff` is the offset genuinely in
+    /// force at that instant rather than an arbitrary `long`. `mktime` resolves both from the
+    /// timezone database, which this crate has no access to by design (D19).
+    SecondsSinceEpochUnavailable,
+    /// A `struct tm` field a specifier reads is outside the range POSIX `<time.h>` fixes for it.
+    ///
+    /// The fields come from the guest, so this is the expected case rather than an internal
+    /// error. Refused per specifier and named per field: `%d` refuses a `tm_mday` of 0 and says
+    /// so, while `%Y` beside it does not care.
+    FieldOutOfRange {
+        /// The conversion that read the field.
+        specifier: u8,
+        /// The field's C name, e.g. `"tm_mday"`.
+        field: &'static str,
+        /// What the guest put there.
+        value: i32,
+        /// The lowest value POSIX allows.
+        lower: i32,
+        /// The highest value POSIX allows.
+        upper: i32,
+    },
+    /// A year specifier was asked for a year outside the range whose representation the standard
+    /// fixes. See [`strftime`]'s "Years outside \[1000, 9999\]" section for the whole argument.
+    YearNotRepresentable {
+        /// The conversion that asked.
+        specifier: u8,
+        /// The proleptic Gregorian year, i.e. `tm_year + 1900` (or the ISO week-based year for
+        /// `%G` and `%g`).
+        year: i64,
+        /// The lowest year this specifier can represent.
+        lower: i64,
+        /// The highest year this specifier can represent.
+        upper: i64,
+    },
+    /// `%Z` was asked for the zone abbreviation and the guest's `tm_zone` pointer was NULL.
+    ///
+    /// A `struct tm` with no `tm_zone` sends a real `strftime` to the global `tzname`, which is
+    /// timezone state this crate does not have and must not invent. Emitting `"UTC"` would be
+    /// the plausible stub: correct for every `tm` this project currently produces and wrong the
+    /// moment one of them is not UTC.
+    TimeZoneNameUnavailable,
+    /// `%z` was asked for a `tm_gmtoff` outside the range a UTC offset can occupy.
+    ///
+    /// POSIX's `TZ` grammar bounds an offset's hour field at 24, so the representable range is
+    /// ±86,400 seconds. Outside it `+hhmm` has no meaning: the hours field would need more than
+    /// two digits, and printing more digits invents a format nothing parses.
+    GmtoffOutOfRange {
+        /// What the guest put in `tm_gmtoff`.
+        gmtoff: i64,
+    },
+    /// The result passed [`MAX_STRFTIME_OUTPUT`].
+    OutputTooLarge {
+        /// The cap that was passed.
+        limit: usize,
+    },
+}
+
+impl core::fmt::Display for StrftimeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StrftimeError::IncompleteSpecifier => {
+                write!(f, "strftime: the format string ended inside a conversion specification")
+            }
+            StrftimeError::UnknownSpecifier { specifier } => write!(
+                f,
+                "strftime: '%{}' is not a C99 or POSIX conversion, and this implementation does \
+                 not copy an unknown conversion through as literal text",
+                DisplayByte(*specifier)
+            ),
+            StrftimeError::ExtensionSpecifier { specifier, what } => write!(
+                f,
+                "strftime: '%{}' ({what}) is outside C99 and POSIX and is refused rather than \
+                 guessed",
+                DisplayByte(*specifier)
+            ),
+            StrftimeError::SecondsSinceEpochUnavailable => write!(
+                f,
+                "strftime: '%s' is mktime() of the broken-down time, which needs field \
+                 normalisation and the timezone database — neither is available here"
+            ),
+            StrftimeError::FieldOutOfRange { specifier, field, value, lower, upper } => write!(
+                f,
+                "strftime: '%{}' reads {field}, which POSIX bounds to [{lower}, {upper}] and the \
+                 caller set to {value}",
+                DisplayByte(*specifier)
+            ),
+            StrftimeError::YearNotRepresentable { specifier, year, lower, upper } => write!(
+                f,
+                "strftime: '%{}' has no specified representation for the year {year}; it is \
+                 defined over [{lower}, {upper}]",
+                DisplayByte(*specifier)
+            ),
+            StrftimeError::TimeZoneNameUnavailable => write!(
+                f,
+                "strftime: '%Z' needs tm_zone or the global tzname, and tm_zone was NULL"
+            ),
+            StrftimeError::GmtoffOutOfRange { gmtoff } => write!(
+                f,
+                "strftime: '%z' formats a UTC offset as +hhmm and tm_gmtoff is {gmtoff} seconds, \
+                 outside the ±86400 POSIX allows a TZ offset"
+            ),
+            StrftimeError::OutputTooLarge { limit } => {
+                write!(f, "strftime: the result passed the {limit}-byte cap")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StrftimeError {}
+
+/// Renders one format byte for an error message: itself when it is printable ASCII, `\xNN`
+/// otherwise, so `%\x00` does not put a NUL in a log line.
+struct DisplayByte(u8);
+
+impl core::fmt::Display for DisplayByte {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_ascii_graphic() {
+            write!(f, "{}", self.0 as char)
+        } else {
+            write!(f, "\\x{:02x}", self.0)
+        }
+    }
+}
+
+/// `size_t strftime(char *s, size_t max, const char *format, const struct tm *tm)` — the
+/// formatting half of it, with the guest buffer left to the caller.
+///
+/// # The return value, exactly
+///
+/// C99 7.23.3.5 paragraph 4: the function returns the number of bytes placed in the array **not
+/// including the terminating null character**, *if the total number of resulting characters
+/// including the terminating null character is not more than `maxsize`*; **otherwise zero is
+/// returned and the contents of the array are indeterminate.** So the test is
+/// `produced + 1 <= max`, which is spelled `produced < max` here because that is the same
+/// predicate with no addition to overflow. [`StrftimeOutput`] carries the distinction in its
+/// shape; see its documentation for why it is not a `usize`.
+///
+/// A believable wrong answer would have been to truncate at `max - 1` and return that length,
+/// which is `snprintf`'s contract and not this one. It is wrong twice: the return value would be
+/// a length rather than zero, and the buffer would hold a prefix of a timestamp that reads
+/// exactly like a whole one — `2026-09-2` is a date.
+///
+/// # Bytes, not characters
+///
+/// `format` is `&[u8]` and the output is `Vec<u8>` because C counts bytes and a guest format
+/// string is not guaranteed to be UTF-8. Taking a `&str` would force the caller to convert, and
+/// the only total conversion available is lossy — it would replace an unconvertible byte with
+/// U+FFFD, changing bytes that the C function copies through untouched. That is a wrong-text
+/// failure introduced by the signature.
+///
+/// # The `%E` and `%O` modifiers
+///
+/// C99 7.23.3.5 paragraph 3: "if the alternative format or specification does not exist for the
+/// current locale, the modifier is ignored". bionic has exactly one locale's behaviour — the C
+/// locale (see [`crate::locale`]) — and the C locale defines no `E` or `O` alternatives, so every
+/// `%Ex` is its `%x` and every `%Oy` is its `%y`. This implementation accepts the modifier before
+/// any conversion it handles rather than only before the pairs POSIX lists, because the reason
+/// they are equivalent — the C locale has no alternative representations at all — does not depend
+/// on which conversion follows. Exactly one modifier is consumed: `%EOy` is `%E` followed by the
+/// conversion `O`, which is unknown.
+///
+/// # Which conversions are implemented, and which refuse
+///
+/// Implemented: `%a %A %b %B %c %C %d %D %e %F %g %G %h %H %I %j %m %M %n %p %r %R %S %t %T %u
+/// %U %V %w %W %x %X %y %Y %z %Z %%`, each with its `%E`/`%O` forms. That is the whole of C99 and
+/// POSIX except `%s`.
+///
+/// Refused **by name**, never emitted:
+///
+/// * `%s` — [`StrftimeError::SecondsSinceEpochUnavailable`], which explains the near miss.
+/// * `%k`, `%l`, `%P`, `%v`, `%+` — [`StrftimeError::ExtensionSpecifier`]. GNU/BSD extensions
+///   outside C99 and POSIX.
+/// * anything else — [`StrftimeError::UnknownSpecifier`].
+///
+/// # `struct tm` fields outside their POSIX ranges
+///
+/// POSIX `<time.h>` gives each field a range: `tm_sec` `[0,60]` (the 60 is the leap second),
+/// `tm_min` `[0,59]`, `tm_hour` `[0,23]`, `tm_mday` `[1,31]`, `tm_mon` `[0,11]`, `tm_wday`
+/// `[0,6]`, `tm_yday` `[0,365]`. `tm_year` is the one field POSIX leaves unbounded.
+///
+/// A field outside its range is [`StrftimeError::FieldOutOfRange`], **checked by the specifiers
+/// that read it and by no others**. Two of those fields index a name table, where an out-of-range
+/// value has no text at all; the rest are printed as numbers, where the tempting answer is to
+/// print the number anyway. `%S` of a `tm_sec` of -5 would be `-5`, a two-character field where
+/// the format promised two digits, and it would flow into a timestamp that still parses.
+///
+/// # Years outside \[1000, 9999\]
+///
+/// `%Y` and `%G` are **defined over \[1000, 9999\]** here and refuse outside it; `%C`, `%y` and
+/// `%g` are defined over \[0, 9999\].
+///
+/// The reason is that C99 fixes the *value* of every year conversion and the *width* of only
+/// some. `%C` is "the year divided by 100 and truncated to an integer, as a decimal number
+/// (00-99)" and `%y` is "the last 2 digits of the year (00-99)": two digits, unambiguous for
+/// every year from 0 to 9999, and undefined for a year that has no two-digit century. `%Y` is
+/// "the year as a decimal number (for example, 1997)", which fixes no width — so the year 500 is
+/// `500` or `0500` depending on the implementation, the year -4 is `-4` or `-0004` or `-004`, and
+/// **there is no standard to derive the answer from**. `%G` is worse: ISO 8601 fixes four digits
+/// for \[1000, 9999\] and requires a *mutual agreement* between sender and receiver for any
+/// expanded representation, which is a protocol this function is not part of.
+///
+/// A believable wrong answer would have been to zero-pad to four digits and print a leading `-`
+/// for negative years. It is believable because two widely used implementations do it, which is
+/// exactly the reason it is not evidence (`docs/VERIFICATION.md` entry 7).
+///
+/// # Errors
+///
+/// [`StrftimeError`], one variant per refusal. Nothing is ever emitted for a conversion that
+/// returns one: the error abandons the whole call rather than leaving a partial result, because
+/// a partial timestamp is a timestamp.
+pub fn strftime(
+    max: usize,
+    format: &[u8],
+    when: &StrftimeTm<'_>,
+) -> Result<StrftimeOutput, StrftimeError> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut index = 0usize;
+    while index < format.len() {
+        // Checked here rather than at every push: one iteration appends at most one conversion,
+        // and every conversion but `%Z` is a couple of dozen bytes. `%Z` is `tm_zone`, whose
+        // length the caller chose, so the overshoot past the cap is bounded by one zone name —
+        // stated in MAX_STRFTIME_OUTPUT's documentation rather than left to be discovered.
+        if out.len() > MAX_STRFTIME_OUTPUT {
+            return Err(StrftimeError::OutputTooLarge { limit: MAX_STRFTIME_OUTPUT });
+        }
+        let byte = format[index];
+        index += 1;
+        if byte != b'%' {
+            out.push(byte);
+            continue;
+        }
+        let Some(&next) = format.get(index) else {
+            return Err(StrftimeError::IncompleteSpecifier);
+        };
+        index += 1;
+        // One `E` or `O` is consumed and discarded: the C locale has no alternative
+        // representations, so the modified conversion *is* the unmodified one.
+        let specifier = if next == b'E' || next == b'O' {
+            let Some(&modified) = format.get(index) else {
+                return Err(StrftimeError::IncompleteSpecifier);
+            };
+            index += 1;
+            modified
+        } else {
+            next
+        };
+        emit(&mut out, specifier, when)?;
+    }
+    // `produced + 1 <= max` without the addition. See this function's "return value" section.
+    if out.len() < max {
+        Ok(StrftimeOutput::Fits(out))
+    } else {
+        Ok(StrftimeOutput::DoesNotFit { needed: out.len() })
+    }
+}
+
+/// Emit one conversion.
+///
+/// # Recursion, and why it needs no depth guard
+///
+/// The compound conversions (`%c %D %F %r %R %T %x %X`) are defined by the standard *as* other
+/// conversions, so they are written that way — one place decides what `%H` looks like, and `%T`
+/// cannot drift from it. Every conversion a compound expands to is a **primitive** one, so the
+/// recursion is one level deep by construction and a runtime depth counter would be a branch no
+/// input can reach (`docs/VERIFICATION.md` entry 12). The property that makes that true is local
+/// and checkable: no arm below that recurses names `c`, `D`, `F`, `r`, `R`, `T`, `x` or `X`.
+fn emit(out: &mut Vec<u8>, specifier: u8, when: &StrftimeTm<'_>) -> Result<(), StrftimeError> {
+    let tm = &when.tm;
+    match specifier {
+        // ---- names out of the C locale's tables -------------------------------------------
+        b'a' => out.extend_from_slice(WEEKDAY_ABBREVIATED[wday(tm, specifier)? as usize]),
+        b'A' => out.extend_from_slice(WEEKDAY_FULL[wday(tm, specifier)? as usize]),
+        // POSIX: "%h — equivalent to %b". Not "similar to": the same conversion.
+        b'b' | b'h' => out.extend_from_slice(MONTH_ABBREVIATED[mon(tm, specifier)? as usize]),
+        b'B' => out.extend_from_slice(MONTH_FULL[mon(tm, specifier)? as usize]),
+
+        // ---- the compound conversions, each spelled as the standard defines it -------------
+        // POSIX LC_TIME, C locale: d_t_fmt is "%a %b %e %H:%M:%S %Y".
+        b'c' => {
+            emit(out, b'a', when)?;
+            out.push(b' ');
+            emit(out, b'b', when)?;
+            out.push(b' ');
+            emit(out, b'e', when)?;
+            out.push(b' ');
+            emit(out, b'H', when)?;
+            out.push(b':');
+            emit(out, b'M', when)?;
+            out.push(b':');
+            emit(out, b'S', when)?;
+            out.push(b' ');
+            emit(out, b'Y', when)?;
+        }
+        // C99: "%D — equivalent to %m/%d/%y". POSIX's C-locale `d_fmt`, which is what %x is,
+        // happens to be the same string — so they share an arm. They are equal *in the C
+        // locale*, not by definition: %D is fixed by the standard and %x is whatever the locale
+        // says, and bionic has one locale (see `crate::locale`).
+        b'D' | b'x' => {
+            emit(out, b'm', when)?;
+            out.push(b'/');
+            emit(out, b'd', when)?;
+            out.push(b'/');
+            emit(out, b'y', when)?;
+        }
+        // C99: "%F — equivalent to %Y-%m-%d (the ISO 8601 date format)".
+        b'F' => {
+            emit(out, b'Y', when)?;
+            out.push(b'-');
+            emit(out, b'm', when)?;
+            out.push(b'-');
+            emit(out, b'd', when)?;
+        }
+        // POSIX C locale t_fmt_ampm: "%I:%M:%S %p".
+        b'r' => {
+            emit(out, b'I', when)?;
+            out.push(b':');
+            emit(out, b'M', when)?;
+            out.push(b':');
+            emit(out, b'S', when)?;
+            out.push(b' ');
+            emit(out, b'p', when)?;
+        }
+        // C99: "%R — equivalent to %H:%M".
+        b'R' => {
+            emit(out, b'H', when)?;
+            out.push(b':');
+            emit(out, b'M', when)?;
+        }
+        // C99: "%T — equivalent to %H:%M:%S". POSIX's C-locale `t_fmt`, which is what %X is, is
+        // the same string, so they share an arm for the same reason %D and %x do.
+        b'T' | b'X' => {
+            emit(out, b'H', when)?;
+            out.push(b':');
+            emit(out, b'M', when)?;
+            out.push(b':');
+            emit(out, b'S', when)?;
+        }
+
+        // ---- the numeric conversions ------------------------------------------------------
+        // C99 %C: "the year divided by 100 and truncated to an integer, as a decimal number
+        // (00-99)". Truncating division, which for the non-negative years this arm accepts is
+        // the same as flooring — the distinction only bites below zero, which is refused.
+        b'C' => {
+            let year = year_within(tm, specifier, 0, 9999)?;
+            push_padded(out, (year / 100) as u64, 2, b'0');
+        }
+        b'd' => push_padded(out, mday(tm, specifier)? as u64, 2, b'0'),
+        // C99 %e: "the day of the month as a decimal number (1-31); a single digit is preceded
+        // by a space". A space, not a zero — that is the whole difference from %d, and swapping
+        // them produces a date that still parses.
+        b'e' => push_padded(out, mday(tm, specifier)? as u64, 2, b' '),
+        b'H' => push_padded(out, hour(tm, specifier)? as u64, 2, b'0'),
+        // C99 %I: "the hour (12-hour clock) as a decimal number (01-12)". Midnight and noon are
+        // 12, not 0: the remainder mod 12 is 0 at both and the clock has no 0.
+        b'I' => {
+            let hour = hour(tm, specifier)?;
+            let twelve = if hour % 12 == 0 { 12 } else { hour % 12 };
+            push_padded(out, twelve as u64, 2, b'0');
+        }
+        // C99 %j: "the day of the year as a decimal number (001-366)". `tm_yday` is 0-based, so
+        // the +1 is the conversion; omitting it is off by one for every day of every year and
+        // still produces three plausible digits.
+        b'j' => push_padded(out, (yday(tm, specifier)? + 1) as u64, 3, b'0'),
+        // `tm_mon` is 0-based and %m is 1-based, same shape as %j.
+        b'm' => push_padded(out, (mon(tm, specifier)? + 1) as u64, 2, b'0'),
+        b'M' => push_padded(out, field(tm.min, "tm_min", 0, 59, specifier)? as u64, 2, b'0'),
+        // 60 is allowed: POSIX bounds tm_sec at [0,60] so a positive leap second can be
+        // represented, even though a value produced by `gmtime` never is one.
+        b'S' => push_padded(out, field(tm.sec, "tm_sec", 0, 60, specifier)? as u64, 2, b'0'),
+        b'n' => out.push(b'\n'),
+        b't' => out.push(b'\t'),
+        // POSIX C locale am_pm: "AM"/"PM". Noon is PM and midnight is AM, which is what
+        // `hour < 12` says; the off-by-one alternative (`hour <= 12`) is wrong for one hour a
+        // day and right for the other twenty-three.
+        b'p' => out.extend_from_slice(if hour(tm, specifier)? < 12 { b"AM" } else { b"PM" }),
+        // C99 %u: "the ISO 8601 weekday as a decimal number (1-7), where Monday is 1". `tm_wday`
+        // has Sunday as 0, so Sunday is 7 and every other day is itself.
+        b'u' => {
+            let wday = wday(tm, specifier)?;
+            push_padded(out, if wday == 0 { 7 } else { wday as u64 }, 1, b'0');
+        }
+        // C99 %w: "the weekday as a decimal number (0-6), where Sunday is 0" — `tm_wday` exactly.
+        b'w' => push_padded(out, wday(tm, specifier)? as u64, 1, b'0'),
+        // C99 %U: "the week number of the year (the first Sunday as the first day of week 1) as
+        // a decimal number (00-53)".
+        //
+        // Derivation: `tm_yday - tm_wday` is the day of year of the Sunday that begins this
+        // week, as a 0-based number that is negative for the days before the year's first
+        // Sunday. Adding 7 and dividing by 7 maps that Sunday to 1, the one a week earlier to 2,
+        // and every day before the first Sunday to 0 — which is what "week 0" means. The
+        // numerator is in [1, 372] for every in-range field pair, so the truncating `/` is the
+        // floor and no sign question arises.
+        b'U' => {
+            let (yday, wday) = (yday(tm, specifier)?, wday(tm, specifier)?);
+            push_padded(out, ((yday + 7 - wday) / 7) as u64, 2, b'0');
+        }
+        // C99 %W: the same with Monday as the first day of the week. The only change is the
+        // weekday index: `(tm_wday + 6) % 7` re-bases Sunday-first onto Monday-first.
+        b'W' => {
+            let (yday, wday) = (yday(tm, specifier)?, wday(tm, specifier)?);
+            push_padded(out, ((yday + 7 - (wday + 6) % 7) / 7) as u64, 2, b'0');
+        }
+        // C99 %V: "the ISO 8601 week number as a decimal number (01-53)". NOT %U and NOT %W: see
+        // `iso_week_date`.
+        b'V' => {
+            let (_, week) = iso_week_date(tm, specifier)?;
+            push_padded(out, week as u64, 2, b'0');
+        }
+        b'G' => {
+            let (year, _) = iso_week_date(tm, specifier)?;
+            let year = year_representable(year, specifier, 1000, 9999)?;
+            push_padded(out, year as u64, 4, b'0');
+        }
+        b'g' => {
+            let (year, _) = iso_week_date(tm, specifier)?;
+            let year = year_representable(year, specifier, 0, 9999)?;
+            push_padded(out, (year % 100) as u64, 2, b'0');
+        }
+        b'y' => {
+            let year = year_within(tm, specifier, 0, 9999)?;
+            push_padded(out, (year % 100) as u64, 2, b'0');
+        }
+        b'Y' => {
+            let year = year_within(tm, specifier, 1000, 9999)?;
+            push_padded(out, year as u64, 4, b'0');
+        }
+
+        // ---- the two bionic extension fields ----------------------------------------------
+        // POSIX %z: "the offset from UTC in the ISO 8601:2000 standard format (+hhmm or -hhmm)".
+        // Four digits and no colon; `+hh:mm` is the GNU `%:z`, a different conversion. Seconds
+        // are dropped rather than rounded — the format has no room for them, and rounding would
+        // move a historical LMT offset to a minute it never had.
+        b'z' => {
+            let offset = when.gmtoff;
+            if !(-86_400..=86_400).contains(&offset) {
+                return Err(StrftimeError::GmtoffOutOfRange { gmtoff: offset });
+            }
+            // `+` for zero: UTC is +0000, and C has no negative zero here.
+            out.push(if offset < 0 { b'-' } else { b'+' });
+            // `unsigned_abs`, not `-offset`: negating `i64::MIN` overflows, and this value is a
+            // `long` the guest chose. The range check above already refuses it, so this is belt
+            // and braces — but the check and the negation are five lines apart and only one of
+            // them is obviously load-bearing.
+            let magnitude = offset.unsigned_abs();
+            push_padded(out, magnitude / 3600, 2, b'0');
+            push_padded(out, (magnitude / 60) % 60, 2, b'0');
+        }
+        b'Z' => match when.zone {
+            Some(zone) => out.extend_from_slice(zone),
+            None => return Err(StrftimeError::TimeZoneNameUnavailable),
+        },
+
+        b'%' => out.push(b'%'),
+
+        // ---- the refusals ------------------------------------------------------------------
+        b's' => return Err(StrftimeError::SecondsSinceEpochUnavailable),
+        b'k' | b'l' | b'P' | b'v' | b'+' => {
+            let what = match specifier {
+                b'k' => "GNU/BSD: the 24-hour hour, blank-padded",
+                b'l' => "GNU/BSD: the 12-hour hour, blank-padded",
+                b'P' => "GNU: am/pm in lower case",
+                b'v' => "BSD: %e-%b-%Y",
+                _ => "BSD: date(1)'s default format",
+            };
+            return Err(StrftimeError::ExtensionSpecifier { specifier, what });
+        }
+        _ => return Err(StrftimeError::UnknownSpecifier { specifier }),
+    }
+    Ok(())
+}
+
+/// Check one `struct tm` field against the range POSIX `<time.h>` fixes for it, widening to
+/// `i64` so that every arithmetic expression above is over a type the field cannot overflow.
+fn field(
+    value: i32,
+    name: &'static str,
+    lower: i32,
+    upper: i32,
+    specifier: u8,
+) -> Result<i64, StrftimeError> {
+    if value < lower || value > upper {
+        return Err(StrftimeError::FieldOutOfRange {
+            specifier,
+            field: name,
+            value,
+            lower,
+            upper,
+        });
+    }
+    Ok(i64::from(value))
+}
+
+/// `tm_wday`, checked. POSIX: `[0, 6]`, Sunday is 0.
+fn wday(tm: &Tm, specifier: u8) -> Result<i64, StrftimeError> {
+    field(tm.wday, "tm_wday", 0, 6, specifier)
+}
+
+/// `tm_mon`, checked. POSIX: `[0, 11]`, January is 0.
+fn mon(tm: &Tm, specifier: u8) -> Result<i64, StrftimeError> {
+    field(tm.mon, "tm_mon", 0, 11, specifier)
+}
+
+/// `tm_mday`, checked. POSIX: `[1, 31]` — 1-based, unlike every other date field.
+fn mday(tm: &Tm, specifier: u8) -> Result<i64, StrftimeError> {
+    field(tm.mday, "tm_mday", 1, 31, specifier)
+}
+
+/// `tm_hour`, checked. POSIX: `[0, 23]`.
+fn hour(tm: &Tm, specifier: u8) -> Result<i64, StrftimeError> {
+    field(tm.hour, "tm_hour", 0, 23, specifier)
+}
+
+/// `tm_yday`, checked. POSIX: `[0, 365]` — 0-based, so 365 is the 366th day of a leap year.
+fn yday(tm: &Tm, specifier: u8) -> Result<i64, StrftimeError> {
+    field(tm.yday, "tm_yday", 0, 365, specifier)
+}
+
+/// The proleptic Gregorian year the `tm` names.
+///
+/// `i64::from` before the addition, not after: `tm_year + 1900` in `i32` overflows for
+/// `tm_year > i32::MAX - 1900`, which a guest can set, and in a release build it wraps to a
+/// negative year rather than panicking (`docs/VERIFICATION.md` entry 3). Widened first, the
+/// addition cannot overflow at all — the sum of an `i32` and 1900 is inside `i64` for every
+/// `i32` — which is why this is not a `checked_add`: there is nothing to check.
+fn calendar_year(tm: &Tm) -> i64 {
+    i64::from(tm.year) + 1900
+}
+
+/// [`calendar_year`], refused when it is outside the range the specifier can represent.
+fn year_within(
+    tm: &Tm,
+    specifier: u8,
+    lower: i64,
+    upper: i64,
+) -> Result<i64, StrftimeError> {
+    year_representable(calendar_year(tm), specifier, lower, upper)
+}
+
+/// The same check for a year that has already been computed (`%G` and `%g`'s ISO year).
+fn year_representable(
+    year: i64,
+    specifier: u8,
+    lower: i64,
+    upper: i64,
+) -> Result<i64, StrftimeError> {
+    if year < lower || year > upper {
+        return Err(StrftimeError::YearNotRepresentable { specifier, year, lower, upper });
+    }
+    Ok(year)
+}
+
+/// The ISO 8601 week-based year and week number: `(%G, %V)`.
+///
+/// # The derivation, written out, because this is the specifier set that is easy to get subtly
+/// wrong
+///
+/// ISO 8601 numbers weeks from **Monday** and puts week 1 as the week containing the year's
+/// first Thursday — equivalently, the week containing 4 January, equivalently the week holding
+/// the majority of its days in the new year. That has two consequences `%U` and `%W` do not
+/// have: the first days of January can belong to **the previous** ISO year, and the last days of
+/// December can belong to **the next** one. `%U` and `%W` never do either; they have a week 0
+/// instead, and they always stay inside their own calendar year. An implementation that computes
+/// `%V` as `%W + 1` agrees with ISO for most of the year, which is what makes it dangerous.
+///
+/// Step 1, the provisional week. With `iso_wday = (tm_wday + 6) % 7` (Monday 0 … Sunday 6),
+/// `week = (tm_yday - iso_wday + 10) / 7`. The `+10` is `+7` for "count weeks from one, not
+/// zero" and `+3` for "the week is numbered by the year its Thursday falls in" — `tm_yday -
+/// iso_wday + 3` is the day of year of this week's Thursday. Over the POSIX field ranges the
+/// numerator is in `[4, 375]`, so the truncating `/` is a floor and `week` is in `[0, 53]`.
+///
+/// Step 2, `week == 0`: this week's Thursday fell in the previous year, so the date belongs to
+/// the previous ISO year's **last** week, which is 52 or 53.
+///
+/// Step 3, `week` beyond the year's own count: this week's Thursday fell in the next year, so
+/// the date is week 1 of the next ISO year. Only a provisional 53 can be beyond it.
+///
+/// A year has 53 ISO weeks exactly when 1 January is a Thursday, or it is a leap year and 1
+/// January is a Wednesday — in both cases the extra day (or two) pushes a 53rd Thursday into the
+/// year. 1 January's weekday comes from the `tm` itself: `(tm_wday - tm_yday) mod 7` walks back
+/// to day 0 of the same year. `rem_euclid`, not `%`, because that difference is negative for
+/// every day after 1 January and `%` would give a negative index.
+///
+/// The previous year's 1 January is `(this year's - 365 - leap(previous)) mod 7`, i.e. one day
+/// earlier for a common year and two for a leap one.
+///
+/// # What this deliberately does not do
+///
+/// It does not re-derive `tm_yday` or `tm_wday` from the date: it uses the fields it is given,
+/// which is what every other conversion here does and what the standard's own formulation is in
+/// terms of. A `tm` whose fields disagree with each other produces a defined answer that reflects
+/// the fields it was handed.
+fn iso_week_date(tm: &Tm, specifier: u8) -> Result<(i64, i64), StrftimeError> {
+    let yday = yday(tm, specifier)?;
+    let wday = wday(tm, specifier)?;
+    // Widened from `i32` and never larger than about 2.1e9, so every sum below is inside `i64`
+    // by many orders of magnitude — the fields it is combined with are bounded by 365.
+    let year = calendar_year(tm);
+
+    let iso_wday = (wday + 6) % 7;
+    let week = (yday - iso_wday + 10) / 7;
+    let january_first = (wday - yday).rem_euclid(7);
+
+    if week == 0 {
+        let previous = year - 1;
+        let previous_first = (january_first - 1 - i64::from(is_leap(previous))).rem_euclid(7);
+        return Ok((previous, weeks_in_iso_year(previous, previous_first)));
+    }
+    if week > weeks_in_iso_year(year, january_first) {
+        return Ok((year + 1, 1));
+    }
+    Ok((year, week))
+}
+
+/// How many ISO 8601 weeks `year` has, given the weekday of its 1 January (Sunday 0).
+///
+/// 52 or 53, never anything else: 52 weeks is 364 days and a year is 365 or 366, so at most one
+/// extra week can form. See [`iso_week_date`] for why the condition is "Thursday, or Wednesday in
+/// a leap year".
+fn weeks_in_iso_year(year: i64, january_first: i64) -> i64 {
+    /// Thursday, in `tm_wday`'s Sunday-is-0 numbering.
+    const THURSDAY: i64 = 4;
+    /// Wednesday, likewise.
+    const WEDNESDAY: i64 = 3;
+    if january_first == THURSDAY || (is_leap(year) && january_first == WEDNESDAY) {
+        53
+    } else {
+        52
+    }
+}
+
+/// Append `value` in decimal, padded on the left to `width` with `pad`.
+///
+/// `u64` rather than a signed type on purpose. Every conversion that reaches here has already
+/// refused a negative value — the fields are range-checked and the years are range-checked — so a
+/// sign branch would be a branch no input can take (`docs/VERIFICATION.md` entry 12). `%z`'s sign
+/// is pushed by `%z`, which is the only conversion that has one.
+///
+/// A value wider than `width` is **not** truncated: it is printed in full. C's `%02d` does the
+/// same, and truncating a year to its last two digits because the field said two is how a
+/// `strftime` prints 2026 as `26`.
+fn push_padded(out: &mut Vec<u8>, value: u64, width: usize, pad: u8) {
+    // 20 digits is `u64::MAX`, so the buffer cannot be overrun by any input.
+    let mut digits = [0u8; 20];
+    let mut count = 0usize;
+    let mut rest = value;
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        count += 1;
+        if rest == 0 {
+            break;
+        }
+    }
+    for _ in count..width {
+        out.push(pad);
+    }
+    for &digit in digits[..count].iter().rev() {
+        out.push(digit);
+    }
+}
+
+/// A guest `struct tm`, read back out of guest memory.
+///
+/// The companion to [`write_tm`], and the shape `strftime` needs: unlike `gmtime`, `strftime`
+/// takes a `struct tm` as **input**, including the two BSD extension fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestTm {
+    /// The nine POSIX fields, unvalidated — see [`StrftimeTm::tm`].
+    pub tm: Tm,
+    /// `tm_gmtoff`, the guest's `long`.
+    pub gmtoff: i64,
+    /// `tm_zone`, the guest **pointer**. Resolving it to bytes needs a string read the caller
+    /// owns, so it is left as an address here; `0` is NULL.
+    pub zone: u64,
+}
+
+/// Read the 56 bytes of a guest `struct tm`.
+///
+/// One [`GuestMemory::read`] of the whole structure rather than eleven field reads, for the
+/// mirror of the reason [`write_tm`] does one write: a `struct tm` that is half-read across a
+/// mapping boundary would be a *partly* stale broken-down time, and every field of it looks like
+/// a time.
+///
+/// The fields are returned exactly as they were found. No range checking happens here — the
+/// ranges belong to the conversions that read the fields, and rejecting a whole `struct tm`
+/// because `tm_isdst` is 7 would refuse calls bionic answers.
+///
+/// # Errors
+///
+/// [`Fault`] if the 56 bytes at `at` are not readable guest memory.
+pub fn read_tm(mem: &impl GuestMemory, at: u64) -> Result<GuestTm, Fault> {
+    checked_range(at, TM_BYTES as u64)?;
+    let mut bytes = [0u8; TM_BYTES];
+    mem.read(at, &mut bytes)?;
+    let int_at = |offset: usize| {
+        // The slice is 4 bytes of a 56-byte array at a fixed offset, so the conversion cannot
+        // fail; `unwrap_or` keeps it total without a panic path rather than asserting it.
+        i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4]))
+    };
+    Ok(GuestTm {
+        tm: Tm {
+            sec: int_at(0),
+            min: int_at(4),
+            hour: int_at(8),
+            mday: int_at(12),
+            mon: int_at(16),
+            year: int_at(20),
+            wday: int_at(24),
+            yday: int_at(28),
+            isdst: int_at(32),
+        },
+        gmtoff: i64::from_le_bytes(
+            bytes[TM_GMTOFF_OFFSET..TM_GMTOFF_OFFSET + 8].try_into().unwrap_or([0; 8]),
+        ),
+        zone: u64::from_le_bytes(
+            bytes[TM_ZONE_OFFSET..TM_ZONE_OFFSET + 8].try_into().unwrap_or([0; 8]),
+        ),
+    })
 }
 
 #[cfg(test)]
