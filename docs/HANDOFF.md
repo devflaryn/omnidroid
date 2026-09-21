@@ -1,8 +1,59 @@
 # Handoff
 
-Written 2026-09-19 for a fresh session. This file is a pointer and a state snapshot, not a history.
-The durable sources of truth are `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/STATUS.md`, the M3
-plan and ledger, and git history.
+Written 2026-09-19, current as of **2026-09-21 after M4**. This file is a pointer and a state
+snapshot, not a history. The durable sources of truth are `docs/ARCHITECTURE.md`,
+`docs/DECISIONS.md`, `docs/STATUS.md`, **`docs/VERIFICATION.md`**, the M3 plan and ledger, and git
+history.
+
+## Read `docs/VERIFICATION.md` before writing a test you intend to rely on
+
+New, and the least reconstructible thing here. **Eleven documented ways verification has failed in
+this project**, each a real incident with its measurement, plus the six process rules they produced.
+Not general advice — every entry produced a *green suite that proved less than it claimed*, and most
+were written by whoever wrote the code.
+
+The two that recur: **a count cannot see a substitution** (assert membership, not totals), and **the
+regression test for a previous defect is where the next gap hides** — both High findings of the
+adapter review were exactly that.
+
+## Where we are on the startup contract
+
+`docs/research/jni-surface.md` §8 is the spine of everything from here: **26 ordered steps** from
+`dlopen` to "the engine asks for a rendering surface", nearly all VERIFIED against the real binary.
+
+| steps | milestone | state |
+|---|---|---|
+| 1-5 | M0-M3 | **done** — ending with all 3,594 initializers |
+| 6-12 | M4 | **done** — `JNI_OnLoad` returns `0x00010006` on the real engine; 19 of 21 scripted downcalls |
+| **13** | **M5 — next** | `initializeNativeCode`. Its brief is the "M4 is reached" section below |
+| 14-20 | M5 | the game thread, `ANativeWindow`, the GameActivity callbacks |
+| 21-24 | M5/M6 | the flags/settings orchestration — **§8.1 says this is the step most likely to be mistaken for "the engine is broken"**, because it hangs rather than errors |
+| 25 | M6 | EGL then Vulkan via `dlopen` |
+| 26 | M7/M8 | input, first frame, interactive |
+
+**The architectural fact that shapes M5 and M6:** the Java side is the **initiator**. `libroblox.so`
+will not reach a first frame by itself — the host must *drive* it with the sequence ART would
+normally perform. It is an **orchestration problem, not an interpretation problem**, and D7 (no JVM,
+no ART, no dex interpreter) is unaffected.
+
+**M6's scope collapsed** (D27): the APK ships **ETC1 only** — 38 containers, 813,802 blocks, **zero**
+in any ETC2-only mode, and **zero** ASTC/EAC/PVRTC bytes anywhere. `crates/omni-texture` decodes it
+with zero dependencies. An ASTC decoder would have been entirely dead code.
+
+## Running more than one agent at once
+
+M4 and the texture work ran in parallel successfully. What made it safe:
+
+* **Disjoint crates.** One owned `omni-android`/`omni-bionic`/`omni-platform`, the other
+  `omni-gfx`/`omni-texture`/`tools`. Both may touch `docs/`.
+* **`tools/mutate.py` is shared and the harness is EXCLUSIVE.** It mutates the working tree in place,
+  so two runs cannot overlap and no one may build or commit during one. Each agent runs only its own
+  rows with `--only`; **the controller runs the full table once, after both finish.**
+* **`--only` pre-flights only the rows it selects**, so staleness elsewhere stays invisible. A large
+  feature *will* stale rows anchored on code it moves — six were staled once, and an id collision
+  once. Pre-flight the whole table (without running it) after any large change.
+* Stage explicit paths, never `-A`; commit in pieces. An agent hit a usage limit mid-task in this
+  session and lost nothing **only because it had committed thirteen times**.
 
 ## Git state
 
