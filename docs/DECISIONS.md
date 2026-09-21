@@ -3281,3 +3281,54 @@ closed, and the thing that keeps that honest is a test over the bound-symbol tab
 paragraph. `inet_ntop`'s divergence from the standard library is third — it is one address class
 out of a hundred and twenty-eight bits, it would never have been found by a hand-written case, and
 a guest that logs an address would have logged a different one.
+
+---
+
+## D26 — `AT_HWCAP` decides to **decline**, for the startup path, and says what would reverse it
+
+**Decision.** The M3 gate and everything up to a first frame run with `HwcapPolicy::Decline` —
+`AT_HWCAP` and `AT_HWCAP2` both zero, which is what a real ARMv8.0 device reports. `Undecided`
+remains the state an instance *starts* in; the gate constructs `Decline` explicitly, so this is a
+choice made at a call site and not a default anybody can drift into.
+
+**Why this was open, and what made it decidable.** D5's amendment framed the two arms as
+*advertise → 53 hard halts into the interpreter* against *decline → 106 fallback arms into a
+spinlock that anti-scales 21x*. Read quickly, "hard halt" sounds fatal, which would have made
+declining mandatory rather than chosen. It is not. **D5 risk 4 states the opposite in its own
+words:** the 231 unimplemented decoder entries, LSE among them, *"surface cleanly via
+`InterpreterFallback` at ~87 ns per trap, so they are correct but slow."*
+
+So **both arms execute correctly** and the question is purely cost:
+
+| | cost per site | behaviour as threads rise |
+|---|---|---|
+| **Advertise** | ~87 ns interpreter trap, 53 sites | per-context, so it **scales** |
+| **Decline** | an uncontended `LDXR`/`STXR`, 106 sites | one **global** spinlock — **21x anti-scaling, 1 → 16 threads** |
+
+An uncontended exclusive pair is a few nanoseconds against 87 for a trap, so declining is roughly an
+order of magnitude cheaper *while thread counts are low* and materially worse once they are not.
+
+**Why that resolves it for now.** The 3,594 initializers and the path to a first frame are not
+thread-heavy: the engine has not started its worker pools while its statics are still constructing.
+Declining takes the cheap arm exactly where the cheap arm applies, and pays nothing for the
+scalability it is not yet using. Advertising would put 53 interpreter traps into the hottest,
+least-parallel part of the run to buy scaling that nothing is asking for.
+
+**What would reverse it, stated now so it is not rediscovered.** Two triggers:
+
+1. **M8 (interactive), measured under real thread load.** Roblox is heavily multithreaded and D5
+   names the spinlock as compounding with risk 4. The moment worker pools are live, the 21x figure
+   is the one that matters and this decision must be re-measured rather than assumed.
+2. **`fastmem_exclusive_access`, which D5 records as the untested mitigation.** If it removes the
+   global spinlock, declining becomes correct permanently and the trigger above disappears. Testing
+   it is worth more than re-arguing this decision, because it is the only path where *neither* arm
+   costs anything.
+
+**Cost if wrong: low, and reversible in one bit.** It is one enum value at one call site, with no
+code shaped around it — which is why the type keeps `Advertise`, `Decline` and `Undecided` distinct
+rather than collapsing the last two.
+
+**What this does not decide.** Whether to advertise anything *else* in `AT_HWCAP`. `Decline` is all
+zeroes; a later phase that needs a different capability advertised is making a new decision, not
+extending this one.
+
