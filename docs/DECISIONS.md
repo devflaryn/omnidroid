@@ -3599,3 +3599,164 @@ still no NDK on this machine. Its safety argument is the strongest of the family
 read is `name` at offset 8, and every field of the struct is a pointer on LP64 except the leading
 `jint` and its padding, so the layout is forced once the field order is right. It is **exercised**
 — the engine really does pass one, and the name `"Main"` came out of it.
+
+---
+
+## D29 — M5: `initializeNativeCode` returns, and the two failure modes that fail silently
+
+**Decision.** `jni-surface.md` §8 step 13 is reached by building the four things §5.2 says the
+GameActivity constructor and its glue need — a pipe with real readiness, an `ALooper`, an
+`AAssetManager` and an `AConfiguration` — and by pointing an **instrument** at each of §8.1's two
+*silent* failure modes before either could happen. `crates/omni-android/src/ndk/` is new and is the
+third thing in that crate the guest reaches, after the bionic adapter and the JNI tables.
+
+### What it is evidence of, measured
+
+`cargo test -p omni-android --release --test gameactivity`, on the real `libroblox.so` after all
+3,594 initializers, `JNI_OnLoad` and §8 steps 7-12. **n = 1 run.**
+
+| | |
+|---|---|
+| `initializeNativeCode` | returns a **non-zero `jlong`** |
+| `activity->callbacks` (+0x00) | `== this + 0x50` |
+| `activity->vm` (+0x08), `env` (+0x10) | the `JavaVM` and `JNIEnv` this layer built |
+| `activity->sdkVersion` (+0x30) | **33**, which the host decided and `__system_property_get` answered |
+| `activity->instance` (+0x38) | non-zero — **this is the assertion that §8 row 14's cond-wait completed**, because `GameActivity_onCreate` writes it only after the game thread signals `app->running` |
+| `activity->assetManager` (+0x40) | what `AAssetManager_fromJava` returned |
+| `msgread`/`msgwrite` (+0x150/+0x154) | two ends of one real `pipe()`, and the looper watches `msgread` |
+| the looper (+0x158) | the one the host prepared on the calling thread |
+| the game thread | its own `ALooper_prepare`, `AConfiguration_fromAssetManager` → `en-US 411x731 dp`, `addFd(ident 1, callback 0)` — `LOOPER_ID_MAIN`, exactly §5.2 |
+| §8 steps 7-12 | **20 of 21**, up from M4's 19 |
+| JNI misses | **0** |
+| imported symbols called | **134 distinct**, up from M4's 113 |
+| the engine | reaches `[FLog::NativeEngine] initializing.` |
+
+### The two instruments, and that both were needed
+
+§8.1 ranks two failure modes as *silent*, and neither was diagnosed after the fact — both were
+made observable first, and both then fired.
+
+**Failure mode 4 — a null `ALooper` makes the call return `0`.** A zero `jlong` is
+indistinguishable from a handle the Java side would pass to all 23 other natives.
+`Ndk::prepare_looper` is a **host** API precisely so a gate can assert a looper exists *before* the
+call; `ALooper_forThread` answers null when there is none, because that null is a real answer the
+engine branches on and refusing there would replace a measurable engine behaviour with this
+layer's opinion.
+
+**Failure mode 5 — a cond-wait deadlock is indistinguishable from a hang.** It is
+indistinguishable *from outside*. `Bionic::parked()` is the inside: every guest thread blocked in
+`pthread_cond_wait`, with the condition variable, the mutex it released, the thread and how long.
+Maintained by an RAII guard, because every exit from the wait must remove the entry including the
+failing ones.
+
+**It fired, and it paid for itself in one use.** A created guest thread carried only the bionic
+instance. The game thread `GameActivity_onCreate` spawns called `AConfiguration_new`, found no NDK
+instance, refused, and died — so `app->running` was never set and step 13 waited on its condition
+variable **for ever**. §8 row 14 and failure mode 5 at once. The watchdog printed
+`thread GuestThreadId(1) in pthread_cond_wait on cond 0x…ff0 holding mutex 0x…fc8 for 180.05 s`
+beside `last import: AConfiguration_new`, and the diagnosis took three minutes.
+`ThreadHost::with_instance` is the fix, and it is the embedding's to state because `Bionic` must
+not learn that `Jni` or `Ndk` exist.
+
+`Bionic::parked_peak()` is a **watch** and is labelled one where it is defined: two threads
+legitimately waiting and two threads deadlocked are the same number.
+
+### The closed descriptor space, opened on purpose
+
+D25 wrote `the_descriptor_space_poll_answers_over_is_closed` as a detector for one specific future
+moment: *the day a phase binds `socket` for real, that test fails and this module has to grow a
+real readiness source with it.* **M5 is that day, and the symbol was `pipe` rather than `socket`.**
+
+The test was **replaced, not updated**. `poll` and `select` now answer from
+`Filesystem::readiness`, a `match` over the descriptor kinds with **no default arm**, so the space
+is still closed — closed under *kinds that have decided what they answer* rather than under *kinds
+that cannot block* — and a sixth kind cannot be added without deciding. The successor asserts that
+the descriptor-producing symbols bound here are exactly those whose readiness has been decided.
+
+A pipe needs **no operating system**: both ends belong to the same guest, so it is a `VecDeque<u8>`,
+two reference counts and a condition variable. Per D22's other half it therefore gets **no
+fabricated `unsupported` arm** for Linux or macOS. That is the **fourth** phase running whose
+OS-surface prediction was too high — files needed fifteen of seventeen operations to be one `std`
+call (D23), threads needed nothing (D24), sockets needed nothing (D25).
+
+**Nothing in `omni-platform`'s pipe ever waits**, and that is deliberate rather than incidental: a
+read from an empty *blocking* pipe reports `WouldBlock` exactly as a non-blocking one does, and the
+adapter decides what to do about it — bounded by `MAX_SLEEP_SECONDS`, refusal by name at the cap,
+the same policy `poll`, `select` and `nanosleep` already apply. D16's runaway-guest defence is built
+from step budgets a sleeping thread does not consume, so "how long may a guest block" is not a
+question a platform seam should answer.
+
+**The readiness generation is read before each attempt, never after the attempt failed.** The other
+order loses a write that lands in between, which is the 1.0104 s lost wakeup of `VERIFICATION.md`
+entry 11.
+
+### Thirteen symbols beyond the prediction, and how each was found
+
+`BEYOND_THE_PREDICTION` was eight after M4 and is **thirteen** now. The five M5 added split by
+*method*, which is worth keeping:
+
+| symbol | how it was found |
+|---|---|
+| `pipe`, `fcntl`, `write` | **decoded out of the binary** — §5.2's instruction-by-instruction reading of `initializeNativeCode`. Bound before the call that needed them existed |
+| `pthread_attr_setdetachstate` | **ran into as an `Unbound`** by the gate. A pure binding gap: `omni_bionic::metadata::attr_setdetachstate` had existed since phase 3c and nothing called it |
+| `strftime` | a **known** gap, recorded by M4 with the reason: there was no implementation to bind. There is now |
+
+`AAsset_read` is bound and `libroblox.so` does **not** import it — only `libzstd-jni` does. It is
+named in `NDK_BEYOND_THE_IMPORTS` with the evidence, for `freelocale`'s reason: a layer that hands
+out an `AAsset` and cannot read it is worse than one that does neither.
+
+### The M4 access violation, reproduced and fixed
+
+D28's record kept "an early run exited with `STATUS_ACCESS_VIOLATION` **after both tests reported
+`ok`**… teardown of a guest with live guest threads is the obvious suspect", unreproduced.
+
+**It reproduces.** M5's gate finishes with the game thread inside `android_main`; the
+whole-workspace run then died with `0xc0000005`, the guest's own
+`[FLog::NativeMain] [android_main] Create a new NativeEngine:` the last line before it.
+`stop_guest_threads` *asked* and nothing waited for the answer.
+
+`Bionic::join_guest_threads(timeout)` is the missing half. **A `Drop` cannot do it**, and that is
+structural: every running guest thread holds an `Arc<Bionic>`, so the instance's own `Drop` cannot
+run while one is alive — the last reference is dropped *by* the last thread. The gate asserts the
+join rather than making a best effort, because a join that timed out and carried on would put the
+crash back under a comment claiming it fixed.
+
+**Joining made three silent failures visible.** Nobody joins a detached thread, so
+`guest_thread_failures()` is the only place one can surface:
+
+* **two threads died on raw `syscall 98` — arm64 `futex`.** The engine's own workers issue raw
+  futex syscalls, bypassing every `pthread_*` symbol this layer binds. The refusal is right — a raw
+  syscall asks the kernel directly, and `-1`/`ENOSYS` is the believable wrong answer because
+  callers carry an ENOSYS fallback and would route around the gap — but it is now an obstacle with
+  a number on it rather than a silence. **This is the largest single thing standing between here
+  and M6.**
+* **one died on `CallObjectMethodV` with a null `jmethodID`** — §8.1's third failure mode, on the
+  game thread.
+
+None of them blocks M5: step 13 returns before any of them happens.
+
+### What the run measured that the research had not
+
+* **`android/view/MotionEvent` and `android/view/KeyEvent` are Tier 0** and §3.1 does not name
+  them. `FindClass` missed, and the null went straight to `GetMethodID` — §8.1's third failure mode
+  happening for real, one class beyond the prediction. The **22 + 11** member lists in
+  `classes.rs` are read out of `Jni::misses` *with the descriptors the engine asked for*, not
+  transcribed from the Android API: a transcription would have missed `getClassification` and
+  `getActionButton`, both API 29 and later. They are independent confirmation of §4.4's buffered
+  input finding — the glue reads the *Java* objects through JNI, which is why `AMotionEvent_*` is
+  absent from the whole APK.
+* **§4.4's "ANativeWindow (9)" is the APK's count, not `libroblox.so`'s.** That binary imports
+  five: `_acquire`, `_fromSurface`, `_getWidth`, `_getHeight`, `_release`. The other four belong to
+  `libimage_processing_util_jni` and `libsurface_util_jni`.
+* **`sched_yield` was called 22,387,975 times** in one run — the AT_HWCAP decline's fallback path
+  (D26) spinning. It is not a correctness problem and it is a large number; D26's "revisit at M8
+  under real thread load" now has a figure attached to it.
+
+### Cost if wrong
+
+**Bounded and visible, as M4's was.** Everything this milestone added either answers or refuses by
+name; the refusals that matter — an indefinite `ALooper_pollOnce`, `AAsset_openFileDescriptor`, a
+raw `syscall` — each say what would have to be invented, and each names what would change it. The
+bet M5 makes is the same one M4 made and it is now tested one step further: that the Java side can
+be *defined* rather than executed, and that the NDK surface under it can be *implemented* rather
+than stubbed.
