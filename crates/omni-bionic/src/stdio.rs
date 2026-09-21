@@ -377,6 +377,48 @@ pub fn fwrite(
     Ok(written / size)
 }
 
+/// Write bytes the **host** already holds to a stream, as `fprintf` and `vfprintf` need.
+///
+/// The `f*printf` family is the one place in this layer where the bytes going to a stream did not
+/// come out of guest memory: the formatting happens host-side, so [`fwrite`]'s guest-pointer
+/// source is the wrong shape and going through guest memory would need a guest buffer nothing
+/// owns. This is the same short-write, error-flag and `errno` bookkeeping as [`fwrite`] with the
+/// source replaced.
+///
+/// Returns how many bytes the descriptor took, which C's `fprintf` reports as its `int` result.
+///
+/// # Errors
+///
+/// None today — the signature keeps [`BionicResult`] so that a caller can treat it like every
+/// other stream operation, and so that a future descriptor layer with a guest-visible failure
+/// does not change every call site.
+pub fn write_host_bytes(
+    ctx: &mut impl GuestContext,
+    descriptors: &impl Descriptors,
+    stream: &mut Stream,
+    bytes: &[u8],
+) -> BionicResult<u64> {
+    let _ = &ctx;
+    let mut done = 0usize;
+    while done < bytes.len() {
+        match descriptors.write(stream.fd, &bytes[done..]) {
+            Ok(0) => {
+                // As `transfer_out`: a descriptor accepting nothing is not making progress, and
+                // looping would be a hang rather than a failure.
+                stream.error = true;
+                break;
+            }
+            Ok(took) => done += took,
+            Err(errno) => {
+                stream.error = true;
+                ctx.set_errno(errno);
+                break;
+            }
+        }
+    }
+    Ok(done as u64)
+}
+
 // ------------------------------------------------------------------ the shared machinery
 
 /// Read `length` bytes of guest memory in chunks and hand them to the descriptor.

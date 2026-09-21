@@ -26,6 +26,7 @@
 //! | `size_t strspn(const char *s, const char *accept)` | [`strspn`] |
 //! | `size_t strcspn(const char *s, const char *reject)` | [`strcspn`] |
 //! | `char *__gnu_strerror_r(int err, char *buf, size_t len)` | [`gnu_strerror_r`] |
+//! | `int strerror_r(int err, char *buf, size_t len)` | [`strerror_r`] |
 //!
 //! Bionic-specific `_chk` contracts (VERIFIED against bionic's `include/string.h` +
 //! `upstream-openbsd/bionic/*.c` behaviour as of the NDK the engine targets):
@@ -619,6 +620,48 @@ pub fn strerror_message(errnum: i32) -> &'static str {
         .find(|(code, _)| *code == errnum)
         .map(|(_, msg)| *msg)
         .unwrap_or("Unknown error")
+}
+
+/// `int strerror_r(int errnum, char *buf, size_t buflen)` — the **POSIX** form.
+///
+/// bionic exports both spellings and they differ in what they return: this one answers `0` or
+/// `ERANGE`, where [`gnu_strerror_r`] answers a `char *`. Getting them the wrong way round turns
+/// every success into a pointer the caller will dereference, or every pointer into a `0` the
+/// caller reads as success and then prints an empty buffer — which is why they are two functions
+/// here rather than one with a flag.
+///
+/// bionic's own implementation writes with `strlcpy` and returns `ERANGE` when the message did
+/// not fit, **without touching `errno`** (its `ErrnoRestorer` puts back whatever was there). So
+/// truncation is reported in the return value only, and this does the same: a caller that ignores
+/// the result gets a NUL-terminated prefix, which is what a device gives it.
+///
+/// `buflen == 0` or a null `buf` cannot even hold a NUL; that is `ERANGE`, since nothing was
+/// written and the message did not fit.
+pub fn strerror_r(
+    mem: &mut impl GuestMemory,
+    errnum: i32,
+    buf: u64,
+    buflen: u64,
+) -> crate::error::BionicResult<i32> {
+    if buflen == 0 || buf == 0 {
+        return Ok(crate::errno::consts::ERANGE);
+    }
+    let (b, len) = checked_range(buf, buflen)?;
+    let message: Vec<u8> = if ERRNO_STRINGS.iter().any(|(c, _)| *c == errnum) {
+        strerror_message(errnum).as_bytes().to_vec()
+    } else {
+        format!("Unknown error {errnum}").into_bytes()
+    };
+    // `strlcpy`: copy what fits, always terminate, and report the length it *wanted*.
+    let room = (len - 1) as usize;
+    let copied = message.len().min(room);
+    let mut out = message[..copied].to_vec();
+    out.push(0);
+    mem.write(b, &out)?;
+    if message.len() >= len as usize {
+        return Ok(crate::errno::consts::ERANGE);
+    }
+    Ok(0)
 }
 
 /// `char *__gnu_strerror_r(int errnum, char *buf, size_t buflen)`

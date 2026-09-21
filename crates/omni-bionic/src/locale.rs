@@ -15,6 +15,8 @@
 //!   trivially and honestly, argued in the phase 3 notes.
 //! * `uselocale` records the handle in guest memory via the context (the adapter owns
 //!   where the thread's locale lives) — no allocation.
+//! * `__ctype_get_mb_cur_max` is [`MB_CUR_MAX`], which is 4: UTF-8 is the only multibyte
+//!   encoding bionic has.
 //! * `localeconv` returns the C/POSIX `lconv` field values and composes the struct into a
 //!   scratch buffer from [`crate::context::GuestContext::scratch`].
 //!
@@ -64,6 +66,22 @@ pub fn newlocale(
     let _ = base; // nothing to combine: one behaviour
     Ok(C_LOCALE_HANDLE)
 }
+
+/// `size_t __ctype_get_mb_cur_max(void)` — the value behind the `MB_CUR_MAX` macro.
+///
+/// **4, and it is a fact about bionic rather than a choice.** Android's only multibyte encoding
+/// is UTF-8: bionic has one locale implementation, every accepted `newlocale` name maps to it,
+/// and RFC 3629 caps a UTF-8 sequence at four bytes. There is no locale a guest can select here
+/// or on a device under which this is anything else.
+///
+/// It is `size_t`, so it returns 64 bits — a caller comparing it against a `size_t` length would
+/// read the upper half of whatever was in the register if this answered 32.
+pub const fn ctype_get_mb_cur_max() -> u64 {
+    MB_CUR_MAX
+}
+
+/// `MB_CUR_MAX` for the only encoding bionic has: UTF-8, capped at four bytes by RFC 3629.
+pub const MB_CUR_MAX: u64 = 4;
 
 /// `void freelocale(locale_t locobj)` — releases nothing: the only handle this crate can
 /// produce is the static C-locale sentinel. (Correctness argument: `newlocale` never

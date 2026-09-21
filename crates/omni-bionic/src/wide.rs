@@ -12,6 +12,7 @@
 //! | `int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n)` | [`wmemcmp`] |
 //! | `int wctob(wint_t c)` | [`wctob`] |
 //! | `size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)` | [`mbrtowc`] |
+//! | `int mbtowc(wchar_t *pwc, const char *s, size_t n)` | [`mbtowc`] |
 //! | `size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps)` | [`mbsrtowcs`] |
 //!
 //! All are the C/POSIX-locale forms (no `_l` variants are reachable). Element size for
@@ -33,6 +34,9 @@ use crate::memory::{checked_range, Fault, GuestMemory};
 const MB_ERR: u64 = u64::MAX;
 /// C standard `(size_t)-2`: incomplete multibyte sequence.
 const MB_INCOMPLETE: u64 = u64::MAX - 1;
+/// `EILSEQ`, 84 in Linux numbering (kernel UAPI; VERIFIED, and the same source the rest of
+/// [`crate::errno`] comes from).
+const EILSEQ: i32 = 84;
 
 /// Read one 32-bit little-endian `wchar_t` at `addr`.
 fn read_wc(mem: &impl GuestMemory, addr: u64) -> Result<u32, Fault> {
@@ -210,7 +214,7 @@ pub fn mbrtowc(
     let (s, n) = checked_range(s, n)?;
     match utf8_decode(ctx, s, n)? {
         Decode::Invalid => {
-            ctx.set_errno(84); // EILSEQ, Linux numbering
+            ctx.set_errno(EILSEQ);
             Err(BionicError::Unimplemented("mbrtowc: EILSEQ"))
         }
         Decode::Incomplete => Ok(MB_INCOMPLETE),
@@ -223,6 +227,66 @@ pub fn mbrtowc(
                 ctx.write(pwc, &cp.to_le_bytes())?;
             }
             Ok(consumed)
+        }
+    }
+}
+
+/// `int mbtowc(wchar_t *pwc, const char *s, size_t n)`
+///
+/// The non-restartable form. bionic implements it as `mbrtowc` over a private `mbstate_t`, and
+/// folds both of that function's error returns into `-1` with `EILSEQ`:
+///
+/// ```c
+/// rval = mbrtowc(pwc, s, n, &mbs);
+/// if (rval == __MB_ERR_ILLEGAL_SEQUENCE || rval == __MB_ERR_INCOMPLETE_SEQUENCE) {
+///   memset(&mbs, 0, sizeof(mbs)); errno = EILSEQ; return -1;
+/// }
+/// return rval;
+/// ```
+///
+/// **The private state is nothing here and that is a fact rather than a simplification**: the
+/// C/POSIX locale's encoding is UTF-8, which is stateless, so bionic's `mbs` is always in its
+/// initial state between calls and there is nothing for a caller to observe. That is the same
+/// argument [`mbrtowc`]'s `ps` rests on.
+///
+/// `s == NULL` asks whether encodings are state-dependent. They are not, so the answer is `0`.
+///
+/// # Errors
+///
+/// Only a guest memory [`Fault`]. `EILSEQ` is a *return value* the caller branches on, not a
+/// refusal -- which is the difference between this and [`mbrtowc`], whose invalid-sequence arm
+/// reports `Unimplemented` and would abort an M3 run where a device returns `-1`.
+pub fn mbtowc(
+    ctx: &mut impl crate::context::GuestContext,
+    pwc: u64,
+    s: u64,
+    n: u64,
+) -> Result<i32, Fault> {
+    if s == 0 {
+        return Ok(0); // UTF-8 has no shift states
+    }
+    if n == 0 {
+        // No bytes to look at is bionic's "incomplete", which this form reports as -1/EILSEQ.
+        ctx.set_errno(EILSEQ);
+        return Ok(-1);
+    }
+    let (start, avail) = checked_range(s, n)?;
+    match utf8_decode(ctx, start, avail)? {
+        Decode::Invalid | Decode::Incomplete => {
+            ctx.set_errno(EILSEQ);
+            Ok(-1)
+        }
+        Decode::Char(cp, consumed) => {
+            if cp == 0 {
+                // A NUL character: C says store it and return 0. bionic returns `mbrtowc`'s 0
+                // and `mbrtowc` stores nothing, so nothing is stored here either.
+                return Ok(0);
+            }
+            if pwc != 0 {
+                ctx.write(pwc, &cp.to_le_bytes())?;
+            }
+            // `consumed` is 1..=4, so the narrowing cannot lose anything.
+            Ok(consumed as i32)
         }
     }
 }
