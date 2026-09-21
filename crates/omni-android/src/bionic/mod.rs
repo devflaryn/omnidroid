@@ -1410,6 +1410,60 @@ impl Bionic {
         self.threads_stopping.store(true, Ordering::Release);
     }
 
+    /// Wait until no created guest thread is still running, or until `timeout` elapses.
+    ///
+    /// Returns **whether they all stopped**. Call it after
+    /// [`stop_guest_threads`](Bionic::stop_guest_threads) and **before dropping the instance or
+    /// the address space it runs in**.
+    ///
+    /// # Why this exists, and what its absence cost
+    ///
+    /// `stop_guest_threads` *asks*; nothing waited for the answer. An embedding that stopped its
+    /// threads and immediately dropped the guest left one executing translated code in an address
+    /// space another thread was unmapping.
+    ///
+    /// MEASURED: M5's gate finishes with the game thread inside `android_main`, and the
+    /// whole-workspace run then died with `STATUS_ACCESS_VIOLATION` (`0xc0000005`) — **after both
+    /// tests had reported `ok`**, with the guest's own
+    /// `[FLog::NativeMain] [android_main] Create a new NativeEngine:` as the last line before the
+    /// crash. HANDOFF has recorded that exact shape since M4, once, unreproduced, with "teardown
+    /// of a guest with live guest threads is the obvious suspect" beside it. It is reproducible
+    /// now, and it was the suspect.
+    ///
+    /// **A `Drop` on this type cannot do it**, which is the structural reason this is a method a
+    /// caller must remember: every running guest thread holds an `Arc<Bionic>`, so this instance's
+    /// `Drop` cannot run while one is alive. The cycle is deliberate — a thread needs the instance
+    /// to service its handlers — and it means the last reference is dropped *by* the last thread,
+    /// long after the embedding has moved on.
+    ///
+    /// # What it can and cannot promise
+    ///
+    /// The stop switch is read **between run windows** (D16), so a thread stops after at most one
+    /// window of guest instructions. A thread blocked *inside* a handler — a bounded wait, a
+    /// `pthread_join`, a condition variable — stops only when that returns, which is why this
+    /// takes a timeout and reports rather than blocking for ever. `false` means at least one
+    /// thread is still running and the caller must **not** tear the address space down;
+    /// [`live_guest_threads`](Bionic::live_guest_threads) and
+    /// [`parked`](Bionic::parked) say which and why.
+    pub fn join_guest_threads(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.guest_threads.lock();
+        loop {
+            let running = guard.records.values().filter(|r| !r.state.is_finished()).count();
+            if running == 0 {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            // `wait_for` rather than `wait`: a detached thread that finished removed its own
+            // record and notified, but a thread that is *about* to check the stop switch has
+            // nothing to notify with, so a bare wait could sleep past the deadline.
+            self.threads_done.wait_for(&mut guard, deadline - now);
+        }
+    }
+
     /// Whether [`stop_guest_threads`](Bionic::stop_guest_threads) has been called.
     #[must_use]
     pub fn guest_threads_stopping(&self) -> bool {

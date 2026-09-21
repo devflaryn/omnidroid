@@ -788,6 +788,35 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
 
     // The game thread exists and did its own `ALooper_prepare`: two loopers, not one.
     assert!(guest.ndk.live_loopers() >= 2, "§5.2 android_app_entry prepares the game thread's own");
+
+    // ---- teardown, which is not a formality --------------------------------------------------
+    //
+    // **The game thread is still running**, inside `android_main`, and it will still be running
+    // when this function returns. Dropping the guest under it unmaps an address space a thread is
+    // executing translated code in.
+    //
+    // MEASURED before this was here: the whole-workspace run died with `STATUS_ACCESS_VIOLATION`
+    // **after both tests reported `ok`**, with the guest's own
+    // `[FLog::NativeMain] [android_main] Create a new NativeEngine:` as the last line. HANDOFF has
+    // carried that exact shape since M4 as a one-off that never reproduced, with "teardown of a
+    // guest with live guest threads is the obvious suspect" beside it. It reproduces, and it was.
+    //
+    // Asserted rather than best-effort: a join that timed out and carried on would put the crash
+    // back and leave this comment claiming it had been fixed.
+    guest.bionic.stop_guest_threads();
+    let stopped = guest.bionic.join_guest_threads(std::time::Duration::from_secs(60));
+    let _ = writeln!(
+        std::io::stderr(),
+        "M5 teardown: {} guest thread(s) still running, failures {:?}",
+        guest.bionic.live_guest_threads(),
+        guest.bionic.guest_thread_failures()
+    );
+    assert!(
+        stopped,
+        "the game thread did not stop within 60 s of being asked, so this address space cannot          be torn down: {} still running, parked {:?}",
+        guest.bionic.live_guest_threads(),
+        guest.bionic.parked()
+    );
     assert_eq!(
         guest.field_u32(base, native_code::BYTES - 4) as u64 as u32 as u64,
         guest.field_u32(base, native_code::BYTES - 4) as u64,
