@@ -2491,8 +2491,29 @@ number in this record and the second whose whole cause was a figure living only 
   than reconcile that by arithmetic the endpoints were measured. `omni-bionic`'s lib was 98.
   `omni-bionic` and `omni-android`'s libs were also run in **debug**, per the working agreement
   about overflow, and pass there.
-* `tools/mutate.py`: **213 → 239 rows**, 26 new — 19 direction A and 7 direction B — and the new
-  rows are **26/26 caught**. A full run of the whole table is reported separately below.
+* `tools/mutate.py`: **213 → 239 rows**, 26 new — 19 direction A and 7 direction B. The new rows
+  are **26/26 caught**, and **a full run of the whole table on the committed tree is 239/239
+  caught**, with `pre-flight: 239/239 patterns match exactly once` and `pre-flight: 11/11 commands
+  pass on the unmutated tree`. 239 rows reported, 239 distinct ids, no MISS.
+
+  **That full run is the second one; the first was discarded rather than reported.** It also said
+  239/239, and it was worthless: `cargo` was run against the tree while it was going and
+  `bionic/mod.rs` — which three rows mutate — was edited underneath it. A concurrent build makes a
+  row read as "caught" for the wrong reason, because a compile failure from a half-written file is
+  indistinguishable from the suite failing. The harness's own docstring warns about exactly this.
+  A contaminated pass is worse than no number, because it is believable.
+
+  **Two stale rows were found by the pre-flight rather than by a MISS**, which is what that gate
+  is for:
+
+  * `stdio-A2`'s pattern is Python source *and* Rust source at once, and an unescaped `\n` in it
+    is a newline in the pattern rather than the two characters the file holds. It matched nothing.
+  * `data-A1` had been mutating the `stdin`/`stdout`/`stderr` loop, which phase 3b gave a
+    `register_stream` call. Re-targeted at the line that computes the spacing, and it is now
+    caught by two tests: the data-object one it always had, and phase 3b's `fileno(stdout) == 1`.
+
+  Both refused the *whole run* rather than reporting a row as MISS, which is the difference
+  between a gate and a report.
 * Clippy clean on `--all-targets --release`, `cargo doc --workspace --no-deps` clean,
   `cargo build --workspace --release --no-default-features` builds.
 * `cargo tree -p omni-bionic -e normal` is still one line (D19), and `cargo tree -p omni-android -e
