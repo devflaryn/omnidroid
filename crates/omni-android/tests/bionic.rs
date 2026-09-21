@@ -5814,6 +5814,28 @@ fn poll_with_nothing_ready_sleeps_for_its_timeout_and_returns_zero() {
     });
     assert_eq!(returned as i64, 0);
     assert!(started.elapsed() < std::time::Duration::from_millis(500), "a zero timeout blocked");
+
+    // **An array of disabled slots, still with no filesystem.** A program that has stopped using
+    // a `pollfd` sets its `fd` negative rather than shortening the array, and POSIX says those
+    // entries are ignored — so this call names no descriptor and must not need a descriptor
+    // table to answer it.
+    let at = f.guest.data + 0x400;
+    let mut array = Vec::new();
+    array.extend_from_slice(&pollfd(-1, 0x001));
+    array.extend_from_slice(&pollfd(-7, 0x004));
+    for index in 0..2 {
+        array[index * 8 + 6] = 0x5A;
+        array[index * 8 + 7] = 0x5A;
+    }
+    f.guest.write_bytes(at, &array);
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 2);
+        asm.mov(2, 0);
+    });
+    assert_eq!(returned as i64, 0, "every entry is ignored, so nothing is ready");
+    assert_eq!(revents_of(&f, at, 0), 0, "and every revents is zeroed rather than left alone");
+    assert_eq!(revents_of(&f, at, 1), 0);
 }
 
 /// **An unbounded wait and an over-long one are refused by name, and a bounded one is not.**
@@ -5861,7 +5883,11 @@ fn poll_with_a_hostile_nfds_is_einval() {
     let _guard = serialized();
     let f = fixture();
     let out = f.guest.data + 0x300;
-    for nfds in [u64::MAX, 1025, 0x8000_0000_0000_0000] {
+    // 1,025 first, deliberately: it is one past the cap and is an array this layer *could* read,
+    // so a missing cap fails the assertion below rather than overflowing the length arithmetic.
+    // `SIZE_MAX` is the one that would, and a debug build panics on it — which is a failure too,
+    // and a noisier one, so it is not the first thing a reader of a failing run sees.
+    for nfds in [1025, u64::MAX, 0x8000_0000_0000_0000] {
         let entry = f.guest.next_entry();
         let mut asm = Asm::at(entry);
         asm.push(mov_reg(21, 30));
@@ -6344,11 +6370,40 @@ fn the_process_cpu_clock_is_answered_and_the_thread_cpu_clock_is_still_refused()
     assert!((0..86_400).contains(&seconds), "{seconds} seconds of process CPU time");
     assert!((0..1_000_000_000).contains(&nanos), "tv_nsec must be normalised: {nanos}");
 
-    // It must agree with `clock()`, which is the whole reason the refusal had to go.
+    // **It must agree with `clock()`**, which is the whole reason the refusal had to go — and the
+    // tolerance has to be tight enough that a wrong *unit* cannot pass. `CLOCKS_PER_SEC` is a
+    // million, so a `clock()` reporting milliseconds is a thousand-fold error that still rises
+    // and still looks like a time; 50 ms of slack separates the two calls' own drift — the
+    // accounting quantum is ~15.6 ms — from that.
+    //
+    // The CPU is **burned here rather than assumed**. Run alone rather than in a full suite this
+    // binary has used about 60 ms by the time it reaches this point (MEASURED: 62,500
+    // microseconds), and a unit check needs the figure to be large against its own tolerance.
+    // 250 ms of real arithmetic makes the precondition hold whatever else ran first, which is
+    // what stops this test depending on the order libtest happens to pick.
+    let burn = std::time::Instant::now();
+    let mut acc: u64 = 1;
+    while burn.elapsed() < std::time::Duration::from_millis(250) {
+        acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    }
+    assert_ne!(acc, 0, "the busy loop must not be optimised away");
+
+    let ok = value_of(&f, "clock_gettime", |asm| {
+        asm.mov(0, CLOCK_PROCESS_CPUTIME_ID);
+        asm.mov(1, ts as u64);
+    });
+    assert_eq!(ok, 0);
+    let seconds = f.guest.read_u64(ts) as i64;
+    let nanos = f.guest.read_u64(ts + 8) as i64;
     let from_clock = value_of(&f, "clock", |_asm| {}) as i64;
     let from_clock_gettime = seconds * 1_000_000 + nanos / 1_000;
     assert!(
-        (from_clock - from_clock_gettime).abs() < 5_000_000,
+        from_clock_gettime > 200_000,
+        "this process has used only {from_clock_gettime} microseconds of CPU after a 250 ms busy \
+         loop, which is too little for the unit check below to mean anything"
+    );
+    assert!(
+        (from_clock - from_clock_gettime).abs() < 50_000,
         "clock() said {from_clock} microseconds and clock_gettime said {from_clock_gettime}: one \
          question, two answers"
     );

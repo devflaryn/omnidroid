@@ -255,8 +255,11 @@ mod tests {
             return;
         }
         let busy = threads.min(4);
-        let before = cpu_time().expect("the host's process times");
+        // The wall interval must **contain** the CPU interval rather than the other way round: a
+        // CPU reading taken before the clock starts would span more wall time than `elapsed`
+        // measures, and a wall-clock impostor would then satisfy the assertion below by accident.
         let wall = Instant::now();
+        let before = cpu_time().expect("the host's process times");
         let handles: Vec<_> = (0..busy)
             .map(|_| {
                 std::thread::spawn(|| {
@@ -272,12 +275,15 @@ mod tests {
         for handle in handles {
             assert_ne!(handle.join().expect("a busy thread"), 0);
         }
-        let elapsed = wall.elapsed();
         let charged = cpu_time().expect("the host's process times") - before;
+        let elapsed = wall.elapsed();
+        // Half again, rather than merely more: `busy` is at least two, so a real CPU clock
+        // advances by about `busy` times the interval, and the margin is what stops a scheduling
+        // hiccup in either direction deciding the test.
         assert!(
-            charged > elapsed,
+            charged > elapsed + elapsed / 2,
             "{busy} threads burned {elapsed:?} of wall time and the process CPU clock advanced by \
-             only {charged:?}: a clock that cannot exceed wall time is a wall clock"
+             only {charged:?}: a clock that cannot outrun wall time is a wall clock"
         );
     }
 

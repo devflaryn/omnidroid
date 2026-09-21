@@ -104,6 +104,13 @@ BIONIC_STDIO = "crates/omni-bionic/src/stdio.rs"
 ADAPTER_FILES = "crates/omni-android/src/bionic/files.rs"
 ADAPTER_STDIO = "crates/omni-android/src/bionic/stdio.rs"
 
+# Phase 3d/3e: the network group and the six nothing else claimed. `omni-platform` gained one
+# primitive for this phase (process CPU time) and **no socket seam at all** -- `poll` and `select`
+# answer over the descriptor table `fs` already had, which is why there is nothing to mutate on
+# the platform side of them.
+BIONIC_NET = "crates/omni-bionic/src/net.rs"
+ADAPTER_NET = "crates/omni-android/src/bionic/net.rs"
+
 # Phase 3c: threads and signals.
 BIONIC_SIGNAL = "crates/omni-bionic/src/signal.rs"
 BIONIC_LAYOUTS = "crates/omni-bionic/src/layouts.rs"
@@ -2593,6 +2600,282 @@ directory", ADAPTER_FILES,
      """    if !host.starts_with(root) {""",
      """    if false && !host.starts_with(root) {""",
      PLATFORM),
+
+    # ================================================================ phase 3d: the network group
+    #
+    # `omni-platform` did not grow for this phase, so there is nothing to mutate on that side.
+    # `poll` and `select` are mutated where their answer is decided, which is the adapter, and
+    # `inet_ntop`'s formatting is mutated in `omni-bionic`, which is where BIND's rules live.
+
+    # BIND formats into a local buffer and only then compares against `size`. Without the compare,
+    # a destination the guest said was eight bytes long receives nine -- and the nine are a
+    # truncated address, which is still a printable string naming a different host.
+    ("net-A1", "A", "inet_ntop writes a truncated address instead of reporting ENOSPC",
+     BIONIC_NET,
+     """    if size as usize <= text.len() {""",
+     """    if false && size as usize <= text.len() {""",
+     BIONIC),
+
+    # `best.len > 1`. A naive "compress the longest run" produces `1::2:3:4:5:6:7` for an address
+    # with one zero group: a different, shorter, plausible spelling, and not bionic's.
+    ("net-A2", "A", "a single zero group is compressed, which is not what BIND does",
+     BIONIC_NET,
+     """    let best = best.filter(|(_, len)| *len > 1);""",
+     """    let best = best.filter(|(_, len)| *len > 0);""",
+     BIONIC),
+
+    # The encapsulated-IPv4 tail. Without `len == 6`, `::1.2.3.4` prints as `::102:304` -- the same
+    # address, spelled the way the modern standard library spells it and not the way bionic does.
+    # The 200,000-address differential run found that divergence rather than assuming it, and this
+    # row is what keeps the finding.
+    ("net-A3", "A", "the IPv4-compatible form loses its dotted tail",
+     BIONIC_NET,
+     """                base == 0 && (len == 6 || (len == 5 && words[5] == 0xFFFF))""",
+     """                base == 0 && (len == 5 && words[5] == 0xFFFF)""",
+     BIONIC),
+
+    # The pooled `gai_strerror` table. A bound of one leaves every code but `Success` falling
+    # through to "Unknown error", which is a string, prints, and says nothing.
+    ("net-A4", "A", "gai_strerror answers Unknown error for codes that are in its table",
+     ADAPTER_MOD,
+     """            Ok(index) if index < known => index,""",
+     """            Ok(index) if index < 1 => index,""",
+     ANDROID),
+
+    # The fallback row is interned last and `gai_message` indexes it by `known`. Without it, a code
+    # outside the table indexes past the end and gets the pool's base, which holds `"UTC"`.
+    ("net-A5", "A", "the gai_strerror fallback row is never interned",
+     ADAPTER_MOD,
+     """        for code in 0..=omni_bionic::net::GAI_MESSAGES as i32 {""",
+     """        for code in 0..omni_bionic::net::GAI_MESSAGES as i32 {""",
+     ANDROID),
+
+    # POSIX: a negative descriptor is ignored with a zeroed `revents`. It is the idiom for a slot a
+    # program has stopped using, so `POLLNVAL` there makes every such program see an error it has
+    # no cause for -- and makes `poll` return a non-zero count for an array of disabled slots.
+    ("net-A6", "A", "a negative pollfd is reported POLLNVAL instead of being ignored",
+     ADAPTER_NET,
+     """        let revents = if fd < 0 {""",
+     """        let revents = if false && fd < 0 {""",
+     ANDROID),
+
+    # A descriptor nothing opened reported as ready. The guest then reads it and gets EBADF from a
+    # call `poll` had just said would not block.
+    ("net-A7", "A", "a descriptor that is not open is reported ready rather than POLLNVAL",
+     ADAPTER_NET,
+     """        } else if fs.is_some_and(|fs| fs.is_open(fd)) {""",
+     """        } else if fs.is_some() {""",
+     ANDROID),
+
+    # **Review finding M1's shape, in this group.** Read the whole array, decide, write it once --
+    # against reading and writing entry by entry, which leaves a half-updated `revents` array
+    # behind a reported failure. One row rather than two, because each half alone is invisible: a
+    # per-entry read fails before the whole-array write is reached, and a per-entry write is never
+    # reached after a whole-array read has failed. VERIFIED as a detector before the row was
+    # written -- the first entry's sentinel is overwritten and
+    # `a_poll_array_that_runs_off_its_mapping_leaves_the_first_entry_untouched` fails.
+    ("net-A8", "A", "poll answers the guest's array entry by entry instead of all at once",
+     ADAPTER_NET,
+     """    let mut entries = view.mem().read_bytes(at, bytes, blame)?;""",
+     """    let mut entries = vec![0u8; bytes];
+    for (i, chunk) in entries.chunks_exact_mut(POLLFD_BYTES).enumerate() {
+        chunk.copy_from_slice(&view.mem().read_bytes(at + i * POLLFD_BYTES, POLLFD_BYTES, blame)?);
+        let mut answer = [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], 1, 0];
+        if i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) < 0 {
+            answer[6] = 0;
+        }
+        view.mem().write_bytes(at + i * POLLFD_BYTES, &answer, blame)?;
+    }""",
+     ANDROID),
+
+    # `nfds` is an `nfds_t`, which is 64 bits and is the guest's. Without the cap, `poll(p, 1025,
+    # 0)` reads an array eight kilobytes long out of whatever follows the guest's own, and
+    # `poll(p, SIZE_MAX, 0)` asks this layer for 147 exabytes -- which in a debug build is an
+    # arithmetic panic reachable from guest input, the shape Global Constraint 11 calls Critical.
+    ("net-A10", "A", "poll's nfds cap removed, so a guest-chosen count is honoured",
+     ADAPTER_NET,
+     """        if nfds > MAX_POLL_FDS {""",
+     """        if false && nfds > MAX_POLL_FDS {""",
+     ANDROID),
+
+    # `select` reports `EBADF` for the CALL, not for one bit. Without the check, a descriptor
+    # nothing opened is reported ready in whichever set named it.
+    ("net-A11", "A", "select reports a descriptor nothing opened as ready",
+     ADAPTER_NET,
+     """        if named.iter().any(|fd| !fs.is_open(*fd)) {""",
+     """        if named.iter().any(|fd| !fs.is_open(*fd)) && false {""",
+     ANDROID),
+
+    # POSIX: `select` returns the total number of bits set across all the masks, so one descriptor
+    # ready in two sets is two. Counting descriptors instead returns one -- a smaller, entirely
+    # reasonable-looking number.
+    ("net-A12", "A", "select counts ready descriptors instead of ready bits",
+     ADAPTER_NET,
+     """    let ready: i32 = sets[0].count(nfds) + sets[1].count(nfds);
+    sets[2].clear();""",
+     """    let ready: i32 = sets[0].count(nfds).max(sets[1].count(nfds));
+    sets[2].clear();""",
+     ANDROID),
+
+    # Nothing in this runtime can raise an exception condition, so the exception set comes back
+    # empty. Leaving the guest's own bits in it says every descriptor it asked about has one.
+    ("net-A13", "A", "select leaves the guest's bits in the exception set",
+     ADAPTER_NET,
+     """    sets[2].clear();
+    if ready > 0 {""",
+     """    if ready > 0 {""",
+     ANDROID),
+
+    # Bionic converts the `timeval` before the syscall and reports a `tv_usec` outside [0, 1e6) as
+    # EINVAL itself. Without the check, `{i64::MIN, i64::MIN}` reaches the duration arithmetic.
+    ("net-A14", "A", "select accepts a malformed struct timeval",
+     ADAPTER_NET,
+     """        if !(0..MICROS_PER_SECOND).contains(&micros) || seconds < 0 {""",
+     """        if false && (!(0..MICROS_PER_SECOND).contains(&micros) || seconds < 0) {""",
+     ANDROID),
+
+    # `socket` answering -1/EAFNOSUPPORT is the most believable wrong answer this phase had: a
+    # legitimate POSIX outcome that a networked program branches on quietly, so the engine disables
+    # its own networking during initialisation and nothing records that this layer, rather than the
+    # device, decided that.
+    ("net-A15", "A", "socket answers -1/EAFNOSUPPORT instead of refusing",
+     ADAPTER_NET,
+     """    let family = match domain {""",
+     """    if domain != i32::MIN {
+        let state = active(c.symbol(), c.address())?;
+        {
+            let mut view = enter(c, &state);
+            view.set_errno(consts::EAFNOSUPPORT);
+        }
+        c.ret().i32(-1);
+        return Ok(());
+    }
+    let family = match domain {""",
+     ANDROID),
+
+    # `freeaddrinfo` returns `void`, which is what makes a silent no-op the dangerous answer: there
+    # is no value to be wrong, so nothing distinguishes it from a correct free.
+    ("net-A16", "A", "freeaddrinfo quietly does nothing instead of refusing",
+     ADAPTER_NET,
+     """    let res = c.args().next_u64()?;""",
+     """    let res = c.args().next_u64()?;
+    if res != u64::MAX {
+        c.ret().void();
+        return Ok(());
+    }""",
+     ANDROID),
+
+    # ---- the over-corrections ------------------------------------------------------------------
+
+    # The cap on a wait applied to every wait, so a `poll` with a thirty-millisecond timeout is
+    # refused. A guest polling with a short timeout is the ordinary case, and refusing it stops a
+    # correct guest over a bound that exists for a hostile one.
+    ("net-B1", "B", "every bounded wait is refused, not only one past the cap",
+     ADAPTER_NET,
+     """    if duration.as_secs() > MAX_SLEEP_SECONDS {""",
+     """    if duration.as_millis() > 0 {""",
+     ANDROID),
+
+    # `nfds == FD_SETSIZE` is the last legal value: an `fd_set` holds descriptors 0..FD_SETSIZE, so
+    # `select(FD_SETSIZE, ..)` names all of them. Excluding it refuses a correct call.
+    ("net-B2", "B", "select refuses an nfds of exactly FD_SETSIZE",
+     ADAPTER_NET,
+     """    if !(0..=FD_SETSIZE).contains(&nfds) {""",
+     """    if !(0..FD_SETSIZE).contains(&nfds) {""",
+     ANDROID),
+
+    # The descriptor table consulted whether or not any entry names a descriptor, so a `poll` over
+    # an array of disabled slots refuses on an instance with no filesystem root. `poll` needs a
+    # descriptor table only when it is asked about a descriptor.
+    ("net-B3", "B", "poll needs a filesystem even when it is asked about no descriptors",
+     ADAPTER_NET,
+     """    let fs = if names_a_descriptor { Some(filesystem(view)?) } else { None };""",
+     """    let _ = names_a_descriptor;
+    let fs = Some(filesystem(view)?);""",
+     ANDROID),
+
+    # ================================================================ phase 3e: the last six
+
+    # The two `__gcov_*` imports resolve to nothing only because the reference is WEAK. Without
+    # that check every declared-absent symbol resolves to nothing however it is referenced, and a
+    # strong reference becomes a branch to address zero with no symbol attached -- the failure the
+    # whole thunk region exists to replace.
+    ("gcov-B1", "B", "a strong reference to an absent symbol also resolves to nothing",
+     BOUNDARY,
+     """                if request.weak && self.is_absent(request.name) {""",
+     """                if self.is_absent(request.name) {""",
+     ANDROID),
+
+    # And the revert: the absent list ignored, so `__gcov_dump` gets a thunk address, the guest's
+    # own `CBZ` falls through, and it calls a symbol no Android device supplies -- followed, four
+    # bytes later, by `BL abort`.
+    ("gcov-A1", "A", "the absent list is ignored, so a weak import gets an address after all",
+     BOUNDARY,
+     """                if request.weak && self.is_absent(request.name) {""",
+     """                if false && self.is_absent(request.name) {""",
+     ANDROID),
+
+    # `time(tloc)` stores the value as well as returning it. A handler that returns the right
+    # number and writes nothing is invisible to any test that only reads the return value.
+    ("clocks-A8", "A", "time returns the right value and does not store it",
+     ADAPTER_CLOCKS,
+     """        if tloc != 0 {""",
+     """        if false && tloc != 0 {""",
+     ANDROID),
+
+    # `CLOCKS_PER_SEC` is a million, fixed by POSIX. Reporting milliseconds is a constant
+    # thousand-fold error in every ratio `clock()` is used to compute, and the value still rises.
+    ("clocks-A9", "A", "clock reports milliseconds where CLOCKS_PER_SEC says microseconds",
+     ADAPTER_CLOCKS,
+     """        i64::try_from(cpu.as_micros()).map_err(|_| {""",
+     """        i64::try_from(cpu.as_millis()).map_err(|_| {""",
+     ANDROID),
+
+    # The process CPU clock answered from the wall clock: monotonic, a plausible number of seconds,
+    # and not what was asked for -- the exact failure `clocks-A1` records for `CLOCK_MONOTONIC`,
+    # one clock along. Its detector is the one assertion a wall clock cannot satisfy: several
+    # threads burning one interval of wall time advance a process CPU clock by more than it.
+    ("plat-A9", "A", "process CPU time is served from the monotonic clock",
+     PLAT_PROCESS_MOD,
+     """pub fn cpu_time() -> ProcessResult<Duration> {
+    backend::cpu_time()
+}""",
+     """pub fn cpu_time() -> ProcessResult<Duration> {
+    let _ = backend::cpu_time();
+    Ok(crate::clock::monotonic_now())
+}""",
+     PLATFORM),
+
+    # `mallinfo` answering eighty zeroed bytes is the believable wrong answer precisely because it
+    # is arithmetically TRUE of a libc heap nothing has allocated from -- and `libroblox.so`
+    # imports no allocator at all, so there is no heap for it to describe.
+    ("guestmem-A9", "A", "mallinfo writes eighty zeroed bytes instead of refusing",
+     ADAPTER_GUESTMEM,
+     """    let out = c.args().indirect_result();""",
+     """    let out = c.args().indirect_result();
+    if out != usize::MAX {
+        c.mem().write_bytes(
+            out,
+            &[0u8; MALLINFO_BYTES],
+            crate::mem::Blame::new(c.symbol(), c.address(), 0),
+        )?;
+        c.ret().void();
+        return Ok(());
+    }""",
+     ANDROID),
+
+    # `longjmp` is declared `noreturn`. A handler that quietly returns resumes the guest in the
+    # frame it was trying to escape, carrying whatever condition made it jump -- the same failure
+    # `raise` declines, one frame further in.
+    ("signals-A4", "A", "longjmp returns normally instead of refusing",
+     ADAPTER_SIGNALS,
+     """    let delivered = if val == 0 { 1 } else { val };""",
+     """    let delivered = if val == 0 { 1 } else { val };
+    if env != u64::MAX {
+        c.ret().void();
+        return Ok(());
+    }""",
+     ANDROID),
 ]
 
 
