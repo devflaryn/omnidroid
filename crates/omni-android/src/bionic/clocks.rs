@@ -286,12 +286,23 @@ fn requested(seconds: i64, nanos: i64) -> Result<Duration, i32> {
     Ok(Duration::new(seconds as u64, nanos as u32))
 }
 
+/// Whether a requested sleep is past [`MAX_SLEEP_SECONDS`] and must be refused.
+///
+/// A predicate of its own rather than an inline comparison, so that it can be asserted **without
+/// sleeping**. A test for "an over-long sleep is refused" that got the answer wrong would hang for
+/// as long as the guest asked, which is not a failure mode a suite can recover from — so the
+/// decision is checked here as arithmetic and end to end in `tests/bionic.rs` with a value the cap
+/// really does refuse.
+fn capped(duration: Duration) -> bool {
+    duration.as_secs() > MAX_SLEEP_SECONDS
+}
+
 /// Sleep, or refuse a duration past the cap.
 ///
 /// Returns the errno to report, or an error if the request is refused. See the module
 /// documentation: the cap is a hostile-input defence, and a clamp would be a lie.
 fn sleep_for(view: &GuestView<'_>, duration: Duration, asked: &str) -> AbiResult<()> {
-    if duration.as_secs() > MAX_SLEEP_SECONDS {
+    if capped(duration) {
         return Err(view.refusal(format!(
             "the guest asked to sleep for {asked}, and this layer caps a single sleep at \
              {MAX_SLEEP_SECONDS} seconds. A sleeping thread executes no guest instructions, so \
@@ -400,6 +411,27 @@ mod tests {
         assert_eq!(requested(2, 500), Ok(Duration::new(2, 500)));
         // i64::MAX seconds is well-formed and is what the *cap* exists to refuse, not this check.
         assert_eq!(requested(i64::MAX, 0), Ok(Duration::new(i64::MAX as u64, 0)));
+    }
+
+    /// The sleep cap, asserted as arithmetic rather than by sleeping.
+    ///
+    /// **This is the detector for the cap**, and it is a unit test on purpose: the end-to-end form
+    /// of "an over-long sleep is refused" cannot fail safely, because a version that did not
+    /// refuse would sleep for the `i64::MAX` seconds the test asked for and hang the suite rather
+    /// than failing it. Here the same decision is a pure function over a `Duration`.
+    #[test]
+    fn the_sleep_cap_refuses_past_a_minute_and_admits_everything_under_it() {
+        assert_eq!(MAX_SLEEP_SECONDS, 60);
+        assert!(!capped(Duration::ZERO));
+        assert!(!capped(Duration::from_millis(10)), "an ordinary sleep must not be refused");
+        assert!(!capped(Duration::from_millis(1)));
+        assert!(!capped(Duration::from_secs(MAX_SLEEP_SECONDS)), "the cap is inclusive");
+        assert!(
+            !capped(Duration::new(MAX_SLEEP_SECONDS, 999_999_999)),
+            "and it is whole seconds, so the last nanosecond of the last second is still in"
+        );
+        assert!(capped(Duration::from_secs(MAX_SLEEP_SECONDS + 1)));
+        assert!(capped(Duration::new(i64::MAX as u64, 0)), "the case this exists for");
     }
 
     /// A `struct timespec` and a `struct timeval` are both two 8-byte fields on LP64.

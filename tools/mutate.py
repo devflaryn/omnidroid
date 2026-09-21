@@ -84,6 +84,16 @@ ADAPTER_FORMAT = "crates/omni-android/src/bionic/format.rs"
 ADAPTER_DATA = "crates/omni-android/src/bionic/data.rs"
 ADAPTER_DL = "crates/omni-android/src/bionic/dl.rs"
 ADAPTER_GUESTMEM = "crates/omni-android/src/bionic/guestmem.rs"
+# M3 task 3 phase 3a: the OS surface. `omni-platform` grows past `vm` and `fault`, and the adapter
+# grows the twenty-three guest symbols over it.
+PLAT_CLOCK = "crates/omni-platform/src/clock.rs"
+PLAT_LOG = "crates/omni-platform/src/log.rs"
+PLAT_PROCESS = "crates/omni-platform/src/process/windows.rs"
+PLAT_PROCESS_MOD = "crates/omni-platform/src/process/mod.rs"
+BIONIC_TIME = "crates/omni-bionic/src/time.rs"
+ADAPTER_CLOCKS = "crates/omni-android/src/bionic/clocks.rs"
+ADAPTER_PROCENV = "crates/omni-android/src/bionic/procenv.rs"
+ADAPTER_LOGGING = "crates/omni-android/src/bionic/logging.rs"
 
 # Commands, kept narrow so the whole run stays under a few minutes.
 MEM = ["cargo", "test", "-p", "omni-mem", "--no-fail-fast"]
@@ -134,6 +144,13 @@ ANDROID = [
     "--test", "bionic",
     "--no-fail-fast",
 ]
+
+# The adapter's **library** targets only, with no guest in sight. One row needs this and says why:
+# removing the sleep cap makes the end-to-end test sleep for the `i64::MAX` seconds it asked for,
+# which HANGS rather than fails -- the failure mode this module's docstring already records from M3
+# task 2. Its detector is the unit test on `clocks::capped`, which is why that predicate is a
+# function rather than an inline comparison.
+ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
 
 # (id, direction, description, file, old, new, command)
 MUTATIONS = [
@@ -1726,6 +1743,333 @@ MUTATIONS = [
     ("guestmem-B3", "B", "the purely advisory madvise hints refused as well", ADAPTER_GUESTMEM,
      """    if ADVISORY.contains(&advice) {""",
      """    if false && ADVISORY.contains(&advice) {""",
+     ANDROID),
+    # ---- M3 task 3 phase 3a: the OS surface ------------------------------------------------------
+    #
+    # `omni-platform` grows past `vm` and `fault` for the first time. Two halves, and both are
+    # mutated: the seam itself (clock, process, log) and the twenty-three guest symbols over it.
+
+    # The monotonic clock re-anchored per call. Still non-decreasing, still plausible, and every
+    # reading is ~0 -- so a guest measuring an interval measures nothing.
+    ("plat-A1", "A", "the monotonic clock is re-anchored on every call instead of on one epoch",
+     PLAT_CLOCK,
+     """    let epoch = *EPOCH.get_or_init(Instant::now);""",
+     """    let epoch = Instant::now();""",
+     PLATFORM),
+
+    # The worst available value out of an entropy source: a buffer of zeroes, reported as filled.
+    ("plat-A2", "A", "random_bytes reports success without asking the OS for anything", PLAT_PROCESS,
+     """        let status = unsafe {
+            BCryptGenRandom(core::ptr::null_mut(), chunk.as_mut_ptr(), len, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+        };""",
+     """        let _ = (&chunk, len);
+        let status = 0;""",
+     PLATFORM),
+
+    ("plat-A3", "A", "sleep returns immediately whatever it was asked for", PLAT_CLOCK,
+     """    if duration.is_zero() {
+        return;
+    }""",
+     """    if true {
+        return;
+    }""",
+     PLATFORM),
+
+    ("plat-A4", "A", "an out-of-range android log priority is mapped to a neighbour", PLAT_LOG,
+     """            8 => Priority::Silent,
+            _ => return None,""",
+     """            8 => Priority::Silent,
+            _ => Priority::Unknown,""",
+     PLATFORM),
+
+    # The over-correction: an empty request is a no-op in C and must not become a failure.
+    ("plat-B1", "B", "random_bytes fails an empty request instead of treating it as a no-op",
+     PLAT_PROCESS_MOD,
+     """    if out.is_empty() {
+        return Ok(());
+    }""",
+     """    if out.is_empty() {
+        return Err(ProcessError::Status {
+            operation: "random_bytes",
+            api: "BCryptGenRandom",
+            status: -1,
+        });
+    }""",
+     PLATFORM),
+
+    # The over-correction: a severity that maps perfectly well is refused.
+    ("plat-B2", "B", "the most severe syslog level stops mapping onto the android scale", PLAT_LOG,
+     """            0..=2 => Priority::Fatal,""",
+     """            1..=2 => Priority::Fatal,""",
+     PLATFORM),
+
+    # ---- the calendar ----------------------------------------------------------------------------
+    #
+    # Every row here is wrong only for part of the input range, which is what makes the conversion
+    # worth mutating at all: a wrong answer for 1969 and a right one for 2026 is exactly the shape
+    # that ships.
+
+    ("time-A1", "A", "floor division becomes truncating, so every pre-1970 date is a day late",
+     BIONIC_TIME,
+     """    if numerator % denominator != 0 && ((numerator < 0) != (denominator < 0)) {
+        quotient - 1
+    } else {
+        quotient
+    }""",
+     """    quotient""",
+     BIONIC),
+
+    ("time-A2", "A", "the Gregorian 400-year leap exception is dropped, so 2000 is not a leap year",
+     BIONIC_TIME,
+     """    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0""",
+     """    year % 4 == 0 && year % 100 != 0""",
+     BIONIC),
+
+    ("time-A3", "A", "a year that will not fit int tm_year wraps instead of reporting EOVERFLOW",
+     BIONIC_TIME,
+     """    let Ok(tm_year) = i32::try_from(tm_year) else {
+        return Err(GmtimeError::YearOutOfRange { year });
+    };""",
+     """    let tm_year = tm_year as i32;""",
+     BIONIC),
+
+    ("time-A4", "A", "the weekday uses % instead of rem_euclid, so pre-1970 days are negative",
+     BIONIC_TIME,
+     """    let wday = (days + UNIX_EPOCH_WEEKDAY).rem_euclid(7);""",
+     """    let wday = (days + UNIX_EPOCH_WEEKDAY) % 7;""",
+     BIONIC),
+
+    ("time-A5", "A", "tm_yday loses the leap-day adjustment after February", BIONIC_TIME,
+     """    let leap_day = i32::from(is_leap(year) && month > 2);""",
+     """    let leap_day = 0;""",
+     BIONIC),
+
+    ("time-A6", "A", "tm_zone is left null, so guest code prints a const char * that is not there",
+     BIONIC_TIME,
+     """    bytes[TM_ZONE_OFFSET..TM_ZONE_OFFSET + 8].copy_from_slice(&zone.to_le_bytes());""",
+     """    let _ = zone;""",
+     BIONIC),
+
+    # The over-correction: refusing input that is entirely legal. A negative time_t is a date
+    # before 1970, not an error.
+    ("time-B1", "B", "gmtime refuses every pre-1970 timestamp", BIONIC_TIME,
+     """    let days = floor_div(timestamp, SECONDS_PER_DAY);""",
+     """    if timestamp < 0 {
+        return Err(GmtimeError::YearOutOfRange { year: 0 });
+    }
+    let days = floor_div(timestamp, SECONDS_PER_DAY);""",
+     BIONIC),
+
+    # The over-correction: the year bound tightened below what the guest's own `int` allows.
+    ("time-B2", "B", "the tm_year bound is narrowed to 16 bits, refusing years an int holds",
+     BIONIC_TIME,
+     """    let Ok(tm_year) = i32::try_from(tm_year) else {""",
+     """    let Ok(tm_year) = i16::try_from(tm_year).map(i32::from) else {""",
+     BIONIC),
+
+    # ---- the clock symbols -----------------------------------------------------------------------
+
+    ("clocks-A1", "A", "CLOCK_MONOTONIC is served from the wall clock", ADAPTER_CLOCKS,
+     """            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+                omni_platform::clock::monotonic_now()
+            }""",
+     """            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+                omni_platform::clock::realtime_now()
+            }""",
+     ANDROID),
+
+    # CLOCK_BOOTTIME counts time spent suspended and the host's monotonic clock does not, so
+    # aliasing it is a wrong answer rather than a coarser right one.
+    ("clocks-A2", "A", "CLOCK_BOOTTIME is aliased to the monotonic clock instead of refused",
+     ADAPTER_CLOCKS,
+     """            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {""",
+     """            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {""",
+     ANDROID),
+
+    ("clocks-A3", "A", "gettimeofday writes nanoseconds into a struct timeval's tv_usec",
+     ADAPTER_CLOCKS,
+     """            write_pair(&view, tv, seconds, nanos / 1_000, 0)?;""",
+     """            write_pair(&view, tv, seconds, nanos, 0)?;""",
+     ANDROID),
+
+    ("clocks-A4", "A", "nanosleep accepts a malformed timespec instead of reporting EINVAL",
+     ADAPTER_CLOCKS,
+     """    if seconds < 0 || !(0..NANOS_PER_SECOND).contains(&nanos) {""",
+     """    if false {""",
+     ANDROID),
+
+    # **Scoped to the library target on purpose.** Removing the cap makes the end-to-end test sleep
+    # for the i64::MAX seconds it asks for, which hangs rather than fails -- the failure mode this
+    # harness's own docstring records from M3 task 2. The detector is the unit test on `capped`,
+    # which is why that predicate is a function.
+    ("clocks-A5", "A", "the sleep cap is not applied, so a guest can block a host thread forever",
+     ADAPTER_CLOCKS,
+     """    duration.as_secs() > MAX_SLEEP_SECONDS""",
+     """    false && duration.as_secs() > MAX_SLEEP_SECONDS""",
+     ANDROID_LIB),
+
+    ("clocks-A6", "A", "usleep reads all 64 bits of X0 although useconds_t is 32", ADAPTER_CLOCKS,
+     """    let micros = u64::from(c.args().next_u64()? as u32);""",
+     """    let micros = c.args().next_u64()?;""",
+     ANDROID),
+
+    ("clocks-A7", "A", "gmtime_r returns its buffer after failing to fill it", ADAPTER_CLOCKS,
+     """                view.set_errno(EOVERFLOW);
+                0u64""",
+     """                view.set_errno(EOVERFLOW);
+                result""",
+     ANDROID),
+
+    # The over-correction: the cap applied to the sub-second part, so an ordinary 10 ms sleep is
+    # refused. A bound that refuses correct input is as wrong as no bound.
+    ("clocks-B1", "B", "the sleep cap is applied to the nanoseconds, refusing a 10 ms sleep",
+     ADAPTER_CLOCKS,
+     """    duration.as_secs() > MAX_SLEEP_SECONDS""",
+     """    u64::from(duration.subsec_nanos()) > MAX_SLEEP_SECONDS""",
+     ANDROID),
+
+    # ---- process and environment -----------------------------------------------------------------
+    #
+    # The first row is the one that matters most in this phase: the open AT_HWCAP decision made by
+    # defaulting, which is precisely what the policy type exists to prevent.
+    ("procenv-A1", "A",
+     "the open AT_HWCAP decision is made by defaulting an instance to Decline", ADAPTER_MOD,
+     """            hwcap: Mutex::new(HwcapPolicy::Undecided),""",
+     """            hwcap: Mutex::new(HwcapPolicy::Decline),""",
+     ANDROID),
+
+    ("procenv-A2", "A", "sysconf answers a page size for a constant nobody verified", ADAPTER_PROCENV,
+     """    let believed = believed_sysconf_name(name).map_or_else(""",
+     """    if name == 0x0027 {
+        c.ret().u64(4096);
+        return Ok(());
+    }
+    let believed = believed_sysconf_name(name).map_or_else(""",
+     ANDROID),
+
+    ("procenv-A3", "A", "prctl answers 0, which every option has available as a believable done",
+     ADAPTER_PROCENV,
+     """    let option = c.args().next_i32()?;
+    let named = prctl_option_name(option)""",
+     """    let option = c.args().next_i32()?;
+    c.ret().i32(0);
+    return Ok(());
+    #[allow(unreachable_code)]
+    let named = prctl_option_name(option)""",
+     ANDROID),
+
+    ("procenv-A4", "A", "syscall answers -1/ENOSYS, which callers route around silently",
+     ADAPTER_PROCENV,
+     """    let number = c.args().next_u64()? as i64;
+    let named = syscall_name(number)""",
+     """    let number = c.args().next_u64()? as i64;
+    c.ret().i32(-1);
+    return Ok(());
+    #[allow(unreachable_code)]
+    let named = syscall_name(number)""",
+     ANDROID),
+
+    # Half a buffer of real entropy and a reported failure: the caller cannot tell which half.
+    ("procenv-A5", "A",
+     "arc4random_buf validates one byte instead of the whole destination", ADAPTER_PROCENV,
+     """            view.mem().checked_ptr(at, len, true, blame)?;""",
+     """            view.mem().checked_ptr(at, 1, true, blame)?;""",
+     ANDROID),
+
+    ("procenv-A6", "A", "__system_property_get reports the length including its NUL",
+     ADAPTER_PROCENV,
+     """        i32::try_from(text.len()).map_err(|_| {""",
+     """        i32::try_from(text.len() + 1).map_err(|_| {""",
+     ANDROID),
+
+    ("procenv-A7", "A", "abort returns to the guest instead of becoming a typed outcome",
+     ADAPTER_PROCENV,
+     """    let state = active(c.symbol(), c.address())?;
+    Err(AbiError::GuestAborted {
+        symbol: c.symbol().to_string(),
+        address: c.address(),
+        why: "the guest called abort()",""",
+     """    let state = active(c.symbol(), c.address())?;
+    c.ret().void();
+    return Ok(());
+    #[allow(unreachable_code)]
+    Err(AbiError::GuestAborted {
+        symbol: c.symbol().to_string(),
+        address: c.address(),
+        why: "the guest called abort()",""",
+     ANDROID),
+
+    ("procenv-A8", "A", "_exit loses the status the guest asked to exit with", ADAPTER_PROCENV,
+     """    Err(AbiError::GuestExited {
+        symbol: c.symbol().to_string(),
+        address: c.address(),
+        status,
+    })""",
+     """    let _ = status;
+    Err(AbiError::GuestExited {
+        symbol: c.symbol().to_string(),
+        address: c.address(),
+        status: 0,
+    })""",
+     ANDROID),
+
+    ("procenv-A9", "A",
+     "the abort message is dropped, so the only account of the crash is lost", ADAPTER_PROCENV,
+     """        why: "the guest called abort()",
+        message: state.bionic.abort_message(),""",
+     """        why: "the guest called abort()",
+        message: { let _ = &state; None },""",
+     ANDROID),
+
+    # The over-correction: getenv(NULL) is undefined in C, and NULL is the answer that cannot be
+    # mistaken for a value. Refusing it fails a program that is merely careless.
+    ("procenv-B1", "B", "getenv refuses a null name instead of answering NULL", ADAPTER_PROCENV,
+     """        if name == 0 {
+            0
+        } else {""",
+     """        if name == 0 {
+            return Err(view.refusal("a null name"));
+        } else {""",
+     ANDROID),
+
+    # The over-correction: an unset property is a fact, and 0 with an empty string is what bionic
+    # answers. Refusing it turns "this host has no property service" into a halt.
+    ("procenv-B2", "B", "an unset system property is refused instead of answered as unset",
+     ADAPTER_PROCENV,
+     """        let text = found.unwrap_or_default();""",
+     """        let Some(text) = found else {
+            return Err(view.refusal("no such property"));
+        };""",
+     ANDROID),
+
+    # ---- the log sink ----------------------------------------------------------------------------
+
+    ("logging-A1", "A", "syslog drops the facility instead of carrying it into the tag",
+     ADAPTER_LOGGING,
+     """            (Some(ident), facility) => format!("{ident}[facility {facility}]"),""",
+     """            (Some(ident), _facility) => ident,""",
+     ANDROID),
+
+    ("logging-A2", "A", "closelog leaves openlog's ident in place", ADAPTER_LOGGING,
+     """    let state = active(c.symbol(), c.address())?;
+    state.bionic.set_syslog_ident(None);
+    c.ret().void();""",
+     """    let state = active(c.symbol(), c.address())?;
+    let _ = &state;
+    c.ret().void();""",
+     ANDROID),
+
+    ("logging-A3", "A", "the capture ring drops its newest records rather than its oldest",
+     ADAPTER_MOD,
+     """            ring.pop_front();""",
+     """            ring.pop_back();""",
+     ANDROID),
+
+    # The over-correction: a ring too small to hold what one run produces is a bound that destroys
+    # the thing it was bounding.
+    ("logging-B1", "B", "the log capture ring is tightened to four records", ADAPTER_MOD,
+     """pub const LOG_CAPTURE_MAX: usize = 256;""",
+     """pub const LOG_CAPTURE_MAX: usize = 4;""",
      ANDROID),
 ]
 

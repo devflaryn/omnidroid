@@ -2693,6 +2693,49 @@ fn arc4random_buf_fills_exactly_the_buffer_it_was_given() {
         }
     }
 
+    // **A request bigger than the host-side chunk, so the multi-chunk path is real code.** The
+    // failure this catches is a chunk loop that writes every chunk at the *base* rather than at
+    // the offset: with one chunk that is invisible, and with two it silently leaves the second
+    // half untouched.
+    let wide = f.guest.data + 0x1000;
+    let wide_len = 8192u64;
+    for offset in (0..wide_len).step_by(8) {
+        f.guest.write_u64(wide + offset as omni_cpu::GuestAddr, 0xAAAA_AAAA_AAAA_AAAA);
+    }
+    value_of(&f, "arc4random_buf", |asm| {
+        asm.mov(0, wide as u64);
+        asm.mov(1, wide_len);
+    });
+    for (half, range) in [("first", 0u64..4096), ("second", 4096..8192)] {
+        assert!(
+            range
+                .step_by(8)
+                .any(|o| f.guest.read_u64(wide + o as omni_cpu::GuestAddr) != 0xAAAA_AAAA_AAAA_AAAA),
+            "the {half} 4 KiB chunk of an 8 KiB request was left untouched"
+        );
+    }
+
+    // **A destination that is writable for its first chunk and not its second is refused with
+    // NOTHING written.** Without validating the whole range up front, the first 4 KiB would
+    // receive real entropy and the call would then report failure — and the caller would have no
+    // way to know which half it got.
+    let straddle = f.guest.data + harness::DATA_BYTES as omni_cpu::GuestAddr - 5000;
+    for offset in (0..4992u64).step_by(8) {
+        f.guest.write_u64(straddle + offset as omni_cpu::GuestAddr, 0xAAAA_AAAA_AAAA_AAAA);
+    }
+    let error = refusal_of(&f, "arc4random_buf", |asm| {
+        asm.mov(0, straddle as u64);
+        asm.mov(1, 8192);
+    });
+    assert_eq!(error.symbol(), Some("arc4random_buf"));
+    for offset in (0..4992u64).step_by(8) {
+        assert_eq!(
+            f.guest.read_u64(straddle + offset as omni_cpu::GuestAddr),
+            0xAAAA_AAAA_AAAA_AAAA,
+            "a refused arc4random_buf wrote entropy into the part of the range that WAS writable"
+        );
+    }
+
     // A zero length writes nothing and is legal C at any address, null included.
     let sentinel = f.guest.read_u64(first);
     value_of(&f, "arc4random_buf", |asm| {
@@ -3066,6 +3109,9 @@ fn the_log_capture_ring_is_bounded_and_reports_what_it_dropped() {
     assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
 
     let records = f.bionic.log_records();
+    // Pinned as a number as well as as a symbol: a test written only against the constant would
+    // pass for any cap at all, including one too small to hold a run's worth of lines.
+    assert_eq!(LOG_CAPTURE_MAX, 256);
     assert_eq!(records.len(), LOG_CAPTURE_MAX, "the ring is bounded");
     assert_eq!(f.bionic.log_dropped(), rounds - LOG_CAPTURE_MAX as u64, "and says what it dropped");
     // The loop counts down, so the *last* record is n=1 and the oldest survivor is n=256.
