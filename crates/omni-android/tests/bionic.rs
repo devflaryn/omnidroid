@@ -7792,3 +7792,236 @@ fn a_thread_blocked_in_pthread_cond_wait_is_visible_while_it_is_blocked() {
     );
     assert_eq!(f.bionic.parked_peak(), 1, "the peak survives the thread that made it");
 }
+
+// =================================================================== adapter review finding M1
+//
+// `read`, `pread` and `__write_chk` consumed from the descriptor **before** validating the guest
+// buffer, so a half-mapped buffer kept some bytes behind a reported failure. D22 wrote the rule
+// down for `arc4random_buf`; phase 3b did not carry it across. Three detectors follow, and every
+// one of them needs a **half-mapped** buffer: valid for its first part and not for the rest. A
+// wholly invalid buffer refuses in both versions and proves nothing, which is why the fixture
+// below *asserts* the cliff rather than assuming it.
+
+/// A one-page mapping with free address space immediately after it, filled with `0xAA`.
+///
+/// Returns the base and the page size. A **failure** rather than a skip if the shape cannot be
+/// built: `VERIFICATION.md` entry 4 is about a test that early-returned when its fixture was
+/// missing and still reported `ok`.
+fn island_with_a_cliff(f: &Fixture) -> (omni_cpu::GuestAddr, usize) {
+    use omni_mem::{CommitPolicy, Placement, Protection};
+    let page = f.guest.space.page_size();
+    let island = f
+        .guest
+        .space
+        .map_anonymous(
+            Placement::Fixed(f.guest.unmapped & !(page - 1)),
+            page,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("an island mapping");
+    assert!(f.guest.space.region_at(island).is_some(), "the island itself must be mapped");
+    assert!(
+        f.guest.space.region_at(island + page).is_none(),
+        "these tests need free address space immediately after the island. Without the cliff \
+         there is no half-mapped buffer, every refusal below would be a refusal of a wholly bad \
+         pointer, and the test would pass for a reason that has nothing to do with M1"
+    );
+    f.guest.write_bytes(island, &vec![0xAAu8; page]);
+    (island, page)
+}
+
+/// **M1: a `read` into a half-mapped buffer takes nothing out of the descriptor.**
+///
+/// The buffer's first sixteen bytes are writable and the rest of it is off the end of the
+/// mapping. Before the fix the loop read twenty-four bytes from the descriptor and *then* tried
+/// to place them: the placing access refused, the guest was told the call failed, and the bytes
+/// were gone. Guest memory looks identical either way — `write_bytes` checks before it copies —
+/// so **the descriptor is the only thing that can discriminate**, and it is what is asserted.
+///
+/// A pipe and a regular file are both exercised, because the fix treats them the same and the
+/// reason it can is that the check happens before either is touched.
+#[test]
+fn a_read_into_a_half_mapped_buffer_consumes_nothing_from_the_descriptor() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("m1-read");
+    let (island, page) = island_with_a_cliff(&f);
+    // Sixteen writable bytes, then the cliff. A twenty-four byte read straddles it.
+    let straddling = island + page - 16;
+
+    // --- A pipe. Destructive: there is nothing to seek back to, so a lost byte is lost.
+    let fs = f.bionic.filesystem().expect("a root");
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    const SENT: &[u8] = b"012345678901234567890123";
+    assert_eq!(fs.write(write_fd, SENT).expect("twenty-four bytes into the pipe"), 24);
+
+    let error = refusal_of(&f, "read", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, straddling as u64);
+        asm.mov(2, 24);
+    });
+    assert_eq!(error.symbol(), Some("read"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert!(error.guest_address().is_some(), "{error}");
+
+    let mut back = [0u8; 24];
+    assert_eq!(fs.read(read_fd, &mut back).expect("the pipe still holds its bytes"), 24);
+    assert_eq!(&back, SENT, "a refused `read` must consume nothing from the pipe");
+    assert_eq!(
+        read_guest(&f, straddling, 16),
+        vec![0xAAu8; 16],
+        "and it must place nothing in the part of the buffer that was writable"
+    );
+
+    // --- A regular file. Recoverable by seeking, and deliberately not treated differently: the
+    // assertion is that the offset never moved, not that something put it back.
+    std::fs::write(scratch.path("m1"), SENT).expect("a file");
+    let fd = open_through_guest(&f, "/m1", O_RDONLY);
+    assert!(fd >= 0, "open failed with {fd}");
+    let error = refusal_of(&f, "read", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, straddling as u64);
+        asm.mov(2, 24);
+    });
+    assert_eq!(error.symbol(), Some("read"), "{error:?}");
+    let mut back = [0u8; 8];
+    assert_eq!(fs.read(fd, &mut back).expect("the file is readable"), 8);
+    assert_eq!(&back, b"01234567", "the refused `read` must not have moved the file offset");
+
+    // --- `pread`, which names an offset rather than moving one. It loses the least of the three
+    // and is held to the same rule, because the rule is about the order of the two steps.
+    let error = refusal_of(&f, "pread", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, straddling as u64);
+        asm.mov(2, 24);
+        asm.mov(3, 0);
+    });
+    assert_eq!(error.symbol(), Some("pread"), "{error:?}");
+    assert_eq!(read_guest(&f, straddling, 16), vec![0xAAu8; 16], "`pread` places nothing either");
+}
+
+/// **M1, the source side: a `__write_chk` out of a half-mapped buffer puts nothing into the
+/// descriptor.**
+///
+/// The count has to **cross a chunk boundary** for this to be a test of anything. The loop moves
+/// [`IO_BLOCK`](omni_platform::fs::IO_BLOCK) at a time and reads each chunk out of guest memory
+/// in one access, so for `count <= IO_BLOCK` the source was already validated before any host
+/// write and the defect cannot show. It shows at the *second* chunk, which is the one the first
+/// chunk's host write precedes — so the buffer is one page long and the count is two.
+#[test]
+fn a_write_chk_from_a_half_mapped_buffer_puts_nothing_into_the_descriptor() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("m1-write");
+    let (island, page) = island_with_a_cliff(&f);
+    let io_block = omni_platform::fs::IO_BLOCK;
+    assert_eq!(
+        page, io_block,
+        "this test's arithmetic needs a page to be exactly one IO_BLOCK; on a host where it is \
+         not, the second chunk would still be inside the island and nothing would be tested"
+    );
+    let count = (io_block * 2) as u64;
+
+    let fd = open_through_guest(&f, "/m1w", O_WRONLY | O_CREAT);
+    assert!(fd >= 0, "open failed with {fd}");
+    let error = refusal_of(&f, "__write_chk", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, island as u64);
+        asm.mov(2, count);
+        asm.mov(3, count);
+    });
+    assert_eq!(error.symbol(), Some("__write_chk"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert_eq!(
+        std::fs::metadata(scratch.path("m1w")).expect("the file exists").len(),
+        0,
+        "a refused `__write_chk` must not have put its first chunk into the file"
+    );
+
+    // `write` shares the loop, so it shares the rule; asserted rather than assumed, because a fix
+    // applied to one of the two callers is exactly the shape a review finds next.
+    let fd = open_through_guest(&f, "/m1w2", O_WRONLY | O_CREAT);
+    assert!(fd >= 0, "open failed with {fd}");
+    let error = refusal_of(&f, "write", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, island as u64);
+        asm.mov(2, count);
+    });
+    assert_eq!(error.symbol(), Some("write"), "{error:?}");
+    assert_eq!(
+        std::fs::metadata(scratch.path("m1w2")).expect("the file exists").len(),
+        0,
+        "and neither must a refused `write`"
+    );
+}
+
+/// **M1's shape in a third place: a `readdir` that cannot place its entry consumes no entry.**
+///
+/// `Filesystem::readdir` advances the stream, and there is no `rewinddir` and no `seekdir` here,
+/// so an entry that is consumed and then cannot be written is an entry the guest can never
+/// obtain — a directory silently one file short.
+///
+/// The destination is the adapter's own arena slot rather than a pointer the guest chose, so the
+/// only way to reach the check is for the guest to reprotect the arena under itself. It can:
+/// `mprotect` is bound and does not exclude the arena. `VERIFICATION.md` entry 12 — a branch no
+/// input can take is not a check — so the input is constructed here rather than argued about.
+#[test]
+fn a_readdir_that_cannot_write_its_entry_consumes_no_entry() {
+    use omni_mem::Protection;
+    let _guard = serialized();
+    let (f, scratch) = rooted("m1-readdir");
+    std::fs::create_dir(scratch.path("d")).expect("a directory");
+    for name in ["alpha", "beta", "gamma"] {
+        std::fs::write(scratch.path(&format!("d/{name}")), b"x").expect("a file");
+    }
+    let path = f.cstring(f.guest.data + 0x100, b"/d");
+    let dirp = value_of(&f, "opendir", |asm| {
+        asm.mov(0, path as u64);
+    });
+    assert_ne!(dirp, 0, "opendir returned NULL");
+
+    let page = f.guest.space.page_size();
+    let slot_page = (dirp as omni_cpu::GuestAddr) & !(page - 1);
+    assert_ne!(
+        slot_page,
+        f.bionic.arena() & !(page - 1),
+        "the page being made read-only must not be the one holding thread block zero, or this \
+         test would be about `errno` rather than about `readdir`"
+    );
+    f.guest.space.protect(slot_page, page, Protection::Read).expect("the slot page read-only");
+    let error = refusal_of(&f, "readdir", |asm| {
+        asm.mov(0, dirp);
+    });
+    assert_eq!(error.symbol(), Some("readdir"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    f.guest.space.protect(slot_page, page, Protection::ReadWrite).expect("writable again");
+
+    // Membership against the directory's real contents. A count would see this defect too — it
+    // loses exactly one entry — but a count cannot say *which* one went missing, and entry 1 is
+    // about exactly that difference.
+    let mut names = Vec::new();
+    for _ in 0..16 {
+        let entry = value_of(&f, "readdir", |asm| {
+            asm.mov(0, dirp);
+        });
+        if entry == 0 {
+            break;
+        }
+        names.push(
+            String::from_utf8(f.read_cstring(entry as omni_cpu::GuestAddr + 19))
+                .expect("a UTF-8 name"),
+        );
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            ".".to_string(),
+            "..".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+        ],
+        "a refused `readdir` must not have advanced the stream"
+    );
+    assert_eq!(value_of(&f, "closedir", |asm| { asm.mov(0, dirp); }) as i64, 0);
+}

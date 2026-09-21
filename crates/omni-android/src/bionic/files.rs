@@ -36,6 +36,17 @@
 //! `EIO`. `EIO` is a real answer that guest code retries or reports; an error nobody identified
 //! deserves the refusal that names it.
 //!
+//! # Order: admit the guest's buffer, then touch the descriptor
+//!
+//! Every transfer here validates the guest's whole buffer **before** the first irreversible host
+//! step, because a descriptor read is destructive on a pipe and a descriptor write is destructive
+//! everywhere. D22 states the rule for `arc4random_buf`; phase 3b did not carry it across, which
+//! is what the adapter review filed as **M1**. [`read_into_guest`] and [`write_from_guest`] carry
+//! it now, [`readdir`] carries it for the directory stream, and [`read_into_guest`] is where the
+//! argument — including the cross-thread unmapping this **cannot** defend against — is written
+//! out. [`write_struct`] is the same rule for the fixed structures: one access, so a destination
+//! that is only partly writable leaves the guest nothing rather than half a `struct stat`.
+//!
 //! # The layout trap, and what is ASSUMED
 //!
 //! Three guest structures are written here and **none of them is the host's**. Android arm64 is
@@ -516,6 +527,34 @@ fn write_struct(view: &GuestView<'_>, at: u64, bytes: &[u8], argument: usize) ->
     view.mem().write_bytes(address, bytes, Blame::new(view.symbol(), view.address(), argument))
 }
 
+/// Admit the **whole** of a guest transfer buffer, and hand back its base address.
+///
+/// D22's rule for `arc4random_buf` — *validate the entire destination before producing a single
+/// byte* — spelled once so the three descriptor transfers share it rather than restate it. The
+/// argument for doing it this way, and the limits of what it buys, are in [`read_into_guest`].
+///
+/// Returning the base address is the other half: every chunk of the loop is then `base + done`
+/// inside a range already admitted, which is why the loops here no longer add a guest-chosen
+/// `count` onto a guest-chosen pointer. That sum was `buffer + done` on `u64`, and `VERIFICATION`
+/// entry 3 is about what a release build does with arithmetic on guest-controlled values.
+fn transfer_buffer(
+    view: &GuestView<'_>,
+    buffer: u64,
+    count: u64,
+    write: bool,
+    argument: usize,
+) -> AbiResult<GuestAddr> {
+    let at = guest_address(view, buffer)?;
+    // The same target-width refusal [`guest_address`] makes for a pointer, made for a length. On
+    // an LP64 host it cannot fire, because every caller has already rejected a `count` above
+    // `MAX_COUNT`; on a 32-bit one it is the difference between a refusal and a truncated length
+    // that would admit less memory than the transfer goes on to touch.
+    let len = usize::try_from(count)
+        .map_err(|_| view.refusal("a transfer length wider than the host's usize"))?;
+    view.mem().checked_ptr(at, len, write, Blame::new(view.symbol(), view.address(), argument))?;
+    Ok(at)
+}
+
 // ================================================================== opening
 
 /// Turn the guest's `O_*` word into [`OpenFlags`], refusing what cannot be honoured.
@@ -690,6 +729,57 @@ pub(super) fn close(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// Returns the bytes transferred, or the `errno` for a failure that happened before any byte was.
 /// A failure *after* some bytes have been transferred reports the short count, which is what
 /// `read(2)` does: the error is reported by the next call.
+///
+/// # The whole destination is admitted before the descriptor is touched
+///
+/// Adapter review finding **M1**, and it is D22's `arc4random_buf` rule carried across: *nothing
+/// irreversible happens until the guest-supplied destination has been validated.* Phase 3b's loop
+/// read a chunk from the descriptor and **then** tried to place it, so a buffer writable for its
+/// first page and not its second took bytes out of the descriptor and reported the call as a
+/// failure. **The believable wrong answer that hid it** is that the guest was told the call
+/// failed, so nothing was read — true of the *return value*, false of the descriptor, and guest
+/// memory looked clean either way because the placing access is checked before it copies.
+///
+/// **For a pipe those bytes are gone.** A pipe read is destructive and there is nothing to seek
+/// back to. The glue's command pipe carries one `APP_CMD_*` byte per message (§5.2), and a lost
+/// one is a guest that waits forever rather than a guest that retries.
+///
+/// ## A regular file could be recovered from, and is still treated the same way
+///
+/// A `read` on a regular file *could* be undone by seeking the offset back; a `read` on a pipe
+/// could not. One rule covers both, and the reasons are worth naming because the asymmetry is
+/// real:
+///
+/// * the recovery exists for only one of the two descriptor kinds, so a design resting on it
+///   leaves the destructive kind — the one that loses data — uncovered, and this layer would have
+///   to branch on a kind it does not otherwise need to know;
+/// * a seek back is not a restoration when the descriptor is shared. Nothing stops two guest
+///   threads reading one descriptor, so rewinding after another thread's `read` has moved the
+///   offset corrupts *that* read instead of repairing this one;
+/// * admitting the destination first costs one range check per call, happens before any host call
+///   at all, and is the same sentence for both kinds.
+///
+/// ## Why the whole destination rather than chunk by chunk
+///
+/// The loop moves [`IO_BLOCK`] at a time so that a guest-chosen `count` never becomes a host-side
+/// buffer of that size — the reason the chunking is here, and it is unchanged. Validating each
+/// chunk just before its own descriptor read would keep the invariant too, and would deliver the
+/// chunks that do fit. It was rejected: the only way to report the rest is a **short count**, and
+/// a short `read` is precisely how a drained pipe and an ended file announce themselves. A guest
+/// whose buffer is half unmapped would be told *that is all there is* — a plausible wrong answer,
+/// which Global Constraint 1 forbids — where admitting the whole buffer tells it by name, with
+/// the address and the length, that its own destination is not writable.
+///
+/// ## What this does **not** promise
+///
+/// It promises that **no byte leaves the descriptor unless the entire destination was writable at
+/// the moment it was checked.** It does not promise the destination is still writable when the
+/// bytes arrive. Another guest thread may `munmap` or `mprotect` the range between the check and
+/// the write — `guestmem` binds both — and no check on this side of the boundary can close that
+/// window, because the window *is* the transfer. When it happens the bytes already read are lost
+/// and the call refuses by name. That is a property of guest memory rather than of this function,
+/// and [`GuestMem::checked_ptr`](crate::mem::GuestMem::checked_ptr) says the same of its own
+/// result: the check has happened, and no claim is made about other guest threads.
 fn read_into_guest(
     view: &mut GuestView<'_>,
     fd: i32,
@@ -698,6 +788,9 @@ fn read_into_guest(
     offset: Option<u64>,
 ) -> AbiResult<Settled<i64>> {
     let fs = filesystem(view)?;
+    // Before a byte leaves the descriptor. See this function's documentation for what that does
+    // and does not buy.
+    let base = transfer_buffer(view, buffer, count, true, 1)?;
     let mut blocking = BlockingWait::new();
     let mut done = 0u64;
     let mut chunk = vec![0u8; IO_BLOCK];
@@ -719,7 +812,10 @@ fn read_into_guest(
         match settle(view, read)? {
             Settled::Done(0) => break,
             Settled::Done(got) => {
-                let at = guest_address(view, buffer + done)?;
+                // `done < count` and `[base, base + count)` was admitted above, so this offset
+                // is inside a range this call has already checked and needs no arithmetic guard
+                // of its own — the bound is the validation, not the addition.
+                let at = base + done as usize;
                 view.mem().write_bytes(
                     at,
                     &chunk[..got],
@@ -819,6 +915,10 @@ impl BlockingWait {
 }
 
 /// `ssize_t read(int fd, void *buf, size_t count)`
+///
+/// The whole of `buf` is admitted before the descriptor is read from. [`read_into_guest`] is
+/// where review finding **M1** was closed and where what that does and does not promise — the
+/// pipe, the regular file, and the cross-thread race it cannot close — is written out.
 pub(super) fn read(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (fd, buf, count) = {
         let mut a = c.args();
@@ -842,6 +942,11 @@ pub(super) fn read(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 }
 
 /// `ssize_t pread(int fd, void *buf, size_t count, off_t offset)`
+///
+/// Same destination rule as [`read`], through the same [`read_into_guest`]. `pread` does not move
+/// the descriptor's offset, so a failed one is the *least* costly of the three to get wrong —
+/// which is exactly why it is stated here rather than left to be inferred: the rule is about the
+/// order of the two steps, not about how much a particular descriptor loses.
 pub(super) fn pread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (fd, buf, count, offset) = {
         let mut a = c.args();
@@ -873,6 +978,24 @@ pub(super) fn pread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// descriptor took whatever it was given; a pipe takes what fits. `Settled::Done(0)` therefore
 /// ends the loop rather than spinning — a descriptor that took nothing and reported no error has
 /// no more room, and the count so far is what the guest is told.
+///
+/// # The whole source is admitted before the descriptor is touched
+///
+/// The mirror of [`read_into_guest`]'s rule, and the reason finding **M1** named `__write_chk`
+/// beside `read` and `pread`. Here the irreversible side effect is on the far side: phase 3b's
+/// loop copied one [`IO_BLOCK`] out of guest memory, handed it to the descriptor, and only then
+/// looked at the next chunk — so a source readable for its first page and not its second put a
+/// page into a **pipe** and then reported the whole call as a failure. A byte in a pipe cannot be
+/// taken back out; the reader has already been told a message started, and for the glue's command
+/// pipe half a message is a command.
+///
+/// The one-chunk case hid it, which is why the regression test has to cross a chunk boundary: for
+/// `count <= IO_BLOCK` the single `read_bytes` already failed before any host write, so the defect
+/// is invisible below 4 KiB and certain above it.
+///
+/// The same two limits apply as for the read direction: the promise is that **no byte reaches the
+/// descriptor unless the entire source was readable at the moment it was checked**, and a range
+/// another guest thread unmaps mid-transfer is a race no check here can close.
 fn write_from_guest(
     view: &mut GuestView<'_>,
     fd: i32,
@@ -880,13 +1003,16 @@ fn write_from_guest(
     count: u64,
 ) -> AbiResult<Settled<i64>> {
     let fs = filesystem(view)?;
+    // Before a byte reaches the descriptor. See this function's documentation.
+    let base = transfer_buffer(view, buf, count, false, 1)?;
     let mut blocking = BlockingWait::new();
     let mut done = 0u64;
     let mut chunk = vec![0u8; IO_BLOCK];
     while done < count {
         blocking.observe(fs);
         let want = ((count - done) as usize).min(IO_BLOCK);
-        let at = guest_address(view, buf + done)?;
+        // Inside the range admitted above, exactly as in `read_into_guest`.
+        let at = base + done as usize;
         let bytes = view.mem().read_bytes(at, want, Blame::new(view.symbol(), view.address(), 1))?;
         chunk[..want].copy_from_slice(&bytes);
         match settle(view, fs.write(fd, &chunk[..want]))? {
@@ -955,6 +1081,11 @@ pub(super) fn write(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// code** — the call would read past the end of the object. That is a refusal naming the symbol
 /// and both numbers, exactly as `__memcpy_chk` and `__strlen_chk` already are; reporting it as a
 /// short write would lose the finding.
+///
+/// The whole of `buf` is admitted before the descriptor is written to — see [`write_from_guest`],
+/// the source-side half of review finding **M1**. That check is after the FORTIFY one, and in
+/// that order: `count > buf_size` is a fact about guest code that holds whatever guest memory
+/// looks like, and it is the more specific finding of the two.
 pub(super) fn write_chk(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (fd, buf, count, buf_size) = {
         let mut a = c.args();
@@ -1362,6 +1493,25 @@ pub(super) fn readdir(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 return Ok(());
             }
         };
+        // **Admitted before the stream is advanced**, which is finding M1's shape in a third
+        // place. `Filesystem::readdir` consumes an entry, and there is no `rewinddir` and no
+        // `seekdir` here, so an entry that cannot be placed is an entry the guest can never
+        // obtain — a directory silently one file short, which is the plausible-wrong-answer class
+        // rather than a fault.
+        //
+        // The destination is this instance's own arena rather than a pointer the guest chose, so
+        // it is writable unless the guest has reprotected or unmapped the arena under itself. It
+        // **can**: `mprotect` and `munmap` are bound in `guestmem` and neither excludes the
+        // arena. That is what makes this a check rather than reassurance (`VERIFICATION` entry
+        // 12), and `a_readdir_that_cannot_write_its_entry_consumes_no_entry` is the input that
+        // reaches it.
+        let slot = guest_address(&view, dirp)?;
+        view.mem().checked_ptr(
+            slot,
+            DIRENT_BYTES,
+            true,
+            Blame::new(view.symbol(), view.address(), 0),
+        )?;
         match settle(&view, fs.readdir(id))? {
             Settled::Done(Some(entry)) => {
                 let encoded = encode_dirent(&entry, position + 1);
