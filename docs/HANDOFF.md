@@ -27,10 +27,12 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
-**1,059 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was
-1,004 before M3 task 3 phase 3b, 959 before phase 3a, 926 before phase 2, 877 before phase 1, and
-608 before `omni-bionic` existed, so those are not comparable). **The whole mutation table has been
-run on the committed tree: 239/239 caught.** Clippy clean on
+**1092 passing, 0 failing, 13 ignored** (`cargo test --workspace --release`, 2026-09-21 — was
+1,059 before M3 task 3 phase 3c, 1,004 before phase 3b, 959 before phase 3a, 926 before phase 2,
+877 before phase 1, and 608 before `omni-bionic` existed, so those are not comparable). The
+thirteenth ignored test is phase 3c's per-guest-thread memory measurement, which is `#[ignore]`d
+because `process_commit_charge` is process-global. **The whole mutation table has been run on the
+committed tree: 255/255 caught.** Clippy clean on
 `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
 With `workspace = true` a member's `default-features = false` is **ignored**, so the omni-android
@@ -41,7 +43,7 @@ gate that refuses to run against a modified tree:
 
 | Harness | Rows |
 |---|---|
-| `tools/mutate.py` (workspace) | **239**, all caught on a full run |
+| `tools/mutate.py` (workspace) | **255**, all caught on a full run |
 | `crates/dynarmic-sys/tools/mutate_shim.py` | 23 |
 | `crates/omni-elf/tools/mutate_loader.py` | 18 |
 
@@ -146,13 +148,18 @@ Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-pl
   `omni-bionic` and the 23 clock / process-environment / logging symbols over them — **137 of the
   188** now covered (119 thunk functions + 18 data objects), 16 new adapter tests and 9 new
   `omni-bionic` ones, mutation **175 → 212** (37 new, 37/37 caught). Durable record is **D22**.
-  Phase 3b, this session: **`omni-platform` gained `fs`, a ROOTED filesystem** — every guest path
+  Phase 3b: **`omni-platform` gained `fs`, a ROOTED filesystem** — every guest path
   resolves inside one host directory the embedding supplies, and an instance with no root refuses
   every path call by name — plus bionic's `FILE*` layer in `omni-bionic` over a trait, and the 29
   file-io symbols over both. **166 of the 188** now covered (148 thunk functions + 18 data
   objects), 55 new tests, mutation **213 → 239** (26 new, 26/26 caught). Durable record is **D23**.
-  Phases 3c (sockets and polling) and 3d (thread lifecycle) remain; scope for the whole task is
-  **170 thunk functions + 18 data objects**.
+  Phase 3c, this session: **the runtime can create a guest thread**, which is what makes the
+  16 MiB-per-thread blocker real rather than theoretical. `pthread_create`, `join`, `detach` and
+  `getschedparam`, plus the four signal symbols — one implemented exactly and three refused by
+  name. **174 of the 188** now covered (156 thunk functions + 18 data objects), mutation
+  **239 → 255** (16 new). Durable record is **D24**. **`omni-platform` did not have to grow for
+  it**, which the plan predicted it would. Phase 3d (sockets and polling) and 3e (the six nothing
+  else claims) remain; scope for the whole task is **170 thunk functions + 18 data objects**.
 - Task 4 (all 3,594 initializers, the M3 gate) — not started.
 
 ### What Task 1 established
@@ -303,7 +310,8 @@ The 100 do **not** form one job. They split by what they depend on:
 | ~~The **18** data symbols~~ — not ~19, and the list that stood here named two symbols the initializers never reach | **DONE** — phase 2, D21 | — |
 | ~~Clocks, process info, logging~~ | **DONE** — phase 3a, D22. `omni-platform` gained `clock`, `process` and `log` | — |
 | ~~Files and directories~~ | **DONE** — phase 3b, D23. `omni-platform` gained `fs`; the confinement policy is in `fs::path` | — |
-| Sockets and polling, thread lifecycle | **More `omni-platform` surface** | **YES** — phases 3c, 3d |
+| ~~Thread lifecycle and signals~~ | **DONE** — phase 3c, D24. **No `omni-platform` surface was needed**: `std::thread`, `omni-mem` and `omni-cpu` between them have all of it | — |
+| Sockets and polling | **More `omni-platform` surface** | **YES** — phase 3d |
 
 **That blocker is now mostly cleared.** `omni-platform` was `vm` and `fault` and nothing else
 until phase 3a, which added `clock`, `process` and `log` (D22); phase 3b added `fs` (D23). What is
@@ -329,37 +337,42 @@ those targets — that was ruled against deliberately.
    **Done** (D22): 137 of the 188 covered, 25 new tests, 37 new mutation rows, 37/37 caught.
 4. ~~Files and directories.~~ **Done** (D23): 166 of the 188 covered, 55 new tests, 26 new
    mutation rows, 26/26 caught.
-5. **Next:** sockets and polling (3c), then thread lifecycle and signals (3d), then the six the
-   plan's `3e` row collects.
+5. ~~Thread lifecycle and signals.~~ **Done** (D24): 174 of the 188 covered, 16 new mutation
+   rows. It needed no new `omni-platform` surface at all.
+6. **Next:** sockets and polling (3d), then the six the plan's `3e` row collects.
 
 ## Next action
 
-**M3 Task 3 phase 3c: sockets and polling.** Phases 1, 2, 3a and 3b are complete and committed
-(D20, D21, D22, D23). **166 of the 188 reachable imports are covered** — 148 thunk functions and
-all 18 `STT_OBJECT` data objects — and **22** are left. The list is derived, not asserted: the 188
-of `init-reachable-imports.txt` minus the 148 bound and the 18 placed, classified with
-`tools/os_surface.py` — and the adapter's own test now asserts that remainder as a **set
-difference** rather than as a total, so a substitution in it cannot pass.
+**M3 Task 3 phase 3d: sockets and polling.** Phases 1, 2, 3a, 3b and 3c are complete and
+committed (D20, D21, D22, D23, D24). **174 of the 188 reachable imports are covered** — 156 thunk
+functions and all 18 `STT_OBJECT` data objects — and **14** are left. The list is derived, not
+asserted: the 188 of `init-reachable-imports.txt` minus the 156 bound and the 18 placed,
+classified with `tools/os_surface.py` — and the adapter's own test asserts that remainder as a
+**set difference** rather than as a total, so a substitution in it cannot pass.
 
 | group | count | symbols |
 |---|---|---|
 | ~~**file-io** — phase 3b~~ | ~~29~~ | **DONE** (D23) |
-| **network** — phase 3c | **8** | `socket`, `poll`, `select`, `eventfd`, `getaddrinfo`, `freeaddrinfo`, `gai_strerror`, `inet_ntop` |
-| **threads-sync** — phase 3d | **8** | `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_getschedparam`, `pthread_sigmask`, and **three signal symbols the plan's phase table never assigned to any phase**: `sigaction`, `sigfillset`, `raise` |
+| ~~**threads + signals** — phase 3c~~ | ~~8~~ | **DONE** (D24) |
+| **network** — phase 3d | **8** | `socket`, `poll`, `select`, `eventfd`, `getaddrinfo`, `freeaddrinfo`, `gai_strerror`, `inet_ntop` |
 | time-clocks | 2 | `clock` (process CPU time, which needs `GetProcessTimes`-shaped surface) and `time` (one line over `clock::realtime_now`, deliberately left for whoever binds `clock` beside it) |
 | no group | 4 | `mallinfo`, which returns 80 bytes indirectly through `X8` and would have to describe a libc heap `libroblox.so` does not have; `longjmp`, which is guest control flow and not an OS call at all; and the two `__gcov_*` |
 
-**Three of those are a finding rather than a list entry.** `sigaction`, `sigfillset` and `raise` are
-in the reachable 188 and appear in **no row** of the plan's phase-3 table — the classifier files them
-under `threads-sync`, and the table's thread row is about lifecycle and scheduling. Signals are their
-own problem (the guest's signal state is exactly what `pthread_sigmask` was excluded from
-`omni-bionic` for, D19), and whoever picks up 3d should decide whether they belong there or in a
-phase of their own. `longjmp` is likewise unassigned and is the odd one out in the other direction:
-it needs no OS at all, only the guest's own `jmp_buf` and a way to resume the guest at a saved PC.
+**A naming correction, made by phase 3c rather than left to be tripped over.** This section used
+to call sockets *3c* and threads *3d*, while the plan's own phase-3 table has `3c` as threads +
+signals and `3d` as network. The **table** is what was followed and this file now agrees with it.
+Nothing depended on the order, and the swap is recorded rather than quietly fixed because a
+reader with the old numbering in mind will otherwise think a phase was skipped.
 
-**The blocker is now mostly cleared.** `omni-platform` was `vm` and `fault` and nothing else
-until phase 3a, which added `clock`, `process` and `log`; phase 3b added `fs`. What is still
-missing is sockets and threads.
+**`sigaction`, `sigfillset` and `raise` were a finding rather than a list entry** — in the
+reachable 188 and in no row of the plan's original table — and phase 3c settled them with the
+thread group. One is implemented exactly and three refuse by name; D24 has the split and the
+believable wrong answer each refusal declines to give.
+
+**The blocker is now all but cleared.** `omni-platform` was `vm` and `fault` and nothing else
+until phase 3a, which added `clock`, `process` and `log`; phase 3b added `fs`; phase 3c needed
+**nothing** — `std::thread`, `omni-mem` and `omni-cpu` between them have the whole of thread
+lifecycle. What is still missing is sockets.
 
 Per the five-target guidance, that extension must add the **Linux and macOS signatures as honest
 `unsupported` returns at the same time, naming the intended POSIX call**. Do not write speculative
@@ -368,15 +381,18 @@ unverified body misbehaves silently where a typed error fails immediately. **And
 half before copying the pattern:** a primitive that calls no OS API at all must *not* be given a
 fabricated `unsupported` arm, because that is a false claim in the other direction.
 
-**A prediction this file made about phase 3b was wrong, and the correction is the useful part.**
-It said "Files will be the opposite balance, and almost all of them will need [the structural unix
-half]". The opposite happened: **fifteen of the seventeen** file primitives are one portable `std`
-call and are implemented once, and only `pread` and `statvfs` needed a backend. D23 records the
-sharper test that produced that answer, and it is the one to apply to sockets rather than the
-guess: not "does it call the OS", but **is there one `std` call that serves all five targets?**
-`std::net` will answer yes for rather less of `socket`/`poll`/`select` than `std::fs` did, but the
-question is the same one and the answer is worth measuring rather than assuming in either
-direction.
+**Two predictions about the OS surface have now been wrong in the same direction, and the
+correction is the useful part.** This file said "Files will be the opposite balance, and almost all
+of them will need [the structural unix half]"; the opposite happened — **fifteen of the seventeen**
+file primitives are one portable `std` call and only `pread` and `statvfs` needed a backend (D23).
+The plan's table then listed "**Threads** — spawn, join, detach, attributes, scheduling" among the
+things `omni-platform` must grow for, and phase 3c needed **none of it**: `std::thread` is portable,
+the stack is an `omni-mem` mapping and the context is `omni-cpu`'s (D24). So the sharper test D23
+proposed is the one to apply to sockets rather than the guess: not "does it call the OS", but **is
+there one `std` call that serves all five targets?** `std::net` will answer yes for rather less of
+`socket`/`poll`/`select` than `std::fs` did, but the question is the same one and the answer is
+worth measuring rather than assuming in either direction. **And a primitive that needs no OS call
+must not be given a fabricated `unsupported` arm**, which is the other half of the same rule.
 
 What phases 2, 3a and 3b leave for whoever picks this up:
 
@@ -400,9 +416,18 @@ What phases 2, 3a and 3b leave for whoever picks this up:
 - **`fprintf` and `vfprintf` are still refusals and are now one binding away.** Both halves exist:
   `format::render` and phase 3b's `stdio`. Phase 3b deliberately left the binding out of its scope
   of 29 and corrected the refusal text, which used to say `omni-platform` had no file surface.
-- **`ReentrantCall::invalidate_code` reaches one context.** `munmap` and `mprotect` discard the
-  calling thread's translations; a second guest thread that had already translated the same range
-  keeps its own. Closing that needs a registry of live contexts, which belongs with thread lifecycle.
+- ~~**`ReentrantCall::invalidate_code` reaches one context.**~~ **Closed as far as it can be, in
+  phase 3c (D24).** There is a registry of live contexts now: an `munmap` or `mprotect` applies to
+  the calling context synchronously and is **queued for every other live one**, which applies it at
+  the top of its next run segment. What is left is stated rather than implied — a guest thread that
+  neither crosses the exit path nor returns from `cpu.run` keeps a stale translation until it does,
+  which for a created guest thread is bounded by one step window and under `RunLimit::Unlimited` is
+  not bounded at all. `Boundary::code_invalidations` is a detector for it, not a watch.
+- **A guest thread does not run its `pthread_key` destructors when it exits**, and bionic does.
+  Closing it needs a host → guest call from *outside* a thunk crossing, which is a boundary API
+  that does not exist. It does not affect M3's gate — the 3,594 initializers run on a thread that
+  does not exit, and `pthread_exit` is not among the 188 — but a guest that frees per-thread state
+  from a key destructor leaks it once per thread exit (D24).
 - **`mlock`, `MADV_DONTNEED`, `MAP_FIXED` and file-backed `mmap` are refusals, not gaps.** Each names
   the guarantee it could not meet. D21 records why `-1`/`ENOMEM` was rejected for `mlock` in
   particular: it is the most believable wrong answer in the group.
@@ -458,7 +483,7 @@ Round trip re-measured after the mechanism changed: **26.7-31.0 ns against 81-10
 | Risk | State |
 |---|---|
 | **Test APK is cheat-injected** | `Roblox-2.738.1397.apk` is signed by "Gloop", not Roblox, with an injected Luau executor in `libzstd-jni`. `libroblox.so` itself is stock. **A stock Play-signed APK has been requested from the user and never supplied.** Design is from the stock engine only (D6). Still the correct thing to ask for |
-| **16 MiB per guest thread** | A fixed array dynarmic allocates and *writes* even when its feature is disabled — and D16 says to run with it disabled. Fork patch written up in `crates/dynarmic-sys/patches/README.md`, not applied. ~512 MiB at 32 threads. Directly threatens the multi-instance memory requirement |
+| **16 MiB per guest thread** | A fixed array dynarmic allocates and *writes* even when its feature is disabled — and D16 says to run with it disabled. Fork patch written up in `crates/dynarmic-sys/patches/README.md`, **still not applied**: D5 pins the vendored tree byte-for-byte unmodified, so applying it is a decision to record rather than a side effect of needing the memory. ~512 MiB at 32 threads. **Live as of phase 3c**, which is the first phase in which a guest can create a thread at all — and measured through that path: **24.76-24.84 MiB per concurrent guest thread**, of which **98.6% comes back when the thread exits** (n = 4 runs of 8 threads, D24). So the constraint is on *concurrent* threads, not on threads ever created, and `ThreadHost::with_limit` is what an embedding bounds it with |
 | **W^X does not hold for the code cache** | Recorded as an explicit exception under D12. Enabling dynarmic's no-execute option makes **upstream's own suite segfault**. Under identity mapping the cache is guest-writable in principle, gated only by ASLR |
 | **`AT_HWCAP` is an open decision for M3** | Roblox's atomics are one population behind a single flag we own. Advertise LSE → 53 hard interpreter halts; decline → 106 fallback arms into a global spinlock that anti-scales 21x. Both arms measured; **the choice is still unmade, and phase 3a made that structural**: `bionic::HwcapPolicy` has no `Default`, an instance starts `Undecided`, and under it `getauxval(AT_HWCAP)` *refuses by name with both measurements in the message*. A host that has decided calls `Bionic::set_hwcap_policy`. Defaulting to "decline" was considered and rejected — it reads as the safe arm and is the one that costs 21x, and nothing would have recorded that a choice had been made (D22). Mutation row `procenv-A1` injects exactly that |
 | No Vulkan validation layers installed | Will matter from M6. A real use-after-free once crashed the driver with no diagnostic |
@@ -499,7 +524,10 @@ already appeared in this project's own documents, every one added by summarising
 - JIT arena: dual-mapped, 162 ns/cycle against 2259 for protection flipping.
 - Thunk: **≈33 ns/call** in-loop, 80-105 exiting to Rust, 3x.
 - Cold translation on real code **0.516 Mguest-insn/s** (n=11); warm **156.7** (n=31).
-- Per guest thread **24.5 MiB** (n=8); shrinking the code cache does **not** help.
+- Per guest thread **24.76-24.84 MiB** (n = 4 runs of 8 threads, measured through a real guest
+  `pthread_create` in phase 3c), and **98.6% of it comes back when the thread exits** — the
+  residual is 0.35-0.40 MiB per thread. Shrinking the code cache does **not** help: 24.56, 34.61
+  and 34.61 MiB/thread at 8, 32 and 128 MiB of cache (n=8 contexts, one layer down).
 - Roblox shape: 2.27% indirect, **4.30 instructions per basic block**, **128 exclusive-monitor sites
   against 53 LSE** (29.3% of atomic RMW). All static mixes, used as proxies.
 - Texture formats: **neither ETC2 nor ASTC** on the dev GPU; BC1/BC3/BC7 yes. Runtime transcoding is
@@ -523,6 +551,9 @@ Each of these was recorded, then disproved by someone other than its author. Sev
 | 88 of the 188 reachable imports are implemented in `omni-bionic` | **79.** 88 was the naive any-mention grep minus one known exclusion; the stated method, run, gives 82, of which five are English words in unrelated prose. Wrong by nine, in the direction that makes the remaining work look smaller (D20) |
 | `FileExt::seek_read` on Windows is `pread` | It is **not**: it moves the descriptor's own file pointer, so a `pread` built on it alone leaves the next sequential `read` at end of file with every call reporting `Ok`. MEASURED on a ten-byte file: `read(4)`, `pread(3, offset 7)`, `read(3)` gave **0 bytes** instead of `456`. The position is saved and restored now (D23) |
 | `fprintf` cannot be serviced because `omni-platform` has no file surface | It has one as of phase 3b. The refusal text said this and was corrected: what is missing now is only the binding of the `printf` family onto the stream layer (D23) |
+| D23: `the_arena_fits_in_one_commit_granule` "pins the total against the granule **and the four tables against the order the accessors assume**" | Only the first half was true. The second assertion restated `ARENA_BYTES`'s own definition character for character and **could not fail**, so nothing checked that the four accessors agreed with the layout — dropping `POOL_BYTES` from `files_base()` left the whole suite green while `fopen` handed out `FILE` objects on top of the pool. Found by an independent review of phase 3c; replaced by a test that walks the bases **out of the accessors** (D24). The second time here a *total* stayed consistent while its *membership* did not |
+| The plan's table: `omni-platform` must grow "**Threads** — spawn, join, detach, attributes, scheduling" | It did not have to. Phase 3c is `std::thread`, an `omni-mem` mapping for the stack and an `omni-cpu` context — **no new platform primitive**, and therefore no `unsupported` arm to write (D24). Second phase running whose five-target prediction over-estimated the OS surface |
+| HANDOFF: phase **3c** is sockets and polling, **3d** is thread lifecycle | The plan's own phase-3 table has `3c` as threads + signals and `3d` as network, and the table is what was followed. Corrected here rather than quietly, because a reader with the old numbering will otherwise think a phase was skipped |
 | `malloc` is the host allocator, so the guest heap is the host heap | `libroblox.so` imports **no allocator at all**; the seam is guest `mmap` through the demand pager |
 | The reachable `STT_OBJECT` set includes `timezone` and `tzname` | It does **not**, and it does include `AMEDIAFORMAT_KEY_STRIDE` and `AMEDIAFORMAT_KEY_WIDTH`, which the list omitted. The count of **18** was right in both versions, which is why every count-based assertion passed; the membership was wrong by two in each direction. Derived from the real `.dynsym` now (D21) |
 | `__sF` is reached as `__sF + addend`, which is why `declare_data` needs a size | Each of the eighteen data imports has exactly **one** relocation, `R_AARCH64_GLOB_DAT`, addend **zero**. The conclusion stands — `&__sF[2]` is arithmetic the guest does at run time — but the evidence given for it was not true of this binary (D21) |

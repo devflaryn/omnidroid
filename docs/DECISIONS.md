@@ -2532,3 +2532,373 @@ sampled, and four mutation rows in both directions. The three ASSUMED layouts ar
 one table and is cheap to change, and each is asserted from real guest code against a value the
 test chose, so an offset that moved fails rather than drifts. `MAX_OPEN_FILES`, `MAX_OPEN_DIRS`,
 `MAX_GUEST_FILES` and `MAX_DIR_ENTRIES` are policy numbers and are stated as such.
+
+---
+
+## D24 — Phase 3c: guest threads, and the three signal symbols that stay refusals
+
+D20 is the adapter, D21 is phase 2, D22 is phase 3a, D23 is phase 3b. This is phase 3c of M3
+task 3: the eight symbols of the plan's `3c` row — `pthread_create`, `pthread_join`,
+`pthread_detach`, `pthread_getschedparam`, `pthread_sigmask`, `raise`, `sigaction`,
+`sigfillset` — and it is the phase where the runtime can create a guest thread for the first
+time.
+
+### What is bound now
+
+| | count | what |
+|---|---|---|
+| serviced inside the run loop | **145** | phase 3b's 140, plus four signal symbols and `pthread_getschedparam` |
+| serviced on the exit path | **11** | phase 3b's 8, plus `pthread_create`, `pthread_join`, `pthread_detach` |
+| `STT_OBJECT` data objects | **18** | unchanged |
+| **of the 188 reachable imports** | **174** | 156 thunk functions and the 18 data objects |
+| left `Unbound` | **14** | eight sockets and polling, and the six nothing else claims |
+
+**Derived, not taken from the plan.** The 188 of `init-reachable-imports.txt` minus every symbol
+named in `bionic/handlers.rs` and `bionic/data.rs` is a 22-symbol remainder; intersecting it with
+the plan's `3c` row gives exactly these eight, and the remaining 14 are asserted as a **set
+difference** against the reachable file rather than as a total.
+
+**One correction to the plan's own text, and it is a swap rather than an error of substance.**
+`HANDOFF.md`'s "Next action" called phase 3c *sockets and polling* and 3d *thread lifecycle*,
+while the plan's phase-3 table has `3c` as threads + signals and `3d` as network. The table is
+what was followed; HANDOFF has been corrected to agree with it. Nothing depended on the order.
+
+### `pthread_create` is where three constraints meet, and none is traded against another
+
+**1. D13 is satisfied structurally rather than by remembering it.** A guest thread's `TPIDR_EL0`
+must point at a populated bionic TLS block with a stack guard at `+0x28` **before it executes one
+instruction**. The context comes from a new `GuestCpuBackend::create_guest_thread`, which
+allocates the block from the backend's own arena and builds a `GuestThreadConfig` — a type that
+cannot be constructed without a usable thread pointer. A backend with no arena refuses that call
+by name rather than inventing one.
+
+The arena must be **the backend's**, and this is the part that would have been easy to get wrong
+in a way nothing would have noticed for a long time. Bionic reads its stack guard once per
+process and copies **one** value into every thread's slot 5; a second `TlsArena` beside the
+backend's would put a second guard value into one address space, and a canary stored on a frame
+in one thread and checked in another would then fail `__stack_chk_fail` — which is a
+*termination*, arriving in a thread that did nothing wrong, on a timing-dependent schedule.
+`a_created_guest_thread_has_its_thread_pointer_and_the_process_stack_guard` asserts it from real
+guest code: the start routine executes `MRS X0, TPIDR_EL0` and `LDR X1, [X0, #0x28]` itself,
+exactly as 1,276 of `libroblox.so`'s own instructions do, and the value it reads is compared
+against the arena's.
+
+**2. Host → guest re-entry stays a type property** (D18, task 2's finding F9). `ImportCall` still
+holds no CPU, so an inline handler still cannot run guest code. What `pthread_create` needed was
+not a second CPU on the calling thread but the **boundary**, so that it could install the thunk
+table on a context it had just created and start a run loop there: `ReentrantCall::boundary()`,
+which exists only on the exit path. It cannot be used to re-enter the calling thread's guest
+either — `Boundary::run` needs a `&mut dyn GuestCpu`, the call already holds the only one for
+this thread, and the borrow checker will not produce a second. The capability it hands out is
+exactly "drive a CPU you have just made", which is what `pthread_create` is.
+
+`pthread_create` also maps the new thread's stack, which is F9's other half and the reason `mmap`
+is on the exit path too.
+
+**`pthread_getschedparam` is inline**, unlike its three siblings: it runs no guest code and
+touches no mapping, and putting it on the exit path for tidiness would cost it 3x per call (D17)
+for nothing. `dispatch_paths_are_what_f9_requires` pins that in both directions.
+
+**3. The 16 MiB-per-guest-thread blocker is live now, and is measured below.**
+
+### D16's shape for a thread that never returns
+
+A created thread runs in **short budget windows** and re-reads the instance's stop switch between
+them, rather than in one unlimited run. That is D16's prescription rather than a preference: the
+halt flag is checked at terminals that a counted budget makes exclusive
+(`crates/dynarmic-sys/patches/README.md` item 2b), so an asynchronous halt is not a mechanism
+that can be relied on here, while a window boundary is a decision point that exists whatever the
+guest is doing. `Bionic::stop_guest_threads` is the switch, and its documentation says what it is
+not: it is not an interrupt, and a thread blocked in a guest mutex or inside `pthread_join` stops
+only once that returns.
+
+`a_runaway_guest_thread_stops_at_a_window_boundary` runs an unconditional guest loop and stops it.
+
+### The split between a POSIX return and a refusal
+
+The pthread functions return their error **as the return value**, not through `errno`.
+
+* **Well-formed and legitimately failed → what POSIX says**, and each is a branch guest code has:
+  `EAGAIN` for a resource that ran out (the live-thread limit, the backend's thread count, a
+  stack that could not be mapped), `ESRCH` for a `pthread_t` no live thread answers to, `EINVAL`
+  for a thread that is not joinable and for an attribute object whose detach state is neither
+  value, `EDEADLK` for a join that would deadlock.
+* **Cannot be carried out correctly → `AbiError::Refused` naming the symbol.** Three of them:
+
+  1. **No thread host.** `EAGAIN` would say the runtime ran out of resources when it was never
+     configured, and a correct guest would retry for ever.
+  2. **A NULL start routine.** POSIX defines no error for it and bionic simply branches to it, so
+     there is no correct number: `EAGAIN` claims a shortage that did not happen and `0` claims a
+     thread was started. It is a detected defect in guest code and is reported as one — the same
+     treatment `__write_chk` gives a detected buffer overrun (D23).
+  3. **Joining a thread that stopped without returning.** There is no `void *` for a thread that
+     never produced one, and `0` with an untouched `retval` is indistinguishable from a thread
+     that returned `NULL`.
+
+**A detached thread's failure has nobody to report to**, so it goes to
+`Bionic::guest_thread_failures` — which is the only place it can surface — and a joinable one is
+reported both ways.
+
+### The hostile surface a guest that spawns threads adds, and what each case answers
+
+| the guest does | the answer |
+|---|---|
+| joins itself | `EDEADLK`, which POSIX names |
+| two threads join each other | `EDEADLK` — the check walks the wait chain, so a cycle of any length is caught, not only the self-join |
+| joins a thread nobody handed out | `ESRCH` |
+| joins a detached thread | `EINVAL` |
+| detaches twice | `EINVAL`; succeeding twice would make a double detach indistinguishable from a single one, and in a real implementation it is a use-after-free of the thread's descriptor |
+| asks for a stack of `SIZE_MAX` | `EAGAIN`. The round-up is `checked_add`; the masked form wraps to **zero** and a release build does it silently, so the thread would get a stack made entirely of its guard page |
+| asks for a stack below the floor | `EINVAL`, which is POSIX's answer for a stacksize under `PTHREAD_STACK_MIN` — never a silent round-up, which would leave `pthread_attr_getstacksize` and the real stack disagreeing |
+| writes a detach state of 99 into its attr | `EINVAL` |
+| passes a start routine at an unmapped address | the thread is created, faults, and is **recorded**; the join refuses naming the failure |
+| creates more threads than the limit | `EAGAIN` |
+| panics the runner | a recorded failure rather than a `pthread_join` that blocks for ever — the panic is caught, because the record would otherwise stay `Running` |
+
+### MEASURED: what a guest thread costs, and what comes back
+
+n = **4 runs of 8 threads**, release, `crates/omni-android/tests/thread_memory.rs`, each run in
+its own process because `process_commit_charge` is process-global. The threads are created by
+real `pthread_create` calls from translated ARM64 code and joined again.
+
+| | |
+|---|---|
+| per guest thread, running | **24.76 - 24.84 MiB** |
+| instance + boundary + the first context | 25.14 - 25.16 MiB |
+| residual after all eight were joined | **2.79 - 3.18 MiB in total, 0.35 - 0.40 MiB per thread** |
+
+**The adapter adds almost nothing per thread.** 24.8 MiB against `omni-cpu`'s **24.56 MiB** for a
+raw context with no adapter and no guest stack (n = 1 run of 8 contexts) is agreement to within
+1%. What this layer adds is a 1 MiB guest stack that is lazily committed and of which a spinning
+thread touches one page, and an arena block that was already committed when the instance was
+built.
+
+**98.6% of it comes back**, and that is the figure the multi-instance requirement turns on. The
+cost is of *concurrent* guest threads rather than of threads ever created, so a guest that creates
+and joins in a loop does not drift upwards. An instance whose guest runs N threads costs the
+~16.7 MiB of a loaded `libroblox.so` plus about 24.8 MiB per concurrent thread — three instances
+with four threads each is roughly 50 + 12 × 24.8 ≈ 348 MiB. `ThreadHost::with_limit` is what an
+embedding bounds that with; the default is `MAX_GUEST_THREADS`, the arena's own capacity, so this
+layer adds no second invented ceiling.
+
+**The fork patch is still NOT applied.** 16 MiB of the per-thread figure is `A64EmitX64`'s fixed
+fast-dispatch table, held by value and **written by the constructor** for a feature D16 runs
+disabled; `crates/dynarmic-sys/patches/README.md` item 4 has the patch and the argument for it.
+Applying it gives up D5's byte-for-byte-unmodified claim about the vendored tree, which is a
+decision to record rather than a side effect of needing the memory, and it needs upstream's
+202,200 assertions run against it with `FastDispatch` both on and off first.
+
+### `omni-platform` did not have to grow, and the plan predicted it would
+
+The plan's phase-3 table lists "**Threads** — spawn, join, detach, attributes, scheduling" among
+the things `omni-platform` must grow for. **It did not have to.** Everything here is portable
+`std` (`std::thread`, `std::panic::catch_unwind`), `omni-mem` (the stack mapping) and `omni-cpu`
+(the context and its TLS block). No new platform primitive exists, so there is **no
+`unsupported` arm to write** — and per D22's other half, fabricating one would be a false claim
+in the other direction: it would assert that a thread this process can spawn cannot be spawned.
+
+This is the second phase running whose five-target prediction was wrong in the direction of
+over-estimating the OS surface; phase 3b predicted files would "almost all" need a unix half and
+fifteen of seventeen needed none (D23). The sharper test D23 proposed — *is there one `std` call
+that serves all five targets?* — answers yes for the whole of this phase.
+
+**Nothing here has been built for Linux or macOS, let alone run there.**
+
+### The registry of live contexts, decided explicitly
+
+Phase 2 recorded `ReentrantCall::invalidate_code` as reaching **one** context and labelled that
+"a narrowing of the window, not a closing of it", with the note that the registry which would
+close the rest belonged with thread lifecycle. This is that phase, so the decision is made rather
+than carried forward.
+
+Every `Boundary::run` registers the context it drives; `invalidate_code` applies the range to the
+calling context synchronously and **queues it for every other live one**, which applies it at the
+top of its next run segment — the only place a `&mut dyn GuestCpu` for that context exists. A
+queue that fills collapses to the whole address space, which is *more* invalidation rather than
+less: over-invalidating costs translation, and dropping a range leaves a context executing bytes
+that are not there. `Boundary::watch_context` is the long-lived form, and the thread runner holds
+one — without it a guest thread's registration would be taken off and put back between every run
+window, and a range invalidated in that gap would be queued for a context that no longer existed.
+
+**What is still open is stated rather than implied.** A context drains at a run-segment boundary,
+so a guest thread that neither crosses the exit path nor returns from `cpu.run` keeps a stale
+translation until it does. For a created guest thread that is bounded by one step window; under
+`RunLimit::Unlimited` with a loop that never leaves generated code it is unbounded. Closing it
+completely needs either a cross-context invalidation the backend does not offer or an
+asynchronous halt honoured under a counted budget, which the patches README measures as not being
+the case on this pin.
+
+`CodeInvalidations` is a **detector**, not a watch: both counters stay at zero under exactly the
+workload that raises them if the broadcast is removed.
+
+### Signals: one is answered exactly, three are refused by name
+
+A POSIX signal is three mechanisms — a disposition table, a per-thread mask, and delivery that
+can interrupt a thread at an arbitrary instruction — and Omnidroid has none of them. Inventing
+one is a design of its own, with its own interactions with the demand pager (D10), the halt flag
+(D16) and the boundary's re-entrancy rules (D18).
+
+| symbol | here | the believable wrong answer it declines |
+|---|---|---|
+| `sigfillset` | **implemented**, in `omni-bionic` | — |
+| `sigaction` | **refused** | `0`: the guest believes it will be told about `SIGSEGV`, `SIGPIPE` or `SIGABRT`, and the code that would have recovered is never reached |
+| `raise` | **refused** | `0`: `raise(SIGABRT)` is the tail of `assert` and of most C++ runtimes' `std::terminate`, so the guest **runs on past the point it expected to die**, carrying the invariant it had just found broken |
+| `pthread_sigmask` | **refused** | `0` with an empty old mask: the guest believes signals are blocked across a critical section |
+
+`pthread_sigmask` is the symbol `omni-bionic` had already **excluded by name** for this exact
+reason (D19), so the other two are the same family getting the same answer.
+
+**`sigfillset` is not a concession.** It is `memset(set, 0xff, sizeof(sigset_t))`: a total
+function of its one argument with no table, no mask and no delivery behind it. Refusing it as
+well would be the over-correction, and row `signals-B1` injects exactly that. What it is *for* is
+still refused, which is the point — a guest that calls `sigfillset(&set)` and then
+`pthread_sigmask(SIG_BLOCK, &set, &old)` gets a correctly filled set and then a refusal naming
+the symbol, rather than a correctly filled set and a lie.
+
+**Mapping `raise(SIGABRT)` onto `abort`'s reported termination was considered and rejected**, and
+the refusal text says so. `abort` *is* bound and reports a termination rather than performing one
+(D22). Routing `raise` onto it would be this layer deciding that `SIGABRT`'s disposition is
+`SIG_DFL` — a fact about a table that does not exist — and it would answer for one signal number
+out of 64 while every other still needed a decision.
+
+Two things recorded rather than assumed. Bionic's `sigfillset` fills the **whole** word where
+glibc leaves signals 32 and 33 clear for NPTL; this follows bionic, which is the same
+follow-bionic-not-glibc convention `guestcmp` already carries for `strcmp`'s byte difference. And
+`sizeof(sigset_t) = 8` joins the ASSUMED layouts in `layouts.rs` — forced by `_KERNEL__NSIG = 64`
+rather than chosen, and the only write to a `sigset_t` in the whole runtime is bounded by it.
+
+### `pthread_getschedparam` answers, and the argument is that the answer is forced
+
+It reports `SCHED_OTHER` with a priority of **0** for a thread this instance created, and `ESRCH`
+for any other `pthread_t`. That is an answer rather than a plausible stub because of three facts,
+and the conclusion follows from them rather than from a preference:
+
+1. **Nothing in the reachable 188 can set a scheduling policy.** The set contains
+   `pthread_getschedparam`, `sched_getcpu` and `sched_yield`, and no `pthread_setschedparam`, no
+   `pthread_attr_setschedpolicy`, no `pthread_attr_setschedparam`, no `sched_setscheduler`, no
+   `setpriority`.
+2. So every thread in this guest's world has the policy it was created with, which is the
+   default, because nothing here changes a host thread's priority either. On Linux and Android
+   that default is `SCHED_OTHER` — `SCHED_NORMAL`, which is 0.
+3. `sched_priority` is not a choice under `SCHED_OTHER`: Linux's `sched_get_priority_min` and
+   `_max` for it are both 0, so the field has exactly one legal value.
+
+**The paragraph to invalidate is fact 1.** If a later phase binds a setter, this stops being an
+answer and becomes a lie, and it has to grow a real per-thread policy or become a refusal. Row
+`threads-B2` injects the over-correction — refusing it along with the signal family — because
+refusing it would stop a correct guest over a field it is only reading.
+
+### What a guest thread deliberately does not do, recorded rather than hidden
+
+**It does not run its `pthread_key` destructors when it exits.** Bionic does. Closing it needs a
+host → guest call from *outside* a thunk crossing, which is a boundary API that does not exist —
+every call into guest code today is made from inside a `ReentrantCall`, and a thread finishing
+its start routine is not inside one. The cost is a leak of whatever a guest frees from a key
+destructor, once per thread exit. It does not affect M3's gate, where the 3,594 initializers run
+on a thread that does not exit, and `pthread_exit` is not among the 188 at all.
+`CallThreads::detach_and_take_destructors` still returns an empty list and still has no caller.
+
+### A defect an independent review found in phase 3b's own test, and it is a correction to D23
+
+`the_arena_fits_in_one_commit_granule` ended with an `assert_eq!` restating `ARENA_BYTES`'s own
+definition character for character. **It cannot fail.** D23 claims that test "pins the total
+against the granule **and the four tables against the order the accessors assume**"; the first
+half is true and the second half was asserted nowhere. Dropping `POOL_BYTES` from `files_base()`,
+or swapping it with `dirents_base()`, left the whole workspace suite green while `fopen` handed
+out `FILE` objects on top of the pool's interned strings.
+
+`the_arena_tables_are_where_the_accessors_say_they_are` is the replacement: it walks the four
+bases **out of the accessors themselves**, checks each region starts exactly where the previous
+one ends and that the last ends exactly at the end of the arena, then allocates one `FILE` and
+one `dirent` through the only two allocators over those tables and checks each lands inside its
+own. Nothing in it restates the sum — extending the tautology to a fifth term would have
+reproduced the defect one term wider. Row `arena-A1`.
+
+This is the second time in this project a *total* has been consistent while its *membership* was
+not; the data-symbol list wrong by two in each direction (D21) was the first. It is why this
+phase derives its own symbol set as a set difference rather than trusting a count.
+
+**This phase added no per-thread arena state**, so the 256 bytes of granule headroom phase 3b left
+are untouched: the thread registry is host-side, and `pthread_create`, `pthread_join` and
+`pthread_getschedparam` write only into buffers the guest supplied.
+
+### A defect in the table this phase created, found by writing the test that produces it
+
+`ThreadTable` took the next block index from the map's **length**. That is exact for a table
+nothing is ever removed from, and until this phase nothing was — thread lifecycle is what removes
+one. Remove the entry holding index 1 from a table of three and the length is 2, so the next
+thread is handed index 2, **which is live**. Two guest threads would then share one `errno` cell
+and one `strerror` buffer, and the symptom would be an occasional wrong error number in a thread
+that did nothing wrong.
+
+Blocks come from a free list now, and the index is carried on the slot.
+`a_thread_that_exits_does_not_give_its_block_to_a_live_thread` is the detector, and it produces
+the collision rather than merely creating threads: two threads start, the **first** exits, a
+third starts while the second is still running, and the third's `errno` cell is compared with the
+second's. Verified as a detector before the row was written. Row `threads-A2`.
+
+### Three defects in this phase's own code, found by re-reading it before reporting
+
+Recorded because the *method* is the reusable part: each was found by reading the code again with
+the question "what does a guest-chosen number do here", not by a test failing.
+
+1. **`pthread_create` added to a guest-chosen address unchecked.** `at + ATTR_GUARD_SIZE` wraps
+   for an `attr` near the top of the address space and a **debug build panics** on it, which
+   Global Constraint 11 calls Critical. It was not reachable — the first field read
+   short-circuits for `attr == usize::MAX` — but that is an accident of ordering rather than a
+   defence, and the ordering is one edit away from changing. `checked_add` and a refusal now.
+2. **A failed stack unmap was swallowed** by a `let _ =`. It leaks the stack's address space and
+   commit charge for the life of the instance, and the thread that leaked it is the only thing
+   that knows. Recorded as a thread failure beside the outcome rather than instead of it.
+3. **`pthread_getschedparam` answered `ESRCH` for the main thread**, because the registry held
+   only threads `pthread_create` made. The wrong answer: the main thread is a thread of this
+   process with the same default policy, so facts 1-3 above apply to it identically, and a guest
+   asking about *itself* during initialisation — which is the ordinary use — would have taken an
+   error branch for no reason. It answers for any thread this instance has an identity for, and
+   the test asks about `pthread_self()` as well now.
+
+### Verification
+
+* `cargo test --workspace --release`: **1,092 passed, 0 failed, 13 ignored**, from 1,059 and 12.
+  The 33 new tests are **4** in `omni-bionic`'s lib (108 → 112), **3** in `omni-android`'s lib
+  (100 → 103), **1** in `omni-cpu`'s `seam` target (7 → 8) and **23** in `omni-android`'s
+  `bionic` target (91 → 114), plus the new `thread_memory` target, which contributes the
+  thirteenth **ignored** test and 2 passing ones that are the shared harness's own encoding
+  checks. `omni-android` and `omni-bionic` were also run in **debug**, per the working agreement
+  about overflow, and pass there — which is where `round_up`'s guest-supplied arithmetic is
+  checked, and where `pthread_create`'s newly-checked `attr` offset arithmetic would panic if it
+  were left as a bare `+`.
+* `tools/mutate.py`: **239 → 255 rows**, 16 new — 12 direction A and 4 direction B, and the new
+  rows are **16/16 caught** (signals 4/4, threads 9/9, watch 2/2, arena 1/1). **The whole table is run on the committed tree after this entry lands**, and the result is recorded in its own commit rather than predicted here.
+
+  **One row HUNG rather than failing, and that was a defect in the test.** `threads-B1` refuses
+  the first `pthread_detach`, which leaves the thread joinable — and
+  `detaching_twice_is_einval_and_joining_a_detached_thread_is_einval` opened its release gate
+  from the guest program *after* its own `pthread_join`. With the join blocking instead of
+  returning `EINVAL`, the program deadlocked against a gate it had not reached, and the harness
+  sat on that row for over half an hour. This project has recorded the same shape once before
+  ("two mutation rows hung instead of failing", task 2). A test that deadlocks under the defect
+  it exists to detect reports nothing at all. The gate is opened from the **host** now, once both
+  detaches have happened, and an `OpenOnDrop` guard releases every gate a test's guest threads
+  spin on **while a panic unwinds** — so a failing assertion no longer leaves a guest thread
+  spinning for the rest of the binary either. Every row now finishes in about eleven seconds.
+* Clippy clean on `--all-targets --release`, `cargo doc --workspace --no-deps` clean,
+  `cargo build --workspace --release --no-default-features` builds.
+* `cargo tree -p omni-bionic -e normal` is still one line (D19) — this phase put `sigfillset`
+  there and added no dependency — and `cargo tree -p omni-android -e normal` still has no
+  `dynarmic-sys`.
+* The portability invariant is re-verified: every `cfg(target_os)` mention outside `omni-platform`
+  is still a doc comment stating the rule or a `#![cfg(target_os = "windows")]` gate on a
+  Windows-only *test*. **This phase added none, and added no `omni-platform` surface at all.**
+
+**Nothing here is a claim about Linux or macOS.** Neither has been built for, let alone run.
+
+### Cost if wrong
+
+The expensive thing to get wrong is D13, because its symptom is a stack-check *termination* in a
+thread that did nothing wrong, on a schedule nobody controls — so it is asserted from real guest
+code reading its own thread pointer, and the guard is compared against the arena's rather than
+merely checked for being non-zero. The block-index collision is the next: it is silent by
+construction, and its detector produces the collision rather than exercising the code. The
+per-thread memory figure is the one that constrains the product rather than the code, and it is
+measured through the path the guest takes rather than one layer down.

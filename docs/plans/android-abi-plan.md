@@ -162,7 +162,7 @@ not exist yet.)
 | **Process and environment** — pid, environment block, auxv, sysconf/sysinfo, abort/exit, cpu id, random bytes | 13 `process-env` symbols. `getauxval` is where the **`AT_HWCAP` decision** lands — still open, both arms measured, see the blockers table |
 | **Sockets and polling** — socket, poll/select, getaddrinfo | 8 `network` symbols |
 | **A log sink** | `__android_log_print`, `syslog`, `openlog`, `closelog` |
-| **Threads** — spawn, join, detach, attributes, scheduling | the 9 lifecycle/scheduling symbols |
+| ~~**Threads** — spawn, join, detach, attributes, scheduling~~ — **this row was wrong and phase 3c is the correction**: `omni-platform` did **not** have to grow. A guest thread is `std::thread` (portable), an `omni-mem` mapping for its stack, and an `omni-cpu` context whose TLS block satisfies D13 by construction. No new platform primitive exists, so there is no `unsupported` arm to write either — and D22's other half says fabricating one would be a false claim in the other direction | the 9 lifecycle/scheduling symbols, **DONE** (D24) |
 
 **The five-target rule applies to every one of these.** When a platform primitive is added, add the
 Linux and macOS signatures **at the same time** as honest `unsupported` returns naming the POSIX call
@@ -191,13 +191,13 @@ rather than counts.
 
 **The authoritative remainder was 51** when this was written, independently derived twice
 (reachable 188 minus every symbol named in `bionic/handlers.rs` and `bionic/data.rs`). **Phase 3b
-closed the first row, so it is 22 now**, and the adapter's own test asserts that remainder as a set
-difference against the reachable file rather than as a total:
+closed the first row and phase 3c the second, so it is 14 now**, and the adapter's own test asserts
+that remainder as a set difference against the reachable file rather than as a total:
 
 | group | n | symbols |
 |---|---:|---|
 | ~~**3b** file-io~~ | ~~29~~ | **DONE** — phase 3b, D23. The list was re-derived twice before anything was written and is exactly the `file-io` bucket of the remainder, as a set rather than a count: `__open_2 __write_chk access close closedir fclose fdopen feof fflush fgets fileno fopen fputc fputs fread fstat fwrite lstat mkdir open opendir pread read readdir rename rmdir stat statvfs unlink` |
-| **3c** threads + signals | 8 | `pthread_create pthread_detach pthread_getschedparam pthread_join pthread_sigmask raise sigaction sigfillset` |
+| ~~**3c** threads + signals~~ | ~~8~~ | **DONE** — phase 3c, D24. Derived twice before anything was written, and it is exactly the plan's row: `pthread_create pthread_detach pthread_getschedparam pthread_join pthread_sigmask raise sigaction sigfillset`. Four answered, three refused by name (`sigaction`, `raise`, `pthread_sigmask`) and `sigfillset` implemented in `omni-bionic` because it is pure computation |
 | **3d** network | 8 | `eventfd freeaddrinfo gai_strerror getaddrinfo inet_ntop poll select socket` |
 | **3e** the remainder nothing else claims | 6 | `clock time mallinfo longjmp __gcov_dump __gcov_flush` |
 
