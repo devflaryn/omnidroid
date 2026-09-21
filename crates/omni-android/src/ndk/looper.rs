@@ -253,25 +253,28 @@ fn prepare(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
-/// The looper slot a guest `ALooper*` names, or a refusal naming the pointer.
-fn slot_for(ndk: &Ndk, c: &ImportCall<'_, '_>, looper: u64) -> AbiResult<usize> {
-    let at = GuestAddr::try_from(looper)
-        .ok()
-        .and_then(|at| ndk.slot_of(at))
-        .ok_or_else(|| {
-            refuse_inline(
-                c,
-                format!(
-                    "the guest passed {looper:#x} as an `ALooper *`, and this instance's loopers \
-                     live in {MAX_LOOPERS_TEXT}. An ALooper is opaque, so a pointer this layer did \
-                     not hand out is either a looper from another instance or a value the engine \
-                     computed -- and either way there is nothing here to operate on",
-                    MAX_LOOPERS_TEXT = "its own arena"
-                ),
-            )
-        })?;
+/// The guest `ALooper*` as a checked arena address, or a refusal naming the pointer.
+///
+/// **Checked rather than trusted.** The arena is divided into a range per handle kind, and
+/// `Slots::index_of` refuses a pointer that is inside a range but off a slot boundary — so an
+/// `AAsset *` passed where an `ALooper *` belongs, and a `looper + 4` the engine computed, are
+/// both refusals rather than lookups that happen to succeed.
+fn looper_at(ndk: &Ndk, c: &ImportCall<'_, '_>, looper: u64) -> AbiResult<GuestAddr> {
+    let at = GuestAddr::try_from(looper).unwrap_or(0);
     let state = ndk.state.lock();
-    if state.loopers[at].is_none() {
+    if state.loopers.index_of(at).is_none() {
+        return Err(refuse_inline(
+            c,
+            format!(
+                "the guest passed {looper:#x} as an `ALooper *`, and this instance's loopers live \
+                 in their own range of its arena. An ALooper is opaque, so a pointer this layer \
+                 did not hand out is a handle of another kind, a looper from another instance, or \
+                 a value the engine computed -- and there is nothing here to operate on in any of \
+                 those cases"
+            ),
+        ));
+    }
+    if state.loopers.get(at).is_none() {
         return Err(refuse_inline(
             c,
             format!("the guest passed {looper:#x} as an `ALooper *`, and that slot is not live"),
@@ -285,15 +288,15 @@ fn acquire(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let looper = c.args().next_u64()?;
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_acquire");
-    let slot = slot_for(&ndk, c, looper)?;
+    let at = looper_at(&ndk, c, looper)?;
     let mut state = ndk.state.lock();
     let thread = Ndk::thread_index(&mut state);
     let references = {
-        let entry = state.loopers[slot].as_mut().expect("the slot was checked live");
+        let entry = state.loopers.get_mut(at).expect("the slot was checked live");
         entry.references += 1;
         entry.references
     };
-    state.record(looper as GuestAddr, thread, "acquire", format!("references now {references}"));
+    state.record(at, thread, "acquire", format!("references now {references}"));
     Ok(())
 }
 
@@ -315,11 +318,11 @@ fn release(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let looper = c.args().next_u64()?;
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_release");
-    let slot = slot_for(&ndk, c, looper)?;
+    let at = looper_at(&ndk, c, looper)?;
     let mut state = ndk.state.lock();
     let thread = Ndk::thread_index(&mut state);
     let references = {
-        let entry = state.loopers[slot].as_mut().expect("the slot was checked live");
+        let entry = state.loopers.get_mut(at).expect("the slot was checked live");
         entry.references -= 1;
         entry.references
     };
@@ -328,16 +331,11 @@ fn release(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         // The last reference, including the one creation made. The thread's own binding goes
         // with it, so a later `ALooper_forThread` on that thread answers NULL -- which is what a
         // device does and is the condition §8.1's fourth failure mode is about.
-        state.loopers[slot] = None;
-        state.by_thread.retain(|_, held| *held != slot);
-        state.record(looper as GuestAddr, thread, "release", "destroyed".to_string());
+        state.loopers.remove(at);
+        state.by_thread.retain(|_, held| *held != at);
+        state.record(at, thread, "release", "destroyed".to_string());
     } else {
-        state.record(
-            looper as GuestAddr,
-            thread,
-            "release",
-            format!("references now {references}"),
-        );
+        state.record(at, thread, "release", format!("references now {references}"));
     }
     Ok(())
 }
@@ -359,7 +357,7 @@ fn add_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_addFd");
-    let slot = slot_for(&ndk, c, looper)?;
+    let at = looper_at(&ndk, c, looper)?;
 
     if fd < 0 {
         return Err(refuse_inline(c, format!("`ALooper_addFd` was given fd {fd}")));
@@ -415,7 +413,7 @@ fn add_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
     let mut state = ndk.state.lock();
     let thread = Ndk::thread_index(&mut state);
-    let entry = state.loopers[slot].as_mut().expect("the slot was checked live");
+    let entry = state.loopers.get_mut(at).expect("the slot was checked live");
     if entry.opts & ALOOPER_PREPARE_ALLOW_NON_CALLBACKS == 0 && callback == 0 {
         return Err(AbiError::Refused {
             symbol: c.symbol().to_string(),
@@ -447,7 +445,7 @@ fn add_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     entry.fds.push(stored);
     state.record(
-        looper as GuestAddr,
+        at,
         thread,
         "addFd",
         format!("fd {fd} ident {ident} events {events:#x} callback {callback:#x} data {data:#x}"),
@@ -468,15 +466,15 @@ fn remove_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_removeFd");
-    let slot = slot_for(&ndk, c, looper)?;
+    let at = looper_at(&ndk, c, looper)?;
     let mut state = ndk.state.lock();
     let thread = Ndk::thread_index(&mut state);
-    let entry = state.loopers[slot].as_mut().expect("the slot was checked live");
+    let entry = state.loopers.get_mut(at).expect("the slot was checked live");
     let before = entry.fds.len();
     entry.fds.retain(|held| held.fd != fd);
     let removed = before != entry.fds.len();
     state.record(
-        looper as GuestAddr,
+        at,
         thread,
         "removeFd",
         format!("fd {fd}: {}", if removed { "removed" } else { "was not watched" }),
@@ -531,7 +529,6 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         c.ret(|mut r| r.i32(ALOOPER_POLL_ERROR));
         return Ok(());
     };
-    let slot = ndk.slot_of(looper).expect("a looper this instance handed out");
 
     let budget = if timeout_millis < 0 {
         return Err(refuse_reentrant(
@@ -584,7 +581,7 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         let seen = fs.ready_generation();
         let pass = {
             let state = ndk.state.lock();
-            let entry = state.loopers[slot].as_ref().expect("the slot was checked live");
+            let entry = state.loopers.get(looper).expect("the slot was checked live");
             let mut callbacks = Vec::new();
             let mut ident = None;
             for held in &entry.fds {
@@ -723,7 +720,7 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 );
                 if returned == 0 {
                     // The NDK's documented contract: a callback returning 0 asks to be removed.
-                    let entry = state.loopers[slot].as_mut().expect("the slot was checked live");
+                    let entry = state.loopers.get_mut(looper).expect("the slot was checked live");
                     entry.fds.retain(|held| held.fd != fd);
                 }
             }

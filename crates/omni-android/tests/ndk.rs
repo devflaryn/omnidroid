@@ -23,9 +23,13 @@ use std::sync::Arc;
 use harness::a64::*;
 use harness::{serialized, Asm, Guest, BUDGET};
 use omni_android::bionic::{Bionic, ThreadHost};
+use omni_android::jni::Jni;
+use omni_android::ndk::assets::{AssetTable, ASSET_MANAGER_CLASS};
+use omni_android::ndk::config::{ACONFIGURATION_SCREENSIZE_LARGE, ACONFIGURATION_SCREENSIZE_NORMAL};
 use omni_android::ndk::{
-    Ndk, ALOOPER_EVENT_HANGUP, ALOOPER_EVENT_INPUT, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK,
-    ALOOPER_POLL_ERROR, ALOOPER_POLL_TIMEOUT, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS, MAX_LOOPERS,
+    DeviceConfiguration, Ndk, ScreenSize, ACONFIGURATION_NAVHIDDEN_NO, ALOOPER_EVENT_HANGUP,
+    ALOOPER_EVENT_INPUT, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK, ALOOPER_POLL_ERROR,
+    ALOOPER_POLL_TIMEOUT, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS, MAX_LOOPERS, MAX_OPEN_ASSETS,
 };
 use omni_android::{AbiError, Boundary};
 use omni_cpu::ExitReason;
@@ -34,6 +38,7 @@ use omni_cpu::ExitReason;
 struct Fixture {
     guest: Guest,
     bionic: Arc<Bionic>,
+    jni: Arc<Jni>,
     ndk: Arc<Ndk>,
     boundary: Arc<Boundary>,
     _root: Scratch,
@@ -63,16 +68,18 @@ fn fixture(tag: &str) -> Fixture {
     let guest = Guest::new();
     let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
     let ndk = Ndk::new(Arc::clone(&guest.space)).expect("an NDK instance");
-    let builder = guest.boundary(320);
+    let jni = Jni::new(Arc::clone(&guest.space)).expect("a JNI instance");
+    let builder = guest.boundary(640);
     bionic.bind_into(&builder).expect("bind every bionic handler");
     ndk.bind_into(&builder).expect("bind every NDK handler");
+    jni.install_into(&builder).expect("install the JNI tables");
     bionic.set_log_to_stderr(false);
     let root = Scratch::new(tag);
     bionic.set_filesystem_root(&root.0).expect("a filesystem root");
     let host: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&guest.backend) as _;
     bionic.set_thread_host(ThreadHost::new(host)).expect("a thread host");
     let boundary = builder.finish();
-    Fixture { guest, bionic, ndk, boundary, _root: root }
+    Fixture { guest, bionic, jni, ndk, boundary, _root: root }
 }
 
 impl Fixture {
@@ -83,6 +90,7 @@ impl Fixture {
     /// Run a program with **all three** instances published to this thread.
     fn run(&self, entry: omni_cpu::GuestAddr) -> Result<ExitReason, AbiError> {
         let _bionic = self.bionic.activate().expect("publish the bionic instance");
+        let _jni = self.jni.activate().expect("publish the JNI instance");
         let _ndk = self.ndk.activate();
         let mut cpu = self.guest.thread(&self.boundary);
         self.boundary.run(&mut cpu, entry, BUDGET)
@@ -748,4 +756,482 @@ fn an_ndk_handler_without_an_activation_refuses_and_names_the_setup_call() {
     };
     assert!(matches!(error, AbiError::NdkNotActive { .. }), "{error:?}");
     assert!(error.to_string().contains("Ndk::activate"), "{error}");
+}
+
+// =================================================================== AAssetManager and AAsset
+
+/// The `DeviceConfiguration` these tests decide on. Every field is a *decision*, which is the
+/// whole point of there being no default — see `ndk::config`.
+fn a_configuration() -> DeviceConfiguration {
+    DeviceConfiguration {
+        language: *b"en",
+        country: *b"GB",
+        screen_width_dp: 411,
+        screen_height_dp: 731,
+        screen_size: ScreenSize::Normal,
+        nav_hidden: ACONFIGURATION_NAVHIDDEN_NO,
+    }
+}
+
+/// A fixture with assets and a decided configuration, and the `jobject` that stands for the Java
+/// `AssetManager` step 13 is handed.
+fn with_assets(tag: &str) -> (Fixture, u64) {
+    let f = fixture(tag);
+    f.ndk
+        .set_asset_source(omni_android::ndk::assets::source(
+            AssetTable::new()
+                .with("shaders/blit.vert", &b"#version 320 es"[..])
+                .with("empty.bin", Vec::new()),
+        ))
+        .expect("an asset source");
+    f.ndk.set_configuration(a_configuration());
+    let object = f.jni.new_object(ASSET_MANAGER_CLASS).expect("a Java AssetManager");
+    (f, object)
+}
+
+/// Read `len` bytes out of guest memory.
+fn read_bytes(f: &Fixture, at: omni_cpu::GuestAddr, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|offset| {
+            let address = at + offset;
+            (f.guest.read_u64(address & !7) >> (8 * (address & 7))) as u8
+        })
+        .collect()
+}
+
+/// **`AAssetManager_fromJava` checks the `jobject` is really an `AssetManager`.**
+///
+/// Accepting any non-null value would turn a wrong argument — a `Configuration`, a stale handle —
+/// into an asset manager that answers null for every asset, thousands of instructions from the
+/// mistake. Asked twice with the same object it returns the **same** manager, which is what a
+/// device does.
+#[test]
+fn asset_manager_from_java_checks_the_class_and_is_idempotent() {
+    let _guard = serialized();
+    let (f, object) = with_assets("from-java");
+
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    assert_ne!(manager, 0, "a real AAssetManager");
+    assert_eq!(f.ndk.live_asset_managers(), 1);
+
+    let again = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    assert_eq!(again, manager, "the same jobject gets the same manager");
+    assert_eq!(f.ndk.live_asset_managers(), 1, "and no second one is made");
+
+    // A `jobject` of another class.
+    let wrong = f.jni.new_object("android/content/res/Configuration").expect("a Configuration");
+    let error = f.refusal_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, wrong);
+    });
+    assert!(error.to_string().contains("Configuration"), "the refusal names the class: {error}");
+
+    // A handle nobody issued, and a null.
+    let error = f.refusal_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0xdead_beef);
+    });
+    assert!(error.to_string().contains("live jobject"), "{error}");
+    let error = f.refusal_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+    });
+    assert!(error.to_string().contains("null"), "{error}");
+}
+
+/// **An instance with no asset source refuses by name and says which call supplies one.**
+#[test]
+fn an_instance_with_no_asset_source_refuses_and_names_the_setter() {
+    let _guard = serialized();
+    let f = fixture("no-assets");
+    assert!(!f.ndk.has_asset_source());
+    let object = f.jni.new_object(ASSET_MANAGER_CLASS).expect("a Java AssetManager");
+    let error = f.refusal_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    assert_eq!(error.symbol(), Some("AAssetManager_fromJava"));
+    assert!(error.to_string().contains("Ndk::set_asset_source"), "{error}");
+}
+
+/// **An asset opens, reports its length, reads in pieces, and ends at end of file.**
+#[test]
+fn an_asset_opens_reads_in_pieces_and_ends_at_end_of_file() {
+    let _guard = serialized();
+    let (f, object) = with_assets("read");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"shaders/blit.vert\0");
+    let asset = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 2); // AASSET_MODE_STREAMING
+    });
+    assert_ne!(asset, 0, "the asset is in the table, so it opens");
+    assert_eq!(f.ndk.live_assets(), 1);
+
+    let length = f.value_of("AAsset_getLength", |asm| {
+        asm.mov(0, asset);
+    });
+    assert_eq!(length as i64, 15, "\"#version 320 es\" is fifteen bytes");
+
+    // Four bytes, then the rest, then end of file. **In pieces on purpose**: a handler that
+    // ignored its own position would answer the first four bytes every time and every count
+    // would still look right.
+    let buffer = f.guest.data + 0x200;
+    f.guest.write_u64(buffer, 0x5A5A_5A5A_5A5A_5A5A);
+    let read = f.value_of("AAsset_read", |asm| {
+        asm.mov(0, asset);
+        asm.mov(1, buffer as u64);
+        asm.mov(2, 4);
+    });
+    assert_eq!(read as i64, 4);
+    assert_eq!(&read_bytes(&f, buffer, 4), b"#ver");
+
+    let read = f.value_of("AAsset_read", |asm| {
+        asm.mov(0, asset);
+        asm.mov(1, buffer as u64);
+        asm.mov(2, 64);
+    });
+    assert_eq!(read as i64, 11, "the rest, not the whole asset again");
+    assert_eq!(&read_bytes(&f, buffer, 11), b"sion 320 es");
+
+    let read = f.value_of("AAsset_read", |asm| {
+        asm.mov(0, asset);
+        asm.mov(1, buffer as u64);
+        asm.mov(2, 64);
+    });
+    assert_eq!(read as i64, 0, "end of file");
+
+    let entry = f.program_calling("AAsset_close", |asm| {
+        asm.mov(0, asset);
+    });
+    assert!(matches!(f.run(entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.ndk.live_assets(), 0);
+}
+
+/// **An asset that is not there is a null, not a refusal.** The engine probes for optional
+/// content, and "there is no such asset" is an ordinary answer every caller branches on.
+#[test]
+fn an_asset_that_is_not_there_is_null() {
+    let _guard = serialized();
+    let (f, object) = with_assets("missing");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"nope/not-here.bin\0");
+    let asset = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 3);
+    });
+    assert_eq!(asset, 0, "null, and the call did not fail");
+    assert_eq!(f.ndk.live_assets(), 0, "and nothing was allocated for it");
+}
+
+/// **`AAsset_getBuffer` maps the bytes where the guest can read them, once, read-only.**
+///
+/// The assertion is that the **guest** can load bytes out of the returned pointer — through real
+/// translated code — because "returns a plausible address" is exactly what a stub would do.
+#[test]
+fn asset_get_buffer_maps_the_bytes_once_and_the_guest_can_read_them() {
+    let _guard = serialized();
+    let (f, object) = with_assets("buffer");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"shaders/blit.vert\0");
+    let asset = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 3);
+    });
+
+    let buffer = f.value_of("AAsset_getBuffer", |asm| {
+        asm.mov(0, asset);
+    });
+    assert_ne!(buffer, 0, "a real pointer");
+    let again = f.value_of("AAsset_getBuffer", |asm| {
+        asm.mov(0, asset);
+    });
+    assert_eq!(again, buffer, "the same pointer every time: that is what makes it safe to store");
+
+    // **The guest reads it**, which is the only assertion that distinguishes a mapping from a
+    // number: `memcmp` against the expected text, through the boundary.
+    let expected = f.guest.data + 0x300;
+    f.guest.write_bytes(expected, b"#version 320 es");
+    let same = f.value_of("memcmp", |asm| {
+        asm.mov(0, buffer);
+        asm.mov(1, expected as u64);
+        asm.mov(2, 15);
+    });
+    assert_eq!(same as i64, 0, "the mapped bytes are the asset's bytes");
+
+    // A zero-length asset maps nothing and answers NULL, which is the NDK's answer and not an
+    // error: the caller has already learned the length is zero.
+    f.guest.write_bytes(name, b"empty.bin\0");
+    let empty = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 3);
+    });
+    assert_ne!(empty, 0, "an empty asset still opens");
+    assert_eq!(
+        f.value_of("AAsset_getLength", |asm| {
+            asm.mov(0, empty);
+        }) as i64,
+        0
+    );
+    assert_eq!(
+        f.value_of("AAsset_getBuffer", |asm| {
+            asm.mov(0, empty);
+        }),
+        0,
+        "and its buffer is NULL rather than a mapping of nothing"
+    );
+}
+
+/// **`AAsset_openFileDescriptor` refuses, and the refusal explains the measurement behind it.**
+#[test]
+fn asset_open_file_descriptor_refuses_because_every_entry_is_deflated() {
+    let _guard = serialized();
+    let (f, _object) = with_assets("fd");
+    let error = f.refusal_of("AAsset_openFileDescriptor", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+    });
+    assert_eq!(error.symbol(), Some("AAsset_openFileDescriptor"));
+    let text = error.to_string();
+    assert!(text.contains("DEFLATED"), "{text}");
+    assert!(text.contains("AAsset_read"), "it must name the fallback: {text}");
+}
+
+/// The open-asset ceiling answers **null**, which is how a device reports failing to open one.
+#[test]
+fn the_open_asset_ceiling_answers_null() {
+    let _guard = serialized();
+    let (f, object) = with_assets("asset-ceiling");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"shaders/blit.vert\0");
+    for index in 0..MAX_OPEN_ASSETS {
+        let asset = f.value_of("AAssetManager_open", |asm| {
+            asm.mov(0, manager);
+            asm.mov(1, name as u64);
+            asm.mov(2, 3);
+        });
+        assert_ne!(asset, 0, "open {index} must succeed");
+    }
+    assert_eq!(f.ndk.live_assets(), MAX_OPEN_ASSETS);
+    let past = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 3);
+    });
+    assert_eq!(past, 0, "the cap is a null, not a refusal");
+}
+
+// =================================================================== AConfiguration
+
+/// **A configuration is empty until `fromAssetManager` fills it, and reading an empty one
+/// refuses.**
+///
+/// Answering zero would be this layer inventing "language `\0\0`, screen size ANY" — a
+/// legal-looking configuration the engine would act on. On a device `AConfiguration_new` gives
+/// back whatever the allocator left.
+#[test]
+fn a_configuration_is_empty_until_it_is_filled_and_reading_an_empty_one_refuses() {
+    let _guard = serialized();
+    let (f, object) = with_assets("config");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+
+    let config = f.value_of("AConfiguration_new", |_asm| {});
+    assert_ne!(config, 0);
+    assert_eq!(f.ndk.live_configurations(), 1);
+
+    let error = f.refusal_of("AConfiguration_getScreenWidthDp", |asm| {
+        asm.mov(0, config);
+    });
+    assert!(error.to_string().contains("never filled"), "{error}");
+
+    let entry = f.program_calling("AConfiguration_fromAssetManager", |asm| {
+        asm.mov(0, config);
+        asm.mov(1, manager);
+    });
+    assert!(matches!(f.run(entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(
+        f.value_of("AConfiguration_getScreenWidthDp", |asm| {
+            asm.mov(0, config);
+        }) as i64,
+        411
+    );
+    assert_eq!(
+        f.value_of("AConfiguration_getScreenHeightDp", |asm| {
+            asm.mov(0, config);
+        }) as i64,
+        731
+    );
+    assert_eq!(
+        f.value_of("AConfiguration_getScreenSize", |asm| {
+            asm.mov(0, config);
+        }) as i64,
+        i64::from(ACONFIGURATION_SCREENSIZE_NORMAL)
+    );
+    assert_eq!(
+        f.value_of("AConfiguration_getNavHidden", |asm| {
+            asm.mov(0, config);
+        }) as i64,
+        i64::from(ACONFIGURATION_NAVHIDDEN_NO)
+    );
+
+    // **Two bytes, unterminated.** The header says `char out[2]`; a third byte — even a NUL —
+    // writes past the object the caller gave, so the sentinel after the pair must survive.
+    let out = f.guest.data + 0x300;
+    f.guest.write_u64(out, 0x5A5A_5A5A_5A5A_5A5A);
+    let entry = f.program_calling("AConfiguration_getLanguage", |asm| {
+        asm.mov(0, config);
+        asm.mov(1, out as u64);
+    });
+    assert!(matches!(f.run(entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(&read_bytes(&f, out, 2), b"en");
+    assert_eq!(read_bytes(&f, out + 2, 1)[0], 0x5A, "the third byte is untouched");
+
+    f.guest.write_u64(out, 0x5A5A_5A5A_5A5A_5A5A);
+    let entry = f.program_calling("AConfiguration_getCountry", |asm| {
+        asm.mov(0, config);
+        asm.mov(1, out as u64);
+    });
+    assert!(matches!(f.run(entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(&read_bytes(&f, out, 2), b"GB");
+    assert_eq!(read_bytes(&f, out + 2, 1)[0], 0x5A, "the third byte is untouched");
+
+    // **A copy, not a reference.** A device's configuration changing does not change one the
+    // guest already holds, which is why `onConfigurationChanged` exists.
+    f.ndk.set_configuration(DeviceConfiguration {
+        screen_width_dp: 1_280,
+        screen_size: ScreenSize::Large,
+        ..a_configuration()
+    });
+    assert_eq!(
+        f.value_of("AConfiguration_getScreenWidthDp", |asm| {
+            asm.mov(0, config);
+        }) as i64,
+        411,
+        "the configuration the guest holds does not change under it"
+    );
+
+    // Re-reading through `fromAssetManager` is how a guest on a device picks up the change.
+    let entry = f.program_calling("AConfiguration_fromAssetManager", |asm| {
+        asm.mov(0, config);
+        asm.mov(1, manager);
+    });
+    assert!(matches!(f.run(entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(
+        f.value_of("AConfiguration_getScreenWidthDp", |asm| {
+            asm.mov(0, config);
+        }) as i64,
+        1_280
+    );
+    assert_eq!(
+        f.value_of("AConfiguration_getScreenSize", |asm| {
+            asm.mov(0, config);
+        }) as i64,
+        i64::from(ACONFIGURATION_SCREENSIZE_LARGE)
+    );
+
+    let entry = f.program_calling("AConfiguration_delete", |asm| {
+        asm.mov(0, config);
+    });
+    assert!(matches!(f.run(entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.ndk.live_configurations(), 0);
+    // A second delete finds nothing, and says so rather than making a double delete invisible.
+    let error = f.refusal_of("AConfiguration_delete", |asm| {
+        asm.mov(0, config);
+    });
+    assert!(error.to_string().contains("not a live"), "{error}");
+}
+
+/// **An instance whose configuration nobody decided refuses by name.**
+#[test]
+fn an_undecided_configuration_refuses_and_names_the_setter() {
+    let _guard = serialized();
+    let f = fixture("undecided");
+    f.ndk
+        .set_asset_source(omni_android::ndk::assets::source(AssetTable::new()))
+        .expect("an asset source");
+    assert_eq!(f.ndk.configuration(), None);
+    let object = f.jni.new_object(ASSET_MANAGER_CLASS).expect("a Java AssetManager");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let config = f.value_of("AConfiguration_new", |_asm| {});
+    let error = f.refusal_of("AConfiguration_fromAssetManager", |asm| {
+        asm.mov(0, config);
+        asm.mov(1, manager);
+    });
+    assert_eq!(error.symbol(), Some("AConfiguration_fromAssetManager"));
+    assert!(error.to_string().contains("Ndk::set_configuration"), "{error}");
+}
+
+/// **Handles of different kinds are not interchangeable**, although they all live in one arena.
+///
+/// The check that makes this true is `Slots::index_of`, which is per-kind: each family has its own
+/// range. Without it an `AConfiguration *` passed where an `AAssetManager *` belongs would index a
+/// table it does not belong to.
+#[test]
+fn a_handle_of_one_kind_is_refused_where_another_belongs() {
+    let _guard = serialized();
+    let (f, object) = with_assets("kinds");
+    let looper = f.prepare();
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let config = f.value_of("AConfiguration_new", |_asm| {});
+    assert!(looper != manager && manager != config, "three distinct identities");
+
+    // A looper where an asset manager belongs.
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"shaders/blit.vert\0");
+    let error = f.refusal_of("AAssetManager_open", |asm| {
+        asm.mov(0, looper);
+        asm.mov(1, name as u64);
+        asm.mov(2, 3);
+    });
+    assert!(error.to_string().contains("did not hand that out"), "{error}");
+
+    // A configuration where a looper belongs.
+    let error = f.refusal_of("ALooper_acquire", |asm| {
+        asm.mov(0, config);
+    });
+    assert!(error.to_string().contains("ALooper"), "{error}");
+
+    // An asset manager where a configuration belongs.
+    let error = f.refusal_of("AConfiguration_getScreenSize", |asm| {
+        asm.mov(0, manager);
+    });
+    assert!(error.to_string().contains("did not hand that out"), "{error}");
 }

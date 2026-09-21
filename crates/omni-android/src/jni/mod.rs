@@ -528,6 +528,28 @@ impl Jni {
         self.state.lock().registry.class_name(class).to_string()
     }
 
+    /// The declared class of the **instance** a `jobject` names, or `None`.
+    ///
+    /// `None` for a handle this instance did not issue, for one that has been deleted, and for an
+    /// object that is not an instance — a `jclass`, a `String`, an array. Those are all "not an
+    /// instance of the class you asked about", which is the only question a caller of this has.
+    ///
+    /// Added for `AAssetManager_fromJava`, which is handed a `jobject` and must establish that it
+    /// really is an `android.content.res.AssetManager`: accepting any non-null value would turn a
+    /// wrong argument into an asset manager that answers null for every asset, thousands of
+    /// instructions from the mistake.
+    #[must_use]
+    pub fn instance_class_name(&self, handle: u64) -> Option<String> {
+        let state = self.state.lock();
+        let object = state.handles.object("Jni::instance_class_name", self.arena, handle).ok()?;
+        match object {
+            refs::Object::Instance { class, .. } => {
+                Some(state.registry.class_name(*class).to_string())
+            }
+            _ => None,
+        }
+    }
+
     /// Record one upcall. See [`JniState::record`].
     pub(crate) fn record_call(
         &self,

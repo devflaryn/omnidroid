@@ -586,6 +586,18 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: WINDOW_INSETS_TYPE,
         fields: NONE,
     },
+    // **`AssetManager` has no members and that is the whole of it.** §8 step 13 receives one as an
+    // argument, takes a global reference to it and hands it to `AAssetManager_fromJava`; nothing
+    // on the startup path calls a method on it from native code. It is declared so that the host
+    // can *build* one — `Jni::new_object` refuses a class nobody declared — and so that
+    // `AAssetManager_fromJava` can check that what it was given really is one, rather than turning
+    // a wrong argument into an asset manager that answers null for every asset.
+    ClassSpec {
+        name: "android/content/res/AssetManager",
+        tier: Tier::Zero,
+        methods: NONE,
+        fields: NONE,
+    },
     ClassSpec {
         name: "android/content/res/Configuration",
         tier: Tier::Zero,
