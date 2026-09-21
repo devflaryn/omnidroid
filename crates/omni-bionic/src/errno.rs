@@ -18,6 +18,8 @@ pub mod consts {
     pub const ENOENT: i32 = 2;
     /// Interrupted system call.
     pub const EINTR: i32 = 4;
+    /// Input/output error.
+    pub const EIO: i32 = 5;
     /// Bad file descriptor.
     pub const EBADF: i32 = 9;
     /// Cannot allocate memory.
@@ -29,6 +31,22 @@ pub mod consts {
     pub const EAGAIN: i32 = 11;
     /// Device or resource busy: pthread_mutex_trylock on a held mutex.
     pub const EBUSY: i32 = 16;
+    /// File exists: `open(O_CREAT|O_EXCL)` on a path that is already there, `mkdir` twice.
+    pub const EEXIST: i32 = 17;
+    /// Not a directory: a path component that had to be one is not.
+    pub const ENOTDIR: i32 = 20;
+    /// Is a directory: `unlink` or `read` on one.
+    pub const EISDIR: i32 = 21;
+    /// Too many open files in this process: the descriptor ceiling.
+    pub const EMFILE: i32 = 24;
+    /// File too large.
+    pub const EFBIG: i32 = 27;
+    /// No space left on device.
+    pub const ENOSPC: i32 = 28;
+    /// Illegal seek: an offset operation on a pipe or a standard stream.
+    pub const ESPIPE: i32 = 29;
+    /// Read-only filesystem.
+    pub const EROFS: i32 = 30;
     /// Invalid argument.
     pub const EINVAL: i32 = 22;
     /// Numerical argument out of domain.
@@ -37,8 +55,16 @@ pub mod consts {
     pub const ERANGE: i32 = 34;
     /// Resource deadlock avoided: ERRORCHECK relock by the owner.
     pub const EDEADLK: i32 = 35;
+    /// File name too long: past `PATH_MAX` or `NAME_MAX`.
+    pub const ENAMETOOLONG: i32 = 36;
     /// Function not implemented.
     pub const ENOSYS: i32 = 38;
+    /// Directory not empty: `rmdir` on a directory that still has entries.
+    pub const ENOTEMPTY: i32 = 39;
+    /// Too many levels of symbolic links.
+    pub const ELOOP: i32 = 40;
+    /// Value too large for the defined data type.
+    pub const EOVERFLOW: i32 = 75;
     /// Operation not supported (Linux: 95 on most architectures; arm64 uses the
     /// asm-generic numbering where ENOTSUP == EOPNOTSUPP == 95).
     pub const ENOTSUP: i32 = 95;
@@ -77,17 +103,30 @@ mod tests {
         assert_eq!(EPERM, 1);
         assert_eq!(ENOENT, 2);
         assert_eq!(EINTR, 4);
+        assert_eq!(EIO, 5);
         assert_eq!(EBADF, 9);
         assert_eq!(EAGAIN, 11, "EAGAIN == EWOULDBLOCK == 11 on Linux");
         assert_eq!(ENOMEM, 12);
         assert_eq!(EACCES, 13);
         assert_eq!(EBUSY, 16);
+        assert_eq!(EEXIST, 17);
+        assert_eq!(ENOTDIR, 20);
+        assert_eq!(EISDIR, 21);
+        assert_eq!(EMFILE, 24);
+        assert_eq!(EFBIG, 27);
+        assert_eq!(ENOSPC, 28);
+        assert_eq!(ESPIPE, 29);
+        assert_eq!(EROFS, 30);
         assert_eq!(EINVAL, 22);
         assert_eq!(EDOM, 33);
         assert_eq!(ERANGE, 34);
         // errno.h
         assert_eq!(EDEADLK, 35);
+        assert_eq!(ENAMETOOLONG, 36);
         assert_eq!(ENOSYS, 38);
+        assert_eq!(ENOTEMPTY, 39);
+        assert_eq!(ELOOP, 40);
+        assert_eq!(EOVERFLOW, 75, "the file-io group's own, added in phase 3b");
         assert_eq!(ENOTSUP, 95, "ENOTSUP == EOPNOTSUPP == 95 in the asm-generic numbering");
         assert_eq!(ETIMEDOUT, 110, "the LINUX value; Windows' ERROR_SEM_TIMEOUT is 121");
         assert_eq!(EOWNERDEAD, 130);
@@ -101,8 +140,10 @@ mod tests {
     #[test]
     fn the_errno_values_are_all_distinct() {
         let all = [
-            EPERM, ENOENT, EINTR, EBADF, EAGAIN, ENOMEM, EACCES, EBUSY, EINVAL, EDOM, ERANGE,
-            EDEADLK, ENOSYS, ENOTSUP, ETIMEDOUT, EOWNERDEAD, ENOTRECOVERABLE,
+            EPERM, ENOENT, EINTR, EIO, EBADF, EAGAIN, ENOMEM, EACCES, EBUSY, EEXIST, ENOTDIR,
+            EISDIR, EMFILE, EFBIG, ENOSPC, ESPIPE, EROFS, EINVAL, EDOM, ERANGE, EDEADLK,
+            ENAMETOOLONG, ENOSYS, ENOTEMPTY, ELOOP, EOVERFLOW, ENOTSUP, ETIMEDOUT, EOWNERDEAD,
+            ENOTRECOVERABLE,
         ];
         let mut sorted = all.to_vec();
         sorted.sort_unstable();

@@ -77,6 +77,7 @@ pub mod printf;
 pub mod rwlock;
 pub mod sem;
 pub mod sort;
+pub mod stdio;
 pub mod string;
 pub mod threads;
 pub mod time;
