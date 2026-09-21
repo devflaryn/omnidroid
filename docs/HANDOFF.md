@@ -140,7 +140,7 @@ Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-pl
   **D20**. Phase 2, commits `9878e79`..`4545ef5`: the `dl*` family, the guest-memory group and all 18 data
   objects — **114 of the 188** now covered (96 thunk functions + 18 data objects), 30 new tests,
   mutation **155 → 175** (20 new, 20/20 caught after one MISS was closed). Durable record is
-  **D21**. Phase 3a, commits `21b712d`..`f2d02f7`: **`omni-platform` grew past `vm` and `fault` for
+  **D21**. Phase 3a, commits `21b712d`..`a27bb00`: **`omni-platform` grew past `vm` and `fault` for
   the first time** (`clock`, `process`, `log`), plus `gmtime_r`'s calendar arithmetic in
   `omni-bionic` and the 23 clock / process-environment / logging symbols over them — **137 of the
   188** now covered (119 thunk functions + 18 data objects), 16 new adapter tests and 9 new
