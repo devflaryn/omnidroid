@@ -3171,6 +3171,62 @@ fn gmtime_r_breaks_a_real_timestamp_down_into_the_guest_struct_tm() {
     );
 }
 
+/// **`gmtime` answers into this thread's own `struct tm`, and it is not the scratch buffer.**
+///
+/// The non-reentrant spelling returns a pointer to storage the library owns. M4's gate found it
+/// missing, and it has to agree with `gmtime_r` on the one case where the two could drift: a year
+/// that does not fit `int tm_year` is NULL with `EOVERFLOW`, not a wrapped date.
+///
+/// The last part is what makes the per-thread block's split load-bearing: `strerror` and `gmtime`
+/// both hand back a pointer the guest may hold, so a `gmtime` between a `strerror` and the
+/// guest's read of it must not rewrite the message.
+#[test]
+fn gmtime_answers_into_per_thread_storage_that_strerror_does_not_share() {
+    let _guard = serialized();
+    let f = fixture();
+    let timer = f.guest.data + 0x200;
+    // 2000-02-29T12:00:00Z, as `gmtime_r`'s test uses, so the two are compared on one date.
+    f.guest.write_u64(timer, 951_825_600);
+
+    let returned = value_of(&f, "gmtime", |asm| {
+        asm.mov(0, timer as u64);
+    });
+    assert_ne!(returned, 0, "gmtime returns a pointer to storage it owns");
+    let at = returned as omni_cpu::GuestAddr;
+    assert_eq!(read_i32(&f, at + 8), 12, "tm_hour");
+    assert_eq!(read_i32(&f, at + 12), 29, "tm_mday");
+    assert_eq!(read_i32(&f, at + 16), 1, "tm_mon is 0-based, so February is 1");
+    assert_eq!(read_i32(&f, at + 20), 100, "tm_year is years since 1900");
+    assert_eq!(read_i32(&f, at + 24), 2, "2000-02-29 was a Tuesday");
+    let zone = f.guest.read_u64(at + 48) as omni_cpu::GuestAddr;
+    assert_eq!(f.read_cstring(zone), b"UTC");
+
+    // The same answer `gmtime_r` gives for a year that will not fit, which is the one case the
+    // two spellings could drift apart on.
+    f.guest.write_u64(timer, i64::MAX as u64);
+    let refused = value_of(&f, "gmtime", |asm| {
+        asm.mov(0, timer as u64);
+    });
+    assert_eq!(refused, 0, "an out-of-range year is NULL, not a wrapped date");
+
+    // **The two returned pointers must not overlap.** `strerror` hands back a `char *` from the
+    // same thread block, and one buffer for both would let this `gmtime` rewrite that message.
+    f.guest.write_u64(timer, 951_825_600);
+    let message = value_of(&f, "strerror", |asm| {
+        asm.mov(0, 2); // ENOENT
+    }) as omni_cpu::GuestAddr;
+    let before = f.read_cstring(message);
+    assert!(!before.is_empty());
+    let tm = value_of(&f, "gmtime", |asm| {
+        asm.mov(0, timer as u64);
+    }) as omni_cpu::GuestAddr;
+    assert!(
+        tm > message + before.len() || message >= tm + 56,
+        "strerror's buffer at {message:#x} and gmtime's struct tm at {tm:#x} overlap"
+    );
+    assert_eq!(f.read_cstring(message), before, "and the message survived the gmtime");
+}
+
 /// **A sleep really sleeps, a malformed request is `EINVAL`, and a request past the cap refuses.**
 ///
 /// The cap is the hostile-input half: a sleeping thread executes no guest instructions, so D16's

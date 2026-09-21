@@ -1738,9 +1738,15 @@ MUTATIONS = [
     c.invalidate_code(address, len)""",
      ANDROID),
 
-    ("guestmem-A2", "A", "MADV_DONTNEED is answered instead of refused", ADAPTER_GUESTMEM,
-     """    if advice == MADV_DONTNEED || advice == MADV_REMOVE {""",
-     """    if false && (advice == MADV_DONTNEED || advice == MADV_REMOVE) {""",
+    # **Re-aimed, not retired.** This row used to inject `MADV_DONTNEED` being *answered*, and
+    # that is what it now does by design (D28 amendment 1): the guarantee is met by decommitting
+    # rather than by writing zeroes, so the old form no longer describes a defect. What is left of
+    # the original property is `MADV_REMOVE`, which punches a hole in an *underlying object* that
+    # no mapping here has. `jni-A11` and `jni-B3` cover MADV_DONTNEED's own semantics from both
+    # directions.
+    ("guestmem-A2", "A", "MADV_REMOVE is answered instead of refused", ADAPTER_GUESTMEM,
+     """    if advice == MADV_REMOVE {""",
+     """    if false {""",
      ANDROID),
 
     # Re-anchored for M3's gate: the `fd != -1` half of this condition was a defect in its own
@@ -1968,11 +1974,44 @@ MUTATIONS = [
      """    let micros = c.args().next_u64()?;""",
      ANDROID),
 
+    # The pattern carries `gmtime_r`'s own `Ok` arm because M4 bound `gmtime` beside it and the
+    # two share these two lines. Without the context it matched **twice**, and the pre-flight
+    # refused the whole run rather than mutating whichever came first -- which is what that gate
+    # is for. `clocks-A10` is the same property for the non-reentrant spelling.
     ("clocks-A7", "A", "gmtime_r returns its buffer after failing to fill it", ADAPTER_CLOCKS,
      """                view.set_errno(EOVERFLOW);
-                0u64""",
+                0u64
+            }
+            Ok(tm) => {
+                let zone = state.bionic.utc_zone();
+                let at = guest_address(view.blaming(1), result)?;""",
      """                view.set_errno(EOVERFLOW);
-                result""",
+                result
+            }
+            Ok(tm) => {
+                let zone = state.bionic.utc_zone();
+                let at = guest_address(view.blaming(1), result)?;""",
+     ANDROID),
+
+    # **`gmtime` returning its own buffer after failing to fill it**, which is `clocks-A7`'s
+    # property for the spelling that owns the storage. A caller that tests the result against NULL
+    # -- which is the whole of `gmtime`'s error reporting -- would read a `struct tm` nothing
+    # wrote. Bound by M4's gate, so it had no row until now. (Numbered A10: A8 and A9 were both taken, and
+    # the harness's duplicate-id gate is what said so before anything ran.)
+    ("clocks-A10", "A", "gmtime returns its per-thread struct tm after failing to fill it",
+     ADAPTER_CLOCKS,
+     """                view.set_errno(EOVERFLOW);
+                0u64
+            }
+            Ok(tm) => {
+                let zone = state.bionic.utc_zone();
+                let at = view.tm_address();""",
+     """                view.set_errno(EOVERFLOW);
+                view.tm_address() as u64
+            }
+            Ok(tm) => {
+                let zone = state.bionic.utc_zone();
+                let at = view.tm_address();""",
      ANDROID),
 
     # The over-correction: the cap applied to the sub-second part, so an ordinary 10 ms sleep is
