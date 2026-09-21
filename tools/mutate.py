@@ -1641,10 +1641,13 @@ MUTATIONS = [
      ANDROID),
 
     # ---- M3 task 3 phase 2: the eighteen data objects -------------------------------------------
+    # RE-TARGETED in phase 3b: the loop this mutated gained a `register_stream` call, so the
+    # original pattern stopped matching and the pre-flight refused the whole run. That is the gate
+    # working -- a stale row is otherwise a MISS that looks like a missing test.
     ("data-A1", "A", "stdin/stdout/stderr spaced by a pointer instead of by a whole FILE",
      ADAPTER_DATA,
-     """        mem.write_u64(cell, (sf + index * FILE_BYTES) as u64, blame(symbol, cell))?;""",
-     """        mem.write_u64(cell, (sf + index * 8) as u64, blame(symbol, cell))?;""",
+     """        let stream = sf + index * FILE_BYTES;""",
+     """        let stream = sf + index * 8;""",
      ANDROID),
 
     ("data-A2", "A", "in6addr_loopback is 1:: rather than ::1", ADAPTER_DATA,
