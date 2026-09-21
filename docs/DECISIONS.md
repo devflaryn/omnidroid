@@ -2909,3 +2909,350 @@ merely checked for being non-zero. The block-index collision is the next: it is 
 construction, and its detector produces the collision rather than exercising the code. The
 per-thread memory figure is the one that constrains the product rather than the code, and it is
 measured through the path the guest takes rather than one layer down.
+
+---
+
+## D25 — Phase 3d + 3e: the last fourteen imports, and two symbols that must resolve to nothing
+
+D20 is the adapter, D21 phase 2, D22 phase 3a, D23 phase 3b, D24 phase 3c. This is the last
+import phase of M3 task 3: the plan's `3d` row (**8** network symbols) and its `3e` row (**6**
+that no other phase claimed), run together because they are the remainder and because the
+membership test that accounts for all 188 has to be written once.
+
+**After this phase every one of the 188 statically-reachable imports is accounted for**, and the
+adapter's own test asserts that as a set difference against `init-reachable-imports.txt` rather
+than as a total.
+
+### The final coverage of the 188
+
+| | count | what |
+|---|---|---|
+| **answered** | **143** | a real value, computed or read from a real source |
+| **refused by name** | **22** | `AbiError::Refused`, naming the symbol, the guest address and the missing piece |
+| **a guest termination, reported** | **3** | `abort`, `__stack_chk_fail`, `_exit` — a third outcome, not a refusal (D22) |
+| **bound**, therefore | **168** | 157 inline and 11 on the exit path |
+| `STT_OBJECT` data objects | **18** | unchanged since phase 2 |
+| deliberately **absent** | **2** | `__gcov_dump`, `__gcov_flush` — see below |
+| **total** | **188** | 143 + 22 + 3 + 18 + 2 |
+
+**That split is asserted by *calling* every symbol, not by counting a table.**
+`the_final_split_of_the_reachable_set_is_what_the_record_claims` calls each of the 22 with zeroed
+arguments and requires `AbiError::Refused` — not `Unbound`, which would mean nothing implements
+it — and calls the three terminations and requires neither. This project's most repeated mistake
+is a total that stays right while its membership drifts, and a count in a document is exactly
+where that happens.
+
+A **conditional** refusal is an answer, and the distinction is load-bearing: `getauxval` refuses
+only while the `AT_HWCAP` decision is open, `sched_getcpu` only on a target whose process backend
+is structural, `mmap` only for a shape it cannot honour, and `dlerror` answers `NULL` — which is
+true, not a stub.
+
+**Derived, not taken from the plan.** The 188 of `init-reachable-imports.txt` minus every symbol
+named in `bionic/handlers.rs` and `bionic/data.rs` was a 14-symbol remainder before this phase and
+is the **two absent symbols** after it, which is what
+`the_bound_count_is_exactly_what_this_phase_claims` now asserts. A count cannot see a
+substitution; this project has had a list whose count stayed right while two members were wrong
+and two were missing (D21), and a *total* stay consistent while its membership did not (D24).
+
+The twenty-two, by the phase that decided each: `fprintf`, `vfprintf`, `vasprintf`, `sscanf`,
+`fscanf` (D20); `dlopen`, `dlsym`, `dlclose`, `mlock` (D21); `sysconf`, `sysinfo`, `prctl`,
+`syscall` (D22); `sigaction`, `raise`, `pthread_sigmask` (D24); and this phase's `socket`,
+`eventfd`, `getaddrinfo`, `freeaddrinfo`, `mallinfo`, `longjmp`. Each names the missing piece
+rather than the fact that something is missing, and each declines a *believable* wrong answer that
+is written down beside it.
+
+### `omni-platform` grew by exactly one primitive, and not the one the plan named
+
+The plan's phase-3 table lists "**Sockets and polling** — socket, poll/select, getaddrinfo" among
+the things `omni-platform` must grow for. **It did not have to.** No socket seam exists, and
+therefore no `unsupported` arm was fabricated for Linux or macOS either — D22's other half: a
+primitive that calls no OS API must not be given one, because that is a false claim in the other
+direction.
+
+**This is the third phase running whose five-target prediction over-estimated the OS surface.**
+Phase 3b predicted files would "almost all" need a unix half and fifteen of seventeen needed none
+(D23); phase 3c predicted thread lifecycle would need new platform surface and it needed none at
+all (D24). The sharper test D23 proposed — *is there one `std` call that serves all five targets?*
+— answers a **third** thing for this group: there is no OS call to make.
+
+What *did* arrive is `process::cpu_time`, for the guest's `clock()`. That one genuinely fails
+D23's test: `Instant` is wall time and nothing in the standard library reports consumed processor
+time, so it has a Windows backend (`GetProcessTimes` on the current-process pseudo-handle) and the
+Linux and macOS signatures written at the same time as honest `Unsupported` returns naming
+`clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`. `ProcessError::LastError` is a new variant rather than
+a reuse of `Status`, for the reason `Status`'s own documentation gives: an `NTSTATUS` and a
+`GetLastError` code are different number spaces with the same digits.
+
+**Nothing in this phase has been built for Linux or macOS, let alone run there.**
+
+### Why `poll` and `select` need no operating system, as a closed argument
+
+Not "they are easy", and not "nothing polls during static initialisation". The argument is that
+**the descriptor space they observe is entirely this runtime's own, and POSIX fixes the answer for
+every kind in it**:
+
+1. The only bound symbols that produce a descriptor are `open`, `__open_2` and `opendir`, plus
+   `fileno` handing back one of those or one of the three standard streams. `socket` and
+   `eventfd` — the two symbols in the reachable 188 that would introduce a descriptor which can
+   *block* — refuse. `pipe`, `socketpair`, `epoll_create`, `timerfd_create`, `signalfd`,
+   `inotify_init` and `dup` are not among the 188 at all.
+2. So every descriptor that exists is a regular file, a directory, or one of stdin, stdout and
+   stderr, and none of them can block: `omni-platform`'s `read` on a standard stream is an
+   immediate end of file and its `write` to one is an immediate host write.
+3. Linux answers exactly `POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM` for a regular file — its
+   `DEFAULT_POLLMASK` — **regardless of the descriptor's access mode**, which is why a read-only
+   file answers `POLLOUT` there and here.
+
+The consistency criterion is the one that matters, and it is not "what would a device do": it is
+that **`poll`'s answer predicts what `read` and `write` on that descriptor actually do in this
+runtime**.
+
+**The paragraph to invalidate is a test rather than a sentence.**
+`the_descriptor_space_poll_answers_over_is_closed` intersects `Bionic::bound_symbols()` with every
+POSIX symbol that hands out a descriptor and asserts the result is exactly
+`{eventfd, open, __open_2, opendir, socket}`, then calls the two refusals to confirm they refuse.
+The day a phase binds `socket` for real, that test fails and this module has to grow a real
+readiness source with it. Row `net-A7` injects the always-ready rule applied to a descriptor that
+is not open.
+
+**A wait that nothing can end is refused by name**, which is the same argument `MAX_SLEEP_SECONDS`
+makes for `nanosleep`: a sleeping thread executes no guest instructions, so D16's runaway-guest
+defence — built from step budgets — cannot end one. `poll(fds, n, -1)` and `select(.., NULL)` with
+nothing ready are therefore refusals, and a *finite* timeout past the cap is refused rather than
+clamped, because a clamp returns `0` from a call that waited a minute when it was asked to wait a
+year. Row `net-B1` is the over-correction: every bounded wait refused.
+
+### The two `__gcov_*` symbols must resolve to NOTHING, and the guest's own code says so
+
+This is the phase's most consequential decision and the brief asked for it explicitly.
+
+[`Binding::Unbound`] is the design for every other import: a symbol nothing implements gets a real
+address whose call produces a typed error naming it, which beats a branch to address zero with no
+symbol attached. **That argument assumes the guest calls the symbol either way.** For a *weak*
+undefined symbol it does not, because the reference the compiler emits is a null test and the
+address is what the test reads.
+
+**VERIFIED by decoding the single site in `libroblox.so` that references them**, at `0x6194be8`:
+
+```text
+0x6194bec: LDR  X8, [X8, #0x788]   ; the __gcov_dump GOT slot
+0x6194bf0: CBZ  X8, 0x6194bfc      ; if it is null, skip
+0x6194bf4: BL   0x62d7c80          ; __gcov_dump's PLT stub
+0x6194bf8: BL   0x62d6760          ; abort's PLT stub
+0x6194c00: LDR  X8, [X8, #0x790]   ; the __gcov_flush GOT slot
+0x6194c04: CBZ  X8, 0x6194c10      ; if it is null, skip
+0x6194c08: BL   0x62d7c90          ; __gcov_flush's PLT stub
+```
+
+The guest null-tests both before calling either, and no Android libc exports `__gcov_*` — they
+belong to `libgcov`, which is linked only into a coverage-instrumented binary, and this one merely
+kept the guarded reference. So a null GOT slot is what a real device produces and what the guest
+expects.
+
+Give them an address instead and the `CBZ` falls through. With the symbol left `Unbound` the run
+**fails** on a path a device never takes. With the symbol bound to a no-op that "flushed" coverage
+data nothing ever collected, the guest goes on to **`BL abort`** — the next instruction. **A
+plausible stub here does not merely lie, it terminates the process, and the terminating
+instruction is four bytes past the call the stub answered.** Nothing short of decoding the call
+site would have shown that.
+
+`BoundaryBuilder::declare_absent` is the mechanism, and it is **not** "weak symbols resolve to
+nothing". `libroblox.so` has five weak undefined imports — `__cxa_thread_atexit_impl`, `gettid`,
+`getentropy` and these two — and a real bionic supplies the first three, so a guest on a device
+calls them. The declaration is therefore per symbol and the provider requires **both** the name
+and the weakness: a *strong* reference to a declared-absent symbol still gets a named slot,
+because a strong reference has no null test in front of it. Rows `gcov-A1` (the list ignored) and
+`gcov-B1` (the weakness ignored) pin both directions, and `declare_absent` refuses a symbol that
+already has a slot rather than letting this layer give the loader two answers about one name.
+
+`the_two_gcov_imports_are_weak_null_tested_and_left_unresolved` asserts all four facts against the
+real library rather than quoting them: both are `WEAK NOTYPE` in `.dynsym`; each has one
+`GLOB_DAT` **and** one `JUMP_SLOT`, so the address is taken as well as called; the instruction
+after the `LDR` of each GOT slot is a `CBZ` on the register the `LDR` wrote; and after a real load
+the slot holds zero.
+
+**This is the one place in the runtime where "nothing" is the answer**, and it costs the loader
+two of its previously-565 function slots: `the_data_symbols_land_in_the_data_area...` now expects
+540 rather than 542.
+
+### `inet_ntop`: the standard library is not an oracle for bionic, and a differential run proved it
+
+The brief's guidance was that `inet_ntop` is formatting and `Ipv4Addr`/`Ipv6Addr` already
+`Display`. They do, and **`Display` is the wrong answer.**
+
+MEASURED: a differential run of **200,000** pseudo-random 128-bit addresses (half of each draw's
+bytes zeroed by a second draw, so the compression paths are reached) against
+`std::net::Ipv6Addr`'s `Display` disagrees **43 times**, and all 43 are one class — the
+*IPv4-compatible* address, where the first six groups are zero and the seventh is not. Rust
+deliberately stopped printing that deprecated form in dotted notation and writes `::77:0`; BIND's
+`inet_ntop6`, which bionic ships essentially unchanged, writes `::0.119.0.0`, because its
+condition is `best.len == 6` and says nothing about deprecation.
+
+So the algorithm is written out in `omni_bionic::net` and the differential test is **committed
+with that class asserted from the other side**, which makes delegating to `Display` later a
+failure rather than a silent change of a guest-observable value. The same
+follow-bionic-not-something-else convention `guestcmp` records for `strcmp`'s byte difference —
+and the same shape: the convenient implementation was *nearly* right.
+
+Two further BIND behaviours a from-scratch RFC 5952 formatter gets wrong are asserted directly: a
+run of **one** zero group is not compressed (`1:0:2:3:4:5:6:7`, not `1::2:3:4:5:6:7`), and `::`
+and `::1` do **not** grow a dotted tail while `::1.2.3.4` and `::ffff:1.2.3.4` do.
+
+A `size` that cannot hold the result **and its NUL** is `ENOSPC` with **nothing written**, which
+is BIND's own behaviour: it formats into a local buffer and only then compares. A truncated
+address is still a printable string naming a different host.
+
+`gai_strerror`'s table is fifteen rows **ASSUMED** from bionic's `ai_errlist` with no NDK on this
+machine to check them against — the same gap `layouts.rs`, `FILE_BYTES` and `TM_BYTES` record.
+What is safe about it is the shape rather than the letters: a wrong message is a wrong
+*diagnostic*, the caller is `printf`, and nothing branches on the text. The one thing that would
+not be safe — a pointer to storage that does not outlive the call — is the adapter's problem, and
+it interns the whole table in the instance's **pool** in `Bionic::new`. The per-thread scratch
+`strerror` uses would have been the believable wrong answer: the next `strerror` on that thread
+overwrites a message the guest may have stored a pointer to.
+
+### The four network refusals, and the believable wrong answer each declines
+
+| symbol | the believable wrong answer | what it would cost |
+|---|---|---|
+| `socket` | `-1` with `EAFNOSUPPORT` or `EACCES` | a **legitimate POSIX outcome** a networked program branches on quietly. The engine switches its own networking off during initialisation, the run completes, and nothing anywhere records that Omnidroid rather than the device made that choice |
+| `eventfd` | `-1` with `ENOSYS` | says *this kernel* has no eventfd, which is a fact about a kernel and not about this layer — and a guest that believes it falls back to a pipe, which is not bound either |
+| `getaddrinfo` | `EAI_NONAME` or `EAI_FAIL` | a caller retries `EAI_AGAIN` and reports `EAI_FAIL` as a real DNS failure; either way it believes it asked a resolver |
+| `freeaddrinfo` | doing nothing | it returns **`void`**, so there is no value to be wrong: a silent no-op is indistinguishable from a correct free, and would still be indistinguishable on the day `getaddrinfo` starts returning real lists and it starts leaking them |
+
+`socket` is refused for three reasons and any one would do. `omni-platform` has no socket seam. An
+embedding has no way to say which network a guest may reach, the way `Bionic::set_filesystem_root`
+says which directory it may reach — and phase 3b's whole confinement argument was that a default
+would have to be *somewhere*. And Global Constraint 8 forbids network access at run time, with D6
+recording that the APK under test is cheat-injected and carries a Luau executor.
+
+`eventfd` is refused because **a descriptor the guest can obtain and then cannot use is worse than
+one it cannot obtain**: every descriptor in this runtime belongs to `omni-platform`'s rooted
+filesystem table, which `read`, `__write_chk`, `close`, `fstat` and `poll` are all written
+against, and an eventfd is a counter with blocking reads that none of the five could carry. The
+failure would move from this call, where it names what is missing, to whichever call the guest
+reached next — reporting `EBADF` about a descriptor this layer issued itself.
+
+`getaddrinfo` is refused for two independent reasons. **There is nowhere to build the answer**: a
+`struct addrinfo` list lives in *guest* memory and must be freeable, and this layer has no guest
+allocator — the arena is a fixed set of tables sized at construction (65,280 bytes of a 65,536-byte
+granule, 256 spare), the pool is a bump allocator that never frees, and F9 forbids a handler
+mapping guest memory at all. The guest's own allocator is not reachable either: `libroblox.so`
+imports no allocator (D17). **And the resolution needs a network**, which is `socket`'s argument.
+Recorded for whoever implements it later: `sizeof(struct addrinfo)` on LP64 bionic would be **48
+bytes**, and bionic orders `ai_canonname` before `ai_addr` where glibc does the reverse — so a
+glibc-derived layout puts the canonical name where the address belongs. **ASSUMED; there is no NDK
+on this machine.**
+
+### `mallinfo` and `longjmp`, and why neither is a marshalling problem
+
+**`mallinfo` is the only reachable import that returns through `X8`**, and that is *not* why it is
+refused. `Args::indirect_result` exists, task 2 built it for this symbol, and eighty bytes of
+zeroes would be three lines. The reason is that **there is no heap for the answer to describe**:
+`libroblox.so` imports no allocator at all, carries its own, and reaches the host through guest
+`mmap`. Eighty zeroed bytes is the believable wrong answer *precisely because it is
+arithmetically true* of a libc heap nothing has allocated from — zero arena, zero free blocks,
+zero in use — so a guest logging its memory usage prints a consistent, self-consistent, fictional
+zero at both ends of the run. The other available lie is worse: reporting this process's commit
+charge as the arena would be a real number, from the right process, describing the wrong
+allocator. The refusal reports the `X8` the guest passed, so a reader can see the marshalling is
+not what failed.
+
+**`longjmp` needs no operating system**, which is exactly why it fell through every phase of this
+task's OS-surface plan and had to be collected by the last one. It needs two things this layer
+does not have. Restoring a `jmp_buf` means writing `X19`-`X28`, `X29`, `X30`, `SP` and the low
+halves of `D8`-`D15` of the **calling thread's own guest context** and then not returning; the
+boundary gives a handler the AAPCS64 argument registers and one return value and deliberately no
+way to write guest state, because D18 makes "cannot reach the CPU" a *type* property and that is
+what stops an inline handler re-entering the guest. And nothing here can have **filled** a
+`jmp_buf`: `setjmp` is not among the 188 — it is in the reachable file's Tier C section, reached
+only through an address-taken edge — so it is not bound, and bionic mangles the saved `SP` and
+`LR` with a per-process cookie besides. The believable wrong answer is to **return**: `longjmp` is
+`noreturn`, and a handler that quietly returned would resume the guest in the frame it was trying
+to escape, carrying whatever condition made it jump. That is `raise`'s failure one frame further
+in, which is why `longjmp` is documented and refused *with* the signal family rather than beside
+it.
+
+### A correction to D22: `CLOCK_PROCESS_CPUTIME_ID` is answered now
+
+Phase 3a refused it on the argument that this layer had no process CPU accounting. This phase
+added `omni_platform::process::cpu_time` for the guest's `clock()`, and **the refusal's stated
+reason became false**. Leaving it would have had this layer answer one question two ways —
+`clock()` reporting a real figure while `clock_gettime` said the figure could not be had. The same
+shape as `fprintf`'s refusal text claiming `omni-platform` had no file surface after phase 3b gave
+it one (D23).
+
+`CLOCK_THREAD_CPUTIME_ID` stays refused and the distinction is real rather than tidy: a per-thread
+figure is `GetThreadTimes`, a primitive that does not exist, and answering it with the *process*
+figure would report every thread as having consumed the whole program's CPU. The refusal names
+that primitive now. `CLOCK_BOOTTIME` stays refused because it counts time spent suspended.
+
+`the_process_cpu_clock_is_answered_and_the_thread_cpu_clock_is_still_refused` asserts the two
+against each other, and the tolerance is what makes it a unit check: **50 ms**, one accounting
+quantum over the drift between the two calls, against a `CLOCKS_PER_SEC` of a million. A first
+version allowed 5 seconds, which a **thousand-fold** unit error passes.
+
+### Three test defects this phase found in its own tests, and the method that found them
+
+Recorded because the *method* is the reusable part: two were found by the whole-workspace run
+rather than by a filtered one, and the third by a mutation row having nothing to catch it.
+
+1. **A `cpu_time` test asserted "a sleep charges no CPU".** That is true of a *thread* clock and
+   false of the process clock this reports — and the whole-workspace run, where libtest has other
+   tests executing, is where it shows. MEASURED on the run that caught it: a 50 ms sleep was
+   charged **93.75 ms** of process CPU time. The discrimination is made the other way now, and it
+   is one a wall clock cannot fake: several threads burning one interval of wall time advance a
+   process CPU clock by **more** than that interval, and interference from other threads only
+   makes the assertion easier — the direction a shared-process measurement has to be robust in.
+   Row `plat-A9`.
+2. **The same test read the CPU clock before starting the wall clock**, so the CPU interval was
+   the wider of the two and a wall-clock impostor satisfied it by accident. The wall interval
+   contains the CPU interval now, with a 1.5x margin.
+3. **`poll_with_nothing_ready_sleeps_for_its_timeout_and_returns_zero` never polled an array**, so
+   the over-correction row `net-B3` — `poll` demanding a filesystem root for a call that names no
+   descriptor — had nothing to catch it. It polls two *disabled* slots now, which is the idiom
+   POSIX defines a negative `fd` for.
+
+### What a guest thread costs is unchanged, and so is the arena
+
+This phase added **no per-thread arena state**: `poll`, `select` and `inet_ntop` write only into
+buffers the guest supplied, and `gai_strerror`'s table is in the pool, which is inside
+`ARENA_BYTES` already. The 256 bytes of granule headroom phase 3b left are untouched and
+`the_arena_fits_in_one_commit_granule` still holds.
+
+### Verification
+
+* `cargo test --workspace --release`: **1,133 passed, 0 failed, 13 ignored**, from 1,093 and 13.
+  The 40 new tests are **2** in `omni-platform`'s lib (38 → 40), **9** in `omni-bionic`'s lib
+  (112 → 121), **5** in `omni-android`'s lib (103 → 108), **23** in `omni-android`'s `bionic`
+  target (114 → 137) and **1** in its `libroblox` target (6 → 7). `omni-android`, `omni-bionic`
+  and `omni-platform` were also run in **debug**, per the working agreement about overflow, and
+  pass there — which is where `poll`'s guest-supplied `nfds` arithmetic and `select`'s
+  guest-supplied `timeval` arithmetic are checked.
+* `tools/mutate.py`: **258 → 283 rows**, 25 new — 21 direction A and 4 direction B — and the new
+  rows are **25/25 caught** (net 18/18, gcov 2/2, clocks 2/2, guestmem 1/1, signals 1/1, plat
+  1/1). `net-A8` was verified as a *detector* before its row was written, by injecting the
+  per-entry implementation and watching the sentinel change.
+* Clippy clean on `--all-targets --release`, `cargo doc --workspace --no-deps` clean,
+  `cargo build --workspace --release --no-default-features` builds.
+* `cargo tree -p omni-bionic -e normal` is still one line (D19) — this phase put `inet_ntop` and
+  `gai_strerror`'s table there and added no dependency — and `cargo tree -p omni-android -e
+  normal` still has no `dynarmic-sys`.
+* The portability invariant is re-verified: every `cfg(target_os)` mention outside `omni-platform`
+  is still a doc comment stating the rule or a `#![cfg(target_os = "windows")]` gate on a
+  Windows-only *test*. This phase added none.
+
+### Cost if wrong
+
+The expensive thing to get wrong is the `__gcov_*` decision, and it is expensive in a direction
+that would have been very hard to find: a no-op stub there is followed four bytes later by the
+guest's own `BL abort`, so the symptom is a *termination* during initialisation with no
+relationship to the symbol that caused it. It is settled by decoding the guest's own instructions
+rather than by an argument about weak symbols, and the decoding is a committed test against the
+real library.
+
+`poll`'s always-ready rule is the next: it is correct only while the descriptor space stays
+closed, and the thing that keeps that honest is a test over the bound-symbol table rather than a
+paragraph. `inet_ntop`'s divergence from the standard library is third — it is one address class
+out of a hundred and twenty-eight bits, it would never have been found by a hand-written case, and
+a guest that logs an address would have logged a different one.

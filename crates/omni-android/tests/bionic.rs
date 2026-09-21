@@ -6471,3 +6471,99 @@ fn longjmp_refuses_and_names_what_restoring_a_jmp_buf_would_take() {
     assert!(text.contains("delivering 1"), "C's zero-becomes-one rule: {text}");
     assert!(text.contains("setjmp"), "and that nothing here can have filled the jmp_buf: {text}");
 }
+
+/// **The final split of the 188, asserted by calling every symbol rather than by counting.**
+///
+/// M3 task 3 ends here, so the number that goes into the record is this one — and this project's
+/// most repeated mistake is a *total* that stays right while its membership drifts (D21's data
+/// list wrong by two in each direction, D24's arena test restating its own definition). So the
+/// split is derived by **calling** each symbol and seeing what it does, not by reading a table:
+///
+/// * **22 refuse by name.** Each is called with zeroed arguments, which every one of them refuses
+///   on, and the refusal has to be `AbiError::Refused` — not `Unbound`, which would mean nothing
+///   implements it, and not a plausible value.
+/// * **3 report a guest termination**, which is a third outcome rather than a refusal: `abort`
+///   and `__stack_chk_fail` report `GuestAborted` and `_exit` reports `GuestExited`, because this
+///   process hosts several guest instances and a host `abort()` would take all of them (D22).
+/// * **143 answer**, which is what is left of the 168 bound.
+/// * **18** are data objects and **2** are deliberately absent.
+///
+/// 143 + 22 + 3 + 18 + 2 = 188.
+#[test]
+fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
+    let _guard = serialized();
+    let f = fixture();
+
+    // Every symbol that refuses **whatever it is passed**. A conditional refusal is not in this
+    // list: `getauxval` refuses only while the `AT_HWCAP` decision is open, `sched_getcpu` only
+    // on a target whose process backend is structural, and `mmap` only for a shape it cannot
+    // honour — each of those answers on some path, so each is an answer.
+    let refusals = [
+        // phase 1: the printf family that cannot be serviced
+        "fprintf",
+        "vfprintf",
+        "vasprintf",
+        "sscanf",
+        "fscanf",
+        // phase 2: libdl. `dlerror` is NOT here — it answers NULL, which is true.
+        "dlopen",
+        "dlsym",
+        "dlclose",
+        // phase 2: the one guest-memory call whose guarantee cannot be met
+        "mlock",
+        // phase 3a: the process facts this layer will not guess at
+        "sysconf",
+        "sysinfo",
+        "prctl",
+        "syscall",
+        // phase 3c: the signal family, which needs delivery that does not exist
+        "sigaction",
+        "raise",
+        "pthread_sigmask",
+        // phase 3d: the network
+        "socket",
+        "eventfd",
+        "getaddrinfo",
+        "freeaddrinfo",
+        // phase 3e: the two that need something no OS would supply
+        "mallinfo",
+        "longjmp",
+    ];
+    assert_eq!(refusals.len(), 22);
+    for symbol in refusals {
+        let error = refusal_of(&f, symbol, |asm| {
+            for register in 0..6 {
+                asm.mov(register, 0);
+            }
+        });
+        assert!(
+            matches!(error, AbiError::Refused { .. }),
+            "`{symbol}` must refuse by name, and it produced {error:?}"
+        );
+        assert_eq!(error.symbol(), Some(symbol), "{error:?}");
+        assert_eq!(error.guest_address(), Some(f.thunk(symbol)), "{error:?}");
+    }
+
+    // The three terminations, which are reported rather than performed.
+    for symbol in ["abort", "__stack_chk_fail", "_exit"] {
+        let error = refusal_of(&f, symbol, |asm| {
+            asm.mov(0, 0);
+        });
+        assert!(
+            !matches!(error, AbiError::Refused { .. } | AbiError::Unbound { .. }),
+            "`{symbol}` reports a guest termination, which is neither a refusal nor a gap: \
+             {error:?}"
+        );
+    }
+
+    let bound = Bionic::bound_symbols().count();
+    assert_eq!(bound, 168);
+    let answered = bound - refusals.len() - 3;
+    assert_eq!(answered, 143, "143 answer, 22 refuse by name, 3 report a termination");
+    assert_eq!(
+        answered + refusals.len() + 3 + omni_android::bionic::DATA_OBJECTS.len()
+            + omni_android::bionic::ABSENT_SYMBOLS.len(),
+        188,
+        "every one of the statically-reachable imports is accounted for"
+    );
+}

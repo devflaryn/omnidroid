@@ -160,7 +160,8 @@ not exist yet.)
 | ~~**Files**~~ — **DONE, phase 3b (D23)**: `omni_platform::fs`, a **rooted** descriptor table. Every guest path resolves inside one host directory the embedding supplies, and an instance with no root refuses every path call by name. Bionic's `FILE*` layer went to `omni-bionic` over a trait, as this row said it should | 29 `file-io` symbols of the reachable remainder (the row's "33" counted the whole classifier bucket, which includes symbols the initializers do not reach) |
 | **Clocks** — monotonic and realtime now, and sleep | `clock_gettime`, `gettimeofday`, `gmtime_r`, `nanosleep`, `usleep`. The `Clock` trait `omni-bionic` already defines is the shape the adapter implements |
 | **Process and environment** — pid, environment block, auxv, sysconf/sysinfo, abort/exit, cpu id, random bytes | 13 `process-env` symbols. `getauxval` is where the **`AT_HWCAP` decision** lands — still open, both arms measured, see the blockers table |
-| **Sockets and polling** — socket, poll/select, getaddrinfo | 8 `network` symbols |
+| ~~**Sockets and polling** — socket, poll/select, getaddrinfo~~ — **this row was wrong too, and phases 3d/3e are the correction**: `omni-platform` did **not** have to grow. `poll` and `select` need no OS call at all, because the descriptor space they observe is closed (the only bound symbols producing a descriptor are `open`, `__open_2` and `opendir`; `socket` and `eventfd` refuse), so every descriptor is a regular file, a directory or a standard stream and POSIX fixes the answer for all of them. `inet_ntop` and `gai_strerror` are pure computation and went to `omni-bionic`; the other four refuse by name. **Third row running whose OS-surface prediction was too large** | the 8 `network` symbols, **DONE** (D25) |
+| **Process CPU time** — the one primitive these phases did need | `clock`, and with it `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, whose phase-3a refusal this makes false. `GetProcessTimes` on Windows; Linux and macOS name `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` and are structural. **DONE** (D25) |
 | **A log sink** | `__android_log_print`, `syslog`, `openlog`, `closelog` |
 | ~~**Threads** — spawn, join, detach, attributes, scheduling~~ — **this row was wrong and phase 3c is the correction**: `omni-platform` did **not** have to grow. A guest thread is `std::thread` (portable), an `omni-mem` mapping for its stack, and an `omni-cpu` context whose TLS block satisfies D13 by construction. No new platform primitive exists, so there is no `unsupported` arm to write either — and D22's other half says fabricating one would be a false claim in the other direction | the 9 lifecycle/scheduling symbols, **DONE** (D24) |
 
@@ -198,11 +199,25 @@ that remainder as a set difference against the reachable file rather than as a t
 |---|---:|---|
 | ~~**3b** file-io~~ | ~~29~~ | **DONE** — phase 3b, D23. The list was re-derived twice before anything was written and is exactly the `file-io` bucket of the remainder, as a set rather than a count: `__open_2 __write_chk access close closedir fclose fdopen feof fflush fgets fileno fopen fputc fputs fread fstat fwrite lstat mkdir open opendir pread read readdir rename rmdir stat statvfs unlink` |
 | ~~**3c** threads + signals~~ | ~~8~~ | **DONE** — phase 3c, D24. Derived twice before anything was written, and it is exactly the plan's row: `pthread_create pthread_detach pthread_getschedparam pthread_join pthread_sigmask raise sigaction sigfillset`. Four answered, three refused by name (`sigaction`, `raise`, `pthread_sigmask`) and `sigfillset` implemented in `omni-bionic` because it is pure computation |
-| **3d** network | 8 | `eventfd freeaddrinfo gai_strerror getaddrinfo inet_ntop poll select socket` |
-| **3e** the remainder nothing else claims | 6 | `clock time mallinfo longjmp __gcov_dump __gcov_flush` |
+| ~~**3d** network~~ | ~~8~~ | **DONE** — phases 3d/3e, D25, run together as the remainder. Derived twice before anything was written and exactly the plan's row: `eventfd freeaddrinfo gai_strerror getaddrinfo inet_ntop poll select socket`. Two answered from `omni-bionic`, two implemented over the descriptor table `fs` already had, four refused by name |
+| ~~**3e** the remainder nothing else claims~~ | ~~6~~ | **DONE** — D25: `clock time mallinfo longjmp __gcov_dump __gcov_flush`. `time` and `clock` answered, `mallinfo` and `longjmp` refused by name, and the two `__gcov_*` **not bound at all** — they are declared *absent*, so a weak reference resolves to null, which is what the guest's own `CBZ` expects and what a real device produces |
 
 `longjmp` needs no OS but does need the boundary to restore a guest `jmp_buf`, which is why it is not
 simply `omni-bionic` work. `mallinfo` is the only reachable import returning through `X8`.
+
+**Both turned out to be refusals, and neither for a marshalling reason** (D25). `X8` *is*
+marshalled — task 2 built `Args::indirect_result` for exactly this symbol — and the reason
+`mallinfo` refuses is that `libroblox.so` imports no allocator at all, so there is no heap for the
+answer to describe; eighty zeroed bytes is the believable wrong answer precisely because it is
+arithmetically true of a libc heap nothing has allocated from. `longjmp` refuses because the
+boundary deliberately gives a handler no way to write the calling thread's guest state (D18 makes
+that a *type* property), and because `setjmp` is not among the 188, so nothing here can have
+filled a `jmp_buf` in the first place.
+
+**Task 3 is complete.** All 188 statically-reachable imports are accounted for: **143** answered,
+**22** refused by name, **3** reporting a guest termination, **18** data objects and **2**
+deliberately absent. D25 is the record, and the split is asserted by calling every symbol rather
+than by counting a table.
 
 **Sequencing note.** `dl_iterate_phdr` is *not* in this phase — it needs `omni-elf`'s loader state,
 not the OS — and it is the highest-value single item in Task 3, because the statically-linked C++
