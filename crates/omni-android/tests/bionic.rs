@@ -7898,6 +7898,30 @@ fn a_read_into_a_half_mapped_buffer_consumes_nothing_from_the_descriptor() {
     });
     assert_eq!(error.symbol(), Some("pread"), "{error:?}");
     assert_eq!(read_guest(&f, straddling, 16), vec![0xAAu8; 16], "`pread` places nothing either");
+
+    // --- **The over-correction validating first invites**, asserted so that a later "check it
+    // always" cannot land unnoticed. A zero-length transfer at a null pointer is legal C, the
+    // seam is never reached, and there is nothing to protect; a check applied unconditionally
+    // would refuse a correct program. This is the direction-B half of the finding.
+    assert_eq!(
+        value_of(&f, "read", |asm| {
+            asm.mov(0, read_fd as u64);
+            asm.mov(1, 0);
+            asm.mov(2, 0);
+        }) as i64,
+        0,
+        "`read(fd, NULL, 0)` is zero, not a refusal"
+    );
+    assert_eq!(
+        value_of(&f, "__write_chk", |asm| {
+            asm.mov(0, write_fd as u64);
+            asm.mov(1, 0);
+            asm.mov(2, 0);
+            asm.mov(3, 0);
+        }) as i64,
+        0,
+        "and `__write_chk(fd, NULL, 0, 0)` is zero too"
+    );
 }
 
 /// **M1, the source side: a `__write_chk` out of a half-mapped buffer puts nothing into the
@@ -7951,6 +7975,24 @@ fn a_write_chk_from_a_half_mapped_buffer_puts_nothing_into_the_descriptor() {
         std::fs::metadata(scratch.path("m1w2")).expect("the file exists").len(),
         0,
         "and neither must a refused `write`"
+    );
+
+    // **The source is admitted for reading, not for writing.** A guest writing its own `.rodata`
+    // to a descriptor is an ordinary correct program, and admitting the source as writable -- the
+    // over-correction a copy of the destination rule produces -- would refuse it. Asserted here
+    // because the two calls differ by one boolean and nothing else would notice.
+    let fd = open_through_guest(&f, "/m1w3", O_WRONLY | O_CREAT);
+    assert!(fd >= 0, "open failed with {fd}");
+    let wrote = value_of(&f, "__write_chk", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, f.guest.readonly as u64);
+        asm.mov(2, 16);
+        asm.mov(3, 16);
+    }) as i64;
+    assert_eq!(wrote, 16, "sixteen bytes of read-only guest memory are a legal source");
+    assert_eq!(
+        std::fs::metadata(scratch.path("m1w3")).expect("the file exists").len(),
+        16
     );
 }
 
