@@ -62,6 +62,19 @@
 //! in. Nothing about that is a stub — it is what the device does — but a truncation nobody can
 //! see would be worse than a refusal, so it is reported three ways (above).
 //!
+//! **Finding W1 was the same defect one layer down**, and is closed the same way. `liblog` does
+//! not cap a *formatted* message after the fact: it formats into `char buf[LOG_BUF_SIZE]` in the
+//! first place, so the conversion that overruns the buffer is cut inside `vsnprintf` and the
+//! ones after it produce nothing. Capping afterwards needs the formatter to have produced the
+//! whole thing first, which is what made a 1 MiB result (`OutputTooLarge`) and a 64 KiB field
+//! (`FieldTooWide`) into refusals — aborting a guest over a log line, which is the outcome the
+//! first paragraph of this file says the module exists to prevent.
+//!
+//! So the destination size goes *in*: [`format::render_bounded`](super::format::render_bounded)
+//! is given [`MAX_MESSAGE_BYTES`] and keeps the prefix that fits, and the count of what it could
+//! not keep comes back beside it so that `capped_record_of` can report a cut the length
+//! comparison in [`capped_record`] can no longer see.
+//!
 //! The paths that remain refusals are the first case, and each one's doc comment below says what
 //! this layer would otherwise have had to invent. The inventory is in
 //! [`android_log_print`]'s own documentation, path by path, because a count of refusals is not a
@@ -385,6 +398,11 @@ fn capped_record_of(
 /// can take is not a check (`VERIFICATION.md` entry 12). They are named rather than counted,
 /// because a count cannot see a substitution (entry 1).
 ///
+/// The table below has nineteen rows because **W1** is kept in it as a row that is no longer a
+/// refusal: a defect that has been closed is worth more in the inventory than out of it, and the
+/// split of W1 into the half that truncates and the half (**W1b**) that still refuses is exactly
+/// the distinction the finding asked for. The eighteen are the other rows.
+///
 /// | id | path | decision |
 /// |---|---|---|
 /// | **A1** | no live instance for this call ([`active`]) | **kept.** Host state rather than guest input; there is no instance to log *to*, so there is nothing to invent |
@@ -402,7 +420,8 @@ fn capped_record_of(
 /// | **F7** | an unknown or malformed conversion, refused by `plan` before any argument is fetched | **kept, and this is the one worth spelling out.** The damage is not the one field: an unknown conversion means the planner cannot know whether it consumes an argument, so *every later conversion reads a different argument*. What would be invented is the whole rest of the line, not a field |
 /// | **V1** | a variadic argument lies past the mapped overflow area, or the overflow pointer would leave the address space | **kept.** This is a format string claiming more arguments than the caller passed; would have to invent the value |
 /// | **S1** | a `%s` argument's pointer is wider than `usize`, unreadable, or unterminated | **kept**, for the reasons given for **T1**-**T3**. A **null** `%s` is not in this list: it prints `(null)`, which is what bionic prints |
-/// | **W1** | the formatted output passes `MAX_OUTPUT` (1 MiB), or one field passes `MAX_FIELD_WIDTH` (64 KiB) | **wrong, and not fixable from this file.** The device truncates; see below |
+/// | **W1** | the formatted output passes `MAX_OUTPUT` (1 MiB), or one field's width passes `MAX_FIELD_WIDTH` (64 KiB) | **gone — now a truncation.** The formatter is given `liblog`'s own destination size and keeps the prefix that fits, which is what `vsnprintf(buf, LOG_BUF_SIZE, …)` does. See below |
+/// | **W1b** | one field's **precision** passes `MAX_FIELD_WIDTH` on `%e %E %g %G %a %A` | **kept, and it is the one arm that could not be made byte-correct.** See below |
 /// | **W2** | a format-time argument-kind mismatch (`'*' width needs an int`, `%s needs a string`, `%p needs a pointer`) | **kept, and no input reaches it**: `plan` and `format` walk the same format string, so the kind fetched is always the kind expected. A planner and a formatter that could disagree is the defect this would catch |
 /// | **M1** | the formatted result contains a character above `U+00FF` | **kept, and no input reaches it**: the core copies guest bytes as Latin-1 and every conversion it produces is ASCII. Refused rather than substituted, because a substituted byte is a believable wrong answer in a string a guest will read |
 ///
@@ -422,16 +441,42 @@ fn capped_record_of(
 /// two want different fixes, and a fix aimed at the stated mechanism would have closed neither.
 /// (`VERIFICATION.md` entry 10: read the source, not the summary of it.)
 ///
-/// ## Still refusing where the device truncates: **W1**, and **S1**/**T3** in part
+/// ## **W1**, closed: the order the pieces go in is the whole of it
 ///
-/// `omni_bionic::printf` stops with `OutputTooLarge` past `MAX_OUTPUT` and with `FieldTooWide`
-/// past `MAX_FIELD_WIDTH`, and `format::render` turns both into a refusal. A device would have
-/// produced the first 1,023 bytes and moved on. The same is true of a `%s` argument longer than
-/// `STRING_LIMIT`: `vsnprintf` would have copied 1,023 bytes of it and never looked for the NUL.
+/// The budget is [`MAX_MESSAGE_BYTES`], which is `LOG_BUF_SIZE` less the NUL — the same
+/// destination size `liblog` gives `vsnprintf`, so the same bytes. What made the arm need
+/// thought rather than a `match` is that a partial field is **not** a shortened field:
 ///
-/// Reproducing either needs `format::render` to take a byte budget — to stop the walk at the cap
-/// and keep what it has, rather than discarding a partial result — which is a change to
-/// `bionic/format.rs` and `omni-bionic`'s `printf`, not to this file. It is recorded here, at the
+/// * `%70000d` right-justified is 69,998 spaces and then `42`, so a device's buffer holds
+///   **1,023 spaces** and no digits at all. Clamping the width to the budget — the obvious fix —
+///   produces 1,021 spaces and then `42`: the right length, the right characters, the wrong
+///   order, and a tail a device does not have.
+/// * `%-70000d` is the body first, so `42` and then spaces.
+/// * `%070000d` of -42 is the **sign** first, so `-` and then zeros.
+///
+/// All three are exact, because the padding is emitted as a counted fill rather than built:
+/// nothing has to clamp a guest-chosen width to anything. The same holds for a precision, which
+/// is a run of zeros at a known offset for the integer conversions, a no-op for `%s`, and a run
+/// of zeros past `EXACT_FRACTION_DIGITS` for `%f` — a finite `double`'s exact decimal expansion
+/// is at most 1,074 fraction digits long, so a longer precision appends zeros and rounds
+/// nothing.
+///
+/// ## **W1b**: the arm that is not byte-correct, refused by name
+///
+/// `%.70000e`, and the same for `E g G a A`. Their digits are built through
+/// `10u64.pow(precision.min(15))` in `format_exp`, and `format_g` delegates to a precision it
+/// derives, so past fifteen places what this engine produces is **already** not `vsnprintf`'s —
+/// a divergence that predates the budget. Under a budget those wrong digits would land in the
+/// *visible* prefix rather than being discarded with the rest, so the refusal is kept and names
+/// the conversion. Their **width** is a separate question and is honoured, because padding is
+/// placeable whatever the body is.
+///
+/// ## Still refusing where the device truncates: **S1**/**T3** in part
+///
+/// A `%s` argument longer than `GuestMem::STRING_LIMIT` (64 KiB) is refused as unterminated
+/// where `vsnprintf` would have copied 1,023 bytes of it and never looked for the NUL. Closing
+/// that needs a **bounded** `cstr` read in `mem.rs` — the budget cannot help, because the bytes
+/// never reach the formatter — and the same is true of an over-long tag. Recorded here, at the
 /// place it bites, rather than only in a review document.
 pub(super) fn android_log_print(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (prio, tag_pointer, fmt, consumed, overflow) = {
@@ -823,6 +868,98 @@ mod tests {
         // 1,023 guest bytes: 511 whole 'é' plus one half, and the half becomes U+FFFD.
         assert!(record.message.ends_with('\u{FFFD}'), "{:?}", record.message);
         assert_eq!(record.message.chars().count(), 512);
+    }
+
+    /// **A message the *formatter* cut is still reported as truncated, on all three channels.**
+    ///
+    /// The half of finding W1 that is not about aborting. `format::render_bounded` stops at
+    /// `liblog`'s 1,024-byte buffer, so the message reaching [`capped_record`] is already at the
+    /// cap and the length comparison there sees nothing to report — a record that lost 39 KiB
+    /// and looks complete, which is exactly the wrong answer its reader cannot detect. The
+    /// formatter's own count is what closes that, and `capped_record_of` is where it lands.
+    ///
+    /// n = one record at the shape `render_bounded` produces: 1,023 bytes kept out of 40,000.
+    #[test]
+    fn a_message_the_formatter_cut_is_still_reported_as_truncated() {
+        let kept_bytes = vec![b'x'; MAX_MESSAGE_BYTES];
+        let (record, kept) = capped_record_of(Priority::Info, b"tag", &kept_bytes, 40_000);
+        assert_eq!(record.message.len(), MAX_MESSAGE_BYTES, "the bytes that survived");
+        assert_eq!(kept.message, MAX_MESSAGE_BYTES);
+        assert_eq!(
+            record.truncated,
+            Some(Truncation { tag_bytes: 3, message_bytes: 40_000 }),
+            "the record must carry what it was, not what arrived"
+        );
+
+        // Without the formatter's count this is what the same bytes look like: whole.
+        assert_eq!(
+            capped_record(Priority::Info, b"tag", &kept_bytes).0.truncated,
+            None,
+            "which is the silent truncation this exists to stop"
+        );
+
+        // Channel two: the ring's counter, which must move for a shortening and not for an
+        // eviction.
+        let ring = LogRing::new();
+        ring.push(record.clone());
+        assert_eq!(ring.truncated(), 1);
+        assert_eq!(ring.dropped(), 0, "nothing was evicted");
+
+        // Channel three: the rendered stderr line.
+        let line = format_line(&Record {
+            priority: record.priority,
+            tag: &record.tag,
+            message: &record.message,
+            truncated: record.truncated,
+        });
+        assert!(line.contains(TRUNCATION_MARKER), "{}", &line[..line.len().min(120)]);
+        assert!(line.contains("of 40000 bytes"), "the original length is on the line");
+    }
+
+    /// **And a message the formatter did *not* cut reports nothing**, at the boundary.
+    ///
+    /// `VERIFICATION.md` entry 11: a flag that is set under the fault and also set without it is
+    /// a watch, not a detector. Asserted at exactly the budget and one byte past it.
+    #[test]
+    fn a_message_the_formatter_did_not_cut_carries_no_truncation() {
+        let short = b"hello world";
+        let (whole, _) = capped_record_of(Priority::Info, b"tag", short, short.len());
+        assert_eq!(whole.truncated, None, "nothing was lost anywhere");
+        assert_eq!(whole.message, "hello world");
+
+        let at_budget = vec![b'x'; MAX_MESSAGE_BYTES];
+        let (exact, _) =
+            capped_record_of(Priority::Info, b"tag", &at_budget, MAX_MESSAGE_BYTES);
+        assert_eq!(exact.truncated, None, "exactly at the buffer is not a truncation");
+
+        let (past, _) =
+            capped_record_of(Priority::Info, b"tag", &at_budget, MAX_MESSAGE_BYTES + 1);
+        assert_eq!(
+            past.truncated,
+            Some(Truncation { tag_bytes: 3, message_bytes: MAX_MESSAGE_BYTES + 1 }),
+            "one byte past it is"
+        );
+    }
+
+    /// **The payload cap and the formatter's cut are different cuts and both are reported.**
+    ///
+    /// A long tag takes the payload, so the message loses bytes a second time — after the
+    /// formatter already cut it. The record must report the larger of the two losses, which is
+    /// the formatter's, or a reader would be told the message was 1,023 bytes when it was
+    /// 40,000.
+    #[test]
+    fn a_tag_that_takes_the_payload_and_a_formatter_cut_are_both_reported() {
+        let tag = vec![b't'; MAX_TAG_AND_MESSAGE_BYTES - 40];
+        let kept_bytes = vec![b'x'; MAX_MESSAGE_BYTES];
+        let (record, kept) = capped_record_of(Priority::Info, &tag, &kept_bytes, 40_000);
+        assert_eq!(kept.tag, MAX_TAG_AND_MESSAGE_BYTES - 40, "the tag is iov[1] and fills first");
+        assert_eq!(kept.message, 40, "the message gets what is left of the payload");
+        assert_eq!(record.message.len(), 40);
+        assert_eq!(
+            record.truncated,
+            Some(Truncation { tag_bytes: MAX_TAG_AND_MESSAGE_BYTES - 40, message_bytes: 40_000 }),
+            "the message's own length, not the 1,023 that reached the payload cap"
+        );
     }
 
     /// **The rendered stderr line says a record was truncated**, so a run watched only through
