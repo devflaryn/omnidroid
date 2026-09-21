@@ -3854,23 +3854,61 @@ directory", ADAPTER_FILES,
     # is an A row for each half that was missing and a **B row for believing the finding as
     # filed** -- adding `COM0`/`LPT0` is the over-correction, and it now fails.
 
-    # The console buffers, which the list did not have. `CONIN$` and `CONOUT$` are openable by
-    # name and are how a guest reaches the console rather than a file under the root.
+    # **The anchor is the whole const, because the declared length has to move with the
+    # elements.** A first version dropped entries and left `[&str; 30]`, which does not compile --
+    # and the harness reported it as `did not compile, twice` rather than as `caught`, which is
+    # the retry gate doing exactly what `VERIFICATION.md` entry 8 added it for. A row that does not
+    # compile proves nothing, and it is the one outcome that looks like a result.
     ("confine-A1", "A", "the console-buffer device names are dropped from the list",
      PLAT_FS_PATH,
-     """    // The console buffers, openable by name — the first half of M6.
-    "CONIN$", "CONOUT$",""",
-     """    // The console buffers, openable by name — the first half of M6.""",
+     r"""const WINDOWS_DEVICES: [&str; 30] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL",
+    // The console buffers, openable by name — the first half of M6.
+    "CONIN$", "CONOUT$",
+    // Serial and parallel ports. The range is 1..=9: `COM0` and `LPT0` are files, measured.
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", //
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    // The superscript forms, U+00B9/U+00B2/U+00B3 — the second half of M6. Only these three
+    // digit look-alikes match; twenty-six others were tried and did not.
+    "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
+];""",
+     r"""const WINDOWS_DEVICES: [&str; 28] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL",
+    // Serial and parallel ports. The range is 1..=9: `COM0` and `LPT0` are files, measured.
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", //
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    // The superscript forms, U+00B9/U+00B2/U+00B3 — the second half of M6. Only these three
+    // digit look-alikes match; twenty-six others were tried and did not.
+    "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
+];""",
      PLATFORM),
 
-    # The six superscript forms. MEASURED: only U+00B9/B2/B3 match, out of twenty-six digit
-    # look-alikes tried -- so this is a three-member special case rather than a "Unicode digit"
-    # rule, and a list that drops them lets the superscript spellings through as ordinary names.
+    # As `confine-A1`: the whole const, so the length moves with the elements.
     ("confine-A2", "A", "the superscript COM/LPT device forms are dropped from the list",
      PLAT_FS_PATH,
-     r"""    "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
+     r"""const WINDOWS_DEVICES: [&str; 30] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL",
+    // The console buffers, openable by name — the first half of M6.
+    "CONIN$", "CONOUT$",
+    // Serial and parallel ports. The range is 1..=9: `COM0` and `LPT0` are files, measured.
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", //
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    // The superscript forms, U+00B9/U+00B2/U+00B3 — the second half of M6. Only these three
+    // digit look-alikes match; twenty-six others were tried and did not.
+    "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
 ];""",
-     """];""",
+     r"""const WINDOWS_DEVICES: [&str; 24] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL",
+    // The console buffers, openable by name — the first half of M6.
+    "CONIN$", "CONOUT$",
+    // Serial and parallel ports. The range is 1..=9: `COM0` and `LPT0` are files, measured.
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", //
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];""",
      PLATFORM),
 
     # The extension no longer stripped, so `NUL.txt` reaches the host. MEASURED as *not* a device
