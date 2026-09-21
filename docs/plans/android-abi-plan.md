@@ -157,7 +157,7 @@ not exist yet.)
 
 | `omni-platform` must grow | for |
 |---|---|
-| **Files** — open/close/read/pread/write, stat/fstat/lstat/statvfs, rename/unlink/mkdir/rmdir, opendir/readdir/closedir | 33 `file-io` symbols. Bionic's `FILE*` layer (`fopen`, `fgets`, `fputs`, `fflush`, `feof`, `fileno`, `fdopen`, `fread`, `fwrite`) then belongs in `omni-bionic` **on top of** the fd primitives, not in the platform crate |
+| ~~**Files**~~ — **DONE, phase 3b (D23)**: `omni_platform::fs`, a **rooted** descriptor table. Every guest path resolves inside one host directory the embedding supplies, and an instance with no root refuses every path call by name. Bionic's `FILE*` layer went to `omni-bionic` over a trait, as this row said it should | 29 `file-io` symbols of the reachable remainder (the row's "33" counted the whole classifier bucket, which includes symbols the initializers do not reach) |
 | **Clocks** — monotonic and realtime now, and sleep | `clock_gettime`, `gettimeofday`, `gmtime_r`, `nanosleep`, `usleep`. The `Clock` trait `omni-bionic` already defines is the shape the adapter implements |
 | **Process and environment** — pid, environment block, auxv, sysconf/sysinfo, abort/exit, cpu id, random bytes | 13 `process-env` symbols. `getauxval` is where the **`AT_HWCAP` decision** lands — still open, both arms measured, see the blockers table |
 | **Sockets and polling** — socket, poll/select, getaddrinfo | 8 `network` symbols |
@@ -189,12 +189,14 @@ derivation that looked complete because its **totals** were consistent, while it
 not. Derive the remainder by subtracting what is bound from the reachable set, and assert membership
 rather than counts.
 
-**The authoritative remainder is 51**, independently derived twice (reachable 188 minus every symbol
-named in `bionic/handlers.rs` and `bionic/data.rs`):
+**The authoritative remainder was 51** when this was written, independently derived twice
+(reachable 188 minus every symbol named in `bionic/handlers.rs` and `bionic/data.rs`). **Phase 3b
+closed the first row, so it is 22 now**, and the adapter's own test asserts that remainder as a set
+difference against the reachable file rather than as a total:
 
 | group | n | symbols |
 |---|---:|---|
-| **3b** file-io | 29 | `__open_2 __write_chk access close closedir fclose fdopen feof fflush fgets fileno fopen fputc fputs fread fstat fwrite lstat mkdir open opendir pread read readdir rename rmdir stat statvfs unlink` |
+| ~~**3b** file-io~~ | ~~29~~ | **DONE** — phase 3b, D23. The list was re-derived twice before anything was written and is exactly the `file-io` bucket of the remainder, as a set rather than a count: `__open_2 __write_chk access close closedir fclose fdopen feof fflush fgets fileno fopen fputc fputs fread fstat fwrite lstat mkdir open opendir pread read readdir rename rmdir stat statvfs unlink` |
 | **3c** threads + signals | 8 | `pthread_create pthread_detach pthread_getschedparam pthread_join pthread_sigmask raise sigaction sigfillset` |
 | **3d** network | 8 | `eventfd freeaddrinfo gai_strerror getaddrinfo inet_ntop poll select socket` |
 | **3e** the remainder nothing else claims | 6 | `clock time mallinfo longjmp __gcov_dump __gcov_flush` |

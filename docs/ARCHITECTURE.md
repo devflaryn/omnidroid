@@ -52,7 +52,7 @@ backends implement them, and nothing in the core knows which backend it has.
 
 | Crate | Responsibility | Platform-specific? |
 |---|---|---|
-| `omni-platform` | OS primitives: virtual memory, threads, files, dynamic loading, clocks, windowing. One module per OS behind one trait set. **Today that is `vm`, `fault`, `clock`, `process` and `log`** — files, threads, dynamic loading and windowing are still aspirational, and the row is left describing the intent rather than trimmed, because the intent is what the later phases fill in | **yes**, the only place `cfg(target_os)` is allowed |
+| `omni-platform` | OS primitives: virtual memory, threads, files, dynamic loading, clocks, windowing. One module per OS behind one trait set. **Today that is `vm`, `fault`, `clock`, `process`, `log` and `fs`** — threads, dynamic loading and windowing are still aspirational, and the row is left describing the intent rather than trimmed, because the intent is what the later phases fill in. `fs` is a **rooted** seam rather than a bare one: a guest path resolves only inside one host directory the embedding supplies (D23) | **yes**, the only place `cfg(target_os)` is allowed |
 | `omni-mem` | Guest address-space manager built on `omni-platform`: reservation, lazy commit, decommit, placeholder mapping, the JIT code arena | no |
 | `omni-apk` | APK reading, zip parsing, and the content-addressed 4 KB-aligned extraction cache | no |
 | `omni-elf` | Bionic-compatible ELF loader: program headers, APS2 packed relocations, symbol resolution, `init_array`, RELRO, `dl_iterate_phdr` state | no |

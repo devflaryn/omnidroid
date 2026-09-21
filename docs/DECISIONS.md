@@ -2109,3 +2109,365 @@ possible example of how they get in.
 **Cost if wrong.** The refusals are cheap to turn into implementations once the surface exists. The
 `_SC_*` constants are four lines behind one header. The expensive one to get wrong is `AT_HWCAP`,
 and it is not decided here.
+
+---
+## D23 — Phase 3b: files, and a guest that cannot name a host file
+
+D20 is the adapter, D21 is phase 2, D22 is phase 3a. This is phase 3b of M3 task 3: the 29
+`file-io` symbols, the `omni-platform` seam under them, and the two design questions the brief
+said had to be answered explicitly rather than by accident.
+
+### What is bound now
+
+| | count | what |
+|---|---|---|
+| serviced inside the run loop | **140** | phase 3a's 111, plus all 29 of phase 3b |
+| serviced on the exit path | **8** | unchanged: nothing in this phase calls guest code or touches `GuestSpace` |
+| `STT_OBJECT` data objects | **18** | unchanged |
+| **of the 188 reachable imports** | **166** | 148 thunk functions and the 18 data objects |
+| left `Unbound` | **22** | eight sockets and polling, eight threads and signals, and the six nothing else claims |
+
+The 29: eighteen descriptor symbols (`open`, `__open_2`, `close`, `read`, `pread`, `__write_chk`,
+`access`, `stat`, `fstat`, `lstat`, `statvfs`, `rename`, `unlink`, `mkdir`, `rmdir`, `opendir`,
+`readdir`, `closedir`) and eleven `FILE *` ones (`fopen`, `fdopen`, `fclose`, `feof`, `fflush`,
+`fgets`, `fileno`, `fputc`, `fputs`, `fread`, `fwrite`).
+
+**Derived, not taken from the plan.** The plan's `3b` row was re-derived twice before anything was
+written: the 188 of `init-reachable-imports.txt` minus every symbol named in `bionic/handlers.rs`
+and `bionic/data.rs` gives the 51-symbol remainder, and intersecting that with
+`tools/os_surface.py`'s `file-io` bucket gives exactly these 29 — set equality in both directions,
+not a count. `the_bound_count_is_exactly_what_this_phase_claims` now names all 29 **and** asserts
+that the unbound remainder is exactly the 22 named ones, as a set difference against the reachable
+file rather than as a total. D21 records why: a count cannot see a substitution.
+
+All 29 are **inline**. None calls guest code and none reaches `GuestSpace` — they read and write
+guest memory, which `memcpy` already does from the fast path, and the arena a `FILE` or a `struct
+dirent` lands in is mapped once in `Bionic::new`. That is F9's constraint honoured by the same
+means phase 1 used, rather than by the exit path phase 2 needed.
+
+### Question 1: a guest path is an Android path and none of them exists here
+
+`/data/data/…`, `/system/lib64/…`, `/proc/self/maps`. **None may be allowed to mean what it
+says**: `open("/etc/passwd")` resolved against the host's own root hands the guest a host file. D6
+records that the APK under test is cheat-injected and that guest code is treated as hostile, and
+"several isolated instances in one process" is non-negotiable — two instances that can reach each
+other's files are not isolated.
+
+**The policy: every guest path is resolved to a host path inside one host directory, by rules
+applied before any host call, and a path that cannot be is refused by name.**
+
+**Confinement is a property of the type rather than a check.** A `Filesystem` *is* a root plus a
+descriptor table and there is no constructor without a root; an instance whose embedding has not
+called `Bionic::set_filesystem_root` has **no filesystem at all**, and every path-taking symbol
+refuses naming that method. That default is the same shape as `dl_iterate_phdr` refusing with no
+image registered (D21) and `HwcapPolicy::Undecided` refusing `getauxval` (D22), and for the same
+reason: a default root would have to be *somewhere* — the process's working directory, or a
+temporary directory — and either hands untrusted guest code host files nobody decided to expose.
+The root may be set **once**: allowing it to move would let a descriptor opened under one root be
+read under another.
+
+Six rules, in `omni_platform::fs::path`, four of them before any host call:
+
+1. **Length** — `PATH_MAX` (4096) and `NAME_MAX` (255), the guest's own limits, reported as
+   `ENAMETOOLONG` because that is what a real device answers. It is also what stops a guest's
+   64 KiB string becoming a 64 KiB host path.
+2. **Encoding** — UTF-8, because a lossy conversion can make two different guest paths name one
+   host file.
+3. **Lexical resolution with no host call** — split on `/`, drop `.` and empty components, *pop* on
+   `..`. A `..` at the top stays at the top, which is POSIX's own `/.. == /`. **After this step no
+   `..` exists**, so none ever reaches the host. This is the whole traversal defence and it is
+   arithmetic rather than a check made afterwards on a path the host already saw.
+4. **Component hygiene**, which is where the host-specific hazards die: a separator (`\` is one on
+   Windows, so `a\..\..\b` is a traversal the `/` split never sees), a drive or alternate-data-stream
+   marker (`:`), a wildcard, a control character, a **Windows character device** (`NUL`, `CON`,
+   `COM1`… name a device in *every* directory, with any extension), and a trailing dot or space
+   (Win32 strips them, so `secret.` and `secret` are one host file — two guest paths, one file).
+   Applied on all five targets rather than under a `cfg`, so the confinement property does not
+   depend on the host.
+5. **Symlinks** — every component is checked and a symlink anywhere in the path is refused, except
+   as the final component of an `lstat`, which is the one call whose job is to describe a link
+   without following it.
+6. **A final containment assertion** — the built path must still start with the root. Rules 3 and 4
+   already guarantee it; this costs one comparison and is what notices if they ever stop.
+
+**What it defends against and what it does not, stated rather than implied.** It defends against
+everything the *guest* can do, which is the threat D6 names: `symlink`, `symlinkat` and `link` are
+not in the reachable set and are not implemented, and `open(O_CREAT)` creates a regular file — so
+the set of symlinks inside the root is fixed by whoever populated it, and rule 5 refuses those. It
+is **not** race-free against an adversary who can create a symlink inside the root *while* the
+guest runs, because the check and the open are two calls. Closing that needs `openat(2)` with
+`O_NOFOLLOW` per component, which Windows has no equivalent of and `std` exposes on no target; the
+Linux backend's notes record it as a real improvement available on that target rather than a
+like-for-like port.
+
+**The guest has no working directory, and that is a fact rather than a simplification.** `chdir`,
+`fchdir` and `getcwd` are not among the 188, so nothing this milestone runs can move or observe
+one. A relative path therefore resolves against the root, which is what a zygote-forked Android
+app that never called `chdir` sees.
+
+The end-to-end test creates a bait file **outside** the root and hands the guest eleven shapes of
+path that would reach it, then asserts afterwards that the bait is unread and unmodified. A
+traversal that worked would show up as content rather than as a missing refusal.
+
+### Question 2: `sizeof(FILE)` is still ASSUMED, and this phase does not need it to be right
+
+D21 recorded `FILE_BYTES = 152` as derived from bionic's `struct __sFILE` and **not verified
+against an NDK**, with the obligation that "the phase that implements stdio must confirm it
+against a real header before reading a field". There is still no NDK on this machine. **The
+obligation is not discharged; it is narrowed, and the narrowing is the answer.**
+
+**No field of a guest `FILE` is ever read or written.**
+
+* A `FILE *` is a **key**, not a structure. The descriptor and the two sticky flags live in a
+  host-side table on `Bionic`, keyed by the guest address. `feof`, `fileno` and `fflush` answer
+  from that table.
+* The bytes at a `FILE *` are written exactly once — to **zero**, when the object is handed out —
+  and are never read. A zeroed bionic `FILE` has `_flags == 0`, which that library's own `__sfp`
+  calls a free slot, so the bytes say "not an open stream": true, and safe.
+* So a wrong `FILE_BYTES` cannot produce a wrong **answer**. It can only produce a wrong
+  **address** — a translation unit compiled against an old header where `stdout` was the macro
+  `(&__sF[1])` would compute a different one — and that address is not in the table, so every
+  function **refuses by name**, naming the address and the number this layer used. A loud failure,
+  not a silent one.
+
+**What remains open, precisely.** Anything that makes a `FILE` field observable to the guest:
+`ferror`, `clearerr`, `fseek` and `setvbuf` are the four that would, and **none is among the 188**.
+If a later phase binds one, that is the paragraph it invalidates. One residual edge is recorded
+rather than argued away: a translation unit that *inlines* a field access instead of calling the
+function reads our zeroes, which for `_flags` reads as "closed stream" and makes an inlined
+`feof`/`ferror` macro answer false — the safe direction, and it needs a pre-Lollipop NDK header to
+happen at all.
+
+The three guest structures this phase *does* write are the opposite case and are handled the
+opposite way: see below.
+
+### The five-target rule, applied with a sharper test than "does it call the OS"
+
+D22's rule is that a primitive implemented purely on `std` works on all five and must **not** get a
+fabricated `Unsupported` arm, because that is a false claim in the other direction. Files are where
+that rule has to be applied operation by operation rather than module by module, and the test that
+does it is: **is there one `std` call that serves all five targets?**
+
+| primitive | how | Linux / macOS |
+|---|---|---|
+| `open`, `close`, `read`, `write`, `flush` | `std::fs::File`, `Read`, `Write` | **implemented** — portable `std`, no backend |
+| `stat`, `lstat`, `fstat` | `fs::metadata`, `symlink_metadata`, `File::metadata` | **implemented** — portable `std` |
+| `rename`, `unlink`, `mkdir`, `rmdir` | `std::fs`'s four of the same name | **implemented** — portable `std` |
+| `opendir`, `readdir`, `closedir` | `std::fs::read_dir` | **implemented** — portable `std` |
+| `access` | metadata plus an open probe | **implemented** — portable `std` |
+| **`pread`** | **backend**: `FileExt::seek_read` on Windows | **`Unsupported`**, naming `pread(2)` |
+| **`statvfs`** | **backend**: `GetDiskFreeSpaceExW` + `GetDiskFreeSpaceW` + `GetVolumeInformationW` | **`Unsupported`**, naming `statvfs(3)` |
+
+Fifteen of the seventeen are one portable call and are written once. `pread` is
+`FileExt::seek_read` on Windows and `FileExt::read_at` on unix — two traits in two modules, no
+single call — and `statvfs` has no `std` spelling at all, so those two get the Windows
+implementation and a structural unix half, exactly as `process::random_bytes` does (D22).
+
+**Nothing here has been run on Linux or macOS.** The portable half is expected to work there and
+has not been built for either, let alone tested; an implementation existing is not a claim.
+
+### MEASURED: `FileExt::seek_read` is not `pread`, and the first version of this seam was wrong
+
+Windows' `ReadFile` with an `OVERLAPPED` offset updates the file pointer for a synchronous handle,
+and `std` does not undo it. Measured on a ten-byte file, n=1 per row and structural rather than
+statistical:
+
+| step | expected of `pread` | `seek_read` alone |
+|---|---|---|
+| `read(4)` | `0123`, cursor 4 | `0123`, cursor 4 |
+| `pread(3, offset 7)` | `789`, cursor still 4 | `789`, **cursor 10** |
+| `read(3)` | `456` | **0 bytes: end of file** |
+
+Every call returns `Ok`, nothing is reported, and a guest's *sequential* reads silently jump to the
+end of the file the first time anything `pread`s. That is the exact silent-wrong-answer shape this
+seam exists to avoid, and it is why `pread` is a primitive here rather than a seek and a read in
+the caller. The position is saved and restored now, **including when the read itself fails**.
+
+It was caught by the seam's own test, written before the implementation was believed. Row `fs-A3`
+is that defect injected.
+
+### `statvfs` invents nothing, and the three fields it does not answer are an answer
+
+Three Win32 queries fill every field: `GetDiskFreeSpaceW` for the cluster geometry,
+`GetDiskFreeSpaceExW` for the 64-bit byte counts (the older call's cluster counts are 32-bit and
+saturate near 8 TB; the newer one has no cluster size in it, so both are needed), and
+`GetVolumeInformationW` for `f_namemax`, `f_fsid` and the read-only flag.
+
+`f_files`, `f_ffree` and `f_favail` are **zero**, and that is what Linux reports for a filesystem
+with no fixed inode table — FAT and exFAT do exactly this, and NTFS has none either because its MFT
+grows. Any other number would be a count of something that does not exist, and a guest computing
+"inodes remaining" from an invented `f_files` would refuse to write a file for a reason nobody
+could find.
+
+### The three guest structures are the layout trap, and every field carries its provenance
+
+Android arm64 is LP64 with a 64-bit `time_t`, a 16-byte `struct timespec` and the kernel's own
+field order. Unlike `FILE`, these are **transparent** — the guest reads their fields directly — so
+a wrong offset is a wrong answer rather than a wrong address.
+
+| structure | bytes | source | state |
+|---|---|---|---|
+| `struct stat` | **128** | Linux UAPI `include/uapi/asm-generic/stat.h`, which arm64 uses unmodified and which bionic's `<sys/stat.h>` matches field for field on LP64 | **ASSUMED** |
+| `struct statvfs` | **112** | bionic `<sys/statvfs.h>`, LP64 | **ASSUMED** |
+| `struct dirent` | **280** | bionic `<dirent.h>`, LP64 (`dirent` and `dirent64` are the same structure there) | **ASSUMED** |
+
+`statvfs` has the strongest safety argument of the three, the same one `omni_bionic::time::TM_BYTES`
+has: on LP64 every one of `fsblkcnt_t`, `fsfilcnt_t` and `unsigned long` is eight bytes, so the
+layout is *forced* once the field order is right.
+
+Field by field, `struct stat`:
+
+* **Exact**: the `S_IF*` type bits, `st_size`, the three timestamps.
+* **`st_blksize`** is `IO_BLOCK` (4096) and is a **fact**: every chunked transfer in this seam and
+  in the `FILE *` layer moves at most that much, so a guest sizing its buffers from the field is
+  sizing them to what happens.
+* **`st_mode`'s permission bits are DERIVED** from the host's read-only attribute, which is the
+  only permission `std` exposes on all five targets, and the code says so rather than implying an
+  ACL evaluation. A symlink is `0o777`, which is not a derivation — Linux reports exactly that for
+  every symlink. Refusing `stat` outright because Windows has no mode word was considered and
+  rejected: `stat` is mostly used to ask "is this a directory" and "how big is it", both exact
+  here, and refusing all of it to avoid approximating one field would fail a correct program over a
+  field it is not reading. `access(W_OK)` and `st_mode & S_IWUSR` are derived from the *same* fact,
+  so they cannot disagree.
+* **`st_ino` is a hash of the path, never zero**, and this is the field where the choice matters
+  most. Windows' real file identity is reachable only from an open handle and opening a *directory*
+  needs a flag `std::fs` does not expose. **Zero was rejected outright**: real code compares
+  `(st_dev, st_ino)` pairs to ask "are these the same file", and a constant makes the answer always
+  *yes* — every file in the guest's world would be one file. A path hash answers "different" for
+  different names; its one inaccuracy is that a hard link reports as two files, which is the
+  conservative direction, and nothing the guest can call creates one. Row `fs-A4` is the zero.
+* **`st_nlink` is 1 for everything**, including directories. Not 2: **btrfs reports 1 for
+  directories**, so the `st_nlink - 2` subdirectory-count optimisation has had to tolerate it for a
+  decade, and 1 is *true* here because nothing can create a hard link.
+* **`st_uid` and `st_gid` are 0.** There is no user here. An invented app uid would be a number with
+  nothing behind it; 0 is the only value that is not one.
+* **`st_blocks`** is `size.div_ceil(512)` — the 512-byte units the field is defined in, derived
+  from the size rather than from allocation, so a sparse file over-reports. `div_ceil` rather than
+  `(n + 511) / 512`, because the second overflows for a size near `u64::MAX` and a release build
+  wraps.
+
+### The `FILE *` layer is in `omni-bionic`, over a trait, and that is where the interesting failures are
+
+D19's guarantee holds: `cargo tree -p omni-bionic -e normal` is still one line. The layer belongs
+there because **none of it is an OS call** — `fread(p, 3, 7, f)` is "multiply, with the overflow
+checked; read that many bytes; report how many whole items arrived", and only the middle clause
+reaches the OS. The adapter implements `stdio::Descriptors` over the filesystem seam; the tests
+implement it over a `Vec<u8>`.
+
+**Unbuffered, and that is a decision.** C says a stream may be unbuffered and `setvbuf` is not
+reachable. It is what makes `fgets` correct: an unbuffered `fgets` reads one byte at a time and
+stops **on** the newline, so the descriptor is left exactly where C says it is, where a buffered one
+reads ahead and must put back what it did not use — and a read-ahead that is not put back is a
+silently lost byte on a shared descriptor. It is also what makes `fflush` honest: every write
+reaches the descriptor before the call returns, so there is nothing of this layer's to flush and
+succeeding is the contract being *satisfied*. Calling `sync_all` instead would be a **stronger**
+guarantee than `fflush` makes, bought with a disk round trip per call. The test counts the reads —
+six for `"first\n"`, not seven.
+
+**`size * nmemb` is `checked_mul`, and the detector is the errno rather than the count.** Two
+guest numbers: a debug build panics on the overflow, which Global Constraint 11 calls Critical, and
+a **release build wraps** to zero — which still satisfies "fewer items than asked for", so a test
+that only checked the return would pass against the broken version. That is `gmtime(i64::MIN)`
+again (D22). Six boundary pairs are enumerated rather than sampled, and each asserts `EINVAL`.
+
+**Every host allocation is bounded by a constant, not by a guest argument.** Transfers move through
+a 4 KiB buffer however large the request is — the shape `arc4random_buf` already uses — so
+`fread(p, 1, 1 << 40, f)` runs through 4 KiB and returns what was there.
+
+### The split between `-1` with `errno` and a refusal, which is this group's whole risk
+
+* **Well-formed and legitimately failed → what Linux returns, with `errno` set.** `ENOENT`,
+  `EEXIST`, `ENOTEMPTY`, `EISDIR`, `ENOTDIR`, `EBADF`, `EMFILE`, `EINVAL`. The contract, not a stub:
+  guest code has a branch for every one and a real device produces them.
+* **Cannot be carried out correctly → `AbiError::Refused`, naming the symbol and the argument.**
+
+The refusals, each with the believable wrong answer it declines to give:
+
+1. **No filesystem root.** Answering `ENOENT` would hide "this runtime was not configured" inside
+   the ordinary noise of a guest probing for files.
+2. **A path that tries to leave the root.** A traversal, a Windows device name, a drive-relative
+   path. Reporting one as `ENOENT` would hide a hostile input in that same noise.
+3. **`access(X_OK)`.** Windows has no execute permission on a file and the read-only attribute says
+   nothing about one, so *both* answers are believable and wrong: `0` tells the guest it may execute
+   a file this runtime cannot execute at all, and `-1`/`EACCES` reports a policy decision nobody
+   made. `F_OK`, `R_OK` and `W_OK` are answered by **probing** — asking the host to open the file
+   the way the guest asks about — which is the only answer that is not a guess.
+4. **`O_SYNC`, `O_DSYNC`, `O_DIRECT`, `O_PATH`, `O_TMPFILE`, `FASYNC`.** Each promises something
+   this layer does not do, and each has "accept it and do nothing" sitting next to it — which is
+   `mlock`'s decision (D21) applied to flags. The flags that are *accepted and do nothing* are a
+   separate list and each is accepted because what it asks for is already true: `O_NOCTTY` (no
+   controlling terminal exists), `O_NONBLOCK` (a no-op on a regular file on Linux too),
+   `O_LARGEFILE` (always in effect on LP64), `O_NOFOLLOW` (no path component may be a symlink, which
+   is stronger), `O_NOATIME`, `O_CLOEXEC` (nothing execs). A bit nobody has defined is refused with
+   the bits named rather than masked away.
+5. **`__open_2` with `O_CREAT`.** That form takes no `mode`, so the file would be created with
+   whatever was in the register — which is why bionic's FORTIFY build calls `__fortify_fatal` here.
+   `__write_chk` with `count > buf_size` is the same shape: a **detected buffer overrun in guest
+   code**, reported as one rather than as a short write.
+6. **A wild `FILE *` or `DIR *`.** `NULL` is `readdir`'s own end-of-directory answer and `EBADF` is
+   `fileno`'s own invalid-stream answer, so either would let guest code route around a wild pointer,
+   a use-after-`fclose`, or the `&__sF[n]` arithmetic. Every `FILE *` and `DIR *` in this guest's
+   world came out of this layer. (`closedir` is the exception and answers `EBADF`: its whole job is
+   to release a handle, and `EBADF` is what a double `closedir` gets on a device.)
+7. **A host failure `std::io::ErrorKind` did not classify.** It is **not** given `EIO`. `EIO` is a
+   real answer guest code retries and reports; an error nobody identified deserves the refusal that
+   names it. The trait between the layers carries an errno, so the adapter *stashes* the
+   unclassified failure and refuses after the stream logic unwinds — the same shape `GuestView`
+   already uses to carry a rich `AbiError` through `omni-bionic`'s thin `Fault`.
+
+### Recorded and not worked around: `mkdir`'s mode is not applied
+
+Windows has no POSIX permission bits, so a directory the guest asks to create with `0700` is
+created with what it inherits from the instance's root. It is stated in the open rather than turned
+into a refusal, because refusing every `mkdir` would stop the engine creating any directory at all,
+and because **the security boundary this design rests on is the root** — which the host operator
+supplies and protects — rather than the permissions of one directory inside it. Row `files-B7`
+injects the over-correction.
+
+### Two facts about descriptors that are answers rather than gaps
+
+`stdin` reads **end of file immediately**: this guest was started with no terminal and no pipe, so
+there is nothing to read. Blocking would be the wrong answer and inventing input a worse one.
+`stdout` and `stderr` go to the host's own standard streams — not to `omni-platform::log`, which is
+where a *log record* with a priority and a tag goes; a `write(1, …)` is bytes with neither.
+
+The three are registered as streams over descriptors 0, 1 and 2 when the data objects are placed,
+so `fileno(stdout)` is 1. That one assertion proves the registration, the `FILE_BYTES` spacing and
+the declaration order in `DATA_OBJECTS` all agree with each other.
+
+### A correction to a refusal that this phase made false
+
+`fprintf` and `vfprintf` refused with "writing to the guest `FILE *` needs host file surface, and
+`omni-platform` has none yet: it is virtual memory and faults only". That was true until this phase
+and is not any more. Both refusals now name what is **actually** missing — the binding of the
+`printf` family onto the stream layer, both halves of which now exist — and say that phase 3b
+deliberately left it out of its scope of 29. A diagnostic that states something false is a defect in
+the diagnostic, and this project's record already carries enough of those.
+
+### Verification
+
+* `cargo test --workspace --release`: **1,058 passed, 0 failed, 12 ignored**, from 1,004. The 54
+  new tests are 21 in `omni-platform`'s lib (16 → 37), 11 in `omni-bionic`'s new `stdio` module
+  (97 → 108), 8 in `omni-android`'s lib (91 → 99) and 15 in `omni-android`'s `bionic` target
+  (76 → 91). `omni-bionic` and `omni-android`'s libs were also run in **debug**, per the working
+  agreement about overflow, and pass there.
+* `tools/mutate.py`: **213 → 239 rows**, 26 new — 19 direction A and 7 direction B — and the new
+  rows are **26/26 caught**. A full run of the whole table is reported separately below.
+* Clippy clean on `--all-targets --release`, `cargo doc --workspace --no-deps` clean,
+  `cargo build --workspace --release --no-default-features` builds.
+* `cargo tree -p omni-bionic -e normal` is still one line (D19), and `cargo tree -p omni-android -e
+  normal` still has no `dynarmic-sys`.
+* The portability invariant is re-verified: every `cfg(target_os)` mention outside `omni-platform`
+  is still a doc comment stating the rule or a `#![cfg(target_os = "windows")]` gate on a
+  Windows-only *test*, which the two `windows_only.rs` files already assert. This phase added none.
+
+**Nothing here is a claim about Linux or macOS.** Neither has been built for, let alone run.
+
+### Cost if wrong
+
+The confinement rules are the expensive thing to get wrong and they are the most heavily tested:
+one property test against a bait file outside the root, the lexical rules enumerated rather than
+sampled, and four mutation rows in both directions. The three ASSUMED layouts are the next: each is
+one table and is cheap to change, and each is asserted from real guest code against a value the
+test chose, so an offset that moved fails rather than drifts. `MAX_OPEN_FILES`, `MAX_OPEN_DIRS`,
+`MAX_GUEST_FILES` and `MAX_DIR_ENTRIES` are policy numbers and are stated as such.
