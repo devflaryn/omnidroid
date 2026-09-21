@@ -48,6 +48,13 @@
 //! implement any of them, and a stub that pretended to would be exactly the "plausible stub" the
 //! design rules above forbid.
 //!
+//! **Amendment, M3 task 3 phase 3c.** The adapter now implements those eight, over a CPU backend
+//! the embedding supplies; `pthread_sigmask` is still excluded here and is **refused** there,
+//! for the same reason. One signal symbol did move in: [`signal::fillset`], which is
+//! `memset(set, 0xff, sizeof(sigset_t))` and touches no state at all, so it belongs on this side
+//! of the line while `sigaction` and `raise` stay refusals in the adapter. That module's
+//! documentation has the split.
+//!
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![warn(clippy::all)]
@@ -73,6 +80,7 @@ pub mod mutex;
 pub mod numerics;
 pub mod once;
 pub mod shared_mem;
+pub mod signal;
 pub mod printf;
 pub mod rwlock;
 pub mod sem;

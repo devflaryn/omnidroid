@@ -55,7 +55,7 @@ use crate::error::{AbiError, AbiResult};
 use super::view::GuestView;
 use super::{
     active, clocks, dl, enter, files, format, guestmem, logging, procenv, runtime::CallThreads,
-    stdio,
+    signals, stdio,
 };
 
 // ------------------------------------------------------------------ result lifting
@@ -922,6 +922,14 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("fputs", stdio::fputs),
     ("fread", stdio::fread),
     ("fwrite", stdio::fwrite),
+    // ---- phase 3c: signals. One is answered because it is pure computation over the guest's
+    // own `sigset_t`; three are bound and **refuse by name**, because there is no guest signal
+    // delivery here and each of them has a believable wrong answer that would not be observable
+    // until much later. `signals`' module documentation has the table.
+    ("sigfillset", signals::sigfillset),
+    ("sigaction", signals::sigaction),
+    ("raise", signals::raise),
+    ("pthread_sigmask", signals::pthread_sigmask),
 ];
 
 /// Serviced on the **exit** path: 80-102 ns per call.

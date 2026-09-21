@@ -96,6 +96,21 @@ pub mod sizes {
     /// `sizeof(struct timespec)` — LP64: `tv_sec` 8 (64-bit) + `tv_nsec` 8 = 16 bytes.
     /// Confidence: HIGH (LP64 `time_t` is 64-bit; the struct is naturally padded to 8).
     pub const TIMESPEC: u64 = 16;
+
+    /// `sizeof(sigset_t)` — bionic LP64: `typedef unsigned long sigset_t`, so 8 bytes.
+    ///
+    /// Confidence: HIGH, and the argument is that the size is **forced** rather than chosen.
+    /// The kernel's `_KERNEL__NSIG` is 64, so a 64-bit word holds exactly one bit per signal
+    /// and there is nothing for a larger type to carry; bionic's `sigset64_t` is the same eight
+    /// bytes on LP64, which is why that library aliases the two there. Still **ASSUMED** in the
+    /// sense this project uses the word — there is no NDK on this machine to read the header
+    /// from — and it is recorded here beside the other ASSUMED layouts rather than inline.
+    ///
+    /// The safety direction matters and is the reason this one is comfortable: the only write
+    /// this crate makes to a `sigset_t` is [`crate::signal::fillset`], which writes exactly this
+    /// many bytes. Too small would under-fill a set the guest then uses to block signals — and
+    /// nothing in the reachable set can block one, because `pthread_sigmask` is refused.
+    pub const SIGSET_T: u64 = 8;
 }
 
 /// Field offsets inside the structs, where this crate's own representation needs one.

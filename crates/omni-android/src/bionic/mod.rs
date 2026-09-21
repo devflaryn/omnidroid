@@ -46,6 +46,7 @@ mod handlers;
 mod logging;
 mod procenv;
 mod runtime;
+mod signals;
 mod stdio;
 mod view;
 

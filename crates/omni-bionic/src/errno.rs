@@ -16,6 +16,12 @@ pub mod consts {
     pub const EPERM: i32 = 1;
     /// No such file or directory.
     pub const ENOENT: i32 = 2;
+    /// No such process: a `pthread_t` no live thread answers to.
+    ///
+    /// POSIX's own answer for `pthread_join`, `pthread_detach` and `pthread_getschedparam`
+    /// given an id that names no thread, and what bionic's `__pthread_internal_find` produces
+    /// when its table has no entry.
+    pub const ESRCH: i32 = 3;
     /// Interrupted system call.
     pub const EINTR: i32 = 4;
     /// Input/output error.
@@ -102,6 +108,7 @@ mod tests {
         // errno-base.h
         assert_eq!(EPERM, 1);
         assert_eq!(ENOENT, 2);
+        assert_eq!(ESRCH, 3, "the thread-lifecycle group's own, added in phase 3c");
         assert_eq!(EINTR, 4);
         assert_eq!(EIO, 5);
         assert_eq!(EBADF, 9);
@@ -140,7 +147,7 @@ mod tests {
     #[test]
     fn the_errno_values_are_all_distinct() {
         let all = [
-            EPERM, ENOENT, EINTR, EIO, EBADF, EAGAIN, ENOMEM, EACCES, EBUSY, EEXIST, ENOTDIR,
+            EPERM, ENOENT, ESRCH, EINTR, EIO, EBADF, EAGAIN, ENOMEM, EACCES, EBUSY, EEXIST, ENOTDIR,
             EISDIR, EMFILE, EFBIG, ENOSPC, ESPIPE, EROFS, EINVAL, EDOM, ERANGE, EDEADLK,
             ENAMETOOLONG, ENOSYS, ENOTEMPTY, ELOOP, EOVERFLOW, ENOTSUP, ETIMEDOUT, EOWNERDEAD,
             ENOTRECOVERABLE,

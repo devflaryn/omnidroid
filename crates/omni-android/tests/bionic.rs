@@ -151,15 +151,16 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 148, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 152, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
     // Phase 3b adds 29, all inline: eighteen descriptor symbols and eleven `FILE *` ones.
-    assert_eq!(Bionic::inline_symbols().count(), 140);
+    // Phase 3c adds 4 inline (the signal family) and 4 re-entrant (thread lifecycle).
+    assert_eq!(Bionic::inline_symbols().count(), 144);
     assert_eq!(Bionic::reentrant_symbols().count(), 8);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
-    // handler at all. 148 + 18 = 166 of the 188 the initializers reach.
+    // handler at all. 152 + 18 = 170 of the 188 the initializers reach.
     assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
 
     // **Membership, not just a total** — a count cannot see a substitution, and this project has
@@ -252,15 +253,12 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         "poll",
         "select",
         "socket",
-        // threads and signals
+        // threads and signals: `pthread_create`, `join`, `detach` and `getschedparam` are
+        // still here until phase 3c's second half binds them; the four signal symbols are not.
         "pthread_create",
         "pthread_detach",
         "pthread_getschedparam",
         "pthread_join",
-        "pthread_sigmask",
-        "raise",
-        "sigaction",
-        "sigfillset",
         // the remainder nothing else claims
         "clock",
         "time",
@@ -269,7 +267,7 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         "__gcov_dump",
         "__gcov_flush",
     ];
-    assert_eq!(still_unbound.len(), 22, "188 - 148 bound - 18 data objects");
+    assert_eq!(still_unbound.len(), 18, "188 - 152 bound - 18 data objects");
     for symbol in still_unbound {
         assert!(
             !bound.contains(symbol),
@@ -929,6 +927,126 @@ fn the_unservable_printf_family_refuses_with_the_missing_piece_named() {
         assert!(text.contains(needle), "`{symbol}` must say what is missing: {text}");
         assert!(matches!(error, AbiError::Refused { .. }), "{error:?}");
     }
+}
+
+// =================================================================== signals (phase 3c)
+
+/// **`sigfillset` really fills the guest's `sigset_t`, and stops at its end.**
+///
+/// Asserted on the *bytes*, not on the return value: a handler that returned 0 and wrote nothing
+/// would pass any assertion about the result, and the guest would carry an uninitialised set
+/// forward. The guard word after the set is what catches a write sized from the wrong constant.
+#[test]
+fn sigfillset_fills_every_bit_of_the_guests_sigset() {
+    let _guard = serialized();
+    let f = fixture();
+    let set = f.guest.data + 0x200;
+    f.guest.write_u64(set, 0);
+    f.guest.write_u64(set + 8, 0x1234_5678_9ABC_DEF0);
+    let result = value_of(&f, "sigfillset", |asm| {
+        asm.mov(0, set as u64);
+    });
+    assert_eq!(result, 0, "sigfillset returns 0 on success");
+    assert_eq!(f.guest.read_u64(set), u64::MAX, "every one of the 64 signal bits");
+    assert_eq!(
+        f.guest.read_u64(set + 8),
+        0x1234_5678_9ABC_DEF0,
+        "and nothing past sizeof(sigset_t), which is 8 on LP64"
+    );
+}
+
+/// A null `set` is bionic's own `-1` with `EINVAL`, read back through `__errno` the way the guest
+/// would read it. It is not a refusal: guest code has a branch for this one.
+#[test]
+fn sigfillset_with_a_null_set_is_minus_one_with_einval() {
+    let _guard = serialized();
+    let f = fixture();
+    let out = f.guest.data + 0x300;
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, 0);
+    asm.bl(f.thunk("sigfillset"));
+    asm.mov(22, out as u64);
+    asm.push(str_imm(0, 22, 0));
+    asm.bl(f.thunk("__errno"));
+    asm.push(ldr_w(1, 0, 0));
+    asm.push(str_imm(1, 22, 8));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i64, -1, "sigfillset(NULL) is -1, sign-extended");
+    assert_eq!(f.guest.read_u64(out + 8), 22, "EINVAL is Linux's 22");
+}
+
+/// A `sigset_t` the guest cannot write to is a typed refusal naming the symbol, not a host
+/// access violation and not a silent success.
+#[test]
+fn sigfillset_on_read_only_guest_memory_is_a_typed_refusal() {
+    let _guard = serialized();
+    let f = fixture();
+    let error = refusal_of(&f, "sigfillset", |asm| {
+        asm.mov(0, f.guest.readonly as u64);
+    });
+    assert_eq!(error.symbol(), Some("sigfillset"));
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+}
+
+/// **The three that cannot be delivered refuse by name, and say what is missing.**
+///
+/// `Unbound` would have said only "nothing implements this". A refusal says *why*, names the
+/// signal number the guest asked about, and — for `raise` — says explicitly that mapping
+/// `SIGABRT` onto `abort`'s reported termination was considered and declined. A `0` from any of
+/// these is the failure Global Constraint 1 is about: it is not observable until the thing the
+/// guest registered for actually happens.
+#[test]
+fn the_undeliverable_signal_family_refuses_by_name() {
+    let _guard = serialized();
+    let f = fixture();
+    // SIGSEGV(11) for sigaction, SIGABRT(6) for raise, SIG_BLOCK(0) for the mask.
+    for (symbol, needles, setup) in [
+        (
+            "sigaction",
+            vec!["SIGSEGV", "no guest signal delivery", "installing a handler"],
+            vec![11u64, 0x4000, 0x5000],
+        ),
+        ("raise", vec!["SIGABRT", "`abort`"], vec![6, 0, 0]),
+        ("pthread_sigmask", vec!["SIG_BLOCK", "D19"], vec![0, 0x4000, 0]),
+    ] {
+        let error = refusal_of(&f, symbol, |asm| {
+            for (index, value) in setup.iter().enumerate() {
+                asm.mov(index as u32, *value);
+            }
+        });
+        assert_eq!(error.symbol(), Some(symbol));
+        assert_eq!(error.guest_address(), Some(f.thunk(symbol)));
+        assert!(matches!(error, AbiError::Refused { .. }), "{error:?}");
+        let text = error.to_string();
+        for needle in needles {
+            assert!(text.contains(needle), "`{symbol}` must say `{needle}`: {text}");
+        }
+    }
+}
+
+/// `sigaction`'s **query** form is refused too, and says which form it was.
+///
+/// It is the one that looks answerable — nothing can have installed a handler, so `SIG_DFL` is
+/// arithmetically true — and answering it would mean writing a `struct sigaction` whose layout
+/// has never been checked against a header on this machine, to describe a table that does not
+/// exist.
+#[test]
+fn the_query_form_of_sigaction_is_refused_and_names_itself_as_a_query() {
+    let _guard = serialized();
+    let f = fixture();
+    let error = refusal_of(&f, "sigaction", |asm| {
+        asm.mov(0, 13); // SIGPIPE
+        asm.mov(1, 0); // act == NULL: a query
+        asm.mov(2, f.guest.data as u64 + 0x400);
+    });
+    let text = error.to_string();
+    assert!(text.contains("querying the current disposition"), "{text}");
+    assert!(text.contains("SIGPIPE"), "{text}");
 }
 
 /// A handler on a thread with no instance published refuses by name rather than inventing a

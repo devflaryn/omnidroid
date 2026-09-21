@@ -25,3 +25,6 @@ Thumbs.db
 
 # Mutation-harness backups (crates/dynarmic-sys/tools/mutate_shim.py)
 *.mutate-orig
+
+# Scratch produced by review tooling; never part of the record.
+.freebuff/
