@@ -1,4 +1,5 @@
-//! Bionic's `FILE *` layer: `fgets`, `fputs`, `fputc`, `fread`, `fwrite`, `feof`, `fflush`.
+//! Bionic's `FILE *` layer: `fgets`, `fputs`, `fputc`, `fread`, `fwrite`, `feof`, `fflush`, and
+//! the `fopen`/`fdopen` mode string.
 //!
 //! # Why this is here and not in the platform crate
 //!
@@ -33,10 +34,51 @@
 //!   did not use; an unbuffered one reads one byte at a time and stops *on* the newline, so the
 //!   descriptor is left exactly where C says it is. With a shared descriptor, a read-ahead that
 //!   was never put back is a silently lost byte.
-//! * `fflush` therefore has nothing of ours to flush, which is why it is not a lie to succeed.
+//! * `fflush` has nothing of **ours** to flush — and that clause is where a reader has already
+//!   gone wrong once, so it is spelled out in full below.
 //!
 //! The cost is a `read(2)` per byte in `fgets`. Correct rather than fast, and nothing in the
 //! 3,594 initializers reads a line in a hot loop.
+//!
+//! # "Nothing of ours to flush" is not "nothing to flush", and `fclose` must still flush
+//!
+//! [`Descriptors::flush`] exists, is called by [`fflush`], and is **not** a formality. This layer
+//! holds no bytes, but the layer under it may: the adapter's standard streams are the host's own
+//! `Stdout` and `Stderr`, which buffer, and its `flush` reaches them for real.
+//!
+//! C is explicit about what that costs anyone who forgets it:
+//!
+//! * **C17 7.21.5.1p2 (`fclose`)** — "causes the stream pointed to by `stream` to be flushed and
+//!   the associated file to be closed. Any unwritten buffered data for the stream are delivered
+//!   to the host environment to be written to the file."
+//! * **C17 7.22.4.4p2 (`exit`)** — "all open streams with unwritten buffered data are flushed,
+//!   all open streams are closed".
+//!
+//! So a `fclose` that closes without flushing first **silently drops whatever the layer below was
+//! holding**, and on a standard stream that is the last thing the engine said before it stopped.
+//! The believable wrong answer is the one this project already wrote down: `fclose` returns `0`,
+//! every assertion about return values passes, and the output is simply not there.
+//!
+//! **This crate cannot fix that, and the reason is structural rather than an omission.**
+//! [`Descriptors`] has `read`, `write` and `flush` and deliberately has **no `close`**: closing a
+//! descriptor is an operating-system call, this crate has no OS access (D19), and there is
+//! therefore no `omni_bionic::stdio::fclose` for the flush to live inside. Adding a `close` to the
+//! trait to create one would be worse than the defect — it would be a fourth method whose only
+//! implementation is in the adapter, for the sake of calling the third one first.
+//!
+//! The obligation is therefore stated here and discharged by the caller: **an adapter's `fclose`
+//! must call [`Descriptors::flush`] (or `fflush`) on the stream before it closes the descriptor,
+//! and must close it whatever the flush reported**, because C17 7.21.5.1p2 also says the stream is
+//! no longer usable after `fclose` whether or not it succeeded.
+//!
+//! # The `fopen` mode string is parsed here, whole
+//!
+//! [`parse_mode`] is pure byte arithmetic over a guest-supplied string, which is this module's
+//! own definition of what belongs on this side of the trait, and it is written up under that
+//! function rather than here. The one fact worth stating at the top: **it is given the whole mode
+//! string and it never shortens one.** A parse that silently drops the tail of a long mode can
+//! drop a `+` with it and hand back a read-only stream to a caller that asked for a read-write
+//! one, which is a wrong answer with nothing anywhere reporting it.
 //!
 //! # Every host allocation here is bounded by a constant, not by a guest argument
 //!
@@ -417,6 +459,233 @@ pub fn write_host_bytes(
         }
     }
     Ok(done as u64)
+}
+
+// ================================================================== the fopen mode string
+
+/// What a `fopen` or `fdopen` mode string asked for, in the vocabulary of `open(2)`.
+///
+/// **This crate's own type, not `omni-platform`'s.** The flags an adapter finally hands its
+/// filesystem seam are that crate's business; what a *mode string means* is byte arithmetic over
+/// a guest argument, so it is here, where it can be tested without a filesystem — the same split
+/// [`Descriptors`] already makes. An adapter maps this onto its own open flags in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenMode {
+    /// The stream may be read.
+    pub read: bool,
+    /// The stream may be written.
+    pub write: bool,
+    /// Create the file if it does not exist (`O_CREAT`).
+    pub create: bool,
+    /// Truncate an existing file to zero length (`O_TRUNC`).
+    pub truncate: bool,
+    /// Every write goes to the end of the file (`O_APPEND`).
+    pub append: bool,
+    /// Fail if the file already exists (`O_EXCL`).
+    ///
+    /// **Never set without [`create`](Self::create)**, and that is load-bearing rather than
+    /// tidiness: POSIX.1-2017 `open` says "if `O_EXCL` is set and `O_CREAT` is not set, the
+    /// result is undefined", so an `x` on a mode that does not create has no defined meaning to
+    /// pass on. See [`parse_mode`] for what happens to it.
+    pub exclusive: bool,
+    /// The descriptor should not survive an `exec` (`O_CLOEXEC`), from bionic's `e` modifier.
+    ///
+    /// Carried rather than dropped. Nothing in this milestone execs, so an adapter that ignores
+    /// it is ignoring something unobservable — but the drop is then in one place that can say so,
+    /// instead of being a character the parse quietly forgot.
+    pub close_on_exec: bool,
+}
+
+/// Why [`parse_mode`] refused a mode string.
+///
+/// Every variant is `EINVAL` to the guest — see [`ModeRefusal::errno`]. The variants exist so
+/// that a caller can say *which byte* it refused and why, which is the difference between a
+/// diagnosable `fopen` returning `NULL` and an unexplained one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeRefusal {
+    /// The mode string was empty, or its first byte was the terminator.
+    ///
+    /// C17 7.21.5.3p3 lists the permitted mode strings and the empty string is not among them;
+    /// bionic reaches its `default:` arm on the terminator and reports `EINVAL`.
+    Empty,
+    /// The first byte was not one of `r`, `w` or `a`. Carries the byte.
+    Access(u8),
+    /// A byte after the first was not one of `+`, `b`, `x`, `e`. Carries the byte.
+    Modifier(u8),
+}
+
+impl ModeRefusal {
+    /// The `errno` a guest sees for this refusal.
+    ///
+    /// `EINVAL` for every variant, which is what `fopen` reports for a mode it cannot parse. It
+    /// is a method rather than a constant at the call site so that there is one place to read.
+    #[must_use]
+    pub const fn errno(self) -> i32 {
+        consts::EINVAL
+    }
+}
+
+impl core::fmt::Display for ModeRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            ModeRefusal::Empty => f.write_str("the mode string is empty"),
+            ModeRefusal::Access(byte) => write!(
+                f,
+                "the mode string starts with {}, which is not one of `r`, `w` or `a`",
+                Quoted(byte)
+            ),
+            ModeRefusal::Modifier(byte) => write!(
+                f,
+                "the mode string contains the modifier {}, which is not one of `+`, `b`, `x` or \
+                 `e`",
+                Quoted(byte)
+            ),
+        }
+    }
+}
+
+/// A single byte printed so that a non-printable one is still readable in a message.
+struct Quoted(u8);
+
+impl core::fmt::Display for Quoted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_ascii_graphic() {
+            write!(f, "`{}`", self.0 as char)
+        } else {
+            write!(f, "the byte {:#04x}", self.0)
+        }
+    }
+}
+
+/// Read a `fopen`/`fdopen` mode string into the access it asks for.
+///
+/// `mode` is the bytes of the guest's mode string. It may be **any bytes at all** — the guest
+/// chose them — and this function is total over them: it returns [`OpenMode`] or a named
+/// [`ModeRefusal`], never a shortened mode and never a panic.
+///
+/// # The rule, in one sentence
+///
+/// The **first** byte selects the access and is mandatory; every **remaining** byte must be a
+/// modifier this layer understands, and each one is honoured.
+///
+/// | mode | access | source |
+/// |---|---|---|
+/// | `r` | read | C17 7.21.5.3p3 |
+/// | `r+` | read and write | C17 7.21.5.3p3 |
+/// | `w` | write, create, truncate | C17 7.21.5.3p3 |
+/// | `w+` | read and write, create, truncate | C17 7.21.5.3p3 |
+/// | `a` | write, create, append | C17 7.21.5.3p3 |
+/// | `a+` | read and write, create, append | C17 7.21.5.3p3 |
+///
+/// `r+b` and `rb+` are **the same mode**, and C17 7.21.5.3p3 lists both spellings explicitly;
+/// the modifiers are a set here rather than a sequence, so order cannot matter.
+///
+/// * **`b`** is accepted and does nothing. POSIX.1-2017 `fopen`: "the character `b` shall have no
+///   effect". `std::fs` translates no line ending on any target, so a stream opened without `b` is
+///   already binary — which matters more on a Windows host than on a device, and is why nothing in
+///   this layer ever touches a `\r`.
+/// * **`e`** is bionic's and glibc's `O_CLOEXEC` modifier. It is recorded in
+///   [`OpenMode::close_on_exec`] rather than discarded here.
+/// * **`x`** is `O_EXCL` (C11 added `wx` and its spellings to 7.21.5.3p3). It is honoured with
+///   `w` and `a`, and with `r` it is accepted and has **no effect**, because
+///   [`OpenMode::exclusive`] is never set without [`OpenMode::create`] and POSIX.1-2017 `open`
+///   leaves `O_EXCL` without `O_CREAT` undefined. That drop is stated here and asserted by a
+///   test; it changes no access, only a flag with no defined meaning to change.
+/// * **Anything else** after the first byte is [`ModeRefusal::Modifier`].
+///
+/// # Why there is no length bound, and why that IS the fix
+///
+/// This function used to live in the adapter behind a 16-byte bound whose own documentation said
+/// a longer mode was `EINVAL` — and the code **truncated** instead, so a 17-byte
+/// `"rbbbbbbbbbbbbbbb+"` lost its `+` and opened a **read-only** stream for a caller that asked
+/// for a read-write one. Nothing reported it: `fopen` returned a perfectly good `FILE *`, and the
+/// first `fwrite` failed much later somewhere else. That is the finding this function exists to
+/// close.
+///
+/// Raising the bound would not have closed it; it would have moved it. Refusing past the bound —
+/// making the code match the old doc — would have closed the silence but bought a *second*
+/// disagreement: C17 7.21.5.3's footnote says an implementation "might choose to ignore the
+/// remaining characters" of a mode string that begins with a valid sequence, and bionic's own
+/// `__sflags` walks the mode to its terminator with no limit at all, so a long-but-meant mode is
+/// one a real device opens and we would have refused.
+///
+/// So the bound is gone and the whole string is read. **A bound was never what made this safe.**
+/// The work is one pass over a slice the *caller* already bounded — the adapter reads the mode
+/// with a `cstr` walk capped at `GuestMem::STRING_LIMIT` (64 KiB), the same cap every other guest
+/// string in that layer gets — and this pass is strictly cheaper than the walk that produced it.
+/// With no bound there is no tail to lose, at any length, so the property the finding is about
+/// ("the access granted is the access asked for") holds by construction rather than by a
+/// constant.
+///
+/// # An interior NUL ends the mode, because that is where a C string ends
+///
+/// `fopen(path, "r\0b+")` asks for **`"r"`**: the `b+` is not part of the string, it is memory
+/// after it. Honouring that is not a truncation — it is C's own definition of a string, and it
+/// makes this function give the same answer whether a caller hands it the mode or the buffer the
+/// mode lives in. Today's adapter cannot reach it (its `cstr` already stops at the NUL), so this
+/// is a property of the function's contract rather than a live check on guest input, and it is
+/// tested directly.
+///
+/// # Provenance
+///
+/// * **C17 7.21.5.3p3 and its footnote** — the mode list, the `x` spellings, and the permission
+///   to ignore trailing characters. Normative.
+/// * **POSIX.1-2017 `fopen` and `open`** — `b` has no effect; `O_EXCL` without `O_CREAT` is
+///   undefined.
+/// * **bionic's `__sflags` (`bionic/libc/stdio/flags.cpp`)** — that the first character is
+///   switched on and the rest walked to the terminator with no length limit. **RECALLED, not
+///   verified: there is no NDK and no bionic checkout on this machine.** Nothing above depends on
+///   it — it is cited only as the reason a length *refusal* was rejected, and C17 7.21.5.3p3
+///   makes every mode it could disagree about undefined behaviour, so a disagreement cannot make
+///   this layer non-conforming.
+///
+/// # Errors
+///
+/// A [`ModeRefusal`] naming the byte that refused. All of them are `EINVAL`.
+pub fn parse_mode(mode: &[u8]) -> Result<OpenMode, ModeRefusal> {
+    // Where the C string ends. `position` and not a bound: nothing is dropped that was part of
+    // the string.
+    let mode = match mode.iter().position(|&byte| byte == 0) {
+        Some(end) => &mode[..end],
+        None => mode,
+    };
+    let Some((&access, modifiers)) = mode.split_first() else {
+        return Err(ModeRefusal::Empty);
+    };
+    // The first byte, and only the first byte, selects the access. A leading space, a `R`, a `+`
+    // on its own -- all of them land here, which is bionic's `default:` arm and C17 7.21.5.3p3's
+    // undefined case.
+    let (reads, writes, create, truncate, append) = match access {
+        b'r' => (true, false, false, false, false),
+        b'w' => (false, true, true, true, false),
+        b'a' => (false, true, true, false, true),
+        other => return Err(ModeRefusal::Access(other)),
+    };
+    let mut plus = false;
+    let mut exclusive = false;
+    let mut close_on_exec = false;
+    // Every remaining byte, however many there are. No `take`, no `min`, no cap: see above.
+    for &byte in modifiers {
+        match byte {
+            b'+' => plus = true,
+            b'b' => {}
+            b'x' => exclusive = true,
+            b'e' => close_on_exec = true,
+            other => return Err(ModeRefusal::Modifier(other)),
+        }
+    }
+    Ok(OpenMode {
+        // `+` adds the half the access letter did not give. `r+` and `w+` and `a+` are all
+        // read-and-write, which is why this is an `||` in both fields rather than a per-arm
+        // assignment that has to be right three times.
+        read: reads || plus,
+        write: writes || plus,
+        create,
+        truncate,
+        append,
+        exclusive: exclusive && create,
+        close_on_exec,
+    })
 }
 
 // ------------------------------------------------------------------ the shared machinery
