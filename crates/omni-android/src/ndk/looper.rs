@@ -53,7 +53,7 @@ use crate::abi::Args;
 use crate::boundary::{GuestArg, ImportCall, ImportFn, ReentrantCall, ReentrantFn};
 use crate::error::{AbiError, AbiResult};
 
-use super::{active, Ndk, MAX_LOOPER_FDS};
+use super::{active, Ndk, NdkState, MAX_LOOPER_FDS};
 
 // ================================================================== the NDK's own constants
 //
@@ -260,8 +260,26 @@ fn prepare(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// `AAsset *` passed where an `ALooper *` belongs, and a `looper + 4` the engine computed, are
 /// both refusals rather than lookups that happen to succeed.
 fn looper_at(ndk: &Ndk, c: &ImportCall<'_, '_>, looper: u64) -> AbiResult<GuestAddr> {
-    let at = GuestAddr::try_from(looper).unwrap_or(0);
     let state = ndk.state.lock();
+    looper_in(&state, c, looper)
+}
+
+/// As [`looper_at`], but against a state whose lock the caller **already holds**.
+///
+/// # Why this exists, and why the lock must not be released in between
+///
+/// A liveness check justifies a later `expect` only if nothing could have changed the table in
+/// between. `looper_at` takes the lock, checks, and *drops* it before returning; a caller that
+/// then re-locks and writes `.expect("the slot was checked live")` is asserting something that
+/// stopped being true the moment the guard fell. `ALooper_release` on another guest thread, taking
+/// the last reference, frees the slot in exactly that window -- and `ALooper_pollOnce` holds the
+/// window open for as long as it sleeps, which makes ordinary shutdown the case that hits it.
+///
+/// What the panic would cost is the point: a release the guest got wrong is a *guest* defect, and
+/// this layer's contract is that such a thing becomes a typed refusal naming the symbol and the
+/// guest address, never a host panic unwinding out of an import.
+fn looper_in(state: &NdkState, c: &ImportCall<'_, '_>, looper: u64) -> AbiResult<GuestAddr> {
+    let at = GuestAddr::try_from(looper).unwrap_or(0);
     if state.loopers.index_of(at).is_none() {
         return Err(refuse_inline(
             c,
@@ -288,11 +306,12 @@ fn acquire(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let looper = c.args().next_u64()?;
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_acquire");
-    let at = looper_at(&ndk, c, looper)?;
+    // **One lock across the check and the increment.** See [`looper_in`].
     let mut state = ndk.state.lock();
+    let at = looper_in(&state, c, looper)?;
     let thread = Ndk::thread_index(&mut state);
     let references = {
-        let entry = state.loopers.get_mut(at).expect("the slot was checked live");
+        let entry = state.loopers.get_mut(at).expect("checked live under this same lock");
         entry.references += 1;
         entry.references
     };
@@ -318,11 +337,13 @@ fn release(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let looper = c.args().next_u64()?;
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_release");
-    let at = looper_at(&ndk, c, looper)?;
+    // **One lock across the check and the decrement.** This is the call that frees the slot, so
+    // two of these racing is the case [`looper_in`] describes.
     let mut state = ndk.state.lock();
+    let at = looper_in(&state, c, looper)?;
     let thread = Ndk::thread_index(&mut state);
     let references = {
-        let entry = state.loopers.get_mut(at).expect("the slot was checked live");
+        let entry = state.loopers.get_mut(at).expect("checked live under this same lock");
         entry.references -= 1;
         entry.references
     };
@@ -357,7 +378,11 @@ fn add_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_addFd");
-    let at = looper_at(&ndk, c, looper)?;
+    // **The handle first, so a forged one is reported as a forged one** rather than as
+    // whatever the fd below turns out to be. The binding is discarded on purpose: this
+    // check orders the diagnosis and nothing may rest on it, because the descriptor work
+    // that follows drops this lock. See [`looper_in`].
+    looper_at(&ndk, c, looper)?;
 
     if fd < 0 {
         return Err(refuse_inline(c, format!("`ALooper_addFd` was given fd {fd}")));
@@ -412,8 +437,12 @@ fn add_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     }
 
     let mut state = ndk.state.lock();
+    // **Re-checked under the lock that is about to be written through.** The check at the top of
+    // this function ordered the diagnosis; it cannot be what this rests on, because the
+    // descriptor work in between drops the lock and takes the filesystem's.
+    let at = looper_in(&state, c, looper)?;
     let thread = Ndk::thread_index(&mut state);
-    let entry = state.loopers.get_mut(at).expect("the slot was checked live");
+    let entry = state.loopers.get_mut(at).expect("checked live under this same lock");
     if entry.opts & ALOOPER_PREPARE_ALLOW_NON_CALLBACKS == 0 && callback == 0 {
         return Err(AbiError::Refused {
             symbol: c.symbol().to_string(),
@@ -466,10 +495,11 @@ fn remove_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ALooper_removeFd");
-    let at = looper_at(&ndk, c, looper)?;
+    // **One lock across the check and the removal.** See [`looper_in`].
     let mut state = ndk.state.lock();
+    let at = looper_in(&state, c, looper)?;
     let thread = Ndk::thread_index(&mut state);
-    let entry = state.loopers.get_mut(at).expect("the slot was checked live");
+    let entry = state.loopers.get_mut(at).expect("checked live under this same lock");
     let before = entry.fds.len();
     entry.fds.retain(|held| held.fd != fd);
     let removed = before != entry.fds.len();
@@ -581,7 +611,20 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         let seen = fs.ready_generation();
         let pass = {
             let state = ndk.state.lock();
-            let entry = state.loopers.get(looper).expect("the slot was checked live");
+            // **Re-read every pass, because this loop sleeps.** The looper was live when
+            // `pollOnce` was entered; another guest thread taking the last reference during a
+            // sleep frees it, and a looper that goes away under a poll is a refusal naming the
+            // call rather than a panic out of the import. See [`looper_in`].
+            let Some(entry) = state.loopers.get(looper) else {
+                return Err(refuse_reentrant(
+                    c,
+                    format!(
+                        "the looper at {looper:#x} was released while `ALooper_pollOnce` was \
+                         waiting on it. A poll whose looper no longer exists has nothing left to \
+                         report, and the descriptors it was watching are now owned by nobody"
+                    ),
+                ));
+            };
             let mut callbacks = Vec::new();
             let mut ident = None;
             for held in &entry.fds {
@@ -720,6 +763,11 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 );
                 if returned == 0 {
                     // The NDK's documented contract: a callback returning 0 asks to be removed.
+                    //
+                    // **`if let`, not `expect`.** The callback that just returned is *guest code*,
+                    // run with no lock held, and `ALooper_release` is one of the things it may
+                    // have called. A looper it destroyed has no registration left to remove, which
+                    // is the request already satisfied -- not a reason to panic. See [`looper_in`].
                     let entry = state.loopers.get_mut(looper).expect("the slot was checked live");
                     entry.fds.retain(|held| held.fd != fd);
                 }

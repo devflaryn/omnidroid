@@ -64,7 +64,7 @@ use crate::abi::Args;
 use crate::boundary::{ImportCall, ImportFn};
 use crate::error::{AbiError, AbiResult};
 
-use super::{active, Ndk};
+use super::{active, Ndk, NdkState};
 
 /// The Java class `ANativeWindow_fromSurface` accepts.
 ///
@@ -158,8 +158,20 @@ fn count(ndk: &Ndk, symbol: &'static str) {
 /// but off a slot boundary — so an `ALooper *` passed where an `ANativeWindow *` belongs, and a
 /// `window + 4` the engine computed, are refusals rather than lookups that happen to succeed.
 fn window_at(ndk: &Ndk, c: &ImportCall<'_, '_>, window: u64) -> AbiResult<GuestAddr> {
-    let at = GuestAddr::try_from(window).unwrap_or(0);
     let state = ndk.state.lock();
+    window_in(&state, c, window)
+}
+
+/// As [`window_at`], but against a state whose lock the caller **already holds**.
+///
+/// A liveness check justifies a later `expect` only if the lock was never released in between.
+/// `window_at` drops its guard before returning, so a caller that re-locks and writes
+/// `.expect("the slot was checked live")` is asserting something a concurrent
+/// `ANativeWindow_release` -- taking the last reference and freeing the slot -- can falsify in the
+/// gap. `looper.rs`'s `looper_in` carries the full argument; this is the same rule one handle
+/// family along.
+fn window_in(state: &NdkState, c: &ImportCall<'_, '_>, window: u64) -> AbiResult<GuestAddr> {
+    let at = GuestAddr::try_from(window).unwrap_or(0);
     if state.windows.index_of(at).is_none() {
         return Err(refuse(
             c,
@@ -289,11 +301,12 @@ fn window_acquire(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let window = c.args().next_u64()?;
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ANativeWindow_acquire");
-    let at = window_at(&ndk, c, window)?;
+    // **One lock across the check and the increment.** See [`window_in`].
     let mut state = ndk.state.lock();
+    let at = window_in(&state, c, window)?;
     let thread = Ndk::thread_index(&mut state);
     let references = {
-        let entry = state.windows.get_mut(at).expect("the slot was checked live");
+        let entry = state.windows.get_mut(at).expect("checked live under this same lock");
         entry.references += 1;
         entry.references
     };
@@ -320,11 +333,13 @@ fn window_release(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let window = c.args().next_u64()?;
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "ANativeWindow_release");
-    let at = window_at(&ndk, c, window)?;
+    // **One lock across the check and the decrement.** This is the call that frees the slot, so
+    // two of these racing is the case [`window_in`] describes.
     let mut state = ndk.state.lock();
+    let at = window_in(&state, c, window)?;
     let thread = Ndk::thread_index(&mut state);
     let references = {
-        let entry = state.windows.get_mut(at).expect("the slot was checked live");
+        let entry = state.windows.get_mut(at).expect("checked live under this same lock");
         entry.references -= 1;
         entry.references
     };

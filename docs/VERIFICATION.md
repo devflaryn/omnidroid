@@ -5,8 +5,9 @@ because each one produced a **green suite that proved less than it claimed**, an
 person who wrote the test was the person who wrote the code — which is the blind spot that makes all
 of them possible.
 
-There are **twelve** of them. Entry 12 arrived in M5 and is the only one found by a test that could
-not be written rather than by one that passed.
+There are **thirteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
+could not be written rather than by one that passed. Entry 13 arrived in M6 and is the only one
+found by reviewing a *copy* of the defect rather than the original.
 
 Read this before writing a test you intend to rely on, and before believing a number.
 
@@ -201,6 +202,35 @@ dereference, a state guarded after the state machine has left it.
 > statement, make it a `debug_assert!` — which says *this cannot happen* — not an `if` that says
 > *this might*. And when a test for a check cannot be written, ask whether the check can fire
 > before assuming the test is hard.
+
+## 13. An `expect`'s justification can expire, and a comment is not what holds it
+
+Eight sites across `ndk/looper.rs` and `ndk/window.rs` read `state.loopers.get_mut(at).expect("the
+slot was checked live")`. The check was real and one call earlier. **But `looper_at` took the
+lock, checked, and dropped the guard before returning**, and every caller then re-locked. The
+justification was true when it was written down and false by the time it was used, and the only
+thing carrying it across the gap was the sentence inside the `expect`.
+
+What it cost is the point: a guest that releases a handle it still holds is a *guest* defect, and
+this layer's entire contract is that such a thing becomes a typed refusal naming the symbol and
+guest address. This turned it into a **host panic unwinding out of an import** — the one failure
+this project is built to never produce, sitting behind a string that asserted it could not happen.
+
+Every suite was green, and would have stayed green: tests drive one guest thread per handle, so
+nothing in them opens the window. It was found by **reviewing a new module that copied the pattern
+faithfully** — `window.rs` inherited it from `looper.rs` along with the comment. That is entry 5
+one step along: the defect became visible in the copy, not in the original, because a second
+instance is the first time the reasoning is read rather than remembered.
+
+And it was not purely a race. `ALooper_pollOnce` reaches it **single-threaded**: the registered
+callback is guest code, invoked with no lock held, and `ALooper_release` is one of the things it
+may call before returning the 0 that asks for its own registration to be removed.
+
+> An `expect` is justified by structure, not by prose. If the justification is "this was checked",
+> the check and the use must be under the same lock, in the same scope, with nothing between them
+> that could yield — and if they are not, the sentence is documentation of a bug. Where the
+> justification genuinely holds, say what makes it hold ("checked live under this same lock"), so
+> the next reader can verify the claim instead of trusting it.
 
 ---
 
