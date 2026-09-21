@@ -1751,14 +1751,14 @@ MUTATIONS = [
 
     # The monotonic clock re-anchored per call. Still non-decreasing, still plausible, and every
     # reading is ~0 -- so a guest measuring an interval measures nothing.
-    ("plat-A1", "A", "the monotonic clock is re-anchored on every call instead of on one epoch",
+    ("seam-A1", "A", "the monotonic clock is re-anchored on every call instead of on one epoch",
      PLAT_CLOCK,
      """    let epoch = *EPOCH.get_or_init(Instant::now);""",
      """    let epoch = Instant::now();""",
      PLATFORM),
 
     # The worst available value out of an entropy source: a buffer of zeroes, reported as filled.
-    ("plat-A2", "A", "random_bytes reports success without asking the OS for anything", PLAT_PROCESS,
+    ("seam-A2", "A", "random_bytes reports success without asking the OS for anything", PLAT_PROCESS,
      """        let status = unsafe {
             BCryptGenRandom(core::ptr::null_mut(), chunk.as_mut_ptr(), len, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
         };""",
@@ -1766,7 +1766,7 @@ MUTATIONS = [
         let status = 0;""",
      PLATFORM),
 
-    ("plat-A3", "A", "sleep returns immediately whatever it was asked for", PLAT_CLOCK,
+    ("seam-A3", "A", "sleep returns immediately whatever it was asked for", PLAT_CLOCK,
      """    if duration.is_zero() {
         return;
     }""",
@@ -1775,7 +1775,7 @@ MUTATIONS = [
     }""",
      PLATFORM),
 
-    ("plat-A4", "A", "an out-of-range android log priority is mapped to a neighbour", PLAT_LOG,
+    ("seam-A4", "A", "an out-of-range android log priority is mapped to a neighbour", PLAT_LOG,
      """            8 => Priority::Silent,
             _ => return None,""",
      """            8 => Priority::Silent,
@@ -1783,7 +1783,7 @@ MUTATIONS = [
      PLATFORM),
 
     # The over-correction: an empty request is a no-op in C and must not become a failure.
-    ("plat-B1", "B", "random_bytes fails an empty request instead of treating it as a no-op",
+    ("seam-B1", "B", "random_bytes fails an empty request instead of treating it as a no-op",
      PLAT_PROCESS_MOD,
      """    if out.is_empty() {
         return Ok(());
@@ -1798,7 +1798,7 @@ MUTATIONS = [
      PLATFORM),
 
     # The over-correction: a severity that maps perfectly well is refused.
-    ("plat-B2", "B", "the most severe syslog level stops mapping onto the android scale", PLAT_LOG,
+    ("seam-B2", "B", "the most severe syslog level stops mapping onto the android scale", PLAT_LOG,
      """            0..=2 => Priority::Fatal,""",
      """            1..=2 => Priority::Fatal,""",
      PLATFORM),
@@ -2169,6 +2169,23 @@ def main():
     parser.add_argument("--only", default=None, help="run mutations whose id starts with this")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
+
+    # **Row ids must be unique, and nothing used to check.** Six rows added for M3 task 3 phase 3a
+    # were filed under `plat-*`, and four of them collided with the fault handler's existing
+    # `plat-A1`..`plat-A4`. Nothing complained: a full run still touched every row, so the totals
+    # were right, but `--only plat-A1` selected two different mutations and a report naming a row
+    # id no longer identified one. That is the count-cannot-see-a-substitution failure this project
+    # has already been bitten by, in the harness that exists to catch it.
+    seen = {}
+    collisions = []
+    for row in MUTATIONS:
+        if row[0] in seen:
+            collisions.append(f"  {row[0]}: {seen[row[0]]}  AND  {row[2]}")
+        seen[row[0]] = row[2]
+    if collisions:
+        print(f"{len(collisions)} duplicate mutation id(s). Nothing was run.")
+        print(chr(10).join(collisions))
+        return 2
 
     selected = [m for m in MUTATIONS if args.only is None or m[0].startswith(args.only)]
     if args.list:
