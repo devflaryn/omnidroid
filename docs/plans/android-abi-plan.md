@@ -171,6 +171,37 @@ than a redesign. Do **not** write speculative `open`/`mmap` bodies for those tar
 against deliberately, because an unverified body misbehaves silently where a typed error fails
 immediately and visibly.
 
+**CORRECTION (2026-09-21), and it is mine.** The table above was derived from the classifier's
+*OS* buckets — `file-io`, `process-env`, `time-clocks`, `network`, `logging` — plus the nine
+thread-lifecycle symbols. That treated `threads-sync` as already covered and ignored three buckets
+entirely, so **seven reachable symbols had no phase at all**:
+
+| missed | classifier bucket | why it fell through |
+|---|---|---|
+| `sigaction`, `sigfillset`, `raise` | `threads-sync` | signals share a bucket with the sync primitives, which were assumed covered |
+| `longjmp` | `pure` | needs no OS, so it was never a candidate for an OS phase — and so was never assigned to any |
+| `clock`, `time` | `time-clocks` | phase 3a enumerated five of the seven; these two were left behind |
+| `mallinfo` | `memory` | returns 80 bytes through `X8` and would have to describe a libc heap that does not exist |
+| `__gcov_dump`, `__gcov_flush` | `unclear` | the classifier refuses to bucket them, so nothing downstream did either |
+
+Same failure shape as the withdrawn "88 already implemented" and the data-symbol substitution: a
+derivation that looked complete because its **totals** were consistent, while its **membership** was
+not. Derive the remainder by subtracting what is bound from the reachable set, and assert membership
+rather than counts.
+
+**The authoritative remainder is 51**, independently derived twice (reachable 188 minus every symbol
+named in `bionic/handlers.rs` and `bionic/data.rs`):
+
+| group | n | symbols |
+|---|---:|---|
+| **3b** file-io | 29 | `__open_2 __write_chk access close closedir fclose fdopen feof fflush fgets fileno fopen fputc fputs fread fstat fwrite lstat mkdir open opendir pread read readdir rename rmdir stat statvfs unlink` |
+| **3c** threads + signals | 8 | `pthread_create pthread_detach pthread_getschedparam pthread_join pthread_sigmask raise sigaction sigfillset` |
+| **3d** network | 8 | `eventfd freeaddrinfo gai_strerror getaddrinfo inet_ntop poll select socket` |
+| **3e** the remainder nothing else claims | 6 | `clock time mallinfo longjmp __gcov_dump __gcov_flush` |
+
+`longjmp` needs no OS but does need the boundary to restore a guest `jmp_buf`, which is why it is not
+simply `omni-bionic` work. `mallinfo` is the only reachable import returning through `X8`.
+
 **Sequencing note.** `dl_iterate_phdr` is *not* in this phase — it needs `omni-elf`'s loader state,
 not the OS — and it is the highest-value single item in Task 3, because the statically-linked C++
 runtime walks 11.5 MB of `.eh_frame` through it and **C++ exceptions break without it**.
