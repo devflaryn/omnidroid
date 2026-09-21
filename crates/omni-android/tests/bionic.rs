@@ -7642,3 +7642,141 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         "every one of the statically-reachable imports is accounted for"
     );
 }
+
+// =========================================== M5: the park witness, for §8 row 14's cond-wait
+
+/// **A guest thread blocked in `pthread_cond_wait` is visible from outside while it is blocked.**
+///
+/// `jni-surface.md` §8.1's fifth failure mode, as a measurement. §8 row 14 has
+/// `GameActivity_onCreate` blocking here until the game thread signals `app->running`, and that
+/// file says a deadlock there is indistinguishable from a hang. It is indistinguishable from
+/// outside; `Bionic::parked` is the inside, and this is what asserts it works **before** M5's gate
+/// needs it.
+///
+/// **A detector rather than a watch** (`VERIFICATION.md` entry 11): the assertion is that the list
+/// is non-empty *while a thread is genuinely parked* and empty again *after it is released*, which
+/// a counter that only rose under load could not distinguish. The peak is read too, and it is
+/// labelled a watch where it is defined.
+#[test]
+fn a_thread_blocked_in_pthread_cond_wait_is_visible_while_it_is_blocked() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+
+    let cond = f.guest.data + 0x400;
+    let mutex = f.guest.data + 0x480;
+    let handle = f.guest.data + 0x500;
+    let entered = f.guest.data + 0x508;
+    f.guest.write_u64(entered, 0);
+
+    // The waiter: lock, say it is here, wait, unlock, return.
+    let waiter = {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_lock"));
+        asm.mov(9, entered as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
+        asm.mov(0, cond as u64);
+        asm.mov(1, mutex as u64);
+        asm.bl(f.thunk("pthread_cond_wait"));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_unlock"));
+        asm.mov(0, 0);
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        entry
+    };
+    // Every program is assembled before any guest thread runs: `Guest::load` reprotects the whole
+    // code region, and doing that under a running guest thread faults it.
+    let create = {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, cond as u64);
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_cond_init"));
+        asm.mov(0, mutex as u64);
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_mutex_init"));
+        asm.mov(0, handle as u64);
+        asm.mov(1, 0);
+        asm.mov(2, waiter as u64);
+        asm.mov(3, 0);
+        asm.bl(f.thunk("pthread_create"));
+        asm.mov(22, f.guest.data as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        entry
+    };
+    let release = {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, cond as u64);
+        asm.bl(f.thunk("pthread_cond_broadcast"));
+        asm.mov(22, handle as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.mov(22, f.guest.data as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        entry
+    };
+
+    assert!(f.bionic.parked().is_empty(), "nothing is parked before anything runs");
+    assert_eq!(f.bionic.parked_peak(), 0);
+
+    // **A fresh context per program.** The first program's `BL`s leave `X30` pointing into the
+    // middle of itself, and a second program's `MOV X21, X30` would save that and `RET X21` into
+    // it -- a loop, not a return, which shows up as the whole budget being spent.
+    // `tests/thread_memory.rs` records the same trap.
+    {
+        let _active = f.bionic.activate().expect("a thread block");
+        let exit = run_program(&f, create).expect("the create completes");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    }
+    assert_eq!(f.guest.read_u64(f.guest.data), 0, "pthread_create must succeed");
+
+    // **Wait for the witness rather than for a duration.** A sleep long enough to be reliable is
+    // `VERIFICATION.md` entry 6's shape; a bounded poll on the thing under test is not.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let observed = loop {
+        let parked = f.bionic.parked();
+        if !parked.is_empty() {
+            break parked;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no thread appeared in the park witness in 30 seconds; the waiter reported entering: \
+             {}",
+            f.guest.read_u64(entered)
+        );
+        std::thread::yield_now();
+    };
+
+    assert_eq!(observed.len(), 1, "exactly one thread is waiting: {observed:?}");
+    let held = &observed[0];
+    assert_eq!(held.symbol, "pthread_cond_wait", "the symbol it is inside");
+    assert_eq!(held.cond, cond as u64, "the condition variable it is on");
+    assert_eq!(held.mutex, mutex as u64, "and the mutex it released to wait");
+    assert!(!held.thread.is_none(), "a real guest thread, not the reserved none-value");
+    assert_eq!(f.bionic.parked_peak(), 1);
+
+    {
+        let _active = f.bionic.activate().expect("a thread block");
+        let exit = run_program(&f, release).expect("the broadcast and join complete");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    }
+    assert_eq!(f.guest.read_u64(f.guest.data), 0, "pthread_join must succeed");
+    assert!(
+        f.bionic.parked().is_empty(),
+        "the guard must remove the entry on the way out: a stale one makes a run that finished \
+         look like the deadlock this exists to find"
+    );
+    assert_eq!(f.bionic.parked_peak(), 1, "the peak survives the thread that made it");
+}

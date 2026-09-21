@@ -63,7 +63,7 @@ use omni_bionic::atexit::AtexitRegistry;
 use omni_bionic::cond::CondWaiters;
 use omni_bionic::metadata::NameRegistry;
 use omni_bionic::mutex::OwnerTable;
-use omni_bionic::threads::GuestThreadId;
+pub use omni_bionic::threads::GuestThreadId;
 use omni_bionic::tls::TlsRegistry;
 use omni_elf::loader::DlPhdrInfo;
 use omni_bionic::stdio::Stream;
@@ -326,6 +326,77 @@ pub struct Bionic {
     /// D16's shape: a watchdog over a guest that never returns is built from short budget
     /// windows, because the halt flag is checked at terminals a counted budget makes exclusive.
     threads_stopping: AtomicBool,
+
+    // ------------------------------------------------------------------- M5: the park witness
+    /// Every guest thread currently blocked inside a condition-variable wait.
+    ///
+    /// **`jni-surface.md` §8.1's fifth failure mode, made observable before it is needed.** §8 row
+    /// 14 has `GameActivity_onCreate` blocking on `pthread_cond_wait` until the game thread sets
+    /// `app->running`, and that file says in as many words that a deadlock there is
+    /// indistinguishable from a hang. It is indistinguishable from *outside*; from here the
+    /// difference is exactly this list — which thread, on which condition variable, holding which
+    /// mutex, since when.
+    ///
+    /// Maintained by an RAII guard rather than by a pair of calls, so an error path out of the
+    /// wait cannot leave a thread recorded as parked for ever. A stale entry would be worse than
+    /// none: it would make a run that completed look like the deadlock this exists to find.
+    parked: Mutex<Vec<ParkRecord>>,
+    /// The most threads ever parked at once, which a run that has already finished can still
+    /// report.
+    parked_peak: AtomicU64,
+}
+
+/// One guest thread, blocked in a wait, as the host can see it from outside.
+///
+/// See [`Bionic::parked`]. Every field is what a reader needs to tell §8 row 14's *expected* wait
+/// from a deadlock: the cond and the mutex identify the object, and the thread identifies which
+/// side of row 14 is stuck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedWait {
+    /// The symbol the thread is inside.
+    pub symbol: &'static str,
+    /// Which guest thread, as the thread registry numbers them.
+    pub thread: GuestThreadId,
+    /// The guest `pthread_cond_t *`.
+    pub cond: u64,
+    /// The guest `pthread_mutex_t *` it released to wait.
+    pub mutex: u64,
+    /// How long it has been there, when the list was taken.
+    pub waiting: std::time::Duration,
+}
+
+/// Records a thread as parked for as long as it lives.
+///
+/// The guard exists rather than a matched pair of calls because every exit from a wait has to
+/// remove the entry, **including the failing ones**, and a `?` in the middle of a handler is
+/// exactly how one of those gets missed.
+pub(crate) struct ParkGuard {
+    bionic: Arc<Bionic>,
+    token: u64,
+}
+
+impl Drop for ParkGuard {
+    fn drop(&mut self) {
+        let mut parked = self.bionic.parked.lock();
+        if let Some(index) = parked.iter().position(|held| held.started == self.token) {
+            parked.remove(index);
+        }
+    }
+}
+
+/// The stored form of a park: [`ParkedWait`] plus the instant it began.
+#[derive(Debug, Clone)]
+struct ParkRecord {
+    symbol: &'static str,
+    thread: GuestThreadId,
+    cond: u64,
+    mutex: u64,
+    since: std::time::Instant,
+    /// A token unique to this park, so the guard removes *its* entry rather than the first one
+    /// that happens to match on thread and address. Two waits on one condition variable from one
+    /// thread cannot overlap, but a token costs nothing and a search by `(thread, cond)` would be
+    /// a correctness argument to maintain.
+    started: u64,
 }
 
 /// The live guest threads, and who is waiting for whom.
@@ -443,6 +514,8 @@ impl Bionic {
             threads_done: Condvar::new(),
             thread_failures: Mutex::new(Vec::new()),
             threads_stopping: AtomicBool::new(false),
+            parked: Mutex::new(Vec::new()),
+            parked_peak: AtomicU64::new(0),
         });
         // `gmtime_r`'s `tm_zone` is a `const char *` the guest dereferences, so it has to point at
         // something for the whole life of the instance. Interned here, before any guest code runs
@@ -706,6 +779,70 @@ impl Bionic {
     #[must_use]
     pub fn filesystem(&self) -> Option<&Filesystem> {
         self.fs.get()
+    }
+
+    /// **Every guest thread blocked in a condition-variable wait, right now.**
+    ///
+    /// `jni-surface.md` §8.1's fifth failure mode: step 14's `pthread_cond_wait` makes a deadlock
+    /// indistinguishable from a hang *from outside*. This is the inside.
+    ///
+    /// Read it from a watchdog, not from the blocked thread — the blocked thread is, by
+    /// construction, not going to ask. The M3 gate's `OMNI_INIT_WATCHDOG` is the pattern: a host
+    /// thread that after a stated budget prints this and **fails**, because a watchdog that prints
+    /// and continues turns a hang into a slow pass.
+    #[must_use]
+    pub fn parked(&self) -> Vec<ParkedWait> {
+        let now = std::time::Instant::now();
+        self.parked
+            .lock()
+            .iter()
+            .map(|held| ParkedWait {
+                symbol: held.symbol,
+                thread: held.thread,
+                cond: held.cond,
+                mutex: held.mutex,
+                waiting: now.saturating_duration_since(held.since),
+            })
+            .collect()
+    }
+
+    /// The most threads that were ever parked at once.
+    ///
+    /// **A watch, and labelled as one** (`VERIFICATION.md` entry 11). It rises under ordinary
+    /// load and it does not distinguish a deadlock from a busy run: two threads legitimately
+    /// waiting and two threads deadlocked are the same number. What detects a deadlock is
+    /// [`parked`](Bionic::parked) read *while it is happening*; this is for a run that has already
+    /// finished, where it answers "did anything wait at all" — which is the question a scripted
+    /// sequence that was supposed to reach row 14 and did not needs answered.
+    #[must_use]
+    pub fn parked_peak(&self) -> u64 {
+        self.parked_peak.load(Ordering::Relaxed)
+    }
+
+    /// Record the calling thread as parked until the returned guard is dropped.
+    pub(crate) fn park(
+        self: &Arc<Self>,
+        symbol: &'static str,
+        thread: GuestThreadId,
+        cond: u64,
+        mutex: u64,
+    ) -> ParkGuard {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        let live = {
+            let mut parked = self.parked.lock();
+            parked.push(ParkRecord {
+                symbol,
+                thread,
+                cond,
+                mutex,
+                since: std::time::Instant::now(),
+                started: token,
+            });
+            parked.len() as u64
+        };
+        self.parked_peak.fetch_max(live, Ordering::Relaxed);
+        ParkGuard { bionic: Arc::clone(self), token }
     }
 
     /// The `st_dev` every file on this instance's root reports.

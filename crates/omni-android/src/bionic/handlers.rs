@@ -603,6 +603,11 @@ pub(super) fn pthread_cond_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         (a.next_u64()?, a.next_u64()?)
     };
     let state = active(c.symbol(), c.address())?;
+    // **§8.1's fifth failure mode, recorded while it is happening.** §8 row 14 blocks here until
+    // the game thread signals `app->running`, and a deadlock there looks exactly like a hang from
+    // outside. The guard removes the entry on **every** exit including the failing ones, which a
+    // matched pair of calls around a `?` would not.
+    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex);
     let code = {
         let mut view = enter(c, &state);
         let threads = CallThreads { table: &state.bionic.threads, me: state.thread };
