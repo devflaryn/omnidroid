@@ -255,6 +255,14 @@ handlers! {
     fn strstr(haystack: ptr, needle: ptr) -> u64 =
         |v| omni_bionic::string::strstr(&v, haystack, needle);
 
+    /// `int strerror_r(int errnum, char *buf, size_t buflen)` — the **POSIX** form, which
+    /// returns `0` or `ERANGE`.
+    ///
+    /// **Found by M3's gate, at `init_array[3118]`.** `libroblox.so` imports both spellings;
+    /// only the GNU one was in Task 1's 188.
+    fn strerror_r(errnum: i32, buf: ptr, buflen: u64) -> i32 =
+        |v| omni_bionic::string::strerror_r(&mut v, errnum, buf, buflen);
+
     /// `char *__gnu_strerror_r(int errnum, char *buf, size_t buflen)` — the GNU form, which
     /// returns a pointer and may or may not have used `buf`.
     fn gnu_strerror_r(errnum: i32, buf: ptr, buflen: u64) -> u64 =
@@ -331,11 +339,46 @@ handlers! {
     fn sincosf(x: f32, sin_ptr: ptr, cos_ptr: ptr) -> void =
         |v| omni_bionic::libm::sincosf(&mut v, x, sin_ptr, cos_ptr);
 
+    // ---------------------------------------------------------- wide characters
+
+    /// `size_t __ctype_get_mb_cur_max(void)` — what the `MB_CUR_MAX` macro expands to.
+    ///
+    /// **Found by M3's gate, at `init_array[2]`.** Not in Task 1's 188 and not in its Tier C
+    /// section either.
+    fn ctype_get_mb_cur_max() -> u64 = |v| omni_bionic::locale::ctype_get_mb_cur_max();
+
+    /// `int mbtowc(wchar_t *pwc, const char *s, size_t n)`
+    ///
+    /// **Found by M3's gate, at `init_array[2]`, and it is the sharpest thing the gate found
+    /// about the static prediction**: `mbtowc` is not among Task 1's 188 *and is not in the Tier
+    /// C address-taken section either* -- `init-reachable-imports.txt` files it under "never
+    /// referenced from the Tier C closure at all". `tools/call_sites.py` finds exactly one direct
+    /// call site, at `0x2b772f4`, passing `n = 4`, which is `MB_CUR_MAX` for UTF-8.
+    fn mbtowc(pwc: ptr, s: ptr, n: u64) -> i32 =
+        |v| omni_bionic::wide::mbtowc(&mut v, pwc, s, n);
+
     // ---------------------------------------------------------- locale
 
     /// `locale_t newlocale(int category_mask, const char *locale, locale_t base)`
     fn newlocale(category_mask: i32, locale: ptr, base: u64) -> u64 =
         |v| omni_bionic::locale::newlocale(&mut v, category_mask, locale, base);
+
+    /// `locale_t uselocale(locale_t newloc)` — install `newloc` for the calling thread and
+    /// return what was there.
+    ///
+    /// **Found by the M3 gate, at `init_array[2]`.** It is not among Task 1's 188: the static
+    /// closure put it in the Tier C section, reached only through an address-taken edge — and
+    /// the engine calls it directly, third initializer in. The slot it reads and writes is the
+    /// one in this thread's arena block ([`GuestView::locale_address`]), because `omni-bionic`
+    /// refuses to invent per-thread storage and answers `Unimplemented` for a zero slot instead.
+    fn uselocale(newloc: u64) -> u64 = |v| {
+        let slot = v.locale_address() as u64;
+        omni_bionic::locale::uselocale(&mut v, slot, newloc)
+    };
+
+    /// `void freelocale(locale_t locobj)` — releases nothing, because `newlocale` allocates
+    /// nothing: the only handle this layer produces is the static C-locale sentinel.
+    fn freelocale(locobj: u64) -> void = |v| omni_bionic::locale::freelocale(locobj);
 
     // ---------------------------------------------------------- pthread: identity
 
@@ -777,6 +820,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("strstr", strstr),
     ("strerror", strerror),
     ("__gnu_strerror_r", gnu_strerror_r),
+    ("strerror_r", strerror_r),
     // numbers
     ("atoi", atoi),
     ("atoll", atoll),
@@ -802,8 +846,13 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("nan", nan),
     ("frexp", frexp),
     ("sincosf", sincosf),
+    // wide characters
+    ("__ctype_get_mb_cur_max", ctype_get_mb_cur_max),
+    ("mbtowc", mbtowc),
     // locale
     ("newlocale", newlocale),
+    ("uselocale", uselocale),
+    ("freelocale", freelocale),
     // pthread identity and scheduling
     ("pthread_self", pthread_self),
     ("pthread_equal", pthread_equal),
@@ -843,9 +892,6 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("__cxa_thread_atexit_impl", cxa_thread_atexit),
     // libdl: four that refuse by name rather than issue a handle they cannot honour.
     // `dl_iterate_phdr` is the fifth and is on the exit path, because it calls a guest callback.
-    ("dlopen", dl::dlopen),
-    ("dlsym", dl::dlsym),
-    ("dlclose", dl::dlclose),
     ("dlerror", dl::dlerror),
     // the printf family
     ("snprintf", format::snprintf),
@@ -975,6 +1021,11 @@ pub(super) static REENTRANT: &[(&str, ReentrantFn)] = &[
     ("pthread_once", pthread_once),
     ("qsort", qsort),
     ("dl_iterate_phdr", dl::dl_iterate_phdr),
+    // `dlopen`, `dlsym` and `dlclose` are on the exit path because each needs the boundary's
+    // symbol table and `ImportCall` deliberately cannot reach it. None of them calls guest code.
+    ("dlopen", dl::dlopen),
+    ("dlsym", dl::dlsym),
+    ("dlclose", dl::dlclose),
     ("mmap", guestmem::mmap),
     ("munmap", guestmem::munmap),
     ("mprotect", guestmem::mprotect),

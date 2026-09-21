@@ -215,6 +215,26 @@ pub struct Bionic {
     names: NameRegistry,
     /// `__cxa_atexit`.
     atexit: AtexitRegistry,
+    /// Each guest thread's blocked-signal mask, as `rt_sigprocmask` set it.
+    ///
+    /// See `procenv::rt_sigprocmask` for why a value nothing acts on is still worth storing
+    /// exactly: this runtime delivers no signal to the guest at all, so the mask's only
+    /// observable is the guest reading back what it wrote.
+    signal_masks: Mutex<BTreeMap<GuestThreadId, u64>>,
+    /// How much memory the embedding says this guest has, for `sysinfo`.
+    ///
+    /// **No default**, like the filesystem root (D23) and the thread host (D24), and for the same
+    /// reason: only the embedding knows, and a number this layer chose would be a number with
+    /// nothing behind it. `sysinfo` refuses by name until it is set.
+    memory_budget: Mutex<Option<u64>>,
+    /// Labels the guest has attached to its own anonymous mappings with
+    /// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ..)`, keyed by `(address, length)`.
+    ///
+    /// **This is where that call's whole observable effect lives.** On a device the label appears
+    /// beside the range in `/proc/self/maps` and nothing reads it back through `prctl`; here it is
+    /// readable by the host instead, which is the same information in the only place there is to
+    /// put it. See `procenv::prctl`.
+    vma_names: Mutex<BTreeMap<(u64, u64), String>>,
     /// The `rand` sequence's state. Process-wide, as C says it is.
     rand: AtomicU32,
     /// The bump allocator for [`POOL_BYTES`], and what has been handed out of it.
@@ -393,6 +413,9 @@ impl Bionic {
             conds: CondWaiters::new(),
             names: NameRegistry::new(),
             atexit: AtexitRegistry::new(),
+            vma_names: Mutex::new(BTreeMap::new()),
+            memory_budget: Mutex::new(None),
+            signal_masks: Mutex::new(BTreeMap::new()),
             // Seeded as C's `rand` is before any `srand`: the standard says the sequence is as
             // if `srand(1)` had been called.
             rand: AtomicU32::new(1),
@@ -904,7 +927,7 @@ impl Bionic {
     /// second thread sharing the first one's `errno`.
     pub fn activate(self: &Arc<Self>) -> AbiResult<Activation> {
         let base = self.arena;
-        let slot = self
+        let (slot, fresh) = self
             .threads
             .attach_current(MAX_GUEST_THREADS, |index| base + index * THREAD_BLOCK_BYTES)
             .ok_or_else(|| AbiError::Refused {
@@ -916,6 +939,20 @@ impl Bionic {
                     n = MAX_GUEST_THREADS + 1
                 ),
             })?;
+        if fresh {
+            // **A recycled block still holds the last thread's header.** `errno` and the
+            // `locale_t` cell both live there, and a new thread inheriting either is a plausible
+            // wrong answer: bionic gives a new thread a zeroed TLS block, where `errno` is 0 and
+            // the thread locale is `LC_GLOBAL_LOCALE`. The rest of the block -- the scratch
+            // buffer and the `dl_phdr_info` records -- is written before it is read on every
+            // path, so only the header needs this.
+            let mem = GuestMem::new(Arc::clone(&self.space));
+            mem.write_bytes(
+                slot.block,
+                &[0u8; SCRATCH_OFFSET],
+                Blame::new("pthread_self", slot.block, 0),
+            )?;
+        }
         let active = Active { bionic: Arc::clone(self), thread: slot.id, block: slot.block };
         let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(active));
         Ok(Activation { previous })
@@ -937,6 +974,87 @@ impl Bionic {
     #[must_use]
     pub fn attached(&self) -> usize {
         self.threads.live()
+    }
+
+    /// Apply `how`/`set` to a guest thread's blocked-signal mask and return what it was.
+    ///
+    /// `how` is `SIG_BLOCK`, `SIG_UNBLOCK` or `SIG_SETMASK`; `set` is `None` for a query.
+    pub(crate) fn update_signal_mask(
+        &self,
+        thread: GuestThreadId,
+        how: i32,
+        set: Option<u64>,
+    ) -> u64 {
+        let mut masks = self.signal_masks.lock();
+        let previous = masks.get(&thread).copied().unwrap_or(0);
+        if let Some(bits) = set {
+            let next = match how {
+                0 => previous | bits,  // SIG_BLOCK
+                1 => previous & !bits, // SIG_UNBLOCK
+                _ => bits,             // SIG_SETMASK
+            };
+            masks.insert(thread, next);
+        }
+        previous
+    }
+
+    /// A guest thread's blocked-signal mask, for a test or a host that wants to see it.
+    #[must_use]
+    pub fn signal_mask(&self, thread: GuestThreadId) -> u64 {
+        self.signal_masks.lock().get(&thread).copied().unwrap_or(0)
+    }
+
+    /// Tell this guest how much memory it has, which is what `sysinfo` reports as `totalram`.
+    ///
+    /// **There is no default**, for the reason [`set_filesystem_root`](Bionic::set_filesystem_root)
+    /// and [`set_thread_host`](Bionic::set_thread_host) have none: the number is a property of the
+    /// *embedding's* budget for this guest, and one invented here would be the host's RAM
+    /// presented as the guest's — which is the wrong answer, and the one a guest sizing a cache
+    /// carries for the life of the run.
+    ///
+    /// `sysinfo` refuses by name, naming this method, until it has been called.
+    pub fn set_memory_budget(&self, bytes: u64) {
+        *self.memory_budget.lock() = Some(bytes);
+    }
+
+    /// What the embedding said this guest's memory budget is, if it said.
+    #[must_use]
+    pub fn memory_budget(&self) -> Option<u64> {
+        *self.memory_budget.lock()
+    }
+
+    /// How long ago this instance was built, which is how long the guest's world has existed.
+    ///
+    /// `sysinfo`'s `uptime` field. A device reports time since *boot*; there was no boot here, and
+    /// the instant this instance was constructed is the earliest moment the guest could observe
+    /// anything, so it is the honest epoch for a guest that has no machine underneath it.
+    #[must_use]
+    pub fn uptime(&self) -> std::time::Duration {
+        omni_bionic::threads::Clock::now_monotonic(&self.clock)
+    }
+
+    /// Record the label the guest attached to one of its anonymous mappings.
+    ///
+    /// `None` clears it, which is what a null name pointer means to the kernel.
+    pub(crate) fn set_vma_name(&self, address: u64, len: u64, name: Option<String>) {
+        let mut names = self.vma_names.lock();
+        match name {
+            Some(text) => {
+                names.insert((address, len), text);
+            }
+            None => {
+                names.remove(&(address, len));
+            }
+        }
+    }
+
+    /// Every label the guest has attached to one of its anonymous mappings, by `(address, len)`.
+    ///
+    /// The readable half of `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ..)`. A device puts these in
+    /// `/proc/self/maps`; there is no `/proc` here, so this is where they are.
+    #[must_use]
+    pub fn vma_names(&self) -> Vec<((u64, u64), String)> {
+        self.vma_names.lock().iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 
     /// The futex, for a test that wants its activity counters.

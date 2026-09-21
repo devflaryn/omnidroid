@@ -285,20 +285,26 @@ impl ThreadTable {
     /// `capacity` is the arena's capacity in blocks; `block_at` turns an index into an address.
     /// Returns `None` when the arena is full, which is a refusal rather than a wrap onto
     /// another thread's errno.
+    /// The `bool` is **true when the block is newly handed out**, which the caller needs
+    /// because blocks are recycled: a thread that exits returns its block to the free list, and
+    /// the next thread to take it would otherwise inherit whatever the previous one left in
+    /// `errno` and in the `locale_t` cell. That is a plausible wrong answer rather than a
+    /// crash, which is the shape Global Constraint 1 is about, so the caller zeroes the block's
+    /// header when this says the block is fresh.
     pub fn attach_current(
         &self,
         capacity: usize,
         block_at: impl Fn(usize) -> GuestAddr,
-    ) -> Option<ThreadSlot> {
+    ) -> Option<(ThreadSlot, bool)> {
         let key = std::thread::current().id();
         let mut inner = self.inner.lock();
         if let Some(slot) = inner.slots.get(&key) {
-            return Some(*slot);
+            return Some((*slot, false));
         }
         let index = inner.take_block(capacity)?;
         let slot = ThreadSlot { id: self.next_id(), block: block_at(index), index };
         inner.slots.insert(key, slot);
-        Some(slot)
+        Some((slot, true))
     }
 
     /// Take a block and an identity for a thread that does not exist yet.

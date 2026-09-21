@@ -84,14 +84,27 @@ pub const DL_INFO_SLOTS: usize = crate::boundary::MAX_GUEST_DEPTH + 1;
 /// | offset | bytes | what |
 /// |---|---|---|
 /// | 0 | 4 | `errno`, an `int` |
-/// | 4 | 12 | padding, so the scratch starts 16-byte aligned |
+/// | 4 | 4 | padding, so the locale handle is 8-byte aligned |
+/// | 8 | 8 | this thread's `locale_t`, for `uselocale` |
 /// | 16 | [`SCRATCH_BYTES`] | scratch for a returned string |
 /// | 16 + [`SCRATCH_BYTES`] | [`DL_INFO_SLOTS`] × [`DL_PHDR_INFO_BYTES`] | one `dl_phdr_info` per nesting level |
+///
+/// **The locale handle fits in padding that already existed**, which is why the M3 gate's
+/// `uselocale` cost this arena nothing: bytes 4-15 were there only so the scratch buffer starts
+/// 16-byte aligned, and eight of them at offset 8 are aligned for a `locale_t`. [`ARENA_BYTES`]
+/// and with it the one-commit-granule relation are therefore unchanged.
+///
+/// [`ARENA_BYTES`]: super::ARENA_BYTES
 pub const THREAD_BLOCK_BYTES: usize =
     16 + SCRATCH_BYTES + DL_INFO_SLOTS * DL_PHDR_INFO_BYTES;
 
 /// Offset of `errno` inside a thread block.
 pub const ERRNO_OFFSET: usize = 0;
+/// Offset of this thread's `locale_t` inside a thread block.
+///
+/// Eight rather than four: `locale_t` is a pointer and the guest reads it as one. See the table
+/// above for why this needed no more arena.
+pub const LOCALE_OFFSET: usize = 8;
 /// Offset of the scratch buffer inside a thread block.
 pub const SCRATCH_OFFSET: usize = 16;
 /// Offset of the first `dl_phdr_info` record inside a thread block.
@@ -207,6 +220,17 @@ impl<'a> GuestView<'a> {
     #[must_use]
     pub fn errno_address(&self) -> GuestAddr {
         self.active.block + ERRNO_OFFSET
+    }
+
+    /// This thread's `locale_t` cell in guest memory.
+    ///
+    /// `uselocale` is a *thread* property, and `omni-bionic` deliberately refuses to invent
+    /// storage for it — its `uselocale` takes the slot's guest address as an argument and
+    /// answers `Unimplemented` for a zero, rather than guessing. This is the adapter deciding
+    /// where that storage lives, which is the same arrangement as `scratch`.
+    #[must_use]
+    pub fn locale_address(&self) -> GuestAddr {
+        self.active.block + LOCALE_OFFSET
     }
 
     /// This thread's scratch buffer in guest memory.
