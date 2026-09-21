@@ -206,8 +206,19 @@ EXPECTED_BLOCK_MODES = {
 }
 EXPECTED_TOTAL_BLOCKS = 813802
 
-# Decoded RGBA8 bytes the ETC payload above expands to: 813,802 blocks x 16 texels x 4 bytes.
-EXPECTED_RGBA8_BYTES = 52083328
+# Decoded RGBA8 bytes the ETC payload above expands to.
+#
+# There are two figures here and the difference is not rounding. `813,802 blocks x 16 texels x 4
+# bytes = 52,083,328` counts whole blocks; the *images* are 52,079,224 bytes, because the last two
+# mip levels of every texture are 2x2 and 1x1 and each still occupies a full 4x4 block. The gap is
+# 1,026 texels -- 27 per texture across all 38.
+#
+# The first version of this tool reported only the block-padded number and called it "decoded to
+# RGBA8", which is wrong for the thing that matters: what gets uploaded is the image. Found by
+# `crates/omni-texture/tests/real_assets.rs` disagreeing with it, which is the cross-check between
+# two implementations doing its job.
+EXPECTED_IMAGE_RGBA8_BYTES = 52079224
+EXPECTED_BLOCK_PADDED_RGBA8_BYTES = 52083328
 
 # The compression vocabulary `libroblox.so` negotiates assets in. Found as literal JSON in
 # `.rodata`; see the report for why it settles the runtime-downloaded half of the question.
@@ -301,6 +312,7 @@ def census(apk_path: Path) -> dict:
     texture_bytes: collections.Counter = collections.Counter()
     block_modes: collections.Counter = collections.Counter()
     etc_payload_bytes = 0
+    image_rgba_bytes = 0
     unknown_formats: collections.Counter = collections.Counter()
     entries = 0
 
@@ -322,8 +334,13 @@ def census(apk_path: Path) -> dict:
                 textures[name] = f"KTX1:{named}"
                 texture_bytes[f"KTX1:{named}"] += len(data)
                 if fmt in ETC_RGB_FORMATS:
+                    level_width, level_height = header["width"], header["height"]
                     for payload in ktx1_levels(data, header):
                         etc_payload_bytes += len(payload)
+                        # The image is what gets uploaded; the block grid is what gets decoded.
+                        image_rgba_bytes += level_width * level_height * 4
+                        level_width = max(level_width // 2, 1)
+                        level_height = max(level_height // 2, 1)
                         for i in range(0, len(payload) - 7, 8):
                             block_modes[etc_block_mode(payload[i:i + 8])] += 1
             elif kind == "DDS":
@@ -344,6 +361,7 @@ def census(apk_path: Path) -> dict:
         "texture_bytes": texture_bytes,
         "block_modes": block_modes,
         "etc_payload_bytes": etc_payload_bytes,
+        "image_rgba_bytes": image_rgba_bytes,
         "unknown_formats": unknown_formats,
     }
 
@@ -404,7 +422,9 @@ def report(result: dict, caps: list[str]) -> list[str]:
         share = (100.0 * count / total_blocks) if total_blocks else 0.0
         lines.append(f"  {mode:<24} {count:>9}  {share:7.3f}%")
     lines += [
-        f"  decoded to RGBA8 this is {total_blocks * 16 * 4} B",
+        f"  the images decode to {result['image_rgba_bytes']} B of RGBA8",
+        f"  (whole blocks would be {total_blocks * 16 * 4} B; the difference is the 2x2 and 1x1 "
+        f"mip levels, which still occupy a full 4x4 block)",
         "",
         "Compression vocabulary the engine negotiates streamed assets in "
         "(literal JSON in libroblox.so .rodata):",
@@ -441,8 +461,14 @@ def check(result: dict, caps: list[str]) -> int:
     total_blocks = sum(result["block_modes"].values())
     if total_blocks != EXPECTED_TOTAL_BLOCKS:
         failures.append(f"total ETC blocks {total_blocks} != {EXPECTED_TOTAL_BLOCKS}")
-    if total_blocks * 16 * 4 != EXPECTED_RGBA8_BYTES:
-        failures.append(f"decoded RGBA8 size {total_blocks * 16 * 4} != {EXPECTED_RGBA8_BYTES}")
+    if result["image_rgba_bytes"] != EXPECTED_IMAGE_RGBA8_BYTES:
+        failures.append(
+            f"decoded image RGBA8 size {result['image_rgba_bytes']} != "
+            f"{EXPECTED_IMAGE_RGBA8_BYTES}")
+    if total_blocks * 16 * 4 != EXPECTED_BLOCK_PADDED_RGBA8_BYTES:
+        failures.append(
+            f"block-padded RGBA8 size {total_blocks * 16 * 4} != "
+            f"{EXPECTED_BLOCK_PADDED_RGBA8_BYTES}")
 
     if tuple(caps) != EXPECTED_CLIENT_COMPRESSION_CAPS:
         failures.append(

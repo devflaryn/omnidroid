@@ -23,6 +23,10 @@ omni-android = { path = "crates/omni-android" }
 # `cargo tree -p omni-bionic -e normal` being one line is what makes "no OS access" checkable
 # rather than a rule a reviewer has to remember.
 omni-bionic = { path = "crates/omni-bionic" }
+# Texture transcoding: ETC1 to RGBA8. Zero dependencies and `#![no_std]`, for the D19-shaped
+# reason its own `lib.rs` records -- pure computation that must not be able to reach the OS,
+# checkable by `cargo tree -p omni-texture -e normal` rather than by review.
+omni-texture = { path = "crates/omni-texture" }
 omni-gfx = { path = "crates/omni-gfx" }
 omni-core = { path = "crates/omni-core" }
 # The dynarmic FFI (preflight ruling P1). Only `omni-cpu` depends on it, and only on an x86-64

@@ -1,0 +1,26 @@
+[package]
+name = "omni-texture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints.rust]
+# Texture payloads are guest-controlled and the test APK is cheat-injected (D6). An overflowing
+# literal is the shape of a constant that silently wraps on a hostile dimension.
+overflowing_literals = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+# Intentionally empty, and load-bearing: see the D19-shaped argument in lib.rs. The crate is also
+# `#![no_std]`, so "no OS access" is not a rule anyone has to remember -- it cannot name one.
+
+[dev-dependencies]
+# Only the real-asset sweep needs to open the APK; `cargo tree -p omni-texture -e normal` is
+# unaffected, which is the property the no-OS-access argument rests on.
+omni-apk = { workspace = true }

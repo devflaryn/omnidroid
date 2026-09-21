@@ -206,6 +206,9 @@ dependencies = [
 [[package]]
 name = "omni-gfx"
 version = "0.1.0"
+dependencies = [
+ "omni-texture",
+]
 
 [[package]]
 name = "omni-mem"
@@ -224,6 +227,13 @@ dependencies = [
  "libc",
  "thiserror",
  "windows-sys",
+]
+
+[[package]]
+name = "omni-texture"
+version = "0.1.0"
+dependencies = [
+ "omni-apk",
 ]
 
 [[package]]

@@ -9,3 +9,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# Runtime texture transcoding. Its own crate, zero-dependency and `#![no_std]`, for the reason
+# `omni-texture/src/lib.rs` records: the renderer transitively links Vulkan and the windowing
+# system, and pure computation that must not be able to reach the OS should be somewhere
+# `cargo tree` can prove it cannot (the D19 argument).
+omni-texture = { workspace = true }
