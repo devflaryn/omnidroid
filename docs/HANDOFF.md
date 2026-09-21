@@ -30,7 +30,7 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 **1,230 passing, 0 failing, 17 ignored** (`cargo test --workspace --release`, after M4 and after
 the texture work that ran in parallel with it). The M4 gate `tests/jni_startup.rs` is two of
 them, and it takes 48 s because it loads 109 MB and runs 3,594 initializers before it starts.
-Mutation: `tools/mutate.py` holds **335** rows; M4's own seventeen (`--only jni`) are 17/17, and
+Mutation: `tools/mutate.py` holds **336** rows; M4's own seventeen (`--only jni`) are 17/17, and
 the whole table has **not** been run since — that is owed. The earlier figure, kept for the shape
 of the history:
 
@@ -800,6 +800,14 @@ These are in the M3 plan as Global Constraints. The three worth knowing before w
    happened to `gmtime(i64::MIN)` in phase 3a (D22). When a new module does arithmetic on a
    guest-supplied number, run its tests in **both** profiles.
 
+5. **`--only` pre-flights only what it selects, so a change to a file another row keys on is
+   invisible until the full run.** M4 made two rows stale — one whose statement the milestone had
+   made obsolete, one whose pattern a new function duplicated — and `--only jni` reported 17/17
+   throughout. The check that found them runs no command and mutates nothing: import `mutate.py`,
+   and for every row count `as_written(old, text)` in `read_exactly(path)`. It takes a second, it
+   is safe to run while another agent holds the harness, and it is what a task that edits a file
+   with existing rows owes.
+
 ---
 
 # START HERE
@@ -827,7 +835,8 @@ two host-side facts a new harness has to reproduce. Read D28 and its amendment f
 by instruction — and §8.1's failure modes 4 and 5, which are the two that fail *silently*.
 
 **Also owed:** the whole mutation table has not been run since M4 and the texture work landed.
-335 rows; M4's own seventeen are 17/17 under `--only jni`.
+336 rows; M4's own seventeen are 17/17 under `--only jni`, and the whole table's **pre-flight**
+passes (336 distinct ids, every pattern matching exactly once).
 
 Task 2's review package and dispatch instructions, which were the previous first action, are kept
 in `task-2-review.md`; nothing above depends on them any more.
