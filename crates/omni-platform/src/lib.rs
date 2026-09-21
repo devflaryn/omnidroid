@@ -25,9 +25,14 @@
 //!   return [`ProcessError::Unsupported`](process::ProcessError::Unsupported) naming the POSIX
 //!   call they intend to make.
 //! * [`log`] — a sink for a line the guest wrote, with Android's and syslog's priority scales.
+//! * [`fs`] — files and directories: a **rooted** descriptor table, metadata, and directory
+//!   listings. Every guest path is resolved inside one host directory supplied by the embedding,
+//!   and a path that cannot be is refused by name; see [`fs::path`](fs) for the policy and the
+//!   hostile cases. Fifteen of its seventeen operations are `std::fs` and are implemented once;
+//!   `pread` and `statvfs` have a Windows backend and a structural unix one naming `pread(2)`
+//!   and `statvfs(3)`.
 //!
-//! Files, directories, sockets, threads, dynamic loading and windowing will arrive as sibling
-//! modules in later tasks.
+//! Sockets, threads, dynamic loading and windowing will arrive as sibling modules in later tasks.
 //!
 //! # Not every primitive needs a `cfg`, and saying which is part of the seam
 //!
@@ -35,6 +40,13 @@
 //! unix one. [`clock`], [`log`], and half of [`process`] are **portable standard library** —
 //! `Instant`, `SystemTime`, `thread::sleep`, `stderr`, `process::id`, `available_parallelism` —
 //! and they are implemented once, with no backend and no `cfg`.
+//!
+//! [`fs`] is where that distinction has to be made operation by operation rather than module by
+//! module, and the test it is made with is sharper than "does it call the OS": **is there one
+//! `std` call that serves all five targets?** `File::open`, `fs::metadata` and `fs::read_dir`
+//! are, so they are written once. `pread` is `FileExt::seek_read` on Windows and
+//! `FileExt::read_at` on unix — two traits, two modules, no single call — and `statvfs` has no
+//! `std` spelling at all, so those two get a backend and a structural unix half.
 //!
 //! That asymmetry is deliberate and is written out in each module. The five-target rule this
 //! project enforces is *never claim a platform works*, and a fabricated `Unsupported` return for
@@ -55,6 +67,7 @@
 
 pub mod clock;
 pub mod fault;
+pub mod fs;
 pub mod log;
 pub mod process;
 pub mod vm;
