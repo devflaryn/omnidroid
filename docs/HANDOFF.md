@@ -32,7 +32,7 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 877 before phase 1, and 608 before `omni-bionic` existed, so those are not comparable). The
 thirteenth ignored test is phase 3c's per-guest-thread memory measurement, which is `#[ignore]`d
 because `process_commit_charge` is process-global. **The whole mutation table has been run on the
-committed tree: 255/255 caught.** Clippy clean on
+committed tree: 255/255 caught**, with both pre-flight gates passing (255/255 patterns match exactly once; 11/11 commands pass on the unmutated tree). Clippy clean on
 `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
 With `workspace = true` a member's `default-features = false` is **ignored**, so the omni-android

@@ -2869,7 +2869,11 @@ the question "what does a guest-chosen number do here", not by a test failing.
   checked, and where `pthread_create`'s newly-checked `attr` offset arithmetic would panic if it
   were left as a bare `+`.
 * `tools/mutate.py`: **239 → 255 rows**, 16 new — 12 direction A and 4 direction B, and the new
-  rows are **16/16 caught** (signals 4/4, threads 9/9, watch 2/2, arena 1/1). **The whole table is run on the committed tree after this entry lands**, and the result is recorded in its own commit rather than predicted here.
+  rows are **16/16 caught** (signals 4/4, threads 9/9, watch 2/2, arena 1/1). **A full run of the whole table on the committed tree is 255/255 caught**, with
+  `pre-flight: 255/255 patterns match exactly once` and `pre-flight: 11/11 commands pass on the
+  unmutated tree`. 255 rows reported, 255 distinct ids, no MISS, and the tree byte-for-byte
+  restored afterwards. It was run on a committed tree with nothing else touching it, which is the
+  condition phase 3b's first full run failed and had to be discarded for.
 
   **One row HUNG rather than failing, and that was a defect in the test.** `threads-B1` refuses
   the first `pthread_detach`, which leaves the thread joinable — and
