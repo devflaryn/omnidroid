@@ -92,6 +92,22 @@ fn extents_that_overflow_the_size_arithmetic_are_refused() {
     }
 }
 
+/// A large extent that *does* fit is not refused.
+///
+/// The over-correction this guards against is inventing a maximum dimension here. The host's
+/// `maxImageDimension2D` is 32,768 (`graphics-spike.md` section 3), but that is a property of a
+/// device, and this crate is pure computation with no device in it -- a limit belongs where the
+/// image is created, not where its bytes are decoded. The only bound here is arithmetic.
+#[test]
+fn a_large_but_representable_extent_is_not_refused() {
+    assert_eq!(decoded_len(16_384, 16_384), Ok(1_073_741_824));
+    assert_eq!(compressed_len(ETC1, 16_384, 16_384), Ok(134_217_728));
+    assert_eq!(decoded_len(32_768, 32_768), Ok(4_294_967_296));
+    // And a tiny one, which a minimum-dimension over-correction would refuse.
+    assert_eq!(decoded_len(1, 1), Ok(4));
+    assert_eq!(compressed_len(ETC1, 1, 1), Ok(8));
+}
+
 /// The block grid rounds up, and the texels past the image edge are discarded rather than written.
 /// A 5x3 image is a 2x1 grid: sixteen bytes of payload, fifteen texels of output.
 #[test]

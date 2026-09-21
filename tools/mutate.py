@@ -175,6 +175,21 @@ ANDROID = [
 # function rather than an inline comparison.
 ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
 
+# M6 groundwork: runtime texture transcoding (`omni-texture`). Zero dependencies and `#![no_std]`,
+# so its command builds in about a second.
+TEXTURE_ETC1 = "crates/omni-texture/src/etc1.rs"
+TEXTURE_LIB = "crates/omni-texture/src/lib.rs"
+TEXTURE_FORMAT = "crates/omni-texture/src/format.rs"
+# `tests/exhaustive.rs` is deliberately NOT named here. MEASURED: 27.4 s in a debug build against
+# under a second for the rest of the crate, and every row below has a named detector in one of the
+# three targets that ARE named -- the same reasoning, and the same precedent, as `BIONIC` leaving
+# out `tests/stress.rs`. `real_assets` is named because two rows are only caught there.
+TEXTURE = [
+    "cargo", "test", "-p", "omni-texture", "--lib",
+    "--test", "spec_vectors", "--test", "hostile", "--test", "real_assets",
+    "--no-fail-fast",
+]
+
 # (id, direction, description, file, old, new, command)
 MUTATIONS = [
     # ---- the commit ceiling: the Critical -------------------------------------------------------
@@ -3098,6 +3113,191 @@ directory", ADAPTER_FILES,
     Ok(0)""",
      """    Ok(b as i32)""",
      BIONIC),
+
+    # =============================================================================================
+    # M6 groundwork -- `omni-texture`, the ETC1 decoder. Added by the texture-transcoding task.
+    #
+    # A wrong decoder does not crash: it produces a plausible, silently wrong texture thousands of
+    # frames before anyone looks at it. Every row below is a mutation that a casual test suite
+    # would not notice, which is the whole reason the vectors in `tests/spec_vectors.rs` are
+    # derived from the specification rather than from another decoder.
+    # =============================================================================================
+
+    # ---- the ETC2 escape: the one place an ETC1 decoder produces believable wrong pixels --------
+    ("texture-A1", "A", "an ETC2 T/H/planar block is decoded as a differential block",
+     TEXTURE_ETC1,
+     """        if !(0..=31).contains(&sum) {
+            return Err(modes[channel]);
+        }""",
+     """        if false && !(0..=31).contains(&sum) {
+            return Err(modes[channel]);
+        }""",
+     TEXTURE),
+
+    ("texture-A2", "A", "only the overflow end of the ETC2 escape is tested, not the underflow",
+     TEXTURE_ETC1,
+     """        if !(0..=31).contains(&sum) {""",
+     """        if sum > 31 {""",
+     TEXTURE),
+
+    # The over-correction of the same check. Base 0 and base 31 are perfectly legal ETC1 endpoints
+    # -- the real water-normal and skybox blocks use both -- and narrowing the range to refuse them
+    # reads as "be strict about the boundary" while rejecting ordinary content.
+    ("texture-B1", "B", "the ETC2 escape range is narrowed, refusing legitimate 0 and 31 endpoints",
+     TEXTURE_ETC1,
+     """        if !(0..=31).contains(&sum) {""",
+     """        if !(1..=30).contains(&sum) {""",
+     TEXTURE),
+
+    # ---- the pixel index layout: the classic transposition ---------------------------------------
+    ("texture-A3", "A", "pixel numbering is row-first, so every block is transposed",
+     TEXTURE_ETC1,
+     """            let i = x * BLOCK_EXTENT + y;""",
+     """            let i = y * BLOCK_EXTENT + x;""",
+     TEXTURE),
+
+    ("texture-A4", "A", "the msb and lsb index bit planes are swapped",
+     TEXTURE_ETC1,
+     """            let lsb = (indices >> i) & 1;
+            let msb = (indices >> (i + 16)) & 1;""",
+     """            let lsb = (indices >> (i + 16)) & 1;
+            let msb = (indices >> i) & 1;""",
+     TEXTURE),
+
+    # Specification table 8.16 maps 00 -> a, 01 -> b, 10 -> -a, 11 -> -b, which over the ascending
+    # set {-b, -a, a, b} is elements 2, 3, 1, 0. The identity mapping is what a flattened table
+    # copied in the wrong order gives, and it is a plausible-looking image.
+    ("texture-A5", "A", "the pixel-index-to-modifier mapping is the identity",
+     TEXTURE_ETC1,
+     """const PIXEL_INDEX_TO_SET_ELEMENT: [usize; 4] = [2, 3, 1, 0];""",
+     """const PIXEL_INDEX_TO_SET_ELEMENT: [usize; 4] = [0, 1, 2, 3];""",
+     TEXTURE),
+
+    # ---- base colour reconstruction ---------------------------------------------------------------
+    ("texture-A6", "A", "5-to-8 bit extension shifts without replicating the high bits",
+     TEXTURE_ETC1,
+     """    (value << 3) | (value >> 2)""",
+     """    value << 3""",
+     TEXTURE),
+
+    ("texture-A7", "A", "4-to-8 bit extension shifts without replicating the nibble",
+     TEXTURE_ETC1,
+     """    (value << 4) | value""",
+     """    value << 4""",
+     TEXTURE),
+
+    ("texture-A8", "A", "the modifier wraps instead of saturating",
+     TEXTURE_ETC1,
+     """    let value = base as i32 + modifier;
+    if value < 0 {
+        0
+    } else if value > 255 {
+        255
+    } else {
+        value as u8
+    }""",
+     """    let value = base as i32 + modifier;
+    value as u8""",
+     TEXTURE),
+
+    ("texture-A9", "A", "the diffbit is ignored, so every block decodes as differential",
+     TEXTURE_ETC1,
+     """    if (block[3] >> 1) & 1 == 0 {""",
+     """    if false {""",
+     TEXTURE),
+
+    ("texture-A10", "A", "the flipbit is ignored, so the sub-block split is always left/right",
+     TEXTURE_ETC1,
+     """            let sub = usize::from(if flip { y >= 2 } else { x >= 2 });""",
+     """            let sub = usize::from(x >= 2);""",
+     TEXTURE),
+
+    ("texture-A11", "A", "decoded alpha is transparent where an RGB format must read opaque",
+     TEXTURE_ETC1,
+     """            out[at + 3] = 0xFF;""",
+     """            out[at + 3] = 0x00;""",
+     TEXTURE),
+
+    # ---- the format gate --------------------------------------------------------------------------
+    # The believable one: ETC2's RGB8 form is a superset of ETC1 at the container level, so
+    # accepting it here "obviously works" -- right up to the first block that uses a mode this
+    # decoder does not have, which is content-dependent and therefore intermittent.
+    ("texture-A12", "A", "GL_COMPRESSED_RGB8_ETC2 is accepted as though it were ETC1",
+     TEXTURE_FORMAT,
+     """        if gl_internal_format == 0x8D64 {""",
+     """        if gl_internal_format == 0x8D64 || gl_internal_format == 0x9274 {""",
+     TEXTURE),
+
+    # ---- sizes, extents and the block grid --------------------------------------------------------
+    ("texture-A13", "A", "the block grid truncates instead of rounding up",
+     TEXTURE_LIB,
+     """    let blocks_x = width / bw + u32::from(width % bw != 0);""",
+     """    let blocks_x = width / bw;""",
+     TEXTURE),
+
+    ("texture-A14", "A", "an undersized destination is written into instead of refused",
+     TEXTURE_LIB,
+     """    if out.len() < needed_out {
+        return Err(TextureError::OutputTooSmall {""",
+     """    if false && out.len() < needed_out {
+        return Err(TextureError::OutputTooSmall {""",
+     TEXTURE),
+
+    ("texture-A15", "A", "a zero extent is accepted and reports a zero-byte image",
+     TEXTURE_LIB,
+     """pub fn decoded_len(width: u32, height: u32) -> Result<usize, TextureError> {
+    if width == 0 || height == 0 {""",
+     """pub fn decoded_len(width: u32, height: u32) -> Result<usize, TextureError> {
+    if false && (width == 0 || height == 0) {""",
+     TEXTURE),
+
+    # ---- direction B: the three over-corrections ---------------------------------------------------
+    # Each of these reads as "be stricter", and each destroys a property the design depends on.
+
+    # A KTX mip level is padded to a four-byte boundary and a caller may hand over the rest of the
+    # chain; GL's own `imageSize` is a lower bound, not an equality. Requiring an exact length
+    # refuses the real APK's own files.
+    ("texture-B2", "B", "a payload longer than the block grid is refused as truncated",
+     TEXTURE_LIB,
+     """    if data.len() < needed_in {
+        return Err(TextureError::TruncatedBlockData {""",
+     """    if data.len() != needed_in {
+        return Err(TextureError::TruncatedBlockData {""",
+     TEXTURE),
+
+    ("texture-B3", "B", "a destination larger than the image is refused as too small",
+     TEXTURE_LIB,
+     """    let needed_out = decoded_len(width, height)?;
+    if out.len() < needed_out {""",
+     """    let needed_out = decoded_len(width, height)?;
+    if out.len() != needed_out {""",
+     TEXTURE),
+
+    # The device limit that does not belong here. `maxImageDimension2D` is 32,768 on the
+    # development host, but that is a property of a device and this crate has no device in it: the
+    # only bound that belongs here is arithmetic. A limit invented at this layer silently caps the
+    # renderer on hardware that could go higher.
+    ("texture-B4", "B", "a maximum dimension is invented inside pure computation",
+     TEXTURE_LIB,
+     """pub fn decoded_len(width: u32, height: u32) -> Result<usize, TextureError> {
+    if width == 0 || height == 0 {""",
+     """pub fn decoded_len(width: u32, height: u32) -> Result<usize, TextureError> {
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {""",
+     TEXTURE),
+
+    # GL permits a compressed image whose dimensions are not multiples of the block size; the
+    # texels past the edge are discarded. Refusing them outright is what the engine does for DXT
+    # (`ERROR: DXT texture dimension {}x{} not divisible by 4.` is in `libroblox.so`), which is
+    # exactly what makes it a believable over-correction here.
+    ("texture-B5", "B", "a non-multiple-of-four extent is refused instead of clipped",
+     TEXTURE_LIB,
+     """    let (bw, bh) = format.block_extent();""",
+     """    let (bw, bh) = format.block_extent();
+    if width % bw != 0 || height % bh != 0 {
+        return Err(TextureError::ZeroExtent { width, height });
+    }""",
+     TEXTURE),
+
 ]
 
 
