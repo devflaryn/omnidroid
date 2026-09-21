@@ -661,6 +661,10 @@ fn run_guest_thread(spawn: Spawn) {
             );
         }
         let _activation = bionic.activate_slot(slot);
+        // Keep this context in the boundary's registry for the whole of its life rather than for
+        // one run window. A guest thread runs in many short windows, and a range another thread
+        // unmapped between two of them has to reach this one — see `Boundary::watch_context`.
+        let _watch = boundary.watch_context();
         cpu.set_sp(stack_top);
         cpu.set_x(XReg::new(0).expect("X0 exists"), argument);
         cpu.set_x(XReg::new(30).expect("X30 exists"), boundary.sentinel() as u64);

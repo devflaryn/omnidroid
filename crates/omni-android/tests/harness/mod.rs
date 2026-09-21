@@ -113,6 +113,12 @@ impl Guest {
     ///
     /// Returns its entry address. Programs are packed in order rather than all placed at zero,
     /// because several tests load more than one and a second `load` must not overwrite the first.
+    ///
+    /// **Do not call this while another guest thread is running.** It flips the protection of the
+    /// whole code region to `ReadWrite` and back, and a thread fetching from it in that window
+    /// takes a fault that has nothing to do with what is being tested. A test that starts a guest
+    /// thread assembles every program it needs first. Found by a phase 3c test failing about one
+    /// run in three.
     pub fn load(&self, program: &[u32]) -> GuestAddr {
         let offset = self.next_code.get();
         let bytes = program.len() * 4;

@@ -57,8 +57,10 @@ pub mod varargs;
 pub use bionic::{Activation, Bionic};
 pub use abi::{ArgRegs, ArgSource, Args, Ret, RetSink, ARG_REGISTERS};
 pub use boundary::{
-    Binding, Boundary, BoundaryBuilder, Crossings, GuestArg, GuestReturn, ImportCall, ImportFn,
-    ReentrantCall, ReentrantFn, Slot, MAX_EXIT_CROSSINGS, MAX_GUEST_DEPTH,
+    Binding, Boundary, BoundaryBuilder, CodeInvalidations, ContextRegistration, Crossings,
+    GuestArg, GuestReturn,
+    ImportCall, ImportFn, ReentrantCall, ReentrantFn, Slot, MAX_EXIT_CROSSINGS, MAX_GUEST_DEPTH,
+    MAX_PENDING_INVALIDATIONS,
 };
 pub use error::{AbiError, AbiResult, RefusalText};
 pub use mem::{Blame, GuestMem};

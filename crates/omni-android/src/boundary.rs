@@ -38,6 +38,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use omni_cpu::{
@@ -307,6 +308,7 @@ impl BoundaryBuilder {
             sentinel: inner.sentinel,
             exit_crossings: inner.exit_crossings,
             crossings: Mutex::new(Crossings::default()),
+            code_watch: CodeWatch::default(),
         })
     }
 }
@@ -363,6 +365,181 @@ pub struct Crossings {
     pub deepest: usize,
 }
 
+/// How much cross-context code invalidation has happened — and, in its documentation, the whole
+/// of what that mechanism is and is not.
+///
+/// # Why there is a registry of live contexts at all
+///
+/// [`GuestCpu::invalidate_code`] is a **per context** operation, which the guest-memory phase
+/// recorded as "a narrowing of the window, not a closing of it" when `munmap` and `mprotect`
+/// arrived: a second guest thread that had already translated a range kept its own translation of
+/// bytes that were no longer there. Closing it needs a registry of live contexts, and that
+/// belongs with thread lifecycle — because until there is a `pthread_create` there is no second
+/// guest thread to keep a stale translation.
+///
+/// So: every [`Boundary::run`] registers a queue for the context it is driving (or reuses a
+/// [`ContextRegistration`] the caller already holds), and
+/// [`ReentrantCall::invalidate_code`] pushes the range onto every **other** registered queue.
+/// Each context drains its own queue into its own CPU at the top of every run segment — which is
+/// the only place a `&mut dyn GuestCpu` for that context exists. A queue that fills collapses to
+/// the whole address space ([`MAX_PENDING_INVALIDATIONS`]), which is *more* invalidation rather
+/// than less: over-invalidating costs translation, and dropping a range leaves a context
+/// executing bytes that are not there.
+///
+/// # What remains open, stated exactly
+///
+/// A context drains at a run-segment boundary, so a guest thread that neither crosses the exit
+/// path nor returns from `cpu.run` keeps a stale translation until it does. With
+/// [`RunLimit::Unlimited`] and a guest loop that never leaves generated code, that is for ever; a
+/// guest thread created through `pthread_create` runs in counted windows, so for one of those it
+/// is bounded by a window. Closing it completely needs either a cross-context invalidation the
+/// backend does not offer or an asynchronous halt honoured under a counted budget, which
+/// `crates/dynarmic-sys/patches/README.md` item 2b measures as not being the case on this pin.
+///
+/// The window is therefore **narrower** than it was and is not closed, and the difference is
+/// written down rather than implied.
+///
+/// # A detector, not a watch
+///
+/// Global Constraint 13's distinction: with the broadcast removed, `queued` and `applied` stay at
+/// zero under exactly the workload that makes them rise, because nothing else raises them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeInvalidations {
+    /// Ranges handed to another context's queue.
+    pub queued: u64,
+    /// Ranges another context has taken out of its queue and applied to its own CPU.
+    pub applied: u64,
+    /// Times a queue filled and collapsed to "the whole address space".
+    pub overflows: u64,
+}
+
+/// How many ranges one context's queue holds before it collapses to the whole address space.
+///
+/// **A policy number.** A queue that fills is one whose context has not crossed the boundary
+/// since 64 other-thread `munmap`/`mprotect` calls, and the collapse is *more* invalidation
+/// rather than less — over-invalidating is always safe and only costs translation, where
+/// dropping a range silently leaves a context executing bytes that are no longer there.
+pub const MAX_PENDING_INVALIDATIONS: usize = 64;
+
+/// One context's pending cross-thread invalidations.
+struct CodeQueue {
+    /// Fast path: the run loop reads this once per segment and takes the lock only when it is
+    /// non-zero or the queue has overflowed.
+    pending: AtomicUsize,
+    inner: Mutex<QueueInner>,
+}
+
+#[derive(Default)]
+struct QueueInner {
+    ranges: Vec<(GuestAddr, usize)>,
+    /// Set when the queue filled: the next drain invalidates the whole guest address space.
+    overflowed: bool,
+}
+
+/// The registry of live contexts: one queue each, and the counters. See [`CodeInvalidations`].
+#[derive(Default)]
+struct CodeWatch {
+    contexts: Mutex<Vec<(u64, Arc<CodeQueue>)>>,
+    next: AtomicU64,
+    queued: AtomicU64,
+    applied: AtomicU64,
+    overflows: AtomicU64,
+}
+
+impl CodeWatch {
+    fn register(&self) -> (u64, Arc<CodeQueue>) {
+        let token = self.next.fetch_add(1, Ordering::Relaxed);
+        let queue = Arc::new(CodeQueue {
+            pending: AtomicUsize::new(0),
+            inner: Mutex::new(QueueInner::default()),
+        });
+        self.contexts.lock().push((token, Arc::clone(&queue)));
+        (token, queue)
+    }
+
+    fn deregister(&self, token: u64) {
+        self.contexts.lock().retain(|(held, _)| *held != token);
+    }
+
+    /// Hand `range` to every context but `except`.
+    fn broadcast(&self, except: u64, range: (GuestAddr, usize)) {
+        let contexts = self.contexts.lock();
+        for (token, queue) in contexts.iter() {
+            if *token == except {
+                continue;
+            }
+            let mut inner = queue.inner.lock();
+            if inner.overflowed {
+                continue;
+            }
+            if inner.ranges.len() >= MAX_PENDING_INVALIDATIONS {
+                // More invalidation rather than less: the next drain covers the whole space.
+                inner.ranges.clear();
+                inner.overflowed = true;
+                self.overflows.fetch_add(1, Ordering::Relaxed);
+            } else {
+                inner.ranges.push(range);
+                self.queued.fetch_add(1, Ordering::Relaxed);
+            }
+            queue.pending.store(
+                inner.ranges.len() + usize::from(inner.overflowed),
+                Ordering::Release,
+            );
+        }
+    }
+
+    fn counts(&self) -> CodeInvalidations {
+        CodeInvalidations {
+            queued: self.queued.load(Ordering::Relaxed),
+            applied: self.applied.load(Ordering::Relaxed),
+            overflows: self.overflows.load(Ordering::Relaxed),
+        }
+    }
+}
+
+thread_local! {
+    // The queue and token of the context this thread is currently running, if any. A thread-local
+    // rather than a parameter because a nested `run_at_depth` -- a guest callback -- drives the
+    // SAME CPU, so it must drain the same queue rather than register a second one.
+    static CONTEXT: RefCell<Option<(u64, Arc<CodeQueue>)>> = const { RefCell::new(None) };
+}
+
+/// Keeps one CPU context in the boundary's registry, so another guest thread's `munmap` or
+/// `mprotect` can reach it.
+///
+/// **Hold one for the life of a long-lived context**, which is what the thread runner does: a
+/// guest thread runs in short budget windows and each window is its own [`Boundary::run`], so a
+/// registration that lasted one run would be taken off and put back between them — and a range
+/// invalidated in that gap would be queued for a context that no longer existed and dropped when
+/// the new one registered. See [`CodeInvalidations`].
+///
+/// A [`Boundary::run`] with no registration already held registers one for the duration of that
+/// run. That is correct while it is running, and it is the whole of what is left open here: a
+/// range invalidated while a context is **outside** `run` is not applied to it, because there is
+/// nothing to apply it to and nothing to remember it with. A context that is not running is not
+/// executing stale translations either; it becomes observable only if it starts running again,
+/// which is why a context that will do so holds one of these.
+pub struct ContextRegistration {
+    boundary: Arc<Boundary>,
+    token: u64,
+    previous: Option<(u64, Arc<CodeQueue>)>,
+}
+
+impl core::fmt::Debug for ContextRegistration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ContextRegistration").field("token", &self.token).finish()
+    }
+}
+
+impl Drop for ContextRegistration {
+    fn drop(&mut self) {
+        CONTEXT.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+        self.boundary.code_watch.deregister(self.token);
+    }
+}
+
 // ------------------------------------------------------------------------------- the boundary
 
 /// The frozen boundary: address to symbol to handler, plus the machinery to drive a guest through it.
@@ -374,6 +551,8 @@ pub struct Boundary {
     sentinel: GuestAddr,
     exit_crossings: u64,
     crossings: Mutex<Crossings>,
+    /// The live contexts, and what each of them still has to invalidate. See [`CodeWatch`].
+    code_watch: CodeWatch,
 }
 
 impl Boundary {
@@ -410,6 +589,13 @@ impl Boundary {
     #[must_use]
     pub fn crossings(&self) -> Crossings {
         *self.crossings.lock()
+    }
+
+    /// How much cross-context code invalidation this boundary has done. See
+    /// [`CodeInvalidations`], whose documentation is where the mechanism is described.
+    #[must_use]
+    pub fn code_invalidations(&self) -> CodeInvalidations {
+        self.code_watch.counts()
     }
 
     /// The token an inline thunk is registered with: this boundary's own address.
@@ -471,7 +657,62 @@ impl Boundary {
         // Dropped rather than reported here, because reporting it would blame this run for a failure
         // that happened in another one.
         let _ = take_pending();
+        // Register this run's context for the length of the run, so that another guest thread's
+        // `munmap` or `mprotect` can reach it — unless the caller already holds a registration
+        // for this context, which a long-lived one does. Registering a second would give this
+        // thread two queues and drain only the inner one.
+        let _context = if CONTEXT.with(|cell| cell.borrow().is_some()) {
+            None
+        } else {
+            Some(self.watch_context())
+        };
         self.run_at_depth(cpu, from, limit, 0)
+    }
+
+    /// Keep this thread's CPU context in the registry until the returned guard is dropped.
+    ///
+    /// See [`ContextRegistration`]: a context that runs in repeated short windows holds one
+    /// across all of them, so that a range another guest thread invalidates between two windows
+    /// is still applied.
+    #[must_use]
+    pub fn watch_context(self: &Arc<Self>) -> ContextRegistration {
+        let (token, queue) = self.code_watch.register();
+        let previous = CONTEXT.with(|cell| cell.borrow_mut().replace((token, queue)));
+        ContextRegistration { boundary: Arc::clone(self), token, previous }
+    }
+
+    /// Apply whatever another context queued for this one, before it runs again.
+    ///
+    /// Called at the top of every run segment, which is the only place a `&mut dyn GuestCpu` for
+    /// this context exists. The common case is one relaxed load.
+    fn drain_invalidations(&self, cpu: &mut dyn GuestCpu) -> AbiResult<()> {
+        let queue = CONTEXT.with(|cell| cell.borrow().as_ref().map(|(_, q)| Arc::clone(q)));
+        let Some(queue) = queue else { return Ok(()) };
+        if queue.pending.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        let (ranges, overflowed) = {
+            let mut inner = queue.inner.lock();
+            let overflowed = core::mem::take(&mut inner.overflowed);
+            let ranges = core::mem::take(&mut inner.ranges);
+            queue.pending.store(0, Ordering::Release);
+            (ranges, overflowed)
+        };
+        if overflowed {
+            // The whole space, which is more invalidation rather than less. A backend that has
+            // translated nothing in most of it does nothing for most of it.
+            let space = self.mem.space();
+            let range = omni_cpu::GuestRange::new(space.base(), space.len())?;
+            cpu.invalidate_code(range)?;
+            self.code_watch.applied.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        for (address, len) in ranges {
+            let range = omni_cpu::GuestRange::new(address, len)?;
+            cpu.invalidate_code(range)?;
+            self.code_watch.applied.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn run_at_depth(
@@ -514,6 +755,11 @@ impl Boundary {
                     pc,
                 });
             }
+            // Another guest thread may have unmapped or reprotected a range this context has
+            // translated. This is the only place a `&mut dyn GuestCpu` for it exists, so it is
+            // the only place that can be put right; see [`CodeWatch`] for what that does and does
+            // not close.
+            self.drain_invalidations(cpu)?;
             let exit = cpu.run(pc, remaining)?;
             // Saturating, because a backend counts at the end of a unit it handles as a whole and may
             // overshoot its slice. A counter that wrapped here would turn a bounded run into an
@@ -910,10 +1156,13 @@ impl ReentrantCall<'_> {
     /// length to pages may legitimately have nothing to invalidate, and
     /// [`GuestRange`](omni_cpu::GuestRange) refuses an empty range.
     ///
-    /// **Per context, and the limitation is real.**
-    /// [`GuestCpu::invalidate_code`] is documented as a
-    /// per-context operation, and this reaches the one context the calling guest thread is on.
-    /// Another guest thread that had already translated the same range keeps its translation.
+    /// **Per context, and what closes the rest of it is a registry.**
+    /// [`GuestCpu::invalidate_code`] is documented as a per-context operation, so this call
+    /// reaches only the context the calling guest thread is on. Phase 2 recorded that as "a
+    /// narrowing of the window, not a closing of it" and said a registry of live contexts
+    /// belonged with thread lifecycle. It is here now: the range is also **queued for every other
+    /// live context**, each of which applies it at the top of its next run segment.
+    /// [`CodeInvalidations`] has what that closes and the one case it does not.
     ///
     /// # Errors
     ///
@@ -923,7 +1172,11 @@ impl ReentrantCall<'_> {
             return Ok(());
         }
         let range = omni_cpu::GuestRange::new(address, len)?;
+        // This context first, synchronously, because the caller is about to return into it.
         self.cpu.invalidate_code(range)?;
+        // Then every other live context, which applies it at the top of its next run segment.
+        let me = CONTEXT.with(|cell| cell.borrow().as_ref().map(|(token, _)| *token));
+        self.boundary.code_watch.broadcast(me.unwrap_or(u64::MAX), (address, len));
         Ok(())
     }
 

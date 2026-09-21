@@ -5060,3 +5060,109 @@ fn a_thread_host_may_be_set_only_once() {
         other => panic!("a second thread host must be refused, got {other:?}"),
     }
 }
+
+/// **A second guest thread's translations are invalidated when another thread unmaps a range.**
+///
+/// Phase 2 recorded `ReentrantCall::invalidate_code` as reaching **one** context — "a narrowing
+/// of the window, not a closing of it" — and said the registry of live contexts that would close
+/// the rest belonged with thread lifecycle. This is that registry, and this is the test that can
+/// tell it apart from nothing happening.
+///
+/// **A detector rather than a watch** (Global Constraint 13): both counters stay at zero under
+/// exactly this workload if the broadcast is removed, because there is no other path that raises
+/// them. What is asserted is that a range one thread unmapped reached a *different* live context
+/// and was applied to its CPU.
+#[test]
+fn a_range_one_guest_thread_unmaps_reaches_another_threads_context() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    f.bionic
+        .set_thread_host(ThreadHost::new(backend).with_limit(2).with_step_window(1_000))
+        .expect("a thread host");
+    let out = f.guest.data + 0x800;
+    let gate = f.guest.data + 0xC80;
+    let running = f.guest.data + 0xC88;
+    f.guest.write_u64(gate, 0);
+    f.guest.write_u64(running, 0);
+
+    // A guest thread that keeps running -- so it keeps reaching run-window boundaries, which is
+    // where a context applies what another one queued for it.
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, running as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
+        asm.mov(9, gate as u64);
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(10, 9, 0));
+        asm.push(subs_imm(10, 10, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.mov(0, 0);
+    });
+
+    // **Every program this test runs is assembled before the second thread starts.**
+    // `Guest::load` flips the whole shared code region to `ReadWrite` and back to `ReadExecute`,
+    // and doing that while another guest thread is fetching from it is a fault in that thread
+    // rather than anything to do with what is being tested. Found by this test failing about one
+    // run in three.
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+    });
+    let mapped = program(&f, |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0x1_0000);
+        asm.mov(2, PROT_RW);
+        asm.mov(3, MAP_ANON_PRIVATE);
+        asm.mov(4, u64::MAX);
+        asm.mov(5, 0);
+        asm.bl(f.thunk("mmap"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 64));
+        asm.mov(1, 0x1_0000);
+        asm.bl(f.thunk("munmap"));
+        asm.push(str_imm(0, 22, 72));
+    });
+    let join = program(&f, |asm| {
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 24));
+    });
+
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8), 0, "the thread was created");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while f.guest.read_u64(running) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the second guest thread never started");
+        std::thread::yield_now();
+    }
+    let before = f.boundary.code_invalidations();
+    assert_eq!(before.applied, 0, "nothing has been unmapped yet");
+
+    // Now this thread maps and unmaps a range, through the guest's own `mmap`/`munmap`.
+    assert!(matches!(run_program(&f, mapped).expect("completes"), ExitReason::Returned { .. }));
+    assert_ne!(f.guest.read_u64(out + 64), u64::MAX, "the mapping succeeded");
+    assert_eq!(f.guest.read_u64(out + 72), 0, "and the unmapping did");
+
+    // The other context picks it up at its next run-window boundary.
+    while f.boundary.code_invalidations().applied == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the other guest thread's context never applied the invalidation: {:?}",
+            f.boundary.code_invalidations()
+        );
+        std::thread::yield_now();
+    }
+    let after = f.boundary.code_invalidations();
+    assert!(after.queued >= 1, "{after:?}");
+    assert!(after.applied >= 1, "{after:?}");
+    assert_eq!(after.overflows, 0, "two ranges do not fill a queue of 64");
+
+    // Let it go and reap it.
+    f.guest.write_u64(gate, 1);
+    assert!(matches!(run_program(&f, join).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 24), 0, "the join succeeded");
+}
