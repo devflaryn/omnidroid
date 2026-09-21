@@ -548,6 +548,16 @@ impl GuestCpuBackend for DynarmicBackend {
         Ok(Box::new(self.build(config, None)?))
     }
 
+    /// The inherent [`create_thread_with_tls`](DynarmicBackend::create_thread_with_tls), behind
+    /// the trait — so that a runtime holding `&dyn GuestCpuBackend` can create a guest thread
+    /// without knowing which backend it has, which is what `pthread_create` needs.
+    ///
+    /// The block comes from this backend's **one** arena, so every thread of this address space
+    /// carries the same stack guard (D13).
+    fn create_guest_thread(&self) -> CpuResult<Box<dyn GuestCpu>> {
+        Ok(Box::new(self.create_thread_with_tls()?))
+    }
+
     fn shared_cost(&self) -> ContextCost {
         self.shared.tls.cost()
     }

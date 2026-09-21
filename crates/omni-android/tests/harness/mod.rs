@@ -36,7 +36,7 @@ pub const BUDGET: RunLimit = RunLimit::Instructions(10_000_000);
 /// A guest address space with code, data and a stack, and a backend over it.
 pub struct Guest {
     pub space: Arc<GuestSpace>,
-    pub backend: DynarmicBackend,
+    pub backend: Arc<DynarmicBackend>,
     pub code: GuestAddr,
     pub data: GuestAddr,
     /// A mapped, committed, **read-only** page: a guest handing its own `.rodata` over as an output
@@ -71,8 +71,10 @@ impl Guest {
             .map(|r| (r.start + r.len / 2) & !0xF)
             .expect("some free address space");
 
-        let backend = DynarmicBackend::new(Arc::clone(&space), DynarmicOptions::default())
-            .expect("a translating backend");
+        let backend = Arc::new(
+            DynarmicBackend::new(Arc::clone(&space), DynarmicOptions::default())
+                .expect("a translating backend"),
+        );
         // The same assertion `omni-cpu`'s suites make, for the same reason: a backend with no demand
         // pager puts every guest fault on dynarmic's own handler and the 30-49x recompiled callback
         // path. The tests would pass and would have stopped testing the path they name.

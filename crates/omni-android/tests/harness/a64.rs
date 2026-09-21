@@ -216,6 +216,15 @@ pub fn b_to(from: GuestAddr, to: GuestAddr) -> u32 {
     b((delta / 4) as i32)
 }
 
+/// `MRS Xt, TPIDR_EL0` — `S3_3_C13_C0_2`, the bionic thread pointer.
+///
+/// The instruction D13 is about: `libroblox.so` holds 1,282 of these and 1,276 of them go
+/// straight on to load `[Xt, #0x28]`, which is bionic's `TLS_SLOT_STACK_GUARD`. A guest thread
+/// with no thread pointer faults on the first stack-protected call it makes.
+pub const fn mrs_tpidr_el0(rt: u32) -> u32 {
+    0xD53B_D040 | (rt & 0x1F)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

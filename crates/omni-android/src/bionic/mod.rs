@@ -48,6 +48,7 @@ mod procenv;
 mod runtime;
 mod signals;
 mod stdio;
+mod threads;
 mod view;
 
 use std::cell::RefCell;
@@ -66,9 +67,10 @@ use omni_elf::loader::DlPhdrInfo;
 use omni_bionic::stdio::Stream;
 use omni_mem::{CommitPolicy, GuestAddr, GuestSpace, Placement, Protection};
 use omni_platform::fs::Filesystem;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::boundary::{BoundaryBuilder, ImportCall, ImportFn, ReentrantFn};
+use threads::JoinOutcome;
 use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
 
@@ -80,6 +82,10 @@ pub use logging::LogRecord;
 pub use omni_platform::log::Priority as LogPriority;
 pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
+pub use threads::{
+    GuestThreadFailure, GuestThreadState, ThreadHost, DEFAULT_GUEST_STACK_BYTES,
+    GUEST_THREAD_STEP_WINDOW, MIN_GUEST_STACK_BYTES, SCHED_OTHER,
+};
 pub use view::{
     GuestView, DL_INFO_OFFSET, DL_INFO_SLOTS, DL_PHDR_INFO_BYTES, ERRNO_OFFSET, SCRATCH_BYTES,
     SCRATCH_OFFSET, THREAD_BLOCK_BYTES,
@@ -262,6 +268,50 @@ pub struct Bionic {
     streams: Mutex<BTreeMap<GuestAddr, Stream>>,
     /// The open directory streams: the guest `DIR *`, and the seam's handle behind it.
     dirs: Mutex<BTreeMap<GuestAddr, i32>>,
+
+    // ---------------------------------------------------------- phase 3c: thread lifecycle
+    /// What makes a guest thread's CPU context, and the policy around it.
+    ///
+    /// **`None` until the embedding supplies one, and no default is possible.** The adapter
+    /// cannot invent a `GuestCpuBackend`, and a backend is the only thing that can give a new
+    /// guest thread the bionic TLS block D13 requires before it runs one instruction. An
+    /// instance without one refuses `pthread_create` by name, naming
+    /// [`Bionic::set_thread_host`].
+    ///
+    /// A `OnceLock` for the same reason the filesystem root is one: a backend that changed
+    /// under a running guest thread would leave that thread's context orphaned from the arena
+    /// its TLS block came from.
+    thread_host: OnceLock<ThreadHost>,
+    /// Every guest thread `pthread_create` started and has not yet reaped.
+    guest_threads: Mutex<GuestThreads>,
+    /// Signalled when a guest thread finishes, which is what `pthread_join` waits on.
+    threads_done: Condvar,
+    /// Guest threads that stopped without returning, oldest first.
+    thread_failures: Mutex<Vec<GuestThreadFailure>>,
+    /// The cooperative stop switch every created thread checks between run windows.
+    ///
+    /// D16's shape: a watchdog over a guest that never returns is built from short budget
+    /// windows, because the halt flag is checked at terminals a counted budget makes exclusive.
+    threads_stopping: AtomicBool,
+}
+
+/// The live guest threads, and who is waiting for whom.
+///
+/// One structure under one lock, because the deadlock check reads both: `records` says which
+/// threads exist and `waits` says which of them is blocked on which, and a check that read them
+/// under two locks could see a cycle that had already been broken, or miss one that had just
+/// formed.
+#[derive(Default)]
+struct GuestThreads {
+    /// `pthread_t` to what is known about it.
+    records: BTreeMap<GuestThreadId, threads::ThreadRecord>,
+    /// Joiner to the thread it is inside `pthread_join` on.
+    ///
+    /// The **only** source of truth for both questions a join has to answer: "is somebody
+    /// already joining this thread" is a search of the values, and "would this join deadlock" is
+    /// a walk of the chain. Keeping a second flag on the record beside it would be two places to
+    /// update and one of them would eventually be missed.
+    waits: BTreeMap<GuestThreadId, GuestThreadId>,
 }
 
 /// One loaded image, as `dl_iterate_phdr` reports it.
@@ -351,6 +401,11 @@ impl Bionic {
             fs_device: OnceLock::new(),
             streams: Mutex::new(BTreeMap::new()),
             dirs: Mutex::new(BTreeMap::new()),
+            thread_host: OnceLock::new(),
+            guest_threads: Mutex::new(GuestThreads::default()),
+            threads_done: Condvar::new(),
+            thread_failures: Mutex::new(Vec::new()),
+            threads_stopping: AtomicBool::new(false),
         });
         // `gmtime_r`'s `tm_zone` is a `const char *` the guest dereferences, so it has to point at
         // something for the whole life of the instance. Interned here, before any guest code runs
@@ -874,6 +929,315 @@ impl Bionic {
     /// Store the `rand` state.
     pub fn set_rand_state(&self, state: u32) {
         self.rand.store(state, Ordering::Relaxed);
+    }
+
+    // ------------------------------------------------------------------ phase 3c: threads
+
+    /// Give this guest instance the ability to create threads.
+    ///
+    /// **Until this is called `pthread_create` refuses by name, naming this method.** There is no
+    /// default and there cannot be one: a guest thread is a host thread driving a new
+    /// [`GuestCpu`](omni_cpu::GuestCpu) context whose `TPIDR_EL0` points at a populated bionic
+    /// TLS block (D13), and only a [`GuestCpuBackend`](omni_cpu::GuestCpuBackend) can produce
+    /// one. The same shape as [`set_filesystem_root`](Bionic::set_filesystem_root) and
+    /// [`HwcapPolicy::Undecided`](HwcapPolicy): a capability an embedding grants explicitly.
+    ///
+    /// # What this costs, measured
+    ///
+    /// **A guest thread costs about 24.5 MiB of commit charge** — measured at 24.56 MiB/thread
+    /// (n = 1 run of 8 contexts, serialized, release;
+    /// `omni-cpu/tests/bench.rs::the_commit_charge_of_a_guest_thread`), against an
+    /// instance-without-threads figure of ~16.7 MiB. Most of it is **not** the code cache: the
+    /// same measurement at 8, 32 and 128 MiB of cache gives 24.56, 34.61 and 34.61 MiB/thread,
+    /// so shrinking the cache does not help. 16 MiB of it is a fixed fast-dispatch table
+    /// `A64EmitX64` holds by value and writes in its constructor for a feature D16 runs
+    /// **disabled** — `crates/dynarmic-sys/patches/README.md` item 4 has the patch, and it is
+    /// **not applied**, because D5 pins the vendored tree byte-for-byte unmodified.
+    ///
+    /// So an instance whose guest creates threads is not an instance that costs 16.7 MiB. Use
+    /// [`ThreadHost::with_limit`] to bound it; the default is [`MAX_GUEST_THREADS`], which is the
+    /// arena's own capacity rather than a judgement about memory.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] if this instance already has one. It may be set once: a backend that
+    /// changed under a running guest thread would leave that thread's TLS block orphaned from the
+    /// arena it came from, and the stack-guard value would no longer be one per address space.
+    pub fn set_thread_host(&self, host: ThreadHost) -> AbiResult<()> {
+        if self.thread_host.set(host).is_err() {
+            return Err(AbiError::Refused {
+                symbol: "pthread_create".to_string(),
+                address: self.arena,
+                why: "this guest instance already has a thread host. It may be set once: a second \
+                      CPU backend would allocate TLS blocks out of a second arena, and bionic \
+                      copies ONE stack-guard value into every thread of a process — so a canary \
+                      stored on a frame in one thread and checked in another would fail, which is \
+                      a termination rather than an error"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The thread host, or `None` if the embedding has not supplied one.
+    #[must_use]
+    pub fn thread_host(&self) -> Option<&ThreadHost> {
+        self.thread_host.get()
+    }
+
+    /// The arena's thread table, which owns the `errno` blocks and the `pthread_t` counter.
+    pub(crate) fn threads_table(&self) -> &ThreadTable {
+        &self.threads
+    }
+
+    /// The guest address space, so a thread can give its stack back.
+    pub(crate) fn space_ref(&self) -> &Arc<GuestSpace> {
+        &self.space
+    }
+
+    /// Publish this instance to the calling thread **on a slot that was reserved for it**.
+    ///
+    /// The half of [`activate`](Bionic::activate) a created guest thread uses: its identity and
+    /// its block were allocated by `pthread_create`, in the parent, so that the `pthread_t` the
+    /// parent wrote is the one this thread's `pthread_self()` will return.
+    pub(crate) fn activate_slot(self: &Arc<Self>, slot: ThreadSlot) -> Activation {
+        let active = Active { bionic: Arc::clone(self), thread: slot.id, block: slot.block };
+        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(active));
+        Activation { previous }
+    }
+
+    /// How many guest threads this instance created and are still running.
+    ///
+    /// **Running**, not "not yet reaped": a joinable thread that has finished and is waiting for
+    /// its `pthread_join` holds no context, no stack and no arena block, so counting it against
+    /// the live limit would refuse a `pthread_create` that nothing was standing in the way of.
+    #[must_use]
+    pub fn live_guest_threads(&self) -> usize {
+        self.guest_threads
+            .lock()
+            .records
+            .values()
+            .filter(|record| !record.state.is_finished())
+            .count()
+    }
+
+    /// How many guest threads this instance created and has not reaped, running or not.
+    #[must_use]
+    pub fn guest_thread_records(&self) -> usize {
+        self.guest_threads.lock().records.len()
+    }
+
+    /// Whether this instance knows a `pthread_t` — that is, whether `pthread_create` produced it.
+    #[must_use]
+    pub fn knows_guest_thread(&self, thread: u64) -> bool {
+        self.guest_threads.lock().records.contains_key(&GuestThreadId(thread))
+    }
+
+    /// The state of a guest thread, for a test or an embedding that wants to look.
+    #[must_use]
+    pub fn guest_thread_state(&self, thread: u64) -> Option<GuestThreadState> {
+        self.guest_threads.lock().records.get(&GuestThreadId(thread)).map(|r| r.state.clone())
+    }
+
+    /// Every guest thread that stopped for a reason other than returning, oldest first.
+    ///
+    /// **This is the only place a detached thread's failure can surface.** Nobody joins a
+    /// detached thread, so a fault in one would otherwise be silent; it is recorded here and, for
+    /// a joinable thread, also reported out of `pthread_join` as a refusal.
+    #[must_use]
+    pub fn guest_thread_failures(&self) -> Vec<GuestThreadFailure> {
+        self.thread_failures.lock().clone()
+    }
+
+    /// Ask every created guest thread to stop at its next run-window boundary.
+    ///
+    /// **D16's mechanism, and its limits are stated rather than implied.** The switch is read
+    /// between run windows, so a thread stops after at most one window of guest instructions
+    /// ([`ThreadHost::with_step_window`]); it is *not* an interrupt, and a thread blocked in a
+    /// guest mutex or inside `pthread_join` stops only once that returns. It is idempotent and
+    /// cannot be taken back: an instance that has asked its guest threads to stop is shutting
+    /// down.
+    pub fn stop_guest_threads(&self) {
+        self.threads_stopping.store(true, Ordering::Release);
+    }
+
+    /// Whether [`stop_guest_threads`](Bionic::stop_guest_threads) has been called.
+    #[must_use]
+    pub fn guest_threads_stopping(&self) -> bool {
+        self.threads_stopping.load(Ordering::Acquire)
+    }
+
+    /// Record a guest thread that did not finish by returning.
+    pub(crate) fn record_thread_failure(&self, failure: GuestThreadFailure) {
+        self.thread_failures.lock().push(failure);
+    }
+
+    /// Put a new thread in the registry, before it starts.
+    pub(crate) fn register_guest_thread(
+        &self,
+        id: GuestThreadId,
+        detached: bool,
+        start_routine: GuestAddr,
+    ) {
+        self.guest_threads.lock().records.insert(
+            id,
+            threads::ThreadRecord {
+                state: GuestThreadState::Running,
+                detached,
+                handle: None,
+                start_routine,
+            },
+        );
+    }
+
+    /// Give a registered thread its host handle, once `spawn` has returned one.
+    ///
+    /// **A detached thread can have finished and been reaped before this runs**, which is why
+    /// the missing-record case drops the handle rather than asserting: dropping a `JoinHandle`
+    /// detaches the host thread, which is exactly what a detached guest thread wants.
+    pub(crate) fn attach_guest_thread_handle(
+        &self,
+        id: GuestThreadId,
+        handle: std::thread::JoinHandle<()>,
+    ) {
+        let mut guard = self.guest_threads.lock();
+        match guard.records.get_mut(&id) {
+            Some(record) => record.handle = Some(handle),
+            None => drop(handle),
+        }
+    }
+
+    /// Remove a thread that was registered and then failed to start.
+    pub(crate) fn forget_guest_thread(&self, id: GuestThreadId) {
+        self.guest_threads.lock().records.remove(&id);
+    }
+
+    /// Record how a guest thread ended and wake anything joining it.
+    ///
+    /// A **detached** thread is removed here instead: nobody will join it, so keeping the record
+    /// would be a leak a guest could drive in a loop.
+    pub(crate) fn finish_guest_thread(&self, id: GuestThreadId, state: GuestThreadState) {
+        {
+            let mut guard = self.guest_threads.lock();
+            let detached = guard.records.get(&id).is_some_and(|record| record.detached);
+            if detached {
+                guard.records.remove(&id);
+            } else if let Some(record) = guard.records.get_mut(&id) {
+                record.state = state;
+            }
+        }
+        self.threads_done.notify_all();
+    }
+
+    /// `pthread_join`'s whole decision, under one lock.
+    ///
+    /// `Err(String)` is a refusal: a thread that stopped without returning has no `void *`, and
+    /// `0` with a null `retval` would be indistinguishable from one that returned `NULL`.
+    pub(crate) fn join_guest_thread(
+        &self,
+        me: GuestThreadId,
+        thread: u64,
+    ) -> Result<JoinOutcome, String> {
+        use omni_bionic::errno::consts;
+        let target = GuestThreadId(thread);
+        // POSIX names this one explicitly, and it is the only deadlock a single thread can cause
+        // on its own.
+        if target == me {
+            return Ok(JoinOutcome::Errno(consts::EDEADLK));
+        }
+        let mut guard = self.guest_threads.lock();
+        let Some(record) = guard.records.get(&target) else {
+            return Ok(JoinOutcome::Errno(consts::ESRCH));
+        };
+        if record.detached {
+            return Ok(JoinOutcome::Errno(consts::EINVAL));
+        }
+        if guard.waits.values().any(|waiting_for| *waiting_for == target) {
+            // POSIX: joining a thread another thread is already joining is undefined, and EINVAL
+            // is the "not a joinable thread" answer. Letting both through would have two joiners
+            // reaping one host thread.
+            return Ok(JoinOutcome::Errno(consts::EINVAL));
+        }
+        // **The deadlock check, and it is a hostile-input defence rather than a nicety.** Two
+        // guest threads joining each other is two host threads blocked for ever on guest input.
+        // Walking the wait chain forward from the target is bounded by the number of records,
+        // because each step moves to a different thread and a repeat would be the cycle itself.
+        let mut at = target;
+        for _ in 0..=guard.records.len() {
+            match guard.waits.get(&at) {
+                Some(next) if *next == me => return Ok(JoinOutcome::Errno(consts::EDEADLK)),
+                Some(next) => at = *next,
+                None => break,
+            }
+        }
+
+        guard.waits.insert(me, target);
+        while guard.records.get(&target).is_some_and(|record| !record.state.is_finished()) {
+            self.threads_done.wait(&mut guard);
+        }
+        guard.waits.remove(&me);
+        let Some(record) = guard.records.remove(&target) else {
+            // Cannot normally happen: only `finish_guest_thread` removes a record while a thread
+            // is running, and only for a detached one, which this call already refused.
+            return Ok(JoinOutcome::Errno(consts::ESRCH));
+        };
+        let handle = record.handle;
+        let state = record.state;
+        let start_routine = record.start_routine;
+        drop(guard);
+        // Reap the host thread. It has already recorded its state, so this returns as soon as it
+        // finishes unwinding its own frame.
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+        match state {
+            GuestThreadState::Returned(value) => Ok(JoinOutcome::Returned(value)),
+            GuestThreadState::Running => Ok(JoinOutcome::Errno(consts::ESRCH)),
+            GuestThreadState::Stopped => Err(format!(
+                "the guest joined thread {thread:#x} (start routine {start_routine:#x}), which \
+                 this runtime had asked to stop and which therefore never returned a value. \
+                 There is no `void *` to report: 0 with a null retval would be indistinguishable \
+                 from a thread that returned NULL. See `Bionic::stop_guest_threads`"
+            )),
+            GuestThreadState::Failed(why) => Err(format!(
+                "the guest joined thread {thread:#x} (start routine {start_routine:#x}), which \
+                 stopped without returning: {why}. There is no `void *` for a thread that never \
+                 produced one, and 0 with a null retval would report that it returned NULL"
+            )),
+        }
+    }
+
+    /// `pthread_detach`'s whole decision, as the value it returns.
+    pub(crate) fn detach_guest_thread(&self, thread: u64) -> i32 {
+        use omni_bionic::errno::consts;
+        let id = GuestThreadId(thread);
+        let mut guard = self.guest_threads.lock();
+        let Some(record) = guard.records.get(&id) else {
+            // Either an id this instance never handed out, or a detached thread that has already
+            // finished and been reaped — both are "no such thread", which is what ESRCH says.
+            return consts::ESRCH;
+        };
+        if record.detached {
+            // POSIX: "the value specified by thread does not refer to a joinable thread". A
+            // second detach answering 0 would make it indistinguishable from the first, and in a
+            // real implementation it is a use-after-free of the thread's own descriptor.
+            return consts::EINVAL;
+        }
+        if guard.waits.values().any(|waiting_for| *waiting_for == id) {
+            return consts::EINVAL;
+        }
+        if record.state.is_finished() {
+            // Finished and nobody is joining it: reap it now rather than leaving a record no call
+            // will ever remove.
+            let record = guard.records.remove(&id).expect("just looked it up");
+            drop(guard);
+            if let Some(handle) = record.handle {
+                let _ = handle.join();
+            }
+            return 0;
+        }
+        guard.records.get_mut(&id).expect("just looked it up").detached = true;
+        0
     }
 
     /// Bind every symbol this phase implements into `builder`, and return how many.

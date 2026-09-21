@@ -55,7 +55,7 @@ use crate::error::{AbiError, AbiResult};
 use super::view::GuestView;
 use super::{
     active, clocks, dl, enter, files, format, guestmem, logging, procenv, runtime::CallThreads,
-    signals, stdio,
+    signals, stdio, threads,
 };
 
 // ------------------------------------------------------------------ result lifting
@@ -930,6 +930,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("sigaction", signals::sigaction),
     ("raise", signals::raise),
     ("pthread_sigmask", signals::pthread_sigmask),
+    // ---- phase 3c: the one thread symbol that runs no guest code and touches no mapping, so
+    // the exit path would cost it 3x per call for nothing.
+    ("pthread_getschedparam", threads::pthread_getschedparam),
 ];
 
 /// Serviced on the **exit** path: 80-102 ns per call.
@@ -953,4 +956,12 @@ pub(super) static REENTRANT: &[(&str, ReentrantFn)] = &[
     ("mprotect", guestmem::mprotect),
     ("madvise", guestmem::madvise),
     ("mlock", guestmem::mlock),
+    // ---- phase 3c: thread lifecycle. Re-entrant for both of F9's reasons at once: the start
+    // routine is **guest code**, and `pthread_create` maps the new thread's stack, which reaches
+    // `GuestSpace`. It is also the only handler that needs the boundary itself, to install the
+    // thunk table on a context it has just created; `threads`' module documentation has the
+    // three constraints that meet in it and why none of them is traded against another.
+    ("pthread_create", threads::pthread_create),
+    ("pthread_join", threads::pthread_join),
+    ("pthread_detach", threads::pthread_detach),
 ];

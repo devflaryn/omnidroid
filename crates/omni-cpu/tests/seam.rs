@@ -472,3 +472,29 @@ fn the_backend_is_usable_entirely_through_trait_objects() {
     let moved = std::thread::spawn(move || cpu.x(XReg::X0)).join().expect("the guest thread");
     assert_eq!(moved, 0x1234);
 }
+
+/// **A backend that owns no TLS arena refuses `create_guest_thread` by name.**
+///
+/// That call is the one `pthread_create` makes, and what it asks for is a context on a block the
+/// *backend* allocated — because the stack-guard value has to be the same in every thread of one
+/// address space (D13), and it is a property of the arena. A backend with no arena has no guard
+/// to give, so the default body refuses and names itself; it does **not** fall back to
+/// `create_thread` with an invented thread pointer, which is the one thing that would satisfy the
+/// type and break the guest.
+#[test]
+fn a_backend_with_no_tls_arena_refuses_to_create_a_guest_thread() {
+    let backend: Box<dyn GuestCpuBackend> = Box::new(NativeShaped);
+    match backend.create_guest_thread() {
+        Err(error @ CpuError::Unsupported { .. }) => {
+            let text = error.to_string();
+            assert!(text.contains("D13"), "the refusal must say what it cannot satisfy: {text}");
+            assert!(text.contains("stack-guard"), "{text}");
+        }
+        Err(other) => panic!("a backend with no arena must refuse by name, got {other:?}"),
+        Ok(_) => panic!("a backend with no TLS arena handed out a guest thread anyway"),
+    }
+    // And the hand-it-a-block form still works, which is what makes the refusal a statement about
+    // the arena rather than about guest threads.
+    let config = GuestThreadConfig::new(space(), TLS).expect("a guest thread");
+    assert!(backend.create_thread(config).is_ok());
+}

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use harness::a64::*;
 use harness::{serialized, Asm, Guest, BUDGET};
-use omni_android::bionic::Bionic;
+use omni_android::bionic::{Bionic, ThreadHost};
 use omni_android::{AbiError, Boundary};
 use omni_cpu::{ExitReason, GuestCpu};
 
@@ -151,16 +151,16 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 152, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 156, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
     // Phase 3b adds 29, all inline: eighteen descriptor symbols and eleven `FILE *` ones.
     // Phase 3c adds 4 inline (the signal family) and 4 re-entrant (thread lifecycle).
-    assert_eq!(Bionic::inline_symbols().count(), 144);
-    assert_eq!(Bionic::reentrant_symbols().count(), 8);
+    assert_eq!(Bionic::inline_symbols().count(), 145);
+    assert_eq!(Bionic::reentrant_symbols().count(), 11);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
-    // handler at all. 152 + 18 = 170 of the 188 the initializers reach.
+    // handler at all. 156 + 18 = 174 of the 188 the initializers reach.
     assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
 
     // **Membership, not just a total** — a count cannot see a substitution, and this project has
@@ -240,6 +240,36 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         assert!(bound.contains(symbol), "`{symbol}` is in phase 3b's scope and is not bound");
     }
 
+    // **Phase 3c's eight, named one by one**, derived the same way: the 188 minus everything
+    // named in `handlers.rs` and `data.rs`, intersected with the plan's `3c` row. Four of them
+    // are answered, three refuse by name and one -- `sigfillset` -- is pure computation over the
+    // guest's own `sigset_t` and is implemented in `omni-bionic`.
+    let phase_3c = [
+        "pthread_create",
+        "pthread_detach",
+        "pthread_getschedparam",
+        "pthread_join",
+        "pthread_sigmask",
+        "raise",
+        "sigaction",
+        "sigfillset",
+    ];
+    assert_eq!(phase_3c.len(), 8);
+    for symbol in phase_3c {
+        assert!(bound.contains(symbol), "`{symbol}` is in phase 3c's scope and is not bound");
+    }
+    // The three that create, join and detach a thread are on the **exit path**, and that is F9
+    // rather than a preference: a start routine is guest code and `pthread_create` maps the new
+    // thread's stack. `pthread_getschedparam` does neither and is inline with the four signal
+    // symbols, which also hold no CPU.
+    let reentrant: std::collections::BTreeSet<&str> = Bionic::reentrant_symbols().collect();
+    for symbol in ["pthread_create", "pthread_join", "pthread_detach"] {
+        assert!(reentrant.contains(symbol), "`{symbol}` must be re-entrant (F9)");
+    }
+    for symbol in ["sigfillset", "sigaction", "raise", "pthread_sigmask", "pthread_getschedparam"] {
+        assert!(!reentrant.contains(symbol), "`{symbol}` holds no CPU and belongs inline");
+    }
+
     // And the complement: the groups phase 3b deliberately does not touch stay `Unbound`, so that
     // "not done yet" and "done" cannot be confused by anyone reading the count. These are the
     // remaining 22 — eight sockets, eight threads and signals, and the six nothing else claims.
@@ -253,12 +283,6 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         "poll",
         "select",
         "socket",
-        // threads and signals: `pthread_create`, `join`, `detach` and `getschedparam` are
-        // still here until phase 3c's second half binds them; the four signal symbols are not.
-        "pthread_create",
-        "pthread_detach",
-        "pthread_getschedparam",
-        "pthread_join",
         // the remainder nothing else claims
         "clock",
         "time",
@@ -267,7 +291,7 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         "__gcov_dump",
         "__gcov_flush",
     ];
-    assert_eq!(still_unbound.len(), 18, "188 - 152 bound - 18 data objects");
+    assert_eq!(still_unbound.len(), 14, "188 - 156 bound - 18 data objects");
     for symbol in still_unbound {
         assert!(
             !bound.contains(symbol),
@@ -314,7 +338,18 @@ fn dispatch_paths_are_what_f9_requires() {
     for symbol in ["pthread_once", "qsort", "dl_iterate_phdr"] {
         assert!(reentrant.contains(symbol), "`{symbol}` calls guest code");
     }
-    assert_eq!(reentrant.len(), 8, "nothing else belongs on the slow path: {reentrant:?}");
+    // Phase 3c's three, which are on the exit path for **both** of F9's reasons at once: a start
+    // routine is guest code, and `pthread_create` maps the new thread's stack. The fourth,
+    // `pthread_getschedparam`, reaches neither and stays inline — putting it here for tidiness
+    // would cost it 3x per call for nothing, which is the over-correction half of this test.
+    for symbol in ["pthread_create", "pthread_join", "pthread_detach"] {
+        assert!(reentrant.contains(symbol), "`{symbol}` belongs with thread lifecycle (F9)");
+    }
+    assert!(
+        !reentrant.contains("pthread_getschedparam"),
+        "`pthread_getschedparam` runs no guest code and touches no mapping (D17)"
+    );
+    assert_eq!(reentrant.len(), 11, "nothing else belongs on the slow path: {reentrant:?}");
     let inline: std::collections::BTreeSet<&str> = Bionic::inline_symbols().collect();
     // The four `dl*` refusals touch no address space and run no guest code, so they stay on the
     // fast path even though their sibling does not.
@@ -4296,4 +4331,732 @@ fn the_descriptor_and_stream_ceilings_report_emfile_rather_than_growing() {
         }),
         0
     );
+}
+
+// =================================================================== thread lifecycle (phase 3c)
+
+/// A fixture whose instance can create guest threads, over the guest's own backend.
+fn fixture_with_threads(limit: usize) -> Fixture {
+    let f = fixture_with(&[]);
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    f.bionic
+        .set_thread_host(ThreadHost::new(backend).with_limit(limit))
+        .expect("a thread host");
+    f
+}
+
+/// Assemble a start routine: `X0` is the guest's `arg`, and whatever it leaves in `X0` is the
+/// thread's `void *`. It finishes with `RET`, which lands on the boundary's sentinel.
+fn start_routine(f: &Fixture, build: impl FnOnce(&mut Asm)) -> omni_cpu::GuestAddr {
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    build(&mut asm);
+    asm.push(ret(30));
+    f.guest.load(asm.words());
+    entry
+}
+
+/// `pthread_create(&tid, attr, start, arg)` with `tid` at `out` and the result at `out + 8`.
+fn create_call(
+    f: &Fixture,
+    asm: &mut Asm,
+    out: omni_cpu::GuestAddr,
+    attr: u64,
+    start: omni_cpu::GuestAddr,
+    arg: u64,
+) {
+    asm.mov(0, out as u64);
+    asm.mov(1, attr);
+    asm.mov(2, start as u64);
+    asm.mov(3, arg);
+    asm.bl(f.thunk("pthread_create"));
+    asm.mov(22, out as u64);
+    asm.push(str_imm(0, 22, 8));
+}
+
+/// **An instance with no thread host refuses `pthread_create` by name.**
+///
+/// No default is possible: only a CPU backend can give a new guest thread the bionic TLS block
+/// D13 requires before it runs an instruction. `EAGAIN` would say the runtime ran out of
+/// resources when it was never configured, and a guest would retry for ever.
+#[test]
+fn pthread_create_without_a_thread_host_refuses_by_name() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let error = refusal_of(&f, "pthread_create", |asm| {
+        asm.mov(0, f.guest.data as u64 + 0x800);
+        asm.mov(1, 0);
+        asm.mov(2, f.guest.code as u64);
+        asm.mov(3, 0);
+    });
+    assert_eq!(error.symbol(), Some("pthread_create"));
+    assert!(matches!(error, AbiError::Refused { .. }), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("set_thread_host"), "the refusal must name the method: {text}");
+    assert!(text.contains("D13"), "and say what it cannot satisfy without one: {text}");
+}
+
+/// **The phase, end to end: a real guest thread runs real translated ARM64 code, and the join
+/// brings its `void *` back.**
+///
+/// Asserted three ways, because each one alone would pass against a different broken version:
+/// the thread's own *side effect* in guest memory (a handler that returned 0 without starting
+/// anything would leave it untouched), the value `pthread_join` writes (a join that succeeded
+/// without waiting would read it before the thread wrote it), and the return codes of both calls.
+#[test]
+fn a_guest_thread_runs_guest_code_and_join_brings_back_its_value() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let marker = f.guest.data + 0x880;
+    f.guest.write_u64(marker, 0);
+
+    // The start routine: store `arg` at `marker`, and return `arg + 1`.
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, marker as u64);
+        asm.push(str_imm(0, 9, 0));
+        asm.push(add_imm(0, 0, 1));
+    });
+
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0x4321);
+        // pthread_join(tid, &retval)
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, out as u64 + 16);
+        asm.bl(f.thunk("pthread_join"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 24));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(f.guest.read_u64(out + 8), 0, "pthread_create returns 0 on success");
+    assert_eq!(f.guest.read_u64(out + 24), 0, "pthread_join returns 0 on success");
+    assert_eq!(f.guest.read_u64(marker), 0x4321, "the start routine really ran, with its arg");
+    assert_eq!(f.guest.read_u64(out + 16), 0x4322, "and its `void *` came back through the join");
+    assert_ne!(f.guest.read_u64(out), 0, "the pthread_t is never the reserved zero");
+    assert_eq!(f.bionic.live_guest_threads(), 0, "the thread was reaped by the join");
+}
+
+/// **D13, on a thread the guest created: `TPIDR_EL0` is programmed before the thread's first
+/// instruction, and its stack guard is the same value every other thread has.**
+///
+/// This is the constraint that is easiest to satisfy incorrectly and hardest to notice: a guest
+/// thread with a zero thread pointer faults on the first stack-protected call, with a symptom
+/// that reads as a loader bug, and one with a *different* guard than its parent fails
+/// `__stack_chk_fail` only when a canary crosses threads.
+///
+/// The start routine reads the thread pointer itself, exactly as 1,276 of `libroblox.so`'s own
+/// instructions do, and stores both the pointer and `[Xt, #0x28]`.
+#[test]
+fn a_created_guest_thread_has_its_thread_pointer_and_the_process_stack_guard() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let seen = f.guest.data + 0x900;
+    f.guest.write_u64(seen, 0);
+    f.guest.write_u64(seen + 8, 0);
+
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, seen as u64);
+        asm.push(mrs_tpidr_el0(10));
+        asm.push(str_imm(10, 9, 0));
+        asm.push(ldr_imm(11, 10, 0x28));
+        asm.push(str_imm(11, 9, 8));
+        asm.mov(0, 0);
+    });
+
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 24));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 24), 0, "the join succeeded");
+
+    let pointer = f.guest.read_u64(seen);
+    let guard = f.guest.read_u64(seen + 8);
+    assert_ne!(pointer, 0, "a guest thread with a null TPIDR_EL0 is D13's crash");
+    assert!(
+        f.guest.space.contains(pointer as usize, 0x30),
+        "the thread pointer must be guest memory with room for the slots up to +0x28"
+    );
+    assert_ne!(guard, 0, "a zero canary compares equal to a zeroed stack slot");
+    assert_eq!(
+        guard,
+        f.guest.backend.tls().stack_guard(),
+        "bionic copies ONE per-process guard into every thread; a created thread with its own \
+         value fails __stack_chk_fail only when a canary crosses threads"
+    );
+}
+
+/// The `pthread_t` the parent is given is the one the child's `pthread_self()` returns, and the
+/// two threads have different `errno` cells.
+///
+/// Allocating the identity in the child would make these differ until the child got there, which
+/// is a race guest code loses rarely and silently.
+#[test]
+fn a_created_thread_agrees_with_its_parent_about_its_own_identity() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let seen = f.guest.data + 0x900;
+    f.guest.write_u64(seen, 0);
+    f.guest.write_u64(seen + 8, 0);
+
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.mov(20, seen as u64);
+        asm.bl(f.thunk("pthread_self"));
+        asm.push(str_imm(0, 20, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(str_imm(0, 20, 8));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 24));
+        // And this thread's own errno cell, for the comparison.
+        asm.bl(f.thunk("__errno"));
+        asm.push(str_imm(0, 22, 32));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(f.guest.read_u64(out + 24), 0, "the join succeeded");
+    assert_eq!(
+        f.guest.read_u64(seen),
+        f.guest.read_u64(out),
+        "the child's pthread_self() must be the pthread_t the parent was handed"
+    );
+    assert_ne!(
+        f.guest.read_u64(seen + 8),
+        f.guest.read_u64(out + 32),
+        "two guest threads sharing one errno cell is the failure the arena exists to prevent"
+    );
+}
+
+/// **A start routine at an address that is not guest code is a recorded failure, and the join
+/// refuses rather than reporting a `void *` the thread never produced.**
+///
+/// The hostile case the brief names. A `0` from the join with a null `retval` would be
+/// indistinguishable from a thread that returned `NULL`.
+#[test]
+fn a_start_routine_at_a_bad_address_is_a_recorded_failure_and_a_join_refusal() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, f.guest.unmapped, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, out as u64 + 16);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 24));
+    });
+    let error = match run_program(&f, entry) {
+        Err(error) => error,
+        Ok(exit) => panic!("the join must refuse, got {exit:?}"),
+    };
+    assert_eq!(error.symbol(), Some("pthread_join"));
+    assert!(matches!(error, AbiError::Refused { .. }), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("stopped without returning"), "{text}");
+
+    // `pthread_create` itself succeeded: the thread was created, and it is the thread that
+    // failed. That distinction is the whole reason the failure is recorded separately.
+    assert_eq!(f.guest.read_u64(out + 8), 0, "pthread_create reported success");
+    let failures = f.bionic.guest_thread_failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].start_routine, f.guest.unmapped);
+    assert_eq!(failures[0].thread, f.guest.read_u64(out));
+}
+
+/// A detached thread that fails has nobody to report to, so the instance's failure list is the
+/// only place it can surface — and it is, with the thread and its start routine named.
+#[test]
+fn a_detached_guest_thread_that_fails_is_still_recorded() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let attr = f.guest.data + 0xA00;
+    let entry = program(&f, |asm| {
+        // pthread_attr_init, then write PTHREAD_CREATE_DETACHED into it directly -- the guest's
+        // own attr bytes, which is all a detach state is.
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_attr_init"));
+        asm.mov(9, attr as u64);
+        asm.mov(10, 1);
+        asm.push(str_w(10, 9, 0));
+        create_call(&f, asm, out, attr as u64, f.guest.unmapped, 0);
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8), 0, "pthread_create reported success");
+
+    // The thread is detached, so nothing joins it: wait for the failure to be recorded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while f.bionic.guest_thread_failures().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "a detached thread's failure was never recorded");
+        std::thread::yield_now();
+    }
+    let failures = f.bionic.guest_thread_failures();
+    assert_eq!(failures[0].start_routine, f.guest.unmapped);
+    assert!(
+        failures[0].to_string().contains("start routine"),
+        "the record must name the thread and its start routine: {}",
+        failures[0]
+    );
+    // And the record is gone: nobody will ever join a detached thread, so keeping one would be a
+    // leak a guest could drive in a loop.
+    while f.bionic.guest_thread_records() > 0 {
+        assert!(std::time::Instant::now() < deadline, "a detached thread's record was never removed");
+        std::thread::yield_now();
+    }
+}
+
+/// The POSIX error cases, each of which is a branch guest code has.
+///
+/// Asserted **by number**: `EDEADLK` is 35, `ESRCH` is 3 and `EINVAL` is 22 in Linux's numbering,
+/// which is not the host's, and a handler that returned the host's would be wrong in a way that
+/// only a guest can see.
+#[test]
+fn the_join_and_detach_error_cases_are_the_posix_ones() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+
+    // Joining yourself.
+    let entry = program(&f, |asm| {
+        asm.bl(f.thunk("pthread_self"));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        // An id nothing ever handed out.
+        asm.mov(0, 0xDEAD_BEEF);
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 8));
+        // Detaching one.
+        asm.mov(0, 0xDEAD_BEEF);
+        asm.bl(f.thunk("pthread_detach"));
+        asm.push(str_imm(0, 22, 16));
+        // And `pthread_getschedparam` on it.
+        asm.mov(0, 0xDEAD_BEEF);
+        asm.mov(1, out as u64 + 64);
+        asm.mov(2, out as u64 + 72);
+        asm.bl(f.thunk("pthread_getschedparam"));
+        asm.push(str_imm(0, 22, 24));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out), 35, "joining yourself is EDEADLK");
+    assert_eq!(f.guest.read_u64(out + 8), 3, "joining an unknown thread is ESRCH");
+    assert_eq!(f.guest.read_u64(out + 16), 3, "detaching an unknown thread is ESRCH");
+    assert_eq!(f.guest.read_u64(out + 24), 3, "getschedparam on an unknown thread is ESRCH");
+}
+
+/// A second `pthread_detach` is `EINVAL`, and a `pthread_join` on a detached thread is too.
+///
+/// **A second detach answering `0` would be indistinguishable from the first**, and a double
+/// detach is a guest defect worth hearing about: in a real implementation it is a use-after-free
+/// of the thread's own descriptor. The thread here spins on a guest word so that it is still
+/// running while both calls are made — a thread that had already finished would exercise the
+/// reap path instead, which is a different branch.
+#[test]
+fn detaching_twice_is_einval_and_joining_a_detached_thread_is_einval() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let gate = f.guest.data + 0x980;
+    f.guest.write_u64(gate, 0);
+
+    // Spin until the parent stores a non-zero word, then return.
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, gate as u64);
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(10, 9, 0));
+        asm.push(subs_imm(10, 10, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.mov(0, 0);
+    });
+
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(19, 22, 0));
+        asm.push(mov_reg(0, 19));
+        asm.bl(f.thunk("pthread_detach"));
+        asm.push(str_imm(0, 22, 16));
+        asm.push(mov_reg(0, 19));
+        asm.bl(f.thunk("pthread_detach"));
+        asm.push(str_imm(0, 22, 24));
+        asm.push(mov_reg(0, 19));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 32));
+        // Let it go.
+        asm.mov(9, gate as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 16), 0, "the first detach succeeds");
+    assert_eq!(f.guest.read_u64(out + 24), 22, "the second is EINVAL, not a second success");
+    assert_eq!(f.guest.read_u64(out + 32), 22, "a detached thread is not joinable");
+
+    // And the detached thread really does finish and clean itself up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while f.bionic.guest_thread_records() > 0 {
+        assert!(std::time::Instant::now() < deadline, "the detached thread never finished");
+        std::thread::yield_now();
+    }
+    assert!(f.bionic.guest_thread_failures().is_empty(), "it returned, so it did not fail");
+}
+
+/// **Two guest threads joining each other is `EDEADLK`, not two host threads blocked for ever.**
+///
+/// A hang from untrusted guest input is a denial of service on the host, and POSIX permits
+/// `EDEADLK` for exactly this ("a deadlock was detected"). The check walks the wait chain, so it
+/// catches a cycle of any length rather than only the self-join POSIX names.
+#[test]
+fn two_guest_threads_joining_each_other_is_edeadlk() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let ids = f.guest.data + 0xB00;
+    let results = f.guest.data + 0xB40;
+    for offset in 0..8u32 {
+        f.guest.write_u64(ids + offset as usize * 8, 0);
+        f.guest.write_u64(results + offset as usize * 8, 0);
+    }
+
+    // Each thread joins whichever id it is handed, spinning until it is non-zero first so that
+    // both ids are published before either join is attempted.
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.push(mov_reg(20, 0)); // the address of the id to join
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(9, 20, 0));
+        asm.push(subs_imm(9, 9, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.push(mov_reg(0, 9));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 20, 16));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+
+    let entry = program(&f, |asm| {
+        // Thread A is told to join what lands at `ids + 8`; thread B, `ids + 0`.
+        create_call(&f, asm, out, 0, start, ids as u64 + 8);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(19, 22, 0));
+        create_call(&f, asm, out + 32, 0, start, ids as u64);
+        asm.mov(22, out as u64 + 32);
+        asm.push(ldr_imm(20, 22, 0));
+        // Publish both ids at once, so neither thread can join before the other exists.
+        asm.mov(9, ids as u64);
+        asm.push(str_imm(19, 9, 0));
+        asm.push(str_imm(20, 9, 8));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    // **The parent does not join them**, and that is not a convenience: a `pthread_join` from
+    // this thread would itself be a waiter on one of the two, and the other's join would then be
+    // refused as "already being joined" before it ever reached the cycle check. The first draft
+    // did exactly that and measured EINVAL instead of EDEADLK.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while f.bionic.live_guest_threads() > 0 {
+        assert!(std::time::Instant::now() < deadline, "the mutual join deadlocked");
+        std::thread::yield_now();
+    }
+
+    // One of the two saw the cycle. Which one is a race and is not asserted; that exactly one
+    // did is not.
+    let a = f.guest.read_u64(ids + 16);
+    let b = f.guest.read_u64(ids + 24);
+    assert!(
+        a == 35 || b == 35,
+        "one of the two mutual joins must be EDEADLK, got {a} and {b}"
+    );
+    assert!(f.bionic.guest_thread_failures().is_empty(), "neither thread failed: {:?}", f.bionic.guest_thread_failures());
+}
+
+/// A hostile `pthread_attr_t`: a detach state the guest wrote directly, a stack under the floor,
+/// and a stack size no mapping of which can exist.
+///
+/// **`SIZE_MAX` is the one that matters.** Rounding it up to a page with `(n + page - 1) &
+/// !(page - 1)` gives **zero**, silently in a release build, so a guest asking for the largest
+/// stack in the world would be handed a zero-byte one. That is `gmtime(i64::MIN)` again.
+#[test]
+fn a_hostile_pthread_attr_is_einval_or_eagain_and_never_a_zero_stack() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let attr = f.guest.data + 0xA00;
+    let start = start_routine(&f, |asm| {
+        asm.mov(0, 7);
+    });
+
+    let entry = program(&f, |asm| {
+        // A detach state that is neither JOINABLE nor DETACHED.
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_attr_init"));
+        asm.mov(9, attr as u64);
+        asm.mov(10, 99);
+        asm.push(str_w(10, 9, 0));
+        create_call(&f, asm, out, attr as u64, start, 0);
+
+        // A stack under the floor.
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_attr_init"));
+        asm.mov(0, attr as u64);
+        asm.mov(1, 64);
+        asm.bl(f.thunk("pthread_attr_setstacksize"));
+        create_call(&f, asm, out + 32, attr as u64, start, 0);
+
+        // A stack of SIZE_MAX.
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_attr_init"));
+        asm.mov(0, attr as u64);
+        asm.mov(1, u64::MAX);
+        asm.bl(f.thunk("pthread_attr_setstacksize"));
+        create_call(&f, asm, out + 64, attr as u64, start, 0);
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(f.guest.read_u64(out + 8), 22, "a detach state of 99 is EINVAL");
+    assert_eq!(f.guest.read_u64(out + 40), 22, "a 64-byte stack is EINVAL");
+    assert_eq!(f.guest.read_u64(out + 72), 11, "a SIZE_MAX stack is EAGAIN, never a zero stack");
+    assert_eq!(f.bionic.guest_thread_records(), 0, "none of the three created a thread");
+    assert_eq!(f.bionic.live_guest_threads(), 0);
+}
+
+/// **Thread-count exhaustion is `EAGAIN`, which is POSIX's own answer and a branch guest code
+/// has** — not a refusal, and not a thread that shares another one's `errno` block.
+#[test]
+fn creating_more_guest_threads_than_the_limit_is_eagain() {
+    let _guard = serialized();
+    let f = fixture_with_threads(2);
+    let out = f.guest.data + 0x800;
+    let gate = f.guest.data + 0x980;
+    f.guest.write_u64(gate, 0);
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, gate as u64);
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(10, 9, 0));
+        asm.push(subs_imm(10, 10, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.mov(0, 0);
+    });
+
+    let entry = program(&f, |asm| {
+        for slot in 0..3u32 {
+            create_call(&f, asm, out + slot as usize * 32, 0, start, 0);
+        }
+        // Let them all go, then join the two that started.
+        asm.mov(9, gate as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
+        for slot in 0..2u32 {
+            asm.mov(22, out as u64 + u64::from(slot) * 32);
+            asm.push(ldr_imm(0, 22, 0));
+            asm.mov(1, 0);
+            asm.bl(f.thunk("pthread_join"));
+        }
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8), 0, "the first is created");
+    assert_eq!(f.guest.read_u64(out + 40), 0, "and the second");
+    assert_eq!(f.guest.read_u64(out + 72), 11, "the third is EAGAIN, the limit being 2");
+    assert_eq!(f.bionic.live_guest_threads(), 0, "both were reaped");
+    assert!(f.bionic.guest_thread_failures().is_empty());
+}
+
+/// **A guest thread's arena block goes back when it exits**, so a guest that creates and joins in
+/// a loop is not limited to 64 threads for the life of the instance.
+///
+/// The block index comes from a free list rather than from the table's length, and the length
+/// version is what makes two live threads share one block — which is silent. This test creates
+/// and joins more threads than the live limit, which only works if blocks are reused.
+#[test]
+fn an_exited_guest_thread_gives_its_arena_block_back() {
+    let _guard = serialized();
+    let f = fixture_with_threads(2);
+    let out = f.guest.data + 0x800;
+    let counter = f.guest.data + 0x9C0;
+    f.guest.write_u64(counter, 0);
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, counter as u64);
+        asm.push(ldr_imm(10, 9, 0));
+        asm.push(add_imm(10, 10, 1));
+        asm.push(str_imm(10, 9, 0));
+        asm.mov(0, 0);
+    });
+
+    for _ in 0..6 {
+        let entry = program(&f, |asm| {
+            create_call(&f, asm, out, 0, start, 0);
+            asm.mov(22, out as u64);
+            asm.push(ldr_imm(0, 22, 0));
+            asm.mov(1, 0);
+            asm.bl(f.thunk("pthread_join"));
+            asm.push(str_imm(0, 22, 24));
+        });
+        assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(f.guest.read_u64(out + 8), 0, "every create succeeds");
+        assert_eq!(f.guest.read_u64(out + 24), 0, "every join succeeds");
+    }
+    assert_eq!(f.guest.read_u64(counter), 6, "six threads really ran");
+    // **One**: this test's own host thread, which attached when the first program ran. Six
+    // guest threads came and went; if a block were never given back the count would be seven,
+    // and the seventh `pthread_create` would eventually be refused rather than reusing one.
+    assert_eq!(
+        f.bionic.attached(),
+        1,
+        "every exited guest thread must have given its arena block back"
+    );
+}
+
+/// `pthread_getschedparam` answers `SCHED_OTHER` with a priority of 0 for a thread this instance
+/// created, and it writes both out-parameters.
+///
+/// The argument that this is an answer rather than a stub is in the handler's documentation and
+/// rests on there being no way to *set* a policy anywhere in the reachable 188 — which
+/// `the_bound_count_is_exactly_what_this_phase_claims` and the reachable list together pin.
+#[test]
+fn getschedparam_answers_sched_other_with_priority_zero() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let gate = f.guest.data + 0x980;
+    f.guest.write_u64(gate, 0);
+    f.guest.write_u64(out + 64, 0x5555_5555_5555_5555);
+    f.guest.write_u64(out + 72, 0x6666_6666_6666_6666);
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, gate as u64);
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(10, 9, 0));
+        asm.push(subs_imm(10, 10, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.mov(0, 0);
+    });
+
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(19, 22, 0));
+        asm.push(mov_reg(0, 19));
+        asm.mov(1, out as u64 + 64);
+        asm.mov(2, out as u64 + 72);
+        asm.bl(f.thunk("pthread_getschedparam"));
+        asm.push(str_imm(0, 22, 24));
+        asm.mov(9, gate as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
+        asm.push(mov_reg(0, 19));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 24), 0, "it answers for a thread it created");
+    assert_eq!(
+        f.guest.read_u64(out + 64) & 0xFFFF_FFFF,
+        0,
+        "SCHED_OTHER is SCHED_NORMAL and is 0"
+    );
+    assert_eq!(
+        f.guest.read_u64(out + 72) & 0xFFFF_FFFF,
+        0,
+        "sched_priority has exactly one legal value under SCHED_OTHER"
+    );
+}
+
+/// The stop switch really stops a guest thread that would otherwise run for ever, at a run-window
+/// boundary — and a `pthread_join` on it is a refusal rather than a `void *` it never produced.
+///
+/// **D16's shape**: the bound on a runaway guest is a short budget window plus a decision point,
+/// not a cross-thread halt. The window is lowered here so the test is a second rather than a
+/// minute; that the mechanism is the window and not the halt is what the low value demonstrates.
+#[test]
+fn a_runaway_guest_thread_stops_at_a_window_boundary() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    f.bionic
+        .set_thread_host(ThreadHost::new(backend).with_limit(2).with_step_window(1_000))
+        .expect("a thread host");
+    let out = f.guest.data + 0x800;
+    let running = f.guest.data + 0x9E0;
+    f.guest.write_u64(running, 0);
+
+    // An unconditional loop that first says it is running.
+    let start = start_routine(&f, |asm| {
+        asm.mov(9, running as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
+        asm.push(b(0));
+    });
+
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8), 0, "the thread was created");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while f.guest.read_u64(running) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the runaway thread never started");
+        std::thread::yield_now();
+    }
+    f.bionic.stop_guest_threads();
+    while f.bionic.live_guest_threads() > 0 {
+        assert!(std::time::Instant::now() < deadline, "the stop switch did not stop it");
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        f.bionic.guest_thread_state(f.guest.read_u64(out)),
+        Some(omni_android::bionic::GuestThreadState::Stopped)
+    );
+
+    // And the join refuses, naming what happened, rather than reporting a value.
+    let join = program(&f, |asm| {
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+    });
+    let error = match run_program(&f, join) {
+        Err(error) => error,
+        Ok(exit) => panic!("the join must refuse, got {exit:?}"),
+    };
+    assert!(error.to_string().contains("asked to stop"), "{error}");
+}
+
+/// A second thread host is refused: a second CPU backend would allocate TLS blocks from a second
+/// arena, and bionic copies **one** stack-guard value into every thread of a process.
+#[test]
+fn a_thread_host_may_be_set_only_once() {
+    let _guard = serialized();
+    let f = fixture_with_threads(2);
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    match f.bionic.set_thread_host(ThreadHost::new(backend)) {
+        Err(AbiError::Refused { why, .. }) => {
+            assert!(why.contains("stack-guard"), "the refusal must say what breaks: {why}");
+        }
+        other => panic!("a second thread host must be refused, got {other:?}"),
+    }
 }

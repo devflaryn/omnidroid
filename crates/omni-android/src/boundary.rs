@@ -879,6 +879,24 @@ impl ReentrantCall<'_> {
         self.depth
     }
 
+    /// The boundary itself, so a handler can drive a **different** guest thread through it.
+    ///
+    /// **Only `pthread_create` needs this, and it is on the exit path only.** A new guest thread
+    /// is a new [`GuestCpu`] with the whole thunk table installed on it and its own run loop, and
+    /// [`install`](Boundary::install) and [`run`](Boundary::run) both take `&Arc<Boundary>` — so
+    /// without this a handler could not start one.
+    ///
+    /// It does **not** weaken the re-entrancy property D18 makes a type property.
+    /// [`ImportCall`] has no boundary and no CPU, so nothing on the inline path can reach this.
+    /// And what it hands back cannot re-enter *this* thread's guest either: `Boundary::run` needs
+    /// a `&mut dyn GuestCpu`, this call already holds the only one for the calling thread, and the
+    /// borrow checker will not produce a second. The only CPU a handler can drive through it is
+    /// one it has just created, which is precisely the capability `pthread_create` is.
+    #[must_use]
+    pub fn boundary(&self) -> &Arc<Boundary> {
+        self.boundary
+    }
+
     /// Discard any translated code covering `[address, address + len)`.
     ///
     /// **Only reachable from the exit path, and that is the point.** A handler that changes what

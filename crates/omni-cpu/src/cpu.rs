@@ -396,6 +396,46 @@ pub trait GuestCpuBackend: Send + Sync {
     /// or [`CpuError::Backend`](crate::CpuError::Backend) if the backend failed to initialise one.
     fn create_thread(&self, config: GuestThreadConfig) -> CpuResult<Box<dyn GuestCpu>>;
 
+    /// Bring up one guest thread's CPU context **on a bionic TLS block this backend allocates**.
+    ///
+    /// The call a runtime uses when the guest itself asks for a thread — `pthread_create` — as
+    /// against [`create_thread`](GuestCpuBackend::create_thread), which is for a caller that has
+    /// already built a block and wants to hand it over.
+    ///
+    /// # Why the backend allocates the block rather than the caller
+    ///
+    /// **The stack-guard value has to be the same in every thread of one address space**, and it
+    /// is a property of the arena the block came from. Bionic reads its guard once per process
+    /// from `getauxval(AT_RANDOM)` and copies that one value into every thread's slot 5; a
+    /// function that stores the canary on its frame in one thread and checks it in another would
+    /// fail otherwise, and `__stack_chk_fail` is a *termination*. So a caller that allocated its
+    /// own [`TlsArena`](crate::TlsArena) beside the backend's would be introducing a second guard
+    /// value into one guest process, and the symptom would be an occasional inexplicable stack
+    /// check failure in a thread that did nothing wrong. Keeping the allocation on this side
+    /// means there is one arena per backend and therefore one guard per address space, which is
+    /// what D13 describes.
+    ///
+    /// The returned context **owns** its block and returns it to the arena when dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`CpuError::Unsupported`](crate::CpuError::Unsupported) from the default body, which is
+    /// what a backend that does not manage TLS blocks answers — a refusal naming the backend,
+    /// never a context without a thread pointer. Otherwise as
+    /// [`create_thread`](GuestCpuBackend::create_thread), plus
+    /// [`CpuError::Memory`](crate::CpuError::Memory) if the block could not be committed and
+    /// `Unsupported` when the arena is full, which is how a guest asking for more threads than
+    /// this backend was sized for is refused rather than handed a shared block.
+    fn create_guest_thread(&self) -> CpuResult<Box<dyn GuestCpu>> {
+        Err(crate::error::CpuError::Unsupported {
+            backend: "guest-cpu-backend",
+            operation: "create a guest thread with a TLS block of this backend's own",
+            reason: "this backend does not own a TLS arena, so it has no stack-guard value to \
+                     give a new thread and cannot satisfy D13 on its own. A caller that has its \
+                     own bionic TLS block builds a GuestThreadConfig and calls create_thread",
+        })
+    }
+
     /// What this backend costs *once*, not per thread: anything shared between contexts.
     ///
     /// Reported separately from [`GuestCpu::cost`] so that summing contexts does not count shared

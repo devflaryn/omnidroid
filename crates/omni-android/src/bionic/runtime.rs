@@ -207,6 +207,12 @@ pub struct ThreadSlot {
     pub id: GuestThreadId,
     /// This thread's private block in the adapter's arena: errno, then scratch.
     pub block: GuestAddr,
+    /// Which block of the arena this is.
+    ///
+    /// Carried so that a thread which exits can give its block *back* by index. Phase 3c is what
+    /// made that necessary: until it, nothing ever detached, so the table could take the next
+    /// index from its own length. See [`ThreadTable::detach_current`].
+    pub index: usize,
 }
 
 /// Every guest thread this instance has seen, keyed by the **host** thread running it.
@@ -214,22 +220,69 @@ pub struct ThreadSlot {
 /// A `pthread_t` is 64 bits on LP64 and a Windows thread id is a 32-bit `DWORD`, so the host's
 /// id is never handed to the guest: the guest's identity is this table's own counter, which
 /// starts at one because [`GuestThreadId::NONE`] is reserved.
+///
+/// # Blocks are allocated from a free list, and that changed in phase 3c
+///
+/// The first version took the next block index from `slots.len()`, which is exact for a table
+/// nothing is ever removed from — and until thread lifecycle existed, nothing was. It becomes
+/// **wrong** the moment a thread can exit: remove the entry holding index 3 from a table of five
+/// and the length is 4, so the next thread is handed index 4, which is still live. Two guest
+/// threads would then share one `errno` cell and one `strerror` buffer, and the only symptom
+/// would be an occasional wrong error number in a thread that did nothing.
+///
+/// So the index is carried on the slot, a freed one goes on a list, and the list is preferred
+/// over the high-water mark. Row `threads-A2` injects the length-based version.
 #[derive(Debug, Default)]
 pub struct ThreadTable {
-    slots: Mutex<HashMap<std::thread::ThreadId, ThreadSlot>>,
+    inner: Mutex<TableInner>,
     next: AtomicU64,
+}
+
+/// The table's contents: who holds which block, and which blocks are free.
+#[derive(Debug, Default)]
+struct TableInner {
+    /// Host thread to slot, for the threads that are running.
+    slots: HashMap<std::thread::ThreadId, ThreadSlot>,
+    /// Blocks given back by [`ThreadTable::detach_current`] or [`ThreadTable::release`].
+    free: Vec<usize>,
+    /// The next block never yet handed out.
+    high_water: usize,
+}
+
+impl TableInner {
+    /// Take a block index, or `None` when the arena is full.
+    fn take_block(&mut self, capacity: usize) -> Option<usize> {
+        if let Some(index) = self.free.pop() {
+            return Some(index);
+        }
+        if self.high_water >= capacity {
+            return None;
+        }
+        let index = self.high_water;
+        self.high_water += 1;
+        Some(index)
+    }
 }
 
 impl ThreadTable {
     /// An empty table.
     #[must_use]
     pub fn new() -> Self {
-        Self { slots: Mutex::new(HashMap::new()), next: AtomicU64::new(1) }
+        Self { inner: Mutex::new(TableInner::default()), next: AtomicU64::new(1) }
+    }
+
+    /// A fresh `pthread_t`.
+    ///
+    /// `fetch_add` rather than an index: a thread that exits frees its *block* but must never
+    /// hand its **identity** to the next one, because guest code may still hold the old value and
+    /// `pthread_equal` would then say two different threads are the same.
+    fn next_id(&self) -> GuestThreadId {
+        GuestThreadId(self.next.fetch_add(1, Ordering::Relaxed))
     }
 
     /// The slot for the calling host thread, allocating one from `blocks` if it has none.
     ///
-    /// `blocks` is the arena's capacity in blocks; `block_at` turns an index into an address.
+    /// `capacity` is the arena's capacity in blocks; `block_at` turns an index into an address.
     /// Returns `None` when the arena is full, which is a refusal rather than a wrap onto
     /// another thread's errno.
     pub fn attach_current(
@@ -238,33 +291,84 @@ impl ThreadTable {
         block_at: impl Fn(usize) -> GuestAddr,
     ) -> Option<ThreadSlot> {
         let key = std::thread::current().id();
-        let mut slots = self.slots.lock();
-        if let Some(slot) = slots.get(&key) {
+        let mut inner = self.inner.lock();
+        if let Some(slot) = inner.slots.get(&key) {
             return Some(*slot);
         }
-        let index = slots.len();
-        if index >= capacity {
-            return None;
-        }
-        // `fetch_add` rather than `index + 1`: a thread that detaches frees its map entry but
-        // must not hand its `pthread_t` to the next one, because guest code may still be holding
-        // the old value and `pthread_equal` would then say two different threads are the same.
-        let id = GuestThreadId(self.next.fetch_add(1, Ordering::Relaxed));
-        let slot = ThreadSlot { id, block: block_at(index) };
-        slots.insert(key, slot);
+        let index = inner.take_block(capacity)?;
+        let slot = ThreadSlot { id: self.next_id(), block: block_at(index), index };
+        inner.slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Take a block and an identity for a thread that does not exist yet.
+    ///
+    /// **`pthread_create` has to know the `pthread_t` before the new thread runs**, because it
+    /// writes it into the guest's own `pthread_t *` and the guest may compare that value against
+    /// what the new thread's `pthread_self()` returns. Allocating it in the child would make the
+    /// two different until the child got there, which is a race guest code would lose rarely and
+    /// silently.
+    ///
+    /// The slot must then be either [`adopt`](ThreadTable::adopt)ed by the new host thread or
+    /// [`release`](ThreadTable::release)d if the spawn failed — otherwise the block is lost for
+    /// the life of the instance.
+    pub fn reserve(
+        &self,
+        capacity: usize,
+        block_at: impl Fn(usize) -> GuestAddr,
+    ) -> Option<ThreadSlot> {
+        let mut inner = self.inner.lock();
+        let index = inner.take_block(capacity)?;
+        Some(ThreadSlot { id: self.next_id(), block: block_at(index), index })
+    }
+
+    /// Bind a reserved slot to the calling host thread.
+    ///
+    /// Returns `false` if this host thread already holds a slot, which would be an adapter bug:
+    /// the runner calls this exactly once, on a thread that has just been created.
+    pub fn adopt(&self, slot: ThreadSlot) -> bool {
+        let key = std::thread::current().id();
+        let mut inner = self.inner.lock();
+        inner.slots.insert(key, slot).is_none()
+    }
+
+    /// Give a reserved slot back without ever having used it.
+    pub fn release(&self, slot: ThreadSlot) {
+        self.inner.lock().free.push(slot.index);
+    }
+
+    /// Give the calling host thread's block back, so another guest thread may have it.
+    ///
+    /// Returns the slot that was released, or `None` if this thread held none.
+    pub fn detach_current(&self) -> Option<ThreadSlot> {
+        let key = std::thread::current().id();
+        let mut inner = self.inner.lock();
+        let slot = inner.slots.remove(&key)?;
+        inner.free.push(slot.index);
         Some(slot)
     }
 
     /// How many host threads currently hold a slot.
     #[must_use]
     pub fn live(&self) -> usize {
-        self.slots.lock().len()
+        self.inner.lock().slots.len()
+    }
+
+    /// How many blocks are spoken for: held by a running thread, or reserved for one starting.
+    ///
+    /// Not the same as [`live`](ThreadTable::live), which counts only the threads that have
+    /// adopted their slot — a block reserved by `pthread_create` for a thread that has not
+    /// started yet is occupied and is not live.
+    #[must_use]
+    pub fn occupied(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.high_water - inner.free.len()
     }
 
     /// Whether the calling host thread holds a slot.
     #[must_use]
     pub fn is_attached(&self) -> bool {
-        self.slots.lock().contains_key(&std::thread::current().id())
+        self.inner.lock().slots.contains_key(&std::thread::current().id())
     }
 }
 
