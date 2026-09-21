@@ -71,7 +71,7 @@
 //! first paragraph of this file says the module exists to prevent.
 //!
 //! So the destination size goes *in*: [`format::render_bounded`](super::format::render_bounded)
-//! is given [`MAX_MESSAGE_BYTES`] and keeps the prefix that fits, and the count of what it could
+//! is given [`FORMAT_BUDGET`] and keeps the prefix that fits, and the count of what it could
 //! not keep comes back beside it so that `capped_record_of` can report a cut the length
 //! comparison in [`capped_record`] can no longer see.
 //!
@@ -109,6 +109,20 @@ use super::{active, enter, format, LOG_CAPTURE_MAX};
 
 /// `LOG_PRIMASK` from `<syslog.h>`: the low three bits of a `syslog` priority are the severity.
 const SYSLOG_SEVERITY_MASK: i32 = 0x07;
+
+/// The destination size the formatter is given for a log line: **1,023**.
+///
+/// **Not a policy number of this layer's own.** `liblog`'s `__android_log_print` formats with
+/// `vsnprintf(buf, LOG_BUF_SIZE, fmt, ap)` into `char buf[LOG_BUF_SIZE]`, so the formatter's
+/// destination is `LOG_BUF_SIZE` less the NUL — which is what [`MAX_MESSAGE_BYTES`] is, beside
+/// the AOSP file it was read out of. Written as a name rather than passed as a literal at the two
+/// call sites so that `the_format_budget_is_liblogs_own_buffer` can assert the relation, which is
+/// the only kind of test a constant has (`VERIFICATION.md` entry 12).
+///
+/// Giving the formatter a *larger* budget would not be wrong so much as pointless — the payload
+/// cap would cut the excess a moment later — but it would make the two cuts report different
+/// numbers for the same loss. A smaller one would shorten lines a device carries whole.
+const FORMAT_BUDGET: usize = MAX_MESSAGE_BYTES;
 
 /// One line the guest logged, as the instance's ring keeps it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,7 +518,7 @@ pub(super) fn android_log_print(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         // with `vsnprintf(buf, LOG_BUF_SIZE, fmt, ap)`: the same destination size, so the same
         // bytes. Not a policy number of this layer's own -- `omni_platform::log` names the AOSP
         // file it was read out of.
-        let rendered = format::render_bounded(&view, fmt, 2, &mut source, MAX_MESSAGE_BYTES)?;
+        let rendered = format::render_bounded(&view, fmt, 2, &mut source, FORMAT_BUDGET)?;
         let message = message_bytes(&view, &rendered.text)?;
         let (record, kept) = capped_record_of(priority, &tag, &message, rendered.full);
         state.bionic.log(record);
@@ -564,7 +578,7 @@ pub(super) fn syslog(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         // bionic's `vsyslog` calls `__android_log_vprint`, whose body is `__android_log_print`'s
         // -- the same `char buf[LOG_BUF_SIZE]` -- so the budget is the same one, and a `syslog`
         // budgeted differently here would be a divergence invented by this layer.
-        let rendered = format::render_bounded(&view, fmt, 1, &mut source, MAX_MESSAGE_BYTES)?;
+        let rendered = format::render_bounded(&view, fmt, 1, &mut source, FORMAT_BUDGET)?;
         let message = message_bytes(&view, &rendered.text)?;
         let (record, _) = capped_record_of(mapped, tag.as_bytes(), &message, rendered.full);
         state.bionic.log(record);
@@ -868,6 +882,27 @@ mod tests {
         // 1,023 guest bytes: 511 whole 'é' plus one half, and the half becomes U+FFFD.
         assert!(record.message.ends_with('\u{FFFD}'), "{:?}", record.message);
         assert_eq!(record.message.chars().count(), 512);
+    }
+
+    /// **The budget handed to the formatter is `liblog`'s own buffer, asserted as a relation.**
+    ///
+    /// A constant has no behaviour to test, so what is testable is the relation it stands in
+    /// (`VERIFICATION.md` entry 12, and the same shape as `the_two_ring_bounds_are_both_live`).
+    /// Both directions matter and for different reasons: a *smaller* budget shortens lines a
+    /// device carries whole, and a *larger* one leaves the payload cap to make a second cut that
+    /// reports a different number for the same loss.
+    #[test]
+    fn the_format_budget_is_liblogs_own_buffer() {
+        assert_eq!(FORMAT_BUDGET, MAX_MESSAGE_BYTES, "the formatter's destination is the buffer");
+        assert_eq!(
+            FORMAT_BUDGET,
+            omni_platform::log::LOG_BUF_SIZE - 1,
+            "`vsnprintf(buf, LOG_BUF_SIZE, ...)` writes LOG_BUF_SIZE - 1 characters and a NUL"
+        );
+        assert_eq!(FORMAT_BUDGET, 1023);
+        // And the budget alone is never what cuts the *tag*: the payload cap does that, and the
+        // two are independent numbers.
+        assert!(FORMAT_BUDGET < MAX_TAG_AND_MESSAGE_BYTES);
     }
 
     /// **A message the *formatter* cut is still reported as truncated, on all three channels.**
