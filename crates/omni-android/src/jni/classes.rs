@@ -178,6 +178,11 @@ pub struct Class {
     pub methods: Vec<Member>,
     /// Its fields, in declaration order.
     pub fields: Vec<Member>,
+    /// Its nearest **declared** ancestor, if [`EXTENDS`] names one.
+    ///
+    /// Filled after every class is declared, because an edge may name a class that is declared
+    /// later in [`DECLARED`] or only by the generated surface.
+    pub superclass: Option<ClassId>,
 }
 
 /// A lookup the registry could not answer.
@@ -223,7 +228,44 @@ impl Registry {
         for spec in super::surface::DEX_SURFACE {
             registry.extend_with(spec);
         }
+        // **Last**, because an edge may name a class the generated surface is what declares.
+        registry.link_superclasses();
         registry
+    }
+
+    /// Resolve [`EXTENDS`] into [`Class::superclass`].
+    ///
+    /// An edge whose either end is not declared is **dropped silently and deliberately**: the
+    /// table is a fact about the APK, not a requirement on this registry, and a host that
+    /// declared a narrower surface should not be refused for it. Nothing can be resolved *by* a
+    /// dropped edge, so a mistake here surfaces as the miss it already was.
+    fn link_superclasses(&mut self) {
+        for (subclass, superclass) in EXTENDS {
+            let (Some(sub), Some(sup)) = (self.find(subclass), self.find(superclass)) else {
+                continue;
+            };
+            if sub == sup {
+                continue;
+            }
+            self.classes[usize::from(sub.0)].superclass = Some(sup);
+        }
+    }
+
+    /// `class` and every declared ancestor of it, nearest first.
+    ///
+    /// **Bounded by the number of classes**, so a cycle in [`EXTENDS`] ends the walk instead of
+    /// hanging a guest thread inside a `GetMethodID`. `the_superclass_chain_is_acyclic` asserts
+    /// there is no cycle; this bound is what makes that assertion a statement about the data
+    /// rather than the only thing standing between a typo and a hang.
+    fn ancestry(&self, class: ClassId) -> impl Iterator<Item = ClassId> + '_ {
+        let mut next = Some(class);
+        let mut budget = self.classes.len() + 1;
+        std::iter::from_fn(move || {
+            let current = next?;
+            budget = budget.checked_sub(1)?;
+            next = self.class(current).and_then(|declared| declared.superclass);
+            Some(current)
+        })
     }
 
     /// Declare `spec`, or add to an existing class only the members it does not already have.
@@ -245,7 +287,7 @@ impl Registry {
         };
         let mut added = 0;
         for member in spec.methods {
-            if self.method(id, member.name, member.descriptor, member.is_static).is_none() {
+            if self.declared_method(id, member.name, member.descriptor, member.is_static).is_none() {
                 let class = &mut self.classes[usize::from(id.0)];
                 if class.methods.len() < usize::from(u16::MAX) {
                     class.methods.push(Member {
@@ -260,7 +302,7 @@ impl Registry {
             }
         }
         for member in spec.fields {
-            if self.field(id, member.name, member.descriptor, member.is_static).is_none() {
+            if self.declared_field(id, member.name, member.descriptor, member.is_static).is_none() {
                 let class = &mut self.classes[usize::from(id.0)];
                 if class.fields.len() < usize::from(u16::MAX) {
                     class.fields.push(Member {
@@ -316,6 +358,7 @@ impl Registry {
             tier: spec.tier,
             methods,
             fields,
+            superclass: None,
         });
         self.by_name.insert(spec.name.to_string(), id);
         Ok(id)
@@ -363,9 +406,26 @@ impl Registry {
         self.class(id).map_or("<unknown class>", |c| c.name.as_str())
     }
 
-    /// Resolve a method by name and descriptor.
+    /// Resolve a method by name and descriptor, **walking the superclass chain**.
+    ///
+    /// JNI's `GetMethodID` and `GetStaticMethodID` both search the superclasses, and the engine
+    /// depends on it: §8 row 23's helpers do `GetObjectClass(activity->javaGameActivity)` once
+    /// and then ask that one `jclass` for members declared at three different levels. See
+    /// [`EXTENDS`]. The returned [`MethodId`] names the class that **declares** the member, which
+    /// is what decides the [`Answer`].
     #[must_use]
     pub fn method(&self, class: ClassId, name: &str, descriptor: &str, is_static: bool) -> Option<MethodId> {
+        self.ancestry(class).find_map(|at| self.declared_method(at, name, descriptor, is_static))
+    }
+
+    /// Resolve a method **without** walking the superclass chain.
+    ///
+    /// `RegisterNatives` and [`extend_with`](Registry::extend_with) use this rather than
+    /// [`method`](Registry::method): JNI requires `RegisterNatives` to name a method of the class
+    /// it is given, and a merge that saw an inherited member as "already present" would refuse to
+    /// add the subclass's own declaration of it.
+    #[must_use]
+    pub fn declared_method(&self, class: ClassId, name: &str, descriptor: &str, is_static: bool) -> Option<MethodId> {
         let declared = self.class(class)?;
         declared
             .methods
@@ -374,9 +434,17 @@ impl Registry {
             .map(|member| MethodId { class, member: member as u16 })
     }
 
-    /// Resolve a field by name and descriptor.
+    /// Resolve a field by name and descriptor, walking the superclass chain. As
+    /// [`method`](Registry::method).
     #[must_use]
     pub fn field(&self, class: ClassId, name: &str, descriptor: &str, is_static: bool) -> Option<FieldId> {
+        self.ancestry(class).find_map(|at| self.declared_field(at, name, descriptor, is_static))
+    }
+
+    /// Resolve a field without walking the chain. As
+    /// [`declared_method`](Registry::declared_method).
+    #[must_use]
+    pub fn declared_field(&self, class: ClassId, name: &str, descriptor: &str, is_static: bool) -> Option<FieldId> {
         let declared = self.class(class)?;
         declared
             .fields
@@ -486,6 +554,53 @@ pub struct ClassSpec {
     pub fields: &'static [MemberSpec],
 }
 
+/// The superclass edges this layer models: `(subclass, its nearest declared ancestor)`.
+///
+/// # Why a registry that is "a flat `(class, name, descriptor)` registry" needs a chain at all
+///
+/// §6's recommended architecture is a flat registry, and it was flat until M5's gate reached
+/// `NativeEngine::initializing`. **MEASURED there, n = 1 run:** §8 row 23's helpers take the
+/// `jobject` at `NativeCode + 0x18` — §5.2 step 8's `activity->javaGameActivity` — do
+/// `GetObjectClass` on it **once**, and then ask that single `jclass` for members declared at
+/// three different levels of the Java hierarchy:
+///
+/// | guest pc | `GetMethodID` asks for | declared by |
+/// |---|---|---|
+/// | `0x02bdad0c` | `getResources` `()Landroid/content/res/Resources;` | `android/content/Context` |
+/// | `0x02bd8b80` | `getNativeHelper` `()Lcom/roblox/client/startup/NativeHelper;` | `com/roblox/client/startup/MainGameActivity` |
+///
+/// Neither is a member of `com/google/androidgamesdk/GameActivity`, and the lists file agrees —
+/// it attributes them to `android/content/Context` and `com/roblox/client/startup/MainGameActivity`
+/// respectively, and gives `GameActivity` exactly five members. **No flat class can answer both**,
+/// so a flat registry could only be made to pass by declaring members on a class that does not
+/// have them, which is the plausible-stub shape Global Constraint 1 forbids one level up.
+///
+/// Each of these is a `GetObjectClass` → `GetMethodID` → `CallObjectMethod` with **no `cbz` in
+/// between** — the ids are never tested, which is `jni-surface.md` §8.1's third failure mode, and
+/// it surfaces as `CallObjectMethodV` being handed `0x0`.
+///
+/// # The two edges, and the evidence for each
+///
+/// * **`MainGameActivity extends GameActivity`** — VERIFIED, `apk-analysis.md`'s activity table
+///   and §5.3: "`MainGameActivity extends com.google.androidgamesdk.GameActivity`". It is also
+///   why `"com/roblox/client/startup/MainGameActivity"` appears in **zero** `.rodata` string
+///   literals of `libroblox.so` (Section B lists all 128 class-name literals and it is not among
+///   them) while five of its members are looked up: the engine never `FindClass`es it, it only
+///   ever reaches it through `GetObjectClass` of the activity it was handed.
+/// * **`GameActivity extends android/content/Context`** — the *nearest declared* ancestor, not
+///   the immediate one. §5.3 measured the real chain as `GameActivity` → `Lj/b;`
+///   (AppCompatActivity) → `Activity` → `ContextThemeWrapper` → `ContextWrapper` → `Context`.
+///   None of those four intermediates is on the measured surface — no string literal, no member
+///   looked up — so declaring them would be four claims about a surface nobody measured. The edge
+///   records the relation that is load-bearing and the doc records the elision.
+///
+/// An edge whose either end is undeclared is dropped by
+/// [`link_superclasses`](Registry::link_superclasses).
+pub static EXTENDS: &[(&str, &str)] = &[
+    ("com/roblox/client/startup/MainGameActivity", "com/google/androidgamesdk/GameActivity"),
+    ("com/google/androidgamesdk/GameActivity", "android/content/Context"),
+];
+
 /// An instance method.
 const fn m(name: &'static str, descriptor: &'static str, answer: Answer) -> MemberSpec {
     MemberSpec { name, descriptor, is_static: false, answer }
@@ -506,6 +621,9 @@ const NONE: &[MemberSpec] = &[];
 // ------------------------------------------------------------------- Tier 0, §3.1
 
 /// `com/google/androidgamesdk/GameActivity` — five `CHECK_NOT_NULL` members.
+///
+/// It has no `getResources`, and that is correct: see [`EXTENDS`], which is where the engine's
+/// `activity.getResources()` is answered from.
 static GAME_ACTIVITY: &[MemberSpec] = &[
     m("finish", "()V", Answer::Sink),
     m("setWindowFlags", "(II)V", Answer::Sink),
@@ -1417,6 +1535,58 @@ mod tests {
         // The 18 Configuration fields, counted as well as named, because §3.1 states the number.
         let id = registry.find("android/content/res/Configuration").expect("declared");
         assert_eq!(registry.class(id).expect("declared").fields.len(), 18);
+    }
+
+    /// Every [`EXTENDS`] edge resolves, and the chain has no cycle.
+    ///
+    /// An edge naming a class nobody declares is dropped silently, which is right for a host that
+    /// narrowed the surface and wrong for a typo in **this** table — so the table's own ends are
+    /// checked here rather than at run time. The acyclicity assertion is what makes
+    /// `Registry::ancestry`'s budget a belt rather than the only brace.
+    #[test]
+    fn every_superclass_edge_resolves_and_the_chain_is_acyclic() {
+        let registry = Registry::with_declared();
+        for (subclass, superclass) in EXTENDS {
+            let sub = registry.find(subclass).unwrap_or_else(|| panic!("{subclass} is not declared"));
+            let sup =
+                registry.find(superclass).unwrap_or_else(|| panic!("{superclass} is not declared"));
+            assert_ne!(sub, sup, "{subclass} cannot extend itself");
+            assert_eq!(
+                registry.class(sub).expect("declared").superclass,
+                Some(sup),
+                "{subclass} did not get linked to {superclass}"
+            );
+        }
+        for id in 0..registry.class_count() {
+            let start = ClassId(u16::try_from(id).expect("the id encoding holds it"));
+            let mut seen = BTreeSet::new();
+            for at in registry.ancestry(start) {
+                assert!(seen.insert(at), "`{}` is on a cycle", registry.class_name(at));
+            }
+        }
+    }
+
+    /// `method` walks the chain and `declared_method` does not, which is the distinction
+    /// `RegisterNatives` and the generated-surface merge both rest on.
+    ///
+    /// Without it, a `RegisterNatives` naming an inherited member would bind a guest function
+    /// pointer onto the **superclass's** member, where every other subclass would then call it.
+    #[test]
+    fn only_the_walking_lookup_crosses_a_superclass_edge() {
+        let registry = Registry::with_declared();
+        let activity = registry.find("com/roblox/client/startup/MainGameActivity").expect("declared");
+        let descriptor = "()Landroid/content/res/Resources;";
+        assert!(
+            registry.method(activity, "getResources", descriptor, false).is_some(),
+            "`method` must walk to `android/content/Context`"
+        );
+        assert!(
+            registry.declared_method(activity, "getResources", descriptor, false).is_none(),
+            "`declared_method` must not walk"
+        );
+        // And the class that really declares it answers both ways.
+        let context = registry.find("android/content/Context").expect("declared");
+        assert!(registry.declared_method(context, "getResources", descriptor, false).is_some());
     }
 
     /// The nine inset-type masks must be distinct bits, or the mask the engine builds out of them

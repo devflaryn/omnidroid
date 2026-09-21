@@ -820,7 +820,16 @@ fn call_method(
     // would deadlock the moment the guest called another JNI function.
     let (member, class, arguments, receiver_id) = {
         let state = jni.state();
-        let id = state.handles.decode_method(name, address, method)?;
+        // **The receiver is named in the failure, and that is the whole diagnosis.** A null
+        // `jmethodID` arrives with no name of its own — `decode_method` says so in those words —
+        // but the `jobject` beside it does have one, and it is what identifies the lookup that
+        // was never checked. Without it the refusal says only "some method of some class".
+        let id = state
+            .handles
+            .decode_method(name, address, method)
+            .map_err(|error| {
+                name_the_receiver(&state.handles, &state.registry, error, receiver)
+            })?;
         let member = state
             .registry
             .member(id)
@@ -928,8 +937,11 @@ fn register_natives(
         let descriptor =
             read_cstr(mem, mem.read_u64(entry + 8, blame(2))? as GuestAddr, blame(2))?;
         let function = mem.read_u64(entry + 16, blame(2))? as GuestAddr;
-        match state.registry.method(class, &member, &descriptor, true).or_else(|| {
-            state.registry.method(class, &member, &descriptor, false)
+        // `declared_method`, not `method`: JNI requires a `RegisterNatives` entry to name a
+        // method **of the class it was given**, and binding a superclass's member to a subclass's
+        // function pointer would silently rewrite what every other receiver of that class calls.
+        match state.registry.declared_method(class, &member, &descriptor, true).or_else(|| {
+            state.registry.declared_method(class, &member, &descriptor, false)
         }) {
             Some(id) => {
                 if let Some(target) = state.registry.member_mut(id) {
@@ -971,6 +983,44 @@ pub const NATIVE_METHOD_BYTES: usize = 24;
 fn read_cstr(mem: &GuestMem, at: GuestAddr, blame: Blame<'_>) -> AbiResult<String> {
     let bytes = mem.cstr(at, blame)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Add the receiver's class to a `Call…Method…` handle failure.
+///
+/// The receiver is the one thing still nameable when the `jmethodID` is not: for an instance call
+/// it is the object whose class declares the method that was looked up, and for a static call it
+/// is that class itself. `jni-surface.md` §8.1's third failure mode is a lookup that returned
+/// null and was not checked, and which class it was asked of is what says *where*.
+fn name_the_receiver(
+    handles: &Handles,
+    registry: &Registry,
+    error: AbiError,
+    receiver: u64,
+) -> AbiError {
+    let AbiError::JniBadHandle { function, address, kind, handle, why } = error else {
+        return error;
+    };
+    let named = if receiver == 0 {
+        "the receiver is null too".to_string()
+    } else {
+        match handles.resolve_nullable("Call…Method…", address, receiver) {
+            // A static call's receiver **is** the class, so it is named as itself rather than
+            // through `class_of`, which would answer `java/lang/Class` and hide it.
+            Ok(Some(id)) => match handles.object_of(id) {
+                Some(Object::Class(class)) => {
+                    format!("the receiver is the class `{}`", registry.class_name(*class))
+                }
+                _ => match class_of(handles, registry, id) {
+                    Some(class) => format!("the receiver is a `{}`", registry.class_name(class)),
+                    None => "the receiver is an array or a direct buffer".to_string(),
+                },
+            },
+            Ok(None) | Err(_) => {
+                format!("the receiver {receiver:#x} does not decode either")
+            }
+        }
+    };
+    AbiError::JniBadHandle { function, address, kind, handle, why: format!("{why} -- {named}") }
 }
 
 /// The class **of** an object, which is what `GetObjectClass` answers.
@@ -1632,6 +1682,68 @@ mod tests {
         "GetJavaVM",
         "NewDirectByteBuffer",
     ];
+
+    /// A null `jmethodID` is reported **with the class of the object it was going to be called
+    /// on**, which is the only name such a failure has.
+    ///
+    /// `decode_method` can say nothing but "it is null": the id carries no class and no member.
+    /// The `jobject` beside it does, and naming it is what turned M5's
+    /// `CallObjectMethodV ... was given 0x0` into a diagnosis — it said
+    /// `com/google/androidgamesdk/GameActivity`, which is how the missing lookup was found.
+    ///
+    /// The three shapes are asserted separately because each answers a different question: an
+    /// instance names its class, a `jclass` names **itself** rather than `java/lang/Class` (a
+    /// static call's receiver *is* the class, and `class_of` would hide it), and a null receiver
+    /// says so rather than being reported as a second bad handle.
+    #[test]
+    fn a_null_method_id_is_reported_with_the_class_of_its_receiver() {
+        let registry = Registry::with_declared();
+        let mut handles = Handles::new(0x1234);
+        let bad = || AbiError::JniBadHandle {
+            function: "CallObjectMethodV".to_string(),
+            address: 0,
+            kind: "jmethodID",
+            handle: 0,
+            why: "it is null".to_string(),
+        };
+        let activity = registry.find("com/roblox/client/startup/MainGameActivity").expect("declared");
+
+        let instance = handles
+            .new_local(
+                "NewObjectV",
+                0,
+                Object::Instance { class: activity, fields: std::collections::BTreeMap::new() },
+            )
+            .expect("a reference");
+        let said = name_the_receiver(&handles, &registry, bad(), instance).to_string();
+        assert!(
+            said.contains("the receiver is a `com/roblox/client/startup/MainGameActivity`"),
+            "{said}"
+        );
+
+        let class = handles.new_local("FindClass", 0, Object::Class(activity)).expect("a reference");
+        let said = name_the_receiver(&handles, &registry, bad(), class).to_string();
+        assert!(
+            said.contains("the receiver is the class `com/roblox/client/startup/MainGameActivity`"),
+            "a static call's receiver is the class itself, not java/lang/Class: {said}"
+        );
+
+        let said = name_the_receiver(&handles, &registry, bad(), 0).to_string();
+        assert!(said.contains("the receiver is null too"), "{said}");
+
+        // A handle this instance never issued is reported as that, not silently dropped.
+        let said = name_the_receiver(&handles, &registry, bad(), 0xdead_beef).to_string();
+        assert!(said.contains("does not decode either"), "{said}");
+
+        // And an error that is not a bad handle passes through untouched.
+        let other = AbiError::JniRefused {
+            function: "CallObjectMethodV".to_string(),
+            address: 0,
+            detail: "something else".to_string(),
+        };
+        let said = name_the_receiver(&handles, &registry, other, instance).to_string();
+        assert!(said.contains("something else") && !said.contains("the receiver"), "{said}");
+    }
 
     /// **`GetObjectClass(jclass)` answers `java.lang.Class`, not the class itself.**
     ///
