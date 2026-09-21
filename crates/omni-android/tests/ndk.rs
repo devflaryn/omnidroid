@@ -27,9 +27,10 @@ use omni_android::jni::Jni;
 use omni_android::ndk::assets::{AssetTable, ASSET_MANAGER_CLASS};
 use omni_android::ndk::config::{ACONFIGURATION_SCREENSIZE_LARGE, ACONFIGURATION_SCREENSIZE_NORMAL};
 use omni_android::ndk::{
-    DeviceConfiguration, Ndk, ScreenSize, ACONFIGURATION_NAVHIDDEN_NO, ALOOPER_EVENT_HANGUP,
-    ALOOPER_EVENT_INPUT, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK, ALOOPER_POLL_ERROR,
-    ALOOPER_POLL_TIMEOUT, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS, MAX_LOOPERS, MAX_OPEN_ASSETS,
+    DeviceConfiguration, Ndk, ScreenSize, WindowGeometry, ACONFIGURATION_NAVHIDDEN_NO,
+    ALOOPER_EVENT_HANGUP, ALOOPER_EVENT_INPUT, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK,
+    ALOOPER_POLL_ERROR, ALOOPER_POLL_TIMEOUT, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS, MAX_LOOPERS,
+    MAX_NATIVE_WINDOWS, MAX_OPEN_ASSETS, SURFACE_CLASS,
 };
 use omni_android::{AbiError, Boundary};
 use omni_cpu::ExitReason;
@@ -1234,4 +1235,355 @@ fn a_handle_of_one_kind_is_refused_where_another_belongs() {
         asm.mov(0, manager);
     });
     assert!(error.to_string().contains("did not hand that out"), "{error}");
+}
+
+// =================================================================== ANativeWindow
+
+/// A geometry the tests use, and a second one for the resize.
+///
+/// **1440x3120 rather than 1920x1080.** Not because the numbers matter — nothing here reads them
+/// but the assertions — but because 1920x1080 is the exact value `ndk::window` names as the
+/// believable wrong answer, and a test whose expected value is the invented default cannot tell
+/// the refusal from the invention.
+fn a_geometry() -> WindowGeometry {
+    WindowGeometry::new(1440, 3120).expect("a positive geometry")
+}
+
+/// A fixture with a decided window geometry and a Java `Surface` to make a window from.
+fn with_surface(tag: &str) -> (Fixture, u64) {
+    let f = fixture(tag);
+    f.ndk.set_window_geometry(a_geometry());
+    let surface = f.jni.new_object(SURFACE_CLASS).expect("a Java Surface");
+    (f, surface)
+}
+
+/// `ANativeWindow_fromSurface(NULL, surface)` through the guest.
+fn from_surface(f: &Fixture, surface: u64) -> u64 {
+    f.value_of("ANativeWindow_fromSurface", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, surface);
+    })
+}
+
+/// Call a one-argument `void` NDK function through the guest and require it to complete.
+fn call_with(f: &Fixture, symbol: &str, argument: u64) {
+    let entry = f.program_calling(symbol, |asm| {
+        asm.mov(0, argument);
+    });
+    assert!(matches!(f.run(entry).expect("completes"), ExitReason::Returned { .. }));
+}
+
+/// **`ANativeWindow_fromSurface` checks the `jobject` is really a `Surface`.**
+///
+/// The same check `AAssetManager_fromJava` makes and for the same reason: accepting any non-null
+/// value turns a wrong argument into a window that answers nonsense thousands of instructions
+/// later. §8 row 17 hands this the `Surface` the Java side passed `onSurfaceCreatedNative`, so a
+/// value of another class is a host that built the wrong object.
+///
+/// Asked twice with the same `Surface` it returns the **same** window and takes a second
+/// reference, which is what a device does — the `ANativeWindow` is the `Surface`'s native peer.
+#[test]
+fn from_surface_checks_the_class_and_the_same_surface_is_the_same_window() {
+    let _guard = serialized();
+    let (f, surface) = with_surface("from-surface");
+
+    let window = from_surface(&f, surface);
+    assert_ne!(window, 0, "a real ANativeWindow");
+    assert_eq!(f.ndk.live_windows(), 1);
+    assert_eq!(
+        f.ndk.window_references(window as omni_cpu::GuestAddr),
+        Some(1),
+        "fromSurface acquires one reference for the caller, which is what the NDK documents"
+    );
+
+    let again = from_surface(&f, surface);
+    assert_eq!(again, window, "the same Surface gets the same window");
+    assert_eq!(f.ndk.live_windows(), 1, "and no second one is made");
+    assert_eq!(
+        f.ndk.window_references(window as omni_cpu::GuestAddr),
+        Some(2),
+        "a second fromSurface is a second reference, not a second window: row 17 releases the old \
+         window, and a second object here would destroy one the other holder still has"
+    );
+
+    // A different Surface is a different window.
+    let other_surface = f.jni.new_object(SURFACE_CLASS).expect("a second Java Surface");
+    let other = from_surface(&f, other_surface);
+    assert_ne!(other, window, "a different Surface is a different window");
+    assert_eq!(f.ndk.live_windows(), 2);
+
+    // A `jobject` of another class.
+    let wrong = f.jni.new_object(ASSET_MANAGER_CLASS).expect("a Java AssetManager");
+    let error = f.refusal_of("ANativeWindow_fromSurface", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, wrong);
+    });
+    assert_eq!(error.symbol(), Some("ANativeWindow_fromSurface"));
+    assert!(error.to_string().contains("AssetManager"), "the refusal names the class: {error}");
+
+    // A handle nobody issued, and a null.
+    let error = f.refusal_of("ANativeWindow_fromSurface", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0xdead_beef);
+    });
+    assert!(error.to_string().contains("live jobject"), "{error}");
+    let error = f.refusal_of("ANativeWindow_fromSurface", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+    });
+    assert!(error.to_string().contains("null"), "{error}");
+}
+
+/// **The reference count is a count**, and the last release destroys the window.
+///
+/// `live_windows()` alone cannot tell a window held twice from one held once — that is
+/// `VERIFICATION.md` entry 1's substitution, so the count itself is asserted at every step.
+/// Clamping at zero is the believable wrong answer: it keeps a window alive that guest code
+/// believes it has destroyed, and §8 row 17 — which releases the old window before asking for a
+/// new one — would then hold a handle to a surface nobody owns.
+#[test]
+fn window_acquire_and_release_count_and_the_last_release_destroys_it() {
+    let _guard = serialized();
+    let (f, surface) = with_surface("window-refcount");
+    let window = from_surface(&f, surface);
+    let at = window as omni_cpu::GuestAddr;
+    assert_eq!(f.ndk.window_references(at), Some(1));
+
+    // fromSurface made one; the guest takes two more.
+    for expected in [2i64, 3] {
+        call_with(&f, "ANativeWindow_acquire", window);
+        assert_eq!(f.ndk.window_references(at), Some(expected));
+    }
+    assert_eq!(f.ndk.live_windows(), 1);
+
+    // Three releases take it to zero, and the third destroys it.
+    for (expected_live, expected_references) in [(1usize, Some(2i64)), (1, Some(1)), (0, None)] {
+        call_with(&f, "ANativeWindow_release", window);
+        assert_eq!(f.ndk.live_windows(), expected_live);
+        assert_eq!(f.ndk.window_references(at), expected_references);
+    }
+
+    // A fourth release names a window that is no longer live. The refusal comes from the identity
+    // check, not from a negative count -- a `references < 0` guard would be unreachable here for
+    // `ALooper_release`'s reason (VERIFICATION.md entry 12), and there is none.
+    let error = f.refusal_of("ANativeWindow_release", |asm| {
+        asm.mov(0, window);
+    });
+    assert_eq!(error.symbol(), Some("ANativeWindow_release"));
+    assert!(error.to_string().contains("not live"), "{error}");
+
+    // And the same Surface now makes a fresh window, because the old one is gone.
+    let fresh = from_surface(&f, surface);
+    assert_eq!(f.ndk.live_windows(), 1);
+    assert_eq!(f.ndk.window_references(fresh as omni_cpu::GuestAddr), Some(1));
+}
+
+/// **A window identity is an arena address in its own range, and a forged one is refused.**
+///
+/// The point of the per-kind range: a handle of one kind passed where another belongs is a
+/// refusal rather than a lookup that happens to succeed.
+#[test]
+fn a_window_is_an_arena_address_and_a_forged_one_is_refused() {
+    let _guard = serialized();
+    let (f, surface) = with_surface("window-identity");
+    let window = from_surface(&f, surface);
+    let arena = f.ndk.arena() as u64;
+    assert!(
+        window >= arena && window < arena + f.ndk.arena_bytes() as u64,
+        "{window:#x} is not in the arena at {arena:#x}"
+    );
+
+    // Inside the arena but off a slot boundary.
+    let error = f.refusal_of("ANativeWindow_acquire", |asm| {
+        asm.mov(0, window + 4);
+    });
+    assert_eq!(error.symbol(), Some("ANativeWindow_acquire"));
+    assert!(error.to_string().contains("ANativeWindow"), "{error}");
+
+    // A pointer nowhere near it, named in the refusal.
+    let error = f.refusal_of("ANativeWindow_getWidth", |asm| {
+        asm.mov(0, 0xdead_beef);
+    });
+    assert!(error.to_string().contains("dead"), "the refusal must name the pointer: {error}");
+
+    // A looper where a window belongs, and a window where a looper belongs. Both directions,
+    // because a one-directional check passes against a layer that shares one table.
+    let looper = f.prepare();
+    assert_ne!(looper, window);
+    let error = f.refusal_of("ANativeWindow_getHeight", |asm| {
+        asm.mov(0, looper);
+    });
+    assert!(error.to_string().contains("ANativeWindow"), "{error}");
+    let error = f.refusal_of("ALooper_acquire", |asm| {
+        asm.mov(0, window);
+    });
+    assert!(error.to_string().contains("ALooper"), "{error}");
+}
+
+/// **An instance whose window geometry nobody decided refuses by name and says which call
+/// decides.**
+///
+/// This is the decision `ndk::window` documents at length: there is no real surface yet, so the
+/// dimensions are the embedding's. Returning `android/native_window.h`'s documented
+/// negative-on-error would report a device failure that did not happen; returning 1920x1080 would
+/// be a device profile nobody chose, indistinguishable in every log from one the host meant.
+///
+/// The window itself is made **without** a geometry, deliberately: nothing on §8 row 17's path
+/// (`fromSurface` -> `callbacks[7] onNativeWindowCreated` -> `APP_CMD_INIT_WINDOW`) asks for a
+/// dimension, so refusing there would refuse a call that needs nothing this layer lacks.
+#[test]
+fn an_undecided_window_geometry_refuses_and_names_the_setter() {
+    let _guard = serialized();
+    let f = fixture("undecided-window");
+    assert_eq!(f.ndk.window_geometry(), None);
+    let surface = f.jni.new_object(SURFACE_CLASS).expect("a Java Surface");
+
+    // The window is made, acquired and released without a geometry: those calls need none.
+    let window = from_surface(&f, surface);
+    assert_ne!(window, 0, "fromSurface does not need the geometry");
+    call_with(&f, "ANativeWindow_acquire", window);
+    call_with(&f, "ANativeWindow_release", window);
+    assert_eq!(f.ndk.live_windows(), 1);
+
+    for symbol in ["ANativeWindow_getWidth", "ANativeWindow_getHeight"] {
+        let error = f.refusal_of(symbol, |asm| {
+            asm.mov(0, window);
+        });
+        assert_eq!(error.symbol(), Some(symbol));
+        let text = error.to_string();
+        assert!(text.contains("Ndk::set_window_geometry"), "{error}");
+        assert!(text.contains("1920x1080"), "the refusal names the wrong answer it refused: {error}");
+    }
+
+    // And once the host decides, the same window answers -- through the same handle, with no new
+    // call to fromSurface, which is the point of reading the geometry at call time.
+    f.ndk.set_window_geometry(a_geometry());
+    assert_eq!(
+        f.value_of("ANativeWindow_getWidth", |asm| {
+            asm.mov(0, window);
+        }) as i64,
+        1440
+    );
+    assert_eq!(
+        f.value_of("ANativeWindow_getHeight", |asm| {
+            asm.mov(0, window);
+        }) as i64,
+        3120
+    );
+}
+
+/// **A resize reaches a window the guest already holds**, which is where this deliberately
+/// differs from `AConfiguration`.
+///
+/// `AConfiguration_fromAssetManager` snapshots, because a configuration the guest holds does not
+/// change under it on a device -- that is why `onConfigurationChanged` exists.
+/// `ANativeWindow_getWidth` is the opposite: it queries the live surface, and §8 row 18's
+/// `onSurfaceChangedNative` may call `callbacks[8] onNativeWindowResized` without the window
+/// handle changing. A snapshot here would keep answering the old size, which shows up only as a
+/// viewport stale by one event.
+///
+/// The two dimensions are asserted **separately and with different values**, because a handler
+/// that returned the width for both would pass a test that used a square.
+#[test]
+fn a_resize_reaches_a_window_the_guest_already_holds() {
+    let _guard = serialized();
+    let (f, surface) = with_surface("window-resize");
+    let window = from_surface(&f, surface);
+    assert_eq!(
+        f.value_of("ANativeWindow_getWidth", |asm| {
+            asm.mov(0, window);
+        }) as i64,
+        1440
+    );
+    assert_eq!(
+        f.value_of("ANativeWindow_getHeight", |asm| {
+            asm.mov(0, window);
+        }) as i64,
+        3120,
+        "the height is not the width"
+    );
+
+    // The host rotates the device. The same handle, no new fromSurface.
+    f.ndk.set_window_geometry(WindowGeometry::new(3120, 1440).expect("the rotated geometry"));
+    assert_eq!(
+        f.value_of("ANativeWindow_getWidth", |asm| {
+            asm.mov(0, window);
+        }) as i64,
+        3120,
+        "getWidth queries the live surface, as AOSP's query(NATIVE_WINDOW_WIDTH) does"
+    );
+    assert_eq!(
+        f.value_of("ANativeWindow_getHeight", |asm| {
+            asm.mov(0, window);
+        }) as i64,
+        1440
+    );
+}
+
+/// The window ceiling answers **null**, which is how a device reports failing to produce one.
+///
+/// A refusal would be wrong: §8 row 17's caller branches on null, and a cap this layer chose is
+/// not a reason to invent a failure mode the caller has no arm for. `MAX_NATIVE_WINDOWS` distinct
+/// `Surface`s fill it, because the same `Surface` twice is the same window.
+#[test]
+fn the_window_ceiling_answers_null() {
+    let _guard = serialized();
+    let f = fixture("window-ceiling");
+    f.ndk.set_window_geometry(a_geometry());
+    let mut windows = Vec::new();
+    for _ in 0..MAX_NATIVE_WINDOWS {
+        let surface = f.jni.new_object(SURFACE_CLASS).expect("a Java Surface");
+        let window = from_surface(&f, surface);
+        assert_ne!(window, 0);
+        windows.push(window);
+    }
+    assert_eq!(f.ndk.live_windows(), MAX_NATIVE_WINDOWS);
+    // Membership, not a total: every one is a distinct address.
+    let mut sorted = windows.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), MAX_NATIVE_WINDOWS, "each window is its own slot");
+
+    let surface = f.jni.new_object(SURFACE_CLASS).expect("one Surface too many");
+    assert_eq!(from_surface(&f, surface), 0, "the ceiling is a null, not a refusal");
+    assert_eq!(f.ndk.live_windows(), MAX_NATIVE_WINDOWS, "and nothing was evicted");
+
+    // Freeing one lets the next in.
+    call_with(&f, "ANativeWindow_release", windows[0]);
+    assert_eq!(f.ndk.live_windows(), MAX_NATIVE_WINDOWS - 1);
+    assert_ne!(from_surface(&f, surface), 0, "the freed slot is reused");
+}
+
+/// **The census counts each `ANativeWindow` symbol by name**, so a gate can assert which calls
+/// the engine actually made rather than that the run completed.
+#[test]
+fn every_window_symbol_is_counted_by_name() {
+    let _guard = serialized();
+    let (f, surface) = with_surface("window-census");
+    let window = from_surface(&f, surface);
+    call_with(&f, "ANativeWindow_acquire", window);
+    let _ = f.value_of("ANativeWindow_getWidth", |asm| {
+        asm.mov(0, window);
+    });
+    let _ = f.value_of("ANativeWindow_getHeight", |asm| {
+        asm.mov(0, window);
+    });
+    call_with(&f, "ANativeWindow_release", window);
+
+    let census = f.ndk.census();
+    for symbol in [
+        "ANativeWindow_fromSurface",
+        "ANativeWindow_acquire",
+        "ANativeWindow_release",
+        "ANativeWindow_getWidth",
+        "ANativeWindow_getHeight",
+    ] {
+        assert_eq!(census.get(symbol).copied(), Some(1), "`{symbol}` was not counted once");
+    }
+    // A refused call is still a call that happened, and is still counted: a census that only
+    // counted successes would make the refusal invisible in exactly the run where it mattered.
+    let _ = f.refusal_of("ANativeWindow_getWidth", |asm| {
+        asm.mov(0, 0xdead_beef);
+    });
+    assert_eq!(f.ndk.census().get("ANativeWindow_getWidth").copied(), Some(2));
 }

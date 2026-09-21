@@ -1,4 +1,4 @@
-//! The NDK surface: `ALooper` now, `AAssetManager`, `AConfiguration` and `ANativeWindow` next.
+//! The NDK surface: `ALooper`, `AAssetManager`, `AConfiguration` and `ANativeWindow`.
 //!
 //! The third thing in this crate that the guest reaches, after the bionic adapter and the JNI
 //! tables, and the first that is neither. `libroblox.so` imports **32** `libandroid.so` /
@@ -46,6 +46,7 @@ pub mod assets;
 pub mod config;
 mod handles;
 pub mod looper;
+pub mod window;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -69,6 +70,7 @@ pub use looper::{
     ALOOPER_EVENT_INVALID, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK, ALOOPER_POLL_ERROR,
     ALOOPER_POLL_TIMEOUT, ALOOPER_POLL_WAKE, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS,
 };
+pub use window::{WindowGeometry, SURFACE_CLASS};
 
 /// How many loopers one instance can hold.
 ///
@@ -100,6 +102,15 @@ pub const MAX_OPEN_ASSETS: usize = 32;
 /// what a device answers on allocation failure.
 pub const MAX_CONFIGURATIONS: usize = 8;
 
+/// How many `ANativeWindow`s one instance can hold.
+///
+/// **A policy number.** `jni-surface.md` §8 row 17 needs exactly one — `onSurfaceCreatedNative`
+/// releases the old window and makes one from the new `Surface` — and asking twice with the same
+/// `Surface` gets the same window back, so four is room for a host that hands the engine more
+/// than one surface without the bound being what stops it. Matched to [`MAX_ASSET_MANAGERS`] for
+/// the same reason: both are per-Java-object families whose real count is one.
+pub const MAX_NATIVE_WINDOWS: usize = 4;
+
 /// How many descriptors one looper can watch.
 ///
 /// §5.2 registers one per looper: `msgread` in the constructor, and the glue's own command pipe
@@ -129,7 +140,7 @@ pub struct LooperEvent {
     /// Which guest thread made the call, as this instance numbers them.
     pub thread: usize,
     /// The operation: `"prepare"`, `"forThread"`, `"acquire"`, `"release"`, `"addFd"`,
-    /// `"removeFd"`, `"pollOnce"`, `"callback"`.
+    /// `"removeFd"`, `"pollOnce"`, `"callback"`, `"configuration"`, `"window"`.
     pub what: &'static str,
     /// What it was asked and what it decided.
     pub detail: String,
@@ -146,6 +157,8 @@ struct NdkState {
     assets: Slots<OpenAsset>,
     /// The live `AConfiguration`s.
     configs: Slots<config::LiveConfiguration>,
+    /// The live `ANativeWindow`s.
+    windows: Slots<window::LiveWindow>,
     /// Which looper address a host thread's guest thread has been given.
     by_thread: HashMap<std::thread::ThreadId, GuestAddr>,
     /// Which index this instance has given each host thread, for the event log.
@@ -165,7 +178,7 @@ impl NdkState {
     }
 }
 
-/// One NDK instance: the four opaque-handle registries and the arena their identities come out of.
+/// One NDK instance: the five opaque-handle registries and the arena their identities come out of.
 pub struct Ndk {
     /// Kept so `AAsset_getBuffer` can map an asset's bytes where the guest can read them.
     space: Arc<GuestSpace>,
@@ -188,6 +201,13 @@ pub struct Ndk {
     /// language, country, screen size and density are the *embedding's* facts, and a number this
     /// layer chose would be a number with nothing behind it.
     configuration: Mutex<Option<DeviceConfiguration>>,
+    /// What `ANativeWindow_getWidth` and `_getHeight` report.
+    ///
+    /// **`None` by default and they refuse**, the same shape as the configuration above and as
+    /// `HwcapPolicy` (D26). There is no real surface yet — graphics is M6/M7 and `omni-gfx` is
+    /// not wired to any of this — so the dimensions are facts about the *host's* output. A
+    /// plausible 1920x1080 invented here would be a device profile nobody chose.
+    window_geometry: Mutex<Option<WindowGeometry>>,
     state: Mutex<NdkState>,
     /// How many times each named NDK function has been serviced.
     ///
@@ -215,10 +235,14 @@ impl Ndk {
     /// [`AbiError::Memory`] if the address space could not supply the arena.
     pub fn new(space: Arc<GuestSpace>) -> AbiResult<Arc<Self>> {
         let page = space.page_size();
-        // Four tables, laid out end to end. **Each kind gets its own range**, which is what makes
+        // Five tables, laid out end to end. **Each kind gets its own range**, which is what makes
         // an `AAsset *` passed where an `ALooper *` belongs a refusal rather than a table lookup
         // that happens to succeed.
-        let slots = MAX_LOOPERS + MAX_ASSET_MANAGERS + MAX_OPEN_ASSETS + MAX_CONFIGURATIONS;
+        let slots = MAX_LOOPERS
+            + MAX_ASSET_MANAGERS
+            + MAX_OPEN_ASSETS
+            + MAX_CONFIGURATIONS
+            + MAX_NATIVE_WINDOWS;
         let arena_bytes = (slots * SLOT_BYTES + page - 1) & !(page - 1);
         // Eagerly committed: it is one page, and a handle is given to the guest on the first
         // `ALooper_prepare` there is, so nothing is saved by faulting it in.
@@ -238,6 +262,7 @@ impl Ndk {
         let managers = Slots::new(loopers.end(), MAX_ASSET_MANAGERS);
         let assets = Slots::new(managers.end(), MAX_OPEN_ASSETS);
         let configs = Slots::new(assets.end(), MAX_CONFIGURATIONS);
+        let windows = Slots::new(configs.end(), MAX_NATIVE_WINDOWS);
         Ok(Arc::new(Self {
             space,
             mem,
@@ -245,11 +270,13 @@ impl Ndk {
             arena_bytes,
             asset_source: OnceLock::new(),
             configuration: Mutex::new(None),
+            window_geometry: Mutex::new(None),
             state: Mutex::new(NdkState {
                 loopers,
                 managers,
                 assets,
                 configs,
+                windows,
                 by_thread: HashMap::new(),
                 thread_ids: HashMap::new(),
                 events: Vec::new(),
@@ -306,6 +333,27 @@ impl Ndk {
         *self.configuration.lock()
     }
 
+    /// Decide what `ANativeWindow_getWidth` and `_getHeight` report.
+    ///
+    /// D26's shape again, and [`ndk::window`](window)'s documentation says why it has to be:
+    /// there is no real surface yet, so the dimensions are the *embedding's* facts. Until this is
+    /// called, both getters refuse **by name** and the refusal says this is the call that decides.
+    ///
+    /// May be called again, because a surface really is resized — §8 row 18's
+    /// `onSurfaceChangedNative` is that event — and unlike [`Ndk::set_configuration`] it **does**
+    /// reach a window the guest already holds, exactly as it does on a device:
+    /// `ANativeWindow_getWidth` queries the live surface rather than a copy taken when the window
+    /// was made.
+    pub fn set_window_geometry(&self, geometry: WindowGeometry) {
+        *self.window_geometry.lock() = Some(geometry);
+    }
+
+    /// What this instance's window reports, if the embedding has decided.
+    #[must_use]
+    pub fn window_geometry(&self) -> Option<WindowGeometry> {
+        *self.window_geometry.lock()
+    }
+
     /// Checked guest memory over this instance's address space.
     #[must_use]
     pub fn mem(&self) -> &GuestMem {
@@ -330,7 +378,8 @@ impl Ndk {
     ///
     /// [`AbiError::Refused`] if a symbol already has a slot.
     pub fn bind_into(&self, builder: &BoundaryBuilder) -> AbiResult<usize> {
-        for (symbol, handler) in looper::INLINE.iter().chain(assets::INLINE).chain(config::INLINE)
+        for (symbol, handler) in
+            looper::INLINE.iter().chain(assets::INLINE).chain(config::INLINE).chain(window::INLINE)
         {
             builder.bind_inline(symbol, *handler)?;
         }
@@ -351,6 +400,7 @@ impl Ndk {
             .iter()
             .chain(assets::INLINE)
             .chain(config::INLINE)
+            .chain(window::INLINE)
             .map(|(s, _)| *s)
     }
 
@@ -430,6 +480,23 @@ impl Ndk {
     #[must_use]
     pub fn live_configurations(&self) -> usize {
         self.state.lock().configs.live()
+    }
+
+    /// How many `ANativeWindow`s are live.
+    #[must_use]
+    pub fn live_windows(&self) -> usize {
+        self.state.lock().windows.live()
+    }
+
+    /// How many references are held to the `ANativeWindow` at `window`, or `None` if that is not
+    /// a live window of this instance.
+    ///
+    /// For a test that asserts the count is a **count**: `live_windows()` alone cannot tell a
+    /// window held twice from one held once, which is the substitution `VERIFICATION.md` entry 1
+    /// is about.
+    #[must_use]
+    pub fn window_references(&self, window: GuestAddr) -> Option<i64> {
+        self.state.lock().windows.get(window).map(window::LiveWindow::references)
     }
 
     /// The descriptors a looper is watching, for a test or a diagnostic.

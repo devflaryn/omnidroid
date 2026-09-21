@@ -956,10 +956,26 @@ fn every_ndk_symbol_is_an_import_of_the_real_binary_and_outside_the_188() {
         "AConfiguration_getScreenWidthDp",
         "AConfiguration_getScreenHeightDp",
         "AConfiguration_getScreenSize",
+        // **Five `ANativeWindow`, not nine.** MEASURED in
+        // `docs/research/apk-undefined-symbols.txt`, per-library section `libroblox.so (565
+        // undefined; ...)`: that binary imports exactly these five. `_getFormat` is imported only
+        // by `libsurface_util_jni.so`; `_lock`, `_setBuffersGeometry` and `_unlockAndPost` only by
+        // `libimage_processing_util_jni.so`. `apk-analysis.md` §4.4's "ANativeWindow (9)" is the
+        // count across the whole APK, which D29 already records. Binding any of the other four
+        // would fail the import check above rather than this list.
+        "ANativeWindow_fromSurface",
+        "ANativeWindow_acquire",
+        "ANativeWindow_release",
+        "ANativeWindow_getWidth",
+        "ANativeWindow_getHeight",
     ] {
         assert!(bound.contains(symbol), "`{symbol}` is not bound");
     }
-    assert_eq!(bound.len(), 23, "seven ALooper, seven AAsset*, nine AConfiguration");
+    assert_eq!(
+        bound.len(),
+        28,
+        "seven ALooper, seven AAsset*, nine AConfiguration, five ANativeWindow"
+    );
 }
 
 /// The 188 imports the initializers statically reach, from the research file the adapter's own

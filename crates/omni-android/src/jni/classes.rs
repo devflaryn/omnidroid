@@ -697,6 +697,15 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: NONE,
         fields: NONE,
     },
+    // **`Surface` has no members and that is the whole of it**, for `AssetManager`'s reason one
+    // object along. §8 row 17 receives one as an argument to `onSurfaceCreatedNative` and hands it
+    // straight to `ANativeWindow_fromSurface`; nothing on the startup path calls a method on it
+    // from native code — row 24's `PlatformParams.surface()` returns one rather than reading it.
+    // It is declared so that the host can *build* one — `Jni::new_object` refuses a class nobody
+    // declared — and so that `ANativeWindow_fromSurface` can check that what it was given really
+    // is one, rather than turning a wrong argument into a window that answers nonsense thousands
+    // of instructions from the mistake.
+    ClassSpec { name: "android/view/Surface", tier: Tier::Zero, methods: NONE, fields: NONE },
     ClassSpec {
         name: "android/content/res/Configuration",
         tier: Tier::Zero,
