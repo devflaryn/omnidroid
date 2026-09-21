@@ -2213,6 +2213,33 @@ def main():
         return 2
     print(f"pre-flight: {len(selected)}/{len(selected)} patterns match exactly once")
 
+    # Pre-flight 2: **every command must PASS on the unmutated tree.**
+    #
+    # This exists because it did not, and the hole is the worst one a mutation harness can have: a
+    # command that already fails reports every row that uses it as `caught`, because "the suite
+    # failed" is the whole of what `caught` means here. Eight `time-*` rows were reported 8/8
+    # caught that way -- `gmtime(i64::MIN)` panicked with an arithmetic overflow in a **debug**
+    # build, which is what this harness runs, while the whole-workspace suite runs `--release` and
+    # wrapped silently instead. The defect was real and is fixed; the eight "caught"s were worth
+    # nothing until it was.
+    #
+    # One run per distinct command rather than per row, so a full table costs a handful of extra
+    # runs rather than two hundred.
+    commands = []
+    for row in selected:
+        if row[6] not in commands:
+            commands.append(row[6])
+    for command in commands:
+        code, output, seconds = run(command)
+        if code != 0:
+            print(f"pre-flight failed: `{' '.join(command)}` does not pass on the unmutated tree "
+                  f"({seconds}s). Nothing was mutated. Every row using this command would have "
+                  f"been reported `caught` whatever its mutation did.")
+            for name in failing_tests(output):
+                print(f"  {name}")
+            return 2
+    print(f"pre-flight: {len(commands)}/{len(commands)} commands pass on the unmutated tree")
+
     print(f"{len(selected)} mutations\n")
     results = []
     for mid, direction, description, path, old, new, command in selected:

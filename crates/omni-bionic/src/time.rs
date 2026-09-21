@@ -172,8 +172,13 @@ const DAYS_BEFORE_MONTH: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 27
 /// converted; there is no other failure.
 pub fn gmtime(timestamp: i64) -> Result<Tm, GmtimeError> {
     let days = floor_div(timestamp, SECONDS_PER_DAY);
-    // Non-negative by construction: `days` is the floor, so the remainder is in `0..86400`.
-    let second_of_day = timestamp - days * SECONDS_PER_DAY;
+    // `rem_euclid` rather than `timestamp - days * SECONDS_PER_DAY`, which is the same value and
+    // **overflows**: for `timestamp` near `i64::MIN` the floor pushes `days * SECONDS_PER_DAY`
+    // past `i64::MIN`, which panics in a debug build and wraps in a release one. Both are
+    // reachable from a guest-supplied `time_t`, and a panic reachable from guest input is
+    // Critical. `rem_euclid` cannot overflow: its result is in `0..SECONDS_PER_DAY` by
+    // construction, and it is the same non-negative remainder the floor division implies.
+    let second_of_day = timestamp.rem_euclid(SECONDS_PER_DAY);
 
     // `civil_from_days`, shifted so the year starts in March and the leap day is last.
     let shifted = days + DAYS_ERA_TO_UNIX_EPOCH;
@@ -368,6 +373,50 @@ mod tests {
             }
             assert_eq!(tm.yday, expected_yday, "{tm:?}");
             expected_yday += 1;
+        }
+    }
+
+    /// **No `i64` makes this panic or wrap**, which is the whole of Global Constraint 11 for a
+    /// function whose only argument is a number the guest chose.
+    ///
+    /// Found by the mutation harness rather than by this suite: `gmtime(i64::MIN)` used to compute
+    /// `timestamp - days * SECONDS_PER_DAY`, and for timestamps near `i64::MIN` the floor pushes
+    /// that product past `i64::MIN`. In a **debug** build it panicked; in a **release** build it
+    /// wrapped and produced a time of day from nonsense. The whole workspace suite runs
+    /// `--release`, which is exactly why it never saw it.
+    ///
+    /// The boundaries are enumerated rather than sampled: the two extremes, the two values one
+    /// step inside them, and the two day boundaries nearest `i64::MIN`, because the overflow is a
+    /// property of the multiplication rather than of any particular date.
+    #[test]
+    fn no_timestamp_at_all_can_make_this_panic_or_wrap() {
+        let edges = [
+            i64::MIN,
+            i64::MIN + 1,
+            i64::MIN + SECONDS_PER_DAY,
+            -SECONDS_PER_DAY - 1,
+            -1,
+            0,
+            1,
+            i64::MAX - SECONDS_PER_DAY,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for timestamp in edges {
+            // Either a `Tm` whose fields are in range, or the one documented refusal. Never a
+            // panic, and never a time of day outside a day.
+            match gmtime(timestamp) {
+                Ok(tm) => {
+                    assert!((0..24).contains(&tm.hour), "{timestamp}: hour {}", tm.hour);
+                    assert!((0..60).contains(&tm.min), "{timestamp}: minute {}", tm.min);
+                    assert!((0..60).contains(&tm.sec), "{timestamp}: second {}", tm.sec);
+                    assert!((0..7).contains(&tm.wday), "{timestamp}: weekday {}", tm.wday);
+                    assert!((0..366).contains(&tm.yday), "{timestamp}: day of year {}", tm.yday);
+                    assert!((1..=31).contains(&tm.mday), "{timestamp}: day {}", tm.mday);
+                    assert!((0..12).contains(&tm.mon), "{timestamp}: month {}", tm.mon);
+                }
+                Err(GmtimeError::YearOutOfRange { .. }) => {}
+            }
         }
     }
 
