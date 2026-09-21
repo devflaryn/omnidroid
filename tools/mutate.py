@@ -99,6 +99,9 @@ ADAPTER_LOGGING = "crates/omni-android/src/bionic/logging.rs"
 # `FILE *` layer lands in `omni-bionic` over a trait, and the adapter binds the 29 file-io symbols.
 PLAT_FS = "crates/omni-platform/src/fs/mod.rs"
 PLAT_FS_PATH = "crates/omni-platform/src/fs/path.rs"
+# M5: the pipe. An in-process byte queue with two ends, and the first descriptor kind whose
+# readiness depends on another descriptor.
+PLAT_FS_PIPE = "crates/omni-platform/src/fs/pipe.rs"
 PLAT_FS_WINDOWS = "crates/omni-platform/src/fs/windows.rs"
 BIONIC_STDIO = "crates/omni-bionic/src/stdio.rs"
 ADAPTER_FILES = "crates/omni-android/src/bionic/files.rs"
@@ -3541,6 +3544,154 @@ directory", ADAPTER_FILES,
      """        if self.pinned_bytes + need > MAX_PINNED_BYTES {""",
      """        if true {""",
      ANDROID_LIB),
+
+    # =============================================== M5: the pipe, and the descriptor space opening
+    #
+    # `jni-surface.md` §5.2 needs two pipes before `initializeNativeCode` can return, and binding
+    # `pipe` is what ended the closed-descriptor-space argument `bionic/net.rs` used to make. The
+    # rows below are over the seam (`omni-platform`), the readiness rules `poll` and `select` now
+    # answer from, and the blocking wait the adapter owns because the seam deliberately does not.
+
+    # **The clause end-of-file depends on.** A reader whose writers have all closed must report
+    # itself readable, because end of file IS a read that returns immediately. Without it a poll
+    # loop parks on a pipe that can never produce another byte -- and every count-based assertion
+    # about it still passes, which is `VERIFICATION.md` entry 11's shape exactly.
+    ("pipe-A1", "A", "a reader with no writers left is not readable",
+     PLAT_FS_PIPE,
+     """                    readable: !empty || state.writers == 0,""",
+     """                    readable: !empty,""",
+     PLATFORM),
+
+    # End of file itself: a read from an emptied, writerless pipe answers `WouldBlock` instead of
+    # zero. A guest draining a pipe until `read` returns 0 never stops.
+    ("pipe-A2", "A", "an emptied pipe with no writers reports EAGAIN instead of end of file",
+     PLAT_FS_PIPE,
+     """            if state.writers == 0 {
+                // End of file, and it stays end of file: every later read answers zero too.
+                return Ok(0);
+            }""",
+     """            if false {
+                return Ok(0);
+            }""",
+     PLATFORM),
+
+    # A write past the free space refusing the whole request rather than taking what fits. It is
+    # the believable wrong answer for this shape: POSIX guarantees atomicity only to `PIPE_BUF`,
+    # and a guest writing a large buffer would spin against a pipe that was draining.
+    ("pipe-A3", "A", "a write larger than the free space takes nothing",
+     PLAT_FS_PIPE,
+     """        let taken = buf.len().min(room);
+        state.queue.extend(&buf[..taken]);""",
+     """        if buf.len() > room {
+            return Err(FsError::kinded("write", "a pipe", FsErrorKind::WouldBlock, "no room"));
+        }
+        let taken = buf.len();
+        state.queue.extend(&buf[..taken]);""",
+     PLATFORM),
+
+    # Closing an end not waking the gate. The last writer going away is what makes a blocked
+    # reader see end of file; a close that does not raise the generation leaves that reader
+    # parked until its deadline, which is a stall rather than a wrong answer -- the hardest kind
+    # to see.
+    ("pipe-A4", "A", "closing an end of a pipe does not wake what is waiting on it",
+     PLAT_FS_PIPE,
+     """        self.pipe.gate.bump();
+    }
+}
+
+/// Create a pipe""",
+     """        let _ = &self.pipe;
+    }
+}
+
+/// Create a pipe""",
+     PLATFORM),
+
+    # `POLLHUP` masked by what was asked for. POSIX reports it whether or not it was requested,
+    # and the canonical drain loop asks only for `POLLIN`: without this the loop never learns the
+    # writer is gone.
+    ("pipe-A5", "A", "POLLHUP is only reported when it was asked for",
+     ADAPTER_NET,
+     """    if readiness.hangup {
+        revents |= POLLHUP;
+    }""",
+     """    if readiness.hangup {
+        revents |= events & POLLHUP;
+    }""",
+     ANDROID),
+
+    # The blocking wait removed: a blocking descriptor is told `EAGAIN`, which only a
+    # non-blocking one can be told. The plausible wrong answer this whole type exists to prevent.
+    ("pipe-A6", "A", "a blocking read reports EAGAIN instead of waiting",
+     ADAPTER_FILES,
+     """        errno == consts::EAGAIN && fs.is_nonblocking(fd).is_ok_and(|nonblocking| !nonblocking)""",
+     """        let _ = (fs, fd, errno);
+        false""",
+     ANDROID),
+
+    # The all-or-nothing descriptor check for a pipe's two ends. With `+ 1` a pipe fits where only
+    # one slot is free, and the instance ends up holding one descriptor past its own ceiling.
+    ("pipe-A7", "A", "a pipe needs only one free descriptor slot",
+     PLAT_FS,
+     """        if table.open.len() + 2 > MAX_OPEN_FILES {""",
+     """        if table.open.len() + 1 > MAX_OPEN_FILES {""",
+     PLATFORM),
+
+    # `F_SETFL` accepting any bit, which is what Linux does and what this layer must not: a guest
+    # that set `O_ASYNC` and was told it worked waits for a signal this runtime never delivers.
+    ("pipe-A8", "A", "fcntl(F_SETFL) silently ignores every bit but O_NONBLOCK",
+     ADAPTER_FILES,
+     """                if unhandled != 0 {""",
+     """                if false {""",
+     ANDROID),
+
+    # ---- the over-corrections ----
+
+    # A pipe given the always-ready answer the other four kinds get. It reads as restoring the
+    # simple rule `poll` used to have, and it makes every `poll` on an empty pipe report data
+    # that is not there.
+    ("pipe-B1", "B", "a pipe answers always-ready like every other descriptor kind",
+     PLAT_FS,
+     """            Entry::Pipe(handle) => handle.readiness(),""",
+     """            Entry::Pipe(_) => Readiness::ALWAYS,""",
+     PLATFORM),
+
+    # The blocking bound removed. It reads as more POSIX-faithful -- a blocking read really does
+    # wait indefinitely on a device -- and it is a permanent hang of a host thread, which D16's
+    # step budgets cannot end because a sleeping thread executes no guest instructions.
+    #
+    # **Its detector is a unit test on the bound**, not an end-to-end one: an unbounded blocking
+    # read on a pipe nobody writes to does not fail, it never returns. Same precedent, and same
+    # reason, as the `clocks::capped` row.
+    ("pipe-B2", "B", "a blocking transfer waits for ever, as a device does",
+     ADAPTER_FILES,
+     """    Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS)""",
+     """    Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)""",
+     ANDROID_LIB),
+
+    # `F_GETFL` reporting an access mode as well. It reads as more complete -- a real `F_GETFL`
+    # does return one -- and this seam does not record which mode a descriptor was opened for, so
+    # the value would be a guess the guest branches on.
+    ("pipe-B3", "B", "F_GETFL invents an access mode",
+     ADAPTER_FILES,
+     """                Settled::Done(false) => 0,""",
+     """                Settled::Done(false) => O_ACCMODE,""",
+     ANDROID),
+
+    # Reading the write end answered as end of file instead of `EBADF`. It reads as the gentler
+    # answer and it tells a guest that used the wrong end of its own pipe that the data is gone.
+    ("pipe-B4", "B", "reading the write end of a pipe is end of file rather than EBADF",
+     PLAT_FS_PIPE,
+     """        if self.end != PipeEnd::Read {
+            return Err(FsError::kinded(
+                "read",""",
+     """        if self.end != PipeEnd::Read {
+            return Ok(0);
+        }
+        if false {
+            return Err(FsError::kinded(
+                "read",""",
+     PLATFORM),
 ]
 
 

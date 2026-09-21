@@ -759,6 +759,16 @@ fn read_into_guest(
 /// **Non-blocking is the common case on the startup path and costs nothing**: §5.2 sets
 /// `O_NONBLOCK` on both ends of both of the glue's pipes, so this type's deadline is never even
 /// computed there.
+/// When a blocking transfer gives up, as an instant.
+///
+/// **A function rather than an expression inside [`BlockingWait::wait`]**, and for the reason the
+/// mutation harness records for `clocks::capped`: a row that removes this bound makes the
+/// end-to-end test **hang** rather than fail, so the detector has to be a unit test on the bound
+/// itself, and a unit test needs something to call.
+fn blocking_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS)
+}
+
 struct BlockingWait {
     /// Set on the first wait, so the bound is over the whole call rather than per retry — a
     /// per-retry bound is no bound at all when the retries are unbounded.
@@ -790,9 +800,7 @@ impl BlockingWait {
 
     /// Wait for the descriptor's readiness to change, or refuse by name at the cap.
     fn wait(&mut self, view: &GuestView<'_>, fs: &Filesystem, fd: i32) -> AbiResult<()> {
-        let deadline = *self
-            .deadline
-            .get_or_insert_with(|| Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS));
+        let deadline = *self.deadline.get_or_insert_with(blocking_deadline);
         let now = Instant::now();
         if now >= deadline {
             return Err(view.refusal(format!(
@@ -1576,6 +1584,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// **A blocking transfer gives up within a minute**, asserted against a literal.
+    ///
+    /// The detector for removing the bound, and it has to be a unit test: an end-to-end test of
+    /// an unbounded blocking `read` on a pipe nobody writes to **hangs**, and a hang is not a
+    /// failing test — it is a run that never ends, which is what M3 task 2 already paid for
+    /// twice. The comparison is against a literal rather than against `MAX_SLEEP_SECONDS`, so
+    /// the test does not assert its own definition (review finding M2).
+    #[test]
+    fn a_blocking_transfer_gives_up_within_a_minute() {
+        let deadline = blocking_deadline();
+        let bound = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            bound <= Duration::from_secs(60) && bound > Duration::from_secs(1),
+            "a blocking read or write waits {bound:?}, which is outside the cap this layer \
+             documents. A sleeping thread executes no guest instructions, so D16's step budgets \
+             cannot end one"
+        );
+    }
+
     /// The three structures are the sizes the guest's headers say, and their fields land where
     /// the tables above claim.
     ///
@@ -1755,6 +1782,9 @@ mod tests {
             (FsErrorKind::ReadOnlyFilesystem, consts::EROFS),
             (FsErrorKind::BadDescriptor, consts::EBADF),
             (FsErrorKind::NameTooLong, consts::ENAMETOOLONG),
+            // M5: a pipe is the only thing on this seam that can produce either.
+            (FsErrorKind::WouldBlock, consts::EAGAIN),
+            (FsErrorKind::BrokenPipe, consts::EPIPE),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for (kind, expected) in mapped {

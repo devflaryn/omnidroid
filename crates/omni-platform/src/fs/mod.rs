@@ -2182,6 +2182,11 @@ mod tests {
     /// guarantees atomicity only up to [`PIPE_BUF`]; past it a write may be split.
     #[test]
     fn a_write_larger_than_the_free_space_takes_what_fits_and_says_how_much() {
+        // **The capacity against a literal, once.** Every other assertion here is written in
+        // terms of `PIPE_CAPACITY`, which would make them all pass for any value of it — the
+        // shape review finding M2 named, where a test asserts its own definition.
+        assert_eq!(PIPE_CAPACITY, 65_536, "Linux's default pipe capacity");
+        assert_eq!(PIPE_BUF, 4_096, "Linux's atomicity bound");
         let scratch = Scratch::new("pipe-full");
         let fs = scratch.fs();
         let (read_fd, write_fd) = fs.pipe().expect("a pipe");
