@@ -135,15 +135,25 @@ fn cached_main_lib() -> Option<&'static Path> {
     PATH.get_or_init(|| {
         let apk_path = repo_root().join(APK_NAME);
         if !apk_path.is_file() {
-            // Straight to the process's stderr: `eprintln!` is captured by libtest and thrown away
-            // for a passing test, so a skipped gate would look exactly like a passing one.
-            let notice = format!(
-                "\nSKIP: the M3 gate needs {APK_NAME}, which is not at {}. Every assertion about \
-                 the 3,594 initializers was skipped.\n\n",
-                apk_path.display()
+            // **The gate FAILS rather than skips, and that is deliberate.**
+            //
+            // Writing to raw stderr and returning `None` was the earlier behaviour, on the
+            // argument that a notice makes the skip visible. It does -- but a skipped test still
+            // reports `ok`, and this is the test that *is* M3's evidence.
+            //
+            // A green suite that proved nothing about the 3,594 initializers is exactly the shape
+            // of the two High findings this project's adapter review turned up: a confinement
+            // test that early-returned because the host could not create a symlink, and a
+            // regression test whose refusal arm was empty. Both passed run after run while
+            // asserting nothing, and both were written as the fix for an earlier defect.
+            //
+            // A milestone gate is the last place to accept that trade. If the fixture is missing,
+            // the honest outcome is a failure naming what is missing, not a pass.
+            panic!(
+                "the M3 gate needs {}, which is not at {}. It is not skippable: this test is the milestone's evidence, and passing without it would assert nothing about the 3,594 initializers.",
+                APK_NAME,
+                apk_path.display(),
             );
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), notice.as_bytes());
-            return None;
         }
         let apk = omni_apk::Apk::open(&apk_path).expect("the real APK must open");
         let cache = omni_apk::LibraryCache::new(

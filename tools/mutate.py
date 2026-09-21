@@ -3293,7 +3293,29 @@ def main():
             # was genuinely caught by a failing test -- was filed as MISS. A harness that
             # misclassifies its own results is worse than no harness.
             elif not caught and ("error[" in output or "could not compile" in output):
-                status, detail = "MISS", "did not compile"
+                # **Retried once, and the retry is the point.** MEASURED: one 298-row run produced
+                # two of these and BOTH compiled fine afterwards -- `mem-A18` logged
+                # "did not compile (2s)" where its real build and suite take 23s, and `varargs-A8`
+                # the same. Two seconds is not a compile; it is a cargo lock or a filesystem race.
+                #
+                # A transient build failure is indistinguishable from a genuinely non-compiling
+                # mutation at this point, and filing it as MISS sends somebody to investigate a row
+                # that is fine -- the mirror of the misclassification the comment above records. A
+                # mutation that truly does not compile fails twice; a race does not.
+                code, output, retry_seconds = run(command)
+                seconds += retry_seconds
+                caught = failing_tests(output)
+                if code == 0:
+                    status, detail = "NOT CAUGHT", "every test still passed (build retried)"
+                elif not caught and ("error[" in output or "could not compile" in output):
+                    status, detail = "MISS", "did not compile, twice"
+                elif caught:
+                    status = "caught"
+                    detail = f"{len(caught)} test(s), after a build retry: " + ", ".join(caught[:3])
+                    if len(caught) > 3:
+                        detail += f", +{len(caught) - 3} more"
+                else:
+                    status, detail = "caught", "the suite failed after a build retry"
             elif caught:
                 status = "caught"
                 detail = f"{len(caught)} test(s): " + ", ".join(caught[:3])
