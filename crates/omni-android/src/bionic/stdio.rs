@@ -44,6 +44,22 @@
 //! before the call returns, so `fflush` has nothing of this layer's to flush and succeeding is
 //! the contract being satisfied rather than a stub. `fflush` on a *standard* stream still reaches
 //! the host's own `Stdout`, which does buffer.
+//!
+//! # `ferror` and `clearerr` are imported and are not bound, which is what the error flag is for
+//!
+//! The paragraph above says `ferror`, `clearerr`, `fseek` and `setvbuf` are absent from the 188.
+//! That is true and it is **narrower than "not imported"**, so it is worth separating the two:
+//! all four are undefined dynamic symbols of the APK's libraries — `ferror` from
+//! `libroblox.so`, `libbacktrace-native.so` and `libzstd-jni`, `clearerr` from `libroblox.so` —
+//! and none is reachable from the 3,594 initializers, so none is bound here and no guest call in
+//! this milestone can reach one.
+//!
+//! The consequence is about **`errno`, not about `FILE`**. C17 7.21.10.3's `ferror` is the only
+//! call that can read a stream's error indicator, so with it unbound the flag
+//! [`omni_bionic::stdio::Stream`] keeps is write-only: correct, maintained where C says, and
+//! unobservable. **`errno` is therefore the whole of what a guest learns about why a stream
+//! operation failed**, which is why a site that reports `EOF` without setting one is a silent
+//! wrong answer rather than a missing convenience — the guest has no second place to look.
 
 use std::cell::RefCell;
 
@@ -87,9 +103,37 @@ use super::{active, enter};
 /// unwind with; the handler then finds the stash and turns the whole call into a refusal naming
 /// the symbol and the host's own message. It is the same shape [`GuestView`] already uses to
 /// carry a rich `AbiError` through `omni-bionic`'s thin `Fault`.
+///
+/// # The second thing it stashes: a write that took none of a non-empty buffer
+///
+/// [`omni_bionic::stdio::Descriptors::write`]'s contract is that a non-empty buffer yields at
+/// least one byte taken or an errno, because **POSIX.1-2017 XSH `write()` has no zero return for
+/// `nbyte > 0`** — it transfers at least one byte or fails with `errno` set. The state therefore
+/// has no `errno` anywhere in POSIX, and `omni-bionic` refuses to invent one: it sets the stream's
+/// error indicator, stops (looping would hang), and leaves `errno` alone. On its own that is the
+/// finding this file was reviewed for — the guest gets `EOF` from `fputc`, or a short count from
+/// `fwrite`, and reads whatever `errno` an earlier, unrelated call left behind.
+///
+/// **This is the layer that can do better, so it does.** Only `omni-platform`'s `std::io::Write`
+/// half can produce a zero return at all: the `/dev/*` entries return `buf.len()`, a pipe returns
+/// at least one byte or `EAGAIN`/`EPIPE`, and a directory or a read-only descriptor is `EBADF`
+/// before any write happens. A regular file and the standard streams go through
+/// `std::io::Write::write`, whose own contract permits `Ok(0)` for "the underlying object is no
+/// longer able to accept bytes". If that ever happens the failure is exactly the kind
+/// `errno_for` has no number for, so it takes the same road: stashed, and refused by name.
+///
+/// **Stated plainly rather than implied: no input I could construct reaches it.** Nothing in the
+/// seam returns `Ok(0)` for a non-empty buffer today, so this is a guard on a `std` contract
+/// rather than on guest input, and it is kept rather than deleted because it is the only place a
+/// `std::io` zero return could become a guest-visible answer with a borrowed reason.
 pub(super) struct HostDescriptors<'a> {
     fs: &'a Filesystem,
-    unclassified: RefCell<Option<FsError>>,
+    /// The message a refusal should carry, if this call hit something with no honest errno.
+    ///
+    /// A `String` rather than an `FsError` because both producers are now in this file and only
+    /// one of them has a host error object: the zero-byte write is a contract violation the seam
+    /// reported as success, so there is nothing to carry but the sentence describing it.
+    unclassified: RefCell<Option<String>>,
 }
 
 impl<'a> HostDescriptors<'a> {
@@ -101,36 +145,77 @@ impl<'a> HostDescriptors<'a> {
     fn errno(&self, error: FsError) -> i32 {
         match error.kind().and_then(errno_for) {
             Some(errno) => errno,
-            None => {
-                let mut slot = self.unclassified.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(error);
-                }
-                // The stream logic needs *some* number to unwind with. It never reaches the
-                // guest: the handler checks the stash first and refuses.
-                consts::EIO
-            }
+            None => self.stash(error.to_string()),
         }
     }
 
+    /// Record why this call must be refused, and hand the stream logic a number to unwind with.
+    ///
+    /// The number **never reaches the guest**: every caller of this type checks the stash before
+    /// it returns and refuses. The first reason wins, because it is the one that describes the
+    /// state the rest of the call then ran in.
+    fn stash(&self, why: String) -> i32 {
+        let mut slot = self.unclassified.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(why);
+        }
+        consts::EIO
+    }
+
     /// The stashed failure, if the call hit one.
-    fn take_unclassified(&self) -> Option<FsError> {
+    fn take_unclassified(&self) -> Option<String> {
         self.unclassified.borrow_mut().take()
     }
 }
 
 impl Descriptors for HostDescriptors<'_> {
     fn read(&self, fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
+        // `Ok(0)` is passed straight through: it is end of file, which C17 7.21.8.1p3 makes a
+        // return value and not an error, and `feof` is what reports it. The asymmetry with
+        // `write` below is `read(2)`'s and `write(2)`'s own.
         self.fs.read(fd, buf).map_err(|error| self.errno(error))
     }
 
     fn write(&self, fd: i32, buf: &[u8]) -> Result<usize, i32> {
-        self.fs.write(fd, buf).map_err(|error| self.errno(error))
+        match self.fs.write(fd, buf) {
+            Ok(taken) => match write_contract_violation(fd, buf.len(), taken) {
+                Some(why) => Err(self.stash(why)),
+                None => Ok(taken),
+            },
+            Err(error) => Err(self.errno(error)),
+        }
     }
 
     fn flush(&self, fd: i32) -> Result<(), i32> {
         self.fs.flush(fd).map_err(|error| self.errno(error))
     }
+}
+
+/// Why a *successful* seam write must nevertheless refuse, if it must.
+///
+/// The one rule: **a non-empty buffer must yield at least one byte.** POSIX.1-2017 XSH `write()`
+/// has no zero return for `nbyte > 0`, so a zero here is a state POSIX never had to name — and
+/// therefore one it gives no `errno`. Reporting it as a short count would hand the guest `EOF`
+/// from `fputc`, or fewer items from `fwrite`, with `errno` still holding whatever an earlier
+/// call left there; that is the finding this function exists to close.
+///
+/// A free function rather than an arm inside [`Descriptors::write`] so that the rule can be
+/// tested directly: no descriptor in `omni-platform` returns zero for a non-empty buffer, so the
+/// arm itself is not reachable from any input, and a rule that cannot be exercised is a rule
+/// nobody is checking. The two negative cases matter as much as the positive one — an empty
+/// buffer returning zero is POSIX's own answer, and a short-but-non-zero return is an ordinary
+/// partial write the stream layer loops on.
+fn write_contract_violation(fd: i32, requested: usize, taken: usize) -> Option<String> {
+    if requested == 0 || taken > 0 {
+        return None;
+    }
+    Some(format!(
+        "the host took none of a {requested} byte write to fd {fd} and reported no error. POSIX's \
+         `write()` has no zero return for a non-zero count, so there is no errno that describes \
+         this and none is invented: a guest told `ENOSPC` would delete files it does not need to, \
+         one told `EAGAIN` would retry forever, and one told `EIO` would report broken hardware \
+         nobody observed"
+    ))
 }
 
 /// `omni-bionic`'s answer in the seam's vocabulary — the one place the two flag sets meet.
@@ -185,6 +270,14 @@ fn lift<T>(view: &GuestView<'_>, result: BionicResult<T>) -> AbiResult<T> {
 /// it is a wild pointer, a use-after-`fclose`, or the `&__sF[n]` arithmetic described in the
 /// module documentation. Reporting it as an ordinary invalid stream would let guest code route
 /// around it, and this project's whole failure mode is a plausible answer surfacing later.
+///
+/// **It is a deviation from POSIX and is named as one.** POSIX.1-2017 XSH `fileno` says the call
+/// "shall return -1 and set `errno` to indicate the error", with `EBADF` for a stream that is not
+/// valid; `fflush` lists `EBADF` too. A refusal answers neither, on purpose: `EBADF` is the
+/// answer for a stream that *was* one, and none of the three causes above ever was. The deviation
+/// is safe in the direction that matters — the guest gets a named failure instead of a number it
+/// could branch past — and it is the one place in this file where the `errno` a standard names is
+/// deliberately not set.
 fn stream_of(view: &GuestView<'_>, file: u64) -> AbiResult<Stream> {
     view.active.bionic.stream_of(file).ok_or_else(|| {
         view.refusal(format!(
@@ -216,8 +309,11 @@ fn with_stream<T>(
     let descriptors = HostDescriptors::new(fs);
     let produced = body(&mut view, &descriptors, &mut stream);
     state.bionic.update_stream(file, stream);
-    if let Some(error) = descriptors.take_unclassified() {
-        return Err(view.refusal(error.to_string()));
+    // **After the write-back, not before.** The flags the stream logic set are C's own record of
+    // what happened and they stay true whether or not the call then refuses; a refusal that
+    // returned first would leave `feof` answering false about a stream that did reach its end.
+    if let Some(why) = descriptors.take_unclassified() {
+        return Err(view.refusal(why));
     }
     produced
 }
@@ -423,6 +519,19 @@ pub(super) fn fileno(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// uses before it aborts or forks. Implementing it as a no-op would be the plausible wrong
 /// answer: the call would succeed and the host's own `Stdout` buffer would still be holding the
 /// last thing the engine said before it died.
+///
+/// # Which `errno` a `fflush(NULL)` leaves behind when more than one stream fails
+///
+/// C17 7.21.5.2p3 gives `fflush` one return value and one error indicator per stream, and says
+/// nothing about `errno` at all; POSIX.1-2017 XSH `fflush` gives it a single `errno` and does not
+/// say whose it is when the argument is `NULL` and several streams fail. **The last failing
+/// stream's number is what the guest reads here**, because every stream is flushed — stopping at
+/// the first failure would leave the rest of the engine's output in the host's buffers, which is
+/// the whole reason this form exists. Each stream's own error indicator is set as C requires, so
+/// the per-stream truth is not lost; it is only unreadable until `ferror` is bound.
+///
+/// The one thing that is *not* left to chance: `EOF` is returned if **any** stream failed, so a
+/// later failure cannot mask an earlier one in the return value.
 pub(super) fn fflush(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let file = c.args().next_u64()?;
     if file == 0 {
@@ -440,8 +549,8 @@ pub(super) fn fflush(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             }
             state.bionic.update_stream(pointer, stream);
         }
-        if let Some(error) = descriptors.take_unclassified() {
-            return Err(view.refusal(error.to_string()));
+        if let Some(why) = descriptors.take_unclassified() {
+            return Err(view.refusal(why));
         }
         drop(view);
         c.ret().i32(code);
@@ -586,5 +695,41 @@ mod tests {
                 String::from_utf8_lossy(mode)
             );
         }
+    }
+
+    /// **The review finding, as a rule that can be exercised.**
+    ///
+    /// `fputc`, `transfer_out` and `write_host_bytes` set a stream's error indicator on a
+    /// zero-byte write and never touched `errno`, so the guest got `EOF` and then read the reason
+    /// for some earlier, unrelated call. `omni-bionic` cannot fix that — POSIX.1-2017 XSH
+    /// `write()` has no zero return for `nbyte > 0` and therefore no `errno` for the state, and
+    /// inventing one would be a specific, believable, wrong reason. This layer can, because it
+    /// has a refusal channel, and this is the rule it refuses by.
+    ///
+    /// All three cases are asserted, not just the refusing one: `docs/VERIFICATION.md` entry 12
+    /// is about branches nothing can take, and a rule that refused an ordinary short write or an
+    /// empty write would break every chunked transfer in the layer above while still passing a
+    /// test that only checked the zero case.
+    #[test]
+    fn a_write_that_took_none_of_a_non_empty_buffer_is_refused_and_nothing_else_is() {
+        // The violation: bytes were offered and none was taken, with no error reported.
+        let why = write_contract_violation(7, 4096, 0).expect("a zero-byte write must refuse");
+        assert!(why.contains("fd 7"), "the refusal must name the descriptor: {why}");
+        assert!(why.contains("4096"), "the refusal must name how much was offered: {why}");
+        assert!(
+            why.contains("ENOSPC") && why.contains("EAGAIN") && why.contains("EIO"),
+            "the refusal must say which plausible errno it is declining to invent: {why}"
+        );
+
+        // POSIX's own zero: `write(fd, "", 0)` returns zero and that is success. The stream layer
+        // never asks for one, and a rule that refused it would be wrong about the standard.
+        assert!(write_contract_violation(7, 0, 0).is_none(), "an empty write is not a failure");
+
+        // An ordinary short write, which is what `read(2)`/`write(2)` semantics are for: the
+        // layer above loops on it. Refusing here would turn every transfer longer than one seam
+        // write into a refusal.
+        assert!(write_contract_violation(7, 4096, 1).is_none(), "a one-byte short write");
+        assert!(write_contract_violation(7, 4096, 4095).is_none(), "an almost-complete write");
+        assert!(write_contract_violation(7, 4096, 4096).is_none(), "a complete write");
     }
 }

@@ -86,6 +86,45 @@
 //! [`TRANSFER_CHUNK`]-byte buffer however large the request is, the same shape
 //! `arc4random_buf` already uses — so the peak host allocation for any call in this module is
 //! [`TRANSFER_CHUNK`] bytes and the guest cannot choose it.
+//!
+//! # Every failure the guest can see carries the `errno` that explains it
+//!
+//! C itself has no `errno` for stdio: C17 7.21 speaks only of the **error indicator** and of
+//! `EOF`. POSIX is where the number comes from, and it gives one to every function here that can
+//! fail. A caller that prints `strerror(errno)` after an `EOF` is reading that number, so **a
+//! failure reported without setting it hands the caller the reason for some earlier, unrelated
+//! call**. The return value is right and the explanation is a lie — the same silent-wrong-answer
+//! shape this seam already refuses one layer down (D23's `pread` cursor), arriving as the
+//! *reason* for a failure rather than as the failure itself.
+//!
+//! Every site in this module that a guest can observe therefore does exactly one of two things,
+//! and says at the site which one and why:
+//!
+//! 1. **Sets the `errno` POSIX specifies**, which is always the one the descriptor classified.
+//!    POSIX.1-2017 XSH defines the whole ERRORS list of `fputc` (and by reference `fputs` and
+//!    `fwrite`) as the errors of `write()`, of `fgetc` (and by reference `fgets` and `fread`) as
+//!    the errors of `read()`, and of `fflush` as the errors of `write()`. So this layer never
+//!    *chooses* a number: it passes on the one [`Descriptors`] gave it.
+//! 2. **Sets none, naming the clause that makes the outcome not an error at all.** End of file is
+//!    the whole of this case. C17 7.21.8.1p3 has `fread` return a short count "if a read error
+//!    **or end-of-file** is encountered", and `feof` is how a caller tells the two apart; an
+//!    `errno` here would be an invented explanation for a normal outcome.
+//!
+//! There is deliberately no third case. The one state that would have needed one — a descriptor
+//! that takes none of a non-empty buffer and reports no error, for which neither C nor POSIX
+//! defines an `errno` — is excluded by [`Descriptors::write`]'s contract instead of being given
+//! a plausible number. See that method: an `errno` nobody can justify is worse than none, because
+//! it is a *specific, believable, wrong* reason.
+//!
+//! # The error indicator, and what it is for **here**
+//!
+//! C17 7.21.7.3p2 sets the error indicator on a write error, 7.21.5.2p3 on a failed `fflush`, and
+//! C17 7.21.10.3 has `ferror` report it. [`Stream::error`] is that indicator and it is maintained
+//! exactly as C says — but **nothing in this runtime can read it**: `ferror` and `clearerr` are
+//! imported by the APK's libraries and are neither among the 188 statically reachable imports nor
+//! bound by any adapter, so no guest call can observe the flag today. Until one does, `errno` is
+//! the *whole* of what a guest learns about why a stream operation failed, which is precisely why
+//! a missing one is a defect rather than a cosmetic omission.
 
 use crate::context::GuestContext;
 use crate::errno::consts;
@@ -125,23 +164,57 @@ pub const EOF: i32 = -1;
 pub trait Descriptors {
     /// Read into `buf`; `Ok(0)` is end of file.
     ///
+    /// **`Ok(0)` is not a failure and must not carry an `errno`.** That is `read(2)`'s own
+    /// meaning of a zero return, and C17 7.21.8.1p3 keeps the distinction alive all the way up:
+    /// `fread` returns a short count "if a read error **or** end-of-file is encountered", and
+    /// `feof` is what separates them. A descriptor that reported end of file as an error would
+    /// make every caller that loops to the end of a file report a failure that did not happen.
+    ///
     /// # Errors
     ///
-    /// The guest `errno` to report.
+    /// The guest `errno` to report. POSIX.1-2017 XSH `fgetc` defines the ERRORS list of every
+    /// reading function in this module as the errors of `read()`, so the number chosen here is
+    /// the number the guest reads out of `errno`.
     fn read(&self, fd: i32, buf: &mut [u8]) -> Result<usize, i32>;
 
     /// Write from `buf`, returning how many bytes were taken.
     ///
+    /// # `Ok(0)` is forbidden for a non-empty `buf`, and that is a contract rather than a hope
+    ///
+    /// POSIX.1-2017 XSH `write()` has **no zero return for `nbyte > 0`**: it transfers at least
+    /// one byte, or it fails and sets `errno`. Zero is defined only for `nbyte == 0`. So there is
+    /// no `errno` anywhere in C or POSIX meaning "the descriptor took none of the bytes and did
+    /// not say why" — the state does not exist on a device, so nothing had to name it.
+    ///
+    /// This layer will not invent one. `ENOSPC` would tell a guest to free space, `EAGAIN` to
+    /// retry, `EPIPE` that its reader is gone, and `EIO` that hardware failed; all four are
+    /// specific, believable and unfounded, and D23's refusal 7 already records why an
+    /// unclassified failure is refused by name rather than given `EIO`.
+    ///
+    /// **An implementation that cannot take a byte must say why with an `errno` of its own.** The
+    /// adapter enforces exactly that on its seam — `std::io::Write` is the only half of it whose
+    /// own contract permits a zero return — and turns a violation into a refusal naming the
+    /// symbol, so the guest gets a loud failure instead of `EOF` plus whatever `errno` happened
+    /// to be left over.
+    ///
+    /// The three call sites in this module still **stop** on a zero return rather than trusting
+    /// the contract, because this crate is generic over this trait and looping would be a hang
+    /// rather than a failure. Each says at the site what it does about `errno` and why.
+    ///
     /// # Errors
     ///
-    /// The guest `errno` to report.
+    /// The guest `errno` to report. POSIX.1-2017 XSH `fputc` defines the ERRORS list of every
+    /// writing function in this module as the errors of `write()`, so the number chosen here is
+    /// the number the guest reads out of `errno`.
     fn write(&self, fd: i32, buf: &[u8]) -> Result<usize, i32>;
 
     /// Push anything the layer below is holding at the operating system.
     ///
     /// # Errors
     ///
-    /// The guest `errno` to report.
+    /// The guest `errno` to report. POSIX.1-2017 XSH `fflush` defines its ERRORS list as the
+    /// errors of `write()` plus `EBADF`, and C17 7.21.5.2p3 sets the stream's error indicator
+    /// alongside it.
     fn flush(&self, fd: i32) -> Result<(), i32>;
 }
 
@@ -151,13 +224,32 @@ pub trait Descriptors {
 /// until something clears it, and the only things that can are `clearerr`, `fseek` and `rewind` —
 /// **none of which is in the reachable import set**. So within this milestone a stream that has
 /// reached its end reports it for the rest of its life, which is exactly what C promises.
+///
+/// "Not in the reachable import set" is narrower than "not imported", and the difference matters
+/// enough to state: `clearerr` and `fseek` **are** undefined dynamic symbols of the APK's
+/// libraries, they are simply not reachable from the 3,594 initializers and no adapter binds
+/// them. A phase that binds one inherits the obligation D23 narrowed around `sizeof(FILE)`, and
+/// it is the same phase that would make [`Stream::error`] observable through `ferror`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stream {
     /// The descriptor this stream reads and writes.
     pub fd: i32,
     /// Set when a read found end of file.
+    ///
+    /// C17 7.21.10.2 is what reads it (`feof`). It is **not** an error: see
+    /// [`Descriptors::read`].
     pub eof: bool,
-    /// Set when an operation failed.
+    /// Set when an operation failed — C's *error indicator*.
+    ///
+    /// Maintained where C17 says: 7.21.7.3p2 on a write error, 7.21.5.2p3 on a failed `fflush`,
+    /// and 7.21.7.2p3's read error for `fgets`.
+    ///
+    /// **Nothing in this runtime can read it.** C17 7.21.10.3's `ferror` and 7.21.10.1's
+    /// `clearerr` are imported by the APK's libraries but are neither statically reachable from
+    /// the initializers nor bound by any adapter, so the flag is bookkeeping for the phase that
+    /// binds them. Until then `errno` is the whole of what a guest learns about *why* an
+    /// operation failed, which is why a site that sets this flag and no `errno` is a defect and
+    /// not a rounding error — see the module documentation.
     pub error: bool,
 }
 
@@ -183,6 +275,17 @@ pub const fn feof(stream: &Stream) -> i32 {
 }
 
 /// `int fflush(FILE *stream)`
+///
+/// # What a failure tells the guest, and where the number comes from
+///
+/// **C17 7.21.5.2p3**: "the `fflush` function sets the error indicator for the stream and returns
+/// `EOF` if a write error occurs, otherwise it returns zero." Both halves are here.
+///
+/// **POSIX.1-2017 XSH `fflush`** supplies the `errno`, and its ERRORS list is the errors of
+/// `write()` plus `EBADF` — every one of them a condition the descriptor below is the only thing
+/// that can recognise. So the number is [`Descriptors::flush`]'s, passed on unchanged rather than
+/// chosen here; the believable wrong answer would be picking a *likely* one (`EIO`) and telling a
+/// guest whose `fflush` failed on a closed descriptor that its hardware broke.
 ///
 /// # Errors
 ///
@@ -216,6 +319,27 @@ pub fn fflush(
 /// * **Stopping *on* the newline, not after it.** The byte after the newline must still be there
 ///   for the next call. This is why the read is a byte at a time — see the module documentation.
 ///
+/// # The three ways this returns `NULL`, and which of them sets `errno`
+///
+/// A caller cannot tell them apart from the return value alone, which is why C gives it `feof`
+/// and `ferror` and POSIX gives it `errno`. All three are answered here:
+///
+/// | why | flags | `errno` | source |
+/// |---|---|---|---|
+/// | a read failed | error indicator set | the descriptor's | C17 7.21.7.2p3; POSIX.1-2017 `fgets` → `fgetc` |
+/// | end of file, nothing read | end-of-file set | **untouched** | C17 7.21.7.2p3 — not an error |
+/// | `size <= 0` | neither | **untouched** | undefined in C17 7.21.7.2; see below |
+///
+/// `size <= 0` is the one that deserves spelling out. C17 7.21.7.2p2 defines `fgets` only in
+/// terms of "at most one less than the number of characters specified by `n`" and of writing a
+/// null character after the last one read, neither of which means anything for `n <= 0`, so the
+/// call is undefined. **POSIX.1-2017 `fgets` specifies no `errno` for it either** — its ERRORS
+/// list is `fgetc`'s, and every entry there describes a transfer that was attempted and failed,
+/// where this attempts none. So nothing is read, nothing is written, and no `errno` is set:
+/// `EINVAL` would be this layer inventing a diagnosis for a call C declined to define, and a
+/// caller that logged it would be told its *argument* was rejected by a library that in fact
+/// made no complaint at all.
+///
 /// # Errors
 ///
 /// [`BionicError::Memory`] for a destination that cannot be written.
@@ -227,8 +351,9 @@ pub fn fgets(
     size: i32,
 ) -> BionicResult<u64> {
     if size <= 0 {
-        // glibc and bionic both return NULL without touching the buffer. A `size` of zero has no
-        // room even for the terminator.
+        // NULL, the buffer untouched, and **no errno**: C17 7.21.7.2 does not define the call and
+        // POSIX names no error for it, so there is nothing true to report. See the table above
+        // for why an invented `EINVAL` would be worse than the silence.
         return Ok(0);
     }
     // `size - 1` cannot underflow: `size >= 1` here.
@@ -241,6 +366,9 @@ pub fn fgets(
         }
         let mut byte = [0u8; 1];
         match descriptors.read(stream.fd, &mut byte) {
+            // End of file. The flag is set and **no `errno` is**: C17 7.21.7.2p3 makes this a
+            // return value rather than a failure, and `feof` is how a caller tells it from the
+            // error arm below. A number here would describe a file that simply ended.
             Ok(0) => {
                 stream.eof = true;
                 break;
@@ -256,11 +384,18 @@ pub fn fgets(
                 }
             }
             Err(errno) => {
+                // C17 7.21.7.2p3: a read error sets the error indicator and returns NULL, and
+                // the buffer contents are indeterminate. Nothing partial is committed, so
+                // "indeterminate" here means "unchanged", which is the stronger and safer of the
+                // two readings.
+                //
+                // The `errno` is the descriptor's, not one chosen here: POSIX.1-2017 `fgets`
+                // defines its ERRORS list as `fgetc`'s, which is `read()`'s, and the descriptor
+                // is the only layer that can tell `EBADF` from `EIO` from `EAGAIN`. Without this
+                // line the guest would read whatever the last unrelated call left behind, which
+                // is the finding this module's `errno` rule exists to close.
                 stream.error = true;
                 ctx.set_errno(errno);
-                // C: on a read error `fgets` returns NULL and the buffer contents are
-                // indeterminate. Nothing partial is committed, so "indeterminate" here means
-                // "unchanged", which is the stronger and safer of the two readings.
                 return Ok(0);
             }
         }
@@ -271,6 +406,10 @@ pub fn fgets(
     if written == 0 && stream.eof {
         // End of file with nothing read: NULL, and the buffer is left alone. Writing a NUL here
         // would be the plausible wrong answer -- it would turn "no line" into "an empty line".
+        //
+        // No `errno`, deliberately (C17 7.21.7.2p3): this NULL and the read-error NULL are
+        // different answers, and `feof` is the call that separates them. Giving this one a number
+        // would make every `while (fgets(...))` loop end by reporting a failure.
         return Ok(0);
     }
     write_all(ctx, s + written, &[0u8])?;
@@ -279,8 +418,20 @@ pub fn fgets(
 
 /// `int fputs(const char *s, FILE *stream)`
 ///
-/// Returns a non-negative value on success and `EOF` on failure. C fixes only the sign, and this
-/// returns the number of bytes written, which is what bionic does.
+/// Returns a non-negative value on success and `EOF` on failure. C fixes only the sign (C17
+/// 7.21.7.4p3: "returns `EOF` if a write error occurs; otherwise it returns a nonnegative value"),
+/// and this returns the number of bytes written, which is what bionic does.
+///
+/// # The `EOF` carries the descriptor's `errno`, except in the one state POSIX does not define
+///
+/// POSIX.1-2017 XSH `fputs` defines its ERRORS list as `fputc`'s, which is `write()`'s, so a
+/// short write that came from a failing descriptor reports that descriptor's number — set in
+/// `transfer_out`, which is where the write happens.
+///
+/// The exception is a descriptor that takes **none** of the bytes and reports no error. That is
+/// forbidden by [`Descriptors::write`]'s contract because POSIX gives `write()` no zero return
+/// for a non-empty buffer and therefore gives the state no `errno`; `transfer_out` stops on it
+/// so this cannot hang, and does not invent a number. See both.
 ///
 /// # Errors
 ///
@@ -308,6 +459,18 @@ pub fn fputs(
 /// is the interesting part: `fputc(-1, f)` writes the byte `0xff` and returns `255`, **not**
 /// `EOF`, so a caller comparing the result against `EOF` is not misled by a byte that happens to
 /// be `0xff`.
+///
+/// # What an `EOF` from here tells the guest
+///
+/// **C17 7.21.7.3p2**: "if a write error occurs, the error indicator for the stream is set and
+/// `fputc` returns `EOF`." **POSIX.1-2017 XSH `fputc`** adds the `errno`, and its ERRORS list —
+/// `EAGAIN`, `EBADF`, `EFBIG`, `EINTR`, `EIO`, `ENOSPC`, `EPIPE`, and `ENOMEM`/`ENXIO` as "may
+/// fail" — is `write()`'s. Every entry is a condition only the descriptor can recognise, so the
+/// failing arm below reports the descriptor's number and chooses none of its own.
+///
+/// The second arm is the state POSIX does not define, and it is the one this function cannot
+/// report honestly: see [`Descriptors::write`] for why it has no `errno` and why the adapter,
+/// which *can* refuse by name, is where it is stopped.
 pub fn fputc(
     ctx: &mut impl GuestContext,
     descriptors: &impl Descriptors,
@@ -319,11 +482,26 @@ pub fn fputc(
         Ok(1) => i32::from(byte),
         Ok(_) => {
             // A write that took nothing is a failure of the stream rather than a short write: one
-            // byte is either written or it is not.
+            // byte is either written or it is not. The error indicator is set, per C17
+            // 7.21.7.3p2, and `EOF` is returned.
+            //
+            // **No `errno`, and that is the decision rather than an omission.** POSIX.1-2017 XSH
+            // `write()` has no zero return for `nbyte > 0`, so no POSIX errno describes this and
+            // there is nothing true to set. The four numbers that would look right here --
+            // `ENOSPC`, `EAGAIN`, `EPIPE`, `EIO` -- each name a cause nobody observed, and a
+            // caller logging `strerror(errno)` would print a confident diagnosis of the wrong
+            // problem. `Descriptors::write`'s contract forbids the state instead, and the adapter
+            // enforces it with a refusal that names the symbol, so no guest reaches this arm
+            // through the shipping descriptor; it survives only to stop the call rather than
+            // spin, for an implementation that has broken the contract.
             stream.error = true;
             EOF
         }
         Err(errno) => {
+            // The descriptor's number, unchanged: POSIX.1-2017 XSH `fputc`'s ERRORS list is
+            // `write()`'s, and only the layer that made the call can tell those apart. Dropping
+            // this line is the defect this module's `errno` rule exists to close -- the guest
+            // would still see `EOF`, and would read the reason for some earlier call.
             stream.error = true;
             ctx.set_errno(errno);
             EOF
@@ -345,6 +523,28 @@ pub fn fputc(
 /// request for zero bytes and report success. This project has already shipped exactly that shape
 /// once (`gmtime(i64::MIN)`, D22), so the multiplication is `checked_mul` and an overflow is
 /// `EINVAL` with zero items read.
+///
+/// **Where that `EINVAL` comes from, since POSIX does not list it.** POSIX.1-2017 XSH `fread`
+/// defines its ERRORS list as `fgetc`'s, and `EINVAL` is not in it — this is a *deliberate
+/// extension*, which XSH 2.3 permits in as many words ("implementations may generate errors
+/// included in this list under circumstances other than those described here"), and it is named
+/// as an extension rather than presented as the standard's answer. It is defensible because the
+/// argument pair genuinely is invalid: `size * nmemb` is not representable, so there is no
+/// request to carry out. On a device C's unsigned arithmetic would wrap and `fread` would read
+/// the wrapped count, which is the wrong answer the wrap produces here too.
+///
+/// # The rest of the return values, and which of them set `errno`
+///
+/// | outcome | flags | `errno` | source |
+/// |---|---|---|---|
+/// | short at end of file | end-of-file set | **untouched** | C17 7.21.8.1p3 — not an error |
+/// | short on a read failure | error indicator set | the descriptor's | C17 7.21.8.1p3; POSIX `fread` → `fgetc` |
+/// | `size` or `nmemb` zero | neither | **untouched** | C17 7.21.8.1p3 — "the state of the stream remain\[s\] unchanged" |
+/// | `size * nmemb` overflows | error indicator set | `EINVAL` (extension, above) | XSH 2.3 |
+///
+/// The first row is the one worth stating rather than assuming: a file that ended is the normal
+/// way a read loop finishes, and an `errno` there would make every correct caller report a
+/// failure at the end of every file it read.
 ///
 /// # Errors
 ///
@@ -372,6 +572,9 @@ pub fn fread(
     while done < total {
         let want = ((total - done) as usize).min(TRANSFER_CHUNK);
         match descriptors.read(stream.fd, &mut buffer[..want]) {
+            // End of file: the flag, and **no `errno`**. C17 7.21.8.1p3 makes a short count at
+            // the end of a file a return value rather than a failure, and `feof` is what tells
+            // it from the error arm below. See the table on this function.
             Ok(0) => {
                 stream.eof = true;
                 break;
@@ -381,6 +584,10 @@ pub fn fread(
                 done += got as u64;
             }
             Err(errno) => {
+                // The descriptor's number, unchanged: POSIX.1-2017 XSH `fread`'s ERRORS list is
+                // `fgetc`'s, which is `read()`'s. Without this the guest gets the same short
+                // count as an ordinary end of file, `feof` answers false, and `errno` explains
+                // some earlier call.
                 stream.error = true;
                 ctx.set_errno(errno);
                 break;
@@ -394,7 +601,19 @@ pub fn fread(
 /// `size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)`
 ///
 /// Returns the number of complete items written. The multiplication is checked for the reason
-/// [`fread`] gives.
+/// [`fread`] gives, and the `EINVAL` it reports is the same named extension.
+///
+/// # A short count *is* the failure report, so it must carry the reason
+///
+/// **C17 7.21.8.2p3**: `fwrite` "returns the number of elements successfully written, which will
+/// be less than `nmemb` only if a write error is encountered." There is no `EOF` here — the count
+/// is the whole signal — so a guest that wants to know *why* has only `errno`, and
+/// POSIX.1-2017 XSH `fwrite` defines that list as `fputc`'s, which is `write()`'s. The number is
+/// therefore the descriptor's, set in `transfer_out`.
+///
+/// The single case that carries none is a descriptor that took nothing and reported no error,
+/// which POSIX gives no `errno` because `write()` cannot do it; [`Descriptors::write`] forbids it
+/// and the adapter refuses it by name.
 ///
 /// # Errors
 ///
@@ -429,6 +648,15 @@ pub fn fwrite(
 ///
 /// Returns how many bytes the descriptor took, which C's `fprintf` reports as its `int` result.
 ///
+/// # The short count is the failure report, so it carries the same `errno`
+///
+/// **C17 7.21.6.1p14**: `fprintf` "returns the number of characters transmitted, or a negative
+/// value if an output or encoding error occurred". A caller that got fewer characters than it
+/// expected has only `errno` to tell it why, and POSIX.1-2017 XSH `fprintf` defines that list as
+/// `fputc`'s, which is `write()`'s. So a failing descriptor's number is passed on here exactly as
+/// `transfer_out` passes it on for [`fwrite`]; the one state with no number is the same one,
+/// and [`Descriptors::write`] says why.
+///
 /// # Errors
 ///
 /// None today — the signature keeps [`BionicResult`] so that a caller can treat it like every
@@ -440,18 +668,24 @@ pub fn write_host_bytes(
     stream: &mut Stream,
     bytes: &[u8],
 ) -> BionicResult<u64> {
-    let _ = &ctx;
     let mut done = 0usize;
     while done < bytes.len() {
         match descriptors.write(stream.fd, &bytes[done..]) {
             Ok(0) => {
                 // As `transfer_out`: a descriptor accepting nothing is not making progress, and
                 // looping would be a hang rather than a failure.
+                //
+                // **No `errno`, for the reason `Descriptors::write` gives**: POSIX's `write()`
+                // has no zero return for a non-empty buffer, so no number describes this, and
+                // the four that would look plausible here each name a cause nobody observed.
+                // The contract forbids the state and the adapter refuses it by name; this arm
+                // exists to stop rather than to diagnose.
                 stream.error = true;
                 break;
             }
             Ok(took) => done += took,
             Err(errno) => {
+                // The descriptor's own number -- see the `fputc` arm for why none is chosen here.
                 stream.error = true;
                 ctx.set_errno(errno);
                 break;
@@ -694,6 +928,11 @@ pub fn parse_mode(mode: &[u8]) -> Result<OpenMode, ModeRefusal> {
 ///
 /// Returns how many bytes the descriptor took, which is less than `length` on a short write or an
 /// error. The chunking is the bound described in the module documentation.
+///
+/// **This is where `fputs`'s `EOF` and `fwrite`'s short count get their `errno`**, which is why
+/// both of those functions' documentation points here rather than repeating it: a failing
+/// descriptor's number is stored, and the one state POSIX gives no number to is stopped without
+/// inventing one. See [`Descriptors::write`].
 fn transfer_out(
     ctx: &mut impl GuestContext,
     descriptors: &impl Descriptors,
@@ -710,11 +949,24 @@ fn transfer_out(
             Ok(0) => {
                 // A descriptor that accepts nothing is not making progress; looping would spin
                 // forever on it, which is a hang rather than a failure.
+                //
+                // **The error indicator is set and no `errno` is** -- C17 7.21.7.4p3 and
+                // 7.21.8.2p3 make this a failure of `fputs`/`fwrite`, but POSIX.1-2017 XSH
+                // `write()` has no zero return for a non-empty buffer, so it defines no errno
+                // for the state and this layer will not invent one. `ENOSPC` would send a guest
+                // deleting files, `EAGAIN` would send it round the loop again, `EPIPE` would
+                // tell it a reader it never had is gone, and `EIO` is the number D23's refusal 7
+                // already declines to hand out for a failure nobody classified. The contract on
+                // `Descriptors::write` forbids the state; the adapter, which has a refusal
+                // channel this crate does not, turns a violation into one naming the symbol.
                 stream.error = true;
                 break;
             }
             Ok(took) => done += took as u64,
             Err(errno) => {
+                // The descriptor's number, unchanged: POSIX.1-2017 XSH `fputc` -- which is
+                // `fputs`'s and `fwrite`'s ERRORS list by reference -- is `write()`'s, and only
+                // the layer that made the call can tell `ENOSPC` from `EPIPE` from `EBADF`.
                 stream.error = true;
                 ctx.set_errno(errno);
                 break;
