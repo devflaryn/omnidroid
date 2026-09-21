@@ -151,14 +151,15 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 119, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 148, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
-    assert_eq!(Bionic::inline_symbols().count(), 111);
+    // Phase 3b adds 29, all inline: eighteen descriptor symbols and eleven `FILE *` ones.
+    assert_eq!(Bionic::inline_symbols().count(), 140);
     assert_eq!(Bionic::reentrant_symbols().count(), 8);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
-    // handler at all. 119 + 18 = 137 of the 188 the initializers reach.
+    // handler at all. 148 + 18 = 166 of the 188 the initializers reach.
     assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
 
     // **Membership, not just a total** — a count cannot see a substitution, and this project has
@@ -198,14 +199,98 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
         assert!(bound.contains(symbol), "`{symbol}` is in phase 3a's scope and is not bound");
     }
 
-    // And the complement: the groups phase 3a deliberately does not touch stay `Unbound`, so that
-    // "not done yet" and "done" cannot be confused by anyone reading the count.
-    for symbol in ["open", "close", "read", "fopen", "socket", "poll", "pthread_create", "pthread_join"] {
+    // **Phase 3b's 29, named one by one**, derived from the plan's `3b` row and cross-checked
+    // against `tools/os_surface.py`'s `file-io` bucket intersected with the reachable remainder.
+    let phase_3b = [
+        // the eighteen descriptor symbols
+        "__open_2",
+        "__write_chk",
+        "access",
+        "close",
+        "closedir",
+        "fstat",
+        "lstat",
+        "mkdir",
+        "open",
+        "opendir",
+        "pread",
+        "read",
+        "readdir",
+        "rename",
+        "rmdir",
+        "stat",
+        "statvfs",
+        "unlink",
+        // bionic's `FILE *` layer on top of them
+        "fclose",
+        "fdopen",
+        "feof",
+        "fflush",
+        "fgets",
+        "fileno",
+        "fopen",
+        "fputc",
+        "fputs",
+        "fread",
+        "fwrite",
+    ];
+    assert_eq!(phase_3b.len(), 29);
+    for symbol in phase_3b {
+        assert!(bound.contains(symbol), "`{symbol}` is in phase 3b's scope and is not bound");
+    }
+
+    // And the complement: the groups phase 3b deliberately does not touch stay `Unbound`, so that
+    // "not done yet" and "done" cannot be confused by anyone reading the count. These are the
+    // remaining 22 — eight sockets, eight threads and signals, and the six nothing else claims.
+    let still_unbound = [
+        // network (3c in the plan's table)
+        "eventfd",
+        "freeaddrinfo",
+        "gai_strerror",
+        "getaddrinfo",
+        "inet_ntop",
+        "poll",
+        "select",
+        "socket",
+        // threads and signals
+        "pthread_create",
+        "pthread_detach",
+        "pthread_getschedparam",
+        "pthread_join",
+        "pthread_sigmask",
+        "raise",
+        "sigaction",
+        "sigfillset",
+        // the remainder nothing else claims
+        "clock",
+        "time",
+        "mallinfo",
+        "longjmp",
+        "__gcov_dump",
+        "__gcov_flush",
+    ];
+    assert_eq!(still_unbound.len(), 22, "188 - 148 bound - 18 data objects");
+    for symbol in still_unbound {
         assert!(
             !bound.contains(symbol),
-            "`{symbol}` belongs to phase 3b/3c/3d and must still name itself when called"
+            "`{symbol}` belongs to a later phase and must still name itself when called"
         );
     }
+
+    // The two lists together are the whole remainder, asserted as a **set difference against the
+    // reachable file** rather than as a total: a count cannot see a substitution, and this project
+    // has had a list whose count stayed right while two members were wrong and two were missing.
+    let reachable = reachable_imports();
+    let data: std::collections::BTreeSet<&str> =
+        omni_android::bionic::DATA_OBJECTS.iter().map(|o| o.symbol).collect();
+    let remainder: std::collections::BTreeSet<String> = reachable
+        .iter()
+        .filter(|symbol| !bound.contains(symbol.as_str()) && !data.contains(symbol.as_str()))
+        .cloned()
+        .collect();
+    let expected: std::collections::BTreeSet<String> =
+        still_unbound.iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(remainder, expected, "the unbound remainder is not the list above");
 }
 
 /// **Task 2 review finding F9, asserted rather than trusted to a comment.**
@@ -784,14 +869,17 @@ fn a_long_double_conversion_is_refused_and_names_itself() {
 }
 
 /// Every symbol this phase deliberately does not implement stays `Unbound`, and its call names
-/// itself. That is the design, not a gap: a `fopen` bound to a stub returning a plausible `FILE*`
-/// would surface three thousand initializers later somewhere unrelated.
+/// itself. That is the design, not a gap: a `socket` bound to a stub returning a plausible
+/// descriptor would surface three thousand initializers later somewhere unrelated.
+///
+/// The symbol here was `fopen` until phase 3b bound it; it is `socket` now, which phase 3c will
+/// bind and which will move it on again. That churn is the test working.
 #[test]
 fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     let _guard = serialized();
     let f = fixture();
-    let thunk = f.boundary.slot_named("fopen").map(|s| s.address);
-    assert!(thunk.is_none(), "fopen must not be bound by this phase");
+    let thunk = f.boundary.slot_named("socket").map(|s| s.address);
+    assert!(thunk.is_none(), "socket must not be bound by this phase");
 
     // One that *is* declared, because the loader would have asked for it: bind it as the loader
     // would and confirm the call names it.
@@ -799,7 +887,7 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
     let builder = guest.boundary(256);
     bionic.bind_into(&builder).expect("bind");
-    let unbound = builder.declare_function("fopen").expect("a slot");
+    let unbound = builder.declare_function("socket").expect("a slot");
     let boundary = builder.finish();
     let entry = guest.next_entry();
     let mut asm = Asm::at(entry);
@@ -809,9 +897,9 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     guest.load(asm.words());
     let mut cpu = guest.thread(&boundary);
     let _active = bionic.activate().expect("a thread block");
-    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("fopen is not implemented");
+    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("socket is not implemented");
     assert!(matches!(error, AbiError::Unbound { .. }), "{error:?}");
-    assert_eq!(error.symbol(), Some("fopen"));
+    assert_eq!(error.symbol(), Some("socket"));
     assert_eq!(error.guest_address(), Some(unbound));
 }
 
@@ -822,8 +910,10 @@ fn the_unservable_printf_family_refuses_with_the_missing_piece_named() {
     let _guard = serialized();
     let f = fixture();
     for (symbol, needle) in [
-        ("fprintf", "file surface"),
-        ("vfprintf", "file surface"),
+        // Phase 3b built the stream layer these two named as missing, so their refusals now
+        // name what is *actually* missing -- the binding -- rather than a surface that exists.
+        ("fprintf", "only the binding"),
+        ("vfprintf", "only the binding"),
         ("vasprintf", "allocator"),
         ("sscanf", "scanf"),
         ("fscanf", "scanf"),
@@ -3203,4 +3293,889 @@ fn hostile_arguments_to_the_clock_and_process_group_are_typed_errors_and_not_pan
             }
         }
     }
+}
+
+// =================================================================== phase 3b: files
+
+/// A host directory that removes itself, for the guest's filesystem root.
+///
+/// Built without a dependency, and with the process id and thread id in its name so that two
+/// tests -- and two `cargo test` processes -- cannot collide on it.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let mut at = std::env::temp_dir();
+        at.push(format!(
+            "omni-bionic-fs-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(&at).expect("a scratch directory");
+        Scratch(at)
+    }
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A fixture whose instance has a filesystem rooted at a fresh scratch directory.
+///
+/// Built on `fixture_with`, which also places the eighteen data objects — because `__sF` has to
+/// exist before `stdin`, `stdout` and `stderr` can be streams over descriptors 0, 1 and 2.
+fn rooted(tag: &str) -> (Fixture, Scratch) {
+    let scratch = Scratch::new(tag);
+    let f = fixture_with(&[]);
+    f.bionic.set_filesystem_root(&scratch.0).expect("a filesystem root");
+    (f, scratch)
+}
+
+/// Read `len` bytes out of guest memory.
+fn read_guest(f: &Fixture, at: omni_cpu::GuestAddr, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|offset| {
+            let address = at + offset;
+            (f.guest.read_u64(address & !7) >> (8 * (address & 7))) as u8
+        })
+        .collect()
+}
+
+/// A little-endian `u32` read out of guest memory.
+fn read_u32_guest(f: &Fixture, at: omni_cpu::GuestAddr) -> u32 {
+    u32::from_le_bytes(read_guest(f, at, 4).try_into().expect("four bytes"))
+}
+
+/// A little-endian `u64` read out of guest memory at an arbitrary alignment.
+fn read_u64_guest(f: &Fixture, at: omni_cpu::GuestAddr) -> u64 {
+    u64::from_le_bytes(read_guest(f, at, 8).try_into().expect("eight bytes"))
+}
+
+// The guest's own `O_*`, spelled again in the test so that the constants in `files.rs` are
+// compared against a second copy rather than against themselves.
+const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0o100;
+const O_TRUNC: u64 = 0o1000;
+const O_DIRECTORY: u64 = 0o200000;
+
+/// **An instance with no filesystem root refuses every path call, by name.**
+///
+/// The default is the confinement property: there is no root until the embedding names one, so
+/// there is no way for a guest to reach a host file by accident. A refusal rather than `ENOENT`,
+/// because "this runtime was not configured" and "that file is not there" are different problems
+/// and only one of them is the guest's.
+#[test]
+fn a_guest_with_no_filesystem_root_refuses_every_path_call_by_name() {
+    let _guard = serialized();
+    let f = fixture();
+    let path = f.cstring(f.guest.data + 0x100, b"/data/anything");
+    for symbol in ["open", "stat", "lstat", "access", "unlink", "rmdir", "opendir", "statvfs"] {
+        let error = refusal_of(&f, symbol, |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, 0);
+        });
+        assert_eq!(error.symbol(), Some(symbol), "{error:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains("set_filesystem_root"),
+            "`{symbol}` must name the method that would supply a root: {text}"
+        );
+    }
+}
+
+/// A file created, written and read back **through real translated guest code**.
+///
+/// Five calls, each its own guest program: `open`, `__write_chk`, `close`, `open`, `read`. The
+/// assertion is on the *bytes*, read out of guest memory afterwards, so a handler that returned a
+/// plausible count without moving anything fails it.
+#[test]
+fn a_file_is_created_written_and_read_back_through_real_guest_code() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("roundtrip");
+    let path = f.cstring(f.guest.data + 0x100, b"/hello.txt");
+    let payload = b"the quick brown fox jumps over the lazy dog";
+    let source = f.guest.data + 0x200;
+    f.guest.write_bytes(source, payload);
+
+    let fd = value_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_WRONLY | O_CREAT | O_TRUNC);
+        asm.mov(2, 0o644);
+    }) as i64;
+    assert!(fd >= 3, "open returned {fd}");
+
+    let written = value_of(&f, "__write_chk", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, source as u64);
+        asm.mov(2, payload.len() as u64);
+        asm.mov(3, payload.len() as u64);
+    }) as i64;
+    assert_eq!(written, payload.len() as i64);
+
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+    // The host really has the file, with the bytes the guest wrote.
+    assert_eq!(std::fs::read(scratch.path("hello.txt")).expect("the host file"), payload);
+
+    let fd = value_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY);
+        asm.mov(2, 0);
+    }) as i64;
+    assert_eq!(fd, 3, "the lowest free descriptor comes back after the close");
+    let destination = f.guest.data + 0x400;
+    let read = value_of(&f, "read", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, destination as u64);
+        asm.mov(2, 256);
+    }) as i64;
+    assert_eq!(read, payload.len() as i64);
+    assert_eq!(read_guest(&f, destination, payload.len()), payload);
+    // A second read is end of file, which is zero and not an error.
+    assert_eq!(
+        value_of(&f, "read", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, destination as u64);
+            asm.mov(2, 256);
+        }) as i64,
+        0
+    );
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+}
+
+/// **The confinement property, through the boundary, against a bait file.**
+///
+/// A file is created *outside* the root and the guest is given every shape of path that would
+/// reach it. The assertion afterwards is that the bait is still there and was never read: a
+/// traversal that worked would show up as content rather than as a missing refusal.
+#[test]
+fn no_guest_path_can_reach_a_file_outside_the_instance_root() {
+    let _guard = serialized();
+    let outer = Scratch::new("outer");
+    std::fs::write(outer.path("secret.txt"), b"HOST SECRET").expect("the bait");
+    let root = outer.path("root");
+    std::fs::create_dir_all(&root).expect("the guest root");
+    let f = fixture();
+    f.bionic.set_filesystem_root(&root).expect("a filesystem root");
+
+    let attempts: &[&[u8]] = &[
+        b"/../secret.txt",
+        b"/../../secret.txt",
+        b"../secret.txt",
+        b"/a/../../secret.txt",
+        b"/./../secret.txt",
+        b"//../secret.txt",
+        br"/..\secret.txt",
+        b"/a/b/c/../../../../secret.txt",
+        b"/NUL",
+        b"/C:secret.txt",
+        b"/secret.txt.",
+    ];
+    for (index, attempt) in attempts.iter().enumerate() {
+        let path = f.cstring(f.guest.data + 0x100 + index * 0x40, attempt);
+        let entry = call_one(&f, "open", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, O_RDONLY);
+            asm.mov(2, 0);
+        });
+        let mut cpu = f.guest.thread(&f.boundary);
+        match f.run(&mut cpu, entry) {
+            // Refused outright: a traversal, a device name, an aliasing name.
+            Err(error) => assert_eq!(error.symbol(), Some("open"), "{error:?}"),
+            // Or absorbed: `/.. == /`, so the path named something inside the root that is not
+            // there. `-1` is the answer, never a descriptor.
+            Ok(_) => {
+                let fd = f.guest.read_u64(f.guest.data) as i64 as i32;
+                assert_eq!(
+                    fd,
+                    -1,
+                    "`{}` opened descriptor {fd}",
+                    String::from_utf8_lossy(attempt)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read(outer.path("secret.txt")).expect("the bait survives"),
+        b"HOST SECRET",
+        "the bait was modified"
+    );
+}
+
+/// **`struct stat`'s fields land where the guest reads them.**
+///
+/// The layout is ASSUMED — derived from Linux UAPI, with no NDK here to check it against — so the
+/// test asserts against a file whose length this test chose. A layout that moved `st_size` would
+/// report a number that is not 1,234.
+#[test]
+fn stat_lands_its_fields_where_the_guest_reads_them() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("stat");
+    std::fs::write(scratch.path("f"), vec![7u8; 1234]).expect("a file of known length");
+    std::fs::create_dir(scratch.path("d")).expect("a directory");
+    let path = f.cstring(f.guest.data + 0x100, b"/f");
+    let buf = f.guest.data + 0x400;
+
+    assert_eq!(
+        value_of(&f, "stat", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, buf as u64);
+        }) as i64,
+        0
+    );
+    let mode = read_u32_guest(&f, buf + 16);
+    assert_eq!(mode & omni_android::bionic::S_IFMT, omni_android::bionic::S_IFREG, "st_mode");
+    assert_ne!(mode & 0o200, 0, "a writable file must report S_IWUSR");
+    assert_eq!(read_u32_guest(&f, buf + 20), 1, "st_nlink");
+    assert_eq!(read_u64_guest(&f, buf + 48), 1234, "st_size");
+    assert_eq!(read_u32_guest(&f, buf + 56), 4096, "st_blksize is the size this layer transfers in");
+    assert_eq!(read_u64_guest(&f, buf + 64), 1234u64.div_ceil(512), "st_blocks");
+    assert_ne!(read_u64_guest(&f, buf + 8), 0, "st_ino must never be zero");
+    assert_ne!(read_u64_guest(&f, buf), 0, "st_dev must never be zero");
+    let file_ino = read_u64_guest(&f, buf + 8);
+
+    // A directory, through `lstat`, which is the same encoder on a different call.
+    let dir = f.cstring(f.guest.data + 0x140, b"/d");
+    assert_eq!(
+        value_of(&f, "lstat", |asm| {
+            asm.mov(0, dir as u64);
+            asm.mov(1, buf as u64);
+        }) as i64,
+        0
+    );
+    let mode = read_u32_guest(&f, buf + 16);
+    assert_eq!(mode & omni_android::bionic::S_IFMT, omni_android::bionic::S_IFDIR);
+    assert_ne!(read_u64_guest(&f, buf + 8), file_ino, "two paths must not share an inode");
+
+    // And `fstat` on an open descriptor agrees with `stat` on its path.
+    let fd = value_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY);
+        asm.mov(2, 0);
+    }) as i64;
+    assert_eq!(
+        value_of(&f, "fstat", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, buf as u64);
+        }) as i64,
+        0
+    );
+    assert_eq!(read_u64_guest(&f, buf + 48), 1234, "fstat's st_size");
+    assert_eq!(read_u64_guest(&f, buf + 8), file_ino, "one file, one inode");
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+
+    // A path that is not there is `-1`, not a zeroed structure reported as a success.
+    let missing = f.cstring(f.guest.data + 0x180, b"/nope");
+    assert_eq!(
+        value_of(&f, "stat", |asm| {
+            asm.mov(0, missing as u64);
+            asm.mov(1, buf as u64);
+        }) as i64,
+        -1
+    );
+}
+
+/// `statvfs` fills the guest's structure with the host volume's own numbers.
+///
+/// **Structural rather than numeric**: the relations that must hold for any volume, because a
+/// test that pinned a free-space figure would be asserting about this machine's disk. A fabricated
+/// filesystem has no reason to satisfy them.
+#[test]
+fn statvfs_fills_the_guests_structure_with_the_hosts_numbers() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("statvfs");
+    let path = f.cstring(f.guest.data + 0x100, b"/");
+    let buf = f.guest.data + 0x400;
+    let entry = call_one(&f, "statvfs", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, buf as u64);
+    });
+    let mut cpu = f.guest.thread(&f.boundary);
+    match f.run(&mut cpu, entry) {
+        Err(error) => {
+            // The only acceptable failure is the structural refusal on a target with no backend.
+            assert!(error.to_string().contains("statvfs(3)"), "{error}");
+            return;
+        }
+        Ok(_) => assert_eq!(f.guest.read_u64(f.guest.data) as i64, 0),
+    }
+    let field = |index: usize| read_u64_guest(&f, buf + index * 8);
+    assert!(field(0) > 0 && field(0).is_power_of_two(), "f_bsize is {}", field(0));
+    assert_eq!(field(1), field(0), "f_frsize is the allocation unit too on this host");
+    assert!(field(2) > 0, "f_blocks");
+    assert!(field(3) <= field(2), "f_bfree > f_blocks");
+    assert!(field(4) <= field(3), "f_bavail > f_bfree");
+    assert_eq!((field(5), field(6), field(7)), (0, 0, 0), "the three inode counts");
+    assert!(field(10) > 0, "f_namemax");
+}
+
+/// A directory walk: `opendir`, `readdir` to the end, `closedir`.
+///
+/// `.` and `..` come first and every entry appears exactly once. The `DIR *` and the returned
+/// `struct dirent *` are the same address, which is what makes the "valid until the next call"
+/// contract true by construction.
+#[test]
+fn a_directory_walk_returns_dot_dotdot_and_every_entry_once() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("dir");
+    std::fs::create_dir(scratch.path("d")).expect("a directory");
+    for name in ["alpha", "beta"] {
+        std::fs::write(scratch.path(&format!("d/{name}")), b"x").expect("a file");
+    }
+    std::fs::create_dir(scratch.path("d/sub")).expect("a subdirectory");
+    let path = f.cstring(f.guest.data + 0x100, b"/d");
+
+    let dirp = value_of(&f, "opendir", |asm| { asm.mov(0, path as u64); });
+    assert_ne!(dirp, 0, "opendir returned NULL");
+    assert_eq!(f.bionic.open_dirs(), 1);
+
+    let mut names = Vec::new();
+    for _ in 0..8 {
+        let entry = value_of(&f, "readdir", |asm| { asm.mov(0, dirp); });
+        if entry == 0 {
+            break;
+        }
+        assert_eq!(entry, dirp, "readdir must return the DIR's own dirent slot");
+        let ino = read_u64_guest(&f, entry as omni_cpu::GuestAddr);
+        assert_ne!(ino, 0, "d_ino must never be zero");
+        let reclen = u16::from_le_bytes(
+            read_guest(&f, entry as omni_cpu::GuestAddr + 16, 2).try_into().unwrap(),
+        );
+        assert_eq!(reclen, 280, "d_reclen");
+        let kind = read_guest(&f, entry as omni_cpu::GuestAddr + 18, 1)[0];
+        let name = f.read_cstring(entry as omni_cpu::GuestAddr + 19);
+        names.push((String::from_utf8(name).expect("a UTF-8 name"), kind));
+    }
+    assert_eq!(names[0], (".".to_string(), 4), "DT_DIR");
+    assert_eq!(names[1], ("..".to_string(), 4));
+    let mut rest: Vec<_> = names[2..].to_vec();
+    rest.sort();
+    assert_eq!(
+        rest,
+        vec![
+            ("alpha".to_string(), 8u8),
+            ("beta".to_string(), 8),
+            ("sub".to_string(), 4),
+        ],
+        "DT_REG is 8 and DT_DIR is 4"
+    );
+    assert_eq!(value_of(&f, "closedir", |asm| { asm.mov(0, dirp); }) as i64, 0);
+    assert_eq!(f.bionic.open_dirs(), 0);
+    // A `DIR *` that has been closed is `EBADF`, not a second walk of the same directory.
+    assert_eq!(value_of(&f, "closedir", |asm| { asm.mov(0, dirp); }) as i64, -1);
+}
+
+/// **The three standard streams are streams**, with the descriptors POSIX reserves.
+///
+/// `stdin`, `stdout` and `stderr` are data objects pointing into `__sF`, and phase 3b registers
+/// each of the three as a stream over descriptor 0, 1 and 2. `fileno` answering 1 for `stdout` is
+/// what proves the registration, the `FILE_BYTES` spacing and the declaration order agree.
+#[test]
+fn the_three_standard_streams_are_streams_over_the_descriptors_posix_reserves() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("std");
+    let sf = f
+        .boundary
+        .slot_named("__sF")
+        .expect("__sF is declared")
+        .address;
+    for (index, expected) in [(0usize, 0i64), (1, 1), (2, 2)] {
+        let stream = sf + index * omni_android::bionic::FILE_BYTES;
+        assert_eq!(
+            value_of(&f, "fileno", |asm| { asm.mov(0, stream as u64); }) as i64,
+            expected,
+            "`__sF[{index}]` must be descriptor {expected}"
+        );
+        assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream as u64); }) as i64, 0);
+        // `fflush` on a standard stream reaches the host's own buffered writer.
+        assert_eq!(value_of(&f, "fflush", |asm| { asm.mov(0, stream as u64); }) as i64, 0);
+    }
+    // `fflush(NULL)` walks every stream and succeeds.
+    assert_eq!(value_of(&f, "fflush", |asm| { asm.mov(0, 0); }) as i64, 0);
+    // And the `stdout` data object really points at `__sF[1]`.
+    let stdout_cell = f.boundary.slot_named("stdout").expect("stdout is declared").address;
+    assert_eq!(
+        f.guest.read_u64(stdout_cell),
+        (sf + omni_android::bionic::FILE_BYTES) as u64,
+        "stdout must point at __sF[1]"
+    );
+}
+
+/// A `FILE *` round trip: `fopen`, `fputs`, `fclose`, `fopen`, `fgets`, `feof`, `fclose`.
+#[test]
+fn a_file_stream_round_trips_through_fopen_fputs_fgets_and_fclose() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("stream");
+    let path = f.cstring(f.guest.data + 0x100, b"/lines.txt");
+    let write_mode = f.cstring(f.guest.data + 0x140, b"w");
+    let read_mode = f.cstring(f.guest.data + 0x160, b"r");
+    let line = f.cstring(f.guest.data + 0x200, b"first line\nsecond line\n");
+
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, write_mode as u64);
+    });
+    assert_ne!(stream, 0, "fopen returned NULL");
+    assert_eq!(f.bionic.open_streams(), 4, "the three standard streams plus this one");
+    assert_eq!(
+        value_of(&f, "fputs", |asm| {
+            asm.mov(0, line as u64);
+            asm.mov(1, stream);
+        }) as i64,
+        23,
+        "fputs returns the byte count bionic returns, and the two lines are 11 + 12 bytes"
+    );
+    assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64, 0);
+    assert_eq!(f.bionic.open_streams(), 3, "the slot is released");
+    assert_eq!(
+        std::fs::read(scratch.path("lines.txt")).expect("the host file"),
+        b"first line\nsecond line\n"
+    );
+
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, read_mode as u64);
+    });
+    let buf = f.guest.data + 0x400;
+    let got = value_of(&f, "fgets", |asm| {
+        asm.mov(0, buf as u64);
+        asm.mov(1, 64);
+        asm.mov(2, stream);
+    });
+    assert_eq!(got, buf as u64, "fgets returns its buffer");
+    assert_eq!(f.read_cstring(buf), b"first line\n", "the newline is kept");
+    let got = value_of(&f, "fgets", |asm| {
+        asm.mov(0, buf as u64);
+        asm.mov(1, 64);
+        asm.mov(2, stream);
+    });
+    assert_eq!(got, buf as u64);
+    assert_eq!(f.read_cstring(buf), b"second line\n", "and the second line is intact");
+    assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 0, "not at the end yet");
+    assert_eq!(
+        value_of(&f, "fgets", |asm| {
+            asm.mov(0, buf as u64);
+            asm.mov(1, 64);
+            asm.mov(2, stream);
+        }),
+        0,
+        "the third call is end of file: NULL"
+    );
+    assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 1, "and feof sticks");
+    assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64, 0);
+}
+
+/// `fread` and `fwrite` report whole items, and `fdopen` puts a stream over a descriptor.
+#[test]
+fn fread_and_fwrite_report_whole_items_over_a_descriptor_fdopen_adopted() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("items");
+    std::fs::write(scratch.path("b"), b"0123456789").expect("ten bytes");
+    let path = f.cstring(f.guest.data + 0x100, b"/b");
+    let mode = f.cstring(f.guest.data + 0x140, b"rb");
+    let fd = value_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY);
+        asm.mov(2, 0);
+    }) as i64;
+    let stream = value_of(&f, "fdopen", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, mode as u64);
+    });
+    assert_ne!(stream, 0, "fdopen returned NULL");
+    assert_eq!(value_of(&f, "fileno", |asm| { asm.mov(0, stream); }) as i64, fd);
+
+    let buf = f.guest.data + 0x400;
+    // Three items of three bytes: nine bytes, three items.
+    assert_eq!(
+        value_of(&f, "fread", |asm| {
+            asm.mov(0, buf as u64);
+            asm.mov(1, 3);
+            asm.mov(2, 3);
+            asm.mov(3, stream);
+        }),
+        3
+    );
+    assert_eq!(read_guest(&f, buf, 9), b"012345678");
+    // One byte left: no complete item, and end of file.
+    assert_eq!(
+        value_of(&f, "fread", |asm| {
+            asm.mov(0, buf as u64);
+            asm.mov(1, 3);
+            asm.mov(2, 3);
+            asm.mov(3, stream);
+        }),
+        0
+    );
+    assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 1);
+    assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64, 0);
+
+    // And `fwrite` on the way out, with `fputc` after it.
+    let out = f.cstring(f.guest.data + 0x180, b"/out");
+    let wmode = f.cstring(f.guest.data + 0x1c0, b"wb");
+    let source = f.guest.data + 0x600;
+    f.guest.write_bytes(source, &[1u8, 2, 3, 4, 5, 6]);
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, out as u64);
+        asm.mov(1, wmode as u64);
+    });
+    assert_eq!(
+        value_of(&f, "fwrite", |asm| {
+            asm.mov(0, source as u64);
+            asm.mov(1, 2);
+            asm.mov(2, 3);
+            asm.mov(3, stream);
+        }),
+        3,
+        "three items of two bytes"
+    );
+    // `fputc` returns the byte as an unsigned char: 0xff is 255, never EOF.
+    assert_eq!(
+        value_of(&f, "fputc", |asm| {
+            asm.mov(0, 0xffff_ffff_ffff_ffff);
+            asm.mov(1, stream);
+        }) as i64,
+        255
+    );
+    assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64, 0);
+    assert_eq!(
+        std::fs::read(scratch.path("out")).expect("the host file"),
+        &[1u8, 2, 3, 4, 5, 6, 0xff]
+    );
+}
+
+/// `pread` reads at an offset and leaves the descriptor's own offset alone.
+///
+/// **The regression this pins was found by the seam's own test and is worth having from the guest
+/// side too**: `FileExt::seek_read` on Windows moves the file pointer, so a `pread` built on it
+/// alone makes the next sequential `read` return end of file.
+#[test]
+fn pread_leaves_the_descriptors_own_offset_alone_for_the_guest_too() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("pread");
+    std::fs::write(scratch.path("p"), b"0123456789").expect("ten bytes");
+    let path = f.cstring(f.guest.data + 0x100, b"/p");
+    let fd = value_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY);
+        asm.mov(2, 0);
+    }) as i64;
+    let buf = f.guest.data + 0x400;
+    assert_eq!(
+        value_of(&f, "read", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, buf as u64);
+            asm.mov(2, 4);
+        }) as i64,
+        4
+    );
+    assert_eq!(read_guest(&f, buf, 4), b"0123");
+    let entry = call_one(&f, "pread", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, (buf + 0x100) as u64);
+        asm.mov(2, 3);
+        asm.mov(3, 7);
+    });
+    let mut cpu = f.guest.thread(&f.boundary);
+    match f.run(&mut cpu, entry) {
+        Err(error) => {
+            assert!(error.to_string().contains("pread(2)"), "{error}");
+            return;
+        }
+        Ok(_) => assert_eq!(f.guest.read_u64(f.guest.data) as i64, 3),
+    }
+    assert_eq!(read_guest(&f, buf + 0x100, 3), b"789");
+    // The sequential offset is untouched: the next read continues from 4.
+    assert_eq!(
+        value_of(&f, "read", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, (buf + 0x200) as u64);
+            asm.mov(2, 3);
+        }) as i64,
+        3
+    );
+    assert_eq!(read_guest(&f, buf + 0x200, 3), b"456", "pread moved the descriptor's offset");
+    // A negative offset is EINVAL rather than a wrap into a huge one.
+    assert_eq!(
+        value_of(&f, "pread", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, buf as u64);
+            asm.mov(2, 3);
+            asm.mov(3, 0xffff_ffff_ffff_ffff);
+        }) as i64,
+        -1
+    );
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+}
+
+/// The namespace calls keep POSIX's own distinctions, from real guest code.
+#[test]
+fn the_namespace_calls_keep_posixs_distinctions_from_guest_code() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("namespace");
+    let dir = f.cstring(f.guest.data + 0x100, b"/d");
+    let file = f.cstring(f.guest.data + 0x140, b"/d/f");
+    let moved = f.cstring(f.guest.data + 0x180, b"/moved");
+
+    assert_eq!(
+        value_of(&f, "mkdir", |asm| {
+            asm.mov(0, dir as u64);
+            asm.mov(1, 0o755);
+        }) as i64,
+        0
+    );
+    assert!(scratch.path("d").is_dir(), "the host directory exists");
+    assert_eq!(
+        value_of(&f, "mkdir", |asm| {
+            asm.mov(0, dir as u64);
+            asm.mov(1, 0o755);
+        }) as i64,
+        -1,
+        "a second mkdir is EEXIST"
+    );
+    std::fs::write(scratch.path("d/f"), b"body").expect("a file in it");
+    // `unlink` refuses a directory and `rmdir` refuses a file, which `std::fs` does not do for us.
+    assert_eq!(value_of(&f, "unlink", |asm| { asm.mov(0, dir as u64); }) as i64, -1);
+    assert_eq!(value_of(&f, "rmdir", |asm| { asm.mov(0, file as u64); }) as i64, -1);
+    assert_eq!(value_of(&f, "rmdir", |asm| { asm.mov(0, dir as u64); }) as i64, -1, "not empty");
+    assert_eq!(
+        value_of(&f, "rename", |asm| {
+            asm.mov(0, file as u64);
+            asm.mov(1, moved as u64);
+        }) as i64,
+        0
+    );
+    assert!(scratch.path("moved").is_file());
+    assert_eq!(value_of(&f, "rmdir", |asm| { asm.mov(0, dir as u64); }) as i64, 0, "now empty");
+    assert_eq!(value_of(&f, "unlink", |asm| { asm.mov(0, moved as u64); }) as i64, 0);
+    assert_eq!(value_of(&f, "unlink", |asm| { asm.mov(0, moved as u64); }) as i64, -1);
+
+    // `access`: F_OK, R_OK and W_OK are answered; X_OK is refused by name.
+    std::fs::write(scratch.path("a"), b"x").expect("a file");
+    let probe = f.cstring(f.guest.data + 0x1c0, b"/a");
+    for mode in [0u64, 4, 2, 6] {
+        assert_eq!(
+            value_of(&f, "access", |asm| {
+                asm.mov(0, probe as u64);
+                asm.mov(1, mode);
+            }) as i64,
+            0,
+            "access(path, {mode})"
+        );
+    }
+    let error = refusal_of(&f, "access", |asm| {
+        asm.mov(0, probe as u64);
+        asm.mov(1, 1);
+    });
+    assert_eq!(error.symbol(), Some("access"), "{error:?}");
+    assert!(error.to_string().contains("X_OK"), "{error}");
+}
+
+/// **`__open_2` refuses `O_CREAT` by name, and the refused `open` flags refuse by name.**
+///
+/// Each of these is a promise this layer cannot keep, and each has a believable wrong answer
+/// available — accept the flag and do nothing — which is the shape `mlock` was refused for.
+#[test]
+fn the_open_flags_that_cannot_be_honoured_refuse_by_name() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("flags");
+    let path = f.cstring(f.guest.data + 0x100, b"/x");
+    // `__open_2` with O_CREAT: the FORTIFY check bionic aborts on.
+    let error = refusal_of(&f, "__open_2", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_WRONLY | O_CREAT);
+    });
+    assert_eq!(error.symbol(), Some("__open_2"), "{error:?}");
+    assert!(error.to_string().contains("O_CREAT"), "{error}");
+    // And the flags whose guarantees this layer cannot meet.
+    for (flag, name) in [
+        (0o4010000u64, "O_SYNC"),
+        (0o10000u64, "O_DSYNC"),
+        (0o40000u64, "O_DIRECT"),
+        (0o10000000u64, "O_PATH"),
+        (0o20200000u64, "O_TMPFILE"),
+    ] {
+        let error = refusal_of(&f, "open", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, O_RDWR | flag);
+            asm.mov(2, 0);
+        });
+        assert!(error.to_string().contains(name), "{name}: {error}");
+    }
+    // A bit nobody defined is refused with the bits named, never masked away.
+    let error = refusal_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY | (1 << 30));
+        asm.mov(2, 0);
+    });
+    assert!(error.to_string().contains("no name for"), "{error}");
+    // `O_DIRECTORY` on a file is ENOTDIR, and on a directory it gives a descriptor that stats.
+    assert_eq!(
+        value_of(&f, "__open_2", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, O_RDONLY | O_DIRECTORY);
+        }) as i64,
+        -1
+    );
+}
+
+/// **A wild `FILE *` or `DIR *` is refused by name, never answered.**
+///
+/// `NULL` is `readdir`'s own end-of-directory answer and `EBADF` is `fileno`'s own invalid-stream
+/// answer, so either would let guest code route around a wild pointer. Every `FILE *` and `DIR *`
+/// in this guest's world came out of this layer, so one that did not is a real defect.
+#[test]
+fn a_wild_file_or_directory_pointer_is_refused_by_name() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("wild");
+    for symbol in ["feof", "fileno", "fclose", "fflush"] {
+        let error = refusal_of(&f, symbol, |asm| { asm.mov(0, 0xdead_beef_0000_1000); });
+        assert_eq!(error.symbol(), Some(symbol), "{error:?}");
+        assert!(error.to_string().contains("dead"), "{error}");
+    }
+    let error = refusal_of(&f, "readdir", |asm| { asm.mov(0, 0xdead_beef_0000_1000); });
+    assert_eq!(error.symbol(), Some("readdir"), "{error:?}");
+    // `closedir` on an unknown pointer is EBADF rather than a refusal: it is the one call whose
+    // whole job is to release a handle, and `EBADF` is what a double `closedir` gets on a device.
+    assert_eq!(value_of(&f, "closedir", |asm| { asm.mov(0, 0xdead_beef_0000_1000); }) as i64, -1);
+}
+
+/// **Hostile arguments to the file group: every one is a defined answer or a typed refusal.**
+///
+/// Null pointers, unmapped pointers, read-only destinations, descriptors nobody opened, counts
+/// past `SSIZE_MAX`, and a FORTIFY size smaller than the count. A panic or an abort reachable
+/// from any of these is Critical (Global Constraint 11), so the test asserts the *shape* of every
+/// outcome rather than a value.
+#[test]
+fn hostile_arguments_to_the_file_group_are_typed_errors_and_not_panics() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("hostile");
+    std::fs::write(scratch.path("h"), b"0123456789").expect("a file");
+    let path = f.cstring(f.guest.data + 0x100, b"/h");
+    let fd = value_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY);
+        asm.mov(2, 0);
+    });
+    let unmapped = f.guest.unmapped as u64;
+    let readonly = f.guest.readonly as u64;
+
+    let cases: &[(&str, &[u64])] = &[
+        // Null and wild paths.
+        ("open", &[0, O_RDONLY, 0]),
+        ("open", &[unmapped, O_RDONLY, 0]),
+        ("stat", &[0, f.guest.data as u64]),
+        ("lstat", &[unmapped, f.guest.data as u64]),
+        ("statvfs", &[0, f.guest.data as u64]),
+        ("access", &[0, 0]),
+        ("unlink", &[0]),
+        ("mkdir", &[unmapped, 0o755]),
+        ("rmdir", &[0]),
+        ("opendir", &[0]),
+        ("rename", &[0, 0]),
+        // Destinations that cannot be written.
+        ("stat", &[path as u64, unmapped]),
+        ("stat", &[path as u64, readonly]),
+        ("fstat", &[fd, readonly]),
+        ("statvfs", &[path as u64, unmapped]),
+        ("read", &[fd, unmapped, 16]),
+        ("read", &[fd, readonly, 16]),
+        // Descriptors nobody opened, including the negative ones a failed call returns.
+        ("read", &[0xffff_ffff_ffff_ffff, f.guest.data as u64, 16]),
+        ("close", &[0xffff_ffff_ffff_ffff]),
+        ("fstat", &[999, f.guest.data as u64]),
+        ("pread", &[999, f.guest.data as u64, 16, 0]),
+        ("__write_chk", &[999, f.guest.data as u64, 4, 4]),
+        // Counts and offsets the guest chose.
+        ("read", &[fd, f.guest.data as u64, 0xffff_ffff_ffff_ffff]),
+        ("pread", &[fd, f.guest.data as u64, 0xffff_ffff_ffff_ffff, 0]),
+        ("pread", &[fd, f.guest.data as u64, 16, 0x8000_0000_0000_0000]),
+        ("__write_chk", &[fd, f.guest.data as u64, 0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff]),
+        // A FORTIFY size smaller than the count: a detected overrun in guest code.
+        ("__write_chk", &[fd, f.guest.data as u64, 64, 8]),
+        // Zero-length transfers at a null pointer, which are legal C and must not fault.
+        ("read", &[fd, 0, 0]),
+        ("__write_chk", &[fd, 0, 0, 0]),
+        // Streams.
+        ("fopen", &[0, 0]),
+        ("fopen", &[path as u64, 0]),
+        ("fopen", &[path as u64, unmapped]),
+        ("fdopen", &[999, 0]),
+        ("fgets", &[0, 64, 0]),
+        ("fread", &[unmapped, 1, 16, 0]),
+    ];
+
+    for (symbol, args) in cases {
+        let entry = call_one(&f, symbol, |asm| {
+            for (index, value) in args.iter().enumerate() {
+                asm.mov(index as u32, *value);
+            }
+        });
+        let mut cpu = f.guest.thread(&f.boundary);
+        match f.run(&mut cpu, entry) {
+            Ok(exit) => {
+                assert!(
+                    matches!(exit, ExitReason::Returned { .. }),
+                    "`{symbol}` {args:x?}: {exit:?}"
+                );
+                let value = f.guest.read_u64(f.guest.data) as i64;
+                assert!(
+                    value == 0 || value == -1 || value >= 0,
+                    "`{symbol}` {args:x?} completed with {value}"
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.symbol(), Some(*symbol), "{error:?}");
+                assert!(error.guest_address().is_some(), "{error}");
+            }
+        }
+    }
+}
+
+/// The descriptor and stream ceilings are `EMFILE`, and they are real bounds.
+///
+/// A guest that leaks descriptors in a loop would otherwise hold as many host handles as it
+/// liked, and several instances share one host process.
+#[test]
+fn the_descriptor_and_stream_ceilings_report_emfile_rather_than_growing() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("ceilings");
+    std::fs::write(scratch.path("c"), b"x").expect("a file");
+    let path = f.cstring(f.guest.data + 0x100, b"/c");
+    let mode = f.cstring(f.guest.data + 0x140, b"r");
+
+    let mut opened = 0usize;
+    loop {
+        let fd = value_of(&f, "open", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, O_RDONLY);
+            asm.mov(2, 0);
+        }) as i64;
+        if fd < 0 {
+            break;
+        }
+        opened += 1;
+        assert!(opened <= omni_platform::fs::MAX_OPEN_FILES, "the descriptor ceiling never fired");
+    }
+    assert_eq!(
+        opened,
+        omni_platform::fs::MAX_OPEN_FILES - 3,
+        "three of the descriptors are the standard streams"
+    );
+    // And a `fopen` now fails too, because it needs a descriptor first.
+    assert_eq!(
+        value_of(&f, "fopen", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, mode as u64);
+        }),
+        0
+    );
 }

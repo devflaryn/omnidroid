@@ -203,9 +203,18 @@ pub(super) fn install(
     // `stdin`, `stdout`, `stderr`: `FILE *` variables, pointing at the three members of `__sF`.
     // That is what bionic does, and it is what makes `stdout == &__sF[1]` hold for a guest
     // translation unit compiled against an old NDK header where `stdout` *was* that macro.
+    //
+    // **Each one is also registered as a stream over its POSIX descriptor**, which is what makes
+    // `fputs(s, stdout)` and `fileno(stderr)` work in phase 3b. The registration is keyed by the
+    // guest address, so the `FILE` bytes here stay zeroed and are never interpreted — see
+    // `stdio`'s module documentation for why that is what keeps `FILE_BYTES` harmless.
     for (index, symbol) in ["stdin", "stdout", "stderr"].into_iter().enumerate() {
         let cell = at(symbol);
-        mem.write_u64(cell, (sf + index * FILE_BYTES) as u64, blame(symbol, cell))?;
+        let stream = sf + index * FILE_BYTES;
+        mem.write_u64(cell, stream as u64, blame(symbol, cell))?;
+        // `index` is 0, 1, 2 -- which are STDIN_FILENO, STDOUT_FILENO and STDERR_FILENO, and that
+        // correspondence is the whole reason the three are declared in this order.
+        bionic.register_stream(stream, index as i32);
     }
 
     // `environ`: `char **environ`. It points at a vector of `char *` terminated by a null, and

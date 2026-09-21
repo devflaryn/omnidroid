@@ -332,9 +332,13 @@ pub(super) fn fprintf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     refuse(
         c,
         &format!(
-            "writing to the guest FILE * at {stream:#x} needs host file surface, and \
-             omni-platform has none yet: it is virtual memory and faults only. The formatting \
-             half of this call is implemented and reachable through snprintf"
+            "writing to the guest FILE * at {stream:#x} means formatting into a stream, and \
+             this layer has not bound the printf family onto one. **Both halves now exist**: the \
+             formatting is `format::render`, which `snprintf` and `__android_log_print` already \
+             go through, and the stream is phase 3b's `stdio`. What is missing is only the \
+             binding, which phase 3b deliberately left out of its scope of the 29 file-io \
+             symbols. NOTE: this refusal used to say `omni-platform has no file surface`, which \
+             was true until phase 3b and is not any more"
         ),
     )
 }
@@ -345,8 +349,8 @@ pub(super) fn vfprintf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     refuse(
         c,
         &format!(
-            "writing to the guest FILE * at {stream:#x} needs host file surface, and \
-             omni-platform has none yet"
+            "writing to the guest FILE * at {stream:#x} means formatting into a stream. As \
+             `fprintf`: both halves exist as of phase 3b and only the binding is missing"
         ),
     )
 }

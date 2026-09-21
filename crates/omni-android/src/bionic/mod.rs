@@ -39,16 +39,19 @@
 mod clocks;
 mod data;
 mod dl;
+mod files;
 mod format;
 mod guestmem;
 mod handlers;
 mod logging;
 mod procenv;
 mod runtime;
+mod stdio;
 mod view;
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -59,7 +62,9 @@ use omni_bionic::mutex::OwnerTable;
 use omni_bionic::threads::GuestThreadId;
 use omni_bionic::tls::TlsRegistry;
 use omni_elf::loader::DlPhdrInfo;
+use omni_bionic::stdio::Stream;
 use omni_mem::{CommitPolicy, GuestAddr, GuestSpace, Placement, Protection};
+use omni_platform::fs::Filesystem;
 use parking_lot::Mutex;
 
 use crate::boundary::{BoundaryBuilder, ImportCall, ImportFn, ReentrantFn};
@@ -67,6 +72,9 @@ use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
 
 pub use data::{DataObject, GuestProcess, DATA_OBJECTS, FILE_BYTES};
+pub use files::{
+    errno_for, DIRENT_BYTES, STATVFS_BYTES, STAT_BYTES, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
+};
 pub use logging::LogRecord;
 pub use omni_platform::log::Priority as LogPriority;
 pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
@@ -98,8 +106,34 @@ pub const MAX_GUEST_THREADS: usize = 64;
 /// refusal naming the symbol, never a silent overwrite.
 pub const POOL_BYTES: usize = 4096;
 
-/// Bytes of guest address space the arena occupies: the per-thread blocks, then the pool.
-pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES + POOL_BYTES;
+/// How many `FILE` objects one instance can hand out beyond the three standard streams.
+///
+/// **A policy number.** Each costs [`FILE_BYTES`] of the arena and one entry in the stream table,
+/// and the three standard streams do not come out of it — they live in `__sF`, which the boundary
+/// already placed. A `fopen` past this is `EMFILE`, which is the answer a real device gives when a
+/// process runs out of streams and one every correct caller already branches on.
+///
+/// It is smaller than [`omni_platform::fs::MAX_OPEN_FILES`] on purpose: a descriptor is cheaper
+/// than a stream, and a guest holding 32 streams open during static initialisation is doing
+/// something this layer wants to hear about.
+pub const MAX_GUEST_FILES: usize = 32;
+
+/// How many directory streams one instance can hand out.
+///
+/// Matched to [`omni_platform::fs::MAX_OPEN_DIRS`] so the two ceilings cannot disagree: a larger
+/// arena would hand out a slot the seam then refused, and a smaller one would leave the seam's own
+/// ceiling unreachable and untested.
+pub const MAX_GUEST_DIRS: usize = omni_platform::fs::MAX_OPEN_DIRS;
+
+/// Bytes of guest address space the arena occupies.
+///
+/// The per-thread blocks, the pool, the `FILE` objects `fopen` hands out, and one `struct dirent`
+/// per open directory stream. **All of it is mapped once, in [`Bionic::new`]**, which is F9's
+/// constraint: a handler may not map guest memory, and `fopen` and `opendir` are handlers.
+pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
+    + POOL_BYTES
+    + MAX_GUEST_FILES * FILE_BYTES
+    + MAX_GUEST_DIRS * DIRENT_BYTES;
 
 /// The longest a single guest `nanosleep` or `usleep` may block a host thread.
 ///
@@ -184,6 +218,30 @@ pub struct Bionic {
     /// Whether records also reach the host's standard error. On by default: that is what a real
     /// run wants, and a suite that does not want it says so.
     log_to_stderr: AtomicBool,
+
+    // ---------------------------------------------------------------- phase 3b: files
+    /// The guest's filesystem: one host directory every guest path is resolved inside.
+    ///
+    /// **`None` until the embedding names one, and that default is load-bearing.** A guest with no
+    /// root has no filesystem at all and every path-taking symbol refuses by name. A default would
+    /// have to be *somewhere* — the process's working directory, or a temporary one — and either
+    /// would let untrusted guest code read and write host files nobody decided to expose. See
+    /// [`Bionic::set_filesystem_root`] and `files`' module documentation.
+    ///
+    /// A `OnceLock` rather than a `Mutex<Option<..>>`: the root may be set once and never moved.
+    /// Changing it while the guest runs would let a descriptor opened under one root be read under
+    /// another, which is a confinement hole with a legitimate-looking API in front of it.
+    fs: OnceLock<Filesystem>,
+    /// The `st_dev` every file on that root reports. Derived once, from the root's own path.
+    fs_device: OnceLock<u64>,
+    /// The open `FILE *` streams, keyed by the guest address the object was placed at.
+    ///
+    /// **The guest's `FILE` bytes are never read**, which is what keeps the unverified
+    /// [`FILE_BYTES`] from being able to produce a wrong answer; `stdio`'s module documentation
+    /// has the whole argument.
+    streams: Mutex<BTreeMap<GuestAddr, Stream>>,
+    /// The open directory streams: the guest `DIR *`, and the seam's handle behind it.
+    dirs: Mutex<BTreeMap<GuestAddr, i32>>,
 }
 
 /// One loaded image, as `dl_iterate_phdr` reports it.
@@ -257,6 +315,10 @@ impl Bionic {
             log_ring: Mutex::new(VecDeque::new()),
             log_dropped: AtomicU64::new(0),
             log_to_stderr: AtomicBool::new(true),
+            fs: OnceLock::new(),
+            fs_device: OnceLock::new(),
+            streams: Mutex::new(BTreeMap::new()),
+            dirs: Mutex::new(BTreeMap::new()),
         });
         // `gmtime_r`'s `tm_zone` is a `const char *` the guest dereferences, so it has to point at
         // something for the whole life of the instance. Interned here, before any guest code runs
@@ -439,6 +501,183 @@ impl Bionic {
     #[must_use]
     pub fn pool(&self) -> GuestAddr {
         self.arena + MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
+    }
+
+    // ------------------------------------------------------------------ phase 3b: files
+
+    /// Give this guest instance a filesystem, confined to `root`.
+    ///
+    /// **Every guest path — `/data/...`, `/system/...`, `/proc/...` — is resolved inside this
+    /// directory**, by rules applied before any host call is made; `omni_platform::fs::path` has
+    /// the policy and enumerates the hostile cases. Until this is called the instance has no
+    /// filesystem and every path-taking guest symbol refuses by name, naming this method.
+    ///
+    /// There is deliberately no default and no way to unset it. A default root would have to be
+    /// the process's working directory or a temporary one, and either would hand untrusted guest
+    /// code host files nobody decided to expose; allowing it to *change* would let a descriptor
+    /// opened under one root be read under another.
+    ///
+    /// Call it during setup. It maps nothing and writes no guest memory, so it is not bound by
+    /// F9's constraint — but the guest refuses every file call made before it.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] if `root` does not exist, is not a directory, or if this instance
+    /// already has one.
+    pub fn set_filesystem_root(&self, root: impl AsRef<Path>) -> AbiResult<()> {
+        let filesystem = Filesystem::new(root.as_ref()).map_err(|error| AbiError::Refused {
+            symbol: "open".to_string(),
+            address: self.arena,
+            why: error.to_string(),
+        })?;
+        let device = omni_platform::fs::identity(filesystem.root());
+        if self.fs.set(filesystem).is_err() {
+            return Err(AbiError::Refused {
+                symbol: "open".to_string(),
+                address: self.arena,
+                why: format!(
+                    "this guest instance already has a filesystem root (`{}`). It may be set once \
+                     and never moved: a descriptor opened under one root must not become readable \
+                     under another",
+                    self.fs.get().map_or_else(String::new, |fs| fs.root().display().to_string())
+                ),
+            });
+        }
+        let _ = self.fs_device.set(device);
+        Ok(())
+    }
+
+    /// The guest's filesystem, or `None` if the embedding has not supplied a root.
+    #[must_use]
+    pub fn filesystem(&self) -> Option<&Filesystem> {
+        self.fs.get()
+    }
+
+    /// The `st_dev` every file on this instance's root reports.
+    ///
+    /// One number per root, non-zero, derived from the root's own path — so two instances with two
+    /// roots report two devices, which is what "these are different filesystems" means to the
+    /// `(st_dev, st_ino)` identity test guest code makes.
+    #[must_use]
+    pub fn filesystem_device(&self) -> u64 {
+        *self.fs_device.get().unwrap_or(&1)
+    }
+
+    /// First address of the `FILE` object table.
+    #[must_use]
+    pub fn files_base(&self) -> GuestAddr {
+        self.pool() + POOL_BYTES
+    }
+
+    /// First address of the `struct dirent` table.
+    #[must_use]
+    pub fn dirents_base(&self) -> GuestAddr {
+        self.files_base() + MAX_GUEST_FILES * FILE_BYTES
+    }
+
+    /// Register a stream at a guest address the boundary already placed — the three `__sF` ones.
+    pub(crate) fn register_stream(&self, at: GuestAddr, fd: i32) {
+        self.streams.lock().insert(at, Stream::new(fd));
+    }
+
+    /// Hand out a `FILE` object for `fd`, or `None` when the table is full.
+    ///
+    /// The object's bytes are zeroed, and that is the only time they are ever written. A zeroed
+    /// bionic `FILE` has `_flags == 0`, which that library's own `__sfp` calls a free slot — so the
+    /// bytes say "not an open stream", which is true and safe, rather than describing one.
+    ///
+    /// The arena is already mapped, in [`Bionic::new`], so this writes into memory this process
+    /// owns rather than mapping any: F9's constraint is that a handler may not map, and `fopen` is
+    /// a handler.
+    pub(crate) fn open_stream(
+        &self,
+        view: &view::GuestView<'_>,
+        fd: i32,
+    ) -> AbiResult<Option<GuestAddr>> {
+        let mut streams = self.streams.lock();
+        let base = self.files_base();
+        let free = (0..MAX_GUEST_FILES)
+            .map(|index| base + index * FILE_BYTES)
+            .find(|at| !streams.contains_key(at));
+        let Some(at) = free else {
+            return Ok(None);
+        };
+        view.mem().write_bytes(
+            at,
+            &[0u8; FILE_BYTES],
+            Blame::new(view.symbol(), view.address(), 0),
+        )?;
+        streams.insert(at, Stream::new(fd));
+        Ok(Some(at))
+    }
+
+    /// The stream a guest `FILE *` names.
+    #[must_use]
+    pub fn stream_of(&self, file: u64) -> Option<Stream> {
+        GuestAddr::try_from(file).ok().and_then(|at| self.streams.lock().get(&at).copied())
+    }
+
+    /// Store a stream's flags back after an operation changed them.
+    ///
+    /// **The step that is easy to forget.** `omni_bionic::stdio` takes a `&mut Stream`, and a
+    /// handler that dropped the mutated copy would leave `feof` answering false forever after an
+    /// end of file.
+    pub(crate) fn update_stream(&self, file: u64, stream: Stream) {
+        if let Ok(at) = GuestAddr::try_from(file) {
+            if let Some(slot) = self.streams.lock().get_mut(&at) {
+                *slot = stream;
+            }
+        }
+    }
+
+    /// Release a `FILE` object's slot.
+    pub(crate) fn close_stream(&self, file: u64) -> Option<Stream> {
+        GuestAddr::try_from(file).ok().and_then(|at| self.streams.lock().remove(&at))
+    }
+
+    /// Every open stream's guest `FILE *`, which is what `fflush(NULL)` walks.
+    #[must_use]
+    pub fn stream_pointers(&self) -> Vec<u64> {
+        self.streams.lock().keys().map(|at| *at as u64).collect()
+    }
+
+    /// How many streams this instance holds open.
+    #[must_use]
+    pub fn open_streams(&self) -> usize {
+        self.streams.lock().len()
+    }
+
+    /// Give a directory stream a guest `DIR *`: the address of its own `struct dirent` slot.
+    ///
+    /// **The `DIR *` IS the slot**, which makes `readdir`'s contract — "the returned pointer stays
+    /// valid until the next call on this `DIR`" — true by construction rather than by bookkeeping,
+    /// and makes two streams over one directory structurally unable to overwrite each other's
+    /// entry.
+    pub(crate) fn attach_dir(&self, id: i32) -> Option<GuestAddr> {
+        let mut dirs = self.dirs.lock();
+        let base = self.dirents_base();
+        let free = (0..MAX_GUEST_DIRS)
+            .map(|index| base + index * DIRENT_BYTES)
+            .find(|at| !dirs.contains_key(at))?;
+        dirs.insert(free, id);
+        Some(free)
+    }
+
+    /// The seam handle a guest `DIR *` names.
+    #[must_use]
+    pub fn dir_for(&self, dirp: u64) -> Option<i32> {
+        GuestAddr::try_from(dirp).ok().and_then(|at| self.dirs.lock().get(&at).copied())
+    }
+
+    /// Release a directory stream's slot.
+    pub(crate) fn detach_dir(&self, dirp: u64) -> Option<i32> {
+        GuestAddr::try_from(dirp).ok().and_then(|at| self.dirs.lock().remove(&at))
+    }
+
+    /// How many directory streams this instance holds open.
+    #[must_use]
+    pub fn open_dirs(&self) -> usize {
+        self.dirs.lock().len()
     }
 
     /// Take `len` zeroed, 8-byte-aligned bytes out of the pool.

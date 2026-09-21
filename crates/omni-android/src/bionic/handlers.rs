@@ -24,11 +24,16 @@
 //!
 //! # What is deliberately not here
 //!
-//! **Files, directories, sockets and polling, and thread lifecycle.** Each needs host surface
-//! `omni-platform` still does not have — files and directories are phase 3b, sockets 3c, thread
-//! lifecycle 3d — and each keeps the boundary's own
+//! **Sockets and polling, and thread lifecycle.** Each needs host surface `omni-platform` still
+//! does not have — sockets are phase 3c, thread lifecycle 3d — and each keeps the boundary's own
 //! [`Binding::Unbound`](crate::Binding::Unbound), whose call names the symbol and the guest
 //! address. That is exactly the failure that is wanted, rather than a plausible zero.
+//!
+//! Files and directories **are** here as of phase 3b, with bionic's `FILE *` layer on top of
+//! them: eighteen descriptor symbols in `files` and eleven stream symbols in `stdio`. They are
+//! the first group where a guest argument names something *outside* this process — a path — and
+//! the whole of what stops that being a host file is `omni-platform`'s rooted filesystem, which
+//! an instance does not have until the embedding supplies one.
 //!
 //! Clocks, process information and logging **are** here as of phase 3a, and with them the first
 //! growth of `omni-platform` past `vm` and `fault`. Four of those symbols are bound and **refuse
@@ -49,7 +54,8 @@ use crate::error::{AbiError, AbiResult};
 
 use super::view::GuestView;
 use super::{
-    active, clocks, dl, enter, format, guestmem, logging, procenv, runtime::CallThreads,
+    active, clocks, dl, enter, files, format, guestmem, logging, procenv, runtime::CallThreads,
+    stdio,
 };
 
 // ------------------------------------------------------------------ result lifting
@@ -880,6 +886,42 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("syslog", logging::syslog),
     ("openlog", logging::openlog),
     ("closelog", logging::closelog),
+    // ---- phase 3b: files and directories. Eighteen descriptor-level symbols over
+    // `omni-platform`'s rooted filesystem seam. They are inline rather than re-entrant because
+    // none of them calls guest code and none reaches `GuestSpace`: they read and write guest
+    // memory, which `memcpy` already does from the fast path, and the arena a `FILE` or a
+    // `dirent` lands in was mapped in `Bionic::new` (F9).
+    ("open", files::open),
+    ("__open_2", files::open_2),
+    ("close", files::close),
+    ("read", files::read),
+    ("pread", files::pread),
+    ("__write_chk", files::write_chk),
+    ("access", files::access),
+    ("stat", files::stat),
+    ("fstat", files::fstat),
+    ("lstat", files::lstat),
+    ("statvfs", files::statvfs),
+    ("rename", files::rename),
+    ("unlink", files::unlink),
+    ("mkdir", files::mkdir),
+    ("rmdir", files::rmdir),
+    ("opendir", files::opendir),
+    ("readdir", files::readdir),
+    ("closedir", files::closedir),
+    // ---- phase 3b: bionic's `FILE *` layer, over those descriptors. The stream logic is in
+    // `omni-bionic` (D19) and what is here is the binding from a guest `FILE *` to a stream.
+    ("fopen", stdio::fopen),
+    ("fdopen", stdio::fdopen),
+    ("fclose", stdio::fclose),
+    ("feof", stdio::feof),
+    ("fflush", stdio::fflush),
+    ("fgets", stdio::fgets),
+    ("fileno", stdio::fileno),
+    ("fputc", stdio::fputc),
+    ("fputs", stdio::fputs),
+    ("fread", stdio::fread),
+    ("fwrite", stdio::fwrite),
 ];
 
 /// Serviced on the **exit** path: 80-102 ns per call.
