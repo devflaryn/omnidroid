@@ -1057,6 +1057,17 @@ impl Bionic {
         self.vma_names.lock().iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 
+    /// Who holds the mutex at a guest address, according to the host-side authority.
+    ///
+    /// The guest word at `+4` carries only the low 32 bits of the owner and is a witness; this
+    /// is the table `omni-bionic`'s mutex calls actually decide on. Exposed because a guest
+    /// blocked in `pthread_mutex_lock` is diagnosable only from another thread, and "who holds
+    /// it" is the question.
+    #[must_use]
+    pub fn mutex_owner(&self, address: u64) -> Option<GuestThreadId> {
+        self.owners.get(address)
+    }
+
     /// The futex, for a test that wants its activity counters.
     #[must_use]
     pub fn futex(&self) -> &AddressFutex {

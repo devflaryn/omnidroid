@@ -96,7 +96,13 @@ impl OwnerTable {
         self.owners.lock().unwrap().insert(addr, owner);
     }
 
-    fn get(&self, addr: u64) -> Option<GuestThreadId> {
+    /// Who holds the mutex at `addr`, if anybody.
+    ///
+    /// Public because a guest blocked in `pthread_mutex_lock` can only be diagnosed from another
+    /// thread, and "who holds it" is the question. It is a read of the same table the lock and
+    /// unlock paths decide on, so it cannot disagree with them.
+    #[must_use]
+    pub fn get(&self, addr: u64) -> Option<GuestThreadId> {
         self.owners.lock().unwrap().get(&addr).copied()
     }
 

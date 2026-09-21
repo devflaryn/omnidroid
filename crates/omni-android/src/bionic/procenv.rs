@@ -870,6 +870,8 @@ fn syscall_name(number: i64) -> Option<&'static str> {
     })
 }
 
+/// `gettid`, in the asm-generic numbering arm64 Linux uses.
+const SYS_GETTID: i64 = 178;
 /// `rt_sigprocmask`, in the asm-generic numbering arm64 Linux uses.
 const SYS_RT_SIGPROCMASK: i64 = 135;
 /// `sizeof(sigset_t)` as the kernel's `rt_sigprocmask` requires it, and as D24 records it.
@@ -983,6 +985,43 @@ pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     if number == SYS_RT_SIGPROCMASK {
         return rt_sigprocmask(c, (a1 as i64, a2, a3, a4));
+    }
+    if number == SYS_GETTID {
+        // **`gettid` is a thread identity, and this runtime has one.**
+        //
+        // Found by M3's gate, and found the expensive way: a guest thread created during static
+        // initialisation called it *while holding a recursive mutex*, the refusal killed that
+        // thread, and the main thread then deadlocked on the lock it never released. The whole
+        // contract of `gettid` is "a value that identifies this thread within this process, and
+        // is not the same as any other live thread's" -- `GuestThreadId` is exactly that, and it
+        // is better than the kernel's in one respect: it is never recycled.
+        //
+        // bionic has no `gettid` symbol to import on an old NDK, which is why the engine issues
+        // the raw syscall rather than calling one.
+        //
+        // **What this does not give the guest** is a value that means anything to the operating
+        // system: it names no `/proc/<pid>/task` entry and cannot be passed to `tgkill`. Neither
+        // exists here -- there is no `/proc` and `raise` already refuses -- so there is nothing a
+        // guest could do with a "real" one that it cannot do with this.
+        let state = active(c.symbol(), c.address())?;
+        let Some(thread) = state.bionic.current_thread() else {
+            return Err(refuse(
+                c,
+                "the calling thread is not attached to this instance, so it has no identity to                  report. A host that runs guest code holds a `Bionic::activate` guard across it"
+                    .to_string(),
+            ));
+        };
+        let Ok(narrowed) = i32::try_from(thread.0) else {
+            return Err(refuse(
+                c,
+                format!(
+                    "this guest instance has reached thread identity {}, which does not fit the                      guest's `pid_t` (an int). Truncating it would hand two live threads the                      same id",
+                    thread.0
+                ),
+            ));
+        };
+        c.ret().i32(narrowed);
+        return Ok(());
     }
     let named = syscall_name(number).map_or_else(String::new, |name| format!(" (arm64 `{name}`)"));
     Err(refuse(

@@ -53,6 +53,8 @@ pub struct AddressFutex {
     /// Diagnostics only: how many waits and wakes have been performed.
     waits: AtomicU64,
     wakes: AtomicU64,
+    /// The guest address of the most recent park. See [`AddressFutex::parked_on`].
+    last_wait: AtomicU64,
 }
 
 impl AddressFutex {
@@ -71,6 +73,17 @@ impl AddressFutex {
     pub fn activity(&self) -> (u64, u64) {
         (self.waits.load(Ordering::Relaxed), self.wakes.load(Ordering::Relaxed))
     }
+
+    /// The guest address of the most recent park, or `0` if nothing has parked.
+    ///
+    /// **What a stuck guest looks like from another thread.** A guest blocked here executes no
+    /// guest instructions, so nothing on its own thread reports again; this says *which object*
+    /// it is blocked on, and the caller can then read that object's bytes out of guest memory.
+    /// One relaxed store on a path that is about to sleep.
+    #[must_use]
+    pub fn parked_on(&self) -> u64 {
+        self.last_wait.load(Ordering::Relaxed)
+    }
 }
 
 impl Futex for AddressFutex {
@@ -79,6 +92,7 @@ impl Futex for AddressFutex {
         // `omni-bionic` passes a meaningful `expected`.
         let _ = expected;
         self.waits.fetch_add(1, Ordering::Relaxed);
+        self.last_wait.store(addr, Ordering::Relaxed);
         let deadline = timeout.map(|t| Instant::now() + t);
         // SAFETY: `parking_lot_core::park` requires that the key is not concurrently used by
         // another parking implementation with incompatible invariants, that `validate`,

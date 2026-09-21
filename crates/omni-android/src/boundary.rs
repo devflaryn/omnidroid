@@ -421,6 +421,7 @@ impl BoundaryBuilder {
             crossings: Mutex::new(Crossings::default()),
             code_watch: CodeWatch::default(),
             census: AtomicBool::new(false),
+            last_call: AtomicUsize::new(0),
         })
     }
 }
@@ -679,6 +680,8 @@ pub struct Boundary {
     code_watch: CodeWatch,
     /// Whether every crossing counts itself. See [`Boundary::start_census`].
     census: AtomicBool,
+    /// The address of the slot the most recent crossing was for. See [`Boundary::last_call`].
+    last_call: AtomicUsize,
 }
 
 impl Boundary {
@@ -808,11 +811,28 @@ impl Boundary {
         )
     }
 
+    /// The symbol the guest most recently branched into, while the census was on.
+    ///
+    /// **The one thing that identifies a guest parked inside a handler.** A guest blocked on a
+    /// futex, a condition variable or a join executes no guest instructions, so no budget
+    /// expires and nothing on its own thread will report again; another thread reading this is
+    /// what says which import it went into. Recorded only under the census, for the reason
+    /// [`start_census`](Boundary::start_census) gives about the 33 ns path.
+    #[must_use]
+    pub fn last_call(&self) -> Option<&Slot> {
+        let address = self.last_call.load(Ordering::Relaxed);
+        if address == 0 {
+            return None;
+        }
+        self.slots.get(&address)
+    }
+
     /// Charge one crossing to a slot, if a host asked for the census.
     #[inline]
     fn count(&self, slot: &Slot) {
         if self.census.load(Ordering::Relaxed) {
             slot.calls.fetch_add(1, Ordering::Relaxed);
+            self.last_call.store(slot.address, Ordering::Relaxed);
         }
     }
 

@@ -380,6 +380,68 @@ fn run_initializers(
 ) -> Run {
     use std::io::Write;
     let _active = guest.bionic.activate().expect("publish the instance to this thread");
+    // `OMNI_INIT_TRACE=1` prints every initializer index before it runs. See the call site.
+    let trace = std::env::var_os("OMNI_INIT_TRACE").is_some();
+    // `OMNI_INIT_WATCHDOG=<seconds>` reports what the run is doing from *another* thread.
+    //
+    // **The one diagnostic that works when the guest is blocked rather than looping.** A guest
+    // parked inside a handler -- on a futex, a condition variable, a join -- executes no guest
+    // instructions, so no step budget expires and nothing on this thread will ever print again.
+    // The watchdog reads the boundary's census and the instance's thread table, both of which are
+    // `Sync`, and says which symbol was last entered and how many guest threads are live.
+    let watchdog = std::env::var("OMNI_INIT_WATCHDOG")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let me = guest.bionic.current_thread();
+    if let Some(seconds) = watchdog {
+        let progress = Arc::clone(&progress);
+        let boundary = Arc::clone(&guest.boundary);
+        let bionic = Arc::clone(&guest.bionic);
+        boundary.start_census();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(seconds));
+            let mut called: Vec<(&str, u64)> = boundary
+                .census()
+                .map(|c| c.into_iter().collect())
+                .unwrap_or_default();
+            called.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            let _ = writeln!(
+                std::io::stderr(),
+                "WATCHDOG: at init_array[{}], last import `{}`, {} live guest threads,                  crossings {:?}
+  futex {:?} parked on {:#x} = {:016x} {:016x}, owner {:?}, this thread {:?}
+                   thread records {}, failures {:?}
+  top imports: {:?}",
+                progress.load(std::sync::atomic::Ordering::Relaxed),
+                boundary.last_call().map_or("-", |slot| slot.symbol.as_str()),
+                bionic.live_guest_threads(),
+                boundary.crossings(),
+                bionic.futex().activity(),
+                bionic.futex().parked_on(),
+                boundary
+                    .mem()
+                    .read_u64(
+                        bionic.futex().parked_on() as omni_cpu::GuestAddr,
+                        omni_android::Blame::new("watchdog", 0, 0),
+                    )
+                    .unwrap_or(0),
+                boundary
+                    .mem()
+                    .read_u64(
+                        bionic.futex().parked_on() as omni_cpu::GuestAddr + 8,
+                        omni_android::Blame::new("watchdog", 0, 0),
+                    )
+                    .unwrap_or(0),
+                bionic.mutex_owner(bionic.futex().parked_on()),
+                me,
+                bionic.guest_thread_records(),
+                bionic.guest_thread_failures(),
+                &called[..called.len().min(12)]
+            );
+            let _ = std::io::stderr().flush();
+        });
+    }
+
     let mut completed = Vec::with_capacity(guest.object.init_array.len());
     let mut stopped = None;
     let mut guest_instructions = 0u64;
@@ -390,6 +452,19 @@ fn run_initializers(
         // The caller name is what a reader three thousand initializers deep actually needs: which
         // of 3,594, not a bare guest address.
         let caller = format!("init_array[{index}]");
+        progress.store(index, std::sync::atomic::Ordering::Relaxed);
+        if trace {
+            // **Before the call, flushed.** A run that stops because the guest is *blocked* in a
+            // handler prints nothing at all afterwards, and the index it stopped on is the only
+            // thing that identifies it -- an instruction budget cannot reach a parked host
+            // thread. Gated on the environment so an ordinary run is not 3,594 lines.
+            let _ = writeln!(
+                std::io::stderr(),
+                "IN  [{index}] {target:#x} vaddr={:#x}",
+                target - guest.object.base
+            );
+            let _ = std::io::stderr().flush();
+        }
         match guest.boundary.call_guest(cpu, &caller, target, &guest.process_args, limit) {
             Ok(_) => completed.push((index, target)),
             Err(error) => {
@@ -403,6 +478,35 @@ fn run_initializers(
             }
         }
         guest_instructions = guest_instructions.saturating_add(cpu.last_run_instructions());
+        // **A guest thread that died is reported here, not waited for.**
+        //
+        // M3's gate found this the expensive way: an initializer started a guest thread, that
+        // thread took a *recursive* mutex and then hit a refusal, and it died holding the lock.
+        // The main thread blocked on that mutex for ever, and a blocked host thread executes no
+        // guest instructions -- so `PER_INITIALIZER` could never expire and the gate hung with
+        // nothing printed. `Bionic::guest_thread_failures` already knew why; nothing asked it.
+        //
+        // Checked after every initializer rather than at the end, so the report names the
+        // initializer that started the thread rather than the one that later deadlocked.
+        if stopped.is_none() {
+            let failures = guest.bionic.guest_thread_failures();
+            if let Some(failure) = failures.first() {
+                let error = AbiError::Refused {
+                    symbol: "pthread_create".to_string(),
+                    address: target,
+                    why: format!(
+                        "a guest thread this instance started has died: thread {}, entry point                          {:#x}, because {}. It is reported here rather than waited for: a thread                          that dies holding a mutex deadlocks whoever takes that mutex next, and a                          blocked host thread executes no guest instructions, so no step budget                          can ever end the wait",
+                        failure.thread, failure.start_routine, failure.why
+                    ),
+                };
+                if on_failure == OnFailure::Stop {
+                    stopped = Some((index, target, error));
+                    break;
+                }
+                let _ = writeln!(std::io::stderr(), "THREAD[{index}] {error}");
+                let _ = std::io::stderr().flush();
+            }
+        }
         if on_failure == OnFailure::Continue && index % 100 == 99 {
             let _ = writeln!(
                 std::io::stderr(),
