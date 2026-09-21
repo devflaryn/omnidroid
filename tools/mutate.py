@@ -2960,8 +2960,12 @@ directory", ADAPTER_FILES,
     # what came back.
     ("dl-A5", "A", "dlopen issues a handle for a library this runtime does not supply",
      ADAPTER_DL,
-     """                    None => {""",
-     """                    None if false => {""",
+     """                        ));
+                        0
+                    }""",
+     """                        ));
+                        HANDLE_TAG | (libraries.len() as u64 + 1)
+                    }""",
      ANDROID),
 
     # `_SC_PAGESIZE` off by one. This is the shape D22 refused to risk for three phases: the real
@@ -3038,10 +3042,20 @@ directory", ADAPTER_FILES,
     # `/dev/urandom` reading end-of-file. Zero is `/dev/null`'s answer, one entry along, and it is
     # what `std::random_device` gets when the file is not there -- the guest's C++ runtime then
     # throws `system_error` and terminates, which is how the gate found the device was needed.
-    ("plat-A11", "A", "/dev/urandom reads end of file instead of entropy",
+    # A **short read** from `/dev/urandom`. A modern one always fills the buffer, and
+    # `std::random_device` reads four bytes at a time with no loop -- so a partial fill leaves the
+    # rest of the caller's buffer holding whatever was there, which is the believable wrong
+    # answer: the bytes did change, and some of them are not entropy.
+    ("plat-A11", "A", "/dev/urandom fills only half the buffer",
      PLAT_FS,
-     """                Device::Random => {""",
-     """                Device::Random if false => {""",
+     """                    })?;
+                    Ok(buf.len())
+                }
+                Device::Null => Ok(0),""",
+     """                    })?;
+                    Ok(buf.len() / 2)
+                }
+                Device::Null => Ok(0),""",
      PLATFORM),
 
     # The over-correction: every path under `/dev` becomes a device. A guest opening
