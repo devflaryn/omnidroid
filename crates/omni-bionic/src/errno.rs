@@ -51,6 +51,13 @@ pub mod consts {
     pub const ENOSPC: i32 = 28;
     /// Illegal seek: an offset operation on a pipe or a standard stream.
     pub const ESPIPE: i32 = 29;
+    /// Broken pipe: a write to a pipe whose every read end is closed.
+    ///
+    /// On a device this arrives with `SIGPIPE`, whose default disposition terminates the process,
+    /// so a caller normally sees the signal rather than the errno. This runtime delivers no
+    /// signals (D24), so the errno is the whole of what the guest gets — which is what a caller
+    /// that has set `SIG_IGN` sees on a device, and is the form every correct caller branches on.
+    pub const EPIPE: i32 = 32;
     /// Read-only filesystem.
     pub const EROFS: i32 = 30;
     /// Invalid argument.
@@ -126,6 +133,7 @@ mod tests {
         assert_eq!(EFBIG, 27);
         assert_eq!(ENOSPC, 28);
         assert_eq!(ESPIPE, 29);
+        assert_eq!(EPIPE, 32, "the pipe group's own, added in M5");
         assert_eq!(EROFS, 30);
         assert_eq!(EINVAL, 22);
         assert_eq!(EDOM, 33);
@@ -152,7 +160,7 @@ mod tests {
     fn the_errno_values_are_all_distinct() {
         let all = [
             EPERM, ENOENT, ESRCH, EINTR, EIO, EBADF, EAGAIN, ENOMEM, EACCES, EBUSY, EEXIST, ENOTDIR,
-            EISDIR, EMFILE, EFBIG, ENOSPC, ESPIPE, EROFS, EINVAL, EDOM, ERANGE, EDEADLK,
+            EISDIR, EMFILE, EFBIG, ENOSPC, ESPIPE, EPIPE, EROFS, EINVAL, EDOM, ERANGE, EDEADLK,
             ENAMETOOLONG, ENOSYS, ENOTEMPTY, ELOOP, EOVERFLOW, ENOTSUP, EAFNOSUPPORT, ETIMEDOUT,
             EOWNERDEAD, ENOTRECOVERABLE,
         ];

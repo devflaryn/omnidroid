@@ -171,6 +171,26 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
         "getcwd",
         "M4 gate, called three times by nativeSetAssetPath while the engine canonicalises the asset directory.",
     ),
+    (
+        "pipe",
+        "M5, read out of the binary rather than out of a run: jni-surface.md §5.2 decodes \
+         initializeNativeCode at 0x0285b750 and finds pipe() twice -- once for the \
+         msgread/msgwrite pair the ALooper watches, once in GameActivity_onCreate for the glue's \
+         own command pipe. The file's LAST section says the initializers never reach it.",
+    ),
+    (
+        "fcntl",
+        "M5, from the same decoding: fcntl(F_SETFL, O_NONBLOCK) on both ends of both pipes. The \
+         file's LAST section, as `pipe`.",
+    ),
+    (
+        "write",
+        "M5. The file's Tier C section -- reached only through an address-taken edge -- so it is \
+         outside the 188 although `read` and `__write_chk` are inside them. \
+         android_native_app_glue writes one APP_CMD byte into the pipe per message, and the \
+         engine carries that code's own diagnostic \"Failure writing android_app cmd: %s\" in \
+         .rodata.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -221,7 +241,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 176, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 179, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -233,15 +253,19 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // needs the boundary's symbol table and `ImportCall` deliberately cannot reach it. So
     // 157 + 5 - 3 = 159 inline and 11 + 3 = 14 re-entrant.
     // **M4's gate adds three more** -- `strnlen`, `gmtime`, `getcwd` -- all inline, for 162.
-    // Each of the eight is a symbol `libroblox.so` imports that the static closure did not
+    // **M5 adds three**, `pipe`, `fcntl` and `write`, also inline, for 165. They are the first
+    // entries in `BEYOND_THE_PREDICTION` found by *decoding* the guest's instructions
+    // (jni-surface.md §5.2) rather than by watching a run reach them, which is why they could be
+    // bound before the call that needs them exists.
+    // Each of the eleven is a symbol `libroblox.so` imports that the static closure did not
     // predict. D17 says 188 is a lower bound; this is by how much, so far.
-    assert_eq!(Bionic::inline_symbols().count(), 162);
+    assert_eq!(Bionic::inline_symbols().count(), 165);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
-    // null, which is what the guest's own null test expects. 173 - 5 + 18 + 2 = 188, which is
-    // every one of the imports the initializers were *predicted* to reach; the five are what the
-    // prediction missed.
+    // null, which is what the guest's own null test expects. The identity below is what makes the
+    // total meaningful: everything bound, minus what the prediction missed, plus the data objects
+    // and the two absent ones, is exactly the 188 the initializers were predicted to reach.
     assert_eq!(symbols.len() - BEYOND_THE_PREDICTION.len() + 18 + 2, 188);
     assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
     assert_eq!(omni_android::bionic::ABSENT_SYMBOLS.len(), 2);
@@ -6017,6 +6041,25 @@ fn revents_of(f: &Fixture, at: omni_cpu::GuestAddr, index: usize) -> i16 {
     i16::from_le_bytes([bytes[0], bytes[1]])
 }
 
+/// Make a pipe through real guest code and return `(read end, write end)`.
+///
+/// Through the guest's own `pipe`, not through `Filesystem::pipe`, so what is tested is the
+/// handler and the `int[2]` it writes as well as the seam underneath.
+fn pipe_through_guest(f: &Fixture) -> (i32, i32) {
+    let at = f.guest.data + 0x40;
+    // A sentinel in both slots, so "wrote nothing" and "wrote zero" are distinguishable.
+    f.guest.write_u64(at, 0x5A5A_5A5A_5A5A_5A5A);
+    let returned = value_of(f, "pipe", |asm| {
+        asm.mov(0, at as u64);
+    });
+    assert_eq!(returned as i64, 0, "pipe() failed");
+    let bytes = read_guest(f, at, 8);
+    (
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    )
+}
+
 /// Open a file through real guest code and return the descriptor.
 fn open_through_guest(f: &Fixture, path: &str, flags: u64) -> i32 {
     let at = f.cstring(f.guest.data + 0x80, path.as_bytes());
@@ -6773,15 +6816,22 @@ fn the_four_network_refusals_name_the_missing_piece() {
     assert!(error.to_string().contains("void"), "{error}");
 }
 
-/// **The descriptor space `poll` and `select` answer over is closed, asserted mechanically.**
+/// **Every symbol that produces a descriptor has had its readiness decided, asserted
+/// mechanically.**
 ///
-/// This is the paragraph to invalidate, written as a test. `poll` reports every open descriptor
-/// as ready because every descriptor in this runtime is a regular file, a directory or a standard
-/// stream — and that is true only while nothing binds a symbol that produces a descriptor which
-/// can block. The day a phase binds `socket`, `eventfd`, `pipe` or `epoll_create` for real, this
-/// fails, and `net`'s always-ready rule has to grow a real readiness source with it.
+/// This test's predecessor asserted something stronger and now false: that the descriptor space
+/// was closed under kinds that *cannot block*, so `poll` could report every open descriptor as
+/// ready. D25 wrote down what it was for — "the day a phase binds `socket` for real, that test
+/// fails and this module has to grow a real readiness source with it" — and **M5 was that day**,
+/// with `pipe` rather than `socket`.
+///
+/// It was replaced rather than updated, which is the distinction that matters: updating it would
+/// have kept a green test that no longer asserted anything. What it asserts now is that the list
+/// of descriptor-producing symbols bound here is exactly the list whose readiness
+/// `omni-platform`'s `Entry::readiness` has decided, so binding an eleventh one without deciding
+/// still fails.
 #[test]
-fn the_descriptor_space_poll_answers_over_is_closed() {
+fn every_symbol_that_produces_a_descriptor_has_had_its_readiness_decided() {
     let bound: std::collections::BTreeSet<&str> = Bionic::bound_symbols().collect();
     // Every POSIX symbol that hands out a descriptor, whether or not it is in the reachable 188.
     let descriptor_makers = [
@@ -6793,11 +6843,11 @@ fn the_descriptor_space_poll_answers_over_is_closed() {
         descriptor_makers.iter().copied().filter(|s| bound.contains(s)).collect();
     assert_eq!(
         present,
-        vec!["eventfd", "open", "__open_2", "opendir", "socket"],
+        vec!["eventfd", "open", "__open_2", "opendir", "pipe", "socket"],
         "a symbol that produces a descriptor was bound without `poll` being told about it"
     );
-    // And of those five, the two that would produce a descriptor which can block are refusals —
-    // asserted by calling them, because a comment saying so is not a fact.
+    // Of those six, the two that would produce a descriptor whose readiness nothing here models
+    // are still refusals — asserted by calling them, because a comment saying so is not a fact.
     let _guard = serialized();
     let f = fixture();
     for symbol in ["socket", "eventfd"] {
@@ -6808,9 +6858,92 @@ fn the_descriptor_space_poll_answers_over_is_closed() {
         });
         assert!(
             matches!(error, AbiError::Refused { .. }),
-            "`{symbol}` must refuse for `poll`'s always-ready rule to hold: {error:?}"
+            "`{symbol}` must refuse: nothing in this runtime models a socket's readiness, and \
+             `poll` would have to answer for one: {error:?}"
         );
     }
+}
+
+/// **The kinds that are modelled each answer for themselves, through real guest code.**
+///
+/// A file is always ready; an empty pipe's read end is not readable and its write end is; and the
+/// same read end is readable the moment a byte is in it. *A count of ready descriptors cannot see
+/// any of that* — every assertion here is on the named entry's own `revents`, which is this
+/// project's first rule about counts.
+#[test]
+fn poll_reports_a_pipes_real_readiness_and_not_merely_that_it_is_open() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("poll-pipe");
+    std::fs::write(scratch.path("a.bin"), b"hello").expect("a file to poll");
+    let file_fd = open_through_guest(&f, "/a.bin", O_RDONLY);
+    assert!(file_fd >= 3, "a real descriptor: {file_fd}");
+
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    const POLLHUP: i16 = 0x010;
+
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    assert!(read_fd >= 3 && write_fd > read_fd, "a real pipe: {read_fd} and {write_fd}");
+
+    let at = f.guest.data + 0x400;
+    let mut array = Vec::new();
+    array.extend_from_slice(&pollfd(file_fd, POLLIN | POLLOUT));
+    array.extend_from_slice(&pollfd(read_fd, POLLIN));
+    array.extend_from_slice(&pollfd(write_fd, POLLOUT));
+    f.guest.write_bytes(at, &array);
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 3);
+        asm.mov(2, 0);
+    });
+    assert_eq!(revents_of(&f, at, 0), POLLIN | POLLOUT, "a file is ready for both");
+    assert_eq!(revents_of(&f, at, 1), 0, "an empty pipe's read end is not readable");
+    assert_eq!(revents_of(&f, at, 2), POLLOUT, "an empty pipe's write end is writable");
+    assert_eq!(returned as i64, 2, "the count agrees, which is the weaker statement");
+
+    // One byte through the guest's own `write`, and the read end changes its answer.
+    let payload = f.cstring(f.guest.data + 0x80, b"!");
+    let written = value_of(&f, "write", |asm| {
+        asm.mov(0, write_fd as u64);
+        asm.mov(1, payload as u64);
+        asm.mov(2, 1);
+    });
+    assert_eq!(written as i64, 1, "one byte into the pipe");
+    f.guest.write_bytes(at, &pollfd(read_fd, POLLIN));
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 0);
+    });
+    assert_eq!(revents_of(&f, at, 0), POLLIN, "a pipe with a byte in it is readable");
+    assert_eq!(returned as i64, 1);
+
+    // And with the write end closed and the byte drained, the read end reports `POLLHUP` —
+    // **whether or not it was asked for**, which is what makes the canonical drain loop see end
+    // of file instead of spinning.
+    let buffer = f.guest.data + 0x200;
+    let read = value_of(&f, "read", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, buffer as u64);
+        asm.mov(2, 16);
+    });
+    assert_eq!(read as i64, 1, "the one byte comes back");
+    let closed = value_of(&f, "close", |asm| {
+        asm.mov(0, write_fd as u64);
+    });
+    assert_eq!(closed as i64, 0);
+    f.guest.write_bytes(at, &pollfd(read_fd, POLLIN));
+    let returned = value_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 0);
+    });
+    assert_eq!(
+        revents_of(&f, at, 0),
+        POLLIN | POLLHUP,
+        "end of file is readable, and POLLHUP is reported without being asked for"
+    );
+    assert_eq!(returned as i64, 1);
 }
 
 // =================================================================== phase 3e: the last four
@@ -7194,8 +7327,9 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         );
     }
 
-    // **The split is over the 188 the static closure predicted**, so the eight symbols M3's and
-    // M4's gates found outside it are subtracted rather than folded in: they are not part of
+    // **The split is over the 188 the static closure predicted**, so the eleven symbols M3's and
+    // M4's gates found outside it — and M5 decoded out of the binary — are subtracted rather than
+    // folded in: they are not part of
     // what Task 1 predicted, and counting them here would make the total right for the wrong
     // reason -- the exact failure shape this project has made five times.
     let bound = Bionic::bound_symbols().count() - BEYOND_THE_PREDICTION.len();

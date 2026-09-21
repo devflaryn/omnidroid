@@ -433,6 +433,14 @@ pub fn errno_for(kind: FsErrorKind) -> Option<i32> {
         FsErrorKind::ReadOnlyFilesystem => consts::EROFS,
         FsErrorKind::BadDescriptor => consts::EBADF,
         FsErrorKind::NameTooLong => consts::ENAMETOOLONG,
+        // **Added in M5, when `pipe` made a descriptor that can block.** Both are the guest's own
+        // answers for a pipe and both have a branch in every correct caller: `EAGAIN` for a
+        // non-blocking end with nothing to do, `EPIPE` for a write whose readers have all gone.
+        FsErrorKind::WouldBlock => consts::EAGAIN,
+        FsErrorKind::BrokenPipe => consts::EPIPE,
+        // `FsErrorKind::Other` and nothing else. It is spelled as a wildcard because the enum is
+        // `#[non_exhaustive]`, and a kind added upstream without a decision here must refuse by
+        // name rather than acquire a plausible errno.
         _ => return None,
     })
 }
@@ -772,6 +780,76 @@ pub(super) fn pread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// Write `count` bytes of guest memory to `fd`, in [`IO_BLOCK`] pieces.
+///
+/// Returns the bytes transferred, or the `errno` for a failure that happened before any byte was.
+/// A failure *after* some bytes have gone reports the short count, which is what `write(2)` does:
+/// the error is reported by the next call.
+///
+/// **A short write is a real answer here, and it was not before.** Until a pipe existed, every
+/// descriptor took whatever it was given; a pipe takes what fits. `Settled::Done(0)` therefore
+/// ends the loop rather than spinning — a descriptor that took nothing and reported no error has
+/// no more room, and the count so far is what the guest is told.
+fn write_from_guest(
+    view: &mut GuestView<'_>,
+    fd: i32,
+    buf: u64,
+    count: u64,
+) -> AbiResult<Settled<i64>> {
+    let fs = filesystem(view)?;
+    let mut done = 0u64;
+    let mut chunk = vec![0u8; IO_BLOCK];
+    while done < count {
+        let want = ((count - done) as usize).min(IO_BLOCK);
+        let at = guest_address(view, buf + done)?;
+        let bytes = view.mem().read_bytes(at, want, Blame::new(view.symbol(), view.address(), 1))?;
+        chunk[..want].copy_from_slice(&bytes);
+        match settle(view, fs.write(fd, &chunk[..want]))? {
+            Settled::Done(0) => break,
+            Settled::Done(took) => done += took as u64,
+            Settled::Failed(errno) => {
+                if done == 0 {
+                    return Ok(Settled::Failed(errno));
+                }
+                break;
+            }
+        }
+    }
+    Ok(Settled::Done(done as i64))
+}
+
+/// `ssize_t write(int fd, const void *buf, size_t count)`
+///
+/// **Bound in M5, and outside the 188** — the reachable list puts it in the Tier C section, and
+/// what needs it is `android_native_app_glue`, which writes one `APP_CMD_*` byte into the pipe
+/// per message (`jni-surface.md` §5.2, and the engine carries the glue's own diagnostic
+/// `"Failure writing android_app cmd: %s"` in `.rodata`).
+///
+/// `__write_chk` has been here since phase 3b and is the FORTIFY form of this; both now go
+/// through the same loop, so a difference between them can only be the `buf_size` check that is
+/// the whole point of the FORTIFY form.
+pub(super) fn write(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, count) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = transfer(c, &state, |view| {
+        if count > MAX_COUNT {
+            return Ok(Settled::Failed(consts::EINVAL));
+        }
+        if count == 0 {
+            // C: zero bytes. POSIX leaves the result unspecified for anything but a regular file
+            // and says nothing is written; the seam is not called at all, so a zero-length write
+            // at a null pointer does not fault.
+            return Ok(Settled::Done(0));
+        }
+        write_from_guest(view, fd, buf, count)
+    })?;
+    c.ret().u64(result as u64);
+    Ok(())
+}
+
 /// `ssize_t __write_chk(int fd, const void *buf, size_t count, size_t buf_size)`
 ///
 /// bionic's FORTIFY form of `write`. `buf_size` is the compiler's knowledge of how large the
@@ -799,30 +877,7 @@ pub(super) fn write_chk(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         if count == 0 {
             return Ok(Settled::Done(0));
         }
-        let fs = filesystem(view)?;
-        let mut done = 0u64;
-        let mut chunk = vec![0u8; IO_BLOCK];
-        while done < count {
-            let want = ((count - done) as usize).min(IO_BLOCK);
-            let at = guest_address(view, buf + done)?;
-            let bytes = view.mem().read_bytes(
-                at,
-                want,
-                Blame::new(view.symbol(), view.address(), 1),
-            )?;
-            chunk[..want].copy_from_slice(&bytes);
-            match settle(view, fs.write(fd, &chunk[..want]))? {
-                Settled::Done(0) => break,
-                Settled::Done(took) => done += took as u64,
-                Settled::Failed(errno) => {
-                    if done == 0 {
-                        return Ok(Settled::Failed(errno));
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(Settled::Done(done as i64))
+        write_from_guest(view, fd, buf, count)
     })?;
     c.ret().u64(result as u64);
     Ok(())
@@ -1244,6 +1299,181 @@ pub(super) fn closedir(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             Settled::Failed(errno) => {
                 view.set_errno(errno);
                 -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+// ================================================================== pipes and descriptor flags
+//
+// **Neither symbol is among the 188 the initializers reach**, and both are imports of
+// `libroblox.so`. They are here because `jni-surface.md` §5.2 decodes `initializeNativeCode` and
+// finds `pipe()` + `fcntl(F_SETFL, O_NONBLOCK)` twice before the call can return -- once in the
+// constructor, for the `msgread`/`msgwrite` pair the `ALooper` watches, and once in
+// `GameActivity_onCreate`, for the glue's own command pipe.
+//
+// Binding `pipe` is what ended the closed-descriptor-space argument `net` used to make; that
+// module's documentation records what replaced it.
+
+/// `F_GETFL`: read the descriptor's status flags. Linux `asm-generic/fcntl.h`.
+const F_GETFL: i32 = 3;
+/// `F_SETFL`: set the descriptor's status flags.
+const F_SETFL: i32 = 4;
+
+/// The `fcntl` commands this layer knows the names of.
+///
+/// **The whole list, not the ones that seemed likely.** A command absent from it still refuses,
+/// with its raw number, which is still a measurement — but a named one tells whoever reads the
+/// failure what the engine was trying to do.
+const FCNTL_COMMANDS: &[(i32, &str)] = &[
+    (0, "F_DUPFD"),
+    (1, "F_GETFD"),
+    (2, "F_SETFD"),
+    (3, "F_GETFL"),
+    (4, "F_SETFL"),
+    (5, "F_GETLK"),
+    (6, "F_SETLK"),
+    (7, "F_SETLKW"),
+    (8, "F_SETOWN"),
+    (9, "F_GETOWN"),
+    (10, "F_SETSIG"),
+    (11, "F_GETSIG"),
+    (1024, "F_SETLEASE"),
+    (1025, "F_GETLEASE"),
+    (1026, "F_NOTIFY"),
+    (1030, "F_DUPFD_CLOEXEC"),
+    (1031, "F_SETPIPE_SZ"),
+    (1032, "F_GETPIPE_SZ"),
+];
+
+/// Name an `fcntl` command, or render its number.
+fn fcntl_command_name(command: i32) -> String {
+    FCNTL_COMMANDS
+        .iter()
+        .find(|(number, _)| *number == command)
+        .map_or_else(|| format!("command {command}"), |(_, name)| (*name).to_string())
+}
+
+/// `int pipe(int pipefd[2])`
+///
+/// Writes the read end into `pipefd[0]` and the write end into `pipefd[1]` as **one** access, so
+/// a destination that is only partly writable leaves the guest neither descriptor rather than
+/// one — the same all-or-nothing shape [`write_struct`] exists for, and the direction review
+/// finding M1 says to err in.
+///
+/// **If the write fails, both descriptors are closed again.** The other order is not available:
+/// the numbers do not exist until the pipe does. Leaving them open would hand the guest a leak it
+/// cannot close, because it never learned what to close.
+pub(super) fn pipe(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let pipefd = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        if pipefd == 0 {
+            // POSIX: `EFAULT`. A refusal rather than `-1`, for the reason `path_for` gives — a
+            // guest that ignored the return would carry two uninitialised descriptors forward.
+            return Err(view.refusal("`pipe` was given a null `pipefd` pointer"));
+        }
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.pipe())? {
+            Settled::Done((read_fd, write_fd)) => {
+                let mut bytes = [0u8; 8];
+                bytes[..4].copy_from_slice(&read_fd.to_le_bytes());
+                bytes[4..].copy_from_slice(&write_fd.to_le_bytes());
+                if let Err(error) = write_struct(&view, pipefd, &bytes, 0) {
+                    let _ = fs.close(read_fd);
+                    let _ = fs.close(write_fd);
+                    return Err(error);
+                }
+                0
+            }
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int fcntl(int fd, int cmd, ...)`
+///
+/// **Two commands, and every other one refuses with the command named.** `F_GETFL` and `F_SETFL`
+/// are what §5.2 needs: the glue sets `O_NONBLOCK` on both ends of both pipes, and reads nothing
+/// back.
+///
+/// Variadic. It is a fourteenth variadic import rather than a correction to Task 2's count of
+/// thirteen, which was over the 188 — `fcntl` is outside them.
+///
+/// # What `F_SETFL` accepts, and why the rest is a refusal rather than a mask
+///
+/// Linux's `F_SETFL` ignores every bit except `O_APPEND`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` and
+/// `O_NONBLOCK`. Ignoring bits is exactly the believable-wrong-answer shape this project refuses:
+/// a guest that set `O_ASYNC` and was told it worked would wait for a signal that never comes. So
+/// `O_NONBLOCK` is honoured, a zero clears it, and any other bit is refused with the bits named.
+///
+/// # What `F_GETFL` does **not** answer
+///
+/// The access mode. This seam does not record `O_RDONLY`/`O_RDWR` in a form `fcntl` could return,
+/// and a fabricated `O_RDWR` is precisely the value a guest would branch on. Only the one status
+/// flag this layer models is answered; the rest of the word is zero, which is a true statement
+/// about every flag `F_SETFL` here can set.
+pub(super) fn fcntl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, command, argument) = {
+        let mut a: Args<'_> = c.args();
+        (a.next_i32()?, a.next_i32()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        if !fs.is_open(fd) {
+            view.set_errno(consts::EBADF);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        match command {
+            F_GETFL => match settle(&view, fs.is_nonblocking(fd))? {
+                Settled::Done(true) => O_NONBLOCK,
+                Settled::Done(false) => 0,
+                Settled::Failed(errno) => {
+                    view.set_errno(errno);
+                    -1
+                }
+            },
+            F_SETFL => {
+                let flags = argument as i32;
+                let unhandled = flags & !O_NONBLOCK;
+                if unhandled != 0 {
+                    return Err(view.refusal(format!(
+                        "the guest called `fcntl(F_SETFL)` with {unhandled:#x} beyond O_NONBLOCK. \
+                         Linux ignores every bit but O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME and \
+                         O_NONBLOCK, and ignoring one here would tell the guest a flag took \
+                         effect when nothing in this runtime implements it -- a guest that set \
+                         O_ASYNC would wait for a signal that never arrives"
+                    )));
+                }
+                match settle(&view, fs.set_nonblocking(fd, flags & O_NONBLOCK != 0))? {
+                    Settled::Done(()) => 0,
+                    Settled::Failed(errno) => {
+                        view.set_errno(errno);
+                        -1
+                    }
+                }
+            }
+            other => {
+                return Err(view.refusal(format!(
+                    "the guest called `fcntl` with {} on fd {fd}. This layer implements F_GETFL \
+                     and F_SETFL(O_NONBLOCK), which is what the GameActivity glue needs for its \
+                     two pipes (jni-surface.md §5.2). Every other command asks for something this \
+                     runtime does not have: a second descriptor for one description, a \
+                     close-on-exec flag with nothing to exec, a record lock, a signal owner, or a \
+                     pipe capacity this layer fixes at omni_platform::fs::PIPE_CAPACITY",
+                    fcntl_command_name(other)
+                )));
             }
         }
     };

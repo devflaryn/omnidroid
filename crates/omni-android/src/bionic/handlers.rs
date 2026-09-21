@@ -966,6 +966,12 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("opendir", files::opendir),
     ("readdir", files::readdir),
     ("closedir", files::closedir),
+    // ---- M5: the two §5.2 needs before `initializeNativeCode` can return. Neither is among the
+    // 188 the initializers reach, and binding `pipe` is what ended `net`'s closed-descriptor-space
+    // argument -- see that module for what replaced it.
+    ("pipe", files::pipe),
+    ("fcntl", files::fcntl),
+    ("write", files::write),
     // ---- phase 3b: bionic's `FILE *` layer, over those descriptors. The stream logic is in
     // `omni-bionic` (D19) and what is here is the binding from a guest `FILE *` to a stream.
     ("fopen", stdio::fopen),

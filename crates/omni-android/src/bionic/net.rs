@@ -25,42 +25,58 @@
 //! fabricated for Linux or macOS either — which is D22's other half: a primitive that calls no OS
 //! API must not be given one, because that is a false claim in the other direction.
 //!
-//! # Why `poll` and `select` need no operating system, stated as a closed argument
+//! # Why `poll` and `select` need no operating system — the argument, and the day it changed
 //!
-//! Not "they are easy", and not "nothing polls during static initialisation". The argument is
-//! that **the descriptor space they observe is entirely this runtime's own, and POSIX fixes the
-//! answer for every kind in it**:
+//! Until M5 the argument was that **the descriptor space they observe is entirely this runtime's
+//! own, and none of the kinds in it can block**: every descriptor was a regular file, a directory
+//! or one of the three standard streams, `socket` and `eventfd` refused by name, and `pipe` was
+//! not among the 188 at all. So `poll` reported every open descriptor as ready, which is also what
+//! Linux does for a regular file — its `DEFAULT_POLLMASK` is exactly
+//! `POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM`, regardless of the access mode the descriptor was
+//! opened with, which is why a read-only file still answers `POLLOUT` there and here.
 //!
-//! 1. The only bound symbols that produce a descriptor are `open`, `__open_2` and `opendir`, plus
-//!    `fileno` handing back one of those or one of the three standard streams. `socket` and
-//!    `eventfd` — the two symbols in the reachable 188 that would introduce a *different* kind of
-//!    descriptor — refuse. `pipe`, `socketpair`, `epoll_create`, `timerfd_create`, `signalfd`,
-//!    `inotify_init` and `dup` are not in the 188 at all.
-//! 2. So every descriptor that exists is a regular file, a directory, or one of stdin, stdout and
-//!    stderr, and **none of them can block**: `omni-platform`'s `read` on a standard stream is an
-//!    immediate end of file, its `write` to one is an immediate host write, and a regular file is
-//!    always ready by definition.
-//! 3. Linux reports exactly `POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM` for a regular file — its
-//!    `DEFAULT_POLLMASK` — regardless of the descriptor's access mode, which is why a read-only
-//!    file still answers `POLLOUT` there and here.
+//! `the_descriptor_space_poll_answers_over_is_closed` asserted that mechanically, and D25 wrote
+//! down what it was for: *the day a phase binds `socket` for real, that test fails and this module
+//! has to grow a real readiness source with it.* **M5 is that day, and the symbol was `pipe`
+//! rather than `socket`** — §8 row 13a needs two of them before `initializeNativeCode` can return.
 //!
-//! The consistency criterion is the one that matters: **`poll`'s answer predicts what `read` and
-//! `write` on that descriptor will actually do in this runtime**, not what they would do on a
-//! device. `the_descriptor_space_poll_answers_over_is_closed` asserts fact 1 mechanically, so the
-//! paragraph to invalidate is a test rather than a sentence — the day a phase binds `socket` for
-//! real, that test fails and this module has to grow a real readiness source with it.
+//! What replaced the argument is not a weaker version of it. `omni-platform`'s
+//! [`Filesystem::readiness`] is a `match` over the descriptor kinds with **no default arm**: a
+//! file, a directory, a device and a standard stream answer [`Readiness::ALWAYS`] for the reason
+//! above, and a pipe answers from its own queue and reference counts. So the space is still
+//! closed — closed under *kinds that have decided what they answer* rather than under *kinds that
+//! cannot block* — and a sixth kind cannot be added without deciding.
+//!
+//! Still no operating system. A pipe here is an in-process byte queue; there is no OS call on
+//! either side of it.
+//!
+//! The consistency criterion is unchanged and is the one that matters: **`poll`'s answer predicts
+//! what `read` and `write` on that descriptor will actually do in this runtime**, not what they
+//! would do on a device.
+//!
+//! [`Filesystem::readiness`]: omni_platform::fs::Filesystem::readiness
+//! [`Readiness::ALWAYS`]: omni_platform::fs::Readiness::ALWAYS
 //!
 //! # What they do when nothing is ready, and the one thing they refuse
 //!
-//! A descriptor that can never become ready makes an *infinite* wait a permanent hang of a host
-//! thread, and D16's runaway-guest defence is built from step budgets that a sleeping thread does
-//! not consume. So `poll(fds, n, -1)` and `select(.., NULL)` with nothing ready are **refused by
-//! name**, with the same argument [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) makes for
-//! `nanosleep` — and a finite timeout past that cap is refused rather than clamped, because a
-//! clamp returns `0` from a call that waited a minute when it was asked to wait a year.
+//! An *infinite* wait is a permanent hang of a host thread whenever nothing arrives, and D16's
+//! runaway-guest defence is built from step budgets that a sleeping thread does not consume. So
+//! `poll(fds, n, -1)` and `select(.., NULL)` with nothing ready are **refused by name**, with the
+//! same argument [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) makes for `nanosleep` — and a
+//! finite timeout past that cap is refused rather than clamped, because a clamp returns `0` from a
+//! call that waited a minute when it was asked to wait a year.
 //!
-//! A finite timeout with nothing ready is a real sleep and a real `0`, which is what `poll`
-//! promises.
+//! **That refusal survived a pipe existing, and its reason changed.** It used to rest on "none of
+//! the descriptors it named can ever become ready", which a pipe makes false. What is left is the
+//! step-budget argument alone, which is the half that was load-bearing: a host thread parked on a
+//! pipe nobody writes to is exactly as unrecoverable as one parked on a regular file.
+//!
+//! A finite timeout is a real wait on `omni-platform`'s readiness gate, re-testing the
+//! descriptors each time it rises, and a real `0` when it expires — which is what `poll` promises.
+//! **The generation is read before the descriptors are tested**, so a write landing between the
+//! test and the wait raises it and the wait returns at once. Reading it afterwards is the lost
+//! wakeup this project has already measured once, at 1.0104 s (`sem_post`, `VERIFICATION.md`
+//! entry 11).
 //!
 //! # The `-1`/`errno` versus refusal split, as the rest of the adapter draws it
 //!
@@ -75,12 +91,13 @@
 //! the direction review finding M1 says to err in, and `select`'s ordering — validate the
 //! timeout, then rewrite the sets — was wrong in the first version of this module.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
 use omni_bionic::net;
 use omni_mem::GuestAddr;
+use omni_platform::fs::Readiness;
 
 use crate::boundary::ImportCall;
 use crate::error::{AbiError, AbiResult};
@@ -88,7 +105,7 @@ use crate::mem::Blame;
 
 use super::files::filesystem;
 use super::view::GuestView;
-use super::{active, enter, MAX_SLEEP_SECONDS};
+use super::{active, enter, Active, MAX_SLEEP_SECONDS};
 
 // ================================================================== the guest's constants
 //
@@ -216,30 +233,14 @@ pub(super) fn gai_strerror(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 // ================================================================== polling
 
-/// What a `poll` or `select` call decided to do, computed while the guest view is alive and
-/// carried out after it is dropped.
-///
-/// A type rather than an early `return`, because [`ImportCall::args`] borrows the call shared and
-/// [`ImportCall::ret`] borrows it uniquely, so a handler cannot write its return value while a
-/// [`GuestView`] is alive. It also means a handler cannot decide to wait and then forget to.
-enum Outcome {
-    /// Return this value now.
-    Value(i32),
-    /// Sleep, then return zero: the timeout expired with nothing ready.
-    Sleep(Duration),
-}
-
-impl Outcome {
-    fn perform(self) -> i32 {
-        match self {
-            Outcome::Value(value) => value,
-            Outcome::Sleep(duration) => {
-                omni_platform::clock::sleep(duration);
-                0
-            }
-        }
-    }
-}
+// **The wait used to be carried out after the guest view was dropped, and no longer is.**
+//
+// Before a pipe existed, a `poll` with nothing ready could only sleep, so the handler computed a
+// duration while the view was alive and slept after dropping it. A wait that re-tests the
+// descriptors has to hold — or re-enter — the view for each test, which both `poll` and `select`
+// now do. What survives is the constraint that produced the old shape: [`ImportCall::args`]
+// borrows the call shared and [`ImportCall::ret`] borrows it uniquely, so the return value is
+// still written once, after every view is gone.
 
 /// `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
 pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
@@ -248,12 +249,12 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         (a.next_u64()?, a.next_u64()?, a.next_i32()?)
     };
     let state = active(c.symbol(), c.address())?;
-    let outcome = {
+    let first = {
         let mut view = enter(c, &state);
         if nfds > MAX_POLL_FDS {
             // Linux's own answer for an `nfds` past the process's descriptor limit.
             view.set_errno(consts::EINVAL);
-            Outcome::Value(-1)
+            Some(-1)
         } else {
             // `nfds` is bounded above, so this cannot overflow.
             let bytes = nfds as usize * POLLFD_BYTES;
@@ -267,17 +268,78 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 poll_entries(&view, fds, bytes)?
             };
             if ready > 0 {
-                Outcome::Value(ready)
+                Some(ready)
             } else {
-                let duration =
-                    if timeout < 0 { None } else { Some(Duration::from_millis(timeout as u64)) };
-                Outcome::Sleep(bounded_wait(c, duration)?)
+                None
             }
         }
     };
-    let value = outcome.perform();
+    let value = match first {
+        Some(value) => value,
+        None => {
+            // Nothing is ready yet. The wait is bounded here, before any of it happens, so a
+            // refusal arrives instead of a sleep rather than after one.
+            let duration =
+                if timeout < 0 { None } else { Some(Duration::from_millis(timeout as u64)) };
+            let budget = bounded_wait(c, duration)?;
+            let bytes = nfds as usize * POLLFD_BYTES;
+            wait_until_ready(c, &state, budget, |view| {
+                if bytes == 0 {
+                    Ok(0)
+                } else {
+                    poll_entries(view, fds, bytes)
+                }
+            })?
+        }
+    };
     c.ret().i32(value);
     Ok(())
+}
+
+/// Re-test readiness every time `omni-platform`'s gate rises, until something is ready or the
+/// budget runs out.
+///
+/// `test` is whatever the caller counts as ready — the `pollfd` array for `poll`, the three
+/// `fd_set`s for `select` — and it writes the guest's own objects back each time it runs, because
+/// the last run is the one the guest sees and the caller cannot know in advance which that is.
+///
+/// **The generation is read before `test` runs.** A write that lands between the test and the wait
+/// raises it, so the wait returns immediately rather than sleeping through the event. The other
+/// order is the lost wakeup `VERIFICATION.md` entry 11 measured at 1.0104 s.
+///
+/// An instance with **no filesystem** cannot have a pipe, so nothing can ever raise the gate and
+/// the wait degenerates to the sleep this function replaced. That is a real branch, not a
+/// fallback: `poll(NULL, 0, 50)` as a sleep is legal on an instance that has no filesystem root.
+fn wait_until_ready(
+    c: &ImportCall<'_, '_>,
+    state: &Active,
+    budget: Duration,
+    mut test: impl FnMut(&GuestView<'_>) -> AbiResult<i32>,
+) -> AbiResult<i32> {
+    let Some(deadline) = Instant::now().checked_add(budget) else {
+        // `bounded_wait` caps the budget well below anything that could do this, so this is a
+        // refusal for something that cannot happen rather than a clamp that hides it.
+        return Err(refuse(c, format!("a wait of {budget:?} is past this host's clock")));
+    };
+    let Some(fs) = state.bionic.filesystem() else {
+        omni_platform::clock::sleep(budget);
+        return Ok(0);
+    };
+    loop {
+        let seen = fs.ready_generation();
+        let ready = {
+            let view = enter(c, state);
+            test(&view)?
+        };
+        if ready > 0 {
+            return Ok(ready);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(0);
+        }
+        fs.wait_for_readiness(seen, deadline - now);
+    }
 }
 
 /// Read the guest's `pollfd` array, answer every entry, write it back, and count the ready ones.
@@ -305,11 +367,14 @@ fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<i32> 
             // idiom for a slot a program has stopped using, so answering `POLLNVAL` for it would
             // make every such program see an error it has no cause for.
             0
-        } else if fs.is_some_and(|fs| fs.is_open(fd)) {
-            events & READY_MASK
         } else {
-            // Reported whether or not it was requested, which is what `POLLNVAL` is for.
-            POLLNVAL
+            match fs.map(|fs| fs.readiness(fd)) {
+                Some(Ok(readiness)) => revents_for(readiness, events),
+                // Reported whether or not it was requested, which is what `POLLNVAL` is for. A
+                // seam failure that is not `EBADF` cannot reach here: `readiness` answers from
+                // the table alone and makes no host call.
+                _ => POLLNVAL,
+            }
         };
         entry[6..8].copy_from_slice(&revents.to_le_bytes());
         if revents != 0 {
@@ -320,6 +385,29 @@ fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<i32> 
     Ok(ready)
 }
 
+/// Turn one descriptor's readiness into the `revents` bits for the `events` that were asked for.
+///
+/// **`POLLERR` and `POLLHUP` are reported whether or not they were requested**, which is POSIX's
+/// own rule and is why they are not in [`READY_MASK`]. A guest that polled only for `POLLIN` on a
+/// pipe whose writers have all gone still learns that they have — without it, the canonical drain
+/// loop never sees end of file and spins.
+fn revents_for(readiness: Readiness, events: i16) -> i16 {
+    let mut revents = 0i16;
+    if readiness.readable {
+        revents |= events & (POLLIN | POLLRDNORM);
+    }
+    if readiness.writable {
+        revents |= events & (POLLOUT | POLLWRNORM);
+    }
+    if readiness.hangup {
+        revents |= POLLHUP;
+    }
+    if readiness.error {
+        revents |= POLLERR;
+    }
+    revents
+}
+
 /// `int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)`
 pub(super) fn select(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (nfds, readfds, writefds, exceptfds, timeout) = {
@@ -327,11 +415,10 @@ pub(super) fn select(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         (a.next_i32()?, a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
     };
     let state = active(c.symbol(), c.address())?;
-    let outcome = {
+    let value = {
         let mut view = enter(c, &state);
         select_outcome(c, &mut view, nfds, [readfds, writefds, exceptfds], timeout)?
     };
-    let value = outcome.perform();
     c.ret().i32(value);
     Ok(())
 }
@@ -343,7 +430,7 @@ fn select_outcome(
     nfds: i32,
     pointers: [u64; 3],
     timeout: u64,
-) -> AbiResult<Outcome> {
+) -> AbiResult<i32> {
     if !(0..=FD_SETSIZE).contains(&nfds) {
         // Negative is `EINVAL` on Linux. Past `FD_SETSIZE` is `EINVAL` here, and this is the one
         // place the call is stricter than Linux, which clamps to the process's descriptor table
@@ -352,7 +439,7 @@ fn select_outcome(
         // rejection of the request rather than a truncation of it — the whole call fails and the
         // guest is told, which is the opposite of review finding M5's shape.
         view.set_errno(consts::EINVAL);
-        return Ok(Outcome::Value(-1));
+        return Ok(-1);
     }
     // Whole words, as the kernel's own `FDS_BYTES` computes them: an `fd_set` is an array of
     // 64-bit words, so an `nfds` of 65 covers two of them. `nfds` is bounded by `FD_SETSIZE`, so
@@ -373,19 +460,19 @@ fn select_outcome(
         let fs = filesystem(view)?;
         if named.iter().any(|fd| !fs.is_open(*fd)) {
             view.set_errno(consts::EBADF);
-            return Ok(Outcome::Value(-1));
+            return Ok(-1);
         }
     }
-    // Readable and writable; never an exception. See the module documentation: every descriptor
-    // in this runtime is a regular file, a directory or a standard stream, and Linux's answer for
-    // all of those is ready for both.
+    // **What the guest asked about, kept**, because a wait re-tests the same question and the
+    // sets are about to be overwritten with the answer.
+    let asked: [Set; 3] = [sets[0].copy(), sets[1].copy(), sets[2].copy()];
+    answer_sets(view, &asked, &mut sets, nfds);
     let ready: i32 = sets[0].count(nfds) + sets[1].count(nfds);
-    sets[2].clear();
     if ready > 0 {
         for set in &sets {
             set.write_back(view)?;
         }
-        return Ok(Outcome::Value(ready));
+        return Ok(ready);
     }
     // **The timeout is read and validated BEFORE any set is modified**, and that ordering is the
     // contract rather than tidiness: POSIX says that on failure "the objects pointed to by the
@@ -409,7 +496,7 @@ fn select_outcome(
             // `tv_usec` outside `[0, 1e6)` as `EINVAL` itself; a negative `tv_sec` is the
             // kernel's own `EINVAL`.
             view.set_errno(consts::EINVAL);
-            return Ok(Outcome::Value(-1));
+            return Ok(-1);
         }
         // Neither field can overflow the sum: `tv_usec` is bounded by a million and `tv_sec` by
         // the cap `bounded_wait` applies next.
@@ -417,16 +504,71 @@ fn select_outcome(
     };
     // Refused before anything is written, for the same reason.
     let wait = bounded_wait(c, duration)?;
-    // Nothing is ready and the wait is going to happen, so on return every set must be empty:
-    // POSIX requires the sets to be zeroed when `select` times out, and a guest that read a stale
-    // bit would act on a descriptor this call did not report.
+    // **The wait re-asks the question every time the readiness gate rises**, against `asked`
+    // rather than against the sets in guest memory, which are about to be overwritten. Before a
+    // pipe existed this was a plain sleep, because nothing could change during it.
+    let Some(deadline) = Instant::now().checked_add(wait) else {
+        return Err(refuse(c, format!("a wait of {wait:?} is past this host's clock")));
+    };
+    loop {
+        // Read before the descriptors are tested. The other order loses a wakeup that lands in
+        // between — `VERIFICATION.md` entry 11, measured at 1.0104 s.
+        let seen = view.active.bionic.filesystem().map(omni_platform::fs::Filesystem::ready_generation);
+        answer_sets(view, &asked, &mut sets, nfds);
+        let ready: i32 = sets[0].count(nfds) + sets[1].count(nfds);
+        if ready > 0 {
+            for set in &sets {
+                set.write_back(view)?;
+            }
+            return Ok(ready);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match (seen, view.active.bionic.filesystem()) {
+            (Some(seen), Some(fs)) => {
+                fs.wait_for_readiness(seen, deadline - now);
+            }
+            // No filesystem means no pipe means nothing can change, so the wait is the sleep it
+            // always was. A `select` used purely as a sleep does not need a filesystem root.
+            _ => {
+                omni_platform::clock::sleep(deadline - now);
+                break;
+            }
+        }
+    }
+    // The wait expired, so on return every set must be empty: POSIX requires the sets to be
+    // zeroed when `select` times out, and a guest that read a stale bit would act on a descriptor
+    // this call did not report.
     for set in &mut sets {
         set.clear();
     }
     for set in &sets {
         set.write_back(view)?;
     }
-    Ok(Outcome::Sleep(wait))
+    Ok(0)
+}
+
+/// Answer each set from `asked`: keep the descriptors that are ready for what that set asks, and
+/// empty `exceptfds`.
+///
+/// A file, a directory, a device and a standard stream are ready for both, which is Linux's answer
+/// for them; a pipe is ready for one, the other or neither.
+///
+/// **`exceptfds` is emptied.** Linux sets it for out-of-band socket data and for a few `ioctl`
+/// conditions on character devices, and this runtime produces neither. A pipe with no readers
+/// reports `POLLERR` to `poll`, and `select`'s `exceptfds` is deliberately **not** where Linux
+/// reports that either.
+fn answer_sets(view: &GuestView<'_>, asked: &[Set; 3], sets: &mut [Set; 3], nfds: i32) {
+    let readiness = |fd: i32| {
+        view.active.bionic.filesystem().and_then(|fs| fs.readiness(fd).ok())
+    };
+    sets[0].restore(&asked[0]);
+    sets[1].restore(&asked[1]);
+    sets[0].retain(nfds, |fd| readiness(fd).is_some_and(|r| r.readable));
+    sets[1].retain(nfds, |fd| readiness(fd).is_some_and(|r| r.writable));
+    sets[2].clear();
 }
 
 /// One guest `fd_set`, read out of guest memory and written back to the same place.
@@ -468,6 +610,32 @@ impl Set {
 
     fn clear(&mut self) {
         self.bits.fill(0);
+    }
+
+    /// A copy of the bits, kept so a wait can re-ask the same question after the set in guest
+    /// memory has been overwritten with an answer.
+    fn copy(&self) -> Set {
+        Set { at: self.at, bits: self.bits.clone(), argument: self.argument }
+    }
+
+    /// Put `other`'s bits back, so the next answer starts from what the guest asked.
+    fn restore(&mut self, other: &Set) {
+        self.bits.copy_from_slice(&other.bits);
+    }
+
+    /// Keep only the members `keep` accepts, clearing every other bit.
+    ///
+    /// Bits at or above `nfds` are cleared too: POSIX says `select` examines only the first
+    /// `nfds` descriptors, and a bit the call did not examine must not be reported as ready.
+    fn retain(&mut self, nfds: i32, mut keep: impl FnMut(i32) -> bool) {
+        let members: Vec<i32> = self.members(nfds).filter(|fd| keep(*fd)).collect();
+        self.clear();
+        for fd in members {
+            let byte = (fd / 8) as usize;
+            if let Some(bits) = self.bits.get_mut(byte) {
+                *bits |= 1 << (fd % 8);
+            }
+        }
     }
 
     fn write_back(&self, view: &GuestView<'_>) -> AbiResult<()> {
