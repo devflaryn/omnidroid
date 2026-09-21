@@ -144,6 +144,11 @@ BIONIC = [
     # `printf_tests` is named because the field-width and output caps live there, and they are
     # the only bound in this crate that a guest-chosen value can push against.
     "--test", "printf_tests",
+    # M5 added two integration targets and **every row that needs one would have reported a false
+    # MISS without them** -- which is entry 8's own lesson, arriving as a prediction rather than
+    # as a surprise this time: both agents that wrote these rows said so in their reports before
+    # anything was run.
+    "--test", "strftime_tests", "--test", "stdio_modes_tests",
     "--no-fail-fast",
 ]
 CPU = ["cargo", "test", "-p", "omni-cpu", "--no-fail-fast"]
@@ -2163,10 +2168,13 @@ MUTATIONS = [
     c.ret().void();""",
      ANDROID),
 
+    # **RE-ANCHORED in M5**, when review finding M3 moved the ring's own state out of
+    # `bionic/mod.rs` and into `logging::LogRing` so that it could bound bytes as well as records.
+    # The property and the detector are unchanged; only the line holding it moved.
     ("logging-A3", "A", "the capture ring drops its newest records rather than its oldest",
-     ADAPTER_MOD,
-     """            ring.pop_front();""",
-     """            ring.pop_back();""",
+     ADAPTER_LOGGING,
+     """            let Some(gone) = state.records.pop_front() else { break };""",
+     """            let Some(gone) = state.records.pop_back() else { break };""",
      ANDROID),
 
     # The over-correction: a ring too small to hold what one run produces is a bound that destroys
@@ -3930,6 +3938,248 @@ directory", ADAPTER_FILES,
         intended: "sysconf(_SC_NPROCESSORS_ONLN)",
         platform: "this target",
     })""",
+     PLATFORM),
+
+    # =============================================================== M5: strftime, and its refusals
+    #
+    # `nativeInitFastLog` is one of the two scripted downcalls of §8 step 9 that did not return,
+    # and M4 recorded why: there was no implementation to bind. These rows are over the one that
+    # now exists. Every `A` row is a **plausible** wrong answer -- an off-by-one in a day number,
+    # a twelve-hour clock that prints `00` at noon -- because wrong *text* is what this function
+    # fails as, and nothing downstream can tell wrong text from right text.
+
+    # The NUL stops needing room, so a result that exactly fills `max` reports as fitting. C says
+    # the array is indeterminate in that case, so the caller would read an unterminated string.
+    ("strftime-A1", "A", "the terminating NUL stops needing room in max",
+     BIONIC_TIME,
+     """    if out.len() < max {""",
+     """    if out.len() <= max {""",
+     BIONIC),
+
+    # `%V` loses ISO 8601's Thursday rule and becomes a plain Monday-week count. Agrees with the
+    # right answer for most of the year, which is what makes it worth a row.
+    ("strftime-A2", "A", "%V loses ISO's Thursday rule and counts Mondays instead",
+     BIONIC_TIME,
+     """    let week = (yday - iso_wday + 10) / 7;""",
+     """    let week = (yday - iso_wday + 7) / 7;""",
+     BIONIC),
+
+    # `%e` zero-pads like `%d`. The two conversions exist precisely to differ.
+    ("strftime-A3", "A", "%e zero-pads, so it stops differing from %d",
+     BIONIC_TIME,
+     """        b'e' => push_padded(out, mday(tm, specifier)? as u64, 2, b' '),""",
+     """        b'e' => push_padded(out, mday(tm, specifier)? as u64, 2, b'0'),""",
+     BIONIC),
+
+    # An unknown conversion copied through as literal text instead of refused. tzcode-derived
+    # libraries do exactly this, and `%Q` in a log line is indistinguishable from a time.
+    ("strftime-A4", "A", "an unknown conversion is copied through instead of refused",
+     BIONIC_TIME,
+     """        _ => return Err(StrftimeError::UnknownSpecifier { specifier }),""",
+     """        _ => { out.push(b'%'); out.push(specifier); }""",
+     BIONIC),
+
+    # `%j` loses the 0-based-to-1-based `+1`. **Still three digits, still parses, off by one for
+    # every day of every year** -- the shape a count-based test cannot see.
+    ("strftime-A5", "A", "%j is off by one because tm_yday is zero-based",
+     BIONIC_TIME,
+     """        b'j' => push_padded(out, (yday(tm, specifier)? + 1) as u64, 3, b'0'),""",
+     """        b'j' => push_padded(out, yday(tm, specifier)? as u64, 3, b'0'),""",
+     BIONIC),
+
+    # `%I` loses the twelve-for-zero case, so noon and midnight print `00`. Wrong for two hours a
+    # day and right for the other twenty-two.
+    ("strftime-A6", "A", "%I prints 00 at noon and midnight",
+     BIONIC_TIME,
+     """            let twelve = if hour % 12 == 0 { 12 } else { hour % 12 };""",
+     """            let twelve = hour % 12;""",
+     BIONIC),
+
+    # ---- the over-corrections ----
+
+    # `tm_sec` narrowed to [0,59]. It reads as "seconds are 0 to 59" and destroys the leap second
+    # POSIX's own `<time.h>` range admits.
+    ("strftime-B1", "B", "tm_sec is narrowed to 0..=59 and the leap second is refused",
+     BIONIC_TIME,
+     """        b'S' => push_padded(out, field(tm.sec, "tm_sec", 0, 60, specifier)? as u64, 2, b'0'),""",
+     """        b'S' => push_padded(out, field(tm.sec, "tm_sec", 0, 59, specifier)? as u64, 2, b'0'),""",
+     BIONIC),
+
+    # `%z` refuses an offset that is not a whole minute. It reads as "never silently lose
+    # seconds" and destroys POSIX's documented truncation, which is what `+hhmm` can express.
+    ("strftime-B2", "B", "%z refuses an offset that is not a whole number of minutes",
+     BIONIC_TIME,
+     """            if !(-86_400..=86_400).contains(&offset) {""",
+     """            if !(-86_400..=86_400).contains(&offset) || offset % 60 != 0 {""",
+     BIONIC),
+
+    # The output cap cut to 4 KiB. It reads as "a timestamp is never longer than a log line" and
+    # refuses formats the thunk boundary can actually deliver.
+    ("strftime-B3", "B", "the strftime output cap is cut to a log line's worth",
+     BIONIC_TIME,
+     """pub const MAX_STRFTIME_OUTPUT: usize = 1024 * 1024;""",
+     """pub const MAX_STRFTIME_OUTPUT: usize = 4096;""",
+     BIONIC),
+
+    # ============================================== M5: the fopen mode parse, review finding M5
+    #
+    # The finding was that a mode over sixteen bytes was **silently truncated**, so
+    # `"rbbbbbbbbbbbbbbb+"` lost its `+` and yielded a read-only stream while the code's own doc
+    # said `EINVAL`. It also named a sixteen-byte witness that parsed correctly even with the
+    # bound -- the shape begins at seventeen -- which is `VERIFICATION.md` entry 10 again: the
+    # conclusion was right and the evidence for it was not.
+
+    # The bound put back, in the place it now would have to go.
+    ("modes-A1", "A", "a long fopen mode is truncated again, losing its trailing +",
+     BIONIC_STDIO,
+     """    let mode = match mode.iter().position(|&byte| byte == 0) {
+        Some(end) => &mode[..end],
+        None => mode,
+    };""",
+     """    let mode = match mode.iter().position(|&byte| byte == 0) {
+        Some(end) => &mode[..end],
+        None => &mode[..mode.len().min(16)],
+    };""",
+     BIONIC),
+
+    # `+` only adds write, so `w+` and `a+` are not readable. C17 7.21.5.3p3 says update modes
+    # permit both.
+    ("modes-A2", "A", "+ only adds write, so w+ and a+ are not readable",
+     BIONIC_STDIO,
+     """        read: reads || plus,
+        write: writes || plus,""",
+     """        read: reads,
+        write: writes || plus,""",
+     BIONIC),
+
+    # An unknown modifier ignored instead of refused. An unknown byte *might* change the access
+    # on a device, and ignoring it hands back a stream whose access differs from the one asked
+    # for -- which is the finding's own shape, one character along.
+    ("modes-A3", "A", "an unknown mode modifier is ignored instead of refused",
+     BIONIC_STDIO,
+     """            other => return Err(ModeRefusal::Modifier(other)),""",
+     """            _ => {}""",
+     BIONIC),
+
+    # An interior NUL is not a terminator, so `"r\0b+"` grants write access the C string never
+    # asked for.
+    ("modes-A4", "A", "an interior NUL stops ending the mode string",
+     BIONIC_STDIO,
+     """    let mode = match mode.iter().position(|&byte| byte == 0) {
+        Some(end) => &mode[..end],
+        None => mode,
+    };
+    let Some((&access, modifiers)) = mode.split_first() else {""",
+     """    let Some((&access, modifiers)) = mode.split_first() else {""",
+     BIONIC),
+
+    # ---- the over-corrections ----
+
+    # `x` honoured with no creating mode. POSIX: "if O_EXCL is set and O_CREAT is not set, the
+    # result is undefined" -- so there is no defined thing to pass on.
+    ("modes-B1", "B", "x sets O_EXCL with no O_CREAT, which POSIX leaves undefined",
+     BIONIC_STDIO,
+     """        exclusive: exclusive && create,""",
+     """        exclusive,""",
+     BIONIC),
+
+    # Making the code match the OLD doc instead of removing the bound: loud rather than silent,
+    # and still wrong, because bionic's `__sflags` walks to the terminator and opens these.
+    ("modes-B2", "B", "a mode past sixteen bytes is refused rather than parsed",
+     BIONIC_STDIO,
+     """    let Some((&access, modifiers)) = mode.split_first() else {
+        return Err(ModeRefusal::Empty);
+    };""",
+     """    if mode.len() > 16 {
+        return Err(ModeRefusal::Modifier(b'?'));
+    }
+    let Some((&access, modifiers)) = mode.split_first() else {
+        return Err(ModeRefusal::Empty);
+    };""",
+     BIONIC),
+
+    # ================================= M5: the log ring's byte bound, and liblog's truncation
+    #
+    # Review findings M3 and M4. The ring bounded record count, not bytes, so 256 records of a
+    # guest-chosen megabyte each was 0.8 GiB with `log_dropped()` still reporting 0; and
+    # `__android_log_print` refused where a real `liblog` truncates.
+
+    # The byte bound set so high it can never bind -- which is a check no input can fail, and is
+    # `VERIFICATION.md` entry 12's shape applied to a bound rather than a branch.
+    ("log-A1", "A", "the ring's byte bound is set where it can never bind",
+     ADAPTER_LOGGING,
+     """pub const LOG_CAPTURE_MAX_BYTES: usize = 256 * 1024;""",
+     """pub const LOG_CAPTURE_MAX_BYTES: usize = 64 * 1024 * 1024;""",
+     ANDROID_LIB),
+
+    # The ring stops checking bytes at all, which is what M3 found.
+    ("log-A2", "A", "the ring bounds records only, as it did before M3",
+     ADAPTER_LOGGING,
+     """            let over_bytes = state.bytes.saturating_add(cost) > LOG_CAPTURE_MAX_BYTES;""",
+     """            let over_bytes = false;""",
+     ANDROID_LIB),
+
+    # **A record is truncated and does not say so.** The whole point of reproducing the platform's
+    # truncation rather than refusing was that it be visible; a log line silently missing its tail
+    # is a wrong answer a reader cannot detect.
+    ("log-A3", "A", "a truncated record does not record that it was truncated",
+     ADAPTER_LOGGING,
+     """    let truncated = if kept.tag < tag.len() || kept.message < message.len() {
+        Some(Truncation { tag_bytes: tag.len(), message_bytes: message.len() })
+    } else {
+        None
+    };""",
+     """    let truncated = None;""",
+     ANDROID_LIB),
+
+    # The same thing on the other reporting channel: the stderr line drops its marker, so a run
+    # watched only through stderr goes silently short.
+    ("log-A4", "A", "the stderr line drops the truncation marker",
+     PLAT_LOG,
+     """    if let Some(cut) = record.truncated {""",
+     """    if let Some(cut) = record.truncated.filter(|_| false) {""",
+     PLATFORM),
+
+    # An eviction also bumps the truncation counter, so "dropped" and "truncated" stop being
+    # distinguishable -- which is the measurement both bounds exist to provide.
+    ("log-A5", "A", "an evicted record is also counted as truncated",
+     ADAPTER_LOGGING,
+     """            self.dropped.fetch_add(1, Ordering::Relaxed);""",
+     """            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.truncated.fetch_add(1, Ordering::Relaxed);""",
+     ANDROID_LIB),
+
+    # The per-record ceiling forgets that one invalid guest byte becomes a three-byte U+FFFD, so
+    # the bound is 8,130 bytes per record too small and the ring can exceed it.
+    ("log-A6", "A", "the per-record ceiling forgets that a bad byte widens threefold",
+     ADAPTER_LOGGING,
+     """    core::mem::size_of::<LogRecord>() + 3 * MAX_TAG_AND_MESSAGE_BYTES;""",
+     """    core::mem::size_of::<LogRecord>() + MAX_TAG_AND_MESSAGE_BYTES;""",
+     ANDROID_LIB),
+
+    # ---- the over-corrections ----
+
+    # The message capped at the payload cap instead of liblog's own 1024-byte buffer, so a line a
+    # device would have cut at 1023 survives whole. Under-truncating reads as generous.
+    ("log-B1", "B", "the message is capped at the payload rather than liblog's buffer",
+     PLAT_LOG,
+     """    let message = message_bytes.min(MAX_MESSAGE_BYTES);""",
+     """    let message = message_bytes.min(MAX_TAG_AND_MESSAGE_BYTES);""",
+     PLATFORM),
+
+    # Cutting far below the platform's cap, so a line a device carries whole comes back short.
+    ("log-B2", "B", "the message buffer is cut far below liblog's own",
+     PLAT_LOG,
+     """pub const LOG_BUF_SIZE: usize = 1024;""",
+     """pub const LOG_BUF_SIZE: usize = 256;""",
+     PLATFORM),
+
+    # The payload cap fills the **message** first and cuts the tag -- "keep the useful part",
+    # which is the opposite of the order `logd_writer.cpp`'s three iovecs impose.
+    ("log-B3", "B", "the payload cap fills the message first and cuts the tag",
+     PLAT_LOG,
+     """    let tag = tag_bytes.min(MAX_TAG_AND_MESSAGE_BYTES);""",
+     """    let tag = tag_bytes.min(MAX_TAG_AND_MESSAGE_BYTES.saturating_sub(message));""",
      PLATFORM),
 
     ("park-A2", "A", "the park witness names the mutex as the condition variable",

@@ -334,7 +334,7 @@ pub(super) fn strftime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let state = active(c.symbol(), c.address())?;
     let written = {
-        let mut view = enter(c, &state);
+        let view = enter(c, &state);
         if format == 0 || tm == 0 {
             return Err(view.refusal(format!(
                 "`strftime` was given a null {}",
