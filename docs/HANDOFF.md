@@ -27,7 +27,7 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
-**1,058 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was
+**1,059 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was
 1,004 before M3 task 3 phase 3b, 959 before phase 3a, 926 before phase 2, 877 before phase 1, and
 608 before `omni-bionic` existed, so those are not comparable). **The whole mutation table has been
 run on the committed tree: 239/239 caught.** Clippy clean on
@@ -150,7 +150,7 @@ Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-pl
   resolves inside one host directory the embedding supplies, and an instance with no root refuses
   every path call by name — plus bionic's `FILE*` layer in `omni-bionic` over a trait, and the 29
   file-io symbols over both. **166 of the 188** now covered (148 thunk functions + 18 data
-  objects), 54 new tests, mutation **213 → 239** (26 new, 26/26 caught). Durable record is **D23**.
+  objects), 55 new tests, mutation **213 → 239** (26 new, 26/26 caught). Durable record is **D23**.
   Phases 3c (sockets and polling) and 3d (thread lifecycle) remain; scope for the whole task is
   **170 thunk functions + 18 data objects**.
 - Task 4 (all 3,594 initializers, the M3 gate) — not started.
@@ -327,7 +327,7 @@ those targets — that was ruled against deliberately.
    covered, 30 new tests, 20 new mutation rows, 20/20 caught.
 3. ~~Extend `omni-platform` with clocks, process information and a log sink, then bind them.~~
    **Done** (D22): 137 of the 188 covered, 25 new tests, 37 new mutation rows, 37/37 caught.
-4. ~~Files and directories.~~ **Done** (D23): 166 of the 188 covered, 54 new tests, 26 new
+4. ~~Files and directories.~~ **Done** (D23): 166 of the 188 covered, 55 new tests, 26 new
    mutation rows, 26/26 caught.
 5. **Next:** sockets and polling (3c), then thread lifecycle and signals (3d), then the six the
    plan's `3e` row collects.

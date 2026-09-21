@@ -108,15 +108,26 @@ pub const POOL_BYTES: usize = 4096;
 
 /// How many `FILE` objects one instance can hand out beyond the three standard streams.
 ///
-/// **A policy number.** Each costs [`FILE_BYTES`] of the arena and one entry in the stream table,
-/// and the three standard streams do not come out of it — they live in `__sF`, which the boundary
-/// already placed. A `fopen` past this is `EMFILE`, which is the answer a real device gives when a
-/// process runs out of streams and one every correct caller already branches on.
+/// **A policy number, and it is the ONE that the commit granule chose rather than a preference.**
+/// Each costs [`FILE_BYTES`] of the arena and one entry in the stream table, and the three
+/// standard streams do not come out of it — they live in `__sF`, which the boundary already
+/// placed. A `fopen` past this is `EMFILE`, which is what a real device reports when a process
+/// runs out of streams and one every correct caller already branches on.
 ///
-/// It is smaller than [`omni_platform::fs::MAX_OPEN_FILES`] on purpose: a descriptor is cheaper
-/// than a stream, and a guest holding 32 streams open during static initialisation is doing
-/// something this layer wants to hear about.
-pub const MAX_GUEST_FILES: usize = 32;
+/// **It was 32 and the granule test refused it.** [`ARENA_BYTES`] came to **67,712** bytes with
+/// 32 slots, against `omni_mem::DEFAULT_COMMIT_GRANULE` — the granule D10 *measured*, which this
+/// crate references rather than restates. Over it by 2,176 bytes, so [`Bionic::new`]'s eager
+/// commit would silently have cost a **second** granule per instance and the comment justifying
+/// that exception to D10 ("never commit speculatively") would have been false. Nothing else would
+/// have noticed: the charge is real but small, and no test measured it. Sixteen slots gives
+/// 64 × 848 + 4096 + 16 × 152 + 16 × 280 = **65,280**. The relation is pinned by
+/// `the_arena_fits_in_one_commit_granule`, which compares against the constant rather than a
+/// literal, so a re-measured granule moves this with it.
+///
+/// It is also smaller than [`omni_platform::fs::MAX_OPEN_FILES`] on purpose: a descriptor is
+/// cheaper than a stream, and a guest holding sixteen streams open during static initialisation
+/// is doing something this layer wants to hear about.
+pub const MAX_GUEST_FILES: usize = 16;
 
 /// How many directory streams one instance can hand out.
 ///
@@ -124,6 +135,14 @@ pub const MAX_GUEST_FILES: usize = 32;
 /// arena would hand out a slot the seam then refused, and a smaller one would leave the seam's own
 /// ceiling unreachable and untested.
 pub const MAX_GUEST_DIRS: usize = omni_platform::fs::MAX_OPEN_DIRS;
+
+/// A stream needs a descriptor, so the stream table must not outrun the descriptor table.
+///
+/// A **compile-time** assertion rather than a test, because both sides are constants: a build
+/// that violated it could not produce a binary to run a test with. It was written as a test
+/// first, and clippy pointed out that `assert!(16 < 64)` is folded away — which is the lint
+/// being right about where the check belongs rather than about whether to make it.
+const _: () = assert!(MAX_GUEST_FILES < omni_platform::fs::MAX_OPEN_FILES);
 
 /// Bytes of guest address space the arena occupies.
 ///
@@ -277,10 +296,22 @@ impl Bionic {
     /// [`AbiError::Memory`] if the arena could not be mapped.
     pub fn new(space: Arc<GuestSpace>) -> AbiResult<Arc<Self>> {
         // Eager rather than lazy, and the exception to D10's "never commit speculatively" is
-        // stated rather than assumed: the arena is 17 KiB, which is a fraction of one 64 KiB
-        // commit granule, so lazy and eager cost exactly the same commit charge here. Eager
+        // stated rather than assumed: the arena is [`ARENA_BYTES`], which is under one commit
+        // granule (`omni_mem::DEFAULT_COMMIT_GRANULE`, a figure D10 measured rather than chose),
+        // so lazy and eager cost exactly the same commit charge here. Eager
         // buys that the first `errno` write on a new thread cannot fail for a commit reason
         // inside a handler, where there is no good way to retry.
+        //
+        // `the_arena_fits_in_one_commit_granule` asserts the "under one granule" half, because
+        // that is the part which stops being true when a phase adds a table. Phase 3b added two --
+        // the `FILE` objects and the `struct dirent` slots -- taking the arena from **58,368**
+        // bytes to **65,280**.
+        //
+        // The number this comment used to give was "17 KiB", which was right when D20 wrote it
+        // (64 blocks x 272 bytes = 17,408) and had been wrong since **phase 2**, which widened the
+        // per-thread block to 848 bytes for the `dl_phdr_info` slots and took the arena to 58,368
+        // without anyone updating the sentence. A figure in a comment that nothing asserts is a
+        // figure that drifts; the test is why this one now cannot.
         let arena = space.map_anonymous(
             Placement::Anywhere { align: space.page_size() },
             ARENA_BYTES,
@@ -976,3 +1007,41 @@ static INLINE: &[(&str, ImportFn)] = handlers::INLINE;
 /// Every symbol serviced on the **exit** path, because it calls guest code back.
 static REENTRANT: &[(&str, ReentrantFn)] = handlers::REENTRANT;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The arena is one commit granule, which is what makes eagerly committing it free.
+    ///
+    /// **The assertion that stops being true quietly.** `Bionic::new` commits the whole arena
+    /// eagerly and justifies it by "lazy and eager cost the same when it is under one granule"
+    /// (D10 forbids committing speculatively otherwise). Phase 3b added two tables to it — the
+    /// `FILE` objects and the `struct dirent` slots — and a third would be the one that makes the
+    /// justification false without changing a line of the code that gives it.
+    #[test]
+    fn the_arena_fits_in_one_commit_granule() {
+        // **The granule is a MEASURED quantity and is referenced rather than restated.** D10 set
+        // it by measurement (4 KiB measured *worse* than the VEH fault it rejected), and
+        // `omni_mem::DEFAULT_COMMIT_GRANULE` is where that number lives. A literal here would be
+        // a fourth copy of a figure this project's own rule says appears once.
+        let granule = omni_mem::DEFAULT_COMMIT_GRANULE;
+        assert!(
+            ARENA_BYTES <= granule,
+            "the arena is {ARENA_BYTES} bytes against a commit granule of {granule}: eagerly \
+             committing it is no longer free, and `Bionic::new`'s exception to D10 no longer holds"
+        );
+        // And the four tables that make it up are each non-empty and in the order the accessors
+        // assume: thread blocks, pool, FILE objects, dirent slots.
+        assert_eq!(
+            ARENA_BYTES,
+            MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
+                + POOL_BYTES
+                + MAX_GUEST_FILES * FILE_BYTES
+                + MAX_GUEST_DIRS * DIRENT_BYTES
+        );
+        // The two ceiling relations are compile-time assertions beside the constants they
+        // relate, because both sides are constants; see `MAX_GUEST_DIRS` and the `const _` under
+        // it. What is left here is the one relation that is genuinely arithmetic over four of
+        // them.
+    }
+}

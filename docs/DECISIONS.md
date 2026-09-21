@@ -2444,13 +2444,53 @@ and is not any more. Both refusals now name what is **actually** missing — the
 deliberately left it out of its scope of 29. A diagnostic that states something false is a defect in
 the diagnostic, and this project's record already carries enough of those.
 
+### A defect this phase's own test found in this phase's own work, and it was mine
+
+`Bionic::new` commits the adapter's arena **eagerly**, and justifies that exception to D10's
+"never commit speculatively" with one sentence: the arena is under a commit granule, so lazy and
+eager cost the same charge, and eager buys that the first `errno` write on a new thread cannot
+fail inside a handler.
+
+Phase 3b added two tables to that arena — the `FILE` objects `fopen` hands out and the `struct
+dirent` slot each directory stream owns — and with `MAX_GUEST_FILES = 32` it came to **67,712
+bytes**, against `omni_mem::DEFAULT_COMMIT_GRANULE`. Over it by 2,176 bytes, so the eager commit
+would silently have cost a **second** granule per guest instance and the sentence justifying it
+would have been false.
+
+**Nothing else would have noticed.** The extra charge is real but small, no test measured it, and
+every other assertion in the workspace still passed. `the_arena_fits_in_one_commit_granule` is the
+assertion that does, and it pins the total against the granule and the four tables against the
+order the accessors assume; the two ceiling relations moved to `const` assertions beside the
+constants they relate, because both sides are constants and a build that violated one could not
+produce a binary to run a test with.
+
+`MAX_GUEST_FILES` is **16** now, and the number is chosen by the granule budget rather than by
+preference: 64 × 848 + 4096 + 16 × 152 + 16 × 280 = **65,280**.
+
+**The test compares against `omni_mem::DEFAULT_COMMIT_GRANULE` rather than a literal**, because the
+granule is a *measured* quantity — D10 set it by measurement, having found 4 KiB worse than the VEH
+fault it rejected — and this project's own rule is that a measured quantity appears once with its n
+and everything else links to it. A literal would have been a fourth copy, and it would have left
+the relation silently wrong if the granule were ever re-measured.
+
+**A second figure fell out of this, and it had been wrong for two phases.** The comment that
+justified the eager commit said the arena was "17 KiB". That was right when D20 wrote it — 64
+blocks of 272 bytes is 17,408 — and stopped being right in **phase 2**, which widened the
+per-thread block to 848 bytes for the `dl_phdr_info` slots and took the arena to **58,368** without
+anyone updating the sentence. Nothing asserted it, so nothing noticed. That is the eighth wrong
+number in this record and the second whose whole cause was a figure living only in prose.
+
 ### Verification
 
-* `cargo test --workspace --release`: **1,058 passed, 0 failed, 12 ignored**, from 1,004. The 54
-  new tests are 21 in `omni-platform`'s lib (16 → 37), 11 in `omni-bionic`'s new `stdio` module
-  (97 → 108), 8 in `omni-android`'s lib (91 → 99) and 15 in `omni-android`'s `bionic` target
-  (76 → 91). `omni-bionic` and `omni-android`'s libs were also run in **debug**, per the working
-  agreement about overflow, and pass there.
+* `cargo test --workspace --release`: **1,059 passed, 0 failed, 12 ignored**, from 1,004. The 55
+  new tests are 21 in `omni-platform`'s lib (**16 → 37**), 10 in `omni-bionic`'s new `stdio`
+  module (**98 → 108**), 9 in `omni-android`'s lib (**91 → 100**) and 15 in `omni-android`'s
+  `bionic` target (**76 → 91**). Every "before" here was **re-measured** in a throwaway worktree
+  at `e5abf1b`, not carried over: a first draft of this paragraph said "11 in `omni-bionic`
+  (97 → 108)", the four deltas then summed to 56 against a workspace movement of 55, and rather
+  than reconcile that by arithmetic the endpoints were measured. `omni-bionic`'s lib was 98.
+  `omni-bionic` and `omni-android`'s libs were also run in **debug**, per the working agreement
+  about overflow, and pass there.
 * `tools/mutate.py`: **213 → 239 rows**, 26 new — 19 direction A and 7 direction B — and the new
   rows are **26/26 caught**. A full run of the whole table is reported separately below.
 * Clippy clean on `--all-targets --release`, `cargo doc --workspace --no-deps` clean,
