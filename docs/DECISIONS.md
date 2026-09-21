@@ -3455,3 +3455,147 @@ name. The work to add a format is additive: a new `CompressedFormat` variant and
   belongs where the image is created.
 - **The container layer.** The engine parses KTX itself; this crate takes block data.
 - **Anything about the renderer.** `omni-gfx` is still a re-export and a doc comment.
+
+---
+
+## D28 — JNI without a JVM: 409 members is not a JVM, and the one entry that reads like one
+
+**Decision.** `crates/omni-android/src/jni/` implements `jni-surface.md` §8 steps 6-12: a `JavaVM`
+and a `JNIEnv` in guest memory, a class and member registry, handles that are checked indices
+rather than pointers, and a host-owned startup script. **It does not violate D7**, and the reason
+is structural rather than a matter of degree.
+
+### Why 104 classes and 409 members is not the thing D7 forbids
+
+`jni-surface.md` §6 searched for every mechanism that would force dex execution and found **all of
+them absent**: zero hits for `java/lang/reflect/*`, `Class.forName`, `getDeclaredMethod`,
+`defineClass`, `java/lang/invoke/*` or `dalvik/system/*`, and `JNIEnv::DefineClass` (slot 0x28) is
+**never dereferenced**. Nothing loads code. What the engine does is look members up by name and
+descriptor and call them, and 90% of what it looks up is Roblox's own thin Kotlin shell — getters
+and notification sinks **whose behaviour Omnidroid gets to define**. Defining them is not
+interpreting them.
+
+**The one entry that reads as a D7 violation and is not: `java/lang/ClassLoader`.** §6 identifies
+`loadClass`/`findClass`/`getClassLoader` as the canonical *"cache the app `ClassLoader` in
+`JNI_OnLoad` so `FindClass` resolves app classes on threads attached later"* pattern, reached from
+`NativeObjectManager.getClassLoader()` and from
+`RBX::Security::Android::Detail::JvmClassLoaderHelper`. It is a **name resolver**, and this layer
+implements it as one: `Answer::ResolveClass` looks the argument up in the registry and returns the
+`jclass` `FindClass` would. No bytes are read, no class is defined, and `DefineClass` stays a
+refusal that names itself. It is a variant of its own so that the reading is unavoidable to
+whoever edits it next.
+
+### What it answers, and what it refuses
+
+**59 of 233** `JNINativeInterface` slots and **2 of 8** `JavaVM` slots are ever dereferenced (§0).
+All 233 + 8 get a real thunk address; the 174 this layer does not implement produce
+`AbiError::JniRefused` **naming themselves**. There are no plausible stubs: §8.1 ranks "`FindClass`
+returning `NULL` where the caller does not check" third among the expected failure modes precisely
+because a believable answer fails thousands of instructions later.
+
+A member the host has not decided is `Answer::Unanswered`, and **calling** one refuses by name.
+`Jni::define` is how an embedding decides — the same shape as `Bionic::set_hwcap_policy` (D26),
+where the type refuses until a call site chooses.
+
+### The two-table class registry, and its precedence
+
+| table | what it is | answers |
+|---|---|---|
+| `classes::DECLARED` | hand-written, from §3.1's tiers and from `classes2.dex` | decided |
+| `surface::DEX_SURFACE` | **generated** by `tools/gen_dex_surface.py`: 98 classes, 1,526 members | `Unanswered` |
+
+The generated table exists because a **lookup** that misses and an **answer** that is missing are
+different failures and both are real at once. §3.1's Tier 0 members are `CHECK_NOT_NULL` aborts;
+§3.1's Tier X classes are absent from the whole APK and the engine tolerates null for them. So a
+miss returns null with a pending exception **and is recorded** in `Jni::misses`. What made the
+generated table necessary was measured: while a class the engine names was undeclared, the pending
+`ClassNotFoundException` that nothing cleared made the engine's own `JNIEnvScope` abort with
+`RBXCRASH: JNIException (JNI exception pending when entering JNIEnvScope)`. With the table in,
+**0 misses** across the whole startup path.
+
+Precedence is hand-written-wins, and it is held by **two** independent things — `extend_with` adds
+only members a class does not already have, and `Registry::method` takes the first match. Two
+mutation rows failed to break it with one edit each before `jni-A9` broke both halves at once.
+
+### What this decision is evidence of, measured
+
+`cargo test -p omni-android --release --test jni_startup`, on the real `libroblox.so` after all
+3,594 initializers, n = 1 run:
+
+| | |
+|---|---|
+| `JNI_OnLoad` at `base + 0x2173ff4` | returns **`0x00010006`** |
+| step 6a/6b | 23 `FindClass`, 46 `GetStaticMethodID`, 20 `NewGlobalRef`, 18 `ExceptionCheck`, **0 misses** |
+| `GetEnv` / `AttachCurrentThread` | 11 / 1 — the thread began detached, so both JavaVM slots ran, and it attached with the name `"Main"` out of `JavaVMAttachArgs` |
+| §8 steps 7-12 | **19 of 21** downcalls return |
+| imported symbols called across the whole run | **113 distinct** |
+
+**Cost if wrong: high but bounded, and visible.** The bet is that the Java side can be *defined*
+rather than executed. The 19 of 21 is what tests it, and the two that do not return name what they
+need rather than misbehaving.
+
+---
+
+## D28 (amendment 1) — three corrections M4's gate made to things already written down
+
+Each was found by running the engine, and each is a case where the earlier statement was reasonable
+and wrong.
+
+**1. `MADV_DONTNEED` was refused on a false premise (D21).** D21 refused it because meeting its
+"a later read returns zero" guarantee would mean *writing* zeroes across the range, committing
+every lazy granule the call was asking to release. That assumed the only way to zero a range is to
+write to it. It is not: `advise_idle` + `reclaim_idle` **decommits** with `MEM_DECOMMIT` — D10's
+only primitive that gives commit charge back — and the demand pager faults the range back in as a
+freshly committed, zero-filled page. The guarantee is met by giving the memory back, which is the
+direction the call asked for in the first place. It is carried out now, the range is **verified**
+afterwards (no entry in it may report committed bytes), and the test reads the bytes back **through
+guest code** rather than through a host pointer.
+
+Two things a reader needs: `reclaim_idle` is space-wide, so one `MADV_DONTNEED` makes every
+outstanding `MADV_FREE` take effect at once — which `MADV_FREE`'s contract permits. And
+`MADV_REMOVE` stays refused: it punches a hole in an *underlying object*, and every mapping this
+layer gives the guest is private and anonymous.
+
+**2. `__strncpy_chk2`'s source check was wrong in the refusing direction.** It failed whenever
+`n > src_size`. Bionic's loop checks per byte actually read and stops at the source's NUL, so
+`strncpy(dst, src, sizeof dst)` with a shorter source — the commonest FORTIFY shape there is — is
+legal and copies with NUL padding. `n > src_size` alone now fails only when there is no NUL in the
+first `min(n, src_size)` bytes, which is the case where bionic really would read `src[src_size]`.
+
+**3. §8 step 9's order is a list, not a proof.** §8 puts `nativeInitFastLog` first and the two
+directory calls fifth and sixth. The engine refuses that order: `nativeInitFastLog` throws
+`Cannot initialize fastlog system.  Cache directory not set.` and raises `SIGTRAP`. §4.2 attributes
+step 9's eleven downcalls to three different methods (`W0`, `T0`, `X0`) and nothing said which of
+the three runs first. **`T0` does.** `script::SEQUENCE` runs the directories first.
+
+**And one defect of this layer's own, for the record.** `GetObjectClass` on a `jclass` answered the
+class itself. A `jclass` is an instance of `java.lang.Class`, and `JvmClassLoaderHelper` asks
+*that* for `getClassLoader`; the null `jmethodID` went straight into `CallObjectMethodV`. Row
+`jni-A1`.
+
+**Three imports outside the 188, all bound now:** `strnlen` (from `JNI_OnLoad`'s registration
+helpers), `gmtime` (from `nativeInitFastLog`), `getcwd` (from `nativeSetAssetPath`). D17 calls 188
+a lower bound with 17,698 unfollowable indirect call sites behind it; `BEYOND_THE_PREDICTION` is
+**eight** symbols now, not five.
+
+**`getcwd`'s answer is a decision.** The guest's working directory is the confinement root, and
+from inside it that is `/`. There is no `chdir` here and no per-process directory to change (D23),
+so the only directory the guest can be *in* is that root. Answering the host's own working
+directory would be a fact about this process rather than about the guest, and it would name a path
+outside the confinement boundary.
+
+**`LoggingProtocol.getProcessTimestamp()J` is a decision with one ASSUMED half.** The host owns
+"when did this process start"; the **units** are assumed to be milliseconds since the Unix epoch,
+which is the overwhelmingly common Android spelling (`System.currentTimeMillis`,
+`SystemClock.elapsedRealtime` and `Process.getStartElapsedRealtime` are all milliseconds, though
+the last two are measured from boot). If the engine ever subtracts this from its own
+`CLOCK_MONOTONIC`, the difference is wrong by the machine's uptime. Nothing on steps 6-12 does —
+the value is taken and stored — so the risk is **recorded and not discharged**. The table's default
+is `Unanswered`; the gate decides it at its own call site.
+
+**`sizeof(JavaVMAttachArgs) = 24` joins the ASSUMED layouts** (`FILE` 152, `dl_phdr_info` 64,
+`struct tm` 56, `stat` 128, `statvfs` 112, `dirent` 280, `sigset_t` 8, `addrinfo` 48). There is
+still no NDK on this machine. Its safety argument is the strongest of the family: the only field
+read is `name` at offset 8, and every field of the struct is a pointer on LP64 except the leading
+`jint` and its padding, so the layout is forced once the field order is right. It is **exercised**
+— the engine really does pass one, and the name `"Main"` came out of it.

@@ -27,6 +27,13 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
+**1,230 passing, 0 failing, 17 ignored** (`cargo test --workspace --release`, after M4 and after
+the texture work that ran in parallel with it). The M4 gate `tests/jni_startup.rs` is two of
+them, and it takes 48 s because it loads 109 MB and runs 3,594 initializers before it starts.
+Mutation: `tools/mutate.py` holds **335** rows; M4's own seventeen (`--only jni`) are 17/17, and
+the whole table has **not** been run since — that is owed. The earlier figure, kept for the shape
+of the history:
+
 **1134 passing, 0 failing, 13 ignored** (`cargo test --workspace --release`, 2026-09-21 — was
 1,093 before M3 task 3 phases 3d+3e, 1,059 before phase 3c, 1,004 before phase 3b, 959 before
 phase 3a, 926 before phase 2, 877 before phase 1, and 608 before `omni-bionic` existed, so those
@@ -124,8 +131,9 @@ What stays unclaimed is what has been **run**, which is Windows x86-64 only.
 | **M0** APK parsed, libraries extracted | **Reached** | All 11 arm64-v8a libraries extracted to a content-addressed 4 KB-aligned cache and mapped from it. Exactly one entry in the whole APK is directly mappable (a 1,447-byte icon) — no library is, which is why the cache exists |
 | **M1** ELF loaded and relocated | **Reached** | All **568,806** relocations applied (568,272 APS2 + 534 `DT_JMPREL`) and **read back out of mapped memory**, RELRO sealed over exactly 5,205,568 bytes with a child process asserting the fault, 565 imports enumerated, 3,594 initializers collected |
 | **M2** Real ARM64 Roblox code executes | **Reached** | Three real `libroblox.so` functions run with `init_array` deliberately **not** run. A base64 function returns **256 predicted values, one per byte**, predicted from RFC 4648 — and a reviewer hand-decoded all 26 words and wrote an independent interpreter to confirm. A stack-protected leaf proves D13 three ways including both failure paths |
-| **M3** All 3,594 initializers | **In progress** — Task 1 of 4 complete | See below |
-| M4-M8 | Not started | JNI, GameActivity, Vulkan, first frame, interactive |
+| **M3** All 3,594 initializers | **Reached** | Every entry runs in order, asserted on the recorded `(index, address)` sequence and on state the initializers wrote. **91,581,468 guest instructions**; all 188 statically-reachable imports accounted for |
+| **M4** `JNI_OnLoad` succeeds | **Reached** | Returns **`0x00010006`** on the real engine, both `JavaVM` slots exercised, **0** lookups nothing declares, and **19 of 21** of §8's scripted steps 7-12 return. D28 |
+| M5-M8 | Not started | GameActivity (`initializeNativeCode`), Vulkan, first frame, interactive |
 
 ## M3 progress — exact
 
@@ -352,7 +360,101 @@ a fabricated `unsupported` arm either.
    accounted for**, 41 new tests, 26 new mutation rows, 26/26 caught. One new platform primitive
    and no socket seam.
 
-## Next action
+## M4 is reached — what it left for M5 (§8 step 13, `initializeNativeCode`)
+
+M4 delivered `jni-surface.md` §8 steps 6 through 12 (D28). The gate is
+`cargo test -p omni-android --release --test jni_startup`, which loads the real library, runs all
+3,594 initializers, calls `JNI_OnLoad`, and drives the scripted Java-side sequence.
+
+**What is VERIFIED, on the real `libroblox.so`, n = 1 run each:**
+
+| | |
+|---|---|
+| `JNI_OnLoad` at `base + 0x2173ff4` | returns **`0x00010006`** |
+| the two `JavaVM` slots | `GetEnv` 11, `AttachCurrentThread` 1. The thread began **detached**, so the engine's own scoped-attach helper took the `JNI_EDETACHED` branch and attached with the name `"Main"` out of `JavaVMAttachArgs` |
+| step 6a/6b | 23 `FindClass`, 46 `GetStaticMethodID`, 8 `GetFieldID`, 20 `NewGlobalRef`, 18 `ExceptionCheck`, **0 lookups nothing declares** |
+| §8 steps 7-12 | **19 of 21** downcalls return, step 12 included |
+| whole run | 22 upcalls into Java, **113 distinct imported symbols** called |
+| the JNI census over the whole run | 45 `GetStringUTFChars` each paired with a `ReleaseStringUTFChars`, **0 buffers left pinned** |
+
+### The two scripted downcalls that do not return, exactly
+
+1. **`nativeInitFastLog` needs `strftime`**, and `omni-bionic` does not have it. Not a binding gap:
+   there is no implementation to bind. It is a full C library function with a format language, and
+   a partial one is the plausible-stub shape — an unimplemented specifier produces wrong *text*,
+   which nothing downstream can tell from right text.
+2. **`nativeSetPlatformHeadersWithIdfa` hands `strchr` a pointer to memory that is mapped nowhere.**
+   MEASURED: `region_at` on it returns `None`, and it is in neither the JNI arena nor the pinned
+   pool, so it is not a pointer this layer handed out. Whether it is a guest-heap pointer the
+   engine's own allocator released, or something this layer got wrong further back, is **not
+   established**. The gate prints the pointer and what is mapped there on every failed step, which
+   is the instrumentation the next person needs.
+
+### What step 13 needs that does not exist yet
+
+§8 rows 13, 13a and 14 are explicit, and none of this is built:
+
+* **`ALooper_forThread` / `ALooper_acquire` / `ALooper_addFd` / `ALooper_prepare`.** §8.1's fourth
+  failure mode is that `ALooper_forThread()` returning null makes `initializeNativeCode` return
+  **`0`** and Java-side startup fail *silently*. A looper has to exist on the calling thread
+  **before** the call, and a second one on the game thread the glue spawns.
+* **`AAssetManager_fromJava`**, and a Java `AssetManager` object for it to accept.
+  `AConfiguration_new` / `_fromAssetManager` / `_getLanguage` / `_getCountry` follow on the game
+  thread.
+* **`ANativeWindow`** and a Java `Surface` that `ANativeWindow_fromSurface` accepts — that is step
+  17, but the type has to exist before step 13's glue can store one.
+* **`pipe` and `fcntl(F_SETFL, O_NONBLOCK)`**, twice. Neither is bound; neither is among the 188.
+* **`__system_property_get("ro.build.version.sdk")`** is bound and answers, but the host has to
+  *set* the property or the SDK version field is empty.
+* **The glue blocks on `pthread_cond_wait` until the game thread signals `app->running`** (§8 row
+  14). Guest threads exist (D24) and run in short budget windows, so this is expected to work —
+  but §8.1's fifth failure mode is that a deadlock here is indistinguishable from a hang.
+  **Instrument it**: `Boundary::last_call` is the one thing that identifies a guest parked inside
+  a handler, and the M3 gate's `OMNI_INIT_WATCHDOG` is the pattern.
+
+### What M4 leaves in place for it
+
+* **`RegisterNatives` is implemented.** `GameActivity_register` binds 24 natives from a
+  `JNINativeMethod[24]` at `.data.rel.ro 0x062dc1c8` — 24 bytes per entry, which Section F
+  VERIFIES against the real table. Every binding lands in `Jni::registrations`, and a method the
+  registry does not declare is **recorded, not refused**, with its function pointer kept.
+* **The Tier 0 classes step 13 aborts without are declared**: `GameActivity`'s five methods,
+  `Insets`' four fields, `WindowInsetsCompat$Type`'s nine static masks (distinct bits, asserted),
+  `Configuration`'s 18 fields plus `getLocales()`, `ActivityThread`, `ClassLoader`, `String`.
+  `getWindowInsets` and `getWaterfallInsets` return a real `Insets` instance.
+* **`Jni::misses` is the measurement to read first** if step 13 aborts. A Tier 0 miss is a
+  `CHECK_NOT_NULL` three thousand instructions before the abort, and the list has it by name.
+* **A contradiction with §3.1, unresolved.** §3.1 calls `Configuration`'s fields "**18 int
+  fields**" and lists `fontScale` among them. `fontScale` is a `public float` on every Android
+  release, and Section D shows the analysis could not resolve **any** of these descriptors
+  (`<unresolved>`), so "18 int" is the analyst's summary and not a measurement. It is declared `F`
+  here. If the engine asks for it as `I` the lookup misses **and the miss is recorded with the
+  descriptor it asked for**, which is the measurement that settles it.
+* **`tools/gen_dex_surface.py` regenerates `src/jni/surface.rs`** and reproduces the committed file
+  byte for byte. Re-run it if the APK changes; it also answers "what members does class X have"
+  for any dex class, which is how `DeviceParams`, `DeviceStaticParams`, `PlatformParams` and
+  `InitParams` got their real field lists.
+
+### Two host-side facts the script depends on, which a new harness must reproduce
+
+* **The confinement root needs an Android directory tree.** The engine canonicalises
+  `/data/data/com.roblox.client/{cache,files,shared_prefs}`, `/data/app/com.roblox.client`,
+  `/data/app/android` and `/storage/emulated/0/Android/data/com.roblox.client`, and throws
+  `boost::filesystem::canonical: No such file or directory` on any that is absent. The gate's
+  `Scratch::DIRECTORIES` is the list.
+* **`nativeSetAssetPath` takes a directory, not the apk file.** MEASURED: passing
+  `/data/app/com.roblox.client/base.apk` made the engine throw `'…/base.apk' is not a directory`.
+  It then canonicalises `dirname(assetPath)/android` as well.
+
+### One thing that happened once and has not reproduced
+
+An early run of the gate exited with `STATUS_ACCESS_VIOLATION` **after both tests reported `ok`**,
+on a run in which four scripted steps failed. It has not reproduced since the step count rose to
+19, and nothing was changed that would explain it. It is recorded rather than claimed fixed:
+teardown of a guest with live guest threads is the obvious suspect, and the M3 gate's note about
+the instance never being released is the other end of the same thread.
+
+## M3 Task 4, kept for the record — it is done, and M4 has been done on top of it
 
 **M3 Task 4: run all 3,594 initializers — the M3 gate.** Every import phase of Task 3 is complete
 and committed (D20, D21, D22, D23, D24, D25), and **all 188 statically-reachable imports are
@@ -717,12 +819,15 @@ Read in this order:
 7. **`.superpowers/sdd/android-abi-plan/task-1-report.md`** and **`task-1-review.md`** — only if Task
    2 needs the measurement detail behind D17.
 
-**First concrete action: M3 Task 4, the milestone gate** — run all 3,594 initializers. Task 2 was
-reviewed (its findings are in `task-2-review.md`) and Task 3 is complete: every one of the 188
-statically-reachable imports is answered, refused by name, placed as a data object, or
-deliberately absent. "Next action" above has the split, the eight things Task 4 will want from
-this layer that do not exist yet, and the one decision (`AT_HWCAP`) that will stop the run on the
-first initializer that asks.
+**First concrete action: M5 — §8 step 13, `initializeNativeCode`.** M3 and M4 are both reached;
+"M4 is reached" above has what step 13 needs that does not exist (`ALooper`, `AAssetManager`,
+`ANativeWindow`, `pipe`, `fcntl`), the two scripted downcalls M4 did not get to return, and the
+two host-side facts a new harness has to reproduce. Read D28 and its amendment first, then
+`jni-surface.md` §5.2 — `initializeNativeCode`'s fourteen steps are written out there instruction
+by instruction — and §8.1's failure modes 4 and 5, which are the two that fail *silently*.
+
+**Also owed:** the whole mutation table has not been run since M4 and the texture work landed.
+335 rows; M4's own seventeen are 17/17 under `--only jni`.
 
 Task 2's review package and dispatch instructions, which were the previous first action, are kept
 in `task-2-review.md`; nothing above depends on them any more.

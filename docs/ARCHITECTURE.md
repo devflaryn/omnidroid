@@ -220,6 +220,22 @@ from the binary.
 
 ---
 
+**The rule one level up: JNI (M4, D28).** `libroblox.so` reaches a JNI function by loading a slot
+out of a `JNINativeInterface` whose layout the NDK fixes, so the *slot list* is the specification
+the same way the import list is. **59 of 233** slots and **2 of 8** `JavaVM` slots are ever
+dereferenced, and all 241 get a real thunk address: the 174 this layer does not implement refuse
+**naming themselves**, because a null table entry would turn a call the analysis said cannot
+happen into a branch to zero with nothing attached to it — the same failure shape `region` exists
+to replace. The class and member surface follows the same rule from the other side: a *lookup* the
+registry cannot answer returns null with a pending exception **and is recorded**, and a *call* to a
+member nobody decided the answer for refuses by name.
+
+**And the structural fact that shapes the whole layer:** the Java side is the **initiator**.
+`libroblox.so` does not bootstrap itself — flags, settings, base URLs, directories and
+`InitParams` all arrive from Java, and the engine waits for them. So `omni-android` owns a
+*script* (`jni::script`) and the engine responds to it. That is an orchestration problem, not an
+interpretation one, and it is the whole of why D7 holds.
+
 ## 6. ARM64 execution
 
 `omni-cpu` exposes a `GuestCpu` trait (create a context, run from an address, handle a thunk exit,
