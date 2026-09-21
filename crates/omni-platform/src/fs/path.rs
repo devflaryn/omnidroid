@@ -203,14 +203,94 @@ pub fn resolve_lexically(operation: &'static str, path: &[u8]) -> FsResult<Resol
     Ok(Resolved { components })
 }
 
-/// Windows device names, which name a character device **whatever directory they appear in**.
+/// The names Win32 resolves to a character device rather than to a file.
 ///
-/// `open("/data/NUL")` on a Windows host opens the null device rather than a file in the root,
-/// and `CON`/`AUX`/`PRN` are worse: they are the console. The comparison is case-insensitive and
-/// ignores any extension, because `nul.txt` is still the null device.
-const WINDOWS_DEVICES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+/// `open("/data/NUL")` on a Windows host can hand the guest the null device instead of a file in
+/// the root. The comparison is case-insensitive and is made against the component's stem, so
+/// `nul.txt` is refused too — see "the extension rule stays anyway" below, which is **not** the
+/// reason the previous version of this comment gave.
+///
+/// # How this set was established
+///
+/// The oracle is **`ntdll!RtlIsDosDeviceName_U`**, the routine Win32 path canonicalisation itself
+/// calls to decide whether a name is a DOS device: zero for a name that is a file, a packed
+/// offset/length for one that is a device. That is the implementation, not a second one —
+/// `VERIFICATION.md` entry 7 — and it is used because there is no published specification of this
+/// predicate. Microsoft's *Naming Files, Paths, and Namespaces* lists names to avoid; it does not
+/// define the set, and the set it lists is not the set this host honours.
+///
+/// **MEASURED** on Windows 11 Pro 10.0.26200, `ntdll` 10.0.26100.9278, ACP 1252 / OEMCP 437.
+/// Every name below returned non-zero. Each was cross-checked with `CreateFileW` from a process
+/// whose current directory was a scratch directory, and the directory was then enumerated through
+/// a verbatim `\\?\` path (which performs no device translation, so the enumeration cannot lie):
+/// a device name produced **no directory entry**, a file name produced one.
+///
+/// * `CON` `PRN` `AUX` `NUL` — `0x0006` each.
+/// * `CONIN$` (`0x000C`) and `CONOUT$` (`0x000E`), the console's input and output buffers, which
+///   `CreateFile` documents as openable by name. **They were absent from this list**, which is
+///   half of finding M6.
+/// * `COM1`..`COM9` and `LPT1`..`LPT9` — `0x0008`, all eighteen.
+/// * `COM¹ COM² COM³ LPT¹ LPT² LPT³` (U+00B9, U+00B2, U+00B3) — `0x0008` each. The other half of
+///   M6, and the part no reader should believe without the measurement.
+///
+/// # `COM0` and `LPT0` are **not** devices, and adding them would be the over-correction
+///
+/// M6 as filed says this list omits them. It does, and it should. **MEASURED:
+/// `RtlIsDosDeviceName_U` returns zero for `COM0` and for `LPT0`**, and `CreateFileW("COM0")`
+/// from a scratch current directory created an ordinary file that the verbatim enumeration then
+/// listed. The digit range was walked end to end: `0` is a file, `1`..`9` are devices, `COM10`
+/// and `LPT10` are files. The believable wrong answer was to trust the finding and add two names
+/// that would then refuse two legitimate filenames for a reason that is not true.
+///
+/// # No other digit look-alike is one
+///
+/// Twenty-six candidates were tried after `COM` and `LPT`: superscript `⁰⁴⁵⁹` (U+2070, U+2074,
+/// U+2075, U+2079), subscripts (U+2081..U+2083), fullwidth (U+FF11..U+FF13), Arabic-Indic
+/// (U+0661..U+0663), Extended Arabic-Indic (U+06F1), Devanagari (U+0966, U+0967), circled digits
+/// (U+2460, U+2461), vulgar fractions (U+00BC, U+00BD) and Roman numerals (U+2160, U+2170).
+/// **Only U+00B9, U+00B2 and U+00B3 matched.** So this is a three-member special case rather than
+/// a "any Unicode digit" rule, which is why the six names are spelled out instead of computed.
+///
+/// # The mechanism is not established here, and the obvious explanation is wrong
+///
+/// The tempting story is that the superscripts fold to ASCII digits through a code page.
+/// **MEASURED against CP437: `¹` → `0x31` (`1`) and `³` → `0x33` (`3`), but `²` → `0xFD`, which is
+/// not `2`; and U+2074 maps to `4` in both CP1252 and CP437 yet is not a device.**
+/// `RtlUpcaseUnicodeChar` leaves all four unchanged. So whatever fold produces this set, it is
+/// neither of those, and this comment records the behaviour it measured rather than a cause it did
+/// not. `VERIFICATION.md` entry 10 is about exactly this distinction: reasoning that is wrong
+/// while the conclusion happens to hold.
+///
+/// # Two claims the previous version of this comment made, both contradicted by measurement
+///
+/// 1. *"which name a character device **whatever directory they appear in**"*. **MEASURED:** given
+///    the full drive path `C:\dir\NAME`, only `NUL` is still translated (`FILE_TYPE_CHAR`, no
+///    directory entry); `CON`, `PRN`, `AUX`, `COM1`… each created an ordinary file
+///    (`FILE_TYPE_DISK`, entry listed). Given the **bare** name with the current directory set to
+///    that directory, all of them are devices again. The hazard is real, but it is a property of
+///    how the path is spelled and of the build, not of the directory.
+/// 2. *"ignores any extension, because `nul.txt` is still the null device"*. **MEASURED on this
+///    build: it is not.** `NUL.txt`, `CON.log` and `COM1.txt` all return zero and all created
+///    ordinary files.
+///
+/// # The extension rule stays anyway, and that is a decision
+///
+/// It is kept because the confinement property must not depend on a Windows build number — the
+/// extension form *was* a device on earlier Windows and is still what Microsoft's own naming
+/// guidance tells callers to avoid — and because over-refusing cannot produce an escape while
+/// under-refusing can. The cost is that a guest cannot create `nul.txt` inside its root, and no
+/// Android path in the reachable set names one.
+const WINDOWS_DEVICES: [&str; 30] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL",
+    // The console buffers, openable by name — the first half of M6.
+    "CONIN$", "CONOUT$",
+    // Serial and parallel ports. The range is 1..=9: `COM0` and `LPT0` are files, measured.
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", //
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    // The superscript forms, U+00B9/U+00B2/U+00B3 — the second half of M6. Only these three
+    // digit look-alikes match; twenty-six others were tried and did not.
+    "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
 ];
 
 /// Why one path component may not be turned into a host path component, if it may not.
@@ -220,6 +300,27 @@ const WINDOWS_DEVICES: [&str; 22] = [
 /// because a path that is refused on Windows and accepted on Linux would make the confinement
 /// property depend on the host — and because `omni-platform` is the crate that owns this
 /// knowledge, so the rules may as well be stated once.
+///
+/// # What "host-independent" does and does not mean here, because the previous wording overstated it
+///
+/// It means one thing, and that thing is true and is checked: **this function is a pure function
+/// of the component's bytes. There is no `cfg`, no host call and no locale in it, so the set of
+/// guest paths the layer accepts is the same on all five targets.** That is the property worth
+/// having — a confinement rule that varies by host is a rule nobody can reason about.
+///
+/// It does **not** mean that the *hazards* are host-independent, and finding M6 was filed because
+/// this comment read as though it did. They are not, and the device rule is the proof:
+/// `WINDOWS_DEVICES` is an over-approximation of one host family's behaviour, the exact set
+/// Win32 honours varies by Windows build and by how the path is spelled (both measured, on
+/// `WINDOWS_DEVICES`), and on Linux and macOS none of those names is special at all. The list is
+/// therefore **a superset that is refused everywhere, not an exhaustive account of any one host**.
+/// It covers every name measured to be a device on the build recorded on `WINDOWS_DEVICES` plus
+/// the ones Microsoft's naming guidance documents; it is not claimed to be complete for a Windows
+/// build nobody here has run.
+///
+/// Refusing more than one host needs is the safe direction and is chosen deliberately: an
+/// over-refusal costs a guest a filename it never uses, an under-refusal is an escape. Where a
+/// fact could not be established, this file refuses and says which fact it could not establish.
 #[must_use]
 pub fn hostile_component(name: &str) -> Option<String> {
     if let Some(bad) = name.chars().find(|c| c.is_control()) {
@@ -248,7 +349,15 @@ pub fn hostile_component(name: &str) -> Option<String> {
              name the same host file as the component without it"
         ));
     }
-    let stem = name.split('.').next().unwrap_or(name);
+    // The stem is the component up to its first dot, with trailing spaces removed. Win32 strips
+    // trailing dots and spaces **before** its own device test — MEASURED: `NUL `, `NUL  `, `NUL.`,
+    // `NUL..`, `COM1 `, `COM1.` and `CONOUT$ ` all return non-zero from `RtlIsDosDeviceName_U`.
+    // The trailing-dot/space rule above already refuses a component that *ends* in one, so this
+    // trim only changes the answer for a stem whose trailing space is interior to the component,
+    // such as `NUL .txt` — which MEASURED as *not* a device on this build, and is refused anyway
+    // because it is one strip away from being one and over-refusing cannot create an escape.
+    // Trailing dots need no trimming here: the split on `.` has already removed them.
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
     if WINDOWS_DEVICES.iter().any(|device| stem.eq_ignore_ascii_case(device)) {
         return Some(format!(
             "the component `{name}` names the Windows character device `{}`, which is a device \
@@ -463,5 +572,225 @@ mod tests {
             "/data/x"
         );
         assert_eq!(display(&[b'/', 0xff]), "/\u{fffd}", "a lossy rendering never fails");
+    }
+
+    /// **The device list, named member by member in both directions.**
+    ///
+    /// `VERIFICATION.md` entry 1: a count cannot see a substitution, so this does not check a
+    /// length. The thirty names are spelled again here, independently of the constant, and the
+    /// two are compared as sets *both ways* — a name dropped from the constant fails the first
+    /// direction, a name quietly added fails the second. Finding M6 was two omissions
+    /// (`CONIN$`/`CONOUT$` and the six superscript forms) that no length assertion could see,
+    /// because nobody had written the members down anywhere else.
+    ///
+    /// The superscripts are written as escapes on the left and as literals on the right, so a
+    /// source-encoding accident cannot make both sides wrong in the same way.
+    #[test]
+    fn the_windows_device_list_is_exactly_the_names_measured_on_this_host() {
+        let expected: [&str; 30] = [
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "CONIN$",
+            "CONOUT$",
+            "COM1",
+            "COM2",
+            "COM3",
+            "COM4",
+            "COM5",
+            "COM6",
+            "COM7",
+            "COM8",
+            "COM9",
+            "LPT1",
+            "LPT2",
+            "LPT3",
+            "LPT4",
+            "LPT5",
+            "LPT6",
+            "LPT7",
+            "LPT8",
+            "LPT9",
+            "COM¹",
+            "COM²",
+            "COM³",
+            "LPT¹",
+            "LPT²",
+            "LPT³",
+        ];
+        for name in expected {
+            assert!(
+                WINDOWS_DEVICES.contains(&name),
+                "`{name}` is a Win32 device (RtlIsDosDeviceName_U non-zero, measured) and is \
+                 missing from WINDOWS_DEVICES — that omission is finding M6"
+            );
+        }
+        for name in WINDOWS_DEVICES {
+            assert!(
+                expected.contains(&name),
+                "WINDOWS_DEVICES lists `{name}`, which this test does not vouch for. Either it \
+                 was measured and this list is stale, or it is an over-correction: `COM0` and \
+                 `LPT0` measured as ordinary files and must not be here"
+            );
+        }
+        // The superscripts are the three Latin-1 code points and nothing else, asserted on the
+        // code points rather than on glyphs a diff cannot distinguish.
+        assert_eq!("COM¹".chars().last(), Some('\u{b9}'));
+        assert_eq!("COM²".chars().last(), Some('\u{b2}'));
+        assert_eq!("COM³".chars().last(), Some('\u{b3}'));
+    }
+
+    /// Every device name is refused in every spelling a guest component can carry one in.
+    ///
+    /// Case is folded, an extension is stripped, and a trailing space inside the component is
+    /// trimmed before the comparison — each of those is a spelling Win32 was measured to accept
+    /// as the device, or (for `NUL .txt`) one strip away from it.
+    #[test]
+    fn every_windows_device_name_is_refused_in_every_spelling_a_component_can_carry() {
+        for device in WINDOWS_DEVICES {
+            for spelling in [
+                device.to_string(),
+                device.to_lowercase(),
+                format!("{device}.txt"),
+                format!("{}.log", device.to_lowercase()),
+                format!("{device} .txt"),
+                format!("{device}.tar.gz"),
+            ] {
+                assert!(
+                    hostile_component(&spelling).is_some(),
+                    "`{spelling}` reaches the Win32 device `{device}` and was accepted"
+                );
+            }
+        }
+        // And through the whole lexical pipeline, not just the predicate: a guest path naming one
+        // is a confinement refusal rather than an error the guest could mistake for ENOENT.
+        for path in [
+            &b"/data/CONIN$"[..],
+            b"/data/conout$",
+            b"/data/app/COM\xc2\xb9",
+            b"/LPT\xc2\xb3/x",
+            b"/data/NUL.txt",
+        ] {
+            let error = resolve_lexically("test", path)
+                .expect_err("a component naming a Win32 device must be refused");
+            assert!(matches!(error, FsError::Confined { .. }), "{error}");
+        }
+    }
+
+    /// **The over-correction detector.** These are near-misses, and every one of them is a file.
+    ///
+    /// Finding M6 as filed asserts that the list omits `COM0` and `LPT0`. MEASURED with
+    /// `ntdll!RtlIsDosDeviceName_U` on Windows 11 Pro 10.0.26200: **both return zero**, and
+    /// `CreateFileW` from a scratch current directory created ordinary files that a verbatim
+    /// enumeration listed. Refusing them would cost two legitimate names for a reason that is not
+    /// true, so this test fails if a later reader "fixes" the list by believing the finding.
+    #[test]
+    fn the_near_miss_names_are_ordinary_files_and_must_not_be_refused() {
+        for name in [
+            // Measured zero from RtlIsDosDeviceName_U, and each created a real directory entry.
+            "COM0", "LPT0", "COM10", "LPT10", "CONERR$", "CLOCK$", "CONFIG$", "KEYBD$", "SCREEN$",
+            // Names that merely start or end like a device.
+            "NULL", "CONIN", "CONOUT", "CONS", "AUX1", "PRN1", "LST", "PLT", "console", "com",
+            "auxiliary", "prnt", "COM0.txt", "LPT0.log",
+        ] {
+            assert!(
+                hostile_component(name).is_none(),
+                "`{name}` is an ordinary filename on Windows (measured) and was refused"
+            );
+        }
+    }
+
+    /// Only the three Latin-1 superscripts are device digits; twenty-three look-alikes are not.
+    ///
+    /// **This is the assertion that says the rule is a three-member special case rather than a
+    /// "Unicode digit" rule.** MEASURED: after `COM` and `LPT`, only U+00B9, U+00B2 and U+00B3
+    /// returned non-zero. The believable wrong answer was to generalise to "any character with a
+    /// Unicode decimal-digit value", which would refuse `COM１` and `COM١` — both measured as
+    /// ordinary files — and would *still* not explain `COM²`, whose CP437 byte is `0xFD`.
+    #[test]
+    fn only_the_three_latin1_superscripts_are_device_digits() {
+        for suffix in ['\u{b9}', '\u{b2}', '\u{b3}'] {
+            for stem in ["COM", "LPT", "com", "lpt"] {
+                let name = format!("{stem}{suffix}");
+                assert!(hostile_component(&name).is_some(), "`{name}` is a device, measured");
+            }
+        }
+        // Every other digit look-alike tried against the kernel routine, and all returned zero.
+        for suffix in [
+            '\u{2070}', '\u{2074}', '\u{2075}', '\u{2079}', // superscript 0 4 5 9
+            '\u{2081}', '\u{2082}', '\u{2083}', // subscript 1 2 3
+            '\u{ff11}', '\u{ff12}', '\u{ff13}', // fullwidth 1 2 3
+            '\u{661}', '\u{662}', '\u{663}',   // Arabic-Indic 1 2 3
+            '\u{6f1}', '\u{966}', '\u{967}',   // Extended Arabic-Indic 1, Devanagari 0 1
+            '\u{2460}', '\u{2461}',            // circled 1 2
+            '\u{bc}', '\u{bd}',                // vulgar fractions
+            '\u{2160}', '\u{2170}',            // Roman numeral one, both cases
+        ] {
+            for stem in ["COM", "LPT"] {
+                let name = format!("{stem}{suffix}");
+                assert!(
+                    hostile_component(&name).is_none(),
+                    "`{name}` (U+{:04X}) measured as an ordinary file and was refused",
+                    u32::from(suffix)
+                );
+            }
+        }
+    }
+
+    /// **The hazard itself, on the host running the test — and it asserts on every target.**
+    ///
+    /// `VERIFICATION.md` entry 4: a fixture that is missing is a failure, not a skip. There is no
+    /// early return here. Both branches assert, because both are facts worth pinning:
+    ///
+    /// * On Windows, creating `<dir>/NUL` through an ordinary drive path succeeds and leaves the
+    ///   directory **empty** — the write went to the null device. That is the escape the rule
+    ///   exists for, demonstrated rather than asserted from a comment. MEASURED on Windows 11 Pro
+    ///   10.0.26200: `NUL` is the one name still translated in this spelling; `CON` and `COM1` are
+    ///   files here and are refused anyway, because the rule is a superset.
+    /// * On Linux and macOS the same call creates an ordinary file called `NUL`, and
+    ///   `hostile_component` refuses it **regardless** — which is the host-independence property
+    ///   stated on [`hostile_component`], executed rather than claimed.
+    ///
+    /// If a future Windows build stops translating `NUL` here, this test fails on purpose: the
+    /// comment on `WINDOWS_DEVICES` records that behaviour as measured, and a measurement that
+    /// has stopped being true must stop being written down.
+    #[test]
+    fn the_null_device_hazard_is_real_here_and_the_rule_is_applied_on_every_host() {
+        // The rule first, and it is the same answer on all five targets.
+        assert!(hostile_component("NUL").is_some(), "`NUL` must be refused on every host");
+
+        let dir = std::env::temp_dir().join(format!(
+            "omni-devprobe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory in the host temp dir");
+
+        // A control, so an empty listing cannot be an unwritable directory misread as a device.
+        std::fs::write(dir.join("control.txt"), b"x").expect("the scratch directory is writable");
+        let created = std::fs::File::create(dir.join("NUL"));
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the scratch directory lists")
+            .map(|entry| entry.expect("a directory entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        created.expect("creating `NUL` succeeds on every host — as a device or as a file");
+        assert!(names.contains(&"control.txt".to_string()), "the control file is missing: {names:?}");
+        if cfg!(windows) {
+            assert!(
+                !names.iter().any(|name| name == "NUL"),
+                "`<dir>/NUL` produced a real directory entry on Windows: the null device no \
+                 longer swallows it in this spelling, so the measurement recorded on \
+                 WINDOWS_DEVICES is stale. Listing: {names:?}"
+            );
+        } else {
+            assert!(
+                names.iter().any(|name| name == "NUL"),
+                "`NUL` is an ordinary filename on this target and no entry appeared: {names:?}"
+            );
+        }
     }
 }

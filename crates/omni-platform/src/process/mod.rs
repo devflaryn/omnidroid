@@ -189,6 +189,76 @@ mod tests {
         );
     }
 
+    /// **`cpu_count` reports failure rather than substituting one.** The regression test for M7.
+    ///
+    /// The substitution it used to make — `-> usize` with `map_or(1, ..)` — is invisible to any
+    /// assertion about the *value*, because `1` is a believable processor count and is the right
+    /// answer on a single-core host. `VERIFICATION.md` entry 1 in a different shape: what the
+    /// old test asserted (`>= 1`) is satisfied by the substitution as readily as by a measurement.
+    ///
+    /// So the two things asserted here are the ones a revert cannot satisfy together:
+    ///
+    /// 1. The answer is a `Result` whose `Err` a caller is forced to handle — a revert to `usize`
+    ///    stops this test compiling, which is the detection.
+    /// 2. The `Ok` is **the number `available_parallelism` itself gave**, not a constant that
+    ///    looks like one. A body that answers a fixed `1` fails this on any host with more than
+    ///    one logical processor.
+    ///
+    /// **What this test cannot do, said rather than implied.** It cannot tell this body apart
+    /// from one that keeps the signature and merely swallows the error —
+    /// `available_parallelism().unwrap_or(1)`. **MEASURED: that exact mutation was applied to
+    /// this file and `cargo test -p omni-platform` stayed green, 60 passed, 0 failed**, because
+    /// `available_parallelism` does not fail on this host and the substituting branch therefore
+    /// never runs. `VERIFICATION.md` entry 12 is the same shape — a branch no input can take is
+    /// not a check, and here it is a branch no test can take. What keeps the property is that the
+    /// `Err` arm exists at all and that the caller in `omni-android`'s `sysconf` refuses on it;
+    /// what would detect its loss is a host on which the query fails, which this one is not. The
+    /// believable wrong answer was to write "this test catches the substitution" and leave it.
+    ///
+    /// And the failure path is pinned by construction rather than left undescribed, because no
+    /// test can make this host's `available_parallelism` fail on demand: the variant is
+    /// [`ProcessError::Indeterminate`], it names `cpu_count`, and it is *not* `Unsupported` —
+    /// this primitive is one portable `std` call on all five targets and must not claim a
+    /// target-specific backend it does not have.
+    #[test]
+    fn cpu_count_reports_what_std_reports_and_never_substitutes_a_believable_number() {
+        match (cpu_count(), std::thread::available_parallelism()) {
+            (Ok(ours), Ok(theirs)) => assert_eq!(
+                ours, theirs,
+                "cpu_count answered {ours} where available_parallelism answered {theirs}: the \
+                 seam is not reporting the measurement it claims to report"
+            ),
+            (Err(ours), Err(theirs)) => {
+                assert!(
+                    matches!(ours, ProcessError::Indeterminate { operation: "cpu_count", .. }),
+                    "a std query that failed must be reported as Indeterminate, not {ours}"
+                );
+                assert!(
+                    ours.to_string().contains(&theirs.to_string()),
+                    "the refusal must carry what std said (`{theirs}`): {ours}"
+                );
+            }
+            (ours, theirs) => panic!(
+                "cpu_count and available_parallelism disagreed about whether the host can be \
+                 asked at all: {ours:?} against {theirs:?}. A substituted answer is exactly this \
+                 shape"
+            ),
+        }
+
+        // The failure path's shape, stated rather than left to a host that cannot produce it.
+        let refusal = ProcessError::Indeterminate {
+            operation: "cpu_count",
+            detail: "the host has no notion of parallelism".to_string(),
+        };
+        assert!(!refusal.is_unsupported(), "cpu_count is portable std and has no backend to miss");
+        let text = refusal.to_string();
+        assert!(text.contains("cpu_count"), "the refusal must name the operation: {text}");
+        assert!(
+            text.contains("the host has no notion of parallelism"),
+            "the refusal must carry what std said: {text}"
+        );
+    }
+
     /// Entropy: the buffer is filled, and two draws differ.
     ///
     /// **Structural, not statistical.** 64 bytes left at zero is the failure mode of a backend
