@@ -944,19 +944,27 @@ impl Bionic {
     ///
     /// # What this costs, measured
     ///
-    /// **A guest thread costs about 24.5 MiB of commit charge** — measured at 24.56 MiB/thread
-    /// (n = 1 run of 8 contexts, serialized, release;
-    /// `omni-cpu/tests/bench.rs::the_commit_charge_of_a_guest_thread`), against an
-    /// instance-without-threads figure of ~16.7 MiB. Most of it is **not** the code cache: the
-    /// same measurement at 8, 32 and 128 MiB of cache gives 24.56, 34.61 and 34.61 MiB/thread,
-    /// so shrinking the cache does not help. 16 MiB of it is a fixed fast-dispatch table
-    /// `A64EmitX64` holds by value and writes in its constructor for a feature D16 runs
-    /// **disabled** — `crates/dynarmic-sys/patches/README.md` item 4 has the patch, and it is
-    /// **not applied**, because D5 pins the vendored tree byte-for-byte unmodified.
+    /// **A guest thread costs 24.76-24.84 MiB of commit charge**, measured through this very
+    /// path — n = 4 runs of 8 threads, release, `tests/thread_memory.rs`, each run creating them
+    /// from real translated ARM64 code and joining them again. It agrees to within 1% with
+    /// `omni-cpu/tests/bench.rs`'s **24.56 MiB/thread** for a raw context with no adapter and no
+    /// guest stack (n = 1 run of 8 contexts), so what this layer adds per thread is small.
     ///
-    /// So an instance whose guest creates threads is not an instance that costs 16.7 MiB. Use
-    /// [`ThreadHost::with_limit`] to bound it; the default is [`MAX_GUEST_THREADS`], which is the
-    /// arena's own capacity rather than a judgement about memory.
+    /// Most of it is **not** the code cache: the same `omni-cpu` measurement at 8, 32 and 128 MiB
+    /// of cache gives 24.56, 34.61 and 34.61 MiB/thread, so shrinking the cache does not help.
+    /// 16 MiB of it is a fixed fast-dispatch table `A64EmitX64` holds by value and **writes in
+    /// its constructor** for a feature D16 runs **disabled** —
+    /// `crates/dynarmic-sys/patches/README.md` item 4 has the patch, and it is **not applied**,
+    /// because D5 pins the vendored tree byte-for-byte unmodified.
+    ///
+    /// **What comes back is the figure the multi-instance requirement turns on, and it is 98.6%**:
+    /// after the eight threads were joined, the residual over the pre-thread baseline was 2.79 to
+    /// 3.18 MiB in total, 0.35 to 0.40 MiB per thread. So the cost is of *concurrent* guest
+    /// threads rather than of threads ever created, and an instance whose guest creates threads
+    /// is not an instance that costs the ~16.7 MiB of a loaded `libroblox.so`: it costs that plus
+    /// about 24.8 MiB for every thread running at once. Use [`ThreadHost::with_limit`] to bound
+    /// it; the default is [`MAX_GUEST_THREADS`], which is the arena's own capacity rather than a
+    /// judgement about memory.
     ///
     /// # Errors
     ///
