@@ -4432,6 +4432,41 @@ fn fixture_with_threads(limit: usize) -> Fixture {
     f
 }
 
+/// Write a `u64` into guest memory from a host thread that does not hold the `Guest`.
+///
+/// `Guest` is deliberately not `Sync` — it owns a `Cell` for the next code offset — so a helper
+/// thread cannot borrow it. Identity mapping (D4) makes a guest address a host address, and
+/// `GuestSpace` is `Send + Sync`, so this is the whole of what such a thread needs.
+fn poke(space: &Arc<omni_mem::GuestSpace>, at: omni_cpu::GuestAddr, value: u64) {
+    let ptr = space.ptr(at, 8).expect("a host pointer for a guest word");
+    // SAFETY: `GuestSpace::ptr` has checked that the eight bytes at `at` are mapped and
+    // committed in this space, and D4 makes the guest address a host address. Guest threads may
+    // be reading this word concurrently, which is the point of it — it is a gate they poll —
+    // and an aligned 8-byte store is what they poll for.
+    unsafe { ptr.cast::<u64>().write_unaligned(value) }
+}
+
+/// Opens a set of guest gate words when dropped, **including while a panic unwinds**.
+///
+/// Every test here that starts a guest thread which spins on a gate needs one. A failing
+/// assertion otherwise leaves that thread spinning for the rest of the test binary: it does not
+/// hang — libtest exits the process when the run finishes — but it burns a core and makes every
+/// later test slower and noisier, and under a mutation run that is dozens of rows. Found when
+/// mutation row `threads-B1` made `pthread_join` block in a test whose program opened its gate
+/// *after* the join, which deadlocked the harness rather than failing it.
+struct OpenOnDrop {
+    space: Arc<omni_mem::GuestSpace>,
+    gates: Vec<omni_cpu::GuestAddr>,
+}
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        for gate in &self.gates {
+            poke(&self.space, *gate, 1);
+        }
+    }
+}
+
 /// Assemble a start routine: `X0` is the guest's `arg`, and whatever it leaves in `X0` is the
 /// thread's `void *`. It finishes with `RET`, which lands on the boundary's sentinel.
 fn start_routine(f: &Fixture, build: impl FnOnce(&mut Asm)) -> omni_cpu::GuestAddr {
@@ -4776,6 +4811,8 @@ fn detaching_twice_is_einval_and_joining_a_detached_thread_is_einval() {
         asm.mov(0, 0);
     });
 
+    let ready = f.guest.data + 0x988;
+    f.guest.write_u64(ready, 0);
     let entry = program(&f, |asm| {
         create_call(&f, asm, out, 0, start, 0);
         asm.mov(22, out as u64);
@@ -4786,16 +4823,43 @@ fn detaching_twice_is_einval_and_joining_a_detached_thread_is_einval() {
         asm.push(mov_reg(0, 19));
         asm.bl(f.thunk("pthread_detach"));
         asm.push(str_imm(0, 22, 24));
+        // Both detaches are done: tell the host, which releases the thread. See below.
+        asm.mov(9, ready as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
         asm.push(mov_reg(0, 19));
         asm.mov(1, 0);
         asm.bl(f.thunk("pthread_join"));
         asm.push(str_imm(0, 22, 32));
-        // Let it go.
-        asm.mov(9, gate as u64);
-        asm.mov(10, 1);
-        asm.push(str_imm(10, 9, 0));
     });
-    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    // **The gate is opened from the host, once both detaches have happened, and not by the guest
+    // program after its own `pthread_join`.** The join here is *expected* to return EINVAL
+    // immediately, because the thread is detached — but a defect that made it block instead
+    // would deadlock against a gate the same program had not reached yet. That is not a
+    // hypothetical: mutation row `threads-B1` refuses the *first* detach, which leaves the
+    // thread joinable, and the first version of this test hung the whole mutation harness on it
+    // rather than failing. A test that deadlocks under the defect it exists to detect reports
+    // nothing at all.
+    let _gates = OpenOnDrop { space: Arc::clone(&f.guest.space), gates: vec![gate] };
+    let opener = {
+        let space = Arc::clone(&f.guest.space);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while space.ptr(ready, 8).map_or(0, |p| unsafe { p.cast::<u64>().read_unaligned() })
+                == 0
+            {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            poke(&space, gate, 1);
+        })
+    };
+    let outcome = run_program(&f, entry);
+    opener.join().expect("the gate opener");
+    assert!(matches!(outcome.expect("completes"), ExitReason::Returned { .. }));
     assert_eq!(f.guest.read_u64(out + 16), 0, "the first detach succeeds");
     assert_eq!(f.guest.read_u64(out + 24), 22, "the second is EINVAL, not a second success");
     assert_eq!(f.guest.read_u64(out + 32), 22, "a detached thread is not joinable");
@@ -4826,6 +4890,11 @@ fn two_guest_threads_joining_each_other_is_edeadlk() {
         f.guest.write_u64(results + offset as usize * 8, 0);
     }
 
+    // The ids double as the gates these two spin on, so a failing assertion releases them.
+    let _gates = OpenOnDrop {
+        space: Arc::clone(&f.guest.space),
+        gates: vec![ids, ids + 8],
+    };
     // Each thread joins whichever id it is handed, spinning until it is non-zero first so that
     // both ids are published before either join is attempted.
     let start = start_routine(&f, |asm| {
@@ -4939,6 +5008,7 @@ fn creating_more_guest_threads_than_the_limit_is_eagain() {
     let out = f.guest.data + 0x800;
     let gate = f.guest.data + 0x980;
     f.guest.write_u64(gate, 0);
+    let _gates = OpenOnDrop { space: Arc::clone(&f.guest.space), gates: vec![gate] };
     let start = start_routine(&f, |asm| {
         asm.mov(9, gate as u64);
         let loop_at = asm.pc();
@@ -5028,17 +5098,15 @@ fn getschedparam_answers_sched_other_with_priority_zero() {
     let _guard = serialized();
     let f = fixture_with_threads(4);
     let out = f.guest.data + 0x800;
-    let gate = f.guest.data + 0x980;
-    f.guest.write_u64(gate, 0);
     f.guest.write_u64(out + 64, 0x5555_5555_5555_5555);
     f.guest.write_u64(out + 72, 0x6666_6666_6666_6666);
+    f.guest.write_u64(out + 80, 0x7777_7777_7777_7777);
+    f.guest.write_u64(out + 88, 0x8888_8888_8888_8888);
+    // **No gate, and the thread returns immediately.** Whether it is still running when the
+    // question is asked does not matter: a joinable thread's record outlives it until the join,
+    // so `pthread_getschedparam` answers either way — and a thread that spins would have to be
+    // released, which is one more way for a failing assertion to leave one behind.
     let start = start_routine(&f, |asm| {
-        asm.mov(9, gate as u64);
-        let loop_at = asm.pc();
-        asm.push(ldr_imm(10, 9, 0));
-        asm.push(subs_imm(10, 10, 0));
-        let here = asm.pc();
-        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
         asm.mov(0, 0);
     });
 
@@ -5051,15 +5119,24 @@ fn getschedparam_answers_sched_other_with_priority_zero() {
         asm.mov(2, out as u64 + 72);
         asm.bl(f.thunk("pthread_getschedparam"));
         asm.push(str_imm(0, 22, 24));
-        asm.mov(9, gate as u64);
-        asm.mov(10, 1);
-        asm.push(str_imm(10, 9, 0));
+        // And about **this** thread, which `pthread_create` did not make. The first version
+        // answered ESRCH for it, because the registry only held created threads — the wrong
+        // answer, since the main thread is a thread of this process with the same default
+        // policy, and a guest asking about itself during initialisation would have taken an
+        // error branch for no reason.
+        asm.bl(f.thunk("pthread_self"));
+        asm.mov(1, out as u64 + 80);
+        asm.mov(2, out as u64 + 88);
+        asm.bl(f.thunk("pthread_getschedparam"));
+        asm.push(str_imm(0, 22, 40));
         asm.push(mov_reg(0, 19));
         asm.mov(1, 0);
         asm.bl(f.thunk("pthread_join"));
     });
     assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
     assert_eq!(f.guest.read_u64(out + 24), 0, "it answers for a thread it created");
+    assert_eq!(f.guest.read_u64(out + 40), 0, "and for the thread asking, which it did not create");
+    assert_eq!(f.guest.read_u64(out + 80) & 0xFFFF_FFFF, 0, "SCHED_OTHER for this thread too");
     assert_eq!(
         f.guest.read_u64(out + 64) & 0xFFFF_FFFF,
         0,
@@ -5172,9 +5249,11 @@ fn a_range_one_guest_thread_unmaps_reaches_another_threads_context() {
     let running = f.guest.data + 0xC88;
     f.guest.write_u64(gate, 0);
     f.guest.write_u64(running, 0);
+    let _gates = OpenOnDrop { space: Arc::clone(&f.guest.space), gates: vec![gate] };
 
     // A guest thread that keeps running -- so it keeps reaching run-window boundaries, which is
     // where a context applies what another one queued for it.
+    let _gates = OpenOnDrop { space: Arc::clone(&f.guest.space), gates: vec![gate] };
     let start = start_routine(&f, |asm| {
         asm.mov(9, running as u64);
         asm.mov(10, 1);
@@ -5318,6 +5397,10 @@ fn a_thread_that_exits_does_not_give_its_block_to_a_live_thread() {
         }
     });
 
+    let _gates = OpenOnDrop {
+        space: Arc::clone(&f.guest.space),
+        gates: (0..3).map(rec).collect(),
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let wait_for = |at: omni_cpu::GuestAddr| {
         while f.guest.read_u64(at) == 0 {

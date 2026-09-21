@@ -2513,13 +2513,13 @@ directory", ADAPTER_FILES,
     # correct guest over a field it is only reading.
     ("threads-B2", "B", "pthread_getschedparam refuses instead of answering the forced default",
      ADAPTER_THREADS,
-     """    let call = Call::inline(c)?;
-    if !call.bionic().knows_guest_thread(thread) {""",
-     """    let call = Call::inline(c)?;
-    if thread != u64::MAX {
+     """    if !known {
+        c.ret().i32(consts::ESRCH);
+        return Ok(());
+    }""",
+     """    if !known || thread != u64::MAX {
         return call.refuse("this runtime does not model scheduling policy");
-    }
-    if !call.bionic().knows_guest_thread(thread) {""",
+    }""",
      ANDROID),
 
     # ------------------------------------------------ phase 3c: cross-context code invalidation

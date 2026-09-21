@@ -365,6 +365,18 @@ impl ThreadTable {
         inner.high_water - inner.free.len()
     }
 
+    /// Whether any live host thread holds this identity.
+    ///
+    /// A linear scan of at most [`MAX_GUEST_THREADS`](crate::bionic::MAX_GUEST_THREADS) entries,
+    /// which is what `pthread_getschedparam` needs to tell "a thread of this instance" from "a
+    /// `pthread_t` nobody handed out". A second map keyed the other way would be a second thing
+    /// to keep in step with this one for a question asked once per call rather than once per
+    /// crossing.
+    #[must_use]
+    pub fn knows(&self, id: GuestThreadId) -> bool {
+        self.inner.lock().slots.values().any(|slot| slot.id == id)
+    }
+
     /// Whether the calling host thread holds a slot.
     #[must_use]
     pub fn is_attached(&self) -> bool {

@@ -69,6 +69,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use omni_bionic::errno::consts;
+use omni_bionic::threads::GuestThreadId;
 use omni_cpu::{ExitReason, GuestCpu, GuestCpuBackend, RunLimit, XReg};
 use omni_mem::{CommitPolicy, GuestAddr, Placement, Protection};
 
@@ -443,9 +444,23 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         (false, 0u64, None)
     } else {
         let at = guest_address(&call, attr, 1)?;
-        let state = call.mem.read_i32(at + ATTR_DETACH_STATE, call.blame(1))?;
-        let size = call.mem.read_u64(at + ATTR_STACK_SIZE, call.blame(1))?;
-        let guard = call.mem.read_u64(at + ATTR_GUARD_SIZE, call.blame(1))?;
+        // **`checked_add` on every offset, because `at` is an address the guest chose.**
+        // `at + ATTR_GUARD_SIZE` wraps for an `attr` near the top of the address space, and a
+        // debug build *panics* on it -- which Global Constraint 11 calls Critical. Today the
+        // first read short-circuits for `attr == usize::MAX`, so the overflow is not reachable;
+        // that is an accident of ordering and not a defence.
+        let field = |offset: usize| {
+            at.checked_add(offset).ok_or_else(|| AbiError::Refused {
+                symbol: call.symbol.clone(),
+                address: call.address,
+                why: format!(
+                    "the guest's pthread_attr_t at {at:#x} is close enough to the top of the                      address space that its own fields do not fit below it"
+                ),
+            })
+        };
+        let state = call.mem.read_i32(field(ATTR_DETACH_STATE)?, call.blame(1))?;
+        let size = call.mem.read_u64(field(ATTR_STACK_SIZE)?, call.blame(1))?;
+        let guard = call.mem.read_u64(field(ATTR_GUARD_SIZE)?, call.blame(1))?;
         match state {
             CREATE_JOINABLE => (false, size, Some(guard)),
             CREATE_DETACHED => (true, size, Some(guard)),
@@ -686,7 +701,19 @@ fn run_guest_thread(spawn: Spawn) {
     // returns and immediately creates another thread finds the resources free rather than
     // transiently needing two of them. The 16 MiB-plus context is the one that matters.
     let (base, len) = stack;
-    let _ = bionic.space_ref().unmap(base, len);
+    // **Recorded rather than swallowed.** A stack that cannot be given back leaks its address
+    // space and its commit charge for the life of the instance, and the thread that leaked it is
+    // the only thing that knows. It does not change how the thread ended -- it returned or it did
+    // not -- so it is reported beside the outcome rather than instead of it.
+    if let Err(error) = bionic.space_ref().unmap(base, len) {
+        bionic.record_thread_failure(GuestThreadFailure {
+            thread: slot.id.0,
+            start_routine: entry,
+            why: format!(
+                "the guest thread's stack at {base:#x} ({len} bytes) could not be unmapped, so                  its address space and commit charge are leaked for the life of this instance:                  {error}"
+            ),
+        });
+    }
     let _ = bionic.threads_table().detach_current();
     drop(cpu);
 
@@ -845,7 +872,15 @@ pub(super) fn pthread_getschedparam(c: &mut ImportCall<'_, '_>) -> AbiResult<()>
         (a.next_u64()?, a.next_u64()?, a.next_u64()?)
     };
     let call = Call::inline(c)?;
-    if !call.bionic().knows_guest_thread(thread) {
+    // **Any thread this instance has an identity for**, which is the threads `pthread_create`
+    // made *and* the host threads that attached to the instance -- above all the one the
+    // initializers run on. Answering `ESRCH` for `pthread_self()` was the first version and it is
+    // the wrong answer: the main thread is a thread of this process with the same default policy,
+    // so facts 1-3 above apply to it identically, and a guest asking about itself during
+    // initialisation would have taken an error branch for no reason.
+    let known = call.bionic().knows_guest_thread(thread)
+        || call.bionic().threads_table().knows(GuestThreadId(thread));
+    if !known {
         c.ret().i32(consts::ESRCH);
         return Ok(());
     }
