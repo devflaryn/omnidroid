@@ -91,6 +91,8 @@
 //! instance once the embedding has said how much memory the guest has, and its documentation
 //! names the one field that is not. `prctl` answers `PR_SET_VMA` and refuses the rest.
 
+use std::time::Duration;
+
 use omni_bionic::context::GuestContext;
 use omni_mem::GuestAddr;
 
@@ -971,6 +973,309 @@ fn rt_sigprocmask(c: &mut ImportCall<'_, '_>, args: (i64, u64, u64, u64)) -> Abi
 /// value the engine's probe compares against.
 const EFAULT: i32 = 14;
 
+// ================================================================== the raw futex
+//
+// MEASURED by M5's gate: **two of the engine's own worker threads died on `syscall(98, ..)`**,
+// reported through `Bionic::guest_thread_failures()` because nobody joins a detached thread. It
+// was the largest single obstacle between M5 and M6 (D29), and it is the third raw syscall the
+// engine turns out to issue, after `rt_sigprocmask` and `gettid`.
+//
+// **This is not a stub and it is not a new capability.** `omni-bionic`'s whole synchronisation
+// layer already blocks and wakes on guest addresses through `AddressFutex`, which is a futex in
+// everything but the name — a parking lot keyed by a guest address, with the queue's bucket lock
+// held across registration. What was missing was the *door*: the guest was knocking on the raw
+// one. `syscall` already dispatches by number to a real implementation where one exists, and this
+// is the same shape.
+
+/// `futex`, in the asm-generic numbering arm64 Linux uses.
+const SYS_FUTEX: i64 = 98;
+
+/// `FUTEX_WAIT`: sleep if `*uaddr == val`.
+const FUTEX_WAIT: i32 = 0;
+/// `FUTEX_WAKE`: wake up to `val` waiters.
+const FUTEX_WAKE: i32 = 1;
+/// `FUTEX_WAIT_BITSET`: as `FUTEX_WAIT`, with an **absolute** timeout and a bitset.
+const FUTEX_WAIT_BITSET: i32 = 9;
+/// `FUTEX_WAKE_BITSET`: as `FUTEX_WAKE`, waking only waiters whose bitset intersects.
+const FUTEX_WAKE_BITSET: i32 = 10;
+
+/// `FUTEX_PRIVATE_FLAG`: the futex is not shared between processes.
+///
+/// **Accepted and ignored, and that is a fact rather than a convenience.** The flag tells the
+/// kernel it may skip the work of resolving the address to a shared-memory identity, because no
+/// other process can be waiting on it. Here there *is* no other process: every guest address
+/// belongs to one instance in one host process, so private and shared name the same set of
+/// waiters. Ignoring it is the whole of what honouring it means.
+const FUTEX_PRIVATE_FLAG: i32 = 128;
+
+/// `FUTEX_CLOCK_REALTIME`: measure the (absolute) timeout against `CLOCK_REALTIME`.
+const FUTEX_CLOCK_REALTIME: i32 = 256;
+
+/// `FUTEX_BITSET_MATCH_ANY`: the bitset bionic's own `__futex_wait_ex` passes.
+const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
+
+/// The command bits, with the two flags masked off.
+fn futex_command(op: i32) -> i32 {
+    op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
+}
+
+/// Name a futex operation for a refusal, so the message says what was asked rather than a number.
+fn futex_op_name(command: i32) -> &'static str {
+    match command {
+        0 => "FUTEX_WAIT",
+        1 => "FUTEX_WAKE",
+        2 => "FUTEX_FD",
+        3 => "FUTEX_REQUEUE",
+        4 => "FUTEX_CMP_REQUEUE",
+        5 => "FUTEX_WAKE_OP",
+        6 => "FUTEX_LOCK_PI",
+        7 => "FUTEX_UNLOCK_PI",
+        8 => "FUTEX_TRYLOCK_PI",
+        9 => "FUTEX_WAIT_BITSET",
+        10 => "FUTEX_WAKE_BITSET",
+        11 => "FUTEX_WAIT_REQUEUE_PI",
+        12 => "FUTEX_CMP_REQUEUE_PI",
+        13 => "FUTEX_LOCK_PI2",
+        _ => "an operation linux/futex.h does not define",
+    }
+}
+
+/// The six arguments `futex` takes, named.
+///
+/// A struct rather than a tuple because they are six machine words of which four are integers,
+/// and `(uaddr, op, val, timeout, val3)` passed positionally is five chances to transpose two
+/// without a compile error -- which for `val` and `val3` would silently compare against the
+/// bitset.
+struct FutexArgs {
+    /// The word to compare and to park on.
+    uaddr: u64,
+    /// The operation, with its two flag bits still set.
+    op: i32,
+    /// `FUTEX_WAIT`'s expected value, or `FUTEX_WAKE`'s count.
+    val: u64,
+    /// A `struct timespec *`, or null for no timeout.
+    timeout: u64,
+    /// The bitset, for the `BITSET` forms.
+    val3: u64,
+}
+
+/// `long futex(uint32_t *uaddr, int op, uint32_t val, const struct timespec *timeout,
+///             uint32_t *uaddr2, uint32_t val3)`, reached through `syscall(98, ..)`.
+///
+/// # What is implemented, and what each answer is
+///
+/// | operation | answer |
+/// |---|---|
+/// | `FUTEX_WAIT` | `0` woken, `-1`/`EAGAIN` if `*uaddr != val`, `-1`/`ETIMEDOUT` at the timeout |
+/// | `FUTEX_WAIT_BITSET` | the same, with an **absolute** timeout, and only for `FUTEX_BITSET_MATCH_ANY` |
+/// | `FUTEX_WAKE` | how many waiters were woken |
+/// | `FUTEX_WAKE_BITSET` | the same, and only for `FUTEX_BITSET_MATCH_ANY` |
+/// | everything else | **refused by name** |
+///
+/// # The comparison is the point
+///
+/// Linux compares `*uaddr` with `val` **atomically with** the decision to block, and that
+/// comparison is what makes a futex a futex: a waiter that skipped it would sleep through a wake
+/// that had already happened, which is the lost-wake class this project has already measured once
+/// at 1.0104 s (`VERIFICATION.md` entry 11). [`AddressFutex::wait_compared`] performs it inside
+/// `parking_lot_core`'s `validate` callback, under the queue's bucket lock, which is the same
+/// place the kernel performs it.
+///
+/// This is **not** the `expected` that `Futex::wait` ignores — see `runtime`'s module docs for why
+/// that one is ignored and why this one is not the same question.
+///
+/// # A bitset that is not `MATCH_ANY` refuses, and that is the interesting refusal
+///
+/// A partial bitset means "wake only waiters interested in these bits", and this futex's queues
+/// carry no bits. The believable wrong answer is to treat every bitset as `MATCH_ANY`: it *works*
+/// for the common case, and it silently wakes waiters the caller deliberately excluded — which is
+/// a correctness bug in the guest's own synchronisation, arriving as a spurious wakeup that its
+/// re-check loop will absorb without reporting. bionic's own `__futex_wait_ex` passes
+/// `FUTEX_BITSET_MATCH_ANY`, so nothing on the expected path is refused by this.
+///
+/// # An indefinite wait is allowed here, where `poll` refuses one
+///
+/// `poll(fds, n, -1)` is refused because **nothing in the descriptor space could ever wake it**.
+/// A futex is different in exactly the way that matters: it is woken by another *guest* thread,
+/// and this runtime has those — `pthread_mutex_lock` has parked indefinitely through the same
+/// mechanism since phase 3c. D16's defence is against a guest that cannot be stopped, and a
+/// created guest thread is stopped between run windows whatever it is doing.
+fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
+    let FutexArgs { uaddr, op, val, timeout, val3 } = args;
+    let command = futex_command(op);
+    let state = active(c.symbol(), c.address())?;
+    let absolute = command == FUTEX_WAIT_BITSET;
+    let realtime = op & FUTEX_CLOCK_REALTIME != 0;
+
+    let result = {
+        let mut view = enter(c, &state);
+        // Linux: `EINVAL` for an unaligned `uaddr`. The word is compared and woken on as a
+        // 32-bit quantity, and an unaligned one has no atomic load on any target this runs on.
+        if uaddr % 4 != 0 {
+            view.set_errno(omni_bionic::errno::consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let Ok(word) = GuestAddr::try_from(uaddr) else {
+            view.set_errno(EFAULT);
+            c.ret().i32(-1);
+            return Ok(());
+        };
+        match command {
+            FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                if command == FUTEX_WAIT_BITSET && val3 as u32 != FUTEX_BITSET_MATCH_ANY {
+                    return Err(refuse(
+                        c,
+                        format!(
+                            "the guest issued `futex(FUTEX_WAIT_BITSET)` with bitset                              {:#010x}. This layer's queues carry no bits, so it can honour only                              FUTEX_BITSET_MATCH_ANY ({FUTEX_BITSET_MATCH_ANY:#010x}), which is                              what bionic's own `__futex_wait_ex` passes. Treating a partial                              bitset as MATCH_ANY is the believable wrong answer: it works, and                              it wakes waiters the caller deliberately excluded",
+                            val3 as u32
+                        ),
+                    ));
+                }
+                // The timeout. `FUTEX_WAIT`'s is **relative**; `FUTEX_WAIT_BITSET`'s is
+                // **absolute**, and the two are not interchangeable -- treating an absolute
+                // deadline as a duration would sleep for fifty-five years.
+                let wait = match read_futex_timeout(&mut view, timeout, absolute, realtime)? {
+                    Ok(duration) => duration,
+                    Err(errno) => {
+                        view.set_errno(errno);
+                        c.ret().i32(-1);
+                        return Ok(());
+                    }
+                };
+                let expected = val as u32;
+                let mem = view.mem();
+                let blame = Blame::new(view.symbol(), view.address(), 0);
+                // The word must be readable **before** anything parks on it, so that an
+                // unreadable one is `EFAULT` rather than a thread asleep on an address nothing
+                // will ever wake.
+                if mem.read_u32(word, blame).is_err() {
+                    view.set_errno(EFAULT);
+                    c.ret().i32(-1);
+                    return Ok(());
+                }
+                let outcome = state.bionic.futex().wait_compared(
+                    uaddr,
+                    || mem.read_u32(word, blame).is_ok_and(|current| current == expected),
+                    wait,
+                );
+                match outcome {
+                    omni_bionic::threads::WaitResult::Woken => 0,
+                    omni_bionic::threads::WaitResult::TimedOut => {
+                        view.set_errno(omni_bionic::errno::consts::ETIMEDOUT);
+                        -1
+                    }
+                    omni_bionic::threads::WaitResult::WouldBlock => {
+                        // The word had already changed. `EAGAIN` is Linux's answer and the whole
+                        // value of having compared.
+                        view.set_errno(omni_bionic::errno::consts::EAGAIN);
+                        -1
+                    }
+                }
+            }
+            FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+                if command == FUTEX_WAKE_BITSET && val3 as u32 != FUTEX_BITSET_MATCH_ANY {
+                    return Err(refuse(
+                        c,
+                        format!(
+                            "the guest issued `futex(FUTEX_WAKE_BITSET)` with bitset {:#010x};                              as FUTEX_WAIT_BITSET, only FUTEX_BITSET_MATCH_ANY can be honoured",
+                            val3 as u32
+                        ),
+                    ));
+                }
+                // `val` is the number to wake. Linux takes it as an `int` and treats a negative
+                // one as a very large count; the two spellings of "all" that callers use are
+                // `INT_MAX` and `UINT_MAX`, and both land on `u32::MAX` here.
+                let count = if (val as i32) < 0 { u32::MAX } else { val as u32 };
+                omni_bionic::threads::Futex::wake(state.bionic.futex(), uaddr, count) as i32
+            }
+            other => {
+                return Err(refuse(
+                    c,
+                    format!(
+                        "the guest issued `futex({uaddr:#x}, {}, ..)`. This layer implements \
+                         FUTEX_WAIT, FUTEX_WAKE and their BITSET forms over the same parking lot \
+                         `omni-bionic`'s mutexes and condition variables already use; \
+                         {} asks for something that lot does not have. REQUEUE and WAKE_OP move \
+                         or conditionally wake waiters across two addresses, and the PI \
+                         operations need priority inheritance from a kernel scheduler -- there is \
+                         no kernel here. Answering 0 would tell the guest a requeue happened, and \
+                         its waiters would then be on the wrong queue",
+                        futex_op_name(other),
+                        futex_op_name(other)
+                    ),
+                ));
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// Read a `struct timespec` argument for `futex`, and turn it into a duration to wait.
+///
+/// `Ok(None)` is "wait indefinitely", which a null pointer means. `Err(errno)` is what the guest
+/// is told.
+///
+/// **Absolute and relative are both here because the two operations differ**, and confusing them
+/// is not a small error: `FUTEX_WAIT` takes a *relative* timeout and `FUTEX_WAIT_BITSET` takes an
+/// *absolute* deadline, so treating one as the other turns a one-millisecond wait into a
+/// fifty-five-year one, or a deadline into an immediate timeout.
+fn read_futex_timeout(
+    view: &mut GuestView<'_>,
+    timeout: u64,
+    absolute: bool,
+    realtime: bool,
+) -> AbiResult<Result<Option<Duration>, i32>> {
+    if timeout == 0 {
+        return Ok(Ok(None));
+    }
+    let Ok(at) = GuestAddr::try_from(timeout) else {
+        return Ok(Err(EFAULT));
+    };
+    let blame = Blame::new(view.symbol(), view.address(), 3);
+    let Ok(bytes) = view.mem().read_bytes(at, TIMESPEC_BYTES, blame) else {
+        return Ok(Err(EFAULT));
+    };
+    let seconds = i64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
+    let nanos = i64::from_le_bytes(bytes[8..16].try_into().expect("eight bytes"));
+    // The kernel's own validation: a `tv_nsec` outside [0, 1e9) is `EINVAL`, and so is a negative
+    // `tv_sec` on a relative wait.
+    if !(0..1_000_000_000).contains(&nanos) {
+        return Ok(Err(omni_bionic::errno::consts::EINVAL));
+    }
+    if !absolute {
+        if seconds < 0 {
+            return Ok(Err(omni_bionic::errno::consts::EINVAL));
+        }
+        return Ok(Ok(Some(
+            Duration::from_secs(seconds as u64) + Duration::from_nanos(nanos as u64),
+        )));
+    }
+    // An **absolute** deadline, against `CLOCK_MONOTONIC` unless `FUTEX_CLOCK_REALTIME` says
+    // otherwise. Turned into a remaining duration here, against the same clock the guest's own
+    // `clock_gettime` reads, so that a deadline the guest computed from that clock means what it
+    // meant when it computed it.
+    let now_nanos = if realtime {
+        omni_platform::clock::realtime_now().as_nanos() as i128
+    } else {
+        omni_platform::clock::monotonic_now().as_nanos() as i128
+    };
+    let deadline_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
+    let remaining = deadline_nanos - now_nanos;
+    if remaining <= 0 {
+        // A deadline already past is an immediate timeout, not an error and not an indefinite
+        // wait. Returning `None` here would park for ever on a call that asked not to.
+        return Ok(Ok(Some(Duration::ZERO)));
+    }
+    Ok(Ok(Some(Duration::from_nanos(
+        u64::try_from(remaining).unwrap_or(u64::MAX),
+    ))))
+}
+
+/// `sizeof(struct timespec)` on LP64: two 64-bit fields.
+const TIMESPEC_BYTES: usize = 16;
+
 /// `long syscall(long number, ...)`
 ///
 /// Refused, and refused *by number*, which is the only useful thing this can do. A raw syscall
@@ -979,12 +1284,25 @@ const EFAULT: i32 = 14;
 /// `mlock` returning 0 was rejected in phase 2 — callers of `syscall` routinely have a fallback
 /// path for `ENOSYS`, so the gap would be silently routed around.
 pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    let (number, a1, a2, a3, a4) = {
+    let (number, a1, a2, a3, a4, _a5, a6) = {
         let mut a = c.args();
-        (a.next_u64()? as i64, a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
+        (
+            a.next_u64()? as i64,
+            a.next_u64()?,
+            a.next_u64()?,
+            a.next_u64()?,
+            a.next_u64()?,
+            // `uaddr2`, which only the operations this layer refuses use. Read so that the
+            // sixth argument -- `val3`, the bitset -- lands in the right register.
+            a.next_u64()?,
+            a.next_u64()?,
+        )
     };
     if number == SYS_RT_SIGPROCMASK {
         return rt_sigprocmask(c, (a1 as i64, a2, a3, a4));
+    }
+    if number == SYS_FUTEX {
+        return futex(c, FutexArgs { uaddr: a1, op: a2 as i32, val: a3, timeout: a4, val3: a6 });
     }
     if number == SYS_GETTID {
         // **`gettid` is a thread identity, and this runtime has one.**

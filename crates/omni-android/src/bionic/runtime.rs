@@ -27,7 +27,7 @@
 //! would change the meaning of `wait` for every caller at once.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omni_bionic::metadata::Yield;
@@ -55,6 +55,15 @@ pub struct AddressFutex {
     wakes: AtomicU64,
     /// The guest address of the most recent park. See [`AddressFutex::parked_on`].
     last_wait: AtomicU64,
+    /// Every address currently parked on, and how many threads are on each.
+    ///
+    /// **Kept so that a shutdown can reach them.** `parking_lot_core` has no "unpark everything"
+    /// across all keys -- it is a hash table and there is no key list -- so the only way to wake
+    /// every waiter is to know which addresses have one. Maintained around the park itself, so
+    /// an entry exists for exactly as long as a thread is on that queue.
+    parked: Mutex<HashMap<u64, usize>>,
+    /// Set when the instance is shutting down. See [`AddressFutex::stop`].
+    stopping: AtomicBool,
 }
 
 impl AddressFutex {
@@ -74,6 +83,137 @@ impl AddressFutex {
         (self.waits.load(Ordering::Relaxed), self.wakes.load(Ordering::Relaxed))
     }
 
+    /// Park on `addr` **only if `still_expected()` still holds**, checked atomically with the
+    /// decision to block.
+    ///
+    /// # This is the comparison the trait's `wait` deliberately does not make
+    ///
+    /// The module documentation explains why [`Futex::wait`] ignores its `expected`: some of
+    /// `omni-bionic`'s own callers pass a placeholder, and honouring it there would turn blocking
+    /// contention into a busy spin. That argument is about *those callers*. It says nothing about
+    /// a caller that has a real word and a real value to compare it against — and a **raw
+    /// `futex(FUTEX_WAIT)` from guest code is exactly that**: Linux's contract is that the kernel
+    /// compares `*uaddr` with `val` and returns `EAGAIN` without sleeping if they differ, and a
+    /// waiter that skipped the comparison would sleep through a wake that had already happened.
+    ///
+    /// So the capability is added here rather than by changing what `wait` means for everyone.
+    ///
+    /// # Why this closes the window, and where the closure runs
+    ///
+    /// `still_expected` is `parking_lot_core::park`'s **`validate`** callback, which runs with the
+    /// queue's bucket lock held. A concurrent [`Futex::wake`] on the same address must take that
+    /// lock to find the queue, so it cannot land between the comparison and the park. That is the
+    /// same property the kernel gets from its hash-bucket spinlock, and it is the whole reason
+    /// this is a callback rather than a value compared before the call.
+    ///
+    /// **The closure must not panic and must not itself park**, which is `parking_lot_core`'s
+    /// requirement. A reader of guest memory satisfies both: it returns a `Result` and takes only
+    /// the address space's own lock. That lock is safe to take here because **nothing in this
+    /// runtime parks while holding it** — the pager's own invariant is that the thread running
+    /// guest code must not hold the space lock, so the inversion that would deadlock (hold the
+    /// space lock, then wait on a futex) has no path.
+    ///
+    /// Returns [`WaitResult::WouldBlock`] when the comparison failed, which is the caller's
+    /// `EAGAIN`.
+    pub fn wait_compared(
+        &self,
+        addr: u64,
+        still_expected: impl Fn() -> bool,
+        timeout: Option<Duration>,
+    ) -> WaitResult {
+        if self.stopped() {
+            return WaitResult::WouldBlock;
+        }
+        let _parked = self.enter_park(addr);
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.last_wait.store(addr, Ordering::Relaxed);
+        let deadline = timeout.map(|t| Instant::now() + t);
+        // SAFETY: as `Futex::wait`, and with one addition. `park` requires that the key is not
+        // concurrently used by another parking implementation with incompatible invariants — the
+        // key is a guest address, which no other parker in this process uses — and that
+        // `validate`, `before_sleep` and `timed_out` neither panic nor park. `before_sleep` and
+        // `timed_out` are empty. `validate` is the caller's `still_expected`, whose contract is
+        // stated above and is discharged by its only caller, which reads four bytes of guest
+        // memory through the checked path.
+        let result = unsafe {
+            parking_lot_core::park(
+                addr as usize,
+                still_expected,
+                || {},
+                |_, _| {},
+                parking_lot_core::DEFAULT_PARK_TOKEN,
+                deadline,
+            )
+        };
+        match result {
+            parking_lot_core::ParkResult::Unparked(_) => WaitResult::Woken,
+            parking_lot_core::ParkResult::TimedOut => WaitResult::TimedOut,
+            // `validate` said the word had already changed. **This is the answer, not a
+            // degenerate case**: it is `FUTEX_WAIT`'s `EAGAIN`, and it is the whole value of
+            // performing the comparison.
+            parking_lot_core::ParkResult::Invalid => WaitResult::WouldBlock,
+        }
+    }
+
+    /// **Stop accepting waits, and wake everything already parked.**
+    ///
+    /// # Why a stop switch on the *futex* and not only on the thread runner
+    ///
+    /// `Bionic::stop_guest_threads` asks every created guest thread to stop, and `drive` reads
+    /// that between run windows — which reaches a thread that is *executing* and not one that is
+    /// *parked*. A parked thread executes no guest instructions, so no window ever ends for it.
+    ///
+    /// MEASURED, and it arrived the moment the raw `futex` syscall was implemented: before it,
+    /// the engine's worker threads died on the refusal and teardown was quiet; after it, they
+    /// lived, parked indefinitely, and **two of them were still running when the gate asked them
+    /// to stop**. Implementing a blocking primitive correctly is what made its shutdown path
+    /// reachable.
+    ///
+    /// So this does both halves: it wakes every address a thread is parked on, and it makes every
+    /// later wait return [`WaitResult::WouldBlock`] without parking. The second half is what stops
+    /// a woken thread simply parking again — every caller of a futex re-checks its predicate and
+    /// loops, so waking without refusing is a wake the guest immediately undoes.
+    ///
+    /// **A `WouldBlock` loop is a spin, and that is bounded rather than ignored.** A guest that
+    /// spins consumes its run window, and `drive` reads the thread-runner's stop switch at the end
+    /// of it — so the spin lasts at most one window (`GUEST_THREAD_STEP_WINDOW`, a million guest
+    /// instructions) and then the thread stops. That is D16's mechanism doing exactly what it was
+    /// built for: the window boundary is a decision point that exists whatever the guest is doing.
+    ///
+    /// Idempotent, and it cannot be taken back: a futex that has been stopped belongs to an
+    /// instance that is shutting down.
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let addresses: Vec<u64> = self.parked.lock().keys().copied().collect();
+        for address in addresses {
+            // Every waiter on every address, not one each: a queue with three threads on it needs
+            // three wakes, and `unpark_all` is the operation that does not have to know how many.
+            omni_bionic::threads::Futex::wake(self, address, u32::MAX);
+        }
+    }
+
+    /// Whether [`stop`](AddressFutex::stop) has been called.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// How many threads are parked, and on how many distinct addresses.
+    ///
+    /// **A detector rather than a watch**, unlike [`activity`](AddressFutex::activity): it is zero
+    /// exactly when nothing is parked, so a shutdown that left a thread behind is visible in it.
+    #[must_use]
+    pub fn parked_now(&self) -> (usize, usize) {
+        let parked = self.parked.lock();
+        (parked.values().sum(), parked.len())
+    }
+
+    /// Record this thread as parked on `addr` for as long as the guard lives.
+    fn enter_park(&self, addr: u64) -> ParkedOn<'_> {
+        *self.parked.lock().entry(addr).or_insert(0) += 1;
+        ParkedOn { futex: self, addr }
+    }
+
     /// The guest address of the most recent park, or `0` if nothing has parked.
     ///
     /// **What a stuck guest looks like from another thread.** A guest blocked here executes no
@@ -86,11 +226,42 @@ impl AddressFutex {
     }
 }
 
+/// Keeps an address in [`AddressFutex::parked`] for as long as a thread is on its queue.
+///
+/// A guard rather than a matched pair, for the reason every guard in this project is one: `park`
+/// has three exits — woken, timed out, and the validate callback refusing — and a pair of calls
+/// around them would eventually miss one. An address left in the table after its thread has gone
+/// makes `stop` wake a queue nobody is on, which is harmless, and makes `parked_now` report a
+/// thread that does not exist, which is not: it would say a shutdown had failed when it had not.
+struct ParkedOn<'a> {
+    futex: &'a AddressFutex,
+    addr: u64,
+}
+
+impl Drop for ParkedOn<'_> {
+    fn drop(&mut self) {
+        let mut parked = self.futex.parked.lock();
+        if let Some(count) = parked.get_mut(&self.addr) {
+            *count -= 1;
+            if *count == 0 {
+                parked.remove(&self.addr);
+            }
+        }
+    }
+}
+
 impl Futex for AddressFutex {
     fn wait(&self, addr: u64, expected: u32, timeout: Option<Duration>) -> WaitResult {
         // See the module docs: the comparison is the caller's, because not every caller in
         // `omni-bionic` passes a meaningful `expected`.
         let _ = expected;
+        if self.stopped() {
+            // The instance is shutting down. Every caller re-checks its predicate after
+            // `WouldBlock` and loops, which is the spin `stop` documents as bounded by one run
+            // window.
+            return WaitResult::WouldBlock;
+        }
+        let _parked = self.enter_park(addr);
         self.waits.fetch_add(1, Ordering::Relaxed);
         self.last_wait.store(addr, Ordering::Relaxed);
         let deadline = timeout.map(|t| Instant::now() + t);

@@ -1408,6 +1408,11 @@ impl Bionic {
     /// down.
     pub fn stop_guest_threads(&self) {
         self.threads_stopping.store(true, Ordering::Release);
+        // **And wake everything parked on a futex**, which the switch above cannot reach: it is
+        // read between run windows, and a parked thread never ends one. See `AddressFutex::stop`
+        // for the measurement that made this necessary -- implementing the raw `futex` syscall is
+        // what turned the engine's worker threads from dying into parking.
+        self.futex.stop();
     }
 
     /// Wait until no created guest thread is still running, or until `timeout` elapses.
