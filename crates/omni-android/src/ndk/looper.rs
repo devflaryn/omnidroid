@@ -768,8 +768,9 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                     // run with no lock held, and `ALooper_release` is one of the things it may
                     // have called. A looper it destroyed has no registration left to remove, which
                     // is the request already satisfied -- not a reason to panic. See [`looper_in`].
-                    let entry = state.loopers.get_mut(looper).expect("the slot was checked live");
-                    entry.fds.retain(|held| held.fd != fd);
+                    if let Some(entry) = state.loopers.get_mut(looper) {
+                        entry.fds.retain(|held| held.fd != fd);
+                    }
                 }
             }
             ALOOPER_POLL_CALLBACK
