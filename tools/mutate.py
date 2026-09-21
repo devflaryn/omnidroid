@@ -2205,8 +2205,11 @@ MUTATIONS = [
     }""",
      BIONIC),
 
+    # The `\\n` is escaped because this pattern is Python source **and** Rust source: an unescaped
+    # `\n` here is a newline in the pattern rather than the two characters the Rust file holds,
+    # and it matches nothing. The pre-flight pattern gate caught it, which is what it is for.
     ("stdio-A2", "A", "fgets reads past its newline instead of stopping on it", BIONIC_STDIO,
-     """                if byte[0] == b'\n' {
+     """                if byte[0] == b'\\n' {
                     break;
                 }""",
      """                if false {
