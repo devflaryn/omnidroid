@@ -6946,6 +6946,283 @@ fn poll_reports_a_pipes_real_readiness_and_not_merely_that_it_is_open() {
     assert_eq!(returned as i64, 1);
 }
 
+// =================================================================== M5: pipes and fcntl
+
+/// `O_NONBLOCK` as the guest spells it: Linux UAPI `asm-generic/fcntl.h`, octal 4000.
+const O_NONBLOCK_GUEST: u64 = 0o4000;
+/// `F_GETFL` and `F_SETFL`.
+const F_GETFL_GUEST: u64 = 3;
+const F_SETFL_GUEST: u64 = 4;
+/// `EAGAIN` and `EPIPE`, as the guest's own `errno` must carry them.
+const EAGAIN_GUEST: u64 = 11;
+const EPIPE_GUEST: u64 = 32;
+
+/// **Bytes written into one end come out of the other, through real translated ARM64 code.**
+///
+/// The `int[2]` is asserted against a sentinel, so a handler that returned `0` and wrote nothing
+/// is distinguishable from one that wrote two descriptors.
+#[test]
+fn a_pipe_round_trips_bytes_through_real_guest_code() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("pipe-roundtrip");
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    assert!(read_fd >= 3, "a real descriptor: {read_fd}");
+    assert_eq!(write_fd, read_fd + 1, "the lowest two free descriptors, in order");
+
+    let source = f.cstring(f.guest.data + 0x100, b"APP_CMD");
+    let written = value_of(&f, "write", |asm| {
+        asm.mov(0, write_fd as u64);
+        asm.mov(1, source as u64);
+        asm.mov(2, 7);
+    });
+    assert_eq!(written as i64, 7);
+
+    let destination = f.guest.data + 0x200;
+    f.guest.write_u64(destination, 0x5A5A_5A5A_5A5A_5A5A);
+    let read = value_of(&f, "read", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, destination as u64);
+        asm.mov(2, 64);
+    });
+    assert_eq!(read as i64, 7, "a read from a pipe returns what is there, not what was asked for");
+    assert_eq!(&read_guest(&f, destination, 7), b"APP_CMD", "the bytes, in order");
+
+    // And the pipe is empty again: a second read on the now-non-blocking end says so rather than
+    // repeating the bytes.
+    let set = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_SETFL_GUEST);
+        asm.mov(2, O_NONBLOCK_GUEST);
+    });
+    assert_eq!(set as i64, 0);
+    let out = f.guest.data + 0x400;
+    let entry = program(&f, |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, destination as u64);
+        asm.mov(2, 64);
+        asm.bl(f.thunk("read"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i64, -1, "an empty non-blocking pipe reads -1");
+    assert_eq!(f.guest.read_u64(out + 8), EAGAIN_GUEST, "with EAGAIN, which is Linux's 11");
+}
+
+/// **`fcntl` round-trips `O_NONBLOCK` and refuses every other command by name.**
+///
+/// `F_GETFL` answers the flag and nothing else — in particular not a fabricated access mode,
+/// which is the value a guest would branch on.
+#[test]
+fn fcntl_round_trips_o_nonblock_and_refuses_every_other_command() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("fcntl");
+    let (read_fd, _write_fd) = pipe_through_guest(&f);
+
+    let flags = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_GETFL_GUEST);
+        asm.mov(2, 0);
+    });
+    assert_eq!(flags as i64, 0, "a fresh pipe is blocking, and no access mode is invented");
+
+    let set = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_SETFL_GUEST);
+        asm.mov(2, O_NONBLOCK_GUEST);
+    });
+    assert_eq!(set as i64, 0);
+    let flags = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_GETFL_GUEST);
+        asm.mov(2, 0);
+    });
+    assert_eq!(flags, O_NONBLOCK_GUEST, "what was set comes back");
+
+    // Clearing it is the other direction, and a layer that only ever sets would pass every
+    // assertion above.
+    let cleared = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_SETFL_GUEST);
+        asm.mov(2, 0);
+    });
+    assert_eq!(cleared as i64, 0);
+    let flags = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_GETFL_GUEST);
+        asm.mov(2, 0);
+    });
+    assert_eq!(flags, 0, "and clearing it clears it");
+
+    // A descriptor nobody opened is `EBADF`, which is an answer rather than a refusal.
+    let out = f.guest.data + 0x400;
+    let entry = program(&f, |asm| {
+        asm.mov(0, 61);
+        asm.mov(1, F_GETFL_GUEST);
+        asm.mov(2, 0);
+        asm.bl(f.thunk("fcntl"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i64, -1);
+    assert_eq!(f.guest.read_u64(out + 8), EBADF_NET, "EBADF is Linux's 9");
+
+    // **Every other command refuses, and the refusal names it.** `F_DUPFD` and `F_SETFD` are the
+    // two a guest is most likely to reach for, and `F_GETPIPE_SZ` is the one whose believable
+    // wrong answer -- this layer's own capacity -- would be a promise about a pipe the guest
+    // could then resize.
+    for (command, name) in [(0u64, "F_DUPFD"), (2, "F_SETFD"), (1032, "F_GETPIPE_SZ")] {
+        let error = refusal_of(&f, "fcntl", |asm| {
+            asm.mov(0, read_fd as u64);
+            asm.mov(1, command);
+            asm.mov(2, 0);
+        });
+        assert_eq!(error.symbol(), Some("fcntl"));
+        assert!(error.to_string().contains(name), "the refusal must name {name}: {error}");
+    }
+    // And one nobody has a name for still refuses, with its number.
+    let error = refusal_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, 4242);
+        asm.mov(2, 0);
+    });
+    assert!(error.to_string().contains("4242"), "{error}");
+
+    // A bit beyond O_NONBLOCK is refused rather than ignored: O_ASYNC (0o20000) asks for a signal
+    // this runtime does not deliver, and Linux's own `F_SETFL` would accept it.
+    let error = refusal_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_SETFL_GUEST);
+        asm.mov(2, 0o20000);
+    });
+    assert!(error.to_string().contains("O_ASYNC"), "{error}");
+}
+
+/// **A write to a pipe whose reader has closed is `EPIPE`**, not a short write and not a refusal.
+///
+/// On a device it is also `SIGPIPE`; there is no signal delivery here, so the errno is the whole
+/// of what the guest gets, which is what a caller that has set `SIG_IGN` sees on a device.
+#[test]
+fn a_write_to_a_pipe_whose_reader_has_closed_is_epipe() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("pipe-epipe");
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    let closed = value_of(&f, "close", |asm| {
+        asm.mov(0, read_fd as u64);
+    });
+    assert_eq!(closed as i64, 0);
+
+    let source = f.cstring(f.guest.data + 0x100, b"x");
+    let out = f.guest.data + 0x400;
+    let entry = program(&f, |asm| {
+        asm.mov(0, write_fd as u64);
+        asm.mov(1, source as u64);
+        asm.mov(2, 1);
+        asm.bl(f.thunk("write"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i64, -1, "a broken pipe is -1, not a short write");
+    assert_eq!(f.guest.read_u64(out + 8), EPIPE_GUEST, "EPIPE is Linux's 32");
+}
+
+/// **A blocking read waits**, and the assertion is the value it returns rather than how long it
+/// took.
+///
+/// A host thread writes one byte after a delay that is long against everything the guest does to
+/// reach the call. If the blocking wait were missing, the read would report `-1`/`EAGAIN`
+/// immediately and this fails deterministically; if it is there, the read returns the byte. The
+/// test can therefore **fail only when the wait is absent** — it cannot fail because the machine
+/// was slow, which `VERIFICATION.md` entry 6 is about. Under a slow enough machine it stops
+/// *exercising* the wait and still passes, which is the safe direction for a bound of this shape.
+#[test]
+fn a_blocking_read_on_an_empty_pipe_waits_for_a_writer() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("pipe-blocking");
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+
+    // The read end is left **blocking** -- the default -- and the write end is the host's here,
+    // because a second guest thread would be testing the thread layer rather than the wait.
+    let bionic = Arc::clone(&f.bionic);
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let fs = bionic.filesystem().expect("the instance has a root");
+        fs.write(write_fd, b"Q").expect("one byte into the pipe")
+    });
+
+    let destination = f.guest.data + 0x200;
+    f.guest.write_u64(destination, 0x5A5A_5A5A_5A5A_5A5A);
+    let read = value_of(&f, "read", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, destination as u64);
+        asm.mov(2, 8);
+    });
+    assert_eq!(writer.join().expect("the writer thread"), 1);
+    assert_eq!(
+        read as i64,
+        1,
+        "a blocking read must wait for the writer; -1 here means it reported EAGAIN to a \
+         descriptor that never asked to be non-blocking"
+    );
+    assert_eq!(read_guest(&f, destination, 1), b"Q");
+}
+
+/// **A pipe past the descriptor ceiling is all-or-nothing, and a null `pipefd` is a refusal.**
+#[test]
+fn pipe_refuses_a_null_pointer_and_leaves_nothing_open_when_it_cannot_fit() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("pipe-refusals");
+    let error = refusal_of(&f, "pipe", |asm| {
+        asm.mov(0, 0);
+    });
+    assert_eq!(error.symbol(), Some("pipe"));
+    assert!(error.to_string().contains("null"), "{error}");
+
+    // Fill the table to one short of the ceiling, then ask for two.
+    let fs = f.bionic.filesystem().expect("a root");
+    let ceiling = omni_platform::fs::MAX_OPEN_FILES;
+    while fs.open_count() < ceiling - 1 {
+        fs.open(b"/dev/null", omni_platform::fs::OpenFlags {
+            read: true,
+            ..omni_platform::fs::OpenFlags::default()
+        })
+        .expect("a device descriptor");
+    }
+    let before = fs.open_count();
+    let at = f.guest.data + 0x40;
+    f.guest.write_u64(at, 0x5A5A_5A5A_5A5A_5A5A);
+    let out = f.guest.data + 0x400;
+    let entry = program(&f, |asm| {
+        asm.mov(0, at as u64);
+        asm.bl(f.thunk("pipe"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i64, -1, "one free slot is not two");
+    assert_eq!(f.guest.read_u64(out + 8), 24, "EMFILE is Linux's 24");
+    assert_eq!(fs.open_count(), before, "a refused pipe leaks no descriptor");
+    assert_eq!(
+        f.guest.read_u64(at),
+        0x5A5A_5A5A_5A5A_5A5A,
+        "and it wrote nothing into the guest's `int[2]`"
+    );
+}
+
 // =================================================================== phase 3e: the last four
 //
 // `time`, `clock`, `mallinfo`, `longjmp`. The other two of the six — `__gcov_dump` and
@@ -7041,15 +7318,37 @@ fn clock_is_process_cpu_time_in_microseconds_rather_than_wall_time() {
     asm.push(b_cond(1, -1)); // b.ne back one instruction
     asm.push(ret(21));
     f.guest.load(asm.words());
-    let mut cpu = f.guest.thread(&f.boundary);
-    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
 
-    let after_work = value_of(&f, "clock", |_asm| {}) as i64;
-    assert!(
-        after_work > first,
-        "three million guest instructions moved the process CPU clock not at all: {first} -> \
-         {after_work}"
-    );
+    // **The work is repeated until the clock moves, under a wall-clock deadline**, and the
+    // assertion is that it moved rather than that one pass was enough.
+    //
+    // A single pass is a **flake**, and it was seen as one: MEASURED in a whole-workspace run,
+    // `1843750 -> 1843750`. Windows charges process CPU in scheduler ticks of 15.625 ms — that
+    // failing figure is exactly 118 of them — and three million guest instructions through the
+    // translator do not reliably cross a tick boundary. So the old assertion was really "this
+    // pass happened to straddle a tick", which is `VERIFICATION.md` entry 6's shape: a
+    // timing-dependent test that must be made structural rather than given a bigger number.
+    //
+    // A deadline rather than a fixed repeat count, because the quantum is the host's and a count
+    // chosen against this machine is the same assumption one level up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut passes = 0u32;
+    let after_work = loop {
+        let mut cpu = f.guest.thread(&f.boundary);
+        assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+        passes += 1;
+        let now = value_of(&f, "clock", |_asm| {}) as i64;
+        if now > first {
+            break now;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{passes} passes of three million guest instructions moved the process CPU clock not \
+             at all in 20 seconds of wall time: {first} -> {now}. That is not the host's \
+             15.625 ms tick quantum; it is a clock that does not advance"
+        );
+    };
+    assert!(after_work > first, "{first} -> {after_work} over {passes} passes");
 
     // It never goes backwards across two calls through the boundary.
     let last = value_of(&f, "clock", |_asm| {}) as i64;

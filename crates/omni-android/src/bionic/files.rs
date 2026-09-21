@@ -46,6 +46,8 @@
 //! already record, and the same discipline applies: the derivation is written out field by field
 //! so it can be checked against a header rather than re-derived from memory.
 
+use std::time::{Duration, Instant};
+
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
 use omni_mem::GuestAddr;
@@ -60,7 +62,7 @@ use crate::error::AbiResult;
 use crate::mem::Blame;
 
 use super::view::GuestView;
-use super::{active, enter};
+use super::{active, enter, MAX_SLEEP_SECONDS};
 
 // ================================================================== the guest's constants
 //
@@ -696,9 +698,11 @@ fn read_into_guest(
     offset: Option<u64>,
 ) -> AbiResult<Settled<i64>> {
     let fs = filesystem(view)?;
+    let mut blocking = BlockingWait::new();
     let mut done = 0u64;
     let mut chunk = vec![0u8; IO_BLOCK];
     while done < count {
+        blocking.observe(fs);
         let want = ((count - done) as usize).min(IO_BLOCK);
         let read = match offset {
             None => fs.read(fd, &mut chunk[..want]),
@@ -725,14 +729,85 @@ fn read_into_guest(
             }
             Settled::Failed(errno) => {
                 if done == 0 {
+                    if blocking.should_wait(fs, fd, errno) {
+                        blocking.wait(view, fs, fd)?;
+                        continue;
+                    }
                     return Ok(Settled::Failed(errno));
                 }
+                // **A pipe that gave some bytes and then had no more is a complete `read`.**
+                // POSIX: a read from a pipe returns as soon as at least one byte is available,
+                // and never waits for the rest of the buffer. Waiting here would turn a
+                // one-byte `APP_CMD` into a hang.
                 break;
             }
         }
     }
     // `done <= count <= MAX_COUNT`, so the cast cannot make a negative count.
     Ok(Settled::Done(done as i64))
+}
+
+/// The wait a **blocking** descriptor owes when the seam says the call would block.
+///
+/// `omni-platform`'s pipe never waits and never decides how long a guest may block — that is this
+/// layer's policy, and it is the same policy `poll`, `select` and `nanosleep` already apply:
+/// bounded by [`MAX_SLEEP_SECONDS`], and a refusal by name rather than a clamp when the bound is
+/// reached. D16's runaway-guest defence is built from step budgets that a sleeping thread does not
+/// consume, so an unbounded blocking `read` on a pipe nobody writes to is a permanent hang of a
+/// host thread.
+///
+/// **Non-blocking is the common case on the startup path and costs nothing**: §5.2 sets
+/// `O_NONBLOCK` on both ends of both of the glue's pipes, so this type's deadline is never even
+/// computed there.
+struct BlockingWait {
+    /// Set on the first wait, so the bound is over the whole call rather than per retry — a
+    /// per-retry bound is no bound at all when the retries are unbounded.
+    deadline: Option<Instant>,
+    /// The readiness generation as it was **before** the attempt that is about to be made.
+    ///
+    /// This is the whole of why the wait cannot lose a wakeup. A write that lands between the
+    /// seam saying `EAGAIN` and the wait starting raises the generation past this value, so the
+    /// wait returns at once instead of sleeping through the event it was waiting for. Reading the
+    /// generation *after* the failed attempt is the other order, and it is the 1.0104 s lost
+    /// wakeup `VERIFICATION.md` entry 11 records.
+    seen: u64,
+}
+
+impl BlockingWait {
+    fn new() -> BlockingWait {
+        BlockingWait { deadline: None, seen: 0 }
+    }
+
+    /// Record the generation before an attempt. Called on every pass of the transfer loop.
+    fn observe(&mut self, fs: &Filesystem) {
+        self.seen = fs.ready_generation();
+    }
+
+    /// Whether this failure is one a blocking descriptor waits out rather than reports.
+    fn should_wait(&self, fs: &Filesystem, fd: i32, errno: i32) -> bool {
+        errno == consts::EAGAIN && fs.is_nonblocking(fd).is_ok_and(|nonblocking| !nonblocking)
+    }
+
+    /// Wait for the descriptor's readiness to change, or refuse by name at the cap.
+    fn wait(&mut self, view: &GuestView<'_>, fs: &Filesystem, fd: i32) -> AbiResult<()> {
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS));
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(view.refusal(format!(
+                "a blocking `{}` on fd {fd} waited {MAX_SLEEP_SECONDS} seconds and the \
+                 descriptor never became ready. This layer caps a guest-chosen wait at that -- \
+                 the same cap `nanosleep`, `poll` and `select` name, and for the same reason: a \
+                 sleeping thread executes no guest instructions, so no step budget can end one. \
+                 Returning a short count or EAGAIN instead would report to a blocking descriptor \
+                 something only a non-blocking one can be told",
+                view.symbol()
+            )));
+        }
+        fs.wait_for_readiness(self.seen, deadline - now);
+        Ok(())
+    }
 }
 
 /// `ssize_t read(int fd, void *buf, size_t count)`
@@ -797,9 +872,11 @@ fn write_from_guest(
     count: u64,
 ) -> AbiResult<Settled<i64>> {
     let fs = filesystem(view)?;
+    let mut blocking = BlockingWait::new();
     let mut done = 0u64;
     let mut chunk = vec![0u8; IO_BLOCK];
     while done < count {
+        blocking.observe(fs);
         let want = ((count - done) as usize).min(IO_BLOCK);
         let at = guest_address(view, buf + done)?;
         let bytes = view.mem().read_bytes(at, want, Blame::new(view.symbol(), view.address(), 1))?;
@@ -809,7 +886,20 @@ fn write_from_guest(
             Settled::Done(took) => done += took as u64,
             Settled::Failed(errno) => {
                 if done == 0 {
+                    if blocking.should_wait(fs, fd, errno) {
+                        blocking.wait(view, fs, fd)?;
+                        continue;
+                    }
                     return Ok(Settled::Failed(errno));
+                }
+                // **A blocking write that has already moved some bytes keeps going**, which is
+                // the one place `write` differs from `read`: POSIX says a blocking write to a
+                // pipe transfers the whole request, so a partial write here is the pipe being
+                // full rather than the request being satisfied. It is bounded by the same
+                // deadline, so a reader that never drains still ends in a refusal.
+                if blocking.should_wait(fs, fd, errno) {
+                    blocking.wait(view, fs, fd)?;
+                    continue;
                 }
                 break;
             }
