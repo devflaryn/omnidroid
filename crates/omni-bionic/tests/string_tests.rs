@@ -19,8 +19,7 @@ use omni_bionic::mock::MockMemory;
 use omni_bionic::string::{
     gnu_strerror_r, strcat, strcat_chk, strchr, strcmp, strcasecmp, strcpy, strcspn, strlen,
     strlen_chk, strncasecmp, strncmp, strncpy, strncpy_chk, strncpy_chk2, strncat, strnlen,
-    strrchr, strspn, strstr,
-};
+    strrchr, strspn, strstr, strerror_r};
 
 fn m_str(s: &str, at: u64) -> MockMemory {
     let mut mem = MockMemory::new();
@@ -485,4 +484,51 @@ fn gnu_strerror_r_zero_len_or_null_buf_rejected() {
         gnu_strerror_r(&mut mem, 22, 0, 64).unwrap_err(),
         BionicError::InvalidArgument("__gnu_strerror_r")
     );
+}
+
+// ------------------------------------------------------------------ strerror_r (M3's gate)
+
+/// **The POSIX `strerror_r` returns an `int`, and `__gnu_strerror_r` returns a `char *`.**
+///
+/// `libroblox.so` imports both spellings. Getting them the wrong way round turns every success
+/// into a pointer the caller dereferences, or every pointer into a `0` the caller reads as success
+/// before printing an empty buffer -- which is why they are two functions here rather than one
+/// with a flag, and why this asserts the *return value* and not only the bytes.
+#[test]
+fn posix_strerror_r_returns_zero_and_writes_the_message() {
+    let mut mem = MockMemory::new();
+    mem.map(0x1000, &[0xAAu8; 64]);
+    assert_eq!(strerror_r(&mut mem, 22, 0x1000, 64), Ok(0));
+    let mut out = [0u8; 18];
+    mem.read(0x1000, &mut out).unwrap();
+    assert_eq!(&out[..17], b"Invalid argument\0");
+    assert_eq!(out[17], 0xAA, "strlcpy writes the message and its NUL, and nothing past them");
+}
+
+/// Truncation is `ERANGE` in the **return value**, with a NUL-terminated prefix written and
+/// `errno` untouched -- bionic restores `errno` around this call, so a caller that ignores the
+/// result still gets a usable string.
+#[test]
+fn posix_strerror_r_reports_truncation_as_erange() {
+    let mut mem = MockMemory::new();
+    mem.map(0x1000, &[0u8; 64]);
+    assert_eq!(strerror_r(&mut mem, 22, 0x1000, 8), Ok(34), "ERANGE");
+    let mut out = [0u8; 8];
+    mem.read(0x1000, &mut out).unwrap();
+    assert_eq!(&out, b"Invalid\0");
+    // A buffer that cannot hold even a NUL is ERANGE with nothing written.
+    assert_eq!(strerror_r(&mut mem, 22, 0x1000, 0), Ok(34));
+    assert_eq!(strerror_r(&mut mem, 22, 0, 64), Ok(34));
+}
+
+/// An errno nothing knows gets bionic's own fallback shape, not glibc's.
+#[test]
+fn posix_strerror_r_uses_bionics_unknown_error_shape() {
+    let mut mem = MockMemory::new();
+    mem.map(0x1000, &[0u8; 64]);
+    assert_eq!(strerror_r(&mut mem, 4242, 0x1000, 64), Ok(0));
+    let mut out = [0u8; 64];
+    mem.read(0x1000, &mut out).unwrap();
+    let end = out.iter().position(|&b| b == 0).expect("a terminator");
+    assert_eq!(&out[..end], b"Unknown error 4242");
 }

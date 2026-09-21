@@ -2240,6 +2240,40 @@ fn guest_mmap_refusal(
     })
 }
 
+/// **`MAP_ANONYMOUS` with a non-negative `fd`, which Linux ignores and this layer once refused.**
+///
+/// `mmap(2)`: "the fd argument is ignored; however, some implementations require fd to be -1 ...
+/// portable applications should ensure this". The kernel's anonymous path never looks at it, and
+/// passing `0` is legal and ordinary — the engine's own allocator does exactly that.
+///
+/// **M3's gate is what found it, and the cost was the whole milestone**: `libroblox.so` imports no
+/// allocator at all (D17), so guest `mmap` *is* the heap seam, and every allocation the engine
+/// made was being refused as "a file-backed mapping". The gate went from 188 initializers to 3,096
+/// of 3,594 on this one clause.
+///
+/// It was invisible to every test here because every one of them passes `-1`, which is what the
+/// manual page tells applications to do and what nothing is obliged to do. Both spellings are
+/// asserted, and so is the direction that must **not** change: no `MAP_ANONYMOUS` is still a
+/// refusal whatever `fd` says.
+#[test]
+fn an_anonymous_mmap_ignores_fd_the_way_linux_does() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    for fd in [-1i64, 0, 7] {
+        let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, fd, 0);
+        assert_ne!(at, u64::MAX, "MAP_ANONYMOUS with fd {fd} must not be MAP_FAILED");
+        assert_eq!(at % f.guest.space.page_size() as u64, 0);
+    }
+    // The over-correction: a mapping without `MAP_ANONYMOUS` is file-backed whatever `fd` is, and
+    // is still refused by name.
+    for fd in [-1i64, 0, 7] {
+        let error = guest_mmap_refusal(&f, 0, length, PROT_RW, 0x02 /* MAP_PRIVATE */, fd);
+        assert_eq!(error.symbol(), Some("mmap"), "fd {fd}");
+        assert!(error.to_string().contains("file-backed"), "fd {fd}: {error}");
+    }
+}
+
 /// **The heap seam.** The guest asks for anonymous memory, writes to it, and reads it back — all
 /// in translated ARM64, so the mapping the handler made is the one the demand pager serves.
 #[test]

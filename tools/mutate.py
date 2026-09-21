@@ -2906,6 +2906,181 @@ directory", ADAPTER_FILES,
         return Ok(());
     }""",
      ANDROID),
+    # ------------------------------------------------------------------ M3 task 4: the gate
+    #
+    # Running all 3,594 initializers is what found every defect below, and every row's detector is
+    # an ordinary fast test rather than the gate itself: the gate loads 109 MB and executes 91.6 M
+    # guest instructions, so a row scoped to it would multiply this harness's cost by that.
+
+    # **The defect the gate cost the most to find.** Linux ignores `fd` entirely when
+    # MAP_ANONYMOUS is set -- `mmap(2)` says so -- and this clause refused every anonymous
+    # mapping made with the `0` the engine's own allocator passes. `libroblox.so` imports no
+    # allocator, so guest `mmap` IS the heap seam: the gate went from 188 initializers to 3,096
+    # on this one clause, and no existing test could see it because every one of them passes -1.
+    ("guestmem-A10", "A", "an anonymous mmap with a non-negative fd is refused as file-backed",
+     ADAPTER_GUESTMEM,
+     """    if flags & MAP_ANONYMOUS == 0 {""",
+     """    if fd != -1 || flags & MAP_ANONYMOUS == 0 {""",
+     ANDROID),
+
+    # The over-correction: treating every mapping as anonymous. A file-backed `mmap` would then
+    # hand the guest zeroed anonymous memory where it asked for a file's contents, which is the
+    # believable wrong answer -- it succeeds, and the data is simply not there.
+    ("guestmem-B4", "B", "every mmap is treated as anonymous, file-backed included",
+     ADAPTER_GUESTMEM,
+     """    if flags & MAP_ANONYMOUS == 0 {""",
+     """    if false {""",
+     ANDROID),
+
+    # `dlsym` answering with an `Unbound` slot's address. That address exists so a DIRECT call can
+    # name the symbol; handing it back through `dlsym` converts a lookup the guest is prepared to
+    # see fail into a pointer it will call thousands of initializers later -- which is exactly the
+    # argument phase 2 refused all three `dl*` calls on, and the half of it that survives.
+    ("boundary-A13", "A", "dlsym answers with an Unbound slot instead of missing",
+     BOUNDARY,
+     """        if matches!(slot.binding, Binding::Unbound) {
+            return None;
+        }""",
+     """""",
+     ANDROID),
+
+    # The over-correction on the other side of the same function: a handle for one library
+    # answering for every symbol this layer has. The guest's own `.gnu.version_r` says which
+    # library each import comes from, and ignoring it makes `dlsym(libc_handle, "eglGetProcAddress")`
+    # succeed where a device fails.
+    ("boundary-B4", "B", "a library handle resolves symbols from every library",
+     BOUNDARY,
+     """            Some(name) if slot.library.as_deref() == Some(name) => Some(slot),
+            Some(_) => None,""",
+     """            Some(_) => Some(slot),""",
+     ANDROID),
+
+    # `dlopen` issuing a handle for a library this runtime does not have. NULL is the true answer
+    # and the one every caller has a branch for; a handle makes the guest `dlsym` it and carry
+    # what came back.
+    ("dl-A5", "A", "dlopen issues a handle for a library this runtime does not supply",
+     ADAPTER_DL,
+     """                    None => {""",
+     """                    None if false => {""",
+     ANDROID),
+
+    # `_SC_PAGESIZE` off by one. This is the shape D22 refused to risk for three phases: the real
+    # page-size query then arrives as an unmodelled number and is refused LOUDLY, while some other
+    # `_SC_` name silently receives a page size. The decode of the guest's own call sites is what
+    # licensed the constant, so a row that moves it is a row about that evidence.
+    ("procenv-A10", "A", "_SC_PAGESIZE is off by one",
+     ADAPTER_PROCENV,
+     """const SC_PAGESIZE: i32 = 0x0027;""",
+     """const SC_PAGESIZE: i32 = 0x0026;""",
+     ANDROID),
+
+    # `PR_GET_THP_DISABLE` answering 0 -- "huge pages are available and not disabled" -- instead
+    # of the EINVAL a kernel without CONFIG_TRANSPARENT_HUGEPAGE gives. Zero is the believable
+    # wrong answer: it is a success, and the allocator then believes a feature exists.
+    ("procenv-A11", "A", "the transparent-huge-page prctl options answer 0 instead of EINVAL",
+     ADAPTER_PROCENV,
+     """        view.set_errno(omni_bionic::errno::consts::EINVAL);
+        drop(view);
+        c.ret().i32(-1);
+        return Ok(());""",
+     """        drop(view);
+        c.ret().i32(0);
+        return Ok(());""",
+     ANDROID),
+
+    # `PR_SET_VMA` answering 0 without keeping the label. Keeping it is the ENTIRE observable
+    # effect of that call on a device -- the text beside the range in /proc/self/maps -- so a
+    # handler that returns 0 and stores nothing is the plausible stub, not an implementation.
+    ("procenv-A12", "A", "PR_SET_VMA succeeds without recording the label",
+     ADAPTER_PROCENV,
+     """                Ok(text) => {
+                    state.bionic.set_vma_name(addr, len, text);
+                    0
+                }""",
+     """                Ok(_) => 0,""",
+     ANDROID),
+
+    # `gettid` answering the process id. It is the believable wrong answer precisely because it is
+    # RIGHT for a single-threaded process -- on Linux the main thread's tid equals the pid -- and
+    # it is what a naive implementation reaches for. Every thread would then share one identity.
+    ("procenv-A13", "A", "gettid answers the process id instead of the thread identity",
+     ADAPTER_PROCENV,
+     """        let Ok(narrowed) = i32::try_from(thread.0) else {""",
+     """        let thread = omni_bionic::threads::GuestThreadId(u64::from(
+            omni_platform::process::pid(),
+        ));
+        let Ok(narrowed) = i32::try_from(thread.0) else {""",
+     ANDROID),
+
+    # `rt_sigprocmask` validating `how` before the `set` pointer. The engine passes an invalid
+    # `how` ON PURPOSE and reads the errno to decide whether an address is readable; checking
+    # `how` first answers EINVAL for every address, so the probe reports unmapped memory as
+    # readable and the guest dereferences it.
+    ("procenv-A14", "A", "rt_sigprocmask checks `how` before the pointer, breaking the probe",
+     ADAPTER_PROCENV,
+     """            if (set != 0 && !readable(&view, set, false))
+                || (oldset != 0 && !readable(&view, oldset, true))
+            {""",
+     """            if false {""",
+     ANDROID),
+
+    # The over-correction: answering EFAULT for a readable `set` too. The probe then reports every
+    # address as unreadable, and the guest routes around memory it could have used -- a wrong
+    # answer with no failure anywhere.
+    ("procenv-B5", "B", "rt_sigprocmask answers EFAULT for a readable set as well",
+     ADAPTER_PROCENV,
+     """            if (set != 0 && !readable(&view, set, false))
+                || (oldset != 0 && !readable(&view, oldset, true))
+            {""",
+     """            if set != 0 || oldset != 0 {""",
+     ANDROID),
+
+    # `/dev/urandom` reading end-of-file. Zero is `/dev/null`'s answer, one entry along, and it is
+    # what `std::random_device` gets when the file is not there -- the guest's C++ runtime then
+    # throws `system_error` and terminates, which is how the gate found the device was needed.
+    ("plat-A11", "A", "/dev/urandom reads end of file instead of entropy",
+     PLAT_FS,
+     """                Device::Random => {""",
+     """                Device::Random if false => {""",
+     PLATFORM),
+
+    # The over-correction: every path under `/dev` becomes a device. A guest opening
+    # `/dev/watchdog` would get a readable, writable character device instead of the ENOENT that
+    # says this runtime does not have one, and the confinement rule would stop meaning anything
+    # for that prefix.
+    ("plat-B6", "B", "any path under /dev is treated as a device",
+     PLAT_FS,
+     """    DEVICES.iter().find(|(name, _)| *name == spelled).map(|(_, device)| *device)""",
+     """    if spelled.starts_with("/dev/") {
+        return Some(Device::Random);
+    }
+    DEVICES.iter().find(|(name, _)| *name == spelled).map(|(_, device)| *device)""",
+     PLATFORM),
+
+    # `mbtowc` reporting an illegal sequence as a successful zero-length decode. `0` is the value
+    # for a NUL character, so the caller reads "end of string" and stops -- silently truncating
+    # every string with a byte it could not decode, where a device answers -1 and EILSEQ.
+    ("bionic-A12", "A", "mbtowc reports an illegal sequence as a NUL character",
+     BIONIC_WIDE,
+     """        Decode::Invalid | Decode::Incomplete => {
+            ctx.set_errno(EILSEQ);
+            Ok(-1)
+        }""",
+     """        Decode::Invalid | Decode::Incomplete => Ok(0),""",
+     BIONIC),
+
+    # POSIX `strerror_r` returning the buffer pointer, which is the GNU form's return value.
+    # `libroblox.so` imports both spellings; a caller of the POSIX one tests the result against 0
+    # and would read every success as a failure -- or, with a buffer at a low address, the other
+    # way round.
+    ("bionic-A13", "A", "POSIX strerror_r returns the buffer pointer like the GNU form",
+     BIONIC_STRING,
+     """    if message.len() >= len as usize {
+        return Ok(crate::errno::consts::ERANGE);
+    }
+    Ok(0)""",
+     """    Ok(b as i32)""",
+     BIONIC),
 ]
 
 

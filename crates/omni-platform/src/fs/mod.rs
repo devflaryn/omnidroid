@@ -1813,6 +1813,94 @@ mod tests {
         );
     }
 
+    /// **`/dev/urandom` is a device, and it fills the whole buffer with entropy.**
+    ///
+    /// Three things at once, because each has a believable wrong answer next to it: the read
+    /// returns the whole length (a short read would leave the rest of the caller's buffer
+    /// holding whatever was there), it is not the same twice (a fixed pattern would satisfy any
+    /// "it changed" assertion), and it is not all zero (which `/dev/zero` is, one entry along).
+    #[test]
+    fn dev_urandom_is_a_device_that_fills_the_buffer_with_entropy() {
+        let scratch = Scratch::new("urandom");
+        let fs = scratch.fs();
+        let fd = fs.open(b"/dev/urandom", OpenFlags { read: true, ..OpenFlags::default() })
+            .expect("a device descriptor");
+        let mut first = [0u8; 64];
+        let mut second = [0u8; 64];
+        assert_eq!(fs.read(fd, &mut first).expect("a read"), first.len());
+        assert_eq!(fs.read(fd, &mut second).expect("a read"), second.len());
+        assert_ne!(first, second, "two reads of /dev/urandom must not agree");
+        assert_ne!(first, [0u8; 64], "/dev/urandom is not /dev/zero");
+        // `stat` describes it without a host path existing for it.
+        assert_eq!(fs.stat(b"/dev/urandom").expect("stat").kind, FileKind::Other);
+        fs.close(fd).expect("close");
+    }
+
+    /// `/dev/null`, `/dev/zero`, and the three writes that are accepted and kept by nobody.
+    #[test]
+    fn the_other_devices_answer_what_a_device_answers() {
+        let scratch = Scratch::new("devices");
+        let fs = scratch.fs();
+        let read_write = OpenFlags { read: true, write: true, ..OpenFlags::default() };
+
+        let null = fs.open(b"/dev/null", read_write).expect("/dev/null");
+        let mut buf = [0xAAu8; 8];
+        assert_eq!(fs.read(null, &mut buf).expect("a read"), 0, "/dev/null is end of file");
+        assert_eq!(buf, [0xAAu8; 8], "and it writes nothing into the buffer");
+
+        let zero = fs.open(b"/dev/zero", read_write).expect("/dev/zero");
+        assert_eq!(fs.read(zero, &mut buf).expect("a read"), buf.len());
+        assert_eq!(buf, [0u8; 8], "/dev/zero fills with zero");
+
+        // Every device takes the whole write and keeps none of it, which is what the three of
+        // them do on a device.
+        for fd in [null, zero] {
+            assert_eq!(fs.write(fd, b"discarded").expect("a write"), 9);
+        }
+        // A character device has no offset, so `pread` on one is not a short read: it is an error.
+        assert!(fs.pread(zero, &mut buf, 0).is_err(), "a device has no offset to read at");
+    }
+
+    /// **The device list is closed**, and a path that merely looks like one is an ordinary path.
+    ///
+    /// The over-correction half: a rule that matched `/dev/` as a prefix would make every path
+    /// under it a device, and `ENOENT` for a file that is not there is what the guest must get.
+    #[test]
+    fn a_path_that_is_not_one_of_the_four_devices_is_an_ordinary_path() {
+        let scratch = Scratch::new("notdev");
+        let fs = scratch.fs();
+        assert!(device_for(b"/dev/urandom").is_some());
+        for path in [
+            &b"/dev/watchdog"[..],
+            b"/dev/urandom2",
+            b"/dev",
+            b"/urandom",
+            b"/proc/sys/vm/overcommit_memory",
+        ] {
+            assert!(
+                device_for(path).is_none(),
+                "`{}` is not one of the four devices this seam implements",
+                path::display(path)
+            );
+        }
+        assert_eq!(
+            fs.open(b"/dev/watchdog", OpenFlags { read: true, ..OpenFlags::default() })
+                .unwrap_err()
+                .kind(),
+            Some(FsErrorKind::NotFound),
+            "a path that is not a device resolves under the root like any other"
+        );
+        // Spellings of the same device all reach it, because the path is normalised first.
+        for path in [&b"/dev/./urandom"[..], b"/dev//urandom", b"/x/../dev/urandom"] {
+            assert_eq!(
+                device_for(path),
+                Some(Device::Random),
+                "`{}` names /dev/urandom",
+                path::display(path)
+            );
+        }
+    }
+
     /// A root that is not a directory, or is not there, is refused when the filesystem is built.
     #[test]
     fn a_root_that_is_not_a_directory_is_refused_at_construction() {

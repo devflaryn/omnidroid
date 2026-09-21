@@ -1891,6 +1891,57 @@ mod tests {
         assert_ne!(other, first);
     }
 
+    /// **`lookup` is what `dlsym` answers with, and an `Unbound` slot is not a hit.**
+    ///
+    /// Both directions. A symbol this layer supplies is found in the scope the guest's own
+    /// `DT_VERNEED` attributes it to and nowhere else; and a symbol that has an address only so
+    /// that a *direct call* can name itself is a miss, because handing that address back through
+    /// `dlsym` would turn a lookup the guest is prepared to see fail into a pointer it calls
+    /// thousands of initializers later.
+    #[test]
+    fn lookup_answers_in_the_librarys_scope_and_never_with_an_unbound_slot() {
+        let b = builder();
+        // The loader is what attributes a symbol, so the attribution is made the way the loader
+        // makes it: by resolving a request that carries a library.
+        let ask = |name: &str, library: Option<&str>| {
+            b.resolve(&SymbolRequest {
+                name,
+                kind: SymbolKind::Function,
+                library,
+                version: None,
+                weak: false,
+            })
+        };
+        ask("memcpy", Some("libc.so")).expect("a slot");
+        ask("sinf", Some("libm.so")).expect("a slot");
+        ask("setjmp", Some("libc.so")).expect("a slot");
+        b.bind_inline("memcpy", noop).expect("bound");
+        b.bind_inline("sinf", noop).expect("bound");
+        // `setjmp` is deliberately left unbound.
+        let boundary = b.finish();
+
+        assert_eq!(
+            boundary.libraries().into_iter().collect::<Vec<_>>(),
+            vec!["libc.so", "libm.so"],
+            "the libraries are the guest's own, not a list here"
+        );
+        // Found in the global scope and in its own library.
+        assert!(boundary.lookup(None, "memcpy").is_some());
+        assert!(boundary.lookup(Some("libc.so"), "memcpy").is_some());
+        // **And not in another library's**, which is the whole point of the scope.
+        assert!(
+            boundary.lookup(Some("libm.so"), "memcpy").is_none(),
+            "this binary says `memcpy` comes from libc.so, so libm.so must not answer for it"
+        );
+        assert!(boundary.lookup(Some("libc.so"), "sinf").is_none());
+        // An `Unbound` slot has an address and is still a miss, in every scope.
+        assert!(boundary.slot_named("setjmp").is_some(), "it does have an address");
+        assert!(boundary.lookup(None, "setjmp").is_none());
+        assert!(boundary.lookup(Some("libc.so"), "setjmp").is_none());
+        // A symbol nothing declared is a miss rather than a panic.
+        assert!(boundary.lookup(None, "eglGetProcAddress").is_none());
+    }
+
     /// The design point: an import nothing implements still gets an address, so that calling it is a
     /// named error rather than a branch to zero.
     #[test]

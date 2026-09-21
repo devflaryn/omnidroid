@@ -13,7 +13,7 @@
 use omni_bionic::context::GuestContext;
 use omni_bionic::memory::{Fault, GuestMemory};
 use omni_bionic::mock::MockMemory;
-use omni_bionic::wide::{mbsrtowcs, mbrtowc, wctob, wmemcmp, wmemchr, wcslen};
+use omni_bionic::wide::{mbsrtowcs, mbrtowc, mbtowc, wctob, wmemcmp, wmemchr, wcslen};
 
 /// Context double over [`MockMemory`].
 #[derive(Default)]
@@ -287,4 +287,63 @@ fn mbsrtowcs_null_src_slot_rejected() {
     // Slot exists but points at null.
     ctx.mem.map(0x3000, &0u64.to_le_bytes());
     assert!(mbsrtowcs(&mut ctx, 0x2000, 0x3000, 8, 0).is_err());
+}
+
+// ------------------------------------------------------------------ mbtowc (M3's gate)
+
+/// `mbtowc` stores the scalar value and returns how many bytes it consumed.
+#[test]
+fn mbtowc_decodes_one_character_and_reports_its_length() {
+    let mut ctx = Ctx::default();
+    // U+00E9 LATIN SMALL LETTER E WITH ACUTE, two bytes in UTF-8.
+    ctx.mem.map(0x1000, b"\xC3\xA9x\x00");
+    ctx.mem.map(0x2000, &[0u8; 4]);
+    assert_eq!(mbtowc(&mut ctx, 0x2000, 0x1000, 4), Ok(2));
+    let mut out = [0u8; 4];
+    ctx.read(0x2000, &mut out).unwrap();
+    assert_eq!(u32::from_le_bytes(out), 0xE9);
+    // A NUL character is `0`, and nothing is stored -- which is `mbrtowc`'s rule and therefore
+    // bionic's, since `mbtowc` returns what `mbrtowc` returned.
+    ctx.mem.map(0x3000, b"\x00");
+    assert_eq!(mbtowc(&mut ctx, 0x2000, 0x3000, 1), Ok(0));
+}
+
+/// **`EILSEQ` is a return value here, not a refusal**, and that is the whole reason this function
+/// exists separately from [`mbrtowc`].
+///
+/// `mbrtowc`'s invalid-sequence arm reports `Unimplemented`, which the adapter turns into a
+/// refusal that would stop a run where a device returns `-1`. Both of bionic's error cases --
+/// an illegal sequence and an incomplete one -- are `-1` with `EILSEQ`.
+#[test]
+fn mbtowc_reports_an_illegal_or_incomplete_sequence_as_minus_one_with_eilseq() {
+    let mut ctx = Ctx::default();
+    ctx.mem.map(0x1000, b"\xFF\x00"); // 0xFF is not a legal UTF-8 lead byte
+    assert_eq!(mbtowc(&mut ctx, 0, 0x1000, 2), Ok(-1));
+    assert_eq!(ctx.errno(), 84, "EILSEQ, Linux numbering");
+
+    let mut ctx = Ctx::default();
+    ctx.mem.map(0x1000, b"\xC3"); // a valid prefix with its continuation byte missing
+    assert_eq!(mbtowc(&mut ctx, 0, 0x1000, 1), Ok(-1));
+    assert_eq!(ctx.errno(), 84);
+
+    // `n == 0` is "no bytes to look at", which is bionic's incomplete case.
+    let mut ctx = Ctx::default();
+    ctx.mem.map(0x1000, b"a");
+    assert_eq!(mbtowc(&mut ctx, 0, 0x1000, 0), Ok(-1));
+    assert_eq!(ctx.errno(), 84);
+}
+
+/// `s == NULL` asks whether encodings are state-dependent. UTF-8's are not, so the answer is 0.
+#[test]
+fn mbtowc_with_a_null_string_answers_zero_for_a_stateless_encoding() {
+    let mut ctx = Ctx::default();
+    assert_eq!(mbtowc(&mut ctx, 0x2000, 0, 4), Ok(0));
+}
+
+/// Hostile: a `pwc` that is not writable is a fault, not a silent discard.
+#[test]
+fn mbtowc_with_an_unmapped_destination_faults() {
+    let mut ctx = Ctx::default();
+    ctx.mem.map(0x1000, b"a");
+    assert!(mbtowc(&mut ctx, 0x9999_0000, 0x1000, 1).is_err());
 }
