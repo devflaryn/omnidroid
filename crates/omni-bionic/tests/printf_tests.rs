@@ -451,3 +451,437 @@ fn a_repeated_wide_field_is_stopped_by_the_total_cap() {
         Err(FormatError::OutputTooLarge { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------------------------
+// The budget: what a `vsnprintf` into a fixed buffer keeps (adapter-review finding W1)
+// ---------------------------------------------------------------------------------------------
+//
+// Oracle, as everywhere else in this file: the conversion rules, hand-derived. The device's
+// arrangement is `char buf[LOG_BUF_SIZE]` with `LOG_BUF_SIZE` 1024, so 1,023 characters and a
+// NUL -- `omni_platform::log` carries that constant and names the AOSP file it came out of, and
+// it is written out here rather than imported because `omni-bionic` has no dependencies (D19).
+
+/// `LOG_BUF_SIZE - 1`: the characters `liblog`'s `vsnprintf` keeps. See above.
+const LIBLOG_BUDGET: usize = 1023;
+
+/// Format under a budget, failing loudly rather than skipping if it refuses.
+///
+/// `VERIFICATION.md` entry 4: a test that takes an early exit on an unexpected outcome passes
+/// without asserting anything. Every call here is a claim that this input **does not refuse**.
+fn bounded(
+    fmt_str: &str,
+    args: &[FormatArg],
+    budget: usize,
+) -> (String, omni_bionic::printf::Produced) {
+    let mut out = String::new();
+    match omni_bionic::printf::format_bounded(fmt_str, args, &mut out, budget) {
+        Ok(produced) => (out, produced),
+        Err(error) => panic!(
+            "`{}` at budget {budget} must truncate, not refuse: {error}",
+            &fmt_str[..fmt_str.len().min(40)]
+        ),
+    }
+}
+
+/// **The trap, and the reason this arm needed thought rather than a `match`.**
+///
+/// A right-justified field puts its padding *first*, so a device's buffer fills with padding and
+/// the number never reaches it: `vsnprintf(buf, 1024, "%70000d", 42)` leaves 1,023 **spaces**.
+/// The believable wrong answer is to clamp the width to the budget, which produces 1,021 spaces
+/// followed by `42` -- the right length, the right characters, in the wrong order, and a tail a
+/// device does not have. Asserted on the bytes, not on the length, because the two differ only
+/// in the last two of 1,023.
+#[test]
+fn a_wide_right_justified_field_is_cut_to_its_padding_and_never_to_its_number() {
+    let (out, produced) = bounded("%70000d", &[FormatArg::Int(42)], LIBLOG_BUDGET);
+    assert_eq!(out, " ".repeat(LIBLOG_BUDGET), "a device's buffer is all padding");
+    assert!(!out.ends_with("42"), "the number belongs 68,977 characters past the buffer");
+    // And the clamped-width answer is named, so a future change to it fails here rather than
+    // passing a length check.
+    let clamped = format!("{:>width$}", 42, width = LIBLOG_BUDGET);
+    assert_ne!(out, clamped, "clamping the width to the budget is the wrong answer");
+    // `full` is what `vsnprintf` returns: the whole field, not what was kept.
+    assert_eq!(produced.full, 70_000);
+    assert_eq!(produced.kept, LIBLOG_BUDGET);
+    assert!(produced.truncated());
+}
+
+/// The other two padding modes, where the payload **is** in the prefix and must survive.
+///
+/// The companion to the test above: a fix that answered "a wide field is all padding" would be
+/// right for one of the three modes and wrong for the other two.
+#[test]
+fn a_wide_left_justified_or_zero_padded_field_keeps_what_comes_first() {
+    // `-`: the body leads, then spaces.
+    let (left, _) = bounded("%-70000d", &[FormatArg::Int(42)], LIBLOG_BUDGET);
+    assert_eq!(left, format!("42{}", " ".repeat(LIBLOG_BUDGET - 2)));
+
+    // `0`: the sign leads, then zeros -- the sign is not overwritten by the padding.
+    let (zero, _) = bounded("%070000d", &[FormatArg::Int(-42)], LIBLOG_BUDGET);
+    assert_eq!(zero, format!("-{}", "0".repeat(LIBLOG_BUDGET - 1)));
+    assert!(zero.starts_with('-'), "a lost sign is a different number");
+
+    // `#0x`: the `0x` leads for the same reason.
+    let (hex, _) = bounded("%#070000x", &[FormatArg::UInt(0xab)], LIBLOG_BUDGET);
+    assert_eq!(hex, format!("0x{}", "0".repeat(LIBLOG_BUDGET - 2)));
+}
+
+/// **The budgeted output is a prefix of the unbounded output**, at every budget, for every
+/// padding mode and both `*` forms.
+///
+/// The general statement of what a fixed buffer does, asserted against this engine's own
+/// unbounded result rather than against a second implementation (`VERIFICATION.md` entry 7).
+/// The widths stay under `MAX_FIELD_WIDTH` so that the unbounded half is producible at all --
+/// which is exactly the case where the fix must change nothing.
+#[test]
+fn a_budgeted_result_is_a_character_prefix_of_the_unbounded_one() {
+    let cases: &[(&str, &[FormatArg])] = &[
+        ("[%4096d]", &[FormatArg::Int(-7)]),
+        ("[%-4096d]", &[FormatArg::Int(-7)]),
+        ("[%04096d]", &[FormatArg::Int(-7)]),
+        ("[%+4096.100d]", &[FormatArg::Int(7)]),
+        ("[%#4096.80x]", &[FormatArg::UInt(0xdead_beef)]),
+        ("[%4096s]", &[FormatArg::Str("payload")]),
+        ("[%-4096s]", &[FormatArg::Str("payload")]),
+        ("[%4096.3s]", &[FormatArg::Str("payload")]),
+        ("[%*d]", &[FormatArg::Int(4096), FormatArg::Int(-7)]),
+        ("[%.*f]", &[FormatArg::Int(900), FormatArg::Double(0.5)]),
+        ("[%4096c]", &[FormatArg::Int(0x41)]),
+        ("[%4096p]", &[FormatArg::Ptr(0x1000)]),
+        ("literal %s and %d over and over", &[FormatArg::Str("s"), FormatArg::Int(1)]),
+    ];
+    for (spec, args) in cases {
+        let whole: Vec<char> = fmt(spec, args).chars().collect();
+        for budget in [0usize, 1, 2, 7, 100, 1023, 4095, 4096, 4097, whole.len(), 1 << 20] {
+            let (out, produced) = bounded(spec, args, budget);
+            let expected: String = whole.iter().take(budget).collect();
+            assert_eq!(out, expected, "`{spec}` at budget {budget}");
+            assert_eq!(produced.full, whole.len(), "`{spec}` full length at budget {budget}");
+            assert_eq!(produced.kept, expected.chars().count(), "`{spec}` kept at {budget}");
+            assert_eq!(
+                produced.truncated(),
+                whole.len() > budget,
+                "`{spec}` at budget {budget} must report whether it lost anything"
+            );
+        }
+    }
+}
+
+/// **The case finding W1 names: a format string that *builds* a megabyte.**
+///
+/// Unbounded this is `OutputTooLarge` and the partial result is discarded, which aborts the
+/// guest run. Under a budget it is what a device keeps. The input is genuinely constructed --
+/// sixty-four 64 KiB fields, 4 MiB in total -- rather than asserted about in the abstract.
+#[test]
+fn a_repeated_wide_field_truncates_under_a_budget_where_it_refuses_without_one() {
+    use omni_bionic::printf::{MAX_FIELD_WIDTH, MAX_OUTPUT};
+    let wide = format!("%{MAX_FIELD_WIDTH}d");
+    let repeated = wide.repeat(64);
+    let args: Vec<FormatArg> = (0..64).map(|_| FormatArg::Int(1)).collect();
+
+    // Unbounded: unchanged, and the refusal is still the right answer there.
+    assert!(matches!(
+        format(&repeated, &args, &mut String::new()),
+        Err(FormatError::OutputTooLarge { .. })
+    ));
+
+    let (out, produced) = bounded(&repeated, &args, LIBLOG_BUDGET);
+    assert_eq!(out, " ".repeat(LIBLOG_BUDGET), "the first field's padding, and nothing else");
+    assert_eq!(produced.full, 64 * MAX_FIELD_WIDTH, "4 MiB is what it asked for");
+    assert!(produced.full > MAX_OUTPUT, "the input really does pass the unbounded cap");
+    assert!(produced.truncated());
+}
+
+/// A run of literal bytes is bounded by the same budget, and reports its true length.
+#[test]
+fn a_long_literal_run_truncates_under_a_budget() {
+    use omni_bionic::printf::MAX_OUTPUT;
+    let literals = "x".repeat(MAX_OUTPUT + 16);
+    assert!(matches!(
+        format(&literals, &[], &mut String::new()),
+        Err(FormatError::OutputTooLarge { .. })
+    ));
+    let (out, produced) = bounded(&literals, &[], LIBLOG_BUDGET);
+    assert_eq!(out, "x".repeat(LIBLOG_BUDGET));
+    assert_eq!(produced.full, MAX_OUTPUT + 16);
+}
+
+/// **A guest-chosen precision is a counted run, not an allocation**, for the integer
+/// conversions.
+///
+/// `%.70000d` is a minimum digit count: sign, then 69,999 zeros, then the digit. A device's
+/// buffer therefore holds 1,023 zeros and no digit at all.
+#[test]
+fn a_huge_integer_precision_is_a_fill_and_the_digits_sit_past_the_budget() {
+    let (out, produced) = bounded("%.70000d", &[FormatArg::Int(7)], LIBLOG_BUDGET);
+    assert_eq!(out, "0".repeat(LIBLOG_BUDGET));
+    assert_eq!(produced.full, 70_000, "69,999 zeros and one digit");
+
+    // With a sign the sign leads, because the zeros are the *precision* and go after it.
+    let (signed, _) = bounded("%.70000d", &[FormatArg::Int(-7)], LIBLOG_BUDGET);
+    assert_eq!(signed, format!("-{}", "0".repeat(LIBLOG_BUDGET - 1)));
+
+    // `%#.70000x`: the `0x` leads, and for `%#o` the alternate-form prefix is dropped where the
+    // precision's own leading zero already supplies one.
+    let (hex, hex_produced) = bounded("%#.70000x", &[FormatArg::UInt(0xab)], LIBLOG_BUDGET);
+    assert_eq!(hex, format!("0x{}", "0".repeat(LIBLOG_BUDGET - 2)));
+    assert_eq!(hex_produced.full, 70_002);
+    let (oct, _) = bounded("%#.70000o", &[FormatArg::UInt(0o17)], LIBLOG_BUDGET);
+    assert_eq!(oct, "0".repeat(LIBLOG_BUDGET), "no second `0` prefix: the precision supplied one");
+}
+
+/// **`%.*f` past `EXACT_FRACTION_DIGITS` is zeros, and splitting there changes no byte.**
+///
+/// The smallest positive `f64` is `2^-1074`, so a finite `double`'s exact decimal expansion has
+/// at most 1,074 fraction digits and a precision past that appends literal zeros and rounds
+/// nothing. That is what lets `%.70000f` be answered without building 70,000 digits.
+///
+/// Checked two ways: against the hand-derived bytes, and against this engine's **own** output at
+/// a precision below the split, which is the half that does not take the fill path at all. If
+/// the split rounded, those two would differ.
+#[test]
+fn a_huge_f_precision_is_a_fill_and_the_bytes_are_the_whole_conversions() {
+    use omni_bionic::printf::EXACT_FRACTION_DIGITS;
+    assert_eq!(EXACT_FRACTION_DIGITS, 1074, "2^-1074 is the smallest positive double");
+
+    // 0.5 is exact: "0.5" then 69,998 zeros.
+    let (out, produced) = bounded("%.70000f", &[FormatArg::Double(0.5)], LIBLOG_BUDGET);
+    assert_eq!(out, format!("0.5{}", "0".repeat(LIBLOG_BUDGET - 3)));
+    assert_eq!(produced.full, 70_002, "`0.` and 70,000 fraction digits");
+
+    // 0.1 is not exact: its expansion is 55 digits long and the rest are zeros. The first 900
+    // characters must be the same whether the conversion was asked for 1,000 of them (no fill)
+    // or for 70,000 (fill).
+    let below_the_split: String =
+        fmt("%.1000f", &[FormatArg::Double(0.1)]).chars().take(900).collect();
+    let (above_the_split, _) = bounded("%.70000f", &[FormatArg::Double(0.1)], 900);
+    assert_eq!(above_the_split, below_the_split, "the split must not round");
+    assert!(
+        above_the_split.starts_with("0.1000000000000000055511151231257827"),
+        "{}",
+        &above_the_split[..40]
+    );
+    assert!(above_the_split.ends_with("000"), "and the tail is zeros");
+
+    // A negative value with a width: width 70,000 over a body of 70,003 is no padding at all,
+    // so the sign and the digits lead.
+    let (wide, wide_produced) = bounded("%70000.70000f", &[FormatArg::Double(-0.5)], LIBLOG_BUDGET);
+    assert_eq!(wide, format!("-0.5{}", "0".repeat(LIBLOG_BUDGET - 4)));
+    assert_eq!(wide_produced.full, 70_003);
+
+    // `inf` has no fraction digits at any precision, so there is no fill to run away with.
+    let (infinite, inf_produced) =
+        bounded("%.70000f", &[FormatArg::Double(f64::INFINITY)], LIBLOG_BUDGET);
+    assert_eq!(infinite, "inf");
+    assert_eq!(inf_produced.full, 3);
+    assert!(!inf_produced.truncated());
+}
+
+/// **The arm that could not be made byte-correct, refused by name rather than guessed.**
+///
+/// `e E g G a A` build their digits through `10u64.pow(precision.min(15))` and through a
+/// precision `format_g` derives, so past fifteen places this engine's digits are not
+/// `vsnprintf`'s and a partial result would be a plausible wrong answer in the *visible* prefix.
+/// A budget does not change that, so these stay refusals -- and the refusal names the conversion.
+///
+/// The negative half is the point: the conversions that **can** be placed must not be swept up
+/// with them, or the fix would be a refusal with extra steps.
+#[test]
+fn the_floating_conversions_this_engine_cannot_place_still_refuse_under_a_budget() {
+    for conversion in ['e', 'E', 'g', 'G', 'a', 'A'] {
+        let spec = format!("%.70000{conversion}");
+        let mut out = String::new();
+        let outcome = omni_bionic::printf::format_bounded(
+            &spec,
+            &[FormatArg::Double(1.5)],
+            &mut out,
+            LIBLOG_BUDGET,
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(FormatError::FieldTooWide { conversion: c, .. }) if c == conversion
+            ),
+            "`{spec}` must refuse and name its conversion, got {outcome:?}"
+        );
+        assert_eq!(out, "", "and nothing plausible-but-wrong was written on the way");
+    }
+    // Their *width* is a different question and is honoured: the padding is placeable.
+    let (wide, wide_produced) = bounded("%70000e", &[FormatArg::Double(1.5)], LIBLOG_BUDGET);
+    assert_eq!(wide, " ".repeat(LIBLOG_BUDGET));
+    assert_eq!(wide_produced.full, 70_000);
+    // And the conversions that can be placed are not refused with them.
+    for spec in ["%.70000d", "%.70000u", "%.70000x", "%.70000f", "%.70000s"] {
+        let args: Vec<FormatArg> = if spec.ends_with('s') {
+            vec![FormatArg::Str("short")]
+        } else if spec.ends_with('f') {
+            vec![FormatArg::Double(0.5)]
+        } else {
+            vec![FormatArg::Int(1)]
+        };
+        let (_, produced) = bounded(spec, &args, LIBLOG_BUDGET);
+        assert!(produced.full > 0, "`{spec}` produced nothing at all");
+    }
+}
+
+/// A `%s` precision can only ever **shorten** a string, so a huge one costs nothing and a
+/// device simply prints the string.
+#[test]
+fn a_huge_string_precision_prints_the_whole_string_rather_than_refusing() {
+    let (out, produced) = bounded("%.70000s", &[FormatArg::Str("payload")], LIBLOG_BUDGET);
+    assert_eq!(out, "payload");
+    assert_eq!(produced.full, 7);
+    assert!(!produced.truncated());
+    // Unbounded, the cap is still what stops a hostile count reaching `emit_padded`.
+    assert!(matches!(
+        format("%.70000s", &[FormatArg::Str("payload")], &mut String::new()),
+        Err(FormatError::FieldTooWide { conversion: 's', .. })
+    ));
+}
+
+/// **A `%s` precision that lands inside a character used to panic.**
+///
+/// A `%s` argument is one `char` per guest byte, so a guest byte above `0x7F` is two bytes of
+/// the host `String`. The precision sliced at a byte index taken straight from the guest, which
+/// both counted the wrong unit and panicked on a boundary the guest picked -- a panic unwinding
+/// out of an import, which is the failure this layer exists to never produce. The input here is
+/// the two guest bytes `0xC3 0xA9`, which is what `"e-acute"` arrives as.
+#[test]
+fn a_string_precision_counts_guest_bytes_and_cannot_split_a_character() {
+    let guest = "\u{c3}\u{a9}"; // two guest bytes, four host bytes
+    assert_eq!(guest.len(), 4, "the host String really is twice the guest's length");
+    assert_eq!(guest.chars().count(), 2);
+    assert_eq!(fmt("%.1s", &[FormatArg::Str(guest)]), "\u{c3}", "one guest byte, not half of one");
+    assert_eq!(fmt("%.2s", &[FormatArg::Str(guest)]), guest);
+    assert_eq!(fmt("%.9s", &[FormatArg::Str(guest)]), guest, "a precision past the end is a no-op");
+    assert_eq!(fmt("%.0s", &[FormatArg::Str(guest)]), "");
+    // And the width is measured in the same unit, or a two-byte guest character would be padded
+    // as though it were two characters.
+    assert_eq!(fmt("%4s", &[FormatArg::Str(guest)]), format!("  {guest}"));
+}
+
+/// **The budget is guest bytes, which is not host bytes**, and the difference is a factor of two
+/// on exactly the input a hostile guest picks.
+///
+/// A budget applied to `out.len()` would keep 511 guest bytes where a device keeps 1,023.
+#[test]
+fn the_budget_counts_guest_bytes_and_not_host_string_bytes() {
+    let high: String = core::iter::repeat_n('\u{ff}', 4000).collect();
+    let (out, produced) = bounded("%s", &[FormatArg::Str(&high)], LIBLOG_BUDGET);
+    assert_eq!(out.chars().count(), LIBLOG_BUDGET, "1,023 guest bytes");
+    assert_eq!(out.len(), 2 * LIBLOG_BUDGET, "which is 2,046 host bytes");
+    assert!(out.chars().all(|c| c == '\u{ff}'));
+    assert_eq!(produced.full, 4000);
+    assert_eq!(produced.kept, LIBLOG_BUDGET);
+}
+
+/// A message that fits is untouched, and says so -- the negative half of every assertion above.
+///
+/// `VERIFICATION.md` entry 11: a flag that is set under the fault and also set without it
+/// reports nothing. So this asserts `truncated()` is **false** at the exact boundary and true
+/// one character past it.
+#[test]
+fn a_message_that_fits_the_budget_is_byte_identical_and_reports_no_truncation() {
+    let exact = "y".repeat(LIBLOG_BUDGET);
+    let (out, produced) = bounded("%s", &[FormatArg::Str(&exact)], LIBLOG_BUDGET);
+    assert_eq!(out, exact);
+    assert_eq!(produced.kept, LIBLOG_BUDGET);
+    assert_eq!(produced.full, LIBLOG_BUDGET);
+    assert!(!produced.truncated(), "exactly at the budget is not a truncation");
+
+    let past = "y".repeat(LIBLOG_BUDGET + 1);
+    let (out, produced) = bounded("%s", &[FormatArg::Str(&past)], LIBLOG_BUDGET);
+    assert_eq!(out, exact, "one character past it loses exactly one character");
+    assert_eq!(produced.full, LIBLOG_BUDGET + 1);
+    assert!(produced.truncated());
+
+    // An ordinary line, which is every line the engine actually logs.
+    let (out, produced) =
+        bounded("hello %s #%d", &[FormatArg::Str("world"), FormatArg::Int(7)], LIBLOG_BUDGET);
+    assert_eq!(out, "hello world #7");
+    assert_eq!(produced.full, 14);
+    assert!(!produced.truncated());
+}
+
+/// The unbounded entry point is unchanged, character for character, and `usize::MAX` is the
+/// same call.
+#[test]
+fn an_unbounded_budget_is_the_unbounded_call() {
+    let cases: &[(&str, &[FormatArg])] = &[
+        (
+            "%d %i %u %o %x %X",
+            &[
+                FormatArg::Int(-1),
+                FormatArg::Int(2),
+                FormatArg::UInt(3),
+                FormatArg::UInt(8),
+                FormatArg::UInt(255),
+                FormatArg::UInt(255),
+            ],
+        ),
+        ("%c%s%p", &[FormatArg::Int(0x41), FormatArg::Str("bc"), FormatArg::Ptr(0)]),
+        (
+            "%e %f %g %a",
+            &[
+                FormatArg::Double(1.5),
+                FormatArg::Double(1.5),
+                FormatArg::Double(1.5),
+                FormatArg::Double(1.5),
+            ],
+        ),
+        (
+            "%08.3f|%-8d|%+d|% d|%#x",
+            &[
+                FormatArg::Double(-1.5),
+                FormatArg::Int(7),
+                FormatArg::Int(7),
+                FormatArg::Int(7),
+                FormatArg::UInt(0x2a),
+            ],
+        ),
+    ];
+    for (spec, args) in cases {
+        let (out, produced) = bounded(spec, args, usize::MAX);
+        assert_eq!(out, fmt(spec, args), "`{spec}`");
+        assert!(!produced.truncated());
+        assert_eq!(produced.kept, produced.full);
+    }
+}
+
+/// A width past the cap **still refuses without a budget**, which is the half of the cap that is
+/// still doing work: with nowhere for the output to stop, `emit_padded` would be asked for an
+/// allocation the guest picked.
+#[test]
+fn a_hostile_width_without_a_budget_is_still_refused() {
+    use omni_bionic::printf::MAX_FIELD_WIDTH;
+    for spec in ["%70000d", "%-70000d", "%070000d"] {
+        assert!(
+            matches!(
+                format(spec, &[FormatArg::Int(1)], &mut String::new()),
+                Err(FormatError::FieldTooWide { requested: 70_000, limit: MAX_FIELD_WIDTH, .. })
+            ),
+            "`{spec}` unbounded"
+        );
+    }
+    // The `*` form too: the format string alone looks harmless.
+    assert!(matches!(
+        format("%*d", &[FormatArg::Int(i64::MAX), FormatArg::Int(1)], &mut String::new()),
+        Err(FormatError::FieldTooWide { conversion: 'd', .. })
+    ));
+    // And under a budget the same `*` width is honoured, because the padding is counted.
+    let (out, produced) =
+        bounded("%*d", &[FormatArg::Int(70_000), FormatArg::Int(1)], LIBLOG_BUDGET);
+    assert_eq!(out, " ".repeat(LIBLOG_BUDGET));
+    assert_eq!(produced.full, 70_000);
+}
+
+/// A budget of zero writes nothing and still reports the whole length -- `snprintf(NULL, 0, ...)`
+/// is the documented way to ask how long a result would be.
+#[test]
+fn a_zero_budget_writes_nothing_and_still_counts() {
+    let (out, produced) = bounded("%s and %d", &[FormatArg::Str("abc"), FormatArg::Int(10)], 0);
+    assert_eq!(out, "");
+    assert_eq!(produced.kept, 0);
+    assert_eq!(produced.full, 10, "abc and 10");
+    assert!(produced.truncated());
+}
