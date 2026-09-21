@@ -104,6 +104,10 @@ PLAT_FS_PATH = "crates/omni-platform/src/fs/path.rs"
 PLAT_FS_PIPE = "crates/omni-platform/src/fs/pipe.rs"
 # M5: the NDK surface. `ALooper` is the first of the four families.
 NDK_LOOPER = "crates/omni-android/src/ndk/looper.rs"
+# M6: `ANativeWindow` is the fourth. Five symbols, because that is what `libroblox.so` imports --
+# §4.4's "ANativeWindow (9)" is the count across the whole APK.
+NDK_WINDOW = "crates/omni-android/src/ndk/window.rs"
+NDK_MOD = "crates/omni-android/src/ndk/mod.rs"
 PLAT_FS_WINDOWS = "crates/omni-platform/src/fs/windows.rs"
 BIONIC_STDIO = "crates/omni-bionic/src/stdio.rs"
 ADAPTER_FILES = "crates/omni-android/src/bionic/files.rs"
@@ -149,6 +153,10 @@ BIONIC = [
     # as a surprise this time: both agents that wrote these rows said so in their reports before
     # anything was run.
     "--test", "strftime_tests", "--test", "stdio_modes_tests",
+    # M6 added a third for the same reason, predicted the same way: `errno-A1`, `errno-A3`,
+    # `errno-B1`, `errno-B2` and `errno-B4` are caught HERE AND NOWHERE ELSE. Leaving it out would
+    # have turned five rows into MISSes that read as missing tests rather than a missing target.
+    "--test", "stdio_errno_tests",
     "--no-fail-fast",
 ]
 CPU = ["cargo", "test", "-p", "omni-cpu", "--no-fail-fast"]
@@ -4225,6 +4233,261 @@ directory", ADAPTER_FILES,
      """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex);""",
      """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, mutex, mutex);""",
      ANDROID),
+
+    # ---- ANativeWindow (M6). The five symbols `libroblox.so` imports. -------------------------
+
+    # The last release no longer frees the slot, so a destroyed window stays live and a release
+    # past the last reference silently succeeds -- a handle guest code believes it gave up.
+    ("window-A1", "A", "the last release no longer frees the window slot",
+     NDK_WINDOW,
+     """        state.windows.remove(at);""",
+     """        let _ = at;""",
+     ANDROID),
+
+    # `_getHeight` answers the width. Both are `int32_t` through the same path, so nothing but a
+    # test that asserts the two DIFFER can see it -- which is why the detector sets them apart.
+    ("window-A2", "A", "ANativeWindow_getHeight answers the width",
+     NDK_WINDOW,
+     """    c.ret().i32(geometry.height);""",
+     """    c.ret().i32(geometry.width);""",
+     ANDROID),
+
+    # The undecided geometry becomes an invented 1920x1080 -- the exact wrong answer the module
+    # documents its refusal against, and the one that is indistinguishable in every log from a
+    # resolution the host meant.
+    ("window-A3", "A", "an undecided window geometry is invented as 1920x1080",
+     NDK_MOD,
+     """    pub fn window_geometry(&self) -> Option<WindowGeometry> {
+        *self.window_geometry.lock()
+    }""",
+     """    pub fn window_geometry(&self) -> Option<WindowGeometry> {
+        Some(self.window_geometry.lock().unwrap_or(WindowGeometry { width: 1920, height: 1080 }))
+    }""",
+     ANDROID),
+
+    # The `Surface` class check is dropped, so any live jobject becomes a window -- an
+    # AssetManager passed by mistake answers as a surface thousands of instructions later.
+    ("window-A4", "A", "ANativeWindow_fromSurface stops checking the jobject's class",
+     NDK_WINDOW,
+     """    if class != SURFACE_CLASS {""",
+     """    if false {""",
+     ANDROID),
+
+    # `_getWidth` stops checking the handle, so a forged pointer reads the host's geometry and a
+    # wrong handle is never reported at all.
+    ("window-A5", "A", "ANativeWindow_getWidth stops checking the handle",
+     NDK_WINDOW,
+     """    // The handle is checked **before** the geometry, so a forged pointer is refused as a forged
+    // pointer whether or not the host has decided: the two failures have different fixes.
+    window_at(&ndk, c, window)?;""",
+     """    let _ = window;""",
+     ANDROID),
+
+    # Over-corrects: `_fromSurface` refuses when the geometry is undecided. It reads as more
+    # careful and is strictly worse -- it refuses a call that needs nothing this layer lacks, and
+    # moves the diagnosis away from the call that actually wanted the number.
+    ("window-B1", "B", "fromSurface refuses when the geometry is undecided",
+     NDK_WINDOW,
+     """    let mut state = ndk.state.lock();
+    let thread = Ndk::thread_index(&mut state);
+    let existing =""",
+     """    decided(&ndk, c)?;
+    let mut state = ndk.state.lock();
+    let thread = Ndk::thread_index(&mut state);
+    let existing =""",
+     ANDROID),
+
+    # Over-corrects: the window ceiling refuses instead of answering null, inventing a failure
+    # mode §8 row 17's caller has no arm for. A device that cannot produce a window answers null.
+    ("window-B2", "B", "the window ceiling refuses instead of answering null",
+     NDK_WINDOW,
+     """        drop(state);
+        // **Null, not a refusal.** A device that cannot produce a window answers null here and
+        // §8 row 17's caller branches on it; a cap this layer chose is not a reason to invent a
+        // failure mode the caller has no arm for.
+        c.ret().u64(0);
+        return Ok(());""",
+     """        drop(state);
+        return Err(refuse(c, format!("this instance already holds {} ANativeWindows", super::MAX_NATIVE_WINDOWS)));""",
+     ANDROID),
+
+    # Over-corrects: each `_fromSurface` hands out a FRESH window rather than a second reference.
+    # It reads as the more careful, less-sharing choice, and it makes §8 row 17's "release any old
+    # window" destroy an object another holder still has.
+    ("window-B3", "B", "fromSurface hands out a fresh window instead of a second reference",
+     NDK_WINDOW,
+     """    let existing =
+        state.windows.iter().find(|(_, live)| live.from_surface == surface).map(|(at, _)| at);""",
+     """    let existing: Option<GuestAddr> = None;""",
+     ANDROID),
+
+    # ---- Review finding M1: admit the guest buffer BEFORE the descriptor is touched. ----------
+    #
+    # What these rows defend is an ORDER, not a check. The unfixed code validated per chunk, which
+    # also never wrote out of bounds -- it just reported the failure as a SHORT COUNT, and a short
+    # read is how a drained pipe and an ended file announce themselves. So every detector below
+    # asserts on the DESCRIPTOR, not on guest memory: guest memory looks identical either way.
+
+    ("order-A1", "A", "read/pread consume from the descriptor before the destination is admitted",
+     ADAPTER_FILES,
+     """    let base = transfer_buffer(view, buffer, count, true, 1)?;""",
+     """    let base = guest_address(view, buffer)?;""",
+     ANDROID),
+
+    ("order-A2", "A", "write/__write_chk reach the descriptor before the source is admitted",
+     ADAPTER_FILES,
+     """    let base = transfer_buffer(view, buf, count, false, 1)?;""",
+     """    let base = guest_address(view, buf)?;""",
+     ANDROID),
+
+    # The believable wrong fix: only the first byte is admitted rather than the whole length. It
+    # looks like a validated transfer and catches a wholly unmapped buffer, which is the case a
+    # careless test would use -- and it misses every buffer that starts mapped and ends nowhere.
+    ("order-A3", "A", "only the first byte of the transfer buffer is admitted",
+     ADAPTER_FILES,
+     """    view.mem().checked_ptr(at, len, write, Blame::new(view.symbol(), view.address(), argument))?;""",
+     """    view.mem().checked_ptr(at, len.min(1), write, Blame::new(view.symbol(), view.address(), argument))?;""",
+     ANDROID),
+
+    # `readdir` advances the stream before admitting the slot. There is no `seekdir` here, so the
+    # entry it consumed and could not place is one the guest can never obtain again.
+    ("order-A4", "A", "readdir advances the stream before admitting its slot",
+     ADAPTER_FILES,
+     """        let slot = guest_address(&view, dirp)?;
+        view.mem().checked_ptr(
+            slot,
+            DIRENT_BYTES,
+            true,
+            Blame::new(view.symbol(), view.address(), 0),
+        )?;
+""",
+     """        let _ = guest_address(&view, dirp)?;
+""",
+     ANDROID),
+
+    # Over-corrects: validate unconditionally, so a legal `read(fd, NULL, 0)` refuses. C says a
+    # zero-length read does not even check the descriptor for readability.
+    ("order-B1", "B", "a zero-length read at a null pointer is refused",
+     ADAPTER_FILES,
+     """        if count == 0 {
+            // C: zero bytes, and the descriptor is not even checked for readability by POSIX.
+            // The seam is not called at all, so a zero-length read at a null pointer -- which is
+            // legal C -- does not fault.
+            return Ok(Settled::Done(0));
+        }
+""",
+     """""",
+     ANDROID),
+
+    # Over-corrects: a write's SOURCE is admitted as writable. Demanding more than the operation
+    # needs reads as stricter and refuses a guest writing out of its own `.rodata`, which is
+    # ordinary.
+    ("order-B2", "B", "a write's source buffer is admitted as writable",
+     ADAPTER_FILES,
+     """    let base = transfer_buffer(view, buf, count, false, 1)?;""",
+     """    let base = transfer_buffer(view, buf, count, true, 1)?;""",
+     ANDROID),
+
+    # ---- The reason a stream failure gives the guest (M6). -----------------------------------
+    #
+    # `ferror` and `clearerr` ARE imported by `libroblox.so` and neither is bound, so the error
+    # flag is write-only today: `errno` is the ENTIRE channel by which a guest learns *why* a
+    # stream operation failed. That is what makes a missing one a silent wrong answer rather than
+    # a missing convenience, and it is why these rows exist at all.
+    #
+    # Every "no errno" detector starts from a SENTINEL (`EDOM`, which nothing in this layer can
+    # produce) rather than from zero. Asserting against 0 would pass for a layer that CLEARED
+    # errno -- which POSIX forbids -- and would not see a stale value at all.
+
+    ("errno-A1", "A", "fputc reports EOF without the errno that explains it",
+     BIONIC_STDIO,
+     """            // The descriptor's number, unchanged: POSIX.1-2017 XSH `fputc`'s ERRORS list is
+            // `write()`'s, and only the layer that made the call can tell those apart. Dropping
+            // this line is the defect this module's `errno` rule exists to close -- the guest
+            // would still see `EOF`, and would read the reason for some earlier call.
+            stream.error = true;
+            ctx.set_errno(errno);
+            EOF""",
+     """            stream.error = true;
+            EOF""",
+     BIONIC),
+
+    ("errno-A2", "A", "fputs and fwrite report a short count without the errno that explains it",
+     BIONIC_STDIO,
+     """                // The descriptor's number, unchanged: POSIX.1-2017 XSH `fputc` -- which is
+                // `fputs`'s and `fwrite`'s ERRORS list by reference -- is `write()`'s, and only
+                // the layer that made the call can tell `ENOSPC` from `EPIPE` from `EBADF`.
+                stream.error = true;
+                ctx.set_errno(errno);""",
+     """                stream.error = true;""",
+     BIONIC),
+
+    ("errno-A3", "A", "fread reports a short count without the errno that explains it",
+     BIONIC_STDIO,
+     """                // The descriptor's number, unchanged: POSIX.1-2017 XSH `fread`'s ERRORS list is
+                // `fgetc`'s, which is `read()`'s. Without this the guest gets the same short
+                // count as an ordinary end of file, `feof` answers false, and `errno` explains
+                // some earlier call.
+                stream.error = true;
+                ctx.set_errno(errno);""",
+     """                stream.error = true;""",
+     BIONIC),
+
+    # Over-corrects. A zero-byte write for a non-empty buffer cannot happen on a device --
+    # POSIX.1-2017 XSH `write()` transfers at least one byte or fails with errno set -- so there
+    # is no true number for it, and `ENOSPC` is the most believable wrong one: it sends a guest
+    # off deleting files to make room that was never the problem.
+    ("errno-B1", "B", "a zero-byte write is given an invented ENOSPC",
+     BIONIC_STDIO,
+     """                stream.error = true;
+                break;
+            }
+            Ok(took) => done += took as u64,""",
+     """                stream.error = true;
+                ctx.set_errno(consts::ENOSPC);
+                break;
+            }
+            Ok(took) => done += took as u64,""",
+     BIONIC),
+
+    # The same over-correction one site along, with the number D23's refusal 7 already declines to
+    # hand out.
+    ("errno-B2", "B", "fputc's zero-byte write is given an invented EIO",
+     BIONIC_STDIO,
+     """            stream.error = true;
+            EOF
+        }
+        Err(errno) => {""",
+     """            stream.error = true;
+            ctx.set_errno(consts::EIO);
+            EOF
+        }
+        Err(errno) => {""",
+     BIONIC),
+
+    # Over-corrects in the adapter: the contract guard fires on an ORDINARY SHORT WRITE, refusing
+    # a call that is doing exactly what `write()` is allowed to do. The guard is meant to catch
+    # only `taken == 0` for a non-empty buffer.
+    ("errno-B3", "B", "the adapter refuses an ordinary short write",
+     ADAPTER_STDIO,
+     """    if requested == 0 || taken > 0 {""",
+     """    if requested == 0 || taken >= requested {""",
+     ANDROID),
+
+    # Over-corrects: reaching the end of a file is reported as a failure. C17 7.21.8.1p3 makes a
+    # short count at the end of a file a return value rather than an error, and `feof` is what
+    # tells it from the error arm.
+    ("errno-B4", "B", "reaching the end of a file is reported as EIO",
+     BIONIC_STDIO,
+     """            // End of file: the flag, and **no `errno`**. C17 7.21.8.1p3 makes a short count at
+            // the end of a file a return value rather than a failure, and `feof` is what tells
+            // it from the error arm below. See the table on this function.
+            Ok(0) => {
+                stream.eof = true;""",
+     """            Ok(0) => {
+                ctx.set_errno(consts::EIO);
+                stream.eof = true;""",
+     BIONIC),
 ]
 
 
