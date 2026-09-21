@@ -379,7 +379,7 @@ pub fn fgets(
                     break;
                 }
                 if pending.len() == TRANSFER_CHUNK {
-                    written += flush_into_guest(ctx, s + written, &pending)?;
+                    written += flush_into_guest(ctx, offset_from(s, written)?, &pending)?;
                     pending.clear();
                 }
             }
@@ -401,7 +401,7 @@ pub fn fgets(
         }
     }
     if !pending.is_empty() {
-        written += flush_into_guest(ctx, s + written, &pending)?;
+        written += flush_into_guest(ctx, offset_from(s, written)?, &pending)?;
     }
     if written == 0 && stream.eof {
         // End of file with nothing read: NULL, and the buffer is left alone. Writing a NUL here
@@ -412,7 +412,7 @@ pub fn fgets(
         // would make every `while (fgets(...))` loop end by reporting a failure.
         return Ok(0);
     }
-    write_all(ctx, s + written, &[0u8])?;
+    write_all(ctx, offset_from(s, written)?, &[0u8])?;
     Ok(s)
 }
 
@@ -580,7 +580,7 @@ pub fn fread(
                 break;
             }
             Ok(got) => {
-                write_all(ctx, ptr + done, &buffer[..got])?;
+                write_all(ctx, offset_from(ptr, done)?, &buffer[..got])?;
                 done += got as u64;
             }
             Err(errno) => {
@@ -944,7 +944,7 @@ fn transfer_out(
     let mut buffer = vec![0u8; TRANSFER_CHUNK];
     while done < length {
         let want = ((length - done) as usize).min(TRANSFER_CHUNK);
-        read_all(ctx, ptr + done, &mut buffer[..want])?;
+        read_all(ctx, offset_from(ptr, done)?, &mut buffer[..want])?;
         match descriptors.write(stream.fd, &buffer[..want]) {
             Ok(0) => {
                 // A descriptor that accepts nothing is not making progress; looping would spin
@@ -974,6 +974,22 @@ fn transfer_out(
         }
     }
     Ok(done)
+}
+
+/// `base + offset`, as the memory fault an overflow is rather than the wrap a release build makes.
+///
+/// Every transfer in this module walks a guest-chosen pointer forward by a guest-chosen count, and
+/// `base + offset` on two `u64`s is **a panic in a debug build and a silent wrap in a release
+/// one** — `VERIFICATION.md` entry 3, which this project has already shipped once as
+/// `gmtime(i64::MIN)`. The wrap is the worse half: a pointer that lands back at a low address is
+/// caught by [`checked_range`](crate::memory::checked_range) only because a non-empty access at
+/// null is refused, and the fault it then reports names address zero rather than the pointer the
+/// guest actually passed.
+///
+/// Reported at `base`, because that is the argument the guest supplied and the number a refusal
+/// has to name; the sum does not exist.
+fn offset_from(base: u64, offset: u64) -> BionicResult<u64> {
+    base.checked_add(offset).ok_or(BionicError::Memory(crate::memory::Fault(base)))
 }
 
 /// Write a whole slice into guest memory, reporting a fault as one.
@@ -1371,5 +1387,48 @@ mod tests {
         let fds = Fds::new(b"short");
         let mut stream = Stream::new(3);
         assert_eq!(fread(&mut ctx, &fds, &mut stream, 0x1000, 1, 1 << 40).expect("fread"), 5);
+    }
+
+    /// **`base + offset` on two guest-chosen `u64`s is a fault, not a wrap and not a panic.**
+    ///
+    /// `VERIFICATION.md` entry 3: a release build wraps silently and a debug build panics, and a
+    /// panic reachable from guest input is what Global Constraint 11 calls Critical. This project
+    /// has shipped that exact shape once already (`gmtime(i64::MIN)`).
+    ///
+    /// The input is a mapping whose **last byte is at `u64::MAX`**, which is a representable
+    /// guest address and which `checked_range` is written to accept. One chunk then fills it
+    /// exactly and the next step off its end has nowhere to land.
+    ///
+    /// **The assertion is on the faulting address, and that is the whole point.** Unfixed, a
+    /// release build wraps to zero and `checked_range` refuses a non-empty access at null — so
+    /// the call still fails, and it fails naming address `0`, a pointer the guest never passed.
+    /// A test that only checked `is_err()` would pass against the defect.
+    #[test]
+    fn a_transfer_that_would_walk_past_the_end_of_the_address_space_faults_where_it_started() {
+        const TOP: u64 = u64::MAX - (TRANSFER_CHUNK as u64 - 1);
+
+        // `fread`: the first chunk fills the mapping to its last byte, and the second has no
+        // address at all.
+        let mut ctx = Ctx::new();
+        ctx.mem.map(TOP, &[0u8; TRANSFER_CHUNK]);
+        let fds = Fds::new(&vec![b'x'; TRANSFER_CHUNK + 1]);
+        let mut stream = Stream::new(3);
+        assert_eq!(
+            fread(&mut ctx, &fds, &mut stream, TOP, 1, TRANSFER_CHUNK as u64 + 1),
+            Err(BionicError::Memory(Fault(TOP))),
+            "the fault names the pointer the guest passed, not the address a wrap produced"
+        );
+
+        // `fgets`, which walks the same way with `s + written`: one full chunk is flushed into
+        // the mapping, and the tail of the line has nowhere to go.
+        let mut ctx = Ctx::new();
+        ctx.mem.map(TOP, &[0u8; TRANSFER_CHUNK]);
+        let fds = Fds::new(&vec![b'x'; 5000]);
+        let mut stream = Stream::new(3);
+        assert_eq!(
+            fgets(&mut ctx, &fds, &mut stream, TOP, 5000),
+            Err(BionicError::Memory(Fault(TOP))),
+            "`s + written` is the same arithmetic on the same two guest-chosen numbers"
+        );
     }
 }
