@@ -4530,6 +4530,249 @@ directory", ADAPTER_FILES,
                     };
                     entry.fds.retain(|held| held.fd != fd);""",
      ANDROID),
+
+    # ---- W1: `__android_log_print` truncates where a device truncates (M6). ------------------
+    #
+    # Real liblog does not cap a formatted message after the fact -- it formats into a 1024-byte
+    # stack buffer in the first place, and `vsnprintf` truncates rather than failing. This layer
+    # refused instead, aborting the whole guest run for a log line: the exact outcome
+    # `logging.rs`'s own module header says the module exists to prevent.
+    #
+    # The trap these rows exist for is `trunc-B1`. A wide field is not a long field that gets
+    # shortened -- it is a field with PADDING ON ONE SIDE, and which side decides the bytes.
+    # `%70000d` of 42 on a device yields 1023 spaces AND NO DIGITS AT ALL. Clamping the width to
+    # the budget yields 1021 spaces then `42`: right length, right characters, wrong order, and a
+    # tail no device has. It is byte-identical for the left-justified and zero-padded modes, so
+    # it would have looked correct in two tests of three. Only an assertion on the bytes sees it.
+
+    # the padding fill ignores the budget, so a guest-chosen width is a guest-chosen allocation
+    # again Detector:
+    # `a_wide_right_justified_field_is_cut_to_its_padding_and_never_to_its_number`.
+    ("trunc-A2", "A", "the padding fill ignores the budget, so a guest-chosen width is a guest-chosen allocation again",
+     BIONIC_PRINTF,
+     """        let take = self.room().min(n);""",
+     """        let take = n;""",
+     BIONIC),
+
+    # the text sink ignores the budget, so literals and bodies run past the buffer Detector:
+    # `a_long_literal_run_truncates_under_a_budget`.
+    ("trunc-A3", "A", "the text sink ignores the budget, so literals and bodies run past the buffer",
+     BIONIC_PRINTF,
+     """        let room = self.room();""",
+     """        let room = usize::MAX;""",
+     BIONIC),
+
+    # the characters the budget dropped are not counted, so a cut line reports as whole Detector:
+    # `a_wide_right_justified_field_is_cut_to_its_padding_and_never_to_its_number`.
+    ("trunc-A4", "A", "the characters the budget dropped are not counted, so a cut line reports as whole",
+     BIONIC_PRINTF,
+     """        self.full = self.full.saturating_add(n);""",
+     """        self.full = self.full.saturating_add(take);""",
+     BIONIC),
+
+    # the %s precision goes back to a byte slice: wrong unit, and a panic on a boundary a guest
+    # picks Detector: `a_string_precision_counts_guest_bytes_and_cannot_split_a_character`.
+    ("trunc-A5", "A", "the %s precision goes back to a byte slice: wrong unit, and a panic on a boundary a guest picks",
+     BIONIC_PRINTF,
+     """    match s.char_indices().nth(p) {
+        Some((at, _)) => &s[..at],
+        None => s,
+    }""",
+     """    &s[..p.min(s.len())]""",
+     BIONIC),
+
+    # the record discards the formatter's count, so a budget-cut line reads as complete Detector:
+    # `a_message_the_formatter_cut_is_still_reported_as_truncated`.
+    ("trunc-A6", "A", "the record discards the formatter's count, so a budget-cut line reads as complete",
+     ADAPTER_LOGGING,
+     """        record.truncated =
+            Some(Truncation { tag_bytes: tag.len(), message_bytes: full_message_bytes });""",
+     """        let _ = full_message_bytes;""",
+     ANDROID_LIB),
+
+    # the width is clamped to the budget, so a wide right-justified field ends with its number
+    # where a device has only padding Detector:
+    # `a_wide_right_justified_field_is_cut_to_its_padding_and_never_to_its_number`.
+    ("trunc-B1", "B", "the width is clamped to the budget, so a wide right-justified field ends with its number where a device has only padding",
+     BIONIC_PRINTF,
+     """    let pad = width.unwrap_or(0).saturating_sub(body.len());""",
+     """    let pad = width.unwrap_or(0).min(bound.budget).saturating_sub(body.len());""",
+     BIONIC),
+
+    # the unbounded entry point takes the total cap as a budget, so snprintf truncates where its
+    # return value must be the full length Detector:
+    # `a_repeated_wide_field_is_stopped_by_the_total_cap`.
+    ("trunc-B2", "B", "the unbounded entry point takes the total cap as a budget, so snprintf truncates where its return value must be the full length",
+     BIONIC_PRINTF,
+     """    format_bounded(fmt, args, out, usize::MAX)?;""",
+     """    format_bounded(fmt, args, out, MAX_OUTPUT)?;""",
+     BIONIC),
+
+    # the budget counts host bytes, so a message of guest bytes above 0x7F is cut at half what a
+    # device keeps Detector: `the_budget_counts_guest_bytes_and_not_host_string_bytes`.
+    ("trunc-B3", "B", "the budget counts host bytes, so a message of guest bytes above 0x7F is cut at half what a device keeps",
+     BIONIC_PRINTF,
+     """        let asked = text.chars().count();""",
+     """        let asked = text.len();""",
+     BIONIC),
+
+    # the wide-precision refusal widens to every conversion, so %.70000d refuses where a device
+    # truncates Detector:
+    # `the_floating_conversions_this_engine_cannot_place_still_refuse_under_a_budget`.
+    ("trunc-B4", "B", "the wide-precision refusal widens to every conversion, so %.70000d refuses where a device truncates",
+     BIONIC_PRINTF,
+     """        what == "precision" && matches!(conv, 'e' | 'E' | 'g' | 'G' | 'a' | 'A')""",
+     '        what == "precision"',
+     BIONIC),
+
+    # the refusal is dropped for the arm this engine cannot place, so %.70000e emits digits that
+    # are not vsnprintf's Detector:
+    # `the_floating_conversions_this_engine_cannot_place_still_refuse_under_a_budget`.
+    ("trunc-B5", "B", "the refusal is dropped for the arm this engine cannot place, so %.70000e emits digits that are not vsnprintf's",
+     BIONIC_PRINTF,
+     """        what == "precision" && matches!(conv, 'e' | 'E' | 'g' | 'G' | 'a' | 'A')""",
+     """        let _ = (what, conv);
+        false""",
+     BIONIC),
+
+    # the %f fill starts below the exact expansion, so a huge precision loses real digits to zeros
+    # Detector: `a_huge_f_precision_is_a_fill_and_the_bytes_are_the_whole_conversions`.
+    ("trunc-B6", "B", "the %f fill starts below the exact expansion, so a huge precision loses real digits to zeros",
+     BIONIC_PRINTF,
+     """pub const EXACT_FRACTION_DIGITS: usize = 1074;""",
+     """pub const EXACT_FRACTION_DIGITS: usize = 16;""",
+     BIONIC),
+
+    # the log budget is cut below liblog's own buffer, shortening lines a device carries whole
+    # Detector: `the_format_budget_is_liblogs_own_buffer`.
+    ("trunc-B7", "B", "the log budget is cut below liblog's own buffer, shortening lines a device carries whole",
+     ADAPTER_LOGGING,
+     """const FORMAT_BUDGET: usize = MAX_MESSAGE_BYTES;""",
+     """const FORMAT_BUDGET: usize = 64;""",
+     ANDROID_LIB),
+
+    # a record the formatter did not cut is reported as truncated Detector:
+    # `a_message_the_formatter_did_not_cut_carries_no_truncation`.
+    ("trunc-B8", "B", "a record the formatter did not cut is reported as truncated",
+     ADAPTER_LOGGING,
+     """    if full_message_bytes > message.len() {""",
+     """    if full_message_bytes >= message.len() {""",
+     ANDROID_LIB),
+
+    # ---- M1's shape in the FILE * layer (M6). --------------------------------------------------
+    #
+    # `ff6719e` closed the finding in `read`/`pread`/`write`/`__write_chk`; the SAME shape was
+    # still live one crate along, in `fread`, `fgets` and `fwrite`. `omni-bionic` cannot close it
+    # itself: D19 leaves its `GuestMemory` with `read` and `write` and nothing else, so it has no
+    # way to probe a mapping without writing to it, and a trait probe defaulted to `Ok(())` would
+    # be a plausible stub for every implementer. The admission therefore lives in the adapter,
+    # which has `checked_ptr` and a refusal channel -- the same placement, for the same two
+    # reasons, as `7bf21af`'s zero-byte-write contract.
+    #
+    # `fwrite` is the SOURCE side and is admitted READABLE, not writable: `order-B2` is the row
+    # that exists because demanding more than the operation needs refuses a guest writing out of
+    # its own `.rodata`. `sorder-A5` is the `size` versus `size - 1` edge, which is worth its own
+    # row because C writes at most `size - 1` bytes AND a terminator, so `size` is the admission.
+
+    ("sorder-A1", "A", "fread consumes from the descriptor before the destination is admitted",
+     ADAPTER_STDIO,
+     """        if let Some(total) = size.checked_mul(nmemb) {
+            admit_transfer(view, ptr, total, true, 0)?;
+        }
+        let produced = stdio::fread(view, descriptors, stream, ptr, size, nmemb);
+""",
+     """        let produced = stdio::fread(view, descriptors, stream, ptr, size, nmemb);
+""",
+     ANDROID),
+
+    ("sorder-A2", "A", "fgets consumes from the descriptor before the destination is admitted",
+     ADAPTER_STDIO,
+     """        if size > 0 {
+            // `size <= 0` is the case C17 7.21.7.2 does not define, and `omni_bionic::stdio`
+            // answers it by reading nothing, writing nothing and setting no `errno`. There is no
+            // transfer to admit, so admitting one would refuse a call that touches neither the
+            // buffer nor the descriptor.
+            admit_transfer(view, s, size as u64, true, 0)?;
+        }
+        let produced = stdio::fgets(view, descriptors, stream, s, size);
+""",
+     """        let produced = stdio::fgets(view, descriptors, stream, s, size);
+""",
+     ANDROID),
+
+    ("sorder-A3", "A", "fwrite reaches the descriptor before the source is admitted",
+     ADAPTER_STDIO,
+     """        if let Some(total) = size.checked_mul(nmemb) {
+            // As `fread`: an unrepresentable product is `EINVAL` from the layer below, not a
+            // refusal about a pointer that was never the problem.
+            admit_transfer(view, ptr, total, false, 0)?;
+        }
+        let produced = stdio::fwrite(view, descriptors, stream, ptr, size, nmemb);
+""",
+     """        let produced = stdio::fwrite(view, descriptors, stream, ptr, size, nmemb);
+""",
+     ANDROID),
+
+    ("sorder-A4", "A", "only the first byte of a stream transfer buffer is admitted",
+     ADAPTER_STDIO,
+     """    view.mem().checked_ptr(at, len, write, Blame::new(view.symbol(), view.address(), argument))?;""",
+     """    view.mem().checked_ptr(at, len.min(1), write, Blame::new(view.symbol(), view.address(), argument))?;""",
+     ANDROID),
+
+    ("sorder-A5", "A", "fgets admits size - 1, leaving the terminator's own byte unchecked",
+     ADAPTER_STDIO,
+     """            admit_transfer(view, s, size as u64, true, 0)?;""",
+     """            admit_transfer(view, s, size as u64 - 1, true, 0)?;""",
+     ANDROID),
+
+    ("sorder-A6", "A", "the transfer loops walk the guest pointer with a wrapping add again",
+     BIONIC_STDIO,
+     """fn offset_from(base: u64, offset: u64) -> BionicResult<u64> {
+    base.checked_add(offset).ok_or(BionicError::Memory(crate::memory::Fault(base)))
+}""",
+     """fn offset_from(base: u64, offset: u64) -> BionicResult<u64> {
+    Ok(base.wrapping_add(offset))
+}""",
+     BIONIC),
+
+    ("sorder-B1", "B", "a zero-length stream transfer is refused",
+     ADAPTER_STDIO,
+     """    if length == 0 {
+        return Ok(());
+    }
+""",
+     """""",
+     ANDROID),
+
+    ("sorder-B2", "B", "an fwrite's source buffer is admitted as writable",
+     ADAPTER_STDIO,
+     """            admit_transfer(view, ptr, total, false, 0)?;""",
+     """            admit_transfer(view, ptr, total, true, 0)?;""",
+     ANDROID),
+
+    ("sorder-B3", "B", "an unrepresentable size * nmemb is refused instead of answered with EINVAL",
+     ADAPTER_STDIO,
+     """        if let Some(total) = size.checked_mul(nmemb) {
+            admit_transfer(view, ptr, total, true, 0)?;
+        }
+""",
+     """        admit_transfer(view, ptr, size.saturating_mul(nmemb), true, 0)?;
+""",
+     ANDROID),
+
+    ("sorder-B4", "B", "fgets admits a buffer for a size C leaves undefined, so a legal no-op refuses",
+     ADAPTER_STDIO,
+     """        if size > 0 {
+            // `size <= 0` is the case C17 7.21.7.2 does not define, and `omni_bionic::stdio`
+            // answers it by reading nothing, writing nothing and setting no `errno`. There is no
+            // transfer to admit, so admitting one would refuse a call that touches neither the
+            // buffer nor the descriptor.
+            admit_transfer(view, s, size as u64, true, 0)?;
+        }
+""",
+     """        admit_transfer(view, s, size as u64, true, 0)?;
+""",
+     ANDROID),
 ]
 
 
