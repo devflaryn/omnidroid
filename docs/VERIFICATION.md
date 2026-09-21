@@ -271,6 +271,24 @@ may call before returning the 0 that asks for its own registration to be removed
    the source directories before doing anything else.**
 4. **Let a killed harness run exit rather than killing it again.** Its restore is a `finally`; a
    killed interpreter skips it and leaves a mutation live.
+
+   **And confirm what actually died.** A background *shell* was reaped here for system memory
+   pressure, and the harness it had launched **kept running as an orphaned child**. The tree was
+   checked immediately, came back clean, and that was believed. It was clean because the run was
+   *between rows* -- minutes later a probe found `jmid-B1` live in `jni/classes.rs`, and minutes
+   after that the tree was clean again because the run had finished normally and restored.
+
+   > One clean `git status` after a kill is not evidence the harness is gone; it is a sample of a
+   > tree that goes clean and dirty every few seconds by design. Confirm the **process** is gone,
+   > or wait for its log to print its own final tally, before believing either the tree or the
+   > results.
+
+   The second half of that hour was worse and was avoidable: believing the run was dead, cargo was
+   run and a file mutated **while it was still going** -- rule 3 again, from the other side, hours
+   after rule 3 was amended for the same mistake. Both runs then compiled the same crate from
+   different source states behind one cargo lock. Nothing was lost, and the results of the
+   overlapping prefix are worth exactly as much as that: they have to be run again on a tree
+   nobody else is in.
 5. **Edit `tools/mutate.py` by inserting before the list terminator, never by slicing it.** Slicing
    truncated the file once. Check your ids are free before adding — ones that look free have not been.
 6. **A figure enters `DECISIONS.md` only after someone other than its author reproduces it.** That
