@@ -3836,6 +3836,102 @@ directory", ADAPTER_FILES,
     # count**: the number of parked threads is right, every total is right, and the object named
     # is the wrong one -- which is this project's first verification lesson, applied to its own
     # newest instrument.
+    # ============================================ M5: the Win32 device set, measured rather than listed
+    #
+    # Review finding M6 said `WINDOWS_DEVICES` omitted `COM0`/`LPT0` and the superscript forms.
+    # **Half of that was wrong**, and the measurement is what settled it: `COM0` and `LPT0` are
+    # ordinary files on this build (`RtlIsDosDeviceName_U` answers zero for both, and
+    # `CreateFileW("COM0")` created a file the directory listing then showed), while `CONIN$`,
+    # `CONOUT$` and the six U+00B9/B2/B3 forms are real devices and really were missing. So there
+    # is an A row for each half that was missing and a **B row for believing the finding as
+    # filed** -- adding `COM0`/`LPT0` is the over-correction, and it now fails.
+
+    # The console buffers, which the list did not have. `CONIN$` and `CONOUT$` are openable by
+    # name and are how a guest reaches the console rather than a file under the root.
+    ("confine-A1", "A", "the console-buffer device names are dropped from the list",
+     PLAT_FS_PATH,
+     """    // The console buffers, openable by name — the first half of M6.
+    "CONIN$", "CONOUT$",""",
+     """    // The console buffers, openable by name — the first half of M6.""",
+     PLATFORM),
+
+    # The six superscript forms. MEASURED: only U+00B9/B2/B3 match, out of twenty-six digit
+    # look-alikes tried -- so this is a three-member special case rather than a "Unicode digit"
+    # rule, and a list that drops them lets the superscript spellings through as ordinary names.
+    ("confine-A2", "A", "the superscript COM/LPT device forms are dropped from the list",
+     PLAT_FS_PATH,
+     r"""    "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
+];""",
+     """];""",
+     PLATFORM),
+
+    # The extension no longer stripped, so `NUL.txt` reaches the host. MEASURED as *not* a device
+    # on this build -- and refused anyway, because the confinement property must not depend on a
+    # Windows build number and an over-refusal cannot create an escape.
+    ("confine-A3", "A", "a device name with an extension is no longer recognised",
+     PLAT_FS_PATH,
+     """    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');""",
+     """    let stem = name;""",
+     PLATFORM),
+
+    # The trailing space no longer trimmed, so `NUL .txt` passes. One strip away from a device.
+    ("confine-A4", "A", "a device name with a trailing space is no longer recognised",
+     PLAT_FS_PATH,
+     """    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');""",
+     """    let stem = name.split('.').next().unwrap_or(name);""",
+     PLATFORM),
+
+    # **Believing review finding M6 as it was filed.** It asked for `COM0`/`LPT0`; both measured
+    # as ordinary files. Adding them costs a guest two filenames it is entitled to, which is the
+    # over-refusal direction -- safe for confinement and wrong as a statement about the host.
+    ("confine-B1", "B", "COM0 and LPT0 are refused, which the measurement says are files",
+     PLAT_FS_PATH,
+     """const WINDOWS_DEVICES: [&str; 30] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL",""",
+     """const WINDOWS_DEVICES: [&str; 32] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL", "COM0", "LPT0",""",
+     PLATFORM),
+
+    # Generalising the three superscripts into an "any digit look-alike" rule, by adding the
+    # fullwidth form. MEASURED not to be a device; twenty-six were tried and only three matched.
+    ("confine-B2", "B", "the superscript special case is generalised to another digit look-alike",
+     PLAT_FS_PATH,
+     """const WINDOWS_DEVICES: [&str; 30] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL",""",
+     r"""const WINDOWS_DEVICES: [&str; 31] = [
+    // The four classic character devices.
+    "CON", "PRN", "AUX", "NUL", "COM\u{ff11}",""",
+     PLATFORM),
+
+    # `cpu_count` back to substituting a believable `1`, which is review finding M7's own shape:
+    # the pattern `random_bytes` forbids eleven lines below it in the same file.
+    ("confine-A5", "A", "cpu_count substitutes a believable 1 instead of reporting failure",
+     PLAT_PROCESS_MOD,
+     """    std::thread::available_parallelism().map_err(|error| ProcessError::Indeterminate {
+        operation: "cpu_count",
+        detail: error.to_string(),
+    })""",
+     """    Ok(std::num::NonZeroUsize::new(1).expect("one is not zero"))""",
+     PLATFORM),
+
+    # And the over-correction in the other direction: a fabricated `Unsupported` for a primitive
+    # that is one portable `std` call on all five targets, which `lib.rs` forbids by name.
+    ("confine-B3", "B", "cpu_count claims to be unsupported where std answers on every target",
+     PLAT_PROCESS_MOD,
+     """    std::thread::available_parallelism().map_err(|error| ProcessError::Indeterminate {
+        operation: "cpu_count",
+        detail: error.to_string(),
+    })""",
+     """    Err(ProcessError::Unsupported {
+        operation: "cpu_count",
+        intended: "sysconf(_SC_NPROCESSORS_ONLN)",
+        platform: "this target",
+    })""",
+     PLATFORM),
+
     ("park-A2", "A", "the park witness names the mutex as the condition variable",
      ADAPTER_HANDLERS,
      """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex);""",
