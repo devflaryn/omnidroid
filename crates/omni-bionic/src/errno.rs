@@ -71,6 +71,9 @@ pub mod consts {
     pub const ELOOP: i32 = 40;
     /// Value too large for the defined data type.
     pub const EOVERFLOW: i32 = 75;
+    /// Address family not supported by protocol: `inet_ntop` given an `af` that is neither
+    /// `AF_INET` nor `AF_INET6`.
+    pub const EAFNOSUPPORT: i32 = 97;
     /// Operation not supported (Linux: 95 on most architectures; arm64 uses the
     /// asm-generic numbering where ENOTSUP == EOPNOTSUPP == 95).
     pub const ENOTSUP: i32 = 95;
@@ -135,6 +138,7 @@ mod tests {
         assert_eq!(ELOOP, 40);
         assert_eq!(EOVERFLOW, 75, "the file-io group's own, added in phase 3b");
         assert_eq!(ENOTSUP, 95, "ENOTSUP == EOPNOTSUPP == 95 in the asm-generic numbering");
+        assert_eq!(EAFNOSUPPORT, 97, "the network group's own, added in phase 3d");
         assert_eq!(ETIMEDOUT, 110, "the LINUX value; Windows' ERROR_SEM_TIMEOUT is 121");
         assert_eq!(EOWNERDEAD, 130);
         assert_eq!(ENOTRECOVERABLE, 131);
@@ -149,8 +153,8 @@ mod tests {
         let all = [
             EPERM, ENOENT, ESRCH, EINTR, EIO, EBADF, EAGAIN, ENOMEM, EACCES, EBUSY, EEXIST, ENOTDIR,
             EISDIR, EMFILE, EFBIG, ENOSPC, ESPIPE, EROFS, EINVAL, EDOM, ERANGE, EDEADLK,
-            ENAMETOOLONG, ENOSYS, ENOTEMPTY, ELOOP, EOVERFLOW, ENOTSUP, ETIMEDOUT, EOWNERDEAD,
-            ENOTRECOVERABLE,
+            ENAMETOOLONG, ENOSYS, ENOTEMPTY, ELOOP, EOVERFLOW, ENOTSUP, EAFNOSUPPORT, ETIMEDOUT,
+            EOWNERDEAD, ENOTRECOVERABLE,
         ];
         let mut sorted = all.to_vec();
         sorted.sort_unstable();

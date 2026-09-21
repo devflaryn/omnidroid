@@ -48,6 +48,13 @@
 //! implement any of them, and a stub that pretended to would be exactly the "plausible stub" the
 //! design rules above forbid.
 //!
+//! **Amendment, M3 task 3 phase 3d/3e.** Two more symbols moved in for the same reason
+//! `sigfillset` did — they are pure computation over guest memory with no state behind them:
+//! [`net::inet_ntop`], which is address *formatting* and contains no network at all, and
+//! [`net::gai_strerror_message`], which is a constant table. The other six network symbols of the
+//! reachable 188 need a host socket, a descriptor table or a resolver, and the adapter answers or
+//! refuses each by name.
+//!
 //! **Amendment, M3 task 3 phase 3c.** The adapter now implements those eight, over a CPU backend
 //! the embedding supplies; `pthread_sigmask` is still excluded here and is **refused** there,
 //! for the same reason. One signal symbol did move in: [`signal::fillset`], which is
@@ -77,6 +84,7 @@ pub mod metadata;
 pub mod mock;
 pub mod mock_threads;
 pub mod mutex;
+pub mod net;
 pub mod numerics;
 pub mod once;
 pub mod shared_mem;
