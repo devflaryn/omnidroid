@@ -616,7 +616,15 @@ already appeared in this project's own documents, every one added by summarising
 - Roblox shape: 2.27% indirect, **4.30 instructions per basic block**, **128 exclusive-monitor sites
   against 53 LSE** (29.3% of atomic RMW). All static mixes, used as proxies.
 - Texture formats: **neither ETC2 nor ASTC** on the dev GPU; BC1/BC3/BC7 yes. Runtime transcoding is
-  mandatory from M6.
+  mandatory from M6 — and **the format it must handle is ETC1, not ETC2 and not ASTC**. Measured
+  before the decoder was written (`tools/texture_census.py --check`, D27,
+  `docs/research/texture-formats.md`): **38** compressed containers in the APK, every one
+  `GL_ETC1_RGB8_OES`; **813,802** 4x4 blocks walked and **zero** in any ETC2-only mode; **zero**
+  bytes of ASTC, ETC2, EAC, PVRTC or KTX2 anywhere; everything else block-compressed is
+  DXT1/DXT3/DXT5 or `R8_UNORM`, which the host samples natively. The engine negotiates streamed
+  assets in `dxt`/`etc`/`etc2`/`uncompressed` and `"astc"` does not occur in `libroblox.so` at all.
+  `crates/omni-texture` decodes ETC1 to RGBA8 at **39.0 ns/block** — the whole baked set in a
+  **median 31.72 ms** (n=11 runs, release, single-threaded), producing 52,079,224 B.
 
 ## Corrected or withdrawn — do not resurrect
 
@@ -640,6 +648,8 @@ Each of these was recorded, then disproved by someone other than its author. Sev
 | The plan's table: `omni-platform` must grow "**Sockets and polling** — socket, poll/select, getaddrinfo" | It did not have to. `poll` and `select` need **no OS call at all**: the descriptor space they observe is closed — the only bound symbols producing a descriptor are `open`, `__open_2` and `opendir`, and `socket` and `eventfd` refuse — so every descriptor is a regular file, a directory or a standard stream, and POSIX fixes the answer for all of them. **Third phase running whose five-target prediction over-estimated the OS surface** (D25) |
 | HANDOFF: "`std::net` will answer yes for rather less of `socket`/`poll`/`select` than `std::fs` did" | The question did not arise: there is no `std::net` in any of it. The *third* answer to D23's test — not "one `std` call" and not "a backend", but **no OS call** (D25) |
 | `Ipv6Addr`'s `Display` formats an address the way bionic's `inet_ntop` does | It does **not**, and a differential run of 200,000 addresses found the one class where it differs: Rust deliberately stopped printing the deprecated IPv4-compatible form in dotted notation, so it writes `::77:0` where BIND — which bionic ships essentially unchanged — writes `::0.119.0.0`. 43 disagreements in 200,000, all one class. The algorithm is written out and the differential test is committed with that class asserted from the other side (D25) |
+| The APK's compressed textures are the 26 `.ktx` files | **38.** The twelve `.tex` files are KTX1 containers too — they are the skybox — so an extension-driven census misses every skybox face. `apk-analysis.md` §8.2's file-type table is not wrong; scoping a decoder from it would be. The census classifies by leading bytes now (D27) |
+| The APK's ETC payload decodes to 52,083,328 B of RGBA8 | **52,079,224 B.** The first figure counts whole *blocks*; the 2x2 and 1x1 mip level of each of the 38 textures still occupies a full 4x4 block, so 27 padded texels x 38 files = 1,026 = 4,104 bytes. Found by the Rust sweep disagreeing with the Python census, which is the only reason two implementations exist (D27) |
 | Leaving `__gcov_dump`/`__gcov_flush` `Unbound` is the right answer for a weak import | **Neither `Unbound` nor bound is right: they must resolve to nothing.** The guest tests each GOT slot for null before calling, and the call a stub would have answered is followed four bytes later by `BL abort`. VERIFIED by decoding the one site that references them (D25) |
 | The plan's table: `omni-platform` must grow "**Threads** — spawn, join, detach, attributes, scheduling" | It did not have to. Phase 3c is `std::thread`, an `omni-mem` mapping for the stack and an `omni-cpu` context — **no new platform primitive**, and therefore no `unsupported` arm to write (D24). Second phase running whose five-target prediction over-estimated the OS surface |
 | HANDOFF: phase **3c** is sockets and polling, **3d** is thread lifecycle | The plan's own phase-3 table has `3c` as threads + signals and `3d` as network, and the table is what was followed. Corrected here rather than quietly, because a reader with the old numbering will otherwise think a phase was skipped |

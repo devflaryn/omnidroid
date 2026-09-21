@@ -3332,3 +3332,126 @@ rather than collapsing the last two.
 zeroes; a later phase that needs a different capability advertised is making a new decision, not
 extending this one.
 
+
+---
+
+## D27 — Texture transcoding is ETC1 only, decoded to RGBA8, in a crate that cannot reach the OS
+
+M6 groundwork, built ahead of the renderer because it is the one piece of M6 that is pure
+computation: no guest, no boundary, no JNI, no OS. Full census and method in
+`docs/research/texture-formats.md`; the tool is `tools/texture_census.py --check`.
+
+### The census came first, and it changed the scope
+
+HANDOFF records the constraint: the host GPU samples **neither ETC2 nor ASTC**, BC1/BC3/BC7 yes
+(`graphics-spike.md` §3). It does **not** say which of those two families the APK actually uses, and
+"ETC2 or ASTC" is eleven GL formats and twenty-eight respectively. Measuring first turned weeks of
+speculative work into one format.
+
+| | |
+|---|---|
+| Compressed mobile-format containers in the APK | **38**, every one `GL_ETC1_RGB8_OES` (`0x8D64`) |
+| ASTC / ETC2 / EAC / PVRTC / KTX2 bytes anywhere in the APK | **0** |
+| 4×4 ETC blocks walked | **813,802** |
+| of those, in ETC2's T, H or planar modes | **0** |
+| Everything else block-compressed | DXT1/DXT3/DXT5 and `DXGI_FORMAT_R8_UNORM` — natively sampled |
+| The engine's streamed-asset compression vocabulary | `dxt`, `etc`, `etc2`, `uncompressed`. `"astc"` does not occur in `libroblox.so` at all |
+
+**Two things in that table are load-bearing and neither was obvious.**
+
+First, the blocks were walked rather than trusted. `GL_ETC1_RGB8_OES` and
+`GL_COMPRESSED_RGB8_ETC2` share a container and a bit layout and differ only in what an
+out-of-range base-plus-delta *means* — ETC1 forbids it, ETC2 reuses it as T, H and planar mode. A
+header saying ETC1 does not prove the payload is; 813,802 blocks with none of the escapes does.
+
+Second, the census classifies by leading bytes, never by extension. `apk-analysis.md` §8.2's
+file-type table lists `.ktx` 26 and `.tex` 12 as separate rows, and the twelve `.tex` files **are
+KTX1 files** — they are the skybox. Scoping from the extension gives 26 ETC textures and no skybox.
+
+### Decision 1 — implement ETC1 and refuse the rest by name
+
+`GL_ETC1_RGB8_OES` → RGBA8 is implemented. Every ETC2, EAC, ASTC and S3TC enum is refused with its
+**specification name** in the message, and a block that escapes into one of ETC2's three modes
+fails naming the mode and the block index. Nothing approximates: there is no "unknown mode, use the
+average colour" arm, because "close enough" colour is the believable wrong answer this project
+refuses everywhere else.
+
+**Why the streamed half does not force ETC2.** Omnidroid answers the capability queries the engine
+asks, because it *is* the GLES/Vulkan surface. Advertise DXT — which the host genuinely has — and
+decline ETC2 and ASTC, and the engine asks the CDN for `dxt`. The APK's 38 baked files are fixed
+whatever we advertise, which is exactly why ETC1 is mandatory and ETC2 is not. That half is
+INFERENCE from strings and is not verified until M6 runs; the vocabulary itself is VERIFIED.
+
+### Decision 2 — decode to RGBA8, do not re-encode to BC1, and the reason is testability
+
+ETC1 and BC1 are both 4×4 blocks in 8 bytes, so a transcode would hold the 6:1 compression, and the
+difference is real: 6,510,416 B of ETC payload against **52,079,224 B** as RGBA8.
+
+It is still the wrong thing to build first. ETC1 → RGBA8 is **exact** — the specification defines an
+integer result for every input, so a known-answer test derived from the specification either passes
+or finds a bug. ETC1 → BC1 is an **encode**: two ETC sub-blocks with independent luminance
+modulation have to be refitted onto BC1's single endpoint pair, no output is uniquely correct, and
+the only available oracle is somebody else's encoder. **This project has already paid for exactly
+that**: `Ipv6Addr::Display` was used as the oracle for bionic's `inet_ntop` and disagreed on 43 of
+200,000 addresses (D25). A re-encoder, if VRAM ever forces one, is a second stage behind this API,
+verified against it, with its quality loss measured rather than assumed.
+
+### Decision 3 — its own crate, for D19's reason, decided rather than inherited
+
+`omni-texture` is a separate crate with **zero dependencies** and `#![no_std]`, and it allocates
+nothing — `decode` writes into a caller-supplied buffer. `cargo tree -p omni-texture -e normal` is
+one line. `omni-gfx` re-exports it and is the only edge.
+
+D19 kept `omni-bionic` separate because zero dependencies make "no OS access" checkable by
+`cargo tree` rather than by review. The same argument applies here and is stronger: `omni-gfx` will
+transitively link Vulkan and the windowing system, so folding the transcoder in would downgrade the
+guarantee from *impossible* to *against the rules*. `#![no_std]` goes one step past D19's — zero
+dependencies means it cannot reach an OS primitive through a crate; `no_std` means it cannot name
+one.
+
+**Five targets.** No `cfg(target_os)`, no OS crate, nothing target-specific: integer arithmetic over
+a slice. Per D22's distinction that makes it genuinely correct on all five targets in the same sense
+`std`'s arithmetic is, and a fabricated `unsupported` arm would be a false claim in the other
+direction. What stays unclaimed is what has been **run**: Windows x86-64 only.
+
+### Evidence
+
+29 tests and a doctest, all passing; 20 mutation rows, **20/20 caught**, 15 direction A and 5
+direction B. Every expected value is derived from the specification —
+`OES_compressed_ETC1_RGB8_texture` and OpenGL ES 3.2 §8.7.3, tables 8.15 and 8.16 — and **no second
+decoder was consulted as an oracle**. Single-bit vectors pin the column-first pixel numbering and
+the two index bit planes separately, which is the transposition bug that decodes silently wrong. Two
+real APK blocks are hand-decoded and committed as bytes, so they assert on a clone with no APK in
+it. The APK sweep decodes all 38 textures and every mip level and cross-checks the Python census
+from a second implementation — which is how the RGBA8 figure got corrected (see below).
+
+Hostile input: truncation at every length, an undersized destination at every length, zero and
+overflowing extents, non-multiple-of-four extents, and all 2^24 base-colour triples in both modes
+against an independently written escape predicate. Nothing panics.
+
+**MEASURED cost**, whole baked set (38 textures, 361 mip levels, 813,802 blocks), release, n = 11
+runs: median **31.72 ms**, min 31.30, max 32.11 — **39.0 ns/block**, 1,642 MB/s of output,
+single-threaded, one core, no SIMD.
+
+**A figure corrected during this work.** The census first reported the decoded size as
+52,083,328 B, which is `813,802 blocks × 16 × 4` — whole *blocks*. The *images* are **52,079,224 B**:
+the 2×2 and 1×1 mip level of each of the 38 textures still occupies a full 4×4 block, so 27 padded
+texels × 38 files = 1,026 texels = 4,104 bytes. Found by the Rust sweep disagreeing with the Python
+census, which is the only reason two implementations exist. Both figures are now reported, labelled.
+
+### Cost if wrong
+
+**Low and bounded.** If a later build of Roblox, or a streamed asset, does ship ETC2 or ASTC, the
+failure is a **named refusal at load**, not a wrong image — which is the whole point of refusing by
+name. The work to add a format is additive: a new `CompressedFormat` variant and a decoder beside
+`etc1.rs`, with the format table already carrying every name.
+
+### What this does not decide
+
+- **Whether the engine loads the baked ETC1 assets when ETC1 is not advertised.** It may skip them,
+  giving no skybox rather than a wrong one. Not determinable statically; settled by running M6.
+- **Where a device limit lives.** `maxImageDimension2D` is 32,768 on this host, and deliberately is
+  **not** enforced here — mutation row `texture-B4` injects exactly that over-correction. The limit
+  belongs where the image is created.
+- **The container layer.** The engine parses KTX itself; this crate takes block data.
+- **Anything about the renderer.** `omni-gfx` is still a re-export and a doc comment.
