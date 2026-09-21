@@ -118,23 +118,81 @@ fn refusal_of(f: &Fixture, symbol: &str, setup: impl FnOnce(&mut Asm)) -> AbiErr
 
 // =================================================================== the tables
 
-/// Every symbol bound here is one the 3,594 initializers actually reach, no symbol is bound
-/// twice, and the two dispatch paths are disjoint.
+/// The five symbols bound here that Task 1's 188 does **not** contain, and the evidence for each.
+///
+/// # Task 1's prediction was a lower bound, and M3's gate is what measured by how much
+///
+/// D17 says 188 is a lower bound and says why: 17,698 indirect call sites the static closure could
+/// not follow, and a 2,670,684-byte region with no unwind info hiding one initializer entry point
+/// worth 67 of the 188. Running the 3,594 initializers is the first thing that could test that,
+/// and it found symbols the prediction had placed in two *different* sections of its own file —
+/// and, for two of them, in the section that says the initializers never reach them at all.
+///
+/// This list is what keeps the specification discipline the 188 used to provide. A bound symbol
+/// must be an import of `libroblox.so`, and one outside the 188 must be named here with how it was
+/// found — so a typo still fails, and scope creep is a visible diff rather than a silent binding.
+const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
+    (
+        "uselocale",
+        "M3 gate, called at init_array[2]. The file's Tier C section: reached, said the scan, \
+         only through an address-taken edge",
+    ),
+    (
+        "__ctype_get_mb_cur_max",
+        "M3 gate, called at init_array[2]. The file's LAST section: never referenced from the \
+         Tier C closure at all",
+    ),
+    (
+        "mbtowc",
+        "M3 gate, called at init_array[2], one direct call site at 0x2b772f4 passing n = 4. The \
+         file's LAST section, as `__ctype_get_mb_cur_max`",
+    ),
+    (
+        "freelocale",
+        "NOT called by the initializers, and bound because `newlocale` is: a layer that hands out \
+         a locale handle and refuses to take it back is worse than one that does neither. The \
+         file's Tier C section",
+    ),
+    (
+        "strerror_r",
+        "M3 gate, reached at init_array[3118] on libc++'s verbose-abort path, before \
+         /dev/urandom existed; not called once that path is gone. The POSIX spelling of a symbol \
+         whose GNU spelling IS in the 188, and the two differ in what they return",
+    ),
+];
+
+/// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
+/// outside Task 1's 188 is named in [`BEYOND_THE_PREDICTION`] with how it was found.
 ///
 /// The list is the specification (`ARCHITECTURE.md` section 5), so a handler bound under a name
-/// that is not in it is either a typo — which would leave the real symbol `Unbound` and the typo
-/// unreachable, both silently — or scope creep.
+/// that is not an import at all is either a typo — which would leave the real symbol `Unbound` and
+/// the typo unreachable, both silently — or scope creep.
 #[test]
 fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
     let reachable = reachable_imports();
+    let every_import = all_imports();
+    let beyond: std::collections::BTreeSet<&str> =
+        BEYOND_THE_PREDICTION.iter().map(|(symbol, _)| *symbol).collect();
+    assert_eq!(beyond.len(), BEYOND_THE_PREDICTION.len(), "a symbol is listed twice");
     let mut seen = std::collections::BTreeSet::new();
     for symbol in Bionic::bound_symbols() {
         assert!(
-            reachable.contains(symbol),
-            "`{symbol}` is bound but is not in the first six sections of \
-             docs/research/init-reachable-imports.txt"
+            every_import.contains(symbol),
+            "`{symbol}` is bound but `libroblox.so` does not import it at all"
+        );
+        assert!(
+            reachable.contains(symbol) || beyond.contains(symbol),
+            "`{symbol}` is bound, is outside the 188, and is not named in \
+             BEYOND_THE_PREDICTION with how it was found"
         );
         assert!(seen.insert(symbol), "`{symbol}` is bound twice");
+    }
+    for (symbol, _) in BEYOND_THE_PREDICTION {
+        assert!(
+            !reachable.contains(*symbol),
+            "`{symbol}` IS one of the 188, so listing it as beyond the prediction is wrong"
+        );
+        assert!(seen.contains(symbol), "`{symbol}` is listed as bound and is not bound");
     }
     assert_eq!(
         seen.len(),
@@ -151,19 +209,25 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 168, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 173, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
     // Phase 3b adds 29, all inline: eighteen descriptor symbols and eleven `FILE *` ones.
     // Phase 3c adds 4 inline (the signal family) and 4 re-entrant (thread lifecycle).
     // Phase 3d adds 8 inline (the network group) and phase 3e 4 more, for 168.
-    assert_eq!(Bionic::inline_symbols().count(), 157);
-    assert_eq!(Bionic::reentrant_symbols().count(), 11);
+    // **Task 4, the gate, adds the five in `BEYOND_THE_PREDICTION`** — all inline — and moves
+    // `dlopen`, `dlsym` and `dlclose` from the fast path to the exit path, because answering them
+    // needs the boundary's symbol table and `ImportCall` deliberately cannot reach it. So
+    // 157 + 5 - 3 = 159 inline and 11 + 3 = 14 re-entrant.
+    assert_eq!(Bionic::inline_symbols().count(), 159);
+    assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
-    // null, which is what the guest's own null test expects. 168 + 18 + 2 = 188, which is every
-    // one of the imports the initializers reach.
+    // null, which is what the guest's own null test expects. 173 - 5 + 18 + 2 = 188, which is
+    // every one of the imports the initializers were *predicted* to reach; the five are what the
+    // prediction missed.
+    assert_eq!(symbols.len() - BEYOND_THE_PREDICTION.len() + 18 + 2, 188);
     assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
     assert_eq!(omni_android::bionic::ABSENT_SYMBOLS.len(), 2);
 
@@ -333,7 +397,11 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
          data object, or deliberately absent -- and the only members of that last category are \
          the two `__gcov_*`"
     );
-    assert_eq!(bound.len() + data.len() + absent.len(), 188, "the whole reachable set");
+    assert_eq!(
+        bound.len() - BEYOND_THE_PREDICTION.len() + data.len() + absent.len(),
+        188,
+        "the whole reachable set, with the five symbols M3's gate found outside it subtracted"
+    );
 }
 
 /// **Task 2 review finding F9, asserted rather than trusted to a comment.**
@@ -394,14 +462,46 @@ fn dispatch_paths_are_what_f9_requires() {
             "`{symbol}` runs no guest code and touches no mapping (D17)"
         );
     }
-    assert_eq!(reentrant.len(), 11, "nothing else belongs on the slow path: {reentrant:?}");
-    let inline: std::collections::BTreeSet<&str> = Bionic::inline_symbols().collect();
-    // The four `dl*` refusals touch no address space and run no guest code, so they stay on the
-    // fast path even though their sibling does not.
-    for symbol in ["dlopen", "dlsym", "dlclose", "dlerror"] {
-        assert!(inline.contains(symbol), "`{symbol}` has no reason to exit the run loop");
+    // **Task 4 moved three, and for a reason F9 does not cover.** `dlopen`, `dlsym` and
+    // `dlclose` run no guest code and touch no mapping — so by F9 alone they belong inline — but
+    // answering them needs the boundary's own symbol table, and `ImportCall` holds no boundary at
+    // all, deliberately (D18 makes that a type property). The exit path is the only place they
+    // can be served from. They are not hot: `libroblox.so` makes fourteen direct `dlopen` calls
+    // in the whole image.
+    for symbol in ["dlopen", "dlsym", "dlclose"] {
+        assert!(
+            reentrant.contains(symbol),
+            "`{symbol}` needs the boundary's symbol table, which only the exit path can reach"
+        );
     }
+    assert_eq!(reentrant.len(), 14, "nothing else belongs on the slow path: {reentrant:?}");
+    let inline: std::collections::BTreeSet<&str> = Bionic::inline_symbols().collect();
+    // `dlerror` stays on the fast path: it reads a thread-local string and needs no table.
+    assert!(inline.contains("dlerror"), "`dlerror` has no reason to exit the run loop");
     assert!(inline.is_disjoint(&reentrant));
+}
+
+/// Every undefined symbol the reachable-import file lists, across all eight of its sections.
+///
+/// The whole of `libroblox.so`'s import table: **565**, which is the figure Global Constraint 3
+/// pins. It is what a bound symbol has to be in, now that the 188 is known to be a lower bound.
+fn all_imports() -> std::collections::BTreeSet<String> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/research/init-reachable-imports.txt");
+    let text = std::fs::read_to_string(path).expect("the reachable-import list");
+    let mut out = std::collections::BTreeSet::new();
+    let mut started = false;
+    for line in text.lines() {
+        if line.starts_with("###") {
+            started = true;
+            continue;
+        }
+        let symbol = line.trim();
+        if started && !symbol.is_empty() {
+            out.insert(symbol.to_string());
+        }
+    }
+    assert_eq!(out.len(), 565, "libroblox.so imports 565 symbols (Global Constraint 3)");
+    out
 }
 
 /// Parse the first six sections of the reachable-import list: the 188 symbols that are
@@ -994,11 +1094,11 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
 fn the_unservable_printf_family_refuses_with_the_missing_piece_named() {
     let _guard = serialized();
     let f = fixture();
+    // **`fprintf` and `vfprintf` are no longer here**, and the churn is the test working: phase
+    // 3b built the stream layer they named as missing, the refusal text was corrected to say so,
+    // and M3's gate bound them onto it. Three are left, and each names something that still does
+    // not exist rather than something that does.
     for (symbol, needle) in [
-        // Phase 3b built the stream layer these two named as missing, so their refusals now
-        // name what is *actually* missing -- the binding -- rather than a surface that exists.
-        ("fprintf", "only the binding"),
-        ("vfprintf", "only the binding"),
         ("vasprintf", "allocator"),
         ("sscanf", "scanf"),
         ("fscanf", "scanf"),
@@ -1953,71 +2053,145 @@ fn a_hostile_dl_iterate_phdr_callback_is_a_typed_error_and_not_a_panic() {
 
 // ------------------------------------------------------------------ dlopen and friends
 
-/// `dlopen`, `dlsym` and `dlclose` refuse **by name, quoting the guest's own argument**, and
-/// `dlerror` answers null.
+/// **`dlopen` and `dlsym` answer for the libraries this layer *is*, and refuse to load a file.**
 ///
-/// A plausible handle is the worst outcome available here: the guest would `dlsym` it, store what
-/// came back, and call it thousands of initializers later. A refusal naming the library is a lead.
+/// Phase 2 refused all three, on the argument that a plausible handle is worse than a refusal.
+/// That is right about a handle to a **file** and wrong about the case M3's gate found at
+/// `init_array[3096]`: `dlopen("libc.so")` then `dlsym(h, "getauxval")` then `f(AT_HWCAP)` — the
+/// engine's atomics feature detection. `libc.so` is already loaded on a device and `dlopen` of it
+/// is a lookup; here, this layer *is* `libc.so`.
+///
+/// The scope is the **guest's own** `DT_VERNEED`, not a list here, which is why `libc.so` finds
+/// `getauxval` and a handle for a library the guest does not attribute it to does not.
 #[test]
-fn the_dl_family_refuses_by_name_rather_than_issuing_a_handle_it_cannot_honour() {
+fn the_dl_family_answers_for_the_libraries_this_layer_supplies() {
     let _guard = serialized();
     let f = fixture_with(&[]);
-    let path = f.cstring(f.guest.data + 0x100, b"libvulkan.so");
-    let wanted = f.cstring(f.guest.data + 0x180, b"vkGetInstanceProcAddr");
+    // The fixture's boundary was built by binding handlers, not by a loader, so no slot carries a
+    // `DT_VERNEED` library. That is the honest state for a synthetic guest: `dlopen` of a named
+    // library answers NULL because this boundary supplies none, and the real-library assertions
+    // live in `tests/libroblox.rs` where the loader has actually attributed the imports.
+    let name = f.cstring(f.guest.data + 0x100, b"libvulkan.so");
+    let wanted = f.cstring(f.guest.data + 0x180, b"strlen");
 
-    let open = refusal_of(&f, "dlopen", |asm| {
-        asm.mov(0, path as u64);
+    // `dlopen(NULL)` is the global scope, and it is a real handle.
+    let global = value_of(&f, "dlopen", |asm| {
+        asm.mov(0, 0);
         asm.mov(1, 2); // RTLD_NOW
     });
-    assert_eq!(open.symbol(), Some("dlopen"));
-    assert!(open.to_string().contains("libvulkan.so"), "{open}");
+    assert_ne!(global, 0, "dlopen(NULL) is the global scope and always exists");
+
+    // A library this runtime does not have is **NULL with `dlerror` set**, not a refusal: NULL is
+    // the true answer, and it is the one the compiler emitted a null test for.
+    assert_eq!(
+        value_of(&f, "dlopen", |asm| {
+            asm.mov(0, name as u64);
+            asm.mov(1, 2);
+        }),
+        0,
+        "a library this runtime does not supply is NULL"
+    );
+    let message = f.read_cstring(value_of(&f, "dlerror", |_| {}) as omni_cpu::GuestAddr);
+    let message = String::from_utf8_lossy(&message).into_owned();
+    assert!(message.contains("libvulkan.so"), "dlerror must name it: {message}");
+    // Cleared by reading, as bionic's is: the idiom `dlerror(); p = dlsym(..); if (dlerror())`
+    // depends on both halves.
+    assert_eq!(value_of(&f, "dlerror", |_| {}), 0, "dlerror is cleared by reading");
+
+    // `dlsym` in the global scope finds what this layer supplies, and the address it returns is a
+    // thunk slot — an address the guest can branch to, which is what makes this an implementation.
+    let found = value_of(&f, "dlsym", |asm| {
+        asm.mov(0, global);
+        asm.mov(1, wanted as u64);
+    });
+    assert_eq!(
+        found as omni_cpu::GuestAddr,
+        f.thunk("strlen"),
+        "dlsym returns the symbol's thunk address"
+    );
+    // A symbol nothing supplies is NULL with `dlerror` set, which is `dlsym`'s ordinary answer.
+    let absent = f.cstring(f.guest.data + 0x200, b"vkGetInstanceProcAddr");
+    assert_eq!(
+        value_of(&f, "dlsym", |asm| {
+            asm.mov(0, global);
+            asm.mov(1, absent as u64);
+        }),
+        0
+    );
+    let message = f.read_cstring(value_of(&f, "dlerror", |_| {}) as omni_cpu::GuestAddr);
+    assert!(
+        String::from_utf8_lossy(&message).contains("vkGetInstanceProcAddr"),
+        "dlerror must name the symbol"
+    );
+
+    // `dlclose` of a real handle succeeds: nothing was loaded, so nothing is unloaded, and the
+    // libraries this layer *is* cannot be unloaded — which is also true of `libc.so` on a device.
+    assert_eq!(value_of(&f, "dlclose", |asm| { asm.mov(0, global); }), 0);
+}
+
+/// **A handle this layer never issued is a refusal, not NULL** — and a `dlsym` miss is not a
+/// refusal.
+///
+/// This is where phase 2's argument survives intact. NULL from `dlsym` means "no such symbol",
+/// which guest code routinely treats as an absent optional capability; answering it for a handle
+/// that came from somewhere else would let a wrong *handle* be read as a missing *feature*.
+#[test]
+fn a_dlsym_on_a_handle_this_layer_never_issued_refuses() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let wanted = f.cstring(f.guest.data + 0x180, b"strlen");
 
     let sym = refusal_of(&f, "dlsym", |asm| {
         asm.mov(0, 0x1234);
         asm.mov(1, wanted as u64);
     });
     assert_eq!(sym.symbol(), Some("dlsym"));
-    assert!(sym.to_string().contains("vkGetInstanceProcAddr"), "{sym}");
     assert!(sym.to_string().contains("0x1234"), "{sym}");
 
     let close = refusal_of(&f, "dlclose", |asm| {
         asm.mov(0, 0x1234);
     });
     assert_eq!(close.symbol(), Some("dlclose"));
-
-    // `dlerror` is the one that answers, and null is the true answer: nothing above it can leave
-    // an error behind, because none of the three returns at all.
-    assert_eq!(value_of(&f, "dlerror", |_| {}), 0);
 }
 
-/// Hostile: `dlopen(NULL)`, an unterminated name, and a wild pointer. All three are refused and
-/// none of them is a panic — the refusal *describes* the bad pointer rather than replacing the
-/// useful message with a bad-pointer error.
+/// Hostile: an unterminated `dlopen` name, a wild pointer, and an unterminated `dlsym` name.
+///
+/// None is a panic and none is a refusal: an unreadable name is a *failed lookup*, which is what
+/// the kernel-side of a real `dlopen` produces for a path it cannot read, and `dlerror` carries
+/// the description.
 #[test]
-fn a_hostile_dlopen_argument_is_described_rather_than_crashing() {
+fn a_hostile_dl_argument_is_described_rather_than_crashing() {
     let _guard = serialized();
     let f = fixture_with(&[]);
 
-    let null = refusal_of(&f, "dlopen", |asm| {
-        asm.mov(0, 0);
-        asm.mov(1, 2);
-    });
-    assert!(null.to_string().contains("NULL"), "{null}");
-
-    let wild = refusal_of(&f, "dlopen", |asm| {
-        asm.mov(0, f.guest.unmapped as u64);
-        asm.mov(1, 2);
-    });
-    assert_eq!(wild.symbol(), Some("dlopen"), "still dlopen's refusal, not a bare bad pointer");
-    assert!(wild.to_string().contains("unreadable"), "{wild}");
+    assert_eq!(
+        value_of(&f, "dlopen", |asm| {
+            asm.mov(0, f.guest.unmapped as u64);
+            asm.mov(1, 2);
+        }),
+        0,
+        "a wild name pointer is a failed dlopen, not a crash"
+    );
+    let message = f.read_cstring(value_of(&f, "dlerror", |_| {}) as omni_cpu::GuestAddr);
+    assert!(
+        String::from_utf8_lossy(&message).contains("not a readable string"),
+        "dlerror must describe it"
+    );
 
     // A string with no NUL anywhere in its region.
     let island = f.guest.readonly;
-    let unterminated = refusal_of(&f, "dlsym", |asm| {
+    let global = value_of(&f, "dlopen", |asm| {
         asm.mov(0, 0);
-        asm.mov(1, island as u64);
+        asm.mov(1, 2);
     });
-    assert_eq!(unterminated.symbol(), Some("dlsym"));
+    assert_eq!(
+        value_of(&f, "dlsym", |asm| {
+            asm.mov(0, global);
+            asm.mov(1, island as u64);
+        }),
+        0,
+        "an unterminated symbol name is a failed lookup, not a crash"
+    );
 }
 
 // ------------------------------------------------------------------ the guest-memory group
@@ -3232,51 +3406,143 @@ fn abort_and_exit_become_typed_outcomes_rather_than_ending_the_host() {
     }
 }
 
-/// **The four that cannot be modelled refuse by name, with the guest's own argument in the
-/// message.**
+/// **What the four process calls answer now, and what they still refuse.**
 ///
-/// Each has a believable wrong answer sitting next to it — `sysconf` a page size, `sysinfo` a
-/// zeroed struct, `prctl` a 0, `syscall` a `-1`/`ENOSYS` — and each of those would be routed
-/// around by ordinary guest code without anything being reported.
+/// Phase 3a refused all four outright. M3's gate is what changed three of them, and it changed
+/// them with evidence out of the guest rather than out of a header — `tools/call_sites.py` decodes
+/// the arguments every direct call site passes. What each still refuses is the half with a
+/// believable wrong answer sitting next to it, and the refusal names the value it was given.
 #[test]
-fn the_four_process_symbols_that_cannot_be_modelled_refuse_by_name() {
+fn the_process_symbols_answer_what_is_known_and_refuse_the_rest() {
     let _guard = serialized();
     let f = fixture();
 
-    // `sysconf` refuses even the two names this layer could answer, because bionic's `_SC_*`
-    // numbering could not be verified here and a wrong constant answers the *wrong* query with a
-    // right-looking number.
-    let page = refusal_of(&f, "sysconf", |asm| { asm.mov(0, 0x27); });
-    assert_eq!(page.symbol(), Some("sysconf"));
-    let text = page.to_string();
-    assert!(text.contains("_SC_PAGESIZE"), "{text}");
-    assert!(text.contains("UNVERIFIED"), "the hint must be flagged as unverified: {text}");
-    assert!(text.contains("NDK"), "and must say what would settle it: {text}");
+    // **`sysconf` answers the page size**, from the same source `getauxval(AT_PAGESZ)` answers
+    // from, so the two cannot disagree. Both of bionic's two spellings, which is the corroboration
+    // that licensed the numbering: bionic is the one libc where they are different values.
+    let page = f.bionic.space_page_size() as u64;
+    assert_eq!(value_of(&f, "sysconf", |asm| { asm.mov(0, 0x27); }), page, "_SC_PAGESIZE");
+    assert_eq!(value_of(&f, "sysconf", |asm| { asm.mov(0, 0x28); }), page, "_SC_PAGE_SIZE");
+    let cpus = value_of(&f, "sysconf", |asm| { asm.mov(0, 0x61); });
+    assert!(cpus >= 1, "_SC_NPROCESSORS_ONLN must be at least one: {cpus}");
+    assert_eq!(value_of(&f, "sysconf", |asm| { asm.mov(0, 0x60); }), cpus, "_SC_NPROCESSORS_CONF");
+    // And still refuses the ones it does not know, naming the number and what it is believed to
+    // be. `_SC_PHYS_PAGES` is refused **although a number is available**: it is the host's
+    // physical memory, which is not the guest's budget.
+    let phys = refusal_of(&f, "sysconf", |asm| { asm.mov(0, 0x62); });
+    assert_eq!(phys.symbol(), Some("sysconf"));
+    assert!(phys.to_string().contains("_SC_PHYS_PAGES"), "{phys}");
     let unknown = refusal_of(&f, "sysconf", |asm| { asm.mov(0, 4242); });
     assert!(unknown.to_string().contains("4242"), "{unknown}");
 
+    // **`sysinfo` refuses until the embedding says how much memory the guest has**, naming the
+    // method that supplies it. That is the same shape as the filesystem root and the thread host.
     let info = refusal_of(&f, "sysinfo", |asm| {
         asm.mov(0, (f.guest.data + 0x200) as u64);
     });
     assert_eq!(info.symbol(), Some("sysinfo"));
-    assert!(info.to_string().contains("totalram"), "{info}");
+    assert!(info.to_string().contains("set_memory_budget"), "{info}");
 
+    // **`prctl` answers `PR_SET_VMA` by keeping the label**, which is that call's entire
+    // observable effect on a device, and answers the two transparent-huge-page options with
+    // `EINVAL`, which is what a kernel without `CONFIG_TRANSPARENT_HUGEPAGE` answers.
+    let label = f.cstring(f.guest.data + 0x300, b"roblox-heap");
+    let result = value_of(&f, "prctl", |asm| {
+        asm.mov(0, 0x5356_4d41); // PR_SET_VMA
+        asm.mov(1, 0); // PR_SET_VMA_ANON_NAME
+        asm.mov(2, 0x1000);
+        asm.mov(3, 0x2000);
+        asm.mov(4, label as u64);
+    });
+    assert_eq!(result, 0, "PR_SET_VMA succeeds");
+    assert_eq!(
+        f.bionic.vma_names(),
+        vec![((0x1000u64, 0x2000u64), "roblox-heap".to_string())],
+        "the label is kept, which is the whole of what the call does on a device"
+    );
+    for option in [41i64, 42] {
+        let value = value_of(&f, "prctl", |asm| {
+            asm.mov(0, option as u64);
+            asm.mov(1, 0);
+        });
+        assert_eq!(value as i64 as i32, -1, "PR_*_THP_DISABLE is EINVAL without huge pages");
+    }
+    // And still refuses everything else, naming the option.
     let named = refusal_of(&f, "prctl", |asm| {
         asm.mov(0, 15); // PR_SET_NAME
         asm.mov(1, (f.guest.data + 0x100) as u64);
     });
     assert_eq!(named.symbol(), Some("prctl"));
     assert!(named.to_string().contains("PR_SET_NAME"), "{named}");
-    let vma = refusal_of(&f, "prctl", |asm| { asm.mov(0, 0x5356_4d41); });
-    assert!(vma.to_string().contains("PR_SET_VMA"), "{vma}");
 
-    let tid = refusal_of(&f, "syscall", |asm| { asm.mov(0, 178); });
-    assert_eq!(tid.symbol(), Some("syscall"));
-    let text = tid.to_string();
-    assert!(text.contains("gettid"), "{text}");
-    assert!(text.contains("ENOSYS"), "the refusal must say why -1/ENOSYS was rejected: {text}");
+    // **`syscall` answers `gettid` with this thread's identity** — the whole contract of that
+    // call is a value no other live thread has, and a `GuestThreadId` is exactly that.
+    // The activation is held across the call so the test can ask what the handler answered
+    // *with*: `attach_current` gives one host thread one slot, so the id this sees is the id the
+    // handler saw. Without it the guard inside `Fixture::run` would have been dropped by now and
+    // the comparison would be against `None`.
+    let tid = {
+        let _active = f.bionic.activate().expect("a thread block");
+        let tid = value_of(&f, "syscall", |asm| { asm.mov(0, 178); });
+        assert_eq!(
+            tid,
+            f.bionic.current_thread().expect("attached").0,
+            "gettid is this thread's identity, not an invented number"
+        );
+        tid
+    };
+    assert!(tid > 0, "a thread identity of zero is indistinguishable from an unset one");
+    // And still refuses a number it does not model, naming it.
     let nameless = refusal_of(&f, "syscall", |asm| { asm.mov(0, 100_000); });
-    assert!(nameless.to_string().contains("100000"), "{nameless}");
+    assert_eq!(nameless.symbol(), Some("syscall"));
+    let text = nameless.to_string();
+    assert!(text.contains("100000"), "{text}");
+    assert!(text.contains("ENOSYS"), "the refusal must say why -1/ENOSYS was rejected: {text}");
+}
+
+/// **`syscall(SYS_rt_sigprocmask)` is the engine's pointer-readability probe, and it answers it.**
+///
+/// The engine passes `how = -1` deliberately: the kernel validates `sigsetsize`, then the `set`
+/// pointer — `EFAULT` if it cannot be read — and only then rejects `how` with `EINVAL`. So the
+/// errno the call fails with is a precise answer to "can this process read eight bytes there",
+/// and the caller saves and restores `errno` around it. Both arms are asserted, because the
+/// *difference* between them is the whole answer.
+#[test]
+fn the_rt_sigprocmask_pointer_probe_tells_a_readable_address_from_an_unreadable_one() {
+    let _guard = serialized();
+    let f = fixture();
+    let set = f.guest.data + 0x400;
+    f.guest.write_u64(set, 0);
+
+    let probe = |at: u64| -> i32 {
+        let entry = {
+            let thunk = f.thunk("syscall");
+            let entry = f.guest.next_entry();
+            let mut asm = Asm::at(entry);
+            asm.push(mov_reg(21, 30));
+            asm.mov(0, 135); // SYS_rt_sigprocmask
+            asm.mov(1, u64::from(u32::MAX)); // how = -1, invalid on purpose
+            asm.mov(2, at);
+            asm.mov(3, 0); // oldset = NULL
+            asm.mov(4, 8); // sigsetsize
+            asm.bl(thunk);
+            asm.mov(22, f.guest.data as u64);
+            asm.push(str_imm(0, 22, 0));
+            asm.push(ret(21));
+            f.guest.load(asm.words());
+            entry
+        };
+        let mut cpu = f.guest.thread(&f.boundary);
+        let exit = f.run(&mut cpu, entry).expect("the probe must complete");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+        assert_eq!(f.guest.read_u64(f.guest.data) as i64 as i32, -1, "the probe always fails");
+        // `errno`, read the way the guest reads it.
+        let _active = f.bionic.activate().expect("a thread block");
+        f.guest.read_u64(f.bionic.arena()) as u32 as i32
+    };
+
+    assert_eq!(probe(set as u64), 22, "a readable `set` reaches the `how` check: EINVAL");
+    assert_eq!(probe(f.guest.unmapped as u64), 14, "an unreadable `set` is EFAULT");
 }
 
 // ------------------------------------------------------------------ the log sink
@@ -6593,14 +6859,17 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
     // on a target whose process backend is structural, and `mmap` only for a shape it cannot
     // honour — each of those answers on some path, so each is an answer.
     let refusals = [
-        // phase 1: the printf family that cannot be serviced
-        "fprintf",
-        "vfprintf",
+        // phase 1: the printf family that cannot be serviced. **Three left, not five**:
+        // `fprintf` and `vfprintf` are bound as of M3's gate -- phase 3b built the stream layer
+        // they named as missing, and Task 4 bound the formatting onto it.
         "vasprintf",
         "sscanf",
         "fscanf",
-        // phase 2: libdl. `dlerror` is NOT here — it answers NULL, which is true.
-        "dlopen",
+        // phase 2: libdl. `dlerror` is NOT here — it answers NULL, which is true. **Nor is
+        // `dlopen` any more**: M3's gate found the engine using it to look up `getauxval` in
+        // `libc.so`, which this layer *is*, so it answers a handle for a library it supplies and
+        // NULL for one it does not. `dlsym` and `dlclose` still refuse a handle this layer never
+        // issued, which is a different statement from "no such symbol".
         "dlsym",
         "dlclose",
         // phase 2: the one guest-memory call whose guarantee cannot be met
@@ -6623,7 +6892,7 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         "mallinfo",
         "longjmp",
     ];
-    assert_eq!(refusals.len(), 22);
+    assert_eq!(refusals.len(), 19);
     for symbol in refusals {
         let error = refusal_of(&f, symbol, |asm| {
             for register in 0..6 {
@@ -6650,10 +6919,14 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         );
     }
 
-    let bound = Bionic::bound_symbols().count();
+    // **The split is over the 188 the static closure predicted**, so the five symbols M3's gate
+    // found outside it are subtracted rather than folded in: they are not part of what Task 1
+    // predicted and counting them here would make the total right for the wrong reason, which is
+    // the exact failure shape this project has made five times.
+    let bound = Bionic::bound_symbols().count() - BEYOND_THE_PREDICTION.len();
     assert_eq!(bound, 168);
     let answered = bound - refusals.len() - 3;
-    assert_eq!(answered, 143, "143 answer, 22 refuse by name, 3 report a termination");
+    assert_eq!(answered, 146, "146 answer, 19 refuse by name, 3 report a termination");
     assert_eq!(
         answered + refusals.len() + 3 + omni_android::bionic::DATA_OBJECTS.len()
             + omni_android::bionic::ABSENT_SYMBOLS.len(),

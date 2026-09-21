@@ -662,7 +662,7 @@ pub(super) fn sysinfo(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     // taken gets `freeram = 0` rather than an underflow that wraps to sixteen exabytes.
     let free = omni_mem::process_commit_charge()
         .ok()
-        .map_or(total, |charged| total.saturating_sub(u64::try_from(charged).unwrap_or(u64::MAX)));
+        .map_or(total, |charged| total.saturating_sub(charged));
     let uptime = state.bionic.uptime().as_secs();
 
     let mut bytes = [0u8; SYSINFO_BYTES];
