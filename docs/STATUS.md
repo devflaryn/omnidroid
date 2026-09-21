@@ -3,7 +3,7 @@
 The honest capability record. A thing is **Verified** only if it was run and observed. Nothing is
 claimed for Linux or macOS, because nothing has been tested there.
 
-Last updated: 2026-09-19
+Last updated: 2026-09-21
 
 ## Platforms
 
@@ -88,7 +88,8 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-platform` virtual-memory seam (Windows) | **Done, reviewed.** Reserve, 4 KB placeholder split, commit, decommit, protect, file-backed map, commit-charge measurement |
 | `omni-platform` dual-mapped sections + placeholder coalescing | **Done, reviewed** |
 | `omni-platform` vectored fault seam | **Done, reviewed.** Releasing a handler slot is a quiescence point: the slot is marked draining before the drain and zeroed only afterwards, so a new registrant cannot claim it mid-drain. Took four iterations; the last two defects were found by measurement, not inspection |
-| `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Typed "unsupported on this platform" errors, each naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving |
+| `omni-platform` clock / process / log seams | **Done, pending review.** M3 task 3 phase 3a, the crate's first growth past `vm` and `fault`. Monotonic and wall clocks from one process epoch, sleep, pid, cpu count, entropy, current processor, a log sink with Android's and syslog's priority scales. 16 tests |
+| `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Every primitive that calls an OS API returns a typed "unsupported on this platform" error naming its intended POSIX call, so a non-Windows build fails immediately rather than misbehaving. The primitives that call **no** OS API — the clocks, the log sink, `pid`, `cpu_count` — are portable `std` and are implemented once, deliberately without a fabricated refusal (D22). **Nothing here has been run on any non-Windows target** |
 | `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
 | `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
 | `omni-elf` — loader: map, relocate, resolve, seal | **Done, reviewed.** Milestone **M1** |
@@ -98,7 +99,8 @@ has confirmed it yet — on this project that distinction has mattered every sin
 | `omni-android` — the thunk boundary | **Done, reviewed.** M3 task 2. Region, AAPCS64 marshalling both ways, the variadic rules and a guest `va_list` walk, host → guest re-entry. **No symbol is implemented**: all 565 slots are `Unbound` and name themselves when called. Review found three defects, all fixed |
 | `omni-bionic` — the pure libc/libm subset | **Done, reviewed.** Strings, wide/multibyte, ctype, locale, numeric conversion, `printf` formatting, libm. Verified by mutation (11 rows, 11/11) after review found its errno constants had no test at all |
 | `omni-bionic` — pthread / sync / TLS | **Done for its scope, reviewed.** 42 of the 51 reachable thread symbols; 1 excluded; 8 need host → guest re-entry or the OS and belong to the adapter (D19). Review found a `sem_post` lost wakeup — **1.0104 s** measured — and three timing flakes |
-| `omni-android` — the adapter, and all 3,594 initializers | **Not started.** M3 tasks 3 and 4 |
+| `omni-android` — the bionic adapter | **Phases 1, 2 and 3a done, pending review.** M3 task 3. **137 of the 188 statically reachable imports** covered: 119 thunk functions bound and all 18 `STT_OBJECT` data objects placed and filled (D20, D21, D22). 51 left — files and directories, sockets and polling, thread lifecycle and signals. `AT_HWCAP` is deliberately still undecided and `getauxval` refuses until a host says which arm |
+| `omni-android` — all 3,594 initializers | **Not started.** M3 task 4 |
 | `omni-gfx`, `omni-core`, `omni-cli` | Not started |
 
 **Measured, not assumed**

@@ -52,7 +52,7 @@ backends implement them, and nothing in the core knows which backend it has.
 
 | Crate | Responsibility | Platform-specific? |
 |---|---|---|
-| `omni-platform` | OS primitives: virtual memory, threads, files, dynamic loading, clocks, windowing. One module per OS behind one trait set. | **yes**, the only place `cfg(target_os)` is allowed |
+| `omni-platform` | OS primitives: virtual memory, threads, files, dynamic loading, clocks, windowing. One module per OS behind one trait set. **Today that is `vm`, `fault`, `clock`, `process` and `log`** — files, threads, dynamic loading and windowing are still aspirational, and the row is left describing the intent rather than trimmed, because the intent is what the later phases fill in | **yes**, the only place `cfg(target_os)` is allowed |
 | `omni-mem` | Guest address-space manager built on `omni-platform`: reservation, lazy commit, decommit, placeholder mapping, the JIT code arena | no |
 | `omni-apk` | APK reading, zip parsing, and the content-addressed 4 KB-aligned extraction cache | no |
 | `omni-elf` | Bionic-compatible ELF loader: program headers, APS2 packed relocations, symbol resolution, `init_array`, RELRO, `dl_iterate_phdr` state | no |
@@ -64,7 +64,12 @@ backends implement them, and nothing in the core knows which backend it has.
 | `omni-cli` | Command-line host, the first deliverable. Execution before UI. | no |
 
 **Portability rule.** Anything that is not `omni-platform` or a named backend must compile for all
-five targets without `cfg`. `omni-bionic` makes its half of that rule *structural* rather than
+five targets without `cfg`. Depending on `omni-platform` is the seam working as intended and not a
+breach of that rule — the rule forbids an *external* OS crate (`windows-sys`, `libc`) outside it.
+And the rule has a second half, established in D22: a primitive that calls **no** OS API is
+implemented once, with no backend and no fabricated `unsupported` arm, because claiming that
+something `std` already does on all five targets cannot be done is a false claim in the other
+direction. `omni-bionic` makes its half of that rule *structural* rather than
 conventional: with no dependencies at all it cannot reach an OS primitive, which is the argument D19
 turns on. Linux and macOS support is *structural* until it is actually tested on
 those systems; nothing will be described as working there before then.

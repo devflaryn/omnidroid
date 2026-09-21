@@ -27,9 +27,10 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
-**959 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was 926
-before M3 task 3 phase 2, 877 before phase 1, and 608 before `omni-bionic` existed, so those are not
-comparable). **The whole mutation table has been run on the committed tree: 175/175 caught.** Clippy clean on
+**1,004 passing, 0 failing, 12 ignored** (`cargo test --workspace --release`, 2026-09-21 — was 959
+before M3 task 3 phase 3a, 926 before phase 2, 877 before phase 1, and 608 before `omni-bionic`
+existed, so those are not comparable). **The whole mutation table has been run on the committed
+tree: 212/212 caught.** Clippy clean on
 `--all-targets`, `cargo doc` clean, `--no-default-features` builds — and that last one is now
 *verified* rather than assumed: `cargo tree -p omni-android -e normal` has no `dynarmic-sys` in it.
 With `workspace = true` a member's `default-features = false` is **ignored**, so the omni-android
@@ -40,12 +41,19 @@ gate that refuses to run against a modified tree:
 
 | Harness | Rows |
 |---|---|
-| `tools/mutate.py` (workspace) | **175**, all caught on a full run |
+| `tools/mutate.py` (workspace) | **212**, all caught on a full run |
 | `crates/dynarmic-sys/tools/mutate_shim.py` | 23 |
 | `crates/omni-elf/tools/mutate_loader.py` | 18 |
 
 Other committed tools, each self-checking against a known count: `tools/thunk_sweep.py`,
 `tools/init_reach.py`, `tools/atomic_mix.py`, `tools/branch_mix.py`.
+
+**`tools/mutate.py` gained two gates in phase 3a, both because it needed them.** It now refuses to
+run when two rows share an id (six new rows collided with the fault handler's `plat-A1`..`plat-A4`
+and nothing complained), and it runs **every distinct command once on the unmutated tree** before
+mutating anything. That second gate closes the worst hole a mutation harness can have: a command
+that already fails reports every row using it as `caught`, because "the suite failed" is the whole
+of what caught means. It did exactly that for eight rows before it was fixed — see D22.
 
 ## The five-target requirement — read this before writing any code
 
@@ -80,7 +88,8 @@ invariant auto-disarmed, rather than being silently wrong.
 
 | | |
 |---|---|
-| OS surface confined to `omni-platform` | Verified across all six crates — no `cfg(target_os)` or OS crate escapes it |
+| OS surface confined to `omni-platform` | Verified across every crate — no `cfg(target_os)` or OS crate escapes it. `omni-android` depends on `omni-platform` directly as of phase 3a, which is the seam working, not a breach |
+| `omni-platform` beyond `vm`/`fault` | **`clock`, `process` and `log` exist** (phase 3a, D22). Five of their seven primitives are portable `std` and are implemented once; the two that call an OS API — entropy and the current processor number — have a Windows backend and structural `linux.rs`/`macos.rs` naming `getrandom(2)`, `arc4random_buf(3)` and `sched_getcpu(3)`. **macOS has no `sched_getcpu` and no supported equivalent**, so that one is expected to stay a refusal there |
 | `omni-cpu` builds with **no C++ toolchain at all** (`--no-default-features`) | Guarded by a CI job. That guard was itself found blind once and fixed — read its comment before touching it |
 | ARM64-native CPU path | **Expressible, untested, not claimed.** No trait method requires emitting a byte |
 | ARM64-native thunk veneer | Designed (four instructions, 16-byte slots sized for it), untested |
@@ -93,6 +102,16 @@ honest `unsupported` returns at the same time, naming the intended syscall. It c
 the seam shaped correctly, and it is how the non-Windows bring-up later becomes a fill-in rather than a
 redesign. Do **not** write speculative `mmap` bodies — that was ruled against deliberately, because an
 unverified body can misbehave silently where a typed error fails immediately and visibly.
+
+**And the other half of that rule, established in phase 3a: not every primitive calls an OS API, and
+one that does not must NOT be given a fabricated `unsupported` arm.** `clock`, `log`, `pid` and
+`cpu_count` are `Instant`, `SystemTime`, `thread::sleep`, `stderr`, `process::id` and
+`available_parallelism` — portable standard library, correct on all five targets, and already what
+`omni-cpu`'s `CNTPCT_EL0` is built on (D5 amendment 4). Writing a `cfg(unix)` arm that returned
+`Unsupported` for one of those would be a **false claim in the other direction**: it would assert
+that a clock this process can read cannot be read, and it would make the non-Windows bring-up
+harder. The rule is *never claim a platform works*; `std` working on Linux is not a claim of ours.
+What stays unclaimed is what has been **run**, which is Windows x86-64 only.
 
 ## Milestones
 
@@ -115,13 +134,19 @@ Plan: `docs/plans/android-abi-plan.md`. Ledger: `.superpowers/sdd/android-abi-pl
   ways, the variadic rules and a guest `va_list` walk, checked guest memory, the symbol table, and
   host→guest re-entry. **No symbol is implemented** — all 565 slots are `Unbound` and name themselves
   when called. Tests went 496 → 608, mutation **89 → 118** rows (29 new), all caught.
-- **Task 3 (the bionic subset) — phases 1 and 2 complete.** Phase 1, commits `fd3b6f4`..`b9cdf69`:
+- **Task 3 (the bionic subset) — phases 1, 2 and 3a complete.** Phase 1, commits `fd3b6f4`..`b9cdf69`:
   the adapter, 86 of the 188 reachable imports bound (81 serviced, 5 refused by name), the `printf`
   family, 37 tests against real translated ARM64 code, mutation **137 → 153**. Durable record is
   **D20**. Phase 2, commits `9878e79`..`4545ef5`: the `dl*` family, the guest-memory group and all 18 data
   objects — **114 of the 188** now covered (96 thunk functions + 18 data objects), 30 new tests,
   mutation **155 → 175** (20 new, 20/20 caught after one MISS was closed). Durable record is
-  **D21**. Phase 3 remains; scope for the whole task is **170 thunk functions + 18 data objects**.
+  **D21**. Phase 3a, commits `21b712d`..`f2d02f7`: **`omni-platform` grew past `vm` and `fault` for
+  the first time** (`clock`, `process`, `log`), plus `gmtime_r`'s calendar arithmetic in
+  `omni-bionic` and the 23 clock / process-environment / logging symbols over them — **137 of the
+  188** now covered (119 thunk functions + 18 data objects), 16 new adapter tests and 9 new
+  `omni-bionic` ones, mutation **175 → 212** (37 new, 37/37 caught). Durable record is **D22**.
+  Phases 3b (files and directories), 3c (sockets and polling) and 3d (thread lifecycle) remain;
+  scope for the whole task is **170 thunk functions + 18 data objects**.
 - Task 4 (all 3,594 initializers, the M3 gate) — not started.
 
 ### What Task 1 established
@@ -270,14 +295,16 @@ The 100 do **not** form one job. They split by what they depend on:
 | ~~Guest memory (`mmap`, `munmap`, `mprotect`, `madvise`, `mlock`)~~ | **DONE** — phase 2, D21 | — |
 | ~~`dl*` (`dl_iterate_phdr`, `dlopen`, `dlsym`, `dlclose`, `dlerror`)~~ | **DONE** — phase 2, D21 | — |
 | ~~The **18** data symbols~~ — not ~19, and the list that stood here named two symbols the initializers never reach | **DONE** — phase 2, D21 | — |
-| Files, directories, clocks, process info, sockets, logging, thread lifecycle | **New `omni-platform` surface** | **YES** |
+| ~~Clocks, process info, logging~~ | **DONE** — phase 3a, D22. `omni-platform` gained `clock`, `process` and `log` | — |
+| Files, directories, sockets and polling, thread lifecycle | **More `omni-platform` surface** | **YES** — phases 3b, 3c, 3d |
 
-**The blocker, stated plainly: `omni-platform` today is `vm` and `fault` and nothing else.** No files,
-no directories, no clocks, no process info, no sockets, no dynamic loading — although ARCHITECTURE §2
-describes the crate as covering "virtual memory, threads, files, dynamic loading, clocks, windowing".
-That description is aspirational and always has been; the portability invariant itself is intact
-(verified: every `cfg(target_os)` mention outside `omni-platform` is a doc comment stating the rule,
-not an escape from it).
+**That blocker is now half cleared.** `omni-platform` was `vm` and `fault` and nothing else until
+phase 3a, which added `clock`, `process` and `log` (D22). What is still missing is files,
+directories, sockets and threads — ARCHITECTURE §2 describes the crate as covering "virtual memory,
+threads, files, dynamic loading, clocks, windowing", and three of those six are now real rather than
+aspirational. The portability invariant itself is intact throughout (verified: every
+`cfg(target_os)` mention outside `omni-platform` is a doc comment stating the rule, not an escape
+from it).
 
 So the last group cannot be written without extending `omni-platform` first, and per the five-target
 guidance that extension must add the **Linux and macOS signatures as honest `unsupported` returns at
@@ -291,30 +318,48 @@ those targets — that was ruled against deliberately.
    caught. The seam is proved end to end against real translated ARM64 code.
 2. ~~The data symbols, `dl*`, and the guest-memory group.~~ **Done** (D21): 114 of the 188
    covered, 30 new tests, 20 new mutation rows, 20/20 caught.
-3. **Next:** extend `omni-platform`, then the OS-dependent remainder.
+3. ~~Extend `omni-platform` with clocks, process information and a log sink, then bind them.~~
+   **Done** (D22): 137 of the 188 covered, 25 new tests, 37 new mutation rows, 37/37 caught.
+4. **Next:** files and directories (3b), then sockets and polling (3c), then thread lifecycle (3d).
 
 ## Next action
 
-**M3 Task 3 phase 3: extend `omni-platform`, then the OS-dependent remainder.** Phases 1 and 2 are
-complete and committed (D20, D21). **114 of the 188 reachable imports are covered** — 96 thunk
-functions and all 18 `STT_OBJECT` data objects — and **74** are left: files, directories, clocks,
-process information, sockets, logging and thread lifecycle, plus four that belong to no group —
-`mallinfo`, which returns 80 bytes indirectly through `X8` and would have to describe a libc heap
-`libroblox.so` does not have, `sysconf`, and the two `__gcov_*`. Every one of them needs surface
-`omni-platform` does not have. The list is derived, not asserted: the 188 of
-`init-reachable-imports.txt` minus the 96 bound and the 18 placed.
+**M3 Task 3 phase 3b: files and directories.** Phases 1, 2 and 3a are complete and committed
+(D20, D21, D22). **137 of the 188 reachable imports are covered** — 119 thunk functions and all 18
+`STT_OBJECT` data objects — and **51** are left. The list is derived, not asserted: the 188 of
+`init-reachable-imports.txt` minus the 119 bound and the 18 placed, classified with
+`tools/os_surface.py`.
 
-**The blocker, restated because it has not moved: `omni-platform` today is `vm` and `fault` and
-nothing else.** ARCHITECTURE §2 describes the crate as covering "virtual memory, threads, files,
-dynamic loading, clocks, windowing"; that description is aspirational and always has been. Phases 1
-and 2 extended the crate not at all.
+| group | count | symbols |
+|---|---|---|
+| **file-io** — phase 3b | **29** | `open`, `__open_2`, `close`, `read`, `pread`, `__write_chk`, `access`, `stat`, `fstat`, `lstat`, `statvfs`, `rename`, `unlink`, `mkdir`, `rmdir`, `opendir`, `readdir`, `closedir`, and bionic's `FILE*` layer on top of them: `fopen`, `fclose`, `fdopen`, `fileno`, `feof`, `fflush`, `fgets`, `fputs`, `fputc`, `fread`, `fwrite` |
+| **network** — phase 3c | **8** | `socket`, `poll`, `select`, `eventfd`, `getaddrinfo`, `freeaddrinfo`, `gai_strerror`, `inet_ntop` |
+| **threads-sync** — phase 3d | **8** | `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_getschedparam`, `pthread_sigmask`, and **three signal symbols the plan's phase table never assigned to any phase**: `sigaction`, `sigfillset`, `raise` |
+| time-clocks | 2 | `clock` (process CPU time, which needs `GetProcessTimes`-shaped surface) and `time` (one line over `clock::realtime_now`, deliberately left for whoever binds `clock` beside it) |
+| no group | 4 | `mallinfo`, which returns 80 bytes indirectly through `X8` and would have to describe a libc heap `libroblox.so` does not have; `longjmp`, which is guest control flow and not an OS call at all; and the two `__gcov_*` |
+
+**Three of those are a finding rather than a list entry.** `sigaction`, `sigfillset` and `raise` are
+in the reachable 188 and appear in **no row** of the plan's phase-3 table — the classifier files them
+under `threads-sync`, and the table's thread row is about lifecycle and scheduling. Signals are their
+own problem (the guest's signal state is exactly what `pthread_sigmask` was excluded from
+`omni-bionic` for, D19), and whoever picks up 3d should decide whether they belong there or in a
+phase of their own. `longjmp` is likewise unassigned and is the odd one out in the other direction:
+it needs no OS at all, only the guest's own `jmp_buf` and a way to resume the guest at a saved PC.
+
+**The blocker is now half cleared.** `omni-platform` was `vm` and `fault` and nothing else until
+phase 3a, which added `clock`, `process` and `log`. What is still missing is files, directories,
+sockets and threads.
 
 Per the five-target guidance, that extension must add the **Linux and macOS signatures as honest
 `unsupported` returns at the same time, naming the intended POSIX call**. Do not write speculative
-`open`/`stat`/`clock_gettime` bodies for those targets — that was ruled against deliberately,
-because an unverified body misbehaves silently where a typed error fails immediately.
+`open`/`stat` bodies for those targets — that was ruled against deliberately, because an unverified
+body misbehaves silently where a typed error fails immediately. **And read D22's other half before
+copying the pattern:** a primitive that calls no OS API at all must *not* be given a fabricated
+`unsupported` arm, because that is a false claim in the other direction. Five of phase 3a's seven
+new primitives were portable `std` and are implemented once; two were real OS calls and got the
+structural unix half. Files will be the opposite balance, and almost all of them will need it.
 
-What phase 2 leaves for whoever picks this up:
+What phases 2 and 3a leave for whoever picks this up:
 
 - **`sizeof(FILE) = 152` is derived, not verified** (`bionic::data::FILE_BYTES`). There is no NDK on
   this machine. It is safe today only because every function that would read a field out of a `FILE`
@@ -331,6 +376,17 @@ What phase 2 leaves for whoever picks this up:
   placeholder `expected` of `0` to `futex.wait`, so the adapter's futex still ignores `expected`;
   and `strerror`'s message table still holds ten errno codes, so `ETIMEDOUT` and most of `errno.rs`
   answer `Unknown error`.
+- **`sysconf` refuses every name, including the two this layer could answer** (the page size and the
+  processor count), because bionic's `_SC_*` numbering is its own and there is no NDK here to check
+  it against. D22 has the argument. Four confirmed constants turn it into four lines, and running
+  task 4 will report which values the engine actually passes.
+- **`sizeof(struct tm) = 56` joins `FILE_BYTES` and `dl_phdr_info`** as derived-not-verified, stated
+  in `omni_bionic::time::TM_BYTES`. It has the strongest safety argument of the three: every field
+  is an `int` except the last two, so the layout is forced once the field order is right.
+- **`omni-platform::clock::sleep` is bound by Windows' ~15.6 ms timer tick**, so a guest
+  `usleep(1000)` sleeps for roughly 15 ms. Recorded, not worked around; raising it costs either a
+  process-wide `timeBeginPeriod` or a high-resolution waitable timer per sleeping thread, and
+  neither has been measured.
 
 Carry into the dispatch as before: D17's in-loop dispatch decision, that the dispatcher-side MXCSR
 guard already exists and **must not be moved or removed**, that an unbound symbol must fail with a
@@ -370,7 +426,7 @@ Round trip re-measured after the mechanism changed: **26.7-31.0 ns against 81-10
 | **Test APK is cheat-injected** | `Roblox-2.738.1397.apk` is signed by "Gloop", not Roblox, with an injected Luau executor in `libzstd-jni`. `libroblox.so` itself is stock. **A stock Play-signed APK has been requested from the user and never supplied.** Design is from the stock engine only (D6). Still the correct thing to ask for |
 | **16 MiB per guest thread** | A fixed array dynarmic allocates and *writes* even when its feature is disabled — and D16 says to run with it disabled. Fork patch written up in `crates/dynarmic-sys/patches/README.md`, not applied. ~512 MiB at 32 threads. Directly threatens the multi-instance memory requirement |
 | **W^X does not hold for the code cache** | Recorded as an explicit exception under D12. Enabling dynarmic's no-execute option makes **upstream's own suite segfault**. Under identity mapping the cache is guest-writable in principle, gated only by ASLR |
-| **`AT_HWCAP` is an open decision for M3** | Roblox's atomics are one population behind a single flag we own. Advertise LSE → 53 hard interpreter halts; decline → 106 fallback arms into a global spinlock that anti-scales 21x. Both arms measured; the choice is unmade |
+| **`AT_HWCAP` is an open decision for M3** | Roblox's atomics are one population behind a single flag we own. Advertise LSE → 53 hard interpreter halts; decline → 106 fallback arms into a global spinlock that anti-scales 21x. Both arms measured; **the choice is still unmade, and phase 3a made that structural**: `bionic::HwcapPolicy` has no `Default`, an instance starts `Undecided`, and under it `getauxval(AT_HWCAP)` *refuses by name with both measurements in the message*. A host that has decided calls `Bionic::set_hwcap_policy`. Defaulting to "decline" was considered and rejected — it reads as the safe arm and is the one that costs 21x, and nothing would have recorded that a choice had been made (D22). Mutation row `procenv-A1` injects exactly that |
 | No Vulkan validation layers installed | Will matter from M6. A real use-after-free once crashed the driver with no diagnostic |
 | Linux/macOS untested | Deliberately unclaimed everywhere. Non-Windows paths return typed "unsupported" errors naming their intended POSIX call |
 
@@ -437,6 +493,7 @@ Each of these was recorded, then disproved by someone other than its author. Sev
 | D5's warm figure is an entry ceiling excluding the exit | It was always entry-**and**-exit. This error was the controller's, and it propagated into a report and three code comments |
 | Thunk design ratio is 7.6x | **3x** loader-shaped. 7.6x holds the PLT stub out |
 | A 19-24 ns PLT-stub effect | Re-measured at 10.7 ns and inside an unexplained bimodality. Observation kept, figure dropped |
+| `omni-platform` had 11 tests before phase 3a (commit `21b712d`'s message) | **7** — two in `vm::windows`, five in `fault::windows`. The 16 after was counted; the 11 before was remembered. Recorded in D22 rather than left in a commit message, because it is the shortest possible example of how a wrong number gets in |
 
 **One open question, recorded not resolved:** an entry-and-exit measures ~41 ns, yet a per-call exit
 *is* one entry and one exit and measures 81-103 ns. A bimodal entry path was directly observed during
@@ -468,6 +525,12 @@ These are in the M3 plan as Global Constraints. The three worth knowing before w
 3. **A figure enters `DECISIONS.md` only after someone other than its author reproduces it.** That rule
    has caught a wrong number four times, most clearly when the wrong version was the one that closed
    an open question.
+4. **The whole-workspace suite runs `--release` and the mutation harness runs `debug`, and the
+   difference is load-bearing.** Arithmetic overflow panics in debug and wraps in release, so an
+   overflow reachable from guest input can pass `cargo test --workspace --release` — including the
+   test written for it, if the wrapped value still satisfies the assertion. That is exactly what
+   happened to `gmtime(i64::MIN)` in phase 3a (D22). When a new module does arithmetic on a
+   guest-supplied number, run its tests in **both** profiles.
 
 ---
 

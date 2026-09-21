@@ -1820,3 +1820,292 @@ harness is the only thing that found it.
 are cheap to turn into implementations when the surface exists. The one expensive thing to get wrong
 is `FILE_BYTES`, and it is expensive only from the phase that first interprets a `FILE` — which is
 why the obligation is recorded in the constant rather than in a report.
+
+---
+
+## D22 — Phase 3a: `omni-platform` grows past `vm` and `fault`, and `AT_HWCAP` stays open on purpose
+
+D20 is the adapter, D21 is phase 2. This is phase 3a of M3 task 3, and it is the first time
+`omni-platform` has gained a module since it was written. The shape established here is the one
+phases 3b (files), 3c (sockets) and 3d (thread lifecycle) copy, so the shape is the decision.
+
+### What is bound now
+
+| | count | what |
+|---|---|---|
+| serviced inside the run loop | **111** | phase 2's 88, plus all 23 of phase 3a |
+| serviced on the exit path | **8** | unchanged: nothing in this phase calls guest code or touches `GuestSpace` |
+| `STT_OBJECT` data objects | **18** | unchanged |
+| **of the 188 reachable imports** | **137** | 119 thunk functions and the 18 data objects |
+| left `Unbound` | **51** | files and directories (3b), sockets and polling (3c), thread lifecycle (3d), and `mallinfo` and the two `__gcov_*`, which belong to no group |
+
+The 23: five clocks (`clock_gettime`, `gettimeofday`, `gmtime_r`, `nanosleep`, `usleep`), fourteen
+process-and-environment (`getpid`, `sched_getcpu`, `arc4random_buf`, `getauxval`, `getenv`,
+`__system_property_get`, `abort`, `__stack_chk_fail`, `_exit`, `android_set_abort_message`,
+`sysconf`, `sysinfo`, `prctl`, `syscall`), four logging (`__android_log_print`, `syslog`, `openlog`,
+`closelog`).
+
+`the_bound_count_is_exactly_what_this_phase_claims` now asserts **membership** as well as totals —
+all 23 named one by one, plus a complement check that eight symbols belonging to 3b/3c/3d are still
+`Unbound`. D21 records why: a count cannot see a substitution, and this project has had a list whose
+count stayed right while two members were wrong and two were missing.
+
+### `AT_HWCAP` IS STILL OPEN, and the code is built so it cannot be closed by accident
+
+The LSE question is unresolved and both arms are measured: advertising `HWCAP_ATOMICS` gives **53
+hard interpreter halts**; declining gives **106 fallback arms** into a global spinlock that
+**anti-scales 21x**. `getauxval(AT_HWCAP)` is where the answer would be delivered.
+
+`bionic::HwcapPolicy` has three values — `Undecided`, `Advertise { hwcap, hwcap2 }`, `Decline` — and
+**no `Default` implementation**. An instance starts `Undecided`, spelled out at the construction
+site rather than reached by a derive, and under it `getauxval(AT_HWCAP)` and `getauxval(AT_HWCAP2)`
+**refuse by name, with both measurements in the refusal text**. A host that has made the decision
+calls `Bionic::set_hwcap_policy`, and the fact that it had to call something is the point.
+
+**Defaulting to `Decline` was considered and rejected**, and the reasoning is the part worth keeping.
+It reads as the safe arm, because declining a feature cannot halt the interpreter. It is also the
+arm that costs 21x on a machine with cores — so whoever ran the engine next would measure it, report
+"the runtime is slow", and nothing anywhere would say that a decision had been made. A refusal
+naming both arms cannot be mistaken for anything. `Decline` and `Undecided` are deliberately
+distinct values of the same type, and `declining_and_being_undecided_are_not_the_same_value` asserts
+it; a type in which they were the same could not refuse.
+
+Mutation row `procenv-A1` is that failure injected directly — the default changed to `Decline` — and
+it is caught.
+
+### The shape the later phases copy: not every primitive needs a `cfg`
+
+`omni-platform` gains `clock`, `process` and `log`. The five-target rule says a new platform
+primitive gets its Linux and macOS signatures at the same time, as honest `Unsupported` returns
+naming the POSIX call they intend to make. **That applies to two of the new primitives and not to
+the other five**, and saying which is part of the decision:
+
+| primitive | how | Linux / macOS |
+|---|---|---|
+| `clock::monotonic_now`, `realtime_now`, `sleep` | `Instant`, `SystemTime`, `thread::sleep` | **implemented** — portable `std`, no backend |
+| `process::pid`, `cpu_count` | `std::process::id`, `available_parallelism` | **implemented** — portable `std`, no backend |
+| `log::emit`, `format_line`, the priority scales | `std::io::stderr` | **implemented** — portable `std`, no backend |
+| `process::random_bytes` | `BCryptGenRandom` on Windows | **`Unsupported`**, naming `getrandom(2)` / `arc4random_buf(3)` |
+| `process::current_cpu` | `GetCurrentProcessorNumber` on Windows | **`Unsupported`**, naming `sched_getcpu(3)` |
+
+`vm` and `fault` are OS APIs end to end, which is why both have a structural unix half. The five
+portable entries call no OS API at all. **A fabricated `Unsupported` for something `std` already
+does correctly on all five targets would be a false claim in the other direction** — it would assert
+that a clock this process can read cannot be read, and it would make the non-Windows bring-up harder
+rather than easier. The rule is *never claim a platform works*; `std` working on Linux is not a
+claim of ours. `omni-cpu`'s `CNTPCT_EL0` (D5 amendment 4) is already built on exactly this.
+
+What stays unclaimed is what has been **run**, which is Windows x86-64 only. `process/linux.rs` and
+`process/macos.rs` exist now and are separate files rather than one shared body, because the two
+implementations genuinely differ in shape: `getrandom` can block and return short and needs a loop,
+`arc4random_buf` cannot fail and cannot return short — and **macOS has no `sched_getcpu` and no
+supported equivalent**, so that symbol is expected to stay a refusal there permanently. That is a
+real, permanent difference between the two unix targets and it is written where it will be read.
+
+### Recorded and not worked around: Windows' sleep granularity is guest-visible
+
+`std::thread::sleep` on Windows is bound by the scheduler's ~15.6 ms timer tick, so a guest
+`usleep(1000)` sleeps for something closer to 15 ms than to 1 ms. D5 (amendment 4) already records
+the same number from the other side — its interval measurement busy-waits "because Windows' sleep
+granularity is ~15 ms". Raising it needs either `timeBeginPeriod`, which is process-wide and raises
+power draw for every thread, or a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` timer per sleeping thread.
+Neither is free, neither has been measured, and the choice belongs to whoever first has a guest that
+cares. `clock::sleep` therefore guarantees only what `nanosleep` guarantees: **at least** the
+requested duration, with no bound in the other direction.
+
+### `abort` and `_exit` are reported, never performed
+
+Two new `AbiError` variants: `GuestAborted { symbol, address, why, message }` and
+`GuestExited { symbol, address, status }`. `abort` and `__stack_chk_fail` produce the first,
+`_exit` the second.
+
+**A host `abort()` cannot be contained by any caller**, and hosting several isolated guest instances
+in one process is non-negotiable — one instance's `abort` must not take the other two with it, or
+the host, or the test runner. Reporting it as a value leaves the embedder every option an
+`abort()` removes: log it, restart the instance, turn it into its own exit.
+
+`_exit` is an `Err` rather than a successful `ExitReason` for a narrower reason: every caller of
+`Boundary::run` treats `Ok` as "the guest returned and may be resumed", and a guest that has called
+`_exit` may not be. Making that a type-level difference rather than a flag is the same reasoning D18
+applies to re-entrancy.
+
+`android_set_abort_message` is captured per instance and travels with the abort, because that string
+is where bionic's crash reporter gets the only human-readable account of why a process died.
+
+A test cannot assert "the host did not abort" — there would be nothing left to assert it with — so
+`abort_and_exit_become_typed_outcomes_rather_than_ending_the_host` asserts the shape that makes
+aborting impossible: a value, with the reason in it. Rows `procenv-A7`/`A8`/`A9` inject the three
+ways to lose it.
+
+### `sysconf` refuses two names it could answer, and that is the interesting refusal
+
+Four symbols are bound and **refuse by name**: `sysconf`, `sysinfo`, `prctl`, `syscall`. Three of
+them refuse because answering means modelling something that is not here — a `struct sysinfo`'s
+uptime and free memory, a `prctl` option's effect, a raw syscall's contract, each with a believable
+wrong answer sitting next to it (a zeroed struct, a `0`, a `-1`/`ENOSYS` that callers route around).
+
+`sysconf` is different. Two of its names — the page size and the processor count — are things this
+layer knows, and it still refuses. **Bionic's `_SC_*` numbering is bionic's own**: it is not glibc's,
+and `_SC_PAGESIZE` and `_SC_PAGE_SIZE` are two different values there rather than one macro. There
+is no NDK on this machine. A constant derived from memory has exactly the wrong failure mode here:
+if it is wrong, the real page-size query arrives as an unmodelled number and is refused **loudly**,
+while some other `_SC_` name silently receives a page size. One half of that is safe and the other
+is the plausible-wrong-answer class.
+
+The refusal names the value it was given and what that value is *believed* to be, flagged
+`UNVERIFIED` — diagnostic without being load-bearing, because nothing branches on it. **Confirming
+four constants against a real header turns this into four lines**, and the cheapest way to learn
+which names the engine actually passes is to disassemble its `sysconf` call sites, or simply to run
+task 4 and read the refusals.
+
+The `AT_*` values are the opposite case and are answered: they are Linux UAPI
+(`include/uapi/linux/auxvec.h`), the same source `omni-bionic`'s errno numbers come from, stable
+across every architecture. So are the `clockid_t` values, the `prctl` option numbers and the arm64
+syscall numbers used in the refusal messages.
+
+### The environment and the property table are empty facts, and the host's own is unreachable
+
+`getenv` answers `NULL` and `__system_property_get` answers 0 with an empty string, because this
+guest process was started with no environment and no Android property service. That is the same fact
+`environ` already states as one of the eighteen data objects (D21: it points at a vector of one
+null), and it is a fact rather than a stub.
+
+Both are host-settable — `Bionic::set_env`, `Bionic::set_system_property` — so that "empty" is a
+configuration rather than an absence and the path that *finds* a value is exercised rather than dead.
+A value longer than `PROP_VALUE_MAX` (92, the published Android constant) is refused **when the host
+sets it** rather than truncated when the guest reads it, because the guest sizes its own buffer from
+that constant.
+
+**`omni-platform`'s process seam has no `host_environment()`, deliberately.** Handing the guest the
+variables this process was started with would be a wrong answer — a desktop shell's environment is
+not an Android app's — and an information leak of everything in it, credentials included.
+`getenv_answers_null_until_the_host_gives_the_guest_a_variable` asks for `PATH` first, precisely
+because a `getenv` that reached the host would answer it.
+
+### Logging is the one group that must not refuse
+
+Everything else in this phase that cannot be modelled refuses by name. The four log symbols are
+serviced, and the asymmetry is the decision: a log call has **no return value the guest acts on**
+(`syslog` returns `void`, `__android_log_print`'s byte count is universally ignored), so there is no
+believable wrong answer available to give. What there is instead is the engine's own account of what
+it is doing, arriving in order, during the run of 3,594 initializers this milestone has to get
+through. Refusing `__android_log_print` would halt the run at the first thing the engine wanted to
+report.
+
+Formatting goes through the **real `printf` engine** — `format::render` became `pub(super)` rather
+than being duplicated — because a line reading `%s at %p` with its arguments dropped is worse than no
+line, and because a second copy of the AAPCS64 variadic walk is two places for those rules to drift.
+
+Every record goes to a per-instance bounded ring as well as to stderr. The ring is the
+recording-mock shape this project's working agreements prefer to an output-capture assertion, and it
+is bounded because how much the engine logs has not been measured and an unbounded one is a host
+allocation a guest can drive in a loop. `LOG_CAPTURE_MAX` is 256, records past it are dropped
+oldest-first, and `Bionic::log_dropped` says how many — so a wrap is visible rather than silent.
+
+A priority outside `android_LogPriority` is a refusal naming the value rather than a mapping to its
+nearest neighbour: it is the one argument of these four with a wrong answer available, and a guest
+passing 42 has either a miscompiled call or a corrupted stack.
+
+### `gmtime_r` is in the pure crate, and the algorithm choice is about hostile input
+
+`gmtime` is UTC by definition, so it needs no timezone database, no `TZ` and no host locale; and it
+is handed a `time_t` rather than reading one, so it needs no clock. What is left is integer
+arithmetic, which belongs in `omni-bionic` — `cargo tree -p omni-bionic -e normal` is still one line
+(D19).
+
+`civil_from_days` (Hinnant; the derivation C++20's `<chrono>` is specified against) rather than a
+loop from 1970, **and the reason is hostile input rather than elegance**: a year-stepping loop turns
+`gmtime_r(INT64_MAX)` into a hundred-billion-iteration spin inside a thunk handler. This version is
+branch-free over the whole `i64` range.
+
+A year that will not fit `int tm_year` is `NULL` with `EOVERFLOW`, which is C's own answer.
+Wrapping would produce a *date*: plausible, printable, and wrong by billions of years.
+
+`TM_BYTES = 56` and its field offsets are derived from bionic's `<time.h>` field by field and are
+**not verified against an NDK** — the same provenance `layouts.rs` and `FILE_BYTES` record, stated
+the same way. Unlike the `pthread_*` sizes this one has an independent check available: every field
+is an `int` except the last two, so the layout is forced by the C rules once the field *order* is
+right, and the order is POSIX plus two BSD extensions bionic inherits.
+
+### Two defects found by running the harness, one of them in the harness
+
+**1. `gmtime(i64::MIN)` overflowed.** The time of day was `timestamp - days * SECONDS_PER_DAY`, and
+for timestamps near `i64::MIN` the floor pushes that product past `i64::MIN`: a **panic in a debug
+build**, a silent **wrap in a release build**. `time_t` is a number the guest chooses, so this is a
+panic reachable from guest input, which Global Constraint 11 calls Critical. `rem_euclid` gives the
+same value and cannot overflow.
+
+The suite could not see it. `cargo test --workspace --release` wraps rather than panicking, and the
+wrapped value still produced the `YearOutOfRange` the test asserted — so the test passed for the
+wrong reason. It appeared the first time the mutation harness, which builds **debug**, ran the
+module. `no_timestamp_at_all_can_make_this_panic_or_wrap` enumerates the boundaries rather than
+sampling them, because the overflow is a property of the multiplication and not of any date.
+
+**2. The harness reported 8/8 rows caught while its command was already failing.** A command that
+does not pass on the unmutated tree reports every row using it as `caught`, because "the suite
+failed" is the whole of what caught means. Those eight results were worth nothing until the defect
+above was fixed. `mutate.py` now runs each distinct command once on the pristine tree before
+mutating anything and refuses if any fails, naming the tests — one run per command, not per row.
+
+**3. Six new rows collided with existing ids**, and nothing checked. `plat-A1`..`plat-A4` already
+belonged to the fault handler. A full run still touched every row so the totals stayed right, which
+is the count-cannot-see-a-substitution failure again, this time in the harness that exists to catch
+it. The six are `seam-*` now and `mutate.py` refuses to run when two rows share an id.
+
+### Hostile input
+
+`nanosleep` and `usleep` are capped at `MAX_SLEEP_SECONDS` (60) and **refuse** past it. A sleeping
+thread executes no guest instructions, so D16's runaway-guest defence — which is built from short
+step budgets — cannot end one, and `nanosleep({INT64_MAX, 0})` is a permanent hang of the host
+thread that serviced it. A cap and not a clamp: clamping would return success from a call that slept
+for a minute when it was asked for a year.
+
+The decision is a predicate, `clocks::capped`, with a unit test, **because the end-to-end form of
+that test cannot fail safely**: a version that did not refuse would sleep for the `i64::MAX` seconds
+the test asked for and hang the harness rather than fail it, which is the failure mode `mutate.py`'s
+own docstring records from M3 task 2. Row `clocks-A5` is scoped to a library-only command for the
+same reason.
+
+`usleep` reads only the low 32 bits of `X0`, because `useconds_t` is `unsigned int` and AAPCS64 does
+not require a caller to clear the high half. Reading all 64 would turn an ordinary 100 µs sleep into
+a request for 584,000 years.
+
+`arc4random_buf` validates the **whole** destination before generating a byte, and generates
+host-side in 4 KiB chunks rather than in one allocation the guest chose the size of. Without the
+first, a destination writable for its first page and not its second would receive real entropy in
+that page behind a reported failure, and the caller would have no way to know which half it got.
+
+37 hostile argument shapes across the group, in
+`hostile_arguments_to_the_clock_and_process_group_are_typed_errors_and_not_panics`. Every one either
+completes with a defined `0`/`-1`/`NULL` or refuses by name.
+
+### A wrong number in this phase's own record, corrected
+
+The commit message for `21b712d` says "16 tests pass in `omni-platform` (was 11)". **`was 11` is
+wrong: it was 7** — two in `vm::windows` and five in `fault::windows` — so the nine new tests took
+it from 7 to 16, not from 11 to 16. The 16 was counted; the 11 was remembered, and this project's
+own rule is that a remembered figure is not a figure. Recorded here rather than left in a commit
+message nobody re-reads, because that is the seventh wrong number in this record and the shortest
+possible example of how they get in.
+
+### Verification
+
+* `cargo test --workspace --release`: **1,004 passed, 0 failed, 12 ignored**, from 959. The 45 new
+  tests are 9 in `omni-platform`'s lib (7 → 16), 10 in `omni-bionic`'s new `time` module, 10 in
+  `omni-android`'s lib (81 → 91) and 16 in `omni-android`'s `bionic` target (60 → 76).
+* `tools/mutate.py`: **175 → 212 rows**, 37 new — 29 direction A and 8 direction B — and a **full
+  run of the whole table is 212/212 caught**, with `pre-flight: 11/11 commands pass on the
+  unmutated tree`.
+* Clippy clean on `--all-targets`, `cargo doc` clean, `cargo build --workspace --release
+  --no-default-features` builds.
+* `cargo tree -p omni-bionic -e normal` is still one line (D19), and `cargo tree -p omni-android -e
+  normal` still has no `dynarmic-sys` — so moving `omni-platform` from a dev-dependency to an
+  ordinary one did not touch that guarantee.
+* The portability invariant is re-verified: every `cfg(target_os)` mention outside `omni-platform`
+  is still a doc comment stating the rule, not an escape from it.
+
+**Nothing here is a claim about Linux or macOS.** Neither has been built for, let alone run.
+
+**Cost if wrong.** The refusals are cheap to turn into implementations once the surface exists. The
+`_SC_*` constants are four lines behind one header. The expensive one to get wrong is `AT_HWCAP`,
+and it is not decided here.

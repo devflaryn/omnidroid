@@ -1,5 +1,8 @@
-//! Process and environment: fourteen symbols, of which four are answers, four are facts about a
-//! process that was given nothing, two are terminations, and four are refusals by name.
+//! Process and environment: fourteen symbols. Four are answers (`getpid`, `sched_getcpu`,
+//! `arc4random_buf`, `getauxval`), two are facts about a process that was given nothing (`getenv`,
+//! `__system_property_get`), three are terminations (`abort`, `__stack_chk_fail`, `_exit`) with a
+//! fourth capturing the message that explains one (`android_set_abort_message`), and four refuse by
+//! name (`sysconf`, `sysinfo`, `prctl`, `syscall`). 4 + 2 + 3 + 1 + 4 = 14.
 //!
 //! # `AT_HWCAP` IS AN OPEN DECISION AND THIS MODULE DOES NOT MAKE IT
 //!
