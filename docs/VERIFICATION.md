@@ -5,6 +5,9 @@ because each one produced a **green suite that proved less than it claimed**, an
 person who wrote the test was the person who wrote the code — which is the blind spot that makes all
 of them possible.
 
+There are **twelve** of them. Entry 12 arrived in M5 and is the only one found by a test that could
+not be written rather than by one that passed.
+
 Read this before writing a test you intend to rely on, and before believing a number.
 
 ---
@@ -81,9 +84,18 @@ was seen three times — twice as a red run, and **once inflating the catch list
 So a flake does not merely cost a red run: **it can make a mutation row look detected when nothing
 detected it.**
 
-> Timing-dependent tests get made structural — a recording mock, or an asserted relation between two
-> constants — not given a bigger sleep. Four flakes in this layer were fixed this way; the fifth was
-> found by the harness refusing to run.
+A sixth flake, from M5, has a different cause and the same remedy: **a quantised clock**.
+`clock_is_process_cpu_time_in_microseconds_rather_than_wall_time` asserted that three million guest
+instructions moved the process CPU clock, and it failed once in a whole-workspace run —
+**MEASURED: `1843750 -> 1843750`**. Windows charges process CPU in 15.625 ms scheduler ticks, and
+that figure is exactly 118 of them; three million guest instructions do not reliably cross a tick
+boundary. So the assertion was really *this pass happened to straddle a tick*. It now repeats the
+work until the clock moves, under a wall-clock deadline.
+
+> Timing-dependent tests get made structural — a recording mock, an asserted relation between two
+> constants, or a bounded poll on the thing under test — not given a bigger sleep. Four flakes in
+> this layer were fixed this way; the fifth was found by the harness refusing to run; the sixth was
+> a clock whose resolution was coarser than the thing being measured.
 
 ## 7. Never use a second implementation as your oracle
 
@@ -113,6 +125,11 @@ is safe **only because nothing validates against bionic's exact sequence**.
 Also found: **six rows silently staled** when a large feature moved the code they anchored on, and
 **an id collision** (`plat-A1`..`A4` reused) whose totals still looked right — entry 1, inside the
 tool built to catch entry 1. The harness now refuses duplicate ids.
+
+**The staling recurred in M5**, which is why the rule below is in the imperative: rewriting `poll`
+and `select` to answer from a real readiness source staled **four** `net-*` rows, and `--only pipe`
+and `--only looper` were both green while it was true. The whole-table *pre-flight* — every pattern
+matched, nothing run — costs a second and is what found them.
 
 > Run the **whole table**, not just the rows you added. Both harness defects were found that way and
 > neither would have surfaced otherwise. And a total that does not add up — `297/298 caught, 0 NOT
@@ -164,6 +181,26 @@ so a lost wake always *eventually* healed and every assertion about tokens and c
 suite exercised the wake path thoroughly and never detected that the wake did not happen.
 
 The detector had to assert on **latency and on the flag word**, not on the final count.
+
+## 12. A branch no input can take is not a check
+
+`ALooper_release` guarded on `references < 0` and refused, with a paragraph explaining why
+saturating would be worse. **The guard was unreachable.** The count starts at one, the slot is
+freed the moment it reaches zero, so nothing can ever observe it below — the refusal that does the
+work is the identity check one line earlier, which reports the slot as not live.
+
+It was found by writing the test *for the guard*, which could not construct an input that reached
+it. Nothing else would have: the branch compiles, reads as careful, and every suite around it was
+green. A reviewer scanning for missing checks would have counted it as present.
+
+The same shape is worth watching for wherever a defensive branch sits **after** something that
+already makes its condition impossible — a bound checked twice, a null tested after a
+dereference, a state guarded after the state machine has left it.
+
+> Delete an unreachable guard rather than keeping it as reassurance. If it is worth keeping as a
+> statement, make it a `debug_assert!` — which says *this cannot happen* — not an `if` that says
+> *this might*. And when a test for a check cannot be written, ask whether the check can fire
+> before assuming the test is hard.
 
 ---
 

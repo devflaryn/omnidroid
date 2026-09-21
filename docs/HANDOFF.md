@@ -25,7 +25,7 @@ adapter review were exactly that.
 |---|---|---|
 | 1-5 | M0-M3 | **done** — ending with all 3,594 initializers |
 | 6-12 | M4 | **done** — `JNI_OnLoad` returns `0x00010006` on the real engine; 19 of 21 scripted downcalls |
-| **13** | **M5 — next** | `initializeNativeCode`. Its brief is the "M4 is reached" section below |
+| **13** | **M5 — in progress** | `initializeNativeCode`. Plan: `docs/plans/gameactivity-plan.md`. Tasks 1 (`pipe`/`fcntl`/`write`) and 2 (`ALooper` + the two instruments) are **done and mutation-verified**; 3, 4 and 5 are not started |
 | 14-20 | M5 | the game thread, `ANativeWindow`, the GameActivity callbacks |
 | 21-24 | M5/M6 | the flags/settings orchestration — **§8.1 says this is the step most likely to be mistaken for "the engine is broken"**, because it hangs rather than errors |
 | 25 | M6 | EGL then Vulkan via `dlopen` |
@@ -878,16 +878,73 @@ Read in this order:
 7. **`.superpowers/sdd/android-abi-plan/task-1-report.md`** and **`task-1-review.md`** — only if Task
    2 needs the measurement detail behind D17.
 
-**First concrete action: M5 — §8 step 13, `initializeNativeCode`.** M3 and M4 are both reached;
-"M4 is reached" above has what step 13 needs that does not exist (`ALooper`, `AAssetManager`,
-`ANativeWindow`, `pipe`, `fcntl`), the two scripted downcalls M4 did not get to return, and the
-two host-side facts a new harness has to reproduce. Read D28 and its amendment first, then
-`jni-surface.md` §5.2 — `initializeNativeCode`'s fourteen steps are written out there instruction
-by instruction — and §8.1's failure modes 4 and 5, which are the two that fail *silently*.
+**First concrete action: M5 tasks 3, 4 and 5 — see `docs/plans/gameactivity-plan.md`.** Tasks 1
+and 2 of that plan are **done and mutation-verified**; what remains before
+`initializeNativeCode` can be called is `AAssetManager` + a Java `AssetManager`,
+`AConfiguration`, `ANativeWindow` as a type, `__system_property_get("ro.build.version.sdk")` set
+by the host, and the gate itself. Read D28 and its amendment first, then `jni-surface.md` §5.2 —
+`initializeNativeCode`'s fourteen steps are written out there instruction by instruction — and
+§8.1's failure modes 4 and 5, both of which now have an instrument pointed at them.
 
-**Also owed:** the whole mutation table has not been run since M4 and the texture work landed.
-336 rows; M4's own seventeen are 17/17 under `--only jni`, and the whole table's **pre-flight**
-passes (336 distinct ids, every pattern matching exactly once).
+## M5 in progress — what tasks 1 and 2 delivered
+
+Plan: `docs/plans/gameactivity-plan.md`, which is the M5 spec and carries `android-abi-plan.md`'s
+Global Constraints forward unchanged.
+
+**Task 1 — `pipe`, `fcntl`, `write`, and the end of the closed descriptor space.** `omni-platform`
+grew a fourth descriptor kind: a pipe is a `VecDeque<u8>`, a reader count, a writer count and a
+condition variable, with **no OS call on either side of it** — so no fabricated `unsupported` arm
+for Linux or macOS (D22's other half). That is the **fourth phase running** whose OS-surface
+prediction was too high.
+
+`the_descriptor_space_poll_answers_over_is_closed` **failed, exactly as D25 designed it to**, and
+the symbol turned out to be `pipe` rather than `socket`. It was **replaced, not updated**:
+`poll` and `select` now answer from `Filesystem::readiness`, a `match` over the descriptor kinds
+with no default arm, and the successor test asserts that the descriptor-producing symbols bound
+here are exactly those whose readiness has been decided.
+
+Three symbols bound, all outside the 188 and all found by **decoding the guest's instructions**
+rather than by watching a run reach them: `pipe` and `fcntl` from §5.2's constructor, `write` from
+the glue's one-byte `APP_CMD` messages. `BEYOND_THE_PREDICTION` is **eleven** now.
+
+A blocking `read` on an empty pipe used to answer `EAGAIN` — the plausible wrong answer, told to a
+descriptor that never asked to be non-blocking. The adapter owns the wait now, bounded by
+`MAX_SLEEP_SECONDS` exactly as `poll`, `select` and `nanosleep` are, and **the readiness
+generation is read before each attempt**, not after it failed: the other order is the 1.0104 s
+lost wakeup of `VERIFICATION.md` entry 11.
+
+**Task 2 — `ALooper`, and the two instruments §8.1 asks for.** `crates/omni-android/src/ndk/` is
+new: a third instance beside `Bionic` and `Jni` with its own activation, because an `ImportFn` has
+no user data and a process-wide static would give three concurrent guests one looper registry.
+What it borrows it borrows explicitly — `pollOnce` asks the *bionic* activation for the descriptor
+table, because a looper polls descriptors.
+
+| §8.1 failure mode | the instrument |
+|---|---|
+| **4** — `ALooper_forThread()` null makes step 13 return `0` *silently* | `Ndk::prepare_looper` is a **host** API, so a gate asserts a looper exists **before** the call instead of reading a `jlong` of 0 back afterwards. `ALooper_forThread` answers null when there is none, which is the real answer the engine branches on |
+| **5** — a cond-wait deadlock is indistinguishable from a hang | `Bionic::parked()`: every guest thread blocked in `pthread_cond_wait`, with the cond, the mutex, the thread and how long. Maintained by an RAII guard, so no exit path can leave a stale entry. `Bionic::parked_peak()` is a **watch** and is labelled one. Plus the `Ndk` event log: every looper operation, by thread, with what it decided |
+
+Decisions in the looper, each with the believable wrong answer it declines: `ALOOPER_POLL_WAKE` is
+**never** returned (there is no `wake` among the seven imported symbols); an **indefinite**
+`pollOnce` is refused by name with `poll(fds, n, -1)`'s argument, and the refusal says what would
+change it — a host-driven event source, which M6 needs anyway; a registration with a callback
+stores `ALOOPER_POLL_CALLBACK` as its ident, as AOSP does, because §5.2 passes `ident = 0` *and* a
+callback; idents are reported before callbacks run, which is the order `android_app_entry` and
+`GameLoop` depend on.
+
+**Two things the tests found in the code that wrote them.** A `references < 0` guard in
+`ALooper_release` that **no input could reach** — the count starts at one and the slot is freed at
+zero — deleted rather than kept as a branch nothing can take. And a real flake in
+`clock_is_process_cpu_time_...`, MEASURED at `1843750 -> 1843750`: Windows charges process CPU in
+15.625 ms ticks, that figure is exactly 118 of them, and three million guest instructions do not
+reliably cross one. Made structural per entry 6, not given a bigger number.
+
+**Verification for M5 so far.** Mutation **336 → 361 rows**: `--only pipe` 12/12, `--only looper`
+11/11, `--only park` 2/2, and `--only net` 19/19 after four rows were re-anchored. The whole-table
+pre-flight passes (361 distinct ids, every pattern matching exactly once) — and **it is what found
+the four staled rows**, which `--only` could not have.
+
+**Still owed:** the whole mutation table has not been *run* since M4 and the texture work landed.
 
 Task 2's review package and dispatch instructions, which were the previous first action, are kept
 in `task-2-review.md`; nothing above depends on them any more.
