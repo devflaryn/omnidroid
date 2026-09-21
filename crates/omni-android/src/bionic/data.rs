@@ -82,8 +82,13 @@ use super::Bionic;
 ///
 /// **Why an error here cannot be silent, which is the only reason it is acceptable to state a
 /// derived number.** A `FILE`'s contents are opaque: every function that would interpret them is
-/// `Unbound` or refuses by name (`fprintf`, `vfprintf`, `fclose`, `fread`, `fwrite`, `fopen` —
-/// none is implemented, and `fprintf` refuses while *naming the guest `FILE *` it was handed*).
+/// `Unbound` or refuses by name.
+///
+/// **That sentence used to name `fclose`, `fread`, `fwrite` and `fopen` as "none is implemented".
+/// Phase 3b implemented all four**, so the evidence given here was stale for a whole phase while
+/// the conclusion stayed true for a *different* reason — the stronger one `bionic/stdio.rs` states:
+/// a `FILE *` is a **key into a host-side table**, its bytes are written once to zero and never
+/// read, so a wrong size yields a wrong *address* that refuses by name rather than a wrong answer.
 /// So the only thing a wrong stride can make wrong is the arithmetic `stdout == &__sF[1]`, and
 /// that arithmetic is wrong **consistently**: this module places `stdout` at `__sF + FILE_BYTES`
 /// using the same number guest code would use, so the two agree with each other whatever the real

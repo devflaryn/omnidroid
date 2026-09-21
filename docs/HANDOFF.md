@@ -478,6 +478,46 @@ The implementer reported these against its own work; they were the highest-value
 Round trip re-measured after the mechanism changed: **26.7-31.0 ns against 81-101 ns**
 (n=31/cell/process, 45 processes). D17's 3x holds; its bimodality open question is untouched.
 
+## The adapter review — findings still open
+
+Phases 1/2/3a/3b had their **numbers** verified (counts, mutation totals, derivations all reproduce)
+but had never had an adversarial code read. That review ran 2026-09-21; full text in
+`.superpowers/sdd/android-abi-plan/task-3-review.md` (**git-ignored scratch — this table is the
+durable copy**).
+
+Its shape is worth knowing: **the implementations were largely sound; the evidence for them was
+weaker than the records claimed.** Fourteen statements in D20-D23 were false or overstated.
+
+**Closed:**
+
+| | |
+|---|---|
+| **H1** — confinement rules 5 and 6 had never executed here | Fixed `b75ff45`. The test early-returned because this host cannot create a symlink (**MEASURED: `WinError 1314`**). It now falls back to a directory junction and **fails loudly rather than skipping**; rows `fs-A7`/`fs-A8` added, both caught |
+| **H2** — the `gmtime` regression test asserted nothing for six of its ten inputs | Fixed `b75ff45`. Its `Err` arm was empty. No assertion *could* catch the wrap — in release it is correct by accident — so the detector is row `time-A7`, run in debug |
+| **M2** — the arena test asserted its own definition | Fixed by phase 3c: replaced with one that walks the bases out of the accessors, verified as a detector |
+
+**Open, none a blocker for Task 4:**
+
+| | |
+|---|---|
+| **M1** | `read`/`pread`/`__write_chk` consume from the descriptor **before** validating the guest destination, so a half-mapped buffer keeps some bytes behind a reported failure. D22 got this right for `arc4random_buf` and wrote the rule down; phase 3b did not carry it across |
+| **M3** | The log ring bounds **record count, not bytes**. 256 records × a ~1 MiB message ≈ 0.8 GiB per instance with `log_dropped()` still reporting 0 |
+| **M4** | `__android_log_print` refuses on at least **eight** guest-reachable paths, six undiscussed — a >1 MiB `%s` aborts the whole run, the exact outcome its module header says it exists to prevent. Real `liblog` truncates |
+| **M5** | A `fopen` mode string over 16 bytes is **silently truncated** where the code's own doc says `EINVAL`, so `"rbbbbbbbbbbbbbb+"` loses its `+` and yields a read-only stream |
+| **M6** | `WINDOWS_DEVICES` omits `COM0`/`LPT0` and the superscript `COM¹/²/³` forms. **No exploit constructible today** — the canonicalised root is a verbatim `\?\` path — but `path.rs` claims the rules are host-independent, and this one now is not |
+| **M7** | `process::cpu_count` answers `1` on failure, the substitute-an-answer pattern `random_bytes` forbids eleven lines below. Unreachable from any guest path today |
+| **L1-L7, N1-N3** | `__system_property_get`'s 0 indistinguishable from unconfigured; a hostile-test predicate that admits any fabricated success; `write_tm`'s atomicity documented as asserted in a suite that cannot reach it; `gmtime_r`/`nanosleep` errnos set but never asserted; `fgets` one host `read(2)` per byte; `openlog`'s facility dropped; `fclose` does not flush `stdout` |
+
+**Five of the fourteen false claims are corrected** (`branch-free` → loop-free in two places, the
+`linux.rs`/`macos.rs` "differ in shape" that are identical re-exports, the duplicated `EOVERFLOW`,
+and `data.rs`'s "none is implemented" naming four functions phase 3b implemented). The rest are
+recorded in the review file.
+
+**The lesson worth carrying.** Both High findings were *tests written as the fix for a previously
+found defect* — the place nobody re-audits, because a test that closed a bug is assumed to work.
+And one flaky test was found **inflating a `wcslen` mutation's catch list**, which means a flake does
+not only cost a red run: it can make a row look detected when nothing detected it.
+
 ## Blockers and risks
 
 | Risk | State |

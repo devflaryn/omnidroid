@@ -103,9 +103,11 @@ const PAIR_BYTES: usize = 16;
 
 /// `EOVERFLOW`, the code `gmtime_r` reports when the year will not fit `int tm_year`.
 ///
-/// Linux UAPI value (75), spelled here rather than added to `omni-bionic`'s errno table: that
-/// table carries only the codes that crate's own functions produce, and this one is the adapter's.
-const EOVERFLOW: i32 = 75;
+/// Linux UAPI value (75). **Aliased to `omni-bionic`'s table rather than repeated.** It was spelled
+/// out here on the argument that the table "carries only the codes that crate's own functions
+/// produce" — phase 3b's file-io group put `EOVERFLOW` in that table and invalidated it, leaving two
+/// sources of truth for one guest-ABI number. They agreed; that is luck, not a design.
+const EOVERFLOW: i32 = omni_bionic::errno::consts::EOVERFLOW;
 
 /// The symbolic name of a `clockid_t` this layer knows about, for a refusal that has to say what
 /// was asked for.

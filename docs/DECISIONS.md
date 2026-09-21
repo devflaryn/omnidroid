@@ -1896,9 +1896,10 @@ rather than easier. The rule is *never claim a platform works*; `std` working on
 claim of ours. `omni-cpu`'s `CNTPCT_EL0` (D5 amendment 4) is already built on exactly this.
 
 What stays unclaimed is what has been **run**, which is Windows x86-64 only. `process/linux.rs` and
-`process/macos.rs` exist now and are separate files rather than one shared body, because the two
-implementations genuinely differ in shape: `getrandom` can block and return short and needs a loop,
-`arc4random_buf` cannot fail and cannot return short — and **macOS has no `sched_getcpu` and no
+`process/macos.rs` exist now as separate files, **though as written they are identical one-line
+re-exports of `super::unix` and do not differ at all** — a review checked. They are separate because
+the two implementations *will* differ once written: `getrandom` can block and return short and needs
+a loop, `arc4random_buf` cannot fail and cannot return short — and **macOS has no `sched_getcpu` and no
 supported equivalent**, so that symbol is expected to stay a refusal there permanently. That is a
 real, permanent difference between the two unix targets and it is written where it will be read.
 
@@ -2016,7 +2017,9 @@ arithmetic, which belongs in `omni-bionic` — `cargo tree -p omni-bionic -e nor
 `civil_from_days` (Hinnant; the derivation C++20's `<chrono>` is specified against) rather than a
 loop from 1970, **and the reason is hostile input rather than elegance**: a year-stepping loop turns
 `gmtime_r(INT64_MAX)` into a hundred-billion-iteration spin inside a thunk handler. This version is
-branch-free over the whole `i64` range.
+**loop-free — O(1)** over the whole `i64` range. (Recorded as *branch-free* until a review pointed
+out that is literally false: `floor_div` alone has an `if`/`else`. The absence of a loop is the
+property the argument needs; the stronger word would invite a constant-time claim it cannot support.)
 
 A year that will not fit `int tm_year` is `NULL` with `EOVERFLOW`, which is C's own answer.
 Wrapping would produce a *date*: plausible, printable, and wrong by billions of years.

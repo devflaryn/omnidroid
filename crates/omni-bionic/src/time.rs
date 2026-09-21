@@ -13,8 +13,11 @@
 //!
 //! `civil_from_days` from Howard Hinnant's *chrono-Compatible Low-Level Date Algorithms*, the same
 //! derivation C++20's `<chrono>` is specified against. It is used here rather than a table walk for
-//! one reason that matters to this project: it is **branch-free over the whole i64 range** and has
-//! no accumulating loop, so a hostile `time_t` cannot make it slow. A "step a year at a time from
+//! one reason that matters to this project: it is **loop-free — O(1) over the whole `i64` range**,
+//! so a hostile `time_t` cannot make it slow. (It was described here as *branch-free*, which is
+//! literally untrue — `floor_div` has an `if`/`else` and `gmtime` has two more. The property that
+//! matters is the absence of an accumulating loop, and nothing should lean on the stronger word:
+//! this is not a constant-time algorithm and is not written to be one.) A "step a year at a time from
 //! 1970" implementation is the obvious alternative and it turns `gmtime_r(INT64_MAX)` into a
 //! hundred-billion-iteration loop inside a thunk handler — a denial of service reachable from one
 //! guest argument.
