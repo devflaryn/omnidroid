@@ -52,11 +52,13 @@ pub mod boundary;
 pub mod error;
 pub mod jni;
 pub mod mem;
+pub mod ndk;
 pub mod region;
 pub mod varargs;
 
 pub use bionic::{Activation, Bionic};
 pub use jni::{Jni, JniActivation};
+pub use ndk::{Ndk, NdkActivation};
 pub use abi::{ArgRegs, ArgSource, Args, Ret, RetSink, ARG_REGISTERS};
 pub use boundary::{
     Binding, Boundary, BoundaryBuilder, CodeInvalidations, ContextRegistration, Crossings,

@@ -417,6 +417,24 @@ pub enum AbiError {
         address: GuestAddr,
     },
 
+    /// An NDK handler ran on a thread with no NDK state installed.
+    ///
+    /// A **host** mistake, exactly as [`BionicNotActive`](AbiError::BionicNotActive) and
+    /// [`JniNotActive`](AbiError::JniNotActive) are: `Ndk::activate` was not held across
+    /// `Boundary::run`. It is an error rather than a default-constructed instance because a
+    /// per-call default would give every guest thread its own private looper registry, and two
+    /// threads that each believe they own the game thread's looper is the failure no later test
+    /// can see.
+    #[error(
+        "`{symbol}` at {address:#x} was serviced on a thread with no NDK state: `Ndk::activate` must be held across `Boundary::run`"
+    )]
+    NdkNotActive {
+        /// The NDK symbol.
+        symbol: String,
+        /// Its thunk address.
+        address: GuestAddr,
+    },
+
     /// The thunk region could not be reserved or has run out of slots.
     #[error("the thunk region cannot hold another {what}: {detail}")]
     RegionFull {
@@ -460,6 +478,7 @@ impl AbiError {
             AbiError::JniRefused { function, .. }
             | AbiError::JniBadHandle { function, .. }
             | AbiError::JniNotActive { function, .. } => Some(function),
+            AbiError::NdkNotActive { symbol, .. } => Some(symbol),
             AbiError::NoSuchThunk { .. }
             | AbiError::CrossingLimit { .. }
             | AbiError::RegionFull { .. }
@@ -490,7 +509,8 @@ impl AbiError {
             | AbiError::BionicNotActive { address, .. }
             | AbiError::JniRefused { address, .. }
             | AbiError::JniBadHandle { address, .. }
-            | AbiError::JniNotActive { address, .. } => Some(address),
+            | AbiError::JniNotActive { address, .. }
+            | AbiError::NdkNotActive { address, .. } => Some(address),
             // The address the *guest* branched to, not the slot it landed in: the whole point of the
             // variant is that those differ.
             AbiError::MidThunk { address, .. } | AbiError::NoSuchThunk { address, .. } => {
