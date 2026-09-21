@@ -84,7 +84,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 
 use omni_platform::log::{
-    liblog_caps, Kept, Priority, Record, Truncation, MAX_TAG_AND_MESSAGE_BYTES,
+    liblog_caps, Kept, Priority, Record, Truncation, MAX_MESSAGE_BYTES, MAX_TAG_AND_MESSAGE_BYTES,
 };
 
 use crate::boundary::ImportCall;
@@ -336,6 +336,32 @@ fn capped_record(priority: Priority, tag: &[u8], message: &[u8]) -> (LogRecord, 
     (record, kept)
 }
 
+/// [`capped_record`], for a message the **formatter** already cut.
+///
+/// `full_message_bytes` is what `vsnprintf` would have returned: the length of the whole
+/// formatted message, which is not `message.len()` once
+/// [`format::render_bounded`](super::format::render_bounded) has stopped at `liblog`'s
+/// 1,024-byte buffer. [`capped_record`] compares `message.len()` against the caps and therefore
+/// sees nothing to report for a message that arrived already at the cap — a **silent**
+/// truncation, which this module's header says is worse than a refusal and which this restores
+/// the report for.
+///
+/// The three reporting channels are unchanged: the counter, the record's own [`Truncation`], and
+/// the marker on the rendered stderr line.
+fn capped_record_of(
+    priority: Priority,
+    tag: &[u8],
+    message: &[u8],
+    full_message_bytes: usize,
+) -> (LogRecord, Kept) {
+    let (mut record, kept) = capped_record(priority, tag, message);
+    if full_message_bytes > message.len() {
+        record.truncated =
+            Some(Truncation { tag_bytes: tag.len(), message_bytes: full_message_bytes });
+    }
+    (record, kept)
+}
+
 /// `int __android_log_print(int prio, const char *tag, const char *fmt, ...)`
 ///
 /// Returns the number of bytes of the formatted message this layer accepted — that is, the
@@ -429,9 +455,13 @@ pub(super) fn android_log_print(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             )));
         };
         let tag = read_label_bytes(view.blaming(1), tag_pointer, 1)?;
-        let rendered = format::render(&view, fmt, 2, &mut source)?;
-        let message = message_bytes(&view, &rendered)?;
-        let (record, kept) = capped_record(priority, &tag, &message);
+        // `MAX_MESSAGE_BYTES`, because that is `LOG_BUF_SIZE` less the NUL and `liblog` formats
+        // with `vsnprintf(buf, LOG_BUF_SIZE, fmt, ap)`: the same destination size, so the same
+        // bytes. Not a policy number of this layer's own -- `omni_platform::log` names the AOSP
+        // file it was read out of.
+        let rendered = format::render_bounded(&view, fmt, 2, &mut source, MAX_MESSAGE_BYTES)?;
+        let message = message_bytes(&view, &rendered.text)?;
+        let (record, kept) = capped_record_of(priority, &tag, &message, rendered.full);
         state.bionic.log(record);
         // At most `MAX_MESSAGE_BYTES` (1,023) by the cap above, so the narrowing cannot lose a
         // bit. Written as a static assertion on the constant rather than as a runtime check,
@@ -486,9 +516,12 @@ pub(super) fn syslog(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             (None, 0) => "syslog".to_string(),
             (None, facility) => format!("syslog[facility {facility}]"),
         };
-        let rendered = format::render(&view, fmt, 1, &mut source)?;
-        let message = message_bytes(&view, &rendered)?;
-        let (record, _) = capped_record(mapped, tag.as_bytes(), &message);
+        // bionic's `vsyslog` calls `__android_log_vprint`, whose body is `__android_log_print`'s
+        // -- the same `char buf[LOG_BUF_SIZE]` -- so the budget is the same one, and a `syslog`
+        // budgeted differently here would be a divergence invented by this layer.
+        let rendered = format::render_bounded(&view, fmt, 1, &mut source, MAX_MESSAGE_BYTES)?;
+        let message = message_bytes(&view, &rendered.text)?;
+        let (record, _) = capped_record_of(mapped, tag.as_bytes(), &message, rendered.full);
         state.bionic.log(record);
     }
     c.ret().void();
@@ -558,7 +591,7 @@ pub(crate) fn emit(record: &LogRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omni_platform::log::{format_line, MAX_MESSAGE_BYTES, TRUNCATION_MARKER};
+    use omni_platform::log::{format_line, TRUNCATION_MARKER};
 
     /// A record with a message of `bytes` 'x' and a tag of `tag` 't', pre-cap.
     fn made(tag: usize, message: usize) -> LogRecord {

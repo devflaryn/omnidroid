@@ -42,7 +42,49 @@ pub const MAX_FIELD_WIDTH: usize = 64 * 1024;
 ///
 /// Capping a single field is not enough on its own: a format string may repeat a wide
 /// conversion. Checked once per loop iteration, which also bounds the literal bytes.
+///
+/// **This cap governs the *unbounded* entry point only.** [`format_bounded`] is given a
+/// destination size by its caller and is bounded by that instead — which is the arrangement a C
+/// `vsnprintf` has, and the reason the two caps above are policy rather than correctness.
 pub const MAX_OUTPUT: usize = 1024 * 1024;
+
+/// Fraction digits past which `%f` cannot round: **1074**.
+///
+/// The smallest positive `f64` is `2^-1074`, so every finite `double` is an exact multiple of
+/// `2^-1074` and its exact decimal expansion has at most 1074 fraction digits. A `%.*f` asking
+/// for more than that appends **literal zeros** and rounds nothing, so the first 1074 fraction
+/// digits are the same whether the conversion was asked for 1074 of them or for a million.
+///
+/// That is what lets [`format_bounded`] answer `%.1000000f` with the bytes the whole conversion
+/// would have produced, without producing a million of them: the digits are computed once at this
+/// precision and the remainder is a *fill*, counted and emitted only as far as the budget reaches.
+/// Derived from the format, not from a second implementation — `a_huge_f_precision_is_a_fill_and
+/// _the_bytes_are_the_whole_conversions` checks the two against each other.
+pub const EXACT_FRACTION_DIGITS: usize = 1074;
+
+/// What one [`format_bounded`] call produced.
+///
+/// The two numbers are different exactly when the budget bit, and both are in **characters** —
+/// one character is one guest byte, which is not the same as one host `String` byte for a byte
+/// above `0x7F`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Produced {
+    /// Characters appended to `out`: what a device's fixed-size buffer would have kept.
+    pub kept: usize,
+    /// Characters the format string asked for, kept or not — C's `vsnprintf` return value.
+    ///
+    /// A caller reporting a truncation needs this and not `kept`: "1023 bytes" and "1023 of
+    /// 40,000 bytes" are the same line with and without the only fact that matters about it.
+    pub full: usize,
+}
+
+impl Produced {
+    /// Whether the budget bit — some of what the format string asked for was not kept.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.full > self.kept
+    }
+}
 
 /// One printf argument. The adapter builds these from the guest's va_list.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -163,6 +205,47 @@ pub fn format(
     out: &mut String,
 ) -> Result<usize, FormatError> {
     let start_len = out.len();
+    format_bounded(fmt, args, out, usize::MAX)?;
+    Ok(out.len() - start_len)
+}
+
+/// Format `args` into `out`, appending at most `budget` characters and reporting how many the
+/// format string asked for.
+///
+/// **This is `vsnprintf` into a fixed buffer, and it exists because that is what the platform
+/// does.** `liblog`'s `__android_log_print` formats into `char buf[1024]`; the conversion that
+/// overruns it is *cut*, the ones after it produce nothing, and the call returns. It does not
+/// fail, and a layer that failed where a device truncates would abort a guest over a log line.
+///
+/// `budget` is counted in **characters**, one per guest byte — see [`Bound`]. `usize::MAX` means
+/// unbounded, which is what [`format`] passes and which leaves [`MAX_OUTPUT`] and
+/// [`MAX_FIELD_WIDTH`] doing the bounding instead.
+///
+/// # What a budget changes, and what it deliberately does not
+///
+/// * A conversion whose field would cross the budget emits **its own first characters**, in the
+///   right order — the padding of a right-justified field comes before its body, so a `%70000d`
+///   cut at 1023 is 1023 spaces and not 1021 spaces followed by the number. Clamping the width
+///   to the budget would have produced the second, which is the believable wrong answer here.
+/// * The walk **continues** past a full budget, exactly as `vsnprintf`'s does, so
+///   [`Produced::full`] is the true length and not a lower bound.
+/// * A width past [`MAX_FIELD_WIDTH`] stops being a refusal: the padding is a counted fill
+///   rather than an allocation, so the reason for the cap is gone. So does a precision, on every
+///   conversion whose body this engine can place exactly. The floating conversions `e E g G a A`
+///   are the exception and **stay refusals**; [`Bound::refuses_wide`] says why.
+///
+/// # Errors
+///
+/// Every [`FormatError`] [`format`] can raise except [`FormatError::OutputTooLarge`], which a
+/// budget makes unreachable.
+pub fn format_bounded(
+    fmt: &str,
+    args: &[FormatArg],
+    out: &mut String,
+    budget: usize,
+) -> Result<Produced, FormatError> {
+    let start_len = out.len();
+    let mut bound = Bound { budget, kept: 0, full: 0 };
     let mut arg_idx = 0usize;
     let bytes = fmt.as_bytes();
     let mut i = 0usize;
@@ -176,7 +259,7 @@ pub fn format(
         }
         let b = bytes[i];
         if b != b'%' {
-            out.push(b as char); // format strings with %s args stay ASCII-safe in practice;
+            bound.ch(out, b as char); // format strings with %s args stay ASCII-safe in practice;
             i += 1;             // non-ASCII bytes are copied verbatim as chars < 0x100 —
             continue;           // documented: fmt is expected ASCII (C locale)
         }
@@ -222,20 +305,24 @@ pub fn format(
         // after the fetch rather than in `plan`: a `*` width is an argument and the format string
         // alone cannot be scanned for it.
         for (requested, what) in [(width, "width"), (precision, "precision")] {
-            let _ = what;
             if let Some(n) = requested {
                 if n > MAX_FIELD_WIDTH {
-                    return Err(FormatError::FieldTooWide {
-                        conversion: spec,
-                        requested: n,
-                        limit: MAX_FIELD_WIDTH,
-                    });
+                    // Nested rather than `&&` so the cap's own test reads on one line: the
+                    // question "is this count hostile" and the question "is there anywhere for
+                    // the answer to go" are separate, and only the second one a budget changes.
+                    if bound.refuses_wide(what, spec) {
+                        return Err(FormatError::FieldTooWide {
+                            conversion: spec,
+                            requested: n,
+                            limit: MAX_FIELD_WIDTH,
+                        });
+                    }
                 }
             }
         }
         let arg = match spec {
             '%' => {
-                out.push('%');
+                bound.ch(out, '%');
                 continue;
             }
             _ => next_arg(args, &mut arg_idx)?,
@@ -244,8 +331,12 @@ pub fn format(
             'd' | 'i' => {
                 let n = as_int(arg, spec, length)?;
                 let mut digits = n.unsigned_abs().to_string();
+                // precision on integers = minimum digit count. Counted rather than inserted:
+                // the count is guest-chosen, and `pad_zero` would turn `%.1000000d` into a
+                // megabyte of '0' before anything had looked at where it was going.
+                let mut zeros = 0usize;
                 if let Some(p) = precision {
-                    pad_zero(&mut digits, p); // precision on integers = minimum digit count
+                    zeros = p.saturating_sub(digits.len());
                     if n == 0 && p == 0 {
                         digits.clear(); // C: precision 0 on zero value prints nothing
                     }
@@ -259,18 +350,34 @@ pub fn format(
                 } else {
                     ""
                 };
-                emit_padded(out, &format!("{sign}{digits}"), width, &flags, &precision);
+                let body = format!("{sign}{digits}");
+                emit_padded(
+                    out,
+                    &mut bound,
+                    &Body::run(&body, sign.len(), '0', zeros),
+                    width,
+                    &flags,
+                    &precision,
+                );
             }
             'u' => {
                 let n = as_uint(arg, spec, length)?;
                 let mut digits = n.to_string();
+                let mut zeros = 0usize;
                 if let Some(p) = precision {
-                    pad_zero(&mut digits, p);
+                    zeros = p.saturating_sub(digits.len());
                     if n == 0 && p == 0 {
                         digits.clear(); // C: precision 0 on zero value prints nothing
                     }
                 }
-                emit_padded(out, &digits, width, &flags, &precision);
+                emit_padded(
+                    out,
+                    &mut bound,
+                    &Body::run(&digits, 0, '0', zeros),
+                    width,
+                    &flags,
+                    &precision,
+                );
             }
             'o' | 'x' | 'X' => {
                 // Alternate form: leading 0 for %o (only when it adds a zero), 0x/0X for x/X.
@@ -287,20 +394,34 @@ pub fn format(
                     _ => "",
                 };
                 let mut body = digits;
+                let mut zeros = 0usize;
                 if let Some(p) = precision {
-                    pad_zero(&mut body, p);
+                    zeros = p.saturating_sub(body.len());
                     if n == 0 && p == 0 {
                         body.clear(); // C: "#." still prints empty for zero value
                     }
                 }
-                let prefix = if prefix == "0" && body.starts_with('0') { "" } else { prefix };
-                emit_padded(out, &format!("{prefix}{body}"), width, &flags, &precision);
+                // `zeros > 0` is what `body.starts_with('0')` used to say once the zeros had
+                // been inserted: `%#.4o` of 8 is "0010", whose own leading zero makes the `#`
+                // prefix redundant. Asking the count rather than the string keeps that true
+                // without building the string.
+                let leads_with_zero = zeros > 0 || body.starts_with('0');
+                let prefix = if prefix == "0" && leads_with_zero { "" } else { prefix };
+                let body = format!("{prefix}{body}");
+                emit_padded(
+                    out,
+                    &mut bound,
+                    &Body::run(&body, prefix.len(), '0', zeros),
+                    width,
+                    &flags,
+                    &precision,
+                );
             }
             'c' => {
                 let n = as_int(arg, spec, length)?;
                 // %c takes an int converted to unsigned char.
                 let ch = (n as u32 & 0xFF) as u8 as char;
-                emit_padded(out, &ch.to_string(), width, &flags, &precision);
+                emit_padded(out, &mut bound, &Body::plain(&ch.to_string()), width, &flags, &precision);
             }
             's' => {
                 let s = match arg {
@@ -308,12 +429,13 @@ pub fn format(
                     FormatArg::Ptr(0) => "(null)", // bionic prints "(null)" for %p-style nulls in %s too
                     _ => return Err(FormatError::MalformedFormat("%s needs a string")),
                 };
-                // Precision truncates strings.
+                // Precision truncates strings — it can only ever shorten one, so a precision
+                // past `MAX_FIELD_WIDTH` costs nothing here and is not refused under a budget.
                 let s = match precision {
-                    Some(p) if s.len() > p => &s[..p],
-                    _ => s,
+                    Some(p) => truncate_chars(s, p),
+                    None => s,
                 };
-                emit_padded(out, s, width, &flags, &precision);
+                emit_padded(out, &mut bound, &Body::plain(s), width, &flags, &precision);
             }
             'p' => {
                 let ptr = match arg {
@@ -326,32 +448,45 @@ pub fn format(
                 } else {
                     format!("0x{ptr:x}")
                 };
-                emit_padded(out, &body, width, &flags, &precision);
+                emit_padded(out, &mut bound, &Body::plain(&body), width, &flags, &precision);
             }
             'e' | 'E' => {
                 let v = as_double(arg, spec)?;
                 let s = format_exp(v, precision.unwrap_or(6), flags.alt, spec == 'E');
-                emit_padded(out, &s, width, &flags, &precision);
+                emit_padded(out, &mut bound, &Body::plain(&s), width, &flags, &precision);
             }
             'f' | 'F' => {
                 let v = as_double(arg, spec)?;
-                let s = format_fixed(v, precision.unwrap_or(6), flags.alt, spec == 'F');
-                emit_padded(out, &s, width, &flags, &precision);
+                let asked = precision.unwrap_or(6);
+                // Past `EXACT_FRACTION_DIGITS` the conversion appends zeros and rounds nothing,
+                // so the digits are computed once and the remainder is a counted fill. Only for
+                // a finite value: `inf` and `nan` have no fraction digits at any precision.
+                let computed = asked.min(EXACT_FRACTION_DIGITS);
+                let s = format_fixed(v, computed, flags.alt, spec == 'F');
+                let tail = if v.is_finite() { asked - computed } else { 0 };
+                emit_padded(
+                    out,
+                    &mut bound,
+                    &Body::run(&s, s.len(), '0', tail),
+                    width,
+                    &flags,
+                    &precision,
+                );
             }
             'g' | 'G' => {
                 let v = as_double(arg, spec)?;
                 let s = format_g(v, precision.unwrap_or(6), flags.alt, spec == 'G');
-                emit_padded(out, &s, width, &flags, &precision);
+                emit_padded(out, &mut bound, &Body::plain(&s), width, &flags, &precision);
             }
             'a' | 'A' => {
                 let v = as_double(arg, spec)?;
                 let s = format_hex_float(v, spec == 'A');
-                emit_padded(out, &s, width, &flags, &precision);
+                emit_padded(out, &mut bound, &Body::plain(&s), width, &flags, &precision);
             }
             other => return Err(FormatError::UnknownSpecifier(other)),
         }
     }
-    Ok(out.len() - start_len)
+    Ok(Produced { kept: bound.kept, full: bound.full })
 }
 
 // ---------------------------------------------------------------------------
@@ -659,41 +794,195 @@ fn annotate(e: FormatError, _spec: char) -> FormatError {
     e
 }
 
-/// Zero-extend `digits` to at least `p` characters (integer precision).
-fn pad_zero(digits: &mut String, p: usize) {
-    while digits.len() < p {
-        digits.insert(0, '0');
+/// The first `p` characters of `s`, for `%s`'s precision.
+///
+/// **Characters, not host bytes, and that is a fix rather than a refinement.** A `%s` argument
+/// arrives as one `char` per guest byte, so a guest byte above `0x7F` occupies two bytes of the
+/// host `String`. `&s[..p]` on a guest-chosen `p` therefore counted the wrong unit *and*
+/// **panicked** when `p` landed inside a character — a panic unwinding out of an import, which is
+/// the one failure this layer exists to never produce, reachable from
+/// `__android_log_print("%.1s", "\u{c3}\u{a9}")`.
+fn truncate_chars(s: &str, p: usize) -> &str {
+    match s.char_indices().nth(p) {
+        Some((at, _)) => &s[..at],
+        None => s,
+    }
+}
+
+/// The budget one [`format_bounded`] call may still append, and the count of everything it was
+/// asked for.
+///
+/// **Characters, not host bytes.** One produced character is one guest byte — the adapter maps
+/// guest bytes onto `char` one for one — and a byte above `0x7F` is two bytes of the host
+/// `String`. Budgeting `out.len()` would cap a different quantity than `vsnprintf`'s buffer does,
+/// by up to a factor of two, on exactly the input a hostile guest picks.
+struct Bound {
+    /// Characters that may still be appended in total. `usize::MAX` means unbounded.
+    budget: usize,
+    /// Characters appended.
+    kept: usize,
+    /// Characters asked for, kept or not: C's `vsnprintf` return value.
+    full: usize,
+}
+
+impl Bound {
+    /// Whether a destination size was given at all.
+    fn is_bounded(&self) -> bool {
+        self.budget != usize::MAX
+    }
+
+    /// Characters that still fit.
+    fn room(&self) -> usize {
+        self.budget.saturating_sub(self.kept)
+    }
+
+    /// Append what fits of `text`, and count all of it.
+    fn text(&mut self, out: &mut String, text: &str) {
+        let asked = text.chars().count();
+        let room = self.room();
+        if room >= asked {
+            out.push_str(text);
+            self.kept += asked;
+        } else {
+            // By character, never by byte index: a body can hold a guest byte above 0x7F, and
+            // slicing it at a byte offset would panic on a boundary a guest chose.
+            for ch in text.chars().take(room) {
+                out.push(ch);
+            }
+            self.kept += room;
+        }
+        self.full = self.full.saturating_add(asked);
+    }
+
+    /// Append one character if it fits, and count it either way.
+    fn ch(&mut self, out: &mut String, c: char) {
+        if self.room() > 0 {
+            out.push(c);
+            self.kept += 1;
+        }
+        self.full = self.full.saturating_add(1);
+    }
+
+    /// Append what fits of `n` copies of `c`, and count all `n`.
+    ///
+    /// **The whole reason a guest-chosen width stops being an allocation.** `n` is never
+    /// materialised: what is pushed is bounded by the budget and what is counted is arithmetic.
+    fn fill(&mut self, out: &mut String, c: char, n: usize) {
+        let take = self.room().min(n);
+        out.extend(core::iter::repeat_n(c, take));
+        self.kept += take;
+        self.full = self.full.saturating_add(n);
+    }
+
+    /// Whether a width or precision past [`MAX_FIELD_WIDTH`] must still be refused.
+    ///
+    /// Unbounded, always: with nowhere for the output to stop, the cap is the only thing between
+    /// `%999999999d` and an allocation the guest picked, and an allocation failure aborts.
+    ///
+    /// Under a budget the padding is a counted fill, so a **width** is honoured exactly as
+    /// `vsnprintf` honours it. So is a **precision** on every conversion whose body this engine
+    /// can place without building it: `%.*s` can only shorten a string, and an integer's
+    /// precision is a run of zeros at a known offset.
+    ///
+    /// `e E g G a A` are the exception and stay refusals **by name**. Their bodies are built
+    /// digit by digit — `format_exp` carries the mantissa through `10u64.pow(precision.min(15))`
+    /// and `format_g` delegates to `format_fixed` at a precision it derives — so this engine has
+    /// no placement for the digits past a budget that is the digits `vsnprintf` would have
+    /// written. Emitting the ones it can build would be a plausible wrong answer in the visible
+    /// prefix, which is the one outcome worth more than a refusal here.
+    fn refuses_wide(&self, what: &str, conv: char) -> bool {
+        if !self.is_bounded() {
+            return true;
+        }
+        what == "precision" && matches!(conv, 'e' | 'E' | 'g' | 'G' | 'a' | 'A')
+    }
+}
+
+/// One field's body, with any guest-chosen run of repeated characters left **counted rather
+/// than built**.
+///
+/// Two conversions need the run: an integer's precision, which is a minimum digit count and so a
+/// run of `'0'` between the sign and the digits, and `%f`'s precision past
+/// [`EXACT_FRACTION_DIGITS`], which is a run of `'0'` after them. Everything else is
+/// [`Body::plain`].
+struct Body<'a> {
+    /// The body with the run removed.
+    text: &'a str,
+    /// Byte offset into `text` the run sits at. `text` is ASCII wherever `run_len` is non-zero.
+    run_at: usize,
+    /// The repeated character.
+    run: char,
+    /// How many of it.
+    run_len: usize,
+}
+
+impl<'a> Body<'a> {
+    /// A body with no run.
+    fn plain(text: &'a str) -> Self {
+        Body { text, run_at: 0, run: '0', run_len: 0 }
+    }
+
+    /// A body with `run_len` copies of `run` spliced in at byte offset `run_at`.
+    fn run(text: &'a str, run_at: usize, run: char, run_len: usize) -> Self {
+        Body { text, run_at, run, run_len }
+    }
+
+    /// The body's length in **characters**, which is what a width is measured against.
+    fn len(&self) -> usize {
+        self.text.chars().count().saturating_add(self.run_len)
+    }
+
+    /// Emit the body from byte offset `from` (at or before `run_at`).
+    fn emit(&self, out: &mut String, bound: &mut Bound, from: usize) {
+        if self.run_len == 0 {
+            bound.text(out, &self.text[from..]);
+            return;
+        }
+        bound.text(out, &self.text[from..self.run_at]);
+        bound.fill(out, self.run, self.run_len);
+        bound.text(out, &self.text[self.run_at..]);
     }
 }
 
 /// Pad `body` to `width` per the flags. Zero-padding goes after any sign/prefix.
 /// The `0` flag is ignored for integer conversions when a precision is given (C11
 /// 7.21.6.1: "if a precision is specified, the 0 flag is ignored" for d,i,o,u,x,X).
+///
+/// # The order the pieces go in is the whole of the truncation question
+///
+/// Under a budget only the first pieces survive, so *which* piece comes first decides the bytes.
+/// A right-justified `%70000d` is padding first and the number last, so a device's 1,023-byte
+/// buffer holds **1,023 spaces** — clamping the width to the budget instead would have put the
+/// number at the end of them, which is the believable wrong answer this arrangement avoids by
+/// never needing the width and the budget to be the same number.
 fn emit_padded(
     out: &mut String,
-    body: &str,
+    bound: &mut Bound,
+    body: &Body<'_>,
     width: Option<usize>,
     flags: &Flags,
     precision: &Option<usize>,
 ) {
     let pad = width.unwrap_or(0).saturating_sub(body.len());
     if pad == 0 {
-        out.push_str(body);
+        body.emit(out, bound, 0);
         return;
     }
-    let zero_ok = flags.zero && precision.is_none() && !numeric_needs_space_first(body);
+    let zero_ok = flags.zero && precision.is_none() && !numeric_needs_space_first(body.text);
     if flags.left {
-        out.push_str(body);
-        out.extend(core::iter::repeat_n(' ', pad));
+        body.emit(out, bound, 0);
+        bound.fill(out, ' ', pad);
     } else if zero_ok {
         // Zero padding must respect the sign/prefix position: "0x...", "-12" etc.
-        let split = prefix_len(body);
-        out.push_str(&body[..split]);
-        out.extend(core::iter::repeat_n('0', pad));
-        out.push_str(&body[split..]);
+        // `zero_ok` requires no precision, and a run only ever comes from one, so the split
+        // never falls inside a run.
+        let split = prefix_len(body.text);
+        bound.text(out, &body.text[..split]);
+        bound.fill(out, '0', pad);
+        body.emit(out, bound, split);
     } else {
-        out.extend(core::iter::repeat_n(' ', pad));
-        out.push_str(body);
+        bound.fill(out, ' ', pad);
+        body.emit(out, bound, 0);
     }
 }
 

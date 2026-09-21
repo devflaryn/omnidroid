@@ -29,7 +29,7 @@
 //! way. A character above `U+00FF` cannot appear — nothing in the pipeline produces one — and if
 //! one ever did it would be a refusal rather than a substituted byte.
 
-use omni_bionic::printf::{format as format_core, plan, ArgKind, FormatArg};
+use omni_bionic::printf::{format_bounded, plan, ArgKind, FormatArg};
 
 use crate::boundary::ImportCall;
 use crate::error::{AbiError, AbiResult};
@@ -166,6 +166,39 @@ pub(super) fn render(
     fmt_argument: usize,
     source: &mut dyn VaSource,
 ) -> AbiResult<String> {
+    Ok(render_bounded(view, fmt_ptr, fmt_argument, source, usize::MAX)?.text)
+}
+
+/// What [`render_bounded`] produced.
+pub(super) struct Rendered {
+    /// The characters kept — one `char` per guest byte, as everywhere in this module.
+    pub text: String,
+    /// How long the whole message was, in **guest bytes**: C's `vsnprintf` return value.
+    ///
+    /// Carried separately rather than folded into `text` because a caller reporting a truncation
+    /// needs the number that is no longer there. `text` is what survived; this is what it was.
+    pub full: usize,
+}
+
+/// [`render`], but into a destination of a known size, keeping the prefix that fits.
+///
+/// **This is what stops a log line ending a guest run.** `liblog` formats into `char buf[1024]`
+/// and a `vsnprintf` that overruns it truncates; the two caps `omni_bionic::printf` applies when
+/// nothing bounds it — [`MAX_OUTPUT`](omni_bionic::printf::MAX_OUTPUT) and
+/// [`MAX_FIELD_WIDTH`](omni_bionic::printf::MAX_FIELD_WIDTH) — are refusals where the platform
+/// has a defined behaviour, which is finding **W1**. A caller that has a destination size passes
+/// it here and gets the device's bytes; a caller that does not (every `*printf` whose return
+/// value is the *full* length the guest then acts on) passes `usize::MAX` and keeps the refusals.
+///
+/// The budget is counted in guest bytes, which is one `char` of the formatting core's output —
+/// not one host `String` byte, which a byte above `0x7F` costs two of.
+pub(super) fn render_bounded(
+    view: &GuestView<'_>,
+    fmt_ptr: u64,
+    fmt_argument: usize,
+    source: &mut dyn VaSource,
+    budget: usize,
+) -> AbiResult<Rendered> {
     if fmt_ptr == 0 {
         // bionic's own `printf` crashes on a null format. A refusal naming the symbol is the
         // only other honest answer; printing the literal "(null)" would be an invention.
@@ -175,8 +208,9 @@ pub(super) fn render(
     let owned = collect(view, &fmt, source, fmt_argument + 1)?;
     let args: Vec<FormatArg<'_>> = owned.iter().map(Owned::as_arg).collect();
     let mut out = String::new();
-    format_core(&fmt, &args, &mut out).map_err(|error| view.refusal(error.to_string()))?;
-    Ok(out)
+    let produced = format_bounded(&fmt, &args, &mut out, budget)
+        .map_err(|error| view.refusal(error.to_string()))?;
+    Ok(Rendered { text: out, full: produced.full })
 }
 
 /// Write an `snprintf`-style truncated result, and return what the full length was.
