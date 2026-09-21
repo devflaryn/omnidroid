@@ -62,12 +62,17 @@ use super::files::{errno_for, filesystem};
 use super::view::GuestView;
 use super::{active, enter};
 
-/// The longest `fopen` mode string this layer will read.
-///
-/// `"rb+xe"` is five; sixteen is generous and is the bound that stops a guest handing a 64 KiB
-/// "mode" string. A longer one is `EINVAL`, which is what `fopen` reports for a mode it cannot
-/// parse anyway.
-const MAX_MODE_BYTES: usize = 16;
+// **There is no bound on a `fopen` mode string here, and there used to be.**
+//
+// Review finding M5: a mode over sixteen bytes was *silently truncated*, so
+// `"rbbbbbbbbbbbbbbb+"` lost its `+` and yielded a read-only stream while the code's own doc
+// said `EINVAL`. The caller is already bounded — `GuestMem::cstr` caps at `STRING_LIMIT`, 64 KiB
+// — so the parse is one pass over a slice that is already finite, and with no second bound there
+// is no tail to lose at any length.
+//
+// Refusing past a length was considered and rejected: C17 7.21.5.3p3's footnote lets an
+// implementation ignore the characters after a valid mode, and bionic's own `__sflags` walks to
+// the terminator with no limit, so a long-but-meant mode is one a real device opens.
 
 /// [`omni_bionic::stdio::Descriptors`] over `omni-platform`'s filesystem seam.
 ///
@@ -128,68 +133,37 @@ impl Descriptors for HostDescriptors<'_> {
     }
 }
 
-/// What a `fopen` mode string asked for.
+/// `omni-bionic`'s answer in the seam's vocabulary — the one place the two flag sets meet.
 ///
-/// # The modes, and what each modifier does here
+/// The parse itself is [`omni_bionic::stdio::parse_mode`], in the crate whose module header says
+/// byte arithmetic over a guest argument belongs there: it needs no OS, and it is testable
+/// without a filesystem. What is left here is the mapping, and the one thing the mapping drops.
 ///
-/// | mode | access |
-/// |---|---|
-/// | `r` | read |
-/// | `r+` | read and write |
-/// | `w` | write, create, truncate |
-/// | `w+` | read and write, create, truncate |
-/// | `a` | write, create, append |
-/// | `a+` | read and write, create, append |
-///
-/// `b` is accepted and does nothing, which is correct rather than lazy: POSIX says the binary
-/// modifier has no effect, and `std::fs` performs no line-ending translation on any target, so a
-/// stream opened without `b` is already binary. That matters here more than on a real device —
-/// a Windows host is where a text mode would otherwise appear — and it is why nothing in this
-/// layer ever touches a `\r`.
-///
-/// `e` (bionic's `O_CLOEXEC` modifier) is accepted and does nothing, because nothing here execs.
-/// `x` is `O_EXCL` and is honoured with `w`. Any other character is `EINVAL`.
-fn parse_mode(mode: &[u8]) -> Option<OpenFlags> {
-    let first = *mode.first()?;
-    let plus = mode.contains(&b'+');
-    let exclusive = mode.contains(&b'x');
-    for byte in &mode[1..] {
-        if !matches!(byte, b'+' | b'b' | b'e' | b'x') {
-            return None;
-        }
+/// **`close_on_exec` is dropped here, named.** `OpenFlags` has no field for it because nothing in
+/// this process execs; recording it in `OpenMode` and dropping it at one visible site is the
+/// difference between a decision and a character that vanished in a parse, which is what `e` used
+/// to do.
+fn open_flags(mode: omni_bionic::stdio::OpenMode) -> OpenFlags {
+    OpenFlags {
+        read: mode.read,
+        write: mode.write,
+        create: mode.create,
+        exclusive: mode.exclusive,
+        truncate: mode.truncate,
+        append: mode.append,
+        directory: false,
     }
-    let flags = match first {
-        b'r' => OpenFlags { read: true, write: plus, ..OpenFlags::default() },
-        b'w' => OpenFlags {
-            read: plus,
-            write: true,
-            create: true,
-            truncate: true,
-            exclusive,
-            ..OpenFlags::default()
-        },
-        b'a' => OpenFlags {
-            read: plus,
-            write: true,
-            create: true,
-            append: true,
-            exclusive,
-            ..OpenFlags::default()
-        },
-        _ => return None,
-    };
-    Some(flags)
 }
 
-/// Read a `fopen` mode string, bounded.
+/// Read a `fopen` mode string. Bounded by `GuestMem::cstr` and by nothing else — see the note
+/// where `MAX_MODE_BYTES` used to be.
 fn mode_argument(view: &GuestView<'_>, pointer: u64, argument: usize) -> AbiResult<Vec<u8>> {
     if pointer == 0 {
         return Err(view.refusal(format!("argument {argument} is a null mode string")));
     }
     let at = GuestAddr::try_from(pointer)
         .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))?;
-    let bytes = view.mem().cstr(at, Blame::new(view.symbol(), view.address(), argument))?;
-    Ok(bytes.into_iter().take(MAX_MODE_BYTES).collect())
+    view.mem().cstr(at, Blame::new(view.symbol(), view.address(), argument))
 }
 
 /// Turn an `omni-bionic` failure into the boundary's, keeping the rich error the view stashed.
@@ -291,10 +265,13 @@ pub(super) fn fopen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let mut view = enter(c, &state);
         let path_bytes = super::files::path_for(view.blaming(0), path, 0)?;
         let mode_bytes = mode_argument(view.blaming(1), mode, 1)?;
-        let Some(flags) = parse_mode(&mode_bytes) else {
-            view.set_errno(consts::EINVAL);
-            c.ret().u64(0);
-            return Ok(());
+        let flags = match omni_bionic::stdio::parse_mode(&mode_bytes) {
+            Ok(mode) => open_flags(mode),
+            Err(why) => {
+                view.set_errno(why.errno());
+                c.ret().u64(0);
+                return Ok(());
+            }
         };
         let fs = filesystem(&view)?;
         match super::files::settle(&view, fs.open(&path_bytes, flags))? {
@@ -336,8 +313,8 @@ pub(super) fn fdopen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let result = {
         let mut view = enter(c, &state);
         let mode_bytes = mode_argument(view.blaming(1), mode, 1)?;
-        if parse_mode(&mode_bytes).is_none() {
-            view.set_errno(consts::EINVAL);
+        if let Err(why) = omni_bionic::stdio::parse_mode(&mode_bytes) {
+            view.set_errno(why.errno());
             c.ret().u64(0);
             return Ok(());
         }
@@ -361,12 +338,28 @@ pub(super) fn fdopen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 /// `int fclose(FILE *stream)`
 ///
-/// Closes the descriptor and releases the `FILE` object's slot. Returns 0, or `EOF` with `errno`
-/// if the descriptor could not be closed.
+/// **Flushes, then closes**, then releases the `FILE` object's slot. Returns 0, or `EOF` with
+/// `errno` if either half failed.
 ///
-/// The slot is released **whatever the descriptor did**, which is C's own rule: after `fclose`
-/// the stream may not be used again even if it reported a failure. Keeping the slot on a failed
-/// close would leak one per failure and let a guest exhaust the table.
+/// # The flush, which was missing and mattered
+///
+/// C17 7.21.5.1p2: `fclose` flushes the stream before closing it, and any unwritten buffered data
+/// are delivered to the host environment. This layer buffers nothing of its own — which is what
+/// the old comment here said, and why the omission looked harmless — but **the layer below does**:
+/// `Filesystem::flush` reaches `std::io::Stdout` and `Stderr`, which buffer, and
+/// `Filesystem::close` only removes the table entry. CONFIRMED live: `fclose(stdout)` returned 0
+/// with the last line the engine printed simply not there.
+///
+/// A regular file is unaffected — `std::fs::File` is unbuffered — so this is entirely about the
+/// three standard streams, which is exactly where a lost diagnostic costs most.
+///
+/// **There is no matching obligation for `exit`.** C17 7.22.4.4p2 has `exit` flush every stream,
+/// but only `_exit` is bound here, and 7.22.4.5p2 leaves flushing implementation-defined for
+/// `_Exit` while POSIX says `_exit` does not flush stdio.
+///
+/// The slot is released and the descriptor closed **whatever the flush did**, which is C's own
+/// rule: after `fclose` the stream may not be used again even if it reported a failure. Keeping
+/// the slot on a failure would leak one per failure and let a guest exhaust the table.
 pub(super) fn fclose(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let file = c.args().next_u64()?;
     let state = active(c.symbol(), c.address())?;
@@ -375,9 +368,17 @@ pub(super) fn fclose(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let stream = stream_of(&view, file)?;
         let fs = filesystem(&view)?;
         state.bionic.close_stream(file);
-        match super::files::settle(&view, fs.close(stream.fd))? {
-            super::files::Settled::Done(()) => 0,
-            super::files::Settled::Failed(errno) => {
+        // Flush first, close second, and close **whatever the flush reported**: the stream is
+        // gone after `fclose` either way, and a descriptor left open because its flush failed
+        // would be a leak with a legitimate-looking cause.
+        let flushed = super::files::settle(&view, fs.flush(stream.fd))?;
+        let closed = super::files::settle(&view, fs.close(stream.fd))?;
+        match (flushed, closed) {
+            (super::files::Settled::Done(()), super::files::Settled::Done(())) => 0,
+            // Whichever failed, the guest is told once. The flush's errno wins when both fail,
+            // because it is the one that says data was lost rather than that a handle was.
+            (super::files::Settled::Failed(errno), _)
+            | (_, super::files::Settled::Failed(errno)) => {
                 view.set_errno(errno);
                 EOF
             }
@@ -533,46 +534,57 @@ pub(super) fn fwrite(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 mod tests {
     use super::*;
 
-    /// Every `fopen` mode C defines, and the modifiers, and the ones that are `EINVAL`.
+    /// **The mapping, which is all that is left here.** The parse itself moved to
+    /// `omni_bionic::stdio::parse_mode` and is tested there, case by case, in
+    /// `crates/omni-bionic/tests/stdio_modes_tests.rs`.
+    ///
+    /// What this asserts is the thing a move can silently get wrong: that every field of
+    /// `OpenMode` reaches the field of `OpenFlags` that means the same thing. A mapping that
+    /// swapped `truncate` and `append` would pass every test in the other crate.
     #[test]
-    fn the_fopen_modes_are_the_six_c_defines_plus_the_modifiers() {
-        let read = parse_mode(b"r").expect("r");
-        assert_eq!((read.read, read.write, read.create), (true, false, false));
-        let update = parse_mode(b"r+").expect("r+");
-        assert_eq!((update.read, update.write, update.create), (true, true, false));
-        let write = parse_mode(b"w").expect("w");
+    fn every_open_mode_field_reaches_the_seam_flag_that_means_the_same_thing() {
+        use omni_bionic::stdio::parse_mode;
+        let read = open_flags(parse_mode(b"r").expect("r"));
+        assert_eq!(
+            (read.read, read.write, read.create, read.truncate, read.append, read.exclusive),
+            (true, false, false, false, false, false)
+        );
+        let write = open_flags(parse_mode(b"w").expect("w"));
         assert_eq!(
             (write.read, write.write, write.create, write.truncate, write.append),
-            (false, true, true, true, false)
+            (false, true, true, true, false),
+            "`w` truncates and does not append"
         );
-        let write_update = parse_mode(b"w+").expect("w+");
-        assert_eq!((write_update.read, write_update.truncate), (true, true));
-        let append = parse_mode(b"a").expect("a");
+        let append = open_flags(parse_mode(b"a").expect("a"));
         assert_eq!(
-            (append.read, append.write, append.create, append.append, append.truncate),
-            (false, true, true, true, false)
+            (append.read, append.write, append.create, append.truncate, append.append),
+            (false, true, true, false, true),
+            "`a` appends and does not truncate -- the pair a swapped mapping would hide"
         );
-        assert!(parse_mode(b"a+").expect("a+").read);
-        // `b` is accepted and changes nothing, which is what POSIX says it does -- and matters
-        // here because a Windows host is exactly where a text mode would otherwise appear.
-        assert_eq!(parse_mode(b"rb"), parse_mode(b"r"));
-        assert_eq!(parse_mode(b"wb+"), parse_mode(b"w+"));
-        assert_eq!(parse_mode(b"rbe"), parse_mode(b"r"), "bionic's O_CLOEXEC modifier");
-        // `x` is O_EXCL, and only with a creating mode.
-        assert!(parse_mode(b"wx").expect("wx").exclusive);
-        assert!(!parse_mode(b"r").expect("r").exclusive);
-        // Everything else is EINVAL rather than a guess.
-        for bad in [&b""[..], b"z", b"+", b"rz", b"w!", b"R", b"rw"] {
-            assert_eq!(parse_mode(bad), None, "`{}` was accepted", String::from_utf8_lossy(bad));
-        }
+        assert!(open_flags(parse_mode(b"r+").expect("r+")).write);
+        assert!(open_flags(parse_mode(b"w+").expect("w+")).read);
+        assert!(open_flags(parse_mode(b"wx").expect("wx")).exclusive);
+        // Never a directory: `fopen` opens a stream, and `O_DIRECTORY` would make the seam
+        // refuse every ordinary file.
+        assert!(!open_flags(parse_mode(b"r").expect("r")).directory);
     }
 
-    /// The mode bound is a constant, so a 64 KiB "mode" string cannot be walked.
+    /// **Review finding M5, in the shipping path.**
+    ///
+    /// The bound that truncated a long mode is gone, so the `+` survives at any length. The
+    /// review named `"rbbbbbbbbbbbbbb+"`, which is **sixteen** bytes and parsed correctly even
+    /// with the bound; the shape begins at seventeen. Both are asserted by name so the
+    /// correction cannot be lost again.
     #[test]
-    fn the_mode_string_is_bounded() {
-        assert_eq!(MAX_MODE_BYTES, 16);
-        // A long mode that starts legally is still rejected, because the characters past the
-        // first are checked and a `y` is not a modifier.
-        assert_eq!(parse_mode(b"rbbbbbbbbbbbbbby"), None);
+    fn a_long_mode_keeps_its_plus_all_the_way_through_the_adapter() {
+        use omni_bionic::stdio::parse_mode;
+        for mode in [&b"rbbbbbbbbbbbbbb+"[..], b"rbbbbbbbbbbbbbbb+", b"rbbbbbbbbbbbbbbbbbbbbbb+"] {
+            let flags = open_flags(parse_mode(mode).expect("a legal mode at any length"));
+            assert!(
+                flags.read && flags.write,
+                "`{}` is a read-write mode and the adapter must not shorten it",
+                String::from_utf8_lossy(mode)
+            );
+        }
     }
 }

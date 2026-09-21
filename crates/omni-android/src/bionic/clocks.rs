@@ -301,6 +301,110 @@ pub(super) fn gmtime_r(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `size_t strftime(char *s, size_t max, const char *format, const struct tm *tm)`
+///
+/// **The symbol M4's gate stopped on.** `nativeInitFastLog` is one of the two scripted downcalls
+/// of §8 step 9 that did not return, and the reason was recorded plainly: there was no
+/// implementation to bind. There is now — `omni_bionic::time::strftime` — and this is the
+/// binding.
+///
+/// # What it returns, and the one answer that is not a length
+///
+/// C17 7.27.3.5: the number of bytes written **not counting the terminating NUL**, or **0** if
+/// the result including the NUL would not fit in `max` — and when it returns 0 the contents of
+/// the array are **indeterminate**. So the zero case writes *nothing* into guest memory rather
+/// than a truncated string: a caller that received a truncated timestamp and a zero could not
+/// tell it from a caller that received nothing, and the truncation is the shape that produces
+/// wrong *text* downstream.
+///
+/// # Every refusal names the conversion, and none of them guesses
+///
+/// `omni-bionic` refuses a conversion it cannot perform correctly rather than emitting something —
+/// `%s` needs `mktime` and the tz database, `%k`/`%l`/`%P`/`%v`/`%+` are extensions outside C and
+/// POSIX, and an unknown conversion is refused rather than copied through as literal text. That
+/// last one is the important one: tzcode-derived libraries emit the literal `%Q` for an unknown
+/// `%Q`, and nothing downstream can tell that from a time.
+///
+/// A field outside its POSIX range is refused **per conversion**, which is why a `tm` the guest
+/// scribbled on fails where it is read rather than producing a date.
+pub(super) fn strftime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (s, max, format, tm) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let written = {
+        let mut view = enter(c, &state);
+        if format == 0 || tm == 0 {
+            return Err(view.refusal(format!(
+                "`strftime` was given a null {}",
+                if format == 0 { "format string" } else { "struct tm" }
+            )));
+        }
+        let format_at = guest_address(view.blaming(2), format)?;
+        let format_bytes =
+            view.mem().cstr(format_at, Blame::new(view.symbol(), view.address(), 2))?;
+        let tm_at = guest_address(view.blaming(3), tm)?;
+        let guest_tm = match time::read_tm(&view, tm_at as u64) {
+            Ok(read) => read,
+            Err(fault) => return Err(view.fault(fault)),
+        };
+        // `tm_zone` is a `const char *` **into guest memory**, and only `%Z` reads it. Read it
+        // here, where the view is alive, rather than inside the formatter: `omni-bionic` has no
+        // guest memory and must not grow any (D19).
+        let zone_bytes = if guest_tm.zone == 0 {
+            None
+        } else {
+            let zone_at = guest_address(view.blaming(3), guest_tm.zone)?;
+            Some(view.mem().cstr(zone_at, Blame::new(view.symbol(), view.address(), 3))?)
+        };
+        let when = time::StrftimeTm {
+            tm: guest_tm.tm,
+            gmtoff: guest_tm.gmtoff,
+            zone: zone_bytes.as_deref(),
+        };
+        // `max` is a `size_t` the guest chose. Narrowed rather than truncated: a `max` wider than
+        // a host `usize` cannot describe a buffer this process could address, and wrapping it
+        // would turn a huge buffer into a small one and a correct result into a silent zero.
+        let Ok(max) = usize::try_from(max) else {
+            return Err(view.refusal(format!(
+                "`strftime` was given max = {max}, which is wider than this host's usize and so \
+                 cannot describe a buffer in this address space"
+            )));
+        };
+        match time::strftime(max, &format_bytes, &when) {
+            Err(why) => return Err(view.refusal(why.to_string())),
+            // C: the array's contents are indeterminate, so nothing is written. A truncated
+            // string beside a zero is the believable wrong answer, and it is one a caller that
+            // checked the return would still carry forward.
+            Ok(time::StrftimeOutput::DoesNotFit { .. }) => 0u64,
+            Ok(time::StrftimeOutput::Fits(bytes)) => {
+                if s == 0 {
+                    return Err(view.refusal(
+                        "`strftime` produced a result and was given a null destination"
+                            .to_string(),
+                    ));
+                }
+                let at = guest_address(view.blaming(0), s)?;
+                // The bytes **and** the NUL, in one access: a destination that is only partly
+                // writable leaves the guest nothing rather than an unterminated string, which is
+                // the direction review finding M1 says to err in.
+                let mut with_nul = bytes;
+                let length = with_nul.len();
+                with_nul.push(0);
+                view.mem().write_bytes(
+                    at,
+                    &with_nul,
+                    Blame::new(view.symbol(), view.address(), 0),
+                )?;
+                length as u64
+            }
+        }
+    };
+    c.ret().u64(written);
+    Ok(())
+}
+
 /// `struct tm *gmtime(const time_t *timer)`
 ///
 /// The same calendar arithmetic as [`gmtime_r`], into **this thread's** `struct tm` rather than

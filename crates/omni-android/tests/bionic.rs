@@ -184,6 +184,14 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          file's LAST section, as `pipe`.",
     ),
     (
+        "strftime",
+        "M4's gate, called by nativeInitFastLog -- one of the two scripted downcalls of §8 step 9          that did not return, and the reason was that there was no implementation to bind. The          file's LAST section; `strftime_l` is there too and is not reached. Bound in M5 once          `omni_bionic::time::strftime` existed.",
+    ),
+    (
+        "pthread_attr_setdetachstate",
+        "M5's gate, called by GameActivity_onCreate step 3 to make the game thread detached          before pthread_create. The file's LAST section -- the initializers never reach it. A          PURE BINDING GAP: omni_bionic::metadata::attr_setdetachstate has existed since phase          3c and nothing called it, and pthread_create already reads the detach state out of the          attribute object, so without this the glue's game thread would have been created          joinable and nothing joins it.",
+    ),
+    (
         "write",
         "M5. The file's Tier C section -- reached only through an address-taken edge -- so it is \
          outside the 188 although `read` and `__write_chk` are inside them. \
@@ -241,7 +249,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 179, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 181, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -253,13 +261,17 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // needs the boundary's symbol table and `ImportCall` deliberately cannot reach it. So
     // 157 + 5 - 3 = 159 inline and 11 + 3 = 14 re-entrant.
     // **M4's gate adds three more** -- `strnlen`, `gmtime`, `getcwd` -- all inline, for 162.
-    // **M5 adds three**, `pipe`, `fcntl` and `write`, also inline, for 165. They are the first
-    // entries in `BEYOND_THE_PREDICTION` found by *decoding* the guest's instructions
-    // (jni-surface.md §5.2) rather than by watching a run reach them, which is why they could be
-    // bound before the call that needs them exists.
-    // Each of the eleven is a symbol `libroblox.so` imports that the static closure did not
+    // **M5 adds five**, all inline, for 167. `pipe`, `fcntl` and `write` are the first entries
+    // in `BEYOND_THE_PREDICTION` found by *decoding* the guest's instructions (jni-surface.md
+    // §5.2) rather than by watching a run reach them, which is why they could be bound before the
+    // call that needs them existed. `pthread_attr_setdetachstate` is the fourth and was found the
+    // other way round -- M5's gate ran into it as an `Unbound`, which is the failure that shape
+    // exists to produce.
+    // `strftime` is the fifth, and it is the one that closes a *known* gap rather than finding
+    // a new one: M4's gate recorded `nativeInitFastLog` failing on it by name.
+    // Each of the thirteen is a symbol `libroblox.so` imports that the static closure did not
     // predict. D17 says 188 is a lower bound; this is by how much, so far.
-    assert_eq!(Bionic::inline_symbols().count(), 165);
+    assert_eq!(Bionic::inline_symbols().count(), 167);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -7626,7 +7638,7 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         );
     }
 
-    // **The split is over the 188 the static closure predicted**, so the eleven symbols M3's and
+    // **The split is over the 188 the static closure predicted**, so the thirteen symbols M3's and
     // M4's gates found outside it — and M5 decoded out of the binary — are subtracted rather than
     // folded in: they are not part of
     // what Task 1 predicted, and counting them here would make the total right for the wrong
