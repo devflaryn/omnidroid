@@ -54,6 +54,16 @@ const MAIN_LIB: &str = "libroblox.so";
 /// `DT_INIT_ARRAY` entries in `libroblox.so`. The same exact figure M3's and M4's gates assert.
 const INITIALIZERS: usize = 3_594;
 
+/// The class of the activity `initializeNativeCode` is called on.
+///
+/// **Not `com/google/androidgamesdk/GameActivity`.** §8 row 13 is called from
+/// `GameActivity.onCreate` with `this`, and `apk-analysis.md` §5.3 measured that
+/// `MainGameActivity extends com.google.androidgamesdk.GameActivity` — so `this` is a
+/// `MainGameActivity`. `the_activity_class_answers_every_member_row_23_looks_up_on_it` is the
+/// assertion that says why it matters, and it is a `const` so the fixture and that assertion
+/// cannot drift apart.
+const ACTIVITY_CLASS: &str = "com/roblox/client/startup/MainGameActivity";
+
 /// Undefined, named symbols in `libroblox.so`'s `.dynsym`.
 const TOTAL_IMPORTS: usize = 565;
 
@@ -599,10 +609,22 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             guest.jni.new_object("android/content/res/Configuration").expect("a Configuration"),
         )
     };
-    // `thiz` is the `GameActivity` instance the Java side would be calling from.
+    // `thiz` is the activity instance the Java side would be calling from, and **it is a
+    // `MainGameActivity`, not a `GameActivity`**.
+    //
+    // `initializeNativeCode` is called from `GameActivity.onCreate` with `this`, and
+    // `apk-analysis.md` §5.3 records that **`MainGameActivity extends
+    // com.google.androidgamesdk.GameActivity`** — so on a device `this` is a `MainGameActivity`.
+    // It matters because §8 row 23's helpers do `GetObjectClass` on the global reference to it
+    // and then ask that one `jclass` for `MainGameActivity.getNativeHelper`. MEASURED with a
+    // `GameActivity` here, n = 1 run: the lookup missed, the engine did not check the id, and the
+    // game thread died in `CallObjectMethodV` with `0x0`.
+    //
+    // The five `gGameActivityClassInfo` members are unaffected: step 13 resolves those through
+    // `FindClass("com/google/androidgamesdk/GameActivity")`, which is a class and not this object.
     let thiz = {
         let _jni = guest.jni.activate().expect("publish the JNI instance");
-        guest.jni.new_object("com/google/androidgamesdk/GameActivity").expect("a GameActivity")
+        guest.jni.new_object(ACTIVITY_CLASS).expect("a MainGameActivity")
     };
 
     let step_13 = *guest
@@ -805,6 +827,35 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // back and leave this comment claiming it had been fixed.
     guest.bionic.stop_guest_threads();
     let stopped = guest.bionic.join_guest_threads(std::time::Duration::from_secs(60));
+    {
+        let mut out = std::io::stderr();
+        // **`report` runs too early to see any of this, and that is how a defect hid here.**
+        // `report` is called the instant step 13 returns, which is *before* the game thread has
+        // run `android_main`. MEASURED: the run that ended with the game thread dead on a null
+        // `jmethodID` printed `JNI misses: 0` from `report` and had exactly one miss by the time
+        // the thread was joined. A measurement taken before the thread that produces it is a
+        // measurement of nothing, which is `VERIFICATION.md` entry 4's shape one step along.
+        let misses = guest.jni.misses();
+        let _ = writeln!(out, "POST-TEARDOWN JNI misses: {}", misses.len());
+        for miss in &misses {
+            let _ = writeln!(
+                out,
+                "  MISS {} {}.{} {}",
+                miss.function, miss.class, miss.member, miss.descriptor
+            );
+        }
+        let _ = writeln!(out, "POST-TEARDOWN JNI census: {:?}", guest.jni.census());
+        let calls = guest.jni.calls();
+        let _ = writeln!(out, "POST-TEARDOWN upcalls: {}", calls.len());
+        for record in calls.iter().rev().take(40).rev() {
+            let _ = writeln!(
+                out,
+                "  CALL {}.{}{} {:?}",
+                record.class, record.member, record.descriptor, record.args
+            );
+        }
+        let _ = out.flush();
+    }
     let _ = writeln!(
         std::io::stderr(),
         "M5 teardown: {} guest thread(s) still running, failures {:?}",
@@ -822,6 +873,37 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         guest.field_u32(base, native_code::BYTES - 4) as u64,
         "the NativeCode really is at least 0x278 bytes, because its last word is readable"
     );
+
+    // ---- the game thread's own JNI, asserted rather than printed -----------------------------
+    //
+    // **A printed list nobody asserts on is a watch and not a detector** (`VERIFICATION.md`
+    // entry 11). Everything above this line is about the thread that called step 13; these two
+    // are about the thread step 13 spawned, and they are the only assertions in this gate that
+    // are.
+    //
+    // A miss on the game thread is a `GetMethodID`/`GetFieldID`/`FindClass` that answered null,
+    // and §8.1's third failure mode is that the engine does not check it. There is no allowlist
+    // because there is nothing on it: MEASURED 0, n = 2 runs. A Tier X miss that is genuinely
+    // expected belongs here **by name**, beside its evidence -- never as a relaxed bound.
+    let misses = guest.jni.misses();
+    assert!(
+        misses.is_empty(),
+        "the run ended with {} JNI miss(es), and the engine does not check what a failed lookup \
+         answers -- the first of them is {:?}",
+        misses.len(),
+        misses.first()
+    );
+    // And the shape a miss turns into one frame later, asserted separately: a miss that the
+    // engine happened not to use would still be a miss, and a null id reaching a call is a
+    // **crash** rather than a gap. Named by the text the typed error carries, so a refusal that
+    // stops naming it stops passing.
+    for failure in guest.bionic.guest_thread_failures() {
+        assert!(
+            !failure.why.contains("as a jmethodID"),
+            "a guest thread died on a null jmethodID, which is jni-surface.md §8.1's third \
+             failure mode: {failure:?}"
+        );
+    }
 }
 
 /// Everything this run measured, printed before anything is asserted.
@@ -867,6 +949,71 @@ fn report(guest: &Guest) {
     }
     let _ = writeln!(out, "================ end of report ================\n");
     let _ = out.flush();
+}
+
+/// §8 row 23's three lookups all resolve from the **one** `jclass` the engine derives from the
+/// activity it was handed, and each resolves at the class that really declares it.
+///
+/// # The failure this would have caught
+///
+/// `NativeEngine::initializing` does `GetObjectClass(activity->javaGameActivity)` **once** and
+/// then asks that single `jclass` for members declared at three levels of the Java hierarchy.
+/// MEASURED from `libroblox.so`, n = 1 run of the gate plus an instruction-level decode:
+///
+/// * `0x02bdaca0` → `GetObjectClass` at `0x02bdace8`, `GetMethodID("getResources",
+///   "()Landroid/content/res/Resources;")` at `0x02bdad0c`, then `bl 0x2bd8c30` at `0x02bdad1c`
+///   — the variadic wrapper whose `CallObjectMethodV` (slot `0x118`) is at `0x02bd8cac`.
+/// * `0x02bd8b20` → the same three steps for `getNativeHelper`
+///   `()Lcom/roblox/client/startup/NativeHelper;` at `0x02bd8b80`, call at `0x02bd8b90`.
+///
+/// **Neither site tests the id.** With the wrong activity class, or with no superclass chain,
+/// `GetMethodID` answers null and the null reaches `CallObjectMethodV` — `jni-surface.md` §8.1's
+/// third failure mode, and it killed the game thread in teardown while the gate itself passed.
+///
+/// Membership and declaring class, not a count: a count could not see `getResources` being
+/// answered by the wrong class.
+///
+/// Separate from the gate and needing neither the APK nor a run, so that it is cheap enough to be
+/// run while the thing it guards is being changed.
+#[test]
+fn the_activity_class_answers_every_member_row_23_looks_up_on_it() {
+    use omni_android::jni::classes::Registry;
+    let registry = Registry::with_declared();
+    let activity = registry
+        .find(ACTIVITY_CLASS)
+        .unwrap_or_else(|| panic!("{ACTIVITY_CLASS} must be declared: it is what step 13 is called on"));
+    // (member, descriptor, the class that must declare it)
+    let required: &[(&str, &str, &str)] = &[
+        (
+            "getNativeHelper",
+            "()Lcom/roblox/client/startup/NativeHelper;",
+            "com/roblox/client/startup/MainGameActivity",
+        ),
+        ("getResources", "()Landroid/content/res/Resources;", "android/content/Context"),
+        ("finish", "()V", "com/google/androidgamesdk/GameActivity"),
+    ];
+    for (member, descriptor, declared_by) in required {
+        let id = registry.method(activity, member, descriptor, false).unwrap_or_else(|| {
+            panic!(
+                "`GetMethodID(GetObjectClass(thiz), \"{member}\", \"{descriptor}\")` answers null, \
+                 and the engine does not check it"
+            )
+        });
+        assert_eq!(
+            registry.class_name(id.class),
+            *declared_by,
+            "`{member}{descriptor}` must resolve at the class that declares it"
+        );
+    }
+    // **The chain is directional**, which is the half a "declare it on both" fix would get wrong:
+    // a `Context` is not a `MainGameActivity` and must not answer its members.
+    let context = registry.find("android/content/Context").expect("declared");
+    assert!(
+        registry
+            .method(context, "getNativeHelper", "()Lcom/roblox/client/startup/NativeHelper;", false)
+            .is_none(),
+        "the superclass must not resolve the subclass's members"
+    );
 }
 
 /// NDK symbols this layer binds that **`libroblox.so` does not import**, and why each is bound.
