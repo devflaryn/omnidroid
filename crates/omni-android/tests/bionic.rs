@@ -8067,3 +8067,401 @@ fn a_readdir_that_cannot_write_its_entry_consumes_no_entry() {
     );
     assert_eq!(value_of(&f, "closedir", |asm| { asm.mov(0, dirp); }) as i64, 0);
 }
+
+// ============================================== M1's shape in the `FILE *` layer (the stream side)
+//
+// `fgets`, `fread` and `fwrite` reached the descriptor **before** the guest's buffer had been
+// validated, exactly as `read`, `pread` and `__write_chk` did. The loops are in
+// `omni_bionic::stdio`, whose entire guest-memory vocabulary is `GuestMemory::read`/`write` — no
+// way to ask whether a range is mapped without writing to it, and no refusal channel — so the
+// admission lives in the adapter, where `GuestMem::checked_ptr` already is. Same reasoning, same
+// place, as the zero-byte-write contract.
+//
+// Every detector below needs a **half-mapped** buffer and reaches the descriptor through a
+// **pipe**, because the return value is a refusal in both versions: only the descriptor can tell
+// a fix from the defect. `island_with_a_cliff` above *asserts* its cliff rather than skipping.
+
+/// A stream over a descriptor the guest already holds, through real guest code.
+fn fdopen_through_guest(f: &Fixture, fd: i32, mode: &[u8]) -> u64 {
+    let at = f.cstring(f.guest.data + 0xc0, mode);
+    let stream = value_of(f, "fdopen", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, at as u64);
+    });
+    assert_ne!(stream, 0, "fdopen returned NULL for fd {fd}");
+    stream
+}
+
+/// Call `symbol`, then read this thread's `errno` back through `__errno`.
+///
+/// The cell is seeded with **`EDOM`** first, which nothing in the stream layer can produce, so an
+/// assertion below distinguishes *set to this* from *left alone* and from *cleared*. Asserting
+/// against zero would pass for a layer that cleared `errno`, which POSIX forbids.
+fn value_and_errno(f: &Fixture, symbol: &str, setup: impl FnOnce(&mut Asm)) -> (u64, i32) {
+    let thunk = f.thunk(symbol);
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.bl(f.thunk("__errno"));
+    asm.mov(1, 33); // EDOM, the sentinel.
+    asm.push(str_w(1, 0, 0));
+    setup(&mut asm);
+    asm.bl(thunk);
+    asm.mov(22, f.guest.data as u64);
+    asm.push(str_imm(0, 22, 0));
+    asm.bl(f.thunk("__errno"));
+    asm.push(ldr_w(1, 0, 0));
+    asm.push(str_imm(1, 22, 8));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    let exit = f.run(&mut cpu, entry).expect("the run must complete");
+    assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    (f.guest.read_u64(f.guest.data), f.guest.read_u64(f.guest.data + 8) as i32)
+}
+
+/// **A `fread` into a half-mapped buffer takes nothing out of the descriptor.**
+///
+/// The defect is invisible below one [`TRANSFER_CHUNK`](omni_bionic::stdio::TRANSFER_CHUNK), for
+/// the reason the `__write_chk` test already documents: the loop moves a chunk at a time and
+/// places each one in a single access, so for `total <= TRANSFER_CHUNK` the placing access failed
+/// before the descriptor was read a second time. It shows at the **second** chunk — the one the
+/// first chunk's descriptor read precedes — so the buffer is one page and the request is two.
+///
+/// The discriminating assertion is on the **pipe**, not on guest memory. A pipe read is
+/// destructive and there is nothing to seek back to; unfixed, the first 4096 bytes are placed in
+/// the island, the next arrive and cannot be placed, and every one of them is gone behind a
+/// return value that says the call failed.
+#[test]
+fn a_fread_into_a_half_mapped_buffer_consumes_nothing_from_the_descriptor() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("m1-fread");
+    let (island, page) = island_with_a_cliff(&f);
+    assert_eq!(
+        page,
+        omni_bionic::stdio::TRANSFER_CHUNK,
+        "this test's arithmetic needs a page to be exactly one TRANSFER_CHUNK; on a host where \
+         it is not, the second chunk would still be inside the island and nothing would be tested"
+    );
+
+    // --- A pipe. The bytes it gives up cannot be recovered.
+    let fs = f.bionic.filesystem().expect("a root");
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    let sent: Vec<u8> = (0..page + 16).map(|i| (i % 251) as u8).collect();
+    assert_eq!(fs.write(write_fd, &sent).expect("the pipe takes it all"), sent.len());
+    let stream = fdopen_through_guest(&f, read_fd, b"r");
+
+    let error = refusal_of(&f, "fread", |asm| {
+        asm.mov(0, island as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 2 * page as u64);
+        asm.mov(3, stream);
+    });
+    assert_eq!(error.symbol(), Some("fread"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert!(error.guest_address().is_some(), "{error}");
+
+    let mut back = vec![0u8; sent.len()];
+    let got =
+        fs.read(read_fd, &mut back).expect("a refused fread leaves the pipe holding its bytes");
+    assert_eq!(got, sent.len(), "a refused `fread` must consume nothing from the pipe");
+    assert_eq!(back, sent, "and the bytes must be the ones that were sent, in order");
+    assert_eq!(
+        read_guest(&f, island, 64),
+        vec![0xAAu8; 64],
+        "and it must place nothing in the part of the buffer that WAS writable -- unfixed, the \
+         first chunk lands here behind a call the guest was told had failed"
+    );
+
+    // --- A regular file. Recoverable by seeking, and deliberately held to the same rule: the
+    // assertion is that the offset never moved, not that something put it back.
+    std::fs::write(scratch.path("f"), &sent).expect("a file");
+    let fd = open_through_guest(&f, "/f", O_RDONLY);
+    assert!(fd >= 0, "open failed with {fd}");
+    let stream = fdopen_through_guest(&f, fd, b"rb");
+    let error = refusal_of(&f, "fread", |asm| {
+        asm.mov(0, island as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 2 * page as u64);
+        asm.mov(3, stream);
+    });
+    assert_eq!(error.symbol(), Some("fread"), "{error:?}");
+    let mut head = [0u8; 8];
+    assert_eq!(fs.read(fd, &mut head).expect("the file is readable"), 8);
+    assert_eq!(&head, &sent[..8], "the refused `fread` must not have moved the file offset");
+}
+
+/// **A `fgets` into a half-mapped buffer takes nothing out of the descriptor.**
+///
+/// `fgets` reads one byte per `read(2)` — deliberately, so that it stops *on* its newline and
+/// leaves the next byte for the next call — and accumulates them host-side until the newline or
+/// the capacity. It is the whole accumulated line that is then placed, so a destination whose
+/// first sixteen bytes are writable swallows a forty-one byte line one byte at a time and loses
+/// every one of them at the single placing access.
+///
+/// Sixteen writable bytes and a `size` of 64: the admission is `size`, because C17 7.21.7.2p2
+/// gives `fgets` an array of `size` characters to write `size - 1` characters and a terminator
+/// into.
+#[test]
+fn an_fgets_into_a_half_mapped_buffer_consumes_nothing_from_the_descriptor() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("m1-fgets");
+    let (island, page) = island_with_a_cliff(&f);
+    // Sixteen writable bytes, then the cliff.
+    let straddling = island + page - 16;
+
+    let fs = f.bionic.filesystem().expect("a root");
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    const LINE: &[u8] = b"0123456789012345678901234567890123456789\n";
+    assert_eq!(LINE.len(), 41, "forty bytes and a newline: past the sixteen that are writable");
+    assert_eq!(fs.write(write_fd, LINE).expect("the line goes in"), LINE.len());
+    let stream = fdopen_through_guest(&f, read_fd, b"r");
+
+    let error = refusal_of(&f, "fgets", |asm| {
+        asm.mov(0, straddling as u64);
+        asm.mov(1, 64);
+        asm.mov(2, stream);
+    });
+    assert_eq!(error.symbol(), Some("fgets"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+
+    let mut back = [0u8; 41];
+    assert_eq!(
+        fs.read(read_fd, &mut back).expect("a refused fgets leaves the pipe holding its line"),
+        41,
+        "a refused `fgets` must consume nothing from the pipe -- unfixed it eats the whole line \
+         one byte at a time and then finds it cannot place it"
+    );
+    assert_eq!(&back, LINE, "and the line must be intact and in order");
+    assert_eq!(
+        read_guest(&f, straddling, 16),
+        vec![0xAAu8; 16],
+        "and nothing is placed in the part of the buffer that was writable"
+    );
+
+    // **The admission is `size`, not `size - 1`, and this is the input that tells them apart.**
+    // Sixteen bytes are writable. A `size` of 17 describes an array of seventeen characters, and
+    // C17 7.21.7.2p2 lets `fgets` write sixteen of them plus a terminator -- so the seventeenth
+    // byte is one a correct call reaches, and a check that admitted `size - 1` would let this
+    // through, swallow sixteen bytes and lose them at the terminator. The companion assertion --
+    // that a `size` of exactly 16 here SUCCEEDS -- is in
+    // `the_stream_admissions_refuse_nothing_that_touches_neither_buffer_nor_descriptor`, and
+    // neither half means anything without the other.
+    assert_eq!(fs.write(write_fd, LINE).expect("the line goes back in"), LINE.len());
+    let error = refusal_of(&f, "fgets", |asm| {
+        asm.mov(0, straddling as u64);
+        asm.mov(1, 17);
+        asm.mov(2, stream);
+    });
+    assert_eq!(error.symbol(), Some("fgets"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    let mut back = [0u8; 41];
+    assert_eq!(
+        fs.read(read_fd, &mut back).expect("the pipe still holds its line"),
+        41,
+        "one byte past the mapping is still past the mapping. A `size - 1` admission would \
+         have taken sixteen bytes out of the pipe and then failed at the terminator"
+    );
+    assert_eq!(&back, LINE);
+}
+
+/// **A `fwrite` out of a half-mapped buffer puts nothing into the descriptor.**
+///
+/// The source side, and it is an instance rather than the mirror image that does not apply:
+/// `transfer_out` reads one chunk out of guest memory, hands it to the descriptor, and only then
+/// looks at the next. A byte in a **pipe** cannot be taken back out, and for the glue's command
+/// pipe half a message is a command.
+///
+/// Like the `__write_chk` detector this mirrors, the count has to cross a chunk boundary: for
+/// `total <= TRANSFER_CHUNK` the single `read_all` already failed before any host write.
+#[test]
+fn an_fwrite_from_a_half_mapped_buffer_puts_nothing_into_the_descriptor() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("m1-fwrite");
+    let (island, page) = island_with_a_cliff(&f);
+    assert_eq!(page, omni_bionic::stdio::TRANSFER_CHUNK, "a page must be exactly one chunk here");
+
+    let path = f.cstring(f.guest.data + 0x100, b"/w");
+    let mode = f.cstring(f.guest.data + 0x140, b"wb");
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, mode as u64);
+    });
+    assert_ne!(stream, 0, "fopen returned NULL");
+
+    let error = refusal_of(&f, "fwrite", |asm| {
+        asm.mov(0, island as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 2 * page as u64);
+        asm.mov(3, stream);
+    });
+    assert_eq!(error.symbol(), Some("fwrite"), "{error:?}");
+    assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
+    assert_eq!(
+        std::fs::metadata(scratch.path("w")).expect("the file exists").len(),
+        0,
+        "a refused `fwrite` must not have put its first chunk into the descriptor"
+    );
+}
+
+/// **And the calls the admission must NOT refuse**, which is the half of this that over-corrects.
+///
+/// `docs/VERIFICATION.md` entry 12 and the mutation table's `order-B1` are both about this: a
+/// check applied unconditionally reads as stricter and is wrong. Four shapes, each asserted by
+/// name rather than assumed:
+///
+/// * a **zero-length** transfer at a wholly unmapped pointer. C17 7.21.8.1p3 leaves the stream
+///   unchanged for `size` or `nmemb` of zero, and `read(fd, NULL, 0)` is legal C.
+/// * an **overflowing `size * nmemb`**, which is `EINVAL` and zero items, not a refusal about a
+///   pointer that was never looked at. A refusal here would replace a defined answer.
+/// * `fgets` with a **non-positive `size`**, which C17 7.21.7.2 does not define and which this
+///   layer answers by touching neither the buffer nor the descriptor.
+/// * an **exactly-fitting** buffer: `size` bytes admitted, not `size + 1`, and a full chunk
+///   admitted, not a chunk plus one. Without these a check that over-reached by a byte would
+///   still pass every refusing test above.
+#[test]
+fn the_stream_admissions_refuse_nothing_that_touches_neither_buffer_nor_descriptor() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("m1-stream-b");
+    let (island, page) = island_with_a_cliff(&f);
+    // Past the cliff: no mapping at all, so any admission of a non-zero length refuses here.
+    let nowhere = island + page;
+
+    let fs = f.bionic.filesystem().expect("a root");
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    let sent: Vec<u8> = (0..page).map(|i| (i % 251) as u8).collect();
+    assert_eq!(fs.write(write_fd, &sent).expect("the pipe takes it all"), page);
+    let stream = fdopen_through_guest(&f, read_fd, b"r");
+
+    // --- Zero-length, at a pointer that is not a pointer.
+    let (items, errno) = value_and_errno(&f, "fread", |asm| {
+        asm.mov(0, nowhere as u64);
+        asm.mov(1, 0);
+        asm.mov(2, 4096);
+        asm.mov(3, stream);
+    });
+    assert_eq!(items, 0, "zero items");
+    assert_eq!(errno, 33, "and the stream is untouched, so `errno` keeps the EDOM sentinel");
+
+    let (items, errno) = value_and_errno(&f, "fread", |asm| {
+        asm.mov(0, nowhere as u64);
+        asm.mov(1, 4096);
+        asm.mov(2, 0);
+        asm.mov(3, stream);
+    });
+    assert_eq!((items, errno), (0, 33), "`nmemb == 0` is the same answer as `size == 0`");
+
+    // --- The unrepresentable product: EINVAL, which is an answer about the arguments and holds
+    // whatever guest memory looks like. Admitting a wrapped or saturated product here would turn
+    // it into a refusal about the pointer.
+    let (items, errno) = value_and_errno(&f, "fread", |asm| {
+        asm.mov(0, nowhere as u64);
+        asm.mov(1, 1u64 << 32);
+        asm.mov(2, 1u64 << 32);
+        asm.mov(3, stream);
+    });
+    assert_eq!(items, 0, "zero items for a product that is not representable");
+    assert_eq!(errno, 22, "EINVAL, and not the EDOM sentinel: the answer must still be given");
+
+    // --- `fgets` with a size C does not define.
+    for size in [0u64, 0xffff_ffff_ffff_ffff] {
+        let (returned, errno) = value_and_errno(&f, "fgets", |asm| {
+            asm.mov(0, nowhere as u64);
+            asm.mov(1, size);
+            asm.mov(2, stream);
+        });
+        assert_eq!(returned, 0, "NULL for a size of {size}");
+        assert_eq!(errno, 33, "and no errno: C17 7.21.7.2 defines no error for it");
+    }
+
+    // --- Exactly-fitting destinations. A `fgets` of the last sixteen bytes of the island writes
+    // fifteen characters and a terminator at most, and sixteen is what is admitted.
+    let (f2, scratch2) = rooted("m1-stream-b2");
+    let (island2, page2) = island_with_a_cliff(&f2);
+    let fs2 = f2.bionic.filesystem().expect("a root");
+    let (read2, write2) = pipe_through_guest(&f2);
+    assert_eq!(fs2.write(write2, b"abc\n").expect("four bytes"), 4);
+    let stream2 = fdopen_through_guest(&f2, read2, b"r");
+    let edge = island2 + page2 - 16;
+    assert_eq!(
+        value_of(&f2, "fgets", |asm| {
+            asm.mov(0, edge as u64);
+            asm.mov(1, 16);
+            asm.mov(2, stream2);
+        }),
+        edge as u64,
+        "a `size` that exactly fills the mapping must be admitted, not refused: admitting \
+         `size + 1` would look stricter and reject a correct call"
+    );
+    assert_eq!(f2.read_cstring(edge), b"abc\n", "and the line arrives, newline kept");
+
+    // A whole-chunk `fread` into a whole-page island, and a whole-chunk `fwrite` out of it.
+    let sent2: Vec<u8> = (0..page2).map(|i| (i % 241) as u8).collect();
+    let mut offered = 0;
+    while offered < sent2.len() {
+        offered += fs2.write(write2, &sent2[offered..]).expect("the pipe takes it");
+    }
+    assert_eq!(
+        value_of(&f2, "fread", |asm| {
+            asm.mov(0, island2 as u64);
+            asm.mov(1, 1);
+            asm.mov(2, page2 as u64);
+            asm.mov(3, stream2);
+        }),
+        page2 as u64,
+        "a request that exactly fills the mapping must be admitted"
+    );
+    assert_eq!(read_guest(&f2, island2, page2), sent2, "and every byte arrives");
+
+    let out = f2.cstring(f2.guest.data + 0x100, b"/o");
+    let wmode = f2.cstring(f2.guest.data + 0x140, b"wb");
+    let sink = value_of(&f2, "fopen", |asm| {
+        asm.mov(0, out as u64);
+        asm.mov(1, wmode as u64);
+    });
+    assert_ne!(sink, 0, "fopen returned NULL");
+    assert_eq!(
+        value_of(&f2, "fwrite", |asm| {
+            asm.mov(0, island2 as u64);
+            asm.mov(1, 1);
+            asm.mov(2, page2 as u64);
+            asm.mov(3, sink);
+        }),
+        page2 as u64,
+        "a source that exactly fills the mapping must be admitted, and admitted READABLE: a \
+         source demanded writable would refuse a guest writing out of its own .rodata"
+    );
+    assert_eq!(value_of(&f2, "fclose", |asm| { asm.mov(0, sink); }) as i64, 0);
+    assert_eq!(std::fs::read(scratch2.path("o")).expect("the host file"), sent2);
+
+    // --- And the source really is admitted READABLE rather than writable. Asserted over a
+    // mapping that is genuinely read-only, because over a read-write one the two are the same
+    // check and the test would pass for a reason that has nothing to do with the rule.
+    f2.guest
+        .space
+        .protect(island2, page2, omni_mem::Protection::Read)
+        .expect("the island read-only");
+    let ro = f2.cstring(f2.guest.data + 0x180, b"/ro");
+    let sink = value_of(&f2, "fopen", |asm| {
+        asm.mov(0, ro as u64);
+        asm.mov(1, wmode as u64);
+    });
+    assert_ne!(sink, 0, "fopen returned NULL");
+    assert_eq!(
+        value_of(&f2, "fwrite", |asm| {
+            asm.mov(0, island2 as u64);
+            asm.mov(1, 1);
+            asm.mov(2, page2 as u64);
+            asm.mov(3, sink);
+        }),
+        page2 as u64,
+        "a guest writing out of its own .rodata is ordinary, and demanding the \
+         destination-side access for a source reads as stricter while being wrong"
+    );
+    assert_eq!(value_of(&f2, "fclose", |asm| { asm.mov(0, sink); }) as i64, 0);
+    assert_eq!(std::fs::read(scratch2.path("ro")).expect("the host file"), sent2);
+    f2.guest
+        .space
+        .protect(island2, page2, omni_mem::Protection::ReadWrite)
+        .expect("writable again");
+}
