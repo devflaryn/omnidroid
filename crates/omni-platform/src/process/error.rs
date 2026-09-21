@@ -58,6 +58,21 @@ pub enum ProcessError {
         /// The raw `GetLastError` code.
         code: u32,
     },
+
+    /// A quantity the standard library reports, which it could not determine.
+    ///
+    /// **Not a catch-all**, and the distinction from the two Windows variants above is the point:
+    /// those name an OS entry point and a number space, and this one names a `std` query that is
+    /// documented as being able to fail — `available_parallelism` does, on a target with no such
+    /// notion or with the permission to ask withheld. It exists because the alternative was
+    /// substituting an answer, which is what the phase-3 review's finding M7 was about.
+    #[error("`{operation}`: the standard library could not determine it: {detail}")]
+    Indeterminate {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// What the standard library said.
+        detail: String,
+    },
 }
 
 impl ProcessError {

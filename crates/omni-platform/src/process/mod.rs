@@ -97,11 +97,25 @@ pub fn pid() -> u32 {
 /// How many CPUs this process may run on, as `sysconf(_SC_NPROCESSORS_ONLN)` reports it.
 ///
 /// `available_parallelism` rather than a raw core count: it honours affinity masks and container
-/// limits, which is what "processors online *for this process*" means. It never returns zero, so
-/// neither does this — a zero would divide by zero in any guest thread-pool sizing that used it.
-#[must_use]
-pub fn cpu_count() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+/// limits, which is what "processors online *for this process*" means. `NonZeroUsize` is the
+/// return type's own guarantee that it is never zero — a zero divides by zero in any guest
+/// thread-pool sizing that uses it.
+///
+/// **It was `-> usize` with `map_or(1, ..)` and that was the substitute-an-answer pattern**
+/// `random_bytes` forbids eleven lines below: a host that could not report its parallelism was
+/// told it had one CPU, which is a believable number and is not a measurement. The phase-3 review
+/// found it (M7) while it was unreachable from any guest path; M3's gate is what made it
+/// reachable, because `sysconf(_SC_NPROCESSORS_ONLN)` answers out of here.
+///
+/// # Errors
+///
+/// [`ProcessError::Indeterminate`] when the standard library cannot determine it, which it
+/// documents as possible when the platform has no such notion or the query itself fails.
+pub fn cpu_count() -> ProcessResult<std::num::NonZeroUsize> {
+    std::thread::available_parallelism().map_err(|error| ProcessError::Indeterminate {
+        operation: "cpu_count",
+        detail: error.to_string(),
+    })
 }
 
 /// Fill `out` with cryptographically strong random bytes.
@@ -169,7 +183,10 @@ mod tests {
     #[test]
     fn the_portable_facts_are_answered_on_every_target() {
         assert_ne!(pid(), 0, "no process has pid 0");
-        assert!(cpu_count() >= 1, "a zero cpu count divides by zero in guest code that uses it");
+        assert!(
+            cpu_count().expect("this host reports its parallelism").get() >= 1,
+            "a zero cpu count divides by zero in guest code that uses it"
+        );
     }
 
     /// Entropy: the buffer is filled, and two draws differ.

@@ -312,7 +312,94 @@ enum Entry {
     Directory { host: PathBuf, guest: String },
     /// One of the three standard streams.
     Standard(StdStream),
+    /// A **character device** this seam serves itself, not a file under the root.
+    ///
+    /// See [`Device`]: the guest's `/dev/urandom` is the entropy source
+    /// [`crate::process::random_bytes`] already provides, and it is not a path that can be
+    /// confined into a host directory because it is not a file.
+    Device(Device),
 }
+
+/// A character device the guest can open by its POSIX path.
+///
+/// # Why the filesystem seam has devices at all
+///
+/// **M3's gate found it, at `init_array[3118]`**, and the message came from the guest's own C++
+/// runtime: `libc++abi: terminating due to uncaught exception of type std::system_error:
+/// random_device failed to open /dev/urandom: No such file or directory`. `std::random_device`
+/// opens `/dev/urandom` and there is no way to satisfy it with a file — the guest reads from it
+/// for the life of the process and any file would run out.
+///
+/// It is **not** a hole in D23's confinement. The confinement rule is that a guest path resolves
+/// inside one host directory; `/dev/urandom` resolves to no host path at all, and what serves it
+/// is `crate::process::random_bytes`, which is the same OS entropy source `arc4random_buf`
+/// already answers from. Nothing here can reach the host filesystem through it.
+///
+/// The set is closed and small on purpose: a device is something this seam *implements*, and
+/// every name added to [`DEVICES`] is a claim that it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Device {
+    /// `/dev/urandom` and `/dev/random`: the host's entropy source.
+    ///
+    /// **The two are the same here, and on Linux since 5.6 they are the same there too** — the
+    /// blocking pool was removed and `/dev/random` blocks only until the CRNG is initialised,
+    /// which it is long before a process starts. There is no distinction left to model.
+    ///
+    /// Reads always fill the whole buffer, which is what a modern `/dev/urandom` does. Writes are
+    /// accepted and discarded: writing to `/dev/urandom` stirs the kernel's pool and the bytes
+    /// are consumed, so "accepted, no observable effect" is the contract rather than a shortcut.
+    Random,
+    /// `/dev/null`: reads end of file, writes are discarded.
+    Null,
+    /// `/dev/zero`: reads fill with zero bytes, writes are discarded.
+    Zero,
+}
+
+/// Which device a guest path names, if any.
+///
+/// The path is put through [`path::resolve_lexically`] first, so the answer is about the path the
+/// guest *means* rather than the bytes it typed: `/dev/./urandom`, `/dev//urandom` and
+/// `/x/../dev/urandom` are all `/dev/urandom`, and none of them can slip past by spelling. A path
+/// that is not resolvable at all is not a device, and the caller's ordinary resolution then
+/// reports why.
+#[must_use]
+pub fn device_for(guest_path: &[u8]) -> Option<Device> {
+    let resolved = path::resolve_lexically("device", guest_path).ok()?;
+    let spelled = resolved.guest_path();
+    DEVICES.iter().find(|(name, _)| *name == spelled).map(|(_, device)| *device)
+}
+
+/// What `stat` and `fstat` say about a device.
+///
+/// A character device: no size, no times, and an identity taken from its own path so that two
+/// descriptors on one device compare equal and two on different devices do not.
+fn device_stat(device: Device) -> FileStat {
+    FileStat {
+        kind: FileKind::Other,
+        size: 0,
+        read_only: false,
+        accessed: None,
+        modified: None,
+        created: None,
+        identity: identity(Path::new(
+            DEVICES
+                .iter()
+                .find(|(_, candidate)| *candidate == device)
+                .map_or("/dev", |(name, _)| *name),
+        )),
+    }
+}
+
+/// Every device path this seam serves, and what serves it.
+///
+/// Matched against the guest's path **after** `path::normalise` has canonicalised it, so
+/// `/dev/./urandom` and `/dev//urandom` reach the same entry and no spelling slips past.
+pub const DEVICES: &[(&str, Device)] = &[
+    ("/dev/urandom", Device::Random),
+    ("/dev/random", Device::Random),
+    ("/dev/null", Device::Null),
+    ("/dev/zero", Device::Zero),
+];
 
 /// Which standard stream a reserved descriptor is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +557,30 @@ impl Filesystem {
                 "a descriptor opened for neither reading nor writing",
             ));
         }
+        // A device is checked before the path is resolved, because it is not a path under the
+        // root and resolving it would answer `ENOENT` for something this seam does implement.
+        if let Some(device) = device_for(guest_path) {
+            let mut table = self.table();
+            if table.open.len() >= MAX_OPEN_FILES {
+                return Err(FsError::kinded(
+                    OP,
+                    shown,
+                    FsErrorKind::TooManyOpenFiles,
+                    format!("this guest instance already holds {MAX_OPEN_FILES} descriptors"),
+                ));
+            }
+            if flags.directory {
+                return Err(FsError::kinded(
+                    OP,
+                    shown,
+                    FsErrorKind::NotADirectory,
+                    "a character device is not a directory",
+                ));
+            }
+            let fd = table.lowest_free_fd();
+            table.open.insert(fd, Entry::Device(device));
+            return Ok(fd);
+        }
         let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
         let mut table = self.table();
         if table.open.len() >= MAX_OPEN_FILES {
@@ -568,6 +679,31 @@ impl Filesystem {
                 FsErrorKind::IsADirectory,
                 "a directory descriptor cannot be read; `readdir` is the call for that",
             )),
+            Some(Entry::Device(device)) => match device {
+                // **A short read is not modelled and must not be**: a modern `/dev/urandom`
+                // fills the whole buffer, and `std::random_device` reads four bytes at a time
+                // without a loop. A partial fill would leave the rest of the caller's buffer
+                // holding whatever was there, which is the believable-wrong-answer shape.
+                Device::Random => {
+                    crate::process::random_bytes(buf).map_err(|error| {
+                        FsError::refused(
+                            OP,
+                            "/dev/urandom",
+                            format!(
+                                "the host entropy source failed: {error}. Filling the buffer from \
+                                 a pseudo-random sequence would satisfy every test that checked \
+                                 the bytes had changed and would not be entropy"
+                            ),
+                        )
+                    })?;
+                    Ok(buf.len())
+                }
+                Device::Null => Ok(0),
+                Device::Zero => {
+                    buf.fill(0);
+                    Ok(buf.len())
+                }
+            },
             Some(Entry::File { file, readable, guest, .. }) => {
                 if !*readable {
                     return Err(FsError::kinded(
@@ -596,6 +732,15 @@ impl Filesystem {
         let mut table = self.table();
         match table.open.get_mut(&fd) {
             None => Err(bad_fd(OP, fd)),
+            // A character device has no offset to read at. Linux answers `ESPIPE` for a `pread`
+            // on one, which is the same answer it gives for a pipe and is what the caller's own
+            // fallback to `read` branches on.
+            Some(Entry::Device(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a character device has no offset, so there is nothing to read *at*",
+            )),
             Some(Entry::Standard(_)) => Err(FsError::kinded(
                 OP,
                 format!("fd {fd}"),
@@ -642,6 +787,11 @@ impl Filesystem {
         let mut table = self.table();
         match table.open.get_mut(&fd) {
             None => Err(bad_fd(OP, fd)),
+            // Every device here accepts everything and keeps none of it, which is what the three
+            // of them do on a device: writing to `/dev/null` and `/dev/zero` discards, and
+            // writing to `/dev/urandom` stirs the kernel's pool and consumes the bytes. The
+            // whole buffer is taken, because a short write here would be invented.
+            Some(Entry::Device(_)) => Ok(buf.len()),
             Some(Entry::Standard(StdStream::In)) => Err(FsError::kinded(
                 OP,
                 format!("fd {fd}"),
@@ -713,6 +863,9 @@ impl Filesystem {
     /// As [`resolve`](Self::resolve), plus [`FsError::Io`] for a host failure.
     pub fn stat(&self, guest_path: &[u8]) -> FsResult<FileStat> {
         const OP: &str = "stat";
+        if let Some(device) = device_for(guest_path) {
+            return Ok(device_stat(device));
+        }
         let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
         let metadata = std::fs::metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
         Ok(describe(&host, &metadata))
@@ -728,6 +881,10 @@ impl Filesystem {
     /// As [`stat`](Self::stat).
     pub fn lstat(&self, guest_path: &[u8]) -> FsResult<FileStat> {
         const OP: &str = "lstat";
+        if let Some(device) = device_for(guest_path) {
+            // A device node is not a symbolic link, so `lstat` and `stat` agree about it.
+            return Ok(device_stat(device));
+        }
         let host = self.resolve(OP, guest_path, FinalLink::Describe)?;
         let metadata = std::fs::symlink_metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
         Ok(describe(&host, &metadata))
@@ -743,6 +900,23 @@ impl Filesystem {
         let table = self.table();
         match table.open.get(&fd) {
             None => Err(bad_fd(OP, fd)),
+            // As a standard stream: a character device, with no size and no times. The
+            // identity is the device's own path, so two descriptors on `/dev/urandom` compare
+            // equal and one on `/dev/null` does not — which is what `st_rdev` gives on a device.
+            Some(Entry::Device(device)) => Ok(FileStat {
+                kind: FileKind::Other,
+                size: 0,
+                read_only: false,
+                accessed: None,
+                modified: None,
+                created: None,
+                identity: identity(Path::new(
+                    DEVICES
+                        .iter()
+                        .find(|(_, candidate)| candidate == device)
+                        .map_or("/dev", |(name, _)| *name),
+                )),
+            }),
             // A standard stream is a character device, which is what a real `fstat` on one
             // reports. Nothing is invented: there is no size, no time and no path.
             Some(Entry::Standard(_)) => Ok(FileStat {
