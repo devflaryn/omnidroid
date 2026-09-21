@@ -2565,41 +2565,93 @@ fn map_fixed_noreplace_is_honoured_and_refuses_an_occupied_address() {
     assert_eq!(misaligned, u64::MAX);
 }
 
-/// **`MADV_FREE` is implemented and `MADV_DONTNEED` is refused**, and the difference is their
-/// contracts: `MADV_FREE` promises "the old contents or zeroes", which `advise_idle` gives, and
-/// `MADV_DONTNEED` promises "zero, immediately", which it does not.
+/// **The guarantee, asserted by reading the bytes back through guest code.**
+///
+/// `MADV_FREE` promises "the old contents or zeroes", which `advise_idle` alone gives.
+/// `MADV_DONTNEED` promises "zero, immediately" -- and the only way to check that is to write a
+/// value, advise the range away, and have the *guest* load from it again. `MADV_REMOVE` stays a
+/// refusal, because it is defined on an underlying object this layer's private anonymous mappings
+/// do not have.
+///
+/// M4's gate is what made this necessary: `JNI_OnLoad` reaches the engine's own heap trim, and
+/// while `MADV_DONTNEED` was refused, §8 step 6 stopped there.
 #[test]
-fn madvise_implements_the_advice_it_can_honour_and_refuses_the_one_it_cannot() {
+fn madvise_dontneed_really_does_return_zero_and_madv_remove_is_refused() {
     let _guard = serialized();
     let f = fixture_with(&[]);
     let length = 64 * 1024;
     let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
     assert_ne!(at, u64::MAX);
-    // Touch it, so there is a committed granule for the advice to be about.
-    let touch = program(&f, |asm| {
+
+    // The value is written and read back **by guest code**, so that "before" and "after" are the
+    // same measurement rather than two different ones -- and so that the read goes through the
+    // demand pager, which is the thing that has to hand back a fresh zero page.
+    let read_back = |f: &Fixture| -> u64 {
+        let entry = program(f, |asm| {
+            asm.mov(9, at);
+            asm.push(ldr_imm(10, 9, 0));
+            asm.mov(11, f.guest.data as u64);
+            asm.push(str_imm(10, 11, 0));
+        });
+        run_program(f, entry).expect("the read must complete");
+        f.guest.read_u64(f.guest.data)
+    };
+    let write = program(&f, |asm| {
         asm.mov(9, at);
-        asm.mov(10, 0x55);
+        asm.mov(10, 0x5555_5555_5555_5555u64);
         asm.push(str_imm(10, 9, 0));
     });
-    run_program(&f, touch).expect("writable");
+    run_program(&f, write).expect("writable");
+    assert_eq!(read_back(&f), 0x5555_5555_5555_5555, "the write landed");
 
+    // `MADV_FREE` is the weak form: the pages may be dropped, so afterwards the contents are the
+    // old ones **or** zeroes. Asserted as that disjunction rather than as one of them, because
+    // pinning either would pin an implementation detail the contract does not give.
     let freed = value_of(&f, "madvise", |asm| {
         asm.mov(0, at);
         asm.mov(1, length);
         asm.mov(2, 8); // MADV_FREE
     });
     assert_eq!(freed as i64 as i32, 0);
+    let after_free = read_back(&f);
+    assert!(
+        after_free == 0x5555_5555_5555_5555 || after_free == 0,
+        "MADV_FREE permits the old contents or zeroes, and this is {after_free:#x}"
+    );
 
-    let dontneed = refusal_of(&f, "madvise", |asm| {
+    // Put the value back, so `MADV_DONTNEED` is tested against a non-zero range whatever
+    // `MADV_FREE` did -- and so that the *sequence* an allocator really makes, free then
+    // dontneed over the same range, is the one under test.
+    run_program(&f, write).expect("writable");
+    assert_eq!(read_back(&f), 0x5555_5555_5555_5555);
+
+    let dontneed = value_of(&f, "madvise", |asm| {
         asm.mov(0, at);
         asm.mov(1, length);
         asm.mov(2, 4); // MADV_DONTNEED
     });
-    assert_eq!(dontneed.symbol(), Some("madvise"));
-    let text = dontneed.to_string();
-    assert!(text.contains("MADV_DONTNEED"), "{text}");
-    assert!(text.contains("zero"), "the refusal must name the guarantee it cannot meet: {text}");
-    assert!(text.contains("MADV_FREE"), "and what is implemented instead: {text}");
+    assert_eq!(dontneed as i64 as i32, 0, "MADV_DONTNEED must be carried out, not refused");
+    assert_eq!(
+        read_back(&f),
+        0,
+        "MADV_DONTNEED guarantees a later read returns zero, and this is the assertion that \
+         distinguishes carrying it out from reporting success"
+    );
+    // The range is still mapped and still writable: `MADV_DONTNEED` releases the contents, not
+    // the mapping. An implementation that unmapped it would pass the zero check above and be
+    // wrong in a way nothing else here would see.
+    run_program(&f, write).expect("still mapped and writable");
+    assert_eq!(read_back(&f), 0x5555_5555_5555_5555);
+
+    let removed = refusal_of(&f, "madvise", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+        asm.mov(2, 9); // MADV_REMOVE
+    });
+    assert_eq!(removed.symbol(), Some("madvise"));
+    let text = removed.to_string();
+    assert!(text.contains("MADV_REMOVE"), "{text}");
+    assert!(text.contains("underlying"), "the refusal names the object it has none of: {text}");
 
     // The purely advisory ones succeed, because ignoring a hint that cannot change what a read
     // returns is the latitude the interface gives.
@@ -2619,6 +2671,7 @@ fn madvise_implements_the_advice_it_can_honour_and_refuses_the_one_it_cannot() {
     });
     assert_eq!(unknown as i64 as i32, -1);
 }
+
 
 /// `mlock` is refused, and the refusal says why `-1`/`ENOMEM` was rejected — it is the most
 /// tempting wrong answer in the group, because a failing `mlock` is ordinary on a real device.

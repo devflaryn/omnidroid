@@ -445,15 +445,41 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
 /// `int madvise(void *addr, size_t length, int advice)`
 ///
-/// **`MADV_FREE` is implemented and `MADV_DONTNEED` is refused, and the difference is the whole
-/// content of this handler.** `MADV_FREE` says the kernel *may* drop the pages and that a later
-/// read will see either the old contents or zeroes — which is precisely what
-/// [`advise_idle`](omni_mem::GuestSpace::advise_idle) plus a later `reclaim_idle` does.
-/// `MADV_DONTNEED` is stronger: on private anonymous memory a subsequent read is *guaranteed* to
-/// be zero, immediately. This layer cannot give that guarantee without writing zeroes over the
-/// range, which would force commit on every lazy granule the call was meant to release — the
-/// opposite of the point. So it is refused by name, with the guarantee it could not meet spelled
-/// out, rather than answered with a success an allocator would believe.
+/// **`MADV_FREE` and `MADV_DONTNEED` differ in *when*, and that is the whole content of this
+/// handler.** `MADV_FREE` says the kernel may drop the pages and that a later read sees either
+/// the old contents or zeroes, which is [`advise_idle`](omni_mem::GuestSpace::advise_idle) alone.
+/// `MADV_DONTNEED` is stronger: on private anonymous memory a later read is *guaranteed* to be
+/// zero, immediately.
+///
+/// # `MADV_DONTNEED` was refused and is now carried out — and the earlier reasoning was wrong
+///
+/// D21 refused it, on the argument that meeting the guarantee would mean **writing zeroes** over
+/// the range and so committing every lazy granule the call was asking to release. That argument
+/// assumed the only way to zero a range is to write to it. It is not:
+/// [`advise_idle`](omni_mem::GuestSpace::advise_idle) followed by
+/// [`reclaim_idle`](omni_mem::GuestSpace::reclaim_idle) **decommits** the granules with
+/// `MEM_DECOMMIT` — D10's only primitive that gives commit charge back — and the demand pager
+/// faults the range back in on the next access as a freshly committed, **zero-filled** page. The
+/// guarantee is met by giving the memory back rather than by writing to it, which is the
+/// direction the call was asking for in the first place.
+///
+/// **Found by M4's gate**, where `JNI_OnLoad` reaches the engine's own heap trim and this refusal
+/// stopped §8 step 6. It is a correction to D21 rather than a relaxation of it: the refusal did
+/// exactly what it was written to do, and what was wrong was its premise.
+///
+/// # Two things a reader needs to know
+///
+/// * **`reclaim_idle` is space-wide.** It decommits every granule any earlier `MADV_FREE` marked,
+///   not only this call's range. `MADV_FREE`'s contract permits the pages to be dropped at any
+///   time, so that is correct; what it costs is that one `MADV_DONTNEED` makes every outstanding
+///   `MADV_FREE` take effect at once.
+/// * **A partial range is refused rather than half-done.** `advise_idle` reports how many bytes
+///   it marked, and an entry it could not split stays in use. Returning `0` after marking less
+///   than the whole range would promise zeroes this layer had not delivered, which is precisely
+///   the believable wrong answer the refusal existed to prevent.
+///
+/// `MADV_REMOVE` stays refused: it is defined on shared, file-backed mappings as punching a hole
+/// in the **underlying object**, and nothing here has an underlying object to punch.
 pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let (addr, length, advice) = {
         let mut a = c.args();
@@ -464,16 +490,65 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let page = space.page_size();
     let at = usize::try_from(addr).unwrap_or(usize::MAX);
 
-    if advice == MADV_DONTNEED || advice == MADV_REMOVE {
+    if advice == MADV_REMOVE {
         return call.refuse(format!(
-            "the guest asked for {} over {length} bytes at {at:#x}. Both promise that a later \
-             read of the range returns zero, immediately; `GuestSpace::advise_idle` only marks \
-             the granules for a later `reclaim_idle`, so the old contents survive until then. \
-             Meeting the promise would mean writing zeroes across the range, which commits every \
-             lazy granule the call was asking to release. MADV_FREE, whose contract is \"old \
-             contents or zeroes\", is implemented",
-            if advice == MADV_DONTNEED { "MADV_DONTNEED" } else { "MADV_REMOVE" }
+            "the guest asked for MADV_REMOVE over {length} bytes at {at:#x}. It is defined as \
+             punching a hole in the object *underlying* a shared mapping, and every mapping this \
+             layer gives the guest is private and anonymous, so there is no underlying object to \
+             punch. MADV_DONTNEED, which is what a private anonymous range wants, is carried out"
         ));
+    }
+
+    if advice == MADV_DONTNEED {
+        let Some(len) = pages(length, page).filter(|&n| n != 0 && at % page == 0) else {
+            let mut view = call.view();
+            fail(&mut view, consts::EINVAL);
+            c.ret(|mut r| r.i32(-1));
+            return Ok(());
+        };
+        if let Err(error) = space.advise_idle(at, len) {
+            let mut view = call.view();
+            fail(&mut view, errno_for(&error));
+            c.ret(|mut r| r.i32(-1));
+            return Ok(());
+        }
+        if let Err(error) = space.reclaim_idle() {
+            let mut view = call.view();
+            fail(&mut view, errno_for(&error));
+            c.ret(|mut r| r.i32(-1));
+            return Ok(());
+        }
+        // **The guarantee, checked directly rather than through a proxy.**
+        //
+        // `advise_idle` returns how many bytes it *newly* marked, which is zero for a range an
+        // earlier `MADV_FREE` already marked -- so a `marked < len` test refuses the ordinary
+        // free-then-dontneed sequence an allocator makes, which is what it did the first time it
+        // was written. What actually has to be true is that nothing in the range is committed any
+        // more, and `RegionInfo::committed` says exactly that, per entry and unmerged.
+        let mut cursor = at;
+        while cursor < at + len {
+            let Some(region) = space.region_at(cursor) else {
+                return call.refuse(format!(
+                    "MADV_DONTNEED over {len} bytes at {at:#x} reaches unmapped address \
+                     {cursor:#x}, so the range it guarantees zeroes for is not all mapped"
+                ));
+            };
+            if region.committed != 0 {
+                return call.refuse(format!(
+                    "MADV_DONTNEED over {len} bytes at {at:#x} left {} committed bytes at {:#x}, \
+                     so a later read there would return the old contents rather than the zeroes \
+                     the call guarantees. Reporting success would be the believable wrong answer",
+                    region.committed, region.start
+                ));
+            }
+            cursor = region.end();
+        }
+        // The bytes at those addresses are gone, so any translation covering them is stale. The
+        // same argument `munmap` and `mprotect` make, and part of why all five of these are on
+        // the exit path at all (finding F9).
+        c.invalidate_code(at, len)?;
+        c.ret(|mut r| r.i32(0));
+        return Ok(());
     }
 
     if advice == MADV_FREE {

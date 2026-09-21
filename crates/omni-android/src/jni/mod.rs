@@ -47,6 +47,7 @@ pub mod pool;
 pub mod refs;
 pub mod script;
 pub mod slots;
+pub mod surface;
 pub mod values;
 
 use std::cell::RefCell;
@@ -599,6 +600,19 @@ impl Jni {
         (state.handles.live_references(), state.handles.live_objects(), state.handles.peak_references())
     }
 
+    /// The first address of the pinned pool, for a diagnostic that has to say whether a guest
+    /// pointer is one this layer handed out.
+    #[must_use]
+    pub fn pool_base(&self) -> GuestAddr {
+        self.pool.lock().base()
+    }
+
+    /// How many bytes the pinned pool reserves.
+    #[must_use]
+    pub fn pool_bytes(&self) -> usize {
+        self.pool.lock().bytes()
+    }
+
     /// How many pinned buffers are live and how many bytes they hold.
     ///
     /// A non-zero count after a call that should have released everything is a leak, and it is
@@ -607,6 +621,45 @@ impl Jni {
     pub fn pin_stats(&self) -> (usize, usize, usize) {
         let pool = self.pool.lock();
         (pool.live_pins(), pool.pinned_bytes(), pool.peak_pinned_bytes())
+    }
+
+    /// **Decide what a member answers**, replacing whatever the table declared.
+    ///
+    /// This is the facility D7's argument rests on, made explicit: 90% of the 409-member surface
+    /// is Roblox's own thin Kotlin shell *whose behaviour Omnidroid gets to define*, and this is
+    /// where an embedding defines it. [`classes::Answer::Unanswered`] is the table's way of
+    /// saying "the layer does not know and will refuse"; this is the host's way of saying it
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] if the class or the member is not declared, naming both — a
+    /// silent no-op here would leave the host believing it had decided something it had not.
+    pub fn define(
+        &self,
+        class: &str,
+        member: &str,
+        descriptor: &str,
+        is_static: bool,
+        answer: classes::Answer,
+    ) -> AbiResult<()> {
+        let mut state = self.state.lock();
+        let refuse = |detail: String| AbiError::JniRefused {
+            function: "Jni::define".to_string(),
+            address: self.arena,
+            detail,
+        };
+        let Some(id) = state.registry.find(class) else {
+            return Err(refuse(format!("`{class}` is not declared")));
+        };
+        let Some(method) = state.registry.method(id, member, descriptor, is_static) else {
+            return Err(refuse(format!(
+                "`{class}` declares no {}method `{member}{descriptor}`",
+                if is_static { "static " } else { "" }
+            )));
+        };
+        state.registry.member_mut(method).expect("just resolved").answer = answer;
+        Ok(())
     }
 
     /// The class registry, for a host that wants to declare more classes before running.
@@ -956,8 +1009,11 @@ mod tests {
         let jni = instance();
         let (classes, members) =
             jni.with_registry(|registry| (registry.class_count(), registry.member_count()));
-        assert_eq!(classes, classes::DECLARED.len());
-        assert!(members > 100, "the declared surface is {members} members");
+        // The hand-written table plus the generated one, which overlap: the lower bound is the
+        // larger of the two and the upper bound is their sum.
+        assert!(classes >= classes::DECLARED.len().max(surface::DEX_CLASSES), "{classes}");
+        assert!(classes <= classes::DECLARED.len() + surface::DEX_CLASSES, "{classes}");
+        assert!(members > surface::DEX_MEMBERS, "the declared surface is {members} members");
         assert!(jni.misses().is_empty());
         assert!(jni.calls().is_empty());
         assert_eq!(jni.calls_dropped(), 0);

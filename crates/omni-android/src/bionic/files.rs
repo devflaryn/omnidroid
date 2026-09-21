@@ -844,6 +844,59 @@ fn transfer(
     }
 }
 
+// ================================================================== the working directory
+
+/// `char *getcwd(char *buf, size_t size)`
+///
+/// **The guest's working directory is the confinement root, and from inside it that is `/`.**
+///
+/// There is no `chdir` here and no per-process directory to change: every guest path is
+/// resolved against the one root the host supplied (D23), so the only directory the guest can
+/// be *in* is that root, and the only name it has for it is `/`. Answering the host's own
+/// working directory would be a fact about this process rather than about the guest, and it
+/// would name a path outside the confinement boundary -- which is the direction D23's whole
+/// design exists to stop.
+///
+/// **Not among the 188 statically-reachable imports.** M4's gate found it: the engine calls it
+/// from `MainGameActivity.nativeSetAssetPath`, and D17 records 188 as a lower bound.
+///
+/// The error cases are the POSIX ones, and they are errors rather than refusals because a
+/// caller that passes a one-byte buffer is asking a question with a defined answer:
+/// `EINVAL` for a zero `size` with a non-null `buf`, `ERANGE` when the name does not fit.
+pub(super) fn getcwd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (buf, size) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let mut view = enter(c, &state);
+    // The root, NUL included.
+    const CWD: &[u8] = b"/ ";
+    if buf == 0 {
+        // glibc and bionic both allocate in this case. There is no guest allocator this layer
+        // can call, and handing back a pointer into host-owned memory would give the guest an
+        // address it would later `free`. `EINVAL` with null is what POSIX defines for a null
+        // `buf` outside that extension.
+        view.set_errno(consts::EINVAL);
+        c.ret().u64(0);
+        return Ok(());
+    }
+    if size == 0 {
+        view.set_errno(consts::EINVAL);
+        c.ret().u64(0);
+        return Ok(());
+    }
+    if size < CWD.len() as u64 {
+        view.set_errno(consts::ERANGE);
+        c.ret().u64(0);
+        return Ok(());
+    }
+    let address = guest_address(&view, buf)?;
+    view.mem().write_bytes(address, CWD, Blame::new(view.symbol(), view.address(), 0))?;
+    c.ret().u64(buf);
+    Ok(())
+}
+
 // ================================================================== metadata
 
 /// `int access(const char *pathname, int mode)`

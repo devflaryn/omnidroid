@@ -253,7 +253,9 @@ fn strncpy_chk_and_chk2_named_failures() {
     // dst overflow: n > dst_size.
     let err = strncpy_chk(&mut mem, 0x1000, 0x2000, 5, 4).unwrap_err();
     assert_eq!(err, BionicError::CheckFailed("__strncpy_chk"));
-    // chk2: n > src_size fails even when dst is fine.
+    // chk2's **source** check: the source object is 3 bytes and holds `abc` with its NUL at
+    // offset 3, outside it. Bionic's loop reaches `src[3]`, sees `3 >= src_len`, and calls
+    // `__fortify_fatal`. This is the case that really does fail.
     let err2 = strncpy_chk2(&mut mem, 0x1000, 0x2000, 4, 8, 3).unwrap_err();
     assert_eq!(err2, BionicError::CheckFailed("__strncpy_chk2"));
     // chk2 happy path: n <= both.
@@ -261,6 +263,22 @@ fn strncpy_chk_and_chk2_named_failures() {
     let mut out = [0u8; 4];
     mem.read(0x1000, &mut out).unwrap();
     assert_eq!(out, [b'a', b'b', b'c', 0]);
+
+    // **The case that used to fail and must not.** `strncpy(dst, src, sizeof dst)` with a
+    // source object smaller than `n` is the commonest FORTIFY shape there is: the source's NUL
+    // is inside its own object, so bionic copies two bytes and NUL-pads the rest of `n` without
+    // ever reading past the source. `n > src_size` on its own is not a failure, and asserting
+    // that it is was what stopped jni-surface.md section 8 step 6 on the real engine.
+    mem.map_str(0x3000, "ab");
+    mem.map(0x1000, &[0xffu8; 8]);
+    assert_eq!(strncpy_chk2(&mut mem, 0x1000, 0x3000, 4, 4, 3), Ok(0x1000));
+    let mut out = [0u8; 5];
+    mem.read(0x1000, &mut out).unwrap();
+    assert_eq!(
+        out,
+        [b'a', b'b', 0, 0, 0xff],
+        "exactly n bytes written, NUL-padded, and nothing past n disturbed"
+    );
 }
 
 #[test]

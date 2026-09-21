@@ -107,6 +107,22 @@ pub const ERRNO_OFFSET: usize = 0;
 pub const LOCALE_OFFSET: usize = 8;
 /// Offset of the scratch buffer inside a thread block.
 pub const SCRATCH_OFFSET: usize = 16;
+/// Bytes of the scratch buffer a returned **string** may use.
+///
+/// The scratch is shared between two kinds of returned pointer, and they are given disjoint
+/// halves rather than taking turns: `strerror` and `dlerror` return a `char *` the guest may
+/// hold across other calls, and `gmtime` returns a `struct tm *` with the same property. One
+/// buffer for both would let a `gmtime` between a `strerror` and the guest's `printf` of it
+/// rewrite the message.
+///
+/// 200 bytes, which is [`SCRATCH_BYTES`] less the 56 a `struct tm` takes. Bionic's longest
+/// `strerror` message is well under a hundred, so nothing that fitted before stops fitting; a
+/// longer one is still refused by name rather than truncated.
+pub const STRING_SCRATCH_BYTES: usize = SCRATCH_BYTES - omni_bionic::time::TM_BYTES;
+
+/// Offset of this thread's `struct tm` inside a thread block. See [`STRING_SCRATCH_BYTES`].
+pub const TM_OFFSET: usize = SCRATCH_OFFSET + STRING_SCRATCH_BYTES;
+
 /// Offset of the first `dl_phdr_info` record inside a thread block.
 pub const DL_INFO_OFFSET: usize = 16 + SCRATCH_BYTES;
 
@@ -237,6 +253,12 @@ impl<'a> GuestView<'a> {
     #[must_use]
     pub fn scratch_address(&self) -> GuestAddr {
         self.active.block + SCRATCH_OFFSET
+    }
+
+    /// This thread's `struct tm`, which `gmtime` returns a pointer to.
+    #[must_use]
+    pub fn tm_address(&self) -> GuestAddr {
+        self.active.block + TM_OFFSET
     }
 
     /// This thread's `dl_phdr_info` record for boundary nesting level `depth`.
@@ -380,6 +402,6 @@ impl GuestContext for GuestView<'_> {
     }
 
     fn scratch(&mut self) -> Option<(u64, usize)> {
-        Some((self.scratch_address() as u64, SCRATCH_BYTES))
+        Some((self.scratch_address() as u64, STRING_SCRATCH_BYTES))
     }
 }

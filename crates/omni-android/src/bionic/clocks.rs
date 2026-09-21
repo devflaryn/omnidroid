@@ -301,6 +301,49 @@ pub(super) fn gmtime_r(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `struct tm *gmtime(const time_t *timer)`
+///
+/// The same calendar arithmetic as [`gmtime_r`], into **this thread's** `struct tm` rather than
+/// one the caller supplies -- which is what the non-`_r` form is: a pointer to storage the
+/// library owns and the caller must not free. Per thread rather than per process, which is what
+/// bionic does and what stops two guest threads overwriting each other's result.
+///
+/// **Not among the 188 statically-reachable imports.** M4's gate found it: the engine calls it
+/// from `NativeSettingsInterface.nativeInitFastLog`, which formats a timestamp for every log
+/// line. D17 records 188 as a lower bound.
+///
+/// A year outside `int tm_year` is `EOVERFLOW` and a null return, exactly as [`gmtime_r`]
+/// answers it -- the one case where the two must agree and the easiest place for them to drift.
+pub(super) fn gmtime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let timer = {
+        let mut a = c.args();
+        a.next_u64()?
+    };
+    let state = active(c.symbol(), c.address())?;
+    let returned = {
+        let mut view = enter(c, &state);
+        let timer_at = guest_address(view.blaming(0), timer)?;
+        let timestamp =
+            view.mem().read_u64(timer_at, Blame::new(view.symbol(), view.address(), 0))? as i64;
+        match time::gmtime(timestamp) {
+            Err(GmtimeError::YearOutOfRange { .. }) => {
+                view.set_errno(EOVERFLOW);
+                0u64
+            }
+            Ok(tm) => {
+                let zone = state.bionic.utc_zone();
+                let at = view.tm_address();
+                if let Err(fault) = time::write_tm(&mut view, at as u64, &tm, zone as u64) {
+                    return Err(view.fault(fault));
+                }
+                at as u64
+            }
+        }
+    };
+    c.ret().u64(returned);
+    Ok(())
+}
+
 /// The duration a `(seconds, nanoseconds)` pair asks for, or the errno a malformed one gets.
 ///
 /// POSIX: `tv_nsec` must be in `[0, 999999999]` and `tv_sec` must not be negative; anything else

@@ -34,9 +34,10 @@
 //!   here [`crate::error::BionicError::CheckFailed`]. (`>=`, not `>`: bionic passes the
 //!   object size, and a string filling the whole object with no room for NUL is the bug.)
 //! * `__strncpy_chk2(dst, src, n, dst_size, src_size)`: bionic's two-source-size variant —
-//!   aborts if `n > dst_size` **or** if `src`'s first `n` bytes are not all readable within
-//!   `src_size`. Here: `CheckFailed` naming `__strncpy_chk2` for the dst check; the src check
-//!   degrades to reading through the trait (a fault names the address), documented below.
+//!   aborts if `n > dst_size`, and aborts on the **source** side only if the copy would really
+//!   read `src[src_size]`, i.e. there is no NUL in the first `min(n, src_size)` bytes. `n >
+//!   src_size` alone is NOT a failure: that is `strncpy(dst, src, sizeof dst)` with a shorter
+//!   source, which bionic copies and NUL-pads.
 //! * `__strcat_chk(dst, src, dst_size)`: aborts if the combined length would exceed
 //!   `dst_size` (i.e. `strlen(dst) + strlen(src) + 1 > dst_size` — the `+1` for NUL is
 //!   bionic's documented intent).
@@ -370,10 +371,21 @@ pub fn strncpy_chk(
 
 /// `char *__strncpy_chk2(char *dst, const char *src, size_t n, size_t dst_size, size_t src_size)`
 ///
-/// Bionic's two-size variant: fails the check when `n > dst_size` **or** `n > src_size`
-/// (bionic aborts when the requested copy cannot be served from the source object).
-/// Here both are named [`crate::error::BionicError::CheckFailed`] failures for
-/// `"__strncpy_chk2"`.
+/// Bionic's two-size variant. The destination check is `n > dst_size`, and the **source** check
+/// is per byte actually read: bionic's loop aborts only when it is about to read `src[src_size]`,
+/// which it never reaches if the source's NUL comes first.
+///
+/// # `n > src_size` was the check and it was wrong
+///
+/// This used to fail whenever `n > src_size`, which aborts the single commonest FORTIFY shape
+/// there is: `strncpy(dst, src, sizeof dst)` where `src` is a smaller object. Bionic copies the
+/// source up to its NUL and NUL-pads the rest of `n`; nothing reads past the source at all.
+/// **Found by M4's gate**, where `JNI_OnLoad` does exactly that and the refusal stopped
+/// jni-surface.md section 8 step 6 -- a check that was wrong in the direction that refuses
+/// legitimate calls, which is the safe direction to be wrong in and still a defect.
+///
+/// A source with no NUL in its first `min(n, src_size)` bytes and `n > src_size` **does** fail:
+/// that is the case where bionic's loop really would read `src[src_size]`.
 pub fn strncpy_chk2(
     mem: &mut impl GuestMemory,
     dst: u64,
@@ -382,10 +394,37 @@ pub fn strncpy_chk2(
     dst_size: u64,
     src_size: u64,
 ) -> crate::error::BionicResult<u64> {
-    if n > dst_size || n > src_size {
+    if n > dst_size {
         return Err(crate::error::BionicError::CheckFailed("__strncpy_chk2"));
     }
-    Ok(strncpy(mem, dst, src, n)?)
+    let (d, n) = checked_range(dst, n)?;
+    if n == 0 {
+        return Ok(dst);
+    }
+    // Bionic reads at most this many source bytes: it stops at the NUL and it stops before
+    // `src_size`. The scan is bounded by both, so an unterminated source cannot run away.
+    let readable = n.min(src_size);
+    let src_nul = find_nul_bounded(mem, src, readable)?;
+    let copy_len = match src_nul {
+        Some(nul) => nul - src,
+        None if n > src_size => {
+            // The loop would have reached `src[src_size]` without having seen a NUL, which is
+            // where bionic calls `__fortify_fatal`.
+            return Err(crate::error::BionicError::CheckFailed("__strncpy_chk2"));
+        }
+        None => n,
+    };
+    let bytes = read_vec(mem, src, copy_len)?;
+    let mut out = Vec::with_capacity(n as usize);
+    out.extend_from_slice(&bytes);
+    if src_nul.is_some() {
+        // C's padding rule: `strncpy` writes exactly `n` bytes, the tail as NULs.
+        out.push(0);
+        out.resize(n as usize, 0);
+    }
+    probe_mapped(mem, d, n)?;
+    mem.write(d, &out)?;
+    Ok(dst)
 }
 
 /// `char *strcat(char *dst, const char *src)`

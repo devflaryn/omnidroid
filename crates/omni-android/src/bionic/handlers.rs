@@ -218,6 +218,14 @@ handlers! {
     /// `size_t __strlen_chk(const char *s, size_t s_len)` — FORTIFY.
     fn strlen_chk(s: ptr, s_len: u64) -> u64 = |v| omni_bionic::string::strlen_chk(&v, s, s_len);
 
+    /// `size_t strnlen(const char *s, size_t n)`
+    ///
+    /// **Not among the 188 statically-reachable imports**, and M4's gate is what found it: the
+    /// engine reaches it from `JNI_OnLoad`'s registration helpers, and D17 says in as many
+    /// words that 188 is a *lower* bound with 17,698 unfollowable indirect call sites behind it.
+    /// The implementation was already in `omni-bionic`; only the binding was missing.
+    fn strnlen(s: ptr, n: u64) -> u64 = |v| omni_bionic::string::strnlen(&v, s, n);
+
     /// `int strcmp(const char *a, const char *b)` — byte difference, unchanged.
     fn strcmp(a: ptr, b: ptr) -> i32 = |v| omni_bionic::string::strcmp(&v, a, b);
 
@@ -806,6 +814,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("__memset_chk", memset_chk),
     // strings
     ("strlen", strlen),
+    ("strnlen", strnlen),
     ("__strlen_chk", strlen_chk),
     ("strcmp", strcmp),
     ("strncmp", strncmp),
@@ -906,6 +915,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // `omni-bionic`'s calendar arithmetic, which needs no clock at all.
     ("clock_gettime", clocks::clock_gettime),
     ("gettimeofday", clocks::gettimeofday),
+    ("gmtime", clocks::gmtime),
     ("gmtime_r", clocks::gmtime_r),
     ("nanosleep", clocks::nanosleep),
     ("usleep", clocks::usleep),
@@ -944,6 +954,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pread", files::pread),
     ("__write_chk", files::write_chk),
     ("access", files::access),
+    ("getcwd", files::getcwd),
     ("stat", files::stat),
     ("fstat", files::fstat),
     ("lstat", files::lstat),

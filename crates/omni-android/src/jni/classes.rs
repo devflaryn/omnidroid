@@ -112,6 +112,29 @@ pub enum Answer {
     Null,
     /// `<init>`: construct an instance of the declaring class with no fields set.
     NewInstance,
+    /// Construct an instance of **another** declared class and return it.
+    ///
+    /// What a factory getter is: `ActivityThread.currentApplication()`,
+    /// `Context.getResources()`, `Resources.getDisplayMetrics()`. The engine walks that chain to
+    /// reach five `DisplayMetrics` fields, and each link is a real object rather than a pretend
+    /// one — the fields at the end are what the host defines.
+    NewInstanceOf(&'static str),
+    /// `ClassLoader.loadClass(String)` / `findClass(String)`: resolve argument 0 as a class name
+    /// and return the `jclass`, or Java `null` when nothing declares it.
+    ///
+    /// **This is the member that reads like a D7 violation and is not**, and it is a variant of
+    /// its own so that the reading is unavoidable: it resolves a *name* against this registry.
+    /// It reads no bytes, defines no class, and `DefineClass` remains a refusal that names
+    /// itself. See the module docs.
+    ResolveClass,
+    /// `String.getBytes(String charset)`: the receiver's text, encoded.
+    StringBytes,
+    /// An `Object[0]`.
+    ///
+    /// `List.toArray()` on the empty list this layer hands the engine. Correct rather than a
+    /// stub: the list really has no elements, and an empty array is what `toArray` returns for
+    /// one.
+    EmptyObjectArray,
     /// Read the named field of the receiver and return it.
     Field(&'static str),
     /// The member is on the surface and the host has **not** decided what it answers.
@@ -193,7 +216,65 @@ impl Registry {
         for spec in DECLARED {
             registry.declare(spec).expect("this crate's own class declarations are well formed");
         }
+        // **The generated surface goes in second, and that order is the policy.** `extend_with`
+        // adds a class that is not declared and, for one that is, only the members it does not
+        // already have -- so every decided answer above survives and every *other* member of a
+        // class the engine can name still resolves. See `surface`'s own header.
+        for spec in super::surface::DEX_SURFACE {
+            registry.extend_with(spec);
+        }
         registry
+    }
+
+    /// Declare `spec`, or add to an existing class only the members it does not already have.
+    ///
+    /// **A hand-written declaration always wins.** A member already present keeps its
+    /// [`Answer`]; one that is not present arrives with whatever `spec` gives it, which for the
+    /// generated surface is [`Answer::Unanswered`].
+    ///
+    /// Returns how many members were added.
+    pub fn extend_with(&mut self, spec: &ClassSpec) -> usize {
+        let Some(id) = self.find(spec.name) else {
+            let before = self.member_count();
+            // The only failures are a duplicate name, excluded by the `find` above, and an id
+            // that does not fit in 16 bits. The second is this crate's own problem and is
+            // asserted by `the_whole_declared_surface_fits_the_id_encoding`; a registry that is
+            // short is better than a panic reachable from a host that declared its own classes.
+            let _ = self.declare(spec);
+            return self.member_count() - before;
+        };
+        let mut added = 0;
+        for member in spec.methods {
+            if self.method(id, member.name, member.descriptor, member.is_static).is_none() {
+                let class = &mut self.classes[usize::from(id.0)];
+                if class.methods.len() < usize::from(u16::MAX) {
+                    class.methods.push(Member {
+                        name: member.name.to_string(),
+                        descriptor: member.descriptor.to_string(),
+                        is_static: member.is_static,
+                        answer: member.answer,
+                        bound_native: None,
+                    });
+                    added += 1;
+                }
+            }
+        }
+        for member in spec.fields {
+            if self.field(id, member.name, member.descriptor, member.is_static).is_none() {
+                let class = &mut self.classes[usize::from(id.0)];
+                if class.fields.len() < usize::from(u16::MAX) {
+                    class.fields.push(Member {
+                        name: member.name.to_string(),
+                        descriptor: member.descriptor.to_string(),
+                        is_static: member.is_static,
+                        answer: member.answer,
+                        bound_native: None,
+                    });
+                    added += 1;
+                }
+            }
+        }
+        added
     }
 
     /// Add a class.
@@ -355,9 +436,14 @@ impl Registry {
             Answer::Double(value) => Value::Double(value),
             Answer::Text(text) => Value::Text(text.to_string()),
             Answer::Null => Value::Object(None),
-            Answer::Field(_) | Answer::NewInstance | Answer::Native | Answer::Unanswered => {
-                return None
-            }
+            Answer::Field(_)
+            | Answer::NewInstance
+            | Answer::NewInstanceOf(_)
+            | Answer::ResolveClass
+            | Answer::StringBytes
+            | Answer::EmptyObjectArray
+            | Answer::Native
+            | Answer::Unanswered => return None,
         })
     }
 }
@@ -414,8 +500,10 @@ const NONE: &[MemberSpec] = &[];
 static GAME_ACTIVITY: &[MemberSpec] = &[
     m("finish", "()V", Answer::Sink),
     m("setWindowFlags", "(II)V", Answer::Sink),
-    m("getWindowInsets", "(I)Landroidx/core/graphics/Insets;", Answer::Unanswered),
-    m("getWaterfallInsets", "()Landroidx/core/graphics/Insets;", Answer::Unanswered),
+    m("getWindowInsets", "(I)Landroidx/core/graphics/Insets;",
+        Answer::NewInstanceOf("androidx/core/graphics/Insets")),
+    m("getWaterfallInsets", "()Landroidx/core/graphics/Insets;",
+        Answer::NewInstanceOf("androidx/core/graphics/Insets")),
     m("setImeEditorInfoFields", "(III)V", Answer::Sink),
 ];
 
@@ -501,14 +589,18 @@ pub static DECLARED: &[ClassSpec] = &[
     ClassSpec {
         name: "android/content/res/Configuration",
         tier: Tier::Zero,
-        methods: &[m("getLocales", "()Landroid/os/LocaleList;", Answer::Unanswered)],
+        methods: &[m(
+            "getLocales",
+            "()Landroid/os/LocaleList;",
+            Answer::NewInstanceOf("android/os/LocaleList"),
+        )],
         fields: CONFIGURATION,
     },
     ClassSpec {
         name: "java/lang/String",
         tier: Tier::Zero,
         methods: &[
-            m("getBytes", "(Ljava/lang/String;)[B", Answer::Unanswered),
+            m("getBytes", "(Ljava/lang/String;)[B", Answer::StringBytes),
             m("onSetCookie", "([Ljava/lang/String;Ljava/lang/String;)V", Answer::Sink),
         ],
         fields: NONE,
@@ -520,8 +612,10 @@ pub static DECLARED: &[ClassSpec] = &[
         tier: Tier::Zero,
         methods: &[
             s("currentActivityThread", "()Landroid/app/ActivityThread;", Answer::NewInstance),
-            s("currentApplication", "()Landroid/app/Application;", Answer::Unanswered),
-            m("getApplication", "()Landroid/app/Application;", Answer::Unanswered),
+            s("currentApplication", "()Landroid/app/Application;",
+                Answer::NewInstanceOf("android/app/Application")),
+            m("getApplication", "()Landroid/app/Application;",
+                Answer::NewInstanceOf("android/app/Application")),
         ],
         fields: NONE,
     },
@@ -530,9 +624,10 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "java/lang/ClassLoader",
         tier: Tier::Zero,
         methods: &[
-            m("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", Answer::Unanswered),
-            m("findClass", "(Ljava/lang/String;)Ljava/lang/Class;", Answer::Unanswered),
-            m("getClassLoader", "()Ljava/lang/ClassLoader;", Answer::Unanswered),
+            m("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", Answer::ResolveClass),
+            m("findClass", "(Ljava/lang/String;)Ljava/lang/Class;", Answer::ResolveClass),
+            m("getClassLoader", "()Ljava/lang/ClassLoader;",
+                Answer::NewInstanceOf("java/lang/ClassLoader")),
         ],
         fields: NONE,
     },
@@ -554,7 +649,7 @@ pub static DECLARED: &[ClassSpec] = &[
             s(
                 "getDeviceStaticParams",
                 "()Lcom/roblox/engine/jni/model/DeviceStaticParams;",
-                Answer::Unanswered,
+                Answer::NewInstanceOf("com/roblox/engine/jni/model/DeviceStaticParams"),
             ),
             s("getMobileAdvertisingId", "()V", Answer::Sink),
             s("getWebViewUserAgent", "()V", Answer::Sink),
@@ -668,7 +763,8 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "com/roblox/client/startup/MainGameActivity",
         tier: Tier::One,
         methods: &[
-            m("getNativeHelper", "()Lcom/roblox/client/startup/NativeHelper;", Answer::Unanswered),
+            m("getNativeHelper", "()Lcom/roblox/client/startup/NativeHelper;",
+                Answer::NewInstanceOf("com/roblox/client/startup/NativeHelper")),
             m("bootstrapTheApp", "()V", Answer::Sink),
             m("syncCookiesFromEngine", "()V", Answer::Sink),
             m("openWebActivity", "(Ljava/lang/String;Ljava/lang/String;)V", Answer::Sink),
@@ -718,7 +814,11 @@ pub static DECLARED: &[ClassSpec] = &[
     ClassSpec {
         name: "com/snapchat/djinni/NativeObjectManager",
         tier: Tier::One,
-        methods: &[m("getClassLoader", "()Ljava/lang/ClassLoader;", Answer::Unanswered)],
+        methods: &[m(
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            Answer::NewInstanceOf("java/lang/ClassLoader"),
+        )],
         fields: NONE,
     },
     ClassSpec {
@@ -727,11 +827,112 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: &[m("<init>", "(FFFFFZIIIIIIZZZ)V", Answer::NewInstance)],
         fields: NONE,
     },
+    // ---- the four parameter objects, with the member lists read out of the dex -------------
+    //
+    // **VERIFIED from `classes2.dex`**, not guessed. `jni-surface.md` Section D leaves these
+    // lookups in its `!unresolved` group — the in-binary dataflow could not tie them to a class —
+    // and the engine's own `GetFieldID` sites are the only other evidence. So the member lists
+    // here were read out of the dex directly, which is what turned "`DeviceStaticParams.osVersion`
+    // is missing" from one refusal per member into one list. The dex gives the **names, types and
+    // order**; every *value* below is the host's own decision about the device Omnidroid presents.
+    ClassSpec {
+        name: "com/roblox/engine/jni/model/DeviceStaticParams",
+        tier: Tier::One,
+        methods: &[m("<init>", "()V", Answer::NewInstance)],
+        fields: &[
+            f("appBuildVariant", "Ljava/lang/String;", Answer::Text("release")),
+            f("appVersion", "Ljava/lang/String;", Answer::Text("2.738.1397")),
+            f("cpu64Bit", "Z", Answer::Bool(true)),
+            f("deviceName", "Ljava/lang/String;", Answer::Text("Omnidroid")),
+            f("deviceSku", "Ljava/lang/String;", Answer::Text("omnidroid")),
+            f("manufacturer", "Ljava/lang/String;", Answer::Text("Omnidroid")),
+            f("osVersion", "Ljava/lang/String;", Answer::Text("13")),
+            f("socModel", "Ljava/lang/String;", Answer::Text("omnidroid-host")),
+        ],
+    },
+    ClassSpec {
+        name: "com/roblox/engine/jni/model/DeviceParams",
+        tier: Tier::One,
+        methods: &[m("<init>", "()V", Answer::NewInstance)],
+        fields: &[
+            f("appBuildVariant", "Ljava/lang/String;", Answer::Text("release")),
+            f("appVersion", "Ljava/lang/String;", Answer::Text("2.738.1397")),
+            f("country", "Ljava/lang/String;", Answer::Text("US")),
+            f("cpu64Bit", "Z", Answer::Bool(true)),
+            f("deviceName", "Ljava/lang/String;", Answer::Text("Omnidroid")),
+            f("deviceSku", "Ljava/lang/String;", Answer::Text("omnidroid")),
+            // 2 GiB, the same budget the gate gives `sysinfo`. Stated once there and once here
+            // is already two places; if a third appears, the figure needs a constant.
+            f("deviceTotalMemoryMB", "I", Answer::Int(2048)),
+            f("displayPhysicalHeightPixels", "I", Answer::Int(1080)),
+            f("displayPhysicalWidthPixels", "I", Answer::Int(1920)),
+            f("displayResolution", "Ljava/lang/String;", Answer::Text("1920x1080")),
+            f("isChrome", "Z", Answer::Bool(false)),
+            f("isLowRamDevice", "Z", Answer::Bool(false)),
+            f("largeMemoryClass", "I", Answer::Int(512)),
+            f("lowMemoryKillerBackgroundAppThreshold", "J", Answer::Long(0)),
+            f("lowMemoryKillerForegroundAppThreshold", "J", Answer::Long(0)),
+            f("manufacturer", "Ljava/lang/String;", Answer::Text("Omnidroid")),
+            f("memoryClass", "I", Answer::Int(256)),
+            f("networkType", "Ljava/lang/String;", Answer::Text("wifi")),
+            f("osVersion", "Ljava/lang/String;", Answer::Text("13")),
+            f("socModel", "Ljava/lang/String;", Answer::Text("omnidroid-host")),
+            f("testDeviceName", "Ljava/lang/String;", Answer::Text("")),
+        ],
+    },
+    ClassSpec {
+        name: "com/roblox/engine/jni/model/PlatformParams",
+        tier: Tier::One,
+        methods: &[m("<init>", "()V", Answer::NewInstance)],
+        fields: &[
+            f("assetFolderPath", "Ljava/lang/String;", Answer::Text("")),
+            f("dpiScale", "F", Answer::Float(1.0)),
+            f("isKeyboardDevice", "Z", Answer::Bool(true)),
+            f("isMouseDevice", "Z", Answer::Bool(true)),
+            f("isTouchDevice", "Z", Answer::Bool(false)),
+            f("viewportHeightMm", "I", Answer::Int(0)),
+            f("viewportWidthMm", "I", Answer::Int(0)),
+        ],
+    },
+    // `InitParams` is an AutoValue interface: accessors, not fields. §8 step 12 names seven of
+    // these (`platformParams`, `deviceParams`, `baseURL`, `userAgent`, `isTablet`, `isPotato`,
+    // `isVrDevice`) from `MainGameActivity.E2`'s builder calls; the dex adds `buildVariant` and
+    // `vrContext`.
+    ClassSpec {
+        name: "com/roblox/engine/jni/autovalue/InitParams",
+        tier: Tier::One,
+        methods: &[
+            m("<init>", "()V", Answer::NewInstance),
+            m("baseURL", "()Ljava/lang/String;", Answer::Text("https://www.roblox.com")),
+            m("buildVariant", "()Ljava/lang/String;", Answer::Text("release")),
+            m(
+                "deviceParams",
+                "()Lcom/roblox/engine/jni/model/DeviceParams;",
+                Answer::NewInstanceOf("com/roblox/engine/jni/model/DeviceParams"),
+            ),
+            m("isPotato", "()Z", Answer::Bool(false)),
+            m("isTablet", "()Z", Answer::Bool(false)),
+            m("isVrDevice", "()Z", Answer::Bool(false)),
+            m(
+                "platformParams",
+                "()Lcom/roblox/engine/jni/model/PlatformParams;",
+                Answer::NewInstanceOf("com/roblox/engine/jni/model/PlatformParams"),
+            ),
+            m("userAgent", "()Ljava/lang/String;", Answer::Text("Roblox/Android")),
+            // There is no VR activity, and `null` is what a device without one answers.
+            m("vrContext", "()Landroid/app/Activity;", Answer::Null),
+        ],
+        fields: NONE,
+    },
     // ---- support: the framework shape the engine reads a Context through -------------------
     ClassSpec {
         name: "android/content/Context",
         tier: Tier::One,
-        methods: &[m("getResources", "()Landroid/content/res/Resources;", Answer::Unanswered)],
+        methods: &[m(
+            "getResources",
+            "()Landroid/content/res/Resources;",
+            Answer::NewInstanceOf("android/content/res/Resources"),
+        )],
         fields: NONE,
     },
     ClassSpec {
@@ -743,7 +944,11 @@ pub static DECLARED: &[ClassSpec] = &[
     ClassSpec {
         name: "android/content/res/Resources",
         tier: Tier::One,
-        methods: &[m("getDisplayMetrics", "()Landroid/util/DisplayMetrics;", Answer::Unanswered)],
+        methods: &[m(
+            "getDisplayMetrics",
+            "()Landroid/util/DisplayMetrics;",
+            Answer::NewInstanceOf("android/util/DisplayMetrics"),
+        )],
         fields: NONE,
     },
     ClassSpec {
@@ -763,7 +968,7 @@ pub static DECLARED: &[ClassSpec] = &[
         tier: Tier::One,
         methods: &[
             m("size", "()I", Answer::Int(1)),
-            m("get", "(I)Ljava/util/Locale;", Answer::Unanswered),
+            m("get", "(I)Ljava/util/Locale;", Answer::NewInstanceOf("java/util/Locale")),
         ],
         fields: NONE,
     },
@@ -794,8 +999,15 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "java/util/List",
         tier: Tier::One,
         methods: &[
+            // The empty list: `size()` is 0, `get(I)` is never reached from it, and `toArray()`
+            // really is an empty array. §8 step 11 hands one to
+            // `nativeSetAppPreviousExitReasons`, and a device with no recorded exits hands the
+            // same thing. M4's gate found `size` missing: the engine called it with a null
+            // `jmethodID` it had not checked.
+            m("size", "()I", Answer::Int(0)),
+            m("isEmpty", "()Z", Answer::Bool(true)),
             m("get", "(I)Ljava/lang/Object;", Answer::Null),
-            m("toArray", "()[Ljava/lang/Object;", Answer::Unanswered),
+            m("toArray", "()[Ljava/lang/Object;", Answer::EmptyObjectArray),
         ],
         fields: NONE,
     },
@@ -843,7 +1055,95 @@ pub static DECLARED: &[ClassSpec] = &[
         fields: NONE,
     },
     ClassSpec { name: "java/lang/Object", tier: Tier::Support, methods: NONE, fields: NONE },
-    ClassSpec { name: "java/lang/Class", tier: Tier::Support, methods: NONE, fields: NONE },
+    // `GetObjectClass(jclass)` answers with this, and `JvmClassLoaderHelper` then asks it for the
+    // app ClassLoader. See `env::class_of`.
+    ClassSpec {
+        name: "java/lang/Class",
+        tier: Tier::Zero,
+        methods: &[
+            m("getClassLoader", "()Ljava/lang/ClassLoader;",
+                Answer::NewInstanceOf("java/lang/ClassLoader")),
+            m("getName", "()Ljava/lang/String;", Answer::Unanswered),
+        ],
+        fields: NONE,
+    },
+    // ---- what `JNI_OnLoad` reaches that §3.1 ranks Tier 3 ---------------------------------
+    //
+    // **Every one of these was found by running M4's gate**, not predicted: `JNI_OnLoad` looks
+    // them up, the lookup missed, and `Jni::misses` named them. Member lists from `classes2.dex`
+    // for the two app classes; `android/util/Log`'s single member is Section D's.
+    ClassSpec {
+        name: "android/util/Log",
+        tier: Tier::Three,
+        // The engine prints `<no trace>` itself when it has no stack trace, which is what it
+        // printed while this class was undeclared — so an empty string is the answer it is
+        // already written to handle, not a placeholder.
+        methods: &[s(
+            "getStackTraceString",
+            "(Ljava/lang/Throwable;)Ljava/lang/String;",
+            Answer::Text(""),
+        )],
+        fields: NONE,
+    },
+    ClassSpec {
+        name: "com/roblox/audio/AppRtcDeviceWrapper",
+        tier: Tier::Three,
+        methods: &[
+            m("<init>", "(J)V", Answer::NewInstance),
+            m("getSelectedAudioDeviceAsInt", "()I", Answer::Int(0)),
+            m("getSelectedAudioDeviceName", "()Ljava/lang/String;", Answer::Text("")),
+            // There is no audio device here, and `false` is what the engine's own code is written
+            // to branch on. Answering `true` would be the believable wrong answer: it would make
+            // the engine route audio at something that does not exist.
+            m("isValid", "()Z", Answer::Bool(false)),
+            m("wrapSetCommunicationMute", "(Z)V", Answer::Sink),
+            m("wrapStartCommunication", "()V", Answer::Sink),
+            m("wrapStopCommunication", "()V", Answer::Sink),
+        ],
+        fields: &[f("nativeReference", "J", Answer::Long(0))],
+    },
+    ClassSpec {
+        name: "org/fmod/MediaCodec",
+        tier: Tier::Three,
+        methods: &[
+            m("<init>", "()V", Answer::NewInstance),
+            m("getChannelCount", "()I", Answer::Int(0)),
+            m("getLength", "()J", Answer::Long(0)),
+            m("getSampleRate", "()I", Answer::Int(0)),
+            // No decoder, so initialisation fails — the same argument as `AudioDevice.init`.
+            m("init", "(J)Z", Answer::Bool(false)),
+            m("read", "([BI)I", Answer::Int(0)),
+            m("release", "()V", Answer::Sink),
+            m("seek", "(I)V", Answer::Sink),
+            // The two `RegisterNatives`-only natives §4 counts for this class. Declared so that
+            // the engine's own `RegisterNatives` call binds them rather than recording a miss.
+            s("fmodGetSize", "(J)J", Answer::Native),
+            s("fmodReadAt", "(JJ[BII)I", Answer::Native),
+        ],
+        fields: &[
+            f("mChannelCount", "I", Answer::Int(0)),
+            f("mCodecPtr", "J", Answer::Long(0)),
+            f("mCurrentOutputBufferIndex", "I", Answer::Int(0)),
+            f("mDataSourceProxy", "Ljava/lang/Object;", Answer::Null),
+            f("mInputFinished", "Z", Answer::Bool(true)),
+            f("mLength", "J", Answer::Long(0)),
+            f("mOutputFinished", "Z", Answer::Bool(true)),
+            f("mSampleRate", "I", Answer::Int(0)),
+        ],
+    },
+    ClassSpec {
+        name: "org/fmod/AudioDevice",
+        tier: Tier::Three,
+        methods: &[
+            m("<init>", "()V", Answer::NewInstance),
+            m("close", "()V", Answer::Sink),
+            // As `isValid` above: no device, so the initialisation fails, which is a state FMOD
+            // handles on a real device with no audio output.
+            m("init", "(IIII)Z", Answer::Bool(false)),
+            m("write", "([BI)V", Answer::Sink),
+        ],
+        fields: NONE,
+    },
     // ---- the exceptions a failed lookup leaves pending ------------------------------------
     ClassSpec {
         name: "java/lang/ClassNotFoundException",
@@ -924,10 +1224,26 @@ mod tests {
         }
     }
 
+    /// The two tables together, and the **precedence between them**: a class the hand-written
+    /// table declares keeps its decided answers after the generated surface has been merged in.
     #[test]
     fn the_registry_builds_and_finds_what_it_declared() {
         let registry = Registry::with_declared();
-        assert_eq!(registry.class_count(), DECLARED.len());
+        // Every hand-written class is there, and the generated surface added the rest.
+        assert!(registry.class_count() >= DECLARED.len());
+        assert!(registry.class_count() <= DECLARED.len() + super::super::surface::DEX_CLASSES);
+        for spec in DECLARED {
+            assert!(registry.find(spec.name).is_some(), "{} was dropped", spec.name);
+        }
+        // Precedence: `NativeUserJavaInterface.getUserId` is decided by hand and the generated
+        // surface declares the same member as `Unanswered`. The hand-written answer must win,
+        // and this is the assertion that a merge in the wrong order would fail.
+        let id = registry.find("com/roblox/engine/jni/user/NativeUserJavaInterface").expect("declared");
+        let method = registry.method(id, "getUserId", "()J", true).expect("declared");
+        assert_eq!(registry.member(method).expect("declared").answer, Answer::Long(0));
+        // And a member only the generated surface has resolves, with no answer decided.
+        let id = registry.find("org/fmod/FMOD").expect("the generated surface declares it");
+        assert!(registry.class(id).expect("declared").methods.iter().any(|m| m.answer == Answer::Unanswered));
         let id = registry.find("com/google/androidgamesdk/GameActivity").expect("Tier 0");
         assert_eq!(registry.class(id).expect("declared").tier, Tier::Zero);
         assert!(registry.find("com/roblox/gloop/Loader").is_none(), "the injected payload is not declared");

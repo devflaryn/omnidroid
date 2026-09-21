@@ -137,7 +137,31 @@ pub static SEQUENCE: &[Downcall] = &[
         descriptor: "()V",
         args: &[],
     },
-    // ---- step 9: the settings bootstrap, `bh.x0` — 11 downcalls, all (String…)V -----------
+    // ---- step 9: the settings bootstrap, `bh.x0` -- 11 downcalls, all (String...)V --------
+    //
+    // **The order inside step 9 is a correction to §8, made by running it.** §8 lists
+    // `nativeInitFastLog` first and the two directory calls fifth and sixth. The engine refuses
+    // that order: `nativeInitFastLog` throws `Cannot initialize fastlog system.  Cache
+    // directory not set.` and `raise`s SIGTRAP. MEASURED on the real binary. §8 step 9 is a
+    // *list* of the eleven downcalls `bh.x0` makes and not a proof of their order -- §4.2
+    // attributes them to three different methods (`W0`, `T0`, `X0`) and nothing said which of
+    // the three runs first. `T0` does.
+    Downcall {
+        step: 9,
+        caller: "bh/x0.T0",
+        class: "com/roblox/engine/jni/NativeSettingsInterface",
+        member: "nativeSetCacheDirectory",
+        descriptor: "(Ljava/lang/String;)V",
+        args: &[ScriptArg::Text("/data/data/com.roblox.client/cache")],
+    },
+    Downcall {
+        step: 9,
+        caller: "bh/x0.T0",
+        class: "com/roblox/engine/jni/NativeSettingsInterface",
+        member: "nativeSetFilesDirectory",
+        descriptor: "(Ljava/lang/String;)V",
+        args: &[ScriptArg::Text("/data/data/com.roblox.client/files")],
+    },
     Downcall {
         step: 9,
         caller: "bh/x0.W0",
@@ -169,22 +193,6 @@ pub static SEQUENCE: &[Downcall] = &[
         member: "nativeSetBaseUrl",
         descriptor: "(Ljava/lang/String;Ljava/lang/String;)V",
         args: &[ScriptArg::Text("https://www.roblox.com"), ScriptArg::Text("roblox.com")],
-    },
-    Downcall {
-        step: 9,
-        caller: "bh/x0.T0",
-        class: "com/roblox/engine/jni/NativeSettingsInterface",
-        member: "nativeSetCacheDirectory",
-        descriptor: "(Ljava/lang/String;)V",
-        args: &[ScriptArg::Text("/data/data/com.roblox.client/cache")],
-    },
-    Downcall {
-        step: 9,
-        caller: "bh/x0.T0",
-        class: "com/roblox/engine/jni/NativeSettingsInterface",
-        member: "nativeSetFilesDirectory",
-        descriptor: "(Ljava/lang/String;)V",
-        args: &[ScriptArg::Text("/data/data/com.roblox.client/files")],
     },
     Downcall {
         step: 9,
@@ -233,7 +241,10 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/client/startup/MainGameActivity",
         member: "nativeSetAssetPath",
         descriptor: "(Ljava/lang/String;)V",
-        args: &[ScriptArg::Text("/data/app/com.roblox.client/base.apk")],
+        // **A directory, not the apk file.** MEASURED: passing the apk path made the engine
+        // throw `'/data/app/com.roblox.client/base.apk' is not a directory`. §8 step 10 says
+        // only "nativeSetAssetPath(String)"; what the string is was not in the analysis.
+        args: &[ScriptArg::Text("/data/app/com.roblox.client")],
     },
     Downcall {
         step: 10,
@@ -291,21 +302,17 @@ pub static SEQUENCE: &[Downcall] = &[
 /// a `jclass` for each and so that its member lookups on the parameter objects are **recorded**
 /// rather than refused.
 ///
-/// Deliberately memberless. The analysis could not attribute the `DeviceParams` / `InitParams`
-/// member lookups to a class (they are in Section D's `!unresolved` group), so declaring members
-/// here would be guessing. Leaving them empty means the engine's own lookups land in
-/// [`Jni::misses`], which is the measurement that turns "what does `InitParams` need" from a
-/// guess into a list.
+/// Deliberately memberless: these five are classes a `static` native is *called on*, and nothing
+/// looks members up on them. The parameter objects the script passes -- `DeviceParams`,
+/// `PlatformParams`, `DeviceStaticParams`, `InitParams` -- are **not** here: their member lists
+/// were read out of `classes2.dex` and are declared in [`super::classes::DECLARED`], because the
+/// engine reads them field by field and a missing one is one refusal per member.
 pub static SCRIPT_CLASSES: &[&str] = &[
     "com/roblox/universalapp/linking/JNIBaseUrlProtocol",
     "com/roblox/universalapp/linking/JNIWebLoginProtocol",
     "com/roblox/engine/jni/NativeReportingInterface",
     "com/roblox/engine/jni/NativeSettingsInterface",
     "com/roblox/engine/jni/NativeGLInterface",
-    "com/roblox/engine/jni/model/DeviceParams",
-    "com/roblox/engine/jni/model/DeviceStaticParams",
-    "com/roblox/engine/jni/model/PlatformParams",
-    "com/roblox/engine/jni/autovalue/InitParams",
 ];
 
 /// What one step did.

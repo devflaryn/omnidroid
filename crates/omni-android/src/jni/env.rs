@@ -971,10 +971,24 @@ fn read_cstr(mem: &GuestMem, at: GuestAddr, blame: Blame<'_>) -> AbiResult<Strin
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// The class **of** an object, which is what `GetObjectClass` answers.
+///
+/// **A `jclass` is an instance of `java.lang.Class`, not of itself**, and getting that wrong is
+/// not a detail: `RBX::Security::Android::Detail::JvmClassLoaderHelper` does
+/// `GetObjectClass(someClass)` and then `GetMethodID(that, "getClassLoader",
+/// "()Ljava/lang/ClassLoader;")` — the cache-the-app-ClassLoader pattern jni-surface.md section 6
+/// describes. Answering the class itself makes that lookup ask
+/// `NativeGLJavaInterface.getClassLoader`, which does not exist, and the null `jmethodID` goes
+/// straight into `CallObjectMethodV`. MEASURED: that is exactly what it did.
 fn class_of(state: &JniState, id: ObjectId) -> Option<ClassId> {
     match state.handles.object_of(id)? {
-        Object::Instance { class, .. } | Object::Class(class) => Some(*class),
-        Object::Throwable { class, .. } => Some(*class),
+        Object::Class(_) => state.registry.find("java/lang/Class"),
+        Object::String(_) => state.registry.find("java/lang/String"),
+        Object::Instance { class, .. } | Object::Throwable { class, .. } => Some(*class),
+        // An array's class is `[B`, `[I`, `[Ljava/lang/Object;` and so on, and a direct
+        // `ByteBuffer`'s is a framework class with no dex declaration. Nothing on the measured
+        // surface asks for either, so the caller refuses by name rather than this returning
+        // something believable.
         _ => None,
     }
 }
@@ -1294,6 +1308,99 @@ fn evaluate(
                 name,
                 address,
                 Object::Instance { class, fields: std::collections::BTreeMap::new() },
+            )?;
+            Ok(Value::Object(Some(object)))
+        }
+        Answer::NewInstanceOf(other) => {
+            let Some(other_id) = state.registry.find(other) else {
+                return Err(AbiError::JniRefused {
+                    function: name.to_string(),
+                    address,
+                    detail: format!(
+                        "`{}.{}` returns an instance of `{other}`, which is not declared",
+                        state.registry.class_name(class),
+                        member.name
+                    ),
+                });
+            };
+            let object = state.handles.create(
+                name,
+                address,
+                Object::Instance { class: other_id, fields: std::collections::BTreeMap::new() },
+            )?;
+            Ok(Value::Object(Some(object)))
+        }
+        Answer::ResolveClass => {
+            // The name resolver, not a code loader. See `classes`'s module documentation.
+            let Some(Value::Long(handle)) = arguments.first() else {
+                return Err(AbiError::JniRefused {
+                    function: name.to_string(),
+                    address,
+                    detail: format!(
+                        "`{}.{}` takes a class name and was called with {} arguments",
+                        state.registry.class_name(class),
+                        member.name,
+                        arguments.len()
+                    ),
+                });
+            };
+            let text = match state.handles.object(name, address, *handle as u64)? {
+                Object::String(text) => text.to_string_lossy(),
+                other => return Err(wrong_kind(name, address, other, "a java.lang.String")),
+            };
+            // Both spellings: the engine caches the loader and then asks it for app classes by
+            // their dotted name, while `FindClass` uses the slashed one.
+            let jni_name = text.replace('.', "/");
+            match state.registry.find(&jni_name) {
+                Some(found) => {
+                    let object = state.handles.create(name, address, Object::Class(found))?;
+                    Ok(Value::Object(Some(object)))
+                }
+                None => {
+                    state.registry.record_miss(Miss {
+                        function: format!("{}.{}", "java/lang/ClassLoader", member.name),
+                        class: jni_name,
+                        member: String::new(),
+                        descriptor: String::new(),
+                    });
+                    Ok(Value::Object(None))
+                }
+            }
+        }
+        Answer::StringBytes => {
+            let Some(receiver) = receiver else {
+                return Err(AbiError::JniRefused {
+                    function: name.to_string(),
+                    address,
+                    detail: "`String.getBytes` was called with no receiver".to_string(),
+                });
+            };
+            let bytes = match state.handles.object_of(receiver) {
+                Some(Object::String(text)) => text.to_string_lossy().into_bytes(),
+                Some(other) => {
+                    return Err(wrong_kind(name, address, other, "a java.lang.String"))
+                }
+                None => return Err(freed(name, address)),
+            };
+            let object = state.handles.create(
+                name,
+                address,
+                Object::ByteArray(bytes.into_iter().map(|b| b as i8).collect()),
+            )?;
+            Ok(Value::Object(Some(object)))
+        }
+        Answer::EmptyObjectArray => {
+            let Some(element) = state.registry.find("java/lang/Object") else {
+                return Err(AbiError::JniRefused {
+                    function: name.to_string(),
+                    address,
+                    detail: "`java/lang/Object` is not declared".to_string(),
+                });
+            };
+            let object = state.handles.create(
+                name,
+                address,
+                Object::ObjectArray { element, elements: Vec::new() },
             )?;
             Ok(Value::Object(Some(object)))
         }
