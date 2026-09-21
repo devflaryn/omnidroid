@@ -1116,8 +1116,10 @@ MUTATIONS = [
     ("boundary-A7", "A",
      "a callback entered on a stack pointer AArch64 forbids",
      BOUNDARY,
-     """        if sp % 16 != 0 {""",
-     """        if false && sp % 16 != 0 {""",
+     """    let sp = cpu.sp();
+    if sp % 16 != 0 {""",
+     """    let sp = cpu.sp();
+    if false && sp % 16 != 0 {""",
      ANDROID),
 
     ("boundary-A8", "A",
@@ -1718,9 +1720,13 @@ MUTATIONS = [
      """    if false && (advice == MADV_DONTNEED || advice == MADV_REMOVE) {""",
      ANDROID),
 
+    # Re-anchored for M3's gate: the `fd != -1` half of this condition was a defect in its own
+    # right (`guestmem-A10`), and removing it left this row's pattern unmatched. The statement is
+    # unchanged -- serving a file-backed request as anonymous memory hands the guest zeroed pages
+    # where it asked for a file's contents, and succeeds while doing it.
     ("guestmem-A3", "A", "a file-backed mmap is served as anonymous memory", ADAPTER_GUESTMEM,
-     """    if fd != -1 || flags & MAP_ANONYMOUS == 0 {""",
-     """    if false && (fd != -1 || flags & MAP_ANONYMOUS == 0) {""",
+     """    if flags & MAP_ANONYMOUS == 0 {""",
+     """    if false {""",
      ANDROID),
 
     # Widening rather than refusing: the guest asked for write-only and is given read as well.
@@ -1964,35 +1970,37 @@ MUTATIONS = [
      """            hwcap: Mutex::new(HwcapPolicy::Decline),""",
      ANDROID),
 
-    ("procenv-A2", "A", "sysconf answers a page size for a constant nobody verified", ADAPTER_PROCENV,
-     """    let believed = believed_sysconf_name(name).map_or_else(""",
-     """    if name == 0x0027 {
-        c.ret().u64(4096);
-        return Ok(());
-    }
-    let believed = believed_sysconf_name(name).map_or_else(""",
+    # Re-anchored for M3's gate. `sysconf` answers the page size and the processor count now, so
+    # the old form of this row -- answering an unverified constant -- is what the code does. What
+    # is still worth injecting is `_SC_PHYS_PAGES`: a number IS available for it, and it is the
+    # host's physical memory rather than the guest's budget, which is the same wrong answer
+    # `sysinfo` refuses for.
+    ("procenv-A2", "A", "sysconf answers _SC_PHYS_PAGES with the host's memory", ADAPTER_PROCENV,
+     """        other => {
+            let believed = believed_sysconf_name(other).map_or_else(""",
+     """        other if other == 0x0062 => 1 << 19,
+        other => {
+            let believed = believed_sysconf_name(other).map_or_else(""",
      ANDROID),
 
     ("procenv-A3", "A", "prctl answers 0, which every option has available as a believable done",
      ADAPTER_PROCENV,
-     """    let option = c.args().next_i32()?;
-    let named = prctl_option_name(option)""",
-     """    let option = c.args().next_i32()?;
-    c.ret().i32(0);
-    return Ok(());
-    #[allow(unreachable_code)]
-    let named = prctl_option_name(option)""",
+     """    if option != PR_SET_VMA {
+        let named = prctl_option_name(option)""",
+     """    if option != PR_SET_VMA {
+        c.ret().i32(0);
+        return Ok(());
+        #[allow(unreachable_code)]
+        let named = prctl_option_name(option)""",
      ANDROID),
 
     ("procenv-A4", "A", "syscall answers -1/ENOSYS, which callers route around silently",
      ADAPTER_PROCENV,
-     """    let number = c.args().next_u64()? as i64;
-    let named = syscall_name(number)""",
-     """    let number = c.args().next_u64()? as i64;
-    c.ret().i32(-1);
+     """    let named = syscall_name(number).map_or_else(String::new, |name| format!(" (arm64 `{name}`)"));""",
+     """    c.ret().i32(-1);
     return Ok(());
     #[allow(unreachable_code)]
-    let named = syscall_name(number)""",
+    let named = syscall_name(number).map_or_else(String::new, |name| format!(" (arm64 `{name}`)"));""",
      ANDROID),
 
     # Half a buffer of real entropy and a reported failure: the caller cannot tell which half.
@@ -2171,8 +2179,12 @@ MUTATIONS = [
 
     ("fs-A5", "A", "the descriptor ceiling removed, so a leaking guest holds host handles",
      PLAT_FS,
-     """        if table.open.len() >= MAX_OPEN_FILES {""",
-     """        if false && table.open.len() >= MAX_OPEN_FILES {""",
+     """        let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
+        let mut table = self.table();
+        if table.open.len() >= MAX_OPEN_FILES {""",
+     """        let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
+        let mut table = self.table();
+        if false && table.open.len() >= MAX_OPEN_FILES {""",
      PLATFORM),
 
     ("fs-A6", "A", "unlink removes a directory, which is rmdir's job", PLAT_FS,
@@ -2921,15 +2933,6 @@ directory", ADAPTER_FILES,
      ADAPTER_GUESTMEM,
      """    if flags & MAP_ANONYMOUS == 0 {""",
      """    if fd != -1 || flags & MAP_ANONYMOUS == 0 {""",
-     ANDROID),
-
-    # The over-correction: treating every mapping as anonymous. A file-backed `mmap` would then
-    # hand the guest zeroed anonymous memory where it asked for a file's contents, which is the
-    # believable wrong answer -- it succeeds, and the data is simply not there.
-    ("guestmem-B4", "B", "every mmap is treated as anonymous, file-backed included",
-     ADAPTER_GUESTMEM,
-     """    if flags & MAP_ANONYMOUS == 0 {""",
-     """    if false {""",
      ANDROID),
 
     # `dlsym` answering with an `Unbound` slot's address. That address exists so a DIRECT call can
