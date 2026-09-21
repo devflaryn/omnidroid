@@ -28,3 +28,7 @@ Thumbs.db
 
 # Scratch produced by review tooling; never part of the record.
 .freebuff/
+
+# Python bytecode from tools/ (they are scripts, not a package).
+__pycache__/
+*.pyc

@@ -15,6 +15,7 @@
 //! | [`cpu_count`] | `std::thread::available_parallelism()` — portable standard library |
 //! | [`random_bytes`] | **backend**: `BCryptGenRandom` on Windows; `getrandom(2)` / `arc4random_buf(3)` intended elsewhere |
 //! | [`current_cpu`] | **backend**: `GetCurrentProcessorNumber` on Windows; `sched_getcpu(3)` intended on Linux |
+//! | [`cpu_time`] | **backend**: `GetProcessTimes` on Windows; `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` intended elsewhere |
 //!
 //! The two backend entries carry the five-target rule in full: `linux.rs` and `macos.rs` exist
 //! **now**, they name the POSIX call they intend to make, and they return
@@ -27,6 +28,7 @@
 //! ```text
 //! random_bytes(&mut [u8]) -> ProcessResult<()>
 //! current_cpu() -> ProcessResult<u32>
+//! cpu_time() -> ProcessResult<Duration>
 //! ```
 //!
 //! A backend that is missing one, or whose signature has drifted, does not build for that target —
@@ -42,6 +44,15 @@
 //! already is (it is one of the eighteen data objects, and it points at an empty vector). Reading
 //! the real host environment, if anything ever needs to, is `std::env` and needs no seam at all.
 //!
+//! # Process CPU time is the seam's third backend primitive, and it is genuinely not `std`
+//!
+//! [`cpu_time`] serves the guest's `clock()` and `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`. The
+//! sharper five-target test D23 proposed — *is there one `std` call that serves all five
+//! targets?* — answers **no** here, and that is the first time in three phases it has. `Instant`
+//! is wall time; nothing in the standard library reports how much processor time this process has
+//! consumed. So this one gets a Windows backend and a structural unix half, and the two other
+//! entries in this module that already had one gain a third sibling rather than an exception.
+//!
 //! # `sysinfo` is not here either
 //!
 //! There is no `physical_memory()`, because the guest symbol that would use it — `sysinfo` — is
@@ -49,6 +60,8 @@
 //! refuses would be surface built for a call that is not made.
 
 mod error;
+
+use std::time::Duration;
 
 pub use error::{ProcessError, ProcessResult};
 
@@ -121,6 +134,33 @@ pub fn current_cpu() -> ProcessResult<u32> {
     backend::current_cpu()
 }
 
+/// Processor time this **process** has consumed, across every thread it has ever had.
+///
+/// What `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` reports on Linux, and therefore what the
+/// guest's `clock()` is scaled from. User **and** kernel time together, which is what both of
+/// those report and what `clock(3)` is specified to return ("processor time used"): counting only
+/// user time would make a guest that spends its startup inside the kernel look idle.
+///
+/// **It is the process's, not the thread's, and not this guest instance's.** Several guest
+/// instances share one host process, so they share this number, exactly as they share
+/// [`pid`]. That is the same honest answer `getpid` gives and for the same reason — there is no
+/// per-instance process for a per-instance figure to describe.
+///
+/// **Resolution is the host's scheduler accounting, not a clock.** On Windows `GetProcessTimes`
+/// is accumulated per scheduler tick (~15.6 ms by default, the same quantum
+/// [`crate::clock::sleep`] records), so a short call may report **zero** elapsed CPU time and a
+/// sequence of readings advances in steps rather than smoothly. A caller that needs to measure a
+/// microsecond of work does not have a tool here; a caller asking "how much CPU has this process
+/// burned" does.
+///
+/// # Errors
+///
+/// [`ProcessError::Unsupported`] on Linux and macOS, naming the intended POSIX call.
+/// [`ProcessError::LastError`] if the OS refuses to report it.
+pub fn cpu_time() -> ProcessResult<Duration> {
+    backend::cpu_time()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +196,78 @@ mod tests {
         // An empty request succeeds and touches nothing.
         let mut nothing: [u8; 0] = [];
         random_bytes(&mut nothing).expect("an empty request is a no-op");
+    }
+
+    /// Process CPU time advances under work, never goes backwards, and is not wall time.
+    ///
+    /// **The three ways this returns a plausible wrong number, each asserted separately.** A
+    /// backend that read the *creation* `FILETIME` instead of the kernel and user ones would
+    /// report about 420 years (1601 to now) and would still be monotonic — so the reading is
+    /// bounded above by something no real process reaches. A backend that returned wall time
+    /// would advance across a sleep — so a sleep is timed and the CPU reading must **not**
+    /// follow it. And a backend that returned a constant would pass both of those — so a busy
+    /// loop must move it.
+    ///
+    /// n = one busy loop of at least 50 ms of real arithmetic, which is several Windows
+    /// scheduler quanta (~15.6 ms), plus one 50 ms sleep. The busy-loop assertion is one-sided
+    /// and the bound is the accounting quantum rather than the elapsed time: the OS charges in
+    /// ticks, so asserting "at least as much CPU as wall time" would be flaky by construction.
+    #[test]
+    #[cfg_attr(not(target_os = "windows"), ignore = "no process-cpu-time backend on this target")]
+    fn process_cpu_time_advances_with_work_and_not_with_sleeping() {
+        use std::time::Instant;
+
+        let first = cpu_time().expect("the host's process times");
+        assert!(
+            first < Duration::from_secs(60 * 60 * 24 * 365),
+            "this process has not used {first:?} of CPU: that is an absolute FILETIME read as a \
+             duration"
+        );
+
+        // Real work the optimiser cannot remove: the accumulator is read afterwards.
+        let started = Instant::now();
+        let mut acc: u64 = 0;
+        let mut i: u64 = 0;
+        while started.elapsed() < Duration::from_millis(50) {
+            i = i.wrapping_add(1);
+            acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+        }
+        assert_ne!(acc, 0, "the busy loop must not be optimised away");
+        let after_work = cpu_time().expect("the host's process times");
+        assert!(
+            after_work > first,
+            "50 ms of arithmetic moved the process CPU clock not at all: {first:?} -> \
+             {after_work:?}"
+        );
+
+        // A sleep consumes wall time and no CPU. The bound is one scheduler quantum, because the
+        // test harness's other threads are in this same process and are charged to it too.
+        let before_sleep = cpu_time().expect("the host's process times");
+        crate::clock::sleep(Duration::from_millis(50));
+        let after_sleep = cpu_time().expect("the host's process times");
+        assert!(after_sleep >= before_sleep, "process CPU time went backwards");
+        assert!(
+            after_sleep - before_sleep < Duration::from_millis(40),
+            "a 50 ms sleep charged {:?} of CPU time, which is wall time wearing a CPU clock's \
+             name",
+            after_sleep - before_sleep
+        );
+    }
+
+    /// Process CPU time is answered on Windows and refused by name elsewhere.
+    #[test]
+    fn process_cpu_time_is_answered_or_refused_by_name() {
+        match cpu_time() {
+            Ok(_) => assert!(cfg!(target_os = "windows"), "only Windows has a cpu-time backend"),
+            Err(error) => {
+                assert!(error.is_unsupported(), "{error}");
+                let text = error.to_string();
+                assert!(
+                    text.contains("CLOCK_PROCESS_CPUTIME_ID"),
+                    "the refusal must name its POSIX call: {text}"
+                );
+            }
+        }
     }
 
     /// The current cpu is answered on Windows and is a refusal that names its POSIX call elsewhere.

@@ -42,6 +42,22 @@ pub enum ProcessError {
         /// The raw `NTSTATUS`.
         status: i32,
     },
+
+    /// A Windows API that reports through `GetLastError` failed.
+    ///
+    /// The **other** number space, and it is a separate variant for the reason
+    /// [`Status`](ProcessError::Status) gives: `NTSTATUS 0xC0000008` and Win32 error 8 are
+    /// different failures with the same digits, and rendering one as the other sends a reader
+    /// after the wrong thing three thousand initializers deep.
+    #[error("`{operation}`: {api} failed with GetLastError {code}")]
+    LastError {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The OS entry point that failed.
+        api: &'static str,
+        /// The raw `GetLastError` code.
+        code: u32,
+    },
 }
 
 impl ProcessError {

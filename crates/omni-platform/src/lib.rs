@@ -20,10 +20,11 @@
 //!   SEH does. D4 verified the ordering (`veh_hits = 1`, dynarmic's slow path never entered) and
 //!   D10 requires it, because whoever handles the fault owns guest demand paging.
 //! * [`clock`] — monotonic time, wall time and sleeping. One process-wide monotonic epoch.
-//! * [`process`] — pid, cpu count, entropy and the current processor number. Implemented and run
-//!   on Windows; the entropy and cpu-id halves are structural on Linux and macOS, where they
-//!   return [`ProcessError::Unsupported`](process::ProcessError::Unsupported) naming the POSIX
-//!   call they intend to make.
+//! * [`process`] — pid, cpu count, entropy, the current processor number and this process's
+//!   consumed CPU time. Implemented and run on Windows; the entropy, cpu-id and cpu-time thirds
+//!   are structural on Linux and macOS, where they return
+//!   [`ProcessError::Unsupported`](process::ProcessError::Unsupported) naming the POSIX call they
+//!   intend to make.
 //! * [`log`] — a sink for a line the guest wrote, with Android's and syslog's priority scales.
 //! * [`fs`] — files and directories: a **rooted** descriptor table, metadata, and directory
 //!   listings. Every guest path is resolved inside one host directory supplied by the embedding,
@@ -32,7 +33,12 @@
 //!   `pread` and `statvfs` have a Windows backend and a structural unix one naming `pread(2)`
 //!   and `statvfs(3)`.
 //!
-//! Sockets, threads, dynamic loading and windowing will arrive as sibling modules in later tasks.
+//! Threads, dynamic loading and windowing may arrive as sibling modules in later tasks.
+//! **Sockets deliberately did not.** M3 task 3's network phase found that the four socket-shaped
+//! symbols the guest reaches either need no OS call at all (`poll` and `select`, whose whole
+//! descriptor domain is [`fs`]'s and whose answer POSIX fixes for it) or must be refused by name
+//! at the adapter (`socket`, `eventfd`), so there was nothing left for a seam here to carry; D25
+//! has the argument. A later milestone that gives the guest a real network will add one.
 //!
 //! # Not every primitive needs a `cfg`, and saying which is part of the seam
 //!

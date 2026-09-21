@@ -2,10 +2,15 @@
 //!
 //! Two entry points, both thin, and each with one thing about it that is not obvious.
 
+use std::time::Duration;
+
+use windows_sys::Win32::Foundation::{FILETIME, GetLastError};
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcessorNumber;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessorNumber, GetProcessTimes,
+};
 
 use super::{ProcessError, ProcessResult};
 
@@ -57,4 +62,72 @@ pub(super) fn random_bytes(out: &mut [u8]) -> ProcessResult<()> {
 pub(super) fn current_cpu() -> ProcessResult<u32> {
     // SAFETY: takes no arguments, touches no memory, and cannot fail.
     Ok(unsafe { GetCurrentProcessorNumber() })
+}
+
+/// `GetProcessTimes(GetCurrentProcess(), ..)`, kernel time **plus** user time.
+///
+/// Three things about this call are not obvious, and each of them is a way to get a plausible
+/// wrong number out of it.
+///
+/// **The pseudo-handle is not a handle.** `GetCurrentProcess()` returns `(HANDLE)-1`, a constant
+/// that every process-scoped API resolves against the caller. It needs no `CloseHandle` and
+/// costs no OS call; opening a real handle to this process to pass here would be a handle leak
+/// waiting for the first early return.
+///
+/// **A `FILETIME` here is not a date.** The creation and exit fields are absolute times since
+/// 1601, and the kernel and user fields are *durations* in the same 100-nanosecond unit. Reading
+/// them as one kind or the other is the silent-wrong-answer shape, so only the two durations are
+/// read and the two absolute times are discarded — they are written by the API whether or not
+/// this function wants them, so they are received into locals rather than passed as null.
+///
+/// **The two halves are assembled rather than transmuted.** `FILETIME` is two `u32`s and is
+/// documented as not necessarily 8-byte aligned, so casting one to a `u64` is undefined
+/// behaviour on a struct the OS filled. Shift and OR instead.
+///
+/// The resolution is the scheduler's accounting quantum, which the seam's own documentation
+/// records: this reports zero for a process that has run for less than one tick.
+pub(super) fn cpu_time() -> ProcessResult<Duration> {
+    let mut creation = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: `GetProcessTimes` writes four `FILETIME`s at the four pointers and reads only the
+    // handle. All four are live, uniquely-borrowed locals of exactly that type. The current-process
+    // pseudo-handle is always valid for the calling process and must not be closed.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: no arguments, no memory, and the call above is the last one this thread made.
+        let code = unsafe { GetLastError() };
+        return Err(ProcessError::LastError {
+            operation: "cpu_time",
+            api: "GetProcessTimes",
+            code,
+        });
+    }
+    let ticks = filetime_ticks(kernel).saturating_add(filetime_ticks(user));
+    Ok(hundred_nanos(ticks))
+}
+
+/// A `FILETIME` read as a duration in 100-nanosecond units.
+fn filetime_ticks(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+
+/// `ticks` 100-nanosecond units as a [`Duration`].
+///
+/// Split rather than `Duration::from_nanos(ticks * 100)`, because that multiply overflows a `u64`
+/// at about 58,000 years of accumulated CPU time — reachable by a machine with enough cores only
+/// in principle, but a wrap would report a *small* duration for a huge one, which is the wrong
+/// direction to be wrong in silently.
+fn hundred_nanos(ticks: u64) -> Duration {
+    const PER_SECOND: u64 = 10_000_000;
+    Duration::new(ticks / PER_SECOND, ((ticks % PER_SECOND) * 100) as u32)
 }

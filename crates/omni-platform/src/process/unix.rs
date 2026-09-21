@@ -18,6 +18,8 @@
 //!
 //! Neither is hard; both have a decision in them that must be made by reading, not guessing.
 
+use std::time::Duration;
+
 use super::{ProcessError, ProcessResult};
 
 /// The platform this backend was compiled for, for error messages.
@@ -51,4 +53,21 @@ pub(super) fn random_bytes(_out: &mut [u8]) -> ProcessResult<()> {
 /// unix targets, and it is the reason this module says "on Linux" rather than "on unix".
 pub(super) fn current_cpu() -> ProcessResult<u32> {
     unsupported("current_cpu", "sched_getcpu(3) on Linux; macOS has no supported equivalent")
+}
+
+/// Intended: `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts)` on both, `getrusage(RUSAGE_SELF)` as
+/// the fallback where the clock id is unavailable.
+///
+/// The decision in it: **`CLOCK_PROCESS_CPUTIME_ID` and `getrusage` do not report the same
+/// thing to the same precision.** The clock id is nanosecond-resolution and counts the whole
+/// process; `getrusage` reports `ru_utime` and `ru_stime` as `timeval`s, which is microseconds,
+/// and a caller has to add them. Picking one and documenting the other as equivalent would be
+/// the plausible-looking mistake — the guest's `clock()` is scaled to `CLOCKS_PER_SEC`, which is
+/// 1,000,000, so microseconds happen to be exactly enough for it and are *not* enough for
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, which this same primitive also serves.
+///
+/// macOS has `CLOCK_PROCESS_CPUTIME_ID` since 10.12 and it is the same call there, which is why
+/// this one entry is genuinely shared between the two targets where [`current_cpu`] is not.
+pub(super) fn cpu_time() -> ProcessResult<Duration> {
+    unsupported("cpu_time", "clock_gettime(CLOCK_PROCESS_CPUTIME_ID) on Linux and macOS")
 }
