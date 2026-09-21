@@ -4488,6 +4488,48 @@ directory", ADAPTER_FILES,
                 ctx.set_errno(consts::EIO);
                 stream.eof = true;""",
      BIONIC),
+
+    # ---- The one lock-discipline site that is deterministically detectable (M6). --------------
+    #
+    # Eight sites were converted when `looper_in`/`window_in` closed the check-then-act window
+    # (VERIFICATION entry 13). **Only this one gets rows.** The other seven -- `acquire`,
+    # `release`, `removeFd`, `addFd`'s re-check and the window pair -- are behaviourally identical
+    # single-threaded: reverting them changes nothing any single-threaded test can observe, and
+    # reaching them needs a second guest thread inside a sleeping window, which is a sleep. Entry 6
+    # is that a flake does not merely cost a red run -- it can make a row look detected when
+    # nothing detected it. So those sites stay uncovered and labelled, not covered by something
+    # that sometimes passes.
+
+    ("lock-A1", "A", "pollOnce's callback arm asserts a liveness its own callback could have ended",
+     NDK_LOOPER,
+     """                    if let Some(entry) = state.loopers.get_mut(looper) {
+                        entry.fds.retain(|held| held.fd != fd);
+                    }""",
+     """                    let entry = state.loopers.get_mut(looper).expect("the slot was checked live");
+                    entry.fds.retain(|held| held.fd != fd);""",
+     ANDROID),
+
+    # The over-correction that reads as MORE careful: refuse, rather than treat a removal against a
+    # looper the callback destroyed as the request already satisfied. It turns a guest sequence the
+    # NDK documents -- release, then return 0 -- into a typed refusal, which ends the poll the glue
+    # is driving. Caught on the ALOOPER_POLL_CALLBACK assertion, not on the registration set, which
+    # is empty either way.
+    ("lock-B1", "B", "a callback that destroyed its own looper is refused instead of answered",
+     NDK_LOOPER,
+     """                    if let Some(entry) = state.loopers.get_mut(looper) {
+                        entry.fds.retain(|held| held.fd != fd);
+                    }""",
+     """                    let Some(entry) = state.loopers.get_mut(looper) else {
+                        return Err(refuse_reentrant(
+                            c,
+                            format!(
+                                "the callback for fd {fd} returned 0, but the looper at \
+                                 {looper:#x} is no longer live"
+                            ),
+                        ));
+                    };
+                    entry.fds.retain(|held| held.fd != fd);""",
+     ANDROID),
 ]
 
 

@@ -239,11 +239,28 @@ may call before returning the 0 that asks for its own registration to be removed
 1. **Commit in pieces.** Agents have been cut off mid-task by usage limits repeatedly; uncommitted
    work is the only thing at risk. One survived a limit only because it had committed thirteen times.
 2. **Never `git add -A` or `-a`.** Stage explicit paths and read `git diff --numstat` first: a
-   one-line change in a file you never touched is the signature of a live mutation. A mutation has
-   been committed as source here once.
-3. **Never run cargo, edit a file, or run git while the harness is running.** It mutates the tree in
-   place. A concurrent build already cost one discarded full-table result, and the number would have
-   been believable.
+   one-line change in a file you never touched is the signature of a live mutation. **A mutation
+   has been committed as source here twice.** The second time the path was explicit and the file
+   was one the committer had genuinely edited seconds earlier -- so naming the path is necessary
+   and is *not* sufficient. What would have caught it: reading the staged diff, not the numstat.
+   The hunk said `expect` while the comment three lines above it, and the commit message, both
+   said `if let`. **When the diff disagrees with the prose you just wrote, the diff is the tree
+   and the prose is your intent.**
+3. **Never run cargo, edit a file, or run git while the harness is running** -- and the
+   prohibition is **symmetric**. It mutates the tree in place. A concurrent build already cost one
+   discarded full-table result, and the number would have been believable.
+
+   The symmetry is the second lesson, and it cost the second committed mutation. Anything that
+   hand-applies a row is a harness run, whether or not it is `tools/mutate.py`: an agent proving a
+   detector by reverting a fix holds the tree exactly as the harness does, for seconds at a time,
+   with no lock and no announcement. The other party read rule 3 as binding only the harness
+   operator, edited and committed the same file inside that window, and captured the reversion.
+
+   > Before dispatching work that hand-applies mutations, decide who owns the tree for its
+   > duration -- and do not be the one who commits. If a file must be shared, the mutator restores
+   > byte-for-byte and says so with a hash; the committer reads the staged diff before every
+   > commit. Both halves happened here, which is the only reason the correct bytes were never
+   > lost.
 4. **Let a killed harness run exit rather than killing it again.** Its restore is a `finally`; a
    killed interpreter skips it and leaves a mutation live.
 5. **Edit `tools/mutate.py` by inserting before the list terminator, never by slicing it.** Slicing
