@@ -359,6 +359,64 @@ pub enum AbiError {
         status: i32,
     },
 
+    /// A JNI function this layer will not answer, naming itself.
+    ///
+    /// **The variant that replaces a plausible stub.** `jni-surface.md` §8.1 ranks `FindClass`
+    /// returning `NULL` where the caller does not check third among the expected failure modes,
+    /// because it is a fatal abort thousands of instructions later. The same is true of every
+    /// other believable JNI answer — a `jmethodID` that resolves to the wrong member, a
+    /// `jstring` whose length is counted in the wrong units. So a JNI function that cannot be
+    /// answered correctly raises this instead, and `function` is the slot's own name
+    /// (`JNIEnv::GetPrimitiveArrayCritical`, `JavaVM::DestroyJavaVM`) rather than a generic one:
+    /// that is the entire reason all 233 slots get their own thunk address.
+    #[error("`{function}` at {address:#x} was refused: {detail}")]
+    JniRefused {
+        /// The JNI function, by name.
+        function: String,
+        /// Its thunk address, or the instance's arena for a host-side call.
+        address: GuestAddr,
+        /// Why, in one sentence.
+        detail: String,
+    },
+
+    /// A `jobject`, `jclass`, `jmethodID` or `jfieldID` the guest handed back that this layer
+    /// never issued.
+    ///
+    /// Distinct from [`JniRefused`](AbiError::JniRefused) on purpose: that one is a gap in the
+    /// host, this one is a fact about the guest. The APK is cheat-injected (D6) and JNI's types
+    /// are opaque pointers, so there is nothing in the ABI that constrains what arrives — and a
+    /// null `jmethodID`, which is by far the commonest shape, means an earlier lookup returned
+    /// null and was not checked.
+    #[error("`{function}` at {address:#x} was given {handle:#x} as a {kind}, which {why}")]
+    JniBadHandle {
+        /// The JNI function.
+        function: String,
+        /// Its thunk address.
+        address: GuestAddr,
+        /// `"jobject"`, `"jmethodID"` or `"jfieldID"`.
+        kind: &'static str,
+        /// The raw 64-bit value the guest passed.
+        handle: u64,
+        /// Why it did not decode.
+        why: String,
+    },
+
+    /// A JNI handler ran on a thread with no JNI state installed.
+    ///
+    /// A **host** mistake, exactly as [`BionicNotActive`](AbiError::BionicNotActive) is:
+    /// `Jni::activate` was not held across `Boundary::run`. It is an error rather than a
+    /// default-constructed instance because a per-call default would give every guest thread its
+    /// own private handle table and its own pending exception.
+    #[error(
+        "`{function}` at {address:#x} was serviced on a thread with no JNI state: `Jni::activate` must be held across `Boundary::run`"
+    )]
+    JniNotActive {
+        /// The JNI function.
+        function: String,
+        /// Its thunk address.
+        address: GuestAddr,
+    },
+
     /// The thunk region could not be reserved or has run out of slots.
     #[error("the thunk region cannot hold another {what}: {detail}")]
     RegionFull {
@@ -397,6 +455,11 @@ impl AbiError {
             | AbiError::GuestAborted { symbol, .. }
             | AbiError::GuestExited { symbol, .. }
             | AbiError::BionicNotActive { symbol, .. } => Some(symbol),
+            // The JNI variants name a *function* rather than an ELF symbol, and it is the same
+            // question a reader is asking: which call failed.
+            AbiError::JniRefused { function, .. }
+            | AbiError::JniBadHandle { function, .. }
+            | AbiError::JniNotActive { function, .. } => Some(function),
             AbiError::NoSuchThunk { .. }
             | AbiError::CrossingLimit { .. }
             | AbiError::RegionFull { .. }
@@ -424,7 +487,10 @@ impl AbiError {
             | AbiError::Refused { address, .. }
             | AbiError::GuestAborted { address, .. }
             | AbiError::GuestExited { address, .. }
-            | AbiError::BionicNotActive { address, .. } => Some(address),
+            | AbiError::BionicNotActive { address, .. }
+            | AbiError::JniRefused { address, .. }
+            | AbiError::JniBadHandle { address, .. }
+            | AbiError::JniNotActive { address, .. } => Some(address),
             // The address the *guest* branched to, not the slot it landed in: the whole point of the
             // variant is that those differ.
             AbiError::MidThunk { address, .. } | AbiError::NoSuchThunk { address, .. } => {
