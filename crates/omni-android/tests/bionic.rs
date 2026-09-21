@@ -37,6 +37,10 @@ fn fixture() -> Fixture {
     let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
     let builder = guest.boundary(256);
     bionic.bind_into(&builder).expect("bind every handler");
+    // The log sink writes to the host's stderr by default, which is what a real run wants and what
+    // a suite that logs 266 lines on purpose does not. The instance's ring still records every
+    // line, and the ring is what these tests assert on.
+    bionic.set_log_to_stderr(false);
     let boundary = builder.finish();
     Fixture { guest, bionic, boundary }
 }
@@ -147,14 +151,61 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 96, "bound symbols: {symbols:?}");
-    // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 adds ten: the four `dl*` refusals
-    // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path.
-    assert_eq!(Bionic::inline_symbols().count(), 88);
+    assert_eq!(symbols.len(), 119, "bound symbols: {symbols:?}");
+    // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
+    // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
+    // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
+    assert_eq!(Bionic::inline_symbols().count(), 111);
     assert_eq!(Bionic::reentrant_symbols().count(), 8);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
-    // handler at all. 96 + 18 = 114 of the 188 the initializers reach.
+    // handler at all. 119 + 18 = 137 of the 188 the initializers reach.
     assert_eq!(omni_android::bionic::DATA_OBJECTS.len(), 18);
+
+    // **Membership, not just a total** — a count cannot see a substitution, and this project has
+    // had a list whose count stayed right while two members were wrong and two were missing. The
+    // 23 phase 3a binds are named one by one.
+    let bound: std::collections::BTreeSet<&str> = symbols.iter().copied().collect();
+    let phase_3a = [
+        // clocks
+        "clock_gettime",
+        "gettimeofday",
+        "gmtime_r",
+        "nanosleep",
+        "usleep",
+        // process and environment
+        "getpid",
+        "sched_getcpu",
+        "arc4random_buf",
+        "getauxval",
+        "getenv",
+        "__system_property_get",
+        "abort",
+        "__stack_chk_fail",
+        "_exit",
+        "android_set_abort_message",
+        "sysconf",
+        "sysinfo",
+        "prctl",
+        "syscall",
+        // logging
+        "__android_log_print",
+        "syslog",
+        "openlog",
+        "closelog",
+    ];
+    assert_eq!(phase_3a.len(), 23);
+    for symbol in phase_3a {
+        assert!(bound.contains(symbol), "`{symbol}` is in phase 3a's scope and is not bound");
+    }
+
+    // And the complement: the groups phase 3a deliberately does not touch stay `Unbound`, so that
+    // "not done yet" and "done" cannot be confused by anyone reading the count.
+    for symbol in ["open", "close", "read", "fopen", "socket", "poll", "pthread_create", "pthread_join"] {
+        assert!(
+            !bound.contains(symbol),
+            "`{symbol}` belongs to phase 3b/3c/3d and must still name itself when called"
+        );
+    }
 }
 
 /// **Task 2 review finding F9, asserted rather than trusted to a comment.**
@@ -1286,6 +1337,7 @@ fn fixture_with(images: &[Image]) -> Fixture {
     let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
     let builder = guest.boundary(256);
     bionic.bind_into(&builder).expect("bind every handler");
+    bionic.set_log_to_stderr(false);
     let stack_guard = guest.backend.tls().stack_guard();
     bionic
         .declare_data_into(&builder, &GuestProcess { stack_guard })
@@ -2274,4 +2326,835 @@ fn code_at_a_reused_address_is_retranslated_rather_than_run_from_the_cache() {
         0xBB,
         "0xAA here is the first program's translation, served out of the code cache after the          memory it was translated from was unmapped"
     );
+}
+
+
+// =================================================================== M3 task 3 phase 3a
+//
+// Clocks, process and environment, and the log sink — the first symbols in this adapter whose
+// answers come from `omni-platform`.
+
+use omni_android::bionic::{HwcapPolicy, LogPriority, HWCAP_ATOMICS, LOG_CAPTURE_MAX, PROP_VALUE_MAX};
+
+/// Linux `clockid_t` values, as guest code passes them.
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+const CLOCK_BOOTTIME: u64 = 7;
+
+/// Read a guest `int` at any 4-byte-aligned address.
+///
+/// The harness reads 8 bytes at a time from an 8-aligned address, and a `struct tm` is nine `int`s
+/// in a row — so half of them start at offset 4 of their word.
+fn read_i32(f: &Fixture, at: omni_cpu::GuestAddr) -> i32 {
+    assert_eq!(at % 4, 0, "an int is 4-byte aligned");
+    let word = f.guest.read_u64(at & !7);
+    let shift = 32 * ((at & 7) / 4);
+    (word >> shift) as u32 as i32
+}
+
+// ------------------------------------------------------------------ clocks
+
+/// **Both clocks are answered from the platform seam, and the ids this layer does not model are
+/// refused by number.**
+///
+/// The refusal half is the part that matters. `clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)`
+/// answered with wall time is a plausible, monotonic number of seconds that is not what was asked
+/// for, and a guest profiler built on it would report wall time as CPU time forever.
+#[test]
+fn clock_gettime_answers_the_two_clocks_and_refuses_the_ones_it_does_not_model() {
+    let _guard = serialized();
+    let f = fixture();
+    let ts = f.guest.data + 0x200;
+
+    for id in [CLOCK_MONOTONIC, 4 /* _RAW */, 6 /* _COARSE */] {
+        f.guest.write_u64(ts, u64::MAX);
+        f.guest.write_u64(ts + 8, u64::MAX);
+        let code = value_of(&f, "clock_gettime", |asm| {
+            asm.mov(0, id);
+            asm.mov(1, ts as u64);
+        });
+        assert_eq!(code as i64 as i32, 0, "clock {id}");
+        let nanos = f.guest.read_u64(ts + 8);
+        assert!(nanos < 1_000_000_000, "clock {id}: tv_nsec is {nanos}, which is not a fraction");
+        // The monotonic clock is measured from a process epoch, so a *plausible* reading is a
+        // small number of seconds rather than a Unix time. Asserting the upper bound is what
+        // catches "monotonic was served from the wall clock", which is otherwise invisible.
+        let seconds = f.guest.read_u64(ts);
+        assert!(seconds < 1_000_000, "clock {id}: {seconds} s looks like a wall clock");
+    }
+
+    // Monotonic never goes backwards across two real calls through the boundary.
+    let first = {
+        value_of(&f, "clock_gettime", |asm| {
+            asm.mov(0, CLOCK_MONOTONIC);
+            asm.mov(1, ts as u64);
+        });
+        (f.guest.read_u64(ts), f.guest.read_u64(ts + 8))
+    };
+    let second = {
+        value_of(&f, "clock_gettime", |asm| {
+            asm.mov(0, CLOCK_MONOTONIC);
+            asm.mov(1, ts as u64);
+        });
+        (f.guest.read_u64(ts), f.guest.read_u64(ts + 8))
+    };
+    assert!(second >= first, "CLOCK_MONOTONIC went backwards: {first:?} -> {second:?}");
+
+    for id in [CLOCK_REALTIME, 5 /* _COARSE */] {
+        let code = value_of(&f, "clock_gettime", |asm| {
+            asm.mov(0, id);
+            asm.mov(1, ts as u64);
+        });
+        assert_eq!(code as i64 as i32, 0, "clock {id}");
+        // 2020-01-01. A wall clock below it is a host whose clock is not set, which is worth
+        // knowing about; the point of the bound is that it separates a wall clock from a
+        // monotonic one, and nothing narrower would.
+        assert!(f.guest.read_u64(ts) > 1_577_836_800, "clock {id} is not a wall clock");
+    }
+
+    for (id, name) in [
+        (CLOCK_PROCESS_CPUTIME_ID, "CLOCK_PROCESS_CPUTIME_ID"),
+        (CLOCK_THREAD_CPUTIME_ID, "CLOCK_THREAD_CPUTIME_ID"),
+        (CLOCK_BOOTTIME, "CLOCK_BOOTTIME"),
+    ] {
+        let error = refusal_of(&f, "clock_gettime", |asm| {
+            asm.mov(0, id);
+            asm.mov(1, ts as u64);
+        });
+        assert_eq!(error.symbol(), Some("clock_gettime"));
+        let text = error.to_string();
+        assert!(text.contains(name), "the refusal must name the clock asked for: {text}");
+    }
+    // And one nobody has a name for is still refused, with its number in the message.
+    let unknown = refusal_of(&f, "clock_gettime", |asm| {
+        asm.mov(0, 4242);
+        asm.mov(1, ts as u64);
+    });
+    assert!(unknown.to_string().contains("4242"), "{unknown}");
+}
+
+/// **`gettimeofday` writes MICROseconds**, and zeroes the obsolete `struct timezone`.
+///
+/// The thousand-fold error is the one this catches: `tv_usec` filled with nanoseconds is still a
+/// number under a billion and still increases, so nothing but a range check sees it.
+#[test]
+fn gettimeofday_writes_microseconds_and_zeroes_the_obsolete_timezone() {
+    let _guard = serialized();
+    let f = fixture();
+    let tv = f.guest.data + 0x200;
+    let tz = f.guest.data + 0x240;
+    f.guest.write_u64(tv, u64::MAX);
+    f.guest.write_u64(tv + 8, u64::MAX);
+    f.guest.write_u64(tz, 0xAAAA_AAAA_AAAA_AAAA);
+
+    let code = value_of(&f, "gettimeofday", |asm| {
+        asm.mov(0, tv as u64);
+        asm.mov(1, tz as u64);
+    });
+    assert_eq!(code as i64 as i32, 0);
+    assert!(f.guest.read_u64(tv) > 1_577_836_800, "tv_sec must be a wall clock");
+    let micros = f.guest.read_u64(tv + 8);
+    assert!(micros < 1_000_000, "tv_usec is {micros}: a struct timeval is MICROseconds");
+    assert_eq!(f.guest.read_u64(tz), 0, "Linux fills the obsolete struct timezone with zeroes");
+
+    // Both null is legal and writes nothing: `gettimeofday(NULL, NULL)` must not fault.
+    let code = value_of(&f, "gettimeofday", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+    });
+    assert_eq!(code as i64 as i32, 0, "a null tv is legal — the call is then only about tz");
+}
+
+/// **`gmtime_r` fills the guest's `struct tm` at the documented offsets.**
+///
+/// A leap day in a year divisible by 400 is the date chosen, because it exercises the century rule
+/// in both directions at once. Asserted field by field against a date anyone can check, not
+/// against the conversion's own inverse.
+#[test]
+fn gmtime_r_breaks_a_real_timestamp_down_into_the_guest_struct_tm() {
+    let _guard = serialized();
+    let f = fixture();
+    let timer = f.guest.data + 0x200;
+    let result = f.guest.data + 0x240;
+    // 2000-02-29T12:00:00Z, a Tuesday, day 59 of the year.
+    f.guest.write_u64(timer, 951_825_600);
+    for offset in (0..56).step_by(8) {
+        f.guest.write_u64(result + offset, 0xAAAA_AAAA_AAAA_AAAA);
+    }
+
+    let returned = value_of(&f, "gmtime_r", |asm| {
+        asm.mov(0, timer as u64);
+        asm.mov(1, result as u64);
+    });
+    assert_eq!(returned, result as u64, "gmtime_r returns the buffer it was given");
+
+    assert_eq!(read_i32(&f, result), 0, "tm_sec");
+    assert_eq!(read_i32(&f, result + 4), 0, "tm_min");
+    assert_eq!(read_i32(&f, result + 8), 12, "tm_hour");
+    assert_eq!(read_i32(&f, result + 12), 29, "tm_mday");
+    assert_eq!(read_i32(&f, result + 16), 1, "tm_mon is 0-based, so February is 1");
+    assert_eq!(read_i32(&f, result + 20), 100, "tm_year is years since 1900");
+    assert_eq!(read_i32(&f, result + 24), 2, "tm_wday: 2000-02-29 was a Tuesday");
+    assert_eq!(read_i32(&f, result + 28), 59, "tm_yday is 0-based");
+    assert_eq!(read_i32(&f, result + 32), 0, "UTC has no daylight saving");
+    assert_eq!(f.guest.read_u64(result + 40), 0, "tm_gmtoff: UTC's offset is zero");
+    let zone = f.guest.read_u64(result + 48) as omni_cpu::GuestAddr;
+    assert_ne!(zone, 0, "tm_zone is a `const char *` guest code prints");
+    assert_eq!(f.read_cstring(zone), b"UTC", "and it says UTC, because gmtime is UTC");
+
+    // A pre-1970 timestamp: the half of the calendar arithmetic that a truncating division gets
+    // wrong by exactly one day, and only before the epoch.
+    f.guest.write_u64(timer, (-1i64) as u64);
+    value_of(&f, "gmtime_r", |asm| {
+        asm.mov(0, timer as u64);
+        asm.mov(1, result as u64);
+    });
+    assert_eq!(read_i32(&f, result + 20), 69, "1969");
+    assert_eq!(read_i32(&f, result + 16), 11, "December");
+    assert_eq!(read_i32(&f, result + 12), 31);
+    assert_eq!(read_i32(&f, result + 8), 23);
+
+    // A year that will not fit `int tm_year` is NULL with EOVERFLOW, which is C's answer and not
+    // a stub. The struct is left as it was rather than half written.
+    f.guest.write_u64(result, 0x1234_5678_9ABC_DEF0);
+    f.guest.write_u64(timer, i64::MAX as u64);
+    let refused = value_of(&f, "gmtime_r", |asm| {
+        asm.mov(0, timer as u64);
+        asm.mov(1, result as u64);
+    });
+    assert_eq!(refused, 0, "an out-of-range year is NULL, not a wrapped date");
+    assert_eq!(
+        f.guest.read_u64(result),
+        0x1234_5678_9ABC_DEF0,
+        "a failed conversion must not have written anything"
+    );
+}
+
+/// **A sleep really sleeps, a malformed request is `EINVAL`, and a request past the cap refuses.**
+///
+/// The cap is the hostile-input half: a sleeping thread executes no guest instructions, so D16's
+/// step-budget watchdog cannot end one, and `nanosleep({INT64_MAX, 0})` would be a permanent hang
+/// of the host thread that serviced it.
+///
+/// The duration assertion is **one-sided**, which is the only side `nanosleep` and Windows' ~15.6 ms
+/// timer tick between them guarantee. n = 1: a lower bound on a sleep is not a rare event and does
+/// not need a sample — every run either slept or did not.
+#[test]
+fn nanosleep_sleeps_reports_einval_and_refuses_a_request_past_the_cap() {
+    let _guard = serialized();
+    let f = fixture();
+    let req = f.guest.data + 0x200;
+    let rem = f.guest.data + 0x240;
+
+    // 10 ms.
+    f.guest.write_u64(req, 0);
+    f.guest.write_u64(req + 8, 10_000_000);
+    f.guest.write_u64(rem, 0xAAAA_AAAA_AAAA_AAAA);
+    f.guest.write_u64(rem + 8, 0xAAAA_AAAA_AAAA_AAAA);
+    let before = std::time::Instant::now();
+    let code = value_of(&f, "nanosleep", |asm| {
+        asm.mov(0, req as u64);
+        asm.mov(1, rem as u64);
+    });
+    let elapsed = before.elapsed();
+    assert_eq!(code as i64 as i32, 0);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(10),
+        "a 10 ms nanosleep returned after {elapsed:?}, so it did not sleep"
+    );
+    assert_eq!(f.guest.read_u64(rem), 0, "no signals are delivered, so nothing remains");
+    assert_eq!(f.guest.read_u64(rem + 8), 0);
+
+    // POSIX's validity rule, at both edges. `-1` with `errno` is the C library's own answer to a
+    // malformed request and is a contract rather than a stub.
+    for (seconds, nanos) in [(0u64, 1_000_000_000u64), (0, (-1i64) as u64), ((-1i64) as u64, 0)] {
+        f.guest.write_u64(req, seconds);
+        f.guest.write_u64(req + 8, nanos);
+        let code = value_of(&f, "nanosleep", |asm| {
+            asm.mov(0, req as u64);
+            asm.mov(1, 0);
+        });
+        assert_eq!(code as i64 as i32, -1, "{seconds}s + {nanos}ns must be EINVAL");
+    }
+
+    // Past the cap: refused by name, with both numbers in the message.
+    f.guest.write_u64(req, i64::MAX as u64);
+    f.guest.write_u64(req + 8, 0);
+    let error = refusal_of(&f, "nanosleep", |asm| {
+        asm.mov(0, req as u64);
+        asm.mov(1, 0);
+    });
+    assert_eq!(error.symbol(), Some("nanosleep"));
+    let text = error.to_string();
+    assert!(text.contains("60"), "the refusal must name the cap: {text}");
+    assert!(text.contains(&i64::MAX.to_string()), "and what was asked for: {text}");
+}
+
+/// **`usleep` takes only the low 32 bits of `X0`**, because `useconds_t` is `unsigned int`.
+///
+/// The structural assertion, and the reason it is structural rather than timed: AAPCS64 does not
+/// require a caller to clear the high half of a register holding a 32-bit argument, so a handler
+/// that read all 64 bits would turn a perfectly ordinary 100 µs sleep into a request for 584,000
+/// years — which the cap would then *refuse*. So the test is "a correct call is not refused", and
+/// it fails loudly against the wrong read rather than hanging.
+#[test]
+fn usleep_reads_only_the_low_thirty_two_bits_of_its_argument() {
+    let _guard = serialized();
+    let f = fixture();
+    let code = value_of(&f, "usleep", |asm| {
+        asm.mov(0, 0xFFFF_FFFF_0000_0064);
+    });
+    assert_eq!(code as i64 as i32, 0, "100 us with a dirty high half must still be 100 us");
+
+    // And the cap still applies to a value that really is large: 0xFFFF_FFFF us is 4,294 s.
+    let error = refusal_of(&f, "usleep", |asm| {
+        asm.mov(0, 0xFFFF_FFFF);
+    });
+    assert_eq!(error.symbol(), Some("usleep"));
+    assert!(error.to_string().contains("60"), "{error}");
+}
+
+// ------------------------------------------------------------------ process and environment
+
+/// `getpid` is the host's, and `sched_getcpu` is answered or refused by name — never `-1`.
+#[test]
+fn getpid_and_sched_getcpu_come_from_the_platform_seam() {
+    let _guard = serialized();
+    let f = fixture();
+    let pid = value_of(&f, "getpid", |_| {}) as i64 as i32;
+    assert_eq!(
+        pid,
+        std::process::id() as i32,
+        "several guest instances share one host process, exactly as several threads of an \
+         Android process share one pid"
+    );
+
+    let entry = call_one(&f, "sched_getcpu", |_| {});
+    let mut cpu = f.guest.thread(&f.boundary);
+    match f.run(&mut cpu, entry) {
+        Ok(_) => {
+            let id = f.guest.read_u64(f.guest.data) as i64 as i32;
+            assert!(id >= 0, "a processor number is never negative: {id}");
+        }
+        Err(error) => {
+            // The other four targets have no cpu-id backend and must say so by name. `-1` is a
+            // documented `sched_getcpu` failure that callers route around, so it is the one
+            // answer that would hide the gap.
+            assert_eq!(error.symbol(), Some("sched_getcpu"));
+            assert!(error.to_string().contains("sched_getcpu"), "{error}");
+        }
+    }
+}
+
+/// **`arc4random_buf` fills exactly what it was given, with bytes that differ between draws.**
+///
+/// Structural, not statistical: 64 bytes left at zero is what a backend that reports success
+/// without writing looks like, two identical 64-byte draws is what a constant source looks like,
+/// and an untouched sentinel past the end is what a length bug looks like. None of the three is a
+/// randomness-quality claim and none is a flake risk at 2^-512.
+#[test]
+fn arc4random_buf_fills_exactly_the_buffer_it_was_given() {
+    let _guard = serialized();
+    let f = fixture();
+    let first = f.guest.data + 0x400;
+    let second = f.guest.data + 0x500;
+    // 64 bytes of buffer followed by 32 bytes of sentinel.
+    for offset in (0..96).step_by(8) {
+        f.guest.write_u64(first + offset, 0xAAAA_AAAA_AAAA_AAAA);
+        f.guest.write_u64(second + offset, 0xAAAA_AAAA_AAAA_AAAA);
+    }
+
+    for at in [first, second] {
+        value_of(&f, "arc4random_buf", |asm| {
+            asm.mov(0, at as u64);
+            asm.mov(1, 64);
+        });
+    }
+    let read = |at: omni_cpu::GuestAddr| -> Vec<u64> {
+        (0..64).step_by(8).map(|o| f.guest.read_u64(at + o)).collect()
+    };
+    let a = read(first);
+    let b = read(second);
+    assert!(a.iter().any(|&w| w != 0), "the buffer was reported filled and is all zero");
+    assert!(
+        a.iter().any(|&w| w != 0xAAAA_AAAA_AAAA_AAAA),
+        "the buffer was reported filled and is untouched"
+    );
+    assert_ne!(a, b, "two draws from a real entropy source cannot be equal");
+    for at in [first, second] {
+        for offset in (64..96).step_by(8) {
+            assert_eq!(
+                f.guest.read_u64(at + offset),
+                0xAAAA_AAAA_AAAA_AAAA,
+                "arc4random_buf wrote past the {offset}th byte of a 64-byte request"
+            );
+        }
+    }
+
+    // A zero length writes nothing and is legal C at any address, null included.
+    let sentinel = f.guest.read_u64(first);
+    value_of(&f, "arc4random_buf", |asm| {
+        asm.mov(0, first as u64);
+        asm.mov(1, 0);
+    });
+    assert_eq!(f.guest.read_u64(first), sentinel, "a zero-length request must touch nothing");
+    value_of(&f, "arc4random_buf", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+    });
+}
+
+/// **`getenv` answers `NULL` until the host gives the guest a variable**, and the pointer it then
+/// returns is stable.
+///
+/// Empty is a *fact* about a process that was started with no environment — the same fact the
+/// `environ` data object states by pointing at a vector of one null — not a stub. The host's own
+/// environment is deliberately unreachable: it would be both a wrong answer and a leak.
+#[test]
+fn getenv_answers_null_until_the_host_gives_the_guest_a_variable() {
+    let _guard = serialized();
+    let f = fixture();
+    let path = f.cstring(f.guest.data + 0x100, b"PATH");
+    let name = f.cstring(f.guest.data + 0x140, b"OMNI_TEST");
+    let empty = f.cstring(f.guest.data + 0x180, b"");
+    let malformed = f.cstring(f.guest.data + 0x1C0, b"A=B");
+
+    // `PATH` is certainly set in the host's environment, which is exactly why it is the one asked
+    // for: a `getenv` that reached the host would answer it.
+    assert_eq!(
+        value_of(&f, "getenv", |asm| { asm.mov(0, path as u64); }),
+        0,
+        "the guest must not see the host's environment"
+    );
+    assert_eq!(value_of(&f, "getenv", |asm| { asm.mov(0, 0); }), 0, "getenv(NULL)");
+    assert_eq!(value_of(&f, "getenv", |asm| { asm.mov(0, empty as u64); }), 0, "an empty name");
+    assert_eq!(value_of(&f, "getenv", |asm| { asm.mov(0, malformed as u64); }), 0, "a name with `=`");
+
+    f.bionic.set_env("OMNI_TEST", "a value").expect("the pool has room");
+    let found = value_of(&f, "getenv", |asm| { asm.mov(0, name as u64); });
+    assert_ne!(found, 0, "a variable the host set must be found");
+    assert_eq!(f.read_cstring(found as omni_cpu::GuestAddr), b"a value");
+    // `getenv`'s contract is that the pointer stays valid, so two calls give the same address.
+    assert_eq!(value_of(&f, "getenv", |asm| { asm.mov(0, name as u64); }), found);
+
+    // A name that could never be found again is refused at the setting end rather than stored.
+    assert!(f.bionic.set_env("", "x").is_err());
+    assert!(f.bionic.set_env("A=B", "x").is_err());
+}
+
+/// **The property table is empty until the host fills it**, and an oversized value is refused when
+/// it is set rather than truncated when it is read.
+#[test]
+fn the_system_property_table_is_empty_until_the_host_fills_it() {
+    let _guard = serialized();
+    let f = fixture();
+    let name = f.cstring(f.guest.data + 0x100, b"ro.build.version.sdk");
+    let value = f.guest.data + 0x200;
+    f.guest.write_u64(value, 0xAAAA_AAAA_AAAA_AAAA);
+
+    let length = value_of(&f, "__system_property_get", |asm| {
+        asm.mov(0, name as u64);
+        asm.mov(1, value as u64);
+    }) as i64 as i32;
+    assert_eq!(length, 0, "an unset property is length 0");
+    assert_eq!(f.read_cstring(value), b"", "and an empty string, not an untouched buffer");
+
+    f.bionic.set_system_property("ro.build.version.sdk", "33").expect("a short value");
+    let length = value_of(&f, "__system_property_get", |asm| {
+        asm.mov(0, name as u64);
+        asm.mov(1, value as u64);
+    }) as i64 as i32;
+    assert_eq!(length, 2, "the length excludes the NUL, as bionic's does");
+    assert_eq!(f.read_cstring(value), b"33");
+
+    // A null name is answered as "not set" rather than dereferenced.
+    let length = value_of(&f, "__system_property_get", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, value as u64);
+    }) as i64 as i32;
+    assert_eq!(length, 0);
+
+    // The guest declares `char value[PROP_VALUE_MAX]`, so a longer value is refused at the setting
+    // end: writing it would overflow a buffer in guest code, and truncating it would be a
+    // believable wrong answer.
+    let too_long = "x".repeat(PROP_VALUE_MAX);
+    let error = f.bionic.set_system_property("ro.too.long", &too_long).expect_err("refused");
+    assert!(error.to_string().contains(&PROP_VALUE_MAX.to_string()), "{error}");
+    // One byte less, with its NUL, is exactly the limit and is accepted.
+    f.bionic
+        .set_system_property("ro.exactly.max", &"x".repeat(PROP_VALUE_MAX - 1))
+        .expect("PROP_VALUE_MAX includes the NUL");
+}
+
+/// **`getauxval(AT_HWCAP)` REFUSES until a host makes the decision, and the refusal carries both
+/// measured arms.**
+///
+/// This is the open `AT_HWCAP` question, and the test exists so that it cannot be closed by
+/// accident. Advertising `HWCAP_ATOMICS` gives 53 hard interpreter halts; declining gives 106
+/// fallback arms into a global spinlock that anti-scales 21x. Neither is a default, and a policy
+/// type in which "no decision" and "decided to decline" were the same value could not refuse.
+#[test]
+fn getauxval_refuses_at_hwcap_until_a_host_makes_the_decision() {
+    let _guard = serialized();
+    let f = fixture();
+
+    // The default is the refusal, and it names both arms.
+    assert_eq!(f.bionic.hwcap_policy(), HwcapPolicy::Undecided);
+    for kind in [16u64 /* AT_HWCAP */, 26 /* AT_HWCAP2 */] {
+        let error = refusal_of(&f, "getauxval", |asm| { asm.mov(0, kind); });
+        assert_eq!(error.symbol(), Some("getauxval"));
+        let text = error.to_string();
+        assert!(text.contains("OPEN DECISION"), "{text}");
+        assert!(text.contains("53"), "the refusal must carry the advertise arm: {text}");
+        assert!(text.contains("106"), "and the decline arm: {text}");
+        assert!(text.contains("21x"), "and what declining costs: {text}");
+    }
+
+    // A host that has decided says so, and then gets what it asked for — including zero, which is
+    // a decision and is not the same value as having made none.
+    f.bionic.set_hwcap_policy(HwcapPolicy::Decline);
+    assert_eq!(value_of(&f, "getauxval", |asm| { asm.mov(0, 16); }), 0);
+    assert_eq!(value_of(&f, "getauxval", |asm| { asm.mov(0, 26); }), 0);
+
+    f.bionic.set_hwcap_policy(HwcapPolicy::Advertise { hwcap: HWCAP_ATOMICS, hwcap2: 7 });
+    assert_eq!(value_of(&f, "getauxval", |asm| { asm.mov(0, 16); }), HWCAP_ATOMICS);
+    assert_eq!(value_of(&f, "getauxval", |asm| { asm.mov(0, 26); }), 7);
+    assert_eq!(HWCAP_ATOMICS, 1 << 8, "HWCAP_ATOMICS is bit 8 of AT_HWCAP on AArch64");
+
+    // `AT_PAGESZ` is a fact and is answered whatever the policy is.
+    let page = value_of(&f, "getauxval", |asm| { asm.mov(0, 6); });
+    assert_eq!(page, f.guest.space.page_size() as u64);
+
+    // Everything else refuses by number, rather than returning `getauxval`'s documented 0/ENOENT —
+    // which a guest cannot tell apart from a key whose value really is zero.
+    for kind in [23u64 /* AT_SECURE */, 17 /* AT_CLKTCK */, 25 /* AT_RANDOM */, 9999] {
+        let error = refusal_of(&f, "getauxval", |asm| { asm.mov(0, kind); });
+        assert!(error.to_string().contains(&kind.to_string()), "{error}");
+    }
+}
+
+/// **`abort`, `__stack_chk_fail` and `_exit` become typed, catchable outcomes.**
+///
+/// The failure this replaces is `std::process::abort()`, which no caller can contain and which
+/// would take every other guest instance in the process — and this test runner — with it. A test
+/// cannot assert "the host did not abort", because there would be nothing left to assert it; what
+/// it can assert is the shape that makes aborting impossible, which is a value carrying the reason.
+#[test]
+fn abort_and_exit_become_typed_outcomes_rather_than_ending_the_host() {
+    let _guard = serialized();
+    let f = fixture();
+
+    let silent = refusal_of(&f, "abort", |_| {});
+    assert_eq!(silent.symbol(), Some("abort"));
+    assert!(matches!(silent, AbiError::GuestAborted { .. }), "{silent:?}");
+    assert!(silent.to_string().contains("set no abort message"), "{silent}");
+
+    // The message bionic's crash reporter would have printed travels with the abort.
+    let message = f.cstring(f.guest.data + 0x100, b"terminating with uncaught exception");
+    value_of(&f, "android_set_abort_message", |asm| { asm.mov(0, message as u64); });
+    assert_eq!(
+        f.bionic.abort_message().as_deref(),
+        Some("terminating with uncaught exception")
+    );
+    let spoken = refusal_of(&f, "abort", |_| {});
+    assert!(spoken.to_string().contains("uncaught exception"), "{spoken}");
+
+    // The stack protector is an abort with its own reason, so a reader is not left thinking the
+    // guest chose to exit.
+    let smashed = refusal_of(&f, "__stack_chk_fail", |_| {});
+    assert_eq!(smashed.symbol(), Some("__stack_chk_fail"));
+    assert!(matches!(smashed, AbiError::GuestAborted { .. }), "{smashed:?}");
+    assert!(smashed.to_string().contains("canary"), "{smashed}");
+
+    // A null message clears it.
+    value_of(&f, "android_set_abort_message", |asm| { asm.mov(0, 0); });
+    assert_eq!(f.bionic.abort_message(), None);
+
+    // `_exit` carries its status, and a zero status is still an exit rather than a success.
+    for status in [42i64, 0, -1] {
+        let exited = refusal_of(&f, "_exit", |asm| { asm.mov(0, status as u64); });
+        assert_eq!(exited.symbol(), Some("_exit"));
+        match exited {
+            AbiError::GuestExited { status: reported, .. } => {
+                assert_eq!(i64::from(reported), status);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// **The four that cannot be modelled refuse by name, with the guest's own argument in the
+/// message.**
+///
+/// Each has a believable wrong answer sitting next to it — `sysconf` a page size, `sysinfo` a
+/// zeroed struct, `prctl` a 0, `syscall` a `-1`/`ENOSYS` — and each of those would be routed
+/// around by ordinary guest code without anything being reported.
+#[test]
+fn the_four_process_symbols_that_cannot_be_modelled_refuse_by_name() {
+    let _guard = serialized();
+    let f = fixture();
+
+    // `sysconf` refuses even the two names this layer could answer, because bionic's `_SC_*`
+    // numbering could not be verified here and a wrong constant answers the *wrong* query with a
+    // right-looking number.
+    let page = refusal_of(&f, "sysconf", |asm| { asm.mov(0, 0x27); });
+    assert_eq!(page.symbol(), Some("sysconf"));
+    let text = page.to_string();
+    assert!(text.contains("_SC_PAGESIZE"), "{text}");
+    assert!(text.contains("UNVERIFIED"), "the hint must be flagged as unverified: {text}");
+    assert!(text.contains("NDK"), "and must say what would settle it: {text}");
+    let unknown = refusal_of(&f, "sysconf", |asm| { asm.mov(0, 4242); });
+    assert!(unknown.to_string().contains("4242"), "{unknown}");
+
+    let info = refusal_of(&f, "sysinfo", |asm| {
+        asm.mov(0, (f.guest.data + 0x200) as u64);
+    });
+    assert_eq!(info.symbol(), Some("sysinfo"));
+    assert!(info.to_string().contains("totalram"), "{info}");
+
+    let named = refusal_of(&f, "prctl", |asm| {
+        asm.mov(0, 15); // PR_SET_NAME
+        asm.mov(1, (f.guest.data + 0x100) as u64);
+    });
+    assert_eq!(named.symbol(), Some("prctl"));
+    assert!(named.to_string().contains("PR_SET_NAME"), "{named}");
+    let vma = refusal_of(&f, "prctl", |asm| { asm.mov(0, 0x5356_4d41); });
+    assert!(vma.to_string().contains("PR_SET_VMA"), "{vma}");
+
+    let tid = refusal_of(&f, "syscall", |asm| { asm.mov(0, 178); });
+    assert_eq!(tid.symbol(), Some("syscall"));
+    let text = tid.to_string();
+    assert!(text.contains("gettid"), "{text}");
+    assert!(text.contains("ENOSYS"), "the refusal must say why -1/ENOSYS was rejected: {text}");
+    let nameless = refusal_of(&f, "syscall", |asm| { asm.mov(0, 100_000); });
+    assert!(nameless.to_string().contains("100000"), "{nameless}");
+}
+
+// ------------------------------------------------------------------ the log sink
+
+/// **`__android_log_print` runs the real `printf` engine**, and the record keeps the priority and
+/// the tag the guest gave.
+///
+/// A line reading `%s at %p` with the arguments dropped would be worse than no line, so the
+/// formatting is the same engine `snprintf` uses rather than a passthrough of the format string.
+#[test]
+fn android_log_print_formats_through_the_real_printf_engine() {
+    let _guard = serialized();
+    let f = fixture();
+    let tag = f.cstring(f.guest.data + 0x100, b"Roblox");
+    let fmt = f.cstring(f.guest.data + 0x140, b"n=%d s=%s");
+    let text = f.cstring(f.guest.data + 0x180, b"hi");
+
+    let written = value_of(&f, "__android_log_print", |asm| {
+        asm.mov(0, 4); // ANDROID_LOG_INFO
+        asm.mov(1, tag as u64);
+        asm.mov(2, fmt as u64);
+        asm.mov(3, 7);
+        asm.mov(4, text as u64);
+    }) as i64 as i32;
+
+    let records = f.bionic.log_records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].priority, LogPriority::Info);
+    assert_eq!(records[0].tag, "Roblox");
+    assert_eq!(records[0].message, "n=7 s=hi");
+    assert_eq!(written, records[0].message.len() as i32, "the return is the message's length");
+
+    // A null tag is an empty tag, not a fault.
+    value_of(&f, "__android_log_print", |asm| {
+        asm.mov(0, 6); // ANDROID_LOG_ERROR
+        asm.mov(1, 0);
+        asm.mov(2, text as u64);
+    });
+    let records = f.bionic.log_records();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].tag, "");
+    assert_eq!(records[1].priority, LogPriority::Error);
+
+    // A priority outside the scale is a refusal, not a mapping to its nearest neighbour.
+    let error = refusal_of(&f, "__android_log_print", |asm| {
+        asm.mov(0, 42);
+        asm.mov(1, tag as u64);
+        asm.mov(2, text as u64);
+    });
+    assert_eq!(error.symbol(), Some("__android_log_print"));
+    assert!(error.to_string().contains("42"), "{error}");
+    assert_eq!(f.bionic.log_records().len(), 2, "a refused line must not be recorded");
+}
+
+/// `syslog` takes its tag from `openlog`, keeps the facility, and `closelog` clears it.
+#[test]
+fn syslog_takes_its_tag_from_openlog_and_closelog_clears_it() {
+    let _guard = serialized();
+    let f = fixture();
+    let ident = f.cstring(f.guest.data + 0x100, b"omnidroid");
+    let fmt = f.cstring(f.guest.data + 0x140, b"x=%d");
+
+    // LOG_USER (1 << 3) | LOG_WARNING (4).
+    value_of(&f, "openlog", |asm| {
+        asm.mov(0, ident as u64);
+        asm.mov(1, 0x01); // LOG_PID, read and not acted on
+        asm.mov(2, 8); // LOG_USER
+    });
+    assert_eq!(f.bionic.syslog_ident().as_deref(), Some("omnidroid"));
+    value_of(&f, "syslog", |asm| {
+        asm.mov(0, 8 | 4);
+        asm.mov(1, fmt as u64);
+        asm.mov(2, 5);
+    });
+    let records = f.bionic.log_records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].priority, LogPriority::Warn, "LOG_WARNING maps to WARN");
+    assert_eq!(records[0].tag, "omnidroid[facility 8]", "the facility is carried, not dropped");
+    assert_eq!(records[0].message, "x=5");
+
+    value_of(&f, "closelog", |_| {});
+    assert_eq!(f.bionic.syslog_ident(), None);
+    value_of(&f, "syslog", |asm| {
+        asm.mov(0, 3); // LOG_ERR, facility 0
+        asm.mov(1, fmt as u64);
+        asm.mov(2, 9);
+    });
+    let records = f.bionic.log_records();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].priority, LogPriority::Error);
+    assert_eq!(records[1].tag, "syslog", "with no ident and no facility, the tag names the call");
+    assert_eq!(records[1].message, "x=9");
+}
+
+/// **The capture ring is bounded, and it says how much it dropped.**
+///
+/// How much the engine logs during initialisation has not been measured, so an unbounded ring is a
+/// host allocation a guest can drive in a loop. The assertion is on *membership* rather than only
+/// on the count: each line carries its own number, so the surviving window is checked at both ends
+/// — a ring that dropped the newest records instead of the oldest would keep exactly the same
+/// number of them.
+///
+/// Driven from a guest loop rather than 266 separate runs, so it is one translation and 266 real
+/// thunk crossings.
+#[test]
+fn the_log_capture_ring_is_bounded_and_reports_what_it_dropped() {
+    let _guard = serialized();
+    let f = fixture();
+    let rounds: u64 = LOG_CAPTURE_MAX as u64 + 10;
+    let tag = f.cstring(f.guest.data + 0x100, b"loop");
+    let fmt = f.cstring(f.guest.data + 0x140, b"n=%d");
+    let thunk = f.thunk("__android_log_print");
+
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    // X22 is callee-saved, so the handler cannot disturb it.
+    asm.mov(22, rounds);
+    let loop_start = asm.pc();
+    asm.mov(0, 4); // ANDROID_LOG_INFO
+    asm.mov(1, tag as u64);
+    asm.mov(2, fmt as u64);
+    asm.push(mov_reg(3, 22)); // the variadic `%d`
+    asm.bl(thunk);
+    asm.push(subs_imm(22, 22, 1));
+    let here = asm.pc();
+    let back = ((loop_start as i64 - here as i64) / 4) as i32;
+    asm.push(b_cond(1 /* NE */, back));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+
+    let mut cpu = f.guest.thread(&f.boundary);
+    let exit = f.run(&mut cpu, entry).expect("the loop must complete");
+    assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+
+    let records = f.bionic.log_records();
+    assert_eq!(records.len(), LOG_CAPTURE_MAX, "the ring is bounded");
+    assert_eq!(f.bionic.log_dropped(), rounds - LOG_CAPTURE_MAX as u64, "and says what it dropped");
+    // The loop counts down, so the *last* record is n=1 and the oldest survivor is n=256.
+    assert_eq!(records[0].message, format!("n={LOG_CAPTURE_MAX}"), "the oldest survivor");
+    assert_eq!(records[LOG_CAPTURE_MAX - 1].message, "n=1", "the newest");
+}
+
+// ------------------------------------------------------------------ hostile arguments
+
+/// **Every pointer and length in the phase 3a group, hostile**, and none of them panics.
+///
+/// A panic or an abort reachable from guest-supplied arguments is Critical. Each case here either
+/// completes with a defined `-1`/`0`/`NULL` or refuses by name; nothing else is acceptable, and in
+/// particular nothing may report success having written somewhere it should not.
+#[test]
+fn hostile_arguments_to_the_clock_and_process_group_are_typed_errors_and_not_panics() {
+    let _guard = serialized();
+    let f = fixture();
+    let wild = f.guest.unmapped as u64;
+    // A `struct timespec` asking for zero time, so `nanosleep`'s hostile cases test the *pointer*
+    // rather than spending a minute asleep.
+    let zero_req = f.guest.data + 0x300;
+    f.guest.write_u64(zero_req, 0);
+    f.guest.write_u64(zero_req + 8, 0);
+
+    let cases: &[(&str, &[u64])] = &[
+        ("clock_gettime", &[1, 0]),
+        ("clock_gettime", &[1, wild]),
+        ("clock_gettime", &[1, u64::MAX]),
+        ("clock_gettime", &[1, u64::MAX - 4]),
+        ("gettimeofday", &[wild, 0]),
+        ("gettimeofday", &[0, wild]),
+        ("gettimeofday", &[u64::MAX, u64::MAX]),
+        ("gmtime_r", &[0, 0]),
+        ("gmtime_r", &[wild, wild]),
+        ("gmtime_r", &[u64::MAX, u64::MAX]),
+        ("nanosleep", &[0, 0]),
+        ("nanosleep", &[wild, 0]),
+        ("nanosleep", &[u64::MAX, u64::MAX]),
+        ("nanosleep", &[zero_req as u64, wild]),
+        ("arc4random_buf", &[0, 64]),
+        ("arc4random_buf", &[wild, 64]),
+        ("arc4random_buf", &[wild, u64::MAX]),
+        ("arc4random_buf", &[u64::MAX, u64::MAX]),
+        ("getenv", &[wild]),
+        ("getenv", &[u64::MAX]),
+        ("__system_property_get", &[wild, wild]),
+        ("__system_property_get", &[0, 0]),
+        ("__system_property_get", &[0, u64::MAX]),
+        ("android_set_abort_message", &[wild]),
+        ("android_set_abort_message", &[u64::MAX]),
+        ("getauxval", &[u64::MAX]),
+        ("sysconf", &[u64::MAX]),
+        ("sysinfo", &[wild]),
+        ("prctl", &[u64::MAX, u64::MAX, u64::MAX]),
+        ("syscall", &[u64::MAX, u64::MAX]),
+        ("__android_log_print", &[4, wild, wild]),
+        ("__android_log_print", &[4, 0, 0]),
+        ("__android_log_print", &[u64::MAX, 0, 0]),
+        ("syslog", &[0, 0]),
+        ("syslog", &[0, wild]),
+        ("openlog", &[wild, 0, 0]),
+        ("openlog", &[u64::MAX, 0, 0]),
+    ];
+
+    for (symbol, args) in cases {
+        let entry = call_one(&f, symbol, |asm| {
+            for (index, value) in args.iter().enumerate() {
+                asm.mov(index as u32, *value);
+            }
+        });
+        let mut cpu = f.guest.thread(&f.boundary);
+        match f.run(&mut cpu, entry) {
+            Ok(exit) => {
+                assert!(
+                    matches!(exit, ExitReason::Returned { .. }),
+                    "`{symbol}` {args:x?}: {exit:?}"
+                );
+                let code = f.guest.read_u64(f.guest.data) as i64 as i32;
+                assert!(
+                    code == 0 || code == -1,
+                    "`{symbol}` {args:x?} completed with {code}, which is neither a success nor \
+                     a defined failure"
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.symbol(), Some(*symbol), "{error:?}");
+                assert!(error.guest_address().is_some(), "{error}");
+            }
+        }
+    }
 }

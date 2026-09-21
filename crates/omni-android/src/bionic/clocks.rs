@@ -1,0 +1,411 @@
+//! `clock_gettime`, `gettimeofday`, `gmtime_r`, `nanosleep`, `usleep`.
+//!
+//! # Where the answers come from
+//!
+//! `omni-platform`'s [`clock`](omni_platform::clock) seam: one process-wide monotonic epoch and
+//! the host wall clock. `gmtime_r` reaches neither — it is calendar arithmetic in
+//! [`omni_bionic::time`], because `gmtime` is UTC by definition and needs no clock, no timezone
+//! database and no locale.
+//!
+//! # The clock ids that are answered, and the ones that are refused
+//!
+//! Five are answered and the rest are refused **by number**, which is the whole of Global
+//! Constraint 1 applied to an integer argument: `clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)`
+//! answered with wall time is a *number of seconds*, it is monotonic, it is plausible, and it is
+//! not what was asked for. A profiler built on it would report wall time as CPU time for the life
+//! of the program.
+//!
+//! | id | what | here |
+//! |---|---|---|
+//! | 0 `CLOCK_REALTIME` | wall clock | answered |
+//! | 1 `CLOCK_MONOTONIC` | never jumps backwards | answered |
+//! | 4 `CLOCK_MONOTONIC_RAW` | monotonic, not NTP-slewed | answered, same source |
+//! | 5 `CLOCK_REALTIME_COARSE` | wall clock, cheaper and coarser | answered, same source |
+//! | 6 `CLOCK_MONOTONIC_COARSE` | monotonic, cheaper and coarser | answered, same source |
+//! | 2 `CLOCK_PROCESS_CPUTIME_ID` | CPU time of the process | **refused** |
+//! | 3 `CLOCK_THREAD_CPUTIME_ID` | CPU time of the thread | **refused** |
+//! | 7 `CLOCK_BOOTTIME` | monotonic **including** suspend | **refused** |
+//!
+//! The three "same source" rows are answers rather than approximations, and the difference
+//! matters. `_COARSE` differs from its base clock only in *resolution*, and a clock that is more
+//! precise than asked for satisfies the contract. `_RAW` differs only in not being slewed by NTP,
+//! and nothing in this runtime slews anything. `CLOCK_BOOTTIME` is the one that genuinely differs
+//! — it counts time spent suspended and the host's monotonic clock does not — so it is refused
+//! rather than aliased.
+//!
+//! # Sleeping is capped, and that is a hostile-input defence rather than a semantics change
+//!
+//! `nanosleep` and `usleep` block a host thread from inside a dispatch, and the duration is a
+//! number the guest chose. `nanosleep({INT64_MAX, 0})` is a permanent hang of that thread, with no
+//! watchdog above it — D16's runaway-guest defence is built from *step budgets* and a sleeping
+//! thread is not executing steps. So a request longer than
+//! [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) is refused by name, with the requested
+//! duration and the cap both in the message.
+//!
+//! A cap rather than a clamp, deliberately: clamping would return 0 after sleeping for a minute,
+//! and the guest would believe it had slept for a year.
+//!
+//! # `-1` with `errno` versus a refusal
+//!
+//! The same split `guestmem` draws. A **malformed** request — `tv_nsec` outside `0..1e9`, a
+//! negative `tv_sec`, a year that will not fit `int tm_year` — is what the C library itself reports
+//! as `-1`/`NULL` with `errno`, so that is what happens here: it is the contract, not a stub, and
+//! guest code has a defined branch for it. A request this layer **cannot carry out** is a refusal.
+//!
+//! A bad *pointer* is neither: it goes through [`GuestMem`](crate::mem::GuestMem) and arrives as
+//! [`AbiError::BadPointer`](crate::AbiError), naming the symbol, the argument and which of
+//! `admit`'s rules refused it. `-1`/`EFAULT` would be the C answer and it is the wrong one here,
+//! because a guest that ignores `clock_gettime`'s return — which almost all code does — would
+//! carry an unwritten `struct timespec` forward with no indication anything had happened.
+
+use std::time::Duration;
+
+use omni_bionic::context::GuestContext;
+use omni_bionic::errno::consts;
+use omni_bionic::time::{self, GmtimeError};
+use omni_mem::GuestAddr;
+
+use crate::boundary::ImportCall;
+use crate::error::AbiResult;
+use crate::mem::Blame;
+
+use super::view::GuestView;
+use super::{active, enter, MAX_SLEEP_SECONDS};
+
+// ------------------------------------------------------------------ the guest's constants
+//
+// Linux's `clockid_t` numbering, which is what `libroblox.so` was compiled against. These are
+// kernel UAPI (`include/uapi/linux/time.h`), the same source `omni-bionic`'s errno numbers come
+// from, and they are stable across every Linux architecture.
+
+/// `CLOCK_REALTIME`.
+const CLOCK_REALTIME: i32 = 0;
+/// `CLOCK_MONOTONIC`.
+const CLOCK_MONOTONIC: i32 = 1;
+/// `CLOCK_PROCESS_CPUTIME_ID`.
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+/// `CLOCK_THREAD_CPUTIME_ID`.
+const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+/// `CLOCK_MONOTONIC_RAW`.
+const CLOCK_MONOTONIC_RAW: i32 = 4;
+/// `CLOCK_REALTIME_COARSE`.
+const CLOCK_REALTIME_COARSE: i32 = 5;
+/// `CLOCK_MONOTONIC_COARSE`.
+const CLOCK_MONOTONIC_COARSE: i32 = 6;
+/// `CLOCK_BOOTTIME`.
+const CLOCK_BOOTTIME: i32 = 7;
+
+/// Nanoseconds in a second, as the bound `tv_nsec` must respect.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// Bytes of a guest `struct timespec` and `struct timeval`: two `long`-sized fields on LP64.
+const PAIR_BYTES: usize = 16;
+
+/// `EOVERFLOW`, the code `gmtime_r` reports when the year will not fit `int tm_year`.
+///
+/// Linux UAPI value (75), spelled here rather than added to `omni-bionic`'s errno table: that
+/// table carries only the codes that crate's own functions produce, and this one is the adapter's.
+const EOVERFLOW: i32 = 75;
+
+/// The symbolic name of a `clockid_t` this layer knows about, for a refusal that has to say what
+/// was asked for.
+fn clock_name(id: i32) -> Option<&'static str> {
+    Some(match id {
+        CLOCK_REALTIME => "CLOCK_REALTIME",
+        CLOCK_MONOTONIC => "CLOCK_MONOTONIC",
+        CLOCK_PROCESS_CPUTIME_ID => "CLOCK_PROCESS_CPUTIME_ID",
+        CLOCK_THREAD_CPUTIME_ID => "CLOCK_THREAD_CPUTIME_ID",
+        CLOCK_MONOTONIC_RAW => "CLOCK_MONOTONIC_RAW",
+        CLOCK_REALTIME_COARSE => "CLOCK_REALTIME_COARSE",
+        CLOCK_MONOTONIC_COARSE => "CLOCK_MONOTONIC_COARSE",
+        CLOCK_BOOTTIME => "CLOCK_BOOTTIME",
+        _ => return None,
+    })
+}
+
+/// Split a duration into the `(seconds, nanoseconds)` a guest `struct timespec` holds.
+///
+/// # Errors
+///
+/// [`AbiError::Refused`](crate::AbiError::Refused) if the seconds do not fit a signed 64-bit
+/// `time_t`. Unreachable from the
+/// clocks here — it is 292 billion years — and checked rather than cast, because `as` on a
+/// `Duration` that somehow held more would produce a *negative* time.
+fn split(view: &GuestView<'_>, duration: Duration) -> AbiResult<(i64, i64)> {
+    let seconds = i64::try_from(duration.as_secs()).map_err(|_| {
+        view.refusal(format!(
+            "the clock reads {} seconds, which does not fit the guest's signed 64-bit time_t",
+            duration.as_secs()
+        ))
+    })?;
+    Ok((seconds, i64::from(duration.subsec_nanos())))
+}
+
+/// Write the two `long`-sized fields of a `struct timespec` or `struct timeval`.
+///
+/// One 16-byte write rather than two 8-byte ones, so a destination that is only half writable
+/// leaves the guest nothing rather than half a timestamp.
+fn write_pair(
+    view: &GuestView<'_>,
+    at: u64,
+    first: i64,
+    second: i64,
+    argument: usize,
+) -> AbiResult<()> {
+    let address = guest_address(view, at)?;
+    let mut bytes = [0u8; PAIR_BYTES];
+    bytes[..8].copy_from_slice(&first.to_le_bytes());
+    bytes[8..].copy_from_slice(&second.to_le_bytes());
+    view.mem().write_bytes(address, &bytes, Blame::new(view.symbol(), view.address(), argument))
+}
+
+/// Narrow a guest pointer to a host address, refusing rather than truncating.
+fn guest_address(view: &GuestView<'_>, pointer: u64) -> AbiResult<GuestAddr> {
+    GuestAddr::try_from(pointer)
+        .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))
+}
+
+/// `int clock_gettime(clockid_t clk_id, struct timespec *tp)`
+pub(super) fn clock_gettime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (clk_id, tp) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    {
+        let view = enter(c, &state);
+        let duration = match clk_id {
+            CLOCK_REALTIME | CLOCK_REALTIME_COARSE => omni_platform::clock::realtime_now(),
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+                omni_platform::clock::monotonic_now()
+            }
+            other => {
+                let named = clock_name(other)
+                    .map_or_else(|| "no clock this layer has a name for".to_string(), |name| format!("`{name}`"));
+                return Err(view.refusal(format!(
+                    "the guest asked for clockid_t {other} ({named}). This layer models the \
+                     realtime and monotonic clocks and nothing else: it has no process or thread \
+                     CPU accounting, and no way to know how long the host was suspended. \
+                     Answering with wall time would be a plausible number of seconds and would \
+                     not be what was asked for"
+                )));
+            }
+        };
+        let (seconds, nanos) = split(&view, duration)?;
+        write_pair(&view, tp, seconds, nanos, 1)?;
+    }
+    c.ret().i32(0);
+    Ok(())
+}
+
+/// `int gettimeofday(struct timeval *tv, struct timezone *tz)`
+///
+/// `tv` may legitimately be null — the call is then only about `tz` — so a null `tv` writes
+/// nothing and succeeds rather than faulting.
+///
+/// `tz` is the obsolete `struct timezone { int tz_minuteswest; int tz_dsttime; }`. Linux fills it
+/// with **zeroes** and has done since the field stopped meaning anything; writing zeroes is
+/// therefore the kernel's own answer rather than a placeholder, and it is what a guest that passes
+/// a non-null `tz` will read on a real device.
+pub(super) fn gettimeofday(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (tv, tz) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    {
+        let view = enter(c, &state);
+        if tv != 0 {
+            let (seconds, nanos) = split(&view, omni_platform::clock::realtime_now())?;
+            // `tv_usec`, not `tv_nsec`: a `struct timeval` is microseconds. Writing nanoseconds
+            // here is a thousand-fold error that still looks like a time.
+            write_pair(&view, tv, seconds, nanos / 1_000, 0)?;
+        }
+        if tz != 0 {
+            let at = guest_address(&view, tz)?;
+            view.mem().write_bytes(at, &[0u8; 8], Blame::new(view.symbol(), view.address(), 1))?;
+        }
+    }
+    c.ret().i32(0);
+    Ok(())
+}
+
+/// `struct tm *gmtime_r(const time_t *timer, struct tm *result)`
+///
+/// Returns `result` on success and `NULL` with `EOVERFLOW` when the year does not fit
+/// `int tm_year` — which is what glibc does and is a contract rather than a stub. See
+/// [`omni_bionic::time`] for the calendar arithmetic and for why it is branch-free.
+///
+/// `tm_zone` points at a NUL-terminated `"UTC"` in the adapter's own pool, interned once when the
+/// instance was built. It has to point at *something*: `tm_zone` is a `const char *` and guest
+/// code prints it.
+pub(super) fn gmtime_r(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (timer, result) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let returned = {
+        let mut view = enter(c, &state);
+        let timer_at = guest_address(view.blaming(0), timer)?;
+        // `read_u64` then reinterpret: `time_t` is signed and the bits are the same, but the
+        // reinterpretation is spelled so that a pre-1970 timestamp is obviously intended.
+        let timestamp =
+            view.mem().read_u64(timer_at, Blame::new(view.symbol(), view.address(), 0))? as i64;
+        match time::gmtime(timestamp) {
+            Err(GmtimeError::YearOutOfRange { .. }) => {
+                view.set_errno(EOVERFLOW);
+                0u64
+            }
+            Ok(tm) => {
+                let zone = state.bionic.utc_zone();
+                let at = guest_address(view.blaming(1), result)?;
+                // The bionic crate reports a failed write as a thin `Fault`; the view turns it
+                // back into the boundary's rich error, naming the argument and the rule.
+                if let Err(fault) = time::write_tm(&mut view, at as u64, &tm, zone as u64) {
+                    return Err(view.fault(fault));
+                }
+                result
+            }
+        }
+    };
+    c.ret().u64(returned);
+    Ok(())
+}
+
+/// The duration a `(seconds, nanoseconds)` pair asks for, or the errno a malformed one gets.
+///
+/// POSIX: `tv_nsec` must be in `[0, 999999999]` and `tv_sec` must not be negative; anything else
+/// is `EINVAL`. That is the C library's own answer to a malformed request, which is why it is
+/// returned rather than refused.
+fn requested(seconds: i64, nanos: i64) -> Result<Duration, i32> {
+    if seconds < 0 || !(0..NANOS_PER_SECOND).contains(&nanos) {
+        return Err(consts::EINVAL);
+    }
+    // Both casts are safe: the checks above establish `seconds >= 0` and `nanos` in range.
+    Ok(Duration::new(seconds as u64, nanos as u32))
+}
+
+/// Sleep, or refuse a duration past the cap.
+///
+/// Returns the errno to report, or an error if the request is refused. See the module
+/// documentation: the cap is a hostile-input defence, and a clamp would be a lie.
+fn sleep_for(view: &GuestView<'_>, duration: Duration, asked: &str) -> AbiResult<()> {
+    if duration.as_secs() > MAX_SLEEP_SECONDS {
+        return Err(view.refusal(format!(
+            "the guest asked to sleep for {asked}, and this layer caps a single sleep at \
+             {MAX_SLEEP_SECONDS} seconds. A sleeping thread executes no guest instructions, so \
+             D16's step-budget watchdog cannot end it and the host thread would be blocked for as \
+             long as the guest said. Clamping the sleep instead would return success from a call \
+             that had not done what it was asked"
+        )));
+    }
+    omni_platform::clock::sleep(duration);
+    Ok(())
+}
+
+/// `int nanosleep(const struct timespec *req, struct timespec *rem)`
+///
+/// `rem` is the remaining time when a sleep is cut short by a signal. Nothing here delivers
+/// signals to the guest, so every sleep that starts runs to completion and `rem` is written as
+/// zero — a fact about this runtime, not a placeholder. A `rem` the caller did not supply is
+/// skipped rather than faulted on: null is how a caller says it does not want it.
+pub(super) fn nanosleep(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (req, rem) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let code = {
+        let mut view = enter(c, &state);
+        let req_at = guest_address(view.blaming(0), req)?;
+        let blame = Blame::new(view.symbol(), view.address(), 0);
+        let seconds = view.mem().read_u64(req_at, blame)? as i64;
+        let nanos = view.mem().read_u64(req_at + 8, blame)? as i64;
+        match requested(seconds, nanos) {
+            Err(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+            Ok(duration) => {
+                sleep_for(&view, duration, &format!("{seconds} s + {nanos} ns"))?;
+                if rem != 0 {
+                    write_pair(&view, rem, 0, 0, 1)?;
+                }
+                0
+            }
+        }
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
+/// `int usleep(useconds_t usec)`
+///
+/// `useconds_t` is `unsigned int` — **32 bits**, not 64 — so only the low half of `X0` is the
+/// argument and the high half is whatever the caller left there. Reading all 64 bits would turn a
+/// dirty register into a multi-century sleep request, which the cap would then refuse: a correct
+/// call refused because of a register nobody was required to clear.
+///
+/// bionic's `usleep` has no `EINVAL` for a value at or above one million — it converts and calls
+/// `nanosleep` — so neither does this.
+pub(super) fn usleep(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let micros = u64::from(c.args().next_u64()? as u32);
+    let state = active(c.symbol(), c.address())?;
+    {
+        let view = enter(c, &state);
+        sleep_for(&view, Duration::from_micros(micros), &format!("{micros} us"))?;
+    }
+    c.ret().i32(0);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omni_bionic::time::TM_BYTES;
+
+    /// The clock-id table is the Linux UAPI numbering, and the refusal set is the complement.
+    #[test]
+    fn the_clock_ids_are_the_linux_numbering() {
+        assert_eq!(
+            [
+                CLOCK_REALTIME,
+                CLOCK_MONOTONIC,
+                CLOCK_PROCESS_CPUTIME_ID,
+                CLOCK_THREAD_CPUTIME_ID,
+                CLOCK_MONOTONIC_RAW,
+                CLOCK_REALTIME_COARSE,
+                CLOCK_MONOTONIC_COARSE,
+                CLOCK_BOOTTIME,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(clock_name(7), Some("CLOCK_BOOTTIME"));
+        assert_eq!(clock_name(11), None, "an unknown id must not be given a name it does not have");
+    }
+
+    /// POSIX's `timespec` validity rule, at both edges.
+    #[test]
+    fn a_malformed_timespec_is_einval_and_a_valid_one_is_a_duration() {
+        assert_eq!(requested(-1, 0), Err(consts::EINVAL), "a negative tv_sec");
+        assert_eq!(requested(0, -1), Err(consts::EINVAL), "a negative tv_nsec");
+        assert_eq!(
+            requested(0, NANOS_PER_SECOND),
+            Err(consts::EINVAL),
+            "tv_nsec must be strictly below one second"
+        );
+        assert_eq!(requested(0, NANOS_PER_SECOND - 1), Ok(Duration::new(0, 999_999_999)));
+        assert_eq!(requested(0, 0), Ok(Duration::ZERO));
+        assert_eq!(requested(2, 500), Ok(Duration::new(2, 500)));
+        // i64::MAX seconds is well-formed and is what the *cap* exists to refuse, not this check.
+        assert_eq!(requested(i64::MAX, 0), Ok(Duration::new(i64::MAX as u64, 0)));
+    }
+
+    /// A `struct timespec` and a `struct timeval` are both two 8-byte fields on LP64.
+    #[test]
+    fn the_pair_is_sixteen_bytes() {
+        assert_eq!(PAIR_BYTES, 16);
+        assert_eq!(TM_BYTES, 56, "and a struct tm is not the same shape");
+    }
+}

@@ -36,17 +36,21 @@
 //! must not hold this space's lock" invariant does not allow. Nothing in this phase maps from a
 //! handler. The one mapping this module performs happens before any CPU exists, let alone runs.
 
+mod clocks;
 mod data;
 mod dl;
 mod format;
 mod guestmem;
 mod handlers;
+mod logging;
+mod procenv;
 mod runtime;
 mod view;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use omni_bionic::atexit::AtexitRegistry;
 use omni_bionic::cond::CondWaiters;
@@ -63,6 +67,9 @@ use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
 
 pub use data::{DataObject, GuestProcess, DATA_OBJECTS, FILE_BYTES};
+pub use logging::LogRecord;
+pub use omni_platform::log::Priority as LogPriority;
+pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
 pub use view::{
     GuestView, DL_INFO_OFFSET, DL_INFO_SLOTS, DL_PHDR_INFO_BYTES, ERRNO_OFFSET, SCRATCH_BYTES,
@@ -93,6 +100,26 @@ pub const POOL_BYTES: usize = 4096;
 
 /// Bytes of guest address space the arena occupies: the per-thread blocks, then the pool.
 pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES + POOL_BYTES;
+
+/// The longest a single guest `nanosleep` or `usleep` may block a host thread.
+///
+/// **A policy number, and a hostile-input defence rather than a semantics change.** The duration
+/// is a value the guest chose, and a sleeping thread executes no guest instructions — so D16's
+/// runaway-guest defence, which is built from short step budgets, cannot end one. `nanosleep({
+/// INT64_MAX, 0 })` is otherwise a permanent hang of that host thread.
+///
+/// Sixty seconds is far longer than anything the 3,594 initializers can legitimately want and far
+/// shorter than a hang. A request past it is a refusal naming both numbers, never a clamp: a clamp
+/// would return success from a call that slept for a minute when it was asked for a year.
+pub const MAX_SLEEP_SECONDS: u64 = 60;
+
+/// How many log records one instance keeps for inspection.
+///
+/// **A policy number.** How much the engine logs during initialisation has not been measured, and
+/// an unbounded ring is a host allocation a guest can drive in a loop. Records past the cap are
+/// dropped oldest-first and counted, so [`Bionic::log_dropped`] can say the ring wrapped rather
+/// than the ring quietly pretending it did not.
+pub const LOG_CAPTURE_MAX: usize = 256;
 
 /// One guest instance's bionic state.
 ///
@@ -130,6 +157,33 @@ pub struct Bionic {
     pool: Mutex<usize>,
     /// Every loaded image `dl_iterate_phdr` must enumerate, in the order it was registered.
     images: Mutex<Vec<GuestImage>>,
+
+    // ---------------------------------------------------------------- phase 3a: the OS surface
+    /// `"UTC"` in the pool, for `gmtime_r`'s `tm_zone`. Interned once in [`Bionic::new`].
+    utc_zone: OnceLock<GuestAddr>,
+    /// The guest's environment: the name, and the value interned in the pool.
+    ///
+    /// **Empty by default and that is a fact, not a gap** — this guest process was started with no
+    /// environment, which is what the `environ` data object already says. The host fills it with
+    /// [`Bionic::set_env`]. It is never the *host's* environment: see `procenv`'s module docs.
+    env: Mutex<Vec<(Vec<u8>, GuestAddr)>>,
+    /// The Android property table `__system_property_get` reads, empty by default for the same
+    /// reason: there is no property service here.
+    properties: Mutex<Vec<(Vec<u8>, String)>>,
+    /// What `getauxval(AT_HWCAP)` should answer. **[`HwcapPolicy::Undecided`] by default, and
+    /// that default refuses** — the decision is open; see `procenv`'s module documentation.
+    hwcap: Mutex<HwcapPolicy>,
+    /// The guest's last `android_set_abort_message`, reported with the abort it explains.
+    abort_message: Mutex<Option<String>>,
+    /// `openlog`'s ident, which tags later `syslog` lines.
+    syslog_ident: Mutex<Option<String>>,
+    /// The last [`LOG_CAPTURE_MAX`] records, for inspection.
+    log_ring: Mutex<VecDeque<LogRecord>>,
+    /// How many records the ring dropped, so a wrap is visible rather than silent.
+    log_dropped: AtomicU64,
+    /// Whether records also reach the host's standard error. On by default: that is what a real
+    /// run wants, and a suite that does not want it says so.
+    log_to_stderr: AtomicBool,
 }
 
 /// One loaded image, as `dl_iterate_phdr` reports it.
@@ -175,7 +229,7 @@ impl Bionic {
             Protection::ReadWrite,
             CommitPolicy::Eager,
         )?;
-        Ok(Arc::new(Self {
+        let bionic = Arc::new(Self {
             space,
             arena,
             threads: ThreadTable::new(),
@@ -192,7 +246,193 @@ impl Bionic {
             rand: AtomicU32::new(1),
             pool: Mutex::new(0),
             images: Mutex::new(Vec::new()),
-        }))
+            utc_zone: OnceLock::new(),
+            env: Mutex::new(Vec::new()),
+            properties: Mutex::new(Vec::new()),
+            // Spelled out rather than reached by `Default`, because this is the open `AT_HWCAP`
+            // decision and it must not be made by a derive nobody read. See `procenv`.
+            hwcap: Mutex::new(HwcapPolicy::Undecided),
+            abort_message: Mutex::new(None),
+            syslog_ident: Mutex::new(None),
+            log_ring: Mutex::new(VecDeque::new()),
+            log_dropped: AtomicU64::new(0),
+            log_to_stderr: AtomicBool::new(true),
+        });
+        // `gmtime_r`'s `tm_zone` is a `const char *` the guest dereferences, so it has to point at
+        // something for the whole life of the instance. Interned here, before any guest code runs
+        // — which is F9's constraint: nothing in a handler may map, and the pool is already mapped
+        // by the time a handler could reach it.
+        let utc = bionic.intern("gmtime_r", b"UTC")?;
+        let _ = bionic.utc_zone.set(utc);
+        Ok(bionic)
+    }
+
+    /// `"UTC"` in the pool, which `gmtime_r` writes into `tm_zone`.
+    ///
+    /// Always set: [`Bionic::new`] interns it before returning, so there is no lazy path here and
+    /// no way for a handler to have to allocate.
+    #[must_use]
+    pub fn utc_zone(&self) -> GuestAddr {
+        // Unreachable: `new` sets it and nothing clears it. Falling back to the pool's base rather
+        // than panicking, because a panic in a handler is reachable from guest code.
+        *self.utc_zone.get().unwrap_or(&self.arena)
+    }
+
+    /// The page size the guest's own address space works at, which is what `AT_PAGESZ` answers.
+    #[must_use]
+    pub fn space_page_size(&self) -> usize {
+        self.space.page_size()
+    }
+
+    // ------------------------------------------------------------------ environment and properties
+
+    /// Give the guest an environment variable, visible to `getenv`.
+    ///
+    /// The **value** is copied into the adapter's pool, because `getenv` returns a pointer the
+    /// caller may hold indefinitely. Setting a name twice replaces the entry and leaves the old
+    /// value's pool bytes stranded — call this during setup, not in a loop.
+    ///
+    /// Call it **before any guest code runs**: it writes to the pool, and F9's constraint is that
+    /// nothing maps or allocates guest memory from inside a handler.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] if the name is empty or contains `=` — neither can name a variable —
+    /// or if the pool is full.
+    pub fn set_env(&self, name: &str, value: &str) -> AbiResult<()> {
+        if name.is_empty() || name.contains('=') {
+            return Err(AbiError::Refused {
+                symbol: "getenv".to_string(),
+                address: self.pool(),
+                why: format!(
+                    "`{name}` is not a usable environment variable name: an empty name names \
+                     nothing, and `=` is the separator, so neither could ever be found again"
+                ),
+            });
+        }
+        let at = self.intern("getenv", value.as_bytes())?;
+        let mut env = self.env.lock();
+        let key = name.as_bytes().to_vec();
+        match env.iter_mut().find(|(existing, _)| *existing == key) {
+            Some(entry) => entry.1 = at,
+            None => env.push((key, at)),
+        }
+        Ok(())
+    }
+
+    /// The pooled value for `name`, or `None`.
+    pub(crate) fn lookup_env(&self, name: &[u8]) -> Option<GuestAddr> {
+        self.env.lock().iter().find(|(existing, _)| existing == name).map(|(_, at)| *at)
+    }
+
+    /// Give the guest an Android system property, visible to `__system_property_get`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] for a value that does not fit [`PROP_VALUE_MAX`] with its NUL. The
+    /// refusal is here rather than a truncation at read time, because the guest sizes its buffer
+    /// from that same constant and a truncated property value is a believable wrong answer.
+    pub fn set_system_property(&self, name: &str, value: &str) -> AbiResult<()> {
+        if value.len() + 1 > PROP_VALUE_MAX {
+            return Err(AbiError::Refused {
+                symbol: "__system_property_get".to_string(),
+                address: self.pool(),
+                why: format!(
+                    "the property `{name}` was given a {}-byte value, and bionic's PROP_VALUE_MAX \
+                     is {PROP_VALUE_MAX} bytes including the NUL. The guest sizes its own buffer \
+                     from that constant, so the choice here is refusing or truncating, and a \
+                     truncated property value is a believable wrong answer",
+                    value.len() + 1
+                ),
+            });
+        }
+        let mut properties = self.properties.lock();
+        let key = name.as_bytes().to_vec();
+        match properties.iter_mut().find(|(existing, _)| *existing == key) {
+            Some(entry) => entry.1 = value.to_string(),
+            None => properties.push((key, value.to_string())),
+        }
+        Ok(())
+    }
+
+    /// The property value for `name`, or `None`.
+    pub(crate) fn lookup_property(&self, name: &[u8]) -> Option<String> {
+        self.properties.lock().iter().find(|(existing, _)| existing == name).map(|(_, v)| v.clone())
+    }
+
+    // ------------------------------------------------------------------ the AT_HWCAP decision
+
+    /// What `getauxval(AT_HWCAP)` will answer.
+    ///
+    /// [`HwcapPolicy::Undecided`] until a host says otherwise, and under that the call **refuses**.
+    #[must_use]
+    pub fn hwcap_policy(&self) -> HwcapPolicy {
+        *self.hwcap.lock()
+    }
+
+    /// State what `getauxval(AT_HWCAP)` should answer.
+    ///
+    /// **This is an open decision for M3 and both arms are measured** — advertising
+    /// [`HWCAP_ATOMICS`] gives 53 hard interpreter halts, declining gives 106 fallback arms into a
+    /// global spinlock that anti-scales 21x. `procenv`'s module documentation has the whole
+    /// argument. A host calling this is making that choice explicitly, which is the only way it
+    /// may be made.
+    pub fn set_hwcap_policy(&self, policy: HwcapPolicy) {
+        *self.hwcap.lock() = policy;
+    }
+
+    // ------------------------------------------------------------------ abort and logging
+
+    /// The guest's last `android_set_abort_message`, if it set one.
+    #[must_use]
+    pub fn abort_message(&self) -> Option<String> {
+        self.abort_message.lock().clone()
+    }
+
+    /// Set or clear the abort message.
+    pub fn set_abort_message(&self, message: Option<String>) {
+        *self.abort_message.lock() = message;
+    }
+
+    /// `openlog`'s ident, if one is set.
+    #[must_use]
+    pub fn syslog_ident(&self) -> Option<String> {
+        self.syslog_ident.lock().clone()
+    }
+
+    /// Set or clear `openlog`'s ident.
+    pub fn set_syslog_ident(&self, ident: Option<String>) {
+        *self.syslog_ident.lock() = ident;
+    }
+
+    /// Record one log line, and emit it if this instance is emitting.
+    pub(crate) fn log(&self, record: LogRecord) {
+        if self.log_to_stderr.load(Ordering::Relaxed) {
+            logging::emit(&record);
+        }
+        let mut ring = self.log_ring.lock();
+        if ring.len() == LOG_CAPTURE_MAX {
+            ring.pop_front();
+            self.log_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        ring.push_back(record);
+    }
+
+    /// Every log record still in the ring, oldest first.
+    #[must_use]
+    pub fn log_records(&self) -> Vec<LogRecord> {
+        self.log_ring.lock().iter().cloned().collect()
+    }
+
+    /// How many records the ring has dropped, so a wrap is visible.
+    #[must_use]
+    pub fn log_dropped(&self) -> u64 {
+        self.log_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Whether log records also reach the host's standard error. On by default.
+    pub fn set_log_to_stderr(&self, enabled: bool) {
+        self.log_to_stderr.store(enabled, Ordering::Relaxed);
     }
 
     /// First address of the static pool.

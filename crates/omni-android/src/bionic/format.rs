@@ -44,7 +44,7 @@ use super::{active, enter};
 /// The two walks are genuinely different — one starts where the named arguments stopped, the
 /// other reads a record the *callee* filled in — but a `printf` implementation should not care,
 /// and duplicating the collection loop for each would be two places for the bank rules to drift.
-trait VaSource {
+pub(super) trait VaSource {
     /// The next 64-bit integer or pointer.
     fn next_u64(&mut self) -> AbiResult<u64>;
     /// The next `double`. A variadic `float` was promoted by the caller, so there is no
@@ -107,7 +107,7 @@ fn read_latin1(view: &GuestView<'_>, at: u64, argument: usize) -> AbiResult<Stri
 }
 
 /// Map a formatted result back to bytes, one `char` to one byte.
-fn to_bytes(view: &GuestView<'_>, text: &str) -> AbiResult<Vec<u8>> {
+pub(super) fn to_bytes(view: &GuestView<'_>, text: &str) -> AbiResult<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len());
     for ch in text.chars() {
         let code = ch as u32;
@@ -156,7 +156,11 @@ fn collect(
 }
 
 /// Read the format string, fetch the arguments, and format.
-fn render(
+///
+/// `pub(super)` because `liblog` needs it: `__android_log_print` and `syslog` are variadic
+/// `printf` calls whose *destination* is a log sink rather than a buffer, and giving them a second
+/// copy of the argument walk would be two places for the AAPCS64 variadic bank rules to drift.
+pub(super) fn render(
     view: &GuestView<'_>,
     fmt_ptr: u64,
     fmt_argument: usize,

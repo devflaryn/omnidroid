@@ -32,6 +32,16 @@ omni-elf = { workspace = true }
 # `omni-android` -> `omni-bionic`, which is downward, and `omni-bionic` depends on nothing at
 # all -- so nothing here can reach the OS through it.
 omni-bionic = { workspace = true }
+# The OS seam. **This is the seam working as intended, not a violation of Global Constraint 4**:
+# the constraint forbids an *external* OS crate (`windows-sys`, `libc`) outside `omni-platform`,
+# and depending on `omni-platform` is how every other crate reaches the OS — `omni-mem` already
+# does, transitively, which is why this was a dev-dependency before rather than absent.
+#
+# M3 task 3 phase 3a is what needed it directly: `clock_gettime`, `arc4random_buf` and
+# `sched_getcpu` are guest symbols whose answers only the OS has. The adapter still contains no
+# `cfg(target_os)` and no OS crate, and `cargo tree -p omni-android -e normal` still has no
+# `dynarmic-sys` in it, so the `--no-default-features` guarantee is untouched.
+omni-platform = { workspace = true }
 thiserror = { workspace = true }
 # The thunk table is built while the loader resolves symbols, from `&self`, and dispatched from
 # guest threads afterwards.
@@ -53,4 +63,4 @@ omni-cpu = { path = "../omni-cpu", default-features = false, features = ["dynarm
 # mock would assert facts about the mock. `omni-apk` is for the real-APK fixture (Global
 # Constraint 2).
 omni-apk = { workspace = true }
-omni-platform = { workspace = true }
+# `omni-platform` is an ordinary dependency now (see above) and needs no entry here.

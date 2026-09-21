@@ -305,6 +305,60 @@ pub enum AbiError {
         address: GuestAddr,
     },
 
+    /// The guest deliberately terminated itself: `abort`, or a failed stack-protector check.
+    ///
+    /// **Not a refusal and not a defect in this layer.** The guest asked to die, and the only
+    /// thing that would be wrong here is doing what it asked *literally*: `std::process::abort()`
+    /// on the host cannot be caught by any caller, and the runtime is required to host several
+    /// isolated guest instances in one process (see the memory figures in `STATUS.md`). One
+    /// instance's `abort` must not take the other two with it, or the host, or the test runner.
+    ///
+    /// So it becomes this: a typed error that propagates out of
+    /// [`Boundary::run`](crate::Boundary::run) like any other, which the caller may report, log,
+    /// restart the instance after, or turn into its own exit — all of which are decisions that
+    /// belong to the embedder and none of which an `abort()` leaves available.
+    ///
+    /// `message` is whatever the guest passed to `android_set_abort_message`, which is where
+    /// bionic's own crash reporter gets the line it prints, and is usually the only human-readable
+    /// account of why the process died.
+    #[error(
+        "the guest terminated itself through `{symbol}` at {address:#x}: {why}{}",
+        match message {
+            Some(text) => format!(" -- the guest's abort message was: {text}"),
+            None => " -- the guest set no abort message".to_string(),
+        }
+    )]
+    GuestAborted {
+        /// The symbol the guest called: `abort` or `__stack_chk_fail`.
+        symbol: String,
+        /// Its thunk address.
+        address: GuestAddr,
+        /// What that symbol means, in one clause.
+        why: &'static str,
+        /// The guest's `android_set_abort_message`, if it set one.
+        message: Option<String>,
+    },
+
+    /// The guest called `_exit`.
+    ///
+    /// The same containment argument as [`GuestAborted`](AbiError::GuestAborted): calling the
+    /// host's `exit` would end every other guest instance in the process and the host with them.
+    /// An exit is reported, not performed.
+    ///
+    /// It is an `Err` rather than a successful [`ExitReason`] because every caller of
+    /// `Boundary::run` today treats `Ok` as "the guest returned and may be resumed", and a guest
+    /// that has called `_exit` may not be: resuming it would run code after `exit`. Making that a
+    /// type-level difference rather than a flag is the same reasoning D18 applies to re-entrancy.
+    #[error("the guest called `{symbol}` at {address:#x} with status {status}")]
+    GuestExited {
+        /// The symbol the guest called.
+        symbol: String,
+        /// Its thunk address.
+        address: GuestAddr,
+        /// The status the guest asked to exit with.
+        status: i32,
+    },
+
     /// The thunk region could not be reserved or has run out of slots.
     #[error("the thunk region cannot hold another {what}: {detail}")]
     RegionFull {
@@ -340,6 +394,8 @@ impl AbiError {
             | AbiError::GuestCallbackStopped { symbol, .. }
             | AbiError::BadCallbackStack { symbol, .. }
             | AbiError::Refused { symbol, .. }
+            | AbiError::GuestAborted { symbol, .. }
+            | AbiError::GuestExited { symbol, .. }
             | AbiError::BionicNotActive { symbol, .. } => Some(symbol),
             AbiError::NoSuchThunk { .. }
             | AbiError::CrossingLimit { .. }
@@ -366,6 +422,8 @@ impl AbiError {
             | AbiError::VarArgsExhausted { address, .. }
             | AbiError::TooDeep { address, .. }
             | AbiError::Refused { address, .. }
+            | AbiError::GuestAborted { address, .. }
+            | AbiError::GuestExited { address, .. }
             | AbiError::BionicNotActive { address, .. } => Some(address),
             // The address the *guest* branched to, not the slot it landed in: the whole point of the
             // variant is that those differ.
@@ -467,6 +525,17 @@ mod tests {
                 depth: 9,
                 limit: 8,
             },
+            AbiError::GuestAborted {
+                symbol: "pthread_once".into(),
+                address: 0x1234_5000,
+                why: "the guest called abort()",
+                message: None,
+            },
+            AbiError::GuestExited {
+                symbol: "pthread_once".into(),
+                address: 0x1234_5000,
+                status: 0,
+            },
         ];
         for error in &cases {
             let text = error.to_string();
@@ -478,6 +547,43 @@ mod tests {
             );
             assert!(error.guest_address().is_some(), "{text}");
         }
+    }
+
+    /// **The guest's self-termination is reported, never performed**, and the abort message it set
+    /// travels with it.
+    ///
+    /// The thing this test is really pinning is that the two variants exist at all: the failure
+    /// they replace is `std::process::abort()`, which no caller can contain and which would take
+    /// every other guest instance in the process with it. A test cannot assert "the host did not
+    /// abort" — the runner would be gone — so it asserts the shape that makes aborting impossible:
+    /// a value, with the reason in it.
+    #[test]
+    fn a_guest_abort_carries_its_message_and_an_exit_carries_its_status() {
+        let silent = AbiError::GuestAborted {
+            symbol: "abort".into(),
+            address: 0x7000,
+            why: "the guest called abort()",
+            message: None,
+        };
+        assert!(silent.to_string().contains("set no abort message"), "{silent}");
+
+        let spoken = AbiError::GuestAborted {
+            symbol: "__stack_chk_fail".into(),
+            address: 0x7000,
+            why: "the stack protector found a corrupted canary",
+            message: Some("terminating with uncaught exception".into()),
+        };
+        let text = spoken.to_string();
+        assert!(text.contains("__stack_chk_fail"), "{text}");
+        assert!(text.contains("corrupted canary"), "{text}");
+        assert!(text.contains("terminating with uncaught exception"), "{text}");
+
+        let exited = AbiError::GuestExited { symbol: "_exit".into(), address: 0x7000, status: 42 };
+        let text = exited.to_string();
+        assert!(text.contains("status 42"), "{text}");
+        // A zero status is still an exit and must not read as a success.
+        let zero = AbiError::GuestExited { symbol: "_exit".into(), address: 0x7000, status: 0 };
+        assert!(zero.to_string().contains("status 0"), "{zero}");
     }
 
     /// `MidThunk` must report where the guest went, not where it should have gone — the whole

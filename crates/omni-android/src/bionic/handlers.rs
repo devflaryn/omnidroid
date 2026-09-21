@@ -24,12 +24,18 @@
 //!
 //! # What is deliberately not here
 //!
-//! Files, directories, clocks, process information, sockets, logging, thread lifecycle and the
-//! `dl*` family. Each needs host surface `omni-platform` does not have yet, and the plan's
-//! guidance is explicit that adding it comes with the Linux and macOS signatures as honest
-//! `unsupported` returns at the same time. Those symbols keep the boundary's own
+//! **Files, directories, sockets and polling, and thread lifecycle.** Each needs host surface
+//! `omni-platform` still does not have — files and directories are phase 3b, sockets 3c, thread
+//! lifecycle 3d — and each keeps the boundary's own
 //! [`Binding::Unbound`](crate::Binding::Unbound), whose call names the symbol and the guest
-//! address — which is exactly the failure that is wanted, rather than a plausible zero.
+//! address. That is exactly the failure that is wanted, rather than a plausible zero.
+//!
+//! Clocks, process information and logging **are** here as of phase 3a, and with them the first
+//! growth of `omni-platform` past `vm` and `fault`. Four of those symbols are bound and **refuse
+//! by name** — `sysconf`, `sysinfo`, `prctl`, `syscall` — which is a different statement from
+//! `Unbound`: `Unbound` says nothing implements this, and a refusal says *which* missing piece,
+//! with the guest's own argument in it. See `procenv`'s module documentation, and in particular
+//! why `sysconf` refuses two names this layer could otherwise answer.
 
 use std::sync::Arc;
 
@@ -42,7 +48,9 @@ use crate::boundary::{ImportCall, ImportFn, ReentrantCall, ReentrantFn};
 use crate::error::{AbiError, AbiResult};
 
 use super::view::GuestView;
-use super::{active, dl, enter, format, guestmem, runtime::CallThreads};
+use super::{
+    active, clocks, dl, enter, format, guestmem, logging, procenv, runtime::CallThreads,
+};
 
 // ------------------------------------------------------------------ result lifting
 
@@ -842,6 +850,36 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("vasprintf", format::vasprintf),
     ("sscanf", format::sscanf),
     ("fscanf", format::fscanf),
+    // ---- phase 3a: clocks. Answers from `omni-platform`'s clock seam; `gmtime_r` from
+    // `omni-bionic`'s calendar arithmetic, which needs no clock at all.
+    ("clock_gettime", clocks::clock_gettime),
+    ("gettimeofday", clocks::gettimeofday),
+    ("gmtime_r", clocks::gmtime_r),
+    ("nanosleep", clocks::nanosleep),
+    ("usleep", clocks::usleep),
+    // ---- phase 3a: process and environment. Four answers, two facts about a process that was
+    // given nothing, two terminations reported rather than performed, and four refusals by name.
+    ("getpid", procenv::getpid),
+    ("sched_getcpu", procenv::sched_getcpu),
+    ("arc4random_buf", procenv::arc4random_buf),
+    ("getauxval", procenv::getauxval),
+    ("getenv", procenv::getenv),
+    ("__system_property_get", procenv::system_property_get),
+    ("abort", procenv::abort),
+    ("__stack_chk_fail", procenv::stack_chk_fail),
+    ("_exit", procenv::exit),
+    ("android_set_abort_message", procenv::android_set_abort_message),
+    ("sysconf", procenv::sysconf),
+    ("sysinfo", procenv::sysinfo),
+    ("prctl", procenv::prctl),
+    ("syscall", procenv::syscall),
+    // ---- phase 3a: the log sink. These four are serviced rather than refused because a log call
+    // has no return value the guest acts on, so there is no believable wrong answer available —
+    // and because refusing would halt the run at the first thing the engine wanted to report.
+    ("__android_log_print", logging::android_log_print),
+    ("syslog", logging::syslog),
+    ("openlog", logging::openlog),
+    ("closelog", logging::closelog),
 ];
 
 /// Serviced on the **exit** path: 80-102 ns per call.
