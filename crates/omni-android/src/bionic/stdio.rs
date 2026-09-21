@@ -38,6 +38,32 @@
 //! the safe direction, and it needs a TU built against a pre-Lollipop NDK header to happen at
 //! all.
 //!
+//! # Order: admit the guest's buffer, then touch the descriptor
+//!
+//! [`fgets`], [`fread`] and [`fwrite`] validate the guest's **whole** buffer before they call
+//! into [`omni_bionic::stdio`], because everything past that point is irreversible: a descriptor
+//! read is destructive on a pipe and a descriptor write is destructive everywhere. It is review
+//! finding **M1**'s rule — `files::read_into_guest` is where the argument is written out in full
+//! — arriving in the stream layer, and `admit_transfer` is the one place it is spelled.
+//!
+//! **Why here and not in `omni-bionic`, where the loops are.** That crate's whole guest-memory
+//! vocabulary is [`omni_bionic::memory::GuestMemory`], which has exactly two methods, `read` and
+//! `write`. There is no way to ask it whether a range is mapped without *writing* to it, and
+//! writing to it is the side effect being avoided — it would also turn `fgets`'s documented
+//! "nothing partial is committed, so indeterminate means unchanged" into a false statement.
+//! Adding a third, probe method to the trait is what D19 forbids: a defaulted one returning
+//! `Ok(())` is a plausible stub for every other implementer (the crate's own `MockMemory`, and
+//! the tests that drive it), and an undefaulted one is a method whose only honest implementation
+//! needs mapping and protection state, which is precisely the OS-adjacent knowledge that crate
+//! has none of and must keep having none of. This layer already holds it, in
+//! [`GuestMem::checked_ptr`](crate::mem::GuestMem::checked_ptr), and already has the refusal
+//! channel to report it — the same two reasons the zero-byte-write contract above is enforced
+//! here rather than there.
+//!
+//! What it promises and what it does not is `files::read_into_guest`'s paragraph unchanged: **no
+//! byte leaves the descriptor unless the entire buffer was usable at the moment it was checked**,
+//! and no claim at all about another guest thread unmapping it mid-transfer.
+//!
 //! # Unbuffered, which is what makes `fflush` honest
 //!
 //! [`omni_bionic::stdio`] has the argument. The short version: every write reaches the descriptor
@@ -565,7 +591,59 @@ pub(super) fn fflush(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 // ================================================================== transfers
 
+/// Admit the **whole** of a guest transfer buffer, before anything irreversible happens to a
+/// descriptor.
+///
+/// Review finding **M1** in the stream layer. `files::transfer_buffer` is the same rule for the
+/// raw descriptor calls and carries the full argument; the module header above says why this
+/// side of the boundary is where it has to live rather than inside `omni-bionic`'s loops.
+///
+/// **A zero-length transfer is admitted without a check, and that is load-bearing rather than an
+/// optimisation.** `fread(p, 1, 0, f)` and `fwrite(p, 0, n, f)` leave the stream untouched by C17
+/// 7.21.8.1p3's own words, `fgets` with a non-positive `size` reads and writes nothing, and
+/// `read(fd, NULL, 0)` is legal C. [`GuestMem::checked_ptr`](crate::mem::GuestMem::checked_ptr)
+/// does **not** short-circuit an empty range the way `read_bytes` and `write_bytes` do — it goes
+/// straight to `admit`, which answers for the address — so a check here without this guard would
+/// refuse a correct program. `order-B1` exists in the mutation table because over-correcting in
+/// exactly this way is the plausible mistake.
+///
+/// `write` chooses the access the *operation* needs and no more: a `fwrite` source is admitted
+/// **readable**, not writable, because a guest handing `fwrite` a pointer into its own `.rodata`
+/// is ordinary and a stricter-looking check would refuse it (`order-B2`, for the same over-
+/// correction one layer down).
+fn admit_transfer(
+    view: &GuestView<'_>,
+    pointer: u64,
+    length: u64,
+    write: bool,
+    argument: usize,
+) -> AbiResult<()> {
+    if length == 0 {
+        return Ok(());
+    }
+    let at = GuestAddr::try_from(pointer)
+        .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))?;
+    // The same target-width refusal made for a length. On an LP64 host it cannot fire; on a
+    // 32-bit one it is the difference between a refusal and a truncated length that would admit
+    // less memory than the transfer goes on to touch.
+    let len = usize::try_from(length)
+        .map_err(|_| view.refusal("a transfer length wider than the host's usize"))?;
+    view.mem().checked_ptr(at, len, write, Blame::new(view.symbol(), view.address(), argument))?;
+    Ok(())
+}
+
 /// `char *fgets(char *s, int size, FILE *stream)`
+///
+/// The whole of `s` is admitted before the descriptor is read from — see the module header. The
+/// length admitted is **`size`, not `size - 1`**: C17 7.21.7.2p2 has `fgets` read at most one
+/// less than `size` characters and then store a null character after the last one, so the object
+/// it is given has to be `size` characters long and `size` is what a correct call can write.
+///
+/// The honest edge, stated rather than left to be discovered: this layer therefore refuses a call
+/// whose `size` overruns the object even when the line that arrives would have fit. C licenses
+/// the refusal — the argument really does describe an array the guest does not have — but a
+/// device would not have noticed, so the deviation is named here. The alternative is the one M1
+/// rejected: admit as you go, and report a buffer that is half unmapped as a stream that ended.
 pub(super) fn fgets(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (s, size, file) = {
         let mut a = c.args();
@@ -573,6 +651,13 @@ pub(super) fn fgets(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let result = with_stream(c, file, |view, descriptors, stream| {
         view.blaming(0);
+        if size > 0 {
+            // `size <= 0` is the case C17 7.21.7.2 does not define, and `omni_bionic::stdio`
+            // answers it by reading nothing, writing nothing and setting no `errno`. There is no
+            // transfer to admit, so admitting one would refuse a call that touches neither the
+            // buffer nor the descriptor.
+            admit_transfer(view, s, size as u64, true, 0)?;
+        }
         let produced = stdio::fgets(view, descriptors, stream, s, size);
         lift(view, produced)
     })?;
@@ -581,6 +666,17 @@ pub(super) fn fgets(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 }
 
 /// `int fputs(const char *s, FILE *stream)`
+///
+/// **No admission here, and the reason is structural rather than an omission.**
+/// `omni_bionic::stdio::fputs` begins with `bounded_strlen`, which walks `[s, s + length]` a byte
+/// at a time looking for the NUL **before** `transfer_out` makes its first descriptor write. So
+/// the whole source has not merely been probed, it has been *read*, and a range that faults ends
+/// the call with nothing yet in the descriptor. Adding `admit_transfer` in front of it would be a
+/// check no input can fail, which `VERIFICATION.md` entry 12 is about.
+///
+/// It shares the cross-thread window everything else here shares, and shares it in the same
+/// place: the walk and the transfer are two passes, and a range another guest thread unmaps
+/// between them is a race no check on this side can close.
 pub(super) fn fputs(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (s, file) = {
         let mut a = c.args();
@@ -610,6 +706,18 @@ pub(super) fn fputc(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 }
 
 /// `size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)`
+///
+/// The whole of `ptr` is admitted before the descriptor is read from — see the module header.
+///
+/// # The overflowing `size * nmemb` is deliberately **not** admitted, and stays `EINVAL`
+///
+/// `omni_bionic::stdio::fread` answers an unrepresentable product with `EINVAL` and zero items
+/// (POSIX XSH 2.3's permitted extension, argued at that function), and that is a fact about the
+/// *arguments* which holds whatever guest memory looks like. Admitting `size.wrapping_mul(nmemb)`
+/// here would hand the guest a refusal about its pointer for a call whose pointer was never the
+/// problem, and admitting the saturated product would refuse where `EINVAL` is the answer. So the
+/// product is computed with the same `checked_mul`, and a `None` skips the admission and lets the
+/// layer below give the answer it already gives.
 pub(super) fn fread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (ptr, size, nmemb, file) = {
         let mut a = c.args();
@@ -617,6 +725,9 @@ pub(super) fn fread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let result = with_stream(c, file, |view, descriptors, stream| {
         view.blaming(0);
+        if let Some(total) = size.checked_mul(nmemb) {
+            admit_transfer(view, ptr, total, true, 0)?;
+        }
         let produced = stdio::fread(view, descriptors, stream, ptr, size, nmemb);
         lift(view, produced)
     })?;
@@ -625,6 +736,21 @@ pub(super) fn fread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 }
 
 /// `size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)`
+///
+/// **The source side of the same finding, and it is an instance rather than a mirror-image that
+/// does not apply.** `omni_bionic::stdio`'s `transfer_out` reads one `TRANSFER_CHUNK` out of
+/// guest memory, hands it to the descriptor, and only then looks at the next chunk — so a source
+/// readable for its first page and not its second put 4 KiB into a **pipe** and then reported the
+/// whole call as a failure. A byte in a pipe cannot be taken back out: the reader has already
+/// been told a message started, and for the glue's command pipe half a message is a command.
+/// That is exactly why M1 named `__write_chk` beside `read` and `pread`.
+///
+/// Below one chunk the defect cannot show — the single `read_all` already failed before any host
+/// write — which is why the regression test crosses the boundary and says so.
+///
+/// The source is admitted **readable**, not writable: a guest that hands `fwrite` a pointer into
+/// its own `.rodata` is doing something ordinary, and demanding more than the operation needs
+/// reads as stricter while being wrong (`order-B2` is that over-correction one layer down).
 pub(super) fn fwrite(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (ptr, size, nmemb, file) = {
         let mut a = c.args();
@@ -632,6 +758,11 @@ pub(super) fn fwrite(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     let result = with_stream(c, file, |view, descriptors, stream| {
         view.blaming(0);
+        if let Some(total) = size.checked_mul(nmemb) {
+            // As `fread`: an unrepresentable product is `EINVAL` from the layer below, not a
+            // refusal about a pointer that was never the problem.
+            admit_transfer(view, ptr, total, false, 0)?;
+        }
         let produced = stdio::fwrite(view, descriptors, stream, ptr, size, nmemb);
         lift(view, produced)
     })?;
