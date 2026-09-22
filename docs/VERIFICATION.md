@@ -5,9 +5,11 @@ because each one produced a **green suite that proved less than it claimed**, an
 person who wrote the test was the person who wrote the code — which is the blind spot that makes all
 of them possible.
 
-There are **thirteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
+There are **fourteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
 could not be written rather than by one that passed. Entry 13 arrived in M6 and is the only one
-found by reviewing a *copy* of the defect rather than the original.
+found by reviewing a *copy* of the defect rather than the original. Entry 14 arrived in M6 and is
+the only one where a **test asserted the defect** and a comment supplied the reasoning that made
+it look right.
 
 Read this before writing a test you intend to rely on, and before believing a number.
 
@@ -231,6 +233,66 @@ may call before returning the 0 that asks for its own registration to be removed
 > that could yield — and if they are not, the sentence is documentation of a bug. Where the
 > justification genuinely holds, say what makes it hold ("checked live under this same lock"), so
 > the next reader can verify the claim instead of trusting it.
+## 14. A test can assert the defect, and a comment can supply the reasoning that makes it look right
+
+`strchr` had **no terminator arm**. It read forward until it found the byte or faulted, so a
+search for a byte the string does not contain walked past the terminator and kept going until it
+left the mapping. C 7.24.5.2 searches *the string pointed to by `s`* — the bytes up to and
+including its terminator — and returns a null pointer when the byte is absent, which is the whole
+of how every caller detects absence.
+
+The suite was green, and it was green **because a test asserted the defect**:
+
+```rust
+// 'z' is absent, so the scan walks to the NUL and past it — C says strchr scans until
+// it finds the byte, so absence inside a 6-byte mapping means the scan hits unmapped
+// memory after the terminator: a fault (not guest NULL) is the honest result here.
+assert_eq!(strchr(&mem, 0x1000, 'z' as i32), Err(Fault(0x1006)));
+```
+
+Three things made it survive. The assertion was **specific** — a fault at an exact address, which
+reads as a measured fact rather than a guess. The comment **supplied a rule** ("C says strchr
+scans until it finds the byte") that is false and that nobody had to check, because it was stated
+in the voice this project states measurements in. And the behaviour is **plausible**: "the string
+is unterminated, so a fault is honest" is true of `strchr`'s *sibling* cases and of the second
+test in the same file, which maps eight bytes with no NUL at all and correctly still faults.
+
+> A comment is not a citation. When a test asserts what a C function does, the doc comment beside
+> it should name the clause — `C 7.24.5.2`, `POSIX strchr` — not paraphrase it, because a
+> paraphrase is exactly as convincing when it is wrong.
+
+**What it cost is the point, and it is the widest blast radius of anything in this file.**
+`libroblox.so` embeds OpenSSL, whose `crypto/core_namemap.c` tokenises an algorithm-name list by
+calling `strchr(names, ':')` in a loop at guest `0x029f7748`; most names contain no colon. The
+scan left the allocation, the refusal unwound out of OpenSSL **while it held a global lock**, and
+every later acquirer of that lock spun for ever. That lock is taken by `nativeInitClientSettings`,
+so §8 row 21 hung; the engine never received flags; it never asked for a renderer. From the
+outside, a **one-line omission in a search function** presented as *graphics do not work* — four
+milestones and one subsystem away from the cause, in a subsystem that had never been asked for
+anything.
+
+The route to it is worth keeping too, because none of the obvious steps found it:
+
+* `sched_yield` at 22 million calls, `parked`, `guest_thread_failures` and the import census all
+  said "nothing is running" and none said why.
+* Three hypotheses were **eliminated by measurement** and each would have been a plausible place
+  to stop: `STLR` writes (tested at the CPU level), nested guest calls preserve every
+  callee-saved register (read from `SavedState`), and no wake ever landed near a waiter (a
+  near-miss detector added for the purpose, which reported zero).
+* The step that found it was correcting a **broken measurement**. The lock value printed beside
+  each scripted downcall was read *after the whole table had run*, so every row reported the same
+  number and the lock looked as though it had been held since step 7. Running the table one row
+  at a time, reading the lock between rows, named the exact call that takes it and never gives it
+  back — and that call was the one already known to fail, carried in the handoff for two sessions
+  as an open item whose consequences were never traced.
+
+> **An open item with no consequence attached is a bet that it has none.**
+> `nativeSetPlatformHeadersWithIdfa` was recorded as "20 of 21 downcalls return; this is the one
+> that does not", milestone after milestone, without anyone asking *what it was holding when it
+> stopped*. A refusal is not inert: it unwinds out of guest code at whatever point the guest had
+> reached, and if that point is inside a critical section the guest never leaves it. Every
+> refusal that can fire inside a lock is a deadlock waiting for the second acquirer.
+
 
 ---
 

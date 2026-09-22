@@ -496,9 +496,32 @@ pub fn strncat(mem: &mut impl GuestMemory, dst: u64, src: u64, n: u64) -> Result
 
 /// `char *strchr(const char *s, int c)`
 ///
-/// Finds the first occurrence of the byte `(unsigned char)c` in `s`, **including the
-/// terminating NUL** (so `strchr(s, 0)` returns the terminator's address). Returns guest
-/// `0` when not found.
+/// Finds the first occurrence of the byte `(unsigned char)c` **in the string** `s`, and the
+/// string ends at its terminator. The terminator is itself a candidate — C makes it "part of the
+/// string" for this function specifically — so `strchr(s, 0)` returns the terminator's address.
+/// A byte that is not in the string returns guest `0`.
+///
+/// # The scan stops at the NUL, and this is the one thing here that was wrong
+///
+/// This loop used to have **no terminator arm at all**: it read forward until it found `c` or
+/// faulted. A search for a byte the string does not contain therefore walked *past* the
+/// terminator and kept going until it left the mapping, and the refusal it produced named an
+/// address in whatever happened to follow.
+///
+/// C 7.24.5.2 is explicit that the search is over "the string pointed to by `s`", and the string
+/// is the bytes up to and including its terminator. `strchr` returning a null pointer when the
+/// byte is absent is the whole of how every caller detects absence.
+///
+/// **MEASURED, and it is the defect that stopped M6.** `libroblox.so` embeds OpenSSL, whose
+/// `crypto/core_namemap.c` tokenises an algorithm-name list by calling `strchr(names, ':')` in a
+/// loop at guest `0x029f7748`. Most names contain no colon. The scan ran off the end of the
+/// guest allocation, the refusal unwound out of OpenSSL **while it held a global lock**, and
+/// every later acquirer of that lock spun for ever — which is how a one-line omission in a search
+/// function presented as §8 row 21 hanging four milestones away, with a graphics subsystem that
+/// had never been asked for anything getting the blame.
+///
+/// The `want` comparison stays **above** the terminator check: `strchr(s, 0)` must find the
+/// terminator rather than report it as the end of the search.
 pub fn strchr(mem: &impl GuestMemory, s: u64, c: i32) -> Result<u64, Fault> {
     if s == 0 {
         return Err(Fault(0));
@@ -510,6 +533,12 @@ pub fn strchr(mem: &impl GuestMemory, s: u64, c: i32) -> Result<u64, Fault> {
         mem.read(cursor, &mut probe)?;
         if probe[0] == want {
             return Ok(cursor);
+        }
+        if probe[0] == 0 {
+            // The end of the string, and `c` was not in it. A **fault** here would be this layer
+            // walking past a terminator the guest put there on purpose; an unterminated string
+            // still faults, because then there is no terminator to stop at.
+            return Ok(0);
         }
         cursor += 1;
     }

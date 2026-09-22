@@ -351,12 +351,19 @@ fn strchr_includes_terminator_and_missing_returns_null() {
     let mem = m_str("hello", 0x1000);
     assert_eq!(strchr(&mem, 0x1000, 'l' as i32), Ok(0x1002));
     assert_eq!(strchr(&mem, 0x1000, 'h' as i32), Ok(0x1000));
-    // The NUL is findable.
+    // The NUL is findable: C 7.24.5.2 makes the terminator part of the string *for this
+    // function*, so `strchr(s, 0)` returns its address rather than null.
     assert_eq!(strchr(&mem, 0x1000, 0), Ok(0x1005));
-    // 'z' is absent, so the scan walks to the NUL and past it — C says strchr scans until
-    // it finds the byte, so absence inside a 6-byte mapping means the scan hits unmapped
-    // memory after the terminator: a fault (not guest NULL) is the honest result here.
-    assert_eq!(strchr(&mem, 0x1000, 'z' as i32), Err(Fault(0x1006)));
+    // **'z' is absent, so the answer is a null pointer**, and the scan must stop at the
+    // terminator to produce it.
+    //
+    // This assertion used to read `Err(Fault(0x1006))`, with a comment claiming "C says strchr
+    // scans until it finds the byte". It does not: C 7.24.5.2 searches *the string*, which ends
+    // at its terminator, and returning null is the whole of how a caller detects absence. The
+    // implementation had no terminator arm, the test asserted that as correct, and the suite was
+    // green while the function walked off the end of every allocation it was asked about a byte
+    // that was not there. `docs/VERIFICATION.md` entry 14.
+    assert_eq!(strchr(&mem, 0x1000, 'z' as i32), Ok(0));
     // c is converted to unsigned char: 0x141 matches 'A'.
     let mem2 = m_str("A", 0x1000);
     assert_eq!(strchr(&mem2, 0x1000, 0x141), Ok(0x1000));
@@ -366,9 +373,37 @@ fn strchr_includes_terminator_and_missing_returns_null() {
 fn strchr_null_and_unterminated() {
     let mem = MockMemory::new();
     assert_eq!(strchr(&mem, 0, 'a' as i32), Err(Fault(0)));
+    // **An unterminated string still faults**, and that is the arm that separates "stop at the
+    // terminator" from "stop early for any reason": there is no terminator here to stop at, so
+    // the scan genuinely does leave the mapping and the fault names where.
     let mut mem2 = MockMemory::new();
     mem2.map(0x1000, &[0x41; 8]);
     assert_eq!(strchr(&mem2, 0x1000, 'z' as i32), Err(Fault(0x1008)));
+}
+
+/// **The absent byte after which the scan must not read another byte**, asserted by putting
+/// unmapped memory immediately after the terminator.
+///
+/// The test above says `strchr` *answers* null for an absent byte. This one says it does not
+/// *touch* anything past the terminator to get there — which is the property OpenSSL's
+/// `crypto/core_namemap.c` depends on and the one whose absence stopped M6. A scan that read one
+/// byte too many would fault here instead of answering, and the two assertions fail differently:
+/// that one on the value, this one on the error.
+#[test]
+fn strchr_does_not_read_past_the_terminator() {
+    // Exactly "ab\0" mapped, and nothing at all after it.
+    let mut mem = MockMemory::new();
+    mem.map(0x2000, b"ab\0");
+    assert_eq!(strchr(&mem, 0x2000, 'z' as i32), Ok(0), "absent: a null pointer, not a fault");
+    assert_eq!(strchr(&mem, 0x2000, 'b' as i32), Ok(0x2001));
+    assert_eq!(strchr(&mem, 0x2000, 0), Ok(0x2002), "the terminator is still findable");
+
+    // And the empty string: the terminator is the first byte, so every other byte is absent
+    // without a single step forward.
+    let mut empty = MockMemory::new();
+    empty.map(0x3000, b"\0");
+    assert_eq!(strchr(&empty, 0x3000, 'a' as i32), Ok(0));
+    assert_eq!(strchr(&empty, 0x3000, 0), Ok(0x3000));
 }
 
 #[test]

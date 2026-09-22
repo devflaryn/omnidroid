@@ -422,6 +422,7 @@ impl BoundaryBuilder {
             code_watch: CodeWatch::default(),
             census: AtomicBool::new(false),
             last_call: AtomicUsize::new(0),
+            last_caller: AtomicUsize::new(0),
         })
     }
 }
@@ -682,6 +683,9 @@ pub struct Boundary {
     census: AtomicBool,
     /// The address of the slot the most recent crossing was for. See [`Boundary::last_call`].
     last_call: AtomicUsize,
+    /// The guest address the most recent crossing will return to. See
+    /// [`Boundary::last_caller`].
+    last_caller: AtomicUsize,
 }
 
 impl Boundary {
@@ -829,11 +833,31 @@ impl Boundary {
 
     /// Charge one crossing to a slot, if a host asked for the census.
     #[inline]
-    fn count(&self, slot: &Slot) {
+    fn count(&self, slot: &Slot, caller: GuestAddr) {
         if self.census.load(Ordering::Relaxed) {
             slot.calls.fetch_add(1, Ordering::Relaxed);
             self.last_call.store(slot.address, Ordering::Relaxed);
+            self.last_caller.store(caller, Ordering::Relaxed);
         }
+    }
+
+    /// The guest address the most recent crossing will return to, or `0`.
+    ///
+    /// **`last_call` says which symbol; this says from where.** A thunk address is the same for
+    /// every call to one symbol, so a run that stopped inside `strchr` learns nothing from it:
+    /// `strchr` is called 695 times on the startup path. `X30` names the *call site*, one
+    /// instruction past the `BL`, which lands inside the calling function rather than at its
+    /// entry — so a reader with the binary can decode what built the argument.
+    ///
+    /// It is a **guest** value: a callee that has already clobbered `X30`, or a `BR` rather than
+    /// a `BL`, gives something that is not a return address. It is read at the crossing, before
+    /// any handler runs, and it is a diagnostic rather than control flow.
+    ///
+    /// Recorded only under the census, for the reason [`start_census`](Boundary::start_census)
+    /// gives about the 33 ns path.
+    #[must_use]
+    pub fn last_caller(&self) -> GuestAddr {
+        self.last_caller.load(Ordering::Relaxed)
     }
 
     /// The token an inline thunk is registered with: this boundary's own address.
@@ -1168,7 +1192,7 @@ impl Boundary {
         // Charged before the binding is looked at, so that an `Unbound` symbol the guest really
         // reached appears in the census. That one is the whole point: an import nobody predicted,
         // named by the guest having branched to it.
-        self.count(slot);
+        self.count(slot, resume);
         match slot.binding {
             Binding::Unbound => Err(AbiError::Unbound {
                 symbol: slot.symbol.clone(),
@@ -1268,7 +1292,7 @@ impl Boundary {
             call.defer_to_caller();
             return;
         };
-        self.count(slot);
+        self.count(slot, call.x(30) as GuestAddr);
         let Binding::Inline(handler) = slot.binding else {
             call.defer_to_caller();
             return;

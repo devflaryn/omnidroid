@@ -633,6 +633,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     }
     .expect("§8 step 6: JNI_OnLoad must return");
     assert_eq!(returned.as_i32(), slots::JNI_VERSION_1_6, "§8 step 6");
+    stall_report(&guest, "after JNI_OnLoad, before step 7");
     let _ = writeln!(
         std::io::stderr(),
         "after JNI_OnLoad: spin lock {}, count {}",
@@ -641,39 +642,60 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     );
 
     // ---- steps 7-12: the scripted sequence, which M4 delivered -----------------------------
-    let outcomes = {
-        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
-        let _jni = guest.jni.activate().expect("publish the JNI instance");
-        let _ndk = guest.ndk.activate();
-        script::run(
-            &guest.jni,
-            &guest.boundary,
-            &mut cpu,
-            &|symbol| guest.exports.get(symbol).copied(),
-            script::SEQUENCE,
-            0,
-        )
-        .expect("building the scripted arguments must not fail")
-    };
+    // **One step at a time, with the lock read between them.** MEASURED the other way first, and
+    // it was a measurement of nothing: running the whole table and then printing the lock beside
+    // each outcome reads the *final* value once per row, so every row reported the same number
+    // and the value looked as though it had been taken at step 7 whatever had actually happened.
+    // `VERIFICATION.md` entry 4's shape -- a census taken after the work is not evidence about
+    // when the work happened.
+    let mut outcomes = Vec::new();
+    for step in script::SEQUENCE {
+        let before = image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30");
+        let threads_before = guest.bionic.guest_thread_records();
+        let produced = {
+            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+            let _jni = guest.jni.activate().expect("publish the JNI instance");
+            let _ndk = guest.ndk.activate();
+            script::run(
+                &guest.jni,
+                &guest.boundary,
+                &mut cpu,
+                &|symbol| guest.exports.get(symbol).copied(),
+                std::slice::from_ref(step),
+                0,
+            )
+            .expect("building the scripted arguments must not fail")
+        };
+        for outcome in &produced {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  step {:>2} {:<72} {}   [spin lock {} -> {}, count {}, threads {} -> {}]",
+                outcome.step,
+                outcome.symbol,
+                match &outcome.result {
+                    Ok(()) => "returned".to_string(),
+                    Err(error) => format!(
+                        "{error} [last crossing from guest {:#x} (link {:#x})]{}",
+                        guest.boundary.last_caller(),
+                        guest.boundary.last_caller().wrapping_sub(guest.object.base),
+                        bytes_before_the_fault(&guest, &error.to_string())
+                    ),
+                },
+                before,
+                image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30"),
+                image_word(&guest, SPIN_LOCK_OFFSET + 4, "the count at 0x06dd0a34"),
+                threads_before,
+                guest.bionic.guest_thread_records()
+            );
+        }
+        outcomes.extend(produced);
+    }
     let reached = outcomes.iter().filter(|o| o.ok()).count();
     let _ = writeln!(
         std::io::stderr(),
         "\nM5: steps 7-12 reached {reached} of {} scripted downcalls",
         outcomes.len()
     );
-    for outcome in &outcomes {
-        let _ = writeln!(
-            std::io::stderr(),
-            "  step {:>2} {:<72} {}   [spin lock {}]",
-            outcome.step,
-            outcome.symbol,
-            match &outcome.result {
-                Ok(()) => "returned".to_string(),
-                Err(error) => format!("{error}"),
-            },
-            image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30")
-        );
-    }
     for outcome in outcomes.iter().filter(|o| o.step <= 8) {
         if let Err(error) = &outcome.result {
             panic!("§8 step {}: `{}` failed: {error}", outcome.step, outcome.symbol);
@@ -1302,6 +1324,52 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     }
 }
 
+/// The bytes **before** an address a refusal named as unreadable.
+///
+/// A refusal that says "1 byte at `0x…000` is not mapped" says where the read stopped and nothing
+/// about why it got there. For a string walk -- `strchr`, `strlen`, `strcmp` -- the question is
+/// always whether the terminator was missing or whether the walk had already passed it, and the
+/// answer is in the bytes just behind the boundary. Rendered as text with non-printables escaped,
+/// because what a string walk ran past is a string.
+///
+/// The address is parsed out of the message rather than threaded through the error type: this is
+/// a probe for one investigation, and a field on `AbiError` would be a permanent surface added
+/// for a temporary question.
+fn bytes_before_the_fault(guest: &Guest, message: &str) -> String {
+    // **The last `at 0x`, not the first.** The first is the thunk's own address, which every
+    // refusal carries and which is never the address that faulted.
+    let Some(rest) = message.rsplit(" at 0x").next().filter(|_| message.contains(" at 0x")) else {
+        return String::new();
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    let Ok(at) = usize::from_str_radix(&digits, 16) else { return String::new() };
+    if at < 128 {
+        return String::new();
+    }
+    let mut rendered = String::new();
+    // A word at a time, taking the byte out of it: `GuestMem` has no byte reader, and an aligned
+    // word read covers the same range.
+    for offset in (at - 128)..at {
+        match guest.boundary.mem().read_u32(
+            offset & !3,
+            omni_android::Blame::new("the bytes before a fault", at, 0),
+        ) {
+            Ok(word) => {
+                let byte = (word >> (8 * (offset & 3))) as u8;
+                if byte == 0 {
+                    rendered.push_str("[NUL]");
+                } else if byte.is_ascii_graphic() || byte == b' ' {
+                    rendered.push(byte as char);
+                } else {
+                    rendered.push_str(&format!("<{byte:02x}>"));
+                }
+            }
+            Err(_) => rendered.push('?'),
+        }
+    }
+    format!("\n      the 128 bytes before {at:#x}: [{rendered}]")
+}
+
 /// **Everything known about a guest that has stopped making progress, in one place.**
 ///
 /// # What this exists to answer, and why each line is in it
@@ -1361,9 +1429,14 @@ fn stall_report(guest: &Guest, when: &str) {
     let (waits, wakes) = futex.activity();
     let _ = writeln!(
         out,
-        "  futex: {waits} wait(s), {wakes} wake(s), {} with no deadline; cond-parked {:?}",
+        "  futex: {waits} wait(s), {wakes} wake(s), {} with no deadline; cond-parked {:?};          near misses {:?}",
         futex.indefinite_parks(),
-        guest.bionic.parked()
+        guest.bionic.parked(),
+        futex
+            .near_misses()
+            .iter()
+            .map(|(woke, parked)| format!("woke {woke:#x} while {parked:#x} was parked"))
+            .collect::<Vec<_>>()
     );
     for (address, waiters) in futex.parked_addresses() {
         let word = guest.boundary.mem().read_u32(
