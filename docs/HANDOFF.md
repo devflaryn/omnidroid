@@ -925,6 +925,51 @@ resizable window, physical device, device, queue, swapchain, command buffers, su
 and the presented pixels copied back and asserted. Every call from assembled ARM64 through guest
 thunks, against a real RTX 4060.
 
+## The settings fetch COMPLETES, and the gate is RED at the frontier
+
+```text
+settingsUrl: https://clientsettingscdn.roblox.com/v2/settings/application/GoogleAndroidApp
+[FLog::NativeDM] ... getFlags: success = true, payload's size = 1358053.
+```
+
+1,358,053 bytes over TLS from the real endpoint in **3.08 s**. The `HTTP 400` was **ours**:
+the gate asked for application name `android`, a value this project invented. The server says so
+(`{"errors":[{"code":1,"message":"The application name is invalid."}]}`), a direct probe settles it
+(`android` -> 400, `GoogleAndroidApp` -> 200), and the correct value is read out of the APK:
+`bh.x0.M` in `classes2.dex` is one instruction, `const-string v0, "GoogleAndroidApp"`.
+
+A second instance of the same bug: **`nativeInitClientSettings`'s third argument is an application
+*name*, not a base URL.** We passed a URL and the engine built
+`.../settings-compressed/application/https:/clientsettings.roblox.com/...zst`.
+
+**`ldexp` is why the download appeared to stall at 30%.** `omni_bionic::libm::ldexp` has existed
+since phase 1, sits directly beside `frexp` which *was* bound, and nothing called it. A thread died
+on it and the reader parked waiting for the thread that had died, so `recvfrom` froze. Two runs
+were spent measuring read sizes before that was clear -- entry 16 again, in the session that wrote
+entry 16. **Do not trust the ~1,629 bytes-per-read figure** recorded during that period: it was
+computed over a truncated transfer and has never been recomputed over a completed one.
+
+### The gate is RED, and it is the frontier
+
+`cargo test -p omni-android --release --test gameactivity` fails on **two guest-thread deaths in
+post-flags code that no run reached before**. Nothing has been widened to hide them:
+`WATCHDOG_SECONDS` is 180, `FLAG_FETCH_WAIT` is 30.
+
+1. **`GetStaticObjectField` refused**: `com/roblox/protocols/systemdialog/
+   PlatformSystemDialogHandler.INSTANCE` is on the measured JNI surface and this layer has not
+   decided what it answers. A `classes.rs` question -- §8 row 23 territory.
+2. **`MemoryFault { pc: 2399330234196, address: 2400510558208, access: Read }` on guest thread 22.**
+   A *second*, distinct death in the same run, and **not** a refusal. Uninvestigated.
+
+Two more open threads from the same run:
+
+* **`nativeGameGlobalInit` (§8 row 22) does not return within 180 s.** The gate's post-fetch surface
+  re-delivery sits after it, so **whether the surface is finally accepted has never been observed.**
+  `continueAfterFlagsLoaded_` is reached only on the fetch's success path; the instrument is in
+  place and the run cannot reach it yet.
+* The `DynamicFastVariableReloader`'s `.zst` request aborts at **exactly `time:5012.3ms`** with a
+  now well-formed URL -- a 5 s client-side timeout, unexplained.
+
 ## The two things between here and a real Roblox frame
 
 **1. `HTTP 400` on the client-settings request.** The transport is proven; the *request* is
