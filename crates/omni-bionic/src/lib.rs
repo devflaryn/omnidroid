@@ -96,6 +96,7 @@ pub mod sort;
 pub mod stdio;
 pub mod string;
 pub mod threads;
+pub mod unwind;
 pub mod time;
 pub mod tls;
 pub mod wide;

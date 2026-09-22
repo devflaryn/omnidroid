@@ -5,11 +5,18 @@ because each one produced a **green suite that proved less than it claimed**, an
 person who wrote the test was the person who wrote the code — which is the blind spot that makes all
 of them possible.
 
-There are **fourteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
+There are **sixteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
 could not be written rather than by one that passed. Entry 13 arrived in M6 and is the only one
 found by reviewing a *copy* of the defect rather than the original. Entry 14 arrived in M6 and is
 the only one where a **test asserted the defect** and a comment supplied the reasoning that made
-it look right.
+it look right. Entries 15 and 16 arrived together, later in M6, and are the only pair where the
+*instruments* were wrong rather than the code: a diagnostic that had been switched off read exactly
+like a system that had stopped, and three guest threads died unremarked behind a green gate.
+
+**This count has itself been wrong.** It said "fourteen" for as long as there were sixteen,
+because two entries were appended without it — which is the same defect as an `expect` whose
+justification expired (entry 13), in the document that warns about that. If you add an entry, the
+number above is part of the entry.
 
 Read this before writing a test you intend to rely on, and before believing a number.
 
@@ -295,6 +302,71 @@ The route to it is worth keeping too, because none of the obvious steps found it
 
 
 ---
+
+## 15. A diagnostic that can be switched off looks exactly like a system that has stopped
+
+`Boundary::census` keeps its per-symbol counts when the flag is cleared -- deliberately, so that a
+run which counted and then stopped can still report what it counted. The gate's watchdog read the
+total every twenty seconds and printed `FROZEN` when it did not move.
+
+It did not move for three sessions, and the census had simply been **off**: `report()` stops it to
+print a stable snapshot, and every interesting thing in M6 happens after `report()`. The reading
+was not stale, not slow and not deadlocked. It was not a reading at all.
+
+Everything downstream inherited it. `last_call` is written by the same counter, so that froze too
+and named `memset` for twenty minutes. The per-thread crossing records are written by the same
+counter, so every thread reported "stopped". A hypothesis was built on all three agreeing.
+
+What broke it was a counter that is **not** gated: `Boundary::crossings().exits`, charged in the
+same function as the census on the same line of control flow. One reading of it said 26,631,317 ->
+53,276,895 -> 79,473,983, and the guest that had been "deadlocked since step 7" was executing
+1.3 million imports a second.
+
+> A number that can be *off* must say so in its own output, or it will be read as a measurement of
+> the thing it is not measuring. Where that cannot be arranged, keep one counter in the same place
+> that nothing can switch off, and read the pair -- two counters that must agree are a check, and
+> one counter is a belief.
+
+## 16. A thread that dies is not a call that fails
+
+The gate reported, run after run and correctly: all 3,594 initializers, `JNI_OnLoad`, **21 of 21**
+scripted downcalls, all seven lifecycle rows returned, the flags loaded. Behind it, three of the
+guest's own worker threads had been **killed by this layer** and nothing printed a word about it:
+
+* one on a perfectly ordinary, NUL-terminated log line that `GuestMem::cstr` refused because its
+  walk was bounded by a commit-granule boundary (see `omni_mem::scan_reach`);
+* one on `pthread_getattr_np`, unbound;
+* one on `pthread_mutex_trylock`, unbound -- whose primitive `omni_bionic::mutex::trylock` already
+  existed and was already unit-tested, and had simply never been wired to a symbol.
+
+Each took with it whatever the guest had given it to do. One was holding the future that
+`nativePostClientSettingsLoadedInitialization3` was waiting on, which is why the runtime hung.
+
+Every assertion the gate makes is about a call **this** thread made. A guest thread that starts,
+runs, and dies is invisible to all of them: it is not a downcall that returned an error, it is not
+a refusal on the calling thread, and `live_guest_threads()` going down is indistinguishable from a
+worker finishing its job.
+
+> `Bionic::guest_thread_failures()` is not a debugging aid, it is a **result**. Print it after
+> every step, and assert it empty wherever the run is expected to be healthy. A harness that only
+> checks the thread it is standing on will report a green run on a burning building.
+
+The assertion earned itself on its **first** run. It was added to catch the three deaths above, all
+of which needed `OMNI_M6_ROWS_21_22=1` to reach — and it immediately failed the gate's *default*
+path on a fourth, `strcspn`, which had been killing a guest thread on every ordinary run of this
+suite for as long as that thread has existed, in a build everybody called green.
+
+There is a second lesson under the first. Four of the five symbols involved
+(`pthread_mutex_trylock`, `pthread_attr_getstack`, `__strcat_chk`, `strcspn`) were **already
+implemented and already unit-tested** in `omni-bionic`; only the line wiring each to its symbol was
+missing. The primitives had been written against the *import list* and the wiring done against
+*what the run had reached*, so every primitive whose symbol the run had not yet touched sat there,
+tested, unreachable and invisible.
+
+> Two lists that are built from different sources will disagree, and the disagreement will be
+> silent in whichever direction nothing asserts. If one side is generated from a specification and
+> the other from experience, something has to assert that every entry on the first side is on the
+> second — or, failing that, something has to make the first *encounter* loud.
 
 # Process rules these produced
 

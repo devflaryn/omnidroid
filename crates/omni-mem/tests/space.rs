@@ -1376,6 +1376,225 @@ fn an_access_may_straddle_a_commit_granule_boundary_within_one_mapping() {
     assert_tiles_the_space(&space);
 }
 
+/// **A scan reaches across committed granules of one mapping**, which is the question `admit`
+/// cannot be asked.
+///
+/// `admit` walks as far as the length it is given needs, so `admit(address, 1, ..)` reports the end
+/// of the *first entry*. A caller with no length -- a C-string walk looking for a NUL -- that used
+/// that as its bound would be bounded by a granule boundary, which is not a fact about the guest's
+/// address space at all.
+///
+/// MEASURED, and it killed a thread: a real Roblox worker died during M6 startup on
+/// "`__android_log_print` ... a string at 0x277dca62fa0 ... with no NUL in the first 96 bytes".
+/// 96 was the distance to the next entry; the string was ordinary and NUL-terminated.
+#[test]
+fn a_scan_reaches_across_the_committed_granules_of_one_mapping() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let base = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            4 * granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a lazily-committed mapping");
+    let boundary = base + granule;
+    space.ensure_committed(base, 1).expect("commit the first granule");
+    space.ensure_committed(boundary, 1).expect("commit the second granule");
+
+    // The precondition this test is about: the two granules are still separate entries.
+    assert_eq!(
+        space.region_at(boundary - 8).expect("mapped").end(),
+        boundary,
+        "adjacent committed granules are expected to stay separate entries",
+    );
+    // ...and that is exactly what a one-byte `admit` reports, which is the defect.
+    assert_eq!(
+        omni_mem::admit(&space, boundary - 96, 1, omni_mem::FaultAccess::Read)
+            .expect("mapped")
+            .end,
+        boundary,
+        "a one-byte admit reports the entry end -- the reading that bounded the walk at 96 bytes",
+    );
+
+    let reach = omni_mem::scan_reach(
+        &space,
+        boundary - 96,
+        omni_mem::FaultAccess::Read,
+        64 * 1024,
+    )
+    .expect("the address is readable");
+    assert!(
+        reach >= boundary + granule.min(64 * 1024 - 96),
+        "the scan must cross into the second granule, got {reach:#x} against a boundary at \
+         {boundary:#x}",
+    );
+    assert_tiles_the_space(&space);
+}
+
+/// **A scan stops at an uncommitted granule**, and does not commit one to look past it.
+///
+/// `admit` may commit under rule 4 because it was told a length the guest is about to touch. A scan
+/// has no such length: committing a whole 64 KiB run to hunt for a NUL would charge D15's ceiling
+/// for memory the guest never asked for. A string that really does continue into the next granule
+/// continues into one the guest wrote, and that one is committed.
+#[test]
+fn a_scan_stops_at_an_uncommitted_granule_rather_than_committing_it() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let base = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            4 * granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a lazily-committed mapping");
+    space.ensure_committed(base, 1).expect("commit only the first granule");
+    let committed_before = space.stats().committed;
+
+    // **The limit has to exceed a granule or this test proves nothing.** MEASURED: it was
+    // `64 * 1024`, which *is* the commit granule, so the ceiling landed exactly on the first
+    // entry's end and the loop this test is about never executed. The mutation harness found it —
+    // `access-B3`, which deletes the commit check, changed nothing and was reported NOT CAUGHT.
+    // `VERIFICATION.md` entry 11: exercising is not detecting.
+    let reach = omni_mem::scan_reach(&space, base, omni_mem::FaultAccess::Read, 4 * granule)
+        .expect("the address is readable");
+    assert_eq!(reach, base + granule, "the scan stops where the committed run does");
+    assert_eq!(
+        space.stats().committed,
+        committed_before,
+        "a scan must not commit the granule it declined to look into",
+    );
+    assert_tiles_the_space(&space);
+}
+
+/// **A scan does not leave its mapping**, however the neighbour is placed.
+///
+/// The over-correction the fix invites: two mappings butted together are still two mappings, and a
+/// string that appears to run from one into the other is a guest bug, not a long string.
+#[test]
+fn a_scan_stops_at_the_end_of_its_own_mapping() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let first = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("the first mapping");
+    let second = space
+        .map_anonymous(
+            Placement::Fixed(first + granule),
+            granule,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a second mapping butted against the first");
+    assert_eq!(second, first + granule, "the two mappings must be adjacent");
+    space.ensure_committed(first, 1).expect("commit the first");
+    space.ensure_committed(second, 1).expect("commit the second");
+
+    // Four granules of limit against a one-granule mapping, for the reason the test above gives:
+    // a limit that stops where the mapping stops cannot tell a scan that respects the boundary
+    // from one that has never looked at it.
+    let reach = omni_mem::scan_reach(&space, first, omni_mem::FaultAccess::Read, 4 * granule)
+        .expect("the address is readable");
+    assert_eq!(
+        reach,
+        first + granule,
+        "the scan stops at the mapping boundary, with {second:#x} mapped and readable beyond it",
+    );
+    assert_tiles_the_space(&space);
+}
+
+/// **A scan stops where the protection stops**, inside one mapping it is otherwise entitled to.
+///
+/// The fourth of the loop's four conditions, and the only one a mapping's own extent cannot
+/// express: `mprotect` can drop a range of a mapping to `PROT_NONE` under a reader, and the bytes
+/// on the far side are still mapped, still committed and still part of the same mapping. A scan
+/// that only asked "am I still in my mapping" would walk straight into them.
+#[test]
+fn a_scan_stops_where_the_protection_of_its_own_mapping_stops() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let base = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            4 * granule,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("an eagerly-committed mapping");
+    // Drop the second granule to no access, leaving the first and the third readable. The scan
+    // starts in the first, so the run it could walk is interrupted rather than ended.
+    space
+        .protect(base + granule, granule, Protection::None)
+        .expect("drop the middle to no access");
+
+    let reach = omni_mem::scan_reach(&space, base, omni_mem::FaultAccess::Read, 4 * granule)
+        .expect("the address is readable");
+    assert_eq!(
+        reach,
+        base + granule,
+        "the scan stops at the protection boundary, not at the mapping's end",
+    );
+    // The precondition, so this cannot pass for the wrong reason: the range beyond really is still
+    // part of the same mapping and really is still committed.
+    let beyond = space.region_at(base + 2 * granule).expect("mapped");
+    assert_eq!(
+        beyond.mapping,
+        space.region_at(base).expect("mapped").mapping,
+        "the far side must be the same mapping, or this test is the mapping check again",
+    );
+    assert!(beyond.is_committed(), "the far side must be committed, or it is the commit check");
+    assert_tiles_the_space(&space);
+}
+
+/// A scan that asks for less than the run is given less: the cap is the caller's, and it is kept.
+#[test]
+fn a_scan_is_bounded_by_the_limit_it_was_given() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let base = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            2 * granule,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("an eagerly-committed mapping");
+    assert_eq!(
+        omni_mem::scan_reach(&space, base, omni_mem::FaultAccess::Read, 32)
+            .expect("the address is readable"),
+        base + 32,
+    );
+}
+
+/// An address that is not readable at all is the caller's error, and the rule that refused it is
+/// the one `admit` would have named.
+#[test]
+fn a_scan_of_an_unreadable_address_refuses_with_the_rule_that_said_no() {
+    let space = space(64 * MIB);
+    let granule = space.commit_granule();
+    let base = space
+        .map_anonymous(
+            Placement::Anywhere { align: granule },
+            granule,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("a mapping");
+    space.protect(base, granule, Protection::None).expect("drop to no access");
+    assert_eq!(
+        omni_mem::scan_reach(&space, base, omni_mem::FaultAccess::Read, 64),
+        Err(omni_mem::Refusal::Protection),
+    );
+}
+
 /// **...but it may not straddle out of its mapping.**
 ///
 /// The over-correction a span fix invites: letting the walk run past the end of the mapping into

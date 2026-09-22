@@ -254,6 +254,52 @@ handlers! {
     /// `char *strcat(char *dst, const char *src)`
     fn strcat(dst: ptr, src: ptr) -> u64 = |v| omni_bionic::string::strcat(&mut v, dst, src);
 
+    /// `char *__strcat_chk(char *dst, const char *src, size_t dst_size)`
+    ///
+    /// The FORTIFY form, and a **pure binding gap** found the way the other four in this session
+    /// were: a guest worker thread died on it during the M6 startup run and
+    /// `Bionic::guest_thread_failures()` named it. `omni_bionic::string::strcat_chk` has existed
+    /// since phase 3a with the check's own test beside it, and nothing called it.
+    fn strcat_chk(dst: ptr, src: ptr, dst_size: u64) -> u64 =
+        |v| omni_bionic::string::strcat_chk(&mut v, dst, src, dst_size);
+
+    /// `size_t strcspn(const char *s, const char *reject)`
+    ///
+    /// The same shape, and the one that mattered most: it was killing a guest thread in the gate's
+    /// **default** path, not only under `OMNI_M6_ROWS_21_22`, and had been doing so unremarked for
+    /// as long as the thread has existed. The assertion that caught it is
+    /// `VERIFICATION.md` entry 16's, added in the same session.
+    ///
+    /// **Its sibling `strspn` is deliberately NOT bound**, though it is the same primitive with
+    /// the sense of one test flipped and binding it would cost nothing. Nothing has measured the
+    /// guest calling it, and "the primitive is already written" is not the same claim as "the
+    /// guest needs it" -- that is the rule against implementing an API because its name exists.
+    /// If the guest does call it, the thread-failure assertion now says so on the first run, by
+    /// name, which is what makes waiting safe rather than merely tidy.
+    fn strcspn(s: ptr, reject: ptr) -> u64 = |v| omni_bionic::string::strcspn(&v, s, reject);
+
+    /// `int isspace(int c)`
+    ///
+    /// **The sixth pure binding gap of this session and the first found by a TLS handshake.**
+    /// `omni_bionic::ctype::is_space` has existed since phase 1 with its own test -- the one that
+    /// asserts *exactly six* bytes classify -- and nothing had ever called it. A guest worker
+    /// thread died on it during M6's network run, one call after `getentropy`:
+    /// `GuestThreadFailure { thread: 8, why: "the guest called the imported symbol `isspace`
+    /// through its thunk at 0x18945ed5e60, and nothing in the compatibility layer implements it"
+    /// }`, on the thread carrying the client-settings fetch.
+    ///
+    /// **It takes no guest memory at all**, which makes it the smallest handler in this file and
+    /// worth one sentence about what is still easy to get wrong: C's `isspace` returns *some*
+    /// non-zero value for true, not necessarily 1, and callers may only test it against zero --
+    /// so `i32::from(bool)` is a correct answer and not a narrowed one. The classification is the
+    /// **C locale's**, which is the only locale bionic has.
+    ///
+    /// Its neighbour `tolower` is imported too, has `omni_bionic::ctype::to_lower` waiting for it,
+    /// and is deliberately **not** bound: nothing has measured the guest calling it, and the
+    /// thread-failure assertion will name it on the first run that does.
+    fn isspace(c: i32) -> i32 = |v| i32::from(omni_bionic::ctype::is_space(c));
+
+
     /// `char *strchr(const char *s, int c)`
     fn strchr(s: ptr, c: i32) -> u64 = |v| omni_bionic::string::strchr(&v, s, c);
 
@@ -302,6 +348,23 @@ handlers! {
     fn strtoull(nptr: ptr, endptr: ptr, base: i32) -> u64 =
         |v| omni_bionic::numerics::strtoull(&mut v, nptr, endptr, base);
 
+    /// `unsigned long long strtoull_l(const char *nptr, char **endptr, int base, locale_t loc)`
+    ///
+    /// **The locale argument is ignored, and that is bionic's own implementation rather than a
+    /// shortcut here**: that library has exactly one locale, so its `strtoull_l` is `strtoull`
+    /// with the fourth parameter unused. `strftime_l` is bound on the same ground, for the same
+    /// reason, one milestone earlier.
+    ///
+    /// Found by M6's network run: a guest **worker thread** died on it as an `Unbound` while the
+    /// client-settings response was being parsed -- `GuestThreadFailure { thread: 3, why: "the
+    /// guest called the imported symbol `strtoull_l` through its thunk ..." }`, from image offset
+    /// 0x2b81a44. It is in the file's LAST section, "never referenced from the Tier C closure at
+    /// all", although `strtoull` IS one of the 188 and has been bound since phase 1. Another pure
+    /// binding gap of the `pthread_mutex_trylock` kind: the primitive was written and tested in
+    /// phase 1 and only the line naming this spelling was missing.
+    fn strtoull_l(nptr: ptr, endptr: ptr, base: i32, _locale: u64) -> u64 =
+        |v| omni_bionic::numerics::strtoull(&mut v, nptr, endptr, base);
+
     /// `double strtod(const char *nptr, char **endptr)`
     fn strtod(nptr: ptr, endptr: ptr) -> f64 =
         |v| omni_bionic::numerics::strtod(&mut v, nptr, endptr);
@@ -316,6 +379,22 @@ handlers! {
     /// module-level note on the table below for why that is safe here.
     fn rand() -> i32 = |v| omni_bionic::numerics::rand(&mut v);
 
+    /// `void srand(unsigned int seed)`
+    ///
+    /// **A pure binding gap, the seventh of this session**, and the one that says most about the
+    /// pattern: `rand` has been bound since phase 1 and has been *called 750 times* in every run
+    /// of this gate, while the call that seeds it sat in `omni_bionic::numerics` with its own
+    /// test and no caller. A guest worker thread died on it during M6's network run, after the
+    /// client-settings fetch had failed and the engine had begun its retry.
+    ///
+    /// **It is not entropy and must not be confused with one.** `srand` chooses where a
+    /// deterministic sequence starts, which is the whole point of it: a caller that seeds with a
+    /// fixed value expects the same numbers. The entropy calls -- `arc4random_buf`, `getentropy`
+    /// and the raw `getrandom` -- go to `omni_platform::process::random_bytes` and have no seed at
+    /// all. The sequence here is `omni-bionic`'s LCG and is **not** bit-exact with bionic's, which
+    /// is safe for the reason the note on `rand` gives and for no other.
+    fn srand(seed: i32) -> void = |v| omni_bionic::numerics::srand(&mut v, seed as u32);
+
     // ---------------------------------------------------------- libm
 
     /// `double exp(double x)`
@@ -326,6 +405,17 @@ handlers! {
     fn log(x: f64) -> f64 = |v| omni_bionic::libm::log(&mut v, x);
     /// `float logf(float x)`
     fn logf(x: f32) -> f32 = |v| omni_bionic::libm::logf(&mut v, x);
+    /// `double log10(double x)`
+    ///
+    /// **The eighth pure binding gap of this session**, found on a guest worker thread in M6's
+    /// network run -- thread 14, at image offset 0x2280b0c, on the telemetry path the engine
+    /// takes once a flag fetch has failed. `omni_bionic::libm::log10` has existed since phase 3a
+    /// beside the `log` that was bound, and nothing had called it.
+    ///
+    /// Its `f32` sibling `log10f` is in the same module, is equally written and tested, and is
+    /// deliberately **not** bound: no run has reached it, and the thread-failure assertion will
+    /// name it on the first one that does.
+    fn log10(x: f64) -> f64 = |v| omni_bionic::libm::log10(&mut v, x);
     /// `double pow(double x, double y)`
     fn pow(x: f64, y: f64) -> f64 = |v| omni_bionic::libm::pow(&mut v, x, y);
     /// `float powf(float x, float y)`
@@ -400,9 +490,6 @@ handlers! {
         omni_bionic::threads::GuestThreadId(b),
     );
 
-    /// `int sched_yield(void)`
-    fn sched_yield() -> i32 = |v| omni_bionic::metadata::sched_yield(&v.active.bionic.yielder);
-
     /// `int sched_get_priority_max(int policy)` -- Linux's constant per policy.
     fn sched_get_priority_max(policy: i32) -> i32 =
         |v| omni_bionic::metadata::sched_get_priority_max(policy);
@@ -459,6 +546,16 @@ handlers! {
     /// the glue's game thread would have been created **joinable**, and nothing joins it.
     fn pthread_attr_setdetachstate(attr: ptr, state: i32) -> i32 =
         |v| omni_bionic::metadata::attr_setdetachstate(&mut v, attr, state);
+
+    /// `int pthread_getattr_np(pthread_t thid, pthread_attr_t *attr)`
+    ///
+    /// The only member of this family that reports a **live** thread rather than storing a
+    /// request, so it is the only one that needs thread state and the only one that is not one
+    /// line of `omni-bionic`. `threads::pthread_getattr_np` has the table of what each field is
+    /// filled from, the three cases it refuses instead of guessing, and the M6 thread failure
+    /// that found it.
+    fn pthread_getattr_np(thid: u64, attr: ptr) -> i32 =
+        |v| threads::pthread_getattr_np(&mut v, thid, attr);
 
     // ---------------------------------------------------------- pthread: mutex
 
@@ -601,6 +698,26 @@ sync_handler! {
     fn pthread_mutex_lock(m) = |v, threads, futex, owners, conds|
         omni_bionic::mutex::lock(&mut v, futex, owners, &threads, m);
 
+    /// `int pthread_mutex_trylock(pthread_mutex_t *m)` — takes the mutex or answers `EBUSY`,
+    /// and never blocks.
+    ///
+    /// **A pure binding gap, and the second of them in this family.**
+    /// `omni_bionic::mutex::trylock` has existed since phase 3c with
+    /// `trylock_held_is_ebusy_all_types` beside it, and nothing called it — the same shape
+    /// `pthread_attr_setdetachstate` had in M5. M6's startup run found it the way an `Unbound`
+    /// is meant to be found: a guest worker thread died on it. `GuestThreadFailure { thread: 3,
+    /// start_routine: 0x284d168 }`, at image offset `0x2b53aa0` (`0x2b53aa4` is the return
+    /// address), inside libc++'s `std::mutex::try_lock` — so the callers are every `try_lock`
+    /// and every `std::unique_lock` built with `std::try_to_lock` in the engine.
+    ///
+    /// It takes the **owner table** and the thread registry and no futex, which is the whole
+    /// difference from `pthread_mutex_lock` beside it: there is nothing to wait on, so there is
+    /// nothing to be woken from. The owner table is still required, because a RECURSIVE mutex
+    /// the caller already holds is a successful re-entry and a RECURSIVE mutex somebody else
+    /// holds is `EBUSY`, and the two are the same lock word.
+    fn pthread_mutex_trylock(m) = |v, threads, futex, owners, conds|
+        omni_bionic::mutex::trylock(&mut v, owners, &threads, m);
+
     /// `int pthread_mutex_unlock(pthread_mutex_t *m)`
     fn pthread_mutex_unlock(m) = |v, threads, futex, owners, conds|
         omni_bionic::mutex::unlock(&mut v, futex, owners, &threads, m);
@@ -630,6 +747,86 @@ sync_handler! {
         omni_bionic::cond::broadcast(conds, cond);
 }
 
+/// One `sched_yield` in every `YIELD_SAMPLE_MASK + 1` has its guest stack recorded.
+///
+/// A power-of-two mask so the test is an `and`, and 64 Ki so that the cost is under one walk per
+/// hundred thousand calls. **A spin cannot hide behind it**: a loop that yields is yielding
+/// millions of times, so it is sampled thousands of times, and the last sample wins. What the rate
+/// does lose is a thread that yields a handful of times and stops -- which is the case nobody is
+/// looking for here, because it is not stuck.
+const YIELD_SAMPLE_MASK: u64 = 0xFFFF;
+
+/// How many `sched_yield` calls this process has serviced, for the sampling above.
+static YIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `int sched_yield(void)`
+///
+/// Hand-written rather than generated because of the sampling: see [`Bionic::yield_stacks`] for
+/// what a spinning thread costs and why a park record cannot see one.
+pub(super) fn sched_yield(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (frame, link) = (c.frame(), c.caller() as u64);
+    let state = active(c.symbol(), c.address())?;
+    if YIELDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & YIELD_SAMPLE_MASK == 0 {
+        let stack = {
+            let view = enter(c, &state);
+            omni_bionic::unwind::frames(&view, frame, link, 24)
+        };
+        state.bionic.record_yield_stack(state.thread, stack);
+    }
+    let value = {
+        let v = enter(c, &state);
+        omni_bionic::metadata::sched_yield(&v.active.bionic.yielder)
+    };
+    c.ret().i32(value);
+    Ok(())
+}
+
+/// `int pthread_attr_getstack(const pthread_attr_t *attr, void **stackaddr, size_t *stacksize)`
+///
+/// Hand-written rather than generated because it has **two** out-parameters, which the `handlers!`
+/// macro's one-value shape cannot express.
+///
+/// # How it was found, and why nothing new had to be written for it
+///
+/// `omni_bionic::metadata::attr_getstack` has existed and been tested since phase 3c; it had
+/// simply never been wired to a symbol. That is the third time in this session -- after
+/// `pthread_mutex_trylock`, whose primitive was likewise already written and already tested -- and
+/// each was found the same way: **a guest worker thread died on it** during the M6 startup run and
+/// `Bionic::guest_thread_failures()` named it.
+///
+/// ```text
+/// the guest called the imported symbol `pthread_attr_getstack` through its thunk at
+/// 0x17fe3bf3e30, and nothing in the compatibility layer implements it
+/// ```
+///
+/// It follows `pthread_getattr_np` immediately: the guest asks for its own live attributes and
+/// then reads the stack back out of them, which is the whole point of asking.
+///
+/// **Both pointers are written, or neither is.** The two fields are read first and the writes
+/// happen after, so a `stacksize` pointer this layer refuses cannot leave a caller holding a base
+/// with no length -- which is the one shape that would look like a success.
+pub(super) fn pthread_attr_getstack(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (attr, stackaddr, stacksize) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let code = {
+        let mut view = enter(c, &state);
+        match Lift::lift(omni_bionic::metadata::attr_getstack(&mut view, attr), &view)? {
+            Ok((base, size)) => {
+                use omni_bionic::memory::GuestMemory as _;
+                Lift::lift(view.write(stackaddr, &base.to_le_bytes()), &view)?;
+                Lift::lift(view.write(stacksize, &size.to_le_bytes()), &view)?;
+                0
+            }
+            Err(errno) => errno,
+        }
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
 /// `int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m)`
 ///
 /// Two phases, and the order is the atomicity: the calling thread registers on the cond's waiter
@@ -644,12 +841,19 @@ pub(super) fn pthread_cond_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let mut a = c.args();
         (a.next_u64()?, a.next_u64()?)
     };
+    let (frame, link) = (c.frame(), c.caller() as u64);
     let state = active(c.symbol(), c.address())?;
     // **§8.1's fifth failure mode, recorded while it is happening.** §8 row 14 blocks here until
     // the game thread signals `app->running`, and a deadlock there looks exactly like a hang from
     // outside. The guard removes the entry on **every** exit including the failing ones, which a
     // matched pair of calls around a `?` would not.
-    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex);
+    // **Read before anything runs, and only ever printed.** `X29`/`X30` are the guest's own,
+    // so the walk defends itself rather than trusting them; see `omni_bionic::unwind::frames`.
+    let stack = {
+        let view = enter(c, &state);
+        omni_bionic::unwind::frames(&view, frame, link, 24)
+    };
+    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex, stack);
     let code = {
         let mut view = enter(c, &state);
         let threads = CallThreads { table: &state.bionic.threads, me: state.thread };
@@ -715,6 +919,7 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
         let mut a = c.args();
         (a.next_u64()?, a.next_u64()?, a.next_u64()?)
     };
+    let (frame, link) = (c.frame(), c.caller() as u64);
     let state = active(c.symbol(), c.address())?;
     let (clock, deadline) = {
         let mut view = enter(c, &state);
@@ -778,7 +983,13 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
         });
     }
 
-    let _parked = state.bionic.park("pthread_cond_timedwait", state.thread, cond, mutex);
+    // **Read before anything runs, and only ever printed.** `X29`/`X30` are the guest's own,
+    // so the walk defends itself rather than trusting them; see `omni_bionic::unwind::frames`.
+    let stack = {
+        let view = enter(c, &state);
+        omni_bionic::unwind::frames(&view, frame, link, 24)
+    };
+    let _parked = state.bionic.park("pthread_cond_timedwait", state.thread, cond, mutex, stack);
     let code = {
         let mut view = enter(c, &state);
         let threads = CallThreads { table: &state.bionic.threads, me: state.thread };
@@ -1000,6 +1211,13 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("strncpy", strncpy),
     ("__strncpy_chk2", strncpy_chk2),
     ("strcat", strcat),
+    ("__strcat_chk", strcat_chk),
+    ("strcspn", strcspn),
+    // M6's network run, found by a guest worker thread dying on it during the TLS handshake --
+    // a PURE BINDING GAP, the sixth this session: `omni_bionic::ctype::is_space` has existed
+    // since phase 1 and nothing called it. Its neighbour `tolower` has the same shape and is
+    // deliberately NOT here; no run has reached it (D17).
+    ("isspace", isspace),
     ("strchr", strchr),
     ("strrchr", strrchr),
     ("strstr", strstr),
@@ -1013,13 +1231,21 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("strtoll", strtoll),
     ("strtoul", strtoul),
     ("strtoull", strtoull),
+    ("strtoull_l", strtoull_l),
     ("strtod", strtod),
     ("strtof", strtof),
     ("rand", rand),
+    // M6's network run: the call that seeds the `rand` above it, which has been bound since
+    // phase 1. A PURE BINDING GAP and the seventh of this session.
+    ("srand", srand),
     // libm
     ("exp", exp),
     ("expf", expf),
     ("log", log),
+    // M6's network run, found on a guest worker thread on the engine's post-failure telemetry
+    // path. A PURE BINDING GAP and the eighth: `omni_bionic::libm::log10` sits beside the `log`
+    // on the line above and had no caller. `log10f` stays Unbound -- no run has reached it.
+    ("log10", log10),
     ("logf", logf),
     ("pow", pow),
     ("powf", powf),
@@ -1052,6 +1278,8 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pthread_attr_destroy", pthread_attr_destroy),
     ("pthread_attr_setstacksize", pthread_attr_setstacksize),
     ("pthread_attr_setdetachstate", pthread_attr_setdetachstate),
+    ("pthread_attr_getstack", pthread_attr_getstack),
+    ("pthread_getattr_np", pthread_getattr_np),
     // pthread mutex
     ("pthread_mutexattr_init", pthread_mutexattr_init),
     ("pthread_mutexattr_destroy", pthread_mutexattr_destroy),
@@ -1059,6 +1287,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pthread_mutex_init", pthread_mutex_init),
     ("pthread_mutex_destroy", pthread_mutex_destroy),
     ("pthread_mutex_lock", pthread_mutex_lock),
+    ("pthread_mutex_trylock", pthread_mutex_trylock),
     ("pthread_mutex_unlock", pthread_mutex_unlock),
     // pthread rwlock
     ("pthread_rwlock_init", pthread_rwlock_init),
@@ -1107,6 +1336,10 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("getpid", procenv::getpid),
     ("sched_getcpu", procenv::sched_getcpu),
     ("arc4random_buf", procenv::arc4random_buf),
+    // M6's network run, one call after `getsockname`: OpenSSL seeding its DRBG for the TLS
+    // handshake. The same entropy source as `arc4random_buf` with the interface's own 256-byte
+    // bound on top. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records how it was found.
+    ("getentropy", procenv::getentropy),
     ("getauxval", procenv::getauxval),
     ("getenv", procenv::getenv),
     ("__system_property_get", procenv::system_property_get),
@@ -1133,9 +1366,16 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("open", files::open),
     ("__open_2", files::open_2),
     ("close", files::close),
-    ("read", files::read),
+    // ---- M6: `read`, `write` and `__write_chk` are **dispatched** through `net` rather than
+    // bound straight to `files`. `libroblox.so` imports no `recv` and no `send` at all -- MEASURED
+    // from the APK's own undefined-symbol table -- so the stream data path over a socket is these
+    // three, which is what OpenSSL's `readsocket`/`writesocket` expand to and the engine carries
+    // its own OpenSSL. Each tests one `is_socket` and hands everything else to the `files`
+    // function it used to be bound to, unchanged. `net`'s module documentation has the two
+    // reasons `Filesystem::read` cannot serve a socket itself.
+    ("read", net::read),
     ("pread", files::pread),
-    ("__write_chk", files::write_chk),
+    ("__write_chk", net::write_chk),
     ("access", files::access),
     ("getcwd", files::getcwd),
     ("stat", files::stat),
@@ -1154,7 +1394,12 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // argument -- see that module for what replaced it.
     ("pipe", files::pipe),
     ("fcntl", files::fcntl),
-    ("write", files::write),
+    // M6's network run, one call after `isspace`, on the same client-settings thread. FIONBIO
+    // only -- the second spelling of the `fcntl` above it, over the same descriptor table. The
+    // three SIOC* requests this binary also passes refuse by name; `files::IOCTL_REQUESTS`
+    // decodes all five call sites and says which is which.
+    ("ioctl", files::ioctl),
+    ("write", net::write),
     // ---- phase 3b: bionic's `FILE *` layer, over those descriptors. The stream logic is in
     // `omni-bionic` (D19) and what is here is the binding from a guest `FILE *` to a stream.
     ("fopen", stdio::fopen),
@@ -1186,11 +1431,41 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // has the closed argument for why `poll` and `select` need no operating system, and the
     // believable wrong answer each refusal declines to give.
     ("inet_ntop", net::inet_ntop),
+    // M6: `inet_pton`, the other direction, and NOT one of phase 3d's eight -- it is outside the
+    // 188 and was found by a guest worker thread dying on it (thread 7, start routine at image
+    // offset 0x2217f04). It is here rather than at the end of the table because it belongs
+    // beside its opposite; `BEYOND_THE_PREDICTION` in `tests/bionic.rs` is what records that it
+    // is outside the prediction, and the count assertions there are what notice.
+    ("inet_pton", net::inet_pton),
     ("gai_strerror", net::gai_strerror),
     ("poll", net::poll),
     ("select", net::select),
-    ("socket", net::socket),
     ("eventfd", net::eventfd),
+    // ---- M6: the socket surface. Four of these eight were in phase 3d's "refused by name" list
+    // and the other four are outside Task 1's 188 entirely -- `BEYOND_THE_PREDICTION` in
+    // `tests/bionic.rs` carries how each was found. D30 withdrew Global Constraint 8, and what
+    // replaced the refusal is not an open socket but `Bionic::set_network_policy`: an instance
+    // whose embedding has not named a network creates no socket at all and says so by name.
+    //
+    // `listen`, `accept`, `accept4`, `socketpair`, `epoll_*`, `sendmsg`/`recvmsg` and the `mmsg`
+    // forms are imported by `libroblox.so` and are deliberately **not here**: none has a
+    // primitive in `omni_platform::net` and no run has reached one (D17 -- importing is not
+    // calling). Each stays `Binding::Unbound`, whose call names the symbol and the guest address,
+    // and `guest_thread_failures()` now reports the first run that hits one by name.
+    ("socket", net::socket),
+    ("connect", net::connect),
+    ("bind", net::bind),
+    ("shutdown", net::shutdown),
+    // M6's network run, one refusal after the keep-alive options: the settings-fetch thread asks
+    // its connected socket which local end it was given. Outside Task 1's 188 and recorded in
+    // `BEYOND_THE_PREDICTION`. Its sibling `getpeername` is imported too and is **not** here --
+    // no run has reached it (D17).
+    ("getsockname", net::getsockname),
+    ("setsockopt", net::setsockopt),
+    ("getsockopt", net::getsockopt),
+    ("sendto", net::sendto),
+    ("__sendto_chk", net::sendto_chk),
+    ("recvfrom", net::recvfrom),
     ("getaddrinfo", net::getaddrinfo),
     ("freeaddrinfo", net::freeaddrinfo),
     // ---- phase 3e: the six nothing else claimed. Two are answered -- `time` over the same wall
@@ -1200,6 +1475,11 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // ABSENT, so a weak reference to either resolves to null and the guest's own null test
     // skips the call. `bionic::absent` has the decoded guest instructions.
     ("time", clocks::time),
+    // M6's network run, one call after the raw `getrandom`: OpenSSL turning an X.509
+    // notBefore/notAfter into a time_t. Answered from `omni_bionic::time::mktime`, written for
+    // this and tested as `gmtime`'s exact inverse. On this runtime local time IS UTC, which the
+    // handler states and says what would falsify.
+    ("mktime", clocks::mktime),
     ("clock", clocks::clock),
     ("mallinfo", guestmem::mallinfo),
     ("longjmp", signals::longjmp),

@@ -3771,3 +3771,139 @@ raw `syscall` — each say what would have to be invented, and each names what w
 bet M5 makes is the same one M4 made and it is now tested one step further: that the Java side can
 be *defined* rather than executed, and that the NDK surface under it can be *implemented* rather
 than stubbed.
+
+## D30 — Global Constraint 8 is withdrawn: the guest gets a real network
+
+**Decided by the project owner, 2026-09-22, in response to a direct question about this fork.**
+The instruction is quoted rather than paraphrased, because it overturns a rule that is reasoned
+about in five files and nobody should have to reconstruct it:
+
+> Playable Roblox is the higher-priority requirement. Networking is allowed and required. Do not
+> preserve any earlier "no runtime networking" constraint if it prevents login, settings fetches,
+> game joining, or normal Roblox operation. Implement the smallest correct networking surface
+> Roblox actually exercises, preserving instance isolation and portability. You may temporarily use
+> a measured failure path such as EAI_NONAME only as a diagnostic to reach first rendering, but do
+> not treat that as the finished behavior.
+
+### What was true, and why it was right until it was not
+
+Global Constraint 8 — "no network access at runtime" — is in every plan document from the
+foundation onward. It was never arbitrary. D6 records that the APK under test is **cheat-injected
+and carries a Luau executor**, so guest code is hostile by assumption, and a socket handed to it is
+an unrestricted host socket. `socket`, `getaddrinfo` and `freeaddrinfo` were therefore refused *by
+name*, and D25 recorded the pleasing consequence that `poll` and `select` needed no operating
+system at all, because every descriptor in this runtime was a file, a directory or a standard
+stream.
+
+The constraint was reached by a runtime that could not yet do anything a network was for. It is
+withdrawn by one that can: the engine now asks for
+`https://clientsettingscdn.roblox.com/v2/settings/application/android` by name, and everything the
+goal actually asks for — login, joining a game, playing it — is on the far side of that request.
+
+### What replaces it, and what does *not*
+
+**The threat D6 named has not gone away, and the answer to it is not a refusal any more — it is a
+seam with a policy on it.** The shape is the one `omni-platform`'s filesystem already has and for
+the same reason: `Bionic::set_filesystem_root` means a guest path resolves inside one host
+directory and nowhere else, and it was never "the guest gets no files". Networking gets the
+equivalent, so that "which network may this instance reach" is a question an embedding answers
+rather than a question this layer has no way to ask.
+
+Concretely, and these are requirements on the implementation rather than aspirations:
+
+1. **`omni-platform` grows a `net` module**, and it is the only place a socket syscall is made.
+   `ARCHITECTURE.md`'s table says "No `net` module was ever added either, and that is a result
+   rather than an omission" — that sentence is now wrong and is corrected there, not deleted.
+2. **Sockets live in the descriptor table `fs` already owns.** `poll`, `select`, `close` and
+   `fcntl` observe **one** descriptor space; two allocators handing out the same number is a defect
+   waiting for the guest to find it. `Entry` has no default arm in `readiness`, so adding a socket
+   variant forces every decision to be made rather than inherited — keep it that way.
+3. **Instance isolation is per-`Filesystem`**, i.e. per `Bionic` instance, exactly as descriptors
+   already are. Two instances cannot see each other's sockets because they cannot see each other's
+   descriptors.
+4. **D25 is superseded in its operative half.** `poll` and `select` answered `ALWAYS` because
+   nothing in the descriptor space could block; a socket can, so they now need real readiness and
+   therefore a real OS call. D25's own text says "the day a phase binds `socket` for real, that
+   test fails and this module has to grow a real readiness source with it". This is that day, and
+   it arrived exactly as written.
+5. **Portability is not relaxed.** Windows x86-64 stays the only tested host; Linux x86-64, Linux
+   ARM64, macOS x86-64 and macOS ARM64 stay required-but-unverified. D23's sharper test — *is there
+   one `std` call that serves all five targets?* — answers **partly** here, which is a third answer
+   and has to be said out loud: the seam uses `std` where `std` serves and a per-OS backend only
+   for the part it does not.
+
+   > **Amended once the seam was built, because the line this paragraph originally drew was in the
+   > wrong place.** It said `std::net` carries "connect/send/recv/non-blocking across all five" and
+   > that only readiness needs a backend. The connect half is **false**: `std` cannot produce a
+   > socket that is not already connected or bound — `TcpStream::connect` blocks,
+   > `connect_timeout` documents a zero `Duration` as an error, and there is no `TcpStream::new`.
+   > So creation, `bind`, `connect`, four socket options and `poll` are all backend work. The line
+   > that does hold, and the one to reason with: **creating a socket is the backend; everything you
+   > can do to one once you hold it is `std`, and is written once for all five targets.**
+
+### The smallest correct surface, and how "smallest" is decided
+
+**By what the guest actually calls, measured, and not by what it imports.** `libroblox.so` imports
+thirty-odd network symbols (`socketpair`, `listen`, `accept4`, `recvmmsg`, `if_nametoindex` …) and
+importing is not calling — D17's whole point. The rule that has held all session holds here: a
+symbol is bound when a run has reached it, and `Bionic::guest_thread_failures()` now says so by
+name on the first run that does.
+
+The engine's TLS is its **own** — it carries OpenSSL — so this layer owes sockets and DNS and not
+one line of cryptography.
+
+### `EAI_NONAME` as a diagnostic, and the trap in it
+
+The owner's instruction permits a measured failure path to reach first rendering and forbids
+treating it as finished. That is worth restating as a rule, because it is `VERIFICATION.md` entry
+14's shape exactly: **a deliberate failure that gets you past a gate is indistinguishable, a week
+later, from an implementation that works.** If a temporary `EAI_NONAME` is used, it must refuse to
+be permanent — it belongs behind an explicit, loudly-printed switch, never as the default, and no
+test may assert the behaviour it produces as though it were the contract.
+
+## D4 (amendment 1) — identity fastmem does not confine the guest, and the docs said it did
+
+**Found while deciding `vkMapMemory`, and it changed the question.** The premise everyone had been
+reasoning from — written in `HANDOFF.md`, and implied by `dynarmic/mod.rs`'s own comment — was that
+a host pointer handed to the guest is useless to it because `omni_mem::admit` refuses anything
+outside `GuestSpace`. **The first half is true and the second half is false.**
+
+Verified in the source, not inferred: `crates/omni-cpu/src/dynarmic/mod.rs` sets
+`fastmem_pointer = 0`, `fastmem_address_space_bits = 64`, `silently_mirror_fastmem = false`,
+`fastmem_enabled = true`. A guest `ldr x0, [x1]` therefore compiles to a host load at exactly `x1`,
+with **no bounds check in the generated code** — which is the whole of the 30-49x that setting buys
+(n = 31, two loop shapes). The only thing that can stop such an access is a **host** page fault.
+
+So the three defences that reject a foreign address — `GuestSpace::contains`, `admit` rule 1 via
+`region_at`, and `DemandPager::handle_fault`'s `NotOurs` — all sit on paths the guest's own
+instruction stream never takes:
+
+| address the guest dereferences | what happens |
+|---|---|
+| nothing mapped anywhere in this process | host fault → pager says `NotOurs` → typed `ExitReason::MemoryFault`. **Works as documented.** |
+| mapped in this process, outside `GuestSpace` — the code cache, the thunk region, the Rust heap, a DLL, a driver's mapped memory | **no fault; read or written directly** |
+
+`admit` is what stops *this layer* dereferencing a guest-chosen number — Global Constraint 11 — and
+that is a narrower claim than guest memory isolation. The two had been conflated.
+
+### What follows, and what does not
+
+* **Omnidroid is a compatibility layer, not a sandbox**, and no document should say otherwise. D6
+  records that the APK under test is cheat-injected and carries a Luau executor; under identity
+  fastmem, guest code that computes an address reaches whatever is there. That is a property of the
+  D4 trade, not a defect introduced by anything since.
+* **It changes design decisions, immediately.** Handing the guest a host pointer does not fail
+  safely — it *works*, silently, until a shim re-validates the same pointer and refuses it far from
+  the cause. That is a worse failure mode than a refusal, and it is the argument for the
+  `VK_EXT_external_memory_host` route recorded under the `vkMapMemory` decision: memory that is
+  already inside `GuestSpace` keeps one story true on both paths.
+* **It is not a patch to apply in passing.** Isolation would mean giving up identity mapping
+  (`fastmem_pointer` at a reserved base and `address_space_bits` at the guest's real width, so an
+  out-of-range address wraps into the reservation) and paying the 30-49x, or reserving the whole
+  range around `GuestSpace` so everything outside it is guard pages. Either is a D4 decision to
+  reopen with measurements.
+
+The comment in `dynarmic/mod.rs` said a wild guest address "faults instead of aliasing a valid
+page". It is true for the row above where it is true and silent about the row where it is not —
+`VERIFICATION.md` entry 13's shape exactly, in the file whose behaviour it describes. Corrected in
+place there, under **"What fastmem does not check"**, rather than deleted.

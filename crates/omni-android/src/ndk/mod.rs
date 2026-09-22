@@ -45,6 +45,7 @@
 pub mod assets;
 pub mod config;
 mod handles;
+pub mod host_window;
 pub mod looper;
 pub mod window;
 
@@ -65,12 +66,13 @@ pub use assets::{AssetSource, OpenAsset};
 pub use config::{DeviceConfiguration, ScreenSize, ACONFIGURATION_NAVHIDDEN_NO,
     ACONFIGURATION_NAVHIDDEN_YES};
 pub use handles::{SLOT_BYTES, SLOT_MAGIC};
+pub use host_window::HostWindowSource;
 pub use looper::{
     FdRegistration, Looper, ALOOPER_EVENT_ERROR, ALOOPER_EVENT_HANGUP, ALOOPER_EVENT_INPUT,
     ALOOPER_EVENT_INVALID, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK, ALOOPER_POLL_ERROR,
     ALOOPER_POLL_TIMEOUT, ALOOPER_POLL_WAKE, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS,
 };
-pub use window::{WindowGeometry, SURFACE_CLASS};
+pub use window::{WindowBacking, WindowGeometry, WindowSource, SURFACE_CLASS};
 
 /// How many loopers one instance can hold.
 ///
@@ -201,13 +203,27 @@ pub struct Ndk {
     /// language, country, screen size and density are the *embedding's* facts, and a number this
     /// layer chose would be a number with nothing behind it.
     configuration: Mutex<Option<DeviceConfiguration>>,
-    /// What `ANativeWindow_getWidth` and `_getHeight` report.
+    /// The **constant** a host asserted `ANativeWindow_getWidth` and `_getHeight` report.
     ///
     /// **`None` by default and they refuse**, the same shape as the configuration above and as
-    /// `HwcapPolicy` (D26). There is no real surface yet — graphics is M6/M7 and `omni-gfx` is
-    /// not wired to any of this — so the dimensions are facts about the *host's* output. A
-    /// plausible 1920x1080 invented here would be a device profile nobody chose.
+    /// `HwcapPolicy` (D26). Nothing here owns a surface, so the dimensions are facts about the
+    /// *host's* output. A plausible 1920x1080 invented here would be a device profile nobody
+    /// chose.
+    ///
+    /// This is [`WindowBacking::Fixed`]'s half. [`Ndk::window_source`](Ndk::window_source) is the
+    /// other, and it **wins** — see [`ndk::window`](window)'s documentation for the precedence
+    /// and why it is by kind rather than by which call came last.
     window_geometry: Mutex<Option<WindowGeometry>>,
+    /// The **live source** a host attached, asked at every `ANativeWindow_getWidth`.
+    ///
+    /// A `Mutex` rather than the `OnceLock` the asset source uses, and the difference is not an
+    /// oversight. An asset source may not change because an open `AAsset` holds bytes that came
+    /// out of it, so a second one would orphan them. A window source holds nothing of the
+    /// guest's: a host that swaps one window for another has changed which window is on the
+    /// screen and nothing else, and it is the same freedom [`Ndk::set_window_geometry`] already
+    /// has for the same reason. There is only ever **one** source, so there are never two
+    /// answers to the question.
+    window_source: Mutex<Option<Arc<dyn WindowSource>>>,
     state: Mutex<NdkState>,
     /// How many times each named NDK function has been serviced.
     ///
@@ -271,6 +287,7 @@ impl Ndk {
             asset_source: OnceLock::new(),
             configuration: Mutex::new(None),
             window_geometry: Mutex::new(None),
+            window_source: Mutex::new(None),
             state: Mutex::new(NdkState {
                 loopers,
                 managers,
@@ -344,14 +361,79 @@ impl Ndk {
     /// reach a window the guest already holds, exactly as it does on a device:
     /// `ANativeWindow_getWidth` queries the live surface rather than a copy taken when the window
     /// was made.
+    ///
+    /// **A live source, if one has been attached, answers instead of this.** See
+    /// [`Ndk::set_window_source`] and [`ndk::window`](window)'s documentation for the precedence;
+    /// [`Ndk::window_backing`] reports which is in effect, so a host that has set both can see
+    /// which of its two decisions the guest is being told about.
     pub fn set_window_geometry(&self, geometry: WindowGeometry) {
         *self.window_geometry.lock() = Some(geometry);
     }
 
-    /// What this instance's window reports, if the embedding has decided.
+    /// The **constant** this instance was given, if the embedding decided one.
+    ///
+    /// This is [`WindowBacking::Fixed`]'s payload and nothing else: it is `None` until
+    /// [`Ndk::set_window_geometry`] is called and keeps answering that constant afterwards, even
+    /// when a live source has been attached on top of it and is what the guest is actually being
+    /// told. [`Ndk::window_client_size`] is the one that resolves the backing, and
+    /// [`Ndk::window_backing`] is the one that says which of the two is in effect.
     #[must_use]
     pub fn window_geometry(&self) -> Option<WindowGeometry> {
         *self.window_geometry.lock()
+    }
+
+    /// Back this instance's `ANativeWindow`s with something that **has** a client size.
+    ///
+    /// The live half of [`Ndk::set_window_geometry`], and the one a host with a real window on
+    /// the screen wants: `source` is asked at **every** `ANativeWindow_getWidth` and
+    /// `_getHeight`, so a resize reaches a window the guest already holds without the host
+    /// having to notice the resize at all. [`ndk::window`](window) records the measurement that
+    /// makes the difference matter — this host's surface extent drifted 41 times in 5 seconds
+    /// with the window untouched and no resize event to carry it.
+    ///
+    /// **It wins over a constant** supplied by [`Ndk::set_window_geometry`], whenever the two
+    /// have both been supplied and in whichever order. Calling it again replaces the source,
+    /// which is a host that has swapped one window for another and not a host that now has two.
+    ///
+    /// [`HostWindowSource`] is the implementation this workspace ships, over
+    /// `omni_platform::window::Window`.
+    pub fn set_window_source(&self, source: Arc<dyn WindowSource>) {
+        *self.window_source.lock() = Some(source);
+    }
+
+    /// The live source this instance was given, if one was.
+    #[must_use]
+    pub fn window_source(&self) -> Option<Arc<dyn WindowSource>> {
+        self.window_source.lock().clone()
+    }
+
+    /// Which of the two backings answers `ANativeWindow_getWidth`, or `None` for neither.
+    ///
+    /// **The detector, rather than the number.** A test that only checked that the guest read
+    /// back the window's width would pass against an instance still on a constant that happened
+    /// to equal it, which is `VERIFICATION.md` entry 11's distinction — exercising the path is
+    /// not detecting which path ran. This says which.
+    #[must_use]
+    pub fn window_backing(&self) -> Option<WindowBacking> {
+        if let Some(source) = self.window_source() {
+            return Some(WindowBacking::Live(source));
+        }
+        self.window_geometry().map(WindowBacking::Fixed)
+    }
+
+    /// What `ANativeWindow_getWidth` and `_getHeight` would answer right now, resolved through
+    /// the backing.
+    ///
+    /// `None` covers both of the cases those two calls refuse for, which is why they do not use
+    /// this: an instance with no backing at all and a live source reporting a zero-pixel client
+    /// area are different host problems with different fixes, and the refusals say which. This
+    /// is for a host or a gate that wants the number.
+    #[must_use]
+    pub fn window_client_size(&self) -> Option<WindowGeometry> {
+        match self.window_backing()? {
+            WindowBacking::Fixed(geometry) => Some(geometry),
+            WindowBacking::Live(source) => source.geometry(),
+        }
     }
 
     /// Checked guest memory over this instance's address space.

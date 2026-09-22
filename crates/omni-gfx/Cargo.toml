@@ -20,6 +20,23 @@ omni-texture = { workspace = true }
 # `cfg(target_os)` anywhere.
 omni-platform = { workspace = true }
 
+# The guest-facing Vulkan seam this crate implements: `omni_android::vulkan::VulkanHost`, in
+# `src/host.rs`.
+#
+# **The direction is the decision, and it is this way round because of `ash`.** `omni-android` must
+# build `cfg`-free for five targets and its manifest's whole argument is that
+# `cargo tree -p omni-android -e normal` contains no `ash` and no `libloading` -- the
+# `--no-default-features` build is what proves no C++ toolchain and no Vulkan SDK are needed. A
+# normal dependency the other way would put both into every build of the adapter and would
+# unscope the Global Constraint 4 exception this manifest records below. So the trait lives up
+# there, the implementation lives here, and the embedding supplies it.
+#
+# `omni-android` keeps its **dev**-dependency on this crate for `tests/ndk_host_window.rs` and
+# `tests/vulkan_instance.rs`. That is a dependency cycle only through dev-dependencies, which
+# Cargo supports: the two libraries are built in this order, and this crate's own test targets are
+# what close the loop.
+omni-android = { workspace = true }
+
 thiserror = { workspace = true }
 
 # Vulkan bindings, loaded at **runtime**.

@@ -216,6 +216,31 @@ pub enum GfxError {
         provided: usize,
     },
 
+    /// Another Vulkan stack already has a swapchain on this window.
+    ///
+    /// # Why this is an error of ours and not a `VkResult`
+    ///
+    /// The Vulkan specification permits a native window to be associated with at most one
+    /// swapchain at a time, and *allows* an implementation to report
+    /// `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` rather than requiring it. On this host nothing reports
+    /// it: there are no validation layers (`docs/research/graphics-spike.md` §6), and the spike's
+    /// own swapchain lifetime error produced zero diagnostic output and crashed `nvoglv64.dll`
+    /// instead. So the rule is enforced above the driver, by [`claim`](crate::claim), and the
+    /// refusal names the **other owner** — because "`omni_gfx::Renderer` has it" and "the guest
+    /// has it" call for opposite fixes and a `VkResult` could say neither.
+    #[error(
+        "`{owner}` already owns a swapchain on the window {window:#x}; a native window may be \
+         associated with at most one swapchain at a time, and this host has no validation layer \
+         to report a second one"
+    )]
+    WindowInUse {
+        /// Who holds the claim, as [`claim_window`](crate::claim::claim_window)'s caller named
+        /// itself.
+        owner: &'static str,
+        /// The window's own handle, so a reader can correlate it with a window they can see.
+        window: u64,
+    },
+
     /// An RGBA8 image has a zero dimension.
     ///
     /// Separate from [`GfxError::ImageLengthMismatch`] because zero is not a short buffer: a

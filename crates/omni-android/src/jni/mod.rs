@@ -522,6 +522,28 @@ impl Jni {
         self.state.lock()
     }
 
+    /// Which of this instance's locks are held **right now**, by anyone, as `(name, held)`.
+    ///
+    /// **`state` is not the only one, which is the point.** A JNI call takes `env_slots` to find
+    /// its index, `census` to count itself, and then `state` and sometimes `pool` — so a thread
+    /// reported as stopped inside a JNI handler may be waiting on any of the four, and probing
+    /// one of them proves nothing about the other three. M6 lost a measurement to exactly that:
+    /// `state_is_locked()` answered `false` for a thread that was demonstrably inside
+    /// `GetFieldID`, which was read as "not a lock" when it only meant "not *that* lock".
+    ///
+    /// `try_lock` on each, so it costs nothing until something asks, and each answer is only true
+    /// of the instant it was taken.
+    #[must_use]
+    pub fn locks_held(&self) -> Vec<(&'static str, bool)> {
+        vec![
+            ("state", self.state.try_lock().is_none()),
+            ("pool", self.pool.try_lock().is_none()),
+            ("census", self.census.try_lock().is_none()),
+            ("env_slots", self.env_slots.try_lock().is_none()),
+            ("vm_slots", self.vm_slots.try_lock().is_none()),
+        ]
+    }
+
     /// Whether the state lock is held **right now**, by anyone.
     ///
     /// # The invariant this exists to check rather than assert

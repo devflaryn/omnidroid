@@ -183,6 +183,96 @@ pub fn admit(
     })
 }
 
+/// How far a **byte-wise scan** may run from `address` without leaving the mapping it starts in.
+///
+/// # The question [`admit`] cannot answer, and the defect that proved it
+///
+/// `admit` is told a length. It walks exactly as many entries as that length needs, so
+/// `admit(address, 1, Read)` reports the end of the *first entry* — and a commit carves one mapping
+/// into a run of entries, one per OS placeholder, which are never coalesced back together. A caller
+/// that asks for one byte and then treats the returned `end` as "how far I may read" is therefore
+/// bounded by a granule boundary that the guest has never heard of and that is nowhere in its
+/// address space.
+///
+/// **MEASURED.** A real Roblox worker thread died during startup with
+///
+/// ```text
+/// `__android_log_print` was passed a string at 0x277dca62fa0 for argument 3
+///  with no NUL in the first 96 bytes
+/// ```
+///
+/// — 96 bytes being the distance to the next entry boundary, not a property of the string. The log
+/// line was perfectly ordinary and perfectly terminated; it simply straddled a granule. The thread
+/// was killed by this layer, and with it went a future that nothing else could complete.
+///
+/// So the scan needs its own question: not "may I read these `n` bytes" but "how many bytes may I
+/// read before I must stop". That is this.
+///
+/// # What it will and will not cross
+///
+/// It extends across an adjacent entry only when that entry **begins exactly where the last one
+/// ended**, belongs to **the same mapping**, permits `access`, and is **already committed**. The
+/// first three are [`admit`]'s own rule for a straddling access, kept identical here because a scan
+/// that wandered into the next `mmap` is the bug the cap exists to prevent. The fourth is this
+/// function's alone: `admit` may commit under rule 4 because it was told a length the guest is
+/// actually about to touch, and a scan has no such length — committing a whole 64 KiB run to look
+/// for a NUL would charge D15's ceiling for memory the guest never asked for. A string that really
+/// does continue into the next granule continues into one the guest wrote, which is committed.
+///
+/// `limit` caps the answer; the caller's own cap (`GuestMem::STRING_LIMIT`) is what stops a scan
+/// through a gigabyte of mapped zeroes.
+///
+/// # Errors
+///
+/// [`Refusal`], from the first entry only — an address that is not readable at all is the caller's
+/// error. Running out of *run* is not an error: the answer is simply short.
+pub fn scan_reach(
+    space: &GuestSpace,
+    address: GuestAddr,
+    access: FaultAccess,
+    limit: usize,
+) -> Result<GuestAddr, Refusal> {
+    // The first byte goes through `admit`, so it is refused by exactly the rules everything else is
+    // refused by, including rule 4's commit -- the caller is about to read that byte.
+    let first = admit(space, address, 1, access)?;
+    let Some(region) = space.region_at(address) else {
+        // `admit` just said this address is mapped, so this cannot happen without another thread
+        // having unmapped it in between. The one byte `admit` vouched for is then all that can be
+        // claimed, which is what a racing unmap leaves true.
+        return Ok(first.end);
+    };
+    // **The caller's cap, and only the caller's cap.** Clamping this to the mapping's own extent
+    // as well was one rule with two implementations, and the mutation harness said so: with both
+    // in place, `access-B2` — which removes the loop's "same mapping" test — changed nothing any
+    // input could observe, because the ceiling had already stopped the walk. A guard no input can
+    // reach is not a guard (`VERIFICATION.md` entry 12), and the pair of them made each other
+    // untestable. The loop below is the one that enforces the mapping boundary, because it is also
+    // the one that has to enforce commit and protection, and those cannot be expressed as a
+    // ceiling at all.
+    let ceiling = address.checked_add(limit).unwrap_or(GuestAddr::MAX);
+    let mut end = first.end;
+    while end < ceiling {
+        let Some(next) = space.region_at(end) else {
+            break;
+        };
+        // Four conditions, each of which a scan can actually meet, and each with a test:
+        // a hole (regions tile, so a gap is free space starting elsewhere); a *different* mapping
+        // butted against this one; a granule of this mapping that is reserved but not committed;
+        // and a range of it whose protection was dropped. `next.mapping.is_none()` is not among
+        // them because it is implied: free space has no mapping, and `region.mapping` is `Some`
+        // for anything `admit` admitted.
+        if next.start != end
+            || next.mapping != region.mapping
+            || !next.is_committed()
+            || admits_region(&next, end, 1, access).is_err()
+        {
+            break;
+        }
+        end = next.end();
+    }
+    Ok(end.min(ceiling))
+}
+
 /// Rules 1-3 of [`admit`] — mapped, whole, permitted — for a caller that already has the
 /// [`RegionInfo`].
 ///

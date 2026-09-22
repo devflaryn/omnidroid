@@ -17,6 +17,50 @@
 //!   access to an unmapped address stop *at the faulting instruction*, which is what turns it into a
 //!   typed [`ExitReason::MemoryFault`] rather than a run that carries on with garbage.
 //!
+//! # What fastmem does not check, and why every reader of this file needs to know
+//!
+//! **`admit` does not govern the guest's own loads and stores. It never has.**
+//!
+//! With `fastmem_pointer = 0` and `fastmem_address_space_bits = 64`, a guest `ldr x0, [x1]` is
+//! compiled to a host load at *exactly* `x1`. There is no bounds check, no mask and no table
+//! lookup in the generated code -- that absence is the 30-49x this setting buys. The only thing
+//! that can interrupt such an access is a **host** page fault, so:
+//!
+//! * an address with nothing mapped behind it **in this whole process** faults,
+//!   [`omni_platform::fault`] hands it to the pager, the pager answers `NotOurs` for anything
+//!   outside `GuestSpace`, and `check_halt_on_memory_access` turns it into a typed
+//!   [`ExitReason::MemoryFault`]. This is the case the comment beside `fastmem_pointer` describes
+//!   and it is real;
+//! * an address that **is** mapped in this process but is not part of `GuestSpace` -- this crate's
+//!   code cache, the boundary's thunk region, the Rust heap, a loaded DLL, a graphics driver's
+//!   mapped memory -- **does not fault, and is read or written directly.**
+//!
+//! `omni_mem::admit` is checked by [`CpuCtx::resolve`] on the *slow* path and by every handler in
+//! `omni-android` that touches a guest pointer. Those are this layer's own accesses. The guest's
+//! instruction stream does not go through either.
+//!
+//! So the sentence "`admit` refuses it, therefore the guest cannot touch it" is **false**, and it
+//! has been written down in this project more than once. What `admit` gives is that *this layer*
+//! will not be tricked into dereferencing a guest-chosen number -- which is Global Constraint 11,
+//! and which is a different and narrower claim than guest memory isolation.
+//!
+//! **Consequences, stated so they are not rediscovered:**
+//!
+//! 1. Handing the guest any host address in a register (a `vkMapMemory` result, a host callback
+//!    pointer, an allocator's return) makes that memory *work* for the guest, silently, until some
+//!    shim in `omni-android` re-validates the same pointer and refuses it a long way from the
+//!    cause. Preferring memory that is already inside `GuestSpace` is therefore not a safety
+//!    nicety, it is what keeps one story true in both places.
+//! 2. D6 records that the APK under test is cheat-injected and carries a Luau executor. Under
+//!    identity fastmem, guest code that computes an address reaches whatever is at it. This
+//!    runtime is a **compatibility layer, not a sandbox**, and nothing in it should be described
+//!    as confining guest execution.
+//! 3. Turning this into isolation is not a patch. It would mean giving up identity mapping
+//!    (`fastmem_pointer` to a reserved base, `address_space_bits` down to the guest's real width so
+//!    out-of-range wraps into the reservation) and paying the 30-49x, or reserving the entire
+//!    address range around `GuestSpace` so that everything outside it is guard pages. Both are D4
+//!    decisions to reopen with measurements, not edits to make in passing.
+//!
 //! # The three FFI hazards, and what handles each
 //!
 //! `dynarmic-sys` states them; this is where they are paid for.
@@ -66,6 +110,8 @@ use crate::thunk::{ThunkContext, ThunkFn, ThunkRegs};
 use crate::tls::{GuestTls, TlsArena};
 
 mod callbacks;
+
+pub use callbacks::HINTS_OBSERVED;
 
 pub use callbacks::BACKEND_NAME;
 
@@ -942,9 +988,12 @@ impl DynarmicCpu {
                 &*tpidrro_el0
             },
             // D4, all four fields together. `fastmem_pointer = 0` with 64 bits is the identity
-            // mapping; mirroring is off so a wild guest address faults instead of aliasing a valid
-            // page; recompiling on a fastmem failure is what routes a declined fault to the slow
-            // path, where it becomes a typed exit.
+            // mapping; mirroring is off so a guest address with nothing behind it faults instead of
+            // aliasing a valid page; recompiling on a fastmem failure is what routes a declined
+            // fault to the slow path, where it becomes a typed exit.
+            //
+            // **"Faults" means "is unmapped in the HOST process", and that is narrower than it
+            // reads.** See this module's documentation, under "What fastmem does not check".
             fastmem_enabled: i32::from(overrides.direct_access.unwrap_or(true)),
             fastmem_pointer: 0,
             fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(64),

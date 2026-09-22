@@ -32,6 +32,14 @@
 //!   hostile cases. Fifteen of its seventeen operations are `std::fs` and are implemented once;
 //!   `pread` and `statvfs` have a Windows backend and a structural unix one naming `pread(2)`
 //!   and `statvfs(3)`.
+//! * [`net`] — TCP and UDP client sockets, socket options, readiness over a set of sockets, and
+//!   name resolution. The **only** place in the workspace where a socket call is made. It is a
+//!   seam with a **policy** on it rather than an open socket: a [`Socket`](net::Socket) cannot be
+//!   created without a [`NetPolicy`](net::NetPolicy), and the default reaches nothing. Sends,
+//!   receives, `shutdown`, timeouts, `TCP_NODELAY` and resolution are portable `std` and are
+//!   implemented once; socket *creation*, `bind`, `connect`, four socket options and readiness
+//!   have a Windows backend and a structural unix one, because `std` cannot make a socket that is
+//!   not already connected or bound and has no readiness call at all.
 //! * [`window`] — a resizable desktop window, the handle a graphics backend puts a surface on,
 //!   and a **non-blocking** drain of input and lifecycle events. Implemented and run on Windows;
 //!   structural on Linux and macOS, where the window type is literally uninhabited so that the
@@ -39,11 +47,18 @@
 //!   consumer today; GameActivity's input callbacks are the other one it exists for.
 //!
 //! Threads and dynamic loading may arrive as sibling modules in later tasks.
-//! **Sockets deliberately did not.** M3 task 3's network phase found that the four socket-shaped
-//! symbols the guest reaches either need no OS call at all (`poll` and `select`, whose whole
-//! descriptor domain is [`fs`]'s and whose answer POSIX fixes for it) or must be refused by name
-//! at the adapter (`socket`, `eventfd`), so there was nothing left for a seam here to carry; D25
-//! has the argument. A later milestone that gives the guest a real network will add one.
+//! **Sockets did not, until M6, and the sentence that used to stand here is corrected rather than
+//! deleted.** It read: *M3 task 3's network phase found that the four socket-shaped symbols the
+//! guest reaches either need no OS call at all (`poll` and `select`, whose whole descriptor
+//! domain is [`fs`]'s and whose answer POSIX fixes for it) or must be refused by name at the
+//! adapter (`socket`, `eventfd`), so there was nothing left for a seam here to carry; D25 has the
+//! argument. A later milestone that gives the guest a real network will add one.*
+//!
+//! That was true of a runtime that could not yet do anything a network was for. **D30 is the
+//! milestone it predicted**: the project owner withdrew Global Constraint 8 because playable
+//! Roblox needs login, settings and a game server, and [`net`] is the seam it required. D25's own
+//! text said the day `socket` was bound for real, `poll` and `select` would have to grow a real
+//! readiness source — that day has arrived, and [`net::poll`] is it.
 //!
 //! # Not every primitive needs a `cfg`, and saying which is part of the seam
 //!
@@ -58,6 +73,15 @@
 //! are, so they are written once. `pread` is `FileExt::seek_read` on Windows and
 //! `FileExt::read_at` on unix — two traits, two modules, no single call — and `statvfs` has no
 //! `std` spelling at all, so those two get a backend and a structural unix half.
+//!
+//! [`net`] answers that question a **third** way, and D30 asked for it to be said out loud:
+//! *partly*. Once a socket exists, everything done to it is one portable `std` call on all five
+//! targets, so `send`, `recv`, `sendto`, `recvfrom`, `shutdown`, the non-blocking flag,
+//! `TCP_NODELAY`, both timeouts and the whole of name resolution are written once. But `std` has
+//! **no way to make a socket that is not already connected or bound** — `TcpStream::connect`
+//! blocks and there is no `TcpStream::new` — and it has no readiness call in any form. So socket
+//! creation, `bind`, `connect`, four socket options and `poll` have a backend, and the rest does
+//! not.
 //!
 //! That asymmetry is deliberate and is written out in each module. The five-target rule this
 //! project enforces is *never claim a platform works*, and a fabricated `Unsupported` return for
@@ -80,6 +104,7 @@ pub mod clock;
 pub mod fault;
 pub mod fs;
 pub mod log;
+pub mod net;
 pub mod process;
 pub mod vm;
 pub mod window;

@@ -60,6 +60,16 @@
 //!   [`Filesystem::pread`] exists as its own primitive rather than being built from a seek and a
 //!   read: a seek-and-read pair is not `pread`, because it moves the descriptor's own offset —
 //!   which was MEASURED here and is written up in the Windows backend.
+//!
+//! # Sockets are descriptors here, and their *operations* are not
+//!
+//! D30 point 2: `poll`, `select`, `close` and `fcntl` observe **one** descriptor space, so a
+//! socket is an [`Entry`] in this table and gets its number from [`Filesystem::attach_socket`].
+//! What it does **not** get is a transfer path through [`Filesystem::read`] and
+//! [`Filesystem::write`] — both refuse a socket by name and say where to go instead, because a
+//! socket's failures (`ECONNRESET`, `ETIMEDOUT`, `ENOTCONN`) have no spelling in [`FsErrorKind`]
+//! and a blocking socket cannot be waited out on a gate nothing in this process raises for it.
+//! [`Filesystem::socket_at`] hands the socket back and [`net`](crate::net) does the rest.
 
 mod error;
 pub mod eventfd;
@@ -333,7 +343,63 @@ enum Entry {
     /// space — and, unlike a pipe, it is **one** descriptor rather than two, so the read side and
     /// the write side of the same counter are the same number.
     EventFd(eventfd::EventFd),
+    /// A socket: the first kind here whose readiness is the **operating system's** answer rather
+    /// than this process's own state.
+    ///
+    /// See [`net`](crate::net). D30 point 2 requires it to be in this table and not in one of its
+    /// own, for the reason [`Pipe`](Entry::Pipe) already gives and one more: `close`, `fcntl` and
+    /// `poll` are written against *this* table, so a second allocator would hand out a number one
+    /// of them would answer about the wrong object. Instance isolation follows from that rather
+    /// than from anything in `net` — per-[`Filesystem`] is per-guest-instance, exactly as every
+    /// other descriptor already is.
+    ///
+    /// # Why an `Arc<Mutex<..>>` where every other kind is held directly
+    ///
+    /// Because a socket operation can **wait on the host**, and every other kind here cannot. A
+    /// pipe read is an in-process queue operation that returns immediately; a `recv` on a blocking
+    /// socket is a call into the kernel that returns when a packet arrives. Holding the table lock
+    /// across one would stop every *other* descriptor in this instance for the duration, including
+    /// the `poll` on another thread that is waiting to learn the socket became readable.
+    ///
+    /// So the handle is cloned out from under the table lock — [`Filesystem::socket_at`] — and the
+    /// socket's own lock is taken with the table lock released. The lock order is one edge, table
+    /// then socket, and nothing takes it the other way round: [`Entry::readiness`] locks the socket
+    /// while holding the table, and no path locks the table while holding a socket.
+    Socket(Arc<Mutex<crate::net::Socket>>),
 }
+
+/// The readiness a socket reports when the host's own readiness call **fails**.
+///
+/// [`Entry::readiness`] is infallible and [`crate::net::Socket::readiness`] is not, which is the
+/// one place the socket kind does not fit the table's existing shape. That seam's own
+/// documentation names the answer and this is it: `error` is what a device reports as `POLLNVAL`
+/// or `POLLERR`, and it is the only answer that does not invent readiness a caller would act on.
+/// Reporting `readable` would send a caller into a `recv` that cannot work; reporting nothing at
+/// all would make a broken socket indistinguishable from a quiet one, and a `poll` loop over it
+/// would spin until its deadline with nothing to show for it.
+const SOCKET_READINESS_UNAVAILABLE: Readiness =
+    Readiness { readable: false, writable: false, hangup: false, error: true };
+
+/// The failure readiness is an error and claims no readiness at all.
+///
+/// **A compile-time assertion rather than a test, because every term is a constant.** It was
+/// written as a test first and clippy pointed out that the comparisons fold away — the same lint,
+/// on the same ground, that moved `MAX_GUEST_FILES`'s ceiling check in `omni-android`'s bionic
+/// adapter out of a test and up beside its constant. A test that asserts `true` asserts nothing,
+/// and reads like a covered case.
+///
+/// What it pins is a relation to the two answers this constant must **not** be.
+/// [`Readiness::ALWAYS`] would send a caller into a transfer it has no evidence for; an all-false
+/// readiness would make a socket the host refuses to poll indistinguishable from a quiet one, and
+/// a `poll` loop over that spins to its deadline with nothing to show for it.
+const _: () = assert!(SOCKET_READINESS_UNAVAILABLE.error);
+const _: () = assert!(!SOCKET_READINESS_UNAVAILABLE.readable);
+const _: () = assert!(!SOCKET_READINESS_UNAVAILABLE.writable);
+const _: () = assert!(
+    SOCKET_READINESS_UNAVAILABLE.readable != Readiness::ALWAYS.readable
+        || SOCKET_READINESS_UNAVAILABLE.writable != Readiness::ALWAYS.writable
+        || SOCKET_READINESS_UNAVAILABLE.error != Readiness::ALWAYS.error
+);
 
 impl Entry {
     /// What this descriptor would do right now.
@@ -352,8 +418,46 @@ impl Entry {
             }
             Entry::Pipe(handle) => handle.readiness(),
             Entry::EventFd(counter) => counter.readiness(),
+            // **The one kind whose answer is a question for the operating system**, and therefore
+            // the one that can fail where this function cannot. See
+            // [`SOCKET_READINESS_UNAVAILABLE`] for why a refused poll is reported as an error
+            // rather than as "not ready": the two are different facts and a caller acts on them
+            // differently.
+            //
+            // A poisoned socket lock is taken over rather than panicked on, for the reason
+            // [`Filesystem::table`] gives for the table's own: a panic inside a handler is
+            // reachable from guest code, and the state behind this lock is one socket.
+            Entry::Socket(socket) => socket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .readiness()
+                .unwrap_or(SOCKET_READINESS_UNAVAILABLE),
         }
     }
+}
+
+/// Where a descriptor's readiness comes from, which is what a caller waiting on a **mixed** set
+/// has to know.
+///
+/// There is no single call that waits on this runtime's own descriptors and on the host's sockets
+/// at once: the in-process half is a condition variable ([`ReadyGate`]) and the socket half is a
+/// kernel object. A caller therefore tests everything, waits a slice on whichever side can wait,
+/// and tests again — and to do that it has to be able to ask which side each descriptor is on.
+///
+/// Answering it here rather than leaving the caller to infer it from
+/// [`Filesystem::pipe_end`] and friends is the difference between one decision and a growing list
+/// of "and also an eventfd, and also a socket" tests at every wait site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadinessSource {
+    /// A regular file, a directory, a character device or a standard stream: always ready, so
+    /// there is nothing to wait for and a caller that waits on one waits for ever.
+    Immediate,
+    /// A pipe or an eventfd: in-process state, and [`Filesystem::wait_for_readiness`] is how a
+    /// change in it is waited for.
+    Gate,
+    /// A socket: the host's own readiness call, [`crate::net::poll`], is the only thing that can
+    /// wait for it.
+    Host,
 }
 
 /// A character device the guest can open by its POSIX path.
@@ -780,6 +884,98 @@ impl Filesystem {
         }
     }
 
+    // ---------------------------------------------------------------- sockets
+
+    /// Put a socket in this instance's descriptor table and hand back its number.
+    ///
+    /// **The number is this table's and the socket is [`net`](crate::net)'s**, which is D30 point
+    /// 2 split exactly where it says to split it: that module creates a socket and hands out no
+    /// descriptor, and this one owns every number a guest can see. A socket therefore competes for
+    /// the same [`MAX_OPEN_FILES`] ceiling as a file and a pipe, which is the truth about a
+    /// process rather than a convenience — `RLIMIT_NOFILE` on a device counts sockets too.
+    ///
+    /// Closing is [`close`](Self::close) and nothing else: dropping the entry drops the
+    /// [`Socket`](crate::net::Socket), which closes the host descriptor, so there is no second
+    /// close that could be forgotten.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::TooManyOpenFiles`] when one more descriptor would take this instance past
+    /// [`MAX_OPEN_FILES`]. **The socket is dropped — and therefore closed — on that path**, which
+    /// is the only correct thing to do with a host descriptor whose number the caller will never
+    /// learn.
+    pub fn attach_socket(&self, socket: crate::net::Socket) -> FsResult<i32> {
+        const OP: &str = "socket";
+        let mut table = self.table();
+        if table.open.len() + 1 > MAX_OPEN_FILES {
+            return Err(FsError::kinded(
+                OP,
+                "a socket",
+                FsErrorKind::TooManyOpenFiles,
+                format!(
+                    "this guest instance holds {} of {MAX_OPEN_FILES} descriptors, and a socket \
+                     is one of them: a device counts sockets against RLIMIT_NOFILE too",
+                    table.open.len()
+                ),
+            ));
+        }
+        let fd = table.lowest_free_fd();
+        table.open.insert(fd, Entry::Socket(Arc::new(Mutex::new(socket))));
+        Ok(fd)
+    }
+
+    /// The socket `fd` names, as a handle that outlives the table lock.
+    ///
+    /// **The clone is the point.** Every operation on a socket is a call that may wait on the
+    /// host, and a caller that held the table lock across one would stop this instance's other
+    /// descriptors for its duration. So the handle is cloned out here, the table lock is released
+    /// when this returns, and the caller locks the socket itself. See [`Entry::Socket`] for the
+    /// lock order that makes that safe.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold, and
+    /// [`FsErrorKind::NotASocket`] for one that is open and is not a socket — which is `ENOTSOCK`,
+    /// and is what a device answers a `connect` on a file.
+    pub fn socket_at(&self, fd: i32) -> FsResult<Arc<Mutex<crate::net::Socket>>> {
+        const OP: &str = "socket_at";
+        match self.table().open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::Socket(socket)) => Ok(Arc::clone(socket)),
+            Some(_) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::NotASocket,
+                "the descriptor is open and is not a socket, so a socket operation on it is \
+                 ENOTSOCK. It is reported rather than answered, because every other descriptor \
+                 kind here would have to invent a peer, a family or a readiness it does not have",
+            )),
+        }
+    }
+
+    /// Whether `fd` is a socket. `false` for every other kind, including one that is not open.
+    #[must_use]
+    pub fn is_socket(&self, fd: i32) -> bool {
+        matches!(self.table().open.get(&fd), Some(Entry::Socket(_)))
+    }
+
+    /// Which side of a mixed wait `fd` is on, or `None` when it is not open.
+    ///
+    /// See [`ReadinessSource`]. A **total** function over the descriptor kinds, with no default
+    /// arm, for [`Entry::readiness`]'s reason: a seventh kind must decide which side it waits on
+    /// rather than inherit an answer.
+    #[must_use]
+    pub fn readiness_source(&self, fd: i32) -> Option<ReadinessSource> {
+        match self.table().open.get(&fd)? {
+            Entry::File { .. }
+            | Entry::Directory { .. }
+            | Entry::Standard(_)
+            | Entry::Device(_) => Some(ReadinessSource::Immediate),
+            Entry::Pipe(_) | Entry::EventFd(_) => Some(ReadinessSource::Gate),
+            Entry::Socket(_) => Some(ReadinessSource::Host),
+        }
+    }
+
     /// What `fd` would do right now, as `poll` and `select` ask it.
     ///
     /// # Errors
@@ -840,6 +1036,13 @@ impl Filesystem {
             None => Err(bad_fd("is_nonblocking", fd)),
             Some(Entry::Pipe(handle)) => Ok(handle.nonblocking()),
             Some(Entry::EventFd(counter)) => Ok(counter.nonblocking()),
+            // The socket's own record of the flag, which is what `set_nonblocking` put on the
+            // host descriptor. Read back from the socket rather than remembered here, so that the
+            // answer to `fcntl(F_GETFL)` cannot disagree with what the kernel was told.
+            Some(Entry::Socket(socket)) => Ok(socket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .nonblocking()),
             Some(_) => Ok(false),
         }
     }
@@ -865,6 +1068,21 @@ impl Filesystem {
                 counter.set_nonblocking(nonblocking);
                 Ok(())
             }
+            // **The host is told, not just this table.** A pipe's flag is a field this process
+            // reads on every operation; a socket's is `ioctl(FIONBIO)` on a kernel object, and a
+            // flag recorded here but never set there would make the guest's `fcntl(F_SETFL,
+            // O_NONBLOCK)` read back as done while every `recv` still blocked.
+            Some(Entry::Socket(socket)) => socket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_nonblocking(nonblocking)
+                .map_err(|error| {
+                    FsError::refused(
+                        OP,
+                        format!("fd {fd}"),
+                        format!("the host refused to change the socket's blocking mode: {error}"),
+                    )
+                }),
             // A file, a directory, a device and a standard stream all answer `Readiness::ALWAYS`,
             // so `O_NONBLOCK` on one is a request with nothing to change. Linux accepts it there;
             // this seam does not pretend to, because accepting it would be this layer claiming a
@@ -968,6 +1186,40 @@ impl Filesystem {
             Some(Entry::Pipe(handle)) => handle.read(buf),
             // As the pipe above: the table lock is held, and nothing in `eventfd` waits.
             Some(Entry::EventFd(counter)) => counter.read(buf),
+            // **`read` on a socket is `recv`, and it is refused here rather than performed, for
+            // one reason: the failure would lose its classification on the way out.**
+            //
+            // A socket fails in kinds this seam has no spelling for — `ECONNRESET`,
+            // `ECONNREFUSED`, `ETIMEDOUT`, `ENOTCONN` — and [`FsErrorKind`] is deliberately small
+            // and describes files. Performing the `recv` here would mean either flattening those
+            // onto the nearest file errno, which is the plausible-wrong-answer shape Global
+            // Constraint 1 forbids (a guest told `EPIPE` for a reset connection retries the wrong
+            // thing), or widening a *filesystem* error type with a dozen network kinds that every
+            // other operation on this seam can never produce.
+            //
+            // The second reason is about waiting rather than failing, and it is what settles it:
+            // a blocking pipe read is waited out on [`Filesystem::wait_for_readiness`], and that
+            // gate **never rises for a socket** — nothing in this process changes a socket's
+            // state. A caller that reached a socket through this path would therefore wait its
+            // whole budget on a descriptor that was ready the moment it started.
+            //
+            // So the socket path is [`Filesystem::socket_at`] plus
+            // [`Socket::recv`](crate::net::Socket::recv), which keeps the [`NetError`] the
+            // adapter turns into the guest's errno. Reachable from this public API by any caller
+            // that has a socket's number, which is why it is a refusal and not a `debug_assert`.
+            //
+            // [`NetError`]: crate::net::NetError
+            Some(Entry::Socket(_)) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "fd is a socket. `read` on one is `recv`, and this seam does not perform it: a \
+                 socket fails with ECONNRESET, ECONNREFUSED, ETIMEDOUT and ENOTCONN, none of \
+                 which FsErrorKind can express, and a blocking socket read cannot be waited out \
+                 on this instance's readiness gate because nothing in this process ever raises it \
+                 for a socket. Take the socket with `Filesystem::socket_at` and call \
+                 `omni_platform::net::Socket::recv`, which keeps the NetError kind the caller \
+                 needs to report",
+            )),
             Some(Entry::File { file, readable, guest, .. }) => {
                 if !*readable {
                     return Err(FsError::kinded(
@@ -1027,6 +1279,19 @@ impl Filesystem {
                 format!("fd {fd}"),
                 FsErrorKind::InvalidInput,
                 "a pipe has no offset to read at (ESPIPE)",
+            )),
+            // A socket is a stream of packets the network delivered, not a stored object with
+            // positions in it: there is nothing at offset *n* to read, and Linux answers `ESPIPE`
+            // here exactly as it does for a pipe. This arm is a refusal for the same reason as
+            // the pipe's — and *not* the refusal `read` and `write` give, because that one is
+            // about a classification this seam cannot carry, while this one is about an operation
+            // that does not exist on a socket at all.
+            Some(Entry::Socket(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a socket has no offset to read at (ESPIPE): what arrives is what the network \
+                 delivered, in the order it delivered it",
             )),
             Some(Entry::Directory { guest, .. }) => Err(FsError::kinded(
                 OP,
@@ -1092,6 +1357,18 @@ impl Filesystem {
             // See the note in `read`: one lock order, and nothing in `pipe` waits.
             Some(Entry::Pipe(handle)) => handle.write(buf),
             Some(Entry::EventFd(counter)) => counter.write(buf),
+            // `write` on a socket is `send`, and it is refused here for the two reasons the
+            // `read` arm gives at length: the failure kinds do not survive the trip through
+            // `FsErrorKind`, and a blocking send cannot be waited out on a gate nothing raises
+            // for a socket. `Filesystem::socket_at` plus `Socket::send` is the route.
+            Some(Entry::Socket(_)) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "fd is a socket. `write` on one is `send`; take the socket with \
+                 `Filesystem::socket_at` and call `omni_platform::net::Socket::send`, which \
+                 keeps the NetError kind — see this seam's `read` for why performing it here \
+                 would flatten ECONNRESET and EPIPE onto the same answer",
+            )),
             Some(Entry::File { file, writable, guest, .. }) => {
                 if !*writable {
                     return Err(FsError::kinded(
@@ -1233,6 +1510,25 @@ impl Filesystem {
                 modified: None,
                 created: None,
                 identity: identity(Path::new("/proc/self/fd/anon_inode:[eventfd]")),
+            }),
+            // **Zero size, and the peer is not described.** Linux's `fstat` on a socket reports
+            // `S_IFSOCK` with `st_size` 0 and no times; the address, the peer and the connection
+            // state are `getsockname`, `getpeername` and `getsockopt(SO_ERROR)`, and none of them
+            // is a question `fstat` answers. Putting the receive queue's depth in `st_size` — the
+            // way the pipe arm below legitimately does — would be inventing a number Linux does
+            // not put there, and `FIONREAD` is the call that does answer it.
+            //
+            // The identity distinguishes a socket from every other anonymous descriptor kind and
+            // does **not** distinguish two sockets from each other, which is the same limit the
+            // eventfd arm has: `identity` is derived from a path and two sockets have none.
+            Some(Entry::Socket(_)) => Ok(FileStat {
+                kind: FileKind::Other,
+                size: 0,
+                read_only: false,
+                accessed: None,
+                modified: None,
+                created: None,
+                identity: identity(Path::new("/proc/self/fd/socket")),
             }),
             Some(Entry::Pipe(handle)) => Ok(FileStat {
                 kind: FileKind::Other,
@@ -2465,5 +2761,206 @@ mod tests {
         std::fs::write(&file, b"x").expect("a file");
         let error = Filesystem::new(&file).expect_err("a root that is a file");
         assert!(matches!(error, FsError::Refused { .. }), "{error}");
+    }
+    // ============================================================ sockets in the same table
+    //
+    // **Compiled only where a backend exists**, `#[cfg(target_os = "windows")]`, for the reason
+    // `tests/net_loopback.rs` states at length: the Linux and macOS net backends are structural,
+    // so `Socket::new` cannot produce a socket there and a test that "passed" by asserting the
+    // refusal would be asserting the absence of an implementation rather than the presence of
+    // one. Every socket below is unconnected and bound to nothing, and the policy is
+    // `loopback_only`, so nothing here can reach the network even if a test were written wrongly.
+    #[cfg(target_os = "windows")]
+    mod sockets {
+        use super::*;
+        use crate::net::{IpFamily, NetPolicy, Socket, SocketKind};
+
+        /// An unconnected datagram socket under a policy that admits nothing off this machine.
+        fn a_socket() -> Socket {
+            Socket::new(SocketKind::Datagram, IpFamily::V4, Arc::new(NetPolicy::loopback_only()))
+                .expect("a datagram socket")
+        }
+
+        /// A socket's number comes out of the **same** allocator a file's does, and `close` takes
+        /// it back.
+        ///
+        /// D30 point 2 asserted as a property rather than as a comment: the defect it forbids is
+        /// two allocators handing out one number, so the test opens a file *and* a socket and
+        /// requires the numbers to differ — which is the thing a second allocator would get
+        /// wrong, and which asserting either one alone cannot see.
+        #[test]
+        fn a_socket_and_a_file_cannot_be_handed_the_same_descriptor_number() {
+            let scratch = Scratch::new("socket-fd");
+            let fs = scratch.fs();
+            let file = fs.open(b"/f.txt", write_flags()).expect("a file");
+            let sock = fs.attach_socket(a_socket()).expect("a socket");
+            assert!(sock >= FIRST_FD, "fd {sock} collides with a standard stream");
+            assert_ne!(sock, file, "one descriptor space, one allocator");
+            assert!(fs.is_socket(sock));
+            assert!(!fs.is_socket(file), "a file is not a socket");
+            assert!(fs.is_open(sock));
+
+            fs.close(sock).expect("close");
+            assert!(!fs.is_open(sock), "closing the descriptor closes the socket with it");
+            assert!(!fs.is_socket(sock));
+            assert_eq!(fs.close(sock).unwrap_err().kind(), Some(FsErrorKind::BadDescriptor));
+        }
+
+        /// `read` and `write` refuse a socket **by name**, and the refusal says where to go.
+        ///
+        /// The value of the assertion is in the second half. A refusal that merely said "not
+        /// supported" would leave the next caller to guess, and the reason this path is a refusal
+        /// at all — that a socket's failure kinds do not survive `FsErrorKind` — is exactly the
+        /// kind of reasoning that goes missing between one milestone and the next.
+        #[test]
+        fn read_and_write_on_a_socket_refuse_by_name_and_name_the_route() {
+            let scratch = Scratch::new("socket-rw");
+            let fs = scratch.fs();
+            let sock = fs.attach_socket(a_socket()).expect("a socket");
+
+            let mut buf = [0u8; 8];
+            let error = fs.read(sock, &mut buf).expect_err("read on a socket is recv");
+            assert!(matches!(error, FsError::Refused { .. }), "{error}");
+            let text = error.to_string();
+            assert!(text.contains("socket_at"), "the refusal names the route: {text}");
+            assert!(text.contains("recv"), "and the call to make: {text}");
+            assert_eq!(buf, [0u8; 8], "and it read nothing into the caller's buffer");
+
+            let error = fs.write(sock, b"bytes").expect_err("write on a socket is send");
+            assert!(matches!(error, FsError::Refused { .. }), "{error}");
+            let text = error.to_string();
+            assert!(text.contains("socket_at"), "{text}");
+            assert!(text.contains("send"), "{text}");
+        }
+
+        /// `pread` on a socket is `ESPIPE`, which is `InvalidInput` here — a *different* answer
+        /// from `read`'s refusal, because it is a different fact.
+        #[test]
+        fn a_socket_has_no_offset_to_pread_at() {
+            let scratch = Scratch::new("socket-pread");
+            let fs = scratch.fs();
+            let sock = fs.attach_socket(a_socket()).expect("a socket");
+            let mut buf = [0u8; 4];
+            let error = fs.pread(sock, &mut buf, 0).expect_err("a socket has no offset");
+            assert_eq!(error.kind(), Some(FsErrorKind::InvalidInput), "{error}");
+        }
+
+        /// `O_NONBLOCK` set through the table reaches the **socket**, and reads back from it.
+        ///
+        /// Asserted through `Filesystem::socket_at` as well as through `is_nonblocking`, because
+        /// a table that remembered the flag without telling the host would pass the second
+        /// assertion on its own — and every `recv` would still block.
+        #[test]
+        fn the_nonblocking_flag_set_through_the_table_reaches_the_socket_itself() {
+            let scratch = Scratch::new("socket-nonblock");
+            let fs = scratch.fs();
+            let sock = fs.attach_socket(a_socket()).expect("a socket");
+            assert!(!fs.is_nonblocking(sock).expect("a fresh socket blocks, as socket(2) says"));
+
+            fs.set_nonblocking(sock, true).expect("O_NONBLOCK");
+            assert!(fs.is_nonblocking(sock).expect("the table's answer"));
+            assert!(
+                fs.socket_at(sock).expect("the handle").lock().expect("not poisoned").nonblocking(),
+                "the flag was recorded in the table and never reached the socket"
+            );
+
+            fs.set_nonblocking(sock, false).expect("and back again");
+            assert!(!fs.is_nonblocking(sock).expect("the table's answer"));
+        }
+
+        /// `fstat` on a socket reports no size and no times, which is what Linux reports.
+        ///
+        /// The size assertion is the one that matters: the pipe arm beside this one legitimately
+        /// puts the buffered byte count in `st_size`, and copying that to a socket would invent a
+        /// number Linux does not put there — `FIONREAD` is the call that answers it.
+        #[test]
+        fn fstat_on_a_socket_has_no_size_and_no_times() {
+            let scratch = Scratch::new("socket-fstat");
+            let fs = scratch.fs();
+            let sock = fs.attach_socket(a_socket()).expect("a socket");
+            let stat = fs.fstat(sock).expect("fstat");
+            assert_eq!(stat.kind, FileKind::Other, "S_IFSOCK is not a regular file");
+            assert_eq!(stat.size, 0);
+            assert_eq!(stat.accessed, None);
+            assert_eq!(stat.modified, None);
+            assert_ne!(stat.identity, 0, "zero is the value no real inode has");
+        }
+
+        /// Every descriptor kind is on the side of a mixed wait that can actually wait for it.
+        ///
+        /// **Membership over all four kinds, not one of them** (VERIFICATION entry 1): a caller
+        /// that alternates between the readiness gate and the host's `select` gets the *wrong*
+        /// side wrong silently — it waits out its whole slice on a descriptor that was already
+        /// ready — so each kind is named here rather than inferred.
+        #[test]
+        fn each_descriptor_kind_waits_on_the_side_that_can_wake_it() {
+            let scratch = Scratch::new("socket-source");
+            let fs = scratch.fs();
+            let file = fs.open(b"/f.txt", write_flags()).expect("a file");
+            let (read_fd, _write_fd) = fs.pipe().expect("a pipe");
+            let event = fs.eventfd(0, 0).expect("an eventfd");
+            let sock = fs.attach_socket(a_socket()).expect("a socket");
+
+            assert_eq!(fs.readiness_source(file), Some(ReadinessSource::Immediate));
+            assert_eq!(fs.readiness_source(STDOUT_FD), Some(ReadinessSource::Immediate));
+            assert_eq!(fs.readiness_source(read_fd), Some(ReadinessSource::Gate));
+            assert_eq!(fs.readiness_source(event), Some(ReadinessSource::Gate));
+            assert_eq!(fs.readiness_source(sock), Some(ReadinessSource::Host));
+            assert_eq!(fs.readiness_source(9_999), None, "a descriptor that is not open");
+        }
+
+        /// `socket_at` on a descriptor that is not a socket is `ENOTSOCK`, and on one that is not
+        /// open is `EBADF`. The two are different facts and stay different answers.
+        #[test]
+        fn socket_at_tells_not_a_socket_apart_from_not_open() {
+            let scratch = Scratch::new("socket-at");
+            let fs = scratch.fs();
+            let file = fs.open(b"/f.txt", write_flags()).expect("a file");
+            assert_eq!(
+                fs.socket_at(file).unwrap_err().kind(),
+                Some(FsErrorKind::NotASocket),
+                "a file is open and is not a socket"
+            );
+            assert_eq!(fs.socket_at(9_999).unwrap_err().kind(), Some(FsErrorKind::BadDescriptor));
+        }
+
+        /// A fresh socket is **not readable**, and it answers at all — which is what
+        /// `Entry::readiness` having no default arm was for.
+        ///
+        /// `Readiness::ALWAYS` is asserted *against* rather than for: it is a regular file's
+        /// answer, and a socket variant that had inherited it would send a caller into a `recv`
+        /// with nothing behind it.
+        #[test]
+        fn a_socket_answers_readiness_from_the_host_rather_than_always() {
+            let scratch = Scratch::new("socket-readiness");
+            let fs = scratch.fs();
+            let sock = fs.attach_socket(a_socket()).expect("a socket");
+            let readiness = fs.readiness(sock).expect("the host answered");
+            assert!(!readiness.readable, "nothing has arrived on an unconnected datagram socket");
+            assert_ne!(readiness, Readiness::ALWAYS, "ALWAYS is a regular file's answer");
+            assert!(!readiness.error, "and the socket is not broken");
+        }
+
+        /// A socket counts against the descriptor ceiling, exactly as a file and a pipe do.
+        ///
+        /// The refusal is `EMFILE` and the table does not grow — and the socket the caller never
+        /// learned a number for is dropped, which is the only correct thing to do with a host
+        /// descriptor nothing could ever close.
+        #[test]
+        fn a_socket_counts_against_the_same_descriptor_ceiling_a_file_does() {
+            let scratch = Scratch::new("socket-ceiling");
+            let fs = scratch.fs();
+            let mut held = Vec::new();
+            while fs.open_count() < MAX_OPEN_FILES {
+                held.push(fs.attach_socket(a_socket()).expect("a socket below the ceiling"));
+            }
+            assert_eq!(fs.open_count(), MAX_OPEN_FILES);
+            let error = fs.attach_socket(a_socket()).expect_err("one past the ceiling");
+            assert_eq!(error.kind(), Some(FsErrorKind::TooManyOpenFiles), "{error}");
+            assert_eq!(fs.open_count(), MAX_OPEN_FILES, "and the table did not grow");
+
+            fs.close(held.pop().expect("a held socket")).expect("close");
+            fs.attach_socket(a_socket()).expect("the freed slot is reusable");
+        }
     }
 }

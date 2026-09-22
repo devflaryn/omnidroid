@@ -36,6 +36,13 @@ windows-sys = { workspace = true, features = [
     # the brush is null -- which it is, because the swapchain owns every pixel of the client area.
     # `Win32_UI_HiDpi` is one call, `SetProcessDpiAwarenessContext`, without which `GetClientRect`
     # reports virtualised pixels on a scaled display and every swapchain extent is wrong.
+    # The network seam (src/net/windows.rs). Winsock is the whole of it: `socket`, `bind`,
+    # `connect`, `getsockopt`/`setsockopt` and `select` -- the five calls `std::net` has no
+    # spelling for, because `std` cannot make a socket that is not already connected or bound and
+    # has no readiness call at all. `WSAStartup` is here too: a raw `socket(2)` in a process where
+    # nothing has initialised Winsock fails with WSANOTINITIALISED, and this seam may well make
+    # the first network call the runtime makes.
+    "Win32_Networking_WinSock",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

@@ -79,10 +79,17 @@
 //! name. **What would falsify this** is a real bionic `<bits/sysconf.h>`, and it is the cheapest
 //! check anyone with an NDK can run.
 //!
-//! `_SC_PHYS_PAGES` is deliberately *not* answered even though a number is available: it is the
-//! host's physical memory, which is not the guest's budget, and it is the same wrong answer
-//! `sysinfo` refuses for. `_SC_CLK_TCK`, `_SC_OPEN_MAX` and `_SC_IOV_MAX` are refused because each
-//! has a believable wrong answer and nothing here measures the right one.
+//! `_SC_PHYS_PAGES` is answered **from the embedding's memory budget**, and the reasoning that
+//! used to refuse it stands unchanged -- what it rejected was the *host's* physical memory, which
+//! is not the guest's, and it is still not answered with that. It is the same number and the same
+//! seam `sysinfo` takes, `Bionic::set_memory_budget`, so the two cannot disagree about how much
+//! memory the guest has; an instance with no budget set still refuses, by the same name and with
+//! the same instruction. MEASURED: `nativePostClientSettingsLoadedInitialization3` stopped on
+//! `sysconf(98)` once the client-settings phase got far enough to size its caches, which is
+//! exactly what the field is for.
+//!
+//! `_SC_CLK_TCK`, `_SC_OPEN_MAX` and `_SC_IOV_MAX` are still refused because each has a believable
+//! wrong answer and nothing here measures the right one.
 //!
 //! # `syscall` refuses; `sysinfo` and `prctl` answer what this runtime actually knows
 //!
@@ -280,6 +287,72 @@ pub(super) fn arc4random_buf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         }
     }
     c.ret().void();
+    Ok(())
+}
+
+/// `int getentropy(void *buffer, size_t length)`
+///
+/// **MEASURED, and it is where the TLS handshake starts.** With `getsockname` bound, the
+/// settings-fetch thread went one call further and died on this as an `Unbound`:
+/// `GuestThreadFailure { thread: 8, why: "the guest called the imported symbol `getentropy`
+/// through its thunk at 0x237481e5ec0, and nothing in the compatibility layer implements it" }`.
+/// The engine carries its own OpenSSL (D30) and OpenSSL seeds its DRBG from `getentropy` where
+/// the platform has one, which Android does from API 28.
+///
+/// **The whole of it is [`arc4random_buf`]'s body with a return value and one bound**, and the
+/// bound is the only part that is not obvious:
+///
+/// * **`length > 256` is `EIO`, not a large read.** That limit is the interface's, not an
+///   implementation detail — it is in OpenBSD's original, in POSIX's adoption of it, in glibc's
+///   `getentropy(3)` and in bionic's own `getentropy.cpp`, which tests `if (buffer_size > 256)`
+///   before anything else. A layer that served a 4 KB request would be answering a call no
+///   device answers, and the caller's own error path — OpenSSL falls back to another source —
+///   would never run here and would never be exercised anywhere else either.
+/// * **The destination is validated whole before one byte is generated**, for the reason
+///   [`arc4random_buf`] gives: a half-filled buffer and a reported failure leaves the caller
+///   unable to say which half it got. With the 256-byte bound this is one `checked_ptr` and no
+///   chunking at all.
+/// * **A host entropy failure refuses by name.** It does not fall back. `getentropy`'s entire
+///   contract is that the bytes are unpredictable; bytes from anywhere else would satisfy every
+///   test that checked the buffer had changed, and would seed a TLS session key.
+///
+/// `length == 0` writes nothing and succeeds, which is what a zero-length request means and what
+/// bionic does with one -- the bound is an upper one.
+pub(super) fn getentropy(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    /// The interface's own maximum, from bionic's `getentropy.cpp` and POSIX alike. A request
+    /// larger than this is `EIO` on a device and is `EIO` here.
+    const MAX_ENTROPY: u64 = 256;
+
+    let (buffer, length) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        if length > MAX_ENTROPY {
+            view.set_errno(omni_bionic::errno::consts::EIO);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let len = length as usize;
+        if len > 0 {
+            let at = guest_address(view.blaming(0), buffer)?;
+            let blame = Blame::new(view.symbol(), view.address(), 0);
+            view.mem().checked_ptr(at, len, true, blame)?;
+            let mut scratch = [0u8; MAX_ENTROPY as usize];
+            omni_platform::process::random_bytes(&mut scratch[..len]).map_err(|error| {
+                view.refusal(format!(
+                    "the host entropy source failed for a {len}-byte getentropy: {error}. There \
+                     is no fallback here on purpose -- getentropy's whole contract is that the \
+                     bytes are unpredictable, and anything else would seed a session key"
+                ))
+            })?;
+            view.mem().write_bytes(at, &scratch[..len], blame)?;
+        }
+        0
+    };
+    c.ret().i32(result);
     Ok(())
 }
 
@@ -512,6 +585,8 @@ const SC_PAGE_SIZE: i32 = 0x0028;
 const SC_NPROCESSORS_CONF: i32 = 0x0060;
 /// bionic's `_SC_NPROCESSORS_ONLN`.
 const SC_NPROCESSORS_ONLN: i32 = 0x0061;
+/// bionic's `_SC_PHYS_PAGES`.
+const SC_PHYS_PAGES: i32 = 0x0062;
 
 /// What a `sysconf` name is believed to be, for the refusal's diagnostic half.
 ///
@@ -527,7 +602,7 @@ fn believed_sysconf_name(name: i32) -> Option<&'static str> {
         SC_PAGE_SIZE => "_SC_PAGE_SIZE",
         SC_NPROCESSORS_CONF => "_SC_NPROCESSORS_CONF",
         SC_NPROCESSORS_ONLN => "_SC_NPROCESSORS_ONLN",
-        0x0062 => "_SC_PHYS_PAGES",
+        SC_PHYS_PAGES => "_SC_PHYS_PAGES",
         _ => return None,
     })
 }
@@ -576,6 +651,30 @@ pub(super) fn sysconf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 }
             }
         }
+        // **The embedding's budget, not the host's RAM**, which is what this name used to be
+        // refused for and what it must still never be answered with. `sysinfo` takes the same
+        // number through the same seam, so a guest that asks both ways cannot be told two
+        // different things about the memory it has.
+        SC_PHYS_PAGES => {
+            let page = state.bionic.space_page_size() as u64;
+            let Some(total) = state.bionic.memory_budget() else {
+                return Err(refuse(
+                    c,
+                    format!(
+                        "the guest asked for sysconf({name}), `_SC_PHYS_PAGES`, and nothing has                          told this instance how much memory the guest has. The host's physical                          memory is the wrong number in the one field a guest sizes a cache from,                          which is what `sysinfo` refuses for too. Call Bionic::set_memory_budget"
+                    ),
+                ));
+            };
+            // Whole pages, rounded down: a partial page is not a page a guest can have, and
+            // rounding up would promise memory the budget does not cover.
+            let Ok(pages) = i64::try_from(total / page.max(1)) else {
+                return Err(refuse(
+                    c,
+                    format!("the memory budget is {total} bytes, which is not a count of pages                              that fits a long"),
+                ));
+            };
+            pages
+        }
         other => {
             let believed = believed_sysconf_name(other).map_or_else(
                 || "no name this layer recognises".to_string(),
@@ -588,9 +687,10 @@ pub(super) fn sysconf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                      page size (`_SC_PAGESIZE` {SC_PAGESIZE}, `_SC_PAGE_SIZE` {SC_PAGE_SIZE}) and \
                      the processor count (`_SC_NPROCESSORS_CONF` {SC_NPROCESSORS_CONF}, \
                      `_SC_NPROCESSORS_ONLN` {SC_NPROCESSORS_ONLN}) because it knows both. It has \
-                     no clock tick, no descriptor ceiling of the guest's own, no `iovec` limit and \
-                     no physical memory to report, and every one of those has a believable wrong \
-                     answer available"
+                     no clock tick, no descriptor ceiling of the guest's own and no `iovec` limit \
+                     to report, and every one of those has a believable wrong answer available. \
+                     `_SC_PHYS_PAGES` ({SC_PHYS_PAGES}) is answered from the embedding's memory \
+                     budget and never from the host's RAM"
                 ),
             ));
         }
@@ -990,6 +1090,20 @@ const EFAULT: i32 = 14;
 /// `futex`, in the asm-generic numbering arm64 Linux uses.
 const SYS_FUTEX: i64 = 98;
 
+/// `getrandom`, in the asm-generic numbering arm64 Linux uses.
+///
+/// **MEASURED**: the engine's own OpenSSL issues it raw, and this is the second time this
+/// runtime has met a symbol bionic did not export on the NDK the engine was built against --
+/// `gettid` was the first, for the same reason. `getrandom(2)` arrived in Linux 3.17 and bionic
+/// grew a wrapper for it in API 28; an `libc` that predates the wrapper reaches the kernel
+/// directly, which is what `libroblox.so` does here.
+const SYS_GETRANDOM: i64 = 278;
+
+/// `GRND_NONBLOCK`: do not wait for the entropy pool to be initialised; fail with `EAGAIN`.
+const GRND_NONBLOCK: u64 = 0x0001;
+/// `GRND_RANDOM`: draw from the blocking pool rather than `urandom`.
+const GRND_RANDOM: u64 = 0x0002;
+
 /// `FUTEX_WAIT`: sleep if `*uaddr == val`.
 const FUTEX_WAIT: i32 = 0;
 /// `FUTEX_WAKE`: wake up to `val` waiters.
@@ -1330,6 +1444,88 @@ const TIMESPEC_BYTES: usize = 16;
 /// no kernel. Returning `-1`/`ENOSYS` is the believable answer and is wrong for the same reason
 /// `mlock` returning 0 was rejected in phase 2 — callers of `syscall` routinely have a fallback
 /// path for `ENOSYS`, so the gap would be silently routed around.
+/// `ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)`, reached through
+/// `syscall(278, ..)`.
+///
+/// **MEASURED, and it is where the TLS handshake stops being a guess.** With `getentropy` bound,
+/// M6's network run got as far as the client-settings HTTPS request and a guest worker thread
+/// died here: `GuestThreadFailure { thread: 6, why: "`syscall` ... the guest issued raw syscall
+/// 278 (arm64 `getrandom`)" }`. The engine carries its own OpenSSL (D30), which seeds its DRBG
+/// from `getrandom` where the wrapper is missing -- so this is `getentropy`'s sibling reached by
+/// the other road, and it is answered from the same source for the same reason.
+///
+/// # Why this one is answerable when a raw syscall usually is not
+///
+/// [`syscall`]'s refusal says the honest thing about raw syscalls in general: there is no kernel
+/// here, and `-1/ENOSYS` is the believable wrong answer because callers carry ENOSYS fallbacks
+/// and would route around the gap in silence. The three exceptions are exceptions for the same
+/// reason as each other: **the runtime has the thing being asked for, under another name.**
+/// `gettid` is `GuestThreadId`, `rt_sigprocmask` is D24's mask, `futex` is `omni-bionic`'s waiter
+/// registry -- and entropy is `omni_platform::process::random_bytes`, which `arc4random_buf` and
+/// `getentropy` already answer from. Nothing is invented; a second spelling reaches the same
+/// implementation.
+///
+/// # The two flags, and why neither changes the answer here
+///
+/// * **`GRND_NONBLOCK`** asks not to wait for the entropy pool to initialise. This host's source
+///   is `BCryptGenRandom` with the system-preferred RNG, which has no uninitialised state to wait
+///   on, so the call never blocks and the flag is satisfied by construction rather than ignored.
+/// * **`GRND_RANDOM`** asks for the blocking pool rather than `urandom`. Linux itself has treated
+///   the two as the same source since 5.6, and this host has one CSPRNG; the flag therefore
+///   selects nothing that exists. It is **accepted** rather than refused because the bytes it
+///   would select are the bytes already being returned.
+///
+/// **Any other flag bit refuses by name.** A bit nobody has decoded asks for a property this
+/// layer has not checked it provides, and `getrandom` is a call whose whole value is the property.
+///
+/// # The length
+///
+/// `getrandom` is not `getentropy`: it has **no 256-byte limit**, and a short read is a legal
+/// answer -- Linux caps a single `urandom` draw at 32 MiB and returns what it drew. This
+/// implementation fills what it was asked for in [`ENTROPY_CHUNK`]-sized host draws, so a guest
+/// asking for a terabyte cannot make this layer allocate one, and returns the full count. The
+/// destination is validated whole before the first byte is generated, exactly as
+/// [`arc4random_buf`] does and for the reason written there.
+fn getrandom(c: &mut ImportCall<'_, '_>, buf: u64, buflen: u64, flags: u64) -> AbiResult<()> {
+    /// Bytes generated host-side at a time. A guest-chosen length must never become a host-side
+    /// allocation of that length.
+    const ENTROPY_CHUNK: usize = 4096;
+
+    let state = active(c.symbol(), c.address())?;
+    let written = {
+        let view = enter(c, &state);
+        let unknown = flags & !(GRND_NONBLOCK | GRND_RANDOM);
+        if unknown != 0 {
+            return Err(view.refusal(format!(
+                "the guest issued getrandom(buf={buf:#x}, {buflen}, flags={flags:#x}) with                  {unknown:#x} beyond GRND_NONBLOCK and GRND_RANDOM. Those two ask for properties                  this host's CSPRNG has by construction; a bit nobody has decoded asks for one                  nothing here has checked, and getrandom is a call whose entire value is the                  property it was asked for"
+            )));
+        }
+        let Ok(len) = usize::try_from(buflen) else {
+            return Err(view.refusal("a getrandom length wider than the host's usize"));
+        };
+        if len > 0 {
+            let at = guest_address(view.blaming(0), buf)?;
+            let blame = Blame::new(view.symbol(), view.address(), 0);
+            view.mem().checked_ptr(at, len, true, blame)?;
+            let mut scratch = [0u8; ENTROPY_CHUNK];
+            let mut done = 0usize;
+            while done < len {
+                let take = ENTROPY_CHUNK.min(len - done);
+                omni_platform::process::random_bytes(&mut scratch[..take]).map_err(|error| {
+                    view.refusal(format!(
+                        "the host entropy source failed after {done} of {len} bytes: {error}.                          Returning the short count would look like Linux's own partial draw and                          would hand the caller bytes from nowhere for the rest"
+                    ))
+                })?;
+                view.mem().write_bytes(at + done, &scratch[..take], blame)?;
+                done += take;
+            }
+        }
+        len
+    };
+    c.ret().i32(written as i32);
+    Ok(())
+}
+
 pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (number, a1, a2, a3, a4, _a5, a6) = {
         let mut a = c.args();
@@ -1350,6 +1546,9 @@ pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     }
     if number == SYS_FUTEX {
         return futex(c, FutexArgs { uaddr: a1, op: a2 as i32, val: a3, timeout: a4, val3: a6 });
+    }
+    if number == SYS_GETRANDOM {
+        return getrandom(c, a1, a2, a3);
     }
     if number == SYS_GETTID {
         // **`gettid` is a thread identity, and this runtime has one.**

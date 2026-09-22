@@ -71,6 +71,8 @@ BIONIC_COND = "crates/omni-bionic/src/cond.rs"
 # M6: `sched_get_priority_max`/`_min`, which the engine sizes a real-time band against.
 BIONIC_METADATA = "crates/omni-bionic/src/metadata.rs"
 BIONIC_PRINTF = "crates/omni-bionic/src/printf.rs"
+# M6: the guest frame-pointer walk, which reads guest-supplied pointers (D6).
+BIONIC_UNWIND = "crates/omni-bionic/src/unwind.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
 LEAF = "crates/omni-elf/src/leaf.rs"
@@ -120,10 +122,29 @@ ADAPTER_STDIO = "crates/omni-android/src/bionic/stdio.rs"
 
 # Phase 3d/3e: the network group and the six nothing else claimed. `omni-platform` gained one
 # primitive for this phase (process CPU time) and **no socket seam at all** -- `poll` and `select`
-# answer over the descriptor table `fs` already had, which is why there is nothing to mutate on
-# the platform side of them.
+# answered over the descriptor table `fs` already had.
+#
+# **That last sentence stopped being true in M6.** D30 withdrew Global Constraint 8, `omni-platform`
+# grew a `net` module, and a socket is a descriptor in the same table -- so `poll` and `select` now
+# make a real host readiness call. The `sock-` rows below are the marshalling that came with it: a
+# `struct addrinfo` list in GUEST memory, its `sockaddr`s, and the bounded slab they live in.
 BIONIC_NET = "crates/omni-bionic/src/net.rs"
 ADAPTER_NET = "crates/omni-android/src/bionic/net.rs"
+# M6: the guest's `struct addrinfo` layout and the slab `getaddrinfo` builds a list in. Its own
+# file because every byte in it is read by the guest, and because the field ORDER is the thing
+# that is dangerous to get wrong -- bionic puts `ai_canonname` before `ai_addr` and glibc reverses
+# them, with the same `sizeof` either way.
+ADAPTER_ADDRINFO = "crates/omni-android/src/bionic/addrinfo.rs"
+
+# M6, the socket-configuration follow-on: the keep-alive TIMING options and `getsockname`.
+# `omni-platform`'s net backend is mutated for the FIRST time here, and it is the one file in
+# this workspace that knows the host's socket-option numbers. The `sockcfg-` rows are about one
+# failure mode and it is the worst kind this table has: an option number mapped to the wrong host
+# constant SUCCEEDS. `setsockopt` returns zero, the socket keeps working, and the only difference
+# is a keep-alive that fires at the wrong time on a connection nobody is watching. Linux numbers
+# these 4, 5, 6; Windows numbers the same three 3, 17, 16 and puts TCP_MAXRT on 5.
+PLATFORM_NET_WINDOWS = "crates/omni-platform/src/net/windows.rs"
+PLATFORM_NET_MOD = "crates/omni-platform/src/net/mod.rs"
 
 # Phase 3c: threads and signals.
 BIONIC_SIGNAL = "crates/omni-bionic/src/signal.rs"
@@ -1387,11 +1408,93 @@ MUTATIONS = [
      """        if next.start != covered_end || next.is_free() {""",
      MEM_AND_CPU),
 
+    # ---- a scan has no length, so it needs its own reach ----------------------------------------
+    # `scan_reach` is the bound a C-string walk uses. A2 is the defect it was written for: bounding
+    # the walk by the first entry, which is a granule boundary the guest has never heard of and
+    # which killed a guest thread on an ordinary log line. A3 is the same defect from the commit
+    # side. B2 is the over-correction -- running out of the mapping into whatever is next -- and B3
+    # lets the scan commit memory the guest never asked for, which charges D15's ceiling to look
+    # for a NUL.
+    ("access-A2", "A",
+     "a scan is bounded by its first entry, so a string that crosses a granule is refused",
+     ACCESS,
+     """    let mut end = first.end;
+    while end < ceiling {""",
+     """    let mut end = first.end;
+    while end < address {""",
+     MEM_AND_CPU),
+
+    ("access-A3", "A",
+     "the scan ignores the caller's limit and runs to the end of the mapping instead",
+     ACCESS,
+     """    let ceiling = address.checked_add(limit).unwrap_or(GuestAddr::MAX);""",
+     """    let ceiling = GuestAddr::MAX;""",
+     MEM_AND_CPU),
+
+    ("access-B2", "B",
+     "the scan crosses out of its mapping into whatever is mapped next",
+     ACCESS,
+     """        if next.start != end
+            || next.mapping != region.mapping
+            || !next.is_committed()
+            || admits_region(&next, end, 1, access).is_err()
+        {""",
+     """        if next.start != end || next.is_free() {""",
+     MEM_AND_CPU),
+
+    ("access-B3", "B",
+     "the scan looks into an uncommitted granule, committing it to hunt for a terminator",
+     ACCESS,
+     """            || !next.is_committed()
+            || admits_region(&next, end, 1, access).is_err()""",
+     """            || admits_region(&next, end, 1, access).is_err()""",
+     MEM_AND_CPU),
+
+    ("access-B4", "B",
+     "the scan reads into a range whose protection was dropped under it",
+     ACCESS,
+     """            || admits_region(&next, end, 1, access).is_err()""",
+     """            || next.is_free()""",
+     MEM_AND_CPU),
+
     # ---- omni-bionic ----------------------------------------------------------------------------
     # The crate had 126 rows' worth of workspace mutation coverage around it and NONE of its own,
     # across 12,543 lines. These rows target the claims that would be silently wrong rather than
     # loudly broken: the guest ABI's widths, the Linux errno numbering, and the two error-reporting
     # conventions that are opposites of each other.
+
+    # ---- the frame walk is evidence, and a walk that hangs is not ------------------------------
+    # `unwind::frames` reads guest-supplied pointers (D6: assume one that writes its own frame
+    # pointer). A1/A2 remove the two guards that make a hostile chain terminate; B1 removes the
+    # alignment check that comes before the read.
+    ("unwind-A1", "A",
+     "the ascent check goes, so a frame pointing at itself walks to the bound every time",
+     BIONIC_UNWIND,
+     """        if next <= fp {
+            break;
+        }""",
+     """        if next < fp {
+            break;
+        }""",
+     BIONIC),
+
+    ("unwind-A2", "A",
+     "a null return address no longer ends the chain, so the list reports zeroes as frames",
+     BIONIC_UNWIND,
+     """        if ret == 0 {
+            break;
+        }""",
+     """        if ret == u64::MAX {
+            break;
+        }""",
+     BIONIC),
+
+    ("unwind-B1", "B",
+     "the alignment check goes, so a misaligned frame pointer is read rather than rejected",
+     BIONIC_UNWIND,
+     """        if fp == 0 || fp % 8 != 0 {""",
+     """        if fp == 0 {""",
+     BIONIC),
 
     # The guest's errno numbers are LINUX numbers. The development host is Windows, whose numbering
     # is different, so a value quietly taken from the host is the classic silent-wrong-answer here.
@@ -2102,10 +2205,17 @@ MUTATIONS = [
      ANDROID),
 
     # Half a buffer of real entropy and a reported failure: the caller cannot tell which half.
+    # **Re-anchored in M6's network phase.** `getentropy` and the raw `getrandom` both validate
+    # their destination with the same one-liner, so the pattern went from one match to three and
+    # the whole-table pre-flight reported it stale -- `VERIFICATION.md` entry 8's own lesson,
+    # arriving again. The anchor now carries the comment above the call, which is unique to
+    # `arc4random_buf` and is where the reasoning for the check lives.
     ("procenv-A5", "A",
      "arc4random_buf validates one byte instead of the whole destination", ADAPTER_PROCENV,
-     """            view.mem().checked_ptr(at, len, true, blame)?;""",
-     """            view.mem().checked_ptr(at, 1, true, blame)?;""",
+     """            // reported failure — and the caller would have no way to know which half it got.
+            view.mem().checked_ptr(at, len, true, blame)?;""",
+     """            // reported failure — and the caller would have no way to know which half it got.
+            view.mem().checked_ptr(at, 1, true, blame)?;""",
      ANDROID),
 
     ("procenv-A6", "A", "__system_property_get reports the length including its NUL",
@@ -2838,12 +2948,16 @@ directory", ADAPTER_FILES,
     # Nothing in this runtime can raise an exception condition, so the exception set comes back
     # empty. Leaving the guest's own bits in it says every descriptor it asked about has one.
     # **RE-ANCHORED in M5**: the clear moved into `answer_sets`, which is now the one place any
-    # set is answered.
+    # set is answered. **RE-ANCHORED AGAIN in M6, and the second time is the lesson**
+    # (VERIFICATION entry 8): `answer_sets` grew a `Watch` return for the mixed socket/pipe wait,
+    # so `sets[2].clear();` stopped being the last line of the function and this row silently
+    # matched nothing. `--only sock` would never have seen it; the whole-table pre-flight did.
     ("net-A13", "A", "select leaves the guest's bits in the exception set",
      ADAPTER_NET,
      """    sets[2].clear();
-}""",
-     """}""",
+
+    let mut watch = Watch::default();""",
+     """    let mut watch = Watch::default();""",
      ANDROID),
 
     # Bionic converts the `timeval` before the syscall and reports a `tv_usec` outside [0, 1e6) as
@@ -2913,9 +3027,13 @@ directory", ADAPTER_FILES,
     # The cap on a wait applied to every wait, so a `poll` with a thirty-millisecond timeout is
     # refused. A guest polling with a short timeout is the ordinary case, and refusing it stops a
     # correct guest over a bound that exists for a hostile one.
+    # **Re-anchored in M6's network phase**, when the cap stopped being unconditional: a set that
+    # can become ready now waits as long as the guest asked (see `Watch::can_change` and
+    # `sockcfg-B2`). The row's meaning is unchanged -- it refuses every bounded wait -- and the
+    # `!can_change &&` is dropped along with the comparison, which is what makes it do that.
     ("net-B1", "B", "every bounded wait is refused, not only one past the cap",
      ADAPTER_NET,
-     """    if duration.as_secs() > MAX_SLEEP_SECONDS {""",
+     """    if !can_change && duration.as_secs() > MAX_SLEEP_SECONDS {""",
      """    if duration.as_millis() > 0 {""",
      ANDROID),
 
@@ -2936,6 +3054,161 @@ directory", ADAPTER_FILES,
      """    let _ = names_a_descriptor;
     let fs = Some(filesystem(view)?);""",
      ANDROID),
+
+    # ---- M6: `inet_pton`, the other direction ---------------------------------------------------
+    # Found by a guest worker thread dying on it (thread 7, start routine at image offset
+    # 0x2217f04), and the only symbol added this session that needed new computation rather than a
+    # binding. Every row below removes ONE strictness rule, because `inet_pton`'s whole reason to
+    # exist beside `inet_aton` is that it has them: each mutation turns a text the function must
+    # reject into a valid-looking address for a DIFFERENT host, which is the shape of the parser
+    # CVEs -- two parsers reading one string and disagreeing about what it names. None of them is
+    # a crash and none of them is visible in the return value alone.
+    #
+    # The parsing is mutated in `omni-bionic`, where BIND's rules live, and the one adapter row is
+    # about errno, which is the adapter's to get wrong.
+
+    # **Leading zeros.** `inet_aton` reads `010.1.1.1` as octal and names 8.1.1.1; a decimal reader
+    # names 10.1.1.1. BIND's `saw_digit && *tp == 0` refuses the spelling outright, which is the
+    # only fix that does not depend on which reading the other parser chose.
+    ("pton-A1", "A", "a leading zero is accepted, so 010.1.1.1 parses as some host or other",
+     BIONIC_NET,
+     """            if saw_digit && tmp[octet] == 0 {
+                return Ok(None);
+            }""",
+     """            if false && saw_digit && tmp[octet] == 0 {
+                return Ok(None);
+            }""",
+     BIONIC),
+
+    # **Two `::`.** How many zero groups each one stands for is undecidable, so there is no address
+    # to return -- but a parser that just skips empty groups returns one, and it is an address the
+    # guest never wrote down.
+    ("pton-A2", "A", "a second :: is accepted, so an ambiguous address parses as one of its readings",
+     BIONIC_NET,
+     """                if colonp.is_some() {
+                    return Ok(None);
+                }""",
+     """                if false && colonp.is_some() {
+                    return Ok(None);
+                }""",
+     BIONIC),
+
+    # **`dst` on a failed parse.** BIND accumulates into a local and only a complete address is
+    # copied out; handing the partial `tmp` back instead writes whatever had been parsed so far
+    # into the guest's `in6_addr` AND reports success. A caller that ignores the return value --
+    # and the ones that do not, here -- reads a different address with no sign of where it came
+    # from. This is the row that fails if the "write nothing" property stops being asserted.
+    ("pton-A3", "A", "a refused parse hands back the bytes it had, so dst receives a partial address",
+     BIONIC_NET,
+     """    // Refusal 7.
+    if tp != endp {
+        return Ok(None);
+    }""",
+     """    // Refusal 7.
+    if tp != endp {
+        return Ok(Some(tmp));
+    }""",
+     BIONIC),
+
+    # **A leading `:` that is not part of `::`.** `:1:2:3:4:5:6:7:8` has eight groups and reads as
+    # a perfectly ordinary address once the stray colon is swallowed.
+    ("pton-A4", "A", "a stray leading colon is swallowed instead of refused",
+     BIONIC_NET,
+     """        if scan.at(1)? != Ch::Byte(b':') {
+            return Ok(None);
+        }""",
+     """        if false {
+            return Ok(None);
+        }""",
+     BIONIC),
+
+    # **A `::` that stands for no groups at all.** `1:2:3:4:5:6:7:8::` is already sixteen bytes, so
+    # the `::` compresses nothing -- and `::` is defined to stand for one group or more. Without
+    # `tp == endp` it parses as the eight groups with the colons ignored.
+    ("pton-A5", "A", "a :: in an already-full address is ignored rather than refused",
+     BIONIC_NET,
+     """        if tp == endp {
+            return Ok(None);
+        }""",
+     """        if false && tp == endp {
+            return Ok(None);
+        }""",
+     BIONIC),
+
+    # **A fifth hex digit.** `12345::` would take only the low sixteen bits and parse as `2345::`,
+    # which is a real address and the wrong one -- the silent-truncation form of this defect.
+    ("pton-A6", "A", "a fifth hex digit is taken, so a group truncates to its low sixteen bits",
+     BIONIC_NET,
+     """            if seen_xdigits > 4 {
+                return Ok(None);
+            }""",
+     """            if seen_xdigits > 5 {
+                return Ok(None);
+            }""",
+     BIONIC),
+
+    # **A trailing `:`.** BIND looks one character ahead at each separator precisely for this, and
+    # without it `1:2:3:4:5:6:7:8:` and `1::2:` both parse.
+    ("pton-A7", "A", "a trailing colon separates nothing and is accepted anyway",
+     BIONIC_NET,
+     """            if scan.at(i)? == Ch::End {
+                return Ok(None);
+            }""",
+     """            if false {
+                return Ok(None);
+            }""",
+     BIONIC),
+
+    # **Shorthand.** `inet_aton("127.1")` is 127.0.0.1 and `inet_aton("127")` is 0.0.0.127;
+    # `inet_pton` takes four octets or nothing. Without `octets < 4` the missing ones are the zeros
+    # the local array started as, so `127.1` parses -- as 127.1.0.0, which is neither reading.
+    ("pton-A8", "A", "fewer than four octets is accepted, so 127.1 parses as 127.1.0.0",
+     BIONIC_NET,
+     """    if octets < 4 {
+        return Ok(None);
+    }
+    Ok(Some(tmp))""",
+     """    if false && octets < 4 {
+        return Ok(None);
+    }
+    Ok(Some(tmp))""",
+     BIONIC),
+
+    # **A 0 is a parse answer, not an error.** Setting errno for it is the believable wrong answer:
+    # it reads as diligence, and it breaks the standard "try AF_INET, then AF_INET6" routine, whose
+    # second call has to see the errno from the attempt that was MEANT to fail.
+    ("pton-A9", "A", "a 0 from inet_pton sets errno, so the family-probing idiom reads the wrong one",
+     ADAPTER_NET,
+     """            Ok(Ok(false)) => 0,""",
+     """            Ok(Ok(false)) => {
+                view.set_errno(consts::EINVAL);
+                0
+            }""",
+     ANDROID),
+
+    # The over-correction, and it is the one a careful reader makes: a zero octet looks like the
+    # leading zero the rule above refuses, so the check fires on the first digit rather than on a
+    # digit that FOLLOWS a zero -- and 0.0.0.0 and 10.0.0.1 stop being addresses.
+    ("pton-B1", "B", "every zero octet is read as a leading zero, so 10.0.0.1 is refused",
+     BIONIC_NET,
+     """            if saw_digit && tmp[octet] == 0 {""",
+     """            if tmp[octet] == 0 {""",
+     BIONIC),
+
+    # The second over-correction, and it is `inet_ntop`'s own rule in the wrong direction: BIND
+    # will not PRINT a `::` that stands for a single zero group (`best.len > 1`), which is a
+    # formatting rule and says nothing about what may be READ. `1:2:3:4:5:6::8` is legal input.
+    ("pton-B2", "B", ":: is required to stand for two groups, which is a printing rule not a parsing one",
+     BIONIC_NET,
+     """        if tp == endp {
+            return Ok(None);
+        }
+        // Slide everything after the run to the end""",
+     """        if tp + 2 >= endp {
+            return Ok(None);
+        }
+        // Slide everything after the run to the end""",
+     BIONIC),
 
     # ================================================================ phase 3e: the last six
 
@@ -4260,8 +4533,8 @@ directory", ADAPTER_FILES,
 
     ("park-A2", "A", "the park witness names the mutex as the condition variable",
      ADAPTER_HANDLERS,
-     """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex);""",
-     """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, mutex, mutex);""",
+     """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex, stack);""",
+     """    let _parked = state.bionic.park("pthread_cond_wait", state.thread, mutex, mutex, stack);""",
      ANDROID),
 
     # ---- ANativeWindow (M6). The five symbols `libroblox.so` imports. -------------------------
@@ -5210,6 +5483,327 @@ directory", ADAPTER_FILES,
      """            }
             let address = pc as GuestAddr;""",
      CPU),
+
+    # ======================================= M6: the two symbols a guest WORKER THREAD died on
+    #
+    # `pthread_getattr_np` and `pthread_mutex_trylock`, both found by `guest_thread_failures`
+    # rather than by a downcall stopping. The first needed new logic -- it is the first member of
+    # the attr family that reports a LIVE thread, so `pthread_create` had to start recording
+    # where it puts a stack -- and the second needed only its binding, because
+    # `omni_bionic::mutex::trylock` has been written and unit-tested since phase 3c.
+    #
+    # Every row below keeps the answer *plausible*, which is the only kind worth writing here: a
+    # stack base one guard page out is a real, readable, writable address in the right mapping,
+    # and nothing a caller can check would notice it.
+
+    # The guard page reported as part of the stack. The base then names a PROT_NONE page, so the
+    # thread that writes to the byte it was told is its lowest faults -- and a garbage collector
+    # scanning from it would fault on the first word.
+    ("worker-A1", "A", "the reported stack base is the mapping's, not the first byte above the guard",
+     ADAPTER_THREADS,
+     """            base: stack_base + guard,""",
+     """            base: stack_base,""",
+     ANDROID),
+
+    # The same error from the other end: the size grown by the guard instead of the base moved.
+    # `base + size` then runs one page past the top of the mapping, which is the direction that
+    # makes a "how much stack is left" calculation too generous rather than too small.
+    ("worker-A2", "A", "the guard is folded into the reported stack size",
+     ADAPTER_THREADS,
+     """            size: stack_bytes,
+            guard,""",
+     """            size: stack_bytes + guard,
+            guard,""",
+     ANDROID),
+
+    # The identity test dropped, so every question is answered from the CALLING thread's record.
+    # An unknown `pthread_t` stops being ESRCH and a known one gets somebody else's 256 KiB --
+    # the one wrong answer a caller cannot detect, because the range it is handed is real.
+    ("worker-A3", "A", "pthread_getattr_np answers any pthread_t from the calling thread's own stack",
+     ADAPTER_THREADS,
+     """    if thid != me.0 {""",
+     """    if thid != me.0 && thid == u64::MAX {""",
+     ANDROID),
+
+    # The detach state guessed rather than read from the instance's record. JOINABLE is the
+    # flattering direction: it is what most threads are, and the one it is wrong for is the one
+    # nobody may join.
+    ("worker-A4", "A", "the detach state is assumed joinable instead of read from the live record",
+     ADAPTER_THREADS,
+     """    let detached = v
+        .active
+        .bionic
+        .guest_thread_list()
+        .into_iter()
+        .find(|summary| summary.id == me)
+        .map(|summary| summary.detached);""",
+     """    let detached = Some(false);""",
+     ANDROID),
+
+    # The measured M6 failure itself, as a row: the symbol is not bound, so the guest's call
+    # reaches `Binding::Unbound` and the worker thread that made it dies. `thread: 3`,
+    # `start_routine: 0x284d168`, at image offset 0x2b53aa0.
+    ("worker-A5", "A", "pthread_mutex_trylock is not bound at all, which is the M6 thread failure",
+     ADAPTER_HANDLERS,
+     """    ("pthread_mutex_trylock", pthread_mutex_trylock),""",
+     """""",
+     ANDROID),
+
+    # A second `pthread_attr_t` layout, which is what this crate's round-trip test exists to
+    # stop: the stack base written where `attr_setguardsize` puts the guard. The attr is
+    # self-consistent and wrong, and a guest reading it with `pthread_attr_getstack` is told its
+    # stack starts at zero -- the "system default" encoding -- while its guard is an address.
+    ("worker-A6", "A", "the live attr's stack base is written over the guard-size field",
+     BIONIC_METADATA,
+     """    mem.write(attr_addr + 24, &stack_base.to_le_bytes())?;""",
+     """    mem.write(attr_addr + 16, &stack_base.to_le_bytes())?;""",
+     BIONIC),
+
+    # The zeroing dropped, with the range check kept so that only the erasure changes. The
+    # reachable guest pattern is one attr used for `pthread_attr_init` + `setstacksize` +
+    # `pthread_create` and then for `pthread_getattr_np`, so the fields this call does not reach
+    # keep the earlier REQUEST -- and "how big is my stack" answers "as big as you asked for".
+    ("worker-A7", "A", "a live attr is written over whatever the caller left in the object",
+     BIONIC_METADATA,
+     """    attr_init(mem, attr_addr)?;""",
+     """    check_range(attr_addr, sizes::PTHREAD_ATTR_T)?;""",
+     BIONIC),
+
+    # The detach state constant-folded in the crate rather than in the adapter. Same wrong
+    # answer as `worker-A4` and a different place to make it, which is why both are written: one
+    # is caught by the guest-level test and one by the unit test beside the function.
+    ("worker-A8", "A", "the live attr always reports JOINABLE whatever it was given",
+     BIONIC_METADATA,
+     """    let state = if detached { detach_state::DETACHED } else { detach_state::JOINABLE };""",
+     """    let state = detach_state::JOINABLE;""",
+     BIONIC),
+
+    # The over-correction: refusing a question POSIX has an answer for. ESRCH is a value guest
+    # code branches on -- it is how a caller discovers the thread it held a `pthread_t` for has
+    # gone -- and a refusal there stops a correct guest over a case it had already handled.
+    ("worker-B1", "B", "an unknown pthread_t is refused by name instead of answered ESRCH",
+     ADAPTER_THREADS,
+     """        if !known {
+            return Ok(consts::ESRCH);
+        }""",
+     """        if !known {
+            return Err(v.refusal("this runtime does not model another thread's attributes"));
+        }""",
+     ANDROID),
+    # ---- M6: the socket surface and the `struct addrinfo` marshalling ---------------------------
+    #
+    # D30 withdrew Global Constraint 8 and this is the half of it that is bytes rather than policy.
+    # Every row below is a change that would be **silently** wrong: the guest would get a list it
+    # could walk, a `sockaddr` it could pass to `connect`, and an `EAI_*` code it has a branch for
+    # -- and each would be about the wrong address, the wrong port or the wrong failure. None of
+    # them is a crash, which is why they are here.
+
+    ("sock-A1", "A", "sin_port written in the guest's byte order instead of network order",
+     ADAPTER_ADDRINFO,
+     """            out[2..4].copy_from_slice(&port.to_be_bytes());
+            out[4..8].copy_from_slice(address);""",
+     """            out[2..4].copy_from_slice(&port.to_le_bytes());
+            out[4..8].copy_from_slice(address);""",
+     ANDROID),
+
+    ("sock-A2", "A", "sin6_flowinfo byte-swapped: a host-order field written network order",
+     ADAPTER_ADDRINFO,
+     """            out[SIN6_FLOWINFO_OFFSET..SIN6_FLOWINFO_OFFSET + 4]
+                .copy_from_slice(&flowinfo.to_le_bytes());""",
+     """            out[SIN6_FLOWINFO_OFFSET..SIN6_FLOWINFO_OFFSET + 4]
+                .copy_from_slice(&flowinfo.to_be_bytes());""",
+     ANDROID),
+
+    # The one the layout warning is about. `ai_canonname` and `ai_addr` have the same type and the
+    # structure has the same `sizeof` either way, so nothing about a size or a shape notices.
+    ("sock-A3", "A", "ai_addr written at glibc's offset instead of bionic's",
+     ADAPTER_ADDRINFO,
+     """        out[field(AI_ADDR_OFFSET)..field(AI_ADDR_OFFSET) + 8]
+            .copy_from_slice(&sockaddr_address.to_le_bytes());""",
+     """        out[field(AI_CANONNAME_OFFSET)..field(AI_CANONNAME_OFFSET) + 8]
+            .copy_from_slice(&sockaddr_address.to_le_bytes());""",
+     ANDROID),
+
+    ("sock-A4", "A", "ai_addrlen reports the slab's slot size rather than the family's",
+     ADAPTER_ADDRINFO,
+     """        out[field(AI_ADDRLEN_OFFSET)..field(AI_ADDRLEN_OFFSET) + 4]
+            .copy_from_slice(&(addrlen as u32).to_le_bytes());""",
+     """        out[field(AI_ADDRLEN_OFFSET)..field(AI_ADDRLEN_OFFSET) + 4]
+            .copy_from_slice(&(SOCKADDR_SLOT_BYTES as u32).to_le_bytes());""",
+     ANDROID),
+
+    # A list that never terminates. The guest walks `ai_next` until it is null, so this is a walk
+    # into the rest of the slab -- and the nodes there are zeroed, so it reads as an address of
+    # 0.0.0.0 rather than as a fault.
+    ("sock-A5", "A", "ai_next points past the last node instead of ending the list",
+     ADAPTER_ADDRINFO,
+     """        let next = if index + 1 < nodes.len() {
+            (at + (index + 1) * ADDRINFO_BYTES) as u64
+        } else {
+            0
+        };""",
+     """        let next = (at + (index + 1) * ADDRINFO_BYTES) as u64;""",
+     ANDROID),
+
+    # The free list matched by range rather than by the exact head. A guest that walks and frees
+    # as it goes passes `res->ai_next`, and this would release a slot it is still reading.
+    ("sock-A6", "A", "freeaddrinfo matches any pointer into the slot instead of the head",
+     ADAPTER_ADDRINFO,
+     """        match live.iter().position(|slot| *slot == Some(head)) {""",
+     """        match live.iter().position(|slot| {
+            slot.is_some_and(|at| head >= at && head < at + ADDRINFO_RESULT_BYTES)
+        }) {""",
+     ANDROID),
+
+    ("sock-A7", "A", "a full slab reuses a live slot instead of refusing",
+     ADAPTER_ADDRINFO,
+     """        let index = live.iter().position(Option::is_none)?;""",
+     """        let index = live.iter().position(Option::is_none).unwrap_or(0);""",
+     ANDROID),
+
+    # D30 names this one as the trap in as many words: an `EAI_*` for a failure nobody classified
+    # tells the guest the name does not exist, which is permanent, so it stops asking for ever.
+    ("sock-A8", "A", "an unclassified resolver failure is given EAI_NONAME instead of refusing",
+     ADAPTER_NET,
+     """        // `ResolveFailure::Unclassified`, and nothing else. A wildcard because the enum is
+        // `#[non_exhaustive]`: a class added upstream without a decision here must refuse by name
+        // rather than acquire a plausible code.
+        _ => return None,""",
+     """        _ => net::EAI_NONAME,""",
+     ANDROID),
+
+    ("sock-A9", "A", "a guest sockaddr's port is read in the guest's byte order",
+     ADAPTER_ADDRINFO,
+     """            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let mut address = [0u8; 4];""",
+     """            let port = u16::from_le_bytes([bytes[2], bytes[3]]);
+            let mut address = [0u8; 4];""",
+     ANDROID),
+
+    # Rule 1 in person: an unclassified host failure given a specific, actionable errno.
+    ("sock-A10", "A", "an unclassified network failure acquires a plausible errno",
+     ADAPTER_NET,
+     """        // `NetErrorKind::Other` and nothing else. Spelled as a wildcard because the enum is
+        // `#[non_exhaustive]`, and a kind added upstream without a decision here must refuse by
+        // name rather than acquire a plausible errno.
+        _ => return None,""",
+     """        _ => consts::EIO,""",
+     ANDROID),
+
+    # The over-corrections. Each reads as *more* careful than the code it replaces, and each
+    # breaks something a real caller does.
+    ("sock-B1", "B", "freeaddrinfo(NULL) refuses by name instead of doing nothing",
+     ADAPTER_NET,
+     """    let res = c.args().next_u64()?;
+    if res == 0 {
+        return Ok(());
+    }""",
+     """    let res = c.args().next_u64()?;""",
+     ANDROID),
+
+    # Mutating the CONSTANT would not compile -- there is a `const _: () = assert!` beside it --
+    # and the harness files a mutation that does not compile as a MISS. So the row bounds the
+    # function instead, which is where a real over-correction would land anyway.
+    ("sock-B2", "B", "a socket transfer is capped at a page, below one TLS record",
+     ADAPTER_NET,
+     """    usize::try_from(count).unwrap_or(usize::MAX).min(SOCKET_IO_BLOCK)""",
+     """    usize::try_from(count).unwrap_or(usize::MAX).min(omni_platform::fs::IO_BLOCK)""",
+     ANDROID),
+
+    # ---- M6: the socket configuration the client-settings fetch actually walks -----------------
+    #
+    # Every row here has the same failure mode and it is why the prefix exists: **a wrong socket
+    # option number is accepted by the host**. There is no error, no log line and no test that
+    # merely calls the function can see it -- which is exactly the shape `VERIFICATION.md` rule 1
+    # is about, one layer lower than a stub.
+
+    ("sockcfg-A1", "A", "the guest's TCP_KEEPIDLE is routed to the probe INTERVAL instead of the idle time",
+     ADAPTER_NET,
+     """            (IPPROTO_TCP, TCP_KEEPIDLE) => int_option(4)?.and_then(|seconds| {
+                positive_seconds(seconds).map(SocketOption::KeepAliveIdle)
+            }),""",
+     """            (IPPROTO_TCP, TCP_KEEPIDLE) => int_option(4)?.and_then(|seconds| {
+                positive_seconds(seconds).map(SocketOption::KeepAliveInterval)
+            }),""",
+     ANDROID),
+
+    # The guest-side constant given the HOST's number. It compiles, it is a real Windows option,
+    # and the only thing that can tell is a test that asserts the Linux value or one that round
+    # trips three distinct values.
+    ("sockcfg-A2", "A", "TCP_KEEPINTVL carries Windows' number (17) instead of Linux's (5)",
+     ADAPTER_NET,
+     """const TCP_KEEPINTVL: i32 = 5;""",
+     """const TCP_KEEPINTVL: i32 = 17;""",
+     ANDROID),
+
+    # **MEASURED NOT CAUGHT, and kept as a miss rather than retargeted.** Zero survives every
+    # conversion between the guest and the host and means "probe with no idle time" when it
+    # arrives -- but Winsock refuses a zero keep-alive figure ITSELF, with an error this seam maps
+    # to EINVAL, so the guest sees 22 with or without the check and no test that runs on this host
+    # can separate them. Linux range-checks all three the same way. The check is for a stack that
+    # would accept zero, there is no such stack among the five targets, and `positive_seconds`'s
+    # documentation says so in as many words. Leaving the row here is the point: a row that cannot
+    # be caught on the tested host is a statement about the host, and deleting it would delete the
+    # statement.
+    ("sockcfg-A3", "A", "a zero keep-alive figure is accepted instead of EINVAL",
+     ADAPTER_NET,
+     """    u32::try_from(value).ok().filter(|seconds| *seconds > 0).map(|seconds| Duration::from_secs(u64::from(seconds)))""",
+     """    u32::try_from(value).ok().map(|seconds| Duration::from_secs(u64::from(seconds)))""",
+     ANDROID),
+
+    # `getsockname` shares `write_peer` with `recvfrom`, so one wrong answer here is two. Reporting
+    # what FITTED rather than the full length tells a caller its buffer was big enough.
+    ("sockcfg-A4", "A", "a truncated sockaddr reports the length that fitted, not the real one",
+     ADAPTER_NET,
+     """    view.mem().write_u32(length_to, len as u32, blame)""",
+     """    view.mem().write_u32(length_to, copied as u32, blame)""",
+     ANDROID),
+
+    # The read half, in the adapter: an `int` of seconds written as a 16-byte `struct timeval`.
+    ("sockcfg-A5", "A", "a keep-alive interval is written back as a struct timeval",
+     ADAPTER_NET,
+     """            OptionValue::Interval(interval) => {
+                (interval.as_secs().min(i32::MAX as u64) as i32).to_le_bytes().to_vec()
+            }""",
+     """            OptionValue::Interval(interval) => timeval_bytes(Some(interval)).to_vec(),""",
+     ANDROID),
+
+    # **The host side of the same defect**, in the only file that knows Windows' numbers. The two
+    # that are transposed here are the ones a reader is most likely to assume are the same option
+    # in both schemes, because they share a NAME.
+    ("sockcfg-A6", "A", "the host's TCP_KEEPINTVL and TCP_KEEPCNT are transposed",
+     PLATFORM_NET_WINDOWS,
+     """        IPPROTO_TCP,
+        TCP_KEEPINTVL,
+        option_i32(seconds, "TCP_KEEPINTVL (the keep-alive probe interval)")?,""",
+     """        IPPROTO_TCP,
+        TCP_KEEPCNT,
+        option_i32(seconds, "TCP_KEEPINTVL (the keep-alive probe interval)")?,""",
+     PLATFORM),
+
+    # A fraction of a second rounded rather than refused: on a host that counts these in whole
+    # seconds, 500 ms becomes 0 -- probe immediately -- and `setsockopt` answers 0.
+    ("sockcfg-B1", "B", "a fractional keep-alive figure is rounded down instead of refused",
+     PLATFORM_NET_MOD,
+     """    if value.subsec_nanos() != 0 {""",
+     """    if false {""",
+     PLATFORM),
+
+    # The predicate the wait cap turns on, which is the other half of this session's work. A
+    # `can_change` that answers false puts the 60-second bound back on a `poll` over a socket, and
+    # that refuses the 69.001s wait the engine's HTTP stack asks for over the settings socket --
+    # killing the thread carrying the connection. Anchored on the predicate rather than on
+    # `bounded_wait`'s condition because the predicate has a unit test and the condition needs an
+    # `ImportCall`, which is the same reasoning `clocks::capped` is a function for.
+    ("sockcfg-B2", "B", "a set naming a socket reports that nothing in it can become ready",
+     ADAPTER_NET,
+     """    fn can_change(&self) -> bool {
+        !self.sockets.is_empty() || self.gate
+    }""",
+     """    fn can_change(&self) -> bool {
+        self.gate
+    }""",
+     ANDROID_LIB),
 ]
 
 

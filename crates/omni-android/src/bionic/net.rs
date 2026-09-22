@@ -1,31 +1,64 @@
-//! The eight network symbols: two answered from `omni-bionic`, two implemented here, four refused
-//! by name.
+//! The network symbols: sockets, name resolution, and the two calls that watch a descriptor set.
 //!
-//! `socket`, `poll`, `select`, `eventfd`, `getaddrinfo`, `freeaddrinfo`, `gai_strerror`,
-//! `inet_ntop`.
+//! `socket`, `connect`, `bind`, `shutdown`, `setsockopt`, `getsockopt`, `getsockname`, `sendto`, `recvfrom`,
+//! `__sendto_chk`, `read`/`write` **over a socket**, `poll`, `select`, `eventfd`, `getaddrinfo`,
+//! `freeaddrinfo`, `gai_strerror`, `inet_ntop`, `inet_pton`.
 //!
-//! # The prediction this group was dispatched with, and what it actually needed
+//! # What this module used to say, and the one decision that overturned it
 //!
-//! The plan's phase-3 table lists "**Sockets and polling** — socket, poll/select, getaddrinfo"
-//! among the things `omni-platform` must grow for. **It did not have to**, and that is now the
-//! third phase running whose five-target prediction over-estimated the OS surface (files: fifteen
-//! of seventeen primitives were one portable `std` call, D23; threads: none at all, D24).
+//! Its heading read "the eight network symbols: two answered from `omni-bionic`, two implemented
+//! here, four refused by name", and the argument under it was that **no socket seam existed and
+//! none was wanted**: Global Constraint 8 said this runtime makes no network access at run time,
+//! so `socket`, `getaddrinfo` and `freeaddrinfo` were refused by name and `poll` and `select`
+//! answered over a descriptor space in which nothing could ever come from outside this process.
+//! That reasoning is **corrected in place rather than deleted**, the way the `AF_INET6` and
+//! `mallinfo` entries in this area already are, because what changed is a decision and not a
+//! mistake.
 //!
-//! The sharper test D23 proposed is *is there one `std` call that serves all five targets?*, and
-//! for this group the answer is a third thing: **there is no OS call to make at all.**
+//! **D30 withdrew Global Constraint 8.** The project owner's instruction is quoted in that record;
+//! the operative half is that playable Roblox needs login, settings and a game server, and that a
+//! measured failure path may be used as a diagnostic and never as the finished behaviour. So the
+//! refusal is gone and what replaced it is not an open socket — it is
+//! [`Bionic::set_network_policy`](super::Bionic::set_network_policy), which is the sentence
+//! `set_filesystem_root` already makes about directories: **which network may this instance reach
+//! is a question the embedding answers.** D6's threat is unchanged. An instance whose embedding
+//! has not answered it creates no socket at all, and says so by name.
 //!
 //! | symbol | where its answer comes from |
 //! |---|---|
-//! | `inet_ntop` | [`omni_bionic::net`] — formatting, no state |
-//! | `gai_strerror` | [`omni_bionic::net`] — a constant table, interned in the instance's pool |
-//! | `poll`, `select` | **here**, over `omni-platform`'s existing descriptor table. No OS call |
-//! | `socket`, `eventfd`, `getaddrinfo`, `freeaddrinfo` | **refused by name** |
+//! | `inet_ntop`, `inet_pton`, `gai_strerror` | [`omni_bionic::net`] — formatting, parsing, a constant table. No state and no OS |
+//! | `socket`, `connect`, `bind`, `shutdown`, `setsockopt`, `getsockopt`, `getsockname`, `sendto`, `recvfrom`, `__sendto_chk` | [`omni_platform::net`] — **the one place in the workspace a socket call is made** |
+//! | `getaddrinfo` | [`omni_platform::net::resolve`], with the list marshalled into the guest's own memory by [`addrinfo`](super::addrinfo) |
+//! | `freeaddrinfo` | the slab's free list, matching the head pointer this layer handed out |
+//! | `read`, `write`, `__write_chk` | **dispatched** here: a socket goes to `recv`/`send`, everything else to `files` |
+//! | `poll`, `select` | here, over `omni-platform`'s one descriptor table — which now holds sockets too |
+//! | `eventfd` | `omni_platform::fs` |
 //!
-//! So no socket seam was added to `omni-platform`, and therefore no `unsupported` arm was
-//! fabricated for Linux or macOS either — which is D22's other half: a primitive that calls no OS
-//! API must not be given one, because that is a false claim in the other direction.
+//! # Why `read` and `write` are bound here rather than in `files`
 //!
-//! # Why `poll` and `select` need no operating system — the argument, and the day it changed
+//! **Because `libroblox.so` imports no `recv` and no `send` at all.** MEASURED, from the APK's own
+//! undefined-symbol table: the stream data path is `read` and `write` on the socket descriptor —
+//! which is what OpenSSL's `readsocket`/`writesocket` expand to on every non-Windows target, and
+//! the engine carries its own OpenSSL. `recvfrom`, `sendto` and `__sendto_chk` are imported and
+//! are the datagram path; `recvmsg`, `sendmsg` and the `mmsg` forms are imported and **nothing has
+//! reached them**, so they stay `Unbound` (D17).
+//!
+//! So a socket has to be reachable through the two symbols `files` already owned, and the
+//! dispatch is one `is_socket` test at the top of each. It is here rather than in `files` for two
+//! reasons that are both about *not* flattening a failure:
+//!
+//! * a socket fails with `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT` and `ENOTCONN`, none of which
+//!   `omni_platform::fs::FsErrorKind` can express, and a socket read routed through the
+//!   filesystem seam would have to arrive as one of the file errnos or as a refusal;
+//! * a *blocking* file or pipe is waited out on `Filesystem::wait_for_readiness`, and that gate
+//!   **never rises for a socket** — nothing in this process changes a socket's state. A blocking
+//!   socket read on that path would wait its whole budget on a descriptor that was ready the
+//!   moment it started.
+//!
+//! `Filesystem::read` and `Filesystem::write` refuse a socket by name and say so, so the dispatch
+//! failing open is a loud failure rather than a silent one.
+//!
+//! # Why `poll` and `select` need an operating system now, which they did not before
 //!
 //! Until M5 the argument was that **the descriptor space they observe is entirely this runtime's
 //! own, and none of the kinds in it can block**: every descriptor was a regular file, a directory
@@ -37,25 +70,38 @@
 //!
 //! `the_descriptor_space_poll_answers_over_is_closed` asserted that mechanically, and D25 wrote
 //! down what it was for: *the day a phase binds `socket` for real, that test fails and this module
-//! has to grow a real readiness source with it.* **M5 is that day, and the symbol was `pipe`
-//! rather than `socket`** — §8 row 13a needs two of them before `initializeNativeCode` can return.
+//! has to grow a real readiness source with it.* M5 replaced the argument's first half — `pipe`
+//! made a descriptor whose readiness is state — and **M6 is the day D25 actually named.** A socket
+//! is the first descriptor here whose readiness is a question for the kernel, so `poll` and
+//! `select` now make an OS call, and `omni_platform::net::poll` is where it is made.
 //!
-//! What replaced the argument is not a weaker version of it. `omni-platform`'s
-//! [`Filesystem::readiness`] is a `match` over the descriptor kinds with **no default arm**: a
-//! file, a directory, a device and a standard stream answer [`Readiness::ALWAYS`] for the reason
-//! above, and a pipe answers from its own queue and reference counts. So the space is still
-//! closed — closed under *kinds that have decided what they answer* rather than under *kinds that
-//! cannot block* — and a sixth kind cannot be added without deciding.
-//!
-//! Still no operating system. A pipe here is an in-process byte queue; there is no OS call on
-//! either side of it.
-//!
-//! The consistency criterion is unchanged and is the one that matters: **`poll`'s answer predicts
-//! what `read` and `write` on that descriptor will actually do in this runtime**, not what they
-//! would do on a device.
+//! `omni-platform`'s [`Filesystem::readiness`] is still a `match` over the descriptor kinds with
+//! **no default arm**, which is what forced the socket variant to decide its own answer rather
+//! than inherit one — including what an infallible readiness reports when the host refuses to poll
+//! at all, which is `error` and is written up beside that arm.
 //!
 //! [`Filesystem::readiness`]: omni_platform::fs::Filesystem::readiness
 //! [`Readiness::ALWAYS`]: omni_platform::fs::Readiness::ALWAYS
+//!
+//! # Waiting on a mixed set: two sides, alternating slices, and the wakeup that would be lost
+//!
+//! A guest `poll` names pipes, eventfds **and** sockets. There is no single call that waits on
+//! both halves: the in-process half is a condition variable and the socket half is a kernel
+//! object. So the loop is *test everything, wait a slice on whichever side can wait, test again*,
+//! and [`omni_platform::fs::ReadinessSource`] is what says which side each descriptor is on.
+//!
+//! When the set is **sockets only**, the whole remaining budget goes into one
+//! `omni_platform::net::poll`, which is the cheapest and most responsive shape available. When it
+//! is **mixed**, the socket wait is capped at [`MIXED_WAIT_SLICE`] so the in-process half is
+//! re-tested that often; when it is **in-process only**, the readiness gate is waited on exactly
+//! as before.
+//!
+//! **The gate generation is read before the descriptors are tested**, in every one of those
+//! branches. A write that lands between the test and the wait raises it and the wait returns at
+//! once; reading it afterwards is the lost wakeup this project has already measured once, at
+//! 1.0104 s (`sem_post`, `VERIFICATION.md` entry 11). The hazard is worse in a mixed set than it
+//! was in a pure one, because the thread may be sleeping in `select` on the *other* side when the
+//! pipe write lands — which is exactly why the socket slice is bounded rather than open-ended.
 //!
 //! # What they do when nothing is ready, and the one thing they refuse
 //!
@@ -66,17 +112,12 @@
 //! finite timeout past that cap is refused rather than clamped, because a clamp returns `0` from a
 //! call that waited a minute when it was asked to wait a year.
 //!
-//! **That refusal survived a pipe existing, and its reason changed.** It used to rest on "none of
-//! the descriptors it named can ever become ready", which a pipe makes false. What is left is the
-//! step-budget argument alone, which is the half that was load-bearing: a host thread parked on a
-//! pipe nobody writes to is exactly as unrecoverable as one parked on a regular file.
-//!
-//! A finite timeout is a real wait on `omni-platform`'s readiness gate, re-testing the
-//! descriptors each time it rises, and a real `0` when it expires — which is what `poll` promises.
-//! **The generation is read before the descriptors are tested**, so a write landing between the
-//! test and the wait raises it and the wait returns at once. Reading it afterwards is the lost
-//! wakeup this project has already measured once, at 1.0104 s (`sem_post`, `VERIFICATION.md`
-//! entry 11).
+//! **That refusal has now outlived two of its own reasons and is kept by a third.** It rested
+//! first on "none of the descriptors it named can ever become ready", which a pipe made false, and
+//! then on "nothing outside this process can make one ready", which a socket makes false. What is
+//! left is the step-budget argument alone, which is the half that was always load-bearing: a host
+//! thread parked for ever on a socket nobody writes to is exactly as unrecoverable as one parked
+//! on a regular file. A blocking transfer is bounded the same way, by the same number.
 //!
 //! # The `-1`/`errno` versus refusal split, as the rest of the adapter draws it
 //!
@@ -86,23 +127,45 @@
 //! `revents` rather than as `-1`, because that is what `poll` does and the two calls genuinely
 //! differ here.
 //!
+//! For the socket calls the split is [`settled`]: a classified host failure becomes the guest's
+//! errno, and **everything else refuses by name**. In particular
+//! [`ResolveFailure::Unclassified`](omni_platform::net::ResolveFailure::Unclassified) is refused
+//! rather than given an `EAI_*` code, and an option outside
+//! [`SocketOption`](omni_platform::net::SocketOption) is refused through
+//! [`NetError::unimplemented_option`](omni_platform::net::NetError::unimplemented_option) carrying
+//! the level and name the guest passed. A `setsockopt` that is silently accepted is precisely the
+//! defect Global Constraint 1 is about: the caller believes the option took effect and behaves as
+//! though it had.
+//!
 //! **And on any of those failures the guest's own objects are left alone.** POSIX says a failed
 //! `select` does not modify the sets, and `poll` answers its whole array or none of it. Both are
 //! the direction review finding M1 says to err in, and `select`'s ordering — validate the
 //! timeout, then rewrite the sets — was wrong in the first version of this module.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
 use omni_bionic::net;
 use omni_mem::GuestAddr;
-use omni_platform::fs::Readiness;
+use omni_platform::fs::{Filesystem, Readiness, ReadinessSource};
+// **`platnet` rather than `net`**, because `net` in this module is already `omni_bionic::net` —
+// the pure-computation half — and the two are deliberately different crates (D19). A single
+// import name for both would make it impossible to see, at a call site, whether an OS call is
+// being made.
+use omni_platform::net as platnet;
+use omni_platform::net::{
+    ConnectOutcome, ConnectProgress, Interest, IpFamily, NetError, NetErrorKind, NetPolicy,
+    OptionValue, PollEntry, ResolveFailure, Shutdown, Socket, SocketAddress, SocketKind,
+    SocketOption, SocketQuery,
+};
 
 use crate::boundary::ImportCall;
 use crate::error::{AbiError, AbiResult};
 use crate::mem::Blame;
 
+use super::addrinfo;
 use super::files::{filesystem, settle, Settled};
 use super::view::GuestView;
 use super::{active, enter, Active, MAX_SLEEP_SECONDS};
@@ -226,6 +289,48 @@ pub(super) fn inet_ntop(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int inet_pton(int af, const char *src, void *dst)`
+///
+/// The third symbol answered out of [`omni_bionic::net`] and the first of the three that is not
+/// one of the 188: the initializers never reach it, and what found it was a guest **worker
+/// thread** dying on it — `thread 7`, start routine at image offset `0x2217f04`, calling through
+/// its thunk at `0x2c6fd3e3270`. That is the same start routine `strcspn` was found on, which is
+/// the engine's URL and address handling.
+///
+/// The marshalling is all of what is here, and the three outcomes are kept apart because the
+/// guest's branches are:
+///
+/// * **1** — `src` was converted, and `dst` holds four or sixteen bytes in network order;
+/// * **0** — `src` is not a valid address for `af`. **Not an error**, so errno is untouched:
+///   a caller that tries `AF_INET` and then `AF_INET6` would otherwise find an errno from the
+///   attempt that was *meant* to fail;
+/// * **-1** with `EAFNOSUPPORT` — `af` is neither family, which is the only one of the three
+///   that sets errno, exactly as bionic's `switch (af)` default arm does.
+///
+/// There is no `socklen_t` here and so no `W3`/`X3` question: `inet_pton` takes three arguments
+/// and the destination's size is implied by the family.
+pub(super) fn inet_pton(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (af, src, dst) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        match net::inet_pton(&mut view, af, src, dst) {
+            Ok(Ok(true)) => 1,
+            Ok(Ok(false)) => 0,
+            Ok(Err(errno)) => {
+                view.set_errno(errno);
+                -1
+            }
+            Err(fault) => return Err(view.fault(fault)),
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `const char *gai_strerror(int ecode)`
 ///
 /// Returns a pointer into the **instance's pool**, interned once in `Bionic::new`, because C says
@@ -258,29 +363,28 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         (a.next_u64()?, a.next_u64()?, a.next_i32()?)
     };
     let state = active(c.symbol(), c.address())?;
-    let first = {
+    // The second half of the pair is **whether anything this call named can become ready**,
+    // which is what decides whether the wait is a sleep or a wait for an event. See
+    // [`bounded_wait`].
+    let (first, can_change) = {
         let mut view = enter(c, &state);
         if nfds > MAX_POLL_FDS {
             // Linux's own answer for an `nfds` past the process's descriptor limit.
             view.set_errno(consts::EINVAL);
-            Some(-1)
+            (Some(-1), false)
         } else {
             // `nfds` is bounded above, so this cannot overflow.
             let bytes = nfds as usize * POLLFD_BYTES;
-            let ready = if bytes == 0 {
+            let (ready, watch) = if bytes == 0 {
                 // A zero-length array is legal and `fds` may be anything, null included — POSIX
                 // says so, and it is the idiom for "sleep for `timeout` milliseconds". Nothing is
                 // read, and in particular the descriptor table is not consulted, so a `poll` used
                 // as a sleep works on an instance that has no filesystem.
-                0
+                (0, Watch::default())
             } else {
                 poll_entries(&view, fds, bytes)?
             };
-            if ready > 0 {
-                Some(ready)
-            } else {
-                None
-            }
+            (if ready > 0 { Some(ready) } else { None }, watch.can_change())
         }
     };
     let value = match first {
@@ -290,11 +394,11 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             // refusal arrives instead of a sleep rather than after one.
             let duration =
                 if timeout < 0 { None } else { Some(Duration::from_millis(timeout as u64)) };
-            let budget = bounded_wait(c, duration)?;
+            let budget = bounded_wait(c, duration, can_change)?;
             let bytes = nfds as usize * POLLFD_BYTES;
             wait_until_ready(c, &state, budget, |view| {
                 if bytes == 0 {
-                    Ok(0)
+                    Ok((0, Watch::default()))
                 } else {
                     poll_entries(view, fds, bytes)
                 }
@@ -305,25 +409,150 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
-/// Re-test readiness every time `omni-platform`'s gate rises, until something is ready or the
-/// budget runs out.
+/// Which side of a mixed wait the descriptors a call named are on.
+///
+/// **The reason this exists is that there is no single call that waits on both sides.** The
+/// in-process half — a pipe, an eventfd — is a condition variable this process owns, and the
+/// socket half is a kernel object; `omni_platform::fs::ReadinessSource` is what says which a given
+/// descriptor is. A descriptor that is [`ReadinessSource::Immediate`] is recorded nowhere, because
+/// it is already ready and a caller that waited on one would wait for ever.
+///
+/// The interests are **unioned per descriptor**, not appended, so a `poll` array that names one
+/// socket twice — once for `POLLIN` and once for `POLLOUT` — produces one entry asking about
+/// both. That matters for more than tidiness: the same socket appearing twice would mean locking
+/// its mutex twice in one thread, which deadlocks.
+#[derive(Debug, Default)]
+struct Watch {
+    /// Every distinct socket named, with the union of what was asked about it.
+    sockets: Vec<(i32, Interest)>,
+    /// Whether anything named waits on this instance's readiness gate.
+    gate: bool,
+}
+
+impl Watch {
+    /// Whether anything in this set has a readiness that can **change**.
+    ///
+    /// **The predicate the wait cap turns on**, and it is the one [`bounded_wait`]'s refusal has
+    /// always claimed to be about: "nothing that can become ready". A socket's readiness is the
+    /// network's and an entry on the gate is another descriptor's writer, so either one makes
+    /// this call a wait for an event rather than a sleep with a timer. A set of files,
+    /// directories and standard streams makes it false -- every one of those is
+    /// `Readiness::ALWAYS`, so a wait on them has already returned.
+    fn can_change(&self) -> bool {
+        !self.sockets.is_empty() || self.gate
+    }
+
+    /// Record what one descriptor was asked about.
+    fn note(&mut self, fs: &Filesystem, fd: i32, interest: Interest) {
+        match fs.readiness_source(fd) {
+            Some(ReadinessSource::Host) => {
+                match self.sockets.iter_mut().find(|(seen, _)| *seen == fd) {
+                    Some((_, held)) => {
+                        held.readable |= interest.readable;
+                        held.writable |= interest.writable;
+                    }
+                    None => self.sockets.push((fd, interest)),
+                }
+            }
+            Some(ReadinessSource::Gate) => self.gate = true,
+            // `Immediate` is already ready, so the caller will have counted it and never reached
+            // a wait; `None` is a descriptor that is not open, which `poll` has already answered
+            // `POLLNVAL` and `select` `EBADF`. Neither is something to wait on.
+            Some(ReadinessSource::Immediate) | None => {}
+        }
+    }
+}
+
+/// Wait one step on whichever side of the set can wait, without losing a wakeup from the other.
+///
+/// The three cases, and the middle one is the whole of the mixed-set problem:
+///
+/// * **No socket.** The readiness gate is waited on for the whole remaining budget, exactly as
+///   before sockets existed. `seen` was read *before* the descriptors were tested, so a pipe write
+///   that landed in between raises the generation past it and the wait returns at once.
+/// * **Sockets and something on the gate.** No call waits on both, so the socket side is given
+///   [`MIXED_WAIT_SLICE`] and the loop re-tests everything after it. Nothing is lost — the gate
+///   generation is re-read on the next pass and a change that landed during the slice is still
+///   there — but an in-process wakeup can be **late** by up to one slice, which is why the slice
+///   is small and why it is a constant with a reason attached rather than a number.
+/// * **Sockets only.** The whole remaining budget goes into one `omni_platform::net::poll`, which
+///   wakes exactly when the kernel says so and costs nothing while it waits.
+///
+/// The socket handles are locked in **ascending descriptor order**, so two guest threads waiting
+/// on overlapping sets cannot take two locks in opposite orders. They are all held for the
+/// duration of the one readiness call and released before the next test — which is why the table
+/// lock is not held here: the order is table-then-socket everywhere, and this takes the socket
+/// locks with no table lock in hand.
+fn wait_a_slice(
+    c: &ImportCall<'_, '_>,
+    fs: &Filesystem,
+    watch: &Watch,
+    seen: u64,
+    remaining: Duration,
+) -> AbiResult<()> {
+    if watch.sockets.is_empty() {
+        fs.wait_for_readiness(seen, remaining);
+        return Ok(());
+    }
+    let mut named = watch.sockets.clone();
+    named.sort_unstable_by_key(|(fd, _)| *fd);
+    let held: Vec<(Arc<std::sync::Mutex<Socket>>, Interest)> = named
+        .into_iter()
+        // A descriptor another guest thread closed between the test and here is simply not
+        // waited on; the next pass of the loop answers `POLLNVAL` for it.
+        .filter_map(|(fd, interest)| fs.socket_at(fd).ok().map(|handle| (handle, interest)))
+        .collect();
+    if held.is_empty() {
+        fs.wait_for_readiness(seen, remaining);
+        return Ok(());
+    }
+    // **Every individual host park stays under the cap**, which is what lets `bounded_wait`
+    // honour a longer total: a mixed set is re-tested every `MIXED_WAIT_SLICE` so the in-process
+    // half is not late, and a sockets-only set parks for at most `MAX_SLEEP_SECONDS` at a time,
+    // so the sum the guest asked for is made of parks no longer than the ones `nanosleep` allows.
+    let slice = if watch.gate {
+        remaining.min(MIXED_WAIT_SLICE)
+    } else {
+        remaining.min(Duration::from_secs(MAX_SLEEP_SECONDS))
+    };
+    let guards: Vec<std::sync::MutexGuard<'_, Socket>> =
+        held.iter().map(|(handle, _)| locked(handle)).collect();
+    let mut entries: Vec<PollEntry<'_>> = guards
+        .iter()
+        .zip(held.iter())
+        .map(|(guard, (_, interest))| PollEntry::new(guard, *interest))
+        .collect();
+    // The set cannot be larger than `omni_platform::net::MAX_POLL_SOCKETS`: this instance holds
+    // at most `omni_platform::fs::MAX_OPEN_FILES` descriptors and the compile-time assertion
+    // beside that constant is what says the one bound is inside the other. A failure here is the
+    // host's readiness call failing, which is refused by name rather than reported as a timeout.
+    platnet::poll(&mut entries, slice).map_err(|error| refuse(c, error.to_string()))?;
+    Ok(())
+}
+
+/// Re-test readiness until something is ready or the budget runs out, waiting on whichever side
+/// of the descriptor set can wait.
 ///
 /// `test` is whatever the caller counts as ready — the `pollfd` array for `poll`, the three
 /// `fd_set`s for `select` — and it writes the guest's own objects back each time it runs, because
-/// the last run is the one the guest sees and the caller cannot know in advance which that is.
+/// the last run is the one the guest sees and the caller cannot know in advance which that is. It
+/// also reports a [`Watch`]: which of the descriptors it looked at are sockets and which wait on
+/// the gate, which is what the next line needs to know how to sleep.
 ///
 /// **The generation is read before `test` runs.** A write that lands between the test and the wait
 /// raises it, so the wait returns immediately rather than sleeping through the event. The other
-/// order is the lost wakeup `VERIFICATION.md` entry 11 measured at 1.0104 s.
+/// order is the lost wakeup `VERIFICATION.md` entry 11 measured at 1.0104 s — and the hazard is
+/// sharper now than it was, because with a socket in the set the thread may be asleep in the
+/// host's `select` when the pipe write lands. [`wait_a_slice`] is where that is answered.
 ///
-/// An instance with **no filesystem** cannot have a pipe, so nothing can ever raise the gate and
-/// the wait degenerates to the sleep this function replaced. That is a real branch, not a
-/// fallback: `poll(NULL, 0, 50)` as a sleep is legal on an instance that has no filesystem root.
+/// An instance with **no filesystem** has no descriptors at all, so nothing can ever become ready
+/// and the wait degenerates to a sleep. That is a real branch, not a fallback: `poll(NULL, 0, 50)`
+/// as a sleep is legal on an instance that has no filesystem root.
 fn wait_until_ready(
     c: &ImportCall<'_, '_>,
     state: &Active,
     budget: Duration,
-    mut test: impl FnMut(&GuestView<'_>) -> AbiResult<i32>,
+    mut test: impl FnMut(&GuestView<'_>) -> AbiResult<(i32, Watch)>,
 ) -> AbiResult<i32> {
     let Some(deadline) = Instant::now().checked_add(budget) else {
         // `bounded_wait` caps the budget well below anything that could do this, so this is a
@@ -336,7 +565,7 @@ fn wait_until_ready(
     };
     loop {
         let seen = fs.ready_generation();
-        let ready = {
+        let (ready, watch) = {
             let view = enter(c, state);
             test(&view)?
         };
@@ -347,7 +576,8 @@ fn wait_until_ready(
         if now >= deadline {
             return Ok(0);
         }
-        fs.wait_for_readiness(seen, deadline - now);
+        stop_requested(c, state)?;
+        wait_a_slice(c, fs, &watch, seen, deadline - now)?;
     }
 }
 
@@ -357,10 +587,13 @@ fn wait_until_ready(
 /// so an array that is only partly mapped leaves the guest's `revents` untouched rather than half
 /// updated — the same all-or-nothing shape `clocks::write_pair` and `files::write_struct` use,
 /// and the direction review finding M1 says to err in.
-fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<i32> {
+/// It also reports the [`Watch`] a wait needs: which of the descriptors it looked at are sockets,
+/// with the union of what each was asked about, and whether any of them waits on the gate.
+fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<(i32, Watch)> {
     let at = guest_address(view, fds)?;
     let blame = Blame::new(view.symbol(), view.address(), 0);
     let mut entries = view.mem().read_bytes(at, bytes, blame)?;
+    let mut watch = Watch::default();
     // The descriptor table is consulted only if some entry actually names a descriptor, so an
     // instance with no filesystem still answers a `poll` over an array of ignored entries.
     let names_a_descriptor = entries
@@ -378,10 +611,27 @@ fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<i32> 
             0
         } else {
             match fs.map(|fs| fs.readiness(fd)) {
-                Some(Ok(readiness)) => revents_for(readiness, events),
+                Some(Ok(readiness)) => {
+                    // What this entry asks about, for the wait that may follow. `POLLPRI` is
+                    // deliberately not folded into `readable`: nothing in this runtime produces
+                    // out-of-band data, and treating a request for it as a request for ordinary
+                    // data would wake a caller for something it did not ask about.
+                    if let Some(fs) = fs {
+                        watch.note(
+                            fs,
+                            fd,
+                            Interest {
+                                readable: events & READABLE_MASK != 0,
+                                writable: events & WRITABLE_MASK != 0,
+                            },
+                        );
+                    }
+                    revents_for(readiness, events)
+                }
                 // Reported whether or not it was requested, which is what `POLLNVAL` is for. A
                 // seam failure that is not `EBADF` cannot reach here: `readiness` answers from
-                // the table alone and makes no host call.
+                // the table alone and, for a socket, from a host call that reports its own
+                // failure as `error` rather than as a refusal.
                 _ => POLLNVAL,
             }
         };
@@ -391,7 +641,7 @@ fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<i32> 
         }
     }
     view.mem().write_bytes(at, &entries, blame)?;
-    Ok(ready)
+    Ok((ready, watch))
 }
 
 /// Turn one descriptor's readiness into the `revents` bits for the `events` that were asked for.
@@ -475,7 +725,9 @@ fn select_outcome(
     // **What the guest asked about, kept**, because a wait re-tests the same question and the
     // sets are about to be overwritten with the answer.
     let asked: [Set; 3] = [sets[0].copy(), sets[1].copy(), sets[2].copy()];
-    answer_sets(view, &asked, &mut sets, nfds);
+    // The watch is kept rather than discarded: it says whether the descriptors this call named
+    // can become ready, which is what `bounded_wait` below turns the cap on. See there.
+    let first_watch = answer_sets(view, &asked, &mut sets, nfds);
     let ready = ready_bits(&sets, nfds);
     if ready > 0 {
         for set in &sets {
@@ -512,7 +764,7 @@ fn select_outcome(
         Some(Duration::from_secs(seconds as u64) + Duration::from_micros(micros as u64))
     };
     // Refused before anything is written, for the same reason.
-    let wait = bounded_wait(c, duration)?;
+    let wait = bounded_wait(c, duration, first_watch.can_change())?;
     // **The wait re-asks the question every time the readiness gate rises**, against `asked`
     // rather than against the sets in guest memory, which are about to be overwritten. Before a
     // pipe existed this was a plain sleep, because nothing could change during it.
@@ -523,7 +775,7 @@ fn select_outcome(
         // Read before the descriptors are tested. The other order loses a wakeup that lands in
         // between — `VERIFICATION.md` entry 11, measured at 1.0104 s.
         let seen = view.active.bionic.filesystem().map(omni_platform::fs::Filesystem::ready_generation);
-        answer_sets(view, &asked, &mut sets, nfds);
+        let watch = answer_sets(view, &asked, &mut sets, nfds);
         let ready = ready_bits(&sets, nfds);
         if ready > 0 {
             for set in &sets {
@@ -535,12 +787,16 @@ fn select_outcome(
         if now >= deadline {
             break;
         }
+        stop_requested(c, view.active)?;
         match (seen, view.active.bionic.filesystem()) {
+            // **The same alternating wait `poll` makes**, and through the same function, so the
+            // two calls cannot drift apart about which side of a mixed set they sleep on.
             (Some(seen), Some(fs)) => {
-                fs.wait_for_readiness(seen, deadline - now);
+                wait_a_slice(c, fs, &watch, seen, deadline - now)?;
             }
-            // No filesystem means no pipe means nothing can change, so the wait is the sleep it
-            // always was. A `select` used purely as a sleep does not need a filesystem root.
+            // No filesystem means no descriptors at all, so nothing can change and the wait is
+            // the sleep it always was. A `select` used purely as a sleep does not need a
+            // filesystem root.
             _ => {
                 omni_platform::clock::sleep(deadline - now);
                 break;
@@ -581,15 +837,53 @@ fn ready_bits(sets: &[Set; 3], nfds: i32) -> i32 {
     sets[0].count(nfds) + sets[1].count(nfds)
 }
 
-fn answer_sets(view: &GuestView<'_>, asked: &[Set; 3], sets: &mut [Set; 3], nfds: i32) {
+/// It also reports the [`Watch`] a wait needs, built from what the guest **asked** rather than
+/// from what is ready — a descriptor that is ready is not waited on.
+fn answer_sets(
+    view: &GuestView<'_>,
+    asked: &[Set; 3],
+    sets: &mut [Set; 3],
+    nfds: i32,
+) -> Watch {
     let readiness = |fd: i32| {
         view.active.bionic.filesystem().and_then(|fs| fs.readiness(fd).ok())
     };
     sets[0].restore(&asked[0]);
     sets[1].restore(&asked[1]);
-    sets[0].retain(nfds, |fd| readiness(fd).is_some_and(|r| r.readable));
-    sets[1].retain(nfds, |fd| readiness(fd).is_some_and(|r| r.writable));
+    // **An errored descriptor counts as both readable and writable**, and that clause is what
+    // makes `select` work over a socket at all. Linux reports a failed non-blocking connect by
+    // making the socket *writable* — the write fails immediately, which is what "ready" means to
+    // `select` — and `getsockopt(SO_ERROR)` is then how the caller learns why. Windows' `select`,
+    // which is `omni_platform::net`'s backend, reports the same condition in `exceptfds`, so it
+    // arrives here as `Readiness::error` with `writable` clear. Without this clause a guest
+    // waiting for writability after a refused connect would never wake, and `exceptfds` is not
+    // where Linux would have told it either.
+    //
+    // The same clause covers a pipe write end whose readers have all gone, which reports `error`
+    // and not `writable`: a `write` on it returns `EPIPE` immediately, which is ready.
+    sets[0].retain(nfds, |fd| readiness(fd).is_some_and(|r| r.readable || r.error));
+    sets[1].retain(nfds, |fd| readiness(fd).is_some_and(|r| r.writable || r.error));
+    // **`exceptfds` is emptied.** Linux sets it for out-of-band socket data and for a few `ioctl`
+    // conditions on character devices, and this runtime produces neither: the seam's backend
+    // never reports urgent data, and a failed connect is reported above where Linux reports it.
     sets[2].clear();
+
+    let mut watch = Watch::default();
+    if let Some(fs) = view.active.bionic.filesystem() {
+        for fd in asked[0].members(nfds) {
+            watch.note(fs, fd, Interest::READABLE);
+        }
+        for fd in asked[1].members(nfds) {
+            watch.note(fs, fd, Interest::WRITABLE);
+        }
+        // A descriptor named only in `exceptfds` is still watched — with neither interest, which
+        // the readiness backend answers as "tell me if something is wrong with it". Dropping it
+        // would leave a `select` that named a socket only there waiting on nothing.
+        for fd in asked[2].members(nfds) {
+            watch.note(fs, fd, Interest { readable: false, writable: false });
+        }
+    }
+    watch
 }
 
 /// One guest `fd_set`, read out of guest memory and written back to the same place.
@@ -671,26 +965,56 @@ impl Set {
 
 /// The bound both calls apply to a wait with nothing that can end it.
 ///
-/// `None` is "wait indefinitely" and is refused; a finite wait past
-/// [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) is refused rather than clamped.
-fn bounded_wait(c: &ImportCall<'_, '_>, duration: Option<Duration>) -> AbiResult<Duration> {
+/// `None` is "wait indefinitely" and is refused.
+///
+/// # The 60-second cap applies to a wait nothing can end, and to nothing else
+///
+/// **This is `VERIFICATION.md` entry 13's shape, found in this module's own refusal text.** The
+/// message that cap produces has always said *"with nothing that can become ready"*, and that
+/// sentence was true when it was written -- every descriptor in this runtime was a file, a
+/// directory or a standard stream, all `Readiness::ALWAYS`, so a `poll` that was not already
+/// satisfied was a sleep with a timer on it. A pipe made it half-false and a socket made it
+/// false: a `poll` over a socket is a wait for the network, and it ends when the peer speaks.
+///
+/// MEASURED, and this is what made the sentence worth re-reading: the engine's HTTP stack asks
+/// `poll` for **69.001 s** over the client-settings socket. The cap refused it, the refusal
+/// killed the guest thread carrying that connection, and the fetch came back on another thread
+/// as `fetch flag exception: HttpError: Unknown` -- a network failure this layer had caused and
+/// then attributed to the network.
+///
+/// So the cap now turns on [`Watch::can_change`]:
+///
+/// * **Nothing in the set can become ready.** The wait is a sleep, `nanosleep`'s argument applies
+///   unchanged -- a sleeping thread executes no guest instructions, so no step budget can end one
+///   (D16) -- and a finite wait past [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) is refused
+///   rather than clamped, because clamping would return 0 from a call that waited a minute when
+///   it was asked to wait longer.
+/// * **Something in the set can become ready.** The guest's own timeout is honoured. What makes
+///   that safe is not a judgement about how long is reasonable: it is that [`wait_until_ready`]
+///   is a **loop of bounded slices** that re-tests the whole set on every pass, and
+///   [`wait_a_slice`] caps each host call at [`MAX_SLEEP_SECONDS`] as well -- so the cap still
+///   governs every individual park, and what has been lifted is only the bound on the *sum* of
+///   parks, which the guest asked for and which ends the moment the descriptor is ready.
+///
+/// **What would falsify this**: a run in which a guest thread sits in `poll` past the gate's
+/// watchdog over a set that can never become ready. That would mean a descriptor whose
+/// `readiness_source` says its readiness can change when it cannot, which is a defect there
+/// rather than in this cap.
+fn bounded_wait(
+    c: &ImportCall<'_, '_>,
+    duration: Option<Duration>,
+    can_change: bool,
+) -> AbiResult<Duration> {
     let Some(duration) = duration else {
         return Err(refuse(
             c,
             format!(
-                "the guest asked `{}` to wait indefinitely, and none of the descriptors it named \
-                 can ever become ready: every descriptor in this runtime is a regular file, a \
-                 directory or a standard stream, all of which are ready the moment they are \
-                 polled, and the two symbols that would introduce a descriptor which blocks -- \
-                 `socket` and `eventfd` -- are refused by name. So this call would block the \
-                 host thread for ever, and D16's runaway-guest defence is built from step \
-                 budgets that a sleeping thread does not consume. Returning 0 instead would \
-                 report a timeout to a call that was given none",
+                "the guest asked `{}` to wait indefinitely, and this layer has no unbounded \n                 wait. The reason this refusal used to give -- that none of the descriptors \n                 it named can ever become ready, because every descriptor here was a file, \n                 a directory or a standard stream and `socket` and `eventfd` were refused \n                 by name -- has now outlived itself twice: a pipe made a descriptor whose \n                 readiness is state, and M6 made a socket, whose readiness is the network. \n                 What is left is the half that was always load-bearing: a host thread \n                 parked for ever on a socket nobody writes to is exactly as unrecoverable \n                 as one parked on a regular file, and D16's runaway-guest defence is built \n                 from step budgets that a sleeping thread does not consume. Returning 0 \n                 instead would report a timeout to a call that was given none",
                 c.symbol()
             ),
         ));
     };
-    if duration.as_secs() > MAX_SLEEP_SECONDS {
+    if !can_change && duration.as_secs() > MAX_SLEEP_SECONDS {
         return Err(refuse(
             c,
             format!(
@@ -699,7 +1023,10 @@ fn bounded_wait(c: &ImportCall<'_, '_>, duration: Option<Duration>) -> AbiResult
                  same cap `nanosleep` and `usleep` name, and for the same reason: a sleeping \
                  thread executes no guest instructions, so no step budget can end one. Clamping \
                  to the cap was rejected, because it would return 0 from a call that waited a \
-                 minute when it was asked to wait {duration:?}",
+                 minute when it was asked to wait {duration:?}. Note what this refusal is \
+                 NOT about: a set naming a socket or a pipe is a wait for an event, and its \
+                 timeout is honoured in full because the wait re-tests every slice and ends the \
+                 moment the descriptor is ready",
                 c.symbol()
             ),
         ));
@@ -707,93 +1034,7 @@ fn bounded_wait(c: &ImportCall<'_, '_>, duration: Option<Duration>) -> AbiResult
     Ok(duration)
 }
 
-// ================================================================== the four that are refused
-
-/// `AF_INET6`, as Linux numbers the address families. The guest's ABI, not this layer's choice.
-const AF_INET6: i32 = 10;
-
-/// `int socket(int domain, int type, int protocol)`
-///
-/// Refused for every address family but one. **Omnidroid gives the guest no network**, and there
-/// is not a seam here that happens to be empty: there is no socket module in `omni-platform` and
-/// no way for an embedding to express a network policy, which is the shape
-/// `Bionic::set_filesystem_root` gives the filesystem. A socket opened here would be an
-/// unrestricted host socket in the hands of untrusted guest code — D6 records that the APK under
-/// test is cheat-injected and carries a Luau executor — and Global Constraint 8 says this runtime
-/// makes no network access at run time.
-///
-/// **`-1` with `EAFNOSUPPORT` or `EACCES` for a socket the guest asked to *use* stays rejected**,
-/// and it is the most believable wrong answer available here. Each is a legitimate POSIX outcome
-/// that a networked program has a quiet branch for, so the engine would disable its own
-/// networking during initialisation, the run would complete, and nothing anywhere would record
-/// that *Omnidroid* rather than the device had made that choice. The same argument D21 makes for
-/// refusing `mlock` rather than answering `-1`/`ENOMEM`.
-///
-/// # `AF_INET6` is answered, and the exception is narrower than it looks
-///
-/// That argument was written before any call site had been decoded, and it does not survive the
-/// one that M6 reaches. `libroblox.so` at guest `0x021ed7bc` does this:
-///
-/// ```text
-/// 0x21ed7bc: mov  w0, #0xa          ; AF_INET6
-/// 0x21ed7c0: mov  w1, #2            ; SOCK_DGRAM
-/// 0x21ed7c4: mov  w2, wzr
-/// 0x21ed7c8: bl   socket
-/// 0x21ed7cc: ldrh w8, [x19, #0x2d8]
-/// 0x21ed7d0: cmn  w0, #1            ; did it fail?
-/// 0x21ed7d4: and  w9, w8, #0xfffe   ; clear "this host has IPv6"
-/// 0x21ed7d8: strh w9, [x19, #0x2d8]
-/// 0x21ed7dc: b.eq #0x21ed7f0        ; failed: leave it clear
-/// ```
-///
-/// It never sends anything. It creates the descriptor **to ask whether the family exists**,
-/// clears a capability bit, and sets it again only on success — an explicit, first-class branch
-/// for the failure. `EAFNOSUPPORT` is precisely what a kernel with IPv6 disabled answers, and
-/// Android devices with IPv6 off are ordinary rather than exotic.
-///
-/// So the two answers are not the same statement. Answering `AF_INET` would tell the engine it
-/// has a network it does not have. Answering `AF_INET6` tells it this runtime has **no IPv6** —
-/// which is true, is strictly *more* restrictive than a refusal would leave the guest believing,
-/// and grants nothing: no descriptor is created, no seam is opened, and the very next `AF_INET`
-/// call still refuses by name. The recorded reasoning is corrected rather than deleted, because
-/// what changed is the evidence and not the principle.
-pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    let (domain, kind, protocol) = {
-        let mut a = c.args();
-        (a.next_i32()?, a.next_i32()?, a.next_i32()?)
-    };
-    let family = match domain {
-        1 => "AF_UNIX",
-        2 => "AF_INET",
-        AF_INET6 => "AF_INET6",
-        16 => "AF_NETLINK",
-        _ => "an address family this layer has no name for",
-    };
-    if domain == AF_INET6 {
-        let state = active(c.symbol(), c.address())?;
-        let mut view = enter(c, &state);
-        view.set_errno(consts::EAFNOSUPPORT);
-        c.ret().i32(-1);
-        return Ok(());
-    }
-    Err(refuse(
-        c,
-        format!(
-            "the guest called socket({domain}, {kind}, {protocol}) -- {family}. Omnidroid gives \
-             the guest no network: `omni-platform` has no socket seam, and an embedding has no \
-             way to say which network a guest may reach, the way `Bionic::set_filesystem_root` \
-             says which directory it may reach. A descriptor returned here would be an \
-             unrestricted host socket held by untrusted guest code (D6), and Global Constraint 8 \
-             forbids network access at run time. Returning -1 with EAFNOSUPPORT or EACCES was \
-             rejected for a family the guest means to *use*: both are legitimate POSIX answers a \
-             networked program branches on quietly, so the engine would switch its networking off \
-             during initialisation and nothing would record that this layer, rather than the \
-             device, had decided that. AF_INET6 is the one exception and it is answered, because \
-             its only call site here is a capability probe with an explicit failure arm -- see \
-             this function's documentation"
-        ),
-    ))
-}
+// ================================================================== eventfd
 
 /// `int eventfd(unsigned int initval, int flags)`
 ///
@@ -842,72 +1083,1966 @@ pub(super) fn eventfd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+// ================================================================== the socket surface
+//
+// Everything from here down is D30's half of this module: the guest's socket symbols over
+// `omni_platform::net`, which is the only place in the workspace a socket call is made.
+
+/// `SOCK_STREAM`: TCP. Linux UAPI, and the number the guest passes.
+const SOCK_STREAM: i32 = 1;
+/// `SOCK_DGRAM`: UDP.
+const SOCK_DGRAM: i32 = 2;
+/// `SOCK_NONBLOCK`: `socket(2)`'s in-line `O_NONBLOCK`, `0o4000` on arm64 as on x86.
+const SOCK_NONBLOCK: i32 = 0o4000;
+/// `SOCK_CLOEXEC`: `socket(2)`'s in-line close-on-exec, `0o2000000`.
+const SOCK_CLOEXEC: i32 = 0o2_000_000;
+/// The two `type` bits `socket(2)` accepts beside the socket kind itself.
+const SOCK_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
+
+/// `IPPROTO_IP`, which is the zero a caller passes for "the default protocol for this type".
+const IPPROTO_IP: i32 = 0;
+/// `IPPROTO_TCP`, and `SOL_TCP`: the level `TCP_NODELAY` is set at.
+const IPPROTO_TCP: i32 = 6;
+/// `IPPROTO_UDP`.
+const IPPROTO_UDP: i32 = 17;
+/// `IPPROTO_IPV6`, and `SOL_IPV6`: the level `IPV6_V6ONLY` is set at.
+const IPPROTO_IPV6: i32 = 41;
+
+/// `SOL_SOCKET`. **Linux's value is 1**; several other systems spell it `0xFFFF`, and this is one
+/// of the constants where taking the development host's number would be silently wrong.
+const SOL_SOCKET: i32 = 1;
+
+/// `SO_REUSEADDR`.
+const SO_REUSEADDR: i32 = 2;
+/// Linux's `SO_KEEPALIVE`, which is the guest's numbering and not the host's.
+///
+/// **MEASURED**: Roblox's own HTTP stack sets it on the settings socket, and until the seam had
+/// the option the refusal killed the fetch thread -- the last thing between the run and graphics.
+const SO_KEEPALIVE: i32 = 9;
+/// `SO_ERROR`: the pending socket error, which is how a non-blocking `connect` reports itself.
+const SO_ERROR: i32 = 4;
+/// `SO_SNDBUF`.
+const SO_SNDBUF: i32 = 7;
+/// `SO_RCVBUF`.
+const SO_RCVBUF: i32 = 8;
+/// `SO_RCVTIMEO`. Linux arm64 numbers the `_OLD` form 20, which is what a 64-bit userspace uses.
+const SO_RCVTIMEO: i32 = 20;
+/// `SO_SNDTIMEO`.
+const SO_SNDTIMEO: i32 = 21;
+/// `TCP_NODELAY`, at level `IPPROTO_TCP`.
+const TCP_NODELAY: i32 = 1;
+/// Linux's `TCP_KEEPIDLE`: seconds a connection may be idle before the first keep-alive probe.
+///
+/// **MEASURED, and it is the number that named this work.** With `SO_KEEPALIVE` implemented, the
+/// engine's HTTP stack went straight on to configure the timing and this layer refused:
+/// `` `setsockopt` refused: setsockopt(fd 13, option 4 at IPPROTO_TCP) with a 4-byte value ``,
+/// which killed guest thread 8 -- the thread that had just logged
+/// `settingsUrl: https://clientsettingscdn.roblox.com/v2/settings/application/android`.
+///
+/// **These three numbers are the guest's and they are not the host's.** `omni_platform::net`
+/// takes a named [`SocketOption`] variant, never an option number, precisely so that this
+/// disagreement has one place to live:
+///
+/// | quantity | here (Linux/bionic) | Windows (`windows-sys` 0.61.2) |
+/// |---|---|---|
+/// | idle before first probe | `TCP_KEEPIDLE` = 4 | `TCP_KEEPALIVE` = 3 |
+/// | interval between probes | `TCP_KEEPINTVL` = 5 | `TCP_KEEPINTVL` = 17 |
+/// | probes before giving up | `TCP_KEEPCNT` = 6 | `TCP_KEEPCNT` = 16 |
+///
+/// The overlap is what makes it dangerous rather than merely different: Windows defines
+/// `TCP_MAXRT` = 5 at the same level, so handing the guest's `TCP_KEEPINTVL` straight to the host
+/// would set the maximum retransmit time, succeed, and leave the probe interval whatever it was.
+const TCP_KEEPIDLE: i32 = 4;
+/// Linux's `TCP_KEEPINTVL`: seconds between keep-alive probes. See [`TCP_KEEPIDLE`].
+const TCP_KEEPINTVL: i32 = 5;
+/// Linux's `TCP_KEEPCNT`: unanswered probes before the connection is declared dead. See
+/// [`TCP_KEEPIDLE`].
+const TCP_KEEPCNT: i32 = 6;
+/// `IPV6_V6ONLY`, at level `IPPROTO_IPV6`.
+const IPV6_V6ONLY: i32 = 26;
+
+/// `SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`.
+const SHUT_RD: i32 = 0;
+const SHUT_WR: i32 = 1;
+const SHUT_RDWR: i32 = 2;
+
+/// `MSG_DONTWAIT`: this one call does not block, whatever the descriptor's flag says.
+const MSG_DONTWAIT: i32 = 0x40;
+/// `MSG_NOSIGNAL`: do not raise `SIGPIPE` on a write to a closed connection.
+const MSG_NOSIGNAL: i32 = 0x4000;
+
+/// `AI_PASSIVE`: the caller means to `bind` the result rather than `connect` it.
+const AI_PASSIVE: i32 = 0x0001;
+/// `AI_CANONNAME`: fill `ai_canonname` on the first node.
+const AI_CANONNAME: i32 = 0x0002;
+/// `AI_NUMERICHOST`: `node` is an address literal and must not be looked up.
+const AI_NUMERICHOST: i32 = 0x0004;
+/// `AI_NUMERICSERV`: `service` is a port number and must not be looked up.
+const AI_NUMERICSERV: i32 = 0x0008;
+/// `AI_ALL`, with `AI_V4MAPPED`: return IPv4 addresses as IPv6-mapped ones too.
+const AI_ALL: i32 = 0x0100;
+/// `AI_V4MAPPED_CFG`: the same, if the host has an IPv6 address configured.
+const AI_V4MAPPED_CFG: i32 = 0x0200;
+/// `AI_ADDRCONFIG`: return a family only if this host has an address of it configured.
+const AI_ADDRCONFIG: i32 = 0x0400;
+/// `AI_V4MAPPED`.
+const AI_V4MAPPED: i32 = 0x0800;
+/// Every `ai_flags` bit bionic's `netdb.h` defines.
+const AI_MASK: i32 = AI_PASSIVE
+    | AI_CANONNAME
+    | AI_NUMERICHOST
+    | AI_NUMERICSERV
+    | AI_ALL
+    | AI_V4MAPPED_CFG
+    | AI_ADDRCONFIG
+    | AI_V4MAPPED;
+
+/// `EAI_ADDRFAMILY`: the name has no address of the family that was asked for.
+const EAI_ADDRFAMILY: i32 = 1;
+/// `EAI_AGAIN`: the resolver did not answer. **The one an `EAI_*` caller may retry.**
+const EAI_AGAIN: i32 = 2;
+/// `EAI_BADFLAGS`: `ai_flags` contains something `netdb.h` does not define.
+const EAI_BADFLAGS: i32 = 3;
+/// `EAI_FAIL`: a permanent resolver failure that is not "no such name".
+const EAI_FAIL: i32 = 4;
+/// `EAI_FAMILY`: `ai_family` is a family this layer has no socket for.
+const EAI_FAMILY: i32 = 5;
+/// `EAI_SOCKTYPE`: `ai_socktype` is one this layer has no socket for.
+const EAI_SOCKTYPE: i32 = 10;
+
+// ---------------------------------------------------------------- the socket errno numbers
+//
+// **Linux's `asm-generic/errno.h`, which is what arm64 uses, written as literals here for the
+// reason `omni_bionic::errno` gives for its own table**: these numbers reach the guest, the
+// development host is Windows — where `WSAECONNREFUSED` is 10061 and not 111 — and a wrong one
+// makes the guest take the wrong branch rather than making the build fail. They are here rather
+// than in `omni_bionic::errno` because that crate's table is "constants reachable by this crate's
+// functions", and no function in it can produce a socket failure.
+
+/// `EMSGSIZE`: a datagram larger than the path will carry.
+const EMSGSIZE: i32 = 90;
+/// `ENOPROTOOPT`: the option is not defined at this level on this socket.
+const ENOPROTOOPT: i32 = 92;
+/// `ENOTSOCK`: the descriptor is open and is not a socket.
+const ENOTSOCK: i32 = 88;
+/// `EADDRINUSE`.
+const EADDRINUSE: i32 = 98;
+/// `EADDRNOTAVAIL`.
+const EADDRNOTAVAIL: i32 = 99;
+/// `ENETUNREACH`.
+const ENETUNREACH: i32 = 101;
+/// `ECONNABORTED`.
+const ECONNABORTED: i32 = 103;
+/// `ECONNRESET`: the peer reset the connection. **The one an HTTPS client meets in normal use.**
+const ECONNRESET: i32 = 104;
+/// `ENOBUFS`.
+const ENOBUFS: i32 = 105;
+/// `EISCONN`.
+const EISCONN: i32 = 106;
+/// `ENOTCONN`.
+const ENOTCONN: i32 = 107;
+/// `ECONNREFUSED`: nothing is listening on the far end.
+const ECONNREFUSED: i32 = 111;
+/// `EHOSTUNREACH`.
+const EHOSTUNREACH: i32 = 113;
+/// `EINPROGRESS`: a non-blocking `connect` has started. **The normal answer, not an edge case.**
+const EINPROGRESS: i32 = 115;
+
+/// How long one socket wait may sleep before the in-process half of a mixed set is re-tested.
+///
+/// **Only used when the set is mixed.** A `poll` naming only sockets puts its whole remaining
+/// budget into one `omni_platform::net::poll`, which wakes exactly when the kernel says so; a set
+/// that also names a pipe or an eventfd cannot, because no single call waits on both a condition
+/// variable and a kernel object. So the socket side is given a slice and the loop re-tests the
+/// in-process side that often.
+///
+/// Twenty milliseconds is the bound on how late an in-process wakeup can be delivered in that
+/// case, and it is a bound on latency rather than on correctness: the gate generation is still
+/// read before the test, so nothing is *lost*, only deferred by at most one slice. Smaller would
+/// cost wakeups on a guest that polls a mixed set continuously; larger would show up as input
+/// latency, since the glue's command pipe is one of the descriptors in that set.
+const MIXED_WAIT_SLICE: Duration = Duration::from_millis(20);
+
+/// The most bytes one socket transfer moves in a single call.
+///
+/// **A bound on a host allocation the guest chooses the size of**, which is why it exists: `count`
+/// is a `size_t` the guest supplies and a `read(fd, buf, SIZE_MAX)` would otherwise ask this layer
+/// for a buffer of that size. A short transfer is `read`'s and `write`'s own contract on a socket
+/// — TCP delivers what has arrived and takes what fits — so capping one call is conforming rather
+/// than a truncation, and every correct caller already loops.
+///
+/// 64 KiB rather than [`IO_BLOCK`](omni_platform::fs::IO_BLOCK)'s 4 KiB because a TLS record is up
+/// to 16 KiB plus framing and the engine carries its own OpenSSL: a cap below one record would
+/// turn every record into four calls for nothing.
+const SOCKET_IO_BLOCK: usize = 64 * 1024;
+
+/// The cap is at least one TLS record, which is what the reasoning above rests on.
+///
+/// A **compile-time** assertion rather than a line in a test, because both sides are constants
+/// and clippy is right that a test would fold it to `assert!(true)` -- the same lint, on the same
+/// ground, that moved [`MAX_GUEST_FILES`](super::MAX_GUEST_FILES)'s ceiling check up beside its
+/// constant. What the *test* beside `transfer_length` asserts instead is the function: that a
+/// guest-chosen length is capped at this number and not at some smaller one.
+const _: () = assert!(SOCKET_IO_BLOCK >= 16 * 1024);
+
+/// Every descriptor this instance can hold fits in one host readiness call.
+///
+/// A **compile-time** assertion rather than a test, because both sides are constants. It is what
+/// makes the mixed wait's socket set unconditionally expressible: `omni_platform::net::poll`
+/// refuses a set larger than `MAX_POLL_SOCKETS` — rather than truncating it, which would answer
+/// "not ready" about sockets it never looked at — and this says that a guest cannot build one,
+/// because it cannot hold more descriptors than that in the first place.
+const _: () =
+    assert!(omni_platform::fs::MAX_OPEN_FILES <= omni_platform::net::MAX_POLL_SOCKETS);
+
+/// What one socket call produced: a value, or an `errno` the guest is to be told.
+///
+/// [`super::files::Settled`]'s counterpart for the network seam, and a separate type for the
+/// reason the two seams have separate error kinds at all: a socket's failures are not a file's.
+enum Netted<T> {
+    /// The call succeeded.
+    Done(T),
+    /// The call failed the way a real device fails, and this is the `errno` to report.
+    Failed(i32),
+}
+
+/// The guest `errno` for a classified host network failure, or `None` when there is not one.
+///
+/// **[`NetErrorKind::Other`] deliberately has no errno**, exactly as `FsErrorKind::Other` does not:
+/// it is the kind `std::io::ErrorKind` could not classify, and giving it `EIO` would hand guest
+/// code a specific, actionable failure for something nobody identified. A refusal naming the
+/// symbol and the host's own message is what a reader can act on.
+fn net_errno_for(kind: NetErrorKind) -> Option<i32> {
+    Some(match kind {
+        NetErrorKind::WouldBlock => consts::EAGAIN,
+        NetErrorKind::InProgress => EINPROGRESS,
+        NetErrorKind::AlreadyConnected => EISCONN,
+        NetErrorKind::NotConnected => ENOTCONN,
+        NetErrorKind::ConnectionRefused => ECONNREFUSED,
+        NetErrorKind::ConnectionReset => ECONNRESET,
+        NetErrorKind::ConnectionAborted => ECONNABORTED,
+        NetErrorKind::AddressInUse => EADDRINUSE,
+        NetErrorKind::AddressNotAvailable => EADDRNOTAVAIL,
+        NetErrorKind::NetworkUnreachable => ENETUNREACH,
+        NetErrorKind::HostUnreachable => EHOSTUNREACH,
+        NetErrorKind::TimedOut => consts::ETIMEDOUT,
+        NetErrorKind::BrokenPipe => consts::EPIPE,
+        NetErrorKind::PermissionDenied => consts::EACCES,
+        NetErrorKind::InvalidInput => consts::EINVAL,
+        NetErrorKind::AddressFamilyNotSupported => consts::EAFNOSUPPORT,
+        NetErrorKind::MessageSize => EMSGSIZE,
+        NetErrorKind::Interrupted => consts::EINTR,
+        NetErrorKind::NoBufferSpace => ENOBUFS,
+        // `NetErrorKind::Other` and nothing else. Spelled as a wildcard because the enum is
+        // `#[non_exhaustive]`, and a kind added upstream without a decision here must refuse by
+        // name rather than acquire a plausible errno.
+        _ => return None,
+    })
+}
+
+/// Turn a network seam result into either a value or an `errno`, refusing what cannot be either.
+///
+/// The one place the `-1`/refusal split is made for the socket calls, so it is a function rather
+/// than a rule repeated fifteen times. Every variant but [`NetError::Io`] is a refusal:
+///
+/// * [`NetError::Policy`] is a **configuration** fact — the embedding did not open this
+///   destination — and reporting it as `ENETUNREACH` would hide it in the ordinary noise of a
+///   client failing over, which is the argument D30 itself makes;
+/// * [`NetError::Unsupported`] means this target's backend was never built;
+/// * [`NetError::UnimplementedOption`] and [`NetError::Refused`] are Global Constraint 1 in
+///   person: a `setsockopt` answered `0` without taking effect is the defect "no plausible stubs"
+///   exists for;
+/// * [`NetError::Resolve`] never reaches here — `getaddrinfo` reports `EAI_*`, which is a
+///   different numbering with a different `gai_strerror`, and it is handled where it arises.
+fn settled<T>(view: &GuestView<'_>, result: platnet::NetResult<T>) -> AbiResult<Netted<T>> {
+    match result {
+        Ok(value) => Ok(Netted::Done(value)),
+        Err(error) => match error.kind().and_then(net_errno_for) {
+            Some(errno) => Ok(Netted::Failed(errno)),
+            None => Err(view.refusal(error.to_string())),
+        },
+    }
+}
+
+/// The instance's network policy, or a refusal naming the method that would supply one.
+///
+/// The counterpart of `files::filesystem`, and the same sentence about a different resource. **A
+/// default was rejected rather than omitted**: `NetPolicy::closed()` would be a silent version of
+/// this refusal, so an embedding that simply forgot would get a guest whose networking failed as
+/// though the network were down — which is D30's own trap, one layer up from `EAI_NONAME`.
+fn policy(view: &GuestView<'_>) -> AbiResult<Arc<NetPolicy>> {
+    view.active.bionic.network_policy().map(Arc::clone).ok_or_else(|| {
+        view.refusal(
+            "this guest instance has no network policy. Which destinations a guest may reach is \
+             set by the embedding with `Bionic::set_network_policy`, the way which host directory \
+             it may read is set with `Bionic::set_filesystem_root`, and none has been supplied. \
+             There is deliberately no default: `NetPolicy::closed()` would make an embedding that \
+             forgot indistinguishable from one that decided, and the guest would report a network \
+             outage that this layer had invented (D30 withdrew Global Constraint 8 in favour of a \
+             policy, not in favour of an open socket; D6: the APK under test is cheat-injected \
+             and the executor is treated as hostile)",
+        )
+    })
+}
+
+/// The socket `fd` names, or the guest's own answer for a descriptor that is not one.
+///
+/// `EBADF` and `ENOTSOCK` are kept apart because guest code branches on the difference: the first
+/// says the descriptor was closed under it, the second says it is holding the wrong kind of
+/// object.
+fn socket_of(
+    view: &GuestView<'_>,
+    fs: &Filesystem,
+    fd: i32,
+) -> AbiResult<Netted<Arc<std::sync::Mutex<Socket>>>> {
+    match fs.socket_at(fd) {
+        Ok(handle) => Ok(Netted::Done(handle)),
+        Err(error) => match error.kind() {
+            Some(omni_platform::fs::FsErrorKind::BadDescriptor) => {
+                Ok(Netted::Failed(consts::EBADF))
+            }
+            Some(omni_platform::fs::FsErrorKind::NotASocket) => Ok(Netted::Failed(ENOTSOCK)),
+            _ => Err(view.refusal(error.to_string())),
+        },
+    }
+}
+
+/// Lock a socket, taking a poisoned lock over rather than panicking on it.
+///
+/// A panic in a handler is reachable from guest code (Global Constraint 11), and a poisoned mutex
+/// here means an earlier call panicked while holding one socket — which is a defect to report,
+/// not a reason to abort the host.
+fn locked(handle: &std::sync::Mutex<Socket>) -> std::sync::MutexGuard<'_, Socket> {
+    handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether this call is to behave as a non-blocking one.
+///
+/// `MSG_DONTWAIT` makes a single call non-blocking on a socket that is otherwise blocking. This
+/// seam has no per-call flag — `omni_platform::net` takes the socket's own mode — so the flag is
+/// honoured only where it asks for something already true, and **refused by name otherwise**
+/// rather than ignored: a caller that passed it and was told the call succeeded would believe the
+/// call could not have blocked.
+fn wants_nonblocking(nonblocking: bool, flags: i32) -> bool {
+    nonblocking || flags & MSG_DONTWAIT != 0
+}
+
+/// Wait until a blocking socket is ready for `interest`, or say that the cap ran out.
+///
+/// **The bound is the same one `nanosleep`, `poll` and a blocking pipe transfer name**, and for
+/// the same reason: a sleeping thread executes no guest instructions, so D16's step budgets cannot
+/// end one. A device would wait for ever here; this layer waits [`MAX_SLEEP_SECONDS`] and then
+/// refuses by name, which is what `files::BlockingWait` does for a pipe.
+///
+/// The socket lock is held for one slice at a time and released between them, so a `poll` on
+/// another guest thread — which takes the descriptor table's lock and then this one — is delayed
+/// by at most a slice rather than by the whole wait.
+fn await_socket(
+    handle: &std::sync::Mutex<Socket>,
+    interest: Interest,
+    deadline: Instant,
+) -> AbiResult<bool> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        let slice = (deadline - now).min(MIXED_WAIT_SLICE);
+        let readiness = {
+            let socket = locked(handle);
+            let mut entries = [PollEntry::new(&socket, interest)];
+            match platnet::poll(&mut entries, slice) {
+                Ok(_) => entries[0].readiness(),
+                // The host's readiness call failed. Reported as ready so that the transfer below
+                // runs and produces the *real* failure with the host's own message, rather than
+                // this layer inventing one from a poll it could not make.
+                Err(_) => return Ok(true),
+            }
+        };
+        if (interest.readable && readiness.readable)
+            || (interest.writable && readiness.writable)
+            || readiness.error
+            || readiness.hangup
+        {
+            return Ok(true);
+        }
+    }
+}
+
+/// End a wait that this runtime is tearing down, by name.
+///
+/// **The other half of lifting the cap on a wait that can end early.** `bounded_wait` now lets
+/// `poll` and `select` wait as long as the guest asked when the set contains a socket or a pipe,
+/// and a 69-second wait that nothing can interrupt holds teardown for 69 seconds --
+/// `Bionic::stop_guest_threads` is read *between run windows*, and a thread asleep in this loop
+/// never ends one. MEASURED, on the run that lifted the cap: no guest thread was killed and
+/// `join_guest_threads` then timed out with one still running, which is the same gap
+/// `AddressFutex::stop` and `Conds::stop` were each added to close, arriving a third time in a
+/// third waiting primitive.
+///
+/// **Checked between slices, so it costs one relaxed load per slice and nothing while waiting.**
+/// It is the same shape `ALooper_pollOnce` already uses and is refused for the same reason it
+/// gives: the wait did not expire and nothing became ready, so `0` would report a timeout that
+/// did not happen and `-1`/`EINTR` would name a signal this runtime has no delivery for.
+fn stop_requested(c: &ImportCall<'_, '_>, state: &Active) -> AbiResult<()> {
+    if !state.bionic.guest_threads_stopping() {
+        return Ok(());
+    }
+    Err(refuse(
+        c,
+        format!(
+            "`{}` was waiting on a descriptor set when this runtime asked its guest threads to \
+             stop. The wait did not expire and nothing became ready, so there is no value to \
+             return that would be true: 0 would report a timeout that did not happen, and \
+             -1/EINTR would name a signal that was never delivered because this runtime has no \
+             signal delivery",
+            c.symbol()
+        ),
+    ))
+}
+
+/// The refusal a blocking socket call produces when it reaches the cap.
+fn waited_out(view: &GuestView<'_>, fd: i32) -> AbiError {
+    view.refusal(format!(
+        "a blocking `{}` on socket fd {fd} waited {MAX_SLEEP_SECONDS} seconds and the socket \
+         never became ready. This layer caps a guest-chosen wait at that -- the same cap \
+         `nanosleep`, `poll` and a blocking pipe transfer name, and for the same reason: a \
+         sleeping thread executes no guest instructions, so no step budget can end one. Returning \
+         EAGAIN or a short count instead would report to a blocking socket something only a \
+         non-blocking one can be told",
+        view.symbol()
+    ))
+}
+
+/// Read a guest `sockaddr` argument into the seam's structured form.
+///
+/// The `socklen_t` is the guest's own and is checked against the family **the guest named**, not
+/// against what this layer would like: a `connect` with `sizeof(struct sockaddr_in)` on an
+/// `AF_INET6` address is `EINVAL` on a device, and reading the sixteen IPv6 bytes anyway would
+/// connect somewhere the caller never described.
+fn read_sockaddr(
+    view: &GuestView<'_>,
+    pointer: u64,
+    len: i32,
+    argument: usize,
+) -> AbiResult<Netted<SocketAddress>> {
+    if pointer == 0 {
+        // POSIX: `EFAULT`. A refusal rather than `-1`, for `files::path_for`'s stated reason --
+        // guest code that ignored the return would carry an unconnected socket forward with
+        // nothing to say what happened.
+        return Err(view.refusal(format!("argument {argument} is a null `sockaddr` pointer")));
+    }
+    let Ok(given) = usize::try_from(len) else {
+        return Ok(Netted::Failed(consts::EINVAL));
+    };
+    if given < addrinfo::SOCKADDR_IN_BYTES {
+        // Shorter than the smallest address this layer can read, so the family cannot even be
+        // established. `EINVAL` is what a device answers.
+        return Ok(Netted::Failed(consts::EINVAL));
+    }
+    let at = guest_address(view, pointer)?;
+    // Read the whole slot rather than the guest's length: the guest may legitimately pass a
+    // `sockaddr_storage` with a shorter `socklen_t`, and reading a fixed size keeps this to one
+    // access. It is bounded above by `SOCKADDR_SLOT_BYTES`, which is 32 bytes.
+    let want = given.min(addrinfo::SOCKADDR_SLOT_BYTES);
+    let mut bytes = [0u8; addrinfo::SOCKADDR_SLOT_BYTES];
+    let read =
+        view.mem().read_bytes(at, want, Blame::new(view.symbol(), view.address(), argument))?;
+    bytes[..read.len()].copy_from_slice(&read);
+    match addrinfo::decode_sockaddr(&bytes, given) {
+        Ok(address) => Ok(Netted::Done(address)),
+        Err(addrinfo::SockaddrError::TooShort { .. }) => Ok(Netted::Failed(consts::EINVAL)),
+        Err(addrinfo::SockaddrError::Family(family)) => {
+            // A family this layer has no socket for. `EAFNOSUPPORT` is a device's own answer and
+            // every caller that tries more than one family has a branch for it.
+            let _ = family;
+            Ok(Netted::Failed(consts::EAFNOSUPPORT))
+        }
+    }
+}
+
+// ================================================================== socket, connect, bind
+
+/// `int socket(int domain, int type, int protocol)`
+///
+/// **Answered from M6, where it had been refused by name since M3**, and the refusal's own
+/// reasoning is corrected here rather than deleted. It said: "Omnidroid gives the guest no
+/// network: `omni-platform` has no socket seam, and an embedding has no way to say which network
+/// a guest may reach, the way `Bionic::set_filesystem_root` says which directory it may reach."
+/// Both halves were true and both have been built. D30 withdrew Global Constraint 8 because
+/// playable Roblox is on the far side of a settings fetch, and what replaced the refusal is the
+/// policy that argument asked for — [`super::Bionic::set_network_policy`], which an instance
+/// **must** have before a socket exists at all.
+///
+/// The part of the old reasoning that survives unchanged is D6's threat: the APK under test is
+/// cheat-injected and carries a Luau executor, so a descriptor handed out here is held by code
+/// treated as hostile. That is why the policy is consulted for every destination rather than once
+/// at creation, and why the default is no socket rather than a closed one.
+///
+/// # The `AF_INET6` exception is now the ordinary case
+///
+/// The refusal carried one narrow exception, decoded at guest `0x021ed7bc`: a `socket(AF_INET6,
+/// SOCK_DGRAM, 0)` whose result is never used to send anything — the engine creates the descriptor
+/// **to ask whether the family exists**, clears a capability bit, and sets it again only on
+/// success. It was answered `-1`/`EAFNOSUPPORT` because that told the engine the truth (this
+/// runtime had no IPv6) while granting nothing.
+///
+/// That is no longer the truth, so it is no longer the answer. An `AF_INET6` socket is created for
+/// real; if this host has no IPv6, the host's own `socket(2)` fails and the guest gets
+/// `EAFNOSUPPORT` from the machine rather than from this layer's opinion of it. The capability
+/// probe still works, and it now reports a fact.
+///
+/// # What is refused, and why each is not `-1`
+///
+/// `AF_UNIX` and `AF_NETLINK` have no primitive in `omni_platform::net` and nothing has reached
+/// them; `SOCK_RAW` and `SOCK_SEQPACKET` likewise. Each is refused **by name** rather than
+/// answered `-1`/`EAFNOSUPPORT`, because a networked program branches on that quietly: it would
+/// switch off the feature that needed the socket and nothing anywhere would record that this
+/// layer, rather than the device, had decided.
+pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (domain, kind, protocol) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let family = match domain {
+            addrinfo::AF_INET => IpFamily::V4,
+            addrinfo::AF_INET6 => IpFamily::V6,
+            other => {
+                let named = match other {
+                    1 => "AF_UNIX",
+                    16 => "AF_NETLINK",
+                    _ => "an address family this layer has no name for",
+                };
+                return Err(refuse(
+                    c,
+                    format!(
+                        "the guest called socket({domain}, {kind}, {protocol}) -- {named}. \
+                         `omni_platform::net` is an IP client: it makes AF_INET and AF_INET6 \
+                         stream and datagram sockets and nothing else, because that is what a \
+                         measured run has reached (D17: importing is not calling). Answering -1 \
+                         with EAFNOSUPPORT was rejected -- it is a legitimate POSIX answer a \
+                         networked program branches on quietly, so the engine would switch off \
+                         whatever needed this socket and nothing would record that this layer, \
+                         rather than the device, had decided"
+                    ),
+                ));
+            }
+        };
+        let flags = kind & SOCK_FLAGS;
+        let socket_kind = match kind & !SOCK_FLAGS {
+            SOCK_STREAM => SocketKind::Stream,
+            SOCK_DGRAM => SocketKind::Datagram,
+            other => {
+                let named = match other {
+                    3 => "SOCK_RAW",
+                    5 => "SOCK_SEQPACKET",
+                    _ => "a socket type this layer has no name for",
+                };
+                return Err(refuse(
+                    c,
+                    format!(
+                        "the guest called socket({domain}, {kind}, {protocol}) -- type {other} is \
+                         {named}. This seam implements SOCK_STREAM and SOCK_DGRAM, which is TCP \
+                         for HTTPS and UDP for the game protocol; nothing has reached anything \
+                         else and `omni_platform::net::SocketKind` has no variant for one"
+                    ),
+                ));
+            }
+        };
+        // A protocol that contradicts the type is the guest asking for something that does not
+        // exist. Linux answers `EPROTONOSUPPORT`; this refuses by name, because the combination
+        // is a *programming* error rather than a device's capability and a quiet -1 would hide it.
+        let protocol_matches = matches!(
+            (socket_kind, protocol),
+            (_, IPPROTO_IP)
+                | (SocketKind::Stream, IPPROTO_TCP)
+                | (SocketKind::Datagram, IPPROTO_UDP)
+        );
+        if !protocol_matches {
+            return Err(refuse(
+                c,
+                format!(
+                    "the guest called socket({domain}, {kind}, {protocol}): protocol {protocol} \
+                     is not the protocol of {}. This seam takes 0 (the type's default), \
+                     IPPROTO_TCP ({IPPROTO_TCP}) on a stream socket and IPPROTO_UDP \
+                     ({IPPROTO_UDP}) on a datagram one",
+                    socket_kind.as_str()
+                ),
+            ));
+        }
+
+        let policy = policy(&view)?;
+        let fs = filesystem(&view)?;
+        let mut socket = match settled(&view, Socket::new(socket_kind, family, policy))? {
+            Netted::Done(socket) => socket,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        // `SOCK_NONBLOCK` is honoured before the descriptor exists, which is the whole point of
+        // its being a `socket(2)` flag rather than a later `fcntl`: there is no window in which
+        // the socket is blocking. `SOCK_CLOEXEC` is accepted and inert -- there is no `exec` in
+        // this runtime, so there is nothing for close-on-exec to do, and refusing it would refuse
+        // the flag almost every real caller sets.
+        if flags & SOCK_NONBLOCK != 0 {
+            if let Netted::Failed(errno) = settled(&view, socket.set_nonblocking(true))? {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        }
+        match settle(&view, fs.attach_socket(socket))? {
+            Settled::Done(fd) => fd,
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`
+///
+/// **`EINPROGRESS` is the normal answer on a non-blocking socket and not an edge case**, and it is
+/// the one this whole call is shaped around: the engine will not park a thread on a connect, so it
+/// sets `O_NONBLOCK`, calls this, gets `-1`/`EINPROGRESS`, waits for writability with `poll`, and
+/// reads `SO_ERROR`. Every step of that is implemented here and in `getsockopt`.
+///
+/// On a **blocking** socket the wait is done here instead, bounded by [`MAX_SLEEP_SECONDS`] for
+/// D16's reason, and the answer is `0` or the connect's own errno — which is what a device gives.
+///
+/// The policy is consulted **before any packet leaves the machine**, inside
+/// `omni_platform::net::Socket::connect`, and a destination outside it is a refusal naming the
+/// rule rather than `ENETUNREACH`: which network an instance may reach is a configuration fact,
+/// and reporting one as a routing failure would hide it in the ordinary noise of a client failing
+/// over.
+pub(super) fn connect(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, addr, addrlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let address = match read_sockaddr(&view, addr, addrlen, 1)? {
+            Netted::Done(address) => address,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let (progress, nonblocking) = {
+            let mut socket = locked(&handle);
+            let nonblocking = socket.nonblocking();
+            match settled(&view, socket.connect(&address))? {
+                Netted::Done(progress) => (progress, nonblocking),
+                Netted::Failed(errno) => {
+                    view.set_errno(errno);
+                    c.ret().i32(-1);
+                    return Ok(());
+                }
+            }
+        };
+        match progress {
+            ConnectProgress::Connected => 0,
+            ConnectProgress::InProgress if nonblocking => {
+                view.set_errno(EINPROGRESS);
+                -1
+            }
+            ConnectProgress::InProgress => {
+                // A blocking connect finishes here rather than in the guest. The socket is
+                // writable-or-in-error when the handshake settles, which is the only correct
+                // thing to wait for: `SO_ERROR` reads zero while it is still in flight, so
+                // reading it alone cannot tell success from *not yet*.
+                let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
+                if !await_socket(&handle, Interest::WRITABLE, deadline)? {
+                    return Err(waited_out(&view, fd));
+                }
+                match settled(&view, locked(&handle).connect_result())? {
+                    Netted::Done(ConnectOutcome::Connected) => 0,
+                    Netted::Done(ConnectOutcome::Failed(kind)) => {
+                        match net_errno_for(kind) {
+                            Some(errno) => {
+                                view.set_errno(errno);
+                                -1
+                            }
+                            None => {
+                                return Err(view.refusal(format!(
+                                    "a blocking connect to {address} failed with a host error \
+                                     this layer has no errno for ({kind}). Reporting a specific \
+                                     errno for a failure nobody classified would hand guest code \
+                                     an actionable branch for something nobody identified"
+                                )))
+                            }
+                        }
+                    }
+                    // The wait said the socket had settled and `SO_ERROR` says otherwise. That is
+                    // not a state this layer can describe, so it says so rather than reporting a
+                    // connection it has no evidence for.
+                    Netted::Done(other) => {
+                        return Err(view.refusal(format!(
+                            "a blocking connect to {address} was reported ready by the host's \
+                             readiness call and then answered {other:?}, which is a socket that \
+                             is neither connected nor failed. Returning 0 here would be a guess"
+                        )))
+                    }
+                    Netted::Failed(errno) => {
+                        view.set_errno(errno);
+                        -1
+                    }
+                }
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`
+///
+/// **Not policy-checked, and that is the seam's decision rather than an omission here.**
+/// `NetPolicy` is a *destination* policy and a local address is not a destination; what a bind
+/// does open is an inbound path, which is a different question, and this layer has no `listen` and
+/// no `accept` so a stream socket cannot accept anything regardless.
+pub(super) fn bind(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, addr, addrlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let address = match read_sockaddr(&view, addr, addrlen, 1)? {
+            Netted::Done(address) => address,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let outcome = settled(&view, locked(&handle).bind(&address))?;
+        match outcome {
+            Netted::Done(()) => 0,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`
+///
+/// **MEASURED, and it is the call after the keep-alive options.** With `TCP_KEEPIDLE`,
+/// `TCP_KEEPINTVL` and `TCP_KEEPCNT` implemented, the settings-fetch thread went straight on to
+/// `getsockname` and died on it as an `Unbound`: `GuestThreadFailure { thread: 8, why: "the guest
+/// called the imported symbol `getsockname` through its thunk at 0x12d070352d0, and nothing in
+/// the compatibility layer implements it" }`. A connected client asks it for the local end it was
+/// given -- which is the ephemeral port the host chose -- and OpenSSL's BIO layer and every HTTP
+/// stack that logs a connection want it.
+///
+/// **The whole of this is [`write_peer`]**, which `recvfrom` already needed and which already
+/// implements the one rule that is easy to get wrong: a short `addrlen` **truncates the address
+/// and reports the full length**, so the caller learns it was not given enough room by comparing
+/// what it passed with what came back. Getting that backwards -- writing the truncated length --
+/// would tell a caller its buffer had been big enough.
+///
+/// `getpeername` is **deliberately not bound beside it**, although
+/// [`Socket::peer_address`](omni_platform::net::Socket::peer_address) is implemented and one line
+/// away. D17's rule is the whole of the reason: `libroblox.so` imports it and no run has called
+/// it, so it stays `Binding::Unbound` and the first run that reaches it will say so by name --
+/// which is how this symbol was found.
+pub(super) fn getsockname(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, addr, addrlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        if addr == 0 || addrlen == 0 {
+            // The same answer `getsockopt` in this file gives a null out-parameter, and for the
+            // same reason: there is nowhere to put the result. A device answers `EFAULT` here,
+            // `omni-bionic`'s errno table carries no `EFAULT`, and inventing the number would be
+            // a constant this layer had not derived from anything -- so the call fails, by a
+            // number that is also a failure, rather than succeeding while writing nothing.
+            view.set_errno(consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let outcome = settled(&view, locked(&handle).local_address())?;
+        match outcome {
+            Netted::Done(address) => {
+                write_peer(&view, addr, addrlen, &address)?;
+                0
+            }
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int shutdown(int sockfd, int how)`
+pub(super) fn shutdown(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, how) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let direction = match how {
+            SHUT_RD => Shutdown::Read,
+            SHUT_WR => Shutdown::Write,
+            SHUT_RDWR => Shutdown::Both,
+            // Linux's own answer for a `how` outside the three.
+            _ => {
+                view.set_errno(consts::EINVAL);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let outcome = settled(&view, locked(&handle).shutdown(direction))?;
+        match outcome {
+            Netted::Done(()) => 0,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+// ================================================================== the socket options
+
+/// The guest's `(level, optname)` as a name, for a refusal that has to say what was asked for.
+fn option_name(level: i32, name: i32) -> String {
+    let level_name = match level {
+        SOL_SOCKET => "SOL_SOCKET".to_owned(),
+        IPPROTO_TCP => "IPPROTO_TCP".to_owned(),
+        IPPROTO_IPV6 => "IPPROTO_IPV6".to_owned(),
+        IPPROTO_IP => "IPPROTO_IP".to_owned(),
+        other => format!("level {other}"),
+    };
+    let option = match (level, name) {
+        (SOL_SOCKET, SO_REUSEADDR) => "SO_REUSEADDR".to_owned(),
+        (SOL_SOCKET, SO_KEEPALIVE) => "SO_KEEPALIVE".to_owned(),
+        (SOL_SOCKET, SO_ERROR) => "SO_ERROR".to_owned(),
+        (SOL_SOCKET, SO_SNDBUF) => "SO_SNDBUF".to_owned(),
+        (SOL_SOCKET, SO_RCVBUF) => "SO_RCVBUF".to_owned(),
+        (SOL_SOCKET, SO_RCVTIMEO) => "SO_RCVTIMEO".to_owned(),
+        (SOL_SOCKET, SO_SNDTIMEO) => "SO_SNDTIMEO".to_owned(),
+        (IPPROTO_TCP, TCP_NODELAY) => "TCP_NODELAY".to_owned(),
+        (IPPROTO_TCP, TCP_KEEPIDLE) => "TCP_KEEPIDLE".to_owned(),
+        (IPPROTO_TCP, TCP_KEEPINTVL) => "TCP_KEEPINTVL".to_owned(),
+        (IPPROTO_TCP, TCP_KEEPCNT) => "TCP_KEEPCNT".to_owned(),
+        (IPPROTO_IPV6, IPV6_V6ONLY) => "IPV6_V6ONLY".to_owned(),
+        (_, other) => format!("option {other}"),
+    };
+    format!("{option} at {level_name}")
+}
+
+/// A guest `int` of seconds as the [`Duration`] `omni_platform::net` takes, or `None` for a value
+/// no keep-alive option accepts.
+///
+/// `None` is what the caller turns into `EINVAL`, and the two ways to reach it are the two a
+/// device refuses: a negative number, which is not a count of seconds at all, and zero, which
+/// Linux's `do_tcp_setsockopt` rejects for every one of `TCP_KEEPIDLE`, `TCP_KEEPINTVL` and
+/// `TCP_KEEPCNT`. **Zero is the one worth the check.** It is a perfectly valid `u32`, it survives
+/// every conversion between here and the host, and it would arrive at `setsockopt` meaning
+/// "probe with no idle time" -- a socket that works, configured to give up on itself.
+///
+/// # The zero check is **not** what produces `EINVAL` on either supported host, and that is
+/// measured rather than assumed
+///
+/// `sockcfg-A3` in `tools/mutate.py` removes the `> 0` and is **NOT CAUGHT** -- deliberately
+/// left in the table as a miss rather than retargeted at something that would pass. The reason
+/// is the honest one: **Winsock refuses a zero keep-alive figure itself**, with an error this
+/// seam maps to `EINVAL`, so on this host the guest gets 22 either way and no test that runs
+/// here can tell the two apart. Linux's `do_tcp_setsockopt` range-checks all three the same way,
+/// so the same is true of the other supported target once its backend exists.
+///
+/// So what is this check for? **A host whose stack accepts zero.** There is no such host in the
+/// five this project targets, which is exactly why the branch reads as redundant and why
+/// `VERIFICATION.md` entry 12 is worth holding it against: *a branch no input can take is not a
+/// check*. It survives that test -- every input can take it, and it fires before the host is
+/// asked -- but it is honest to say that on the only target anybody runs, the host is what
+/// produces the answer. **What would make it load-bearing**: a backend on a stack that took a
+/// zero idle time literally, at which point this is the line that stops a socket being
+/// configured to probe with no idle time at all.
+///
+/// A separate function rather than an inline `filter` so that the row above has somewhere to
+/// anchor, and so that this paragraph has somewhere to live.
+fn positive_seconds(value: i32) -> Option<Duration> {
+    u32::try_from(value).ok().filter(|seconds| *seconds > 0).map(|seconds| Duration::from_secs(u64::from(seconds)))
+}
+
+/// Read a guest `struct timeval` as a duration, or `None` for the zero that means "no timeout".
+fn read_timeval(view: &GuestView<'_>, at: GuestAddr) -> AbiResult<Option<Duration>> {
+    let raw = view.mem().read_bytes(at, TIMEVAL_BYTES, Blame::new(view.symbol(), view.address(), 3))?;
+    let seconds = i64::from_le_bytes(raw[..8].try_into().expect("eight bytes"));
+    let micros = i64::from_le_bytes(raw[8..].try_into().expect("eight bytes"));
+    if seconds <= 0 && micros <= 0 {
+        // A zero `timeval` clears the timeout, which is what a device does and what
+        // `omni_platform::net` spells `None`. A negative one is not a duration; Linux answers
+        // `EINVAL`, and `None` here means the same thing to the seam, so it is reported as the
+        // clear rather than as a refusal -- see `setsockopt`, which validates it before this.
+        return Ok(None);
+    }
+    Ok(Some(
+        Duration::from_secs(seconds.max(0) as u64) + Duration::from_micros(micros.max(0) as u64),
+    ))
+}
+
+/// Write a duration back as a guest `struct timeval`.
+fn timeval_bytes(timeout: Option<Duration>) -> [u8; TIMEVAL_BYTES] {
+    let mut out = [0u8; TIMEVAL_BYTES];
+    if let Some(duration) = timeout {
+        out[..8].copy_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+        out[8..].copy_from_slice(&i64::from(duration.subsec_micros()).to_le_bytes());
+    }
+    out
+}
+
+/// `int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)`
+///
+/// **The option set is closed and an option outside it is refused by name**, carrying the level
+/// and the number the guest passed. That is Global Constraint 1 in person: a `setsockopt` that
+/// returns `0` without taking effect leaves the caller believing the option is in force and
+/// behaving as though it were, and the failure surfaces somewhere else entirely.
+/// `omni_platform::net::NetError::unimplemented_option` exists for exactly this and is what words
+/// the refusal, so the message also says which options *are* available — which is what the next
+/// person needs at the moment they discover the one they wanted is not.
+///
+/// An option that exists and is not defined on **this** socket — `TCP_NODELAY` on a datagram one,
+/// `IPV6_V6ONLY` on an IPv4 one — is a different answer: `ENOPROTOOPT`, which is what a device
+/// gives and which the seam reports as a refusal this layer turns into that errno.
+pub(super) fn setsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, level, name, optval, optlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?, a.next_i32()?, a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        if optval == 0 {
+            view.set_errno(consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let at = guest_address(&view, optval)?;
+        let given = usize::try_from(optlen).unwrap_or(0);
+        // Every option here is either an `int` or a `struct timeval`, and a buffer shorter than
+        // the one the option needs is `EINVAL` on a device. Checked against the option rather
+        // than accepted and padded: a caller that passed two bytes for an `int` has a bug this
+        // layer must not paper over.
+        let int_option = |needed: usize| -> AbiResult<Option<i32>> {
+            if given < needed {
+                return Ok(None);
+            }
+            Ok(Some(view.mem().read_i32(at, Blame::new(view.symbol(), view.address(), 3))?))
+        };
+        let option = match (level, name) {
+            (SOL_SOCKET, SO_REUSEADDR) => int_option(4)?.map(|on| SocketOption::ReuseAddress(on != 0)),
+            // The boolean only. `omni_platform::net::SocketOption::KeepAlive` documents what is
+            // deliberately not carried with it -- the idle interval, which has no portable
+            // spelling and which this layer therefore does not pretend to set.
+            (SOL_SOCKET, SO_KEEPALIVE) => int_option(4)?.map(|on| SocketOption::KeepAlive(on != 0)),
+            (IPPROTO_TCP, TCP_NODELAY) => int_option(4)?.map(|on| SocketOption::NoDelay(on != 0)),
+            // **The keep-alive timing, which is where the guest's numbering and the host's stop
+            // agreeing.** See [`TCP_KEEPIDLE`] for the table; the point of naming a variant here
+            // rather than forwarding `(level, name)` is that `omni_platform::net` has no way to
+            // accept an option number, so the disagreement cannot be forwarded by accident.
+            //
+            // **A value below one is `EINVAL`, and it is not a formality.** Linux range-checks
+            // all three in `do_tcp_setsockopt` and refuses zero; a zero accepted here would reach
+            // the host as "probe immediately" or "give up after no probes", which is a working
+            // socket configured to tear itself down -- the failure would be a dropped connection
+            // minutes later and nothing would point back to this call.
+            (IPPROTO_TCP, TCP_KEEPIDLE) => int_option(4)?.and_then(|seconds| {
+                positive_seconds(seconds).map(SocketOption::KeepAliveIdle)
+            }),
+            (IPPROTO_TCP, TCP_KEEPINTVL) => int_option(4)?.and_then(|seconds| {
+                positive_seconds(seconds).map(SocketOption::KeepAliveInterval)
+            }),
+            (IPPROTO_TCP, TCP_KEEPCNT) => int_option(4)?.and_then(|count| {
+                u32::try_from(count).ok().filter(|c| *c > 0).map(SocketOption::KeepAliveCount)
+            }),
+            (IPPROTO_IPV6, IPV6_V6ONLY) => int_option(4)?.map(|on| SocketOption::V6Only(on != 0)),
+            (SOL_SOCKET, SO_RCVBUF) => int_option(4)?.and_then(|bytes| {
+                usize::try_from(bytes).ok().map(SocketOption::ReceiveBuffer)
+            }),
+            (SOL_SOCKET, SO_SNDBUF) => int_option(4)?
+                .and_then(|bytes| usize::try_from(bytes).ok().map(SocketOption::SendBuffer)),
+            (SOL_SOCKET, SO_RCVTIMEO) | (SOL_SOCKET, SO_SNDTIMEO) => {
+                if given < TIMEVAL_BYTES {
+                    None
+                } else {
+                    let timeout = read_timeval(&view, at)?;
+                    Some(if name == SO_RCVTIMEO {
+                        SocketOption::ReceiveTimeout(timeout)
+                    } else {
+                        SocketOption::SendTimeout(timeout)
+                    })
+                }
+            }
+            _ => {
+                return Err(view.refusal(format!(
+                    "the guest called setsockopt(fd {fd}, {}) with a {optlen}-byte value. {}",
+                    option_name(level, name),
+                    NetError::unimplemented_option("setsockopt", level, name)
+                )))
+            }
+        };
+        let Some(option) = option else {
+            // The option is implemented and the guest's argument is not one this option accepts:
+            // an `optlen` too short for the value, a buffer size that is not a size, or a
+            // keep-alive figure below one. All three are `EINVAL` on a device, which is why they
+            // share an arm -- and each is decided beside its own option above rather than here,
+            // so that the reason is written next to the rule it comes from.
+            view.set_errno(consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        };
+        let outcome = locked(&handle).set_option(option);
+        match outcome {
+            Ok(()) => 0,
+            // An option that exists and is not defined on this socket kind or family. The seam
+            // refuses it by name and a device answers `ENOPROTOOPT`, which is the answer every
+            // caller that probes an option already branches on.
+            Err(NetError::Refused { .. }) => {
+                view.set_errno(ENOPROTOOPT);
+                -1
+            }
+            Err(error) => match settled::<()>(&view, Err(error))? {
+                Netted::Done(()) => 0,
+                Netted::Failed(errno) => {
+                    view.set_errno(errno);
+                    -1
+                }
+            },
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen)`
+///
+/// **`SO_ERROR` is the one that matters and the one that is consumed by reading it.** It is how a
+/// non-blocking `connect` reports itself, and `omni_platform::net` is built so that a host-side
+/// caller cannot take it first: the error is moved into the socket's own pending slot and stays
+/// readable exactly once, by whoever asks first, which is what a device does.
+///
+/// **Both guest objects are validated before either is written.** A `getsockopt` that filled
+/// `optval` and then failed to update `*optlen` would leave the guest reading a value against a
+/// stale length — the all-or-nothing shape `files::write_struct` exists for, and the direction
+/// review finding M1 says to err in.
+pub(super) fn getsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, level, name, optval, optlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?, a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        if optval == 0 || optlen == 0 {
+            view.set_errno(consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let value_at = guest_address(&view, optval)?;
+        let length_at = guest_address(&view, optlen)?;
+        let blame = Blame::new(view.symbol(), view.address(), 3);
+        let given = view.mem().read_u32(length_at, blame)? as usize;
+
+        let query = match (level, name) {
+            (SOL_SOCKET, SO_ERROR) => SocketQuery::Error,
+            (SOL_SOCKET, SO_REUSEADDR) => SocketQuery::ReuseAddress,
+            (SOL_SOCKET, SO_KEEPALIVE) => SocketQuery::KeepAlive,
+            (SOL_SOCKET, SO_RCVBUF) => SocketQuery::ReceiveBuffer,
+            (SOL_SOCKET, SO_SNDBUF) => SocketQuery::SendBuffer,
+            (SOL_SOCKET, SO_RCVTIMEO) => SocketQuery::ReceiveTimeout,
+            (SOL_SOCKET, SO_SNDTIMEO) => SocketQuery::SendTimeout,
+            (IPPROTO_TCP, TCP_NODELAY) => SocketQuery::NoDelay,
+            // The read half of the keep-alive timing. **The run reached the write half only**
+            // -- the engine sets these and has not been observed reading them back -- and it is
+            // here because the seam's own evidence that the numbers are mapped right is a round
+            // trip: an option written to the wrong host constant succeeds, so only reading the
+            // three back and finding the three values can tell the two apart. Refusing the read
+            // while implementing the write would have meant the mapping could not be verified at
+            // the one place a guest could ever check it.
+            (IPPROTO_TCP, TCP_KEEPIDLE) => SocketQuery::KeepAliveIdle,
+            (IPPROTO_TCP, TCP_KEEPINTVL) => SocketQuery::KeepAliveInterval,
+            (IPPROTO_TCP, TCP_KEEPCNT) => SocketQuery::KeepAliveCount,
+            (IPPROTO_IPV6, IPV6_V6ONLY) => SocketQuery::V6Only,
+            _ => {
+                return Err(view.refusal(format!(
+                    "the guest called getsockopt(fd {fd}, {}) into a {given}-byte buffer. {}",
+                    option_name(level, name),
+                    NetError::unimplemented_option("getsockopt", level, name)
+                )))
+            }
+        };
+        let answer = locked(&handle).get_option(query);
+        let value = match answer {
+            Ok(value) => value,
+            Err(NetError::Refused { .. }) => {
+                view.set_errno(ENOPROTOOPT);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+            Err(error) => match settled::<OptionValue>(&view, Err(error))? {
+                Netted::Done(value) => value,
+                Netted::Failed(errno) => {
+                    view.set_errno(errno);
+                    c.ret().i32(-1);
+                    return Ok(());
+                }
+            },
+        };
+        // **`SO_ERROR` reports the errno, not the host's classification.** It is the one option
+        // whose *value* is a guest errno, and a caller that read anything else out of it would
+        // branch on a number from the wrong table.
+        let bytes: Vec<u8> = match value {
+            OptionValue::Error(None) => 0i32.to_le_bytes().to_vec(),
+            OptionValue::Error(Some(kind)) => match net_errno_for(kind) {
+                Some(errno) => errno.to_le_bytes().to_vec(),
+                None => {
+                    return Err(view.refusal(format!(
+                        "getsockopt(SO_ERROR) on fd {fd} found a host failure this layer has no \
+                         errno for ({kind}). Reporting 0 would tell the guest the connection \
+                         succeeded, and reporting a plausible errno would hand it an actionable \
+                         branch for something nobody identified"
+                    )))
+                }
+            },
+            OptionValue::Flag(on) => i32::from(on).to_le_bytes().to_vec(),
+            OptionValue::Bytes(bytes) => (bytes.min(i32::MAX as usize) as i32).to_le_bytes().to_vec(),
+            OptionValue::Timeout(timeout) => timeval_bytes(timeout).to_vec(),
+            // **An `int` of seconds, not a `struct timeval`**, and the difference is twelve bytes
+            // and a wrong answer: `TCP_KEEPIDLE` and `TCP_KEEPINTVL` are plain integers on Linux
+            // where `SO_RCVTIMEO` is a `timeval`, so writing one as the other would fill the
+            // guest's four-byte buffer with the low half of a seconds field and then fail the
+            // length check -- or, for a caller that passed sixteen bytes, succeed and be wrong.
+            OptionValue::Interval(interval) => {
+                (interval.as_secs().min(i32::MAX as u64) as i32).to_le_bytes().to_vec()
+            }
+            OptionValue::Count(count) => (count.min(i32::MAX as u32) as i32).to_le_bytes().to_vec(),
+            // `OptionValue` is `#[non_exhaustive]`: a variant added upstream without a decision
+            // here must refuse by name rather than be written into guest memory as some shape.
+            other => {
+                return Err(view.refusal(format!(
+                    "getsockopt(fd {fd}, {}) produced {other:?}, which this layer has no guest \
+                     representation for",
+                    option_name(level, name)
+                )))
+            }
+        };
+        if given < bytes.len() {
+            // Linux answers `EINVAL` for a buffer too small to hold the option. Truncating would
+            // hand the guest a value it would read as a whole one.
+            view.set_errno(consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        // Both destinations admitted before either is written.
+        view.mem().checked_ptr(value_at, bytes.len(), true, blame)?;
+        view.mem().checked_ptr(length_at, 4, true, blame)?;
+        view.mem().write_bytes(value_at, &bytes, blame)?;
+        view.mem().write_u32(length_at, bytes.len() as u32, blame)?;
+        0
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+// ================================================================== the data path
+
+/// Reject a `flags` word this layer cannot honour, naming the bits.
+///
+/// Two are accepted and the rest refuse by name.
+///
+/// * **`MSG_NOSIGNAL`** asks for no `SIGPIPE` on a write to a closed connection. This runtime
+///   delivers no signal to the guest at all (D24), so its *contract* is already satisfied —
+///   accepting it is conforming rather than convenient, exactly as `O_NOCTTY` is in `files`.
+/// * **`MSG_DONTWAIT`** asks for this one call not to block. `omni_platform::net` has no per-call
+///   flag — it takes the socket's own mode — so it is honoured by making the call non-blocking,
+///   which is what [`wants_nonblocking`] does.
+///
+/// Everything else — `MSG_PEEK`, `MSG_OOB`, `MSG_WAITALL`, `MSG_MORE` — asks for behaviour this
+/// seam does not implement, and ignoring one would tell the guest it got something it did not:
+/// a `MSG_PEEK` that consumed the datagram is a message the caller can never read again.
+fn check_message_flags(view: &GuestView<'_>, flags: i32) -> AbiResult<()> {
+    let unknown = flags & !(MSG_NOSIGNAL | MSG_DONTWAIT);
+    if unknown == 0 {
+        return Ok(());
+    }
+    Err(view.refusal(format!(
+        "the guest called `{}` with message flags {flags:#x}, of which {unknown:#x} is outside \
+         MSG_NOSIGNAL and MSG_DONTWAIT. This seam implements those two -- the first because this \
+         runtime delivers no signals at all, so its contract is already met, and the second \
+         because it asks for the socket's own non-blocking mode for one call. MSG_PEEK, MSG_OOB, \
+         MSG_WAITALL and MSG_MORE each ask for behaviour `omni_platform::net` does not implement, \
+         and ignoring one would tell the guest it got a behaviour it did not: a MSG_PEEK that \
+         consumed the datagram is a message the caller can never read again",
+        view.symbol()
+    )))
+}
+
+/// The most a single socket transfer may move, from a guest-chosen `count`.
+fn transfer_length(count: u64) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX).min(SOCKET_IO_BLOCK)
+}
+
+/// Receive into guest memory, optionally reporting where the datagram came from.
+///
+/// # The whole destination is admitted before the socket is touched
+///
+/// Adapter review finding **M1**, carried across from `files::read_into_guest` and load-bearing
+/// for the same reason one step further: **a received datagram is gone.** There is no offset to
+/// seek back to and no second copy in the kernel, so a receive that took the bytes and then found
+/// the guest's buffer unwritable would have lost a message the peer will not send again. The
+/// buffer is therefore admitted first, in full, before `recv` is called.
+///
+/// What it does *not* promise is that the destination is still writable when the bytes arrive:
+/// another guest thread may `munmap` the range between the check and the write, and no check on
+/// this side of the boundary can close that window, because the window *is* the transfer.
+fn socket_recv(
+    view: &GuestView<'_>,
+    handle: &std::sync::Mutex<Socket>,
+    fd: i32,
+    buffer: u64,
+    count: u64,
+    flags: i32,
+    from: Option<(u64, u64)>,
+) -> AbiResult<Netted<i64>> {
+    check_message_flags(view, flags)?;
+    let want = transfer_length(count);
+    if want == 0 {
+        // A zero-length receive on a stream socket returns 0 without consuming anything, and the
+        // seam is not called at all -- so a zero-length receive at a null pointer, which is legal
+        // C, does not fault.
+        return Ok(Netted::Done(0));
+    }
+    let at = guest_address(view, buffer)?;
+    let blame = Blame::new(view.symbol(), view.address(), 1);
+    view.mem().checked_ptr(at, want, true, blame)?;
+
+    let nonblocking = locked(handle).nonblocking();
+    if !wants_nonblocking(nonblocking, flags) {
+        let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
+        if !await_socket(handle, Interest::READABLE, deadline)? {
+            return Err(waited_out(view, fd));
+        }
+    }
+    let mut host = vec![0u8; want];
+    let outcome = {
+        let socket = locked(handle);
+        match from {
+            None => socket.recv(&mut host).map(|read| (read, None)),
+            Some(_) => socket.recv_from(&mut host).map(|(read, peer)| (read, Some(peer))),
+        }
+    };
+    let (read, peer) = match settled(view, outcome)? {
+        Netted::Done(pair) => pair,
+        Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+    };
+    view.mem().write_bytes(at, &host[..read], blame)?;
+    if let (Some((address_at, length_at)), Some(peer)) = (from, peer) {
+        write_peer(view, address_at, length_at, &peer)?;
+    }
+    Ok(Netted::Done(read as i64))
+}
+
+/// Write a `recvfrom` source address back into the guest's `sockaddr` and `socklen_t`.
+///
+/// **A short `addrlen` truncates the address and reports the full length**, which is `recvfrom`'s
+/// own contract on a device — the caller learns that what it was given was not big enough by
+/// comparing the two. Nothing is written at all when either pointer is null, which is how a
+/// caller says it does not want the address.
+fn write_peer(
+    view: &GuestView<'_>,
+    address_at: u64,
+    length_at: u64,
+    peer: &SocketAddress,
+) -> AbiResult<()> {
+    if address_at == 0 || length_at == 0 {
+        return Ok(());
+    }
+    let address_to = guest_address(view, address_at)?;
+    let length_to = guest_address(view, length_at)?;
+    let blame = Blame::new(view.symbol(), view.address(), 4);
+    let room = view.mem().read_u32(length_to, blame)? as usize;
+    let (bytes, len) = addrinfo::encode_sockaddr(peer);
+    let copied = room.min(len);
+    view.mem().checked_ptr(address_to, copied, true, blame)?;
+    view.mem().checked_ptr(length_to, 4, true, blame)?;
+    if copied > 0 {
+        view.mem().write_bytes(address_to, &bytes[..copied], blame)?;
+    }
+    // The *full* length, not what fitted: that is how the caller learns it was truncated.
+    view.mem().write_u32(length_to, len as u32, blame)
+}
+
+/// Send from guest memory, optionally to an address the caller named.
+///
+/// The mirror of [`socket_recv`]'s rule and the reason finding **M1** named the write direction
+/// too: the whole source is read out of guest memory before anything reaches the socket, because
+/// a byte that has left this machine cannot be taken back and half a request is a request.
+fn socket_send(
+    view: &GuestView<'_>,
+    handle: &std::sync::Mutex<Socket>,
+    fd: i32,
+    buffer: u64,
+    count: u64,
+    flags: i32,
+    to: Option<SocketAddress>,
+) -> AbiResult<Netted<i64>> {
+    check_message_flags(view, flags)?;
+    let want = transfer_length(count);
+    if want == 0 {
+        // A zero-length send is legal and this layer makes it a no-op on a stream socket. On a
+        // datagram socket a zero-length datagram is a real message, so it goes through.
+        if to.is_none() {
+            return Ok(Netted::Done(0));
+        }
+    }
+    let at = guest_address(view, buffer)?;
+    let blame = Blame::new(view.symbol(), view.address(), 1);
+    let bytes = view.mem().read_bytes(at, want, blame)?;
+
+    let nonblocking = locked(handle).nonblocking();
+    if !wants_nonblocking(nonblocking, flags) {
+        let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
+        if !await_socket(handle, Interest::WRITABLE, deadline)? {
+            return Err(waited_out(view, fd));
+        }
+    }
+    let outcome = {
+        let socket = locked(handle);
+        match &to {
+            None => socket.send(&bytes),
+            Some(address) => socket.send_to(&bytes, address),
+        }
+    };
+    match settled(view, outcome)? {
+        Netted::Done(sent) => Ok(Netted::Done(sent as i64)),
+        Netted::Failed(errno) => Ok(Netted::Failed(errno)),
+    }
+}
+
+/// Run a socket transfer and write the guest's `ssize_t` result.
+fn transfer_result(
+    c: &mut ImportCall<'_, '_>,
+    state: &Active,
+    run: impl FnOnce(&mut GuestView<'_>) -> AbiResult<Netted<i64>>,
+) -> AbiResult<()> {
+    let value = {
+        let mut view = enter(c, state);
+        match run(&mut view)? {
+            Netted::Done(count) => count,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().u64(value as u64);
+    Ok(())
+}
+
+/// The socket behind `fd`, or the guest's `-1` answer written and the call finished.
+///
+/// A macro-free early return is not expressible here — the descriptor lookup has to happen inside
+/// the guest view and the return value is written after it is dropped — so each caller does the
+/// two-step itself. This helper is the first step.
+fn socket_for_transfer(
+    view: &GuestView<'_>,
+    fd: i32,
+) -> AbiResult<Netted<Arc<std::sync::Mutex<Socket>>>> {
+    let fs = filesystem(view)?;
+    socket_of(view, fs, fd)
+}
+
+/// `ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen)`
+///
+/// A null `dest_addr` is `send`, which is what a connected socket uses and is how the guest's own
+/// `send` is compiled on bionic — there is no separate `send` import in `libroblox.so`.
+pub(super) fn sendto(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, len, flags, dest, addrlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?, a.next_i32()?, a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        let to = if dest == 0 {
+            None
+        } else {
+            match read_sockaddr(view, dest, addrlen, 4)? {
+                Netted::Done(address) => Some(address),
+                Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+            }
+        };
+        socket_send(view, &handle, fd, buf, len, flags, to)
+    })
+}
+
+/// `ssize_t __sendto_chk(int fd, const void *buf, size_t len, size_t buflen, int flags, const struct sockaddr *dest, socklen_t addrlen)`
+///
+/// The `_FORTIFY_SOURCE` form of `sendto`, and **the check is the whole of what it adds**: bionic
+/// compares the length being sent against the compiler's knowledge of the buffer's size and calls
+/// `__fortify_fatal` when the first exceeds the second. That is a guest defect being caught, so it
+/// is reported by name with both numbers rather than sent — a `sendto` that went ahead would put
+/// whatever follows the buffer on the network.
+pub(super) fn sendto_chk(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, len, buflen, flags, dest, addrlen) = {
+        let mut a = c.args();
+        (
+            a.next_i32()?,
+            a.next_u64()?,
+            a.next_u64()?,
+            a.next_u64()?,
+            a.next_i32()?,
+            a.next_u64()?,
+            a.next_i32()?,
+        )
+    };
+    if len > buflen {
+        return Err(refuse(
+            c,
+            format!(
+                "the guest called __sendto_chk(fd {fd}, buf={buf:#x}, len={len}, buflen={buflen}) \
+                 -- it asked to send {len} bytes out of a buffer the compiler knows is {buflen}. \
+                 That is what _FORTIFY_SOURCE exists to catch and bionic answers it with \
+                 __fortify_fatal, which terminates the process. Sending would put whatever \
+                 follows the buffer on the network"
+            ),
+        ));
+    }
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        let to = if dest == 0 {
+            None
+        } else {
+            match read_sockaddr(view, dest, addrlen, 5)? {
+                Netted::Done(address) => Some(address),
+                Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+            }
+        };
+        socket_send(view, &handle, fd, buf, len, flags, to)
+    })
+}
+
+/// `ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)`
+///
+/// A null `src_addr` is `recv`, which is how a connected socket receives and how the guest's own
+/// `recv` is compiled — `libroblox.so` imports no `recv`.
+pub(super) fn recvfrom(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, len, flags, src, addrlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?, a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        let from = if src == 0 { None } else { Some((src, addrlen)) };
+        socket_recv(view, &handle, fd, buf, len, flags, from)
+    })
+}
+
+// ================================================================== read and write, dispatched
+
+/// `ssize_t read(int fd, void *buf, size_t count)` — a socket, or whatever `files` makes of it.
+///
+/// **Bound here rather than in `files` because `libroblox.so` imports no `recv`.** MEASURED, from
+/// the APK's own undefined-symbol table: the stream data path is `read`/`write` on the socket
+/// descriptor, which is what OpenSSL's `readsocket`/`writesocket` expand to on every non-Windows
+/// target, and the engine carries its own OpenSSL. This module's header has the two reasons the
+/// socket case cannot be served by `Filesystem::read`.
+///
+/// Everything that is not a socket goes to `files::read` unchanged, which is the whole of what
+/// this function adds: one `is_socket` test and a delegation.
+pub(super) fn read(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, count) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    if !is_socket(c, fd)? {
+        return super::files::read(c);
+    }
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        socket_recv(view, &handle, fd, buf, count, 0, None)
+    })
+}
+
+/// `ssize_t write(int fd, const void *buf, size_t count)` — a socket, or `files`.
+pub(super) fn write(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, count) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    if !is_socket(c, fd)? {
+        return super::files::write(c);
+    }
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        socket_send(view, &handle, fd, buf, count, 0, None)
+    })
+}
+
+/// `ssize_t __write_chk(int fd, const void *buf, size_t count, size_t buflen)` — a socket, or
+/// `files`.
+///
+/// The FORTIFY check itself stays in `files::write_chk`, which is where it was written and
+/// tested; this adds the socket dispatch in front of it and nothing else.
+pub(super) fn write_chk(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, count, buflen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
+    if !is_socket(c, fd)? {
+        return super::files::write_chk(c);
+    }
+    if count > buflen {
+        return Err(refuse(
+            c,
+            format!(
+                "the guest called __write_chk(fd {fd}, buf={buf:#x}, count={count}, \
+                 buflen={buflen}) on a socket -- it asked to write {count} bytes out of a buffer \
+                 the compiler knows is {buflen}. bionic answers that with __fortify_fatal"
+            ),
+        ));
+    }
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        socket_send(view, &handle, fd, buf, count, 0, None)
+    })
+}
+
+/// Whether `fd` is a socket in this instance, for the three dispatching symbols.
+///
+/// **An instance with no filesystem has no descriptors at all**, so it has no sockets either and
+/// the call goes to `files`, which refuses by name with the message that says a root is missing.
+/// Answering the dispatch question here rather than letting `files` do it keeps that refusal in
+/// one place.
+fn is_socket(c: &ImportCall<'_, '_>, fd: i32) -> AbiResult<bool> {
+    let state = active(c.symbol(), c.address())?;
+    Ok(state.bionic.filesystem().is_some_and(|fs| fs.is_socket(fd)))
+}
+
+// ================================================================== name resolution
+
+/// Map a resolver failure onto the `EAI_*` numbering `gai_strerror` already carries.
+///
+/// **[`ResolveFailure::Unclassified`] deliberately has no code**, and that is the one decision in
+/// this function. D30 names it as the trap in as many words: a measured failure path may be used
+/// as a diagnostic and must never become the finished behaviour, and a default `EAI_NONAME` for
+/// anything unrecognised is exactly that — the guest would be told the name does not exist, would
+/// stop asking for ever, and nothing anywhere would record that this layer had invented the
+/// answer. `omni_platform::net::resolve` documents the case it arises in: the unix targets, where
+/// `std` reports a resolver failure with no error number at all.
+///
+/// The numbering is bionic's `netdb.h`, which counts **up** from 1 where glibc counts down from
+/// -1 — so taking the development host's values would be silently wrong. It is corroborated inside
+/// `omni_bionic::net`: `gai_strerror_message`'s table is bionic's own `ai_errlist`, and row 8 is
+/// "Name or service not known", which is the string `EAI_NONAME` carries.
+fn eai_for(failure: ResolveFailure) -> Option<i32> {
+    Some(match failure {
+        ResolveFailure::NoSuchHost => net::EAI_NONAME,
+        ResolveFailure::NoAddressOfFamily => EAI_ADDRFAMILY,
+        ResolveFailure::Transient => EAI_AGAIN,
+        ResolveFailure::NonRecoverable => EAI_FAIL,
+        // `ResolveFailure::Unclassified`, and nothing else. A wildcard because the enum is
+        // `#[non_exhaustive]`: a class added upstream without a decision here must refuse by name
+        // rather than acquire a plausible code.
+        _ => return None,
+    })
+}
+
+/// What the guest's `struct addrinfo` hints asked for.
+#[derive(Debug, Clone, Copy)]
+struct Hints {
+    flags: i32,
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+}
+
+impl Hints {
+    /// What a null `hints` means: any family, any socket type, no flags.
+    const ANY: Hints =
+        Hints { flags: 0, family: addrinfo::AF_UNSPEC, socktype: 0, protocol: 0 };
+}
+
 /// `int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)`
 ///
-/// Refused, for two independent reasons and either would be enough.
+/// **Answered from M6, where it had been refused by name since phase 3d.** The refusal gave two
+/// reasons and said either alone was decisive. One is void: D30 withdrew Global Constraint 8 and
+/// `omni_platform::net::resolve` is the resolver it said was missing. The other was the real work
+/// and is what [`addrinfo`](super::addrinfo) is:
 ///
-/// **There is nowhere to put the answer.** `getaddrinfo` allocates a linked list of
-/// `struct addrinfo` *in guest memory* — each node carrying an `ai_addr` pointer to a
-/// `sockaddr` and an optional `ai_canonname` string — and hands back a pointer the guest walks
-/// and later frees. This layer has no guest allocator to build one with: the adapter's arena is a
-/// fixed set of tables sized at construction, at 65,280 bytes of a 65,536-byte commit granule
-/// with 256 bytes spare, its pool is a bump allocator that never frees — so a guest resolving in
-/// a loop would exhaust it and never get the memory back — and task 2's finding F9 forbids a
-/// handler mapping guest memory at all, because an inline handler runs with generated code live.
-/// The guest's own allocator is not reachable from here either: `libroblox.so` imports no
-/// allocator (D17), it carries its own and reaches the host through guest `mmap`.
+/// > There is nowhere to put the answer. `getaddrinfo` allocates a linked list of
+/// > `struct addrinfo` *in guest memory* [...] the adapter's pool is a bump allocator that never
+/// > frees, so a guest resolving in a loop would exhaust it, and task 2's finding F9 forbids a
+/// > handler mapping guest memory at all.
 ///
-/// **And the resolution itself needs a network**, which is the whole of `socket`'s argument.
+/// Both halves of that still hold, which is why the answer is a **bounded slab with a free list**,
+/// mapped in `Bionic::new` and carved into [`ADDRINFO_RESULTS`](super::ADDRINFO_RESULTS) slots.
+/// `freeaddrinfo` gives a slot back by matching the head pointer this call handed out. **A full
+/// slab refuses by name**: never an overwrite of a list the guest is still walking, and never a
+/// truncated one, which would show up as a connection to an address the resolver did not return.
 ///
-/// One thing is worth recording for whoever implements this later: `sizeof(struct addrinfo)` on
-/// LP64 bionic would be **48 bytes** — `int ai_flags, ai_family, ai_socktype, ai_protocol`, a
-/// `socklen_t ai_addrlen` with four bytes of padding after it, then `char *ai_canonname`,
-/// `struct sockaddr *ai_addr` and `struct addrinfo *ai_next`. **That is ASSUMED, not verified**:
-/// there is no NDK on this machine, it is the same gap `FILE_BYTES` and `layouts.rs` record, and
-/// bionic orders `ai_canonname` before `ai_addr` where glibc does the reverse — so a
-/// glibc-derived layout would put the canonical name where the address belongs.
+/// The layout warning the refusal recorded is kept alive rather than retired —
+/// `sizeof(struct addrinfo)` is **48 bytes** and **ASSUMED**, there is no NDK on this machine, and
+/// **bionic orders `ai_canonname` before `ai_addr` where glibc reverses them**. `addrinfo`'s module
+/// documentation carries it, and `the_addrinfo_layout_is_bionics_and_not_glibcs` is the assertion.
+///
+/// # What is honoured, what is accepted, and what refuses
+///
+/// * **`AI_NUMERICHOST` is honoured exactly**: a node that is not an address literal answers
+///   `EAI_NONAME` without a query leaving the machine, which is the whole point of the flag.
+/// * **`AI_NUMERICSERV` is honoured by construction**: this seam takes a numeric service only —
+///   `omni_platform::net::service_port` refuses a service *name* by name rather than guessing that
+///   `https` is 443, because a built-in table would be a claim about the host's `/etc/services`
+///   that nothing here can check.
+/// * **`AI_CANONNAME` is accepted and `ai_canonname` is left null.** `std::net::ToSocketAddrs`
+///   returns no canonical name, so there is none to report; `omni_platform::net::resolve` records
+///   that limit, and a name invented here is the one the guest would log and trust.
+/// * **`AI_ADDRCONFIG`, `AI_V4MAPPED`, `AI_V4MAPPED_CFG` and `AI_ALL` are accepted and do not
+///   change the answer.** Each of them *narrows or widens by family*, and what they cannot do is
+///   make this layer return an address the resolver did not give: the observable difference is a
+///   `connect` the guest tries and the host refuses, which is the same outcome the guest already
+///   has a branch for. Stated here rather than left silent, because accepting a flag is a claim.
+/// * **`AI_PASSIVE` is accepted and is unreachable in the case it changes.** It matters only for
+///   a null `node`, and a null `node` is refused below: it asks `getaddrinfo` for a *listening*
+///   address, and this seam has no `listen` and no `accept`.
+/// * A bit outside `netdb.h` is `EAI_BADFLAGS`, which is the guest's own answer for it.
 pub(super) fn getaddrinfo(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (node, service, hints, res) = {
         let mut a = c.args();
         (a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
     };
-    Err(refuse(
-        c,
-        format!(
-            "the guest called getaddrinfo(node={node:#x}, service={service:#x}, \
-             hints={hints:#x}, res={res:#x}). Two things are missing and either alone is \
-             decisive. There is nowhere to build the answer: a `struct addrinfo` list lives in \
-             GUEST memory and must be freeable by `freeaddrinfo`, and this layer has no guest \
-             allocator -- the arena is fixed at construction and the pool is a bump allocator \
-             that never frees, while F9 forbids a handler mapping guest memory. And the \
-             resolution needs DNS, which means a network this runtime does not give the guest \
-             (see `socket`) and Global Constraint 8 forbids at run time. Returning EAI_NONAME or \
-             EAI_FAIL was rejected: a caller retries EAI_AGAIN, reports EAI_FAIL as a real DNS \
-             failure, and either way believes it asked a resolver"
-        ),
-    ))
+    let state = active(c.symbol(), c.address())?;
+    let code = {
+        let mut view = enter(c, &state);
+        resolve_into(c, &mut view, node, service, hints, res)?
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
+/// The whole of `getaddrinfo`'s decision, with the guest view alive.
+///
+/// Returns the `EAI_*` code, or `0` with `*res` written.
+fn resolve_into(
+    c: &ImportCall<'_, '_>,
+    view: &mut GuestView<'_>,
+    node: u64,
+    service: u64,
+    hints: u64,
+    res: u64,
+) -> AbiResult<i32> {
+    if node == 0 {
+        // A null `node` asks for the local host — the loopback address, or the wildcard with
+        // `AI_PASSIVE`. Both are *listening* questions and this seam implements outgoing
+        // connections only, so answering one would be inventing a use for a result nothing here
+        // can consume. `omni_platform::net::resolve` refuses the same thing for the same reason.
+        return Err(refuse(
+            c,
+            "the guest called getaddrinfo with a null `node`, which asks for an address to bind \
+             and listen on. This layer has no `listen` and no `accept` -- `omni_platform::net` is \
+             a TCP and UDP client -- so there is no answer that is not invented. A run that \
+             reaches this is a run that needs an inbound path, which is new work and not a \
+             missing line"
+                .to_string(),
+        ));
+    }
+    if res == 0 {
+        // The out-parameter is where the whole answer goes. A null one is `EFAULT` on a device;
+        // it arrives here as a refusal for `files::path_for`'s stated reason -- a guest that
+        // ignored the return would walk an uninitialised pointer.
+        return Err(view.refusal("`getaddrinfo` was given a null `res` pointer"));
+    }
+    let res_at = guest_address(view, res)?;
+
+    let hints = if hints == 0 {
+        Hints::ANY
+    } else {
+        let at = guest_address(view, hints)?;
+        let blame = Blame::new(view.symbol(), view.address(), 2);
+        let raw = view.mem().read_bytes(at, addrinfo::ADDRINFO_BYTES, blame)?;
+        let field = |offset: usize| {
+            i32::from_le_bytes(raw[offset..offset + 4].try_into().expect("four bytes"))
+        };
+        Hints { flags: field(0), family: field(4), socktype: field(8), protocol: field(12) }
+    };
+
+    if hints.flags & !AI_MASK != 0 {
+        return Ok(EAI_BADFLAGS);
+    }
+    let want = match hints.family {
+        addrinfo::AF_UNSPEC => None,
+        addrinfo::AF_INET => Some(IpFamily::V4),
+        addrinfo::AF_INET6 => Some(IpFamily::V6),
+        _ => return Ok(EAI_FAMILY),
+    };
+    // **One node per address per socket type**, and a zero `ai_socktype` means both. That is
+    // bionic's own shape: its `explore` table has a row per (family, socktype, protocol) and a
+    // hints socktype of 0 visits every row, which is why a real `getaddrinfo` returns several
+    // nodes for one address. The order is bionic's too -- datagram before stream -- and it is
+    // ASSUMED from that table rather than measured, for the same reason the layout is.
+    let socktypes: &[(i32, i32)] = match hints.socktype {
+        SOCK_STREAM => &[(SOCK_STREAM, IPPROTO_TCP)],
+        SOCK_DGRAM => &[(SOCK_DGRAM, IPPROTO_UDP)],
+        0 => &[(SOCK_DGRAM, IPPROTO_UDP), (SOCK_STREAM, IPPROTO_TCP)],
+        _ => return Ok(EAI_SOCKTYPE),
+    };
+    if hints.protocol != IPPROTO_IP
+        && !socktypes.iter().any(|(_, protocol)| *protocol == hints.protocol)
+    {
+        // A protocol that no socket type in the request can carry. Bionic answers `EAI_SOCKTYPE`
+        // for the mismatch rather than `EAI_PROTOCOL`, which it reserves for a protocol it does
+        // not know at all.
+        return Ok(EAI_SOCKTYPE);
+    }
+    let socktypes: Vec<(i32, i32)> = socktypes
+        .iter()
+        .copied()
+        .filter(|(_, protocol)| hints.protocol == IPPROTO_IP || *protocol == hints.protocol)
+        .collect();
+
+    let name = {
+        let at = guest_address(view, node)?;
+        let bytes = view.mem().cstr(at, Blame::new(view.symbol(), view.address(), 0))?;
+        match String::from_utf8(bytes) {
+            Ok(name) => name,
+            // A host name is IDNA or ASCII; bytes that are not UTF-8 are not a name any resolver
+            // can be asked about, and `EAI_NONAME` is what a device answers for one.
+            Err(_) => return Ok(net::EAI_NONAME),
+        }
+    };
+    if hints.flags & AI_NUMERICHOST != 0 && name.parse::<std::net::IpAddr>().is_err() {
+        // The flag's entire purpose: no query may leave the machine for a name that is not
+        // already an address. `EAI_NONAME` is what `getaddrinfo` answers for it.
+        return Ok(net::EAI_NONAME);
+    }
+    let port = if service == 0 {
+        0
+    } else {
+        let at = guest_address(view, service)?;
+        let bytes = view.mem().cstr(at, Blame::new(view.symbol(), view.address(), 1))?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        match platnet::service_port(&text) {
+            Ok(port) => port,
+            Err(error) => return Err(view.refusal(error.to_string())),
+        }
+    };
+
+    let policy = policy(view)?;
+    let addresses = match platnet::resolve(&name, port, want, &policy) {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            return match error.resolve_failure().and_then(eai_for) {
+                Some(code) => Ok(code),
+                // Everything else -- a policy refusal, an unclassified resolver failure, an empty
+                // name -- refuses by name. D30 names the alternative as the trap: an `EAI_*` for a
+                // failure nobody classified tells the guest something definite about a name, and
+                // the guest acts on it for ever.
+                None => Err(view.refusal(error.to_string())),
+            };
+        }
+    };
+
+    let mut nodes = Vec::new();
+    for address in &addresses {
+        for (socktype, protocol) in &socktypes {
+            nodes.push(addrinfo::ResultNode {
+                socktype: *socktype,
+                protocol: *protocol,
+                address: *address,
+            });
+        }
+    }
+    if nodes.len() > addrinfo::ADDRINFO_NODES_PER_RESULT {
+        return Err(view.refusal(format!(
+            "`{name}` resolved to {} address(es) which, with {} socket type(s), is {} \
+             `struct addrinfo` nodes -- and one result slot holds {}. The list is refused rather \
+             than truncated: a truncated one is indistinguishable from a complete one to the \
+             guest, which would connect to whichever addresses survived while nothing recorded \
+             that the resolver had offered others. Raising ADDRINFO_NODES_PER_RESULT is the fix, \
+             and it is a decision about the slab's size rather than a line to add",
+            addresses.len(),
+            socktypes.len(),
+            nodes.len(),
+            addrinfo::ADDRINFO_NODES_PER_RESULT
+        )));
+    }
+
+    let slab = view.active.bionic.addrinfo_slab();
+    let Some(head) = slab.take() else {
+        return Err(view.refusal(format!(
+            "the `struct addrinfo` slab is full: all {} result slots are live, which means the \
+             guest holds that many lists it has not passed to `freeaddrinfo`. The call is refused \
+             rather than reusing a slot, because reusing one overwrites a list the guest may still \
+             be walking -- and it would do it silently, since nothing in a walk can tell a node \
+             from a node that has been replaced. `Bionic::addrinfo_slab().live()` is what says \
+             whether this is a guest that leaks or a slab that is too small",
+            super::ADDRINFO_RESULTS
+        )));
+    };
+    // From here on the slot is taken, so every failure path gives it back. A slot leaked by an
+    // error return is a slot no `freeaddrinfo` can ever name, and after
+    // ADDRINFO_RESULTS of them every later resolution refuses.
+    let bytes = addrinfo::encode_result(&nodes, head);
+    let blame = Blame::new(view.symbol(), view.address(), 3);
+    // **The whole list, then the head pointer, and the guest's own pointer last.** The guest
+    // learns the address only after the bytes it points at are there, so a write that fails
+    // leaves `*res` untouched and the guest with nothing to walk.
+    if let Err(error) = view.mem().write_bytes(head, &bytes, blame) {
+        slab.release(head);
+        return Err(error);
+    }
+    if let Err(error) = view.mem().write_u64(res_at, head as u64, blame) {
+        slab.release(head);
+        return Err(error);
+    }
+    Ok(0)
 }
 
 /// `void freeaddrinfo(struct addrinfo *res)`
 ///
-/// Refused, and the **`void` return is exactly why**. There is no value to get wrong, so a stub
-/// here would be invisible: it would do nothing, report nothing, and be indistinguishable from a
-/// correct implementation until something needed the memory back.
+/// **Answered from M6, and the `void` return is still exactly why it cannot be a stub.** The old
+/// refusal's argument was that nothing in this layer could produce a list, so any pointer arriving
+/// here came from somewhere else — and that doing nothing would be indistinguishable from a
+/// correct free, "on the day `getaddrinfo` starts returning real lists and this stub starts
+/// leaking them". This is that day, and the answer is a free list rather than a no-op.
 ///
-/// Nothing in this layer can produce an `addrinfo` list — `getaddrinfo` refuses — so any pointer
-/// that arrives here was not made by this layer. Freeing it is impossible (there is nothing to
-/// free), and *ignoring* it would be a claim that the list is gone.
+/// The slot is matched on the **head pointer this layer handed out**, exactly, and a pointer that
+/// matches nothing is a refusal naming it. That refuses three things a range check would accept:
+///
+/// * `res->ai_next`, which a guest walking and freeing as it went would pass — and which would
+///   free a slot the guest is still reading;
+/// * a list already freed, which is a double free and a defect worth hearing about;
+/// * a pointer from somewhere else entirely, which is the case the old refusal was about.
+///
+/// A null pointer is a no-op and not a refusal: bionic's own `freeaddrinfo` is a `while (ai)`
+/// loop, so `freeaddrinfo(NULL)` does nothing there and callers written against it rely on that.
 pub(super) fn freeaddrinfo(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let res = c.args().next_u64()?;
+    if res == 0 {
+        return Ok(());
+    }
+    let state = active(c.symbol(), c.address())?;
+    let head = guest_address(&enter(c, &state), res)?;
+    if state.bionic.addrinfo_slab().release(head) {
+        return Ok(());
+    }
     Err(refuse(
         c,
         format!(
-            "the guest called freeaddrinfo({res:#x}). Nothing in this layer can have produced \
-             that list -- `getaddrinfo` refuses by name -- so the pointer came from somewhere \
-             else. This function returns `void`, which is what makes doing nothing the \
-             dangerous answer here: a silent no-op is indistinguishable from a correct free, and \
-             it would still be indistinguishable on the day `getaddrinfo` starts returning real \
-             lists and this stub starts leaking them"
+            "the guest called freeaddrinfo({res:#x}), and that is not the head of any list this \
+             layer handed out. `getaddrinfo` answers out of a bounded slab and records the head \
+             pointer of every live result; a pointer that matches none of them is one of three \
+             things, and none of them is a free: a pointer INTO a live list (`res->ai_next`, \
+             which a guest that walks and frees as it goes would pass, and freeing it would \
+             release a slot the guest is still reading), a list that has already been freed, or a \
+             pointer from somewhere else. This function returns `void`, which is what makes doing \
+             nothing the dangerous answer: a silent no-op is indistinguishable from a correct free"
         ),
     ))
 }
@@ -951,6 +3086,29 @@ mod tests {
         assert_eq!(FD_SETSIZE as usize / 8, 128, "sizeof(fd_set)");
     }
 
+    /// **A set naming a socket or the readiness gate can become ready; one naming neither cannot.**
+    ///
+    /// This predicate is what `bounded_wait` turns the 60-second cap on, so getting it wrong in
+    /// the "false" direction refuses the 69.001-second `poll` the engine's HTTP stack asks for
+    /// over the settings socket and kills the thread carrying the connection — MEASURED, and it
+    /// is why the cap stopped being unconditional. Getting it wrong in the "true" direction lets
+    /// a plain sleep run unbounded, which is the D16 hazard the cap exists for.
+    ///
+    /// It is a function rather than an inline `||` for the reason `clocks::capped` is one: a
+    /// mutation of it has to have somewhere to be caught, and the condition it feeds needs an
+    /// `ImportCall` to reach. See `sockcfg-B2` in `tools/mutate.py`.
+    #[test]
+    fn a_set_can_become_ready_exactly_when_it_names_a_socket_or_the_gate() {
+        assert!(!Watch::default().can_change(), "a set of files and standard streams cannot");
+        let socket_only =
+            Watch { sockets: vec![(7, Interest::READABLE)], gate: false };
+        assert!(socket_only.can_change(), "a socket's readiness is the network's");
+        let gate_only = Watch { sockets: Vec::new(), gate: true };
+        assert!(gate_only.can_change(), "a pipe or an eventfd is another descriptor's writer");
+        let both = Watch { sockets: vec![(7, Interest::BOTH)], gate: true };
+        assert!(both.can_change());
+    }
+
     /// The `fd_set` bit order is the kernel's: descriptor *n* is bit *n mod 8* of byte *n / 8*.
     ///
     /// Asserted on an asymmetric pattern, because a byte- or word-reversed implementation reads a
@@ -987,4 +3145,264 @@ mod tests {
         assert_eq!(MAX_POLL_FDS, 1024, "Linux's usual RLIMIT_NOFILE soft limit");
         assert_eq!(FD_SETSIZE, 1024, "and the size of an fd_set in bits");
     }
+    /// **The socket constants are the Linux arm64 values**, written as literals.
+    ///
+    /// The same discipline `omni_bionic::errno` records and the same reason, one family along:
+    /// these numbers reach the guest, the development host's are different — `SOL_SOCKET` is
+    /// `0xFFFF` on Winsock and 1 here, `WSAECONNREFUSED` is 10061 and `ECONNREFUSED` is 111 — and
+    /// a wrong one makes the guest take the wrong branch rather than making the build fail.
+    /// Comparing a constant to itself would pass against any value.
+    #[test]
+    fn the_socket_constants_are_the_linux_values() {
+        // `socket(2)`'s type word.
+        assert_eq!(SOCK_STREAM, 1);
+        assert_eq!(SOCK_DGRAM, 2);
+        assert_eq!(SOCK_NONBLOCK, 0o4000);
+        assert_eq!(SOCK_CLOEXEC, 0o2_000_000);
+        assert_eq!(SOCK_FLAGS, 0o2_004_000, "the two bits that are not the socket kind");
+        // Protocols and levels.
+        assert_eq!(IPPROTO_IP, 0);
+        assert_eq!(IPPROTO_TCP, 6);
+        assert_eq!(IPPROTO_UDP, 17);
+        assert_eq!(IPPROTO_IPV6, 41);
+        assert_eq!(SOL_SOCKET, 1, "Winsock spells this 0xFFFF; the guest is Linux");
+        // Options.
+        assert_eq!(SO_REUSEADDR, 2);
+        assert_eq!(SO_ERROR, 4);
+        assert_eq!(SO_SNDBUF, 7);
+        assert_eq!(SO_RCVBUF, 8);
+        assert_eq!(SO_RCVTIMEO, 20, "the _OLD form, which is what LP64 userspace uses");
+        assert_eq!(SO_SNDTIMEO, 21);
+        assert_eq!(SO_KEEPALIVE, 9, "the switch, which M6's network run found the engine setting");
+        assert_eq!(TCP_NODELAY, 1);
+        assert_eq!(IPV6_V6ONLY, 26);
+        // **The three keep-alive TIMING options, and they are the ones where taking the
+        // development host's numbers would be silently wrong in the worst way.** Windows spells
+        // the idle time `TCP_KEEPALIVE` = 3, the count `TCP_KEEPCNT` = 16 and the interval
+        // `TCP_KEEPINTVL` = 17 -- and it puts `TCP_MAXRT` on 5, which is Linux's
+        // `TCP_KEEPINTVL`. So a pass-through of the guest's 5 sets a real Windows option with a
+        // different meaning, `setsockopt` answers 0, and nothing anywhere reports it. The
+        // mapping itself is asserted by round trip in
+        // `the_keep_alive_timing_options_reach_the_socket_in_the_guests_numbering`; these three
+        // lines are the guest half of it.
+        assert_eq!(TCP_KEEPIDLE, 4, "Windows calls the same quantity TCP_KEEPALIVE and numbers it 3");
+        assert_eq!(TCP_KEEPINTVL, 5, "Windows numbers this 17, and puts TCP_MAXRT on 5");
+        assert_eq!(TCP_KEEPCNT, 6, "Windows numbers this 16");
+        // `shutdown(2)`.
+        assert_eq!(SHUT_RD, 0);
+        assert_eq!(SHUT_WR, 1);
+        assert_eq!(SHUT_RDWR, 2);
+        // Message flags.
+        assert_eq!(MSG_DONTWAIT, 0x40);
+        assert_eq!(MSG_NOSIGNAL, 0x4000);
+        // **`SO_KEEPALIVE` used to be the exception here and is not any more**, and the line is
+        // corrected in place rather than deleted because the history is the point: M6's network
+        // run found the engine setting option 9 at `SOL_SOCKET` on the settings socket, this
+        // seam had no `SocketOption` for it, and the refusal killed the fetch thread. It is
+        // implemented now and is asserted above with the rest.
+        //
+        // What is left is the shape that assertion had, pointed at something that genuinely is
+        // not implemented: **`SO_LINGER` is 13**, nothing here has a variant for it, and if it
+        // ever gains one this line is where a reader finds out it used to refuse.
+        for implemented in [
+            SO_REUSEADDR,
+            SO_ERROR,
+            SO_SNDBUF,
+            SO_RCVBUF,
+            SO_RCVTIMEO,
+            SO_SNDTIMEO,
+            SO_KEEPALIVE,
+        ] {
+            assert_ne!(implemented, 13, "SO_LINGER is 13 and is not implemented");
+        }
+    }
+
+    /// **The socket errno numbers are Linux's `asm-generic/errno.h`**, written as literals.
+    ///
+    /// They are here rather than in `omni_bionic::errno` because that module's table is
+    /// "constants reachable by this crate's functions" and no function in it can produce a socket
+    /// failure. The values still reach the guest, so they get the same test.
+    ///
+    /// `EINPROGRESS` is the one worth reading twice: it is the **normal** answer to a
+    /// non-blocking `connect`, not an edge case, and a guest that received any other value would
+    /// treat a connection that was merely in flight as one that had failed.
+    #[test]
+    fn the_socket_errno_numbers_are_the_linux_values() {
+        assert_eq!(ENOTSOCK, 88);
+        assert_eq!(EMSGSIZE, 90);
+        assert_eq!(ENOPROTOOPT, 92);
+        assert_eq!(EADDRINUSE, 98);
+        assert_eq!(EADDRNOTAVAIL, 99);
+        assert_eq!(ENETUNREACH, 101);
+        assert_eq!(ECONNABORTED, 103);
+        assert_eq!(ECONNRESET, 104);
+        assert_eq!(ENOBUFS, 105);
+        assert_eq!(EISCONN, 106);
+        assert_eq!(ENOTCONN, 107);
+        assert_eq!(ECONNREFUSED, 111);
+        assert_eq!(EHOSTUNREACH, 113);
+        assert_eq!(EINPROGRESS, 115);
+        // And none of them collides with one `omni_bionic::errno` already owns, which is what
+        // would happen if this table had been written from the wrong architecture's headers.
+        for socket_errno in [
+            ENOTSOCK, EMSGSIZE, ENOPROTOOPT, EADDRINUSE, EADDRNOTAVAIL, ENETUNREACH,
+            ECONNABORTED, ECONNRESET, ENOBUFS, EISCONN, ENOTCONN, ECONNREFUSED, EHOSTUNREACH,
+            EINPROGRESS,
+        ] {
+            for owned in [
+                consts::EAGAIN,
+                consts::EINVAL,
+                consts::EACCES,
+                consts::EPIPE,
+                consts::EINTR,
+                consts::EAFNOSUPPORT,
+                consts::ETIMEDOUT,
+                consts::EBADF,
+            ] {
+                assert_ne!(socket_errno, owned, "two names for one number");
+            }
+        }
+    }
+
+    /// **Every classified host failure has an errno, and `Other` has none.**
+    ///
+    /// Membership over the whole enum rather than a count (VERIFICATION entry 1), because the
+    /// failure this catches is a kind silently acquiring the *wrong* errno: the mapping is
+    /// one-to-one, so two kinds sharing a number is a copy-and-paste error that nothing else can
+    /// see. `Other` is the one that must stay unmapped — it is the kind `std::io::ErrorKind`
+    /// could not classify, and giving it `EIO` would hand guest code an actionable branch for
+    /// something nobody identified.
+    #[test]
+    fn every_classified_network_failure_maps_to_exactly_one_errno_and_other_maps_to_none() {
+        let classified = [
+            NetErrorKind::WouldBlock,
+            NetErrorKind::InProgress,
+            NetErrorKind::AlreadyConnected,
+            NetErrorKind::NotConnected,
+            NetErrorKind::ConnectionRefused,
+            NetErrorKind::ConnectionReset,
+            NetErrorKind::ConnectionAborted,
+            NetErrorKind::AddressInUse,
+            NetErrorKind::AddressNotAvailable,
+            NetErrorKind::NetworkUnreachable,
+            NetErrorKind::HostUnreachable,
+            NetErrorKind::TimedOut,
+            NetErrorKind::BrokenPipe,
+            NetErrorKind::PermissionDenied,
+            NetErrorKind::InvalidInput,
+            NetErrorKind::AddressFamilyNotSupported,
+            NetErrorKind::MessageSize,
+            NetErrorKind::Interrupted,
+            NetErrorKind::NoBufferSpace,
+        ];
+        let mut seen = Vec::new();
+        for kind in classified {
+            let errno = net_errno_for(kind).unwrap_or_else(|| {
+                panic!("{kind} is a classified failure and has no errno")
+            });
+            assert!(errno > 0, "{kind} mapped to {errno}, and an errno is positive");
+            assert!(!seen.contains(&errno), "{kind} shares errno {errno} with another kind");
+            seen.push(errno);
+        }
+        assert_eq!(
+            net_errno_for(NetErrorKind::Other),
+            None,
+            "an unclassified host failure must refuse by name rather than acquire an errno"
+        );
+    }
+
+    /// **`ResolveFailure::Unclassified` has no `EAI_*` code, and the other four do.**
+    ///
+    /// D30 names this as the trap in as many words: a default `EAI_NONAME` for a failure nobody
+    /// classified tells the guest the name does not exist — which is permanent, so the guest stops
+    /// asking for ever — and nothing anywhere records that this layer invented the answer.
+    ///
+    /// The four that *are* mapped are asserted against bionic's own numbering, which counts **up**
+    /// from 1 where glibc counts down from -1. `EAI_NONAME` is corroborated inside `omni-bionic`:
+    /// row 8 of `gai_strerror_message`'s table is "Name or service not known".
+    #[test]
+    fn the_resolver_classes_map_to_bionics_eai_numbers_and_unclassified_maps_to_none() {
+        assert_eq!(eai_for(ResolveFailure::NoSuchHost), Some(8));
+        assert_eq!(eai_for(ResolveFailure::NoSuchHost), Some(net::EAI_NONAME));
+        assert_eq!(eai_for(ResolveFailure::NoAddressOfFamily), Some(1));
+        assert_eq!(eai_for(ResolveFailure::Transient), Some(2));
+        assert_eq!(eai_for(ResolveFailure::NonRecoverable), Some(4));
+        assert_eq!(
+            eai_for(ResolveFailure::Unclassified),
+            None,
+            "D30: a measured failure path may be a diagnostic and must never be the contract"
+        );
+        // The four codes are distinct and each carries bionic's own message, which is what says
+        // the numbering is bionic's rather than a host's.
+        assert_eq!(net::gai_strerror_message(8), "Name or service not known");
+        assert_eq!(net::gai_strerror_message(1), "Address family for hostname not supported");
+        assert_eq!(net::gai_strerror_message(2), "Temporary failure in name resolution");
+        assert_eq!(net::gai_strerror_message(4), "Non-recoverable failure in name resolution");
+        // And the retryable one is the only retryable one, which is what a client acts on.
+        assert!(ResolveFailure::Transient.is_retryable());
+        for permanent in [
+            ResolveFailure::NoSuchHost,
+            ResolveFailure::NoAddressOfFamily,
+            ResolveFailure::NonRecoverable,
+            ResolveFailure::Unclassified,
+        ] {
+            assert!(!permanent.is_retryable(), "{permanent} is not worth asking again");
+        }
+    }
+
+    /// **`MSG_DONTWAIT` is honoured only where it asks for something already true.**
+    ///
+    /// `omni_platform::net` takes the socket's own blocking mode and has no per-call flag, so the
+    /// only honest reading of the flag is "make this call non-blocking" — which
+    /// [`wants_nonblocking`] does by returning true. What it must not do is report a blocking call
+    /// as non-blocking or the other way round.
+    #[test]
+    fn the_per_call_nonblocking_flag_is_the_union_of_the_two_sources() {
+        assert!(wants_nonblocking(true, 0), "the socket's own flag");
+        assert!(wants_nonblocking(false, MSG_DONTWAIT), "the per-call flag");
+        assert!(wants_nonblocking(true, MSG_DONTWAIT), "both");
+        assert!(!wants_nonblocking(false, 0), "neither");
+        assert!(
+            !wants_nonblocking(false, MSG_NOSIGNAL),
+            "MSG_NOSIGNAL says nothing about blocking"
+        );
+    }
+
+    /// **A guest-chosen transfer length never becomes a host allocation of that size.**
+    ///
+    /// The bound this exists for is a `read(fd, buf, SIZE_MAX)`: `count` is a `size_t` the guest
+    /// supplies, and without a cap it is a request for that many bytes of host memory. A short
+    /// transfer is `read`'s and `write`'s own contract on a socket, so capping one call is
+    /// conforming rather than a truncation.
+    #[test]
+    fn a_guest_chosen_transfer_length_is_capped_rather_than_allocated() {
+        assert_eq!(transfer_length(0), 0);
+        assert_eq!(transfer_length(1), 1);
+        assert_eq!(transfer_length(SOCKET_IO_BLOCK as u64), SOCKET_IO_BLOCK);
+        assert_eq!(transfer_length(SOCKET_IO_BLOCK as u64 + 1), SOCKET_IO_BLOCK);
+        assert_eq!(transfer_length(u64::MAX), SOCKET_IO_BLOCK);
+        // **Against the number rather than against the constant**, because a cap read out of
+        // whatever `SOCKET_IO_BLOCK` happens to be would agree with any value. A TLS record is up
+        // to 16 KiB plus framing and the engine carries its own OpenSSL, so a cap below one
+        // record turns every record into four calls.
+        assert!(
+            transfer_length(u64::MAX) >= 16 * 1024,
+            "a socket transfer is capped at {} bytes, below one TLS record",
+            transfer_length(u64::MAX)
+        );
+    }
+
+    /// **A `struct timeval` round-trips, and a zero one is "no timeout" rather than zero.**
+    ///
+    /// The distinction is the one `setsockopt(SO_RCVTIMEO)` makes on a device: a zero `timeval`
+    /// clears the timeout, and a caller that had it translated into a zero-length one would have
+    /// every receive time out immediately.
+    #[test]
+    fn a_zero_timeval_clears_the_timeout_and_a_real_one_round_trips() {
+        assert_eq!(timeval_bytes(None), [0u8; TIMEVAL_BYTES]);
+        let bytes = timeval_bytes(Some(Duration::from_millis(2_500)));
+        assert_eq!(&bytes[..8], &2i64.to_le_bytes(), "tv_sec");
+        assert_eq!(&bytes[8..], &500_000i64.to_le_bytes(), "tv_usec, not milliseconds");
+    }
+
 }

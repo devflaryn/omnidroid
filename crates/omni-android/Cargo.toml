@@ -64,3 +64,18 @@ omni-cpu = { path = "../omni-cpu", default-features = false, features = ["dynarm
 # Constraint 2).
 omni-apk = { workspace = true }
 # `omni-platform` is an ordinary dependency now (see above) and needs no entry here.
+#
+# The renderer, **for test targets only**, and the direction is why it is down here rather than
+# above. `omni-gfx` and `omni-android` are siblings in `ARCHITECTURE.md` section 2's table:
+# neither is below the other, `omni-core` is what orchestrates both, and an ordinary dependency
+# either way would be this crate deciding which graphics API the engine gets -- which D8 has not
+# measured and which `ndk/window.rs` is deliberately not in the business of.
+#
+# What needs it is `tests/ndk_host_window.rs`, and only because the claim that test makes cannot
+# be made any other way: that `ANativeWindow_getWidth` answers the client size of a window real
+# frames are being presented into. A mock renderer would assert facts about the mock -- the same
+# argument the two entries above make for the translating backend and for the real APK. With
+# resolver = "2" a dev-dependency's features reach only the test targets, so the shipping
+# dependency graph is untouched and `cargo tree -p omni-android -e normal` still contains no
+# `ash` and no `libloading`.
+omni-gfx = { workspace = true }

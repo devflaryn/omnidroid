@@ -71,6 +71,43 @@
 //! `dlerror` is per **thread**, as bionic's is, and is cleared by reading — the idiom
 //! `dlerror(); p = dlsym(..); if (dlerror())` depends on both halves.
 //!
+//! # One scope that is **not** in the guest's `DT_VERNEED`: the Vulkan loader
+//!
+//! The table above derives every scope from the importing binary's own version records, and that
+//! is still the rule for every library the guest *links against*. `libvulkan.so` is not one of
+//! them. `libroblox.so` has **zero `vk*` symbols in its import table**; it reaches Vulkan the way
+//! a loader is meant to be reached, at guest `0x02595160`:
+//!
+//! ```text
+//! 0x2595170: adrp/add x0, "libvulkan.so.1" ; mov w1, #2 (RTLD_NOW) ; bl dlopen
+//! 0x2595180: cbnz x0, got_it               ; if that failed,
+//! 0x2595184: adrp/add x0, "libvulkan.so"   ; mov w1, #2            ; bl dlopen
+//! 0x2595194: cbz  x0, give_up
+//! 0x2595198: adrp/add x1, "vkGetInstanceProcAddr" ; bl dlsym
+//! ```
+//!
+//! `.gnu.version_r` can never mention those names, because nothing in the file references them, so
+//! [`Boundary::libraries`](crate::Boundary::libraries) will never contain them and the NULL arm
+//! above would answer both `dlopen`s. **That NULL is a decision, not a fact**, and the `cbz` at
+//! `0x2595194` is the branch that swallows it: the engine falls back to whichever renderer it has
+//! left and nothing anywhere records that a choice was made — D22's shape, and the argument the
+//! `getauxval` case already made one library along.
+//!
+//! So `dlopen` answers for a second, short list: the `soname`s of libraries **this layer supplies
+//! in its own right**, which is [`vulkan::LOADER_SONAMES`](crate::vulkan::LOADER_SONAMES) and
+//! nothing else. Two properties keep that from becoming a handle nobody can honour:
+//!
+//! * It is issued **only when the symbol behind it is really bound** — `provided_index` looks
+//!   [`vulkan::LOADER_ENTRY_POINT`](crate::vulkan::LOADER_ENTRY_POINT) up in the boundary before
+//!   handing out a handle, so an embedding that never called `Vulkan::bind_into` gets the old
+//!   NULL and the old behaviour exactly.
+//! * `dlsym` in that scope answers from the *module's* own statement of what it exports
+//!   ([`vulkan::loader_exports`](crate::vulkan::loader_exports)) rather than from the boundary's
+//!   whole table, so `dlsym(vulkan_handle, "memcpy")` fails as it does on a device. A `vk*` name
+//!   that this layer does not export is a **refusal** rather than a NULL, because a real
+//!   `libvulkan.so` does export it and NULL there would be this layer lying about the platform —
+//!   the one thing the NULL arm above is careful not to do.
+//!
 //! These three are on the **exit path** rather than the fast one, because each needs the
 //! boundary's symbol table and [`ImportCall`] deliberately cannot reach it (D18 makes that a type
 //! property). None of them calls guest code. They are not hot: the engine makes fourteen direct
@@ -97,6 +134,45 @@ use super::view::{GuestView, DL_PHDR_INFO_BYTES};
 const HANDLE_TAG: u64 = 0xD10D_0000_0000_0000;
 /// The mask that separates the tag from the scope index.
 const HANDLE_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+/// Where the index space for libraries **this layer supplies in its own right** begins.
+///
+/// The low part of a handle indexes [`Boundary::libraries`](crate::Boundary::libraries), which is
+/// one entry per library the guest's own `DT_VERNEED` names — four, for `libroblox.so`. Starting
+/// the second space at 2^32 keeps the two from ever meeting without either of them needing to
+/// know how large the other is, and it means a handle read by eye says which kind it is.
+/// See the module documentation for why there is a second kind at all.
+const PROVIDED_BASE: u64 = 1 << 32;
+
+/// The libraries this layer supplies itself, beyond the ones the guest's own file names.
+///
+/// One family, and it is a `fn` rather than a `const` so that the list lives with the module that
+/// implements the library rather than being restated here.
+fn provided_libraries() -> &'static [&'static str] {
+    &crate::vulkan::LOADER_SONAMES
+}
+
+/// The index `dlopen` should issue for a provided library, or `None` if this runtime does not
+/// have it **bound**.
+///
+/// The second half is what stops this being a handle nobody can honour: an embedding that never
+/// called [`Vulkan::bind_into`](crate::Vulkan::bind_into) has no `vkGetInstanceProcAddr` slot, so
+/// there is nothing a handle could be used to reach and NULL — the answer this function's absence
+/// produces — is the true one.
+fn provided_index(boundary: &crate::Boundary, name: &str) -> Option<usize> {
+    let index = provided_libraries().iter().position(|candidate| *candidate == name)?;
+    boundary.lookup(None, crate::vulkan::LOADER_ENTRY_POINT).map(|_| index)
+}
+
+/// The provided library a handle names, if it names one.
+fn provided_library_of(handle: u64) -> Option<&'static str> {
+    if handle & !HANDLE_MASK != HANDLE_TAG {
+        return None;
+    }
+    (handle & HANDLE_MASK)
+        .checked_sub(PROVIDED_BASE)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| provided_libraries().get(index).copied())
+}
 
 thread_local! {
     // A `thread_local!` invocation carries no rustdoc, so the documentation is here: bionic keeps
@@ -121,6 +197,9 @@ fn scope_of(boundary: &crate::Boundary, handle: u64) -> Option<Option<String>> {
     let index = handle & HANDLE_MASK;
     if index == 0 {
         return Some(None);
+    }
+    if let Some(name) = provided_library_of(handle) {
+        return Some(Some(name.to_string()));
     }
     let libraries: Vec<&str> = boundary.libraries().into_iter().collect();
     libraries.get(index as usize - 1).map(|name| Some((*name).to_string()))
@@ -164,17 +243,26 @@ pub(super) fn dlopen(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 let libraries: Vec<&str> = boundary.libraries().into_iter().collect();
                 match libraries.iter().position(|candidate| *candidate == name) {
                     Some(index) => HANDLE_TAG | (index as u64 + 1),
-                    None => {
-                        // **NULL, not a refusal.** This runtime does not have that library, which
-                        // is a fact about it, and `dlopen` returning NULL for a library that is
-                        // not present is the answer every caller has a branch for.
-                        set_dlerror(format!(
-                            "dlopen failed: library \"{name}\" not found. This runtime supplies \
-                             {}, which are the libraries libroblox.so's own DT_VERNEED names",
-                            libraries.join(", ")
-                        ));
-                        0
-                    }
+                    // A library this layer supplies in its own right, which the guest's own
+                    // version records cannot name because nothing in the file references it.
+                    // See the module documentation: `libvulkan.so` is reached only through
+                    // `dlopen`, so a NULL here is a renderer decision and not a fact.
+                    None => match provided_index(&boundary, &name) {
+                        Some(index) => HANDLE_TAG | (PROVIDED_BASE + index as u64),
+                        None => {
+                            // **NULL, not a refusal.** This runtime does not have that library,
+                            // which is a fact about it, and `dlopen` returning NULL for a library
+                            // that is not present is the answer every caller has a branch for.
+                            set_dlerror(format!(
+                                "dlopen failed: library \"{name}\" not found. This runtime \
+                                 supplies {}, which are the libraries libroblox.so's own \
+                                 DT_VERNEED names, and {}, which it supplies in its own right",
+                                libraries.join(", "),
+                                provided_libraries().join(", ")
+                            ));
+                            0
+                        }
+                    },
                 }
             }
         }
@@ -222,6 +310,56 @@ pub(super) fn dlsym(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         c.ret(|mut r| r.u64(0));
         return Ok(());
     };
+    // A handle for a library this layer supplies in its own right answers from **that library's**
+    // statement of what it exports, not from the boundary's whole table. Without this, the scope
+    // check below would refuse everything — a provided library has no `Slot::library`
+    // attribution, because no `DT_VERNEED` record exists to give it one — and the global scope
+    // would answer for `memcpy`, which `libvulkan.so` does not export.
+    if let Some(library) = provided_library_of(handle) {
+        if crate::vulkan::loader_exports(&wanted) {
+            match boundary.lookup(None, &wanted) {
+                Some(slot) => c.ret(|mut r| r.u64(slot.address as u64)),
+                None => {
+                    // Reachable: `provided_index` checks the entry point is bound before issuing
+                    // a handle, but a guest can forge one, and a forged handle asking for a
+                    // symbol this layer has not bound is an ordinary `dlsym` miss.
+                    set_dlerror(format!(
+                        "dlsym failed: \"{wanted}\" is what \"{library}\" exports here, and \
+                         nothing in this boundary is bound to it"
+                    ));
+                    c.ret(|mut r| r.u64(0));
+                }
+            }
+            return Ok(());
+        }
+        if wanted.starts_with("vk") {
+            // **A refusal, not NULL.** A real `libvulkan.so` exports the core entry points
+            // directly as well as through `vkGetInstanceProcAddr`, so NULL here would be this
+            // layer claiming the platform's Vulkan loader does not have `{wanted}` — and the
+            // caller's null test would then disable something on the strength of it. The
+            // measured bootstrap at `0x2595198` asks for `vkGetInstanceProcAddr` and nothing
+            // else, so reaching this is itself the finding.
+            return Err(AbiError::Refused {
+                symbol,
+                address,
+                why: format!(
+                    "the guest called `dlsym(\"{library}\", \"{wanted}\")`. This runtime's Vulkan \
+                     loader exports `{entry}` and nothing else, because that is the only symbol \
+                     libroblox.so's own bootstrap at guest 0x2595198 fetches with dlsym -- every \
+                     other Vulkan function it uses arrives through vkGetInstanceProcAddr. NULL is \
+                     not the answer: a real libvulkan.so does export `{wanted}`, so a NULL here \
+                     would be a false statement about the platform and the guest's null test \
+                     would quietly turn something off on the strength of it",
+                    entry = crate::vulkan::LOADER_ENTRY_POINT
+                ),
+            });
+        }
+        set_dlerror(format!(
+            "dlsym failed: undefined symbol \"{wanted}\" in \"{library}\""
+        ));
+        c.ret(|mut r| r.u64(0));
+        return Ok(());
+    }
     let found = boundary.lookup(scope.as_deref(), &wanted).map(|slot| slot.address as u64);
     match found {
         Some(at) => {

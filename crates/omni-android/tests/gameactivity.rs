@@ -50,6 +50,7 @@ use omni_cpu::{GuestAddr, GuestCpu, RunLimit, XReg};
 use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
 use omni_elf::{ElfImage, LoadedObject};
 use omni_mem::{Backing, CommitPolicy, GuestSpace, MapExecutability, Placement, Protection};
+use omni_platform::net::NetPolicy;
 
 const APK_NAME: &str = "Roblox-2.738.1397.apk";
 const MAIN_LIB: &str = "libroblox.so";
@@ -324,6 +325,19 @@ impl Guest {
         let root = Scratch::new("m5-gate");
         bionic.set_filesystem_root(&root.0).expect("a filesystem root");
         bionic.set_memory_budget(GUEST_MEMORY_BUDGET);
+        // **Which network this guest may reach — D30's replacement for Global Constraint 8.**
+        //
+        // The `EAI_NONAME` diagnostic that used to stand here is gone, with the two `Bionic`
+        // methods behind it: `getaddrinfo` resolves for real now, and that switch's own doc
+        // comment said to delete it on this day. `VERIFICATION.md` entry 14 is why leaving it
+        // would have been the defect rather than the convenience.
+        //
+        // `NetPolicy::unrestricted()` is the word an embedding has to write on purpose; the gate
+        // is a measurement of what the real engine does against the real internet, so narrowing
+        // it would make a refused destination look like a network failure.
+        bionic
+            .set_network_policy(Arc::new(NetPolicy::unrestricted()))
+            .expect("a network policy");
         // §5.2 step 2. The host has to *set* it or the SDK version field is empty.
         bionic
             .set_system_property("ro.build.version.sdk", SDK_VERSION)
@@ -501,6 +515,28 @@ fn define_host_answers(jni: &Jni) {
 }
 
 /// A host directory that removes itself, for the guest's filesystem root.
+/// Every scratch root this process has created, for [`remove_scratch_roots`].
+///
+/// A `Mutex<Vec<_>>` rather than a single slot: the gate builds one guest per test and the
+/// watchdog may end the process during any of them.
+static LEAKED_ON_EXIT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Delete every scratch root, for the paths that end the process without unwinding.
+///
+/// Called from the watchdog immediately before its `exit`. Failures are ignored: a directory that
+/// cannot be removed is a leak, and a panic here would replace a useful report with a useless one.
+fn remove_scratch_roots() {
+    let roots: Vec<PathBuf> = match LEAKED_ON_EXIT.lock() {
+        Ok(mut held) => held.drain(..).collect(),
+        // A poisoned lock means a thread panicked holding it, which is exactly a run that is
+        // ending badly -- the directories still have to go.
+        Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+    };
+    for root in roots {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -524,6 +560,18 @@ impl Scratch {
         at.push(format!("omni-m5-gate-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&at);
         std::fs::create_dir_all(&at).expect("a scratch directory");
+        // **Registered so that the watchdog's `exit` can still remove it.**
+        //
+        // `Drop` is what normally cleans this up, and `std::process::exit` runs no destructors --
+        // so every run the watchdog ends leaks the whole extracted library, about 104 MB. MEASURED:
+        // 930 GB of disk went to 0.1 GB over one session's worth of stalled runs, and the build
+        // then failed with `os error 112` for reasons that had nothing to do with the build.
+        //
+        // A registry rather than a `Drop` guard on the watchdog thread, because the watchdog does
+        // not own this and the thing that has to run is not a drop at all.
+        if let Ok(mut held) = LEAKED_ON_EXIT.lock() {
+            held.push(at.clone());
+        }
         for directory in Self::DIRECTORIES {
             std::fs::create_dir_all(at.join(directory)).expect("an app directory");
         }
@@ -819,6 +867,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             // The main thread is blocked inside the guest and will never return, so failing the
             // assertion from here is not possible. Ending the process with a failing status is,
             // and it is what turns a hang into a red run instead of one that never finishes.
+            //
+            // **And the scratch roots go first, because `exit` runs no destructors.** See
+            // `Scratch::new` for the 930 GB that taught this.
+            remove_scratch_roots();
             std::process::exit(101);
         });
     }
@@ -850,6 +902,13 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // **Everything is reported before anything is asserted**, because what step 13 reached is the
     // measurement this gate takes and a panic would take it with it.
     report(&guest);
+    // **Turned back on, because `report` turns it off to print a stable snapshot and everything
+    // interesting happens after that.** MEASURED: every watchdog sample through the §8 row 21
+    // stall read the census as FROZEN and it was not frozen, it was *off* -- `Boundary::census`
+    // keeps the counts when the flag is cleared, so a stopped census is indistinguishable from a
+    // stalled guest at the call site. Three sessions of work were spent on a deadlock that the
+    // un-gated `Boundary::crossings` said, in one reading, was a guest running flat out.
+    guest.boundary.start_census();
 
     let handle = handle.unwrap_or_else(|error| {
         panic!("§8 step 13: initializeNativeCode did not return. {error}")
@@ -1020,6 +1079,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         let ndk = Arc::clone(&guest.ndk);
         let boundary = Arc::clone(&guest.boundary);
         let jni = Arc::clone(&guest.jni);
+        let space = Arc::clone(&guest.space);
         let image_base = guest.object.base;
         std::thread::spawn(move || {
             let deadline =
@@ -1046,16 +1106,45 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     );
                     let _ = writeln!(
                         std::io::stderr(),
-                        "      JNI state lock held: {}",
-                        jni.state_is_locked()
+                        "      JNI locks held: {:?}, guest space map lock held: {}, raw futex calls {} recorded / {} dropped",
+                        jni.locks_held()
+                            .iter()
+                            .filter(|(_, held)| *held)
+                            .map(|(name, _)| *name)
+                            .collect::<Vec<_>>(),
+                        space.map_lock_is_held(),
+                        bionic.futex_calls().len(),
+                        bionic.futex_calls_dropped()
                     );
+                    for call in bionic.futex_calls().iter().take(6) {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "        futex: thread {:#x} {} on {:#x} value {} from link {:#x} -> {}",
+                            call.thread,
+                            call.op,
+                            call.address,
+                            call.value,
+                            call.caller.wrapping_sub(image_base),
+                            if call.outcome == i32::MIN {
+                                "ENTERED AND NEVER RETURNED".to_string()
+                            } else {
+                                call.outcome.to_string()
+                            }
+                        );
+                    }
                     for report in boundary.threads() {
                         let _ = writeln!(
                             std::io::stderr(),
-                            "      host thread last crossed {:?} from link {:#x}, {} crossing(s)",
+                            "      guest thread {:#x} last crossed {:?} from link {:#x}, {}                              crossing(s), {}",
+                            report.guest_thread,
                             report.symbol,
                             report.caller.wrapping_sub(image_base),
-                            report.crossings
+                            report.crossings,
+                            if report.crossings > report.exits {
+                                "INSIDE THE HANDLER"
+                            } else {
+                                "in guest code"
+                            }
                         );
                     }
                     let _ = writeln!(
@@ -1077,6 +1166,221 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                             ))
                             .collect::<Vec<_>>()
                     );
+                    // **Which guest threads are left, and what killed the rest.** Eight threads
+                    // have crossed this boundary and three are live: a thread that died inside a
+                    // job holding a future nobody else can complete is exactly the shape of the
+                    // stall being looked at, and it is invisible in every other reading here.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      guest threads: {:?}; image base {image_base:#x}; failures {:?}",
+                        bionic
+                            .guest_thread_list()
+                            .iter()
+                            .map(|t| format!(
+                                "{:?}{}",
+                                t.id,
+                                if t.running { "" } else { " (exited)" }
+                            ))
+                            .collect::<Vec<_>>(),
+                        bionic.guest_thread_failures()
+                    );
+                    // **And the frames of whoever is spinning**, which has no park record at
+                    // all: a thread calling `sched_yield` in a loop is never blocked, so nothing
+                    // in the wait registry knows about it, and it is burning a core.
+                    for (thread, stack) in bionic.yield_stacks() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "        {thread:?} yielding at: {:?}",
+                            stack
+                                .iter()
+                                .map(|frame| format!("{:#x}", frame.wrapping_sub(image_base as u64)))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    // **The frames above the wait, which is what names the caller.** One symbol
+                    // is not an answer here: the `pthread_cond_wait` this stalls on is reached
+                    // through a helper with ten call sites. Printed as image offsets, because
+                    // that is what the disassembler is addressed in.
+                    for held in bionic.parked() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "        {:?} stack: {:?}",
+                            held.thread,
+                            held.backtrace
+                                .iter()
+                                .map(|frame| format!("{:#x}", frame.wrapping_sub(image_base as u64)))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    // **Host CPU time, which tells a spin from a block.** Frozen crossings and a
+                    // budget that never expires say the guest is executing nothing; they do not
+                    // say whether the *host* thread servicing it is burning a core inside a
+                    // handler or parked on something. Process CPU time answers that directly and
+                    // is the only thing here that can.
+                    let cpu = omni_platform::process::cpu_time().ok();
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      process CPU time: {:?} (climbing means host code is spinning),                          hints continued through: {}",
+                        cpu,
+                        omni_cpu::dynarmic::HINTS_OBSERVED
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    // **The fault counters, which are the only thing left that can burn a core
+                    // without executing a guest instruction.** A guest access that faults, is
+                    // "handled", and then faults again on re-execution never retires the
+                    // instruction: the budget does not tick, no import is crossed, and the host
+                    // spins. `examined` climbing while `resolved` keeps pace is exactly that
+                    // shape, and nothing else in this runtime produces it.
+                    let faults = omni_platform::fault::stats();
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      faults: examined {} resolved {} declined {} drained {}, run-loop                          iterations {}",
+                        faults.examined,
+                        faults.resolved,
+                        faults.declined,
+                        faults.drained,
+                        omni_android::RUN_LOOP_ITERATIONS
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    // **What the run loop is going round ON.** The loop's only path back to its
+                    // own top is a thunk exit, and a thunk exit is charged to the census -- so a
+                    // climbing iteration count beside a frozen census is two readings that cannot
+                    // both be true, and this is the one that names which. The site is the thunk
+                    // the last turn went through; the instruction total is what those turns
+                    // retired, and a budget that never expires while this stays still is a slice
+                    // that executes nothing.
+                    let site = omni_android::RUN_LOOP_LAST_SITE
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      run loop last went round on {:?} (thunk {:#x}), guest instructions                          retired {}, entries {}, last exit {:?}",
+                        boundary.symbol_at(site),
+                        site,
+                        omni_android::RUN_LOOP_INSTRUCTIONS
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        omni_android::RUN_LOOP_ENTRIES
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        *omni_android::RUN_LOOP_LAST_EXIT.lock()
+                    );
+                    // **The witness the census cannot be checked without.** `exits` is charged in
+                    // the same function as the per-symbol count and is *not* census-gated, so the
+                    // two are obliged to move together: if this climbs while the census does not,
+                    // the reading that is wrong is the census one, and the stall is somewhere else
+                    // entirely.
+                    let counted = boundary.crossings();
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      boundary exits {}, guest calls {}, deepest {}; busiest imports {:?}",
+                        counted.exits,
+                        counted.guest_calls,
+                        counted.deepest,
+                        {
+                            // The six busiest imports, which is what names a spin. A total says
+                            // the guest is running; this says what it is running *at*, and a
+                            // guest spinning on one symbol is a different bug from a guest making
+                            // progress through many.
+                            let mut busiest: Vec<(&str, u64)> = boundary
+                                .census()
+                                .map(|c| c.into_iter().collect())
+                                .unwrap_or_default();
+                            busiest.sort_unstable_by_key(|(_, calls)| std::cmp::Reverse(*calls));
+                            busiest.truncate(6);
+                            busiest
+                        }
+                    );
+                    // **The network census, by name rather than by rank.** The six busiest
+                    // imports above cannot show this: a whole HTTPS fetch is a handful of calls
+                    // against tens of millions of mutex operations, so every network symbol is
+                    // invisible in a ranking and the absence of one is the measurement.
+                    //
+                    // The order is the order a client walks: a name, a socket, its options, a
+                    // connect, the readiness wait, the error the connect reports, and then the
+                    // bytes. Reading it left to right says exactly how far the fetch got, and a
+                    // zero after a non-zero is where it stopped -- which is a different question
+                    // from "did a thread die", and the one `fetch flag exception: HttpError:
+                    // Unknown` does not answer.
+                    {
+                        let census = boundary.census();
+                        let count = |symbol: &str| -> u64 {
+                            census
+                                .as_ref()
+                                .and_then(|c| c.get(symbol).copied())
+                                .unwrap_or(0)
+                        };
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "      net census: {:?}",
+                            [
+                                "getaddrinfo",
+                                "freeaddrinfo",
+                                "socket",
+                                "setsockopt",
+                                "getsockopt",
+                                "getsockname",
+                                "ioctl",
+                                "fcntl",
+                                "connect",
+                                "poll",
+                                "select",
+                                "read",
+                                "write",
+                                "__write_chk",
+                                "sendto",
+                                "recvfrom",
+                                "shutdown",
+                                "close",
+                                "getentropy",
+                                "mktime",
+                            ]
+                            .map(|symbol| (symbol, count(symbol)))
+                        );
+                    }
+                    // **What the engine has asked the Java side for, and what it asked for and
+                    // did not get.** The whole client-settings phase is a conversation: the
+                    // engine loads flags, calls `NativeHelper.gameActivity_onFlagsLoaded`, and
+                    // the answer is what marks the DataModel's own "flags received". A stall
+                    // here is either an upcall that was never made or one that missed, and those
+                    // are opposite bugs. `report` cannot see either: it runs before the game
+                    // thread has started.
+                    let misses = jni.misses();
+                    let calls = jni.calls();
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      JNI upcalls {} ({} missed); last: {:?}",
+                        calls.len(),
+                        misses.len(),
+                        calls
+                            .iter()
+                            .rev()
+                            .take(60)
+                            .rev()
+                            .map(|record| format!("{}.{}", record.class, record.member))
+                            .collect::<Vec<_>>()
+                    );
+                    // **The synchronisation census, which a total cannot answer.** The gate
+                    // thread is asleep on a one-shot `pthread_cond_wait` with no predicate, so
+                    // "was it ever signalled" is the whole question, and it is one number.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      sync census: {:?}",
+                        boundary
+                            .census()
+                            .map(|c| c
+                                .into_iter()
+                                .filter(|(symbol, _)| symbol.starts_with("pthread_cond")
+                                    || symbol.starts_with("pthread_join")
+                                    || *symbol == "syscall"
+                                    || *symbol == "sched_yield")
+                                .collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    );
+                    for miss in misses.iter().rev().take(6).rev() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "        MISS {} {}.{} {}",
+                            miss.function, miss.class, miss.member, miss.descriptor
+                        );
+                    }
                     previous = total;
                     next_sample += std::time::Duration::from_secs(20);
                 }
@@ -1114,6 +1418,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             let _ = writeln!(out, "NDK CENSUS: {:?}", ndk.census());
             let _ = writeln!(out, "================ ending the run ================");
             let _ = out.flush();
+            // **Before the `exit`, because the `exit` runs no destructors.** See `Scratch::new`.
+            remove_scratch_roots();
             std::process::exit(101);
         });
     }
@@ -1156,6 +1462,50 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         ),
         ("onWindowInsetsChangedNative", "(J)V", vec![]),
     ];
+    // **§8 rows 21-22 are opt-in, and the reason is printed every run.** Making the *driver*
+    // opt-in is not `VERIFICATION.md` entry 4's shape: nothing that is **asserted** is skipped.
+    // Step 13 and rows 17-20 still run and still assert, every time. What is gated is an attempt
+    // to cross a frontier, and the run says so out loud with the command that reproduces it.
+    let attempt_flags = std::env::var_os("OMNI_M6_ROWS_21_22").is_some();
+    if !attempt_flags {
+        let _ = writeln!(
+            std::io::stderr(),
+            "
+§8 rows 21-22: NOT ATTEMPTED. Set OMNI_M6_ROWS_21_22=1 to drive the client-settings              phase and the surface rows in the order the engine asks for them."
+        );
+    }
+
+    // ---- §8 row 21's *first* downcall, driven before the surface rows ----------------------
+    //
+    // **The engine said the order in §8's table was wrong, in its own words.** With the surface
+    // delivered first, the game thread answered
+    //
+    // ```text
+    // [FLog::NativeDM] nativeActivity_onSurfaceChanged: ... Flags-Not-Received. Return.
+    // ```
+    //
+    // -- and *returned*, having done nothing with the window. Nothing re-delivers a surface that
+    // was dropped, so the renderer was never asked for, and from outside that was
+    // indistinguishable from a graphics problem: the game loop spun in `ALooper_pollOnce`
+    // (MEASURED: 138,974,961 calls), `nativePostClientSettingsLoadedInitialization3` blocked in
+    // `pthread_cond_wait`, and a worker spun on `sched_yield` waiting for a pointer at
+    // `0x02173f8c` that the surface path publishes.
+    //
+    // On a device the client-settings fetch (`fi.e$f`) runs from `onCreate`, long before the
+    // SurfaceView's `surfaceCreated` callback, so the flags are there when the surface arrives.
+    // §8's table lists 21 after 20 because that is the order the *dex* names them in; the
+    // ordering between those two rows was never independently verified, and the engine has now
+    // said what it is. This is the roadmap extended from measured runtime behaviour, which is
+    // what the goal asks for when the roadmap and the runtime disagree.
+    let settings_outcomes = if attempt_flags {
+        drive_flag_rows(&guest, &mut cpu, &script::FLAGS_AND_START[..1])
+    } else {
+        Vec::new()
+    };
+    let settings_loaded = attempt_flags
+        && settings_outcomes.iter().all(|outcome| outcome.result.is_ok())
+        && !settings_outcomes.is_empty();
+
     let mut row_outcomes: Vec<(String, Result<(), String>)> = Vec::new();
     for (member, descriptor, tail) in rows {
         let target = native(member, descriptor);
@@ -1179,6 +1529,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 Err(error) => format!("{error}"),
             }
         );
+        report_dead_guest_threads(&guest, &format!("after §8 row `{member}`"));
         let failed = result.is_err();
         row_outcomes.push((
             member.to_string(),
@@ -1225,73 +1576,95 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // **asserted** is skipped. Step 13 and rows 17-20 still run and still assert, every time.
     // What is gated is an attempt to cross a frontier that is known not to be crossable yet, and
     // the run says so out loud with the command that reproduces it.
-    let attempt_flags = std::env::var_os("OMNI_M6_ROWS_21_22").is_some();
-    if !attempt_flags {
-        let _ = writeln!(
-            std::io::stderr(),
-            "
-§8 rows 21-22: NOT ATTEMPTED. They block -- `nativeInitClientSettings` returns and              loads the flags, then `nativePostClientSettingsLoadedInitialization3` waits on a              condition variable that the two futex-parked workers never signal. Set              OMNI_M6_ROWS_21_22=1 to drive them and get the stall report."
-        );
-    }
-    let flags_outcomes = if attempt_flags
+    // ---- §8 row 21's second downcall, then the surface again ------------------------------
+    //
+    // **The engine drops a surface that arrives before the flags, and nothing re-delivers it.**
+    // MEASURED, in the run where row 21 finally returned: `nativeActivity_onSurfaceChanged:
+    // state:2` and then `... Flags-Not-Received. Return.` at 6.601 s, while
+    // `nativePostClientSettingsLoadedInitialization3` -- the call that runs
+    // `continueAfterFlagsLoaded_`, which sets the byte at `DataModel + 0x289` that the surface
+    // path is gated on -- did not return until 6.808 s. The window was taken and thrown away two
+    // hundred milliseconds before the engine was willing to look at it.
+    //
+    // On a device the surface is not lost, because it is a property of a live `SurfaceView`: the
+    // engine picks it up on the next event, and §8 row 24 exists precisely for the case where the
+    // app bridge has to hand it back (`nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams`).
+    // Here nothing else will send one, so the harness re-sends what a device's view would still
+    // be holding.
+    let flags_outcomes = if settings_loaded
         && row_outcomes.iter().all(|(_, result)| result.is_ok())
     {
-        // **One row at a time, reported before the next is attempted.** MEASURED with the whole
-        // table handed to one `script::run`: a later row hung, the watchdog ended the process,
-        // and *none* of the per-row lines had been printed -- so the run said nothing about the
-        // rows that had already returned. `VERIFICATION.md` entry 4's shape: the measurement has
-        // to survive the failure it is measuring.
-        let mut all = Vec::new();
-        for step in script::FLAGS_AND_START {
-            let table = std::slice::from_ref(step);
-            let outcomes = {
-                let _bionic = guest.bionic.activate().expect("publish the bionic instance");
-                let _jni = guest.jni.activate().expect("publish the JNI instance");
-                let _ndk = guest.ndk.activate();
-                script::run(
-                    &guest.jni,
-                    &guest.boundary,
-                    &mut cpu,
-                    &|symbol| guest.exports.get(symbol).copied(),
-                    table,
-                    0,
-                )
-                .expect("building the scripted arguments must not fail")
-            };
-            for outcome in &outcomes {
+    {
+        // Row 21's second downcall on its own first, so the flags are received...
+        let mut all = drive_flag_rows(&guest, &mut cpu, &script::FLAGS_AND_START[1..2]);
+        if all.iter().all(|outcome| outcome.result.is_ok()) {
+            // ...then the surface again, now that the engine will accept it. Only the two rows
+            // that carry the window: the lifecycle state is already where it should be, and
+            // re-sending `onStart`/`onResume` would be telling the engine about a transition
+            // that did not happen.
+            for (member, descriptor, tail) in [
+                ("onSurfaceCreatedNative", "(JLandroid/view/Surface;)V", vec![GuestArg::Int(surface)]),
+                (
+                    "onSurfaceChangedNative",
+                    "(JLandroid/view/Surface;III)V",
+                    vec![
+                        GuestArg::Int(surface),
+                        GuestArg::Int(1),
+                        GuestArg::Int(SURFACE_WIDTH as u64),
+                        GuestArg::Int(SURFACE_HEIGHT as u64),
+                    ],
+                ),
+            ] {
+                let target = native(member, descriptor);
+                let mut args = vec![
+                    GuestArg::Pointer(guest.jni.env_for(0)),
+                    GuestArg::Int(thiz),
+                    GuestArg::Int(native_code),
+                ];
+                args.extend(tail);
+                let result = {
+                    let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                    let _jni = guest.jni.activate().expect("publish the JNI instance");
+                    let _ndk = guest.ndk.activate();
+                    guest.boundary.call_guest(&mut cpu, member, target, &args, LIFECYCLE_BUDGET)
+                };
                 let _ = writeln!(
                     std::io::stderr(),
-                    "§8 row {}: {} -> {}   [engine flags byte: {}]",
-                    outcome.step,
-                    outcome.symbol,
-                    match &outcome.result {
-                        Ok(()) => format!(
-                            "returned {}",
-                            match outcome.returned {
-                                Some(x0) => format!("{:#x} ({})", x0, x0 as u32 as i32),
-                                None => "nothing".to_string(),
-                            }
-                        ),
-                        Err(error) => format!(
-                            "{error} [last crossing from guest {:#x} (link {:#x})]",
-                            guest.boundary.last_caller(),
-                            guest.boundary.last_caller().wrapping_sub(guest.object.base)
-                        ),
-                    },
-                    flags_loaded_byte(&guest)
+                    "§8 row 24: {member} re-sent after the flags -> {}",
+                    match &result {
+                        Ok(_) => "returned".to_string(),
+                        Err(error) => format!("{error}"),
+                    }
                 );
+                report_dead_guest_threads(&guest, &format!("after re-sending `{member}`"));
+                if result.is_err() {
+                    break;
+                }
             }
-            let failed = outcomes.iter().any(|outcome| outcome.result.is_err());
-            all.extend(outcomes);
-            if failed {
-                break;
-            }
+            // **The reading that says whether any of this worked.** The byte at
+            // `DataModel + 0x289` is what `nativeActivity_onSurfaceChanged` tests at guest
+            // `0x02bd307c`; until `continueAfterFlagsLoaded_` writes it at `0x02bd3be4` the
+            // engine returns without looking at the window.
+            let _ = writeln!(
+                std::io::stderr(),
+                "§8 row 24: engine flags-received byte now {}",
+                flags_loaded_byte(&guest)
+            );
+            all.extend(drive_flag_rows(&guest, &mut cpu, &script::FLAGS_AND_START[2..]));
         }
         all
+    }
     } else {
         let _ = writeln!(
             std::io::stderr(),
-            "§8 rows 21-22: not attempted, because a lifecycle row did not return"
+            "§8 rows 21-22: the rest not attempted, because {}",
+            if settings_loaded {
+                "a lifecycle row did not return"
+            } else if attempt_flags {
+                "`nativeInitClientSettings` did not return"
+            } else {
+                "OMNI_M6_ROWS_21_22 is not set"
+            }
         );
         Vec::new()
     };
@@ -1356,6 +1729,52 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         let _ = out.flush();
     }
+    // **The network census, printed on every run rather than only on a stalled one.**
+    //
+    // It was added to the watchdog's stall report first, and that was `VERIFICATION.md` entry 15's
+    // shape arriving as a prediction: a diagnostic that only fires when the run goes wrong says
+    // nothing about the run that goes right, and this one is about a fetch that FAILS while
+    // everything else looks healthy. MEASURED: the first run that reached teardown did so in 77 s
+    // and the watchdog never sampled, so the census was never printed at all.
+    //
+    // The order is the order a client walks -- a name, a socket, its options, a connect, the
+    // readiness wait, the error the connect reports, the bytes -- so reading it left to right says
+    // how far the settings fetch got. A zero after a non-zero is where it stopped, which is a
+    // different question from "did a thread die" and the one `fetch flag exception: HttpError:
+    // Unknown` does not answer.
+    {
+        let census = guest.boundary.census();
+        let count =
+            |symbol: &str| -> u64 { census.as_ref().and_then(|c| c.get(symbol).copied()).unwrap_or(0) };
+        let _ = writeln!(
+            std::io::stderr(),
+            "POST-TEARDOWN net census: {:?}",
+            [
+                "getaddrinfo",
+                "freeaddrinfo",
+                "socket",
+                "setsockopt",
+                "getsockopt",
+                "getsockname",
+                "ioctl",
+                "fcntl",
+                "connect",
+                "poll",
+                "select",
+                "read",
+                "write",
+                "__write_chk",
+                "sendto",
+                "recvfrom",
+                "shutdown",
+                "close",
+                "getentropy",
+                "mktime",
+                "syscall",
+            ]
+            .map(|symbol| (symbol, count(symbol)))
+        );
+    }
     let _ = writeln!(
         std::io::stderr(),
         "M5 teardown: {} guest thread(s) still running, failures {:?}",
@@ -1372,6 +1791,39 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         guest.field_u32(base, native_code::BYTES - 4) as u64 as u32 as u64,
         guest.field_u32(base, native_code::BYTES - 4) as u64,
         "the NativeCode really is at least 0x278 bytes, because its last word is readable"
+    );
+
+    // ---- the guest's own threads, asserted rather than printed -------------------------------
+    //
+    // **`VERIFICATION.md` entry 16, and it is here because it was missing.** Every other assertion
+    // in this gate is about a call *this* thread made. A guest thread that starts, runs and is
+    // killed by this layer is invisible to all of them -- it is not a downcall that returned an
+    // error and it is not a refusal on the calling thread -- and `live_guest_threads()` falling is
+    // indistinguishable from a worker finishing.
+    //
+    // MEASURED: the gate reported "21 of 21 scripted downcalls" and seven lifecycle rows returned,
+    // for three milestones, while three of the guest's worker threads lay dead -- one on an
+    // ordinary log line this layer refused, two on symbols nothing had bound. One of them was
+    // holding the future `nativePostClientSettingsLoadedInitialization3` was waiting on, which is
+    // the whole of why the runtime hung.
+    //
+    // No allowlist, for the reason the JNI-miss assertion below gives: a thread this layer killed
+    // is a defect in this layer, and one that is genuinely expected belongs here by name beside
+    // its evidence, never as a relaxed bound.
+    let dead = guest.bionic.guest_thread_failures();
+    assert!(
+        dead.is_empty(),
+        "the run ended with {} guest thread(s) killed by this layer. Each took with it whatever \n         work the guest had given it, and a thread that dies is not a call that fails -- so \n         nothing else in this gate would have said a word:\n{}",
+        dead.len(),
+        dead.iter()
+            .map(|failure| format!(
+                "  thread {} started at link {:#x}: {}",
+                failure.thread,
+                failure.start_routine.wrapping_sub(guest.object.base),
+                failure.why
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 
     // ---- the game thread's own JNI, asserted rather than printed -----------------------------
@@ -1417,6 +1869,103 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
 /// The address is parsed out of the message rather than threaded through the error type: this is
 /// a probe for one investigation, and a field on `AbiError` would be a permanent surface added
 /// for a temporary question.
+/// Drive a slice of [`script::FLAGS_AND_START`], **one step at a time**, reporting each before
+/// the next is attempted.
+///
+/// MEASURED with the whole table handed to one `script::run`: a later row hung, the watchdog
+/// ended the process, and *none* of the per-row lines had been printed -- so the run said nothing
+/// about the rows that had already returned. `VERIFICATION.md` entry 4's shape: the measurement
+/// has to survive the failure it is measuring.
+fn drive_flag_rows(
+    guest: &Guest,
+    cpu: &mut DynarmicCpu,
+    table: &[script::Downcall],
+) -> Vec<script::StepOutcome> {
+    let mut all = Vec::new();
+    for step in table {
+        let one = std::slice::from_ref(step);
+        let outcomes = {
+            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+            let _jni = guest.jni.activate().expect("publish the JNI instance");
+            let _ndk = guest.ndk.activate();
+            script::run(
+                &guest.jni,
+                &guest.boundary,
+                cpu,
+                &|symbol| guest.exports.get(symbol).copied(),
+                one,
+                0,
+            )
+            .expect("building the scripted arguments must not fail")
+        };
+        for outcome in &outcomes {
+            let _ = writeln!(
+                std::io::stderr(),
+                "§8 row {}: {} -> {}   [engine flags byte: {}]",
+                outcome.step,
+                outcome.symbol,
+                match &outcome.result {
+                    Ok(()) => format!(
+                        "returned {}",
+                        match outcome.returned {
+                            Some(x0) => format!("{:#x} ({})", x0, x0 as u32 as i32),
+                            None => "nothing".to_string(),
+                        }
+                    ),
+                    Err(error) => format!(
+                        "{error} [last crossing from guest {:#x} (link {:#x})]",
+                        guest.boundary.last_caller(),
+                        guest.boundary.last_caller().wrapping_sub(guest.object.base)
+                    ),
+                },
+                flags_loaded_byte(guest)
+            );
+        }
+        // **A row that returns is not a row that went well.** MEASURED: the gate reported "21 of
+        // 21 scripted downcalls" and "rows 17-20 all returned" for three milestones while, behind
+        // it, three of the guest's own worker threads had died -- one on a string this layer
+        // refused, one on an unbound symbol, one on a memory fault -- and each took with it
+        // whatever work it was holding. Nothing printed any of it, because a guest thread that
+        // dies is not a downcall that failed.
+        //
+        // Reported after every row rather than once at the end, so the row that killed a thread is
+        // the row it is printed under.
+        report_dead_guest_threads(guest, &format!("after §8 row {}", step.step));
+        let failed = outcomes.iter().any(|outcome| outcome.result.is_err());
+        all.extend(outcomes);
+        if failed {
+            break;
+        }
+    }
+    all
+}
+
+/// Print every guest thread that has died, and what killed it, or say that none has.
+///
+/// See the call site in [`drive_flag_rows`] for the three that were dying unremarked. This is a
+/// **print, not an assertion**, only until those are fixed: the gate cannot assert an empty list
+/// while it is not empty, and an assertion added now would be one more thing to remember to turn
+/// on. The `report` at the end of the run asserts it.
+fn report_dead_guest_threads(guest: &Guest, when: &str) {
+    let failures = guest.bionic.guest_thread_failures();
+    if failures.is_empty() {
+        return;
+    }
+    let mut out = std::io::stderr();
+    let _ = writeln!(out, "  DEAD GUEST THREADS {when} ({}):", failures.len());
+    for failure in &failures {
+        let _ = writeln!(
+            out,
+            "    thread {} started at {:#x} (link {:#x}): {}",
+            failure.thread,
+            failure.start_routine,
+            failure.start_routine.wrapping_sub(guest.object.base),
+            failure.why
+        );
+    }
+    let _ = out.flush();
+}
+
 fn bytes_before_the_fault(guest: &Guest, message: &str) -> String {
     // **The last `at 0x`, not the first.** The first is the thunk's own address, which every
     // refusal carries and which is never the address that faulted.

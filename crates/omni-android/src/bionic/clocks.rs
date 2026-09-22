@@ -301,6 +301,74 @@ pub(super) fn gmtime_r(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `time_t mktime(struct tm *tm)`
+///
+/// **MEASURED, and it is the TLS certificate check.** With the raw `getrandom` answered, M6's
+/// network run got the client-settings request onto the wire and the guest thread carrying it
+/// died here: `GuestThreadFailure { thread: 6, why: "the guest called the imported symbol
+/// `mktime` through its thunk at 0x1e172e54ef0, and nothing in the compatibility layer implements
+/// it" }`, from image offset 0x2212920. The engine carries its own OpenSSL (D30), which parses an
+/// X.509 `notBefore`/`notAfter` into a `struct tm` and calls this to compare it with now.
+///
+/// # On this runtime `mktime` **is** `timegm`, and that is a fact rather than a simplification
+///
+/// C says `mktime` interprets the broken-down time as **local**. This process has no local time:
+/// there is no timezone database, no `TZ` in the environment (`getenv` answers `NULL` for every
+/// name, which is a fact about a process started with no environment, not a stub), and no
+/// `localtime`/`localtime_r` is bound or imported on any reached path. Everything this layer
+/// reports is UTC -- `gmtime_r` writes `tm_gmtoff = 0` and a `tm_zone` of `"UTC"`, which is the
+/// storage this handler reuses.
+///
+/// So the honest statement is: **this runtime's local time is UTC**, and `mktime` is therefore
+/// `timegm`. That is a real difference from a device, which would apply the phone's offset, and
+/// it is written here rather than hidden because it is observable: a certificate whose validity
+/// window is being compared against `time()` -- which is also UTC here -- sees a consistent
+/// clock, while guest code that formatted a local timestamp for a user would see UTC.
+/// **What would falsify the "nothing is affected" half**: a run in which the guest reads `TZ` or
+/// calls `localtime`. Both would arrive by name -- `getenv("TZ")` through the env table and
+/// `localtime` as an `Unbound` -- so neither can happen quietly.
+///
+/// # What is written back, and the order it is written in
+///
+/// C 7.29.2.3 requires `mktime` to **normalise the structure in place**: the 61st second becomes
+/// the next minute, month 12 becomes January of the next year, and `tm_wday`/`tm_yday` are set
+/// from the date. `omni_bionic::time::mktime` does that arithmetic and this writes the result
+/// back through the same one-piece [`omni_bionic::time::write_tm`] `gmtime_r` uses, so a
+/// destination that is not fully writable faults with nothing written rather than leaving the
+/// guest a half-normalised time.
+///
+/// **The structure is written before the value is returned, and only on success.** An
+/// unrepresentable date is `(time_t)-1` with the guest's `struct tm` **untouched**, which is what
+/// C requires -- "the values of the other components are set to represent the specified calendar
+/// time" is conditional on success, and a caller that got `-1` and a rewritten `tm` could not
+/// tell which fields were its own.
+pub(super) fn mktime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let at = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let returned = {
+        let mut view = enter(c, &state);
+        let tm_at = guest_address(view.blaming(0), at)?;
+        let guest_tm = match time::read_tm(&view, tm_at as u64) {
+            Ok(read) => read,
+            Err(fault) => return Err(view.fault(fault)),
+        };
+        match time::mktime(&guest_tm.tm) {
+            // C: `(time_t)-1`, and the guest's structure is left exactly as it was.
+            Err(_) => -1i64,
+            Ok((seconds, normalised)) => {
+                let zone = state.bionic.utc_zone();
+                if let Err(fault) = time::write_tm(&mut view, tm_at as u64, &normalised, zone as u64)
+                {
+                    return Err(view.fault(fault));
+                }
+                seconds
+            }
+        }
+    };
+    c.ret().u64(returned as u64);
+    Ok(())
+}
+
 /// `size_t strftime(char *s, size_t max, const char *format, const struct tm *tm)`
 ///
 /// **The symbol M4's gate stopped on.** `nativeInitFastLog` is one of the two scripted downcalls

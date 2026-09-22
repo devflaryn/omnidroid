@@ -165,6 +165,61 @@ pub fn attr_getstack(
     Ok(Ok((u64::from_le_bytes(bbase), u64::from_le_bytes(bsize))))
 }
 
+/// `pthread_getattr_np`'s half: a **live** thread's four attributes, written
+/// into the guest's `pthread_attr_t`.
+///
+/// This is the only writer in this module that fills `stack_base`, and the
+/// reason is that nothing else can: the attr setters this crate implements are
+/// the ones bionic lets a caller use *before* a thread exists, and a stack base
+/// is not among them — `pthread_attr_setstack` is not in the reachable set and
+/// is not bound. `attr_getstack` has read the field since phase 3c and nothing
+/// has ever written it, so an attr that reached it reported base 0, which is the
+/// "system default" encoding rather than an address. A caller asking a running
+/// thread where its stack is wants the address.
+///
+/// **It invents nothing.** Every one of the four values is supplied by the
+/// caller, which is the only layer that can have measured them: the adapter
+/// mapped the stack, chose the guard and holds the detach state. This function
+/// is the encoding and only the encoding — which is why it is here, over
+/// `GuestMemory`, with no host or thread state anywhere near it (D19).
+///
+/// The offsets are the ones `attr_setdetachstate` (0), `attr_setstacksize` (8),
+/// `attr_setguardsize` (16) and `attr_getstack` (24) already use. They are
+/// restated here rather than shared, because three of the four setters validate
+/// a guest's request and this writes a fact — and what holds the two statements
+/// together is a test rather than a comment:
+/// `a_live_thread_attr_reads_back_through_every_existing_accessor` writes with
+/// this function and reads with all four accessors, so a fifth layout invented
+/// here fails it (`docs/VERIFICATION.md` entry 1 — the round trip is the
+/// membership check a size assertion cannot make).
+///
+/// Every byte is zeroed first, through [`attr_init`]. bionic fills the whole
+/// object, and a caller that reuses one attr for `pthread_attr_init` and then
+/// for this would otherwise read its own earlier `setstacksize` back out of a
+/// field this call did not reach.
+pub fn attr_from_live_thread(
+    mem: &mut impl GuestMemory,
+    attr_addr: u64,
+    detached: bool,
+    stack_base: u64,
+    stack_size: u64,
+    guard_size: u64,
+) -> Result<(), crate::memory::Fault> {
+    // Range-checks the whole 56 bytes and zeroes them, so the three writes below
+    // are inside an area this call has already been allowed to write.
+    attr_init(mem, attr_addr)?;
+    // A `bool` rather than an `int` because the state has exactly two values and
+    // this is the one caller that cannot get one from the guest: the thread is
+    // either detached or it is not, and an `i32` parameter would need an EINVAL
+    // arm for a number no caller can produce (`docs/VERIFICATION.md` entry 12).
+    let state = if detached { detach_state::DETACHED } else { detach_state::JOINABLE };
+    mem.write(attr_addr, &state.to_le_bytes())?;
+    mem.write(attr_addr + 8, &stack_size.to_le_bytes())?;
+    mem.write(attr_addr + 16, &guard_size.to_le_bytes())?;
+    mem.write(attr_addr + 24, &stack_base.to_le_bytes())?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // naming
 // ---------------------------------------------------------------------------
@@ -400,6 +455,83 @@ mod tests {
         assert_eq!(attr_getstack(&mut mem, 0x1000).unwrap(), Ok((0, 16 * 1024 * 1024)));
 
         assert_eq!(attr_destroy(&mut mem, 0x1000).unwrap(), 0);
+    }
+
+    /// **What `attr_from_live_thread` writes is what all four existing accessors
+    /// read**, field by field and value by value.
+    ///
+    /// This is the test that stops a second `pthread_attr_t` layout existing.
+    /// The adapter's `pthread_getattr_np` fills an attr the guest then reads
+    /// with `pthread_attr_getstack` and `pthread_attr_getguardsize`, so a writer
+    /// with its own idea of where `guard_size` lives produces an attr that is
+    /// *self-consistent and wrong* — the guest reads the stack size out of the
+    /// guard field and believes its stack is 4 KiB. Nothing about the write
+    /// would fail; only reading it back the way the guest does shows it.
+    ///
+    /// The four values are deliberately **distinct and non-zero**, so a pair of
+    /// swapped offsets cannot pass: entry 1 in `docs/VERIFICATION.md` is a count
+    /// that stayed right while two members were substituted, and two fields
+    /// holding each other's value is the same failure one struct down.
+    #[test]
+    fn a_live_thread_attr_reads_back_through_every_existing_accessor() {
+        let mut mem = MockMemory::new();
+        mem.map(0x1000, &[0u8; 56]);
+        // A base, a size and a guard that are all different, and none of them a
+        // power of two multiple of another.
+        let base = 0x7f_1234_5000u64;
+        let size = 1024 * 1024u64;
+        let guard = 4096u64;
+
+        attr_from_live_thread(&mut mem, 0x1000, true, base, size, guard).unwrap();
+        assert_eq!(attr_getdetachstate(&mut mem, 0x1000).unwrap(), Ok(detach_state::DETACHED));
+        assert_eq!(attr_getstacksize(&mut mem, 0x1000).unwrap(), Ok(size));
+        assert_eq!(attr_getguardsize(&mut mem, 0x1000).unwrap(), Ok(guard));
+        assert_eq!(attr_getstack(&mut mem, 0x1000).unwrap(), Ok((base, size)));
+
+        // Joinable is the other state, and it is 0 — which is also what an
+        // untouched field reads as, so it is asserted from a DETACHED attr
+        // rather than from a fresh one: that is the only way round that proves
+        // the write happened.
+        attr_from_live_thread(&mut mem, 0x1000, false, base, size, guard).unwrap();
+        assert_eq!(attr_getdetachstate(&mut mem, 0x1000).unwrap(), Ok(detach_state::JOINABLE));
+    }
+
+    /// **Every byte of a reused attr is the live thread's**, and none of it is
+    /// what the caller put there before.
+    ///
+    /// The reachable guest pattern is one `pthread_attr_t` on the stack used for
+    /// a `pthread_attr_init` + `setstacksize` + `pthread_create` and then for a
+    /// `pthread_getattr_np`. Without the zeroing, the fields this call does not
+    /// reach keep the earlier request — so the answer to "how big is my stack"
+    /// would be "as big as you once asked for", which is the plausible wrong
+    /// answer Global Constraint 1 is about.
+    #[test]
+    fn a_live_thread_attr_leaves_nothing_of_what_the_attr_held_before() {
+        let mut mem = MockMemory::new();
+        mem.map(0x2000, &[0xAAu8; 56]);
+        attr_from_live_thread(&mut mem, 0x2000, false, 0x4000, 8192, 0).unwrap();
+        let mut whole = [0u8; 56];
+        mem.read(0x2000, &mut whole).unwrap();
+        // The four fields, then everything else, which must be zero: bionic's
+        // `__private` tail carries the scheduling fields and this layer knows
+        // nothing about them, so zero is the only value it may write there.
+        assert_eq!(&whole[0..8], &0u64.to_le_bytes(), "detach state JOINABLE and its padding");
+        assert_eq!(&whole[8..16], &8192u64.to_le_bytes());
+        assert_eq!(&whole[16..24], &0u64.to_le_bytes(), "a guard size of zero is a value");
+        assert_eq!(&whole[24..32], &0x4000u64.to_le_bytes());
+        assert!(whole[32..].iter().all(|b| *b == 0), "{:?}", &whole[32..]);
+    }
+
+    /// Hostile: the same null and wrapping addresses the other attr writers
+    /// refuse, through the one that writes four fields rather than one.
+    #[test]
+    fn a_live_thread_attr_refuses_an_address_its_own_fields_do_not_fit_below() {
+        let mut mem = MockMemory::new();
+        assert!(attr_from_live_thread(&mut mem, 0, false, 0x1000, 4096, 0).is_err());
+        assert!(attr_from_live_thread(&mut mem, u64::MAX - 20, false, 0x1000, 4096, 0).is_err());
+        // And an address that is neither null nor wrapping but is not mapped:
+        // the fault comes from the memory, not from the range check.
+        assert!(attr_from_live_thread(&mut mem, 0xdead_0000, false, 0x1000, 4096, 0).is_err());
     }
 
     /// Names: set/get roundtrip, truncation limit (ERANGE past 15 chars),

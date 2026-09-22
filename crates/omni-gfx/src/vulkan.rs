@@ -45,6 +45,7 @@ use ash::khr;
 use ash::vk;
 use omni_platform::window::RawWindow;
 
+use crate::claim;
 use crate::error::{GfxError, GfxResult};
 use crate::image::Rgba8Image;
 use crate::select::{self, PresentMode};
@@ -270,11 +271,22 @@ pub struct Renderer {
     frames_presented: u64,
     swapchain_generations: u64,
 
-    /// The two owning halves, **last**, so that they are destroyed after everything that was
-    /// created from them. Rust drops fields in declaration order and Vulkan requires the reverse
-    /// of creation order; putting them here is what reconciles the two.
+    /// The two owning halves, **last but one**, so that they are destroyed after everything that
+    /// was created from them. Rust drops fields in declaration order and Vulkan requires the
+    /// reverse of creation order; putting them here is what reconciles the two.
     dev: DeviceOwner,
     base: Base,
+
+    /// This window's exclusive swapchain claim, held for as long as the renderer is.
+    ///
+    /// **Last of all**, so that the window is released only after this renderer's swapchain has
+    /// actually been destroyed. A claim dropped before `Base` would leave a window that the guest
+    /// could claim while a `VkSwapchainKHR` of ours was still on it, which is the exact state
+    /// [`claim`](crate::claim) exists to make impossible.
+    ///
+    /// Never read. Its whole job is to exist and then to be dropped; the leading underscore says
+    /// so to the compiler and this paragraph says so to a reader.
+    _window: claim::WindowClaim,
 }
 
 impl Renderer {
@@ -297,6 +309,14 @@ impl Renderer {
         // anything this code does.
         let entry = unsafe { ash::Entry::load() }
             .map_err(|err| GfxError::LoaderMissing { detail: err.to_string() })?;
+
+        // **The window is claimed before anything is created on it**, so that a conflict with
+        // `omni_gfx`'s other Vulkan stack -- or with the guest's -- is a named refusal rather than
+        // a second swapchain a driver may or may not object to. `claim` carries the argument;
+        // `window_key` is what says this renderer knows which window system it is on.
+        let claim = claim::claim_window(window_key(window)?, "omni_gfx::Renderer").map_err(
+            |claimed| GfxError::WindowInUse { owner: claimed.owner, window: claimed.window.raw() },
+        )?;
 
         let (instance, available_layers, validation_enabled) = create_instance(&entry)?;
         let surface_fn = khr::surface::Instance::new(&entry, &instance);
@@ -375,6 +395,7 @@ impl Renderer {
             swapchain_generations: 0,
             dev,
             base,
+            _window: claim,
         };
         renderer.recreate_swapchain()?;
         Ok(renderer)
@@ -1198,6 +1219,21 @@ fn create_surface(
         // `RawWindow` is `#[non_exhaustive]`, so a Wayland or AppKit variant added to the seam
         // later lands here and refuses **naming itself**, rather than turning this `match` into
         // one that silently stopped being exhaustive.
+        other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
+    }
+}
+
+/// The [`claim::WindowKey`] for a window, or a refusal naming the system it belongs to.
+///
+/// **The same `match` shape [`create_surface`] has, and for the same reason**: `RawWindow` is
+/// `#[non_exhaustive]`, so a Wayland or AppKit variant added to the seam later lands in the
+/// wildcard arm and refuses naming itself. It is a separate function rather than a field of the
+/// surface result because the claim is taken *before* the instance exists -- a renderer that
+/// created an instance and a surface and only then discovered the window was taken would have
+/// done real work on a window it is not allowed to present to.
+fn window_key(window: RawWindow) -> GfxResult<claim::WindowKey> {
+    match window {
+        RawWindow::Win32 { hwnd, .. } => Ok(claim::WindowKey::win32(hwnd)),
         other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
     }
 }

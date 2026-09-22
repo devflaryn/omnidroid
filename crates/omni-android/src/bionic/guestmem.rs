@@ -627,40 +627,46 @@ pub const MALLINFO_BYTES: usize = 80;
 
 /// `struct mallinfo mallinfo(void)`
 ///
-/// Refused, and the reason is not that the marshalling is hard. `X8` is marshalled — it is the
-/// one thing about this symbol task 2 built for — and eighty bytes of zeroes could be written
-/// into it in three lines. **The reason is that there is no heap for the answer to describe.**
+/// **Ten zeroed `size_t` fields, and the reasoning that used to refuse them is corrected rather
+/// than deleted, because what changed is one step of it and not the principle.**
 ///
-/// `libroblox.so` **imports no allocator at all** (D17, and the correction to this plan's own
-/// earlier text): no `malloc`, no `free`, no `calloc`, no `realloc`. It carries its own allocator
-/// and reaches the host through guest `mmap`, which is the seam this module is. So a `mallinfo`
-/// here would be describing libc's heap — and libc's heap in this process has no relationship to
-/// the guest's memory at all. Every field would be a fact about something the guest does not use.
+/// The facts are unchanged. `libroblox.so` **imports no allocator at all** (D17): no `malloc`, no
+/// `free`, no `calloc`, no `realloc`. It carries its own -- Mimalloc, which the engine announces
+/// by name at startup -- and reaches the host through guest `mmap`, which is the seam this module
+/// is. So `mallinfo` here describes libc's heap, and libc's heap in this process has no
+/// relationship to the guest's memory.
 ///
-/// **Eighty bytes of zeroes is the believable wrong answer**, and it is believable precisely
-/// because it is *arithmetically true* of a libc heap nothing has allocated from: zero arena,
-/// zero free blocks, zero in use. A guest that logs its memory usage during initialisation would
-/// print a consistent, self-consistent, entirely fictional zero and carry on — and the same
-/// number is what a leak detector would read at both ends of the run.
+/// What the old text called "the believable wrong answer" it also called, in the same sentence,
+/// *arithmetically true*: zero arena, zero blocks, zero in use, of a heap nothing has allocated
+/// from. Those cannot both stand. **It is not a wrong answer; it is the right one**, and the
+/// worry underneath it was a different worry: that a human reading a log line would take "0 bytes
+/// allocated" for "this program uses no memory". That is a reason to write this comment, not a
+/// reason to fail a call the engine needs.
 ///
-/// The other available lie is worse: reporting this *process's* commit charge as the arena would
-/// be a real number, from the right process, describing the wrong allocator.
+/// MEASURED: `nativePostClientSettingsLoadedInitialization3` stops here. The three call sites are
+/// `0x02283420`, `0x02283470` and `0x022834c0`, and each is a one-line getter -- the first reads
+/// the field at `+0x38`, `uordblks`, and returns it. This is the engine's own memory telemetry
+/// asking libc how much of *libc's* heap it is using, and the answer is none of it.
+///
+/// The other available answer is still rejected and for the reason it always was: reporting this
+/// **process's** commit charge as the arena would be a real number, from the right process,
+/// describing the wrong allocator. That one would be a lie. Zero is not.
 pub(super) fn mallinfo(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let out = c.args().indirect_result();
-    Err(AbiError::Refused {
-        symbol: c.symbol().to_string(),
-        address: c.address(),
-        why: format!(
-            "the guest called mallinfo(), which returns {MALLINFO_BYTES} bytes indirectly \
-             through X8 (here, {out:#x}). There is no libc heap for it to describe: \
-             `libroblox.so` imports no allocator at all -- no malloc, no free, no calloc, no \
-             realloc -- and carries its own, reaching the host through guest `mmap` (D17). \
-             Writing ten zeroed size_t fields was rejected, and it is the most believable wrong \
-             answer this phase had: it is arithmetically TRUE of a libc heap nothing has \
-             allocated from, so a guest that logs its memory usage would print a consistent, \
-             self-consistent, fictional zero at both ends of the run"
-        ),
-    })
+    // Through `GuestMem`, so the eighty bytes go past the same admission rules every other guest
+    // write does and a hostile `X8` is the boundary's typed refusal rather than a host fault.
+    c.mem().write_bytes(
+        out,
+        &[0u8; MALLINFO_BYTES],
+        crate::mem::Blame::new(c.symbol(), c.address(), 0),
+    )?;
+    // AAPCS64 passes the indirect result location in `X8` and the callee writes through it; the
+    // value left in `X0` is not what a caller reads -- all three sites here load the field
+    // straight out of their own stack slot. It is set to the same address because that is what
+    // bionic leaves there, and a register this layer declines to set is a register that differs
+    // from the device for no reason.
+    c.ret().u64(out as u64);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -118,7 +118,10 @@ fn refusal_of(f: &Fixture, symbol: &str, setup: impl FnOnce(&mut Asm)) -> AbiErr
 
 // =================================================================== the tables
 
-/// The eight symbols bound here that Task 1's 188 does **not** contain, and the evidence for each.
+/// The symbols bound here that Task 1's 188 does **not** contain, and the evidence for each.
+///
+/// It began as eight and the count is deliberately not restated in this sentence: the table's own
+/// length is the number, and `the_bound_count_is_exactly_what_this_phase_claims` is what pins it.
 ///
 /// # Task 1's prediction was a lower bound, and M3's gate is what measured by how much
 ///
@@ -243,6 +246,192 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          Bionic has one locale implementation, so its own `strftime_l` forwards to \
          `strftime`, and so does this one.",
     ),
+    (
+        "pthread_getattr_np",
+        "M6's startup run, found by a guest WORKER THREAD dying on it rather than by a \
+         downcall stopping: GuestThreadFailure { thread: 7, start_routine: 0x27798fa8db0, \
+         why: \"the guest called the imported symbol `pthread_getattr_np` through its thunk \
+         at 0x277928d3e20, and nothing in the compatibility layer implements it\" }. The BL \
+         is at image offset 0x2173df8 and 0x2173dfc is the return address. The file's Tier C \
+         section -- reached solely through an address-taken edge -- which is why it is \
+         outside the 188 although `pthread_attr_init` and `pthread_attr_setstacksize` are \
+         inside them. It is the first member of the attr family that reports a LIVE thread, \
+         so it is the first that could not be bound by binding an `omni-bionic` function: \
+         the stack base and size it answers with had to start being recorded when \
+         `pthread_create` maps a stack.",
+    ),
+    (
+        "pthread_mutex_trylock",
+        "M6's startup run, and the SECOND guest worker thread to die on an Unbound in it: \
+         GuestThreadFailure { thread: 3, start_routine: 0x284d168 (image-relative), \
+         why: \"the guest called the imported symbol `pthread_mutex_trylock` through its \
+         thunk at 0x1f7dad82f10, and nothing in the compatibility layer implements it\" }. \
+         The BL is at image offset 0x2b53aa0 and 0x2b53aa4 is the return address, inside a \
+         libc++ `std::mutex::try_lock` wrapper -- so the real callers are every try_lock in \
+         the engine and not one site. The file's Tier C section, one line below \
+         `pthread_getattr_np` in it. A PURE BINDING GAP of the `pthread_attr_setdetachstate` \
+         kind: `omni_bionic::mutex::trylock` has existed since phase 3c with \
+         `trylock_held_is_ebusy_all_types` beside it, and nothing called it.",
+    ),
+    (
+        "pthread_attr_getstack",
+        "M6's startup run, and the THIRD guest worker thread to die on an Unbound in it -- this          one only after `pthread_getattr_np` was bound, because it is the call that comes next:          GuestThreadFailure { thread: 7, why: \"the guest called the imported symbol          `pthread_attr_getstack` through its thunk at 0x17fe3bf3e30, and nothing in the          compatibility layer implements it\" }. A thread asks for its own live attributes and          then reads the stack back out of them, which is the whole point of having asked.          Another PURE BINDING GAP, and the third in one session:          `omni_bionic::metadata::attr_getstack` has existed since phase 3c and nothing called          it. Hand-written rather than generated because it has two out-parameters.",
+    ),
+    (
+        "strcspn",
+        "M6's startup run, and the one of these that mattered most: it was killing a guest          thread in the gate's **default** path, not only under OMNI_M6_ROWS_21_22, and had been          doing so unremarked for as long as that thread has existed. GuestThreadFailure {          thread: 7, start_routine: 0x2217f04 (image-relative), why: \"the guest called the          imported symbol `strcspn` through its thunk at 0x18a0c303cf0, and nothing in the          compatibility layer implements it\" }. Found by the assertion VERIFICATION.md entry 16          produced, on its first run. A PURE BINDING GAP: `omni_bionic::string::strcspn` has          existed since phase 3a. Its sibling `strspn` is the same `span_walk` with one test          flipped and is deliberately still unbound, because nothing has measured the guest          calling it.",
+    ),
+    (
+        "__strcat_chk",
+        "M6's startup run, once the client-settings phase got far enough to build URLs:          GuestThreadFailure { thread: 3, why: \"the guest called the imported symbol          `__strcat_chk` through its thunk at 0x20513e53200, and nothing in the compatibility          layer implements it\" }, from image offset 0x22ac22c. The FORTIFY form of `strcat`,          which was bound. Another PURE BINDING GAP -- `omni_bionic::string::strcat_chk` has          existed since phase 3a with the check's own test beside it -- and the fifth in this          session, which is a pattern rather than a coincidence: the primitives were written          against the import list and the wiring was done against what the run had reached.",
+    ),
+    (
+        "inet_pton",
+        "M6's startup run, and a guest WORKER THREAD dying on it: GuestThreadFailure { thread: \
+         7, start_routine: 0x2217f04 (image-relative), why: \"the guest called the imported \
+         symbol `inet_pton` through its thunk at 0x2c6fd3e3270, and nothing in the compatibility \
+         layer implements it\" }. The same start routine `strcspn` was found on -- the engine's \
+         URL and address handling -- one symbol further along it. The file's LAST section: never \
+         referenced from the Tier C closure at all, although `inet_ntop` IS one of the 188 and \
+         has been bound since phase 3d. NOT a binding gap, and the first of this session's \
+         worker-thread finds that was not: nothing in `omni-bionic` parsed an address, so \
+         `omni_bionic::net::inet_pton` is new code -- BIND's `inet_pton4`/`inet_pton6`, which is \
+         what bionic ships, with the strictness that distinguishes it from `inet_aton` (no \
+         leading zeros, no shorthand, no hex) tested rule by rule.",
+    ),
+    (
+        "setsockopt",
+        "M6's network run, found the way an Unbound is meant to be found and then found again one \
+         option deeper: with `socket` answering for the first time, the engine's HTTP stack \
+         created fd 12 and immediately configured it, and the guest WORKER THREAD carrying the \
+         client-settings fetch died -- GuestThreadFailure { thread: 8, why: \"`setsockopt` ... \
+         refused this call: the guest called setsockopt(fd 12, option 9 at SOL_SOCKET)\" }, from \
+         link 0x6009d94. Option 9 at SOL_SOCKET is SO_KEEPALIVE. The file's LAST section: never \
+         referenced from the Tier C closure at all, although `socket`, `getaddrinfo` and \
+         `freeaddrinfo` ARE among the 188.",
+    ),
+    (
+        "connect",
+        "M6, with the socket group D30 authorises. **NOT yet reached by a run**, and that is \
+         stated rather than implied: the client-settings fetch stops one call earlier, on the \
+         SO_KEEPALIVE that `omni_platform::net::SocketOption` has no variant for, so nothing has \
+         yet observed the connect that follows it. What is claimed here is the rest of one client \
+         call sequence bound together -- socket, setsockopt, connect, poll, getsockopt(SO_ERROR), \
+         write, read -- because the run stops at the first missing member and each round trip of \
+         that discovery loop is three minutes. The file's LAST section.",
+    ),
+    (
+        "getsockopt",
+        "M6, with `connect`: it is how a non-blocking connect reports itself. The engine sets \
+         O_NONBLOCK, calls connect, gets -1/EINPROGRESS, waits for writability and reads \
+         SO_ERROR; binding the first three and not the fourth would leave the guest unable to \
+         learn whether its own connection succeeded. NOT yet reached by a run -- see `connect`. \
+         The file's LAST section.",
+    ),
+    (
+        "sendto",
+        "M6, with the socket group. `libroblox.so` imports NO plain `send` and no plain `recv` at \
+         all -- MEASURED from the APK's own undefined-symbol table -- so `sendto` with a null \
+         destination IS the guest's `send`, which is how bionic compiles one. NOT yet reached by \
+         a run. The file's LAST section.",
+    ),
+    (
+        "recvfrom",
+        "M6, with `sendto` and for the same measured reason: there is no `recv` import, so \
+         `recvfrom` with a null source address is the guest's `recv`. NOT yet reached by a run. \
+         The file's LAST section.",
+    ),
+    (
+        "__sendto_chk",
+        "M6, the _FORTIFY_SOURCE form of `sendto`, bound beside it because the compiler chooses \
+         between the two and a layer that implements one and not the other fails on whichever the \
+         optimiser picked. It adds one check and nothing else -- len against the buffer size the \
+         compiler knows -- and that check is refused by name rather than sent, because sending \
+         would put whatever follows the buffer on the network. NOT yet reached by a run. The \
+         file's LAST section.",
+    ),
+    (
+        "bind",
+        "M6, with the socket group. A UDP client binds a local port before it sends, which is the \
+         game protocol's path rather than the settings fetch's, so this is the member of the \
+         group furthest from what has been measured. It is bound rather than left Unbound because \
+         `omni_platform::net::Socket::bind` exists and a bind is the one socket call whose \
+         absence stops a datagram socket having a source address at all. NOT yet reached by a \
+         run. The file's LAST section.",
+    ),
+    (
+        "shutdown",
+        "M6, with the socket group: it is how a client half-closes a TLS connection it is done \
+         writing to, and `omni_platform::net::Socket::shutdown` implements it for stream sockets \
+         and refuses it by name on a datagram one. NOT yet reached by a run. The file's LAST \
+         section.",
+    ),
+    (
+        "strtoull_l",
+        "M6's network run, and the SECOND guest worker thread to die in it: GuestThreadFailure { \
+         thread: 3, why: \"the guest called the imported symbol `strtoull_l` through its thunk \
+         ...\" }, from image offset 0x2b81a44, while the client-settings response was being \
+         parsed. NOT a network symbol at all -- it is here because the network is what got the \
+         run far enough to reach it. A PURE BINDING GAP of the `pthread_mutex_trylock` kind: \
+         `omni_bionic::numerics::strtoull` has existed since phase 1 and bionic has one locale, \
+         so its own `strtoull_l` ignores the locale argument exactly as this does. `strftime_l` \
+         is the same shape one milestone earlier. The file's LAST section, one line below \
+         `strtoll_l`, which is there too and has not been reached.",
+    ),
+    (
+        "srand",
+        "M6's network run, on the engine's retry after the client-settings fetch failed: \
+         GuestThreadFailure { thread: 6, why: \"the guest called the imported symbol `srand` \
+         through its thunk at 0x1ac79524e60\" }, from link 0x22127fc. A PURE BINDING GAP and the \
+         SEVENTH of this session, and the one that shows the pattern most sharply: `rand` has \
+         been bound since phase 1 and this gate has counted it at 750 calls every run, while the \
+         call that SEEDS it sat in `omni_bionic::numerics` with its own test and no caller. Not \
+         entropy -- srand chooses where a deterministic sequence starts, which is the opposite of \
+         what arc4random_buf, getentropy and the raw getrandom do. The file's LAST section.",
+    ),
+    (
+        "log10",
+        "M6's network run, one thread over: GuestThreadFailure { thread: 14, why: \"the guest \
+         called the imported symbol `log10` through its thunk at 0x1ac79525500\" }, from link \
+         0x2280b0c, on the telemetry path the engine takes once a flag fetch has failed. A PURE \
+         BINDING GAP and the EIGHTH -- `omni_bionic::libm::log10` has sat beside the `log` that \
+         WAS bound since phase 3a. Its sibling `log10f` is equally written, equally tested and \
+         deliberately NOT bound. Section 7 of the file (Tier C only, reached solely through an \
+         address-taken edge), which is outside the 188 the first six sections make.",
+    ),
+    (
+        "mktime",
+        "M6's network run, one call after the raw getrandom and the first thing that is          unambiguously CERTIFICATE validation: GuestThreadFailure { thread: 6, why: \"the guest          called the imported symbol `mktime` through its thunk at 0x1e172e54ef0\" }, from image          offset 0x2212920, on the thread carrying the client-settings fetch. OpenSSL turns an          X.509 notBefore/notAfter into a struct tm and calls this to compare it with now. NOT a          binding gap: `omni_bionic::time` had `gmtime` and `strftime` and nothing that went the          other way, so this is the second symbol of the session that needed NEW COMPUTATION --          `days_from_civil`, the exact inverse of the `civil_from_days` `gmtime` already used,          plus C 7.29.2.3's in-place normalisation. On this runtime local time IS UTC (no TZ, no          timezone database, no localtime bound or reached), so mktime and timegm coincide and          the handler says what would falsify that. The file's LAST section.",
+    ),
+    (
+        "ioctl",
+        "M6's network run, one call after `isspace` and on the same client-settings thread:          GuestThreadFailure { thread: 8, why: \"the guest called the imported symbol `ioctl`          through its thunk at 0x28fa0c555e0, and nothing in the compatibility layer implements          it\" }. Bound for FIONBIO ONLY, which is the second spelling of the          fcntl(F_SETFL, O_NONBLOCK) that has been bound since M5 and reaches the same          `Filesystem::set_nonblocking` on the same descriptor. What makes this entry worth          reading is that the scope was DECODED rather than guessed: `ioctl` reaches this binary          through one PLT stub at 0x62d7340 and five BL sites target it, four of which load a          literal request -- 0x5421 FIONBIO at 0x02956388, 0x8913 SIOCGIFFLAGS at 0x055b040c,          0x8912 SIOCGIFCONF at 0x061f4354, 0x8915 SIOCGIFADDR at 0x061f43d0 -- and the fifth is          a pass-through wrapper. The three SIOC* requests enumerate the HOST's interfaces,          nothing in omni-platform can answer them, and each refuses BY NAME rather than being          absent. The file's LAST section.",
+    ),
+    (
+        "isspace",
+        "M6's network run, one call after `getentropy` and still on the TLS handshake:          GuestThreadFailure { thread: 8, why: \"the guest called the imported symbol `isspace`          through its thunk at 0x18945ed5e60, and nothing in the compatibility layer implements          it\" }. A PURE BINDING GAP and the SIXTH of this session --          `omni_bionic::ctype::is_space` has existed since phase 1, with the test that asserts          exactly six bytes classify, and nothing had ever called it. That makes six symbols          whose primitive was written against the import list and whose wiring was done against          what a run had reached, which VERIFICATION.md entry 16 names as a pattern rather than a          coincidence. Its neighbour `tolower` is the same shape, has `omni_bionic::ctype::         to_lower` waiting, and is deliberately NOT bound. The file's LAST section.",
+    ),
+    (
+        "getentropy",
+        "M6's network run, one call after `getsockname` and the first thing in this project that          is unambiguously TLS: GuestThreadFailure { thread: 8, why: \"the guest called the          imported symbol `getentropy` through its thunk at 0x237481e5ec0, and nothing in the          compatibility layer implements it\" }. `libroblox.so` carries its own OpenSSL (D30) and          OpenSSL seeds its DRBG from `getentropy` where the platform has one, which Android does          from API 28. NOT a binding gap: the entropy source has been wired since phase 3a as          `arc4random_buf`, over the same `omni_platform::process::random_bytes`. What this adds          is the interface's own 256-byte bound, which is a real difference and not a formality --          a device answers EIO above it and the caller has a fallback path that would never run          here. The file's LAST section.",
+    ),
+    (
+        "getsockname",
+        "M6's network run, found the way an Unbound is meant to be found and the FIRST member of \
+         the socket group above to be reached by a run rather than bound ahead of one. With \
+         `SO_KEEPALIVE` answering, the engine set the three keep-alive TIMING options on the \
+         settings socket -- `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, which this layer had \
+         no variant for and refused by name -- and once those answered the same thread died one \
+         call later: GuestThreadFailure { thread: 8, start_routine: 1292942786308, why: \"the \
+         guest called the imported symbol `getsockname` through its thunk at 0x12d070352d0, and \
+         nothing in the compatibility layer implements it\" }. A connected client asking which \
+         local end it was given. NOT a binding gap of the `pthread_mutex_trylock` kind and not \
+         new computation either: `omni_platform::net::Socket::local_address` and this file's own \
+         `write_peer` both existed, and the handler is the two of them joined. Its sibling \
+         `getpeername` is one line away in the import table, is equally implemented in the seam, \
+         and is deliberately NOT bound -- no run has reached it. The file's LAST section, with \
+         `getpeername` three lines above it.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -293,7 +482,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 186, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 208, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -315,7 +504,48 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // a new one: M4's gate recorded `nativeInitFastLog` failing on it by name.
     // Each of the thirteen is a symbol `libroblox.so` imports that the static closure did not
     // predict. D17 says 188 is a lower bound; this is by how much, so far.
-    assert_eq!(Bionic::inline_symbols().count(), 172);
+    // **M6 adds two more, both inline and both found by a guest WORKER THREAD dying on an
+    // `Unbound`** rather than by a scripted downcall stopping -- which is the first time that
+    // has been the discovery route, and it is what `guest_thread_failures` exists for.
+    // `pthread_getattr_np` needed new logic: it is the first member of the attr family that
+    // reports a *live* thread, so `pthread_create` had to start recording where it puts a
+    // stack. `pthread_mutex_trylock` needed none -- `omni_bionic::mutex::trylock` was written
+    // and unit-tested in phase 3c and nothing had ever called it.
+    // **`inet_pton` is the one that needed NEW COMPUTATION**, and it is worth separating from
+    // the binding gaps around it: every other symbol this session added had an `omni-bionic`
+    // function waiting for a caller, and nothing in that crate parsed an address at all. Its
+    // opposite `inet_ntop` has been bound since phase 3d and IS one of the 188; this spelling is
+    // in the file's LAST section, and a guest worker thread dying on it is what found it.
+    // **M6's network phase adds nine more, all inline, for 187**, and the shape of the nine is
+    // worth separating. `setsockopt` and `strtoull_l` were found the way an `Unbound` is meant
+    // to be found -- a guest WORKER THREAD died on each, which is what `guest_thread_failures`
+    // exists for. The other seven -- `connect`, `getsockopt`, `bind`, `shutdown`, `sendto`,
+    // `recvfrom`, `__sendto_chk` -- are the rest of ONE client call sequence, bound together
+    // and **not yet reached by a run**, which `BEYOND_THE_PREDICTION` says of each of them in
+    // as many words. D17's rule is that a symbol is bound when a run has reached it, and this
+    // is the place that rule is stretched: the run stops at the first missing member of the
+    // sequence and each round trip of that loop is three minutes. The honest statement is the
+    // one in the table -- measured for two of the nine, decided for seven.
+    //
+    // **M6's network run adds seven more, inline, for 194.** The first is the first member of that
+    // socket group a run has actually reached rather than one bound ahead of a run: `getsockname`,
+    // which the settings-fetch thread called once the three keep-alive TIMING options
+    // (`TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`) stopped refusing. It cost no new
+    // computation and closed no binding gap -- `Socket::local_address` and this adapter's own
+    // `write_peer` both already existed -- so the honest category for it is neither of the two
+    // this comment has used before: it is a symbol whose *pieces* were all present and which
+    // nothing had asked for. `getpeername` is its sibling, is equally implemented in the seam,
+    // and stays Unbound because no run has reached it. The second is `getentropy`, one call
+    // further on and the first symbol in this project that is unambiguously TLS: the engine's own
+    // OpenSSL seeding its DRBG. Its entropy source has been wired since phase 3a under a
+    // different name (`arc4random_buf`), so what it adds is the interface's own 256-byte bound
+    // and nothing else.
+    //
+    // Three symbols LEFT the refusal list in the same change and none of them is new here:
+    // `socket`, `getaddrinfo` and `freeaddrinfo` were bound and refusing since phase 3d and now
+    // answer, which is a category change rather than a count change. See
+    // `the_final_split_of_the_reachable_set_is_what_the_record_claims`.
+    assert_eq!(Bionic::inline_symbols().count(), 194);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -540,6 +770,10 @@ fn dispatch_paths_are_what_f9_requires() {
     // would cost it 3x per call for nothing (D17).
     for symbol in [
         "inet_ntop",
+        // M6's addition to this group, and inline for the same reason as its opposite: it reads
+        // a guest string and writes four or sixteen bytes, which is what `memcpy` already does
+        // from the fast path.
+        "inet_pton",
         "gai_strerror",
         "poll",
         "select",
@@ -6238,6 +6472,117 @@ fn inet_ntop_with_an_unknown_family_is_eafnosupport() {
     assert_eq!(f.guest.read_u64(out + 8), EAFNOSUPPORT);
 }
 
+/// **`inet_pton` parses both families through a real thunk**, and the bytes are read back out of
+/// guest memory rather than inferred from the return value.
+///
+/// The IPv6 case is asserted on all sixteen bytes of an address with a `::` in the middle of it,
+/// because the zero run is reinflated by a hand-written overlapping slide: an off-by-one there
+/// produces a valid-looking address with the groups in the wrong half.
+#[test]
+fn inet_pton_parses_both_families_through_a_real_thunk() {
+    let _guard = serialized();
+    let f = fixture();
+    let dst = f.guest.data + 0x200;
+
+    let src = f.cstring(f.guest.data + 0x100, b"192.0.2.1");
+    let returned = value_of(&f, "inet_pton", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, src as u64);
+        asm.mov(2, dst as u64);
+    });
+    assert_eq!(returned, 1, "a converted address is 1");
+    assert_eq!(read_guest(&f, dst, 4), vec![192, 0, 2, 1]);
+
+    let src = f.cstring(f.guest.data + 0x100, b"2001:db8::8a2e:370:7334");
+    let returned = value_of(&f, "inet_pton", |asm| {
+        asm.mov(0, AF_INET6);
+        asm.mov(1, src as u64);
+        asm.mov(2, dst as u64);
+    });
+    assert_eq!(returned, 1);
+    assert_eq!(
+        read_guest(&f, dst, 16),
+        vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0x8a, 0x2e, 0x03, 0x70, 0x73, 0x34]
+    );
+
+    // The embedded quad, which is the one form where the two families' parsers meet.
+    let src = f.cstring(f.guest.data + 0x100, b"::ffff:192.0.2.1");
+    let returned = value_of(&f, "inet_pton", |asm| {
+        asm.mov(0, AF_INET6);
+        asm.mov(1, src as u64);
+        asm.mov(2, dst as u64);
+    });
+    assert_eq!(returned, 1);
+    assert_eq!(
+        read_guest(&f, dst, 16),
+        vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 0, 2, 1]
+    );
+}
+
+/// **A text that is not an address is 0, writes nothing, and does not touch errno.**
+///
+/// All three in one program, because the third can only be asserted against an errno that is
+/// already set: the call before it asks for `AF_UNIX` and leaves `EAFNOSUPPORT` behind, and the
+/// malformed parse that follows must leave it exactly there. A handler that reported 0 by
+/// setting an errno — `EINVAL` is the believable choice — would pass an assertion on the return
+/// value alone, and would break a caller that tries `AF_INET` first and `AF_INET6` second, which
+/// is how every "parse an address the user typed" routine is written.
+///
+/// The address is `01.2.3.4`: **valid dotted-decimal to `inet_aton`, and not an address here.**
+/// It is the leading-zero rule end to end rather than in a unit test, because that rule is the
+/// one a future widening would take out first.
+#[test]
+fn inet_pton_answers_zero_without_writing_and_without_setting_errno() {
+    let _guard = serialized();
+    let f = fixture();
+    let src = f.cstring(f.guest.data + 0x100, b"01.2.3.4");
+    let dst = f.guest.data + 0x200;
+    // A sentinel the refused call must not disturb.
+    f.guest.write_bytes(dst, &[0xA5; 16]);
+    let out = f.guest.data + 0x300;
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(22, out as u64);
+    // First, a family this layer does not parse: -1, and errno becomes EAFNOSUPPORT.
+    asm.mov(0, 1);
+    asm.mov(1, src as u64);
+    asm.mov(2, dst as u64);
+    asm.bl(f.thunk("inet_pton"));
+    asm.push(str_imm(0, 22, 0));
+    // Then the malformed address, which is 0 and is **not** an error.
+    asm.mov(0, AF_INET);
+    asm.mov(1, src as u64);
+    asm.mov(2, dst as u64);
+    asm.bl(f.thunk("inet_pton"));
+    asm.push(str_imm(0, 22, 8));
+    asm.bl(f.thunk("__errno"));
+    asm.push(ldr_w(1, 0, 0));
+    asm.push(str_imm(1, 22, 16));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(
+        f.guest.read_u64(out),
+        u64::MAX,
+        "an unsupported family is -1, sign-extended into X0 so `cmp w0, #-1` sees it"
+    );
+    assert_eq!(f.guest.read_u64(out + 8), 0, "`01.2.3.4` is not an address inet_pton accepts");
+    assert_eq!(
+        f.guest.read_u64(out + 16),
+        EAFNOSUPPORT,
+        "a 0 from inet_pton is a parse answer, not an error, and must leave errno alone"
+    );
+    assert_eq!(
+        read_guest(&f, dst, 16),
+        vec![0xA5; 16],
+        "a refused conversion must not leave part of an address behind: a caller that ignores \
+         the return value would read a different host"
+    );
+}
+
 /// **`gai_strerror` returns a pointer that stays valid**, which is the whole of its contract.
 ///
 /// Two calls with the same code return the **same** address, and a `strerror` in between does not
@@ -6949,22 +7294,33 @@ fn an_unknown_eventfd_flag_is_einval() {
 }
 
 
-/// **The three remaining network refusals name themselves, their argument, and the missing
-/// piece.**
+/// A fixture with a filesystem root **and** a network policy: everything a socket needs.
 ///
-/// Not just that they fail: each message has to carry the thing a reader three thousand
-/// initializers deep needs, which is *what is missing* rather than *that something is*.
-///
-/// **There were four.** `eventfd` was the fourth until M6, and its own refusal said what
-/// would end it: an eventfd is a descriptor, and the table had no kind that could carry a
-/// counter with a destructive read. `omni-platform` has that kind now, so `eventfd` is
-/// answered and is tested above rather than here -- a refusal that has been closed belongs
-/// in neither list.
-#[test]
-fn the_three_network_refusals_name_the_missing_piece() {
-    let _guard = serialized();
-    let f = fixture();
+/// The policy is [`NetPolicy::loopback_only`] and never `unrestricted`, so no test in this file
+/// can reach the internet even if one were written wrongly — the policy refuses the address
+/// before any packet leaves. Creating a socket is not policy-checked (a socket has no destination
+/// yet), so every test here that only creates one works under it unchanged.
+fn networked(tag: &str) -> (Fixture, Scratch) {
+    let (f, scratch) = rooted(tag);
+    f.bionic
+        .set_network_policy(Arc::new(omni_platform::net::NetPolicy::loopback_only()))
+        .expect("a network policy");
+    (f, scratch)
+}
 
+/// **A socket cannot be created without an embedding having said which network it may reach**,
+/// and the refusal names the method that would say it.
+///
+/// This is D30's replacement for Global Constraint 8 asserted as a property of the *default*
+/// rather than of a configuration: an instance that has decided nothing gets no socket at all,
+/// and it gets that without anybody remembering to write a check. `NetPolicy::closed()` as a
+/// default was rejected for the reason the refusal itself gives — an embedding that forgot would
+/// be indistinguishable from one that decided, and the guest would report a network outage this
+/// layer had invented.
+#[test]
+fn a_socket_needs_a_network_policy_and_the_refusal_names_what_would_supply_one() {
+    let _guard = serialized();
+    let (f, _root) = rooted("socket-no-policy");
     let error = refusal_of(&f, "socket", |asm| {
         asm.mov(0, AF_INET);
         asm.mov(1, 1); // SOCK_STREAM
@@ -6972,24 +7328,744 @@ fn the_three_network_refusals_name_the_missing_piece() {
     });
     assert_eq!(error.symbol(), Some("socket"), "{error:?}");
     let text = error.to_string();
-    assert!(text.contains("AF_INET"), "the family, named: {text}");
-    assert!(text.contains("EAFNOSUPPORT"), "the wrong answer it declines: {text}");
+    assert!(text.contains("set_network_policy"), "the method that would supply one: {text}");
+    assert!(text.contains("D30"), "the decision that made it a policy: {text}");
+    assert!(
+        text.contains("NetPolicy::closed()"),
+        "and why the closed policy is not the default: {text}"
+    );
+}
 
-    let error = refusal_of(&f, "getaddrinfo", |asm| {
+/// **The four symbols that left the refusal list answer, and they answer through real guest
+/// code.**
+///
+/// The other half of `the_final_split_of_the_reachable_set_is_what_the_record_claims`: three of
+/// these (`socket`, `getaddrinfo`, `freeaddrinfo`) were phase 3d's network refusals and one
+/// (`eventfd`) had been answering since M6 while still sitting in that list. A refusal that has
+/// been closed belongs in neither place, so the contract that replaced it is pinned here.
+///
+/// **The resolution is of an address literal**, `127.0.0.1`, so nothing leaves the machine and
+/// there is no DNS server to be down: `std` parses a literal itself rather than asking a
+/// resolver. What is under test is this layer's marshalling, not the host's resolver.
+#[test]
+fn the_network_group_answers_once_the_embedding_has_said_what_it_may_reach() {
+    let _guard = serialized();
+    let (f, _root) = networked("net-answers");
+
+    // `socket` hands out a descriptor out of the same table a file comes from.
+    let fd = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 2); // SOCK_DGRAM
+        asm.mov(2, 0);
+    }) as i32;
+    assert!(fd >= 3, "a socket must not collide with a standard stream: fd {fd}");
+    assert!(f.bionic.filesystem().expect("a filesystem").is_socket(fd));
+
+    // `eventfd` answers too, which is what stopped it belonging in the refusal list.
+    let event = value_of(&f, "eventfd", |asm| {
         asm.mov(0, 0);
         asm.mov(1, 0);
-        asm.mov(2, 0);
-        asm.mov(3, 0);
-    });
-    assert_eq!(error.symbol(), Some("getaddrinfo"));
-    let text = error.to_string();
-    assert!(text.contains("GUEST memory"), "where the answer would have to live: {text}");
+    }) as i32;
+    assert!(event >= 3 && event != fd, "two descriptors, two numbers");
 
-    let error = refusal_of(&f, "freeaddrinfo", |asm| {
-        asm.mov(0, 0x1234);
+    // `getaddrinfo` builds a list in guest memory and hands back its head.
+    let node = f.cstring(f.guest.data + 0x100, b"127.0.0.1");
+    let service = f.cstring(f.guest.data + 0x140, b"443");
+    let res = f.guest.data + 0x180;
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, node as u64);
+        asm.mov(1, service as u64);
+        asm.mov(2, 0); // no hints
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 0, "an address literal resolves without a query leaving the machine");
+    let head = read_u64_guest(&f, res);
+    assert_ne!(head, 0, "`res` must point at the list");
+    assert_eq!(f.bionic.addrinfo_slab().live(), 1, "one result slot is live");
+
+    // And `freeaddrinfo` gives the slot back.
+    let returned = value_of(&f, "freeaddrinfo", |asm| {
+        asm.mov(0, head);
     });
-    assert_eq!(error.symbol(), Some("freeaddrinfo"));
-    assert!(error.to_string().contains("void"), "{error}");
+    let _ = returned;
+    assert_eq!(f.bionic.addrinfo_slab().live(), 0, "the slot came back");
+}
+
+/// **The keep-alive timing options reach the socket in the GUEST's numbering, not the host's.**
+///
+/// The detector for the one defect in this area that no other test can see. Linux numbers these
+/// `TCP_KEEPIDLE` = 4, `TCP_KEEPINTVL` = 5 and `TCP_KEEPCNT` = 6; Windows numbers the same three
+/// 3, 17 and 16 and puts `TCP_MAXRT` on 5. **Every wrong mapping succeeds** — `setsockopt` returns
+/// zero, the socket keeps working, and the only difference is a keep-alive that fires at the wrong
+/// time on a connection nobody is watching. So the three are set to three *distinct* values and
+/// all three are read back: a transposition cannot survive that, and neither a single option nor
+/// three equal values would catch one.
+///
+/// The numbers are written into guest memory and passed as a `const void *`, which is what
+/// `setsockopt` takes — a test that passed them in a register would be testing a different ABI.
+#[test]
+fn the_keep_alive_timing_options_reach_the_socket_in_the_guests_numbering() {
+    let _guard = serialized();
+    let (f, _root) = networked("keepalive-timing");
+
+    // A stream socket: these are `IPPROTO_TCP` options and a datagram one refuses them.
+    let fd = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 1); // SOCK_STREAM
+        asm.mov(2, 0);
+    }) as i32;
+    assert!(fd >= 3, "a socket must not collide with a standard stream: fd {fd}");
+
+    // `SO_KEEPALIVE` first, because the timing configures something that is off by default.
+    let on = f.guest.data + 0x100;
+    f.guest.write_bytes(on, &1i32.to_le_bytes());
+    let rc = value_of(&f, "setsockopt", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, 1); // SOL_SOCKET
+        asm.mov(2, 9); // SO_KEEPALIVE
+        asm.mov(3, on as u64);
+        asm.mov(4, 4);
+    }) as i32;
+    assert_eq!(rc, 0, "setsockopt(SOL_SOCKET, SO_KEEPALIVE)");
+
+    // Three options, three distinct values, in the guest's own numbering.
+    const ROWS: [(u64, i32); 3] = [(4, 120), (5, 31), (6, 7)];
+    for (optname, value) in ROWS {
+        let at = f.guest.data + 0x120;
+        f.guest.write_bytes(at, &value.to_le_bytes());
+        let rc = value_of(&f, "setsockopt", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, 6); // IPPROTO_TCP
+            asm.mov(2, optname);
+            asm.mov(3, at as u64);
+            asm.mov(4, 4);
+        }) as i32;
+        assert_eq!(rc, 0, "setsockopt(IPPROTO_TCP, option {optname}) = {value}");
+    }
+    for (optname, expected) in ROWS {
+        let value_at = f.guest.data + 0x140;
+        let len_at = f.guest.data + 0x160;
+        f.guest.write_bytes(value_at, &0i32.to_le_bytes());
+        f.guest.write_bytes(len_at, &4u32.to_le_bytes());
+        let rc = value_of(&f, "getsockopt", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, 6);
+            asm.mov(2, optname);
+            asm.mov(3, value_at as u64);
+            asm.mov(4, len_at as u64);
+        }) as i32;
+        assert_eq!(rc, 0, "getsockopt(IPPROTO_TCP, option {optname})");
+        assert_eq!(
+            read_u32_guest(&f, value_at) as i32,
+            expected,
+            "option {optname} must come back from the host option it was written to; reading \
+             another row's value here means the two are transposed"
+        );
+        assert_eq!(read_u32_guest(&f, len_at), 4, "an int, not a timeval");
+    }
+}
+
+/// **Zero is `EINVAL` for all three keep-alive figures, and the errno is read the way a guest
+/// reads it.**
+///
+/// Linux range-checks each of them in `do_tcp_setsockopt` and refuses zero. It matters more than
+/// a range check usually would: zero is a perfectly good `u32`, it survives every conversion
+/// between the guest and the host, and it would arrive at the host meaning *probe with no idle
+/// time* or *give up after no probes* — a socket that works, configured to tear itself down.
+/// Nothing downstream could tell that from a socket that had been configured properly.
+#[test]
+fn a_zero_keep_alive_figure_is_einval_rather_than_a_socket_that_tears_itself_down() {
+    let _guard = serialized();
+    let (f, _root) = networked("keepalive-zero");
+    let fd = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 1);
+        asm.mov(2, 0);
+    }) as i32;
+    let zero = f.guest.data + 0x100;
+    f.guest.write_bytes(zero, &0i32.to_le_bytes());
+    let out = f.guest.data + 0x400;
+    for optname in [4u64, 5, 6] {
+        let entry = program(&f, |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, 6); // IPPROTO_TCP
+            asm.mov(2, optname);
+            asm.mov(3, zero as u64);
+            asm.mov(4, 4);
+            asm.bl(f.thunk("setsockopt"));
+            asm.mov(22, out as u64);
+            asm.push(str_imm(0, 22, 0));
+            asm.bl(f.thunk("__errno"));
+            asm.push(ldr_w(1, 0, 0));
+            asm.push(str_imm(1, 22, 8));
+        });
+        assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(
+            f.guest.read_u64(out) as i64,
+            -1,
+            "setsockopt(IPPROTO_TCP, option {optname}) = 0 must fail"
+        );
+        assert_eq!(f.guest.read_u64(out + 8), 22, "EINVAL is Linux's 22");
+    }
+}
+
+/// **`getsockname` reports the address the socket was bound to, and a short buffer is truncated
+/// while the FULL length is reported.**
+///
+/// The second half is the rule that is easy to get backwards and impossible to notice: `addrlen`
+/// is how a caller learns its buffer was not big enough, so writing the truncated length would
+/// tell it the address it holds is complete. `recvfrom` shares the same marshalling, which is why
+/// one defect here would be two wrong answers.
+#[test]
+fn getsockname_reports_the_bound_address_and_a_short_buffer_gets_the_full_length() {
+    let _guard = serialized();
+    let (f, _root) = networked("getsockname");
+    let fd = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 2); // SOCK_DGRAM, which can be bound without a peer
+        asm.mov(2, 0);
+    }) as i32;
+
+    // `bind(fd, {AF_INET, port 0, 127.0.0.1}, 16)`, so the host chooses the port.
+    let sockaddr = f.guest.data + 0x100;
+    let mut bytes = [0u8; 16];
+    bytes[0..2].copy_from_slice(&2u16.to_le_bytes()); // sin_family = AF_INET
+    bytes[2..4].copy_from_slice(&0u16.to_be_bytes()); // sin_port = 0, network order
+    bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    f.guest.write_bytes(sockaddr, &bytes);
+    let rc = value_of(&f, "bind", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, sockaddr as u64);
+        asm.mov(2, 16);
+    }) as i32;
+    assert_eq!(rc, 0, "bind to 127.0.0.1:0");
+
+    // The whole address, into a buffer that fits it.
+    let out = f.guest.data + 0x200;
+    let len_at = f.guest.data + 0x240;
+    f.guest.write_bytes(out, &[0xAAu8; 16]);
+    f.guest.write_bytes(len_at, &16u32.to_le_bytes());
+    let rc = value_of(&f, "getsockname", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, out as u64);
+        asm.mov(2, len_at as u64);
+    }) as i32;
+    assert_eq!(rc, 0, "getsockname on a bound socket");
+    assert_eq!(read_u32_guest(&f, len_at), 16, "sizeof(struct sockaddr_in)");
+    let got = read_guest(&f, out, 16);
+    assert_eq!(&got[0..2], &[2, 0], "sin_family = AF_INET, little-endian u16");
+    assert_eq!(&got[4..8], &[127, 0, 0, 1], "the address it was bound to");
+    let port = u16::from_be_bytes([got[2], got[3]]);
+    assert_ne!(port, 0, "the host chose a port and getsockname is how the guest learns it");
+
+    // **The same call into a buffer that does not fit it.** Eight bytes take the family, the port
+    // and the address, and `addrlen` must still say sixteen.
+    let short_out = f.guest.data + 0x280;
+    let short_len = f.guest.data + 0x2C0;
+    f.guest.write_bytes(short_out, &[0xAAu8; 16]);
+    f.guest.write_bytes(short_len, &8u32.to_le_bytes());
+    let rc = value_of(&f, "getsockname", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, short_out as u64);
+        asm.mov(2, short_len as u64);
+    }) as i32;
+    assert_eq!(rc, 0, "a short buffer is not an error, it is a truncation");
+    assert_eq!(
+        read_u32_guest(&f, short_len),
+        16,
+        "the FULL length, not what fitted -- that is how the caller learns it was truncated"
+    );
+    let truncated = read_guest(&f, short_out, 16);
+    assert_eq!(&truncated[0..8], &got[0..8], "the first eight bytes are the address's");
+    assert_eq!(&truncated[8..16], &[0xAA; 8], "and nothing past the eight it was given");
+}
+
+/// **The `struct addrinfo` list the guest walks is bionic's layout, read back the way the guest
+/// reads it.**
+///
+/// Every assertion follows a pointer out of guest memory rather than recomputing this layer's own
+/// arithmetic: `res` to the head, `ai_addr` to the `sockaddr`, `ai_next` to the end. A test that
+/// compared against a second copy of the encoder would agree with any layout, including glibc's —
+/// and glibc's is the one that would hand the guest a null `char *` where its `sockaddr *`
+/// belongs, with the same `sizeof` and the same field set.
+#[test]
+fn a_resolved_list_is_laid_out_the_way_bionic_lays_one_out() {
+    let _guard = serialized();
+    let (f, _root) = networked("gai-layout");
+
+    let node = f.cstring(f.guest.data + 0x100, b"127.0.0.1");
+    let service = f.cstring(f.guest.data + 0x140, b"443");
+    let hints = f.guest.data + 0x200;
+    // `ai_family = AF_INET`, `ai_socktype = SOCK_STREAM`, and nothing else set.
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints + 4, &(AF_INET as i32).to_le_bytes());
+    f.guest.write_bytes(hints + 8, &1i32.to_le_bytes());
+    let res = f.guest.data + 0x180;
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, node as u64);
+        asm.mov(1, service as u64);
+        asm.mov(2, hints as u64);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 0);
+
+    let head = read_u64_guest(&f, res) as omni_cpu::GuestAddr;
+    // `ai_flags`, `ai_family`, `ai_socktype`, `ai_protocol`, `ai_addrlen`.
+    assert_eq!(read_u32_guest(&f, head + 4) as i32, AF_INET as i32, "ai_family");
+    assert_eq!(read_u32_guest(&f, head + 8), 1, "ai_socktype = SOCK_STREAM");
+    assert_eq!(read_u32_guest(&f, head + 12), 6, "ai_protocol = IPPROTO_TCP");
+    assert_eq!(read_u32_guest(&f, head + 16), 16, "ai_addrlen = sizeof(struct sockaddr_in)");
+    // **The two fields whose ORDER is the whole danger.** `ai_canonname` is at 24 and is null;
+    // `ai_addr` is at 32 and points at a `sockaddr`. A glibc-derived layout swaps them, has the
+    // same `sizeof`, and every size check still passes.
+    assert_eq!(read_u64_guest(&f, head + 24), 0, "ai_canonname is null and is the FIRST pointer");
+    let ai_addr = read_u64_guest(&f, head + 32) as omni_cpu::GuestAddr;
+    assert_ne!(ai_addr, 0, "ai_addr is the SECOND pointer and is not null");
+    assert_eq!(read_u64_guest(&f, head + 40), 0, "one address, so ai_next ends the list");
+
+    // The `sockaddr` the guest would hand to `connect`, byte for byte.
+    let sockaddr = read_guest(&f, ai_addr, 16);
+    assert_eq!(&sockaddr[0..2], &[2, 0], "sin_family = AF_INET, little-endian u16");
+    assert_eq!(&sockaddr[2..4], &[0x01, 0xBB], "sin_port = 443 in NETWORK order");
+    assert_ne!(&sockaddr[2..4], &[0xBB, 0x01], "and not in the guest's own byte order");
+    assert_eq!(&sockaddr[4..8], &[127, 0, 0, 1], "sin_addr, in the order it is written");
+}
+
+/// **`freeaddrinfo` matches the head pointer exactly, and a pointer into the middle of a live
+/// list is refused rather than freed.**
+///
+/// The `void` return is what makes this worth a test of its own: there is no value for a wrong
+/// answer to be wrong in, so a `freeaddrinfo` that accepted anything would be invisible until the
+/// slab handed a live list's storage to the next resolution. The pointer used here —
+/// `head + 48` — is `res->ai_next`'s target on a two-node list and is exactly what a guest that
+/// walked and freed as it went would pass.
+#[test]
+fn freeaddrinfo_refuses_a_pointer_that_is_not_the_head_it_handed_out() {
+    let _guard = serialized();
+    let (f, _root) = networked("gai-free");
+
+    let node = f.cstring(f.guest.data + 0x100, b"127.0.0.1");
+    let res = f.guest.data + 0x180;
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, node as u64);
+        asm.mov(1, 0); // no service: port 0
+        asm.mov(2, 0);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 0);
+    let head = read_u64_guest(&f, res);
+    assert_eq!(f.bionic.addrinfo_slab().live(), 1);
+
+    for wrong in [head + 48, head + 1, 0xDEAD_0000] {
+        let error = refusal_of(&f, "freeaddrinfo", |asm| {
+            asm.mov(0, wrong);
+        });
+        assert_eq!(error.symbol(), Some("freeaddrinfo"), "{error:?}");
+        assert!(error.to_string().contains("void"), "{error}");
+        assert_eq!(
+            f.bionic.addrinfo_slab().live(),
+            1,
+            "a pointer that is not the head must not free the slot"
+        );
+    }
+    // A null pointer is a no-op, which is what bionic's own `while (ai)` loop does with one.
+    let _ = value_of(&f, "freeaddrinfo", |asm| {
+        asm.mov(0, 0);
+    });
+    assert_eq!(f.bionic.addrinfo_slab().live(), 1, "freeaddrinfo(NULL) frees nothing");
+
+    // And the real head does free it, exactly once.
+    let _ = value_of(&f, "freeaddrinfo", |asm| {
+        asm.mov(0, head);
+    });
+    assert_eq!(f.bionic.addrinfo_slab().live(), 0);
+    let error = refusal_of(&f, "freeaddrinfo", |asm| {
+        asm.mov(0, head);
+    });
+    assert!(matches!(error, AbiError::Refused { .. }), "a double free is refused: {error:?}");
+}
+
+/// **A full slab refuses by name and says which of the two things went wrong.**
+///
+/// Never an overwrite of a list the guest is still walking, and never a truncated one: a guest
+/// walking a list cannot tell a node from a node that has been replaced, so reusing a live slot
+/// would be silent. The refusal names `addrinfo_slab().live()`, which is what distinguishes a
+/// guest that leaks lists from a slab that is too small — and the test reads that number as well,
+/// so the two agree.
+#[test]
+fn a_full_addrinfo_slab_refuses_rather_than_reusing_a_live_slot() {
+    let _guard = serialized();
+    let (f, _root) = networked("gai-full");
+    let node = f.cstring(f.guest.data + 0x100, b"127.0.0.1");
+    let res = f.guest.data + 0x180;
+
+    let mut heads = Vec::new();
+    for taken in 0..omni_android::bionic::ADDRINFO_RESULTS {
+        let code = value_of(&f, "getaddrinfo", |asm| {
+            asm.mov(0, node as u64);
+            asm.mov(1, 0);
+            asm.mov(2, 0);
+            asm.mov(3, res as u64);
+        }) as i32;
+        assert_eq!(code, 0, "slot {taken} of the slab");
+        let head = read_u64_guest(&f, res);
+        assert!(!heads.contains(&head), "slot {taken} was handed out twice");
+        heads.push(head);
+    }
+    assert_eq!(f.bionic.addrinfo_slab().live(), omni_android::bionic::ADDRINFO_RESULTS);
+
+    let before = read_u64_guest(&f, res);
+    let error = refusal_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, node as u64);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, res as u64);
+    });
+    assert_eq!(error.symbol(), Some("getaddrinfo"), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("slab is full"), "{text}");
+    assert!(text.contains("addrinfo_slab().live()"), "and how to tell the two causes apart: {text}");
+    assert_eq!(read_u64_guest(&f, res), before, "a refused call writes nothing to `res`");
+
+    // Freeing one makes exactly one more available, which is the free list working rather than
+    // the slab having grown.
+    let _ = value_of(&f, "freeaddrinfo", |asm| {
+        asm.mov(0, heads[2]);
+    });
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, node as u64);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 0);
+    assert_eq!(read_u64_guest(&f, res), heads[2], "the freed slot is the one handed out next");
+}
+
+/// **`AI_NUMERICHOST` is honoured, an unknown flag is `EAI_BADFLAGS`, and a family this layer has
+/// no socket for is `EAI_FAMILY`.**
+///
+/// Three different `EAI_*` codes for three different mistakes, because a client that tried one
+/// family and then the other branches on the difference. The numbering is bionic's, which counts
+/// **up** from 1 where glibc counts down from -1 — so a table taken from the development host
+/// would be wrong in a way no size or shape check could see.
+#[test]
+fn getaddrinfo_reports_the_bionic_eai_codes_and_not_the_hosts() {
+    let _guard = serialized();
+    let (f, _root) = networked("gai-codes");
+    let res = f.guest.data + 0x180;
+    let hints = f.guest.data + 0x200;
+    let name = f.cstring(f.guest.data + 0x100, b"not-an-address.invalid");
+
+    // AI_NUMERICHOST over a name that is not a literal: EAI_NONAME, and no query leaves.
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints, &4i32.to_le_bytes()); // ai_flags = AI_NUMERICHOST
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, name as u64);
+        asm.mov(1, 0);
+        asm.mov(2, hints as u64);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 8, "EAI_NONAME is 8 on bionic; glibc spells it -2");
+
+    // A flag `netdb.h` does not define.
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints, &0x4000i32.to_le_bytes());
+    let literal = f.cstring(f.guest.data + 0x100, b"127.0.0.1");
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, literal as u64);
+        asm.mov(1, 0);
+        asm.mov(2, hints as u64);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 3, "EAI_BADFLAGS");
+
+    // A family this layer has no socket for: AF_UNIX.
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints + 4, &1i32.to_le_bytes());
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, literal as u64);
+        asm.mov(1, 0);
+        asm.mov(2, hints as u64);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 5, "EAI_FAMILY");
+
+    // And the family the literal does not have is EAI_ADDRFAMILY, not EAI_NONAME: the name exists.
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints + 4, &10i32.to_le_bytes()); // AF_INET6
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, literal as u64);
+        asm.mov(1, 0);
+        asm.mov(2, hints as u64);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 1, "EAI_ADDRFAMILY -- the name resolved, just not to this family");
+}
+
+/// **An option this seam does not implement is refused by name, carrying the numbers the guest
+/// passed.**
+///
+/// Global Constraint 1 in person.
+///
+/// # This test asserted the opposite of the code for one session, and that is worth keeping
+///
+/// It was written when the M6 network run found the engine's HTTP stack setting `SO_KEEPALIVE`
+/// (option 9 at `SOL_SOCKET`) on the settings socket and this seam refusing it. The refusal was
+/// the finding; the test pinned it. **Then `SO_KEEPALIVE` was implemented in the same uncommitted
+/// change and this test was not moved**, so it sat here asserting that an implemented option
+/// refuses -- red, in a tree nobody had run this target on.
+///
+/// It is `VERIFICATION.md` entry 5 exactly: *the regression test for a previous defect is where
+/// the next gap hides*, and entry 13's half of it -- a justification that was true when it was
+/// written down and false by the time it was used. The repair is the one the split-list tests in
+/// this file already make: a symbol that becomes implemented has to be **moved**, and what
+/// replaces it must be something that genuinely is not.
+///
+/// `SO_LINGER` (option 13 at `SOL_SOCKET`) is what replaced it. It is a real option, it is
+/// imported-but-never-called territory, and nothing in `omni_platform::net::SocketOption` has a
+/// variant for it -- so the refusal it produces is the contract this test is about. The
+/// `SO_KEEPALIVE` end of the story is asserted by *calling* it, in
+/// `the_keep_alive_timing_options_reach_the_socket_in_the_guests_numbering`.
+#[test]
+fn an_unimplemented_socket_option_is_refused_with_its_own_numbers() {
+    let _guard = serialized();
+    let (f, _root) = networked("setsockopt-unknown");
+    let fd = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 1);
+        asm.mov(2, 0);
+    }) as i32;
+    let value = f.guest.data + 0x100;
+    f.guest.write_bytes(value, &1i32.to_le_bytes());
+
+    let error = refusal_of(&f, "setsockopt", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, 1); // SOL_SOCKET
+        asm.mov(2, 13); // SO_LINGER, which nothing implements
+        asm.mov(3, value as u64);
+        asm.mov(4, 4);
+    });
+    assert_eq!(error.symbol(), Some("setsockopt"), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("option 13"), "the number the guest passed: {text}");
+    assert!(text.contains("level 1"), "and the level: {text}");
+    assert!(text.contains("SO_RCVBUF"), "and what IS implemented: {text}");
+    assert!(
+        text.contains("silently ignored"),
+        "and why it is not accepted: {text}"
+    );
+}
+
+/// **The options that are implemented round-trip through `setsockopt` and `getsockopt`, and
+/// `O_NONBLOCK` set with `fcntl` reaches the socket itself.**
+///
+/// `TCP_NODELAY` is the one asserted by value, because it is a boolean the kernel does not
+/// reinterpret — `SO_RCVBUF` is doubled by Linux and rounded by Windows, so a round-trip test on
+/// one asserts only that the kernel agreed to *something*.
+#[test]
+fn the_implemented_socket_options_round_trip_and_fcntl_reaches_the_socket() {
+    let _guard = serialized();
+    let (f, _root) = networked("sockopt-roundtrip");
+    let fd = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 1); // SOCK_STREAM
+        asm.mov(2, 0);
+    }) as i32;
+
+    let value = f.guest.data + 0x100;
+    let length = f.guest.data + 0x140;
+    f.guest.write_bytes(value, &1i32.to_le_bytes());
+    let set = value_of(&f, "setsockopt", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, 6); // IPPROTO_TCP
+        asm.mov(2, 1); // TCP_NODELAY
+        asm.mov(3, value as u64);
+        asm.mov(4, 4);
+    }) as i32;
+    assert_eq!(set, 0, "TCP_NODELAY is implemented");
+
+    f.guest.write_bytes(value, &0i32.to_le_bytes());
+    f.guest.write_bytes(length, &4u32.to_le_bytes());
+    let got = value_of(&f, "getsockopt", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, 6);
+        asm.mov(2, 1);
+        asm.mov(3, value as u64);
+        asm.mov(4, length as u64);
+    }) as i32;
+    assert_eq!(got, 0);
+    assert_ne!(read_u32_guest(&f, value), 0, "TCP_NODELAY reads back as set");
+    assert_eq!(read_u32_guest(&f, length), 4, "and the length is the option's own");
+
+    // `SO_ERROR` on a socket nothing has done to it is zero, which is "no pending error".
+    f.guest.write_bytes(length, &4u32.to_le_bytes());
+    let got = value_of(&f, "getsockopt", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, 1); // SOL_SOCKET
+        asm.mov(2, 4); // SO_ERROR
+        asm.mov(3, value as u64);
+        asm.mov(4, length as u64);
+    }) as i32;
+    assert_eq!(got, 0);
+    assert_eq!(read_u32_guest(&f, value), 0, "a fresh socket has no pending error");
+
+    // `fcntl(F_SETFL, O_NONBLOCK)` on a socket reaches the host, which is what a `recv` answers
+    // to. Asserted through the descriptor table rather than through `F_GETFL` alone, because a
+    // table that remembered the flag and never told the socket would pass the second on its own.
+    let set = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, 4); // F_SETFL
+        asm.mov(2, 0o4000); // O_NONBLOCK
+    }) as i32;
+    assert_eq!(set, 0);
+    let fs = f.bionic.filesystem().expect("a filesystem");
+    assert!(fs.is_nonblocking(fd).expect("a socket answers"));
+    assert!(
+        fs.socket_at(fd).expect("the handle").lock().expect("not poisoned").nonblocking(),
+        "the flag was recorded in the table and never reached the socket"
+    );
+    let flags = value_of(&f, "fcntl", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, 3); // F_GETFL
+        asm.mov(2, 0);
+    }) as i32;
+    assert_eq!(flags & 0o4000, 0o4000, "F_GETFL reports it back");
+}
+
+/// **`poll` answers over a socket, and over a socket and a pipe at once, through real guest
+/// code.**
+///
+/// This is the test D25 predicted: "the day a phase binds `socket` for real, that test fails and
+/// this module has to grow a real readiness source with it". The readiness under it is now a host
+/// `select`, not a table lookup, and three separate things can go wrong that a count of ready
+/// descriptors cannot see —
+///
+/// * a socket reported `POLLIN` because something inherited a file's always-ready answer, which
+///   would send the guest into a receive with nothing behind it;
+/// * a timeout that never returns, because the wait picked the side of a **mixed** set that
+///   cannot wake it — the alternating-slice hazard this module's header is about;
+/// * a timeout that returns instantly, which looks like a working poll and is a busy loop.
+///
+/// Each is asserted on the named entry's own `revents` and on the clock, in a set that has a
+/// socket, a pipe and a file in it at once.
+#[test]
+fn poll_answers_over_a_socket_and_a_pipe_in_the_same_call() {
+    let _guard = serialized();
+    let (f, _root) = networked("poll-socket");
+
+    let sock = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 2); // SOCK_DGRAM
+        asm.mov(2, 0);
+    }) as i32;
+    let pipefd = f.guest.data + 0x300;
+    let made = value_of(&f, "pipe", |asm| {
+        asm.mov(0, pipefd as u64);
+    }) as i32;
+    assert_eq!(made, 0);
+    let read_fd = read_u32_guest(&f, pipefd) as i32;
+
+    // Three entries: the socket asked about both directions, the pipe's read end asked about
+    // reading, and a descriptor that is not open at all.
+    let fds = f.guest.data + 0x400;
+    let entry = |slot: usize, fd: i32, events: i16| {
+        let at = fds + slot * 8;
+        f.guest.write_bytes(at, &fd.to_le_bytes());
+        f.guest.write_bytes(at + 4, &events.to_le_bytes());
+        f.guest.write_bytes(at + 6, &0i16.to_le_bytes());
+    };
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    const POLLNVAL: i16 = 0x020;
+    entry(0, sock, POLLIN | POLLOUT);
+    entry(1, read_fd, POLLIN);
+    entry(2, 4095, POLLIN);
+
+    let started = std::time::Instant::now();
+    let ready = value_of(&f, "poll", |asm| {
+        asm.mov(0, fds as u64);
+        asm.mov(1, 3);
+        asm.mov(2, 200); // milliseconds
+    }) as i32;
+    let took = started.elapsed();
+
+    let revents = |slot: usize| {
+        i16::from_le_bytes(read_guest(&f, fds + slot * 8 + 6, 2).try_into().expect("two bytes"))
+    };
+    // **An unconnected datagram socket is writable and is not readable.** The writable half is
+    // the host's answer and not this layer's; the readable half is what `Readiness::ALWAYS` would
+    // have got wrong.
+    assert_eq!(revents(0) & POLLOUT, POLLOUT, "a datagram socket's send buffer has room");
+    assert_eq!(revents(0) & POLLIN, 0, "and nothing has arrived on it");
+    // An empty pipe with a live writer is not readable.
+    assert_eq!(revents(1), 0, "an empty pipe read end reports nothing");
+    // A descriptor nobody opened is `POLLNVAL`, whether or not it was asked for.
+    assert_eq!(revents(2), POLLNVAL);
+    assert_eq!(ready, 2, "the socket and the bad descriptor; the pipe is not ready");
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "a poll with something already ready must not sleep: {took:?}"
+    );
+
+    // And a mixed set with **nothing** ready returns 0 when its timeout expires, rather than
+    // hanging on the side of the set that cannot wake it. Asserted on the clock in both
+    // directions: a wait that returned instantly is a busy loop, and one that never returns is
+    // the alternating-slice hazard.
+    entry(0, sock, POLLIN);
+    entry(1, read_fd, POLLIN);
+    entry(2, -1, POLLIN);
+    let started = std::time::Instant::now();
+    let ready = value_of(&f, "poll", |asm| {
+        asm.mov(0, fds as u64);
+        asm.mov(1, 3);
+        asm.mov(2, 150);
+    }) as i32;
+    let took = started.elapsed();
+    assert_eq!(ready, 0, "nothing in the set can become ready inside the timeout");
+    assert_eq!(revents(2), 0, "a negative descriptor is ignored and its revents zeroed");
+    assert!(
+        took >= std::time::Duration::from_millis(120),
+        "the call returned in {took:?} from a 150 ms timeout, which is a busy loop"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "the call waited {took:?} for a 150 ms timeout: the wait picked a side of the mixed set \
+         that cannot wake it"
+    );
+}
+
+/// **A family or a socket type this layer has no primitive for is refused by name, not answered
+/// `-1`.**
+///
+/// The argument the old blanket `socket` refusal made, kept for the cases that are still true: a
+/// networked program branches on `EAFNOSUPPORT` quietly — it switches off whatever needed the
+/// socket — so the run would complete and nothing anywhere would record that this layer, rather
+/// than the device, had decided. `AF_INET6` is **no longer** in this list, which is the part that
+/// changed: it is created for real, and a host with no IPv6 is what reports `EAFNOSUPPORT` now.
+#[test]
+fn a_socket_family_with_no_primitive_is_refused_by_name_rather_than_answered() {
+    let _guard = serialized();
+    let (f, _root) = networked("socket-refusals");
+
+    for (domain, kind, named) in [(1u64, 1u64, "AF_UNIX"), (16, 2, "AF_NETLINK")] {
+        let error = refusal_of(&f, "socket", |asm| {
+            asm.mov(0, domain);
+            asm.mov(1, kind);
+            asm.mov(2, 0);
+        });
+        assert_eq!(error.symbol(), Some("socket"), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains(named), "the family, named: {text}");
+        assert!(text.contains("EAFNOSUPPORT"), "the wrong answer it declines: {text}");
+    }
+    // `SOCK_RAW` is a type with no primitive, and it is refused with the type named.
+    let error = refusal_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 3); // SOCK_RAW
+        asm.mov(2, 0);
+    });
+    assert!(error.to_string().contains("SOCK_RAW"), "{error}");
 }
 
 /// **Every symbol that produces a descriptor has had its readiness decided, asserted
@@ -7022,22 +8098,48 @@ fn every_symbol_that_produces_a_descriptor_has_had_its_readiness_decided() {
         vec!["eventfd", "open", "__open_2", "opendir", "pipe", "socket"],
         "a symbol that produces a descriptor was bound without `poll` being told about it"
     );
-    // Of those six, the two that would produce a descriptor whose readiness nothing here models
-    // are still refusals — asserted by calling them, because a comment saying so is not a fact.
+    // **And all six of them now answer, which is the sentence that changed in M6.** The version
+    // of this test before it asserted the opposite for two of them -- "nothing in this runtime
+    // models a socket's readiness, and `poll` would have to answer for one" -- and called them by
+    // name to prove it. That was true and D25 wrote down the day it would stop being true: a
+    // socket's readiness is now `omni_platform::net::Socket::readiness`, which is a real `select`
+    // on the host, and `Entry::readiness` has an arm for it with no default to inherit.
+    //
+    // So what is asserted instead is the thing that can still go wrong: every descriptor kind
+    // this layer hands out has a `ReadinessSource`, and the three sources are distinct. A seventh
+    // kind added without deciding fails `Filesystem::readiness_source`'s own match, which has no
+    // default arm either.
     let _guard = serialized();
-    let f = fixture();
-    for symbol in ["socket", "eventfd"] {
-        let error = refusal_of(&f, symbol, |asm| {
-            asm.mov(0, 2);
-            asm.mov(1, 1);
-            asm.mov(2, 0);
-        });
-        assert!(
-            matches!(error, AbiError::Refused { .. }),
-            "`{symbol}` must refuse: nothing in this runtime models a socket's readiness, and \
-             `poll` would have to answer for one: {error:?}"
-        );
-    }
+    let (f, _root) = networked("readiness-decided");
+    let path = f.cstring(f.guest.data + 0x100, b"/f.txt");
+    let file = value_of(&f, "open", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_WRONLY | O_CREAT);
+        asm.mov(2, 0o644);
+    }) as i32;
+    let event = value_of(&f, "eventfd", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+    }) as i32;
+    let sock = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 2);
+        asm.mov(2, 0);
+    }) as i32;
+    let fs = f.bionic.filesystem().expect("a filesystem");
+    use omni_platform::fs::ReadinessSource;
+    assert_eq!(fs.readiness_source(file), Some(ReadinessSource::Immediate));
+    assert_eq!(fs.readiness_source(event), Some(ReadinessSource::Gate));
+    assert_eq!(
+        fs.readiness_source(sock),
+        Some(ReadinessSource::Host),
+        "a socket's readiness is the operating system's answer and nothing else's"
+    );
+    assert_ne!(
+        fs.readiness(sock).expect("the host answered"),
+        omni_platform::fs::Readiness::ALWAYS,
+        "ALWAYS is a regular file's answer and would send `poll` into a receive with nothing          behind it"
+    );
 }
 
 /// **The kinds that are modelled each answer for themselves, through real guest code.**
@@ -7604,13 +8706,17 @@ fn the_process_cpu_clock_is_answered_and_the_thread_cpu_clock_is_still_refused()
     assert!(text.contains("GetThreadTimes"), "it must name the missing primitive: {text}");
 }
 
-/// **`mallinfo` refuses, and its refusal names the heap that is not there.**
+/// **`mallinfo` reports the empty libc heap that is genuinely there.**
 ///
-/// The one reachable import that returns through `X8`, and the refusal reports that register's
-/// value — so a reader can see the guest really did pass a result buffer and that the marshalling
-/// is not what failed.
+/// It refused until M6, and the refusal's own text conceded that ten zeroed fields would be
+/// *arithmetically true* of a heap nothing has allocated from. `libroblox.so` imports no allocator
+/// (D17), so nothing ever has. `nativePostClientSettingsLoadedInitialization3` stops on this call,
+/// and a true answer that unblocks it is not what the no-stubs rule is about.
+///
+/// The one reachable import that returns through `X8`, so this is also the only test that
+/// exercises the indirect result register at all.
 #[test]
-fn mallinfo_refuses_and_names_the_allocator_that_is_not_here() {
+fn mallinfo_reports_the_empty_libc_heap_through_the_indirect_result_register() {
     let _guard = serialized();
     let f = fixture();
     let out = f.guest.data + 0x500;
@@ -7623,17 +8729,43 @@ fn mallinfo_refuses_and_names_the_allocator_that_is_not_here() {
     asm.bl(f.thunk("mallinfo"));
     asm.push(ret(21));
     f.guest.load(asm.words());
+    // A non-zero pattern across the whole struct first, so that "all ten fields are zero" is a
+    // thing this call did rather than a thing the buffer already was. Without it the assertion
+    // below passes just as well against a handler that writes nothing at all.
+    for field in 0..10usize {
+        f.guest.write_u64(out + field * 8, 0xDEAD_0000_0000_0000 | field as u64);
+    }
     let mut cpu = f.guest.thread(&f.boundary);
-    let error = match f.run(&mut cpu, entry) {
+    f.run(&mut cpu, entry).expect("mallinfo returns");
+    for field in 0..10usize {
+        assert_eq!(
+            f.guest.read_u64(out + field * 8),
+            0,
+            "field {field} of the ten: the libc heap this runtime has is empty, and every one of \
+             its counts says so",
+        );
+    }
+
+    // **A hostile `X8` is the boundary's refusal, not a host fault.** The eighty bytes go through
+    // `GuestMem`, so an unmapped result buffer is refused by name with the length and the access
+    // in it — the property that makes writing through a guest-supplied pointer safe at all, and
+    // the half of this symbol a returning handler could most easily lose.
+    let hostile = f.guest.next_entry();
+    let mut asm = Asm::at(hostile);
+    asm.push(mov_reg(21, 30));
+    asm.mov(8, 0);
+    asm.bl(f.thunk("mallinfo"));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    let error = match f.run(&mut cpu, hostile) {
         Err(error) => error,
-        Ok(exit) => panic!("mallinfo completed with {exit:?}"),
+        Ok(exit) => panic!("a null X8 completed with {exit:?}"),
     };
     assert_eq!(error.symbol(), Some("mallinfo"), "{error:?}");
     let text = error.to_string();
-    assert!(text.contains(&format!("{out:#x}")), "the X8 the guest passed, read back: {text}");
-    assert!(text.contains("imports no allocator"), "{text}");
-    // And nothing was written into the result buffer.
-    assert_eq!(f.guest.read_u64(out), 0, "a refused mallinfo must not write a fictional zero");
+    assert!(text.contains("80"), "the length it would have written: {text}");
+    assert!(text.contains("writing"), "the access it was refused for: {text}");
 }
 
 /// **`longjmp` refuses**, and the refusal names what restoring a `jmp_buf` would take.
@@ -7664,17 +8796,31 @@ fn longjmp_refuses_and_names_what_restoring_a_jmp_buf_would_take() {
 /// list wrong by two in each direction, D24's arena test restating its own definition). So the
 /// split is derived by **calling** each symbol and seeing what it does, not by reading a table:
 ///
-/// * **13 refuse by name, whatever they are passed.** Each is called with zeroed arguments, the
+/// * **8 refuse by name, whatever they are passed.** Each is called with zeroed arguments, the
 ///   refusal has to be `AbiError::Refused` — not `Unbound`, which would mean nothing implements
 ///   it, and not a plausible value — and it must **still** refuse when it is given something
 ///   plausible, which is the half that keeps a conditional answer out of this list.
 /// * **3 report a guest termination**, which is a third outcome rather than a refusal: `abort`
 ///   and `__stack_chk_fail` report `GuestAborted` and `_exit` reports `GuestExited`, because this
 ///   process hosts several guest instances and a host `abort()` would take all of them (D22).
-/// * **152 answer**, which is what is left of the 168 bound.
+/// * **157 answer**, which is what is left of the 168 bound.
 /// * **18** are data objects and **2** are deliberately absent.
 ///
-/// 152 + 13 + 3 + 18 + 2 = 188.
+/// 157 + 8 + 3 + 18 + 2 = 188.
+///
+/// # M6's network phase moved FOUR out of the refusal list, and the fourth was already wrong
+///
+/// `socket`, `getaddrinfo` and `freeaddrinfo` were phase 3d's network refusals and D30 withdrew
+/// the constraint that produced them; each answers now, once an embedding has said which network
+/// this instance may reach. `eventfd` is the fourth and it had **already** started answering in
+/// M6 — it stayed in this list because it happens to refuse in the bare fixture, which is exactly
+/// the "membership adjusted to keep a total right" failure this test's own heading complains
+/// about, found while removing the other three.
+///
+/// Their new contract is asserted by *calling* them, in
+/// `the_network_group_answers_once_the_embedding_has_said_what_it_may_reach`, which is the same
+/// treatment `mallinfo` got when it left this list: a refusal that has been closed belongs in
+/// neither place, and the answer that replaced it has to be pinned somewhere real.
 ///
 /// # It was 143 + 22 until M3's gate, and SIX symbols changed category
 ///
@@ -7716,16 +8862,22 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         "sigaction",
         "raise",
         "pthread_sigmask",
-        // phase 3d: the network
-        "socket",
-        "eventfd",
-        "getaddrinfo",
-        "freeaddrinfo",
         // phase 3e: the two that need something no OS would supply
-        "mallinfo",
         "longjmp",
     ];
-    assert_eq!(refusals.len(), 13);
+    // **Eight, and the four that left in M6 are the point of this milestone.** `socket`,
+    // `getaddrinfo` and `freeaddrinfo` were the last of phase 3d's network refusals; D30 withdrew
+    // Global Constraint 8 and each of them answers now. `eventfd` had already started answering in
+    // M6 and stayed in this list because it *happens* to refuse in the bare fixture below -- which
+    // is the membership-adjusted-to-keep-a-total-right failure this test's own documentation
+    // complains about, found while removing the other three.
+    //
+    // The category is "refuses whatever it is passed". All four of them refuse **only** when the
+    // embedding has supplied nothing -- no filesystem root, no network policy -- which is a
+    // conditional refusal and belongs on the other side of the line, exactly as `getauxval`'s and
+    // `sched_getcpu`'s do. `the_network_group_answers_once_the_embedding_has_said_what_it_may
+    // _reach` is where their new contract is asserted, and it is asserted by calling them.
+    assert_eq!(refusals.len(), 8);
     for symbol in refusals {
         let error = refusal_of(&f, symbol, |asm| {
             for register in 0..6 {
@@ -7810,7 +8962,7 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
     let bound = Bionic::bound_symbols().count() - BEYOND_THE_PREDICTION.len();
     assert_eq!(bound, 168);
     let answered = bound - refusals.len() - 3;
-    assert_eq!(answered, 152, "152 answer, 13 refuse by name, 3 report a termination");
+    assert_eq!(answered, 157, "157 answer, 8 refuse by name, 3 report a termination");
     assert_eq!(
         answered + refusals.len() + 3 + omni_android::bionic::DATA_OBJECTS.len()
             + omni_android::bionic::ABSENT_SYMBOLS.len(),
@@ -8770,4 +9922,338 @@ fn the_stream_admissions_refuse_nothing_that_touches_neither_buffer_nor_descript
         .space
         .protect(island2, page2, omni_mem::Protection::ReadWrite)
         .expect("writable again");
+}
+
+// =========================================== M6: the two symbols a guest WORKER THREAD died on
+//
+// Both were found by `guest_thread_failures` rather than by a scripted downcall stopping, which
+// is the first time that has been the discovery route. `BEYOND_THE_PREDICTION` carries the two
+// failure records verbatim.
+
+/// **A guest thread is told where its own stack really is.**
+///
+/// Four numbers, and the test asserts every one of them against a value this test *chose* rather
+/// than against whatever the handler produced: the size is set on the thread host here, the
+/// guard is the page size, the detach state follows from creating with a `NULL` attribute
+/// object, and the base is pinned by a relation rather than by a constant, because its value is
+/// whatever `map_anonymous` returned.
+///
+/// The relation is the point and it is what a constant could not do. The thread reads **its own
+/// `SP`** as its first instruction and the assertion is that `SP` lies inside the range the
+/// handler reported — so a base that named the mapping's true bottom (the `PROT_NONE` guard
+/// page) rather than the first usable byte, or a size that folded the guard in, fails here. That
+/// is the whole of what a caller does with this function: decide whether a pointer is on its own
+/// stack, or how much of it is left.
+///
+/// And the thread **writes to the base it was told about** before returning. A host-side read
+/// cannot check that afterwards — the runner unmaps the stack before the join returns — but the
+/// store itself is the check: a base inside the guard is `PROT_NONE`, so the store faults, the
+/// thread dies, and `pthread_join` refuses instead of answering 0. Three assertions below fail
+/// together in that case, which is why `guest_thread_failures` is asserted empty by name.
+#[test]
+fn pthread_getattr_np_reports_the_stack_the_runtime_gave_the_thread() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    // **Not the layer's default.** A test that asserted `DEFAULT_GUEST_STACK_BYTES` would pass
+    // against a handler that reported the policy number instead of the mapping, which is exactly
+    // the plausible wrong answer here: the two are equal for a default-attribute thread.
+    const STACK: usize = 256 * 1024;
+    f.bionic
+        .set_thread_host(ThreadHost::new(backend).with_limit(2).with_default_stack(STACK))
+        .expect("a thread host");
+    let page = f.guest.space.page_size();
+    let out = f.guest.data + 0x800;
+    let attr = f.guest.data + 0xA00;
+    let seen = f.guest.data + 0xB00;
+    // Poisoned, so every field asserted below had to be written by this call rather than found
+    // already holding the value that was wanted.
+    f.guest.write_bytes(attr, &[0xAB; 56]);
+    f.guest.write_u64(seen, 0);
+    f.guest.write_u64(seen + 8, 0);
+
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.mov(20, seen as u64);
+        // `ADD X9, SP, #0` is `MOV X9, SP`. First instruction of the thread, before a call can
+        // have moved it.
+        asm.push(add_imm(9, 31, 0));
+        asm.push(str_imm(9, 20, 0));
+        asm.bl(f.thunk("pthread_self"));
+        asm.mov(1, attr as u64);
+        asm.bl(f.thunk("pthread_getattr_np"));
+        asm.push(str_imm(0, 20, 8));
+        // Write to the lowest byte it was told it may touch.
+        asm.mov(9, attr as u64);
+        asm.push(ldr_imm(10, 9, 24));
+        asm.mov(11, 0x5A5A);
+        asm.push(str_imm(11, 10, 0));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 24));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8), 0, "pthread_create");
+    assert_eq!(f.guest.read_u64(out + 24), 0, "pthread_join: the thread returned, so it did not \
+        fault writing to the base it was given");
+    assert_eq!(f.bionic.guest_thread_failures(), Vec::new(), "no thread failed");
+    assert_eq!(f.guest.read_u64(seen + 8), 0, "pthread_getattr_np answers 0 for its own thread");
+
+    let detach = f.guest.read_u64(attr) & 0xFFFF_FFFF;
+    let size = f.guest.read_u64(attr + 8);
+    let guard = f.guest.read_u64(attr + 16);
+    let base = f.guest.read_u64(attr + 24);
+    assert_eq!(detach, 0, "created with a NULL attr, so PTHREAD_CREATE_JOINABLE");
+    assert_eq!(size, STACK as u64, "the stack this instance was configured to give a thread");
+    assert_eq!(guard, page as u64, "a NULL attr gets this layer's own one-page guard");
+    assert_ne!(base, 0, "a base of zero is the `attr_init` encoding for \"system default\"");
+    assert_eq!(base % page as u64, 0, "the mapping and its guard are both page-aligned");
+
+    // **The relation, and then the tighter fact separately** (`docs/VERIFICATION.md` entry 10):
+    // the first is what every caller of this function relies on, the second is what this layer
+    // happens to do today and would have to be restated if it ever pushed an initial frame.
+    let sp = f.guest.read_u64(seen);
+    assert!(
+        base < sp && sp <= base + size,
+        "the thread's own SP {sp:#x} must be inside the stack it was told it has \
+         ({base:#x}..{:#x})",
+        base + size
+    );
+    assert_eq!(sp, base + size, "and a thread starts at the very top of its stack");
+}
+
+/// **A detached thread's attr says DETACHED, and a guard size of zero is reported as a value.**
+///
+/// Two facts the joinable case cannot show. The detach state is read out of the instance's own
+/// record on every call rather than copied when the thread was created — a copy would answer
+/// JOINABLE for a thread that had since been detached, which is the answer that makes a caller
+/// decide to join something nobody may join. And the guard here is **0** rather than a page,
+/// because `pthread_attr_init` zeroes the guard field and `pthread_create` honours it: only a
+/// `NULL` attribute object means "this layer's default", which is the `Some(0) => 0` arm there.
+///
+/// Nobody joins a detached thread, so there is no call to wait on. The host polls the thread's
+/// own done-word under a deadline that **fails** rather than skips, which is
+/// `docs/VERIFICATION.md` entries 4 and 6 together: a fixed sleep would be a guess about a
+/// machine, and a missing fixture that reports `ok` is not a test.
+#[test]
+fn a_detached_threads_attr_says_detached_and_a_zero_guard_is_reported_as_zero() {
+    let _guard = serialized();
+    let f = fixture_with_threads(2);
+    let out = f.guest.data + 0x800;
+    let attr = f.guest.data + 0xA00;
+    let live = f.guest.data + 0xA80;
+    let done = f.guest.data + 0xB80;
+    f.guest.write_bytes(live, &[0xCD; 56]);
+    f.guest.write_u64(done, 0);
+    f.guest.write_u64(done + 8, 0);
+
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.mov(20, done as u64);
+        asm.bl(f.thunk("pthread_self"));
+        asm.mov(1, live as u64);
+        asm.bl(f.thunk("pthread_getattr_np"));
+        asm.push(str_imm(0, 20, 8));
+        // Written last, so that the host polling on it sees everything above.
+        asm.mov(9, 1);
+        asm.push(str_imm(9, 20, 0));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+
+    let entry = program(&f, |asm| {
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_attr_init"));
+        asm.mov(0, attr as u64);
+        asm.mov(1, 1); // PTHREAD_CREATE_DETACHED
+        asm.bl(f.thunk("pthread_attr_setdetachstate"));
+        create_call(&f, asm, out, attr as u64, start, 0);
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8), 0, "pthread_create");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while f.guest.read_u64(done) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached thread never reached its done-word; failures: {:?}",
+            f.bionic.guest_thread_failures()
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(f.guest.read_u64(done + 8), 0, "pthread_getattr_np answered 0");
+    assert_eq!(f.guest.read_u64(live) & 0xFFFF_FFFF, 1, "PTHREAD_CREATE_DETACHED");
+    assert_eq!(f.guest.read_u64(live + 16), 0, "an attr that asked for no guard is given none");
+    assert_ne!(f.guest.read_u64(live + 24), 0, "and it still knows where the stack is");
+    assert_ne!(f.guest.read_u64(live + 8), 0, "and how big it is");
+}
+
+/// **The three questions it refuses to answer, and the one POSIX error it does answer.**
+///
+/// Each of the three would have a believable wrong answer, and the middle one is the dangerous
+/// case: reporting the *calling* thread's stack for somebody else's `pthread_t` hands out a
+/// mapping that is real, readable and 256 KiB long, so nothing the caller can check would catch
+/// it. A refusal naming the symbol and the thunk address is the only other honest answer.
+#[test]
+fn pthread_getattr_np_refuses_what_it_cannot_know_and_is_esrch_for_a_thread_that_is_not_there() {
+    let _guard = serialized();
+    let f = fixture_with_threads(2);
+    let attr = f.guest.data + 0xA00;
+
+    // 1. A `pthread_t` nothing answers to. **ESRCH is an answer, not a stop**: it is POSIX's own
+    //    error for this function and guest code has a branch for it, and this instance genuinely
+    //    knows the id is not one of its own -- the created-thread registry and the arena's thread
+    //    table between them hold every identity it has ever handed out.
+    let code = value_of(&f, "pthread_getattr_np", |asm| {
+        asm.mov(0, 0xDEAD_BEEF);
+        asm.mov(1, attr as u64);
+    });
+    assert_eq!(code, 3, "ESRCH for a thread this instance never handed out");
+
+    // 2. This thread, which attached to the instance rather than being created by it -- the
+    //    thread the initializers and every JNI downcall run on. The embedding gave it its stack
+    //    and set `SP` itself; nothing in `Bionic` was told where that mapping is.
+    let error = refusal_of(&f, "pthread_getattr_np", |asm| {
+        asm.bl(f.thunk("pthread_self"));
+        asm.mov(1, attr as u64);
+    });
+    assert_eq!(error.symbol(), Some("pthread_getattr_np"));
+    assert_eq!(error.guest_address(), Some(f.thunk("pthread_getattr_np")));
+    let text = error.to_string();
+    assert!(
+        text.contains("/proc/self/maps"),
+        "the refusal must name what bionic reads to answer this and this runtime does not \
+         have: {text}"
+    );
+
+    // 3. A thread this instance *did* start, asked about by a different thread. The record of
+    //    where a thread's stack is lives on the thread itself, so this one is not a gap in the
+    //    question but a gap in what is kept -- and the refusal says which change would lift it.
+    let out = f.guest.data + 0x800;
+    let start = start_routine(&f, |asm| {
+        asm.mov(0, 0);
+    });
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, attr as u64);
+        asm.bl(f.thunk("pthread_getattr_np"));
+    });
+    let error = run_program(&f, entry).expect_err("a refusal, not an answer");
+    assert!(matches!(error, AbiError::Refused { .. }), "{error:?}");
+    assert_eq!(error.symbol(), Some("pthread_getattr_np"));
+    let text = error.to_string();
+    assert!(
+        text.contains("not the thread asking"),
+        "the refusal must say which thread it cannot answer for: {text}"
+    );
+}
+
+/// **`pthread_mutex_trylock` takes a free mutex, answers `EBUSY` for a held one, and re-enters a
+/// recursive one it already owns.**
+///
+/// The three branches, and the types are chosen so that **no defect in reach can hang this
+/// test**. The held case uses an `ERRORCHECK` mutex rather than a `NORMAL` one for exactly that
+/// reason: `pthread_mutex_lock` on an `ERRORCHECK` mutex the caller holds returns `EDEADLK`
+/// immediately, so a `trylock` wired to `lock` fails this assertion with 35 where 16 was wanted.
+/// Over a `NORMAL` mutex the same defect would **block for ever** inside the handler, where the
+/// run budget cannot see it -- and a test that deadlocks under the defect it exists to detect
+/// reports nothing at all (`docs/VERIFICATION.md` entry 8, and the `threads-B1` story beside
+/// `detaching_twice_is_einval_and_joining_a_detached_thread_is_einval`).
+///
+/// The recursive case is the one that needs the **owner table**: a recursive mutex held by the
+/// caller is a successful re-entry and one held by anybody else is `EBUSY`, and the two are the
+/// same lock word. A binding that passed no owner table would answer `EBUSY` to a thread
+/// re-entering its own mutex, which is a `std::recursive_mutex::try_lock` failing for no reason.
+#[test]
+fn trylock_takes_a_free_mutex_answers_ebusy_for_a_held_one_and_re_enters_a_recursive_one() {
+    let _guard = serialized();
+    let f = fixture();
+    let attr = f.guest.data + 0x300;
+    let mutex = f.guest.data + 0x200;
+    let out = f.guest.data + 0x400;
+    f.guest.write_bytes(mutex, &[0u8; 40]);
+    f.guest.write_bytes(attr, &[0u8; 8]);
+
+    let entry = program(&f, |asm| {
+        asm.mov(23, out as u64);
+        // --- An ERRORCHECK mutex: held is EBUSY, even by the thread holding it.
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_mutexattr_init"));
+        asm.mov(0, attr as u64);
+        asm.mov(1, 2); // PTHREAD_MUTEX_ERRORCHECK
+        asm.bl(f.thunk("pthread_mutexattr_settype"));
+        asm.mov(0, mutex as u64);
+        asm.mov(1, attr as u64);
+        asm.bl(f.thunk("pthread_mutex_init"));
+        asm.push(str_imm(0, 23, 0));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_trylock"));
+        asm.push(str_imm(0, 23, 8));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_trylock"));
+        asm.push(str_imm(0, 23, 16));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_unlock"));
+        asm.push(str_imm(0, 23, 24));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_trylock"));
+        asm.push(str_imm(0, 23, 32));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_unlock"));
+
+        // --- A RECURSIVE mutex: the owner re-enters it and the count is real.
+        asm.mov(0, attr as u64);
+        asm.mov(1, 1); // PTHREAD_MUTEX_RECURSIVE
+        asm.bl(f.thunk("pthread_mutexattr_settype"));
+        asm.mov(0, mutex as u64);
+        asm.mov(1, attr as u64);
+        asm.bl(f.thunk("pthread_mutex_init"));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_trylock"));
+        asm.push(str_imm(0, 23, 40));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_trylock"));
+        asm.push(str_imm(0, 23, 48));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_unlock"));
+        asm.push(str_imm(0, 23, 56));
+        // Still held once, so a third party would still see EBUSY -- asserted through the
+        // *second* unlock succeeding rather than by claiming it.
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_unlock"));
+        asm.push(str_imm(0, 23, 64));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(f.guest.read_u64(out), 0, "pthread_mutex_init (ERRORCHECK)");
+    assert_eq!(f.guest.read_u64(out + 8), 0, "a free mutex is taken, and trylock answers 0");
+    assert_eq!(
+        f.guest.read_u64(out + 16),
+        16,
+        "a held mutex is EBUSY -- 35 here would be `lock`'s EDEADLK, which is the defect this \
+         type was chosen to make visible rather than fatal"
+    );
+    assert_eq!(f.guest.read_u64(out + 24), 0, "pthread_mutex_unlock");
+    assert_eq!(f.guest.read_u64(out + 32), 0, "and the unlock really released it");
+
+    assert_eq!(f.guest.read_u64(out + 40), 0, "a free RECURSIVE mutex is taken");
+    assert_eq!(f.guest.read_u64(out + 48), 0, "and its owner re-enters it rather than EBUSY");
+    assert_eq!(f.guest.read_u64(out + 56), 0, "the first unlock of two");
+    assert_eq!(f.guest.read_u64(out + 64), 0, "the second, which is what makes the count real");
+
+    // **A watch, not a detector** (`docs/VERIFICATION.md` entry 11): it rises whenever this
+    // layer blocks and would stay at zero under most ways of getting `trylock` wrong. What it
+    // does say is the one thing the return codes cannot -- that nothing slept.
+    let (waits, _) = f.bionic.futex().activity();
+    assert_eq!(waits, 0, "a trylock must never enter the futex");
 }

@@ -1565,6 +1565,162 @@ pub(super) fn closedir(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 // Binding `pipe` is what ended the closed-descriptor-space argument `net` used to make; that
 // module's documentation records what replaced it.
 
+/// `FIONBIO`: set or clear non-blocking mode. Linux `asm-generic/ioctls.h`.
+const FIONBIO: i32 = 0x5421;
+/// `SIOCGIFCONF`: enumerate the host's configured interfaces. Linux `bits/ioctls.h`.
+const SIOCGIFCONF: i32 = 0x8912;
+/// `SIOCGIFFLAGS`: one interface's flags.
+const SIOCGIFFLAGS: i32 = 0x8913;
+/// `SIOCGIFADDR`: one interface's address.
+const SIOCGIFADDR: i32 = 0x8915;
+
+/// The `ioctl` requests `libroblox.so` actually passes, decoded from its own instructions.
+///
+/// **Every one of the five call sites, not a guess.** `ioctl` reaches `libroblox.so` through one
+/// PLT stub at `0x62d7340` (its GOT slot is `0x67d2098`), and five `BL`s in `.text` target it.
+/// Four of them load a literal request into `w1` immediately before the branch and the fifth is
+/// a pass-through wrapper:
+///
+/// | call site | `w1` | request |
+/// |---|---|---|
+/// | `0x02956388` | `0x5421` | `FIONBIO`, with `x2` pointing at the `int` stored from its own `w1` one instruction earlier -- this is a `set_nonblocking(fd, on)` helper |
+/// | `0x055b040c` | `0x8913` | `SIOCGIFFLAGS` |
+/// | `0x061f4354` | `0x8912` | `SIOCGIFCONF` |
+/// | `0x061f43d0` | `0x8915` | `SIOCGIFADDR` |
+/// | `0x02955ffc` | -- | a three-instruction wrapper that passes its caller's request straight through |
+///
+/// That decoding is why this table is the whole reachable set rather than the ones that seemed
+/// likely, and why the three `SIOC*` requests are **named and refused** rather than absent: a
+/// refusal that says `SIOCGIFCONF` tells the next reader the engine was enumerating network
+/// interfaces, which is a different problem from anything `FIONBIO` is about.
+///
+/// `FIONREAD` is deliberately not here. It is the request everybody expects beside `FIONBIO`,
+/// **no call site passes it**, and listing it would make this table a catalogue of ioctl numbers
+/// rather than a decoding of this binary.
+const IOCTL_REQUESTS: &[(i32, &str)] = &[
+    (0x5421, "FIONBIO"),
+    (0x8912, "SIOCGIFCONF"),
+    (0x8913, "SIOCGIFFLAGS"),
+    (0x8915, "SIOCGIFADDR"),
+];
+
+/// Name an `ioctl` request, or render its number.
+fn ioctl_request_name(request: i32) -> String {
+    match IOCTL_REQUESTS.iter().find(|(number, _)| *number == request) {
+        Some((_, name)) => format!("{name} ({request:#x})"),
+        None => format!("request {request:#x}"),
+    }
+}
+
+/// `int ioctl(int fd, int request, ...)` -- **`FIONBIO` only, and everything else by name.**
+///
+/// **MEASURED**: with `isspace` bound, M6's network run went one call further and the
+/// client-settings thread died here -- `GuestThreadFailure { thread: 8, why: "the guest called
+/// the imported symbol `ioctl` through its thunk at 0x28fa0c555e0, and nothing in the
+/// compatibility layer implements it" }`.
+///
+/// # Why only one request, when four are reachable
+///
+/// [`IOCTL_REQUESTS`] decodes all five call sites, and the split between them is not arbitrary.
+/// `FIONBIO` is a **descriptor** operation this runtime already implements: it is the same state
+/// `fcntl(F_SETFL, O_NONBLOCK)` sets, on the same descriptor table, through the same
+/// `Filesystem::set_nonblocking` -- so serving it adds no new behaviour, it routes a second
+/// spelling to the first one's implementation.
+///
+/// The three `SIOC*` requests are the opposite: they enumerate the **host's** network interfaces
+/// and report their names, flags and addresses. Nothing in `omni-platform` can answer them,
+/// D30's isolation argument is about not handing the guest the host's network by accident, and
+/// an invented interface list is the plausible-stub shape rule 1 exists for -- a caller that
+/// asked which interfaces exist and was told `lo` would believe it.
+///
+/// # The three are declined with `EPERM`, and the reason is decoded rather than assumed
+///
+/// **This is the one judgement call in this file and it should be read as one.** The three are
+/// not answered, and they are not a refusal that unwinds either. They return `-1` with `EPERM`:
+/// *this instance is not permitted to enumerate the host's interfaces*, which is exactly what is
+/// true and is a statement no caller can mistake for data.
+///
+/// The alternative -- `AbiError::Refused`, which is what an unimplemented capability gets
+/// everywhere else in this layer -- was what this handler did first, and MEASURED it kills the
+/// guest thread carrying the client-settings fetch. That is the correct answer when the caller
+/// has no error path, because a thread that dies loudly is better than one that believes a lie.
+/// **Here the caller has an error path, by name, and it was decoded before this was changed:**
+///
+/// * `0x061f4358`: `cmn w0, #1; b.eq 0x61f4668` -- the `SIOCGIFCONF` site tests for `-1` and
+///   branches to code that passes the string `"ioctl(SIOCGIFCONF)"` (at `0x29797d`) to a
+///   reporting function, stores `-1` and the captured `errno` into its result structure, and
+///   returns. It does not abort, retry or dereference anything.
+/// * `0x061f43d4` and `0x055b03dc`: the `SIOCGIFADDR` and `SIOCGIFFLAGS` sites test `-1` the same
+///   way, inside the per-interface loop.
+///
+/// So the guest is told the call failed, it takes the path it already has for exactly that
+/// failure, and nothing in this layer pretends. **What would falsify this judgement**: a run in
+/// which the settings fetch does not complete *and* the reason traces back to one of these three
+/// -- at which point the answer is a real interface enumeration behind a `NetPolicy` decision,
+/// not a different errno. The refusal is one line away and is what to restore if that happens.
+///
+/// `EPERM` rather than `ENOTTY` or `EINVAL` deliberately: those two say the descriptor does not
+/// support the request, which is false -- it is a socket and a device would answer. `EPERM` says
+/// the caller may not, which is the truth and is the same sentence `NetPolicy` makes everywhere
+/// else in this runtime.
+///
+/// # `x2` is a pointer and the value is read before anything is changed
+///
+/// `FIONBIO` takes a `const int *`, not an `int`. The decoded call site at `0x02956388` stores
+/// its own `w1` into a stack slot and passes `x29-4`, which is exactly that shape. Reading it
+/// through the guest view means a null or unmapped pointer is a fault naming the argument,
+/// rather than a non-blocking flip decided by whatever the register happened to hold.
+pub(super) fn ioctl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, request, argument) = {
+        let mut a: Args<'_> = c.args();
+        (a.next_i32()?, a.next_i32()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        if !fs.is_open(fd) {
+            view.set_errno(consts::EBADF);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        if request == SIOCGIFCONF || request == SIOCGIFFLAGS || request == SIOCGIFADDR {
+            // **A policy denial, reported as one, and it is the one judgement call in this file.**
+            // See [`ioctl`]'s documentation for why this is `-1`/`EPERM` and not a refusal that
+            // unwinds, and for the decoded evidence that the guest branches on the `-1`.
+            view.set_errno(consts::EPERM);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        if request != FIONBIO {
+            return Err(view.refusal(format!(
+                "the guest called `ioctl(fd {fd}, {})`. This layer implements FIONBIO, and                  declines the three interface-enumeration requests by policy with EPERM.                  {request:#x} is neither: nothing in this binary was decoded passing it, so it                  is an argument nobody has measured and there is no honest answer to invent for                  it",
+                ioctl_request_name(request)
+            )));
+        }
+        if argument == 0 {
+            // `FIONBIO` dereferences its argument; a device answers `EFAULT` and this layer has
+            // no `EFAULT` in its errno table. `EINVAL` is the same shape of answer `getsockopt`
+            // gives a null out-parameter in `net`, and it is a failure rather than a silent
+            // no-op -- which is what a caller whose flag did not take effect needs.
+            view.set_errno(consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let at = guest_address(&view, argument)?;
+        let on = view.mem().read_i32(at, Blame::new(view.symbol(), view.address(), 2))? != 0;
+        match settle(&view, fs.set_nonblocking(fd, on))? {
+            Settled::Done(()) => 0,
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `F_GETFL`: read the descriptor's status flags. Linux `asm-generic/fcntl.h`.
 const F_GETFL: i32 = 3;
 /// `F_SETFL`: set the descriptor's status flags.

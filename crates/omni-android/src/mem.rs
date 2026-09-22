@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use omni_mem::{admit, FaultAccess, GuestAddr, GuestSpace, Refusal};
+use omni_mem::{admit, scan_reach, FaultAccess, GuestAddr, GuestSpace, Refusal};
 
 use crate::error::{AbiError, AbiResult};
 
@@ -255,16 +255,34 @@ impl GuestMem {
     /// # Errors
     ///
     /// [`AbiError::BadPointer`] if the pointer itself is not readable, or
-    /// [`AbiError::Unterminated`] if no NUL appears within the region or within the cap.
+    /// [`AbiError::Unterminated`] if no NUL appears before the end of the mapping or within the cap.
     pub fn cstr(&self, address: GuestAddr, blame: Blame<'_>) -> AbiResult<Vec<u8>> {
-        // The first byte establishes that the pointer is readable at all, and hands back the end of
-        // the region it lives in — which is the only *hard* bound on the walk. Without it the scan
-        // would step from a mapped page onto an unmapped one and take the fault on the host side,
-        // where there is no guest to report it against.
-        let region_end = self.check(address, 1, FaultAccess::Read, blame)?;
-        let reach = region_end.saturating_sub(address).min(Self::STRING_LIMIT);
-        // SAFETY: `check` established that the byte at `address` is readable, and `reach` is clamped
-        // to the end of the region it found, so every byte scanned is inside that region. Identity
+        // The walk needs a *hard* bound before it starts: without one it would step from a mapped
+        // page onto an unmapped one and take the fault on the host side, where there is no guest to
+        // report it against.
+        //
+        // **`scan_reach`, not `admit`, because a scan has no length to declare.** `admit` walks as
+        // many entries as the length it is given needs, so asking it for one byte reports the end
+        // of the *first entry* -- and a lazy commit carves one mapping into a run of entries, one
+        // per OS placeholder, that are never joined back up. Bounding the walk by that is bounding
+        // it by a granule boundary the guest has never heard of.
+        //
+        // MEASURED, and it killed a thread: a real Roblox worker died during startup on
+        // "`__android_log_print` ... a string at 0x277dca62fa0 ... with no NUL in the first 96
+        // bytes". The string was ordinary and NUL-terminated; 96 was the distance to the next
+        // entry. `scan_reach` answers the question this actually asks -- how far may I read before
+        // I must stop -- and its documentation is where the rule it will not cross is written.
+        let reach_end = match scan_reach(&self.space, address, FaultAccess::Read, Self::STRING_LIMIT)
+        {
+            Ok(end) => end,
+            Err(refusal) => {
+                return Err(self.bad_pointer(address, 1, FaultAccess::Read, refusal, blame))
+            }
+        };
+        let reach = reach_end.saturating_sub(address).min(Self::STRING_LIMIT);
+        // SAFETY: `scan_reach` established that every byte in `[address, address + reach)` lies in
+        // a mapped, committed entry of **one** mapping that permits reading -- that is the whole of
+        // what it promises and the whole of what is needed here. Identity
         // mapping (D4) makes the guest address a host address. The scan is byte-at-a-time through a
         // raw pointer rather than over a slice, because forming a `&[u8]` across memory another guest
         // thread can write would be undefined behaviour whatever the scan then did with it.
@@ -413,6 +431,61 @@ mod tests {
         // An empty string is a NUL at offset zero, not an error.
         f.mem.write_bytes(f.rw, b"\0", blame()).expect("write");
         assert!(f.mem.cstr(f.rw, blame()).expect("cstr").is_empty());
+    }
+
+    /// **A string that straddles a commit granule is read, not refused.**
+    ///
+    /// The regression this is the detector for, and the run that produced it: a real Roblox worker
+    /// thread died during §8 row 21 with
+    ///
+    /// ```text
+    /// `__android_log_print` was passed a string at 0x277dca62fa0 for argument 3
+    ///  with no NUL in the first 96 bytes
+    /// ```
+    ///
+    /// 96 is not a property of the string -- it is the distance to the next entry boundary in a
+    /// lazily-committed mapping, which the guest has never heard of. The log line was ordinary and
+    /// NUL-terminated. The thread was killed by this layer, and the future it was holding was never
+    /// completed.
+    ///
+    /// Every other fixture here is `CommitPolicy::Eager`, which is one entry that is never split,
+    /// which is why nothing saw this.
+    #[test]
+    fn a_string_that_crosses_a_commit_granule_is_read_rather_than_refused() {
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let granule = space.commit_granule();
+        let base = space
+            .map_anonymous(
+                Placement::Anywhere { align: granule },
+                4 * granule,
+                Protection::ReadWrite,
+                CommitPolicy::Lazy,
+            )
+            .expect("a lazily-committed mapping");
+        let boundary = base + granule;
+        space.ensure_committed(base, 1).expect("commit the first granule");
+        space.ensure_committed(boundary, 1).expect("commit the second granule");
+        // The precondition: the granules really are separate entries, which is what used to bound
+        // the walk.
+        assert_eq!(
+            space.region_at(boundary - 8).expect("mapped").end(),
+            boundary,
+            "adjacent committed granules are expected to stay separate entries",
+        );
+
+        let mem = GuestMem::new(Arc::clone(&space));
+        // A log line of the length the engine actually emits, placed so that it begins 96 bytes
+        // before the boundary and ends well past it.
+        let line: Vec<u8> = b"[FLog::NativeDM] nativeActivity_onSurfaceChanged: state:2, \
+                              window 0x0000007f00000000, density 0.000, flags-received"
+            .to_vec();
+        assert!(line.len() > 96, "the line has to cross the boundary to be the case under test");
+        let start = boundary - 96;
+        let mut stored = line.clone();
+        stored.push(0);
+        mem.write_bytes(start, &stored, blame()).expect("write the line across the boundary");
+
+        assert_eq!(mem.cstr(start, blame()).expect("the string is readable"), line);
     }
 
     /// The hostile string: mapped memory that never terminates. The walk must stop at the end of the

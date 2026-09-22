@@ -12,6 +12,19 @@
 //! so that a machine with no GPU can still test them and a machine with one GPU can be tested
 //! against tables from GPUs nobody here has.
 //!
+//! [`host`] — [`GfxVulkanHost`], this crate as `omni_android::vulkan::VulkanHost`. The **guest**
+//! side of D8 begins there: `libroblox.so` opens `libvulkan.so` itself and reaches every entry
+//! point through `vkGetInstanceProcAddr`, so `omni-android` owns the loader, the thunks, the
+//! census and the extension-name rewrite log, and this crate supplies the driver behind them. The
+//! trait lives up there and the implementation lives here for the reason `Cargo.toml` records:
+//! `ash` and `libloading` must stay out of the adapter's dependency graph.
+//!
+//! [`claim`] — who owns a window's swapchain. Two Vulkan stacks point at one window in an
+//! Omnidroid process — [`vulkan::Renderer`] and the guest's, through [`host::GfxVulkanHost`] —
+//! and a native window may have at most one swapchain. This host has no validation layer to say
+//! so, so the rule is a named refusal above the driver rather than an undefined behaviour below
+//! it.
+//!
 //! [`image`] — the RGBA8 frame type. Its format is not a preference: D27 scoped texture
 //! transcoding to `GL_ETC1_RGB8_OES` decoded to RGBA8, because this host's GPU samples **neither
 //! ETC2 nor ASTC** (`docs/research/graphics-spike.md` §3, both families measured), so RGBA8 is
@@ -46,12 +59,16 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod claim;
 pub mod error;
+pub mod host;
 pub mod image;
 pub mod select;
 pub mod vulkan;
 
+pub use crate::claim::{claim_window, WindowClaim, WindowClaimed, WindowKey};
 pub use crate::error::{GfxError, GfxResult, VkError};
+pub use crate::host::{GfxVulkanHost, PresentedImage};
 pub use crate::image::Rgba8Image;
 pub use crate::select::PresentMode;
 pub use crate::vulkan::{FrameOutcome, Renderer, RendererConfig};

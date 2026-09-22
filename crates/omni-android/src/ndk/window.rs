@@ -31,19 +31,54 @@
 //! `ALooper_forThread` + `ALooper_acquire`; row 17 is the same shape one object along, which is
 //! why the reference count here is the one `looper.rs` already built and not a new idea.
 //!
-//! # **There is no surface, and the dimensions are therefore the embedding's**
+//! # **The dimensions are the embedding's, and there are two ways for it to supply them**
 //!
-//! Graphics is M6/M7. `omni-gfx` is not wired to any of this, nothing in this runtime has ever
-//! produced a pixel, and no `EGLSurface` exists for a window to be the back end of. So the width
-//! and the height are **not facts this layer has**; they are facts about the host's output, in
-//! exactly the sense D26 gives for `AT_HWCAP` and `ndk::config` gives for the device profile.
+//! The width and the height are **not facts this layer has**. Nothing here owns a surface: on a
+//! device `ANativeWindow_getWidth` is `query(NATIVE_WINDOW_WIDTH)` against a producer the window
+//! system owns, and the analogue of that producer is the *host's* output — in exactly the sense
+//! D26 gives for `AT_HWCAP` and `ndk::config` gives for the device profile.
 //!
-//! An instance whose embedding has not called [`Ndk::set_window_geometry`](super::Ndk::set_window_geometry)
-//! refuses `ANativeWindow_getWidth` and `_getHeight` **by name**, and the refusal says which call
-//! decides. The believable wrong answer is 1920x1080 — a resolution that is plausible, that every
-//! caller accepts, and that would be indistinguishable in every log from one the host meant. A
-//! device profile nobody chose is worse than a refusal, because the refusal is a line in a log
-//! and the profile is a silently different run.
+//! So an instance carries at most one **backing** for those two calls, and which one it has is a
+//! value of [`WindowBacking`] rather than a shape inferred from two fields:
+//!
+//! * [`WindowBacking::Fixed`] — a [`WindowGeometry`] the embedding decided, through
+//!   [`Ndk::set_window_geometry`](super::Ndk::set_window_geometry). A host *asserting* a size.
+//!   It is what `tests/ndk.rs` uses, and what the §8 gate in `tests/gameactivity.rs` supplies as
+//!   1280x720 — a constant the harness chose, with no window behind it.
+//! * [`WindowBacking::Live`] — a [`WindowSource`] the embedding attached through
+//!   [`Ndk::set_window_source`](super::Ndk::set_window_source), asked **at every call**. A host
+//!   *reporting* a size it reads from something that has one.
+//!   [`HostWindowSource`](super::HostWindowSource) is the one this workspace ships, over
+//!   `omni_platform::window::Window`.
+//!
+//! **The live source wins** when both have been supplied, and that is a rule rather than an
+//! ordering: a constant left over from before is not a second opinion about a window that is on
+//! the screen, it is a stale one. [`Ndk::window_backing`](super::Ndk::window_backing) reports
+//! which is in effect, so "the guest is being told the real window's size" is something a test
+//! can **detect** rather than infer from the number happening to agree — which is
+//! `VERIFICATION.md` entry 11's distinction, and here the two backings can trivially hold the
+//! same number.
+//!
+//! An instance with **neither** refuses `ANativeWindow_getWidth` and `_getHeight` **by name**,
+//! and the refusal says which calls decide. The believable wrong answer is 1920x1080 — a
+//! resolution that is plausible, that every caller accepts, and that would be indistinguishable
+//! in every log from one the host meant. A device profile nobody chose is worse than a refusal,
+//! because the refusal is a line in a log and the profile is a silently different run.
+//!
+//! # Why a live source is a *pull* and not a stream of resize events
+//!
+//! [`Ndk::set_window_geometry`](super::Ndk::set_window_geometry) can already be called again, so
+//! a host could in principle drive it from every
+//! [`WindowEvent::Resized`](omni_platform::window::WindowEvent::Resized) it drains and never need
+//! a source at all. That is push, and push is not enough here for a **measured** reason:
+//! `omni_platform::window::Window::client_size` asks the OS on every call rather than caching
+//! what the last resize event said, because the graphics spike measured this host's surface
+//! extent drifting **41 times across 5 seconds with the window untouched**
+//! (`docs/research/graphics-spike.md` §4, a Parsec virtual-display adapter renegotiating the
+//! desktop). No `WM_SIZE` accompanies that. A push-fed geometry would be correct after every
+//! resize the *user* performed and quietly stale after every one the *display* performed, which
+//! is the same class of wrong answer as a snapshot taken at `fromSurface` — one the guest cannot
+//! see and that shows up only as a viewport that does not match the swapchain.
 //!
 //! # Why the geometry is read at call time rather than copied into the window
 //!
@@ -57,6 +92,8 @@
 //! `onSurfaceChangedNative` may call `callbacks[8] onNativeWindowResized` without the window
 //! handle changing. Snapshotting here would make a resized window keep answering its old size,
 //! which is the kind of wrong answer that only shows up as a viewport that is stale by one event.
+
+use std::sync::Arc;
 
 use omni_mem::GuestAddr;
 
@@ -112,6 +149,91 @@ impl WindowGeometry {
         }
         Ok(WindowGeometry { width, height })
     }
+}
+
+/// Something that **has** the host window's client size and will be asked for it at every call.
+///
+/// Implemented by the embedding, the same shape as [`AssetSource`](super::AssetSource) and for
+/// the same reason: the answer belongs to something this crate cannot reach. `omni-android` does
+/// not own a window, must not call a windowing API (Global Constraint 4), and cannot depend on
+/// `omni-gfx`; what it can do is ask.
+///
+/// # `Send + Sync`, and why that forces the shape of every implementation
+///
+/// `ANativeWindow_getWidth` is serviced on whichever guest thread called it — the game thread
+/// `GameActivity_onCreate` spawns, in `jni-surface.md` §8's case — and
+/// `omni_platform::window::Window` is deliberately **`!Send` and `!Sync`**, because Win32
+/// delivers window messages only to the thread that created the window. Those two facts do not
+/// meet: an implementation cannot hold a `Window` and query it from here.
+///
+/// So an implementation is necessarily a **cell the window's own thread publishes into**, and the
+/// pull stops there rather than at the OS. [`HostWindowSource`](super::HostWindowSource) is that
+/// cell, written once so that every embedding does not write it again and get the atomics wrong
+/// in a different way.
+///
+/// # Why this is not `fn geometry(&self) -> WindowGeometry`
+///
+/// A minimised window has a **zero-pixel** client area, which is a state
+/// `omni_platform::window::Window::client_size` documents and returns `(0, 0)` for, and which
+/// [`WindowGeometry::new`] refuses because a surface has a positive extent in both axes. There is
+/// no number to return, and an implementation forced to return one would have to invent it. So
+/// absence is in the type, and `ANativeWindow_getWidth` refuses naming the source.
+pub trait WindowSource: Send + Sync + core::fmt::Debug {
+    /// The host window's client size **now**, or `None` when it has no pixels.
+    ///
+    /// Called on a guest thread, inside an import, with no lock of this instance's held — this
+    /// module's `decided` clones the `Arc` out before asking. An implementation that blocks here
+    /// blocks the guest thread inside `ANativeWindow_getWidth`.
+    fn geometry(&self) -> Option<WindowGeometry>;
+
+    /// The OS handle of the window behind this source, or `None` when there is not one.
+    ///
+    /// # What this is for, and why it is not used yet
+    ///
+    /// Nothing in this crate reads it today, and that is stated rather than hidden: it is here
+    /// because `vkCreateAndroidSurfaceKHR` has **no host counterpart**. On Win32 the call is
+    /// `vkCreateWin32SurfaceKHR`, so the shim that implements it has to read
+    /// `VkAndroidSurfaceCreateInfoKHR::window`, resolve that `ANativeWindow *` to the host window
+    /// behind it, and hand the driver an `HWND` — and until this method existed a
+    /// [`WindowSource`] published a width and a height and nothing that could name a window. The
+    /// geometry and the handle have to come from the **same** source or they can describe two
+    /// different windows, which is why this is a method here rather than a second seam.
+    ///
+    /// # `None` is an ordinary answer
+    ///
+    /// The default is `None`, and it is a default rather than a required method for a reason that
+    /// is not convenience: a source fed by [`HostWindowSource::publish`](super::HostWindowSource)
+    /// alone — a test, or a host compositing into something that is not an OS window — genuinely
+    /// has no handle, and forcing it to invent one would be the shape `WindowGeometry`'s own
+    /// `Option` exists to avoid. A surface shim that gets `None` refuses naming this method; it
+    /// does not guess.
+    ///
+    /// It is `Copy` and returned by value, so nothing here borrows a window across a guest call.
+    fn raw_window(&self) -> Option<omni_platform::window::RawWindow> {
+        None
+    }
+}
+
+/// What answers `ANativeWindow_getWidth` and `_getHeight` for one instance.
+///
+/// Two named variants of one type rather than two independent fields, for D22's reason: values
+/// that must not be confused are distinguishable only if the type can tell them apart. A host
+/// that has a real window on the screen and a host that has asserted a constant are answering
+/// the same question from very different places, and
+/// [`Ndk::window_backing`](super::Ndk::window_backing) is how a test says which one it is looking
+/// at.
+#[derive(Debug, Clone)]
+pub enum WindowBacking {
+    /// A geometry the embedding decided, through
+    /// [`Ndk::set_window_geometry`](super::Ndk::set_window_geometry). Nothing is behind it but
+    /// the host's word.
+    Fixed(WindowGeometry),
+    /// A live source attached through
+    /// [`Ndk::set_window_source`](super::Ndk::set_window_source), asked at every call.
+    ///
+    /// **Wins over [`WindowBacking::Fixed`]** when both have been supplied; this module's
+    /// documentation says why the precedence is by kind rather than by which call came last.
+    Live(Arc<dyn WindowSource>),
 }
 
 /// One live `ANativeWindow`.
@@ -353,7 +475,17 @@ fn window_release(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
-/// The decided geometry, or a refusal naming the call that decides.
+/// The geometry this instance's backing reports, or a refusal naming the call that decides.
+///
+/// # The lock is dropped before the source is asked, and that is the point of the clone
+///
+/// [`WindowSource::geometry`] is the **embedding's** code, reached from inside a guest import.
+/// Asking it while holding `window_source`'s lock would mean an embedding whose source takes its
+/// own lock — a `HostWindowSource` is an atomic, but nothing says the next one is — deadlocks
+/// against any host thread that is calling `Ndk::set_window_source` at that moment. Cloning the
+/// `Arc` out costs one refcount bump and removes the question, which is `VERIFICATION.md` entry
+/// 13's rule read the other way round: an `expect` needs the check and the use under one lock,
+/// and a call-out needs no lock at all.
 ///
 /// # Why this refuses rather than returning the NDK's documented error value
 ///
@@ -381,17 +513,44 @@ fn window_release(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// The believable wrong answers, stated so they are on the record: `1920x1080`, which is a device
 /// profile nobody chose; and `-1`, which is a device failure that did not happen.
 fn decided(ndk: &Ndk, c: &ImportCall<'_, '_>) -> AbiResult<WindowGeometry> {
+    // Cloned out, then the guard dies at the end of the statement. See this function's
+    // documentation for why asking the embedding under this lock would be a deadlock nobody
+    // would find.
+    let source = ndk.window_source.lock().clone();
+    if let Some(source) = source {
+        return source.geometry().ok_or_else(|| {
+            refuse(
+                c,
+                format!(
+                    "`{}` was called and this guest instance's live window source has no client \
+                     area to report: {source:?}. A surface has a positive extent in both axes, \
+                     so there is no number to return here and no device analogue to borrow -- a \
+                     window with no pixels is a *minimised* one on Win32, which \
+                     `omni_platform::window::Window::client_size` documents as (0, 0), and \
+                     Android's answer to a surface that is gone is to destroy it \
+                     (`onSurfaceDestroyedNative`, and the `ANativeWindow_release` jni-surface.md \
+                     §8 row 17 pairs with it) rather than to shrink it. The source's own \
+                     description above says which host state this is -- one nothing has \
+                     published to yet, or a window that really has no pixels -- and they have \
+                     different fixes",
+                    c.symbol()
+                ),
+            )
+        });
+    }
     ndk.window_geometry().ok_or_else(|| {
         refuse(
             c,
             format!(
-                "`{}` was called and this guest instance's window geometry has not been decided. \
-                 There is no real surface yet -- graphics is M6/M7 and omni-gfx is not wired to \
-                 this -- so the width and the height are facts about the *host's* output, not \
-                 facts this layer has. `Ndk::set_window_geometry` is what decides. Answering the \
-                 NDK's documented negative-on-error would report a device failure that did not \
-                 happen, and answering 1920x1080 would be a device profile nobody chose, \
-                 indistinguishable in every log from one the host meant",
+                "`{}` was called and this guest instance has no window backing at all. The width \
+                 and the height are facts about the *host's* output, not facts this layer has: \
+                 nothing here owns a surface, so there is nothing to query. Either \
+                 `Ndk::set_window_geometry` decides a constant, or `Ndk::set_window_source` \
+                 attaches a live source that is asked at every call -- and the second is what a \
+                 host with a real window on the screen wants. Answering the NDK's documented \
+                 negative-on-error would report a device failure that did not happen, and \
+                 answering 1920x1080 would be a device profile nobody chose, indistinguishable \
+                 in every log from one the host meant",
                 c.symbol()
             ),
         )

@@ -162,6 +162,7 @@ dependencies = [
  "omni-bionic",
  "omni-cpu",
  "omni-elf",
+ "omni-gfx",
  "omni-mem",
  "omni-platform",
  "parking_lot",
@@ -227,6 +228,7 @@ name = "omni-gfx"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "omni-android",
  "omni-platform",
  "omni-texture",
  "thiserror",

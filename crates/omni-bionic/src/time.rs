@@ -246,6 +246,121 @@ pub fn gmtime(timestamp: i64) -> Result<Tm, GmtimeError> {
     })
 }
 
+/// The inverse of [`gmtime`]: a broken-down UTC time as a Unix timestamp, normalised.
+///
+/// This is `timegm(3)`, and on this runtime it is also `mktime(3)` -- see the adapter's
+/// `mktime` handler for why the two coincide here and would not on a device with a timezone.
+///
+/// # What "normalised" means, and why it is the whole of the contract
+///
+/// C 7.29.2.3 says `mktime` interprets a `struct tm` whose members **need not be in their normal
+/// ranges** and, on success, sets them to values that are. So the 61st second of a minute is the
+/// first second of the next one, month 12 is January of the following year, and day 0 is the last
+/// day of the previous month. Callers rely on exactly that: OpenSSL builds a `struct tm` from an
+/// X.509 `notBefore`/`notAfter` string and lets this function decide what it means.
+///
+/// The arithmetic is the mirror of [`gmtime`]'s and is **loop-free for the same reason**: a
+/// "step a month at a time" normalisation over a hostile `tm_mon` is a denial of service
+/// reachable from one guest argument. Months normalise by division, and the day count is
+/// `days_from_civil` -- Howard Hinnant's exact inverse of the `civil_from_days` [`gmtime`] uses,
+/// from the same paper C++20's `<chrono>` is specified against, so the pair round-trips by
+/// construction rather than by agreement.
+///
+/// `tm_wday` and `tm_yday` in the input are **ignored**, which is what C requires; the returned
+/// [`Tm`] carries the ones the date implies. `tm_isdst` is ignored too: UTC has no daylight
+/// saving, so there is no third answer for `-1` to ask for.
+///
+/// # Errors
+///
+/// [`MktimeError::OutOfRange`] when the normalised date does not fit a `time_t`, which C reports
+/// as `-1`. Every arithmetic step below is `checked_*`: a `struct tm` is nine guest-controlled
+/// `int`s, `tm_year` alone can be `i32::MIN`, and this is exactly the shape `VERIFICATION.md`
+/// entry 3 is about -- a release build wraps, the wrapped value passes a later range check, and
+/// the answer is a plausible date.
+pub fn mktime(tm: &Tm) -> Result<(i64, Tm), MktimeError> {
+    let fail = || MktimeError::OutOfRange { year: i64::from(tm.year), mon: i64::from(tm.mon) };
+
+    // **Months first**, because normalising them is what decides the year. `tm_mon` is 0-based,
+    // so a floor division by twelve carries into the year and the remainder is the month.
+    let months = i64::from(tm.year).checked_mul(12).ok_or_else(fail)?
+        .checked_add(i64::from(tm.mon)).ok_or_else(fail)?;
+    let year = floor_div(months, 12).checked_add(1900).ok_or_else(fail)?;
+    let month = months - floor_div(months, 12) * 12; // 0..=11
+    let month = month + 1; // 1..=12, which is what `days_from_civil` takes
+
+    // `days_from_civil` takes the day of month as an `i64` and tolerates any value: an out-of-
+    // range `tm_mday` simply moves the day count, which is the normalisation C asks for.
+    let days = days_from_civil(year, month, 1)
+        .checked_add(i64::from(tm.mday))
+        .ok_or_else(fail)?
+        .checked_sub(1)
+        .ok_or_else(fail)?;
+
+    let seconds = days
+        .checked_mul(SECONDS_PER_DAY)
+        .ok_or_else(fail)?
+        .checked_add(i64::from(tm.hour).checked_mul(3600).ok_or_else(fail)?)
+        .ok_or_else(fail)?
+        .checked_add(i64::from(tm.min).checked_mul(60).ok_or_else(fail)?)
+        .ok_or_else(fail)?
+        .checked_add(i64::from(tm.sec))
+        .ok_or_else(fail)?;
+
+    // **The normalised fields come from `gmtime` rather than from this function's own
+    // arithmetic**, and that is deliberate: two independent normalisations that were meant to
+    // agree are two places for them to disagree, and the one a caller will compare against is
+    // whatever `gmtime` says about the timestamp it was just handed.
+    let normalised = gmtime(seconds).map_err(|_| fail())?;
+    Ok((seconds, normalised))
+}
+
+/// Why a `struct tm` could not be converted to a `time_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MktimeError {
+    /// The date is outside the range a `time_t` holds.
+    ///
+    /// C's answer is `(time_t)-1`. Wrapping instead would produce a timestamp, which is the same
+    /// failure shape [`GmtimeError::YearOutOfRange`] exists to avoid in the other direction.
+    OutOfRange {
+        /// The year the fields implied, for the message.
+        year: i64,
+        /// The month, 0-based as `tm_mon` is.
+        mon: i64,
+    },
+}
+
+impl core::fmt::Display for MktimeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MktimeError::OutOfRange { year, mon } => write!(
+                f,
+                "the broken-down time (tm_year implying {year}, tm_mon {mon}) is outside the \
+                 range a 64-bit time_t holds, which C reports as (time_t)-1"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MktimeError {}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date: `days_from_civil`.
+///
+/// **The exact inverse of the `civil_from_days` in [`gmtime`]**, from the same paper, so that
+/// `gmtime(mktime(t)) == t` holds by construction. `month` is 1-based here, unlike `tm_mon`.
+/// `day` is not range-checked: a value outside 1..=31 moves the result, which is the
+/// normalisation `mktime` needs and the reason this takes an `i64`.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    // Shift the year so it starts in March and the leap day is last, exactly as the inverse does.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = floor_div(year, 400);
+    let year_of_era = year - era * 400; // 0..=399
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 }; // 0..=11, 0 is March
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1; // 0..=365
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year; // 0..=146_096
+    era * DAYS_PER_ERA + day_of_era - DAYS_ERA_TO_UNIX_EPOCH
+}
+
 /// Serialise `tm` into the 56 bytes of a guest `struct tm`.
 ///
 /// `zone` is a guest pointer to a NUL-terminated `"UTC"`; the caller owns that storage, because a
@@ -1166,6 +1281,129 @@ pub fn read_tm(mem: &impl GuestMemory, at: u64) -> Result<GuestTm, Fault> {
 mod tests {
     use super::*;
     use crate::mock::MockMemory;
+
+    /// **`mktime` is `gmtime`'s inverse over every timestamp `gmtime` accepts**, asserted as a
+    /// round trip rather than against a second table.
+    ///
+    /// VERIFICATION entry 7 is why this is a round trip and not a comparison with `chrono` or
+    /// with the host's own `mktime`: agreeing with a second implementation proves only that both
+    /// did the same thing. The property under test is the one C states -- `mktime` and `gmtime`
+    /// are inverses on normalised input -- and it is checked on the dates whose weekday the
+    /// suite above already pins independently, plus the two ends of the representable range.
+    #[test]
+    fn mktime_is_the_exact_inverse_of_gmtime() {
+        for timestamp in [
+            0i64,
+            -1,
+            951_782_400,      // 2000-02-29, a leap day in a leap century
+            4_107_542_399,    // 2100-02-28T23:59:59, the century that is NOT a leap year
+            1_774_137_600,    // 2026-03-22
+            -2_208_988_800,   // 1900-01-01, before the epoch
+            67_768_036_191_676_799, // the last second `struct tm`'s int tm_year can hold
+            -67_768_040_609_740_800,
+        ] {
+            let tm = gmtime(timestamp).expect("in range for tm_year");
+            let (back, normalised) =
+                mktime(&tm).unwrap_or_else(|e| panic!("mktime({timestamp}): {e}"));
+            assert_eq!(back, timestamp, "round trip of {timestamp} through {tm:?}");
+            assert_eq!(normalised, tm, "already-normalised input must come back unchanged");
+        }
+    }
+
+    /// **Out-of-range fields normalise**, which is `mktime`'s whole reason for existing.
+    ///
+    /// Each row states the denormalised fields and the date they mean, derived from C 7.29.2.3
+    /// ("the values ... are not restricted to the ranges indicated") rather than from another
+    /// implementation's output. The 61st second is the row that matters most: a `struct tm` built
+    /// from an X.509 time string is exactly this shape when the string is malformed, and an
+    /// implementation that clamped rather than carried would accept a certificate for the wrong
+    /// second and never say so.
+    #[test]
+    fn denormalised_fields_carry_rather_than_clamp() {
+        /// `(sec, min, hour, mday, mon, year)` and the normalised `(year, mon, mday, hour, min, sec)`.
+        struct Row {
+            given: (i32, i32, i32, i32, i32, i32),
+            means: (i32, i32, i32, i32, i32, i32),
+        }
+        for row in [
+            // 2026-01-01T00:00:60 is 2026-01-01T00:01:00.
+            Row { given: (60, 0, 0, 1, 0, 126), means: (126, 0, 1, 0, 1, 0) },
+            // Month 12 of 2025 is January 2026.
+            Row { given: (0, 0, 0, 1, 12, 125), means: (126, 0, 1, 0, 0, 0) },
+            // Month -1 of 2026 is December 2025.
+            Row { given: (0, 0, 0, 1, -1, 126), means: (125, 11, 1, 0, 0, 0) },
+            // Day 0 of March is the last day of February -- and 2026 is not a leap year.
+            Row { given: (0, 0, 0, 0, 2, 126), means: (126, 1, 28, 0, 0, 0) },
+            // Day 0 of March 2024 is the 29th, because 2024 is.
+            Row { given: (0, 0, 0, 0, 2, 124), means: (124, 1, 29, 0, 0, 0) },
+            // 25 hours past midnight is the next day at 01:00.
+            Row { given: (0, 0, 25, 1, 0, 126), means: (126, 0, 2, 1, 0, 0) },
+            // A negative second borrows from the day before.
+            Row { given: (-1, 0, 0, 1, 0, 126), means: (125, 11, 31, 23, 59, 59) },
+        ] {
+            let (sec, min, hour, mday, mon, year) = row.given;
+            let tm = Tm { sec, min, hour, mday, mon, year, wday: 99, yday: 99, isdst: -1 };
+            let (_, got) = mktime(&tm).expect("a representable date");
+            assert_eq!(
+                (got.year, got.mon, got.mday, got.hour, got.min, got.sec),
+                row.means,
+                "normalising {:?}",
+                row.given
+            );
+        }
+    }
+
+    /// **`tm_wday` and `tm_yday` in the input are ignored and replaced**, as C requires.
+    ///
+    /// Asserted with deliberately wrong values in, because an implementation that *used* them
+    /// would agree with a correct one on every input where they happen to be right -- which is
+    /// every input a test writer would naturally construct.
+    #[test]
+    fn the_weekday_and_day_of_year_are_computed_rather_than_believed() {
+        let tm = Tm { sec: 0, min: 0, hour: 0, mday: 1, mon: 0, year: 70, wday: 5, yday: 200, isdst: 0 };
+        let (seconds, normalised) = mktime(&tm).expect("the epoch");
+        assert_eq!(seconds, 0, "the wrong wday/yday must not move the timestamp");
+        assert_eq!(normalised.wday, 4, "1970-01-01 was a Thursday");
+        assert_eq!(normalised.yday, 0, "and the first day of the year");
+    }
+
+    /// **No `struct tm` can make this panic or wrap**, over every extreme of every field.
+    ///
+    /// VERIFICATION entry 3 in person: `mktime` multiplies guest-controlled `int`s by 86,400 and
+    /// by 12, a release build wraps, and a wrapped timestamp is a date. This is run in whatever
+    /// profile the suite runs in, and the `checked_*` chain is what makes the debug profile agree
+    /// with it rather than panic.
+    #[test]
+    fn no_broken_down_time_at_all_can_make_this_panic_or_wrap() {
+        let extremes = [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX];
+        for &year in &extremes {
+            for &mon in &extremes {
+                for &mday in &extremes {
+                    for &hour in &[i32::MIN, 0, i32::MAX] {
+                        let tm = Tm {
+                            sec: i32::MAX,
+                            min: i32::MIN,
+                            hour,
+                            mday,
+                            mon,
+                            year,
+                            wday: 0,
+                            yday: 0,
+                            isdst: 0,
+                        };
+                        // Either a timestamp or a named refusal; never a panic and never a wrap.
+                        if let Ok((seconds, normalised)) = mktime(&tm) {
+                            assert_eq!(
+                                gmtime(seconds).expect("mktime only returns representable dates"),
+                                normalised,
+                                "a returned pair must agree with gmtime: {tm:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Known timestamps, converted field by field.
     ///

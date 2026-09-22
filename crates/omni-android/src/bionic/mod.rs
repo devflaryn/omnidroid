@@ -37,6 +37,7 @@
 //! handler. The one mapping this module performs happens before any CPU exists, let alone runs.
 
 mod absent;
+mod addrinfo;
 mod clocks;
 mod data;
 mod dl;
@@ -83,6 +84,10 @@ pub use files::{
 };
 pub use logging::{LogRecord, LogRing, LOG_CAPTURE_MAX_BYTES, RECORD_MAX_FOOTPRINT};
 pub use omni_platform::log::Truncation;
+pub use addrinfo::{
+    AddrinfoSlab, ADDRINFO_BYTES, ADDRINFO_NODES_PER_RESULT, ADDRINFO_RESULTS,
+    ADDRINFO_RESULT_BYTES, ADDRINFO_SLAB_BYTES,
+};
 pub use net::{FD_SETSIZE, MAX_POLL_FDS};
 pub use omni_platform::log::Priority as LogPriority;
 pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
@@ -240,6 +245,25 @@ pub struct Bionic {
     /// reason: only the embedding knows, and a number this layer chose would be a number with
     /// nothing behind it. `sysinfo` refuses by name until it is set.
     memory_budget: Mutex<Option<u64>>,
+    /// Which network this guest instance may reach.
+    ///
+    /// **`None` until the embedding says, and a socket cannot be created without one** — the same
+    /// shape as the filesystem root (D23), the thread host (D24) and the memory budget, and for
+    /// the same reason in a case where it matters more: D6 records that the APK under test is
+    /// cheat-injected and carries a Luau executor, so a default would hand untrusted guest code a
+    /// host socket nobody decided to open. See [`Bionic::set_network_policy`].
+    ///
+    /// A `OnceLock` for [`Bionic::fs`]'s reason: a policy that changed while the guest ran would
+    /// leave a socket created under one set of rules being used under another, which is a
+    /// confinement hole with a legitimate-looking API in front of it.
+    net_policy: OnceLock<Arc<omni_platform::net::NetPolicy>>,
+    /// The bounded `struct addrinfo` slab `getaddrinfo` builds its answer in, and the free list
+    /// `freeaddrinfo` returns a slot to.
+    ///
+    /// Its region is mapped in [`Bionic::new`], which is F9's constraint: `getaddrinfo` is an
+    /// inline handler and a handler may not map guest memory. See `addrinfo` for why it is its
+    /// own mapping rather than a fifth table of the arena.
+    addrinfo: addrinfo::AddrinfoSlab,
     /// Labels the guest has attached to its own anonymous mappings with
     /// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ..)`, keyed by `(address, length)`.
     ///
@@ -360,6 +384,9 @@ pub struct Bionic {
     /// wait cannot leave a thread recorded as parked for ever. A stale entry would be worse than
     /// none: it would make a run that completed look like the deadlock this exists to find.
     parked: Mutex<Vec<ParkRecord>>,
+    /// The last sampled guest stack of each thread that called `sched_yield`. See
+    /// [`Bionic::yield_stacks`].
+    yield_stacks: Mutex<std::collections::BTreeMap<GuestThreadId, Vec<u64>>>,
     /// The most threads ever parked at once, which a run that has already finished can still
     /// report.
     parked_peak: AtomicU64,
@@ -382,6 +409,15 @@ pub struct ParkedWait {
     pub mutex: u64,
     /// How long it has been there, when the list was taken.
     pub waiting: std::time::Duration,
+    /// The guest return addresses above the wait, innermost first, as
+    /// [`omni_bionic::unwind::frames`] could read them.
+    ///
+    /// **The reading that says which caller is stuck.** `symbol` and the boundary's per-thread
+    /// record are both one frame deep, and the helpers a blocked thread parks in are shared:
+    /// MEASURED, the `pthread_cond_wait` this runtime stalls on is reached from a wrapper with
+    /// ten call sites, so one frame narrowed the question by a factor of ten and stopped. Frames
+    /// are evidence only -- see that function for what a frame-pointer walk can and cannot claim.
+    pub backtrace: Vec<u64>,
 }
 
 /// Records a thread as parked for as long as it lives.
@@ -416,6 +452,8 @@ struct ParkRecord {
     /// thread cannot overlap, but a token costs nothing and a search by `(thread, cond)` would be
     /// a correctness argument to maintain.
     started: u64,
+    /// See [`ParkedWait::backtrace`].
+    backtrace: Vec<u64>,
 }
 
 /// The live guest threads, and who is waiting for whom.
@@ -492,9 +530,34 @@ impl Bionic {
             Protection::ReadWrite,
             CommitPolicy::Eager,
         )?;
+        // **A second mapping, and it is not part of the arena on purpose.** `addrinfo`'s module
+        // documentation has the whole argument: the arena is 65,280 bytes of a 65,536-byte commit
+        // granule and `the_arena_fits_in_one_commit_granule` is what makes its eager commit free,
+        // so a slab worth having cannot go in it. An eager mapping commits its own length rather
+        // than a granule, so this costs `ADDRINFO_SLAB_BYTES` and leaves that invariant alone.
+        //
+        // Mapped here for the arena's reason, which is F9: `getaddrinfo` is an inline handler and
+        // a handler may not map guest memory.
+        let resolver = match space.map_anonymous(
+            Placement::Anywhere { align: space.page_size() },
+            ADDRINFO_SLAB_BYTES,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        ) {
+            Ok(at) => at,
+            Err(error) => {
+                // The arena is already mapped and this constructor is about to fail, so it is
+                // given back here rather than leaked into an address space nothing will ever hold
+                // a `Bionic` for.
+                let _ = space.unmap(arena, ARENA_BYTES);
+                return Err(error.into());
+            }
+        };
         let bionic = Arc::new(Self {
             space,
             arena,
+            net_policy: OnceLock::new(),
+            addrinfo: addrinfo::AddrinfoSlab::new(resolver),
             threads: ThreadTable::new(),
             futex: AddressFutex::new(),
             clock: HostClock::new(),
@@ -535,6 +598,7 @@ impl Bionic {
             futex_calls: Mutex::new(Vec::new()),
             futex_calls_dropped: AtomicU64::new(0),
             parked: Mutex::new(Vec::new()),
+            yield_stacks: Mutex::new(std::collections::BTreeMap::new()),
             parked_peak: AtomicU64::new(0),
         });
         // `gmtime_r`'s `tm_zone` is a `const char *` the guest dereferences, so it has to point at
@@ -847,6 +911,7 @@ impl Bionic {
                 cond: held.cond,
                 mutex: held.mutex,
                 waiting: now.saturating_duration_since(held.since),
+                backtrace: held.backtrace.clone(),
             })
             .collect()
     }
@@ -864,6 +929,36 @@ impl Bionic {
         self.parked_peak.load(Ordering::Relaxed)
     }
 
+    /// Where each thread was, the last time its `sched_yield` was sampled.
+    ///
+    /// # The measurement a spin needs and a park record cannot give
+    ///
+    /// A thread blocked in `pthread_cond_wait` has a park record; a thread *spinning* has none,
+    /// because it is never blocked -- it is making a call, returning, and making it again. It is
+    /// nonetheless stuck, it burns a whole core doing it, and from outside it is indistinguishable
+    /// from a guest that is working.
+    ///
+    /// **MEASURED:** a run stalled inside `nativePostClientSettingsLoadedInitialization3` charged
+    /// 21,942,746 `sched_yield` calls in twenty seconds to one guest thread. That names the
+    /// symbol, which twenty call sites share; the stack names the loop.
+    ///
+    /// Sampled rather than recorded, for the reason the number above makes obvious: one frame walk
+    /// per yield would cost more than the guest's whole run. The rate, and why a spin cannot escape
+    /// it, are beside the `sched_yield` handler in `handlers.rs`.
+    #[must_use]
+    pub fn yield_stacks(&self) -> Vec<(GuestThreadId, Vec<u64>)> {
+        self.yield_stacks
+            .lock()
+            .iter()
+            .map(|(thread, stack)| (*thread, stack.clone()))
+            .collect()
+    }
+
+    /// Keep this thread's sampled `sched_yield` stack, replacing the one before it.
+    pub(crate) fn record_yield_stack(&self, thread: GuestThreadId, stack: Vec<u64>) {
+        self.yield_stacks.lock().insert(thread, stack);
+    }
+
     /// Record the calling thread as parked until the returned guard is dropped.
     pub(crate) fn park(
         self: &Arc<Self>,
@@ -871,6 +966,7 @@ impl Bionic {
         thread: GuestThreadId,
         cond: u64,
         mutex: u64,
+        backtrace: Vec<u64>,
     ) -> ParkGuard {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let token = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -883,6 +979,7 @@ impl Bionic {
                 mutex,
                 since: std::time::Instant::now(),
                 started: token,
+                backtrace,
             });
             parked.len() as u64
         };
@@ -1198,6 +1295,72 @@ impl Bionic {
     /// `sysinfo` refuses by name, naming this method, until it has been called.
     pub fn set_memory_budget(&self, bytes: u64) {
         *self.memory_budget.lock() = Some(bytes);
+    }
+
+    /// Tell this guest instance which network it may reach.
+    ///
+    /// **There is no default and a socket cannot be created without one**, which is the same
+    /// sentence [`set_filesystem_root`](Bionic::set_filesystem_root) makes about directories and
+    /// is the shape D30 chose deliberately. Global Constraint 8 said "no network access at run
+    /// time"; the project owner withdrew it because playable Roblox needs login, settings and a
+    /// game server. What replaced it is **not an open socket**: D6's threat is unchanged — the
+    /// APK under test is cheat-injected and carries a Luau executor — so which destinations an
+    /// instance may reach became a question an embedding answers, exactly as which host directory
+    /// it may read already was.
+    ///
+    /// `set_filesystem_root` never meant "the guest gets no files"; this does not mean "the guest
+    /// gets no network". It means every `connect`, every `sendto` and every name looked up goes
+    /// through [`omni_platform::net::NetPolicy`] first, and a destination outside it is refused by
+    /// name — naming the rule that refused it — rather than reported as `ENETUNREACH`, which
+    /// would hide a configuration fact in the ordinary noise of a client failing over.
+    ///
+    /// Until this is called, `socket` refuses by name and names this method. There is deliberately
+    /// no default: [`NetPolicy::closed`](omni_platform::net::NetPolicy::closed) would be a
+    /// *silent* version of the same refusal, and an embedding that had simply forgotten would get
+    /// a guest whose networking failed as though the network were down.
+    ///
+    /// Call it during setup. It maps nothing and writes no guest memory, so F9 does not bind it.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] if this instance already has a policy. It may be set once and never
+    /// moved: a socket created under one set of rules must not become usable under another.
+    pub fn set_network_policy(
+        &self,
+        policy: Arc<omni_platform::net::NetPolicy>,
+    ) -> AbiResult<()> {
+        let describe = policy.describe();
+        if self.net_policy.set(policy).is_err() {
+            return Err(AbiError::Refused {
+                symbol: "socket".to_string(),
+                address: self.arena,
+                why: format!(
+                    "this guest instance already has a network policy (`{}`), and the one offered \
+                     was `{describe}`. It may be set once and never moved: a socket created under \
+                     one set of rules must not become usable under another",
+                    self.net_policy
+                        .get()
+                        .map_or_else(String::new, |held| held.describe())
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The network policy this instance runs under, or `None` if the embedding has not set one.
+    #[must_use]
+    pub fn network_policy(&self) -> Option<&Arc<omni_platform::net::NetPolicy>> {
+        self.net_policy.get()
+    }
+
+    /// The bounded `struct addrinfo` slab `getaddrinfo` builds its lists in.
+    ///
+    /// Public so that a host can read [`AddrinfoSlab::live`] after a run: a guest that leaks
+    /// resolutions and a slab that is merely small produce the same refusal, and that number is
+    /// what tells them apart.
+    #[must_use]
+    pub fn addrinfo_slab(&self) -> &AddrinfoSlab {
+        &self.addrinfo
     }
 
     /// What the embedding said this guest's memory budget is, if it said.
@@ -1856,6 +2019,11 @@ impl Drop for Bionic {
         // give it back is not reportable from `drop` and is not worth aborting over: the space
         // itself is about to go, and the commit charge goes with it.
         let _ = self.space.unmap(self.arena, ARENA_BYTES);
+        // The resolver slab is a second mapping for the reason `addrinfo` gives -- the arena is
+        // 65,280 bytes of a 65,536-byte commit granule and a slab worth having does not fit -- so
+        // it is given back separately. It has to be given back at all: a guest that resolved and
+        // never freed still holds nothing after this, because the mapping is gone with it.
+        let _ = self.space.unmap(self.addrinfo.base(), ADDRINFO_SLAB_BYTES);
     }
 }
 
@@ -1900,6 +2068,21 @@ impl core::fmt::Debug for Activation {
 ///
 /// Cloned out rather than borrowed: the borrow would have to be held across a handler that can
 /// re-enter guest code and arrive back here, and an `Arc` clone is one relaxed increment.
+/// The guest thread id published on **this** host thread, or `None` if no instance is active.
+///
+/// **Infallible where [`active`] refuses**, which is the whole of why it exists: it is read on
+/// the boundary's crossing path, where a missing instance is ordinary (a host-initiated call
+/// before `activate`) rather than an error, and where an `AbiError` would have nowhere to go.
+///
+/// It is what lets a crossing record say *which guest thread* it belongs to. Without it a stall
+/// report lists anonymous host threads and the reader has to match them to
+/// `Bionic::parked`, `futex_calls` and `guest_thread_list` by counting -- which is how M6's stall
+/// was misread twice.
+#[must_use]
+pub(crate) fn current_guest_thread() -> Option<GuestThreadId> {
+    ACTIVE.with(|cell| cell.borrow().as_ref().map(|active| active.thread))
+}
+
 pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<Active> {
     ACTIVE.with(|cell| cell.borrow().clone()).ok_or_else(|| AbiError::BionicNotActive {
         symbol: symbol.to_string(),

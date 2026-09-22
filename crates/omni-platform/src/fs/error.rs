@@ -69,6 +69,14 @@ pub enum FsErrorKind {
     /// On a device this also raises `SIGPIPE`. There is no signal delivery in this runtime
     /// (D24), so the errno is the whole of what the guest receives.
     BrokenPipe,
+    /// A socket operation on a descriptor that is open and is not a socket — `ENOTSOCK`.
+    ///
+    /// **Decided by this seam rather than reported by the host**, and it is the one kind here
+    /// that no `std::io::ErrorKind` can produce: the descriptor table knows what each number is,
+    /// so a `connect` on a regular file is a fact this layer can state before any host call is
+    /// made. Added with [`Entry::Socket`](super::Filesystem::socket_at) in M6; every other kind
+    /// predates sockets existing at all.
+    NotASocket,
     /// The host reported a failure [`std::io::ErrorKind`] does not classify.
     ///
     /// **Not mapped to an errno by the caller.** See the module documentation: a call that fails
@@ -97,6 +105,7 @@ impl FsErrorKind {
             FsErrorKind::NameTooLong => "file name too long",
             FsErrorKind::WouldBlock => "resource temporarily unavailable",
             FsErrorKind::BrokenPipe => "broken pipe",
+            FsErrorKind::NotASocket => "not a socket",
             FsErrorKind::Other => "an unclassified host error",
         }
     }

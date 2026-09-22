@@ -373,6 +373,22 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
     }
 }
 
+/// Every hint continued through, across **every** context in the process.
+///
+/// # Why a global, when the context already counts them
+///
+/// `Context::hints` is per guest thread and is reachable only from that thread's `DynarmicCpu`.
+/// The question a stall asks is the opposite one: *some* thread is burning a core and the asker
+/// is a watchdog on a third thread that holds none of their contexts. A process-wide relaxed
+/// counter answers it in one read.
+///
+/// It is a **watch, not a detector** (`docs/VERIFICATION.md` entry 11): it rises whenever a guest
+/// spins on a `yield`, which is ordinary, and it stays where it is under every defect the hint
+/// arm could have. What it is for is telling a *spin* from a *block* when the import census is
+/// frozen and no instruction budget is being consumed — in that state a climbing hint count is
+/// the guest looping through hints and nothing else, which no other counter in the runtime shows.
+pub static HINTS_OBSERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The architecture's **hint** instructions, and the reason this arm exists at all.
 ///
 /// `YIELD`, `WFE`, `WFI`, `SEV` and `SEVL` are hints: A64 permits an implementation to execute
@@ -443,6 +459,7 @@ unsafe extern "C" fn cb_exception_raised(ctx: *mut c_void, pc: u64, kind: u32) {
         with(ctx, (), |c| {
             if is_hint(kind) {
                 c.hints += 1;
+                HINTS_OBSERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if hint_yields(kind) {
                     std::thread::yield_now();
                 }

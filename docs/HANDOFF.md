@@ -886,10 +886,11 @@ These are in the M3 plan as Global Constraints. The three worth knowing before w
 Read in this order:
 
 1. **`docs/HANDOFF.md`** — this file.
-2. **`docs/VERIFICATION.md`** — **thirteen** documented ways verification has failed *in this
-   project*, each a real incident, plus the six process rules they produced. Rules 2, 3 and 4 were
-   all amended in the last session because all three were broken in it. Read it before writing a
-   test you intend to rely on, and before believing a number.
+2. **`docs/VERIFICATION.md`** — **sixteen** documented ways verification has failed *in this
+   project*, each a real incident, plus the six process rules they produced. Entries 15 and 16 are
+   this session's and they are the two that cost the most: a diagnostic that was switched **off**
+   read exactly like a system that had stopped, and three guest threads died unremarked behind a
+   green gate. Read it before writing a test you intend to rely on, and before believing a number.
 3. **`docs/STATUS.md`** — the honest capability matrix. Nothing is claimed for Linux or macOS.
 4. **`docs/research/jni-surface.md` §8** — the 26-step startup contract, and **§8.1**, which ranks
    the failure modes in the order you will meet them.
@@ -929,63 +930,186 @@ nativeInitClientSettings -> returned 0 ; engine Flag::areFlagsLoaded byte: 1
 That is what §8 row 21 exists to do, and the TaskScheduler's
 `Can't initialize the TaskScheduler before flags have been loaded` is gone.
 
-## The immediate blocker: two idle workers and a main thread waiting on them
+## The immediate blocker: the engine will not take the surface until the flags have arrived
 
-Row 21's **second** downcall, `nativePostClientSettingsLoadedInitialization3`, does not return.
-The gate's watchdog samples every 20 s and the picture is stable from the first sample on:
+Row 21's **second** downcall, `nativePostClientSettingsLoadedInitialization3`, does not return,
+and the previous session's account of why was wrong in every particular. What it actually is:
 
 ```text
-M6 watchdog sample: crossings 23643372 -> 23643372 (FROZEN), last JNIEnv::GetFieldID, live threads 3
-    futex parked ["0x...2e60 x1", "0x...a1f0 x1"], indefinite 2,
-    cond-parked ["GuestThreadId(6) in pthread_cond_wait on cond 0x...384 mutex 0x...35c"]
+[FLog::NativeDM] nativeActivity_onSurfaceChanged: state:2.
+[FLog::NativeDM] nativeActivity_onSurfaceChanged: ... Flags-Not-Received. Return.
 ```
 
-* **`GuestThreadId(6)` is the calling thread itself** — the gate's own thread, inside the
-  downcall, in `pthread_cond_wait`. It is not in `guest_thread_list`, which holds only the three
-  threads the guest *created* (`0x2`, `0x3`, `0x4`).
-* **Crossings are frozen**, so nothing is executing imports, and no guest instructions are being
-  executed either — the `LIFECYCLE_BUDGET` of 2×10⁹ would have expired in seconds otherwise.
-* **Threads `0x2` and `0x3` are the two idle workers**, parked in a raw indefinite
-  `FUTEX_WAIT_BITSET` from guest `0x0284d130` since before §8 step 7, on the high half of a
-  64-bit atomic whose upper word is a sequence counter:
+The engine **drops the window** and returns, having done nothing with it. Nothing re-delivers a
+dropped surface, so the renderer is never asked for, and from outside that is indistinguishable
+from a graphics problem: the game loop spins in `ALooper_pollOnce` (MEASURED 138,974,961 calls in
+180 s), the flags-loaded call blocks, and a worker burns a core on `sched_yield`.
 
-  ```text
-  0x284d030: bl   <atomic load of [x19]>
-  0x284d040: cmp  x21, x0, lsr #32   ; the expected value is the SEQUENCE, x19 + 4
-  0x284d048: cmn  x20, #1            ; timeout == -1 ?
-  0x284d04c: b.eq 0x284d114          ; yes -> the untimed wait
-  0x284d114: add  x1, x19, #4 / mov w0,#0x62 / mov w2,#0x89 / mov x4,xzr / mov w6,#-1
-  ```
+The gate now drives **§8 row 21's first downcall before rows 17-20**, because that is the order
+the engine asks for. On a device the client-settings fetch (`fi.e$f`) runs from `onCreate`, long
+before the SurfaceView's `surfaceCreated`; §8's table lists 21 after 20 because that is the order
+the *dex* names them in, and the ordering between those two rows was never independently verified.
+With the flags first, `[FLog::NativeDM] initialize: state:1. areFlagsLoaded:**true**`.
 
-  **Not a lost wake**: both words still read what the waiters parked expecting, and
-  `AddressFutex::near_misses()` — added for exactly this question — reports **empty**, so no wake
-  has ever landed within eight bytes of either. They are workers on a queue nothing posts to.
-* **Thread `0x4` is alive and doing nothing** either, and is the piece with no explanation yet.
+The gate is the byte at `DataModel + 0x289`, read at guest `0x02bd307c`
+(`ldrb w8, [x19, #0x289]; tbz w8, #0 -> bail`) and written at `0x02bd3be4`, inside
+`[FLog::NativeDM] continueAfterFlagsLoaded_:` at `0x02bd3b58`. So the surface is accepted only
+after `continueAfterFlagsLoaded_` runs, and that runs only after the settings fetch resolves one
+way or the other.
 
-So the open question is one thing: **what should post work to those workers, and why has it not
-run.** A scan of all 28 raw `syscall` sites finds wake sides in the binary — five
-`FUTEX_WAKE_BITSET|PRIVATE` at `0x2856274`..`0x2857078` and one `FUTEX_WAKE|PRIVATE` at
-`0x61a34d0` — but the first group targets `obj + 0xc`, a different object shape from the waiters'
-`obj + 4`, and none of them runs.
+### Three guest threads were dying, and nothing said so
 
-### The one thing to check first, because it has now been right twice
+`nativePostClientSettingsLoadedInitialization3` waits on a one-shot `pthread_cond_wait` at
+`0x02320118` (no predicate, EINTR retry only), reached through
+`getFlags("ClientAppSettings")` at `0x02bd564c`. The **guest backtrace** at the park — a frame
+walk added this session, `omni_bionic::unwind::frames` — is
 
-**A refusal that fires inside a guest critical section leaves the lock held for ever**, and that
-turned out to be the whole of the previous blocker: `nativeSetPlatformHeadersWithIdfa` refused
-inside OpenSSL's namemap lock, and §8 row 21 spun on it four milestones later. The same shape is
-the first hypothesis for anything that hangs here. Every refusal reachable inside a lock is a
-deadlock waiting for its second acquirer, and an open item with no consequence attached is a bet
-that it has none.
+```text
+0x2320170  0x3d387e4  0x5ff4678  0x4eca058  0x4ecb060  0x4ecaf30  0x2bd5650  ...
+```
 
-### What has been ruled out, so nobody repeats it
+and `0x3d387d0` is a proper `while (!done) wait()` loop on a byte at `obj + 0x28`. Something has
+to complete that future. Three of the guest's own worker threads had been **killed by this
+layer**, and every one of the gate's assertions is about the thread it is standing on, so nothing
+printed a word (`VERIFICATION.md` entry 16):
 
-* **`STLR` writes.** Tested at the CPU level: `stlr wzr, [xN]` zeroes the word.
-* **Nested guest calls preserve every callee-saved register.** `SavedState` captures and restores
-  all 31 `X`, all 32 `V`, `SP`, `PC` and `NZCV` on every path.
-* **No `pthread_create` was lost**, and the processor count is the host's real one.
-* **Every `omni-bionic` futex wait is bounded** (50 ms or 1 s slices that re-check), so a lost
-  wake there self-heals. `indefinite_parks()` reports exactly `2`, both the raw syscalls above.
-* **No wake has ever landed beside a waiter** (`near_misses()` is empty).
+| thread | what killed it | fixed by |
+|---|---|---|
+| a log worker | `__android_log_print` refused a NUL-terminated line "with no NUL in the first 96 bytes" | `omni_mem::scan_reach` |
+| `0x2173df8` | `pthread_getattr_np` unbound | bound |
+| `0x2b53aa0` | `pthread_mutex_trylock` unbound — `omni_bionic::mutex::trylock` already existed and was already tested, and had never been wired to a symbol | bound |
+
+The 96 was not a property of the string. `GuestMem::cstr` bounded its walk with
+`admit(address, 1, Read)`, which reports the end of the **first entry** — and a lazy commit carves
+one mapping into a run of entries, one per OS placeholder, never coalesced. 96 was the distance to
+the next granule. `omni_mem::scan_reach` is the question a scan actually asks: *how far may I read
+before I must stop*, bounded by the mapping and not by the granule.
+
+With that fixed the engine gets much further and names its own next step:
+
+```text
+[FLog::ClientRunInfo] The base url is https://www.roblox.com
+[FLog::Output] settingsUrl: https://clientsettingscdn.roblox.com/v2/settings/application/android
+```
+
+### The pure-binding-gap pattern, which has now happened five times in one session
+
+`pthread_mutex_trylock`, `pthread_attr_getstack`, `__strcat_chk` and `strcspn` were each **already
+written and already unit-tested** in `omni-bionic`, and each had simply never been wired to a
+symbol in `handlers.rs`. Every one was found the same way: a guest worker thread died on it and
+`Bionic::guest_thread_failures()` named it.
+
+That is not four coincidences. The primitives were written against **the import list**, and the
+wiring was done against **what the run had reached** — so every primitive whose symbol the run had
+not yet reached stayed unbound, and stayed invisible, until a thread walked into it.
+
+**Do not respond to this by binding everything available.** `strspn` is `strcspn`'s own
+`span_walk` with one test flipped, binding it would cost nothing, and it is deliberately still
+unbound: "the primitive is already written" is not the same claim as "the guest needs it", and the
+rule against implementing an API because its name exists is the rule that has kept this layer
+honest. What makes waiting safe is the assertion — a guest thread that dies now fails the gate by
+name on the first run.
+
+`inet_pton` is the one that broke the pattern: the guest reached it and nothing in `omni-bionic`
+parses addresses at all, so it is real work rather than wiring.
+
+### The host window is connected, and it was demonstrated rather than argued
+
+`Ndk::set_window_source` takes an `Arc<dyn WindowSource>` and `ANativeWindow_getWidth`/`_getHeight`
+ask it on **every call** — a pull, not a push, because `Window::client_size` asks the OS each time
+and a pushed geometry is stale after every resize the *display* does rather than the user. The
+constant path (`set_window_geometry`) is untouched and still what most tests use.
+
+MEASURED, on this machine, through a real thunk from translated ARM64 code:
+
+```text
+live window: device "NVIDIA GeForce RTX 4060", validation false,
+guest (1024, 576) -> (736, 414), swapchain Some((736, 414)) over 2 generations,
+6 frames presented, 8 samples
+```
+
+The same `ANativeWindow *` followed a real `set_client_size`, the swapchain was recreated once,
+frames were presented on both sides, and `window_geometry()` was asserted `None` throughout so the
+constant path provably was not what answered. A minimised window gives a genuine 0x0 client area,
+`swapchain_extent() == None`, and a refusal that names the source — there is no device analogue for
+a zero-sized surface, so it is refused rather than invented.
+
+**This is still not the engine's frames.** It is Omnidroid's renderer presenting into Omnidroid's
+window with the guest reading the right numbers. The engine's own drawing still has nowhere to go:
+0 of 17 `egl*` symbols bound, `dlopen("libvulkan.so")` still refused, and which of the two paths
+Roblox takes has still never been observed.
+
+### The chain after the string fix, in the order the guest walked it
+
+Each of these was reached only because the one before it was answered, and each was found by the
+thread-failure assertion rather than by looking:
+
+```text
+__android_log_print (the 96-byte scan)  ->  pthread_getattr_np  ->  pthread_attr_getstack
+  ->  pthread_mutex_trylock  ->  strcspn  ->  __strcat_chk  ->  sysconf(_SC_PHYS_PAGES)
+  ->  inet_pton  ->  getaddrinfo  ->  mallinfo  ->  socket(AF_INET, SOCK_DGRAM, 0)
+```
+
+`sysconf(_SC_PHYS_PAGES)` is answered from `Bionic::set_memory_budget`, the same seam `sysinfo`
+takes, so a guest that asks both ways cannot be told two different things — and never from the
+host's RAM, which is what it used to be refused for.
+
+`mallinfo` now writes ten zeroed `size_t` fields. Its refusal had conceded, in its own text, that
+zeroes would be *arithmetically true* of a heap nothing has allocated from, and `libroblox.so`
+imports no allocator at all (D17), so nothing ever has. The worry underneath the refusal was that
+a human reading a log would take "0 bytes allocated" for "uses no memory"; that is a reason for a
+comment, not for failing a call the engine needs. Reporting this process's commit charge as the
+arena is still rejected, and still for the original reason: a real number, from the right process,
+describing the wrong allocator.
+
+**And then the network seam was built, and the chain ran out the other side.** As of the guest
+network surface landing:
+
+```text
+nativeInitClientSettings RETURNED 0, engine flags byte 1
+[FLog::NativeDM] initialize: areFlagsLoaded:true  ->  bootstrapTheApp_
+onSurfaceCreated / Changed / Start / Resume / FocusChanged / ContentRect / WindowInsets all returned
+settingsUrl: https://clientsettingscdn.roblox.com/v2/settings/application/android
+nativePostClientSettingsLoadedInitialization3 RETURNED 1      <- it used to block here
+engine in its main loop: 123 M ALooper_pollOnce, 12 guest threads
+socket() = fd 12  ->  setsockopt(fd 12, SOL_SOCKET, 9)  ->  refused  ->  worker thread died
+```
+
+**§8 row 21 is closed.** The call that consumed three sessions returns, the engine is running its
+own main loop, and the runtime is carrying twelve guest threads. `SO_KEEPALIVE` (option 9) was the
+next name, and it is now answered on both sides of the seam — `std::net` has no spelling for it, so
+it is backend work, and only the boolean is carried because the *timing* knobs
+(`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` against Windows' `SIO_KEEPALIVE_VALS`) have no
+portable form at all.
+
+### The empty-resolver diagnostic existed, bought one step, and is gone
+
+`OMNI_EMPTY_RESOLVER=1` answered every `getaddrinfo` with `EAI_NONAME`, under the permission D30
+records, so that the graphics path downstream could be observed while the real seam was built.
+**It did not reach rendering, and that was measured rather than assumed**: the engine does not give
+up when resolution fails — it opens a UDP socket and resolves for itself. So it bought one step
+rather than the four that were hoped for, and there was never a shortcut to first rendering that
+did not go through sockets.
+
+`Bionic::use_the_empty_resolver_for_diagnosis`, its field, its `getaddrinfo` branch and the gate's
+env block were **deleted** the moment `getaddrinfo` resolved for real, which is what its own doc
+comment and D30 both said had to happen. `grep -rn "empty_resolver\|OMNI_EMPTY_RESOLVER" crates/
+tools/` is empty. This paragraph is the record that it existed, because `VERIFICATION.md` entry 14
+is about a deliberate failure that outlived its purpose and started reading like a measurement.
+
+### Hypotheses that were measured and are dead — do not repeat them
+
+* **It was never a deadlock.** The census read `FROZEN` because it had been switched *off*, not
+  because nothing was moving; `Boundary::crossings().exits`, which is not census-gated, read
+  26,631,317 -> 53,276,895 -> 79,473,983 over forty seconds. See `VERIFICATION.md` entry 15.
+* **The two indefinitely-parked raw futex waiters are not it.** Both are ordinary idle workers;
+  `AddressFutex::near_misses()` is empty, so no wake has ever landed beside one.
+* **The `sched_yield` spinner is downstream, not upstream.** It waits at `0x2173f8c` for the
+  singleton at `0x7275550`, published by `0x2174ad4` under a `__cxa_guard`, called only from
+  `0x217402c` — code that has not run yet. It burns a core and it is not the cause.
+* Hints, `STLR`, callee-saved registers across nested guest calls, lost `pthread_create`s and the
+  processor count were all eliminated in earlier sessions and stay eliminated.
+
 
 ## Network: the constraint the goal will meet
 
@@ -993,12 +1117,263 @@ Flags now load with **no network at all**, because the host supplies the setting
 `nativeInitClientSettings` parses — which is what the Java side does on a device too. The
 `AF_INET6` call M6 reaches is a capability probe and is answered.
 
-**Everything past that is a real network question.** Roblox authenticates and joins a game server
-over HTTP; Global Constraint 8 says this runtime makes no network access at run time, and there
-is no socket seam in `omni-platform` to make one through. A *frame* may well be reachable offline
-— the engine can render its own loading UI — but "reaches the game" and "playable" cannot be. The
-next `socket(AF_INET, ...)` is where that decision has to be made, and it is an embedding policy
-decision, not a gap in this layer.
+**Everything past that is a real network question, and the engine has now named the first URL.**
+With the string-scan defect fixed, `nativePostClientSettingsLoadedInitialization3` reaches its
+settings fetch and logs
+
+```text
+[FLog::Output] settingsUrl: https://clientsettingscdn.roblox.com/v2/settings/application/android
+```
+
+The engine's HTTP is its **own**, over raw BSD sockets: `libroblox.so` imports `socket`,
+`connect`, `getaddrinfo`, `sendmsg`/`recvmsg`, `epoll_*`, `select` and `poll` directly, with ten
+direct `getaddrinfo` call sites and eight `connect` ones. So the fetch will resolve a name before
+it opens anything, and `getaddrinfo` is the **first** thing it meets. That is the fork, and it is
+a narrower one than `socket` would be:
+
+* **`getaddrinfo` currently refuses by name**, which kills the calling guest thread — and a killed
+  worker leaves the future nobody else can complete, which is precisely the hang this session
+  spent itself on. A refusal here is not a clear failure; it is a silent deadlock.
+* **The engine has a first-class failure arm** and logs it:
+  `[FLog::NativeDM] ... getFlags: success = false.` at `0x04b5223`, and that path runs on to
+  `continueAfterFlagsLoaded_`, which sets the byte the surface is gated on. A device in airplane
+  mode takes exactly that branch and still renders its own UI.
+* Answering `EAI_NONAME` allocates nothing, hands back no descriptor, opens no seam, and is
+  **true**: this runtime resolves no names. The recorded objection — "a caller believes it asked a
+  resolver" — is weaker than it reads, because the caller *did* ask this runtime's resolver.
+
+**That decision has since been made, and it went the other way: see D30.** Global Constraint 8 is
+**withdrawn**. The project owner's instruction is that playable Roblox is the higher-priority
+requirement, that networking is allowed and required, and that no earlier "no runtime networking"
+rule may be preserved where it prevents login, settings fetches, game joining or normal operation.
+So the socket seam in `omni-platform` is not a decision to be made any more, it is work to be done,
+and D30 records what constrains it: the smallest surface a run has actually reached, sockets in the
+descriptor table `fs` already owns, isolation per instance, and portability unrelaxed.
+
+A temporary `EAI_NONAME` is permitted **only** as a diagnostic to reach first rendering, and D30
+says why that permission is dangerous: a deliberate failure that gets you past a gate is
+indistinguishable a week later from an implementation that works.
+
+## The graphics path: decoded, not guessed
+
+`libroblox.so` **bootstraps Vulkan itself**, and the sequence is at guest `0x02595160`:
+
+```text
+0x2595170: adrp/add x0, "libvulkan.so.1" ; mov w1, #2 (RTLD_NOW) ; bl dlopen
+0x2595180: cbnz x0, got_it                ; and if that failed,
+0x2595184: adrp/add x0, "libvulkan.so"    ; mov w1, #2           ; bl dlopen
+0x2595194: cbz  x0, give_up
+0x2595198: adrp/add x1, "vkGetInstanceProcAddr" ; bl dlsym   -> global 0x6d3ca8
+0x25951b8: mov x0, xzr ; x1 = "vkCreateInstance"              ; blr x8
+0x25951c8:              x1 = "vkEnumerateInstanceExtensionProperties"
+```
+
+That is the standard loader bootstrap: fetch `vkGetInstanceProcAddr` by name, then call it with a
+**null instance** for the global entry points. There are **zero `vk*` symbols in the import
+table** — the whole API arrives through those two calls, which is why §8 row 25 describes Vulkan as
+arriving "by `dlopen`" and lists no symbols for it.
+
+`libEGL.so` and `libGLESv2.so` are `DT_NEEDED`, so both paths are in the binary and **which one the
+engine uses has never been observed at runtime.** That observation is what the first Vulkan stage
+is for: answer the `dlopen`/`dlsym`/`vkGetInstanceProcAddr` *mechanism*, record every name the
+engine asks for, and let the first actual call refuse by name. One run then yields the ordered list
+of entry points and the first one that matters, instead of one name per three-minute run.
+
+**Why Vulkan is the tractable side, and it is not a preference.** Identity mapping (D4) means a
+guest pointer *is* a host pointer, and Vulkan's structures are fixed by the specification and
+identical on every LP64 target — so most of the forwarding is genuine trampolining: read the
+AAPCS64 arguments, call the host function, write the result. The parts that are *not* trampolining
+are small and known in advance: callbacks the guest supplies (allocator, debug messenger) have to
+become guest calls back across the boundary, and **`vkCreateAndroidSurfaceKHR` has no host
+counterpart at all** — the guest will hand it an `ANativeWindow *`, and this layer has to turn that
+into a Win32 surface for the real window `ndk::HostWindowSource` now backs it with. GLES has no
+equivalent shortcut: it would have to be implemented, not forwarded.
+
+### Vulkan stage 1 is built: the loader opens and records, and implements nothing
+
+`crates/omni-android/src/vulkan/` answers the *mechanism* and not the API. `dlopen("libvulkan.so")`
+and `"libvulkan.so.1"` issue a handle **only if `vkGetInstanceProcAddr` is bound in that boundary**,
+so an embedding that never calls `Vulkan::bind_into` gets the old NULL byte for byte.
+`vkGetInstanceProcAddr(NULL, name)` answers the specification's five global commands with a stable
+thunk each, answers NULL for anything else with a null instance — which the "Command Function
+Pointers" table *specifies*, so it is not a guess — and refuses a non-null instance, because this
+layer has issued none. Every thunk it hands out **refuses when called**, naming the Vulkan function
+and quoting `x0`–`x7`. There is no list of Vulkan names in the file: 64 anonymous slots handed out
+in ask-order, and a 65th distinct name is a refusal rather than a NULL, because "the pool is full"
+must not be spelled like "this implementation lacks that function".
+
+The census is per-instance, bounded at 512, and **ungated** — unlike `Boundary::census`, which sits
+on a 33 ns path. This one is entered tens of times per process, so a flag would buy nothing and
+would make an empty census ambiguous, which is entry 15 exactly.
+
+### Stage 2a is built: the guest holds a real `VkInstance` on this machine's driver
+
+```text
+the driver reported 20 instance extension(s); the guest was shown:
+    VK_KHR_surface (specVersion 25)
+    VK_KHR_android_surface (specVersion 6)
+vkCreateInstance returned VkResult 0
+the guest's VkInstance handle is 0x1b752e78000 -> HostInstance(#0)
+that instance's first physical device is: NVIDIA GeForce RTX 4060
+  extension-name substitutions: 3 recorded (0 dropped)
+    [0] "VK_KHR_win32_surface" advertised to the guest as "VK_KHR_android_surface" (from 0x…010c)
+    [2] "VK_KHR_android_surface" sent to the driver as "VK_KHR_win32_surface"     (from 0x…01b4)
+  pAllocator: NULL in all 1 vkCreateInstance call(s)
+```
+
+**The device name is the evidence, not the `VkResult`.** `VK_SUCCESS` proves nothing — a stub
+returns it — and an NVIDIA string read back out of the instance the *guest* holds cannot be
+fabricated.
+
+The seam is `trait VulkanHost` in `omni-android`, implemented by `omni-gfx`, so `omni-gfx` stays a
+**dev**-dependency and `cargo tree -p omni-android -e normal` still contains no `ash` and no
+`libloading`. Three properties of its shape are load-bearing:
+
+* **`has_instance_proc` returns `bool`, never a pointer.** The guest branches to whatever
+  `vkGetInstanceProcAddr` gives it, so a host code address reaching translated ARM64 is a jump into
+  x86-64 with an AAPCS64 frame. No type in the file can carry a host function pointer, so it cannot
+  happen by mistake.
+* **`HostInstance` is a token the host mints**; the driver's dispatchable pointer never leaves
+  `omni-gfx`, and two indirections separate the guest from it.
+* **`DriverAnswer` separates "the seam could not ask" from "the driver said no."**
+  `VK_ERROR_INCOMPATIBLE_DRIVER` is an answer the engine branches on, so it is forwarded verbatim;
+  collapsing the two would mean either refusing a legitimate decline or inventing a `VkResult`.
+
+`VK_KHR_android_surface` is advertised where the driver offers `VK_KHR_win32_surface`, and the
+guest's enabled list is rewritten back the other way. **Both directions are logged** (`vulkan::
+rewrite`, bounded at 256, printed unconditionally including "no extension name was substituted in
+this run"), because Global Constraint 1 is about exactly this and a silent rename is the defect it
+names. The test checks it three ways — the guest reads the Android name, the guest does *not* read
+the Win32 name, and the log names both spellings and the direction — so a list that came out right
+by coincidence fails the third.
+
+**`pAllocator` has not been observed for Roblox**, because the gate does not reach graphics yet.
+What exists is the *instrument*: `allocator_calls()` is charged on the handler's first line, and
+`report()` prints "vkCreateInstance was never entered, so nothing was observed" rather than
+presenting zero-of-zero as evidence.
+
+Known before stage 3: **`MAX_PROC_SLOTS = 64` is now reachable for real.** Stage 1 could only issue
+five; a live instance means the driver answers for most of the instance-level set, and a renderer
+resolving surface + swapchain + debug utils will be in the dozens. Raise it before stage 3, not
+after.
+
+### Stage 3 is built: a real surface on the real window, and a real device chosen
+
+```text
+the window's client area is 1024x576
+vkCreateAndroidSurfaceKHR -> VkResult 0; the guest's VkSurfaceKHR handle is 0x2919292e0c0
+vkEnumeratePhysicalDevices reported 1 device(s):
+    0x2919292e040 -> "NVIDIA GeForce RTX 4060" (VkPhysicalDeviceType 2)
+chosen: queue family 0 of 16 queue(s); memory: 5 type(s) across 3 heap(s)
+    surface: currentExtent 1024x576, minImageCount 2; 7 format(s); present modes [2, 3, 1, 0, ...]
+    263 device extension(s); the guest asked for 189 and got VkResult 5 -- VK_INCOMPLETE, as it must
+vkCreateDevice     -> VkResult 0; the guest's VkDevice handle is 0x2919292e100
+vkGetDeviceQueue   -> the guest's VkQueue handle is 0x2919292e140
+vkGetDeviceProcAddr("vkCreateSwapchainKHR") -> guest thunk 0x29192926e70
+```
+
+Every number there was read out of **guest** memory after a real driver wrote it, from assembled
+ARM64 branching through guest thunks. The `VK_INCOMPLETE` is not contrived: this driver reports 263
+extensions = 68,380 bytes, which does not fit the 64 KB guest arena, so the guest asks for the 189
+that fit and is told so. That is the truncating half of the two-count idiom exercised against a
+real driver, which no test double can establish.
+
+`MAX_PROC_SLOTS` went 64 -> **640**, measured rather than chosen: every entry point the engine can
+ask for must exist as a NUL-terminated string in the binary, because `pName` is the only place the
+API is named, and `libroblox.so` contains **592** distinct `vk[A-Z]...` strings.
+
+**A third rewrite site appeared, and only because it was run.**
+`vkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR")` asked the driver, an NVIDIA driver
+has never heard of that command, and the layer answered its NULL -- one call after telling the
+engine `VK_KHR_android_surface` exists. That is a worse state than not advertising it. It is now
+answered on this layer's authority, **conditional on the driver having the host's own surface entry
+point**, so a host with no WSI still produces NULL and records nothing.
+
+### The `vkMapMemory` answer: neither option, and the premise was wrong
+
+**Recommendation: do not teach `omni-mem` about foreign ranges, and do not bounce. Make the memory
+not foreign** -- allocate it out of `GuestSpace` and import it with `VK_EXT_external_memory_host`.
+
+Measured on this machine:
+
+```text
+VK_EXT_external_memory_host is present (of 263 device extensions)
+minImportedHostPointerAlignment = 4096            (= GuestSpace::page_size())
+vkGetMemoryHostPointerPropertiesEXT(ordinary committed host memory) -> SUCCESS
+  memoryTypeBits = 0xc  -> types 2 and 3, both HOST_VISIBLE | HOST_COHERENT
+vkAllocateMemory(VkImportMemoryHostPointerInfoEXT) -> OK
+vkMapMemory -> 0x1cdb4f89000, and the pointer imported was 0x1cdb4f89000 -- SAME
+```
+
+So `vkMapMemory` returns an address **already inside `GuestSpace`**, `admit` admits it with **zero
+changes to `omni-mem`**, and `HOST_COHERENT` stays genuinely coherent because there is only one
+copy of the bytes.
+
+**Bouncing is not merely wrong here, it is impossible.** This driver's memory types:
+
+```text
+[0] (none)                                        heap 1
+[1] DEVICE_LOCAL                                  heap 0
+[2] HOST_VISIBLE | HOST_COHERENT                  heap 1
+[3] HOST_VISIBLE | HOST_COHERENT | HOST_CACHED    heap 1
+[4] DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT   heap 2
+```
+
+**Every** `HOST_VISIBLE` type is also `HOST_COHERENT`, so the engine is never required to call
+`vkFlushMappedMemoryRanges` and a bounce buffer has no flush point at all. There is no memory type
+on this GPU where the explicit-flush variant would even be legal.
+
+What the import route costs, so it is weighed rather than discovered: it is an **extension**, not
+guaranteed by the specification; the importable set (`0xc`) is a *subset* of the host-visible set,
+so `vkGetPhysicalDeviceMemoryProperties` must mask out the types this layer cannot back -- **a
+Global Constraint 1 rewrite needing its own entry in `Vulkan::rewrites`**, because an engine
+choosing from a list this layer edited is not choosing from the driver's list; device-local,
+non-host-visible allocations need no import and stay ordinary forwards, split at `vkAllocateMemory`
+on the type index the guest already supplies; and guest-space commit charge now covers texture
+uploads, so `GuestSpaceConfig::max_committed` (D15) becomes a streaming ceiling to set deliberately.
+
+### Stage 2: what is trampolining and what is not
+
+**Genuinely trampolining.** D4 identity mapping makes a validated guest pointer a host pointer, and
+Vulkan's structures are fixed by the specification in fixed-width types — `long` never appears, and
+`size_t` is 8 bytes on both aarch64 LP64 and x86-64 Windows LLP64 — so a
+`const VkInstanceCreateInfo *` can go to the host driver unchanged after an `admit` check. Returns
+are `void`, `VkResult` (i32) or a 64-bit handle, all of which `Ret` covers, and the arguments past
+eight that `vkCmdWaitEvents` needs spill to the AAPCS64 overflow area `ImportCall::args()` already
+walks.
+
+**Not trampolining, hardest first:**
+
+1. **`vkMapMemory` — ANSWERED, and the premise as written here was wrong.** See "the `vkMapMemory`
+   answer" above. Neither of the two options this paragraph offered is the recommendation, and the
+   sentence "`admit` refuses it and the guest cannot touch what it was given" is **false**: `admit`
+   governs this layer's own shims, not the guest's loads and stores (D4 amendment 1).
+2. **`vkCreateAndroidSurfaceKHR` has no host counterpart.** On Win32 it is
+   `vkCreateWin32SurfaceKHR`, so the shim reads `VkAndroidSurfaceCreateInfoKHR.window`, resolves
+   that `ANativeWindow *` to the host window behind it, and calls the Win32 path —
+   `ndk::HostWindowSource` publishes only width and height today and must also carry
+   `omni_platform::window::RawWindow`. Paired with it: the instance must be created with
+   `VK_KHR_win32_surface` where the guest asked for `VK_KHR_android_surface`, and
+   `vkEnumerateInstanceExtensionProperties` must **advertise** the Android extension or the engine
+   will never try. Both are substitutions, and a silent rename is the defect class Global
+   Constraint 1 exists for — each needs its own recorded rewrite log.
+3. **Callbacks.** `VkAllocationCallbacks *pAllocator` and any debug messenger are guest function
+   pointers a host driver cannot branch into, and the driver may call `pfnAllocation` on its own
+   worker thread where there is no guest CPU context at all. **Refuse a non-null `pAllocator` and
+   measure whether Roblox passes one** — most engines pass NULL — and build a re-entry trampoline
+   only if it does. Any shim that can re-enter the guest must be `bind_reentrant`; `ImportCall`
+   structurally cannot.
+4. **Handles.** `VkDevice`/`VkQueue`/`VkCommandBuffer` are dispatchable host pointers the driver
+   dereferences, so a wild one from the guest is a host crash reachable from guest data (Global
+   Constraint 11). Each needs a registry like `ndk::handles::Slots`, never a cast.
+5. **`vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` must never return a host function pointer.** The
+   guest branches to what it is given.
+
+**Do not make `omni-gfx` a normal dependency of `omni-android`.** It would push `ash` and
+`libloading` into every build of the adapter on all five targets, and `omni-gfx`'s own manifest
+records `libloading` as a tolerated exception *inside that crate*. Define a `VulkanHost` trait in
+`omni-android` and have `omni-gfx` implement it — the seam shape `AssetSource`, `WindowSource`,
+`ThreadHost` and `HwcapPolicy` all already have, for this exact reason.
 
 ## Be clear-eyed about how far this is from a playable game
 

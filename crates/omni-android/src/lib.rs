@@ -55,6 +55,7 @@ pub mod mem;
 pub mod ndk;
 pub mod region;
 pub mod varargs;
+pub mod vulkan;
 
 pub use bionic::{Activation, Bionic};
 pub use jni::{Jni, JniActivation};
@@ -64,6 +65,8 @@ pub use boundary::{
     Binding, Boundary, BoundaryBuilder, CodeInvalidations, ContextRegistration, Crossings,
     GuestArg, GuestReturn,
     ImportCall, ImportFn, ReentrantCall, ReentrantFn, Slot, ThreadCrossingReport,
+    RUN_LOOP_ITERATIONS, RUN_LOOP_INSTRUCTIONS, RUN_LOOP_LAST_SITE,
+    RUN_LOOP_ENTRIES, RUN_LOOP_LAST_EXIT,
     MAX_EXIT_CROSSINGS, MAX_GUEST_DEPTH,
     MAX_PENDING_INVALIDATIONS,
 };
@@ -71,3 +74,4 @@ pub use error::{AbiError, AbiResult, RefusalText};
 pub use mem::{Blame, GuestMem};
 pub use region::{ThunkRegion, SLOT_BYTES};
 pub use varargs::{GuestVaList, VarArgs, GR_SLOT, VA_LIST_BYTES, VR_SLOT};
+pub use vulkan::{Vulkan, VulkanActivation};

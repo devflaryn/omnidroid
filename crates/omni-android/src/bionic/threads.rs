@@ -65,6 +65,7 @@
 //!   returning — because there is no value to report for a thread that never produced one, and
 //!   `0` with a zero `retval` would be a thread that "returned NULL".
 
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -78,6 +79,7 @@ use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
 
 use super::runtime::ThreadSlot;
+use super::view::GuestView;
 use super::{active, Active, Bionic, MAX_GUEST_THREADS};
 
 // ------------------------------------------------------------------ the guest's constants
@@ -364,6 +366,57 @@ pub(super) struct ThreadRecord {
     pub(super) start_routine: GuestAddr,
 }
 
+/// Where a running guest thread's stack is, as the call that mapped it measured it.
+///
+/// **The four numbers `pthread_getattr_np` is allowed to report**, and each of them is a fact
+/// this layer produced rather than one it read out of the guest: `pthread_create` chose the
+/// size, mapped the range, and dropped the guard to `PROT_NONE` itself.
+///
+/// `base` and `size` describe the **usable** stack — the region above the guard — which is what
+/// POSIX means by `pthread_attr_getstack`'s "lowest addressable byte" and what the thread's `SP`
+/// ranges over: it starts at `base + size` rounded down to sixteen and grows towards `base`. The
+/// guard is reported separately, as its own field, because that is where Linux puts it: below
+/// the stack and outside it. A layer that folded the guard into the size would be telling a
+/// guest it may use a page that faults by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GuestStack {
+    /// The `pthread_t` this stack belongs to.
+    ///
+    /// Carried so that the answer is checked against the identity the caller asked about rather
+    /// than assumed from the host thread it was asked on. The two agree by construction today —
+    /// `adopt` binds exactly one guest identity to the host thread the runner made for it — and
+    /// the comparison is what keeps that an assertion instead of a memory.
+    thread: GuestThreadId,
+    /// The lowest byte the thread may touch: the mapping base plus the guard.
+    base: GuestAddr,
+    /// Bytes above `base`, which is the stack the thread asked for rounded up to a page.
+    size: usize,
+    /// The `PROT_NONE` region below `base`, in bytes. Zero when the attribute object asked for
+    /// no guard, which is a value and not an absence.
+    guard: usize,
+}
+
+thread_local! {
+    /// The stack of the guest thread running on **this host thread**, or `None` on a host thread
+    /// that `pthread_create` did not start.
+    ///
+    /// # Why a thread-local, and what it deliberately cannot answer
+    ///
+    /// A guest thread is one host thread ([`run_guest_thread`]), so "this thread's stack" is
+    /// per-host-thread state and this is where per-host-thread state lives in this crate — the
+    /// same shape as the instance publication `Bionic::activate` uses. It is written once, by
+    /// the runner, between `adopt` and the first guest instruction, and cleared before the stack
+    /// is unmapped, so a value read out of it always names a mapping that is still there.
+    ///
+    /// The cost is stated rather than hidden: **it can only answer for the calling thread.**
+    /// `pthread_create` computes another thread's stack and then lets go of it — no registry
+    /// keeps it — so a `pthread_getattr_np` about a *different* thread is refused by name rather
+    /// than answered from a number this runtime does not have. Recording it in the instance's
+    /// own thread table would be the change that lifts that, and it is a change to
+    /// [`ThreadRecord`], not to this.
+    static THIS_THREADS_STACK: Cell<Option<GuestStack>> = const { Cell::new(None) };
+}
+
 /// One raw `futex` syscall, as [`Bionic::futex_calls`](crate::bionic::Bionic::futex_calls)
 /// records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +540,10 @@ struct Spawn {
     argument: u64,
     /// The whole stack mapping, including its guard, so the thread can give it back.
     stack: (GuestAddr, usize),
+    /// The same mapping split the way a *caller* asks about it — usable region and guard — for
+    /// [`THIS_THREADS_STACK`]. Computed here, where the three numbers that make it are in scope
+    /// together, rather than subtracted back apart in the runner.
+    live: GuestStack,
     /// `SP` at entry: the top of the stack, 16-byte aligned as AAPCS64 requires.
     stack_top: GuestAddr,
     window: u64,
@@ -715,6 +772,15 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         entry,
         argument,
         stack: (stack_base, total),
+        // `stack_base + guard` and `stack_bytes` rather than `total - guard`: the same two
+        // numbers, and this form has no subtraction in it. `total` is `stack_bytes + guard` and
+        // was `checked_add`ed above, so the sum below cannot wrap either.
+        live: GuestStack {
+            thread: slot.id,
+            base: stack_base + guard,
+            size: stack_bytes,
+            guard,
+        },
         stack_top,
         window: host.step_window(),
         also: host.instances().to_vec(),
@@ -777,6 +843,7 @@ fn run_guest_thread(spawn: Spawn) {
         entry,
         argument,
         stack,
+        live,
         stack_top,
         window,
         also,
@@ -792,6 +859,11 @@ fn run_guest_thread(spawn: Spawn) {
             );
         }
         let _activation = bionic.activate_slot(slot);
+        // Where this thread's stack is, published to the thread itself before it runs an
+        // instruction — because `pthread_getattr_np` may be the first thing the start routine
+        // calls, and because this is the last point at which anything holds the numbers. See
+        // [`THIS_THREADS_STACK`] for why the record is per-thread and what that costs.
+        THIS_THREADS_STACK.with(|cell| cell.set(Some(live)));
         // **Everything else the embedding said this thread carries**, published for the thread's
         // whole life. A guest thread missing one does not fail where it is missing: M5's gate
         // measured the game thread dying on `AConfiguration_new` with no NDK instance, which
@@ -832,6 +904,12 @@ fn run_guest_thread(spawn: Spawn) {
     // Give everything back before anyone is told the thread is over, so a `pthread_join` that
     // returns and immediately creates another thread finds the resources free rather than
     // transiently needing two of them. The 16 MiB-plus context is the one that matters.
+    //
+    // The stack record goes first, and before the unmap rather than after it, so that what
+    // [`THIS_THREADS_STACK`] holds is a mapping that exists for the whole time it holds it. This
+    // thread runs no more guest code, so nothing can read it either way -- it is the invariant
+    // that is being kept structural, not a window that is being closed.
+    THIS_THREADS_STACK.with(|cell| cell.set(None));
     let (base, len) = stack;
     // **Recorded rather than swallowed.** A stack that cannot be given back leaks its address
     // space and its commit charge for the life of the instance, and the thread that leaked it is
@@ -886,6 +964,32 @@ fn drive(
             Ok(ExitReason::StepLimitReached { pc: at, .. }) => pc = at,
             Ok(ExitReason::Halted { .. }) => return GuestThreadState::Stopped,
             Ok(other) => return GuestThreadState::Failed(format!("{other:?}")),
+            // **A call refused while this instance is shutting down is the shutdown working, not
+            // a thread this layer killed.**
+            //
+            // `stop_guest_threads` is one-way and is called by an embedding that is tearing the
+            // instance down. A wait that was in progress when it was thrown has no true value to
+            // return -- `ALooper_pollOnce` and this module's socket `poll` both say so and both
+            // refuse -- and that refusal arrives here as an `Err`. Filing it as
+            // `GuestThreadFailure` would put it in the list `VERIFICATION.md` entry 16 defines as
+            // "threads killed by this layer", where it does not belong and where it would sit
+            // beside real ones.
+            //
+            // MEASURED, and this is the run that made the distinction necessary: lifting the wait
+            // cap on a `poll` over a socket (see `net::bounded_wait`) left the client-settings
+            // thread legitimately waiting 69 s, `join_guest_threads` timed out with it still
+            // running, and the fix -- ending the wait on the stop switch -- turned a hang into a
+            // refusal that the gate then read as a killed thread. Both readings were wrong about
+            // the same event.
+            //
+            // **What this hides, stated rather than implied**: a genuine refusal that happens to
+            // land in the window between `stop_guest_threads` and the thread's next window is
+            // filed as `Stopped` too. The window is short and it is only ever open while the
+            // instance is being destroyed, so nothing downstream of it can observe the guest --
+            // but a defect that fires *only* during teardown would not be reported, and that is
+            // the price. The check is `guest_threads_stopping`, which cannot be set by anything
+            // the guest does.
+            Err(_) if bionic.guest_threads_stopping() => return GuestThreadState::Stopped,
             Err(error) => return GuestThreadState::Failed(error.to_string()),
         }
     }
@@ -1022,6 +1126,121 @@ pub(super) fn pthread_getschedparam(c: &mut ImportCall<'_, '_>) -> AbiResult<()>
     call.mem.write_bytes(param_at, &[0u8; SCHED_PARAM_BYTES], call.blame(2))?;
     c.ret().i32(0);
     Ok(())
+}
+
+// ================================================================== pthread_getattr_np
+
+/// `int pthread_getattr_np(pthread_t thid, pthread_attr_t *attr)`
+///
+/// Fills `attr` with the attributes of a **live** thread and returns 0, `ESRCH` for a `pthread_t`
+/// no thread of this instance answers to, or a refusal naming what it would have had to guess.
+///
+/// # What each field is filled from, and why none of it is invented
+///
+/// | field | source |
+/// |---|---|
+/// | stack base | the mapping `pthread_create` made for this thread, **plus its guard** |
+/// | stack size | the size that `pthread_create` rounded up to a page and mapped |
+/// | guard size | the bytes it then dropped to `PROT_NONE` |
+/// | detach state | the instance's own record, read now rather than remembered |
+///
+/// The three stack numbers come from [`THIS_THREADS_STACK`], which the runner publishes to a
+/// guest thread before its first instruction — so they are the numbers this layer *acted on*
+/// when it mapped the stack, not a description of it derived afterwards. The thread's `SP`
+/// starts at `base + size` rounded down to sixteen and grows towards `base`; `base` is above the
+/// guard, which is where POSIX's "lowest addressable byte" is and where a caller checking
+/// whether a pointer is on its own stack needs the boundary to be.
+///
+/// The detach state is read from [`Bionic::guest_thread_list`] on every call rather than carried
+/// beside the stack, because `pthread_detach` can change it after the thread starts. A copy
+/// taken at creation would answer JOINABLE for a thread that had since been detached — a
+/// plausible wrong answer, and the one that makes a caller decide to join something nobody may
+/// join.
+///
+/// # The three answers that are not a filled-in attr, and why each is the honest one
+///
+/// * **`ESRCH` for a `pthread_t` nothing answers to.** POSIX's own error for this function, and
+///   this instance genuinely knows the id is not one of its: the created-thread registry and the
+///   arena's thread table between them hold every identity it has ever handed out. Guest code
+///   has a branch for it.
+/// * **A refusal for a thread that is not the caller.** `pthread_create` computes another
+///   thread's stack and then lets go of it; nothing keeps it, so this layer does not know where
+///   another thread's stack is. The believable wrong answer here is *this* thread's stack with
+///   somebody else's `pthread_t` on the question, which a garbage collector scanning a worker's
+///   stack would follow into the wrong 1 MiB. Lifting it means recording the stack on
+///   [`ThreadRecord`], and the refusal says so.
+/// * **A refusal for a thread this layer did not start.** The main guest thread's stack is the
+///   embedding's: the gate maps it and sets `SP` itself, and no part of `Bionic` is told where
+///   it is. Bionic answers this case by reading `/proc/self/maps`, which is a file this runtime
+///   does not have, and every number that could be put there instead would be a guess about a
+///   mapping somebody else made.
+///
+/// # How it was found
+///
+/// M6's startup run, as an `Unbound` that killed a guest worker: `GuestThreadFailure { thread: 7,
+/// start_routine: 0x27798fa8db0, why: "the guest called the imported symbol `pthread_getattr_np`
+/// through its thunk at 0x277928d3e20, and nothing in the compatibility layer implements it" }`.
+/// The call is at image offset `0x2173df8`, with `0x2173dfc` as the return address.
+///
+/// **Inline, for `pthread_getschedparam`'s reason and not by analogy with the rest of the
+/// family.** It runs no guest code and reaches no `GuestSpace` — it writes 56 bytes of guest
+/// memory, which `memcpy` does from the fast path — so the exit path would cost it three times
+/// as much per call for nothing (D17).
+pub(super) fn pthread_getattr_np(v: &mut GuestView<'_>, thid: u64, attr: u64) -> AbiResult<i32> {
+    let me = v.active.thread;
+    if thid != me.0 {
+        let known = v.active.bionic.knows_guest_thread(thid)
+            || v.active.bionic.threads_table().knows(GuestThreadId(thid));
+        if !known {
+            return Ok(consts::ESRCH);
+        }
+        return Err(v.refusal(format!(
+            "the guest asked pthread_getattr_np about thread {thid:#x}, which this instance did \
+             start but which is not the thread asking. `pthread_create` maps a thread's stack \
+             and then lets go of it -- the stack is recorded on the thread that owns it, so this \
+             layer can report a live stack only for the caller. Answering with the calling \
+             thread's own stack would hand out a 1 MiB range belonging to a different thread, \
+             which is the one wrong answer a caller cannot detect: it is a valid mapping. \
+             Recording the stack on the instance's thread record is what would lift this"
+        )));
+    }
+    // Both halves of the answer, looked up before either is used, so that a missing one names
+    // itself rather than being discovered halfway through writing the guest's attr.
+    let stack = THIS_THREADS_STACK.with(Cell::get).filter(|live| live.thread == me);
+    let detached = v
+        .active
+        .bionic
+        .guest_thread_list()
+        .into_iter()
+        .find(|summary| summary.id == me)
+        .map(|summary| summary.detached);
+    let (Some(stack), Some(detached)) = (stack, detached) else {
+        return Err(v.refusal(format!(
+            "the guest asked pthread_getattr_np about its own thread {thid:#x}, and this \
+             instance did not create it: no stack is recorded for it ({}) and it has no thread \
+             record ({}). A host thread that attached to this instance -- the thread the \
+             initializers and the JNI downcalls run on -- was given its stack by the embedding, \
+             which sets SP itself and tells `Bionic` nothing about the mapping. Bionic answers \
+             this case out of /proc/self/maps, which this runtime does not have; there is no \
+             stack base here to report and inventing one would put a caller's own stack bounds \
+             somewhere they are not",
+            if stack.is_some() { "present" } else { "absent" },
+            if detached.is_some() { "present" } else { "absent" },
+        )));
+    };
+    // Blamed on argument 1, which is the `pthread_attr_t *`: argument 0 is the `pthread_t` and is
+    // not a pointer, so a fault here is always the guest's attr.
+    v.blaming(1);
+    omni_bionic::metadata::attr_from_live_thread(
+        &mut *v,
+        attr,
+        detached,
+        stack.base as u64,
+        stack.size as u64,
+        stack.guard as u64,
+    )
+    .map_err(|fault| v.fault(fault))?;
+    Ok(0)
 }
 
 #[cfg(test)]

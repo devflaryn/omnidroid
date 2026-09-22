@@ -827,6 +827,28 @@ impl GuestSpace {
         Some(RegionInfo::from_entry(start, entry))
     }
 
+    /// Whether the region map's lock is held **right now**, by anyone.
+    ///
+    /// # Why a space needs this and a caller cannot get it any other way
+    ///
+    /// One `Mutex` guards the whole map, and **every** guest memory check goes through it:
+    /// `region_at` is on the path of every bounds check in every import handler, and the pager
+    /// takes it to commit a page on a fault. So a thread that holds it while blocked stops the
+    /// entire runtime, and from outside that looks exactly like the guest having stopped — the
+    /// import census freezes, no guest instructions are executed, and nothing names a lock.
+    ///
+    /// A **fault handler holds it without ever crossing the boundary**, which is what makes this
+    /// invisible to the crossing records: the pager is not an import, so a thread inside it is
+    /// reported as being in guest code.
+    ///
+    /// `try_lock` rather than a flag, so it costs nothing until something asks. It is a
+    /// diagnostic and deliberately not a synchronisation primitive: `false` means only that it
+    /// was free at the instant of the call.
+    #[must_use]
+    pub fn map_lock_is_held(&self) -> bool {
+        self.inner.try_lock().is_none()
+    }
+
     /// What the space currently holds.
     #[must_use]
     pub fn stats(&self) -> SpaceStats {

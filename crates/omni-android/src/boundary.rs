@@ -818,6 +818,16 @@ impl Boundary {
         )
     }
 
+    /// The symbol registered at a thunk address, if this boundary has one there.
+    ///
+    /// Unlike [`slot_at`](Boundary::slot_at) this answers `None` rather than building the typed
+    /// refusal, because its callers are reporting a measurement and an address that is not a slot
+    /// is one of the answers they are asking for.
+    #[must_use]
+    pub fn symbol_at(&self, address: GuestAddr) -> Option<&str> {
+        self.slots.get(&address).map(|slot| slot.symbol.as_str())
+    }
+
     /// The symbol the guest most recently branched into, while the census was on.
     ///
     /// **The one thing that identifies a guest parked inside a handler.** A guest blocked on a
@@ -861,7 +871,26 @@ impl Boundary {
             record.slot.store(slot, Ordering::Relaxed);
             record.caller.store(caller, Ordering::Relaxed);
             record.depth.fetch_add(1, Ordering::Relaxed);
+            // The guest thread id, so a report can be matched against `Bionic::parked`,
+            // `futex_calls` and `guest_thread_list` by **name** rather than by counting rows --
+            // which is how this stall was misread twice. Infallible: a host-initiated call before
+            // `activate` has no instance, and that is ordinary rather than an error.
+            if let Some(thread) = crate::bionic::current_guest_thread() {
+                record.guest_thread.store(thread.0, Ordering::Relaxed);
+            }
         });
+    }
+
+    /// Record that this thread's handler returned. See [`ThreadCrossingReport::exits`].
+    #[inline]
+    fn mark_exit(&self) {
+        if self.census.load(Ordering::Relaxed) {
+            CROSSING.with(|cell| {
+                if let Some(record) = cell.get() {
+                    record.exits.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
     }
 
     /// Where **every** host thread that has crossed this boundary was, at its last crossing.
@@ -897,6 +926,8 @@ impl Boundary {
                     slot,
                     caller: record.caller.load(Ordering::Relaxed),
                     crossings: record.depth.load(Ordering::Relaxed),
+                    exits: record.exits.load(Ordering::Relaxed),
+                    guest_thread: record.guest_thread.load(Ordering::Relaxed),
                 }
             })
             .collect()
@@ -1128,6 +1159,7 @@ impl Boundary {
         limit: RunLimit,
         depth: usize,
     ) -> AbiResult<ExitReason> {
+        RUN_LOOP_ENTRIES.fetch_add(1, Ordering::Relaxed);
         let halt = cpu.halt_handle();
         let mut pc = from;
         let mut crossings = 0u64;
@@ -1147,6 +1179,7 @@ impl Boundary {
         // the run wants it over the run.
         let mut spent = 0u64;
         loop {
+            RUN_LOOP_ITERATIONS.fetch_add(1, Ordering::Relaxed);
             // The containment for a guest that loops through the *exit* path: each crossing returns
             // to Rust, so the backend's own budget never expires. Checked before the run rather than
             // after, so a halt requested while the boundary was servicing a call is honoured before
@@ -1171,6 +1204,7 @@ impl Boundary {
             // overshoot its slice. A counter that wrapped here would turn a bounded run into an
             // unbounded one.
             spent = spent.saturating_add(cpu.last_run_instructions());
+            RUN_LOOP_INSTRUCTIONS.fetch_add(cpu.last_run_instructions(), Ordering::Relaxed);
             let site = match exit {
                 ExitReason::Thunk { pc: site } => site,
                 // **A branch into the region that was not a call to a slot's first instruction.**
@@ -1202,9 +1236,13 @@ impl Boundary {
                 // too, since a fault is *not* resumable and a step limit is, so a caller would have
                 // resumed a faulting guest.
                 ExitReason::StepLimitReached { pc: at, .. } => {
+                    *RUN_LOOP_LAST_EXIT.lock() = "StepLimitReached";
                     return Ok(ExitReason::StepLimitReached { pc: at, executed: spent })
                 }
-                other => return Ok(other),
+                other => {
+                    *RUN_LOOP_LAST_EXIT.lock() = exit_name(&other);
+                    return Ok(other);
+                }
             };
             // An inline handler that failed left its reason here and deferred.
             //
@@ -1235,6 +1273,7 @@ impl Boundary {
                 }
                 remaining = RunLimit::Instructions(left);
             }
+            RUN_LOOP_LAST_SITE.store(site, Ordering::Relaxed);
             crossings += 1;
             pc = self.service_exit(cpu, site, depth)?;
         }
@@ -1289,7 +1328,14 @@ impl Boundary {
                     args,
                     depth,
                 };
-                handler(&mut reentrant)?;
+                let outcome = handler(&mut reentrant);
+                // **Counted here too, and leaving it out made the pair lie.** `count` runs on both
+                // dispatch paths, so a thread that had ever made one re-entrant crossing reported
+                // `crossings > exits` for the rest of the run and every later reading of it said
+                // "inside a handler" whatever the thread was doing. MEASURED: it claimed exactly
+                // that for a thread that was executing guest code, which is the opposite answer.
+                self.mark_exit();
+                outcome?;
                 Ok(resume)
             }
         }
@@ -1359,7 +1405,14 @@ impl Boundary {
             return;
         };
         let mut import = ImportCall { symbol: &slot.symbol, call, mem: &self.mem };
-        if let Err(error) = handler(&mut import) {
+        let outcome = handler(&mut import);
+        // **Counted on the way out, whatever the handler answered.** `crossings` says a thread
+        // reached a symbol; only the pair says whether it is still *in* it. A thread stopped with
+        // `crossings == exits + 1` is blocked inside a handler -- on a host lock, or in a scan
+        // with no bound -- and a thread with `crossings == exits` is stopped in guest code. Those
+        // are completely different problems and nothing else here distinguishes them.
+        self.mark_exit();
+        if let Err(error) = outcome {
             // No return channel from inside the run loop, so the error goes in the thread's channel
             // and the call becomes an ordinary exit at the same address. Nothing is written to the
             // guest's return register, which is the point: Global Constraint 1's failure shape is a
@@ -1395,6 +1448,65 @@ fn inline_trampoline(call: &mut ThunkCall<'_>) {
 
 // --------------------------------------------------------------------------- the two call shapes
 
+/// Iterations of [`Boundary::run`]'s loop, across every thread in the process.
+///
+/// **A heartbeat for the one place a stall can hide from every other counter.** The loop either
+/// runs the guest — which consumes the instruction budget — or services a crossing — which the
+/// census counts. A stall with a frozen census, a budget that never expires and a host thread at
+/// 100% is, by elimination, one of those two not doing what it says; this says which, in one
+/// read, from a thread that holds none of the contexts involved.
+///
+/// Relaxed and process-wide, and unconditional rather than census-gated: it is one increment per
+/// *slice*, not per import, so it is nothing beside the run it measures, and a stall that only
+/// happens with the census off would otherwise have no witness at all.
+pub static RUN_LOOP_ITERATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The thunk address the run loop most recently went round on, and the instructions it has run.
+///
+/// # Why a *site* rather than another total
+///
+/// [`RUN_LOOP_ITERATIONS`] says the loop is turning. It cannot say what it is turning *on*, and
+/// the two candidates need opposite work: a guest looping through one import is a guest bug to be
+/// named, and a loop that turns without reaching an import at all is a defect in this function.
+/// The loop's only path back to the top is an [`ExitReason::Thunk`], so a site recorded here is the
+/// crossing that path went through -- which the census is then obliged to agree with. **MEASURED:
+/// the census stayed frozen at 22,370,858 while the iteration count climbed by 26 million in
+/// twenty seconds, and exactly one of those two readings can be true.**
+///
+/// `RUN_LOOP_INSTRUCTIONS` is the other half: a slice that retires no instruction spends no budget,
+/// which is how a bounded run becomes unbounded without any bound being wrong.
+pub static RUN_LOOP_LAST_SITE: AtomicUsize = AtomicUsize::new(0);
+
+/// Guest instructions the run loop has charged, summed over every slice. See [`RUN_LOOP_LAST_SITE`].
+pub static RUN_LOOP_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times [`Boundary::run`] has been *entered*, against [`RUN_LOOP_ITERATIONS`]'s turns.
+///
+/// **The pair is the discriminator, and one number could not be.** A turn is charged inside the
+/// loop and an entry outside it, so entries ~ turns means the loop runs once per call and whatever
+/// is spinning is the *caller*; turns >> entries means the spin is the loop itself. The first shape
+/// leaves [`RUN_LOOP_LAST_SITE`] stale at whatever crossing last happened, which is exactly how a
+/// site can name `ALooper_pollOnce` while the census, which only a crossing moves, stays frozen.
+pub static RUN_LOOP_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// The name of the last [`ExitReason`] a run returned, for the same reading. `""` until one has.
+pub static RUN_LOOP_LAST_EXIT: parking_lot::Mutex<&'static str> = parking_lot::Mutex::new("");
+
+/// The static name of an exit reason, for [`RUN_LOOP_LAST_EXIT`].
+///
+/// A `match` rather than `Debug`, because the payload is an address that changes every time and the
+/// question this answers is which *shape* of exit keeps coming back.
+fn exit_name(exit: &ExitReason) -> &'static str {
+    match exit {
+        ExitReason::Thunk { .. } => "Thunk",
+        ExitReason::Returned { .. } => "Returned",
+        ExitReason::Halted { .. } => "Halted",
+        ExitReason::StepLimitReached { .. } => "StepLimitReached",
+        ExitReason::MemoryFault { .. } => "MemoryFault",
+        _ => "another exit this layer has no name for",
+    }
+}
+
 /// One host thread's most recent crossing, as the boundary records it.
 ///
 /// Three relaxed atomics rather than a lock, because this is written on every import.
@@ -1403,6 +1515,8 @@ struct ThreadCrossing {
     slot: AtomicUsize,
     caller: AtomicUsize,
     depth: AtomicU64,
+    exits: AtomicU64,
+    guest_thread: AtomicU64,
 }
 
 /// Where one host thread was at its last crossing, as [`Boundary::threads`] reports it.
@@ -1416,7 +1530,23 @@ pub struct ThreadCrossingReport {
     pub caller: GuestAddr,
     /// How many crossings this thread has made. **A frozen count is a stopped thread**, and it
     /// says so without the caller having to sample twice.
+    ///
+    /// It is the thread's **total**, not the count at `slot`: a worker that made twenty million
+    /// crossings and is now waiting for its next task reports twenty million here and a wait
+    /// site in `caller`, and reading that as twenty million waits is exactly the mistake this
+    /// sentence exists to prevent.
     pub crossings: u64,
+    /// How many of those crossings' handlers have **returned**.
+    ///
+    /// **The pair is the measurement, not either number.** `crossings == exits` means the thread
+    /// is in guest code; `crossings == exits + 1` means it is still inside a handler, which is a
+    /// host lock or an unbounded scan and not a guest problem at all. Counted only for the inline
+    /// path, which is where a handler that blocks would block.
+    pub exits: u64,
+    /// The guest `pthread_t` this host thread was running as at that crossing, or `0` if no
+    /// instance was active. **What makes a report matchable** against `Bionic::parked`,
+    /// `futex_calls` and `guest_thread_list`.
+    pub guest_thread: u64,
 }
 
 thread_local! {
@@ -1471,6 +1601,16 @@ impl ImportCall<'_, '_> {
     #[must_use]
     pub fn caller(&self) -> GuestAddr {
         self.call.x(30) as GuestAddr
+    }
+
+    /// The guest's frame pointer, `X29`, for walking the stack above this call.
+    ///
+    /// The same standing as [`caller`](ImportCall::caller) and for the same reason: it is a guest
+    /// value, this layer cannot vouch for it, and the only thing it is used for is a diagnostic
+    /// frame list -- see [`omni_bionic::unwind::frames`], which is what defends the walk.
+    #[must_use]
+    pub fn frame(&self) -> u64 {
+        self.call.x(29)
     }
 
     /// Name this call and an argument, for an error message.
