@@ -14,3 +14,31 @@ publish = false
 # system, and pure computation that must not be able to reach the OS should be somewhere
 # `cargo tree` can prove it cannot (the D19 argument).
 omni-texture = { workspace = true }
+
+# The window this renderer presents to. `omni-platform` is the seam, not an exception to Global
+# Constraint 4: this crate names `omni_platform::window::RawWindow` and no OS type, and has no
+# `cfg(target_os)` anywhere.
+omni-platform = { workspace = true }
+
+thiserror = { workspace = true }
+
+# Vulkan bindings, loaded at **runtime**.
+#
+# `default-features = false` drops `linked`, which would put `vulkan-1.lib` on the link line and
+# make a Vulkan SDK a build requirement for the whole workspace. `loaded` instead resolves
+# `vulkan-1.dll`/`libvulkan.so.1` with `dlopen` at `Entry::load()` time, so a machine with no
+# Vulkan at all still *builds* Omnidroid and refuses at run time with a message
+# (`GfxError::LoaderMissing`) rather than failing to link.
+#
+# `debug` is on because it is what gives `vk::Result` and the info structs their `Debug`/`Display`
+# impls, and this crate's errors quote them. Without it a driver failure prints as a bare integer.
+#
+# **The Global Constraint 4 question, answered rather than skipped.** `loaded` pulls `libloading`,
+# which does call `LoadLibraryExW`/`dlopen`. That is an OS call reached from outside
+# `omni-platform`, and the honest reading is that it is a *documented exception* rather than
+# compliance: D8 puts the Vulkan driver in this crate, and the alternative — an `omni-platform`
+# dynamic-loading seam plus hand-written signatures for the ~90 entry points this renderer uses —
+# would move one `dlopen` behind the seam at the cost of a second, unverifiable copy of Vulkan's
+# ABI. The constraint's purpose is that the five-target build stays `cfg`-free, and `ash` is
+# `cfg`-free at every call site here.
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }

@@ -1,16 +1,66 @@
 //! Renderer abstraction and the guest-facing `libvulkan.so`/EGL/GLES surfaces (D8).
 //!
-//! Still almost empty: created by M0 task 1 so later tasks have somewhere to land, and graphics
-//! work itself starts at M6.
+//! # What is here now
 //!
-//! The one thing here is the re-export of [`omni_texture`], the runtime transcoder for the
-//! compressed texture formats the guest uses and the host GPU cannot sample. It is a separate
-//! crate rather than a module: the host supports neither ETC2 nor ASTC
-//! (`docs/research/graphics-spike.md` §3), the APK ships 38 ETC1 textures
-//! (`tools/texture_census.py`), and decoding them is pure computation that must not be able to
-//! reach the OS -- which `cargo tree -p omni-texture -e normal` being one line makes checkable
-//! rather than conventional, exactly as D19 argued for `omni-bionic`. The renderer will call it
-//! from `glCompressedTexImage2D`; the guest hands over `GL_ETC1_RGB8_OES` and gets RGBA8 back.
+//! [`vulkan`] — a real Vulkan renderer over `omni_platform::window`: instance, physical-device
+//! selection, logical device, a `VK_KHR_win32_surface` swapchain with correct recreation on
+//! resize, and two ways to put a frame on the screen ([`vulkan::Renderer::present_clear`] and
+//! [`vulkan::Renderer::present_rgba8`]). It is the **host side** of D8 — the device and the
+//! present loop the guest-facing forwarding layer will be built on top of, not that layer itself.
+//!
+//! [`select`] — every choice the renderer makes, as pure functions over what the driver reported,
+//! so that a machine with no GPU can still test them and a machine with one GPU can be tested
+//! against tables from GPUs nobody here has.
+//!
+//! [`image`] — the RGBA8 frame type. Its format is not a preference: D27 scoped texture
+//! transcoding to `GL_ETC1_RGB8_OES` decoded to RGBA8, because this host's GPU samples **neither
+//! ETC2 nor ASTC** (`docs/research/graphics-spike.md` §3, both families measured), so RGBA8 is
+//! what arrives.
+//!
+//! # Two host facts this crate is written around, both measured
+//!
+//! **There are no validation layers on this machine.**
+//! `vkEnumerateInstanceLayerProperties` reports five layers and `VK_LAYER_KHRONOS_validation` is
+//! not among them (spike §6). [`vulkan::Renderer`] enables it when it is present and never
+//! requires it — but every lifetime and every layout transition in that file is written as though
+//! nothing will ever report a mistake, because here nothing will. The spike's own swapchain
+//! use-after-free produced **zero** diagnostic output and crashed the NVIDIA driver instead.
+//!
+//! **Vulkan is loaded at run time, not linked.** `ash` with `default-features = false` and
+//! `loaded` means no Vulkan SDK is needed to build the workspace, and a host with no Vulkan at all
+//! gets [`error::GfxError::LoaderMissing`] rather than a link error. `Cargo.toml` records why that
+//! is worth the one Global Constraint 4 exception it costs.
+//!
+//! # What is deliberately absent
+//!
+//! No shaders, no `VkPipeline`, no SPIR-V, and therefore no shader compiler in the build. The
+//! present path is `vkCmdClearColorImage` and `vkCmdBlitImage`. D8 records that Roblox ships
+//! **1,364 SPIR-V modules** of its own; the shaders this project runs will be the guest's, and a
+//! triangle of our own would only have added a second source of them. See [`vulkan`].
+//!
+//! No EGL or GLES surface yet. D8 requires those symbols to *resolve*, because `libroblox.so`
+//! hard-links 91 EGL+GL imports through `DT_NEEDED` and will not load otherwise — but resolving
+//! them is a link-time requirement of `omni-android`'s import table, not a rendering requirement
+//! of this crate.
+
+#![warn(missing_docs)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+pub mod error;
+pub mod image;
+pub mod select;
+pub mod vulkan;
+
+pub use crate::error::{GfxError, GfxResult, VkError};
+pub use crate::image::Rgba8Image;
+pub use crate::select::PresentMode;
+pub use crate::vulkan::{FrameOutcome, Renderer, RendererConfig};
 
 /// The texture transcoder. See [`omni_texture`] for the census that scoped it to one format.
+///
+/// A separate crate rather than a module, and D19's argument is why: `omni-gfx` transitively links
+/// Vulkan and the windowing system, and pure computation that must not be able to reach the OS
+/// belongs where `cargo tree -p omni-texture -e normal` can prove it cannot. The renderer will
+/// call it from `glCompressedTexImage2D`; the guest hands over `GL_ETC1_RGB8_OES` and gets RGBA8
+/// back — which is exactly what [`Rgba8Image`] accepts.
 pub use omni_texture;

@@ -32,8 +32,13 @@
 //!   hostile cases. Fifteen of its seventeen operations are `std::fs` and are implemented once;
 //!   `pread` and `statvfs` have a Windows backend and a structural unix one naming `pread(2)`
 //!   and `statvfs(3)`.
+//! * [`window`] — a resizable desktop window, the handle a graphics backend puts a surface on,
+//!   and a **non-blocking** drain of input and lifecycle events. Implemented and run on Windows;
+//!   structural on Linux and macOS, where the window type is literally uninhabited so that the
+//!   compiler discharges every operation but the one that refuses. M6's renderer is its only
+//!   consumer today; GameActivity's input callbacks are the other one it exists for.
 //!
-//! Threads, dynamic loading and windowing may arrive as sibling modules in later tasks.
+//! Threads and dynamic loading may arrive as sibling modules in later tasks.
 //! **Sockets deliberately did not.** M3 task 3's network phase found that the four socket-shaped
 //! symbols the guest reaches either need no OS call at all (`poll` and `select`, whose whole
 //! descriptor domain is [`fs`]'s and whose answer POSIX fixes for it) or must be refused by name
@@ -77,3 +82,4 @@ pub mod fs;
 pub mod log;
 pub mod process;
 pub mod vm;
+pub mod window;

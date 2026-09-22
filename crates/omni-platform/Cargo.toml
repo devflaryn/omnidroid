@@ -31,4 +31,13 @@ windows-sys = { workspace = true, features = [
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # The window seam (src/window/windows.rs). `Win32_Graphics_Gdi` is not for drawing: `WNDCLASSW`
+    # carries an `HBRUSH` background field, so the struct itself is behind that feature even when
+    # the brush is null -- which it is, because the swapchain owns every pixel of the client area.
+    # `Win32_UI_HiDpi` is one call, `SetProcessDpiAwarenessContext`, without which `GetClientRect`
+    # reports virtualised pixels on a scaled display and every swapchain extent is wrong.
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
