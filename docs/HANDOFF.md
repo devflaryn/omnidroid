@@ -1035,29 +1035,57 @@ harnesses bind a `Vulkan` and the other embeddings stay at 4096.
    *statement* and `std::sync::Mutex` is not reentrant. Every assertion had already passed — it
    hung in teardown.
 
-## The two things between here and a real Roblox frame
+## What is between here and a real Roblox frame — CURRENT
 
-**1. `HTTP 400` on the client-settings request.** The transport is proven; the *request* is
-malformed. This is not optional and the reason is decoded: the success path at guest `0x02bd5560`
-calls `continueAfterFlagsLoaded_` (`0x02bd3b58`), which writes the byte at `DataModel + 0x289` at
-`0x02bd3be4`; the **failure** path at `0x02bd569c` writes state `0xb` and goes elsewhere. That byte
-is tested at `0x02bd307c` and is the only thing gating `nativeActivity_onSurfaceChanged` -- until it
-is 1 the engine returns without touching the window and **no frame is possible**. It is also why
-Roblox shows a Java-side "check your connection" screen offline rather than rendering.
+**Both of the things this section used to name are done.** The `HTTP 400` is fixed and the fetch
+completes; Vulkan stage 5 is built and verified to a textured triangle. What follows is the live
+list, and it is short because the gate names each item by failing on it.
 
-The binary has `apiKey=%s` at `0x5a1188` and `/v2/settings/application/{}` at `0x38c7a2`. The gate
-supplies `CLIENT_SETTINGS = {"applicationSettings":{}}` -- an **empty** document where a device's
-Java side supplies a real one.
+**1. The gate is RED on two guest-thread deaths**, both in post-flags code that no run reached
+before the settings fix:
 
-> **The line not to cross here.** Anything the host supplies must be read out of the APK, decoded
-> from the binary as a constant the engine already carries, a truthful statement about this host,
-> or asked of an embedding through a seam with no default. If the only route to a valid request is
-> a credential this project does not have, that is a real answer and belongs in this file -- not a
-> fabricated key.
+* `GetStaticObjectField` refused on `com/roblox/protocols/systemdialog/
+  PlatformSystemDialogHandler.INSTANCE` — a `classes.rs` question, §8 row 23 territory.
+* `MemoryFault { pc: 2399330234196, address: 2400510558208, access: Read }` on guest thread 22.
+  **Not a refusal**, uninvestigated, and the more interesting of the two.
 
-**2. Vulkan stage 5: memory and resources.** Everything between "I have a device" and "I can draw":
-device memory, buffers, images, shaders, pipelines, descriptors, and the recording commands a draw
-needs. The memory design is settled and measured -- see "The `vkMapMemory` answer".
+**2. `nativeGameGlobalInit` (§8 row 22) does not return within 180 s**, so the gate never delivers a
+window afterwards and **whether the engine ever accepts the surface has never been observed.** The
+instrument is in place — the `Flags-Not-Received` count either side of the post-fetch delivery — and
+it has never been reached. Establishing that verdict is the single most valuable next measurement,
+because everything downstream of it is graphics work that is already built and waiting.
+
+**3. Then the engine's own renderer.** Stages 1-5 cover the mechanism; what the engine actually
+calls, in what order, is recorded by `Vulkan::names()` the first run that gets there. Expect the
+census to name entry points stage 5 deliberately did not implement, and expect that list to be
+short — everything structural is there.
+
+**Do not re-investigate:** the settings fetch (it completes, 1,358,053 bytes in 3.08 s), TLS (it
+works, and the HTTP inside it is encrypted and not visible to any recorder), the Vulkan loader,
+instance, surface, device, swapchain, presentation or memory route (all live-verified against a
+real driver), or the `ALooper_pollOnce(-1)` question.
+
+## After the first frame — the goal is not a frame
+
+A single presented frame is **not** the finish line and the goal says so explicitly. The work does
+not stop there, and planning as though it does is how a runtime ends up with a screenshot instead of
+a game:
+
+* **Continuous frames.** One frame proves a path; frames continuing prove the path is stable under
+  the engine's own pacing, its swapchain recreation, and a resized window.
+* **Input.** §8 row 26: the engine's own path is
+  `NativeInputInterface.nativePassInput(IFFIII)` / `nativePassInputBatch([I[FIIII)` from the host's
+  pointer events — **not** necessarily `onTouchEventNative`. `omni_platform::window::WindowEvent`
+  already carries what the host delivers; nothing wires it to the guest yet.
+* **Reaching the game.** Login and joining a server are further network work on a seam that now
+  exists. D30 permits it.
+* **Optimisation, and it is not cosmetic.** The game thread spins `ALooper_pollOnce` ~230 M times
+  and `sched_yield` ~20 M times per run; it has been visible for several milestones and mattered
+  the moment a megabyte had to be downloaded past it. It will matter again when frames are being
+  produced. Measure before changing anything — this project has twice been wrong about what the
+  spin was costing.
+* **Survival.** The goal asks for long enough to prove it is interactive. Teardown, leak behaviour
+  and the commit ceiling (D15, which now covers texture uploads) all become real at that point.
 
 
 ## The immediate blocker: the engine will not take the surface until the flags have arrived
