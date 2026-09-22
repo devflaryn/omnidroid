@@ -1,6 +1,6 @@
 # Handoff
 
-Written 2026-09-19, current as of **2026-09-22, mid-M6**. This file is a pointer and a state
+Written 2026-09-19, current as of **2026-09-22, late M6**. This file is a pointer and a state
 snapshot, not a history. The durable sources of truth are `docs/ARCHITECTURE.md`,
 `docs/DECISIONS.md`, `docs/STATUS.md`, **`docs/VERIFICATION.md`**, the M3 plan and ledger, and git
 history.
@@ -30,8 +30,9 @@ adapter review were exactly that.
 | **13** | **M5 — reached** | `initializeNativeCode` returns a `NativeCode *` on the real engine. Record: **D29** |
 | 14 | **M5 — reached** | the game thread runs `android_app_entry`, and §8 row 14's cond-wait completes |
 | 15 | **reached** | the game thread runs `android_main` → `NativeEngine::GameLoop()` |
-| 16-20 | **M6 — next, and the live blocker** | the GameActivity callbacks. `ANativeWindow` exists (**five** symbols in this binary, not §4.4's nine); **nothing drives the callbacks that post `APP_CMD_*` down the pipe**, which is why the game thread sits in `ALooper_pollOnce(-1)` |
-| 21-24 | M6 | the flags/settings orchestration — **§8.1 says this is the step most likely to be mistaken for "the engine is broken"**, because it hangs rather than errors |
+| 16-20 | **M6 — reached** | all seven lifecycle/surface natives return, and the engine logs `APP_CMD_INIT_WINDOW: hasWindow = true` through `APP_CMD_CONTENT_RECT_CHANGED`. `ALooper_pollOnce(-1)` now waits instead of refusing, on a measured wake source |
+| **21-22** | **M6 — the live blocker** | driven (`script::FLAGS_AND_START`), and `nativeInitClientSettings` reaches the engine's settings parser — then spins on a guest lock held since §8 step 7 by one of two workers stranded in a raw `futex` wait. **§8.1's sixth failure mode, and it hangs rather than errors** |
+| 23-24 | M6 | the rest of the flags/settings orchestration, unreached |
 | 25 | **M6/M7 — essentially unbuilt** | EGL (17 hard-linked symbols, **0 bound**) then Vulkan via `dlopen` (**0 `vk*` imports**). `omni-gfx` is a 16-line stub that nothing depends on |
 | 26 | M7/M8 | input, first frame, interactive |
 
@@ -84,7 +85,7 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 > **Superseded — the current figures are in the `Verification state` section under `# START HERE`
 > at the end of this file.** Kept here for the shape of the history. As of 2026-09-22 it is
-> **1,388 passing / 0 failing / 17 ignored** across 113 targets, and `tools/mutate.py` holds **446**
+> **1,404 passing / 0 failing / 17 ignored** across 114 targets, and `tools/mutate.py` holds **446**
 > rows with gate 1 clean; the full table has **not** been run in one pass since it was 393.
 
 **1,328 passing, 0 failing, 17 ignored** (`cargo test --workspace --release`, after M5). The two
@@ -901,11 +902,106 @@ Read in this order:
 `cargo test -p omni-android --release --test gameactivity` is the gate, and it is **green**. It
 loads the real APK, runs all 3,594 initializers, `JNI_OnLoad`, §8 steps 7-12, then
 `Java_com_google_androidgamesdk_GameActivity_initializeNativeCode`, which returns a non-zero
-`NativeCode *`. The game thread then runs `android_app_entry` → `android_main` →
-`NativeEngine::GameLoop()`, calls `MainGameActivity.getNativeHelper()` → `bootstrapTheApp()`, and
-**stops inside `ALooper_pollOnce(-1)`**, which this layer refuses by name.
+`NativeCode *`. The game thread runs `android_app_entry` → `android_main` →
+`NativeEngine::GameLoop()` → `bootstrapTheApp()` → `ALooper_pollOnce(-1)`.
 
-**That refusal is the frontier.** Everything below is about crossing it.
+**That wait now happens instead of being refused, and §8 rows 17-20 all land.** The gate drives
+them from its own main thread, the way ART would, and the engine answers by name:
+
+```text
+APP_CMD_INIT_WINDOW: hasWindow = true, hasFocus = false
+APP_CMD_WINDOW_RESIZED / APP_CMD_START / APP_CMD_RESUME
+APP_CMD_GAINED_FOCUS / APP_CMD_CONTENT_RECT_CHANGED
+nativeActivity_onSurfaceChanged: ... Flags-Not-Received. Return.
+```
+
+That last line is §8.1's **sixth** failure mode arriving exactly where it says it will. The engine
+will not ask for a renderer until the flags phase has run, so **the frontier is §8 rows 21-22, not
+graphics**, and a run that stops here looks like a graphics problem from outside and is not one.
+
+## The immediate blocker: two stranded workers behind one spin lock
+
+§8 row 21's `nativeInitClientSettings` reaches the engine's settings parser and then **spins
+for its whole 200,000,000-instruction budget** at guest `0x021eba20` — the `yield` of a
+three-instruction `ldr`/`cbz`/`yield` spin whose acquire is `swap(1, 0x06dd0a30)` through the
+outline-atomic helper at `0x032f0950`.
+
+`stall_report` in the gate prints the whole diagnosis in one place:
+
+```text
+spin lock 0x1 count 0x1 | import crossings 24823417 -> 24823417 (FROZEN) | live threads 2
+  thread 0x2: start routine link 0x284d168, running true
+  thread 0x3: start routine link 0x284d168, running true
+  thread 0x4: start routine link 0x621bdbc, running FALSE
+  futex: 3 wait(s), 42536 wake(s), 2 with no deadline; cond-parked []
+  parked on ...d0c x1: the word reads Ok(0)
+  parked on ...40c x1: the word reads Ok(0)
+  thread 0x2 FUTEX_WAIT_BITSET on ...d0c value 0 from guest link 0x284d134 -> ENTERED AND NEVER RETURNED
+  thread 0x3 FUTEX_WAIT_BITSET on ...40c value 0 from guest link 0x284d134 -> ENTERED AND NEVER RETURNED
+```
+
+Read it in this order, because that is the order it narrows:
+
+* **The lock has been held since §8 step 7**, `JNIBaseUrlProtocol.init`. It is `0` before the
+  initializers, `0` after all 3,594, `0` after `JNI_OnLoad`, and `1` from the first step-7
+  downcall onwards. Its refcount at `0x06dd0a34` is `1`, and that word is only incremented at
+  `0x0600f6dc` — **inside** the critical section — so the holder is inside `0x0600f6c4`'s
+  first-entry path, which is `bl 0x01dc7428`.
+* **Import crossings are frozen.** No guest thread is executing anything.
+* **Two guest threads are stranded in a raw `futex` wait**, both from `0x0284d130`:
+
+  ```text
+  0x284d114: add x1, x19, #4     ; the word is obj + 4
+  0x284d118: mov w0, #0x62       ; 98 = SYS_futex
+  0x284d11c: mov w2, #0x89       ; FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG
+  0x284d124: mov x4, xzr         ; timeout NULL -- indefinite, by the guest's own choice
+  0x284d12c: mov w6, #-1         ; FUTEX_BITSET_MATCH_ANY
+  ```
+
+  This layer honours that correctly; the wait is exactly what the guest asked for.
+* **It is not a lost wake.** Both words still read the value the waiters parked expecting (`0`),
+  and a scan of all 28 raw `syscall` sites finds the wake side — five
+  `FUTEX_WAKE_BITSET|PRIVATE` (`0x8a`) at `0x2856274`..`0x2857078` and one `FUTEX_WAKE|PRIVATE`
+  at `0x61a34d0` — **none of which ran**. They are idle workers on a queue nothing posted to.
+* **Thread `0x4` finished**, normally: `guest_thread_failures()` is empty.
+
+So the chain is: **two stranded workers → a held lock → no client settings → no flags → the engine
+never asks for a renderer.**
+
+**Forcing the lock word to `0` carries row 21 straight past it** (an experiment, deliberately not
+committed) — it then reached `eventfd`, which is why `eventfd` is now implemented. That is the
+proof that the lock is the only thing in the way, and it is also the thing not to ship: freeing a
+lock somebody holds is how a deadlock becomes a data race.
+
+### What has been ruled out, so nobody repeats it
+
+* **`STLR` works.** `stlr wzr, [xN]` was tested directly at the CPU level and writes zero; the
+  release instruction at `0x021eba84` is not the problem.
+* **Callee-saved registers survive a nested guest call.** `SavedState` captures and restores all
+  31 `X`, all 32 `V`, `SP`, `PC` and `NZCV` on every path, so a clobbered `x20` is not why the
+  release could have gone to the wrong address.
+* **No `pthread_create` was lost.** Three crossings, three registered threads.
+* **The processor count is the host's real one**, so the pool is not sized from a number this
+  layer invented.
+* **Every `omni-bionic` futex wait is bounded** (50 ms or 1 s slices, re-checking the predicate),
+  so a lost wake *there* self-heals. `AddressFutex::indefinite_parks()` reports exactly `2`, and
+  both are the raw syscalls above.
+
+### Where to pick it up
+
+The open question is one thing only: **what should have posted work to those two workers, and why
+did it not run.** The tools to answer it are now in the tree and are what found everything above:
+
+* `Bionic::guest_thread_list` — which threads exist, what each runs, whether it has finished.
+* `Bionic::futex_calls` — every raw `futex` syscall with its guest thread and **call site**,
+  recorded *on the way in* so a call that never returns is still in the list.
+* `AddressFutex::parked_addresses`, `::indefinite_parks`.
+* `ImportCall::caller` — `X30`, the guest address a call returns to.
+* `stall_report` in `tests/gameactivity.rs`, which prints all of it.
+
+The two temporary probes in the gate — `SPIN_LOCK_OFFSET` and `FLAGS_LOADED_OFFSET` — are marked
+as such and both were decoded to exactly one address; `FLAGS_LOADED_OFFSET` has **one** `STRB` in
+the whole 109 MB binary and the TaskScheduler fatal is its only reader's only message.
 
 ## Be clear-eyed about how far this is from a playable game
 
@@ -936,106 +1032,75 @@ is. Row 25 is where the engine *asks for graphics* — it is the door, not the r
 So: M6 (a Vulkan or GLES device created through the forwarding layer), M7 (first frame presented)
 and M8 (interactive) are all ahead, and M6 has barely begun. Plan in those terms.
 
-## The immediate blocker, and why it is not what it looks like
+## What the last session changed (7 commits, `8a5d372..HEAD`)
 
-`ALooper_pollOnce(-1)` refuses with: *"a wait with no deadline cannot be ended by anything this
-runtime has… what changes this is a host-driven event source, which M6 needs anyway."*
+**`ALooper_pollOnce(-1)` is allowed, on a fact rather than a policy.** The refusal's premise —
+"nothing could ever wake it" — is conditional, and the call can now test it:
+`Filesystem::pipe_writers` counts the descriptors still holding a pipe's write end, and an
+indefinite wait is allowed exactly when one of the looper's own registrations has one. When none
+does the refusal stands and now names every watched descriptor with the count that decided it.
+The wait is sliced at 50 ms and re-reads the stop switch — **below the deadline test, not above
+it**: `pollOnce(0)` is a poll and not a wait, and with the two the other way round teardown turned
+every zero-timeout poll on the game thread into a refusal.
 
-**That premise is now false, and this is the single most important thing this handoff carries.**
-The game thread is not stuck — it is *correctly* blocked, waiting for the **main thread** to post
-`APP_CMD_INIT_WINDOW` down the pipe the glue created. On a device, the thing that writes to that
-pipe is §8 steps 16-20: `setInputConnectionNative`, `onSurfaceCreatedNative`,
-`onSurfaceChangedNative`, `onStartNative`, `onResumeNative`, `onWindowFocusChangedNative`,
-`onContentRectChangedNative`, `onWindowInsetsChangedNative`. **None of them has a driver yet.**
+**§8 rows 17-20 are driven from the gate's main thread.** The 23 non-exported `GameActivity`
+natives come from what the engine's own `RegisterNatives` bound (all 24 are recorded), and the
+`jlong` handle sits in `x2` whether they are static or instance — so the caller never has to
+establish which, a distinction `RegisterNatives` does not carry. The row loop **stops at the first
+failure**: these natives hold the glue's own mutex across the call, so a refusal abandons it and
+the next row deadlocks on it. MEASURED — that is how the `pthread_cond_timedwait` gap presented.
 
-So the work is not "make an indefinite wait safe". It is:
+**The A64 hint instructions are no longer "unsupported".** `YIELD` stopped the guest; it is a hint
+the architecture lets an implementation execute as a `NOP`, and `libroblox.so` spins on one at
+`0x021eba20`. It reached a callback because of an upstream defect, decoded rather than guessed:
+`backend/x64/a64_interface.cpp:273` builds the translator's options from **two** of a three-member
+aggregate, so `TranslationOptions::hook_hint_instructions` keeps its declared default of `true`
+whatever `DynarmicOptions` asks for. The A32 paths do forward it. Handled in the callback rather
+than patched into the vendored tree, because the arm is correct either way.
 
-1. **Drive steps 16-20 from the gate's main thread**, which is what ART would do. These are
-   *exported* natives taking the `jlong` handle; call them the way step 13 is called.
-2. **Then** let `pollOnce(-1)` block, under a condition that is a fact rather than a cap: an
-   indefinite poll is legitimate exactly when the looper watches a descriptor that *something in
-   this runtime can still write* — a pipe whose write end is held by a live thread. If no such
-   descriptor exists, the wait genuinely cannot end and the refusal is still right.
-3. The stop path already exists. `Bionic::stop_guest_threads` + `join_guest_threads` and the
-   stoppable futex (`AddressFutex::stop`) were built for exactly this, and D16's step budget does
-   not tick for a sleeping thread.
+**Four new bindings**, each in `BEYOND_THE_PREDICTION` with how it was found.
+`pthread_cond_timedwait` was found as an `Unbound` inside `onStartNative` and then decoded at
+`0x0285f7ec` — the glue's `android_app_set_activity_state`, an absolute `CLOCK_REALTIME` deadline
+two seconds out, whose `cmp w0, #0x6e` is the guest's own agreement with `omni_bionic`'s
+`ETIMEDOUT`. The clock is read back from the cond through `cond::clock_of` rather than assumed.
+`sched_get_priority_max` was the next `Unbound`; `sched_get_priority_min` and `sched_setscheduler`
+were added by decoding their call sites, **and the ledger says so** — `_min` has not yet been
+reached by a run and its entry states that rather than implying otherwise.
 
-**Expect §8.1's sixth failure mode here.** Steps 21-24 *hang rather than error* and are "the step
-most likely to be mistaken for the engine being broken". The gate's 180-second watchdog prints
-`parked()`, the looper log and the JNI misses, then exits 101 — that output is the diagnosis, so
-keep it and read it rather than re-running.
+**`eventfd` is a descriptor kind, not a refusal.** Its own refusal named what would end it: the
+table had no kind that could carry a counter with a destructive read. `Entry::readiness` having no
+default arm is what made adding one a decision — it refused to compile until `pread` and `fstat`
+had answers too.
 
-## What the last session changed (25 commits, `440bb2b..8a5d372`)
+**The diagnostics that found the stall**, all new: `Bionic::guest_thread_list`,
+`Bionic::futex_calls` (recorded **on the way in**, because a record written on the way out is
+written by every call except the ones that matter), `AddressFutex::parked_addresses`,
+`AddressFutex::indefinite_parks`, `ImportCall::caller`, and `stall_report` in the gate.
 
-**M6 work landed:** `ANativeWindow` (five symbols, arena handles, geometry refused until decided);
-the raw `futex` syscall (`SYS_FUTEX` 98) — which removed both `syscall 98` guest-thread deaths and
-exposed that parked threads never saw the stop switch; and the superclass chain in the JNI
-registry.
-
-**The null `jmethodID` is fixed and the diagnosis is worth reading.** `CallObjectMethodV` got `0x0`
-at guest pc `0x02bd8cac`, from a `GetMethodID` at `0x02bdad0c` asking
-`com/google/androidgamesdk/GameActivity` for `getResources()Landroid/content/res/Resources;` —
-with **no `cbz` between them**, §8.1's third failure mode exactly. The member is declared on
-`android/content/Context`; the registry had no superclass chain. `Registry::method`/`field` now
-walk one, with a two-edge `EXTENDS` table; `declared_method`/`declared_field` keep the non-walking
-semantics that `RegisterNatives` and the generated-surface merge need.
-
-> **The premise that investigation started from was wrong, and the lesson generalises.**
-> `Jni::misses` was empty, which read as "the member *is* declared, so the *answer* is missing".
-> It was empty because `report()` runs the instant step 13 returns — **before `android_main` has
-> run at all**. Measured after `join_guest_threads`, misses = 1 and it named the member. A census
-> taken before the work happens is not evidence that the work succeeded.
-
-**Four review findings closed:** M1 (validate the guest buffer before the descriptor is touched) in
-`files.rs` *and* its second instance in the `FILE *` layer; the stale-`errno` finding across twelve
-reporting sites; and **W1** — `__android_log_print` now truncates where a device truncates instead
-of aborting the run.
-
-**One defect found by review, not by a test:** eight `expect`s in `ndk/looper.rs` and
-`ndk/window.rs` were justified by a liveness check made under a lock that had **already been
-released**. `VERIFICATION.md` entry 13. It was found by reviewing the *copy* (`window.rs`) rather
-than the original — a second instance is the first time reasoning gets read instead of remembered.
+> **One operational hazard worth knowing.** The gate's watchdog ends a hung run with
+> `std::process::exit(101)`, which skips every `Drop` — so each hung run leaves its ~104 MB
+> extracted-library scratch directory behind in `%TEMP%`. Enough of them filled a 930 GB disk
+> during this session and cargo failed with `os error 112`. `%TEMP%\omni-*` is safe to delete
+> between runs.
 
 ## Verification state
 
-**1,388 passing, 0 failing, 17 ignored** across 113 targets (`cargo test --workspace --release`).
-Was 1,232 at the start of the last session.
+**1,404 passing, 0 failing, 17 ignored** across 114 targets (`cargo test --workspace --release`).
+Was 1,388 at the start of the session. Clippy is clean at `-D warnings` across all targets, and
+`cargo doc` adds no warning in any file this session touched.
 
-**`tools/mutate.py` holds 446 rows.** Gate 1 (every `old` matches its file exactly once) is clean
-across all 446, checked with the harness's own `read_exactly`/`as_written`.
+**`tools/mutate.py` still holds 446 rows, and nothing was added to it this session.** That is the
+largest outstanding debt and it has grown: the M6 work landed sixteen new tests and five new
+observable behaviours with no mutation rows behind them. The carried-forward debt is unchanged and
+now has company:
 
-53 rows were added last session and run by prefix. **Both pre-flight gates passed for every
-prefix**, and every row was caught:
-
-| prefix | rows | what it defends | status |
-|---|---|---|---|
-| `window-` | 8 | `ANativeWindow` | 8/8 caught, clean run |
-| `order-` | 6 | M1's order in `files.rs` | 6/6 caught, clean run |
-| `errno-` | 7 | the reason a stream failure gives | 7/7 caught, clean run |
-| `lock-` | 2 | the `pollOnce` callback arm | 2/2 caught, clean run |
-| `trunc-` | 13 | W1's truncation | 13/13 caught, clean run |
-| `sorder-` | 10 | M1's order in the `FILE *` layer | 10/10 caught — **but see below** |
-| `jmid-` | 7 | the superclass chain | 7/7 caught — **but see below** |
-
-> **`sorder-` and `jmid-` must be re-run before they count.** Four `sorder-B` rows were caught with
-> the harness unable to name a failing test, three of them in 0 s. And the `jmid-` run overlapped a
-> concurrent `cargo` invocation and a hand-applied mutation — my error, recorded in rule 4. Nothing
-> was lost and the tree is verified identical to `HEAD`, but results produced under that overlap
-> are worth exactly that much. **Re-run `--only sorder` and `--only jmid` on an exclusive tree.**
->
-> **The whole 446-row table has never been run in one pass.** That is the largest outstanding
-> verification debt.
-
-**Two process incidents, both recorded, both mine:**
-
-* A **live mutation was committed** in `1df08fb` — the second time in this project. The path was
-  explicit and the numstat was checked; neither helped, because the *contents* were wrong while the
-  count was right. Restored in `d17c0a5`. Rule 2 now says: read the staged **diff**, and when the
-  diff disagrees with the prose you just wrote, the diff is the tree.
-* A background shell was reaped for memory pressure and **the harness kept running as an orphaned
-  child**. One clean `git status` immediately afterwards was believed and was wrong — it was clean
-  because the run was *between rows*. Rule 4 now says to confirm the *process* is gone, or wait for
-  the log's own final tally.
+* **`--only sorder` and `--only jmid` must be re-run on an exclusive tree**, for the reasons the
+  previous session recorded.
+* **The whole 446-row table has never been run in one pass.**
+* **New, owed by this session:** rows for the indefinite-`pollOnce` wake-source test and its
+  slice/stop-switch ordering, for `cond::clock_of`'s field offset, for the scheduling band's two
+  endpoints, for `eventfd`'s eight-byte rule and destructive read, and for the hint arm (a row
+  that turns `is_hint` into `false` must be caught by `tests/hints.rs`).
 
 ## Still open, carried forward
 
