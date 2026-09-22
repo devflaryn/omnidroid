@@ -149,7 +149,9 @@ use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
 use omni_bionic::net;
 use omni_mem::GuestAddr;
-use omni_platform::fs::{Filesystem, Readiness, ReadinessSource};
+use omni_platform::fs::{
+    EpollMember, EpollOp, Filesystem, FsErrorKind, Readiness, ReadinessSource, EPOLL_CLOEXEC,
+};
 // **`platnet` rather than `net`**, because `net` in this module is already `omni_bionic::net` —
 // the pure-computation half — and the two are deliberately different crates (D19). A single
 // import name for both would make it impossible to see, at a call site, whether an OS call is
@@ -611,6 +613,13 @@ fn poll_entries(view: &GuestView<'_>, fds: u64, bytes: usize) -> AbiResult<(i32,
             0
         } else {
             match fs.map(|fs| fs.readiness(fd)) {
+                // **Only `EBADF` is `POLLNVAL`.** The comment on the arm below said no other seam
+                // failure could reach here; an epoll descriptor's readiness, which the seam
+                // refuses by name, made that false, and a refusal read as `POLLNVAL` would tell the
+                // guest a live descriptor was closed.
+                Some(Err(error)) if error.kind() != Some(FsErrorKind::BadDescriptor) => {
+                    return Err(view.refusal(error.to_string()));
+                }
                 Some(Ok(readiness)) => {
                     // What this entry asks about, for the wait that may follow. `POLLPRI` is
                     // deliberately not folded into `readable`: nothing in this runtime produces
@@ -720,6 +729,14 @@ fn select_outcome(
         if named.iter().any(|fd| !fs.is_open(*fd)) {
             view.set_errno(consts::EBADF);
             return Ok(-1);
+        }
+        // `answer_sets` reads a refused readiness as "not ready", so an epoll descriptor -- whose
+        // readiness the seam does not answer -- is refused here, by name, before it can be.
+        if let Some(epfd) = named.iter().find(|fd| fs.is_epoll(**fd)) {
+            return Err(view.refusal(format!(
+                "`select` was asked about fd {epfd}, an epoll descriptor. Its readiness is its \
+                 members' and is not answered here; Linux allows it and no run has reached it"
+            )));
         }
     }
     // **What the guest asked about, kept**, because a wait re-tests the same question and the
@@ -1032,6 +1049,300 @@ fn bounded_wait(
         ));
     }
     Ok(duration)
+}
+
+// ================================================================== epoll
+
+/// `EPOLLIN`, `EPOLLOUT`, `EPOLLERR` and `EPOLLHUP`: Linux `uapi/linux/eventpoll.h`.
+const EPOLLIN: u32 = 0x001;
+const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+
+/// The event bits this layer delivers as asked: **level-triggered** input and output, and the two
+/// conditions reported whether or not they are asked for.
+///
+/// Decided from the engine, not from the header. Its transport (`libroblox.so` link
+/// `0x23cc814`-`0x23cc848`) builds `events` from two bits of its own and nothing else --
+/// `EPOLLIN`, `EPOLLOUT`, or both -- so `EPOLLET`, `EPOLLONESHOT`, `EPOLLRDHUP`, `EPOLLPRI`,
+/// `EPOLLEXCLUSIVE` and `EPOLLWAKEUP` are refused by name, each a semantics this layer would
+/// otherwise claim and not keep: an edge-triggered caller woken level-triggered spins on a
+/// writable socket, and a one-shot caller re-reported loses its own bookkeeping.
+const EPOLL_REQUESTABLE: u32 = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
+
+/// Bytes of one `struct epoll_event` **on aarch64**: `uint32_t events`, four bytes of padding,
+/// then the 64-bit `epoll_data_t` at offset 8.
+///
+/// Not x86-64's 12: the kernel header packs the structure only `#ifdef __x86_64__`, and the
+/// engine's own code agrees -- it builds one with `stp xzr, x20, [sp]` then `str w8, [sp]`
+/// (`0x23cc840`-`0x23cc844`), data at 8, events at 0.
+const EPOLL_EVENT_BYTES: usize = 16;
+
+/// `EP_MAX_EVENTS`: `INT_MAX / sizeof(struct epoll_event)`, the kernel's own bound on
+/// `maxevents`.
+const EP_MAX_EVENTS: i32 = i32::MAX / EPOLL_EVENT_BYTES as i32;
+
+/// How long one pass of an **indefinite** `epoll_wait` may wait before it is renewed.
+///
+/// Not a timeout the guest sees: [`epoll_wait`] loops until something is ready. It exists because
+/// [`wait_until_ready`] takes a deadline, and every individual park inside it is already capped
+/// (see [`wait_a_slice`]) and re-checks the stop switch, so the length only decides how often the
+/// deadline is renewed.
+const INDEFINITE_EPOLL_PASS: Duration = Duration::from_secs(3600);
+
+/// `int epoll_create1(int flags)`
+///
+/// A new, empty interest list, as a descriptor from the one table (D30). `EPOLL_CLOEXEC` is
+/// accepted and inert -- there is no `exec` for it to act on -- and any other flag is `EINVAL`,
+/// which is the kernel's answer.
+///
+/// MEASURED reader: the engine's transport, `RbxTransport I/O backend chosen: sys`, at
+/// `libroblox.so` link `0x23cc788` with flags 0, on the client-settings success path. The guest
+/// thread died on the `Unbound` this replaces.
+pub(super) fn epoll_create1(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let flags = c.args().next_i32()?;
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        if flags & !EPOLL_CLOEXEC != 0 {
+            view.set_errno(consts::EINVAL);
+            -1
+        } else {
+            let fs = filesystem(&view)?;
+            match settle(&view, fs.epoll_create())? {
+                Settled::Done(fd) => fd,
+                Settled::Failed(errno) => {
+                    view.set_errno(errno);
+                    -1
+                }
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)`
+///
+/// The list's rules are the seam's (`omni_platform::fs::epoll`); what is decided here is the
+/// guest's structure and which event bits can be honoured -- see [`EPOLL_REQUESTABLE`].
+/// `EPOLL_CTL_DEL` ignores `event`, which may be null, as it may on Linux since 2.6.9.
+pub(super) fn epoll_ctl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (epfd, op, fd, event) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?, a.next_i32()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let op = match op {
+            1 => Some(EpollOp::Add),
+            2 => Some(EpollOp::Delete),
+            3 => Some(EpollOp::Modify),
+            _ => None,
+        };
+        match op {
+            None => {
+                view.set_errno(consts::EINVAL);
+                -1
+            }
+            Some(op) => {
+                let member = if op == EpollOp::Delete {
+                    EpollMember { events: 0, data: 0 }
+                } else {
+                    let at = guest_address(&view, event)?;
+                    if at == 0 {
+                        // Linux: EFAULT. Refused, for the reason `pipe` refuses a null `pipefd`.
+                        return Err(view.refusal(
+                            "`epoll_ctl` ADD/MOD was given a null `struct epoll_event *`",
+                        ));
+                    }
+                    let bytes = view.mem().read_bytes(
+                        at,
+                        EPOLL_EVENT_BYTES,
+                        Blame::new(view.symbol(), view.address(), 3),
+                    )?;
+                    let events = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+                    let data = u64::from_le_bytes(bytes[8..16].try_into().expect("eight bytes"));
+                    let unhonoured = events & !EPOLL_REQUESTABLE;
+                    if unhonoured != 0 {
+                        return Err(view.refusal(format!(
+                            "`epoll_ctl` was asked to watch fd {fd} for {events:#x}, of which \
+                             {unhonoured:#x} is a semantics this layer does not implement \
+                             (EPOLLET, EPOLLONESHOT, EPOLLRDHUP, EPOLLPRI, EPOLLEXCLUSIVE or \
+                             EPOLLWAKEUP). Delivering level-triggered IN/OUT events in their \
+                             place would claim a behaviour the caller then builds on"
+                        )));
+                    }
+                    EpollMember { events, data }
+                };
+                let fs = filesystem(&view)?;
+                match settle(&view, fs.epoll_ctl(epfd, op, fd, member))? {
+                    Settled::Done(()) => 0,
+                    Settled::Failed(errno) => {
+                        view.set_errno(errno);
+                        -1
+                    }
+                }
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)`
+///
+/// **Level-triggered**, over each member's own readiness, on the same wait `poll` uses: the
+/// gate for pipes and eventfds, the host's readiness call for sockets, and both in slices when
+/// the list mixes them. `EPOLLERR` and `EPOLLHUP` are reported whether or not they were asked
+/// for, as the kernel does.
+///
+/// **`timeout == -1` waits for as long as it takes**, in passes of [`INDEFINITE_EPOLL_PASS`]
+/// whose every park is capped and re-checks the stop switch -- which is what makes it different
+/// from the unbounded `poll` [`bounded_wait`] refuses: the engine's I/O thread idles here by
+/// design (`0x28738a0` passes -1), and it can still be stopped. A list with **nothing that can
+/// become ready** is refused instead, because on a device that thread would never wake.
+///
+/// The output array is admitted whole before anything is waited for, and written once.
+pub(super) fn epoll_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (epfd, events, maxevents, timeout) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_i32()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let first = {
+        let mut view = enter(c, &state);
+        if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
+            view.set_errno(consts::EINVAL);
+            Some(-1)
+        } else {
+            let fs = filesystem(&view)?;
+            match settle(&view, fs.epoll_members(epfd))? {
+                Settled::Failed(errno) => {
+                    view.set_errno(errno);
+                    Some(-1)
+                }
+                Settled::Done(_) => {
+                    // The whole array, before a byte of it is written or a wait begins.
+                    let at = guest_address(&view, events)?;
+                    view.mem().checked_ptr(
+                        at,
+                        maxevents as usize * EPOLL_EVENT_BYTES,
+                        true,
+                        Blame::new(view.symbol(), view.address(), 1),
+                    )?;
+                    None
+                }
+            }
+        }
+    };
+    if let Some(value) = first {
+        c.ret().i32(value);
+        return Ok(());
+    }
+    let test = |view: &GuestView<'_>| epoll_events(view, epfd, events, maxevents as usize);
+    let (ready, watch) = {
+        let view = enter(c, &state);
+        test(&view)?
+    };
+    let value = if ready > 0 || timeout == 0 {
+        ready
+    } else if timeout < 0 {
+        if !watch.can_change() {
+            return Err(refuse(
+                c,
+                format!(
+                    "`epoll_wait` on fd {epfd} with no timeout, over an interest list in which \
+                     nothing can become ready. On a device this thread would never wake; this \
+                     layer has no unbounded wait for a thread that cannot be woken"
+                ),
+            ));
+        }
+        loop {
+            let found = wait_until_ready(c, &state, INDEFINITE_EPOLL_PASS, test)?;
+            if found > 0 {
+                break found;
+            }
+        }
+    } else {
+        let budget =
+            bounded_wait(c, Some(Duration::from_millis(timeout as u64)), watch.can_change())?;
+        wait_until_ready(c, &state, budget, test)?
+    };
+    c.ret().i32(value);
+    Ok(())
+}
+
+/// One pass over an interest list: every member's readiness, the ready ones written to the
+/// guest's array (at most `max`, in one write), and the [`Watch`] a wait needs.
+///
+/// The list is read **fresh on every pass**: another guest thread may `epoll_ctl` while this one
+/// waits, and the kernel reports against the list as it is when the event is collected.
+fn epoll_events(
+    view: &GuestView<'_>,
+    epfd: i32,
+    out: u64,
+    max: usize,
+) -> AbiResult<(i32, Watch)> {
+    let fs = filesystem(view)?;
+    let members = match fs.epoll_members(epfd) {
+        Ok(members) => members,
+        // Closed by another thread mid-wait. There is no errno for an `epoll_wait` whose epoll
+        // descriptor went away under it, and pretending it timed out would be the invented
+        // answer; refused, naming what happened.
+        Err(error) => return Err(view.refusal(format!("the epoll descriptor went away: {error}"))),
+    };
+    let mut watch = Watch::default();
+    let mut collected = Vec::with_capacity(max.min(members.len()) * EPOLL_EVENT_BYTES);
+    let mut ready = 0i32;
+    for (fd, member) in members {
+        let readiness = match fs.readiness(fd) {
+            Ok(readiness) => readiness,
+            // `close` removes a descriptor from every list under the table lock, so a member
+            // that is not open can only be one closed between the snapshot and this read.
+            Err(error) if error.kind() == Some(FsErrorKind::BadDescriptor) => continue,
+            Err(error) => return Err(view.refusal(error.to_string())),
+        };
+        watch.note(
+            fs,
+            fd,
+            Interest {
+                readable: member.events & EPOLLIN != 0,
+                writable: member.events & EPOLLOUT != 0,
+            },
+        );
+        let revents = epoll_revents(readiness, member.events);
+        if revents != 0 && (ready as usize) < max {
+            collected.extend_from_slice(&revents.to_le_bytes());
+            collected.extend_from_slice(&[0u8; 4]);
+            collected.extend_from_slice(&member.data.to_le_bytes());
+            ready += 1;
+        }
+    }
+    if ready > 0 {
+        let at = guest_address(view, out)?;
+        view.mem().write_bytes(at, &collected, Blame::new(view.symbol(), view.address(), 1))?;
+    }
+    Ok((ready, watch))
+}
+
+/// One member's `events` word for what it asked about, and the two conditions it did not have to.
+fn epoll_revents(readiness: Readiness, asked: u32) -> u32 {
+    let mut revents = 0u32;
+    if readiness.readable {
+        revents |= asked & EPOLLIN;
+    }
+    if readiness.writable {
+        revents |= asked & EPOLLOUT;
+    }
+    if readiness.error {
+        revents |= EPOLLERR;
+    }
+    if readiness.hangup {
+        revents |= EPOLLHUP;
+    }
+    revents
 }
 
 // ================================================================== eventfd

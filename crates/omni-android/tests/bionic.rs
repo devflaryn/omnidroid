@@ -498,6 +498,30 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          fseeko reaches this. `lseek(fd, 0, SEEK_CUR)` on an unbuffered stream. `ftell` is \
          imported and deliberately NOT bound.",
     ),
+    (
+        "epoll_create1",
+        "M6, on the fetch thread straight after `RbxTransport I/O backend chosen: sys` -- the \
+         engine's OWN transport, at link 0x23cc788 with flags 0: GuestThreadFailure { thread: 6, \
+         why: \"the guest called the imported symbol `epoll_create1` through its thunk at \
+         0x1b3d07a5020, and nothing in the compatibility layer implements it\" }. NEW \
+         COMPUTATION: an epoll instance is a new descriptor kind in the one table (D30), with \
+         close removing a descriptor from every interest list.",
+    ),
+    (
+        "epoll_ctl",
+        "M6, DECODED on the same transport rather than reached, and said so: 0x23cc848 is the \
+         call right after epoll_create1's owner registers a descriptor -- ADD or MOD, with \
+         events built from EPOLLIN/EPOLLOUT and nothing else, and a 16-byte arm64 epoll_event \
+         (data at offset 8, `stp xzr, x20, [sp]` then `str w8, [sp]`). Every other event bit is \
+         refused by name.",
+    ),
+    (
+        "epoll_wait",
+        "M6, DECODED on the same transport: 0x23ce040, maxevents 1024 and a timeout rounded up \
+         from microseconds, and 0x28738a0 elsewhere with -1. Level-triggered on the wait `poll` \
+         already had; -1 waits in renewable passes that each re-check the stop switch, and a \
+         list in which nothing can become ready is refused rather than slept on for ever.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -548,7 +572,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 215, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 218, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -618,7 +642,9 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // step further along the same path: `gmtime_r` under the local-time-is-UTC decision.
     // **And `pwrite`, for 199**: SQLite's page writes, `pread`'s mirror at every layer.
     // **`fseeko` and `ftello`, for 201**: a file class's seek and position, the second decoded.
-    assert_eq!(Bionic::inline_symbols().count(), 201);
+    // **`epoll_create1`, `epoll_ctl`, `epoll_wait`, for 204**: the engine's own transport, the
+    // first reached and the other two decoded on the same object.
+    assert_eq!(Bionic::inline_symbols().count(), 204);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -8273,9 +8299,15 @@ fn every_symbol_that_produces_a_descriptor_has_had_its_readiness_decided() {
         descriptor_makers.iter().copied().filter(|s| bound.contains(s)).collect();
     assert_eq!(
         present,
-        vec!["eventfd", "open", "__open_2", "opendir", "pipe", "socket"],
+        vec!["epoll_create1", "eventfd", "open", "__open_2", "opendir", "pipe", "socket"],
         "a symbol that produces a descriptor was bound without `poll` being told about it"
     );
+    // **`epoll_create1` is the seventh, and its decision is a refusal rather than an answer.** An
+    // epoll descriptor's readiness is its members', possibly on both waiting sides at once; no run
+    // has polled one, so `Filesystem::readiness` refuses it by name and every consumer that would
+    // ask -- `poll`, `select`, `ALooper_addFd` -- refuses before it can read that refusal as
+    // "closed". Asserted at the end of this test for `poll`, the one whose old arm said no such
+    // refusal could reach it.
     // **And all six of them now answer, which is the sentence that changed in M6.** The version
     // of this test before it asserted the opposite for two of them -- "nothing in this runtime
     // models a socket's readiness, and `poll` would have to answer for one" -- and called them by
@@ -8317,6 +8349,24 @@ fn every_symbol_that_produces_a_descriptor_has_had_its_readiness_decided() {
         fs.readiness(sock).expect("the host answered"),
         omni_platform::fs::Readiness::ALWAYS,
         "ALWAYS is a regular file's answer and would send `poll` into a receive with nothing          behind it"
+    );
+    let epfd = value_of(&f, "epoll_create1", |asm| {
+        asm.mov(0, 0);
+    }) as i32;
+    assert_eq!(fs.readiness_source(epfd), None, "no one waiting side is true of an epoll set");
+    let at = f.guest.data + 0x400;
+    let mut entry = [0u8; 8];
+    entry[0..4].copy_from_slice(&epfd.to_le_bytes());
+    entry[4..6].copy_from_slice(&1i16.to_le_bytes());
+    f.guest.write_bytes(at, &entry);
+    let error = refusal_of(&f, "poll", |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 0);
+    });
+    assert!(
+        error.to_string().contains("epoll"),
+        "poll on an epoll descriptor refuses by name rather than answering POLLNVAL: {error}"
     );
 }
 
@@ -8760,6 +8810,185 @@ fn the_engines_sqlite_record_locks_are_granted_and_validated_like_linux() {
         asm.mov(2, flock as u64);
     });
     assert!(error.to_string().contains("not a regular file"), "{error}");
+}
+
+/// One call through real guest code: `(x0 as i64, errno)`, with errno cleared first so a
+/// success cannot inherit a stale value.
+fn call_with_errno(f: &Fixture, symbol: &str, args: &[u64]) -> (i64, u64) {
+    let out = f.guest.data + 0x400;
+    f.guest.write_u64(out + 8, 0);
+    let entry = program(f, |asm| {
+        asm.bl(f.thunk("__errno"));
+        asm.mov(9, 0);
+        asm.push(str_w(9, 0, 0));
+        for (register, value) in args.iter().enumerate() {
+            asm.mov(register as u32, *value);
+        }
+        asm.bl(f.thunk(symbol));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(f, entry).expect("completes"), ExitReason::Returned { .. }));
+    (f.guest.read_u64(out) as i64, f.guest.read_u64(out + 8))
+}
+
+/// `EPOLLIN`, `EPOLLOUT`, `EPOLLHUP` and `EPOLLET`, as the guest spells them.
+const EPOLLIN_GUEST: u32 = 0x001;
+const EPOLLOUT_GUEST: u32 = 0x004;
+const EPOLLHUP_GUEST: u32 = 0x010;
+const EPOLLET_GUEST: u32 = 0x8000_0000;
+
+/// **The engine's transport's epoll, through real guest code: level-triggered events carrying the
+/// guest's own data back, the kernel's refusals errno by errno, and close leaving the list.**
+///
+/// Asserted on the 16-byte arm64 `epoll_event` the guest reads, not on the count: a count cannot
+/// see a `data` word written at x86-64's offset 4 instead of 8, and that is the difference the
+/// layout constant exists for.
+#[test]
+fn epoll_reports_level_triggered_events_with_the_guests_data_and_the_kernels_errors() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("epoll");
+    let event = f.guest.data + 0x300;
+    let events = f.guest.data + 0x500;
+    let set_event = |bits: u32, data: u64| {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&bits.to_le_bytes());
+        bytes[4..8].copy_from_slice(&[0xEE; 4]);
+        bytes[8..16].copy_from_slice(&data.to_le_bytes());
+        f.guest.write_bytes(event, &bytes);
+    };
+    let ctl = |epfd: i32, op: u64, fd: i32| {
+        call_with_errno(&f, "epoll_ctl", &[epfd as u64, op, fd as u64, event as u64])
+    };
+    let wait = |epfd: i32, max: u64, timeout: i64| {
+        call_with_errno(&f, "epoll_wait", &[epfd as u64, events as u64, max, timeout as u64])
+    };
+    let reported = |index: usize| {
+        let bytes = read_guest(&f, events + index * 16, 16);
+        (
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        )
+    };
+
+    assert_eq!(call_with_errno(&f, "epoll_create1", &[1]), (-1, EINVAL_NET), "an unknown flag");
+    let (epfd, errno) = call_with_errno(&f, "epoll_create1", &[0]);
+    assert!(epfd >= 3 && errno == 0, "{epfd} {errno}");
+    let epfd = epfd as i32;
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+
+    set_event(EPOLLIN_GUEST, 0x1122_3344_5566_7788);
+    assert_eq!(ctl(epfd, 1, read_fd), (0, 0), "ADD the read end for input");
+    assert_eq!(wait(epfd, 8, 0), (0, 0), "an empty pipe is not readable");
+
+    f.guest.write_bytes(f.guest.data + 0x200, b"x");
+    assert_eq!(
+        call_with_errno(&f, "write", &[write_fd as u64, (f.guest.data + 0x200) as u64, 1]),
+        (1, 0)
+    );
+    assert_eq!(wait(epfd, 8, 0), (1, 0), "one byte makes it readable");
+    assert_eq!(reported(0), (EPOLLIN_GUEST, 0x1122_3344_5566_7788), "events at 0, data at 8");
+    assert_eq!(wait(epfd, 8, 0), (1, 0), "level-triggered: still readable, reported again");
+
+    set_event(EPOLLOUT_GUEST, 2);
+    assert_eq!(ctl(epfd, 1, write_fd), (0, 0), "ADD the write end for output");
+    assert_eq!(wait(epfd, 8, 0), (2, 0), "both ends now");
+    assert_eq!(wait(epfd, 1, 0), (1, 0), "but never more than maxevents");
+
+    // The kernel's answers, each by number.
+    set_event(EPOLLIN_GUEST, 3);
+    assert_eq!(ctl(epfd, 1, read_fd), (-1, 17), "ADD twice is EEXIST");
+    assert_eq!(ctl(epfd, 3, 99), (-1, EBADF_NET), "a descriptor that is not open is EBADF");
+    assert_eq!(ctl(epfd, 1, epfd), (-1, EINVAL_NET), "an instance cannot watch itself");
+    assert_eq!(ctl(epfd, 9, read_fd), (-1, EINVAL_NET), "an unknown op");
+    let file = open_through_guest(&f, "/plain", O_RDWR | O_CREAT);
+    assert_eq!(ctl(epfd, 1, file), (-1, 1), "a regular file is EPERM");
+    assert_eq!(ctl(file, 1, read_fd), (-1, EINVAL_NET), "epfd that is not an epoll is EINVAL");
+    assert_eq!(wait(epfd, 0, 0), (-1, EINVAL_NET), "maxevents 0");
+    set_event(EPOLLIN_GUEST, 4);
+    let (_, missing) = ctl(epfd, 3, file);
+    assert_eq!(missing, 1, "MOD of a file is refused as EPERM before the list is consulted");
+    assert_eq!(ctl(epfd, 2, file), (-1, 1), "and so is DEL: `file_can_poll` comes first");
+
+    // MOD replaces the data, DEL removes, and a refused bit refuses by name.
+    set_event(EPOLLIN_GUEST, 0xABCD);
+    assert_eq!(ctl(epfd, 3, read_fd), (0, 0));
+    assert_eq!(ctl(epfd, 2, write_fd), (0, 0), "DEL");
+    assert_eq!(ctl(epfd, 2, write_fd), (-1, 2), "DEL twice is ENOENT");
+    assert_eq!(wait(epfd, 8, 0), (1, 0));
+    assert_eq!(reported(0), (EPOLLIN_GUEST, 0xABCD), "the modified data");
+    set_event(EPOLLIN_GUEST | EPOLLET_GUEST, 5);
+    let error = refusal_of(&f, "epoll_ctl", |asm| {
+        asm.mov(0, epfd as u64);
+        asm.mov(1, 3);
+        asm.mov(2, read_fd as u64);
+        asm.mov(3, event as u64);
+    });
+    assert!(error.to_string().contains("EPOLLET"), "{error}");
+
+    // Closing the write end hangs the read end up once it drains; HUP is reported unasked.
+    assert_eq!(call_with_errno(&f, "close", &[write_fd as u64]), (0, 0));
+    let buf = (f.guest.data + 0x200) as u64;
+    assert_eq!(call_with_errno(&f, "read", &[read_fd as u64, buf, 8]), (1, 0), "drain the byte");
+    assert_eq!(wait(epfd, 8, 0), (1, 0));
+    assert_eq!(reported(0).0 & EPOLLHUP_GUEST, EPOLLHUP_GUEST, "a hangup nobody asked about");
+
+    // And closing a watched descriptor takes it out of the list: a number reused by `open` must
+    // not inherit the watch.
+    assert_eq!(call_with_errno(&f, "close", &[read_fd as u64]), (0, 0));
+    assert_eq!(wait(epfd, 8, 0), (0, 0), "nothing left to report");
+    std::fs::write(scratch.path("reuse"), b"").expect("a host file");
+    let reused = open_through_guest(&f, "/reuse", O_RDONLY);
+    assert_eq!(reused, read_fd, "the lowest free number came back");
+    assert_eq!(wait(epfd, 8, 0), (0, 0), "and it is not watched");
+}
+
+/// **`epoll_wait(-1)` waits until something is ready -- here, a write from another thread -- and
+/// refuses when nothing in its list ever could be.**
+///
+/// The first half is the engine's I/O thread idling, which `poll`'s rules would have refused;
+/// the second is the case that makes an unbounded wait unrecoverable, and is still refused.
+#[test]
+fn an_indefinite_epoll_wait_is_woken_by_a_write_and_refused_over_nothing() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("epoll-wait");
+    let (epfd, _) = call_with_errno(&f, "epoll_create1", &[0]);
+    let epfd = epfd as i32;
+    let events = f.guest.data + 0x500;
+    let error = refusal_of(&f, "epoll_wait", |asm| {
+        asm.mov(0, epfd as u64);
+        asm.mov(1, events as u64);
+        asm.mov(2, 4);
+        asm.mov(3, u64::MAX);
+    });
+    assert!(error.to_string().contains("nothing can become ready"), "{error}");
+
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    let event = f.guest.data + 0x300;
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&EPOLLIN_GUEST.to_le_bytes());
+    bytes[8..16].copy_from_slice(&77u64.to_le_bytes());
+    f.guest.write_bytes(event, &bytes);
+    assert_eq!(
+        call_with_errno(&f, "epoll_ctl", &[epfd as u64, 1, read_fd as u64, event as u64]),
+        (0, 0)
+    );
+    let bionic = Arc::clone(&f.bionic);
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        bionic.filesystem().expect("a filesystem").write(write_fd, b"!").expect("a write")
+    });
+    let started = std::time::Instant::now();
+    let (ready, errno) =
+        call_with_errno(&f, "epoll_wait", &[epfd as u64, events as u64, 4, u64::MAX]);
+    let waited = started.elapsed();
+    assert_eq!(writer.join().expect("the writer"), 1);
+    assert_eq!((ready, errno), (1, 0), "woken by the write, after {waited:?}");
+    assert!(waited >= std::time::Duration::from_millis(100), "it did wait: {waited:?}");
+    assert_eq!(f.guest.read_u64(events + 8), 77, "and handed back the guest's data");
 }
 
 /// **A write to a pipe whose reader has closed is `EPIPE`**, not a short write and not a refusal.

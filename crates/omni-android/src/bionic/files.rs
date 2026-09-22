@@ -453,6 +453,8 @@ pub fn errno_for(kind: FsErrorKind) -> Option<i32> {
         FsErrorKind::BrokenPipe => consts::EPIPE,
         // Added with `lseek`'s seam method, for the stream seeks SQLite's neighbour reached.
         FsErrorKind::NotSeekable => consts::ESPIPE,
+        // `epoll_ctl` on a regular file or a directory, which the kernel refuses as EPERM.
+        FsErrorKind::NotPollable => consts::EPERM,
         // `FsErrorKind::Other` and nothing else. It is spelled as a wildcard because the enum is
         // `#[non_exhaustive]`, and a kind added upstream without a decision here must refuse by
         // name rather than acquire a plausible errno.

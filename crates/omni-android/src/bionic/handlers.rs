@@ -1473,6 +1473,12 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("poll", net::poll),
     ("select", net::select),
     ("eventfd", net::eventfd),
+    // M6: the engine's own transport (`RbxTransport I/O backend chosen: sys`) on the settings
+    // success path. Level-triggered IN/OUT, as its call sites build them. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records how each was found.
+    ("epoll_create1", net::epoll_create1),
+    ("epoll_ctl", net::epoll_ctl),
+    ("epoll_wait", net::epoll_wait),
     // ---- M6: the socket surface. Four of these eight were in phase 3d's "refused by name" list
     // and the other four are outside Task 1's 188 entirely -- `BEYOND_THE_PREDICTION` in
     // `tests/bionic.rs` carries how each was found. D30 withdrew Global Constraint 8, and what

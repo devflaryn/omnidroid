@@ -432,6 +432,17 @@ fn add_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     // have to invent readiness for.
     {
         let bionic = crate::bionic::active(c.symbol(), c.address())?;
+        // An epoll descriptor's readiness is its members' and the seam does not answer it; the
+        // poll below would read that refusal as ALOOPER_EVENT_INVALID, so it is refused here.
+        if bionic.bionic.filesystem().is_some_and(|fs| fs.is_epoll(fd)) {
+            return Err(refuse_inline(
+                c,
+                format!(
+                    "`ALooper_addFd` was given fd {fd}, an epoll descriptor. Its readiness is its \
+                     members' and is not answered here; Linux allows it and no run has reached it"
+                ),
+            ));
+        }
         let fs = bionic.bionic.filesystem().ok_or_else(|| {
             refuse_inline(
                 c,

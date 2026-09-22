@@ -71,12 +71,14 @@
 //! and a blocking socket cannot be waited out on a gate nothing in this process raises for it.
 //! [`Filesystem::socket_at`] hands the socket back and [`net`](crate::net) does the rest.
 
+pub mod epoll;
 mod error;
 pub mod eventfd;
 pub mod path;
 pub mod pipe;
 
 pub use error::{FsError, FsErrorKind, FsResult};
+pub use epoll::{EpollMember, EpollOp, EPOLL_CLOEXEC};
 pub use eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
 pub use path::{FinalLink, Resolved, NAME_MAX, PATH_MAX};
 pub use pipe::{PipeEnd, Readiness, ReadyGate, PIPE_BUF, PIPE_CAPACITY};
@@ -350,6 +352,11 @@ enum Entry {
     /// space — and, unlike a pipe, it is **one** descriptor rather than two, so the read side and
     /// the write side of the same counter are the same number.
     EventFd(eventfd::EventFd),
+    /// An epoll instance: an interest list over *other* descriptors.
+    ///
+    /// See [`epoll`]. The one kind whose readiness is not its own -- it is its members' -- so it
+    /// is the one kind [`Entry::readiness`] does not answer, and asking refuses by name.
+    Epoll(epoll::EpollSet),
     /// A socket: the first kind here whose readiness is the **operating system's** answer rather
     /// than this process's own state.
     ///
@@ -416,8 +423,8 @@ impl Entry {
     /// because every descriptor was a regular file, a directory or a standard stream, and that
     /// stopped being true the moment `pipe` was bound. Making readiness a `match` with no default
     /// arm means a sixth kind cannot be added without deciding its answer.
-    fn readiness(&self) -> Readiness {
-        match self {
+    fn readiness(&self) -> Option<Readiness> {
+        Some(match self {
             // A regular file, a directory, a character device and a standard stream can none of
             // them block. `Readiness::ALWAYS` says why that is Linux's answer too.
             Entry::File { .. } | Entry::Directory { .. } | Entry::Standard(_) | Entry::Device(_) => {
@@ -425,6 +432,10 @@ impl Entry {
             }
             Entry::Pipe(handle) => handle.readiness(),
             Entry::EventFd(counter) => counter.readiness(),
+            // An epoll descriptor is readable when a member has an event to report, which is a
+            // question about every member at once and about more than one waiting side. No run
+            // has asked it; `Filesystem::readiness` refuses by name.
+            Entry::Epoll(_) => return None,
             // **The one kind whose answer is a question for the operating system**, and therefore
             // the one that can fail where this function cannot. See
             // [`SOCKET_READINESS_UNAVAILABLE`] for why a refused poll is reported as an error
@@ -439,7 +450,7 @@ impl Entry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .readiness()
                 .unwrap_or(SOCKET_READINESS_UNAVAILABLE),
-        }
+        })
     }
 }
 
@@ -822,7 +833,16 @@ impl Filesystem {
             // Dropping the entry closes the host handle. A close that the host itself fails is
             // not reportable through `Drop`, and POSIX already says the descriptor is gone
             // whatever `close` returned.
-            Some(_) => Ok(()),
+            Some(_) => {
+                // **And it leaves every interest list** -- see [`epoll`] for why a number reused
+                // by the next `open` must not inherit a watch on the object this one named.
+                for entry in table.open.values_mut() {
+                    if let Entry::Epoll(set) = entry {
+                        set.forget(fd);
+                    }
+                }
+                Ok(())
+            }
             None => Err(bad_fd("close", fd)),
         }
     }
@@ -918,6 +938,132 @@ impl Filesystem {
         let fd = table.lowest_free_fd();
         table.open.insert(fd, Entry::EventFd(counter));
         Ok(fd)
+    }
+
+    /// `epoll_create1(2)`: a new, empty interest list, as a descriptor.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::TooManyOpenFiles`] past [`MAX_OPEN_FILES`].
+    pub fn epoll_create(&self) -> FsResult<i32> {
+        let mut table = self.table();
+        if table.open.len() + 1 > MAX_OPEN_FILES {
+            return Err(FsError::kinded(
+                "epoll_create",
+                "an epoll instance",
+                FsErrorKind::TooManyOpenFiles,
+                format!(
+                    "this guest instance holds {} of {MAX_OPEN_FILES} descriptors",
+                    table.open.len()
+                ),
+            ));
+        }
+        let fd = table.lowest_free_fd();
+        table.open.insert(fd, Entry::Epoll(epoll::EpollSet::default()));
+        Ok(fd)
+    }
+
+    /// `epoll_ctl(2)` on the interest list `epfd`.
+    ///
+    /// The kernel's answers, each from where the kernel decides it: `EBADF` for either descriptor
+    /// not open; `EINVAL` for an `epfd` that is not an epoll instance or for `fd == epfd`;
+    /// `EPERM` ([`FsErrorKind::NotPollable`]) for a regular file or a directory; `EEXIST` and
+    /// `ENOENT` from the list itself. Nesting refuses by name -- see [`epoll`].
+    ///
+    /// # Errors
+    ///
+    /// As above.
+    pub fn epoll_ctl(&self, epfd: i32, op: EpollOp, fd: i32, member: EpollMember) -> FsResult<()> {
+        const OP: &str = "epoll_ctl";
+        let mut table = self.table();
+        let target = format!("epfd {epfd}, fd {fd}");
+        match table.open.get(&epfd) {
+            None => return Err(bad_fd(OP, epfd)),
+            Some(Entry::Epoll(_)) => {}
+            Some(_) => {
+                return Err(FsError::kinded(
+                    OP,
+                    target,
+                    FsErrorKind::InvalidInput,
+                    "epfd is not an epoll descriptor",
+                ))
+            }
+        }
+        if fd == epfd {
+            return Err(FsError::kinded(
+                OP,
+                target,
+                FsErrorKind::InvalidInput,
+                "an epoll instance cannot watch itself",
+            ));
+        }
+        // What `fd` is decides whether it may be watched, **for every op, DEL included**: Linux's
+        // `do_epoll_ctl` tests `file_can_poll` before it looks at the list at all.
+        match table.open.get(&fd) {
+            None => return Err(bad_fd(OP, fd)),
+            Some(Entry::File { .. } | Entry::Directory { .. }) => {
+                return Err(FsError::kinded(
+                    OP,
+                    target,
+                    FsErrorKind::NotPollable,
+                    "a regular file or a directory is always ready and cannot be polled, so the \
+                     kernel refuses to watch one (EPERM)",
+                ))
+            }
+            Some(Entry::Epoll(_)) => {
+                return Err(FsError::refused(
+                    OP,
+                    target,
+                    "an epoll descriptor inside another's interest list: Linux allows nesting, \
+                     and no run has reached it",
+                ))
+            }
+            Some(_) => {}
+        }
+        let Some(Entry::Epoll(set)) = table.open.get_mut(&epfd) else {
+            // Checked two statements up under this same lock, and nothing between yields.
+            return Err(bad_fd(OP, epfd));
+        };
+        set.apply(op, fd, member).map_err(|refusal| match refusal {
+            epoll::EpollRefusal::AlreadyWatched => FsError::kinded(
+                OP,
+                format!("epfd {epfd}, fd {fd}"),
+                FsErrorKind::AlreadyExists,
+                "fd is already in this interest list (EEXIST)",
+            ),
+            epoll::EpollRefusal::NotWatched => FsError::kinded(
+                OP,
+                format!("epfd {epfd}, fd {fd}"),
+                FsErrorKind::NotFound,
+                "fd is not in this interest list (ENOENT)",
+            ),
+        })
+    }
+
+    /// The interest list behind `epfd`, in ascending descriptor order.
+    ///
+    /// # Errors
+    ///
+    /// `EBADF` for a descriptor that is not open and `EINVAL` for one that is not an epoll
+    /// instance -- `epoll_wait`'s own two answers.
+    pub fn epoll_members(&self, epfd: i32) -> FsResult<Vec<(i32, EpollMember)>> {
+        match self.table().open.get(&epfd) {
+            None => Err(bad_fd("epoll_wait", epfd)),
+            Some(Entry::Epoll(set)) => Ok(set.members()),
+            Some(_) => Err(FsError::kinded(
+                "epoll_wait",
+                format!("fd {epfd}"),
+                FsErrorKind::InvalidInput,
+                "not an epoll descriptor",
+            )),
+        }
+    }
+
+    /// Whether `fd` is an epoll instance -- what a caller about to ask for readiness checks, so
+    /// that an unanswered question refuses by name instead of reading as "not open".
+    #[must_use]
+    pub fn is_epoll(&self, fd: i32) -> bool {
+        matches!(self.table().open.get(&fd), Some(Entry::Epoll(_)))
     }
 
     /// The counter behind `fd`, or `None` when `fd` is not an eventfd.
@@ -1021,6 +1167,9 @@ impl Filesystem {
             | Entry::Device(_) => Some(ReadinessSource::Immediate),
             Entry::Pipe(_) | Entry::EventFd(_) => Some(ReadinessSource::Gate),
             Entry::Socket(_) => Some(ReadinessSource::Host),
+            // Its members may be on both sides, so no one answer is true; `readiness` refuses an
+            // epoll descriptor before a caller would ask where to wait for it.
+            Entry::Epoll(_) => None,
         }
     }
 
@@ -1032,7 +1181,15 @@ impl Filesystem {
     pub fn readiness(&self, fd: i32) -> FsResult<Readiness> {
         match self.table().open.get(&fd) {
             None => Err(bad_fd("readiness", fd)),
-            Some(entry) => Ok(entry.readiness()),
+            Some(entry) => entry.readiness().ok_or_else(|| {
+                FsError::refused(
+                    "readiness",
+                    format!("fd {fd}"),
+                    "fd is an epoll descriptor, whose readiness is its members' and is not \
+                     answered here -- nested epoll, or poll/select/ALooper_addFd on an epoll \
+                     descriptor. Linux allows it; no run has reached it",
+                )
+            }),
         }
     }
 
@@ -1294,6 +1451,13 @@ impl Filesystem {
             // belongs to the caller and not to this seam.
             Some(Entry::Pipe(handle)) => handle.read(buf),
             // As the pipe above: the table lock is held, and nothing in `eventfd` waits.
+            // Linux: an epoll descriptor has no `read`, and asking is `EINVAL`.
+            Some(Entry::Epoll(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "an epoll descriptor cannot be read or written (EINVAL)",
+            )),
             Some(Entry::EventFd(counter)) => counter.read(buf),
             // **`read` on a socket is `recv`, and it is refused here rather than performed, for
             // one reason: the failure would lose its classification on the way out.**
@@ -1383,6 +1547,12 @@ impl Filesystem {
                 FsErrorKind::InvalidInput,
                 "an eventfd is a counter with no offset to read at (ESPIPE), and its read                  consumes what it returns",
             )),
+            Some(Entry::Epoll(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::NotSeekable,
+                "an epoll descriptor has no offset (ESPIPE)",
+            )),
             Some(Entry::Pipe(_)) => Err(FsError::kinded(
                 OP,
                 format!("fd {fd}"),
@@ -1449,7 +1619,13 @@ impl Filesystem {
         let table = self.table();
         match table.open.get(&fd) {
             None => Err(bad_fd(OP, fd)),
-            Some(Entry::Pipe(_) | Entry::Socket(_) | Entry::EventFd(_) | Entry::Standard(_)) => {
+            Some(
+                Entry::Pipe(_)
+                | Entry::Socket(_)
+                | Entry::EventFd(_)
+                | Entry::Standard(_)
+                | Entry::Epoll(_),
+            ) => {
                 Err(FsError::kinded(
                     OP,
                     format!("fd {fd}"),
@@ -1523,6 +1699,12 @@ impl Filesystem {
                 format!("fd {fd}"),
                 FsErrorKind::InvalidInput,
                 "an eventfd is a counter with no offset to write at (ESPIPE)",
+            )),
+            Some(Entry::Epoll(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::NotSeekable,
+                "an epoll descriptor has no offset (ESPIPE)",
             )),
             Some(Entry::Pipe(_)) => Err(FsError::kinded(
                 OP,
@@ -1599,6 +1781,13 @@ impl Filesystem {
             )),
             // See the note in `read`: one lock order, and nothing in `pipe` waits.
             Some(Entry::Pipe(handle)) => handle.write(buf),
+            // Linux: an epoll descriptor has no `write`, and asking is `EINVAL`.
+            Some(Entry::Epoll(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "an epoll descriptor cannot be read or written (EINVAL)",
+            )),
             Some(Entry::EventFd(counter)) => counter.write(buf),
             // `write` on a socket is `send`, and it is refused here for the two reasons the
             // `read` arm gives at length: the failure kinds do not survive the trip through
@@ -1745,6 +1934,17 @@ impl Filesystem {
             // Linux, and putting the counter here would make `fstat` a second, non-destructive
             // way to read it -- which is a behaviour a device does not have and which a guest
             // that found it would be entitled to rely on.
+            // An anonymous inode, as the eventfd arm below, and for the same reason nothing about
+            // the interest list is reported: `fstat` is not how Linux describes one.
+            Some(Entry::Epoll(_)) => Ok(FileStat {
+                kind: FileKind::Other,
+                size: 0,
+                read_only: false,
+                accessed: None,
+                modified: None,
+                created: None,
+                identity: identity(Path::new("/proc/self/fd/anon_inode:[eventpoll]")),
+            }),
             Some(Entry::EventFd(_)) => Ok(FileStat {
                 kind: FileKind::Other,
                 size: 0,

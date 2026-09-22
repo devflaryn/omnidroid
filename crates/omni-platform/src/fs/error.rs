@@ -82,6 +82,9 @@ pub enum FsErrorKind {
     ///
     /// [`NotASocket`]: FsErrorKind::NotASocket
     NotSeekable,
+    /// `epoll_ctl` on a descriptor that cannot be polled -- a regular file or a directory --
+    /// `EPERM`. Decided by this seam from the descriptor's kind.
+    NotPollable,
     /// The host reported a failure [`std::io::ErrorKind`] does not classify.
     ///
     /// **Not mapped to an errno by the caller.** See the module documentation: a call that fails
@@ -112,6 +115,7 @@ impl FsErrorKind {
             FsErrorKind::BrokenPipe => "broken pipe",
             FsErrorKind::NotASocket => "not a socket",
             FsErrorKind::NotSeekable => "illegal seek",
+            FsErrorKind::NotPollable => "operation not permitted",
             FsErrorKind::Other => "an unclassified host error",
         }
     }
