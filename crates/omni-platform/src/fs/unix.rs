@@ -48,6 +48,13 @@ pub(super) fn pread(_file: &File, _buf: &mut [u8], _offset: u64) -> FsResult<usi
     unsupported("pread", "pread(2) via std::os::unix::fs::FileExt::read_at")
 }
 
+/// Intended: `pwrite(2)`, reachable from `std` as `std::os::unix::fs::FileExt::write_at` -- the
+/// mirror of [`pread`], with the same one-call, short-writes-reported decision, and added with the
+/// Windows half when the engine's SQLite first reached it. Not written here, for `pread`'s reason.
+pub(super) fn pwrite(_file: &File, _buf: &[u8], _offset: u64) -> FsResult<usize> {
+    unsupported("pwrite", "pwrite(2) via std::os::unix::fs::FileExt::write_at")
+}
+
 /// Intended: `statvfs(3)` on both, through `libc::statvfs`.
 ///
 /// The decisions in it, and they differ between the two unix targets:

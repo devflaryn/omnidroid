@@ -968,6 +968,35 @@ pub(super) fn pread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)`
+///
+/// [`write`] at an offset, through the same [`write_from_guest`] -- so the same rule holds: the
+/// whole source is admitted before a byte reaches the file. The descriptor's own offset is not
+/// moved, which is `Filesystem::pwrite`'s job and was measured to need doing on Windows.
+///
+/// MEASURED reader: the engine's embedded SQLite, on the thread that had taken its record lock
+/// and asked `geteuid` -- SQLite writes its pages with `pwrite` where the platform has it, which
+/// Android does. The guest thread died on the `Unbound` this replaces.
+pub(super) fn pwrite(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, buf, count, offset) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?, a.next_u64()? as i64)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = transfer(c, &state, |view| {
+        if count > MAX_COUNT || offset < 0 {
+            // A negative offset is `EINVAL` on Linux, as for `pread`.
+            return Ok(Settled::Failed(consts::EINVAL));
+        }
+        if count == 0 {
+            return Ok(Settled::Done(0));
+        }
+        write_from_guest(view, fd, buf, count, Some(offset as u64))
+    })?;
+    c.ret().u64(result as u64);
+    Ok(())
+}
+
 /// Write `count` bytes of guest memory to `fd`, in [`IO_BLOCK`] pieces.
 ///
 /// Returns the bytes transferred, or the `errno` for a failure that happened before any byte was.
@@ -1001,6 +1030,7 @@ fn write_from_guest(
     fd: i32,
     buf: u64,
     count: u64,
+    offset: Option<u64>,
 ) -> AbiResult<Settled<i64>> {
     let fs = filesystem(view)?;
     // Before a byte reaches the descriptor. See this function's documentation.
@@ -1015,7 +1045,18 @@ fn write_from_guest(
         let at = base + done as usize;
         let bytes = view.mem().read_bytes(at, want, Blame::new(view.symbol(), view.address(), 1))?;
         chunk[..want].copy_from_slice(&bytes);
-        match settle(view, fs.write(fd, &chunk[..want]))? {
+        let wrote = match offset {
+            None => fs.write(fd, &chunk[..want]),
+            Some(start) => {
+                // Guest arithmetic, so checked: `read_into_guest`'s reason, in this direction a
+                // wrapped offset *overwrites* the wrong part of the file with every call succeeding.
+                let Some(at) = start.checked_add(done) else {
+                    return Ok(Settled::Failed(consts::EINVAL));
+                };
+                fs.pwrite(fd, &chunk[..want], at)
+            }
+        };
+        match settle(view, wrote)? {
             Settled::Done(0) => break,
             Settled::Done(took) => done += took as u64,
             Settled::Failed(errno) => {
@@ -1068,7 +1109,7 @@ pub(super) fn write(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             // at a null pointer does not fault.
             return Ok(Settled::Done(0));
         }
-        write_from_guest(view, fd, buf, count)
+        write_from_guest(view, fd, buf, count, None)
     })?;
     c.ret().u64(result as u64);
     Ok(())
@@ -1106,7 +1147,7 @@ pub(super) fn write_chk(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         if count == 0 {
             return Ok(Settled::Done(0));
         }
-        write_from_guest(view, fd, buf, count)
+        write_from_guest(view, fd, buf, count, None)
     })?;
     c.ret().u64(result as u64);
     Ok(())

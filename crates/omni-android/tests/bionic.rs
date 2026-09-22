@@ -453,6 +453,30 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          anything but an application uid. `getuid` is its sibling in the same never-referenced \
          section and is deliberately NOT bound -- no run has reached it.",
     ),
+    (
+        "localtime_r",
+        "M6, on the fetch thread, one step past the PlatformSystemDialogHandler registration on \
+         the client-settings success path: GuestThreadFailure { thread: 6, why: \"the guest \
+         called the imported symbol `localtime_r` through its thunk at 0x1d4e5f84f60, and \
+         nothing in the compatibility layer implements it\" }, from link 0x2264274. The Tier C \
+         section of the reachable list, reached only through an address-taken edge. NOT new \
+         computation: this runtime's local time is UTC -- no TZ, no zone database, no \
+         persist.sys.timezone -- which `clocks::mktime` had recorded along with the sentence \
+         that a guest calling localtime would be the test of it. It is `gmtime_r`. `localtime` \
+         is its neighbour in the same section and is deliberately NOT bound.",
+    ),
+    (
+        "pwrite",
+        "M6, on the SQLite thread, the call after its record lock and `geteuid`: SQLite writes \
+         its pages with pwrite where the platform has one, and Android does. GuestThreadFailure \
+         { thread: 8, why: \"the guest called the imported symbol `pwrite` through its thunk at \
+         0x1d4e5f85dd0, and nothing in the compatibility layer implements it\" }. NOT a binding \
+         gap and not quite new: `pread` had a seam method and a Windows backend, and this is \
+         their mirror at every layer -- including the saved-and-restored cursor, because \
+         `seek_write` moves the Windows file pointer exactly as `seek_read` was measured to \
+         (and a mutation dropping the restore fails `pwrite_does_not_move_the_descriptors_offset`, \
+         which is that measurement). `pread64`/`pwrite64` are not imported on LP64.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -503,7 +527,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 211, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 213, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -569,8 +593,10 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     //
     // **The settings success path adds `geteuid`, inline, for 197**: SQLite asking whether it is
     // root. Answered from a seam with no default, because no source this runtime has knows an
-    // Android uid. See its `BEYOND_THE_PREDICTION` entry.
-    assert_eq!(Bionic::inline_symbols().count(), 197);
+    // Android uid. See its `BEYOND_THE_PREDICTION` entry. **And `localtime_r`, for 198**, one
+    // step further along the same path: `gmtime_r` under the local-time-is-UTC decision.
+    // **And `pwrite`, for 199**: SQLite's page writes, `pread`'s mirror at every layer.
+    assert_eq!(Bionic::inline_symbols().count(), 199);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -3508,6 +3534,45 @@ fn gmtime_r_breaks_a_real_timestamp_down_into_the_guest_struct_tm() {
         0x1234_5678_9ABC_DEF0,
         "a failed conversion must not have written anything"
     );
+}
+
+/// **`localtime_r` is `gmtime_r` on a runtime with no zone, and the premise is asserted with it.**
+///
+/// The premise is what makes it true: no `TZ` in the environment. So the test reads `getenv("TZ")`
+/// through the guest first -- if an embedding ever gives this instance a zone, the premise fails
+/// here, by name, instead of `localtime_r` quietly disagreeing with the environment. Then both
+/// conversions of one timestamp, into two buffers, compared byte for byte over the whole
+/// `struct tm` including `tm_gmtoff` and the `tm_zone` pointer.
+#[test]
+fn localtime_r_is_gmtime_r_on_a_runtime_with_no_zone() {
+    let _guard = serialized();
+    let f = fixture();
+    let name = f.cstring(f.guest.data + 0x100, b"TZ");
+    assert_eq!(
+        value_of(&f, "getenv", |asm| { asm.mov(0, name as u64); }),
+        0,
+        "the premise: this instance has no TZ"
+    );
+
+    let timer = f.guest.data + 0x200;
+    let (local, utc) = (f.guest.data + 0x240, f.guest.data + 0x280);
+    f.guest.write_u64(timer, 951_825_600); // 2000-02-29T12:00:00Z
+    for offset in (0..56).step_by(8) {
+        f.guest.write_u64(local + offset, 0xAAAA_AAAA_AAAA_AAAA);
+        f.guest.write_u64(utc + offset, 0x5555_5555_5555_5555);
+    }
+    let returned = value_of(&f, "localtime_r", |asm| {
+        asm.mov(0, timer as u64);
+        asm.mov(1, local as u64);
+    });
+    assert_eq!(returned, local as u64, "localtime_r returns the buffer it was given");
+    value_of(&f, "gmtime_r", |asm| {
+        asm.mov(0, timer as u64);
+        asm.mov(1, utc as u64);
+    });
+    assert_eq!(read_guest(&f, local, 56), read_guest(&f, utc, 56), "the same struct tm");
+    assert_eq!(read_i32(&f, local + 8), 12, "tm_hour is the UTC hour");
+    assert_eq!(f.guest.read_u64(local + 40), 0, "tm_gmtoff");
 }
 
 /// **`gmtime` answers into this thread's own `struct tm`, and it is not the scratch buffer.**
@@ -8422,6 +8487,47 @@ fn fcntl_round_trips_o_nonblock_and_refuses_every_other_command() {
         asm.mov(2, 0o20000);
     });
     assert!(error.to_string().contains("O_ASYNC"), "{error}");
+}
+
+/// **`pwrite` writes at an offset through real guest code and leaves the sequential offset alone.**
+///
+/// Asserted on the bytes the host file ends up holding, which is the only place the two defects
+/// this guards show: a `pwrite` that moved the offset puts the following `write` after the page
+/// instead of at the end, and a `pwrite` that ignored its offset appends. Both leave every return
+/// value looking right.
+#[test]
+fn pwrite_writes_at_its_offset_and_the_next_write_continues_where_write_left_off() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("pwrite");
+    let fd = open_through_guest(&f, "/pages", O_RDWR | O_CREAT);
+    assert!(fd >= 3, "open returned {fd}");
+    let source = f.guest.data + 0x200;
+    let write_through_guest = |symbol: &str, bytes: &[u8], offset: Option<u64>| -> i64 {
+        f.guest.write_bytes(source, bytes);
+        value_of(&f, symbol, |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, source as u64);
+            asm.mov(2, bytes.len() as u64);
+            if let Some(offset) = offset {
+                asm.mov(3, offset);
+            }
+        }) as i64
+    };
+    assert_eq!(write_through_guest("write", b"0123456789", None), 10);
+    assert_eq!(write_through_guest("pwrite", b"ab", Some(2)), 2, "pwrite returns what it wrote");
+    assert_eq!(write_through_guest("write", b"XY", None), 2);
+    assert_eq!(
+        std::fs::read(scratch.path("pages")).expect("the host file"),
+        b"01ab456789XY",
+        "the page landed at offset 2 and the sequential write at the end"
+    );
+    // A negative offset is EINVAL, not a write somewhere.
+    assert_eq!(write_through_guest("pwrite", b"zz", Some(u64::MAX)), -1);
+    assert_eq!(
+        std::fs::read(scratch.path("pages")).expect("the host file"),
+        b"01ab456789XY",
+        "nothing was written"
+    );
 }
 
 /// **`geteuid` answers the application uid the embedding gave, and refuses until it is given.**

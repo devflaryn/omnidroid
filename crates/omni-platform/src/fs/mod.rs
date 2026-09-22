@@ -1431,6 +1431,79 @@ impl Filesystem {
         }
     }
 
+    /// `pwrite(2)`: write at an absolute offset **without moving the descriptor's own offset**.
+    ///
+    /// [`pread`](Filesystem::pread)'s mirror, arm for arm: a descriptor with no position in it
+    /// answers `ESPIPE` (as `InvalidInput`), a directory `EISDIR`, and a file not open for writing
+    /// `EBADF`. Added when the engine's SQLite reached it.
+    ///
+    /// # Errors
+    ///
+    /// As above, and [`FsError::Unsupported`] on Linux and macOS, naming `pwrite(2)`.
+    pub fn pwrite(&self, fd: i32, buf: &[u8], offset: u64) -> FsResult<usize> {
+        const OP: &str = "pwrite";
+        let mut table = self.table();
+        match table.open.get_mut(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::Device(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a character device has no offset, so there is nothing to write *at* (ESPIPE)",
+            )),
+            Some(Entry::Standard(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a standard stream is a pipe: it has no offset to write at (ESPIPE)",
+            )),
+            Some(Entry::EventFd(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "an eventfd is a counter with no offset to write at (ESPIPE)",
+            )),
+            Some(Entry::Pipe(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a pipe has no offset to write at (ESPIPE)",
+            )),
+            Some(Entry::Socket(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a socket has no offset to write at (ESPIPE)",
+            )),
+            Some(Entry::Directory { guest, .. }) => Err(FsError::kinded(
+                OP,
+                guest.clone(),
+                FsErrorKind::IsADirectory,
+                "a directory descriptor cannot be written",
+            )),
+            Some(Entry::File { file, writable, guest, .. }) => {
+                if !*writable {
+                    return Err(FsError::kinded(
+                        OP,
+                        guest.clone(),
+                        FsErrorKind::BadDescriptor,
+                        "the descriptor was not opened for writing",
+                    ));
+                }
+                let guest = guest.clone();
+                backend::pwrite(file, buf, offset).map_err(|error| match error {
+                    FsError::Io { kind, detail, .. } => FsError::Io {
+                        operation: OP,
+                        path: guest,
+                        kind,
+                        detail,
+                    },
+                    other => other,
+                })
+            }
+        }
+    }
+
     /// `write(2)`: write `buf`, returning how many bytes were taken.
     ///
     /// # Errors
@@ -2415,6 +2488,32 @@ mod tests {
         fs.closedir(first).expect("close");
         fs.closedir(second).expect("close");
         assert_eq!(fs.dir_count(), 0);
+    }
+
+    /// `pwrite` writes at an offset and leaves the descriptor's own offset alone -- the
+    /// `seek_write` half of `pread`'s measured defect -- or refuses by name with no backend.
+    #[test]
+    fn pwrite_does_not_move_the_descriptors_offset() {
+        let scratch = Scratch::new("pwrite");
+        let fs = scratch.fs();
+        let fd = fs.open(b"/f", write_flags()).expect("open");
+        fs.write(fd, b"0123456789").expect("write");
+        match fs.pwrite(fd, b"ab", 2) {
+            Ok(n) => {
+                assert_eq!(n, 2);
+                // The sequential offset is still 10, so this lands at the end, not after "ab".
+                fs.write(fd, b"XY").expect("write");
+                fs.close(fd).expect("close");
+                let fd = fs.open(b"/f", read_flags()).expect("reopen");
+                let mut all = [0u8; 16];
+                let n = fs.read(fd, &mut all).expect("read");
+                assert_eq!(&all[..n], b"01ab456789XY", "pwrite moved the descriptor's offset");
+            }
+            Err(error) => {
+                assert!(matches!(error, FsError::Unsupported { .. }), "{error}");
+                assert!(error.to_string().contains("pwrite(2)"), "{error}");
+            }
+        }
     }
 
     /// `pread` reads at an offset and leaves the descriptor's own offset alone — or refuses by

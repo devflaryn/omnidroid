@@ -1,4 +1,5 @@
-//! Windows backend for the filesystem seam: the two operations with no portable `std` spelling.
+//! Windows backend for the filesystem seam: the operations with no portable `std` spelling --
+//! `pread`, `pwrite` and `statvfs`.
 //!
 //! Everything else in [`crate::fs`] is `std::fs` and is implemented once for all five targets.
 //! These two are here because they need a *different* call per target rather than one portable
@@ -58,6 +59,30 @@ pub(super) fn pread(file: &File, buf: &mut [u8], offset: u64) -> FsResult<usize>
     let restored = handle.seek(SeekFrom::Start(saved));
     let count = read.map_err(|error| FsError::io("pread", "a descriptor", &error))?;
     restored.map_err(|error| FsError::io("pread", "a descriptor", &error))?;
+    Ok(count)
+}
+
+/// `pwrite(2)` on Windows: `FileExt::seek_write` with the descriptor's own offset saved and put
+/// back, for exactly [`pread`]'s measured reason.
+///
+/// `seek_write` is `WriteFile` with an `OVERLAPPED` offset, and on a synchronous handle Windows
+/// moves the file pointer to the end of what it wrote -- the same behaviour `pread`'s table
+/// measured for `seek_read`, from the same `OVERLAPPED` rule. Left alone, a guest that `pwrite`s a
+/// page and then `write`s sequentially would put the second write after the page rather than
+/// where its own offset was, and every call would report success. So the position is saved
+/// before and restored after, including when the write fails.
+///
+/// One call, short writes reported: `pwrite`'s contract is not "write all of it", and a loop here
+/// would make the same guest program behave differently on two hosts (see `pread`).
+pub(super) fn pwrite(file: &File, buf: &[u8], offset: u64) -> FsResult<usize> {
+    let mut handle: &File = file;
+    let saved = handle
+        .stream_position()
+        .map_err(|error| FsError::io("pwrite", "a descriptor", &error))?;
+    let written = file.seek_write(buf, offset);
+    let restored = handle.seek(SeekFrom::Start(saved));
+    let count = written.map_err(|error| FsError::io("pwrite", "a descriptor", &error))?;
+    restored.map_err(|error| FsError::io("pwrite", "a descriptor", &error))?;
     Ok(count)
 }
 

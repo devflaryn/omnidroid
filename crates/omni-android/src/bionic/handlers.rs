@@ -1345,6 +1345,10 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("strftime", clocks::strftime),
     ("strftime_l", clocks::strftime_l),
     ("gmtime_r", clocks::gmtime_r),
+    // M6: the client-settings success path formatting a time. This runtime's local time is UTC,
+    // which `clocks::mktime` recorded and this run tested. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records how it was found.
+    ("localtime_r", clocks::localtime_r),
     ("nanosleep", clocks::nanosleep),
     ("usleep", clocks::usleep),
     // ---- phase 3a: process and environment. Four answers, two facts about a process that was
@@ -1395,6 +1399,10 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // reasons `Filesystem::read` cannot serve a socket itself.
     ("read", net::read),
     ("pread", files::pread),
+    // M6: the engine's SQLite writing its pages, on the thread that took the record lock. The
+    // mirror of `pread`, through the same write loop. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records how it was found.
+    ("pwrite", files::pwrite),
     ("__write_chk", net::write_chk),
     ("access", files::access),
     ("getcwd", files::getcwd),

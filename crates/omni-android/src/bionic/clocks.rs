@@ -301,6 +301,29 @@ pub(super) fn gmtime_r(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `struct tm *localtime_r(const time_t *timer, struct tm *result)`
+///
+/// **`gmtime_r`, because this runtime's local time is UTC** -- the statement [`mktime`] records
+/// and says what would falsify, and this is the run that tested it: the guest called
+/// `localtime_r` rather than reading a zone from somewhere this layer does not answer. There is
+/// no `TZ` in the environment (`getenv` answers `NULL` for every name), no timezone database,
+/// and no `persist.sys.timezone` property unless an embedding sets one -- and bionic, given no
+/// zone from either, computes local time as UTC. So the broken-down time, `tm_gmtoff = 0`,
+/// `tm_isdst = 0` and the `"UTC"` `tm_zone` are all what a device with no zone configured
+/// reports, not a substitute for a zone.
+///
+/// **What would change it**: an embedding that sets `TZ` or `persist.sys.timezone`. Neither is
+/// read here, so that embedding would be told one thing by `getenv` and another by this; the
+/// day one is set, this has to grow a zone and stop being `gmtime_r`.
+///
+/// MEASURED reader: the client-settings success path on the fetch thread, `libroblox.so` link
+/// `0x2264274`, reached from `0x224ecc0` after `0x2bd58a4` -- one step past the
+/// `PlatformSystemDialogHandler` registration. The guest thread died on the `Unbound` this
+/// replaces.
+pub(super) fn localtime_r(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    gmtime_r(c)
+}
+
 /// `time_t mktime(struct tm *tm)`
 ///
 /// **MEASURED, and it is the TLS certificate check.** With the raw `getrandom` answered, M6's
@@ -314,10 +337,11 @@ pub(super) fn gmtime_r(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 ///
 /// C says `mktime` interprets the broken-down time as **local**. This process has no local time:
 /// there is no timezone database, no `TZ` in the environment (`getenv` answers `NULL` for every
-/// name, which is a fact about a process started with no environment, not a stub), and no
-/// `localtime`/`localtime_r` is bound or imported on any reached path. Everything this layer
-/// reports is UTC -- `gmtime_r` writes `tm_gmtoff = 0` and a `tm_zone` of `"UTC"`, which is the
-/// storage this handler reuses.
+/// name, which is a fact about a process started with no environment, not a stub), and --
+/// when this was written -- no `localtime`/`localtime_r` on any reached path. Everything this
+/// layer reports is UTC -- `gmtime_r` writes `tm_gmtoff = 0` and a `tm_zone` of `"UTC"`, which is
+/// the storage this handler reuses. **`localtime_r` has since been reached**, and answers the
+/// same way for the same reason; see [`localtime_r`].
 ///
 /// So the honest statement is: **this runtime's local time is UTC**, and `mktime` is therefore
 /// `timegm`. That is a real difference from a device, which would apply the phone's offset, and

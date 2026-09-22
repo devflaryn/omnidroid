@@ -24,4 +24,4 @@
 //!   be doing a conversion that happens to be the identity. That is the target where a layout
 //!   error in it would be hardest to notice.
 
-pub(super) use super::unix::{pread, volume_stats};
+pub(super) use super::unix::{pread, pwrite, volume_stats};
