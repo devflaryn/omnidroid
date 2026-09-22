@@ -522,6 +522,31 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          already had; -1 waits in renewable passes that each re-check the stop switch, and a \
          list in which nothing can become ready is refused rather than slept on for ever.",
     ),
+    (
+        "timerfd_create",
+        "M6, the transport's timer, one call after epoll_create1 (link 0x23cc718): \
+         GuestThreadFailure { thread: 6, why: \"the guest called the imported symbol \
+         `timerfd_create` through its thunk at 0x1f84c7f7f80, and nothing in the compatibility \
+         layer implements it\" }, as timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK). NEW \
+         COMPUTATION: the first descriptor whose readiness changes with TIME, which nothing \
+         announces, so ReadinessSource::Timer tells a waiter to cap its wait at the deadline. \
+         CLOCK_MONOTONIC only -- the clock the guest's own clock_gettime reads.",
+    ),
+    (
+        "timerfd_settime",
+        "M6, DECODED on the same transport: one-shot, armed both relative (0x23cdea0, flags 0) \
+         and absolute (0x23cdf5c, TFD_TIMER_ABSTIME), from a 32-byte itimerspec whose value the \
+         engine stores at offset 16. The absolute form is why the timer is on the guest's own \
+         monotonic clock and no other.",
+    ),
+    (
+        "fsync",
+        "M6, the SQLite thread committing, after its record lock, geteuid and pwrite: \
+         GuestThreadFailure { thread: 8, why: \"the guest called the imported symbol `fsync` \
+         through its thunk at 0x1f84c7f8620, and nothing in the compatibility layer implements \
+         it\" }. File::sync_all for a regular file; EINVAL for a descriptor with nothing to \
+         synchronise; a directory refuses by name until a run shows SQLite's directory sync.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -572,7 +597,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 218, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 221, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -644,7 +669,9 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`fseeko` and `ftello`, for 201**: a file class's seek and position, the second decoded.
     // **`epoll_create1`, `epoll_ctl`, `epoll_wait`, for 204**: the engine's own transport, the
     // first reached and the other two decoded on the same object.
-    assert_eq!(Bionic::inline_symbols().count(), 204);
+    // **`timerfd_create`, `timerfd_settime` and `fsync`, for 207**: the transport's timer and
+    // SQLite's commit.
+    assert_eq!(Bionic::inline_symbols().count(), 207);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -8299,7 +8326,16 @@ fn every_symbol_that_produces_a_descriptor_has_had_its_readiness_decided() {
         descriptor_makers.iter().copied().filter(|s| bound.contains(s)).collect();
     assert_eq!(
         present,
-        vec!["epoll_create1", "eventfd", "open", "__open_2", "opendir", "pipe", "socket"],
+        vec![
+            "epoll_create1",
+            "eventfd",
+            "open",
+            "__open_2",
+            "opendir",
+            "pipe",
+            "socket",
+            "timerfd_create"
+        ],
         "a symbol that produces a descriptor was bound without `poll` being told about it"
     );
     // **`epoll_create1` is the seventh, and its decision is a refusal rather than an answer.** An
@@ -8368,6 +8404,13 @@ fn every_symbol_that_produces_a_descriptor_has_had_its_readiness_decided() {
         error.to_string().contains("epoll"),
         "poll on an epoll descriptor refuses by name rather than answering POLLNVAL: {error}"
     );
+    // **`timerfd_create` is the eighth**, and the first whose readiness changes with time: its
+    // source says so, which is what makes a waiter cap its wait at the deadline.
+    let timer = value_of(&f, "timerfd_create", |asm| {
+        asm.mov(0, 1);
+        asm.mov(1, 0o4000);
+    }) as i32;
+    assert_eq!(fs.readiness_source(timer), Some(ReadinessSource::Timer));
 }
 
 /// **The kinds that are modelled each answer for themselves, through real guest code.**
@@ -8989,6 +9032,112 @@ fn an_indefinite_epoll_wait_is_woken_by_a_write_and_refused_over_nothing() {
     assert_eq!((ready, errno), (1, 0), "woken by the write, after {waited:?}");
     assert!(waited >= std::time::Duration::from_millis(100), "it did wait: {waited:?}");
     assert_eq!(f.guest.read_u64(events + 8), 77, "and handed back the guest's data");
+}
+
+/// Write an aarch64 `struct itimerspec`: interval then value, each `(tv_sec, tv_nsec)`.
+fn write_itimerspec(f: &Fixture, at: omni_cpu::GuestAddr, interval: (i64, i64), value: (i64, i64)) {
+    let mut bytes = [0u8; 32];
+    for (offset, part) in [(0, interval.0), (8, interval.1), (16, value.0), (24, value.1)] {
+        bytes[offset..offset + 8].copy_from_slice(&part.to_le_bytes());
+    }
+    f.guest.write_bytes(at, &bytes);
+}
+
+/// **A timerfd in an epoll set wakes an indefinite `epoll_wait` at its deadline** -- which
+/// nothing announces, so this is the test that the wait caps itself there -- and is read as one
+/// expiration, relative and absolute, on the clock the guest's own `clock_gettime` reads.
+#[test]
+fn a_timerfd_wakes_epoll_at_its_deadline_on_the_guests_own_monotonic_clock() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("timerfd");
+    let spec = f.guest.data + 0x300;
+    let events = f.guest.data + 0x500;
+    let (timer, errno) = call_with_errno(&f, "timerfd_create", &[1, 0o4000]);
+    assert!(timer >= 3 && errno == 0, "{timer} {errno}");
+    let (epfd, _) = call_with_errno(&f, "epoll_create1", &[0]);
+    let event = f.guest.data + 0x340;
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&EPOLLIN_GUEST.to_le_bytes());
+    bytes[8..16].copy_from_slice(&0x7117u64.to_le_bytes());
+    f.guest.write_bytes(event, &bytes);
+    assert_eq!(
+        call_with_errno(&f, "epoll_ctl", &[epfd as u64, 1, timer as u64, event as u64]),
+        (0, 0)
+    );
+    let buf = (f.guest.data + 0x200) as u64;
+    assert_eq!(call_with_errno(&f, "read", &[timer as u64, buf, 8]), (-1, EAGAIN_GUEST), "disarmed");
+
+    // Relative: 80 ms from now, and an epoll_wait(-1) that only a capped wait can end.
+    write_itimerspec(&f, spec, (0, 0), (0, 80_000_000));
+    assert_eq!(call_with_errno(&f, "timerfd_settime", &[timer as u64, 0, spec as u64, 0]), (0, 0));
+    let started = std::time::Instant::now();
+    let (ready, _) = call_with_errno(&f, "epoll_wait", &[epfd as u64, events as u64, 4, u64::MAX]);
+    let waited = started.elapsed();
+    assert_eq!(ready, 1, "the timer fired");
+    assert_eq!(f.guest.read_u64(events + 8), 0x7117, "and handed back the guest's data");
+    assert!(waited >= std::time::Duration::from_millis(70), "not early: {waited:?}");
+    assert!(waited < std::time::Duration::from_millis(1500), "not a slice late: {waited:?}");
+    assert_eq!(call_with_errno(&f, "read", &[timer as u64, buf, 8]), (8, 0));
+    assert_eq!(f.guest.read_u64(buf as omni_cpu::GuestAddr), 1, "one expiration");
+    assert_eq!(call_with_errno(&f, "read", &[timer as u64, buf, 8]), (-1, EAGAIN_GUEST), "consumed");
+
+    // Absolute, on the guest's own CLOCK_MONOTONIC as the guest reads it.
+    let now = f.guest.data + 0x380;
+    assert_eq!(call_with_errno(&f, "clock_gettime", &[1, now as u64]), (0, 0));
+    let (seconds, nanos) = (f.guest.read_u64(now) as i64, f.guest.read_u64(now + 8) as i64);
+    let deadline = (seconds * 1_000_000_000 + nanos) + 60_000_000;
+    write_itimerspec(&f, spec, (0, 0), (deadline / 1_000_000_000, deadline % 1_000_000_000));
+    assert_eq!(call_with_errno(&f, "timerfd_settime", &[timer as u64, 1, spec as u64, 0]), (0, 0));
+    let started = std::time::Instant::now();
+    let (ready, _) = call_with_errno(&f, "epoll_wait", &[epfd as u64, events as u64, 4, u64::MAX]);
+    assert_eq!(ready, 1);
+    assert!(started.elapsed() < std::time::Duration::from_millis(1500), "{:?}", started.elapsed());
+    assert_eq!(call_with_errno(&f, "read", &[timer as u64, buf, 8]), (8, 0));
+    // **An absolute deadline already in the past is expired at once** -- the case that tells
+    // absolute from relative: read as a delay, it would land as far in the future as the guest's
+    // clock is past its epoch. At least 70 ms have passed on that clock by here.
+    assert_eq!(call_with_errno(&f, "clock_gettime", &[1, now as u64]), (0, 0));
+    let past = f.guest.read_u64(now) as i64 * 1_000_000_000 + f.guest.read_u64(now + 8) as i64
+        - 20_000_000;
+    write_itimerspec(&f, spec, (0, 0), (past / 1_000_000_000, past % 1_000_000_000));
+    assert_eq!(call_with_errno(&f, "timerfd_settime", &[timer as u64, 1, spec as u64, 0]), (0, 0));
+    assert_eq!(
+        call_with_errno(&f, "epoll_wait", &[epfd as u64, events as u64, 4, 0]),
+        (1, 0),
+        "a deadline in the past is already expired"
+    );
+
+    // The kernel's refusals.
+    write_itimerspec(&f, spec, (0, 0), (0, 1_000_000_000));
+    assert_eq!(
+        call_with_errno(&f, "timerfd_settime", &[timer as u64, 0, spec as u64, 0]),
+        (-1, EINVAL_NET),
+        "tv_nsec of a whole second"
+    );
+    let (read_fd, _write_fd) = pipe_through_guest(&f);
+    write_itimerspec(&f, spec, (0, 0), (0, 1));
+    assert_eq!(
+        call_with_errno(&f, "timerfd_settime", &[read_fd as u64, 0, spec as u64, 0]),
+        (-1, EINVAL_NET),
+        "not a timerfd"
+    );
+    let error = refusal_of(&f, "timerfd_create", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+    });
+    assert!(error.to_string().contains("CLOCK_MONOTONIC"), "{error}");
+}
+
+/// **`fsync` syncs a regular file and answers the kernel's `EINVAL` for a pipe.**
+#[test]
+fn fsync_syncs_a_file_and_is_einval_for_a_pipe() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("fsync");
+    let file = open_through_guest(&f, "/db", O_RDWR | O_CREAT);
+    assert_eq!(call_with_errno(&f, "fsync", &[file as u64]), (0, 0));
+    let (read_fd, _write_fd) = pipe_through_guest(&f);
+    assert_eq!(call_with_errno(&f, "fsync", &[read_fd as u64]), (-1, EINVAL_NET));
+    assert_eq!(call_with_errno(&f, "fsync", &[77]), (-1, EBADF_NET));
 }
 
 /// **A write to a pipe whose reader has closed is `EPIPE`**, not a short write and not a refusal.

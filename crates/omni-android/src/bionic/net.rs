@@ -151,6 +151,7 @@ use omni_bionic::net;
 use omni_mem::GuestAddr;
 use omni_platform::fs::{
     EpollMember, EpollOp, Filesystem, FsErrorKind, Readiness, ReadinessSource, EPOLL_CLOEXEC,
+    TFD_TIMER_ABSTIME,
 };
 // **`platnet` rather than `net`**, because `net` in this module is already `omni_bionic::net` —
 // the pure-computation half — and the two are deliberately different crates (D19). A single
@@ -429,6 +430,10 @@ struct Watch {
     sockets: Vec<(i32, Interest)>,
     /// Whether anything named waits on this instance's readiness gate.
     gate: bool,
+    /// The earliest timerfd deadline named, on the monotonic clock: a time at which readiness
+    /// changes with **nothing** announcing it, so no wait may run past it. See
+    /// [`ReadinessSource::Timer`].
+    deadline: Option<Duration>,
 }
 
 impl Watch {
@@ -457,6 +462,13 @@ impl Watch {
                 }
             }
             Some(ReadinessSource::Gate) => self.gate = true,
+            // Re-arming raises the gate; expiring raises nothing, so the deadline is kept too.
+            Some(ReadinessSource::Timer) => {
+                self.gate = true;
+                if let Some(at) = fs.timer_deadline(fd) {
+                    self.deadline = Some(self.deadline.map_or(at, |held| held.min(at)));
+                }
+            }
             // `Immediate` is already ready, so the caller will have counted it and never reached
             // a wait; `None` is a descriptor that is not open, which `poll` has already answered
             // `POLLNVAL` and `select` `EBADF`. Neither is something to wait on.
@@ -492,6 +504,12 @@ fn wait_a_slice(
     seen: u64,
     remaining: Duration,
 ) -> AbiResult<()> {
+    // **Never past a timer's deadline**: its expiry changes readiness and raises nothing, so a
+    // wait that ran past it would report the timer late by whatever was left of the slice.
+    let remaining = match watch.deadline {
+        Some(at) => remaining.min(at.saturating_sub(omni_platform::clock::monotonic_now())),
+        None => remaining,
+    };
     if watch.sockets.is_empty() {
         fs.wait_for_readiness(seen, remaining);
         return Ok(());
@@ -1343,6 +1361,141 @@ fn epoll_revents(readiness: Readiness, asked: u32) -> u32 {
         revents |= EPOLLHUP;
     }
     revents
+}
+
+// ================================================================== timerfd
+
+/// `CLOCK_MONOTONIC`, the one clock a timerfd here can be on -- see `omni_platform::fs::timerfd`.
+const TIMERFD_CLOCK_MONOTONIC: i32 = 1;
+
+/// Bytes of an aarch64 `struct itimerspec`: `it_interval` then `it_value`, each a 16-byte
+/// `timespec`. The engine's own layout agrees: it zeroes `[sp, #8]` and stores the value at
+/// `[sp, #0x18]`, passing `sp + 8` (`libroblox.so` link `0x23cde60`-`0x23cde9c`).
+const ITIMERSPEC_BYTES: usize = 32;
+
+/// `int timerfd_create(int clockid, int flags)`
+///
+/// **`CLOCK_MONOTONIC` only**, the clock the guest's own `clock_gettime` answers, so a deadline
+/// it computes from that clock fires when it meant. `CLOCK_REALTIME` and `CLOCK_BOOTTIME` refuse
+/// by name: a wall-clock timer has to follow the wall clock's jumps, and `clocks` already refuses
+/// the boot clock. Unknown flags are `EINVAL`, from the seam.
+///
+/// MEASURED reader: the engine's transport, link `0x23cc718`, `timerfd_create(CLOCK_MONOTONIC,
+/// TFD_NONBLOCK)`, one call after `epoll_create1` on the client-settings success path.
+pub(super) fn timerfd_create(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (clockid, flags) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        if clockid != TIMERFD_CLOCK_MONOTONIC {
+            return Err(view.refusal(format!(
+                "`timerfd_create` on clock {clockid}. Only CLOCK_MONOTONIC (1) is implemented: it \
+                 is the clock the guest's own clock_gettime reads, and a timer on CLOCK_REALTIME \
+                 must follow the wall clock's jumps, which nothing here models"
+            )));
+        }
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.timerfd_create(flags))? {
+            Settled::Done(fd) => fd,
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int timerfd_settime(int fd, int flags, const struct itimerspec *new_value,
+/// struct itimerspec *old_value)`
+///
+/// Relative (`flags` 0) or absolute (`TFD_TIMER_ABSTIME`), both measured: the transport arms its
+/// one-shot timer each way (`0x23cdea0`, `0x23cdf5c`). `TFD_TIMER_CANCEL_ON_SET` refuses by name
+/// -- it is about wall-clock changes, and there is no wall-clock timer here. A `tv_nsec` outside
+/// `[0, 1e9)` or a negative `tv_sec` is `EINVAL`, the kernel's answer; `old_value`, when given, is
+/// written with what the timer had left, after the new arming is known to be valid.
+pub(super) fn timerfd_settime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, flags, new_value, old_value) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        if flags & !TFD_TIMER_ABSTIME != 0 {
+            if flags & 2 != 0 {
+                return Err(view.refusal(
+                    "`timerfd_settime` with TFD_TIMER_CANCEL_ON_SET, which is about wall-clock \
+                     changes; there is no wall-clock timer in this runtime",
+                ));
+            }
+            view.set_errno(consts::EINVAL);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let at = guest_address(&view, new_value)?;
+        if at == 0 {
+            // Linux: EFAULT. Refused, for the reason `pipe` refuses a null `pipefd`.
+            return Err(view.refusal("`timerfd_settime` was given a null `new_value`"));
+        }
+        let raw = view.mem().read_bytes(
+            at,
+            ITIMERSPEC_BYTES,
+            Blame::new(view.symbol(), view.address(), 2),
+        )?;
+        let field = |offset: usize| {
+            i64::from_le_bytes(raw[offset..offset + 8].try_into().expect("eight bytes"))
+        };
+        let timespec = |seconds: i64, nanos: i64| {
+            if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+                None
+            } else {
+                Some(Duration::new(seconds as u64, nanos as u32))
+            }
+        };
+        match (timespec(field(0), field(8)), timespec(field(16), field(24))) {
+            (Some(interval), Some(value)) => {
+                let fs = filesystem(&view)?;
+                let absolute = flags & TFD_TIMER_ABSTIME != 0;
+                match settle(&view, fs.timerfd_settime(fd, absolute, value, interval))? {
+                    Settled::Done((remaining, old_interval)) => {
+                        if old_value != 0 {
+                            let out = guest_address(&view, old_value)?;
+                            let mut bytes = [0u8; ITIMERSPEC_BYTES];
+                            for (offset, part) in [
+                                (0, old_interval.as_secs()),
+                                (8, u64::from(old_interval.subsec_nanos())),
+                                (16, remaining.as_secs()),
+                                (24, u64::from(remaining.subsec_nanos())),
+                            ] {
+                                bytes[offset..offset + 8].copy_from_slice(&part.to_le_bytes());
+                            }
+                            view.mem().write_bytes(
+                                out,
+                                &bytes,
+                                Blame::new(view.symbol(), view.address(), 3),
+                            )?;
+                        }
+                        0
+                    }
+                    Settled::Failed(errno) => {
+                        view.set_errno(errno);
+                        -1
+                    }
+                }
+            }
+            _ => {
+                view.set_errno(consts::EINVAL);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
 }
 
 // ================================================================== eventfd
@@ -3412,11 +3565,11 @@ mod tests {
     fn a_set_can_become_ready_exactly_when_it_names_a_socket_or_the_gate() {
         assert!(!Watch::default().can_change(), "a set of files and standard streams cannot");
         let socket_only =
-            Watch { sockets: vec![(7, Interest::READABLE)], gate: false };
+            Watch { sockets: vec![(7, Interest::READABLE)], gate: false, deadline: None };
         assert!(socket_only.can_change(), "a socket's readiness is the network's");
-        let gate_only = Watch { sockets: Vec::new(), gate: true };
+        let gate_only = Watch { sockets: Vec::new(), gate: true, deadline: None };
         assert!(gate_only.can_change(), "a pipe or an eventfd is another descriptor's writer");
-        let both = Watch { sockets: vec![(7, Interest::BOTH)], gate: true };
+        let both = Watch { sockets: vec![(7, Interest::BOTH)], gate: true, deadline: None };
         assert!(both.can_change());
     }
 

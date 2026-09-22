@@ -972,6 +972,31 @@ pub(super) fn pread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int fsync(int fd)`
+///
+/// The seam's `File::sync_all` for a regular file, `EINVAL` for a descriptor with nothing to
+/// synchronise, and a refusal by name for a directory -- see `Filesystem::fsync`.
+///
+/// MEASURED reader: the engine's SQLite, on the thread that took the record lock and wrote its
+/// pages -- a transaction's commit. The guest thread died on the `Unbound` this replaces.
+pub(super) fn fsync(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let fd = c.args().next_i32()?;
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.fsync(fd))? {
+            Settled::Done(()) => 0,
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)`
 ///
 /// [`write`] at an offset, through the same [`write_from_guest`] -- so the same rule holds: the
@@ -2024,7 +2049,7 @@ fn record_lock(
     if l_len > 0 && l_start.checked_add(l_len - 1).is_none() {
         return Ok(Settled::Failed(consts::EOVERFLOW));
     }
-    if l_len < 0 && l_start.checked_add(l_len).map_or(true, |start| start < 0) {
+    if l_len < 0 && l_start.checked_add(l_len).is_none_or(|start| start < 0) {
         return Ok(Settled::Failed(consts::EINVAL));
     }
 

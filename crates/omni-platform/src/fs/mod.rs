@@ -76,12 +76,14 @@ mod error;
 pub mod eventfd;
 pub mod path;
 pub mod pipe;
+pub mod timerfd;
 
 pub use error::{FsError, FsErrorKind, FsResult};
 pub use epoll::{EpollMember, EpollOp, EPOLL_CLOEXEC};
 pub use eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
 pub use path::{FinalLink, Resolved, NAME_MAX, PATH_MAX};
 pub use pipe::{PipeEnd, Readiness, ReadyGate, PIPE_BUF, PIPE_CAPACITY};
+pub use timerfd::{TimerFd, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME};
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -357,6 +359,11 @@ enum Entry {
     /// See [`epoll`]. The one kind whose readiness is not its own -- it is its members' -- so it
     /// is the one kind [`Entry::readiness`] does not answer, and asking refuses by name.
     Epoll(epoll::EpollSet),
+    /// A timer: the one kind whose readiness changes with **time**, which no writer announces.
+    ///
+    /// See [`timerfd`]. [`ReadinessSource::Timer`] is how a waiter learns it must cap its wait at
+    /// the deadline.
+    TimerFd(timerfd::TimerFd),
     /// A socket: the first kind here whose readiness is the **operating system's** answer rather
     /// than this process's own state.
     ///
@@ -436,6 +443,8 @@ impl Entry {
             // question about every member at once and about more than one waiting side. No run
             // has asked it; `Filesystem::readiness` refuses by name.
             Entry::Epoll(_) => return None,
+            // On the clock the guest's own `CLOCK_MONOTONIC` reads -- see `timerfd`.
+            Entry::TimerFd(timer) => timer.readiness(crate::clock::monotonic_now()),
             // **The one kind whose answer is a question for the operating system**, and therefore
             // the one that can fail where this function cannot. See
             // [`SOCKET_READINESS_UNAVAILABLE`] for why a refused poll is reported as an error
@@ -476,6 +485,11 @@ pub enum ReadinessSource {
     /// A socket: the host's own readiness call, [`crate::net::poll`], is the only thing that can
     /// wait for it.
     Host,
+    /// A timerfd: its readiness changes when its **deadline** passes, which raises nothing -- so a
+    /// waiter caps its wait at [`Filesystem::timer_deadline`] -- and when it is re-armed, which
+    /// raises the gate. Both halves are needed: the first is the timer firing, the second is
+    /// another thread moving it.
+    Timer,
 }
 
 /// A character device the guest can open by its POSIX path.
@@ -1066,6 +1080,80 @@ impl Filesystem {
         matches!(self.table().open.get(&fd), Some(Entry::Epoll(_)))
     }
 
+    /// `timerfd_create(2)` on `CLOCK_MONOTONIC`, disarmed. The clock is the caller's decision to
+    /// refuse; see [`timerfd`] for why it can only be this one.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::InvalidInput`] for a flag outside [`timerfd::KNOWN_FLAGS`], and
+    /// [`FsErrorKind::TooManyOpenFiles`] past [`MAX_OPEN_FILES`].
+    pub fn timerfd_create(&self, flags: i32) -> FsResult<i32> {
+        const OP: &str = "timerfd_create";
+        let unknown = flags & !timerfd::KNOWN_FLAGS;
+        if unknown != 0 {
+            return Err(FsError::kinded(
+                OP,
+                "a timerfd",
+                FsErrorKind::InvalidInput,
+                format!("flags {flags:#o} contain {unknown:#o}, which `timerfd_create` does not define"),
+            ));
+        }
+        let mut table = self.table();
+        if table.open.len() + 1 > MAX_OPEN_FILES {
+            return Err(FsError::kinded(
+                OP,
+                "a timerfd",
+                FsErrorKind::TooManyOpenFiles,
+                format!(
+                    "this guest instance holds {} of {MAX_OPEN_FILES} descriptors",
+                    table.open.len()
+                ),
+            ));
+        }
+        let timer =
+            timerfd::TimerFd::new(flags & timerfd::TFD_NONBLOCK != 0, Arc::clone(&self.gate));
+        let fd = table.lowest_free_fd();
+        table.open.insert(fd, Entry::TimerFd(timer));
+        Ok(fd)
+    }
+
+    /// `timerfd_settime(2)`: arm or disarm `fd`, returning `(remaining, interval)` as it was.
+    ///
+    /// # Errors
+    ///
+    /// `EBADF` for a descriptor that is not open and `EINVAL` for one that is not a timerfd --
+    /// the kernel's two answers.
+    pub fn timerfd_settime(
+        &self,
+        fd: i32,
+        absolute: bool,
+        value: Duration,
+        interval: Duration,
+    ) -> FsResult<(Duration, Duration)> {
+        match self.table().open.get(&fd) {
+            None => Err(bad_fd("timerfd_settime", fd)),
+            Some(Entry::TimerFd(timer)) => {
+                Ok(timer.settime(absolute, value, interval, crate::clock::monotonic_now()))
+            }
+            Some(_) => Err(FsError::kinded(
+                "timerfd_settime",
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "not a timerfd",
+            )),
+        }
+    }
+
+    /// The next expiry of the timerfd `fd` on the monotonic clock, or `None` when `fd` is not an
+    /// armed timerfd. What a waiter caps its wait at -- see [`ReadinessSource::Timer`].
+    #[must_use]
+    pub fn timer_deadline(&self, fd: i32) -> Option<Duration> {
+        match self.table().open.get(&fd) {
+            Some(Entry::TimerFd(timer)) => timer.deadline(),
+            _ => None,
+        }
+    }
+
     /// The counter behind `fd`, or `None` when `fd` is not an eventfd.
     ///
     /// Diagnostic: the guest reads the counter with `read`, which is destructive, so a host that
@@ -1170,6 +1258,7 @@ impl Filesystem {
             // Its members may be on both sides, so no one answer is true; `readiness` refuses an
             // epoll descriptor before a caller would ask where to wait for it.
             Entry::Epoll(_) => None,
+            Entry::TimerFd(_) => Some(ReadinessSource::Timer),
         }
     }
 
@@ -1241,6 +1330,7 @@ impl Filesystem {
             None => Err(bad_fd("is_nonblocking", fd)),
             Some(Entry::Pipe(handle)) => Ok(handle.nonblocking()),
             Some(Entry::EventFd(counter)) => Ok(counter.nonblocking()),
+            Some(Entry::TimerFd(timer)) => Ok(timer.nonblocking()),
             // The socket's own record of the flag, which is what `set_nonblocking` put on the
             // host descriptor. Read back from the socket rather than remembered here, so that the
             // answer to `fcntl(F_GETFL)` cannot disagree with what the kernel was told.
@@ -1271,6 +1361,10 @@ impl Filesystem {
             }
             Some(Entry::EventFd(counter)) => {
                 counter.set_nonblocking(nonblocking);
+                Ok(())
+            }
+            Some(Entry::TimerFd(timer)) => {
+                timer.set_nonblocking(nonblocking);
                 Ok(())
             }
             // **The host is told, not just this table.** A pipe's flag is a field this process
@@ -1459,6 +1553,7 @@ impl Filesystem {
                 "an epoll descriptor cannot be read or written (EINVAL)",
             )),
             Some(Entry::EventFd(counter)) => counter.read(buf),
+            Some(Entry::TimerFd(timer)) => timer.read(buf, crate::clock::monotonic_now()),
             // **`read` on a socket is `recv`, and it is refused here rather than performed, for
             // one reason: the failure would lose its classification on the way out.**
             //
@@ -1547,6 +1642,12 @@ impl Filesystem {
                 FsErrorKind::InvalidInput,
                 "an eventfd is a counter with no offset to read at (ESPIPE), and its read                  consumes what it returns",
             )),
+            Some(Entry::TimerFd(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::NotSeekable,
+                "a timerfd has no offset (ESPIPE)",
+            )),
             Some(Entry::Epoll(_)) => Err(FsError::kinded(
                 OP,
                 format!("fd {fd}"),
@@ -1601,6 +1702,49 @@ impl Filesystem {
         }
     }
 
+    /// `fsync(2)`: push a regular file's data and metadata to the device.
+    ///
+    /// `File::sync_all`, portable `std` -- `FlushFileBuffers` on Windows, `fsync` on unix -- so no
+    /// backend. A descriptor with nothing to synchronise (pipe, socket, eventfd, timerfd, epoll,
+    /// standard stream, device) is `EINVAL`, which is Linux's answer for "a special file which
+    /// does not support synchronization".
+    ///
+    /// # Errors
+    ///
+    /// As above; `EBADF` for no such descriptor; and [`FsError::Refused`] for a **directory**:
+    /// Linux syncs one (SQLite does, after creating a journal), `std` has no directory handle to
+    /// flush, and no run has reached it yet -- so it refuses by name rather than answering.
+    pub fn fsync(&self, fd: i32) -> FsResult<()> {
+        const OP: &str = "fsync";
+        let table = self.table();
+        match table.open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::File { file, guest, .. }) => {
+                file.sync_all().map_err(|error| FsError::io(OP, guest, &error))
+            }
+            Some(Entry::Directory { guest, .. }) => Err(FsError::refused(
+                OP,
+                guest.clone(),
+                "fsync on a directory: Linux supports it and `std` has no directory handle to \
+                 flush; no run has reached it, so it is refused by name rather than answered",
+            )),
+            Some(
+                Entry::Standard(_)
+                | Entry::Device(_)
+                | Entry::Pipe(_)
+                | Entry::EventFd(_)
+                | Entry::Socket(_)
+                | Entry::Epoll(_)
+                | Entry::TimerFd(_),
+            ) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "the descriptor has nothing to synchronise (EINVAL)",
+            )),
+        }
+    }
+
     /// `lseek(2)`: move the descriptor's offset and return where it now is.
     ///
     /// Portable `std` -- `Seek` for `&File` -- so no backend. `whence` is Linux's numbering
@@ -1624,7 +1768,8 @@ impl Filesystem {
                 | Entry::Socket(_)
                 | Entry::EventFd(_)
                 | Entry::Standard(_)
-                | Entry::Epoll(_),
+                | Entry::Epoll(_)
+                | Entry::TimerFd(_),
             ) => {
                 Err(FsError::kinded(
                     OP,
@@ -1699,6 +1844,12 @@ impl Filesystem {
                 format!("fd {fd}"),
                 FsErrorKind::InvalidInput,
                 "an eventfd is a counter with no offset to write at (ESPIPE)",
+            )),
+            Some(Entry::TimerFd(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::NotSeekable,
+                "a timerfd has no offset (ESPIPE)",
             )),
             Some(Entry::Epoll(_)) => Err(FsError::kinded(
                 OP,
@@ -1789,6 +1940,13 @@ impl Filesystem {
                 "an epoll descriptor cannot be read or written (EINVAL)",
             )),
             Some(Entry::EventFd(counter)) => counter.write(buf),
+            // Linux: a timerfd is armed with `timerfd_settime`, and `write` on one is `EINVAL`.
+            Some(Entry::TimerFd(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "a timerfd cannot be written (EINVAL); it is armed with timerfd_settime",
+            )),
             // `write` on a socket is `send`, and it is refused here for the two reasons the
             // `read` arm gives at length: the failure kinds do not survive the trip through
             // `FsErrorKind`, and a blocking send cannot be waited out on a gate nothing raises
@@ -1936,6 +2094,15 @@ impl Filesystem {
             // that found it would be entitled to rely on.
             // An anonymous inode, as the eventfd arm below, and for the same reason nothing about
             // the interest list is reported: `fstat` is not how Linux describes one.
+            Some(Entry::TimerFd(_)) => Ok(FileStat {
+                kind: FileKind::Other,
+                size: 0,
+                read_only: false,
+                accessed: None,
+                modified: None,
+                created: None,
+                identity: identity(Path::new("/proc/self/fd/anon_inode:[timerfd]")),
+            }),
             Some(Entry::Epoll(_)) => Ok(FileStat {
                 kind: FileKind::Other,
                 size: 0,

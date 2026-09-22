@@ -434,6 +434,20 @@ fn add_fd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let bionic = crate::bionic::active(c.symbol(), c.address())?;
         // An epoll descriptor's readiness is its members' and the seam does not answer it; the
         // poll below would read that refusal as ALOOPER_EVENT_INVALID, so it is refused here.
+        // A timerfd is refused for a neighbouring reason: its readiness changes at a deadline
+        // that raises nothing, and the looper's wait does not cap itself at one, so a registered
+        // timer would be reported late by up to a whole wait.
+        if bionic.bionic.filesystem().is_some_and(|fs| {
+            fs.readiness_source(fd) == Some(omni_platform::fs::ReadinessSource::Timer)
+        }) {
+            return Err(refuse_inline(
+                c,
+                format!(
+                    "`ALooper_addFd` was given fd {fd}, a timerfd, and the looper's wait does not \
+                     wake at a timer's deadline. No run has reached it"
+                ),
+            ));
+        }
         if bionic.bionic.filesystem().is_some_and(|fs| fs.is_epoll(fd)) {
             return Err(refuse_inline(
                 c,

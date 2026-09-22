@@ -1403,6 +1403,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // mirror of `pread`, through the same write loop. Outside Task 1's 188;
     // `BEYOND_THE_PREDICTION` records how it was found.
     ("pwrite", files::pwrite),
+    // M6: SQLite committing, on the same thread. Outside Task 1's 188; `BEYOND_THE_PREDICTION`
+    // records how it was found.
+    ("fsync", files::fsync),
     ("__write_chk", net::write_chk),
     ("access", files::access),
     ("getcwd", files::getcwd),
@@ -1479,6 +1482,10 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("epoll_create1", net::epoll_create1),
     ("epoll_ctl", net::epoll_ctl),
     ("epoll_wait", net::epoll_wait),
+    // M6: the same transport's timer, one call after epoll_create1. CLOCK_MONOTONIC only.
+    // Outside Task 1's 188; `BEYOND_THE_PREDICTION` records how each was found.
+    ("timerfd_create", net::timerfd_create),
+    ("timerfd_settime", net::timerfd_settime),
     // ---- M6: the socket surface. Four of these eight were in phase 3d's "refused by name" list
     // and the other four are outside Task 1's 188 entirely -- `BEYOND_THE_PREDICTION` in
     // `tests/bionic.rs` carries how each was found. D30 withdrew Global Constraint 8, and what
