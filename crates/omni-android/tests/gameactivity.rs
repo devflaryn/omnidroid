@@ -41,9 +41,10 @@ use omni_android::jni::classes::Answer;
 use omni_android::jni::{script, slots, Jni};
 use omni_android::ndk::assets::{AssetSource, ASSET_MANAGER_CLASS};
 use omni_android::ndk::{
-    DeviceConfiguration, Ndk, ScreenSize, WindowGeometry, ACONFIGURATION_NAVHIDDEN_NO,
-    SURFACE_CLASS,
+    DeviceConfiguration, HostWindowSource, Ndk, ScreenSize, WindowGeometry, WindowSource,
+    ACONFIGURATION_NAVHIDDEN_NO, SURFACE_CLASS,
 };
+use omni_android::vulkan::{Vulkan, VulkanHost};
 use omni_android::{Boundary, BoundaryBuilder, GuestArg};
 use omni_cpu::dynarmic::{DynarmicBackend, DynarmicCpu, DynarmicOptions};
 use omni_cpu::{GuestAddr, GuestCpu, RunLimit, XReg};
@@ -53,6 +54,16 @@ use omni_mem::{Backing, CommitPolicy, GuestSpace, MapExecutability, Placement, P
 use omni_platform::net::NetPolicy;
 
 const APK_NAME: &str = "Roblox-2.738.1397.apk";
+
+/// The switch every live-GPU test in this crate already uses, and the one that decides whether
+/// this gate gives the engine **a real window and a real Vulkan driver**.
+///
+/// Off, the gate is what it was: a constant geometry and no Vulkan bound, so `dlopen("libvulkan.so")`
+/// answers NULL and the run says so. On, the engine is handed an `ANativeWindow` backed by a
+/// resizable desktop window through [`HostWindowSource`], and `vkGetInstanceProcAddr` reaches this
+/// machine's driver through `omni_gfx::GfxVulkanHost` -- the same two seams the Vulkan stage tests
+/// verified against a real GPU, now driven by the engine instead of by assembled test code.
+const GRAPHICS_GATE: &str = "OMNI_GFX_WINDOW_TESTS";
 const MAIN_LIB: &str = "libroblox.so";
 
 /// `DT_INIT_ARRAY` entries in `libroblox.so`. The same exact figure M3's and M4's gates assert.
@@ -286,6 +297,8 @@ struct Guest {
     bionic: Arc<Bionic>,
     jni: Arc<Jni>,
     ndk: Arc<Ndk>,
+    /// Bound only under [`GRAPHICS_GATE`]; see [`Guest::load`].
+    vulkan: Option<Arc<Vulkan>>,
     boundary: Arc<Boundary>,
     object: LoadedObject,
     stack_top: GuestAddr,
@@ -308,7 +321,10 @@ fn device_configuration() -> DeviceConfiguration {
 }
 
 impl Guest {
-    fn load() -> Self {
+    /// `graphics` is the host driver to bind Vulkan to, when [`GRAPHICS_GATE`] asked for one.
+    /// `None` binds no Vulkan at all -- not an unhosted one, which would hand the engine a loader
+    /// whose every call refuses -- so the default gate's `dlopen("libvulkan.so")` stays NULL.
+    fn load(graphics: Option<Arc<dyn VulkanHost>>) -> Self {
         let path = cached_main_lib();
         let bytes = main_lib_bytes();
         let backing =
@@ -325,15 +341,28 @@ impl Guest {
 
         let bionic = Bionic::new(Arc::clone(&space)).expect("a bionic instance");
         let ndk = Ndk::new(Arc::clone(&space)).expect("an NDK instance");
-        // Room for every import, the 241 JNI slots and the NDK surface.
+        // Room for every import, the 241 JNI slots and the NDK surface -- and, with graphics, the
+        // Vulkan loader's pool and the data area its handle registries need (8192, not 4096:
+        // `vulkan::REQUIRED_DATA_BYTES` records why no smaller arrangement exists).
+        let (vulkan_slots, data_bytes) = if graphics.is_some() {
+            (omni_android::vulkan::BOUND_SYMBOLS, omni_android::vulkan::REQUIRED_DATA_BYTES)
+        } else {
+            (0, 4096)
+        };
         let builder = BoundaryBuilder::new(
             Arc::clone(&space),
-            TOTAL_IMPORTS + JNI_SLOTS + Ndk::bound_symbols().count(),
-            4096,
+            TOTAL_IMPORTS + JNI_SLOTS + Ndk::bound_symbols().count() + vulkan_slots,
+            data_bytes,
         )
         .expect("a thunk region");
         bionic.bind_into(&builder).expect("bind every bionic handler");
         ndk.bind_into(&builder).expect("bind every NDK handler");
+        let vulkan = graphics.map(|host| {
+            let vulkan = Vulkan::new();
+            vulkan.bind_into(&builder).expect("bind the Vulkan loader");
+            vulkan.set_host(host);
+            vulkan
+        });
         bionic
             .declare_data_into(
                 &builder,
@@ -455,6 +484,7 @@ impl Guest {
             bionic,
             jni,
             ndk,
+            vulkan,
             boundary,
             object,
             stack_top,
@@ -736,7 +766,14 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         );
         omni_platform::net::record::record_first(record_bytes);
     }
-    let guest = Guest::load();
+    let graphics = std::env::var(GRAPHICS_GATE).is_ok_and(|v| v == "1");
+    let host: Option<Arc<dyn VulkanHost>> = graphics.then(|| {
+        omni_gfx::GfxVulkanHost::load().expect(
+            "OMNI_GFX_WINDOW_TESTS=1 asks for this machine's Vulkan driver, and there is no \
+             loader to reach it through",
+        ) as Arc<dyn VulkanHost>
+    });
+    let guest = Guest::load(host);
     let mut cpu = guest.thread();
     guest.boundary.start_census();
 
@@ -1152,9 +1189,46 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // surface is, precisely so that a number nobody chose cannot leak in. This gate is a host, so
     // it chooses — and it chooses a size a desktop window can actually have, not a device
     // profile, because the window this runtime will present in is a resizable host window.
-    guest.ndk.set_window_geometry(
-        WindowGeometry::new(SURFACE_WIDTH, SURFACE_HEIGHT).expect("a positive geometry"),
-    );
+    //
+    // **Or, under [`GRAPHICS_GATE`], it hands the engine a real window**, and the surface size is
+    // whatever that window's client area actually is -- asked of the OS, not assumed from the
+    // size requested, because a desktop window's frame takes its share.
+    let mut window: Option<omni_platform::window::Window> = None;
+    let mut window_source: Option<Arc<HostWindowSource>> = None;
+    let (surface_width, surface_height) = if graphics {
+        let opened = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
+            "Omnidroid - Roblox",
+            SURFACE_WIDTH as u32,
+            SURFACE_HEIGHT as u32,
+        ))
+        .unwrap_or_else(|err| panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"));
+        opened.show();
+        let mut opened = opened;
+        let _ = opened.poll_events().count();
+        let source = HostWindowSource::watching(&opened).expect("a source watching the window");
+        let size = source.geometry().expect("a freshly shown window has pixels");
+        guest.ndk.set_window_source(Arc::clone(&source) as Arc<dyn WindowSource>);
+        let _ = writeln!(
+            std::io::stderr(),
+            "GRAPHICS: a real window, client area {}x{}, and Vulkan bound to this machine's driver",
+            size.width,
+            size.height
+        );
+        window = Some(opened);
+        window_source = Some(source);
+        (size.width, size.height)
+    } else {
+        guest.ndk.set_window_geometry(
+            WindowGeometry::new(SURFACE_WIDTH, SURFACE_HEIGHT).expect("a positive geometry"),
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "GRAPHICS: NOT ATTEMPTED -- a constant {SURFACE_WIDTH}x{SURFACE_HEIGHT} geometry and \
+             no Vulkan bound, so dlopen(\"libvulkan.so\") answers NULL. Set {GRAPHICS_GATE}=1 \
+             to give the engine a real window and this machine's driver."
+        );
+        (SURFACE_WIDTH, SURFACE_HEIGHT)
+    };
     let surface = {
         let _jni = guest.jni.activate().expect("publish the JNI instance");
         guest.jni.new_object(SURFACE_CLASS).expect("a Java Surface")
@@ -1539,8 +1613,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 // `omni-texture` transcodes into; a value nothing here can produce would be a
                 // number invented for a field the engine reads.
                 GuestArg::Int(1),
-                GuestArg::Int(SURFACE_WIDTH as u64),
-                GuestArg::Int(SURFACE_HEIGHT as u64),
+                GuestArg::Int(surface_width as u64),
+                GuestArg::Int(surface_height as u64),
             ],
         ),
         ("onStartNative", "(J)V", vec![]),
@@ -1552,8 +1626,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             vec![
                 GuestArg::Int(0),
                 GuestArg::Int(0),
-                GuestArg::Int(SURFACE_WIDTH as u64),
-                GuestArg::Int(SURFACE_HEIGHT as u64),
+                GuestArg::Int(surface_width as u64),
+                GuestArg::Int(surface_height as u64),
             ],
         ),
         ("onWindowInsetsChangedNative", "(J)V", vec![]),
@@ -1706,8 +1780,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     vec![
                         GuestArg::Int(surface),
                         GuestArg::Int(1),
-                        GuestArg::Int(SURFACE_WIDTH as u64),
-                        GuestArg::Int(SURFACE_HEIGHT as u64),
+                        GuestArg::Int(surface_width as u64),
+                        GuestArg::Int(surface_height as u64),
                     ],
                 ),
             ] {
@@ -1812,8 +1886,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                         vec![
                             GuestArg::Int(surface),
                             GuestArg::Int(1),
-                            GuestArg::Int(SURFACE_WIDTH as u64),
-                            GuestArg::Int(SURFACE_HEIGHT as u64),
+                            GuestArg::Int(surface_width as u64),
+                            GuestArg::Int(surface_height as u64),
                         ],
                     ),
                 ] {
@@ -1885,7 +1959,31 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         if guest.bionic.live_guest_threads() == 0 {
             break;
         }
+        // The window's own thread is this one, so this is where it is pumped and sampled: a
+        // window nobody pumps is one the OS marks as not responding, and a geometry nobody
+        // samples goes stale at the first resize.
+        if let (Some(open), Some(source)) = (window.as_mut(), window_source.as_ref()) {
+            let _ = open.poll_events().count();
+            let _ = source.sample(open);
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // **What the engine asked the Vulkan loader for, in order** -- the census the stage tests
+    // said the first run that reached graphics would produce. Printed whether or not anything
+    // was asked, so an empty list is a reading and not a missing line.
+    match &guest.vulkan {
+        Some(vulkan) => {
+            let names = vulkan.names();
+            let _ = writeln!(
+                std::io::stderr(),
+                "VULKAN: the engine resolved {} entry point(s): {names:?}\n{}",
+                names.len(),
+                vulkan.report()
+            );
+        }
+        None => {
+            let _ = writeln!(std::io::stderr(), "VULKAN: not bound ({GRAPHICS_GATE} unset)");
+        }
     }
 
     // ---- teardown, which is not a formality --------------------------------------------------
