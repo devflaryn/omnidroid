@@ -129,6 +129,13 @@ pub const STDERR_FD: i32 = 2;
 /// correct caller already has a branch for.
 pub const MAX_OPEN_FILES: usize = 64;
 
+/// How many distinct missing paths [`Filesystem::open_misses`] keeps.
+///
+/// A bound rather than a growing list, because a guest that retries a missing file in a loop would
+/// otherwise turn a diagnostic into a leak. 256 is far more than any run has produced and small
+/// enough to print.
+pub const MAX_RECORDED_MISSES: usize = 256;
+
 /// How many directory streams one guest instance may hold open at once.
 pub const MAX_OPEN_DIRS: usize = 16;
 
@@ -576,6 +583,8 @@ struct DirStream {
 pub struct Filesystem {
     root: PathBuf,
     table: Mutex<Table>,
+    /// Guest paths `open` was asked for and could not produce. See [`Filesystem::open_misses`].
+    misses: Mutex<Vec<Vec<u8>>>,
     /// Rises whenever any pipe in this instance changes state. See [`pipe::ReadyGate`]: it is how
     /// a caller waits for readiness without this seam ever choosing how long to wait.
     gate: Arc<ReadyGate>,
@@ -623,6 +632,7 @@ impl Filesystem {
         }
         Ok(Filesystem {
             root: canonical,
+            misses: Mutex::new(Vec::new()),
             table: Mutex::new(Table {
                 open: BTreeMap::from([
                     (STDIN_FD, Entry::Standard(StdStream::In)),
@@ -691,6 +701,44 @@ impl Filesystem {
     /// [`FsError::Io`] for a host failure, including [`FsErrorKind::TooManyOpenFiles`] when this
     /// instance already holds [`MAX_OPEN_FILES`].
     pub fn open(&self, guest_path: &[u8], flags: OpenFlags) -> FsResult<i32> {
+        let outcome = self.open_inner(guest_path, flags);
+        if outcome.is_err() {
+            let mut misses = self.misses.lock().expect("the miss list is not poisoned");
+            // Bounded, and **keeping the oldest**: the first thing a guest could not find is what
+            // explains the rest, and a run that asks for one missing file in a retry loop must not
+            // push it out with copies of itself.
+            if misses.len() < MAX_RECORDED_MISSES && !misses.iter().any(|seen| seen == guest_path) {
+                misses.push(guest_path.to_vec());
+            }
+        }
+        outcome
+    }
+
+    /// Guest paths this instance was asked to open and could not, oldest first, deduplicated.
+    ///
+    /// # Why a seam needs this at all
+    ///
+    /// A missing file is not an error this layer can see the consequence of. `open` answers
+    /// `ENOENT`, which is a perfectly ordinary thing for a guest to be told and to handle — so the
+    /// failure is *correct here* and lands somewhere else entirely, in whatever the guest does
+    /// without the file.
+    ///
+    /// **MEASURED, and it is what this was added for.** Roblox's settings fetch exchanged bytes
+    /// over real sockets in both directions and then reported `HttpError: Unknown`, with no refusal
+    /// and no dead thread anywhere in the run. The APK ships `assets/ssl/cacert.pem` — 228,725
+    /// bytes of certificate authorities — and OpenSSL's compiled-in default store is
+    /// `/actions-runner/_work/openssl/openssl/pkg/ssl/cert.pem`, a build machine's path that exists
+    /// on no device. On Android the Java side puts the bundle where the engine can open it; D7 says
+    /// the Java side is *defined* rather than executed, so if nothing here does it, nothing does.
+    ///
+    /// An `ENOENT` is the quietest possible failure and this is the only place that can say it
+    /// happened.
+    #[must_use]
+    pub fn open_misses(&self) -> Vec<Vec<u8>> {
+        self.misses.lock().expect("the miss list is not poisoned").clone()
+    }
+
+    fn open_inner(&self, guest_path: &[u8], flags: OpenFlags) -> FsResult<i32> {
         const OP: &str = "open";
         let shown = path::display(guest_path);
         if !flags.read && !flags.write && !flags.directory {

@@ -553,7 +553,31 @@ impl Scratch {
         // on a device.
         "data/data/com.roblox.client/obb",
         "storage/emulated/0/Android/obb/com.roblox.client",
+        // The engine's own TLS store lives here; see `CA_BUNDLE_IN_APK`.
+        "data/data/com.roblox.client/files/exe",
     ];
+
+    /// Where the APK keeps its certificate authorities, and where the engine looks for them.
+    ///
+    /// # This is the Java side's job, and D7 says the Java side is defined rather than executed
+    ///
+    /// **MEASURED, by the miss recorder `Filesystem::open_misses`.** The settings fetch exchanged
+    /// bytes over real sockets in both directions and then reported `HttpError: Unknown`, with no
+    /// refusal, no dead thread and nothing else wrong in the run. What the engine could not find
+    /// was `/data/data/com.roblox.client/files/exe/cacert.pem`, and OpenSSL's compiled-in default
+    /// store is `/actions-runner/_work/openssl/openssl/pkg/ssl/cert.pem` -- a build machine's path
+    /// that exists on no device, which is why the bundle is shipped and placed rather than found.
+    ///
+    /// The APK carries it at `assets/ssl/cacert.pem`, 228,725 bytes. On a device the Java side
+    /// unpacks it into the app's files directory before the engine starts; nothing here executes
+    /// that Java, so the host does it, exactly as it already supplies the app's directories, the
+    /// SDK version and the client-settings document.
+    ///
+    /// **It is copied, not invented.** The bytes are the APK's own. A host that substituted its
+    /// own trust store would be deciding, on the guest's behalf, which authorities Roblox trusts.
+    const CA_BUNDLE_IN_APK: &'static str = "ssl/cacert.pem";
+    /// Where the engine opens it, measured rather than assumed. See [`Self::CA_BUNDLE_IN_APK`].
+    const CA_BUNDLE_IN_GUEST: &'static str = "data/data/com.roblox.client/files/exe/cacert.pem";
 
     fn new(tag: &str) -> Scratch {
         let mut at = std::env::temp_dir();
@@ -577,6 +601,21 @@ impl Scratch {
         }
         std::fs::write(at.join("data/app/com.roblox.client/base.apk"), b"")
             .expect("a placeholder for the package's own apk");
+        // The certificate authorities, out of the APK and into the path the engine opens. See
+        // `CA_BUNDLE_IN_APK` for why this is the host's job and why the bytes are the APK's own.
+        let apk = omni_apk::Apk::open(apk_path()).expect("the real APK");
+        let bundle = apk
+            .read_asset(Self::CA_BUNDLE_IN_APK)
+            .expect("the APK's certificate authorities");
+        assert!(
+            bundle.starts_with(b"##
+## Bundle of CA Root Certificates")
+                || bundle.windows(27).any(|w| w == b"-----BEGIN CERTIFICATE-----"),
+            "the bytes at {} are not a PEM bundle, and copying them would be a guess",
+            Self::CA_BUNDLE_IN_APK,
+        );
+        std::fs::write(at.join(Self::CA_BUNDLE_IN_GUEST), &bundle)
+            .expect("the certificate authorities, where the engine looks for them");
         Scratch(at)
     }
 }
@@ -1746,6 +1785,22 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         let census = guest.boundary.census();
         let count =
             |symbol: &str| -> u64 { census.as_ref().and_then(|c| c.get(symbol).copied()).unwrap_or(0) };
+        // **Every path the engine asked for and did not get.** An `ENOENT` is the quietest
+        // failure this runtime can produce: `open` answers it correctly, the guest handles it
+        // correctly, and whatever goes wrong goes wrong somewhere else entirely. See
+        // `Filesystem::open_misses` for the measurement that made this worth printing.
+        if let Some(fs) = guest.bionic.filesystem() {
+            let misses = fs.open_misses();
+            let _ = writeln!(
+                std::io::stderr(),
+                "POST-TEARDOWN missing paths ({}): {:?}",
+                misses.len(),
+                misses
+                    .iter()
+                    .map(|path| String::from_utf8_lossy(path).into_owned())
+                    .collect::<Vec<_>>()
+            );
+        }
         let _ = writeln!(
             std::io::stderr(),
             "POST-TEARDOWN net census: {:?}",

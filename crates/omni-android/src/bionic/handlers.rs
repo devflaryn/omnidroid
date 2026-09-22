@@ -205,6 +205,12 @@ handlers! {
     /// `void *memchr(const void *s, int c, size_t n)`
     fn memchr(s: ptr, c: i32, n: u64) -> u64 = |v| omni_bionic::mem::memchr(&v, s, c, n);
 
+    /// `void *memrchr(const void *s, int c, size_t n)` -- the GNU extension, scanning backwards.
+    ///
+    /// MEASURED: the engine reaches it while parsing the certificate bundle the APK ships, which
+    /// is what a PEM reader does to find the last `-----END CERTIFICATE-----` in a block.
+    fn memrchr(s: ptr, c: i32, n: u64) -> u64 = |v| omni_bionic::mem::memrchr(&v, s, c, n);
+
     /// `void *__memcpy_chk(void *dst, const void *src, size_t n, size_t dst_len)` — FORTIFY.
     fn memcpy_chk(dst: ptr, src: ptr, n: u64, dst_len: u64) -> u64 =
         |v| omni_bionic::mem::memcpy_chk(&mut v, dst, src, n, dst_len);
@@ -1197,6 +1203,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("memset", memset),
     ("memcmp", memcmp),
     ("memchr", memchr),
+    ("memrchr", memrchr),
     ("__memcpy_chk", memcpy_chk),
     ("__memset_chk", memset_chk),
     // strings

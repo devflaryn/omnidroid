@@ -174,6 +174,43 @@ pub fn memchr(mem: &impl GuestMemory, s: u64, c: i32, n: u64) -> Result<u64, Fau
     Ok(0)
 }
 
+/// `void *memrchr(const void *s, int c, size_t n)`
+///
+/// [`memchr`] from the other end: scans the `n` bytes at `s` **backwards** and returns the address
+/// of the *last* match, or guest `NULL`. A zero-length scan returns `NULL` without touching memory.
+///
+/// # It is a GNU extension that bionic has, and the difference matters
+///
+/// `memrchr` is not in C. glibc and bionic both provide it; it is declared in `<string.h>` behind
+/// `_GNU_SOURCE`. So a guest calling it is not doing anything unusual on Android, and there is no
+/// portable fallback this layer could have expected it to use instead.
+///
+/// **MEASURED**: the engine reaches it while parsing the certificate bundle the APK ships
+/// (`assets/ssl/cacert.pem`, 228,725 bytes of PEM). Scanning backwards is how you find the last
+/// `-----END CERTIFICATE-----` boundary in a block, which is exactly what a PEM reader does.
+///
+/// The chunked walk mirrors [`memchr`]'s, backwards: `done` counts bytes already examined from the
+/// **end**, each read covers `[s + n - done - chunk, s + n - done)`, and the position search is
+/// `rposition` so the *last* match inside a chunk wins. Reading forwards and remembering the last
+/// hit would also be correct and would touch every byte of a 228 KB buffer to answer a question
+/// that is usually settled in the final few.
+pub fn memrchr(mem: &impl GuestMemory, s: u64, c: i32, n: u64) -> Result<u64, Fault> {
+    let (s, n) = checked_range(s, n)?;
+    let want = (c & 0xFF) as u8;
+    let mut buf = [0u8; 256];
+    let mut done = 0u64;
+    while done < n {
+        let chunk = (n - done).min(buf.len() as u64) as usize;
+        let at = s + n - done - chunk as u64;
+        mem.read(at, &mut buf[..chunk])?;
+        if let Some(pos) = buf[..chunk].iter().rposition(|&b| b == want) {
+            return ok_ptr(at + pos as u64);
+        }
+        done += chunk as u64;
+    }
+    Ok(0)
+}
+
 /// `void *__memcpy_chk(void *dst, const void *src, size_t n, size_t dst_size)`
 ///
 /// FORTIFY form of [`memcpy`]: the compiler passes the destination's object size, and the
