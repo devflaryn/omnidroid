@@ -232,6 +232,12 @@ pub const fn mrs_cntpct_el0(rt: u32) -> u32 {
     mrs(rt, 3, 3, 14, 0, 1)
 }
 
+/// `MRS Xt, CNTVCT_EL0` — `S3_3_C14_C0_2`. The virtual count: what Android's userspace clock
+/// reads, and what `libroblox.so` executes at link `0x229d184`.
+pub const fn mrs_cntvct_el0(rt: u32) -> u32 {
+    mrs(rt, 3, 3, 14, 0, 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

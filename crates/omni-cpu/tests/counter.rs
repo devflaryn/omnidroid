@@ -45,6 +45,41 @@ fn the_counter_registers_encode_as_the_manual_says() {
     assert_eq!(mrs_cntpct_el0(0), mrs_cntfrq_el0(0) | 0x20);
     // And `Rt` is the low five bits.
     assert_eq!(mrs_cntpct_el0(9), 0xD53B_E029);
+    // CNTVCT_EL0 is S3_3_C14_C0_2, `op2` = 2. Checked against a word out of `libroblox.so`
+    // itself: `mrs x8, cntvct_el0` at link 0x229d184 is 0xd53be048.
+    assert_eq!(mrs_cntvct_el0(8), 0xD53B_E048);
+}
+
+/// **`CNTVCT_EL0` is readable, and it is the same clock as `CNTPCT_EL0`.**
+///
+/// The pin's `MRS` did not know the virtual count, so the read fell to the interpreter fallback and
+/// stopped the guest with `UnsupportedInstruction { encoding: 0xd53be048 }` -- MEASURED on M6's
+/// gate, which lost a guest worker to it at link `0x229d184` on every run once the settings fetch
+/// completed. `dynarmic-sys/patches/0001` answers it with the physical count, because EL0 reads
+/// `CNTPCT_EL0 - CNTVOFF_EL2` and Linux arm64 zeroes the offset when it boots at EL2.
+///
+/// Asserted as **one clock read three times** -- physical, virtual, physical, in one run -- so the
+/// virtual reading must lie between the two physical ones. The exit catches the fallback; the
+/// bracket catches a virtual count kept on its own epoch, which is what a nonzero `CNTVOFF_EL2`
+/// would look like.
+#[test]
+fn cntvct_reads_the_same_clock_as_cntpct() {
+    let guest = Guest::new();
+    let entry = guest.load(&[mrs_cntpct_el0(0), mrs_cntvct_el0(1), mrs_cntpct_el0(2), ret(30)]);
+    let (mut cpu, sentinel) = guest.thread();
+    cpu.set_x(x(30), sentinel as u64);
+
+    let exit = cpu.run(entry, RunLimit::Unlimited).expect("a run that returns");
+    assert!(
+        matches!(exit, ExitReason::Returned { .. }),
+        "`mrs x1, cntvct_el0` must execute rather than stop the guest: {exit}"
+    );
+    let (before, virtual_count, after) = (cpu.x(x(0)), cpu.x(x(1)), cpu.x(x(2)));
+    assert!(
+        before <= virtual_count && virtual_count <= after,
+        "CNTVCT_EL0 read {virtual_count}, outside the CNTPCT_EL0 readings {before}..={after} taken \
+         on either side of it -- so it is not the same counter"
+    );
 }
 
 /// The guest must read back the frequency this backend programmed, exactly (Global Constraint 3).

@@ -7,7 +7,8 @@ dynarmic/
     revision   9d4582339990d4eae53f1dc7160686920fc2075c
     version    6.7.0 (2024-03-05)
     licence    ISC / 0BSD  (see dynarmic/LICENSE.txt)
-    state      pristine at that revision; no Omnidroid patches applied yet
+    state      that revision plus ../patches/0001-a64-mrs-cntvct_el0.patch
+               (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
     Why a vendored tree and not a submodule: `merryhime/dynarmic`, the

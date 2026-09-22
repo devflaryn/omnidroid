@@ -3,10 +3,35 @@
 D5 adopted dynarmic as "a pinned fork we carry patches against". This directory
 is where those patches are recorded.
 
-**The vendored tree is currently pristine** at
-`9d4582339990d4eae53f1dc7160686920fc2075c`. Nothing here has been applied yet,
-which is deliberate: it keeps "the 202,200 upstream assertions pass on our pin"
-a claim about upstream rather than about us.
+**The vendored tree is upstream `9d4582339990d4eae53f1dc7160686920fc2075c`
+plus the patches listed under "Applied".** Until patch 0001 it was pristine,
+which kept "the 202,200 upstream assertions pass on our pin" a claim about
+upstream rather than about us; that figure has **not** been re-measured with
+0001 applied, and should be before it is repeated.
+
+## Applied
+
+### 0001 — `MRS Xt, CNTVCT_EL0` reads the counter `CNTPCT_EL0` reads
+
+`0001-a64-mrs-cntvct_el0.patch`. The pin's `MRS` knows `CNTPCT_EL0` and not
+`CNTVCT_EL0` (`S3_3_C14_C0_2`), so the virtual count fell to
+`InterpretThisInstruction()`, which Omnidroid has no interpreter behind: the
+guest stopped with `UnsupportedInstruction { encoding: 0xd53be048 }`.
+`ARCHITECTURE.md` section 6 and D5 amendment 4 both recorded the gap and that
+Android's userspace clock reads this register rather than `CNTPCT_EL0`.
+
+**MEASURED, and why it had to be fixed now**: `libroblox.so` executes
+`mrs x8, cntvct_el0` at link `0x229d184` on a guest worker, and M6's gate lost
+that thread to it on every run once the client-settings fetch completed
+(2 of 2 runs, as thread 16 and as thread 3).
+
+**Why the same value is correct and not merely convenient**: EL0 reads
+`CNTVCT_EL0` as `CNTPCT_EL0 - CNTVOFF_EL2`, and Linux arm64 clears
+`CNTVOFF_EL2` when it boots at EL2 (`msr cntvoff_el2, xzr` in its EL2 timer
+setup). So on the platform the guest was built for, the two registers read the
+same count, at the same `CNTFRQ_EL0` — which is what `omni-cpu`'s
+`cntvct_reads_the_same_clock_as_cntpct` asserts, from guest `MRS`
+instructions.
 
 ## How a patch is carried
 
