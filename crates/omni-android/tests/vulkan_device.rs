@@ -155,6 +155,9 @@ impl StageThreeHost {
                 "vkCreateSwapchainKHR".to_string(),
                 "vkQueueSubmit".to_string(),
                 "vkAllocateMemory".to_string(),
+                // On the far side of stage 5's frontier, and here so that a test can show the
+                // frontier is named rather than assumed.
+                "vkCreateComputePipelines".to_string(),
             ],
             has_platform_surface_call: true,
             log: Mutex::new(HostLog::default()),
@@ -287,6 +290,18 @@ impl VulkanHost for StageThreeHost {
 
     fn queue_family_properties(&self, _device: HostPhysicalDevice) -> AbiResult<Vec<Vec<u8>>> {
         Ok(self.families.clone())
+    }
+
+    /// **This double can back its one memory type**, so nothing is masked and the blob the guest
+    /// receives is the one below, byte for byte.
+    ///
+    /// Stage 5 made `vkGetPhysicalDeviceMemoryProperties` edit the property flags of every type
+    /// this layer cannot import into (`omni_android::vulkan::physical::mask_memory_types`), and a
+    /// double that answered `0` here would have every host-visible bit cleared — which is correct
+    /// behaviour and would make the verbatim assertion below about the wrong thing. The masking
+    /// itself is tested in `tests/vulkan_memory.rs`, against a double written for it.
+    fn importable_memory_types(&self, _device: HostPhysicalDevice) -> AbiResult<u32> {
+        Ok(0x1)
     }
 
     fn physical_device_memory_properties(
@@ -1490,16 +1505,27 @@ fn device_proc_addr_answers_thunks_and_the_two_nulls() {
     assert!(text.contains("vkCreateSwapchainKHR"), "{text}");
     assert!(text.contains("pCreateInfo = NULL"), "the handler is real now: {text}");
 
-    // What still refuses by *name* is the batch after this one. `vkAllocateMemory` is a command
-    // the double's driver has, so a thunk is handed out for it and the refusal names stage 5 --
-    // which is the honest statement of where the frontier is.
+    // What still refuses by *name* is the batch after this one. **The example had to change in
+    // stage 5**: `vkAllocateMemory` is implemented now, so the frontier moved, and
+    // `vkCreateComputePipelines` is on the far side of it. That the assertion had to be rewritten
+    // is the point of keeping it — it is what makes "the frontier is named" a claim about where
+    // the frontier actually is rather than a sentence that would pass whatever happened.
+    let name = f.cstr("vkCreateComputePipelines");
+    let compute = f.call(get_proc, [device, name, 0, 0]).expect("a lookup");
+    assert_ne!(compute, 0, "the driver has vkCreateComputePipelines, so a thunk is handed out");
+    let text = f.refusal(compute, [device, 0, 0, 0]).to_string();
+    assert!(text.contains("vkCreateComputePipelines"), "{text}");
+    assert!(text.contains("stage 5"), "the frontier is named: {text}");
+    assert!(text.contains("compute pipelines"), "and what is on the far side of it: {text}");
+
+    // And the batch this stage *did* implement is reachable through the same lookup, which is the
+    // other half of the same claim: `vkAllocateMemory` refuses for its **argument** now, not for
+    // its name.
     let memory = f.cstr("vkAllocateMemory");
     let allocate = f.call(get_proc, [device, memory, 0, 0]).expect("a lookup");
-    assert_ne!(allocate, 0, "the driver has vkAllocateMemory, so a thunk is handed out");
+    assert_ne!(allocate, 0);
     let text = f.refusal(allocate, [device, 0, 0, 0]).to_string();
-    assert!(text.contains("vkAllocateMemory"), "{text}");
-    assert!(text.contains("stage 5"), "the frontier is named: {text}");
-    assert!(text.contains("device memory"), "{text}");
+    assert!(text.contains("pAllocateInfo = NULL"), "the handler is real now: {text}");
 }
 
 // ============================================================================ the live tests

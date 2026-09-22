@@ -124,7 +124,7 @@
 //! dropped count ([`Vulkan::requests_dropped`]) so that a truncated list says it is truncated.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use omni_mem::GuestAddr;
@@ -136,13 +136,18 @@ use crate::error::{AbiError, AbiResult};
 
 mod command;
 mod counted;
+pub mod descriptor;
 pub mod device;
+mod draw;
 mod handles;
 pub mod host;
 pub mod instance;
+pub mod memory;
 pub mod physical;
 mod queue;
+pub mod resource;
 pub mod rewrite;
+pub mod shader;
 pub mod surface;
 pub mod swapchain;
 mod sync;
@@ -159,11 +164,58 @@ pub use device::{
 };
 pub use handles::HANDLE_SLOT_BYTES;
 pub use host::{
-    Acquired, ApplicationInfo, DeviceRequest, DriverAnswer, HostCommandBuffer, HostCommandPool,
-    HostDevice, HostExtension, HostFence, HostImage, HostImageRef, HostImageView, HostInstance,
-    HostPhysicalDevice, HostQueue, HostSemaphore, HostSurface, HostSwapchain, ImageBarrier,
-    ImageViewRequest, InstanceRequest, PipelineBarrier, PresentRequest, Presented, QueueRequest,
-    SubmitRequest, SurfaceCreated, SwapchainRequest, VulkanHost,
+    Acquired, ApplicationInfo, BufferRequest, ColorBlendState, DescriptorBinding, DescriptorCopy,
+    DescriptorPoolRequest, DescriptorSetLayoutRequest, DescriptorWrite, DescriptorWrites,
+    DeviceRequest, DriverAnswer, FramebufferRequest, GraphicsPipelineRequest, HostBuffer,
+    HostCommandBuffer, HostCommandPool, HostCreatedImage, HostDescriptorPool, HostDescriptorSet,
+    HostDescriptorSetLayout, HostDevice, HostDeviceMemory, HostExtension, HostFence,
+    HostFramebuffer, HostImage, HostImageRef, HostImageView, HostInstance, HostPhysicalDevice,
+    HostPipeline, HostPipelineCache, HostPipelineLayout, HostQueue, HostRenderPass, HostSampler,
+    HostSemaphore, HostShaderModule, HostSurface, HostSwapchain, ImageBarrier, ImageRequest,
+    ImageViewRequest, InstanceRequest, MemoryAllocation, MemoryPlan, MultisampleState,
+    PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest, Presented,
+    QueueRequest, RenderPassBegin, RenderPassRequest, ShaderStage, Specialization, SubmitRequest,
+    SubpassRequest, SurfaceCreated, SwapchainRequest, VertexInputState, ViewportState, VulkanHost,
+};
+pub use descriptor::{
+    COPY_DESCRIPTOR_SET_BYTES, DESCRIPTOR_BUFFER_INFO_BYTES, DESCRIPTOR_IMAGE_INFO_BYTES,
+    DESCRIPTOR_POOL_CREATE_INFO_BYTES, DESCRIPTOR_POOL_SIZE_BYTES,
+    DESCRIPTOR_SET_ALLOCATE_INFO_BYTES, DESCRIPTOR_SET_LAYOUT_BINDING_BYTES,
+    DESCRIPTOR_SET_LAYOUT_CREATE_INFO_BYTES, MAX_DESCRIPTOR_BINDINGS, MAX_DESCRIPTOR_COPIES,
+    MAX_DESCRIPTOR_WRITES, MAX_DESCRIPTORS_PER_WRITE, MAX_IMMUTABLE_SAMPLERS, MAX_POOL_SIZES,
+    MAX_SETS_PER_CALL, MAX_SETS_PER_FREE, WRITE_DESCRIPTOR_SET_BYTES,
+};
+pub use draw::{
+    BUFFER_COPY_BYTES, BUFFER_IMAGE_COPY_BYTES, CLEAR_VALUE_BYTES,
+    IMAGE_SUBRESOURCE_LAYERS_BYTES, MAX_BOUND_DESCRIPTOR_SETS, MAX_CLEAR_VALUES, MAX_COPY_REGIONS,
+    MAX_DYNAMIC_OFFSETS, MAX_PUSH_CONSTANT_BYTES, MAX_VERTEX_BUFFER_BINDINGS,
+    RENDER_PASS_BEGIN_INFO_BYTES,
+};
+pub use memory::{
+    HOST_PROPERTY_BITS, MAPPED_MEMORY_RANGE_BYTES, MAX_MAPPED_RANGES, MEMORY_ALLOCATE_INFO_BYTES,
+    MEMORY_REQUIREMENTS_BYTES, VK_WHOLE_SIZE,
+};
+pub use resource::{
+    BUFFER_CREATE_INFO_BYTES, IMAGE_CREATE_INFO_BYTES, MAX_RESOURCE_QUEUE_FAMILIES,
+    SAMPLER_CREATE_INFO_BODY_BYTES, SAMPLER_CREATE_INFO_BYTES,
+};
+pub use shader::{
+    ATTACHMENT_DESCRIPTION_BYTES, ATTACHMENT_REFERENCE_BYTES, COLOR_BLEND_ATTACHMENT_BYTES,
+    COLOR_BLEND_STATE_BYTES, DEPTH_STENCIL_STATE_BODY_BYTES, DEPTH_STENCIL_STATE_BYTES,
+    DYNAMIC_STATE_CREATE_INFO_BYTES, FRAMEBUFFER_CREATE_INFO_BYTES,
+    GRAPHICS_PIPELINE_CREATE_INFO_BYTES, INPUT_ASSEMBLY_STATE_BYTES, MAX_BLEND_ATTACHMENTS,
+    MAX_DYNAMIC_STATES, MAX_ENTRY_POINT_BYTES, MAX_FRAMEBUFFER_ATTACHMENTS,
+    MAX_PIPELINE_CACHE_BYTES, MAX_PIPELINE_STAGES, MAX_PIPELINES_PER_CALL, MAX_PUSH_CONSTANT_RANGES,
+    MAX_RENDER_PASS_ATTACHMENTS, MAX_SAMPLE_MASK_WORDS, MAX_SET_LAYOUTS, MAX_SHADER_CODE_BYTES,
+    MAX_SPECIALIZATION_BYTES, MAX_SPECIALIZATION_ENTRIES, MAX_SUBPASS_DEPENDENCIES,
+    MAX_SUBPASS_REFERENCES, MAX_SUBPASSES, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BINDINGS,
+    MAX_VIEWPORTS, MULTISAMPLE_STATE_BYTES, PIPELINE_CACHE_CREATE_INFO_BYTES,
+    PIPELINE_LAYOUT_CREATE_INFO_BYTES, PIPELINE_SHADER_STAGE_CREATE_INFO_BYTES,
+    PUSH_CONSTANT_RANGE_BYTES, RASTERIZATION_STATE_BODY_BYTES, RASTERIZATION_STATE_BYTES,
+    RECT_2D_BYTES, RENDER_PASS_CREATE_INFO_BYTES, SHADER_MODULE_CREATE_INFO_BYTES,
+    SPECIALIZATION_INFO_BYTES, SPECIALIZATION_MAP_ENTRY_BYTES, SUBPASS_DEPENDENCY_BYTES,
+    SUBPASS_DESCRIPTION_BYTES, TESSELLATION_STATE_BYTES, VERTEX_INPUT_ATTRIBUTE_BYTES,
+    VERTEX_INPUT_BINDING_BYTES, VERTEX_INPUT_STATE_BYTES, VIEWPORT_BYTES, VIEWPORT_STATE_BYTES,
 };
 pub use queue::{MAX_PRESENT_SWAPCHAINS, MAX_SUBMITS, PRESENT_INFO_BYTES, SUBMIT_INFO_BYTES};
 pub use swapchain::{
@@ -399,6 +451,118 @@ pub const MAX_COMMAND_POOLS: usize = 8;
 /// clear and a present need and is the number the refusal names when it is reached.
 pub const MAX_COMMAND_BUFFERS: usize = 64;
 
+// ------------------------------------------------- stage 5's thirteen families, and their bounds
+//
+// **Every one of these is an allocation bound and none of them is a claim about Vulkan.** Reaching
+// one is a refusal naming the constant, because a registry that reused a live slot would silently
+// alias two objects and a registry that grew without bound would be a guest-controlled allocation.
+// They are also chosen **against `REGISTRY_BYTES`' budget** rather than in isolation — see that
+// constant, which stage 5 is what pushed past 4096.
+
+/// How many `VkDeviceMemory` handles one [`Vulkan`] will hold at once.
+///
+/// A renderer's allocation count is the one number here that scales with *content* rather than
+/// with the shape of the renderer: a device-local pool, a staging ring, and one allocation per
+/// texture that has not been sub-allocated. Thirty-two is well above a bring-up path and far below
+/// what a streaming engine would want — which is the honest state, because a suballocator is the
+/// engine's to write and a layer that raised this bound to hide its absence would be hiding it.
+pub const MAX_DEVICE_MEMORIES: usize = 32;
+
+/// How many `VkBuffer` handles one [`Vulkan`] will hold at once.
+pub const MAX_BUFFERS: usize = 32;
+
+/// How many `VkImage` handles the guest **created** one [`Vulkan`] will hold at once.
+///
+/// Separate from [`MAX_IMAGES`], which is the swapchain's, for the reason
+/// [`HostImageRef`](host::HostImageRef) gives: they are the same Vulkan type and different
+/// objects, and each family having its own range of the data area is what makes a `vkDestroyImage`
+/// of a swapchain image a typed refusal.
+pub const MAX_CREATED_IMAGES: usize = 32;
+
+/// How many `VkSampler` handles one [`Vulkan`] will hold at once.
+///
+/// Samplers are *shared*: a renderer makes a handful — linear-repeat, linear-clamp,
+/// nearest-repeat, a shadow comparison one — and binds them to hundreds of textures. Eight is
+/// above every arrangement this project has seen.
+pub const MAX_SAMPLERS: usize = 8;
+
+/// How many `VkShaderModule` handles one [`Vulkan`] will hold at once.
+///
+/// **Not a bound on how many shaders an engine has.** D8 records that Roblox ships 1,364 SPIR-V
+/// modules; what this bounds is how many are *live as modules at one time*, and a module is
+/// ordinarily destroyed immediately after the pipelines that use it are created — the
+/// specification explicitly permits it, and every engine does. Sixteen is a generous batch. An
+/// engine that kept all 1,364 alive would reach a refusal naming this constant, which is the
+/// finding rather than the failure.
+pub const MAX_SHADER_MODULES: usize = 16;
+
+/// How many `VkPipelineLayout` handles one [`Vulkan`] will hold at once.
+pub const MAX_PIPELINE_LAYOUTS: usize = 16;
+
+/// How many `VkRenderPass` handles one [`Vulkan`] will hold at once.
+///
+/// One per distinct attachment arrangement — a forward pass, a shadow pass, a post pass — not one
+/// per frame.
+pub const MAX_RENDER_PASSES: usize = 8;
+
+/// How many `VkFramebuffer` handles one [`Vulkan`] will hold at once.
+///
+/// **One per swapchain image per render pass**, which is why this is larger than
+/// [`MAX_RENDER_PASSES`]: a renderer rebuilds all of them on every resize, and two sets can be
+/// live at once while the old swapchain is retired.
+pub const MAX_FRAMEBUFFERS: usize = 16;
+
+/// How many `VkPipeline` handles one [`Vulkan`] will hold at once.
+pub const MAX_PIPELINES: usize = 16;
+
+/// How many `VkPipelineCache` handles one [`Vulkan`] will hold at once. A renderer has one.
+pub const MAX_PIPELINE_CACHES: usize = 4;
+
+/// How many `VkDescriptorSetLayout` handles one [`Vulkan`] will hold at once.
+///
+/// The same number as [`MAX_SET_LAYOUTS`], deliberately: that is how many one pipeline layout may
+/// be built from, so a smaller registry would make a conforming pipeline layout unbuildable out of
+/// layouts this registry could not all hold at once.
+pub const MAX_DESCRIPTOR_SET_LAYOUTS: usize = MAX_SET_LAYOUTS;
+
+/// How many `VkDescriptorPool` handles one [`Vulkan`] will hold at once.
+pub const MAX_DESCRIPTOR_POOLS: usize = 4;
+
+/// How many `VkDescriptorSet` handles one [`Vulkan`] will hold at once.
+///
+/// The largest of stage 5's bounds for [`MAX_COMMAND_BUFFERS`]' reason: it is the family a
+/// renderer has most of, one per material per frame in flight. Thirty-two is what fits the data
+/// area beside everything else, and the thirty-third is a refusal naming this constant — which is
+/// a real limit on how much a guest can draw and is stated rather than hidden.
+pub const MAX_DESCRIPTOR_SETS: usize = 32;
+
+/// The symbol [`Vulkan::bind_into`] declares the `VkDeviceMemory` registry under.
+pub const DEVICE_MEMORY_REGISTRY_SYMBOL: &str = "vulkan::device_memories";
+/// The symbol [`Vulkan::bind_into`] declares the `VkBuffer` registry under.
+pub const BUFFER_REGISTRY_SYMBOL: &str = "vulkan::buffers";
+/// The symbol [`Vulkan::bind_into`] declares the created-`VkImage` registry under.
+pub const CREATED_IMAGE_REGISTRY_SYMBOL: &str = "vulkan::created_images";
+/// The symbol [`Vulkan::bind_into`] declares the `VkSampler` registry under.
+pub const SAMPLER_REGISTRY_SYMBOL: &str = "vulkan::samplers";
+/// The symbol [`Vulkan::bind_into`] declares the `VkShaderModule` registry under.
+pub const SHADER_MODULE_REGISTRY_SYMBOL: &str = "vulkan::shader_modules";
+/// The symbol [`Vulkan::bind_into`] declares the `VkPipelineLayout` registry under.
+pub const PIPELINE_LAYOUT_REGISTRY_SYMBOL: &str = "vulkan::pipeline_layouts";
+/// The symbol [`Vulkan::bind_into`] declares the `VkRenderPass` registry under.
+pub const RENDER_PASS_REGISTRY_SYMBOL: &str = "vulkan::render_passes";
+/// The symbol [`Vulkan::bind_into`] declares the `VkFramebuffer` registry under.
+pub const FRAMEBUFFER_REGISTRY_SYMBOL: &str = "vulkan::framebuffers";
+/// The symbol [`Vulkan::bind_into`] declares the `VkPipeline` registry under.
+pub const PIPELINE_REGISTRY_SYMBOL: &str = "vulkan::pipelines";
+/// The symbol [`Vulkan::bind_into`] declares the `VkPipelineCache` registry under.
+pub const PIPELINE_CACHE_REGISTRY_SYMBOL: &str = "vulkan::pipeline_caches";
+/// The symbol [`Vulkan::bind_into`] declares the `VkDescriptorSetLayout` registry under.
+pub const DESCRIPTOR_SET_LAYOUT_REGISTRY_SYMBOL: &str = "vulkan::descriptor_set_layouts";
+/// The symbol [`Vulkan::bind_into`] declares the `VkDescriptorPool` registry under.
+pub const DESCRIPTOR_POOL_REGISTRY_SYMBOL: &str = "vulkan::descriptor_pools";
+/// The symbol [`Vulkan::bind_into`] declares the `VkDescriptorSet` registry under.
+pub const DESCRIPTOR_SET_REGISTRY_SYMBOL: &str = "vulkan::descriptor_sets";
+
 /// The symbol [`Vulkan::bind_into`] declares the `VkPhysicalDevice` registry under.
 pub const PHYSICAL_DEVICE_REGISTRY_SYMBOL: &str = "vulkan::physical_devices";
 /// The symbol [`Vulkan::bind_into`] declares the `VkSurfaceKHR` registry under.
@@ -428,22 +592,29 @@ pub const COMMAND_BUFFER_REGISTRY_SYMBOL: &str = "vulkan::command_buffers";
 /// [`ThunkRegion`](crate::ThunkRegion) has to have room for, and working it out from twelve
 /// constants is how an embedding ends up 64 bytes short.
 ///
-/// # This is a budget, and stage 4 is what turned it into one
+/// # This is a budget, and stage 5 is what made it stop fitting in 4 KiB
 ///
-/// Every boundary in this workspace passes **4096** bytes of data area, and stage 3's five
-/// registries used 576 of them — comfortably inside, with nothing to think about. Stage 4 adds
-/// seven more families and the first draft of their bounds came to 8,640 bytes, which is not a
-/// number that fits: it made every existing test fail at `bind_into` with
-/// [`AbiError::RegionFull`], which is the honest failure and is also not one a reader would
-/// enjoy discovering in a run.
+/// Every boundary in this workspace passed **4096** bytes of data area. Stage 3's five registries
+/// used 576 of them; stage 4's seven more brought the total to **3,648**, with 448 left for
+/// everything else, and its bounds were chosen against that number rather than in isolation.
 ///
-/// So stage 4's bounds are chosen against this number rather than in isolation, and
-/// [`the_registries_fit_the_data_area_every_embedding_passes`] asserts the arithmetic so that
-/// raising one of them is a failing test rather than a boundary that will not bind. Raising them
-/// *together* means raising the data area every embedding passes, which is a change to those
-/// embeddings and not to this constant.
+/// **Stage 5 adds thirteen families and does not fit.** Device memory, buffers, created images,
+/// samplers, shader modules, pipeline layouts, render passes, framebuffers, pipelines, pipeline
+/// caches, descriptor set layouts, descriptor pools and descriptor sets need 232 slots between
+/// them even with every bound cut to what a bring-up path can justify — 3,712 bytes against 448
+/// available. There is no arrangement of thirteen families that fits in 448 bytes: that is 28
+/// slots, fewer than two per family, and a registry with one slot in it refuses the second object
+/// of its kind.
 ///
-/// [`AbiError::RegionFull`]: crate::AbiError::RegionFull
+/// So **the data area every embedding passes to [`BoundaryBuilder::new`] goes from 4096 to 8192**,
+/// and that is a deliberate, stated change rather than a quiet bump — the handoff asked for it to
+/// be said out loud. It costs 4 KiB of guest address space per boundary and no commit charge worth
+/// counting; what it buys is that stage 5 exists. The embeddings that had to change are the ones
+/// that bind a `Vulkan` at all, which is the four Vulkan test harnesses, and
+/// [`the_registries_fit_the_data_area_every_embedding_passes`] is what fails if a future family
+/// pushes past the new number too.
+///
+/// [`BoundaryBuilder::new`]: crate::BoundaryBuilder::new
 /// [`the_registries_fit_the_data_area_every_embedding_passes`]:
 ///     #tests::the_registries_fit_the_data_area_every_embedding_passes
 pub const REGISTRY_BYTES: usize = MAX_INSTANCES * INSTANCE_SLOT_BYTES
@@ -453,8 +624,32 @@ pub const REGISTRY_BYTES: usize = MAX_INSTANCES * INSTANCE_SLOT_BYTES
         + MAX_SEMAPHORES
         + MAX_FENCES
         + MAX_COMMAND_POOLS
-        + MAX_COMMAND_BUFFERS)
+        + MAX_COMMAND_BUFFERS
+        + MAX_DEVICE_MEMORIES
+        + MAX_BUFFERS
+        + MAX_CREATED_IMAGES
+        + MAX_SAMPLERS
+        + MAX_SHADER_MODULES
+        + MAX_PIPELINE_LAYOUTS
+        + MAX_RENDER_PASSES
+        + MAX_FRAMEBUFFERS
+        + MAX_PIPELINES
+        + MAX_PIPELINE_CACHES
+        + MAX_DESCRIPTOR_SET_LAYOUTS
+        + MAX_DESCRIPTOR_POOLS
+        + MAX_DESCRIPTOR_SETS)
         * SLOT;
+
+/// The bytes of data area an embedding must pass to [`BoundaryBuilder::new`] for a boundary that
+/// binds a [`Vulkan`].
+///
+/// **Stated here so an embedding has one number to copy rather than a subtraction to do.** See
+/// [`REGISTRY_BYTES`] for why it is 8192 rather than the 4096 every boundary passed before stage
+/// 5, and what that change costs. The `ndk` and `jni` data symbols come out of the same area, so
+/// the margin between the two constants is the whole budget for everything that is not Vulkan.
+///
+/// [`BoundaryBuilder::new`]: crate::BoundaryBuilder::new
+pub const REQUIRED_DATA_BYTES: usize = 8192;
 
 /// What a `VkPhysicalDevice` slot holds, for a reader of a memory dump. Nothing reads it back.
 const PHYSICAL_DEVICE_SLOT_MAGIC: u64 = 0x004F_4D4E_5650_4400; // "\0OMNVPD\0"
@@ -478,6 +673,34 @@ const FENCE_SLOT_MAGIC: u64 = 0x004F_4D4E_5646_4E00; // "\0OMNVFN\0"
 const COMMAND_POOL_SLOT_MAGIC: u64 = 0x004F_4D4E_5643_5000; // "\0OMNVCP\0"
 /// What a `VkCommandBuffer` slot holds. Nothing reads it back.
 const COMMAND_BUFFER_SLOT_MAGIC: u64 = 0x004F_4D4E_5643_4200; // "\0OMNVCB\0"
+/// What a `VkDeviceMemory` slot holds. Nothing reads it back.
+const DEVICE_MEMORY_SLOT_MAGIC: u64 = 0x004F_4D4E_564D_4D00; // "\0OMNVMM\0"
+/// What a `VkBuffer` slot holds. Nothing reads it back.
+const BUFFER_SLOT_MAGIC: u64 = 0x004F_4D4E_5642_4600; // "\0OMNVBF\0"
+/// What a created `VkImage` slot holds. Nothing reads it back. **Different from
+/// [`IMAGE_SLOT_MAGIC`]**, which is a swapchain's, so that a dump says which family an address
+/// belonged to without anyone having to work out the ranges.
+const CREATED_IMAGE_SLOT_MAGIC: u64 = 0x004F_4D4E_5643_4900; // "\0OMNVCI\0"
+/// What a `VkSampler` slot holds. Nothing reads it back.
+const SAMPLER_SLOT_MAGIC: u64 = 0x004F_4D4E_5653_4100; // "\0OMNVSA\0"
+/// What a `VkShaderModule` slot holds. Nothing reads it back.
+const SHADER_MODULE_SLOT_MAGIC: u64 = 0x004F_4D4E_5653_4800; // "\0OMNVSH\0"
+/// What a `VkPipelineLayout` slot holds. Nothing reads it back.
+const PIPELINE_LAYOUT_SLOT_MAGIC: u64 = 0x004F_4D4E_5650_4C00; // "\0OMNVPL\0"
+/// What a `VkRenderPass` slot holds. Nothing reads it back.
+const RENDER_PASS_SLOT_MAGIC: u64 = 0x004F_4D4E_5652_5000; // "\0OMNVRP\0"
+/// What a `VkFramebuffer` slot holds. Nothing reads it back.
+const FRAMEBUFFER_SLOT_MAGIC: u64 = 0x004F_4D4E_5646_4200; // "\0OMNVFB\0"
+/// What a `VkPipeline` slot holds. Nothing reads it back.
+const PIPELINE_SLOT_MAGIC: u64 = 0x004F_4D4E_5650_4900; // "\0OMNVPI\0"
+/// What a `VkPipelineCache` slot holds. Nothing reads it back.
+const PIPELINE_CACHE_SLOT_MAGIC: u64 = 0x004F_4D4E_5650_4300; // "\0OMNVPC\0"
+/// What a `VkDescriptorSetLayout` slot holds. Nothing reads it back.
+const DESCRIPTOR_SET_LAYOUT_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_4C00; // "\0OMNVDL\0"
+/// What a `VkDescriptorPool` slot holds. Nothing reads it back.
+const DESCRIPTOR_POOL_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_5000; // "\0OMNVDP\0"
+/// What a `VkDescriptorSet` slot holds. Nothing reads it back.
+const DESCRIPTOR_SET_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_5300; // "\0OMNVDS\0"
 
 /// What `vkGetInstanceProcAddr` answered for one name.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -728,6 +951,52 @@ struct State {
     fences: Option<Handles<HostFence>>,
     command_pools: Option<Handles<HostCommandPool>>,
     command_buffers: Option<Handles<HostCommandBuffer>>,
+    /// Stage 5's thirteen, carved out of the same data area by the same call.
+    ///
+    /// **Every one of them supports removal**, unlike stage 4's mixed group: these are all objects
+    /// the guest both creates and destroys, and two of them — `descriptor_sets` and, indirectly,
+    /// everything allocated from a pool — are removed *on the guest's behalf* when their pool goes,
+    /// exactly as `command_buffers` are.
+    device_memories: Option<Handles<HostDeviceMemory>>,
+    buffers: Option<Handles<HostBuffer>>,
+    /// Images the **guest** created. Separate from [`images`](State::images), which is a
+    /// swapchain's; [`HostImageRef`] carries the argument.
+    created_images: Option<Handles<HostCreatedImage>>,
+    samplers: Option<Handles<HostSampler>>,
+    shader_modules: Option<Handles<HostShaderModule>>,
+    pipeline_layouts: Option<Handles<HostPipelineLayout>>,
+    render_passes: Option<Handles<HostRenderPass>>,
+    framebuffers: Option<Handles<HostFramebuffer>>,
+    pipelines: Option<Handles<HostPipeline>>,
+    pipeline_caches: Option<Handles<HostPipelineCache>>,
+    descriptor_set_layouts: Option<Handles<HostDescriptorSetLayout>>,
+    descriptor_pools: Option<Handles<HostDescriptorPool>>,
+    descriptor_sets: Option<Handles<HostDescriptorSet>>,
+    /// The `GuestSpace` pages behind every **imported** `VkDeviceMemory`, by token.
+    ///
+    /// **The one piece of state in this file that owns address space.** A forwarded allocation has
+    /// no entry here at all, which is exactly what `vkMapMemory` tests to decide whether it can
+    /// answer. See [`memory`] for why the pages are the guest's rather than the driver's.
+    imports: BTreeMap<HostDeviceMemory, ImportedMemory>,
+    /// How many bytes of `GuestSpace` every live import holds, and the high-water mark. Both are
+    /// diagnostics (Global Constraint 6) and the second is the one that says how close a run came
+    /// to `GuestSpaceConfig::max_committed` (D15).
+    imported_bytes: usize,
+    imported_peak: usize,
+    /// Bytes of `GuestSpace` an allocation that was never handed to the guest failed to give
+    /// back. See `memory::release_guest_pages`: a counter rather than an error, because it
+    /// happens on a path already carrying an answer the guest needs.
+    leaked_import_bytes: usize,
+    /// How many bytes `vkMapMemory` has handed the guest access to, cumulatively. A measure of
+    /// streaming rather than of occupancy, which is why it only rises.
+    mapped_bytes: u64,
+    /// Which `VkPhysicalDevice`s have already had their memory-type rewrite recorded.
+    ///
+    /// `vkGetPhysicalDeviceMemoryProperties` is called repeatedly — once per allocator, and some
+    /// engines call it per allocation — and the *same* masking happens every time. Recording it
+    /// once per physical device keeps [`Vulkan::rewrites`] a log of decisions rather than a log of
+    /// calls, which is what makes it readable; the **count** of calls is in the census either way.
+    memory_rewrites_noted: BTreeSet<HostPhysicalDevice>,
     /// Every extension name this layer changed, oldest first. See [`rewrite`].
     rewrites: Vec<Rewrite>,
     rewrites_dropped: usize,
@@ -758,6 +1027,83 @@ impl core::fmt::Debug for Vulkan {
             .field("calls", &state.calls.len())
             .finish()
     }
+}
+
+/// The `GuestSpace` pages behind one **imported** `VkDeviceMemory`.
+///
+/// See [`memory`]: an allocation from a host-visible memory type is pages this layer took out of
+/// the guest's own address space and handed to the driver through
+/// `VkImportMemoryHostPointerInfoEXT`, so that `vkMapMemory` can answer with an address the guest
+/// may store through. A forwarded allocation has no record here at all, and that absence is what
+/// `vkMapMemory` tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImportedMemory {
+    /// Where the pages start. **This is what `vkMapMemory` answers with**, plus the guest's offset.
+    at: GuestAddr,
+    /// How many bytes were mapped: the guest's `allocationSize` rounded up to
+    /// `minImportedHostPointerAlignment`, which is what `vkFreeMemory` must unmap.
+    len: usize,
+    /// The guest's own `allocationSize`, unrounded. **The bound `vkMapMemory` checks against**,
+    /// because the rounding is this layer's and the pages past `size` are not memory the guest was
+    /// given.
+    size: u64,
+}
+
+/// Generate the three registry methods a stage 5 handle family needs.
+///
+/// # Why a macro here and not thirteen hand-written copies
+///
+/// Stage 3 and stage 4 wrote theirs out, and at four and seven families that was the right call:
+/// each one's refusal says something different about *why that family in particular* must not be
+/// forwarded, and a macro that flattened those into one sentence would have thrown away the most
+/// useful half of every message. Thirteen more copies is a different number. The bodies are
+/// identical — look the handle up, refuse through [`wild_handle`] if it is not there, insert,
+/// remove — and thirteen copies of an identical body is thirteen places for one of them to look
+/// the wrong registry up, which is a defect that produces a *plausible* answer.
+///
+/// So the macro generates the bodies and **takes the per-family reason as a parameter**, which is
+/// the part a reader needs and the part a compiler cannot check. Nothing about the messages is
+/// shared except their shape, which is [`wild_handle`]'s job and was already.
+///
+/// The families are deliberately **not** deduplicating ([`Handles::insert_or_get`]): every one of
+/// them is created by a call that makes a new object each time, and
+/// [`Handles::remove`](handles::Handles::remove) documents why a family that both deduplicates and
+/// has its tokens recycled would be unsound.
+macro_rules! stage_five_family {
+    (
+        $(#[$doc:meta])*
+        $token_fn:ident, $register_fn:ident, $forget_fn:ident,
+        $field:ident, $token:ty, $kind:literal, $creator:literal, $why:literal
+    ) => {
+        $(#[$doc])*
+        fn $token_fn(&self, at: &Site, call: &str, handle: u64) -> AbiResult<$token> {
+            let state = self.state.lock();
+            let registry = state.$field.as_ref();
+            let found = GuestAddr::try_from(handle).ok().and_then(|address| registry?.get(address));
+            found.ok_or_else(|| {
+                wild_handle(
+                    at,
+                    call,
+                    $kind,
+                    handle,
+                    registry.map_or(0, Handles::live),
+                    concat!($why, ". `", $creator, "` is what issues one"),
+                )
+            })
+        }
+
+        #[doc = concat!("Put a `", $kind, "` in the registry. Never deduplicated: each `", $creator, "` makes a new object.")]
+        fn $register_fn(&self, at: &Site, token: $token) -> AbiResult<Registered> {
+            let mut state = self.state.lock();
+            register(at, state.$field.as_mut(), $creator, token, false)
+        }
+
+        #[doc = concat!("Free the slot a live `", $kind, "` handle names.")]
+        fn $forget_fn(&self, handle: GuestAddr) -> bool {
+            let mut state = self.state.lock();
+            state.$field.as_mut().and_then(|h| h.remove(handle)).is_some()
+        }
+    };
 }
 
 impl Vulkan {
@@ -791,6 +1137,25 @@ impl Vulkan {
                 fences: None,
                 command_pools: None,
                 command_buffers: None,
+                device_memories: None,
+                buffers: None,
+                created_images: None,
+                samplers: None,
+                shader_modules: None,
+                pipeline_layouts: None,
+                render_passes: None,
+                framebuffers: None,
+                pipelines: None,
+                pipeline_caches: None,
+                descriptor_set_layouts: None,
+                descriptor_pools: None,
+                descriptor_sets: None,
+                imports: BTreeMap::new(),
+                imported_bytes: 0,
+                imported_peak: 0,
+                leaked_import_bytes: 0,
+                mapped_bytes: 0,
+                memory_rewrites_noted: BTreeSet::new(),
                 rewrites: Vec::new(),
                 rewrites_dropped: 0,
                 next_rewrite: 0,
@@ -946,6 +1311,97 @@ impl Vulkan {
             MAX_COMMAND_BUFFERS,
             "VkCommandBuffer",
             COMMAND_BUFFER_SLOT_MAGIC,
+        )?);
+
+        // Stage 5's thirteen, each in its own range for the same reason, and with one pair where
+        // it matters more than anywhere else: `created_images` and `images` hold the *same Vulkan
+        // type*, so a `vkDestroyImage` of a swapchain image is a lookup that lands in neither
+        // registry rather than one that lands in the wrong one.
+        state.device_memories = Some(carve(
+            builder,
+            DEVICE_MEMORY_REGISTRY_SYMBOL,
+            MAX_DEVICE_MEMORIES,
+            "VkDeviceMemory",
+            DEVICE_MEMORY_SLOT_MAGIC,
+        )?);
+        state.buffers =
+            Some(carve(builder, BUFFER_REGISTRY_SYMBOL, MAX_BUFFERS, "VkBuffer", BUFFER_SLOT_MAGIC)?);
+        state.created_images = Some(carve(
+            builder,
+            CREATED_IMAGE_REGISTRY_SYMBOL,
+            MAX_CREATED_IMAGES,
+            "VkImage (created)",
+            CREATED_IMAGE_SLOT_MAGIC,
+        )?);
+        state.samplers = Some(carve(
+            builder,
+            SAMPLER_REGISTRY_SYMBOL,
+            MAX_SAMPLERS,
+            "VkSampler",
+            SAMPLER_SLOT_MAGIC,
+        )?);
+        state.shader_modules = Some(carve(
+            builder,
+            SHADER_MODULE_REGISTRY_SYMBOL,
+            MAX_SHADER_MODULES,
+            "VkShaderModule",
+            SHADER_MODULE_SLOT_MAGIC,
+        )?);
+        state.pipeline_layouts = Some(carve(
+            builder,
+            PIPELINE_LAYOUT_REGISTRY_SYMBOL,
+            MAX_PIPELINE_LAYOUTS,
+            "VkPipelineLayout",
+            PIPELINE_LAYOUT_SLOT_MAGIC,
+        )?);
+        state.render_passes = Some(carve(
+            builder,
+            RENDER_PASS_REGISTRY_SYMBOL,
+            MAX_RENDER_PASSES,
+            "VkRenderPass",
+            RENDER_PASS_SLOT_MAGIC,
+        )?);
+        state.framebuffers = Some(carve(
+            builder,
+            FRAMEBUFFER_REGISTRY_SYMBOL,
+            MAX_FRAMEBUFFERS,
+            "VkFramebuffer",
+            FRAMEBUFFER_SLOT_MAGIC,
+        )?);
+        state.pipelines = Some(carve(
+            builder,
+            PIPELINE_REGISTRY_SYMBOL,
+            MAX_PIPELINES,
+            "VkPipeline",
+            PIPELINE_SLOT_MAGIC,
+        )?);
+        state.pipeline_caches = Some(carve(
+            builder,
+            PIPELINE_CACHE_REGISTRY_SYMBOL,
+            MAX_PIPELINE_CACHES,
+            "VkPipelineCache",
+            PIPELINE_CACHE_SLOT_MAGIC,
+        )?);
+        state.descriptor_set_layouts = Some(carve(
+            builder,
+            DESCRIPTOR_SET_LAYOUT_REGISTRY_SYMBOL,
+            MAX_DESCRIPTOR_SET_LAYOUTS,
+            "VkDescriptorSetLayout",
+            DESCRIPTOR_SET_LAYOUT_SLOT_MAGIC,
+        )?);
+        state.descriptor_pools = Some(carve(
+            builder,
+            DESCRIPTOR_POOL_REGISTRY_SYMBOL,
+            MAX_DESCRIPTOR_POOLS,
+            "VkDescriptorPool",
+            DESCRIPTOR_POOL_SLOT_MAGIC,
+        )?);
+        state.descriptor_sets = Some(carve(
+            builder,
+            DESCRIPTOR_SET_REGISTRY_SYMBOL,
+            MAX_DESCRIPTOR_SETS,
+            "VkDescriptorSet",
+            DESCRIPTOR_SET_SLOT_MAGIC,
         )?);
         Ok(BOUND_SYMBOLS)
     }
@@ -1208,6 +1664,38 @@ impl Vulkan {
         state.command_buffers.as_ref().map(|h| h.iter().collect()).unwrap_or_default()
     }
 
+    /// Every `VkBuffer` this layer currently holds.
+    #[must_use]
+    pub fn buffer_handles(&self) -> Vec<(GuestAddr, HostBuffer)> {
+        let state = self.state.lock();
+        state.buffers.as_ref().map(|h| h.iter().collect()).unwrap_or_default()
+    }
+
+    /// Every `VkImage` the **guest created** that this layer currently holds. Not the swapchain's;
+    /// [`Vulkan::image_handles`] is that one.
+    #[must_use]
+    pub fn created_image_handles(&self) -> Vec<(GuestAddr, HostCreatedImage)> {
+        let state = self.state.lock();
+        state.created_images.as_ref().map(|h| h.iter().collect()).unwrap_or_default()
+    }
+
+    /// Every `VkPipeline` this layer currently holds.
+    #[must_use]
+    pub fn pipeline_handles(&self) -> Vec<(GuestAddr, HostPipeline)> {
+        let state = self.state.lock();
+        state.pipelines.as_ref().map(|h| h.iter().collect()).unwrap_or_default()
+    }
+
+    /// Every `VkDescriptorSet` this layer currently holds.
+    ///
+    /// **Falls without the guest asking**, like `VkCommandBuffer`: destroying or resetting a
+    /// descriptor pool frees every set in it, and this layer drops their handles in the same call.
+    #[must_use]
+    pub fn descriptor_set_handles(&self) -> Vec<(GuestAddr, HostDescriptorSet)> {
+        let state = self.state.lock();
+        state.descriptor_sets.as_ref().map(|h| h.iter().collect()).unwrap_or_default()
+    }
+
     /// Every `VkInstance` this layer has issued: the handle the guest holds, and the host token
     /// behind it.
     ///
@@ -1367,6 +1855,53 @@ impl Vulkan {
         for (handle, token) in state.swapchains.iter().flat_map(|h| h.iter()) {
             out.push_str(&format!("    {handle:#x} -> {token:?}\n"));
         }
+
+        // **Stage 5's thirteen, and the two numbers that are not handle counts.** The registries
+        // are inventories like stage 4's; the memory figures are what D15 asked for, because
+        // host-visible Vulkan memory is guest commit charge now and the peak is how close this run
+        // came to `GuestSpaceConfig::max_committed`.
+        out.push_str(&format!(
+            "  stage 5 handles live now:\n    \
+             VkDeviceMemory {}/{MAX_DEVICE_MEMORIES}, VkBuffer {}/{MAX_BUFFERS}, \
+             VkImage(created) {}/{MAX_CREATED_IMAGES}, VkSampler {}/{MAX_SAMPLERS}, \
+             VkShaderModule {}/{MAX_SHADER_MODULES}, \
+             VkPipelineLayout {}/{MAX_PIPELINE_LAYOUTS}, VkRenderPass {}/{MAX_RENDER_PASSES}, \
+             VkFramebuffer {}/{MAX_FRAMEBUFFERS}, VkPipeline {}/{MAX_PIPELINES}, \
+             VkPipelineCache {}/{MAX_PIPELINE_CACHES}, \
+             VkDescriptorSetLayout {}/{MAX_DESCRIPTOR_SET_LAYOUTS}, \
+             VkDescriptorPool {}/{MAX_DESCRIPTOR_POOLS}, \
+             VkDescriptorSet {}/{MAX_DESCRIPTOR_SETS}\n",
+            state.device_memories.as_ref().map_or(0, Handles::live),
+            state.buffers.as_ref().map_or(0, Handles::live),
+            state.created_images.as_ref().map_or(0, Handles::live),
+            state.samplers.as_ref().map_or(0, Handles::live),
+            state.shader_modules.as_ref().map_or(0, Handles::live),
+            state.pipeline_layouts.as_ref().map_or(0, Handles::live),
+            state.render_passes.as_ref().map_or(0, Handles::live),
+            state.framebuffers.as_ref().map_or(0, Handles::live),
+            state.pipelines.as_ref().map_or(0, Handles::live),
+            state.pipeline_caches.as_ref().map_or(0, Handles::live),
+            state.descriptor_set_layouts.as_ref().map_or(0, Handles::live),
+            state.descriptor_pools.as_ref().map_or(0, Handles::live),
+            state.descriptor_sets.as_ref().map_or(0, Handles::live),
+        ));
+        out.push_str(&format!(
+            "  guest memory imported for Vulkan: {} live import(s) holding {} byte(s), peak {} \
+             byte(s); {} byte(s) handed to the guest through vkMapMemory\n",
+            state.imports.len(),
+            state.imported_bytes,
+            state.imported_peak,
+            state.mapped_bytes,
+        ));
+        // Stated whether it is zero or not: a leak nobody counted reads exactly like no leak.
+        out.push_str(&match state.leaked_import_bytes {
+            0 => "  every imported allocation this run unwound gave its guest pages back\n"
+                .to_string(),
+            bytes => format!(
+                "  **{bytes} byte(s) of guest address space were taken and not given back** by an \
+                 allocation that was never handed to the guest; see `memory::release_guest_pages`\n"
+            ),
+        });
 
         for (call, result) in &state.driver_results {
             out.push_str(&format!("  the driver answered `{call}` with VkResult {result}\n"));
@@ -1708,21 +2243,6 @@ impl Vulkan {
         })
     }
 
-    /// The [`HostImage`] a guest `VkImage` names, or a typed refusal.
-    fn image_token(&self, at: &Site, call: &str, handle: u64) -> AbiResult<HostImage> {
-        let state = self.state.lock();
-        let registry = state.images.as_ref();
-        let found = GuestAddr::try_from(handle).ok().and_then(|address| registry?.get(address));
-        found.ok_or_else(|| {
-            wild_handle(at, call, "VkImage", handle, registry.map_or(0, Handles::live),
-                "it is *non*-dispatchable, and a clear or a barrier against the wrong image is \
-                 silent -- the frame presented is whatever the presentation engine last had. \
-                 Stage 4 issues `VkImage` handles from `vkGetSwapchainImagesKHR` alone, and they \
-                 stop being valid when their swapchain is destroyed, which is when this layer \
-                 takes them back")
-        })
-    }
-
     /// The [`HostImageView`] a guest `VkImageView` names, or a typed refusal.
     fn image_view_token(&self, at: &Site, call: &str, handle: u64) -> AbiResult<HostImageView> {
         let state = self.state.lock();
@@ -1792,6 +2312,319 @@ impl Vulkan {
                  handle a renderer touches most, once per `vkCmd*`. \
                  `vkAllocateCommandBuffers` is what issues one")
         })
+    }
+
+    // ----------------------------------------------------- stage 5's thirteen, through a macro
+    //
+    // See `stage_five_family!` for why these three methods per family are generated rather than
+    // written out thirteen times, and what the macro is careful to keep hand-written.
+
+    stage_five_family! {
+        /// The [`HostDeviceMemory`] a guest `VkDeviceMemory` names, or a typed refusal.
+        device_memory_token, register_device_memory, forget_device_memory,
+        device_memories, HostDeviceMemory, "VkDeviceMemory", "vkAllocateMemory",
+        "it is *non*-dispatchable, and it is the family where a wrong handle is worst: \
+         `vkMapMemory` on it hands the guest an address it stores through without checking, and \
+         under D4 amendment 1 `admit` does not govern the guest's own stores. A handle naming \
+         another allocation would produce a mapping that works, into memory some other resource \
+         is bound to"
+    }
+
+    stage_five_family! {
+        /// The [`HostBuffer`] a guest `VkBuffer` names, or a typed refusal.
+        buffer_token, register_buffer, forget_buffer,
+        buffers, HostBuffer, "VkBuffer", "vkCreateBuffer",
+        "it is *non*-dispatchable, so a forged one names some other buffer -- and a draw that \
+         bound it would read vertices from whatever that buffer holds, at full speed, with every \
+         `VkResult` zero"
+    }
+
+    stage_five_family! {
+        /// The [`HostCreatedImage`] a guest `VkImage` names, or a typed refusal.
+        ///
+        /// **Only images the guest created.** A swapchain image's handle lives in a different
+        /// range of the data area and lands here as a refusal, which is what makes
+        /// `vkDestroyImage` of one impossible; [`Vulkan::image_ref_token`] is the lookup for the
+        /// calls that legitimately accept either.
+        created_image_token, register_created_image, forget_created_image,
+        created_images, HostCreatedImage, "VkImage (created)", "vkCreateImage",
+        "it is *non*-dispatchable. **A swapchain's `VkImage` lands here too**, and that is the \
+         point: those come from `vkGetSwapchainImagesKHR`, are owned by their swapchain, and \
+         destroying or binding memory to one is undefined behaviour no validation layer on this \
+         machine would report"
+    }
+
+    stage_five_family! {
+        /// The [`HostSampler`] a guest `VkSampler` names, or a typed refusal.
+        sampler_token, register_sampler, forget_sampler,
+        samplers, HostSampler, "VkSampler", "vkCreateSampler",
+        "it is *non*-dispatchable, and a descriptor written with the wrong sampler filters and \
+         wraps differently from what the material asked for -- which looks like an art bug"
+    }
+
+    stage_five_family! {
+        /// The [`HostShaderModule`] a guest `VkShaderModule` names, or a typed refusal.
+        shader_module_token, register_shader_module, forget_shader_module,
+        shader_modules, HostShaderModule, "VkShaderModule", "vkCreateShaderModule",
+        "it is *non*-dispatchable, and a pipeline stage built from the wrong module compiles \
+         successfully against a different shader"
+    }
+
+    stage_five_family! {
+        /// The [`HostPipelineLayout`] a guest `VkPipelineLayout` names, or a typed refusal.
+        pipeline_layout_token, register_pipeline_layout, forget_pipeline_layout,
+        pipeline_layouts, HostPipelineLayout, "VkPipelineLayout", "vkCreatePipelineLayout",
+        "it is *non*-dispatchable, and it is what `vkCmdBindDescriptorSets` and \
+         `vkCmdPushConstants` interpret their arguments against -- so the wrong one binds the \
+         right sets to the wrong slots"
+    }
+
+    stage_five_family! {
+        /// The [`HostRenderPass`] a guest `VkRenderPass` names, or a typed refusal.
+        render_pass_token, register_render_pass, forget_render_pass,
+        render_passes, HostRenderPass, "VkRenderPass", "vkCreateRenderPass",
+        "it is *non*-dispatchable, and it decides whether the attachment is cleared, loaded or \
+         left alone before the first draw touches it"
+    }
+
+    stage_five_family! {
+        /// The [`HostFramebuffer`] a guest `VkFramebuffer` names, or a typed refusal.
+        framebuffer_token, register_framebuffer, forget_framebuffer,
+        framebuffers, HostFramebuffer, "VkFramebuffer", "vkCreateFramebuffer",
+        "it is *non*-dispatchable, and it is **which image the frame is drawn into** -- a forged \
+         one renders this guest's frame into some other swapchain image, and the one that gets \
+         presented is untouched"
+    }
+
+    stage_five_family! {
+        /// The [`HostPipeline`] a guest `VkPipeline` names, or a typed refusal.
+        pipeline_token, register_pipeline, forget_pipeline,
+        pipelines, HostPipeline, "VkPipeline", "vkCreateGraphicsPipelines",
+        "it is *non*-dispatchable. `VK_NULL_HANDLE` lands here too, which is the case that \
+         matters: `vkCreateGraphicsPipelines` may partly fail and writes `VK_NULL_HANDLE` for \
+         each pipeline it did not create, so a guest that did not check its `VkResult` reaches \
+         this with a handle this layer deliberately wrote"
+    }
+
+    stage_five_family! {
+        /// The [`HostPipelineCache`] a guest `VkPipelineCache` names, or a typed refusal.
+        pipeline_cache_token, register_pipeline_cache, forget_pipeline_cache,
+        pipeline_caches, HostPipelineCache, "VkPipelineCache", "vkCreatePipelineCache",
+        "it is *non*-dispatchable. `VK_NULL_HANDLE` is legal wherever one is accepted and is \
+         handled before this lookup, so reaching it means a value that is neither null nor issued"
+    }
+
+    stage_five_family! {
+        /// The [`HostDescriptorSetLayout`] a guest `VkDescriptorSetLayout` names, or a typed
+        /// refusal.
+        descriptor_set_layout_token, register_descriptor_set_layout, forget_descriptor_set_layout,
+        descriptor_set_layouts, HostDescriptorSetLayout, "VkDescriptorSetLayout",
+        "vkCreateDescriptorSetLayout",
+        "it is *non*-dispatchable, and allocating a set from the wrong layout produces a set the \
+         shader indexes past"
+    }
+
+    stage_five_family! {
+        /// The [`HostDescriptorPool`] a guest `VkDescriptorPool` names, or a typed refusal.
+        descriptor_pool_token, register_descriptor_pool, forget_descriptor_pool,
+        descriptor_pools, HostDescriptorPool, "VkDescriptorPool", "vkCreateDescriptorPool",
+        "it is *non*-dispatchable, and resetting or destroying the wrong pool frees every \
+         descriptor set another part of the renderer is still binding"
+    }
+
+    stage_five_family! {
+        /// The [`HostDescriptorSet`] a guest `VkDescriptorSet` names, or a typed refusal.
+        descriptor_set_token, register_descriptor_set, forget_descriptor_set,
+        descriptor_sets, HostDescriptorSet, "VkDescriptorSet", "vkAllocateDescriptorSets",
+        "it is *non*-dispatchable, and it stops being valid when its **pool** is reset or \
+         destroyed rather than when anything names it -- which is when this layer takes the \
+         handle back, so a set used after its pool went lands here"
+    }
+
+    /// The image a guest `VkImage` names, **whichever of the two families it belongs to**.
+    ///
+    /// # Why one lookup and not two calls at every site
+    ///
+    /// `vkCreateImageView`, `vkCmdPipelineBarrier` and `vkCmdCopyBufferToImage` all take a
+    /// `VkImage` that may legitimately be either a swapchain's or one the guest created, and they
+    /// arrive as a bare `uint64_t` with nothing in it to say which. A site that checked one
+    /// registry and then the other would be three copies of a rule; a site that checked only one
+    /// would refuse half the conforming uses.
+    ///
+    /// What comes back is a [`HostImageRef`] and never a bare token, so the *answer* carries which
+    /// family it came from all the way to the host — which is what stops an implementation from
+    /// looking a created image up in its swapchain table and finding something.
+    fn image_ref_token(&self, at: &Site, call: &str, handle: u64) -> AbiResult<HostImageRef> {
+        let state = self.state.lock();
+        let address = GuestAddr::try_from(handle).ok();
+        if let Some(token) =
+            address.and_then(|address| state.images.as_ref().and_then(|h| h.get(address)))
+        {
+            return Ok(HostImageRef::Swapchain(token));
+        }
+        if let Some(token) =
+            address.and_then(|address| state.created_images.as_ref().and_then(|h| h.get(address)))
+        {
+            return Ok(HostImageRef::Created(token));
+        }
+        let swapchain_live = state.images.as_ref().map_or(0, Handles::live);
+        let created_live = state.created_images.as_ref().map_or(0, Handles::live);
+        Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with {handle:#x} as its `VkImage`, and \
+             that is not a handle this layer issued in **either** image family -- it holds \
+             {swapchain_live} swapchain image(s) from `vkGetSwapchainImagesKHR` and \
+             {created_live} image(s) from `vkCreateImage`, each on a \
+             {HANDLE_SLOT_BYTES}-byte boundary of its own range of the boundary's data area. \
+             `VkImage` is *non*-dispatchable, so forwarding this would not fault -- it would name \
+             some other image, and a copy or a barrier against the wrong one is silent",
+            caller = at.caller
+        )))
+    }
+
+    /// Drop the `VkDescriptorSet` handles a pool has just freed, and answer how many.
+    ///
+    /// [`Vulkan::forget_command_buffers_of`]'s argument, one family along: a pool reset or destroy
+    /// frees every set in it without naming one, and a handle left behind would resolve to a token
+    /// whose driver object is gone. The list comes from the host, which is the only participant
+    /// that knows which sets a pool holds.
+    fn forget_descriptor_sets(&self, tokens: &[HostDescriptorSet]) -> usize {
+        if tokens.is_empty() {
+            return 0;
+        }
+        let mut state = self.state.lock();
+        state.descriptor_sets.as_mut().map_or(0, |handles| {
+            handles.retain(|token| !tokens.contains(&token))
+        })
+    }
+
+    /// Record the `GuestSpace` pages behind one imported allocation.
+    fn note_import(&self, token: HostDeviceMemory, at: GuestAddr, len: usize, size: u64) {
+        let mut state = self.state.lock();
+        state.imports.insert(token, ImportedMemory { at, len, size });
+        state.imported_bytes += len;
+        state.imported_peak = state.imported_peak.max(state.imported_bytes);
+    }
+
+    /// The pages behind an imported allocation, or `None` for a forwarded one.
+    fn import_of(&self, token: HostDeviceMemory) -> Option<ImportedMemory> {
+        self.state.lock().imports.get(&token).copied()
+    }
+
+    /// Take the record of an imported allocation's pages, so the caller can unmap them.
+    fn forget_import(&self, token: HostDeviceMemory) -> Option<ImportedMemory> {
+        let mut state = self.state.lock();
+        let import = state.imports.remove(&token)?;
+        state.imported_bytes = state.imported_bytes.saturating_sub(import.len);
+        Some(import)
+    }
+
+    /// Charge bytes of guest address space an unwound allocation could not give back.
+    fn note_leaked_import(&self, bytes: usize) {
+        let mut state = self.state.lock();
+        state.leaked_import_bytes = state.leaked_import_bytes.saturating_add(bytes);
+    }
+
+    /// **Bytes of guest address space this layer took and could not give back.**
+    ///
+    /// Zero in every run anything has seen, and stated in [`report`](Vulkan::report) whether it is
+    /// zero or not: a leak nobody counted reads exactly like no leak, which is
+    /// `VERIFICATION.md` entry 15's shape applied to address space.
+    #[must_use]
+    pub fn leaked_import_bytes(&self) -> usize {
+        self.state.lock().leaked_import_bytes
+    }
+
+    /// Charge one `vkMapMemory` of `bytes`.
+    fn note_mapped(&self, bytes: u64) {
+        let mut state = self.state.lock();
+        state.mapped_bytes = state.mapped_bytes.saturating_add(bytes);
+    }
+
+    /// **How much `GuestSpace` every live imported allocation holds, and the most it ever held.**
+    ///
+    /// The measurement D15 asked for: host-visible Vulkan memory is guest commit charge now, so
+    /// the peak here is how close a run came to `GuestSpaceConfig::max_committed`. Read as a pair
+    /// — the current figure alone says nothing about a run that allocated 300 MB and freed it.
+    #[must_use]
+    pub fn imported_bytes(&self) -> (usize, usize) {
+        let state = self.state.lock();
+        (state.imported_bytes, state.imported_peak)
+    }
+
+    /// How many bytes `vkMapMemory` has handed the guest access to, cumulatively.
+    #[must_use]
+    pub fn mapped_bytes(&self) -> u64 {
+        self.state.lock().mapped_bytes
+    }
+
+    /// Every `VkDeviceMemory` this layer currently holds, with whether it was imported.
+    #[must_use]
+    pub fn device_memory_handles(&self) -> Vec<(GuestAddr, HostDeviceMemory, bool)> {
+        let state = self.state.lock();
+        state
+            .device_memories
+            .as_ref()
+            .map(|handles| {
+                handles
+                    .iter()
+                    .map(|(at, token)| (at, token, state.imports.contains_key(&token)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record that this layer added a device extension the guest did not ask for.
+    ///
+    /// See [`RewriteSite::DeviceExtensionAdded`]. Recorded **per `vkCreateDevice`** rather than
+    /// once, unlike the memory-type mask: a guest that creates two devices has two devices that
+    /// differ from what it described, and a log that mentioned only the first would be a log a
+    /// reader could not use to account for the second.
+    fn note_device_extension_added(&self, name: &str, caller: GuestAddr) {
+        let mut state = self.state.lock();
+        let order = state.next_rewrite;
+        state.record_rewrites(
+            order + 1,
+            vec![Rewrite {
+                order,
+                site: RewriteSite::DeviceExtensionAdded,
+                from: "(not requested by the guest)".to_string(),
+                to: name.to_string(),
+                spec_version: None,
+                caller,
+            }],
+        );
+    }
+
+    /// Record the memory types this layer masked out of one physical device's list, **once**.
+    ///
+    /// Answers whether anything was recorded, so the caller can say in a diagnostic whether this
+    /// was the first time. See [`physical`] for the rewrite itself and Global Constraint 1 for why
+    /// an unrecorded one is the defect this log exists to prevent.
+    fn note_memory_type_rewrites(
+        &self,
+        device: HostPhysicalDevice,
+        masked: &[(u32, u32, u32)],
+        caller: GuestAddr,
+    ) -> bool {
+        let mut state = self.state.lock();
+        if !state.memory_rewrites_noted.insert(device) {
+            return false;
+        }
+        let mut order = state.next_rewrite;
+        let mut entries = Vec::with_capacity(masked.len());
+        for (index, from, to) in masked {
+            entries.push(Rewrite {
+                order,
+                site: RewriteSite::MemoryType { index: *index },
+                from: rewrite::memory_property_flags(*from),
+                to: rewrite::memory_property_flags(*to),
+                spec_version: None,
+                caller,
+            });
+            order += 1;
+        }
+        state.record_rewrites(order, entries);
+        true
     }
 
     /// Put a physical device in the registry, or recover the handle it already has.
@@ -2495,6 +3328,66 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkQueuePresentKHR" => queue::queue_present(c, &at, &vulkan, args),
         "vkQueueWaitIdle" => queue::queue_wait_idle(c, &at, &vulkan, args),
         "vkDeviceWaitIdle" => queue::device_wait_idle(c, &at, &vulkan, args),
+        // Stage 5: memory and resources -- everything between "I have a device" and "I can draw".
+        // The order here is the order a renderer reaches them in, which is also the order
+        // `docs/HANDOFF.md` lists them in.
+        "vkAllocateMemory" => memory::allocate_memory(c, &at, &vulkan, args),
+        "vkFreeMemory" => memory::free_memory(c, &at, &vulkan, args),
+        "vkMapMemory" => memory::map_memory(c, &at, &vulkan, args),
+        "vkUnmapMemory" => memory::unmap_memory(c, &at, &vulkan, args),
+        "vkGetBufferMemoryRequirements" => {
+            memory::buffer_memory_requirements(c, &at, &vulkan, args)
+        }
+        "vkGetImageMemoryRequirements" => memory::image_memory_requirements(c, &at, &vulkan, args),
+        "vkBindBufferMemory" => memory::bind_buffer_memory(c, &at, &vulkan, args),
+        "vkBindImageMemory" => memory::bind_image_memory(c, &at, &vulkan, args),
+        "vkFlushMappedMemoryRanges" => memory::flush_mapped_memory_ranges(c, &at, &vulkan, args),
+        "vkInvalidateMappedMemoryRanges" => {
+            memory::invalidate_mapped_memory_ranges(c, &at, &vulkan, args)
+        }
+        "vkCreateBuffer" => resource::create_buffer(c, &at, &vulkan, args),
+        "vkDestroyBuffer" => resource::destroy_buffer(c, &at, &vulkan, args),
+        "vkCreateImage" => resource::create_image(c, &at, &vulkan, args),
+        "vkDestroyImage" => resource::destroy_image(c, &at, &vulkan, args),
+        "vkCreateSampler" => resource::create_sampler(c, &at, &vulkan, args),
+        "vkDestroySampler" => resource::destroy_sampler(c, &at, &vulkan, args),
+        "vkCreateShaderModule" => shader::create_shader_module(c, &at, &vulkan, args),
+        "vkDestroyShaderModule" => shader::destroy_shader_module(c, &at, &vulkan, args),
+        "vkCreatePipelineCache" => shader::create_pipeline_cache(c, &at, &vulkan, args),
+        "vkDestroyPipelineCache" => shader::destroy_pipeline_cache(c, &at, &vulkan, args),
+        "vkCreatePipelineLayout" => shader::create_pipeline_layout(c, &at, &vulkan, args),
+        "vkDestroyPipelineLayout" => shader::destroy_pipeline_layout(c, &at, &vulkan, args),
+        "vkCreateRenderPass" => shader::create_render_pass(c, &at, &vulkan, args),
+        "vkDestroyRenderPass" => shader::destroy_render_pass(c, &at, &vulkan, args),
+        "vkCreateFramebuffer" => shader::create_framebuffer(c, &at, &vulkan, args),
+        "vkDestroyFramebuffer" => shader::destroy_framebuffer(c, &at, &vulkan, args),
+        "vkCreateGraphicsPipelines" => shader::create_graphics_pipelines(c, &at, &vulkan, args),
+        "vkDestroyPipeline" => shader::destroy_pipeline(c, &at, &vulkan, args),
+        "vkCreateDescriptorSetLayout" => {
+            descriptor::create_descriptor_set_layout(c, &at, &vulkan, args)
+        }
+        "vkDestroyDescriptorSetLayout" => {
+            descriptor::destroy_descriptor_set_layout(c, &at, &vulkan, args)
+        }
+        "vkCreateDescriptorPool" => descriptor::create_descriptor_pool(c, &at, &vulkan, args),
+        "vkDestroyDescriptorPool" => descriptor::destroy_descriptor_pool(c, &at, &vulkan, args),
+        "vkResetDescriptorPool" => descriptor::reset_descriptor_pool(c, &at, &vulkan, args),
+        "vkAllocateDescriptorSets" => descriptor::allocate_descriptor_sets(c, &at, &vulkan, args),
+        "vkFreeDescriptorSets" => descriptor::free_descriptor_sets(c, &at, &vulkan, args),
+        "vkUpdateDescriptorSets" => descriptor::update_descriptor_sets(c, &at, &vulkan, args),
+        "vkCmdBeginRenderPass" => draw::cmd_begin_render_pass(c, &at, &vulkan, args),
+        "vkCmdEndRenderPass" => draw::cmd_end_render_pass(c, &at, &vulkan, args),
+        "vkCmdBindPipeline" => draw::cmd_bind_pipeline(c, &at, &vulkan, args),
+        "vkCmdBindVertexBuffers" => draw::cmd_bind_vertex_buffers(c, &at, &vulkan, args),
+        "vkCmdBindIndexBuffer" => draw::cmd_bind_index_buffer(c, &at, &vulkan, args),
+        "vkCmdBindDescriptorSets" => draw::cmd_bind_descriptor_sets(c, &at, &vulkan, args),
+        "vkCmdSetViewport" => draw::cmd_set_viewport(c, &at, &vulkan, args),
+        "vkCmdSetScissor" => draw::cmd_set_scissor(c, &at, &vulkan, args),
+        "vkCmdDraw" => draw::cmd_draw(c, &at, &vulkan, args),
+        "vkCmdDrawIndexed" => draw::cmd_draw_indexed(c, &at, &vulkan, args),
+        "vkCmdCopyBuffer" => draw::cmd_copy_buffer(c, &at, &vulkan, args),
+        "vkCmdCopyBufferToImage" => draw::cmd_copy_buffer_to_image(c, &at, &vulkan, args),
+        "vkCmdPushConstants" => draw::cmd_push_constants(c, &at, &vulkan, args),
         // Everything else. **Still the measurement**: the refusal names the Vulkan function and
         // quotes `x0`-`x7`, and `Vulkan::names()` is the ordered list that says what to build
         // next.
@@ -2664,45 +3557,59 @@ mod tests {
     /// and an embedding's `ndk` and `jni` data symbols come out of the same 4096.
     #[test]
     fn the_registries_fit_the_data_area_every_embedding_passes() {
-        const DATA_AREA: usize = 4096;
-        assert_eq!(
-            REGISTRY_BYTES,
-            MAX_INSTANCES * INSTANCE_SLOT_BYTES
-                + (MAX_PHYSICAL_DEVICES
-                    + MAX_SURFACES
-                    + MAX_DEVICES
-                    + MAX_QUEUES
-                    + MAX_SWAPCHAINS
-                    + MAX_IMAGES
-                    + MAX_IMAGE_VIEWS
-                    + MAX_SEMAPHORES
-                    + MAX_FENCES
-                    + MAX_COMMAND_POOLS
-                    + MAX_COMMAND_BUFFERS)
-                    * SLOT
-        );
         // Stage 3's five: 64 bytes of `VkInstance` registry and 512 of the other four.
         assert_eq!(MAX_INSTANCES * INSTANCE_SLOT_BYTES, 64);
         assert_eq!((MAX_PHYSICAL_DEVICES + MAX_SURFACES + MAX_DEVICES + MAX_QUEUES) * SLOT, 512);
         // Stage 4's seven.
-        assert_eq!(
-            (MAX_SWAPCHAINS
-                + MAX_IMAGES
-                + MAX_IMAGE_VIEWS
-                + MAX_SEMAPHORES
-                + MAX_FENCES
-                + MAX_COMMAND_POOLS
-                + MAX_COMMAND_BUFFERS)
-                * SLOT,
-            3072
-        );
-        assert_eq!(REGISTRY_BYTES, 3648);
+        let stage_four = (MAX_SWAPCHAINS
+            + MAX_IMAGES
+            + MAX_IMAGE_VIEWS
+            + MAX_SEMAPHORES
+            + MAX_FENCES
+            + MAX_COMMAND_POOLS
+            + MAX_COMMAND_BUFFERS)
+            * SLOT;
+        assert_eq!(stage_four, 3072);
+        // Stage 5's thirteen, which is what pushed the total past the old 4096.
+        let stage_five = (MAX_DEVICE_MEMORIES
+            + MAX_BUFFERS
+            + MAX_CREATED_IMAGES
+            + MAX_SAMPLERS
+            + MAX_SHADER_MODULES
+            + MAX_PIPELINE_LAYOUTS
+            + MAX_RENDER_PASSES
+            + MAX_FRAMEBUFFERS
+            + MAX_PIPELINES
+            + MAX_PIPELINE_CACHES
+            + MAX_DESCRIPTOR_SET_LAYOUTS
+            + MAX_DESCRIPTOR_POOLS
+            + MAX_DESCRIPTOR_SETS)
+            * SLOT;
+        assert_eq!(stage_five, 3712, "232 slots of {SLOT} bytes");
+        assert_eq!(REGISTRY_BYTES, 64 + 512 + stage_four + stage_five);
+        assert_eq!(REGISTRY_BYTES, 7360);
+
+        // **The old area, as the subtraction that says why it had to grow.** 4096 - 3648 left 448
+        // bytes after stage 4, which is 28 slots — fewer than two per stage 5 family, and a
+        // registry with one slot refuses the second object of its kind. There is no arrangement
+        // of thirteen families that fits, which is what makes `REQUIRED_DATA_BYTES` a change to
+        // every embedding rather than a bound to squeeze.
+        assert_eq!(4096 - (64 + 512 + stage_four), 448, "what stage 4 left");
+        assert_eq!(448 / SLOT, 28, "slots, for thirteen new families");
+        assert!(stage_five > 448, "stage 5 does not fit the old area");
+
         // **The margin, as a subtraction rather than as `<`.** A comparison between two constants
         // is one the compiler folds away — clippy's `assertions_on_constants` names it — and the
         // number a reader actually wants is how much room is left, not that there is some. The
-        // `ndk` and `jni` data symbols come out of the same 4096, so this is the whole budget for
+        // `ndk` and `jni` data symbols come out of the same area, so this is the whole budget for
         // everything else; raising a Vulkan bound past it means raising the data area every
-        // embedding passes to `BoundaryBuilder::new`, which is a change to those embeddings.
-        assert_eq!(DATA_AREA - REGISTRY_BYTES, 448, "what is left for everything else");
+        // embedding passes to `BoundaryBuilder::new` **again**, which is a change to those
+        // embeddings and not to this constant.
+        assert_eq!(REQUIRED_DATA_BYTES, 8192);
+        assert_eq!(
+            REQUIRED_DATA_BYTES - REGISTRY_BYTES,
+            832,
+            "what is left for everything else"
+        );
     }
 }

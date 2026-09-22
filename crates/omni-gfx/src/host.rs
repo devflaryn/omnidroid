@@ -43,11 +43,17 @@ use std::sync::{Arc, Mutex, PoisonError};
 use ash::khr;
 use ash::vk;
 use omni_android::vulkan::{
-    Acquired, DeviceRequest, DriverAnswer, HostCommandBuffer, HostCommandPool, HostDevice,
-    HostExtension, HostFence, HostImage, HostImageRef, HostImageView, HostInstance,
-    HostPhysicalDevice, HostQueue, HostSemaphore, HostSurface, HostSwapchain, ImageViewRequest,
-    InstanceRequest, PipelineBarrier, PresentRequest, Presented, SubmitRequest, SurfaceCreated,
-    SwapchainRequest, VulkanHost,
+    Acquired, BufferRequest, DescriptorCopy, DescriptorPoolRequest, DescriptorSetLayoutRequest,
+    DescriptorWrite, DescriptorWrites, DeviceRequest, DriverAnswer, FramebufferRequest,
+    GraphicsPipelineRequest, HostBuffer, HostCommandBuffer, HostCommandPool, HostCreatedImage,
+    HostDescriptorPool, HostDescriptorSet, HostDescriptorSetLayout, HostDevice, HostDeviceMemory,
+    HostExtension, HostFence, HostFramebuffer, HostImage, HostImageRef, HostImageView,
+    HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache, HostPipelineLayout,
+    HostQueue, HostRenderPass, HostSampler, HostSemaphore, HostShaderModule, HostSurface,
+    HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation, MemoryPlan,
+    PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest, Presented,
+    RenderPassBegin, RenderPassRequest, SubmitRequest, SurfaceCreated, SwapchainRequest,
+    VulkanHost,
 };
 use omni_android::{AbiError, AbiResult};
 use omni_platform::window::RawWindow;
@@ -166,6 +172,81 @@ pub struct GfxVulkanHost {
     command_pools: Mutex<Slab<ObjectEntry<vk::CommandPool>>>,
     /// Every command buffer this host allocated.
     command_buffers: Mutex<Slab<CommandBufferEntry>>,
+
+    // ------------------------------------------------------------------------ stage 5
+    //
+    // Thirteen more [`Slab`]s, for stage 4's reason. The only one that is not an
+    // [`ObjectEntry`] is `device_memories`, because an allocation carries one extra fact nothing
+    // else does: whether its pages came out of `GuestSpace` and were **imported**, which is what
+    // `vkMapMemory` rests on and what `omni-android` needs told back to it.
+    /// Every `VkDeviceMemory` this host allocated.
+    device_memories: Mutex<Slab<MemoryEntry>>,
+    /// Every `VkBuffer` this host created.
+    buffers: Mutex<Slab<ObjectEntry<vk::Buffer>>>,
+    /// Every `VkImage` the **guest** created. Not the swapchain's; see [`GfxVulkanHost::images`].
+    created_images: Mutex<Slab<ObjectEntry<vk::Image>>>,
+    /// Every `VkSampler` this host created.
+    samplers: Mutex<Slab<ObjectEntry<vk::Sampler>>>,
+    /// Every `VkShaderModule` this host created.
+    shader_modules: Mutex<Slab<ObjectEntry<vk::ShaderModule>>>,
+    /// Every `VkPipelineLayout` this host created.
+    pipeline_layouts: Mutex<Slab<ObjectEntry<vk::PipelineLayout>>>,
+    /// Every `VkRenderPass` this host created.
+    render_passes: Mutex<Slab<ObjectEntry<vk::RenderPass>>>,
+    /// Every `VkFramebuffer` this host created.
+    framebuffers: Mutex<Slab<ObjectEntry<vk::Framebuffer>>>,
+    /// Every `VkPipeline` this host created.
+    pipelines: Mutex<Slab<ObjectEntry<vk::Pipeline>>>,
+    /// Every `VkPipelineCache` this host created.
+    pipeline_caches: Mutex<Slab<ObjectEntry<vk::PipelineCache>>>,
+    /// Every `VkDescriptorSetLayout` this host created.
+    descriptor_set_layouts: Mutex<Slab<ObjectEntry<vk::DescriptorSetLayout>>>,
+    /// Every `VkDescriptorPool` this host created.
+    descriptor_pools: Mutex<Slab<ObjectEntry<vk::DescriptorPool>>>,
+    /// Every `VkDescriptorSet` this host allocated, each remembering the pool it came from — for
+    /// [`CommandBufferEntry::pool`]'s reason, one family along.
+    descriptor_sets: Mutex<Slab<DescriptorSetEntry>>,
+    /// What `VK_EXT_external_memory_host` answered about each physical device, cached.
+    ///
+    /// See [`GfxVulkanHost::probe_importable`]: the probe costs a throwaway `VkDevice`, the answer
+    /// cannot change for the life of a physical device, and `vkGetPhysicalDeviceMemoryProperties`
+    /// is a call an engine may make once per allocation.
+    importable: Mutex<Vec<ImportableProbe>>,
+}
+
+/// One `VkDeviceMemory`, and **whether its bytes are the guest's**.
+///
+/// `imported` is the whole of stage 5's memory decision made visible in one field: `true` means
+/// the pages were mapped out of `GuestSpace` by `omni-android` and handed here through
+/// [`MemoryAllocation::host_pointer`], so `vkMapMemory` gives back an address the guest may store
+/// through; `false` means an ordinary driver allocation the guest may not map at all.
+struct MemoryEntry {
+    device: usize,
+    memory: vk::DeviceMemory,
+    imported: bool,
+}
+
+/// One `VkDescriptorSet`, the pool it came from, and the device that pool belongs to.
+struct DescriptorSetEntry {
+    device: usize,
+    /// The [`HostDescriptorPool`] token, so that `vkDestroyDescriptorPool` and
+    /// `vkResetDescriptorPool` can find every set they are about to free — the specification frees
+    /// them without naming one, exactly as a command pool frees its buffers.
+    pool: u64,
+    set: vk::DescriptorSet,
+}
+
+/// What one physical device answered about importing host pointers, measured once.
+struct ImportableProbe {
+    /// The physical device, as its raw handle — which is what identifies it across the instance
+    /// and device tables without needing an index into either.
+    physical: u64,
+    /// `vkGetMemoryHostPointerPropertiesEXT`'s `memoryTypeBits` for ordinary host memory, or 0
+    /// when this device has no `VK_EXT_external_memory_host`.
+    memory_type_bits: u32,
+    /// `minImportedHostPointerAlignment`, or [`CONSERVATIVE_IMPORT_ALIGNMENT`] when the instance
+    /// could not be asked.
+    alignment: u64,
 }
 
 /// One device-owned object whose only interesting property is which device it came from.
@@ -420,6 +501,20 @@ impl GfxVulkanHost {
             fences: Mutex::new(Slab::new()),
             command_pools: Mutex::new(Slab::new()),
             command_buffers: Mutex::new(Slab::new()),
+            device_memories: Mutex::new(Slab::new()),
+            buffers: Mutex::new(Slab::new()),
+            created_images: Mutex::new(Slab::new()),
+            samplers: Mutex::new(Slab::new()),
+            shader_modules: Mutex::new(Slab::new()),
+            pipeline_layouts: Mutex::new(Slab::new()),
+            render_passes: Mutex::new(Slab::new()),
+            framebuffers: Mutex::new(Slab::new()),
+            pipelines: Mutex::new(Slab::new()),
+            pipeline_caches: Mutex::new(Slab::new()),
+            descriptor_set_layouts: Mutex::new(Slab::new()),
+            descriptor_pools: Mutex::new(Slab::new()),
+            descriptor_sets: Mutex::new(Slab::new()),
+            importable: Mutex::new(Vec::new()),
         }))
     }
 
@@ -1209,6 +1304,12 @@ fn features_from_bytes(bytes: &[u8]) -> AbiResult<vk::PhysicalDeviceFeatures> {
     }
     Ok(features)
 }
+
+/// The name [`crate::claim`] records the guest's swapchain under.
+///
+/// A `&'static str` the refusal quotes, so that an embedding reading "the guest's
+/// vkCreateSwapchainKHR already owns this window" knows which of its two Vulkan stacks to change.
+const GUEST_SWAPCHAIN_OWNER: &str = "the guest's vkCreateSwapchainKHR";
 
 impl VulkanHost for GfxVulkanHost {
     /// The first of [`PLATFORM_SURFACE_EXTENSIONS`] the driver reports.
@@ -2824,13 +2925,1467 @@ impl VulkanHost for GfxVulkanHost {
             Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
         }
     }
-}
 
-/// The name [`crate::claim`] records the guest's swapchain under.
-///
-/// A `&'static str` the refusal quotes, so that an embedding reading "the guest's
-/// vkCreateSwapchainKHR already owns this window" knows which of its two Vulkan stacks to change.
-const GUEST_SWAPCHAIN_OWNER: &str = "the guest's vkCreateSwapchainKHR";
+    // ============================================================ stage 5: memory and resources
+
+    fn importable_memory_types(&self, physical: HostPhysicalDevice) -> AbiResult<u32> {
+        let probed = self.with_physical(physical, |instance, device| {
+            self.probe_importable(instance, device)
+        })?;
+        probed.map(|(bits, _)| bits)
+    }
+
+    fn device_extensions_required_by_host(
+        &self,
+        physical: HostPhysicalDevice,
+    ) -> AbiResult<Vec<String>> {
+        // **One name, and only when the device has it.** `VK_EXT_external_memory_host` is what
+        // makes `vkMapMemory` able to answer with an address inside `GuestSpace`, and it has to be
+        // enabled on the device the guest will allocate from. A device without it gets an empty
+        // list: nothing is added, nothing is recorded, `vkCreateDevice` behaves exactly as it did
+        // in stage 4, and the consequence surfaces as the memory-type mask instead.
+        //
+        // The probe is what decides, rather than a second reading of the extension list, so that
+        // this answer and `importable_memory_types` cannot disagree -- adding the extension to a
+        // device whose importable set is empty would be an addition that buys nothing.
+        let probed = self.with_physical(physical, |instance, device| {
+            self.probe_importable(instance, device)
+        })?;
+        let (bits, _) = probed?;
+        Ok(if bits == 0 {
+            Vec::new()
+        } else {
+            vec![vk::EXT_EXTERNAL_MEMORY_HOST_NAME.to_string_lossy().into_owned()]
+        })
+    }
+
+    fn memory_plan(&self, device: HostDevice, memory_type_index: u32) -> AbiResult<MemoryPlan> {
+        const METHOD: &str = "VulkanHost::memory_plan";
+        let parts = self.device_parts(device)?;
+        // SAFETY: `physical` is the device this logical device was created from and the instance
+        // that enumerated it is still live.
+        let properties = unsafe { parts.instance.get_physical_device_memory_properties(parts.physical) };
+        if memory_type_index >= properties.memory_type_count {
+            return Err(refused(
+                METHOD,
+                &format!(
+                    "the guest asked about memory type {memory_type_index} and this device has \
+                     {count}. The index is a guest `uint32_t` and this array is a fixed 32-entry \
+                     one, so reading past `memoryTypeCount` would be a host read of whatever the \
+                     driver left in the unused tail -- which is a plausible set of property flags",
+                    count = properties.memory_type_count
+                ),
+            ));
+        }
+        let (bits, alignment) = self.probe_importable(&parts.instance, parts.physical)?;
+        Ok(MemoryPlan {
+            property_flags: properties.memory_types[memory_type_index as usize]
+                .property_flags
+                .as_raw(),
+            importable: bits & (1u32 << memory_type_index) != 0,
+            import_alignment: alignment,
+        })
+    }
+
+    fn allocate_memory(
+        &self,
+        device: HostDevice,
+        allocation: &MemoryAllocation,
+    ) -> AbiResult<DriverAnswer<HostDeviceMemory>> {
+        let parts = self.device_parts(device)?;
+        let mut info = vk::MemoryAllocateInfo::default()
+            .allocation_size(allocation.size)
+            .memory_type_index(allocation.memory_type_index);
+
+        // **The one `pNext` this layer constructs.** `omni-android` refuses every chain the guest
+        // sends and builds this one itself, because the pointer in it has to be a `GuestSpace`
+        // address and no guest is allowed to choose it.
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        if let Some(pointer) = allocation.host_pointer {
+            let pointer = usize::try_from(pointer).map_err(|_| {
+                refused(
+                    "VulkanHost::allocate_memory",
+                    &format!("the guest-space pointer {pointer:#x} does not fit this host's address space"),
+                )
+            })?;
+            import.p_host_pointer = pointer as *mut std::ffi::c_void;
+            // The **rounded** length, not the guest's `allocationSize`: the specification requires
+            // an imported host pointer's length to be a multiple of
+            // `minImportedHostPointerAlignment`, and the shim mapped exactly that many bytes.
+            info = info.allocation_size(allocation.import_length).push_next(&mut import);
+        }
+
+        // SAFETY: the device is live, `info` and anything it chains outlive the call, and
+        // `pAllocator` is `None` because a guest allocator is refused by name one layer up. When
+        // the import is present, `p_host_pointer` names pages `omni-android` mapped and committed
+        // in the guest address space and will keep mapped until `vkFreeMemory`.
+        match unsafe { parts.device.allocate_memory(&info, None) } {
+            Ok(memory) => {
+                let token = self.locked_memories().insert(MemoryEntry {
+                    device: parts.index,
+                    memory,
+                    imported: allocation.host_pointer.is_some(),
+                });
+                Ok(DriverAnswer::Ok(HostDeviceMemory::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn free_memory(&self, memory: HostDeviceMemory) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::free_memory";
+        let (device_index, handle, _) = self.memory_of(memory, METHOD)?;
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the allocation is live, was made from this device, and `pAllocator` was `None`.
+        // Nothing bound to it is still in use: that is the guest's responsibility and the
+        // specification makes it so.
+        unsafe { device.free_memory(handle, None) };
+        self.locked_memories().remove(memory.token());
+        Ok(())
+    }
+
+    fn map_memory(
+        &self,
+        memory: HostDeviceMemory,
+        offset: u64,
+        size: u64,
+        flags: u32,
+    ) -> AbiResult<DriverAnswer<u64>> {
+        const METHOD: &str = "VulkanHost::map_memory";
+        let (device_index, handle, imported) = self.memory_of(memory, METHOD)?;
+        if !imported {
+            return Err(refused(
+                METHOD,
+                "this allocation was forwarded rather than imported, so its bytes are the \
+                 driver's and the only pointer available for it is one outside `GuestSpace`. The \
+                 shim refuses `vkMapMemory` on such an allocation before reaching here; a call \
+                 that got this far means the shim's import record and this host's disagree",
+            ));
+        }
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the allocation is live, host-visible (it was imported from host pages), and not
+        // currently mapped -- which the driver itself enforces and reports.
+        match unsafe {
+            device.map_memory(handle, offset, size, vk::MemoryMapFlags::from_raw(flags))
+        } {
+            // The address travels as an integer so that the shim can **compare** it against the
+            // pointer it imported. It is never written into guest memory unchecked; see
+            // `VulkanHost::map_memory`'s own documentation for the invariant.
+            Ok(pointer) => Ok(DriverAnswer::Ok(pointer as usize as u64)),
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn unmap_memory(&self, memory: HostDeviceMemory) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::unmap_memory";
+        let (device_index, handle, _) = self.memory_of(memory, METHOD)?;
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the allocation is live and currently mapped, which the driver enforces.
+        unsafe { device.unmap_memory(handle) };
+        Ok(())
+    }
+
+    fn flush_mapped_memory_ranges(
+        &self,
+        device: HostDevice,
+        ranges: &[(HostDeviceMemory, u64, u64)],
+    ) -> AbiResult<DriverAnswer<()>> {
+        const METHOD: &str = "VulkanHost::flush_mapped_memory_ranges";
+        let parts = self.device_parts(device)?;
+        let built = self.mapped_ranges(ranges, parts.index, METHOD)?;
+        // SAFETY: every range names a live allocation of this device, and the structures outlive
+        // the call.
+        match unsafe { parts.device.flush_mapped_memory_ranges(&built) } {
+            Ok(()) => Ok(DriverAnswer::Ok(())),
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn invalidate_mapped_memory_ranges(
+        &self,
+        device: HostDevice,
+        ranges: &[(HostDeviceMemory, u64, u64)],
+    ) -> AbiResult<DriverAnswer<()>> {
+        const METHOD: &str = "VulkanHost::invalidate_mapped_memory_ranges";
+        let parts = self.device_parts(device)?;
+        let built = self.mapped_ranges(ranges, parts.index, METHOD)?;
+        // SAFETY: as `flush_mapped_memory_ranges`.
+        match unsafe { parts.device.invalidate_mapped_memory_ranges(&built) } {
+            Ok(()) => Ok(DriverAnswer::Ok(())),
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn buffer_memory_requirements(&self, buffer: HostBuffer) -> AbiResult<Vec<u8>> {
+        const METHOD: &str = "VulkanHost::buffer_memory_requirements";
+        let (device_index, handle) = {
+            let table = self.locked_vk_buffers();
+            self.device_of(&table, buffer.token(), "VkBuffer", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the buffer is live and belongs to this device.
+        let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
+        Ok(requirements_bytes(&requirements))
+    }
+
+    fn image_memory_requirements(&self, image: HostCreatedImage) -> AbiResult<Vec<u8>> {
+        const METHOD: &str = "VulkanHost::image_memory_requirements";
+        let (device_index, handle) = {
+            let table = self.locked_created_images();
+            self.device_of(&table, image.token(), "VkImage", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the image is live and belongs to this device.
+        let requirements = unsafe { device.get_image_memory_requirements(handle) };
+        Ok(requirements_bytes(&requirements))
+    }
+
+    fn bind_buffer_memory(
+        &self,
+        buffer: HostBuffer,
+        memory: HostDeviceMemory,
+        offset: u64,
+    ) -> AbiResult<DriverAnswer<()>> {
+        const METHOD: &str = "VulkanHost::bind_buffer_memory";
+        let (buffer_device, handle) = {
+            let table = self.locked_vk_buffers();
+            self.device_of(&table, buffer.token(), "VkBuffer", METHOD)?
+        };
+        let (memory_device, allocation, _) = self.memory_of(memory, METHOD)?;
+        if buffer_device != memory_device {
+            return Err(cross_device("VkDeviceMemory", memory_device, buffer_device));
+        }
+        let device = self.device_at(buffer_device, METHOD)?;
+        // SAFETY: both objects are live and belong to this device, and nothing is bound to the
+        // buffer yet -- which the driver enforces and reports.
+        match unsafe { device.bind_buffer_memory(handle, allocation, offset) } {
+            Ok(()) => Ok(DriverAnswer::Ok(())),
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn bind_image_memory(
+        &self,
+        image: HostCreatedImage,
+        memory: HostDeviceMemory,
+        offset: u64,
+    ) -> AbiResult<DriverAnswer<()>> {
+        const METHOD: &str = "VulkanHost::bind_image_memory";
+        let (image_device, handle) = {
+            let table = self.locked_created_images();
+            self.device_of(&table, image.token(), "VkImage", METHOD)?
+        };
+        let (memory_device, allocation, _) = self.memory_of(memory, METHOD)?;
+        if image_device != memory_device {
+            return Err(cross_device("VkDeviceMemory", memory_device, image_device));
+        }
+        let device = self.device_at(image_device, METHOD)?;
+        // SAFETY: as `bind_buffer_memory`.
+        match unsafe { device.bind_image_memory(handle, allocation, offset) } {
+            Ok(()) => Ok(DriverAnswer::Ok(())),
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn create_buffer(
+        &self,
+        device: HostDevice,
+        request: &BufferRequest,
+    ) -> AbiResult<DriverAnswer<HostBuffer>> {
+        let parts = self.device_parts(device)?;
+        let info = vk::BufferCreateInfo::default()
+            .flags(vk::BufferCreateFlags::from_raw(request.flags))
+            .size(request.size)
+            .usage(vk::BufferUsageFlags::from_raw(request.usage))
+            .sharing_mode(vk::SharingMode::from_raw(request.sharing_mode as i32))
+            .queue_family_indices(&request.queue_families);
+        // SAFETY: the device is live, `info` and the slice it borrows outlive the call, `pNext`
+        // is null because the shim refuses a chain, and `pAllocator` is `None`.
+        match unsafe { parts.device.create_buffer(&info, None) } {
+            Ok(buffer) => {
+                let token = self
+                    .locked_vk_buffers()
+                    .insert(ObjectEntry { device: parts.index, object: buffer });
+                Ok(DriverAnswer::Ok(HostBuffer::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_buffer(&self, buffer: HostBuffer) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_buffer";
+        let (device_index, handle) = {
+            let table = self.locked_vk_buffers();
+            self.device_of(&table, buffer.token(), "VkBuffer", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the buffer is live and nothing the GPU is executing still references it, which
+        // the specification makes the guest's responsibility.
+        unsafe { device.destroy_buffer(handle, None) };
+        self.locked_vk_buffers().remove(buffer.token());
+        Ok(())
+    }
+
+    fn create_image(
+        &self,
+        device: HostDevice,
+        request: &ImageRequest,
+    ) -> AbiResult<DriverAnswer<HostCreatedImage>> {
+        let parts = self.device_parts(device)?;
+        let info = vk::ImageCreateInfo::default()
+            .flags(vk::ImageCreateFlags::from_raw(request.flags))
+            .image_type(vk::ImageType::from_raw(request.image_type as i32))
+            .format(vk::Format::from_raw(request.format as i32))
+            .extent(vk::Extent3D {
+                width: request.extent[0],
+                height: request.extent[1],
+                depth: request.extent[2],
+            })
+            .mip_levels(request.mip_levels)
+            .array_layers(request.array_layers)
+            .samples(vk::SampleCountFlags::from_raw(request.samples))
+            .tiling(vk::ImageTiling::from_raw(request.tiling as i32))
+            .usage(vk::ImageUsageFlags::from_raw(request.usage))
+            .sharing_mode(vk::SharingMode::from_raw(request.sharing_mode as i32))
+            .queue_family_indices(&request.queue_families)
+            .initial_layout(vk::ImageLayout::from_raw(request.initial_layout as i32));
+        // SAFETY: as `create_buffer`.
+        match unsafe { parts.device.create_image(&info, None) } {
+            Ok(image) => {
+                let token = self
+                    .locked_created_images()
+                    .insert(ObjectEntry { device: parts.index, object: image });
+                Ok(DriverAnswer::Ok(HostCreatedImage::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_image(&self, image: HostCreatedImage) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_image";
+        let (device_index, handle) = {
+            let table = self.locked_created_images();
+            self.device_of(&table, image.token(), "VkImage", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the image is live, is one the **guest** created rather than a swapchain's --
+        // they are separate tables and a swapchain image cannot reach here -- and nothing the GPU
+        // is executing still references it.
+        unsafe { device.destroy_image(handle, None) };
+        self.locked_created_images().remove(image.token());
+        Ok(())
+    }
+
+    fn create_sampler(
+        &self,
+        device: HostDevice,
+        body: &[u8],
+    ) -> AbiResult<DriverAnswer<HostSampler>> {
+        let parts = self.device_parts(device)?;
+        let info = sampler_from_body("vkCreateSampler", body)?;
+        // SAFETY: the device is live and `info` outlives the call.
+        match unsafe { parts.device.create_sampler(&info, None) } {
+            Ok(sampler) => {
+                let token = self
+                    .locked_samplers()
+                    .insert(ObjectEntry { device: parts.index, object: sampler });
+                Ok(DriverAnswer::Ok(HostSampler::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_sampler(&self, sampler: HostSampler) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_sampler";
+        let (device_index, handle) = {
+            let table = self.locked_samplers();
+            self.device_of(&table, sampler.token(), "VkSampler", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the sampler is live and no descriptor in use still names it.
+        unsafe { device.destroy_sampler(handle, None) };
+        self.locked_samplers().remove(sampler.token());
+        Ok(())
+    }
+
+    fn create_shader_module(
+        &self,
+        device: HostDevice,
+        flags: u32,
+        code: &[u8],
+    ) -> AbiResult<DriverAnswer<HostShaderModule>> {
+        const METHOD: &str = "VulkanHost::create_shader_module";
+        let parts = self.device_parts(device)?;
+        if code.len() % 4 != 0 || code.is_empty() {
+            return Err(refused(
+                METHOD,
+                &format!(
+                    "the SPIR-V arrived as {} byte(s), which is not a non-zero multiple of four. \
+                     `pCode` is a `const uint32_t *`, so a driver handed this reads past the end \
+                     of the buffer while assembling its last word",
+                    code.len()
+                ),
+            ));
+        }
+        // **The words, not a re-encoding.** SPIR-V is little-endian 32-bit words on both sides;
+        // this is the copy that gives them four-byte alignment, which `pCode` requires and a
+        // `&[u8]` does not guarantee. Nothing about their content changes.
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four")))
+            .collect();
+        let info = vk::ShaderModuleCreateInfo::default()
+            .flags(vk::ShaderModuleCreateFlags::from_raw(flags))
+            .code(&words);
+        // SAFETY: the device is live, `info` and `words` outlive the call, and `pAllocator` is
+        // `None`. A malformed module is the driver's to reject and it does.
+        match unsafe { parts.device.create_shader_module(&info, None) } {
+            Ok(module) => {
+                let token = self
+                    .locked_modules()
+                    .insert(ObjectEntry { device: parts.index, object: module });
+                Ok(DriverAnswer::Ok(HostShaderModule::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_shader_module(&self, module: HostShaderModule) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_shader_module";
+        let (device_index, handle) = {
+            let table = self.locked_modules();
+            self.device_of(&table, module.token(), "VkShaderModule", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the module is live. Destroying one a pipeline was built from is explicitly
+        // permitted -- the pipeline does not reference it after creation.
+        unsafe { device.destroy_shader_module(handle, None) };
+        self.locked_modules().remove(module.token());
+        Ok(())
+    }
+
+    fn create_pipeline_layout(
+        &self,
+        device: HostDevice,
+        request: &PipelineLayoutRequest,
+    ) -> AbiResult<DriverAnswer<HostPipelineLayout>> {
+        const METHOD: &str = "VulkanHost::create_pipeline_layout";
+        let parts = self.device_parts(device)?;
+        let layouts = {
+            let table = self.locked_set_layouts();
+            self.objects_of(
+                &table,
+                request.set_layouts.iter().copied().map(HostDescriptorSetLayout::token),
+                "VkDescriptorSetLayout",
+                parts.index,
+                METHOD,
+            )?
+        };
+        let ranges: Vec<vk::PushConstantRange> = request
+            .push_constant_ranges
+            .iter()
+            .map(|bytes| push_constant_from_bytes(METHOD, bytes))
+            .collect::<AbiResult<Vec<_>>>()?;
+        let info = vk::PipelineLayoutCreateInfo::default()
+            .flags(vk::PipelineLayoutCreateFlags::from_raw(request.flags))
+            .set_layouts(&layouts)
+            .push_constant_ranges(&ranges);
+        // SAFETY: the device is live, every handle is one of its own, and `info` and the slices it
+        // borrows outlive the call.
+        match unsafe { parts.device.create_pipeline_layout(&info, None) } {
+            Ok(layout) => {
+                let token = self
+                    .locked_layouts()
+                    .insert(ObjectEntry { device: parts.index, object: layout });
+                Ok(DriverAnswer::Ok(HostPipelineLayout::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_pipeline_layout(&self, layout: HostPipelineLayout) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_pipeline_layout";
+        let (device_index, handle) = {
+            let table = self.locked_layouts();
+            self.device_of(&table, layout.token(), "VkPipelineLayout", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the layout is live and no command buffer being recorded still names it.
+        unsafe { device.destroy_pipeline_layout(handle, None) };
+        self.locked_layouts().remove(layout.token());
+        Ok(())
+    }
+
+    fn create_render_pass(
+        &self,
+        device: HostDevice,
+        request: &RenderPassRequest,
+    ) -> AbiResult<DriverAnswer<HostRenderPass>> {
+        const METHOD: &str = "VulkanHost::create_render_pass";
+        let parts = self.device_parts(device)?;
+        let attachments: Vec<vk::AttachmentDescription> = request
+            .attachments
+            .iter()
+            .map(|bytes| attachment_from_bytes(METHOD, bytes))
+            .collect::<AbiResult<Vec<_>>>()?;
+        let dependencies: Vec<vk::SubpassDependency> = request
+            .dependencies
+            .iter()
+            .map(|bytes| dependency_from_bytes(METHOD, bytes))
+            .collect::<AbiResult<Vec<_>>>()?;
+
+        // The references have to outlive the `VkSubpassDescription`s that point at them, so they
+        // are collected first and borrowed afterwards — `create_device`'s `priorities` makes the
+        // same argument, and getting it wrong leaves `pColorAttachments` dangling.
+        let references: Vec<SubpassReferences> = request
+            .subpasses
+            .iter()
+            .map(|subpass| {
+                Ok(SubpassReferences {
+                    input: references_from_bytes(METHOD, &subpass.input_attachments)?,
+                    colour: references_from_bytes(METHOD, &subpass.color_attachments)?,
+                    resolve: references_from_bytes(METHOD, &subpass.resolve_attachments)?,
+                    depth: subpass
+                        .depth_stencil_attachment
+                        .as_ref()
+                        .map(|bytes| reference_from_bytes(METHOD, bytes))
+                        .transpose()?,
+                    preserve: subpass.preserve_attachments.clone(),
+                })
+            })
+            .collect::<AbiResult<Vec<_>>>()?;
+        let subpasses: Vec<vk::SubpassDescription<'_>> = request
+            .subpasses
+            .iter()
+            .zip(references.iter())
+            .map(|(subpass, references)| {
+                let mut description = vk::SubpassDescription::default()
+                    .flags(vk::SubpassDescriptionFlags::from_raw(subpass.flags))
+                    .pipeline_bind_point(vk::PipelineBindPoint::from_raw(subpass.bind_point as i32))
+                    .input_attachments(&references.input)
+                    .color_attachments(&references.colour)
+                    .preserve_attachments(&references.preserve);
+                // **Only when the guest supplied one.** `pResolveAttachments` NULL and
+                // `pResolveAttachments` pointing at `colorAttachmentCount` entries are different
+                // subpasses, and `ash` writes the pointer unconditionally once this is called.
+                if !references.resolve.is_empty() {
+                    description = description.resolve_attachments(&references.resolve);
+                }
+                if let Some(depth) = references.depth.as_ref() {
+                    description = description.depth_stencil_attachment(depth);
+                }
+                description
+            })
+            .collect();
+
+        let info = vk::RenderPassCreateInfo::default()
+            .flags(vk::RenderPassCreateFlags::from_raw(request.flags))
+            .attachments(&attachments)
+            .subpasses(&subpasses)
+            .dependencies(&dependencies);
+        // SAFETY: the device is live and every pointer reachable from `info` is into a local that
+        // outlives the call.
+        match unsafe { parts.device.create_render_pass(&info, None) } {
+            Ok(pass) => {
+                let token =
+                    self.locked_passes().insert(ObjectEntry { device: parts.index, object: pass });
+                Ok(DriverAnswer::Ok(HostRenderPass::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_render_pass(&self, pass: HostRenderPass) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_render_pass";
+        let (device_index, handle) = {
+            let table = self.locked_passes();
+            self.device_of(&table, pass.token(), "VkRenderPass", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the render pass is live and nothing in flight still names it.
+        unsafe { device.destroy_render_pass(handle, None) };
+        self.locked_passes().remove(pass.token());
+        Ok(())
+    }
+
+    fn create_framebuffer(
+        &self,
+        device: HostDevice,
+        request: &FramebufferRequest,
+    ) -> AbiResult<DriverAnswer<HostFramebuffer>> {
+        const METHOD: &str = "VulkanHost::create_framebuffer";
+        let parts = self.device_parts(device)?;
+        let Some(pass_token) = request.render_pass else {
+            return Err(refused(METHOD, "the request names no render pass"));
+        };
+        let pass = {
+            let table = self.locked_passes();
+            let (owner, handle) =
+                self.device_of(&table, pass_token.token(), "VkRenderPass", METHOD)?;
+            if owner != parts.index {
+                return Err(cross_device("VkRenderPass", owner, parts.index));
+            }
+            handle
+        };
+        let attachments = {
+            let table = self.locked_views();
+            self.objects_of(
+                &table,
+                request.attachments.iter().copied().map(HostImageView::token),
+                "VkImageView",
+                parts.index,
+                METHOD,
+            )?
+        };
+        let info = vk::FramebufferCreateInfo::default()
+            .flags(vk::FramebufferCreateFlags::from_raw(request.flags))
+            .render_pass(pass)
+            .attachments(&attachments)
+            .width(request.width)
+            .height(request.height)
+            .layers(request.layers);
+        // SAFETY: the device is live, every handle is one of its own, and `info` outlives the call.
+        match unsafe { parts.device.create_framebuffer(&info, None) } {
+            Ok(framebuffer) => {
+                let token = self
+                    .locked_framebuffers()
+                    .insert(ObjectEntry { device: parts.index, object: framebuffer });
+                Ok(DriverAnswer::Ok(HostFramebuffer::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_framebuffer(&self, framebuffer: HostFramebuffer) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_framebuffer";
+        let (device_index, handle) = {
+            let table = self.locked_framebuffers();
+            self.device_of(&table, framebuffer.token(), "VkFramebuffer", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the framebuffer is live and no render pass in flight still names it.
+        unsafe { device.destroy_framebuffer(handle, None) };
+        self.locked_framebuffers().remove(framebuffer.token());
+        Ok(())
+    }
+
+    fn create_pipeline_cache(
+        &self,
+        device: HostDevice,
+        flags: u32,
+        initial_data: &[u8],
+    ) -> AbiResult<DriverAnswer<HostPipelineCache>> {
+        let parts = self.device_parts(device)?;
+        let info = vk::PipelineCacheCreateInfo::default()
+            .flags(vk::PipelineCacheCreateFlags::from_raw(flags))
+            .initial_data(initial_data);
+        // SAFETY: the device is live and `info` and the slice it borrows outlive the call. A blob
+        // from another driver is rejected by this one's own header check, which is what the
+        // header is for.
+        match unsafe { parts.device.create_pipeline_cache(&info, None) } {
+            Ok(cache) => {
+                let token =
+                    self.locked_caches().insert(ObjectEntry { device: parts.index, object: cache });
+                Ok(DriverAnswer::Ok(HostPipelineCache::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_pipeline_cache(&self, cache: HostPipelineCache) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_pipeline_cache";
+        let (device_index, handle) = {
+            let table = self.locked_caches();
+            self.device_of(&table, cache.token(), "VkPipelineCache", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the cache is live and no pipeline creation is in progress against it.
+        unsafe { device.destroy_pipeline_cache(handle, None) };
+        self.locked_caches().remove(cache.token());
+        Ok(())
+    }
+
+    /// `vkCreateGraphicsPipelines`, rebuilt from the decoded request in four owned layers.
+    ///
+    /// # Why the layers
+    ///
+    /// `VkGraphicsPipelineCreateInfo` is a tree of pointers: a create info points at nine
+    /// sub-states, the vertex-input state points at two arrays, a shader stage points at a name
+    /// and a specialization info, and that points at two more. Every one of those has to be alive
+    /// and unmoved when `vkCreateGraphicsPipelines` reads it, and `ash`'s builders take borrows —
+    /// so the storage is built **bottom-up in four passes**, each fully populated before the next
+    /// borrows from it. `create_device`'s `priorities` makes the same argument two levels
+    /// shallower, and getting it wrong there would leave `pQueuePriorities` dangling.
+    fn create_graphics_pipelines(
+        &self,
+        device: HostDevice,
+        cache: Option<HostPipelineCache>,
+        requests: &[GraphicsPipelineRequest],
+    ) -> AbiResult<PipelinesCreated> {
+        const METHOD: &str = "VulkanHost::create_graphics_pipelines";
+        let parts = self.device_parts(device)?;
+        let cache_handle = match cache {
+            None => vk::PipelineCache::null(),
+            Some(token) => {
+                let table = self.locked_caches();
+                let (owner, handle) =
+                    self.device_of(&table, token.token(), "VkPipelineCache", METHOD)?;
+                if owner != parts.index {
+                    return Err(cross_device("VkPipelineCache", owner, parts.index));
+                }
+                handle
+            }
+        };
+
+        // Layer 0: everything owned, one entry per request.
+        let owned: Vec<OwnedPipeline> = requests
+            .iter()
+            .map(|request| self.own_pipeline(parts.index, request))
+            .collect::<AbiResult<Vec<_>>>()?;
+
+        // Layer 1: specialization infos, borrowing layer 0.
+        let specializations: Vec<Vec<vk::SpecializationInfo<'_>>> = owned
+            .iter()
+            .map(|pipeline| {
+                pipeline
+                    .stages
+                    .iter()
+                    .map(|stage| {
+                        vk::SpecializationInfo::default()
+                            .map_entries(&stage.entries)
+                            .data(&stage.data)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Layer 2: shader stages, borrowing layers 0 and 1.
+        let stages: Vec<Vec<vk::PipelineShaderStageCreateInfo<'_>>> = owned
+            .iter()
+            .zip(specializations.iter())
+            .map(|(pipeline, specializations)| {
+                pipeline
+                    .stages
+                    .iter()
+                    .zip(specializations.iter())
+                    .map(|(stage, specialization)| {
+                        let mut built = vk::PipelineShaderStageCreateInfo::default()
+                            .flags(vk::PipelineShaderStageCreateFlags::from_raw(stage.flags))
+                            .stage(vk::ShaderStageFlags::from_raw(stage.stage))
+                            .module(stage.module)
+                            .name(stage.name.as_c_str());
+                        if stage.specialized {
+                            built = built.specialization_info(specialization);
+                        }
+                        built
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Layer 3: the nine sub-states, borrowing layer 0.
+        let sub_states: Vec<SubStates<'_>> =
+            owned.iter().map(SubStates::of).collect();
+
+        // Layer 4: the create infos themselves.
+        let infos: Vec<vk::GraphicsPipelineCreateInfo<'_>> = owned
+            .iter()
+            .zip(stages.iter())
+            .zip(sub_states.iter())
+            .map(|((pipeline, stages), sub)| pipeline.info(stages, sub))
+            .collect();
+
+        // SAFETY: the device is live; every handle in `infos` is one of its own, checked above;
+        // every pointer reachable from `infos` is into `owned`, `specializations`, `stages` or
+        // `sub_states`, all of which outlive this call and none of which are mutated after being
+        // borrowed; `pAllocator` is `None`.
+        let created = unsafe {
+            parts.device.create_graphics_pipelines(cache_handle, &infos, None)
+        };
+        // **`ash` returns the handles *and* the failure**, which is exactly the partial-success
+        // shape the specification requires and which `PipelinesCreated` exists to carry: the
+        // pipelines that were created are still real and still have to be destroyed.
+        let (handles, result) = match created {
+            Ok(handles) => (handles, vk::Result::SUCCESS),
+            Err((handles, result)) => (handles, result),
+        };
+        if handles.len() != requests.len() {
+            return Err(refused(
+                METHOD,
+                &format!(
+                    "the driver answered with {} handle slot(s) for {} create info structure(s)",
+                    handles.len(),
+                    requests.len()
+                ),
+            ));
+        }
+        let pipelines = handles
+            .into_iter()
+            .map(|handle| {
+                if handle == vk::Pipeline::null() {
+                    None
+                } else {
+                    let token = self
+                        .locked_pipelines()
+                        .insert(ObjectEntry { device: parts.index, object: handle });
+                    Some(HostPipeline::from_token(token))
+                }
+            })
+            .collect();
+        Ok(PipelinesCreated { result: result.as_raw(), pipelines })
+    }
+
+    fn destroy_pipeline(&self, pipeline: HostPipeline) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_pipeline";
+        let (device_index, handle) = {
+            let table = self.locked_pipelines();
+            self.device_of(&table, pipeline.token(), "VkPipeline", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the pipeline is live and nothing in flight still binds it.
+        unsafe { device.destroy_pipeline(handle, None) };
+        self.locked_pipelines().remove(pipeline.token());
+        Ok(())
+    }
+
+    fn create_descriptor_set_layout(
+        &self,
+        device: HostDevice,
+        request: &DescriptorSetLayoutRequest,
+    ) -> AbiResult<DriverAnswer<HostDescriptorSetLayout>> {
+        const METHOD: &str = "VulkanHost::create_descriptor_set_layout";
+        let parts = self.device_parts(device)?;
+        // The immutable samplers have to outlive the bindings that point at them.
+        let samplers: Vec<Vec<vk::Sampler>> = {
+            let table = self.locked_samplers();
+            request
+                .bindings
+                .iter()
+                .map(|binding| {
+                    self.objects_of(
+                        &table,
+                        binding.immutable_samplers.iter().copied().map(HostSampler::token),
+                        "VkSampler",
+                        parts.index,
+                        METHOD,
+                    )
+                })
+                .collect::<AbiResult<Vec<_>>>()?
+        };
+        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = request
+            .bindings
+            .iter()
+            .zip(samplers.iter())
+            .map(|(binding, samplers)| {
+                let mut built = vk::DescriptorSetLayoutBinding::default()
+                    .binding(binding.binding)
+                    .descriptor_type(vk::DescriptorType::from_raw(binding.descriptor_type as i32))
+                    .stage_flags(vk::ShaderStageFlags::from_raw(binding.stage_flags));
+                if samplers.is_empty() {
+                    // `descriptor_count` and `immutable_samplers` are the same field in `ash`'s
+                    // builder: the second sets the count from the slice. With no samplers the
+                    // count is the guest's own.
+                    built = built.descriptor_count(binding.descriptor_count);
+                } else {
+                    built = built.immutable_samplers(samplers);
+                }
+                built
+            })
+            .collect();
+        let info = vk::DescriptorSetLayoutCreateInfo::default()
+            .flags(vk::DescriptorSetLayoutCreateFlags::from_raw(request.flags))
+            .bindings(&bindings);
+        // SAFETY: the device is live and every pointer reachable from `info` is into a local that
+        // outlives the call.
+        match unsafe { parts.device.create_descriptor_set_layout(&info, None) } {
+            Ok(layout) => {
+                let token = self
+                    .locked_set_layouts()
+                    .insert(ObjectEntry { device: parts.index, object: layout });
+                Ok(DriverAnswer::Ok(HostDescriptorSetLayout::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_descriptor_set_layout(&self, layout: HostDescriptorSetLayout) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_descriptor_set_layout";
+        let (device_index, handle) = {
+            let table = self.locked_set_layouts();
+            self.device_of(&table, layout.token(), "VkDescriptorSetLayout", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the layout is live; sets allocated from it stay valid, which the specification
+        // states explicitly.
+        unsafe { device.destroy_descriptor_set_layout(handle, None) };
+        self.locked_set_layouts().remove(layout.token());
+        Ok(())
+    }
+
+    fn create_descriptor_pool(
+        &self,
+        device: HostDevice,
+        request: &DescriptorPoolRequest,
+    ) -> AbiResult<DriverAnswer<HostDescriptorPool>> {
+        let parts = self.device_parts(device)?;
+        let sizes: Vec<vk::DescriptorPoolSize> = request
+            .sizes
+            .iter()
+            .map(|(kind, count)| vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::from_raw(*kind as i32),
+                descriptor_count: *count,
+            })
+            .collect();
+        let info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::from_raw(request.flags))
+            .max_sets(request.max_sets)
+            .pool_sizes(&sizes);
+        // SAFETY: the device is live and `info` and the slice it borrows outlive the call.
+        match unsafe { parts.device.create_descriptor_pool(&info, None) } {
+            Ok(pool) => {
+                let token = self
+                    .locked_descriptor_pools()
+                    .insert(ObjectEntry { device: parts.index, object: pool });
+                Ok(DriverAnswer::Ok(HostDescriptorPool::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_descriptor_pool(&self, pool: HostDescriptorPool) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_descriptor_pool";
+        let (device_index, handle) = {
+            let table = self.locked_descriptor_pools();
+            self.device_of(&table, pool.token(), "VkDescriptorPool", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the pool is live, and destroying it frees every set allocated from it -- which
+        // is why those entries are dropped below rather than freed one by one.
+        unsafe { device.destroy_descriptor_pool(handle, None) };
+        self.locked_descriptor_pools().remove(pool.token());
+        self.drop_sets_of(pool.token());
+        Ok(())
+    }
+
+    fn descriptor_sets_of(&self, pool: HostDescriptorPool) -> AbiResult<Vec<HostDescriptorSet>> {
+        let table = self.locked_descriptor_sets();
+        Ok(table
+            .iter()
+            .filter(|(_, entry)| entry.pool == pool.token())
+            .map(|(token, _)| HostDescriptorSet::from_token(token))
+            .collect())
+    }
+
+    fn allocate_descriptor_sets(
+        &self,
+        pool: HostDescriptorPool,
+        layouts: &[HostDescriptorSetLayout],
+    ) -> AbiResult<DriverAnswer<Vec<HostDescriptorSet>>> {
+        const METHOD: &str = "VulkanHost::allocate_descriptor_sets";
+        let (device_index, pool_handle) = {
+            let table = self.locked_descriptor_pools();
+            self.device_of(&table, pool.token(), "VkDescriptorPool", METHOD)?
+        };
+        let handles = {
+            let table = self.locked_set_layouts();
+            self.objects_of(
+                &table,
+                layouts.iter().copied().map(HostDescriptorSetLayout::token),
+                "VkDescriptorSetLayout",
+                device_index,
+                METHOD,
+            )?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        let info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool_handle)
+            .set_layouts(&handles);
+        // SAFETY: the device is live, the pool and every layout are its own, and `info` and the
+        // slice it borrows outlive the call.
+        match unsafe { device.allocate_descriptor_sets(&info) } {
+            Ok(sets) => {
+                let mut table = self.locked_descriptor_sets();
+                let tokens = sets
+                    .into_iter()
+                    .map(|set| {
+                        HostDescriptorSet::from_token(table.insert(DescriptorSetEntry {
+                            device: device_index,
+                            pool: pool.token(),
+                            set,
+                        }))
+                    })
+                    .collect();
+                Ok(DriverAnswer::Ok(tokens))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn free_descriptor_sets(
+        &self,
+        pool: HostDescriptorPool,
+        sets: &[HostDescriptorSet],
+    ) -> AbiResult<DriverAnswer<()>> {
+        const METHOD: &str = "VulkanHost::free_descriptor_sets";
+        let (device_index, pool_handle) = {
+            let table = self.locked_descriptor_pools();
+            self.device_of(&table, pool.token(), "VkDescriptorPool", METHOD)?
+        };
+        let handles = {
+            let table = self.locked_descriptor_sets();
+            sets.iter()
+                .map(|token| {
+                    let entry = table.get(token.token()).ok_or_else(|| {
+                        refused(
+                            METHOD,
+                            &format!(
+                                "{token:?} is not a descriptor set this host allocated -- it \
+                                 holds {}",
+                                table.len()
+                            ),
+                        )
+                    })?;
+                    // **The check the specification leaves to validation**: freeing a set with a
+                    // pool it was not allocated from is undefined behaviour, and nothing on this
+                    // machine would report it.
+                    if entry.pool != pool.token() {
+                        return Err(refused(
+                            METHOD,
+                            &format!(
+                                "{token:?} was allocated from pool #{} and is being freed with \
+                                 pool #{}. Both handles are real; the pairing is what is wrong",
+                                entry.pool,
+                                pool.token()
+                            ),
+                        ));
+                    }
+                    Ok(entry.set)
+                })
+                .collect::<AbiResult<Vec<_>>>()?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the device and pool are live, every set was allocated from that pool (checked
+        // above), and the pool was created with `FREE_DESCRIPTOR_SET` -- which the driver itself
+        // enforces and reports.
+        let result = unsafe { device.free_descriptor_sets(pool_handle, &handles) };
+        match result {
+            Ok(()) => {
+                let mut table = self.locked_descriptor_sets();
+                for token in sets {
+                    table.remove(token.token());
+                }
+                Ok(DriverAnswer::Ok(()))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn reset_descriptor_pool(
+        &self,
+        pool: HostDescriptorPool,
+        flags: u32,
+    ) -> AbiResult<DriverAnswer<()>> {
+        const METHOD: &str = "VulkanHost::reset_descriptor_pool";
+        let (device_index, handle) = {
+            let table = self.locked_descriptor_pools();
+            self.device_of(&table, pool.token(), "VkDescriptorPool", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the pool is live and no set allocated from it is still in use by a command
+        // buffer the GPU is executing -- the guest's responsibility, which the specification
+        // states.
+        match unsafe {
+            device.reset_descriptor_pool(handle, vk::DescriptorPoolResetFlags::from_raw(flags))
+        } {
+            Ok(()) => {
+                self.drop_sets_of(pool.token());
+                Ok(DriverAnswer::Ok(()))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn update_descriptor_sets(
+        &self,
+        device: HostDevice,
+        writes: &[DescriptorWrite],
+        copies: &[DescriptorCopy],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::update_descriptor_sets";
+        let parts = self.device_parts(device)?;
+
+        // The `VkDescriptorImageInfo`/`VkDescriptorBufferInfo` arrays have to outlive the writes
+        // that point at them, so they are built first.
+        let payloads: Vec<WritePayload> = writes
+            .iter()
+            .map(|write| self.write_payload(parts.index, write, METHOD))
+            .collect::<AbiResult<Vec<_>>>()?;
+        let built_writes: Vec<vk::WriteDescriptorSet<'_>> = writes
+            .iter()
+            .zip(payloads.iter())
+            .map(|(write, payload)| {
+                let built = vk::WriteDescriptorSet::default()
+                    .dst_set(payload.set)
+                    .dst_binding(write.binding)
+                    .dst_array_element(write.array_element)
+                    .descriptor_type(vk::DescriptorType::from_raw(write.descriptor_type as i32));
+                // **Which builder is called is decided by the decoded variant**, which was
+                // decided by `descriptorType` one layer up. `ash` sets `descriptorCount` from the
+                // slice, so the count and the array cannot disagree.
+                match &payload.data {
+                    PayloadData::Images(images) => built.image_info(images),
+                    PayloadData::Buffers(buffers) => built.buffer_info(buffers),
+                }
+            })
+            .collect();
+
+        let built_copies: Vec<vk::CopyDescriptorSet<'_>> = copies
+            .iter()
+            .map(|copy| {
+                let table = self.locked_descriptor_sets();
+                let source = Self::set_handle(&table, copy.source, parts.index, METHOD)?;
+                let destination =
+                    Self::set_handle(&table, copy.destination, parts.index, METHOD)?;
+                Ok(vk::CopyDescriptorSet::default()
+                    .src_set(source)
+                    .src_binding(copy.source_binding)
+                    .src_array_element(copy.source_element)
+                    .dst_set(destination)
+                    .dst_binding(copy.destination_binding)
+                    .dst_array_element(copy.destination_element)
+                    .descriptor_count(copy.count))
+            })
+            .collect::<AbiResult<Vec<_>>>()?;
+
+        // SAFETY: the device is live, every handle in both lists is one of its own, and every
+        // pointer reachable from them is into `payloads` or a local that outlives the call.
+        unsafe { parts.device.update_descriptor_sets(&built_writes, &built_copies) };
+        Ok(())
+    }
+
+    fn cmd_begin_render_pass(
+        &self,
+        buffer: HostCommandBuffer,
+        begin: &RenderPassBegin,
+        contents: u32,
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_begin_render_pass";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let Some(pass_token) = begin.render_pass else {
+            return Err(refused(METHOD, "the request names no render pass"));
+        };
+        let Some(framebuffer_token) = begin.framebuffer else {
+            return Err(refused(METHOD, "the request names no framebuffer"));
+        };
+        let pass = {
+            let table = self.locked_passes();
+            self.device_of(&table, pass_token.token(), "VkRenderPass", METHOD)?.1
+        };
+        let framebuffer = {
+            let table = self.locked_framebuffers();
+            self.device_of(&table, framebuffer_token.token(), "VkFramebuffer", METHOD)?.1
+        };
+        let area = rect_from_bytes(METHOD, &begin.render_area)?;
+        // **The union, reassembled from the guest's own bytes**, for `cmd_clear_color_image`'s
+        // reason: which member is live is decided by each attachment's format, which this layer
+        // does not know, and the three members alias the same sixteen bytes.
+        let clears: Vec<vk::ClearValue> =
+            begin.clear_values.iter().map(clear_value_from_bytes).collect();
+
+        let info = vk::RenderPassBeginInfo::default()
+            .render_pass(pass)
+            .framebuffer(framebuffer)
+            .render_area(area)
+            .clear_values(&clears);
+        // SAFETY: the command buffer is live and recording, every handle is one of its device's,
+        // and `info` and the slice it borrows outlive the call.
+        unsafe {
+            device.cmd_begin_render_pass(
+                handle,
+                &info,
+                vk::SubpassContents::from_raw(contents as i32),
+            );
+        }
+        Ok(())
+    }
+
+    fn cmd_end_render_pass(&self, buffer: HostCommandBuffer) -> AbiResult<()> {
+        let (device, handle) = self.command_parts(buffer, "VulkanHost::cmd_end_render_pass")?;
+        // SAFETY: the command buffer is live and inside a render pass, which the driver enforces.
+        unsafe { device.cmd_end_render_pass(handle) };
+        Ok(())
+    }
+
+    fn cmd_bind_pipeline(
+        &self,
+        buffer: HostCommandBuffer,
+        bind_point: u32,
+        pipeline: HostPipeline,
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_bind_pipeline";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let target = {
+            let table = self.locked_pipelines();
+            self.device_of(&table, pipeline.token(), "VkPipeline", METHOD)?.1
+        };
+        // SAFETY: the command buffer is live and recording, and the pipeline is live.
+        unsafe {
+            device.cmd_bind_pipeline(
+                handle,
+                vk::PipelineBindPoint::from_raw(bind_point as i32),
+                target,
+            );
+        }
+        Ok(())
+    }
+
+    fn cmd_bind_vertex_buffers(
+        &self,
+        buffer: HostCommandBuffer,
+        first_binding: u32,
+        buffers: &[(HostBuffer, u64)],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_bind_vertex_buffers";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let handles = {
+            let table = self.locked_vk_buffers();
+            buffers
+                .iter()
+                .map(|(token, _)| {
+                    self.device_of(&table, token.token(), "VkBuffer", METHOD).map(|(_, h)| h)
+                })
+                .collect::<AbiResult<Vec<_>>>()?
+        };
+        let offsets: Vec<u64> = buffers.iter().map(|(_, offset)| *offset).collect();
+        // SAFETY: the command buffer is live and recording, every buffer is live, and the two
+        // slices have the same length by construction -- they were decoded as pairs.
+        unsafe { device.cmd_bind_vertex_buffers(handle, first_binding, &handles, &offsets) };
+        Ok(())
+    }
+
+    fn cmd_bind_index_buffer(
+        &self,
+        buffer: HostCommandBuffer,
+        index_buffer: HostBuffer,
+        offset: u64,
+        index_type: u32,
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_bind_index_buffer";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let target = {
+            let table = self.locked_vk_buffers();
+            self.device_of(&table, index_buffer.token(), "VkBuffer", METHOD)?.1
+        };
+        // SAFETY: the command buffer is live and recording and the buffer is live.
+        unsafe {
+            device.cmd_bind_index_buffer(
+                handle,
+                target,
+                offset,
+                vk::IndexType::from_raw(index_type as i32),
+            );
+        }
+        Ok(())
+    }
+
+    fn cmd_bind_descriptor_sets(
+        &self,
+        buffer: HostCommandBuffer,
+        bind_point: u32,
+        layout: HostPipelineLayout,
+        first_set: u32,
+        sets: &[HostDescriptorSet],
+        dynamic_offsets: &[u32],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_bind_descriptor_sets";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let layout_handle = {
+            let table = self.locked_layouts();
+            self.device_of(&table, layout.token(), "VkPipelineLayout", METHOD)?.1
+        };
+        let set_handles = {
+            let table = self.locked_descriptor_sets();
+            sets.iter()
+                .map(|token| {
+                    table.get(token.token()).map(|entry| entry.set).ok_or_else(|| {
+                        refused(
+                            METHOD,
+                            &format!(
+                                "{token:?} is not a descriptor set this host holds -- it holds \
+                                 {}. A set freed with its pool lands here",
+                                table.len()
+                            ),
+                        )
+                    })
+                })
+                .collect::<AbiResult<Vec<_>>>()?
+        };
+        // SAFETY: the command buffer is live and recording, and every handle is live.
+        unsafe {
+            device.cmd_bind_descriptor_sets(
+                handle,
+                vk::PipelineBindPoint::from_raw(bind_point as i32),
+                layout_handle,
+                first_set,
+                &set_handles,
+                dynamic_offsets,
+            );
+        }
+        Ok(())
+    }
+
+    fn cmd_set_viewport(
+        &self,
+        buffer: HostCommandBuffer,
+        first: u32,
+        viewports: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_set_viewport";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let built = viewports_from_bytes(METHOD, viewports)?;
+        // SAFETY: the command buffer is live and recording, and `built` outlives the call.
+        unsafe { device.cmd_set_viewport(handle, first, &built) };
+        Ok(())
+    }
+
+    fn cmd_set_scissor(
+        &self,
+        buffer: HostCommandBuffer,
+        first: u32,
+        scissors: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_set_scissor";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let built = rects_from_bytes(METHOD, scissors)?;
+        // SAFETY: as `cmd_set_viewport`.
+        unsafe { device.cmd_set_scissor(handle, first, &built) };
+        Ok(())
+    }
+
+    fn cmd_draw(
+        &self,
+        buffer: HostCommandBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) -> AbiResult<()> {
+        let (device, handle) = self.command_parts(buffer, "VulkanHost::cmd_draw")?;
+        // SAFETY: the command buffer is live, recording, and inside a render pass with a graphics
+        // pipeline bound -- all of which the driver enforces and reports.
+        unsafe {
+            device.cmd_draw(handle, vertex_count, instance_count, first_vertex, first_instance);
+        }
+        Ok(())
+    }
+
+    fn cmd_draw_indexed(
+        &self,
+        buffer: HostCommandBuffer,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) -> AbiResult<()> {
+        let (device, handle) = self.command_parts(buffer, "VulkanHost::cmd_draw_indexed")?;
+        // SAFETY: as `cmd_draw`, with an index buffer bound.
+        unsafe {
+            device.cmd_draw_indexed(
+                handle,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+            );
+        }
+        Ok(())
+    }
+
+    fn cmd_copy_buffer(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostBuffer,
+        destination: HostBuffer,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_copy_buffer";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let (source_handle, destination_handle) = {
+            let table = self.locked_vk_buffers();
+            (
+                self.device_of(&table, source.token(), "VkBuffer", METHOD)?.1,
+                self.device_of(&table, destination.token(), "VkBuffer", METHOD)?.1,
+            )
+        };
+        let built = buffer_copies_from_bytes(METHOD, regions)?;
+        // SAFETY: the command buffer is live and recording, both buffers are live, and `built`
+        // outlives the call.
+        unsafe { device.cmd_copy_buffer(handle, source_handle, destination_handle, &built) };
+        Ok(())
+    }
+
+    fn cmd_copy_buffer_to_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostBuffer,
+        image: HostImageRef,
+        layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_copy_buffer_to_image";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let source_handle = {
+            let table = self.locked_vk_buffers();
+            self.device_of(&table, source.token(), "VkBuffer", METHOD)?.1
+        };
+        let destination = self.image_handle(image, "vkCmdCopyBufferToImage")?;
+        let built = buffer_image_copies_from_bytes(METHOD, regions)?;
+        // SAFETY: the command buffer is live and recording, the buffer and image are live, and
+        // the image is in the layout the guest named -- which is its responsibility and which the
+        // driver reports if the barrier before it was wrong.
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                handle,
+                source_handle,
+                destination,
+                vk::ImageLayout::from_raw(layout as i32),
+                &built,
+            );
+        }
+        Ok(())
+    }
+
+    fn cmd_push_constants(
+        &self,
+        buffer: HostCommandBuffer,
+        layout: HostPipelineLayout,
+        stage_flags: u32,
+        offset: u32,
+        values: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_push_constants";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let layout_handle = {
+            let table = self.locked_layouts();
+            self.device_of(&table, layout.token(), "VkPipelineLayout", METHOD)?.1
+        };
+        // SAFETY: the command buffer is live and recording, the layout is live, and `values`
+        // outlives the call.
+        unsafe {
+            device.cmd_push_constants(
+                handle,
+                layout_handle,
+                vk::ShaderStageFlags::from_raw(stage_flags),
+                offset,
+                values,
+            );
+        }
+        Ok(())
+    }
+}
 
 impl GfxVulkanHost {
     /// The `VkImage` behind an [`HostImageRef`], or a refusal naming the call.
@@ -2849,6 +4404,11 @@ impl GfxVulkanHost {
                         ),
                     )
                 })
+            }
+            HostImageRef::Created(token) => {
+                let table = self.locked_created_images();
+                self.device_of(&table, token.token(), "VkImage", "GfxVulkanHost::image_handle")
+                    .map(|(_, image)| image)
             }
             HostImageRef::None => Err(refused(
                 call,
@@ -2901,6 +4461,692 @@ impl GfxVulkanHost {
                 Ok(handle)
             })
             .collect()
+    }
+
+    // ------------------------------------------------------------------- stage 5 internals
+
+    fn locked_memories(&self) -> std::sync::MutexGuard<'_, Slab<MemoryEntry>> {
+        self.device_memories.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_vk_buffers(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::Buffer>>> {
+        self.buffers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_created_images(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::Image>>> {
+        self.created_images.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_samplers(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::Sampler>>> {
+        self.samplers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_modules(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::ShaderModule>>> {
+        self.shader_modules.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_layouts(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::PipelineLayout>>> {
+        self.pipeline_layouts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_passes(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::RenderPass>>> {
+        self.render_passes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_framebuffers(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::Framebuffer>>> {
+        self.framebuffers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_pipelines(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::Pipeline>>> {
+        self.pipelines.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_caches(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::PipelineCache>>> {
+        self.pipeline_caches.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_set_layouts(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::DescriptorSetLayout>>> {
+        self.descriptor_set_layouts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_descriptor_pools(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::DescriptorPool>>> {
+        self.descriptor_pools.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_descriptor_sets(&self) -> std::sync::MutexGuard<'_, Slab<DescriptorSetEntry>> {
+        self.descriptor_sets.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The device index and `VkDeviceMemory` a token names.
+    fn memory_of(
+        &self,
+        memory: HostDeviceMemory,
+        method: &'static str,
+    ) -> AbiResult<(usize, vk::DeviceMemory, bool)> {
+        let table = self.locked_memories();
+        table.get(memory.token()).map(|entry| (entry.device, entry.memory, entry.imported)).ok_or_else(
+            || {
+                refused(
+                    method,
+                    &format!(
+                        "{memory:?} is not an allocation this host made -- it holds {}. An \
+                         allocation already freed by `vkFreeMemory` lands here, which is the case \
+                         that matters: the guest's pages were unmapped with it",
+                        table.len()
+                    ),
+                )
+            },
+        )
+    }
+
+    /// Resolve a list of tokens out of one of the plain object tables, checking the device.
+    fn objects_of<T: Copy>(
+        &self,
+        table: &Slab<ObjectEntry<T>>,
+        tokens: impl IntoIterator<Item = u64>,
+        family: &'static str,
+        device_index: usize,
+        method: &'static str,
+    ) -> AbiResult<Vec<T>> {
+        tokens
+            .into_iter()
+            .map(|token| {
+                let (owner, object) = self.device_of(table, token, family, method)?;
+                if owner != device_index {
+                    return Err(cross_device(family, owner, device_index));
+                }
+                Ok(object)
+            })
+            .collect()
+    }
+
+    /// **What `VK_EXT_external_memory_host` can do on one physical device, measured once.**
+    ///
+    /// # Why this costs a throwaway `VkDevice`, and why there is no cheaper honest answer
+    ///
+    /// The question `omni-android` needs answered at `vkGetPhysicalDeviceMemoryProperties` is
+    /// *which memory types a host pointer can be imported into*, because that is what decides
+    /// which types it can let the guest map. The only route the specification gives to that fact
+    /// is `vkGetMemoryHostPointerPropertiesEXT`, which is a **device**-level call — and
+    /// `vkGetPhysicalDeviceMemoryProperties` may be made before the guest has created a device.
+    ///
+    /// The tempting alternative is a rule: "host-visible and not device-local". On this machine
+    /// that reproduces the measured `0xc` exactly, which is precisely why it is dangerous — it is
+    /// a *derivation* that happens to agree with one measurement, and the first driver it
+    /// disagreed with would silently mis-mask the table an engine chooses its uploads from. This
+    /// project does not make plausible claims about drivers.
+    ///
+    /// So a device is created, asked, and destroyed. It happens **once per physical device** for
+    /// the life of the host, it enables nothing but `VK_EXT_external_memory_host`, and it asks for
+    /// one queue of family 0 because `vkCreateDevice` requires at least one queue and any family
+    /// index is legal for a device that submits nothing.
+    ///
+    /// A physical device with no `VK_EXT_external_memory_host` answers `memory_type_bits = 0`,
+    /// which masks every host-visible type out of the list the guest sees and makes every
+    /// `vkMapMemory` a refusal naming the type. That is a real limitation of such a host and is
+    /// reported rather than worked around.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when the extension is present and the probe itself fails — which is a
+    /// fact about this host and must not be flattened into an answer of zero.
+    fn probe_importable(
+        &self,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+    ) -> AbiResult<(u32, u64)> {
+        const METHOD: &str = "GfxVulkanHost::probe_importable";
+        let raw = vk::Handle::as_raw(physical);
+        if let Some(probe) =
+            self.importable.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|probe| probe.physical == raw)
+        {
+            return Ok((probe.memory_type_bits, probe.alignment));
+        }
+
+        // SAFETY: `physical` is a live physical device of `instance`, which this host created.
+        let available = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .map_err(|result| {
+                refused(
+                    METHOD,
+                    &format!(
+                        "`vkEnumerateDeviceExtensionProperties` failed with {result:?}, so this \
+                         host cannot say whether it is able to back host-visible memory at all"
+                    ),
+                )
+            })?;
+        let has_extension = available.iter().any(|entry| {
+            entry.extension_name_as_c_str().is_ok_and(|name| name == vk::EXT_EXTERNAL_MEMORY_HOST_NAME)
+        });
+        if !has_extension {
+            let probe = ImportableProbe {
+                physical: raw,
+                memory_type_bits: 0,
+                alignment: CONSERVATIVE_IMPORT_ALIGNMENT,
+            };
+            let answer = (probe.memory_type_bits, probe.alignment);
+            self.importable.lock().unwrap_or_else(PoisonError::into_inner).push(probe);
+            return Ok(answer);
+        }
+
+        let alignment = self.imported_pointer_alignment(instance, physical);
+
+        // The throwaway device. One queue, one extension, nothing else.
+        let priorities = [1.0f32];
+        let queue_info = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(&priorities);
+        let queue_infos = [queue_info];
+        let extension = vk::EXT_EXTERNAL_MEMORY_HOST_NAME.as_ptr();
+        let extensions = [extension];
+        let info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_infos)
+            .enabled_extension_names(&extensions);
+        // SAFETY: `physical` is live, every pointer reachable from `info` is into a local that
+        // outlives the call, and `pAllocator` is `None`.
+        let device = unsafe { instance.create_device(physical, &info, None) }.map_err(|result| {
+            refused(
+                METHOD,
+                &format!(
+                    "creating the one-queue probe device that `vkGetMemoryHostPointerPropertiesEXT` \
+                     needs failed with {result:?}. `VK_EXT_external_memory_host` is present on \
+                     this physical device, so this is a host failure and not an answer of zero -- \
+                     reporting zero would mask every host-visible memory type out of the guest's \
+                     list for a reason that is not true of the device"
+                ),
+            )
+        })?;
+
+        let bits = self.ask_host_pointer_properties(instance, &device, alignment);
+        // SAFETY: the probe device submitted nothing, holds nothing and is about to be dropped.
+        unsafe { device.destroy_device(None) };
+        let memory_type_bits = bits?;
+
+        let probe = ImportableProbe { physical: raw, memory_type_bits, alignment };
+        let answer = (probe.memory_type_bits, probe.alignment);
+        self.importable.lock().unwrap_or_else(PoisonError::into_inner).push(probe);
+        Ok(answer)
+    }
+
+    /// `minImportedHostPointerAlignment`, or a conservative over-alignment when it cannot be asked.
+    ///
+    /// # Why a fallback rather than a refusal
+    ///
+    /// The property lives in a `VkPhysicalDeviceExternalMemoryHostPropertiesEXT` chained onto
+    /// `vkGetPhysicalDeviceProperties2`, which is a **Vulkan 1.1** entry point — and the instance
+    /// this is asked through is the *guest's*, created from the guest's own
+    /// `VkInstanceCreateInfo`, which may well name `apiVersion` 1.0. This host does not get to
+    /// change that.
+    ///
+    /// So the entry point is resolved by name, under both its core and its `KHR` spelling, and if
+    /// neither is there the answer is [`CONSERVATIVE_IMPORT_ALIGNMENT`]. That is **safe rather
+    /// than guessed**: an over-alignment satisfies any smaller requirement, because every
+    /// alignment Vulkan reports is a power of two and 64 KiB is a multiple of all of them up to
+    /// itself. What it costs is rounding — an allocation of one page becomes sixteen — which is
+    /// visible in `Vulkan::imported_bytes()` rather than silent.
+    fn imported_pointer_alignment(
+        &self,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+    ) -> u64 {
+        let core = c"vkGetPhysicalDeviceProperties2";
+        let khr = c"vkGetPhysicalDeviceProperties2KHR";
+        // SAFETY: `instance` is live and both names are NUL-terminated literals. A name the
+        // loader does not have answers null, which is the case this handles.
+        let found = unsafe {
+            self.entry
+                .get_instance_proc_addr(instance.handle(), core.as_ptr())
+                .or_else(|| self.entry.get_instance_proc_addr(instance.handle(), khr.as_ptr()))
+        };
+        let Some(function) = found else { return CONSERVATIVE_IMPORT_ALIGNMENT };
+        // SAFETY: `vkGetPhysicalDeviceProperties2` and its `KHR` alias have this signature by
+        // definition; the loader answered non-null for one of those two names and nothing else.
+        let get_properties2: vk::PFN_vkGetPhysicalDeviceProperties2 =
+            unsafe { std::mem::transmute(function) };
+
+        let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+        // SAFETY: `physical` is a live device of `instance`, and `properties` is a correctly
+        // chained, locally owned structure that outlives the call.
+        unsafe { get_properties2(physical, &mut properties) };
+        let reported = host.min_imported_host_pointer_alignment;
+        // A driver that reported zero, or something that is not a power of two, is one this code
+        // cannot align to — so the conservative value stands rather than being multiplied by it.
+        if reported == 0 || !reported.is_power_of_two() {
+            CONSERVATIVE_IMPORT_ALIGNMENT
+        } else {
+            reported
+        }
+    }
+
+    /// Ask one device which memory types an ordinary host allocation can be imported into.
+    ///
+    /// The pointer is a real, aligned, committed host allocation of exactly `alignment` bytes,
+    /// because that is what the call is defined over — `VkMemoryHostPointerPropertiesEXT`'s answer
+    /// is about the memory the pointer names, not about the pointer's value.
+    fn ask_host_pointer_properties(
+        &self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        alignment: u64,
+    ) -> AbiResult<u32> {
+        const METHOD: &str = "GfxVulkanHost::probe_importable";
+        let name = c"vkGetMemoryHostPointerPropertiesEXT";
+        // SAFETY: `device` is live and was created with `VK_EXT_external_memory_host` enabled, and
+        // the name is a NUL-terminated literal.
+        let found = unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) };
+        let Some(function) = found else {
+            return Err(refused(
+                METHOD,
+                "this device enabled `VK_EXT_external_memory_host` and its loader answered NULL \
+                 for `vkGetMemoryHostPointerPropertiesEXT`, which is the one command that \
+                 extension exists to provide. Answering zero would mask every host-visible memory \
+                 type out of the guest's list for a reason that is not true of the device",
+            ));
+        };
+        // SAFETY: the loader answered non-null for exactly this name, whose signature the
+        // extension defines.
+        let get_properties: vk::PFN_vkGetMemoryHostPointerPropertiesEXT =
+            unsafe { std::mem::transmute(function) };
+
+        let size = usize::try_from(alignment).unwrap_or(4096).max(1);
+        let layout = std::alloc::Layout::from_size_align(size, size).map_err(|err| {
+            refused(METHOD, &format!("a {size}-byte probe allocation is not a valid layout: {err}"))
+        })?;
+        // SAFETY: `layout` has a non-zero size.
+        let probe = unsafe { std::alloc::alloc_zeroed(layout) };
+        if probe.is_null() {
+            return Err(refused(METHOD, "the probe allocation failed"));
+        }
+
+        let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
+        // SAFETY: `device` is live, the handle type is the one for an ordinary host allocation,
+        // `probe` is a live, committed, `alignment`-aligned allocation of this process, and
+        // `properties` is a locally owned structure that outlives the call.
+        let result = unsafe {
+            get_properties(
+                device.handle(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                probe.cast(),
+                &mut properties,
+            )
+        };
+        // SAFETY: `probe` came from `alloc_zeroed` with this exact layout and nothing else freed
+        // it; the driver's call above reads it and keeps no reference.
+        unsafe { std::alloc::dealloc(probe, layout) };
+
+        if result != vk::Result::SUCCESS {
+            return Err(refused(
+                METHOD,
+                &format!(
+                    "`vkGetMemoryHostPointerPropertiesEXT` on ordinary host memory answered \
+                     {result:?}. That is this host failing to answer a question it has the \
+                     extension for, not the device declining"
+                ),
+            ));
+        }
+        Ok(properties.memory_type_bits)
+    }
+
+    /// How many of each stage 5 object this host holds. Diagnostic (Global Constraint 6).
+    ///
+    /// # The allocation table is read **once**, and that is not a tidiness point
+    ///
+    /// Two of the fields below come from `device_memories`, and taking the guard twice inside one
+    /// struct expression deadlocks: a temporary lives to the end of the *enclosing statement*, so
+    /// the first guard is still held when the second is taken, and `std::sync::Mutex` is not
+    /// reentrant. That is not hypothetical — it is how this function was first written, and the
+    /// symptom was the stage 5 live test hanging in teardown after every one of its assertions had
+    /// already passed.
+    #[must_use]
+    pub fn stage_five_objects(&self) -> StageFiveObjects {
+        let (device_memories, imported_memories) = {
+            let table = self.locked_memories();
+            (table.len(), table.iter().filter(|(_, entry)| entry.imported).count())
+        };
+        StageFiveObjects {
+            device_memories,
+            imported_memories,
+            buffers: self.locked_vk_buffers().len(),
+            images: self.locked_created_images().len(),
+            samplers: self.locked_samplers().len(),
+            shader_modules: self.locked_modules().len(),
+            pipeline_layouts: self.locked_layouts().len(),
+            render_passes: self.locked_passes().len(),
+            framebuffers: self.locked_framebuffers().len(),
+            pipelines: self.locked_pipelines().len(),
+            pipeline_caches: self.locked_caches().len(),
+            descriptor_set_layouts: self.locked_set_layouts().len(),
+            descriptor_pools: self.locked_descriptor_pools().len(),
+            descriptor_sets: self.locked_descriptor_sets().len(),
+        }
+    }
+
+    /// Build one `VkMappedMemoryRange` per `(memory, offset, size)`, checking the device.
+    fn mapped_ranges(
+        &self,
+        ranges: &[(HostDeviceMemory, u64, u64)],
+        device_index: usize,
+        method: &'static str,
+    ) -> AbiResult<Vec<vk::MappedMemoryRange<'static>>> {
+        ranges
+            .iter()
+            .map(|(memory, offset, size)| {
+                let (owner, handle, _) = self.memory_of(*memory, method)?;
+                if owner != device_index {
+                    return Err(cross_device("VkDeviceMemory", owner, device_index));
+                }
+                Ok(vk::MappedMemoryRange::default().memory(handle).offset(*offset).size(*size))
+            })
+            .collect()
+    }
+
+    /// Drop this host's record of every descriptor set a pool held.
+    ///
+    /// Called **after** the driver has freed them, by `vkDestroyDescriptorPool` and
+    /// `vkResetDescriptorPool`. [`CommandBufferEntry`] makes the same argument one family along: a
+    /// set whose pool is gone is a handle naming a freed driver object, and the shim drops the
+    /// guest's handles in the same call.
+    fn drop_sets_of(&self, pool: u64) {
+        let mut table = self.locked_descriptor_sets();
+        let doomed: Vec<u64> =
+            table.iter().filter(|(_, entry)| entry.pool == pool).map(|(token, _)| token).collect();
+        for token in doomed {
+            table.remove(token);
+        }
+    }
+
+    /// The `VkDescriptorSet` a token names, checked against one device.
+    fn set_handle(
+        table: &Slab<DescriptorSetEntry>,
+        token: HostDescriptorSet,
+        device_index: usize,
+        method: &'static str,
+    ) -> AbiResult<vk::DescriptorSet> {
+        let entry = table.get(token.token()).ok_or_else(|| {
+            refused(
+                method,
+                &format!(
+                    "{token:?} is not a descriptor set this host holds -- it holds {}",
+                    table.len()
+                ),
+            )
+        })?;
+        if entry.device != device_index {
+            return Err(cross_device("VkDescriptorSet", entry.device, device_index));
+        }
+        Ok(entry.set)
+    }
+
+    /// Resolve one `VkWriteDescriptorSet`'s handles into an owned payload.
+    fn write_payload(
+        &self,
+        device_index: usize,
+        write: &DescriptorWrite,
+        method: &'static str,
+    ) -> AbiResult<WritePayload> {
+        let set = {
+            let table = self.locked_descriptor_sets();
+            Self::set_handle(&table, write.set, device_index, method)?
+        };
+        let data = match &write.writes {
+            DescriptorWrites::Images(entries) => {
+                let samplers = self.locked_samplers();
+                let views = self.locked_views();
+                let built = entries
+                    .iter()
+                    .map(|(sampler, view, layout)| {
+                        let mut info = vk::DescriptorImageInfo::default()
+                            .image_layout(vk::ImageLayout::from_raw(*layout as i32));
+                        if let Some(token) = sampler {
+                            let (owner, handle) =
+                                self.device_of(&samplers, token.token(), "VkSampler", method)?;
+                            if owner != device_index {
+                                return Err(cross_device("VkSampler", owner, device_index));
+                            }
+                            info = info.sampler(handle);
+                        }
+                        if let Some(token) = view {
+                            let (owner, handle) =
+                                self.device_of(&views, token.token(), "VkImageView", method)?;
+                            if owner != device_index {
+                                return Err(cross_device("VkImageView", owner, device_index));
+                            }
+                            info = info.image_view(handle);
+                        }
+                        Ok(info)
+                    })
+                    .collect::<AbiResult<Vec<_>>>()?;
+                PayloadData::Images(built)
+            }
+            DescriptorWrites::Buffers(entries) => {
+                let buffers = self.locked_vk_buffers();
+                let built = entries
+                    .iter()
+                    .map(|(token, offset, range)| {
+                        let (owner, handle) =
+                            self.device_of(&buffers, token.token(), "VkBuffer", method)?;
+                        if owner != device_index {
+                            return Err(cross_device("VkBuffer", owner, device_index));
+                        }
+                        Ok(vk::DescriptorBufferInfo::default()
+                            .buffer(handle)
+                            .offset(*offset)
+                            .range(*range))
+                    })
+                    .collect::<AbiResult<Vec<_>>>()?;
+                PayloadData::Buffers(built)
+            }
+        };
+        Ok(WritePayload { set, data })
+    }
+
+    /// Resolve and own everything one `VkGraphicsPipelineCreateInfo` points at.
+    ///
+    /// Layer 0 of [`GfxVulkanHost::create_graphics_pipelines`]' four. Nothing here borrows from
+    /// anything else, which is what makes the three layers above it able to.
+    fn own_pipeline(
+        &self,
+        device_index: usize,
+        request: &GraphicsPipelineRequest,
+    ) -> AbiResult<OwnedPipeline> {
+        const METHOD: &str = "VulkanHost::create_graphics_pipelines";
+        let stages = {
+            let modules = self.locked_modules();
+            request
+                .stages
+                .iter()
+                .map(|stage| {
+                    let Some(token) = stage.module else {
+                        return Err(refused(METHOD, "a shader stage names no module"));
+                    };
+                    let (owner, module) =
+                        self.device_of(&modules, token.token(), "VkShaderModule", METHOD)?;
+                    if owner != device_index {
+                        return Err(cross_device("VkShaderModule", owner, device_index));
+                    }
+                    let name = CString::new(stage.name.as_str()).map_err(|err| {
+                        refused(
+                            METHOD,
+                            &format!(
+                                "a shader stage entry point \"{}\" has an interior NUL ({err}). \
+                                 Passing it on would name a shorter entry point than the guest \
+                                 wrote, and SPIR-V matches it byte for byte",
+                                stage.name
+                            ),
+                        )
+                    })?;
+                    let (entries, data, specialized) = match stage.specialization.as_ref() {
+                        None => (Vec::new(), Vec::new(), false),
+                        Some(specialization) => (
+                            specialization
+                                .entries
+                                .iter()
+                                .map(|(id, offset, size)| vk::SpecializationMapEntry {
+                                    constant_id: *id,
+                                    offset: *offset,
+                                    size: usize::try_from(*size).unwrap_or(usize::MAX),
+                                })
+                                .collect(),
+                            specialization.data.clone(),
+                            true,
+                        ),
+                    };
+                    Ok(OwnedStage {
+                        flags: stage.flags,
+                        stage: stage.stage,
+                        module,
+                        name,
+                        entries,
+                        data,
+                        specialized,
+                    })
+                })
+                .collect::<AbiResult<Vec<_>>>()?
+        };
+
+        let vertex = request
+            .vertex_input
+            .as_ref()
+            .map(|vertex| {
+                AbiResult::Ok(OwnedVertexInput {
+                    flags: vertex.flags,
+                    bindings: vertex
+                        .bindings
+                        .iter()
+                        .map(|bytes| vertex_binding_from_bytes(METHOD, bytes))
+                        .collect::<AbiResult<Vec<_>>>()?,
+                    attributes: vertex
+                        .attributes
+                        .iter()
+                        .map(|bytes| vertex_attribute_from_bytes(METHOD, bytes))
+                        .collect::<AbiResult<Vec<_>>>()?,
+                })
+            })
+            .transpose()?;
+
+        let viewport = request
+            .viewport
+            .as_ref()
+            .map(|viewport| {
+                AbiResult::Ok(OwnedViewport {
+                    flags: viewport.flags,
+                    viewport_count: viewport.viewport_count,
+                    viewports: viewports_from_bytes(METHOD, &viewport.viewports)?,
+                    scissor_count: viewport.scissor_count,
+                    scissors: rects_from_bytes(METHOD, &viewport.scissors)?,
+                })
+            })
+            .transpose()?;
+
+        let multisample = request.multisample.as_ref().map(|multisample| OwnedMultisample {
+            flags: multisample.flags,
+            samples: multisample.samples,
+            sample_shading: multisample.sample_shading != 0,
+            min_sample_shading: f32::from_le_bytes(multisample.min_sample_shading),
+            sample_mask: multisample.sample_mask.clone(),
+            alpha_to_coverage: multisample.alpha_to_coverage != 0,
+            alpha_to_one: multisample.alpha_to_one != 0,
+        });
+
+        let color_blend = request
+            .color_blend
+            .as_ref()
+            .map(|blend| {
+                let mut constants = [0.0f32; 4];
+                for (index, value) in constants.iter_mut().enumerate() {
+                    *value = f32::from_le_bytes(
+                        blend.blend_constants[index * 4..][..4].try_into().expect("four"),
+                    );
+                }
+                AbiResult::Ok(OwnedColorBlend {
+                    flags: blend.flags,
+                    logic_op_enable: blend.logic_op_enable != 0,
+                    logic_op: blend.logic_op,
+                    attachments: blend
+                        .attachments
+                        .iter()
+                        .map(|bytes| blend_attachment_from_bytes(METHOD, bytes))
+                        .collect::<AbiResult<Vec<_>>>()?,
+                    blend_constants: constants,
+                })
+            })
+            .transpose()?;
+
+        let Some(rasterization) = request.rasterization.as_ref() else {
+            return Err(refused(
+                METHOD,
+                "the request has no rasterization state, which the specification requires of \
+                 every graphics pipeline. The shim refuses a NULL one by name, so this means the \
+                 shim and this host disagree about what a decoded request contains",
+            ));
+        };
+        let rasterization = rasterization_from_body(METHOD, rasterization)?;
+        let depth_stencil = request
+            .depth_stencil
+            .as_ref()
+            .map(|body| depth_stencil_from_body(METHOD, body))
+            .transpose()?;
+
+        let Some(layout_token) = request.layout else {
+            return Err(refused(METHOD, "the request names no pipeline layout"));
+        };
+        let layout = {
+            let table = self.locked_layouts();
+            let (owner, handle) =
+                self.device_of(&table, layout_token.token(), "VkPipelineLayout", METHOD)?;
+            if owner != device_index {
+                return Err(cross_device("VkPipelineLayout", owner, device_index));
+            }
+            handle
+        };
+        let Some(pass_token) = request.render_pass else {
+            return Err(refused(METHOD, "the request names no render pass"));
+        };
+        let render_pass = {
+            let table = self.locked_passes();
+            let (owner, handle) =
+                self.device_of(&table, pass_token.token(), "VkRenderPass", METHOD)?;
+            if owner != device_index {
+                return Err(cross_device("VkRenderPass", owner, device_index));
+            }
+            handle
+        };
+        let base = match request.base_pipeline {
+            None => vk::Pipeline::null(),
+            Some(token) => {
+                let table = self.locked_pipelines();
+                let (owner, handle) = self.device_of(&table, token.token(), "VkPipeline", METHOD)?;
+                if owner != device_index {
+                    return Err(cross_device("VkPipeline", owner, device_index));
+                }
+                handle
+            }
+        };
+
+        Ok(OwnedPipeline {
+            flags: request.flags,
+            stages,
+            vertex,
+            input_assembly: request.input_assembly,
+            tessellation: request.tessellation,
+            viewport,
+            rasterization,
+            multisample,
+            depth_stencil,
+            color_blend,
+            dynamic_states: request.dynamic_states.as_ref().map(|states| {
+                states.iter().map(|state| vk::DynamicState::from_raw(*state as i32)).collect()
+            }),
+            layout,
+            render_pass,
+            subpass: request.subpass,
+            base,
+            base_index: request.base_pipeline_index,
+        })
     }
 }
 
@@ -3016,6 +5262,70 @@ impl Drop for GfxVulkanHost {
             }
         }
 
+        // **Stage 5 first, and within it children before parents**, because a framebuffer names
+        // image views and a pipeline names a layout and a render pass. Everything here is made
+        // *from* a device, so all of it goes before the devices do. The guest's own `GuestSpace`
+        // pages behind an imported allocation are **not** released here: they belong to
+        // `omni_android::vulkan::Vulkan`, which unmaps them at `vkFreeMemory` and whose guest
+        // address space is dropped with the guest rather than with this host.
+        let pipelines = self.locked_pipelines().drain();
+        for entry in pipelines {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and the pipeline is live.
+            unsafe { device.destroy_pipeline(entry.object, None) };
+        }
+        let caches = self.locked_caches().drain();
+        for entry in caches {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and no pipeline creation is in progress.
+            unsafe { device.destroy_pipeline_cache(entry.object, None) };
+        }
+        let framebuffers = self.locked_framebuffers().drain();
+        for entry in framebuffers {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle; this runs **before** the image views it names.
+            unsafe { device.destroy_framebuffer(entry.object, None) };
+        }
+        let passes = self.locked_passes().drain();
+        for entry in passes {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and every framebuffer that named this pass has gone.
+            unsafe { device.destroy_render_pass(entry.object, None) };
+        }
+        let layouts = self.locked_layouts().drain();
+        for entry in layouts {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and every pipeline built from this layout has gone.
+            unsafe { device.destroy_pipeline_layout(entry.object, None) };
+        }
+        let descriptor_pools = self.locked_descriptor_pools().drain();
+        for entry in descriptor_pools {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle, and destroying the pool frees every set allocated from
+            // it -- which is why the set table is simply dropped below.
+            unsafe { device.destroy_descriptor_pool(entry.object, None) };
+        }
+        let _ = self.locked_descriptor_sets().drain();
+        let set_layouts = self.locked_set_layouts().drain();
+        for entry in set_layouts {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and every set allocated from this layout has gone.
+            unsafe { device.destroy_descriptor_set_layout(entry.object, None) };
+        }
+        let samplers = self.locked_samplers().drain();
+        for entry in samplers {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and no descriptor still names this sampler.
+            unsafe { device.destroy_sampler(entry.object, None) };
+        }
+        let modules = self.locked_modules().drain();
+        for entry in modules {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle; a pipeline does not reference its modules after
+            // creation, which the specification states.
+            unsafe { device.destroy_shader_module(entry.object, None) };
+        }
+
         let pools = self.locked_pools().drain();
         for entry in pools {
             let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
@@ -3042,6 +5352,33 @@ impl Drop for GfxVulkanHost {
             let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
             // SAFETY: the device is idle, so nothing references this fence.
             unsafe { device.destroy_fence(entry.object, None) };
+        }
+
+        // **The stage 5 objects that memory is bound to, after the views that might name them.**
+        // An image view of a guest-created image has just been destroyed above, so the image is
+        // free to go -- and the allocations go after both, because a `VkDeviceMemory` freed while
+        // a buffer is still bound to it is a use-after-free the driver is not required to notice.
+        let buffers = self.locked_vk_buffers().drain();
+        for entry in buffers {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and nothing still reads this buffer.
+            unsafe { device.destroy_buffer(entry.object, None) };
+        }
+        let created_images = self.locked_created_images().drain();
+        for entry in created_images {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle, every view of this image has gone, and it is one the
+            // guest created rather than a swapchain's -- those are a different table.
+            unsafe { device.destroy_image(entry.object, None) };
+        }
+        let memories = self.locked_memories().drain();
+        for entry in memories {
+            let Ok(device) = self.device_at(entry.device, "GfxVulkanHost::drop") else { continue };
+            // SAFETY: the device is idle and every buffer and image bound to this allocation has
+            // just been destroyed. For an imported allocation the guest pages outlive this call,
+            // which is correct: freeing the `VkDeviceMemory` is what releases the driver's claim
+            // on them, and `omni-android` owns the mapping itself.
+            unsafe { device.free_memory(entry.memory, None) };
         }
 
         // Swapchains last of the stage 4 group, because a swapchain's images may still be named by
@@ -3374,6 +5711,516 @@ fn optional_c_string(
     CString::new(name.as_str())
         .map(Some)
         .map_err(|err| refused("vkCreateInstance", &format!("`{field}` has an interior NUL: {err}")))
+}
+
+
+// ==================================================================== stage 5 support types
+
+/// The alignment an imported host pointer is given when the instance cannot be asked for the real
+/// one.
+///
+/// 64 KiB, which is **safe rather than guessed**: every alignment Vulkan reports is a power of
+/// two, `minImportedHostPointerAlignment` measured 4096 on this machine, and an allocation aligned
+/// to 64 KiB is aligned to every power of two up to it. Over-aligning costs rounding —
+/// `Vulkan::imported_bytes()` is where that shows — and under-aligning would be undefined
+/// behaviour with no validation layer to report it.
+const CONSERVATIVE_IMPORT_ALIGNMENT: u64 = 64 * 1024;
+
+/// How many of each stage 5 object a [`GfxVulkanHost`] currently holds.
+///
+/// **`imported_memories` is the one that is not a count of a kind.** It is how many of the
+/// allocations are backed by pages out of the guest's own address space rather than the driver's,
+/// which is the whole of stage 5's memory decision expressed as a number — and it is what a live
+/// test asserts against, because an allocation the guest can map and one it cannot are
+/// indistinguishable from their handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StageFiveObjects {
+    /// Live `VkDeviceMemory` allocations.
+    pub device_memories: usize,
+    /// How many of those were imported out of `GuestSpace`.
+    pub imported_memories: usize,
+    /// Live `VkBuffer`s.
+    pub buffers: usize,
+    /// Live `VkImage`s the guest created. Not the swapchain's.
+    pub images: usize,
+    /// Live `VkSampler`s.
+    pub samplers: usize,
+    /// Live `VkShaderModule`s.
+    pub shader_modules: usize,
+    /// Live `VkPipelineLayout`s.
+    pub pipeline_layouts: usize,
+    /// Live `VkRenderPass`es.
+    pub render_passes: usize,
+    /// Live `VkFramebuffer`s.
+    pub framebuffers: usize,
+    /// Live `VkPipeline`s.
+    pub pipelines: usize,
+    /// Live `VkPipelineCache`s.
+    pub pipeline_caches: usize,
+    /// Live `VkDescriptorSetLayout`s.
+    pub descriptor_set_layouts: usize,
+    /// Live `VkDescriptorPool`s.
+    pub descriptor_pools: usize,
+    /// Live `VkDescriptorSet`s.
+    pub descriptor_sets: usize,
+}
+
+/// The attachment references of one subpass, owned so the `VkSubpassDescription` can point at them.
+struct SubpassReferences {
+    input: Vec<vk::AttachmentReference>,
+    colour: Vec<vk::AttachmentReference>,
+    resolve: Vec<vk::AttachmentReference>,
+    depth: Option<vk::AttachmentReference>,
+    preserve: Vec<u32>,
+}
+
+/// One shader stage's owned storage: the entry-point name and its specialization data.
+struct OwnedStage {
+    flags: u32,
+    stage: u32,
+    module: vk::ShaderModule,
+    name: CString,
+    entries: Vec<vk::SpecializationMapEntry>,
+    data: Vec<u8>,
+    /// Whether the guest supplied a `pSpecializationInfo` at all. **Not** `!entries.is_empty()`: a
+    /// specialization info with no entries is a different thing from none, and only the guest
+    /// knows which it meant.
+    specialized: bool,
+}
+
+/// The vertex-input arrays, owned.
+struct OwnedVertexInput {
+    flags: u32,
+    bindings: Vec<vk::VertexInputBindingDescription>,
+    attributes: Vec<vk::VertexInputAttributeDescription>,
+}
+
+/// The viewport arrays and **their counts**, owned.
+///
+/// The counts are kept beside the arrays because they are allowed to disagree: with
+/// `VK_DYNAMIC_STATE_VIEWPORT` set, `pViewports` may be NULL while `viewportCount` still has to be
+/// right. See `omni_android::vulkan::ViewportState`.
+struct OwnedViewport {
+    flags: u32,
+    viewport_count: u32,
+    viewports: Vec<vk::Viewport>,
+    scissor_count: u32,
+    scissors: Vec<vk::Rect2D>,
+}
+
+/// The multisample state, owned.
+struct OwnedMultisample {
+    flags: u32,
+    samples: u32,
+    sample_shading: bool,
+    min_sample_shading: f32,
+    sample_mask: Vec<u32>,
+    alpha_to_coverage: bool,
+    alpha_to_one: bool,
+}
+
+/// The colour-blend state, owned.
+struct OwnedColorBlend {
+    flags: u32,
+    logic_op_enable: bool,
+    logic_op: u32,
+    attachments: Vec<vk::PipelineColorBlendAttachmentState>,
+    blend_constants: [f32; 4],
+}
+
+/// Everything one `VkGraphicsPipelineCreateInfo` needs, owned and resolved.
+///
+/// See [`GfxVulkanHost::create_graphics_pipelines`] for why the storage is built in layers.
+struct OwnedPipeline {
+    flags: u32,
+    stages: Vec<OwnedStage>,
+    vertex: Option<OwnedVertexInput>,
+    input_assembly: Option<(u32, u32, u32)>,
+    tessellation: Option<(u32, u32)>,
+    viewport: Option<OwnedViewport>,
+    rasterization: vk::PipelineRasterizationStateCreateInfo<'static>,
+    multisample: Option<OwnedMultisample>,
+    depth_stencil: Option<vk::PipelineDepthStencilStateCreateInfo<'static>>,
+    color_blend: Option<OwnedColorBlend>,
+    dynamic_states: Option<Vec<vk::DynamicState>>,
+    layout: vk::PipelineLayout,
+    render_pass: vk::RenderPass,
+    subpass: u32,
+    base: vk::Pipeline,
+    base_index: i32,
+}
+
+/// The nine sub-states, built from an [`OwnedPipeline`] and borrowing it.
+struct SubStates<'a> {
+    vertex: Option<vk::PipelineVertexInputStateCreateInfo<'a>>,
+    input_assembly: Option<vk::PipelineInputAssemblyStateCreateInfo<'a>>,
+    tessellation: Option<vk::PipelineTessellationStateCreateInfo<'a>>,
+    viewport: Option<vk::PipelineViewportStateCreateInfo<'a>>,
+    multisample: Option<vk::PipelineMultisampleStateCreateInfo<'a>>,
+    color_blend: Option<vk::PipelineColorBlendStateCreateInfo<'a>>,
+    dynamic: Option<vk::PipelineDynamicStateCreateInfo<'a>>,
+}
+
+impl<'a> SubStates<'a> {
+    fn of(owned: &'a OwnedPipeline) -> SubStates<'a> {
+        SubStates {
+            vertex: owned.vertex.as_ref().map(|vertex| {
+                vk::PipelineVertexInputStateCreateInfo::default()
+                    .flags(vk::PipelineVertexInputStateCreateFlags::from_raw(vertex.flags))
+                    .vertex_binding_descriptions(&vertex.bindings)
+                    .vertex_attribute_descriptions(&vertex.attributes)
+            }),
+            input_assembly: owned.input_assembly.map(|(flags, topology, restart)| {
+                vk::PipelineInputAssemblyStateCreateInfo::default()
+                    .flags(vk::PipelineInputAssemblyStateCreateFlags::from_raw(flags))
+                    .topology(vk::PrimitiveTopology::from_raw(topology as i32))
+                    .primitive_restart_enable(restart != 0)
+            }),
+            tessellation: owned.tessellation.map(|(flags, points)| {
+                vk::PipelineTessellationStateCreateInfo::default()
+                    .flags(vk::PipelineTessellationStateCreateFlags::from_raw(flags))
+                    .patch_control_points(points)
+            }),
+            viewport: owned.viewport.as_ref().map(|viewport| {
+                let mut built = vk::PipelineViewportStateCreateInfo::default()
+                    .flags(vk::PipelineViewportStateCreateFlags::from_raw(viewport.flags));
+                // **The count when there is no array, the array when there is.** `ash`'s
+                // `viewports` sets the count from the slice, so calling it with an empty one for
+                // a dynamic-viewport pipeline would say `viewportCount = 0` — and a pipeline with
+                // no viewports draws nothing.
+                built = if viewport.viewports.is_empty() {
+                    built.viewport_count(viewport.viewport_count)
+                } else {
+                    built.viewports(&viewport.viewports)
+                };
+                if viewport.scissors.is_empty() {
+                    built.scissor_count(viewport.scissor_count)
+                } else {
+                    built.scissors(&viewport.scissors)
+                }
+            }),
+            multisample: owned.multisample.as_ref().map(|multisample| {
+                let mut built = vk::PipelineMultisampleStateCreateInfo::default()
+                    .flags(vk::PipelineMultisampleStateCreateFlags::from_raw(multisample.flags))
+                    .rasterization_samples(vk::SampleCountFlags::from_raw(multisample.samples))
+                    .sample_shading_enable(multisample.sample_shading)
+                    .min_sample_shading(multisample.min_sample_shading)
+                    .alpha_to_coverage_enable(multisample.alpha_to_coverage)
+                    .alpha_to_one_enable(multisample.alpha_to_one);
+                if !multisample.sample_mask.is_empty() {
+                    built = built.sample_mask(&multisample.sample_mask);
+                }
+                built
+            }),
+            color_blend: owned.color_blend.as_ref().map(|blend| {
+                vk::PipelineColorBlendStateCreateInfo::default()
+                    .flags(vk::PipelineColorBlendStateCreateFlags::from_raw(blend.flags))
+                    .logic_op_enable(blend.logic_op_enable)
+                    .logic_op(vk::LogicOp::from_raw(blend.logic_op as i32))
+                    .attachments(&blend.attachments)
+                    .blend_constants(blend.blend_constants)
+            }),
+            dynamic: owned.dynamic_states.as_ref().map(|states| {
+                vk::PipelineDynamicStateCreateInfo::default().dynamic_states(states)
+            }),
+        }
+    }
+}
+
+impl OwnedPipeline {
+    /// The create info, borrowing the stages and sub-states built from this pipeline.
+    fn info<'a>(
+        &'a self,
+        stages: &'a [vk::PipelineShaderStageCreateInfo<'a>],
+        sub: &'a SubStates<'a>,
+    ) -> vk::GraphicsPipelineCreateInfo<'a> {
+        let mut info = vk::GraphicsPipelineCreateInfo::default()
+            .flags(vk::PipelineCreateFlags::from_raw(self.flags))
+            .stages(stages)
+            .rasterization_state(&self.rasterization)
+            .layout(self.layout)
+            .render_pass(self.render_pass)
+            .subpass(self.subpass)
+            .base_pipeline_handle(self.base)
+            .base_pipeline_index(self.base_index);
+        // **Each of these is set only when the guest supplied one.** A zeroed structure in place
+        // of a NULL is a different pipeline — one that rasterizes where the engine asked for one
+        // that does not — so the pointer stays null instead.
+        if let Some(vertex) = sub.vertex.as_ref() {
+            info = info.vertex_input_state(vertex);
+        }
+        if let Some(assembly) = sub.input_assembly.as_ref() {
+            info = info.input_assembly_state(assembly);
+        }
+        if let Some(tessellation) = sub.tessellation.as_ref() {
+            info = info.tessellation_state(tessellation);
+        }
+        if let Some(viewport) = sub.viewport.as_ref() {
+            info = info.viewport_state(viewport);
+        }
+        if let Some(multisample) = sub.multisample.as_ref() {
+            info = info.multisample_state(multisample);
+        }
+        if let Some(depth_stencil) = self.depth_stencil.as_ref() {
+            info = info.depth_stencil_state(depth_stencil);
+        }
+        if let Some(blend) = sub.color_blend.as_ref() {
+            info = info.color_blend_state(blend);
+        }
+        if let Some(dynamic) = sub.dynamic.as_ref() {
+            info = info.dynamic_state(dynamic);
+        }
+        info
+    }
+}
+
+/// One `VkWriteDescriptorSet`'s resolved payload, owned so the write can point at it.
+struct WritePayload {
+    set: vk::DescriptorSet,
+    data: PayloadData,
+}
+
+/// Which of the two arrays a write carries. The third — `pTexelBufferView` — is refused one layer
+/// up, because this stage creates no `VkBufferView`.
+enum PayloadData {
+    Images(Vec<vk::DescriptorImageInfo>),
+    Buffers(Vec<vk::DescriptorBufferInfo>),
+}
+
+// -------------------------------------------------------------------- flat structures, decoded
+
+/// Build one flat Vulkan structure out of the bytes the guest wrote.
+///
+/// # Why a macro over one `unsafe fn` per type
+///
+/// [`features_from_bytes`] and [`components_from_bytes`] make the argument for the technique and
+/// this is eleven more of it: every structure here is `#[repr(C)]`, is made entirely of
+/// fixed-width scalars and enums, has **no pointer and no padding hole**, and is therefore valid
+/// for any byte pattern of its own length — so the guest's aarch64 LP64 bytes *are* the bytes this
+/// host's structure holds. What makes it safe is the length check, which is against
+/// `core::mem::size_of` of `ash`'s generated type rather than against a number written here: a
+/// disagreement between the two crates about a structure the specification fixes is then a
+/// refusal naming both numbers, not a short read.
+///
+/// Writing eleven of these by hand would be eleven places for the check to be omitted.
+macro_rules! flat_structure {
+    ($name:ident, $type:ty, $what:literal) => {
+        #[doc = concat!("A `", $what, "` from the bytes the guest wrote.")]
+        fn $name(call: &str, bytes: &[u8]) -> AbiResult<$type> {
+            let expected = std::mem::size_of::<$type>();
+            if bytes.len() != expected {
+                return Err(refused(
+                    call,
+                    &format!(
+                        concat!(
+                            "a `", $what, "` arrived as {} byte(s) and `sizeof(", $what,
+                            ")` is {} here. `omni_android::vulkan` and this crate disagree about \
+                             a structure the specification fixes"
+                        ),
+                        bytes.len(),
+                        expected
+                    ),
+                ));
+            }
+            let mut value = <$type>::default();
+            // SAFETY: the lengths are equal, checked one statement ago; the structure is
+            // `#[repr(C)]` and made entirely of fixed-width scalars and enums with no pointer and
+            // no padding, so every byte pattern of its length is a valid value of it. The source
+            // is a `&[u8]` and the destination a distinct local, so they cannot overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    std::ptr::addr_of_mut!(value).cast::<u8>(),
+                    expected,
+                );
+            }
+            Ok(value)
+        }
+    };
+}
+
+flat_structure!(attachment_from_bytes, vk::AttachmentDescription, "VkAttachmentDescription");
+flat_structure!(dependency_from_bytes, vk::SubpassDependency, "VkSubpassDependency");
+flat_structure!(reference_from_bytes, vk::AttachmentReference, "VkAttachmentReference");
+flat_structure!(push_constant_from_bytes, vk::PushConstantRange, "VkPushConstantRange");
+flat_structure!(rect_from_bytes, vk::Rect2D, "VkRect2D");
+
+/// A list of `VkAttachmentReference` from the flat bytes of a guest array.
+fn references_from_bytes(call: &str, bytes: &[u8]) -> AbiResult<Vec<vk::AttachmentReference>> {
+    flat_list(call, bytes, "VkAttachmentReference", reference_from_bytes)
+}
+
+/// A list of `VkViewport` from the flat bytes of a guest array.
+fn viewports_from_bytes(call: &str, bytes: &[u8]) -> AbiResult<Vec<vk::Viewport>> {
+    flat_list(call, bytes, "VkViewport", viewport_from_bytes)
+}
+
+/// A list of `VkRect2D` from the flat bytes of a guest array.
+fn rects_from_bytes(call: &str, bytes: &[u8]) -> AbiResult<Vec<vk::Rect2D>> {
+    flat_list(call, bytes, "VkRect2D", rect_from_bytes)
+}
+
+/// A list of `VkBufferCopy` from the flat bytes of a guest array.
+fn buffer_copies_from_bytes(call: &str, bytes: &[u8]) -> AbiResult<Vec<vk::BufferCopy>> {
+    flat_list(call, bytes, "VkBufferCopy", buffer_copy_from_bytes)
+}
+
+/// A list of `VkBufferImageCopy` from the flat bytes of a guest array.
+fn buffer_image_copies_from_bytes(
+    call: &str,
+    bytes: &[u8],
+) -> AbiResult<Vec<vk::BufferImageCopy>> {
+    flat_list(call, bytes, "VkBufferImageCopy", buffer_image_copy_from_bytes)
+}
+
+flat_structure!(viewport_from_bytes, vk::Viewport, "VkViewport");
+flat_structure!(buffer_copy_from_bytes, vk::BufferCopy, "VkBufferCopy");
+flat_structure!(buffer_image_copy_from_bytes, vk::BufferImageCopy, "VkBufferImageCopy");
+flat_structure!(
+    blend_attachment_from_bytes,
+    vk::PipelineColorBlendAttachmentState,
+    "VkPipelineColorBlendAttachmentState"
+);
+flat_structure!(
+    vertex_binding_from_bytes,
+    vk::VertexInputBindingDescription,
+    "VkVertexInputBindingDescription"
+);
+flat_structure!(
+    vertex_attribute_from_bytes,
+    vk::VertexInputAttributeDescription,
+    "VkVertexInputAttributeDescription"
+);
+
+/// Split a guest array's flat bytes into elements and decode each one.
+///
+/// The stride is `sizeof` of **this host's** structure, and a length that does not divide by it is
+/// a refusal rather than a truncation: a truncated list of attachment references is a plausible
+/// list of attachment references, and the render pass built from it would be a different one.
+fn flat_list<T>(
+    call: &str,
+    bytes: &[u8],
+    what: &str,
+    decode: impl Fn(&str, &[u8]) -> AbiResult<T>,
+) -> AbiResult<Vec<T>> {
+    let stride = std::mem::size_of::<T>();
+    if stride == 0 || bytes.len() % stride != 0 {
+        return Err(refused(
+            call,
+            &format!(
+                "an array of `{what}` arrived as {} byte(s), which does not divide by the \
+                 {stride} that `sizeof({what})` is here",
+                bytes.len()
+            ),
+        ));
+    }
+    bytes.chunks_exact(stride).map(|chunk| decode(call, chunk)).collect()
+}
+
+/// A `VkClearValue` from the sixteen bytes the guest wrote.
+///
+/// **The union travels whole.** Which member is live is decided by the attachment's format, which
+/// this layer does not know; the three members alias the same sixteen bytes, so this is a copy and
+/// not an interpretation. [`VulkanHost::cmd_clear_color_image`] makes the same argument for
+/// `VkClearColorValue`.
+fn clear_value_from_bytes(bytes: &[u8; 16]) -> vk::ClearValue {
+    let mut value = vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } };
+    // SAFETY: `VkClearValue` is a union of four sixteen-byte aggregates of scalars, so every byte
+    // pattern is a valid value of it and its size is exactly sixteen. The source is a fixed-size
+    // array and the destination a distinct local, so they cannot overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            std::ptr::addr_of_mut!(value).cast::<u8>(),
+            16,
+        );
+    }
+    value
+}
+
+/// Build one Vulkan create-info structure from the **body** bytes after its `sType` and `pNext`.
+///
+/// [`flat_structure`]'s argument, for the three structures whose bodies are flat but whose first
+/// sixteen bytes are a header this host must set itself — `sType` because `ash`'s `default()` is
+/// what knows it, and `pNext` because it must be null and the shim refuses any chain.
+macro_rules! flat_body {
+    ($name:ident, $type:ty, $what:literal, $body:expr) => {
+        #[doc = concat!("A `", $what, "` from the body bytes after its `pNext`.")]
+        fn $name(call: &str, body: &[u8]) -> AbiResult<$type> {
+            const HEADER: usize = 16;
+            if body.len() != $body {
+                return Err(refused(
+                    call,
+                    &format!(
+                        concat!(
+                            "the body of a `", $what, "` arrived as {} byte(s) and this stage's \
+                             constant says {}. `omni_android::vulkan` and this crate disagree \
+                             about a structure the specification fixes"
+                        ),
+                        body.len(),
+                        $body
+                    ),
+                ));
+            }
+            let expected = std::mem::size_of::<$type>();
+            if expected < HEADER + $body {
+                return Err(refused(
+                    call,
+                    &format!(
+                        concat!("`sizeof(", $what, ")` is {} here, which cannot hold a \
+                                 sixteen-byte header and a {}-byte body"),
+                        expected, $body
+                    ),
+                ));
+            }
+            let mut value = <$type>::default();
+            // SAFETY: the body is exactly the bytes of the members after `pNext`, all of which
+            // are fixed-width scalars, enums and fixed aggregates of those with no pointer and no
+            // padding; `default()` has already written the `sType` and a null `pNext` into the
+            // first sixteen bytes, which this does not touch. The length fits, checked one
+            // statement ago, and the two regions cannot overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    body.as_ptr(),
+                    std::ptr::addr_of_mut!(value).cast::<u8>().add(HEADER),
+                    $body,
+                );
+            }
+            Ok(value)
+        }
+    };
+}
+
+flat_body!(sampler_from_body, vk::SamplerCreateInfo<'static>, "VkSamplerCreateInfo", 64);
+flat_body!(
+    rasterization_from_body,
+    vk::PipelineRasterizationStateCreateInfo<'static>,
+    "VkPipelineRasterizationStateCreateInfo",
+    44
+);
+flat_body!(
+    depth_stencil_from_body,
+    vk::PipelineDepthStencilStateCreateInfo<'static>,
+    "VkPipelineDepthStencilStateCreateInfo",
+    88
+);
+
+/// A `VkMemoryRequirements` as the bytes the guest is owed.
+///
+/// The output direction of [`flat_structure`]'s argument: three fixed-width members, no pointer,
+/// identical on both targets, so the driver's structure *is* the guest's bytes.
+fn requirements_bytes(requirements: &vk::MemoryRequirements) -> Vec<u8> {
+    let mut out = vec![0u8; std::mem::size_of::<vk::MemoryRequirements>()];
+    // SAFETY: the destination is exactly `sizeof(VkMemoryRequirements)` bytes, the source is one
+    // such structure, and a `Vec<u8>` cannot overlap a local.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::from_ref(requirements).cast::<u8>(),
+            out.as_mut_ptr(),
+            out.len(),
+        );
+    }
+    out
 }
 
 #[cfg(test)]

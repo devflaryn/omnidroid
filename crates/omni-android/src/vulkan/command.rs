@@ -37,14 +37,26 @@
 //! for exactly this case. A handler that read `args[7]` and stopped would silently record a
 //! barrier with no image barriers in it.
 //!
-//! # Buffer memory barriers are refused, and that is not the same as being dropped
+//! # Buffer memory barriers are refused, and the reason changed in stage 5
 //!
-//! A `VkBufferMemoryBarrier` names a `VkBuffer`. Stage 4 has no `VkBuffer` registry, because
-//! stage 4 creates no buffers — device memory and buffers are stage 5. Forwarding a barrier with a
-//! guest-chosen buffer handle would be handing the driver a non-dispatchable value nothing
-//! validated, and dropping the barrier would remove a synchronisation the engine asked for. So a
-//! non-zero `bufferMemoryBarrierCount` is a refusal naming the count, and the guest's own
-//! `vkCreateBuffer` would have been refused before it could get here.
+//! Stage 4's reason was that a `VkBufferMemoryBarrier` names a `VkBuffer` and there was no
+//! `VkBuffer` registry to resolve it through. **Stage 5 has one**, so that reason is gone and the
+//! honest one is D17: nothing in this stage's path records one. A `VkMemoryBarrier`, which this
+//! call *does* decode, covers every ordering a staging upload needs on a host where every
+//! host-visible memory type is also host-coherent — which this one is — and implementing a
+//! structure because its name exists is exactly what D17 refuses.
+//!
+//! Dropping it is still not the alternative: a missing barrier is a data race on the GPU that no
+//! validation layer on this machine would report. So a non-zero `bufferMemoryBarrierCount` is a
+//! refusal naming the count, and [`Vulkan::names`](super::Vulkan::names) reaching it is what would
+//! say a real engine wants it.
+//!
+//! # Both image families, since stage 5
+//!
+//! The barrier and the clear here take a `VkImage` that may be a swapchain's or one the guest made
+//! with `vkCreateImage` — a texture upload's two layout transitions are against the latter.
+//! [`Vulkan::image_ref_token`](super::Vulkan) accepts either and answers *which*, so the
+//! distinction reaches the host in the type rather than being flattened here.
 
 use std::sync::Arc;
 
@@ -52,7 +64,7 @@ use crate::abi::ARG_REGISTERS;
 use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 
-use super::host::{DriverAnswer, HostImageRef, ImageBarrier, PipelineBarrier};
+use super::host::{DriverAnswer, ImageBarrier, PipelineBarrier};
 use super::instance::{guest_pointer, refuse_allocator, require_pointer};
 use super::view::IMAGE_SUBRESOURCE_RANGE_BYTES;
 use super::{Site, Vulkan, VK_SUCCESS};
@@ -595,14 +607,15 @@ pub(super) fn cmd_pipeline_barrier(
             "the guest called `{CALL}` from {caller:#x} with \
              `bufferMemoryBarrierCount = {buffer_count}` and \
              `pBufferMemoryBarriers = {array:#x}`. Each of those \
-             {BUFFER_MEMORY_BARRIER_BYTES}-byte structures names a `VkBuffer`, and **stage 4 has \
-             no `VkBuffer` registry** because it creates no buffers -- device memory and buffers \
-             are stage 5. Forwarding one would hand the driver a non-dispatchable handle nothing \
-             validated, which is the defect Global Constraint 1 names; dropping the barrier would \
-             remove a synchronisation the engine asked for, and a missing barrier is a data race \
-             on the GPU that no validation layer on this machine would report. The guest's own \
-             `vkCreateBuffer` is refused by name, so nothing it could legitimately hold can reach \
-             this",
+             {BUFFER_MEMORY_BARRIER_BYTES}-byte structures names a `VkBuffer`. **Stage 5 has a \
+             `VkBuffer` registry now**, so the reason stage 4 gave -- that there was no way to \
+             resolve the handle -- no longer holds; what holds instead is D17. Nothing in this \
+             stage's path records one: a `VkMemoryBarrier`, which this call does decode, covers \
+             every ordering a staging upload needs on a coherent host, and implementing a \
+             structure because its name exists is what D17 refuses. Dropping the barrier is not \
+             the alternative -- a missing barrier is a data race on the GPU that no validation \
+             layer on this machine would report -- so it is refused, and `Vulkan::names()` \
+             reaching this is what says a real engine wants it",
             caller = at.caller,
             array = args[7]
         )));
@@ -641,7 +654,9 @@ pub(super) fn cmd_clear_color_image(
     const CALL: &str = "vkCmdClearColorImage";
     let host = vulkan.require_host(at)?;
     let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
-    let image = vulkan.image_token(at, CALL, args[1])?;
+    // Either image family, for `decode_image_barriers`' reason: a guest may legitimately clear an
+    // image it created as well as a swapchain's.
+    let image = vulkan.image_ref_token(at, CALL, args[1])?;
     let layout = args[2] as u32;
 
     let colour_at = require_pointer(at, CALL, "pColor", args[3])?;
@@ -678,13 +693,7 @@ pub(super) fn cmd_clear_color_image(
         })
         .collect();
 
-    host.cmd_clear_color_image(
-        buffer,
-        HostImageRef::Swapchain(image),
-        layout,
-        colour,
-        &ranges,
-    )?;
+    host.cmd_clear_color_image(buffer, image, layout, colour, &ranges)?;
     c.ret().void();
     Ok(())
 }
@@ -772,7 +781,12 @@ fn decode_image_barriers(
                  this machine is undefined behaviour with no validation layer to report it"
             )));
         }
-        let image = vulkan.image_token(at, "vkCmdPipelineBarrier", u64::from_le_bytes(
+        // **Either image family.** Stage 4 could only be barriering a swapchain image, because
+        // those were the only images there were; stage 5 adds `vkCreateImage`, and the texture
+        // upload's two layout transitions are against one of those. `image_ref_token` answers
+        // *which* family it found, so a host cannot look a created image up in its swapchain
+        // table -- see `Vulkan::image_ref_token`.
+        let image = vulkan.image_ref_token(at, "vkCmdPipelineBarrier", u64::from_le_bytes(
             entry[40..48].try_into().expect("eight"),
         ))?;
         out.push(ImageBarrier {
@@ -782,7 +796,7 @@ fn decode_image_barriers(
             new_layout: u32_at(28),
             src_queue_family: u32_at(32),
             dst_queue_family: u32_at(36),
-            image: HostImageRef::Swapchain(image),
+            image,
             subresource_range: entry[48..48 + IMAGE_SUBRESOURCE_RANGE_BYTES].to_vec(),
         });
     }

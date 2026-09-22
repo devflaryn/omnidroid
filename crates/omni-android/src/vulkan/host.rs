@@ -423,15 +423,20 @@ pub struct ImageViewRequest {
 
 /// Which image an [`ImageViewRequest`] is over.
 ///
-/// A one-variant enum today, and it is here rather than a bare [`HostImage`] because the variant
-/// that will be added is the one that matters: stage 5's `vkCreateImage` produces images that are
-/// **not** a swapchain's, and a host that had been matching on `HostImage` alone would silently
-/// treat one as the other. A reader asking "which images can this layer make a view of?" gets the
-/// answer from the type.
+/// **Stage 4 wrote this with one variant and said why**: `vkCreateImage` produces images that are
+/// *not* a swapchain's, and a host matching on a bare [`HostImage`] would silently treat one as
+/// the other. Stage 5 is that second variant arriving, and the prediction held — the two are the
+/// same Vulkan type, the same 64-bit non-dispatchable value, and completely different objects. One
+/// is owned by its swapchain, already has memory and must never be destroyed by the guest; the
+/// other is owned by the guest, has **no memory at all** until `vkBindImageMemory`, and must be.
+/// A `vkDestroyImage` of a swapchain image is the mistake this enum makes unrepresentable, and no
+/// validation layer on this machine would have caught it (`docs/research/graphics-spike.md` §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostImageRef {
-    /// An image `vkGetSwapchainImagesKHR` produced, which is the only kind stage 4 has.
+    /// An image `vkGetSwapchainImagesKHR` produced.
     Swapchain(HostImage),
+    /// An image the guest made with `vkCreateImage`.
+    Created(HostCreatedImage),
     /// No image at all — `VkImageViewCreateInfo::image` was `VK_NULL_HANDLE`, which the
     /// specification does not permit and which the shim refuses before a host sees it. Present so
     /// that the type has a `Default` for the structures that derive one.
@@ -628,6 +633,636 @@ pub struct SurfaceCreated {
     /// because a surface silently created through another platform's call is exactly the defect
     /// Global Constraint 1 names.
     pub host_call: String,
+}
+
+// ============================================================ stage 5's thirteen handle families
+//
+// **Thirteen new families, and the split between them is the one thing worth reading first.**
+// Stage 4's seven were all objects with a lifetime the guest controls. These are too, with one
+// difference that decides the shape of the two that matter: [`HostDeviceMemory`] is the only
+// family in this file whose object the guest can **write to directly**, because `vkMapMemory`
+// hands back an address the guest stores through without this layer seeing it again. That is why
+// [`MemoryAllocation::host_pointer`] exists at all, and why it is a guest address rather than a
+// host one.
+
+host_token! {
+    /// One `VkDeviceMemory` a host allocated. **Non-dispatchable.**
+    ///
+    /// # The one allocation that is not the driver's alone
+    ///
+    /// Two completely different things travel under this token, split at `vkAllocateMemory` on the
+    /// memory type index the guest supplied:
+    ///
+    /// * a **forwarded** allocation, for a type with no `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`. The
+    ///   driver allocated it, nothing here can address it, and `vkMapMemory` on one is a refusal
+    ///   naming the type — which is what the specification requires of it too.
+    /// * an **imported** allocation, for a host-visible type. The bytes are a `GuestSpace` mapping
+    ///   this layer made, handed to the driver through `VkImportMemoryHostPointerInfoEXT`, so that
+    ///   `vkMapMemory` can answer with an address **inside the guest's own address space**. See
+    ///   [`MemoryAllocation::host_pointer`] for the measurement that settled this, and
+    ///   [`VulkanHost::map_memory`] for the invariant it is checked against.
+    ///
+    /// An implementation has to keep the two apart, because freeing them is the same call and
+    /// unmapping the guest range is not.
+    HostDeviceMemory
+}
+
+host_token! {
+    /// One `VkBuffer` a host created. **Non-dispatchable.**
+    ///
+    /// Created with no memory bound: `vkCreateBuffer` makes a buffer, `vkGetBufferMemoryRequirements`
+    /// says what it needs, and `vkBindBufferMemory` is a separate call. A buffer used before it is
+    /// bound is undefined behaviour the specification does not require a driver to catch, and there
+    /// are no validation layers on this machine — so an implementation that can cheaply record
+    /// whether a binding happened should.
+    HostBuffer
+}
+
+host_token! {
+    /// One `VkImage` the **guest** created with `vkCreateImage`. **Non-dispatchable.**
+    ///
+    /// Deliberately **not** [`HostImage`], which is a swapchain's. The two are the same Vulkan type
+    /// and completely different objects: a swapchain image is owned by its swapchain, has memory
+    /// already, and must not be destroyed; this one is owned by the guest, has no memory until
+    /// `vkBindImageMemory`, and must be. [`HostImageRef`] is what keeps a call that accepts either
+    /// from confusing them, and it is why that enum existed in stage 4 with one variant.
+    HostCreatedImage
+}
+
+host_token! {
+    /// One `VkSampler` a host created. **Non-dispatchable.**
+    HostSampler
+}
+
+host_token! {
+    /// One `VkShaderModule` a host created. **Non-dispatchable.**
+    ///
+    /// **The SPIR-V needed no translation.** It is the same bytes on both sides — a stream of
+    /// little-endian 32-bit words whose layout the SPIR-V specification fixes independently of any
+    /// host — so what crosses this seam is the guest's own bytes, copied out through `GuestMem`
+    /// because they are a guest pointer this layer must validate, and not because they had to be
+    /// changed.
+    HostShaderModule
+}
+
+host_token! {
+    /// One `VkPipelineLayout` a host created. **Non-dispatchable.**
+    HostPipelineLayout
+}
+
+host_token! {
+    /// One `VkRenderPass` a host created. **Non-dispatchable.**
+    HostRenderPass
+}
+
+host_token! {
+    /// One `VkFramebuffer` a host created. **Non-dispatchable.**
+    HostFramebuffer
+}
+
+host_token! {
+    /// One `VkPipeline` a host created. **Non-dispatchable.**
+    HostPipeline
+}
+
+host_token! {
+    /// One `VkPipelineCache` a host created. **Non-dispatchable.**
+    HostPipelineCache
+}
+
+host_token! {
+    /// One `VkDescriptorSetLayout` a host created. **Non-dispatchable.**
+    HostDescriptorSetLayout
+}
+
+host_token! {
+    /// One `VkDescriptorPool` a host created. **Non-dispatchable.**
+    ///
+    /// The pool owns every set allocated from it, exactly as [`HostCommandPool`] owns its buffers,
+    /// and `vkResetDescriptorPool` frees them all at once without naming any of them. An
+    /// implementation must drop its record of the sets there, and the shim drops their guest
+    /// handles in the same call.
+    HostDescriptorPool
+}
+
+host_token! {
+    /// One `VkDescriptorSet` a host allocated. **Non-dispatchable.**
+    ///
+    /// Unlike `VkCommandBuffer`, which is dispatchable and which a driver dereferences, this is a
+    /// 64-bit value the driver looks up — so a forged one binds *some other* set, and the symptom
+    /// is a draw that samples a texture nobody chose. It is behind a registry for exactly the
+    /// reason [`HostSurface`] is.
+    HostDescriptorSet
+}
+
+/// What a host driver can do with one memory type, and whether this layer can back it.
+///
+/// # Why the shim has to ask before it allocates
+///
+/// `vkAllocateMemory` arrives with a `memoryTypeIndex` and nothing else. The split this stage
+/// rests on — forward a device-local allocation, **import** a host-visible one out of `GuestSpace`
+/// — is decided entirely by that index, and the only participant that knows what the index means
+/// is the driver. So the shim asks, once per allocation, and the answer is three facts rather than
+/// a boolean because the three lead to three different outcomes:
+///
+/// * not host-visible → an ordinary forward, and `vkMapMemory` on it is a refusal;
+/// * host-visible and importable → a `GuestSpace` mapping, imported;
+/// * host-visible and **not** importable → a refusal naming the type, because this layer cannot
+///   produce an address the guest may store through and inventing one is Global Constraint 11.
+///
+/// The third is not hypothetical and it is the reason
+/// [`VulkanHost::physical_device_memory_properties`]' answer is rewritten: on this machine the
+/// importable set is `0xc` while the host-visible set is `0x1c`, so the `DEVICE_LOCAL |
+/// HOST_VISIBLE` ReBAR type is host-visible to the driver and unbackable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPlan {
+    /// `VkMemoryType::propertyFlags` for this index, **as the driver reports it** — not as the
+    /// guest was shown it. The two differ exactly where the rewrite masked a bit, and this is the
+    /// one that decides what the allocation actually is.
+    pub property_flags: u32,
+    /// Whether `VK_EXT_external_memory_host` can import a host pointer into this memory type on
+    /// this device, from `vkGetMemoryHostPointerPropertiesEXT`'s `memoryTypeBits`.
+    pub importable: bool,
+    /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment`, which
+    /// both the imported pointer and its length must be a multiple of. Measured 4096 on this
+    /// machine, which is `GuestSpace::page_size()` — and a host that reports a larger one is why
+    /// this travels rather than being assumed.
+    pub import_alignment: u64,
+}
+
+impl MemoryPlan {
+    /// `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`.
+    pub const HOST_VISIBLE: u32 = 0x2;
+    /// `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`.
+    pub const HOST_COHERENT: u32 = 0x4;
+    /// `VK_MEMORY_PROPERTY_HOST_CACHED_BIT`.
+    pub const HOST_CACHED: u32 = 0x8;
+
+    /// Whether the guest may map memory of this type at all.
+    #[must_use]
+    pub const fn host_visible(&self) -> bool {
+        self.property_flags & Self::HOST_VISIBLE != 0
+    }
+}
+
+/// One `vkAllocateMemory`, decoded, with this layer's half of the decision already made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryAllocation {
+    /// `VkMemoryAllocateInfo::allocationSize`, the guest's, unrounded.
+    pub size: u64,
+    /// `memoryTypeIndex`, the guest's. **The driver's numbering**, because the rewrite this layer
+    /// applies to `vkGetPhysicalDeviceMemoryProperties` changes property *bits* and never the
+    /// order or the count — so an index the guest chose from the edited list is still an index
+    /// into the driver's own list.
+    pub memory_type_index: u32,
+    /// The **guest** address of the `GuestSpace` mapping to import, or `None` for an ordinary
+    /// forwarded allocation.
+    ///
+    /// # Why this is a guest address handed to a driver, and why that is not the thing this crate
+    /// forbids
+    ///
+    /// The rule this project holds is "never hand the **guest** a host pointer". This is the other
+    /// direction, and under D4's identity mapping a guest address *is* a host address — so what
+    /// the driver receives is an ordinary, committed, readable-writable page of this process,
+    /// which is precisely what `VkImportMemoryHostPointerInfoEXT` asks for.
+    ///
+    /// The alternative was letting the driver allocate and handing its pointer back through
+    /// `vkMapMemory`. That would **work**, silently, because D4 amendment 1 says `admit` governs
+    /// this layer's own shims and not the guest's loads and stores — so the guest would happily
+    /// store through a driver pointer outside `GuestSpace` until some later shim re-validated it,
+    /// a long way from the cause. Measured on this machine and recorded in `docs/HANDOFF.md`:
+    /// `VK_EXT_external_memory_host` is present, `minImportedHostPointerAlignment` is 4096 which
+    /// is `GuestSpace::page_size()`, and `vkMapMemory` returned **the same pointer that was
+    /// imported**.
+    ///
+    /// The range is `[host_pointer, host_pointer + import_length)`, both aligned to
+    /// [`MemoryPlan::import_alignment`], and it stays mapped until `vkFreeMemory`.
+    pub host_pointer: Option<u64>,
+    /// The length of that mapping, which is [`size`](MemoryAllocation::size) rounded **up** to
+    /// [`MemoryPlan::import_alignment`]. Zero when there is no mapping.
+    ///
+    /// Carried rather than recomputed because the driver is given this length, not `size`: the
+    /// specification requires an imported host pointer's length to be a multiple of the alignment,
+    /// and an implementation that passed `size` would be passing a number the driver rejects for
+    /// every allocation whose size is not already a multiple of a page.
+    pub import_length: u64,
+}
+
+/// One `VkBufferCreateInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BufferRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `size`, in bytes.
+    pub size: u64,
+    /// `usage`.
+    pub usage: u32,
+    /// `sharingMode`.
+    pub sharing_mode: u32,
+    /// `pQueueFamilyIndices`, owned. Empty for `VK_SHARING_MODE_EXCLUSIVE`.
+    pub queue_families: Vec<u32>,
+}
+
+/// One `VkImageCreateInfo`, decoded out of guest memory.
+///
+/// `extent` travels as its three `uint32_t`s rather than as a named type, for
+/// [`DeviceRequest::features`]' reason: `VkExtent3D` has no pointer and no hole, and three named
+/// fields in this crate would be three chances to write `depth` where `height` belongs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `imageType`.
+    pub image_type: u32,
+    /// `format`.
+    pub format: u32,
+    /// `extent`, as `[width, height, depth]`.
+    pub extent: [u32; 3],
+    /// `mipLevels`.
+    pub mip_levels: u32,
+    /// `arrayLayers`.
+    pub array_layers: u32,
+    /// `samples`.
+    pub samples: u32,
+    /// `tiling`.
+    pub tiling: u32,
+    /// `usage`.
+    pub usage: u32,
+    /// `sharingMode`.
+    pub sharing_mode: u32,
+    /// `pQueueFamilyIndices`, owned.
+    pub queue_families: Vec<u32>,
+    /// `initialLayout`.
+    pub initial_layout: u32,
+}
+
+/// One `VkPipelineLayoutCreateInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipelineLayoutRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `pSetLayouts`, resolved to tokens, in the guest's order — **which is the set number**, so
+    /// reordering would rebind every descriptor set the pipeline has.
+    pub set_layouts: Vec<HostDescriptorSetLayout>,
+    /// `pPushConstantRanges`, as their
+    /// [`PUSH_CONSTANT_RANGE_BYTES`](super::PUSH_CONSTANT_RANGE_BYTES) bytes each. Three
+    /// `uint32_t`s with no handle in them.
+    pub push_constant_ranges: Vec<Vec<u8>>,
+}
+
+/// One `VkDescriptorSetLayoutBinding`, decoded.
+///
+/// The one member that is a handle is `pImmutableSamplers`, which is why this is a struct rather
+/// than bytes: an immutable sampler is baked into the layout and cannot be replaced by a later
+/// `vkUpdateDescriptorSets`, so a guest-chosen handle reaching a driver here would be a sampler
+/// nothing could subsequently correct.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescriptorBinding {
+    /// `binding`.
+    pub binding: u32,
+    /// `descriptorType`.
+    pub descriptor_type: u32,
+    /// `descriptorCount`.
+    pub descriptor_count: u32,
+    /// `stageFlags`.
+    pub stage_flags: u32,
+    /// `pImmutableSamplers`, resolved. Empty when the guest passed NULL, which is the usual case.
+    pub immutable_samplers: Vec<HostSampler>,
+}
+
+/// One `VkDescriptorSetLayoutCreateInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescriptorSetLayoutRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `pBindings`, in the guest's order.
+    pub bindings: Vec<DescriptorBinding>,
+}
+
+/// One `VkDescriptorPoolCreateInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescriptorPoolRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `maxSets`.
+    pub max_sets: u32,
+    /// `pPoolSizes`, as `(type, descriptorCount)` pairs. No handle in a `VkDescriptorPoolSize`.
+    pub sizes: Vec<(u32, u32)>,
+}
+
+/// What one `VkWriteDescriptorSet` points at.
+///
+/// **Three variants rather than three optional vectors**, because the specification makes exactly
+/// one of the three arrays live and which one is decided by `descriptorType`. A structure with all
+/// three present would let a shim fill the wrong one and a host read it without noticing: a
+/// `COMBINED_IMAGE_SAMPLER` write whose `pBufferInfo` was filled instead would produce a
+/// descriptor pointing at nothing, and the draw that used it would sample black.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptorWrites {
+    /// `pImageInfo`: `(sampler, view, layout)` per descriptor. The sampler is `None` for the types
+    /// that do not take one (`SAMPLED_IMAGE`, `STORAGE_IMAGE`, the input attachment), and the view
+    /// is `None` for a bare `SAMPLER`.
+    Images(Vec<(Option<HostSampler>, Option<HostImageView>, u32)>),
+    /// `pBufferInfo`: `(buffer, offset, range)` per descriptor. `range` is the guest's, including
+    /// `VK_WHOLE_SIZE`.
+    Buffers(Vec<(HostBuffer, u64, u64)>),
+}
+
+/// One `VkWriteDescriptorSet`, decoded out of guest memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptorWrite {
+    /// `dstSet`.
+    pub set: HostDescriptorSet,
+    /// `dstBinding`.
+    pub binding: u32,
+    /// `dstArrayElement`.
+    pub array_element: u32,
+    /// `descriptorType`.
+    pub descriptor_type: u32,
+    /// What it points at. Its length **is** `descriptorCount`, which is the point of decoding it:
+    /// the two cannot disagree once the array has been copied.
+    pub writes: DescriptorWrites,
+}
+
+/// One `VkCopyDescriptorSet`, decoded out of guest memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorCopy {
+    /// `srcSet`.
+    pub source: HostDescriptorSet,
+    /// `srcBinding`.
+    pub source_binding: u32,
+    /// `srcArrayElement`.
+    pub source_element: u32,
+    /// `dstSet`.
+    pub destination: HostDescriptorSet,
+    /// `dstBinding`.
+    pub destination_binding: u32,
+    /// `dstArrayElement`.
+    pub destination_element: u32,
+    /// `descriptorCount`.
+    pub count: u32,
+}
+
+/// One `VkSubpassDescription`, decoded out of guest memory.
+///
+/// Every attachment list travels as its `VkAttachmentReference` **bytes** — two `uint32_t`s, an
+/// index and a layout, with no handle — for [`DeviceRequest::features`]' reason. What is *not*
+/// bytes is the distinction between "no resolve attachments" and "a resolve attachment per colour
+/// attachment", and between a `pDepthStencilAttachment` that is NULL and one that is not: those
+/// are the two places a dropped pointer would produce a render pass that compiles and renders
+/// differently, so they are `Vec` emptiness and `Option` respectively rather than a count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubpassRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `pipelineBindPoint`.
+    pub bind_point: u32,
+    /// `pInputAttachments`, flat.
+    pub input_attachments: Vec<u8>,
+    /// `pColorAttachments`, flat.
+    pub color_attachments: Vec<u8>,
+    /// `pResolveAttachments`, flat, or empty when the guest passed NULL.
+    pub resolve_attachments: Vec<u8>,
+    /// `pDepthStencilAttachment`, or `None` when the guest passed NULL.
+    pub depth_stencil_attachment: Option<Vec<u8>>,
+    /// `pPreserveAttachments`.
+    pub preserve_attachments: Vec<u32>,
+}
+
+/// One `VkRenderPassCreateInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderPassRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `pAttachments`, as `VkAttachmentDescription` bytes, nine `uint32_t`s each and no handle.
+    pub attachments: Vec<Vec<u8>>,
+    /// `pSubpasses`, decoded.
+    pub subpasses: Vec<SubpassRequest>,
+    /// `pDependencies`, as `VkSubpassDependency` bytes, seven `uint32_t`s each and no handle.
+    pub dependencies: Vec<Vec<u8>>,
+}
+
+/// One `VkFramebufferCreateInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FramebufferRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `renderPass`, as a token. A framebuffer is only compatible with render passes that match
+    /// the one it was made with, and the driver checks that — against the render pass this names.
+    pub render_pass: Option<HostRenderPass>,
+    /// `pAttachments`, resolved, **in the guest's order**, which is the attachment index every
+    /// `VkAttachmentReference` in the render pass refers to.
+    pub attachments: Vec<HostImageView>,
+    /// `width`.
+    pub width: u32,
+    /// `height`.
+    pub height: u32,
+    /// `layers`.
+    pub layers: u32,
+}
+
+/// One `VkSpecializationInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Specialization {
+    /// `pMapEntries`, as `(constantID, offset, size)`. `size` is a `size_t`, which is eight bytes
+    /// on the guest's aarch64 LP64 and on this host alike.
+    pub entries: Vec<(u32, u32, u64)>,
+    /// `pData`, copied. Its length is `dataSize`.
+    pub data: Vec<u8>,
+}
+
+/// One `VkPipelineShaderStageCreateInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShaderStage {
+    /// `flags`.
+    pub flags: u32,
+    /// `stage`, a single bit of `VkShaderStageFlagBits`.
+    pub stage: u32,
+    /// `module`, as a token.
+    pub module: Option<HostShaderModule>,
+    /// `pName`, the entry point inside the module. **Not assumed to be `"main"`**: a module
+    /// compiled from HLSL or with several entry points names one here, and substituting `"main"`
+    /// would link a different shader.
+    pub name: String,
+    /// `pSpecializationInfo`, or `None`.
+    pub specialization: Option<Specialization>,
+}
+
+/// `VkPipelineVertexInputStateCreateInfo`, decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VertexInputState {
+    /// `flags`.
+    pub flags: u32,
+    /// `pVertexBindingDescriptions`, as their
+    /// [`VERTEX_INPUT_BINDING_BYTES`](super::VERTEX_INPUT_BINDING_BYTES) bytes each.
+    pub bindings: Vec<Vec<u8>>,
+    /// `pVertexAttributeDescriptions`, as their
+    /// [`VERTEX_INPUT_ATTRIBUTE_BYTES`](super::VERTEX_INPUT_ATTRIBUTE_BYTES) bytes each.
+    pub attributes: Vec<Vec<u8>>,
+}
+
+/// `VkPipelineViewportStateCreateInfo`, decoded.
+///
+/// # Why the counts are separate from the arrays
+///
+/// Because they are allowed to disagree, and the case where they do is the one this stage uses:
+/// with `VK_DYNAMIC_STATE_VIEWPORT` in `pDynamicStates`, `pViewports` is **ignored and may be
+/// NULL** while `viewportCount` is still required to be correct. A structure that stored only the
+/// arrays would lose the count, and the pipeline would be created with zero viewports and fail at
+/// the draw rather than here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewportState {
+    /// `flags`.
+    pub flags: u32,
+    /// `viewportCount`.
+    pub viewport_count: u32,
+    /// `pViewports`, flat, or empty when it was NULL.
+    pub viewports: Vec<u8>,
+    /// `scissorCount`.
+    pub scissor_count: u32,
+    /// `pScissors`, flat, or empty when it was NULL.
+    pub scissors: Vec<u8>,
+}
+
+/// `VkPipelineMultisampleStateCreateInfo`, decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultisampleState {
+    /// `flags`.
+    pub flags: u32,
+    /// `rasterizationSamples`.
+    pub samples: u32,
+    /// `sampleShadingEnable`.
+    pub sample_shading: u32,
+    /// `minSampleShading`, as its four raw bytes — a `float`, carried unmodified rather than
+    /// through an `f32` so that a signalling NaN the guest wrote is the one the driver sees.
+    pub min_sample_shading: [u8; 4],
+    /// `pSampleMask`, which is `ceil(rasterizationSamples / 32)` words, or empty when NULL.
+    pub sample_mask: Vec<u32>,
+    /// `alphaToCoverageEnable`.
+    pub alpha_to_coverage: u32,
+    /// `alphaToOneEnable`.
+    pub alpha_to_one: u32,
+}
+
+/// `VkPipelineColorBlendStateCreateInfo`, decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColorBlendState {
+    /// `flags`.
+    pub flags: u32,
+    /// `logicOpEnable`.
+    pub logic_op_enable: u32,
+    /// `logicOp`.
+    pub logic_op: u32,
+    /// `pAttachments`, as their
+    /// [`COLOR_BLEND_ATTACHMENT_BYTES`](super::COLOR_BLEND_ATTACHMENT_BYTES) bytes each.
+    pub attachments: Vec<Vec<u8>>,
+    /// `blendConstants`, as its sixteen raw bytes. Four floats, carried for
+    /// [`MultisampleState::min_sample_shading`]'s reason.
+    pub blend_constants: [u8; 16],
+}
+
+/// One `VkGraphicsPipelineCreateInfo`, decoded out of guest memory.
+///
+/// # The largest structure this layer decodes, and the reason it is decoded at all
+///
+/// Every other fixed-layout Vulkan structure in this crate travels as its bytes, because it has no
+/// pointer to follow. This one is nothing *but* pointers: nine sub-state pointers, two handles, an
+/// array of shader stages each of which holds a handle and two more pointers, and a `pDynamicState`
+/// whose presence changes what the other members mean. There is no byte image to pass through.
+///
+/// What is decoded is therefore only what has to be. Each sub-state's own **body** travels as bytes
+/// wherever that body is flat — [`RasterizationState`](GraphicsPipelineRequest::rasterization) and
+/// [`depth_stencil`](GraphicsPipelineRequest::depth_stencil) are the two that are — and is decoded
+/// wherever it holds a pointer of its own.
+///
+/// # `None` is not `Default` here
+///
+/// Five of these members are legitimately NULL for a pipeline that does not use them: a pipeline
+/// with `rasterizerDiscardEnable` set needs no viewport, multisample, depth-stencil or colour-blend
+/// state at all, and one with no tessellation stages needs no tessellation state. A `Default`
+/// substituted for a NULL would be a pipeline that rasterizes where the engine asked for one that
+/// does not, so each is an `Option` and the host passes NULL back through.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphicsPipelineRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `pStages`, in the guest's order.
+    pub stages: Vec<ShaderStage>,
+    /// `pVertexInputState`.
+    pub vertex_input: Option<VertexInputState>,
+    /// `pInputAssemblyState`, as `(flags, topology, primitiveRestartEnable)`.
+    pub input_assembly: Option<(u32, u32, u32)>,
+    /// `pTessellationState`, as `(flags, patchControlPoints)`.
+    pub tessellation: Option<(u32, u32)>,
+    /// `pViewportState`.
+    pub viewport: Option<ViewportState>,
+    /// `pRasterizationState`, as the
+    /// [`RASTERIZATION_STATE_BODY_BYTES`](super::RASTERIZATION_STATE_BODY_BYTES) bytes that follow
+    /// its `pNext`. Eleven scalars, no pointer.
+    pub rasterization: Option<Vec<u8>>,
+    /// `pMultisampleState`.
+    pub multisample: Option<MultisampleState>,
+    /// `pDepthStencilState`, as the
+    /// [`DEPTH_STENCIL_STATE_BODY_BYTES`](super::DEPTH_STENCIL_STATE_BODY_BYTES) bytes that follow
+    /// its `pNext`. Two `VkStencilOpState`s and nine scalars, no pointer.
+    pub depth_stencil: Option<Vec<u8>>,
+    /// `pColorBlendState`.
+    pub color_blend: Option<ColorBlendState>,
+    /// `pDynamicState`'s `pDynamicStates`, or `None` when `pDynamicState` itself was NULL —
+    /// which is **not** the same as an empty list, though the driver treats them alike.
+    pub dynamic_states: Option<Vec<u32>>,
+    /// `layout`, as a token.
+    pub layout: Option<HostPipelineLayout>,
+    /// `renderPass`, as a token.
+    pub render_pass: Option<HostRenderPass>,
+    /// `subpass`.
+    pub subpass: u32,
+    /// `basePipelineHandle`, as a token, or `None` for `VK_NULL_HANDLE`.
+    pub base_pipeline: Option<HostPipeline>,
+    /// `basePipelineIndex`, the guest's, including `-1`.
+    pub base_pipeline_index: i32,
+}
+
+/// What one `vkCreateGraphicsPipelines` did.
+///
+/// # Why this is not a [`DriverAnswer`], for a reason [`Acquired`]'s is not
+///
+/// `vkCreateGraphicsPipelines` is the only creation call in Vulkan that **partly succeeds**. The
+/// specification is explicit: when a pipeline fails to be created, `pPipelines` receives
+/// `VK_NULL_HANDLE` in that slot, *the pipelines that succeeded are still valid and still the
+/// application's to destroy*, and an error code is returned for the call as a whole. A
+/// `DriverAnswer<Vec<HostPipeline>>` cannot say that. It would force the failure to be total, and
+/// an implementation obeying it would drop handles the driver had created — which is a leak of the
+/// most expensive object a renderer makes.
+///
+/// So the result is the `i32` the driver produced and the list travels beside it with a hole in it
+/// where a pipeline failed. The shim writes `VK_NULL_HANDLE` for each `None`, which is what the
+/// guest is owed, and registers a handle only for each `Some`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelinesCreated {
+    /// The driver's own `VkResult`, verbatim. `VK_SUCCESS` when every pipeline was created.
+    pub result: i32,
+    /// One entry per request, in the guest's order. `None` is a pipeline the driver declined to
+    /// create, and the guest receives `VK_NULL_HANDLE` for it.
+    pub pipelines: Vec<Option<HostPipeline>>,
+}
+
+/// One `VkRenderPassBeginInfo`, decoded out of guest memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderPassBegin {
+    /// `renderPass`, as a token.
+    pub render_pass: Option<HostRenderPass>,
+    /// `framebuffer`, as a token.
+    pub framebuffer: Option<HostFramebuffer>,
+    /// `renderArea`, as its [`RECT_2D_BYTES`](super::RECT_2D_BYTES) bytes: two `int32_t`s and two
+    /// `uint32_t`s.
+    pub render_area: Vec<u8>,
+    /// `pClearValues`, as their sixteen raw bytes each.
+    ///
+    /// **The union travels whole**, for [`VulkanHost::cmd_clear_color_image`]'s reason: which
+    /// member is live is decided by the attachment's format, which this layer does not know, and
+    /// interpreting the bytes would be this layer choosing.
+    pub clear_values: Vec<[u8; 16]>,
 }
 
 /// The refusal a [`VulkanHost`] method's default body produces.
@@ -1603,6 +2238,979 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
             "VulkanHost::device_wait_idle",
             "there is nothing to wait for; see `queue_wait_idle` for what a fabricated success \
              licenses the guest to do next",
+        ))
+    }
+
+    // =========================================================== stage 5: memory and resources
+
+    /// Which memory types on `physical` this host can **import a host pointer into**, as a mask of
+    /// `1 << memoryTypeIndex`.
+    ///
+    /// # Why this is asked of a physical device and answered by a device-level call
+    ///
+    /// The only route the specification gives to this fact is
+    /// `vkGetMemoryHostPointerPropertiesEXT`, which takes a `VkDevice` — and the call that needs
+    /// the answer is `vkGetPhysicalDeviceMemoryProperties`, which an engine may make **before** it
+    /// has created one. So the question is asked of the physical device and it is the
+    /// implementation's problem to obtain a device to ask with, cache the answer, and be honest
+    /// about it. It is not this crate's problem, and it must not be guessed at here: a rule like
+    /// "host-visible and not device-local" reproduces the measured `0xc` on this machine and is a
+    /// *derivation*, not a measurement, which is exactly the kind of plausible claim this project
+    /// refuses to make about a driver.
+    ///
+    /// A host with no `VK_EXT_external_memory_host` answers **0**. That is a legitimate answer and
+    /// the consequence is stated rather than hidden: every host-visible type is masked out of the
+    /// list the guest sees, and any `vkAllocateMemory` from one is a refusal naming the type.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `physical` is not a token this host issued, or when the probe
+    /// itself failed — which is a fact about this host and not an answer of zero.
+    fn importable_memory_types(&self, physical: HostPhysicalDevice) -> AbiResult<u32> {
+        let _ = physical;
+        Err(host_has_no(
+            "VulkanHost::importable_memory_types",
+            "this layer cannot say which memory types it is able to back, so it cannot edit the \
+             list the guest chooses from -- and an unedited list is a guest choosing a type whose \
+             `vkMapMemory` this layer would then have to refuse, one call after telling it the \
+             type was host-visible",
+        ))
+    }
+
+    /// The device extensions this host **must** have enabled in order to satisfy the guest's
+    /// Vulkan, whatever the guest itself asked for.
+    ///
+    /// # Why the default is an empty list and not a refusal
+    ///
+    /// Every other method added since stage 2a defaults to refusing by name, because the answer
+    /// they would otherwise have to invent is one only a real driver can give. This one is
+    /// different: "this host needs no extension the guest did not ask for" is a **complete and
+    /// true** answer for a host that needs none, and every test double in this workspace is such a
+    /// host — it creates no device and imports no memory. A default that refused would make
+    /// `vkCreateDevice` fail for a double that is behaving correctly.
+    ///
+    /// [`GfxVulkanHost`] overrides it with exactly one name, `VK_EXT_external_memory_host`, and
+    /// only when the physical device has it. The shim appends whatever comes back, records each
+    /// addition as a [`RewriteSite::DeviceExtensionAdded`](super::RewriteSite), and a physical
+    /// device without the extension therefore produces no rewrite, no addition and no failure —
+    /// the consequence appears instead as the memory-type mask.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `physical` is not a token this host issued, or when the
+    /// extension list cannot be read — which is a fact about this host, and must not be flattened
+    /// into an empty list.
+    fn device_extensions_required_by_host(
+        &self,
+        physical: HostPhysicalDevice,
+    ) -> AbiResult<Vec<String>> {
+        let _ = physical;
+        Ok(Vec::new())
+    }
+
+    /// What one memory type index means on `device`, and whether this layer can back it.
+    ///
+    /// See [`MemoryPlan`] for the three outcomes and why the shim has to know before it allocates.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued, or when
+    /// `memory_type_index` is past the device's `memoryTypeCount` — which is a guest value and is
+    /// refused here rather than reaching a driver, because indexing a driver's fixed array with a
+    /// guest `uint32_t` is a host read out of bounds.
+    fn memory_plan(&self, device: HostDevice, memory_type_index: u32) -> AbiResult<MemoryPlan> {
+        let _ = (device, memory_type_index);
+        Err(host_has_no(
+            "VulkanHost::memory_plan",
+            "there is no way to tell a device-local allocation from a host-visible one, and \
+             guessing would either import memory the driver cannot import or forward an \
+             allocation the guest is about to map",
+        ))
+    }
+
+    /// `vkAllocateMemory`, forwarded — **importing the guest's pages when there are any**.
+    ///
+    /// When [`MemoryAllocation::host_pointer`] is `Some`, an implementation must chain a
+    /// `VkImportMemoryHostPointerInfoEXT` with
+    /// `handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` and that pointer, and
+    /// must pass [`MemoryAllocation::import_length`] as `allocationSize` rather than
+    /// [`MemoryAllocation::size`] — the specification requires the imported length to be a
+    /// multiple of `minImportedHostPointerAlignment` and the guest's size is not.
+    ///
+    /// When it is `None` the allocation is an ordinary forward and `allocationSize` is the guest's.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued, or when an import was
+    /// asked for and this host has no `VK_EXT_external_memory_host`.
+    fn allocate_memory(
+        &self,
+        device: HostDevice,
+        allocation: &MemoryAllocation,
+    ) -> AbiResult<DriverAnswer<HostDeviceMemory>> {
+        let _ = (device, allocation);
+        Err(host_has_no(
+            "VulkanHost::allocate_memory",
+            "there is no `VkDeviceMemory`, and a handle naming nothing would be bound to a buffer \
+             and then written through a pointer `vkMapMemory` invented",
+        ))
+    }
+
+    /// `vkFreeMemory`, forwarded.
+    ///
+    /// **The guest's mapping is not this method's to unmap.** The shim made the `GuestSpace`
+    /// mapping and the shim releases it, after this returns — so an implementation frees the
+    /// driver's object and drops its own record, and nothing here touches guest address space.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `memory` is not a token this host issued.
+    fn free_memory(&self, memory: HostDeviceMemory) -> AbiResult<()> {
+        let _ = memory;
+        Err(host_has_no(
+            "VulkanHost::free_memory",
+            "the allocation cannot be freed, and returning quietly would leak a device allocation \
+             per texture for as long as the guest runs",
+        ))
+    }
+
+    /// `vkMapMemory`, forwarded, answering **the address the driver produced**.
+    ///
+    /// # The invariant the shim checks this against, and why it is checked rather than assumed
+    ///
+    /// For an imported allocation the address must be the pointer that was imported, plus
+    /// `offset`. That is what was measured on this machine — `vkMapMemory -> 0x1cdb4f89000, and
+    /// the pointer imported was 0x1cdb4f89000` — and it is what makes the whole route work: the
+    /// guest receives an address inside `GuestSpace`, `admit` admits it, and `HOST_COHERENT` is
+    /// genuinely coherent because there is only one copy of the bytes.
+    ///
+    /// It is also a property of a driver rather than of the specification, which says only that
+    /// the pointer is to the start of the range. So the shim compares, and a driver that answered
+    /// anything else is a **refusal naming both addresses** rather than a host pointer handed to
+    /// translated ARM64. The answer travels as a `u64` here precisely so that the comparison is
+    /// possible; it is never what reaches the guest unchecked.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `memory` is not a token this host issued.
+    fn map_memory(
+        &self,
+        memory: HostDeviceMemory,
+        offset: u64,
+        size: u64,
+        flags: u32,
+    ) -> AbiResult<DriverAnswer<u64>> {
+        let _ = (memory, offset, size, flags);
+        Err(host_has_no(
+            "VulkanHost::map_memory",
+            "there is no mapping, and the one thing that must never happen here is a plausible \
+             address: the guest stores through whatever it is given, and D4 amendment 1 means \
+             `admit` would not stop it",
+        ))
+    }
+
+    /// `vkUnmapMemory`, forwarded. Returns `void` in Vulkan, so there is no code to carry.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `memory` is not a token this host issued.
+    fn unmap_memory(&self, memory: HostDeviceMemory) -> AbiResult<()> {
+        let _ = memory;
+        Err(host_has_no("VulkanHost::unmap_memory", "the mapping cannot be released"))
+    }
+
+    /// `vkFlushMappedMemoryRanges`, forwarded. Each range is `(memory, offset, size)` with the
+    /// guest's own `size`, including `VK_WHOLE_SIZE`.
+    ///
+    /// **On this machine every `HOST_VISIBLE` memory type is also `HOST_COHERENT`**
+    /// (`docs/HANDOFF.md`), so a conforming engine is never *required* to call this — and one that
+    /// calls it anyway is conforming too, which is why it is implemented rather than refused. What
+    /// it must not become is a no-op: a host whose memory is not coherent would then lose every
+    /// upload, silently, on the first frame.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn flush_mapped_memory_ranges(
+        &self,
+        device: HostDevice,
+        ranges: &[(HostDeviceMemory, u64, u64)],
+    ) -> AbiResult<DriverAnswer<()>> {
+        let _ = (device, ranges);
+        Err(host_has_no(
+            "VulkanHost::flush_mapped_memory_ranges",
+            "nothing is flushed, and a `VK_SUCCESS` would tell the guest its uploads are visible \
+             to the GPU when they may still be in a host cache",
+        ))
+    }
+
+    /// `vkInvalidateMappedMemoryRanges`, forwarded. See
+    /// [`flush_mapped_memory_ranges`](VulkanHost::flush_mapped_memory_ranges).
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn invalidate_mapped_memory_ranges(
+        &self,
+        device: HostDevice,
+        ranges: &[(HostDeviceMemory, u64, u64)],
+    ) -> AbiResult<DriverAnswer<()>> {
+        let _ = (device, ranges);
+        Err(host_has_no(
+            "VulkanHost::invalidate_mapped_memory_ranges",
+            "nothing is invalidated, and the guest would read a stale host cache line where the \
+             GPU's result should be",
+        ))
+    }
+
+    /// `vkGetBufferMemoryRequirements`, forwarded, as the
+    /// [`MEMORY_REQUIREMENTS_BYTES`](super::MEMORY_REQUIREMENTS_BYTES) bytes of a
+    /// `VkMemoryRequirements`.
+    ///
+    /// Bytes for [`VulkanHost::physical_device_properties`]' reason: two `VkDeviceSize`s and a
+    /// `uint32_t`, no pointer, no hole, identical on both targets.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn buffer_memory_requirements(&self, buffer: HostBuffer) -> AbiResult<Vec<u8>> {
+        let _ = buffer;
+        Err(host_has_no(
+            "VulkanHost::buffer_memory_requirements",
+            "there is no size, no alignment and no `memoryTypeBits` -- and a fabricated \
+             `memoryTypeBits` is a guest allocating from a type the buffer cannot be bound to",
+        ))
+    }
+
+    /// `vkGetImageMemoryRequirements`, forwarded. See
+    /// [`buffer_memory_requirements`](VulkanHost::buffer_memory_requirements).
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `image` is not a token this host issued.
+    fn image_memory_requirements(&self, image: HostCreatedImage) -> AbiResult<Vec<u8>> {
+        let _ = image;
+        Err(host_has_no(
+            "VulkanHost::image_memory_requirements",
+            "there is no size, no alignment and no `memoryTypeBits`; an image's requirements \
+             differ from its own extent times its format, because tiling is the driver's",
+        ))
+    }
+
+    /// `vkBindBufferMemory`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued, or when the buffer and the
+    /// memory belong to different devices.
+    fn bind_buffer_memory(
+        &self,
+        buffer: HostBuffer,
+        memory: HostDeviceMemory,
+        offset: u64,
+    ) -> AbiResult<DriverAnswer<()>> {
+        let _ = (buffer, memory, offset);
+        Err(host_has_no(
+            "VulkanHost::bind_buffer_memory",
+            "no memory is bound, and a `VK_SUCCESS` would let the guest write vertices into a \
+             mapping the buffer has no relationship with",
+        ))
+    }
+
+    /// `vkBindImageMemory`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued, or when the image and the
+    /// memory belong to different devices.
+    fn bind_image_memory(
+        &self,
+        image: HostCreatedImage,
+        memory: HostDeviceMemory,
+        offset: u64,
+    ) -> AbiResult<DriverAnswer<()>> {
+        let _ = (image, memory, offset);
+        Err(host_has_no(
+            "VulkanHost::bind_image_memory",
+            "no memory is bound, and the first thing to notice would be a texture that samples as \
+             whatever the driver left in that image",
+        ))
+    }
+
+    /// `vkCreateBuffer`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued.
+    fn create_buffer(
+        &self,
+        device: HostDevice,
+        request: &BufferRequest,
+    ) -> AbiResult<DriverAnswer<HostBuffer>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_buffer",
+            "there is no `VkBuffer`, and every vertex, index and staging upload a renderer makes \
+             is one",
+        ))
+    }
+
+    /// `vkDestroyBuffer`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn destroy_buffer(&self, buffer: HostBuffer) -> AbiResult<()> {
+        let _ = buffer;
+        Err(host_has_no("VulkanHost::destroy_buffer", "the buffer cannot be destroyed"))
+    }
+
+    /// `vkCreateImage`, forwarded. The result is a [`HostCreatedImage`] and **not** a
+    /// [`HostImage`]; [`HostImageRef`] says why those are different families.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued.
+    fn create_image(
+        &self,
+        device: HostDevice,
+        request: &ImageRequest,
+    ) -> AbiResult<DriverAnswer<HostCreatedImage>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_image",
+            "there is no `VkImage`, so there is nothing for a texture upload to be copied into",
+        ))
+    }
+
+    /// `vkDestroyImage`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `image` is not a token this host issued.
+    fn destroy_image(&self, image: HostCreatedImage) -> AbiResult<()> {
+        let _ = image;
+        Err(host_has_no("VulkanHost::destroy_image", "the image cannot be destroyed"))
+    }
+
+    /// `vkCreateSampler`, forwarded. `body` is the
+    /// [`SAMPLER_CREATE_INFO_BODY_BYTES`](super::SAMPLER_CREATE_INFO_BODY_BYTES) bytes of
+    /// `VkSamplerCreateInfo` that follow `pNext`.
+    ///
+    /// Bytes rather than sixteen named fields, for [`DeviceRequest::features`]' reason: they are
+    /// sixteen scalars with no pointer and no hole, and `addressModeU` written where `addressModeV`
+    /// belongs is a texture that wraps on the wrong axis and looks like an atlas bug.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued, or when `body` is not
+    /// the length the specification fixes.
+    fn create_sampler(
+        &self,
+        device: HostDevice,
+        body: &[u8],
+    ) -> AbiResult<DriverAnswer<HostSampler>> {
+        let _ = (device, body);
+        Err(host_has_no(
+            "VulkanHost::create_sampler",
+            "there is no `VkSampler`, and a combined image sampler descriptor needs one",
+        ))
+    }
+
+    /// `vkDestroySampler`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `sampler` is not a token this host issued.
+    fn destroy_sampler(&self, sampler: HostSampler) -> AbiResult<()> {
+        let _ = sampler;
+        Err(host_has_no("VulkanHost::destroy_sampler", "the sampler cannot be destroyed"))
+    }
+
+    /// `vkCreateShaderModule`, forwarded. `code` is the guest's SPIR-V, **verbatim**.
+    ///
+    /// The bytes are the same on both sides: SPIR-V is a stream of little-endian 32-bit words
+    /// whose meaning the SPIR-V specification fixes with no reference to a host, so there is
+    /// nothing here to translate and the only thing this layer does is validate the pointer it
+    /// came through. An implementation must not rewrite it, and must not accept a length that is
+    /// not a multiple of four.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued, or when `code`'s
+    /// length is not a multiple of four.
+    fn create_shader_module(
+        &self,
+        device: HostDevice,
+        flags: u32,
+        code: &[u8],
+    ) -> AbiResult<DriverAnswer<HostShaderModule>> {
+        let _ = (device, flags, code);
+        Err(host_has_no(
+            "VulkanHost::create_shader_module",
+            "there is no `VkShaderModule`, and a pipeline built from one that names nothing would \
+             be a pipeline with no shaders",
+        ))
+    }
+
+    /// `vkDestroyShaderModule`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `module` is not a token this host issued.
+    fn destroy_shader_module(&self, module: HostShaderModule) -> AbiResult<()> {
+        let _ = module;
+        Err(host_has_no("VulkanHost::destroy_shader_module", "the module cannot be destroyed"))
+    }
+
+    /// `vkCreatePipelineLayout`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn create_pipeline_layout(
+        &self,
+        device: HostDevice,
+        request: &PipelineLayoutRequest,
+    ) -> AbiResult<DriverAnswer<HostPipelineLayout>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_pipeline_layout",
+            "there is no `VkPipelineLayout`, and it is what says which descriptor sets a draw may \
+             bind",
+        ))
+    }
+
+    /// `vkDestroyPipelineLayout`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `layout` is not a token this host issued.
+    fn destroy_pipeline_layout(&self, layout: HostPipelineLayout) -> AbiResult<()> {
+        let _ = layout;
+        Err(host_has_no("VulkanHost::destroy_pipeline_layout", "the layout cannot be destroyed"))
+    }
+
+    /// `vkCreateRenderPass`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued, or when an attachment,
+    /// reference or dependency blob is not the length the specification fixes.
+    fn create_render_pass(
+        &self,
+        device: HostDevice,
+        request: &RenderPassRequest,
+    ) -> AbiResult<DriverAnswer<HostRenderPass>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_render_pass",
+            "there is no `VkRenderPass`, and it is what decides whether the swapchain image is \
+             cleared, loaded or left alone before a draw touches it",
+        ))
+    }
+
+    /// `vkDestroyRenderPass`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `pass` is not a token this host issued.
+    fn destroy_render_pass(&self, pass: HostRenderPass) -> AbiResult<()> {
+        let _ = pass;
+        Err(host_has_no("VulkanHost::destroy_render_pass", "the render pass cannot be destroyed"))
+    }
+
+    /// `vkCreateFramebuffer`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued, or when the attachments do
+    /// not all belong to `device`.
+    fn create_framebuffer(
+        &self,
+        device: HostDevice,
+        request: &FramebufferRequest,
+    ) -> AbiResult<DriverAnswer<HostFramebuffer>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_framebuffer",
+            "there is no `VkFramebuffer`, so a render pass has nothing to render into",
+        ))
+    }
+
+    /// `vkDestroyFramebuffer`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `framebuffer` is not a token this host issued.
+    fn destroy_framebuffer(&self, framebuffer: HostFramebuffer) -> AbiResult<()> {
+        let _ = framebuffer;
+        Err(host_has_no("VulkanHost::destroy_framebuffer", "the framebuffer cannot be destroyed"))
+    }
+
+    /// `vkCreatePipelineCache`, forwarded. `initial_data` is `pInitialData`, copied, or empty.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued.
+    fn create_pipeline_cache(
+        &self,
+        device: HostDevice,
+        flags: u32,
+        initial_data: &[u8],
+    ) -> AbiResult<DriverAnswer<HostPipelineCache>> {
+        let _ = (device, flags, initial_data);
+        Err(host_has_no(
+            "VulkanHost::create_pipeline_cache",
+            "there is no `VkPipelineCache`; a renderer that passes one to \
+             `vkCreateGraphicsPipelines` would be passing a handle naming nothing",
+        ))
+    }
+
+    /// `vkDestroyPipelineCache`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `cache` is not a token this host issued.
+    fn destroy_pipeline_cache(&self, cache: HostPipelineCache) -> AbiResult<()> {
+        let _ = cache;
+        Err(host_has_no("VulkanHost::destroy_pipeline_cache", "the cache cannot be destroyed"))
+    }
+
+    /// `vkCreateGraphicsPipelines`, forwarded. **One call, many pipelines, and it may partly
+    /// succeed.**
+    ///
+    /// See [`PipelinesCreated`]: the specification requires `pPipelines` to be filled with
+    /// `VK_NULL_HANDLE` for every pipeline that failed and a valid handle for every one that did
+    /// not, *and* an error code to be returned. A signature that answered
+    /// `DriverAnswer<Vec<HostPipeline>>` could not express that, and the shape it would force —
+    /// treating any failure as total — would throw away pipelines the driver did create, which
+    /// leaks them.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn create_graphics_pipelines(
+        &self,
+        device: HostDevice,
+        cache: Option<HostPipelineCache>,
+        requests: &[GraphicsPipelineRequest],
+    ) -> AbiResult<PipelinesCreated> {
+        let _ = (device, cache, requests);
+        Err(host_has_no(
+            "VulkanHost::create_graphics_pipelines",
+            "there are no pipelines. **This is the method rule 1 is written about**: a \
+             `VK_SUCCESS` with no pipeline behind it is believed, bound, drawn with, and produces \
+             a frame that is empty for a reason nothing records",
+        ))
+    }
+
+    /// `vkDestroyPipeline`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `pipeline` is not a token this host issued.
+    fn destroy_pipeline(&self, pipeline: HostPipeline) -> AbiResult<()> {
+        let _ = pipeline;
+        Err(host_has_no("VulkanHost::destroy_pipeline", "the pipeline cannot be destroyed"))
+    }
+
+    /// `vkCreateDescriptorSetLayout`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn create_descriptor_set_layout(
+        &self,
+        device: HostDevice,
+        request: &DescriptorSetLayoutRequest,
+    ) -> AbiResult<DriverAnswer<HostDescriptorSetLayout>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_descriptor_set_layout",
+            "there is no `VkDescriptorSetLayout`, and it is what a pipeline layout and a \
+             descriptor set are both built from",
+        ))
+    }
+
+    /// `vkDestroyDescriptorSetLayout`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `layout` is not a token this host issued.
+    fn destroy_descriptor_set_layout(&self, layout: HostDescriptorSetLayout) -> AbiResult<()> {
+        let _ = layout;
+        Err(host_has_no(
+            "VulkanHost::destroy_descriptor_set_layout",
+            "the set layout cannot be destroyed",
+        ))
+    }
+
+    /// `vkCreateDescriptorPool`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued.
+    fn create_descriptor_pool(
+        &self,
+        device: HostDevice,
+        request: &DescriptorPoolRequest,
+    ) -> AbiResult<DriverAnswer<HostDescriptorPool>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_descriptor_pool",
+            "there is no `VkDescriptorPool` and therefore nowhere for a descriptor set to come \
+             from",
+        ))
+    }
+
+    /// `vkDestroyDescriptorPool`, forwarded. **Every set allocated from it goes with it**, the way
+    /// a command pool takes its buffers.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `pool` is not a token this host issued.
+    fn destroy_descriptor_pool(&self, pool: HostDescriptorPool) -> AbiResult<()> {
+        let _ = pool;
+        Err(host_has_no("VulkanHost::destroy_descriptor_pool", "the pool cannot be destroyed"))
+    }
+
+    /// Every `VkDescriptorSet` this host has allocated from `pool` and not yet freed.
+    ///
+    /// [`VulkanHost::command_buffers_of`]'s argument, one family along: `vkDestroyDescriptorPool`
+    /// and `vkResetDescriptorPool` both free every set in the pool without naming one, and the
+    /// shim has to drop those guest handles in the same call or the guest holds descriptor-set
+    /// handles naming freed driver objects.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `pool` is not a token this host issued.
+    fn descriptor_sets_of(&self, pool: HostDescriptorPool) -> AbiResult<Vec<HostDescriptorSet>> {
+        let _ = pool;
+        Err(host_has_no(
+            "VulkanHost::descriptor_sets_of",
+            "this layer cannot find out which sets are about to be freed, so it cannot take their \
+             guest handles back",
+        ))
+    }
+
+    /// `vkAllocateDescriptorSets`, forwarded. The list is in the guest's layout order, which is
+    /// the order the shim writes it into `pDescriptorSets`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued, or when a layout does not
+    /// belong to the pool's device.
+    fn allocate_descriptor_sets(
+        &self,
+        pool: HostDescriptorPool,
+        layouts: &[HostDescriptorSetLayout],
+    ) -> AbiResult<DriverAnswer<Vec<HostDescriptorSet>>> {
+        let _ = (pool, layouts);
+        Err(host_has_no(
+            "VulkanHost::allocate_descriptor_sets",
+            "there are no descriptor sets, and a draw that bound one naming nothing would sample \
+             whatever descriptor the hardware last had",
+        ))
+    }
+
+    /// `vkFreeDescriptorSets`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued, or when a set was not
+    /// allocated from `pool` — which the specification makes undefined behaviour and which no
+    /// validation layer on this machine would report.
+    fn free_descriptor_sets(
+        &self,
+        pool: HostDescriptorPool,
+        sets: &[HostDescriptorSet],
+    ) -> AbiResult<DriverAnswer<()>> {
+        let _ = (pool, sets);
+        Err(host_has_no("VulkanHost::free_descriptor_sets", "the sets cannot be freed"))
+    }
+
+    /// `vkResetDescriptorPool`, forwarded. Frees every set in the pool.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `pool` is not a token this host issued.
+    fn reset_descriptor_pool(
+        &self,
+        pool: HostDescriptorPool,
+        flags: u32,
+    ) -> AbiResult<DriverAnswer<()>> {
+        let _ = (pool, flags);
+        Err(host_has_no(
+            "VulkanHost::reset_descriptor_pool",
+            "the pool cannot be reset, and a guest that believed it had been would allocate from \
+             a pool that is still full",
+        ))
+    }
+
+    /// `vkUpdateDescriptorSets`, forwarded. Returns `void` in Vulkan and has no `VkResult`.
+    ///
+    /// **The call where a wrong handle is quietest.** Every one of these writes points a
+    /// descriptor at an image view, a sampler or a buffer, and a descriptor pointing somewhere
+    /// else does not fail — it draws the wrong thing, or reads memory the GPU was not given.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn update_descriptor_sets(
+        &self,
+        device: HostDevice,
+        writes: &[DescriptorWrite],
+        copies: &[DescriptorCopy],
+    ) -> AbiResult<()> {
+        let _ = (device, writes, copies);
+        Err(host_has_no(
+            "VulkanHost::update_descriptor_sets",
+            "no descriptor is updated, and this call has no `VkResult` at all -- so a host that \
+             returned quietly would leave every set holding whatever the pool was allocated with, \
+             with nothing anywhere to say so",
+        ))
+    }
+
+    /// `vkCmdBeginRenderPass`, forwarded. `contents` is `VkSubpassContents`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_begin_render_pass(
+        &self,
+        buffer: HostCommandBuffer,
+        begin: &RenderPassBegin,
+        contents: u32,
+    ) -> AbiResult<()> {
+        let _ = (buffer, begin, contents);
+        Err(host_has_no(
+            "VulkanHost::cmd_begin_render_pass",
+            "no render pass is begun, and every draw recorded afterwards is invalid -- which the \
+             driver reports at `vkEndCommandBuffer`, a long way from here",
+        ))
+    }
+
+    /// `vkCmdEndRenderPass`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn cmd_end_render_pass(&self, buffer: HostCommandBuffer) -> AbiResult<()> {
+        let _ = buffer;
+        Err(host_has_no("VulkanHost::cmd_end_render_pass", "the render pass is not ended"))
+    }
+
+    /// `vkCmdBindPipeline`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_bind_pipeline(
+        &self,
+        buffer: HostCommandBuffer,
+        bind_point: u32,
+        pipeline: HostPipeline,
+    ) -> AbiResult<()> {
+        let _ = (buffer, bind_point, pipeline);
+        Err(host_has_no("VulkanHost::cmd_bind_pipeline", "no pipeline is bound"))
+    }
+
+    /// `vkCmdBindVertexBuffers`, forwarded. `buffers` is `(buffer, offset)` **zipped**, for
+    /// [`SubmitRequest::waits`]' reason — the specification requires `pBuffers` and `pOffsets` to
+    /// have the same length, and a pair cannot come apart the way two `Vec`s can.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_bind_vertex_buffers(
+        &self,
+        buffer: HostCommandBuffer,
+        first_binding: u32,
+        buffers: &[(HostBuffer, u64)],
+    ) -> AbiResult<()> {
+        let _ = (buffer, first_binding, buffers);
+        Err(host_has_no(
+            "VulkanHost::cmd_bind_vertex_buffers",
+            "no vertex buffer is bound, and the draw would read whatever the hardware last had",
+        ))
+    }
+
+    /// `vkCmdBindIndexBuffer`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_bind_index_buffer(
+        &self,
+        buffer: HostCommandBuffer,
+        index_buffer: HostBuffer,
+        offset: u64,
+        index_type: u32,
+    ) -> AbiResult<()> {
+        let _ = (buffer, index_buffer, offset, index_type);
+        Err(host_has_no("VulkanHost::cmd_bind_index_buffer", "no index buffer is bound"))
+    }
+
+    /// `vkCmdBindDescriptorSets`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_bind_descriptor_sets(
+        &self,
+        buffer: HostCommandBuffer,
+        bind_point: u32,
+        layout: HostPipelineLayout,
+        first_set: u32,
+        sets: &[HostDescriptorSet],
+        dynamic_offsets: &[u32],
+    ) -> AbiResult<()> {
+        let _ = (buffer, bind_point, layout, first_set, sets, dynamic_offsets);
+        Err(host_has_no(
+            "VulkanHost::cmd_bind_descriptor_sets",
+            "no descriptor set is bound, so the draw samples nothing the guest chose",
+        ))
+    }
+
+    /// `vkCmdSetViewport`, forwarded. `viewports` is the flat bytes of the guest's array,
+    /// [`VIEWPORT_BYTES`](super::VIEWPORT_BYTES) per entry — six floats, no pointer.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn cmd_set_viewport(
+        &self,
+        buffer: HostCommandBuffer,
+        first: u32,
+        viewports: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, first, viewports);
+        Err(host_has_no(
+            "VulkanHost::cmd_set_viewport",
+            "the viewport is not set, and a pipeline with `VK_DYNAMIC_STATE_VIEWPORT` has none \
+             until it is",
+        ))
+    }
+
+    /// `vkCmdSetScissor`, forwarded. `scissors` is the flat bytes,
+    /// [`RECT_2D_BYTES`](super::RECT_2D_BYTES) per entry.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn cmd_set_scissor(
+        &self,
+        buffer: HostCommandBuffer,
+        first: u32,
+        scissors: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, first, scissors);
+        Err(host_has_no(
+            "VulkanHost::cmd_set_scissor",
+            "the scissor is not set, and a zero-sized scissor discards every fragment -- a frame \
+             that renders nothing with every `VkResult` zero",
+        ))
+    }
+
+    /// `vkCmdDraw`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn cmd_draw(
+        &self,
+        buffer: HostCommandBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) -> AbiResult<()> {
+        let _ = (buffer, vertex_count, instance_count, first_vertex, first_instance);
+        Err(host_has_no(
+            "VulkanHost::cmd_draw",
+            "**nothing is drawn**, and every call around it still answers `VK_SUCCESS`",
+        ))
+    }
+
+    /// `vkCmdDrawIndexed`, forwarded. `vertex_offset` is signed, which is the one argument of the
+    /// six that is.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn cmd_draw_indexed(
+        &self,
+        buffer: HostCommandBuffer,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) -> AbiResult<()> {
+        let _ = (buffer, index_count, instance_count, first_index, vertex_offset, first_instance);
+        Err(host_has_no("VulkanHost::cmd_draw_indexed", "nothing is drawn"))
+    }
+
+    /// `vkCmdCopyBuffer`, forwarded. `regions` is the flat bytes,
+    /// [`BUFFER_COPY_BYTES`](super::BUFFER_COPY_BYTES) per entry — three `VkDeviceSize`s.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_copy_buffer(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostBuffer,
+        destination: HostBuffer,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, source, destination, regions);
+        Err(host_has_no(
+            "VulkanHost::cmd_copy_buffer",
+            "nothing is copied, so a staging upload never reaches device-local memory",
+        ))
+    }
+
+    /// `vkCmdCopyBufferToImage`, forwarded. `regions` is the flat bytes,
+    /// [`BUFFER_IMAGE_COPY_BYTES`](super::BUFFER_IMAGE_COPY_BYTES) per entry.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_copy_buffer_to_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostBuffer,
+        image: HostImageRef,
+        layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, source, image, layout, regions);
+        Err(host_has_no(
+            "VulkanHost::cmd_copy_buffer_to_image",
+            "the texture is never uploaded, and the draw that samples it samples whatever the \
+             driver left in that image",
+        ))
+    }
+
+    /// `vkCmdPushConstants`, forwarded. `values` is the guest's bytes, copied.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_push_constants(
+        &self,
+        buffer: HostCommandBuffer,
+        layout: HostPipelineLayout,
+        stage_flags: u32,
+        offset: u32,
+        values: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, layout, stage_flags, offset, values);
+        Err(host_has_no(
+            "VulkanHost::cmd_push_constants",
+            "the constants are not pushed, and the shader reads whatever was there",
         ))
     }
 }

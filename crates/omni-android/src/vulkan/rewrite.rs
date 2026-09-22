@@ -96,6 +96,86 @@ pub enum RewriteSite {
         /// The windowing system the `ANativeWindow *` resolved to.
         system: &'static str,
     },
+    /// `vkCreateDevice`: an extension the **guest did not ask for** was added to
+    /// `ppEnabledExtensionNames`, because this layer cannot satisfy Vulkan without it.
+    ///
+    /// # Why a layer adds an extension at all, which is the thing to be suspicious of
+    ///
+    /// Exactly one does: `VK_EXT_external_memory_host`. `vkMapMemory` has to answer with an
+    /// address inside `GuestSpace` — [`memory`](super::memory) carries the whole argument, and the
+    /// alternative is a driver pointer the guest stores through successfully until something far
+    /// away notices — and importing those pages needs that extension **enabled on the device**.
+    /// The engine asks for `VK_KHR_swapchain` and nothing else, so the device it receives is not
+    /// the device it described.
+    ///
+    /// That is a real divergence and it is recorded rather than reasoned away. What it costs the
+    /// guest is visible and small: an enabled extension it does not use changes no behaviour of
+    /// any command it does use, and a driver that does not have the extension is never asked for
+    /// it — the host answers with an empty list and the consequence appears as a
+    /// [`RewriteSite::MemoryType`] mask instead.
+    ///
+    /// [`Rewrite::from`] is the sentence that says it was not requested, so a log line reads as a
+    /// sentence rather than as an empty string.
+    DeviceExtensionAdded,
+    /// `vkGetPhysicalDeviceMemoryProperties`: one memory type's `propertyFlags` were **edited**
+    /// before the guest saw them, because this layer cannot back that type.
+    ///
+    /// # Why this is a rewrite and not an implementation detail
+    ///
+    /// Global Constraint 1, and it is the sharpest case of it in this project. An engine picks the
+    /// memory type it uploads every texture through by walking
+    /// `VkPhysicalDeviceMemoryProperties::memoryTypes` and matching property bits. If this layer
+    /// edits that array, **the engine is not choosing from the driver's list** — it is choosing
+    /// from one this layer wrote, and every consequence of that choice looks like a driver
+    /// property.
+    ///
+    /// What is edited and why is in [`memory`](super::memory): `vkMapMemory` can only answer with
+    /// an address inside `GuestSpace`, which needs `VK_EXT_external_memory_host`, and the
+    /// importable set is a **subset** of the host-visible set — `0xc` against `0x1c` on this
+    /// machine, the difference being the `DEVICE_LOCAL | HOST_VISIBLE` ReBAR type. So the
+    /// host-visible bits are cleared from the types that cannot be imported, and the alternative
+    /// was worse in both directions: leaving them would let the engine choose a type whose
+    /// `vkMapMemory` this layer must refuse one call later, and *removing* the entry would
+    /// renumber every index the guest afterwards passes to `vkAllocateMemory`.
+    ///
+    /// [`Rewrite::from`] and [`Rewrite::to`] are the flags as names, so a reader can see what the
+    /// guest lost; [`Rewrite::spec_version`] is `None`, because a memory type has no version.
+    MemoryType {
+        /// Which entry of `memoryTypes` was edited. **The driver's own index**, which is what the
+        /// guest will pass back as `memoryTypeIndex` — the rewrite changes bits and never order,
+        /// so the numbering stays the driver's.
+        index: u32,
+    },
+}
+
+/// `VkMemoryPropertyFlags` as the names the specification gives them, for a log a person reads.
+///
+/// Written out rather than printed as a hexadecimal mask because the whole point of a
+/// [`RewriteSite::MemoryType`] entry is that someone can see *what the guest was not told*:
+/// `0x7 -> 0x1` says nothing, and `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT -> DEVICE_LOCAL`
+/// says everything.
+#[must_use]
+pub fn memory_property_flags(flags: u32) -> String {
+    const NAMES: [(u32, &str); 6] = [
+        (0x01, "DEVICE_LOCAL"),
+        (0x02, "HOST_VISIBLE"),
+        (0x04, "HOST_COHERENT"),
+        (0x08, "HOST_CACHED"),
+        (0x10, "LAZILY_ALLOCATED"),
+        (0x20, "PROTECTED"),
+    ];
+    let named: Vec<&str> =
+        NAMES.iter().filter(|(bit, _)| flags & bit != 0).map(|(_, name)| *name).collect();
+    let known: u32 = NAMES.iter().map(|(bit, _)| bit).sum();
+    let rest = flags & !known;
+    match (named.is_empty(), rest) {
+        (true, 0) => "(no properties)".to_string(),
+        (true, rest) => format!("{rest:#x}"),
+        (false, 0) => named.join(" | "),
+        // An extension's bit this table does not know. Printed rather than dropped: a log that
+        // silently lost a property bit would be the defect this whole file exists to prevent.
+        (false, rest) => format!("{} | {rest:#x}", named.join(" | ")),
+    }
 }
 
 /// One name this layer changed, with both spellings and where it happened.
@@ -133,6 +213,12 @@ impl core::fmt::Display for Rewrite {
             }
             RewriteSite::SurfaceCall { system } => {
                 format!("satisfied on this host's {system} window by")
+            }
+            RewriteSite::MemoryType { index } => {
+                format!("memory type {index} shown to the guest as")
+            }
+            RewriteSite::DeviceExtensionAdded => {
+                "added to the device this layer created, as".to_string()
             }
         };
         write!(f, "[{order}] \"{from}\" {arrow} \"{to}\"", order = self.order, from = self.from, to = self.to)?;

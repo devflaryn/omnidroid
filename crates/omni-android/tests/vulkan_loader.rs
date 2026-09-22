@@ -541,7 +541,7 @@ fn calling_an_unimplemented_thunk_refuses_by_name_and_quotes_the_arguments() {
     assert!(text.contains("x0=0x1111"), "and what the guest passed: {text}");
     assert!(text.contains("x1=0x2222"), "{text}");
     assert!(text.contains("x2=0x3333"), "{text}");
-    assert!(text.contains("stage 4"), "and that this is not an implementation: {text}");
+    assert!(text.contains("stage 5"), "and that this is not an implementation: {text}");
     assert!(
         text.contains("no status code has been invented"),
         "and that it is not a plausible VK_SUCCESS: {text}"

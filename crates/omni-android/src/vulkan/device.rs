@@ -145,7 +145,30 @@ pub(super) fn create_device(
         }
     }
 
-    let request = decode_device_create_info(c, at, create_info_at)?;
+    let mut request = decode_device_create_info(c, at, create_info_at)?;
+
+    // **The second rewrite stage 5 needs, and it is an addition rather than a rename.**
+    //
+    // `vkMapMemory` can only hand the guest an address inside `GuestSpace` by importing those
+    // pages with `VK_EXT_external_memory_host` (see `memory`), and an extension can only be used
+    // on a device that **enabled** it. The engine asks for `VK_KHR_swapchain` and nothing else, so
+    // this layer adds the one it needs — which means the device the guest receives is not the
+    // device it described, and that is precisely the silent divergence Global Constraint 1 exists
+    // to forbid going unrecorded. `Vulkan::rewrites()` is where it is recorded, as
+    // `RewriteSite::DeviceExtensionAdded`, beside the extension renames and the surface call.
+    //
+    // The host is asked rather than told: a physical device without the extension answers with an
+    // empty list, nothing is added, `vkCreateDevice` still succeeds, and the consequence surfaces
+    // where it belongs — `vkGetPhysicalDeviceMemoryProperties` masks every host-visible type out
+    // of the list the guest chooses from, and `vkAllocateMemory` from one refuses by name.
+    for name in host.device_extensions_required_by_host(physical)? {
+        if request.extensions.contains(&name) {
+            continue;
+        }
+        vulkan.note_device_extension_added(&name, at.caller);
+        request.extensions.push(name);
+    }
+
     match host.create_device(physical, &request)? {
         DriverAnswer::Failed(result) => {
             vulkan.note_driver_result(CALL, result);

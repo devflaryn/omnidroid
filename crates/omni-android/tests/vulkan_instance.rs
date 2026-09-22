@@ -863,7 +863,7 @@ fn a_real_instance_resolves_through_the_driver_and_still_returns_guest_thunks() 
     // stage covers.
     let text = f.refusal(destroy, [instance, 0, 0, 0]).to_string();
     assert!(text.contains("vkDestroyInstance"), "{text}");
-    assert!(text.contains("stage 4"), "{text}");
+    assert!(text.contains("stage 5"), "the refusal names the stage it is: {text}");
     assert!(text.contains("Nothing has been"), "{text}");
 }
 

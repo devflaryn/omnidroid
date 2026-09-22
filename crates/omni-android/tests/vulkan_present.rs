@@ -55,21 +55,39 @@ use omni_android::bionic::Bionic;
 use omni_android::jni::Jni;
 use omni_android::ndk::{HostWindowSource, Ndk, WindowSource, SURFACE_CLASS};
 use omni_android::vulkan::{
-    Acquired, DeviceRequest, DriverAnswer, HostCommandBuffer, HostCommandPool, HostDevice,
-    HostExtension, HostFence, HostImage, HostImageRef, HostImageView, HostInstance,
-    HostPhysicalDevice, HostQueue, HostSemaphore, HostSurface, HostSwapchain, ImageViewRequest,
-    InstanceRequest, PipelineBarrier, PresentRequest, Presented, SubmitRequest, SurfaceCreated,
-    SwapchainRequest, Vulkan, VulkanHost, ANDROID_SURFACE_CREATE_INFO_BYTES,
+    Acquired, BufferRequest, DescriptorCopy, DescriptorSetLayoutRequest, DescriptorWrite,
+    DescriptorPoolRequest, DeviceRequest, DriverAnswer, GraphicsPipelineRequest, HostBuffer, HostCommandBuffer,
+    HostCommandPool, HostCreatedImage, HostDescriptorPool, HostDescriptorSet,
+    HostDescriptorSetLayout, HostDevice, HostDeviceMemory, HostExtension, HostFence, HostImage,
+    HostImageRef, HostImageView, HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache,
+    HostPipelineLayout, HostQueue, HostRenderPass, HostSampler, HostSemaphore, HostShaderModule,
+    HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
+    MemoryPlan, PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest,
+    Presented, RenderPassRequest, RewriteSite, SubmitRequest, SurfaceCreated, SwapchainRequest,
+    Vulkan, VulkanHost, ANDROID_SURFACE_CREATE_INFO_BYTES,
+    ATTACHMENT_DESCRIPTION_BYTES, ATTACHMENT_REFERENCE_BYTES, BUFFER_CREATE_INFO_BYTES,
+    BUFFER_IMAGE_COPY_BYTES, COLOR_BLEND_ATTACHMENT_BYTES, COLOR_BLEND_STATE_BYTES,
     COMMAND_BUFFER_ALLOCATE_INFO_BYTES, COMMAND_BUFFER_BEGIN_INFO_BYTES,
-    COMMAND_POOL_CREATE_INFO_BYTES, DEVICE_CREATE_INFO_BYTES, DEVICE_QUEUE_CREATE_INFO_BYTES,
-    GUEST_SURFACE_EXTENSION, IMAGE_MEMORY_BARRIER_BYTES,
-    IMAGE_SUBRESOURCE_RANGE_BYTES, IMAGE_VIEW_CREATE_INFO_BYTES, LOADER_ENTRY_POINT,
-    LOADER_SONAMES, PHYSICAL_DEVICE_FEATURES_BYTES, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES,
-    PHYSICAL_DEVICE_PROPERTIES_BYTES, PRESENT_INFO_BYTES, QUEUE_FAMILY_PROPERTIES_BYTES,
-    HANDLE_SLOT_BYTES, SEMAPHORE_CREATE_INFO_BYTES, STYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
-    STYPE_SWAPCHAIN_CREATE_INFO_KHR, SUBMIT_INFO_BYTES, SURFACE_CAPABILITIES_BYTES,
-    SURFACE_FORMAT_BYTES, SWAPCHAIN_CREATE_INFO_BYTES, VK_ERROR_OUT_OF_DATE_KHR, VK_INCOMPLETE,
-    VK_SUBOPTIMAL_KHR, VK_SUCCESS, VK_TIMEOUT,
+    COMMAND_POOL_CREATE_INFO_BYTES, DESCRIPTOR_IMAGE_INFO_BYTES, DESCRIPTOR_POOL_CREATE_INFO_BYTES,
+    DESCRIPTOR_POOL_SIZE_BYTES, DESCRIPTOR_SET_ALLOCATE_INFO_BYTES,
+    DESCRIPTOR_SET_LAYOUT_BINDING_BYTES, DESCRIPTOR_SET_LAYOUT_CREATE_INFO_BYTES,
+    DEVICE_CREATE_INFO_BYTES, DEVICE_QUEUE_CREATE_INFO_BYTES, DYNAMIC_STATE_CREATE_INFO_BYTES,
+    FRAMEBUFFER_CREATE_INFO_BYTES, GRAPHICS_PIPELINE_CREATE_INFO_BYTES, GUEST_SURFACE_EXTENSION,
+    IMAGE_CREATE_INFO_BYTES, IMAGE_MEMORY_BARRIER_BYTES, IMAGE_SUBRESOURCE_RANGE_BYTES,
+    IMAGE_VIEW_CREATE_INFO_BYTES, INPUT_ASSEMBLY_STATE_BYTES, LOADER_ENTRY_POINT, LOADER_SONAMES,
+    MEMORY_ALLOCATE_INFO_BYTES, MEMORY_REQUIREMENTS_BYTES, MULTISAMPLE_STATE_BYTES,
+    PHYSICAL_DEVICE_FEATURES_BYTES, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES,
+    PHYSICAL_DEVICE_PROPERTIES_BYTES, PIPELINE_LAYOUT_CREATE_INFO_BYTES,
+    PIPELINE_SHADER_STAGE_CREATE_INFO_BYTES, PRESENT_INFO_BYTES, QUEUE_FAMILY_PROPERTIES_BYTES,
+    RASTERIZATION_STATE_BODY_BYTES, RASTERIZATION_STATE_BYTES, RECT_2D_BYTES, RENDER_PASS_BEGIN_INFO_BYTES,
+    RENDER_PASS_CREATE_INFO_BYTES, HANDLE_SLOT_BYTES, SAMPLER_CREATE_INFO_BYTES,
+    SEMAPHORE_CREATE_INFO_BYTES, SHADER_MODULE_CREATE_INFO_BYTES,
+    STYPE_ANDROID_SURFACE_CREATE_INFO_KHR, STYPE_SWAPCHAIN_CREATE_INFO_KHR,
+    SUBMIT_INFO_BYTES, SUBPASS_DEPENDENCY_BYTES, SUBPASS_DESCRIPTION_BYTES,
+    SURFACE_CAPABILITIES_BYTES, SURFACE_FORMAT_BYTES, SWAPCHAIN_CREATE_INFO_BYTES,
+    VERTEX_INPUT_ATTRIBUTE_BYTES, VERTEX_INPUT_BINDING_BYTES, VERTEX_INPUT_STATE_BYTES,
+    VIEWPORT_STATE_BYTES, VK_ERROR_OUT_OF_DATE_KHR, VK_INCOMPLETE, VK_SUBOPTIMAL_KHR, VK_SUCCESS,
+    VK_TIMEOUT, VK_WHOLE_SIZE, WRITE_DESCRIPTOR_SET_BYTES,
 };
 use omni_android::{AbiError, AbiResult, Boundary};
 use omni_cpu::{ExitReason, GuestAddr};
@@ -171,6 +189,90 @@ const CLEAR_COLOUR: [f32; 4] = [0.2, 0.6, 0.8, 1.0];
 /// [`CLEAR_COLOUR`] as the eight-bit values a `UNORM` swapchain stores, in R, G, B, A order.
 const CLEAR_BYTES: [u8; 4] = [51, 153, 204, 255];
 
+
+// ======================================================= the SPIR-V the stage 5 live test draws
+//
+// **Assembled by hand, once, and embedded — because there is no shader compiler on this machine
+// and adding one is exactly what this project does not do.** `omni-gfx`'s own `lib.rs` records
+// that decision: no shaders, no `VkPipeline`, no SPIR-V, "and therefore no shader compiler in the
+// build". The shaders this project runs are the *guest's*; these two exist only so that a test can
+// prove the guest's would work, and they are checked by the thing that matters — an NVIDIA driver
+// compiling them, and the pixels that come out.
+//
+// The GLSL they correspond to, so a reader can check the modules against something:
+//
+// ```glsl
+// // vertex
+// #version 450
+// layout(location = 0) in vec2 inPos;
+// layout(location = 1) in vec2 inUV;
+// layout(location = 0) out vec2 outUV;
+// void main() { gl_Position = vec4(inPos, 0.0, 1.0); outUV = inUV; }
+//
+// // fragment
+// #version 450
+// layout(location = 0) in vec2 inUV;
+// layout(location = 0) out vec4 outColour;
+// layout(set = 0, binding = 0) uniform sampler2D tex;
+// void main() { outColour = texture(tex, inUV); }
+// ```
+//
+// SPIR-V 1.0, which every Vulkan 1.0 driver accepts, and **the same bytes on both sides of the
+// boundary**: the format is little-endian 32-bit words whose meaning the SPIR-V specification
+// fixes with no reference to a host, so nothing translates them and `vulkan::shader` says so.
+
+const TRIANGLE_VERT_SPIRV: [u32; 151] = [
+    0x07230203, 0x00010000, 0x00000000, 0x0000001b, 0x00000000, 0x00020011,
+    0x00000001, 0x0003000e, 0x00000000, 0x00000001, 0x0009000f, 0x00000000,
+    0x00000013, 0x6e69616d, 0x00000000, 0x00000008, 0x0000000c, 0x0000000d,
+    0x0000000f, 0x00050048, 0x00000006, 0x00000000, 0x0000000b, 0x00000000,
+    0x00030047, 0x00000006, 0x00000002, 0x00040047, 0x0000000c, 0x0000001e,
+    0x00000000, 0x00040047, 0x0000000d, 0x0000001e, 0x00000001, 0x00040047,
+    0x0000000f, 0x0000001e, 0x00000000, 0x00020013, 0x00000001, 0x00030021,
+    0x00000002, 0x00000001, 0x00030016, 0x00000003, 0x00000020, 0x00040017,
+    0x00000004, 0x00000003, 0x00000004, 0x00040017, 0x00000005, 0x00000003,
+    0x00000002, 0x0003001e, 0x00000006, 0x00000004, 0x00040020, 0x00000007,
+    0x00000003, 0x00000006, 0x0004003b, 0x00000007, 0x00000008, 0x00000003,
+    0x00040015, 0x00000009, 0x00000020, 0x00000001, 0x0004002b, 0x00000009,
+    0x0000000a, 0x00000000, 0x00040020, 0x0000000b, 0x00000001, 0x00000005,
+    0x0004003b, 0x0000000b, 0x0000000c, 0x00000001, 0x0004003b, 0x0000000b,
+    0x0000000d, 0x00000001, 0x00040020, 0x0000000e, 0x00000003, 0x00000005,
+    0x0004003b, 0x0000000e, 0x0000000f, 0x00000003, 0x0004002b, 0x00000003,
+    0x00000010, 0x00000000, 0x0004002b, 0x00000003, 0x00000011, 0x3f800000,
+    0x00040020, 0x00000012, 0x00000003, 0x00000004, 0x00050036, 0x00000001,
+    0x00000013, 0x00000000, 0x00000002, 0x000200f8, 0x00000014, 0x0004003d,
+    0x00000005, 0x00000015, 0x0000000c, 0x00050051, 0x00000003, 0x00000016,
+    0x00000015, 0x00000000, 0x00050051, 0x00000003, 0x00000017, 0x00000015,
+    0x00000001, 0x00070050, 0x00000004, 0x00000018, 0x00000016, 0x00000017,
+    0x00000010, 0x00000011, 0x00050041, 0x00000012, 0x00000019, 0x00000008,
+    0x0000000a, 0x0003003e, 0x00000019, 0x00000018, 0x0004003d, 0x00000005,
+    0x0000001a, 0x0000000d, 0x0003003e, 0x0000000f, 0x0000001a, 0x000100fd,
+    0x00010038,
+];
+
+const TRIANGLE_FRAG_SPIRV: [u32; 113] = [
+    0x07230203, 0x00010000, 0x00000000, 0x00000013, 0x00000000, 0x00020011,
+    0x00000001, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
+    0x0000000e, 0x6e69616d, 0x00000000, 0x00000007, 0x0000000d, 0x00030010,
+    0x0000000e, 0x00000007, 0x00040047, 0x00000007, 0x0000001e, 0x00000000,
+    0x00040047, 0x0000000d, 0x0000001e, 0x00000000, 0x00040047, 0x0000000b,
+    0x00000022, 0x00000000, 0x00040047, 0x0000000b, 0x00000021, 0x00000000,
+    0x00020013, 0x00000001, 0x00030021, 0x00000002, 0x00000001, 0x00030016,
+    0x00000003, 0x00000020, 0x00040017, 0x00000004, 0x00000003, 0x00000004,
+    0x00040017, 0x00000005, 0x00000003, 0x00000002, 0x00040020, 0x00000006,
+    0x00000003, 0x00000004, 0x0004003b, 0x00000006, 0x00000007, 0x00000003,
+    0x00090019, 0x00000008, 0x00000003, 0x00000001, 0x00000000, 0x00000000,
+    0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x00000009, 0x00000008,
+    0x00040020, 0x0000000a, 0x00000000, 0x00000009, 0x0004003b, 0x0000000a,
+    0x0000000b, 0x00000000, 0x00040020, 0x0000000c, 0x00000001, 0x00000005,
+    0x0004003b, 0x0000000c, 0x0000000d, 0x00000001, 0x00050036, 0x00000001,
+    0x0000000e, 0x00000000, 0x00000002, 0x000200f8, 0x0000000f, 0x0004003d,
+    0x00000009, 0x00000010, 0x0000000b, 0x0004003d, 0x00000005, 0x00000011,
+    0x0000000d, 0x00050057, 0x00000004, 0x00000012, 0x00000010, 0x00000011,
+    0x0003003e, 0x00000007, 0x00000012, 0x000100fd, 0x00010038,
+];
+
+
 /// Fail, naming the variable, if a live test was run without the opt-in.
 fn require_gate() {
     let set = std::env::var(GATE).is_ok_and(|v| v == "1");
@@ -207,6 +309,48 @@ struct HostLog {
     waits: Vec<(Vec<HostFence>, bool, u64)>,
     /// Destroy calls, by name, so a test can say what was and was not torn down.
     destroyed: Vec<String>,
+
+    // ---------------------------------------------------------------------------- stage 5
+    /// Every `vkAllocateMemory`, as the shim decoded it, with the token it was answered with —
+    /// **including whether it was imported**, which is the one fact the guest cannot see and the
+    /// whole of the memory decision.
+    allocations: Vec<(HostDeviceMemory, MemoryAllocation)>,
+    /// Every `vkCreateBuffer` request.
+    buffers: Vec<BufferRequest>,
+    /// Every `vkCreateImage` request.
+    images: Vec<ImageRequest>,
+    /// Every `vkCreateShaderModule`'s SPIR-V, byte for byte.
+    shader_code: Vec<Vec<u8>>,
+    /// Every `vkCreateRenderPass` request.
+    render_passes: Vec<RenderPassRequest>,
+    /// Every `vkCreateGraphicsPipelines` batch.
+    pipelines: Vec<Vec<GraphicsPipelineRequest>>,
+    /// Every `vkCreateDescriptorSetLayout` request.
+    set_layouts: Vec<DescriptorSetLayoutRequest>,
+    /// Which pool each allocated descriptor set came from.
+    sets: Vec<(HostDescriptorPool, HostDescriptorSet)>,
+    /// Every `vkUpdateDescriptorSets` write.
+    writes: Vec<DescriptorWrite>,
+    /// Every `vkCreateSampler`'s body bytes.
+    sampler_bodies: Vec<Vec<u8>>,
+}
+
+/// The measured memory table of this machine, which the double reports so that the rewrite is
+/// asserted against the arrangement it was designed for.
+///
+/// `docs/HANDOFF.md`: five types, of which `0xc` — types 2 and 3 — are importable, and type 4 is
+/// the `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` ReBAR one that is host-visible and **not**.
+const MEASURED_MEMORY_TYPES: [u32; 5] = [0x0, 0x1, 0x6, 0xe, 0x7];
+/// `vkGetMemoryHostPointerPropertiesEXT`'s measured answer on this machine.
+const MEASURED_IMPORTABLE: u32 = 0xc;
+
+/// A `VkMemoryRequirements` blob, for a double that has no driver to ask.
+fn requirements(size: u64, alignment: u64, type_bits: u32) -> Vec<u8> {
+    let mut bytes = vec![0u8; MEMORY_REQUIREMENTS_BYTES];
+    bytes[0..8].copy_from_slice(&size.to_le_bytes());
+    bytes[8..16].copy_from_slice(&alignment.to_le_bytes());
+    bytes[16..20].copy_from_slice(&type_bits.to_le_bytes());
+    bytes
 }
 
 /// A [`VulkanHost`] whose answers the test chooses. **Not a driver, and not guest-facing.**
@@ -218,6 +362,13 @@ struct StageFourHost {
     acquires: Mutex<VecDeque<Acquired>>,
     /// Scripted `vkQueuePresentKHR` answers. Empty means "success".
     presents: Mutex<VecDeque<Presented>>,
+    /// Scripted `vkCreateGraphicsPipelines` outcomes: one `bool` per create info, oldest batch
+    /// first. Empty means "every pipeline was created".
+    ///
+    /// **The only way to see a partial success.** No real driver can be asked to decline the
+    /// second of two pipelines on demand, and that case is the entire reason
+    /// `PipelinesCreated` is not a `DriverAnswer`.
+    pipelines: Mutex<VecDeque<Vec<bool>>>,
     /// How many of each object have been handed out, so tokens are distinct.
     next: Mutex<u64>,
     log: Mutex<HostLog>,
@@ -229,6 +380,7 @@ impl StageFourHost {
             images_per_swapchain: 3,
             acquires: Mutex::new(VecDeque::new()),
             presents: Mutex::new(VecDeque::new()),
+            pipelines: Mutex::new(VecDeque::new()),
             next: Mutex::new(1),
             log: Mutex::new(HostLog::default()),
         })
@@ -321,8 +473,18 @@ impl VulkanHost for StageFourHost {
         Ok(vec![family])
     }
 
+    /// **This machine's measured memory table**, so that the rewrite a test asserts on is the one
+    /// this stage was designed against rather than an invented arrangement.
     fn physical_device_memory_properties(&self, _d: HostPhysicalDevice) -> AbiResult<Vec<u8>> {
-        Ok(vec![0u8; PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES])
+        let mut bytes = vec![0u8; PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES];
+        bytes[0..4].copy_from_slice(&(MEASURED_MEMORY_TYPES.len() as u32).to_le_bytes());
+        for (index, flags) in MEASURED_MEMORY_TYPES.iter().enumerate() {
+            let at = 4 + index * 8;
+            bytes[at..at + 4].copy_from_slice(&flags.to_le_bytes());
+        }
+        bytes[260..264].copy_from_slice(&1u32.to_le_bytes());
+        bytes[264..272].copy_from_slice(&(8u64 << 30).to_le_bytes());
+        Ok(bytes)
     }
 
     fn surface_support(
@@ -390,11 +552,58 @@ impl VulkanHost for StageFourHost {
     }
 
     fn has_device_proc(&self, _device: HostDevice, name: &str) -> AbiResult<bool> {
-        // Every stage 4 name, and nothing else -- so a test that resolves one this stage does not
-        // implement gets the driver's NULL rather than a thunk.
+        // Every stage 4 and stage 5 name, and nothing else -- so a test that resolves one neither
+        // stage implements gets the driver's NULL rather than a thunk.
         Ok(matches!(
             name,
-            "vkCreateSwapchainKHR"
+            "vkAllocateMemory"
+                | "vkFreeMemory"
+                | "vkMapMemory"
+                | "vkUnmapMemory"
+                | "vkGetBufferMemoryRequirements"
+                | "vkGetImageMemoryRequirements"
+                | "vkBindBufferMemory"
+                | "vkBindImageMemory"
+                | "vkFlushMappedMemoryRanges"
+                | "vkInvalidateMappedMemoryRanges"
+                | "vkCreateBuffer"
+                | "vkDestroyBuffer"
+                | "vkCreateImage"
+                | "vkDestroyImage"
+                | "vkCreateSampler"
+                | "vkDestroySampler"
+                | "vkCreateShaderModule"
+                | "vkDestroyShaderModule"
+                | "vkCreatePipelineLayout"
+                | "vkDestroyPipelineLayout"
+                | "vkCreateRenderPass"
+                | "vkDestroyRenderPass"
+                | "vkCreateFramebuffer"
+                | "vkDestroyFramebuffer"
+                | "vkCreateGraphicsPipelines"
+                | "vkDestroyPipeline"
+                | "vkCreateDescriptorSetLayout"
+                | "vkDestroyDescriptorSetLayout"
+                | "vkCreateDescriptorPool"
+                | "vkDestroyDescriptorPool"
+                | "vkResetDescriptorPool"
+                | "vkAllocateDescriptorSets"
+                | "vkFreeDescriptorSets"
+                | "vkUpdateDescriptorSets"
+                | "vkCmdBeginRenderPass"
+                | "vkCmdEndRenderPass"
+                | "vkCmdBindPipeline"
+                | "vkCmdBindVertexBuffers"
+                | "vkCmdBindIndexBuffer"
+                | "vkCmdBindDescriptorSets"
+                | "vkCmdSetViewport"
+                | "vkCmdSetScissor"
+                | "vkCmdDraw"
+                | "vkCmdDrawIndexed"
+                | "vkCmdCopyBuffer"
+                | "vkCmdCopyBufferToImage"
+                | "vkCmdPushConstants"
+                | "vkCreateSwapchainKHR"
                 | "vkGetSwapchainImagesKHR"
                 | "vkDestroySwapchainKHR"
                 | "vkAcquireNextImageKHR"
@@ -618,6 +827,269 @@ impl VulkanHost for StageFourHost {
     ) -> AbiResult<DriverAnswer<()>> {
         self.log().submits.push((queue, submits.to_vec(), fence));
         Ok(DriverAnswer::Ok(()))
+    }
+
+
+    // ================================================================= stage 5 on the double
+    //
+    // Enough of stage 5 for the four properties **no real driver can be made to produce**: a
+    // host-visible memory type that cannot be imported into, a `vkMapMemory` on a forwarded
+    // allocation, a `vkCreateGraphicsPipelines` that partly fails, and a descriptor pool that
+    // takes its sets with it. Everything else about stage 5 is asserted live, against a real
+    // NVIDIA driver, further down this file.
+
+    /// The measured table of this machine, so the rewrite is asserted against the arrangement it
+    /// was designed for.
+    ///
+    /// `docs/HANDOFF.md`: five types, of which `0xc` — types 2 and 3 — are importable, and type 4
+    /// is the `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` ReBAR one that is host-visible and
+    /// **not** importable. That fifth type is the whole reason the memory-type rewrite exists.
+    fn importable_memory_types(&self, _device: HostPhysicalDevice) -> AbiResult<u32> {
+        Ok(MEASURED_IMPORTABLE)
+    }
+
+    fn memory_plan(&self, _device: HostDevice, memory_type_index: u32) -> AbiResult<MemoryPlan> {
+        let flags = *MEASURED_MEMORY_TYPES.get(memory_type_index as usize).ok_or_else(|| {
+            AbiError::Refused {
+                symbol: "StageFourHost::memory_plan".to_string(),
+                address: 0,
+                why: format!("memory type {memory_type_index} is past this double's five"),
+            }
+        })?;
+        Ok(MemoryPlan {
+            property_flags: flags,
+            importable: MEASURED_IMPORTABLE & (1 << memory_type_index) != 0,
+            import_alignment: 4096,
+        })
+    }
+
+    fn allocate_memory(
+        &self,
+        _device: HostDevice,
+        allocation: &MemoryAllocation,
+    ) -> AbiResult<DriverAnswer<HostDeviceMemory>> {
+        let token = self.token();
+        self.log().allocations.push((HostDeviceMemory::from_token(token), *allocation));
+        Ok(DriverAnswer::Ok(HostDeviceMemory::from_token(token)))
+    }
+
+    fn free_memory(&self, _memory: HostDeviceMemory) -> AbiResult<()> {
+        self.note("vkFreeMemory");
+        Ok(())
+    }
+
+    /// **The pointer that was imported, plus the offset** — which is what a real driver does with
+    /// `VK_EXT_external_memory_host` and what the shim checks its answer against.
+    ///
+    /// A forwarded allocation never reaches here: the shim refuses `vkMapMemory` on one before
+    /// asking, because there is no `GuestSpace` mapping behind it to answer with.
+    fn map_memory(
+        &self,
+        memory: HostDeviceMemory,
+        offset: u64,
+        _size: u64,
+        _flags: u32,
+    ) -> AbiResult<DriverAnswer<u64>> {
+        let imported = self
+            .log()
+            .allocations
+            .iter()
+            .find(|(token, _)| *token == memory)
+            .and_then(|(_, allocation)| allocation.host_pointer);
+        match imported {
+            Some(pointer) => Ok(DriverAnswer::Ok(pointer + offset)),
+            // Unreachable from a conforming shim: it refuses `vkMapMemory` on a forwarded
+            // allocation before asking. A code rather than a panic, so a shim that stopped
+            // refusing would show up as a failing assertion rather than as a crash in a double.
+            None => Ok(DriverAnswer::Failed(-1)),
+        }
+    }
+
+    fn unmap_memory(&self, _memory: HostDeviceMemory) -> AbiResult<()> {
+        Ok(())
+    }
+
+    fn create_buffer(
+        &self,
+        _device: HostDevice,
+        request: &BufferRequest,
+    ) -> AbiResult<DriverAnswer<HostBuffer>> {
+        self.log().buffers.push(request.clone());
+        Ok(DriverAnswer::Ok(HostBuffer::from_token(self.token())))
+    }
+
+    fn destroy_buffer(&self, _buffer: HostBuffer) -> AbiResult<()> {
+        self.note("vkDestroyBuffer");
+        Ok(())
+    }
+
+    fn create_image(
+        &self,
+        _device: HostDevice,
+        request: &ImageRequest,
+    ) -> AbiResult<DriverAnswer<HostCreatedImage>> {
+        self.log().images.push(request.clone());
+        Ok(DriverAnswer::Ok(HostCreatedImage::from_token(self.token())))
+    }
+
+    fn destroy_image(&self, _image: HostCreatedImage) -> AbiResult<()> {
+        self.note("vkDestroyImage");
+        Ok(())
+    }
+
+    fn buffer_memory_requirements(&self, _buffer: HostBuffer) -> AbiResult<Vec<u8>> {
+        Ok(requirements(256, 16, 0b1_1100))
+    }
+
+    fn image_memory_requirements(&self, _image: HostCreatedImage) -> AbiResult<Vec<u8>> {
+        Ok(requirements(4096, 256, 0b1_1111))
+    }
+
+    fn bind_buffer_memory(
+        &self,
+        _buffer: HostBuffer,
+        _memory: HostDeviceMemory,
+        _offset: u64,
+    ) -> AbiResult<DriverAnswer<()>> {
+        Ok(DriverAnswer::Ok(()))
+    }
+
+    fn bind_image_memory(
+        &self,
+        _image: HostCreatedImage,
+        _memory: HostDeviceMemory,
+        _offset: u64,
+    ) -> AbiResult<DriverAnswer<()>> {
+        Ok(DriverAnswer::Ok(()))
+    }
+
+    fn create_shader_module(
+        &self,
+        _device: HostDevice,
+        _flags: u32,
+        code: &[u8],
+    ) -> AbiResult<DriverAnswer<HostShaderModule>> {
+        self.log().shader_code.push(code.to_vec());
+        Ok(DriverAnswer::Ok(HostShaderModule::from_token(self.token())))
+    }
+
+    fn destroy_shader_module(&self, _module: HostShaderModule) -> AbiResult<()> {
+        self.note("vkDestroyShaderModule");
+        Ok(())
+    }
+
+    fn create_pipeline_layout(
+        &self,
+        _device: HostDevice,
+        _request: &PipelineLayoutRequest,
+    ) -> AbiResult<DriverAnswer<HostPipelineLayout>> {
+        Ok(DriverAnswer::Ok(HostPipelineLayout::from_token(self.token())))
+    }
+
+    fn create_render_pass(
+        &self,
+        _device: HostDevice,
+        request: &RenderPassRequest,
+    ) -> AbiResult<DriverAnswer<HostRenderPass>> {
+        self.log().render_passes.push(request.clone());
+        Ok(DriverAnswer::Ok(HostRenderPass::from_token(self.token())))
+    }
+
+    /// **The partial success**, scripted. See [`StageFourHost::pipelines`].
+    fn create_graphics_pipelines(
+        &self,
+        _device: HostDevice,
+        _cache: Option<HostPipelineCache>,
+        requests: &[GraphicsPipelineRequest],
+    ) -> AbiResult<PipelinesCreated> {
+        self.log().pipelines.push(requests.to_vec());
+        let scripted = self.pipelines.lock().expect("no panic holds this").pop_front();
+        match scripted {
+            Some(outcomes) => Ok(PipelinesCreated {
+                result: if outcomes.iter().all(|made| *made) { VK_SUCCESS } else { -2 },
+                pipelines: outcomes
+                    .iter()
+                    .map(|made| made.then(|| HostPipeline::from_token(self.token())))
+                    .collect(),
+            }),
+            None => Ok(PipelinesCreated {
+                result: VK_SUCCESS,
+                pipelines: requests
+                    .iter()
+                    .map(|_| Some(HostPipeline::from_token(self.token())))
+                    .collect(),
+            }),
+        }
+    }
+
+    fn destroy_pipeline(&self, _pipeline: HostPipeline) -> AbiResult<()> {
+        self.note("vkDestroyPipeline");
+        Ok(())
+    }
+
+    fn create_descriptor_set_layout(
+        &self,
+        _device: HostDevice,
+        request: &DescriptorSetLayoutRequest,
+    ) -> AbiResult<DriverAnswer<HostDescriptorSetLayout>> {
+        self.log().set_layouts.push(request.clone());
+        Ok(DriverAnswer::Ok(HostDescriptorSetLayout::from_token(self.token())))
+    }
+
+    fn create_descriptor_pool(
+        &self,
+        _device: HostDevice,
+        _request: &DescriptorPoolRequest,
+    ) -> AbiResult<DriverAnswer<HostDescriptorPool>> {
+        Ok(DriverAnswer::Ok(HostDescriptorPool::from_token(self.token())))
+    }
+
+    fn destroy_descriptor_pool(&self, pool: HostDescriptorPool) -> AbiResult<()> {
+        self.note("vkDestroyDescriptorPool");
+        self.log().sets.retain(|(owner, _)| *owner != pool);
+        Ok(())
+    }
+
+    fn descriptor_sets_of(&self, pool: HostDescriptorPool) -> AbiResult<Vec<HostDescriptorSet>> {
+        Ok(self
+            .log()
+            .sets
+            .iter()
+            .filter(|(owner, _)| *owner == pool)
+            .map(|(_, set)| *set)
+            .collect())
+    }
+
+    fn allocate_descriptor_sets(
+        &self,
+        pool: HostDescriptorPool,
+        layouts: &[HostDescriptorSetLayout],
+    ) -> AbiResult<DriverAnswer<Vec<HostDescriptorSet>>> {
+        let sets: Vec<HostDescriptorSet> =
+            layouts.iter().map(|_| HostDescriptorSet::from_token(self.token())).collect();
+        for set in &sets {
+            self.log().sets.push((pool, *set));
+        }
+        Ok(DriverAnswer::Ok(sets))
+    }
+
+    fn update_descriptor_sets(
+        &self,
+        _device: HostDevice,
+        writes: &[DescriptorWrite],
+        _copies: &[DescriptorCopy],
+    ) -> AbiResult<()> {
+        self.log().writes.extend_from_slice(writes);
+        Ok(())
+    }
+
+    fn create_sampler(
+        &self,
+        _device: HostDevice,
+        body: &[u8],
+    ) -> AbiResult<DriverAnswer<HostSampler>> {
+        self.log().sampler_bodies.push(body.to_vec());
+        Ok(DriverAnswer::Ok(HostSampler::from_token(self.token())))
     }
 
     fn queue_present(&self, _queue: HostQueue, present: &PresentRequest) -> AbiResult<Presented> {
@@ -1347,7 +1819,14 @@ fn swapchain_images_are_stable_across_calls_and_die_with_their_swapchain() {
     let view_out = up.f.alloc(8);
     let text = up.f.refusal(view, &[up.device, view_info, 0, view_out]).to_string();
     assert!(text.contains("`VkImage`"), "{text}");
-    assert!(text.contains("swapchain is destroyed"), "it says why it stopped being valid: {text}");
+    // **Stage 5 changed which refusal this is**, and the new one is the stronger statement: the
+    // handle is not in *either* image registry, because there are now two — a swapchain's and the
+    // guest's own `vkCreateImage` images — and a stale swapchain handle is in neither.
+    assert!(
+        text.contains("either** image family"),
+        "it says the handle is in neither registry: {text}"
+    );
+    assert!(text.contains("0 swapchain image(s)"), "and how many of each are real: {text}");
 
     // `VK_NULL_HANDLE` is the specified no-op and must not refuse.
     up.f.call(destroy, [up.device, 0, 0, 0]).expect("a null destroy is a no-op");
@@ -1547,11 +2026,19 @@ fn the_barriers_stacked_arguments_are_read_and_a_buffer_barrier_refuses() {
     assert_eq!(entry.subresource_range.len(), IMAGE_SUBRESOURCE_RANGE_BYTES);
     drop(log);
 
-    // **A buffer memory barrier refuses**, because stage 4 has no `VkBuffer` registry.
+    // **A buffer memory barrier still refuses, and the reason changed in stage 5.** Stage 4
+    // refused because there was no `VkBuffer` registry to resolve the handle through; there is
+    // one now, and what holds instead is D17 — nothing in this stage's path records one. The
+    // assertion is kept and rewritten rather than deleted, because a refusal whose *reason* has
+    // gone stale is the kind that stops meaning anything.
     let text = up.f.refusal(barrier, &[command, 1, 1, 0, 0, 0, 1, 0x9000, 0, 0]).to_string();
     assert!(text.contains("bufferMemoryBarrierCount = 1"), "{text}");
-    assert!(text.contains("no `VkBuffer` registry"), "{text}");
-    assert!(text.contains("stage 5"), "it says where buffers arrive: {text}");
+    assert!(text.contains("`VkBuffer` registry now"), "the old reason is gone: {text}");
+    assert!(text.contains("D17"), "and the one that holds is named: {text}");
+    assert!(
+        text.contains("Dropping the barrier is not the alternative"),
+        "and dropping it is still refused: {text}"
+    );
 
     // A `VkImage` the guest invented, inside the barrier the stack argument points at.
     let mut wild = image_barrier.clone();
@@ -2941,4 +3428,1868 @@ fn the_guest_cannot_take_a_window_omni_gfxs_renderer_already_owns() {
     f.call(destroy, [logical, swapchain, 0, 0]).expect("destroy the retired one");
     assert!(f.vulkan().swapchain_handles().is_empty());
     assert_eq!(host.stage_four_objects().swapchains, 0, "and the window is free again");
+}
+
+// ============================================== stage 5: the structures a textured draw needs
+
+/// `VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO`.
+const STYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
+/// `VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO`.
+const STYPE_GRAPHICS_PIPELINE_CREATE_INFO: u32 = 28;
+/// `VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO`.
+const STYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
+/// `VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO`.
+const STYPE_SAMPLER_CREATE_INFO: u32 = 31;
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO`.
+const STYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: u32 = 32;
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO`.
+const STYPE_DESCRIPTOR_POOL_CREATE_INFO: u32 = 33;
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO`.
+const STYPE_DESCRIPTOR_SET_ALLOCATE_INFO: u32 = 34;
+/// `VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET`.
+const STYPE_WRITE_DESCRIPTOR_SET: u32 = 35;
+/// `VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO`.
+const STYPE_FRAMEBUFFER_CREATE_INFO: u32 = 37;
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO`.
+const STYPE_RENDER_PASS_CREATE_INFO: u32 = 38;
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO`.
+const STYPE_RENDER_PASS_BEGIN_INFO: u32 = 43;
+/// `VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO`.
+const STYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
+/// `VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO`.
+const STYPE_BUFFER_CREATE_INFO: u32 = 12;
+/// `VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO`.
+const STYPE_IMAGE_CREATE_INFO: u32 = 14;
+
+/// `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`.
+const MEMORY_DEVICE_LOCAL: u32 = 0x1;
+/// `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`.
+const MEMORY_HOST_VISIBLE: u32 = 0x2;
+/// `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`.
+const MEMORY_HOST_COHERENT: u32 = 0x4;
+
+/// `VK_BUFFER_USAGE_TRANSFER_SRC_BIT`.
+const BUFFER_USAGE_TRANSFER_SRC: u32 = 0x1;
+/// `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT`.
+const BUFFER_USAGE_VERTEX: u32 = 0x80;
+/// `VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT`.
+const IMAGE_USAGE_TEXTURE: u32 = 0x2 | 0x4;
+/// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
+const LAYOUT_SHADER_READ_ONLY: u32 = 5;
+/// `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL`.
+const LAYOUT_COLOR_ATTACHMENT: u32 = 2;
+/// `VK_FORMAT_R8G8B8A8_UNORM` for the texture, and `VK_FORMAT_R32G32_SFLOAT` for a `vec2`.
+const FORMAT_R32G32_SFLOAT: u32 = 103;
+/// `VK_ACCESS_SHADER_READ_BIT`.
+const ACCESS_SHADER_READ: u32 = 0x20;
+/// `VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT`.
+const ACCESS_COLOR_ATTACHMENT_WRITE: u32 = 0x100;
+/// `VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT`.
+const STAGE_FRAGMENT_SHADER: u32 = 0x80;
+/// `VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT`.
+const STAGE_COLOR_ATTACHMENT_OUTPUT: u32 = 0x400;
+/// `VK_SHADER_STAGE_VERTEX_BIT` and `VK_SHADER_STAGE_FRAGMENT_BIT`.
+const SHADER_STAGE_VERTEX: u32 = 0x1;
+/// `VK_SHADER_STAGE_FRAGMENT_BIT`.
+const SHADER_STAGE_FRAGMENT: u32 = 0x10;
+/// `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`.
+const DESCRIPTOR_COMBINED_IMAGE_SAMPLER: u32 = 1;
+/// `VK_PIPELINE_BIND_POINT_GRAPHICS`.
+const BIND_POINT_GRAPHICS: u32 = 0;
+/// `VK_DYNAMIC_STATE_VIEWPORT` and `VK_DYNAMIC_STATE_SCISSOR`.
+const DYNAMIC_STATE_VIEWPORT: u32 = 0;
+/// `VK_DYNAMIC_STATE_SCISSOR`.
+const DYNAMIC_STATE_SCISSOR: u32 = 1;
+/// `VK_ATTACHMENT_LOAD_OP_CLEAR`, `VK_ATTACHMENT_STORE_OP_STORE`,
+/// `VK_ATTACHMENT_LOAD_OP_DONT_CARE`, `VK_ATTACHMENT_STORE_OP_DONT_CARE`.
+const LOAD_OP_CLEAR: u32 = 1;
+/// `VK_ATTACHMENT_STORE_OP_STORE`.
+const STORE_OP_STORE: u32 = 0;
+/// `VK_ATTACHMENT_LOAD_OP_DONT_CARE`.
+const LOAD_OP_DONT_CARE: u32 = 2;
+/// `VK_ATTACHMENT_STORE_OP_DONT_CARE`.
+const STORE_OP_DONT_CARE: u32 = 1;
+/// `VK_SUBPASS_EXTERNAL`.
+const SUBPASS_EXTERNAL: u32 = 0xFFFF_FFFF;
+/// `VK_SAMPLE_COUNT_1_BIT`.
+const SAMPLE_COUNT_1: u32 = 1;
+/// `VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST`.
+const TOPOLOGY_TRIANGLE_LIST: u32 = 3;
+/// `VK_COLOR_COMPONENT_R|G|B|A_BIT`.
+const COLOR_COMPONENT_RGBA: u32 = 0xF;
+/// `VK_SUBPASS_CONTENTS_INLINE`.
+const SUBPASS_CONTENTS_INLINE: u32 = 0;
+/// `VK_FILTER_NEAREST` and `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE`.
+const FILTER_NEAREST: u32 = 0;
+/// `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE`.
+const ADDRESS_MODE_CLAMP_TO_EDGE: u32 = 2;
+
+/// **The four texels of the 2×2 texture the triangle samples, and the whole of what the live
+/// test asserts.**
+///
+/// Four colours, all different from each other, none equal to the render pass's clear colour, and
+/// none of them 0 or 0xFF in more than one channel. That combination is what makes the assertion
+/// unforgeable in three separate ways at once:
+///
+/// * a frame that was **not drawn** shows the clear colour, which is none of these;
+/// * a texture that was **not uploaded** shows whatever the driver left in the image, which would
+///   have to be these four exact colours in these four exact places by coincidence;
+/// * a **UV mapping that is flipped or transposed** shows these four colours in the wrong
+///   quadrants, which a single-colour texture could never catch.
+///
+/// Row-major, so index 0 is the top-left texel and index 3 the bottom-right — and because the
+/// fullscreen triangle maps `u` and `v` across the whole viewport with `OriginUpperLeft`, that is
+/// also the order the four screen quadrants must show them in.
+const TEXELS: [[u8; 4]; 4] = [
+    [32, 96, 160, 255],   // top-left
+    [16, 176, 64, 255],   // top-right
+    [200, 48, 16, 255],   // bottom-left
+    [240, 224, 80, 255],  // bottom-right
+];
+
+/// What the render pass clears to before the draw. **Deliberately none of [`TEXELS`]**, so that a
+/// frame that cleared and did not draw fails the assertion rather than passing it.
+const DRAW_CLEAR_COLOUR: [f32; 4] = [0.4, 0.0, 0.4, 1.0];
+/// [`DRAW_CLEAR_COLOUR`] as the eight-bit values a `UNORM` swapchain stores.
+const DRAW_CLEAR_BYTES: [u8; 4] = [102, 0, 102, 255];
+
+/// **The fullscreen triangle, as the sixteen bytes per vertex the pipeline declares.**
+///
+/// `(-1,-1), (3,-1), (-1,3)` with `(0,0), (2,0), (0,2)`: the standard oversized triangle, whose
+/// intersection with the `[-1,1]²` clip rectangle is the whole viewport and across which `u` and
+/// `v` interpolate to exactly `0..1` over the visible part — at `x = 1`, the right edge, `t` is
+/// `(1 − −1)/(3 − −1) = 0.5` and `u` is `0 + 0.5 × 2 = 1`.
+///
+/// One triangle rather than two, because the evidence this stage owes is *a triangle*, and a
+/// fullscreen one is the shape that lets four quadrants be asserted from three vertices.
+fn triangle_vertices() -> Vec<u8> {
+    let vertices: [[f32; 4]; 3] =
+        [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]];
+    vertices.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect()
+}
+
+impl Fixture {
+    // ------------------------------------------------------- stage 5's structures, in memory
+
+    /// A `VkMemoryAllocateInfo`.
+    fn memory_allocate_info(&self, size: u64, type_index: u32) -> u64 {
+        let mut bytes = vec![0u8; MEMORY_ALLOCATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_MEMORY_ALLOCATE_INFO.to_le_bytes());
+        bytes[16..24].copy_from_slice(&size.to_le_bytes());
+        bytes[24..28].copy_from_slice(&type_index.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkBufferCreateInfo` with `VK_SHARING_MODE_EXCLUSIVE`.
+    fn buffer_info(&self, size: u64, usage: u32) -> u64 {
+        let mut bytes = vec![0u8; BUFFER_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_BUFFER_CREATE_INFO.to_le_bytes());
+        bytes[24..32].copy_from_slice(&size.to_le_bytes());
+        bytes[32..36].copy_from_slice(&usage.to_le_bytes());
+        bytes[36..40].copy_from_slice(&SHARING_EXCLUSIVE.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkImageCreateInfo` for a 2D, single-mip, single-layer, optimally tiled texture.
+    fn image_info(&self, width: u32, height: u32, format: u32, usage: u32) -> u64 {
+        let mut bytes = vec![0u8; IMAGE_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_IMAGE_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // VK_IMAGE_TYPE_2D
+        bytes[24..28].copy_from_slice(&format.to_le_bytes());
+        bytes[28..32].copy_from_slice(&width.to_le_bytes());
+        bytes[32..36].copy_from_slice(&height.to_le_bytes());
+        bytes[36..40].copy_from_slice(&1u32.to_le_bytes()); // depth
+        bytes[40..44].copy_from_slice(&1u32.to_le_bytes()); // mipLevels
+        bytes[44..48].copy_from_slice(&1u32.to_le_bytes()); // arrayLayers
+        bytes[48..52].copy_from_slice(&SAMPLE_COUNT_1.to_le_bytes());
+        bytes[52..56].copy_from_slice(&0u32.to_le_bytes()); // VK_IMAGE_TILING_OPTIMAL
+        bytes[56..60].copy_from_slice(&usage.to_le_bytes());
+        bytes[60..64].copy_from_slice(&SHARING_EXCLUSIVE.to_le_bytes());
+        bytes[80..84].copy_from_slice(&LAYOUT_UNDEFINED.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkSamplerCreateInfo`: nearest, clamped, no anisotropy, no comparison.
+    ///
+    /// **Nearest and clamped on purpose.** Linear filtering between two of [`TEXELS`] would make
+    /// the asserted pixel a blend whose exact value depends on the driver's rounding, and the
+    /// whole point of the assertion is that it is exact.
+    fn sampler_info(&self) -> u64 {
+        let mut bytes = vec![0u8; SAMPLER_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_SAMPLER_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&FILTER_NEAREST.to_le_bytes()); // magFilter
+        bytes[24..28].copy_from_slice(&FILTER_NEAREST.to_le_bytes()); // minFilter
+        bytes[32..36].copy_from_slice(&ADDRESS_MODE_CLAMP_TO_EDGE.to_le_bytes()); // U
+        bytes[36..40].copy_from_slice(&ADDRESS_MODE_CLAMP_TO_EDGE.to_le_bytes()); // V
+        bytes[40..44].copy_from_slice(&ADDRESS_MODE_CLAMP_TO_EDGE.to_le_bytes()); // W
+        self.bytes(&bytes)
+    }
+
+    /// A `VkShaderModuleCreateInfo` over SPIR-V words already written into guest memory.
+    fn shader_module_info(&self, code: &[u32]) -> u64 {
+        let words: Vec<u8> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let code_at = self.bytes(&words);
+        let mut bytes = vec![0u8; SHADER_MODULE_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_SHADER_MODULE_CREATE_INFO.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(words.len() as u64).to_le_bytes());
+        bytes[32..40].copy_from_slice(&code_at.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkDescriptorSetLayoutCreateInfo` with one combined image sampler at binding 0.
+    fn descriptor_set_layout_info(&self) -> u64 {
+        let mut binding = vec![0u8; DESCRIPTOR_SET_LAYOUT_BINDING_BYTES];
+        binding[0..4].copy_from_slice(&0u32.to_le_bytes()); // binding
+        binding[4..8].copy_from_slice(&DESCRIPTOR_COMBINED_IMAGE_SAMPLER.to_le_bytes());
+        binding[8..12].copy_from_slice(&1u32.to_le_bytes()); // descriptorCount
+        binding[12..16].copy_from_slice(&SHADER_STAGE_FRAGMENT.to_le_bytes());
+        let bindings = self.bytes(&binding);
+
+        let mut bytes = vec![0u8; DESCRIPTOR_SET_LAYOUT_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&bindings.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkDescriptorPoolCreateInfo` for one set with one combined image sampler.
+    fn descriptor_pool_info(&self) -> u64 {
+        let mut size = vec![0u8; DESCRIPTOR_POOL_SIZE_BYTES];
+        size[0..4].copy_from_slice(&DESCRIPTOR_COMBINED_IMAGE_SAMPLER.to_le_bytes());
+        size[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let sizes = self.bytes(&size);
+
+        let mut bytes = vec![0u8; DESCRIPTOR_POOL_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_DESCRIPTOR_POOL_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // maxSets
+        bytes[24..28].copy_from_slice(&1u32.to_le_bytes()); // poolSizeCount
+        bytes[32..40].copy_from_slice(&sizes.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkDescriptorSetAllocateInfo` for one set of one layout.
+    fn descriptor_set_allocate_info(&self, pool: u64, layout: u64) -> u64 {
+        let layouts = self.u64_array(&[layout]);
+        let mut bytes = vec![0u8; DESCRIPTOR_SET_ALLOCATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_DESCRIPTOR_SET_ALLOCATE_INFO.to_le_bytes());
+        bytes[16..24].copy_from_slice(&pool.to_le_bytes());
+        bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&layouts.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkWriteDescriptorSet` for one combined image sampler.
+    fn write_descriptor_set(&self, set: u64, sampler: u64, view: u64) -> u64 {
+        let mut image_info = vec![0u8; DESCRIPTOR_IMAGE_INFO_BYTES];
+        image_info[0..8].copy_from_slice(&sampler.to_le_bytes());
+        image_info[8..16].copy_from_slice(&view.to_le_bytes());
+        image_info[16..20].copy_from_slice(&LAYOUT_SHADER_READ_ONLY.to_le_bytes());
+        let images = self.bytes(&image_info);
+
+        let mut bytes = vec![0u8; WRITE_DESCRIPTOR_SET_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_WRITE_DESCRIPTOR_SET.to_le_bytes());
+        bytes[16..24].copy_from_slice(&set.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0u32.to_le_bytes()); // dstBinding
+        bytes[28..32].copy_from_slice(&0u32.to_le_bytes()); // dstArrayElement
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes()); // descriptorCount
+        bytes[36..40].copy_from_slice(&DESCRIPTOR_COMBINED_IMAGE_SAMPLER.to_le_bytes());
+        bytes[40..48].copy_from_slice(&images.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkPipelineLayoutCreateInfo` with one set layout and no push constants.
+    fn pipeline_layout_info(&self, set_layout: u64) -> u64 {
+        let layouts = self.u64_array(&[set_layout]);
+        let mut bytes = vec![0u8; PIPELINE_LAYOUT_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_PIPELINE_LAYOUT_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&layouts.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkRenderPassCreateInfo` with one colour attachment that is cleared and then presented.
+    fn render_pass_info(&self, format: u32) -> u64 {
+        let mut attachment = vec![0u8; ATTACHMENT_DESCRIPTION_BYTES];
+        attachment[4..8].copy_from_slice(&format.to_le_bytes());
+        attachment[8..12].copy_from_slice(&SAMPLE_COUNT_1.to_le_bytes());
+        attachment[12..16].copy_from_slice(&LOAD_OP_CLEAR.to_le_bytes());
+        attachment[16..20].copy_from_slice(&STORE_OP_STORE.to_le_bytes());
+        attachment[20..24].copy_from_slice(&LOAD_OP_DONT_CARE.to_le_bytes()); // stencilLoadOp
+        attachment[24..28].copy_from_slice(&STORE_OP_DONT_CARE.to_le_bytes()); // stencilStoreOp
+        attachment[28..32].copy_from_slice(&LAYOUT_UNDEFINED.to_le_bytes());
+        attachment[32..36].copy_from_slice(&LAYOUT_PRESENT_SRC.to_le_bytes());
+        let attachments = self.bytes(&attachment);
+
+        let mut reference = vec![0u8; ATTACHMENT_REFERENCE_BYTES];
+        reference[0..4].copy_from_slice(&0u32.to_le_bytes()); // attachment 0
+        reference[4..8].copy_from_slice(&LAYOUT_COLOR_ATTACHMENT.to_le_bytes());
+        let references = self.bytes(&reference);
+
+        let mut subpass = vec![0u8; SUBPASS_DESCRIPTION_BYTES];
+        subpass[4..8].copy_from_slice(&BIND_POINT_GRAPHICS.to_le_bytes());
+        subpass[24..28].copy_from_slice(&1u32.to_le_bytes()); // colorAttachmentCount
+        subpass[32..40].copy_from_slice(&references.to_le_bytes());
+        let subpasses = self.bytes(&subpass);
+
+        // One external dependency, which is what orders the colour write against the acquire.
+        let mut dependency = vec![0u8; SUBPASS_DEPENDENCY_BYTES];
+        dependency[0..4].copy_from_slice(&SUBPASS_EXTERNAL.to_le_bytes());
+        dependency[4..8].copy_from_slice(&0u32.to_le_bytes());
+        dependency[8..12].copy_from_slice(&STAGE_COLOR_ATTACHMENT_OUTPUT.to_le_bytes());
+        dependency[12..16].copy_from_slice(&STAGE_COLOR_ATTACHMENT_OUTPUT.to_le_bytes());
+        dependency[16..20].copy_from_slice(&0u32.to_le_bytes());
+        dependency[20..24].copy_from_slice(&ACCESS_COLOR_ATTACHMENT_WRITE.to_le_bytes());
+        let dependencies = self.bytes(&dependency);
+
+        let mut bytes = vec![0u8; RENDER_PASS_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_RENDER_PASS_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&attachments.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&subpasses.to_le_bytes());
+        bytes[48..52].copy_from_slice(&1u32.to_le_bytes());
+        bytes[56..64].copy_from_slice(&dependencies.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkFramebufferCreateInfo` over one view.
+    fn framebuffer_info(&self, pass: u64, view: u64, width: u32, height: u32) -> u64 {
+        let attachments = self.u64_array(&[view]);
+        let mut bytes = vec![0u8; FRAMEBUFFER_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_FRAMEBUFFER_CREATE_INFO.to_le_bytes());
+        bytes[24..32].copy_from_slice(&pass.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&attachments.to_le_bytes());
+        bytes[48..52].copy_from_slice(&width.to_le_bytes());
+        bytes[52..56].copy_from_slice(&height.to_le_bytes());
+        bytes[56..60].copy_from_slice(&1u32.to_le_bytes()); // layers
+        self.bytes(&bytes)
+    }
+
+    /// A `VkRenderPassBeginInfo` covering the whole framebuffer, with one clear value.
+    fn render_pass_begin_info(
+        &self,
+        pass: u64,
+        framebuffer: u64,
+        width: u32,
+        height: u32,
+        clear: [f32; 4],
+    ) -> u64 {
+        let clear_bytes: Vec<u8> = clear.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let clears = self.bytes(&clear_bytes);
+        let mut bytes = vec![0u8; RENDER_PASS_BEGIN_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_RENDER_PASS_BEGIN_INFO.to_le_bytes());
+        bytes[16..24].copy_from_slice(&pass.to_le_bytes());
+        bytes[24..32].copy_from_slice(&framebuffer.to_le_bytes());
+        // renderArea: offset (0,0), extent (width, height)
+        bytes[40..44].copy_from_slice(&width.to_le_bytes());
+        bytes[44..48].copy_from_slice(&height.to_le_bytes());
+        bytes[48..52].copy_from_slice(&1u32.to_le_bytes()); // clearValueCount
+        bytes[56..64].copy_from_slice(&clears.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkViewport` covering the whole framebuffer, and a `VkRect2D` that does the same.
+    fn viewport_and_scissor(&self, width: u32, height: u32) -> (u64, u64) {
+        let viewport: Vec<u8> = [0.0f32, 0.0, width as f32, height as f32, 0.0, 1.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let mut scissor = vec![0u8; RECT_2D_BYTES];
+        scissor[8..12].copy_from_slice(&width.to_le_bytes());
+        scissor[12..16].copy_from_slice(&height.to_le_bytes());
+        (self.bytes(&viewport), self.bytes(&scissor))
+    }
+
+    /// A `VkBufferImageCopy` for the whole of a 2D, single-mip, single-layer image.
+    fn buffer_image_copy(&self, width: u32, height: u32) -> u64 {
+        let mut bytes = vec![0u8; BUFFER_IMAGE_COPY_BYTES];
+        // bufferOffset 0, bufferRowLength 0 and bufferImageHeight 0 mean "tightly packed".
+        bytes[16..20].copy_from_slice(&ASPECT_COLOR.to_le_bytes());
+        bytes[20..24].copy_from_slice(&0u32.to_le_bytes()); // mipLevel
+        bytes[24..28].copy_from_slice(&0u32.to_le_bytes()); // baseArrayLayer
+        bytes[28..32].copy_from_slice(&1u32.to_le_bytes()); // layerCount
+        bytes[44..48].copy_from_slice(&width.to_le_bytes());
+        bytes[48..52].copy_from_slice(&height.to_le_bytes());
+        bytes[52..56].copy_from_slice(&1u32.to_le_bytes()); // depth
+        self.bytes(&bytes)
+    }
+
+    /// **The whole `VkGraphicsPipelineCreateInfo`, with all nine sub-states present.**
+    ///
+    /// The one that is deliberately *not* filled is `pViewports`/`pScissors`: the pipeline names
+    /// `VK_DYNAMIC_STATE_VIEWPORT` and `_SCISSOR`, which is the case where the counts and the
+    /// arrays legitimately disagree — `viewportCount` must still be 1 while the array is NULL.
+    /// That is exactly the property `ViewportState` keeps the two apart for, and a shim that
+    /// derived the count from the array would build a pipeline with no viewport at all.
+    fn graphics_pipeline_info(
+        &self,
+        layout: u64,
+        pass: u64,
+        vertex_module: u64,
+        fragment_module: u64,
+    ) -> u64 {
+        let entry = self.cstr("main");
+        let mut stages = Vec::new();
+        for (stage, module) in
+            [(SHADER_STAGE_VERTEX, vertex_module), (SHADER_STAGE_FRAGMENT, fragment_module)]
+        {
+            let mut bytes = vec![0u8; PIPELINE_SHADER_STAGE_CREATE_INFO_BYTES];
+            bytes[0..4].copy_from_slice(&18u32.to_le_bytes()); // PIPELINE_SHADER_STAGE_CREATE_INFO
+            bytes[20..24].copy_from_slice(&stage.to_le_bytes());
+            bytes[24..32].copy_from_slice(&module.to_le_bytes());
+            bytes[32..40].copy_from_slice(&entry.to_le_bytes());
+            stages.extend_from_slice(&bytes);
+        }
+        let stages_at = self.bytes(&stages);
+
+        // One binding of sixteen bytes: a `vec2` position and a `vec2` texture coordinate.
+        let mut binding = vec![0u8; VERTEX_INPUT_BINDING_BYTES];
+        binding[0..4].copy_from_slice(&0u32.to_le_bytes()); // binding
+        binding[4..8].copy_from_slice(&16u32.to_le_bytes()); // stride
+        binding[8..12].copy_from_slice(&0u32.to_le_bytes()); // VK_VERTEX_INPUT_RATE_VERTEX
+        let bindings_at = self.bytes(&binding);
+
+        let mut attributes = Vec::new();
+        for (location, offset) in [(0u32, 0u32), (1, 8)] {
+            let mut bytes = vec![0u8; VERTEX_INPUT_ATTRIBUTE_BYTES];
+            bytes[0..4].copy_from_slice(&location.to_le_bytes());
+            bytes[4..8].copy_from_slice(&0u32.to_le_bytes()); // binding
+            bytes[8..12].copy_from_slice(&FORMAT_R32G32_SFLOAT.to_le_bytes());
+            bytes[12..16].copy_from_slice(&offset.to_le_bytes());
+            attributes.extend_from_slice(&bytes);
+        }
+        let attributes_at = self.bytes(&attributes);
+
+        let mut vertex_input = vec![0u8; VERTEX_INPUT_STATE_BYTES];
+        vertex_input[0..4].copy_from_slice(&19u32.to_le_bytes());
+        vertex_input[20..24].copy_from_slice(&1u32.to_le_bytes());
+        vertex_input[24..32].copy_from_slice(&bindings_at.to_le_bytes());
+        vertex_input[32..36].copy_from_slice(&2u32.to_le_bytes());
+        vertex_input[40..48].copy_from_slice(&attributes_at.to_le_bytes());
+        let vertex_input_at = self.bytes(&vertex_input);
+
+        let mut assembly = vec![0u8; INPUT_ASSEMBLY_STATE_BYTES];
+        assembly[0..4].copy_from_slice(&20u32.to_le_bytes());
+        assembly[20..24].copy_from_slice(&TOPOLOGY_TRIANGLE_LIST.to_le_bytes());
+        let assembly_at = self.bytes(&assembly);
+
+        // **Counts without arrays**, which is what the dynamic states below make legal.
+        let mut viewport = vec![0u8; VIEWPORT_STATE_BYTES];
+        viewport[0..4].copy_from_slice(&22u32.to_le_bytes());
+        viewport[20..24].copy_from_slice(&1u32.to_le_bytes()); // viewportCount
+        viewport[32..36].copy_from_slice(&1u32.to_le_bytes()); // scissorCount
+        let viewport_at = self.bytes(&viewport);
+
+        let mut rasterization = vec![0u8; RASTERIZATION_STATE_BYTES];
+        rasterization[0..4].copy_from_slice(&23u32.to_le_bytes());
+        rasterization[28..32].copy_from_slice(&0u32.to_le_bytes()); // VK_POLYGON_MODE_FILL
+        rasterization[32..36].copy_from_slice(&0u32.to_le_bytes()); // VK_CULL_MODE_NONE
+        rasterization[36..40].copy_from_slice(&0u32.to_le_bytes()); // COUNTER_CLOCKWISE
+        rasterization[56..60].copy_from_slice(&1.0f32.to_le_bytes()); // lineWidth
+        let rasterization_at = self.bytes(&rasterization);
+
+        let mut multisample = vec![0u8; MULTISAMPLE_STATE_BYTES];
+        multisample[0..4].copy_from_slice(&24u32.to_le_bytes());
+        multisample[20..24].copy_from_slice(&SAMPLE_COUNT_1.to_le_bytes());
+        let multisample_at = self.bytes(&multisample);
+
+        let mut blend_attachment = vec![0u8; COLOR_BLEND_ATTACHMENT_BYTES];
+        blend_attachment[0..4].copy_from_slice(&0u32.to_le_bytes()); // blendEnable = VK_FALSE
+        blend_attachment[28..32].copy_from_slice(&COLOR_COMPONENT_RGBA.to_le_bytes());
+        let blend_attachments_at = self.bytes(&blend_attachment);
+
+        let mut blend = vec![0u8; COLOR_BLEND_STATE_BYTES];
+        blend[0..4].copy_from_slice(&26u32.to_le_bytes());
+        blend[28..32].copy_from_slice(&1u32.to_le_bytes()); // attachmentCount
+        blend[32..40].copy_from_slice(&blend_attachments_at.to_le_bytes());
+        let blend_at = self.bytes(&blend);
+
+        let states = self.u32_array(&[DYNAMIC_STATE_VIEWPORT, DYNAMIC_STATE_SCISSOR]);
+        let mut dynamic = vec![0u8; DYNAMIC_STATE_CREATE_INFO_BYTES];
+        dynamic[0..4].copy_from_slice(&27u32.to_le_bytes());
+        dynamic[20..24].copy_from_slice(&2u32.to_le_bytes());
+        dynamic[24..32].copy_from_slice(&states.to_le_bytes());
+        let dynamic_at = self.bytes(&dynamic);
+
+        let mut bytes = vec![0u8; GRAPHICS_PIPELINE_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_GRAPHICS_PIPELINE_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&2u32.to_le_bytes()); // stageCount
+        bytes[24..32].copy_from_slice(&stages_at.to_le_bytes());
+        bytes[32..40].copy_from_slice(&vertex_input_at.to_le_bytes());
+        bytes[40..48].copy_from_slice(&assembly_at.to_le_bytes());
+        // pTessellationState stays NULL, which is legal with no tessellation stages.
+        bytes[56..64].copy_from_slice(&viewport_at.to_le_bytes());
+        bytes[64..72].copy_from_slice(&rasterization_at.to_le_bytes());
+        bytes[72..80].copy_from_slice(&multisample_at.to_le_bytes());
+        // pDepthStencilState stays NULL: the render pass has no depth attachment.
+        bytes[88..96].copy_from_slice(&blend_at.to_le_bytes());
+        bytes[96..104].copy_from_slice(&dynamic_at.to_le_bytes());
+        bytes[104..112].copy_from_slice(&layout.to_le_bytes());
+        bytes[112..120].copy_from_slice(&pass.to_le_bytes());
+        bytes[120..124].copy_from_slice(&0u32.to_le_bytes()); // subpass
+        bytes[136..140].copy_from_slice(&(-1i32).to_le_bytes()); // basePipelineIndex
+        self.bytes(&bytes)
+    }
+
+    /// The `memoryTypeIndex` of the first type that is in `type_bits` and has every bit of
+    /// `required`, **read out of the list the guest was shown**.
+    ///
+    /// That last clause is the point: the list has been through
+    /// `physical::mask_memory_types`, so a type whose host-visible bits this layer cleared is one
+    /// this search will not find — which is how a conforming engine is steered away from a type
+    /// `vkMapMemory` would have to refuse.
+    fn memory_type_index(&self, properties: &[u8], type_bits: u32, required: u32) -> Option<u32> {
+        let count = u32::from_le_bytes(properties[0..4].try_into().expect("four"));
+        (0..count).find(|index| {
+            let at = 4 + *index as usize * 8;
+            let flags = u32::from_le_bytes(properties[at..at + 4].try_into().expect("four"));
+            type_bits & (1 << index) != 0 && flags & required == required
+        })
+    }
+}
+
+
+// ===================================== stage 5 against the double: the four unmakeable cases
+//
+// The live test further up is the evidence that a textured triangle reaches the screen. These are
+// the properties it **cannot** show, because no real driver can be made to produce them on demand.
+
+/// Everything from a device to a mapped allocation, for the tests below.
+struct UpToMemory {
+    up: UpToADevice,
+    allocate: u64,
+    map: u64,
+    create_buffer: u64,
+}
+
+fn up_to_memory(tag: &str) -> UpToMemory {
+    let up = up_to_a_device(tag);
+    let allocate = up.f.resolve_device(up.get_proc, up.device, "vkAllocateMemory");
+    let map = up.f.resolve_device(up.get_proc, up.device, "vkMapMemory");
+    let create_buffer = up.f.resolve_device(up.get_proc, up.device, "vkCreateBuffer");
+    UpToMemory { up, allocate, map, create_buffer }
+}
+
+/// **The split: an importable type is backed by guest pages, a device-local one is not.**
+///
+/// The one decision the whole stage rests on, asserted from both sides in one test — because the
+/// two are told apart by nothing the guest can see, and a shim that imported everything would
+/// still pass every other test in this file.
+///
+/// The imported allocation's pages are then checked to be **inside `GuestSpace` and admissible**,
+/// which is the property `docs/HANDOFF.md`'s `VK_EXT_external_memory_host` route was chosen for:
+/// `admit` admits the address with zero changes to `omni-mem`.
+#[test]
+fn a_host_visible_allocation_is_imported_from_guest_pages_and_a_device_local_one_is_forwarded() {
+    let _serial = serialized();
+    let m = up_to_memory("memsplit");
+
+    // Type 2 on this machine's table is `HOST_VISIBLE | HOST_COHERENT` and importable.
+    let out = m.up.f.alloc(8);
+    let info = m.up.f.memory_allocate_info(4096, 2);
+    assert_eq!(
+        m.up.f.call(m.allocate, [m.up.device, info, 0, out]).expect("allocate") as i32,
+        VK_SUCCESS
+    );
+    let imported_handle = m.up.f.guest.read_u64(out as GuestAddr);
+
+    // Type 1 is `DEVICE_LOCAL` alone: nothing to import, nothing to map.
+    let info = m.up.f.memory_allocate_info(8192, 1);
+    assert_eq!(
+        m.up.f.call(m.allocate, [m.up.device, info, 0, out]).expect("allocate") as i32,
+        VK_SUCCESS
+    );
+    let forwarded_handle = m.up.f.guest.read_u64(out as GuestAddr);
+    assert_ne!(imported_handle, forwarded_handle);
+
+    let allocations = m.up.host.log().allocations.clone();
+    assert_eq!(allocations.len(), 2, "{allocations:?}");
+    let imported = allocations[0].1;
+    let forwarded = allocations[1].1;
+
+    assert_eq!(imported.size, 4096, "the guest's own allocationSize travels unrounded");
+    assert_eq!(imported.memory_type_index, 2);
+    let pointer = imported.host_pointer.expect("a host-visible type is imported");
+    assert_eq!(
+        imported.import_length, 4096,
+        "and the length the driver is given is the size rounded up to the alignment"
+    );
+
+    // **Inside `GuestSpace`, and `admit` admits it.** The whole of why this route was chosen.
+    let space = &m.up.f.guest.space;
+    assert!(
+        pointer >= space.base() as u64 && pointer < space.end() as u64,
+        "the imported pages must be the guest's own: {pointer:#x} against \
+         [{:#x}, {:#x})",
+        space.base(),
+        space.end()
+    );
+    omni_mem::admit(space, pointer as GuestAddr, 4096, omni_mem::FaultAccess::Write)
+        .expect("`admit` admits the imported range for writing, with no change to `omni-mem`");
+
+    assert_eq!(forwarded.size, 8192);
+    assert_eq!(forwarded.memory_type_index, 1);
+    assert_eq!(
+        forwarded.host_pointer, None,
+        "a device-local allocation is an ordinary forward -- importing it would take guest commit \
+         charge for memory the guest can never touch"
+    );
+    assert_eq!(forwarded.import_length, 0);
+
+    // The commit charge is exactly the imported allocation's, which is what D15's ceiling now
+    // covers.
+    let (live, peak) = m.up.f.vulkan().imported_bytes();
+    assert_eq!(live, 4096, "only the imported one is guest commit charge");
+    assert_eq!(peak, 4096);
+
+    // ---------------------------------------------------- `vkMapMemory` answers for one and not
+    // the other.
+    let mapped_at = m.up.f.alloc(8);
+    assert_eq!(
+        m.up
+            .f
+            .call_n(m.map, &[m.up.device, imported_handle, 0, VK_WHOLE_SIZE, 0, mapped_at])
+            .expect("map") as i32,
+        VK_SUCCESS
+    );
+    assert_eq!(
+        m.up.f.guest.read_u64(mapped_at as GuestAddr),
+        pointer,
+        "`vkMapMemory` answers with the address that was imported"
+    );
+    assert_eq!(m.up.f.vulkan().mapped_bytes(), 4096);
+
+    // An offset shifts the answer, and is bounded by the guest's own `allocationSize`.
+    assert_eq!(
+        m.up
+            .f
+            .call_n(m.map, &[m.up.device, imported_handle, 256, VK_WHOLE_SIZE, 0, mapped_at])
+            .expect("map") as i32,
+        VK_SUCCESS
+    );
+    assert_eq!(m.up.f.guest.read_u64(mapped_at as GuestAddr), pointer + 256);
+    let text = m
+        .up
+        .f
+        .refusal(m.map, &[m.up.device, imported_handle, 4097, VK_WHOLE_SIZE, 0, mapped_at])
+        .to_string();
+    assert!(text.contains("offset = 4097"), "{text}");
+    assert!(text.contains("stores through without checking it"), "{text}");
+
+    // **And the forwarded one refuses by name.**
+    let text = m
+        .up
+        .f
+        .refusal(m.map, &[m.up.device, forwarded_handle, 0, VK_WHOLE_SIZE, 0, mapped_at])
+        .to_string();
+    assert!(text.contains("**forwarded** rather than imported"), "{text}");
+    assert!(text.contains("HOST_VISIBLE"), "it names why: {text}");
+    assert!(
+        text.contains("inside `GuestSpace`"),
+        "and what it could not have produced instead: {text}"
+    );
+
+    // Freeing the imported one gives the guest pages back.
+    let free = m.up.f.resolve_device(m.up.get_proc, m.up.device, "vkFreeMemory");
+    m.up.f.call(free, [m.up.device, imported_handle, 0, 0]).expect("free");
+    assert_eq!(m.up.f.vulkan().imported_bytes(), (0, 4096), "live falls, the peak does not");
+    assert_eq!(m.up.f.vulkan().leaked_import_bytes(), 0);
+}
+
+/// **A host-visible type this layer cannot import into is refused by name, and the guest is never
+/// shown it as host-visible in the first place.**
+///
+/// Both halves matter and they are different claims. The mask is a courtesy to a conforming
+/// engine — it steers one away from a type whose `vkMapMemory` would have to be refused one call
+/// later. The refusal is the boundary: a guest that names the type anyway, from a list it did not
+/// read or from a number it computed, still cannot reach a `vkMapMemory` that has no address to
+/// answer with.
+#[test]
+fn the_rebar_memory_type_is_masked_out_of_the_guests_list_and_refused_if_named_anyway() {
+    let _serial = serialized();
+    let m = up_to_memory("rebar");
+    let entry_point = m.up.f.entry_point();
+
+    // The one physical device this double has, through the guest's own query.
+    let instance = m.up.f.vulkan().instance_handles()[0].0 as u64;
+    let properties = m.up.f.resolve(entry_point, instance, "vkGetPhysicalDeviceMemoryProperties");
+    let physical = m.up.f.vulkan().physical_device_handles()[0].0 as u64;
+    let at = m.up.f.alloc(PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES);
+    m.up.f.call(properties, [physical, at, 0, 0]).expect("memory properties");
+    let shown = m.up.f.read_bytes(at, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES);
+
+    let flags = |index: usize| {
+        u32::from_le_bytes(shown[4 + index * 8..8 + index * 8].try_into().expect("four"))
+    };
+    assert_eq!(u32::from_le_bytes(shown[0..4].try_into().expect("four")), 5, "the count is kept");
+    assert_eq!(flags(2), 0x6, "an importable type keeps its promise");
+    assert_eq!(flags(3), 0xe, "and so does the cached one");
+    assert_eq!(
+        flags(4),
+        0x1,
+        "**the ReBAR type is shown as device-local only**: it is host-visible to the driver and \
+         this layer cannot import into it, so the promise that the guest may map it is the one \
+         thing that is removed. That it is device-local is still true and is still said"
+    );
+
+    // The rewrite is in the log, with both spellings, so nobody has to diff two tables to see it.
+    let masked: Vec<_> = m
+        .up
+        .f
+        .vulkan()
+        .rewrites()
+        .into_iter()
+        .filter(|rewrite| matches!(rewrite.site, RewriteSite::MemoryType { .. }))
+        .collect();
+    assert_eq!(masked.len(), 1, "one type changed, one record: {masked:?}");
+    assert_eq!(masked[0].site, RewriteSite::MemoryType { index: 4 });
+    assert_eq!(masked[0].from, "DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT");
+    assert_eq!(masked[0].to, "DEVICE_LOCAL");
+    assert!(masked[0].spec_version.is_none(), "a memory type has no version");
+
+    // **Recorded once per physical device, not once per call.** The log is a log of decisions;
+    // an engine that asks per allocation would otherwise fill it with the same line.
+    m.up.f.call(properties, [physical, at, 0, 0]).expect("again");
+    m.up.f.call(properties, [physical, at, 0, 0]).expect("and again");
+    let again = m
+        .up
+        .f
+        .vulkan()
+        .rewrites()
+        .into_iter()
+        .filter(|rewrite| matches!(rewrite.site, RewriteSite::MemoryType { .. }))
+        .count();
+    assert_eq!(again, 1, "three calls, one record");
+
+    // And naming it anyway is a refusal that says what could not be produced.
+    let out = m.up.f.alloc(8);
+    let info = m.up.f.memory_allocate_info(4096, 4);
+    let text = m.up.f.refusal(m.allocate, &[m.up.device, info, 0, out]).to_string();
+    assert!(text.contains("memory type 4"), "{text}");
+    assert!(text.contains("not importable**"), "{text}");
+    assert!(text.contains("VK_EXT_external_memory_host"), "it names the route: {text}");
+    assert!(text.contains("D4 amendment 1"), "and why a driver pointer is not the answer: {text}");
+    assert!(
+        m.up.f.vulkan().imported_bytes().0 == 0,
+        "a refused allocation takes no guest commit charge"
+    );
+}
+
+/// **A `pNext` chain is refused and the address is named, which turns "what does the engine send?"
+/// into a measurement.**
+///
+/// The deliberate choice of this stage, stated where it is checked: chains are refused rather than
+/// walked, because walking means knowing, and a structure this layer did not recognise would have
+/// to be either dropped — producing an object that is not the one that was asked for — or
+/// forwarded blind. `vkAllocateMemory` is the sharpest case, because this layer **constructs** the
+/// one chain an allocation carries.
+#[test]
+fn a_guest_pnext_chain_is_refused_by_name_and_the_address_is_recorded() {
+    let _serial = serialized();
+    let m = up_to_memory("pnext");
+    let out = m.up.f.alloc(8);
+
+    let mut bytes = vec![0u8; MEMORY_ALLOCATE_INFO_BYTES];
+    bytes[0..4].copy_from_slice(&5u32.to_le_bytes()); // MEMORY_ALLOCATE_INFO
+    bytes[8..16].copy_from_slice(&0xDEAD_0000u64.to_le_bytes()); // pNext
+    bytes[16..24].copy_from_slice(&4096u64.to_le_bytes());
+    bytes[24..28].copy_from_slice(&2u32.to_le_bytes());
+    let info = m.up.f.bytes(&bytes);
+
+    let text = m.up.f.refusal(m.allocate, &[m.up.device, info, 0, out]).to_string();
+    assert!(text.contains("pNext = 0xdead0000"), "the address is named: {text}");
+    assert!(text.contains("VkImportMemoryHostPointerInfoEXT"), "{text}");
+    assert!(text.contains("VkMemoryDedicatedAllocateInfo"), "and what it would have been: {text}");
+    assert!(
+        text.contains("two imports of one allocation"),
+        "and why chaining behind it is not an option: {text}"
+    );
+
+    // The same refusal, at a `vkCreate*` that does not construct one -- with a `pNext` on a
+    // structure of the right `sType`, so that it is the chain being refused and not the header.
+    let mut bytes = vec![0u8; BUFFER_CREATE_INFO_BYTES];
+    bytes[0..4].copy_from_slice(&12u32.to_le_bytes()); // BUFFER_CREATE_INFO
+    bytes[8..16].copy_from_slice(&0xBEEF_0000u64.to_le_bytes());
+    bytes[24..32].copy_from_slice(&256u64.to_le_bytes());
+    bytes[32..36].copy_from_slice(&BUFFER_USAGE_VERTEX.to_le_bytes());
+    let buffer_info = m.up.f.bytes(&bytes);
+    let text = m
+        .up
+        .f
+        .refusal(m.create_buffer, &[m.up.device, buffer_info, 0, out])
+        .to_string();
+    assert!(text.contains("refuses every `pNext` chain"), "{text}");
+    assert!(text.contains("walking means knowing"), "{text}");
+}
+
+/// **`vkCreateGraphicsPipelines` may partly succeed, and the guest gets both halves.**
+///
+/// The only creation call in Vulkan that can, and the whole reason
+/// [`PipelinesCreated`](omni_android::vulkan::PipelinesCreated) is not a `DriverAnswer`: the
+/// specification requires `VK_NULL_HANDLE` in the slot of every pipeline that failed, a real
+/// handle in every slot that did not, **and** an error code for the call. A shim that treated any
+/// failure as total would drop handles the driver created, which leaks the most expensive object
+/// a renderer makes.
+///
+/// No real driver can be asked to fail the second of two pipelines on demand, which is why this
+/// one is against the double.
+#[test]
+fn a_partly_failed_pipeline_batch_writes_null_for_the_failures_and_keeps_the_successes() {
+    let _serial = serialized();
+    let m = up_to_memory("pipelines");
+    let f = &m.up.f;
+    let device = m.up.device;
+
+    let create_pass = f.resolve_device(m.up.get_proc, device, "vkCreateRenderPass");
+    let create_set_layout = f.resolve_device(m.up.get_proc, device, "vkCreateDescriptorSetLayout");
+    let create_layout = f.resolve_device(m.up.get_proc, device, "vkCreatePipelineLayout");
+    let create_shader = f.resolve_device(m.up.get_proc, device, "vkCreateShaderModule");
+    let create_pipelines = f.resolve_device(m.up.get_proc, device, "vkCreateGraphicsPipelines");
+
+    let out = f.alloc(8);
+    assert_eq!(
+        f.call(create_pass, [device, f.render_pass_info(FORMAT_B8G8R8A8_UNORM), 0, out])
+            .expect("render pass") as i32,
+        VK_SUCCESS
+    );
+    let pass = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_set_layout, [device, f.descriptor_set_layout_info(), 0, out])
+            .expect("set layout") as i32,
+        VK_SUCCESS
+    );
+    let set_layout = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_layout, [device, f.pipeline_layout_info(set_layout), 0, out])
+            .expect("layout") as i32,
+        VK_SUCCESS
+    );
+    let layout = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_shader, [device, f.shader_module_info(&TRIANGLE_VERT_SPIRV), 0, out])
+            .expect("module") as i32,
+        VK_SUCCESS
+    );
+    let vertex_module = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_shader, [device, f.shader_module_info(&TRIANGLE_FRAG_SPIRV), 0, out])
+            .expect("module") as i32,
+        VK_SUCCESS
+    );
+    let fragment_module = f.guest.read_u64(out as GuestAddr);
+
+    // **The SPIR-V arrived unchanged.** Nothing translates it; `vulkan::shader` says why there is
+    // nothing here to translate.
+    let code = m.up.host.log().shader_code.clone();
+    assert_eq!(code.len(), 2);
+    let expected: Vec<u8> = TRIANGLE_VERT_SPIRV.iter().flat_map(|w| w.to_le_bytes()).collect();
+    assert_eq!(code[0], expected, "the guest's SPIR-V bytes, verbatim");
+    assert_eq!(code[0][0..4], 0x0723_0203u32.to_le_bytes(), "including the magic number");
+
+    // Two create infos, of which the driver will decline the first.
+    let first = f.graphics_pipeline_info(layout, pass, vertex_module, fragment_module);
+    let second = f.graphics_pipeline_info(layout, pass, vertex_module, fragment_module);
+    let both = f.bytes(
+        &[
+            f.read_bytes(first, GRAPHICS_PIPELINE_CREATE_INFO_BYTES),
+            f.read_bytes(second, GRAPHICS_PIPELINE_CREATE_INFO_BYTES),
+        ]
+        .concat(),
+    );
+    m.up.host.pipelines.lock().expect("no panic holds this").push_back(vec![false, true]);
+
+    let pipelines_at = f.poisoned(16, 0x5A);
+    let result = f
+        .call_n(create_pipelines, &[device, 0, 2, both, 0, pipelines_at])
+        .expect("the call completes");
+    assert_eq!(result as i32, -2, "the driver's own code reaches the guest");
+
+    let written = f.read_bytes(pipelines_at, 16);
+    assert_eq!(
+        u64::from_le_bytes(written[0..8].try_into().expect("eight")),
+        0,
+        "**VK_NULL_HANDLE for the one that failed**, which is what the guest's own clean-up loop \
+         reads -- and what the poison pattern would otherwise still be"
+    );
+    let survivor = u64::from_le_bytes(written[8..16].try_into().expect("eight"));
+    assert_ne!(survivor, 0, "and a real handle for the one that was created");
+    assert_eq!(
+        f.vulkan().pipeline_handles().len(),
+        1,
+        "exactly one handle was issued, so the failed slot consumed nothing"
+    );
+
+    // The decoded request reached the host whole, including the members that are easiest to lose.
+    let requests = m.up.host.log().pipelines.clone();
+    assert_eq!(requests.len(), 1, "one call");
+    let request = &requests[0][0];
+    assert_eq!(request.stages.len(), 2);
+    assert_eq!(request.stages[0].name, "main", "the entry point is the guest's, not assumed");
+    assert_eq!(
+        request.dynamic_states.as_deref(),
+        Some(&[0u32, 1][..]),
+        "VK_DYNAMIC_STATE_VIEWPORT and _SCISSOR"
+    );
+    let viewport = request.viewport.as_ref().expect("a viewport state");
+    assert_eq!(viewport.viewport_count, 1);
+    assert!(
+        viewport.viewports.is_empty(),
+        "**the count without the array**: with a dynamic viewport, `pViewports` is NULL and the \
+         count is still required to be right. A shim that derived one from the other would build \
+         a pipeline with no viewport at all"
+    );
+    assert!(request.depth_stencil.is_none(), "NULL stays NULL rather than becoming a zeroed one");
+    assert!(request.tessellation.is_none());
+    assert_eq!(
+        request.rasterization.as_ref().map(Vec::len),
+        Some(RASTERIZATION_STATE_BODY_BYTES),
+        "the rasterization body travels as its members without the tail padding"
+    );
+}
+
+/// **A descriptor pool takes its sets' handles with it, and a swapchain image cannot be
+/// destroyed.**
+///
+/// Two ownership rules that are invisible from a handle. A `VkDescriptorSet` outliving its pool is
+/// the wild non-dispatchable value Global Constraint 1 is about, reached with a handle this layer
+/// itself issued; and `vkDestroyImage` on a swapchain image is undefined behaviour that would take
+/// the presentation engine's own resource with it. Neither would be reported by anything on this
+/// machine, which has no validation layers.
+#[test]
+fn a_descriptor_pool_takes_its_sets_and_a_swapchain_image_cannot_be_destroyed() {
+    let _serial = serialized();
+    let m = up_to_memory("ownership");
+    let f = &m.up.f;
+    let device = m.up.device;
+
+    let create_set_layout = f.resolve_device(m.up.get_proc, device, "vkCreateDescriptorSetLayout");
+    let create_pool = f.resolve_device(m.up.get_proc, device, "vkCreateDescriptorPool");
+    let allocate_sets = f.resolve_device(m.up.get_proc, device, "vkAllocateDescriptorSets");
+    let destroy_pool = f.resolve_device(m.up.get_proc, device, "vkDestroyDescriptorPool");
+    let bind_sets = f.resolve_device(m.up.get_proc, device, "vkCmdBindDescriptorSets");
+
+    let out = f.alloc(8);
+    f.call(create_set_layout, [device, f.descriptor_set_layout_info(), 0, out]).expect("layout");
+    let set_layout = f.guest.read_u64(out as GuestAddr);
+    f.call(create_pool, [device, f.descriptor_pool_info(), 0, out]).expect("pool");
+    let pool = f.guest.read_u64(out as GuestAddr);
+    let set_out = f.alloc(8);
+    assert_eq!(
+        f.call(allocate_sets, [device, f.descriptor_set_allocate_info(pool, set_layout), set_out, 0])
+            .expect("sets") as i32,
+        VK_SUCCESS
+    );
+    let set = f.guest.read_u64(set_out as GuestAddr);
+    assert_eq!(f.vulkan().descriptor_set_handles().len(), 1);
+
+    f.call(destroy_pool, [device, pool, 0, 0]).expect("destroy pool");
+    assert!(
+        f.vulkan().descriptor_set_handles().is_empty(),
+        "the set's handle went with its pool, which the guest never asked for and which the \
+         specification makes true"
+    );
+
+    // And using it afterwards is a typed refusal rather than a bind of a freed object.
+    let command = {
+        let pool_info = f.command_pool_info(POOL_RESET_COMMAND_BUFFER, 0);
+        f.call(f.resolve_device(m.up.get_proc, device, "vkCreateCommandPool"),
+               [device, pool_info, 0, out]).expect("command pool");
+        let command_pool = f.guest.read_u64(out as GuestAddr);
+        let allocate_info = f.command_buffer_allocate_info(command_pool, 1);
+        let buffers_at = f.alloc(8);
+        f.call(f.resolve_device(m.up.get_proc, device, "vkAllocateCommandBuffers"),
+               [device, allocate_info, buffers_at, 0]).expect("allocate");
+        f.guest.read_u64(buffers_at as GuestAddr)
+    };
+    let sets = f.u64_array(&[set]);
+    let layout = {
+        let create_layout = f.resolve_device(m.up.get_proc, device, "vkCreatePipelineLayout");
+        f.call(create_layout, [device, f.pipeline_layout_info(set_layout), 0, out])
+            .expect("pipeline layout");
+        f.guest.read_u64(out as GuestAddr)
+    };
+    let text = f.refusal(bind_sets, &[command, 0, layout, 0, 1, sets, 0, 0]).to_string();
+    assert!(text.contains("`VkDescriptorSet`"), "{text}");
+    assert!(text.contains("its **pool** is reset or destroyed"), "it says why: {text}");
+
+    // ------------------------------------------------------- and the two image families
+    let create_swapchain = f.resolve_device(m.up.get_proc, device, "vkCreateSwapchainKHR");
+    let get_images = f.resolve_device(m.up.get_proc, device, "vkGetSwapchainImagesKHR");
+    let destroy_image = f.resolve_device(m.up.get_proc, device, "vkDestroyImage");
+    let create_image = f.resolve_device(m.up.get_proc, device, "vkCreateImage");
+
+    let info = f.swapchain_info(m.up.surface, 2, FORMAT_B8G8R8A8_UNORM, 8, 8, SWAPCHAIN_USAGE, 1, 0);
+    f.call(create_swapchain, [device, info, 0, out]).expect("swapchain");
+    let swapchain = f.guest.read_u64(out as GuestAddr);
+    let count_at = f.alloc(8);
+    f.call(get_images, [device, swapchain, count_at, 0]).expect("count");
+    let count = f.read_u32(count_at) as usize;
+    let images_at = f.alloc(count * 8);
+    f.call(get_images, [device, swapchain, count_at, images_at]).expect("images");
+    let swapchain_image = f.guest.read_u64(images_at as GuestAddr);
+
+    let text = f.refusal(destroy_image, &[device, swapchain_image, 0, 0]).to_string();
+    assert!(text.contains("VkImage (created)"), "the family it is not: {text}");
+    assert!(
+        text.contains("owned by their swapchain"),
+        "and why destroying it is the mistake the split exists to prevent: {text}"
+    );
+
+    // A created image destroys fine, which is what says the refusal above is about the *family*
+    // and not about `vkDestroyImage` being broken.
+    let image_info = f.image_info(2, 2, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_TEXTURE);
+    assert_eq!(
+        f.call(create_image, [device, image_info, 0, out]).expect("image") as i32,
+        VK_SUCCESS
+    );
+    let created = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(f.vulkan().created_image_handles().len(), 1);
+    f.call(destroy_image, [device, created, 0, 0]).expect("destroy");
+    assert!(f.vulkan().created_image_handles().is_empty());
+    assert_eq!(f.vulkan().image_handles().len(), count, "the swapchain's images are untouched");
+}
+
+/// **Stage 5's evidence: a textured triangle, drawn by guest code, presented, and its pixels
+/// asserted.**
+///
+/// # Why this one test and not twenty
+///
+/// One path exercises the whole stage: device memory allocated through both branches of the split,
+/// `vkMapMemory` answering an address the guest stores through, a vertex buffer, a staging buffer,
+/// an image, a sampler, an image view, two shader modules of real SPIR-V, a pipeline layout, a
+/// render pass, a framebuffer, a graphics pipeline, a descriptor set layout, a pool, a set, an
+/// update, and eleven `vkCmd*` calls ending in `vkCmdDraw`. Any one of them answering
+/// `VK_SUCCESS` without doing its job changes the pixels that come back, and the pixels are what
+/// is asserted.
+///
+/// # What the four quadrants prove that one colour would not
+///
+/// The texture is 2×2 with four distinct colours ([`TEXELS`]) and the triangle is the fullscreen
+/// one, so `u` and `v` span the viewport exactly. Nearest filtering means each screen quadrant is
+/// one texel, exactly, with no blend to round. So the assertion catches, separately:
+///
+/// * **no draw at all** — the frame is [`DRAW_CLEAR_BYTES`], which is none of the four;
+/// * **no texture upload** — the image holds whatever the driver left in it, which would have to
+///   be these four colours in these four places;
+/// * **a flipped or transposed UV mapping** — the four colours appear in the wrong quadrants,
+///   which is the failure a single-colour texture cannot see at all;
+/// * **a descriptor pointing somewhere else** — the sampled colour is not the texture's.
+///
+/// # What the read-back can and cannot see
+///
+/// The same limit stage 4's test states, and it is stated again rather than inherited: these are
+/// the pixels handed to the presentation engine, read back out of the swapchain image. They are
+/// not a photograph of the monitor, because `PrintWindow(PW_RENDERFULLCONTENT)` returns solid
+/// black for a flip-model swapchain's client area on this host
+/// (`docs/research/graphics-spike.md` §1). The step between "these pixels were presented" and
+/// "these pixels are on the screen" is the compositor's.
+#[test]
+#[ignore = "opens a window and the host Vulkan driver; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn a_textured_triangle_is_drawn_by_guest_code_and_the_presented_pixels_are_its_texels() {
+    require_gate();
+    let _serial = serialized();
+
+    let mut window = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
+        "Omnidroid — Vulkan stage 5: a guest textured triangle",
+        512,
+        512,
+    ))
+    .unwrap_or_else(|err| panic!("could not create the window: {err}"));
+    window.show();
+    let _ = window.poll_events().count();
+    let source = HostWindowSource::watching(&window).expect("a source watching the window");
+
+    let host = omni_gfx::GfxVulkanHost::load().expect(
+        "this machine must have a Vulkan loader: the gate was set, so a missing driver is a \
+         failure and not a skip",
+    );
+    let f = fixture("live-stage5", Some(host.clone()));
+    f.ndk.set_window_source(Arc::clone(&source) as Arc<dyn WindowSource>);
+
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let surface = f.a_surface(entry_point, instance);
+
+    // ---------------------------------------------------------------- choose a device and family
+    let enumerate = f.resolve(entry_point, instance, "vkEnumeratePhysicalDevices");
+    let count_at = f.alloc(8);
+    assert_eq!(f.call(enumerate, [instance, count_at, 0, 0]).expect("count") as i32, VK_SUCCESS);
+    let device_count = f.read_u32(count_at) as usize;
+    assert!(device_count > 0, "a machine with a Vulkan loader and no GPU cannot draw");
+    let devices_at = f.alloc(device_count * 8);
+    assert_eq!(
+        f.call(enumerate, [instance, count_at, devices_at, 0]).expect("array") as i32,
+        VK_SUCCESS
+    );
+    let physical_devices: Vec<u64> =
+        (0..device_count).map(|i| f.guest.read_u64(devices_at as GuestAddr + i * 8)).collect();
+
+    let properties = f.resolve(entry_point, instance, "vkGetPhysicalDeviceProperties");
+    let families = f.resolve(entry_point, instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    let support = f.resolve(entry_point, instance, "vkGetPhysicalDeviceSurfaceSupportKHR");
+    let capabilities =
+        f.resolve(entry_point, instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    let formats = f.resolve(entry_point, instance, "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    let memory_properties =
+        f.resolve(entry_point, instance, "vkGetPhysicalDeviceMemoryProperties");
+
+    let scratch = f.alloc(SCRATCH_BYTES);
+    let supported_at = f.alloc(8);
+    let properties_at = f.alloc(PHYSICAL_DEVICE_PROPERTIES_BYTES);
+    let mut chosen: Option<(u64, String, u32)> = None;
+    for physical in &physical_devices {
+        f.call(properties, [*physical, properties_at, 0, 0]).expect("properties");
+        let bytes = f.read_bytes(properties_at, PHYSICAL_DEVICE_PROPERTIES_BYTES);
+        let end = bytes[20..276].iter().position(|b| *b == 0).expect("a NUL-terminated deviceName");
+        let name = String::from_utf8_lossy(&bytes[20..20 + end]).into_owned();
+
+        f.call(families, [*physical, count_at, 0, 0]).expect("family count");
+        let family_count = f.read_u32(count_at) as usize;
+        assert!(family_count * QUEUE_FAMILY_PROPERTIES_BYTES <= SCRATCH_BYTES);
+        f.guest.write_u32(count_at as GuestAddr, family_count as u32);
+        f.call(families, [*physical, count_at, scratch, 0]).expect("families");
+        let family_bytes = f.read_bytes(scratch, family_count * QUEUE_FAMILY_PROPERTIES_BYTES);
+        for index in 0..family_count {
+            let entry = &family_bytes[index * QUEUE_FAMILY_PROPERTIES_BYTES..];
+            let flags = u32::from_le_bytes(entry[0..4].try_into().expect("four"));
+            let queues = u32::from_le_bytes(entry[4..8].try_into().expect("four"));
+            if flags & 0x1 == 0 || queues == 0 {
+                continue;
+            }
+            let result = f
+                .call(support, [*physical, index as u64, surface, supported_at])
+                .expect("surface support");
+            assert_eq!(result as i32, VK_SUCCESS);
+            if f.read_u32(supported_at) == 1 {
+                chosen = Some((*physical, name.clone(), index as u32));
+                break;
+            }
+        }
+        if chosen.is_some() {
+            break;
+        }
+    }
+    let (physical, device_name, family) = chosen.expect("a graphics-and-present queue family");
+
+    // ----------------------------------------------- the memory table, **as the guest is shown it**
+    let memory_at = f.alloc(PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES);
+    f.call(memory_properties, [physical, memory_at, 0, 0]).expect("memory properties");
+    let shown = f.read_bytes(memory_at, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES);
+    let shown_count = u32::from_le_bytes(shown[0..4].try_into().expect("four"));
+    assert!(shown_count > 0, "a device with no memory types cannot be drawn with");
+
+    // **The rewrite, asserted where it is visible.** Whatever this host masked is in the log, and
+    // every type that still advertises HOST_VISIBLE is one this layer can back — which is the
+    // property the whole memory design rests on, and the one that makes `vkMapMemory` below able
+    // to answer at all.
+    let masked: Vec<_> = f
+        .vulkan()
+        .rewrites()
+        .into_iter()
+        .filter(|rewrite| matches!(rewrite.site, RewriteSite::MemoryType { .. }))
+        .collect();
+    let importable = host.importable_memory_types(
+        f.vulkan()
+            .physical_device_handles()
+            .iter()
+            .find(|(handle, _)| *handle as u64 == physical)
+            .map(|(_, token)| *token)
+            .expect("the physical device handle is one this layer issued"),
+    )
+    .expect("this host can say what it can import");
+    for index in 0..shown_count {
+        let at = 4 + index as usize * 8;
+        let flags = u32::from_le_bytes(shown[at..at + 4].try_into().expect("four"));
+        if flags & MEMORY_HOST_VISIBLE != 0 {
+            assert_ne!(
+                importable & (1 << index),
+                0,
+                "memory type {index} is advertised to the guest as host-visible, so this layer \
+                 must be able to import into it -- otherwise `vkMapMemory` on it would have to \
+                 refuse one call after the guest was told it could map"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------ the surface's own terms
+    let capabilities_at = f.alloc(SURFACE_CAPABILITIES_BYTES);
+    assert_eq!(
+        f.call(capabilities, [physical, surface, capabilities_at, 0]).expect("capabilities") as i32,
+        VK_SUCCESS
+    );
+    let caps = f.read_bytes(capabilities_at, SURFACE_CAPABILITIES_BYTES);
+    let read_u32 = |bytes: &[u8], at: usize| {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four"))
+    };
+    let min_images = read_u32(&caps, 0);
+    let extent = (read_u32(&caps, 8), read_u32(&caps, 12));
+    let current_transform = read_u32(&caps, 40);
+    let supported_usage = read_u32(&caps, 48);
+    assert_eq!(
+        supported_usage & SWAPCHAIN_USAGE,
+        SWAPCHAIN_USAGE,
+        "this surface's swapchain images cannot be both a colour attachment and a transfer \
+         source, so the frame could be drawn or read back but not both. \
+         supportedUsageFlags = {supported_usage:#x}"
+    );
+
+    assert_eq!(
+        f.call(formats, [physical, surface, count_at, 0]).expect("format count") as i32,
+        VK_SUCCESS
+    );
+    let format_count = f.read_u32(count_at) as usize;
+    f.guest.write_u32(count_at as GuestAddr, format_count as u32);
+    assert_eq!(
+        f.call(formats, [physical, surface, count_at, scratch]).expect("formats") as i32,
+        VK_SUCCESS
+    );
+    let format_bytes = f.read_bytes(scratch, format_count * SURFACE_FORMAT_BYTES);
+    let offered: Vec<u32> =
+        (0..format_count).map(|i| read_u32(&format_bytes, i * SURFACE_FORMAT_BYTES)).collect();
+    let format = *offered
+        .iter()
+        .find(|f| **f == FORMAT_B8G8R8A8_UNORM || **f == FORMAT_R8G8B8A8_UNORM)
+        .unwrap_or_else(|| {
+            panic!("this surface offers no eight-bit UNORM format ({offered:?})")
+        });
+
+    // ------------------------------------------------------------------ the device and its queue
+    let logical = f.a_device(entry_point, instance, physical, family);
+
+    // **The device this layer created is not the device the guest described**, and the log says
+    // so. `VK_EXT_external_memory_host` is what `vkMapMemory` needs, the engine asked only for
+    // `VK_KHR_swapchain`, and an addition nobody recorded is what Global Constraint 1 forbids.
+    let added: Vec<_> = f
+        .vulkan()
+        .rewrites()
+        .into_iter()
+        .filter(|rewrite| rewrite.site == RewriteSite::DeviceExtensionAdded)
+        .collect();
+    assert_eq!(added.len(), 1, "exactly one extension was added: {added:?}");
+    assert_eq!(added[0].to, "VK_EXT_external_memory_host");
+    assert!(added[0].from.contains("not requested"), "{:?}", added[0]);
+
+    let get_queue = f.resolve(entry_point, instance, "vkGetDeviceQueue");
+    let queue_at = f.alloc(8);
+    f.call(get_queue, [logical, u64::from(family), 0, queue_at]).expect("queue");
+    let queue = f.guest.read_u64(queue_at as GuestAddr);
+
+    let get_proc = f.resolve(entry_point, instance, "vkGetDeviceProcAddr");
+    let name = |n: &str| f.resolve_device(get_proc, logical, n);
+    let create_swapchain = name("vkCreateSwapchainKHR");
+    let get_images = name("vkGetSwapchainImagesKHR");
+    let destroy_swapchain = name("vkDestroySwapchainKHR");
+    let create_view = name("vkCreateImageView");
+    let destroy_view = name("vkDestroyImageView");
+    let create_semaphore = name("vkCreateSemaphore");
+    let destroy_semaphore = name("vkDestroySemaphore");
+    let create_fence = name("vkCreateFence");
+    let destroy_fence = name("vkDestroyFence");
+    let wait_fences = name("vkWaitForFences");
+    let create_pool = name("vkCreateCommandPool");
+    let destroy_pool = name("vkDestroyCommandPool");
+    let allocate_buffers = name("vkAllocateCommandBuffers");
+    let begin = name("vkBeginCommandBuffer");
+    let end = name("vkEndCommandBuffer");
+    let barrier = name("vkCmdPipelineBarrier");
+    let acquire = name("vkAcquireNextImageKHR");
+    let submit = name("vkQueueSubmit");
+    let present = name("vkQueuePresentKHR");
+    let queue_wait_idle = name("vkQueueWaitIdle");
+    let device_wait_idle = name("vkDeviceWaitIdle");
+    // Stage 5's own.
+    let allocate_memory = name("vkAllocateMemory");
+    let free_memory = name("vkFreeMemory");
+    let map_memory = name("vkMapMemory");
+    let unmap_memory = name("vkUnmapMemory");
+    let buffer_requirements = name("vkGetBufferMemoryRequirements");
+    let image_requirements = name("vkGetImageMemoryRequirements");
+    let bind_buffer = name("vkBindBufferMemory");
+    let bind_image = name("vkBindImageMemory");
+    let create_buffer = name("vkCreateBuffer");
+    let destroy_buffer = name("vkDestroyBuffer");
+    let create_image = name("vkCreateImage");
+    let destroy_image = name("vkDestroyImage");
+    let create_sampler = name("vkCreateSampler");
+    let destroy_sampler = name("vkDestroySampler");
+    let create_shader = name("vkCreateShaderModule");
+    let destroy_shader = name("vkDestroyShaderModule");
+    let create_set_layout = name("vkCreateDescriptorSetLayout");
+    let destroy_set_layout = name("vkDestroyDescriptorSetLayout");
+    let create_descriptor_pool = name("vkCreateDescriptorPool");
+    let destroy_descriptor_pool = name("vkDestroyDescriptorPool");
+    let allocate_sets = name("vkAllocateDescriptorSets");
+    let update_sets = name("vkUpdateDescriptorSets");
+    let create_pipeline_layout = name("vkCreatePipelineLayout");
+    let destroy_pipeline_layout = name("vkDestroyPipelineLayout");
+    let create_render_pass = name("vkCreateRenderPass");
+    let destroy_render_pass = name("vkDestroyRenderPass");
+    let create_framebuffer = name("vkCreateFramebuffer");
+    let destroy_framebuffer = name("vkDestroyFramebuffer");
+    let create_pipelines = name("vkCreateGraphicsPipelines");
+    let destroy_pipeline = name("vkDestroyPipeline");
+    let cmd_begin_pass = name("vkCmdBeginRenderPass");
+    let cmd_end_pass = name("vkCmdEndRenderPass");
+    let cmd_bind_pipeline = name("vkCmdBindPipeline");
+    let cmd_bind_vertex = name("vkCmdBindVertexBuffers");
+    let cmd_bind_sets = name("vkCmdBindDescriptorSets");
+    let cmd_set_viewport = name("vkCmdSetViewport");
+    let cmd_set_scissor = name("vkCmdSetScissor");
+    let cmd_draw = name("vkCmdDraw");
+    let cmd_copy_to_image = name("vkCmdCopyBufferToImage");
+
+    // -------------------------------------------------------------------------- the swapchain
+    let info = f.swapchain_info(
+        surface,
+        min_images,
+        format,
+        extent.0,
+        extent.1,
+        SWAPCHAIN_USAGE,
+        current_transform,
+        0,
+    );
+    let out = f.alloc(8);
+    assert_eq!(
+        f.call(create_swapchain, [logical, info, 0, out]).expect("the call completes") as i32,
+        VK_SUCCESS
+    );
+    let swapchain = f.guest.read_u64(out as GuestAddr);
+
+    assert_eq!(
+        f.call(get_images, [logical, swapchain, count_at, 0]).expect("image count") as i32,
+        VK_SUCCESS
+    );
+    let image_count = f.read_u32(count_at) as usize;
+    let images_at = f.alloc(image_count * 8);
+    assert_eq!(
+        f.call(get_images, [logical, swapchain, count_at, images_at]).expect("images") as i32,
+        VK_SUCCESS
+    );
+    let images: Vec<u64> =
+        (0..image_count).map(|i| f.guest.read_u64(images_at as GuestAddr + i * 8)).collect();
+    let views: Vec<u64> = images
+        .iter()
+        .map(|image| {
+            let view_info = f.image_view_info(*image, format);
+            let view_out = f.alloc(8);
+            assert_eq!(
+                f.call(create_view, [logical, view_info, 0, view_out]).expect("view") as i32,
+                VK_SUCCESS
+            );
+            f.guest.read_u64(view_out as GuestAddr)
+        })
+        .collect();
+
+    // ----------------------------------------------------------- the render pass and its targets
+    let pass_info = f.render_pass_info(format);
+    let pass_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_render_pass, [logical, pass_info, 0, pass_out]).expect("render pass") as i32,
+        VK_SUCCESS
+    );
+    let render_pass = f.guest.read_u64(pass_out as GuestAddr);
+    let framebuffers: Vec<u64> = views
+        .iter()
+        .map(|view| {
+            let fb_info = f.framebuffer_info(render_pass, *view, extent.0, extent.1);
+            let fb_out = f.alloc(8);
+            assert_eq!(
+                f.call(create_framebuffer, [logical, fb_info, 0, fb_out]).expect("framebuffer")
+                    as i32,
+                VK_SUCCESS
+            );
+            f.guest.read_u64(fb_out as GuestAddr)
+        })
+        .collect();
+
+    // ----------------------------------------------------- the vertex buffer, through `vkMapMemory`
+    let vertices = triangle_vertices();
+    let vertex_buffer_info = f.buffer_info(vertices.len() as u64, BUFFER_USAGE_VERTEX);
+    let vertex_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_buffer, [logical, vertex_buffer_info, 0, vertex_out]).expect("buffer") as i32,
+        VK_SUCCESS
+    );
+    let vertex_buffer = f.guest.read_u64(vertex_out as GuestAddr);
+
+    let requirements_at = f.alloc(MEMORY_REQUIREMENTS_BYTES);
+    f.call(buffer_requirements, [logical, vertex_buffer, requirements_at, 0]).expect("needs");
+    let requirements = f.read_bytes(requirements_at, MEMORY_REQUIREMENTS_BYTES);
+    let vertex_bytes = u64::from_le_bytes(requirements[0..8].try_into().expect("eight"));
+    let vertex_type_bits = u32::from_le_bytes(requirements[16..20].try_into().expect("four"));
+    let host_visible_type = f
+        .memory_type_index(&shown, vertex_type_bits, MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT)
+        .expect(
+            "the list the guest was shown must still contain a host-visible, host-coherent type \
+             the vertex buffer can be bound to -- if the mask left none, nothing can be uploaded",
+        );
+
+    let vertex_alloc = f.memory_allocate_info(vertex_bytes, host_visible_type);
+    let memory_out = f.alloc(8);
+    assert_eq!(
+        f.call(allocate_memory, [logical, vertex_alloc, 0, memory_out]).expect("allocate") as i32,
+        VK_SUCCESS
+    );
+    let vertex_memory = f.guest.read_u64(memory_out as GuestAddr);
+    assert_eq!(
+        f.call(bind_buffer, [logical, vertex_buffer, vertex_memory, 0]).expect("bind") as i32,
+        VK_SUCCESS
+    );
+
+    // **The measurement this whole stage rests on.**
+    let mapped_at = f.alloc(8);
+    assert_eq!(
+        f.call_n(map_memory, &[logical, vertex_memory, 0, VK_WHOLE_SIZE, 0, mapped_at])
+            .expect("map") as i32,
+        VK_SUCCESS
+    );
+    let mapped = f.guest.read_u64(mapped_at as GuestAddr);
+    let space = &f.guest.space;
+    assert!(
+        mapped >= space.base() as u64 && mapped < space.end() as u64,
+        "**`vkMapMemory` must answer with an address inside `GuestSpace`**: it answered \
+         {mapped:#x}, and the guest's space is [{base:#x}, {end:#x}). A driver pointer here would \
+         be stored through successfully by translated ARM64 -- D4 amendment 1 means `admit` does \
+         not govern the guest's own stores -- and the failure would arrive far from the cause",
+        base = space.base(),
+        end = space.end()
+    );
+    // And `admit` admits it, with **zero changes to `omni-mem`**, which is the claim
+    // `docs/HANDOFF.md` makes for the `VK_EXT_external_memory_host` route.
+    let admitted = omni_mem::admit(
+        space,
+        mapped as GuestAddr,
+        vertices.len(),
+        omni_mem::FaultAccess::Write,
+    )
+    .expect("the mapping `vkMapMemory` answered with is one `admit` admits for writing");
+    assert!(admitted.end >= mapped as GuestAddr + vertices.len());
+
+    // Written through that very pointer. `Guest::write_bytes` goes through `GuestSpace::ptr`,
+    // which refuses an address outside the space -- so this line is itself an assertion.
+    f.guest.write_bytes(mapped as GuestAddr, &vertices);
+    f.call(unmap_memory, [logical, vertex_memory, 0, 0]).expect("unmap");
+
+    // ------------------------------------------------- the texture, and the other half of the split
+    let texel_bytes: Vec<u8> = TEXELS.iter().flat_map(|texel| texel.iter().copied()).collect();
+    let staging_info = f.buffer_info(texel_bytes.len() as u64, BUFFER_USAGE_TRANSFER_SRC);
+    let staging_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_buffer, [logical, staging_info, 0, staging_out]).expect("staging") as i32,
+        VK_SUCCESS
+    );
+    let staging = f.guest.read_u64(staging_out as GuestAddr);
+    f.call(buffer_requirements, [logical, staging, requirements_at, 0]).expect("needs");
+    let staging_requirements = f.read_bytes(requirements_at, MEMORY_REQUIREMENTS_BYTES);
+    let staging_size = u64::from_le_bytes(staging_requirements[0..8].try_into().expect("eight"));
+    let staging_type = f
+        .memory_type_index(
+            &shown,
+            u32::from_le_bytes(staging_requirements[16..20].try_into().expect("four")),
+            MEMORY_HOST_VISIBLE | MEMORY_HOST_COHERENT,
+        )
+        .expect("a host-visible type for the staging buffer");
+    let staging_alloc = f.memory_allocate_info(staging_size, staging_type);
+    assert_eq!(
+        f.call(allocate_memory, [logical, staging_alloc, 0, memory_out]).expect("allocate") as i32,
+        VK_SUCCESS
+    );
+    let staging_memory = f.guest.read_u64(memory_out as GuestAddr);
+    assert_eq!(
+        f.call(bind_buffer, [logical, staging, staging_memory, 0]).expect("bind") as i32,
+        VK_SUCCESS
+    );
+    assert_eq!(
+        f.call_n(map_memory, &[logical, staging_memory, 0, VK_WHOLE_SIZE, 0, mapped_at])
+            .expect("map") as i32,
+        VK_SUCCESS
+    );
+    let staging_pointer = f.guest.read_u64(mapped_at as GuestAddr);
+    f.guest.write_bytes(staging_pointer as GuestAddr, &texel_bytes);
+    f.call(unmap_memory, [logical, staging_memory, 0, 0]).expect("unmap");
+
+    let texture_info = f.image_info(2, 2, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_TEXTURE);
+    let texture_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_image, [logical, texture_info, 0, texture_out]).expect("image") as i32,
+        VK_SUCCESS
+    );
+    let texture = f.guest.read_u64(texture_out as GuestAddr);
+    f.call(image_requirements, [logical, texture, requirements_at, 0]).expect("needs");
+    let texture_requirements = f.read_bytes(requirements_at, MEMORY_REQUIREMENTS_BYTES);
+    let texture_size = u64::from_le_bytes(texture_requirements[0..8].try_into().expect("eight"));
+    let texture_type_bits =
+        u32::from_le_bytes(texture_requirements[16..20].try_into().expect("four"));
+
+    // **The forwarded half of the split**, chosen deliberately: a device-local type with no
+    // `HOST_VISIBLE` bit is one this layer allocates without importing anything, and
+    // `vkMapMemory` on it refuses. Falling back to any type at all keeps the test running on a
+    // device whose only types are host-visible.
+    let device_local_type = f
+        .memory_type_index(&shown, texture_type_bits, MEMORY_DEVICE_LOCAL)
+        .filter(|index| {
+            let at = 4 + *index as usize * 8;
+            u32::from_le_bytes(shown[at..at + 4].try_into().expect("four")) & MEMORY_HOST_VISIBLE
+                == 0
+        })
+        .or_else(|| f.memory_type_index(&shown, texture_type_bits, 0))
+        .expect("some memory type the texture can be bound to");
+    let texture_alloc = f.memory_allocate_info(texture_size, device_local_type);
+    assert_eq!(
+        f.call(allocate_memory, [logical, texture_alloc, 0, memory_out]).expect("allocate") as i32,
+        VK_SUCCESS
+    );
+    let texture_memory = f.guest.read_u64(memory_out as GuestAddr);
+    assert_eq!(
+        f.call(bind_image, [logical, texture, texture_memory, 0]).expect("bind") as i32,
+        VK_SUCCESS
+    );
+
+    let texture_view_info = f.image_view_info(texture, FORMAT_R8G8B8A8_UNORM);
+    let texture_view_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_view, [logical, texture_view_info, 0, texture_view_out]).expect("view")
+            as i32,
+        VK_SUCCESS
+    );
+    let texture_view = f.guest.read_u64(texture_view_out as GuestAddr);
+
+    let sampler_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_sampler, [logical, f.sampler_info(), 0, sampler_out]).expect("sampler")
+            as i32,
+        VK_SUCCESS
+    );
+    let sampler = f.guest.read_u64(sampler_out as GuestAddr);
+
+    // ------------------------------------------------------------------- descriptors and pipeline
+    let set_layout_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_set_layout, [logical, f.descriptor_set_layout_info(), 0, set_layout_out])
+            .expect("set layout") as i32,
+        VK_SUCCESS
+    );
+    let set_layout = f.guest.read_u64(set_layout_out as GuestAddr);
+
+    let descriptor_pool_out = f.alloc(8);
+    assert_eq!(
+        f.call(create_descriptor_pool, [logical, f.descriptor_pool_info(), 0, descriptor_pool_out])
+            .expect("descriptor pool") as i32,
+        VK_SUCCESS
+    );
+    let descriptor_pool = f.guest.read_u64(descriptor_pool_out as GuestAddr);
+
+    let set_out = f.alloc(8);
+    let set_alloc = f.descriptor_set_allocate_info(descriptor_pool, set_layout);
+    assert_eq!(
+        f.call(allocate_sets, [logical, set_alloc, set_out, 0]).expect("sets") as i32,
+        VK_SUCCESS
+    );
+    let descriptor_set = f.guest.read_u64(set_out as GuestAddr);
+    assert_ne!(descriptor_set, 0);
+
+    let write = f.write_descriptor_set(descriptor_set, sampler, texture_view);
+    f.call_n(update_sets, &[logical, 1, write, 0, 0]).expect("update");
+
+    let pipeline_layout_out = f.alloc(8);
+    assert_eq!(
+        f.call(
+            create_pipeline_layout,
+            [logical, f.pipeline_layout_info(set_layout), 0, pipeline_layout_out]
+        )
+        .expect("pipeline layout") as i32,
+        VK_SUCCESS
+    );
+    let pipeline_layout = f.guest.read_u64(pipeline_layout_out as GuestAddr);
+
+    let vertex_module_out = f.alloc(8);
+    let vertex_module_info = f.shader_module_info(&TRIANGLE_VERT_SPIRV);
+    assert_eq!(
+        f.call(create_shader, [logical, vertex_module_info, 0, vertex_module_out])
+            .expect("vertex module") as i32,
+        VK_SUCCESS,
+        "the driver rejected the vertex SPIR-V"
+    );
+    let vertex_module = f.guest.read_u64(vertex_module_out as GuestAddr);
+    let fragment_module_out = f.alloc(8);
+    let fragment_module_info = f.shader_module_info(&TRIANGLE_FRAG_SPIRV);
+    assert_eq!(
+        f.call(create_shader, [logical, fragment_module_info, 0, fragment_module_out])
+            .expect("fragment module") as i32,
+        VK_SUCCESS,
+        "the driver rejected the fragment SPIR-V"
+    );
+    let fragment_module = f.guest.read_u64(fragment_module_out as GuestAddr);
+
+    let pipeline_info =
+        f.graphics_pipeline_info(pipeline_layout, render_pass, vertex_module, fragment_module);
+    let pipeline_out = f.poisoned(8, 0x5A);
+    let created = f
+        .call_n(create_pipelines, &[logical, 0, 1, pipeline_info, 0, pipeline_out])
+        .expect("the call completes");
+    assert_eq!(
+        created as i32, VK_SUCCESS,
+        "the driver answered VkResult {} for the graphics pipeline",
+        created as i32
+    );
+    let pipeline = f.guest.read_u64(pipeline_out as GuestAddr);
+    assert_ne!(pipeline, 0, "a VK_SUCCESS must come with a pipeline, not VK_NULL_HANDLE");
+
+    // ------------------------------------------------------------------- the frame's own objects
+    let sem_info = f.flags_only_info(STYPE_SEMAPHORE_CREATE_INFO, 0);
+    let acquired_out = f.alloc(8);
+    f.call(create_semaphore, [logical, sem_info, 0, acquired_out]).expect("semaphore");
+    let image_available = f.guest.read_u64(acquired_out as GuestAddr);
+    let rendered_out = f.alloc(8);
+    f.call(create_semaphore, [logical, sem_info, 0, rendered_out]).expect("semaphore");
+    let render_finished = f.guest.read_u64(rendered_out as GuestAddr);
+    let fence_info = f.flags_only_info(STYPE_FENCE_CREATE_INFO, 0);
+    let fence_out = f.alloc(8);
+    f.call(create_fence, [logical, fence_info, 0, fence_out]).expect("fence");
+    let fence = f.guest.read_u64(fence_out as GuestAddr);
+
+    let pool_info = f.command_pool_info(POOL_RESET_COMMAND_BUFFER, family);
+    let pool_out = f.alloc(8);
+    f.call(create_pool, [logical, pool_info, 0, pool_out]).expect("pool");
+    let pool = f.guest.read_u64(pool_out as GuestAddr);
+    let allocate_info = f.command_buffer_allocate_info(pool, 1);
+    let buffers_at = f.alloc(8);
+    f.call(allocate_buffers, [logical, allocate_info, buffers_at, 0]).expect("allocate");
+    let command = f.guest.read_u64(buffers_at as GuestAddr);
+
+    // --------------------------------------------------------------------------------- the frame
+    let index_at = f.alloc(8);
+    let acquired = f
+        .call_n(acquire, &[logical, swapchain, u64::MAX, image_available, 0, index_at])
+        .expect("the acquire completes");
+    assert_eq!(acquired as i32, VK_SUCCESS, "the first acquire must succeed");
+    let image_index = f.read_u32(index_at);
+    let framebuffer = framebuffers[image_index as usize];
+
+    let begin_info = f.begin_info(ONE_TIME_SUBMIT, 0);
+    assert_eq!(f.call(begin, [command, begin_info, 0, 0]).expect("begin") as i32, VK_SUCCESS);
+
+    // The texture upload: undefined -> transfer destination, copy, -> shader read only.
+    let to_transfer = f.bytes(&f.image_barrier(
+        STYPE_IMAGE_MEMORY_BARRIER,
+        0,
+        ACCESS_TRANSFER_WRITE,
+        LAYOUT_UNDEFINED,
+        LAYOUT_TRANSFER_DST,
+        texture,
+    ));
+    f.call_n(
+        barrier,
+        &[
+            command,
+            u64::from(STAGE_TOP_OF_PIPE),
+            u64::from(STAGE_TRANSFER),
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            to_transfer,
+        ],
+    )
+    .expect("the upload barrier records");
+
+    let region = f.buffer_image_copy(2, 2);
+    f.call_n(
+        cmd_copy_to_image,
+        &[command, staging, texture, u64::from(LAYOUT_TRANSFER_DST), 1, region],
+    )
+    .expect("the texture upload records");
+
+    let to_sampled = f.bytes(&f.image_barrier(
+        STYPE_IMAGE_MEMORY_BARRIER,
+        ACCESS_TRANSFER_WRITE,
+        ACCESS_SHADER_READ,
+        LAYOUT_TRANSFER_DST,
+        LAYOUT_SHADER_READ_ONLY,
+        texture,
+    ));
+    f.call_n(
+        barrier,
+        &[
+            command,
+            u64::from(STAGE_TRANSFER),
+            u64::from(STAGE_FRAGMENT_SHADER),
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            to_sampled,
+        ],
+    )
+    .expect("the sampling barrier records");
+
+    // The draw.
+    let begin_pass =
+        f.render_pass_begin_info(render_pass, framebuffer, extent.0, extent.1, DRAW_CLEAR_COLOUR);
+    f.call(cmd_begin_pass, [command, begin_pass, u64::from(SUBPASS_CONTENTS_INLINE), 0])
+        .expect("the render pass begins");
+    f.call(cmd_bind_pipeline, [command, u64::from(BIND_POINT_GRAPHICS), pipeline, 0])
+        .expect("bind pipeline");
+    let (viewport_at, scissor_at) = f.viewport_and_scissor(extent.0, extent.1);
+    f.call(cmd_set_viewport, [command, 0, 1, viewport_at]).expect("viewport");
+    f.call(cmd_set_scissor, [command, 0, 1, scissor_at]).expect("scissor");
+    let vertex_handles = f.u64_array(&[vertex_buffer]);
+    let vertex_offsets = f.u64_array(&[0]);
+    f.call_n(cmd_bind_vertex, &[command, 0, 1, vertex_handles, vertex_offsets])
+        .expect("bind vertex buffers");
+    let sets = f.u64_array(&[descriptor_set]);
+    f.call_n(
+        cmd_bind_sets,
+        &[command, u64::from(BIND_POINT_GRAPHICS), pipeline_layout, 0, 1, sets, 0, 0],
+    )
+    .expect("bind descriptor sets");
+    f.call_n(cmd_draw, &[command, 3, 1, 0, 0]).expect("the draw records");
+    f.call(cmd_end_pass, [command, 0, 0, 0]).expect("the render pass ends");
+
+    assert_eq!(f.call(end, [command, 0, 0, 0]).expect("end") as i32, VK_SUCCESS);
+
+    let submit_info =
+        f.submit_info(image_available, STAGE_COLOR_ATTACHMENT_OUTPUT, command, render_finished);
+    assert_eq!(f.call(submit, [queue, 1, submit_info, fence]).expect("submit") as i32, VK_SUCCESS);
+    let fences_at = f.u64_array(&[fence]);
+    assert_eq!(
+        f.call_n(wait_fences, &[logical, 1, fences_at, 1, u64::MAX]).expect("wait") as i32,
+        VK_SUCCESS
+    );
+
+    let index_array = f.u32_array(&[image_index]);
+    let results_at = f.poisoned(8, 0x33);
+    let present_info = f.present_info(render_finished, swapchain, index_array, results_at);
+    let presented = f.call(present, [queue, present_info, 0, 0]).expect("the present completes");
+    assert_eq!(presented as i32, VK_SUCCESS, "the present must succeed");
+
+    f.call(queue_wait_idle, [queue, 0, 0, 0]).expect("queue idle");
+    f.call(device_wait_idle, [logical, 0, 0, 0]).expect("device idle");
+
+    // ------------------------------------------------------- THE EVIDENCE: the presented pixels
+    let host_swapchain = f
+        .vulkan()
+        .swapchain_handles()
+        .iter()
+        .find(|(handle, _)| *handle as u64 == swapchain)
+        .map(|(_, token)| *token)
+        .expect("the swapchain handle is one this layer issued");
+    let presented_image = host
+        .read_presented_image(host_swapchain, image_index)
+        .expect("the presented image must be readable");
+    assert_eq!(presented_image.width, extent.0);
+    assert_eq!(presented_image.height, extent.1);
+
+    let quadrants = [
+        ("top-left", extent.0 / 4, extent.1 / 4, TEXELS[0]),
+        ("top-right", extent.0 * 3 / 4, extent.1 / 4, TEXELS[1]),
+        ("bottom-left", extent.0 / 4, extent.1 * 3 / 4, TEXELS[2]),
+        ("bottom-right", extent.0 * 3 / 4, extent.1 * 3 / 4, TEXELS[3]),
+    ];
+    for (which, x, y, expected) in quadrants {
+        let pixel = presented_image.pixel(x, y).expect("a pixel inside the image");
+        assert_eq!(
+            pixel, expected,
+            "the {which} quadrant of the presented frame must be the {which} texel of the 2x2 \
+             texture the guest uploaded. Expected {expected:?} (R, G, B, A) at ({x}, {y}) and \
+             read back {pixel:?}. This is the assertion the whole stage exists for: every \
+             VkResult above could be zero with an empty frame, an un-uploaded texture or a \
+             flipped UV mapping"
+        );
+        assert_ne!(
+            pixel, DRAW_CLEAR_BYTES,
+            "and it is not the colour the render pass cleared to, which is what a frame that was \
+             never drawn into would be"
+        );
+    }
+
+    // -------------------------------------------------------------------------------- teardown
+    f.call(destroy_pipeline, [logical, pipeline, 0, 0]).expect("destroy pipeline");
+    f.call(destroy_shader, [logical, vertex_module, 0, 0]).expect("destroy module");
+    f.call(destroy_shader, [logical, fragment_module, 0, 0]).expect("destroy module");
+    f.call(destroy_pipeline_layout, [logical, pipeline_layout, 0, 0]).expect("destroy layout");
+    f.call(destroy_descriptor_pool, [logical, descriptor_pool, 0, 0]).expect("destroy pool");
+    assert!(
+        f.vulkan().descriptor_set_handles().is_empty(),
+        "destroying the pool takes its sets' handles with it, exactly as a command pool does"
+    );
+    f.call(destroy_set_layout, [logical, set_layout, 0, 0]).expect("destroy set layout");
+    f.call(destroy_sampler, [logical, sampler, 0, 0]).expect("destroy sampler");
+    f.call(destroy_view, [logical, texture_view, 0, 0]).expect("destroy view");
+    f.call(destroy_image, [logical, texture, 0, 0]).expect("destroy image");
+    f.call(destroy_buffer, [logical, vertex_buffer, 0, 0]).expect("destroy buffer");
+    f.call(destroy_buffer, [logical, staging, 0, 0]).expect("destroy buffer");
+
+    let (before, peak) = f.vulkan().imported_bytes();
+    for memory in [vertex_memory, staging_memory, texture_memory] {
+        f.call(free_memory, [logical, memory, 0, 0]).expect("free");
+    }
+    let (after, _) = f.vulkan().imported_bytes();
+    assert_eq!(after, 0, "every imported allocation gave its guest pages back");
+    assert_eq!(f.vulkan().leaked_import_bytes(), 0, "and none were lost on the way");
+
+    for framebuffer in &framebuffers {
+        f.call(destroy_framebuffer, [logical, *framebuffer, 0, 0]).expect("destroy framebuffer");
+    }
+    f.call(destroy_render_pass, [logical, render_pass, 0, 0]).expect("destroy render pass");
+    for view in &views {
+        f.call(destroy_view, [logical, *view, 0, 0]).expect("destroy view");
+    }
+    f.call(destroy_semaphore, [logical, image_available, 0, 0]).expect("destroy semaphore");
+    f.call(destroy_semaphore, [logical, render_finished, 0, 0]).expect("destroy semaphore");
+    f.call(destroy_fence, [logical, fence, 0, 0]).expect("destroy fence");
+    f.call(destroy_pool, [logical, pool, 0, 0]).expect("destroy pool");
+    f.call(destroy_swapchain, [logical, swapchain, 0, 0]).expect("destroy swapchain");
+
+    let left = host.stage_five_objects();
+    assert_eq!(left.device_memories, 0, "the host let every allocation go: {left:?}");
+    assert_eq!(left.buffers, 0);
+    assert_eq!(left.images, 0);
+    assert_eq!(left.pipelines, 0);
+    assert_eq!(left.descriptor_sets, 0);
+
+    eprintln!("\n=== stage 5 live evidence ===");
+    eprintln!("host: {host:?}");
+    eprintln!("chosen: \"{device_name}\", queue family {family}");
+    eprintln!("    swapchain {}x{}, VkFormat {format}", extent.0, extent.1);
+    eprintln!("memory types the driver reports: {shown_count}");
+    eprintln!("    importable set (vkGetMemoryHostPointerPropertiesEXT): {importable:#x}");
+    for rewrite in &masked {
+        eprintln!("    masked: {rewrite}");
+    }
+    if masked.is_empty() {
+        eprintln!("    masked: nothing -- every host-visible type on this device is importable");
+    }
+    eprintln!("    added to the device: {}", added[0]);
+    eprintln!(
+        "vkAllocateMemory       -> vertex {vertex_bytes} B from type {host_visible_type} \
+         (imported), texture {texture_size} B from type {device_local_type} (forwarded)"
+    );
+    eprintln!("vkMapMemory            -> {mapped:#x}, inside GuestSpace [{:#x}, {:#x})", space.base(), space.end());
+    eprintln!(
+        "    guest commit charge for Vulkan: {before} B live before the frees, peak {peak} B          (each import is rounded up to minImportedHostPointerAlignment)"
+    );
+    eprintln!("    vkMapMemory handed the guest {} B in total", f.vulkan().mapped_bytes());
+    eprintln!("vkCreateShaderModule   -> two real SPIR-V modules, {} and {} words",
+        TRIANGLE_VERT_SPIRV.len(), TRIANGLE_FRAG_SPIRV.len());
+    eprintln!("vkCreateGraphicsPipelines -> VkResult 0, VkPipeline {pipeline:#x}");
+    eprintln!("vkCmdDraw(3, 1, 0, 0)  -> recorded; vkQueuePresentKHR -> VkResult {}", presented as i32);
+    eprintln!(
+        "read back {}x{} from the presented image (VkFormat {}):",
+        presented_image.width, presented_image.height, presented_image.format
+    );
+    eprintln!("    the render pass cleared to {DRAW_CLEAR_COLOUR:?} = {DRAW_CLEAR_BYTES:?}");
+    for (which, x, y, expected) in quadrants {
+        eprintln!(
+            "    {which:<13} ({x:>4}, {y:>4}) = {:?}   expected the texel {expected:?}",
+            presented_image.pixel(x, y).expect("a pixel")
+        );
+    }
+    eprintln!("\n{}", f.vulkan().report());
 }

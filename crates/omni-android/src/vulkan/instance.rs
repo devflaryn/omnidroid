@@ -707,22 +707,28 @@ pub(super) fn unimplemented(
         why: format!(
             "the guest called the Vulkan function `{name}` from {caller:#x}, through the thunk \
              `vkGetInstanceProcAddr` handed out for it at {address:#x}. It was passed \
-             {registers}. **This is stage 4**: `omni_android::vulkan` forwards the instance \
+             {registers}. **This is stage 5**: `omni_android::vulkan` forwards the instance \
              bootstrap (`vkEnumerateInstanceExtensionProperties`, `vkCreateInstance`), the \
              surface substitution (`vkCreateAndroidSurfaceKHR`), the ten queries a renderer \
              makes in order to choose a physical device, `vkCreateDevice`, `vkGetDeviceQueue` and \
-             `vkGetDeviceProcAddr`, and the whole presentation spine -- the swapchain and its \
-             images, image views, semaphores and fences, command pools and command buffers, \
+             `vkGetDeviceProcAddr`, the whole presentation spine -- the swapchain and its images, \
+             image views, semaphores and fences, command pools and command buffers, \
              `vkCmdPipelineBarrier` and `vkCmdClearColorImage`, and \
-             `vkAcquireNextImageKHR`/`vkQueueSubmit`/`vkQueuePresentKHR` with the two idle \
-             waits -- all to a real host driver through `VulkanHost`. It implements no other \
-             Vulkan command: **render passes, framebuffers, pipelines, shaders, descriptors, \
-             buffers and device memory are stage 5**, and which of them gets built is decided by \
-             what the engine's census actually asks for rather than by a header. Nothing has been \
-             created, nothing has been destroyed, and no status code has been invented -- which is \
-             the whole reason this is an error and not a `VK_SUCCESS`. The ordered list of what \
-             was asked for is `Vulkan::names()`, and this call is `Vulkan::first_call()`; the next \
-             batch to implement is whichever names that list holds",
+             `vkAcquireNextImageKHR`/`vkQueueSubmit`/`vkQueuePresentKHR` with the two idle waits \
+             -- and everything between a device and a draw: device memory with \
+             `vkMapMemory`/`vkUnmapMemory` and the two bind calls, buffers, images and samplers, \
+             shader modules, pipeline layouts, render passes, framebuffers, pipeline caches and \
+             `vkCreateGraphicsPipelines`, the four descriptor calls with \
+             `vkUpdateDescriptorSets`, and the thirteen `vkCmd*` a textured draw records. All to \
+             a real host driver through `VulkanHost`. It implements no other Vulkan command: \
+             **compute pipelines, queries, events, sparse binding, buffer views, secondary \
+             command buffers and the `2`-suffixed variants are not here**, and which of them gets \
+             built is decided by what the engine's census actually asks for rather than by a \
+             header (D17). Nothing has been created, nothing has been destroyed, and no status \
+             code has been invented -- which is the whole reason this is an error and not a \
+             `VK_SUCCESS`. The ordered list of what was asked for is `Vulkan::names()`, and this \
+             call is `Vulkan::first_call()`; the next batch to implement is whichever names that \
+             list holds",
             caller = at.caller,
             address = at.address
         ),

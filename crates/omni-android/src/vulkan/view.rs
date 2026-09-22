@@ -38,7 +38,7 @@ use crate::abi::ARG_REGISTERS;
 use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 
-use super::host::{DriverAnswer, HostImageRef, ImageViewRequest};
+use super::host::{DriverAnswer, ImageViewRequest};
 use super::instance::{guest_pointer, refuse_allocator, require_pointer};
 use super::{Site, Vulkan, VK_SUCCESS};
 
@@ -132,11 +132,16 @@ pub(super) fn create_image_view(
 
     // The one member that is a handle. Non-dispatchable, so a forged value would not fault -- it
     // would make a view of some other image, and everything afterwards would look right.
-    let image = vulkan.image_token(at, CALL, u64_at(24))?;
+    //
+    // **Either image family**, which is stage 5 arriving: the swapchain's images still come
+    // through `vkGetSwapchainImagesKHR`, and a texture the guest made with `vkCreateImage` is
+    // viewed by exactly this call. `image_ref_token` says which family it found, so the answer
+    // carries the distinction to the host rather than losing it here.
+    let image = vulkan.image_ref_token(at, CALL, u64_at(24))?;
 
     let request = ImageViewRequest {
         flags: u32_at(16),
-        image: HostImageRef::Swapchain(image),
+        image,
         view_type: u32_at(32),
         format: u32_at(36),
         components: info[40..40 + COMPONENT_MAPPING_BYTES].to_vec(),

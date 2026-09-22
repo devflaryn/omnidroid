@@ -97,8 +97,20 @@ impl Guest {
 
     /// A boundary builder over **this** guest's address space, so its thunk region is identity-mapped
     /// alongside the code the tests write.
+    ///
+    /// The data area is [`omni_android::vulkan::REQUIRED_DATA_BYTES`] — **8192, raised from 4096
+    /// by stage 5**. That constant's own documentation carries the argument: thirteen new handle
+    /// families need 3,584 bytes and stage 4 left 448, so there is no arrangement of them that
+    /// fits the old area. Every boundary here passes the larger number whether it binds a `Vulkan`
+    /// or not, because the area costs address space rather than commit charge and one number is
+    /// what keeps a test from being the place the difference is discovered.
     pub fn boundary(&self, slots: usize) -> BoundaryBuilder {
-        BoundaryBuilder::new(Arc::clone(&self.space), slots, 4096).expect("a thunk region")
+        BoundaryBuilder::new(
+            Arc::clone(&self.space),
+            slots,
+            omni_android::vulkan::REQUIRED_DATA_BYTES,
+        )
+        .expect("a thunk region")
     }
 
     /// Where the next [`load`](Guest::load) will put a program.
