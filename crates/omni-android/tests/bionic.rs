@@ -8580,6 +8580,118 @@ fn sendmsg_gathers_its_iovecs_into_one_datagram_and_refuses_control_messages() {
     assert!(error.to_string().contains("control messages"), "{error}");
 }
 
+/// **`sendmsg` with a `UDP_SEGMENT` control message sends one datagram per segment**, the last one
+/// shorter, and answers the whole length -- what the engine's QUIC transport sends, and what
+/// Linux's GSO puts on the wire. A payload no longer than one segment, or a segment size of 0, is
+/// the one datagram it is. The kernel's own `EINVAL`s: `cmsg_len` other than `CMSG_LEN(2)`,
+/// another `SOL_UDP` message, a header failing `CMSG_OK`, and a 65th segment -- 64 is allowed.
+#[test]
+fn sendmsg_with_udp_segment_sends_one_datagram_per_segment() {
+    let _guard = serialized();
+    let (f, _root) = networked("sendmsg-gso");
+    let socket = || {
+        value_of(&f, "socket", |asm| {
+            asm.mov(0, AF_INET);
+            asm.mov(1, 2); // SOCK_DGRAM
+            asm.mov(2, 0);
+        }) as i32
+    };
+    let (receiver, sender) = (socket(), socket());
+    let sockaddr = f.guest.data + 0x100;
+    let mut bytes = [0u8; 16];
+    bytes[0..2].copy_from_slice(&2u16.to_le_bytes());
+    bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    f.guest.write_bytes(sockaddr, &bytes);
+    assert_eq!(
+        value_of(&f, "bind", |asm| {
+            asm.mov(0, receiver as u64);
+            asm.mov(1, sockaddr as u64);
+            asm.mov(2, 16);
+        }) as i32,
+        0
+    );
+    let len_at = f.guest.data + 0x140;
+    f.guest.write_bytes(len_at, &16u32.to_le_bytes());
+    value_of(&f, "getsockname", |asm| {
+        asm.mov(0, receiver as u64);
+        asm.mov(1, sockaddr as u64);
+        asm.mov(2, len_at as u64);
+    });
+
+    let payload = f.guest.data + 0x200;
+    let iov = f.guest.data + 0x300;
+    let msg = f.guest.data + 0x340;
+    let control = f.guest.data + 0x380;
+    let buf = f.guest.data + 0x400;
+    f.guest.write_u64(iov, payload as u64);
+    f.guest.write_bytes(msg, &[0u8; 56]);
+    f.guest.write_u64(msg, sockaddr as u64);
+    f.guest.write_u64(msg + 8, 16);
+    f.guest.write_u64(msg + 16, iov as u64);
+    f.guest.write_u64(msg + 24, 1);
+    f.guest.write_u64(msg + 32, control as u64);
+    f.guest.write_u64(msg + 40, 24);
+    let message = |data: &[u8], cmsg_len: u64, level: u32, kind: u32, size: u16| {
+        f.guest.write_bytes(payload, data);
+        f.guest.write_u64(iov + 8, data.len() as u64);
+        f.guest.write_bytes(control, &[0u8; 24]);
+        f.guest.write_u64(control, cmsg_len);
+        f.guest.write_u64(control + 8, u64::from(level) | (u64::from(kind) << 32));
+        f.guest.write_bytes(control + 16, &size.to_le_bytes());
+    };
+    let send = |asm: &mut Asm| {
+        asm.mov(0, sender as u64);
+        asm.mov(1, msg as u64);
+        asm.mov(2, 0);
+    };
+    let receive = || {
+        let got = value_of(&f, "recvfrom", |asm| {
+            asm.mov(0, receiver as u64);
+            asm.mov(1, buf as u64);
+            asm.mov(2, 128);
+            asm.mov(3, 0);
+            asm.mov(4, 0);
+            asm.mov(5, 0);
+        }) as i64;
+        assert!(got >= 0, "recvfrom answered {got}");
+        read_guest(&f, buf, got as usize)
+    };
+
+    message(b"0123456789", 18, 17, 103, 4);
+    assert_eq!(value_of(&f, "sendmsg", send) as i64, 10, "the whole length");
+    assert_eq!(receive(), b"0123", "the first segment, alone");
+    assert_eq!(receive(), b"4567");
+    assert_eq!(receive(), b"89", "the last one shorter");
+
+    message(b"0123456789", 18, 17, 103, 16);
+    assert_eq!(value_of(&f, "sendmsg", send) as i64, 10);
+    assert_eq!(receive(), b"0123456789", "no longer than a segment: one datagram");
+    message(b"abc", 18, 17, 103, 0);
+    assert_eq!(value_of(&f, "sendmsg", send) as i64, 3);
+    assert_eq!(receive(), b"abc", "a segment size of 0 is no segmentation");
+
+    let sixty_four = [b'x'; 64];
+    message(&sixty_four, 18, 17, 103, 1);
+    assert_eq!(value_of(&f, "sendmsg", send) as i64, 64, "UDP_MAX_SEGMENTS is allowed");
+    for _ in 0..64 {
+        assert_eq!(receive(), b"x");
+    }
+    let (value, errno) = {
+        message(&[b'y'; 65], 18, 17, 103, 1);
+        value_and_errno(&f, "sendmsg", send)
+    };
+    assert_eq!((value as i64, errno), (-1, 22), "a 65th segment is EINVAL");
+    message(b"0123456789", 20, 17, 103, 4);
+    let (value, errno) = value_and_errno(&f, "sendmsg", send);
+    assert_eq!((value as i64, errno), (-1, 22), "cmsg_len must be CMSG_LEN(2)");
+    message(b"0123456789", 18, 17, 104, 4);
+    let (value, errno) = value_and_errno(&f, "sendmsg", send);
+    assert_eq!((value as i64, errno), (-1, 22), "UDP_GRO is not a send's control message");
+    message(b"0123456789", 30, 0, 1, 0);
+    let (value, errno) = value_and_errno(&f, "sendmsg", send);
+    assert_eq!((value as i64, errno), (-1, 22), "cmsg_len past msg_controllen fails CMSG_OK");
+}
+
 /// **The `struct addrinfo` list the guest walks is bionic's layout, read back the way the guest
 /// reads it.**
 ///
@@ -8860,7 +8972,7 @@ fn path_mtu_discovery_do_is_dont_fragment_and_other_modes_refuse() {
     // UDP_GRO is accepted on a datagram socket; UDP_SEGMENT (103) still refuses.
     assert_eq!(value_of(&f, "setsockopt", set(17, 104, 1)) as i32, 0, "UDP_GRO");
     let error = refusal_of(&f, "setsockopt", set(17, 103, 1200));
-    assert!(error.to_string().contains("option 103"), "UDP_SEGMENT is not accepted: {error}");
+    assert!(error.to_string().contains("UDP_SEGMENT"), "UDP_SEGMENT is not accepted: {error}");
 }
 
 #[test]

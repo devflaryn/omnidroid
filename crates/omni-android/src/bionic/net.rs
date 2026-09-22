@@ -1631,8 +1631,11 @@ const IPV6_MTU_DISCOVER: i32 = 23;
 /// `IP_PMTUDISC_DONT`: never set don't-fragment. The same values serve `IPV6_MTU_DISCOVER`.
 const IP_PMTUDISC_DONT: i32 = 0;
 /// Linux's `UDP_GRO`, at level `IPPROTO_UDP` (`linux/udp.h`): receive offload. `UDP_SEGMENT` (103),
-/// its send-side twin, is **not** accepted -- see the arm that answers this one.
+/// its send-side twin, is **not** accepted as a socket option -- see the arm that answers this
+/// one -- but is honoured as `sendmsg`'s control message, see [`sendmsg`].
 const UDP_GRO: i32 = 104;
+/// Linux's `UDP_SEGMENT` (`linux/udp.h`): a send's GSO segment size, a `__u16`.
+const UDP_SEGMENT: i32 = 103;
 /// `IP_PMTUDISC_DO`: always set don't-fragment. `WANT` (1), `PROBE` (3), `INTERFACE` (4) and `OMIT`
 /// (5) have no Windows spelling and are refused -- see `SocketOption::DontFragment`.
 const IP_PMTUDISC_DO: i32 = 2;
@@ -2450,6 +2453,7 @@ fn option_name(level: i32, name: i32) -> String {
         IPPROTO_TCP => "IPPROTO_TCP".to_owned(),
         IPPROTO_IPV6 => "IPPROTO_IPV6".to_owned(),
         IPPROTO_IP => "IPPROTO_IP".to_owned(),
+        IPPROTO_UDP => "IPPROTO_UDP".to_owned(),
         other => format!("level {other}"),
     };
     let option = match (level, name) {
@@ -2467,6 +2471,7 @@ fn option_name(level: i32, name: i32) -> String {
         (IPPROTO_IPV6, IPV6_V6ONLY) => "IPV6_V6ONLY".to_owned(),
         (IPPROTO_IP, IP_MTU_DISCOVER) => "IP_MTU_DISCOVER".to_owned(),
         (IPPROTO_UDP, UDP_GRO) => "UDP_GRO".to_owned(),
+        (IPPROTO_UDP, UDP_SEGMENT) => "UDP_SEGMENT".to_owned(),
         (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => "IPV6_MTU_DISCOVER".to_owned(),
         (_, other) => format!("option {other}"),
     };
@@ -2619,9 +2624,10 @@ pub(super) fn setsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             // Linux socket still delivers plain datagrams -- and no `UDP_GRO` control message --
             // when nothing was coalesced, and every GRO reader (ngtcp2 here, the MEASURED caller)
             // handles that as the ordinary case. So "on" is true of this socket in the only sense
-            // a caller can observe. Not so its send-side twin `UDP_SEGMENT`, which promises to
-            // split one send into several datagrams: accepting that without splitting would put
-            // one oversized datagram on the wire, so it stays unimplemented and refuses.
+            // a caller can observe. Not so its send-side twin `UDP_SEGMENT` as a socket option,
+            // which promises to split every later send into several datagrams: accepting it
+            // without splitting would put one oversized datagram on the wire, so it stays
+            // unimplemented and refuses. Its control-message form, per `sendmsg`, is split there.
             // `ENOPROTOOPT` on a stream socket, as Linux answers a UDP option there.
             (IPPROTO_UDP, UDP_GRO) => {
                 if locked(&handle).kind() != omni_platform::net::SocketKind::Datagram {
@@ -3114,10 +3120,28 @@ const UIO_MAXIOV: u64 = 1024;
 /// `msg_name` when there is one, on the connection when there is not. MEASURED reader: the
 /// engine's QUIC transport (ngtcp2's `sendmsg`), once the engine was on Vulkan.
 ///
-/// **Control messages are refused by name, and each one is listed.** The two a QUIC stack sends
-/// are an ECN mark (`IP_TOS`/`IPV6_TCLASS`) and a GSO segment size (`UDP_SEGMENT`), and neither
-/// can be dropped quietly: the first is a marking the peer's ECN validation reads, the second asks
-/// for one send to become several datagrams. Which ones this engine sends is for a run to say.
+/// # `UDP_SEGMENT` is honoured by doing what the kernel's software GSO does
+///
+/// MEASURED: the transport sends a batch of QUIC packets as one `sendmsg` carrying a
+/// `UDP_SEGMENT` control message (`cmsg_len` 18, the `__u16` segment size). Linux cuts the
+/// payload into `gso_size`-byte datagrams, the last one shorter, all to the same destination, and
+/// answers the whole length; when the NIC cannot segment, the kernel's own software GSO does the
+/// cutting, so the datagrams on the wire do not depend on the device. That is what happens here:
+/// one host send per segment. The kernel's own checks come first, from `udp_cmsg_send` and
+/// `udp_send_skb` at the kernels Android 13 ships (android13-5.10 and -5.15): a malformed header
+/// (`CMSG_OK`), a `SOL_UDP` message other than `UDP_SEGMENT`, a `cmsg_len` other than
+/// `CMSG_LEN(2)`, or more than [`UDP_MAX_SEGMENTS`] segments is `EINVAL`, and a payload no longer
+/// than one segment is sent as the one datagram it is. Two differences, neither reachable by a
+/// correct caller: a segment larger than the path MTU is the host's `EMSGSIZE` from the first
+/// send rather than Linux's up-front `EINVAL`, and a host send failing **after** the first
+/// segment answers that failure with the earlier segments already sent -- Linux has no such point,
+/// its segments leave as one buffer -- which a QUIC sender's retransmission turns into duplicate
+/// packets its peer discards.
+///
+/// **Every other control message refuses by name, and each one is listed.** An ECN mark
+/// (`IP_TOS`/`IPV6_TCLASS`) is a marking the peer's ECN validation reads and cannot be dropped
+/// quietly; which ones this engine sends is for a run to say. A stream socket's control messages
+/// refuse too: none has been measured there.
 pub(super) fn sendmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (fd, msg, flags) = {
         let mut a = c.args();
@@ -3138,36 +3162,46 @@ pub(super) fn sendmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let (name, namelen) = (word(0), word(8) as u32);
         let (iov, iovlen) = (word(16), word(24));
         let (control, controllen) = (word(32), word(40));
+        let datagram = locked(&handle).kind() == omni_platform::net::SocketKind::Datagram;
+        let mut segment_size = 0usize;
         if control != 0 && controllen != 0 {
-            let mut listed = Vec::new();
-            let mut offset = 0u64;
-            while offset + 16 <= controllen && listed.len() < 8 {
-                let cmsg = view.mem().read_bytes(
-                    guest_address(view, control + offset)?,
-                    16,
-                    Blame::new(view.symbol(), view.address(), 1),
-                )?;
-                let len = u64::from_le_bytes(cmsg[0..8].try_into().expect("eight bytes"));
-                let level = i32::from_le_bytes(cmsg[8..12].try_into().expect("four bytes"));
-                let kind = i32::from_le_bytes(cmsg[12..16].try_into().expect("four bytes"));
-                listed.push(format!("{} (cmsg_len {len})", option_name(level, kind)));
-                if len < 16 {
-                    break;
+            let controls = match control_messages(view, control, controllen)? {
+                Netted::Done(controls) => controls,
+                Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+            };
+            let mut refused = Vec::new();
+            for message in &controls {
+                if datagram && message.level == IPPROTO_UDP {
+                    // `__udp_cmsg_send`: the one `SOL_UDP` message a send takes, at exactly its
+                    // own length; anything else at that level is `EINVAL`, not ignored.
+                    if message.kind != UDP_SEGMENT || message.len != UDP_SEGMENT_CMSG_LEN {
+                        return Ok(Netted::Failed(consts::EINVAL));
+                    }
+                    segment_size = usize::from(message.segment_size);
+                } else {
+                    refused.push(format!(
+                        "{} (cmsg_len {})",
+                        option_name(message.level, message.kind),
+                        message.len
+                    ));
                 }
-                offset += len.next_multiple_of(8);
             }
-            return Err(view.refusal(format!(
-                "the guest called sendmsg(fd {fd}) with {controllen} bytes of control messages: \
-                 {}. None is implemented: an ECN mark and a GSO segment size -- what a QUIC \
-                 stack sends -- can neither be dropped quietly (the peer's ECN validation reads \
-                 the first; the second asks for one send to become several datagrams)",
-                listed.join(", ")
-            )));
+            if !refused.is_empty() {
+                return Err(view.refusal(format!(
+                    "the guest called sendmsg(fd {fd}, a {} socket) with {controllen} bytes of \
+                     control messages, of which these are not implemented: {}. An ECN mark -- \
+                     what a QUIC stack sends besides UDP_SEGMENT -- cannot be dropped quietly: \
+                     the peer's ECN validation reads it",
+                    if datagram { "datagram" } else { "stream" },
+                    refused.join(", ")
+                )));
+            }
         }
         if iovlen > UIO_MAXIOV {
             return Ok(Netted::Failed(EMSGSIZE));
         }
         let mut bytes = Vec::new();
+        let mut asked = 0u64;
         for k in 0..iovlen {
             let entry = view.mem().read_bytes(
                 guest_address(view, iov + 16 * k)?,
@@ -3176,6 +3210,12 @@ pub(super) fn sendmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             )?;
             let base = u64::from_le_bytes(entry[0..8].try_into().expect("eight bytes"));
             let len = u64::from_le_bytes(entry[8..16].try_into().expect("eight bytes"));
+            asked = asked.saturating_add(len);
+            // `udp_sendmsg`'s first check: a UDP payload is at most 0xFFFF bytes, however many
+            // segments it is to become.
+            if datagram && asked > UDP_MAX_PAYLOAD {
+                return Ok(Netted::Failed(EMSGSIZE));
+            }
             let want = transfer_length(len);
             if want == 0 {
                 continue;
@@ -3192,8 +3232,86 @@ pub(super) fn sendmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             }
         };
         check_message_flags(view, flags)?;
-        send_bytes(view, &handle, fd, &bytes, flags, to)
+        if segment_size == 0 || bytes.len() <= segment_size {
+            return send_bytes(view, &handle, fd, &bytes, flags, to);
+        }
+        if bytes.len() > segment_size * UDP_MAX_SEGMENTS {
+            return Ok(Netted::Failed(consts::EINVAL));
+        }
+        let mut sent = 0i64;
+        for segment in bytes.chunks(segment_size) {
+            match send_bytes(view, &handle, fd, segment, flags, to)? {
+                Netted::Done(count) => sent += count,
+                Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+            }
+        }
+        Ok(Netted::Done(sent))
     })
+}
+
+/// `CMSG_LEN(sizeof(__u16))`: the 16-byte `cmsghdr` and `UDP_SEGMENT`'s segment size.
+const UDP_SEGMENT_CMSG_LEN: u64 = 18;
+/// Linux's `UDP_MAX_SEGMENTS` at android13-5.10 and -5.15: `1 << 6`.
+const UDP_MAX_SEGMENTS: usize = 64;
+/// The most one UDP send carries, segmented or not (`udp_sendmsg`: `len > 0xFFFF` is `EMSGSIZE`).
+const UDP_MAX_PAYLOAD: u64 = 0xFFFF;
+/// `net.core.optmem_max`'s default: a control buffer larger than this is `ENOBUFS`, because
+/// `sock_kmalloc` will not allocate it.
+const OPTMEM_MAX: u64 = 20480;
+
+/// One control message's header, and `UDP_SEGMENT`'s value when it is one.
+struct ControlMessage {
+    len: u64,
+    level: i32,
+    kind: i32,
+    /// The `__u16` after the header, read only when `len` is `UDP_SEGMENT`'s.
+    segment_size: u16,
+}
+
+/// Walk `msg_control` as the kernel's `for_each_cmsghdr` does: `CMSG_FIRSTHDR` is nothing below
+/// one header, each header must pass `CMSG_OK` (`EINVAL` otherwise), and `CMSG_NXTHDR` steps by
+/// `CMSG_ALIGN(cmsg_len)` and stops when the next header would not fit.
+fn control_messages(
+    view: &GuestView<'_>,
+    control: u64,
+    controllen: u64,
+) -> AbiResult<Netted<Vec<ControlMessage>>> {
+    if controllen > OPTMEM_MAX {
+        return Ok(Netted::Failed(ENOBUFS));
+    }
+    let mut out = Vec::new();
+    if controllen < 16 {
+        return Ok(Netted::Done(out));
+    }
+    let raw = view.mem().read_bytes(
+        guest_address(view, control)?,
+        controllen as usize,
+        Blame::new(view.symbol(), view.address(), 1),
+    )?;
+    let mut offset = 0usize;
+    loop {
+        let header = &raw[offset..offset + 16];
+        let len = u64::from_le_bytes(header[0..8].try_into().expect("eight bytes"));
+        if len < 16 || len > controllen - offset as u64 {
+            return Ok(Netted::Failed(consts::EINVAL));
+        }
+        let segment_size = if len == UDP_SEGMENT_CMSG_LEN {
+            u16::from_le_bytes(raw[offset + 16..offset + 18].try_into().expect("two bytes"))
+        } else {
+            0
+        };
+        out.push(ControlMessage {
+            len,
+            level: i32::from_le_bytes(header[8..12].try_into().expect("four bytes")),
+            kind: i32::from_le_bytes(header[12..16].try_into().expect("four bytes")),
+            segment_size,
+        });
+        let next = offset + (len as usize).next_multiple_of(8);
+        if next + 16 > controllen as usize {
+            return Ok(Netted::Done(out));
+        }
+        offset = next;
+    }
 }
 
 /// `ssize_t __sendto_chk(int fd, const void *buf, size_t len, size_t buflen, int flags, const struct sockaddr *dest, socklen_t addrlen)`
