@@ -970,6 +970,71 @@ Two more open threads from the same run:
 * The `DynamicFastVariableReloader`'s `.zst` request aborts at **exactly `time:5012.3ms`** with a
   now well-formed URL -- a 5 s client-side timeout, unexplained.
 
+## Stage 5 is built: a textured triangle drawn by guest code, four quadrants asserted
+
+**The `wip(vk)` commit message on `dfb6395` is wrong** — it says the triangle test is not in the
+tree and to treat the modules as unverified. Both were true when it was written and neither is now.
+This section is the correction; do not redo that verification.
+
+```text
+memory types the driver reports: 5
+    importable set (vkGetMemoryHostPointerPropertiesEXT): 0xc
+    masked: memory type 4 "DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT" shown as "DEVICE_LOCAL"
+    added to the device: "VK_EXT_external_memory_host" (not requested by the guest)
+vkAllocateMemory -> vertex 48 B from type 2 (imported), texture 512 B from type 1 (forwarded)
+vkMapMemory      -> 0x198ac960000, inside GuestSpace [0x198ac4c0000, 0x199ac4c0000)
+vkCreateShaderModule -> two real SPIR-V modules, 151 and 113 words
+vkCreateGraphicsPipelines -> VkResult 0 ; vkCmdDraw(3,1,0,0) ; vkQueuePresentKHR -> VkResult 0
+read back 512x512 from the presented image:
+    top-left     (128,128) = [32, 96, 160, 255]    expected the texel [32, 96, 160, 255]
+    top-right    (384,128) = [16, 176, 64, 255]    expected the texel [16, 176, 64, 255]
+    bottom-left  (128,384) = [200, 48, 16, 255]    expected the texel [200, 48, 16, 255]
+    bottom-right (384,384) = [240, 224, 80, 255]   expected the texel [240, 224, 80, 255]
+```
+
+A 2x2 texture of four distinct colours, uploaded through a mapped staging buffer and
+`vkCmdCopyBufferToImage`, sampled by a fullscreen triangle. **Four quadrants rather than one
+colour**, because that catches three failures independently: no draw (the frame is the clear
+colour, which is none of the four), no upload (would need those four colours in those four places
+by coincidence), and a flipped or transposed UV mapping (a single-colour texture cannot see it).
+The SPIR-V is hand-assembled — there is no shader compiler on this machine — and the driver
+compiling it plus the pixels coming back are what check it.
+
+**The memory route is the measured one, and the invariant is enforced rather than assumed**: the
+shim compares the driver's `vkMapMemory` answer against the pointer it imported and **refuses if
+they differ**. Non-host-visible types forward ordinarily and refuse `vkMapMemory` by name, as the
+specification does.
+
+**Two Global Constraint 1 rewrites, both logged.** Memory types that are `HOST_VISIBLE` but not
+importable have those bits **cleared, not removed** — removing the entry would renumber every index
+the guest later passes to `vkAllocateMemory`. And `VK_EXT_external_memory_host` is **added to the
+device the guest asked for**, because the engine asks only for `VK_KHR_swapchain`: the device the
+guest receives is not the device it described, and the log says so.
+
+**`pNext` is refused everywhere the guest sends one**, and the refusal names the address — which
+turns "what does the engine actually send?" into a measurement. `vkAllocateMemory` is the sharpest
+case, because this layer *constructs* the one chain an allocation carries.
+
+`REQUIRED_DATA_BYTES` is now **8192** (`REGISTRY_BYTES` 7360). **There is no arrangement of
+thirteen handle families that fits 4096**, so the data area had to be raised; only the four Vulkan
+harnesses bind a `Vulkan` and the other embeddings stay at 4096.
+
+### Three things stage 5 left, worth knowing before touching it
+
+1. **`minImportedHostPointerAlignment` falls back to 64 KiB.** It lives in a struct chained onto
+   `vkGetPhysicalDeviceProperties2`, a Vulkan **1.1** entry point, and the instance is the
+   *guest's*, created at apiVersion 1.0 — so neither spelling resolves. The fallback is safe
+   (over-alignment satisfies the real 4096) but costs rounding: 48 B and 16 B allocations took
+   65,536 B each. Bounded at ~2 MiB against a 3,584 MiB ceiling. A throwaway 1.1 instance recovers
+   it.
+2. **`probe_importable` creates a throwaway `VkDevice`** per physical device. The tempting
+   shortcut — "host-visible and not device-local" — reproduces the measured `0xc` exactly, **and
+   that is precisely why it was not used**: a derivation that agrees with one measurement.
+3. **A deadlock was introduced and fixed, and how it was found is the lesson**: two
+   `locked_memories()` calls in one struct expression, where a temporary lives to the end of the
+   *statement* and `std::sync::Mutex` is not reentrant. Every assertion had already passed — it
+   hung in teardown.
+
 ## The two things between here and a real Roblox frame
 
 **1. `HTTP 400` on the client-settings request.** The transport is proven; the *request* is
