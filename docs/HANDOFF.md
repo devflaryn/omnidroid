@@ -31,9 +31,9 @@ adapter review were exactly that.
 | 14 | **M5 — reached** | the game thread runs `android_app_entry`, and §8 row 14's cond-wait completes |
 | 15 | **reached** | the game thread runs `android_main` → `NativeEngine::GameLoop()` |
 | 16-20 | **M6 — reached** | all seven lifecycle/surface natives return, and the engine logs `APP_CMD_INIT_WINDOW: hasWindow = true` through `APP_CMD_CONTENT_RECT_CHANGED`. `ALooper_pollOnce(-1)` now waits instead of refusing, on a measured wake source |
-| **21-22** | **M6 — the live blocker** | driven (`script::FLAGS_AND_START`), and `nativeInitClientSettings` reaches the engine's settings parser — then spins on a guest lock held since §8 step 7 by one of two workers stranded in a raw `futex` wait. **§8.1's sixth failure mode, and it hangs rather than errors** |
-| 23-24 | M6 | the rest of the flags/settings orchestration, unreached |
-| 25 | **M6/M7 — essentially unbuilt** | EGL (17 hard-linked symbols, **0 bound**) then Vulkan via `dlopen` (**0 `vk*` imports**). `omni-gfx` is a 16-line stub that nothing depends on |
+| **21** | **M6 — half reached** | `nativeInitClientSettings` **returns 0 and the flags load** (`Flag::areFlagsLoaded` = 1); the engine writes its flag cache, brings up Mimalloc and reports its build. `nativePostClientSettingsLoadedInitialization3` then blocks in `pthread_cond_wait` — **the live blocker**. Opt-in: `OMNI_M6_ROWS_21_22=1` |
+| 22-24 | M6 | `nativeGameGlobalInit`, the app start, the surface update — unreached |
+| 25 | **M7 — the host half exists** | `omni-platform::window` and `omni-gfx` are real: a resizable Win32 window and a Vulkan swapchain presenting **pixel-verified** frames. What is still unbuilt is the *guest-facing* half — EGL (17 hard-linked symbols, **0 bound**) and Vulkan via `dlopen` (**0 `vk*` imports**), and nothing yet connects `ANativeWindow` geometry to the host window |
 | 26 | M7/M8 | input, first frame, interactive |
 
 **The architectural fact that shapes M5 and M6:** the Java side is the **initiator**. `libroblox.so`
@@ -899,117 +899,117 @@ Read in this order:
 
 ## Where the runtime actually stops today
 
-`cargo test -p omni-android --release --test gameactivity` is the gate, and it is **green**. It
-loads the real APK, runs all 3,594 initializers, `JNI_OnLoad`, §8 steps 7-12, then
-`Java_com_google_androidgamesdk_GameActivity_initializeNativeCode`, which returns a non-zero
-`NativeCode *`. The game thread runs `android_app_entry` → `android_main` →
-`NativeEngine::GameLoop()` → `bootstrapTheApp()` → `ALooper_pollOnce(-1)`.
+`cargo test -p omni-android --release --test gameactivity` is the gate, it is **green**, and it
+now takes **27 s** rather than 49 — `strchr` had been scanning megabytes of zeroed pages on every
+miss, and fixing it is the single largest change in this session.
 
-**That wait now happens instead of being refused, and §8 rows 17-20 all land.** The gate drives
-them from its own main thread, the way ART would, and the engine answers by name:
+What runs, every time, asserted:
+
+* all 3,594 initializers, `JNI_OnLoad`, and §8 steps 7-12 at **21 of 21** scripted downcalls —
+  `nativeSetPlatformHeadersWithIdfa`, carried as an open item since M4, returns;
+* `initializeNativeCode` returns a `NativeCode *`, the game thread reaches
+  `NativeEngine::GameLoop()`, and `ALooper_pollOnce(-1)` **waits** rather than refusing;
+* §8 rows 17-20 — all seven lifecycle/surface natives — and the engine answers by name:
 
 ```text
 APP_CMD_INIT_WINDOW: hasWindow = true, hasFocus = false
 APP_CMD_WINDOW_RESIZED / APP_CMD_START / APP_CMD_RESUME
 APP_CMD_GAINED_FOCUS / APP_CMD_CONTENT_RECT_CHANGED
-nativeActivity_onSurfaceChanged: ... Flags-Not-Received. Return.
 ```
 
-That last line is §8.1's **sixth** failure mode arriving exactly where it says it will. The engine
-will not ask for a renderer until the flags phase has run, so **the frontier is §8 rows 21-22, not
-graphics**, and a run that stops here looks like a graphics problem from outside and is not one.
-
-## The immediate blocker: two stranded workers behind one spin lock
-
-§8 row 21's `nativeInitClientSettings` reaches the engine's settings parser and then **spins
-for its whole 200,000,000-instruction budget** at guest `0x021eba20` — the `yield` of a
-three-instruction `ldr`/`cbz`/`yield` spin whose acquire is `swap(1, 0x06dd0a30)` through the
-outline-atomic helper at `0x032f0950`.
-
-`stall_report` in the gate prints the whole diagnosis in one place:
+And with `OMNI_M6_ROWS_21_22=1`, **§8 row 21's first downcall returns and the flags load**:
 
 ```text
-spin lock 0x1 count 0x1 | import crossings 24823417 -> 24823417 (FROZEN) | live threads 2
-  thread 0x2: start routine link 0x284d168, running true
-  thread 0x3: start routine link 0x284d168, running true
-  thread 0x4: start routine link 0x621bdbc, running FALSE
-  futex: 3 wait(s), 42536 wake(s), 2 with no deadline; cond-parked []
-  parked on ...d0c x1: the word reads Ok(0)
-  parked on ...40c x1: the word reads Ok(0)
-  thread 0x2 FUTEX_WAIT_BITSET on ...d0c value 0 from guest link 0x284d134 -> ENTERED AND NEVER RETURNED
-  thread 0x3 FUTEX_WAIT_BITSET on ...40c value 0 from guest link 0x284d134 -> ENTERED AND NEVER RETURNED
+nativeInitClientSettings -> returned 0 ; engine Flag::areFlagsLoaded byte: 1
+[FLog::FlagCache] writeFlagCache: Successfully wrote 31 bytes to flag_cache.dat
+[DFLog::Mimalloc] Mimalloc integration detected, settings: ...
+[FLog::ClientRunInfo] RobloxGitHash: 4b82efeca5f6e7cf71243007cd28125595ff143d
 ```
 
-Read it in this order, because that is the order it narrows:
+That is what §8 row 21 exists to do, and the TaskScheduler's
+`Can't initialize the TaskScheduler before flags have been loaded` is gone.
 
-* **The lock has been held since §8 step 7**, `JNIBaseUrlProtocol.init`. It is `0` before the
-  initializers, `0` after all 3,594, `0` after `JNI_OnLoad`, and `1` from the first step-7
-  downcall onwards. Its refcount at `0x06dd0a34` is `1`, and that word is only incremented at
-  `0x0600f6dc` — **inside** the critical section — so the holder is inside `0x0600f6c4`'s
-  first-entry path, which is `bl 0x01dc7428`.
-* **Import crossings are frozen.** No guest thread is executing anything.
-* **Two guest threads are stranded in a raw `futex` wait**, both from `0x0284d130`:
+## The immediate blocker: two idle workers and a main thread waiting on them
+
+Row 21's **second** downcall, `nativePostClientSettingsLoadedInitialization3`, does not return.
+The gate's watchdog samples every 20 s and the picture is stable from the first sample on:
+
+```text
+M6 watchdog sample: crossings 23643372 -> 23643372 (FROZEN), last JNIEnv::GetFieldID, live threads 3
+    futex parked ["0x...2e60 x1", "0x...a1f0 x1"], indefinite 2,
+    cond-parked ["GuestThreadId(6) in pthread_cond_wait on cond 0x...384 mutex 0x...35c"]
+```
+
+* **`GuestThreadId(6)` is the calling thread itself** — the gate's own thread, inside the
+  downcall, in `pthread_cond_wait`. It is not in `guest_thread_list`, which holds only the three
+  threads the guest *created* (`0x2`, `0x3`, `0x4`).
+* **Crossings are frozen**, so nothing is executing imports, and no guest instructions are being
+  executed either — the `LIFECYCLE_BUDGET` of 2×10⁹ would have expired in seconds otherwise.
+* **Threads `0x2` and `0x3` are the two idle workers**, parked in a raw indefinite
+  `FUTEX_WAIT_BITSET` from guest `0x0284d130` since before §8 step 7, on the high half of a
+  64-bit atomic whose upper word is a sequence counter:
 
   ```text
-  0x284d114: add x1, x19, #4     ; the word is obj + 4
-  0x284d118: mov w0, #0x62       ; 98 = SYS_futex
-  0x284d11c: mov w2, #0x89       ; FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG
-  0x284d124: mov x4, xzr         ; timeout NULL -- indefinite, by the guest's own choice
-  0x284d12c: mov w6, #-1         ; FUTEX_BITSET_MATCH_ANY
+  0x284d030: bl   <atomic load of [x19]>
+  0x284d040: cmp  x21, x0, lsr #32   ; the expected value is the SEQUENCE, x19 + 4
+  0x284d048: cmn  x20, #1            ; timeout == -1 ?
+  0x284d04c: b.eq 0x284d114          ; yes -> the untimed wait
+  0x284d114: add  x1, x19, #4 / mov w0,#0x62 / mov w2,#0x89 / mov x4,xzr / mov w6,#-1
   ```
 
-  This layer honours that correctly; the wait is exactly what the guest asked for.
-* **It is not a lost wake.** Both words still read the value the waiters parked expecting (`0`),
-  and a scan of all 28 raw `syscall` sites finds the wake side — five
-  `FUTEX_WAKE_BITSET|PRIVATE` (`0x8a`) at `0x2856274`..`0x2857078` and one `FUTEX_WAKE|PRIVATE`
-  at `0x61a34d0` — **none of which ran**. They are idle workers on a queue nothing posted to.
-* **Thread `0x4` finished**, normally: `guest_thread_failures()` is empty.
+  **Not a lost wake**: both words still read what the waiters parked expecting, and
+  `AddressFutex::near_misses()` — added for exactly this question — reports **empty**, so no wake
+  has ever landed within eight bytes of either. They are workers on a queue nothing posts to.
+* **Thread `0x4` is alive and doing nothing** either, and is the piece with no explanation yet.
 
-So the chain is: **two stranded workers → a held lock → no client settings → no flags → the engine
-never asks for a renderer.**
+So the open question is one thing: **what should post work to those workers, and why has it not
+run.** A scan of all 28 raw `syscall` sites finds wake sides in the binary — five
+`FUTEX_WAKE_BITSET|PRIVATE` at `0x2856274`..`0x2857078` and one `FUTEX_WAKE|PRIVATE` at
+`0x61a34d0` — but the first group targets `obj + 0xc`, a different object shape from the waiters'
+`obj + 4`, and none of them runs.
 
-**Forcing the lock word to `0` carries row 21 straight past it** (an experiment, deliberately not
-committed) — it then reached `eventfd`, which is why `eventfd` is now implemented. That is the
-proof that the lock is the only thing in the way, and it is also the thing not to ship: freeing a
-lock somebody holds is how a deadlock becomes a data race.
+### The one thing to check first, because it has now been right twice
+
+**A refusal that fires inside a guest critical section leaves the lock held for ever**, and that
+turned out to be the whole of the previous blocker: `nativeSetPlatformHeadersWithIdfa` refused
+inside OpenSSL's namemap lock, and §8 row 21 spun on it four milestones later. The same shape is
+the first hypothesis for anything that hangs here. Every refusal reachable inside a lock is a
+deadlock waiting for its second acquirer, and an open item with no consequence attached is a bet
+that it has none.
 
 ### What has been ruled out, so nobody repeats it
 
-* **`STLR` works.** `stlr wzr, [xN]` was tested directly at the CPU level and writes zero; the
-  release instruction at `0x021eba84` is not the problem.
-* **Callee-saved registers survive a nested guest call.** `SavedState` captures and restores all
-  31 `X`, all 32 `V`, `SP`, `PC` and `NZCV` on every path, so a clobbered `x20` is not why the
-  release could have gone to the wrong address.
-* **No `pthread_create` was lost.** Three crossings, three registered threads.
-* **The processor count is the host's real one**, so the pool is not sized from a number this
-  layer invented.
-* **Every `omni-bionic` futex wait is bounded** (50 ms or 1 s slices, re-checking the predicate),
-  so a lost wake *there* self-heals. `AddressFutex::indefinite_parks()` reports exactly `2`, and
-  both are the raw syscalls above.
+* **`STLR` writes.** Tested at the CPU level: `stlr wzr, [xN]` zeroes the word.
+* **Nested guest calls preserve every callee-saved register.** `SavedState` captures and restores
+  all 31 `X`, all 32 `V`, `SP`, `PC` and `NZCV` on every path.
+* **No `pthread_create` was lost**, and the processor count is the host's real one.
+* **Every `omni-bionic` futex wait is bounded** (50 ms or 1 s slices that re-check), so a lost
+  wake there self-heals. `indefinite_parks()` reports exactly `2`, both the raw syscalls above.
+* **No wake has ever landed beside a waiter** (`near_misses()` is empty).
 
-### Where to pick it up
+## Network: the constraint the goal will meet
 
-The open question is one thing only: **what should have posted work to those two workers, and why
-did it not run.** The tools to answer it are now in the tree and are what found everything above:
+Flags now load with **no network at all**, because the host supplies the settings document that
+`nativeInitClientSettings` parses — which is what the Java side does on a device too. The
+`AF_INET6` call M6 reaches is a capability probe and is answered.
 
-* `Bionic::guest_thread_list` — which threads exist, what each runs, whether it has finished.
-* `Bionic::futex_calls` — every raw `futex` syscall with its guest thread and **call site**,
-  recorded *on the way in* so a call that never returns is still in the list.
-* `AddressFutex::parked_addresses`, `::indefinite_parks`.
-* `ImportCall::caller` — `X30`, the guest address a call returns to.
-* `stall_report` in `tests/gameactivity.rs`, which prints all of it.
-
-The two temporary probes in the gate — `SPIN_LOCK_OFFSET` and `FLAGS_LOADED_OFFSET` — are marked
-as such and both were decoded to exactly one address; `FLAGS_LOADED_OFFSET` has **one** `STRB` in
-the whole 109 MB binary and the TaskScheduler fatal is its only reader's only message.
+**Everything past that is a real network question.** Roblox authenticates and joins a game server
+over HTTP; Global Constraint 8 says this runtime makes no network access at run time, and there
+is no socket seam in `omni-platform` to make one through. A *frame* may well be reachable offline
+— the engine can render its own loading UI — but "reaches the game" and "playable" cannot be. The
+next `socket(AF_INET, ...)` is where that decision has to be made, and it is an embedding policy
+decision, not a gap in this layer.
 
 ## Be clear-eyed about how far this is from a playable game
 
 Reaching §8 row 25 of 26 sounds like 96%. It is not, and a new session should not plan as though it
 is. Row 25 is where the engine *asks for graphics* — it is the door, not the room. Behind it:
 
-* **`crates/omni-gfx/src/lib.rs` is 16 lines.** It is a stub. Nothing depends on it; `grep` for
-  `omni_gfx` across `crates/` returns only comments saying it is not wired.
+* **`crates/omni-gfx` is real now, and it is the *host* half only.** A Vulkan instance, device
+  and swapchain over a resizable Win32 window, presenting frames verified on screen by reading
+  the framebuffer back. **Nothing in `omni-android` calls it**: no guest-facing EGL or Vulkan
+  surface exists, and `Ndk::set_window_geometry` is still fed a constant by the gate rather than
+  by a window. Having a renderer is not having the engine's frames.
 * **Zero `egl*` symbols are bound.** `libroblox.so` imports **17** (measured twice, from the symbol
   table: `eglGetDisplay`, `eglInitialize`, `eglChooseConfig`, `eglCreateContext`,
   `eglCreateWindowSurface`, `eglCreatePbufferSurface`, `eglMakeCurrent`, `eglSwapBuffers`,
@@ -1085,11 +1085,11 @@ written by every call except the ones that matter), `AddressFutex::parked_addres
 
 ## Verification state
 
-**1,404 passing, 0 failing, 17 ignored** across 114 targets (`cargo test --workspace --release`).
-Was 1,388 at the start of the session. Clippy is clean at `-D warnings` across all targets, and
+**1,445 passing, 0 failing, 36 ignored** across 119 targets (`cargo test --workspace --release`).
+Was 1,388 at the start of the session; the extra ignored are the 19 live window and renderer tests, which **fail rather than skip** when run without `OMNI_GFX_WINDOW_TESTS=1`. Clippy is clean at `-D warnings` across all targets, and
 `cargo doc` adds no warning in any file this session touched.
 
-**`tools/mutate.py` still holds 446 rows, and nothing was added to it this session.** That is the
+**`tools/mutate.py` holds 471 rows**, 25 added this session. That is the
 largest outstanding debt and it has grown: the M6 work landed sixteen new tests and five new
 observable behaviours with no mutation rows behind them. The carried-forward debt is unchanged and
 now has company:
