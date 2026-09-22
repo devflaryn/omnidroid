@@ -253,6 +253,12 @@ handlers! {
     fn strncpy(dst: ptr, src: ptr, n: u64) -> u64 =
         |v| omni_bionic::string::strncpy(&mut v, dst, src, n);
 
+    /// `char *__strncpy_chk(char *dst, const char *src, size_t n, size_t dst_len)` -- MEASURED
+    /// reader: a guest worker once the engine had chosen Vulkan. `omni_bionic::string::strncpy_chk`
+    /// had existed unbound beside the bound `__strncpy_chk2`.
+    fn strncpy_chk(dst: ptr, src: ptr, n: u64, dst_len: u64) -> u64 =
+        |v| omni_bionic::string::strncpy_chk(&mut v, dst, src, n, dst_len);
+
     /// `char *__strncpy_chk2(char *dst, const char *src, size_t n, size_t dst_len, size_t src_len)`
     fn strncpy_chk2(dst: ptr, src: ptr, n: u64, dst_len: u64, src_len: u64) -> u64 =
         |v| omni_bionic::string::strncpy_chk2(&mut v, dst, src, n, dst_len, src_len);
@@ -283,6 +289,9 @@ handlers! {
     /// If the guest does call it, the thread-failure assertion now says so on the first run, by
     /// name, which is what makes waiting safe rather than merely tidy.
     fn strcspn(s: ptr, reject: ptr) -> u64 = |v| omni_bionic::string::strcspn(&v, s, reject);
+    /// `char *strpbrk(const char *s, const char *accept)` -- MEASURED reader: a guest worker once
+    /// the engine was on Vulkan.
+    fn strpbrk(s: ptr, accept: ptr) -> u64 = |v| omni_bionic::string::strpbrk(&v, s, accept);
 
     /// `int isspace(int c)`
     ///
@@ -308,6 +317,10 @@ handlers! {
 
     /// `char *strchr(const char *s, int c)`
     fn strchr(s: ptr, c: i32) -> u64 = |v| omni_bionic::string::strchr(&v, s, c);
+    /// `char *__strchr_chk(const char *s, int c, size_t s_len)` -- FORTIFY `strchr`. MEASURED
+    /// reader: a guest worker once the Lua app's renderer was being created.
+    fn strchr_chk(s: ptr, c: i32, s_len: u64) -> u64 =
+        |v| omni_bionic::string::strchr_chk(&v, s, c, s_len);
 
     /// `char *strrchr(const char *s, int c)`
     fn strrchr(s: ptr, c: i32) -> u64 = |v| omni_bionic::string::strrchr(&v, s, c);
@@ -440,6 +453,78 @@ handlers! {
     fn nan(tagp: ptr) -> f64 = |v| omni_bionic::libm::nan(tagp);
     /// `double frexp(double x, int *exp)`
     fn frexp(x: f64, exp_ptr: ptr) -> f64 = |v| omni_bionic::libm::frexp(&mut v, x, exp_ptr);
+    /// `double modf(double x, double *iptr)`
+    ///
+    /// MEASURED: the engine's game thread, in `initEngine_`'s work once the engine settings reached
+    /// a live engine. The float twin `modff` has been in `omni_bionic::libm` since phase 1; the
+    /// double one was written for this.
+    fn modf(x: f64, iptr: ptr) -> f64 = |v| omni_bionic::libm::modf(&mut v, x, iptr);
+    // M6: the engine's libm imports that were still unbound when the Lua app reached `atanf`.
+    // Twenty were already in `omni_bionic::libm`; twelve were written for this (see there).
+    /// `acos`
+    fn acos(x: f64) -> f64 = |v| omni_bionic::libm::acos(&mut v, x);
+    /// `asin`
+    fn asin(x: f64) -> f64 = |v| omni_bionic::libm::asin(&mut v, x);
+    /// `asinf`
+    fn asinf(x: f32) -> f32 = |v| omni_bionic::libm::asinf(&mut v, x);
+    /// `atan2`
+    fn atan2(y: f64, x: f64) -> f64 = |v| omni_bionic::libm::atan2(&mut v, y, x);
+    /// `atan2f`
+    fn atan2f(y: f32, x: f32) -> f32 = |v| omni_bionic::libm::atan2f(&mut v, y, x);
+    /// `atanf`
+    fn atanf(x: f32) -> f32 = |v| omni_bionic::libm::atanf(&mut v, x);
+    /// `cbrtf`
+    fn cbrtf(x: f32) -> f32 = |v| omni_bionic::libm::cbrtf(&mut v, x);
+    /// `cos`
+    fn cos(x: f64) -> f64 = |v| omni_bionic::libm::cos(&mut v, x);
+    /// `cosh`
+    fn cosh(x: f64) -> f64 = |v| omni_bionic::libm::cosh(&mut v, x);
+    /// `coshf`
+    fn coshf(x: f32) -> f32 = |v| omni_bionic::libm::coshf(&mut v, x);
+    /// `fmodf`
+    fn fmodf(x: f32, y: f32) -> f32 = |v| omni_bionic::libm::fmodf(&mut v, x, y);
+    /// `ilogb`
+    fn ilogb(x: f64) -> i32 = |v| omni_bionic::libm::ilogb(x);
+    /// `ldexpf`
+    fn ldexpf(x: f32, exp: i32) -> f32 = |v| omni_bionic::libm::ldexpf(&mut v, x, exp);
+    /// `log10f`
+    fn log10f(x: f32) -> f32 = |v| omni_bionic::libm::log10f(&mut v, x);
+    /// `log2`
+    fn log2(x: f64) -> f64 = |v| omni_bionic::libm::log2(&mut v, x);
+    /// `log2f`
+    fn log2f(x: f32) -> f32 = |v| omni_bionic::libm::log2f(&mut v, x);
+    /// `modff`
+    fn modff(x: f32, iptr: ptr) -> f32 = |v| omni_bionic::libm::modff(&mut v, x, iptr);
+    /// `sin`
+    fn sin(x: f64) -> f64 = |v| omni_bionic::libm::sin(&mut v, x);
+    /// `sinh`
+    fn sinh(x: f64) -> f64 = |v| omni_bionic::libm::sinh(&mut v, x);
+    /// `sinhf`
+    fn sinhf(x: f32) -> f32 = |v| omni_bionic::libm::sinhf(&mut v, x);
+    /// `atan`
+    fn atan(x: f64) -> f64 = |v| omni_bionic::libm::atan(&mut v, x);
+    /// `cbrt`
+    fn cbrt(x: f64) -> f64 = |v| omni_bionic::libm::cbrt(&mut v, x);
+    /// `exp2`
+    fn exp2(x: f64) -> f64 = |v| omni_bionic::libm::exp2(&mut v, x);
+    /// `exp2f`
+    fn exp2f(x: f32) -> f32 = |v| omni_bionic::libm::exp2f(&mut v, x);
+    /// `expm1`
+    fn expm1(x: f64) -> f64 = |v| omni_bionic::libm::expm1(&mut v, x);
+    /// `tan`
+    fn tan(x: f64) -> f64 = |v| omni_bionic::libm::tan(&mut v, x);
+    /// `tanh`
+    fn tanh(x: f64) -> f64 = |v| omni_bionic::libm::tanh(&mut v, x);
+    /// `hypotf`
+    fn hypotf(x: f32, y: f32) -> f32 = |v| omni_bionic::libm::hypotf(&mut v, x, y);
+    /// `fmod`
+    fn fmod(x: f64, y: f64) -> f64 = |v| omni_bionic::libm::fmod(&mut v, x, y);
+    /// `frexpf`
+    fn frexpf(x: f32, exp_ptr: ptr) -> f32 = |v| omni_bionic::libm::frexpf(&mut v, x, exp_ptr);
+    /// `round`
+    fn round(x: f64) -> f64 = |v| omni_bionic::libm::round(x);
+    /// `nextafterf`
+    fn nextafterf(x: f32, y: f32) -> f32 = |v| omni_bionic::libm::nextafterf(&mut v, x, y);
 
     /// `double ldexp(double x, int exp)` -- `x * 2^exp`, and `frexp`'s exact inverse.
     ///
@@ -469,6 +554,117 @@ handlers! {
     /// call site, at `0x2b772f4`, passing `n = 4`, which is `MB_CUR_MAX` for UTF-8.
     fn mbtowc(pwc: ptr, s: ptr, n: u64) -> i32 =
         |v| omni_bionic::wide::mbtowc(&mut v, pwc, s, n);
+
+    /// `size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)`
+    ///
+    /// bionic's `mbrtoc32`, ported (`omni_bionic::wide::mbrtoc32`), over the guest's own state --
+    /// or, for a NULL `ps`, the instance's one private state, as bionic's function-local static
+    /// is. MEASURED reader: the Lua app's thread, once `startLuaApp_` had run.
+    fn mbrtowc(pwc: ptr, s: ptr, n: u64, ps: ptr) -> u64 = |v| {
+        let state = private_or(&v, ps, super::MbStateOwner::Mbrtowc);
+        omni_bionic::wide::mbrtoc32(&mut v, pwc, s, n, state)
+    };
+
+    /// `size_t mbrlen(const char *s, size_t n, mbstate_t *ps)` -- OpenBSD's, which bionic builds:
+    /// `mbrtowc(NULL, s, n, ps)` over its own private state.
+    fn mbrlen(s: ptr, n: u64, ps: ptr) -> u64 = |v| {
+        let state = private_or(&v, ps, super::MbStateOwner::Mbrlen);
+        omni_bionic::wide::mbrtoc32(&mut v, 0, s, n, state)
+    };
+
+    /// `size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps)` -- bionic's
+    /// `mbsnrtowcs(dst, src, SIZE_MAX, len, ps)`. MEASURED reader: the Lua app's thread.
+    fn mbsrtowcs(dst: ptr, src: ptr, len: u64, ps: ptr) -> u64 = |v| {
+        let state = private_or(&v, ps, super::MbStateOwner::Mbsnrtowcs);
+        omni_bionic::wide::mbsnrtowcs(&mut v, dst, src, u64::MAX, len, state)
+    };
+
+    /// `size_t mbsnrtowcs(wchar_t *dst, const char **src, size_t nmc, size_t len, mbstate_t *ps)`
+    fn mbsnrtowcs(dst: ptr, src: ptr, nmc: u64, len: u64, ps: ptr) -> u64 = |v| {
+        let state = private_or(&v, ps, super::MbStateOwner::Mbsnrtowcs);
+        omni_bionic::wide::mbsnrtowcs(&mut v, dst, src, nmc, len, state)
+    };
+
+    /// `size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps)` -- bionic's `c32rtomb`, `wchar_t`
+    /// being UTF-32.
+    fn wcrtomb(s: ptr, wc: i32, ps: ptr) -> u64 = |v| {
+        let state = private_or(&v, ps, super::MbStateOwner::Wcrtomb);
+        omni_bionic::wide::c32rtomb(&mut v, s, wc as u32, state)
+    };
+
+    /// `size_t wcsnrtombs(char *dst, const wchar_t **src, size_t nwc, size_t len, mbstate_t *ps)`
+    fn wcsnrtombs(dst: ptr, src: ptr, nwc: u64, len: u64, ps: ptr) -> u64 = |v| {
+        let state = private_or(&v, ps, super::MbStateOwner::Wcsnrtombs);
+        omni_bionic::wide::wcsnrtombs(&mut v, dst, src, nwc, len, state)
+    };
+
+    /// `wint_t btowc(int c)`
+    fn btowc(c: i32) -> i32 = |v| omni_bionic::wide::btowc(c) as i32;
+
+    /// `int wctob(wint_t c)`
+    fn wctob(c: i32) -> i32 = |v| omni_bionic::wide::wctob(c as u32);
+
+    // ---------------------------------------------------------- wide classification
+    //
+    // bionic's `_l` forms ignore the locale and answer through ICU (`libc/bionic/wctype.cpp`);
+    // `omni_bionic::wctype` is ICU's definitions over Unicode 14.0, the release Android 13's ICU 71
+    // carries. MEASURED reader: libc++'s `ctype_byname<wchar_t>` on the Lua app's thread, which
+    // reached `iswspace_l` first; the rest are its siblings, bound together.
+    /// `int iswalpha_l(wint_t c, locale_t l)`
+    fn iswalpha_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswalpha(c as u32);
+    /// `int iswblank_l(wint_t c, locale_t l)`
+    fn iswblank_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswblank(c as u32);
+    /// `int iswcntrl_l(wint_t c, locale_t l)`
+    fn iswcntrl_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswcntrl(c as u32);
+    /// `int iswdigit_l(wint_t c, locale_t l)`
+    fn iswdigit_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswdigit(c as u32);
+    /// `int iswlower_l(wint_t c, locale_t l)`
+    fn iswlower_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswlower(c as u32);
+    /// `int iswprint_l(wint_t c, locale_t l)`
+    fn iswprint_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswprint(c as u32);
+    /// `int iswpunct_l(wint_t c, locale_t l)`
+    fn iswpunct_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswpunct(c as u32);
+    /// `int iswspace_l(wint_t c, locale_t l)`
+    fn iswspace_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswspace(c as u32);
+    /// `int iswupper_l(wint_t c, locale_t l)`
+    fn iswupper_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswupper(c as u32);
+    /// `int iswxdigit_l(wint_t c, locale_t l)`
+    fn iswxdigit_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::iswxdigit(c as u32);
+    // ---------------------------------------------------------- collation, and its neighbours
+    //
+    // bionic's `_l` forms ignore the locale (`string_l.cpp`, `wchar_l.cpp`, `stdlib_l.cpp`), and its
+    // collation is the code-point order: OpenBSD's `strcoll` is `strcmp`, `strxfrm` a copy, and
+    // `wcscoll`/`wcsxfrm` the same over `wchar_t`. MEASURED reader: the Lua app's thread, at
+    // `wcslen`; the rest are libc++'s `collate_byname` beside it, bound together.
+
+    /// `size_t wcslen(const wchar_t *s)`
+    fn wcslen(s: ptr) -> u64 = |v| omni_bionic::wide::wcslen(&v, s);
+    /// `int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n)` -- FreeBSD's: the first
+    /// differing pair as `1`/`-1`, `wchar_t` being unsigned on AArch64. MEASURED reader: the Lua
+    /// app's thread, once `wcslen` was bound; `omni_bionic::wide::wmemcmp` had existed unbound.
+    fn wmemcmp(a: ptr, b: ptr, n: u64) -> i32 = |v| omni_bionic::wide::wmemcmp(&v, a, b, n);
+    /// `wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n)` -- bound with `wmemcmp`, its
+    /// neighbour in libc++'s `char_traits<wchar_t>`.
+    fn wmemchr(s: ptr, c: i32, n: u64) -> u64 =
+        |v| omni_bionic::wide::wmemchr(&v, s, c as u32, n);
+    /// `int strcoll_l(const char *a, const char *b, locale_t l)`
+    fn strcoll_l(a: ptr, b: ptr, _locale: u64) -> i32 = |v| omni_bionic::string::strcmp(&v, a, b);
+    /// `size_t strxfrm_l(char *dst, const char *src, size_t n, locale_t l)`
+    fn strxfrm_l(dst: ptr, src: ptr, n: u64, _locale: u64) -> u64 =
+        |v| omni_bionic::string::strxfrm(&mut v, dst, src, n);
+    /// `int wcscoll_l(const wchar_t *a, const wchar_t *b, locale_t l)`
+    fn wcscoll_l(a: ptr, b: ptr, _locale: u64) -> i32 = |v| omni_bionic::wide::wcscmp(&v, a, b);
+    /// `size_t wcsxfrm_l(wchar_t *dst, const wchar_t *src, size_t n, locale_t l)`
+    fn wcsxfrm_l(dst: ptr, src: ptr, n: u64, _locale: u64) -> u64 =
+        |v| omni_bionic::wide::wcsxfrm(&mut v, dst, src, n);
+    /// `long long strtoll_l(const char *nptr, char **endptr, int base, locale_t l)`
+    fn strtoll_l(nptr: ptr, endptr: ptr, base: i32, _locale: u64) -> u64 =
+        |v| omni_bionic::numerics::strtoll(&mut v, nptr, endptr, base).map(|n| n as u64);
+
+    /// `wint_t towlower_l(wint_t c, locale_t l)`
+    fn towlower_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::towlower(c as u32) as i32;
+    /// `wint_t towupper_l(wint_t c, locale_t l)`
+    fn towupper_l(c: i32, _locale: u64) -> i32 = |v| omni_bionic::wctype::towupper(c as u32) as i32;
 
     // ---------------------------------------------------------- locale
 
@@ -616,6 +812,16 @@ handlers! {
     /// `int __cxa_thread_atexit_impl(void (*func)(void *), void *arg, void *dso_handle)`
     fn cxa_thread_atexit(func: ptr, arg: ptr, dso: ptr) -> i32 =
         |v| v.active.bionic.tls.thread_atexit(v.active.thread, func as u64, arg as u64, dso as u64);
+}
+
+/// The guest's `ps`, or -- for NULL -- `owner`'s private `mbstate_t`, as bionic's function-local
+/// statics are.
+fn private_or(v: &GuestView<'_>, ps: u64, owner: super::MbStateOwner) -> u64 {
+    if ps == 0 {
+        v.active.bionic.mbstate_private(owner) as u64
+    } else {
+        ps
+    }
 }
 
 // ------------------------------------------------------------------ handlers that need more
@@ -1225,15 +1431,22 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("strcpy", strcpy),
     ("strncpy", strncpy),
     ("__strncpy_chk2", strncpy_chk2),
+    // M6: a worker once Vulkan was chosen. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records it.
+    ("__strncpy_chk", strncpy_chk),
     ("strcat", strcat),
     ("__strcat_chk", strcat_chk),
     ("strcspn", strcspn),
+    // M6: a worker once the engine was on Vulkan. Outside Task 1's 188; `BEYOND_THE_PREDICTION`.
+    ("strpbrk", strpbrk),
     // M6's network run, found by a guest worker thread dying on it during the TLS handshake --
     // a PURE BINDING GAP, the sixth this session: `omni_bionic::ctype::is_space` has existed
     // since phase 1 and nothing called it. Its neighbour `tolower` has the same shape and is
     // deliberately NOT here; no run has reached it (D17).
     ("isspace", isspace),
     ("strchr", strchr),
+    // M6: a guest worker once the renderer was being created. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records it.
+    ("__strchr_chk", strchr_chk),
     ("strrchr", strrchr),
     ("strstr", strstr),
     ("strerror", strerror),
@@ -1271,11 +1484,79 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("acosf", acosf),
     ("nan", nan),
     ("frexp", frexp),
+    ("modf", modf),
+    // M6: the rest of libm, once the Lua app reached `atanf`.
+    ("acos", acos),
+    ("asin", asin),
+    ("asinf", asinf),
+    ("atan2", atan2),
+    ("atan2f", atan2f),
+    ("atanf", atanf),
+    ("cbrtf", cbrtf),
+    ("cos", cos),
+    ("cosh", cosh),
+    ("coshf", coshf),
+    ("fmodf", fmodf),
+    ("ilogb", ilogb),
+    ("ldexpf", ldexpf),
+    ("log10f", log10f),
+    ("log2", log2),
+    ("log2f", log2f),
+    ("modff", modff),
+    ("sin", sin),
+    ("sinh", sinh),
+    ("sinhf", sinhf),
+    ("atan", atan),
+    ("cbrt", cbrt),
+    ("exp2", exp2),
+    ("exp2f", exp2f),
+    ("expm1", expm1),
+    ("tan", tan),
+    ("tanh", tanh),
+    ("hypotf", hypotf),
+    ("fmod", fmod),
+    ("frexpf", frexpf),
+    ("round", round),
+    ("nextafterf", nextafterf),
     ("ldexp", ldexp),
     ("sincosf", sincosf),
     // wide characters
     ("__ctype_get_mb_cur_max", ctype_get_mb_cur_max),
     ("mbtowc", mbtowc),
+    // M6: the Lua app's thread. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records it.
+    ("mbrtowc", mbrtowc),
+    // M6: libc++'s `codecvt`/`ctype<wchar_t>` family on the Lua app's thread, bound together from
+    // bionic's own code once `mbsrtowcs` was reached. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records them.
+    ("mbrlen", mbrlen),
+    ("mbsrtowcs", mbsrtowcs),
+    ("mbsnrtowcs", mbsnrtowcs),
+    ("wcrtomb", wcrtomb),
+    ("wcsnrtombs", wcsnrtombs),
+    ("btowc", btowc),
+    ("wctob", wctob),
+    // M6: libc++'s `ctype_byname<wchar_t>`, reached at `iswspace_l`; its siblings bound with it.
+    ("iswalpha_l", iswalpha_l),
+    ("iswblank_l", iswblank_l),
+    ("iswcntrl_l", iswcntrl_l),
+    ("iswdigit_l", iswdigit_l),
+    ("iswlower_l", iswlower_l),
+    ("iswprint_l", iswprint_l),
+    ("iswpunct_l", iswpunct_l),
+    ("iswspace_l", iswspace_l),
+    ("iswupper_l", iswupper_l),
+    ("iswxdigit_l", iswxdigit_l),
+    ("towlower_l", towlower_l),
+    // M6: `wcslen` on the Lua app's thread, and libc++'s `collate_byname` beside it.
+    ("wcslen", wcslen),
+    ("wmemcmp", wmemcmp),
+    ("wmemchr", wmemchr),
+    ("strcoll_l", strcoll_l),
+    ("strxfrm_l", strxfrm_l),
+    ("wcscoll_l", wcscoll_l),
+    ("wcsxfrm_l", wcsxfrm_l),
+    ("strtoll_l", strtoll_l),
+    ("towupper_l", towupper_l),
     // locale
     ("newlocale", newlocale),
     ("uselocale", uselocale),
@@ -1358,6 +1639,15 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // first record lock. Answered from `Bionic::set_app_uid`, which has no default. Outside Task
     // 1's 188; `BEYOND_THE_PREDICTION` records how it was found.
     ("geteuid", procenv::geteuid),
+    // M6: a guest worker once §8 row 22 had returned. The same figure as `sysconf` and
+    // `getauxval`. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records how it was found.
+    ("getpagesize", procenv::getpagesize),
+    // M6: a guest worker once the Lua app was starting -- `pthread_atfork`, recorded and never
+    // owed a run because nothing forks. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records it.
+    ("__register_atfork", procenv::register_atfork),
+    // M6: the Lua app's thread once `startLuaApp_` had run. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records it.
+    ("localeconv", procenv::localeconv),
     ("sched_getcpu", procenv::sched_getcpu),
     ("arc4random_buf", procenv::arc4random_buf),
     // M6's network run, one call after `getsockname`: OpenSSL seeding its DRBG for the TLS
@@ -1440,6 +1730,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("fdopen", stdio::fdopen),
     ("fclose", stdio::fclose),
     ("feof", stdio::feof),
+    // M6: the worker in `initializeWithAppStarter`. Outside Task 1's 188; `BEYOND_THE_PREDICTION`
+    // records how it was found.
+    ("ferror", stdio::ferror),
     ("fflush", stdio::fflush),
     ("fgets", stdio::fgets),
     ("fileno", stdio::fileno),
@@ -1512,6 +1805,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("setsockopt", net::setsockopt),
     ("getsockopt", net::getsockopt),
     ("sendto", net::sendto),
+    // M6: the engine's QUIC transport, once it was on Vulkan. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records it.
+    ("sendmsg", net::sendmsg),
     ("__sendto_chk", net::sendto_chk),
     ("recvfrom", net::recvfrom),
     ("getaddrinfo", net::getaddrinfo),
@@ -1531,6 +1827,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("clock", clocks::clock),
     ("mallinfo", guestmem::mallinfo),
     ("longjmp", signals::longjmp),
+    // M6: libpng arming its error recovery on a guest worker. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records how it was found.
+    ("setjmp", signals::setjmp),
 ];
 
 /// Serviced on the **exit** path: 80-102 ns per call.

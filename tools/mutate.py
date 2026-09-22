@@ -98,6 +98,11 @@ PLAT_PROCESS_MOD = "crates/omni-platform/src/process/mod.rs"
 BIONIC_TIME = "crates/omni-bionic/src/time.rs"
 ADAPTER_CLOCKS = "crates/omni-android/src/bionic/clocks.rs"
 ADAPTER_PROCENV = "crates/omni-android/src/bionic/procenv.rs"
+ADAPTER_SIGNALS = "crates/omni-android/src/bionic/signals.rs"
+BIONIC_STDIO = "crates/omni-bionic/src/stdio.rs"
+LIBM = "crates/omni-bionic/src/libm.rs"
+BIONIC_LOCALE = "crates/omni-bionic/src/locale.rs"
+BIONIC_WIDE = "crates/omni-bionic/src/wide.rs"
 ADAPTER_LOGGING = "crates/omni-android/src/bionic/logging.rs"
 # M3 task 3 phase 3b: files and directories. `omni-platform` gains a ROOTED filesystem, the
 # `FILE *` layer lands in `omni-bionic` over a trait, and the adapter binds the 29 file-io symbols.
@@ -238,6 +243,8 @@ ANDROID = [
 # task 2. Its detector is the unit test on `clocks::capped`, which is why that predicate is a
 # function rather than an inline comparison.
 ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
+# `libm_tests` alone: the math primitives' own target, which `BIONIC` does not name.
+BIONIC_LIBM = ["cargo", "test", "-p", "omni-bionic", "--test", "libm_tests", "--no-fail-fast"]
 
 # The startup gate, FILTERED to one test by name. `ANDROID` deliberately does not name
 # `--test gameactivity`: that target runs the real APK end to end and takes ~50 s, which is
@@ -2731,6 +2738,74 @@ directory", ADAPTER_FILES,
     ("threads-A6", "A", "the new thread's X30 is not the boundary's sentinel", ADAPTER_THREADS,
      """        cpu.set_x(XReg::new(30).expect("X30 exists"), boundary.sentinel() as u64);""",
      """        cpu.set_x(XReg::new(30).expect("X30 exists"), 0);""",
+     ANDROID),
+
+    # The death context: what a dying thread held, taken before its stack is unmapped. Each of
+    # these leaves the record looking plausible -- a context with one register, or an empty stack
+    # snapshot that reads like a thread whose SP was unreadable, or bytes from the wrong frame.
+    ("deathctx-A1", "A", "a dead thread's registers are not kept", ADAPTER_THREADS,
+     """    let mut registers: Vec<u64> =
+        (0..31).map(|n| cpu.x(XReg::new(n).expect("X0..X30 exist"))).collect();""",
+     """    let mut registers: Vec<u64> = Vec::new();""",
+     ANDROID),
+    ("deathctx-A2", "A", "a dead thread's stack bytes are dropped", ADAPTER_THREADS,
+     """            Ok(word) => stack_bytes.extend_from_slice(&word.to_le_bytes()),""",
+     """            Ok(_) => break,""",
+     ANDROID),
+    # `modf`'s fraction carries x's sign (Annex F): without the copysign a negative integer's
+    # fraction is +0.0, which reads as correct in every test that only compares values.
+    ("modf-A1", "A", "modf's fraction loses x's sign for a negative integer", LIBM,
+     """    Ok((x - integral).copysign(x))""",
+     """    Ok(x - integral)""",
+     BIONIC_LIBM),
+    # `getpagesize` must be the same figure `sysconf` and `getauxval` answer.
+    ("getpagesize-A1", "A", "getpagesize answers a different figure from sysconf", ADAPTER_PROCENV,
+     """    c.ret().i32(page);""",
+     """    c.ret().i32(page * 2);""",
+     ANDROID),
+    # A returning thread's destructors: skipped, the per-thread registry entry an exited
+    # thread's `thread_local` would have removed is left dangling for another thread to read.
+    ("exitdtor-A1", "A", "a returning thread's destructors are not run", ADAPTER_THREADS,
+     """                run_exit_destructors(&bionic, &boundary, &mut *cpu, slot.id, &mut death)
+                    .unwrap_or(GuestThreadState::Returned(value))""",
+     """                GuestThreadState::Returned(value)""",
+     ANDROID),
+    # SIGPIPE's recorded action is what a query returns: a query answering a fixed SIG_DFL would
+    # hand libcurl's restore the wrong action after a SIG_IGN, and read as correct at first query.
+    ("sigpipe-A1", "A", "a SIGPIPE query ignores the recorded action", ADAPTER_SIGNALS,
+     """                    &*held,""",
+     """                    &[0u8; SIGACTION_BYTES],""",
+     ANDROID),
+    ("sigpipe-B1", "B", "a SIGPIPE handler is recorded as though it could be delivered", ADAPTER_SIGNALS,
+     """            (handler <= SIG_IGN).then_some(action)""",
+     """            Some(action)""",
+     ANDROID),
+    ("ferror-A1", "A", "ferror never reports the error indicator", BIONIC_STDIO,
+     """pub const fn ferror(stream: &Stream) -> i32 {
+    if stream.error {""",
+     """pub const fn ferror(stream: &Stream) -> i32 {
+    if stream.error && false {""",
+     BIONIC),
+    # `localeconv`'s chars are CHAR_MAX ("unspecified"); zero would say "0 fraction digits,
+    # currency symbol after the value", a believable locale that is not the C one.
+    ("lconv-A1", "A", "the lconv char fields are zero instead of CHAR_MAX", BIONIC_LOCALE,
+     """        out[80 + k] = value.to_le_bytes()[0];""",
+     """        out[80 + k] = 0 * value.to_le_bytes()[0];""",
+     ANDROID),
+    ("atfork-A1", "A", "__register_atfork answers 0 and keeps nothing", ADAPTER_PROCENV,
+     """        .push(registration);""",
+     """        .truncate(0);""",
+     ANDROID),
+    # `mbrtoc32`'s state: without the write, a character split across calls cannot be finished --
+    # the second call sees continuation bytes with an initial state and answers EILSEQ.
+    ("mbrtoc32-A1", "A", "a split character's bytes are not kept in the guest's mbstate_t",
+     BIONIC_WIDE,
+     """        ctx.write(state + (bytes_so_far + i) as u64, &[byte])?;""",
+     """        let _ = (state, bytes_so_far, i, byte);""",
+     BIONIC),
+    ("deathctx-A3", "A", "the stack snapshot starts one word above SP", ADAPTER_THREADS,
+     """    for at in (sp..sp.saturating_add(DEATH_STACK_BYTES)).step_by(8) {""",
+     """    for at in (sp + 8..sp.saturating_add(DEATH_STACK_BYTES)).step_by(8) {""",
      ANDROID),
 
     # A thread that exits without giving its block back leaks one per thread, so a guest that

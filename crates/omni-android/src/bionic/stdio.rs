@@ -527,6 +527,22 @@ pub(super) fn feof(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int ferror(FILE *stream)`
+///
+/// The stream's error indicator, from the host-side table as [`feof`]'s end-of-file indicator is.
+/// MEASURED reader: the engine's worker running `SingleSurfaceApp::initializeWithAppStarter`, once
+/// the engine settings reached a live engine.
+pub(super) fn ferror(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let file = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let view = enter(c, &state);
+        stdio::ferror(&stream_of(&view, file)?)
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `int fseeko(FILE *stream, off_t offset, int whence)`
 ///
 /// A seek on the stream's descriptor and **the end-of-file indicator cleared**, which C17

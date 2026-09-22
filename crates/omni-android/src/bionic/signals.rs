@@ -17,7 +17,9 @@
 //! the demand pager (D10), the halt flag (D16) and the thunk boundary's re-entrancy rules
 //! (D18) — rather than a gap to be filled in a handler.
 //!
-//! So three of the four refuse. **The important thing about them is what they do not do**:
+//! So three of the four refuse -- `sigaction` with one measured exception: `SIGPIPE`'s `SIG_DFL`
+//! and `SIG_IGN`, which promise no delivery and are what libcurl saves and restores (see
+//! [`sigaction`]). **The important thing about the refusals is what they do not do**:
 //! each has a believable wrong answer sitting right next to it, and each of those answers is
 //! *the* failure Global Constraint 1 exists for, because it is not observable until much later
 //! and somewhere else.
@@ -55,6 +57,7 @@ use omni_bionic::signal;
 
 use crate::boundary::ImportCall;
 use crate::error::{AbiError, AbiResult};
+use crate::mem::Blame;
 
 use super::{active, enter};
 
@@ -119,23 +122,83 @@ pub(super) fn sigfillset(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 // ================================================================== the three that are refused
 
+/// `struct sigaction` on LP64 bionic: `int sa_flags` (padded to eight), the handler union at
+/// `+8`, `sigset_t sa_mask` (one word) at `+16`, `sa_restorer` at `+24`. MEASURED against the
+/// guest's own code as well as bionic's `__SIGACTION_BODY`: libcurl's `sigpipe_ignore` in this
+/// binary (`0x0220229c` on) copies the 32 bytes it was given back, clears `SA_SIGINFO` in the
+/// `int` at `+0` and stores `SIG_IGN` at `+8`.
+pub(super) const SIGACTION_BYTES: usize = 32;
+const HANDLER_OFFSET: usize = 8;
+const SIGPIPE: i32 = 13;
+/// `SIG_DFL` and `SIG_IGN`: the two dispositions that are not a function to deliver to.
+const SIG_IGN: u64 = 1;
+
 /// `int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)`
 ///
-/// Refused. See this module's documentation: there is no disposition table to install into and
-/// no delivery path to reach a handler through, and returning 0 would tell the guest it is going
-/// to be notified about a signal it will never hear about.
+/// **`SIGPIPE` alone is answered, and only with `SIG_DFL` or `SIG_IGN`.** Everything else is
+/// refused, for the reason this module's documentation gives: there is no delivery path to reach
+/// a handler through, and returning 0 for one would tell the guest it will be notified about a
+/// signal it will never hear about.
 ///
-/// The **query** form, `act == NULL`, is refused too. It looks answerable — nothing can have
-/// installed a handler, so `SIG_DFL` for everything is arithmetically true — but answering it
-/// means writing a `struct sigaction` whose layout has never been checked against a header on
-/// this machine, in order to describe a table this runtime does not have. A guest that reads
-/// back `SIG_DFL` learns nothing it did not already know, and a guest that *saves and restores*
-/// a disposition around a call would be handed a restore that silently does nothing.
+/// # Why `SIGPIPE` can be answered
+///
+/// MEASURED reader: libcurl's `sigpipe_ignore`/`sigpipe_restore` around `curl_easy_cleanup` --
+/// query `SIGPIPE`, install `SIG_IGN`, do the work, restore the saved action. It never installs a
+/// handler, so nothing is promised that cannot be kept: `SIG_IGN` says "nothing will be
+/// delivered", which is true.
+///
+/// The query's answer is the app process's real one, read from Android's source rather than
+/// assumed: ART's `Runtime::BlockSignals` **blocks** `SIGPIPE` (with `SIGQUIT` and `SIGUSR1`)
+/// and never sets its disposition, and neither the zygote (`com_android_internal_os_Zygote.cpp`)
+/// nor `AndroidRuntime.cpp` mentions it -- so an app's `SIGPIPE` action is the untouched
+/// `SIG_DFL` with no flags and an empty mask, which is 32 zero bytes. A blocked `SIGPIPE` is also
+/// why a write to a closed socket returns `EPIPE` instead of killing the process, which is what
+/// this layer's sockets do. Other signals are not answered: ART and debuggerd install real
+/// handlers for several (`SIGSEGV`, `SIGABRT`, `SIGBUS`, ...), so "`SIG_DFL` for everything"
+/// would be false on a device.
+///
+/// What is stored is exactly the 32 bytes the guest passed -- bionic's arm64 `sigaction` adds no
+/// restorer -- so a save-and-restore round-trips.
 pub(super) fn sigaction(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (signum, act, oldact) = {
         let mut a = c.args();
         (a.next_i32()?, a.next_u64()?, a.next_u64()?)
     };
+    if signum == SIGPIPE {
+        let new = if act == 0 {
+            None
+        } else {
+            let bytes =
+                c.mem().read_bytes(act as usize, SIGACTION_BYTES, Blame::new(c.symbol(), c.address(), 1))?;
+            let mut action = [0u8; SIGACTION_BYTES];
+            action.copy_from_slice(&bytes);
+            let handler = u64::from_le_bytes(
+                action[HANDLER_OFFSET..HANDLER_OFFSET + 8].try_into().expect("eight bytes"),
+            );
+            (handler <= SIG_IGN).then_some(action)
+        };
+        if act == 0 || new.is_some() {
+            let state = active(c.symbol(), c.address())?;
+            let mut held = state
+                .bionic
+                .sigpipe_action
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if oldact != 0 {
+                c.mem().write_bytes(
+                    oldact as usize,
+                    &*held,
+                    Blame::new(c.symbol(), c.address(), 2),
+                )?;
+            }
+            if let Some(action) = new {
+                *held = action;
+            }
+            drop(held);
+            c.ret().i32(0);
+            return Ok(());
+        }
+    }
     let shape = if act == 0 {
         "querying the current disposition"
     } else {
@@ -206,6 +269,27 @@ pub(super) fn pthread_sigmask(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     ))
 }
 
+// ================================================================== setjmp, and its refusal
+
+/// `int setjmp(jmp_buf env)`
+///
+/// **The direct return: 0.** That is the whole of what `setjmp` is when nothing jumps back, and it
+/// is what this answers. The environment is **not** saved -- an inline handler cannot read the
+/// callee-saved registers (D18) -- and that is safe for one reason stated here and enforced in
+/// [`longjmp`]: the only thing that could ever observe the saved environment is a `longjmp`, and
+/// `longjmp` refuses by name. A guest that sets a buffer and never jumps runs exactly as on a
+/// device; one that jumps stops at the jump, loudly.
+///
+/// MEASURED reader: libpng, arming its error recovery (`png_jmpbuf`) before a decode on a guest
+/// worker, once the Lua app was starting. It jumps only on a corrupt image.
+pub(super) fn setjmp(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let _env = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    state.bionic.setjmps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    c.ret().i32(0);
+    Ok(())
+}
+
 // ================================================================== the fourth refusal
 
 /// `void longjmp(jmp_buf env, int val)`
@@ -227,11 +311,10 @@ pub(super) fn pthread_sigmask(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 ///
 /// # And there is no `jmp_buf` here for it to restore
 ///
-/// `setjmp` is **not among the 188** the initializers reach — it is in the reachable file's Tier C
-/// section, reached only through an address-taken edge — so it is not bound, and a guest that
-/// calls it gets [`AbiError::Unbound`](crate::AbiError::Unbound) naming it. Nothing in this
-/// runtime can therefore have *filled* a `jmp_buf`, and the bytes at the pointer that arrives here
-/// are whatever the guest last left there.
+/// [`setjmp`] answers only its direct return (0) and saves nothing, because an inline handler
+/// cannot read the registers it would save. Nothing in this runtime can therefore have *filled* a
+/// `jmp_buf`, and the bytes at the pointer that arrives here are whatever the guest last left
+/// there -- which is why this refusal is what keeps that `setjmp` honest.
 ///
 /// Bionic's own layout makes that worse rather than better: its `setjmp` mangles the saved `SP`
 /// and `LR` with a per-process cookie and stores a checksum, so even a byte-for-byte copy of a
@@ -258,12 +341,11 @@ pub(super) fn longjmp(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
              there, delivering {delivered} at the matching setjmp. The thunk boundary gives a \
              handler the AAPCS64 argument registers and one return value and deliberately no way \
              to write the calling thread's guest state (D18 makes that a type property, which is \
-             what stops an inline handler re-entering the guest). And nothing here can have \
-             filled that jmp_buf: `setjmp` is not among the 188 imports the initializers reach, \
-             so it is not bound, and bionic mangles the saved SP and LR with a per-process cookie \
-             besides. Returning normally was rejected -- longjmp is noreturn, and a return would \
-             resume the guest in the frame it was trying to escape, carrying the condition that \
-             made it jump"
+             what stops an inline handler re-entering the guest). And nothing here filled that \
+             jmp_buf: this layer's `setjmp` answers only its direct return, 0, because it cannot \
+             read the registers it would save -- this refusal is what makes that safe. Returning \
+             normally was rejected -- longjmp is noreturn, and a return would resume the guest in \
+             the frame it was trying to escape, carrying the condition that made it jump"
         ),
     ))
 }

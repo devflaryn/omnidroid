@@ -137,7 +137,11 @@ pub(super) const SOCKADDR_SLOT_BYTES: usize = SOCKADDR_IN6_BYTES.next_multiple_o
 /// past this the call is **refused by name** rather than truncated. A truncated list is the worse
 /// answer: the guest connects to whichever addresses survived and nothing anywhere records that
 /// the resolver had offered others.
-pub const ADDRINFO_NODES_PER_RESULT: usize = 8;
+///
+/// **32, raised from 8 on a measurement**: once the Lua app was loading, `fts.rbxcdn.com` resolved
+/// to 9 addresses and the call was refused. A CDN name answering a dozen edges is ordinary, and an
+/// `ai_socktype` of 0 multiplies it by three; 32 covers both with room, for 20 KiB of slab.
+pub const ADDRINFO_NODES_PER_RESULT: usize = 32;
 
 /// How many resolutions may be live — handed to the guest and not yet freed — at once.
 ///

@@ -41,15 +41,16 @@
 //! that never returns is otherwise stoppable by nothing, and a window boundary is a decision
 //! point that exists whatever the guest is doing.
 //!
-//! # What a guest thread deliberately does **not** do
+//! # Its destructors run when its start routine returns
 //!
-//! **It does not run `pthread_key` destructors when it exits.** Bionic does. Closing it needs a
-//! host → guest call from outside a thunk crossing, which is a boundary API that does not exist
-//! — every call into guest code today is made from inside a [`ReentrantCall`], and a thread
-//! finishing its start routine is not inside one. The cost is recorded rather than hidden: a
-//! guest that frees per-thread state from a key destructor leaks it once per thread exit. It does
-//! not affect M3's gate, where the 3,594 initializers run on a thread that does not exit, and
-//! `pthread_exit` is not in the reachable 188 at all.
+//! As bionic's thread exit does: `__cxa_thread_atexit_impl` handlers (C++ `thread_local`
+//! destructors) last-registered first, then `pthread_key` destructors -- see
+//! `run_exit_destructors`, which calls each through `Boundary::call_guest` while the stack is
+//! still mapped and before a joiner is released. This used to be a recorded gap, waiting on a
+//! host → guest entry outside a thunk crossing; `call_guest` is that entry, and the gap was
+//! closed when a worker faulted on a per-thread registry entry an exited thread's `thread_local`
+//! destructor would have removed. `pthread_exit` is still unbound, so returning from the start
+//! routine is the only way a guest thread exits normally.
 //!
 //! # The split between an errno-style return and a refusal
 //!
@@ -74,7 +75,7 @@ use omni_bionic::threads::GuestThreadId;
 use omni_cpu::{ExitReason, GuestCpu, GuestCpuBackend, RunLimit, XReg};
 use omni_mem::{CommitPolicy, GuestAddr, Placement, Protection};
 
-use crate::boundary::{Boundary, ImportCall, ReentrantCall};
+use crate::boundary::{Boundary, GuestArg, ImportCall, ReentrantCall};
 use crate::error::{AbiError, AbiResult};
 use crate::mem::{Blame, GuestMem};
 
@@ -471,6 +472,40 @@ pub struct GuestThreadFailure {
     /// (`0x625e4ec` is reached only indirectly) says nothing about which engine path asked,
     /// and that is the question each one poses.
     pub stack: Vec<u64>,
+    /// The registers and the top of the stack at death -- see [`DeathContext`]. Empty when the
+    /// thread never ran guest code.
+    pub context: DeathContext,
+}
+
+/// Bytes of a dying thread's stack kept at [`DeathContext::stack_bytes`].
+pub const DEATH_STACK_BYTES: usize = 512;
+
+/// What a dying guest thread's context held, taken **before its stack is unmapped**.
+///
+/// [`GuestThreadFailure::stack`] names *where* the thread was; this is *what it was holding*.
+/// MEASURED need: a null dereference at `0x2256548` whose null came from a field of an object
+/// the caller had in a callee-saved register -- saved by the faulting function's prologue into
+/// the frame this snapshot covers, and gone with the stack once the thread was reaped.
+///
+/// **Evidence, never control flow**, like the stack. `Debug` is deliberately a summary: failures
+/// are printed on every watchdog sample, and a host that wants the bytes reads the fields.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct DeathContext {
+    /// `X0`..`X30`, then `SP`.
+    pub registers: Vec<u64>,
+    /// Up to [`DEATH_STACK_BYTES`] at `SP`: as many as were readable.
+    pub stack_bytes: Vec<u8>,
+}
+
+impl core::fmt::Debug for DeathContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "DeathContext {{ {} registers, {} stack bytes }}",
+            self.registers.len(),
+            self.stack_bytes.len()
+        )
+    }
 }
 
 impl core::fmt::Display for GuestThreadFailure {
@@ -742,6 +777,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 start_routine: entry,
                 why: format!("the CPU context could not be created: {error}"),
                 stack: Vec::new(),
+                context: DeathContext::default(),
             });
             bionic.threads_table().release(slot);
             let _ = space.unmap(stack_base, total);
@@ -760,6 +796,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             start_routine: entry,
             why: format!("the thunk boundary could not be installed on the new context: {error}"),
             stack: Vec::new(),
+            context: DeathContext::default(),
         });
         bionic.threads_table().release(slot);
         let _ = space.unmap(stack_base, total);
@@ -810,6 +847,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 start_routine: entry,
                 why: format!("the host refused another thread: {error}"),
                 stack: Vec::new(),
+                context: DeathContext::default(),
             });
             bionic.forget_guest_thread(slot.id);
             bionic.threads_table().release(slot);
@@ -862,7 +900,7 @@ fn run_guest_thread(spawn: Spawn) {
     } = spawn;
     // Filled by `drive` at the moment the guest stops without returning, and read after the
     // stack is gone -- so the walk happens there, while the frames it reads are still mapped.
-    let mut death: Vec<u64> = Vec::new();
+    let mut death: (Vec<u64>, DeathContext) = (Vec::new(), DeathContext::default());
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // D13 again, from the other side: the context already has its thread pointer, which is
         // what makes it legal to run guest code at all on this thread.
@@ -902,7 +940,13 @@ fn run_guest_thread(spawn: Spawn) {
         cpu.set_sp(stack_top);
         cpu.set_x(XReg::new(0).expect("X0 exists"), argument);
         cpu.set_x(XReg::new(30).expect("X30 exists"), boundary.sentinel() as u64);
-        drive(&bionic, &boundary, &mut *cpu, entry, window, &mut death)
+        match drive(&bionic, &boundary, &mut *cpu, entry, window, &mut death) {
+            GuestThreadState::Returned(value) => {
+                run_exit_destructors(&bionic, &boundary, &mut *cpu, slot.id, &mut death)
+                    .unwrap_or(GuestThreadState::Returned(value))
+            }
+            other => other,
+        }
     }));
     let state = match outcome {
         Ok(state) => state,
@@ -938,6 +982,7 @@ fn run_guest_thread(spawn: Spawn) {
                 "the guest thread's stack at {base:#x} ({len} bytes) could not be unmapped, so                  its address space and commit charge are leaked for the life of this instance:                  {error}"
             ),
             stack: Vec::new(),
+            context: DeathContext::default(),
         });
     }
     let _ = bionic.threads_table().detach_current();
@@ -948,10 +993,65 @@ fn run_guest_thread(spawn: Spawn) {
             thread: slot.id.0,
             start_routine: entry,
             why: why.clone(),
-            stack: death,
+            stack: death.0,
+            context: death.1,
         });
     }
     bionic.finish_guest_thread(slot.id, state);
+}
+
+/// Guest instructions one thread-exit destructor is allowed: counted, for D16's reason, and far
+/// above what freeing per-thread state costs.
+const EXIT_DESTRUCTOR_BUDGET: RunLimit = RunLimit::Instructions(200_000_000);
+
+/// **What bionic's thread exit does before anyone may join: the thread's destructors.**
+///
+/// `__cxa_thread_atexit_impl` handlers first, last registered first -- C++ `thread_local`
+/// destructors -- then `pthread_key` destructors in ascending key order for up to four rounds;
+/// [`omni_bionic::tls::TlsRegistry::take_exit_work`] produces that order and clears each value
+/// before handing its destructor over. Each is a guest call on this thread, made here because
+/// its stack is still mapped and no joiner has been released.
+///
+/// MEASURED need: a guest worker faulted reading `+0x30` of a per-thread record whose home was
+/// the top of a thread that had exited -- a registry entry its `thread_local` destructor would
+/// have removed, left dangling because nothing ran it.
+///
+/// `None` when every destructor returned; the failed state otherwise, after which the rest are
+/// not called (their values are still cleared, as a crashed thread's would be). None run while
+/// the instance is stopping its threads: that is teardown, and a destructor then would be work
+/// the embedding asked not to happen.
+fn run_exit_destructors(
+    bionic: &Arc<Bionic>,
+    boundary: &Arc<Boundary>,
+    cpu: &mut dyn GuestCpu,
+    thread: GuestThreadId,
+    death: &mut (Vec<u64>, DeathContext),
+) -> Option<GuestThreadState> {
+    let mut failure: Option<GuestThreadState> = None;
+    bionic.tls.take_exit_work(thread, &mut |destructor, value| {
+        if failure.is_some() || bionic.guest_threads_stopping() {
+            return;
+        }
+        let Ok(target) = GuestAddr::try_from(destructor) else {
+            failure = Some(GuestThreadState::Failed(format!(
+                "the thread-exit destructor {destructor:#x} is not an address in this guest"
+            )));
+            return;
+        };
+        if let Err(error) = boundary.call_guest(
+            cpu,
+            "a guest thread's exit destructor",
+            target,
+            &[GuestArg::Int(value)],
+            EXIT_DESTRUCTOR_BUDGET,
+        ) {
+            *death = stack_at_death(boundary, cpu, cpu.pc());
+            failure = Some(GuestThreadState::Failed(format!(
+                "the thread-exit destructor {destructor:#x}({value:#x}) did not return: {error}"
+            )));
+        }
+    });
+    failure
 }
 
 /// Run the start routine in short windows until it returns or the instance asks it to stop.
@@ -961,7 +1061,7 @@ fn drive(
     cpu: &mut dyn GuestCpu,
     entry: GuestAddr,
     window: u64,
-    death: &mut Vec<u64>,
+    death: &mut (Vec<u64>, DeathContext),
 ) -> GuestThreadState {
     let sentinel = boundary.sentinel();
     let mut pc = entry;
@@ -1019,7 +1119,8 @@ fn drive(
     }
 }
 
-/// `PC`, then the frame walk from `X29`/`X30`, for [`GuestThreadFailure::stack`].
+/// `PC`, then the frame walk from `X29`/`X30`, for [`GuestThreadFailure::stack`] -- and the
+/// registers and top of stack for [`GuestThreadFailure::context`].
 ///
 /// `pc` is passed rather than read, because the exit knows it better than the context does: a
 /// fault reports the instruction that faulted, while the context's own `PC` may already be one
@@ -1027,7 +1128,11 @@ fn drive(
 ///
 /// Read through the boundary's checked memory, so a frame pointer the guest corrupted ends the
 /// walk at the first unreadable record rather than faulting this layer (Global Constraint 11).
-fn stack_at_death(boundary: &Boundary, cpu: &dyn GuestCpu, pc: GuestAddr) -> Vec<u64> {
+fn stack_at_death(
+    boundary: &Boundary,
+    cpu: &dyn GuestCpu,
+    pc: GuestAddr,
+) -> (Vec<u64>, DeathContext) {
     /// `omni_bionic::unwind::frames` over [`GuestMem`], read-only.
     struct Frames<'a>(&'a GuestMem);
     impl omni_bionic::memory::GuestMemory for Frames<'_> {
@@ -1045,6 +1150,19 @@ fn stack_at_death(boundary: &Boundary, cpu: &dyn GuestCpu, pc: GuestAddr) -> Vec
             Err(omni_bionic::memory::Fault(addr))
         }
     }
+    let mut registers: Vec<u64> =
+        (0..31).map(|n| cpu.x(XReg::new(n).expect("X0..X30 exist"))).collect();
+    let sp = cpu.sp();
+    registers.push(sp as u64);
+    // As many bytes at SP as are readable: the snapshot stops at the first unreadable granule
+    // rather than failing, because a partial frame is still evidence.
+    let mut stack_bytes = Vec::with_capacity(DEATH_STACK_BYTES);
+    for at in (sp..sp.saturating_add(DEATH_STACK_BYTES)).step_by(8) {
+        match boundary.mem().read_u64(at, Blame::new("a dead guest thread's stack", at, 0)) {
+            Ok(word) => stack_bytes.extend_from_slice(&word.to_le_bytes()),
+            Err(_) => break,
+        }
+    }
     let mut stack = vec![pc as u64];
     stack.extend(omni_bionic::unwind::frames(
         &Frames(boundary.mem()),
@@ -1052,7 +1170,7 @@ fn stack_at_death(boundary: &Boundary, cpu: &dyn GuestCpu, pc: GuestAddr) -> Vec
         cpu.x(XReg::new(30).expect("X30 exists")),
         24,
     ));
-    stack
+    (stack, DeathContext { registers, stack_bytes })
 }
 
 // ================================================================== pthread_join

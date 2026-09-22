@@ -548,6 +548,345 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          synchronise; a directory refuses by name until a run shows SQLite's directory sync.",
     ),
     (
+        "sendmsg",
+        "M6, the first run on Vulkan: the engine's QUIC transport died on it -- \"the guest called \
+         the imported symbol `sendmsg` ... nothing in the compatibility layer implements it\". \
+         The iovecs gathered and sent as sendto sends; control messages refused by name.",
+    ),
+    (
+        "strpbrk",
+        "M6, the first run on Vulkan: a guest worker died on it -- \"the guest called the imported \
+         symbol `strpbrk` ... nothing in the compatibility layer implements it\". s + strcspn, or \
+         NULL at the terminator.",
+    ),
+    (
+        "__strncpy_chk",
+        "M6, the first run in which the engine chose Vulkan: a guest worker died on it -- \"the \
+         guest called the imported symbol `__strncpy_chk` ... nothing in the compatibility layer \
+         implements it\". omni_bionic::string::strncpy_chk had existed unbound.",
+    ),
+    (
+        "__strchr_chk",
+        "M6, the run in which RenderView was first created: a guest worker died on it -- \"the \
+         guest called the imported symbol `__strchr_chk` ... nothing in the compatibility layer \
+         implements it\". bionic's fortify.cpp: strchr within a byte budget, fatal past it.",
+    ),
+    (
+        "setjmp",
+        "M6, once the Lua app was starting: libpng arming its error recovery on a guest worker \
+         died on it -- \"the guest called the imported symbol `setjmp` ... nothing in the \
+         compatibility layer implements it\". Answers the direct return, 0; saves nothing, which \
+         longjmp's refusal keeps safe.",
+    ),
+    (
+        "acos",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "asin",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "asinf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "atan2",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "atan2f",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "atanf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: the Lua app's thread died on it -- \"the guest called the imported symbol `atanf` ... nothing in the compatibility layer implements it\"; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "cbrtf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "cos",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "cosh",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "coshf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "fmodf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "ilogb",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "ldexpf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "log10f",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "log2",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "log2f",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "modff",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "sin",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "sinh",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "sinhf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; omni_bionic::libm had it unbound.",
+    ),
+    (
+        "atan",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "cbrt",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "exp2",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "exp2f",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "expm1",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "tan",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "tanh",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "hypotf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "fmod",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "frexpf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "round",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "nextafterf",
+        "M6, the run in which initializeLuaAppWithLoggedInUser first ran: not yet reached; bound with `atanf`, the rest of the engine's libm imports; written for this.",
+    ),
+    (
+        "wmemcmp",
+        "M6, the run in which wcslen was bound: the Lua app's thread died on it -- \"the guest \
+         called the imported symbol `wmemcmp` ... nothing in the compatibility layer implements \
+         it\". omni_bionic::wide::wmemcmp had existed unbound and matches FreeBSD's.",
+    ),
+    (
+        "wmemchr",
+        "Bound with wmemcmp, its neighbour in libc++'s char_traits<wchar_t>; not yet reached. \
+         omni_bionic::wide::wmemchr had existed unbound.",
+    ),
+    (
+        "wcslen",
+        "M6, the run in which the wide classifiers were bound: the Lua app's thread died on it -- \"the guest called the imported symbol `wcslen` ... nothing in the compatibility layer implements it\"; omni_bionic::wide::wcslen had existed unbound. bionic's own definition at \
+         android-13.0.0_r1.",
+    ),
+    (
+        "strcoll_l",
+        "M6, the run in which the wide classifiers were bound: not yet reached; bound with `wcslen`, its neighbour in libc++'s collate_byname and num_get. bionic's own definition at \
+         android-13.0.0_r1.",
+    ),
+    (
+        "strxfrm_l",
+        "M6, the run in which the wide classifiers were bound: not yet reached; bound with `wcslen`, its neighbour in libc++'s collate_byname and num_get. bionic's own definition at \
+         android-13.0.0_r1.",
+    ),
+    (
+        "wcscoll_l",
+        "M6, the run in which the wide classifiers were bound: not yet reached; bound with `wcslen`, its neighbour in libc++'s collate_byname and num_get. bionic's own definition at \
+         android-13.0.0_r1.",
+    ),
+    (
+        "wcsxfrm_l",
+        "M6, the run in which the wide classifiers were bound: not yet reached; bound with `wcslen`, its neighbour in libc++'s collate_byname and num_get. bionic's own definition at \
+         android-13.0.0_r1.",
+    ),
+    (
+        "strtoll_l",
+        "M6, the run in which the wide classifiers were bound: not yet reached; bound with `wcslen`, its neighbour in libc++'s collate_byname and num_get. bionic's own definition at \
+         android-13.0.0_r1.",
+    ),
+    (
+        "iswalpha_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswblank_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswcntrl_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswdigit_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswlower_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswprint_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswpunct_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswspace_l",
+        "M6, the run in which the mbrtowc family was bound: the Lua app's thread died on it -- \"the guest called the imported symbol `iswspace_l` ... nothing in the compatibility layer implements it\". ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswupper_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "iswxdigit_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "towlower_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "towupper_l",
+        "M6, the run in which the mbrtowc family was bound: not yet reached; bound with `iswspace_l`, its sibling in libc++'s ctype_byname<wchar_t>. ICU's definition over Unicode \
+         14.0 (Android 13's ICU 71), as bionic's wctype.cpp answers.",
+    ),
+    (
+        "mbrlen",
+        "M6, the run in which mbrtowc was bound: not yet reached by a run; bound with `mbsrtowcs`, its family, because libc++'s codecvt and ctype<wchar_t> call them together. Ported from bionic's own code at \
+         android-13.0.0_r1 (wchar.cpp, c32rtomb.cpp, OpenBSD's mbrlen/btowc/wctob).",
+    ),
+    (
+        "mbsrtowcs",
+        "M6, the run in which mbrtowc was bound: the Lua app's thread died on it -- \"the guest called the imported symbol `mbsrtowcs` ... nothing in the compatibility layer implements it\". Ported from bionic's own code at \
+         android-13.0.0_r1 (wchar.cpp, c32rtomb.cpp, OpenBSD's mbrlen/btowc/wctob).",
+    ),
+    (
+        "mbsnrtowcs",
+        "M6, the run in which mbrtowc was bound: not yet reached by a run; bound with `mbsrtowcs`, its family, because libc++'s codecvt and ctype<wchar_t> call them together. Ported from bionic's own code at \
+         android-13.0.0_r1 (wchar.cpp, c32rtomb.cpp, OpenBSD's mbrlen/btowc/wctob).",
+    ),
+    (
+        "wcrtomb",
+        "M6, the run in which mbrtowc was bound: not yet reached by a run; bound with `mbsrtowcs`, its family, because libc++'s codecvt and ctype<wchar_t> call them together. Ported from bionic's own code at \
+         android-13.0.0_r1 (wchar.cpp, c32rtomb.cpp, OpenBSD's mbrlen/btowc/wctob).",
+    ),
+    (
+        "wcsnrtombs",
+        "M6, the run in which mbrtowc was bound: not yet reached by a run; bound with `mbsrtowcs`, its family, because libc++'s codecvt and ctype<wchar_t> call them together. Ported from bionic's own code at \
+         android-13.0.0_r1 (wchar.cpp, c32rtomb.cpp, OpenBSD's mbrlen/btowc/wctob).",
+    ),
+    (
+        "btowc",
+        "M6, the run in which mbrtowc was bound: not yet reached by a run; bound with `mbsrtowcs`, its family, because libc++'s codecvt and ctype<wchar_t> call them together. Ported from bionic's own code at \
+         android-13.0.0_r1 (wchar.cpp, c32rtomb.cpp, OpenBSD's mbrlen/btowc/wctob).",
+    ),
+    (
+        "wctob",
+        "M6, the run in which mbrtowc was bound: not yet reached by a run; bound with `mbsrtowcs`, its family, because libc++'s codecvt and ctype<wchar_t> call them together. Ported from bionic's own code at \
+         android-13.0.0_r1 (wchar.cpp, c32rtomb.cpp, OpenBSD's mbrlen/btowc/wctob).",
+    ),
+    (
+        "mbrtowc",
+        "M6, the run in which localeconv was bound: the Lua app's thread died on it -- \"the guest \
+         called the imported symbol `mbrtowc` through its thunk at 0x1677cb288b0, and nothing in \
+         the compatibility layer implements it\". omni_bionic::wide had an mbrtowc that refused \
+         EILSEQ and ignored mbstate_t; bionic's mbrtoc32 was ported instead.",
+    ),
+    (
+        "localeconv",
+        "M6, the run with room for the engine's threads: the Lua app's thread died on it -- \"the \
+         guest called the imported symbol `localeconv` through its thunk at 0x1c9e15e7a80, and \
+         nothing in the compatibility layer implements it\". bionic's static C-locale lconv, \
+         built once in the pool; omni_bionic::locale had its values and no layout.",
+    ),
+    (
+        "__register_atfork",
+        "M6, the run in which startLuaApp_ first ran: a guest worker died on it -- \"the guest \
+         called the imported symbol `__register_atfork` through its thunk at 0x239b7b87710, and \
+         nothing in the compatibility layer implements it\". pthread_atfork's registration: kept, \
+         never owed a run, because fork is unbound and nothing forks.",
+    ),
+    (
+        "ferror",
+        "M6, once the engine settings reached a live engine: the worker running \
+         SingleSurfaceApp::initializeWithAppStarter died on it -- \"the guest called the imported \
+         symbol `ferror` through its thunk at 0x24ef1a27b00, and nothing in the compatibility \
+         layer implements it\". omni_bionic::stdio::Stream had kept C's error indicator all along \
+         with nothing to read it.",
+    ),
+    (
+        "modf",
+        "M6, the run in which initEngine_ first ran: the engine's own game thread died on it -- \
+         \"the guest called the imported symbol `modf` through its thunk at 0x1e668bb7a30, and \
+         nothing in the compatibility layer implements it\". omni_bionic::libm had modff and \
+         not modf; the double one is written to Annex F's signs.",
+    ),
+    (
+        "getpagesize",
+        "M6, the run that sent the engine settings after the engine existed: a guest worker died \
+         on it -- GuestThreadFailure { thread: 8, why: \"the guest called the imported symbol \
+         `getpagesize` through its thunk at 0x225ce497820, and nothing in the compatibility \
+         layer implements it\" }. bionic's getpagesize is getauxval(AT_PAGESZ): the same source \
+         as sysconf(_SC_PAGESIZE).",
+    ),
+    (
         "ftruncate",
         "M6, the first run in which nativeGameGlobalInit returned: a guest worker, once the \
          storage layer had initialised, died on it -- GuestThreadFailure { thread: 34, why: \"the \
@@ -606,7 +945,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 222, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 292, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -680,7 +1019,19 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // first reached and the other two decoded on the same object.
     // **`timerfd_create`, `timerfd_settime` and `fsync`, for 207**: the transport's timer and
     // SQLite's commit. **`ftruncate`, for 208**: the storage layer, once row 22 returned.
-    assert_eq!(Bionic::inline_symbols().count(), 208);
+    // **`getpagesize`, for 209**: a worker, once the engine had its settings. **`modf`, for
+    // 210**: the game thread in `initEngine_`. **`ferror`, for 211**: the worker in
+    // `initializeWithAppStarter`. **`__register_atfork`, for 212**: once the Lua app started.
+    // **`localeconv`, for 213**: the Lua app's thread. **`mbrtowc`, for 214**: the same thread.
+    // **Its family, for 221**: `mbrlen`, `mbsrtowcs`, `mbsnrtowcs`, `wcrtomb`, `wcsnrtombs`,
+    // `btowc`, `wctob` -- libc++'s codecvt and ctype<wchar_t>, bound together. **The ten
+    // `isw*_l` and `tow{lower,upper}_l`, for 233**: ctype_byname<wchar_t>, reached at `iswspace_l`.
+    // **`wcslen` and collation's five, for 239**: reached at `wcslen`. **`wmemcmp` and
+    // `wmemchr`, for 241**. **The rest of libm, for 273**: 32 functions once the Lua app
+    // reached `atanf`. **`setjmp`, for 274**: libpng's error recovery. **`__strchr_chk`, for
+    // 275**: a worker, once the renderer was being created. **`__strncpy_chk`, for 276**.
+    // **`strpbrk`, for 277**. **`sendmsg`, for 278**: the QUIC transport.
+    assert_eq!(Bionic::inline_symbols().count(), 278);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -1380,6 +1731,155 @@ fn snprintf_formats_integers_strings_and_doubles_from_a_real_variadic_call() {
     assert_eq!(written, produced.len() as i64, "snprintf returns the length it wrote");
 }
 
+/// **`__strchr_chk` is `strchr` within a budget**: a match or the NUL inside it answers as
+/// `strchr` would, and a budget that runs out first is the fortify failure, reported by name.
+#[test]
+fn strchr_chk_finds_within_its_budget_and_fails_past_it() {
+    let _guard = serialized();
+    let f = fixture();
+    let s = f.cstring(f.guest.data + 0x100, b"abcdef");
+    let find = |c: u8, budget: u64| {
+        value_of(&f, "__strchr_chk", |asm| {
+            asm.mov(0, s as u64);
+            asm.mov(1, u64::from(c));
+            asm.mov(2, budget);
+        })
+    };
+    assert_eq!(find(b'd', 7), s as u64 + 3);
+    assert_eq!(find(b'z', 7), 0, "not found: NULL at the NUL");
+    assert_eq!(find(0, 7), s as u64 + 6, "c == 0 finds the terminator");
+    let error = refusal_of(&f, "__strchr_chk", |asm| {
+        asm.mov(0, s as u64);
+        asm.mov(1, u64::from(b'z'));
+        asm.mov(2, 3);
+    });
+    assert!(error.to_string().contains("__strchr_chk"), "{error}");
+    // strpbrk: the first byte in the set, or NULL.
+    let set = f.cstring(f.guest.data + 0x140, b"xed");
+    let first = value_of(&f, "strpbrk", |asm| {
+        asm.mov(0, s as u64);
+        asm.mov(1, set as u64);
+    });
+    assert_eq!(first, s as u64 + 3, "'d' at index 3 comes before 'e'");
+    let none = f.cstring(f.guest.data + 0x160, b"xyz");
+    assert_eq!(value_of(&f, "strpbrk", |asm| {
+        asm.mov(0, s as u64);
+        asm.mov(1, none as u64);
+    }), 0);
+    // __strncpy_chk: n within the destination copies and pads; n past it is the fortify failure.
+    let dst = f.guest.data + 0x200;
+    f.guest.write_u64(dst, u64::MAX);
+    let copied = value_of(&f, "__strncpy_chk", |asm| {
+        asm.mov(0, dst as u64);
+        asm.mov(1, s as u64);
+        asm.mov(2, 8);
+        asm.mov(3, 8);
+    });
+    assert_eq!(copied, dst as u64);
+    assert_eq!(f.guest.read_u64(dst), u64::from_le_bytes(*b"abcdef\0\0"));
+    let error = refusal_of(&f, "__strncpy_chk", |asm| {
+        asm.mov(0, dst as u64);
+        asm.mov(1, s as u64);
+        asm.mov(2, 9);
+        asm.mov(3, 8);
+    });
+    assert!(error.to_string().contains("__strncpy_chk"), "{error}");
+}
+
+/// **`setjmp` answers its direct return, and the `longjmp` that could observe the unsaved
+/// environment still refuses by name** -- the pair's safety argument, as a test.
+#[test]
+fn setjmp_returns_zero_and_longjmp_still_refuses() {
+    let _guard = serialized();
+    let f = fixture();
+    let env = f.guest.data + 0x400;
+    assert_eq!(value_of(&f, "setjmp", |asm| { asm.mov(0, env as u64); }) as u32, 0);
+    assert_eq!(f.bionic.setjmps(), 1);
+    let error = refusal_of(&f, "longjmp", |asm| {
+        asm.mov(0, env as u64);
+        asm.mov(1, 1);
+    });
+    assert!(matches!(error, AbiError::Refused { .. }), "{error:?}");
+    assert!(error.to_string().contains("answers only its direct return"), "{error}");
+}
+
+/// **The float-register ABI for single and double precision, through real thunks**: `atanf`
+/// takes and returns `S0`, `ilogb` takes `D0` and returns `W0`, `frexpf` writes its exponent
+/// through `X0` and returns `S0`, and `round` is half away from zero.
+#[test]
+fn libm_single_and_double_precision_through_real_thunks() {
+    let _guard = serialized();
+    let f = fixture();
+    let data = f.guest.data;
+    let run = |symbol: &str, load: &[(u32, u64)], ints: &[(u32, u64)], store_s: bool| {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(22, data as u64);
+        asm.mov(9, data as u64 + 0x180);
+        for (reg, off) in load {
+            asm.push(ldr_d(*reg, 9, *off as u32));
+        }
+        for (reg, value) in ints {
+            asm.mov(*reg, *value);
+        }
+        asm.bl(f.thunk(symbol));
+        if store_s {
+            asm.push(str_d(0, 22, 0));
+        } else {
+            asm.push(str_imm(0, 22, 0));
+        }
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        let mut cpu = f.guest.thread(&f.boundary);
+        f.run(&mut cpu, entry).expect("the run must complete");
+        f.guest.read_u64(data)
+    };
+    // atanf(1.0f) = pi/4 in S0: the low 32 bits of D0.
+    f.guest.write_u64(data + 0x180, u64::from(1.0f32.to_bits()));
+    let r = run("atanf", &[(0, 0)], &[], true);
+    assert_eq!(f32::from_bits(r as u32), 1.0f32.atan());
+    // ilogb(1024.0) = 10 in W0.
+    f.guest.write_f64(data + 0x180, 1024.0);
+    assert_eq!(run("ilogb", &[(0, 0)], &[], false) as u32 as i32, 10);
+    // round(-2.5) = -3.0 (half away from zero).
+    f.guest.write_f64(data + 0x180, -2.5);
+    assert_eq!(f64::from_bits(run("round", &[(0, 0)], &[], true)), -3.0);
+    // frexpf(12.0f) = 0.75 * 2^4, the exponent through X0.
+    f.guest.write_u64(data + 0x180, u64::from(12.0f32.to_bits()));
+    let exp_at = data + 0x1c0;
+    let r = run("frexpf", &[(0, 0)], &[(0, exp_at as u64)], true);
+    assert_eq!(f32::from_bits(r as u32), 0.75);
+    assert_eq!(f.guest.read_u64(exp_at) as u32, 4);
+}
+
+/// **`modf` through a real thunk**: `x` in `D0`, `iptr` in `X0`, the fraction back in `D0` and the
+/// integer part in guest memory -- the float-register half of the ABI, which the host-side test
+/// of the primitive cannot see.
+#[test]
+fn modf_splits_a_double_through_a_real_thunk() {
+    let _guard = serialized();
+    let f = fixture();
+    let x_at = f.guest.data + 0x180;
+    let int_at = f.guest.data + 0x188;
+    f.guest.write_f64(x_at, -7.25);
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(22, f.guest.data as u64);
+    asm.mov(9, x_at as u64);
+    asm.push(ldr_d(0, 9, 0));
+    asm.mov(0, int_at as u64);
+    asm.bl(f.thunk("modf"));
+    asm.push(str_d(0, 22, 0));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    f.run(&mut cpu, entry).expect("the run must complete");
+    assert_eq!(f.guest.read_u64(f.guest.data), (-0.25f64).to_bits(), "the fraction, in D0");
+    assert_eq!(f.guest.read_u64(int_at), (-7.0f64).to_bits(), "the integer part, stored");
+}
+
 /// `snprintf(NULL, 0, ...)` is the documented way to ask how long a result would be, and it must
 /// not touch the destination. The return is the **full** length, not the truncated one: a handler
 /// that returned the truncated length makes every caller that grows its buffer loop forever.
@@ -1511,15 +2011,15 @@ fn a_long_double_conversion_is_refused_and_names_itself() {
 }
 
 /// A symbol this layer does not implement stays `Unbound`, and its call names itself. That is the
-/// design, not a gap: a `setjmp` bound to a stub returning a plausible zero would surface three
+/// design, not a gap: a stub returning a plausible zero would surface three
 /// thousand initializers later somewhere unrelated.
 ///
 /// **The symbol here has moved three times, and that churn is the test working.** It was `fopen`
 /// until phase 3b bound it, then `socket` until phase 3d bound it — as a refusal, which is a
 /// *different* statement from `Unbound`. Every one of the 188 the initializers reach is now
 /// serviced, refused by name, placed as a data object or deliberately absent, so the example is
-/// now one of the 377 imports **outside** the reachable set: `setjmp`, which `libroblox.so`
-/// imports and which only an address-taken edge reaches. Those are exactly the calls
+/// now one of the imports **outside** the reachable set: it was `setjmp` until M6 bound it, and is
+/// `ungetwc`, which `libroblox.so` imports and nothing has yet reached. Those are exactly the calls
 /// `Binding::Unbound` exists for — D17 records 188 as a *lower bound* with 17,698 unresolvable
 /// indirect call sites behind it, so a symbol outside the prediction must name itself rather than
 /// branch to zero.
@@ -1527,8 +2027,8 @@ fn a_long_double_conversion_is_refused_and_names_itself() {
 fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     let _guard = serialized();
     let f = fixture();
-    let thunk = f.boundary.slot_named("setjmp").map(|s| s.address);
-    assert!(thunk.is_none(), "setjmp is outside the reachable 188 and must not be bound");
+    let thunk = f.boundary.slot_named("ungetwc").map(|s| s.address);
+    assert!(thunk.is_none(), "ungetwc is not bound");
 
     // One that *is* declared, because the loader would have asked for it: bind it as the loader
     // would and confirm the call names it.
@@ -1536,7 +2036,7 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
     let builder = guest.boundary(256);
     bionic.bind_into(&builder).expect("bind");
-    let unbound = builder.declare_function("setjmp").expect("a slot");
+    let unbound = builder.declare_function("ungetwc").expect("a slot");
     let boundary = builder.finish();
     let entry = guest.next_entry();
     let mut asm = Asm::at(entry);
@@ -1546,9 +2046,9 @@ fn a_symbol_this_phase_does_not_implement_is_unbound_and_says_so() {
     guest.load(asm.words());
     let mut cpu = guest.thread(&boundary);
     let _active = bionic.activate().expect("a thread block");
-    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("setjmp is not implemented");
+    let error = boundary.run(&mut cpu, entry, BUDGET).expect_err("ungetwc is not implemented");
     assert!(matches!(error, AbiError::Unbound { .. }), "{error:?}");
-    assert_eq!(error.symbol(), Some("setjmp"));
+    assert_eq!(error.symbol(), Some("ungetwc"));
     assert_eq!(error.guest_address(), Some(unbound));
 }
 
@@ -1739,24 +2239,72 @@ fn the_undeliverable_signal_family_refuses_by_name() {
     }
 }
 
-/// `sigaction`'s **query** form is refused too, and says which form it was.
-///
-/// It is the one that looks answerable — nothing can have installed a handler, so `SIG_DFL` is
-/// arithmetically true — and answering it would mean writing a `struct sigaction` whose layout
-/// has never been checked against a header on this machine, to describe a table that does not
-/// exist.
+/// `sigaction`'s **query** form is refused for every signal but `SIGPIPE`, and says which form it
+/// was: ART and debuggerd install real handlers for several signals, so `SIG_DFL` would be false.
 #[test]
 fn the_query_form_of_sigaction_is_refused_and_names_itself_as_a_query() {
     let _guard = serialized();
     let f = fixture();
     let error = refusal_of(&f, "sigaction", |asm| {
-        asm.mov(0, 13); // SIGPIPE
+        asm.mov(0, 11); // SIGSEGV
         asm.mov(1, 0); // act == NULL: a query
         asm.mov(2, f.guest.data as u64 + 0x400);
     });
     let text = error.to_string();
     assert!(text.contains("querying the current disposition"), "{text}");
-    assert!(text.contains("SIGPIPE"), "{text}");
+    assert!(text.contains("SIGSEGV"), "{text}");
+}
+
+/// **`SIGPIPE` round-trips, as libcurl's `sigpipe_ignore`/`sigpipe_restore` uses it**: the query
+/// answers an Android app's real disposition -- `SIG_DFL`, no flags, empty mask, 32 zero bytes --
+/// a `SIG_IGN` is recorded byte for byte and read back, and the saved action restores. A handler
+/// for `SIGPIPE` still refuses: nothing would ever be delivered to it.
+#[test]
+fn sigpipe_answers_sig_dfl_records_sig_ign_and_restores() {
+    let _guard = serialized();
+    let f = fixture();
+    let old = f.guest.data + 0x400;
+    let act = f.guest.data + 0x440;
+    let query = |f: &Fixture| {
+        for k in 0..4 {
+            f.guest.write_u64(old + 8 * k, 0xAAAA_AAAA_AAAA_AAAA);
+        }
+        let result = value_of(f, "sigaction", |asm| {
+            asm.mov(0, 13);
+            asm.mov(1, 0);
+            asm.mov(2, old as u64);
+        });
+        assert_eq!(result, 0, "the query succeeds");
+        (0..4).map(|k| f.guest.read_u64(old + 8 * k)).collect::<Vec<u64>>()
+    };
+    let set = |f: &Fixture, words: [u64; 4]| {
+        for (k, word) in words.iter().enumerate() {
+            f.guest.write_u64(act + 8 * k, *word);
+        }
+        value_of(f, "sigaction", |asm| {
+            asm.mov(0, 13);
+            asm.mov(1, act as u64);
+            asm.mov(2, 0);
+        })
+    };
+    assert_eq!(query(&f), [0, 0, 0, 0], "an app's SIGPIPE is the untouched SIG_DFL");
+    // `SA_RESTART` in the flags word, `SIG_IGN` at +8, one bit of mask: stored exactly.
+    let ignore = [0x1000_0000, 1, 0x1000, 0];
+    assert_eq!(set(&f, ignore), 0, "SIG_IGN is recorded");
+    assert_eq!(query(&f), ignore, "and read back byte for byte");
+    assert_eq!(set(&f, [0, 0, 0, 0]), 0, "the saved SIG_DFL restores");
+    assert_eq!(query(&f), [0, 0, 0, 0]);
+
+    for k in 0..4 {
+        f.guest.write_u64(act + 8 * k, [0, 0x1234, 0, 0][k]);
+    }
+    let error = refusal_of(&f, "sigaction", |asm| {
+        asm.mov(0, 13);
+        asm.mov(1, act as u64);
+        asm.mov(2, 0);
+    });
+    assert!(error.to_string().contains("installing a handler"), "{error}");
+    assert_eq!(query(&f), [0, 0, 0, 0], "a refused handler changed nothing");
 }
 
 /// A handler on a thread with no instance published refuses by name rather than inventing a
@@ -5010,7 +5558,18 @@ fn fseeko_moves_the_stream_and_clears_end_of_file_and_ftello_reports_it() {
     assert_eq!(fgets(64), buf as u64);
     assert_eq!(fgets(64), 0, "end of file");
     assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 1);
+    assert_eq!(value_of(&f, "ferror", |asm| { asm.mov(0, stream); }) as i64, 0, "no error");
     assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 10, "at the end");
+    // A write to a stream opened for reading fails, and sets the error indicator ferror reports.
+    assert_eq!(
+        value_of(&f, "fputc", |asm| {
+            asm.mov(0, u64::from(b'x'));
+            asm.mov(1, stream);
+        }) as u32 as i32,
+        -1,
+        "fputc on a read-only stream is EOF"
+    );
+    assert_eq!(value_of(&f, "ferror", |asm| { asm.mov(0, stream); }) as i64, 1, "the indicator");
 
     let seek = |offset: i64, whence: u64| {
         value_of(&f, "fseeko", |asm| {
@@ -5797,6 +6356,127 @@ fn a_start_routine_at_a_bad_address_is_a_recorded_failure_and_a_join_refusal() {
         Some(f.boundary.sentinel() as u64),
         "then X30, which the runner pointed at the sentinel: {:?}",
         failures[0].stack
+    );
+}
+
+/// **A dead thread's record keeps what it was holding: its registers and the top of its stack,
+/// read before the stack is unmapped.**
+///
+/// The start routine stores a marker at `[SP]`, puts another in a callee-saved register, and
+/// jumps to an unmapped address. A snapshot taken after the reap would find the stack gone and
+/// keep no bytes; one that forgot the registers would have no `X19`. Either fails here.
+#[test]
+fn a_dead_threads_record_keeps_its_registers_and_the_top_of_its_stack() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    const ARG: u64 = 0x5eed_0000_0000_00a7;
+    const ON_STACK: u64 = 0x57ac_0000_0000_0b0b;
+    const IN_X19: u64 = 0x0019_0000_0000_c0de;
+    let start = start_routine(&f, |asm| {
+        asm.push(sub_imm(31, 31, 32));
+        asm.mov(9, ON_STACK);
+        asm.push(str_imm(9, 31, 0));
+        asm.mov(19, IN_X19);
+        asm.mov(10, f.guest.unmapped as u64);
+        asm.push(br(10));
+    });
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, ARG);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+    });
+    assert!(run_program(&f, entry).is_err(), "the join refuses a thread that died");
+
+    let failures = f.bionic.guest_thread_failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let context = &failures[0].context;
+    assert_eq!(context.registers.len(), 32, "X0..X30 then SP: {context:?}");
+    assert_eq!(context.registers[0], ARG, "X0 still holds the start routine's argument");
+    assert_eq!(context.registers[19], IN_X19, "a callee-saved register is kept");
+    assert_eq!(context.registers[10], f.guest.unmapped as u64, "the branch target register");
+    assert!(
+        context.stack_bytes.len() >= 8,
+        "the top of the stack was read before it was unmapped: {context:?}"
+    );
+    assert_eq!(
+        u64::from_le_bytes(context.stack_bytes[..8].try_into().expect("eight bytes")),
+        ON_STACK,
+        "the bytes are the ones at SP at death"
+    );
+}
+
+/// **A thread's destructors run when it returns, before its joiner is released, in bionic's
+/// order**: the `__cxa_thread_atexit_impl` handler (a C++ `thread_local`'s destructor) first, then
+/// the `pthread_key` destructor, each handed its own value.
+///
+/// Both destructors are guest code that bump one counter and record the count and their argument,
+/// so the test sees whether each ran, what it was given and which ran first. A thread body that
+/// skipped them -- which this layer's did until a worker faulted on a registry entry an exited
+/// thread's `thread_local` had left behind -- records nothing.
+#[test]
+fn a_returning_thread_runs_its_thread_local_then_key_destructors_before_the_join() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let key_at = f.guest.data + 0xA00;
+    let counter = f.guest.data + 0xA10;
+    let atexit_log = f.guest.data + 0xA20;
+    let key_log = f.guest.data + 0xA30;
+    for at in [counter, atexit_log, atexit_log + 8, key_log, key_log + 8] {
+        f.guest.write_u64(at, 0);
+    }
+    let recorder = |slot: omni_cpu::GuestAddr| {
+        start_routine(&f, |asm| {
+            asm.mov(9, counter as u64);
+            asm.push(ldr_imm(10, 9, 0));
+            asm.push(add_imm(10, 10, 1));
+            asm.push(str_imm(10, 9, 0));
+            asm.mov(11, slot as u64);
+            asm.push(str_imm(10, 11, 0));
+            asm.push(str_imm(0, 11, 8));
+        })
+    };
+    let thread_local_dtor = recorder(atexit_log);
+    let key_dtor = recorder(key_log);
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.mov(9, key_at as u64);
+        asm.push(ldr_w(0, 9, 0));
+        asm.mov(1, 0x5E7);
+        asm.bl(f.thunk("pthread_setspecific"));
+        asm.mov(0, thread_local_dtor as u64);
+        asm.mov(1, 0xA7E);
+        asm.mov(2, 0);
+        asm.bl(f.thunk("__cxa_thread_atexit_impl"));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+    let entry = program(&f, |asm| {
+        asm.mov(0, key_at as u64);
+        asm.mov(1, key_dtor as u64);
+        asm.bl(f.thunk("pthread_key_create"));
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 24));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 24), 0, "the join succeeded");
+    assert!(f.bionic.guest_thread_failures().is_empty(), "{:?}", f.bionic.guest_thread_failures());
+    assert_eq!(
+        (f.guest.read_u64(atexit_log), f.guest.read_u64(atexit_log + 8)),
+        (1, 0xA7E),
+        "the thread_local destructor ran first, with its object"
+    );
+    assert_eq!(
+        (f.guest.read_u64(key_log), f.guest.read_u64(key_log + 8)),
+        (2, 0x5E7),
+        "then the key destructor, with the thread's value"
     );
 }
 
@@ -7820,6 +8500,86 @@ fn getsockname_reports_the_bound_address_and_a_short_buffer_gets_the_full_length
     assert_eq!(&truncated[8..16], &[0xAA; 8], "and nothing past the eight it was given");
 }
 
+/// **`sendmsg` gathers its `iovec`s into one datagram to `msg_name`**, which the receiving socket
+/// reads back whole -- and a control message refuses by name, listing what was asked for.
+#[test]
+fn sendmsg_gathers_its_iovecs_into_one_datagram_and_refuses_control_messages() {
+    let _guard = serialized();
+    let (f, _root) = networked("sendmsg");
+    let socket = || {
+        value_of(&f, "socket", |asm| {
+            asm.mov(0, AF_INET);
+            asm.mov(1, 2); // SOCK_DGRAM
+            asm.mov(2, 0);
+        }) as i32
+    };
+    let (receiver, sender) = (socket(), socket());
+    // Bind the receiver to 127.0.0.1:0 and learn its port.
+    let sockaddr = f.guest.data + 0x100;
+    let mut bytes = [0u8; 16];
+    bytes[0..2].copy_from_slice(&2u16.to_le_bytes());
+    bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    f.guest.write_bytes(sockaddr, &bytes);
+    assert_eq!(
+        value_of(&f, "bind", |asm| {
+            asm.mov(0, receiver as u64);
+            asm.mov(1, sockaddr as u64);
+            asm.mov(2, 16);
+        }) as i32,
+        0
+    );
+    let len_at = f.guest.data + 0x140;
+    f.guest.write_bytes(len_at, &16u32.to_le_bytes());
+    value_of(&f, "getsockname", |asm| {
+        asm.mov(0, receiver as u64);
+        asm.mov(1, sockaddr as u64);
+        asm.mov(2, len_at as u64);
+    });
+    // Two iovecs, "hello " and "world", and a msghdr naming the receiver.
+    let first = f.cstring(f.guest.data + 0x200, b"hello ");
+    let second = f.cstring(f.guest.data + 0x220, b"world");
+    let iov = f.guest.data + 0x240;
+    f.guest.write_u64(iov, first as u64);
+    f.guest.write_u64(iov + 8, 6);
+    f.guest.write_u64(iov + 16, second as u64);
+    f.guest.write_u64(iov + 24, 5);
+    let msg = f.guest.data + 0x280;
+    f.guest.write_bytes(msg, &[0u8; 56]);
+    f.guest.write_u64(msg, sockaddr as u64);
+    f.guest.write_u64(msg + 8, 16);
+    f.guest.write_u64(msg + 16, iov as u64);
+    f.guest.write_u64(msg + 24, 2);
+    let sent = value_of(&f, "sendmsg", |asm| {
+        asm.mov(0, sender as u64);
+        asm.mov(1, msg as u64);
+        asm.mov(2, 0);
+    }) as i64;
+    assert_eq!(sent, 11, "both iovecs, one datagram");
+    let buf = f.guest.data + 0x300;
+    let got = value_of(&f, "recvfrom", |asm| {
+        asm.mov(0, receiver as u64);
+        asm.mov(1, buf as u64);
+        asm.mov(2, 64);
+        asm.mov(3, 0);
+        asm.mov(4, 0);
+        asm.mov(5, 0);
+    }) as i64;
+    assert_eq!(got, 11);
+    assert_eq!(read_guest(&f, buf, 11), b"hello world");
+    // A control message: an IP_TOS cmsg (len 20, level IPPROTO_IP, type IP_TOS = 1).
+    let control = f.guest.data + 0x380;
+    f.guest.write_u64(control, 20);
+    f.guest.write_u64(control + 8, 1u64 << 32);
+    f.guest.write_u64(msg + 32, control as u64);
+    f.guest.write_u64(msg + 40, 24);
+    let error = refusal_of(&f, "sendmsg", |asm| {
+        asm.mov(0, sender as u64);
+        asm.mov(1, msg as u64);
+        asm.mov(2, 0);
+    });
+    assert!(error.to_string().contains("control messages"), "{error}");
+}
+
 /// **The `struct addrinfo` list the guest walks is bionic's layout, read back the way the guest
 /// reads it.**
 ///
@@ -8067,6 +8827,42 @@ fn getaddrinfo_reports_the_bionic_eai_codes_and_not_the_hosts() {
 /// variant for it -- so the refusal it produces is the contract this test is about. The
 /// `SO_KEEPALIVE` end of the story is asserted by *calling* it, in
 /// `the_keep_alive_timing_options_reach_the_socket_in_the_guests_numbering`.
+/// **`IP_MTU_DISCOVER` = `IP_PMTUDISC_DO` sets don't-fragment, as ngtcp2 asks**, and the modes
+/// with no host spelling -- or the other family's level -- are refused by name rather than
+/// reported as a policy nothing applies.
+#[test]
+fn path_mtu_discovery_do_is_dont_fragment_and_other_modes_refuse() {
+    let _guard = serialized();
+    let (f, _root) = networked("setsockopt-pmtud");
+    let fd = value_of(&f, "socket", |asm| {
+        asm.mov(0, AF_INET);
+        asm.mov(1, 2); // SOCK_DGRAM
+        asm.mov(2, 0);
+    }) as i32;
+    assert!(fd >= 3, "fd {fd}");
+    let value = f.guest.data + 0x100;
+    let set = |level: u64, name: u64, mode: i32| {
+        f.guest.write_bytes(value, &mode.to_le_bytes());
+        move |asm: &mut Asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, level);
+            asm.mov(2, name);
+            asm.mov(3, value as u64);
+            asm.mov(4, 4);
+        }
+    };
+    assert_eq!(value_of(&f, "setsockopt", set(0, 10, 2)) as i32, 0, "IP_PMTUDISC_DO");
+    assert_eq!(value_of(&f, "setsockopt", set(0, 10, 0)) as i32, 0, "IP_PMTUDISC_DONT");
+    let error = refusal_of(&f, "setsockopt", set(0, 10, 1));
+    assert!(error.to_string().contains("IP_MTU_DISCOVER"), "WANT has no host spelling: {error}");
+    let error = refusal_of(&f, "setsockopt", set(41, 23, 2));
+    assert!(error.to_string().contains("IPV6_MTU_DISCOVER"), "the other family's level: {error}");
+    // UDP_GRO is accepted on a datagram socket; UDP_SEGMENT (103) still refuses.
+    assert_eq!(value_of(&f, "setsockopt", set(17, 104, 1)) as i32, 0, "UDP_GRO");
+    let error = refusal_of(&f, "setsockopt", set(17, 103, 1200));
+    assert!(error.to_string().contains("option 103"), "UDP_SEGMENT is not accepted: {error}");
+}
+
 #[test]
 fn an_unimplemented_socket_option_is_refused_with_its_own_numbers() {
     let _guard = serialized();
@@ -9154,6 +9950,237 @@ fn ftruncate_sets_the_length_and_refuses_what_linux_refuses() {
     assert_eq!(call_with_errno(&f, "ftruncate", &[ro as u64, 1]), (-1, EINVAL_NET), "read-only");
     assert_eq!(call_with_errno(&f, "ftruncate", &[99, 1]), (-1, EBADF_NET));
     assert_eq!(std::fs::read(scratch.path("t.bin")).expect("read").len(), 6, "untouched");
+}
+
+/// **`mbrtowc` through a real thunk keeps a split character in the guest's `mbstate_t`**, and a
+/// NULL `ps` uses one private state across calls, as bionic's static does.
+#[test]
+fn mbrtowc_finishes_a_split_character_from_the_guests_state() {
+    let _guard = serialized();
+    let f = fixture();
+    let text = f.guest.data + 0x100;
+    let out = f.guest.data + 0x200;
+    let state = f.guest.data + 0x210;
+    f.guest.write_u64(text, 0x00AC_82E2); // U+20AC's three bytes, then NUL
+    f.guest.write_u64(state, 0);
+    let call = |s: u64, n: u64, ps: u64| {
+        value_of(&f, "mbrtowc", |asm| {
+            asm.mov(0, out as u64);
+            asm.mov(1, s);
+            asm.mov(2, n);
+            asm.mov(3, ps);
+        })
+    };
+    assert_eq!(call(text as u64, 1, state as u64), u64::MAX - 1, "incomplete");
+    assert_eq!(call(text as u64 + 1, 2, state as u64), 2, "finished from the state");
+    assert_eq!(f.guest.read_u64(out) as u32, 0x20AC);
+    // The same split with ps == NULL: the private state carries it.
+    assert_eq!(call(text as u64, 1, 0), u64::MAX - 1);
+    assert_eq!(call(text as u64 + 1, 2, 0), 2, "the private state kept the lead byte");
+}
+
+/// **`mbsrtowcs` and `wcsnrtombs` through real thunks, as libc++'s `codecvt` uses them**: a
+/// string with a multibyte character converts both ways, `*src` is set to NULL at the NUL, and
+/// a measuring call (`dst == NULL`) counts without writing.
+#[test]
+fn mbsrtowcs_and_wcsnrtombs_round_trip_a_string_and_move_src() {
+    let _guard = serialized();
+    let f = fixture();
+    let text = f.cstring(f.guest.data + 0x100, "a\u{20AC}b".as_bytes());
+    let src = f.guest.data + 0x140;
+    let wide = f.guest.data + 0x200;
+    let back = f.guest.data + 0x300;
+    let wsrc = f.guest.data + 0x148;
+    // Measure: three characters.
+    f.guest.write_u64(src, text as u64);
+    let measured = value_of(&f, "mbsrtowcs", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, src as u64);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+    });
+    assert_eq!(measured, 3, "a, U+20AC, b");
+    // Convert, with room for all four (the NUL included).
+    let converted = value_of(&f, "mbsrtowcs", |asm| {
+        asm.mov(0, wide as u64);
+        asm.mov(1, src as u64);
+        asm.mov(2, 8);
+        asm.mov(3, 0);
+    });
+    assert_eq!(converted, 3);
+    assert_eq!(f.guest.read_u64(src), 0, "*src is NULL once the NUL is converted");
+    assert_eq!(f.guest.read_u64(wide), 0x0000_20AC_0000_0061, "a then U+20AC");
+    assert_eq!(f.guest.read_u64(wide + 8), 0x62, "b then L'\\0'");
+    // And back: 1 + 3 + 1 bytes, then the NUL.
+    f.guest.write_u64(wsrc, wide as u64);
+    let bytes = value_of(&f, "wcsnrtombs", |asm| {
+        asm.mov(0, back as u64);
+        asm.mov(1, wsrc as u64);
+        asm.mov(2, 8);
+        asm.mov(3, 16);
+        asm.mov(4, 0);
+    });
+    assert_eq!(bytes, 5);
+    assert_eq!(f.read_cstring(back), "a\u{20AC}b".as_bytes());
+    assert_eq!(f.guest.read_u64(wsrc), 0, "*src is NULL at the NUL");
+    // wcrtomb, btowc and wctob beside them.
+    let one = value_of(&f, "wcrtomb", |asm| {
+        asm.mov(0, back as u64);
+        asm.mov(1, 0xE9);
+        asm.mov(2, 0);
+    });
+    assert_eq!(one, 2, "U+00E9 is two bytes");
+    assert_eq!(value_of(&f, "btowc", |asm| { asm.mov(0, 0x41); }) as u32, 0x41);
+    assert_eq!(value_of(&f, "btowc", |asm| { asm.mov(0, 0xC3); }) as u32, u32::MAX, "WEOF");
+    assert_eq!(value_of(&f, "wctob", |asm| { asm.mov(0, 0x20AC); }) as u32 as i32, -1, "EOF");
+}
+
+/// **The wide classifiers through real thunks answer ICU's way**: `iswpunct_l('$')` is 0 on
+/// Android 13 (`$` is `Sc`), `iswspace_l` of IDEOGRAPHIC SPACE is 1, and `towupper_l` maps
+/// through the simple case mapping -- `ß` to itself.
+#[test]
+fn the_wide_classifiers_answer_as_icu_does() {
+    let _guard = serialized();
+    let f = fixture();
+    let ask = |symbol: &str, c: u64| {
+        value_of(&f, symbol, |asm| {
+            asm.mov(0, c);
+            asm.mov(1, 0);
+        }) as u32 as i32
+    };
+    assert_eq!(ask("iswpunct_l", u64::from(b'$')), 0, "`$` is a currency symbol");
+    assert_eq!(ask("iswpunct_l", u64::from(b'!')), 1);
+    assert_eq!(ask("iswspace_l", 0x3000), 1);
+    assert_eq!(ask("iswdigit_l", 0x0660), 1);
+    assert_eq!(ask("iswalpha_l", 0x4E00), 1);
+    assert_eq!(ask("iswupper_l", 0x0100), 1);
+    assert_eq!(ask("towupper_l", 0x00DF), 0x00DF, "ß has no simple uppercase");
+    assert_eq!(ask("towlower_l", 0x0130), 0x69, "İ -> i");
+    assert_eq!(ask("iswalpha_l", 0xFFFF_FFFF), 0, "WEOF");
+}
+
+/// **bionic's collation is code-point order**: `strcoll_l` is `strcmp`, `strxfrm_l` a bounded copy
+/// returning the source length, and the `wchar_t` pair the same -- through real thunks.
+#[test]
+fn collation_is_code_point_order_through_real_thunks() {
+    let _guard = serialized();
+    let f = fixture();
+    let a = f.cstring(f.guest.data + 0x100, b"abc");
+    let b = f.cstring(f.guest.data + 0x120, b"abd");
+    let coll = value_of(&f, "strcoll_l", |asm| {
+        asm.mov(0, a as u64);
+        asm.mov(1, b as u64);
+        asm.mov(2, 0);
+    }) as u32 as i32;
+    assert_eq!(coll, -1, "strcmp's byte difference, 'c' - 'd'");
+    let out = f.guest.data + 0x200;
+    let len = value_of(&f, "strxfrm_l", |asm| {
+        asm.mov(0, out as u64);
+        asm.mov(1, a as u64);
+        asm.mov(2, 3);
+        asm.mov(3, 0);
+    });
+    assert_eq!(len, 3, "strlen(src)");
+    assert_eq!(f.read_cstring(out), b"ab", "dsize - 1 bytes and a NUL");
+    let wa = f.guest.data + 0x300;
+    let wb = f.guest.data + 0x340;
+    f.guest.write_u64(wa, 0x0000_20AC_0000_0061);
+    f.guest.write_u64(wa + 8, 0);
+    f.guest.write_u64(wb, 0x0000_0062_0000_0061);
+    f.guest.write_u64(wb + 8, 0);
+    assert_eq!(value_of(&f, "wcslen", |asm| { asm.mov(0, wa as u64); }), 2);
+    let wcoll = value_of(&f, "wcscoll_l", |asm| {
+        asm.mov(0, wa as u64);
+        asm.mov(1, wb as u64);
+        asm.mov(2, 0);
+    }) as u32 as i32;
+    assert_eq!(wcoll, 0x20AC - 0x62, "the code-point difference");
+    let wout = f.guest.data + 0x380;
+    let wlen = value_of(&f, "wcsxfrm_l", |asm| {
+        asm.mov(0, wout as u64);
+        asm.mov(1, wa as u64);
+        asm.mov(2, 8);
+        asm.mov(3, 0);
+    });
+    assert_eq!(wlen, 2);
+    assert_eq!(f.guest.read_u64(wout), 0x0000_20AC_0000_0061, "copied");
+    // wmemcmp's first differing pair, unsigned; wmemchr's address.
+    let cmp = value_of(&f, "wmemcmp", |asm| {
+        asm.mov(0, wa as u64);
+        asm.mov(1, wb as u64);
+        asm.mov(2, 2);
+    }) as u32 as i32;
+    assert_eq!(cmp, 1, "U+20AC > 'b'");
+    let found = value_of(&f, "wmemchr", |asm| {
+        asm.mov(0, wa as u64);
+        asm.mov(1, 0x20AC);
+        asm.mov(2, 2);
+    });
+    assert_eq!(found, wa as u64 + 4);
+}
+
+/// **`localeconv` is bionic's static C-locale `lconv`**: the same pointer every call, `"."` at the
+/// first field, `""` for the other nine strings, and `CHAR_MAX` in all fourteen `char`s -- read
+/// back through the pointers, as a guest would.
+#[test]
+fn localeconv_is_the_static_c_locale_lconv() {
+    let _guard = serialized();
+    let f = fixture();
+    let first = value_of(&f, "localeconv", |_| {});
+    let second = value_of(&f, "localeconv", |_| {});
+    assert_ne!(first, 0);
+    assert_eq!(first, second, "one static object, as bionic's g_locale");
+    let lconv = first as omni_cpu::GuestAddr;
+    let decimal_point = f.guest.read_u64(lconv) as omni_cpu::GuestAddr;
+    assert_eq!(f.read_cstring(decimal_point), b".", "decimal_point");
+    for k in 1..10 {
+        let at = f.guest.read_u64(lconv + 8 * k) as omni_cpu::GuestAddr;
+        assert_ne!(at, 0, "string {k} is a pointer to an empty string, not NULL");
+        assert_eq!(f.read_cstring(at), b"", "string {k}");
+    }
+    let chars = f.guest.read_u64(lconv + 80).to_le_bytes();
+    let more = f.guest.read_u64(lconv + 88).to_le_bytes();
+    assert_eq!(chars, [127; 8], "int_frac_digits .. n_sign_posn are CHAR_MAX");
+    assert_eq!(&more[..6], &[127; 6], "the six int_* are CHAR_MAX");
+}
+
+/// **`__register_atfork` records the registration, in order, and answers 0** -- the handlers are
+/// never owed a run because nothing forks, and the record is what shows they were not dropped.
+#[test]
+fn register_atfork_records_each_registration_in_order() {
+    let _guard = serialized();
+    let f = fixture();
+    for (k, base) in [0x1000u64, 0x2000].into_iter().enumerate() {
+        let result = value_of(&f, "__register_atfork", |asm| {
+            asm.mov(0, base + 1);
+            asm.mov(1, base + 2);
+            asm.mov(2, base + 3);
+            asm.mov(3, base + 4);
+        });
+        assert_eq!(result as u32, 0, "registration {k}");
+    }
+    assert_eq!(
+        f.bionic.atfork_registrations(),
+        vec![[0x1001, 0x1002, 0x1003, 0x1004], [0x2001, 0x2002, 0x2003, 0x2004]]
+    );
+}
+
+/// **`getpagesize` is the figure `sysconf(_SC_PAGESIZE)` and `getauxval(AT_PAGESZ)` answer** --
+/// bionic's is `getauxval(AT_PAGESZ)` -- and that figure is the guest space's own page size.
+#[test]
+fn getpagesize_agrees_with_sysconf_and_getauxval() {
+    let _guard = serialized();
+    let f = fixture();
+    let page = value_of(&f, "getpagesize", |_| {}) as u32 as i32;
+    let sysconf = value_of(&f, "sysconf", |asm| {
+        asm.mov(0, 0x27);
+    }) as i64;
+    let auxv = value_of(&f, "getauxval", |asm| {
+        asm.mov(0, 6);
+    });
+    assert_eq!(page as usize, f.bionic.space_page_size(), "the guest space's page size");
+    assert_eq!(page as i64, sysconf, "sysconf(_SC_PAGESIZE)");
+    assert_eq!(page as u64, auxv, "getauxval(AT_PAGESZ)");
 }
 
 /// **`fsync` syncs a regular file and answers the kernel's `EINVAL` for a pipe.**

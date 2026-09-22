@@ -1624,6 +1624,18 @@ const TCP_KEEPINTVL: i32 = 5;
 const TCP_KEEPCNT: i32 = 6;
 /// `IPV6_V6ONLY`, at level `IPPROTO_IPV6`.
 const IPV6_V6ONLY: i32 = 26;
+/// Linux's `IP_MTU_DISCOVER`, at level `IPPROTO_IP` (`linux/in.h`).
+const IP_MTU_DISCOVER: i32 = 10;
+/// Linux's `IPV6_MTU_DISCOVER`, at level `IPPROTO_IPV6` (`linux/in6.h`).
+const IPV6_MTU_DISCOVER: i32 = 23;
+/// `IP_PMTUDISC_DONT`: never set don't-fragment. The same values serve `IPV6_MTU_DISCOVER`.
+const IP_PMTUDISC_DONT: i32 = 0;
+/// Linux's `UDP_GRO`, at level `IPPROTO_UDP` (`linux/udp.h`): receive offload. `UDP_SEGMENT` (103),
+/// its send-side twin, is **not** accepted -- see the arm that answers this one.
+const UDP_GRO: i32 = 104;
+/// `IP_PMTUDISC_DO`: always set don't-fragment. `WANT` (1), `PROBE` (3), `INTERFACE` (4) and `OMIT`
+/// (5) have no Windows spelling and are refused -- see `SocketOption::DontFragment`.
+const IP_PMTUDISC_DO: i32 = 2;
 
 /// `SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`.
 const SHUT_RD: i32 = 0;
@@ -2453,6 +2465,9 @@ fn option_name(level: i32, name: i32) -> String {
         (IPPROTO_TCP, TCP_KEEPINTVL) => "TCP_KEEPINTVL".to_owned(),
         (IPPROTO_TCP, TCP_KEEPCNT) => "TCP_KEEPCNT".to_owned(),
         (IPPROTO_IPV6, IPV6_V6ONLY) => "IPV6_V6ONLY".to_owned(),
+        (IPPROTO_IP, IP_MTU_DISCOVER) => "IP_MTU_DISCOVER".to_owned(),
+        (IPPROTO_UDP, UDP_GRO) => "UDP_GRO".to_owned(),
+        (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => "IPV6_MTU_DISCOVER".to_owned(),
         (_, other) => format!("option {other}"),
     };
     format!("{option} at {level_name}")
@@ -2594,6 +2609,54 @@ pub(super) fn setsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 u32::try_from(count).ok().filter(|c| *c > 0).map(SocketOption::KeepAliveCount)
             }),
             (IPPROTO_IPV6, IPV6_V6ONLY) => int_option(4)?.map(|on| SocketOption::V6Only(on != 0)),
+            // **Path-MTU discovery, carried as the don't-fragment bit it controls.** MEASURED
+            // reader: ngtcp2, the engine's QUIC transport, setting `IP_PMTUDISC_DO` on IPv4 and
+            // `IPV6_MTU_DISCOVER` = `DO` on IPv6 by the socket's family. The level must be the
+            // socket's own family's: the host option is per family, and an IPv4-level option on
+            // an IPv6 socket (which Linux applies to mapped traffic) has no spelling there.
+            // **`UDP_GRO` is accepted and never coalesces anything, which is Linux's own
+            // behaviour whenever no aggregation happens.** GRO is opportunistic: with it on, a
+            // Linux socket still delivers plain datagrams -- and no `UDP_GRO` control message --
+            // when nothing was coalesced, and every GRO reader (ngtcp2 here, the MEASURED caller)
+            // handles that as the ordinary case. So "on" is true of this socket in the only sense
+            // a caller can observe. Not so its send-side twin `UDP_SEGMENT`, which promises to
+            // split one send into several datagrams: accepting that without splitting would put
+            // one oversized datagram on the wire, so it stays unimplemented and refuses.
+            // `ENOPROTOOPT` on a stream socket, as Linux answers a UDP option there.
+            (IPPROTO_UDP, UDP_GRO) => {
+                if locked(&handle).kind() != omni_platform::net::SocketKind::Datagram {
+                    view.set_errno(ENOPROTOOPT);
+                    c.ret().i32(-1);
+                    return Ok(());
+                }
+                match int_option(4)? {
+                    None => None,
+                    Some(_) => {
+                        c.ret().i32(0);
+                        return Ok(());
+                    }
+                }
+            }
+            (IPPROTO_IP, IP_MTU_DISCOVER) | (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => {
+                let family_matches = match locked(&handle).family() {
+                    omni_platform::net::IpFamily::V4 => level == IPPROTO_IP,
+                    omni_platform::net::IpFamily::V6 => level == IPPROTO_IPV6,
+                };
+                match int_option(4)? {
+                    None => None,
+                    Some(mode) if !family_matches || (mode != IP_PMTUDISC_DO && mode != IP_PMTUDISC_DONT) => {
+                        return Err(view.refusal(format!(
+                            "the guest called setsockopt(fd {fd}, {}) with mode {mode} on a socket \
+                             of the other family, or with a mode other than IP_PMTUDISC_DO (2) or \
+                             IP_PMTUDISC_DONT (0). Only those two have a host spelling -- the \
+                             don't-fragment option of the socket's own family -- and accepting \
+                             another would report a path-MTU policy nothing applies",
+                            option_name(level, name)
+                        )))
+                    }
+                    Some(mode) => Some(SocketOption::DontFragment(mode == IP_PMTUDISC_DO)),
+                }
+            }
             (SOL_SOCKET, SO_RCVBUF) => int_option(4)?.and_then(|bytes| {
                 usize::try_from(bytes).ok().map(SocketOption::ReceiveBuffer)
             }),
@@ -2945,7 +3008,19 @@ fn socket_send(
     let at = guest_address(view, buffer)?;
     let blame = Blame::new(view.symbol(), view.address(), 1);
     let bytes = view.mem().read_bytes(at, want, blame)?;
+    send_bytes(view, handle, fd, &bytes, flags, to)
+}
 
+/// The sending half of [`socket_send`], over bytes already read -- what `sendmsg` hands its
+/// gathered `iovec`s to, so every send waits, times out and reports exactly as `sendto` does.
+fn send_bytes(
+    view: &GuestView<'_>,
+    handle: &std::sync::Mutex<Socket>,
+    fd: i32,
+    bytes: &[u8],
+    flags: i32,
+    to: Option<SocketAddress>,
+) -> AbiResult<Netted<i64>> {
     let nonblocking = locked(handle).nonblocking();
     if !wants_nonblocking(nonblocking, flags) {
         let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
@@ -2956,8 +3031,8 @@ fn socket_send(
     let outcome = {
         let socket = locked(handle);
         match &to {
-            None => socket.send(&bytes),
-            Some(address) => socket.send_to(&bytes, address),
+            None => socket.send(bytes),
+            Some(address) => socket.send_to(bytes, address),
         }
     };
     match settled(view, outcome)? {
@@ -3023,6 +3098,101 @@ pub(super) fn sendto(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             }
         };
         socket_send(view, &handle, fd, buf, len, flags, to)
+    })
+}
+
+/// `struct msghdr` on LP64: `msg_name` at 0, `msg_namelen` (`socklen_t`) at 8, `msg_iov` at 16,
+/// `msg_iovlen` (`size_t`) at 24, `msg_control` at 32, `msg_controllen` (`size_t`) at 40,
+/// `msg_flags` at 48; 56 bytes. An `iovec` is `{ void *iov_base; size_t iov_len; }`, 16 bytes.
+const MSGHDR_BYTES: usize = 56;
+/// Linux's `UIO_MAXIOV`: more `iovec`s than this is `EMSGSIZE`.
+const UIO_MAXIOV: u64 = 1024;
+
+/// `ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)`
+///
+/// The `iovec`s gathered, in order, into one message and sent exactly as `sendto` sends -- to
+/// `msg_name` when there is one, on the connection when there is not. MEASURED reader: the
+/// engine's QUIC transport (ngtcp2's `sendmsg`), once the engine was on Vulkan.
+///
+/// **Control messages are refused by name, and each one is listed.** The two a QUIC stack sends
+/// are an ECN mark (`IP_TOS`/`IPV6_TCLASS`) and a GSO segment size (`UDP_SEGMENT`), and neither
+/// can be dropped quietly: the first is a marking the peer's ECN validation reads, the second asks
+/// for one send to become several datagrams. Which ones this engine sends is for a run to say.
+pub(super) fn sendmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, msg, flags) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        let at = guest_address(view, msg)?;
+        let blame = Blame::new(view.symbol(), view.address(), 1);
+        let header = view.mem().read_bytes(at, MSGHDR_BYTES, blame)?;
+        let word = |offset: usize| {
+            u64::from_le_bytes(header[offset..offset + 8].try_into().expect("eight bytes"))
+        };
+        let (name, namelen) = (word(0), word(8) as u32);
+        let (iov, iovlen) = (word(16), word(24));
+        let (control, controllen) = (word(32), word(40));
+        if control != 0 && controllen != 0 {
+            let mut listed = Vec::new();
+            let mut offset = 0u64;
+            while offset + 16 <= controllen && listed.len() < 8 {
+                let cmsg = view.mem().read_bytes(
+                    guest_address(view, control + offset)?,
+                    16,
+                    Blame::new(view.symbol(), view.address(), 1),
+                )?;
+                let len = u64::from_le_bytes(cmsg[0..8].try_into().expect("eight bytes"));
+                let level = i32::from_le_bytes(cmsg[8..12].try_into().expect("four bytes"));
+                let kind = i32::from_le_bytes(cmsg[12..16].try_into().expect("four bytes"));
+                listed.push(format!("{} (cmsg_len {len})", option_name(level, kind)));
+                if len < 16 {
+                    break;
+                }
+                offset += len.next_multiple_of(8);
+            }
+            return Err(view.refusal(format!(
+                "the guest called sendmsg(fd {fd}) with {controllen} bytes of control messages: \
+                 {}. None is implemented: an ECN mark and a GSO segment size -- what a QUIC \
+                 stack sends -- can neither be dropped quietly (the peer's ECN validation reads \
+                 the first; the second asks for one send to become several datagrams)",
+                listed.join(", ")
+            )));
+        }
+        if iovlen > UIO_MAXIOV {
+            return Ok(Netted::Failed(EMSGSIZE));
+        }
+        let mut bytes = Vec::new();
+        for k in 0..iovlen {
+            let entry = view.mem().read_bytes(
+                guest_address(view, iov + 16 * k)?,
+                16,
+                Blame::new(view.symbol(), view.address(), 1),
+            )?;
+            let base = u64::from_le_bytes(entry[0..8].try_into().expect("eight bytes"));
+            let len = u64::from_le_bytes(entry[8..16].try_into().expect("eight bytes"));
+            let want = transfer_length(len);
+            if want == 0 {
+                continue;
+            }
+            let from = guest_address(view, base)?;
+            bytes.extend(view.mem().read_bytes(from, want, Blame::new(view.symbol(), view.address(), 1))?);
+        }
+        let to = if name == 0 {
+            None
+        } else {
+            match read_sockaddr(view, name, namelen as i32, 1)? {
+                Netted::Done(address) => Some(address),
+                Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+            }
+        };
+        check_message_flags(view, flags)?;
+        send_bytes(view, &handle, fd, &bytes, flags, to)
     })
 }
 

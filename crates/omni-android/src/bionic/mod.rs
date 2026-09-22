@@ -93,7 +93,7 @@ pub use omni_platform::log::Priority as LogPriority;
 pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
 pub use threads::{
-    FutexCall, GuestThreadFailure, GuestThreadState, GuestThreadSummary, ThreadHost,
+    DeathContext, FutexCall, GuestThreadFailure, GuestThreadState, GuestThreadSummary, ThreadHost,
     ThreadLocalInstance,
     DEFAULT_GUEST_STACK_BYTES, GUEST_THREAD_STEP_WINDOW, MIN_GUEST_STACK_BYTES, SCHED_OTHER,
 };
@@ -223,6 +223,13 @@ pub struct Bionic {
     yielder: HostYield,
     /// `pthread_key_create` / `getspecific` / `setspecific`, and `__cxa_thread_atexit_impl`.
     tls: TlsRegistry,
+    /// The one signal disposition this layer holds -- `SIGPIPE`'s. See [`signals::sigaction`].
+    sigpipe_action: std::sync::Mutex<[u8; signals::SIGACTION_BYTES]>,
+    /// `__register_atfork`'s registrations, `(prepare, parent, child, dso)`, in order. Recorded,
+    /// never run: see [`procenv::register_atfork`].
+    atfork: std::sync::Mutex<Vec<[u64; 4]>>,
+    /// How many `setjmp`s have armed a buffer -- see [`signals::setjmp`].
+    setjmps: AtomicU64,
     /// Who owns which mutex. An `Arc` because `omni_bionic::cond` installs it as ambient state
     /// for the duration of a `pthread_cond_wait`, which is how the relock on the way out finds
     /// the same table the lock on the way in used.
@@ -296,6 +303,12 @@ pub struct Bionic {
     /// one for every code outside it, and all of it is written before any guest code runs, which
     /// is F9's constraint.
     gai_messages: OnceLock<Vec<GuestAddr>>,
+    /// bionic's one static `struct lconv`, built in the pool by [`Bionic::new`]; `localeconv`
+    /// returns it.
+    lconv: OnceLock<GuestAddr>,
+    /// The `static mbstate_t` each of bionic's conversion functions keeps for a NULL `ps`, one per
+    /// function as bionic's are -- see [`MbStateOwner`].
+    mbstate_private: OnceLock<GuestAddr>,
     /// The guest's environment: the name, and the value interned in the pool.
     ///
     /// **Empty by default and that is a fact, not a gap** — this guest process was started with no
@@ -570,6 +583,9 @@ impl Bionic {
             clock: HostClock::new(),
             yielder: HostYield,
             tls: TlsRegistry::new(),
+            sigpipe_action: std::sync::Mutex::new([0; signals::SIGACTION_BYTES]),
+            atfork: std::sync::Mutex::new(Vec::new()),
+            setjmps: AtomicU64::new(0),
             owners: Arc::new(OwnerTable::new()),
             conds: CondWaiters::new(),
             names: NameRegistry::new(),
@@ -584,6 +600,8 @@ impl Bionic {
             images: Mutex::new(Vec::new()),
             utc_zone: OnceLock::new(),
             gai_messages: OnceLock::new(),
+            lconv: OnceLock::new(),
+            mbstate_private: OnceLock::new(),
             env: Mutex::new(Vec::new()),
             properties: Mutex::new(Vec::new()),
             // Spelled out rather than reached by `Default`, because this is the open `AT_HWCAP`
@@ -625,6 +643,37 @@ impl Bionic {
             messages.push(bionic.intern("gai_strerror", message.as_bytes())?);
         }
         let _ = bionic.gai_messages.set(messages);
+        // `localeconv` returns a pointer to one static `struct lconv` for the life of the process
+        // (bionic's `g_locale`), so it is built here for the reason `gai_strerror`'s table is.
+        // Each string is interned once; the empty ones share one "".
+        let values = &omni_bionic::locale::LCONV_C_VALUES;
+        let mut interned: Vec<(&str, GuestAddr)> = Vec::new();
+        let mut strings = [0u64; 10];
+        for (slot, text) in omni_bionic::locale::lconv_strings(values).iter().enumerate() {
+            let at = match interned.iter().find(|(seen, _)| seen == text) {
+                Some((_, at)) => *at,
+                None => {
+                    let at = bionic.intern("localeconv", text.as_bytes())?;
+                    interned.push((text, at));
+                    at
+                }
+            };
+            strings[slot] = at as u64;
+        }
+        let lconv = bionic.reserve("localeconv", omni_bionic::locale::LCONV_BYTES)?;
+        GuestMem::new(Arc::clone(&bionic.space)).write_bytes(
+            lconv,
+            &omni_bionic::locale::compose_lconv(values, strings),
+            Blame::new("localeconv", lconv, 0),
+        )?;
+        let _ = bionic.lconv.set(lconv);
+        // The conversion functions' `ps == NULL` states: one each, as bionic's function-local
+        // statics are, for the life of the process.
+        let mbstate = bionic.reserve(
+            "mbrtowc",
+            omni_bionic::wide::MBSTATE_BYTES * MbStateOwner::COUNT,
+        )?;
+        let _ = bionic.mbstate_private.set(mbstate);
         Ok(bionic)
     }
 
@@ -637,6 +686,20 @@ impl Bionic {
         // Unreachable: `new` sets it and nothing clears it. Falling back to the pool's base rather
         // than panicking, because a panic in a handler is reachable from guest code.
         *self.utc_zone.get().unwrap_or(&self.arena)
+    }
+
+    /// `owner`'s private `mbstate_t`, for a NULL `ps`.
+    #[must_use]
+    pub fn mbstate_private(&self, owner: MbStateOwner) -> GuestAddr {
+        *self.mbstate_private.get().unwrap_or(&self.arena)
+            + omni_bionic::wide::MBSTATE_BYTES * owner as usize
+    }
+
+    /// The static `struct lconv` [`Bionic::new`] built, which `localeconv` returns.
+    #[must_use]
+    pub fn lconv(&self) -> GuestAddr {
+        // Unreachable fallback, as `utc_zone`'s: `new` sets it and nothing clears it.
+        *self.lconv.get().unwrap_or(&self.arena)
     }
 
     /// The pooled `gai_strerror` message for `ecode`.
@@ -657,6 +720,18 @@ impl Bionic {
             _ => known,
         };
         messages.get(index).copied().unwrap_or_else(|| self.pool())
+    }
+
+    /// How many `setjmp` calls have returned 0 -- each one a buffer a `longjmp` would refuse.
+    #[must_use]
+    pub fn setjmps(&self) -> u64 {
+        self.setjmps.load(Ordering::Relaxed)
+    }
+
+    /// Every `__register_atfork` registration so far, `(prepare, parent, child, dso)`, in order.
+    #[must_use]
+    pub fn atfork_registrations(&self) -> Vec<[u64; 4]> {
+        self.atfork.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// The page size the guest's own address space works at, which is what `AT_PAGESZ` answers.
@@ -2149,6 +2224,28 @@ pub(crate) fn enter<'a>(
     active: &'a Active,
 ) -> GuestView<'a> {
     GuestView::new(call.mem(), call.symbol(), call.address(), active)
+}
+
+/// Which of bionic's conversion functions a private `mbstate_t` belongs to. bionic gives each its
+/// own `static mbstate_t __private_state`, so a NULL-`ps` `mbrtowc` and a NULL-`ps` `mbrlen` do
+/// not share a half-finished character -- and neither do these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MbStateOwner {
+    /// `mbrtowc`.
+    Mbrtowc = 0,
+    /// `mbrlen` (OpenBSD's, which bionic builds: its own `static mbstate_t mbs`).
+    Mbrlen = 1,
+    /// `mbsnrtowcs`, and `mbsrtowcs`, which passes its `ps` straight through.
+    Mbsnrtowcs = 2,
+    /// `wcrtomb`.
+    Wcrtomb = 3,
+    /// `wcsnrtombs`, and `wcsrtombs`.
+    Wcsnrtombs = 4,
+}
+
+impl MbStateOwner {
+    /// How many there are.
+    pub const COUNT: usize = 5;
 }
 
 /// Every symbol serviced **inside** the run loop: pure host work, no guest code.

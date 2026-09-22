@@ -206,6 +206,63 @@ pub(super) fn getpid(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int getpagesize(void)`
+///
+/// The page size this guest's address space was built with: the figure `sysconf(_SC_PAGESIZE)`
+/// and `getauxval(AT_PAGESZ)` already answer, because bionic's own `getpagesize` *is*
+/// `getauxval(AT_PAGESZ)`. Three answers to one question from one source, so they cannot drift.
+///
+/// MEASURED reader: a guest worker that died on the `Unbound` this replaces, once §8 row 22 had
+/// returned.
+pub(super) fn getpagesize(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let state = active(c.symbol(), c.address())?;
+    let page = state.bionic.space_page_size();
+    let Ok(page) = i32::try_from(page) else {
+        return Err(refuse(c, format!("this guest's page size {page:#x} does not fit an `int`")));
+    };
+    c.ret().i32(page);
+    Ok(())
+}
+
+/// `int __register_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void),
+/// void *dso)` -- what bionic's `pthread_atfork` is.
+///
+/// **Recorded, and never owed a run**: fork handlers run around a `fork`, and this runtime
+/// performs none -- `fork` is not bound, so a guest that calls it dies by name rather than
+/// forking without its handlers. So `0`, "registered", is true, and the registration is kept
+/// (`Bionic::atfork_registrations`) as the evidence and as the list a runtime that did fork would
+/// need. `ENOMEM` is bionic's only failure and there is no allocation here that can fail short
+/// of the host's.
+///
+/// MEASURED reader: a guest worker once the Lua app was starting.
+pub(super) fn register_atfork(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let registration = {
+        let mut a = c.args();
+        [a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?]
+    };
+    let state = active(c.symbol(), c.address())?;
+    state
+        .bionic
+        .atfork
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(registration);
+    c.ret().i32(0);
+    Ok(())
+}
+
+/// `struct lconv *localeconv(void)`
+///
+/// bionic's one static C-locale `lconv` (`libc/bionic/locale.cpp`'s `g_locale`: `"."`, `""` for
+/// every other string, `CHAR_MAX` for every `char`), built once in the pool by `Bionic::new`, so
+/// every call returns the same pointer as bionic's does. MEASURED reader: the Lua app's thread,
+/// once `startLuaApp_` had run.
+pub(super) fn localeconv(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let state = active(c.symbol(), c.address())?;
+    c.ret().u64(state.bionic.lconv() as u64);
+    Ok(())
+}
+
 /// `uid_t geteuid(void)`
 ///
 /// The application uid the embedding gave [`Bionic::set_app_uid`](super::Bionic::set_app_uid),
