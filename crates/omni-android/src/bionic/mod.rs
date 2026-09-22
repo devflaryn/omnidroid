@@ -88,7 +88,8 @@ pub use omni_platform::log::Priority as LogPriority;
 pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
 pub use threads::{
-    GuestThreadFailure, GuestThreadState, ThreadHost, ThreadLocalInstance,
+    FutexCall, GuestThreadFailure, GuestThreadState, GuestThreadSummary, ThreadHost,
+    ThreadLocalInstance,
     DEFAULT_GUEST_STACK_BYTES, GUEST_THREAD_STEP_WINDOW, MIN_GUEST_STACK_BYTES, SCHED_OTHER,
 };
 pub use view::{
@@ -332,6 +333,10 @@ pub struct Bionic {
     /// D16's shape: a watchdog over a guest that never returns is built from short budget
     /// windows, because the halt flag is checked at terminals a counted budget makes exclusive.
     threads_stopping: AtomicBool,
+    /// Every **raw** `futex` syscall the guest has made, with the guest thread that made it.
+    ///
+    /// See [`Bionic::futex_calls`].
+    futex_calls: Mutex<Vec<FutexCall>>,
 
     // ------------------------------------------------------------------- M5: the park witness
     /// Every guest thread currently blocked inside a condition-variable wait.
@@ -519,6 +524,7 @@ impl Bionic {
             threads_done: Condvar::new(),
             thread_failures: Mutex::new(Vec::new()),
             threads_stopping: AtomicBool::new(false),
+            futex_calls: Mutex::new(Vec::new()),
             parked: Mutex::new(Vec::new()),
             parked_peak: AtomicU64::new(0),
         });
@@ -1469,10 +1475,64 @@ impl Bionic {
         }
     }
 
+    /// Every raw `futex` syscall the guest has made, oldest first.
+    ///
+    /// # Why this is a list and not a counter
+    ///
+    /// `AddressFutex`'s own counters say how many waits and wakes happened, and
+    /// [`parked_addresses`](crate::bionic::AddressFutex::parked_addresses) says which addresses
+    /// still have someone on them. Neither says **which guest thread** -- and that is the question
+    /// a deadlock asks, because a lock names no owner and a parked thread reports nothing about
+    /// itself.
+    ///
+    /// The raw syscall is the only unbounded wait in this runtime (`omni-bionic`'s own futex
+    /// waits are all bounded and self-heal), so it is the only one that can strand a thread. It is
+    /// also **rare** -- measured at single digits across a whole startup -- which is why an
+    /// unbounded `Vec` behind a mutex costs nothing here and a ring would lose the beginning,
+    /// which is the part that says who parked first.
+    #[must_use]
+    pub fn futex_calls(&self) -> Vec<FutexCall> {
+        self.futex_calls.lock().clone()
+    }
+
+    /// Record one raw `futex` syscall.
+    pub(crate) fn record_futex_call(&self, call: FutexCall) {
+        self.futex_calls.lock().push(call);
+    }
+
     /// Whether [`stop_guest_threads`](Bionic::stop_guest_threads) has been called.
     #[must_use]
     pub fn guest_threads_stopping(&self) -> bool {
         self.threads_stopping.load(Ordering::Acquire)
+    }
+
+    /// Every guest thread this instance has registered: its id, the start routine it was given,
+    /// whether it was detached, and whether it is still running.
+    ///
+    /// # Why the start routine is the part that matters
+    ///
+    /// A guest thread that is *stuck* produces no further evidence about itself: it executes no
+    /// guest instructions, so no budget expires, and [`parked`](Bionic::parked) sees it only if it
+    /// is in a condition variable. [`live_guest_threads`](Bionic::live_guest_threads) says how
+    /// many there are and [`guest_thread_failures`](Bionic::guest_thread_failures) says which ones
+    /// died -- neither says **which code** a live one is.
+    ///
+    /// The start routine does, and it is an address in the loaded image, so a host that has the
+    /// binary can name the function. It is what a run that stops on a lock some other thread holds
+    /// has to have: the lock names no owner, and this is the list the owner is in.
+    #[must_use]
+    pub fn guest_thread_list(&self) -> Vec<GuestThreadSummary> {
+        self.guest_threads
+            .lock()
+            .records
+            .iter()
+            .map(|(id, record)| GuestThreadSummary {
+                id: *id,
+                start_routine: record.start_routine,
+                detached: record.detached,
+                running: !record.state.is_finished(),
+            })
+            .collect()
     }
 
     /// Record a guest thread that did not finish by returning.

@@ -680,6 +680,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
     }
 
+    stall_report(&guest, "after the scripted sequence");
+
     // ---- §8.1's fourth failure mode, made into a precondition -------------------------------
     //
     // The looper has to exist on **this** thread before step 13, because `ALooper_forThread()`
@@ -1298,6 +1300,100 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
              failure mode: {failure:?}"
         );
     }
+}
+
+/// **Everything known about a guest that has stopped making progress, in one place.**
+///
+/// # What this exists to answer, and why each line is in it
+///
+/// A stuck guest thread reports nothing about itself: it executes no guest instructions, so no
+/// budget expires, and a lock names no owner. Each line here is a fact that was needed to localise
+/// M6's stall, and the order is the order they narrow it:
+///
+/// * **the spin lock and its count** -- the engine state that is blocking, read out of the engine
+///   (see [`SPIN_LOCK_OFFSET`]);
+/// * **import crossings**, sampled twice -- a total that does not move says no thread is executing
+///   anything, which separates "slow" from "stopped";
+/// * **the thread list** -- which guest threads exist, what each was asked to run, and whether it
+///   has finished. A thread that finished while holding a lock and one that is blocked holding it
+///   look identical from the lock;
+/// * **`parked`** -- condition-variable waits, which are the ones `Bionic` can name;
+/// * **the futex** -- how many parks had no deadline at all
+///   ([`AddressFutex::indefinite_parks`]), which addresses still have someone on them, and the
+///   **word at each**, because a waiter on a word whose value has moved was woken and missed it
+///   while a waiter on an unchanged word is waiting for something that never happened;
+/// * **the raw `futex` calls** -- recorded on the way *in*, so a call that never returned is still
+///   in the list. That is the line that named this stall: two guest threads in
+///   `FUTEX_WAIT_BITSET` on their own words, expecting `0`, with **no `FUTEX_WAKE` anywhere in the
+///   run**.
+///
+/// Printed rather than asserted, deliberately. It is a report, and a report that failed the run
+/// would stop it before the rows after it had been tried.
+fn stall_report(guest: &Guest, when: &str) {
+    let mut out = std::io::stderr();
+    let crossings =
+        || guest.boundary.census().map_or(0u64, |census| census.values().sum::<u64>());
+    let first = crossings();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let second = crossings();
+
+    let _ = writeln!(
+        out,
+        "\n================ STALL REPORT: {when} ================\n\
+         spin lock {} count {} | import crossings {first} -> {second} ({}) | live threads {}",
+        image_word(guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30"),
+        image_word(guest, SPIN_LOCK_OFFSET + 4, "the count at 0x06dd0a34"),
+        if second == first { "FROZEN" } else { "moving" },
+        guest.bionic.live_guest_threads(),
+    );
+    for thread in guest.bionic.guest_thread_list() {
+        let _ = writeln!(
+            out,
+            "  thread {:#x}: start routine {:#x} (link {:#x}), detached {}, running {}",
+            thread.id.0,
+            thread.start_routine,
+            thread.start_routine.wrapping_sub(guest.object.base),
+            thread.detached,
+            thread.running
+        );
+    }
+    let futex = guest.bionic.futex();
+    let (waits, wakes) = futex.activity();
+    let _ = writeln!(
+        out,
+        "  futex: {waits} wait(s), {wakes} wake(s), {} with no deadline; cond-parked {:?}",
+        futex.indefinite_parks(),
+        guest.bionic.parked()
+    );
+    for (address, waiters) in futex.parked_addresses() {
+        let word = guest.boundary.mem().read_u32(
+            address as usize,
+            omni_android::Blame::new("a parked futex word", address as usize, 0),
+        );
+        let _ = writeln!(
+            out,
+            "  parked on {address:#x} x{waiters}: the word reads {word:?}"
+        );
+    }
+    let calls = guest.bionic.futex_calls();
+    let _ = writeln!(out, "  raw futex syscalls: {}", calls.len());
+    for call in &calls {
+        let _ = writeln!(
+            out,
+            "    thread {:#x} {} on {:#x} value {} -> {}",
+            call.thread,
+            call.op,
+            call.address,
+            call.value,
+            if call.outcome == i32::MIN {
+                "ENTERED AND NEVER RETURNED".to_string()
+            } else {
+                call.outcome.to_string()
+            }
+        );
+    }
+    let _ = writeln!(out, "================ end of stall report ================\n");
+    let _ = out.flush();
 }
 
 /// A `u32` of the loaded image, by its link-time offset, for a probe that has to name a state

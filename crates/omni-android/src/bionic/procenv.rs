@@ -1107,6 +1107,17 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
     let absolute = command == FUTEX_WAIT_BITSET;
     let realtime = op & FUTEX_CLOCK_REALTIME != 0;
 
+    // **Recorded before the call, not after.** A `FUTEX_WAIT` with a null timeout never returns
+    // until somebody wakes it, so a record written on the way out is written by every call except
+    // the ones that matter. MEASURED: with the record after the match, a run with two threads
+    // stranded in `FUTEX_WAIT` reported an empty list.
+    state.bionic.record_futex_call(crate::bionic::FutexCall {
+        thread: state.thread.0,
+        op: futex_op_static_name(command),
+        address: uaddr,
+        value: val as u32,
+        outcome: FUTEX_IN_PROGRESS,
+    });
     let result = {
         let mut view = enter(c, &state);
         // Linux: `EINVAL` for an unaligned `uaddr`. The word is compared and woken on as a
@@ -1208,8 +1219,39 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
             }
         }
     };
+    // And again on the way out, so the pair says both what was asked and what it answered. An
+    // entry that never gains a partner is a call that never returned.
+    state.bionic.record_futex_call(crate::bionic::FutexCall {
+        thread: state.thread.0,
+        op: futex_op_static_name(command),
+        address: uaddr,
+        value: val as u32,
+        outcome: result,
+    });
     c.ret().i32(result);
     Ok(())
+}
+
+/// The `outcome` of a [`FutexCall`](crate::bionic::FutexCall) that has been entered and not yet
+/// returned.
+///
+/// A sentinel rather than an `Option`, so the record stays `Copy` and one field carries the whole
+/// answer. `i32::MIN` is not a value any futex operation returns: waits answer `0` or `-1`, and
+/// wakes answer a count.
+const FUTEX_IN_PROGRESS: i32 = i32::MIN;
+
+/// The operation's name as a `'static` string, for the record.
+///
+/// Separate from [`futex_op_name`], which formats an unknown operation into an owned `String`:
+/// this one only ever sees the four commands that got as far as being performed.
+const fn futex_op_static_name(command: i32) -> &'static str {
+    match command {
+        FUTEX_WAIT => "FUTEX_WAIT",
+        FUTEX_WAKE => "FUTEX_WAKE",
+        FUTEX_WAIT_BITSET => "FUTEX_WAIT_BITSET",
+        FUTEX_WAKE_BITSET => "FUTEX_WAKE_BITSET",
+        _ => "FUTEX_?",
+    }
 }
 
 /// Read a `struct timespec` argument for `futex`, and turn it into a duration to wait.

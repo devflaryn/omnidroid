@@ -364,6 +364,40 @@ pub(super) struct ThreadRecord {
     pub(super) start_routine: GuestAddr,
 }
 
+/// One raw `futex` syscall, as [`Bionic::futex_calls`](crate::bionic::Bionic::futex_calls)
+/// records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FutexCall {
+    /// The guest thread that made it: its `pthread_t`.
+    pub thread: u64,
+    /// The operation, already named.
+    pub op: &'static str,
+    /// The word it operated on.
+    pub address: u64,
+    /// `FUTEX_WAIT`'s expected value, or `FUTEX_WAKE`'s count.
+    pub value: u32,
+    /// What the call answered: a wait's outcome or a wake's count of threads unparked.
+    pub outcome: i32,
+}
+
+/// One registered guest thread, as
+/// [`Bionic::guest_thread_list`](crate::bionic::Bionic::guest_thread_list) reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestThreadSummary {
+    /// The `pthread_t` it was given.
+    pub id: GuestThreadId,
+    /// The guest function it was asked to run.
+    ///
+    /// **The identifying field.** A stuck guest thread produces no further evidence about
+    /// itself, and a lock names no owner; this is an address in the loaded image, so a host
+    /// holding the binary can turn it into a function.
+    pub start_routine: GuestAddr,
+    /// Whether it was created detached.
+    pub detached: bool,
+    /// Whether it has not finished.
+    pub running: bool,
+}
+
 /// A guest thread that did not finish by returning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestThreadFailure {

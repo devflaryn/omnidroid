@@ -64,6 +64,8 @@ pub struct AddressFutex {
     parked: Mutex<HashMap<u64, usize>>,
     /// Set when the instance is shutting down. See [`AddressFutex::stop`].
     stopping: AtomicBool,
+    /// How many parks were entered with **no deadline**. See [`AddressFutex::indefinite_parks`].
+    indefinite: AtomicU64,
 }
 
 impl AddressFutex {
@@ -127,6 +129,9 @@ impl AddressFutex {
         let _parked = self.enter_park(addr);
         self.waits.fetch_add(1, Ordering::Relaxed);
         self.last_wait.store(addr, Ordering::Relaxed);
+        if timeout.is_none() {
+            self.indefinite.fetch_add(1, Ordering::Relaxed);
+        }
         let deadline = timeout.map(|t| Instant::now() + t);
         // SAFETY: as `Futex::wait`, and with one addition. `park` requires that the key is not
         // concurrently used by another parking implementation with incompatible invariants — the
@@ -208,6 +213,36 @@ impl AddressFutex {
         (parked.values().sum(), parked.len())
     }
 
+    /// How many parks were entered with no deadline at all.
+    ///
+    /// **The number that separates a slow wait from a stranded one.** Every wait inside
+    /// `omni-bionic` passes a bounded slice and re-checks its predicate, so a lost wake there
+    /// heals; only a caller that passes `None` can leave a thread where nothing but a wake or a
+    /// shutdown will reach it. If threads are parked and this is zero, they are in a bounded slice
+    /// and the counters will move.
+    #[must_use]
+    pub fn indefinite_parks(&self) -> u64 {
+        self.indefinite.load(Ordering::Relaxed)
+    }
+
+    /// Every address currently parked on, with how many threads are on each.
+    ///
+    /// **What [`parked_now`](AddressFutex::parked_now) cannot say.** That pair reports *how many*,
+    /// which answers "did shutdown leave anyone behind"; this reports *where*, which is what a run
+    /// stopped on a lock somebody else holds needs. A guest address is a host address under
+    /// identity mapping (D4), so the caller can read the object's bytes and subtract the load base
+    /// to see whether it is in the image at all — an address outside it is a heap or stack object,
+    /// which already narrows what kind of wait it is.
+    ///
+    /// Takes the table's lock, so it is a diagnostic call and not a hot path.
+    #[must_use]
+    pub fn parked_addresses(&self) -> Vec<(u64, usize)> {
+        let mut out: Vec<(u64, usize)> =
+            self.parked.lock().iter().map(|(addr, count)| (*addr, *count)).collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Record this thread as parked on `addr` for as long as the guard lives.
     fn enter_park(&self, addr: u64) -> ParkedOn<'_> {
         *self.parked.lock().entry(addr).or_insert(0) += 1;
@@ -264,6 +299,9 @@ impl Futex for AddressFutex {
         let _parked = self.enter_park(addr);
         self.waits.fetch_add(1, Ordering::Relaxed);
         self.last_wait.store(addr, Ordering::Relaxed);
+        if timeout.is_none() {
+            self.indefinite.fetch_add(1, Ordering::Relaxed);
+        }
         let deadline = timeout.map(|t| Instant::now() + t);
         // SAFETY: `parking_lot_core::park` requires that the key is not concurrently used by
         // another parking implementation with incompatible invariants, that `validate`,
