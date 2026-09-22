@@ -68,6 +68,8 @@ BIONIC_MUTEX = "crates/omni-bionic/src/mutex.rs"
 BIONIC_NUMERICS = "crates/omni-bionic/src/numerics.rs"
 BIONIC_RWLOCK = "crates/omni-bionic/src/rwlock.rs"
 BIONIC_COND = "crates/omni-bionic/src/cond.rs"
+# M6: `sched_get_priority_max`/`_min`, which the engine sizes a real-time band against.
+BIONIC_METADATA = "crates/omni-bionic/src/metadata.rs"
 BIONIC_PRINTF = "crates/omni-bionic/src/printf.rs"
 FAULT = "crates/omni-platform/src/fault/windows.rs"
 EH_FRAME = "crates/omni-elf/src/eh_frame.rs"
@@ -102,6 +104,9 @@ PLAT_FS_PATH = "crates/omni-platform/src/fs/path.rs"
 # M5: the pipe. An in-process byte queue with two ends, and the first descriptor kind whose
 # readiness depends on another descriptor.
 PLAT_FS_PIPE = "crates/omni-platform/src/fs/pipe.rs"
+# M6: the eventfd. The second kind whose readiness is state rather than a constant, and the first
+# whose *read* changes what the next read answers.
+PLAT_FS_EVENTFD = "crates/omni-platform/src/fs/eventfd.rs"
 # M5: the NDK surface. `ALooper` is the first of the four families.
 NDK_LOOPER = "crates/omni-android/src/ndk/looper.rs"
 # M6: `ANativeWindow` is the fourth. Five symbols, because that is what `libroblox.so` imports --
@@ -3803,16 +3808,21 @@ directory", ADAPTER_FILES,
 
     # The wait removed: `pollOnce` answers POLL_TIMEOUT immediately for any timeout. A game loop
     # would spin at whatever rate the run budget allowed instead of waiting for its pipe.
+    # STALE PATTERN REPAIRED (M6). The indefinite wait moved the deadline test inside
+    # `Bound::Until`'s arm, so the four lines moved two levels in and this row had been matching
+    # nothing -- a silent MISS with no relation to the test it names. Found by the whole-table
+    # pattern pass, which is what `VERIFICATION.md` entry 8 says to run; the row's intent is
+    # unchanged.
     ("looper-A8", "A", "pollOnce never waits, and times out at once",
      NDK_LOOPER,
-     """        let now = Instant::now();
-        if now >= deadline {
-            break Pass::Idle;
-        }""",
-     """        let now = Instant::now();
-        if true {
-            break Pass::Idle;
-        }""",
+     """                let now = Instant::now();
+                if now >= deadline {
+                    break Pass::Idle;
+                }""",
+     """                let now = Instant::now();
+                if true {
+                    break Pass::Idle;
+                }""",
      ANDROID),
 
     # ---- the over-corrections ----
@@ -3828,6 +3838,16 @@ directory", ADAPTER_FILES,
 
     # The indefinite-wait refusal widened to every non-positive timeout. It reads as stricter, and
     # `ALooper_pollOnce(0, ..)` is the ordinary non-blocking poll a game loop makes every frame.
+    #
+    # **STALE SINCE M6, AND DELIBERATELY NOT REPAIRED HERE.** `let budget =` is `let bound =` now,
+    # so this pattern matches nothing and the row is a silent MISS -- found by the whole-table
+    # pattern pass (entry 8). The one-word repair is **not** safe to make without running it: M6
+    # turned the `< 0` branch from a refusal into a *wait*, so `<= 0` no longer refuses a zero
+    # timeout, it makes one wait indefinitely whenever a live write end exists. The stopping test
+    # would catch it, but any other `pollOnce(0)` over a live pipe with nothing ready would hang
+    # the target instead of failing it, and `run()` here has no timeout. Repair it with a `new`
+    # that cannot park -- and prove that by reading every `pollOnce(0)` call site in
+    # `tests/ndk.rs`, not by running the harness and finding out.
     ("looper-B2", "B", "a zero timeout is refused along with an indefinite one",
      NDK_LOOPER,
      """    let budget = if timeout_millis < 0 {""",
@@ -4865,6 +4885,331 @@ directory", ADAPTER_FILES,
         }
         let declared = self.class(class)?;""",
      ANDROID_LIB),
+
+    # ======================================= M6: the indefinite `ALooper_pollOnce`, and the fact
+    # ======================================= it is decided on
+    #
+    # §8 rows 17-20 need `ALooper_pollOnce(-1)` to *wait*, and M5 refused it: a host thread parked
+    # on a descriptor nobody can write to cannot be ended by a step budget, because a sleeping
+    # thread executes no guest instructions (D16). What changed is not the policy but the
+    # **measurement** -- `Filesystem::pipe_writers` counts the live write ends, so "something can
+    # still make this ready" is a fact this runtime holds rather than a hope. Every row below is a
+    # way for that fact to be wrong while every count-based assertion around it still passes.
+
+    # The wake-source filter admitting a count of zero. A read end whose last writer has closed is
+    # *readable* -- end of file is a read that returns immediately -- so the refusal cannot rest on
+    # readiness, and `> 0` is the entire difference between a measured fact and a restated hope.
+    ("looper-A9", "A", "a pipe with no live writer counts as a wake source",
+     NDK_LOOPER,
+     """                    .filter(|writers| *writers > 0)""",
+     """                    .filter(|writers| *writers >= 0)""",
+     ANDROID),
+
+    # The decision inverted rather than removed, which is the shape that catches **both** arms with
+    # one row: the dead-pipe case stops being refused and the live-pipe case starts being. A row
+    # that only deleted the refusal would leave the arm M6 turned on untested.
+    ("looper-A10", "A", "the indefinite-wait check answers the opposite question",
+     NDK_LOOPER,
+     """        if sources.is_empty() {""",
+     """        if !sources.is_empty() {""",
+     ANDROID),
+
+    # **The ordering, as a mutation.** The stop switch has to be read below the deadline test,
+    # because `pollOnce(0)` is a poll and not a wait: it asks what is ready now, and POLL_TIMEOUT is
+    # the true answer when nothing is. This row is the check moved back above it -- written as an
+    # equivalent early check rather than as a hunk that moves the block, so the `old` stays one
+    # line and cannot stale against the paragraph of comment that sits between the two.
+    ("looper-A11", "A", "the stop switch read above the deadline test, so a zero-timeout poll refuses",
+     NDK_LOOPER,
+     """        let slice = match bound {""",
+     """        if bionic.bionic.guest_threads_stopping() {
+            return Err(refuse_reentrant(
+                c,
+                "the stop switch was read above the deadline test".to_string(),
+            ));
+        }
+        let slice = match bound {""",
+     ANDROID),
+
+    # The indefinite arm answering "no time left" instead of a slice, so an indefinite poll returns
+    # POLL_TIMEOUT at once -- a timeout reported to a call that was given none, which is the exact
+    # answer the refusal above exists to avoid producing.
+    #
+    # There is deliberately **no row for `WAIT_SLICE`'s value**, and the reason is a finding rather
+    # than an omission: the readiness gate is a condvar, so a write wakes the wait whatever the
+    # slice is, and no test asserts the stop switch ends an indefinite park. A slice of an hour
+    # therefore passes every test in `tests/ndk.rs` today, and a row that cannot fail is worse than
+    # no row (Task 1). What would close it is a test that stops a runtime out of an indefinite
+    # `pollOnce` and bounds how long that takes.
+    ("looper-A12", "A", "an indefinite poll times out at once instead of waiting",
+     NDK_LOOPER,
+     """            Bound::Indefinite => WAIT_SLICE,""",
+     """            Bound::Indefinite => break Pass::Idle,""",
+     ANDROID),
+
+    # ---- the fact itself, at the seam ----
+
+    # The count substituted for the other end's. **A substitution, not a count** (entry 1): the
+    # number is still a number of descriptors, `describe_watched` still prints "N live writer(s)",
+    # and a read end whose writers have all closed reports one because its *reader* is open.
+    ("pipe-A9", "A", "the live-writer count answers with the readers instead",
+     PLAT_FS_PIPE,
+     """    pub fn writers(&self) -> usize {
+        self.state().writers
+    }""",
+     """    pub fn writers(&self) -> usize {
+        self.state().readers
+    }""",
+     ANDROID),
+
+    # The fact made unavailable: a pipe answers `None`, which is what a descriptor that is not a
+    # pipe answers. Every indefinite wait is then refused again -- the M5 behaviour, which is the
+    # believable wrong answer because it reads as conservative.
+    ("pipe-A10", "A", "a pipe reports no writer count, so every indefinite wait is refused again",
+     PLAT_FS,
+     """            Some(Entry::Pipe(handle)) => Some(handle.pipe().writers()),""",
+     """            Some(Entry::Pipe(handle)) => {
+                let _ = handle;
+                None
+            }""",
+     ANDROID),
+
+    # The over-correction: a second descriptor kind answering the question too. An eventfd really
+    # can be written, so "it has a writer" reads as true -- and it is not the question. There is no
+    # *count of ends* for an eventfd, so an indefinite wait would be admitted on a descriptor
+    # nothing in this runtime is holding open to write to.
+    ("pipe-B5", "B", "a kind that is not a pipe answers the live-writer count as well",
+     PLAT_FS,
+     """            Some(Entry::Pipe(handle)) => Some(handle.pipe().writers()),""",
+     """            Some(Entry::Pipe(handle)) => Some(handle.pipe().writers()),
+            Some(Entry::EventFd(_)) => Some(1),""",
+     ANDROID),
+
+    # ======================================= M6: which clock a `pthread_cond_timedwait` is absolute in
+    #
+    # `cond::clock_of` reads back a selector **this crate wrote**, in a field this crate defined at
+    # `cond + 4`, because there is no bionic source on this host to check a bit layout against
+    # (entry 10). So these rows are about the convention being read back exactly, which is the only
+    # thing that makes the round trip evidence of anything.
+
+    # The field offset. An all-zero `pthread_cond_t` is `PTHREAD_COND_INITIALIZER` and must answer
+    # CLOCK_REALTIME, so reading the *wrong* word still answers a legal clock -- it answers
+    # REALTIME for every cond ever created, including the ones that asked for MONOTONIC.
+    ("cond-A1", "A", "the clock selector read from the wrong word of the cond",
+     BIONIC_COND,
+     """    mem.read(cond_addr + 4, &mut b)?;""",
+     """    mem.read(cond_addr, &mut b)?;""",
+     BIONIC),
+
+    # The monotonic arm answering the other clock. On this host the two differ by decades, and a
+    # `timedwait` given a monotonic deadline measured against the wall clock waits for ever or not
+    # at all -- neither of which is an error anything reports.
+    ("cond-A2", "A", "a cond initialised for CLOCK_MONOTONIC reports CLOCK_REALTIME",
+     BIONIC_COND,
+     """        clock_sel::MONOTONIC => Ok(clock_id::CLOCK_MONOTONIC),""",
+     """        clock_sel::MONOTONIC => Ok(clock_id::CLOCK_REALTIME),""",
+     BIONIC),
+
+    # The refusal for a selector `init` never writes, turned into a clock picked by falling
+    # through. The struct is then not one this layer produced and is treated as though it were,
+    # which is entry 12's shape in reverse: a check that reads as defensive doing nothing.
+    ("cond-A3", "A", "an unknown clock selector falls through to a clock instead of EINVAL",
+     BIONIC_COND,
+     """        _ => Err(consts::EINVAL),""",
+     """        _ => Ok(clock_id::CLOCK_REALTIME),""",
+     BIONIC),
+
+    # ======================================= M6: the scheduling band the engine sizes itself against
+    #
+    # MEASURED at guest `0x054e0260`/`0x054e026c`: `libroblox.so` takes the min and the max for
+    # SCHED_FIFO, rejects -1 from either, and requires `max - min >= 3`. Both rows below keep that
+    # relation true, so `the_real_time_band_is_wide_enough_for_the_engine_check_at_0x054e0280`
+    # passes for both of them -- they are caught by the test that names every value instead. That
+    # pairing is the whole point of having the two tests (entry 1).
+    ("sched-A1", "A", "the real-time maximum is a number of this layer's own rather than Linux's 99",
+     BIONIC_METADATA,
+     """        sched_policy::FIFO | sched_policy::RR => 99,""",
+     """        sched_policy::FIFO | sched_policy::RR => 32,""",
+     BIONIC),
+
+    ("sched-A2", "A", "the real-time band starts at 0, where the time-sharing policies do",
+     BIONIC_METADATA,
+     """        sched_policy::FIFO | sched_policy::RR => 1,""",
+     """        sched_policy::FIFO | sched_policy::RR => 0,""",
+     BIONIC),
+
+    # The policy **set**, which is the other half and the one a band check cannot see: SCHED_OTHER
+    # and SCHED_BATCH drop out of the zero arm and answer -1, the value that means "Linux does not
+    # define this policy". A caller is then told its own default policy does not exist.
+    ("sched-A3", "A", "sched_get_priority_max stops defining SCHED_OTHER and SCHED_BATCH",
+     BIONIC_METADATA,
+     """        sched_policy::FIFO | sched_policy::RR => 99,
+        sched_policy::OTHER | sched_policy::BATCH | sched_policy::IDLE => 0,""",
+     """        sched_policy::FIFO | sched_policy::RR => 99,
+        sched_policy::IDLE => 0,""",
+     BIONIC),
+
+    ("sched-A4", "A", "sched_get_priority_min stops defining SCHED_OTHER and SCHED_BATCH",
+     BIONIC_METADATA,
+     """        sched_policy::FIFO | sched_policy::RR => 1,
+        sched_policy::OTHER | sched_policy::BATCH | sched_policy::IDLE => 0,""",
+     """        sched_policy::FIFO | sched_policy::RR => 1,
+        sched_policy::IDLE => 0,""",
+     BIONIC),
+
+    # ======================================= M6: `pthread_cond_timedwait`'s absolute deadline
+    #
+    # The whole of what this handler adds over `pthread_cond_wait` is turning an absolute
+    # `timespec` into a relative wait. Each row below is a way to get a *plausible* duration out of
+    # that arithmetic rather than an error.
+
+    # The subtraction reversed, which is the sign error the handler's own comment is about: a
+    # deadline in the past becomes a wait of however long ago it was. With the epoch as the
+    # deadline that is ~57 years, so it trips the cap and the past-deadline test gets a refusal
+    # where it expected ETIMEDOUT -- it fails at once rather than by waiting.
+    ("timedwait-A1", "A", "the absolute deadline subtracted the wrong way round",
+     ADAPTER_HANDLERS,
+     """    let budget = absolute.saturating_sub(now);""",
+     """    let budget = now.saturating_sub(absolute);""",
+     ANDROID),
+
+    # bionic's own validation of `tv_nsec` removed. A nanosecond field of exactly one billion then
+    # carries into the seconds, and a negative one becomes zero through the `try_from`, so both
+    # produce a wait for a time the caller never expressed instead of the EINVAL a device answers.
+    ("timedwait-A2", "A", "an out-of-range tv_nsec becomes a wait instead of EINVAL",
+     ADAPTER_HANDLERS,
+     """    if !(0..1_000_000_000).contains(&nanos) {""",
+     """    if false {""",
+     ANDROID),
+
+    # The cap removed, so a guest-chosen absolute deadline is waited out in full.
+    #
+    # **This row fails slowly and that is inherent**: the detector asks for twice the cap, so the
+    # mutated handler waits the ~120 s it was given and then answers ETIMEDOUT where a refusal was
+    # expected. It is a bounded failure rather than `pipe-B2`'s hang -- an absolute deadline is
+    # finite by construction -- but it is worth knowing before reading the elapsed column.
+    ("timedwait-A3", "A", "the guest-chosen wait cap removed, so a deadline is waited out in full",
+     ADAPTER_HANDLERS,
+     """    if budget.as_secs() > super::MAX_SLEEP_SECONDS {""",
+     """    if false {""",
+     ANDROID),
+
+    # There is deliberately **no row for the clock selection** -- reading `now` from the monotonic
+    # clock for a cond that asked for CLOCK_REALTIME. It is inert against every test that exists:
+    # no test builds a cond on CLOCK_MONOTONIC and waits on it, and both realtime detectors survive
+    # the substitution (the past-deadline one still sees a deadline in the past, and the cap one
+    # still sees a deadline past the cap, because the two clocks differ by far more than the cap).
+    # A row would MISS, and a row that cannot fail is worse than no row. What would close it is a
+    # test that sets `pthread_condattr_setclock(CLOCK_MONOTONIC)` and asserts the wait's length.
+
+    # ======================================= M6: the eventfd counter (§8 row 21)
+    #
+    # The first descriptor kind whose *read* changes what the next read answers, which is why these
+    # rows are mostly about the second read rather than the first.
+
+    # The destructive read made non-destructive. The counter keeps its value, so a second read
+    # answers 7 again -- every assertion about the *first* read still passes, and a guest using the
+    # eventfd as a wakeup token never stops being woken.
+    ("eventfd-A1", "A", "an eventfd read does not consume the counter",
+     PLAT_FS_EVENTFD,
+     """                std::mem::replace(&mut *count, 0)""",
+     """                *count""",
+     ANDROID),
+
+    # A read of a zero counter succeeding instead of reporting WouldBlock. It delivers a zero,
+    # which is a value no write produced and which the guest cannot tell from a real one.
+    ("eventfd-A2", "A", "a read of a zero counter delivers a zero rather than blocking",
+     PLAT_FS_EVENTFD,
+     """            if *count == 0 {""",
+     """            if false {""",
+     ANDROID),
+
+    # Readiness losing its dependence on the counter: the always-ready answer the other kinds get.
+    # `poll` then reports an eventfd readable while its counter is zero, and the read that follows
+    # blocks or reports EAGAIN -- the readiness table contradicting the operation it describes.
+    ("eventfd-A3", "A", "an eventfd is readable whether or not it has been written",
+     PLAT_FS_EVENTFD,
+     """            readable: count > 0,""",
+     """            readable: true,""",
+     ANDROID),
+
+    # The flag check at the seam. `EFD_SEMAPHORE`, `EFD_CLOEXEC` and `EFD_NONBLOCK` are the whole of
+    # what `eventfd2` defines, and the bit most likely to be smuggled in is one that changes
+    # blocking -- the single decision this seam refuses to fake.
+    ("eventfd-A4", "A", "a flag eventfd2 does not define is accepted rather than EINVAL",
+     PLAT_FS,
+     """        let unknown = flags & !eventfd::KNOWN_FLAGS;
+        if unknown != 0 {""",
+     """        let unknown = flags & !eventfd::KNOWN_FLAGS;
+        if false {""",
+     ANDROID),
+
+    # The over-correction, and the copy-paste that reads as symmetry: writability given the
+    # readability rule. An empty eventfd is then reported as unwritable, so a poller waiting to
+    # *post* a token waits for a condition that only its own posting could produce.
+    ("eventfd-B1", "B", "writability answers the readability question, so an empty eventfd is unwritable",
+     PLAT_FS_EVENTFD,
+     """            writable: count < MAX_COUNT,""",
+     """            writable: count > 0,""",
+     ANDROID),
+
+    # There is deliberately no row for `MAX_COUNT`, for the eight-byte rule on either transfer, or
+    # for the `0xffffffffffffffff` write refusal. All three are **inert against every test that
+    # exists**: nothing performs a short read or write, nothing writes `u64::MAX`, and nothing
+    # takes the counter near its ceiling, so each would report a MISS that read as a missing test
+    # rather than as a missing case. What would close them is one test that does each of those
+    # three things; they are cheap, and they are not written yet.
+
+    # ======================================= M6: the A64 hint instructions (§8 rows 21-22)
+    #
+    # MEASURED on this pin: `hook_hint_instructions: 0` is not forwarded by the x64 A64 backend, so
+    # a `yield` arrives at `handle_exception` as an exception with the config asking for the
+    # opposite. Treating it as unsupported halts a guest whose spin loop is three instructions
+    # long, which is what made this reachable.
+    ("cpu-A40", "A", "a hint is no longer recognised as one, so every hint halts the guest",
+     CPU_CALLBACKS,
+     """const fn is_hint(kind: u32) -> bool {
+    matches!(
+        kind,
+        exception::YIELD
+            | exception::WAIT_FOR_EVENT
+            | exception::WAIT_FOR_INTERRUPT
+            | exception::SEND_EVENT
+            | exception::SEND_EVENT_LOCAL
+    )
+}""",
+     """const fn is_hint(_kind: u32) -> bool {
+    false
+}""",
+     CPU),
+
+    # One member dropped from the set rather than the set removed. `YIELD` is the one the measured
+    # spin loop at guest `0x021eba20` emits, and the other four still passing is what makes this
+    # the flattering direction: four of five hints work.
+    ("cpu-A41", "A", "YIELD drops out of the hint set while the other four stay",
+     CPU_CALLBACKS,
+     """        exception::YIELD
+            | exception::WAIT_FOR_EVENT
+            | exception::WAIT_FOR_INTERRUPT
+            | exception::SEND_EVENT
+            | exception::SEND_EVENT_LOCAL""",
+     """        exception::WAIT_FOR_EVENT
+            | exception::WAIT_FOR_INTERRUPT
+            | exception::SEND_EVENT
+            | exception::SEND_EVENT_LOCAL""",
+     CPU),
+
+    # The early return removed, so a hint is counted, yields the host thread, and *then* falls
+    # through to the unsupported path anyway. The `hints` counter rises while the guest stops --
+    # entry 11's shape exactly, a watch that looks like a detector.
+    ("cpu-A42", "A", "a hint is counted and then halts the guest as an unsupported instruction",
+     CPU_CALLBACKS,
+     """                return;
+            }
+            let address = pc as GuestAddr;""",
+     """            }
+            let address = pc as GuestAddr;""",
+     CPU),
 ]
 
 
