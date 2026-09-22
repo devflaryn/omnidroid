@@ -112,6 +112,21 @@ pub enum Answer {
     Null,
     /// `<init>`: construct an instance of the declaring class with no fields set.
     NewInstance,
+    /// A static field that holds **the one instance of its own class** -- a Kotlin `object`'s
+    /// `INSTANCE`, which `<clinit>` creates with `new-instance` and stores with `sput-object`,
+    /// once.
+    ///
+    /// Made on the first read and the **same object on every read after it**, held by the JNI
+    /// instance for its life the way a class holds its statics: a fresh object per read would
+    /// tell `IsSameObject` two reads of one field differ, and Djinni's proxy cache -- the
+    /// engine's reason for reading `PlatformSystemDialogHandler.INSTANCE` -- is keyed on
+    /// identity. Its fields are unset and its methods answer what they are declared to, so the
+    /// first thing the engine asks of it refuses by name rather than being invented.
+    ///
+    /// Only for a static field whose descriptor is `L<its own class>;`, which is checked where it
+    /// is read: this variant claims the class's own `<clinit>` stored a fresh instance of the
+    /// class, and anywhere else that claim is false.
+    StaticInstance,
     /// Construct an instance of **another** declared class and return it.
     ///
     /// What a factory getter is: `ActivityThread.currentApplication()`,
@@ -129,6 +144,11 @@ pub enum Answer {
     ResolveClass,
     /// `String.getBytes(String charset)`: the receiver's text, encoded.
     StringBytes,
+    /// `System.identityHashCode(Object)`: [`ObjectId::identity_hash`](super::refs::ObjectId::identity_hash)
+    /// of argument 0, and `0` for `null` (its javadoc). A function of identity, not a value
+    /// chosen to look like one: the same object answers the same number for its whole life,
+    /// which is the entire contract.
+    IdentityHash,
     /// An `Object[0]`.
     ///
     /// `List.toArray()` on the empty list this layer hands the engine. Correct rather than a
@@ -515,9 +535,11 @@ impl Registry {
             Answer::Null => Value::Object(None),
             Answer::Field(_)
             | Answer::NewInstance
+            | Answer::StaticInstance
             | Answer::NewInstanceOf(_)
             | Answer::ResolveClass
             | Answer::StringBytes
+            | Answer::IdentityHash
             | Answer::EmptyObjectArray
             | Answer::Native
             | Answer::Unanswered => return None,
@@ -614,6 +636,11 @@ const fn s(name: &'static str, descriptor: &'static str, answer: Answer) -> Memb
 /// An instance field.
 const fn f(name: &'static str, descriptor: &'static str, answer: Answer) -> MemberSpec {
     MemberSpec { name, descriptor, is_static: false, answer }
+}
+
+/// A static field.
+const fn sf(name: &'static str, descriptor: &'static str, answer: Answer) -> MemberSpec {
+    MemberSpec { name, descriptor, is_static: true, answer }
 }
 
 const NONE: &[MemberSpec] = &[];
@@ -1406,6 +1433,49 @@ pub static DECLARED: &[ClassSpec] = &[
         tier: Tier::Support,
         methods: NONE,
         fields: NONE,
+    },
+    // ---- what Djinni's proxy cache asks of the JVM ----------------------------------------
+    //
+    // **MEASURED, M6's gate**: with `PlatformSystemDialogHandler.INSTANCE` answered, the same
+    // thread reached Djinni's `JavaProxyCache` (`0x22592ec`), whose `jniFindClass` asked for
+    // `java/lang/System` (recorded as `MISS FindClass java/lang/System`), got null, and went down
+    // Djinni's "FindClass returned null" assertion (`0x22590dc`) into a `ThrowNew` on a null
+    // class, which killed it. The cache is keyed on `System.identityHashCode` and compared with
+    // `IsSameObject` -- Djinni's `JavaIdentityHash`/`JavaIdentityEquals`.
+    ClassSpec {
+        name: "java/lang/System",
+        tier: Tier::Support,
+        methods: &[s("identityHashCode", "(Ljava/lang/Object;)I", Answer::IdentityHash)],
+        fields: NONE,
+    },
+    // ---- the platform dialog handler the settings success path registers -----------------
+    //
+    // **MEASURED, M6's gate, 2 of 2 runs**: the thread carrying the client-settings fetch logged
+    // `getFlags: success`, then read this field through `GetStaticFieldID`/`GetStaticObjectField`
+    // at link `0x2258b3c`-`0x2258b74` -- called from `0x2bd58a4`, *before*
+    // `continueAfterFlagsLoaded_` at `0x2bd59f8` -- and died on the refusal. So the byte the
+    // surface path is gated on was never written, and every window the gate delivered was
+    // dropped with `Flags-Not-Received`.
+    //
+    // What the engine does with it, decoded from `0x2258b78` on: `NewGlobalRef`, then
+    // `GetObjectClass` and `IsSameObject` against a cached class -- Djinni asking whether this is
+    // one of *its* C++ proxies, whose `nativeRef` it would unwrap with `GetLongField` -- and, when
+    // it is not, `0x22592ec`: Djinni's `JavaProxyCache`, wrapping a Java implementation.
+    //
+    // What the field holds, read out of the APK rather than chosen: `classes2.dex`'s `<clinit>`
+    // for this class is `new-instance v0, PlatformSystemDialogHandler; invoke-direct <init>()V;
+    // sput-object v0, INSTANCE` -- a Kotlin `object`. Only `INSTANCE` is declared here; the
+    // other statics `<clinit>` sets (a coroutine scope, a mutex, two `AtomicReference`s, a
+    // queue) have no measured reader, and the generated surface keeps every method Unanswered.
+    ClassSpec {
+        name: "com/roblox/protocols/systemdialog/PlatformSystemDialogHandler",
+        tier: Tier::Support,
+        methods: NONE,
+        fields: &[sf(
+            "INSTANCE",
+            "Lcom/roblox/protocols/systemdialog/PlatformSystemDialogHandler;",
+            Answer::StaticInstance,
+        )],
     },
 ];
 

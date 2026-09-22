@@ -131,6 +131,17 @@ impl ObjectId {
     pub fn index(self) -> u32 {
         self.index
     }
+
+    /// `System.identityHashCode` for this object: a function of the object's identity alone.
+    ///
+    /// The slot index *and* its generation, because a slot is reused once its object is freed,
+    /// and a later object in the same slot is a different identity. The contract is the whole of
+    /// what is owed -- the same object gives the same value for its life; distinct objects may
+    /// collide -- and ART's own value is an implementation detail no caller may depend on.
+    #[must_use]
+    pub fn identity_hash(self) -> i32 {
+        (self.index ^ self.generation.rotate_left(16)) as i32
+    }
 }
 
 /// A Java object, as this layer models one.

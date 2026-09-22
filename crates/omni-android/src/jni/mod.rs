@@ -151,6 +151,10 @@ pub(crate) struct JniState {
     pub(crate) described: Vec<String>,
     /// Which slot of [`JniState::threads`] a host thread has been given.
     assigned: HashMap<std::thread::ThreadId, usize>,
+    /// The objects [`classes::Answer::StaticInstance`] fields hold, by field: a **global
+    /// reference this instance owns**, which is what keeps the object alive between reads (an
+    /// object is freed with its last reference, and the guest is only ever handed locals).
+    pub(crate) statics: BTreeMap<classes::FieldId, u64>,
 }
 
 impl JniState {
@@ -285,6 +289,7 @@ impl Jni {
                 registrations: Vec::new(),
                 described: Vec::new(),
                 assigned: HashMap::new(),
+                statics: BTreeMap::new(),
             }),
             pool: Mutex::new(pool),
             census: Mutex::new(BTreeMap::new()),

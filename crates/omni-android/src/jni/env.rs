@@ -518,9 +518,13 @@ fn env_call(
             let mut state = jni.state();
             let field = state.handles.decode_field(name, address, field)?;
             let member = field_member(&state, name, address, field)?.clone();
-            let value = Registry::simple_answer(member.answer).ok_or_else(|| {
-                unanswered(&state, name, address, field.class, &member)
-            })?;
+            let value = if member.answer == Answer::StaticInstance {
+                static_instance(&mut state, name, address, field, &member)?
+            } else {
+                Registry::simple_answer(member.answer).ok_or_else(|| {
+                    unanswered(&state, name, address, field.class, &member)
+                })?
+            };
             field_return(&mut state, name, address, value)
         }
 
@@ -1170,6 +1174,53 @@ fn field_member<'a>(
     })
 }
 
+/// [`Answer::StaticInstance`]: the one object the class's `<clinit>` stored in this field.
+///
+/// Created on the first read and anchored by a global reference in [`JniState::statics`], so
+/// every read -- on any thread -- is the same object, which `IsSameObject` and an identity-keyed
+/// cache both depend on. The caller turns the answer into a local reference, as for any field.
+///
+/// # Errors
+///
+/// [`AbiError::JniRefused`] when the field is not typed as its own class or is read through
+/// something other than `GetStaticObjectField` -- the declaration would then be claiming a
+/// `<clinit>` that could not have run -- and whatever the handle table refuses.
+pub(super) fn static_instance(
+    state: &mut JniState,
+    name: &str,
+    address: GuestAddr,
+    field: FieldId,
+    member: &Member,
+) -> AbiResult<Value> {
+    let class = state.registry.class_name(field.class).to_string();
+    let own_type = format!("L{class};");
+    if name != "GetStaticObjectField" || !member.is_static || member.descriptor != own_type {
+        return Err(AbiError::JniRefused {
+            function: name.to_string(),
+            address,
+            detail: format!(
+                "`{class}.{}` ({}, {}) is declared as the instance its own class's `<clinit>` \
+                 stores, which only a static field of type `{own_type}` read by \
+                 `GetStaticObjectField` can be",
+                member.name,
+                member.descriptor,
+                if member.is_static { "static" } else { "not static" }
+            ),
+        });
+    }
+    if let Some(&held) = state.statics.get(&field) {
+        return Ok(Value::Object(Some(state.handles.resolve_id(name, address, held)?)));
+    }
+    let id = state.handles.create(
+        name,
+        address,
+        Object::Instance { class: field.class, fields: std::collections::BTreeMap::new() },
+    )?;
+    let held = state.handles.reference_to(name, address, RefKind::Global, id)?;
+    state.statics.insert(field, held);
+    Ok(Value::Object(Some(id)))
+}
+
 /// An instance field: whatever was stored on the object, or the class's declared default.
 fn instance_field(
     state: &JniState,
@@ -1447,6 +1498,22 @@ fn evaluate(
             )?;
             Ok(Value::Object(Some(object)))
         }
+        Answer::IdentityHash => match arguments.first() {
+            // `Value::Long` is how an object parameter arrives: the raw handle, resolved here.
+            Some(Value::Long(0)) => Ok(Value::Int(0)),
+            Some(Value::Long(handle)) => {
+                Ok(Value::Int(state.handles.resolve_id(name, address, *handle as u64)?.identity_hash()))
+            }
+            other => Err(AbiError::JniRefused {
+                function: name.to_string(),
+                address,
+                detail: format!(
+                    "`{}.{}` takes one object and was called with {other:?}",
+                    state.registry.class_name(class),
+                    member.name
+                ),
+            }),
+        },
         Answer::EmptyObjectArray => {
             let Some(element) = state.registry.find("java/lang/Object") else {
                 return Err(AbiError::JniRefused {
@@ -1502,6 +1569,19 @@ fn evaluate(
             ),
         }),
         Answer::Unanswered => Err(unanswered(state, name, address, class, member)),
+        // A field's answer reaching a method call is a declaration defect, and it says so
+        // rather than falling into `simple_answer` and reading as "not decided".
+        Answer::StaticInstance => Err(AbiError::JniRefused {
+            function: name.to_string(),
+            address,
+            detail: format!(
+                "`{}.{}{}` is declared StaticInstance, which is an answer for a static field and \
+                 not for a call",
+                state.registry.class_name(class),
+                member.name,
+                member.descriptor
+            ),
+        }),
         simple => {
             let _ = arguments;
             Registry::simple_answer(simple)
@@ -1587,6 +1667,106 @@ fn clear_pending(
 mod tests {
     use super::*;
     use crate::jni::slots::{JNI_ABORT, JNI_COMMIT, JNI_ERR};
+
+    const HANDLER: &str = "com/roblox/protocols/systemdialog/PlatformSystemDialogHandler";
+
+    /// **`PlatformSystemDialogHandler.INSTANCE` is one object, read after read, and it outlives
+    /// the reference the guest was given.**
+    ///
+    /// Three failures, each caught separately: a fresh object per read (the ids differ); an
+    /// object nothing on the host holds, so the guest deleting its local frees it (the second
+    /// read's id no longer resolves, or a new slot is made); and an object of the wrong class
+    /// (the class check). Djinni's proxy cache is identity-keyed, which is why the first matters.
+    #[test]
+    fn a_static_instance_field_is_one_object_that_outlives_the_guests_reference() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let class = state.registry.find(HANDLER).expect("declared");
+        let own = format!("L{HANDLER};");
+        let field = state.registry.field(class, "INSTANCE", &own, true).expect("declared");
+        let member = state.registry.field_member(field).expect("a member").clone();
+        assert_eq!(member.answer, Answer::StaticInstance);
+
+        let first = static_instance(&mut state, "GetStaticObjectField", 0, field, &member)
+            .expect("the first read creates it");
+        let Value::Object(Some(id)) = first else { panic!("an object, not {first:?}") };
+        match state.handles.object_of(id) {
+            Some(Object::Instance { class: of, .. }) => assert_eq!(*of, class),
+            other => panic!("an instance of {HANDLER}, not {other:?}"),
+        }
+        // What the guest is handed, and then what the guest does with it.
+        let local = state.handles.reference_to("test", 0, RefKind::Local, id).expect("a local");
+        state.handles.delete("DeleteLocalRef", 0, RefKind::Local, local).expect("deleted");
+
+        let second = static_instance(&mut state, "GetStaticObjectField", 0, field, &member)
+            .expect("the second read");
+        assert_eq!(second, Value::Object(Some(id)), "the same object, still alive");
+        assert!(state.handles.object_of(id).is_some(), "not freed with the guest's local");
+    }
+
+    /// **`System.identityHashCode` is a function of the object, not of the handle**, and `null`
+    /// is 0.
+    ///
+    /// Two different references to one object must agree -- Djinni's proxy cache hashes whatever
+    /// `jobject` it holds, and a hash of the *handle* would file one Java object under two keys.
+    #[test]
+    fn identity_hash_is_the_objects_and_not_the_handles() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let system = state.registry.find("java/lang/System").expect("declared");
+        let method = state
+            .registry
+            .method(system, "identityHashCode", "(Ljava/lang/Object;)I", true)
+            .expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        let empty = || Object::Instance { class: system, fields: std::collections::BTreeMap::new() };
+
+        let one = state.handles.new_local("test", 0, empty()).expect("an object");
+        let also_one = state.handles.duplicate("test", 0, RefKind::Global, one).expect("a second ref");
+        let other = state.handles.new_local("test", 0, empty()).expect("another object");
+        assert_ne!(one, also_one, "two handles");
+
+        let mut hash = |handle: u64| {
+            match evaluate(&mut state, "CallStaticIntMethodV", 0, system, &member, None, &[
+                Value::Long(handle as i64),
+            ]) {
+                Ok(Value::Int(value)) => value,
+                other => panic!("an int, not {other:?}"),
+            }
+        };
+        let (a, b, c, null) = (hash(one), hash(also_one), hash(other), hash(0));
+        assert_eq!(a, b, "one object through two handles");
+        assert_ne!(a, c, "two live objects in two slots");
+        assert_eq!(null, 0, "identityHashCode(null) is 0");
+    }
+
+    /// The claim `StaticInstance` makes is only true of a static field typed as its own class,
+    /// read as an object; anywhere else it refuses, naming the field.
+    #[test]
+    fn a_static_instance_answer_refuses_where_its_claim_would_be_false() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let class = state.registry.find(HANDLER).expect("declared");
+        let field = state
+            .registry
+            .field(class, "INSTANCE", &format!("L{HANDLER};"), true)
+            .expect("declared");
+        let member = state.registry.field_member(field).expect("a member").clone();
+
+        let error = static_instance(&mut state, "GetStaticIntField", 0, field, &member)
+            .expect_err("read as an int");
+        assert!(error.to_string().contains("INSTANCE"), "{error}");
+
+        let mut wrong = member.clone();
+        wrong.descriptor = "Ljava/lang/Object;".to_string();
+        let error = static_instance(&mut state, "GetStaticObjectField", 0, field, &wrong)
+            .expect_err("typed as another class");
+        assert!(error.to_string().contains("Ljava/lang/Object;"), "{error}");
+        assert!(state.statics.is_empty(), "a refused read creates nothing");
+    }
 
     /// Which slots take the exit path, as a membership assertion. `NewObjectArray` starts with
     /// `NewObject` and must **not** be caught by the rule, which a `starts_with` would do.
