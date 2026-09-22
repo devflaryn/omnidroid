@@ -898,37 +898,57 @@ Read in this order:
    (textures — M6's scope), D26 (`AT_HWCAP`), D24, D23, D19, D16, D13, D7.
 6. **`docs/ARCHITECTURE.md`** §§1, 2, 5, 6.
 
-## Where the runtime actually stops today
+## Where the runtime actually is today
 
-`cargo test -p omni-android --release --test gameactivity` is the gate, it is **green**, and it
-now takes **27 s** rather than 49 — `strchr` had been scanning megabytes of zeroed pages on every
-miss, and fixing it is the single largest change in this session.
+`cargo test -p omni-android --release --test gameactivity` is the gate. It is **green** in about
+80 s, and `OMNI_M6_ROWS_21_22=1` drives §8 rows 21-22 as well.
 
-What runs, every time, asserted:
+**The engine runs its own main loop.** Twelve guest threads, its own telemetry, its own HTTP stack
+over real sockets. §8 rows 7-22 are reached and return. What runs, every time, asserted:
 
-* all 3,594 initializers, `JNI_OnLoad`, and §8 steps 7-12 at **21 of 21** scripted downcalls —
-  `nativeSetPlatformHeadersWithIdfa`, carried as an open item since M4, returns;
-* `initializeNativeCode` returns a `NativeCode *`, the game thread reaches
-  `NativeEngine::GameLoop()`, and `ALooper_pollOnce(-1)` **waits** rather than refusing;
-* §8 rows 17-20 — all seven lifecycle/surface natives — and the engine answers by name:
+* all 3,594 initializers, `JNI_OnLoad`, §8 steps 7-12 at **21 of 21** scripted downcalls;
+* `initializeNativeCode` returns a `NativeCode *`, the game thread reaches `NativeEngine::GameLoop`;
+* §8 rows 17-20, the seven lifecycle/surface natives, and the engine answers by name
+  (`APP_CMD_INIT_WINDOW: hasWindow = true, hasFocus = true` through `APP_CMD_CONTENT_RECT_CHANGED`);
+* §8 row 21 **both downcalls** -- `nativeInitClientSettings` and
+  `nativePostClientSettingsLoadedInitialization3`, the call that blocked for three sessions;
+* §8 row 22 `nativeGameGlobalInit`;
+* **no guest thread is killed by this layer** -- that is an assertion now, and it is the one that
+  found four deaths nothing else would have reported.
 
-```text
-APP_CMD_INIT_WINDOW: hasWindow = true, hasFocus = false
-APP_CMD_WINDOW_RESIZED / APP_CMD_START / APP_CMD_RESUME
-APP_CMD_GAINED_FOCUS / APP_CMD_CONTENT_RECT_CHANGED
-```
+**Networking is real** (D30 withdrew Global Constraint 8). The guest's own OpenSSL resolves a name,
+connects, completes a TLS handshake against the real `clientsettingscdn.roblox.com`, verifies
+certificates against the bundle the APK ships, sends its request and reads the reply.
 
-And with `OMNI_M6_ROWS_21_22=1`, **§8 row 21's first downcall returns and the flags load**:
+**Graphics reaches a presented frame from guest code.** Loader, instance, surface on the real
+resizable window, physical device, device, queue, swapchain, command buffers, submit, present --
+and the presented pixels copied back and asserted. Every call from assembled ARM64 through guest
+thunks, against a real RTX 4060.
 
-```text
-nativeInitClientSettings -> returned 0 ; engine Flag::areFlagsLoaded byte: 1
-[FLog::FlagCache] writeFlagCache: Successfully wrote 31 bytes to flag_cache.dat
-[DFLog::Mimalloc] Mimalloc integration detected, settings: ...
-[FLog::ClientRunInfo] RobloxGitHash: 4b82efeca5f6e7cf71243007cd28125595ff143d
-```
+## The two things between here and a real Roblox frame
 
-That is what §8 row 21 exists to do, and the TaskScheduler's
-`Can't initialize the TaskScheduler before flags have been loaded` is gone.
+**1. `HTTP 400` on the client-settings request.** The transport is proven; the *request* is
+malformed. This is not optional and the reason is decoded: the success path at guest `0x02bd5560`
+calls `continueAfterFlagsLoaded_` (`0x02bd3b58`), which writes the byte at `DataModel + 0x289` at
+`0x02bd3be4`; the **failure** path at `0x02bd569c` writes state `0xb` and goes elsewhere. That byte
+is tested at `0x02bd307c` and is the only thing gating `nativeActivity_onSurfaceChanged` -- until it
+is 1 the engine returns without touching the window and **no frame is possible**. It is also why
+Roblox shows a Java-side "check your connection" screen offline rather than rendering.
+
+The binary has `apiKey=%s` at `0x5a1188` and `/v2/settings/application/{}` at `0x38c7a2`. The gate
+supplies `CLIENT_SETTINGS = {"applicationSettings":{}}` -- an **empty** document where a device's
+Java side supplies a real one.
+
+> **The line not to cross here.** Anything the host supplies must be read out of the APK, decoded
+> from the binary as a constant the engine already carries, a truthful statement about this host,
+> or asked of an embedding through a seam with no default. If the only route to a valid request is
+> a credential this project does not have, that is a real answer and belongs in this file -- not a
+> fabricated key.
+
+**2. Vulkan stage 5: memory and resources.** Everything between "I have a device" and "I can draw":
+device memory, buffers, images, shaders, pipelines, descriptors, and the recording commands a draw
+needs. The memory design is settled and measured -- see "The `vkMapMemory` answer".
+
 
 ## The immediate blocker: the engine will not take the surface until the flags have arrived
 
@@ -1289,6 +1309,50 @@ engine `VK_KHR_android_surface` exists. That is a worse state than not advertisi
 answered on this layer's authority, **conditional on the driver having the host's own surface entry
 point**, so a host with no WSI still produces NULL and records nothing.
 
+### Stage 4 is built: a frame presented from guest code, with its pixels asserted
+
+```text
+vkCreateSwapchainKHR    -> VkResult 0; the guest's VkSwapchainKHR is 0x2cf0e56e240
+vkGetSwapchainImagesKHR -> 2 image(s)
+vkAcquireNextImageKHR   -> VkResult 0, imageIndex 0
+vkQueueSubmit / vkWaitForFences / vkQueuePresentKHR -> VkResult 0
+read back 1024x576 from the presented image (VkFormat 44):
+    cleared to [0.2, 0.6, 0.8, 1.0], which a UNORM stores as [51, 153, 204, 255]
+    centre pixel  = [51, 153, 204, 255]
+    corner pixels = [51, 153, 204, 255], [51, 153, 204, 255]
+```
+
+Sixty-three calls, all through guest thunks from assembled ARM64. The clear colour has four
+distinct channels, none 0 or 255 in RGB, so a channel-order mistake or a buffer of zeros cannot
+pass. **It is not a Roblox frame** -- it is this project's own test driving the guest path end to
+end, and what it establishes is that the path exists and carries pixels.
+
+**The read-back had to be built, and the reason is worth keeping.** `omni-gfx` does *not* read the
+framebuffer back: `tests/renderer_live.rs`'s header records that `PrintWindow(PW_RENDERFULLCONTENT)`
+returns solid black for a flip-model client area on this host. So the host copies the swapchain
+image instead -- idle, `PRESENT_SRC_KHR` -> `TRANSFER_SRC_OPTIMAL`, `vkCmdCopyImageToBuffer`,
+transition back. **It reads the pixels handed to the presentation engine, not a capture of the
+monitor**, and that gap is the compositor's. The guest asks for `TRANSFER_SRC` itself; the host
+never widens usage behind it.
+
+**Two swapchains on one window is invalid and nothing here would report it.** There are no
+validation layers on this machine, and the graphics spike crashed `nvoglv64.dll` silently doing
+exactly that. `omni_gfx::claim` is a process-wide window -> owner table: `Renderer::new` and
+`create_swapchain` both take a claim, and the conflict is a refusal **naming the other owner**
+before any driver call. `oldSwapchain` **transfers** the claim rather than taking a fresh one, so
+recreation never leaves the window unowned and a failed driver call puts the claim back.
+
+`VK_ERROR_OUT_OF_DATE_KHR` and `VK_SUBOPTIMAL_KHR` reach the guest as the raw `i32`. `Acquired`
+and `Presented` are deliberately **not** `DriverAnswer`, which would have to call suboptimal a
+failure, and both use ash's *raw* entry points because its wrappers flatten suboptimal to a `bool`.
+Nothing recreates a swapchain on the guest's behalf. Measured: NVIDIA's **first acquire after a
+resize still returns `VK_SUCCESS`** and reports at present, which is conforming, and is why the
+resize test drives whole frames rather than one acquire.
+
+**`REGISTRY_BYTES` is 3648 of the 4096-byte data area** every embedding passes to
+`BoundaryBuilder::new`. A first draft came to 8,640 and made every Vulkan test fail at `bind_into`
+with `RegionFull`. Raising a bound past 4096 now means raising the data area in **every** embedding.
+
 ### The `vkMapMemory` answer: neither option, and the premise was wrong
 
 **Recommendation: do not teach `omni-mem` about foreign ranges, and do not bounce. Make the memory
@@ -1377,111 +1441,136 @@ records `libloading` as a tolerated exception *inside that crate*. Define a `Vul
 
 ## Be clear-eyed about how far this is from a playable game
 
-Reaching §8 row 25 of 26 sounds like 96%. It is not, and a new session should not plan as though it
-is. Row 25 is where the engine *asks for graphics* — it is the door, not the room. Behind it:
+**That earlier warning was right and is kept, with its numbers corrected.** It said reaching §8 row
+25 of 26 "sounds like 96%. It is not" — row 25 is where the engine *asks for* graphics, and it is
+the door rather than the room. That is still the right way to think, and the list it gave has
+largely been worked through:
 
-* **`crates/omni-gfx` is real now, and it is the *host* half only.** A Vulkan instance, device
-  and swapchain over a resizable Win32 window, presenting frames verified on screen by reading
-  the framebuffer back. **Nothing in `omni-android` calls it**: no guest-facing EGL or Vulkan
-  surface exists, and `Ndk::set_window_geometry` is still fed a constant by the gate rather than
-  by a window. Having a renderer is not having the engine's frames.
-* **Zero `egl*` symbols are bound.** `libroblox.so` imports **17** (measured twice, from the symbol
-  table: `eglGetDisplay`, `eglInitialize`, `eglChooseConfig`, `eglCreateContext`,
-  `eglCreateWindowSurface`, `eglCreatePbufferSurface`, `eglMakeCurrent`, `eglSwapBuffers`,
-  `eglSwapInterval`, `eglQuerySurface`, `eglGetConfigAttrib`, `eglGetCurrentContext`,
-  `eglDestroyContext`, `eglDestroySurface`, `eglTerminate`, `eglGetError`, `eglGetProcAddress`).
-* **Zero `vk*` symbols are imported at all** — Vulkan arrives through
-  `dlopen("libvulkan.so")` + `vkGetInstanceProcAddr`, so the whole API comes through `dlsym`. The
-  `dlopen`/`dlsym` layer exists (`bionic/dl.rs`) but answers only for libraries *this layer is*, and
-  refuses to load a file. Making `libvulkan.so` loadable is a deliberate decision, not a patch.
-* **GLES is not bound either.** `libGLESv2` is in `DT_NEEDED`; the engine may take either path.
-  Which one it takes at runtime **has never been observed** and is the first thing to measure.
-* **`crates/omni-texture`** (735 lines) decodes the APK's ETC1 correctly and is *not connected to a
-  pipeline* — it has no consumer.
-* **No window system integration exists.** `ANativeWindow` is five real symbols over an arena
-  handle; `ANativeWindow_getWidth`/`_getHeight` **refuse** until an embedding calls
-  `Ndk::set_window_geometry`, because there is no surface and inventing `1920x1080` would be a
-  device profile nobody chose.
-* **No Vulkan validation layers are installed on this machine.** That will hurt.
+* `crates/omni-gfx` is real, and it is no longer only the host half: `omni-android` drives it
+  through the `VulkanHost` seam, and `ANativeWindow` geometry comes from a real resizable window
+  rather than a constant.
+* **Zero `egl*` symbols are still bound, and that is now a decision rather than a gap.** The engine
+  bootstraps Vulkan itself through `dlopen`/`dlsym` (decoded at guest `0x02595160`), so the EGL
+  path has never been needed. `libEGL.so`/`libGLESv2.so` remain `DT_NEEDED` and **which path the
+  engine takes at runtime has still never been observed** — the Vulkan census will say, the first
+  run that gets that far.
+* `crates/omni-texture` (735 lines, ETC1 only per D27) still has **no consumer**. It becomes one
+  the moment the engine uploads a texture.
+* **No Vulkan validation layers are installed on this machine.** That is still true, it still
+  hurts, and it has already cost one silent `nvoglv64.dll` crash. `omni_gfx::claim` exists because
+  of it.
 
-So: M6 (a Vulkan or GLES device created through the forwarding layer), M7 (first frame presented)
-and M8 (interactive) are all ahead, and M6 has barely begun. Plan in those terms.
+Honest position, weighted by effort rather than by checklist length: the structurally hard parts —
+no VM, no JVM, no dex interpreter, a JIT with identity mapping, demand-paged guest memory, a
+startup handshake that took three sessions — are behind. What remains is **broad rather than deep**:
+the Vulkan surface an engine drives to produce a frame, which is mechanical (SPIR-V needs no
+translation, the structs are byte-identical, the census names every entry point in call order) and
+large.
 
-## What the last session changed (7 commits, `8a5d372..HEAD`)
+The two named blockers above are the whole critical path. Neither is research.
 
-**`ALooper_pollOnce(-1)` is allowed, on a fact rather than a policy.** The refusal's premise —
-"nothing could ever wake it" — is conditional, and the call can now test it:
-`Filesystem::pipe_writers` counts the descriptors still holding a pipe's write end, and an
-indefinite wait is allowed exactly when one of the looper's own registrations has one. When none
-does the refusal stands and now names every watched descriptor with the count that decided it.
-The wait is sliced at 50 ms and re-reads the stop switch — **below the deadline test, not above
-it**: `pollOnce(0)` is a poll and not a wait, and with the two the other way round teardown turned
-every zero-timeout poll on the game thread into a refusal.
 
-**§8 rows 17-20 are driven from the gate's main thread.** The 23 non-exported `GameActivity`
-natives come from what the engine's own `RegisterNatives` bound (all 24 are recorded), and the
-`jlong` handle sits in `x2` whether they are static or instance — so the caller never has to
-establish which, a distinction `RegisterNatives` does not carry. The row loop **stops at the first
-failure**: these natives hold the glue's own mutex across the call, so a refusal abandons it and
-the next row deadlocks on it. MEASURED — that is how the `pthread_cond_timedwait` gap presented.
+## What this session changed
 
-**The A64 hint instructions are no longer "unsupported".** `YIELD` stopped the guest; it is a hint
-the architecture lets an implementation execute as a `NOP`, and `libroblox.so` spins on one at
-`0x021eba20`. It reached a callback because of an upstream defect, decoded rather than guessed:
-`backend/x64/a64_interface.cpp:273` builds the translator's options from **two** of a three-member
-aggregate, so `TranslationOptions::hook_hint_instructions` keeps its declared default of `true`
-whatever `DynarmicOptions` asks for. The A32 paths do forward it. Handled in the callback rather
-than patched into the vendored tree, because the arm is correct either way.
+Four commits. In the order they matter rather than the order they happened:
 
-**Four new bindings**, each in `BEYOND_THE_PREDICTION` with how it was found.
-`pthread_cond_timedwait` was found as an `Unbound` inside `onStartNative` and then decoded at
-`0x0285f7ec` — the glue's `android_app_set_activity_state`, an absolute `CLOCK_REALTIME` deadline
-two seconds out, whose `cmp w0, #0x6e` is the guest's own agreement with `omni_bionic`'s
-`ETIMEDOUT`. The clock is read back from the cond through `cond::clock_of` rather than assumed.
-`sched_get_priority_max` was the next `Unbound`; `sched_get_priority_min` and `sched_setscheduler`
-were added by decoding their call sites, **and the ledger says so** — `_min` has not yet been
-reached by a run and its entry states that rather than implying otherwise.
+**The hang was never a deadlock, and two instruments now make that class visible.** The census read
+`FROZEN` because it had been switched *off* — `Boundary::census` keeps its counts when the flag
+clears, so "off" and "stalled" are the same reading — while the un-gated `crossings().exits` showed
+1.3 M imports a second. What was actually wrong: **three guest worker threads had been killed by
+this layer and nothing said so**, because every assertion in the gate is about the thread it is
+standing on. One held the future the blocked call was waiting for. Added:
+`omni_bionic::unwind::frames` (a guest frame-pointer walk, so a parked thread names its caller
+rather than a helper with ten call sites) and a gate assertion that fails on any guest thread this
+layer kills. The assertion caught a **fourth** death on its first run, in the gate's *default* path,
+happening on every ordinary run of this suite. `VERIFICATION.md` 15 and 16.
 
-**`eventfd` is a descriptor kind, not a refusal.** Its own refusal named what would end it: the
-table had no kind that could carry a counter with a destructive read. `Entry::readiness` having no
-default arm is what made adding one a decision — it refused to compile until `pread` and `fstat`
-had answers too.
+**`omni_mem::scan_reach`.** `GuestMem::cstr` bounded its walk with `admit(addr, 1, Read)`, which
+reports the end of the first *entry* — and a lazy commit carves one mapping into a run of entries.
+An ordinary NUL-terminated log line was refused "with no NUL in the first 96 bytes"; 96 was the
+distance to the next granule.
 
-**The diagnostics that found the stall**, all new: `Bionic::guest_thread_list`,
-`Bionic::futex_calls` (recorded **on the way in**, because a record written on the way out is
-written by every call except the ones that matter), `AddressFutex::parked_addresses`,
-`AddressFutex::indefinite_parks`, `ImportCall::caller`, and `stall_report` in the gate.
+**Networking, D30.** The owner withdrew Global Constraint 8. `omni-platform::net` is the only place
+a socket call is made, sockets joined the descriptor table `fs` already owned, and the blanket
+refusal was replaced by a policy an embedding sets. The guest's own OpenSSL now completes a real
+TLS session.
 
-> **One operational hazard worth knowing.** The gate's watchdog ends a hung run with
-> `std::process::exit(101)`, which skips every `Drop` — so each hung run leaves its ~104 MB
-> extracted-library scratch directory behind in `%TEMP%`. Enough of them filled a 930 GB disk
-> during this session and cargo failed with `os error 112`. `%TEMP%\omni-*` is safe to delete
-> between runs.
+**`Filesystem::open_misses`, and the certificate bundle.** An `ENOENT` is the quietest failure this
+runtime can produce — `open` answers it correctly, the guest handles it correctly, and the
+consequence lands elsewhere. Recording every missing path named
+`/data/data/com.roblox.client/files/exe/cacert.pem` in one run. The APK ships it; the Java side
+places it on a device; D7 says the Java side is defined rather than executed, so the host does it.
+`HttpError: Unknown` became `HTTP 400`.
+
+**Vulkan, stages 1–4.** The loader (the engine bootstraps Vulkan itself; decoded at `0x02595160`),
+a real `VkInstance`, a real surface on the real window, a real device and queue, and a presented
+frame with its pixels asserted. The `VulkanHost` seam keeps `omni-gfx` a dev-dependency, so no
+`ash` or `libloading` reaches the adapter's normal graph on any target.
+
+**D4 amendment 1**, which corrects this project's own documents: identity fastmem means `admit`
+does **not** govern the guest's own loads and stores. Omnidroid is a compatibility layer, not a
+sandbox.
+
+**Nine symbols this session were already implemented and already unit-tested in `omni-bionic`, and
+had simply never been wired to a symbol.** The primitives were written against the *import list*;
+the wiring was done against *what the run had reached*. Expect more of these, and expect the gate to
+name each one.
+
 
 ## Verification state
 
-**1,445 passing, 0 failing, 36 ignored** across 119 targets (`cargo test --workspace --release`).
-Was 1,388 at the start of the session; the extra ignored are the 19 live window and renderer tests, which **fail rather than skip** when run without `OMNI_GFX_WINDOW_TESTS=1`. Clippy is clean at `-D warnings` across all targets, and
-`cargo doc` adds no warning in any file this session touched.
+Run the suite yourself before trusting a number here; the point of this section is the *shape*, not
+the totals. As of the last full run: `cargo test --workspace --release` green, clippy clean at
+`-D warnings` across all targets, `cargo doc` adds no warning in any file this session touched, and
+`cargo build --workspace --no-default-features` is clean.
 
-**`tools/mutate.py` holds 471 rows**, 25 added this session. That is the
-largest outstanding debt and it has grown: the M6 work landed sixteen new tests and five new
-observable behaviours with no mutation rows behind them. The carried-forward debt is unchanged and
-now has company:
+The live graphics and window tests **fail rather than skip** when run without
+`OMNI_GFX_WINDOW_TESTS=1`, which is `VERIFICATION.md` entry 4 applied deliberately: a skipped
+fixture is a failure, so the gate for a test that needs a GPU panics rather than passing quietly.
 
-* **`--only sorder` and `--only jmid` must be re-run on an exclusive tree**, for the reasons the
-  previous session recorded.
-* **The whole 446-row table has never been run in one pass.**
-* **New, owed by this session:** rows for the indefinite-`pollOnce` wake-source test and its
-  slice/stop-switch ordering, for `cond::clock_of`'s field offset, for the scheduling band's two
-  endpoints, for `eventfd`'s eight-byte rule and destructive read, and for the hint arm (a row
-  that turns `is_hint` into `false` must be caught by `tests/hints.rs`).
+**`tools/mutate.py` is the largest outstanding debt and it keeps growing**, because every session
+adds behaviour faster than rows. It now holds roughly 500 rows. What is owed:
+
+* **The whole table has never been run in one pass.** Per-prefix runs have been.
+* **Five rows are stale in files nobody is editing** — listed under "Still open" below. Entry 8's
+  remedy is a whole-table pre-flight, which is cheap and finds them all at once.
+* **`--only sorder` and `--only jmid` must be re-run on an exclusive tree.**
+* Rows are owed for this session's newest behaviour: the Vulkan handle registries (a forged
+  non-dispatchable handle naming *another object* is the silent failure this guards), the
+  extension-name rewrite log, the `counted::enumerate` two-count idiom, and the swapchain claim.
+
 
 ## Still open, carried forward
 
-* **`nativeSetPlatformHeadersWithIdfa` hands `strchr` a pointer mapped nowhere.** 20 of 21 scripted
-  downcalls return; this is the one that does not. **Whose pointer it is has never been
-  established.** §8 step 9.
+**Closed since this list was written**, so nobody re-opens them: `nativeSetPlatformHeadersWithIdfa`
+returns (it was `strchr` with no terminator arm, and 21 of 21 scripted downcalls now return); the
+`ALooper_pollOnce(-1)` question; §8 rows 17-22; the "two idle workers" deadlock, which was never a
+deadlock (see D4 amendment 1 and `VERIFICATION.md` entries 15 and 16).
+
+**Live, and each one is a real finding rather than a chore:**
+
+* **Five mutation rows are stale in files nobody is editing**: `android-mem-A1` (`src/mem.rs`),
+  `boundary-A11`, `boundary-A12` (`src/boundary.rs`), `dl-A5` (`bionic/dl.rs`, staled by the Vulkan
+  work), `looper-B2` (`ndk/looper.rs`, **committed** staleness -- its pattern matches zero times in
+  `HEAD` too). `VERIFICATION.md` entry 8's remedy is a whole-table pre-flight; run one.
+* **The 498-row mutation table has never been run in one pass.** Per-prefix runs have been.
+* **`sockcfg-A3` is a kept, measured MISS**: Winsock refuses a zero keep-alive figure itself with
+  an error this seam maps to `EINVAL`, so no test on this host can separate the check from the
+  host's own refusal. The doc comment says what would make it load-bearing.
+* **One flake, recorded rather than chased**: one run in three ended with a guest thread taking a
+  `MemoryFault` at teardown -- a futex-woken thread reading memory already unmapped.
+* **`getpeername`, `strspn`, and the rest of the socket group are deliberately unbound.** Each has
+  a working primitive and no run has reached it. That is the rule, not an oversight.
+* **`GfxVulkanHost` has no `vkDestroyInstance`/`vkDestroySurfaceKHR`/`vkDestroyDevice`**, so those
+  three accumulate. Stage 4's seven handle families do support removal.
+* **`Vulkan::set_host` is last-writer-wins across five handle families.** A replaced host leaves
+  tokens the new host never issued; each resolves to a refusal by name. Documented, not fixed.
+* **`/proc/meminfo` and `/proc/self/statm` are opened and missing.** The telemetry thread logs and
+  continues; not blocking. If ever answered, they must come from `Bionic::memory_budget()` and
+  `omni_mem::process_commit_charge()`, never invented.
+* **`sched_yield` runs at ~20 M per run.** Unchanged for several milestones; a guest spin loop.
+* **`nativeSetPlatformHeadersWithIdfa`'s headers may be why the settings request is a 400.**
+  Unverified -- it returns, but what it set has never been read back.
 * **W1b** — `%.Ne/E/g/G/a/A` with a precision above 64 KiB still refuses by name. `format_exp`
   carries the mantissa through `10u64.pow(precision.min(15))`, so past fifteen places this engine's
   digits are *already* not `vsnprintf`'s; under a budget those wrong digits would become visible.
