@@ -346,6 +346,12 @@ impl Scratch {
         // `/data/app/android`. What that directory holds is a step-13 question.
         "data/app/android",
         "storage/emulated/0/Android/data/com.roblox.client",
+        // Since the asset path became the decoded one (`script::ASSET_PATH`,
+        // `app_assets/content`): the Java side's three directories, whose `android` sibling is
+        // the `dirname(assetPath)/android` above for the new path.
+        "data/data/com.roblox.client/app_assets/ExtraContent",
+        "data/data/com.roblox.client/app_assets/android",
+        "data/data/com.roblox.client/app_assets/content",
     ];
 
     fn new(tag: &str) -> Scratch {
@@ -525,7 +531,7 @@ fn jni_on_load_returns_jni_version_1_6_and_the_scripted_sequence_runs() {
         census.get("AttachCurrentThread")
     );
 
-    // ---- steps 7-12: the scripted sequence --------------------------------------------------
+    // ---- steps 7-11: the scripted sequence (step 12 waits for the engine) -------------------
     let outcomes = {
         let _bionic = guest.bionic.activate().expect("publish the bionic instance");
         let _jni = guest.jni.activate().expect("publish the JNI instance");
@@ -659,7 +665,8 @@ M4 IMPORT CENSUS: {} distinct imported symbols called across the whole run
     assert_eq!(live_pins, 0, "{pinned_bytes} bytes are still pinned after the whole sequence");
 }
 
-/// The 21 scripted symbols all exist in the real binary, and each is at a distinct address.
+/// The 21 scripted symbols -- [`script::SEQUENCE`]'s 20 and [`script::ENGINE_SETTINGS`]'s one --
+/// all exist in the real binary, and each is at a distinct address.
 ///
 /// Separate from the gate because it needs the ELF and **not** the run: a symbol table check
 /// that had to pay for 3,594 initializers would not be run when it was the thing being changed.
@@ -681,7 +688,7 @@ fn every_scripted_symbol_exists_in_the_real_binary() {
     );
 
     let mut addresses = std::collections::BTreeSet::new();
-    for step in script::SEQUENCE {
+    for step in script::SEQUENCE.iter().chain(script::ENGINE_SETTINGS) {
         let symbol = step.symbol();
         let at = exports.get(symbol.as_str()).copied().unwrap_or_else(|| {
             panic!(
@@ -695,7 +702,7 @@ fn every_scripted_symbol_exists_in_the_real_binary() {
     }
     assert_eq!(
         addresses.len(),
-        script::SEQUENCE.len(),
+        script::SEQUENCE.len() + script::ENGINE_SETTINGS.len(),
         "two scripted downcalls resolve to the same address, so one of them is mangled wrong"
     );
 

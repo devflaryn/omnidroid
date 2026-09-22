@@ -12,9 +12,10 @@
 //!
 //! # Where it stops
 //!
-//! At step 12. Step 13 is `initializeNativeCode`, which needs `ALooper`, `AAssetManager` and
-//! `ANativeWindow` — see this module's parent for why reaching it without a looper produces
-//! §8.1's fourth failure mode, a **silent** `return 0`.
+//! At step 11 -- step 12 waits for the engine, see [`ENGINE_SETTINGS`]. Step 13 is
+//! `initializeNativeCode`, which needs `ALooper`, `AAssetManager` and `ANativeWindow` — see this
+//! module's parent for why reaching it without a looper produces §8.1's fourth failure mode, a
+//! **silent** `return 0`.
 //!
 //! # The name mangling is the short form, and that is measured rather than assumed
 //!
@@ -109,6 +110,18 @@ pub fn mangle(class: &str, member: &str) -> String {
 /// is this one — three drifted duplicates of a figure have already appeared in this project.
 pub const APP_VERSION: &str = "2.738.1397";
 
+/// `Build.VERSION.SDK_INT` of the Android this host presents, as the decimal string the APK sends.
+///
+/// **One figure in three places, stated once.** It is what an embedding answers for
+/// `ro.build.version.sdk` (and so `activity->sdkVersion`), and it is what `DeviceParams.osVersion`
+/// and `DeviceStaticParams.osVersion` carry: `fi.o.d()` and `fi.o.e()` both store
+/// `Integer.toString(Build.VERSION.SDK_INT)` there -- the API level, not the release name.
+/// MEASURED when the two disagreed (`osVersion` said `"13"`): the engine `strtol`s that string
+/// (`0x02593f68`), compares it with its minimum API level for Vulkan (`0x0258eaa8`), and gave up
+/// on Vulkan -- `Mode 6 failed: Android version is too old to activate Vulkan` -- for EGL.
+/// 33 is Android 13.
+pub const ANDROID_SDK_INT: &str = "33";
+
 /// What the host tells the engine this *application* is called.
 ///
 /// # This one string decided whether the client-settings fetch could ever succeed
@@ -158,7 +171,8 @@ pub const APP_VERSION: &str = "2.738.1397";
 /// its third.
 pub const CHANNEL_PLATFORM_NAME: &str = "GoogleAndroidApp";
 
-/// §8 steps 7-12, in order. Every edge is VERIFIED from dex bytecode (Section J).
+/// §8 steps 7-11, in order. Every edge is VERIFIED from dex bytecode (Section J). Step 12 is
+/// [`ENGINE_SETTINGS`], which a device sends after step 13.
 pub static SEQUENCE: &[Downcall] = &[
     // ---- step 7: RobloxApplication.onCreate ----------------------------------------------
     Downcall {
@@ -316,9 +330,20 @@ pub static SEQUENCE: &[Downcall] = &[
         member: "nativeSetAssetPath",
         descriptor: "(Ljava/lang/String;)V",
         // **A directory, not the apk file.** MEASURED: passing the apk path made the engine
-        // throw `'/data/app/com.roblox.client/base.apk' is not a directory`. §8 step 10 says
-        // only "nativeSetAssetPath(String)"; what the string is was not in the analysis.
-        args: &[ScriptArg::Text("/data/app/com.roblox.client")],
+        // throw `'/data/app/com.roblox.client/base.apk' is not a directory`.
+        //
+        // **And which directory is DECODED, not chosen** -- the value this used to hold,
+        // `/data/app/com.roblox.client`, was a guess that satisfied "is a directory" and nothing
+        // else. `MainGameActivity.K2` passes `vk.b.n()`, the Java side's `unpackAssets`: it
+        // takes `Context.getDir("assets")` -- `/data/data/<package>/app_assets` -- creates
+        // `ExtraContent`, `android` and `content` under it (`vk.b$b`), and hands over
+        // `app_assets/content` (`vk.b$g`, `resolve("content").toRealPath()`). The engine then
+        // derives its extra-content folder from it and sets one only if `ExtraContent/` exists
+        // (`0x236fbbc`-`0x236fc4c`) -- MEASURED with the guess: `setExtraAssetFolder ` empty,
+        // and `rbxasset://places/Mobile.rbxl`, which lives in `ExtraContent/places`, beyond reach.
+        // A device passes the `toRealPath` spelling, `/data/user/0/...`, of this same
+        // directory; this root has no such link and nothing measured compares the two.
+        args: &[ScriptArg::Text(ASSET_PATH)],
     },
     Downcall {
         step: 10,
@@ -361,16 +386,45 @@ pub static SEQUENCE: &[Downcall] = &[
         descriptor: "(Ljava/util/List;)V",
         args: &[ScriptArg::Object("java/util/List")],
     },
-    // ---- step 12: the app-bridge init parameters ------------------------------------------
-    Downcall {
-        step: 12,
-        caller: "com/roblox/client/startup/MainGameActivity$Companion.e",
-        class: "com/roblox/client/startup/MainGameActivity",
-        member: "nativeAppBridgeSetInitParams",
-        descriptor: "(Lcom/roblox/engine/jni/autovalue/InitParams;)V",
-        args: &[ScriptArg::Object("com/roblox/engine/jni/autovalue/InitParams")],
-    },
 ];
+
+/// §8 step 12, the app-bridge init parameters -- which a device sends **after** the engine
+/// exists, so it is not in [`SEQUENCE`].
+///
+/// # The engine drops them when they arrive first, and says so
+///
+/// MEASURED, with this downcall at the end of [`SEQUENCE`] (before step 13 creates anything):
+///
+/// ```text
+/// [FLog::NativeMain] [android_main] nativeAppBridgeSetInitParams: ERROR: nativeEngine is not created!
+/// ```
+///
+/// `Java_..._nativeAppBridgeSetInitParams` (`0x02bcc814`) builds the settings and then, at
+/// `0x02bcccc8`, loads the `NativeEngine*` global at `0x0683d888`: null logs the line above and
+/// discards them; non-null calls `NativeEngine::setEngineSettings` (`0x02bcddac`). That is the
+/// **only** caller of `nativeActivity_onEngineSettingsReceived` (`0x02bd1c38`), which sets the
+/// `NativeDataModelManager` byte at `+0x288`. `continueAfterFlagsLoaded_` (`0x02bd3b58`) sets its
+/// neighbour at `+0x289`; whichever of the two lands second moves the state to 3, and the main
+/// loop's step (`0x02bd1cf0`) calls `initEngine_` only in state 3. Dropped here, the settings
+/// never arrive, `initEngine_` never runs, and the Lua app is never initialised -- MEASURED as a
+/// null `SingleSurfaceAppImpl + 0x28` (set only by `initializeWithAppStarter`) read when a later
+/// start reached `userDidLogin`.
+///
+/// # Why after, from the dex
+///
+/// The caller is `MainGameActivity.E2` ("setInitParamsForEngine"), reached from `B2` once the
+/// assets are unpacked -- work `onCreate` starts only after `super.onCreate`, which is
+/// `GameActivity.onCreate` and so `initializeNativeCode`, whose thread creates the engine. `E2`
+/// runs once (an `AtomicBoolean` guards it). The host sends this after the engine has answered
+/// lifecycle rows, which is the earliest point it can know the engine exists.
+pub static ENGINE_SETTINGS: &[Downcall] = &[Downcall {
+    step: 12,
+    caller: "com/roblox/client/startup/MainGameActivity$Companion.e",
+    class: "com/roblox/client/startup/MainGameActivity",
+    member: "nativeAppBridgeSetInitParams",
+    descriptor: "(Lcom/roblox/engine/jni/autovalue/InitParams;)V",
+    args: &[ScriptArg::Object("com/roblox/engine/jni/autovalue/InitParams")],
+}];
 
 /// What the host hands `nativeInitClientSettings` as the client-settings document.
 ///
@@ -440,6 +494,20 @@ pub const CLIENT_SETTINGS: &str = r#"{"applicationSettings":{}}"#;
 /// second copy — `APP_VERSION`'s doc records what three drifted duplicates of one figure cost.
 pub const CLIENT_SETTINGS_APPLICATION: &str = CHANNEL_PLATFORM_NAME;
 
+/// `nativeSetAssetPath`'s argument: the Java side's unpacked-assets directory. See its row in
+/// [`SEQUENCE`] for how it was decoded; an embedding creates it and its two siblings, as the Java
+/// side does ([`ASSET_DIRECTORIES`]).
+pub const ASSET_PATH: &str = "/data/data/com.roblox.client/app_assets/content";
+
+/// The three directories `vk.b$b` creates under `Context.getDir("assets")`, in its order. Their
+/// existence is load-bearing: the engine sets its extra-content folder only if `ExtraContent`
+/// is there.
+pub const ASSET_DIRECTORIES: &[&str] = &[
+    "/data/data/com.roblox.client/app_assets/ExtraContent",
+    "/data/data/com.roblox.client/app_assets/android",
+    "/data/data/com.roblox.client/app_assets/content",
+];
+
 /// §8 rows 21-22: the client-settings phase, and the app start it unblocks.
 ///
 /// # Why this is a second table and not more rows on [`SEQUENCE`]
@@ -501,6 +569,9 @@ pub static FLAGS_AND_START: &[Downcall] = &[
 /// were read out of `classes2.dex` and are declared in [`super::classes::DECLARED`], because the
 /// engine reads them field by field and a missing one is one refusal per member.
 pub static SCRIPT_CLASSES: &[&str] = &[
+    // `RobloxApplication.onCreate`'s `JNIAAssetManagerSetup.initNative(AssetManager)`: a static
+    // native on a class nothing looks members up on, like the rest of this list.
+    "com/roblox/client/JNIAAssetManagerSetup",
     "com/roblox/universalapp/linking/JNIBaseUrlProtocol",
     "com/roblox/universalapp/linking/JNIWebLoginProtocol",
     "com/roblox/engine/jni/NativeReportingInterface",
@@ -651,7 +722,7 @@ mod tests {
     /// what Section G tags each of them. A name that needed an escape would be caught here.
     #[test]
     fn the_scripted_symbols_are_the_short_mangling_of_their_members() {
-        for step in SEQUENCE {
+        for step in SEQUENCE.iter().chain(ENGINE_SETTINGS) {
             let symbol = step.symbol();
             assert!(symbol.starts_with("Java_"), "{symbol}");
             assert!(!symbol.contains('/'), "{symbol}");
@@ -693,8 +764,11 @@ mod tests {
         assert_eq!(count(9), 11, "§8 step 9: `11 downcalls, all (String…)V`");
         assert_eq!(count(10), 2, "nativeSetAssetPath and nativePreloadFlagOverrides");
         assert_eq!(count(11), 4, "nativeSetDeviceInfo, External, Preferences, ExitReasons");
-        assert_eq!(count(12), 1, "nativeAppBridgeSetInitParams");
-        assert_eq!(SEQUENCE.len(), 21);
+        // Step 12 is not here: the engine drops it before step 13 (see `ENGINE_SETTINGS`).
+        assert_eq!(count(12), 0, "nativeAppBridgeSetInitParams waits for the engine");
+        assert_eq!(SEQUENCE.len(), 20);
+        assert_eq!(ENGINE_SETTINGS.len(), 1);
+        assert_eq!(ENGINE_SETTINGS[0].member, "nativeAppBridgeSetInitParams");
         // In order: a script that ran step 12 before step 9 would be a different script.
         for pair in SEQUENCE.windows(2) {
             assert!(pair[0].step <= pair[1].step, "the sequence must be in step order");
@@ -727,7 +801,7 @@ mod tests {
     fn every_class_the_script_names_is_declarable() {
         let declared: Vec<&str> =
             super::super::classes::DECLARED.iter().map(|spec| spec.name).collect();
-        for step in SEQUENCE {
+        for step in SEQUENCE.iter().chain(ENGINE_SETTINGS) {
             assert!(
                 declared.contains(&step.class) || SCRIPT_CLASSES.contains(&step.class),
                 "{} is called on an undeclared class",

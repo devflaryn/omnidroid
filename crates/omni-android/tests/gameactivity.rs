@@ -212,7 +212,7 @@ const FLAGS_LOADED_OFFSET: usize = 0x0727_39d4;
 /// range GameActivity 2.x supports and old enough that nothing requires an API this layer has not
 /// been asked for yet. Reported rather than assumed correct: what the engine *does* with it is
 /// one of the measurements this gate takes.
-const SDK_VERSION: &str = "33";
+const SDK_VERSION: &str = script::ANDROID_SDK_INT;
 
 /// **Serializes every test in this binary**, as M3's and M4's gates do.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -332,9 +332,17 @@ impl Guest {
         let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
         let space = Arc::new(GuestSpace::new().expect("reserve a guest address space"));
 
+        // **As many CPUs as bionic has thread blocks.** The backend's default is 32; MEASURED, once
+        // the Lua app was starting, the engine's 33rd concurrent thread failed to get a TLS block
+        // and a `boost::thread_resource_error` took down the thread that asked (RBXCRASH), while
+        // bionic's arena had room for 64. Ids are recycled on exit, so this is concurrency.
+        let options = DynarmicOptions {
+            max_threads: u32::try_from(omni_android::bionic::MAX_GUEST_THREADS)
+                .expect("the thread count fits"),
+            ..DynarmicOptions::default()
+        };
         let backend = Arc::new(
-            DynarmicBackend::new(Arc::clone(&space), DynarmicOptions::default())
-                .expect("a translating backend"),
+            DynarmicBackend::new(Arc::clone(&space), options).expect("a translating backend"),
         );
         assert!(backend.owns_guest_paging(), "this guest has no demand pager");
         assert!(backend.slice_invariant_armed(), "M2's per-slice callback invariant is not armed");
@@ -412,13 +420,17 @@ impl Guest {
         // named the parked thread, its condvar and its mutex, which is the only reason it took
         // three minutes to find.
         let host: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&backend) as _;
-        bionic
-            .set_thread_host(
-                ThreadHost::new(host)
-                    .with_instance(jni.thread_instance())
-                    .with_instance(ndk.thread_instance()),
-            )
-            .expect("a thread host");
+        let mut thread_host = ThreadHost::new(host)
+            .with_instance(jni.thread_instance())
+            .with_instance(ndk.thread_instance());
+        // **And Vulkan, when it is bound.** MEASURED, the first run in which the engine chose
+        // Vulkan: its render thread's `vkGetInstanceProcAddr` was refused -- "no Vulkan loader
+        // instance is published to this thread" -- because the engine creates its device on a
+        // guest thread it spawned, not on the one the gate calls from.
+        if let Some(vulkan) = &vulkan {
+            thread_host = thread_host.with_instance(vulkan.thread_instance());
+        }
+        bionic.set_thread_host(thread_host).expect("a thread host");
 
         ndk.set_asset_source(Arc::new(ApkAssets::open())).expect("the real APK's assets");
         ndk.set_configuration(device_configuration());
@@ -618,6 +630,11 @@ impl Scratch {
         "storage/emulated/0/Android/obb/com.roblox.client",
         // The engine's own TLS store lives here; see `CA_BUNDLE_IN_APK`.
         "data/data/com.roblox.client/files/exe",
+        // The Java side's unpacked-assets tree -- `script::ASSET_DIRECTORIES` has the decoding.
+        // The engine sets its extra-content folder only if `ExtraContent` exists.
+        "data/data/com.roblox.client/app_assets/ExtraContent",
+        "data/data/com.roblox.client/app_assets/android",
+        "data/data/com.roblox.client/app_assets/content",
     ];
 
     /// Where the APK keeps its certificate authorities, and where the engine looks for them.
@@ -810,6 +827,97 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     .expect("§8 step 6: JNI_OnLoad must return");
     assert_eq!(returned.as_i32(), slots::JNI_VERSION_1_6, "§8 step 6");
     stall_report(&guest, "after JNI_OnLoad, before step 7");
+
+    // ---- `RobloxApplication.onCreate`'s two native setups -----------------------------------
+    //
+    // **Decoded from `classes2.dex`, and missing until the Lua app could not find its content.**
+    // Once native libraries are loaded, `RobloxApplication.onCreate` -- the app's first code, on
+    // both of its branches -- calls `JNIAAssetManagerSetup.a(context)`, which is
+    // `initNative(context.getAssets())` ("Initialize Android AssetReader"), and then
+    // `LocalStorageManager.a(context)`, which is `initStorageManagerNativeV3(getAssets(),
+    // getFilesDir(), getCacheDir())` on the `LocalStorageManager` singleton. The second is what
+    // builds the engine's `RBX::AndroidLocalStorageManager`, whose slot `0x38` (`0x0241b0c8`)
+    // opens content out of the APK with `AAssetManager_open` under `android/`, `ExtraContent/` and
+    // `content/`. MEASURED without them: `[FLog::LocalStorageHandler] Not available on the current
+    // platform.`, `Unable to load rbxasset://configs/UniversalAppPatchConfig/...`, no
+    // `AAssetManager_open` at all, and `initializeWithAppStarter` returning before it instantiated
+    // the controllers -- a null `UserController` read at `SingleSurfaceAppImpl + 0x440`.
+    //
+    // The directories are the ones the script's step 9 hands the engine; the `AssetManager` is a
+    // Java one `AAssetManager_fromJava` maps onto the real APK's assets, as step 13's is.
+    //
+    // **`LocalStorageManager.getAllocatableBytes()`** is `new StatFs(Environment
+    // .getDataDirectory().getPath()).getAvailableBytes()` in the dex -- `f_bavail * f_bsize` of the
+    // volume `/data` is on. That is a fact about this host, so the embedding measures it here,
+    // through the same `statvfs` the guest's own calls get; MEASURED reader: the engine, once the
+    // storage manager existed. A snapshot taken at setup, which is what a JNI answer can hold.
+    {
+        let volume = guest
+            .bionic
+            .filesystem()
+            .expect("the gate roots a filesystem")
+            .statvfs(b"/data")
+            .expect("the volume /data is on");
+        let available = volume.blocks_available.saturating_mul(volume.block_size);
+        guest
+            .jni
+            .define_method(
+                "com/roblox/client/LocalStorageManager",
+                "getAllocatableBytes",
+                "()J",
+                false,
+                Answer::Long(i64::try_from(available).unwrap_or(i64::MAX)),
+            )
+            .expect("getAllocatableBytes is on the measured surface");
+    }
+    {
+        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+        let _jni = guest.jni.activate().expect("publish the JNI instance");
+        let _ndk = guest.ndk.activate();
+        let asset_manager = guest.jni.new_object(ASSET_MANAGER_CLASS).expect("a Java AssetManager");
+        let setup_class = guest
+            .jni
+            .class_reference("com/roblox/client/JNIAAssetManagerSetup")
+            .expect("declared by the script's classes");
+        let storage = guest
+            .jni
+            .new_object("com/roblox/client/LocalStorageManager")
+            .expect("the LocalStorageManager singleton");
+        let files = guest.jni.new_string("/data/data/com.roblox.client/files").expect("filesDir");
+        let cache = guest.jni.new_string("/data/data/com.roblox.client/cache").expect("cacheDir");
+        for (symbol, args) in [
+            (
+                "Java_com_roblox_client_JNIAAssetManagerSetup_initNative",
+                vec![
+                    GuestArg::Pointer(guest.jni.env_for(0)),
+                    GuestArg::Int(setup_class),
+                    GuestArg::Int(asset_manager),
+                ],
+            ),
+            (
+                "Java_com_roblox_client_LocalStorageManager_initStorageManagerNativeV3",
+                vec![
+                    GuestArg::Pointer(guest.jni.env_for(0)),
+                    GuestArg::Int(storage),
+                    GuestArg::Int(asset_manager),
+                    GuestArg::Int(files),
+                    GuestArg::Int(cache),
+                ],
+            ),
+        ] {
+            let target = *guest.exports.get(symbol).expect("exported by libroblox.so");
+            let result = guest.boundary.call_guest(&mut cpu, symbol, target, &args, ON_LOAD_BUDGET);
+            let _ = writeln!(
+                std::io::stderr(),
+                "RobloxApplication.onCreate: {symbol} -> {}",
+                match &result {
+                    Ok(_) => "returned".to_string(),
+                    Err(error) => format!("{error}"),
+                }
+            );
+            result.unwrap_or_else(|error| panic!("RobloxApplication.onCreate: {symbol}: {error}"));
+        }
+    }
     let _ = writeln!(
         std::io::stderr(),
         "after JNI_OnLoad: spin lock {}, count {}",
@@ -1583,6 +1691,19 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 );
             }
             let _ = writeln!(out, "NDK CENSUS: {:?}", ndk.census());
+            // **The paths the engine asked for and did not get**, here as well as at teardown:
+            // a run the watchdog ends never reaches teardown, and an `ENOENT` is the quietest
+            // failure this runtime has (see `Filesystem::open_misses`).
+            if let Some(fs) = bionic.filesystem() {
+                let misses: Vec<String> = fs
+                    .open_misses()
+                    .iter()
+                    .map(|path| String::from_utf8_lossy(path).into_owned())
+                    .filter(|path| !path.starts_with("/proc/") && !path.starts_with("/sys/"))
+                    .collect();
+                let _ = writeln!(out, "MISSING PATHS outside /proc and /sys ({}): {misses:?}", misses.len());
+            }
+            death_contexts(&mut out, boundary.mem(), image_base, &bionic.guest_thread_failures());
             let _ = writeln!(out, "================ ending the run ================");
             let _ = out.flush();
             // **Before the `exit`, because the `exit` runs no destructors.** See `Scratch::new`,
@@ -1722,6 +1843,50 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
     }
 
+    // ---- §8 step 12: the engine settings, once there is an engine to take them -------------
+    //
+    // `MainGameActivity.E2` sends these after `super.onCreate` has created the engine; sent
+    // before, the engine logs `nativeEngine is not created!` and drops them, and `initEngine_`
+    // never runs (see `script::ENGINE_SETTINGS`). The lifecycle rows above are the proof the
+    // engine exists: each waits for the game thread to take its command, and that thread creates
+    // the `NativeEngine` before its loop. Asserted by the engine's own words, not by a return.
+    if row_outcomes.iter().all(|(_, result)| result.is_ok()) {
+        let dropped_before = count_log(&guest, "nativeEngine is not created");
+        let outcomes = {
+            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+            let _jni = guest.jni.activate().expect("publish the JNI instance");
+            let _ndk = guest.ndk.activate();
+            script::run(
+                &guest.jni,
+                &guest.boundary,
+                &mut cpu,
+                &|symbol| guest.exports.get(symbol).copied(),
+                script::ENGINE_SETTINGS,
+                0,
+            )
+            .expect("building the step-12 arguments must not fail")
+        };
+        for outcome in &outcomes {
+            let _ = writeln!(
+                std::io::stderr(),
+                "§8 step 12: {} -> {}",
+                outcome.symbol,
+                match &outcome.result {
+                    Ok(()) => "returned".to_string(),
+                    Err(error) => format!("{error}"),
+                }
+            );
+            if let Err(error) = &outcome.result {
+                panic!("§8 step 12: `{}` failed: {error}", outcome.symbol);
+            }
+        }
+        assert_eq!(
+            count_log(&guest, "nativeEngine is not created"),
+            dropped_before,
+            "§8 step 12: the engine dropped its settings -- it did not exist yet"
+        );
+    }
+
     // ---- §8 rows 21-22: the client settings the engine is waiting for -----------------------
     //
     // **This is §8.1's sixth failure mode, driven rather than waited out.** With the window
@@ -1768,12 +1933,18 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         // Row 21's second downcall on its own first, so the flags are received...
         let mut all = drive_flag_rows(&guest, &mut cpu, &script::FLAGS_AND_START[1..2]);
         if all.iter().all(|outcome| outcome.result.is_ok()) {
-            // ...then the surface again, now that the engine will accept it. Only the two rows
-            // that carry the window: the lifecycle state is already where it should be, and
+            // ...then the surface again, now that the engine will accept it. Only the row that
+            // carries the window's size: the lifecycle state is already where it should be, and
             // re-sending `onStart`/`onResume` would be telling the engine about a transition
             // that did not happen.
+            //
+            // **Not `onSurfaceCreatedNative`.** A live `SurfaceView` does not create its surface
+            // twice, and the glue answers a second one for a window it already holds with
+            // `APP_CMD_TERM_WINDOW` then `APP_CMD_INIT_WINDOW`. MEASURED, once the engine had its
+            // settings and ran `initEngine_` and `initializeLuaApp_`: the TERM reached it as
+            // `nativeActivity_onKillSurface: state:5` and `pauseExperienceOrLuaApp_` -- the gate
+            // pausing the Lua app it had just initialised.
             for (member, descriptor, tail) in [
-                ("onSurfaceCreatedNative", "(JLandroid/view/Surface;)V", vec![GuestArg::Int(surface)]),
                 (
                     "onSurfaceChangedNative",
                     "(JLandroid/view/Surface;III)V",
@@ -1874,12 +2045,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                      be written yet, and the delivery below is racing it")
                 );
                 let refusals_before = count_log(&guest, "Flags-Not-Received");
+                // Not `onSurfaceCreatedNative`, for the reason the pre-fetch delivery above gives.
                 for (member, descriptor, tail) in [
-                    (
-                        "onSurfaceCreatedNative",
-                        "(JLandroid/view/Surface;)V",
-                        vec![GuestArg::Int(surface)],
-                    ),
                     (
                         "onSurfaceChangedNative",
                         "(JLandroid/view/Surface;III)V",
@@ -1889,6 +2056,19 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                             GuestArg::Int(surface_width as u64),
                             GuestArg::Int(surface_height as u64),
                         ],
+                    ),
+                    // **The third call a device's `SurfaceView` makes, and the one that starts the
+                    // engine's surface path.** `SurfaceHolder.Callback2.surfaceRedrawNeeded`
+                    // follows `surfaceChanged`, and `GameActivity` forwards it as this native.
+                    // DECODED: `nativeActivity_onSurfaceChanged` (`0x2bd3000`) is called from the
+                    // command handler only after `APP_CMD_WINDOW_INSETS_CHANGED` or
+                    // `APP_CMD_WINDOW_REDRAW_NEEDED` (`0x2bcdb08`), or when a game loads
+                    // (`0x2bd3938`). MEASURED without it: the window was accepted -- zero
+                    // `Flags-Not-Received` either side -- and nothing asked for a renderer in 20 s.
+                    (
+                        "onSurfaceRedrawNeededNative",
+                        "(JLandroid/view/Surface;)V",
+                        vec![GuestArg::Int(surface)],
                     ),
                 ] {
                     let target = native(member, descriptor);
@@ -2002,6 +2182,22 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // back and leave this comment claiming it had been fixed.
     guest.bionic.stop_guest_threads();
     let stopped = guest.bionic.join_guest_threads(std::time::Duration::from_secs(60));
+    // **Where each thread that would not stop is, and what killed the ones that died** -- printed
+    // before the assertion below, which ends the run and would otherwise take both with it.
+    if !stopped {
+        let mut out = std::io::stderr();
+        for report in guest.boundary.threads() {
+            let _ = writeln!(
+                out,
+                "  NOT STOPPED? guest thread {:#x} last crossed {:?} from link {:#x}, {}",
+                report.guest_thread,
+                report.symbol,
+                report.caller.wrapping_sub(guest.object.base),
+                if report.crossings > report.exits { "INSIDE THE HANDLER" } else { "in guest code" }
+            );
+        }
+    }
+    report_dead_guest_threads(&guest, "after the stop request");
     {
         let mut out = std::io::stderr();
         // **`report` runs too early to see any of this, and that is how a defect hid here.**
@@ -2155,6 +2351,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // No allowlist, for the reason the JNI-miss assertion below gives: a thread this layer killed
     // is a defect in this layer, and one that is genuinely expected belongs here by name beside
     // its evidence, never as a relaxed bound.
+    // (Their stacks and death contexts were printed straight after the stop request, above.)
     let dead = guest.bionic.guest_thread_failures();
     assert!(
         dead.is_empty(),
@@ -2182,7 +2379,22 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // and §8.1's third failure mode is that the engine does not check it. There is no allowlist
     // because there is nothing on it: MEASURED 0, n = 2 runs. A Tier X miss that is genuinely
     // expected belongs here **by name**, beside its evidence -- never as a relaxed bound.
-    let misses = guest.jni.misses();
+    // **§3.1 Tier X, by name, beside its evidence** -- the one shape this comment allows.
+    // `com/roblox/platform/util/DeviceUtils` has no declaring class in any of the APK's 26,620
+    // dex classes (`jni-surface.md` §3.1, VERIFIED), so a device fails this same lookup; and the
+    // engine says it tolerates that in its own words, MEASURED once the surface path first ran:
+    // `[FLog::JNINativeHelper] getViewportDisplaySize: Failed to find class 'DeviceUtils'`, then
+    // carried on. Anything else missed still fails, by membership rather than by count.
+    const TIER_X: &[(&str, &str)] =
+        &[("java/lang/ClassLoader.findClass", "com/roblox/platform/util/DeviceUtils")];
+    let misses: Vec<_> = guest
+        .jni
+        .misses()
+        .into_iter()
+        .filter(|miss| {
+            !TIER_X.iter().any(|(function, class)| miss.function == *function && miss.class == *class)
+        })
+        .collect();
     assert!(
         misses.is_empty(),
         "the run ended with {} JNI miss(es), and the engine does not check what a failed lookup \
@@ -2326,7 +2538,57 @@ fn report_dead_guest_threads(guest: &Guest, when: &str) {
                 .collect::<Vec<_>>()
         );
     }
+    death_contexts(&mut out, guest.boundary.mem(), guest.object.base, &failures);
     let _ = out.flush();
+}
+
+/// **What each dead guest thread was holding**: its registers and the top of its stack, from the
+/// failure record's `DeathContext`, with every word that points into the image printed
+/// link-relative and every word that points at readable guest memory dereferenced eight words
+/// deep -- which is how a null read out of a field is traced to the object it was read from.
+///
+/// Printed by the watchdog too, because a run that dies this way usually blocks and never
+/// reaches teardown: the thread that died was often doing work another thread waits for.
+fn death_contexts(
+    out: &mut impl Write,
+    mem: &omni_android::GuestMem,
+    base: GuestAddr,
+    failures: &[omni_android::bionic::GuestThreadFailure],
+) {
+    let label = |value: u64| -> String {
+        match (value as usize).checked_sub(base) {
+            Some(link) if link < 0x0700_0000 => format!("{value:#x} (link {link:#x})"),
+            _ => format!("{value:#x}"),
+        }
+    };
+    let deref = |value: u64| -> Option<String> {
+        let at = usize::try_from(value).ok().filter(|at| *at >= 0x10000 && at % 8 == 0)?;
+        let words: Vec<String> = (0..8)
+            .map_while(|k| {
+                mem.read_u64(at + 8 * k, omni_android::Blame::new("a death context", at, 0))
+                    .ok()
+            })
+            .map(label)
+            .collect();
+        (!words.is_empty()).then(|| words.join(", "))
+    };
+    for failure in failures {
+        let context = &failure.context;
+        if context.registers.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "DEATH CONTEXT: thread {} -- {}", failure.thread, failure.why);
+        for (n, value) in context.registers.iter().enumerate() {
+            let name = if n == 31 { "sp".to_string() } else { format!("x{n}") };
+            let pointee = deref(*value).map(|p| format!("  -> [{p}]")).unwrap_or_default();
+            let _ = writeln!(out, "    {name:>3} = {}{pointee}", label(*value));
+        }
+        for (k, chunk) in context.stack_bytes.chunks_exact(8).enumerate() {
+            let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+            let pointee = deref(word).map(|p| format!("  -> [{p}]")).unwrap_or_default();
+            let _ = writeln!(out, "    [sp+{:#05x}] {}{pointee}", k * 8, label(word));
+        }
+    }
 }
 
 fn bytes_before_the_fault(guest: &Guest, message: &str) -> String {

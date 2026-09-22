@@ -1705,6 +1705,35 @@ mod tests {
         assert!(state.handles.object_of(id).is_some(), "not freed with the guest's local");
     }
 
+    /// **Each Kotlin `object` the engine reads `INSTANCE` of answers one instance of itself** --
+    /// the declaration, not the generated surface, which leaves every `INSTANCE` unanswered.
+    /// `FacialAgeEstimationProtocol`'s `setListener` is observed, not refused.
+    #[test]
+    fn every_kotlin_object_the_engine_reads_is_an_instance_of_itself() {
+        const FAE: &str = "com/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol";
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        for name in [HANDLER, FAE] {
+            let class = state.registry.find(name).expect("declared");
+            let own = format!("L{name};");
+            let field = state.registry.field(class, "INSTANCE", &own, true).expect("declared");
+            let member = state.registry.field_member(field).expect("a member").clone();
+            assert_eq!(member.answer, Answer::StaticInstance, "{name}.INSTANCE");
+            let value = static_instance(&mut state, "GetStaticObjectField", 0, field, &member)
+                .expect("the read");
+            let Value::Object(Some(id)) = value else { panic!("an object, not {value:?}") };
+            match state.handles.object_of(id) {
+                Some(Object::Instance { class: of, .. }) => assert_eq!(*of, class, "{name}"),
+                other => panic!("an instance of {name}, not {other:?}"),
+            }
+        }
+        let class = state.registry.find(FAE).expect("declared");
+        let method = state.registry.method(class, "setListener", "(J)V", false).expect("declared");
+        let member = state.registry.member(method).expect("a member");
+        assert_eq!(member.answer, Answer::Sink);
+    }
+
     /// **`StartAppParams.surface()` answers the very `Surface` the host stored**, through the
     /// accessor the engine calls -- identity, not a new object of the same class, because the
     /// engine turns it into the `ANativeWindow` the window came from. And a field that is not an

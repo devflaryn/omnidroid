@@ -771,6 +771,39 @@ impl Jni {
         Ok(())
     }
 
+    /// Decide what a declared **method** answers -- [`Self::define_field`]'s twin, for a value
+    /// only the embedding can know, measured when it sets the instance up.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] if the class or the method is not declared, naming both.
+    pub fn define_method(
+        &self,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        is_static: bool,
+        answer: classes::Answer,
+    ) -> AbiResult<()> {
+        let mut state = self.state.lock();
+        let refuse = |detail: String| AbiError::JniRefused {
+            function: "Jni::define_method".to_string(),
+            address: self.arena,
+            detail,
+        };
+        let Some(id) = state.registry.find(class) else {
+            return Err(refuse(format!("`{class}` is not declared")));
+        };
+        let Some(found) = state.registry.method(id, method, descriptor, is_static) else {
+            return Err(refuse(format!(
+                "`{class}` declares no {}method `{method}{descriptor}`",
+                if is_static { "static " } else { "" }
+            )));
+        };
+        state.registry.member_mut(found).expect("just resolved").answer = answer;
+        Ok(())
+    }
+
     /// The class registry, for a host that wants to declare more classes before running.
     pub fn with_registry<T>(&self, f: impl FnOnce(&mut Registry) -> T) -> T {
         f(&mut self.state.lock().registry)

@@ -1123,7 +1123,8 @@ pub static DECLARED: &[ClassSpec] = &[
             f("deviceName", "Ljava/lang/String;", Answer::Text("Omnidroid")),
             f("deviceSku", "Ljava/lang/String;", Answer::Text("omnidroid")),
             f("manufacturer", "Ljava/lang/String;", Answer::Text("Omnidroid")),
-            f("osVersion", "Ljava/lang/String;", Answer::Text("13")),
+            // `Integer.toString(Build.VERSION.SDK_INT)` in the dex -- see `ANDROID_SDK_INT`.
+            f("osVersion", "Ljava/lang/String;", Answer::Text(super::script::ANDROID_SDK_INT)),
             f("socModel", "Ljava/lang/String;", Answer::Text("omnidroid-host")),
         ],
     },
@@ -1152,7 +1153,8 @@ pub static DECLARED: &[ClassSpec] = &[
             f("manufacturer", "Ljava/lang/String;", Answer::Text("Omnidroid")),
             f("memoryClass", "I", Answer::Int(256)),
             f("networkType", "Ljava/lang/String;", Answer::Text("wifi")),
-            f("osVersion", "Ljava/lang/String;", Answer::Text("13")),
+            // `Integer.toString(Build.VERSION.SDK_INT)` in the dex -- see `ANDROID_SDK_INT`.
+            f("osVersion", "Ljava/lang/String;", Answer::Text(super::script::ANDROID_SDK_INT)),
             f("socModel", "Ljava/lang/String;", Answer::Text("omnidroid-host")),
             f("testDeviceName", "Ljava/lang/String;", Answer::Text("")),
         ],
@@ -1162,7 +1164,9 @@ pub static DECLARED: &[ClassSpec] = &[
         tier: Tier::One,
         methods: &[m("<init>", "()V", Answer::NewInstance)],
         fields: &[
-            f("assetFolderPath", "Ljava/lang/String;", Answer::Text("")),
+            // Both builders (`fi.o.f`, `fi.h0.p`) take it from `vk.b.m().n()` -- the same call
+            // that produces what `nativeSetAssetPath` is handed, so the same constant.
+            f("assetFolderPath", "Ljava/lang/String;", Answer::Text(super::script::ASSET_PATH)),
             f("dpiScale", "F", Answer::Float(1.0)),
             f("isKeyboardDevice", "Z", Answer::Bool(true)),
             f("isMouseDevice", "Z", Answer::Bool(true)),
@@ -1515,6 +1519,59 @@ pub static DECLARED: &[ClassSpec] = &[
         fields: &[sf(
             "INSTANCE",
             "Lcom/roblox/protocols/systemdialog/PlatformSystemDialogHandler;",
+            Answer::StaticInstance,
+        )],
+    },
+    // **MEASURED, M6's gate**: once the engine was on Vulkan, a worker died on
+    // `CallStaticBooleanMethodV` of `isSystemThemeAvailable()Z`. In `classes2.dex` it is
+    // `Build.VERSION.SDK_INT >= 29` and nothing else, so on the SDK this host presents
+    // (`script::ANDROID_SDK_INT`, 33) it is true. `getSystemTheme()` beside it reads the night-mode
+    // bits of the Context's `Configuration.uiMode` -- a fact about the host's theme -- and stays
+    // unanswered until a run reaches it and a host seam supplies it.
+    ClassSpec {
+        name: "com/roblox/universalapp/systemtheme/SystemThemeProtocol",
+        tier: Tier::Support,
+        methods: &[s("isSystemThemeAvailable", "()Z", Answer::Bool(true))],
+        fields: NONE,
+    },
+    // **MEASURED, M6's gate**: once the Lua app's renderer was being created, a worker died on
+    // `CallStaticBooleanMethodV` of `hevcHardwareEncodingSupported(III)Z`. In `classes2.dex` it is
+    // a walk of `new MediaCodecList(REGULAR_CODECS).getCodecInfos()` for a hardware `video/hevc`
+    // encoder that supports the size and rate asked -- and `getVideoCodecs()` is the same list,
+    // described. This runtime gives the app **no** `MediaCodec`: there is no Android media stack
+    // behind it, so the list the app would walk is empty, and "no such encoder" and "no codecs"
+    // are the true answers rather than chosen ones. If a media stack is ever provided, these two
+    // must be answered from it.
+    ClassSpec {
+        name: "com/roblox/engine/jni/video/MediaCodecInfoUtils",
+        tier: Tier::Support,
+        methods: &[
+            s("hevcHardwareEncodingSupported", "(III)Z", Answer::Bool(false)),
+            s(
+                "getVideoCodecs",
+                "()[Lcom/roblox/engine/jni/video/VideoCodecCapability;",
+                Answer::EmptyObjectArray,
+            ),
+        ],
+        fields: NONE,
+    },
+    // **MEASURED, M6's gate**: once the engine settings reached a live engine and `initEngine_`
+    // ran, the game thread died on `GetStaticObjectField` of this `INSTANCE`. The same shape as
+    // `PlatformSystemDialogHandler` above, read from `classes2.dex`: `<clinit>` is `new-instance;
+    // invoke-direct <init>()V; sput-object INSTANCE` -- a Kotlin `object`.
+    //
+    // `setListener(J)V` is `Long.valueOf` then `sput-object nativeListenerPtr` and nothing else;
+    // the only readers of that static are this class's own Java methods (`startInquiry`,
+    // `onComplete`, `onError`, `onCancel`), which this runtime does not execute. So the host's
+    // duty is to observe it: a sink. `startInquiry` is the start of a facial-age-estimation flow
+    // through a third-party SDK and stays unanswered -- refused by name if it is ever reached.
+    ClassSpec {
+        name: "com/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol",
+        tier: Tier::Support,
+        methods: &[m("setListener", "(J)V", Answer::Sink)],
+        fields: &[sf(
+            "INSTANCE",
+            "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;",
             Answer::StaticInstance,
         )],
     },
