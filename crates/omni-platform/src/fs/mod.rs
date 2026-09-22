@@ -1745,6 +1745,32 @@ impl Filesystem {
         }
     }
 
+    /// `ftruncate(2)`: make a regular file exactly `length` bytes long.
+    ///
+    /// `File::set_len`, portable `std`. Linux's order and answers (`do_sys_ftruncate`): a negative
+    /// length is `EINVAL` (the caller's check, since this takes a `u64`), no such descriptor is
+    /// `EBADF`, and anything that is not a regular file **open for writing** is `EINVAL`.
+    ///
+    /// # Errors
+    ///
+    /// As above.
+    pub fn ftruncate(&self, fd: i32, length: u64) -> FsResult<()> {
+        const OP: &str = "ftruncate";
+        let table = self.table();
+        match table.open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::File { file, writable: true, guest, .. }) => {
+                file.set_len(length).map_err(|error| FsError::io(OP, guest, &error))
+            }
+            Some(_) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "not a regular file open for writing (EINVAL)",
+            )),
+        }
+    }
+
     /// `lseek(2)`: move the descriptor's offset and return where it now is.
     ///
     /// Portable `std` -- `Seek` for `&File` -- so no backend. `whence` is Linux's numbering

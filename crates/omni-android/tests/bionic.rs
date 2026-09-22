@@ -547,6 +547,15 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          it\" }. File::sync_all for a regular file; EINVAL for a descriptor with nothing to \
          synchronise; a directory refuses by name until a run shows SQLite's directory sync.",
     ),
+    (
+        "ftruncate",
+        "M6, the first run in which nativeGameGlobalInit returned: a guest worker, once the \
+         storage layer had initialised, died on it -- GuestThreadFailure { thread: 34, why: \"the \
+         guest called the imported symbol `ftruncate` through its thunk at 0x1ee0fd27910, and \
+         nothing in the compatibility layer implements it\" }. File::set_len, in Linux's order: \
+         a negative length EINVAL, no descriptor EBADF, not a regular file open for writing \
+         EINVAL.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -597,7 +606,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 221, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 222, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -670,8 +679,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`epoll_create1`, `epoll_ctl`, `epoll_wait`, for 204**: the engine's own transport, the
     // first reached and the other two decoded on the same object.
     // **`timerfd_create`, `timerfd_settime` and `fsync`, for 207**: the transport's timer and
-    // SQLite's commit.
-    assert_eq!(Bionic::inline_symbols().count(), 207);
+    // SQLite's commit. **`ftruncate`, for 208**: the storage layer, once row 22 returned.
+    assert_eq!(Bionic::inline_symbols().count(), 208);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -9126,6 +9135,25 @@ fn a_timerfd_wakes_epoll_at_its_deadline_on_the_guests_own_monotonic_clock() {
         asm.mov(1, 0);
     });
     assert!(error.to_string().contains("CLOCK_MONOTONIC"), "{error}");
+}
+
+/// **`ftruncate` sets a file's length -- the host file is the evidence -- and answers Linux's
+/// `EINVAL` for a negative length and for a descriptor not open for writing.**
+#[test]
+fn ftruncate_sets_the_length_and_refuses_what_linux_refuses() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("ftruncate");
+    std::fs::write(scratch.path("t.bin"), b"0123456789").expect("a host file");
+    let rw = open_through_guest(&f, "/t.bin", O_RDWR);
+    assert_eq!(call_with_errno(&f, "ftruncate", &[rw as u64, 4]), (0, 0));
+    assert_eq!(std::fs::read(scratch.path("t.bin")).expect("read"), b"0123", "shortened");
+    assert_eq!(call_with_errno(&f, "ftruncate", &[rw as u64, 6]), (0, 0));
+    assert_eq!(std::fs::read(scratch.path("t.bin")).expect("read"), b"0123\0\0", "zero-extended");
+    assert_eq!(call_with_errno(&f, "ftruncate", &[rw as u64, u64::MAX]), (-1, EINVAL_NET));
+    let ro = open_through_guest(&f, "/t.bin", O_RDONLY);
+    assert_eq!(call_with_errno(&f, "ftruncate", &[ro as u64, 1]), (-1, EINVAL_NET), "read-only");
+    assert_eq!(call_with_errno(&f, "ftruncate", &[99, 1]), (-1, EBADF_NET));
+    assert_eq!(std::fs::read(scratch.path("t.bin")).expect("read").len(), 6, "untouched");
 }
 
 /// **`fsync` syncs a regular file and answers the kernel's `EINVAL` for a pipe.**

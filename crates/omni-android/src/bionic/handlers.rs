@@ -1406,6 +1406,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // M6: SQLite committing, on the same thread. Outside Task 1's 188; `BEYOND_THE_PREDICTION`
     // records how it was found.
     ("fsync", files::fsync),
+    // M6: the storage layer on a guest worker, once the settings success path had run. Outside
+    // Task 1's 188; `BEYOND_THE_PREDICTION` records how it was found.
+    ("ftruncate", files::ftruncate),
     ("__write_chk", net::write_chk),
     ("access", files::access),
     ("getcwd", files::getcwd),

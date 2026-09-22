@@ -972,6 +972,40 @@ pub(super) fn pread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int ftruncate(int fd, off_t length)`
+///
+/// `Filesystem::ftruncate`, with the one check that belongs on this side of the seam: a negative
+/// `off_t` is `EINVAL` before the descriptor is looked at, which is the kernel's order.
+///
+/// MEASURED reader: a guest worker (thread 34 in the run that found it) once the engine's storage
+/// layer had initialised on the settings success path. The thread died on the `Unbound` this
+/// replaces.
+pub(super) fn ftruncate(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, length) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()? as i64)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        if length < 0 {
+            view.set_errno(consts::EINVAL);
+            -1
+        } else {
+            let fs = filesystem(&view)?;
+            match settle(&view, fs.ftruncate(fd, length as u64))? {
+                Settled::Done(()) => 0,
+                Settled::Failed(errno) => {
+                    view.set_errno(errno);
+                    -1
+                }
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `int fsync(int fd)`
 ///
 /// The seam's `File::sync_all` for a regular file, `EINVAL` for a descriptor with nothing to
