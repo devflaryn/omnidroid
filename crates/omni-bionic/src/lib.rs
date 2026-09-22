@@ -99,7 +99,9 @@ pub mod threads;
 pub mod unwind;
 pub mod time;
 pub mod tls;
+pub mod wctype;
 pub mod wide;
+mod unicode14;
 
 pub use context::GuestContext;
 pub use error::BionicError;

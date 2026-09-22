@@ -47,7 +47,8 @@ use omni_bionic::errno::consts;
 use omni_bionic::memory::{Fault, GuestMemory};
 use omni_bionic::mock::MockMemory;
 use omni_bionic::stdio::{
-    feof, fflush, fgets, fputc, fputs, fread, fwrite, write_host_bytes, Descriptors, Stream, EOF,
+    feof, ferror, fflush, fgets, fputc, fputs, fread, fwrite, write_host_bytes, Descriptors,
+    Stream, EOF,
 };
 
 /// What an earlier, unrelated call left in `errno`.
@@ -259,6 +260,7 @@ fn a_failed_read_reports_the_descriptors_own_errno_from_fgets_and_fread() {
         assert_eq!(fgets(&mut ctx, &fds, &mut stream, 0x1200, 64).expect("fgets"), 0, "fgets");
         assert_eq!(ctx.errno(), errno, "fgets did not report the descriptor's errno {errno}");
         assert!(stream.error, "fgets left the error indicator clear for {errno}");
+        assert_eq!(ferror(&stream), 1, "ferror reports the indicator ({errno})");
         assert_eq!(feof(&stream), 0, "a read error is not an end of file ({errno})");
         assert_eq!(ctx.at(0x1200, 8), b"SENTINEL", "the buffer was written on a failed fgets");
 

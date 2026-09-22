@@ -9,7 +9,7 @@
 //! | trig | [`sin`], [`sinf`], [`cos`], [`cosf`], [`tanf`] |
 //! | hyperbolic | [`sinh`], [`sinhf`], [`cosh`], [`coshf`], [`tanhf`] |
 //! | inverse trig | [`acos`], [`acosf`], [`asin`], [`asinf`], [`atan2`], [`atan2f`], [`atanf`] |
-//! | other | [`cbrtf`], [`fmodf`], [`frexp`], [`ilogb`], [`ldexp`], [`ldexpf`], [`modff`], [`nan`], [`pow`], [`powf`], [`sincosf`] |
+//! | other | [`cbrtf`], [`fmodf`], [`frexp`], [`ilogb`], [`ldexp`], [`ldexpf`], [`modf`], [`modff`], [`nan`], [`pow`], [`powf`], [`sincosf`] |
 //!
 //! Implementation policy (per the task): **do not reimplement transcendental functions** —
 //! Rust's `f64`/`f32` methods compile to calls into the host's libm (via compiler-builtins
@@ -467,10 +467,157 @@ pub fn modff(ctx: &mut impl GuestContext, x: f32, iptr: u64) -> Result<f32, Faul
     if x.is_nan() {
         return Ok(x);
     }
+    // Annex F: the fraction carries x's sign -- `-0.0` for `-inf` and for a negative integer,
+    // which `x - truncated` alone would make `+0.0`.
     if x.is_infinite() {
-        return Ok(0.0);
+        return Ok(0.0f32.copysign(x));
     }
-    Ok(x - truncated)
+    Ok((x - truncated).copysign(x))
+}
+
+/// `double modf(double x, double *iptr)` — splits x into integer and fractional parts, **each
+/// with the sign of x** (C11 Annex F.10.3.12). **Exact.** A negative integer's fraction is `-0.0`,
+/// not `+0.0`; ±inf stores ±inf and returns ±0; NaN stores and returns NaN. Writes the integer
+/// part to the guest `double*` (8 bytes) when non-null.
+pub fn modf(ctx: &mut impl GuestContext, x: f64, iptr: u64) -> Result<f64, Fault> {
+    let integral = if x.is_finite() { x.trunc() } else { x };
+    if iptr != 0 {
+        ctx.write(iptr, &integral.to_le_bytes())?;
+    }
+    if x.is_nan() {
+        return Ok(x);
+    }
+    if x.is_infinite() {
+        return Ok(0.0f64.copysign(x));
+    }
+    Ok((x - integral).copysign(x))
+}
+
+// ---------------------------------------------------------------------------
+// M6: the rest of the engine's libm imports, once the Lua app reached `atanf`
+// ---------------------------------------------------------------------------
+
+/// `double atan(double x)` -- total; no errno.
+pub fn atan(_ctx: &mut impl GuestContext, x: f64) -> f64 {
+    x.atan()
+}
+
+/// `double cbrt(double x)` -- total, sign preserved.
+pub fn cbrt(_ctx: &mut impl GuestContext, x: f64) -> f64 {
+    x.cbrt()
+}
+
+/// `double tan(double x)` -- `±inf` is NaN + EDOM, as [`tanf`].
+pub fn tan(ctx: &mut impl GuestContext, x: f64) -> f64 {
+    if x.is_infinite() {
+        return domain_error(ctx);
+    }
+    x.tan()
+}
+
+/// `double tanh(double x)` -- total; no errno.
+pub fn tanh(_ctx: &mut impl GuestContext, x: f64) -> f64 {
+    x.tanh()
+}
+
+/// `double exp2(double x)` -- overflow from a finite `x` is `+HUGE_VAL` + ERANGE, as [`exp`].
+pub fn exp2(ctx: &mut impl GuestContext, x: f64) -> f64 {
+    let r = x.exp2();
+    if r.is_infinite() && !x.is_infinite() {
+        return range_error_inf(ctx, false);
+    }
+    r
+}
+
+/// `float exp2f(float x)` -- as [`exp2`].
+pub fn exp2f(ctx: &mut impl GuestContext, x: f32) -> f32 {
+    let r = x.exp2();
+    if r.is_infinite() && !x.is_infinite() {
+        ctx.set_errno(ERANGE);
+    }
+    r
+}
+
+/// `double expm1(double x)` -- `e^x - 1`, accurate near 0; overflow as [`exp`].
+pub fn expm1(ctx: &mut impl GuestContext, x: f64) -> f64 {
+    let r = x.exp_m1();
+    if r.is_infinite() && !x.is_infinite() {
+        return range_error_inf(ctx, false);
+    }
+    r
+}
+
+/// `float hypotf(float x, float y)` -- `+inf` if either is infinite (even with a NaN, Annex F);
+/// overflow from finite inputs is `+HUGE_VALF` + ERANGE.
+pub fn hypotf(ctx: &mut impl GuestContext, x: f32, y: f32) -> f32 {
+    if x.is_infinite() || y.is_infinite() {
+        return f32::INFINITY;
+    }
+    let r = x.hypot(y);
+    if r.is_infinite() {
+        ctx.set_errno(ERANGE);
+    }
+    r
+}
+
+/// `double fmod(double x, double y)` -- **exact**, as [`fmodf`]: `fmod(±inf, y)` and `fmod(x, 0)`
+/// are NaN + EDOM; `fmod(finite, ±inf)` is `x`.
+pub fn fmod(ctx: &mut impl GuestContext, x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        return x + y;
+    }
+    if x.is_infinite() || y == 0.0 {
+        return domain_error(ctx);
+    }
+    x % y
+}
+
+/// `float frexpf(float x, int *exp)` -- **exact**, as [`frexp`]: `m * 2^e` with `m ∈ [0.5, 1)`;
+/// `±0`, `±inf` and NaN return `x` with `*exp = 0`. Done in `f64`, where every `f32` (subnormals
+/// included) is normal, so the split is a field extraction.
+pub fn frexpf(ctx: &mut impl GuestContext, x: f32, exp_ptr: u64) -> Result<f32, Fault> {
+    let (m, e) = if x == 0.0 || x.is_nan() || x.is_infinite() {
+        (x, 0i32)
+    } else {
+        let bits = f64::from(x).to_bits();
+        let e = ((bits >> 52) & 0x7ff) as i32 - 1022;
+        let m = f64::from_bits((bits & !(0x7ff << 52)) | (1022 << 52));
+        (m as f32, e)
+    };
+    if exp_ptr != 0 {
+        ctx.write(exp_ptr, &e.to_le_bytes())?;
+    }
+    Ok(m)
+}
+
+/// `double round(double x)` -- half away from zero; **exact**, no errno.
+#[must_use]
+pub fn round(x: f64) -> f64 {
+    x.round()
+}
+
+/// `float nextafterf(float x, float y)` -- **exact** (FreeBSD's `s_nextafterf.c`, which bionic
+/// builds): the next representable `f32` after `x` toward `y`; NaN in, NaN out; `x == y` is `y`;
+/// from `±0` the smallest subnormal with `y`'s sign. Overflow to `±inf`, and a subnormal or zero
+/// result from a non-zero `x`, set ERANGE (POSIX's range errors).
+pub fn nextafterf(ctx: &mut impl GuestContext, x: f32, y: f32) -> f32 {
+    if x.is_nan() || y.is_nan() {
+        return x + y;
+    }
+    if x == y {
+        return y;
+    }
+    if x == 0.0 {
+        ctx.set_errno(ERANGE);
+        return f32::from_bits(1).copysign(y);
+    }
+    let bits = x.to_bits();
+    let away = (x > 0.0) == (y > x);
+    let r = f32::from_bits(if away { bits + 1 } else { bits - 1 });
+    if r.is_infinite() || !r.is_normal() {
+        ctx.set_errno(ERANGE);
+    }
+    r
 }
 
 /// `double nan(const char *tagp)` — a quiet NaN; bionic ignores the tag payload

@@ -120,11 +120,10 @@
 //!
 //! C17 7.21.7.3p2 sets the error indicator on a write error, 7.21.5.2p3 on a failed `fflush`, and
 //! C17 7.21.10.3 has `ferror` report it. [`Stream::error`] is that indicator and it is maintained
-//! exactly as C says — but **nothing in this runtime can read it**: `ferror` and `clearerr` are
-//! imported by the APK's libraries and are neither among the 188 statically reachable imports nor
-//! bound by any adapter, so no guest call can observe the flag today. Until one does, `errno` is
-//! the *whole* of what a guest learns about why a stream operation failed, which is precisely why
-//! a missing one is a defect rather than a cosmetic omission.
+//! exactly as C says, and [`ferror`] reads it -- bound in M6, when the engine's startup reached
+//! it. `clearerr` is still unbound, so nothing clears the flag short of closing the stream; and
+//! `errno` remains the *whole* of what a guest learns about **why** an operation failed, which is
+//! why a missing one is a defect rather than a cosmetic omission.
 
 use crate::context::GuestContext;
 use crate::errno::consts;
@@ -268,6 +267,19 @@ impl Stream {
 #[must_use]
 pub const fn feof(stream: &Stream) -> i32 {
     if stream.eof {
+        1
+    } else {
+        0
+    }
+}
+
+/// `int ferror(FILE *stream)`
+///
+/// Non-zero once an operation has set the stream's error indicator (C17 7.21.10.3). C does not
+/// fix *which* non-zero value, and this returns 1, as [`feof`] does.
+#[must_use]
+pub const fn ferror(stream: &Stream) -> i32 {
+    if stream.error {
         1
     } else {
         0

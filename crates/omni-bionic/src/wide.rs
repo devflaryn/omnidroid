@@ -64,6 +64,58 @@ pub fn wcslen(mem: &impl GuestMemory, s: u64) -> Result<u64, Fault> {
     }
 }
 
+/// `int wcscmp(const wchar_t *s1, const wchar_t *s2)` -- FreeBSD's, which bionic builds: the
+/// first differing pair's difference **as `unsigned int`**, converted to `int` ("XXX assumes
+/// wchar_t = int"). bionic's `wcscoll` and `wcscoll_l` are this.
+///
+/// Errors: `Err(Fault)` on unmapped memory or a null pointer.
+pub fn wcscmp(mem: &impl GuestMemory, s1: u64, s2: u64) -> Result<i32, Fault> {
+    if s1 == 0 || s2 == 0 {
+        return Err(Fault(0));
+    }
+    let mut at = 0u64;
+    loop {
+        let a = read_wc(mem, s1.wrapping_add(at))?;
+        let b = read_wc(mem, s2.wrapping_add(at))?;
+        if a != b {
+            return Ok(a.wrapping_sub(b) as i32);
+        }
+        if a == 0 {
+            return Ok(0);
+        }
+        at += 4;
+    }
+}
+
+/// `size_t wcslcpy(wchar_t *dst, const wchar_t *src, size_t dsize)` -- OpenBSD's: [`wcslen`]
+/// of `src`, having copied up to `dsize - 1` characters and a terminating `L'\0'` when
+/// `dsize != 0`.
+///
+/// Errors: `Err(Fault)` on unmapped memory or a null `src`.
+pub fn wcslcpy(mem: &mut impl GuestMemory, dst: u64, src: u64, dsize: u64) -> Result<u64, Fault> {
+    let len = wcslen(mem, src)?;
+    if dsize != 0 {
+        let copy = len.min(dsize - 1);
+        let bytes = usize::try_from(copy * 4).map_err(|_| Fault(src))?;
+        let mut buf = vec![0u8; bytes];
+        mem.read(src, &mut buf)?;
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        mem.write(dst, &buf)?;
+    }
+    Ok(len)
+}
+
+/// `size_t wcsxfrm(wchar_t *dst, const wchar_t *src, size_t n)` -- OpenBSD's, which bionic builds:
+/// [`wcslen`] for `n == 0`, else [`wcslcpy`]. bionic's `wcsxfrm_l` is this.
+///
+/// Errors: as [`wcslcpy`].
+pub fn wcsxfrm(mem: &mut impl GuestMemory, dst: u64, src: u64, n: u64) -> Result<u64, Fault> {
+    if n == 0 {
+        return wcslen(mem, src);
+    }
+    wcslcpy(mem, dst, src, n)
+}
+
 /// `wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n)` — address of the first
 /// element equal to `c` among `n` elements, or guest `0`.
 pub fn wmemchr(mem: &impl GuestMemory, s: u64, c: u32, n: u64) -> Result<u64, Fault> {
@@ -228,6 +280,423 @@ pub fn mbrtowc(
             }
             Ok(consumed)
         }
+    }
+}
+
+/// `sizeof(mbstate_t)` on LP64 bionic: `unsigned char __seq[4]` and four reserved bytes.
+pub const MBSTATE_BYTES: usize = 8;
+
+/// `size_t mbrtoc32(char32_t *pc32, const char *s, size_t n, mbstate_t *ps)` -- **bionic's own
+/// algorithm, ported**, with the conversion state kept where bionic keeps it: in the guest's
+/// `mbstate_t` at `state` (the caller resolves a NULL `ps` to its private one, as bionic's
+/// `static mbstate_t __private_state` is). bionic's `mbrtowc` is exactly this, because its
+/// `wchar_t` is UTF-32.
+///
+/// Ported from `libc/bionic/mbrtoc32.cpp` at `android-13.0.0_r1` -- the platform this host
+/// reports (SDK 33) -- and `private/bionic_mbstate.h`:
+///
+/// * the state's `__seq[3]` set is `EINVAL`, returning `(size_t)-1`;
+/// * `s == NULL` is `s = "", n = 1, pc32 = NULL`;
+/// * `n == 0` returns `0` (Android 13's reading; later bionic returns `(size_t)-2`);
+/// * an initial state and an ASCII byte is the fast path: store it, return 1 (0 for NUL);
+/// * otherwise the lead byte (the state's first byte, if a sequence is in progress) gives the
+///   length; the bytes still wanted are appended to the state, a non-continuation byte in the
+///   middle being `EILSEQ`; too few bytes is `(size_t)-2` **with the state kept**, so the next call
+///   finishes the character;
+/// * a complete sequence decodes, overlong forms, surrogates and anything above U+10FFFF are
+///   `EILSEQ`, and the return is the number of bytes **this call** consumed (0 for NUL).
+///
+/// Every error path resets the state, as bionic's `mbstate_reset_and_return_illegal` does. The
+/// return is the `size_t` bionic returns, `(size_t)-1` and `(size_t)-2` included: those are
+/// answers a caller branches on, not refusals.
+///
+/// # Errors
+///
+/// Only a guest memory [`Fault`] (reading `s` or the state, writing `pc32` or the state).
+pub fn mbrtoc32(
+    ctx: &mut impl crate::context::GuestContext,
+    pc32: u64,
+    s: u64,
+    n: u64,
+    state: u64,
+) -> Result<u64, Fault> {
+    const ILLEGAL: u64 = u64::MAX;
+    const INCOMPLETE: u64 = u64::MAX - 1;
+    fn reset(ctx: &mut impl crate::context::GuestContext, state: u64) -> Result<(), Fault> {
+        ctx.write(state, &[0u8; 4])
+    }
+    let mut seq = [0u8; 4];
+    ctx.read(state, &mut seq)?;
+    if seq[3] != 0 {
+        ctx.set_errno(crate::errno::consts::EINVAL);
+        reset(ctx, state)?;
+        return Ok(ILLEGAL);
+    }
+    let empty = s == 0;
+    let (mut s, mut n, mut pc32) = (s, n, pc32);
+    if empty {
+        n = 1;
+        pc32 = 0;
+    }
+    if n == 0 {
+        return Ok(0);
+    }
+    // `s == NULL` reads as "", whose only byte is NUL.
+    fn read_at(
+        ctx: &mut impl crate::context::GuestContext,
+        empty: bool,
+        at: u64,
+    ) -> Result<u8, Fault> {
+        if empty {
+            return Ok(0);
+        }
+        let mut byte = [0u8; 1];
+        ctx.read(at, &mut byte)?;
+        Ok(byte[0])
+    }
+    let initial = |seq: &[u8; 4]| seq == &[0u8; 4];
+    let first = read_at(ctx, empty, s)?;
+    if initial(&seq) && first & !0x7f == 0 {
+        if pc32 != 0 {
+            ctx.write(pc32, &u32::from(first).to_le_bytes())?;
+        }
+        return Ok(u64::from(first != 0));
+    }
+    let bytes_so_far = if seq[2] != 0 {
+        3
+    } else if seq[1] != 0 {
+        2
+    } else if seq[0] != 0 {
+        1
+    } else {
+        0
+    };
+    let lead = if bytes_so_far > 0 { seq[0] } else { first };
+    let (mask, length, lower_bound): (u8, usize, u32) = if lead & 0xe0 == 0xc0 {
+        (0x1f, 2, 0x80)
+    } else if lead & 0xf0 == 0xe0 {
+        (0x0f, 3, 0x800)
+    } else if lead & 0xf8 == 0xf0 {
+        (0x07, 4, 0x10000)
+    } else {
+        ctx.set_errno(EILSEQ);
+        reset(ctx, state)?;
+        return Ok(ILLEGAL);
+    };
+    let bytes_wanted = length - bytes_so_far;
+    let mut i = 0usize;
+    while (i as u64) < n.min(bytes_wanted as u64) {
+        let byte = read_at(ctx, empty, s)?;
+        if !initial(&seq) && byte & 0xc0 != 0x80 {
+            ctx.set_errno(EILSEQ);
+            reset(ctx, state)?;
+            return Ok(ILLEGAL);
+        }
+        seq[bytes_so_far + i] = byte;
+        ctx.write(state + (bytes_so_far + i) as u64, &[byte])?;
+        s = s.wrapping_add(1);
+        i += 1;
+    }
+    if i < bytes_wanted {
+        return Ok(INCOMPLETE);
+    }
+    let mut c32 = u32::from(seq[0] & mask);
+    for byte in &seq[1..length] {
+        c32 = (c32 << 6) | u32::from(byte & 0x3f);
+    }
+    if c32 < lower_bound || (0xd800..=0xdfff).contains(&c32) || c32 > 0x10ffff {
+        ctx.set_errno(EILSEQ);
+        reset(ctx, state)?;
+        return Ok(ILLEGAL);
+    }
+    if pc32 != 0 {
+        ctx.write(pc32, &c32.to_le_bytes())?;
+    }
+    reset(ctx, state)?;
+    Ok(if c32 == 0 { 0 } else { bytes_wanted as u64 })
+}
+
+/// `(size_t)-1`: bionic's `BIONIC_MULTIBYTE_RESULT_ILLEGAL_SEQUENCE`.
+pub const MB_ILLEGAL: u64 = u64::MAX;
+/// `(size_t)-2`: bionic's `BIONIC_MULTIBYTE_RESULT_INCOMPLETE_SEQUENCE`.
+pub const MB_INCOMPLETE_SEQUENCE: u64 = u64::MAX - 1;
+/// bionic's `MB_LEN_MAX` (`limits.h`): the longest UTF-8 sequence.
+const MB_LEN_MAX: u64 = 4;
+/// `WEOF`.
+pub const WEOF: u32 = 0xFFFF_FFFF;
+
+fn read_byte(ctx: &mut impl crate::context::GuestContext, at: u64) -> Result<u8, Fault> {
+    let mut byte = [0u8; 1];
+    ctx.read(at, &mut byte)?;
+    Ok(byte[0])
+}
+
+fn read_word(ctx: &mut impl crate::context::GuestContext, at: u64) -> Result<u64, Fault> {
+    let mut bytes = [0u8; 8];
+    ctx.read(at, &mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_wchar(ctx: &mut impl crate::context::GuestContext, at: u64) -> Result<u32, Fault> {
+    let mut bytes = [0u8; 4];
+    ctx.read(at, &mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn state_is_initial(ctx: &mut impl crate::context::GuestContext, state: u64) -> Result<bool, Fault> {
+    let mut seq = [0u8; 4];
+    ctx.read(state, &mut seq)?;
+    Ok(seq == [0; 4])
+}
+
+fn state_bytes_so_far(ctx: &mut impl crate::context::GuestContext, state: u64) -> Result<u64, Fault> {
+    let mut seq = [0u8; 4];
+    ctx.read(state, &mut seq)?;
+    Ok(if seq[2] != 0 {
+        3
+    } else if seq[1] != 0 {
+        2
+    } else {
+        u64::from(seq[0] != 0)
+    })
+}
+
+/// `mbstate_reset_and_return_illegal(EILSEQ, state)`.
+fn illegal(ctx: &mut impl crate::context::GuestContext, state: u64) -> Result<u64, Fault> {
+    ctx.set_errno(EILSEQ);
+    ctx.write(state, &[0u8; 4])?;
+    Ok(MB_ILLEGAL)
+}
+
+/// `mbstate_reset_and_return(value, state)`.
+fn reset_and(ctx: &mut impl crate::context::GuestContext, state: u64, value: u64) -> Result<u64, Fault> {
+    ctx.write(state, &[0u8; 4])?;
+    Ok(value)
+}
+
+/// The UTF-8 bytes `c32rtomb` writes for a non-ASCII `c32`, or `None` past `0x1FFFFF` -- bionic's
+/// ranges, which (unlike `mbrtoc32`'s) do not exclude surrogates or `0x110000..=0x1FFFFF`.
+fn c32_encode(c32: u32) -> Option<([u8; 4], usize)> {
+    let (lead, length) = if c32 & !0x7ff == 0 {
+        (0xc0u8, 2)
+    } else if c32 & !0xffff == 0 {
+        (0xe0, 3)
+    } else if c32 & !0x1f_ffff == 0 {
+        (0xf0, 4)
+    } else {
+        return None;
+    };
+    let mut out = [0u8; 4];
+    let mut rest = c32;
+    for i in (1..length).rev() {
+        out[i] = (rest & 0x3f) as u8 | 0x80;
+        rest >>= 6;
+    }
+    out[0] = (rest & 0xff) as u8 | lead;
+    Some((out, length))
+}
+
+/// `size_t c32rtomb(char *s, char32_t c32, mbstate_t *ps)` -- bionic's, ported from
+/// `android-13.0.0_r1`, over the guest's state at `state`: `s == NULL` resets and returns 1; a NUL
+/// is stored and returns 1; a non-initial state is `EILSEQ`; ASCII is one byte; otherwise the
+/// shortest UTF-8 for anything up to `0x1FFFFF`, and `EILSEQ` past it. bionic's `wcrtomb` is this.
+///
+/// # Errors
+///
+/// Only a guest memory [`Fault`].
+pub fn c32rtomb(
+    ctx: &mut impl crate::context::GuestContext,
+    s: u64,
+    c32: u32,
+    state: u64,
+) -> Result<u64, Fault> {
+    if s == 0 {
+        return reset_and(ctx, state, 1);
+    }
+    if c32 == 0 {
+        ctx.write(s, &[0])?;
+        return reset_and(ctx, state, 1);
+    }
+    if !state_is_initial(ctx, state)? {
+        return illegal(ctx, state);
+    }
+    if c32 & !0x7f == 0 {
+        ctx.write(s, &[c32 as u8])?;
+        return Ok(1);
+    }
+    let Some((bytes, length)) = c32_encode(c32) else {
+        ctx.set_errno(EILSEQ);
+        return Ok(MB_ILLEGAL);
+    };
+    ctx.write(s, &bytes[..length])?;
+    Ok(length as u64)
+}
+
+/// `size_t mbsnrtowcs(wchar_t *dst, const char **src, size_t nmc, size_t len, mbstate_t *ps)` --
+/// bionic's (`libc/bionic/wchar.cpp`, `android-13.0.0_r1`), ported line for line over guest
+/// memory: `src` is the guest address of the `const char *`, which is read and written back as
+/// bionic's is; every multibyte character goes through [`mbrtoc32`] with the same `state`. A NULL
+/// `dst` measures. bionic's `mbsrtowcs` is this with `nmc = SIZE_MAX`.
+///
+/// # Errors
+///
+/// Only a guest memory [`Fault`].
+pub fn mbsnrtowcs(
+    ctx: &mut impl crate::context::GuestContext,
+    dst: u64,
+    src: u64,
+    nmc: u64,
+    len: u64,
+    state: u64,
+) -> Result<u64, Fault> {
+    let s = read_word(ctx, src)?;
+    if nmc > 0 && state_bytes_so_far(ctx, state)? > 0 && read_byte(ctx, s)? < 0x80 {
+        return illegal(ctx, state);
+    }
+    let (mut i, mut o) = (0u64, 0u64);
+    if dst == 0 {
+        while i < nmc {
+            let byte = read_byte(ctx, s.wrapping_add(i))?;
+            let r = if byte < 0x80 {
+                if byte == 0 {
+                    return reset_and(ctx, state, o);
+                }
+                1
+            } else {
+                let r = mbrtoc32(ctx, 0, s.wrapping_add(i), nmc - i, state)?;
+                if r == MB_ILLEGAL || r == MB_INCOMPLETE_SEQUENCE {
+                    return illegal(ctx, state);
+                }
+                if r == 0 {
+                    return reset_and(ctx, state, o);
+                }
+                r
+            };
+            i += r;
+            o += 1;
+        }
+        return reset_and(ctx, state, o);
+    }
+    while i < nmc && o < len {
+        let byte = read_byte(ctx, s.wrapping_add(i))?;
+        let at = dst.wrapping_add(4 * o);
+        let r = if byte < 0x80 {
+            ctx.write(at, &u32::from(byte).to_le_bytes())?;
+            if byte == 0 {
+                ctx.write(src, &0u64.to_le_bytes())?;
+                return reset_and(ctx, state, o);
+            }
+            1
+        } else {
+            let r = mbrtoc32(ctx, at, s.wrapping_add(i), nmc - i, state)?;
+            if r == MB_ILLEGAL {
+                ctx.write(src, &s.wrapping_add(i).to_le_bytes())?;
+                return illegal(ctx, state);
+            }
+            if r == MB_INCOMPLETE_SEQUENCE {
+                ctx.write(src, &s.wrapping_add(nmc).to_le_bytes())?;
+                return illegal(ctx, state);
+            }
+            if r == 0 {
+                ctx.write(src, &0u64.to_le_bytes())?;
+                return reset_and(ctx, state, o);
+            }
+            r
+        };
+        i += r;
+        o += 1;
+    }
+    ctx.write(src, &s.wrapping_add(i).to_le_bytes())?;
+    reset_and(ctx, state, o)
+}
+
+/// `size_t wcsnrtombs(char *dst, const wchar_t **src, size_t nwc, size_t len, mbstate_t *ps)` --
+/// bionic's, ported as [`mbsnrtowcs`] is: a non-initial state is `EILSEQ`; a NULL `dst` measures;
+/// a character that might not fit the `len - o` bytes left is encoded aside and the loop stops
+/// when it does not fit; `*src` is advanced by the characters consumed, or set to NULL at the
+/// terminating NUL. bionic's `wcsrtombs` is this with `nwc = SIZE_MAX`.
+///
+/// # Errors
+///
+/// Only a guest memory [`Fault`].
+pub fn wcsnrtombs(
+    ctx: &mut impl crate::context::GuestContext,
+    dst: u64,
+    src: u64,
+    nwc: u64,
+    len: u64,
+    state: u64,
+) -> Result<u64, Fault> {
+    if !state_is_initial(ctx, state)? {
+        return illegal(ctx, state);
+    }
+    let s = read_word(ctx, src)?;
+    let (mut i, mut o) = (0u64, 0u64);
+    if dst == 0 {
+        while i < nwc {
+            let wc = read_wchar(ctx, s.wrapping_add(4 * i))?;
+            let r = if wc < 0x80 {
+                if wc == 0 {
+                    return Ok(o);
+                }
+                1
+            } else {
+                match c32_encode(wc) {
+                    Some((_, length)) => length as u64,
+                    None => {
+                        ctx.set_errno(EILSEQ);
+                        return Ok(MB_ILLEGAL);
+                    }
+                }
+            };
+            i += 1;
+            o += r;
+        }
+        return Ok(o);
+    }
+    while i < nwc && o < len {
+        let wc = read_wchar(ctx, s.wrapping_add(4 * i))?;
+        let at = dst.wrapping_add(o);
+        let r = if wc < 0x80 {
+            ctx.write(at, &[wc as u8])?;
+            if wc == 0 {
+                ctx.write(src, &0u64.to_le_bytes())?;
+                return Ok(o);
+            }
+            1
+        } else {
+            let Some((bytes, length)) = c32_encode(wc) else {
+                ctx.set_errno(EILSEQ);
+                ctx.write(src, &s.wrapping_add(4 * i).to_le_bytes())?;
+                return Ok(MB_ILLEGAL);
+            };
+            let length = length as u64;
+            if len - o < MB_LEN_MAX && length > len - o {
+                break;
+            }
+            ctx.write(at, &bytes[..length as usize])?;
+            length
+        };
+        i += 1;
+        o += r;
+    }
+    ctx.write(src, &s.wrapping_add(4 * i).to_le_bytes())?;
+    Ok(o)
+}
+
+/// `wint_t btowc(int c)` -- bionic's (OpenBSD's `btowc.c`): `EOF` is `WEOF`; otherwise the byte
+/// `(char)c` through `mbrtowc` with a fresh state, and anything but a one-byte answer is `WEOF`.
+/// In UTF-8 that is: the byte itself below `0x80`, `WEOF` from `0x80` up.
+#[must_use]
+pub const fn btowc(c: i32) -> u32 {
+    if c == -1 {
+        return WEOF;
+    }
+    let byte = c as u8;
+    if byte < 0x80 {
+        byte as u32
+    } else {
+        WEOF
     }
 }
 

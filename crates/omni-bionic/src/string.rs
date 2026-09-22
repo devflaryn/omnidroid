@@ -175,6 +175,39 @@ pub fn strlen_chk(mem: &impl GuestMemory, s: u64, size: u64) -> crate::error::Bi
     Ok(len)
 }
 
+/// `char *__strchr_chk(const char *s, int c, size_t s_len)` -- bionic's FORTIFY `strchr`
+/// (`libc/bionic/fortify.cpp`): walk from `s` with `s_len` bytes of budget, returning the first
+/// byte equal to `(char)c` -- the terminating NUL included, when `c` is 0 -- or NULL at the NUL;
+/// a budget that runs out first is `__fortify_fatal("strchr: prevented read past end of
+/// buffer")`, reported here as [`BionicError::CheckFailed`](crate::error::BionicError::CheckFailed).
+///
+/// Errors: `CheckFailed` as above; a [`Fault`] on unmapped memory.
+pub fn strchr_chk(
+    mem: &impl GuestMemory,
+    s: u64,
+    c: i32,
+    s_len: u64,
+) -> crate::error::BionicResult<u64> {
+    let wanted = c as u8;
+    let mut at = s;
+    let mut left = s_len;
+    loop {
+        if left == 0 {
+            return Err(crate::error::BionicError::CheckFailed("__strchr_chk"));
+        }
+        let mut byte = [0u8; 1];
+        mem.read(at, &mut byte)?;
+        if byte[0] == wanted {
+            return Ok(at);
+        }
+        if byte[0] == 0 {
+            return Ok(0);
+        }
+        at = at.checked_add(1).ok_or(Fault(at))?;
+        left -= 1;
+    }
+}
+
 /// `size_t strnlen(const char *s, size_t n)`
 ///
 /// Returns `strlen(s)` if it is `< n`, else `n`. Never scans past `n` bytes: a string
@@ -249,6 +282,34 @@ pub fn strcmp(mem: &impl GuestMemory, a: u64, b: u64) -> Result<i32, Fault> {
         // standard only fixes the SIGN; bionic fixes the magnitude. We match bionic.
         Some((ca, cb)) => Ok(ca as i32 - cb as i32),
     }
+}
+
+/// `size_t strlcpy(char *dst, const char *src, size_t dsize)` -- OpenBSD's, which bionic builds:
+/// copy up to `dsize - 1` bytes and NUL-terminate when `dsize != 0`; return `strlen(src)`.
+///
+/// Errors: `Err(Fault)` on unmapped memory or a null `src`.
+pub fn strlcpy(mem: &mut impl GuestMemory, dst: u64, src: u64, dsize: u64) -> Result<u64, Fault> {
+    let len = strlen(mem, src)?;
+    if dsize != 0 {
+        let copy = len.min(dsize - 1);
+        let mut bytes = vec![0u8; usize::try_from(copy).map_err(|_| Fault(src))?];
+        mem.read(src, &mut bytes)?;
+        bytes.push(0);
+        mem.write(dst, &bytes)?;
+    }
+    Ok(len)
+}
+
+/// `size_t strxfrm(char *dst, const char *src, size_t n)` -- OpenBSD's, which bionic builds: "since
+/// locales are unimplemented, this is just a copy" -- `strlen(src)` for `n == 0`, else
+/// [`strlcpy`]. bionic's `strxfrm_l` is this.
+///
+/// Errors: as [`strlcpy`].
+pub fn strxfrm(mem: &mut impl GuestMemory, dst: u64, src: u64, n: u64) -> Result<u64, Fault> {
+    if n == 0 {
+        return strlen(mem, src);
+    }
+    strlcpy(mem, dst, src, n)
 }
 
 /// `int strncmp(const char *a, const char *b, size_t n)`
@@ -648,6 +709,17 @@ fn span_walk(
 /// Length of the initial segment of `s` made only of bytes in `accept`.
 pub fn strspn(mem: &impl GuestMemory, s: u64, accept: u64) -> Result<u64, Fault> {
     span_walk(mem, s, accept, true)
+}
+
+/// `char *strpbrk(const char *s, const char *accept)`
+///
+/// The first byte of `s` that is in `accept`, or NULL: `s + strcspn(s, accept)` unless that lands
+/// on the terminating NUL.
+pub fn strpbrk(mem: &impl GuestMemory, s: u64, accept: u64) -> Result<u64, Fault> {
+    let at = s + span_walk(mem, s, accept, false)?;
+    let mut byte = [0u8; 1];
+    mem.read(at, &mut byte)?;
+    Ok(if byte[0] == 0 { 0 } else { at })
 }
 
 /// `size_t strcspn(const char *s, const char *reject)`

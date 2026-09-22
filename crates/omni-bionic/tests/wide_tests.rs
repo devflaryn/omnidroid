@@ -13,7 +13,10 @@
 use omni_bionic::context::GuestContext;
 use omni_bionic::memory::{Fault, GuestMemory};
 use omni_bionic::mock::MockMemory;
-use omni_bionic::wide::{mbsrtowcs, mbrtowc, mbtowc, wctob, wmemcmp, wmemchr, wcslen};
+use omni_bionic::wide::{
+    btowc, c32rtomb, mbrtoc32, mbsnrtowcs, mbsrtowcs, mbrtowc, mbtowc, wcsnrtombs, wctob, wmemcmp,
+    wmemchr, wcslen, MB_ILLEGAL, WEOF,
+};
 
 /// Context double over [`MockMemory`].
 #[derive(Default)]
@@ -112,6 +115,127 @@ fn wctob_single_byte_range_only() {
 }
 
 // ------------------------------------------------------------------ mbrtowc
+
+/// bionic's `mbrtoc32`, which is its `mbrtowc`: a character **split across calls** is finished by
+/// the second call from the state the first left, and the second call returns the bytes *it*
+/// consumed; `(size_t)-1` with `EILSEQ` (not a refusal) for bad input, with the state reset.
+#[test]
+fn mbrtoc32_keeps_a_split_character_in_the_state_as_bionic_does() {
+    const STATE: u64 = 0x3000;
+    const OUT: u64 = 0x2000;
+    let state = |ctx: &Ctx| {
+        let mut b = [0u8; 4];
+        ctx.read(STATE, &mut b).unwrap();
+        b
+    };
+    let out = |ctx: &Ctx| {
+        let mut b = [0u8; 4];
+        ctx.read(OUT, &mut b).unwrap();
+        u32::from_le_bytes(b)
+    };
+    let mut ctx = Ctx::default();
+    ctx.mem.map(0x1000, b"A\xE2\x82\xAC\xFF\xC0\x80\xED\xA0\x80\x00");
+    ctx.mem.map(OUT, &[0u8; 4]);
+    ctx.mem.map(STATE, &[0u8; 8]);
+
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x1000, 8, STATE), Ok(1), "ASCII fast path");
+    assert_eq!(out(&ctx), 0x41);
+    // U+20AC in two calls: one byte, then the other two.
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x1001, 1, STATE), Ok(u64::MAX - 1), "incomplete");
+    assert_eq!(state(&ctx), [0xE2, 0, 0, 0], "the lead byte is kept");
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x1002, 2, STATE), Ok(2), "the bytes this call took");
+    assert_eq!(out(&ctx), 0x20AC);
+    assert_eq!(state(&ctx), [0; 4], "reset once complete");
+    // A bad lead byte, an overlong NUL and a surrogate: -1, EILSEQ, state reset.
+    for (at, len, what) in [(0x1004, 1, "0xFF"), (0x1005, 2, "C0 80"), (0x1007, 3, "a surrogate")] {
+        ctx.errno = 0;
+        assert_eq!(mbrtoc32(&mut ctx, OUT, at, len, STATE), Ok(u64::MAX), "{what}");
+        assert_eq!(ctx.errno, 84, "{what} is EILSEQ");
+        assert_eq!(state(&ctx), [0; 4], "{what} resets the state");
+    }
+    // A continuation expected and not found, mid-sequence.
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x1001, 1, STATE), Ok(u64::MAX - 1));
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x1000, 1, STATE), Ok(u64::MAX), "'A' is not 10xxxxxx");
+    // NUL, n == 0, and s == NULL.
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x100A, 1, STATE), Ok(0), "NUL");
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x1000, 0, STATE), Ok(0), "n == 0 is 0 on Android 13");
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0, 5, STATE), Ok(0), "s == NULL returns 0");
+    // A state with __seq[3] set is EINVAL.
+    ctx.write(STATE, &[0xF0, 0x9F, 0x98, 0x80]).unwrap();
+    assert_eq!(mbrtoc32(&mut ctx, OUT, 0x1000, 1, STATE), Ok(u64::MAX));
+    assert_eq!(ctx.errno, 22, "EINVAL");
+    assert_eq!(state(&ctx), [0; 4]);
+}
+
+/// bionic's `mbsnrtowcs`: `nmc` bounds the bytes read, `len` the characters written, `*src`
+/// ends where the conversion stopped -- mid-string when `len` runs out, at the bad byte for
+/// `EILSEQ` -- and a partial character left by `nmc` is `EILSEQ` with `*src` moved past `nmc`.
+#[test]
+fn mbsnrtowcs_moves_src_as_bionic_does() {
+    const STATE: u64 = 0x3000;
+    const SRC: u64 = 0x3100;
+    const DST: u64 = 0x2000;
+    let mut ctx = Ctx::default();
+    ctx.mem.map(0x1000, b"a\xE2\x82\xACbc\x00\xFFz\x00");
+    ctx.mem.map(DST, &[0u8; 64]);
+    ctx.mem.map(STATE, &[0u8; 8]);
+    ctx.mem.map(SRC, &[0u8; 8]);
+    let src = |ctx: &Ctx| {
+        let mut b = [0u8; 8];
+        ctx.read(SRC, &mut b).unwrap();
+        u64::from_le_bytes(b)
+    };
+    let set_src = |ctx: &mut Ctx, at: u64| ctx.write(SRC, &at.to_le_bytes()).unwrap();
+
+    set_src(&mut ctx, 0x1000);
+    assert_eq!(mbsnrtowcs(&mut ctx, 0, SRC, u64::MAX, 0, STATE), Ok(4), "measure: a U+20AC b c");
+    // `len` = 2: two characters, *src after them.
+    assert_eq!(mbsnrtowcs(&mut ctx, DST, SRC, u64::MAX, 2, STATE), Ok(2));
+    assert_eq!(src(&ctx), 0x1004, "past 'a' and the three bytes of U+20AC");
+    // `nmc` cutting U+20AC in half: EILSEQ, *src past nmc.
+    set_src(&mut ctx, 0x1000);
+    assert_eq!(mbsnrtowcs(&mut ctx, DST, SRC, 2, 8, STATE), Ok(MB_ILLEGAL));
+    assert_eq!(ctx.errno, 84);
+    assert_eq!(src(&ctx), 0x1002, "*src += nmc");
+    // A bad byte: EILSEQ with *src at it.
+    set_src(&mut ctx, 0x1007);
+    assert_eq!(mbsnrtowcs(&mut ctx, DST, SRC, u64::MAX, 8, STATE), Ok(MB_ILLEGAL));
+    assert_eq!(src(&ctx), 0x1007);
+}
+
+/// bionic's `wcsnrtombs` and `c32rtomb`: `len` too short for the next character stops before it
+/// (a partial character is never written), and past `0x1FFFFF` is `EILSEQ`.
+#[test]
+fn wcsnrtombs_stops_before_a_character_that_does_not_fit() {
+    const STATE: u64 = 0x3000;
+    const SRC: u64 = 0x3100;
+    const DST: u64 = 0x2000;
+    let mut ctx = Ctx::default();
+    let mut wide = Vec::new();
+    for c in [0x61u32, 0x20AC, 0x62, 0] {
+        wide.extend_from_slice(&c.to_le_bytes());
+    }
+    ctx.mem.map(0x1000, &wide);
+    ctx.mem.map(DST, &[0xEEu8; 16]);
+    ctx.mem.map(STATE, &[0u8; 8]);
+    ctx.mem.map(SRC, &0x1000u64.to_le_bytes());
+    assert_eq!(wcsnrtombs(&mut ctx, 0, SRC, u64::MAX, 0, STATE), Ok(5), "measure");
+    assert_eq!(wcsnrtombs(&mut ctx, DST, SRC, u64::MAX, 3, STATE), Ok(1), "U+20AC needs 3");
+    let mut out = [0u8; 4];
+    ctx.read(DST, &mut out).unwrap();
+    assert_eq!(out, [0x61, 0xEE, 0xEE, 0xEE], "nothing of U+20AC was written");
+    let mut b = [0u8; 8];
+    ctx.read(SRC, &mut b).unwrap();
+    assert_eq!(u64::from_le_bytes(b), 0x1004, "*src at U+20AC");
+    assert_eq!(c32rtomb(&mut ctx, DST, 0x20_0000, STATE), Ok(MB_ILLEGAL));
+    assert_eq!(ctx.errno, 84);
+    assert_eq!(c32rtomb(&mut ctx, DST, 0x10_FFFF, STATE), Ok(4));
+    assert_eq!(c32rtomb(&mut ctx, 0, 0x41, STATE), Ok(1), "s == NULL is 1");
+    assert_eq!(btowc(-1), WEOF);
+    assert_eq!(btowc(0x141), 0x41, "(char)c");
+    assert_eq!(btowc(0x80), WEOF);
+    assert_eq!(wctob(WEOF), -1);
+}
 
 #[test]
 fn mbrtowc_ascii_and_multibyte_decode() {

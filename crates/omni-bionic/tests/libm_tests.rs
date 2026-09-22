@@ -16,7 +16,8 @@ use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts::{EDOM, ERANGE};
 use omni_bionic::libm::{
     acos, acosf, asin, asinf, atan2, atan2f, atanf, cos, cosf, cosh, exp, expf, fmodf, frexp,
-    ilogb, ldexp, ldexpf, log, log10, log10f, log2, modff, nan, pow, powf, sin, sincosf, sinf,
+    atan, cbrt, exp2, exp2f, expm1, fmod, frexpf, hypotf, nextafterf, round, tan, tanh,
+    ilogb, ldexp, ldexpf, log, log10, log10f, log2, modf, modff, nan, pow, powf, sin, sincosf, sinf,
     sinh, sinhf, tanf, tanhf,
 };
 use omni_bionic::memory::{Fault, GuestMemory};
@@ -411,6 +412,83 @@ fn modff_exact_split_and_signs() {
     assert_eq!(f32::from_le_bytes(ip), f32::INFINITY);
     // NaN propagates.
     assert!(modff(&mut c, f32::NAN, 0).unwrap().is_nan());
+}
+
+/// `modf`'s split, bit-exact, and Annex F's signs: the fraction of a negative integer is `-0.0`,
+/// and ±inf returns ±0 with the infinity stored.
+#[test]
+fn modf_exact_split_and_annex_f_signs() {
+    let mut c = ctx();
+    c.mem.map(0x3000, &[0u8; 8]);
+    fn stored(c: &mut Ctx) -> f64 {
+        let mut b = [0u8; 8];
+        c.mem.read(0x3000, &mut b).unwrap();
+        f64::from_le_bytes(b)
+    }
+    let cases: [(f64, f64, f64); 6] = [
+        (3.75, 0.75, 3.0),
+        (-3.75, -0.75, -3.0),
+        (-3.0, -0.0, -3.0),
+        (1e300, 0.0, 1e300),
+        (f64::INFINITY, 0.0, f64::INFINITY),
+        (f64::NEG_INFINITY, -0.0, f64::NEG_INFINITY),
+    ];
+    for (x, frac, int) in cases {
+        let got = modf(&mut c, x, 0x3000).unwrap();
+        assert_eq!(got.to_bits(), frac.to_bits(), "modf({x}) fraction");
+        assert_eq!(stored(&mut c).to_bits(), int.to_bits(), "modf({x}) integer part");
+    }
+    assert!(modf(&mut c, f64::NAN, 0x3000).unwrap().is_nan());
+    assert!(stored(&mut c).is_nan());
+}
+
+/// The twelve written for M6: the exact ones bit for bit, the transcendental ones on their
+/// edge-case contract.
+#[test]
+fn the_m6_libm_additions_keep_their_contracts() {
+    let mut c = ctx();
+    // exact
+    assert_eq!(fmod(&mut c, 7.5, 2.0).to_bits(), 1.5f64.to_bits());
+    assert_eq!(fmod(&mut c, -7.5, 2.0).to_bits(), (-1.5f64).to_bits(), "the sign of x");
+    c.errno = 0;
+    assert!(fmod(&mut c, 1.0, 0.0).is_nan());
+    assert_eq!(c.errno, EDOM);
+    assert_eq!(round(2.5), 3.0);
+    assert_eq!(round(-2.5), -3.0);
+    assert_eq!(round(-0.4).to_bits(), (-0.0f64).to_bits());
+    assert_eq!(nextafterf(&mut c, 1.0, 2.0), f32::from_bits(1.0f32.to_bits() + 1));
+    assert_eq!(nextafterf(&mut c, 1.0, 0.0), f32::from_bits(1.0f32.to_bits() - 1));
+    assert_eq!(nextafterf(&mut c, -1.0, 0.0), f32::from_bits((-1.0f32).to_bits() - 1));
+    assert_eq!(nextafterf(&mut c, 0.0, -1.0).to_bits(), 0x8000_0001, "-smallest subnormal");
+    c.errno = 0;
+    assert_eq!(nextafterf(&mut c, f32::MAX, f32::INFINITY), f32::INFINITY);
+    assert_eq!(c.errno, ERANGE, "overflow");
+    c.mem.map(0x4000, &[0u8; 4]);
+    assert_eq!(frexpf(&mut c, 12.0, 0x4000).unwrap(), 0.75);
+    let mut e = [0u8; 4];
+    c.mem.read(0x4000, &mut e).unwrap();
+    assert_eq!(i32::from_le_bytes(e), 4);
+    assert_eq!(frexpf(&mut c, f32::from_bits(1), 0x4000).unwrap(), 0.5, "the smallest subnormal");
+    c.mem.read(0x4000, &mut e).unwrap();
+    assert_eq!(i32::from_le_bytes(e), -148);
+    // transcendental, on their edges
+    assert_eq!(atan(&mut c, 0.0), 0.0);
+    assert_eq!(cbrt(&mut c, -27.0), -3.0);
+    assert_eq!(tanh(&mut c, f64::INFINITY), 1.0);
+    c.errno = 0;
+    assert!(tan(&mut c, f64::INFINITY).is_nan());
+    assert_eq!(c.errno, EDOM);
+    c.errno = 0;
+    assert_eq!(exp2(&mut c, 2000.0), f64::INFINITY);
+    assert_eq!(c.errno, ERANGE);
+    assert_eq!(exp2f(&mut c, 3.0), 8.0);
+    assert_eq!(expm1(&mut c, 0.0), 0.0);
+    assert_eq!(hypotf(&mut c, 3.0, 4.0), 5.0);
+    assert_eq!(hypotf(&mut c, f32::INFINITY, f32::NAN), f32::INFINITY, "Annex F");
+    // modff's Annex F signs, fixed in M6.
+    c.mem.map(0x5000, &[0u8; 4]);
+    assert_eq!(modff(&mut c, -3.0, 0x5000).unwrap().to_bits(), (-0.0f32).to_bits());
+    assert_eq!(modff(&mut c, f32::NEG_INFINITY, 0x5000).unwrap().to_bits(), (-0.0f32).to_bits());
 }
 
 #[test]

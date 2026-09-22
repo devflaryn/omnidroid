@@ -151,6 +151,62 @@ pub const LCONV_C_VALUES: LconvValues = LconvValues {
 /// `CHAR_MAX` for signed char on arm64.
 pub const CHAR_MAX: i8 = 127;
 
+/// `sizeof(struct lconv)` on arm64: ten `char *` (80 bytes), fourteen `char`s, and two bytes of
+/// padding to the struct's eight-byte alignment.
+pub const LCONV_BYTES: usize = 96;
+
+/// The ten strings of an `lconv`, in **bionic's declaration order** (`libc/include/locale.h`:
+/// `decimal_point`, `thousands_sep`, `grouping`, `int_curr_symbol`, `currency_symbol`,
+/// `mon_decimal_point`, `mon_thousands_sep`, `mon_grouping`, `positive_sign`, `negative_sign`) --
+/// the order [`compose_lconv`] lays their addresses out in.
+#[must_use]
+pub const fn lconv_strings(values: &LconvValues) -> [&'static str; 10] {
+    [
+        values.decimal_point,
+        values.thousands_sep,
+        values.grouping,
+        values.int_curr_symbol,
+        values.currency_symbol,
+        values.mon_decimal_point,
+        values.mon_thousands_sep,
+        values.mon_grouping,
+        values.positive_sign,
+        values.negative_sign,
+    ]
+}
+
+/// bionic's `struct lconv` as guest bytes: the ten string addresses (in [`lconv_strings`] order,
+/// little-endian), then the fourteen `char` fields in declaration order -- `int_frac_digits`,
+/// `frac_digits`, `p_cs_precedes`, `p_sep_by_space`, `n_cs_precedes`, `n_sep_by_space`,
+/// `p_sign_posn`, `n_sign_posn`, then the six `int_*` -- then zero padding.
+#[must_use]
+pub fn compose_lconv(values: &LconvValues, strings: [u64; 10]) -> [u8; LCONV_BYTES] {
+    let mut out = [0u8; LCONV_BYTES];
+    for (k, at) in strings.iter().enumerate() {
+        out[8 * k..8 * k + 8].copy_from_slice(&at.to_le_bytes());
+    }
+    let chars = [
+        values.int_frac_digits,
+        values.frac_digits,
+        values.p_cs_precedes,
+        values.p_sep_by_space,
+        values.n_cs_precedes,
+        values.n_sep_by_space,
+        values.p_sign_posn,
+        values.n_sign_posn,
+        values.int_p_cs_precedes,
+        values.int_p_sep_by_space,
+        values.int_n_cs_precedes,
+        values.int_n_sep_by_space,
+        values.int_p_sign_posn,
+        values.int_n_sign_posn,
+    ];
+    for (k, value) in chars.iter().enumerate() {
+        out[80 + k] = value.to_le_bytes()[0];
+    }
+    out
+}
+
 /// The C/POSIX locale's `lconv` field values (see [`LCONV_C_VALUES`]).
 pub struct LconvValues {
     /// Decimal separator: ".".
