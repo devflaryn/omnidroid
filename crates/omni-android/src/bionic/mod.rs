@@ -245,6 +245,12 @@ pub struct Bionic {
     /// reason: only the embedding knows, and a number this layer chose would be a number with
     /// nothing behind it. `sysinfo` refuses by name until it is set.
     memory_budget: Mutex<Option<u64>>,
+    /// The Android application uid this guest runs as, for `geteuid`.
+    ///
+    /// **No default**, for [`memory_budget`](Bionic::set_memory_budget)'s reason: an app's uid
+    /// is assigned by the package manager at install time, the APK does not carry it, and the
+    /// Windows host has no uid to report. See [`Bionic::set_app_uid`].
+    app_uid: OnceLock<u32>,
     /// Which network this guest instance may reach.
     ///
     /// **`None` until the embedding says, and a socket cannot be created without one** — the same
@@ -557,6 +563,7 @@ impl Bionic {
             space,
             arena,
             net_policy: OnceLock::new(),
+            app_uid: OnceLock::new(),
             addrinfo: addrinfo::AddrinfoSlab::new(resolver),
             threads: ThreadTable::new(),
             futex: AddressFutex::new(),
@@ -1295,6 +1302,52 @@ impl Bionic {
     /// `sysinfo` refuses by name, naming this method, until it has been called.
     pub fn set_memory_budget(&self, bytes: u64) {
         *self.memory_budget.lock() = Some(bytes);
+    }
+
+    /// Tell this guest which Android application uid it runs as -- what `geteuid` answers.
+    ///
+    /// **There is no default.** An app's uid is assigned when it is installed; it is not in the
+    /// APK, and this host has none of its own, so the only honest source is the embedding --
+    /// which is standing in for the package manager that would have assigned it. `geteuid`
+    /// refuses by name, naming this method, until it is set.
+    ///
+    /// **Refused unless it is an application uid**: `uid % 100000` (`AID_USER_OFFSET`, one block
+    /// per Android user) must lie in `AID_APP_START..=AID_APP_END`, `10000..=19999`, because an
+    /// app process never runs as anything else. The engine's measured reader shows why that
+    /// matters rather than being pedantry: SQLite's `robustFchown` asks `geteuid()` whether it is
+    /// root and, if so, `fchown`s every file it creates. Set once; a process's uid does not
+    /// change under it.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] for a uid outside the application range, or for a second call.
+    pub fn set_app_uid(&self, uid: u32) -> AbiResult<()> {
+        let refuse = |why: String| AbiError::Refused {
+            symbol: "Bionic::set_app_uid".to_string(),
+            address: 0,
+            why,
+        };
+        let app_id = uid % 100_000;
+        if !(10_000..=19_999).contains(&app_id) {
+            return Err(refuse(format!(
+                "uid {uid} is not an Android application uid: its app id {app_id} is outside \
+                 AID_APP_START..=AID_APP_END (10000..=19999), and an app process never runs as \
+                 anything else"
+            )));
+        }
+        match self.app_uid.set(uid) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(refuse(format!(
+                "this instance's uid is already {}, and a process's uid does not change under it",
+                self.app_uid.get().copied().unwrap_or(uid)
+            ))),
+        }
+    }
+
+    /// The uid [`set_app_uid`](Bionic::set_app_uid) gave this guest, if one has been given.
+    #[must_use]
+    pub fn app_uid(&self) -> Option<u32> {
+        self.app_uid.get().copied()
     }
 
     /// Tell this guest instance which network it may reach.

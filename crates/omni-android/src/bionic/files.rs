@@ -64,7 +64,7 @@ use omni_bionic::errno::consts;
 use omni_mem::GuestAddr;
 use omni_platform::fs::{
     AccessCheck, DirEntryInfo, FileKind, FileStat, Filesystem, FsErrorKind, FsResult,
-    OpenFlags, VolumeStats, IO_BLOCK,
+    OpenFlags, RecordLock, VolumeStats, IO_BLOCK,
 };
 
 use crate::abi::Args;
@@ -1725,6 +1725,22 @@ pub(super) fn ioctl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 const F_GETFL: i32 = 3;
 /// `F_SETFL`: set the descriptor's status flags.
 const F_SETFL: i32 = 4;
+/// `F_GETLK`: would this record lock be granted? Linux `asm-generic/fcntl.h`; on LP64 there is
+/// no separate `F_GETLK64`, the one command takes the one 64-bit `struct flock`.
+const F_GETLK: i32 = 5;
+/// `F_SETLK`: take or release a record lock, failing rather than waiting on a conflict.
+const F_SETLK: i32 = 6;
+/// `F_SETLKW`: the same, waiting on a conflict.
+const F_SETLKW: i32 = 7;
+/// `struct flock`'s `l_type` values, `asm-generic/fcntl.h`.
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+/// Bytes of LP64 `struct flock`: `short l_type; short l_whence; off_t l_start; off_t l_len;
+/// pid_t l_pid;` at 0, 2, 8, 16 and 24, padded to 32. The offsets are the engine's own: SQLite's
+/// lock path stores `l_type` at `[sp]`, `l_whence` at `[sp, #2]`, `l_start` at `[sp, #8]` and
+/// `l_len` at `[sp, #0x10]` (`libroblox.so` link `0x22d70b0`-`0x22d70c8`).
+const FLOCK_BYTES: usize = 32;
 
 /// The `fcntl` commands this layer knows the names of.
 ///
@@ -1868,14 +1884,25 @@ pub(super) fn fcntl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                     }
                 }
             }
+            F_GETLK | F_SETLK | F_SETLKW => {
+                match record_lock(&view, fs, fd, command, argument)? {
+                    Settled::Done(()) => 0,
+                    Settled::Failed(errno) => {
+                        view.set_errno(errno);
+                        -1
+                    }
+                }
+            }
             other => {
                 return Err(view.refusal(format!(
-                    "the guest called `fcntl` with {} on fd {fd}. This layer implements F_GETFL \
-                     and F_SETFL(O_NONBLOCK), which is what the GameActivity glue needs for its \
-                     two pipes (jni-surface.md §5.2). Every other command asks for something this \
-                     runtime does not have: a second descriptor for one description, a \
-                     close-on-exec flag with nothing to exec, a record lock, a signal owner, or a \
-                     pipe capacity this layer fixes at omni_platform::fs::PIPE_CAPACITY",
+                    "the guest called `fcntl` with {} on fd {fd}. This layer implements F_GETFL, \
+                     F_SETFL(O_NONBLOCK) -- what the GameActivity glue needs for its two pipes \
+                     (jni-surface.md §5.2) -- and the process-private record locks \
+                     F_GETLK/F_SETLK/F_SETLKW the engine's SQLite takes. Every other command asks \
+                     for something this runtime does not have: a second descriptor for one \
+                     description, a close-on-exec flag with nothing to exec, a signal owner, an \
+                     open-file-description lock, or a pipe capacity this layer fixes at \
+                     omni_platform::fs::PIPE_CAPACITY",
                     fcntl_command_name(other)
                 )));
             }
@@ -1883,6 +1910,90 @@ pub(super) fn fcntl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     c.ret().i32(result);
     Ok(())
+}
+
+/// `fcntl`'s three record-lock commands, over the `struct flock` at `at`.
+///
+/// Validated in **Linux's order**, because a caller can tell the orders apart by which `errno`
+/// it gets: `l_type` (`EINVAL`), then `l_whence` and the range (`EINVAL`, or `EOVERFLOW` for an
+/// end past `off_t`), and only then the descriptor's access mode (`EBADF`, `F_SETLK`/`F_SETLKW`
+/// only -- `fcntl_getlk` does not check it). See [`Filesystem::record_lock`] for why a valid
+/// request is granted: no other process can hold a conflicting lock, so there is nothing to wait
+/// for (`F_SETLKW` never blocks) and nothing for `F_GETLK` to report (it answers `F_UNLCK` and
+/// leaves every other field as it was, which is what Linux writes back when nothing conflicts).
+///
+/// `SEEK_CUR` and `SEEK_END` refuse by name: they need the descriptor's offset or size, and the
+/// only measured caller -- SQLite -- always passes `SEEK_SET`.
+fn record_lock(
+    view: &GuestView<'_>,
+    fs: &Filesystem,
+    fd: i32,
+    command: i32,
+    at: u64,
+) -> AbiResult<Settled<()>> {
+    let pointer =
+        usize::try_from(at).map_err(|_| view.refusal("a `struct flock *` wider than usize"))?;
+    if pointer == 0 {
+        // Linux: EFAULT. Refused, for the reason `pipe` refuses a null `pipefd`.
+        return Err(view.refusal(format!(
+            "`fcntl({})` was given a null `struct flock *`",
+            fcntl_command_name(command)
+        )));
+    }
+    let bytes = view.mem().read_bytes(
+        pointer,
+        FLOCK_BYTES,
+        Blame::new(view.symbol(), view.address(), 2),
+    )?;
+    let l_type = i16::from_le_bytes([bytes[0], bytes[1]]);
+    let l_whence = i16::from_le_bytes([bytes[2], bytes[3]]);
+    let l_start = i64::from_le_bytes(bytes[8..16].try_into().expect("eight bytes"));
+    let l_len = i64::from_le_bytes(bytes[16..24].try_into().expect("eight bytes"));
+
+    let lock = match (command, l_type) {
+        (F_GETLK | F_SETLK | F_SETLKW, F_RDLCK) => RecordLock::Shared,
+        (F_GETLK | F_SETLK | F_SETLKW, F_WRLCK) => RecordLock::Exclusive,
+        (F_SETLK | F_SETLKW, F_UNLCK) => RecordLock::Release,
+        // `F_GETLK` with `F_UNLCK`, and any other type: `fcntl_getlk`/`flock_to_posix_lock`.
+        _ => return Ok(Settled::Failed(consts::EINVAL)),
+    };
+    match l_whence {
+        0 => {}
+        1 | 2 => {
+            return Err(view.refusal(format!(
+                "`fcntl({})` with l_whence {} ({}): a lock relative to the descriptor's {} needs \
+                 that value, and no run has reached one -- SQLite passes SEEK_SET",
+                fcntl_command_name(command),
+                l_whence,
+                if l_whence == 1 { "SEEK_CUR" } else { "SEEK_END" },
+                if l_whence == 1 { "offset" } else { "size" }
+            )))
+        }
+        _ => return Ok(Settled::Failed(consts::EINVAL)),
+    }
+    // `flock_to_posix_lock`: a negative start is EINVAL, an end past `off_t` is EOVERFLOW, and a
+    // negative length locks the bytes *before* the start, which must not reach below zero.
+    if l_start < 0 {
+        return Ok(Settled::Failed(consts::EINVAL));
+    }
+    if l_len > 0 && l_start.checked_add(l_len - 1).is_none() {
+        return Ok(Settled::Failed(consts::EOVERFLOW));
+    }
+    if l_len < 0 && l_start.checked_add(l_len).map_or(true, |start| start < 0) {
+        return Ok(Settled::Failed(consts::EINVAL));
+    }
+
+    if command == F_GETLK {
+        // The descriptor must still be a file this seam locks; its access mode is not checked,
+        // because Linux does not check it for a test. The requested type was validated above
+        // and is not otherwise needed: nothing can conflict with it.
+        if let Settled::Failed(errno) = settle(view, fs.record_lock(fd, RecordLock::Release))? {
+            return Ok(Settled::Failed(errno));
+        }
+        write_struct(view, at, &F_UNLCK.to_le_bytes(), 2)?;
+        return Ok(Settled::Done(()));
+    }
+    settle(view, fs.record_lock(fd, lock))
 }
 
 #[cfg(test)]

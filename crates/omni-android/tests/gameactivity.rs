@@ -365,6 +365,12 @@ impl Guest {
         bionic
             .set_network_policy(Arc::new(NetPolicy::unrestricted()))
             .expect("a network policy");
+        // **The uid the package manager would have assigned**, which only an embedding can
+        // supply: it is not in the APK and Windows has none. 10000 is `FIRST_APPLICATION_UID`,
+        // what Android's package manager gives the first app it installs, and this gate is
+        // standing in for a device with exactly one. SQLite asks, through `geteuid`, whether it
+        // is root; an app never is.
+        bionic.set_app_uid(10_000).expect("an application uid");
         // §5.2 step 2. The host has to *set* it or the SDK version field is empty.
         bionic
             .set_system_property("ro.build.version.sdk", SDK_VERSION)

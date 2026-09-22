@@ -1144,6 +1144,67 @@ impl Filesystem {
         }
     }
 
+    /// Take or release a POSIX (`fcntl`) record lock on `fd` -- **granted, because in this
+    /// runtime nothing can hold a lock that conflicts with it**.
+    ///
+    /// # Why granting is the lock and not a stub of one
+    ///
+    /// A POSIX record lock belongs to a **process**, and a process's own locks never conflict
+    /// with each other: a new lock over a range it already holds replaces the old one, and
+    /// `F_GETLK` reports only a lock "that would prevent this lock from being created", which
+    /// the caller's own cannot be (POSIX `fcntl`, "Record locking"). So the only thing that can
+    /// refuse a lock is *another process* holding a conflicting one, and the only thing a lock
+    /// table is for is deciding that.
+    ///
+    /// Every descriptor here was opened under this instance's root, which is per instance
+    /// (D30 (3)), and an instance is one OS process (`ARCHITECTURE.md` section 7). No other
+    /// process locks these files through this seam, so the kernel's answer to every lock this
+    /// guest can ask for is success, and a table recording them would never be consulted.
+    ///
+    /// **What would falsify it**, so it can be checked rather than trusted: an embedding that
+    /// points two *processes* at one root. They would each be told they hold an exclusive lock,
+    /// and this would need host locks -- which on Windows are mandatory and per handle, so they
+    /// are not POSIX locks either, and are not a drop-in.
+    ///
+    /// MEASURED reader: the engine's embedded SQLite, `unixFileLock` at `libroblox.so` link
+    /// `0x22d72a4`, taking `F_SETLK` on SQLite's `PENDING_BYTE` (`0x40000000`, one byte) from
+    /// `0x22d70d0` on a guest worker -- which was killed by the refusal this replaces.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold, and for a
+    /// [`RecordLock::Shared`] on one not open for reading or a [`RecordLock::Exclusive`] on one
+    /// not open for writing -- POSIX's own `EBADF` for exactly those two. [`FsError::Refused`]
+    /// for anything but a regular file: Linux locks pipes and sockets too, and no run has asked.
+    pub fn record_lock(&self, fd: i32, lock: RecordLock) -> FsResult<()> {
+        const OP: &str = "record_lock";
+        let table = self.table();
+        match table.open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::File { readable, writable, .. }) => match lock {
+                RecordLock::Shared if !*readable => Err(FsError::kinded(
+                    OP,
+                    format!("fd {fd}"),
+                    FsErrorKind::BadDescriptor,
+                    "a shared (F_RDLCK) lock needs a descriptor open for reading",
+                )),
+                RecordLock::Exclusive if !*writable => Err(FsError::kinded(
+                    OP,
+                    format!("fd {fd}"),
+                    FsErrorKind::BadDescriptor,
+                    "an exclusive (F_WRLCK) lock needs a descriptor open for writing",
+                )),
+                RecordLock::Shared | RecordLock::Exclusive | RecordLock::Release => Ok(()),
+            },
+            Some(_) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "a record lock on a descriptor that is not a regular file: Linux allows one, and \
+                 no run has reached it, so it is refused by name rather than granted unmeasured",
+            )),
+        }
+    }
+
     /// The readiness generation, read **before** testing readiness so that a change arriving
     /// between the test and the wait cannot be missed.
     #[must_use]
@@ -1974,6 +2035,17 @@ fn describe(host: &Path, metadata: &std::fs::Metadata) -> FileStat {
 /// and the caller's own answer for `None` is a zero timestamp rather than a wrong one.
 fn since_epoch(time: Option<SystemTime>) -> Option<Duration> {
     time.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+}
+
+/// What a POSIX record lock asks for, which is all [`Filesystem::record_lock`] decides about one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordLock {
+    /// `F_RDLCK`: a shared lock, which needs the descriptor open for reading.
+    Shared,
+    /// `F_WRLCK`: an exclusive lock, which needs it open for writing.
+    Exclusive,
+    /// `F_UNLCK`: a release, which needs neither.
+    Release,
 }
 
 /// The `EBADF` every descriptor operation shares.

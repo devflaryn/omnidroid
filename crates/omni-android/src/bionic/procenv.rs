@@ -206,6 +206,32 @@ pub(super) fn getpid(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `uid_t geteuid(void)`
+///
+/// The application uid the embedding gave [`Bionic::set_app_uid`](super::Bionic::set_app_uid),
+/// which is what an Android app process's effective uid is: the package manager's assignment,
+/// never root. Refused by name until one is given -- the host is Windows and has no uid, and a
+/// number chosen here would be the plausible wrong answer Global Constraint 1 names.
+///
+/// MEASURED reader: the engine's embedded SQLite, on the thread that had just taken its first
+/// record lock (`libroblox.so` link `0x22be3e8`), which is SQLite's `robustFchown` deciding
+/// whether it is root. The guest thread died on the `Unbound` this replaces.
+pub(super) fn geteuid(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let state = active(c.symbol(), c.address())?;
+    let Some(uid) = state.bionic.app_uid() else {
+        return Err(refuse(
+            c,
+            "this guest instance has no application uid. An Android app's uid is assigned by the \
+             package manager at install time -- it is not in the APK, and this host has none -- \
+             so the embedding supplies it with `Bionic::set_app_uid`, and none has been supplied"
+                .to_string(),
+        ));
+    };
+    // `uid_t` is an unsigned 32-bit type on bionic; written as the 32 bits it is.
+    c.ret().i32(uid as i32);
+    Ok(())
+}
+
 /// `int sched_getcpu(void)`
 ///
 /// Answered on Windows from `GetCurrentProcessorNumber`. On a target whose process backend is

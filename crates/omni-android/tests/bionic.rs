@@ -440,6 +440,19 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          and is deliberately NOT bound -- no run has reached it. The file's LAST section, with \
          `getpeername` three lines above it.",
     ),
+    (
+        "geteuid",
+        "M6, the first run in which the client-settings success path ran on: SQLite, on the \
+         thread that had just taken its first `fcntl(F_SETLK)` record lock, asking whether it is \
+         root -- `robustFchown` `fchown`s every file it creates when it is. GuestThreadFailure { \
+         thread: 8, why: \"the guest called the imported symbol `geteuid` through its thunk at \
+         0x2495c454ff0, and nothing in the compatibility layer implements it\" }, from link \
+         0x22be3e8. NEW, and not computation either: nothing in `omni-bionic` or the host knows \
+         an Android uid, because the package manager assigns one at install time and the APK \
+         does not carry it. So it is a seam with no default, `Bionic::set_app_uid`, which refuses \
+         anything but an application uid. `getuid` is its sibling in the same never-referenced \
+         section and is deliberately NOT bound -- no run has reached it.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -490,7 +503,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 210, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 211, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -553,7 +566,11 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // `socket`, `getaddrinfo` and `freeaddrinfo` were bound and refusing since phase 3d and now
     // answer, which is a category change rather than a count change. See
     // `the_final_split_of_the_reachable_set_is_what_the_record_claims`.
-    assert_eq!(Bionic::inline_symbols().count(), 196);
+    //
+    // **The settings success path adds `geteuid`, inline, for 197**: SQLite asking whether it is
+    // root. Answered from a seam with no default, because no source this runtime has knows an
+    // Android uid. See its `BEYOND_THE_PREDICTION` entry.
+    assert_eq!(Bionic::inline_symbols().count(), 197);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -8405,6 +8422,166 @@ fn fcntl_round_trips_o_nonblock_and_refuses_every_other_command() {
         asm.mov(2, 0o20000);
     });
     assert!(error.to_string().contains("O_ASYNC"), "{error}");
+}
+
+/// **`geteuid` answers the application uid the embedding gave, and refuses until it is given.**
+///
+/// Three things, each a separate failure: the refusal names the setter (a guest that dies on it
+/// must say what to do); the value is exactly the one given (a uid chosen here would be the
+/// plausible wrong answer); and the setter refuses root and anything outside the application
+/// range, because SQLite -- the measured caller -- `fchown`s every file it creates when it is
+/// root.
+#[test]
+fn geteuid_answers_the_application_uid_the_embedding_gave_and_nothing_else() {
+    let _guard = serialized();
+    let f = fixture();
+    let error = refusal_of(&f, "geteuid", |_| {});
+    assert_eq!(error.symbol(), Some("geteuid"));
+    assert!(error.to_string().contains("set_app_uid"), "{error}");
+
+    for bad in [0u32, 1000, 9_999, 20_000, 100_000, 99_999] {
+        assert!(f.bionic.set_app_uid(bad).is_err(), "uid {bad} is not an application uid");
+    }
+    assert_eq!(f.bionic.app_uid(), None, "a refused uid is not kept");
+
+    // User 10's copy of an app, to show the per-user offset is understood rather than ignored.
+    let uid = 10 * 100_000 + 10_123;
+    f.bionic.set_app_uid(uid).expect("an application uid");
+    assert_eq!(value_of(&f, "geteuid", |_| {}) as u32, uid);
+    assert!(f.bionic.set_app_uid(10_124).is_err(), "a process's uid does not change under it");
+    assert_eq!(value_of(&f, "geteuid", |_| {}) as u32, uid, "and the first one stands");
+}
+
+/// `F_GETLK`, `F_SETLK`, `F_SETLKW` and the three `l_type`s, Linux `asm-generic/fcntl.h`.
+const F_GETLK_GUEST: u64 = 5;
+const F_SETLK_GUEST: u64 = 6;
+const F_SETLKW_GUEST: u64 = 7;
+const F_RDLCK_GUEST: i16 = 0;
+const F_WRLCK_GUEST: i16 = 1;
+const F_UNLCK_GUEST: i16 = 2;
+/// SQLite's `PENDING_BYTE`, the byte the engine's SQLite locked when the refusal killed it.
+const SQLITE_PENDING_BYTE: i64 = 0x4000_0000;
+
+/// One `fcntl` record-lock call through real guest code: the `struct flock` is written into
+/// guest memory in LP64 layout, and `(return value, errno, the struct afterwards)` comes back.
+fn lock_through_guest(
+    f: &Fixture,
+    fd: i32,
+    command: u64,
+    (l_type, l_whence, l_start, l_len): (i16, i16, i64, i64),
+) -> (i64, u64, Vec<u8>) {
+    let flock = f.guest.data + 0x300;
+    let mut bytes = [0u8; 32];
+    bytes[0..2].copy_from_slice(&l_type.to_le_bytes());
+    bytes[2..4].copy_from_slice(&l_whence.to_le_bytes());
+    bytes[8..16].copy_from_slice(&l_start.to_le_bytes());
+    bytes[16..24].copy_from_slice(&l_len.to_le_bytes());
+    f.guest.write_bytes(flock, &bytes);
+    let out = f.guest.data + 0x400;
+    // errno is cleared first, so a success that left a stale value cannot read as a failure.
+    f.guest.write_u64(out + 8, 0);
+    let entry = program(f, |asm| {
+        asm.bl(f.thunk("__errno"));
+        asm.mov(9, 0);
+        asm.push(str_w(9, 0, 0));
+        asm.mov(0, fd as u64);
+        asm.mov(1, command);
+        asm.mov(2, flock as u64);
+        asm.bl(f.thunk("fcntl"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(f, entry).expect("completes"), ExitReason::Returned { .. }));
+    (f.guest.read_u64(out) as i64, f.guest.read_u64(out + 8), read_guest(f, flock, 32))
+}
+
+/// **The engine's SQLite takes POSIX record locks, and they are granted -- validated the way
+/// Linux validates them, in Linux's order.**
+///
+/// MEASURED on M6's gate: a guest worker died on `fcntl(F_SETLK)` over SQLite's `PENDING_BYTE`
+/// (`unixFileLock`, `libroblox.so` link `0x22d72a4`, called from `0x22d70d0`). A record lock
+/// belongs to a process and this instance is the only process that can lock its files, so a
+/// valid request always succeeds -- see `Filesystem::record_lock`. What *can* fail is asserted
+/// errno by errno, because each is a branch SQLite has.
+#[test]
+fn the_engines_sqlite_record_locks_are_granted_and_validated_like_linux() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("fcntl-lock");
+    let rw = open_through_guest(&f, "/db", O_RDWR | O_CREAT);
+    let ro = open_through_guest(&f, "/db", O_RDONLY);
+    let wo = open_through_guest(&f, "/db", O_WRONLY);
+    assert!(rw >= 3 && ro >= 3 && wo >= 3, "{rw} {ro} {wo}");
+
+    // SQLite's own request, byte for byte: a shared lock on PENDING_BYTE, then the others.
+    let pending = |l_type| (l_type, 0, SQLITE_PENDING_BYTE, 1);
+    for (command, lock, name) in [
+        (F_SETLK_GUEST, pending(F_RDLCK_GUEST), "F_SETLK F_RDLCK"),
+        (F_SETLK_GUEST, pending(F_WRLCK_GUEST), "F_SETLK F_WRLCK"),
+        (F_SETLKW_GUEST, pending(F_WRLCK_GUEST), "F_SETLKW F_WRLCK -- which must not wait"),
+        (F_SETLK_GUEST, pending(F_UNLCK_GUEST), "F_SETLK F_UNLCK"),
+        (F_SETLK_GUEST, (F_WRLCK_GUEST, 0, 0, 0), "a zero length, which is to end of file"),
+    ] {
+        let (ret, errno, _) = lock_through_guest(&f, rw, command, lock);
+        assert_eq!((ret, errno), (0, 0), "{name} on a read-write descriptor");
+    }
+
+    // F_GETLK: nothing conflicts, so l_type comes back F_UNLCK and nothing else is touched.
+    let (ret, errno, after) =
+        lock_through_guest(&f, ro, F_GETLK_GUEST, (F_WRLCK_GUEST, 0, SQLITE_PENDING_BYTE, 510));
+    assert_eq!((ret, errno), (0, 0), "F_GETLK does not check the access mode");
+    assert_eq!(i16::from_le_bytes([after[0], after[1]]), F_UNLCK_GUEST, "no conflicting lock");
+    assert_eq!(i64::from_le_bytes(after[8..16].try_into().unwrap()), SQLITE_PENDING_BYTE);
+    assert_eq!(i64::from_le_bytes(after[16..24].try_into().unwrap()), 510);
+
+    // EBADF: a lock the descriptor's access mode cannot hold.
+    let (ret, errno, _) = lock_through_guest(&f, ro, F_SETLK_GUEST, pending(F_WRLCK_GUEST));
+    assert_eq!((ret, errno), (-1, EBADF_NET), "an exclusive lock on a read-only descriptor");
+    let (ret, errno, _) = lock_through_guest(&f, wo, F_SETLK_GUEST, pending(F_RDLCK_GUEST));
+    assert_eq!((ret, errno), (-1, EBADF_NET), "a shared lock on a write-only descriptor");
+    let (ret, errno, _) = lock_through_guest(&f, ro, F_SETLK_GUEST, pending(F_UNLCK_GUEST));
+    assert_eq!((ret, errno), (0, 0), "a release needs neither");
+
+    // EINVAL and EOVERFLOW, and the ORDER: a bad l_whence on a read-only descriptor asking for an
+    // exclusive lock is EINVAL, not EBADF, because Linux checks the request before the mode.
+    for (fd, command, lock, want, name) in [
+        (rw, F_SETLK_GUEST, (7, 0, 0, 1), EINVAL_NET, "an l_type that is none of the three"),
+        (rw, F_GETLK_GUEST, pending(F_UNLCK_GUEST), EINVAL_NET, "F_GETLK asking about F_UNLCK"),
+        (ro, F_SETLK_GUEST, (F_WRLCK_GUEST, 9, 0, 1), EINVAL_NET, "l_whence 9, before EBADF"),
+        (rw, F_SETLK_GUEST, (F_WRLCK_GUEST, 0, -1, 1), EINVAL_NET, "a negative start"),
+        (rw, F_SETLK_GUEST, (F_WRLCK_GUEST, 0, 4, -5), EINVAL_NET, "a length reaching below 0"),
+        (rw, F_SETLK_GUEST, (F_WRLCK_GUEST, 0, i64::MAX, 2), 75, "an end past off_t: EOVERFLOW"),
+    ] {
+        let (ret, errno, _) = lock_through_guest(&f, fd, command, lock);
+        assert_eq!((ret, errno), (-1, want), "{name}");
+    }
+    // A negative length that stays at or above zero is legal: it locks the bytes before start.
+    let (ret, errno, _) = lock_through_guest(&f, rw, F_SETLK_GUEST, (F_WRLCK_GUEST, 0, 4, -4));
+    assert_eq!((ret, errno), (0, 0), "bytes 0..4, spelled backwards");
+
+    // Refused by name rather than granted unmeasured: a lock relative to the offset, and a lock
+    // on a descriptor that is not a regular file.
+    let flock = f.guest.data + 0x300;
+    let mut relative = [0u8; 32];
+    relative[2..4].copy_from_slice(&1i16.to_le_bytes());
+    relative[16..24].copy_from_slice(&1i64.to_le_bytes());
+    f.guest.write_bytes(flock, &relative);
+    let error = refusal_of(&f, "fcntl", |asm| {
+        asm.mov(0, rw as u64);
+        asm.mov(1, F_SETLK_GUEST);
+        asm.mov(2, flock as u64);
+    });
+    assert!(error.to_string().contains("SEEK_CUR"), "{error}");
+    let (read_fd, _write_fd) = pipe_through_guest(&f);
+    f.guest.write_bytes(flock, &[0u8; 32]);
+    let error = refusal_of(&f, "fcntl", |asm| {
+        asm.mov(0, read_fd as u64);
+        asm.mov(1, F_SETLK_GUEST);
+        asm.mov(2, flock as u64);
+    });
+    assert!(error.to_string().contains("not a regular file"), "{error}");
 }
 
 /// **A write to a pipe whose reader has closed is `EPIPE`**, not a short write and not a refusal.
