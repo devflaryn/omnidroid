@@ -66,6 +66,9 @@ pub struct AddressFutex {
     stopping: AtomicBool,
     /// How many parks were entered with **no deadline**. See [`AddressFutex::indefinite_parks`].
     indefinite: AtomicU64,
+    /// Wakes that landed within eight bytes of a waiter without landing on it. See
+    /// [`AddressFutex::near_misses`].
+    near_misses: Mutex<Vec<(u64, u64)>>,
 }
 
 impl AddressFutex {
@@ -213,6 +216,34 @@ impl AddressFutex {
         (parked.values().sum(), parked.len())
     }
 
+    /// Wakes that landed **within eight bytes of a parked waiter, without landing on it**.
+    ///
+    /// # The one failure this futex cannot report any other way
+    ///
+    /// A waiter is keyed by an address and a wake is keyed by an address, so a wake that targets
+    /// the wrong one of two adjacent words in the same object does nothing and reports nothing:
+    /// the waiter stays parked, the wake reports zero unparked, and both are exactly what a
+    /// correct call on an uncontended address also looks like. Nothing in the counters
+    /// distinguishes them.
+    ///
+    /// It is a real hazard here rather than a theoretical one, because the guest's own primitives
+    /// and this layer's are keyed independently: `libroblox.so` parks with a raw `futex` syscall
+    /// on `obj + 4` — the **high half** of a 64-bit atomic whose upper word is a sequence counter
+    /// — while `omni-bionic`'s mutexes, rwlocks and semaphores wake on the address of the object
+    /// itself. A primitive whose guest half and host half disagreed by four bytes would look
+    /// precisely like the stall M6 is stopped on.
+    ///
+    /// Each entry is `(the address woken, the address parked on)`. Empty means the hazard did not
+    /// occur, which is a **detector** and not a watch: it is zero exactly when no wake came near a
+    /// waiter it missed.
+    ///
+    /// The check runs only when something is actually parked, which is rare — measured at two
+    /// waiters across a whole startup — so the common path is one uncontended mutex acquisition.
+    #[must_use]
+    pub fn near_misses(&self) -> Vec<(u64, u64)> {
+        self.near_misses.lock().clone()
+    }
+
     /// How many parks were entered with no deadline at all.
     ///
     /// **The number that separates a slow wait from a stranded one.** Every wait inside
@@ -333,6 +364,27 @@ impl Futex for AddressFutex {
 
     fn wake(&self, addr: u64, count: u32) -> u32 {
         self.wakes.fetch_add(1, Ordering::Relaxed);
+        // See `near_misses`. Guarded on the table being non-empty so that the overwhelmingly
+        // common case -- a wake with nothing parked anywhere -- is one lock and one `is_empty`.
+        {
+            let parked = self.parked.lock();
+            if !parked.is_empty() && !parked.contains_key(&addr) {
+                let near: Vec<u64> = parked
+                    .keys()
+                    .copied()
+                    .filter(|at| at.abs_diff(addr) <= 8)
+                    .collect();
+                if !near.is_empty() {
+                    drop(parked);
+                    let mut misses = self.near_misses.lock();
+                    for at in near {
+                        if !misses.contains(&(addr, at)) {
+                            misses.push((addr, at));
+                        }
+                    }
+                }
+            }
+        }
         if count == 0 {
             return 0;
         }

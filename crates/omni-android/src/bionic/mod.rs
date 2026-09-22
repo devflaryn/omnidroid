@@ -180,6 +180,12 @@ pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
 /// would return success from a call that slept for a minute when it was asked for a year.
 pub const MAX_SLEEP_SECONDS: u64 = 60;
 
+/// How many raw `futex` syscalls [`Bionic::futex_calls`] keeps.
+///
+/// Bounded because the guest can spin: see [`Bionic::record_futex_call`] for the measurement that
+/// made it necessary. Small, because the question it answers is about the first few parks.
+pub const MAX_FUTEX_CALLS: usize = 512;
+
 /// How many log records one instance keeps for inspection.
 ///
 /// **A policy number.** How much the engine logs during initialisation has not been measured, and
@@ -337,6 +343,8 @@ pub struct Bionic {
     ///
     /// See [`Bionic::futex_calls`].
     futex_calls: Mutex<Vec<FutexCall>>,
+    /// How many raw `futex` syscalls were not recorded. See [`Bionic::futex_calls_dropped`].
+    futex_calls_dropped: AtomicU64,
 
     // ------------------------------------------------------------------- M5: the park witness
     /// Every guest thread currently blocked inside a condition-variable wait.
@@ -525,6 +533,7 @@ impl Bionic {
             thread_failures: Mutex::new(Vec::new()),
             threads_stopping: AtomicBool::new(false),
             futex_calls: Mutex::new(Vec::new()),
+            futex_calls_dropped: AtomicU64::new(0),
             parked: Mutex::new(Vec::new()),
             parked_peak: AtomicU64::new(0),
         });
@@ -1503,9 +1512,35 @@ impl Bionic {
         self.futex_calls.lock().clone()
     }
 
-    /// Record one raw `futex` syscall.
+    /// Record one raw `futex` syscall, up to [`MAX_FUTEX_CALLS`].
+    ///
+    /// **Bounded, and the bound keeps the beginning rather than the end.** The list was unbounded
+    /// when it was written, on the measurement that the raw syscall is rare -- single digits
+    /// across a whole startup. That stopped being true the moment the engine got past its
+    /// client-settings phase: MEASURED at **21,961,771 crossings from one thread at the futex
+    /// wait site alone**, which as an unbounded `Vec` of 40-byte records is about 700 MB of host
+    /// memory charged to a diagnostic.
+    ///
+    /// The **oldest** entries are kept, which is the opposite of the looper's ring and is the
+    /// right way round here: what this answers is *who parked first and on what*, and a spin that
+    /// makes twenty million calls says the same thing in its first ten as in its last.
     pub(crate) fn record_futex_call(&self, call: FutexCall) {
-        self.futex_calls.lock().push(call);
+        let mut calls = self.futex_calls.lock();
+        if calls.len() < MAX_FUTEX_CALLS {
+            calls.push(call);
+        } else {
+            self.futex_calls_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// How many raw `futex` syscalls were not recorded because [`MAX_FUTEX_CALLS`] was reached.
+    ///
+    /// **A number worth reading on its own.** A large one is not a lost diagnostic; it is the
+    /// diagnostic — it says the guest is *spinning* on a futex rather than waiting on one, which
+    /// is a different problem from the one the list was added to find.
+    #[must_use]
+    pub fn futex_calls_dropped(&self) -> u64 {
+        self.futex_calls_dropped.load(Ordering::Relaxed)
     }
 
     /// Whether [`stop_guest_threads`](Bionic::stop_guest_threads) has been called.

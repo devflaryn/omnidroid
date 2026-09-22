@@ -522,6 +522,24 @@ impl Jni {
         self.state.lock()
     }
 
+    /// Whether the state lock is held **right now**, by anyone.
+    ///
+    /// # The invariant this exists to check rather than assert
+    ///
+    /// [`state`](Jni::state)'s documentation says the lock is never held across a call into guest
+    /// code, because a handler that did would deadlock on the guest's next JNI call. That is a
+    /// statement about every one of the 233 slots, and nothing enforces it — it is kept by each
+    /// of them dropping the guard before `ReentrantCall::call_guest`, which is exactly the shape
+    /// `docs/VERIFICATION.md` entry 13 is about: a justification carried by prose across a gap.
+    ///
+    /// So a diagnostic can ask. A run that has stopped with a thread inside a `Get…ID` and no
+    /// crossing anywhere is either blocked on this lock or is not, and those need completely
+    /// different work. `try_lock` rather than a flag, so it costs nothing until something asks.
+    #[must_use]
+    pub fn state_is_locked(&self) -> bool {
+        self.state.try_lock().is_none()
+    }
+
     /// The name of a declared class, for a message.
     #[must_use]
     pub fn class_name(&self, class: classes::ClassId) -> String {

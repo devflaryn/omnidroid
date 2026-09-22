@@ -423,6 +423,7 @@ impl BoundaryBuilder {
             census: AtomicBool::new(false),
             last_call: AtomicUsize::new(0),
             last_caller: AtomicUsize::new(0),
+            thread_records: parking_lot::Mutex::new(Vec::new()),
         })
     }
 }
@@ -686,6 +687,8 @@ pub struct Boundary {
     /// The guest address the most recent crossing will return to. See
     /// [`Boundary::last_caller`].
     last_caller: AtomicUsize,
+    /// One record per host thread that has ever crossed. See [`Boundary::threads`].
+    thread_records: parking_lot::Mutex<Vec<Arc<ThreadCrossing>>>,
 }
 
 impl Boundary {
@@ -838,7 +841,65 @@ impl Boundary {
             slot.calls.fetch_add(1, Ordering::Relaxed);
             self.last_call.store(slot.address, Ordering::Relaxed);
             self.last_caller.store(caller, Ordering::Relaxed);
+            self.mark_thread(slot.address, caller);
         }
+    }
+
+    /// Record this crossing against **the calling host thread**.
+    ///
+    /// The thread-local is registered with the boundary the first time a thread crosses, and the
+    /// hot path after that is one TLS read and three relaxed stores — no lock, because a lock
+    /// here is a lock on every import and this runtime makes tens of millions of them.
+    #[inline]
+    fn mark_thread(&self, slot: GuestAddr, caller: GuestAddr) {
+        CROSSING.with(|cell| {
+            let record = cell.get_or_init(|| {
+                let record = Arc::new(ThreadCrossing::default());
+                self.thread_records.lock().push(Arc::clone(&record));
+                record
+            });
+            record.slot.store(slot, Ordering::Relaxed);
+            record.caller.store(caller, Ordering::Relaxed);
+            record.depth.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Where **every** host thread that has crossed this boundary was, at its last crossing.
+    ///
+    /// # The measurement two of M6's blockers needed and neither could get
+    ///
+    /// [`last_call`](Boundary::last_call) and [`last_caller`](Boundary::last_caller) are global:
+    /// they answer "what was the most recent crossing by anyone", which is the right question
+    /// only while one thread is running. A deadlock is the case where it is the wrong question —
+    /// several threads are stopped in different places, and the global pair reports whichever of
+    /// them moved last, which is the one that is *least* likely to be stuck.
+    ///
+    /// **MEASURED twice.** A run stalled inside `nativePostClientSettingsLoadedInitialization3`
+    /// reported `last_call` as `JNIEnv::GetFieldID` while the thread that mattered was parked in
+    /// `pthread_cond_wait`; and the run before it reported `pthread_getspecific` for the same
+    /// reason. Both times the global answer named a thread that was not the problem.
+    ///
+    /// Each record carries the slot, the guest address the call will return to, and how many
+    /// crossings that thread has made — the last of which is what separates a thread that is
+    /// stopped from one that is merely slow, without waiting to see whether the total moves.
+    ///
+    /// Recorded only under the census, as [`start_census`](Boundary::start_census) requires. A
+    /// thread that has never crossed has no record, which is the truth rather than a zero row.
+    #[must_use]
+    pub fn threads(&self) -> Vec<ThreadCrossingReport> {
+        self.thread_records
+            .lock()
+            .iter()
+            .map(|record| {
+                let slot = record.slot.load(Ordering::Relaxed);
+                ThreadCrossingReport {
+                    symbol: self.slots.get(&slot).map(|slot| slot.symbol.clone()),
+                    slot,
+                    caller: record.caller.load(Ordering::Relaxed),
+                    crossings: record.depth.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
     }
 
     /// The guest address the most recent crossing will return to, or `0`.
@@ -1333,6 +1394,39 @@ fn inline_trampoline(call: &mut ThunkCall<'_>) {
 }
 
 // --------------------------------------------------------------------------- the two call shapes
+
+/// One host thread's most recent crossing, as the boundary records it.
+///
+/// Three relaxed atomics rather than a lock, because this is written on every import.
+#[derive(Debug, Default)]
+struct ThreadCrossing {
+    slot: AtomicUsize,
+    caller: AtomicUsize,
+    depth: AtomicU64,
+}
+
+/// Where one host thread was at its last crossing, as [`Boundary::threads`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadCrossingReport {
+    /// The symbol, if the slot is still one this boundary knows.
+    pub symbol: Option<String>,
+    /// The thunk address it crossed at.
+    pub slot: GuestAddr,
+    /// The guest address that crossing returns to — the call site, not the thunk.
+    pub caller: GuestAddr,
+    /// How many crossings this thread has made. **A frozen count is a stopped thread**, and it
+    /// says so without the caller having to sample twice.
+    pub crossings: u64,
+}
+
+thread_local! {
+    /// This thread's crossing record, created on its first crossing and registered with the
+    /// boundary then. `OnceCell` rather than `RefCell`: it is written once and read on every
+    /// import, and the registration must happen exactly once per thread.
+    static CROSSING: std::cell::OnceCell<Arc<ThreadCrossing>> = const {
+        std::cell::OnceCell::new()
+    };
+}
 
 /// A guest call being serviced **inside** the run loop.
 ///

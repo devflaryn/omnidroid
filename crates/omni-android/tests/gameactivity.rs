@@ -1019,6 +1019,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         let bionic = Arc::clone(&guest.bionic);
         let ndk = Arc::clone(&guest.ndk);
         let boundary = Arc::clone(&guest.boundary);
+        let jni = Arc::clone(&guest.jni);
+        let image_base = guest.object.base;
         std::thread::spawn(move || {
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(WATCHDOG_SECONDS);
@@ -1042,6 +1044,20 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                         boundary.last_call().map(|slot| slot.symbol.clone()),
                         bionic.live_guest_threads()
                     );
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "      JNI state lock held: {}",
+                        jni.state_is_locked()
+                    );
+                    for report in boundary.threads() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "      host thread last crossed {:?} from link {:#x}, {} crossing(s)",
+                            report.symbol,
+                            report.caller.wrapping_sub(image_base),
+                            report.crossings
+                        );
+                    }
                     let _ = writeln!(
                         std::io::stderr(),
                         "      futex parked {:?}, indefinite {}, cond-parked {:?}",
@@ -1515,7 +1531,12 @@ fn stall_report(guest: &Guest, when: &str) {
         );
     }
     let calls = guest.bionic.futex_calls();
-    let _ = writeln!(out, "  raw futex syscalls: {}", calls.len());
+    let _ = writeln!(
+        out,
+        "  raw futex syscalls: {} recorded, {} dropped past the bound (a large drop count is          itself the finding: the guest is spinning on a futex, not waiting on one)",
+        calls.len(),
+        guest.bionic.futex_calls_dropped()
+    );
     for call in &calls {
         let _ = writeln!(
             out,
