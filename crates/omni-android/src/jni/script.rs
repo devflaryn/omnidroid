@@ -109,6 +109,55 @@ pub fn mangle(class: &str, member: &str) -> String {
 /// is this one — three drifted duplicates of a figure have already appeared in this project.
 pub const APP_VERSION: &str = "2.738.1397";
 
+/// What the host tells the engine this *application* is called.
+///
+/// # This one string decided whether the client-settings fetch could ever succeed
+///
+/// The value used to be `"android"`, which nothing in the APK or the binary said. It made the
+/// engine ask for `https://clientsettingscdn.roblox.com/v2/settings/application/android` and the
+/// server answered `HTTP 400` — MEASURED, every run before this change:
+///
+/// ```text
+/// [FLog::Output] settingsUrl: https://clientsettingscdn.roblox.com/v2/settings/application/android
+/// [FLog::Error] fetch flag exception: HTTP 400
+/// [FLog::NativeDM] ... getFlags: success = false.
+/// ```
+///
+/// **The path segment is this string, decoded rather than guessed.** `0x0224ca98` builds the
+/// settings URL; at `0x0224cda8` it formats `/v2/settings/application/{}` (the literal at
+/// `0x0038c7a2`) with the `std::string` it was handed as its first argument, and the query it
+/// passes to the URL assembler at `0x0224ce88` is the **empty** string at `0x002ece6e` — so this
+/// request carries no `apiKey` and no other parameter, and the only thing in it this host chooses
+/// is the application name. Its caller `0x04ecae88` is reached from `0x02bd564c`, inside the very
+/// function whose success path at `0x02bd5560` runs `continueAfterFlagsLoaded_`, and it takes the
+/// name from `0x04ecc164`, which returns the global `std::string` at `0x06cd4770` when that string
+/// is non-empty and the compiled-in default `"AndroidApp"` at `0x006cf650` when it is not.
+/// `0x06cd4770` is exactly what `Java_..._nativeOverrideChannelPlatformName` writes, through
+/// `0x021f74e4`. So whatever the host passes to that downcall *is* the path segment.
+///
+/// **The value is the APK's own, read out of `classes2.dex`.** `bh.x0.W0` — the method
+/// `jni-surface-lists.txt` Section J already names as the caller of both
+/// `nativeOverrideChannelPlatformName2` and `nativeOverrideChannelPlatformName` — passes the
+/// result of `bh.x0.M` to both, and `M` is one instruction long:
+///
+/// ```text
+/// -- direct M
+///   0000: const-string v0, "GoogleAndroidApp"
+/// ```
+///
+/// That is the same class of evidence as the CA bundle: the bytes are the APK's, not this
+/// project's. It is also the *right* name for this APK specifically — a Google Play build says
+/// `GoogleAndroidApp`, and the binary's fallback `AndroidApp` is what a build without a Java side
+/// would ask for. Passing the fallback would work against the server and would be a quieter lie
+/// about which distribution this is, so the dex's constant wins.
+///
+/// **What would falsify this.** If the server answered `400` for `GoogleAndroidApp` too, the
+/// malformed part of the request would be somewhere other than the path, and the next place to
+/// look is the header map `nativeSetPlatformHeadersWithIdfa` builds — decoded at `0x02229ecc` as
+/// four entries, `mdid` and `idfv` from its first argument, `asid` from its second and `idfa` from
+/// its third.
+pub const CHANNEL_PLATFORM_NAME: &str = "GoogleAndroidApp";
+
 /// §8 steps 7-12, in order. Every edge is VERIFIED from dex bytecode (Section J).
 pub static SEQUENCE: &[Downcall] = &[
     // ---- step 7: RobloxApplication.onCreate ----------------------------------------------
@@ -208,7 +257,32 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetPlatformHeadersWithIdfa",
         descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-        args: &[ScriptArg::Text("Android"), ScriptArg::Text(APP_VERSION), ScriptArg::Text("")],
+        // **Three device identifiers, and this host honestly has one of them.** The arguments
+        // used to be `("Android", APP_VERSION, "")`, which was three guesses in a row and
+        // nothing in the APK or the binary said any of them. What the downcall actually does,
+        // decoded at `0x02229ecc`: it converts its three `jstring`s and inserts four entries into
+        // a map — `mdid` and `idfv` both from the **first** (`0x02229f54`, `0x02229fb4`), `asid`
+        // from the second (`0x0222a014`) and `idfa` from the third (`0x0222a074`).
+        //
+        // `bh.x0.X0` in `classes2.dex` calls it as
+        // `nativeSetPlatformHeadersWithIdfa(v0, v2, v1)` with `v0 = bh.x0.t`,
+        // `v2 = "googleplay"` and `v1 = pk.c.d()`. So:
+        //
+        // * **first** — `bh.x0.t` is `Settings.Secure.getString(resolver, "android_id")`, read in
+        //   the same method that fills `bh.x0.n`. That is the device's SSAID. **This host is not
+        //   an Android device and has no `android_id`**, so the empty string is the truth about
+        //   it; there is no value here that would be anything but invented.
+        // * **second** — `"googleplay"`, a constant in the dex, so it is the APK's own byte.
+        // * **third** — `pk.c.d()` is the Google advertising identifier, and the dex's own
+        //   fallback when it cannot be had is `""`. This host cannot have one either, and the
+        //   empty string was already what was passed — unchanged.
+        //
+        // **What would falsify the first one being empty.** A device whose user has reset or
+        // withheld these identifiers sends empty strings here too, so an engine that refused to
+        // work without them would not work on such a device. If a run shows a request failing
+        // *because* `mdid` is empty, that assumption is wrong and the value has to come from the
+        // embedding through a seam, with no default — the shape `set_filesystem_root` has.
+        args: &[ScriptArg::Text(""), ScriptArg::Text("googleplay"), ScriptArg::Text("")],
     },
     Downcall {
         step: 9,
@@ -224,7 +298,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeOverrideChannelPlatformName",
         descriptor: "(Ljava/lang/String;)V",
-        args: &[ScriptArg::Text("android")],
+        args: &[ScriptArg::Text(CHANNEL_PLATFORM_NAME)],
     },
     Downcall {
         step: 9,
@@ -232,7 +306,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeOverrideChannelPlatformName2",
         descriptor: "(Ljava/lang/String;)V",
-        args: &[ScriptArg::Text("android")],
+        args: &[ScriptArg::Text(CHANNEL_PLATFORM_NAME)],
     },
     // ---- step 10: MainGameActivity.b2 / .a2 -----------------------------------------------
     Downcall {
@@ -324,13 +398,47 @@ pub static SEQUENCE: &[Downcall] = &[
 /// would be choosing engine behaviour by guess; an empty map chooses nothing.
 pub const CLIENT_SETTINGS: &str = r#"{"applicationSettings":{}}"#;
 
-/// The base URL `nativeInitClientSettings` would fetch from if [`CLIENT_SETTINGS`] were empty.
+/// `nativeInitClientSettings`'s **third argument, which is an application name and not a URL**.
 ///
-/// Passed because it is the argument the Java side passes, and **it is not reached**: the parse
-/// branch above returns before `0x04ecae88` is called. If a future change empties
-/// `CLIENT_SETTINGS`, this is the string that would decide where the engine tried to go, and a
-/// blank here would make that failure say nothing.
-pub const CLIENT_SETTINGS_URL: &str = "https://clientsettings.roblox.com/v2/settings/application/";
+/// # It was a URL, it was never reached in the run that justified it, and the engine used it anyway
+///
+/// This constant used to be `CLIENT_SETTINGS_URL`, holding
+/// `"https://clientsettings.roblox.com/v2/settings/application/"`, with a doc comment saying it was
+/// "the base URL `nativeInitClientSettings` would fetch from" and that it was "not reached". Both
+/// halves were wrong, and the run said so in one line:
+///
+/// ```text
+/// [DFLog::HttpTraceError] HttpResponse(#7) time:5012.4ms error:9 message:HttpError: Aborted url:
+///   { "https://clientsettingscdn.roblox.com/v2/settings-compressed/application/
+///      https:/clientsettings.roblox.com/v2/settings/application/.zst" }
+/// [FLog::DynamicFastVariableReloader] Could not fetch settings
+/// ```
+///
+/// That is `/v2/settings-compressed/application/{}.zst` — the literal at `0x003a90f7`, formatted
+/// at `0x0224cd68` by the same URL builder as the plain path — with `{}` filled in by this string.
+/// So the argument is the `{}`: an **application name**, the same slot
+/// [`CHANNEL_PLATFORM_NAME`] fills on the other route. The parse branch not reaching
+/// `0x04ecae88` was true and irrelevant; the string is kept and used later by the periodic
+/// reloader regardless of which branch ran.
+///
+/// The decode agrees. `Java_..._nativeInitClientSettings` (`0x022265fc`) converts its three
+/// `jstring`s and calls `0x02baf38c(json, "", s2, s3)`; the empty-document branch at `0x02baf44c`
+/// takes the data pointer of **`s3`** at `0x02baf480`-`0x02baf490` and passes it as `0x04ecae88`'s
+/// first argument at `0x02baf4d0` — the parameter that becomes the path segment.
+///
+/// **And the APK settles it.** `fi.e$f` in `classes2.dex`, the caller
+/// `jni-surface-lists.txt` Section J names for this downcall:
+///
+/// ```text
+///   0060: invoke {} Lbh/x0;.M
+///   0063: move-result-object v5
+///   0064: invoke {v0, v1, v5} NativeGLInterface.nativeInitClientSettings
+/// ```
+///
+/// `bh.x0.M` is the one-instruction accessor that returns `"GoogleAndroidApp"`, so the third
+/// argument is the same value [`CHANNEL_PLATFORM_NAME`] holds, and this is an alias rather than a
+/// second copy — `APP_VERSION`'s doc records what three drifted duplicates of one figure cost.
+pub const CLIENT_SETTINGS_APPLICATION: &str = CHANNEL_PLATFORM_NAME;
 
 /// §8 rows 21-22: the client-settings phase, and the app start it unblocks.
 ///
@@ -361,7 +469,7 @@ pub static FLAGS_AND_START: &[Downcall] = &[
             // The second string is not on either branch of `0x02baf38c`'s first test. Empty
             // rather than invented: the host has nothing to put here that it measured.
             ScriptArg::Text(""),
-            ScriptArg::Text(CLIENT_SETTINGS_URL),
+            ScriptArg::Text(CLIENT_SETTINGS_APPLICATION),
         ],
     },
     Downcall {

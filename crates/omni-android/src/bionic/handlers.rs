@@ -440,6 +440,14 @@ handlers! {
     fn nan(tagp: ptr) -> f64 = |v| omni_bionic::libm::nan(tagp);
     /// `double frexp(double x, int *exp)`
     fn frexp(x: f64, exp_ptr: ptr) -> f64 = |v| omni_bionic::libm::frexp(&mut v, x, exp_ptr);
+
+    /// `double ldexp(double x, int exp)` -- `x * 2^exp`, and `frexp`'s exact inverse.
+    ///
+    /// MEASURED: the engine reaches it once the client-settings document is being parsed, which is
+    /// what a JSON number parser does to assemble a mantissa and a binary exponent. The TENTH pure
+    /// binding gap of this session: `omni_bionic::libm::ldexp` has existed since phase 1, sits
+    /// directly beside `frexp` which *was* bound, and nothing called it.
+    fn ldexp(x: f64, exp: i32) -> f64 = |v| omni_bionic::libm::ldexp(&mut v, x, exp);
     /// `void sincosf(float x, float *sin, float *cos)`
     fn sincosf(x: f32, sin_ptr: ptr, cos_ptr: ptr) -> void =
         |v| omni_bionic::libm::sincosf(&mut v, x, sin_ptr, cos_ptr);
@@ -1263,6 +1271,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("acosf", acosf),
     ("nan", nan),
     ("frexp", frexp),
+    ("ldexp", ldexp),
     ("sincosf", sincosf),
     // wide characters
     ("__ctype_get_mb_cur_max", ctype_get_mb_cur_max),

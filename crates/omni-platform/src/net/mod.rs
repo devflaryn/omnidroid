@@ -108,6 +108,7 @@
 mod address;
 mod error;
 mod policy;
+pub mod record;
 mod resolver;
 
 pub use address::{IpFamily, SocketAddress};
@@ -593,6 +594,14 @@ pub struct Socket {
     /// keeps the *count* right: the error is readable exactly once, by whoever asks first, which
     /// is what a device does.
     pending_error: Option<NetErrorKind>,
+    /// This socket's identity in [`record`], handed out at creation whether or not anything is
+    /// recording.
+    ///
+    /// **Assigned unconditionally, and that is deliberate.** A recording turned on after a socket
+    /// exists still has to be able to name it, and an `Option` here would mean the identity
+    /// depended on when the switch was thrown — so the same socket would appear under two names
+    /// in two runs. The cost when nothing is recording is one relaxed increment per `socket(2)`.
+    record: u64,
 }
 
 impl Socket {
@@ -621,6 +630,7 @@ impl Socket {
             connect: ConnectState::None,
             named: false,
             pending_error: None,
+            record: record::next_id(),
         })
     }
 
@@ -731,6 +741,7 @@ impl Socket {
         // A connect assigns a local address, so `getsockname` has something to answer from here
         // on — see `local_address` for why this seam records that rather than asking.
         self.named = true;
+        record::note_peer(self.record, &address.to_string());
         Ok(progress)
     }
 
@@ -867,6 +878,7 @@ impl Socket {
             }
             Inner::Udp(socket) => socket.send(buf),
         }
+        .inspect(|sent| record::note(self.record, record::Direction::Sent, &buf[..*sent]))
         .map_err(|error| NetError::io(OP, self.describe(), &error))
     }
 
@@ -890,6 +902,7 @@ impl Socket {
             }
             Inner::Udp(socket) => socket.recv(buf),
         }
+        .inspect(|read| record::note(self.record, record::Direction::Received, &buf[..*read]))
         .map_err(|error| NetError::io(OP, self.describe(), &error))
     }
 
@@ -923,6 +936,7 @@ impl Socket {
         self.policy.check_address(OP, address)?;
         socket
             .send_to(buf, address.to_std())
+            .inspect(|sent| record::note(self.record, record::Direction::Sent, &buf[..*sent]))
             .map_err(|error| NetError::io(OP, address.to_string(), &error))
     }
 
@@ -952,6 +966,9 @@ impl Socket {
         };
         socket
             .recv_from(buf)
+            .inspect(|(read, _)| {
+                record::note(self.record, record::Direction::Received, &buf[..*read]);
+            })
             .map(|(read, from)| (read, SocketAddress::from_std(from)))
             .map_err(|error| NetError::io(OP, self.describe(), &error))
     }

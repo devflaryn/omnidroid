@@ -416,6 +416,10 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
         "M6's network run, one call after `getsockname` and the first thing in this project that          is unambiguously TLS: GuestThreadFailure { thread: 8, why: \"the guest called the          imported symbol `getentropy` through its thunk at 0x237481e5ec0, and nothing in the          compatibility layer implements it\" }. `libroblox.so` carries its own OpenSSL (D30) and          OpenSSL seeds its DRBG from `getentropy` where the platform has one, which Android does          from API 28. NOT a binding gap: the entropy source has been wired since phase 3a as          `arc4random_buf`, over the same `omni_platform::process::random_bytes`. What this adds          is the interface's own 256-byte bound, which is a real difference and not a formality --          a device answers EIO above it and the caller has a fallback path that would never run          here. The file's LAST section.",
     ),
     (
+        "ldexp",
+        "M6, and the FIRST symbol reached because a client-settings request finally          SUCCEEDED. With the application name corrected to `GoogleAndroidApp` the engine          received 1,358,051 bytes of flags instead of a 68-byte `HTTP 400`, began parsing          them, and died here: the guest called the imported symbol `ldexp` through its          thunk and nothing in the compatibility layer implemented it. `x * 2^exp` is what a          JSON number parser does to assemble a mantissa and a binary exponent, so the          document itself is what reached it -- the failing request had never got far enough          to ask. A PURE BINDING GAP and the TENTH of this session:          `omni_bionic::libm::ldexp` has existed since phase 1 and sits DIRECTLY BESIDE          `frexp`, which was bound, and nothing had ever called it. VERIFICATION.md entry 16          twice over -- the death was on a guest thread, so the only thing that reported it          was `guest_thread_failures()`, and while it was unbound the socket counters froze          mid-download and looked like a network stall: 409,075 of 1,358,051 bytes received          and then nothing, for 100 s. The frozen counter was a SYMPTOM of a thread this          layer had killed, not a transfer problem, and two runs were spent measuring read          sizes before that was clear.",
+    ),
+    (
         "memrchr",
         "M6's network run, and the symbol that proves the certificate bundle is being PARSED.          The APK ships `assets/ssl/cacert.pem` -- 228,725 bytes of authorities -- and OpenSSL's          compiled-in default store is a build machine's path that exists on no device, so on          Android the Java side unpacks the bundle into the app's files directory. D7 says the          Java side is defined rather than executed, so the gate does it. The moment it did, the          engine stopped reporting `HttpError: Unknown` and died here instead: GuestThreadFailure          { thread: 7, why: \"the guest called the imported symbol `memrchr` through its thunk at          0x21955c65d60, and nothing in the compatibility layer implements it\" }. Scanning          backwards is how a PEM reader finds the last `-----END CERTIFICATE-----` in a block.          NOT a binding gap: `memrchr` is a GNU extension that bionic has and this crate did not,          so `omni_bionic::mem::memrchr` is new computation, written as `memchr`'s mirror. With it          bound the fetch completed a TLS handshake against the real endpoint and the engine          reported `HTTP 400` -- a server answer, which is what proves the whole path works.",
     ),
@@ -486,7 +490,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 209, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 210, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -549,7 +553,7 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // `socket`, `getaddrinfo` and `freeaddrinfo` were bound and refusing since phase 3d and now
     // answer, which is a category change rather than a count change. See
     // `the_final_split_of_the_reachable_set_is_what_the_record_claims`.
-    assert_eq!(Bionic::inline_symbols().count(), 195);
+    assert_eq!(Bionic::inline_symbols().count(), 196);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to

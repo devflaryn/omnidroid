@@ -142,6 +142,33 @@ const LIFECYCLE_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
 /// early when no guest thread is left, because a dead thread will not produce more evidence.
 const POST_ROWS_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long the gate waits for the engine's own flag fetch to answer, before sending the window
+/// again.
+///
+/// # The figure, and the two runs that got it wrong first
+///
+/// **MEASURED on the first run in which the fetch succeeded**: `settingsUrl` logged at 7.448 s,
+/// `getFlags: success = true, payload's size = 1358051.` at 10.927 s — **3.5 s** for a DNS
+/// lookup, a TCP connect, a TLS handshake and 1,358,051 bytes of flags off a real CDN. Thirty
+/// seconds is roughly nine times that: wide enough that a slow network is not reported as a failed
+/// fetch, narrow enough that a fetch which never answers does not eat the suite.
+///
+/// **Two earlier readings of this said something else and both were wrong, in the same way.** The
+/// first took ~2 s from the run where the request was malformed — that was the round trip for a
+/// 68-byte `HTTP 400`, not for a settings document. The second concluded the fetch never completes
+/// at all, from runs where it stalled at 409,075 of 1,358,051 bytes with the socket counters
+/// frozen for 100 s. That stall was not a network figure either: `ldexp` was unbound, the guest
+/// thread parsing the document was killed for it, and the frozen `recvfrom` counter was the
+/// *symptom* of a death on another thread. `VERIFICATION.md` entry 16 — a thread that dies is not
+/// a call that fails — and a bound derived from a truncated transfer is a bound derived from a
+/// defect.
+///
+/// So: this number is only meaningful for a run that completes, and it was set from the first one
+/// that did. The wait's *outcome* is printed either way — see `wait_for_log` for why a timeout
+/// must not be allowed to look like a failure, and the `Flags-Not-Received` counts around the
+/// delivery for the reading that answers whether the engine accepted the window.
+const FLAG_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The spin lock `nativeInitClientSettings` blocks on, as an offset from the load base.
 ///
 /// **A temporary probe, not a contract.** MEASURED: with the hint handling in place, §8 row 21
@@ -684,6 +711,25 @@ mod native_code {
 #[test]
 fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     let _serial = serialized();
+    // **The socket record, off unless this run was asked for it.** See
+    // `omni_platform::net::record` for what it can and cannot show -- the short version is that
+    // the engine's TLS is its own, so what lands here is a `ClientHello` and then ciphertext, and
+    // the one thing in the clear is the server name. It is opt-in because the bytes are the
+    // guest's and may carry its cookies; the switch is read here, in the embedding, because
+    // `omni-platform` reads no environment of its own.
+    let record_bytes = std::env::var("OMNI_NET_RECORD")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if record_bytes > 0 {
+        let _ = writeln!(
+            std::io::stderr(),
+            "OMNI_NET_RECORD={record_bytes}: recording the first {record_bytes} bytes each socket 
+                 carries in each direction. THESE ARE THE GUEST'S BYTES and may carry its 
+                 credentials; they are printed to this run's stderr and written nowhere else."
+        );
+        omni_platform::net::record::record_first(record_bytes);
+    }
     let guest = Guest::load();
     let mut cpu = guest.thread();
     guest.boundary.start_census();
@@ -908,7 +954,9 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             // and it is what turns a hang into a red run instead of one that never finishes.
             //
             // **And the scratch roots go first, because `exit` runs no destructors.** See
-            // `Scratch::new` for the 930 GB that taught this.
+            // `Scratch::new` for the 930 GB that taught this. The network report is here on the
+            // same argument and for the same reason — see `report_network`.
+            report_network(&mut out, &boundary, "M5 watchdog");
             remove_scratch_roots();
             std::process::exit(101);
         });
@@ -1457,7 +1505,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             let _ = writeln!(out, "NDK CENSUS: {:?}", ndk.census());
             let _ = writeln!(out, "================ ending the run ================");
             let _ = out.flush();
-            // **Before the `exit`, because the `exit` runs no destructors.** See `Scratch::new`.
+            // **Before the `exit`, because the `exit` runs no destructors.** See `Scratch::new`,
+            // and `report_network` for why the network numbers are here rather than only in the
+            // teardown this `exit` skips.
+            report_network(&mut out, &boundary, "M6 watchdog");
             remove_scratch_roots();
             std::process::exit(101);
         });
@@ -1686,10 +1737,118 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             // engine returns without looking at the window.
             let _ = writeln!(
                 std::io::stderr(),
-                "§8 row 24: engine flags-received byte now {}",
-                flags_loaded_byte(&guest)
+                "§8 row 24: engine `Flag::areFlagsLoaded` global now {} (NOT the DataModel+0x289 
+                 byte the surface is gated on — see `are_flags_loaded_global`; the reading 
+                 that answers that is the `Flags-Not-Received` count below)",
+                are_flags_loaded_global(&guest)
             );
             all.extend(drive_flag_rows(&guest, &mut cpu, &script::FLAGS_AND_START[2..]));
+
+            // ---- row 24 again, once the engine's *own* fetch has answered -------------------
+            //
+            // **The flags the surface path waits for do not arrive on this thread.** Row 21
+            // hands the engine a client-settings document; the byte at `DataModel + 0x289` that
+            // `nativeActivity_onSurfaceChanged` tests at guest `0x02bd307c` is written by
+            // `continueAfterFlagsLoaded_` (`0x02bd3b58`, the store at `0x02bd3be4`), and the only
+            // caller on that path is `0x02bd5560` — the success side of `NativeDM`'s own HTTP
+            // fetch, which runs on a guest worker and takes about two seconds.
+            //
+            // MEASURED, before this block existed: the two surface rows above ran at 6.43 s and
+            // 6.60 s and the fetch did not answer until 8.50 s, so every surface this gate
+            // delivered was delivered while the engine was still waiting and was dropped with
+            // `... Flags-Not-Received. Return.` The engine was never wrong about anything; the
+            // window simply arrived two seconds early, every run.
+            //
+            // So: wait for the engine to *say* how the fetch went, in its own log, and only then
+            // send the window again. Bounded, and the bound is reported rather than silent — a
+            // wait that timed out and carried on would look exactly like a fetch that failed.
+            let flags_answer = wait_for_log(&guest, "getFlags: success", FLAG_FETCH_WAIT);
+            let _ = writeln!(
+                std::io::stderr(),
+                "§8 row 24: the engine's flag fetch answered: {}",
+                flags_answer.as_deref().unwrap_or("nothing in 30 s")
+            );
+            if flags_answer.as_deref().is_some_and(|line| line.contains("success = true")) {
+                // **`getFlags: success` is logged before the byte is written, so waiting on it
+                // alone is a race.** Decoded: the success line comes from `0x02bd5884`, and the
+                // store the surface path is gated on is at `0x02bd3be4` — inside
+                // `continueAfterFlagsLoaded_`, which the same path does not call until
+                // `0x02bd59f8`, after twenty-odd flag initialisers in between. A window delivered
+                // in that interval would be dropped exactly as the early ones were, and the run
+                // would look like the fix had not worked.
+                //
+                // `continueAfterFlagsLoaded_` logs its own name at `0x02bd3bac`, six instructions
+                // and one call before the store, under the same level guard that let the success
+                // line through — so waiting for *that* closes all but those few instructions,
+                // against a poll that cannot come back in under 25 ms.
+                //
+                // **The residual window is not argued away, it is measured**: the count of
+                // `Flags-Not-Received` lines is taken before the delivery and again after, and
+                // both are printed. If the race were ever lost the second number would be larger,
+                // which is the same line this whole block exists to make disappear.
+                let entered = wait_for_log(&guest, "continueAfterFlagsLoaded_", FLAG_FETCH_WAIT);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "§8 row 24: continueAfterFlagsLoaded_ ran: {}",
+                    entered.as_deref().unwrap_or("NOT SEEN — the byte at DataModel+0x289 may not \
+                     be written yet, and the delivery below is racing it")
+                );
+                let refusals_before = count_log(&guest, "Flags-Not-Received");
+                for (member, descriptor, tail) in [
+                    (
+                        "onSurfaceCreatedNative",
+                        "(JLandroid/view/Surface;)V",
+                        vec![GuestArg::Int(surface)],
+                    ),
+                    (
+                        "onSurfaceChangedNative",
+                        "(JLandroid/view/Surface;III)V",
+                        vec![
+                            GuestArg::Int(surface),
+                            GuestArg::Int(1),
+                            GuestArg::Int(SURFACE_WIDTH as u64),
+                            GuestArg::Int(SURFACE_HEIGHT as u64),
+                        ],
+                    ),
+                ] {
+                    let target = native(member, descriptor);
+                    let mut args = vec![
+                        GuestArg::Pointer(guest.jni.env_for(0)),
+                        GuestArg::Int(thiz),
+                        GuestArg::Int(native_code),
+                    ];
+                    args.extend(tail);
+                    let result = {
+                        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                        let _jni = guest.jni.activate().expect("publish the JNI instance");
+                        let _ndk = guest.ndk.activate();
+                        guest.boundary.call_guest(&mut cpu, member, target, &args, LIFECYCLE_BUDGET)
+                    };
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "§8 row 24: {member} sent again after the fetch -> {}",
+                        match &result {
+                            Ok(_) => "returned".to_string(),
+                            Err(error) => format!("{error}"),
+                        }
+                    );
+                    report_dead_guest_threads(&guest, &format!("after `{member}` post-fetch"));
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                // **The reading this whole block is for.** `nativeActivity_onSurfaceChanged`
+                // returns without touching the window while the byte at `DataModel + 0x289` is
+                // clear, and says so. Equal counts mean the engine accepted the window this time;
+                // a larger second number means it refused again, which is a result and not a
+                // failure of the harness — it says the byte is still clear and names where to
+                // look next.
+                let refusals_after = count_log(&guest, "Flags-Not-Received");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "§8 row 24: `Flags-Not-Received` lines in the ring: {refusals_before} before \n                 the post-fetch delivery, {refusals_after} after"
+                );
+            }
         }
         all
     }
@@ -1830,6 +1989,33 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             .map(|symbol| (symbol, count(symbol)))
         );
     }
+    // **The socket transcripts, if this run asked for them.** Printed after teardown for the
+    // reason the block above gives for the JNI misses: the fetch finishes on a guest thread, and
+    // a print taken before that thread is joined is a print of an empty table.
+    //
+    // **It says so on every run, including the runs where it is off** -- `VERIFICATION.md` entry
+    // 15. "No socket record printed" and "no socket carried a byte" are the same shape on the
+    // page, and the first is a switch while the second is a finding.
+    if record_bytes > 0 {
+        omni_platform::net::record::stop();
+        let transcripts = omni_platform::net::record::take();
+        let _ = writeln!(
+            std::io::stderr(),
+            "POST-TEARDOWN socket record: {} socket(s) carried bytes",
+            transcripts.len()
+        );
+        for transcript in &transcripts {
+            let _ = writeln!(std::io::stderr(), "  {}", transcript.outline());
+        }
+    } else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "POST-TEARDOWN socket record: NOT RECORDED. Set OMNI_NET_RECORD=<bytes> to keep the 
+                 first N bytes each socket carried in each direction. The engine's TLS is its 
+                 own, so what that shows is a ClientHello and then ciphertext -- see 
+                 omni_platform::net::record."
+        );
+    }
     let _ = writeln!(
         std::io::stderr(),
         "M5 teardown: {} guest thread(s) still running, failures {:?}",
@@ -1956,7 +2142,7 @@ fn drive_flag_rows(
         for outcome in &outcomes {
             let _ = writeln!(
                 std::io::stderr(),
-                "§8 row {}: {} -> {}   [engine flags byte: {}]",
+                "§8 row {}: {} -> {}   [Flag::areFlagsLoaded global: {}]",
                 outcome.step,
                 outcome.symbol,
                 match &outcome.result {
@@ -1973,7 +2159,7 @@ fn drive_flag_rows(
                         guest.boundary.last_caller().wrapping_sub(guest.object.base)
                     ),
                 },
-                flags_loaded_byte(guest)
+                are_flags_loaded_global(guest)
             );
         }
         // **A row that returns is not a row that went well.** MEASURED: the gate reported "21 of
@@ -2175,16 +2361,36 @@ fn image_word(guest: &Guest, offset: usize, what: &str) -> String {
     }
 }
 
-/// The engine's own `Flag::areFlagsLoaded()` byte, read out of the engine.
+/// The engine's `Flag::areFlagsLoaded` **global**, read out of the image.
 ///
-/// **This is the state §8 row 21 exists to change**, and reading it directly is how the host
-/// learns whether it changed -- rather than inferring it from the TaskScheduler's fatal, which is
-/// a *different subsystem* reporting a consequence and which is what a run that stopped here
-/// would otherwise have to reason from.
+/// # It is not the byte the surface is gated on, and it was named as though it were
 ///
-/// See [`FLAGS_LOADED_OFFSET`] for how the address was decoded and why it is one address and not
+/// **Renamed, because the old name was `flags_loaded_byte` and the line it printed said "engine
+/// flags-received byte now 1".** Two different bytes were being conflated:
+///
+/// * this one — the `Flag::areFlagsLoaded` global at image offset [`FLAGS_LOADED_OFFSET`], which
+///   `nativeInitClientSettings` sets as soon as it has parsed the document it was handed;
+/// * `DataModel + 0x289` — a field of a heap object, written by `continueAfterFlagsLoaded_` at
+///   guest `0x02bd3be4` and tested at `0x02bd307c`, which is the **only** thing gating
+///   `nativeActivity_onSurfaceChanged`.
+///
+/// This one has read `1` since row 21's first downcall returned, in every run for several
+/// milestones — **including every run in which the surface was refused**. A reading that is `1`
+/// whether or not the thing it is named after happened is `VERIFICATION.md` entry 15's shape: an
+/// instrument whose label promises more than it reads, which will be believed again by whoever
+/// sees it next. It is kept because it is a real reading of a real global, and renamed so that it
+/// can only be read as that.
+///
+/// **What to use instead.** The host cannot read `DataModel + 0x289` — it is a heap address this
+/// side never learns. What it can read is the engine's own report: the branch at `0x02bd307c` is
+/// the sole producer of `[FLog::NativeDM] nativeActivity_onSurfaceChanged: ... Flags-Not-Received.
+/// Return.` (format string `0x004ed460`), so **the absence of that line is the byte being set and
+/// its presence is the byte being clear**. [`count_log`] taken either side of a surface delivery
+/// is the instrument; see row 24's post-fetch block.
+///
+/// See [`FLAGS_LOADED_OFFSET`] for how this address was decoded and why it is one address and not
 /// a guess.
-fn flags_loaded_byte(guest: &Guest) -> String {
+fn are_flags_loaded_global(guest: &Guest) -> String {
     match guest.boundary.mem().read_u32(
         guest.object.base + FLAGS_LOADED_OFFSET,
         omni_android::Blame::new("Flag::areFlagsLoaded", guest.object.base, 0),
@@ -2192,6 +2398,101 @@ fn flags_loaded_byte(guest: &Guest) -> String {
         Ok(word) => format!("{}", word & 0xff),
         Err(error) => format!("unreadable: {error}"),
     }
+}
+
+/// Wait for a line the guest logs, and answer with the line or with nothing.
+///
+/// **The engine is the only thing that knows when its own fetch finished**, and it says so: a
+/// `[FLog::NativeDM] ... getFlags: success = {}` line, on the worker that ran the request. The
+/// host cannot see that from a return value — nothing this thread called is still running — and
+/// inferring it from a timer would be a guess dressed as a measurement.
+///
+/// Returns `None` on the timeout rather than blocking for ever, and the caller **prints which it
+/// got**. A wait that timed out and then carried on as though the thing had happened is
+/// `VERIFICATION.md` entry 14's shape exactly: indistinguishable, a week later, from a wait that
+/// succeeded.
+///
+/// `log_records` is a bounded ring (256 records / 256 KiB) and the engine logs faster than that
+/// during startup, so a match can be **evicted** between polls. The poll interval is therefore
+/// short relative to how fast the ring turns over, and a `None` from this function means "not
+/// seen", not "did not happen".
+fn wait_for_log(guest: &Guest, needle: &str, within: std::time::Duration) -> Option<String> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        for record in guest.bionic.log_records() {
+            if record.message.contains(needle) {
+                return Some(record.message);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// How many lines still in the ring contain `needle`.
+///
+/// **A count taken twice around an event, not a presence test.** `Flags-Not-Received` is logged
+/// every time the engine is handed a window it is not ready for, and this gate hands it several;
+/// "is that line present" would answer yes for the whole run and say nothing about the delivery
+/// that matters. The difference between two counts does.
+///
+/// It reads the same bounded ring [`wait_for_log`] does, so a count can go *down* if the ring
+/// evicted an older match between the two readings. That direction is harmless here — it can only
+/// understate a new refusal, and a new refusal is what the caller is looking for.
+fn count_log(guest: &Guest, needle: &str) -> usize {
+    guest.bionic.log_records().iter().filter(|record| record.message.contains(needle)).count()
+}
+
+/// Everything this run learned about the network, printed **before** an `exit` that runs no
+/// destructors.
+///
+/// # A diagnostic that only prints when the run succeeds is not a diagnostic
+///
+/// Both watchdogs end the process with `std::process::exit(101)`, because the main thread is
+/// inside the guest and cannot be made to fail an assertion from outside. `exit` runs no `Drop`
+/// and skips the rest of `main`, so **everything the teardown block prints is lost on exactly the
+/// runs that needed it** — MEASURED: the run that first fetched a real client-settings document
+/// was killed by the M6 watchdog mid-download and reported not one byte, which is the single
+/// number that would have said whether the fetch was progressing or stuck.
+///
+/// `remove_scratch_roots()` already sits beside each `exit` for the same reason — `Scratch::new`
+/// records the 930 GB that taught it — and this belongs in the same place on the same argument.
+///
+/// The two numbers are chosen to be read together. The census counts **calls**; the record counts
+/// **bytes**. Bytes ÷ calls is the average transfer, which is what separates "the reads are as
+/// large as this layer allows and the thread is simply not being scheduled" from "the guest is
+/// asking for a few hundred bytes at a time" — and `SOCKET_IO_BLOCK` caps one call at 64 KiB, so
+/// a ratio at that cap makes the cap the next question rather than the scheduling.
+fn report_network(out: &mut impl Write, boundary: &Boundary, when: &str) {
+    let census = boundary.census();
+    let count = |symbol: &str| -> u64 {
+        census.as_ref().and_then(|c| c.get(symbol).copied()).unwrap_or(0)
+    };
+    let _ = writeln!(
+        out,
+        "NET CENSUS ({when}): {:?}",
+        ["getaddrinfo", "socket", "connect", "poll", "select", "sendto", "recvfrom", "read",
+         "write", "close"]
+            .map(|symbol| (symbol, count(symbol)))
+    );
+    // Taken, not copied: see `omni_platform::net::record`. On a run that is being killed this is
+    // the last chance to say it, and saying it twice would leave the guest's bytes in a global.
+    let transcripts = omni_platform::net::record::take();
+    if transcripts.is_empty() {
+        let _ = writeln!(
+            out,
+            "SOCKET RECORD ({when}): nothing recorded. Set OMNI_NET_RECORD=<bytes> to capture 
+                 the first N bytes each socket carried in each direction."
+        );
+    } else {
+        let _ = writeln!(out, "SOCKET RECORD ({when}): {} socket(s)", transcripts.len());
+        for transcript in &transcripts {
+            let _ = writeln!(out, "  {}", transcript.outline());
+        }
+    }
+    let _ = out.flush();
 }
 
 /// Everything this run measured, printed before anything is asserted.
@@ -2237,6 +2538,282 @@ fn report(guest: &Guest) {
     }
     let _ = writeln!(out, "================ end of report ================\n");
     let _ = out.flush();
+}
+
+/// Just enough of a `.dex` to read one method's single `const-string`, and nothing more.
+///
+/// # Why a parser rather than a substring search
+///
+/// The first version of the test below searched the APK's dex files for the application name as a
+/// string-pool entry — a `uleb128` length, the MUTF-8 bytes, a `NUL`. It would have passed with
+/// `"android"` in place, because `android` is also a string in those files, and `"android"` is the
+/// exact value that produced `HTTP 400` and kept the engine from ever taking the window. A check
+/// that cannot fail on the defect it is named after is `VERIFICATION.md` entry 12's shape, and it
+/// was rewritten rather than kept.
+///
+/// What is actually true of the right value is narrower and is the only thing worth asserting:
+/// **`bh.x0.M` returns it**. That method is two instructions — `const-string v0, <s>` then
+/// `return-object v0` — and `bh.x0.W0` passes its result to both
+/// `nativeOverrideChannelPlatformName` and `nativeOverrideChannelPlatformName2`, which
+/// `jni-surface-lists.txt` Section J already records as the caller of both.
+///
+/// Everything here is bounds-checked and answers `None` rather than panicking: it is a parser run
+/// over a file this project does not produce, and a malformed dex should fail the test by saying
+/// it could not read the method, not by unwinding out of it.
+mod dex {
+    /// A `uleb128` at `at`, and where it ends.
+    fn uleb(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
+        let mut value = 0u32;
+        let mut shift = 0;
+        let mut at = at;
+        loop {
+            let byte = *bytes.get(at)?;
+            at += 1;
+            value |= u32::from(byte & 0x7f).checked_shl(shift)?;
+            if byte & 0x80 == 0 {
+                return Some((value, at));
+            }
+            shift += 7;
+            if shift > 28 {
+                return None;
+            }
+        }
+    }
+
+    fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+    }
+
+    fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    /// One string out of the string pool, by index.
+    fn string(dex: &[u8], index: u32) -> Option<String> {
+        let (count, off) = (u32_at(dex, 56)?, u32_at(dex, 60)? as usize);
+        if index >= count {
+            return None;
+        }
+        let at = u32_at(dex, off + 4 * index as usize)? as usize;
+        // The `uleb128` here is a length in UTF-16 units, which is **not** the byte length; the
+        // bytes themselves run to the NUL, so that is what is read.
+        let (_utf16_units, start) = uleb(dex, at)?;
+        let end = start + dex.get(start..)?.iter().position(|byte| *byte == 0)?;
+        String::from_utf8(dex.get(start..end)?.to_vec()).ok()
+    }
+
+    /// One type descriptor, by `type_idx`.
+    fn type_name(dex: &[u8], index: u32) -> Option<String> {
+        let (count, off) = (u32_at(dex, 64)?, u32_at(dex, 68)? as usize);
+        if index >= count {
+            return None;
+        }
+        string(dex, u32_at(dex, off + 4 * index as usize)?)
+    }
+
+    /// The method name of one `method_id`.
+    fn method_name(dex: &[u8], index: u32) -> Option<String> {
+        let (count, off) = (u32_at(dex, 88)?, u32_at(dex, 92)? as usize);
+        if index >= count {
+            return None;
+        }
+        string(dex, u32_at(dex, off + 8 * index as usize + 4)?)
+    }
+
+    /// Step over one `encoded_field` or `encoded_method` list, returning where it ends.
+    fn skip_pairs(dex: &[u8], mut at: usize, count: u32, fields: bool) -> Option<usize> {
+        for _ in 0..count {
+            at = uleb(dex, at)?.1;
+            at = uleb(dex, at)?.1;
+            if !fields {
+                at = uleb(dex, at)?.1;
+            }
+        }
+        Some(at)
+    }
+
+    /// The operand of the single `const-string` in `class.method`, if there is exactly one.
+    ///
+    /// `None` covers every way this can fail to be a question with an answer: no such class, no
+    /// such method, an abstract method with no code, a truncated file, or a body that is not the
+    /// shape the caller expects. A caller that wants those distinguished should not be using a
+    /// helper this small.
+    pub fn only_const_string(dex: &[u8], class: &str, method: &str) -> Option<String> {
+        if dex.get(..4)? != b"dex\n" {
+            return None;
+        }
+        let (class_count, class_off) = (u32_at(dex, 96)?, u32_at(dex, 100)? as usize);
+        for i in 0..class_count as usize {
+            let base = class_off + 32 * i;
+            if type_name(dex, u32_at(dex, base)?)? != class {
+                continue;
+            }
+            let data = u32_at(dex, base + 24)? as usize;
+            if data == 0 {
+                return None;
+            }
+            let (static_fields, at) = uleb(dex, data)?;
+            let (instance_fields, at) = uleb(dex, at)?;
+            let (direct_methods, at) = uleb(dex, at)?;
+            let (virtual_methods, at) = uleb(dex, at)?;
+            let at = skip_pairs(dex, at, static_fields, true)?;
+            let mut at = skip_pairs(dex, at, instance_fields, true)?;
+            for count in [direct_methods, virtual_methods] {
+                // The index is a **running delta** inside each list and restarts at zero between
+                // them, which is the one thing in this format that silently yields a plausible
+                // wrong answer if it is got wrong: a method name from the wrong entry.
+                let mut index = 0u32;
+                for _ in 0..count {
+                    let (delta, next) = uleb(dex, at)?;
+                    let (_access, next) = uleb(dex, next)?;
+                    let (code, next) = uleb(dex, next)?;
+                    at = next;
+                    index = index.checked_add(delta)?;
+                    if code == 0 || method_name(dex, index)? != method {
+                        continue;
+                    }
+                    return single_const_string(dex, code as usize);
+                }
+            }
+            return None;
+        }
+        None
+    }
+
+    /// The one `const-string` in a `code_item`'s instruction stream.
+    ///
+    /// **Exactly one, or nothing.** A method with two of them is not the one-line accessor this is
+    /// written for, and answering with the first would be a guess.
+    fn single_const_string(dex: &[u8], code: usize) -> Option<String> {
+        let units = u32_at(dex, code + 12)? as usize;
+        let insns = dex.get(code + 16..code + 16 + 2 * units)?;
+        let mut found: Option<String> = None;
+        let mut at = 0usize;
+        while at + 2 <= insns.len() {
+            // Only the two opcodes this needs are decoded; everything else is **stepped over by
+            // its format width**, which is what makes this a walk rather than a scan for a byte
+            // that happens to be 0x1a. A scan would find the string index of an unrelated
+            // instruction's operand and report a string that is in the file but not in the method.
+            let opcode = insns[at];
+            let width = match opcode {
+                0x00 => match insns.get(at + 1) {
+                    // The three payload pseudo-instructions carry their own size, and a walk that
+                    // guessed 2 bytes for them would resynchronise onto data.
+                    Some(1) => 2 * (u16_at(insns, at + 2)? as usize) + 4,
+                    Some(2) => 4 * (u16_at(insns, at + 2)? as usize) + 8,
+                    Some(3) => {
+                        let element = u16_at(insns, at + 2)? as usize;
+                        let count = u32_at(insns, at + 4)? as usize;
+                        let bytes = element * count;
+                        8 + bytes + (bytes & 1)
+                    }
+                    _ => 2,
+                },
+                0x1a => {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(string(dex, u32::from(u16_at(insns, at + 2)?))?);
+                    4
+                }
+                0x1b => {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(string(dex, u32_at(insns, at + 2)?)?);
+                    6
+                }
+                // `const-wide`, format 51l: five 16-bit units.
+                0x18 => 10,
+                // `invoke-polymorphic` and its range form, 45cc / 4rcc: four units.
+                0xfa | 0xfb => 8,
+                // Three-unit formats: 32x, 31i, 31c, 31t, 35c, 3rc.
+                0x03 | 0x06 | 0x09 | 0x14 | 0x17 | 0x24 | 0x25 | 0x26 | 0x2a | 0x2b | 0x2c
+                | 0x6e..=0x72 | 0x74..=0x78 | 0xfc | 0xfd => 6,
+                // Two-unit formats: 22x, 21s, 21h, 21c, 22c, 20t, 23x, 22t, 21t, 22s, 22b.
+                0x02 | 0x05 | 0x08 | 0x13 | 0x15 | 0x16 | 0x19 | 0x1c | 0x1f | 0x20 | 0x22
+                | 0x23 | 0x29 | 0x2d..=0x3d | 0x44..=0x6d | 0x90..=0xaf | 0xd0..=0xe2 | 0xfe
+                | 0xff => 4,
+                // Everything else is one unit: 10x, 12x, 11x, 11n, 10t, and the unused opcodes,
+                // which cannot appear in a verified dex.
+                _ => 2,
+            };
+            at += width;
+        }
+        found
+    }
+}
+
+/// The application name the script sends is the one **`bh.x0.M` returns**, read out of the APK.
+///
+/// # What this catches, and why a comment could not
+///
+/// The value used to be `"android"`. The engine puts it straight into the path of
+/// `/v2/settings/application/{}` and the server answered
+/// `{"errors":[{"code":1,"message":"The application name is invalid."}]}` with `HTTP 400` —
+/// MEASURED against the real endpoint — and that is the failure that kept
+/// `nativeActivity_onSurfaceChanged` returning `Flags-Not-Received`. Nothing offline could tell
+/// that string from a right one: it is well-formed, it is plausible, and every test in this suite
+/// passed with it in place.
+///
+/// So the assertion is the narrow, checkable thing: the constant is what the APK's own Java side
+/// hands to `nativeOverrideChannelPlatformName`. If a future APK renames its distribution, this
+/// fails and names the new value rather than silently asking a CDN for a channel that does not
+/// exist.
+///
+/// It needs neither the engine, a CPU nor a network, so it is cheap enough to run while the thing
+/// it guards is being changed — the same argument
+/// `the_activity_class_answers_every_member_row_23_looks_up_on_it` makes for itself.
+#[test]
+fn the_application_name_the_script_sends_is_the_one_the_apk_hands_the_engine() {
+    let apk = omni_apk::Apk::open(apk_path()).expect("the real APK");
+    let dexes: Vec<String> = apk
+        .entries()
+        .iter()
+        .map(|entry| entry.name().to_string())
+        .filter(|name| name.ends_with(".dex"))
+        .collect();
+    assert!(!dexes.is_empty(), "the APK has no dex at all, so this test is measuring nothing");
+    // `bh.x0.M` is the application name and `bh.x0.d1` is the version string, and both are
+    // one-instruction accessors in the same class. The version is checked alongside because it
+    // costs one more call and because `APP_VERSION`'s own doc says three drifted duplicates of
+    // that figure have already appeared in this project — a constant taken from a file *name* is
+    // exactly the kind that drifts.
+    let read = |method: &str| -> Option<(String, String)> {
+        dexes.iter().find_map(|name| {
+            let bytes = apk.read_named(name).expect("read a dex out of the APK");
+            dex::only_const_string(&bytes, "Lbh/x0;", method).map(|value| (name.clone(), value))
+        })
+    };
+
+    let (dex_name, value) = read("M").unwrap_or_else(|| {
+        panic!(
+            "`bh.x0.M` was not readable in any of the APK's {} dex files. That method is what \
+             supplies the application name to nativeOverrideChannelPlatformName; if it has moved \
+             or changed shape, the constant has to be re-read rather than carried over",
+            dexes.len()
+        )
+    });
+    assert_eq!(
+        value,
+        script::CHANNEL_PLATFORM_NAME,
+        "{dex_name} says `bh.x0.M` returns {value:?}, and the script sends {:?}. That string is \
+         the path segment of the client-settings request; a value the APK does not name gets \
+         `HTTP 400 The application name is invalid.` and the engine never receives its flags",
+        script::CHANNEL_PLATFORM_NAME
+    );
+
+    let (dex_name, version) = read("d1").unwrap_or_else(|| {
+        panic!("`bh.x0.d1` was not readable in any of the APK's {} dex files", dexes.len())
+    });
+    assert_eq!(
+        version,
+        script::APP_VERSION,
+        "{dex_name} says `bh.x0.d1` returns {version:?} and the script tells the engine it is \
+         {:?}. That value reaches nativeSetRobloxVersion and the platform headers, and the APK's \
+         own Java side is the thing that knows it",
+        script::APP_VERSION
+    );
 }
 
 /// §8 row 23's three lookups all resolve from the **one** `jclass` the engine derives from the

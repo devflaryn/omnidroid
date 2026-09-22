@@ -145,6 +145,10 @@ ADAPTER_ADDRINFO = "crates/omni-android/src/bionic/addrinfo.rs"
 # these 4, 5, 6; Windows numbers the same three 3, 17, 16 and puts TCP_MAXRT on 5.
 PLATFORM_NET_WINDOWS = "crates/omni-platform/src/net/windows.rs"
 PLATFORM_NET_MOD = "crates/omni-platform/src/net/mod.rs"
+# M6: the opt-in socket record. Its two failure modes are both silent -- a recorder that keeps
+# capturing after it was turned off is a credential leak that looks like a working recorder, and a
+# budget that is not enforced is an unbounded buffer that only shows up on a long run.
+PLATFORM_NET_RECORD = "crates/omni-platform/src/net/record.rs"
 
 # Phase 3c: threads and signals.
 BIONIC_SIGNAL = "crates/omni-bionic/src/signal.rs"
@@ -156,6 +160,9 @@ ADAPTER_RUNTIME = "crates/omni-android/src/bionic/runtime.rs"
 JNI_ENV = "crates/omni-android/src/jni/env.rs"
 JNI_REFS = "crates/omni-android/src/jni/refs.rs"
 JNI_CLASSES = "crates/omni-android/src/jni/classes.rs"
+# M6 row 21: the scripted downcall table. The one string in it that decided whether the engine
+# could ever get its flags.
+JNI_SCRIPT = "crates/omni-android/src/jni/script.rs"
 # M6: the startup gate itself. Two `jmid-` rows are anchored in it.
 GATE_ACTIVITY_FILE = "crates/omni-android/tests/gameactivity.rs"
 JNI_VALUES = "crates/omni-android/src/jni/values.rs"
@@ -239,6 +246,13 @@ ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
 # neither the APK nor a guest run -- so this costs a build and not a run.
 GATE_ACTIVITY = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
                  "--no-fail-fast", "the_activity_class"]
+
+# The same target, filtered to the test that reads `bh.x0.M` out of the APK's dex. It opens the
+# APK and reads four dex files -- no guest, no CPU, no network -- so like `GATE_ACTIVITY` it costs
+# a build and not a run. Separate from `GATE_ACTIVITY` because that one is filtered by name to a
+# different test, and a row pointed at the wrong filter reports MISS rather than being wrong.
+GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
+                "--no-fail-fast", "the_application_name"]
 
 # M6 groundwork: runtime texture transcoding (`omni-texture`). Zero dependencies and `#![no_std]`,
 # so its command builds in about a second.
@@ -5804,6 +5818,62 @@ directory", ADAPTER_FILES,
         self.gate
     }""",
      ANDROID_LIB),
+
+    # ---- the socket record: off by default, and bounded ----------------------------------------
+    #
+    # **A recorder that captures while it is switched off is the defect this module exists to not
+    # have.** It would pass every other test -- the bytes are right, the counts are right, the
+    # outline is right -- and it would be quietly accumulating the guest's cookies in a process
+    # global in every run of the whole suite. Nothing but an assertion about the *off* state can
+    # see it.
+    ("netrec-A1", "A", "the record keeps capturing after it is switched off",
+     PLATFORM_NET_RECORD,
+     """    if limit == 0 || bytes.is_empty() {""",
+     """    if bytes.is_empty() {""",
+     PLATFORM),
+
+    # The budget applied to the call instead of to the buffer: every `send` then appends up to
+    # `limit` more bytes, so a long connection grows without bound and the transcript stops being a
+    # prefix. It reads as correct, and a short run cannot tell the two apart.
+    ("netrec-A2", "A", "the byte budget bounds each call rather than the whole capture",
+     PLATFORM_NET_RECORD,
+     """    let room = limit.saturating_sub(buffer.len());""",
+     """    let room = limit;""",
+     PLATFORM),
+
+    # **The one thing in a TLS session that is in the clear, read off by one.** The server name
+    # would come back with the extension's length byte in front of it -- still recognisable to a
+    # human, still "containing" the hostname, and naming a host that was never contacted.
+    ("netrec-B1", "B", "the ClientHello server name is taken one byte early",
+     PLATFORM_NET_RECORD,
+     """            let host = data.get(5..)?;""",
+     """            let host = data.get(4..)?;""",
+     PLATFORM),
+
+    # ---- the application name the client-settings request is built from --------------------------
+    #
+    # **The defect this is the regression test for, put back exactly.** `"android"` is well-formed,
+    # plausible, and in the APK's dex files as a string -- and it made the engine ask
+    # `clientsettingscdn.roblox.com` for an application that does not exist, which answers
+    # `HTTP 400 {"errors":[{"code":1,"message":"The application name is invalid."}]}`. Every test in
+    # the suite passed with it in place for the whole of M6. What catches it is the one assertion
+    # that is about the APK rather than about plausibility: that the string is what `bh.x0.M`
+    # returns.
+    ("appname-A1", "A", "the application name goes back to the invented `android`",
+     JNI_SCRIPT,
+     """pub const CHANNEL_PLATFORM_NAME: &str = "GoogleAndroidApp";""",
+     """pub const CHANNEL_PLATFORM_NAME: &str = "android";""",
+     GATE_APPNAME),
+
+    # The engine's own compiled-in fallback, which is a *real* application name and answers
+    # `HTTP 200` -- so no run and no network would tell it from the right one. It is still wrong:
+    # it says this is a build with no Java side rather than the Google Play build the APK is, and
+    # the two get different flag documents (1,322,077 bytes against 1,351,777, MEASURED).
+    ("appname-B1", "B", "the application name is the binary's fallback instead of the APK's",
+     JNI_SCRIPT,
+     """pub const CHANNEL_PLATFORM_NAME: &str = "GoogleAndroidApp";""",
+     """pub const CHANNEL_PLATFORM_NAME: &str = "AndroidApp";""",
+     GATE_APPNAME),
 ]
 
 
