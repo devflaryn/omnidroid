@@ -7690,6 +7690,148 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
 }
 
 // =========================================== M5: the park witness, for §8 row 14's cond-wait
+// =========================================== M6: pthread_cond_timedwait's absolute deadline
+
+/// **A deadline already in the past returns `ETIMEDOUT` with the mutex relocked, and returns at
+/// once.**
+///
+/// The whole of what this handler adds over `pthread_cond_wait` is turning an *absolute*
+/// `timespec` into a relative wait, and this is the arithmetic's edge. Three things are asserted
+/// separately because each fails differently:
+///
+/// * the **return code** is `ETIMEDOUT` -- a sign error that made the past look like the future
+///   would hang here instead, which the harness budget turns into a failure rather than a pass;
+/// * the mutex is **held again** afterwards, proved by the guest unlocking it and getting 0. A
+///   handler that returned early on a past deadline without going through the two-phase wait
+///   would leave it locked, and POSIX requires the relock on every exit path;
+/// * the call **did not sleep**, bounded generously at one second, because the same sign error in
+///   the other direction produces a correct `ETIMEDOUT` after a wait nobody asked for.
+#[test]
+fn a_past_absolute_deadline_times_out_at_once_with_the_mutex_relocked() {
+    let _guard = serialized();
+    let f = fixture();
+    let cond = f.guest.data + 0x300;
+    let mutex = f.guest.data + 0x400;
+    let abstime = f.guest.data + 0x500;
+    f.guest.write_bytes(cond, &[0u8; 48]);
+    f.guest.write_bytes(mutex, &[0u8; 40]);
+    // The epoch: as far in the past as a CLOCK_REALTIME `timespec` goes.
+    f.guest.write_u64(abstime, 0);
+    f.guest.write_u64(abstime + 8, 0);
+
+    let init_cond = f.thunk("pthread_cond_init");
+    let init_mutex = f.thunk("pthread_mutex_init");
+    let lock = f.thunk("pthread_mutex_lock");
+    let unlock = f.thunk("pthread_mutex_unlock");
+    let timedwait = f.thunk("pthread_cond_timedwait");
+
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(22, f.guest.data as u64);
+    asm.mov(0, cond as u64);
+    asm.mov(1, 0);
+    asm.bl(init_cond);
+    asm.mov(0, mutex as u64);
+    asm.mov(1, 0);
+    asm.bl(init_mutex);
+    asm.mov(0, mutex as u64);
+    asm.bl(lock);
+    asm.push(str_imm(0, 22, 0));
+    asm.mov(0, cond as u64);
+    asm.mov(1, mutex as u64);
+    asm.mov(2, abstime as u64);
+    asm.bl(timedwait);
+    asm.push(str_imm(0, 22, 8));
+    // If the relock did not happen this unlock answers non-zero, which is the assertion below.
+    asm.mov(0, mutex as u64);
+    asm.bl(unlock);
+    asm.push(str_imm(0, 22, 16));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+
+    let started = std::time::Instant::now();
+    let mut cpu = f.guest.thread(&f.boundary);
+    f.run(&mut cpu, entry).expect("the run must complete");
+    let elapsed = started.elapsed();
+
+    assert_eq!(f.guest.read_u64(f.guest.data), 0, "pthread_mutex_lock");
+    assert_eq!(
+        f.guest.read_u64(f.guest.data + 8) as i32,
+        110,
+        "ETIMEDOUT, which is what the guest's own `cmp w0, #0x6e` at 0x0285f7f0 tests for"
+    );
+    assert_eq!(
+        f.guest.read_u64(f.guest.data + 16),
+        0,
+        "the mutex must be held again on the timeout path, so the guest can unlock it"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "a deadline in the past is not a wait: {elapsed:?}"
+    );
+}
+
+/// **A `timespec` with an out-of-range `tv_nsec` is `EINVAL`, not a wait.**
+///
+/// bionic validates it, and the alternative here would be `Duration::new` panicking on a
+/// nanosecond field above a billion or a negative one silently becoming zero -- a wait for a time
+/// the caller never expressed.
+#[test]
+fn an_out_of_range_tv_nsec_is_einval() {
+    let _guard = serialized();
+    let f = fixture();
+    let cond = f.guest.data + 0x300;
+    let mutex = f.guest.data + 0x400;
+    let abstime = f.guest.data + 0x500;
+    f.guest.write_bytes(cond, &[0u8; 48]);
+    f.guest.write_bytes(mutex, &[0u8; 40]);
+
+    for nanos in [1_000_000_000u64, u64::MAX] {
+        f.guest.write_u64(abstime, 0);
+        f.guest.write_u64(abstime + 8, nanos);
+        let returned = value_of(&f, "pthread_cond_timedwait", |asm| {
+            asm.mov(0, cond as u64);
+            asm.mov(1, mutex as u64);
+            asm.mov(2, abstime as u64);
+        });
+        assert_eq!(returned as i32, 22, "EINVAL for tv_nsec = {nanos}");
+    }
+}
+
+/// **An absolute deadline further out than the layer's cap is refused by name**, the same cap
+/// `nanosleep`, `poll`, `select` and `ALooper_pollOnce` state.
+///
+/// The number is derived from the clock rather than written down, so the test cannot drift from
+/// the cap: `MAX_SLEEP_SECONDS` past now is inside it and twice that is not.
+#[test]
+fn an_absolute_deadline_past_the_cap_is_refused_and_names_the_cap() {
+    let _guard = serialized();
+    let f = fixture();
+    let cond = f.guest.data + 0x300;
+    let mutex = f.guest.data + 0x400;
+    let abstime = f.guest.data + 0x500;
+    f.guest.write_bytes(cond, &[0u8; 48]);
+    f.guest.write_bytes(mutex, &[0u8; 40]);
+    let now = omni_platform::clock::realtime_now().as_secs();
+    f.guest.write_u64(abstime, now + 2 * omni_android::bionic::MAX_SLEEP_SECONDS);
+    f.guest.write_u64(abstime + 8, 0);
+
+    let error = refusal_of(&f, "pthread_cond_timedwait", |asm| {
+        asm.mov(0, cond as u64);
+        asm.mov(1, mutex as u64);
+        asm.mov(2, abstime as u64);
+    });
+    let text = error.to_string();
+    assert!(text.contains("pthread_cond_timedwait"), "{text}");
+    assert!(
+        text.contains(&format!("{} seconds", omni_android::bionic::MAX_SLEEP_SECONDS)),
+        "the refusal must name the cap it applied: {text}"
+    );
+    assert!(text.contains("CLOCK_REALTIME"), "and the clock it measured against: {text}");
+}
+
+
 
 /// **A guest thread blocked in `pthread_cond_wait` is visible from outside while it is blocked.**
 ///

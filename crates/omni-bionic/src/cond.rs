@@ -597,6 +597,46 @@ mod tests {
         w.join().unwrap();
     }
 
+    /// `clock_of` reads back exactly what `init` wrote, for all three ways a cond is born.
+    ///
+    /// The third is the one worth having: an **all-zero** struct is `PTHREAD_COND_INITIALIZER`,
+    /// a statically initialised cond that never went through `init`, and it must answer
+    /// `CLOCK_REALTIME`. A `timedwait` on one is otherwise turned into an absolute deadline on
+    /// the wrong clock, which on this host is a difference of decades.
+    #[test]
+    fn clock_of_reads_back_what_init_wrote_including_the_static_initializer() {
+        let mut mem = MockMemory::new();
+        mem.map(0x1000, &[0u8; 48]);
+        mem.map(0x2000, &[0u8; 8]);
+
+        // A cond that never went through `init`: all zero, so CLOCK_REALTIME.
+        assert_eq!(clock_of(&mut mem, 0x1000).unwrap(), Ok(clock_id::CLOCK_REALTIME));
+
+        // A NULL attr, which is bionic's default.
+        assert_eq!(init(&mut mem, 0x1000, 0).unwrap(), 0);
+        assert_eq!(clock_of(&mut mem, 0x1000).unwrap(), Ok(clock_id::CLOCK_REALTIME));
+
+        // An attr that asked for the monotonic clock.
+        assert_eq!(attr_init(&mut mem, 0x2000).unwrap(), 0);
+        assert_eq!(attr_setclock(&mut mem, 0x2000, clock_id::CLOCK_MONOTONIC).unwrap(), 0);
+        assert_eq!(init(&mut mem, 0x1000, 0x2000).unwrap(), 0);
+        assert_eq!(clock_of(&mut mem, 0x1000).unwrap(), Ok(clock_id::CLOCK_MONOTONIC));
+
+        // And back, so the field is read rather than remembered.
+        assert_eq!(attr_setclock(&mut mem, 0x2000, clock_id::CLOCK_REALTIME).unwrap(), 0);
+        assert_eq!(init(&mut mem, 0x1000, 0x2000).unwrap(), 0);
+        assert_eq!(clock_of(&mut mem, 0x1000).unwrap(), Ok(clock_id::CLOCK_REALTIME));
+    }
+
+    /// A selector `init` never writes is `EINVAL` rather than a clock picked by falling through.
+    #[test]
+    fn clock_of_refuses_a_selector_this_crate_never_writes() {
+        let mut mem = MockMemory::new();
+        mem.map(0x1000, &[0u8; 48]);
+        mem.write(0x1004, &7u32.to_le_bytes()).unwrap();
+        assert_eq!(clock_of(&mut mem, 0x1000).unwrap(), Err(consts::EINVAL));
+    }
+
     /// timedwait returns ETIMEDOUT with the mutex RELOCKED: proved by the
     /// waiter unlocking the mutex successfully after the timeout.
     #[test]

@@ -333,6 +333,42 @@ mod tests {
     use super::*;
     use crate::mock::MockMemory;
 
+    /// The scheduling band is Linux's, **named value by value** rather than checked as a span.
+    ///
+    /// A test that only asserted `max - min >= 3` would pass for 1..4, for 0..99, and for a pair
+    /// that had swapped -- and the guest at 0x054e0260 asks exactly that question, so a test
+    /// shaped like the guest's check cannot see a substitution in either endpoint
+    /// (`docs/VERIFICATION.md` entry 1).
+    #[test]
+    fn the_scheduling_priority_band_is_linux_value_by_value() {
+        assert_eq!(sched_get_priority_min(sched_policy::FIFO), 1);
+        assert_eq!(sched_get_priority_max(sched_policy::FIFO), 99);
+        assert_eq!(sched_get_priority_min(sched_policy::RR), 1);
+        assert_eq!(sched_get_priority_max(sched_policy::RR), 99);
+        for policy in [sched_policy::OTHER, sched_policy::BATCH, sched_policy::IDLE] {
+            assert_eq!(sched_get_priority_min(policy), 0, "policy {policy}");
+            assert_eq!(sched_get_priority_max(policy), 0, "policy {policy}");
+        }
+        // 4 is the one number below IDLE that Linux does not define, so it is the case that
+        // separates "anything in range" from the actual set.
+        for policy in [-1, 4, 6, 99] {
+            assert_eq!(sched_get_priority_min(policy), -1, "policy {policy}");
+            assert_eq!(sched_get_priority_max(policy), -1, "policy {policy}");
+        }
+    }
+
+    /// And the relation the guest actually tests, asserted as a relation.
+    ///
+    /// `docs/VERIFICATION.md` entry 10: the values above are the evidence, this is the
+    /// *conclusion* the engine draws from them, and stating it separately means a future change
+    /// to either endpoint has to break one of the two.
+    #[test]
+    fn the_real_time_band_is_wide_enough_for_the_engine_check_at_0x054e0280() {
+        let min = sched_get_priority_min(sched_policy::FIFO);
+        let max = sched_get_priority_max(sched_policy::FIFO);
+        assert!(max - min >= 3, "the guest requires `max - min >= 3`: got {min}..{max}");
+    }
+
     /// pthread_equal: equal identities -> 1, distinct -> 0.
     #[test]
     fn equal_semantics() {
