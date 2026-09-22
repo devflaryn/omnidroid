@@ -1,14 +1,16 @@
 # Handoff
 
-Written 2026-09-19, current as of **2026-09-21 after M4**. This file is a pointer and a state
+Written 2026-09-19, current as of **2026-09-22, mid-M6**. This file is a pointer and a state
 snapshot, not a history. The durable sources of truth are `docs/ARCHITECTURE.md`,
 `docs/DECISIONS.md`, `docs/STATUS.md`, **`docs/VERIFICATION.md`**, the M3 plan and ledger, and git
 history.
 
 ## Read `docs/VERIFICATION.md` before writing a test you intend to rely on
 
-New, and the least reconstructible thing here. **Eleven documented ways verification has failed in
-this project**, each a real incident with its measurement, plus the six process rules they produced.
+New, and the least reconstructible thing here. **Thirteen documented ways verification has failed
+in this project**, each a real incident with its measurement, plus the six process rules they
+produced. **Rules 2, 3 and 4 were all amended on 2026-09-22 because all three were broken that
+day** -- twice by committing or building against a tree a mutation harness was holding.
 Not general advice — every entry produced a *green suite that proved less than it claimed*, and most
 were written by whoever wrote the code.
 
@@ -27,9 +29,10 @@ adapter review were exactly that.
 | 6-12 | M4 | **done** — `JNI_OnLoad` returns `0x00010006` on the real engine; 19 of 21 scripted downcalls |
 | **13** | **M5 — reached** | `initializeNativeCode` returns a `NativeCode *` on the real engine. Record: **D29** |
 | 14 | **M5 — reached** | the game thread runs `android_app_entry`, and §8 row 14's cond-wait completes |
-| 15-20 | **M6 — next** | `NativeEngine`, `ANativeWindow` (**five** symbols in this binary, not §4.4's nine), the GameActivity callbacks |
-| 21-24 | M5/M6 | the flags/settings orchestration — **§8.1 says this is the step most likely to be mistaken for "the engine is broken"**, because it hangs rather than errors |
-| 25 | M6 | EGL then Vulkan via `dlopen` |
+| 15 | **reached** | the game thread runs `android_main` → `NativeEngine::GameLoop()` |
+| 16-20 | **M6 — next, and the live blocker** | the GameActivity callbacks. `ANativeWindow` exists (**five** symbols in this binary, not §4.4's nine); **nothing drives the callbacks that post `APP_CMD_*` down the pipe**, which is why the game thread sits in `ALooper_pollOnce(-1)` |
+| 21-24 | M6 | the flags/settings orchestration — **§8.1 says this is the step most likely to be mistaken for "the engine is broken"**, because it hangs rather than errors |
+| 25 | **M6/M7 — essentially unbuilt** | EGL (17 hard-linked symbols, **0 bound**) then Vulkan via `dlopen` (**0 `vk*` imports**). `omni-gfx` is a 16-line stub that nothing depends on |
 | 26 | M7/M8 | input, first frame, interactive |
 
 **The architectural fact that shapes M5 and M6:** the Java side is the **initiator**. `libroblox.so`
@@ -79,11 +82,16 @@ was checked for a live mutation before anything was run: **it was clean**, and `
 
 ## Verification state
 
+> **Superseded — the current figures are in the `Verification state` section under `# START HERE`
+> at the end of this file.** Kept here for the shape of the history. As of 2026-09-22 it is
+> **1,388 passing / 0 failing / 17 ignored** across 113 targets, and `tools/mutate.py` holds **446**
+> rows with gate 1 clean; the full table has **not** been run in one pass since it was 393.
+
 **1,328 passing, 0 failing, 17 ignored** (`cargo test --workspace --release`, after M5). The two
 gates — `tests/jni_startup.rs` and `tests/gameactivity.rs` — are four of them, and each takes about
 50 s because it loads 109 MB and runs 3,594 initializers before it starts.
 
-Mutation: `tools/mutate.py` holds **393** rows and **the whole table has been run on the committed
+Mutation: `tools/mutate.py` held **393** rows at M5 and **the whole table was run on the committed
 tree: 393/393 caught**, with both pre-flight gates passing. Two rows missed on the first full run
 and **neither was a gap in the code**: both dropped entries from an array without changing its
 declared length, so neither compiled, and the harness reported `did not compile, twice` rather
@@ -877,111 +885,187 @@ These are in the M3 plan as Global Constraints. The three worth knowing before w
 Read in this order:
 
 1. **`docs/HANDOFF.md`** — this file.
-2. **`docs/STATUS.md`** — the honest capability matrix. Distinguishes verified from planned; nothing is
-   claimed for Linux or macOS.
-3. **`docs/ARCHITECTURE.md`** §§1, 5, 6 — the identity-mapping bet (§1), the Android compatibility
-   layer M3 is building (§5), and ARM64 execution (§6).
-4. **`docs/DECISIONS.md`** — **D17 first** (it is M3's design), then D4, D10, D13, D16. Read the
-   amendments and corrections inline; several entries supersede their own earlier text.
-5. **`docs/plans/android-abi-plan.md`** — the M3 plan. Read the Global Constraints, then Task 2.
-6. **`.superpowers/sdd/android-abi-plan/progress.md`** — the ledger: Task 1's rulings, the open
-   question, and the preflight conflict scan.
-7. **`.superpowers/sdd/android-abi-plan/task-1-report.md`** and **`task-1-review.md`** — only if Task
-   2 needs the measurement detail behind D17.
+2. **`docs/VERIFICATION.md`** — **thirteen** documented ways verification has failed *in this
+   project*, each a real incident, plus the six process rules they produced. Rules 2, 3 and 4 were
+   all amended in the last session because all three were broken in it. Read it before writing a
+   test you intend to rely on, and before believing a number.
+3. **`docs/STATUS.md`** — the honest capability matrix. Nothing is claimed for Linux or macOS.
+4. **`docs/research/jni-surface.md` §8** — the 26-step startup contract, and **§8.1**, which ranks
+   the failure modes in the order you will meet them.
+5. **`docs/DECISIONS.md`** — **D29** (M5 and the NDK surface) and **D28** (M4) first, then D27
+   (textures — M6's scope), D26 (`AT_HWCAP`), D24, D23, D19, D16, D13, D7.
+6. **`docs/ARCHITECTURE.md`** §§1, 2, 5, 6.
 
-**First concrete action: M6 — §8 steps 15-25, the surface and the graphics.** M5 is reached and
-its record is **D29**. The two things to settle before writing code are in the M5 section below:
-the engine's own worker threads issue **raw `syscall 98` (arm64 `futex`)**, which needs a decision
-rather than code; and `ANativeWindow` is **five** symbols in this binary, not §4.4's nine.
-Read D29, then `jni-surface.md` §8 rows 17-25 and §8.1's **sixth** failure mode — steps 21-24 hang
-rather than error, and are "the step most likely to be mistaken for the engine being broken".
+## Where the runtime actually stops today
 
-## M5 is reached — what it left for M6
+`cargo test -p omni-android --release --test gameactivity` is the gate, and it is **green**. It
+loads the real APK, runs all 3,594 initializers, `JNI_OnLoad`, §8 steps 7-12, then
+`Java_com_google_androidgamesdk_GameActivity_initializeNativeCode`, which returns a non-zero
+`NativeCode *`. The game thread then runs `android_app_entry` → `android_main` →
+`NativeEngine::GameLoop()`, calls `MainGameActivity.getNativeHelper()` → `bootstrapTheApp()`, and
+**stops inside `ALooper_pollOnce(-1)`**, which this layer refuses by name.
 
-`cargo test -p omni-android --release --test gameactivity` is the gate. It runs all 3,594
-initializers, `JNI_OnLoad`, §8 steps 7-12, and then calls the exported
-`Java_com_google_androidgamesdk_GameActivity_initializeNativeCode`. **It returns a non-zero
-`jlong`**, and the engine reaches `[FLog::NativeEngine] initializing.` Durable record: **D29**.
+**That refusal is the frontier.** Everything below is about crossing it.
 
-**What is VERIFIED, on the real `libroblox.so`, n = 1 run each:**
+## Be clear-eyed about how far this is from a playable game
 
-| | |
-|---|---|
-| step 13 | returns a **`NativeCode *`**, and §5.2's own offsets are read back out of guest memory one assertion each |
-| `activity->instance` (+0x38) | non-zero — the field `GameActivity_onCreate` writes only after the game thread signals `app->running`, so it **is** the assertion that §8 row 14's cond-wait completed |
-| the game thread | `android_app_entry` ran: its own `ALooper_prepare`, `AConfiguration_fromAssetManager` → `en-US 411x731 dp`, `addFd(ident 1, callback 0)` = `LOOPER_ID_MAIN` |
-| §8 steps 7-12 | **20 of 21** (M4 had 19; `strftime` closed `nativeInitFastLog`) |
-| JNI misses | **0** |
-| imports called | **134 distinct** across the whole run (M4: 113) |
-| suite | **1,328 passing, 0 failing, 17 ignored** (`cargo test --workspace --release`) |
-| mutation | **393 rows** |
+Reaching §8 row 25 of 26 sounds like 96%. It is not, and a new session should not plan as though it
+is. Row 25 is where the engine *asks for graphics* — it is the door, not the room. Behind it:
 
-### The one remaining scripted downcall, unchanged
+* **`crates/omni-gfx/src/lib.rs` is 16 lines.** It is a stub. Nothing depends on it; `grep` for
+  `omni_gfx` across `crates/` returns only comments saying it is not wired.
+* **Zero `egl*` symbols are bound.** `libroblox.so` imports **17** (measured twice, from the symbol
+  table: `eglGetDisplay`, `eglInitialize`, `eglChooseConfig`, `eglCreateContext`,
+  `eglCreateWindowSurface`, `eglCreatePbufferSurface`, `eglMakeCurrent`, `eglSwapBuffers`,
+  `eglSwapInterval`, `eglQuerySurface`, `eglGetConfigAttrib`, `eglGetCurrentContext`,
+  `eglDestroyContext`, `eglDestroySurface`, `eglTerminate`, `eglGetError`, `eglGetProcAddress`).
+* **Zero `vk*` symbols are imported at all** — Vulkan arrives through
+  `dlopen("libvulkan.so")` + `vkGetInstanceProcAddr`, so the whole API comes through `dlsym`. The
+  `dlopen`/`dlsym` layer exists (`bionic/dl.rs`) but answers only for libraries *this layer is*, and
+  refuses to load a file. Making `libvulkan.so` loadable is a deliberate decision, not a patch.
+* **GLES is not bound either.** `libGLESv2` is in `DT_NEEDED`; the engine may take either path.
+  Which one it takes at runtime **has never been observed** and is the first thing to measure.
+* **`crates/omni-texture`** (735 lines) decodes the APK's ETC1 correctly and is *not connected to a
+  pipeline* — it has no consumer.
+* **No window system integration exists.** `ANativeWindow` is five real symbols over an arena
+  handle; `ANativeWindow_getWidth`/`_getHeight` **refuse** until an embedding calls
+  `Ndk::set_window_geometry`, because there is no surface and inventing `1920x1080` would be a
+  device profile nobody chose.
+* **No Vulkan validation layers are installed on this machine.** That will hurt.
 
-`nativeSetPlatformHeadersWithIdfa` still hands `strchr` a pointer mapped nowhere, and **whose
-pointer it is has still not been established**. The gate prints the pointer and what is mapped
-there on every failed step; that is unchanged from M4 and is still the instrumentation the next
-person needs.
+So: M6 (a Vulkan or GLES device created through the forwarding layer), M7 (first frame presented)
+and M8 (interactive) are all ahead, and M6 has barely begun. Plan in those terms.
 
-### What M5 found that the research had not
+## The immediate blocker, and why it is not what it looks like
 
-* **`android/view/MotionEvent` and `android/view/KeyEvent` are Tier 0**, and §3.1 does not name
-  them. Their **22 + 11** members in `classes.rs` are read out of `Jni::misses` with the
-  descriptors the engine asked for. Do not "tidy" them against the Android API: a transcription
-  would have missed `getClassification` and `getActionButton`.
-* **§4.4's "ANativeWindow (9)" is the whole APK's count.** `libroblox.so` imports **five**:
-  `_acquire`, `_fromSurface`, `_getWidth`, `_getHeight`, `_release`. The other four belong to
-  `libimage_processing_util_jni` and `libsurface_util_jni`. **This is M6's scope, and it is
-  smaller than §4.4 reads.**
-* **`sched_yield` was called 22,387,975 times** in one run — D26's declined-AT_HWCAP fallback
-  spinning. Not a correctness problem; D26's "revisit at M8 under real thread load" now has a
-  figure.
+`ALooper_pollOnce(-1)` refuses with: *"a wait with no deadline cannot be ended by anything this
+runtime has… what changes this is a host-driven event source, which M6 needs anyway."*
 
-### The three thread failures joining made visible, in the order they matter
+**That premise is now false, and this is the single most important thing this handoff carries.**
+The game thread is not stuck — it is *correctly* blocked, waiting for the **main thread** to post
+`APP_CMD_INIT_WINDOW` down the pipe the glue created. On a device, the thing that writes to that
+pipe is §8 steps 16-20: `setInputConnectionNative`, `onSurfaceCreatedNative`,
+`onSurfaceChangedNative`, `onStartNative`, `onResumeNative`, `onWindowFocusChangedNative`,
+`onContentRectChangedNative`, `onWindowInsetsChangedNative`. **None of them has a driver yet.**
 
-Nobody joins a detached thread, so `Bionic::guest_thread_failures()` is the only place one can
-surface. The gate prints it.
+So the work is not "make an indefinite wait safe". It is:
 
-1. **Two engine threads died on raw `syscall 98` — arm64 `futex`.** The engine's own workers issue
-   raw futex syscalls, bypassing every `pthread_*` symbol this layer binds. **This is the largest
-   single obstacle between here and M6.** The refusal is right: a raw syscall asks the kernel
-   directly in the guest's ABI, and `-1`/`ENOSYS` is the believable wrong answer because callers
-   carry an ENOSYS fallback and would route around the gap without reporting it. What it needs is a
-   decision, not code — the same shape as D26.
-2. **One died on `CallObjectMethodV` with a null `jmethodID`** — §8.1's third failure mode, on the
-   game thread. A lookup that failed was not checked; `Jni::misses` is empty, so the class and
-   member are declared and the *answer* is what was missing.
-3. Step 12 logs `nativeAppBridgeSetInitParams: ERROR: nativeEngine is not created!` — expected
-   ordering, recorded so it is not mistaken for a defect.
+1. **Drive steps 16-20 from the gate's main thread**, which is what ART would do. These are
+   *exported* natives taking the `jlong` handle; call them the way step 13 is called.
+2. **Then** let `pollOnce(-1)` block, under a condition that is a fact rather than a cap: an
+   indefinite poll is legitimate exactly when the looper watches a descriptor that *something in
+   this runtime can still write* — a pipe whose write end is held by a live thread. If no such
+   descriptor exists, the wait genuinely cannot end and the refusal is still right.
+3. The stop path already exists. `Bionic::stop_guest_threads` + `join_guest_threads` and the
+   stoppable futex (`AddressFutex::stop`) were built for exactly this, and D16's step budget does
+   not tick for a sleeping thread.
 
-### What M6 needs that does not exist
+**Expect §8.1's sixth failure mode here.** Steps 21-24 *hang rather than error* and are "the step
+most likely to be mistaken for the engine being broken". The gate's 180-second watchdog prints
+`parked()`, the looper log and the JNI misses, then exits 101 — that output is the diagnosis, so
+keep it and read it rather than re-running.
 
-* **`ANativeWindow`** — five symbols, and a Java `Surface` that `ANativeWindow_fromSurface`
-  accepts. §8 step 17. **Nothing of it is built**, deliberately: M5 reaches step 13, and a window
-  that refused would have been a refusal nobody had reached yet.
-* **`ALooper_pollOnce` has never run against the real engine.** It is implemented and tested, and
-  the NDK census for the gate's run has **no** `ALooper_pollOnce` in it — the game thread died
-  before `GameLoop`. So the decision to **refuse an indefinite `pollOnce`** is untested against the
-  engine's actual argument. If `GameLoop` passes `-1`, that refusal is what stops it, and the fix
-  is the host-driven event source the refusal already names.
-* **EGL then Vulkan by `dlopen`** — §8 step 25, 17 hard-linked EGL symbols and zero `vk*` imports.
-* **No Vulkan validation layers are installed.** That will hurt from M6.
+## What the last session changed (25 commits, `440bb2b..8a5d372`)
 
-### Still open, carried forward
+**M6 work landed:** `ANativeWindow` (five symbols, arena handles, geometry refused until decided);
+the raw `futex` syscall (`SYS_FUTEX` 98) — which removed both `syscall 98` guest-thread deaths and
+exposed that parked threads never saw the stop switch; and the superclass chain in the JNI
+registry.
 
-* The adapter review's **M1** finding is the last of the seven still open: `read`/`pread`/
-  `__write_chk` consume from the descriptor **before** validating the guest destination. M3, M4,
-  M5, M6 and M7 were closed this session; L1-L7 and N1-N3 remain.
-* **A new finding, unfixed** (from the `stdio` work): `fputc`, `transfer_out` and
-  `write_host_bytes` set the stream's error flag on a zero-byte write but never set `errno`, so
-  the guest reads a **stale** one — a plausible reason for a failure that had a different cause.
-* **`__android_log_print` still refuses where a device truncates** for a formatted result over
-  1 MiB or a field over 64 KiB (`W1`). The fix is a byte budget in `format::render` that keeps its
-  partial output instead of discarding it; note the partial output for `FieldTooWide` is *not*
-  byte-identical to `vsnprintf`'s, so that arm needs thought rather than a `match`.
-* **bionic's own `strftime` behaviour is not verified anywhere**: no NDK, no bionic source on this
-  machine. The conversion set is derived from C99 and POSIX. If bionic accepts `%k`/`%l`/`%s`, this
-  refuses six calls bionic answers — a refusal rather than wrong text, which is the direction to
-  err, but a real divergence.
-* **`AT_HWCAP` declines (D26)**; the 22.4 M `sched_yield` figure above is the first real number
-  against it.
+**The null `jmethodID` is fixed and the diagnosis is worth reading.** `CallObjectMethodV` got `0x0`
+at guest pc `0x02bd8cac`, from a `GetMethodID` at `0x02bdad0c` asking
+`com/google/androidgamesdk/GameActivity` for `getResources()Landroid/content/res/Resources;` —
+with **no `cbz` between them**, §8.1's third failure mode exactly. The member is declared on
+`android/content/Context`; the registry had no superclass chain. `Registry::method`/`field` now
+walk one, with a two-edge `EXTENDS` table; `declared_method`/`declared_field` keep the non-walking
+semantics that `RegisterNatives` and the generated-surface merge need.
+
+> **The premise that investigation started from was wrong, and the lesson generalises.**
+> `Jni::misses` was empty, which read as "the member *is* declared, so the *answer* is missing".
+> It was empty because `report()` runs the instant step 13 returns — **before `android_main` has
+> run at all**. Measured after `join_guest_threads`, misses = 1 and it named the member. A census
+> taken before the work happens is not evidence that the work succeeded.
+
+**Four review findings closed:** M1 (validate the guest buffer before the descriptor is touched) in
+`files.rs` *and* its second instance in the `FILE *` layer; the stale-`errno` finding across twelve
+reporting sites; and **W1** — `__android_log_print` now truncates where a device truncates instead
+of aborting the run.
+
+**One defect found by review, not by a test:** eight `expect`s in `ndk/looper.rs` and
+`ndk/window.rs` were justified by a liveness check made under a lock that had **already been
+released**. `VERIFICATION.md` entry 13. It was found by reviewing the *copy* (`window.rs`) rather
+than the original — a second instance is the first time reasoning gets read instead of remembered.
+
+## Verification state
+
+**1,388 passing, 0 failing, 17 ignored** across 113 targets (`cargo test --workspace --release`).
+Was 1,232 at the start of the last session.
+
+**`tools/mutate.py` holds 446 rows.** Gate 1 (every `old` matches its file exactly once) is clean
+across all 446, checked with the harness's own `read_exactly`/`as_written`.
+
+53 rows were added last session and run by prefix. **Both pre-flight gates passed for every
+prefix**, and every row was caught:
+
+| prefix | rows | what it defends | status |
+|---|---|---|---|
+| `window-` | 8 | `ANativeWindow` | 8/8 caught, clean run |
+| `order-` | 6 | M1's order in `files.rs` | 6/6 caught, clean run |
+| `errno-` | 7 | the reason a stream failure gives | 7/7 caught, clean run |
+| `lock-` | 2 | the `pollOnce` callback arm | 2/2 caught, clean run |
+| `trunc-` | 13 | W1's truncation | 13/13 caught, clean run |
+| `sorder-` | 10 | M1's order in the `FILE *` layer | 10/10 caught — **but see below** |
+| `jmid-` | 7 | the superclass chain | 7/7 caught — **but see below** |
+
+> **`sorder-` and `jmid-` must be re-run before they count.** Four `sorder-B` rows were caught with
+> the harness unable to name a failing test, three of them in 0 s. And the `jmid-` run overlapped a
+> concurrent `cargo` invocation and a hand-applied mutation — my error, recorded in rule 4. Nothing
+> was lost and the tree is verified identical to `HEAD`, but results produced under that overlap
+> are worth exactly that much. **Re-run `--only sorder` and `--only jmid` on an exclusive tree.**
+>
+> **The whole 446-row table has never been run in one pass.** That is the largest outstanding
+> verification debt.
+
+**Two process incidents, both recorded, both mine:**
+
+* A **live mutation was committed** in `1df08fb` — the second time in this project. The path was
+  explicit and the numstat was checked; neither helped, because the *contents* were wrong while the
+  count was right. Restored in `d17c0a5`. Rule 2 now says: read the staged **diff**, and when the
+  diff disagrees with the prose you just wrote, the diff is the tree.
+* A background shell was reaped for memory pressure and **the harness kept running as an orphaned
+  child**. One clean `git status` immediately afterwards was believed and was wrong — it was clean
+  because the run was *between rows*. Rule 4 now says to confirm the *process* is gone, or wait for
+  the log's own final tally.
+
+## Still open, carried forward
+
+* **`nativeSetPlatformHeadersWithIdfa` hands `strchr` a pointer mapped nowhere.** 20 of 21 scripted
+  downcalls return; this is the one that does not. **Whose pointer it is has never been
+  established.** §8 step 9.
+* **W1b** — `%.Ne/E/g/G/a/A` with a precision above 64 KiB still refuses by name. `format_exp`
+  carries the mantissa through `10u64.pow(precision.min(15))`, so past fifteen places this engine's
+  digits are *already* not `vsnprintf`'s; under a budget those wrong digits would become visible.
+  Closing it means making the float engine exact past fifteen digits.
+* **S1 and T3** — a `%s` argument or a log tag longer than `STRING_LIMIT` refuses where a device
+  copies what fits. Needs a *bounded* `cstr` in `crates/omni-android/src/mem.rs`.
+* **`trunc-A1` is proposed but deliberately not in the table**: it reverts the budget at the
+  `__android_log_print` call site and its only possible detector lives in `tests/bionic.rs`. A row
+  whose command cannot catch it reports a MISS that reads as a missing test.
+* **`android/app/Application.getResources` is `Answer::Unanswered`** while `android/content/Context`
+  answers it properly. Nothing on the measured path reaches it; if anything ever does, it refuses.
+* **bionic's own `strftime` behaviour is unverified** — no NDK and no bionic source on this machine.
+  If bionic accepts `%k`/`%l`/`%s`, this refuses six calls bionic answers.
+* **`AT_HWCAP` is still undecided** (D26). `sched_yield` was called **22,387,975 times** in one run
+  — the decline path's fallback spinning. Revisit under real thread load.
+* **L1-L7, N1-N3** minor review findings remain.
+
+## Do not re-litigate without new evidence
+
+* **D7** — no JVM, no ART, no dex interpreter. The Java side is *defined*, not executed. Five
+  milestones have been reached on that bet.
+* **D19** — `omni-bionic` has zero dependencies and no OS access. Its `GuestMemory` has only `read`
+  and `write`; it therefore *cannot* validate a mapping, which is why buffer admission lives in the
+  adapter. A defaulted trait probe returning `Ok(())` is a plausible stub for every implementer.
+* **D27** — the APK is **ETC1 only**. Zero ETC2-only blocks, zero ASTC/EAC/PVRTC bytes anywhere.
+* **Only Windows x86-64 is developed and tested.** `omni-platform` is the only crate that may
+  contain `cfg(target_os)` or an OS crate. Never claim a non-Windows target works.
