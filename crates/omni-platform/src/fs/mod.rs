@@ -62,10 +62,12 @@
 //!   which was MEASURED here and is written up in the Windows backend.
 
 mod error;
+pub mod eventfd;
 pub mod path;
 pub mod pipe;
 
 pub use error::{FsError, FsErrorKind, FsResult};
+pub use eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
 pub use path::{FinalLink, Resolved, NAME_MAX, PATH_MAX};
 pub use pipe::{PipeEnd, Readiness, ReadyGate, PIPE_BUF, PIPE_CAPACITY};
 
@@ -325,6 +327,12 @@ enum Entry {
     /// See [`pipe`]. It is in this table rather than in a namespace of its own because `poll` and
     /// `select` observe one descriptor space, and two allocators can hand out the same number.
     Pipe(pipe::PipeHandle),
+    /// An `eventfd`: a counter whose readiness is its own value.
+    ///
+    /// See [`eventfd`]. Here for [`Pipe`](Entry::Pipe)'s reason — `poll` observes one descriptor
+    /// space — and, unlike a pipe, it is **one** descriptor rather than two, so the read side and
+    /// the write side of the same counter are the same number.
+    EventFd(eventfd::EventFd),
 }
 
 impl Entry {
@@ -343,6 +351,7 @@ impl Entry {
                 Readiness::ALWAYS
             }
             Entry::Pipe(handle) => handle.readiness(),
+            Entry::EventFd(counter) => counter.readiness(),
         }
     }
 }
@@ -707,6 +716,70 @@ impl Filesystem {
         Ok((read_fd, write_fd))
     }
 
+    /// `eventfd(2)`: a counter with a descriptor.
+    ///
+    /// `initval` is what the counter starts at and `flags` is the `EFD_*` set. **A flag outside
+    /// [`eventfd::KNOWN_FLAGS`] is refused rather than ignored**, which is the kernel's own answer
+    /// and this seam's rule everywhere else: accepting a flag it cannot honour would tell the
+    /// guest it got a behaviour it did not.
+    ///
+    /// `EFD_CLOEXEC` is accepted and inert — there is no `exec` in this runtime, so there is
+    /// nothing for close-on-exec to do, and refusing it would refuse the flag almost every real
+    /// caller sets.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::TooManyOpenFiles`] past [`MAX_OPEN_FILES`], and
+    /// [`FsErrorKind::InvalidInput`] for an unknown flag.
+    pub fn eventfd(&self, initval: u64, flags: i32) -> FsResult<i32> {
+        const OP: &str = "eventfd";
+        let unknown = flags & !eventfd::KNOWN_FLAGS;
+        if unknown != 0 {
+            return Err(FsError::kinded(
+                OP,
+                "an eventfd",
+                FsErrorKind::InvalidInput,
+                format!(
+                    "flags {flags:#o} contain {unknown:#o}, which `eventfd2` does not define. \
+                     Ignoring it would be this seam accepting a request it cannot honour"
+                ),
+            ));
+        }
+        let mut table = self.table();
+        if table.open.len() + 1 > MAX_OPEN_FILES {
+            return Err(FsError::kinded(
+                OP,
+                "an eventfd",
+                FsErrorKind::TooManyOpenFiles,
+                format!(
+                    "this guest instance holds {} of {MAX_OPEN_FILES} descriptors",
+                    table.open.len()
+                ),
+            ));
+        }
+        let counter = eventfd::EventFd::new(
+            initval,
+            flags & eventfd::EFD_SEMAPHORE != 0,
+            flags & eventfd::EFD_NONBLOCK != 0,
+            Arc::clone(&self.gate),
+        );
+        let fd = table.lowest_free_fd();
+        table.open.insert(fd, Entry::EventFd(counter));
+        Ok(fd)
+    }
+
+    /// The counter behind `fd`, or `None` when `fd` is not an eventfd.
+    ///
+    /// Diagnostic: the guest reads the counter with `read`, which is destructive, so a host that
+    /// wants to observe one cannot do it that way.
+    #[must_use]
+    pub fn eventfd_value(&self, fd: i32) -> Option<u64> {
+        match self.table().open.get(&fd) {
+            Some(Entry::EventFd(counter)) => Some(counter.value()),
+            _ => None,
+        }
+    }
+
     /// What `fd` would do right now, as `poll` and `select` ask it.
     ///
     /// # Errors
@@ -766,6 +839,7 @@ impl Filesystem {
         match self.table().open.get(&fd) {
             None => Err(bad_fd("is_nonblocking", fd)),
             Some(Entry::Pipe(handle)) => Ok(handle.nonblocking()),
+            Some(Entry::EventFd(counter)) => Ok(counter.nonblocking()),
             Some(_) => Ok(false),
         }
     }
@@ -785,6 +859,10 @@ impl Filesystem {
             None => Err(bad_fd(OP, fd)),
             Some(Entry::Pipe(handle)) => {
                 handle.set_nonblocking(nonblocking);
+                Ok(())
+            }
+            Some(Entry::EventFd(counter)) => {
+                counter.set_nonblocking(nonblocking);
                 Ok(())
             }
             // A file, a directory, a device and a standard stream all answer `Readiness::ALWAYS`,
@@ -888,6 +966,8 @@ impl Filesystem {
             // readiness holds only the gate. See `pipe`'s module documentation for why the wait
             // belongs to the caller and not to this seam.
             Some(Entry::Pipe(handle)) => handle.read(buf),
+            // As the pipe above: the table lock is held, and nothing in `eventfd` waits.
+            Some(Entry::EventFd(counter)) => counter.read(buf),
             Some(Entry::File { file, readable, guest, .. }) => {
                 if !*readable {
                     return Err(FsError::kinded(
@@ -933,6 +1013,15 @@ impl Filesystem {
             )),
             // `ESPIPE` for real this time, and for the reason the arm above borrows: a pipe is a
             // queue and there is no position in it to read from.
+            // An eventfd is a counter, not a stream: there is no position in it either, and its
+            // read is destructive, so a `pread` that "did not move the offset" would still consume
+            // the counter. `ESPIPE` is what Linux answers.
+            Some(Entry::EventFd(_)) => Err(FsError::kinded(
+                OP,
+                format!("fd {fd}"),
+                FsErrorKind::InvalidInput,
+                "an eventfd is a counter with no offset to read at (ESPIPE), and its read                  consumes what it returns",
+            )),
             Some(Entry::Pipe(_)) => Err(FsError::kinded(
                 OP,
                 format!("fd {fd}"),
@@ -1002,6 +1091,7 @@ impl Filesystem {
             )),
             // See the note in `read`: one lock order, and nothing in `pipe` waits.
             Some(Entry::Pipe(handle)) => handle.write(buf),
+            Some(Entry::EventFd(counter)) => counter.write(buf),
             Some(Entry::File { file, writable, guest, .. }) => {
                 if !*writable {
                     return Err(FsError::kinded(
@@ -1131,6 +1221,19 @@ impl Filesystem {
             // `st_size` for a pipe — not zero, and not the capacity. The identity distinguishes
             // the two ends, because they are two descriptions of one object and a guest that
             // compared them is entitled to see that they differ.
+            // **`st_size` is zero and the counter is not reported.** An eventfd has no size on
+            // Linux, and putting the counter here would make `fstat` a second, non-destructive
+            // way to read it -- which is a behaviour a device does not have and which a guest
+            // that found it would be entitled to rely on.
+            Some(Entry::EventFd(_)) => Ok(FileStat {
+                kind: FileKind::Other,
+                size: 0,
+                read_only: false,
+                accessed: None,
+                modified: None,
+                created: None,
+                identity: identity(Path::new("/proc/self/fd/anon_inode:[eventfd]")),
+            }),
             Some(Entry::Pipe(handle)) => Ok(FileStat {
                 kind: FileKind::Other,
                 size: handle.pipe().buffered() as u64,

@@ -6819,12 +6819,139 @@ fn a_failed_select_does_not_modify_the_guests_sets() {
     );
 }
 
-/// **The four network refusals name themselves, their argument, and the missing piece.**
+// =========================================== M6: eventfd, which jni-surface.md row 21 reaches
+
+/// **`eventfd` returns a descriptor, and the counter behaves as the kernel's does.**
+///
+/// One program does the whole round trip, so every step's answer is read out of guest memory
+/// rather than inferred: create, write 3, write 4, read, read again. The **second read** is the
+/// one that matters -- an eventfd read is destructive, so a counter that was not zeroed would
+/// answer 7 again and a test that stopped after the first read could not tell the difference.
+#[test]
+fn an_eventfd_counts_and_its_read_is_destructive() {
+    let _guard = serialized();
+    let (f, _root) = rooted("eventfd-round-trip");
+    let buf = f.guest.data + 0x300;
+
+    let create = f.thunk("eventfd");
+    let write = f.thunk("write");
+    let read = f.thunk("read");
+
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(22, f.guest.data as u64);
+    asm.mov(23, buf as u64);
+    // eventfd(0, EFD_NONBLOCK)
+    asm.mov(0, 0);
+    asm.mov(1, 0o4000);
+    asm.bl(create);
+    asm.push(str_imm(0, 22, 0));
+    asm.push(mov_reg(19, 0));
+    // write 3, then 4
+    for value in [3u64, 4] {
+        asm.mov(0, value);
+        asm.push(str_imm(0, 23, 0));
+        asm.push(mov_reg(0, 19));
+        asm.push(mov_reg(1, 23));
+        asm.mov(2, 8);
+        asm.bl(write);
+        asm.push(str_imm(0, 22, 8));
+    }
+    // read: one delivery of the accumulated counter
+    asm.push(mov_reg(0, 19));
+    asm.push(mov_reg(1, 23));
+    asm.mov(2, 8);
+    asm.bl(read);
+    asm.push(str_imm(0, 22, 16));
+    asm.push(ldr_imm(0, 23, 0));
+    asm.push(str_imm(0, 22, 24));
+    // read again: consumed, so EAGAIN under EFD_NONBLOCK
+    asm.push(mov_reg(0, 19));
+    asm.push(mov_reg(1, 23));
+    asm.mov(2, 8);
+    asm.bl(read);
+    asm.push(str_imm(0, 22, 32));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+
+    let mut cpu = f.guest.thread(&f.boundary);
+    f.run(&mut cpu, entry).expect("the run must complete");
+
+    let fd = f.guest.read_u64(f.guest.data) as i32;
+    assert!(fd >= 3, "eventfd must return a real descriptor, got {fd}");
+    assert_eq!(f.guest.read_u64(f.guest.data + 8) as i64, 8, "a write is eight bytes");
+    assert_eq!(f.guest.read_u64(f.guest.data + 16) as i64, 8, "a read is eight bytes");
+    assert_eq!(
+        f.guest.read_u64(f.guest.data + 24),
+        7,
+        "the counter accumulates: 3 + 4, delivered as one read"
+    );
+    assert_eq!(
+        f.guest.read_u64(f.guest.data + 32) as i64,
+        -1,
+        "the read consumed the counter, so the next one has nothing and EFD_NONBLOCK says EAGAIN"
+    );
+}
+
+/// **An eventfd's readiness follows its counter**, which is what `poll` reports on it.
+///
+/// A table whose new kind fell into a "cannot block, therefore always ready" default would report
+/// the eventfd readable while its counter was zero -- the exact defect `Entry::readiness` being a
+/// `match` with no default arm exists to prevent, and the one this asserts against by polling
+/// *before* anything is written.
+#[test]
+fn an_eventfd_is_not_readable_until_it_has_been_written() {
+    let _guard = serialized();
+    let (f, _root) = rooted("eventfd-readiness");
+    let fs = f.bionic.filesystem().expect("a filesystem");
+    let fd = fs.eventfd(0, 0o4000).expect("an eventfd");
+
+    let empty = fs.readiness(fd).expect("the descriptor is open");
+    assert!(!empty.readable, "a zero counter is not readable");
+    assert!(empty.writable, "and it can always be added to");
+    assert_eq!(fs.eventfd_value(fd), Some(0));
+
+    assert_eq!(fs.write(fd, &1u64.to_ne_bytes()).expect("a write"), 8);
+    let written = fs.readiness(fd).expect("still open");
+    assert!(written.readable, "a non-zero counter is readable");
+    assert_eq!(fs.eventfd_value(fd), Some(1));
+
+    // And it is **one** descriptor, not a pair: `pipe_writers` answers only for a pipe, so this
+    // says the two kinds are distinct rather than one being served by the other's arm.
+    assert_eq!(fs.pipe_writers(fd), None, "an eventfd is not a pipe end");
+}
+
+/// **A flag `eventfd2` does not define is `EINVAL`, not an ignored bit.**
+///
+/// The kernel's answer, and this seam's rule everywhere else. Accepting it would tell the guest it
+/// got a behaviour this layer cannot produce, and the flag most likely to be smuggled in is one
+/// that changes blocking -- the single decision `omni-platform` refuses to fake.
+#[test]
+fn an_unknown_eventfd_flag_is_einval() {
+    let _guard = serialized();
+    let (f, _root) = rooted("eventfd-flags");
+    let returned = value_of(&f, "eventfd", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0x4000_0000);
+    });
+    assert_eq!(returned as i32, -1, "an undefined flag must not produce a descriptor");
+}
+
+
+/// **The three remaining network refusals name themselves, their argument, and the missing
+/// piece.**
 ///
 /// Not just that they fail: each message has to carry the thing a reader three thousand
 /// initializers deep needs, which is *what is missing* rather than *that something is*.
+///
+/// **There were four.** `eventfd` was the fourth until M6, and its own refusal said what
+/// would end it: an eventfd is a descriptor, and the table had no kind that could carry a
+/// counter with a destructive read. `omni-platform` has that kind now, so `eventfd` is
+/// answered and is tested above rather than here -- a refusal that has been closed belongs
+/// in neither list.
 #[test]
-fn the_four_network_refusals_name_the_missing_piece() {
+fn the_three_network_refusals_name_the_missing_piece() {
     let _guard = serialized();
     let f = fixture();
 
@@ -6837,13 +6964,6 @@ fn the_four_network_refusals_name_the_missing_piece() {
     let text = error.to_string();
     assert!(text.contains("AF_INET"), "the family, named: {text}");
     assert!(text.contains("EAFNOSUPPORT"), "the wrong answer it declines: {text}");
-
-    let error = refusal_of(&f, "eventfd", |asm| {
-        asm.mov(0, 0);
-        asm.mov(1, 0);
-    });
-    assert_eq!(error.symbol(), Some("eventfd"));
-    assert!(error.to_string().contains("descriptor"), "{error}");
 
     let error = refusal_of(&f, "getaddrinfo", |asm| {
         asm.mov(0, 0);

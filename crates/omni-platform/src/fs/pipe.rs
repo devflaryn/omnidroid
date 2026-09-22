@@ -148,7 +148,11 @@ impl ReadyGate {
     }
 
     /// Record that something changed, and wake everyone waiting.
-    fn bump(&self) {
+    ///
+    /// `pub(super)` rather than private: [`eventfd`](super::eventfd) shares this gate, for the
+    /// reason that module's documentation gives — `poll` observes one descriptor space, so a
+    /// caller waiting on a pipe and an eventfd at once must be woken by either.
+    pub(super) fn bump(&self) {
         {
             let mut generation =
                 self.generation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

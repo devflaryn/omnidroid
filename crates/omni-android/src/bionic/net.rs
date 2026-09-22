@@ -103,7 +103,7 @@ use crate::boundary::ImportCall;
 use crate::error::{AbiError, AbiResult};
 use crate::mem::Blame;
 
-use super::files::filesystem;
+use super::files::{filesystem, settle, Settled};
 use super::view::GuestView;
 use super::{active, enter, Active, MAX_SLEEP_SECONDS};
 
@@ -754,38 +754,49 @@ pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 /// `int eventfd(unsigned int initval, int flags)`
 ///
-/// Refused. An `eventfd` is a **descriptor**, and every descriptor in this runtime belongs to
-/// `omni-platform`'s rooted filesystem table — which is what `read`, `__write_chk`, `close`,
-/// `fstat` and this module's `poll` are all written against. An eventfd is a 64-bit counter whose
-/// `read` blocks until it is non-zero and whose `write` adds to it, and not one of those five
-/// could carry that.
+/// **Answered from M6, where it had been refused by name since M3.** The refusal's argument was
+/// that every descriptor in this runtime belongs to `omni-platform`'s table, which `read`,
+/// `__write_chk`, `close`, `fstat` and this module's `poll` are all written against, and that an
+/// eventfd -- a 64-bit counter with a destructive read -- was not a kind that table had. That was
+/// true and it is what changed: `omni_platform::fs::eventfd` is that kind, the table carries it,
+/// and all five of those calls have an arm for it because the table's `match` has no default.
 ///
-/// **A descriptor the guest can obtain but cannot use is worse than one it cannot obtain**: the
-/// failure moves from this call, where it names the thing that is missing, to whichever of
-/// `read`, `write`, `close` or `poll` the guest reaches next — which will report `EBADF` about a
-/// descriptor this layer handed out itself.
+/// # Why it is implemented now, which is a measurement rather than a plan
 ///
-/// `-1`/`ENOSYS` was rejected for the reason `socket`'s `-1` was: it says *this kernel* has no
-/// `eventfd`, which is a fact about a kernel rather than about this layer, and a guest that
-/// believes it has no eventfd falls back to a pipe — which is not bound either.
+/// `jni-surface.md` §8 row 21 reaches it. `nativeInitClientSettings` -- the call that loads the
+/// client settings the engine refuses to initialise its TaskScheduler without -- asks for
+/// `eventfd(0, 0o200_4000)`, which is `EFD_CLOEXEC | EFD_NONBLOCK`. The refusal was the next stop
+/// after the spin lock, and it is on the only path to a frame.
+///
+/// # What it answers, and what it deliberately does not
+///
+/// The counter, the flags and the `EINVAL` on an unknown flag are `omni-platform`'s; this layer
+/// converts and reports. The one decision here is the same one `pipe` makes: **`EFD_NONBLOCK` is
+/// honoured and a blocking eventfd still reports `EAGAIN` rather than waiting.** A zero-counter
+/// read on a blocking descriptor is the one case where this differs from a device, and it differs
+/// in the direction D16 requires -- a guest parked on a counter nobody increments consumes no
+/// step budget and cannot be ended. The guest's own caller here sets `EFD_NONBLOCK`, so the case
+/// is not on the measured path; when something reaches it, `EAGAIN` is a value every eventfd
+/// caller has an arm for, and the refusal it replaces was not.
 pub(super) fn eventfd(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (initval, flags) = {
         let mut a = c.args();
         (a.next_i32()? as u32, a.next_i32()?)
     };
-    Err(refuse(
-        c,
-        format!(
-            "the guest called eventfd({initval}, {flags:#x}), which must return a descriptor. \
-             Every descriptor in this runtime is one of `omni-platform`'s rooted filesystem \
-             table's, and `read`, `__write_chk`, `close`, `fstat` and `poll` are all written \
-             against that table; an eventfd is a counter with blocking reads and none of the \
-             five could carry one. A descriptor the guest can obtain and then cannot read, \
-             write, close or poll is worse than one it cannot obtain, because the failure moves \
-             to whichever call it reaches next and reports EBADF about a descriptor this layer \
-             issued"
-        ),
-    ))
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.eventfd(u64::from(initval), flags))? {
+            Settled::Done(fd) => fd,
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
 }
 
 /// `int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)`
