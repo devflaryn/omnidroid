@@ -452,7 +452,8 @@ mod tests {
         assert_eq!(STYPE_PRESENT_INFO_KHR, 1_000_001_001);
         // `VK_KHR_swapchain` is extension 2, so its structure types start at 1000001000 and
         // `VkPresentInfoKHR` is the second of them.
-        assert_eq!(STYPE_PRESENT_INFO_KHR, 1_000_000_000 + (2 - 1) * 1000 + 1);
+        let swapchain_extension: u32 = 2;
+        assert_eq!(STYPE_PRESENT_INFO_KHR, 1_000_000_000 + (swapchain_extension - 1) * 1000 + 1);
 
         // `VkSubmitInfo`: three counts, each followed by four bytes of padding because each is
         // followed by a pointer. 16+4+4 = 24, 40+4+4 = 48, 56+4+4 = 64, then one pointer to 72.

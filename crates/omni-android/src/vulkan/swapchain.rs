@@ -524,7 +524,8 @@ mod tests {
         assert_eq!(SWAPCHAIN_CREATE_INFO_BYTES, 104);
         assert_eq!(STYPE_SWAPCHAIN_CREATE_INFO_KHR, 1_000_001_000);
         // Extension 2's structure-type base, which is where that number comes from.
-        assert_eq!(STYPE_SWAPCHAIN_CREATE_INFO_KHR, 1_000_000_000 + (2 - 1) * 1000);
+        let swapchain_extension: u32 = 2;
+        assert_eq!(STYPE_SWAPCHAIN_CREATE_INFO_KHR, 1_000_000_000 + (swapchain_extension - 1) * 1000);
         // `flags` is at 16 and is four bytes; `surface` is a `uint64_t` and is 8-aligned, so there
         // are four bytes of padding and it lands at 24 rather than 20. A layout that packed it at
         // 20 would read the two halves of the surface handle as `minImageCount` and `imageFormat`.
@@ -544,10 +545,15 @@ mod tests {
     /// in which the window was never resized would never notice.
     #[test]
     fn the_two_resize_codes_have_the_signs_the_specification_gives_them() {
-        assert!(VK_SUBOPTIMAL_KHR > 0, "a success code");
-        assert!(VK_TIMEOUT > 0, "a success code");
-        assert!(VK_NOT_READY > 0, "a success code");
-        assert!(VK_ERROR_OUT_OF_DATE_KHR < 0, "a failure code");
+        // **The sign, as `signum` rather than as `> 0`.** A comparison between two constants is
+        // one the compiler folds away and clippy's `assertions_on_constants` names it; what this
+        // states instead is the number the specification's own rule turns on -- a success code is
+        // non-negative and a failure code is negative, and these four are the whole of the resize
+        // story's arithmetic.
+        assert_eq!(VK_SUBOPTIMAL_KHR.signum(), 1, "a success code");
+        assert_eq!(VK_TIMEOUT.signum(), 1, "a success code");
+        assert_eq!(VK_NOT_READY.signum(), 1, "a success code");
+        assert_eq!(VK_ERROR_OUT_OF_DATE_KHR.signum(), -1, "a failure code");
         assert_eq!(VK_SUBOPTIMAL_KHR, 1_000_001_003);
         assert_eq!(VK_ERROR_OUT_OF_DATE_KHR, -1_000_001_004);
         assert_eq!(VK_TIMEOUT, 2);

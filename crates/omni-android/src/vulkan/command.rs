@@ -873,9 +873,12 @@ mod tests {
     #[test]
     fn the_command_bounds_are_above_what_any_renderer_asks_for() {
         assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL, 32);
+        // **Exactly half the registry**, stated as the arithmetic rather than as a comparison:
+        // a `<` between two constants is a comparison the compiler folds away, which clippy's
+        // `assertions_on_constants` names and is right about. What this states instead is the
+        // relation -- one call cannot fill the registry on its own.
+        assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL * 2, super::super::MAX_COMMAND_BUFFERS);
         assert_eq!(super::super::MAX_COMMAND_BUFFERS, 64);
-        assert!(MAX_COMMAND_BUFFERS_PER_CALL < super::super::MAX_COMMAND_BUFFERS,
-            "one call must not be able to fill the registry on its own");
         assert_eq!(MAX_BARRIERS, 32);
         assert_eq!(MAX_CLEAR_RANGES, 8);
         // The largest read each bound permits, in bytes -- all well under a page.

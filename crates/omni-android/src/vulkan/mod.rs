@@ -2697,12 +2697,12 @@ mod tests {
             3072
         );
         assert_eq!(REGISTRY_BYTES, 3648);
-        assert!(
-            REGISTRY_BYTES < DATA_AREA,
-            "the Vulkan registries need {REGISTRY_BYTES} bytes of a {DATA_AREA}-byte data area, \
-             and the `ndk` and `jni` data symbols come out of the same area. Raising a bound \
-             means raising the data area every embedding passes to `BoundaryBuilder::new`"
-        );
+        // **The margin, as a subtraction rather than as `<`.** A comparison between two constants
+        // is one the compiler folds away — clippy's `assertions_on_constants` names it — and the
+        // number a reader actually wants is how much room is left, not that there is some. The
+        // `ndk` and `jni` data symbols come out of the same 4096, so this is the whole budget for
+        // everything else; raising a Vulkan bound past it means raising the data area every
+        // embedding passes to `BoundaryBuilder::new`, which is a change to those embeddings.
         assert_eq!(DATA_AREA - REGISTRY_BYTES, 448, "what is left for everything else");
     }
 }

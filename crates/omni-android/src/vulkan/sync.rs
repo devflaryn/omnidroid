@@ -101,16 +101,20 @@ pub(super) fn create_semaphore(
     let flags = decode_flags_only(
         c,
         at,
-        CALL,
-        "VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO",
-        STYPE_SEMAPHORE_CREATE_INFO,
-        "a semaphore `pNext` chain is where `VkSemaphoreTypeCreateInfo` goes, and that is what \
-         turns a binary semaphore into a **timeline** semaphore -- an object with completely \
-         different wait semantics that `vkQueueSubmit` addresses through a different structure. \
-         Dropping the chain would create a binary semaphore where the engine asked for a \
-         timeline one, and every later wait on it would be a wait on the wrong kind of object",
-        create_info_at,
-        SEMAPHORE_CREATE_INFO_BYTES,
+        &FlagsOnly {
+            call: CALL,
+            stype_name: "VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO",
+            expected_stype: STYPE_SEMAPHORE_CREATE_INFO,
+            why_the_chain_matters:
+                "a semaphore `pNext` chain is where `VkSemaphoreTypeCreateInfo` goes, and that \
+                 is what turns a binary semaphore into a **timeline** semaphore -- an object \
+                 with completely different wait semantics that `vkQueueSubmit` addresses \
+                 through a different structure. Dropping the chain would create a binary \
+                 semaphore where the engine asked for a timeline one, and every later wait on \
+                 it would be a wait on the wrong kind of object",
+            create_info_at,
+            bytes: SEMAPHORE_CREATE_INFO_BYTES,
+        },
     )?;
 
     match host.create_semaphore(device, flags)? {
@@ -176,15 +180,18 @@ pub(super) fn create_fence(
     let flags = decode_flags_only(
         c,
         at,
-        CALL,
-        "VK_STRUCTURE_TYPE_FENCE_CREATE_INFO",
-        STYPE_FENCE_CREATE_INFO,
-        "a fence `pNext` chain is where `VkExportFenceCreateInfo` goes, which makes the fence's \
-         payload shareable with another process or API. Dropping it would create an ordinary \
-         fence where the engine asked for an exportable one, and the failure would arrive at the \
-         `vkGetFenceFdKHR` that came next",
-        create_info_at,
-        FENCE_CREATE_INFO_BYTES,
+        &FlagsOnly {
+            call: CALL,
+            stype_name: "VK_STRUCTURE_TYPE_FENCE_CREATE_INFO",
+            expected_stype: STYPE_FENCE_CREATE_INFO,
+            why_the_chain_matters:
+                "a fence `pNext` chain is where `VkExportFenceCreateInfo` goes, which makes the \
+                 fence's payload shareable with another process or API. Dropping it would \
+                 create an ordinary fence where the engine asked for an exportable one, and the \
+                 failure would arrive at the `vkGetFenceFdKHR` that came next",
+            create_info_at,
+            bytes: FENCE_CREATE_INFO_BYTES,
+        },
     )?;
 
     match host.create_fence(device, flags)? {
@@ -246,6 +253,23 @@ pub(super) fn wait_for_fences(
     let host = vulkan.require_host(at)?;
     let device = vulkan.device_token(at, CALL, args[0])?;
     let fences = decode_fences(c, at, vulkan, CALL, args[1] as u32, args[2])?;
+    if fences.is_empty() {
+        // **Refused here rather than forwarded**, and it is the one place in this module where
+        // this layer has an opinion the driver would also have had. `fenceCount` must be greater
+        // than zero, a wait on no fences returns `VK_SUCCESS` immediately, and what that tells a
+        // frame loop is that work it never submitted has finished -- after which it re-records a
+        // command buffer the GPU may be reading. The driver would refuse too, and on this machine
+        // nothing would report it: there are no validation layers
+        // (`docs/research/graphics-spike.md` §6), so the driver's own `VK_SUCCESS` for a
+        // zero-length wait would be indistinguishable from a wait that happened.
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} with no fences -- `fenceCount` was zero. \
+             The specification requires it to be greater than zero, and `VK_SUCCESS` for a wait \
+             on nothing is the plausible answer Global Constraint 1 exists for: it says work has \
+             finished that was never submitted",
+            caller = at.caller
+        )));
+    }
     let wait_all = (args[3] as u32) != 0;
     let timeout = args[4];
 
@@ -328,6 +352,28 @@ fn decode_fences(
     Ok(out)
 }
 
+/// One of the two create-infos whose only member is a `flags`, as the facts it takes to read it.
+///
+/// **A struct rather than six parameters**, for [`counted::Array`](super::counted::Array)'s
+/// reason and not only because clippy counts: `call`, `stype_name` and `why_the_chain_matters`
+/// are all `&str`, and a positional call that transposed any two of them would compile — and
+/// would then print a refusal naming the wrong structure, which is the worst possible outcome for
+/// a message whose whole job is to say which structure was wrong.
+struct FlagsOnly<'a> {
+    /// The Vulkan function, for every refusal this produces.
+    call: &'a str,
+    /// The `VkStructureType` constant's own name, for the refusal that says the `sType` is wrong.
+    stype_name: &'a str,
+    /// Its value.
+    expected_stype: u32,
+    /// What a dropped `pNext` chain would cost, for the refusal that names one.
+    why_the_chain_matters: &'a str,
+    /// The guest's `pCreateInfo`, already checked non-NULL.
+    create_info_at: omni_mem::GuestAddr,
+    /// `sizeof` that structure.
+    bytes: usize,
+}
+
 /// Decode one of the two create-infos whose only member is a `flags`.
 ///
 /// **Written once because the two structures are byte-for-byte identical.** `VkFenceCreateInfo`
@@ -337,14 +383,10 @@ fn decode_fences(
 fn decode_flags_only(
     c: &mut ImportCall<'_, '_>,
     at: &Site,
-    call: &str,
-    stype_name: &str,
-    expected_stype: u32,
-    why_the_chain_matters: &str,
-    create_info_at: omni_mem::GuestAddr,
-    bytes: usize,
+    what: &FlagsOnly<'_>,
 ) -> AbiResult<u32> {
-    let info = c.mem().read_bytes(create_info_at, bytes, c.blame(1))?;
+    let FlagsOnly { call, stype_name, expected_stype, why_the_chain_matters, .. } = *what;
+    let info = c.mem().read_bytes(what.create_info_at, what.bytes, c.blame(1))?;
     let stype = u32::from_le_bytes(info[0..4].try_into().expect("four"));
     if stype != expected_stype {
         return Err(at.refuse(format!(
@@ -392,7 +434,9 @@ mod tests {
     fn no_conforming_guest_can_reach_the_per_call_fence_bound() {
         assert_eq!(MAX_FENCES_PER_CALL, 32);
         assert_eq!(super::super::MAX_FENCES, 16);
-        assert!(MAX_FENCES_PER_CALL > super::super::MAX_FENCES);
+        // Twice the registry's bound, stated as the arithmetic: a `>` between two constants is
+        // folded away, and the relation is the thing worth saying.
+        assert_eq!(MAX_FENCES_PER_CALL, super::super::MAX_FENCES * 2);
         // The largest read the bound permits is a quarter of a page.
         assert_eq!(MAX_FENCES_PER_CALL * 8, 256);
     }
