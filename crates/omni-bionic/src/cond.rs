@@ -79,6 +79,8 @@ impl WaiterEntry {
 #[derive(Default)]
 pub struct CondWaiters {
     queues: HostMutex<HashMap<u64, Vec<WaiterEntry>>>,
+    /// Set once the instance is shutting down. See [`CondWaiters::stop`].
+    stopping: core::sync::atomic::AtomicBool,
 }
 
 impl CondWaiters {
@@ -140,6 +142,81 @@ impl CondWaiters {
             }
             woken
         };
+        for entry in to_notify {
+            let _guard = entry.mutex.lock().unwrap();
+            entry.condvar.notify_all();
+        }
+        woken
+    }
+
+    /// Shut the registry down: **every current waiter is woken, and every later one returns at
+    /// once.**
+    ///
+    /// # One wake is not enough, and that is the whole reason this is a flag
+    ///
+    /// [`wake_all`](CondWaiters::wake_all) alone was tried and does not work. A correct
+    /// `pthread_cond_wait` caller is a **predicate loop**: it wakes, re-checks its condition,
+    /// finds it still false and waits again. So a one-shot wake releases the thread for as long
+    /// as it takes to re-read one word. MEASURED: with `wake_all` on the stop path and no flag,
+    /// `join_guest_threads` still timed out after 60 seconds with the same thread in the same
+    /// wait.
+    ///
+    /// The flag makes every subsequent wait return immediately, which gives the thread a run
+    /// window in which to read [`Bionic::stop_guest_threads`](crate)'s own switch and stop. It is
+    /// the shape `AddressFutex::stop` already has, for the same reason, one primitive along.
+    ///
+    /// Idempotent and **cannot be taken back**: a registry that has been stopped belongs to an
+    /// instance that is shutting down.
+    pub fn stop(&self) {
+        self.stopping.store(true, core::sync::atomic::Ordering::Release);
+        self.wake_all();
+    }
+
+    /// Whether [`stop`](CondWaiters::stop) has been called.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.stopping.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wake **every** registered waiter, on every condition variable, and report how many.
+    ///
+    /// # Why shutdown needs this and `wake` cannot serve it
+    ///
+    /// [`wake`](CondWaiters::wake) is keyed by address, and a shutdown has no address list: the
+    /// registry is a `HashMap` and the caller does not know which conds a guest has waited on.
+    /// So a thread in `pthread_cond_wait` is, without this, **unreachable by anything except a
+    /// signal the guest itself must send** -- and a guest that is being torn down is precisely
+    /// the guest that will never send it.
+    ///
+    /// That is not hypothetical. `Bionic::stop_guest_threads` already learned this lesson once
+    /// for the futex (`AddressFutex::stop`, added when implementing the raw `futex` syscall
+    /// turned the engine's workers from dying into parking), and the cond registry is the other
+    /// half of the same gap: **MEASURED in M6**, once the engine got past its client-settings
+    /// phase it left a worker in `pthread_cond_wait`, `join_guest_threads` timed out after 60
+    /// seconds, and the gate could not tear the address space down.
+    ///
+    /// A woken waiter is **marked**, exactly as a real signal marks it, so it returns `0` from
+    /// `wait_end` rather than `ETIMEDOUT`. That is correct on both counts: POSIX permits a
+    /// spurious wakeup at any time and every caller re-checks its predicate, and reporting a
+    /// timeout that did not happen is the believable wrong answer this project refuses
+    /// everywhere else. The caller then reads the stop switch at its next run-window boundary
+    /// and stops, which is what the wake is for.
+    pub fn wake_all(&self) -> usize {
+        let mut to_notify: Vec<WaiterEntry> = Vec::new();
+        {
+            let mut queues = self.queues.lock().unwrap();
+            for (_, waiters) in queues.iter_mut() {
+                for entry in waiters.drain(..) {
+                    {
+                        let mut flag = entry.mutex.lock().unwrap();
+                        *flag = true;
+                    }
+                    to_notify.push(entry);
+                }
+            }
+            queues.clear();
+        }
+        let woken = to_notify.len();
         for entry in to_notify {
             let _guard = entry.mutex.lock().unwrap();
             entry.condvar.notify_all();
@@ -355,6 +432,15 @@ pub fn wait_end(
         let mut guard = guard;
         loop {
             if *guard {
+                signalled = true;
+                break;
+            }
+            // **The shutdown switch, read before every sleep.** See `CondWaiters::stop`: a
+            // one-shot wake cannot release a predicate loop, because the loop waits again. This
+            // reports the wait as *signalled* rather than timed out, which is correct on both
+            // counts -- POSIX permits a spurious wakeup at any time and every caller re-checks
+            // its predicate, and an ETIMEDOUT would report a deadline that did not pass.
+            if waiters.stopped() {
                 signalled = true;
                 break;
             }
@@ -635,6 +721,67 @@ mod tests {
         mem.map(0x1000, &[0u8; 48]);
         mem.write(0x1004, &7u32.to_le_bytes()).unwrap();
         assert_eq!(clock_of(&mut mem, 0x1000).unwrap(), Err(consts::EINVAL));
+    }
+
+    /// **`stop` releases a predicate loop, which is the case a single wake cannot.**
+    ///
+    /// The waiter here does what a correct `pthread_cond_wait` caller does: waits, re-checks a
+    /// predicate that is never satisfied, and waits again. `wake_all` alone lets it go round the
+    /// loop once and park again -- MEASURED on the real engine, where `join_guest_threads` still
+    /// timed out after 60 seconds with `wake_all` on the stop path and no flag.
+    ///
+    /// The assertion is that the loop **ends**, under a deadline the test itself enforces, and
+    /// that it ends **signalled** rather than timed out: reporting ETIMEDOUT would be reporting a
+    /// deadline that never passed, and this wait was given none.
+    #[test]
+    fn stop_releases_a_waiter_that_re_waits_on_an_unsatisfied_predicate() {
+        let (mem, futex, owners, threads, waiters, _clock) = fixture();
+        let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = {
+            let (mem, futex, owners, threads, waiters, rounds) = (
+                mem.clone(),
+                futex.clone(),
+                owners.clone(),
+                threads.clone(),
+                waiters.clone(),
+                rounds.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut m = mem.clone();
+                with_owners(owners.clone(), || with_registry(&*threads, || {
+                    assert_eq!(
+                        crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(),
+                        0
+                    );
+                    // The predicate at 0x3000 is never written, so this loop only ever ends
+                    // because the registry was stopped.
+                    loop {
+                        wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                        let r =
+                            wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, None)
+                                .unwrap();
+                        assert_eq!(r, 0, "a stopped wait is signalled, not timed out");
+                        rounds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut b = [0u8; 4];
+                        m.read(0x3000, &mut b).unwrap();
+                        if u32::from_le_bytes(b) == 1 || waiters.stopped() {
+                            break;
+                        }
+                    }
+                }));
+            })
+        };
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!w.is_finished(), "the waiter must still be in its loop before the stop");
+        waiters.stop();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !w.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(w.is_finished(), "`stop` must release a waiter that re-waits");
+        w.join().unwrap();
+        assert!(waiters.stopped());
     }
 
     /// timedwait returns ETIMEDOUT with the mutex RELOCKED: proved by the

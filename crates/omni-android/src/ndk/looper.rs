@@ -789,14 +789,29 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
     let returned = match pass {
         Pass::Idle => {
-            let mut state = ndk.state.lock();
-            let thread = Ndk::thread_index(&mut state);
-            state.record(
-                looper,
-                thread,
-                "pollOnce",
-                format!("{timeout_millis} ms: nothing ready, POLL_TIMEOUT"),
-            );
+            // **A zero-timeout poll that found nothing is not recorded.**
+            //
+            // It is the game loop's idle tick and it carries no information: `GameLoop` calls
+            // `pollOnce(0)` once per frame and again whenever it has nothing to do, so recording
+            // it means a `format!`, a `String` allocation and the state lock on the hottest path
+            // in the runtime. MEASURED once the engine reached its loop: **242,333,924 calls in
+            // one run**, every one of them formatting a line into a ring that had already dropped
+            // it. The event log existed to explain a looper that was not progressing; a log that
+            // is itself what stops it progressing explains nothing.
+            //
+            // A poll that was *given* a timeout and expired is still recorded: that one says a
+            // wait happened and ended, which is the shape §8.1's fifth failure mode asks about.
+            // The census counts every call either way, so nothing is lost that was being counted.
+            if timeout_millis != 0 {
+                let mut state = ndk.state.lock();
+                let thread = Ndk::thread_index(&mut state);
+                state.record(
+                    looper,
+                    thread,
+                    "pollOnce",
+                    format!("{timeout_millis} ms: nothing ready, POLL_TIMEOUT"),
+                );
+            }
             ALOOPER_POLL_TIMEOUT
         }
         Pass::Ident { ident, fd, events, data } => {

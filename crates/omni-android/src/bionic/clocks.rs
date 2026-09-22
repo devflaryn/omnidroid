@@ -332,6 +332,55 @@ pub(super) fn strftime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let mut a = c.args();
         (a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
     };
+    format_time(c, s, max, format, tm)
+}
+
+/// `size_t strftime_l(char *s, size_t max, const char *format, const struct tm *tm, locale_t)`
+///
+/// **The locale argument selects nothing, on this runtime or on a device**, and that is a fact
+/// about bionic rather than a simplification. Android has one locale implementation: every name
+/// `newlocale` accepts maps to it, which is why `omni_bionic::locale::newlocale` answers the same
+/// handle for all of them and why `__ctype_get_mb_cur_max` is 4 with no locale that changes it.
+/// bionic's own `strftime_l` is a one-line forward to `strftime` for exactly this reason, and so
+/// is this.
+///
+/// It is **read** rather than ignored, so that a caller passing a handle this layer never issued
+/// is a refusal naming the value instead of a timestamp formatted by luck. That is the whole of
+/// the difference between forwarding and dropping an argument.
+///
+/// Reached in M6: `nativePostClientSettingsLoadedInitialization3` calls it at guest `0x06258e44`,
+/// which is one call past the point where the client settings have been parsed and the engine
+/// starts reporting its own build. `jni-surface.md` records `strftime_l` in the file's LAST
+/// section as "there too and not reached" — it is reached now, one §8 row later than the note.
+pub(super) fn strftime_l(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (s, max, format, tm, locale) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    {
+        let view = enter(c, &state);
+        if locale != 0 && locale != omni_bionic::locale::C_LOCALE_HANDLE {
+            return Err(view.refusal(format!(
+                "`strftime_l` was given locale {locale:#x}, which is not a handle this layer                  issued. `newlocale` answers one handle here and bionic has one locale                  implementation, so a different value is a stale or fabricated `locale_t` rather                  than a locale whose formatting differs"
+            )));
+        }
+    }
+    format_time(c, s, max, format, tm)
+}
+
+/// The body `strftime` and `strftime_l` share, which is all of both of them.
+///
+/// One copy, for the reason the boundary keeps one marshaller: a second implementation is how the
+/// two would come to disagree about the zero return, the NUL, or which conversions refuse. The
+/// messages name `c.symbol()`, so each reports itself.
+fn format_time(
+    c: &mut ImportCall<'_, '_>,
+    s: u64,
+    max: u64,
+    format: u64,
+    tm: u64,
+) -> AbiResult<()> {
     let state = active(c.symbol(), c.address())?;
     let written = {
         let view = enter(c, &state);

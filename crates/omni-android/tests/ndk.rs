@@ -828,6 +828,51 @@ fn a_poll_once_with_a_timeout_waits_for_a_writer() {
 
 // =================================================================== the instrumentation
 
+/// **A zero-timeout poll that finds nothing is counted and not logged**, which is the one
+/// operation the event log deliberately omits.
+///
+/// `NativeEngine::GameLoop` calls `pollOnce(0)` once per frame and again whenever it has nothing
+/// to do. MEASURED once the engine reached its loop: **242,333,924 calls in one run**, each one
+/// taking the state lock and formatting a line into a ring that had already dropped it -- a log
+/// that had become the reason the thing it was watching could not progress.
+///
+/// Both halves are asserted, because either alone would pass for the wrong reason: the census
+/// **must** still count the call (otherwise this is a measurement lost, not an overhead removed),
+/// and the log **must not** grow (otherwise nothing was saved). A bounded poll that expires is
+/// covered by `the_event_log_names_every_operation_and_the_thread_that_made_it`, which asks for
+/// one millisecond rather than zero for exactly this reason.
+#[test]
+fn a_zero_timeout_poll_that_finds_nothing_is_counted_but_not_logged() {
+    let _guard = serialized();
+    let f = fixture("idle-poll");
+    let looper = f.prepare();
+    let (read_fd, _write_fd) = f.pipe();
+    assert_eq!(f.add_fd(looper, read_fd, 4, ALOOPER_EVENT_INPUT, 0, 0), 1);
+
+    let before = f.ndk.events().len();
+    for _ in 0..8 {
+        let returned = f.value_of("ALooper_pollOnce", |asm| {
+            asm.mov(0, 0);
+            asm.mov(1, 0);
+            asm.mov(2, 0);
+            asm.mov(3, 0);
+        });
+        assert_eq!(returned as i32, ALOOPER_POLL_TIMEOUT);
+    }
+
+    assert_eq!(
+        f.ndk.events().len(),
+        before,
+        "eight idle polls must add nothing to the event log"
+    );
+    assert_eq!(f.ndk.events_dropped(), 0, "and nothing was dropped to achieve that");
+    assert_eq!(
+        f.ndk.census().get("ALooper_pollOnce").copied(),
+        Some(8),
+        "the census still counts every call: the overhead was removed, not the measurement"
+    );
+}
+
 /// **Every looper operation is recorded, by thread, and the record is what §8.1's fifth failure
 /// mode asks for.**
 ///
@@ -841,8 +886,14 @@ fn the_event_log_names_every_operation_and_the_thread_that_made_it() {
     let (read_fd, _write_fd) = f.pipe();
     assert_eq!(f.add_fd(looper, read_fd, 4, ALOOPER_EVENT_INPUT, 0, 0), 1);
     let _ = f.value_of("ALooper_forThread", |_asm| {});
+    // **A one-millisecond timeout, not zero.** A zero-timeout poll that finds nothing is the game
+    // loop's idle tick and is deliberately not recorded -- MEASURED at 242,333,924 calls in one
+    // run once the engine reached `GameLoop`, each one formatting a line into a ring that had
+    // already dropped it. A poll that was *given* a timeout and expired is still recorded,
+    // because that one says a wait happened and ended, and it is the `pollOnce` this log exists
+    // to show.
     let _ = f.value_of("ALooper_pollOnce", |asm| {
-        asm.mov(0, 0);
+        asm.mov(0, 1);
         asm.mov(1, 0);
         asm.mov(2, 0);
         asm.mov(3, 0);

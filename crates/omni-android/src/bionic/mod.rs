@@ -1419,6 +1419,14 @@ impl Bionic {
         // for the measurement that made this necessary -- implementing the raw `futex` syscall is
         // what turned the engine's worker threads from dying into parking.
         self.futex.stop();
+        // **And every condition-variable waiter**, which is the other half of the same gap and
+        // was found the same way. `omni-bionic`'s conds do not use the futex -- they have their
+        // own registry of per-waiter host condvars -- so `futex.stop()` does not reach them, and
+        // a thread in `pthread_cond_wait` could only be released by a signal the guest being torn
+        // down was never going to send. MEASURED in M6: once the engine got past its
+        // client-settings phase it left a worker there, `join_guest_threads` timed out after 60
+        // seconds, and the address space could not be torn down.
+        self.conds.stop();
     }
 
     /// Wait until no created guest thread is still running, or until `timeout` elapses.

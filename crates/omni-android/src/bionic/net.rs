@@ -709,21 +709,54 @@ fn bounded_wait(c: &ImportCall<'_, '_>, duration: Option<Duration>) -> AbiResult
 
 // ================================================================== the four that are refused
 
+/// `AF_INET6`, as Linux numbers the address families. The guest's ABI, not this layer's choice.
+const AF_INET6: i32 = 10;
+
 /// `int socket(int domain, int type, int protocol)`
 ///
-/// Refused. **Omnidroid gives the guest no network at all**, and there is not a seam here that
-/// happens to be empty: there is no socket module in `omni-platform` and no way for an embedding
-/// to express a network policy, which is the shape `Bionic::set_filesystem_root` gives the
-/// filesystem. A socket opened here would be an unrestricted host socket in the hands of
-/// untrusted guest code — D6 records that the APK under test is cheat-injected and carries a Luau
-/// executor — and Global Constraint 8 says this runtime makes no network access at run time.
+/// Refused for every address family but one. **Omnidroid gives the guest no network**, and there
+/// is not a seam here that happens to be empty: there is no socket module in `omni-platform` and
+/// no way for an embedding to express a network policy, which is the shape
+/// `Bionic::set_filesystem_root` gives the filesystem. A socket opened here would be an
+/// unrestricted host socket in the hands of untrusted guest code — D6 records that the APK under
+/// test is cheat-injected and carries a Luau executor — and Global Constraint 8 says this runtime
+/// makes no network access at run time.
 ///
-/// **`-1` with `EAFNOSUPPORT` or `EACCES` was considered and rejected**, and it is the most
-/// believable wrong answer this phase had available. Each is a legitimate POSIX outcome that a
-/// networked program has a quiet branch for, so the engine would disable its own networking
-/// during initialisation, the run would complete, and nothing anywhere would record that
-/// *Omnidroid* rather than the device had made that choice. The same argument D21 makes for
+/// **`-1` with `EAFNOSUPPORT` or `EACCES` for a socket the guest asked to *use* stays rejected**,
+/// and it is the most believable wrong answer available here. Each is a legitimate POSIX outcome
+/// that a networked program has a quiet branch for, so the engine would disable its own
+/// networking during initialisation, the run would complete, and nothing anywhere would record
+/// that *Omnidroid* rather than the device had made that choice. The same argument D21 makes for
 /// refusing `mlock` rather than answering `-1`/`ENOMEM`.
+///
+/// # `AF_INET6` is answered, and the exception is narrower than it looks
+///
+/// That argument was written before any call site had been decoded, and it does not survive the
+/// one that M6 reaches. `libroblox.so` at guest `0x021ed7bc` does this:
+///
+/// ```text
+/// 0x21ed7bc: mov  w0, #0xa          ; AF_INET6
+/// 0x21ed7c0: mov  w1, #2            ; SOCK_DGRAM
+/// 0x21ed7c4: mov  w2, wzr
+/// 0x21ed7c8: bl   socket
+/// 0x21ed7cc: ldrh w8, [x19, #0x2d8]
+/// 0x21ed7d0: cmn  w0, #1            ; did it fail?
+/// 0x21ed7d4: and  w9, w8, #0xfffe   ; clear "this host has IPv6"
+/// 0x21ed7d8: strh w9, [x19, #0x2d8]
+/// 0x21ed7dc: b.eq #0x21ed7f0        ; failed: leave it clear
+/// ```
+///
+/// It never sends anything. It creates the descriptor **to ask whether the family exists**,
+/// clears a capability bit, and sets it again only on success — an explicit, first-class branch
+/// for the failure. `EAFNOSUPPORT` is precisely what a kernel with IPv6 disabled answers, and
+/// Android devices with IPv6 off are ordinary rather than exotic.
+///
+/// So the two answers are not the same statement. Answering `AF_INET` would tell the engine it
+/// has a network it does not have. Answering `AF_INET6` tells it this runtime has **no IPv6** —
+/// which is true, is strictly *more* restrictive than a refusal would leave the guest believing,
+/// and grants nothing: no descriptor is created, no seam is opened, and the very next `AF_INET`
+/// call still refuses by name. The recorded reasoning is corrected rather than deleted, because
+/// what changed is the evidence and not the principle.
 pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (domain, kind, protocol) = {
         let mut a = c.args();
@@ -732,10 +765,17 @@ pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let family = match domain {
         1 => "AF_UNIX",
         2 => "AF_INET",
-        10 => "AF_INET6",
+        AF_INET6 => "AF_INET6",
         16 => "AF_NETLINK",
         _ => "an address family this layer has no name for",
     };
+    if domain == AF_INET6 {
+        let state = active(c.symbol(), c.address())?;
+        let mut view = enter(c, &state);
+        view.set_errno(consts::EAFNOSUPPORT);
+        c.ret().i32(-1);
+        return Ok(());
+    }
     Err(refuse(
         c,
         format!(
@@ -745,9 +785,12 @@ pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
              says which directory it may reach. A descriptor returned here would be an \
              unrestricted host socket held by untrusted guest code (D6), and Global Constraint 8 \
              forbids network access at run time. Returning -1 with EAFNOSUPPORT or EACCES was \
-             rejected: both are legitimate POSIX answers a networked program branches on \
-             quietly, so the engine would switch its networking off during initialisation and \
-             nothing would record that this layer, rather than the device, had decided that"
+             rejected for a family the guest means to *use*: both are legitimate POSIX answers a \
+             networked program branches on quietly, so the engine would switch its networking off \
+             during initialisation and nothing would record that this layer, rather than the \
+             device, had decided that. AF_INET6 is the one exception and it is answered, because \
+             its only call site here is a capability probe with an explicit failure arm -- see \
+             this function's documentation"
         ),
     ))
 }

@@ -1098,6 +1098,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("gettimeofday", clocks::gettimeofday),
     ("gmtime", clocks::gmtime),
     ("strftime", clocks::strftime),
+    ("strftime_l", clocks::strftime_l),
     ("gmtime_r", clocks::gmtime_r),
     ("nanosleep", clocks::nanosleep),
     ("usleep", clocks::usleep),

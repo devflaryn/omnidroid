@@ -233,6 +233,16 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          that one reaches this one next. It answers -1/EPERM, which is what a device answers \
          an app without CAP_SYS_NICE, and the call site ignores the result.",
     ),
+    (
+        "strftime_l",
+        "M6, found the way an Unbound is meant to be found: \
+         `nativePostClientSettingsLoadedInitialization3` stopped on it at guest 0x06258e44, \
+         one call past the point where the client settings have been parsed and the engine \
+         starts reporting its own build. The file LAST section names it beside `strftime` \
+         as there too and not reached -- it is reached now, one row later than that note. \
+         Bionic has one locale implementation, so its own `strftime_l` forwards to \
+         `strftime`, and so does this one.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -283,7 +293,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 185, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 186, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -305,7 +315,7 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // a new one: M4's gate recorded `nativeInitFastLog` failing on it by name.
     // Each of the thirteen is a symbol `libroblox.so` imports that the static closure did not
     // predict. D17 says 188 is a lower bound; this is by how much, so far.
-    assert_eq!(Bionic::inline_symbols().count(), 171);
+    assert_eq!(Bionic::inline_symbols().count(), 172);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
