@@ -378,6 +378,8 @@ pub struct FutexCall {
     pub value: u32,
     /// What the call answered: a wait's outcome or a wake's count of threads unparked.
     pub outcome: i32,
+    /// The guest address the syscall will return to, which names the function that made it.
+    pub caller: GuestAddr,
 }
 
 /// One registered guest thread, as

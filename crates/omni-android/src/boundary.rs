@@ -1338,6 +1338,23 @@ impl ImportCall<'_, '_> {
         self.mem
     }
 
+    /// The guest address this call will return to, which is `X30`.
+    ///
+    /// **Not the same thing as [`address`](ImportCall::address)**, which is the thunk's own slot:
+    /// every call to one symbol reports the same thunk, and this reports the *call site*. A guest
+    /// reached by `BL` leaves its return address in `X30`, so this is one instruction past the
+    /// call -- which is what a reader with the binary wants, because it lands inside the calling
+    /// function rather than at its entry.
+    ///
+    /// It is a **guest** value and nothing here can vouch for it: a callee that has already
+    /// clobbered `X30`, or a `BR` rather than a `BL`, gives something that is not a return
+    /// address. Every handler that uses it reads it first, before anything can run, and treats it
+    /// as a diagnostic rather than as control flow.
+    #[must_use]
+    pub fn caller(&self) -> GuestAddr {
+        self.call.x(30) as GuestAddr
+    }
+
     /// Name this call and an argument, for an error message.
     #[must_use]
     pub fn blame(&self, argument: usize) -> Blame<'_> {

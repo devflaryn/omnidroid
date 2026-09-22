@@ -1380,11 +1380,13 @@ fn stall_report(guest: &Guest, when: &str) {
     for call in &calls {
         let _ = writeln!(
             out,
-            "    thread {:#x} {} on {:#x} value {} -> {}",
+            "    thread {:#x} {} on {:#x} value {} from guest {:#x} (link {:#x}) -> {}",
             call.thread,
             call.op,
             call.address,
             call.value,
+            call.caller,
+            call.caller.wrapping_sub(guest.object.base),
             if call.outcome == i32::MIN {
                 "ENTERED AND NEVER RETURNED".to_string()
             } else {

@@ -1107,6 +1107,9 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
     let absolute = command == FUTEX_WAIT_BITSET;
     let realtime = op & FUTEX_CLOCK_REALTIME != 0;
 
+    // Read **before** anything runs: `X30` is the guest's return address only until the callee
+    // touches it.
+    let caller = c.caller();
     // **Recorded before the call, not after.** A `FUTEX_WAIT` with a null timeout never returns
     // until somebody wakes it, so a record written on the way out is written by every call except
     // the ones that matter. MEASURED: with the record after the match, a run with two threads
@@ -1117,6 +1120,7 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
         address: uaddr,
         value: val as u32,
         outcome: FUTEX_IN_PROGRESS,
+        caller,
     });
     let result = {
         let mut view = enter(c, &state);
@@ -1227,6 +1231,7 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
         address: uaddr,
         value: val as u32,
         outcome: result,
+        caller,
     });
     c.ret().i32(result);
     Ok(())
