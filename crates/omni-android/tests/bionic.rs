@@ -477,6 +477,27 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          (and a mutation dropping the restore fails `pwrite_does_not_move_the_descriptors_offset`, \
          which is that measurement). `pread64`/`pwrite64` are not imported on LP64.",
     ),
+    (
+        "fseeko",
+        "M6, a guest worker's file class seeking (`libroblox.so` link 0x2b59734): GuestThreadFailure \
+         { thread: 3, why: \"the guest called the imported symbol `fseeko` through its thunk at \
+         0x1b3d07a4f40, and nothing in the compatibility layer implements it\" }. And the run \
+         that found it is the one that explained the handoff's MemoryFault: a second worker, \
+         sampling a 128-entry table of per-thread records, read one at 0x...3fd0 -- just under a \
+         page top, the shape of a struct at the top of a thread's stack -- whose memory was gone, \
+         because this layer had killed its thread and unmapped that stack. NEW COMPUTATION: the \
+         seam had no seek at all; `Filesystem::seek` is portable `std`, and the stream half is a \
+         seek plus the end-of-file indicator cleared (C17 7.21.9.2p5). Its Tier C neighbour \
+         `fseek` is imported and deliberately NOT bound.",
+    ),
+    (
+        "ftello",
+        "M6, DECODED rather than reached, and said so: it is the call on fseeko's success path \
+         at 0x2b5975c, one instruction after the stub `tools/init_reach.py`'s PLT map names as \
+         fseeko (the map names a stub only when two encodings agree). The run that reaches \
+         fseeko reaches this. `lseek(fd, 0, SEEK_CUR)` on an unbuffered stream. `ftell` is \
+         imported and deliberately NOT bound.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -527,7 +548,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 213, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 215, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -596,7 +617,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // Android uid. See its `BEYOND_THE_PREDICTION` entry. **And `localtime_r`, for 198**, one
     // step further along the same path: `gmtime_r` under the local-time-is-UTC decision.
     // **And `pwrite`, for 199**: SQLite's page writes, `pread`'s mirror at every layer.
-    assert_eq!(Bionic::inline_symbols().count(), 199);
+    // **`fseeko` and `ftello`, for 201**: a file class's seek and position, the second decoded.
+    assert_eq!(Bionic::inline_symbols().count(), 201);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -4895,6 +4917,56 @@ fn the_three_standard_streams_are_streams_over_the_descriptors_posix_reserves() 
         (sf + omni_android::bionic::FILE_BYTES) as u64,
         "stdout must point at __sF[1]"
     );
+}
+
+/// **`fseeko` moves the stream, clears its end-of-file indicator, and `ftello` reports where it
+/// is** -- through real guest code, with the bytes that come back as the evidence.
+///
+/// The end-of-file half is the one a plausible implementation misses: a seek that moved the
+/// descriptor and left `feof` sticky would read correctly and report end of file for ever after.
+#[test]
+fn fseeko_moves_the_stream_and_clears_end_of_file_and_ftello_reports_it() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("fseeko");
+    std::fs::write(scratch.path("seek.txt"), b"0123456789").expect("a host file");
+    let path = f.cstring(f.guest.data + 0x100, b"/seek.txt");
+    let mode = f.cstring(f.guest.data + 0x140, b"r");
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, mode as u64);
+    });
+    assert_ne!(stream, 0, "fopen returned NULL");
+    let buf = f.guest.data + 0x400;
+    let fgets = |len: u64| {
+        value_of(&f, "fgets", |asm| {
+            asm.mov(0, buf as u64);
+            asm.mov(1, len);
+            asm.mov(2, stream);
+        })
+    };
+    // Read to the end, so the indicator is set.
+    assert_eq!(fgets(64), buf as u64);
+    assert_eq!(fgets(64), 0, "end of file");
+    assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 1);
+    assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 10, "at the end");
+
+    let seek = |offset: i64, whence: u64| {
+        value_of(&f, "fseeko", |asm| {
+            asm.mov(0, stream);
+            asm.mov(1, offset as u64);
+            asm.mov(2, whence);
+        }) as i64
+    };
+    assert_eq!(seek(-4, 2), 0, "SEEK_END - 4");
+    assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 0, "cleared");
+    assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 6);
+    assert_eq!(fgets(3), buf as u64);
+    assert_eq!(f.read_cstring(buf), b"67", "the read starts where the seek put it");
+    assert_eq!(seek(1, 1), 0, "SEEK_CUR + 1");
+    assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 9);
+    assert_eq!(seek(-1, 0), -1, "a negative position is refused, as EINVAL");
+    assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 9, "and moved nothing");
+    assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64, 0);
 }
 
 /// A `FILE *` round trip: `fopen`, `fputs`, `fclose`, `fopen`, `fgets`, `feof`, `fclose`.

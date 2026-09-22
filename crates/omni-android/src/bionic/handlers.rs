@@ -1437,6 +1437,10 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("fflush", stdio::fflush),
     ("fgets", stdio::fgets),
     ("fileno", stdio::fileno),
+    // M6: a file class's seek, then its position, on a guest worker. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records how each was found -- `ftello` by decoding, one call on.
+    ("fseeko", stdio::fseeko),
+    ("ftello", stdio::ftello),
     ("fputc", stdio::fputc),
     ("fputs", stdio::fputs),
     ("fread", stdio::fread),

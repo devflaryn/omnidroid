@@ -451,6 +451,8 @@ pub fn errno_for(kind: FsErrorKind) -> Option<i32> {
         // non-blocking end with nothing to do, `EPIPE` for a write whose readers have all gone.
         FsErrorKind::WouldBlock => consts::EAGAIN,
         FsErrorKind::BrokenPipe => consts::EPIPE,
+        // Added with `lseek`'s seam method, for the stream seeks SQLite's neighbour reached.
+        FsErrorKind::NotSeekable => consts::ESPIPE,
         // `FsErrorKind::Other` and nothing else. It is spelled as a wildcard because the enum is
         // `#[non_exhaustive]`, and a kind added upstream without a decision here must refuse by
         // name rather than acquire a plausible errno.

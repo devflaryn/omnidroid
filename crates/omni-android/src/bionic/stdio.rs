@@ -100,7 +100,7 @@ use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 use crate::mem::Blame;
 
-use super::files::{errno_for, filesystem};
+use super::files::{errno_for, filesystem, settle, Settled};
 use super::view::GuestView;
 use super::{active, enter};
 
@@ -524,6 +524,75 @@ pub(super) fn feof(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         stdio::feof(&stream_of(&view, file)?)
     };
     c.ret().i32(result);
+    Ok(())
+}
+
+/// `int fseeko(FILE *stream, off_t offset, int whence)`
+///
+/// A seek on the stream's descriptor and **the end-of-file indicator cleared**, which C17
+/// 7.21.9.2p5 says a successful `fseek` does -- the one thing a seek owes the stream beyond the
+/// descriptor. There is no buffer to discard or flush: this layer is unbuffered (see the module
+/// documentation), so the descriptor's offset *is* the stream's position. Returns 0, or -1 with
+/// `errno` (`EINVAL` for a bad `whence` or a negative position, `ESPIPE` for a pipe).
+///
+/// No `FILE` field is read or written, so the `sizeof(FILE)` obligation the module documentation
+/// narrows is not touched: the indicator is the host-side table's, as for `feof`.
+///
+/// MEASURED reader: a guest worker at `libroblox.so` link `0x2b59734`, a file class's
+/// `seek(offset, whence)` that calls `ftello` (`0x2b5975c`) on success -- both stubs decoded by
+/// `tools/init_reach.py`'s PLT map, which only names a stub when two encodings agree. The worker
+/// died on the `Unbound` this replaces, and a second worker then faulted reading what looks like
+/// the dead one's stack; see the gate.
+pub(super) fn fseeko(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (file, offset, whence) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()? as i64, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let mut stream = stream_of(&view, file)?;
+        match settle(&view, fs.seek(stream.fd, offset, whence))? {
+            Settled::Done(_) => {
+                stream.eof = false;
+                state.bionic.update_stream(file, stream);
+                0
+            }
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `off_t ftello(FILE *stream)`
+///
+/// The stream's position, which on an unbuffered stream is the descriptor's offset: `lseek(fd,
+/// 0, SEEK_CUR)`, moving nothing. -1 with `errno` on failure (`ESPIPE` for a pipe).
+///
+/// **Bound because it was decoded, not because a run reached it**: it is the call on
+/// [`fseeko`]'s success path at `0x2b5975c`, so the run that reaches `fseeko` reaches this one
+/// instruction later, and waiting a three-minute run to be told so would be ceremony.
+pub(super) fn ftello(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let file = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let stream = stream_of(&view, file)?;
+        match settle(&view, fs.seek(stream.fd, 0, 1))? {
+            Settled::Done(at) => i64::try_from(at).unwrap_or(-1),
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().u64(result as u64);
     Ok(())
 }
 

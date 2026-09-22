@@ -1431,6 +1431,67 @@ impl Filesystem {
         }
     }
 
+    /// `lseek(2)`: move the descriptor's offset and return where it now is.
+    ///
+    /// Portable `std` -- `Seek` for `&File` -- so no backend. `whence` is Linux's numbering
+    /// (`SEEK_SET` 0, `SEEK_CUR` 1, `SEEK_END` 2); anything else, and a position that would be
+    /// negative, is `EINVAL`, which is what Linux answers and what `std` reports as `InvalidInput`.
+    /// A descriptor with no position -- pipe, socket, eventfd, standard stream -- is `ESPIPE`
+    /// ([`FsErrorKind::NotSeekable`]).
+    ///
+    /// # Errors
+    ///
+    /// As above; [`FsErrorKind::BadDescriptor`] for no such descriptor, and [`FsError::Refused`]
+    /// for a directory or a device: Linux seeks both, and no run has asked.
+    pub fn seek(&self, fd: i32, offset: i64, whence: i32) -> FsResult<u64> {
+        use std::io::{Seek, SeekFrom};
+        const OP: &str = "lseek";
+        let table = self.table();
+        match table.open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::Pipe(_) | Entry::Socket(_) | Entry::EventFd(_) | Entry::Standard(_)) => {
+                Err(FsError::kinded(
+                    OP,
+                    format!("fd {fd}"),
+                    FsErrorKind::NotSeekable,
+                    "the descriptor has no position to move (ESPIPE)",
+                ))
+            }
+            Some(Entry::Directory { .. } | Entry::Device(_)) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "a seek on a directory or a device: Linux allows both, and no run has reached \
+                 one, so it is refused by name rather than answered unmeasured",
+            )),
+            Some(Entry::File { file, guest, .. }) => {
+                // **Resolved to an absolute position here, and the host only ever sees
+                // `SEEK_SET`.** MEASURED: `SEEK_CUR` to a negative position reaches Windows as
+                // `ERROR_NEGATIVE_SEEK`, which `std` does not classify, so the guest would have been
+                // refused where Linux answers `EINVAL`. Doing the arithmetic here -- checked,
+                // because every term is the guest's -- makes the answer the same on every host.
+                let mut handle: &File = file;
+                let io = |error: std::io::Error| FsError::io(OP, guest, &error);
+                let invalid = |why: &'static str| {
+                    FsError::kinded(OP, guest.clone(), FsErrorKind::InvalidInput, why)
+                };
+                let base: i64 = match whence {
+                    0 => 0,
+                    1 => i64::try_from(handle.stream_position().map_err(io)?)
+                        .map_err(|_| invalid("the current offset does not fit an off_t"))?,
+                    2 => i64::try_from(file.metadata().map_err(io)?.len())
+                        .map_err(|_| invalid("the file's size does not fit an off_t"))?,
+                    _ => return Err(invalid("whence is none of SEEK_SET, SEEK_CUR and SEEK_END")),
+                };
+                let target = base
+                    .checked_add(offset)
+                    .ok_or_else(|| invalid("the resulting offset overflows an off_t"))?;
+                let target =
+                    u64::try_from(target).map_err(|_| invalid("the resulting offset is negative"))?;
+                handle.seek(SeekFrom::Start(target)).map_err(io)
+            }
+        }
+    }
+
     /// `pwrite(2)`: write at an absolute offset **without moving the descriptor's own offset**.
     ///
     /// [`pread`](Filesystem::pread)'s mirror, arm for arm: a descriptor with no position in it
@@ -2488,6 +2549,30 @@ mod tests {
         fs.closedir(first).expect("close");
         fs.closedir(second).expect("close");
         assert_eq!(fs.dir_count(), 0);
+    }
+
+    /// `seek` moves the offset the next `read` uses, answers where it went, refuses a negative
+    /// position with `InvalidInput`, and a pipe with `NotSeekable`.
+    #[test]
+    fn seek_moves_the_offset_the_next_read_uses() {
+        let scratch = Scratch::new("seek");
+        let fs = scratch.fs();
+        let fd = fs.open(b"/f", write_flags()).expect("open");
+        fs.write(fd, b"0123456789").expect("write");
+        fs.close(fd).expect("close");
+        let fd = fs.open(b"/f", read_flags()).expect("reopen");
+        assert_eq!(fs.seek(fd, 6, 0).expect("SEEK_SET"), 6);
+        let mut two = [0u8; 2];
+        assert_eq!(fs.read(fd, &mut two).expect("read"), 2);
+        assert_eq!(&two, b"67", "the read starts where the seek put it");
+        assert_eq!(fs.seek(fd, 0, 1).expect("SEEK_CUR 0 is ftell"), 8);
+        assert_eq!(fs.seek(fd, -3, 2).expect("SEEK_END"), 7);
+        assert_eq!(fs.seek(fd, -1, 0).unwrap_err().kind(), Some(FsErrorKind::InvalidInput));
+        assert_eq!(fs.seek(fd, -100, 1).unwrap_err().kind(), Some(FsErrorKind::InvalidInput));
+        assert_eq!(fs.seek(fd, 0, 3).unwrap_err().kind(), Some(FsErrorKind::InvalidInput));
+        assert_eq!(fs.seek(fd, 0, 1).expect("unchanged by the failures"), 7);
+        let (read_end, _write_end) = fs.pipe().expect("a pipe");
+        assert_eq!(fs.seek(read_end, 0, 1).unwrap_err().kind(), Some(FsErrorKind::NotSeekable));
     }
 
     /// `pwrite` writes at an offset and leaves the descriptor's own offset alone -- the

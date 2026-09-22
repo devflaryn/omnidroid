@@ -77,6 +77,11 @@ pub enum FsErrorKind {
     /// made. Added with [`Entry::Socket`](super::Filesystem::socket_at) in M6; every other kind
     /// predates sockets existing at all.
     NotASocket,
+    /// A seek on a descriptor with no position in it -- a pipe, a socket, an eventfd, a standard
+    /// stream -- `ESPIPE`. Decided by this seam from the descriptor's kind, as [`NotASocket`] is.
+    ///
+    /// [`NotASocket`]: FsErrorKind::NotASocket
+    NotSeekable,
     /// The host reported a failure [`std::io::ErrorKind`] does not classify.
     ///
     /// **Not mapped to an errno by the caller.** See the module documentation: a call that fails
@@ -106,6 +111,7 @@ impl FsErrorKind {
             FsErrorKind::WouldBlock => "resource temporarily unavailable",
             FsErrorKind::BrokenPipe => "broken pipe",
             FsErrorKind::NotASocket => "not a socket",
+            FsErrorKind::NotSeekable => "illegal seek",
             FsErrorKind::Other => "an unclassified host error",
         }
     }
