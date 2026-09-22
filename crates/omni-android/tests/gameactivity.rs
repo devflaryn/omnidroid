@@ -2203,6 +2203,24 @@ fn report_dead_guest_threads(guest: &Guest, when: &str) {
             failure.start_routine.wrapping_sub(guest.object.base),
             failure.why
         );
+        // PC, X30, then the frame chain, as link addresses so they can be looked up in the
+        // binary. A value outside the image prints as itself, prefixed, rather than as a
+        // wrapped subtraction that would read like an address in it.
+        let _ = writeln!(
+            out,
+            "      guest stack at death (link): {:?}",
+            failure
+                .stack
+                .iter()
+                .map(|&at| {
+                    let at = at as usize;
+                    match at.checked_sub(guest.object.base) {
+                        Some(link) if link < 0x0700_0000 => format!("{link:#x}"),
+                        _ => format!("abs {at:#x}"),
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
     }
     let _ = out.flush();
 }

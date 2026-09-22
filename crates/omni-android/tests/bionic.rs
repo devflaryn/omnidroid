@@ -5566,6 +5566,22 @@ fn a_start_routine_at_a_bad_address_is_a_recorded_failure_and_a_join_refusal() {
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert_eq!(failures[0].start_routine, f.guest.unmapped);
     assert_eq!(failures[0].thread, f.guest.read_u64(out));
+    // **Where it died, not only where it started.** `PC` first -- the fetch from the unmapped
+    // start routine is the fault -- then `X30`, which the runner set to the sentinel and nothing
+    // has overwritten. A record that dropped the stack, or took it after the thread's stack was
+    // unmapped, fails here rather than in a three-minute run that needed it.
+    assert_eq!(
+        failures[0].stack.first().copied(),
+        Some(f.guest.unmapped as u64),
+        "the stack at death starts at the PC that faulted: {:?}",
+        failures[0].stack
+    );
+    assert_eq!(
+        failures[0].stack.get(1).copied(),
+        Some(f.boundary.sentinel() as u64),
+        "then X30, which the runner pointed at the sentinel: {:?}",
+        failures[0].stack
+    );
 }
 
 /// A detached thread that fails has nobody to report to, so the instance's failure list is the

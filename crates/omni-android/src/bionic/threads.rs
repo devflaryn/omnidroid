@@ -462,6 +462,15 @@ pub struct GuestThreadFailure {
     pub start_routine: GuestAddr,
     /// What stopped it.
     pub why: String,
+    /// Where the guest was when it stopped, innermost first: `PC`, then `X30`, then the
+    /// frame-pointer chain ([`omni_bionic::unwind::frames`]). Absolute addresses.
+    ///
+    /// **Evidence, never control flow**, and empty when the thread never ran guest code. It is
+    /// here because `start_routine` names only the *outermost* function, and every death M6
+    /// found was many frames below it: a refusal inside a JNI helper with no direct call site
+    /// (`0x625e4ec` is reached only indirectly) says nothing about which engine path asked,
+    /// and that is the question each one poses.
+    pub stack: Vec<u64>,
 }
 
 impl core::fmt::Display for GuestThreadFailure {
@@ -732,6 +741,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 thread: slot.id.0,
                 start_routine: entry,
                 why: format!("the CPU context could not be created: {error}"),
+                stack: Vec::new(),
             });
             bionic.threads_table().release(slot);
             let _ = space.unmap(stack_base, total);
@@ -749,6 +759,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             thread: slot.id.0,
             start_routine: entry,
             why: format!("the thunk boundary could not be installed on the new context: {error}"),
+            stack: Vec::new(),
         });
         bionic.threads_table().release(slot);
         let _ = space.unmap(stack_base, total);
@@ -798,6 +809,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 thread: slot.id.0,
                 start_routine: entry,
                 why: format!("the host refused another thread: {error}"),
+                stack: Vec::new(),
             });
             bionic.forget_guest_thread(slot.id);
             bionic.threads_table().release(slot);
@@ -848,6 +860,9 @@ fn run_guest_thread(spawn: Spawn) {
         window,
         also,
     } = spawn;
+    // Filled by `drive` at the moment the guest stops without returning, and read after the
+    // stack is gone -- so the walk happens there, while the frames it reads are still mapped.
+    let mut death: Vec<u64> = Vec::new();
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // D13 again, from the other side: the context already has its thread pointer, which is
         // what makes it legal to run guest code at all on this thread.
@@ -887,7 +902,7 @@ fn run_guest_thread(spawn: Spawn) {
         cpu.set_sp(stack_top);
         cpu.set_x(XReg::new(0).expect("X0 exists"), argument);
         cpu.set_x(XReg::new(30).expect("X30 exists"), boundary.sentinel() as u64);
-        drive(&bionic, &boundary, &mut *cpu, entry, window)
+        drive(&bionic, &boundary, &mut *cpu, entry, window, &mut death)
     }));
     let state = match outcome {
         Ok(state) => state,
@@ -922,6 +937,7 @@ fn run_guest_thread(spawn: Spawn) {
             why: format!(
                 "the guest thread's stack at {base:#x} ({len} bytes) could not be unmapped, so                  its address space and commit charge are leaked for the life of this instance:                  {error}"
             ),
+            stack: Vec::new(),
         });
     }
     let _ = bionic.threads_table().detach_current();
@@ -932,6 +948,7 @@ fn run_guest_thread(spawn: Spawn) {
             thread: slot.id.0,
             start_routine: entry,
             why: why.clone(),
+            stack: death,
         });
     }
     bionic.finish_guest_thread(slot.id, state);
@@ -944,6 +961,7 @@ fn drive(
     cpu: &mut dyn GuestCpu,
     entry: GuestAddr,
     window: u64,
+    death: &mut Vec<u64>,
 ) -> GuestThreadState {
     let sentinel = boundary.sentinel();
     let mut pc = entry;
@@ -963,7 +981,10 @@ fn drive(
             // boundary and reports where.
             Ok(ExitReason::StepLimitReached { pc: at, .. }) => pc = at,
             Ok(ExitReason::Halted { .. }) => return GuestThreadState::Stopped,
-            Ok(other) => return GuestThreadState::Failed(format!("{other:?}")),
+            Ok(other) => {
+                *death = stack_at_death(boundary, cpu, other.pc());
+                return GuestThreadState::Failed(format!("{other:?}"));
+            }
             // **A call refused while this instance is shutting down is the shutdown working, not
             // a thread this layer killed.**
             //
@@ -990,9 +1011,48 @@ fn drive(
             // the price. The check is `guest_threads_stopping`, which cannot be set by anything
             // the guest does.
             Err(_) if bionic.guest_threads_stopping() => return GuestThreadState::Stopped,
-            Err(error) => return GuestThreadState::Failed(error.to_string()),
+            Err(error) => {
+                *death = stack_at_death(boundary, cpu, cpu.pc());
+                return GuestThreadState::Failed(error.to_string());
+            }
         }
     }
+}
+
+/// `PC`, then the frame walk from `X29`/`X30`, for [`GuestThreadFailure::stack`].
+///
+/// `pc` is passed rather than read, because the exit knows it better than the context does: a
+/// fault reports the instruction that faulted, while the context's own `PC` may already be one
+/// past it -- MEASURED, a fetch from an unmapped start routine left it at `+4`.
+///
+/// Read through the boundary's checked memory, so a frame pointer the guest corrupted ends the
+/// walk at the first unreadable record rather than faulting this layer (Global Constraint 11).
+fn stack_at_death(boundary: &Boundary, cpu: &dyn GuestCpu, pc: GuestAddr) -> Vec<u64> {
+    /// `omni_bionic::unwind::frames` over [`GuestMem`], read-only.
+    struct Frames<'a>(&'a GuestMem);
+    impl omni_bionic::memory::GuestMemory for Frames<'_> {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), omni_bionic::memory::Fault> {
+            let fault = omni_bionic::memory::Fault(addr);
+            let at = usize::try_from(addr).map_err(|_| fault)?;
+            let bytes = self
+                .0
+                .read_bytes(at, buf.len(), Blame::new("a dead guest thread's frame walk", at, 0))
+                .map_err(|_| fault)?;
+            buf.copy_from_slice(&bytes);
+            Ok(())
+        }
+        fn write(&mut self, addr: u64, _buf: &[u8]) -> Result<(), omni_bionic::memory::Fault> {
+            Err(omni_bionic::memory::Fault(addr))
+        }
+    }
+    let mut stack = vec![pc as u64];
+    stack.extend(omni_bionic::unwind::frames(
+        &Frames(boundary.mem()),
+        cpu.x(XReg::new(29).expect("X29 exists")),
+        cpu.x(XReg::new(30).expect("X30 exists")),
+        24,
+    ));
+    stack
 }
 
 // ================================================================== pthread_join
