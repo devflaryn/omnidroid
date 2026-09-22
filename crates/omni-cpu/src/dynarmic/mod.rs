@@ -783,6 +783,15 @@ pub(crate) struct CpuCtx {
     /// How many of those asked to be handed back to the caller. See
     /// [`ThunkCall::defer_to_caller`].
     pub(crate) inline_deferred: u64,
+    /// Hint instructions (`YIELD`, `WFE`, `WFI`, `SEV`, `SEVL`) that arrived as raised exceptions
+    /// and were continued through.
+    ///
+    /// A **watch, not a detector** (`VERIFICATION.md` entry 11): it rises when the guest spins and
+    /// stays at zero when it does not, and neither says the handling is right. It exists because
+    /// the hints only arrive at all because the x64 A64 backend does not forward
+    /// `hook_hint_instructions` (`callbacks::is_hint` carries the file and line), and a pin that
+    /// started forwarding it would take this to zero silently.
+    pub(crate) hints: u64,
     /// The host thread's `MXCSR`, captured at the top of every `run`. See [`mxcsr`].
     pub(crate) host_mxcsr: u32,
     pub(crate) breakpoints: BTreeSet<GuestAddr>,
@@ -897,6 +906,7 @@ impl DynarmicCpu {
             inline_thunks: BTreeMap::new(),
             inline_calls: 0,
             inline_deferred: 0,
+            hints: 0,
             host_mxcsr: mxcsr::read(),
             breakpoints: BTreeSet::new(),
             sentinel: None,

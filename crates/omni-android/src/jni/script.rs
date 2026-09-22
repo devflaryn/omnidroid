@@ -298,6 +298,91 @@ pub static SEQUENCE: &[Downcall] = &[
     },
 ];
 
+/// What the host hands `nativeInitClientSettings` as the client-settings document.
+///
+/// # This argument is the whole of why row 21 can happen offline, and it was decoded
+///
+/// `Java_..._nativeInitClientSettings` (guest `0x022265fc`) converts its three `jstring`s and
+/// calls `0x02baf38c(json, "", arg2, arg3)`. That function **branches on whether the first string
+/// is empty**:
+///
+/// ```text
+/// 0x2baf3f0: cbz x8, 0x2baf44c      ; length == 0 -> the fetch path
+/// 0x2baf3f8: bl  ...                ; otherwise parse it in place
+/// 0x2baf424: ldrb w8, [x20, #0x58]  ; the parser's error flag
+/// 0x2baf428: cbz  w8, 0x2baf530     ; clear -> "ClientAppSettings", parse_ixp_cache_begin, ...
+/// ```
+///
+/// The empty branch goes to `0x04ecae88("ClientAppSettings", ..)` with the third string, which is
+/// an HTTP fetch of `clientsettings.roblox.com`; the non-empty branch parses the document the
+/// caller supplied and needs no network at all. On a device the Java side fetches it and passes
+/// it here, so **supplying it is what the Java side does**, not a way around the fetch.
+///
+/// `applicationSettings` is empty because this host has no settings document to be honest about.
+/// Every flag then takes the value it was compiled with, which is a state the engine is written
+/// for — it is what a device gets for any flag the response omits. Inventing flag values here
+/// would be choosing engine behaviour by guess; an empty map chooses nothing.
+pub const CLIENT_SETTINGS: &str = r#"{"applicationSettings":{}}"#;
+
+/// The base URL `nativeInitClientSettings` would fetch from if [`CLIENT_SETTINGS`] were empty.
+///
+/// Passed because it is the argument the Java side passes, and **it is not reached**: the parse
+/// branch above returns before `0x04ecae88` is called. If a future change empties
+/// `CLIENT_SETTINGS`, this is the string that would decide where the engine tried to go, and a
+/// blank here would make that failure say nothing.
+pub const CLIENT_SETTINGS_URL: &str = "https://clientsettings.roblox.com/v2/settings/application/";
+
+/// §8 rows 21-22: the client-settings phase, and the app start it unblocks.
+///
+/// # Why this is a second table and not more rows on [`SEQUENCE`]
+///
+/// [`SEQUENCE`] runs before §8 step 13; these run after §8 rows 17-20, with the game thread
+/// already inside `NativeEngine::GameLoop()`. They are the same *shape* — a static native the
+/// Java side calls — and run by the same [`run`], but a host that ran them at step 12 would be
+/// starting the app before there was a window to start it on.
+///
+/// # What made them the frontier
+///
+/// MEASURED, after rows 17-20 landed and the engine took the window: the game thread logged
+/// `[FLog::NativeDM] nativeActivity_onSurfaceChanged: ... Flags-Not-Received. Return.` That is
+/// `jni-surface.md` §8.1's **sixth** failure mode arriving exactly where it says it will — the
+/// engine sits waiting for flags and never asks for a renderer, which from outside looks like a
+/// graphics problem and is not one.
+pub static FLAGS_AND_START: &[Downcall] = &[
+    // ---- row 21: the client settings, and the initialisation they unblock ------------------
+    Downcall {
+        step: 21,
+        caller: "fi/e$f.a",
+        class: "com/roblox/engine/jni/NativeGLInterface",
+        member: "nativeInitClientSettings",
+        descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+        args: &[
+            ScriptArg::Text(CLIENT_SETTINGS),
+            // The second string is not on either branch of `0x02baf38c`'s first test. Empty
+            // rather than invented: the host has nothing to put here that it measured.
+            ScriptArg::Text(""),
+            ScriptArg::Text(CLIENT_SETTINGS_URL),
+        ],
+    },
+    Downcall {
+        step: 21,
+        caller: "fi/e$f.b",
+        class: "com/roblox/engine/jni/NativeGLInterface",
+        member: "nativePostClientSettingsLoadedInitialization3",
+        descriptor: "(Ljava/util/List;)V",
+        args: &[ScriptArg::Object("java/util/List")],
+    },
+    // ---- row 22: global init, then the app itself -------------------------------------------
+    Downcall {
+        step: 22,
+        caller: "fi/e.E",
+        class: "com/roblox/engine/jni/NativeGLInterface",
+        member: "nativeGameGlobalInit",
+        descriptor: "()V",
+        args: &[],
+    },
+];
+
 /// The classes [`SEQUENCE`] names that §3.1 does not rank, declared so that the engine can take
 /// a `jclass` for each and so that its member lookups on the parameter objects are **recorded**
 /// rather than refused.
@@ -326,6 +411,14 @@ pub struct StepOutcome {
     pub target: Option<GuestAddr>,
     /// `Ok` when the guest returned through the sentinel.
     pub result: AbiResult<()>,
+    /// What the guest returned in `X0`, when it returned at all.
+    ///
+    /// **Not every downcall here is `(...)V`.** §8 row 21's `nativeInitClientSettings` is
+    /// `(SSS)I`, and a host that ignored the `int` would be discarding the engine's own report of
+    /// whether the settings document it was handed was usable -- which is the difference between
+    /// a run that can reach a frame and one that fatals thousands of instructions later, in a
+    /// different call, with a message about something else.
+    pub returned: Option<u64>,
     /// [`GuestCpu::last_run_instructions`] after the call.
     ///
     /// **The last run *segment*, not the whole downcall**, and the name says so: every exit-path
@@ -409,6 +502,7 @@ pub fn run(
                         step.class, step.member, step.descriptor, step.step
                     ),
                 }),
+                returned: None,
                 last_segment_instructions: 0,
             });
             continue;
@@ -433,6 +527,7 @@ pub fn run(
             step: step.step,
             symbol,
             target: Some(target),
+            returned: result.as_ref().ok().map(|returned| returned.x0),
             result: result.map(|_| ()),
             last_segment_instructions: cpu.last_run_instructions(),
         });

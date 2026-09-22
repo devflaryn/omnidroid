@@ -141,6 +141,30 @@ const LIFECYCLE_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
 /// early when no guest thread is left, because a dead thread will not produce more evidence.
 const POST_ROWS_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The spin lock `nativeInitClientSettings` blocks on, as an offset from the load base.
+///
+/// **A temporary probe, not a contract.** MEASURED: with the hint handling in place, §8 row 21
+/// spends its whole 200,000,000-instruction budget at guest `0x021eba20` -- the `yield` of a
+/// three-instruction spin (`ldr w8,[x26,#0xa30]; cbz; yield; b`) whose acquire is
+/// `swap(1, 0x06dd0a30)` through the outline atomic helper at `0x032f0950`. The loop exits only
+/// when that word reads zero, so the word is the measurement: printing it at each stage says
+/// *when* it stopped being zero, which is the difference between a lock another live thread holds
+/// and one an earlier refusal abandoned.
+const SPIN_LOCK_OFFSET: usize = 0x06dd_0a30;
+
+/// Where `Flag::areFlagsLoaded()`'s byte lives, as an offset from `libroblox.so`'s load base.
+///
+/// **Decoded, and the decoding is what makes it one address rather than a guess.** A scan of
+/// every `ADRP`+`STRB`/`LDRB` pair in `.text` that resolves to `0x072739d4` finds **one** store
+/// (`0x022474e8`) and several hundred loads; the store's function is `0x022474cc`, whose six
+/// callers include `0x02baf6cc` on the settings loader's success path. The single xref to
+/// `Can't initialize the TaskScheduler before flags have been loaded` (`0x0224fc84`) is guarded
+/// by `tbz w8, #0` on a load of the same byte at `0x0224fa24`.
+///
+/// An offset rather than the absolute address because the image is loaded wherever the host maps
+/// it; `0x072739d4` is the link-time address, and `object.base` is what turns it into this run's.
+const FLAGS_LOADED_OFFSET: usize = 0x0727_39d4;
+
 /// What the host says `ro.build.version.sdk` is.
 ///
 /// **A decision.** §5.2 step 2 reads it into `activity->sdkVersion` at `+0x30`, and the glue
@@ -578,8 +602,20 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     guest.boundary.start_census();
 
     // ---- steps 1-5, which M3 delivered ---------------------------------------------------
+    let _ = writeln!(
+        std::io::stderr(),
+        "before the initializers: spin lock {}, count {}",
+        image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30"),
+        image_word(&guest, SPIN_LOCK_OFFSET + 4, "the count at 0x06dd0a34")
+    );
     let completed = guest.run_initializers(&mut cpu);
     assert_eq!(completed, INITIALIZERS, "M5 starts where M4's gate starts");
+    let _ = writeln!(
+        std::io::stderr(),
+        "after the initializers: spin lock {}, count {}",
+        image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30"),
+        image_word(&guest, SPIN_LOCK_OFFSET + 4, "the count at 0x06dd0a34")
+    );
 
     // ---- step 6: JNI_OnLoad, which M4 delivered --------------------------------------------
     let on_load = *guest.exports.get("JNI_OnLoad").expect("libroblox.so exports JNI_OnLoad");
@@ -597,6 +633,12 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     }
     .expect("§8 step 6: JNI_OnLoad must return");
     assert_eq!(returned.as_i32(), slots::JNI_VERSION_1_6, "§8 step 6");
+    let _ = writeln!(
+        std::io::stderr(),
+        "after JNI_OnLoad: spin lock {}, count {}",
+        image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30"),
+        image_word(&guest, SPIN_LOCK_OFFSET + 4, "the count at 0x06dd0a34")
+    );
 
     // ---- steps 7-12: the scripted sequence, which M4 delivered -----------------------------
     let outcomes = {
@@ -619,6 +661,19 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         "\nM5: steps 7-12 reached {reached} of {} scripted downcalls",
         outcomes.len()
     );
+    for outcome in &outcomes {
+        let _ = writeln!(
+            std::io::stderr(),
+            "  step {:>2} {:<72} {}   [spin lock {}]",
+            outcome.step,
+            outcome.symbol,
+            match &outcome.result {
+                Ok(()) => "returned".to_string(),
+                Err(error) => format!("{error}"),
+            },
+            image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30")
+        );
+    }
     for outcome in outcomes.iter().filter(|o| o.step <= 8) {
         if let Err(error) = &outcome.result {
             panic!("§8 step {}: `{}` failed: {error}", outcome.step, outcome.symbol);
@@ -1067,6 +1122,75 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             break;
         }
     }
+
+    // ---- §8 rows 21-22: the client settings the engine is waiting for -----------------------
+    //
+    // **This is §8.1's sixth failure mode, driven rather than waited out.** With the window
+    // taken, the game thread logged `nativeActivity_onSurfaceChanged: ... Flags-Not-Received.
+    // Return.` -- the engine will not ask for a renderer until the flags phase has run, and from
+    // outside that is indistinguishable from a graphics problem.
+    //
+    // Run only if the lifecycle rows all returned: these go into the same engine the abandoned
+    // glue mutex would be inside, and a flags phase driven over a half-finished lifecycle would
+    // measure the harness rather than the engine.
+    let flags_outcomes = if row_outcomes.iter().all(|(_, result)| result.is_ok()) {
+        // **One row at a time, reported before the next is attempted.** MEASURED with the whole
+        // table handed to one `script::run`: a later row hung, the watchdog ended the process,
+        // and *none* of the per-row lines had been printed -- so the run said nothing about the
+        // rows that had already returned. `VERIFICATION.md` entry 4's shape: the measurement has
+        // to survive the failure it is measuring.
+        let mut all = Vec::new();
+        for step in script::FLAGS_AND_START {
+            let table = std::slice::from_ref(step);
+            let outcomes = {
+                let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                let _jni = guest.jni.activate().expect("publish the JNI instance");
+                let _ndk = guest.ndk.activate();
+                script::run(
+                    &guest.jni,
+                    &guest.boundary,
+                    &mut cpu,
+                    &|symbol| guest.exports.get(symbol).copied(),
+                    table,
+                    0,
+                )
+                .expect("building the scripted arguments must not fail")
+            };
+            for outcome in &outcomes {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "§8 row {}: {} -> {}   [engine flags byte: {}]",
+                    outcome.step,
+                    outcome.symbol,
+                    match &outcome.result {
+                        Ok(()) => format!(
+                            "returned {}",
+                            match outcome.returned {
+                                Some(x0) => format!("{:#x} ({})", x0, x0 as u32 as i32),
+                                None => "nothing".to_string(),
+                            }
+                        ),
+                        Err(error) => format!("{error}"),
+                    },
+                    flags_loaded_byte(&guest)
+                );
+            }
+            let failed = outcomes.iter().any(|outcome| outcome.result.is_err());
+            all.extend(outcomes);
+            if failed {
+                break;
+            }
+        }
+        all
+    } else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "§8 rows 21-22: not attempted, because a lifecycle row did not return"
+        );
+        Vec::new()
+    };
+    let _ = &flags_outcomes;
+
     rows_done.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // **Let the game thread run on what it was just handed.** The lifecycle calls above post
@@ -1173,6 +1297,38 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             "a guest thread died on a null jmethodID, which is jni-surface.md §8.1's third \
              failure mode: {failure:?}"
         );
+    }
+}
+
+/// A `u32` of the loaded image, by its link-time offset, for a probe that has to name a state
+/// inside the engine.
+fn image_word(guest: &Guest, offset: usize, what: &str) -> String {
+    match guest
+        .boundary
+        .mem()
+        .read_u32(guest.object.base + offset, omni_android::Blame::new(what, guest.object.base, 0))
+    {
+        Ok(word) => format!("{word:#x}"),
+        Err(error) => format!("unreadable: {error}"),
+    }
+}
+
+/// The engine's own `Flag::areFlagsLoaded()` byte, read out of the engine.
+///
+/// **This is the state §8 row 21 exists to change**, and reading it directly is how the host
+/// learns whether it changed -- rather than inferring it from the TaskScheduler's fatal, which is
+/// a *different subsystem* reporting a consequence and which is what a run that stopped here
+/// would otherwise have to reason from.
+///
+/// See [`FLAGS_LOADED_OFFSET`] for how the address was decoded and why it is one address and not
+/// a guess.
+fn flags_loaded_byte(guest: &Guest) -> String {
+    match guest.boundary.mem().read_u32(
+        guest.object.base + FLAGS_LOADED_OFFSET,
+        omni_android::Blame::new("Flag::areFlagsLoaded", guest.object.base, 0),
+    ) {
+        Ok(word) => format!("{}", word & 0xff),
+        Err(error) => format!("unreadable: {error}"),
     }
 }
 

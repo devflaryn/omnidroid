@@ -373,10 +373,84 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
     }
 }
 
+/// The architecture's **hint** instructions, and the reason this arm exists at all.
+///
+/// `YIELD`, `WFE`, `WFI`, `SEV` and `SEVL` are hints: A64 permits an implementation to execute
+/// every one of them as a `NOP`, and none has an architectural effect a program can observe. So
+/// the correct emulation is to **let execution continue**, and reporting them as
+/// `UnsupportedInstruction` -- which is what the catch-all below did -- stops a guest on
+/// instructions the guest is entitled to execute.
+///
+/// # This was not reachable by configuration, which is why it is handled here
+///
+/// `DynarmicOptions` sets `hook_hint_instructions: 0`, and the shim passes it into
+/// `A64::UserConfig`. **The x64 A64 backend then does not forward it.**
+/// `backend/x64/a64_interface.cpp:273` builds the translator's options as
+///
+/// ```text
+/// A64::Translate(..., {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+/// ```
+///
+/// -- two initialisers for a three-member aggregate, so `TranslationOptions::
+/// hook_hint_instructions` keeps its declared default of **`true`**
+/// (`frontend/A64/translate/a64_translate.h:37`). The A32 paths do forward it
+/// (`backend/x64/a32_interface.cpp:216`), which is what makes this look like an oversight rather
+/// than a decision. **MEASURED** on this pin: a three-instruction program `movz x0,#7; yield;
+/// ret` exits `UnsupportedInstruction { encoding: 0xd503203f }` with
+/// `interpreter_fallbacks: 0` and `exceptions: 1` -- so it arrives here, through
+/// `ExceptionRaised`, with the config asking for the opposite.
+///
+/// Handled here rather than patched into the vendored tree because this arm is **correct
+/// either way**: if a later pin forwards the flag the hints stop arriving and nothing here
+/// changes, and if some other configuration turns hooking on deliberately, a hint still must not
+/// stop the guest.
+///
+/// # What `RaiseException` has already done
+///
+/// `TranslatorVisitor::RaiseException` emits `SetPC(PC + 4)` before the exception and terminates
+/// the block with `CheckHalt{ReturnToDispatch}`. So the guest `PC` is **already past the hint**
+/// when this callback runs, and simply not halting resumes at the next instruction. There is
+/// nothing to skip and nothing to fix up.
+const fn is_hint(kind: u32) -> bool {
+    matches!(
+        kind,
+        exception::YIELD
+            | exception::WAIT_FOR_EVENT
+            | exception::WAIT_FOR_INTERRUPT
+            | exception::SEND_EVENT
+            | exception::SEND_EVENT_LOCAL
+    )
+}
+
+/// Whether a hint asks the host thread to give up its slice.
+///
+/// `YIELD` and `WFE`/`WFI` are emitted by spin loops -- the guest that made this reachable is
+/// `libroblox.so` at `0x021eba20`, a three-instruction `ldr`/`cbz`/`yield` spin on a guard word
+/// another guest thread owns. Yielding the *host* thread is what the hint is for, and it is the
+/// difference between that loop costing a scheduler slice and costing a core.
+///
+/// `SEV`/`SEVL` signal rather than wait, so they continue immediately.
+const fn hint_yields(kind: u32) -> bool {
+    matches!(
+        kind,
+        exception::YIELD | exception::WAIT_FOR_EVENT | exception::WAIT_FOR_INTERRUPT
+    )
+}
+
 unsafe extern "C" fn cb_exception_raised(ctx: *mut c_void, pc: u64, kind: u32) {
     // SAFETY: `ctx` is this backend's context.
     unsafe {
         with(ctx, (), |c| {
+            if is_hint(kind) {
+                c.hints += 1;
+                if hint_yields(kind) {
+                    std::thread::yield_now();
+                }
+                // **No `stop`.** The block terminated with `CheckHalt{ReturnToDispatch}` and no
+                // halt bit is set, so the dispatcher continues from the PC `RaiseException`
+                // already advanced past the hint.
+                return;
+            }
             let address = pc as GuestAddr;
             let exit = match kind {
                 // The guest branched somewhere `read_code` refused: an instruction fetch from
