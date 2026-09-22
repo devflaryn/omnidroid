@@ -214,6 +214,68 @@ impl Instances {
 
 // ------------------------------------------------------------------------------- the handlers
 
+/// `VK_API_VERSION_1_3`: `VK_MAKE_API_VERSION(0, 1, 3, 0)`.
+pub const ANDROID_13_LOADER_VERSION: u32 = (1 << 22) | (3 << 12);
+
+/// `VkResult vkEnumerateInstanceVersion(uint32_t *pApiVersion)`
+///
+/// **`VK_API_VERSION_1_3`, the Android 13 loader's own answer.** `frameworks/native/vulkan/
+/// libvulkan/api.cpp` at `android-13.0.0_r1` is `*pApiVersion = VK_API_VERSION_1_3; return
+/// VK_SUCCESS;` -- unconditionally: this reports the *loader's* instance-level version, and the
+/// driver's is applied later, when `vkCreateInstance` clamps the requested `apiVersion` to it. So
+/// the host is not asked here, and what the device can really do still comes from the physical
+/// device's properties, which are the host driver's. MEASURED reader: the engine's instance
+/// bootstrap, straight after `vkEnumerateInstanceLayerProperties`.
+pub(super) fn enumerate_instance_version(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    let version_at = guest_pointer(at, "pApiVersion", args[0])?;
+    if version_at == 0 {
+        return Err(at.refuse(format!(
+            "the guest called `vkEnumerateInstanceVersion` from {caller:#x} with \
+             `pApiVersion = NULL`, so there is nowhere to put the version",
+            caller = at.caller
+        )));
+    }
+    c.mem().write_u32(version_at, ANDROID_13_LOADER_VERSION, c.blame(0))?;
+    c.ret().i32(0);
+    Ok(())
+}
+
+/// `VkResult vkEnumerateInstanceLayerProperties(uint32_t *pPropertyCount, VkLayerProperties *pProperties)`
+///
+/// **None: `*pPropertyCount = 0` and `VK_SUCCESS`, and that is this app's true answer.** An
+/// Android loader offers an app the layers in its own native-library directory (and, for a
+/// debuggable app, the ones debug settings name) and nothing else; this APK's `lib/arm64-v8a/`
+/// holds no `libVkLayer_*`, and the release build is not debuggable. So the answer does not
+/// depend on the host at all, and the host driver's own layers -- validation layers included --
+/// must never reach the guest through here. MEASURED reader: the engine's instance bootstrap,
+/// after `vkEnumerateInstanceExtensionProperties`.
+///
+/// `pProperties` is never written: with nothing to report, both halves of the two-call protocol
+/// answer the same count, and a capacity of any size holds all zero of them (`VK_SUCCESS`, not
+/// `VK_INCOMPLETE`). A NULL `pPropertyCount` refuses, as the extension enumerator's does.
+pub(super) fn enumerate_instance_layer_properties(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    let count_at = guest_pointer(at, "pPropertyCount", args[0])?;
+    if count_at == 0 {
+        return Err(at.refuse(format!(
+            "the guest called `vkEnumerateInstanceLayerProperties` from {caller:#x} with \
+             `pPropertyCount = NULL`. The specification requires it to be a valid pointer in both \
+             halves of the two-call protocol, so there is nowhere to put the answer (zero layers)",
+            caller = at.caller
+        )));
+    }
+    c.mem().write_u32(count_at, 0, c.blame(0))?;
+    c.ret().i32(0);
+    Ok(())
+}
+
 /// `VkResult vkEnumerateInstanceExtensionProperties(const char *pLayerName,
 /// uint32_t *pPropertyCount, VkExtensionProperties *pProperties)`
 ///

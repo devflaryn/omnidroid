@@ -236,6 +236,20 @@ impl Fixture {
         self.guest.read_u64(self.guest.data)
     }
 
+    /// An indirect call to `target` with `X0`-`X2` set that must complete: its `X0`.
+    fn call_through(&self, target: u64, args: [u64; 3]) -> u64 {
+        let program = self.program_branching(|asm| {
+            asm.mov(9, target);
+            asm.mov(0, args[0]);
+            asm.mov(1, args[1]);
+            asm.mov(2, args[2]);
+            asm.push(blr(9));
+        });
+        let exit = self.run(program).expect("the call must complete");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+        self.guest.read_u64(self.guest.data)
+    }
+
     /// The refusal an indirect call to `target` produces, with `X0`-`X2` set.
     fn refusal_of_call(&self, target: u64, args: [u64; 3]) -> AbiError {
         let program = self.program_branching(|asm| {
@@ -510,21 +524,16 @@ fn a_null_name_refuses_rather_than_answering_null() {
 
 // ========================================================================= the returned thunks
 
-/// **Calling a returned thunk for an unimplemented function refuses, names it, and quotes what was
-/// passed.**
+/// **A call through a returned thunk is recorded with what was passed, and reaches its function.**
 ///
-/// This is the measurement the whole of stage 1 is built to produce, and stage 2a did not retire
-/// it — it narrowed it. `libroblox.so` stores the pointer at `0x6d3ca8` and reaches it with
-/// `blr x8`, so the thing that says which Vulkan function the engine went to is this refusal
-/// naming it, and the arguments are quoted because whoever implements it next has to marshal them
-/// and a name with no arguments attached is half a report.
-///
-/// `vkEnumerateInstanceLayerProperties` rather than `vkCreateInstance`, because
-/// **`vkCreateInstance` now forwards** — `tests/vulkan_instance.rs` is where it is asserted. The
-/// function chosen here is deliberately one of the specification's five, so that it is a thunk the
-/// engine can really be handed and not a name invented to have something to refuse.
+/// This test used to call `vkEnumerateInstanceLayerProperties` to see an unimplemented thunk
+/// refuse; M6 implemented it (the engine's bootstrap calls it -- an Android app has no layers),
+/// and with it every one of the specification's five null-instance commands is served, so this
+/// hostless fixture can no longer reach an unimplemented one. That refusal -- named, arguments
+/// quoted, no status invented -- is now asserted in `tests/vulkan_instance.rs`, through a
+/// driver-backed instance. What stays here is the recording, which this fixture still reaches.
 #[test]
-fn calling_an_unimplemented_thunk_refuses_by_name_and_quotes_the_arguments() {
+fn a_call_through_a_returned_thunk_is_recorded_with_its_arguments() {
     let _serial = serialized();
     let f = fixture("call", true);
     let (_, entry_point) = f.open_and_fetch();
@@ -532,26 +541,16 @@ fn calling_an_unimplemented_thunk_refuses_by_name_and_quotes_the_arguments() {
     assert_ne!(layers, 0);
 
     assert!(f.vulkan().first_call().is_none(), "nothing has been called yet");
-    let error = f.refusal_of_call(layers, [0x1111, 0x2222, 0x3333]);
-    let text = error.to_string();
-    assert!(
-        text.contains("vkEnumerateInstanceLayerProperties"),
-        "the refusal must name the function: {text}"
-    );
-    assert!(text.contains("x0=0x1111"), "and what the guest passed: {text}");
-    assert!(text.contains("x1=0x2222"), "{text}");
-    assert!(text.contains("x2=0x3333"), "{text}");
-    assert!(text.contains("stage 5"), "and that this is not an implementation: {text}");
-    assert!(
-        text.contains("no status code has been invented"),
-        "and that it is not a plausible VK_SUCCESS: {text}"
-    );
+    let count_at = f.guest.data + 0x700;
+    f.guest.write_u64(count_at, u64::MAX);
+    let result = f.call_through(layers, [count_at as u64, 0, 0x3333]);
+    assert_eq!(result as i32, 0, "VK_SUCCESS: an Android app has no layers");
+    assert_eq!(f.guest.read_u64(count_at) as u32, 0);
 
-    let call = f.vulkan().first_call().expect("the call is recorded before it refuses");
+    let call = f.vulkan().first_call().expect("the call is recorded");
     assert_eq!(call.name.as_deref(), Some("vkEnumerateInstanceLayerProperties"));
     assert_eq!(call.thunk, layers as GuestAddr);
-    assert_eq!(call.args[0], 0x1111);
-    assert_eq!(call.args[1], 0x2222);
+    assert_eq!(call.args[0], count_at as u64);
     assert_eq!(call.args[2], 0x3333);
     assert_eq!(f.vulkan().calls_dropped(), 0);
 }

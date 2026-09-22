@@ -3267,6 +3267,10 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             instance::enumerate_instance_extension_properties(c, &at, &vulkan, args)
         }
         "vkCreateInstance" => instance::create_instance(c, &at, &vulkan, args),
+        "vkEnumerateInstanceLayerProperties" => {
+            instance::enumerate_instance_layer_properties(c, &at, args)
+        }
+        "vkEnumerateInstanceVersion" => instance::enumerate_instance_version(c, &at, args),
         // Stage 3: the substitution that creates an object rather than renaming a string.
         "vkCreateAndroidSurfaceKHR" => surface::create_android_surface(c, &at, &vulkan, args),
         // Stage 3: the queries a renderer makes in order to choose a device.

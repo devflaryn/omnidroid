@@ -545,6 +545,47 @@ fn a_short_array_is_vk_incomplete_and_says_how_much_fitted() {
     assert_eq!(f.read_u32(count_at), 3);
 }
 
+/// **`vkEnumerateInstanceLayerProperties` answers zero layers**, whatever the host driver has --
+/// an Android loader offers an app only its own layers, and this APK ships none -- in both halves
+/// of the two-call protocol, and without writing a byte of `pProperties`.
+#[test]
+fn instance_layers_are_the_apps_none_not_the_hosts() {
+    let _serial = serialized();
+    let f = fixture_with("layers", RecordingHost::windows_like());
+    let entry_point = f.entry_point();
+    let enumerate = f.resolve(entry_point, "vkEnumerateInstanceLayerProperties");
+    let count_at = f.alloc(4);
+    let properties_at = f.alloc(64);
+    f.guest.write_u32(count_at as GuestAddr, 7);
+    f.guest.write_u32(properties_at as GuestAddr, 0xABAB_ABAB);
+    let result = f.call(enumerate, [count_at, 0, 0, 0]).expect("it must complete");
+    assert_eq!(result as i32, VK_SUCCESS);
+    assert_eq!(f.read_u32(count_at), 0, "no layers");
+    f.guest.write_u32(count_at as GuestAddr, 4);
+    let result = f.call(enumerate, [count_at, properties_at, 0, 0]).expect("it must complete");
+    assert_eq!(result as i32, VK_SUCCESS, "all zero of them fitted");
+    assert_eq!(f.read_u32(count_at), 0);
+    assert_eq!(f.read_u32(properties_at), 0xABAB_ABAB, "pProperties untouched");
+    let text = f.refusal(enumerate, [0, 0, 0, 0]).to_string();
+    assert!(text.contains("pPropertyCount = NULL"), "{text}");
+}
+
+/// **`vkEnumerateInstanceVersion` is Android 13's loader: `VK_API_VERSION_1_3`**, whatever the host
+/// driver's own version -- the loader reports itself, and the driver clamps at instance creation.
+#[test]
+fn the_instance_version_is_the_android_13_loaders() {
+    let _serial = serialized();
+    let f = fixture_with("version", RecordingHost::windows_like());
+    let entry_point = f.entry_point();
+    let enumerate = f.resolve(entry_point, "vkEnumerateInstanceVersion");
+    let version_at = f.alloc(4);
+    let result = f.call(enumerate, [version_at, 0, 0, 0]).expect("it must complete");
+    assert_eq!(result as i32, VK_SUCCESS);
+    assert_eq!(f.read_u32(version_at), (1 << 22) | (3 << 12), "1.3.0");
+    let text = f.refusal(enumerate, [0, 0, 0, 0]).to_string();
+    assert!(text.contains("pApiVersion = NULL"), "{text}");
+}
+
 /// **A NULL `pPropertyCount` refuses**, because there is nowhere to put an answer and
 /// `VK_SUCCESS` would claim a count had been written into memory nothing wrote to.
 #[test]
@@ -798,6 +839,32 @@ fn a_loader_with_no_host_refuses_and_names_set_host() {
 }
 
 // ======================================================= vkGetInstanceProcAddr on a real instance
+
+/// **Calling a returned thunk for an unimplemented function refuses, names it, and quotes what
+/// was passed** -- the measurement stage 1 was built to produce, and still the one that says which
+/// Vulkan function the engine went to next. `vkDestroyInstance`, which the recording driver has
+/// and this layer does not yet serve, obtained the way the engine obtains everything past
+/// bootstrap: through a real instance, from the driver. (When it is served, pick another.)
+#[test]
+fn calling_an_unimplemented_thunk_refuses_by_name_and_quotes_the_arguments() {
+    let _serial = serialized();
+    let host = RecordingHost::windows_like();
+    let f = fixture_with("unimplemented", host.clone());
+    let entry_point = f.entry_point();
+    let create = f.resolve(entry_point, "vkCreateInstance");
+    let info = f.create_info(0, &[], &[GUEST_SURFACE_EXTENSION]);
+    let out = f.alloc(8);
+    assert_eq!(f.call(create, [info, 0, out, 0]).expect("create") as i32, VK_SUCCESS);
+    let instance = f.guest.read_u64(out as GuestAddr);
+    let dispatch = f.proc_addr(entry_point, instance, "vkDestroyInstance").expect("a lookup");
+    assert_ne!(dispatch, 0, "the recording driver has it");
+    let text = f.refusal(dispatch, [0x1111, 0x2222, 0x3333, 0]).to_string();
+    assert!(text.contains("vkDestroyInstance"), "the refusal must name the function: {text}");
+    assert!(text.contains("x0=0x1111"), "and what the guest passed: {text}");
+    assert!(text.contains("x1=0x2222"), "{text}");
+    assert!(text.contains("x2=0x3333"), "{text}");
+    assert!(text.contains("stage 5"), "and that this is not an implementation: {text}");
+}
 
 /// **With a real instance, the driver decides: a thunk for what it has, NULL for what it has
 /// not — and never a host function pointer.**
