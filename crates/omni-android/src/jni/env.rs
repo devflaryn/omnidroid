@@ -1705,6 +1705,34 @@ mod tests {
         assert!(state.handles.object_of(id).is_some(), "not freed with the guest's local");
     }
 
+    /// **`StartAppParams.surface()` answers the very `Surface` the host stored**, through the
+    /// accessor the engine calls -- identity, not a new object of the same class, because the
+    /// engine turns it into the `ANativeWindow` the window came from. And a field that is not an
+    /// object-typed instance field of the holder's class is refused by name.
+    #[test]
+    fn an_accessor_answered_by_a_stored_field_returns_the_stored_object() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let surface = jni.new_object("android/view/Surface").expect("a Surface");
+        let params =
+            jni.new_object("com/roblox/engine/jni/autovalue/StartAppParams").expect("params");
+        jni.set_object_field(params, "surface", surface).expect("stored");
+        assert!(jni.set_object_field(params, "vrContext", surface).is_err(), "not a field");
+
+        let mut state = jni.state();
+        let class = state.registry.find("com/roblox/engine/jni/autovalue/StartAppParams").unwrap();
+        let method = state.registry.method(class, "surface", "()Landroid/view/Surface;", false).unwrap();
+        let member = state.registry.member(method).unwrap().clone();
+        let receiver = state.handles.resolve_id("test", 0, params).unwrap();
+        let expected = state.handles.resolve_id("test", 0, surface).unwrap();
+        // The host's own local goes; the field's anchor keeps the object.
+        state.handles.delete("DeleteLocalRef", 0, RefKind::Local, surface).expect("deleted");
+        let got = evaluate(&mut state, "CallObjectMethodV", 0, class, &member, Some(receiver), &[])
+            .expect("answered");
+        assert_eq!(got, Value::Object(Some(expected)), "the same object, still alive");
+        assert!(state.handles.object_of(expected).is_some(), "kept alive by the field");
+    }
+
     /// **`System.identityHashCode` is a function of the object, not of the handle**, and `null`
     /// is 0.
     ///

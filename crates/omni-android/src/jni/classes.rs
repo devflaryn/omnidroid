@@ -963,17 +963,29 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "com/roblox/engine/jni/user/NativeUserJavaInterface",
         tier: Tier::One,
         methods: &[
-            // Signed out is the state this runtime starts in, and every one of these is what a
-            // device answers for a signed-out app. Not a stub: the host defines the user, and
-            // there is no user.
-            s("getUserId", "()J", Answer::Long(0)),
+            // **Signed out on a fresh install, as the APK's own code answers it -- DECODED, and
+            // four of these were wrong until it was.** The comment here used to say every value
+            // was "what a device answers for a signed-out app"; for `getUserId` (0), `getIsUnder13`
+            // (false), `getTheme` ("Dark") and `getPlatformName` ("Android") it was not, and the
+            // engine said so: with a user id of 0 it took `SingleSurfaceApp::userDidLogin` and
+            // dereferenced null at `0x2256548`, on the first run that started the Lua app.
+            //
+            // The chain, from `classes2.dex`: every one of these delegates to `sImplementation`,
+            // which `ej.b.m` sets to a `wi.c`, which reads the session singleton `ok.c` -- and
+            // `ok.c.<init>` sets the user id to **-1** and under-13 to **true**; only `ok.c.v(J)`,
+            // the login path, changes the id. The username and display name are `null` there and
+            // answered as ""; membership 0; subscription false; the theme is `ok.c.k`, which
+            // `<clinit>` sets to `wl.a.LIGHT`, whose `toString()` is "Light"; the alternate name
+            // is `wi.c.a()`'s literal ""; and `getPlatformName` is `bl.a.d()`, which `wi.c` does
+            // not override, returning "".
+            s("getUserId", "()J", Answer::Long(-1)),
             s("getUsername", "()Ljava/lang/String;", Answer::Text("")),
             s("getDisplayName", "()Ljava/lang/String;", Answer::Text("")),
             s("getAlternateName", "()Ljava/lang/String;", Answer::Text("")),
-            s("getIsUnder13", "()Z", Answer::Bool(false)),
+            s("getIsUnder13", "()Z", Answer::Bool(true)),
             s("getMembershipType", "()I", Answer::Int(0)),
-            s("getTheme", "()Ljava/lang/String;", Answer::Text("Dark")),
-            s("getPlatformName", "()Ljava/lang/String;", Answer::Text("Android")),
+            s("getTheme", "()Ljava/lang/String;", Answer::Text("Light")),
+            s("getPlatformName", "()Ljava/lang/String;", Answer::Text("")),
             s("getHasRobloxSubscription", "()Z", Answer::Bool(false)),
         ],
         fields: NONE,
@@ -1448,6 +1460,35 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: &[s("identityHashCode", "(Ljava/lang/Object;)I", Answer::IdentityHash)],
         fields: NONE,
     },
+    // ---- §8 row 23: what `nativeAppBridgeV2StartAppWithParams` reads ----------------------
+    //
+    // **Three accessors, decoded, and no more**: the native at `0x258b144` calls `surface()`,
+    // `platformParams()` and `vrContext()` through its accessor helper (`0x2335e34`: GetObjectClass,
+    // GetMethodID, Call) and nothing else -- `appStarterPlace` and its six siblings are not even
+    // strings in `libroblox.so`. The Java side (`fi.e.F`, from the record `fi.o.b` fills) sets
+    // them; the engine does not read them here, so they are left to the generated surface's
+    // Unanswered rather than given values nothing consumes.
+    //
+    // `surface()` and `platformParams()` answer what the host stored in the instance -- the same
+    // `Surface` the window came from, which is the point -- and `vrContext()` is `null`, which is
+    // what `fi.e.F` passes on a device that is not VR (`bh.x0.D0()` false skips `setVrContext`).
+    ClassSpec {
+        name: "com/roblox/engine/jni/autovalue/StartAppParams",
+        tier: Tier::One,
+        methods: &[
+            m("surface", "()Landroid/view/Surface;", Answer::Field("surface")),
+            m(
+                "platformParams",
+                "()Lcom/roblox/engine/jni/model/PlatformParams;",
+                Answer::Field("platformParams"),
+            ),
+            m("vrContext", "()Landroid/app/Activity;", Answer::Null),
+        ],
+        fields: &[
+            f("surface", "Landroid/view/Surface;", Answer::Null),
+            f("platformParams", "Lcom/roblox/engine/jni/model/PlatformParams;", Answer::Null),
+        ],
+    },
     // ---- the platform dialog handler the settings success path registers -----------------
     //
     // **MEASURED, M6's gate, 2 of 2 runs**: the thread carrying the client-settings fetch logged
@@ -1548,7 +1589,7 @@ mod tests {
         // and this is the assertion that a merge in the wrong order would fail.
         let id = registry.find("com/roblox/engine/jni/user/NativeUserJavaInterface").expect("declared");
         let method = registry.method(id, "getUserId", "()J", true).expect("declared");
-        assert_eq!(registry.member(method).expect("declared").answer, Answer::Long(0));
+        assert_eq!(registry.member(method).expect("declared").answer, Answer::Long(-1));
         // And a member only the generated surface has resolves, with no answer decided.
         let id = registry.find("org/fmod/FMOD").expect("the generated surface declares it");
         assert!(registry.class(id).expect("declared").methods.iter().any(|m| m.answer == Answer::Unanswered));

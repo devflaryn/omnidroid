@@ -799,6 +799,58 @@ impl Jni {
         )
     }
 
+    /// Store `value` in the instance field `field` of `object`, as the Java side's constructor
+    /// or builder would have -- for the parameter objects a host builds and the engine reads back
+    /// through an accessor answered [`classes::Answer::Field`].
+    ///
+    /// **The stored object is anchored by a global reference this instance keeps**, because a
+    /// Java field keeps its referent alive: a host that deleted its own local afterwards must not
+    /// leave the field naming a freed slot. The anchor is never released -- a field is never
+    /// cleared here -- which bounds the cost at one reference per call; hosts call this a handful
+    /// of times per surface, not per frame.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] when `object` is not an instance, or its class declares no
+    /// instance field `field` of an object type; [`AbiError::JniBadHandle`] for a handle this
+    /// instance did not issue.
+    pub fn set_object_field(&self, object: u64, field: &str, value: u64) -> AbiResult<()> {
+        const NAME: &str = "Jni::set_object_field";
+        let mut state = self.state.lock();
+        let holder = state.handles.resolve_id(NAME, self.arena, object)?;
+        let held = state.handles.resolve_id(NAME, self.arena, value)?;
+        let class = match state.handles.object_of(holder) {
+            Some(refs::Object::Instance { class, .. }) => *class,
+            _ => {
+                return Err(AbiError::JniRefused {
+                    function: NAME.to_string(),
+                    address: self.arena,
+                    detail: "the holder is not an instance of a declared class".to_string(),
+                })
+            }
+        };
+        let Some(index) = state.registry.class(class).and_then(|c| {
+            c.fields.iter().position(|f| f.name == field && !f.is_static && f.descriptor.starts_with('L'))
+        }) else {
+            return Err(AbiError::JniRefused {
+                function: NAME.to_string(),
+                address: self.arena,
+                detail: format!(
+                    "`{}` declares no object-typed instance field `{field}`",
+                    state.registry.class_name(class)
+                ),
+            });
+        };
+        let _anchor = state.handles.reference_to(NAME, self.arena, refs::RefKind::Global, held)?;
+        if let Some(refs::Object::Instance { fields, .. }) = state.handles.object_of_mut(holder) {
+            fields.insert(
+                classes::FieldId { class, member: index as u16 },
+                values::Value::Object(Some(held)),
+            );
+        }
+        Ok(())
+    }
+
     /// A **local reference to the `jclass`** of a declared class.
     ///
     /// What a `static` native method's second argument is: JNI hands a static native
