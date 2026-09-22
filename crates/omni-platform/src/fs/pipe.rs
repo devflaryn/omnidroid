@@ -222,6 +222,19 @@ impl Pipe {
         self.state().queue.len()
     }
 
+    /// How many descriptors still hold the write end.
+    ///
+    /// **The fact an indefinite wait is decided on**, which is why it is a count rather than a
+    /// boolean derived from this pipe's readiness table. A read end's `hangup` conflates two
+    /// states — *no writer and nothing buffered* — so `!hangup` is true both for a pipe someone
+    /// can still write to and for one whose last writer left bytes behind. A caller asking
+    /// "can this ever change again?" needs the first of those and not the second, and there is
+    /// no way back to it from the readiness table.
+    #[must_use]
+    pub fn writers(&self) -> usize {
+        self.state().writers
+    }
+
     /// Readiness of one end of this pipe, by the table in this module's documentation.
     fn readiness(&self, end: PipeEnd) -> Readiness {
         let state = self.state();

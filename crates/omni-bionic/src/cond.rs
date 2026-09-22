@@ -236,6 +236,39 @@ pub fn init(
     Ok(0)
 }
 
+/// Which clock `pthread_cond_timedwait`'s absolute deadline is measured against, as
+/// [`clock_id`] numbers it.
+///
+/// **This reads back what [`init`] wrote**, and it exists because the alternative is worse. A
+/// `timedwait` is given an *absolute* time; turning that into a relative sleep requires knowing
+/// which clock it is absolute in, and bionic keeps the answer in a bit of its own
+/// `pthread_cond_t` state word. This crate does not model bionic's bit layout -- there is no
+/// bionic source on the development host to check it against, and a guessed bit is the kind of
+/// evidence `docs/VERIFICATION.md` entry 10 is about. It keeps the selector in a field it
+/// defined, at `cond + 4`, so reading it back is reading this crate's own convention rather than
+/// reconstructing another implementation's.
+///
+/// An all-zero struct is `PTHREAD_COND_INITIALIZER`, which is `CLOCK_REALTIME` — so a statically
+/// initialised cond answers correctly without ever having been through [`init`].
+///
+/// # Errors
+///
+/// [`crate::memory::Fault`] for a `cond_addr` the guest cannot own, and `Err` of the inner
+/// `Result` carrying `EINVAL` for a selector this crate never writes.
+pub fn clock_of(
+    mem: &mut impl GuestMemory,
+    cond_addr: u64,
+) -> Result<Result<i32, i32>, crate::memory::Fault> {
+    check_range(cond_addr, sizes::PTHREAD_COND_T)?;
+    let mut b = [0u8; 4];
+    mem.read(cond_addr + 4, &mut b)?;
+    Ok(match u32::from_le_bytes(b) {
+        clock_sel::REALTIME => Ok(clock_id::CLOCK_REALTIME),
+        clock_sel::MONOTONIC => Ok(clock_id::CLOCK_MONOTONIC),
+        _ => Err(consts::EINVAL),
+    })
+}
+
 /// `pthread_cond_destroy`: validates, zeroes the struct (the canonical dead
 /// state) and wakes any registered stragglers so a buggy waiter fails fast
 /// instead of hanging. POSIX leaves destroy-with-waiters undefined.

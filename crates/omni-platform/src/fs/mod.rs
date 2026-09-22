@@ -731,6 +731,28 @@ impl Filesystem {
         }
     }
 
+    /// How many descriptors in **this instance** still hold the write end of the pipe `fd` is an
+    /// end of, or `None` when `fd` is not a pipe.
+    ///
+    /// # Why a caller wants this and not `readiness`
+    ///
+    /// It is the fact an *indefinite* wait is decided on. `ALooper_pollOnce(-1)` and `poll(fds,
+    /// n, -1)` are legitimate exactly when something in this runtime can still make the
+    /// descriptor ready; for a pipe read end, that is a write end still being open. The readiness
+    /// table cannot answer it — a read end reports `hangup` only when it has *both* no writer and
+    /// nothing buffered, so `!hangup` is also true for a pipe whose last writer has gone and left
+    /// bytes behind, which is a wait that ends once and then never again.
+    ///
+    /// **A count and not a boolean**, so the caller states its own threshold and a reader of the
+    /// call site can see which one it chose.
+    #[must_use]
+    pub fn pipe_writers(&self, fd: i32) -> Option<usize> {
+        match self.table().open.get(&fd) {
+            Some(Entry::Pipe(handle)) => Some(handle.pipe().writers()),
+            _ => None,
+        }
+    }
+
     /// Whether `O_NONBLOCK` is set on `fd`.
     ///
     /// Only a pipe can carry the flag here, because only a pipe can block. For every other kind

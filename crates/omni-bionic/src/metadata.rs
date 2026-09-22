@@ -260,6 +260,64 @@ pub fn sched_yield(y: &impl Yield) -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// scheduling policy
+// ---------------------------------------------------------------------------
+
+/// The `SCHED_*` policy numbers, as Linux's `sched.h` fixes them for every architecture.
+///
+/// They are the **guest's** ABI: `libroblox.so` was compiled against these, which is the same
+/// provenance the `O_*` flags and the `POLL*` bits carry.
+pub mod sched_policy {
+    /// `SCHED_OTHER`, the ordinary time-sharing policy.
+    pub const OTHER: i32 = 0;
+    /// `SCHED_FIFO`, real-time, run-until-you-yield.
+    pub const FIFO: i32 = 1;
+    /// `SCHED_RR`, real-time, round-robin.
+    pub const RR: i32 = 2;
+    /// `SCHED_BATCH`.
+    pub const BATCH: i32 = 3;
+    /// `SCHED_IDLE`.
+    pub const IDLE: i32 = 5;
+}
+
+/// `int sched_get_priority_max(int policy)`
+///
+/// Linux's answer, which is a **constant per policy** and not a property of the machine: 99 for
+/// the two real-time policies and 0 for every other. That is why this is pure computation in this
+/// crate rather than a question for the host — a host that answered from its own scheduler would
+/// be describing Windows' priority classes to a guest that reasons in Linux's numbers.
+///
+/// `-1` for a policy Linux does not define; the caller is expected to set `EINVAL` alongside it.
+///
+/// # What the guest does with it, MEASURED
+///
+/// Both call sites in `libroblox.so` pass `SCHED_FIFO`. At guest `0x054e0260`/`0x054e026c` it
+/// takes the min and the max, rejects `-1` from either, and then requires
+/// **`max - min >= 3`** (`sub w8, w0, w20; cmp w8, #3; b.lt`) — it is sizing a band of real-time
+/// priorities. Linux's 1..99 satisfies that; a pair this layer invented would silently decide
+/// whether a whole scheduling strategy in the engine turns itself on.
+#[must_use]
+pub fn sched_get_priority_max(policy: i32) -> i32 {
+    match policy {
+        sched_policy::FIFO | sched_policy::RR => 99,
+        sched_policy::OTHER | sched_policy::BATCH | sched_policy::IDLE => 0,
+        _ => -1,
+    }
+}
+
+/// `int sched_get_priority_min(int policy)`
+///
+/// The mirror of [`sched_get_priority_max`]: 1 for the real-time policies, 0 for the rest.
+#[must_use]
+pub fn sched_get_priority_min(policy: i32) -> i32 {
+    match policy {
+        sched_policy::FIFO | sched_policy::RR => 1,
+        sched_policy::OTHER | sched_policy::BATCH | sched_policy::IDLE => 0,
+        _ => -1,
+    }
+}
+
 fn check_range(addr: u64, len: u64) -> Result<(), crate::memory::Fault> {
     if addr == 0 {
         return Err(crate::memory::Fault(0));

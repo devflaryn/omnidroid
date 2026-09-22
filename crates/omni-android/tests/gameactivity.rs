@@ -40,7 +40,10 @@ use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
 use omni_android::jni::{script, slots, Jni};
 use omni_android::ndk::assets::{AssetSource, ASSET_MANAGER_CLASS};
-use omni_android::ndk::{DeviceConfiguration, Ndk, ScreenSize, ACONFIGURATION_NAVHIDDEN_NO};
+use omni_android::ndk::{
+    DeviceConfiguration, Ndk, ScreenSize, WindowGeometry, ACONFIGURATION_NAVHIDDEN_NO,
+    SURFACE_CLASS,
+};
 use omni_android::{Boundary, BoundaryBuilder, GuestArg};
 use omni_cpu::dynarmic::{DynarmicBackend, DynarmicCpu, DynarmicOptions};
 use omni_cpu::{GuestAddr, GuestCpu, RunLimit, XReg};
@@ -96,6 +99,47 @@ const GUEST_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 /// on a condition variable executes no guest instructions, so [`STEP_13_BUDGET`] can never expire
 /// for it. That is §8.1's fifth failure mode, and it is why this number exists at all.
 const WATCHDOG_SECONDS: u64 = 180;
+
+/// The class the 23 non-exported `GameActivity` natives are registered against.
+///
+/// **`GameActivity`, not [`ACTIVITY_CLASS`].** `RegisterNatives` names the class that *declares*
+/// the method, and §4.1 read the `JNINativeMethod[24]` array out of the GameActivity glue; the
+/// receiver those natives are then called on is a `MainGameActivity`, which is a different
+/// statement and is [`ACTIVITY_CLASS`]'s.
+const GAME_ACTIVITY_CLASS: &str = "com/google/androidgamesdk/GameActivity";
+
+/// What this host tells the engine its surface is, in pixels.
+///
+/// **A decision, and the first one this project has made about a window.** `ndk::window` refuses
+/// `ANativeWindow_getWidth`/`_getHeight` until an embedding says, so that a device profile nobody
+/// chose cannot leak in through a default. This gate is an embedding and it chooses a size a
+/// *desktop* window can have: the runtime presents in a resizable host window, not on a phone
+/// panel, and picking 1080x2400 here would be inventing a device to be.
+///
+/// It is deliberately **not** derived from [`device_configuration`]'s 411x731 dp. Those are
+/// `AConfiguration`'s density-independent numbers, which the engine reads for layout; these are
+/// surface pixels, which it reads for a framebuffer. Deriving one from the other would require a
+/// density this host has not measured either.
+const SURFACE_WIDTH: i32 = 1280;
+/// Pixels down. See [`SURFACE_WIDTH`].
+const SURFACE_HEIGHT: i32 = 720;
+
+/// Guest instructions **one §8 row 17-20 lifecycle native** is allowed.
+///
+/// Generous for the same reason [`STEP_13_BUDGET`] is: `onSurfaceCreatedNative` posts
+/// `APP_CMD_INIT_WINDOW` and then *waits* for the game thread to take the window, and everything
+/// the engine does with that window in between is charged to this thread's budget only if it runs
+/// on this thread — which it does not — but the wait itself is bounded by the watchdog and not by
+/// this. Counted rather than `Unlimited` for D16's reason, and below `i64::MAX` for its footgun.
+const LIFECYCLE_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
+
+/// How long the game thread is left to run on what §8 rows 17-20 handed it.
+///
+/// **The measurement is on the other thread.** `report` taking its census the instant step 13
+/// returned is already recorded as a measurement of nothing; this is the same hazard one
+/// lifecycle along, and the remedy is to let the thread that does the work do some of it. Ended
+/// early when no guest thread is left, because a dead thread will not produce more evidence.
+const POST_ROWS_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// What the host says `ro.build.version.sdk` is.
 ///
@@ -810,6 +854,232 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
 
     // The game thread exists and did its own `ALooper_prepare`: two loopers, not one.
     assert!(guest.ndk.live_loopers() >= 2, "§5.2 android_app_entry prepares the game thread's own");
+
+    // ---- §8 rows 17-20: the lifecycle and surface callbacks, driven from this thread ---------
+    //
+    // **This is what ART does, and nothing else can do it.** The game thread is inside
+    // `NativeEngine::GameLoop()` blocked in `ALooper_pollOnce(-1)`, waiting for the *main* thread
+    // to post `APP_CMD_INIT_WINDOW` down the pipe `initializeNativeCode` created. On a device the
+    // poster is `GameActivity.surfaceCreated`/`surfaceChanged`/`onStart`/`onResume`/
+    // `onWindowFocusChanged`/`onGlobalLayout`; here it is this block, called exactly the way
+    // step 13 is called.
+    //
+    // The natives are **not exported symbols**. §4.1: of the 24 `GameActivity` natives only
+    // `initializeNativeCode` has a `Java_*` export; the other 23 live in the `JNINativeMethod[24]`
+    // array at `.data.rel.ro 0x062dc1c8` and arrive through `RegisterNatives`. So they are looked
+    // up in what the engine itself registered, which is also the assertion that the registration
+    // happened at all.
+    //
+    // **The `jlong` handle sits in `x2` whether or not the method is static**, because JNI's
+    // second argument is a `jobject` for an instance native and a `jclass` for a static one and
+    // both occupy one register. That is why this passes `(env, thiz, handle, ..)` without having
+    // to establish which these are — a distinction `RegisterNatives` does not carry.
+    let game_activity_natives: Vec<omni_android::jni::Registration> = guest
+        .jni
+        .registrations()
+        .into_iter()
+        .filter(|r| r.class == GAME_ACTIVITY_CLASS)
+        .collect();
+    assert!(
+        !game_activity_natives.is_empty(),
+        "§4.1: the engine's own `RegisterNatives` binds the 23 non-exported GameActivity natives, \
+         and none was recorded. Everything below drives them, so an empty list is the measurement \
+         and not a missing fixture. All registrations: {:?}",
+        guest.jni.registrations()
+    );
+    {
+        let mut out = std::io::stderr();
+        let _ = writeln!(
+            out,
+            "\n§4.1 GameActivity natives registered: {}",
+            game_activity_natives.len()
+        );
+        for r in &game_activity_natives {
+            let _ = writeln!(out, "  {}{} -> {:#x}", r.member, r.descriptor, r.function);
+        }
+        let _ = out.flush();
+    }
+    let native = |member: &str, descriptor: &str| -> GuestAddr {
+        game_activity_natives
+            .iter()
+            .find(|r| r.member == member && r.descriptor == descriptor)
+            .unwrap_or_else(|| {
+                panic!(
+                    "§4.1 names `{member}{descriptor}` among the 24 GameActivity natives, and the \
+                     engine's `RegisterNatives` did not bind it. Bound: {:?}",
+                    game_activity_natives
+                        .iter()
+                        .map(|r| format!("{}{}", r.member, r.descriptor))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .function
+    };
+
+    // **The geometry is a decision, and this is the embedding that gets to make it.**
+    // `ndk::window` refuses `ANativeWindow_getWidth`/`_getHeight` until a host says what the
+    // surface is, precisely so that a number nobody chose cannot leak in. This gate is a host, so
+    // it chooses — and it chooses a size a desktop window can actually have, not a device
+    // profile, because the window this runtime will present in is a resizable host window.
+    guest.ndk.set_window_geometry(
+        WindowGeometry::new(SURFACE_WIDTH, SURFACE_HEIGHT).expect("a positive geometry"),
+    );
+    let surface = {
+        let _jni = guest.jni.activate().expect("publish the JNI instance");
+        guest.jni.new_object(SURFACE_CLASS).expect("a Java Surface")
+    };
+
+    // The watchdog is re-armed, because **row 17 blocks**. The GameActivity glue's
+    // `android_app_set_window` writes `APP_CMD_INIT_WINDOW` and then waits on its own condition
+    // variable until the game thread has taken the window — so this call cannot return until the
+    // poll this session just made possible actually wakes. A hang here is the same failure §8.1's
+    // fifth mode names, one lifecycle step along.
+    let rows_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let rows_done = Arc::clone(&rows_done);
+        let bionic = Arc::clone(&guest.bionic);
+        let ndk = Arc::clone(&guest.ndk);
+        let boundary = Arc::clone(&guest.boundary);
+        std::thread::spawn(move || {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(WATCHDOG_SECONDS);
+            while std::time::Instant::now() < deadline {
+                if rows_done.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if rows_done.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let mut out = std::io::stderr();
+            let _ = writeln!(
+                out,
+                "\n================ M6 WATCHDOG: §8 rows 17-20 did not finish in \
+                 {WATCHDOG_SECONDS} s ================\n\
+                 last import: {:?}\n\
+                 live guest threads: {}\n\
+                 PARKED:",
+                boundary.last_call().map(|slot| slot.symbol.clone()),
+                bionic.live_guest_threads(),
+            );
+            for held in bionic.parked() {
+                let _ = writeln!(
+                    out,
+                    "  thread {:?} in `{}` on cond {:#x} holding mutex {:#x} for {:?}",
+                    held.thread, held.symbol, held.cond, held.mutex, held.waiting
+                );
+            }
+            let _ = writeln!(out, "LOOPER EVENTS ({} dropped):", ndk.events_dropped());
+            for event in ndk.events().iter().rev().take(60).rev() {
+                let _ = writeln!(
+                    out,
+                    "  thread {} {:<10} looper {:#x}: {}",
+                    event.thread, event.what, event.looper, event.detail
+                );
+            }
+            let _ = writeln!(out, "NDK CENSUS: {:?}", ndk.census());
+            let _ = writeln!(out, "================ ending the run ================");
+            let _ = out.flush();
+            std::process::exit(101);
+        });
+    }
+
+    // Row order is `GameActivity`'s own lifecycle order, which §4.2 read out of dex bytecode:
+    // `surfaceCreated` → `surfaceChanged` → `onStart`/`onResume` → `onWindowFocusChanged` →
+    // `onGlobalLayout` → the insets callback. Each is reported before the next is attempted, so a
+    // run that stops names the row it stopped on rather than the block.
+    let rows: Vec<(&str, &str, Vec<GuestArg>)> = vec![
+        (
+            "onSurfaceCreatedNative",
+            "(JLandroid/view/Surface;)V",
+            vec![GuestArg::Int(surface)],
+        ),
+        (
+            "onSurfaceChangedNative",
+            "(JLandroid/view/Surface;III)V",
+            vec![
+                GuestArg::Int(surface),
+                // `PixelFormat.RGBA_8888`. The one format this runtime can present and the one
+                // `omni-texture` transcodes into; a value nothing here can produce would be a
+                // number invented for a field the engine reads.
+                GuestArg::Int(1),
+                GuestArg::Int(SURFACE_WIDTH as u64),
+                GuestArg::Int(SURFACE_HEIGHT as u64),
+            ],
+        ),
+        ("onStartNative", "(J)V", vec![]),
+        ("onResumeNative", "(J)V", vec![]),
+        ("onWindowFocusChangedNative", "(JZ)V", vec![GuestArg::Int(1)]),
+        (
+            "onContentRectChangedNative",
+            "(JIIII)V",
+            vec![
+                GuestArg::Int(0),
+                GuestArg::Int(0),
+                GuestArg::Int(SURFACE_WIDTH as u64),
+                GuestArg::Int(SURFACE_HEIGHT as u64),
+            ],
+        ),
+        ("onWindowInsetsChangedNative", "(J)V", vec![]),
+    ];
+    let mut row_outcomes: Vec<(String, Result<(), String>)> = Vec::new();
+    for (member, descriptor, tail) in rows {
+        let target = native(member, descriptor);
+        let mut args = vec![
+            GuestArg::Pointer(guest.jni.env_for(0)),
+            GuestArg::Int(thiz),
+            GuestArg::Int(native_code),
+        ];
+        args.extend(tail);
+        let result = {
+            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+            let _jni = guest.jni.activate().expect("publish the JNI instance");
+            let _ndk = guest.ndk.activate();
+            guest.boundary.call_guest(&mut cpu, member, target, &args, LIFECYCLE_BUDGET)
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "§8 row: {member} -> {}",
+            match &result {
+                Ok(_) => "returned".to_string(),
+                Err(error) => format!("{error}"),
+            }
+        );
+        let failed = result.is_err();
+        row_outcomes.push((
+            member.to_string(),
+            result.map(|_| ()).map_err(|error| error.to_string()),
+        ));
+        if failed {
+            // **Stop at the first failure, because the next row would not be evidence.** These
+            // natives go through the glue's `android_app_set_activity_state`/`set_window`, which
+            // take `android_app->mutex` and release it on the way out. A refusal unwinds out of
+            // the guest *inside* that critical section, so the mutex stays held -- MEASURED: the
+            // run that first met `pthread_cond_timedwait` refused inside `onStartNative` and then
+            // hung for the whole watchdog in `onResumeNative`, on a lock the refusal had
+            // abandoned. Continuing would report a deadlock caused by the harness as though it
+            // were the engine's.
+            let _ = writeln!(
+                std::io::stderr(),
+                "§8 rows: stopping at `{member}`; the glue holds its own mutex across these calls, \n                 so a later row would be waiting on a lock this refusal abandoned"
+            );
+            break;
+        }
+    }
+    rows_done.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // **Let the game thread run on what it was just handed.** The lifecycle calls above post
+    // commands; what the engine does with them happens on the other thread, and a measurement
+    // taken the instant the last one returns is a measurement of nothing — the same mistake
+    // `report` made before `join_guest_threads` was added below it.
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < POST_ROWS_SETTLE {
+        if guest.bionic.live_guest_threads() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     // ---- teardown, which is not a formality --------------------------------------------------
     //

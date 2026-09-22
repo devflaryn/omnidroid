@@ -199,6 +199,40 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          engine carries that code's own diagnostic \"Failure writing android_app cmd: %s\" in \
          .rodata.",
     ),
+    (
+        "pthread_cond_timedwait",
+        "M6 gate, found the way an Unbound is meant to be found: driving the row 19 \
+         lifecycle native stopped inside `onStartNative` naming this symbol. Decoded \
+         afterwards at guest 0x0285f7ec -- the GameActivity glue \
+         `android_app_set_activity_state`, which writes the APP_CMD byte and then waits for \
+         the game thread to acknowledge it, on an absolute CLOCK_REALTIME deadline two \
+         seconds out. Its `cmp w0, #0x6e` is the guest own agreement with omni_bionic \
+         ETIMEDOUT. jni-surface.md section 8 row 19.",
+    ),
+    (
+        "sched_get_priority_max",
+        "M6 gate, as an Unbound that killed a guest thread during the settle after the row \
+         17-20 lifecycle natives. Two call sites, both passing SCHED_FIFO: 0x022077e8 and \
+         0x054e026c.",
+    ),
+    (
+        "sched_get_priority_min",
+        "M6, by DECODING rather than by a run reaching it -- `pipe`, `fcntl` and `write` \
+         provenance, and it is stated because the distinction matters. The site at \
+         0x054e0260 calls it two instructions before the `sched_get_priority_max` at \
+         0x054e026c, with no branch between, and then requires `max - min >= 3` before it \
+         will use the band at all. The site that actually fired was the other one \
+         (0x022077e8) -- this one would have refused at _min first -- so this symbol has not \
+         yet been reached by a run: what is claimed here is a decoded call site, not an \
+         observation.",
+    ),
+    (
+        "sched_setscheduler",
+        "M6, by decoding. It is three instructions after the `sched_get_priority_max` at \
+         0x022077e8, in the same basic block with no branch between, so the run that reached \
+         that one reaches this one next. It answers -1/EPERM, which is what a device answers \
+         an app without CAP_SYS_NICE, and the call site ignores the result.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -249,7 +283,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 181, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 185, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -271,7 +305,7 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // a new one: M4's gate recorded `nativeInitFastLog` failing on it by name.
     // Each of the thirteen is a symbol `libroblox.so` imports that the static closure did not
     // predict. D17 says 188 is a lower bound; this is by how much, so far.
-    assert_eq!(Bionic::inline_symbols().count(), 167);
+    assert_eq!(Bionic::inline_symbols().count(), 171);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to

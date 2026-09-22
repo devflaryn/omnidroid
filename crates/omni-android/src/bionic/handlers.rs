@@ -44,6 +44,7 @@
 
 use std::sync::Arc;
 
+use omni_bionic::context::GuestContext;
 use omni_bionic::error::BionicError;
 use omni_bionic::memory::Fault;
 use omni_mem::GuestAddr;
@@ -402,6 +403,33 @@ handlers! {
     /// `int sched_yield(void)`
     fn sched_yield() -> i32 = |v| omni_bionic::metadata::sched_yield(&v.active.bionic.yielder);
 
+    /// `int sched_get_priority_max(int policy)` -- Linux's constant per policy.
+    fn sched_get_priority_max(policy: i32) -> i32 =
+        |v| omni_bionic::metadata::sched_get_priority_max(policy);
+
+    /// `int sched_get_priority_min(int policy)` -- the mirror of the above.
+    fn sched_get_priority_min(policy: i32) -> i32 =
+        |v| omni_bionic::metadata::sched_get_priority_min(policy);
+
+    /// `int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param)`
+    ///
+    /// **`-1`/`EPERM`, which is what a device answers**, not a refusal and not a lie. At guest
+    /// `0x022077fc` the engine asks for `SCHED_FIFO` on itself, three instructions after taking
+    /// `sched_get_priority_max(SCHED_FIFO)`; an ordinary Android application has no
+    /// `CAP_SYS_NICE`, so the kernel refuses that call and the app runs at its normal policy.
+    /// That is the answer on every non-rooted device, so returning it is modelling the platform
+    /// rather than papering over a gap -- and the call site **ignores the result**, which is what
+    /// a caller written for a request it expects to be denied looks like.
+    ///
+    /// Answering `0` would be the believable wrong answer: the engine would then believe its
+    /// render or audio thread runs at real-time priority, and every latency decision downstream
+    /// of that belief would be made on it.
+    fn sched_setscheduler(pid: i32, policy: i32, param: ptr) -> i32 = |v| {
+        let _ = (pid, policy, param);
+        v.set_errno(omni_bionic::errno::consts::EPERM);
+        -1
+    };
+
     /// `int *__errno(void)` — the address of **this** guest thread's `errno`.
     fn errno_location() -> u64 = |v| v.errno_address() as u64;
 
@@ -635,6 +663,135 @@ pub(super) fn pthread_cond_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 )?;
                 omni_bionic::cond::wait_end(
                     &threads, conds, cond, mutex, &mut view, futex, None,
+                )
+            })
+        });
+        Lift::lift(produced, &view)?
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
+/// `int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *abs)`
+///
+/// [`pthread_cond_wait`] with a deadline, and everything that makes that call correct — the
+/// registration before the release, the relock on every exit path, the park record — is the same
+/// here because it is the same two calls into `omni-bionic`. The only thing this adds is turning
+/// an **absolute** deadline into the relative duration `cond::wait_end` takes.
+///
+/// # What the engine actually calls this for, MEASURED
+///
+/// `jni-surface.md` §8 rows 19-20 go through the GameActivity glue's
+/// `android_app_set_activity_state`, at guest `0x0285f760`, and this was decoded from the binary
+/// rather than from a header:
+///
+/// ```text
+/// 0x285f794: bl  pthread_mutex_lock        ; app + 0xc8
+/// 0x285f7a8: bl  write                     ; app->msgwrite, &cmd, 1
+/// 0x285f7bc: bl  clock_gettime             ; w0 = 0  -> CLOCK_REALTIME
+/// 0x285f7cc: add x8, x8, #2                ; ts.tv_sec += 2
+/// 0x285f7ec: bl  pthread_cond_timedwait    ; (app + 0xf0, app + 0xc8, &ts)
+/// 0x285f7f0: cmp w0, #0x6e                 ; ETIMEDOUT == 110
+/// ```
+///
+/// So the deadline is absolute, two seconds out, and on `CLOCK_REALTIME` — and the `cmp w0,
+/// #0x6e` is independent confirmation of `omni_bionic::errno::ETIMEDOUT`, from the guest that has
+/// to agree with it.
+///
+/// **The clock is read back from the cond rather than assumed to be that one**, because the
+/// binary also imports `pthread_condattr_setclock` and uses it once, off this path. `cond::init`
+/// records the selector in a field `omni-bionic` defined, so [`omni_bionic::cond::clock_of`] is
+/// reading this layer's own convention — not a guess at bionic's internal bit layout, which
+/// there is no bionic source on this host to check.
+///
+/// # A deadline already past is not an error
+///
+/// POSIX: the call still releases the mutex, and still reacquires it, before returning
+/// `ETIMEDOUT`. A zero duration through `wait_end` does exactly that, so the past-deadline case
+/// needs no arm of its own — and an early return that skipped the two-phase wait would skip the
+/// release the caller's own loop depends on.
+pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (cond, mutex, abstime) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let (clock, deadline) = {
+        let mut view = enter(c, &state);
+        let clock = match Lift::lift(omni_bionic::cond::clock_of(&mut view, cond), &view)? {
+            Ok(clock) => clock,
+            Err(code) => {
+                // The selector is one `cond::init` never writes, so the struct is not a
+                // `pthread_cond_t` this layer produced. Reported as the code bionic reports
+                // rather than refused: `EINVAL` is exactly what a caller passing a bad cond
+                // gets, and it has an arm for it.
+                c.ret().i32(code);
+                return Ok(());
+            }
+        };
+        let blame = crate::mem::Blame::new(view.symbol(), view.address(), 2);
+        let at = usize::try_from(abstime)
+            .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))?;
+        // `struct timespec` on LP64 bionic: `time_t tv_sec` then `long tv_nsec`, both 8 bytes.
+        // The same layout `clock_gettime` writes one call earlier at the measured call site, so
+        // the two agree by construction rather than by two separate transcriptions.
+        let seconds = view.mem().read_u64(at, blame)? as i64;
+        let nanos = view.mem().read_u64(at + 8, blame)? as i64;
+        (clock, (seconds, nanos))
+    };
+    let (seconds, nanos) = deadline;
+    if !(0..1_000_000_000).contains(&nanos) {
+        // bionic's own validation, and the reason it is not a refusal: `EINVAL` is what the
+        // caller is told on a device, and inventing a wait for an unrepresentable time would be
+        // the believable wrong answer.
+        c.ret().i32(omni_bionic::errno::consts::EINVAL);
+        return Ok(());
+    }
+    let now = match clock {
+        omni_bionic::cond::clock_id::CLOCK_MONOTONIC => omni_platform::clock::monotonic_now(),
+        _ => omni_platform::clock::realtime_now(),
+    };
+    let absolute = std::time::Duration::new(
+        u64::try_from(seconds).unwrap_or(0),
+        u32::try_from(nanos).unwrap_or(0),
+    );
+    // **Saturating rather than checked**, and that is the whole of the past-deadline case: a
+    // deadline already gone is a zero wait, which `wait_end` turns into a release, a relock and
+    // ETIMEDOUT. `seconds` below zero lands here too, through the `unwrap_or(0)` above.
+    let budget = absolute.saturating_sub(now);
+    if budget.as_secs() > super::MAX_SLEEP_SECONDS {
+        return Err(AbiError::Refused {
+            symbol: c.symbol().to_string(),
+            address: c.address(),
+            why: format!(
+                "the guest asked `pthread_cond_timedwait` to wait {budget:?} -- an absolute \
+                 deadline of {seconds}.{nanos:09} on {} -- and this layer caps a guest-chosen \
+                 wait at {} seconds, the same cap `nanosleep`, `poll`, `select` \
+                 and `ALooper_pollOnce` name. Clamping was rejected for their reason: returning \
+                 ETIMEDOUT at the cap reports a deadline that has not passed",
+                match clock {
+                    omni_bionic::cond::clock_id::CLOCK_MONOTONIC => "CLOCK_MONOTONIC",
+                    _ => "CLOCK_REALTIME",
+                },
+                super::MAX_SLEEP_SECONDS
+            ),
+        });
+    }
+
+    let _parked = state.bionic.park("pthread_cond_timedwait", state.thread, cond, mutex);
+    let code = {
+        let mut view = enter(c, &state);
+        let threads = CallThreads { table: &state.bionic.threads, me: state.thread };
+        let owners = Arc::clone(&state.bionic.owners);
+        let conds = &state.bionic.conds;
+        let futex = &state.bionic.futex;
+        let produced = omni_bionic::cond::with_owners(Arc::clone(&owners), || {
+            omni_bionic::cond::with_registry(&threads, || {
+                omni_bionic::cond::wait_begin(
+                    &mut view, &owners, &threads, conds, cond, mutex,
+                )?;
+                omni_bionic::cond::wait_end(
+                    &threads, conds, cond, mutex, &mut view, futex, Some(budget),
                 )
             })
         });
@@ -886,6 +1043,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pthread_equal", pthread_equal),
     ("pthread_setname_np", pthread_setname_np),
     ("sched_yield", sched_yield),
+    ("sched_get_priority_max", sched_get_priority_max),
+    ("sched_get_priority_min", sched_get_priority_min),
+    ("sched_setscheduler", sched_setscheduler),
     ("__errno", errno_location),
     // pthread attributes
     ("pthread_attr_init", pthread_attr_init),
@@ -912,6 +1072,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pthread_cond_signal", pthread_cond_signal),
     ("pthread_cond_broadcast", pthread_cond_broadcast),
     ("pthread_cond_wait", pthread_cond_wait),
+    ("pthread_cond_timedwait", pthread_cond_timedwait),
     // pthread TLS
     ("pthread_key_create", pthread_key_create),
     ("pthread_getspecific", pthread_getspecific),

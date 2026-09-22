@@ -690,16 +690,26 @@ fn poll_once_without_a_looper_is_poll_error() {
     assert_eq!(returned as i32, ALOOPER_POLL_ERROR);
 }
 
-/// **An indefinite `pollOnce` is refused by name**, with the same argument `poll(fds, n, -1)` is.
+/// **An indefinite `pollOnce` with no live wake source is refused, and the refusal names the
+/// descriptors it looked at.**
 ///
-/// A host thread parked on a descriptor nobody writes to cannot be ended by a step budget, because
-/// a sleeping thread executes no guest instructions (D16). Returning `ALOOPER_POLL_TIMEOUT`
-/// instead would report a timeout to a call that was given none.
+/// A host thread parked on a descriptor nobody can write to cannot be ended by a step budget,
+/// because a sleeping thread executes no guest instructions (D16). Returning
+/// `ALOOPER_POLL_TIMEOUT` instead would report a timeout to a call that was given none.
+///
+/// The looper here watches **the read end of a pipe whose write end has been closed**, which is
+/// the exact state the check exists to catch: `readiness` alone cannot see it once bytes are
+/// buffered, so the refusal rests on the writer count.
 #[test]
-fn an_indefinite_poll_once_is_refused_and_says_what_would_change_it() {
+fn an_indefinite_poll_once_with_no_live_writer_is_refused_and_names_the_descriptors() {
     let _guard = serialized();
-    let f = fixture("poll-indefinite");
-    let _looper = f.prepare();
+    let f = fixture("poll-indefinite-dead");
+    let looper = f.prepare();
+    let (read_fd, write_fd) = f.pipe();
+    assert_eq!(f.add_fd(looper, read_fd, 3, ALOOPER_EVENT_INPUT, 0, 0), 1);
+    let fs = f.bionic.filesystem().expect("the instance has a root");
+    fs.close(write_fd).expect("closing the write end");
+
     let error = f.refusal_of("ALooper_pollOnce", |asm| {
         asm.mov(0, u64::from(u32::MAX)); // -1 as an int
         asm.mov(1, 0);
@@ -709,7 +719,75 @@ fn an_indefinite_poll_once_is_refused_and_says_what_would_change_it() {
     assert_eq!(error.symbol(), Some("ALooper_pollOnce"));
     let text = error.to_string();
     assert!(text.contains("indefinite"), "{text}");
-    assert!(text.contains("host-driven event source"), "it must say what would change it: {text}");
+    assert!(
+        text.contains(&format!("{read_fd}:pipe-read-end,0 live writer(s)")),
+        "the refusal must name the descriptor and the count that decided it: {text}"
+    );
+    assert!(
+        text.contains("APP_CMD_INIT_WINDOW"),
+        "it must say what would change it: {text}"
+    );
+}
+
+/// **An indefinite `pollOnce` whose looper watches a writable pipe waits, and returns what
+/// arrives.**
+///
+/// The other arm, and the one M6 turns on. Asserting the returned ident rather than the elapsed
+/// time: if the wait were still refused this fails with the refusal, and if the wait did not
+/// happen at all the call would have to answer before the writer ran.
+#[test]
+fn an_indefinite_poll_once_waits_when_a_live_writer_exists() {
+    let _guard = serialized();
+    let f = fixture("poll-indefinite-live");
+    let looper = f.prepare();
+    let (read_fd, write_fd) = f.pipe();
+    assert_eq!(f.add_fd(looper, read_fd, 7, ALOOPER_EVENT_INPUT, 0, 0), 1);
+
+    let bionic = Arc::clone(&f.bionic);
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let fs = bionic.filesystem().expect("the instance has a root");
+        fs.write(write_fd, b"W").expect("one byte into the pipe")
+    });
+
+    let returned = f.value_of("ALooper_pollOnce", |asm| {
+        asm.mov(0, u64::from(u32::MAX)); // -1 as an int
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+    });
+    assert_eq!(writer.join().expect("the writer thread"), 1);
+    assert_eq!(
+        returned as i32,
+        7,
+        "the ident of the registration the write made ready; a POLL_TIMEOUT here would mean the \
+         indefinite poll answered before the writer arrived"
+    );
+}
+
+/// **A `pollOnce(0)` is a poll and not a wait, so a stopping runtime does not turn it into a
+/// refusal.**
+///
+/// The stop switch is read inside the wait loop so that
+/// `Bionic::stop_guest_threads` can end an indefinite park. MEASURED with that check placed
+/// *above* the deadline test rather than below it: teardown turned every zero-timeout poll on the
+/// game thread into a refusal, reporting an interrupted wait where no wait had been asked for.
+#[test]
+fn a_zero_timeout_poll_once_is_poll_timeout_even_while_stopping() {
+    let _guard = serialized();
+    let f = fixture("poll-zero-stopping");
+    let looper = f.prepare();
+    let (read_fd, _write_fd) = f.pipe();
+    assert_eq!(f.add_fd(looper, read_fd, 9, ALOOPER_EVENT_INPUT, 0, 0), 1);
+    f.bionic.stop_guest_threads();
+
+    let returned = f.value_of("ALooper_pollOnce", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+    });
+    assert_eq!(returned as i32, ALOOPER_POLL_TIMEOUT);
 }
 
 /// **A `pollOnce` with a timeout waits and returns when a writer arrives**, and the assertion is

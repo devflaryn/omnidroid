@@ -26,23 +26,39 @@
 //! not bionic gets a refusal naming both rather than a looper that watches nothing.
 //!
 //! That also means the wait is the same wait `poll` performs — `omni-platform`'s readiness gate,
-//! with the generation read **before** the descriptors are tested — and the same bound:
-//! [`MAX_SLEEP_SECONDS`](crate::bionic::MAX_SLEEP_SECONDS), with an **indefinite** `pollOnce`
-//! refused by name.
+//! with the generation read **before** the descriptors are tested — and, for a *bounded* poll,
+//! the same bound: [`MAX_SLEEP_SECONDS`](crate::bionic::MAX_SLEEP_SECONDS).
 //!
-//! # The indefinite `pollOnce`, which is a decision and not an oversight
+//! # The indefinite `pollOnce`, and the fact it is decided on
 //!
-//! `ALooper_pollOnce(-1, ..)` is what a game loop with nothing to do calls on a device, and it is
-//! the single most reasonable-looking thing to allow here. It is refused, for the reason
-//! `bionic/net.rs` refuses `poll(fds, n, -1)`: D16's runaway-guest defence is built from step
-//! budgets that a sleeping thread does not consume, so a host thread parked on a pipe nobody
-//! writes to cannot be ended by anything this runtime has. The refusal names the symbol and says
-//! what would change it — **a host-driven event source**, which is what M6 needs anyway, because
-//! the frames the engine waits for are the host's to deliver.
+//! `ALooper_pollOnce(-1, ..)` is what `NativeEngine::GameLoop` calls, and it was refused here
+//! until M6 on the argument that D16's runaway-guest defence is built from step budgets a
+//! sleeping thread does not consume, so a host thread parked on a pipe nobody writes to cannot be
+//! ended by anything this runtime has.
 //!
-//! The alternative was considered and rejected on this project's own rule: capping an indefinite
-//! wait and returning `ALOOPER_POLL_TIMEOUT` reports a timeout to a call that was given none,
-//! which is the believable wrong answer for this shape.
+//! **That argument's premise is conditional, and this call can now test it.** The game thread is
+//! not idling — it is waiting for the *main* thread to post `APP_CMD_INIT_WINDOW` down the pipe
+//! `initializeNativeCode` created (`jni-surface.md` §8 rows 17-20). An indefinite wait on that
+//! pipe is legitimate exactly when the pipe can still be written, and that is a fact rather than
+//! a hope: [`Filesystem::pipe_writers`](omni_platform::fs::Filesystem::pipe_writers) counts the
+//! descriptors in this instance that still hold the write end. So:
+//!
+//! * **At least one watched descriptor must be a pipe read end with a live write end.** If none
+//!   is, nothing in this runtime can ever make the poll return and the original refusal still
+//!   holds — with the descriptors it looked at named, so the refusal says *why* rather than
+//!   restating the rule.
+//! * **The wait is sliced** (`WAIT_SLICE`) and re-reads the stop switch every pass, so
+//!   [`Bionic::stop_guest_threads`](crate::bionic::Bionic::stop_guest_threads) ends it. Without
+//!   that, an indefinite poll would be exactly the unstoppable park D16 objects to: the switch is
+//!   read between run windows and a parked thread never ends one.
+//!
+//! The last writer closing does not strand the wait either: a read end with no writers reports
+//! **readable** at end of file (`omni-platform`'s pipe table), so the poll returns, the glue
+//! drains, and the *next* indefinite poll is the one that gets refused.
+//!
+//! Capping the wait and returning [`ALOOPER_POLL_TIMEOUT`] remains rejected on this project's own
+//! rule: it reports a timeout to a call that was given none, which is the believable wrong answer
+//! for this shape.
 
 use std::time::{Duration, Instant};
 
@@ -524,6 +540,49 @@ enum Pass {
     Idle,
 }
 
+/// How long one pass of `ALooper_pollOnce`'s wait sleeps before it looks again.
+///
+/// **This exists for the stop switch and for nothing else.**
+/// [`Bionic::stop_guest_threads`](crate::bionic::Bionic::stop_guest_threads) is read between run
+/// windows (D16), and a thread asleep inside this handler never ends one -- so the handler has to
+/// read it itself, and it can only do that if the sleep is bounded. It costs one gate acquisition
+/// and one atomic load per slice on a thread that is otherwise idle, and it bounds teardown
+/// latency at this value rather than at the whole remaining timeout.
+///
+/// The readiness gate is still what actually wakes the wait: a write to the command pipe bumps
+/// the generation and returns the slice early, so this number is a *ceiling* on how late a stop
+/// is noticed and not a polling interval for the event itself.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
+
+/// How long `ALooper_pollOnce` may wait.
+#[derive(Debug, Clone, Copy)]
+enum Bound {
+    /// `pollOnce(timeoutMillis >= 0)`: this instant, and then [`ALOOPER_POLL_TIMEOUT`].
+    Until(Instant),
+    /// `pollOnce(-1)`, allowed because a live wake source was measured. See this module's
+    /// documentation for what is checked and why the check is a fact rather than a policy.
+    Indefinite,
+}
+
+/// The descriptors a looper watches, rendered for a refusal that has to say *why* nothing can
+/// wake it.
+///
+/// Each entry is `fd:kind`, where a pipe's kind carries the count that decided the refusal -- a
+/// read end with zero live writers is the whole reason an indefinite wait cannot end, and a
+/// message that named only the descriptor numbers would leave the next reader to measure it
+/// again.
+fn describe_watched(fs: &omni_platform::fs::Filesystem, watched: &[FdRegistration]) -> String {
+    watched
+        .iter()
+        .map(|held| match fs.pipe_writers(held.fd) {
+            Some(writers) => format!("{}:pipe-read-end,{writers} live writer(s)", held.fd),
+            None if fs.pipe_end(held.fd).is_some() => format!("{}:pipe-write-end", held.fd),
+            None => format!("{}:not a pipe", held.fd),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `int ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, void **outData)`
 ///
 /// **On the exit path, because it calls guest code.** A registration with a callback is a guest
@@ -560,40 +619,6 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         return Ok(());
     };
 
-    let budget = if timeout_millis < 0 {
-        return Err(refuse_reentrant(
-            c,
-            format!(
-                "the guest called `ALooper_pollOnce({timeout_millis})`, which is an indefinite \
-                 wait. D16's runaway-guest defence is built from step budgets that a sleeping \
-                 thread does not consume, so a host thread parked on a descriptor nobody writes \
-                 to cannot be ended by anything this runtime has -- the same argument `poll(fds, \
-                 n, -1)` is refused under. Returning ALOOPER_POLL_TIMEOUT instead would report a \
-                 timeout to a call that was given none. What changes this is a host-driven event \
-                 source, which M6 needs anyway: the frames this loop is waiting for are the \
-                 host's to deliver"
-            ),
-        ));
-    } else {
-        Duration::from_millis(timeout_millis as u64)
-    };
-    if budget.as_secs() > crate::bionic::MAX_SLEEP_SECONDS {
-        return Err(refuse_reentrant(
-            c,
-            format!(
-                "the guest asked `ALooper_pollOnce` to wait {budget:?}, and this layer caps a \
-                 guest-chosen wait at {} seconds -- the same cap `nanosleep`, `poll` and `select` \
-                 name. Clamping to the cap was rejected: it would return a timeout from a call \
-                 that waited a minute when it was asked to wait longer",
-                crate::bionic::MAX_SLEEP_SECONDS
-            ),
-        ));
-    }
-
-    let Some(deadline) = Instant::now().checked_add(budget) else {
-        return Err(refuse_reentrant(c, format!("a wait of {budget:?} is past this host's clock")));
-    };
-
     let bionic = crate::bionic::active(c.symbol(), c.address())?;
     let Some(fs) = bionic.bionic.filesystem() else {
         return Err(refuse_reentrant(
@@ -602,6 +627,73 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
              looper has nothing to poll"
                 .to_string(),
         ));
+    };
+
+    let bound = if timeout_millis < 0 {
+        // **The premise of the old refusal, tested rather than assumed.** See this module's
+        // documentation: an indefinite wait is legitimate exactly when something in this runtime
+        // can still make one of the watched descriptors ready, and for a pipe read end that is a
+        // write end still open in this instance's descriptor table.
+        let watched = ndk.registrations(looper);
+        let sources: Vec<(i32, usize)> = watched
+            .iter()
+            .filter_map(|held| {
+                fs.pipe_writers(held.fd)
+                    .filter(|writers| *writers > 0)
+                    .map(|writers| (held.fd, writers))
+            })
+            .collect();
+        if sources.is_empty() {
+            return Err(refuse_reentrant(
+                c,
+                format!(
+                    "the guest called `ALooper_pollOnce({timeout_millis})`, which is an \
+                     indefinite wait, and none of the {} descriptor(s) this looper watches can \
+                     still be made ready by anything in this runtime: [{}]. D16's runaway-guest \
+                     defence is built from step budgets that a sleeping thread does not consume, \
+                     so a host thread parked on a descriptor nobody can write to cannot be ended \
+                     by anything this runtime has -- the same argument `poll(fds, n, -1)` is \
+                     refused under. Returning ALOOPER_POLL_TIMEOUT instead would report a \
+                     timeout to a call that was given none. What changes this is a live write \
+                     end on a pipe this looper watches, which is how the main thread posts \
+                     APP_CMD_INIT_WINDOW (jni-surface.md §8 rows 17-20)",
+                    watched.len(),
+                    describe_watched(fs, &watched)
+                ),
+            ));
+        }
+        {
+            let mut state = ndk.state.lock();
+            let thread = Ndk::thread_index(&mut state);
+            state.record(
+                looper,
+                thread,
+                "pollOnce",
+                format!("indefinite: wake sources (fd, live writers) {sources:?}"),
+            );
+        }
+        Bound::Indefinite
+    } else {
+        let budget = Duration::from_millis(timeout_millis as u64);
+        if budget.as_secs() > crate::bionic::MAX_SLEEP_SECONDS {
+            return Err(refuse_reentrant(
+                c,
+                format!(
+                    "the guest asked `ALooper_pollOnce` to wait {budget:?}, and this layer caps \
+                     a guest-chosen wait at {} seconds -- the same cap `nanosleep`, `poll` and \
+                     `select` name. Clamping to the cap was rejected: it would return a timeout \
+                     from a call that waited a minute when it was asked to wait longer",
+                    crate::bionic::MAX_SLEEP_SECONDS
+                ),
+            ));
+        }
+        let Some(deadline) = Instant::now().checked_add(budget) else {
+            return Err(refuse_reentrant(
+                c,
+                format!("a wait of {budget:?} is past this host's clock"),
+            ));
+        };
+        Bound::Until(deadline)
     };
 
     let pass = loop {
@@ -661,11 +753,38 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         if !matches!(pass, Pass::Idle) {
             break pass;
         }
-        let now = Instant::now();
-        if now >= deadline {
-            break Pass::Idle;
+        let slice = match bound {
+            Bound::Indefinite => WAIT_SLICE,
+            Bound::Until(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break Pass::Idle;
+                }
+                (deadline - now).min(WAIT_SLICE)
+            }
+        };
+        // **The stop switch, read every slice — and only once this call is going to sleep.**
+        // `Bionic::stop_guest_threads` is read between run windows, and a thread asleep in this
+        // wait never ends one, so without this an indefinite poll is exactly the unstoppable park
+        // D16 objects to and a 60-second bounded one holds teardown for up to a minute.
+        //
+        // **Below the deadline test, not above it**, because `pollOnce(0)` is a *poll* and not a
+        // wait: it asks what is ready now and POLL_TIMEOUT is the true answer when nothing is.
+        // MEASURED with the two the other way round: teardown turned every `pollOnce(0)` on the
+        // game thread into a refusal, reporting a wait that had been interrupted where no wait
+        // had been asked for.
+        //
+        // Refused rather than turned into POLL_TIMEOUT for a call that *was* waiting: the wait
+        // did not expire, the runtime ended it, and a timeout would say otherwise.
+        if bionic.bionic.guest_threads_stopping() {
+            return Err(refuse_reentrant(
+                c,
+                format!(
+                    "`ALooper_pollOnce({timeout_millis})` was waiting on looper {looper:#x} \n                     when this runtime asked its guest threads to stop. The wait did not \n                     expire and nothing became ready, so there is no value to return that \n                     would be true: ALOOPER_POLL_TIMEOUT would report a timeout that did \n                     not happen"
+                ),
+            ));
         }
-        fs.wait_for_readiness(seen, deadline - now);
+        fs.wait_for_readiness(seen, slice);
     };
 
     let returned = match pass {
