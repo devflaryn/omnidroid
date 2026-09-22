@@ -271,6 +271,13 @@ pub(super) fn set_v6only(inner: &Inner, on: bool) -> NetResult<()> {
     unsupported("setsockopt", "setsockopt(2) with IPPROTO_IPV6/IPV6_V6ONLY")
 }
 
+/// Intended: `setsockopt(2)` with `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` = `IP_PMTUDISC_DO` or
+/// `IP_PMTUDISC_DONT`, by family.
+pub(super) fn set_dont_fragment(inner: &Inner, family: IpFamily, on: bool) -> NetResult<()> {
+    let _ = (inner, family, on);
+    unsupported("setsockopt", "setsockopt(2) with IP_MTU_DISCOVER/IPV6_MTU_DISCOVER")
+}
+
 /// Intended: `poll(2)`.
 ///
 /// The decisions in it, and the first is a change to what the seam *can* say:

@@ -440,6 +440,16 @@ pub enum SocketOption {
     ///
     /// Refused by name on an IPv4 socket, where the option does not exist.
     V6Only(bool),
+    /// Whether the socket's datagrams carry **don't-fragment**, at the IP level of the socket's
+    /// own family: Linux's `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` set to `IP_PMTUDISC_DO` (`true`)
+    /// or `IP_PMTUDISC_DONT` (`false`), and Windows' `IP_DONTFRAGMENT`/`IPV6_DONTFRAG`.
+    ///
+    /// `DO` and the Windows option agree on what a caller can see: the bit is set, nothing is
+    /// fragmented locally, and a datagram larger than the path allows fails its send with
+    /// `EMSGSIZE`. Linux's other modes (`WANT`, `PROBE`, `INTERFACE`, `OMIT`) have no Windows
+    /// spelling and are not carried -- a caller asking for one is refused by name above this seam.
+    /// MEASURED reader: ngtcp2, the engine's QUIC transport, which needs DF for its path-MTU probing.
+    DontFragment(bool),
 }
 
 /// An option to read back from a socket.
@@ -1060,6 +1070,9 @@ impl Socket {
             SocketOption::V6Only(on) => {
                 self.require_v6(OP)?;
                 backend::set_v6only(&self.inner, on)
+            }
+            SocketOption::DontFragment(on) => {
+                backend::set_dont_fragment(&self.inner, self.family, on)
             }
         }
     }

@@ -57,7 +57,7 @@ use std::time::Duration;
 use windows_sys::Win32::Networking::WinSock::{
     bind as ws_bind, connect as ws_connect, getsockopt, select as ws_select, setsockopt,
     socket as ws_socket, WSAGetLastError, WSAStartup, ADDRESS_FAMILY, AF_INET, AF_INET6, FD_SET,
-    IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, SOCKET_ERROR,
+    IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPV6_DONTFRAG, IPV6_V6ONLY, IP_DONTFRAGMENT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, SOCKET_ERROR,
     SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SO_ERROR, SO_KEEPALIVE, SO_RCVBUF, SO_REUSEADDR,
     SO_SNDBUF, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPINTVL, TIMEVAL,
     WSADATA, WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
@@ -594,6 +594,16 @@ pub(super) fn set_v6only(inner: &Inner, on: bool) -> NetResult<()> {
         "setsockopt",
         "setsockopt(IPV6_V6ONLY)",
     )
+}
+
+/// `setsockopt(IPPROTO_IP, IP_DONTFRAGMENT)` or `setsockopt(IPPROTO_IPV6, IPV6_DONTFRAG)`, by the
+/// socket's family -- see [`SocketOption::DontFragment`](super::SocketOption::DontFragment).
+pub(super) fn set_dont_fragment(inner: &Inner, family: IpFamily, on: bool) -> NetResult<()> {
+    let (level, name, api) = match family {
+        IpFamily::V4 => (IPPROTO_IP, IP_DONTFRAGMENT, "setsockopt(IP_DONTFRAGMENT)"),
+        IpFamily::V6 => (IPPROTO_IPV6, IPV6_DONTFRAG, "setsockopt(IPV6_DONTFRAG)"),
+    };
+    set_i32(inner, level, name, i32::from(on), "setsockopt", api)
 }
 
 /// Add a socket to an `FD_SET`. The caller has already bounded the count.
