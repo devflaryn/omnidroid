@@ -144,6 +144,10 @@ pub struct GfxVulkanHost {
     /// instance, and refilling a slot would make a destroyed instance's token -- and every
     /// surface, device and physical-device token that carries its index -- name a new one.
     instances: Mutex<Vec<Option<ash::Instance>>>,
+    /// How each instance can read `VkPhysicalDeviceFeatures2`, indexed by instance token and
+    /// pushed with it: what a device's portability subset needs (`crate::portability`). A leaf
+    /// lock, taken alone and never while holding another.
+    features2: Mutex<Vec<crate::portability::Features2>>,
     /// Each instance's physical devices, **cached on first enumeration**, indexed by instance
     /// token.
     ///
@@ -527,14 +531,13 @@ impl GfxVulkanHost {
     /// workspace and fails here, naming what is missing — which is the whole point of that feature
     /// choice and is recorded in this crate's manifest.
     pub fn load() -> GfxResult<Arc<GfxVulkanHost>> {
-        // SAFETY: `Entry::load` dlopen's the Vulkan loader. It is unsafe because the library it
-        // finds is chosen by the host's own search path and its entry points are trusted after
-        // that; this is the same call `Renderer::new` makes, with the same standing.
-        let entry = unsafe { ash::Entry::load() }
-            .map_err(|err| GfxError::LoaderMissing { detail: err.to_string() })?;
+        // The same loader `Renderer::new` finds: `Entry::load()` where the platform names no
+        // locations (Windows, unchanged), otherwise each in turn. See `crate::portability`.
+        let entry = crate::portability::load_entry().map_err(|detail| GfxError::LoaderMissing { detail })?;
         Ok(Arc::new(GfxVulkanHost {
             entry,
             instances: Mutex::new(Vec::new()),
+            features2: Mutex::new(Vec::new()),
             physical: Mutex::new(Vec::new()),
             surfaces: Mutex::new(Slab::new()),
             devices: Mutex::new(Vec::new()),
@@ -1564,8 +1567,6 @@ impl VulkanHost for GfxVulkanHost {
         let extensions = c_strings("ppEnabledExtensionNames", &request.extensions)?;
         let layer_pointers: Vec<*const std::ffi::c_char> =
             layers.iter().map(|name| name.as_ptr()).collect();
-        let extension_pointers: Vec<*const std::ffi::c_char> =
-            extensions.iter().map(|name| name.as_ptr()).collect();
 
         let application_name = optional_c_string("pApplicationName", request, |a| &a.application_name)?;
         let engine_name = optional_c_string("pEngineName", request, |a| &a.engine_name)?;
@@ -1583,22 +1584,54 @@ impl VulkanHost for GfxVulkanHost {
             info
         });
 
-        let mut info = vk::InstanceCreateInfo::default()
-            .flags(vk::InstanceCreateFlags::from_raw(request.flags))
-            .enabled_layer_names(&layer_pointers)
-            .enabled_extension_names(&extension_pointers);
-        if let Some(application_info) = application_info.as_ref() {
-            info = info.application_info(application_info);
-        }
-
-        // SAFETY: every pointer reachable from `info` is into a local `CString` or a local `Vec`
-        // that outlives this call, `pNext` is null because `InstanceRequest` cannot carry a chain
-        // (the shim refuses one by name), and `pAllocator` is `None` because a guest allocator is
-        // refused by name one layer up. Nothing here is a guest address.
-        match unsafe { self.entry.create_instance(&info, None) } {
+        // **Created as the guest asked, first.** Only when the loader answers
+        // `VK_ERROR_INCOMPATIBLE_DRIVER` -- its answer when every driver it found is a portability
+        // implementation (MoltenVK) and the request did not opt in -- and offers
+        // `VK_KHR_portability_enumeration` is it asked again with that extension and flag added
+        // (see `crate::portability`). A request a native driver accepts is never altered.
+        let api_version = request.application.as_ref().map_or(vk::API_VERSION_1_0, |a| a.api_version);
+        let mut names: Vec<&std::ffi::CStr> = extensions.iter().map(CString::as_c_str).collect();
+        let mut flags = vk::InstanceCreateFlags::from_raw(request.flags);
+        let mut retried = false;
+        let created = loop {
+            let extension_pointers: Vec<*const std::ffi::c_char> =
+                names.iter().map(|name| name.as_ptr()).collect();
+            let mut info = vk::InstanceCreateInfo::default()
+                .flags(flags)
+                .enabled_layer_names(&layer_pointers)
+                .enabled_extension_names(&extension_pointers);
+            if let Some(application_info) = application_info.as_ref() {
+                info = info.application_info(application_info);
+            }
+            // SAFETY: every pointer reachable from `info` is into a local `CString`, a `'static`
+            // name or a local `Vec` that outlives this call, `pNext` is null because
+            // `InstanceRequest` cannot carry a chain (the shim refuses one by name), and
+            // `pAllocator` is `None` because a guest allocator is refused by name one layer up.
+            // Nothing here is a guest address.
+            match unsafe { self.entry.create_instance(&info, None) } {
+                Err(result) if !retried => {
+                    let offered = self.enumerate(None).unwrap_or_default();
+                    let offered: Vec<CString> =
+                        offered.into_iter().filter_map(|e| CString::new(e.name).ok()).collect();
+                    let offered: Vec<&std::ffi::CStr> = offered.iter().map(CString::as_c_str).collect();
+                    if !crate::portability::retry_with_portability(result, &offered, &names) {
+                        break Err(result);
+                    }
+                    names.extend(crate::portability::portability_additions(&offered, &names, api_version));
+                    flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+                    retried = true;
+                }
+                other => break other,
+            }
+        };
+        match created {
             Ok(instance) => {
                 let token = instances.len() as u64;
                 instances.push(Some(instance));
+                self.features2
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(crate::portability::Features2::of(api_version, &names));
                 Ok(DriverAnswer::Ok(HostInstance::from_token(token)))
             }
             Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
@@ -1769,12 +1802,38 @@ impl VulkanHost for GfxVulkanHost {
                     Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
                 }
             }
+            RawWindow::AppKit { ns_view, ca_metal_layer, .. } => {
+                let key = crate::claim::WindowKey::appkit(ns_view);
+                let info = vk::MetalSurfaceCreateInfoEXT::default()
+                    .layer(ca_metal_layer as *const vk::CAMetalLayer);
+                let metal = ash::ext::metal_surface::Instance::new(&self.entry, handle);
+                // SAFETY: `ca_metal_layer` is the `CAMetalLayer` of a live
+                // `omni_platform::window::Window` that `ndk::WindowSource::raw_window` published,
+                // `info` borrows nothing that does not outlive this call, and `pAllocator` is
+                // `None` because a guest allocator is refused by name one layer up.
+                match unsafe { metal.create_metal_surface(&info, None) } {
+                    Ok(surface) => {
+                        let token = self.locked_surfaces().insert(SurfaceEntry {
+                            instance: index,
+                            surface,
+                            window: key,
+                        });
+                        Ok(DriverAnswer::Ok(SurfaceCreated {
+                            surface: HostSurface::from_token(token),
+                            // The pairing table's entry for `VK_EXT_metal_surface`, as the Win32
+                            // arm takes its own: the same string by construction.
+                            host_call: PLATFORM_SURFACE_ENTRY_POINTS[4].to_string(),
+                        }))
+                    }
+                    Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+                }
+            }
             other => Err(refused(
                 "vkCreateAndroidSurfaceKHR",
                 &format!(
                     "the guest's `ANativeWindow *` resolved to a {system} window, and this host \
                      has no Vulkan surface call for that window system -- only \
-                     `VK_KHR_win32_surface`. This is a refusal rather than a `VkResult` because \
+                     `VK_KHR_win32_surface` and `VK_EXT_metal_surface`. This is a refusal rather than a `VkResult` because \
                      the specification has no code for \"this build of the host cannot make a \
                      surface here\", and `VK_ERROR_INITIALIZATION_FAILED` would send the engine \
                      looking at its driver. `crate::vulkan::create_surface` is the other place \
@@ -2234,8 +2293,32 @@ impl VulkanHost for GfxVulkanHost {
         let extensions = c_strings("ppEnabledExtensionNames", &request.extensions)?;
         let layer_pointers: Vec<*const std::ffi::c_char> =
             layers.iter().map(|name| name.as_ptr()).collect();
-        let extension_pointers: Vec<*const std::ffi::c_char> =
+        let mut extension_pointers: Vec<*const std::ffi::c_char> =
             extensions.iter().map(|name| name.as_ptr()).collect();
+
+        // **A portability implementation's subset, enabled as the specification requires** --
+        // a device that exposes `VK_KHR_portability_subset` must have it enabled -- with exactly
+        // the subset features it reports, in front of the guest's own `pNext` chain. The guest
+        // does not know the extension exists (Android drivers are native), so nothing it asked
+        // for is changed; on a native driver nothing is added at all. See `crate::portability`.
+        let features2 = self
+            .features2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(instance_index)
+            .copied()
+            .unwrap_or(crate::portability::Features2::None);
+        let subset = self.with_physical(device, |instance, physical| {
+            // SAFETY: `physical` is a live device of `instance`.
+            let offered = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+            // SAFETY: live handles; `features2` is what this instance was created able to do.
+            unsafe { crate::portability::Subset::of(&self.entry, instance, physical, &offered, features2) }
+        })?;
+        let already = extensions.iter().any(|name| name.as_c_str() == crate::portability::SUBSET);
+        let mut subset_features = subset.filter(|_| !already).map(|subset| subset.features);
+        if subset_features.is_some() {
+            extension_pointers.push(crate::portability::SUBSET.as_ptr());
+        }
         let features = request.features.as_deref().map(features_from_bytes).transpose()?;
 
         // The priorities have to outlive the `VkDeviceQueueCreateInfo`s that point at them, so
@@ -2281,6 +2364,11 @@ impl VulkanHost for GfxVulkanHost {
         // this host's memory.
         let mut chain = HostChain::new("vkCreateDevice", &request.chain)?;
         info.p_next = chain.head().cast_const();
+
+        if let Some(features) = subset_features.as_mut() {
+            features.p_next = info.p_next.cast_mut();
+            info.p_next = (features as *mut vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'_>).cast_const().cast();
+        }
 
         let created = self.with_physical(device, |instance, physical| {
             // SAFETY: `physical` is a live device of `instance`; every pointer reachable from
@@ -5731,7 +5819,16 @@ impl GfxVulkanHost {
             .queue_priorities(&priorities);
         let queue_infos = [queue_info];
         let extension = vk::EXT_EXTERNAL_MEMORY_HOST_NAME.as_ptr();
-        let extensions = [extension];
+        // A portability implementation's probe device must enable its subset too (the spec's
+        // requirement for every device of one); with none of its optional features, which this
+        // throwaway device never uses.
+        let has_subset = available.iter().any(|entry| {
+            entry.extension_name_as_c_str().is_ok_and(|name| name == crate::portability::SUBSET)
+        });
+        let mut extensions = vec![extension];
+        if has_subset {
+            extensions.push(crate::portability::SUBSET.as_ptr());
+        }
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&extensions);

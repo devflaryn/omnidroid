@@ -122,6 +122,45 @@ pub enum AudioError {
         /// The frames that were free at the time.
         writable: u32,
     },
+
+    /// A Core Audio call failed. macOS only: Core Audio reports an `OSStatus`, which is often a
+    /// four-character code (`'!fmt'`, `'nope'`) rather than a number, so both spellings are
+    /// printed.
+    #[error("`{operation}`: {api} failed with OSStatus {status} ({})", fourcc(*status))]
+    OsStatus {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The Core Audio entry point that failed.
+        api: &'static str,
+        /// The raw `OSStatus`.
+        status: i32,
+    },
+
+    /// The default device's stream format names no usable sample rate or channel count (a rate
+    /// below 1 Hz or past `u32`, no channels, or more than `u16::MAX`). macOS only.
+    #[error(
+        "`{operation}`: the default output device reports {sample_rate} Hz and {channels} \
+         channel(s), which is not a stream this seam can describe"
+    )]
+    DeviceFormatUnusable {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The reported rate, truncated to whole hertz.
+        sample_rate: u64,
+        /// The reported channel count.
+        channels: u32,
+    },
+}
+
+/// `status` as `'abcd'` when its four bytes are printable ASCII, as Core Audio's codes are, and as
+/// `-` when it is a plain number.
+fn fourcc(status: i32) -> String {
+    let bytes = status.to_be_bytes();
+    if bytes.iter().all(|b| (0x20..0x7F).contains(b)) {
+        format!("'{}'", bytes.iter().map(|&b| char::from(b)).collect::<String>())
+    } else {
+        "-".to_owned()
+    }
 }
 
 impl AudioError {

@@ -72,3 +72,37 @@ windows-sys = { workspace = true, features = [
     # proves a 32-bit extensible format is refused unless its subtype is float).
     "Win32_Media_KernelStreaming",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# window + audio seams (macOS)
+#
+# AppKit, for the window seam (src/window/macos.rs and src/window/macos/*.rs): `objc2` is the
+# Objective-C runtime binding -- message sends, `define_class!` for the one view class the backend
+# needs, `Retained` for ownership -- and the framework crates are typed bindings over it, so that a
+# selector's arguments are checked by the compiler rather than by a crash at run time. Features are
+# named rather than defaulted: `objc2-app-kit`'s default is the whole framework, several thousand
+# classes, for a backend that touches a dozen. `objc2-quartz-core` is `CAMetalLayer`, the layer
+# `VK_EXT_metal_surface` presents to. The CoreAudio, CoreGraphics, CoreFoundation and libdispatch
+# calls are a handful of C functions each and are declared by hand where they are used.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std", "NSArray", "NSAttributedString", "NSDate", "NSGeometry", "NSNotification", "NSObject",
+    "NSRange", "NSRunLoop", "NSString", "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "objc2-core-foundation", "objc2-quartz-core", "NSApplication", "NSCursor", "NSEvent", "NSGraphics", "NSResponder",
+    "NSRunningApplication", "NSScreen", "NSTextInputClient", "NSTrackingArea", "NSView", "NSWindow",
+] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std", "objc2-core-foundation", "CALayer", "CAMetalLayer",
+] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# window + audio seams (macOS): `tests/window_keys_macos.rs` checks the backend's key table against
+# the one consumer of `WindowEvent::KeyDown.scancode`, `omni_android::jni::keys::evdev_code`, key by
+# key. A dev-dependency cycle (omni-android depends on this crate), which Cargo supports and which
+# `omni-gfx`'s manifest already relies on; `omni-cpu` is built without dynarmic through it.
+omni-android = { workspace = true }
+# `tests/screen_capture_macos.rs` presents with omni-gfx's renderer and captures the screen, which
+# is where a macOS-only capture belongs: omni-gfx may not name a platform.
+omni-gfx = { workspace = true }

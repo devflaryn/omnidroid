@@ -144,7 +144,27 @@ fn the_renderer_picks_a_genuine_device_and_reports_what_it_picked() {
     // Both families exist on the device and both were used to create it. On this host they are
     // the same family (spike §3: family 0 does graphics, compute and transfer), which is what
     // lets the swapchain be EXCLUSIVE — but the assertion is the weaker, portable one.
-    assert!(!report.available_layers.is_empty(), "the loader reports its implicit layers");
+    //
+    // The layers are the **loader's**, exactly: read here independently, from the same loader the
+    // renderer found (the platform's candidates in order, or `Entry::load()` where it names none).
+    // Not "non-empty": that was a fact about the Windows host, whose loader carries five implicit
+    // layers (spike §6); this project's macOS host has none installed (MEASURED, `vulkaninfo`), and
+    // an empty list there is the truth.
+    let candidates = omni_platform::window::vulkan_loader_candidates();
+    // SAFETY: loading the host's Vulkan loader, as the renderer did.
+    let entry = if candidates.is_empty() {
+        unsafe { ash::Entry::load() }.ok()
+    } else {
+        candidates.iter().find_map(|path| unsafe { ash::Entry::load_from(path) }.ok())
+    }
+    .expect("the loader the renderer loaded");
+    // SAFETY: takes no handles.
+    let layers: Vec<String> = unsafe { entry.enumerate_instance_layer_properties() }
+        .unwrap()
+        .iter()
+        .map(|layer| layer.layer_name_as_c_str().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(report.available_layers, layers, "the report lists the loader's layers");
 }
 
 #[test]
