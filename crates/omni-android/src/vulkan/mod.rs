@@ -971,6 +971,10 @@ struct State {
     requests_dropped: usize,
     calls: Vec<ProcCall>,
     calls_dropped: usize,
+    /// **Every** call through a pool thunk, counted by name -- none dropped, because there are at
+    /// most `MAX_PROC_SLOTS` names. `calls` keeps the first `MAX_RECORDS` in order; this is what
+    /// answers "did the engine present, and how often" after the render loop has run for minutes.
+    call_counts: BTreeMap<String, u64>,
     entry_calls: u64,
     /// The real driver behind this loader, or `None` — in which case `vkCreateInstance` and
     /// `vkEnumerateInstanceExtensionProperties` refuse by name rather than inventing an answer.
@@ -1181,6 +1185,7 @@ impl Vulkan {
                 requests_dropped: 0,
                 calls: Vec::new(),
                 calls_dropped: 0,
+                call_counts: BTreeMap::new(),
                 entry_calls: 0,
                 host: None,
                 instances: None,
@@ -1536,6 +1541,12 @@ impl Vulkan {
         self.state.lock().calls_dropped
     }
 
+    /// Every call through a pool thunk, counted by name, none dropped.
+    #[must_use]
+    pub fn call_counts(&self) -> BTreeMap<String, u64> {
+        self.state.lock().call_counts.clone()
+    }
+
     /// The **first** Vulkan function the engine actually called, as opposed to looked up.
     ///
     /// `None` when it has called none, which is a different finding from having looked none up —
@@ -1834,6 +1845,11 @@ impl Vulkan {
         for call in &state.calls {
             out.push_str(&format!("  called {call:?}\n"));
         }
+        // Every call, by name and count, most frequent first: the part of the census that
+        // survives a long run.
+        let mut counted: Vec<(&String, &u64)> = state.call_counts.iter().collect();
+        counted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        out.push_str(&format!("  calls by name, all of them: {counted:?}\n"));
 
         // **The rewrite log, always, including when it is empty.** A rename nobody recorded is the
         // defect Global Constraint 1 names, and a report that printed nothing when nothing was
@@ -3088,6 +3104,9 @@ impl Vulkan {
     ) -> Option<String> {
         let mut state = self.state.lock();
         let name = state.assigned.get(&thunk).cloned();
+        if let Some(name) = &name {
+            *state.call_counts.entry(name.clone()).or_insert(0) += 1;
+        }
         let order = state.calls.len() + state.calls_dropped;
         if state.calls.len() >= MAX_RECORDS {
             state.calls_dropped += 1;

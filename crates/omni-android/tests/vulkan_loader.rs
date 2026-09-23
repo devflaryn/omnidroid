@@ -553,6 +553,14 @@ fn a_call_through_a_returned_thunk_is_recorded_with_its_arguments() {
     assert_eq!(call.args[0], count_at as u64);
     assert_eq!(call.args[2], 0x3333);
     assert_eq!(f.vulkan().calls_dropped(), 0);
+    // And every call is counted by its name -- the census a long render loop's frame count is
+    // read from, after the ordered log has filled.
+    f.call_through(layers, [count_at as u64, 0, 0x3333]);
+    assert_eq!(
+        f.vulkan().call_counts().get("vkEnumerateInstanceLayerProperties"),
+        Some(&2),
+        "two calls, counted under the name they were made through"
+    );
 }
 
 /// **A pool address the guest computed rather than received refuses too, and says so.**
