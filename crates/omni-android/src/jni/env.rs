@@ -350,7 +350,8 @@ fn env_call(
             // lookup is worth more than finding it out at the call.
             Descriptor::parse(name, address, &descriptor)?;
             let mut state = jni.state();
-            let class = class_handle(&state, name, address, class)?;
+            let class = class_handle(&state, name, address, class)
+                .map_err(|error| asked_for(error, &member, &descriptor))?;
             match state.registry.method(class, &member, &descriptor, is_static) {
                 Some(id) => Ok(JniReturn::Word(state.handles.method_id(id))),
                 None => {
@@ -379,7 +380,8 @@ fn env_call(
             let member = read_cstr(mem, args.next_pointer()?, blame(2))?;
             let descriptor = read_cstr(mem, args.next_pointer()?, blame(3))?;
             let mut state = jni.state();
-            let class = class_handle(&state, name, address, class)?;
+            let class = class_handle(&state, name, address, class)
+                .map_err(|error| asked_for(error, &member, &descriptor))?;
             match state.registry.field(class, &member, &descriptor, is_static) {
                 Some(id) => Ok(JniReturn::Word(state.handles.field_id(id))),
                 None => {
@@ -1044,6 +1046,24 @@ fn class_of(handles: &Handles, registry: &Registry, id: ObjectId) -> Option<Clas
 }
 
 /// Decode a `jclass` handle to the class it names.
+/// A member lookup's bad-class refusal, with the member it was for.
+///
+/// MEASURED why: a worker died on `GetStaticMethodID` with a null class, and the refusal named
+/// the null but not the method -- whose name and signature the call had already read -- so which
+/// `FindClass` had answered null for it could not be told from the run.
+fn asked_for(error: AbiError, member: &str, descriptor: &str) -> AbiError {
+    match error {
+        AbiError::JniBadHandle { function, address, kind, handle, why } => AbiError::JniBadHandle {
+            function,
+            address,
+            kind,
+            handle,
+            why: format!("{why} (it asked for `{member}` `{descriptor}`)"),
+        },
+        other => other,
+    }
+}
+
 fn class_handle(
     state: &JniState,
     name: &str,
