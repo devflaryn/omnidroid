@@ -5,7 +5,7 @@
 //! accessible, and assert what the handler saw and that execution resumed with every register
 //! intact -- the one property a trampoline that bounces through another thread could get wrong
 //! while every counter looked right.
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;

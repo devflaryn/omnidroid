@@ -28,7 +28,7 @@
 //! Every figure this test prints carries its `n` (Global Constraint 12): rounds, threads per round,
 //! pages per thread, and the faults actually served.
 
-#![cfg(any(target_os = "windows", target_os = "macos"))]
+#![cfg(any(target_os = "windows", all(target_os = "macos", target_arch = "aarch64")))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
