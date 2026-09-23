@@ -1065,6 +1065,27 @@ impl DynarmicCpu {
             (*ctx.get()).jit = jit;
         }
 
+        // D10: the pager must see a guest fault before dynarmic does. Building the first jit is
+        // when dynarmic's POSIX build installs its own SIGSEGV handler, over the pager's, and that
+        // handler takes a fault in its code cache itself -- onto the 30-49x callback path -- without
+        // passing it on. So first place is re-asserted here, after every jit, while nothing runs.
+        // A no-op on Windows, where a vectored handler is first by construction.
+        if shared.owns_guest_paging {
+            if let Err(error) = DemandPager::reassert_precedence() {
+                // SAFETY: the jit was created above and nothing has run on it or holds it.
+                unsafe { od_jit_free(jit) };
+                return Err(CpuError::Backend {
+                    backend: BACKEND_NAME,
+                    operation: "keep the guest demand pager ahead of dynarmic's fault handler",
+                    detail: format!(
+                        "{error}. D10 requires Omnidroid to take guest faults ahead of dynarmic's \
+                         own handler; without that every demand-paged access in translated code \
+                         recompiles its block onto the callback path, measured 30-49x slower"
+                    ),
+                });
+            }
+        }
+
         let armed = options.assert_callback_free_slices && shared.owns_guest_paging;
 
         Ok(Self {
