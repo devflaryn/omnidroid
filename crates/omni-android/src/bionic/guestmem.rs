@@ -290,9 +290,14 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     // applications to do and what nothing is obliged to do.
     let file_backed = flags & MAP_ANONYMOUS == 0;
     if file_backed && prot != PROT_READ {
+        // The file by name, which the descriptor's number alone does not give.
+        let named = super::files::filesystem(&call.view())
+            .ok()
+            .and_then(|fs| fs.guest_path_of(fd))
+            .map_or_else(|| "a descriptor no path names".to_string(), |path| format!("`{path}`"));
         return call.refuse(format!(
-            "the guest asked for a file-backed mapping of fd {fd} with prot {prot:#x}, flags \
-             {flags:#x}, offset {offset:#x}. A file mapping here is PROT_READ only, made as a \
+            "the guest asked for a file-backed mapping of fd {fd} ({named}) with prot {prot:#x}, \
+             flags {flags:#x}, offset {offset:#x}. A file mapping here is PROT_READ only, made as a \
              snapshot of the file (see `mmap`): a writable MAP_SHARED mapping must carry its \
              writes to the file, an executable one is code, and no run has asked for either"
         ));

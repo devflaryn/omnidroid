@@ -1135,6 +1135,21 @@ impl Filesystem {
         self.table().open.contains_key(&fd)
     }
 
+    /// The guest path `fd` was opened by, for a file, a directory or a generated file; `None`
+    /// for every other kind, which no path names, and for a descriptor not held.
+    ///
+    /// **For a refusal to name the file, which a number does not.** MEASURED: two workers asked
+    /// `mmap` for a writable shared mapping of descriptors 18 and 27, and nothing said what
+    /// either was.
+    #[must_use]
+    pub fn guest_path_of(&self, fd: i32) -> Option<String> {
+        match self.table().open.get(&fd)? {
+            Entry::File { guest, .. } | Entry::Directory { guest, .. } => Some(guest.clone()),
+            Entry::Generated(generated) => Some(generated.guest.clone()),
+            _ => None,
+        }
+    }
+
     // ---------------------------------------------------------------- pipes and readiness
 
     /// `pipe(2)`: a read end and a write end, in that order.
@@ -3046,6 +3061,23 @@ mod tests {
 
     fn read_flags() -> OpenFlags {
         OpenFlags { read: true, ..OpenFlags::default() }
+    }
+
+    /// **A descriptor names the path it was opened by**, and only while it is held: two files
+    /// opened side by side each answer their own, a standard stream answers none, and a closed
+    /// descriptor answers none.
+    #[test]
+    fn a_descriptor_names_the_guest_path_it_was_opened_by() {
+        let scratch = Scratch::new("pathof");
+        let fs = scratch.fs();
+        fs.mkdir(b"/data").expect("mkdir");
+        let first = fs.open(b"/data/first.db", write_flags()).expect("open");
+        let second = fs.open(b"/data/second.db-shm", write_flags()).expect("open");
+        assert_eq!(fs.guest_path_of(first).as_deref(), Some("/data/first.db"));
+        assert_eq!(fs.guest_path_of(second).as_deref(), Some("/data/second.db-shm"));
+        assert_eq!(fs.guest_path_of(1), None, "stdout names no path");
+        fs.close(first).expect("close");
+        assert_eq!(fs.guest_path_of(first), None, "a closed descriptor names nothing");
     }
 
     /// A round trip through the seam: create, write, close, reopen, read back the same bytes.
