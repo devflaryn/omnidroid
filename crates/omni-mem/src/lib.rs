@@ -71,7 +71,7 @@ pub use backing::{Backing, BackingId};
 pub use budget::CommitBudget;
 pub use error::{MemError, MemResult};
 pub use access::{admit, admits_region, permits, scan_reach, Admitted, Refusal};
-pub use pager::{DemandPager, PagerStats};
+pub use pager::{process_pager_totals, DemandPager, PagerStats};
 pub use region::{RegionInfo, RegionKind};
 pub use space::{
     CommitPolicy, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId, Placement, Reclaimed,

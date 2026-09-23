@@ -644,6 +644,9 @@ pub(super) fn closelog(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// truncation travels with the record, so a run watched only through stderr still sees that a
 /// line lost its tail.
 pub(crate) fn emit(record: &LogRecord) {
+    if crate::perf::enabled() {
+        crate::perf::note_log_line(&record.message);
+    }
     omni_platform::log::emit(&Record {
         priority: record.priority,
         tag: &record.tag,

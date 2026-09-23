@@ -446,3 +446,214 @@ fn the_cost_of_the_per_slice_callback_invariant() {
         ns_per_read * 2.0 * slices as f64 / 1e6
     );
 }
+
+/// `x0` = the word, `x9` = iterations: one `LDAXR`/`ADD`/`STLXR`/`CBNZ` increment per iteration,
+/// the shape LLVM emits for a C++ `fetch_add`. `x10` counts failed store-exclusives.
+fn exclusive_increment_loop() -> Vec<u32> {
+    let mut p = vec![movz(10, 0, 0)];
+    let top = p.len();
+    p.push(ldaxr(2, 0));
+    p.push(add_imm(2, 2, 1));
+    p.push(stlxr(3, 2, 0));
+    let cbnz_at = p.len();
+    p.push(0);
+    p.push(subs_imm(9, 9, 1));
+    let here = p.len();
+    p.push(b_cond(1, top as i32 - here as i32));
+    p.push(ret(30));
+    let retry = p.len();
+    p.push(add_imm(10, 10, 1));
+    let here = p.len();
+    p.push(b(top as i32 - here as i32));
+    p[cbnz_at] = cbnz_w(3, retry as i32 - cbnz_at as i32);
+    p
+}
+
+/// **What one guest atomic increment costs under each exclusive monitor**, and how that scales
+/// with the monitor's size and with threads -- the measurement H1 of the world performance work
+/// (`docs/research/perf-world.md`) starts from.
+///
+/// The global monitor's store-exclusive scans every slot the monitor was sized for, inline and
+/// unrolled, under one process-wide spin lock; the runtime sizes it from `max_threads`, which
+/// `23530d1` raised from 64 to 256. So the rows are the monitor at 1, 64 and 256 slots, and
+/// value-compare at 256 threads, each with one thread on a private word, eight threads on eight
+/// private words (each on its own cache lines), and eight threads on one shared word.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_a_guest_atomic_increment() {
+    use omni_cpu::dynarmic::ExclusiveMonitor;
+    let _serial = serialized();
+    const SAMPLES: usize = 7;
+    const ONE: u64 = 1_000_000;
+    const EACH: u64 = 200_000;
+    const THREADS: usize = 8;
+    println!("\n== a guest LDAXR/ADD/STLXR/CBNZ increment (median of {SAMPLES}; ns per increment, wall) ==");
+    for (label, monitor, max_threads) in [
+        ("global, 1 slot   ", ExclusiveMonitor::Global, 1u32),
+        ("global, 64 slots ", ExclusiveMonitor::Global, 64),
+        ("global, 256 slots", ExclusiveMonitor::Global, 256),
+        ("value-compare    ", ExclusiveMonitor::ValueCompare, 256),
+    ] {
+        let threads_here = if max_threads < THREADS as u32 { 1 } else { THREADS };
+        let guest = Guest::with_options(DynarmicOptions {
+            max_threads,
+            exclusive_monitor: monitor,
+            ..Default::default()
+        });
+        let entry = guest.load(&exclusive_increment_loop());
+        let sentinel = guest.code + harness::CODE_BYTES - 4;
+        let mut cpus: Vec<_> = (0..threads_here)
+            .map(|_| {
+                let mut cpu = guest.backend.create_thread_with_tls().expect("a guest thread");
+                cpu.set_return_sentinel(sentinel).expect("arm the sentinel");
+                cpu
+            })
+            .collect();
+        // (label, threads, shared word?, iterations each)
+        let mut cells = vec![("1 thread, private word", 1usize, false, ONE)];
+        if threads_here == THREADS {
+            cells.push(("8 threads, private words", THREADS, false, EACH));
+            cells.push(("8 threads, one shared word", THREADS, true, EACH));
+        }
+        for (cell, n, shared, each) in cells {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            let mut retries = 0u64;
+            for round in 0..=SAMPLES {
+                for i in 0..n {
+                    guest.write_u64(guest.data + if shared { 0 } else { i * 128 }, 0);
+                }
+                let start = std::sync::Barrier::new(n + 1);
+                let (elapsed, failed) = std::thread::scope(|scope| {
+                    let handles: Vec<_> = cpus[..n]
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(i, cpu)| {
+                            let start = &start;
+                            let word = guest.data + if shared { 0 } else { i * 128 };
+                            scope.spawn(move || {
+                                cpu.set_x(x(0), word as u64);
+                                cpu.set_x(x(9), each);
+                                cpu.set_x(x(30), sentinel as u64);
+                                start.wait();
+                                let exit = cpu.run(entry, RunLimit::Unlimited).expect("runs");
+                                assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+                                cpu.x(x(10))
+                            })
+                        })
+                        .collect();
+                    start.wait();
+                    let t = Instant::now();
+                    let failed: u64 = handles.into_iter().map(|h| h.join().expect("joined")).sum();
+                    (t.elapsed(), failed)
+                });
+                let total: u64 = if shared {
+                    guest.read_u64(guest.data)
+                } else {
+                    (0..n).map(|i| guest.read_u64(guest.data + i * 128)).sum()
+                };
+                assert_eq!(total, n as u64 * each, "{label} {cell}: increments lost");
+                if round > 0 {
+                    // Round 0 warms the translation, as `measure` does.
+                    samples.push(elapsed);
+                    retries += failed;
+                }
+            }
+            let summary = Summary::of(samples);
+            let ns = summary.median.as_secs_f64() * 1e9 / (n as u64 * each) as f64;
+            println!(
+                "  {label} | {cell:27} : {ns:8.1} ns/increment  [{:7.1} .. {:7.1}]  retries/increment {:.3}",
+                summary.min.as_secs_f64() * 1e9 / (n as u64 * each) as f64,
+                summary.max.as_secs_f64() * 1e9 / (n as u64 * each) as f64,
+                retries as f64 / (SAMPLES as u64 * n as u64 * each) as f64
+            );
+        }
+    }
+}
+
+/// `BL offset` -- `1 00101 imm26`. Offset in instructions.
+const fn bl_rel(offset_insns: i64) -> u32 {
+    0x9400_0000 | ((offset_insns as u32) & 0x03FF_FFFF)
+}
+
+/// **What a guest call and return cost as the number of distinct blocks grows**, under the flag set
+/// the runtime uses (`INTERRUPTIBLE`: every `RET` returns to the dispatcher, which calls
+/// `GetCurrentBlockThunk` and looks the next block up in a `tsl::robin_map`) and under dynarmic's
+/// default (`ALL_SAFE`: a return-stack buffer predicts the `RET`, and a fast-dispatch table serves
+/// the misses from emitted code). H2 of the world performance work.
+///
+/// The guest is `K` call sites, each a `BL` to its own two-instruction function (`add; ret`), in a
+/// loop: `2K` blocks, one direct transfer and one indirect transfer per call. `K` runs from a
+/// microbenchmark's size to a world's (a busy engine thread translates hundreds of thousands of
+/// blocks), with a 128 MiB code cache so that no configuration evicts.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_a_call_and_return_as_the_block_map_grows() {
+    use omni_cpu::dynarmic::DynarmicBackend;
+    use omni_mem::{CommitPolicy, GuestSpace, Placement, Protection};
+    let _serial = serialized();
+    const SAMPLES: usize = 5;
+    println!("\n== one BL + RET to a distinct function, ns per call (median of {SAMPLES}) ==");
+    for k in [64usize, 1024, 16_384, 131_072] {
+        let calls_per_round: u64 = 4_000_000;
+        let loops = (calls_per_round / k as u64).max(1);
+        let mut row = Vec::new();
+        for (label, interruptible) in [("INTERRUPTIBLE", true), ("ALL_SAFE", false)] {
+            let space = std::sync::Arc::new(GuestSpace::new().expect("a guest space"));
+            let bytes = (k * 4 + 64 + k * 8 + 0xFFFF) & !0xFFFF;
+            let code = space
+                .map_anonymous(
+                    Placement::Anywhere { align: space.page_size() },
+                    bytes,
+                    Protection::ReadWrite,
+                    CommitPolicy::Eager,
+                )
+                .expect("a code region");
+            // Caller: x9 = loops; mov x20, x30; top: BL f_0 .. BL f_{k-1}; subs x9; b.ne top;
+            // mov x30, x20; ret. Functions follow, 8 bytes each.
+            let mut program = vec![mov_reg(20, 30)];
+            let top = program.len();
+            let functions_at = 1 + k + 4; // words
+            for i in 0..k {
+                let here = program.len() as i64;
+                program.push(bl_rel((functions_at + 2 * i) as i64 - here));
+            }
+            program.push(subs_imm(9, 9, 1));
+            let here = program.len();
+            program.push(b_cond(1, top as i32 - here as i32));
+            program.push(mov_reg(30, 20));
+            program.push(ret(30));
+            assert_eq!(program.len(), functions_at);
+            for _ in 0..k {
+                program.push(add_imm(2, 2, 1));
+                program.push(ret(30));
+            }
+            let ptr = space.ptr(code, program.len() * 4).expect("a host pointer");
+            // SAFETY: `ptr` is a committed, writable range of exactly this length in this space.
+            unsafe { core::ptr::copy_nonoverlapping(program.as_ptr(), ptr.cast::<u32>(), program.len()) };
+            space.protect(code, bytes, Protection::ReadExecute).expect("executable");
+            let backend = DynarmicBackend::new(
+                std::sync::Arc::clone(&space),
+                DynarmicOptions { code_cache_size: 128 << 20, interruptible, ..Default::default() },
+            )
+            .expect("a backend");
+            let mut cpu = backend.create_thread_with_tls().expect("a context");
+            let sentinel = code + bytes - 4;
+            cpu.set_return_sentinel(sentinel).expect("sentinel");
+            let mut samples = Vec::new();
+            for round in 0..=SAMPLES {
+                cpu.set_x(x(30), sentinel as u64);
+                cpu.set_x(x(9), loops);
+                let t = Instant::now();
+                let exit = cpu.run(code, RunLimit::Unlimited).expect("runs");
+                assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+                if round > 0 {
+                    samples.push(t.elapsed());
+                }
+            }
+            let summary = Summary::of(samples);
+            let ns = summary.median.as_secs_f64() * 1e9 / (loops * k as u64) as f64;
+            row.push(format!("{label} {ns:6.2}"));
+        }
+        println!("  {:>7} call sites ({:>7} blocks): {}", k, 2 * k, row.join(" | "));
+    }
+}

@@ -26,6 +26,34 @@ pub struct InlineThunkCounts {
     pub deferred: u64,
 }
 
+/// What a context's translator has done since the context was created, for a diagnostic that
+/// has to tell translating apart from executing.
+///
+/// **A watch, not a detector** (`docs/VERIFICATION.md` entry 11): each counter rises with the work
+/// it names and says nothing about whether that work was right. Every field is a plain count kept
+/// by the context that owns it, so reading them costs the backend nothing it would not do anyway.
+/// A backend that does not translate reports zeros, which is the truth for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JitCounters {
+    /// Guest instruction words fetched for translation. Translation is the only thing that
+    /// fetches, so this is instructions translated (a block's words are fetched once per
+    /// translation of that block).
+    pub fetched: u64,
+    /// Translations started: a fetch that does not continue the previous fetch's straight line
+    /// begins a new block.
+    pub blocks: u64,
+    /// Of those, translations of a block start this context had translated before -- only counted
+    /// while [`retranslation tracking`](crate::stats::track_retranslation) is on, and `0`
+    /// otherwise. A steady rise means translated code is being thrown away and rebuilt: a code
+    /// cache too small for what the thread runs, or invalidation.
+    pub retranslated: u64,
+    /// Instruction-cache maintenance the guest asked for (`IC IVAU`, `IC IALLU`).
+    pub icache_ops: u64,
+    /// Ranges this context was asked to drop from its translation cache
+    /// ([`GuestCpu::invalidate_code`]).
+    pub invalidations: u64,
+}
+
 /// A way to stop a running guest thread from another thread.
 ///
 /// Cloneable, `Send` and `Sync`, and obtained *before* [`GuestCpu::run`] is called — which it has to
@@ -366,6 +394,12 @@ pub trait GuestCpu: Send {
     /// process counter shows as flat — which is why this is on the trait at all rather than being
     /// left to whoever remembers to measure. See [`ContextCost`].
     fn cost(&self) -> ContextCost;
+
+    /// What this context's translator has done. See [`JitCounters`]; zeros from a backend that
+    /// does not translate.
+    fn jit_counters(&self) -> JitCounters {
+        JitCounters::default()
+    }
 }
 
 /// What makes [`GuestCpu`] contexts, and holds whatever they share.

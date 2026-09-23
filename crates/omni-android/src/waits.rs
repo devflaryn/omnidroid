@@ -176,6 +176,29 @@ impl Timed {
     }
 }
 
+/// One entry of a [`snapshot`]: `(guest thread, slot, call site, object, op)`.
+pub(crate) type SnapshotKey = (u64, u64, u64, u64, u64);
+
+/// Every entry's running totals, merged across the per-thread tables: `(count, total ns, max ns)`.
+///
+/// For a reader that reports **intervals** (`crate::perf`): it keeps the previous snapshot and
+/// prints the difference, so this leaves the totals alone and the end-of-session [`report`] still
+/// sees everything.
+pub(crate) fn snapshot() -> HashMap<SnapshotKey, (u64, u64, u64)> {
+    let mut merged: HashMap<SnapshotKey, (u64, u64, u64)> = HashMap::new();
+    for table in TABLES.lock().iter() {
+        for (key, stat) in table.lock().iter() {
+            let into = merged
+                .entry((key.thread, key.slot, key.caller, key.object, key.op))
+                .or_insert((0, 0, 0));
+            into.0 += stat.count;
+            into.1 = into.1.saturating_add(stat.total_ns);
+            into.2 = into.2.max(stat.max_ns);
+        }
+    }
+    merged
+}
+
 /// The report: per guest thread, its handler time in all and its `per_thread` largest entries,
 /// over `seconds` of tracing. `name` turns a slot into its symbol and `base` turns a call site
 /// into a link address.

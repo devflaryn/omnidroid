@@ -111,6 +111,7 @@ pub mod fs;
 pub mod log;
 pub mod net;
 pub mod process;
+pub mod sampler;
 pub mod vm;
 pub mod webview;
 pub mod window;

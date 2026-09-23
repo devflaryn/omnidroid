@@ -411,7 +411,7 @@ impl BoundaryBuilder {
     #[must_use]
     pub fn finish(self) -> Arc<Boundary> {
         let inner = self.inner.into_inner();
-        Arc::new(Boundary {
+        let boundary = Arc::new(Boundary {
             mem: GuestMem::new(self.space),
             region: inner.region,
             slots: inner.slots,
@@ -424,7 +424,9 @@ impl BoundaryBuilder {
             last_call: AtomicUsize::new(0),
             last_caller: AtomicUsize::new(0),
             thread_records: parking_lot::Mutex::new(Vec::new()),
-        })
+        });
+        crate::perf::register_boundary(&boundary);
+        boundary
     }
 }
 
@@ -863,11 +865,7 @@ impl Boundary {
     #[inline]
     fn mark_thread(&self, slot: GuestAddr, caller: GuestAddr) {
         CROSSING.with(|cell| {
-            let record = cell.get_or_init(|| {
-                let record = Arc::new(ThreadCrossing::default());
-                self.thread_records.lock().push(Arc::clone(&record));
-                record
-            });
+            let record = cell.get_or_init(|| self.new_record());
             record.slot.store(slot, Ordering::Relaxed);
             record.caller.store(caller, Ordering::Relaxed);
             record.depth.fetch_add(1, Ordering::Relaxed);
@@ -879,6 +877,40 @@ impl Boundary {
                 record.guest_thread.store(thread.0, Ordering::Relaxed);
             }
         });
+    }
+
+    /// This host thread's record, registered with this boundary the first time it is asked for.
+    fn new_record(&self) -> Arc<ThreadCrossing> {
+        let record = Arc::new(ThreadCrossing::default());
+        self.thread_records.lock().push(Arc::clone(&record));
+        record
+    }
+
+    /// Whether the census is counting right now -- which is what makes a thread record's
+    /// `crossings`/`exits` pair say whether the thread is inside a handler.
+    pub(crate) fn census_on(&self) -> bool {
+        self.census.load(Ordering::Relaxed)
+    }
+
+    /// Every host thread's record, for `crate::perf`. A clone of the list, so the lock is held
+    /// for the copy only.
+    pub(crate) fn perf_records(&self) -> Vec<Arc<ThreadCrossing>> {
+        self.thread_records.lock().clone()
+    }
+
+    /// The calling thread's record for `crate::perf`, created -- and its sampling handle opened --
+    /// the first time. Only called while `OMNI_PERF` is on, so a run without it creates records
+    /// exactly where it always did (a crossing under the census).
+    fn perf_record(&self) -> Arc<ThreadCrossing> {
+        let record = CROSSING.with(|cell| Arc::clone(cell.get_or_init(|| self.new_record())));
+        record.perf.host.get_or_init(|| {
+            omni_platform::sampler::HostThread::current()
+                .expect("a sampling handle to this thread (OMNI_PERF)")
+        });
+        if let Some(thread) = crate::bionic::current_guest_thread() {
+            record.guest_thread.store(thread.0, Ordering::Relaxed);
+        }
+        record
     }
 
     /// Record that this thread's handler returned. See [`ThreadCrossingReport::exits`].
@@ -1178,6 +1210,8 @@ impl Boundary {
         // `StepLimitReached` carries one segment's count, and a caller that asked for a budget over
         // the run wants it over the run.
         let mut spent = 0u64;
+        // `OMNI_PERF`'s per-thread record, or nothing: one relaxed load when it is off.
+        let perf = crate::perf::enabled().then(|| self.perf_record());
         loop {
             RUN_LOOP_ITERATIONS.fetch_add(1, Ordering::Relaxed);
             // The containment for a guest that loops through the *exit* path: each crossing returns
@@ -1205,6 +1239,9 @@ impl Boundary {
             // unbounded one.
             spent = spent.saturating_add(cpu.last_run_instructions());
             RUN_LOOP_INSTRUCTIONS.fetch_add(cpu.last_run_instructions(), Ordering::Relaxed);
+            if let Some(record) = &perf {
+                crate::perf::publish_segment(&record.perf, cpu);
+            }
             let site = match exit {
                 ExitReason::Thunk { pc: site } => site,
                 // **A branch into the region that was not a call to a slot's first instruction.**
@@ -1550,12 +1587,52 @@ fn exit_name(exit: &ExitReason) -> &'static str {
 ///
 /// Three relaxed atomics rather than a lock, because this is written on every import.
 #[derive(Debug, Default)]
-struct ThreadCrossing {
+pub(crate) struct ThreadCrossing {
     slot: AtomicUsize,
     caller: AtomicUsize,
     depth: AtomicU64,
     exits: AtomicU64,
     guest_thread: AtomicU64,
+    /// What `crate::perf` reads, written only while it is on. See [`ThreadPerf`].
+    pub(crate) perf: ThreadPerf,
+}
+
+/// One host thread's running totals for `crate::perf`'s interval reporter.
+///
+/// Written by the thread itself at the end of every run segment (a step window or a crossing
+/// that exits the loop), **only while `OMNI_PERF` is on**, and read by the reporter thread. Every
+/// field is the thread's own, so a relaxed store per segment is all it costs.
+#[derive(Debug, Default)]
+pub(crate) struct ThreadPerf {
+    /// Guest instructions this thread has run.
+    pub(crate) instructions: AtomicU64,
+    /// The context's [`omni_cpu::JitCounters`], as last published: fetched, blocks, retranslated,
+    /// icache ops, invalidations.
+    pub(crate) jit: [AtomicU64; 5],
+    /// The host processor it last ran a segment on, for the efficiency-class split.
+    pub(crate) cpu: std::sync::atomic::AtomicU32,
+    /// A handle the sampler can suspend and read, opened on the thread's first segment.
+    pub(crate) host: std::sync::OnceLock<omni_platform::sampler::HostThread>,
+}
+
+/// A copy of one thread's record, for `crate::perf`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CrossingState {
+    pub(crate) slot: GuestAddr,
+    pub(crate) crossings: u64,
+    pub(crate) exits: u64,
+    pub(crate) guest_thread: u64,
+}
+
+impl ThreadCrossing {
+    pub(crate) fn state(&self) -> CrossingState {
+        CrossingState {
+            slot: self.slot.load(Ordering::Relaxed),
+            crossings: self.depth.load(Ordering::Relaxed),
+            exits: self.exits.load(Ordering::Relaxed),
+            guest_thread: self.guest_thread.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Where one host thread was at its last crossing, as [`Boundary::threads`] reports it.

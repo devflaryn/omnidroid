@@ -54,6 +54,7 @@ pub mod error;
 pub mod jni;
 pub mod mem;
 pub mod ndk;
+pub mod perf;
 pub mod region;
 pub mod varargs;
 pub mod vulkan;

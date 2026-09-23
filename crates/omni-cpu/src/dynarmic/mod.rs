@@ -92,15 +92,17 @@ use dynarmic_sys::{
     od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec, od_jit_halt,
     od_jit_invalidate_range, od_jit_new, od_jit_reset_stats, od_jit_run, od_jit_set_pc,
     od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec, od_jit_slow_path_total,
-    od_jit_stats, od_monitor_free,
-    od_monitor_new, OdConfig, OdEffectiveConfig, OdStats, OD_DYNARMIC_ABI_VERSION,
+    od_jit_stats, od_monitor_free, od_monitor_layout_of,
+    od_monitor_new, OdConfig, OdEffectiveConfig, OdMonitorLayout, OdStats, OD_DYNARMIC_ABI_VERSION,
     OD_HALT_CACHE_INVALIDATION, OD_HALT_MEMORY_ABORT, OD_HALT_SHIM_REENTERED, OD_HALT_SHIM_THREW,
     OD_HALT_USER1, OD_HALT_USER8, OD_FIXED_PER_JIT_BYTES,
 };
 use omni_mem::{DemandPager, FaultAccess, GuestAddr, GuestSpace, PagerStats, Protection};
 
 use crate::context::{ContextCost, GuestAddressSpace, GuestRange, GuestThreadConfig};
-use crate::cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle, InlineThunkCounts};
+use crate::cpu::{
+    Capabilities, GuestCpu, GuestCpuBackend, HaltHandle, InlineThunkCounts, JitCounters,
+};
 use crate::error::{CpuError, CpuResult};
 use crate::exit::{AccessKind, ExitReason, RunLimit};
 use crate::fastmem::{require_identity_mapping, MemoryMapping};
@@ -140,6 +142,37 @@ const HALT_PANIC: u32 = OD_HALT_USER8;
 const HALT_OURS: u32 =
     HALT_EXIT | HALT_PANIC | OD_HALT_MEMORY_ABORT | OD_HALT_CACHE_INVALIDATION;
 
+
+/// How guest exclusive loads and stores (`LDXR`/`STXR`, `LDAXP`/`STLXP` and the rest) are made
+/// atomic across guest threads.
+///
+/// Both arms perform every exclusive store as **one host `lock cmpxchg`** (`cmpxchg16b` for a
+/// pair) against the value the thread's own exclusive load read, so both are value-compare at the
+/// memory word. They differ in what surrounds it -- `docs/DECISIONS.md` (D31) has the argument and
+/// `tests/exclusive.rs` the lost-update stress test and the one behaviour that differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusiveMonitor {
+    /// dynarmic's global monitor: every exclusive load and store takes one **process-wide** spin
+    /// lock, and every exclusive store also clears every other processor's reservation of the same
+    /// address -- a scan emitted **inline and unrolled over every slot the monitor was sized for**
+    /// (`EmitExclusiveTestAndClear`), so it costs `max_threads` compares whether or not those
+    /// threads exist.
+    Global,
+    /// No global lock and no scan (dynarmic's `Unsafe_IgnoreGlobalMonitor`): each processor keeps
+    /// its own reservation, and an exclusive store succeeds iff the reserved address matches and
+    /// the word still holds the reserved value. The one observable difference from `Global` is
+    /// ABA across another thread's **exclusive** store, which `Global` fails and this succeeds.
+    ValueCompare,
+}
+
+/// Slots between two processors' monitor entries under [`ExclusiveMonitor::ValueCompare`].
+///
+/// dynarmic keeps the reservations in two dense arrays (8-byte addresses, 16-byte values), so
+/// adjacent processors share cache lines, and every exclusive load by one writes a line that the
+/// others' exclusive loads also write. Eight slots apart puts each processor on lines of its own.
+/// Free under `ValueCompare`, which emits no scan; under `Global` the scan is unrolled over every
+/// slot, so there the stride stays 1.
+const VALUE_COMPARE_SLOT_STRIDE: u32 = 8;
 
 /// How the translating backend is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +225,13 @@ pub struct DynarmicOptions {
     /// callback path is then the designed route for a first touch rather than a degradation.
     /// [`DynarmicBackend::slice_invariant_armed`] reports what is actually in force.
     pub assert_callback_free_slices: bool,
+    /// How exclusive loads and stores are made atomic. See [`ExclusiveMonitor`].
+    pub exclusive_monitor: ExclusiveMonitor,
+    /// **A measurement switch, `None` in every shipped configuration**: the raw dynarmic
+    /// optimization mask (safe bits only) to use instead of the one
+    /// [`interruptible`](Self::interruptible) selects. Set from `OMNI_JIT_OPTIMIZATIONS` by
+    /// [`with_environment`](Self::with_environment), which says so.
+    pub optimizations_override: Option<u32>,
 }
 
 impl Default for DynarmicOptions {
@@ -204,6 +244,8 @@ impl Default for DynarmicOptions {
             interruptible: true,
             check_halt_on_memory_access: true,
             assert_callback_free_slices: true,
+            exclusive_monitor: ExclusiveMonitor::Global,
+            optimizations_override: None,
         }
     }
 }
@@ -212,11 +254,91 @@ impl DynarmicOptions {
     /// The `OptimizationFlag` bitmask these options select.
     #[must_use]
     pub const fn optimizations(&self) -> u32 {
-        if self.interruptible {
-            optimization::INTERRUPTIBLE
-        } else {
-            optimization::ALL_SAFE
+        let safe = match self.optimizations_override {
+            Some(mask) => mask & optimization::ALL_SAFE,
+            None if self.interruptible => optimization::INTERRUPTIBLE,
+            None => optimization::ALL_SAFE,
+        };
+        match self.exclusive_monitor {
+            ExclusiveMonitor::Global => safe,
+            ExclusiveMonitor::ValueCompare => safe | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
         }
+    }
+
+    /// Whether dynarmic's `unsafe_optimizations` gate has to be open: only for the one unsafe flag
+    /// these options can select, [`ExclusiveMonitor::ValueCompare`]'s.
+    #[must_use]
+    pub const fn unsafe_optimizations(&self) -> bool {
+        matches!(self.exclusive_monitor, ExclusiveMonitor::ValueCompare)
+    }
+
+    /// Monitor slots between two processors: see [`VALUE_COMPARE_SLOT_STRIDE`].
+    #[must_use]
+    pub const fn monitor_slot_stride(&self) -> u32 {
+        match self.exclusive_monitor {
+            ExclusiveMonitor::Global => 1,
+            ExclusiveMonitor::ValueCompare => VALUE_COMPARE_SLOT_STRIDE,
+        }
+    }
+
+    /// Apply the process's measurement switches. **Each says so on stderr when it is set**,
+    /// because a run measured under one is a run about the switch (`docs/VERIFICATION.md`
+    /// entry 15):
+    ///
+    /// * `OMNI_JIT_EXCLUSIVE_MONITOR=global|value` -- [`ExclusiveMonitor`];
+    /// * `OMNI_JIT_OPTIMIZATIONS=<hex mask>` -- [`optimizations_override`](Self::optimizations_override);
+    /// * `OMNI_JIT_CHECK_HALT_ON_MEMORY=0|1` -- [`check_halt_on_memory_access`](Self::check_halt_on_memory_access);
+    /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`].
+    ///
+    /// Called by [`DynarmicBackend::new`], so every backend in the process sees the same switches.
+    ///
+    /// # Panics
+    ///
+    /// On a value it cannot read, naming the switch: a typo must not silently measure the default.
+    #[must_use]
+    pub fn with_environment(mut self) -> Self {
+        fn say(text: &str) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "JIT SWITCH: {text}");
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_EXCLUSIVE_MONITOR") {
+            self.exclusive_monitor = match value.trim() {
+                "global" => ExclusiveMonitor::Global,
+                "value" => ExclusiveMonitor::ValueCompare,
+                other => panic!("OMNI_JIT_EXCLUSIVE_MONITOR={other:?} is not `global` or `value`"),
+            };
+            say(&format!(
+                "exclusive monitor {:?} (OMNI_JIT_EXCLUSIVE_MONITOR)",
+                self.exclusive_monitor
+            ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_OPTIMIZATIONS") {
+            let text = value.trim().trim_start_matches("0x");
+            let mask = u32::from_str_radix(text, 16)
+                .unwrap_or_else(|_| panic!("OMNI_JIT_OPTIMIZATIONS={value:?} is not a hex mask"));
+            let before = self.optimizations();
+            self.optimizations_override = Some(mask);
+            say(&format!(
+                "optimization mask {:#010x} instead of {before:#010x} (OMNI_JIT_OPTIMIZATIONS). A                  measurement: with ReturnStackBuffer or FastDispatch set, an indirect-branch loop                  checks no budget (D16)",
+                self.optimizations()
+            ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_CHECK_HALT_ON_MEMORY") {
+            self.check_halt_on_memory_access = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_CHECK_HALT_ON_MEMORY={other:?} is not 0 or 1"),
+            };
+            say(&format!(
+                "check_halt_on_memory_access = {} (OMNI_JIT_CHECK_HALT_ON_MEMORY). A measurement:                  off, a guest fault no longer stops at the faulting instruction",
+                self.check_halt_on_memory_access
+            ));
+        }
+        if std::env::var_os("OMNI_JIT_RETRANSLATION").is_some() {
+            crate::stats::track_retranslation(true);
+            say("counting retranslated block starts per context (OMNI_JIT_RETRANSLATION)");
+        }
+        self
     }
 }
 
@@ -286,8 +408,20 @@ unsafe impl Send for Monitor {}
 // SAFETY: as above.
 unsafe impl Sync for Monitor {}
 
+impl Monitor {
+    /// Where the monitor keeps its lock and slots.
+    fn layout(&self) -> OdMonitorLayout {
+        let mut out = OdMonitorLayout::default();
+        // SAFETY: `self.0` came from `od_monitor_new` and is freed only in `drop`; `out` is
+        // writable.
+        unsafe { od_monitor_layout_of(self.0, &mut out) };
+        out
+    }
+}
+
 impl Drop for Monitor {
     fn drop(&mut self) {
+        crate::stats::unregister_monitor(self.layout().lock as usize);
         // SAFETY: the handle came from `od_monitor_new` and every jit using it has been freed —
         // `DynarmicBackend` hands out contexts that hold an `Arc` of the shared state, so the
         // monitor outlives them all.
@@ -375,19 +509,23 @@ impl DynarmicBackend {
     /// [`CpuError::InvalidAddressSpace`] for a space that cannot be described, or
     /// [`CpuError::Memory`] if the TLS arena could not be reserved.
     pub fn new(space: Arc<GuestSpace>, options: DynarmicOptions) -> CpuResult<Self> {
+        // The process's measurement switches, each announced where it is set. Applied here rather
+        // than by the embedding so that every backend -- a gate's, a test's -- honours the same
+        // ones and none can forget to.
+        let options = options.with_environment();
         let extent = GuestAddressSpace::of(&space)?;
         let tls = TlsArena::new(&space, options.max_threads.max(1) as usize)?;
 
+        // One slot per processor under the global monitor; `monitor_slot_stride` apart under
+        // value-compare, where the scan the slot count would cost is not emitted at all.
+        let slots = u64::from(options.max_threads.max(1)) * u64::from(options.monitor_slot_stride());
         // SAFETY: freed exactly once, in `Monitor::drop`, after every jit that references it.
-        let raw = unsafe { od_monitor_new(u64::from(options.max_threads.max(1))) };
+        let raw = unsafe { od_monitor_new(slots) };
         if raw.is_null() {
             return Err(CpuError::Backend {
                 backend: BACKEND_NAME,
                 operation: "allocate the shared exclusive monitor",
-                detail: format!(
-                    "od_monitor_new({}) returned null",
-                    options.max_threads.max(1)
-                ),
+                detail: format!("od_monitor_new({slots}) returned null"),
             });
         }
 
@@ -419,11 +557,23 @@ impl DynarmicBackend {
         };
         let owns_guest_paging = pager.is_some();
 
+        let monitor = Monitor(raw);
+        let layout = monitor.layout();
+        crate::stats::register_monitor(crate::stats::MonitorLayout {
+            lock: layout.lock as usize,
+            addresses: layout.addresses as usize,
+            address_stride: layout.address_stride as usize,
+            values: layout.values as usize,
+            value_stride: layout.value_stride as usize,
+            slots: layout.processor_count as usize,
+            global: options.exclusive_monitor == ExclusiveMonitor::Global,
+        });
+
         Ok(Self {
             shared: Arc::new(Shared {
                 space,
                 extent,
-                monitor: Monitor(raw),
+                monitor,
                 tls,
                 options,
                 _pager: pager,
@@ -869,6 +1019,14 @@ pub(crate) struct CpuCtx {
     pub(crate) suppressed_breakpoint: Option<GuestAddr>,
 
     pub(crate) pending: Option<PendingExit>,
+    /// What this context's translator has done; see [`JitCounters`]. Plain integers: the context
+    /// is owned by one thread, and a reader gets a copy through [`GuestCpu::jit_counters`].
+    pub(crate) counters: JitCounters,
+    /// The previous fetch's address, so a fetch that does not continue it counts a block start.
+    pub(crate) last_fetch: u64,
+    /// Block starts translated so far, kept only while
+    /// [`crate::stats::tracking_retranslation`] is on.
+    pub(crate) seen_blocks: Option<std::collections::HashSet<u64>>,
     pub(crate) ticks_remaining: u64,
     pub(crate) ticks_used: u64,
     pub(crate) panic_msg: Option<String>,
@@ -979,6 +1137,9 @@ impl DynarmicCpu {
             sentinel: None,
             suppressed_breakpoint: None,
             pending: None,
+            counters: JitCounters::default(),
+            last_fetch: 0,
+            seen_blocks: None,
             ticks_remaining: 0,
             ticks_used: 0,
             panic_msg: None,
@@ -1025,7 +1186,8 @@ impl DynarmicCpu {
             // 21x anti-scaling as a primary risk.
             fastmem_exclusive_access: 1,
             monitor: shared.monitor.0,
-            processor_id,
+            // Spaced by the stride the monitor was sized with; see `VALUE_COMPARE_SLOT_STRIDE`.
+            processor_id: processor_id * options.monitor_slot_stride(),
             code_cache_size: options.code_cache_size,
             // Programmed rather than left at 0, which would select dynarmic's own default. The
             // default is the same 600 MHz, so nothing a guest can read changes -- but the counter
@@ -1040,7 +1202,9 @@ impl DynarmicCpu {
             hook_hint_instructions: 0,
             define_unpredictable_behaviour: 0,
             check_halt_on_memory_access: i32::from(options.check_halt_on_memory_access),
-            unsafe_optimizations: 0,
+            // Open only for the one unsafe flag `DynarmicOptions` can select, and that flag is in
+            // `optimizations` exactly when this is 1 -- dynarmic requires both.
+            unsafe_optimizations: i32::from(options.unsafe_optimizations()),
             optimizations: options.optimizations(),
         };
 
@@ -1519,7 +1683,10 @@ impl GuestCpu for DynarmicCpu {
     }
 
     fn invalidate_code(&mut self, range: GuestRange) -> CpuResult<()> {
-        self.with_ctx(|ctx| ctx.executable_cache = None);
+        self.with_ctx(|ctx| {
+            ctx.executable_cache = None;
+            ctx.counters.invalidations += 1;
+        });
         // SAFETY: the jit is live; the shim clamps a zero or overflowing length, which matters
         // because this range comes from guest `mprotect`, guest `munmap` and the guest's own
         // `IC IVAU` (Global Constraint 11).
@@ -1638,6 +1805,10 @@ impl GuestCpu for DynarmicCpu {
     /// against the 128 MiB default.
     fn cost(&self) -> ContextCost {
         self.cost
+    }
+
+    fn jit_counters(&self) -> JitCounters {
+        self.with_ctx(|ctx| ctx.counters)
     }
 }
 
