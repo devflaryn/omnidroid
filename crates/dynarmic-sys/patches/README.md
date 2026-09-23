@@ -9,6 +9,13 @@ which kept "the 202,200 upstream assertions pass on our pin" a claim about
 upstream rather than about us; that figure has **not** been re-measured with
 0001 applied, and should be before it is repeated.
 
+**Re-measured 2026-09-24, in the runtime's own configuration**
+(`-DDYNARMIC_FRONTENDS=A64`, Release, MSVC 2022, `dynarmic_tests.exe` with no
+filter): **All tests passed (201,698 assertions in 84 test cases)** with 0001
+alone (built from a clean checkout of `83cfa6e`) **and the identical figure with
+0001 + 0002**. The older 202,200/123 was a build that also had the A32 frontend;
+it is not comparable and was not re-run.
+
 ## Applied
 
 ### 0001 — `MRS Xt, CNTVCT_EL0` reads the counter `CNTPCT_EL0` reads
@@ -32,6 +39,32 @@ setup). So on the platform the guest was built for, the two registers read the
 same count, at the same `CNTFRQ_EL0` — which is what `omni-cpu`'s
 `cntvct_reads_the_same_clock_as_cntpct` asserts, from guest `MRS`
 instructions.
+
+### 0002 — a guest thread's fixed cost: the fast-dispatch table and the prelude commit
+
+`0002-per-thread-fixed-cost-fast-dispatch-and-prelude-commit.patch`, D32. Two
+changes, both to what every `A64::Jit` costs before it has translated anything:
+
+1. **The fast-dispatch table is allocated only when `FastDispatch` is on**
+   (candidate 4 below, applied as specified there): `A64EmitX64` holds a
+   `std::unique_ptr<std::array<FastDispatchEntry, …>>`, made in its constructor
+   under `conf.HasOptimization(OptimizationFlag::FastDispatch)` before
+   `GenTerminalHandlers` (its first reader); `ClearFastDispatchTable` and the two
+   emitted table addresses dereference it, all already under the same test.
+   Omnidroid runs with the optimization off (D16), so the 16 MiB -- written in
+   full by the entries' non-zero initialiser -- is simply not there.
+2. **`PRELUDE_COMMIT_SIZE` 16 MiB → 2 MiB** (`block_of_code.cpp`). The constant
+   pool commits its own 2 MiB; the prelude after it measured about 1.1 MiB; every
+   block after that is committed by `GetBlock`'s own 1 MiB-ahead
+   `EnsureMemoryCommitted`. At 16 MiB each thread held ~15 MiB of commit it never
+   touched. MEASURED on a live landing before the change: the least-used code
+   caches committed 18.0 MiB each and touched one contiguous run of 3,200 KiB.
+
+**MEASURED effect**, the logged-out landing at +100 s, 45 guest JITs, n = 1 each,
+same scenario (`memrun.sh` in the 2026-09-24 session scratchpad): process commit
+3,157 → **2,105 MiB**, working set 2,528 → **1,884 MiB**; code caches 882 → 499
+MiB committed; fast-dispatch tables 44 × 16 MiB → none. Upstream suite: identical
+before and after (above).
 
 ## How a patch is carried
 
@@ -235,6 +268,9 @@ against D10's whole budget.
 whether it is read already exist, so the change is the allocation and the null checks, not the
 control flow. Worth **16 MiB per guest thread, about 512 MiB at 32 threads**, and more in working set
 than in commit charge because the constructor writes it.
+
+**Applied as 0002 (2026-09-24)**, after the suite run this paragraph asked for -- see "Applied"
+above. The paragraph that follows is the reasoning as it stood before:
 
 **Not applied.** It changes a hot structure's indirection on the path that *is* enabled upstream, so
 it needs the 202,200-assertion suite run against it with `FastDispatch` both on and off before it can

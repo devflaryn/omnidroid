@@ -3954,3 +3954,46 @@ difference is invisible: a retry loop that succeeds on an unchanged value is the
 A world measurement: the `mon` share `OMNI_PERF`'s sampler reports on the busy threads, and
 presents per 5 s with each arm, same scenario, n stated. If the monitor is not where a world's
 time goes, the default stays. Recorded here when measured.
+
+## D32 — A guest thread's fixed JIT cost is paid on demand: vendored patch 0002
+
+**Decided 2026-09-24 (Windows session, the owner's memory requirement: "strictly on demand -- no
+fixed reservation, no page-file reliance", D10).** A change to the vendored dynarmic tree, so a
+decision rather than a side effect (D5). The patch and its measurements are in
+`crates/dynarmic-sys/patches/README.md` under 0002.
+
+### What every guest thread paid before any translation (MEASURED, a live logged-out landing, 44-45 guest threads)
+
+* a **16 MiB fast-dispatch table**, 704 MiB of commit **and** of working set in all -- written in
+  full by the constructor, for an optimization this runtime turns off (D16);
+* a **16 MiB prelude commit** in every code cache (18.0 MiB with the constant pool), of which the
+  least-used caches touched 3,200 KiB -- 882 MiB committed for 432 MiB used.
+
+Together about 1.6 GB of the landing's 3.2 GB of commit. A game world runs well over a hundred
+guest threads (bionic's table was raised to 256 for one), so the same terms there are several GB.
+
+### The change
+
+The table is allocated only when `FastDispatch` is enabled (every reader was already under that
+test), and the prelude commit is 2 MiB -- the constant pool commits its own 2 MiB, and each block
+after the prelude is committed by dynarmic's own 1 MiB-ahead `EnsureMemoryCommitted`. The code
+cache's *reservation* is unchanged (32 MiB per thread of address space, `CODE_CACHE_BYTES`); what
+it costs in commit is now what the thread has translated plus 1 MiB.
+
+### Evidence
+
+* Landing at +100 s, same scenario, n = 1 each: commit 3,157 → 2,105 MiB, working set 2,528 →
+  1,884 MiB, both runs passing the gate.
+* dynarmic's own suite in the runtime's configuration (A64 frontend, Release): 201,698 assertions
+  in 84 cases pass with 0001 alone and with 0001 + 0002. The suite runs with upstream's default
+  optimizations, FastDispatch **on**, so it exercises the path that still allocates the table;
+  every omni-cpu and omni-android suite exercises it off.
+* `dynarmic-sys/tests/pin_constants.rs` now pins the patched declaration and the allocation's
+  guard, so a re-pin that drops 0002 fails by name.
+
+### What it costs if wrong
+
+A prelude longer than 2 MiB would write past the committed range and fault in the first `Jit`
+constructor -- every test would show it at once, not rarely. If FastDispatch is ever turned on
+(D16 forbids it while it makes a guest loop unstoppable), the table is allocated exactly as
+upstream does.

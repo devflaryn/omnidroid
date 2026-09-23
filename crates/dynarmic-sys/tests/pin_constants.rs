@@ -12,11 +12,11 @@ fn vendored(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/dynarmic").join(relative)
 }
 
-/// The 16 MiB `FastDispatchEntry` table `A64EmitX64` holds as a member, which is the dominant term
-/// in this backend's per-guest-thread cost and is allocated whether or not the optimization that
-/// uses it is enabled.
+/// The 16 MiB `FastDispatchEntry` table, **allocated only when `FastDispatch` is on** -- patch 0002.
+/// Upstream held it by value in every `A64EmitX64`, the dominant term in a guest thread's cost
+/// whether or not the optimization that uses it was enabled.
 #[test]
-fn the_fixed_per_jit_state_is_still_a_sixteen_mebibyte_fast_dispatch_table() {
+fn the_fast_dispatch_table_is_sixteen_mebibytes_and_allocated_only_when_it_is_used() {
     let header = vendored("src/dynarmic/backend/x64/a64_emit_x64.h");
     let Ok(text) = std::fs::read_to_string(&header) else {
         // The vendored tree is present in every build that compiles this crate at all, so its
@@ -36,9 +36,22 @@ fn the_fixed_per_jit_state_is_still_a_sixteen_mebibyte_fast_dispatch_table() {
          OD_FIXED_PER_JIT_BYTES's second factor has moved"
     );
     assert!(
-        has("std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;"),
-        "the table is no longer a by-value member of A64EmitX64, so it may no longer be allocated \
-         per jit at all -- which would make the constant an overstatement rather than a floor"
+        has("std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;"),
+        "the table is no longer patch 0002's lazily allocated member -- if it is by value again, \
+         every jit pays 16 MiB of written memory for an optimization this runtime disables"
+    );
+    let emitter = vendored("src/dynarmic/backend/x64/a64_emit_x64.cpp");
+    let source = std::fs::read_to_string(&emitter)
+        .unwrap_or_else(|e| panic!("the vendored source {}: {e}", emitter.display()));
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    let allocation = lines
+        .iter()
+        .position(|l| l.starts_with("fast_dispatch_table = std::make_unique<"))
+        .expect("patch 0002 allocates the table in A64EmitX64's constructor");
+    assert_eq!(
+        lines[allocation - 1],
+        "if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {",
+        "the allocation is guarded by the optimization that reads the table, and by nothing else"
     );
 
     assert_eq!(

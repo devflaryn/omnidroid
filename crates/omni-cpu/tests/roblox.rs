@@ -668,9 +668,10 @@ fn execution_is_repeatable_and_leak_free() {
 ///
 /// D5 measured 20-35 MiB of unshared code cache per guest thread against dynarmic's 128 MiB
 /// default, and named it a primary risk against D10. This backend defaults the cache to 8 MiB, and
-/// the dominant term turns out not to be the cache at all — `A64EmitX64` holds a
-/// `std::array<FastDispatchEntry, 0x100000>`, a flat 16 MiB per jit, constructed and zeroed
+/// the dominant term turned out not to be the cache at all — upstream `A64EmitX64` holds a
+/// `std::array<FastDispatchEntry, 0x100000>`, a flat 16 MiB per jit, constructed and written
 /// whether or not the FastDispatch optimization is on, and this backend turns it off (D16).
+/// Patch 0002 (D32) allocates it only when it is on, and trims the cache's up-front commit.
 ///
 /// The figure is measured with `process_commit_charge`, which sees dynarmic's cache because the
 /// cache is a private `VirtualAlloc` commit rather than a section (D15's invisible half is the
@@ -710,7 +711,7 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
     println!(
         "per guest thread (n = {THREADS} threads, 1 measurement): {:.3} MiB at creation, \
          {:.3} MiB after translating real Roblox code; GuestCpu::cost() reports {:.3} MiB \
-         (the TLS page plus the pin's fixed 16 MiB per-jit table)",
+         (the TLS page, plus the 16 MiB fast-dispatch table only when FastDispatch is on)",
         per_thread_created as f64 / 1048576.0,
         per_thread_warm as f64 / 1048576.0,
         reported as f64 / 1048576.0,
@@ -783,11 +784,15 @@ const MAX_OTHER_PER_JIT_BYTES: u64 = 2 * 1024 * 1024;
 /// which decomposes as the 16 MiB `FastDispatchEntry` table plus the 8 MiB code cache plus the
 /// 4 KiB TLS page, and therefore tracks `code_cache_size` rather than translated volume.
 ///
-/// 32 MiB is that figure with about 30% of headroom, chosen so that ordinary variation in the
-/// process-global counter cannot fail the test while a real regression cannot pass it. It sits
-/// inside D5's measured 20-35 MiB band and **below** its top, which is what gives it teeth: the
-/// 128 MiB-cache configuration `STATUS.md` records at 34.65 MiB per thread would fail this.
-const MAX_THREAD_COMMIT_BYTES: u64 = 32 * 1024 * 1024;
+/// **Since patch 0002 (D32) it measures 4.47 MiB** (2026-09-24, n = 8 threads, 1 measurement):
+/// the table is not allocated with FastDispatch off, and the cache commits 2 MiB of prelude
+/// beyond its 2 MiB constant pool instead of 16 -- so the figure now tracks what was translated.
+///
+/// 6 MiB is that figure with about 34% of headroom for the process-global counter's noise, and it
+/// is the detector for both halves of the patch, each MEASURED by hand-applying it (2026-09-24):
+/// the table allocated again, 20.48 MiB; the 16 MiB prelude commit back, 8.49 MiB (capped at this
+/// test's 8 MiB cache). The 32 MiB this was before 0002 could see neither.
+const MAX_THREAD_COMMIT_BYTES: u64 = 6 * 1024 * 1024;
 
 /// The per-slice callback invariant, on real engine code: armed, and clean across a whole sweep.
 #[test]

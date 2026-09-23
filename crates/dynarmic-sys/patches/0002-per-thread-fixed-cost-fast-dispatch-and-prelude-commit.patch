@@ -1,0 +1,81 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index cec7813..fe60979 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -51,6 +51,9 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
+ 
+ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
+         : EmitX64(code), conf(conf), jit_interface{jit_interface} {
++    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++        fast_dispatch_table = std::make_unique<std::array<FastDispatchEntry, fast_dispatch_table_size>>();
++    }
+     GenMemory128Accessors();
+     GenFastmemFallbacks();
+     GenTerminalHandlers();
+@@ -162,7 +165,7 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
+ 
+ void A64EmitX64::ClearFastDispatchTable() {
+     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+-        fast_dispatch_table.fill({});
++        fast_dispatch_table->fill({});
+     }
+ }
+ 
+@@ -204,7 +207,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
+         calculate_location_descriptor();
+         code.L(rsb_cache_miss);
+-        code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.data()));
++        code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table->data()));
+         code.mov(rbp, rbx);
+         if (code.HasHostFeature(HostFeature::SSE42)) {
+             code.crc32(rbp, r12);
+@@ -223,7 +226,7 @@ void A64EmitX64::GenTerminalHandlers() {
+ 
+         code.align();
+         fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
+-        code.mov(code.ABI_PARAM2, reinterpret_cast<u64>(fast_dispatch_table.data()));
++        code.mov(code.ABI_PARAM2, reinterpret_cast<u64>(fast_dispatch_table->data()));
+         if (code.HasHostFeature(HostFeature::SSE42)) {
+             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
+         }
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index ed49315..49d146b 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -7,6 +7,7 @@
+ 
+ #include <array>
+ #include <map>
++#include <memory>
+ #include <optional>
+ #include <tuple>
+ 
+@@ -63,7 +64,9 @@ protected:
+     static_assert(sizeof(FastDispatchEntry) == 0x10);
+     static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
+     static constexpr size_t fast_dispatch_table_size = 0x100000;
+-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
++    // Omnidroid patch 0002: allocated only when FastDispatch is enabled. As a by-value member it
++    // was 16 MiB constructed (and written: the entries have a non-zero initializer) in every Jit.
++    std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;
+     void ClearFastDispatchTable();
+ 
+     void (*memory_read_128)();
+diff --git a/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/backend/x64/block_of_code.cpp
+index 22d9868..3ee10ef 100644
+--- a/src/dynarmic/backend/x64/block_of_code.cpp
++++ b/src/dynarmic/backend/x64/block_of_code.cpp
+@@ -55,7 +55,11 @@ const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {Block
+ namespace {
+ 
+ constexpr size_t CONSTANT_POOL_SIZE = 2 * 1024 * 1024;
+-constexpr size_t PRELUDE_COMMIT_SIZE = 16 * 1024 * 1024;
++// Omnidroid patch 0002: 2 MiB, not 16. The prelude (run code, memory accessors, terminal
++// handlers) measured at about 1.1 MiB beyond the constant pool, which commits its own 2 MiB;
++// every block after it is committed on demand by GetBlock's 1 MiB headroom. At 16 MiB each
++// guest thread held ~15 MiB of commit it never touched (D32).
++constexpr size_t PRELUDE_COMMIT_SIZE = 2 * 1024 * 1024;
+ 
+ class CustomXbyakAllocator : public Xbyak::Allocator {
+ public:

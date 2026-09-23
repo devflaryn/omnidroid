@@ -1241,15 +1241,19 @@ impl DynarmicCpu {
             tpidrro_el0,
             shared,
             cost: ContextCost {
-                // The guest's TLS block, plus the per-jit state this pin allocates unconditionally.
-                // Both are derived rather than measured: the first is one page by construction, the
-                // second is `sizeof(FastDispatchEntry) * fast_dispatch_table_size` from the pin,
-                // checked against the vendored header by `dynarmic-sys`'s `pin_constants` test. The
-                // code cache's committed high-water mark is still missing; see `cost`.
-                private_committed: tls
-                    .as_ref()
-                    .map_or(0, GuestTls::len)
-                    .saturating_add(OD_FIXED_PER_JIT_BYTES),
+                // The guest's TLS block, plus the fast-dispatch table **when the optimization that
+                // reads it is on** -- patch 0002 allocates it only then (D32). Both are derived
+                // rather than measured: the first is one page by construction, the second is
+                // `sizeof(FastDispatchEntry) * fast_dispatch_table_size` from the pin, checked
+                // against the vendored source by `dynarmic-sys`'s `pin_constants` test. The code
+                // cache's committed high-water mark is still missing; see `cost`.
+                private_committed: tls.as_ref().map_or(0, GuestTls::len).saturating_add(
+                    if options.optimizations() & dynarmic_sys::optimization::FAST_DISPATCH != 0 {
+                        OD_FIXED_PER_JIT_BYTES
+                    } else {
+                        0
+                    },
+                ),
                 shared_committed: 0,
             },
             tls,
@@ -1790,13 +1794,15 @@ impl GuestCpu for DynarmicCpu {
     /// what the guest has done:
     ///
     /// * the guest's bionic TLS block — one page, by construction;
-    /// * [`OD_FIXED_PER_JIT_BYTES`], the 16 MiB `FastDispatchEntry` table `A64EmitX64` holds as a
-    ///   by-value member, constructed and zeroed whether or not the optimization that uses it is
-    ///   enabled, which this backend disables (D16). `dynarmic-sys`'s `pin_constants` test reads
-    ///   both factors back out of the vendored header, so a re-pin cannot move it silently.
+    /// * [`OD_FIXED_PER_JIT_BYTES`], the 16 MiB `FastDispatchEntry` table, **only when the
+    ///   `FastDispatch` optimization is on** -- which this backend leaves off (D16). Upstream holds
+    ///   it by value and writes it in every jit; patch 0002 allocates it only when it is read
+    ///   (D32). `dynarmic-sys`'s `pin_constants` test reads both factors and the guard back out of
+    ///   the vendored source, so a re-pin cannot move them silently.
     ///
     /// **The missing term is dynarmic's code cache**, which on Windows commits incrementally as code
-    /// is emitted (`BlockOfCode::EnsureMemoryCommitted`), so the figure that matters is a high-water
+    /// is emitted (`BlockOfCode::EnsureMemoryCommitted`: 2 MiB for the prelude since patch 0002,
+    /// 16 MiB before it, then 1 MiB ahead of each block), so the figure that matters is a high-water
     /// mark. It is a private member of `BlockOfCode` that `A64::Jit` does not expose, and reading it
     /// would mean patching the vendored pin. It is **bounded above** by
     /// [`DynarmicOptions::code_cache_size`], and M2's gate asserts both ends: the measured

@@ -55,7 +55,11 @@ const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {Block
 namespace {
 
 constexpr size_t CONSTANT_POOL_SIZE = 2 * 1024 * 1024;
-constexpr size_t PRELUDE_COMMIT_SIZE = 16 * 1024 * 1024;
+// Omnidroid patch 0002: 2 MiB, not 16. The prelude (run code, memory accessors, terminal
+// handlers) measured at about 1.1 MiB beyond the constant pool, which commits its own 2 MiB;
+// every block after it is committed on demand by GetBlock's 1 MiB headroom. At 16 MiB each
+// guest thread held ~15 MiB of commit it never touched (D32).
+constexpr size_t PRELUDE_COMMIT_SIZE = 2 * 1024 * 1024;
 
 class CustomXbyakAllocator : public Xbyak::Allocator {
 public:

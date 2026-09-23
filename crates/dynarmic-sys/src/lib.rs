@@ -395,13 +395,15 @@ pub struct OdEffectiveConfig {
     pub tpidrro_el0_ptr: u64,
 }
 
-/// Bytes of per-jit state this pin allocates **unconditionally**, whatever the code cache size and
-/// whatever the guest does.
+/// Bytes of per-jit state this pin allocates **when the `FastDispatch` optimization is enabled**,
+/// whatever the code cache size and whatever the guest does -- and nothing when it is not.
 ///
-/// `A64EmitX64` holds `std::array<FastDispatchEntry, fast_dispatch_table_size>` as a member, with
-/// `sizeof(FastDispatchEntry) == 0x10` and `fast_dispatch_table_size == 0x100000` — a flat
-/// **16 MiB**, constructed and value-initialised by the constructor whether or not the
-/// `FastDispatch` optimization is enabled, which Omnidroid disables (D16).
+/// `A64EmitX64`'s fast-dispatch table is `sizeof(FastDispatchEntry) == 0x10` times
+/// `fast_dispatch_table_size == 0x100000`: a flat **16 MiB**, written in full on construction (the
+/// entries carry a non-zero initialiser). Upstream holds it by value, so every jit paid it whether
+/// or not the optimization was on; **patch 0002** (`patches/`, D32) allocates it only when it is,
+/// and Omnidroid runs with it off (D16). MEASURED on the landing, 45 guest threads: 704 MiB of
+/// commit and working set, gone.
 ///
 /// It is a constant rather than a call because it is a property of the *pin*, not of a live jit:
 /// there is no accessor for it and adding one would mean patching the vendored tree. What keeps it
