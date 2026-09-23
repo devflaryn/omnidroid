@@ -319,7 +319,9 @@ impl DynarmicOptions {
             let before = self.optimizations();
             self.optimizations_override = Some(mask);
             say(&format!(
-                "optimization mask {:#010x} instead of {before:#010x} (OMNI_JIT_OPTIMIZATIONS). A                  measurement: with ReturnStackBuffer or FastDispatch set, an indirect-branch loop                  checks no budget (D16)",
+                "optimization mask {:#010x} instead of {before:#010x} (OMNI_JIT_OPTIMIZATIONS). A \
+                 measurement: with ReturnStackBuffer or FastDispatch set, an indirect-branch loop \
+                 checks no budget (D16)",
                 self.optimizations()
             ));
         }
@@ -330,7 +332,8 @@ impl DynarmicOptions {
                 other => panic!("OMNI_JIT_CHECK_HALT_ON_MEMORY={other:?} is not 0 or 1"),
             };
             say(&format!(
-                "check_halt_on_memory_access = {} (OMNI_JIT_CHECK_HALT_ON_MEMORY). A measurement:                  off, a guest fault no longer stops at the faulting instruction",
+                "check_halt_on_memory_access = {} (OMNI_JIT_CHECK_HALT_ON_MEMORY). A measurement: \
+                 off, a guest fault no longer stops at the faulting instruction",
                 self.check_halt_on_memory_access
             ));
         }

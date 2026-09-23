@@ -903,10 +903,26 @@ impl Boundary {
     /// exactly where it always did (a crossing under the census).
     fn perf_record(&self) -> Arc<ThreadCrossing> {
         let record = CROSSING.with(|cell| Arc::clone(cell.get_or_init(|| self.new_record())));
-        record.perf.host.get_or_init(|| {
-            omni_platform::sampler::HostThread::current()
-                .expect("a sampling handle to this thread (OMNI_PERF)")
-        });
+        // A diagnostic must not end the guest thread it watches: a handle that cannot be opened
+        // (or a host with no sampler) leaves this thread unsampled -- `perf` skips a record with
+        // no handle -- and says so once.
+        if record.perf.host.get().is_none() {
+            match omni_platform::sampler::HostThread::current() {
+                Ok(host) => {
+                    let _ = record.perf.host.set(host);
+                }
+                Err(error) => {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        use std::io::Write as _;
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "PERF: a thread cannot be sampled ({error}); it is left out of the sampled shares"
+                        );
+                    });
+                }
+            }
+        }
         if let Some(thread) = crate::bionic::current_guest_thread() {
             record.guest_thread.store(thread.0, Ordering::Relaxed);
         }

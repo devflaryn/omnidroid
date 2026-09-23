@@ -8,7 +8,7 @@
 //! the third in translated code and nowhere near the monitor. If `mon` never lit up here, a world
 //! reading of `mon 0%` would mean nothing.
 
-#![cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#![cfg(target_arch = "x86_64")]
 
 mod harness;
 

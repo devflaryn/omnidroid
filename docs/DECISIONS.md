@@ -3907,3 +3907,50 @@ The comment in `dynarmic/mod.rs` said a wild guest address "faults instead of al
 page". It is true for the row above where it is true and silent about the row where it is not —
 `VERIFICATION.md` entry 13's shape exactly, in the file whose behaviour it describes. Corrected in
 place there, under **"What fastmem does not check"**, rather than deleted.
+
+## D31 — How guest exclusives are made atomic: dynarmic's global monitor, or value-compare
+
+**Status: OPEN. The runtime stays on dynarmic's global monitor (`ExclusiveMonitor::Global`, the
+default); `ExclusiveMonitor::ValueCompare` exists, is tested, and is selected only by
+`OMNI_JIT_EXCLUSIVE_MONITOR=value`, which announces itself.** This record says what has been
+measured and what would decide it. It is not a vendored change: `Unsafe_IgnoreGlobalMonitor` is
+dynarmic's own optimization flag, opened through its own `unsafe_optimizations` gate.
+
+### What the two arms are
+
+Both perform every guest exclusive store as **one host `lock cmpxchg`** (`cmpxchg16b` for a pair)
+against the value the same thread's exclusive load read (`fastmem_exclusive_access`). They differ
+in what surrounds it:
+
+* **Global** (dynarmic's default): every exclusive load and store takes one process-wide spin lock,
+  and every exclusive store clears every other processor's reservation of the same address with a
+  scan emitted inline and unrolled over every slot the monitor was sized for
+  (`EmitExclusiveTestAndClear`). Sized from `max_threads`, which `23530d1` raised from 64 to 256.
+* **ValueCompare** (`Unsafe_IgnoreGlobalMonitor`): no lock, no scan. A per-processor reservation of
+  address and value; the store succeeds iff the address matches and the word still holds the
+  value. Slots are spaced eight apart so two processors' reservations do not share a cache line.
+
+### MEASURED (benchmarks, `crates/omni-cpu/tests/bench.rs`, `tests/exclusive.rs`; not a world)
+
+ns of wall time per guest `LDAXR/ADD/STLXR/CBNZ` increment, release, median of 7:
+
+| monitor | 1 thread | 8 threads, private words | 8 threads, one shared word |
+|---|---|---|---|
+| global, 64 slots | 57.3 | 366.7 | 417.2 |
+| global, 256 slots (the runtime since `23530d1`) | 131.4 | 511.1 | 836.2 |
+| value-compare | 12.8 | 2.4 | 46.1 |
+
+Correctness: 16 threads x 20,000 exclusive increments of one 64-bit word and one 16-byte pair give
+exact totals under both arms, with store-exclusive failures counted and asserted non-zero (the
+threads really contended); the same harness with plain `LDR/ADD/STR` loses updates, so the count is
+a detector. **The one behavioural difference, pinned by a test:** a reservation held across another
+thread's exclusive store that changes the word and changes it back (ABA) fails under Global and
+succeeds under ValueCompare. Every one of `libroblox.so`'s 587 exclusive instructions is in a shape
+LLVM's atomic expansion emits (load-exclusive, compute, store-exclusive, retry), for which that
+difference is invisible: a retry loop that succeeds on an unchanged value is the C++ semantics.
+
+### What decides it
+
+A world measurement: the `mon` share `OMNI_PERF`'s sampler reports on the busy threads, and
+presents per 5 s with each arm, same scenario, n stated. If the monitor is not where a world's
+time goes, the default stays. Recorded here when measured.

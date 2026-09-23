@@ -641,8 +641,10 @@ fn report(
 ) {
     let dt = now.at.duration_since(before.at).as_secs_f64().max(1e-3);
     let t = now.at.duration_since(started).as_secs_f64();
+    // Saturating: the counts are summed over the Vulkan instances still registered, so one that
+    // was dropped since the previous interval makes a total go *down*.
     let vk_delta = |name: &str| {
-        now.vk.get(name).copied().unwrap_or(0) - before.vk.get(name).copied().unwrap_or(0)
+        now.vk.get(name).copied().unwrap_or(0).saturating_sub(before.vk.get(name).copied().unwrap_or(0))
     };
     let vk_names: BTreeMap<GuestAddr, String> =
         vulkans.iter().flat_map(|v| v.slot_names()).collect();
@@ -781,8 +783,7 @@ fn report(
         let engine = ENGINE_THREADS.lock();
         if !engine.is_empty() {
             out.push_str(&format!(
-                "PERF   engine threads: {}
-",
+                "PERF   engine threads: {}\n",
                 engine.iter().map(|(i, g)| format!("{i:04x}=g{g}")).collect::<Vec<_>>().join(" ")
             ));
         }
@@ -790,7 +791,7 @@ fn report(
     let mut vk: Vec<(String, u64)> = now
         .vk
         .iter()
-        .map(|(name, n)| (name.clone(), n - before.vk.get(name).copied().unwrap_or(0)))
+        .map(|(name, n)| (name.clone(), n.saturating_sub(before.vk.get(name).copied().unwrap_or(0))))
         .filter(|(_, n)| *n > 0)
         .collect();
     vk.sort_by(|a, b| b.1.cmp(&a.1));
