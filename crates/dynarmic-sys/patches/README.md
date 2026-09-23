@@ -63,6 +63,28 @@ instructions are committed, the PC handed over is the unknown instruction's,
 the PC it left, and the fallback runs under the host's `FPCR` while the guest's
 is back in force afterwards (a subnormal multiply under `FPCR.FZ`, both ways).
 
+### 0003 — arm64: scalar saturating add, subtract and doubling multiply-high
+
+`0003-arm64-scalar-saturation.patch`. **arm64 only.** `SignedSaturatedAdd8/16/32/64`,
+`SignedSaturatedSub*`, `UnsignedSaturatedAdd*`, `UnsignedSaturatedSub*` and
+`SignedSaturatedDoublingMultiplyReturnHigh16/32` were `ASSERT_FALSE("Unimplemented")`
+in `emit_arm64_saturation.cpp`, and the A64 frontend reaches all eighteen from
+`simd_scalar_three_same.cpp` (`SQADD`/`UQADD`/`SQSUB`/`UQSUB` scalar at every
+size — there is no size guard — and `SQDMULH` scalar at H and S, also from
+`simd_scalar_x_indexed_element.cpp`). One guest instruction was a terminated
+process; `tests/a64_saturation.rs` aborted with `SIGABRT` before the patch.
+
+Each is now the host's own scalar AdvSIMD instruction on the element's `B`/`H`/`S`/`D`
+register, which is the ARM ARM operation exactly (these are ARMv8.0 base
+instructions, present on every arm64 host) and sets the host's `FPSR.QC` on
+saturation. The FPSR manager is loaded first, exactly as the vector forms in
+`emit_arm64_vector_saturation.cpp` do, so the host `QC` is folded into the
+guest's `FPSR` at the next spill; the x64 backend ORs the same bit into
+`JitState::fpsr_qc`. `tests/a64_saturation.rs` checks every form at both bounds
+and in range, the cleared upper bits of `Vd`, and `QC` (set, clear, and sticky),
+against values worked from the ARM ARM pseudocode (`SatQ`, and
+`(2 * a * b) >> esize` for `SQDMULH`).
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

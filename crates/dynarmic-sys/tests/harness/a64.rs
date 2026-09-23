@@ -272,6 +272,37 @@ pub const fn ldadd_x(rs: u32, rt: u32, rn: u32) -> u32 {
     0xF820_0000 | (rs << 16) | (rn << 5) | rt
 }
 
+/// AdvSIMD scalar three-same, `01 U 11110 size:2 1 Rm:5 opcode:5 1 Rn:5 Rd:5`. `size` is the element
+/// size (0 = B, 1 = H, 2 = S, 3 = D).
+pub const fn simd_scalar_three_same(u: u32, size: u32, opcode: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    0x5E20_0400 | (u << 29) | (size << 22) | (rm << 16) | (opcode << 11) | (rn << 5) | rd
+}
+
+/// `SQADD <V>d, <V>n, <V>m` (scalar) — three-same `U=0 opcode=00001`.
+pub const fn sqadd_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(0, size, 0b00001, rd, rn, rm)
+}
+
+/// `UQADD <V>d, <V>n, <V>m` (scalar) — `U=1 opcode=00001`.
+pub const fn uqadd_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(1, size, 0b00001, rd, rn, rm)
+}
+
+/// `SQSUB <V>d, <V>n, <V>m` (scalar) — `U=0 opcode=00101`.
+pub const fn sqsub_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(0, size, 0b00101, rd, rn, rm)
+}
+
+/// `UQSUB <V>d, <V>n, <V>m` (scalar) — `U=1 opcode=00101`.
+pub const fn uqsub_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(1, size, 0b00101, rd, rn, rm)
+}
+
+/// `SQDMULH <V>d, <V>n, <V>m` (scalar) — `U=0 opcode=10110`; `size` 1 (H) or 2 (S) only.
+pub const fn sqdmulh_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(0, size, 0b10110, rd, rn, rm)
+}
+
 /// `SVC #imm16` — `11010100 000 imm16:16 000 01`.
 pub const fn svc(imm16: u16) -> u32 {
     0xD400_0001 | ((imm16 as u32) << 5)

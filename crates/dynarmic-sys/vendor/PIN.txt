@@ -9,6 +9,7 @@ dynarmic/
     licence    ISC / 0BSD  (see dynarmic/LICENSE.txt)
     state      that revision plus ../patches/0001-a64-mrs-cntvct_el0.patch
                and ../patches/0002-arm64-interpret-terminal.patch
+               and ../patches/0003-arm64-scalar-saturation.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
