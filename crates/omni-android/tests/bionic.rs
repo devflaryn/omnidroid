@@ -5926,6 +5926,372 @@ fn pread_leaves_the_descriptors_own_offset_alone_for_the_guest_too() {
     assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
 }
 
+// =================================================================== `/proc`, generated
+
+const PROC_MEMINFO: &[u8] = b"/proc/meminfo";
+const PROC_STATM: &[u8] = b"/proc/self/statm";
+const GIB: u64 = 1 << 30;
+const MIB: u64 = 1 << 20;
+
+/// `__open_2(path, flags)`, the engine's own call for both files, and `errno` after it.
+fn open_2_with_errno(f: &Fixture, path: &[u8], flags: u64) -> (i64, u32) {
+    let at = f.cstring(f.guest.data + 0x100, path);
+    let out = f.guest.data + 0x40;
+    let entry = program(f, |asm| {
+        asm.mov(0, at as u64);
+        asm.mov(1, flags);
+        asm.bl(f.thunk("__open_2"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(f, entry).expect("completes"), ExitReason::Returned { .. }));
+    (f.guest.read_u64(out) as i64, f.guest.read_u64(out + 8) as u32)
+}
+
+/// Where a reading lands in guest memory: 4 KiB, which holds the engine's 4095-byte request.
+fn proc_buffer(f: &Fixture) -> omni_cpu::GuestAddr {
+    f.guest.data + 0x1000
+}
+
+/// One reading the way the engine takes it: `pread(fd, buf, count, 0)` on a kept descriptor.
+fn pread_at_zero(f: &Fixture, fd: i64, count: u64) -> String {
+    let buf = proc_buffer(f);
+    let got = value_of(f, "pread", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, buf as u64);
+        asm.mov(2, count);
+        asm.mov(3, 0);
+    }) as i64;
+    assert!(got > 0 && got as u64 <= count, "pread returned {got}");
+    String::from_utf8(read_guest(f, buf, got as usize)).expect("ASCII")
+}
+
+/// Parse `/proc/meminfo`, **asserting Linux's columns as it goes**: the name and its colon in 16,
+/// the value right-aligned in 8, then ` kB`. Values up to 99,999,999 kB fit, which every budget
+/// here does.
+fn meminfo_lines(text: &str) -> Vec<(String, u64)> {
+    assert!(text.ends_with('\n'), "{text:?}");
+    text.lines()
+        .map(|line| {
+            assert_eq!(line.len(), 16 + 8 + 3, "not Linux's column widths: {line:?}");
+            let (label, rest) = line.split_at(16);
+            let name = label.trim_end().strip_suffix(':').unwrap_or_else(|| panic!("{line:?}"));
+            assert!(!name.contains(' '), "{line:?}");
+            let value = rest.strip_suffix(" kB").unwrap_or_else(|| panic!("{line:?}"));
+            let kb = value.trim_start().parse().unwrap_or_else(|_| panic!("{line:?}"));
+            (name.to_string(), kb)
+        })
+        .collect()
+}
+
+fn meminfo_value(lines: &[(String, u64)], name: &str) -> u64 {
+    lines.iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("no {name} in {lines:?}")).1
+}
+
+/// One `/proc/meminfo` reading and one `sysinfo`, **in one guest run**, and what each returned.
+///
+/// One run because the run itself moves the numbers being compared: MEASURED, a guest run's own
+/// translator and thread raise this process's commit charge by about 24 MiB while it lasts, so a
+/// charge measured on the host side of the run cannot bracket a reading taken inside it. Two calls
+/// in one program see the same process.
+fn meminfo_and_sysinfo(f: &Fixture, fd: i64) -> (String, omni_cpu::GuestAddr) {
+    let buf = proc_buffer(f);
+    let info = f.guest.data + 0x3000;
+    let out = f.guest.data + 0x40;
+    let entry = program(f, |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, buf as u64);
+        asm.mov(2, 4095);
+        asm.mov(3, 0);
+        asm.bl(f.thunk("pread"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.mov(0, info as u64);
+        asm.bl(f.thunk("sysinfo"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 8));
+    });
+    assert!(matches!(run_program(f, entry).expect("completes"), ExitReason::Returned { .. }));
+    let got = f.guest.read_u64(out) as i64;
+    assert!(got > 0 && got < 4095, "pread returned {got}");
+    assert_eq!(f.guest.read_u64(out + 8), 0, "sysinfo returned nonzero");
+    (String::from_utf8(read_guest(f, buf, got as usize)).expect("ASCII"), info)
+}
+
+/// **`/proc/meminfo` is the embedding's budget, in Linux's format, and it is what `sysinfo` and
+/// `sysconf(_SC_PHYS_PAGES)` say** -- read the way the engine reads it, one kept descriptor
+/// `pread` at 0, and **a second reading on that descriptor is a new one**.
+///
+/// Membership rather than totals: `MemTotal` must be the budget the embedding set (not the host's
+/// RAM, which is the over-correction), `MemFree` must be that budget less this process's commit
+/// charge -- `sysinfo.freeram`, taken in the same run -- and the four zeros must be `sysinfo`'s.
+#[test]
+fn proc_meminfo_is_the_budget_in_linuxs_format_and_agrees_with_sysinfo() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("proc-meminfo");
+    f.bionic.set_memory_budget(2 * GIB);
+    let page = f.bionic.space_page_size() as u64;
+
+    let (fd, _) = open_2_with_errno(&f, PROC_MEMINFO, O_RDONLY);
+    assert!(fd >= 3, "__open_2(/proc/meminfo) returned {fd}");
+    let charge_outside = omni_mem::process_commit_charge().expect("the commit charge");
+    let (text, info) = meminfo_and_sysinfo(&f, fd);
+    eprintln!("/proc/meminfo, budget 2 GiB, commit charge {charge_outside} before the run:");
+    eprintln!("{text}");
+
+    let lines = meminfo_lines(&text);
+    let names: Vec<&str> = lines.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["MemTotal", "MemFree", "MemAvailable", "Buffers", "Cached", "SwapTotal", "SwapFree"],
+        "every line the engine's parser asks for, in Linux's order: {text}"
+    );
+    let total = meminfo_value(&lines, "MemTotal");
+    let free = meminfo_value(&lines, "MemFree");
+    assert_eq!(total, 2 * GIB / 1024, "MemTotal is the budget the embedding set");
+    // What is not free is at least what this process had committed before the run started --
+    // the run only adds to it -- and not the whole budget.
+    let taken = 2 * GIB - free * 1024;
+    assert!(
+        taken + 2 * MIB >= charge_outside && taken < 2 * GIB,
+        "MemFree {free} kB leaves {taken} bytes taken, against a commit charge of {charge_outside}"
+    );
+    assert_eq!(meminfo_value(&lines, "MemAvailable"), free, "no page cache to reclaim");
+    for name in ["Buffers", "Cached", "SwapTotal", "SwapFree"] {
+        assert_eq!(meminfo_value(&lines, name), 0, "{name}");
+    }
+    for (name, kb) in &lines {
+        assert_eq!(kb % (page / 1024), 0, "{name} is not a whole number of pages");
+    }
+
+    // `sysinfo` fills its structure from the same accounting on Linux, so it must agree -- and
+    // `freeram` is the budget less the commit charge, so this is also the check that `MemFree`
+    // is that and not some other count of memory.
+    assert_eq!(f.guest.read_u64(info + 32), total * 1024, "sysinfo.totalram");
+    assert_eq!(read_u32_guest(&f, info + 104), 1, "mem_unit: the fields are in bytes");
+    assert!(
+        f.guest.read_u64(info + 40).abs_diff(free * 1024) <= MIB,
+        "sysinfo.freeram {} against MemFree {} kB",
+        f.guest.read_u64(info + 40),
+        free
+    );
+    for (offset, name) in [(56, "Buffers"), (64, "SwapTotal"), (72, "SwapFree")] {
+        assert_eq!(f.guest.read_u64(info + offset), meminfo_value(&lines, name) * 1024, "{name}");
+    }
+    let phys_pages = value_of(&f, "sysconf", |asm| { asm.mov(0, 0x62); });
+    assert_eq!(phys_pages * page, total * 1024, "_SC_PHYS_PAGES");
+
+    // **The next reading is a new one**: the engine keeps this descriptor for the life of the
+    // run, so a file generated once at `open` would say 2 GiB for ever.
+    f.bionic.set_memory_budget(GIB);
+    let again = meminfo_lines(&pread_at_zero(&f, fd, 4095));
+    assert_eq!(meminfo_value(&again, "MemTotal"), GIB / 1024, "the second reading's MemTotal");
+
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+    // Nothing was looked for, or created, under the root.
+    assert_eq!(std::fs::read_dir(&scratch.0).expect("the root").count(), 0);
+}
+
+/// **A reading taken in pieces with `read` is one reading**: the budget changes after the first
+/// piece, and the rest of the file is still the file the first piece started.
+///
+/// The detector for a generation per `read`, which would splice two readings into one text --
+/// here visibly, because the first line's number comes from one and the rest from the other.
+#[test]
+fn a_proc_file_read_in_pieces_is_one_reading() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("proc-pieces");
+    f.bionic.set_memory_budget(2 * GIB);
+    let (fd, _) = open_2_with_errno(&f, PROC_MEMINFO, O_RDONLY);
+    assert!(fd >= 3);
+    let buf = proc_buffer(&f);
+    let mut text = Vec::new();
+    loop {
+        let got = value_of(&f, "read", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, buf as u64);
+            asm.mov(2, 7);
+        }) as i64;
+        assert!(got >= 0, "read returned {got}");
+        if got == 0 {
+            break;
+        }
+        text.extend_from_slice(&read_guest(&f, buf, got as usize));
+        // Mid-reading, the embedding changes its mind.
+        f.bionic.set_memory_budget(GIB);
+    }
+    let lines = meminfo_lines(&String::from_utf8(text).expect("ASCII"));
+    assert_eq!(meminfo_value(&lines, "MemTotal"), 2 * GIB / 1024, "the reading's own MemTotal");
+    assert_eq!(lines.len(), 7, "the whole file, once");
+    // And a new reading from 0 on the same descriptor is the new budget's.
+    let again = meminfo_lines(&pread_at_zero(&f, fd, 4095));
+    assert_eq!(meminfo_value(&again, "MemTotal"), GIB / 1024);
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+}
+
+/// **`/proc/self/statm` is seven page counts of this process, and the engine's own `sscanf`
+/// reads the three it asks for** -- with `resident` the working set and not the commit charge.
+///
+/// Each field is pinned by making **its** quantity move, between readings each taken in a guest
+/// run of the same shape (a run raises this process's own numbers while it lasts, so a host-side
+/// measurement cannot bracket one reading; the difference between two can):
+///
+/// * 64 MiB committed and never touched moves the commit charge (`data`) by 64 MiB and the
+///   resident set not at all. A `resident` wired to the commit charge moves with it.
+/// * Touching those 64 MiB moves `resident` by 64 MiB and `shared` not at all: they are private.
+///   A `shared` wired to the whole working set moves with it.
+/// * A reservation moves `size` and nothing else.
+#[test]
+fn proc_self_statm_is_this_process_in_pages_and_the_engines_sscanf_reads_it() {
+    use omni_platform::vm;
+
+    let _guard = serialized();
+    let (f, _scratch) = rooted("proc-statm");
+    let page = f.bionic.space_page_size() as u64;
+    // No budget: statm is the process's, and needs none.
+    let (fd, errno) = open_2_with_errno(&f, PROC_STATM, O_RDONLY);
+    assert!(fd >= 3, "__open_2(/proc/self/statm) returned {fd}, errno {errno}");
+
+    let read_fields = || {
+        let text = pread_at_zero(&f, fd, 63);
+        assert!(text.ends_with('\n') && !text[..text.len() - 1].contains('\n'), "{text:?}");
+        let fields: Vec<u64> = text
+            .trim_end_matches('\n')
+            .split(' ')
+            .map(|field| field.parse().unwrap_or_else(|_| panic!("{text:?}")))
+            .collect();
+        assert_eq!(fields.len(), 7, "seven fields, one space apart: {text:?}");
+        (text, fields)
+    };
+    let pages = |bytes: u64| (bytes / page) as i64;
+    let moved = |from: &[u64], to: &[u64], field: usize| to[field] as i64 - from[field] as i64;
+
+    let ws_outside = omni_mem::process_working_set().expect("the working set");
+    let charge_outside = omni_mem::process_commit_charge().expect("the commit charge");
+    let (text, base) = read_fields();
+    eprintln!(
+        "/proc/self/statm: {text:?} (working set {ws_outside}, commit charge {charge_outside} \
+         before the run)"
+    );
+    // The engine reads 63 bytes; the whole file has to be inside them.
+    assert!(text.len() < 63, "{} bytes do not fit the engine's 63: {text:?}", text.len());
+    let [size, resident, shared, code, lib, data, dt] = base[..] else { unreachable!() };
+    assert_eq!((lib, dt), (0, 0), "Linux has printed 0 for both since 2.6");
+    assert!(shared > 0 && shared <= resident && resident <= size && data <= size, "{text:?}");
+    assert!(code > 0, "this executable has code: {text:?}");
+    // At least what this process held before the run began: the run only adds to both.
+    assert!(
+        resident * page + 8 * MIB >= ws_outside,
+        "resident {resident} pages, working set {ws_outside}"
+    );
+    assert!(
+        data * page + 8 * MIB >= charge_outside,
+        "data {data} pages, commit charge {charge_outside}"
+    );
+
+    // A reservation: address space, and nothing resident or committed.
+    let region = 64 * MIB as usize;
+    let reservation = vm::reserve(region, vm::allocation_granularity()).expect("reserve 64 MiB");
+    let (_, reserved) = read_fields();
+    assert!(
+        (moved(&base, &reserved, 0) - pages(64 * MIB)).abs() <= pages(16 * MIB),
+        "a 64 MiB reservation moved size by {} pages",
+        moved(&base, &reserved, 0)
+    );
+    assert!(moved(&base, &reserved, 5).abs() <= pages(8 * MIB), "{:?} -> {reserved:?}", base);
+
+    // Committed and untouched: `data` moves, `resident` does not.
+    // SAFETY: the whole reservation is this test's and nothing else refers to it.
+    unsafe { vm::commit(reservation.as_ptr(), region, vm::Protection::ReadWrite).expect("commit") };
+    let (_, committed) = read_fields();
+    assert!(
+        (moved(&reserved, &committed, 5) - pages(64 * MIB)).abs() <= pages(8 * MIB),
+        "64 MiB committed moved data by {} pages",
+        moved(&reserved, &committed, 5)
+    );
+    assert!(
+        moved(&reserved, &committed, 1).abs() < pages(16 * MIB),
+        "64 MiB committed and untouched moved resident by {} pages",
+        moved(&reserved, &committed, 1)
+    );
+
+    // Touched: `resident` moves by the 64 MiB, `shared` does not, because they are private.
+    // SAFETY: the whole range is committed read-write by the call above.
+    unsafe { std::ptr::write_bytes(reservation.as_ptr(), 0xa5, region) };
+    let (_, touched) = read_fields();
+    vm::release(reservation).expect("release");
+    assert!(
+        moved(&committed, &touched, 1) > pages(48 * MIB),
+        "touching 64 MiB moved resident by only {} pages",
+        moved(&committed, &touched, 1)
+    );
+    assert!(
+        moved(&committed, &touched, 2).abs() < pages(8 * MIB),
+        "touching 64 MiB of private memory moved shared by {} pages",
+        moved(&committed, &touched, 2)
+    );
+
+    // The engine's own parse, through this layer's `sscanf`: "%zu %zu %zu" into three slots.
+    let format = f.cstring(f.guest.data + 0x200, b"%zu %zu %zu");
+    let slots = f.guest.data + 0x400;
+    let input = proc_buffer(&f);
+    let text = pread_at_zero(&f, fd, 63);
+    f.guest.write_bytes(input + text.len(), &[0]);
+    let entry = program(&f, |asm| {
+        asm.mov(0, input as u64);
+        asm.mov(1, format as u64);
+        asm.mov(2, slots as u64);
+        asm.mov(3, (slots + 8) as u64);
+        asm.mov(4, (slots + 16) as u64);
+        asm.bl(f.thunk("sscanf"));
+        asm.mov(22, f.guest.data as u64);
+        asm.push(str_imm(0, 22, 0));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(f.guest.data) as i32, 3, "the engine needs three conversions");
+    let expected: Vec<u64> =
+        text.trim_end().split(' ').take(3).map(|v| v.parse().expect("a count")).collect();
+    assert_eq!(
+        [f.guest.read_u64(slots), f.guest.read_u64(slots + 8), f.guest.read_u64(slots + 16)],
+        [expected[0], expected[1], expected[2]],
+        "size, resident, shared"
+    );
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+}
+
+/// **What refuses, and what is only an errno.** With no budget, `/proc/meminfo` refuses the
+/// `open` by name -- `sysinfo`'s answer -- while `statm`, which needs none, opens. Writing either
+/// is `EACCES`, and a `/proc` path nothing serves is still `ENOENT`.
+#[test]
+fn proc_meminfo_without_a_budget_refuses_by_name_and_the_rest_are_errnos() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("proc-refusals");
+    let path = f.cstring(f.guest.data + 0x100, PROC_MEMINFO);
+    let error = refusal_of(&f, "__open_2", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY);
+    });
+    assert_eq!(error.symbol(), Some("__open_2"), "{error:?}");
+    assert!(error.to_string().contains("set_memory_budget"), "{error}");
+
+    let (fd, _) = open_2_with_errno(&f, PROC_STATM, O_RDONLY);
+    assert!(fd >= 3, "statm needs no budget");
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, fd as u64); }) as i64, 0);
+
+    f.bionic.set_memory_budget(2 * GIB);
+    for path in [PROC_MEMINFO, PROC_STATM] {
+        assert_eq!(open_2_with_errno(&f, path, O_RDWR), (-1, 13), "EACCES for a 0444 file");
+    }
+    assert_eq!(
+        open_2_with_errno(&f, b"/proc/self/status", O_RDONLY),
+        (-1, 2),
+        "ENOENT for a /proc file nothing serves"
+    );
+}
+
 /// The namespace calls keep POSIX's own distinctions, from real guest code.
 #[test]
 fn the_namespace_calls_keep_posixs_distinctions_from_guest_code() {
