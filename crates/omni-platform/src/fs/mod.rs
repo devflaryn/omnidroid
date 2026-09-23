@@ -70,6 +70,14 @@
 //! socket's failures (`ECONNRESET`, `ETIMEDOUT`, `ENOTCONN`) have no spelling in [`FsErrorKind`]
 //! and a blocking socket cannot be waited out on a gate nothing in this process raises for it.
 //! [`Filesystem::socket_at`] hands the socket back and [`net`](crate::net) does the rest.
+//!
+//! # Generated files are paths that name a fact, not a file
+//!
+//! [`Filesystem::serve_generated`] lets the layer above answer a path with bytes it produces --
+//! `/proc/meminfo` and `/proc/self/statm` are why -- rather than with a file under the root. Like
+//! the [`DEVICES`], such a path names no host file, so it is not a hole in the confinement; unlike
+//! them, what it says is the caller's decision, and this seam only makes it behave as a read-only
+//! file with Linux's `seq_file` rules (see `GeneratedFile`).
 
 pub mod epoll;
 mod error;
@@ -343,6 +351,11 @@ enum Entry {
     /// [`crate::process::random_bytes`] already provides, and it is not a path that can be
     /// confined into a host directory because it is not a file.
     Device(Device),
+    /// A file whose bytes a [`Generator`] produces rather than a file under the root.
+    ///
+    /// See [`Filesystem::serve_generated`]. Here for [`Device`](Entry::Device)'s reason: it names
+    /// no host path, so it cannot be confined into the root and must not be looked for there.
+    Generated(GeneratedFile),
     /// One end of a pipe — the first kind here whose readiness depends on another descriptor.
     ///
     /// See [`pipe`]. It is in this table rather than in a namespace of its own because `poll` and
@@ -434,9 +447,11 @@ impl Entry {
         Some(match self {
             // A regular file, a directory, a character device and a standard stream can none of
             // them block. `Readiness::ALWAYS` says why that is Linux's answer too.
-            Entry::File { .. } | Entry::Directory { .. } | Entry::Standard(_) | Entry::Device(_) => {
-                Readiness::ALWAYS
-            }
+            Entry::File { .. }
+            | Entry::Directory { .. }
+            | Entry::Standard(_)
+            | Entry::Device(_)
+            | Entry::Generated(_) => Readiness::ALWAYS,
             Entry::Pipe(handle) => handle.readiness(),
             Entry::EventFd(counter) => counter.readiness(),
             // An epoll descriptor is readable when a member has an event to report, which is a
@@ -573,6 +588,129 @@ pub const DEVICES: &[(&str, Device)] = &[
     ("/dev/zero", Device::Zero),
 ];
 
+/// What produces a generated file's bytes. See [`Filesystem::serve_generated`].
+///
+/// Called each time a read of the file **starts at offset 0**, and never otherwise, so what it
+/// returns is what one reading of the file sees from start to end. An error is the file refusing
+/// to exist in that reading: it reaches the caller as the `open` or `read` that asked.
+pub type Generator = dyn Fn() -> FsResult<Vec<u8>> + Send + Sync;
+
+/// One open descriptor on a generated file: where it has read to, and what it is reading.
+///
+/// # Why a snapshot, and why it is retaken only at offset 0
+///
+/// This is Linux's `seq_file`, which is what `/proc/meminfo` and `/proc/self/statm` are, carried
+/// across as its two observable rules:
+///
+/// * **A read from offset 0 generates the file afresh.** A reader that keeps the descriptor open
+///   and reads it again from the start sees new numbers -- MEASURED, the engine opens both files
+///   once, keeps the descriptors, and `pread`s them at offset 0 every time it wants a reading
+///   (`libroblox.so` link `0x22826c8` and `0x22829c0`). A snapshot taken at `open` and served for
+///   ever would hand it the same memory figures for the life of the run.
+/// * **A read that continues from where another left off continues the same text.** A reader that
+///   takes a file in pieces must get the pieces of *one* file: a second generation between two
+///   pieces could change a number's width and hand the reader half of one line and half of
+///   another. This matters here, not only in principle: the adapter's `pread` moves a guest's
+///   request in [`IO_BLOCK`] chunks and asks for the next chunk at the offset the last one
+///   ended, so without this rule one guest `pread` could itself be two generations.
+struct GeneratedFile {
+    /// The guest path it was opened by, normalised, for diagnostics and `fstat`'s identity.
+    guest: String,
+    generate: Arc<Generator>,
+    /// What the last generation produced. `None` only before the first read.
+    snapshot: Option<Vec<u8>>,
+    /// The descriptor's own offset, which `read` advances and `lseek` moves.
+    position: u64,
+}
+
+impl core::fmt::Debug for GeneratedFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GeneratedFile")
+            .field("guest", &self.guest)
+            .field("snapshot_bytes", &self.snapshot.as_ref().map(Vec::len))
+            .field("position", &self.position)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GeneratedFile {
+    /// Copy what the file holds from `offset` into `buf`, generating it first if the read starts
+    /// at the beginning. Short at the end, and zero past it, as a file is.
+    fn read_at(&mut self, buf: &mut [u8], offset: u64) -> FsResult<usize> {
+        if offset == 0 || self.snapshot.is_none() {
+            self.snapshot = Some((self.generate)()?);
+        }
+        let bytes = self.snapshot.as_deref().unwrap_or_default();
+        // An offset past what `usize` can hold is past the end of any file this process holds.
+        let start = usize::try_from(offset).map_or(bytes.len(), |at| at.min(bytes.len()));
+        let count = buf.len().min(bytes.len() - start);
+        buf[..count].copy_from_slice(&bytes[start..start + count]);
+        Ok(count)
+    }
+
+    /// `read(2)`: [`read_at`](Self::read_at) the descriptor's own offset, and advance it.
+    fn read(&mut self, buf: &mut [u8]) -> FsResult<usize> {
+        let count = self.read_at(buf, self.position)?;
+        self.position += count as u64;
+        Ok(count)
+    }
+
+    /// `lseek(2)` as `seq_lseek` answers it: `SEEK_SET` and `SEEK_CUR` move the offset, and
+    /// `SEEK_END` is `EINVAL`, because a generated file has no end until it is generated.
+    fn seek(&mut self, offset: i64, whence: i32) -> FsResult<u64> {
+        const OP: &str = "lseek";
+        let invalid = |why: &'static str| {
+            FsError::kinded(OP, self.guest.clone(), FsErrorKind::InvalidInput, why)
+        };
+        let base: i64 = match whence {
+            0 => 0,
+            1 => i64::try_from(self.position)
+                .map_err(|_| invalid("the current offset does not fit an off_t"))?,
+            2 => {
+                return Err(invalid(
+                    "SEEK_END on a generated file, which has no size until it is read; Linux's \
+                     seq_lseek answers EINVAL",
+                ))
+            }
+            _ => return Err(invalid("whence is none of SEEK_SET, SEEK_CUR and SEEK_END")),
+        };
+        let target = base
+            .checked_add(offset)
+            .ok_or_else(|| invalid("the resulting offset overflows an off_t"))?;
+        let target =
+            u64::try_from(target).map_err(|_| invalid("the resulting offset is negative"))?;
+        self.position = target;
+        Ok(target)
+    }
+}
+
+/// The generated files one [`Filesystem`] serves, by normalised guest path.
+#[derive(Default)]
+struct GeneratedFiles(BTreeMap<String, Arc<Generator>>);
+
+impl core::fmt::Debug for GeneratedFiles {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+/// What `stat` and `fstat` say about a generated file: what Linux says about a `/proc` file.
+///
+/// A regular file, **size zero** -- `/proc/meminfo` reports `st_size` 0 on a device, because its
+/// length is not known until it is generated -- read-only, with no times this seam could vouch
+/// for, and an identity taken from its path.
+fn generated_stat(guest: &str) -> FileStat {
+    FileStat {
+        kind: FileKind::Regular,
+        size: 0,
+        read_only: true,
+        accessed: None,
+        modified: None,
+        created: None,
+        identity: identity(Path::new(guest)),
+    }
+}
+
 /// Which standard stream a reserved descriptor is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdStream {
@@ -613,6 +751,8 @@ pub struct Filesystem {
     /// Rises whenever any pipe in this instance changes state. See [`pipe::ReadyGate`]: it is how
     /// a caller waits for readiness without this seam ever choosing how long to wait.
     gate: Arc<ReadyGate>,
+    /// The paths this instance serves from a generator. See [`Filesystem::serve_generated`].
+    generated: Mutex<GeneratedFiles>,
 }
 
 #[derive(Debug)]
@@ -668,7 +808,130 @@ impl Filesystem {
                 next_dir: 1,
             }),
             gate: Arc::new(ReadyGate::default()),
+            generated: Mutex::new(GeneratedFiles::default()),
         })
+    }
+
+    /// Serve `guest_path` from `generate` rather than from under the root.
+    ///
+    /// # What this is for, and what it is not
+    ///
+    /// A file whose contents are a **fact this process can state** rather than bytes anybody
+    /// stored: `/proc/meminfo` and `/proc/self/statm` are the reason it exists. The caller decides
+    /// which paths and what they say; this seam only makes the path behave as a file -- `open`,
+    /// `read`, `pread`, `lseek`, `fstat`, `stat`, `access` and `close` -- and knows nothing about
+    /// `/proc`. Every other guest path still resolves under the root, so this does not widen what
+    /// the guest can reach: a generated file names no host path at all.
+    ///
+    /// A generated file is **read-only**, `0444`, which is what an app sees on `/proc`: opening it
+    /// for writing or with `O_TRUNC` is `EACCES`, and nothing can create, rename or remove it.
+    ///
+    /// # Set once
+    ///
+    /// A path may be served once and never replaced, for the reason the root may be set once: a
+    /// descriptor opened under one generator must not start reading another's file.
+    ///
+    /// # Errors
+    ///
+    /// As [`path::resolve_lexically`] for a path that cannot name anything, and
+    /// [`FsError::Refused`] for a path that is one of the [`DEVICES`] or is already served.
+    pub fn serve_generated(&self, guest_path: &[u8], generate: Arc<Generator>) -> FsResult<()> {
+        const OP: &str = "serve_generated";
+        let name = path::resolve_lexically(OP, guest_path)?.guest_path();
+        if device_for(guest_path).is_some() {
+            return Err(FsError::refused(
+                OP,
+                name,
+                "the path is one of the devices this seam implements, and a device cannot also be \
+                 a generated file",
+            ));
+        }
+        let mut generated =
+            self.generated.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generated.0.contains_key(&name) {
+            return Err(FsError::refused(
+                OP,
+                name,
+                "the path is already served. It may be served once and never replaced: a \
+                 descriptor opened on one generator must not start reading another's file",
+            ));
+        }
+        generated.0.insert(name, generate);
+        Ok(())
+    }
+
+    /// The generated file a guest path names, if it names one: its normalised path and generator.
+    ///
+    /// Normalised first, as [`device_for`] is, so `/proc/./meminfo` and `/proc//meminfo` reach the
+    /// same file and no spelling slips past to the root.
+    fn generated_for(&self, guest_path: &[u8]) -> Option<(String, Arc<Generator>)> {
+        let name = path::resolve_lexically("generated", guest_path).ok()?.guest_path();
+        let generated = self.generated.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generate = Arc::clone(generated.0.get(&name)?);
+        Some((name, generate))
+    }
+
+    /// `open` of a generated file: the flag checks a read-only `/proc` file makes, a first
+    /// generation, and a descriptor.
+    fn open_generated(
+        &self,
+        name: String,
+        generate: Arc<Generator>,
+        flags: OpenFlags,
+    ) -> FsResult<i32> {
+        const OP: &str = "open";
+        if flags.directory {
+            return Err(FsError::kinded(
+                OP,
+                name,
+                FsErrorKind::NotADirectory,
+                "O_DIRECTORY was given and a generated file is not a directory",
+            ));
+        }
+        if flags.create && flags.exclusive {
+            return Err(FsError::kinded(
+                OP,
+                name,
+                FsErrorKind::AlreadyExists,
+                "O_CREAT | O_EXCL on a file that exists (EEXIST)",
+            ));
+        }
+        // Linux adds `MAY_WRITE` to the access check for `O_TRUNC` as well as for a writable
+        // mode, and a `0444` file refuses both with `EACCES`.
+        if flags.write || flags.truncate {
+            return Err(FsError::kinded(
+                OP,
+                name,
+                FsErrorKind::PermissionDenied,
+                "a generated file is read-only (mode 0444), so opening it for writing or with \
+                 O_TRUNC is EACCES -- what an app is told for a file under /proc",
+            ));
+        }
+        // **Generated once here, before a descriptor exists**, so a file that cannot be produced
+        // is refused by the `open` that asked for it, naming why, rather than handed out as a
+        // descriptor whose first read fails. The bytes are kept: a first read that continues
+        // from a nonzero offset reads them rather than generating a second time.
+        let first = generate()?;
+        let mut table = self.table();
+        if table.open.len() >= MAX_OPEN_FILES {
+            return Err(FsError::kinded(
+                OP,
+                name,
+                FsErrorKind::TooManyOpenFiles,
+                format!("this guest instance already holds {MAX_OPEN_FILES} descriptors"),
+            ));
+        }
+        let fd = table.lowest_free_fd();
+        table.open.insert(
+            fd,
+            Entry::Generated(GeneratedFile {
+                guest: name,
+                generate,
+                snapshot: Some(first),
+                position: 0,
+            }),
+        );
+        Ok(fd)
     }
 
     /// The host directory every guest path resolves inside.
@@ -797,6 +1060,11 @@ impl Filesystem {
             let fd = table.lowest_free_fd();
             table.open.insert(fd, Entry::Device(device));
             return Ok(fd);
+        }
+        // A generated file is checked here for the device's reason: it is not a path under the
+        // root, and resolving it there would answer `ENOENT` for a file this instance serves.
+        if let Some((name, generate)) = self.generated_for(guest_path) {
+            return self.open_generated(name, generate, flags);
         }
         let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
         let mut table = self.table();
@@ -1015,7 +1283,9 @@ impl Filesystem {
         // `do_epoll_ctl` tests `file_can_poll` before it looks at the list at all.
         match table.open.get(&fd) {
             None => return Err(bad_fd(OP, fd)),
-            Some(Entry::File { .. } | Entry::Directory { .. }) => {
+            // A generated file is here too: `/proc/meminfo` has no `poll` operation, so Linux's
+            // `file_can_poll` is false for it exactly as for a regular file.
+            Some(Entry::File { .. } | Entry::Directory { .. } | Entry::Generated(_)) => {
                 return Err(FsError::kinded(
                     OP,
                     target,
@@ -1252,7 +1522,8 @@ impl Filesystem {
             Entry::File { .. }
             | Entry::Directory { .. }
             | Entry::Standard(_)
-            | Entry::Device(_) => Some(ReadinessSource::Immediate),
+            | Entry::Device(_)
+            | Entry::Generated(_) => Some(ReadinessSource::Immediate),
             Entry::Pipe(_) | Entry::EventFd(_) => Some(ReadinessSource::Gate),
             Entry::Socket(_) => Some(ReadinessSource::Host),
             // Its members may be on both sides, so no one answer is true; `readiness` refuses an
@@ -1538,6 +1809,10 @@ impl Filesystem {
                     Ok(buf.len())
                 }
             },
+            // The table lock is held across the generation, as it is across a pipe operation, and
+            // for the same reason it is safe: a generator reads facts and takes no lock of this
+            // seam's, so the order is one edge -- the table, then whatever the generator reads.
+            Some(Entry::Generated(file)) => file.read(buf),
             // **Holding the table lock across a pipe operation is safe because nothing in `pipe`
             // waits.** The lock order is one edge — the table, then that pipe's own state, then
             // the ready gate — and no path takes them the other way round: a thread waiting for
@@ -1625,6 +1900,10 @@ impl Filesystem {
                 FsErrorKind::InvalidInput,
                 "a character device has no offset, so there is nothing to read *at*",
             )),
+            // What the engine does with `/proc/meminfo` and `/proc/self/statm`: keep the
+            // descriptor and `pread` it at 0 for each new reading. See `GeneratedFile` for why a
+            // read at 0 generates and a read that continues does not.
+            Some(Entry::Generated(file)) => file.read_at(buf, offset),
             Some(Entry::Standard(_)) => Err(FsError::kinded(
                 OP,
                 format!("fd {fd}"),
@@ -1776,9 +2055,12 @@ impl Filesystem {
                 "fsync on a directory: Linux supports it and `std` has no directory handle to \
                  flush; no run has reached it, so it is refused by name rather than answered",
             )),
+            // A generated file is in this group because `/proc` files have no `fsync` operation,
+            // and `vfs_fsync_range` answers `EINVAL` for a file without one.
             Some(
                 Entry::Standard(_)
                 | Entry::Device(_)
+                | Entry::Generated(_)
                 | Entry::Pipe(_)
                 | Entry::EventFd(_)
                 | Entry::Socket(_)
@@ -1841,7 +2123,8 @@ impl Filesystem {
         };
         match table.open.get(&fd) {
             None => Err(bad_fd(OP, fd)),
-            Some(Entry::File { writable: false, .. }) => {
+            // A generated file is never open for writing, and `vfs_fallocate` checks that first.
+            Some(Entry::File { writable: false, .. } | Entry::Generated(_)) => {
                 refuse(FsErrorKind::BadDescriptor, "not open for writing (EBADF)")
             }
             Some(Entry::File { file, .. }) => {
@@ -1884,9 +2167,12 @@ impl Filesystem {
     pub fn seek(&self, fd: i32, offset: i64, whence: i32) -> FsResult<u64> {
         use std::io::{Seek, SeekFrom};
         const OP: &str = "lseek";
-        let table = self.table();
-        match table.open.get(&fd) {
+        let mut table = self.table();
+        match table.open.get_mut(&fd) {
             None => Err(bad_fd(OP, fd)),
+            // `seq_lseek`'s rules -- see `GeneratedFile::seek`. Moving back to 0 is how a reader
+            // that uses `read` rather than `pread` asks for a new generation.
+            Some(Entry::Generated(file)) => file.seek(offset, whence),
             Some(
                 Entry::Pipe(_)
                 | Entry::Socket(_)
@@ -1909,6 +2195,8 @@ impl Filesystem {
                  one, so it is refused by name rather than answered unmeasured",
             )),
             Some(Entry::File { file, guest, .. }) => {
+                // Shared borrows: the table is taken mutably only for the generated arm above.
+                let (file, guest): (&File, &String) = (file, guest);
                 // **Resolved to an absolute position here, and the host only ever sees
                 // `SEEK_SET`.** MEASURED: `SEEK_CUR` to a negative position reaches Windows as
                 // `ERROR_NEGATIVE_SEEK`, which `std` does not classify, so the guest would have been
@@ -1956,6 +2244,12 @@ impl Filesystem {
                 format!("fd {fd}"),
                 FsErrorKind::InvalidInput,
                 "a character device has no offset, so there is nothing to write *at* (ESPIPE)",
+            )),
+            Some(Entry::Generated(file)) => Err(FsError::kinded(
+                OP,
+                file.guest.clone(),
+                FsErrorKind::BadDescriptor,
+                "a generated file is never open for writing",
             )),
             Some(Entry::Standard(_)) => Err(FsError::kinded(
                 OP,
@@ -2038,6 +2332,14 @@ impl Filesystem {
             // writing to `/dev/urandom` stirs the kernel's pool and consumes the bytes. The
             // whole buffer is taken, because a short write here would be invented.
             Some(Entry::Device(_)) => Ok(buf.len()),
+            // `open` refuses a generated file for writing, so a descriptor on one is read-only
+            // and a write is `EBADF`, as it is on any descriptor opened `O_RDONLY`.
+            Some(Entry::Generated(file)) => Err(FsError::kinded(
+                OP,
+                file.guest.clone(),
+                FsErrorKind::BadDescriptor,
+                "a generated file is never open for writing",
+            )),
             Some(Entry::Standard(StdStream::In)) => Err(FsError::kinded(
                 OP,
                 format!("fd {fd}"),
@@ -2141,6 +2443,9 @@ impl Filesystem {
         if let Some(device) = device_for(guest_path) {
             return Ok(device_stat(device));
         }
+        if let Some((name, _)) = self.generated_for(guest_path) {
+            return Ok(generated_stat(&name));
+        }
         let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
         let metadata = std::fs::metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
         Ok(describe(&host, &metadata))
@@ -2159,6 +2464,10 @@ impl Filesystem {
         if let Some(device) = device_for(guest_path) {
             // A device node is not a symbolic link, so `lstat` and `stat` agree about it.
             return Ok(device_stat(device));
+        }
+        if let Some((name, _)) = self.generated_for(guest_path) {
+            // Nor is a generated file.
+            return Ok(generated_stat(&name));
         }
         let host = self.resolve(OP, guest_path, FinalLink::Describe)?;
         let metadata = std::fs::symlink_metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
@@ -2192,6 +2501,7 @@ impl Filesystem {
                         .map_or("/dev", |(name, _)| *name),
                 )),
             }),
+            Some(Entry::Generated(file)) => Ok(generated_stat(&file.guest)),
             // A standard stream is a character device, which is what a real `fstat` on one
             // reports. Nothing is invented: there is no size, no time and no path.
             Some(Entry::Standard(_)) => Ok(FileStat {
@@ -2307,6 +2617,18 @@ impl Filesystem {
     /// when the probe was refused — which is `access`'s own contract.
     pub fn access(&self, guest_path: &[u8], check: AccessCheck) -> FsResult<()> {
         const OP: &str = "access";
+        // A generated file exists and is readable, and is not writable: `0444`, as `open` says.
+        if let Some((name, _)) = self.generated_for(guest_path) {
+            return match check {
+                AccessCheck::Exists | AccessCheck::Readable => Ok(()),
+                AccessCheck::Writable => Err(FsError::kinded(
+                    OP,
+                    name,
+                    FsErrorKind::PermissionDenied,
+                    "a generated file is read-only (mode 0444)",
+                )),
+            };
+        }
         let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
         let metadata = std::fs::metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
         match check {
@@ -3341,6 +3663,233 @@ mod tests {
                 path::display(path)
             );
         }
+    }
+
+    // ============================================================== generated files
+
+    /// A generator whose output **changes length** with every call, and a count of the calls.
+    ///
+    /// The length is what makes a torn read visible: two generations spliced at an offset cannot
+    /// come out equal to either one, which a generator of fixed-width text could.
+    fn counting_generator() -> (Arc<Generator>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let generate: Arc<Generator> = Arc::new(move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(generation_text(n))
+        });
+        (generate, calls)
+    }
+
+    /// What [`counting_generator`] produces on its `n`th call.
+    fn generation_text(n: usize) -> Vec<u8> {
+        format!("generation {n}: {}\n", "ab".repeat(n)).into_bytes()
+    }
+
+    fn calls(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// **A read from offset 0 generates; a read that continues does not.**
+    ///
+    /// Both halves of `GeneratedFile`'s rule, each against the mistake it rules out: a file
+    /// generated once at `open` would give the engine one memory reading for the whole run, and a
+    /// file generated on every read would splice two readings into one when read in pieces.
+    #[test]
+    fn a_generated_file_is_generated_at_each_read_from_zero_and_only_then() {
+        let scratch = Scratch::new("generated-reads");
+        let fs = scratch.fs();
+        let (generate, count) = counting_generator();
+        fs.serve_generated(b"/proc/meminfo", generate).expect("serve it");
+        assert_eq!(calls(&count), 0, "serving a file generates nothing");
+
+        let fd = fs.open(b"/proc/meminfo", read_flags()).expect("open the generated file");
+        assert!(fd >= FIRST_FD);
+        assert_eq!(calls(&count), 1, "`open` generates once, so a failure is the open's");
+
+        // The engine's own shape: `pread` at 0 for each new reading, on one kept descriptor.
+        let mut buf = [0u8; 256];
+        let got = fs.pread(fd, &mut buf, 0).expect("pread at 0");
+        assert_eq!(&buf[..got], generation_text(2).as_slice());
+        let got = fs.pread(fd, &mut buf, 0).expect("pread at 0 again");
+        assert_eq!(&buf[..got], generation_text(3).as_slice(), "a second reading is a new one");
+
+        // Continuing from a nonzero offset reads the same generation's bytes.
+        let got = fs.pread(fd, &mut buf, 5).expect("pread at 5");
+        assert_eq!(calls(&count), 3, "a read that continues generates nothing");
+        assert_eq!(&buf[..got], &generation_text(3)[5..]);
+        // Past the end is end of file, not an error.
+        assert_eq!(fs.pread(fd, &mut buf, 10_000).expect("pread past the end"), 0);
+
+        // `read` in pieces: the first piece generates and the rest are the same file.
+        let mut whole = Vec::new();
+        let mut piece = [0u8; 3];
+        loop {
+            let got = fs.read(fd, &mut piece).expect("a sequential read");
+            if got == 0 {
+                break;
+            }
+            whole.extend_from_slice(&piece[..got]);
+        }
+        assert_eq!(calls(&count), 4, "one generation for the whole sequential reading");
+        assert_eq!(whole, generation_text(4), "the pieces are one file, not a splice of several");
+
+        // `lseek` back to 0 is how a sequential reader asks for a new reading; `SEEK_END` has no
+        // end to seek from.
+        assert_eq!(fs.seek(fd, 0, 0).expect("SEEK_SET 0"), 0);
+        let got = fs.read(fd, &mut buf).expect("read after the rewind");
+        assert_eq!(&buf[..got], generation_text(5).as_slice());
+        assert_eq!(fs.seek(fd, -2, 1).expect("SEEK_CUR back two"), got as u64 - 2);
+        let error = fs.seek(fd, 0, 2).expect_err("SEEK_END");
+        assert_eq!(error.kind(), Some(FsErrorKind::InvalidInput), "{error}");
+        let error = fs.seek(fd, -1, 0).expect_err("a negative offset");
+        assert_eq!(error.kind(), Some(FsErrorKind::InvalidInput), "{error}");
+
+        fs.close(fd).expect("close");
+        assert!(!fs.is_open(fd));
+    }
+
+    /// **Read-only, and every operation says so the way Linux says it for a `/proc` file.**
+    #[test]
+    fn a_generated_file_is_a_read_only_regular_file_to_every_operation() {
+        let scratch = Scratch::new("generated-readonly");
+        let fs = scratch.fs();
+        let (generate, _) = counting_generator();
+        fs.serve_generated(b"/proc/self/statm", generate).expect("serve it");
+        let path = b"/proc/self/statm";
+
+        let with = |flags: OpenFlags| OpenFlags { read: true, ..flags };
+        let none = OpenFlags::default();
+        for (flags, kind, what) in [
+            (OpenFlags { write: true, ..none }, FsErrorKind::PermissionDenied, "O_WRONLY"),
+            (with(OpenFlags { write: true, ..none }), FsErrorKind::PermissionDenied, "O_RDWR"),
+            (with(OpenFlags { truncate: true, ..none }), FsErrorKind::PermissionDenied, "O_TRUNC"),
+            (with(OpenFlags { directory: true, ..none }), FsErrorKind::NotADirectory, "O_DIRECTORY"),
+            (
+                with(OpenFlags { create: true, exclusive: true, ..none }),
+                FsErrorKind::AlreadyExists,
+                "O_CREAT | O_EXCL",
+            ),
+        ] {
+            let error = fs.open(path, flags).expect_err(what);
+            assert_eq!(error.kind(), Some(kind), "{what}: {error}");
+        }
+        assert_eq!(fs.open_count(), 3, "no refused open left a descriptor behind");
+        // `O_CREAT` without `O_EXCL` opens a file that exists, as it does anywhere.
+        let fd = fs
+            .open(path, OpenFlags { read: true, create: true, ..OpenFlags::default() })
+            .expect("O_CREAT on an existing file");
+
+        let error = fs.write(fd, b"x").expect_err("write");
+        assert_eq!(error.kind(), Some(FsErrorKind::BadDescriptor), "{error}");
+        let error = fs.pwrite(fd, b"x", 0).expect_err("pwrite");
+        assert_eq!(error.kind(), Some(FsErrorKind::BadDescriptor), "{error}");
+        let error = fs.fallocate(fd, 0, 1).expect_err("fallocate");
+        assert_eq!(error.kind(), Some(FsErrorKind::BadDescriptor), "{error}");
+        let error = fs.fsync(fd).expect_err("fsync");
+        assert_eq!(error.kind(), Some(FsErrorKind::InvalidInput), "{error}");
+
+        // A regular file of size 0 -- what `/proc` reports -- read-only, and the same through
+        // the descriptor and through the path.
+        let described = fs.fstat(fd).expect("fstat");
+        assert_eq!(described.kind, FileKind::Regular);
+        assert_eq!(described.size, 0);
+        assert!(described.read_only);
+        assert_eq!(fs.stat(path).expect("stat"), described);
+        assert_eq!(fs.lstat(path).expect("lstat"), described);
+        fs.access(path, AccessCheck::Exists).expect("F_OK");
+        fs.access(path, AccessCheck::Readable).expect("R_OK");
+        let error = fs.access(path, AccessCheck::Writable).expect_err("W_OK");
+        assert_eq!(error.kind(), Some(FsErrorKind::PermissionDenied), "{error}");
+
+        // Always ready, and not something epoll will watch.
+        assert_eq!(fs.readiness(fd).expect("readiness"), Readiness::ALWAYS);
+        assert_eq!(fs.readiness_source(fd), Some(ReadinessSource::Immediate));
+        let epfd = fs.epoll_create().expect("an epoll instance");
+        let member = EpollMember { events: 1, data: 0 };
+        let error = fs.epoll_ctl(epfd, EpollOp::Add, fd, member).expect_err("epoll a /proc file");
+        assert_eq!(error.kind(), Some(FsErrorKind::NotPollable), "{error}");
+
+        // Nothing reached the host: the root is still empty.
+        assert_eq!(
+            std::fs::read_dir(&scratch.0).expect("list the root").count(),
+            0,
+            "a generated file must not be looked for, or created, under the root"
+        );
+    }
+
+    /// **Every spelling of a served path reaches it, and nothing else does.**
+    ///
+    /// The over-correction half is the second loop: serving by prefix would make every `/proc`
+    /// path a generated file, and `ENOENT` for a file that is not served is what the guest must
+    /// get -- recorded as a miss, as any other.
+    #[test]
+    fn only_a_served_path_is_generated_and_every_spelling_of_it_is() {
+        let scratch = Scratch::new("generated-paths");
+        let fs = scratch.fs();
+        let (generate, _) = counting_generator();
+        fs.serve_generated(b"/proc/meminfo", Arc::clone(&generate)).expect("serve it");
+        let spellings = [
+            &b"/proc/meminfo"[..],
+            b"/proc/./meminfo",
+            b"/proc//meminfo",
+            b"/x/../proc/meminfo",
+            b"proc/meminfo",
+        ];
+        for path in spellings {
+            let fd = fs.open(path, read_flags()).unwrap_or_else(|error| {
+                panic!("`{}` names the served file: {error}", path::display(path))
+            });
+            fs.close(fd).expect("close");
+        }
+        let unserved =
+            [&b"/proc/meminfo2"[..], b"/proc", b"/proc/self/status", b"/proc/self/meminfo"];
+        for path in unserved {
+            let error = fs.open(path, read_flags()).expect_err("not served");
+            let shown = path::display(path);
+            assert_eq!(error.kind(), Some(FsErrorKind::NotFound), "{shown}: {error}");
+        }
+        let misses = fs.open_misses();
+        assert!(misses.contains(&b"/proc/self/status".to_vec()), "an unserved path is a miss");
+        assert!(!misses.contains(&b"/proc/meminfo".to_vec()), "a served one is not");
+
+        // Served once; and a device cannot be one.
+        let error =
+            fs.serve_generated(b"/proc/./meminfo", Arc::clone(&generate)).expect_err("twice");
+        assert!(error.to_string().contains("already served"), "{error}");
+        let error = fs.serve_generated(b"/dev/urandom", generate).expect_err("a device");
+        assert!(error.to_string().contains("device"), "{error}");
+    }
+
+    /// **A file that cannot be produced is refused by the call that asked, by name.**
+    #[test]
+    fn a_generator_that_cannot_produce_the_file_refuses_the_call_that_asked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let scratch = Scratch::new("generated-refusal");
+        let fs = scratch.fs();
+        let failing = Arc::new(AtomicBool::new(true));
+        let switch = Arc::clone(&failing);
+        let generate: Arc<Generator> = Arc::new(move || {
+            if switch.load(Ordering::SeqCst) {
+                Err(FsError::refused("generate", "/proc/meminfo", "nothing has said what it holds"))
+            } else {
+                Ok(b"fine\n".to_vec())
+            }
+        });
+        fs.serve_generated(b"/proc/meminfo", generate).expect("serve it");
+
+        let error = fs.open(b"/proc/meminfo", read_flags()).expect_err("the generator refuses");
+        assert_eq!(error.kind(), None, "a refusal, not an errno: {error}");
+        assert!(error.to_string().contains("nothing has said what it holds"), "{error}");
+        assert_eq!(fs.open_count(), 3, "and no descriptor was handed out");
+
+        failing.store(false, Ordering::SeqCst);
+        let fd = fs.open(b"/proc/meminfo", read_flags()).expect("now it can be produced");
+        failing.store(true, Ordering::SeqCst);
+        let mut buf = [0u8; 16];
+        let error = fs.pread(fd, &mut buf, 0).expect_err("a later reading that cannot be produced");
+        assert_eq!(error.kind(), None, "{error}");
     }
 
     // ============================================================== pipes
