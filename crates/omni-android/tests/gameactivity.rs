@@ -2677,8 +2677,11 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         (stop, handle)
     });
     let settle = std::time::Instant::now();
+    // **A person closing the window ends the session**, and the app is then closed as a device
+    // closes it (below), rather than the run carrying on into a window that is gone.
+    let mut close_requested = false;
     while settle.elapsed() < session {
-        if guest.bionic.live_guest_threads() == 0 {
+        if guest.bionic.live_guest_threads() == 0 || close_requested {
             break;
         }
         if std::time::Instant::now() >= next_frames {
@@ -2812,6 +2815,14 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                         Err(error) => input_failure = Some(format!("keyboard {shown}: {error}")),
                     }
                 }
+            }
+            if events.iter().any(|event| matches!(event, omni_platform::window::WindowEvent::CloseRequested)) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "WINDOW: closed by the person at it at +{:.1}s -- the session ends here",
+                    settle.elapsed().as_secs_f32()
+                );
+                close_requested = true;
             }
             for event in &events {
                 let _bionic = guest.bionic.activate().expect("publish the bionic instance");
