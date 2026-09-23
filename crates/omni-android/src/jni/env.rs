@@ -578,6 +578,16 @@ fn env_call(
             let text = string_of(&state, name, address, string)?;
             Ok(JniReturn::Int(i32::try_from(text.len()).unwrap_or(i32::MAX)))
         }
+        // **Outside the 59 §0 measured, and a run reached it**: gate74's thread 16 (started at
+        // link `0x284d168`) died on this slot's refusal once `android.os.Build`'s strings were
+        // answered. The length of what `GetStringUTFChars` copies out, less its terminator --
+        // modified UTF-8, so U+0000 counts two and a supplementary character six.
+        "GetStringUTFLength" => {
+            let string = args.next_u64()?;
+            let state = jni.state();
+            let text = string_of(&state, name, address, string)?;
+            Ok(JniReturn::Int(i32::try_from(text.modified_utf8_len()).unwrap_or(i32::MAX)))
+        }
         "GetStringUTFChars" | "GetStringChars" => {
             let string = args.next_u64()?;
             let is_copy = args.next_pointer()?;
@@ -2016,6 +2026,7 @@ mod tests {
         "NewStringUTF",
         "NewString",
         "GetStringLength",
+        "GetStringUTFLength",
         "GetStringUTFChars",
         "GetStringChars",
         "ReleaseStringUTFChars",
@@ -2158,6 +2169,41 @@ mod tests {
                 region("GetByteArrayRegion", 0x10, 16, start, len).expect_err("out of bounds");
             assert!(matches!(error, AbiError::JniRefused { .. }), "{start},{len}: {error:?}");
         }
+    }
+
+    /// **`GetStringUTFLength` is the modified-UTF-8 length, through the slot itself.** Each unit
+    /// of the string takes a different width: `A` one byte, `é` two, U+0000 two (the form that
+    /// keeps a NUL out of a C string), and a surrogate pair six. A slot answering the UTF-16
+    /// length (`GetStringLength`'s) says 5; standard UTF-8 says 1+2+1+4 = 8; a refusal fails
+    /// the `expect`.
+    #[test]
+    fn get_string_utf_length_is_the_modified_utf8_length() {
+        struct Registers([u64; 1]);
+        impl crate::abi::ArgSource for Registers {
+            fn x(&self, index: u32) -> u64 {
+                self.0.get(index as usize).copied().unwrap_or(0)
+            }
+            fn v(&self, _index: u32) -> u128 {
+                0
+            }
+            fn sp(&self) -> GuestAddr {
+                0
+            }
+        }
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(std::sync::Arc::clone(&space)).expect("a JNI instance");
+        let mem = GuestMem::new(space);
+        let text = JavaString::from_units(vec![0x41, 0xe9, 0x0000, 0xd83d, 0xde00]);
+        let string = jni
+            .state()
+            .handles
+            .new_local("NewString", 0, Object::String(text))
+            .expect("a reference");
+        let registers = Registers([string]);
+        let mut args = Args::new(&registers, &mem, Blame::new("GetStringUTFLength", 0, 1));
+        let answer = env_call(&jni, 0, "GetStringUTFLength", 0, &mut args, &mem)
+            .expect("GetStringUTFLength is answered");
+        assert_eq!(answer, JniReturn::Int(1 + 2 + 2 + 6));
     }
 
     /// The refusal for an unimplemented slot has to carry the slot's own name, because the whole
