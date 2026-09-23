@@ -20,7 +20,15 @@
 use std::path::{Path, PathBuf};
 
 /// Every test file in this crate that is gated to Windows, and therefore runs nowhere else.
-const WINDOWS_ONLY: [&str; 3] = ["arena.rs", "commit_charge.rs", "space.rs"];
+/// `commit_charge.rs` measures commit charge, which only Windows has (macOS backs memory on touch;
+/// `omni-platform/tests/vm_footprint_macos.rs` measures what it does instead).
+const WINDOWS_ONLY: [&str; 1] = ["commit_charge.rs"];
+
+/// Test files gated to the hosts whose `omni-platform` memory backend is implemented: Windows and
+/// macOS. They run nowhere else.
+const WINDOWS_AND_MACOS: [&str; 2] = ["arena.rs", "space.rs"];
+
+const WINDOWS_AND_MACOS_GATE: &str = r#"#![cfg(any(target_os = "windows", target_os = "macos"))]"#;
 
 /// Test files in this crate that are *not* gated, and so really do run everywhere.
 ///
@@ -59,6 +67,15 @@ fn the_windows_only_list_is_accurate() {
              removed, in which case delete it from WINDOWS_ONLY, or this list is lying"
         );
     }
+    for name in WINDOWS_AND_MACOS {
+        let path = tests_dir().join(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            text.lines().any(|line| line.trim() == WINDOWS_AND_MACOS_GATE),
+            "{name} is listed as Windows-and-macOS but does not carry `{WINDOWS_AND_MACOS_GATE}`"
+        );
+    }
     for name in PORTABLE {
         let path = tests_dir().join(name);
         let text = std::fs::read_to_string(&path)
@@ -91,8 +108,12 @@ fn the_windows_only_list_is_accurate() {
         })
         .collect();
     found.sort();
-    let mut expected: Vec<String> =
-        WINDOWS_ONLY.iter().chain(PORTABLE.iter()).map(|s| (*s).to_string()).collect();
+    let mut expected: Vec<String> = WINDOWS_ONLY
+        .iter()
+        .chain(WINDOWS_AND_MACOS.iter())
+        .chain(PORTABLE.iter())
+        .map(|s| (*s).to_string())
+        .collect();
     expected.sort();
     assert_eq!(
         found, expected,
@@ -108,20 +129,25 @@ fn the_windows_only_suites_did_not_run_on_this_target() {
     use std::io::Write;
     // Straight to the process's stderr: `eprintln!` is captured by libtest and then discarded for a
     // passing test, which is exactly the outcome this exists to prevent.
+    let mut skipped: Vec<&str> = WINDOWS_ONLY.to_vec();
+    if !cfg!(target_os = "macos") {
+        skipped.extend(WINDOWS_AND_MACOS);
+    }
     let notice = format!(
         "\n\
          ============================================================================\n\
          omni-mem: {} of {} test files did not run on {}.\n\
          Skipped entirely: {}\n\
-         They are gated to Windows because omni-platform's unix backend returns\n\
-         `Unsupported` from every virtual-memory operation. A green run of this\n\
-         workspace on this target does NOT mean the memory layer works here.\n\
+         They are gated to the hosts whose omni-platform memory backend is\n\
+         implemented (and commit_charge.rs to Windows, the one host with commit\n\
+         charge). A green run of this workspace on this target does NOT mean what\n\
+         they test works here.\n\
          Also skipped, but visibly, as `ignored` with a reason: {}\n\
          ============================================================================\n",
-        WINDOWS_ONLY.len(),
-        WINDOWS_ONLY.len() + PORTABLE.len(),
+        skipped.len(),
+        WINDOWS_ONLY.len() + WINDOWS_AND_MACOS.len() + PORTABLE.len(),
         std::env::consts::OS,
-        WINDOWS_ONLY.join(", "),
+        skipped.join(", "),
         ITEM_GATED.join(", "),
     );
     let _ = std::io::stderr().write_all(notice.as_bytes());
