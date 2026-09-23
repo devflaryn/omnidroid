@@ -247,6 +247,7 @@ fn fresh_reserved(address: usize, size: usize) -> Result<(), u32> {
         return Err(errno());
     }
     debug_assert_eq!(mapped as usize, address, "MAP_FIXED returns the requested base");
+    mirrored(address, size, libc::PROT_NONE);
     Ok(())
 }
 
@@ -256,7 +257,21 @@ fn mprotect(address: usize, size: usize, protection: libc::c_int) -> Result<(), 
     if unsafe { libc::mprotect(address as *mut libc::c_void, size, protection) } != 0 {
         return Err(errno());
     }
+    mirrored(address, size, protection);
     Ok(())
+}
+
+/// Tell the hypervisor seam's stage-2 mirror what `[address, address + size)` now is: it has just
+/// been replaced (`mmap(MAP_FIXED)`), re-protected, or unmapped (`PROT_NONE`). A guest running
+/// natively under Hypervisor.framework otherwise keeps the old pages and ignores host protection
+/// (MEASURED; `crate::hypervisor` and `docs/ports/macos-hvf.md`). Without the `hypervisor` feature
+/// this is nothing; with it and no range attached it is one atomic load.
+#[inline]
+fn mirrored(address: usize, size: usize, protection: libc::c_int) {
+    #[cfg(all(feature = "hypervisor", target_arch = "aarch64"))]
+    crate::hypervisor::host_mapping_changed(address, size, protection);
+    #[cfg(not(all(feature = "hypervisor", target_arch = "aarch64")))]
+    let _ = (address, size, protection);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -613,6 +628,7 @@ pub(super) fn map_file(
         let _ = fresh_reserved(address, size);
         return Err(VmError::Os { operation: "map_file", address, size, source: OsError(code) });
     }
+    mirrored(address, size, create);
     if let Some(target) = then {
         if let Err(code) = mprotect(address, size, prot(target)) {
             let _ = fresh_reserved(address, size);
@@ -682,6 +698,7 @@ pub(super) fn unmap_and_release(address: usize, size: usize) -> VmResult<()> {
     if unsafe { libc::munmap(address as *mut libc::c_void, size) } != 0 {
         return Err(os("unmap_and_release", address, size));
     }
+    mirrored(address, size, libc::PROT_NONE);
     map.remove(&address);
     Ok(())
 }
@@ -704,6 +721,7 @@ pub(super) fn release(base: usize, len: usize, _kind: ReservationKind) -> VmResu
     if unsafe { libc::munmap(base as *mut libc::c_void, requested) } != 0 {
         return Err(os("release", base, len));
     }
+    mirrored(base, requested, libc::PROT_NONE);
     map.remove(&base);
     Ok(())
 }
