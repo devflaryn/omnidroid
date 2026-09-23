@@ -7276,6 +7276,18 @@ directory", ADAPTER_FILES,
      """        let expected = if type_ != mutex_type::RECURSIVE && state == lock_state::LOCKED {""",
      """        let expected = if state == lock_state::LOCKED || type_ == mutex_type::RECURSIVE {""",
      BIONIC_MUTEX_LIB),
+
+    # getaddrinfo with a null node: what Play reached after the empty service (2026-09-23).
+    ("nullnode-A1", "A", "a null node ignores AI_PASSIVE and answers loopback, not the bind address",
+     "crates/omni-android/src/bionic/net.rs",
+     """                match (*family, hints.flags & AI_PASSIVE != 0) {""",
+     """                match (*family, false) {""",
+     BIONIC_GAI),
+    ("nullnode-B1", "B", "a null node's AF_UNSPEC answer puts IPv4 first, where bionic's explore table has IPv6",
+     "crates/omni-android/src/bionic/net.rs",
+     """            None => &[platnet::IpFamily::V6, platnet::IpFamily::V4],""",
+     """            None => &[platnet::IpFamily::V4, platnet::IpFamily::V6],""",
+     BIONIC_GAI),
 ]
 
 

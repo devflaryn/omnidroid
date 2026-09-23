@@ -3772,9 +3772,8 @@ impl Hints {
 ///   make this layer return an address the resolver did not give: the observable difference is a
 ///   `connect` the guest tries and the host refuses, which is the same outcome the guest already
 ///   has a branch for. Stated here rather than left silent, because accepting a flag is a claim.
-/// * **`AI_PASSIVE` is accepted and is unreachable in the case it changes.** It matters only for
-///   a null `node`, and a null `node` is refused below: it asks `getaddrinfo` for a *listening*
-///   address, and this seam has no `listen` and no `accept`.
+/// * **`AI_PASSIVE` is honoured for a null `node`**, the only case it changes: the wildcard
+///   address to bind to, where without it a null `node` is loopback (bionic's `explore_null`).
 /// * A bit outside `netdb.h` is `EAI_BADFLAGS`, which is the guest's own answer for it.
 pub(super) fn getaddrinfo(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (node, service, hints, res) = {
@@ -3801,21 +3800,11 @@ fn resolve_into(
     hints: u64,
     res: u64,
 ) -> AbiResult<i32> {
-    if node == 0 {
-        // A null `node` asks for the local host — the loopback address, or the wildcard with
-        // `AI_PASSIVE`. Both are *listening* questions and this seam implements outgoing
-        // connections only, so answering one would be inventing a use for a result nothing here
-        // can consume. `omni_platform::net::resolve` refuses the same thing for the same reason.
-        return Err(refuse(
-            c,
-            "the guest called getaddrinfo with a null `node`, which asks for an address to bind \
-             and listen on. This layer has no `listen` and no `accept` -- `omni_platform::net` is \
-             a TCP and UDP client -- so there is no answer that is not invented. A run that \
-             reaches this is a run that needs an inbound path, which is new work and not a \
-             missing line"
-                .to_string(),
-        ));
+    if node == 0 && service == 0 {
+        // bionic's first check: no host and no service is `EAI_NONAME`.
+        return Ok(net::EAI_NONAME);
     }
+    let _ = c;
     if res == 0 {
         // The out-parameter is where the whole answer goes. A null one is `EFAULT` on a device;
         // it arrives here as a refusal for `files::path_for`'s stated reason -- a guest that
@@ -3870,7 +3859,9 @@ fn resolve_into(
         .filter(|(_, protocol)| hints.protocol == IPPROTO_IP || *protocol == hints.protocol)
         .collect();
 
-    let name = {
+    let name = if node == 0 {
+        String::new()
+    } else {
         let at = guest_address(view, node)?;
         let bytes = view.mem().cstr(at, Blame::new(view.symbol(), view.address(), 0))?;
         match String::from_utf8(bytes) {
@@ -3880,7 +3871,7 @@ fn resolve_into(
             Err(_) => return Ok(net::EAI_NONAME),
         }
     };
-    if hints.flags & AI_NUMERICHOST != 0 && name.parse::<std::net::IpAddr>().is_err() {
+    if node != 0 && hints.flags & AI_NUMERICHOST != 0 && name.parse::<std::net::IpAddr>().is_err() {
         // The flag's entire purpose: no query may leave the machine for a name that is not
         // already an address. `EAI_NONAME` is what `getaddrinfo` answers for it.
         return Ok(net::EAI_NONAME);
@@ -3909,7 +3900,37 @@ fn resolve_into(
     };
 
     let policy = policy(view)?;
-    let addresses = match platnet::resolve(&name, port, want, &policy) {
+    let addresses = if node == 0 {
+        // **A null `node` is answered, as bionic's `explore_null` answers it, and no query leaves
+        // the machine.** With `AI_PASSIVE` it is the family's wildcard address (`0.0.0.0`, `::`)
+        // -- an address to `bind` a socket to -- and without it the loopback address, each with
+        // the service's port. Families in bionic's `explore` table order, IPv6 before IPv4, each
+        // kept only if the host can make a socket of it (bionic probes with `socket(af,
+        // SOCK_DGRAM)`); this host can make both. It was refused, on the reasoning that a bind
+        // address meant `listen`/`accept`; MEASURED otherwise (2026-09-23): pressing Play on a
+        // game page, a TaskScheduler worker asked for one and died on the refusal -- a UDP client
+        // binding its own port, which is client work (`bind` is implemented).
+        let families: &[platnet::IpFamily] = match want {
+            Some(family) => match family {
+                platnet::IpFamily::V4 => &[platnet::IpFamily::V4],
+                platnet::IpFamily::V6 => &[platnet::IpFamily::V6],
+            },
+            None => &[platnet::IpFamily::V6, platnet::IpFamily::V4],
+        };
+        families
+            .iter()
+            .map(|family| {
+                match (*family, hints.flags & AI_PASSIVE != 0) {
+                    (platnet::IpFamily::V4, true) => platnet::SocketAddress::V4 { address: [0; 4], port },
+                    (platnet::IpFamily::V6, true) => {
+                        platnet::SocketAddress::V6 { address: [0; 16], port, flowinfo: 0, scope_id: 0 }
+                    }
+                    (family, false) => platnet::SocketAddress::loopback(family, port),
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        match platnet::resolve(&name, port, want, &policy) {
         Ok(addresses) => addresses,
         Err(error) => {
             return match error.resolve_failure().and_then(eai_for) {
@@ -3920,6 +3941,7 @@ fn resolve_into(
                 // the guest acts on it for ever.
                 None => Err(view.refusal(error.to_string())),
             };
+            }
         }
     };
 

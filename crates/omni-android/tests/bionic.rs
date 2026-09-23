@@ -991,6 +991,43 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          same receive_message recvmmsg has used since M6, so the two cannot disagree about a \
          msghdr.",
     ),
+    (
+        "pthread_condattr_init",
+        "The first game join (2026-09-23, signed in, Play pressed): GUEST THREAD DIED at +340s, \
+         thread 2 (started at link 0x284d168): the guest called the imported symbol \
+         `pthread_condattr_init` ... and nothing in the compatibility layer implements it; no \
+         frame was presented after it. omni_bionic::cond::attr_init had been written and tested \
+         and never wired (VERIFICATION.md entry 16).",
+    ),
+    (
+        "pthread_condattr_setclock",
+        "Bound with pthread_condattr_init, from the same inventory: libroblox.so imports the \
+         three condattr calls and omni_bionic::cond implements all three; pthread_cond_init \
+         already carries the attr's clock into the cond.",
+    ),
+    (
+        "pthread_condattr_destroy",
+        "Bound with pthread_condattr_init, for the same reason.",
+    ),
+    (
+        "pthread_attr_setschedparam",
+        "Bound BEFORE a run reached it (2026-09-23), from an audit of the imports no source \
+         names, after the first join died on pthread_condattr_init: bionic's whole body is a \
+         store into the attr, and with the policy SCHED_NORMAL pthread_create leaves it unused.",
+    ),
+    (
+        "pthread_setschedparam",
+        "Bound BEFORE a run reached it, from the same audit: the kernel's answers to an \
+         unprivileged app (ESRCH, EPERM for real-time, EINVAL, 0 for SCHED_OTHER 0), and \
+         SCHED_BATCH/SCHED_IDLE refused by name because this layer does not track a policy.",
+    ),
+    (
+        "gethostname",
+        "A signed-in session (2026-09-23): GUEST THREAD DIED at +435s, thread 3 (started at \
+         link 0x284d168): the guest called the imported symbol `gethostname` ... and nothing \
+         in the compatibility layer implements it. Answers Android's `localhost` (AOSP \
+         init.rc: `hostname localhost`), or ENAMETOOLONG.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1041,7 +1078,9 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 307, "bound symbols: {symbols:?}");
+    // 2026-09-23: 307 plus six, each in BEYOND_THE_PREDICTION with how it was found --
+    // three pthread_condattr_*, pthread_attr_setschedparam, pthread_setschedparam, gethostname.
+    assert_eq!(symbols.len(), 313, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1141,7 +1180,10 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // `MAP_SHARED` file mapping the first signed-in session died asking for, bound on the exit
     // path beside `mmap` -- the first symbol added there since phase 3c.
     // **`recvmsg`, for 307**: the same session's QUIC receiver, inline beside `recvmmsg`.
-    assert_eq!(Bionic::inline_symbols().count(), 292);
+    // **Six more, all inline, for 313** (2026-09-23): the three `pthread_condattr_*` the first
+    // game join died on, `pthread_attr_setschedparam` and `pthread_setschedparam` bound ahead of a
+    // run from an audit of unnamed imports, and `gethostname`, a signed-in worker's next death.
+    assert_eq!(Bionic::inline_symbols().count(), 298);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -13913,4 +13955,74 @@ fn getaddrinfo_answers_an_empty_service_as_bionic_does() {
         asm.mov(3, res as u64);
     });
     assert!(refusal.to_string().contains("numeric service only"), "{refusal}");
+}
+
+/// **A null `node` is answered as bionic's `explore_null` answers it**: with `AI_PASSIVE` the
+/// family's wildcard address with the service's port -- an address to `bind` to -- and without it
+/// loopback; IPv6 before IPv4 for `AF_UNSPEC`, datagram before stream; and no host and no service
+/// is `EAI_NONAME`. MEASURED why: pressing Play on a game page, a TaskScheduler worker asked
+/// `getaddrinfo(NULL, ...)` and died on the old refusal (2026-09-23).
+#[test]
+fn getaddrinfo_with_a_null_node_answers_the_bind_or_loopback_address() {
+    let _guard = serialized();
+    let (f, _root) = networked("gai-null-node");
+    let res = f.guest.data + 0x180;
+    let hints = f.guest.data + 0x200;
+    let service = f.cstring(f.guest.data + 0x140, b"5000");
+    let call = |node: u64, service: u64, hints: u64| {
+        value_of(&f, "getaddrinfo", |asm| {
+            asm.mov(0, node);
+            asm.mov(1, service);
+            asm.mov(2, hints);
+            asm.mov(3, res as u64);
+        }) as i32
+    };
+    let sockaddr_of = |node: omni_cpu::GuestAddr| {
+        let ai_addr = read_u64_guest(&f, node + 32) as omni_cpu::GuestAddr;
+        read_guest(&f, ai_addr, 8)
+    };
+
+    assert_eq!(call(0, 0, 0), 8, "no node and no service is EAI_NONAME");
+
+    // AI_PASSIVE, AF_INET, SOCK_DGRAM: one node, 0.0.0.0:5000.
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints, &1i32.to_le_bytes()); // AI_PASSIVE
+    f.guest.write_bytes(hints + 4, &(AF_INET as i32).to_le_bytes());
+    f.guest.write_bytes(hints + 8, &2i32.to_le_bytes()); // SOCK_DGRAM
+    assert_eq!(call(0, service as u64, hints as u64), 0);
+    let head = read_u64_guest(&f, res) as omni_cpu::GuestAddr;
+    assert_eq!(read_u32_guest(&f, head + 4) as i32, AF_INET as i32, "ai_family");
+    assert_eq!(read_u32_guest(&f, head + 8), 2, "SOCK_DGRAM");
+    assert_eq!(sockaddr_of(head), [2, 0, 0x13, 0x88, 0, 0, 0, 0], "0.0.0.0, port 5000 big-endian");
+    assert_eq!(read_u64_guest(&f, head + 40), 0, "one node");
+    let _ = value_of(&f, "freeaddrinfo", |asm| { asm.mov(0, head as u64); });
+
+    // Without AI_PASSIVE: loopback.
+    f.guest.write_bytes(hints, &0i32.to_le_bytes());
+    assert_eq!(call(0, service as u64, hints as u64), 0);
+    let head = read_u64_guest(&f, res) as omni_cpu::GuestAddr;
+    assert_eq!(sockaddr_of(head), [2, 0, 0x13, 0x88, 127, 0, 0, 1], "127.0.0.1:5000");
+    let _ = value_of(&f, "freeaddrinfo", |asm| { asm.mov(0, head as u64); });
+
+    // AF_UNSPEC, any socket type, AI_PASSIVE: [::] then 0.0.0.0, datagram before stream each.
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints, &1i32.to_le_bytes());
+    assert_eq!(call(0, service as u64, hints as u64), 0);
+    let mut node = read_u64_guest(&f, res) as omni_cpu::GuestAddr;
+    let mut seen = Vec::new();
+    while node != 0 {
+        seen.push((read_u32_guest(&f, node + 4), read_u32_guest(&f, node + 8)));
+        node = read_u64_guest(&f, node + 40) as omni_cpu::GuestAddr;
+    }
+    assert_eq!(seen, [(10, 2), (10, 1), (2, 2), (2, 1)], "(AF_INET6, then AF_INET) x (DGRAM, STREAM)");
+    let head = read_u64_guest(&f, res);
+    let _ = value_of(&f, "freeaddrinfo", |asm| { asm.mov(0, head); });
+
+    // AI_NUMERICHOST does not reject a null node: there is no name to be numeric.
+    f.guest.write_bytes(hints, &(1i32 | 4).to_le_bytes());
+    f.guest.write_bytes(hints + 4, &(AF_INET as i32).to_le_bytes());
+    assert_eq!(call(0, service as u64, hints as u64), 0, "AI_PASSIVE | AI_NUMERICHOST with no node");
+    let head = read_u64_guest(&f, res);
+    let _ = value_of(&f, "freeaddrinfo", |asm| { asm.mov(0, head); });
+    assert_eq!(f.bionic.addrinfo_slab().live(), 0, "every list was handed back");
 }
