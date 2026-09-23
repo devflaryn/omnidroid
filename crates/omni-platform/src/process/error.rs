@@ -59,6 +59,23 @@ pub enum ProcessError {
         code: u32,
     },
 
+    /// A POSIX call that reports through `errno` failed.
+    ///
+    /// The **third** number space, and a variant of its own for the reason
+    /// [`Status`](ProcessError::Status) and [`LastError`](ProcessError::LastError) are two: `errno`
+    /// 13 is `EACCES`, Win32 error 13 is `ERROR_INVALID_DATA`, and a message that rendered one as
+    /// the other would name the wrong failure. Added by the Linux backend, whose calls
+    /// (`getrandom`, `sched_getcpu`, `setpriority`, `clock_gettime`) all report this way.
+    #[error("`{operation}`: {api} failed with errno {errno} ({})", std::io::Error::from_raw_os_error(*.errno))]
+    Errno {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The OS entry point that failed.
+        api: &'static str,
+        /// The raw `errno` value, in the host's own numbering.
+        errno: i32,
+    },
+
     /// A quantity the standard library reports, which it could not determine.
     ///
     /// **Not a catch-all**, and the distinction from the two Windows variants above is the point:

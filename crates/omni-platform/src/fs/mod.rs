@@ -4334,13 +4334,13 @@ mod tests {
     }
     // ============================================================ sockets in the same table
     //
-    // **Compiled only where a backend exists**, `#[cfg(target_os = "windows")]`, for the reason
-    // `tests/net_loopback.rs` states at length: the Linux and macOS net backends are structural,
-    // so `Socket::new` cannot produce a socket there and a test that "passed" by asserting the
-    // refusal would be asserting the absence of an implementation rather than the presence of
-    // one. Every socket below is unconnected and bound to nothing, and the policy is
+    // **Compiled only where a backend exists** -- Windows, and Linux since its backend was
+    // written -- for the reason `tests/net_loopback.rs` states at length: the macOS net backend
+    // is structural, so `Socket::new` cannot produce a socket there and a test that "passed" by
+    // asserting the refusal would be asserting the absence of an implementation rather than the
+    // presence of one. Every socket below is unconnected and bound to nothing, and the policy is
     // `loopback_only`, so nothing here can reach the network even if a test were written wrongly.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     mod sockets {
         use super::*;
         use crate::net::{IpFamily, NetPolicy, Socket, SocketKind};
