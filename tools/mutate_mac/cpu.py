@@ -276,4 +276,18 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
      """    mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);""",
      """    mem.invalidate_all();""",
      dyn("code_cache_charge")),
+    # --- mac-mem: patch 0010, the compact block records --------------------------------------------
+    ("mac-mem-A1", "A", "0010: relinking stops at the first block that links to the target, so the "
+     "others keep branching to a stale translation",
+     ARM64 + "address_space.cpp",
+     """    u32 index = head->second;
+    while (index != no_link) {""",
+     """    u32 index = head->second;
+    if (index != no_link) {""",
+     dyn("bookkeeping")),
+    ("mac-mem-A2", "A", "0010: the fastmem handler looks only at a block's first patch site",
+     ARM64 + "address_space.cpp",
+     """        const auto patch_entry = std::lower_bound(first, last, static_cast<u32>(offset),""",
+     """        const auto patch_entry = std::lower_bound(first, first + 1, static_cast<u32>(offset),""",
+     dyn("bookkeeping")),
 ]

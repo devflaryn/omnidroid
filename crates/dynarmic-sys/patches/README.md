@@ -248,6 +248,56 @@ written at that point; every block emitted later is invalidated on its own in `A
 2 MiB, and still to run translated code. The A32 twin (`a32_address_space.cpp`) has the same call;
 A32 is not built here.
 
+### 0010 — arm64: keep what is read of an emitted block, in flat records
+
+`0010-arm64-compact-block-records.patch`. **arm64 only; no change to what is emitted or when.**
+`AddressSpace` kept, for every block it emitted: the block's whole `EmittedBlockInfo` (a vector and
+two robin_maps, 200 bytes) **inline in the buckets** of `block_infos`, a robin_map keyed by entry
+point at a load factor of at most 0.5; a `std::map` node for the reverse lookup; and, for every link
+target, a robin_set of referring entry points in the buckets of `block_references` (96 bytes each,
+and `RelinkForDescriptor`'s `operator[]` made one for every emitted block's own location). Each
+block's fastmem patch sites were a robin_map of their own -- a separate allocation per block.
+
+**MEASURED** in the macOS gate (census built into a scratch build of the pin, counters per jit, read
+at +30/45/60/75/85 s, n = 1 run; bucket and element sizes from `sizeof` on the vendored headers):
+at +60 s, **593,699 blocks over 39 jits** (88,163 in the largest, 616 in the smallest), 2,099 bytes of
+bookkeeping per block before malloc rounding -- `block_infos` buckets 890, `block_references`
+buckets 484 + sets 46, fastmem maps 281, `relocations` vectors 134, per-block link maps 102 + 20,
+`block_entries` 78, reverse map 64 -- 1.19 GiB in all, which `heap(1)` and `footprint(1)` confirm
+(`MALLOC_LARGE` 912 MB, `MALLOC_SMALL` 649 MB). The engine's heavy threads each hold 20-125 thousand
+blocks of the same code.
+
+What is read after a block is emitted is only its entry point, location and size, its fastmem patch
+sites (`FastmemCallback`), and where it links to each target (`RelinkForDescriptor`);
+`relocations` is consumed by `Link` at emission and never read again. The patch keeps exactly that:
+
+* `block_records`: entry point, location, size, first patch site -- 24 bytes, **appended in
+  ascending entry-point order**, because emission only moves forward until `ClearCache` (asserted).
+  A binary search replaces `reverse_block_entries` and `block_infos` (`ReverseGetLocation`,
+  `ReverseGetEntryPoint`, `FastmemCallback`).
+* `fastmem_records`: one per patch site, 24 bytes, grouped by block and sorted by offset, so the
+  handler finds the site by binary search within the block -- the same key the per-block map had.
+  `FakeCall::call_pc` is kept as an offset from the entry point (it is inside the block; asserted).
+* `link_records` + `link_heads`: one 24-byte record per block relocation, chained per target from
+  the newest; a block's records for one target are adjacent in the chain, so `RelinkForDescriptor`
+  patches each referring block's links to that target and invalidates that block once, as before.
+
+Nothing is dropped earlier than before: an invalidated block keeps its records until `ClearCache`,
+exactly as it kept its `block_infos` and `block_references` entries -- `FastmemCallback` can be
+entered from a block that has just been invalidated (the recompile path does that to itself), and
+`RelinkForDescriptor` keeps patching stale blocks' links, as it did. `ClearCache` now **gives the
+memory back** (`= {}` / swap) where `clear()` kept a robin_map's buckets and a vector's capacity.
+The emitters are untouched: `EmittedBlockInfo` is still their product, and is freed after `Emit`.
+
+`tests/bookkeeping.rs` measures bytes in use by the allocator (`malloc_zone_statistics`, every zone;
+it first shows the reading sees a 16 MiB allocation) around the translation of 8,192 blocks with one
+patch site and one link each: **1,785 bytes per block on the pin, 457 with the patch** (n = 8,192
+blocks, of which 147 is the pin's `block_ranges`, which 0011 addresses); the bound is 700. It also
+covers the two lookups the records replace, both of which pass on the pin too: three blocks linked to
+one that is rewritten and invalidated must each stop running its stale translation (the chain walk),
+and a host fault at the third of a block's four patch sites must be served as the third
+(`FastmemCallback`'s binary search).
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is
