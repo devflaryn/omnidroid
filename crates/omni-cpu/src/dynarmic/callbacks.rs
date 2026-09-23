@@ -139,6 +139,19 @@ unsafe extern "C" fn cb_read_code(ctx: *mut c_void, vaddr: u64, out: *mut u32) -
     // SAFETY: `ctx` is this backend's context; `out` is dynarmic's own stack slot.
     unsafe {
         with(ctx, 0, |c| {
+            // The context's own translation counters (`JitCounters`): a plain increment on a
+            // path that is about to cost microseconds of translation.
+            c.counters.fetched += 1;
+            if vaddr != c.last_fetch.wrapping_add(4) {
+                c.counters.blocks += 1;
+                if crate::stats::tracking_retranslation() {
+                    let seen = c.seen_blocks.get_or_insert_with(std::collections::HashSet::new);
+                    if !seen.insert(vaddr) {
+                        c.counters.retranslated += 1;
+                    }
+                }
+            }
+            c.last_fetch = vaddr;
             let address = vaddr as GuestAddr;
             // Order matters. The sentinel and thunks are addresses Omnidroid planted, so they win
             // over whatever the guest has there; a breakpoint is a debugging overlay on a real
@@ -540,6 +553,7 @@ unsafe extern "C" fn cb_icache_op(ctx: *mut c_void, op: u32, vaddr: u64) {
     unsafe {
         with(ctx, (), |c| {
             c.executable_cache = None;
+            c.counters.icache_ops += 1;
             if c.jit.is_null() {
                 return;
             }

@@ -120,6 +120,31 @@ pub const fn stxr(rs: u32, rt: u32, rn: u32) -> u32 {
     0xC800_7C00 | (rs << 16) | (rn << 5) | rt
 }
 
+/// `LDAXR Xt, [Xn]` — load-acquire exclusive: `LDXR` with `o0` (bit 15) set.
+pub const fn ldaxr(rt: u32, rn: u32) -> u32 {
+    ldxr(rt, rn) | (1 << 15)
+}
+
+/// `STLXR Ws, Xt, [Xn]` — store-release exclusive: `STXR` with `o0` (bit 15) set.
+pub const fn stlxr(rs: u32, rt: u32, rn: u32) -> u32 {
+    stxr(rs, rt, rn) | (1 << 15)
+}
+
+/// `LDAXP Xt1, Xt2, [Xn]` — load-acquire exclusive pair. `1 1 001000 0 1 1 11111 1 Rt2 Rn Rt1`.
+pub const fn ldaxp(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xC87F_8000 | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `STLXP Ws, Xt1, Xt2, [Xn]` — store-release exclusive pair. `1 1 001000 0 0 1 Rs 1 Rt2 Rn Rt1`.
+pub const fn stlxp(rs: u32, rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xC820_8000 | (rs << 16) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `CBNZ Wt, offset` — `0 011010 1 imm19 Rt`. Offset in instructions.
+pub const fn cbnz_w(rt: u32, offset_insns: i32) -> u32 {
+    0x3500_0000 | (((offset_insns as u32) & 0x7FFFF) << 5) | rt
+}
+
 /// `MRS Xt, TPIDR_EL0` — `1101 0101 0011 1101 1101 0000 011 Rt`, i.e. `op0=3 op1=3 CRn=13 CRm=0
 /// op2=2`.
 pub const fn mrs_tpidr_el0(rt: u32) -> u32 {
@@ -263,6 +288,14 @@ mod tests {
         assert_eq!(ldar(1, 0), 0xC8DF_FC01);
         assert_eq!(ldxr(1, 0), 0xC85F_7C01);
         assert_eq!(stxr(2, 1, 0), 0xC802_7C01);
+        // The exclusive family `tests/exclusive.rs` uses, each cross-checked against capstone 5.0.7
+        // (`ldaxr x2, [x0]`, `stlxr w3, x2, [x0]`, `ldaxp x4, x5, [x0]`, `stlxp w3, x4, x5, [x0]`,
+        // `cbnz w3, #-4`).
+        assert_eq!(ldaxr(2, 0), 0xC85F_FC02);
+        assert_eq!(stlxr(3, 2, 0), 0xC803_FC02);
+        assert_eq!(ldaxp(4, 5, 0), 0xC87F_9404);
+        assert_eq!(stlxp(3, 4, 5, 0), 0xC823_9404);
+        assert_eq!(cbnz_w(3, -1), 0x35FF_FFE3);
         // `LDAR` and `LDXR` differ only in bit 23 (`o2`, which decides ordered versus exclusive)
         // and bit 15 (`o0`, the acquire flag). Bit 23 is the one the first atomics count did not
         // read, and it is the whole difference between "takes the global monitor" and "does not".

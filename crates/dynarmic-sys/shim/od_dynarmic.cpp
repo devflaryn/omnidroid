@@ -18,6 +18,9 @@
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/interface/optimization_flags.h"
+/* Internal to dynarmic's x64 backend, and read-only here: the addresses the
+ * backend itself bakes into emitted exclusive-access code. */
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 
 namespace {
 
@@ -73,6 +76,7 @@ static_assert(static_cast<u32>(Dynarmic::OptimizationFlag::ConstProp) == OD_OPT_
 static_assert(static_cast<u32>(Dynarmic::OptimizationFlag::MiscIROpt) == OD_OPT_MISC_IR_OPT, "");
 static_assert(static_cast<u32>(Dynarmic::all_safe_optimizations) == OD_OPT_ALL_SAFE, "");
 static_assert(static_cast<u32>(Dynarmic::no_optimizations) == OD_OPT_NONE, "");
+static_assert(static_cast<u32>(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor) == OD_OPT_UNSAFE_IGNORE_GLOBAL_MONITOR, "");
 
 class ShimCallbacks final : public A64::UserCallbacks {
 public:
@@ -257,6 +261,29 @@ void* od_monitor_new(uint64_t processor_count) {
 
 void od_monitor_free(void* monitor) {
     delete static_cast<ExclusiveMonitor*>(monitor);
+}
+
+void od_monitor_layout_of(void* monitor, od_monitor_layout* out) {
+    if (out == nullptr) {
+        return;
+    }
+    *out = od_monitor_layout{};
+    if (monitor == nullptr) {
+        return;
+    }
+    auto* m = static_cast<ExclusiveMonitor*>(monitor);
+    const std::size_t count = Dynarmic::GetExclusiveMonitorProcessorCount(m);
+    out->processor_count = static_cast<uint64_t>(count);
+    out->lock = reinterpret_cast<uint64_t>(Dynarmic::GetExclusiveMonitorLockPointer(m));
+    out->addresses = reinterpret_cast<uint64_t>(Dynarmic::GetExclusiveMonitorAddressPointer(m, 0));
+    out->values = reinterpret_cast<uint64_t>(Dynarmic::GetExclusiveMonitorValuePointer(m, 0));
+    if (count > 1) {
+        out->address_stride = reinterpret_cast<uint64_t>(Dynarmic::GetExclusiveMonitorAddressPointer(m, 1)) - out->addresses;
+        out->value_stride = reinterpret_cast<uint64_t>(Dynarmic::GetExclusiveMonitorValuePointer(m, 1)) - out->values;
+    } else {
+        out->address_stride = sizeof(Dynarmic::VAddr);
+        out->value_stride = sizeof(Dynarmic::Vector);
+    }
 }
 
 void* od_jit_new(const od_config* config) {

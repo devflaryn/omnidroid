@@ -710,6 +710,7 @@ impl Bionic {
             omni_bionic::wide::MBSTATE_BYTES * MbStateOwner::COUNT,
         )?;
         let _ = bionic.mbstate_private.set(mbstate);
+        crate::perf::register_bionic(&bionic);
         Ok(bionic)
     }
 

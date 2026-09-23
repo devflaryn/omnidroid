@@ -57,6 +57,7 @@ pub mod dynarmic;
 mod fastmem;
 mod regs;
 pub mod run;
+pub mod stats;
 mod thunk;
 mod tls;
 
@@ -64,7 +65,7 @@ pub use clock::{cntpct, CNTFRQ_HZ};
 pub use context::{
     ContextCost, GuestAddressSpace, GuestRange, GuestThreadConfig, TLS_SLOT_STACK_GUARD_OFFSET,
 };
-pub use cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle, InlineThunkCounts};
+pub use cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle, InlineThunkCounts, JitCounters};
 pub use error::{CpuError, CpuResult};
 pub use fastmem::{
     identity_mapping, pc_is_representable, require_identity_mapping, truncate_pc, MemoryMapping,

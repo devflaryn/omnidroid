@@ -139,6 +139,9 @@ typedef struct od_callbacks {
 #define OD_OPT_MISC_IR_OPT 0x00000020u
 #define OD_OPT_NONE 0x00000000u
 #define OD_OPT_ALL_SAFE 0x0000FFFFu
+/* dynarmic's `Unsafe_IgnoreGlobalMonitor`. Honoured only when
+ * `od_config::unsafe_optimizations` is also non-zero. */
+#define OD_OPT_UNSAFE_IGNORE_GLOBAL_MONITOR 0x00100000u
 
 /* Not a dynarmic halt reason. Returned by `od_jit_run`/`od_jit_step` when they
  * are called while this jit is already executing -- i.e. from inside a
@@ -302,6 +305,19 @@ void od_dynarmic_abi_layout(od_abi_layout* out);
  * indexes into it and must be unique and less than `processor_count`. */
 void* od_monitor_new(uint64_t processor_count);
 void od_monitor_free(void* monitor);
+
+/* Where a monitor keeps its state, for a diagnostic that has to recognise
+ * the code dynarmic emits against it (the emitted code carries these
+ * addresses as immediates). Read-only; the monitor is not locked. */
+typedef struct od_monitor_layout {
+    uint64_t lock;              /* the spin lock word every exclusive access takes */
+    uint64_t addresses;         /* reservation addresses, one u64 per processor */
+    uint64_t address_stride;    /* bytes between two processors' address slots */
+    uint64_t values;            /* reserved values, one 16-byte slot per processor */
+    uint64_t value_stride;      /* bytes between two processors' value slots */
+    uint64_t processor_count;
+} od_monitor_layout;
+void od_monitor_layout_of(void* monitor, od_monitor_layout* out);
 
 /* Returns null if the config is rejected or dynarmic throws (it allocates the
  * code cache in the constructor, which is where an over-large

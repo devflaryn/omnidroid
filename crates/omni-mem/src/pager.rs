@@ -168,6 +168,21 @@ struct PagerInner {
     retries_exhausted: AtomicU64,
 }
 
+/// Faults every pager in the process has resolved, and bytes they committed doing it.
+///
+/// Process-wide rather than per pager so a diagnostic holding no pager -- `omni-android`'s interval
+/// reporter -- can read them. Two relaxed increments on a path that has just taken a hardware fault
+/// and a system call.
+static PROCESS_RESOLVED: AtomicU64 = AtomicU64::new(0);
+static PROCESS_BYTES_COMMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// `(faults resolved, bytes committed)` by every demand pager this process has installed, since the
+/// process started.
+#[must_use]
+pub fn process_pager_totals() -> (u64, u64) {
+    (PROCESS_RESOLVED.load(Ordering::Relaxed), PROCESS_BYTES_COMMITTED.load(Ordering::Relaxed))
+}
+
 impl PagerInner {
     /// Count one examined fault and its outcome, in one place.
     ///
@@ -176,7 +191,10 @@ impl PagerInner {
     fn record(&self, outcome: FaultOutcome) -> FaultOutcome {
         self.examined.fetch_add(1, Ordering::Relaxed);
         match outcome {
-            FaultOutcome::Resolved => self.resolved.fetch_add(1, Ordering::Relaxed),
+            FaultOutcome::Resolved => {
+                PROCESS_RESOLVED.fetch_add(1, Ordering::Relaxed);
+                self.resolved.fetch_add(1, Ordering::Relaxed)
+            }
             FaultOutcome::NotOurs => self.declined.fetch_add(1, Ordering::Relaxed),
         };
         outcome
@@ -353,6 +371,7 @@ fn resolve(inner: &PagerInner, fault: &Fault) -> FaultOutcome {
             inner
                 .bytes_committed
                 .fetch_add(admitted.committed as u64, Ordering::Relaxed);
+            PROCESS_BYTES_COMMITTED.fetch_add(admitted.committed as u64, Ordering::Relaxed);
             // A real commit clears the retry record: progress was made, so whatever the thread sees
             // next is a new question rather than the same one again.
             LAST_ZERO_COMMIT_GRANULE.with(|cell| cell.set(0));

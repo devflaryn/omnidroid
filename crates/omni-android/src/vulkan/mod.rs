@@ -1183,7 +1183,7 @@ impl Vulkan {
     /// because every identity it hands the guest is a thunk slot the boundary already reserves.
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        let vulkan = Arc::new(Self {
             state: Mutex::new(State {
                 entry: None,
                 pool: Vec::new(),
@@ -1241,7 +1241,16 @@ impl Vulkan {
                 first_allocator_call: None,
                 driver_results: Vec::new(),
             }),
-        })
+        });
+        crate::perf::register_vulkan(&vulkan);
+        vulkan
+    }
+
+    /// The Vulkan function each handed-out pool thunk stands for, by thunk address -- how a
+    /// diagnostic names a thread that is inside one (the pool's own symbols are anonymous).
+    #[must_use]
+    pub fn slot_names(&self) -> BTreeMap<GuestAddr, String> {
+        self.state.lock().assigned.clone()
     }
 
     /// Attach the real driver this loader forwards to.

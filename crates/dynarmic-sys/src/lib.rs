@@ -315,6 +315,33 @@ pub mod optimization {
     /// and halt checks. This is the configuration in which a runaway guest can
     /// still be stopped.
     pub const INTERRUPTIBLE: u32 = ALL_SAFE & !(RETURN_STACK_BUFFER | FAST_DISPATCH);
+    /// dynarmic's `Unsafe_IgnoreGlobalMonitor`: exclusive loads and stores no longer take the
+    /// monitor's process-wide spin lock, and an exclusive store no longer clears every other
+    /// processor's matching reservation. What remains is a per-processor reservation (address and
+    /// value) and a host `lock cmpxchg` of the reserved value on the store. **Honoured only when
+    /// [`super::OdConfig::unsafe_optimizations`] is non-zero**, which is dynarmic's own guard.
+    pub const UNSAFE_IGNORE_GLOBAL_MONITOR: u32 = 0x0010_0000;
+}
+
+/// Where an exclusive monitor keeps its state, from [`od_monitor_layout_of`].
+///
+/// A diagnostic's view: the emitted exclusive-access code carries these addresses as 64-bit
+/// immediates, so a sampled host instruction pointer near such an immediate is monitor work.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OdMonitorLayout {
+    /// The spin lock word every exclusive access takes under the global monitor.
+    pub lock: u64,
+    /// Processor 0's reservation-address slot.
+    pub addresses: u64,
+    /// Bytes between two processors' address slots.
+    pub address_stride: u64,
+    /// Processor 0's reserved-value slot.
+    pub values: u64,
+    /// Bytes between two processors' value slots.
+    pub value_stride: u64,
+    /// How many processors the monitor was sized for.
+    pub processor_count: u64,
 }
 
 /// What dynarmic is actually configured with, read back from its live
@@ -454,6 +481,14 @@ extern "C" {
     /// The returned pointer must be released exactly once with
     /// [`od_monitor_free`], and only after every jit using it is freed.
     pub fn od_monitor_new(processor_count: u64) -> *mut c_void;
+
+    /// Fill `out` with where `monitor` keeps its lock and slots. A null `monitor` leaves `out`
+    /// zeroed.
+    ///
+    /// # Safety
+    /// `monitor` must be null or come from [`od_monitor_new`] and not have been freed; `out` must
+    /// be writable.
+    pub fn od_monitor_layout_of(monitor: *mut c_void, out: *mut OdMonitorLayout);
 
     /// Release a monitor from [`od_monitor_new`].
     ///
