@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
+use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput};
 use omni_android::jni::{script, slots, Jni};
 use omni_android::ndk::assets::{AssetSource, ASSET_MANAGER_CLASS};
 use omni_android::ndk::{
@@ -919,6 +920,19 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         display.height_dp()
     );
     let guest = Guest::load(host, display);
+    // **OMNI_HARDWARE_KEYBOARD=1: this host's keyboard, told to the engine**, under the graphics
+    // gate (the keys are the window's). Declared here, before step 13 reads the configuration, so
+    // `Configuration.keyboard` says QWERTY to the engine and to `vk.g` alike -- see
+    // `omni_android::jni::keys`. Opt-in because the engine acts on it and the layer's default
+    // device is a phone's, which the rest of this gate has been measured against.
+    let hardware_keyboard = graphics && std::env::var_os("OMNI_HARDWARE_KEYBOARD").is_some();
+    if hardware_keyboard {
+        declare_hardware_keyboard(&guest.jni).expect("Configuration's keyboard fields are declared");
+        let _ = writeln!(
+            std::io::stderr(),
+            "INPUT: a hardware QWERTY keyboard is declared to the engine (OMNI_HARDWARE_KEYBOARD)"
+        );
+    }
     let mut cpu = guest.thread();
     guest.boundary.start_census();
 
@@ -1471,6 +1485,11 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     let mut touch: Option<TouchInput> = window.as_ref().map(|_| {
         TouchInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied(), display.density())
             .unwrap_or_else(|error| panic!("§8 row 26: the touch seam could not be built: {error}"))
+    });
+    // And the keys, when a hardware keyboard was declared above.
+    let mut keyboard: Option<KeyInput> = hardware_keyboard.then(|| {
+        KeyInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied())
+            .unwrap_or_else(|error| panic!("the key seam could not be built: {error}"))
     });
     let mut input_failure: Option<String> = None;
     // **OMNI_INPUT_PROBE=1: one SYNTHETIC press-drag-release**, through the same seam, at the
@@ -2318,37 +2337,49 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 _ => open.poll_events().collect(),
             };
             let _ = source.sample(open);
-            // **§8 row 26, on this thread** -- the UI thread, which is where `vk.e.onTouch` runs
-            // on a device and where every lifecycle row above was called from.
-            if let Some(seam) = touch.as_mut() {
-                let view = open.client_size().map_err(|error| {
-                    format!("the window's client size, which is the view `vk.e` divides: {error}")
-                });
-                for event in &events {
-                    let delivered = view.clone().and_then(|view| {
-                        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
-                        let _jni = guest.jni.activate().expect("publish the JNI instance");
-                        let _ndk = guest.ndk.activate();
+            // **§8 row 26, on this thread** -- the UI thread, which is where `vk.e.onTouch` and
+            // `MainGameActivity.onKeyDown` run on a device, and where every lifecycle row above
+            // was called from.
+            let view = open.client_size().map_err(|error| {
+                format!("the window's client size, which is the view `vk.e` divides: {error}")
+            });
+            for event in &events {
+                let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                let _jni = guest.jni.activate().expect("publish the JNI instance");
+                let _ndk = guest.ndk.activate();
+                if let Some(seam) = touch.as_mut() {
+                    match view.clone().and_then(|view| {
                         seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event, view)
                             .map_err(|error| format!("{event:?}: {error}"))
-                    });
-                    match delivered {
+                    }) {
                         Ok(calls) => {
                             for call in calls.iter().filter(|call| call.state != STATE_MOVED) {
                                 let _ = writeln!(std::io::stderr(), "INPUT: nativePassInput {call:?}");
                             }
                         }
-                        Err(error) => {
-                            let _ = writeln!(std::io::stderr(), "INPUT: delivery failed: {error}");
-                            report_dead_guest_threads(&guest, "after a failed nativePassInput");
-                            input_failure = Some(error);
-                            break;
-                        }
+                        Err(error) => input_failure = Some(error),
                     }
                 }
-            }
-            if input_failure.is_some() {
-                touch = None;
+                let keyed = match (keyboard.as_mut(), input_failure.is_none()) {
+                    (Some(seam), true) => {
+                        seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event)
+                    }
+                    _ => Ok(None),
+                };
+                match keyed {
+                    Ok(Some(call)) => {
+                        let _ = writeln!(std::io::stderr(), "INPUT: nativePassKeyEvent {call:?}");
+                    }
+                    Ok(None) => {}
+                    Err(error) => input_failure = Some(format!("{event:?}: {error}")),
+                }
+                if let Some(error) = &input_failure {
+                    let _ = writeln!(std::io::stderr(), "INPUT: delivery failed: {error}");
+                    report_dead_guest_threads(&guest, "after a failed input delivery");
+                    touch = None;
+                    keyboard = None;
+                    break;
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2377,6 +2408,16 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 }
             );
         }
+    }
+    if let Some(seam) = &keyboard {
+        let _ = writeln!(
+            std::io::stderr(),
+            "INPUT: {} nativePassKeyEvent call(s) returned; {} host key(s) with no Linux input \
+             code; {} withheld by vk.g (BACK, VOLUME)",
+            seam.delivered(),
+            seam.unmapped(),
+            seam.withheld()
+        );
     }
     // **What the engine asked the Vulkan loader for, in order** -- the census the stage tests
     // said the first run that reached graphics would produce. Printed whether or not anything
@@ -3570,6 +3611,97 @@ fn the_touch_native_reads_the_registers_the_seam_writes() {
         assert!(
             handed_on.contains(&word),
             "{what} ({word:#010x}) is not before the handler call: {handed_on:08x?}"
+        );
+    }
+}
+
+/// **A host key reaches the USB HID usage the engine expects for it**, through the engine's own
+/// table.
+///
+/// `nativePassKeyEvent` (`0x02baebdc`) hands its scan code, `w3`, to `0x2e4eca8` as its first
+/// argument (`mov w0, w3` before the first call), and that function is a bounds check (`cmp w0,
+/// #0x7f`) and a load from a 128-entry table it addresses with `adrp`/`add`. Both are decoded
+/// here, the table is read out of the real binary, and each host scan code is sent through
+/// `jni::keys::evdev_code` and then through the table. The expected values are the **USB HID
+/// Usage Tables**' own (Keyboard/Keypad page): `a` 4, `w` 26, Space 44, Left Shift 225, Up Arrow
+/// 82. A host-side code that named the wrong physical key lands on the wrong usage.
+#[test]
+fn the_scan_codes_reach_the_usages_the_engine_expects() {
+    use omni_android::jni::keys::{evdev_code, PASS_KEY_EVENT_SYMBOL};
+    let _serial = serialized();
+    let bytes = main_lib_bytes();
+    let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+    let words_at = |vaddr: u64, count: usize| -> Vec<u32> {
+        let offset = elf.vaddr_to_offset(vaddr).expect("in a load segment");
+        bytes[offset..offset + 4 * count]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+            .collect()
+    };
+    let native = elf
+        .exported_symbols()
+        .expect("read .dynsym")
+        .into_iter()
+        .find(|symbol| symbol.name == PASS_KEY_EVENT_SYMBOL)
+        .unwrap_or_else(|| panic!("libroblox.so does not export `{PASS_KEY_EVENT_SYMBOL}`"));
+    let start = native.sym.st_value;
+    let words = words_at(start, native.sym.st_size as usize / 4);
+    let first = words
+        .iter()
+        .position(|word| word & 0xFC00_0000 == 0x9400_0000)
+        .expect("the native calls the scan-code lookup first");
+    // `mov w0, w3`: the scan code is the lookup's argument.
+    assert!(
+        words[..first].contains(&0x2A03_03E0),
+        "the scan code (w3) is not what {PASS_KEY_EVENT_SYMBOL} hands its first call"
+    );
+    let displacement = ((words[first] & 0x03FF_FFFF) << 6) as i32 >> 6;
+    let lookup = (start as i64 + 4 * first as i64 + 4 * i64::from(displacement)) as u64;
+    let body = words_at(lookup, 8);
+    assert!(body.contains(&0x7101_FC1F), "the lookup is bounded at 0x7f: {body:08x?}");
+    let at_adrp = body
+        .iter()
+        .position(|word| word & 0x9F00_0000 == 0x9000_0000)
+        .expect("the lookup addresses its table with adrp");
+    let adrp = body[at_adrp];
+    let add = body[at_adrp + 1];
+    assert_eq!(add & 0xFFC0_0000, 0x9100_0000, "adrp is followed by its add: {add:#010x}");
+    let pages = ((((adrp >> 5) & 0x7FFFF) << 2 | ((adrp >> 29) & 3)) << 11) as i32 >> 11;
+    let page = ((lookup + 4 * at_adrp as u64) & !0xFFF) as i64 + (i64::from(pages) << 12);
+    let table_at = page as u64 + u64::from((add >> 10) & 0xFFF);
+    let table = words_at(table_at, 128);
+
+    for (scancode, usage, key) in [
+        (0x1E, 4, "a"),
+        (0x11, 26, "w"),
+        (0x1F, 22, "s"),
+        (0x20, 7, "d"),
+        (0x02, 30, "1"),
+        (0x0B, 39, "0"),
+        (0x1C, 40, "Enter"),
+        (0x01, 41, "Escape"),
+        (0x0E, 42, "Backspace"),
+        (0x0F, 43, "Tab"),
+        (0x39, 44, "Space"),
+        (0x1D, 224, "Left Control"),
+        (0x2A, 225, "Left Shift"),
+        (0x38, 226, "Left Alt"),
+        (0xE01D, 228, "Right Control"),
+        (0x36, 229, "Right Shift"),
+        (0xE04D, 79, "Right Arrow"),
+        (0xE04B, 80, "Left Arrow"),
+        (0xE050, 81, "Down Arrow"),
+        (0xE048, 82, "Up Arrow"),
+        (0x3B, 58, "F1"),
+        (0x58, 69, "F12"),
+    ] {
+        let evdev = evdev_code(scancode).unwrap_or_else(|| panic!("{key} ({scancode:#x}) has no code"));
+        assert_eq!(
+            table[usize::from(evdev)],
+            usage,
+            "{key}: host scan code {scancode:#x} -> input code {evdev} -> the engine's table at \
+             {table_at:#x} answers usage {}, and the key's usage is {usage}",
+            table[usize::from(evdev)]
         );
     }
 }
