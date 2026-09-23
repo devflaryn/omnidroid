@@ -25,7 +25,7 @@ pub(super) use super::unix::{
     allocation_granularity, coalesce_placeholders, commit, commit_placeholder,
     create_shared_section, decommit, decommit_to_placeholder, map_file, map_section,
     open_file_for_mapping, page_size, placeholder_api_available, placeholder_api_symbols,
-    process_commit_charge, process_working_set, protect, release,
+    process_commit_charge, process_memory, process_working_set, protect, release,
     reserve, reserve_placeholder, split_placeholder, unmap, unmap_and_release, MappableFile,
     SharedSection, MISALIGNED_OS_ERROR,
 };

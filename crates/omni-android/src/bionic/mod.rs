@@ -48,6 +48,7 @@ mod handlers;
 mod logging;
 mod net;
 mod procenv;
+mod procfs;
 mod runtime;
 mod signals;
 mod stdio;
@@ -251,7 +252,11 @@ pub struct Bionic {
     /// **No default**, like the filesystem root (D23) and the thread host (D24), and for the same
     /// reason: only the embedding knows, and a number this layer chose would be a number with
     /// nothing behind it. `sysinfo` refuses by name until it is set.
-    memory_budget: Mutex<Option<u64>>,
+    ///
+    /// Shared (`Arc`) with the generator that answers `/proc/meminfo`, which the filesystem holds
+    /// and which reads this each time the file is read -- so a budget set after the root, or
+    /// changed while the guest runs, is what the next reading says. See `procfs`.
+    memory_budget: Arc<Mutex<Option<u64>>>,
     /// The Android application uid this guest runs as, for `geteuid`.
     ///
     /// **No default**, for [`memory_budget`](Bionic::set_memory_budget)'s reason: an app's uid
@@ -591,7 +596,7 @@ impl Bionic {
             names: NameRegistry::new(),
             atexit: AtexitRegistry::new(),
             vma_names: Mutex::new(BTreeMap::new()),
-            memory_budget: Mutex::new(None),
+            memory_budget: Arc::new(Mutex::new(None)),
             signal_masks: Mutex::new(BTreeMap::new()),
             // Seeded as C's `rand` is before any `srand`: the standard says the sequence is as
             // if `srand(1)` had been called.
@@ -949,6 +954,15 @@ impl Bionic {
             address: self.arena,
             why: error.to_string(),
         })?;
+        // `/proc/meminfo` and `/proc/self/statm`, which the engine reads for its memory budget and
+        // which are facts rather than files. With the root, because they are paths the guest
+        // opens and there is no filesystem to open them in until there is a root. See `procfs`.
+        procfs::serve(&filesystem, Arc::clone(&self.memory_budget), self.space.page_size())
+            .map_err(|error| AbiError::Refused {
+                symbol: "open".to_string(),
+                address: self.arena,
+                why: error.to_string(),
+            })?;
         let device = omni_platform::fs::identity(filesystem.root());
         if self.fs.set(filesystem).is_err() {
             return Err(AbiError::Refused {

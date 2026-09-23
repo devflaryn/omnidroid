@@ -39,6 +39,7 @@
 //! release(base, len, kind) -> VmResult<()>
 //! process_commit_charge() -> VmResult<u64>
 //! process_working_set() -> VmResult<u64>
+//! process_memory() -> VmResult<ProcessMemory>
 //! ```
 //!
 //! Backends work in `usize` addresses rather than raw pointers, so that the descriptor types in
@@ -1052,6 +1053,66 @@ pub fn process_commit_charge() -> VmResult<u64> {
 /// [`VmError::Os`] if the OS refuses to report it.
 pub fn process_working_set() -> VmResult<u64> {
     backend::process_working_set()
+}
+
+/// One snapshot of this process's memory, as the operating system accounts for it.
+///
+/// **Every field is a number the OS was asked for, and each is named for what it measures**
+/// rather than for what a reader will do with it. The shape is Linux's `/proc/<pid>/statm`,
+/// because answering that file is what it was added for: the engine opens `/proc/self/statm` and
+/// sizes a memory budget from its `resident` field (MEASURED, `libroblox.so` link `0x2282674`).
+///
+/// **It is the process's, not a guest instance's**, for the reason [`crate::process::pid`] and
+/// [`crate::process::cpu_time`] give: several guest instances share one host process, and a
+/// per-instance figure would describe a process that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessMemory {
+    /// Bytes of this process's address space in use -- reserved, committed or mapped.
+    ///
+    /// Linux's `total_vm`, which counts every mapping including `PROT_NONE` ones; a Windows
+    /// reservation is a `PROT_NONE` mapping's counterpart, so a reservation counts here and costs
+    /// nothing in [`commit_charge`](Self::commit_charge). On Windows,
+    /// `MEMORYSTATUSEX::ullTotalVirtual - ullAvailVirtual`: `ullAvailVirtual` is documented as
+    /// "unreserved and uncommitted memory currently in the user-mode portion of the virtual
+    /// address space of the calling process".
+    pub address_space: u64,
+    /// Bytes resident: the working set, `WorkingSetSize` -- the number
+    /// [`process_working_set`] reports. What Linux calls the resident set.
+    pub resident: u64,
+    /// Bytes of [`resident`](Self::resident) that are **shareable**: image, file-backed and
+    /// section pages that no write has privatised. `WorkingSetSize - PrivateWorkingSetSize`.
+    ///
+    /// Linux's `MM_FILEPAGES + MM_SHMEMPAGES`, and for the same reason on both sides: a private
+    /// page -- anonymous, or a file page a write copied -- is the process's own, and every other
+    /// resident page is one another mapping of the same object could be sharing.
+    pub resident_shared: u64,
+    /// Private committed bytes, `PrivateUsage` -- the number [`process_commit_charge`] reports.
+    pub commit_charge: u64,
+    /// The host addresses the process's **executable image's** code spans: from the start of its
+    /// lowest executable section to the end of its highest.
+    ///
+    /// Linux's `start_code..end_code`, which the ELF loader sets from the executable's `PF_X`
+    /// segments. On Windows the executable is the module `GetModuleHandleW(NULL)` names, and its
+    /// sections carrying `IMAGE_SCN_MEM_EXECUTE` are read out of the image header this process
+    /// already has mapped. Only the executable's: a DLL's code is not in the range, which is
+    /// Linux's rule for shared libraries too.
+    pub executable_code: core::ops::Range<usize>,
+}
+
+/// This process's memory, as one snapshot. See [`ProcessMemory`] for what each field measures.
+///
+/// **One snapshot rather than a call per field**: `resident_shared` is the difference of two
+/// counters, and read from two calls it could come out larger than the resident set it is a part
+/// of. The counters come from one `K32GetProcessMemoryInfo`, so `resident_shared <= resident`
+/// holds by construction.
+///
+/// # Errors
+///
+/// [`VmError::Os`] if the OS refuses to report a counter, naming which, and
+/// [`VmError::ExecutableImage`] if this process's own image header cannot be read.
+/// [`VmError::Unsupported`] on Linux and macOS.
+pub fn process_memory() -> VmResult<ProcessMemory> {
+    backend::process_memory()
 }
 
 // ---------------------------------------------------------------------------------------------
