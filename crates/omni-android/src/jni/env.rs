@@ -663,6 +663,24 @@ fn env_call(
                 Object::LongArray(vec![0; len]),
             )?))
         }
+        // **Outside the 59 §0 measured, and a run reached it**: gate80's thread 16 (started at
+        // link `0x284d168`) died on this slot's refusal right after the engine logged
+        // `handleTextBoxFocused_AndroidLayer_` for a tap on the login screen's username field.
+        // A new `byte[]` of `len` zeros, as ART allocates one.
+        "NewByteArray" => {
+            let len = args.next_i32()?;
+            let len = usize::try_from(len).map_err(|_| AbiError::JniRefused {
+                function: name.to_string(),
+                address,
+                detail: format!("a length of {len} is negative"),
+            })?;
+            let mut state = jni.state();
+            Ok(JniReturn::Word(state.handles.new_local(
+                name,
+                address,
+                Object::ByteArray(vec![0; len]),
+            )?))
+        }
         "GetObjectArrayElement" => {
             let array = args.next_u64()?;
             let index = args.next_i32()?;
@@ -2034,6 +2052,7 @@ mod tests {
         "GetArrayLength",
         "NewObjectArray",
         "NewLongArray",
+        "NewByteArray",
         "GetObjectArrayElement",
         "SetObjectArrayElement",
         "GetByteArrayElements",
@@ -2178,7 +2197,49 @@ mod tests {
     /// the `expect`.
     #[test]
     fn get_string_utf_length_is_the_modified_utf8_length() {
-        struct Registers([u64; 1]);
+        let (jni, mem) = slot_fixture();
+        let text = JavaString::from_units(vec![0x41, 0xe9, 0x0000, 0xd83d, 0xde00]);
+        let string = jni
+            .state()
+            .handles
+            .new_local("NewString", 0, Object::String(text))
+            .expect("a reference");
+        let answer = call_slot(&jni, &mem, "GetStringUTFLength", &[string])
+            .expect("GetStringUTFLength is answered");
+        assert_eq!(answer, JniReturn::Int(1 + 2 + 2 + 6));
+    }
+
+    /// **`NewByteArray(n)` is a `byte[]` of `n` zeros, through the slot itself**, and a negative
+    /// length is refused rather than wrapped into a huge one. A refusal of the slot fails the
+    /// first `expect`; an array of the wrong kind or length fails the match.
+    #[test]
+    fn new_byte_array_is_a_byte_array_of_zeros() {
+        let (jni, mem) = slot_fixture();
+        let JniReturn::Word(array) =
+            call_slot(&jni, &mem, "NewByteArray", &[5]).expect("NewByteArray is answered")
+        else {
+            panic!("NewByteArray answers a reference");
+        };
+        match jni.state().handles.object("test", 0, array).expect("a live reference") {
+            Object::ByteArray(bytes) => assert_eq!(bytes, &vec![0i8; 5]),
+            other => panic!("NewByteArray made {}", other.kind_name()),
+        }
+        let negative = u64::from((-1i32) as u32);
+        let error = call_slot(&jni, &mem, "NewByteArray", &[negative]).expect_err("negative");
+        assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
+    }
+
+    /// A JNI instance and the guest memory its slots read, for calling a slot directly.
+    fn slot_fixture() -> (std::sync::Arc<Jni>, GuestMem) {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(std::sync::Arc::clone(&space)).expect("a JNI instance");
+        (jni, GuestMem::new(space))
+    }
+
+    /// Call the `JNIEnv` slot `name` with `x` as its arguments after the `JNIEnv*`, the way
+    /// the run loop does once it has read that pointer.
+    fn call_slot(jni: &Jni, mem: &GuestMem, name: &'static str, x: &[u64]) -> AbiResult<JniReturn> {
+        struct Registers(Vec<u64>);
         impl crate::abi::ArgSource for Registers {
             fn x(&self, index: u32) -> u64 {
                 self.0.get(index as usize).copied().unwrap_or(0)
@@ -2190,20 +2251,9 @@ mod tests {
                 0
             }
         }
-        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
-        let jni = Jni::new(std::sync::Arc::clone(&space)).expect("a JNI instance");
-        let mem = GuestMem::new(space);
-        let text = JavaString::from_units(vec![0x41, 0xe9, 0x0000, 0xd83d, 0xde00]);
-        let string = jni
-            .state()
-            .handles
-            .new_local("NewString", 0, Object::String(text))
-            .expect("a reference");
-        let registers = Registers([string]);
-        let mut args = Args::new(&registers, &mem, Blame::new("GetStringUTFLength", 0, 1));
-        let answer = env_call(&jni, 0, "GetStringUTFLength", 0, &mut args, &mem)
-            .expect("GetStringUTFLength is answered");
-        assert_eq!(answer, JniReturn::Int(1 + 2 + 2 + 6));
+        let registers = Registers(x.to_vec());
+        let mut args = Args::new(&registers, mem, Blame::new(name, 0, 1));
+        env_call(jni, 0, name, 0, &mut args, mem)
     }
 
     /// The refusal for an unimplemented slot has to carry the slot's own name, because the whole
