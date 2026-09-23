@@ -42,9 +42,48 @@ non-Windows target the build asks CMake for the vendored copies explicitly
 | `net` | implemented | `net_loopback` 27, `net_macos` 4, `net_seam` 11; `mac-plat-D*` 9/9 |
 | `fault` | implemented | `fault_macos` 10, `fault_teardown_race` 2; `mac-fault-*` 9/9 |
 | `clock` | portable `std`; timer resolution is a no-op here (see "Timers") | |
-| `window`, `audio`, gfx surface | *(in progress, workstream window)* | |
-| dynarmic arm64, `omni-cpu` | *(in progress, workstream cpu)* | |
+| `window` (AppKit), `audio` (Core Audio), gfx surface (MoltenVK) | implemented | see `docs/ports/macos-window.md`; `mac-win-` 22/22, `mac-gfx-` 9/9 |
+| dynarmic arm64, `omni-cpu` | parity: 9 carried patches | see `docs/ports/macos-cpu.md`; `mac-cpu-` 25/25 |
+| **the gate** | **passes**, landing screen reached | below |
 | `webview` | **not ported** (structural `Unsupported`): WKWebView is the macOS equivalent | |
+
+## The gate on macOS
+
+`OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 OMNI_KEYBOARD_MOUSE=1 cargo test -p omni-android
+--release --test gameactivity -- --nocapture --test-threads=1
+initialize_native_code_returns_a_native_code_and_the_game_thread_starts` **passes** (exit 0; 5 runs
+on `port-macos`, 50-110 s each). MEASURED in those runs:
+
+* the engine's Vulkan device is MoltenVK's **Apple M1** (`PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU`, not
+  refused as emulated), a 1280x720 swapchain with 3 images, and the engine reaches
+  `APP_READY(Landing)` -- the real landing screen, captured from the window server below;
+* the network is real: client settings are fetched (`Flag::areFlagsLoaded` 1), `apis.roblox.com`
+  answers 401/404 to an unsigned-in client, as it does to a device; nothing was signed in;
+* **no guest thread is killed** (`M5 teardown: 0 guest thread(s) still running, failures []`);
+* at the landing screen the engine presents **~59 fps** (291-299 presents per 5 s), which is the
+  engine's own 60 fps cap, not this host's limit.
+
+![The engine's landing screen on macOS](macos-landing.png)
+
+Headless (`OMNI_GFX_WINDOW_TESTS` unset) the engine falls back to GLES and a thread dies on unbound
+`eglGetDisplay`: the same failure HANDOFF records for Windows ("still open", item 7).
+
+### Memory in the gate (MEASURED, `tools/footprint_mac.py`, 1 s samples)
+
+| | before patch 0009 | after |
+|---|---|---|
+| boot peak (`ri_lifetime_max_phys_footprint`) | 3,260 MiB | **2,587 MiB** |
+| at the landing screen (60 s) | ~3,210 MiB | **~2,055 MiB** |
+| after teardown | 952 MiB | 1,046 MiB |
+
+`footprint(1)` at the landing screen, after 0009: `MALLOC_LARGE` 876 MB, untagged `VM_ALLOCATE`
+554 MB, `MALLOC_SMALL` 518 MB, graphics ~90 MB. `MallocStackLogging` attributes the malloc
+categories to **dynarmic's per-jit bookkeeping** -- the block map with `EmittedBlockInfo` inline in
+its buckets (527 MB over 39 jits), the block-reference map (326 MB), per-block fastmem patch maps
+(228 MB), interval maps and copies -- about 33 MB per guest thread, each thread holding its own
+translation of the same code. That is D5's risk 2 ("per-thread memory conflicts with the memory
+goal"), measured on the real engine. The owner's target (~800 MB steady, ten instances on 8 GB) is
+**not met** yet; see "Still open".
 
 ## Virtual memory (D10 on this host)
 
