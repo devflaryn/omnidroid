@@ -44,7 +44,7 @@
 //! the guest receives.
 
 use std::ffi::{CStr, CString};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 
 use ash::khr;
 use ash::vk;
@@ -212,6 +212,17 @@ pub struct GfxVulkanHost {
     pipelines: Mutex<Slab<ObjectEntry<vk::Pipeline>>>,
     /// Every `VkPipelineCache` this host created.
     pipeline_caches: Mutex<Slab<ObjectEntry<vk::PipelineCache>>>,
+    /// **What keeps a pipeline cache the size the driver just reported**, while
+    /// `vkGetPipelineCacheData` reads it.
+    ///
+    /// Building a pipeline through a cache grows it, and a cache is internally synchronized, so
+    /// another guest thread may do that between the size query and the fill. The fill's buffer is
+    /// then short, and a short buffer is the path on which this machine's NVIDIA driver was
+    /// measured writing past the end: 2,733 bytes past a 2,766-byte buffer, and
+    /// `STATUS_HEAP_CORRUPTION`. Every pipeline creation that names a cache holds the shared side;
+    /// [`GfxVulkanHost::pipeline_cache_data`] holds the exclusive side across both calls. A call
+    /// added later that grows a cache -- `vkMergePipelineCaches` -- must hold the shared side too.
+    cache_gate: RwLock<()>,
     /// Every `VkQueryPool` this host created.
     query_pools: Mutex<Slab<ObjectEntry<vk::QueryPool>>>,
     /// Every `VkDescriptorSetLayout` this host created.
@@ -529,6 +540,7 @@ impl GfxVulkanHost {
             framebuffers: Mutex::new(Slab::new()),
             pipelines: Mutex::new(Slab::new()),
             pipeline_caches: Mutex::new(Slab::new()),
+            cache_gate: RwLock::new(()),
             query_pools: Mutex::new(Slab::new()),
             descriptor_set_layouts: Mutex::new(Slab::new()),
             descriptor_pools: Mutex::new(Slab::new()),
@@ -4081,6 +4093,72 @@ impl VulkanHost for GfxVulkanHost {
         Ok(())
     }
 
+    /// `vkGetPipelineCacheData`: the whole blob, read into a buffer of exactly the size the driver
+    /// reported, with nothing able to grow the cache in between.
+    ///
+    /// # MEASURED: this machine's driver writes past a short buffer
+    ///
+    /// On the RTX 4060, a 5,499-byte cache read with `*pDataSize = 2766` answered `VK_INCOMPLETE`
+    /// with a count of 36, and had written all 5,499 bytes: 2,733 past the end of the buffer. The
+    /// first run of the live test died of it, `STATUS_HEAP_CORRUPTION`. A buffer of the full size
+    /// was written exactly, with not one byte past it. So this host never hands the driver a
+    /// buffer shorter than the blob. It asks the size and fills exactly that much, and
+    /// [`GfxVulkanHost::cache_gate`] is held exclusively across both calls so that no pipeline
+    /// built through this host can grow the cache between them.
+    ///
+    /// The raw entry point rather than `ash::Device::get_pipeline_cache_data`: if the cache grows
+    /// between its two calls, that one hands the driver a short buffer and retries on
+    /// `VK_INCOMPLETE` after the damage is done.
+    fn pipeline_cache_data(
+        &self,
+        device: HostDevice,
+        cache: HostPipelineCache,
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        const METHOD: &str = "VulkanHost::pipeline_cache_data";
+        let parts = self.device_parts(device)?;
+        let (owner, handle) = {
+            let table = self.locked_caches();
+            self.device_of(&table, cache.token(), "VkPipelineCache", METHOD)?
+        };
+        if owner != parts.index {
+            return Err(cross_device("VkPipelineCache", owner, parts.index));
+        }
+        let get = parts.device.fp_v1_0().get_pipeline_cache_data;
+        let _still = self.cache_gate.write().unwrap_or_else(PoisonError::into_inner);
+
+        let mut size = 0usize;
+        // SAFETY: the device and the cache are live and the cache is the device's own; `pData` is
+        // NULL, so the driver writes the size into `size` and nothing else.
+        let result = unsafe { get(parts.device.handle(), handle, &mut size, std::ptr::null_mut()) };
+        if result.as_raw() < 0 {
+            return Ok(DriverAnswer::Failed(result.as_raw()));
+        }
+        let mut bytes = vec![0u8; size];
+        let mut written = size;
+        // SAFETY: as above, and `bytes` is `size` writable bytes: the whole blob, which it stays
+        // until this returns because the gate holds off every pipeline creation through a cache --
+        // so the driver is never on its short-buffer path.
+        let result =
+            unsafe { get(parts.device.handle(), handle, &mut written, bytes.as_mut_ptr().cast()) };
+        if result.as_raw() < 0 {
+            return Ok(DriverAnswer::Failed(result.as_raw()));
+        }
+        if result != vk::Result::SUCCESS || written > size {
+            return Err(refused(
+                METHOD,
+                &format!(
+                    "the driver reported {size} bytes of cache and then answered {result:?} with \
+                     a count of {written} for a buffer of exactly that size, while every \
+                     pipeline creation through a cache was held off. Something grew the cache \
+                     anyway, and a short buffer is the path on which this machine's driver was \
+                     measured writing past the end of it -- so the bytes are not handed on"
+                ),
+            ));
+        }
+        bytes.truncate(written);
+        Ok(DriverAnswer::Ok(bytes))
+    }
+
     /// `vkCreateGraphicsPipelines`, rebuilt from the decoded request in four owned layers.
     ///
     /// # Why the layers
@@ -4171,6 +4249,8 @@ impl VulkanHost for GfxVulkanHost {
             .map(|((pipeline, stages), sub)| pipeline.info(stages, sub))
             .collect();
 
+        // Building through a cache grows it: held off while `vkGetPipelineCacheData` reads one.
+        let _growing = self.cache_growth(cache);
         // SAFETY: the device is live; every handle in `infos` is one of its own, checked above;
         // every pointer reachable from `infos` is into `owned`, `specializations`, `stages` or
         // `sub_states`, all of which outlive this call and none of which are mutated after being
@@ -4303,6 +4383,8 @@ impl VulkanHost for GfxVulkanHost {
             })
             .collect();
 
+        // Building through a cache grows it: held off while `vkGetPipelineCacheData` reads one.
+        let _growing = self.cache_growth(cache);
         // SAFETY: the device is live; every handle in `infos` is one of its own, checked above;
         // every pointer reachable from `infos` is into `owned` or `specializations`, both of which
         // outlive this call and neither of which is mutated after being borrowed; `pAllocator` is
@@ -5177,6 +5259,12 @@ impl GfxVulkanHost {
 
     fn locked_caches(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::PipelineCache>>> {
         self.pipeline_caches.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`GfxVulkanHost::cache_gate`]'s shared side, for a pipeline creation that names a cache,
+    /// and nothing for one that does not. Held for the length of the driver call.
+    fn cache_growth(&self, cache: Option<HostPipelineCache>) -> Option<RwLockReadGuard<'_, ()>> {
+        cache.map(|_| self.cache_gate.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     fn locked_query_pools(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::QueryPool>>> {

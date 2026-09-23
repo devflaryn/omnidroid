@@ -68,7 +68,7 @@ use super::host::{
 };
 use super::instance::{guest_pointer, refuse_allocator, require_pointer};
 use super::resource::check_header;
-use super::{Site, Vulkan, VK_SUCCESS};
+use super::{Site, Vulkan, VK_INCOMPLETE, VK_SUCCESS};
 
 // ----------------------------------------------------------------- the specification's numbers
 
@@ -530,6 +530,100 @@ pub(super) fn destroy_pipeline_cache(
     host.destroy_pipeline_cache(token)?;
     vulkan.forget_pipeline_cache(handle);
     c.ret().void();
+    Ok(())
+}
+
+/// `VkResult vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache,
+/// size_t *pDataSize, void *pData)`
+///
+/// # Why it exists: measured
+///
+/// A gate run measured the engine's render thread calling it on `APP_CMD_TERM_WINDOW`, through
+/// the thunk `vkGetInstanceProcAddr` handed out, with `x0` its `VkDevice` and `x1` its pipeline
+/// cache: the engine saves the cache on close so that the next launch can pass it back to
+/// [`create_pipeline_cache`] as `pInitialData`. Refusing it killed the thread.
+///
+/// # The two-call idiom
+///
+/// [`counted`](super::counted)'s rules, with a `size_t` of bytes in place of a `uint32_t` of
+/// entries. `pDataSize` is required in both halves. With `pData = NULL` the blob's size is written
+/// and nothing else, `VK_SUCCESS`. With a buffer, `*pDataSize` is the capacity, read from the cell
+/// the guest owns now; a buffer that holds the blob gets all of it and `*pDataSize` written back
+/// after it, `VK_SUCCESS`.
+///
+/// # A short buffer gets nothing, and `VK_INCOMPLETE`
+///
+/// This is where it differs from `counted`, and **this layer, not the driver, decides it**. The
+/// specification says any data written to `pData`, a truncated write included, is valid
+/// `pInitialData` for `vkCreatePipelineCache`. A prefix cut here would not be: the blob past its
+/// 32-byte header is the driver's private format, and a cut can land mid-entry. And the driver
+/// cannot be asked to make the cut. Measured on this machine's NVIDIA driver: given room for 2,766
+/// bytes of a 5,499-byte cache, it wrote all 5,499, 2,733 past the end of the buffer, then
+/// answered `VK_INCOMPLETE` with a count of 36, and the process died of heap corruption. So the
+/// host only ever reads the whole blob ([`VulkanHost::pipeline_cache_data`](super::VulkanHost)).
+/// A guest buffer too small for it gets **zero bytes**, `*pDataSize = 0` and `VK_INCOMPLETE`: "at
+/// most `*pDataSize` bytes", and the one truncation that is valid for every driver's format. An
+/// engine that sized its buffer from the first call gets everything.
+///
+/// # No host allocation the guest sizes
+///
+/// The guest's `size_t` only bounds a write into its own buffer; the host's buffer is the size
+/// the driver reported. A blob past [`MAX_PIPELINE_CACHE_BYTES`](super::MAX_PIPELINE_CACHE_BYTES)
+/// is refused naming the constant: it is the bound [`create_pipeline_cache`] reads `pInitialData`
+/// under, so a blob larger than it could not come back on the next launch anyway.
+pub(super) fn get_pipeline_cache_data(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkGetPipelineCacheData";
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.device_token(at, CALL, args[0])?;
+    let cache = vulkan.pipeline_cache_token(at, CALL, args[1])?;
+    let size_at = require_pointer(at, CALL, "pDataSize", args[2])?;
+    let data_at = guest_pointer(at, "pData", args[3])?;
+
+    let blob = match host.pipeline_cache_data(device, cache)? {
+        DriverAnswer::Failed(result) => {
+            vulkan.note_driver_result(CALL, result);
+            c.ret().i32(result);
+            return Ok(());
+        }
+        DriverAnswer::Ok(blob) => blob,
+    };
+    if blob.len() > MAX_PIPELINE_CACHE_BYTES {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} and the driver's cache blob is {size} \
+             bytes. This layer hands out at most {MAX_PIPELINE_CACHE_BYTES}, the same bound \
+             `vkCreatePipelineCache` reads `pInitialData` under, so a blob this large could not \
+             come back on the next launch either. Raise \
+             `omni_android::vulkan::MAX_PIPELINE_CACHE_BYTES` if a real cache is this large",
+            caller = at.caller,
+            size = blob.len()
+        )));
+    }
+    let size = blob.len() as u64;
+    if data_at == 0 {
+        c.mem().write_u64(size_at, size, c.blame(2))?;
+        c.ret().i32(VK_SUCCESS);
+        return Ok(());
+    }
+
+    let capacity = c.mem().read_u64(size_at, c.blame(2))?;
+    if capacity < size {
+        // Nothing written, and a count that says so. See this function's documentation.
+        c.mem().write_u64(size_at, 0, c.blame(2))?;
+        c.ret().i32(VK_INCOMPLETE);
+        return Ok(());
+    }
+    // A zero-length write is no write at all -- `counted`'s reason: `admit` treats it as one byte.
+    if !blob.is_empty() {
+        c.mem().write_bytes(data_at, &blob, c.blame(3))?;
+    }
+    // Written **after** the bytes, and with what was written.
+    c.mem().write_u64(size_at, size, c.blame(2))?;
+    c.ret().i32(VK_SUCCESS);
     Ok(())
 }
 

@@ -780,7 +780,8 @@ pub(super) fn unimplemented(
              `vkAcquireNextImageKHR`/`vkQueueSubmit`/`vkQueuePresentKHR` with the two idle waits \
              -- and everything between a device and a draw: device memory with \
              `vkMapMemory`/`vkUnmapMemory` and the two bind calls, buffers, images and samplers, \
-             shader modules, pipeline layouts, render passes, framebuffers, pipeline caches, \
+             shader modules, pipeline layouts, render passes, framebuffers, pipeline caches \
+             with `vkGetPipelineCacheData`, \
              `vkCreateGraphicsPipelines` and `vkCreateComputePipelines`, the four descriptor \
              calls with `vkUpdateDescriptorSets` and descriptor update templates, query pools \
              with the GPU timer's two commands, and \
