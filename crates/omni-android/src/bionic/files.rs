@@ -1006,6 +1006,38 @@ pub(super) fn ftruncate(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int posix_fallocate(int fd, off_t offset, off_t len)`
+///
+/// bionic's is `fallocate(fd, 0, offset, len)` with the failure **returned** rather than left in
+/// `errno` -- an `ErrnoRestorer` puts `errno` back -- so every answer here is the return value and
+/// `errno` is never written. A negative offset or a length that is not positive is `EINVAL`, the
+/// kernel's first check; the rest is `Filesystem::fallocate`.
+///
+/// MEASURED reader: a guest worker once the engine was creating its Vulkan device (thread 12 of
+/// the run that found it), which died on the `Unbound` this replaces. That run then could not be
+/// stopped: two threads sat in `pthread_mutex_lock` past the 60-second stop.
+pub(super) fn posix_fallocate(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, offset, len) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()? as i64, a.next_u64()? as i64)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let view = enter(c, &state);
+        if offset < 0 || len <= 0 {
+            consts::EINVAL
+        } else {
+            let fs = filesystem(&view)?;
+            match settle(&view, fs.fallocate(fd, offset as u64, len as u64))? {
+                Settled::Done(()) => 0,
+                Settled::Failed(errno) => errno,
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `int fsync(int fd)`
 ///
 /// The seam's `File::sync_all` for a regular file, `EINVAL` for a descriptor with nothing to

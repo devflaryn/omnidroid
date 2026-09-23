@@ -240,8 +240,24 @@ impl Call {
 
 /// `void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)`
 ///
-/// Anonymous only, lazily committed — which is what Linux does and what makes the demand pager the
-/// heap seam rather than an eager commit of the engine's whole arena.
+/// Anonymous mappings lazily committed — which is what Linux does and what makes the demand pager
+/// the heap seam rather than an eager commit of the engine's whole arena — and read-only file
+/// mappings, made as a snapshot of the file.
+///
+/// # A read-only file mapping is the file's bytes, copied in
+///
+/// MEASURED reader: the engine's `ReadOnlySharedBuffer`, which turns a finished download (16 MB,
+/// written through a `FILE *`) into memory with `fileno` and
+/// `mmap(NULL, size, PROT_READ, MAP_SHARED | MAP_NORESERVE, fd, 0)`. A host file view is not the
+/// answer here: the engine still holds the file open for writing, and the host mapping open
+/// shares reads only. So the pages are anonymous, filled from the file with `pread` and then
+/// protected read-only -- byte for byte what the guest reads, including the zeros past the end of
+/// the file in its last page. **What differs is visibility of later writes**: a `MAP_SHARED`
+/// mapping on Linux shows writes made to the file after it was mapped, and this one does not.
+/// Nothing reachable writes a file it has mapped read-only (the buffer is read-only by
+/// construction); if something does, this is where it will be. Pages wholly past the end of the
+/// file read as zero rather than raising `SIGBUS`, and a writable or executable file mapping is
+/// refused by name.
 pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let (addr, length, prot, flags, fd, offset) = {
         let mut a = c.args();
@@ -272,14 +288,13 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     // `libroblox.so` imports no allocator at all and guest `mmap` is where its heap comes from. No
     // test here could see it: every one of them passes `-1`, which is what the manual page tells
     // applications to do and what nothing is obliged to do.
-    if flags & MAP_ANONYMOUS == 0 {
+    let file_backed = flags & MAP_ANONYMOUS == 0;
+    if file_backed && prot != PROT_READ {
         return call.refuse(format!(
-            "the guest asked for a file-backed mapping — fd {fd}, flags {flags:#x}, offset \
-             {offset:#x}. `omni-mem` can map a file, but only from a `Backing` opened by the host, \
-             and `omni-platform` has no way to open one from a guest descriptor: it is virtual \
-             memory and faults only. MAP_FAILED is not returned because the guest's allocator \
-             handles that by trying something else, and the real failure would surface as an \
-             allocation pattern with no explanation"
+            "the guest asked for a file-backed mapping of fd {fd} with prot {prot:#x}, flags \
+             {flags:#x}, offset {offset:#x}. A file mapping here is PROT_READ only, made as a \
+             snapshot of the file (see `mmap`): a writable MAP_SHARED mapping must carry its \
+             writes to the file, an executable one is code, and no run has asked for either"
         ));
     }
     if flags & !KNOWN_MAP_FLAGS != 0 {
@@ -349,6 +364,44 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     } else {
         Placement::Anywhere { align: page }
     };
+
+    if file_backed {
+        // Linux: the offset must be a multiple of the page size.
+        if offset < 0 || offset as u64 % page as u64 != 0 {
+            fail(&mut view, consts::EINVAL);
+            c.ret(|mut r| r.u64(MAP_FAILED));
+            return Ok(());
+        }
+        let fs = super::files::filesystem(&view)?;
+        let mut host = vec![0u8; usize::try_from(length).unwrap_or(len).min(len)];
+        let read = match super::files::settle(&view, fs.read_for_mapping(fd, &mut host, offset as u64))? {
+            super::files::Settled::Done(read) => read,
+            super::files::Settled::Failed(errno) => {
+                fail(&mut view, errno);
+                c.ret(|mut r| r.u64(MAP_FAILED));
+                return Ok(());
+            }
+        };
+        let at = match space.map_anonymous(placement, len, Protection::ReadWrite, CommitPolicy::Eager) {
+            Ok(at) => at,
+            Err(error) => {
+                fail(&mut view, errno_for(&error));
+                c.ret(|mut r| r.u64(MAP_FAILED));
+                return Ok(());
+            }
+        };
+        let blame = crate::mem::Blame::new(&call.symbol, call.address, 4);
+        call.mem.write_bytes(at, &host[..read], blame)?;
+        if let Err(error) = space.protect(at, len, Protection::Read) {
+            let _ = space.unmap(at, len);
+            fail(&mut view, errno_for(&error));
+            c.ret(|mut r| r.u64(MAP_FAILED));
+            return Ok(());
+        }
+        invalidate(c, at, len)?;
+        c.ret(|mut r| r.u64(at as u64));
+        return Ok(());
+    }
 
     match space.map_anonymous(placement, len, protection, CommitPolicy::Lazy) {
         Ok(at) => {

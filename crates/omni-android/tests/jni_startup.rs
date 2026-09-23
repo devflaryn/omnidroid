@@ -663,6 +663,16 @@ M4 IMPORT CENSUS: {} distinct imported symbols called across the whole run
     // and a non-zero count here is a leak this layer can see.
     let (live_pins, pinned_bytes, _) = guest.jni.pin_stats();
     assert_eq!(live_pins, 0, "{pinned_bytes} bytes are still pinned after the whole sequence");
+
+    // **The engine's own threads are stopped before its address space goes**, as the M5 gate
+    // does. The scripted steps start workers that are still running when this returns, and
+    // dropping the guest under them was a host access violation at process exit -- MEASURED,
+    // exit 0xc0000005 after both tests had reported `ok`.
+    guest.bionic.stop_guest_threads();
+    assert!(
+        guest.bionic.join_guest_threads(std::time::Duration::from_secs(60)),
+        "the engine's threads did not stop within 60 s of being asked"
+    );
 }
 
 /// The 21 scripted symbols -- [`script::SEQUENCE`]'s 20 and [`script::ENGINE_SETTINGS`]'s one --

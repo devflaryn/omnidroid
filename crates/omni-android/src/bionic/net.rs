@@ -1948,6 +1948,24 @@ fn await_socket(
     }
 }
 
+/// Whether a socket is ready for `interest` at this instant: one zero-length poll, and a failed
+/// poll reported as ready for [`await_socket`]'s reason -- the transfer then produces the host's
+/// own failure.
+fn ready_now(handle: &std::sync::Mutex<Socket>, interest: Interest) -> bool {
+    let socket = locked(handle);
+    let mut entries = [PollEntry::new(&socket, interest)];
+    match platnet::poll(&mut entries, Duration::ZERO) {
+        Ok(_) => {
+            let readiness = entries[0].readiness();
+            (interest.readable && readiness.readable)
+                || (interest.writable && readiness.writable)
+                || readiness.error
+                || readiness.hangup
+        }
+        Err(_) => true,
+    }
+}
+
 /// End a wait that this runtime is tearing down, by name.
 ///
 /// **The other half of lifting the cap on a wait that can end early.** `bounded_wait` now lets
@@ -3312,6 +3330,172 @@ fn control_messages(
         }
         offset = next;
     }
+}
+
+/// `struct mmsghdr` on LP64: a `msghdr` (56 bytes), then `unsigned int msg_len` at 56, padded to
+/// the `msghdr`'s alignment of 8.
+const MMSGHDR_BYTES: u64 = 64;
+/// Linux's `MSG_WAITFORONE`: once one message has arrived, the rest of the call is `MSG_DONTWAIT`.
+const MSG_WAITFORONE: i32 = 0x1_0000;
+/// `sizeof(struct sockaddr_in6)`, the longest address a datagram socket here reports.
+const SOCKADDR_IN6_BYTES: usize = 28;
+
+/// `int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, struct timespec *timeout)`
+///
+/// Up to `vlen` datagrams, each received as `recvmsg` receives one ([`receive_message`]), with its
+/// length in `msg_len`. MEASURED reader: the engine's QUIC transport,
+/// `recvmmsg(fd, msgvec, 16, 0, NULL)`, once it had sent with `UDP_SEGMENT`.
+///
+/// Linux's `__sys_recvmmsg`, in its order: `vlen` above `UIO_MAXIOV` is clamped to it; each message
+/// waits as `recv` does -- by the socket's own blocking mode and `MSG_DONTWAIT` -- and after the
+/// first, `MSG_WAITFORONE` makes the rest `MSG_DONTWAIT`. A failure on the first message is the
+/// call's; a failure after it ends the batch and the count so far is the answer, which is how a
+/// non-blocking socket with fewer than `vlen` datagrams waiting answers. One difference: Linux keeps
+/// a non-`EAGAIN` failure after the first message for the socket's next call (`sk_err`), and this
+/// layer does not -- reachable only by a host failure between two datagrams. A `timeout` refuses by
+/// name: its semantics (checked only between datagrams) are for a run to show.
+pub(super) fn recvmmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, msgvec, vlen, flags, timeout) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()? as u32, a.next_i32()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        if timeout != 0 {
+            return Err(view.refusal(format!(
+                "the guest called recvmmsg(fd {fd}, vlen {vlen}) with a timeout at {timeout:#x}. \
+                 Linux checks it only between datagrams, so it neither bounds the first wait nor \
+                 interrupts one; no run has passed one, and answering it any other way would be a \
+                 guess at a contract this layer has not measured"
+            )));
+        }
+        check_message_flags(view, flags & !MSG_WAITFORONE)?;
+        let nonblocking = locked(&handle).nonblocking();
+        let mut dontwait = flags & MSG_DONTWAIT != 0;
+        let mut received = 0i64;
+        for index in 0..u64::from(vlen.min(UIO_MAXIOV as u32)) {
+            let entry = msgvec.wrapping_add(index * MMSGHDR_BYTES);
+            match receive_message(view, &handle, fd, entry, !nonblocking, dontwait)? {
+                Netted::Done(length) => {
+                    let blame = Blame::new(view.symbol(), view.address(), 1);
+                    view.mem().write_u32(guest_address(view, entry + 56)?, length as u32, blame)?;
+                    received += 1;
+                    if flags & MSG_WAITFORONE != 0 {
+                        dontwait = true;
+                    }
+                }
+                Netted::Failed(errno) if received == 0 => return Ok(Netted::Failed(errno)),
+                Netted::Failed(_) => break,
+            }
+        }
+        Ok(Netted::Done(received))
+    })
+}
+
+/// Receive one datagram into the `msghdr` at `msg`, as `recvmsg` does: scattered over its
+/// `iovec`s in order, its source written to `msg_name` (truncated to `msg_namelen`, which is then
+/// set to the full length -- `move_addr_to_user`), `msg_controllen` set to 0 and `msg_flags` to 0.
+///
+/// **No control message is produced**, and that is true rather than chosen: the options that make
+/// Linux add one on receive (`IP_RECVTOS`, `IP_PKTINFO` and their IPv6 twins) are all refused by
+/// `setsockopt`, and `UDP_GRO`, which is accepted, adds its message only when it coalesced -- which
+/// it never does here. `MSG_TRUNC` in `msg_flags` is not reported: the seam cannot see a
+/// truncation (see `Socket::recv_from`).
+///
+/// The whole scatter list is admitted for writing before the socket is touched, for
+/// [`socket_recv`]'s reason: a received datagram is gone.
+///
+/// **`dontwait` on a blocking socket is a readiness check, not a skipped wait.** The host socket's
+/// mode is the guest's, so a host receive on a blocking socket with nothing queued would block
+/// for ever -- MEASURED, by this function's own test, the first time it skipped the wait instead.
+/// A zero-length poll answers `EAGAIN` when nothing is queued, which is what the flag asks.
+fn receive_message(
+    view: &GuestView<'_>,
+    handle: &std::sync::Mutex<Socket>,
+    fd: i32,
+    msg: u64,
+    blocking: bool,
+    dontwait: bool,
+) -> AbiResult<Netted<i64>> {
+    let at = guest_address(view, msg)?;
+    let blame = Blame::new(view.symbol(), view.address(), 1);
+    let header = view.mem().read_bytes(at, MSGHDR_BYTES, blame)?;
+    let word = |offset: usize| {
+        u64::from_le_bytes(header[offset..offset + 8].try_into().expect("eight bytes"))
+    };
+    let (name, room) = (word(0), word(8) as u32 as usize);
+    let (iov, iovlen) = (word(16), word(24));
+    if iovlen > UIO_MAXIOV {
+        return Ok(Netted::Failed(EMSGSIZE));
+    }
+    let mut spans: Vec<(GuestAddr, usize)> = Vec::new();
+    let mut total = 0usize;
+    for k in 0..iovlen {
+        let entry = view.mem().read_bytes(guest_address(view, iov + 16 * k)?, 16, blame)?;
+        let base = u64::from_le_bytes(entry[0..8].try_into().expect("eight bytes"));
+        let len = transfer_length(u64::from_le_bytes(entry[8..16].try_into().expect("eight bytes")))
+            .min(SOCKET_IO_BLOCK - total);
+        if len == 0 {
+            continue;
+        }
+        let to = guest_address(view, base)?;
+        view.mem().checked_ptr(to, len, true, blame)?;
+        spans.push((to, len));
+        total += len;
+    }
+    // The header's written fields and the name, admitted with the scatter list: none of them can
+    // be found unwritable after the datagram has been taken.
+    view.mem().checked_ptr(at, MSGHDR_BYTES, true, blame)?;
+    if name != 0 && room > 0 {
+        view.mem().checked_ptr(guest_address(view, name)?, room.min(SOCKADDR_IN6_BYTES), true, blame)?;
+    }
+    if blocking && dontwait {
+        if !ready_now(handle, Interest::READABLE) {
+            return Ok(Netted::Failed(consts::EAGAIN));
+        }
+    } else if blocking {
+        let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
+        if !await_socket(handle, Interest::READABLE, deadline)? {
+            return Err(waited_out(view, fd));
+        }
+    }
+    let mut host = vec![0u8; total];
+    let outcome = {
+        let socket = locked(handle);
+        if socket.kind() == omni_platform::net::SocketKind::Datagram {
+            socket.recv_from(&mut host).map(|(read, peer)| (read, Some(peer)))
+        } else {
+            socket.recv(&mut host).map(|read| (read, None))
+        }
+    };
+    let (read, peer) = match settled(view, outcome)? {
+        Netted::Done(pair) => pair,
+        Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+    };
+    let mut from = 0usize;
+    for (to, len) in spans {
+        if from == read {
+            break;
+        }
+        let take = len.min(read - from);
+        view.mem().write_bytes(to, &host[from..from + take], blame)?;
+        from += take;
+    }
+    if let (true, Some(peer)) = (name != 0, peer) {
+        let (bytes, len) = addrinfo::encode_sockaddr(&peer);
+        let copied = room.min(len);
+        if copied > 0 {
+            view.mem().write_bytes(guest_address(view, name)?, &bytes[..copied], blame)?;
+        }
+        view.mem().write_u32(at + 8, len as u32, blame)?;
+    }
+    view.mem().write_u64(at + 40, 0, blame)?;
+    view.mem().write_u32(at + 48, 0, blame)?;
+    Ok(Netted::Done(read as i64))
 }
 
 /// `ssize_t __sendto_chk(int fd, const void *buf, size_t len, size_t buflen, int flags, const struct sockaddr *dest, socklen_t addrlen)`

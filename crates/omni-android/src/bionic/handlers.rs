@@ -1699,6 +1699,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // M6: the storage layer on a guest worker, once the settings success path had run. Outside
     // Task 1's 188; `BEYOND_THE_PREDICTION` records how it was found.
     ("ftruncate", files::ftruncate),
+    ("posix_fallocate", files::posix_fallocate),
     ("__write_chk", net::write_chk),
     ("access", files::access),
     ("getcwd", files::getcwd),
@@ -1739,7 +1740,14 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // M6: a file class's seek, then its position, on a guest worker. Outside Task 1's 188;
     // `BEYOND_THE_PREDICTION` records how each was found -- `ftello` by decoding, one call on.
     ("fseeko", stdio::fseeko),
+    // bionic's `fseek` is `return fseeko(fp, offset, whence);` and `long` is `off_t` on LP64, so
+    // it is the same call. MEASURED: the renderer, seeking in its shader pack's stream.
+    ("fseek", stdio::fseeko),
     ("ftello", stdio::ftello),
+    // bionic's `ftell` is `ftello` with an `EOVERFLOW` check against `LONG_MAX`, which cannot fire
+    // where `long` is `off_t` -- LP64 -- so it is the same call. MEASURED: the renderer, sizing
+    // its shader pack's stream after `fseek`.
+    ("ftell", stdio::ftello),
     ("fputc", stdio::fputc),
     ("fputs", stdio::fputs),
     ("fread", stdio::fread),
@@ -1808,6 +1816,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // M6: the engine's QUIC transport, once it was on Vulkan. Outside Task 1's 188;
     // `BEYOND_THE_PREDICTION` records it.
     ("sendmsg", net::sendmsg),
+    ("recvmmsg", net::recvmmsg),
     ("__sendto_chk", net::sendto_chk),
     ("recvfrom", net::recvfrom),
     ("getaddrinfo", net::getaddrinfo),

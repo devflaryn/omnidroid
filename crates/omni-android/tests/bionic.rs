@@ -548,6 +548,33 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          synchronise; a directory refuses by name until a run shows SQLite's directory sync.",
     ),
     (
+        "posix_fallocate",
+        "M6, once the engine was creating its Vulkan device: a guest worker died on it -- \
+         \"the guest called the imported symbol `posix_fallocate` ... nothing in the \
+         compatibility layer implements it\" -- and the run could not then be stopped. \
+         fallocate mode 0 with the failure returned: the file made at least offset + len long, \
+         which on NTFS reserves the clusters.",
+    ),
+    (
+        "ftell",
+        "M6, the renderer's shader pack again, after fseek: \"the guest called the imported symbol \
+         `ftell` ... nothing in the compatibility layer implements it\". bionic's ftell is ftello \
+         plus an EOVERFLOW check that cannot fire on LP64, so it is bound to ftello.",
+    ),
+    (
+        "fseek",
+        "M6, the renderer reading its shader pack once AAsset_openFileDescriptor gave it a \
+         descriptor on the APK: \"the guest called the imported symbol `fseek` ... nothing in the \
+         compatibility layer implements it\". bionic's fseek is fseeko on LP64, bound to it.",
+    ),
+    (
+        "recvmmsg",
+        "M6, once the engine's Vulkan device existed: the QUIC transport's receive thread died on \
+         it -- \"the guest called the imported symbol `recvmmsg` ... nothing in the compatibility \
+         layer implements it\" -- as recvmmsg(fd, msgvec, 16, 0, NULL). One recvmsg per entry; \
+         MSG_WAITFORONE; the count so far on a later failure; a timeout refused by name.",
+    ),
+    (
         "sendmsg",
         "M6, the first run on Vulkan: the engine's QUIC transport died on it -- \"the guest called \
          the imported symbol `sendmsg` ... nothing in the compatibility layer implements it\". \
@@ -945,7 +972,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 292, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 296, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1030,8 +1057,12 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // `wmemchr`, for 241**. **The rest of libm, for 273**: 32 functions once the Lua app
     // reached `atanf`. **`setjmp`, for 274**: libpng's error recovery. **`__strchr_chk`, for
     // 275**: a worker, once the renderer was being created. **`__strncpy_chk`, for 276**.
-    // **`strpbrk`, for 277**. **`sendmsg`, for 278**: the QUIC transport.
-    assert_eq!(Bionic::inline_symbols().count(), 278);
+    // **`strpbrk`, for 277**. **`sendmsg`, for 278**: the QUIC transport. **`posix_fallocate`,
+    // for 279**: a worker, once the engine was creating its Vulkan device. **`recvmmsg`, for
+    // 280**: the QUIC transport's receive side, once the device existed. **`fseek`, for 281**:
+    // the renderer's shader pack, bound to `fseeko`, which it is on LP64. **`ftell`, for 282**:
+    // the same stream, bound to `ftello`.
+    assert_eq!(Bionic::inline_symbols().count(), 282);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -3337,7 +3368,8 @@ fn an_anonymous_mmap_ignores_fd_the_way_linux_does() {
         assert_eq!(at % f.guest.space.page_size() as u64, 0);
     }
     // The over-correction: a mapping without `MAP_ANONYMOUS` is file-backed whatever `fd` is, and
-    // is still refused by name.
+    // a writable one is still refused by name (a read-only one is a snapshot of the file -- see
+    // `a_read_only_file_mapping_holds_the_files_bytes_and_zeros_past_its_end`).
     for fd in [-1i64, 0, 7] {
         let error = guest_mmap_refusal(&f, 0, length, PROT_RW, 0x02 /* MAP_PRIVATE */, fd);
         assert_eq!(error.symbol(), Some("mmap"), "fd {fd}");
@@ -5587,6 +5619,16 @@ fn fseeko_moves_the_stream_and_clears_end_of_file_and_ftello_reports_it() {
     assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 9);
     assert_eq!(seek(-1, 0), -1, "a negative position is refused, as EINVAL");
     assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 9, "and moved nothing");
+    // `fseek` is bionic's `fseeko` on LP64: the same call, through its own symbol.
+    let through_fseek = value_of(&f, "fseek", |asm| {
+        asm.mov(0, stream);
+        asm.mov(1, 2);
+        asm.mov(2, 0);
+    }) as i64;
+    assert_eq!(through_fseek, 0, "fseek SEEK_SET 2");
+    assert_eq!(value_of(&f, "ftello", |asm| { asm.mov(0, stream); }) as i64, 2);
+    // And `ftell` is `ftello` on LP64.
+    assert_eq!(value_of(&f, "ftell", |asm| { asm.mov(0, stream); }) as i64, 2, "ftell agrees");
     assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64, 0);
 }
 
@@ -8580,6 +8622,136 @@ fn sendmsg_gathers_its_iovecs_into_one_datagram_and_refuses_control_messages() {
     assert!(error.to_string().contains("control messages"), "{error}");
 }
 
+/// **`recvmmsg` receives one datagram per `mmsghdr`, as `recvmsg` would**: scattered over two
+/// `iovec`s, the sender's address in `msg_name` with `msg_namelen` set, `msg_controllen` and
+/// `msg_flags` cleared, the length in `msg_len` -- and only as many entries as datagrams arrived.
+/// `MSG_WAITFORONE` returns after the first; `MSG_DONTWAIT` with nothing waiting is `EAGAIN`; a
+/// timeout refuses by name.
+#[test]
+fn recvmmsg_receives_one_datagram_per_entry_as_recvmsg_would() {
+    let _guard = serialized();
+    let (f, _root) = networked("recvmmsg");
+    let socket = || {
+        value_of(&f, "socket", |asm| {
+            asm.mov(0, AF_INET);
+            asm.mov(1, 2); // SOCK_DGRAM
+            asm.mov(2, 0);
+        }) as i32
+    };
+    let (receiver, sender) = (socket(), socket());
+    let bind_loopback = |fd: i32, at: omni_cpu::GuestAddr| {
+        let mut bytes = [0u8; 16];
+        bytes[0..2].copy_from_slice(&2u16.to_le_bytes());
+        bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        f.guest.write_bytes(at, &bytes);
+        assert_eq!(
+            value_of(&f, "bind", |asm| {
+                asm.mov(0, fd as u64);
+                asm.mov(1, at as u64);
+                asm.mov(2, 16);
+            }) as i32,
+            0
+        );
+        let len_at = f.guest.data + 0x140;
+        f.guest.write_bytes(len_at, &16u32.to_le_bytes());
+        value_of(&f, "getsockname", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, at as u64);
+            asm.mov(2, len_at as u64);
+        });
+    };
+    let to = f.guest.data + 0x100;
+    let from = f.guest.data + 0x120;
+    bind_loopback(receiver, to);
+    bind_loopback(sender, from);
+    let payload = f.guest.data + 0x180;
+    let send = |text: &[u8]| {
+        f.guest.write_bytes(payload, text);
+        let sent = value_of(&f, "sendto", |asm| {
+            asm.mov(0, sender as u64);
+            asm.mov(1, payload as u64);
+            asm.mov(2, text.len() as u64);
+            asm.mov(3, 0);
+            asm.mov(4, to as u64);
+            asm.mov(5, 16);
+        }) as i64;
+        assert_eq!(sent, text.len() as i64);
+    };
+
+    // Four entries, each: a 3-byte and a 64-byte iovec, a 16-byte name, a poisoned controllen
+    // and flags, and a sentinel msg_len.
+    let vec = f.guest.data + 0x400;
+    let buffers = f.guest.data + 0x800;
+    let names = f.guest.data + 0xC00;
+    let iovs = f.guest.data + 0xD00;
+    let prepare = || {
+        for k in 0..4usize {
+            let entry = vec + 64 * k;
+            let iov = iovs + 32 * k;
+            f.guest.write_u64(iov, (buffers + 0x100 * k) as u64);
+            f.guest.write_u64(iov + 8, 3);
+            f.guest.write_u64(iov + 16, (buffers + 0x100 * k + 0x80) as u64);
+            f.guest.write_u64(iov + 24, 64);
+            f.guest.write_bytes(entry, &[0u8; 64]);
+            f.guest.write_u64(entry, (names + 16 * k) as u64);
+            f.guest.write_u64(entry + 8, 16);
+            f.guest.write_u64(entry + 16, iov as u64);
+            f.guest.write_u64(entry + 24, 2);
+            f.guest.write_u64(entry + 40, 99);
+            f.guest.write_u64(entry + 48, 0xDEAD);
+            f.guest.write_u64(entry + 56, 0x5EED);
+        }
+    };
+    let receive = |vlen: u64, flags: u64| {
+        value_and_errno(&f, "recvmmsg", |asm| {
+            asm.mov(0, receiver as u64);
+            asm.mov(1, vec as u64);
+            asm.mov(2, vlen);
+            asm.mov(3, flags);
+            asm.mov(4, 0);
+        })
+    };
+
+    for text in [&b"hello world"[..], b"ab", b"third datagram"] {
+        send(text);
+    }
+    prepare();
+    assert_eq!(receive(3, 0).0 as i64, 3, "three datagrams on a blocking socket, vlen 3");
+    let sender_name = read_guest(&f, from, 16);
+    for (k, text) in [&b"hello world"[..], b"ab", b"third datagram"].iter().enumerate() {
+        let entry = vec + 64 * k;
+        let buffer = buffers + 0x100 * k;
+        assert_eq!(f.guest.read_u64(entry + 56) as u32, text.len() as u32, "msg_len {k}");
+        let head = text.len().min(3);
+        assert_eq!(read_guest(&f, buffer, head), &text[..head], "the first iovec {k}");
+        assert_eq!(read_guest(&f, buffer + 0x80, text.len() - head), &text[head..], "the second {k}");
+        assert_eq!(read_guest(&f, names + 16 * k, 16), sender_name, "msg_name {k}");
+        assert_eq!(f.guest.read_u64(entry + 8) as u32, 16, "msg_namelen {k}");
+        assert_eq!(f.guest.read_u64(entry + 40), 0, "msg_controllen {k}");
+        assert_eq!(f.guest.read_u64(entry + 48) as u32, 0, "msg_flags {k}");
+    }
+    assert_eq!(f.guest.read_u64(vec + 64 * 3 + 56) as u32, 0x5EED, "the fourth entry untouched");
+
+    // MSG_WAITFORONE: the first waits, the rest do not -- one datagram, one entry.
+    send(b"one");
+    prepare();
+    assert_eq!(receive(4, 0x1_0000).0 as i64, 1, "MSG_WAITFORONE returns after the first");
+    assert_eq!(f.guest.read_u64(vec + 56) as u32, 3);
+    assert_eq!(f.guest.read_u64(vec + 64 + 56) as u32, 0x5EED, "the second entry untouched");
+    // MSG_DONTWAIT with nothing waiting: EAGAIN, as the call's own failure.
+    let (value, errno) = receive(4, 0x40);
+    assert_eq!((value as i64, errno), (-1, 11), "EAGAIN");
+
+    let error = refusal_of(&f, "recvmmsg", |asm| {
+        asm.mov(0, receiver as u64);
+        asm.mov(1, vec as u64);
+        asm.mov(2, 4);
+        asm.mov(3, 0x40);
+        asm.mov(4, (f.guest.data + 0x1000) as u64);
+    });
+    assert!(error.to_string().contains("timeout"), "{error}");
+}
+
 /// **`sendmsg` with a `UDP_SEGMENT` control message sends one datagram per segment**, the last one
 /// shorter, and answers the whole length -- what the engine's QUIC transport sends, and what
 /// Linux's GSO puts on the wire. A payload no longer than one segment, or a segment size of 0, is
@@ -10062,6 +10234,94 @@ fn ftruncate_sets_the_length_and_refuses_what_linux_refuses() {
     assert_eq!(call_with_errno(&f, "ftruncate", &[ro as u64, 1]), (-1, EINVAL_NET), "read-only");
     assert_eq!(call_with_errno(&f, "ftruncate", &[99, 1]), (-1, EBADF_NET));
     assert_eq!(std::fs::read(scratch.path("t.bin")).expect("read").len(), 6, "untouched");
+}
+
+/// **A read-only file mapping holds the file's bytes, zeros past its end, and cannot be written**
+/// -- the engine's `ReadOnlySharedBuffer` shape, `mmap(NULL, size, PROT_READ,
+/// MAP_SHARED | MAP_NORESERVE, fileno(f), 0)`, on a file still open for writing. Linux's refusals:
+/// a misaligned offset is `EINVAL`, a descriptor not open for reading `EACCES`, no descriptor
+/// `EBADF`; a writable file mapping refuses by name.
+#[test]
+fn a_read_only_file_mapping_holds_the_files_bytes_and_zeros_past_its_end() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("mmap-file");
+    let content: Vec<u8> = (0..5000u32).map(|n| (n * 7 % 251) as u8).collect();
+    std::fs::write(scratch.path("buffer.bin"), &content).expect("a host file");
+    let rw = open_through_guest(&f, "/buffer.bin", O_RDWR);
+    let map = |length: u64, prot: u64, flags: u64, fd: i32, offset: u64| {
+        value_and_errno(&f, "mmap", |asm| {
+            asm.mov(0, 0);
+            asm.mov(1, length);
+            asm.mov(2, prot);
+            asm.mov(3, flags);
+            asm.mov(4, fd as u64);
+            asm.mov(5, offset);
+        })
+    };
+    let (at, _) = map(5000, 1, 0x4001, rw, 0);
+    assert_ne!(at, u64::MAX, "MAP_FAILED");
+    let at = at as omni_cpu::GuestAddr;
+    assert_eq!(read_guest(&f, at, 5000), content, "the file's bytes");
+    assert_eq!(read_guest(&f, at + 5000, 16), vec![0u8; 16], "zeros past the end of the file");
+    // The protection is PROT_READ: a store faults rather than landing.
+    let entry = program(&f, |asm| {
+        asm.mov(9, at as u64);
+        asm.mov(10, 0x55);
+        asm.push(str_imm(10, 9, 0));
+    });
+    match run_program(&f, entry).expect("the run itself must not fail") {
+        ExitReason::MemoryFault { address, .. } => assert_eq!(address, at),
+        other => panic!("a store into a PROT_READ file mapping must fault: {other:?}"),
+    }
+
+    // An offset that is a page: the file from there.
+    let (second, _) = map(100, 1, 0x02, rw, 4096);
+    assert_eq!(read_guest(&f, second as omni_cpu::GuestAddr, 100), &content[4096..4196]);
+    assert_eq!(map(100, 1, 0x02, rw, 100), (u64::MAX, 22), "a misaligned offset: EINVAL");
+    let wo = open_through_guest(&f, "/buffer.bin", O_WRONLY);
+    assert_eq!(map(100, 1, 0x01, wo, 0), (u64::MAX, 13), "not open for reading: EACCES");
+    assert_eq!(map(100, 1, 0x01, 99, 0), (u64::MAX, 9), "no such descriptor: EBADF");
+    let error = refusal_of(&f, "mmap", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 100);
+        asm.mov(2, 3);
+        asm.mov(3, 0x01);
+        asm.mov(4, rw as u64);
+        asm.mov(5, 0);
+    });
+    assert!(error.to_string().contains("PROT_READ only"), "{error}");
+}
+
+/// **`posix_fallocate` makes the file at least `offset + len` bytes long and never shorter, and
+/// answers each failure as its return value with `errno` untouched** -- bionic wraps `fallocate`
+/// in an `ErrnoRestorer`. `EDOM` (33) is the seed, which nothing here produces.
+#[test]
+fn posix_fallocate_extends_never_shortens_and_returns_its_error() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("posix-fallocate");
+    std::fs::write(scratch.path("t.bin"), b"0123456789").expect("a host file");
+    let length = || std::fs::metadata(scratch.path("t.bin")).expect("metadata").len();
+    let rw = open_through_guest(&f, "/t.bin", O_RDWR);
+    let call = |fd: i32, offset: i64, len: i64| {
+        let (value, errno) = value_and_errno(&f, "posix_fallocate", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, offset as u64);
+            asm.mov(2, len as u64);
+        });
+        (value as i32, errno)
+    };
+    assert_eq!(call(rw, 8, 4088), (0, 33), "success, errno untouched");
+    assert_eq!(length(), 4096, "extended to offset + len");
+    assert_eq!(&std::fs::read(scratch.path("t.bin")).expect("read")[..10], b"0123456789");
+    assert_eq!(call(rw, 0, 16), (0, 33), "a range inside the file");
+    assert_eq!(length(), 4096, "never shortened");
+    assert_eq!(call(rw, 0, 0), (22, 33), "a length that is not positive: EINVAL, returned");
+    assert_eq!(call(rw, -1, 16), (22, 33), "a negative offset");
+    let ro = open_through_guest(&f, "/t.bin", O_RDONLY);
+    assert_eq!(call(ro, 0, 8192), (9, 33), "not open for writing: EBADF");
+    assert_eq!(call(99, 0, 16), (9, 33), "no such descriptor");
+    assert_eq!(call(rw, i64::MAX, 1), (27, 33), "an end past i64::MAX: EFBIG");
+    assert_eq!(length(), 4096, "no failure touched the file");
 }
 
 /// **`mbrtowc` through a real thunk keeps a split character in the guest's `mbstate_t`**, and a
