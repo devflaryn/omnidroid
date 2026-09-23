@@ -173,6 +173,9 @@ GATE_ACTIVITY_FILE = "crates/omni-android/tests/gameactivity.rs"
 JNI_VALUES = "crates/omni-android/src/jni/values.rs"
 JNI_POOL = "crates/omni-android/src/jni/pool.rs"
 JNI_SLOTS = "crates/omni-android/src/jni/slots.rs"
+# §8 row 26: the Java side's touch listener, `vk.e.onTouch`, and the seam that feeds it the host
+# window's pointer.
+JNI_INPUT = "crates/omni-android/src/jni/input.rs"
 
 
 # Commands, kept narrow so the whole run stays under a few minutes.
@@ -267,6 +270,11 @@ GATE_ACTIVITY = ["cargo", "test", "-p", "omni-android", "--release", "--test", "
 # different test, and a row pointed at the wrong filter reports MISS rather than being wrong.
 GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
                 "--no-fail-fast", "the_application_name"]
+
+# The touch seam: `jni::input`'s unit tests (in the lib target) and `tests/input.rs`, which calls a
+# hand-assembled stand-in for the native through real translated code and reads back the registers
+# it was called with. No APK and no engine, so every row costs a build and not a run.
+INPUT = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "input", "--no-fail-fast"]
 
 # M6 groundwork: runtime texture transcoding (`omni-texture`). Zero dependencies and `#![no_std]`,
 # so its command builds in about a second.
@@ -6145,6 +6153,173 @@ directory", ADAPTER_FILES,
      """pub const CHANNEL_PLATFORM_NAME: &str = "GoogleAndroidApp";""",
      """pub const CHANNEL_PLATFORM_NAME: &str = "AndroidApp";""",
      GATE_APPNAME),
+
+    # ---- §8 row 26: touch input, `vk.e.onTouch` -> `nativePassInput` ------------------------------
+    #
+    # **Pixels where the engine reads density-independent pixels.** `vk.e` divides by
+    # `DisplayMetrics.density` (`0x01fe`), and on this host at 100% scaling the density is 1.0 --
+    # so the gate cannot see this, and a test written at 1.0 cannot either. The detectors are at
+    # 1.5.
+    ("input-A1", "A", "a press reaches the engine in pixels instead of dp",
+     JNI_INPUT,
+     """                pointer.set_x(x / scale);
+                pointer.set_y(y / scale);
+                pointer.set_state(STATE_BEGAN);""",
+     """                pointer.set_x(x);
+                pointer.set_y(y);
+                pointer.set_state(STATE_BEGAN);""",
+     INPUT),
+
+    # **The two floats in each other's registers.** x is `s0` and y is `s1` (`0x02bbbab0`,
+    # `0x02bbbaa8`); swapped, every touch lands mirrored in the diagonal and nothing fails.
+    ("input-A2", "A", "x and y are passed in each other's registers",
+     JNI_INPUT,
+     """        GuestArg::Float(call.x),
+        GuestArg::Float(call.y),""",
+     """        GuestArg::Float(call.y),
+        GuestArg::Float(call.x),""",
+     INPUT),
+
+    # **The pointer id where the state goes.** Both are small integers, and for a first press both
+    # are zero -- which is why the detector's drag and release are what see it.
+    ("input-A3", "A", "the pointer id and the state trade registers",
+     JNI_INPUT,
+     """        int(call.pointer_id),
+        GuestArg::Float(call.x),
+        GuestArg::Float(call.y),
+        int(call.state),""",
+     """        int(call.state),
+        GuestArg::Float(call.x),
+        GuestArg::Float(call.y),
+        int(call.pointer_id),""",
+     INPUT),
+
+    # **`D.b()` ignored**: touches sent before the engine has a surface, which the Java side never
+    # does (`0x02b3`).
+    ("input-A4", "A", "touches are sent while the surface is dead",
+     JNI_INPUT,
+     """            if ready {""",
+     """            if true {""",
+     INPUT),
+
+    # **An ended pointer is kept.** `0x02f6` forgets it whether or not it was sent, so a release
+    # while the surface is dead must not come back as a move once it is alive.
+    ("input-A5", "A", "an ended pointer is not forgotten",
+     JNI_INPUT,
+     """            self.pointers.remove(&id);""",
+     """            let _ = id;""",
+     INPUT),
+
+    # **The dedup dropped**: a move that does not move is sent anyway. Harmless-looking, and it is
+    # a `nativePassInput` per frame per finger held still.
+    ("input-A6", "A", "a move that does not move is sent",
+     JNI_INPUT,
+     """            } else if pointer.state == pointer.prev_state {
+                changed""",
+     """            } else if pointer.state == pointer.prev_state {
+                true""",
+     INPUT),
+
+    # **The view in pixels.** `vk.e` divides the view's size too (`0x02c0`). The native does not
+    # read it in this build (`w4`/`w5` are never read), which is exactly why nothing but a test
+    # would notice.
+    ("input-A7", "A", "the view's size is sent in pixels",
+     JNI_INPUT,
+     """        let width = (view.0 as f32 / scale) as i32;""",
+     """        let width = view.0 as i32;""",
+     INPUT),
+
+    # **The surface starts alive.** `jk.o0.a` is a boolean field, false until `surfaceCreated`.
+    ("input-A8", "A", "the seam delivers before it is told the surface exists",
+     JNI_INPUT,
+     """            surface_alive: false,""",
+     """            surface_alive: true,""",
+     INPUT),
+
+    # **A finger that never lifts.** A capture something else takes ends with no button-up, and
+    # the engine's thumbstick would be held for ever.
+    ("input-A9", "A", "losing focus mid-press does not cancel the touch",
+     JNI_INPUT,
+     """                Some((x, y)) => vec![touch(Action::Cancel, x, y)],""",
+     """                Some(_) => Vec::new(),""",
+     INPUT),
+
+    # **The neighbouring export.** `nativePassInputBatch` exists, is exported, and takes a
+    # different argument list; resolving it would call the engine with the wrong shape.
+    ("input-A10", "A", "the seam resolves the batch native instead",
+     JNI_INPUT,
+     """pub const PASS_INPUT_SYMBOL: &str = "Java_com_roblox_engine_jni_NativeInputInterface_nativePassInput";""",
+     """pub const PASS_INPUT_SYMBOL: &str = "Java_com_roblox_engine_jni_NativeInputInterface_nativePassInputBatch";""",
+     INPUT),
+
+    # **A zero density admitted**: every coordinate becomes infinity -- MEASURED what a zero did one
+    # field over, in the renderer.
+    ("input-A11", "A", "a density of zero is accepted",
+     JNI_INPUT,
+     """        if !(density.is_finite() && density > 0.0) {""",
+     """        if false {""",
+     INPUT),
+
+    # **A release somewhere else, without the move there.** `vk.e` ignores an up's own position,
+    # so the engine would see the finger lift where it last was rather than where it lifted.
+    ("input-A12", "A", "a release away from the last move is not preceded by a move",
+     JNI_INPUT,
+     """vec![touch(Action::Move, x, y), touch(Action::Up, x, y)]""",
+     """vec![touch(Action::Up, x, y)]""",
+     INPUT),
+
+    # **Over-correction: the up takes its own position.** It reads as more accurate and is not
+    # what `0x01bc` does -- the Java side reports the pointer where it last moved to.
+    ("input-B1", "B", "an up reports the up event's own position",
+     JNI_INPUT,
+     """                if let Some(pointer) = self.pointers.get_mut(&event.pointer) {
+                    pointer.set_state(STATE_ENDED);
+                }""",
+     """                if let Some(pointer) = self.pointers.get_mut(&event.pointer) {
+                    if let Some((x, y)) = event.position(event.pointer) {
+                        pointer.set_x(x / scale);
+                        pointer.set_y(y / scale);
+                    }
+                    pointer.set_state(STATE_ENDED);
+                }""",
+     INPUT),
+
+    # **Over-correction: every press is sent.** The Java side's dedup reaches a press at `(0, 0)`,
+    # because a fresh `vk.e$h` is all zeros; "fixing" that is a different listener.
+    ("input-B2", "B", "a press is always sent, even one that changes nothing",
+     JNI_INPUT,
+     """            } else if pointer.state == pointer.prev_state {
+                changed""",
+     """            } else if pointer.state == pointer.prev_state {
+                changed || pointer.state == STATE_BEGAN""",
+     INPUT),
+
+    # **Over-correction: a hover is a touch.** A touchscreen reports no hover, and a mouse moving
+    # over the window with no button held is not a finger.
+    ("input-B3", "B", "a hover becomes a move",
+     JNI_INPUT,
+     """                    vec![touch(Action::Move, x, y)]
+                }
+                None => Vec::new(),""",
+     """                    vec![touch(Action::Move, x, y)]
+                }
+                None => vec![touch(Action::Move, x, y)],""",
+     INPUT),
+
+    # **Over-correction: every button is a finger.** A right-click would then press whatever is
+    # under the pointer.
+    ("input-B4", "B", "any pointer button puts the finger down",
+     JNI_INPUT,
+     """            WindowEvent::PointerDown { button: PointerButton::Primary, x, y } => {""",
+     """            WindowEvent::PointerDown { x, y, .. } => {""",
+     INPUT),
+
+    # **Over-correction: the view rounded.** Java's `float-to-int` truncates (`0x02c1`).
+    ("input-B5", "B", "the view's size is rounded to the nearest dp instead of truncated",
+     JNI_INPUT,
+     """        let width = (view.0 as f32 / scale) as i32;""",
+     """        let width = (view.0 as f32 / scale).round() as i32;""",
+     INPUT),
 ]
 
 
