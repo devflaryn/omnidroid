@@ -61,7 +61,8 @@ use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 
 use super::host::{
-    ColorBlendState, DriverAnswer, FramebufferRequest, GraphicsPipelineRequest, HostPipelineCache,
+    ColorBlendState, ComputePipelineRequest, DriverAnswer, FramebufferRequest,
+    GraphicsPipelineRequest, HostPipelineCache,
     MultisampleState, PipelineLayoutRequest, RenderPassRequest, ShaderStage, Specialization,
     SubpassRequest, VertexInputState, ViewportState,
 };
@@ -97,6 +98,10 @@ const STYPE_COLOR_BLEND_STATE: u32 = 26;
 const STYPE_DYNAMIC_STATE: u32 = 27;
 /// `VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO`.
 const STYPE_GRAPHICS_PIPELINE_CREATE_INFO: u32 = 28;
+/// `VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO`.
+const STYPE_COMPUTE_PIPELINE_CREATE_INFO: u32 = 29;
+/// `VK_SHADER_STAGE_COMPUTE_BIT`, the one stage a compute pipeline has.
+const SHADER_STAGE_COMPUTE: u32 = 0x20;
 /// `VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO`.
 const STYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
 /// `VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO`.
@@ -164,6 +169,14 @@ pub const FRAMEBUFFER_CREATE_INFO_BYTES: usize = 64;
 /// subpass 120 (then 4 of padding), basePipelineHandle 128, basePipelineIndex 136 (then 4)
 /// ```
 pub const GRAPHICS_PIPELINE_CREATE_INFO_BYTES: usize = 144;
+
+/// `sizeof(VkComputePipelineCreateInfo)`: `flags` 16 (then 4 of padding), the whole
+/// `VkPipelineShaderStageCreateInfo` `stage` **embedded** at 24, `layout` 72,
+/// `basePipelineHandle` 80, `basePipelineIndex` 88 (then 4).
+pub const COMPUTE_PIPELINE_CREATE_INFO_BYTES: usize = 96;
+
+/// Where a `VkComputePipelineCreateInfo`'s embedded `stage` starts.
+const COMPUTE_STAGE_OFFSET: usize = 24;
 
 /// `sizeof(VkPipelineShaderStageCreateInfo)`: `flags` 16, `stage` 20, `module` 24, `pName` 32,
 /// `pSpecializationInfo` 40.
@@ -899,6 +912,142 @@ pub(super) fn create_graphics_pipelines(
     // **Written even on failure**, because that is what the specification requires and what the
     // guest's own clean-up loop reads: `VK_NULL_HANDLE` for each pipeline that was not created,
     // and a real handle for each that was.
+    let mut handles = Vec::with_capacity(count * 8);
+    for token in &created.pipelines {
+        match token {
+            None => handles.extend_from_slice(&0u64.to_le_bytes()),
+            Some(token) => {
+                let registered = vulkan.register_pipeline(at, *token)?;
+                c.mem().write_bytes(registered.at, &registered.image, c.blame(5))?;
+                handles.extend_from_slice(&(registered.at as u64).to_le_bytes());
+            }
+        }
+    }
+    c.mem().write_bytes(out_at, &handles, c.blame(5))?;
+    if created.result != VK_SUCCESS {
+        vulkan.note_driver_result(CALL, created.result);
+    }
+    c.ret().i32(created.result);
+    Ok(())
+}
+
+/// `VkResult vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
+/// uint32_t createInfoCount, const VkComputePipelineCreateInfo *pCreateInfos,
+/// const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines)`
+///
+/// MEASURED: the engine's renderer, once its descriptor update templates exist, creates its compute
+/// pipelines one per call -- `createInfoCount = 1`, a create info on its own stack with no `pNext`
+/// anywhere, one `VK_SHADER_STAGE_COMPUTE_BIT` stage with no specialization, a module and a layout
+/// it made, and no base pipeline. The partial-success rule and its answer are the graphics call's.
+///
+/// The embedded stage is decoded by the graphics call's own stage decoder, as a one-element
+/// `pStages` at the stage's address, so every check a graphics stage gets it gets too -- and a
+/// refusal about it names it `pStages[0]`.
+pub(super) fn create_compute_pipelines(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCreateComputePipelines";
+    refuse_allocator(vulkan, at, CALL, args[4])?;
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.device_token(at, CALL, args[0])?;
+    let cache: Option<HostPipelineCache> = if args[1] == 0 {
+        None
+    } else {
+        Some(vulkan.pipeline_cache_token(at, CALL, args[1])?)
+    };
+    let count = args[2] as u32 as usize;
+    if count == 0 {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} with `createInfoCount = 0`. Nothing would \
+             be created and nothing would be written into `pPipelines`, so the guest would read \
+             whatever was already in its own array as a `VkPipeline` and bind it",
+            caller = at.caller
+        )));
+    }
+    if count > MAX_PIPELINES_PER_CALL {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} with `createInfoCount = {count}`, and \
+             this layer creates at most {MAX_PIPELINES_PER_CALL} in one call, which bounds the \
+             host allocation a guest count controls (Global Constraint 11). Raise \
+             `omni_android::vulkan::MAX_PIPELINES_PER_CALL`",
+            caller = at.caller
+        )));
+    }
+    let infos_at = require_pointer(at, CALL, "pCreateInfos", args[3])?;
+    let out_at = require_pointer(at, CALL, "pPipelines", args[5])?;
+
+    let infos =
+        c.mem().read_bytes(infos_at, count * COMPUTE_PIPELINE_CREATE_INFO_BYTES, c.blame(3))?;
+    let mut requests = Vec::with_capacity(count);
+    for index in 0..count {
+        let info = &infos[index * COMPUTE_PIPELINE_CREATE_INFO_BYTES..]
+            [..COMPUTE_PIPELINE_CREATE_INFO_BYTES];
+        let u32_at =
+            |offset: usize| u32::from_le_bytes(info[offset..offset + 4].try_into().expect("four"));
+        let u64_at =
+            |offset: usize| u64::from_le_bytes(info[offset..offset + 8].try_into().expect("eight"));
+        let stype = u32_at(0);
+        if stype != STYPE_COMPUTE_PIPELINE_CREATE_INFO {
+            return Err(at.refuse(format!(
+                "the guest called `{CALL}` from {caller:#x} and `pCreateInfos[{index}].sType` is \
+                 {stype}, where `VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO` is \
+                 {STYPE_COMPUTE_PIPELINE_CREATE_INFO}. The stage, the layout and the base \
+                 pipeline would be read at offsets belonging to a different structure",
+                caller = at.caller
+            )));
+        }
+        if u64_at(8) != 0 {
+            return Err(at.refuse(format!(
+                "the guest called `{CALL}` from {caller:#x} with \
+                 `pCreateInfos[{index}].pNext = {next:#x}`. A compute-pipeline chain carries \
+                 creation feedback, robustness and subgroup controls, each of which changes what \
+                 is compiled or what the guest reads back; none has been measured here, and this \
+                 layer does not drop a chain it has not read",
+                caller = at.caller,
+                next = u64_at(8)
+            )));
+        }
+        let stage_at = infos_at as u64 + (index * COMPUTE_PIPELINE_CREATE_INFO_BYTES + COMPUTE_STAGE_OFFSET) as u64;
+        let stage = decode_stages(c, at, vulkan, CALL, 1, stage_at)?
+            .pop()
+            .expect("decode_stages answers one stage for a count of one");
+        if stage.stage != SHADER_STAGE_COMPUTE {
+            return Err(at.refuse(format!(
+                "the guest called `{CALL}` from {caller:#x} with \
+                 `pCreateInfos[{index}].stage.stage = {bits:#x}`. The specification requires \
+                 `VK_SHADER_STAGE_COMPUTE_BIT` ({SHADER_STAGE_COMPUTE:#x}) there, and a driver \
+                 handed another stage's bit for a compute pipeline is undefined behaviour with no \
+                 validation layer to say so",
+                caller = at.caller,
+                bits = stage.stage
+            )));
+        }
+        let layout = vulkan.pipeline_layout_token(at, CALL, u64_at(72))?;
+        let base_pipeline =
+            if u64_at(80) == 0 { None } else { Some(vulkan.pipeline_token(at, CALL, u64_at(80))?) };
+        requests.push(ComputePipelineRequest {
+            flags: u32_at(16),
+            stage,
+            layout: Some(layout),
+            base_pipeline,
+            base_pipeline_index: u32_at(88) as i32,
+        });
+    }
+
+    let created = host.create_compute_pipelines(device, cache, &requests)?;
+    if created.pipelines.len() != count {
+        return Err(at.refuse(format!(
+            "the host answered `{CALL}` with {answered} pipeline slot(s) for {count} create info \
+             structure(s). The guest's `pPipelines` array has exactly {count} entries and the \
+             specification requires one written per create info",
+            answered = created.pipelines.len()
+        )));
+    }
+    // **Written even on failure**, as the graphics call's are: `VK_NULL_HANDLE` for each pipeline
+    // that was not created and a real handle for each that was.
     let mut handles = Vec::with_capacity(count * 8);
     for token in &created.pipelines {
         match token {

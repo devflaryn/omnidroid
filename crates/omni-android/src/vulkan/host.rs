@@ -1278,11 +1278,30 @@ pub struct GraphicsPipelineRequest {
     pub base_pipeline_index: i32,
 }
 
-/// What one `vkCreateGraphicsPipelines` did.
+/// One `VkComputePipelineCreateInfo`, decoded out of guest memory.
+///
+/// A compute pipeline is one shader stage and a layout. The stage is **embedded** in the create
+/// info rather than pointed at, which is the one layout difference from the graphics call that
+/// matters, and it is the same [`ShaderStage`] the graphics call decodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComputePipelineRequest {
+    /// `flags`.
+    pub flags: u32,
+    /// `stage`, which the shim has checked is `VK_SHADER_STAGE_COMPUTE_BIT`.
+    pub stage: ShaderStage,
+    /// `layout`, as a token.
+    pub layout: Option<HostPipelineLayout>,
+    /// `basePipelineHandle`, as a token, or `None` for `VK_NULL_HANDLE`.
+    pub base_pipeline: Option<HostPipeline>,
+    /// `basePipelineIndex`, the guest's, including `-1`.
+    pub base_pipeline_index: i32,
+}
+
+/// What one `vkCreateGraphicsPipelines` or `vkCreateComputePipelines` did.
 ///
 /// # Why this is not a [`DriverAnswer`], for a reason [`Acquired`]'s is not
 ///
-/// `vkCreateGraphicsPipelines` is the only creation call in Vulkan that **partly succeeds**. The
+/// The pipeline creation calls are the only ones in Vulkan that **partly succeed**. The
 /// specification is explicit: when a pipeline fails to be created, `pPipelines` receives
 /// `VK_NULL_HANDLE` in that slot, *the pipelines that succeeded are still valid and still the
 /// application's to destroy*, and an error code is returned for the call as a whole. A
@@ -3042,6 +3061,26 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
             "there are no pipelines. **This is the method rule 1 is written about**: a \
              `VK_SUCCESS` with no pipeline behind it is believed, bound, drawn with, and produces \
              a frame that is empty for a reason nothing records",
+        ))
+    }
+
+    /// `vkCreateComputePipelines`, forwarded, with the same partial-success answer as
+    /// [`VulkanHost::create_graphics_pipelines`].
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn create_compute_pipelines(
+        &self,
+        device: HostDevice,
+        cache: Option<HostPipelineCache>,
+        requests: &[ComputePipelineRequest],
+    ) -> AbiResult<PipelinesCreated> {
+        let _ = (device, cache, requests);
+        Err(host_has_no(
+            "VulkanHost::create_compute_pipelines",
+            "there are no compute pipelines, and a `VK_SUCCESS` without one would be bound and \
+             dispatched with nothing behind it",
         ))
     }
 

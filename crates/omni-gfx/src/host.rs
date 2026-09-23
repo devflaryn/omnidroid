@@ -43,7 +43,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use ash::khr;
 use ash::vk;
 use omni_android::vulkan::{
-    flat_structure, Acquired, BufferRequest, ChainLink, DescriptorCopy, ImageFormatQuery, DescriptorPoolRequest, DescriptorSetLayoutRequest,
+    flat_structure, Acquired, BufferRequest, ChainLink, ComputePipelineRequest, DescriptorCopy,
+    ImageFormatQuery, DescriptorPoolRequest, DescriptorSetLayoutRequest,
     DescriptorWrite, DescriptorWrites, DeviceRequest, DriverAnswer, FramebufferRequest,
     GraphicsPipelineRequest, HostBuffer, HostCommandBuffer, HostCommandPool, HostCreatedImage,
     HostDescriptorPool, HostDescriptorSet, HostDescriptorSetLayout, HostDevice, HostDeviceMemory,
@@ -53,8 +54,8 @@ use omni_android::vulkan::{
     HostQueue, HostRenderPass, HostSampler, HostSemaphore, HostShaderModule, HostSurface,
     HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation, MemoryPlan,
     PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest, Presented,
-    RenderPassBegin, RenderPassRequest, SubmitRequest, SurfaceCreated, SwapchainRequest,
-    VulkanHost,
+    RenderPassBegin, RenderPassRequest, ShaderStage, SubmitRequest, SurfaceCreated,
+    SwapchainRequest, VulkanHost,
 };
 use omni_android::{AbiError, AbiResult};
 use omni_platform::window::RawWindow;
@@ -4059,6 +4060,135 @@ impl VulkanHost for GfxVulkanHost {
         Ok(PipelinesCreated { result: result.as_raw(), pipelines })
     }
 
+    /// `vkCreateComputePipelines`, rebuilt from the decoded request in the graphics call's owned
+    /// layers, of which a compute pipeline needs three: the owned stage, its specialization info,
+    /// and the create info with the stage embedded in it.
+    fn create_compute_pipelines(
+        &self,
+        device: HostDevice,
+        cache: Option<HostPipelineCache>,
+        requests: &[ComputePipelineRequest],
+    ) -> AbiResult<PipelinesCreated> {
+        const METHOD: &str = "VulkanHost::create_compute_pipelines";
+        let parts = self.device_parts(device)?;
+        let cache_handle = match cache {
+            None => vk::PipelineCache::null(),
+            Some(token) => {
+                let table = self.locked_caches();
+                let (owner, handle) =
+                    self.device_of(&table, token.token(), "VkPipelineCache", METHOD)?;
+                if owner != parts.index {
+                    return Err(cross_device("VkPipelineCache", owner, parts.index));
+                }
+                handle
+            }
+        };
+
+        // Layer 0: the stage, the layout and the base, owned, one entry per request. Each table is
+        // locked on its own, as `own_pipeline` locks them.
+        let owned: Vec<(OwnedStage, vk::PipelineLayout, vk::Pipeline)> = requests
+            .iter()
+            .map(|request| {
+                let stage = {
+                    let modules = self.locked_modules();
+                    self.own_stage(&modules, parts.index, &request.stage, METHOD)?
+                };
+                let Some(layout_token) = request.layout else {
+                    return Err(refused(METHOD, "the request names no pipeline layout"));
+                };
+                let layout = {
+                    let table = self.locked_layouts();
+                    let (owner, handle) =
+                        self.device_of(&table, layout_token.token(), "VkPipelineLayout", METHOD)?;
+                    if owner != parts.index {
+                        return Err(cross_device("VkPipelineLayout", owner, parts.index));
+                    }
+                    handle
+                };
+                let base = match request.base_pipeline {
+                    None => vk::Pipeline::null(),
+                    Some(token) => {
+                        let table = self.locked_pipelines();
+                        let (owner, handle) =
+                            self.device_of(&table, token.token(), "VkPipeline", METHOD)?;
+                        if owner != parts.index {
+                            return Err(cross_device("VkPipeline", owner, parts.index));
+                        }
+                        handle
+                    }
+                };
+                Ok((stage, layout, base))
+            })
+            .collect::<AbiResult<Vec<_>>>()?;
+
+        // Layer 1: specialization infos, borrowing layer 0.
+        let specializations: Vec<vk::SpecializationInfo<'_>> = owned
+            .iter()
+            .map(|(stage, _, _)| {
+                vk::SpecializationInfo::default().map_entries(&stage.entries).data(&stage.data)
+            })
+            .collect();
+
+        // Layer 2: the create infos, each with its stage embedded, borrowing layers 0 and 1.
+        let infos: Vec<vk::ComputePipelineCreateInfo<'_>> = owned
+            .iter()
+            .zip(specializations.iter())
+            .zip(requests.iter())
+            .map(|(((stage, layout, base), specialization), request)| {
+                let mut built = vk::PipelineShaderStageCreateInfo::default()
+                    .flags(vk::PipelineShaderStageCreateFlags::from_raw(stage.flags))
+                    .stage(vk::ShaderStageFlags::from_raw(stage.stage))
+                    .module(stage.module)
+                    .name(stage.name.as_c_str());
+                if stage.specialized {
+                    built = built.specialization_info(specialization);
+                }
+                vk::ComputePipelineCreateInfo::default()
+                    .flags(vk::PipelineCreateFlags::from_raw(request.flags))
+                    .stage(built)
+                    .layout(*layout)
+                    .base_pipeline_handle(*base)
+                    .base_pipeline_index(request.base_pipeline_index)
+            })
+            .collect();
+
+        // SAFETY: the device is live; every handle in `infos` is one of its own, checked above;
+        // every pointer reachable from `infos` is into `owned` or `specializations`, both of which
+        // outlive this call and neither of which is mutated after being borrowed; `pAllocator` is
+        // `None`.
+        let created = unsafe { parts.device.create_compute_pipelines(cache_handle, &infos, None) };
+        // The handles *and* the failure, as the graphics call's: a pipeline that was created is
+        // still real and still has to be destroyed.
+        let (handles, result) = match created {
+            Ok(handles) => (handles, vk::Result::SUCCESS),
+            Err((handles, result)) => (handles, result),
+        };
+        if handles.len() != requests.len() {
+            return Err(refused(
+                METHOD,
+                &format!(
+                    "the driver answered with {} handle slot(s) for {} create info structure(s)",
+                    handles.len(),
+                    requests.len()
+                ),
+            ));
+        }
+        let pipelines = handles
+            .into_iter()
+            .map(|handle| {
+                if handle == vk::Pipeline::null() {
+                    None
+                } else {
+                    let token = self
+                        .locked_pipelines()
+                        .insert(ObjectEntry { device: parts.index, object: handle });
+                    Some(HostPipeline::from_token(token))
+                }
+            })
+            .collect();
+        Ok(PipelinesCreated { result: result.as_raw(), pipelines })
+    }
+
     fn destroy_pipeline(&self, pipeline: HostPipeline) -> AbiResult<()> {
         const METHOD: &str = "VulkanHost::destroy_pipeline";
         let (device_index, handle) = {
@@ -5271,6 +5401,61 @@ impl GfxVulkanHost {
         Ok(WritePayload { set, data })
     }
 
+    /// Resolve and own one shader stage: its module, which must be `device_index`'s, its entry
+    /// point as a C string, and its specialization. The graphics and compute calls share it,
+    /// because both carry the same `VkPipelineShaderStageCreateInfo`.
+    fn own_stage(
+        &self,
+        modules: &Slab<ObjectEntry<vk::ShaderModule>>,
+        device_index: usize,
+        stage: &ShaderStage,
+        method: &'static str,
+    ) -> AbiResult<OwnedStage> {
+        let Some(token) = stage.module else {
+            return Err(refused(method, "a shader stage names no module"));
+        };
+        let (owner, module) = self.device_of(modules, token.token(), "VkShaderModule", method)?;
+        if owner != device_index {
+            return Err(cross_device("VkShaderModule", owner, device_index));
+        }
+        let name = CString::new(stage.name.as_str()).map_err(|err| {
+            refused(
+                method,
+                &format!(
+                    "a shader stage entry point \"{}\" has an interior NUL ({err}). Passing it on \
+                     would name a shorter entry point than the guest wrote, and SPIR-V matches it \
+                     byte for byte",
+                    stage.name
+                ),
+            )
+        })?;
+        let (entries, data, specialized) = match stage.specialization.as_ref() {
+            None => (Vec::new(), Vec::new(), false),
+            Some(specialization) => (
+                specialization
+                    .entries
+                    .iter()
+                    .map(|(id, offset, size)| vk::SpecializationMapEntry {
+                        constant_id: *id,
+                        offset: *offset,
+                        size: usize::try_from(*size).unwrap_or(usize::MAX),
+                    })
+                    .collect(),
+                specialization.data.clone(),
+                true,
+            ),
+        };
+        Ok(OwnedStage {
+            flags: stage.flags,
+            stage: stage.stage,
+            module,
+            name,
+            entries,
+            data,
+            specialized,
+        })
+    }
+
     /// Resolve and own everything one `VkGraphicsPipelineCreateInfo` points at.
     ///
     /// Layer 0 of [`GfxVulkanHost::create_graphics_pipelines`]' four. Nothing here borrows from
@@ -5286,52 +5471,7 @@ impl GfxVulkanHost {
             request
                 .stages
                 .iter()
-                .map(|stage| {
-                    let Some(token) = stage.module else {
-                        return Err(refused(METHOD, "a shader stage names no module"));
-                    };
-                    let (owner, module) =
-                        self.device_of(&modules, token.token(), "VkShaderModule", METHOD)?;
-                    if owner != device_index {
-                        return Err(cross_device("VkShaderModule", owner, device_index));
-                    }
-                    let name = CString::new(stage.name.as_str()).map_err(|err| {
-                        refused(
-                            METHOD,
-                            &format!(
-                                "a shader stage entry point \"{}\" has an interior NUL ({err}). \
-                                 Passing it on would name a shorter entry point than the guest \
-                                 wrote, and SPIR-V matches it byte for byte",
-                                stage.name
-                            ),
-                        )
-                    })?;
-                    let (entries, data, specialized) = match stage.specialization.as_ref() {
-                        None => (Vec::new(), Vec::new(), false),
-                        Some(specialization) => (
-                            specialization
-                                .entries
-                                .iter()
-                                .map(|(id, offset, size)| vk::SpecializationMapEntry {
-                                    constant_id: *id,
-                                    offset: *offset,
-                                    size: usize::try_from(*size).unwrap_or(usize::MAX),
-                                })
-                                .collect(),
-                            specialization.data.clone(),
-                            true,
-                        ),
-                    };
-                    Ok(OwnedStage {
-                        flags: stage.flags,
-                        stage: stage.stage,
-                        module,
-                        name,
-                        entries,
-                        data,
-                        specialized,
-                    })
-                })
+                .map(|stage| self.own_stage(&modules, device_index, stage, METHOD))
                 .collect::<AbiResult<Vec<_>>>()?
         };
 
@@ -6678,6 +6818,10 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<vk::DescriptorUpdateTemplateEntry>(),
             guest::DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES
+        );
+        assert_eq!(
+            std::mem::size_of::<vk::ComputePipelineCreateInfo<'_>>(),
+            guest::COMPUTE_PIPELINE_CREATE_INFO_BYTES
         );
         assert_eq!(
             vk::StructureType::DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO.as_raw(),

@@ -55,7 +55,8 @@ use omni_android::bionic::Bionic;
 use omni_android::jni::Jni;
 use omni_android::ndk::{HostWindowSource, Ndk, WindowSource, SURFACE_CLASS};
 use omni_android::vulkan::{
-    Acquired, BufferRequest, DescriptorCopy, DescriptorSetLayoutRequest, DescriptorWrite,
+    Acquired, BufferRequest, ComputePipelineRequest, DescriptorCopy, DescriptorSetLayoutRequest,
+    DescriptorWrite, COMPUTE_PIPELINE_CREATE_INFO_BYTES,
     DescriptorPoolRequest, DeviceRequest, DriverAnswer, GraphicsPipelineRequest, HostBuffer, HostCommandBuffer,
     HostCommandPool, HostCreatedImage, HostDescriptorPool, HostDescriptorSet,
     HostDescriptorSetLayout, HostDevice, HostDeviceMemory, HostExtension, HostFence, HostImage,
@@ -224,6 +225,31 @@ const CLEAR_BYTES: [u8; 4] = [51, 153, 204, 255];
 // boundary**: the format is little-endian 32-bit words whose meaning the SPIR-V specification
 // fixes with no reference to a host, so nothing translates them and `vulkan::shader` says so.
 
+/// **An empty compute shader**, assembled by hand for the same reason as the two above:
+///
+/// ```glsl
+/// #version 450
+/// layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+/// void main() {}
+/// ```
+///
+/// `OpCapability Shader`, `OpMemoryModel Logical GLSL450`, `OpEntryPoint GLCompute %4 "main"`,
+/// `OpExecutionMode %4 LocalSize 1 1 1`, `%2 = OpTypeVoid`, `%3 = OpTypeFunction %2`, and
+/// `%4 = OpFunction %2 None %3` with one block that returns. Checked by a driver compiling it.
+const COMPUTE_SPIRV: [u32; 35] = [
+    0x07230203, 0x00010000, 0x00000000, 0x00000006, 0x00000000, // header, bound 6
+    0x00020011, 0x00000001, // OpCapability Shader
+    0x0003000e, 0x00000000, 0x00000001, // OpMemoryModel Logical GLSL450
+    0x0005000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, // OpEntryPoint GLCompute %4 "main"
+    0x00060010, 0x00000004, 0x00000011, 0x00000001, 0x00000001, 0x00000001, // LocalSize 1 1 1
+    0x00020013, 0x00000002, // %2 = OpTypeVoid
+    0x00030021, 0x00000003, 0x00000002, // %3 = OpTypeFunction %2
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, // %4 = OpFunction %2 None %3
+    0x000200f8, 0x00000005, // %5 = OpLabel
+    0x000100fd, // OpReturn
+    0x00010038, // OpFunctionEnd
+];
+
 const TRIANGLE_VERT_SPIRV: [u32; 151] = [
     0x07230203, 0x00010000, 0x00000000, 0x0000001b, 0x00000000, 0x00020011,
     0x00000001, 0x0003000e, 0x00000000, 0x00000001, 0x0009000f, 0x00000000,
@@ -328,6 +354,8 @@ struct HostLog {
     render_passes: Vec<RenderPassRequest>,
     /// Every `vkCreateGraphicsPipelines` batch.
     pipelines: Vec<Vec<GraphicsPipelineRequest>>,
+    /// Every `vkCreateComputePipelines` batch.
+    compute_pipelines: Vec<Vec<ComputePipelineRequest>>,
     /// Every `vkCreateDescriptorSetLayout` request.
     set_layouts: Vec<DescriptorSetLayoutRequest>,
     /// Which pool each allocated descriptor set came from.
@@ -588,6 +616,7 @@ impl VulkanHost for StageFourHost {
                 | "vkCreateFramebuffer"
                 | "vkDestroyFramebuffer"
                 | "vkCreateGraphicsPipelines"
+                | "vkCreateComputePipelines"
                 | "vkDestroyPipeline"
                 | "vkCreateDescriptorSetLayout"
                 | "vkDestroyDescriptorSetLayout"
@@ -1076,6 +1105,29 @@ impl VulkanHost for StageFourHost {
                     .collect(),
             }),
         }
+    }
+
+    /// The same scripted partial success as [`StageFourHost::create_graphics_pipelines`].
+    fn create_compute_pipelines(
+        &self,
+        _device: HostDevice,
+        _cache: Option<HostPipelineCache>,
+        requests: &[ComputePipelineRequest],
+    ) -> AbiResult<PipelinesCreated> {
+        self.log().compute_pipelines.push(requests.to_vec());
+        let outcomes = self
+            .pipelines
+            .lock()
+            .expect("no panic holds this")
+            .pop_front()
+            .unwrap_or_else(|| vec![true; requests.len()]);
+        Ok(PipelinesCreated {
+            result: if outcomes.iter().all(|made| *made) { VK_SUCCESS } else { -2 },
+            pipelines: outcomes
+                .iter()
+                .map(|made| made.then(|| HostPipeline::from_token(self.token())))
+                .collect(),
+        })
     }
 
     fn destroy_pipeline(&self, _pipeline: HostPipeline) -> AbiResult<()> {
@@ -3728,6 +3780,8 @@ const STAGE_COLOR_ATTACHMENT_OUTPUT: u32 = 0x400;
 const SHADER_STAGE_VERTEX: u32 = 0x1;
 /// `VK_SHADER_STAGE_FRAGMENT_BIT`.
 const SHADER_STAGE_FRAGMENT: u32 = 0x10;
+/// `VK_SHADER_STAGE_COMPUTE_BIT`.
+const SHADER_STAGE_COMPUTE: u32 = 0x20;
 /// `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`.
 const DESCRIPTOR_COMBINED_IMAGE_SAMPLER: u32 = 1;
 /// `VK_PIPELINE_BIND_POINT_GRAPHICS`.
@@ -3930,6 +3984,23 @@ impl Fixture {
         bytes[32..36].copy_from_slice(&1u32.to_le_bytes()); // descriptorCount
         bytes[36..40].copy_from_slice(&DESCRIPTOR_COMBINED_IMAGE_SAMPLER.to_le_bytes());
         bytes[40..48].copy_from_slice(&images.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkComputePipelineCreateInfo` as the engine writes one: the stage **embedded** at 24 --
+    /// `sType` 24, `stage` 44, `module` 48, `pName` 56 -- `layout` 72, no base pipeline, and a
+    /// `basePipelineIndex` of -1 at 88.
+    fn compute_pipeline_info(&self, layout: u64, module: u64, stage: u32, flags: u32) -> u64 {
+        let entry = self.cstr("main");
+        let mut bytes = vec![0u8; COMPUTE_PIPELINE_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&29u32.to_le_bytes()); // COMPUTE_PIPELINE_CREATE_INFO
+        bytes[16..20].copy_from_slice(&flags.to_le_bytes());
+        bytes[24..28].copy_from_slice(&18u32.to_le_bytes()); // PIPELINE_SHADER_STAGE_CREATE_INFO
+        bytes[44..48].copy_from_slice(&stage.to_le_bytes());
+        bytes[48..56].copy_from_slice(&module.to_le_bytes());
+        bytes[56..64].copy_from_slice(&entry.to_le_bytes());
+        bytes[72..80].copy_from_slice(&layout.to_le_bytes());
+        bytes[88..92].copy_from_slice(&(-1i32).to_le_bytes());
         self.bytes(&bytes)
     }
 
@@ -4459,6 +4530,92 @@ fn a_guest_pnext_chain_is_refused_by_name_and_the_address_is_recorded() {
     assert!(text.contains("walking means knowing"), "{text}");
 }
 
+/// **A compute pipeline is its embedded stage and its layout, and a batch may partly fail.**
+///
+/// The engine's call (MEASURED): one create info, on its stack, whose stage is a
+/// `VK_SHADER_STAGE_COMPUTE_BIT` stage embedded at 24 rather than behind a pointer. What this
+/// catches: a stage read through a pointer that is not there, a layout read at the base
+/// pipeline's offset, a base index read from the padding, and a failed slot left as whatever the
+/// guest's array held.
+#[test]
+fn a_compute_pipeline_is_its_embedded_stage_and_its_layout() {
+    let _serial = serialized();
+    let m = up_to_memory("compute");
+    let f = &m.up.f;
+    let device = m.up.device;
+    let create_set_layout = f.resolve_device(m.up.get_proc, device, "vkCreateDescriptorSetLayout");
+    let create_layout = f.resolve_device(m.up.get_proc, device, "vkCreatePipelineLayout");
+    let create_shader = f.resolve_device(m.up.get_proc, device, "vkCreateShaderModule");
+    let create_compute = f.resolve_device(m.up.get_proc, device, "vkCreateComputePipelines");
+
+    let out = f.alloc(8);
+    assert_eq!(
+        f.call(create_set_layout, [device, f.descriptor_set_layout_info(), 0, out])
+            .expect("set layout") as i32,
+        VK_SUCCESS
+    );
+    let set_layout = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_layout, [device, f.pipeline_layout_info(set_layout), 0, out])
+            .expect("layout") as i32,
+        VK_SUCCESS
+    );
+    let layout = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_shader, [device, f.shader_module_info(&COMPUTE_SPIRV), 0, out])
+            .expect("module") as i32,
+        VK_SUCCESS
+    );
+    let module = f.guest.read_u64(out as GuestAddr);
+
+    // Two create infos with different flags, of which the driver will decline the second.
+    let first = f.compute_pipeline_info(layout, module, SHADER_STAGE_COMPUTE, 0x1);
+    let second = f.compute_pipeline_info(layout, module, SHADER_STAGE_COMPUTE, 0x2);
+    let both = f.bytes(
+        &[
+            f.read_bytes(first, COMPUTE_PIPELINE_CREATE_INFO_BYTES),
+            f.read_bytes(second, COMPUTE_PIPELINE_CREATE_INFO_BYTES),
+        ]
+        .concat(),
+    );
+    m.up.host.pipelines.lock().expect("no panic holds this").push_back(vec![true, false]);
+    let pipelines_at = f.poisoned(16, 0x5A);
+    let result = f
+        .call_n(create_compute, &[device, 0, 2, both, 0, pipelines_at])
+        .expect("the call completes");
+    assert_eq!(result as i32, -2, "the driver's own code reaches the guest");
+    let written = f.read_bytes(pipelines_at, 16);
+    let created = u64::from_le_bytes(written[0..8].try_into().expect("eight"));
+    assert_ne!(created, 0, "a real handle for the one that was created");
+    assert_ne!(created, 0x5A5A_5A5A_5A5A_5A5A, "and written, not left as the poison");
+    assert_eq!(
+        u64::from_le_bytes(written[8..16].try_into().expect("eight")),
+        0,
+        "VK_NULL_HANDLE for the one that failed"
+    );
+    assert_eq!(f.vulkan().pipeline_handles().len(), 1, "one handle, for the one pipeline");
+
+    let batches = m.up.host.log().compute_pipelines.clone();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].len(), 2);
+    for (index, (request, flags)) in batches[0].iter().zip([0x1u32, 0x2]).enumerate() {
+        assert_eq!(request.flags, flags, "flags {index}");
+        assert_eq!(request.stage.stage, SHADER_STAGE_COMPUTE, "the embedded stage {index}");
+        assert_eq!(request.stage.name, "main", "its entry point {index}");
+        assert!(request.stage.module.is_some(), "its module, as a token {index}");
+        assert_eq!(request.stage.specialization, None, "no specialization {index}");
+        assert!(request.layout.is_some(), "the layout, as a token {index}");
+        assert_eq!(request.base_pipeline, None, "no base pipeline {index}");
+        assert_eq!(request.base_pipeline_index, -1, "basePipelineIndex {index}");
+    }
+
+    // **A stage that is not the compute stage is refused by name**, and reaches no host.
+    let vertex = f.compute_pipeline_info(layout, module, SHADER_STAGE_VERTEX, 0);
+    let text = f.refusal(create_compute, &[device, 0, 1, vertex, 0, pipelines_at]).to_string();
+    assert!(text.contains("VK_SHADER_STAGE_COMPUTE_BIT"), "{text}");
+    assert_eq!(m.up.host.log().compute_pipelines.len(), 1, "the refused call reached no host");
+}
+
 /// **`vkCreateGraphicsPipelines` may partly succeed, and the guest gets both halves.**
 ///
 /// The only creation call in Vulkan that can, and the whole reason
@@ -4693,6 +4850,76 @@ fn a_descriptor_pool_takes_its_sets_and_a_swapchain_image_cannot_be_destroyed() 
     f.call(destroy_image, [device, created, 0, 0]).expect("destroy");
     assert!(f.vulkan().created_image_handles().is_empty());
     assert_eq!(f.vulkan().image_handles().len(), count, "the swapchain's images are untouched");
+}
+
+/// **A real driver builds the compute pipeline the guest describes.**
+///
+/// The guest's create info, with its stage embedded, crosses the boundary, is rebuilt in the host's
+/// memory and handed to the machine's driver, which compiles the module's `GLCompute` entry point
+/// against the layout. A stage flag, an entry-point name or a layout lost on the way is a driver
+/// that fails the call -- or, with no validation layer, one that does something undefined -- so
+/// `VK_SUCCESS` and a handle are the claim, and the handle is destroyed through the guest's path.
+#[test]
+#[ignore = "opens the host Vulkan driver; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn a_real_driver_builds_the_compute_pipeline_the_guest_describes() {
+    require_gate();
+    let _serial = serialized();
+    let host = omni_gfx::GfxVulkanHost::load().expect(
+        "this machine must have a Vulkan loader: the gate was set, so a missing driver is a \
+         failure and not a skip",
+    );
+    let f = fixture("live-compute", Some(host.clone()));
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let enumerate = f.resolve(entry_point, instance, "vkEnumeratePhysicalDevices");
+    let count_at = f.alloc(8);
+    assert_eq!(f.call(enumerate, [instance, count_at, 0, 0]).expect("count") as i32, VK_SUCCESS);
+    let array_at = f.alloc(8);
+    let result = f.call(enumerate, [instance, count_at, array_at, 0]).expect("array") as i32;
+    assert!(result == VK_SUCCESS || result == VK_INCOMPLETE, "{result}");
+    let physical = f.guest.read_u64(array_at as GuestAddr);
+    let device = f.a_device(entry_point, instance, physical, 0);
+    let get_proc = f.resolve(entry_point, instance, "vkGetDeviceProcAddr");
+
+    let create_set_layout = f.resolve_device(get_proc, device, "vkCreateDescriptorSetLayout");
+    let create_layout = f.resolve_device(get_proc, device, "vkCreatePipelineLayout");
+    let create_shader = f.resolve_device(get_proc, device, "vkCreateShaderModule");
+    let create_compute = f.resolve_device(get_proc, device, "vkCreateComputePipelines");
+    let destroy = f.resolve_device(get_proc, device, "vkDestroyPipeline");
+
+    let out = f.alloc(8);
+    assert_eq!(
+        f.call(create_set_layout, [device, f.descriptor_set_layout_info(), 0, out])
+            .expect("set layout") as i32,
+        VK_SUCCESS
+    );
+    let set_layout = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_layout, [device, f.pipeline_layout_info(set_layout), 0, out])
+            .expect("layout") as i32,
+        VK_SUCCESS
+    );
+    let layout = f.guest.read_u64(out as GuestAddr);
+    assert_eq!(
+        f.call(create_shader, [device, f.shader_module_info(&COMPUTE_SPIRV), 0, out])
+            .expect("module") as i32,
+        VK_SUCCESS
+    );
+    let module = f.guest.read_u64(out as GuestAddr);
+
+    let info = f.compute_pipeline_info(layout, module, SHADER_STAGE_COMPUTE, 0);
+    let pipeline_at = f.poisoned(8, 0x5A);
+    let result = f
+        .call_n(create_compute, &[device, 0, 1, info, 0, pipeline_at])
+        .expect("the call completes");
+    assert_eq!(result as i32, VK_SUCCESS, "the driver compiled the guest's compute pipeline");
+    let pipeline = f.guest.read_u64(pipeline_at as GuestAddr);
+    assert_ne!(pipeline, 0);
+    assert_ne!(pipeline, 0x5A5A_5A5A_5A5A_5A5A, "a handle was written");
+    assert_eq!(f.vulkan().pipeline_handles().len(), 1);
+
+    f.call(destroy, [device, pipeline, 0, 0]).expect("the pipeline is destroyed");
+    assert!(f.vulkan().pipeline_handles().is_empty(), "and its handle is forgotten");
 }
 
 /// **Stage 5's evidence: a textured triangle, drawn by guest code, presented, and its pixels

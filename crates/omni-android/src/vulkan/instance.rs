@@ -779,12 +779,14 @@ pub(super) fn unimplemented(
              `vkAcquireNextImageKHR`/`vkQueueSubmit`/`vkQueuePresentKHR` with the two idle waits \
              -- and everything between a device and a draw: device memory with \
              `vkMapMemory`/`vkUnmapMemory` and the two bind calls, buffers, images and samplers, \
-             shader modules, pipeline layouts, render passes, framebuffers, pipeline caches and \
-             `vkCreateGraphicsPipelines`, the four descriptor calls with \
-             `vkUpdateDescriptorSets`, and the thirteen `vkCmd*` a textured draw records. All to \
-             a real host driver through `VulkanHost`. It implements no other Vulkan command: \
-             **compute pipelines, queries, events, sparse binding, buffer views, secondary \
-             command buffers and the `2`-suffixed variants are not here**, and which of them gets \
+             shader modules, pipeline layouts, render passes, framebuffers, pipeline caches, \
+             `vkCreateGraphicsPipelines` and `vkCreateComputePipelines`, the four descriptor \
+             calls with `vkUpdateDescriptorSets` and descriptor update templates, query pools \
+             with the GPU timer's two commands, and \
+             the thirteen `vkCmd*` a textured draw records. All to a real host driver through \
+             `VulkanHost`. It implements no other Vulkan command: **compute dispatch, query \
+             results, events, sparse binding, buffer views, secondary command buffers and most \
+             `2`-suffixed variants are not here**, and which of them gets \
              built is decided by what the engine's census actually asks for rather than by a \
              header (D17). Nothing has been created, nothing has been destroyed, and no status \
              code has been invented -- which is the whole reason this is an error and not a \

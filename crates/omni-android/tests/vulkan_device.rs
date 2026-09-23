@@ -166,6 +166,9 @@ impl StageThreeHost {
                 "vkAllocateMemory".to_string(),
                 // On the far side of stage 5's frontier, and here so that a test can show the
                 // frontier is named rather than assumed.
+                "vkCreateEvent".to_string(),
+                // On the near side since the engine's renderer reached it, and here so that a test
+                // can show it refuses for an argument now rather than for its name.
                 "vkCreateComputePipelines".to_string(),
             ],
             has_platform_surface_call: true,
@@ -1829,18 +1832,26 @@ fn device_proc_addr_answers_thunks_and_the_two_nulls() {
     assert!(text.contains("vkCreateSwapchainKHR"), "{text}");
     assert!(text.contains("pCreateInfo = NULL"), "the handler is real now: {text}");
 
-    // What still refuses by *name* is the batch after this one. **The example had to change in
-    // stage 5**: `vkAllocateMemory` is implemented now, so the frontier moved, and
-    // `vkCreateComputePipelines` is on the far side of it. That the assertion had to be rewritten
-    // is the point of keeping it — it is what makes "the frontier is named" a claim about where
-    // the frontier actually is rather than a sentence that would pass whatever happened.
+    // What still refuses by *name* is the batch after this one. **The example has changed twice**:
+    // in stage 5 `vkAllocateMemory` was implemented and the example became
+    // `vkCreateComputePipelines`; then the engine's renderer reached that, and it is `vkCreateEvent`
+    // now. That the assertion had to be rewritten is the point of keeping it — it is what makes
+    // "the frontier is named" a claim about where the frontier actually is rather than a sentence
+    // that would pass whatever happened.
+    let name = f.cstr("vkCreateEvent");
+    let event = f.call(get_proc, [device, name, 0, 0]).expect("a lookup");
+    assert_ne!(event, 0, "the driver has vkCreateEvent, so a thunk is handed out");
+    let text = f.refusal(event, [device, 0, 0, 0]).to_string();
+    assert!(text.contains("vkCreateEvent"), "{text}");
+    assert!(text.contains("stage 5"), "the frontier is named: {text}");
+    assert!(text.contains("events"), "and what is on the far side of it: {text}");
+
+    // And the one that used to be the example refuses for its arguments, not its name.
     let name = f.cstr("vkCreateComputePipelines");
     let compute = f.call(get_proc, [device, name, 0, 0]).expect("a lookup");
-    assert_ne!(compute, 0, "the driver has vkCreateComputePipelines, so a thunk is handed out");
     let text = f.refusal(compute, [device, 0, 0, 0]).to_string();
     assert!(text.contains("vkCreateComputePipelines"), "{text}");
-    assert!(text.contains("stage 5"), "the frontier is named: {text}");
-    assert!(text.contains("compute pipelines"), "and what is on the far side of it: {text}");
+    assert!(!text.contains("This is stage 5"), "the handler is real now: {text}");
 
     // And the batch this stage *did* implement is reachable through the same lookup, which is the
     // other half of the same claim: `vkAllocateMemory` refuses for its **argument** now, not for

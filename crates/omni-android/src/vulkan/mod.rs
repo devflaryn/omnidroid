@@ -172,7 +172,8 @@ pub use device::{
 };
 pub use handles::HANDLE_SLOT_BYTES;
 pub use host::{
-    Acquired, ApplicationInfo, BufferRequest, ChainLink, ColorBlendState, DescriptorBinding, DescriptorCopy,
+    Acquired, ApplicationInfo, BufferRequest, ChainLink, ColorBlendState, ComputePipelineRequest,
+    DescriptorBinding, DescriptorCopy,
     DescriptorPoolRequest, DescriptorSetLayoutRequest, DescriptorWrite, DescriptorWrites,
     DeviceRequest, DriverAnswer, FramebufferRequest, GraphicsPipelineRequest, HostBuffer,
     HostCommandBuffer, HostCommandPool, HostCreatedImage, HostDescriptorPool, HostDescriptorSet,
@@ -213,8 +214,8 @@ pub use resource::{
 pub use query::{QUERY_POOL_CREATE_INFO_BYTES, STYPE_QUERY_POOL_CREATE_INFO};
 pub use shader::{
     ATTACHMENT_DESCRIPTION_BYTES, ATTACHMENT_REFERENCE_BYTES, COLOR_BLEND_ATTACHMENT_BYTES,
-    COLOR_BLEND_STATE_BYTES, DEPTH_STENCIL_STATE_BODY_BYTES, DEPTH_STENCIL_STATE_BYTES,
-    DYNAMIC_STATE_CREATE_INFO_BYTES, FRAMEBUFFER_CREATE_INFO_BYTES,
+    COLOR_BLEND_STATE_BYTES, COMPUTE_PIPELINE_CREATE_INFO_BYTES, DEPTH_STENCIL_STATE_BODY_BYTES,
+    DEPTH_STENCIL_STATE_BYTES, DYNAMIC_STATE_CREATE_INFO_BYTES, FRAMEBUFFER_CREATE_INFO_BYTES,
     GRAPHICS_PIPELINE_CREATE_INFO_BYTES, INPUT_ASSEMBLY_STATE_BYTES, MAX_BLEND_ATTACHMENTS,
     MAX_DYNAMIC_STATES, MAX_ENTRY_POINT_BYTES, MAX_FRAMEBUFFER_ATTACHMENTS,
     MAX_PIPELINE_CACHE_BYTES, MAX_PIPELINE_STAGES, MAX_PIPELINES_PER_CALL, MAX_PUSH_CONSTANT_RANGES,
@@ -3529,6 +3530,7 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkCreateFramebuffer" => shader::create_framebuffer(c, &at, &vulkan, args),
         "vkDestroyFramebuffer" => shader::destroy_framebuffer(c, &at, &vulkan, args),
         "vkCreateGraphicsPipelines" => shader::create_graphics_pipelines(c, &at, &vulkan, args),
+        "vkCreateComputePipelines" => shader::create_compute_pipelines(c, &at, &vulkan, args),
         "vkDestroyPipeline" => shader::destroy_pipeline(c, &at, &vulkan, args),
         "vkCreateDescriptorSetLayout" => {
             descriptor::create_descriptor_set_layout(c, &at, &vulkan, args)
