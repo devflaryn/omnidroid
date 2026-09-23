@@ -13,3 +13,8 @@ omni-platform = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+
+# Linux tests only: `sigaltstack(2)`, to measure how much alternate stack the demand pager's
+# SIGSEGV path really uses (`tests/pager_linux`). Nothing in this crate's own code calls the OS.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
