@@ -45,11 +45,15 @@
 //!   initializers, which it would then pre-empt.
 //! * The executable is inside an application bundle (`….app/Contents/MacOS/`): an application
 //!   runs its own `NSApplication` on its main thread, and taking that away from it would break it.
-//! * It is not the **last** entry of the executable's initializer list. Everything after it would
-//!   otherwise never run (the constructor does not return). MEASURED: in every test binary of this
-//!   workspace built on this host it is the only entry (`__DATA_CONST,__mod_init_func`, one
-//!   pointer). An initializer list in another section (`__TEXT,__init_offsets`) is also declined,
-//!   as a format this code has never read.
+//! * It cannot find itself in the executable's initializer list, or the list is in a form this
+//!   code has never read (more than one `__mod_init_func`, or ld's `__TEXT,__init_offsets`).
+//!   **Entries after it are run by it**, in order, with dyld's own arguments, before `main` is
+//!   released -- the constructor never returns, so dyld would never run them. MEASURED
+//!   (`otool -s __DATA_CONST __mod_init_func`): the list is `__DATA_CONST,__mod_init_func`, and the
+//!   linker places a test crate's own initializer **after** this one --
+//!   `tests/window_macos.rs::another_initializer_runs_once_on_the_main_thread_before_main` is that
+//!   case, and asserts it ran exactly once, on the main thread. dynarmic's C++ static initializers
+//!   (three in its own test binaries) will land on one side or the other the same way.
 //! * `main` cannot be found: the entry point comes from `LC_MAIN`'s `entryoff` (MEASURED equal to
 //!   `dlsym(RTLD_MAIN_ONLY, "main")` in debug and in thin-LTO release test binaries), and when
 //!   `dlsym` also answers, the two must agree.
@@ -66,6 +70,7 @@
 
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use objc2::MainThreadMarker;
@@ -100,7 +105,7 @@ pub(crate) enum Status {
     NotInExecutable = 3,
     /// The executable is in an application bundle.
     AppBundle = 4,
-    /// Not the last initializer, or the initializer list is in a format not read here.
+    /// Not found in the initializer list, or the list is in a format not read here.
     NotLastInitializer = 5,
     /// `main` could not be found, or `LC_MAIN` and `dlsym` disagree.
     NoMain = 6,
@@ -145,9 +150,9 @@ impl Status {
                  its own NSApplication on the main thread; omni-platform does not take it away"
             }
             Status::NotLastInitializer => {
-                "omni-platform's macOS constructor is not the last entry of the executable's \
-                 __mod_init_func (or the list is in a section it does not read), and taking the \
-                 main thread there would stop the initializers after it from ever running"
+                "omni-platform's macOS constructor could not find itself in the executable's \
+                 __mod_init_func (or the list is in a section it does not read), so it could not \
+                 run the initializers after it and did not take the main thread"
             }
             Status::NoMain => {
                 "the executable's entry point could not be found (no LC_MAIN, or LC_MAIN and \
@@ -251,12 +256,12 @@ extern "C" fn constructor(
     argv: *const *const c_char,
     envp: *const *const c_char,
     apple: *const *const c_char,
-    _vars: *const c_void,
+    vars: *const c_void,
 ) {
     // Nothing here may unwind into dyld.
     let decided = catch_unwind(|| decide(constructor as *const () as usize));
-    let main = match decided {
-        Ok(Ok(main)) => main,
+    let (main, later) = match decided {
+        Ok(Ok(found)) => found,
         Ok(Err(status)) => {
             STATE.store(status as u8, Ordering::Release);
             return;
@@ -283,8 +288,23 @@ extern "C" fn constructor(
         }
         libc::pthread_detach(thread);
     }
+    // **The initializers after this one, run here, in order, with dyld's own arguments** -- what
+    // dyld would have done had this returned, and what it will now never do. Only once the thread
+    // exists: a failure to create it returns to dyld, which must then find them not yet run.
+    for initializer in later {
+        // SAFETY: an entry of the executable's own `__mod_init_func`, called with the arguments
+        // dyld passes every entry of it.
+        let initializer: Initializer = unsafe { core::mem::transmute::<usize, Initializer>(initializer) };
+        initializer(argc, argv, envp, apple, vars);
+    }
+    let (open, opened) = &MAIN_GATE;
+    *open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    opened.notify_all();
     serve();
 }
+
+/// Held shut until every initializer has run: `main` must not start before them.
+static MAIN_GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
 /// The arguments `main` will be called with.
 struct MainCall {
@@ -300,6 +320,12 @@ struct MainCall {
 extern "C" fn run_main(entry: *mut c_void) -> *mut c_void {
     // SAFETY: `entry` came from `Box::into_raw` in `constructor` and is owned by this thread.
     let call = unsafe { Box::from_raw(entry.cast::<MainCall>()) };
+    let (open, opened) = &MAIN_GATE;
+    let mut is_open = open.lock().unwrap_or_else(PoisonError::into_inner);
+    while !*is_open {
+        is_open = opened.wait(is_open).unwrap_or_else(PoisonError::into_inner);
+    }
+    drop(is_open);
     // SAFETY: `call.main` is the executable's entry point, found by `decide` from `LC_MAIN` (and
     // cross-checked against `dlsym` when that answers), and `main`'s C signature is
     // `int main(int, char **, char **, char **)`.
@@ -323,8 +349,9 @@ fn main_stack_size() -> usize {
     usize::try_from(limit.rlim_cur).unwrap_or(FLOOR).max(FLOOR)
 }
 
-/// Every check in this module's header, in order: `Ok(main)` to take the main thread.
-fn decide(this: usize) -> Result<usize, Status> {
+/// Every check in this module's header, in order: `Ok((main, the initializers after this one))` to
+/// take the main thread.
+fn decide(this: usize) -> Result<(usize, Vec<usize>), Status> {
     // SAFETY: no arguments.
     if unsafe { libc::pthread_main_np() } != 1 {
         return Err(Status::NotMainThread);
@@ -339,16 +366,14 @@ fn decide(this: usize) -> Result<usize, Status> {
     if in_app_bundle() {
         return Err(Status::AppBundle);
     }
-    if !last_initializer(header, this) {
-        return Err(Status::NotLastInitializer);
-    }
+    let later = initializers_after(header, this).ok_or(Status::NotLastInitializer)?;
     let main = entry_point(header).ok_or(Status::NoMain)?;
     // SAFETY: `dlsym` with a C-string literal.
     let exported = unsafe { libc::dlsym(libc::RTLD_MAIN_ONLY, c"main".as_ptr()) } as usize;
     if exported != 0 && exported != main {
         return Err(Status::NoMain);
     }
-    Ok(main)
+    Ok((main, later))
 }
 
 /// True when the executable's path is `….app/Contents/MacOS/…`.
@@ -364,8 +389,9 @@ fn in_app_bundle() -> bool {
     path.to_bytes().windows(b".app/Contents/MacOS/".len()).any(|window| window == b".app/Contents/MacOS/")
 }
 
-/// True when `this` is the final pointer of the executable's one `__mod_init_func` section.
-fn last_initializer(header: *const MachHeader64, this: usize) -> bool {
+/// The entries after `this` in the executable's one `__mod_init_func` section, or `None` when
+/// `this` is not in it or the list is in a form this code does not read. See this module's header.
+fn initializers_after(header: *const MachHeader64, this: usize) -> Option<Vec<usize>> {
     let read = |segment: &CStr, section: &CStr| {
         let mut size: libc::c_ulong = 0;
         // SAFETY: `getsectiondata` reads the live header and writes `size`.
@@ -377,13 +403,13 @@ fn last_initializer(header: *const MachHeader64, this: usize) -> bool {
         .filter_map(|segment| read(segment, c"__mod_init_func"))
         .collect();
     if pointer_lists.len() != 1 || read(c"__TEXT", c"__init_offsets").is_some() {
-        return false;
+        return None;
     }
     let (data, size) = pointer_lists[0];
-    let count = size / core::mem::size_of::<usize>();
-    // SAFETY: the section holds `count` rebased pointers; `count >= 1` because `size > 0` and the
-    // section is pointer-sized entries.
-    count > 0 && unsafe { *data.cast::<usize>().add(count - 1) } == this
+    // SAFETY: the section holds `size / 8` rebased pointers, live for the process.
+    let entries = unsafe { core::slice::from_raw_parts(data.cast::<usize>(), size / core::mem::size_of::<usize>()) };
+    let at = entries.iter().position(|&entry| entry == this)?;
+    Some(entries[at + 1..].to_vec())
 }
 
 /// `LC_MAIN`'s `entryoff`, which is relative to the executable's `__TEXT` (the header).

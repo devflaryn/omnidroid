@@ -515,3 +515,32 @@ fn inside_an_app_bundle_the_window_is_refused_by_name() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(stdout.contains("CHILD-WINDOW: refused") && stdout.contains("application bundle"), "{stdout}");
 }
+
+// ------------------------------------------------------------------- a second initializer
+//
+// MEASURED with `otool -s __DATA_CONST __mod_init_func`: in this binary the linker puts this
+// test crate's initializer **after** the constructor, so this is the case where the constructor
+// has to run it itself.
+
+/// Set by [`late_initializer`], a second entry in this binary's `__mod_init_func`.
+static LATE_RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Whether it ran on the main thread, as dyld runs initializers.
+static LATE_ON_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn late_initializer(_argc: i32, _argv: *const *const i8, _envp: *const *const i8, _apple: *const *const i8, _vars: *const c_void) {
+    LATE_RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    LATE_ON_MAIN.store(unsafe { libc::pthread_main_np() } == 1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static LATE: extern "C" fn(i32, *const *const i8, *const *const i8, *const *const i8, *const c_void) = late_initializer;
+
+/// **Every other initializer still runs exactly once, on the main thread, before `main`** -- the
+/// hand-over's promise, since the constructor never returns to dyld. Where this binary's own
+/// initializer lands relative to the constructor is the linker's choice; the test says which.
+#[test]
+fn another_initializer_runs_once_on_the_main_thread_before_main() {
+    assert_eq!(LATE_RAN.load(std::sync::atomic::Ordering::SeqCst), 1, "the other initializer ran a different number of times");
+    assert!(LATE_ON_MAIN.load(std::sync::atomic::Ordering::SeqCst), "it ran off the main thread");
+}
