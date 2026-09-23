@@ -9,8 +9,9 @@
 //! with correct results. `omni-cpu` re-asserts first place after building each jit
 //! (`omni_platform::fault::reassert_precedence`); this binary is the evidence that it works.
 //!
-//! It must be its **own binary with one test** in it: the moment under test is the first jit of the
-//! process, and any earlier test would have taken it.
+//! It must be its **own binary, with the only jit-building test** in it: the moment under test is the
+//! first jit of the process, and any earlier test would have taken it. (The harness's own encoding
+//! self-test also runs here; it builds no jit.)
 #![cfg(all(target_os = "linux", target_arch = "x86_64", feature = "dynarmic"))]
 
 mod harness;
