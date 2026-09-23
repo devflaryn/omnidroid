@@ -218,7 +218,7 @@ pub(super) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// How many times [`random_bytes`] saw `getrandom` return short, and retried `EINTR`.
     ///
@@ -352,6 +352,45 @@ pub(super) mod tests {
         );
     }
 
+    /// **`EINTR` is retried and any other errno is reported, by name** -- `fill_from` driven with
+    /// `getrandom(2)`'s documented contract, because the kernel gives `EINTR` only while it waits
+    /// for the CRNG's first seeding, which a running host is long past (MEASURED: 0 `EINTR` in
+    /// the signal tests above). The source is a script: `-1`/`EINTR`, a 3-byte short fill,
+    /// `-1`/`EINTR`, then the rest; and for the second half, `-1`/`EIO`.
+    #[test]
+    fn eintr_is_retried_and_another_errno_is_reported() {
+        fn fail(errno: i32) -> isize {
+            // SAFETY: this thread's errno slot.
+            unsafe { *libc::__errno_location() = errno };
+            -1
+        }
+        let mut script = 0;
+        let mut out = [0u8; 8];
+        fill_from(&mut out, |rest| {
+            script += 1;
+            match script {
+                1 | 3 => fail(libc::EINTR),
+                2 => {
+                    rest[..3].copy_from_slice(b"abc");
+                    3
+                }
+                _ => {
+                    rest.fill(b'z');
+                    rest.len() as isize
+                }
+            }
+        })
+        .expect("EINTR is retried");
+        assert_eq!(&out, b"abczzzzz");
+        assert_eq!(script, 4, "two EINTRs, one short fill, one final fill");
+
+        let error = fill_from(&mut out, |_| fail(libc::EIO)).expect_err("EIO is not retried");
+        assert!(
+            matches!(error, ProcessError::Errno { errno: libc::EIO, api: "getrandom", .. }),
+            "{error:?}"
+        );
+    }
+
     /// Two draws differ, a short buffer is filled to its end and no further, and an empty one
     /// is a no-op -- on this target, where the shared test in `process` is not ignored any more.
     #[test]
@@ -453,6 +492,11 @@ pub(super) mod tests {
             let lower = (start + 5).min(19);
             set_current_thread_nice(lower).expect("a lower priority is always allowed");
             assert_eq!(current_thread_host_priority().expect("read"), lower);
+            // The oracle is this thread's own kernel id, read here and not through the backend:
+            // a backend that named the wrong task would read back its own wrong answer.
+            // SAFETY: no arguments.
+            let me = unsafe { libc::gettid() }.unsigned_abs();
+            assert_eq!(nice_of(me), lower, "the value did not land on the calling thread");
             assert_eq!(
                 nice_of(bystander_tid),
                 before,
