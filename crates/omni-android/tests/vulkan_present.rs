@@ -5285,8 +5285,12 @@ fn a_host_visible_allocation_is_imported_from_guest_pages_and_a_device_local_one
     assert_eq!(imported.size, 4096, "the guest's own allocationSize travels unrounded");
     assert_eq!(imported.memory_type_index, 2);
     let pointer = imported.host_pointer.expect("a host-visible type is imported");
+    // Rounded up to the import alignment, which is never below the host page: 4096 here, and one
+    // 16 KiB page on Apple silicon, where the pages the guest is handed are 16 KiB.
+    let page = m.up.f.guest.space.page_size() as u64;
     assert_eq!(
-        imported.import_length, 4096,
+        imported.import_length,
+        4096u64.next_multiple_of(page.max(4096)),
         "and the length the driver is given is the size rounded up to the alignment"
     );
 
@@ -5312,10 +5316,10 @@ fn a_host_visible_allocation_is_imported_from_guest_pages_and_a_device_local_one
     assert_eq!(forwarded.import_length, 0);
 
     // The commit charge is exactly the imported allocation's, which is what D15's ceiling now
-    // covers.
+    // covers: the pages mapped for the import, one host page of them.
     let (live, peak) = m.up.f.vulkan().imported_bytes();
-    assert_eq!(live, 4096, "only the imported one is guest commit charge");
-    assert_eq!(peak, 4096);
+    assert_eq!(live as u64, imported.import_length, "only the imported one is guest commit charge");
+    assert_eq!(peak as u64, imported.import_length);
 
     // ---------------------------------------------------- `vkMapMemory` answers for one and not
     // the other.
@@ -5367,7 +5371,11 @@ fn a_host_visible_allocation_is_imported_from_guest_pages_and_a_device_local_one
     // Freeing the imported one gives the guest pages back.
     let free = m.up.f.resolve_device(m.up.get_proc, m.up.device, "vkFreeMemory");
     m.up.f.call(free, [m.up.device, imported_handle, 0, 0]).expect("free");
-    assert_eq!(m.up.f.vulkan().imported_bytes(), (0, 4096), "live falls, the peak does not");
+    assert_eq!(
+        m.up.f.vulkan().imported_bytes(),
+        (0, imported.import_length as usize),
+        "live falls, the peak does not"
+    );
     assert_eq!(m.up.f.vulkan().leaked_import_bytes(), 0);
 }
 
