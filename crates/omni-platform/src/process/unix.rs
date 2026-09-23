@@ -71,3 +71,22 @@ pub(super) fn current_cpu() -> ProcessResult<u32> {
 pub(super) fn cpu_time() -> ProcessResult<Duration> {
     unsupported("cpu_time", "clock_gettime(CLOCK_PROCESS_CPUTIME_ID) on Linux and macOS")
 }
+
+/// Intended: `setpriority(PRIO_PROCESS, gettid(), nice)` on Linux, where a nice value is per
+/// thread and the call is the guest's own; on macOS, whose `setpriority` is per process, a
+/// thread's QoS class or `pthread_setschedparam` -- a mapping decision still to be made.
+pub(super) fn set_current_thread_nice(nice: i32) -> ProcessResult<()> {
+    let _ = nice;
+    unsupported(
+        "set_current_thread_nice",
+        "setpriority(PRIO_PROCESS, gettid(), nice) on Linux; a thread QoS class on macOS",
+    )
+}
+
+/// Intended: `getpriority(PRIO_PROCESS, gettid())` on Linux; the thread's QoS class on macOS.
+pub(super) fn current_thread_host_priority() -> ProcessResult<i32> {
+    unsupported(
+        "current_thread_host_priority",
+        "getpriority(PRIO_PROCESS, gettid()) on Linux; a thread QoS class on macOS",
+    )
+}

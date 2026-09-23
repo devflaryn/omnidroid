@@ -21,4 +21,6 @@
 //!   shard index has to derive one from the thread identity instead, and that is a decision for
 //!   whoever first needs it, not something to guess at here.
 
-pub(super) use super::unix::{cpu_time, current_cpu, random_bytes};
+pub(super) use super::unix::{
+    cpu_time, current_cpu, current_thread_host_priority, random_bytes, set_current_thread_nice,
+};

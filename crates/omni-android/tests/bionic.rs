@@ -582,6 +582,12 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
         "Bound with sem_init: the new FMOD thread's report.",
     ),
     (
+        "setpriority",
+        "M6, FMOD's thread trampoline once its semaphores worked: setpriority(PRIO_PROCESS, 0, -16) \
+         at link 0x4fbcc40, unbound. Applied to the calling host thread through \
+         omni_platform::process::set_current_thread_nice.",
+    ),
+    (
         "ftell",
         "M6, the renderer's shader pack again, after fseek: \"the guest called the imported symbol \
          `ftell` ... nothing in the compatibility layer implements it\". bionic's ftell is ftello \
@@ -998,7 +1004,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 301, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 302, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1090,7 +1096,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // the same stream, bound to `ftello`. **`erfcf`, for 283**: the renderer, `s_erff.c` ported.
     // **`sem_init`, `sem_destroy`, `sem_wait` and `sem_post`, for 287**: FMOD's thread start on
     // the logged-out landing, onto `omni_bionic::sem`, which had never been bound.
-    assert_eq!(Bionic::inline_symbols().count(), 287);
+    // **`setpriority`, for 288**: FMOD's thread trampoline, `PRIO_PROCESS` for the caller.
+    assert_eq!(Bionic::inline_symbols().count(), 288);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -2303,6 +2310,43 @@ fn sigfillset_fills_every_bit_of_the_guests_sigset() {
         0x1234_5678_9ABC_DEF0,
         "and nothing past sizeof(sigset_t), which is 8 on LP64"
     );
+}
+
+/// **`setpriority` for the calling thread answers 0 and changes the host thread's priority**
+/// (FMOD's own call, `PRIO_PROCESS, 0, -16`), and a request for another thread or a process group
+/// is refused by name rather than answered.
+#[test]
+fn setpriority_applies_the_nice_value_to_the_calling_host_thread() {
+    let _guard = serialized();
+    let f = fixture();
+    // On this thread, restored at the end: the level it starts at, the level the guest's call
+    // leaves, and the level the seam itself sets for -16. The guest's call must have **changed**
+    // the level, to the seam's.
+    let level = || omni_platform::process::current_thread_host_priority().expect("the host's level");
+    let baseline = level();
+    let answer = value_of(&f, "setpriority", |asm| {
+        asm.mov(0, 0); // PRIO_PROCESS
+        asm.mov(1, 0); // the calling thread
+        asm.mov(2, (-16i64) as u64);
+    }) as i32;
+    let applied = level();
+    omni_platform::process::set_current_thread_nice(0).expect("restored");
+    let restored = level();
+    omni_platform::process::set_current_thread_nice(-16).expect("the seam applies it");
+    let seam = level();
+    omni_platform::process::set_current_thread_nice(0).expect("restored");
+    assert_eq!(answer, 0, "what a device with RLIMIT_NICE 40 answers");
+    assert_eq!(restored, baseline, "nice 0 is where this thread started");
+    assert_ne!(applied, baseline, "nice -16 changed the host thread's level, not merely answered");
+    assert_eq!(applied, seam, "to the level the seam's mapping gives -16");
+    for (which, who) in [(1u64, 0u64), (0, 9999)] {
+        let error = refusal_of(&f, "setpriority", |asm| {
+            asm.mov(0, which);
+            asm.mov(1, who);
+            asm.mov(2, 0);
+        });
+        assert!(matches!(error, AbiError::Refused { .. }), "which {which}, who {who}: {error:?}");
+    }
 }
 
 /// **`sem_*` through real thunks: a counted semaphore on bionic's one-word `sem_t`**, and the

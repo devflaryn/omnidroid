@@ -9,7 +9,9 @@ use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessorNumber, GetProcessTimes,
+    GetCurrentProcess, GetCurrentProcessorNumber, GetCurrentThread, GetProcessTimes,
+    GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL,
+    THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
 };
 
 use super::{ProcessError, ProcessResult};
@@ -62,6 +64,53 @@ pub(super) fn random_bytes(out: &mut [u8]) -> ProcessResult<()> {
 pub(super) fn current_cpu() -> ProcessResult<u32> {
     // SAFETY: takes no arguments, touches no memory, and cannot fail.
     Ok(unsafe { GetCurrentProcessorNumber() })
+}
+
+/// The Windows priority level, within the normal priority class, a clamped nice value maps to.
+/// See [`super::set_current_thread_nice`] for the table and why it stops short of
+/// `TIME_CRITICAL`.
+fn priority_for_nice(nice: i32) -> i32 {
+    match nice {
+        i32::MIN..=-11 => THREAD_PRIORITY_HIGHEST,
+        -10..=-1 => THREAD_PRIORITY_ABOVE_NORMAL,
+        0 => THREAD_PRIORITY_NORMAL,
+        1..=9 => THREAD_PRIORITY_BELOW_NORMAL,
+        _ => THREAD_PRIORITY_LOWEST,
+    }
+}
+
+/// `SetThreadPriority(GetCurrentThread(), ..)`.
+pub(super) fn set_current_thread_nice(nice: i32) -> ProcessResult<()> {
+    // SAFETY: `GetCurrentThread` returns a pseudo-handle for the calling thread that needs no
+    // close; `SetThreadPriority` reads only it and the level.
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), priority_for_nice(nice)) };
+    if ok == 0 {
+        // SAFETY: no arguments; `SetThreadPriority` is the last call this thread made.
+        let code = unsafe { GetLastError() };
+        return Err(ProcessError::LastError {
+            operation: "set_current_thread_nice",
+            api: "SetThreadPriority",
+            code,
+        });
+    }
+    Ok(())
+}
+
+/// `GetThreadPriority(GetCurrentThread())`.
+pub(super) fn current_thread_host_priority() -> ProcessResult<i32> {
+    // SAFETY: the calling thread's pseudo-handle; only its priority is read.
+    let level = unsafe { GetThreadPriority(GetCurrentThread()) };
+    // `THREAD_PRIORITY_ERROR_RETURN` is `MAXLONG`.
+    if level == i32::MAX {
+        // SAFETY: no arguments; `GetThreadPriority` is the last call this thread made.
+        let code = unsafe { GetLastError() };
+        return Err(ProcessError::LastError {
+            operation: "current_thread_host_priority",
+            api: "GetThreadPriority",
+            code,
+        });
+    }
+    Ok(level)
 }
 
 /// `GetProcessTimes(GetCurrentProcess(), ..)`, kernel time **plus** user time.
@@ -130,4 +179,45 @@ fn filetime_ticks(time: FILETIME) -> u64 {
 fn hundred_nanos(ticks: u64) -> Duration {
     const PER_SECOND: u64 = 10_000_000;
     Duration::new(ticks / PER_SECOND, ((ticks % PER_SECOND) * 100) as u32)
+}
+
+#[cfg(test)]
+mod nice_tests {
+    use super::*;
+
+    /// The table in `set_current_thread_nice`'s documentation, at Android's own named values and
+    /// at each tier's edges.
+    #[test]
+    fn android_priorities_land_in_the_documented_windows_levels() {
+        for (nice, level) in [
+            (-20, THREAD_PRIORITY_HIGHEST),
+            (-19, THREAD_PRIORITY_HIGHEST),
+            (-16, THREAD_PRIORITY_HIGHEST),
+            (-11, THREAD_PRIORITY_HIGHEST),
+            (-10, THREAD_PRIORITY_ABOVE_NORMAL),
+            (-4, THREAD_PRIORITY_ABOVE_NORMAL),
+            (-1, THREAD_PRIORITY_ABOVE_NORMAL),
+            (0, THREAD_PRIORITY_NORMAL),
+            (1, THREAD_PRIORITY_BELOW_NORMAL),
+            (9, THREAD_PRIORITY_BELOW_NORMAL),
+            (10, THREAD_PRIORITY_LOWEST),
+            (19, THREAD_PRIORITY_LOWEST),
+        ] {
+            assert_eq!(priority_for_nice(nice), level, "nice {nice}");
+        }
+    }
+
+    /// Applied, and read back, on a thread of its own.
+    #[test]
+    fn a_nice_value_is_applied_to_the_calling_thread() {
+        std::thread::spawn(|| {
+            assert_eq!(current_thread_host_priority().expect("read"), THREAD_PRIORITY_NORMAL);
+            set_current_thread_nice(-16).expect("applied");
+            assert_eq!(current_thread_host_priority().expect("read"), THREAD_PRIORITY_HIGHEST);
+            set_current_thread_nice(19).expect("applied");
+            assert_eq!(current_thread_host_priority().expect("read"), THREAD_PRIORITY_LOWEST);
+        })
+        .join()
+        .expect("the thread completes");
+    }
 }

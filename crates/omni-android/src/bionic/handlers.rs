@@ -1740,6 +1740,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // `BEYOND_THE_PREDICTION` records it.
     ("localeconv", procenv::localeconv),
     ("sched_getcpu", procenv::sched_getcpu),
+    ("setpriority", procenv::setpriority),
     ("arc4random_buf", procenv::arc4random_buf),
     // M6's network run, one call after `getsockname`: OpenSSL seeding its DRBG for the TLS
     // handshake. The same entropy source as `arc4random_buf` with the interface's own 256-byte

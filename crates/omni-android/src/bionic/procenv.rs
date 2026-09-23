@@ -206,6 +206,59 @@ pub(super) fn getpid(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `PRIO_PROCESS`.
+const PRIO_PROCESS: i32 = 0;
+
+/// `int setpriority(int which, id_t who, int prio)`
+///
+/// MEASURED: FMOD's thread trampoline, `setpriority(PRIO_PROCESS, 0, -16)` at link `0x4fbcc40` --
+/// Android's `THREAD_PRIORITY_AUDIO` for the calling thread, as every FMOD thread starts. The
+/// thread died on it unbound while the render thread waited on a semaphore for it to report its
+/// start, and frames stopped.
+///
+/// **What a device answers is success**: AOSP's `init.rc` sets `setrlimit nice 40 40`, which every
+/// app inherits, so any nice value in `[-20, 19]` is allowed, and Linux clamps values outside it.
+/// So the answer is `0` -- **after** the value is applied: the calling guest thread is this host
+/// thread, and `omni_platform::process::set_current_thread_nice` sets its priority by the seam's
+/// stated mapping. Returning `0` without applying it would be a success with nothing behind it.
+///
+/// Only the calling thread, because that is what a run has asked for: `who` of 0, or the caller's
+/// own `gettid`. Another thread, or `PRIO_PGRP`/`PRIO_USER`, is refused by name.
+pub(super) fn setpriority(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (which, who, prio) = {
+        let mut a = c.args();
+        (a.next_u64()? as i32, a.next_u64()? as u32, a.next_u64()? as i32)
+    };
+    if which != PRIO_PROCESS {
+        return Err(refuse(
+            c,
+            format!(
+                "`setpriority` with `which = {which}`: a process group's or a user's priority is \
+                 not something this layer changes, and no run has asked for one"
+            ),
+        ));
+    }
+    let state = active(c.symbol(), c.address())?;
+    let me = state.bionic.current_thread();
+    let is_me = who == 0 || me.is_some_and(|thread| u64::from(who) == thread.0);
+    if !is_me {
+        return Err(refuse(
+            c,
+            format!(
+                "`setpriority(PRIO_PROCESS, {who}, {prio})` names another thread; this layer applies \
+                 a nice value only to the calling thread, the host thread it runs on, and no run \
+                 has asked for another"
+            ),
+        ));
+    }
+    let nice = prio.clamp(-20, 19);
+    if let Err(error) = omni_platform::process::set_current_thread_nice(nice) {
+        return Err(refuse(c, format!("the host did not apply nice {nice} to this thread: {error}")));
+    }
+    c.ret().i32(0);
+    Ok(())
+}
+
 /// `int getpagesize(void)`
 ///
 /// The page size this guest's address space was built with: the figure `sysconf(_SC_PAGESIZE)`

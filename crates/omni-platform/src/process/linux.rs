@@ -25,4 +25,6 @@
 //!   a wrong cpu id would be hardest to notice, because the guest's `sched_getcpu` and the host's
 //!   would be describing the same physical core.
 
-pub(super) use super::unix::{cpu_time, current_cpu, random_bytes};
+pub(super) use super::unix::{
+    cpu_time, current_cpu, current_thread_host_priority, random_bytes, set_current_thread_nice,
+};

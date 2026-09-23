@@ -148,6 +148,45 @@ pub fn current_cpu() -> ProcessResult<u32> {
     backend::current_cpu()
 }
 
+/// Apply a Linux **nice** value to the calling host thread's scheduling priority.
+///
+/// Serves the guest's `setpriority(PRIO_PROCESS, 0, nice)` -- a nice value for the calling
+/// thread, which on Linux (and so on Android) is per thread. `nice` is clamped to Linux's
+/// `[-20, 19]` first, as the kernel clamps it.
+///
+/// **The two schedulers' scales are not the same scale**, so the mapping is this seam's stated
+/// decision rather than a conversion. On Windows, within the normal priority class:
+///
+/// | nice | Android's names for it | Windows level |
+/// |---|---|---|
+/// | -20 ..= -11 | `URGENT_AUDIO` -19, `AUDIO` -16 | `THREAD_PRIORITY_HIGHEST` |
+/// | -10 ..= -1 | `VIDEO` -10, `URGENT_DISPLAY` -8, `DISPLAY` -4, `FOREGROUND` -2 | `THREAD_PRIORITY_ABOVE_NORMAL` |
+/// | 0 | `DEFAULT` | `THREAD_PRIORITY_NORMAL` |
+/// | 1 ..= 9 | `LESS_FAVORABLE` 1 | `THREAD_PRIORITY_BELOW_NORMAL` |
+/// | 10 ..= 19 | `BACKGROUND` 10, `LOWEST` 19 | `THREAD_PRIORITY_LOWEST` |
+///
+/// Not `THREAD_PRIORITY_TIME_CRITICAL` for the audio values: a nice value is still the fair
+/// scheduler's (CFS) weight on Linux, not a real-time class, and `TIME_CRITICAL` preempts nearly
+/// every normal thread on the machine -- a real-time claim nice never makes.
+///
+/// # Errors
+///
+/// [`ProcessError::Unsupported`] on Linux and macOS, naming the intended call.
+/// [`ProcessError::LastError`] if the OS refuses.
+pub fn set_current_thread_nice(nice: i32) -> ProcessResult<()> {
+    backend::set_current_thread_nice(nice.clamp(-20, 19))
+}
+
+/// The calling host thread's scheduling level, in the host's own numbering (`GetThreadPriority`
+/// on Windows) -- for a test or a diagnostic to see what [`set_current_thread_nice`] did.
+///
+/// # Errors
+///
+/// [`ProcessError::Unsupported`] on Linux and macOS. [`ProcessError::LastError`] if the OS refuses.
+pub fn current_thread_host_priority() -> ProcessResult<i32> {
+    backend::current_thread_host_priority()
+}
+
 /// Processor time this **process** has consumed, across every thread it has ever had.
 ///
 /// What `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` reports on Linux, and therefore what the
