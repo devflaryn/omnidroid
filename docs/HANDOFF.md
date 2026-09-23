@@ -942,6 +942,10 @@ builds. And the process lifecycle: `RobloxApplication.onCreate` registers a
 session record stayed `I` and the next launch died in the engine's inferred-crash report
 (gate109).
 
+**Twenty minutes on a kept install** (gate115, its fourth launch): 7/7, no guest thread killed,
+1,419 presents with no break -- the settled landing at a steady 57 a minute -- both resizes
+delivered, at 8 and 14 minutes, and the device's close at the end.
+
 What a run reaches, every time:
 
 * **The engine's landing screen, drawn by its own renderer, presented to the host window** -- the
@@ -999,7 +1003,12 @@ What a run reaches, every time:
    The `NativeUserJavaInterface` answers are a fresh install's signed-out ones -- DECODED, but a
    signed-in engine may ask the Java side things those answers contradict. Expect refusals; each
    names itself.
-3. **The idle 1 Hz**: decode why before optimising (see above).
+3. **The idle 1 Hz**: decode why before optimising (see above). The engine's own account of its
+   frame pacing (`[FLog::ApplicationFrameRate] ... target: {} ms (user cap, requested, display
+   cap) ... scheduler throttling`) exists, but **no FLog channel has been turned on yet**:
+   `OMNI_CLIENT_APP_SETTINGS` gets its file read and logged, and 12, 1030, "1030" and 65535 all
+   printed nothing (gate115-116). The log site's check is DECODED (`0x61c96a4`: the flag's low byte
+   >= 6 and a bit of `0xfc00`); how a settings value becomes those bits is not.
 4. ~~Background speckle~~ -- **not a rendering defect; resolved**. The white streaks behind the
    Quick Sign-in dialog were the capture's: GDI+ `Graphics.CopyFromScreen` into a 32-bit bitmap
    turns every pixel of exactly RGB(13,11,12) transparent, and the dark backdrop has a few hundred.

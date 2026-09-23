@@ -1085,8 +1085,13 @@ impl Scratch {
         // **OMNI_CLIENT_APP_SETTINGS=<json>: a diagnostic, off by default.** The engine opens
         // `ClientAppSettings.json` (MEASURED: in every run's missing-paths list) -- Roblox's own
         // local flag-override file -- and a device without one is the default this gate keeps.
-        // Set, the JSON is written there verbatim, so a run can turn on an engine log channel
-        // (`{"FLogApplicationFrameRate": 12}`) and read the engine's own account of itself.
+        // Set, the JSON is written there verbatim, for turning on an engine log channel and
+        // reading the engine's own account of itself. **Not yet shown to work for a log**: the
+        // engine logs the file's contents (`LoadClientSettingsFromLocal`), but no `FLog` channel
+        // it named has printed a line -- MEASURED with 12, 1030, "1030" and 65535 (gate115-116).
+        // DECODED, the check at a log site (`FLog::ApplicationFrameRate`, `0x61c96a4`): the
+        // flag's low byte at least 6 **and** a bit of `0xfc00` set; how a settings value becomes
+        // those bits is not decoded.
         if let Some(json) = std::env::var_os("OMNI_CLIENT_APP_SETTINGS") {
             let json = json.into_string().expect("OMNI_CLIENT_APP_SETTINGS is UTF-8 JSON");
             std::fs::create_dir_all(at.join(Self::CLIENT_APP_SETTINGS_DIRECTORY))
