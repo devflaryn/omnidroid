@@ -189,23 +189,6 @@ const fn scancode_of(lparam: LPARAM) -> u32 {
     if (lparam >> 24) & 1 != 0 { 0xE000 | make } else { make }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `W` pressed, as Win32 packs it: a repeat count of 1 in bits 0-15, make code `0x11` in bits
-    /// 16-23; right Ctrl with the extended flag in bit 24; and a key-up's transition bits 30-31,
-    /// which must not leak into the code.
-    #[test]
-    fn the_scancode_is_the_make_code_and_the_extended_flag() {
-        assert_eq!(scancode_of(0x0011_0001), 0x11);
-        assert_eq!(scancode_of(0x011D_0001), 0xE01D);
-        assert_eq!(scancode_of(0x001D_0001), 0x1D, "left Ctrl is not right Ctrl");
-        assert_eq!(scancode_of(0x0148_0001), 0xE048, "the Up arrow, not keypad 8");
-        assert_eq!(scancode_of(0xC011_0001_u32 as i32 as LPARAM), 0x11, "a key-up's high bits");
-    }
-}
-
 /// The window procedure.
 ///
 /// Every arm is a translation into a [`WindowEvent`]; nothing here decides anything. Messages this
@@ -656,5 +639,22 @@ impl Drop for Window {
         // SAFETY: `state` came from `Box::into_raw` in `create` and nothing else owns it. The
         // window is gone, so `wnd_proc` can no longer be entered for it.
         drop(unsafe { Box::from_raw(self.state) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `W` pressed, as Win32 packs it: a repeat count of 1 in bits 0-15, make code `0x11` in bits
+    /// 16-23; right Ctrl with the extended flag in bit 24; and a key-up's transition bits 30-31,
+    /// which must not leak into the code.
+    #[test]
+    fn the_scancode_is_the_make_code_and_the_extended_flag() {
+        assert_eq!(scancode_of(0x0011_0001), 0x11);
+        assert_eq!(scancode_of(0x011D_0001), 0xE01D);
+        assert_eq!(scancode_of(0x001D_0001), 0x1D, "left Ctrl is not right Ctrl");
+        assert_eq!(scancode_of(0x0148_0001), 0xE048, "the Up arrow, not keypad 8");
+        assert_eq!(scancode_of(0xC011_0001_u32 as i32 as LPARAM), 0x11, "a key-up's high bits");
     }
 }
