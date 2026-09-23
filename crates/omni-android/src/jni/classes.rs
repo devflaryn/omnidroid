@@ -218,6 +218,22 @@ pub enum Answer {
     EmptyObjectArray,
     /// Read the named field of the receiver and return it.
     Field(&'static str),
+    /// A callback the **embedding's Java side** handed the engine, `(Ljava/lang/String;)V`: the
+    /// call and its argument are queued for the embedding, which runs the Java method's body on
+    /// its UI thread ([`super::Jni::take_host_calls`]).
+    ///
+    /// What `MessageBus$a.run` and every `memstorage.Callback.onItemSet` the app binds are on a
+    /// device: each parses its argument and **posts** the work to the main looper
+    /// (`Handler.post`), so the engine's thread never waits for it. The receiver must be an object
+    /// the embedding registered ([`super::Jni::new_host_callback`]); any other refuses by name.
+    HostCallback,
+    /// A request handler the embedding's Java side handed the engine,
+    /// `(Ljava/lang/String;)Ljava/lang/String;`: answered **synchronously** with the response the
+    /// embedding registered for the receiver ([`super::Jni::new_host_request_handler`]), and the
+    /// request queued for it as [`HostCallback`](Answer::HostCallback) queues a call.
+    ///
+    /// `MessageBus$b.run` is this: it returns the handler's JSON on the engine's own thread.
+    HostRequest,
     /// The member is on the surface and the host has **not** decided what it answers.
     ///
     /// Calling it is [`AbiError::JniRefused`] naming the class, member and descriptor. Looking it
@@ -626,6 +642,8 @@ impl Registry {
             | Answer::Construct(_)
             | Answer::ShowKeyboard
             | Answer::HideKeyboard
+            | Answer::HostCallback
+            | Answer::HostRequest
             | Answer::Native
             | Answer::Unanswered => return None,
         })

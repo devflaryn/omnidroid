@@ -287,6 +287,11 @@ GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "g
 # recording device. No APK and no audio hardware, so every row costs a build and not a run.
 AAUDIO = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "aaudio", "--no-fail-fast"]
 
+# The Java side's web view (`jni::webview`, and its two answers in `jni::env`): the module's unit
+# tests alone, filtered by path. No APK, no guest and no browser -- the decisions are a state
+# machine and the answers are reached through `env::evaluate` -- so every row costs a build.
+WEBVIEW = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "jni::webview"]
+
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
 GATE_EXITS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
@@ -7113,6 +7118,63 @@ directory", ADAPTER_FILES,
      """    let mut hole = from != at || to != end || from >= to;""",
      """    let mut hole = true;""",
      PROCFS),
+    # The Java side's web view (WebViewProtocol, ri.a and the page's bridge), 2026-09-23. A rows
+    # break what the device does; B rows over-correct in a direction that reads as harmless.
+    ("webview-A1", "A", "isAvailable answers its key unquoted by JSONStringer's rules",
+     "crates/omni-android/src/jni/webview.rs",
+     """format!("{{{}:true}}", json::quote(&self.names.available_key))""",
+     """format!("{{\\"{}\\":true}}", self.names.available_key)""",
+     WEBVIEW),
+    ("webview-A2", "A", "script the engine sends before the page finished runs at once (ri.a.b's queue gone)",
+     "crates/omni-android/src/jni/webview.rs",
+     """Some(fragment) if fragment.loaded && fragment.window =>""",
+     """Some(fragment) if fragment.window =>""",
+     WEBVIEW),
+    ("webview-A3", "A", "openWindow never binds BrowserService.ExecuteJavaScript (ri.a.h)",
+     "crates/omni-android/src/jni/webview.rs",
+     """        actions.push(Action::BindExecuteScript);""",
+     """""",
+     WEBVIEW),
+    ("webview-A4", "A", "the host wraps the page's string itself, so the engine gets it wrapped twice",
+     "crates/omni-android/src/jni/webview.rs",
+     """BrowserEvent::Bridge(text) => vec![Action::Signal(text.clone())],""",
+     """BrowserEvent::Bridge(text) => vec![Action::Signal(format!("{{\\"command\\":{}}}", json::quote(text)))],""",
+     WEBVIEW),
+    ("webview-A5", "A", "the person closing the page never tells the engine (no handleWindowClose)",
+     "crates/omni-android/src/jni/webview.rs",
+     """                vec![Action::PublishWindowClose]""",
+     """                Vec::new()""",
+     WEBVIEW),
+    ("webview-A6", "A", "a call into a callback object is answered and not queued for the UI thread",
+     "crates/omni-android/src/jni/env.rs",
+     """            state.host_calls.push(super::HostCall { tag: entry.tag, argument });""",
+     """            let _ = (entry.tag, argument);""",
+     WEBVIEW),
+    ("webview-A7", "A", "messagebus.Connection.<init>(J)V is left unanswered, so doSubscribeRaw's NewObject refuses",
+     "crates/omni-android/src/jni/webview.rs",
+     """    jni.define(BUS_CONNECTION_CLASS, "<init>", "(J)V", false, Answer::Construct(&[("a", "J")]))?;""",
+     """""",
+     WEBVIEW),
+    ("webview-B1", "B", "a callback object asked for a request's answer returns an empty string",
+     "crates/omni-android/src/jni/env.rs",
+     """                (_, Some(response)) => Ok(Value::Text(response)),""",
+     """                (_, response) => Ok(Value::Text(response.unwrap_or_default())),""",
+     WEBVIEW),
+    ("webview-B2", "B", "quote leaves '/' bare, as json.org does and Android's JSONStringer does not",
+     "crates/omni-android/src/jni/webview.rs",
+     r"""                '"' | '\\' | '/' => {""",
+     r"""                '"' | '\\' => {""",
+     WEBVIEW),
+    ("webview-B3", "B", "a repeated key's first value wins, where JSONObject.put keeps the last",
+     "crates/omni-android/src/jni/webview.rs",
+     """members.iter().rev().find(|(name, _)| name == key)""",
+     """members.iter().find(|(name, _)| name == key)""",
+     WEBVIEW),
+    ("webview-B4", "B", "the user agent's double space before ROBLOX becomes one",
+     "crates/omni-android/src/jni/webview.rs",
+     """{WEBKIT} (KHTML, like Gecko)  ROBLOX""",
+     """{WEBKIT} (KHTML, like Gecko) ROBLOX""",
+     WEBVIEW),
 ]
 
 

@@ -1911,6 +1911,50 @@ pub(super) fn evaluate(
             state.keyboard.push(super::KeyboardRequest::Hide);
             Ok(Value::Void)
         }
+        Answer::HostCallback | Answer::HostRequest => {
+            let refuse = |state: &JniState, why: String| AbiError::JniRefused {
+                function: name.to_string(),
+                address,
+                detail: format!(
+                    "`{}.{}{}`: {why}",
+                    state.registry.class_name(class),
+                    member.name,
+                    member.descriptor
+                ),
+            };
+            let Some(entry) = receiver.and_then(|object| state.host_callbacks.get(&object)).cloned() else {
+                return Err(refuse(
+                    state,
+                    "the receiver is not a callback object the embedding made, so there is no \
+                     Java method body here to run"
+                        .to_string(),
+                ));
+            };
+            // `Value::Long` is how an object parameter arrives: the raw handle (see `ShowKeyboard`).
+            let [Value::Long(raw)] = arguments else {
+                return Err(refuse(state, format!("the arguments are {arguments:?}, not (String)")));
+            };
+            let argument = if *raw == 0 {
+                None
+            } else {
+                let id = state.handles.resolve_id(name, address, *raw as u64)?;
+                match state.handles.object_of(id) {
+                    Some(Object::String(text)) => Some(text.to_string_lossy()),
+                    other => return Err(refuse(state, format!("the argument is {other:?}, not a String"))),
+                }
+            };
+            state.host_calls.push(super::HostCall { tag: entry.tag, argument });
+            match (member.answer, entry.response) {
+                (Answer::HostCallback, _) => Ok(Value::Void),
+                (_, Some(response)) => Ok(Value::Text(response)),
+                (_, None) => Err(refuse(
+                    state,
+                    "the receiver was made as a callback, not a request handler, so it has no \
+                     answer to return"
+                        .to_string(),
+                )),
+            }
+        }
         Answer::Construct(fields) => {
             if fields.len() != arguments.len() {
                 return Err(AbiError::JniRefused {

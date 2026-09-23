@@ -55,6 +55,7 @@ pub mod slots;
 pub mod surface;
 pub mod text;
 pub mod values;
+pub mod webview;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -156,6 +157,26 @@ pub enum KeyboardRequest {
     },
     /// Hide it.
     Hide,
+}
+
+/// One call the engine made into a callback object the embedding's Java side handed it --
+/// [`classes::Answer::HostCallback`] and [`classes::Answer::HostRequest`] -- for the embedding to
+/// run the Java method's body on its UI thread. See [`webview`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCall {
+    /// The tag the embedding registered the object under.
+    pub tag: u32,
+    /// The call's one `String` argument; `None` for Java `null`.
+    pub argument: Option<String>,
+}
+
+/// What the embedding registered a callback object as.
+#[derive(Debug, Clone)]
+pub(crate) struct HostCallbackEntry {
+    /// Its tag, handed back in every [`HostCall`].
+    pub(crate) tag: u32,
+    /// For a request handler, what it answers; `None` for a callback.
+    pub(crate) response: Option<String>,
 }
 
 /// How one earlier run of the app ended, as Android's `ApplicationExitInfo` records it -- what
@@ -286,6 +307,11 @@ pub(crate) struct JniState {
     /// whose generation changes when a slot is reused, so a stale entry can never be read as a
     /// new object's.
     pub(crate) preference_objects: BTreeMap<refs::ObjectId, PreferencesObject>,
+    /// The callback objects the embedding made ([`Jni::new_host_callback`]), by object. Keyed by
+    /// [`refs::ObjectId`] for `preference_objects`'s reason.
+    pub(crate) host_callbacks: BTreeMap<refs::ObjectId, HostCallbackEntry>,
+    /// Calls into them not yet taken by the embedding, oldest first.
+    pub(crate) host_calls: Vec<HostCall>,
 }
 
 impl JniState {
@@ -428,6 +454,8 @@ impl Jni {
                 previous_exits: Vec::new(),
                 shared_preferences: BTreeMap::new(),
                 preference_objects: BTreeMap::new(),
+                host_callbacks: BTreeMap::new(),
+                host_calls: Vec::new(),
             }),
             pool: Mutex::new(pool),
             census: Mutex::new(BTreeMap::new()),
@@ -650,6 +678,112 @@ impl Jni {
     #[must_use]
     pub fn take_keyboard_requests(&self) -> Vec<KeyboardRequest> {
         std::mem::take(&mut self.state.lock().keyboard)
+    }
+
+    /// The calls the engine has made into the embedding's callback objects since the last call,
+    /// oldest first, for the embedding to run on its UI thread. See [`webview`].
+    #[must_use]
+    pub fn take_host_calls(&self) -> Vec<HostCall> {
+        std::mem::take(&mut self.state.lock().host_calls)
+    }
+
+    /// **A callback object of the embedding's Java side**: an instance of `class`, whose methods
+    /// declared [`classes::Answer::HostCallback`] queue a [`HostCall`] carrying `tag`.
+    ///
+    /// Handed back as a **global** reference this instance keeps for its life: the Java object is
+    /// held by whatever the Java side stored it in, and the engine takes its own global reference
+    /// of the ones it keeps. A global may be passed to a native as an argument.
+    ///
+    /// # Errors
+    ///
+    /// An undeclared class, or a full reference table.
+    pub fn new_host_callback(&self, class: &str, tag: u32) -> AbiResult<u64> {
+        self.host_object(class, HostCallbackEntry { tag, response: None })
+    }
+
+    /// **A request handler of the embedding's Java side**: as [`Jni::new_host_callback`], and its
+    /// methods declared [`classes::Answer::HostRequest`] answer `response`.
+    ///
+    /// # Errors
+    ///
+    /// An undeclared class, or a full reference table.
+    pub fn new_host_request_handler(&self, class: &str, tag: u32, response: String) -> AbiResult<u64> {
+        self.host_object(class, HostCallbackEntry { tag, response: Some(response) })
+    }
+
+    fn host_object(&self, class: &str, entry: HostCallbackEntry) -> AbiResult<u64> {
+        const NAME: &str = "Jni::new_host_callback";
+        let mut state = self.state.lock();
+        let Some(id) = state.registry.find(class) else {
+            return Err(AbiError::JniRefused {
+                function: NAME.to_string(),
+                address: self.arena,
+                detail: format!("`{class}` is not declared, so no callback of it can be made"),
+            });
+        };
+        let object = state.handles.create(
+            NAME,
+            self.arena,
+            refs::Object::Instance { class: id, fields: BTreeMap::new() },
+        )?;
+        let global = state.handles.reference_to(NAME, self.arena, refs::RefKind::Global, object)?;
+        state.host_callbacks.insert(object, entry);
+        Ok(global)
+    }
+
+    /// Turn a local reference the host holds -- one a native returned -- into a global this
+    /// instance keeps, and delete the local: what a Java field holding the object amounts to.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniBadHandle`] for a handle that is not a live local of this instance, or a
+    /// full reference table.
+    pub fn promote_to_global(&self, local: u64) -> AbiResult<u64> {
+        const NAME: &str = "Jni::promote_to_global";
+        let mut state = self.state.lock();
+        let object = state.handles.resolve_id(NAME, self.arena, local)?;
+        let global = state.handles.reference_to(NAME, self.arena, refs::RefKind::Global, object)?;
+        state.handles.delete(NAME, self.arena, refs::RefKind::Local, local)?;
+        Ok(global)
+    }
+
+    /// The text of the `java.lang.String` behind `handle`; `None` for `0`, Java `null`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniBadHandle`] for a handle this instance did not issue, and
+    /// [`AbiError::JniRefused`] when the object is not a `String`.
+    pub fn string_of(&self, handle: u64) -> AbiResult<Option<String>> {
+        const NAME: &str = "Jni::string_of";
+        if handle == 0 {
+            return Ok(None);
+        }
+        let state = self.state.lock();
+        match state.handles.object(NAME, self.arena, handle)? {
+            refs::Object::String(text) => Ok(Some(text.to_string_lossy())),
+            other => Err(AbiError::JniRefused {
+                function: NAME.to_string(),
+                address: self.arena,
+                detail: format!("the object is {}, not a java.lang.String", render(&state, other)),
+            }),
+        }
+    }
+
+    /// The exception pending on `thread`'s `JNIEnv`, described and **cleared** -- what a host
+    /// standing in for the Java caller of a native checks when the native returns. On a device
+    /// the exception propagates out of the Java method; the host reports it instead.
+    #[must_use]
+    pub fn take_pending_exception(&self, thread: usize) -> Option<String> {
+        let mut state = self.state.lock();
+        let pending = state.threads.get_mut(thread)?.pending.take()?;
+        const NAME: &str = "Jni::take_pending_exception";
+        let described = match state.handles.object(NAME, self.arena, pending) {
+            Ok(object) => render(&state, object),
+            Err(error) => format!("an exception whose handle does not resolve: {error}"),
+        };
+        // The pending exception is held by a global reference, as `ExceptionClear` releases it.
+        let _ = state.handles.delete(NAME, self.arena, refs::RefKind::Global, pending);
+        Some(described)
     }
 
     /// **The embedding's record of how earlier runs ended**, most recent first -- what the system

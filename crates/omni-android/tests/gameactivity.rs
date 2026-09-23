@@ -42,6 +42,9 @@ use omni_android::jni::classes::Answer;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
 use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput};
 use omni_android::jni::text::TextInput;
+use omni_android::jni::webview::{
+    user_agent, BrowserEvent, BrowserHost, BrowserRequest, BrowserWindow, UserAgentFacts, WebViewProtocol,
+};
 use omni_android::jni::{script, slots, Jni};
 use omni_android::ndk::assets::{AssetSource, ASSET_MANAGER_CLASS};
 use omni_android::ndk::{
@@ -883,6 +886,96 @@ fn define_host_answers(jni: &Jni, display: &Display) {
     for (field, value) in [("widthPixels", display.width_px), ("heightPixels", display.height_px)] {
         jni.define_field("android/util/DisplayMetrics", field, "I", false, Answer::Int(value))
             .unwrap_or_else(|error| panic!("`DisplayMetrics.{field}` is declared: {error}"));
+    }
+}
+
+/// **The facts the app's web view user agent is built from**, from the same decisions the engine
+/// is given: the memory [`GUEST_MEMORY_BUDGET`] (`MemTotal`), the display `DisplayMetrics` answers
+/// (its pixels stand for `Display.getSize` too: one figure, the app's area), its DPI (`xdpi`/`ydpi`
+/// carry `densityDpi`, see [`define_host_answers`]), `Build.MANUFACTURER`/`MODEL`/
+/// `VERSION.RELEASE` by `Build.java`'s rule over [`device_properties`] (`"unknown"` when unset),
+/// and the phone `InitParams.isTablet` answers.
+fn user_agent_facts(display: &Display) -> UserAgentFacts {
+    let properties = device_properties();
+    let property = |name: &str| {
+        properties
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map_or_else(|| "unknown".to_string(), |(_, value)| value.clone())
+    };
+    let density = display.density();
+    UserAgentFacts {
+        total_memory_mb: (GUEST_MEMORY_BUDGET / (1024 * 1024)) as i32,
+        display_size: (display.width_px, display.height_px),
+        dpi: (display.density_dpi(), display.density_dpi()),
+        display_dp: ((display.width_px as f32 / density) as i32, (display.height_px as f32 / density) as i32),
+        manufacturer: property("ro.product.manufacturer"),
+        model: property("ro.product.model"),
+        release: property("ro.build.version.release"),
+        tablet: false,
+        chrome_os: false,
+        tv: false,
+    }
+}
+
+/// **The host's browser for the Java side's web view**: a WebView2 window per page, the size of
+/// the app's window -- the fragment `jk.a0.g` puts up fills the activity's container.
+struct HostBrowser {
+    size: (u32, u32),
+}
+
+impl BrowserHost for HostBrowser {
+    fn open(&mut self, request: &BrowserRequest) -> Result<Box<dyn BrowserWindow>, String> {
+        let view = omni_platform::webview::WebView::open(&omni_platform::webview::WebViewOptions {
+            title: if request.title.is_empty() { "Roblox".to_string() } else { request.title.clone() },
+            url: request.url.clone(),
+            width: self.size.0,
+            height: self.size.1,
+            init_script: Some(request.init_script.clone()),
+            user_agent: Some(request.user_agent.clone()),
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(Box::new(HostPage(view)))
+    }
+}
+
+/// One WebView2 window, as the Java side's web view sees it.
+struct HostPage(omni_platform::webview::WebView);
+
+impl BrowserWindow for HostPage {
+    fn poll(&mut self) -> Vec<BrowserEvent> {
+        use omni_platform::webview::WebViewEvent;
+        let mut events = Vec::new();
+        for event in self.0.poll_events() {
+            match event {
+                // Nothing on the Java side acts on these; `onPageStarted` is only logged there.
+                WebViewEvent::Ready | WebViewEvent::NavigationStarting { .. } => {}
+                WebViewEvent::NavigationCompleted { url, success } => {
+                    events.push(BrowserEvent::PageFinished { url, success });
+                }
+                WebViewEvent::Message(text) => events.push(BrowserEvent::Bridge(text)),
+                // The bridge script posts strings only, so this is some other script's post; the
+                // Java side has no listener for it. Said, not dropped.
+                WebViewEvent::NonStringMessage { json } => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "WEBVIEW: the page posted a non-string ({} chars of JSON); no Java listener takes it",
+                        json.chars().count()
+                    );
+                }
+                WebViewEvent::Closed => events.push(BrowserEvent::Closed),
+                WebViewEvent::Failed(why) => events.push(BrowserEvent::Failed(why)),
+            }
+        }
+        events
+    }
+
+    fn execute_script(&mut self, script: &str) -> Result<(), String> {
+        self.0.execute_script(script).map_err(|error| error.to_string())
+    }
+
+    fn close(&mut self) {
+        self.0.close();
     }
 }
 
@@ -2391,6 +2484,61 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
     }
 
+    // ---- the Java side's web view: `new WebViewProtocol(jk.a0)`, then `fh.c.c()` ----------------
+    //
+    // Where `MainGameActivity.B2` builds it: its UI runnable (`jk.c1`) forces the lazy `fh.c` and
+    // `jk.a0` as the assets start to unpack, before `E2` sends the engine settings. See
+    // `omni_android::jni::webview`. Only with a window: the pages it opens are host windows, and
+    // the headless gate keeps the path it has been measured on. Its failure is reported and the
+    // session goes on without a web view, as the app would go on without a page.
+    let mut web_view: Option<WebViewProtocol> = None;
+    if window.is_some() && row_outcomes.iter().all(|(_, result)| result.is_ok()) {
+        let agent = user_agent(&user_agent_facts(&display));
+        let _ = writeln!(std::io::stderr(), "WEBVIEW: the app's user agent is {agent:?}");
+        let installed = {
+            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+            let _jni = guest.jni.activate().expect("publish the JNI instance");
+            let _ndk = guest.ndk.activate();
+            WebViewProtocol::install(
+                &guest.jni,
+                &guest.boundary,
+                &mut cpu,
+                0,
+                &|symbol| guest.exports.get(symbol).copied(),
+                agent,
+            )
+        };
+        match installed {
+            Ok((protocol, lines)) => {
+                for line in lines {
+                    let _ = writeln!(std::io::stderr(), "WEBVIEW: {line}");
+                }
+                web_view = Some(protocol);
+            }
+            Err(error) => {
+                let _ = writeln!(std::io::stderr(), "WEBVIEW: NOT BUILT, the session has no web view: {error}");
+            }
+        }
+        report_dead_guest_threads(&guest, "after building the web view protocol");
+    }
+    let mut browser = HostBrowser { size: (surface_width as u32, surface_height as u32) };
+    // **OMNI_WEBVIEW_PROBE=<s>: a SYNTHETIC page, opened through the engine's own message bus** at
+    // second `s` of the session: `WebView.openWindow` published as the engine publishes it, with a
+    // `data:` page whose script calls the bridge once; then `WebView.closeWindow` ten seconds later.
+    // It exercises every hop a captcha takes -- the bus to the Java side's subscription, the host's
+    // browser, the bridge object, `signalJavascriptCallback`, the close and `handleWindowClose` --
+    // without an account. Opt-in and said so: the engine receives a `handleJavascriptCallback` it
+    // never asked for.
+    let mut webview_probe: Option<(f32, u8)> = std::env::var("OMNI_WEBVIEW_PROBE").ok().map(|at| {
+        let at = at.trim().parse::<f32>().unwrap_or_else(|_| panic!("OMNI_WEBVIEW_PROBE={at:?} is not a second"));
+        let _ = writeln!(
+            std::io::stderr(),
+            "WEBVIEW PROBE: a SYNTHETIC page will be opened through the engine's bus at +{at}s (OMNI_WEBVIEW_PROBE)"
+        );
+        (at, 0)
+    });
+    let mut webview_signals = 0usize;
+
     // ---- §8 step 12: the engine settings, once there is an engine to take them -------------
     //
     // `MainGameActivity.E2` sends these after `super.onCreate` has created the engine; sent
@@ -3035,7 +3183,64 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 }
             }
         }
+        // **The Java side's web view, on this thread** -- the UI thread, where its callbacks'
+        // `Handler.post`s land on a device: the engine's calls since the last turn, then the page's.
+        if let Some(protocol) = web_view.as_mut() {
+            let pumped = {
+                let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                let _jni = guest.jni.activate().expect("publish the JNI instance");
+                let _ndk = guest.ndk.activate();
+                let probed = match webview_probe.as_mut() {
+                    Some((at, stage)) if *stage < 2 && settle.elapsed().as_secs_f32() >= *at + 10.0 * f32::from(*stage) => {
+                        let (id, json) = if *stage == 0 {
+                            (
+                                protocol.protocol().names().open_window.clone(),
+                                webview_probe_open_message(protocol.protocol().names()),
+                            )
+                        } else {
+                            (protocol.protocol().names().close_window.clone(), "{}".to_string())
+                        };
+                        *stage += 1;
+                        let _ = writeln!(std::io::stderr(), "WEBVIEW PROBE: publishing {id:?}");
+                        protocol.publish_raw(&guest.jni, &guest.boundary, &mut cpu, 0, &id, &json)
+                    }
+                    _ => Ok(()),
+                };
+                probed.and_then(|()| protocol.pump(&guest.jni, &guest.boundary, &mut cpu, 0, &mut browser))
+            };
+            match pumped {
+                Ok(lines) => {
+                    for line in lines {
+                        if line.starts_with("signalJavascriptCallback(") {
+                            webview_signals += 1;
+                        }
+                        let _ = writeln!(std::io::stderr(), "WEBVIEW: {line}");
+                    }
+                }
+                Err(error) => {
+                    let _ = writeln!(std::io::stderr(), "WEBVIEW: a call into the engine failed, no more web view: {error}");
+                    report_dead_guest_threads(&guest, "after a failed web view call");
+                    web_view = None;
+                }
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The page's window, if one is up, closes with the session.
+    drop(web_view);
+    // **The probe, asserted at the end with the rest**: the page's one bridge call has to have
+    // reached `signalJavascriptCallback` and returned.
+    let probe_failure = match webview_probe {
+        Some((at, 0)) => Some(format!("the session ended before the probe's second (+{at}s)")),
+        Some(_) if webview_signals == 0 => Some(
+            "the probe's page was published and its bridge call never reached signalJavascriptCallback".to_string(),
+        ),
+        _ => None,
+    };
+    if let Some(failure) = &probe_failure {
+        let _ = writeln!(std::io::stderr(), "WEBVIEW PROBE: FAILED: {failure}");
+    } else if webview_probe.is_some() {
+        let _ = writeln!(std::io::stderr(), "WEBVIEW PROBE: {webview_signals} bridge call(s) reached the engine");
     }
     if let Some((stop, handle)) = profiler {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3645,6 +3850,35 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         "the app was not closed as a device closes it: {}",
         close_failure.as_deref().unwrap_or_default()
     );
+    assert!(
+        probe_failure.is_none(),
+        "OMNI_WEBVIEW_PROBE: {}",
+        probe_failure.as_deref().unwrap_or_default()
+    );
+}
+
+/// The `WebView.openWindow` message `OMNI_WEBVIEW_PROBE` publishes, in the keys the engine named: a `data:` page whose script calls the bridge once, with the Roblox hybrid bridge's
+/// command shape (`cl.d.e` reads `moduleID`, `functionName`, `params`, `callbackID`).
+fn webview_probe_open_message(names: &omni_android::jni::webview::ProtocolNames) -> String {
+    let page = "<!doctype html><meta charset=\"utf-8\"><title>Omnidroid web view probe</title>\
+                <p>Omnidroid web view probe: this page calls the app's bridge once.</p>\
+                <script>__globalRobloxAndroidBridge__.executeRoblox(JSON.stringify(\
+                {moduleID:\"OmnidroidProbe\",functionName:\"ping\",params:{},callbackID:\"probe-1\"}));</script>";
+    let encoded: String = page
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => char::from(byte).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect();
+    use omni_android::jni::webview::json::quote;
+    format!(
+        "{{{}:{},{}:{}}}",
+        quote(&names.url_key),
+        quote(&format!("data:text/html,{encoded}")),
+        quote(&names.title_key),
+        quote("Omnidroid web view probe")
+    )
 }
 
 /// The bytes **before** an address a refusal named as unreadable.
