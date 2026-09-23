@@ -32,20 +32,30 @@
 //! makes the pointer safe to store. A second mapping per call would leak one per call and hand
 //! the guest a different answer each time.
 //!
-//! # The one that refuses, and why it is the one that matters
+//! # `AAsset_openFileDescriptor` answers what a device answers: -1 for a compressed asset
 //!
 //! `AAsset_openFileDescriptor(asset, &start, &length)` gives back a descriptor into the **APK
 //! file itself** with the asset's offset and length, and the caller then `mmap`s or `pread`s it.
-//! That only works for an asset stored **uncompressed and page-aligned**, and M0 measured this
-//! APK: *every* entry is DEFLATED, and exactly one entry in the whole archive is directly
-//! mappable — a 1,447-byte icon. There is no offset into the file at which this asset's bytes
-//! appear.
+//! That only works for an asset stored **uncompressed**, and M0 measured this APK: *every* entry
+//! is DEFLATED, and exactly one entry in the whole archive is directly mappable — a 1,447-byte
+//! icon. There is no offset into any file at which a deflated asset's bytes appear.
 //!
-//! So it refuses by name, and this is the member of the family where that matters most: the
-//! believable wrong answer is a descriptor on a temporary file with `start = 0`, which *works*,
-//! and which quietly turns every asset read into a host file write. A caller that receives `-1`
-//! falls back to `AAsset_read`, which is what `AAsset_openFileDescriptor`'s own documentation
-//! tells it to do for a compressed asset.
+//! A device answers **-1** for such an asset: `AAsset_openFileDescriptor` asks the asset, and a
+//! compressed asset is the base `Asset::openFileDescriptor`, which is `return -1`
+//! (`frameworks/base/libs/androidfw/Asset.cpp`). The engine runs on devices with this very APK,
+//! so -1 is what it meets there, and its fallback is `AAsset_read` -- which is what the NDK tells
+//! a caller to do. So that is the answer here, for every asset the source says is in no file
+//! ([`AssetPlacement::NotInAnyFile`]).
+//!
+//! An asset **stored** in its package gets what a device gives it (`_FileAsset::
+//! openFileDescriptor`): a new read-only descriptor on the package, positioned at 0, with the
+//! asset's offset and length in `outStart` and `outLength`. MEASURED: the engine's shader pack,
+//! `shaders/shaders_vulkan_mobile.pack`, is stored -- so M0's "every entry is DEFLATED" was true
+//! of what it counted and not of this entry. The package is opened at the **guest** path the
+//! source names, through the guest's own descriptor table, so the guest reads it, maps it and
+//! closes it as it would on a device. The believable wrong answer is still refused: a descriptor
+//! on a temporary copy with `start = 0` would work and quietly turn every asset read into a host
+//! file write.
 
 use std::sync::Arc;
 
@@ -71,6 +81,32 @@ pub trait AssetSource: Send + Sync + core::fmt::Debug {
     /// an asset means inflating all of it, and a streaming interface here would be a decompressor
     /// pretending to be a file.
     fn read(&self, name: &[u8]) -> Option<Vec<u8>>;
+
+    /// Where an asset's bytes lie, which is what `AAsset_openFileDescriptor` asks -- or `None` if
+    /// there is no such asset.
+    ///
+    /// **No default**: whether an asset is stored or compressed in its package is a fact about the
+    /// package, and only the embedding holding it can say.
+    fn placement(&self, name: &[u8]) -> Option<AssetPlacement>;
+}
+
+/// Whether a file holds an asset's bytes as they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssetPlacement {
+    /// No file does: the asset is compressed in its package, or its source has no package at
+    /// all. A device answers `AAsset_openFileDescriptor` with -1.
+    NotInAnyFile,
+    /// Stored uncompressed in its package: a device hands out a descriptor on the package with the
+    /// asset's offset and length in it.
+    StoredInPackage {
+        /// The package's path **as the guest sees it** -- a device's `base.apk` -- which the
+        /// embedding must have placed in the guest's filesystem.
+        package: String,
+        /// Where the asset's bytes start in the package.
+        offset: u64,
+        /// How many bytes they are.
+        length: u64,
+    },
 }
 
 /// One `AAssetManager`: which Java `AssetManager` it came from.
@@ -518,25 +554,112 @@ fn asset_get_buffer(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
 /// `int AAsset_openFileDescriptor(AAsset *asset, off_t *outStart, off_t *outLength)`
 ///
-/// **Refused by name.** See this module's documentation: it gives back a descriptor into the APK
-/// with the asset's offset, which only works for an asset stored uncompressed, and M0 measured
-/// that *every* entry in this APK is DEFLATED. The believable wrong answer — a descriptor on a
-/// temporary file with `start = 0` — works, and quietly turns every asset read into a host file
-/// write.
+/// **-1 for an asset no file holds as it is**, which is a device's answer for a compressed one,
+/// and **a read-only descriptor on the package** for one stored in it -- see this module's
+/// documentation. MEASURED reader: the engine's renderer, once its device and swapchain existed,
+/// for its shader pack. After -1, `outStart` and `outLength` are not written: a device writes the
+/// two uninitialised locals `Asset::openFileDescriptor` left alone, which is to say nothing a
+/// caller may read.
 fn asset_open_file_descriptor(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (asset, out_start, out_length) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
     let ndk = active(c.symbol(), c.address())?;
     count(&ndk, "AAsset_openFileDescriptor");
-    Err(refuse_inline(
-        c,
-        "`AAsset_openFileDescriptor` hands back a descriptor into the APK with the asset's own \
-         offset and length, and that is only possible for an asset stored UNCOMPRESSED. M0 \
-         measured this APK: every entry is DEFLATED, and exactly one entry in the whole archive \
-         is directly mappable -- a 1,447-byte icon. There is no offset in any file at which this \
-         asset's bytes appear. A descriptor on a temporary copy with start = 0 would work and \
-         would turn every asset read into a host file write; the NDK's own documentation tells a \
-         caller that receives -1 to fall back to AAsset_read, which this layer implements"
-            .to_string(),
-    ))
+    let name = {
+        let state = ndk.state.lock();
+        let at = GuestAddr::try_from(asset).ok().unwrap_or(0);
+        state
+            .assets
+            .get(at)
+            .ok_or_else(|| {
+                refuse_inline(
+                    c,
+                    format!(
+                        "`AAsset_openFileDescriptor` was given {asset:#x}, which is not an open \
+                         AAsset"
+                    ),
+                )
+            })?
+            .name
+            .clone()
+    };
+    let source = ndk.asset_source.get().expect("an asset is open, so a source was supplied");
+    match source.placement(&name) {
+        Some(AssetPlacement::NotInAnyFile) => {
+            let mut state = ndk.state.lock();
+            let thread = Ndk::thread_index(&mut state);
+            let at = GuestAddr::try_from(asset).ok().unwrap_or(0);
+            state.record(at, thread, "openFileDescriptor", format!("{}: -1", show(&name)));
+            drop(state);
+            c.ret().i32(-1);
+            Ok(())
+        }
+        Some(AssetPlacement::StoredInPackage { package, offset, length }) => {
+            // The two outputs are admitted before a descriptor exists, so a bad pointer cannot
+            // leave one open that nothing will close.
+            let blame = Blame::new(c.symbol(), c.address(), 1);
+            let mut outputs = Vec::with_capacity(2);
+            for (field, pointer) in [("outStart", out_start), ("outLength", out_length)] {
+                let at = GuestAddr::try_from(pointer).ok().filter(|at| *at != 0).ok_or_else(|| {
+                    refuse_inline(
+                        c,
+                        format!(
+                            "`AAsset_openFileDescriptor` on {} with `{field} = {pointer:#x}`: a \
+                             device writes the asset's place there and would fault",
+                            show(&name)
+                        ),
+                    )
+                })?;
+                c.mem().checked_ptr(at, 8, true, blame)?;
+                outputs.push(at);
+            }
+            let bionic = crate::bionic::active(c.symbol(), c.address())?;
+            let fs = bionic.bionic.filesystem().ok_or_else(|| {
+                refuse_inline(
+                    c,
+                    "this guest instance has no filesystem root, so the package a stored asset \
+                     lives in cannot be opened for it"
+                        .to_string(),
+                )
+            })?;
+            let read_only = omni_platform::fs::OpenFlags { read: true, ..Default::default() };
+            let fd = fs.open(package.as_bytes(), read_only).map_err(|error| {
+                refuse_inline(
+                    c,
+                    format!(
+                        "`AAsset_openFileDescriptor` on {}, stored in the package the source names \
+                         as {package}, which the guest's filesystem cannot open: {error}. The \
+                         embedding places the package there -- a device's `base.apk`",
+                        show(&name)
+                    ),
+                )
+            })?;
+            c.mem().write_u64(outputs[0], offset, blame)?;
+            c.mem().write_u64(outputs[1], length, blame)?;
+            let mut state = ndk.state.lock();
+            let thread = Ndk::thread_index(&mut state);
+            let at = GuestAddr::try_from(asset).ok().unwrap_or(0);
+            state.record(
+                at,
+                thread,
+                "openFileDescriptor",
+                format!("{}: fd {fd} on {package} at {offset}, {length} bytes", show(&name)),
+            );
+            drop(state);
+            c.ret().i32(fd);
+            Ok(())
+        }
+        None => Err(refuse_inline(
+            c,
+            format!(
+                "`AAsset_openFileDescriptor` on {}, which is open but which its source no longer \
+                 knows -- a source that changed under an open asset",
+                show(&name)
+            ),
+        )),
+    }
 }
 
 /// Every asset symbol serviced **inside** the run loop.
@@ -562,6 +685,10 @@ pub struct NoAssets;
 
 impl AssetSource for NoAssets {
     fn read(&self, _name: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn placement(&self, _name: &[u8]) -> Option<AssetPlacement> {
         None
     }
 }
@@ -602,6 +729,11 @@ impl AssetTable {
 impl AssetSource for AssetTable {
     fn read(&self, name: &[u8]) -> Option<Vec<u8>> {
         self.entries.get(name).cloned()
+    }
+
+    /// A table has no package, so no file holds its bytes.
+    fn placement(&self, name: &[u8]) -> Option<AssetPlacement> {
+        self.entries.contains_key(name).then_some(AssetPlacement::NotInAnyFile)
     }
 }
 

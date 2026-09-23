@@ -62,7 +62,7 @@ use crate::mem::{Blame, GuestMem};
 
 use handles::Slots;
 
-pub use assets::{AssetSource, OpenAsset};
+pub use assets::{AssetPlacement, AssetSource, OpenAsset};
 pub use config::{DeviceConfiguration, ScreenSize, ACONFIGURATION_NAVHIDDEN_NO,
     ACONFIGURATION_NAVHIDDEN_YES};
 pub use handles::{SLOT_BYTES, SLOT_MAGIC};

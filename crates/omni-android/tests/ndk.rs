@@ -1218,20 +1218,150 @@ fn asset_get_buffer_maps_the_bytes_once_and_the_guest_can_read_them() {
     );
 }
 
-/// **`AAsset_openFileDescriptor` refuses, and the refusal explains the measurement behind it.**
+/// **`AAsset_openFileDescriptor` answers -1 for an asset no file holds as it is**, which is a
+/// device's answer for a compressed asset -- every asset in this APK -- and leaves `outStart` and
+/// `outLength` alone. An asset its source says is stored in its package refuses by name, and so
+/// does a pointer that is not an open asset.
 #[test]
-fn asset_open_file_descriptor_refuses_because_every_entry_is_deflated() {
+fn asset_open_file_descriptor_is_minus_one_for_an_asset_in_no_file() {
     let _guard = serialized();
-    let (f, _object) = with_assets("fd");
-    let error = f.refusal_of("AAsset_openFileDescriptor", |asm| {
+    let (f, object) = with_assets("fd");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
         asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"shaders/blit.vert\0");
+    let asset = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 2);
+    });
+    assert_ne!(asset, 0);
+    let out = f.guest.data + 0x100;
+    f.guest.write_u64(out, 0x5EED);
+    f.guest.write_u64(out + 8, 0x5EED);
+    let fd = f.value_of("AAsset_openFileDescriptor", |asm| {
+        asm.mov(0, asset);
+        asm.mov(1, out as u64);
+        asm.mov(2, (out + 8) as u64);
+    });
+    assert_eq!(fd as i32, -1, "a device's answer for a compressed asset");
+    assert_eq!(f.guest.read_u64(out), 0x5EED, "outStart left alone");
+    assert_eq!(f.guest.read_u64(out + 8), 0x5EED, "outLength left alone");
+
+    let error = f.refusal_of("AAsset_openFileDescriptor", |asm| {
+        asm.mov(0, 0x40);
         asm.mov(1, 0);
         asm.mov(2, 0);
     });
-    assert_eq!(error.symbol(), Some("AAsset_openFileDescriptor"));
-    let text = error.to_string();
-    assert!(text.contains("DEFLATED"), "{text}");
-    assert!(text.contains("AAsset_read"), "it must name the fallback: {text}");
+    assert!(error.to_string().contains("not an open"), "{error}");
+}
+
+/// **An asset stored uncompressed in its package is a read-only descriptor on the package**, with
+/// the asset's offset and length written out -- a device's `_FileAsset::openFileDescriptor` -- and
+/// the guest reads the asset's bytes at that offset through its own `pread`. A package the
+/// guest's filesystem does not have refuses, naming the path.
+#[test]
+fn asset_open_file_descriptor_on_a_stored_asset_is_a_descriptor_on_its_package() {
+    #[derive(Debug)]
+    struct Stored(&'static str);
+    impl omni_android::ndk::AssetSource for Stored {
+        fn read(&self, _name: &[u8]) -> Option<Vec<u8>> {
+            Some(b"stored".to_vec())
+        }
+        fn placement(&self, _name: &[u8]) -> Option<omni_android::ndk::AssetPlacement> {
+            Some(omni_android::ndk::AssetPlacement::StoredInPackage {
+                package: self.0.to_string(),
+                offset: 7,
+                length: 6,
+            })
+        }
+    }
+    let _guard = serialized();
+    let f = fixture("fd-stored");
+    std::fs::create_dir_all(f._root.0.join("data/app")).expect("a package directory");
+    std::fs::write(f._root.0.join("data/app/base.apk"), b"HEADER:stored:TRAILER").expect("a package");
+    f.ndk
+        .set_asset_source(omni_android::ndk::assets::source(Stored("/data/app/base.apk")))
+        .expect("a source");
+    f.ndk.set_configuration(a_configuration());
+    let object = f.jni.new_object(ASSET_MANAGER_CLASS).expect("a Java AssetManager");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"shaders/pack\0");
+    let asset = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 2);
+    });
+    let out = f.guest.data + 0x100;
+    let fd = f.value_of("AAsset_openFileDescriptor", |asm| {
+        asm.mov(0, asset);
+        asm.mov(1, out as u64);
+        asm.mov(2, (out + 8) as u64);
+    }) as i32;
+    assert!(fd >= 0, "a descriptor, not {fd}");
+    assert_eq!(f.guest.read_u64(out), 7, "outStart: where the asset starts in the package");
+    assert_eq!(f.guest.read_u64(out + 8), 6, "outLength");
+    let buf = f.guest.data + 0x200;
+    let read = f.value_of("pread", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, buf as u64);
+        asm.mov(2, 6);
+        asm.mov(3, 7);
+    });
+    assert_eq!(read, 6);
+    assert_eq!(read_bytes(&f, buf, 6), b"stored", "the asset's bytes, at its offset in the package");
+    let closed = f.value_of("close", |asm| {
+        asm.mov(0, fd as u64);
+    });
+    assert_eq!(closed as i32, 0, "the guest's to close");
+}
+
+/// **A stored asset whose package is not in the guest's filesystem refuses, naming the path.**
+#[test]
+fn asset_open_file_descriptor_refuses_a_package_the_guest_cannot_open() {
+    #[derive(Debug)]
+    struct Stored;
+    impl omni_android::ndk::AssetSource for Stored {
+        fn read(&self, _name: &[u8]) -> Option<Vec<u8>> {
+            Some(b"stored".to_vec())
+        }
+        fn placement(&self, _name: &[u8]) -> Option<omni_android::ndk::AssetPlacement> {
+            Some(omni_android::ndk::AssetPlacement::StoredInPackage {
+                package: "/data/app/absent.apk".to_string(),
+                offset: 0,
+                length: 6,
+            })
+        }
+    }
+    let _guard = serialized();
+    let f = fixture("fd-absent");
+    f.ndk.set_asset_source(omni_android::ndk::assets::source(Stored)).expect("a source");
+    f.ndk.set_configuration(a_configuration());
+    let object = f.jni.new_object(ASSET_MANAGER_CLASS).expect("a Java AssetManager");
+    let manager = f.value_of("AAssetManager_fromJava", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, object);
+    });
+    let name = f.guest.data + 0x80;
+    f.guest.write_bytes(name, b"icon.png\0");
+    let asset = f.value_of("AAssetManager_open", |asm| {
+        asm.mov(0, manager);
+        asm.mov(1, name as u64);
+        asm.mov(2, 2);
+    });
+    let out = f.guest.data + 0x100;
+    let error = f.refusal_of("AAsset_openFileDescriptor", |asm| {
+        asm.mov(0, asset);
+        asm.mov(1, out as u64);
+        asm.mov(2, (out + 8) as u64);
+    });
+    assert!(error.to_string().contains("/data/app/absent.apk"), "{error}");
 }
 
 /// The open-asset ceiling answers **null**, which is how a device reports failing to open one.

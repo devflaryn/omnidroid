@@ -263,6 +263,9 @@ fn main_lib_bytes() -> &'static [u8] {
 
 // ====================================================================== the real APK's assets
 
+/// Where the package's own APK is, as the guest sees it: a device's `base.apk`.
+const GUEST_APK: &str = "/data/app/com.roblox.client/base.apk";
+
 /// The engine's own assets, out of the real APK.
 ///
 /// **The real thing rather than a table**, because what `AAssetManager_open` is asked for is one
@@ -284,6 +287,23 @@ impl AssetSource for ApkAssets {
         let name = std::str::from_utf8(name).ok()?;
         let apk = self.apk.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         apk.read_asset(name).ok()
+    }
+
+    /// The entry's own compression method and place, out of the real APK's central directory.
+    /// A stored entry lives in the package at [`GUEST_APK`], where the gate links the real APK.
+    fn placement(&self, name: &[u8]) -> Option<omni_android::ndk::AssetPlacement> {
+        let name = std::str::from_utf8(name).ok()?;
+        let apk = self.apk.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = apk.asset_entry(name)?;
+        Some(if entry.is_stored() {
+            omni_android::ndk::AssetPlacement::StoredInPackage {
+                package: GUEST_APK.to_string(),
+                offset: entry.payload_offset(),
+                length: entry.uncompressed_size(),
+            }
+        } else {
+            omni_android::ndk::AssetPlacement::NotInAnyFile
+        })
     }
 }
 
@@ -679,8 +699,13 @@ impl Scratch {
         for directory in Self::DIRECTORIES {
             std::fs::create_dir_all(at.join(directory)).expect("an app directory");
         }
-        std::fs::write(at.join("data/app/com.roblox.client/base.apk"), b"")
-            .expect("a placeholder for the package's own apk");
+        // **The package's own APK, where a device has it.** A hard link, so it costs nothing:
+        // MEASURED, the engine asks `AAsset_openFileDescriptor` for its shader pack, which is
+        // STORED in the APK, and a device answers with a descriptor on `base.apk` and the
+        // entry's offset -- so the guest must be able to open the real bytes at that path. This
+        // was an empty placeholder while only its existence was read.
+        std::fs::hard_link(apk_path(), at.join(GUEST_APK.trim_start_matches('/')))
+            .expect("the real APK linked into the guest's root at its device path");
         // The certificate authorities, out of the APK and into the path the engine opens. See
         // `CA_BUNDLE_IN_APK` for why this is the host's job and why the bytes are the APK's own.
         let apk = omni_apk::Apk::open(apk_path()).expect("the real APK");
