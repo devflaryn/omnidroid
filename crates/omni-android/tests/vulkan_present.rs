@@ -350,6 +350,12 @@ struct HostLog {
     cache_initial_data: Vec<Vec<u8>>,
     /// Every `vkGetPipelineCacheData` that reached the host.
     cache_reads: Vec<(HostDevice, HostPipelineCache)>,
+    /// Every semaphore created and not yet destroyed: the child `destroy_device` refuses over.
+    live_semaphores: Vec<HostSemaphore>,
+    /// Every queue token `vkGetDeviceQueue` handed out, once each.
+    queues_handed: Vec<HostQueue>,
+    /// Every device a `vkDestroyDevice` actually destroyed.
+    devices_destroyed: Vec<HostDevice>,
 
     // ---------------------------------------------------------------------------- stage 5
     /// Every `vkAllocateMemory`, as the shim decoded it, with the token it was answered with —
@@ -510,6 +516,7 @@ impl VulkanHost for StageFourHost {
             || name.starts_with("vkEnumerate")
             || name == "vkCreateWin32SurfaceKHR"
             || name == "vkDestroySurfaceKHR"
+            || name == "vkDestroyDevice"
             || name == "vkCreateDevice")
     }
 
@@ -634,7 +641,33 @@ impl VulkanHost for StageFourHost {
     }
 
     fn device_queue(&self, _d: HostDevice, family: u32, index: u32) -> AbiResult<HostQueue> {
-        Ok(HostQueue::from_token((u64::from(family) << 32) | u64::from(index)))
+        let queue = HostQueue::from_token((u64::from(family) << 32) | u64::from(index));
+        let mut log = self.log();
+        if !log.queues_handed.contains(&queue) {
+            log.queues_handed.push(queue);
+        }
+        Ok(queue)
+    }
+
+    /// **Refuses while a semaphore lives**, standing in for the real host's check of every child
+    /// family -- which is the live test's to exercise, against `GfxVulkanHost`. What this lets a
+    /// test see is the guest side of a refusal (nothing forgotten, nothing destroyed) and of a
+    /// success (once, and the queues this double handed out go with the device).
+    fn destroy_device(&self, device: HostDevice) -> AbiResult<Vec<HostQueue>> {
+        let mut log = self.log();
+        if !log.live_semaphores.is_empty() {
+            return Err(AbiError::Refused {
+                symbol: "vkDestroyDevice".to_string(),
+                address: 0,
+                why: format!(
+                    "{device:?} still has objects created from it: {} `VkSemaphore`",
+                    log.live_semaphores.len()
+                ),
+            });
+        }
+        log.devices_destroyed.push(device);
+        log.destroyed.push("vkDestroyDevice".to_string());
+        Ok(std::mem::take(&mut log.queues_handed))
     }
 
     fn has_device_proc(&self, _device: HostDevice, name: &str) -> AbiResult<bool> {
@@ -899,10 +932,13 @@ impl VulkanHost for StageFourHost {
         _device: HostDevice,
         _flags: u32,
     ) -> AbiResult<DriverAnswer<HostSemaphore>> {
-        Ok(DriverAnswer::Ok(HostSemaphore::from_token(self.token())))
+        let semaphore = HostSemaphore::from_token(self.token());
+        self.log().live_semaphores.push(semaphore);
+        Ok(DriverAnswer::Ok(semaphore))
     }
 
-    fn destroy_semaphore(&self, _semaphore: HostSemaphore) -> AbiResult<()> {
+    fn destroy_semaphore(&self, semaphore: HostSemaphore) -> AbiResult<()> {
+        self.log().live_semaphores.retain(|live| *live != semaphore);
         self.note("vkDestroySemaphore");
         Ok(())
     }
@@ -2619,6 +2655,78 @@ fn a_pipeline_cache_is_read_by_the_two_call_idiom_and_a_short_buffer_gets_nothin
     let text = up.f.refusal(get_data, &[up.device, cache, size_at, 0]).to_string();
     assert!(text.contains("`VkPipelineCache`"), "{text}");
     up.f.call(destroy, [up.device, reloaded, 0, 0]).expect("destroy the reloaded one");
+}
+
+// ============================================================================= vkDestroyDevice
+
+/// **A device is destroyed once, only after its children, and its handles -- the device's and its
+/// queues' -- go with it.**
+///
+/// Measured: the engine's render thread tears its device down on `APP_CMD_TERM_WINDOW`, after
+/// saving its pipeline cache, through the thunk `vkGetInstanceProcAddr` handed out. This test owns
+/// the guest side:
+///
+/// * `VK_NULL_HANDLE` is the specified no-op, and reaches no host;
+/// * a wild `VkDevice` and a guest allocator refuse, and reach no host;
+/// * a device the host refuses -- here, over a live semaphore -- keeps its handle and its queue's,
+///   and the refusal names the child;
+/// * once the child is gone the host destroys the device **once**, and the guest's `VkDevice` and
+///   `VkQueue` handles stop being handles: each is then a refusal naming it.
+///
+/// The host's own check of every child family is the live test's, against `GfxVulkanHost`.
+#[test]
+fn a_device_is_destroyed_once_after_its_children_and_its_queues_go_with_it() {
+    let _serial = serialized();
+    let up = up_to_a_device("destroy-device");
+    // Through `vkGetInstanceProcAddr`, as the engine was measured reaching it.
+    let destroy = up.f.resolve(up.entry_point, up.instance, "vkDestroyDevice");
+    let create_semaphore = up.f.resolve_device(up.get_proc, up.device, "vkCreateSemaphore");
+    let destroy_semaphore = up.f.resolve_device(up.get_proc, up.device, "vkDestroySemaphore");
+    let wait_idle = up.f.resolve_device(up.get_proc, up.device, "vkQueueWaitIdle");
+    let get_queue = up.f.resolve(up.entry_point, up.instance, "vkGetDeviceQueue");
+    assert_eq!(up.f.vulkan().device_handles().len(), 1);
+    assert_eq!(up.f.vulkan().queue_handles().len(), 1);
+
+    // `VK_NULL_HANDLE`: the specified no-op.
+    up.f.call(destroy, [0, 0, 0, 0]).expect("a null destroy is a no-op");
+    // A handle this layer did not issue, and a guest allocator.
+    let wild = up.device + HANDLE_SLOT_BYTES as u64;
+    let text = up.f.refusal(destroy, &[wild, 0]).to_string();
+    assert!(text.contains("`VkDevice`"), "it names the family: {text}");
+    assert!(text.contains(&format!("{wild:#x}")), "and the handle: {text}");
+    let text = up.f.refusal(destroy, &[up.device, 0x1000]).to_string();
+    assert!(text.contains("pAllocator"), "{text}");
+    assert!(up.host.log().devices_destroyed.is_empty(), "none of the three reached a host destroy");
+
+    // **A live child: refused, naming it, and nothing is taken back.**
+    let out = up.f.alloc(8);
+    let info = up.f.flags_only_info(STYPE_SEMAPHORE_CREATE_INFO, 0);
+    up.f.call(create_semaphore, [up.device, info, 0, out]).expect("a semaphore");
+    let semaphore = up.f.guest.read_u64(out as GuestAddr);
+    let text = up.f.refusal(destroy, &[up.device, 0]).to_string();
+    assert!(text.contains("VkSemaphore"), "the refusal names the live child: {text}");
+    assert!(up.host.log().devices_destroyed.is_empty(), "the device was not destroyed");
+    assert_eq!(up.f.vulkan().device_handles().len(), 1, "and its handle still names it");
+    assert_eq!(up.f.vulkan().queue_handles().len(), 1, "and so does its queue's");
+    up.f.call(wait_idle, [up.queue, 0, 0, 0]).expect("the queue is still usable");
+
+    // **The child first, then the device: destroyed once, and its handles go with it.**
+    up.f.call(destroy_semaphore, [up.device, semaphore, 0, 0]).expect("destroy the semaphore");
+    up.f.call(destroy, [up.device, 0, 0, 0]).expect("destroy the device");
+    assert_eq!(up.host.log().devices_destroyed, vec![HostDevice::from_token(0)], "once");
+    assert!(up.f.vulkan().device_handles().is_empty(), "the device's slot is free");
+    assert!(up.f.vulkan().queue_handles().is_empty(), "and its queue's handle went with it");
+
+    // **Stale handles name nothing.** A second destroy, a queue lookup and a queue wait.
+    let text = up.f.refusal(destroy, &[up.device, 0]).to_string();
+    assert!(text.contains("`VkDevice`"), "{text}");
+    assert!(text.contains("0 live one(s)"), "{text}");
+    assert_eq!(up.host.log().devices_destroyed.len(), 1, "the host was asked once, not twice");
+    let queue_at = up.f.alloc(8);
+    let text = up.f.refusal(get_queue, &[up.device, 0, 0, queue_at]).to_string();
+    assert!(text.contains("`VkDevice`"), "{text}");
+    let text = up.f.refusal(wait_idle, &[up.queue, 0, 0, 0]).to_string();
+    assert!(text.contains("`VkQueue`"), "a destroyed device's queue names nothing: {text}");
 }
 
 // ======================================================================= vkAcquireNextImageKHR
@@ -5802,6 +5910,122 @@ fn the_real_drivers_pipeline_cache_is_saved_through_the_guest_and_loads_back() {
     }
     let pipeline = f.guest.read_u64(pipeline_at as GuestAddr);
     f.call(name("vkDestroyPipeline"), [device, pipeline, 0, 0]).expect("destroy the pipeline");
+}
+
+/// **The real driver's device is destroyed through the guest path only once nothing made from it
+/// is alive, and then it is gone from the host.**
+///
+/// Measured: the engine's render thread tears its device down on `APP_CMD_TERM_WINDOW`. The
+/// children check is `GfxVulkanHost`'s -- the guest-side registries do not know which device an
+/// object came from -- so it is exercised here, against the real host:
+///
+/// * with two semaphores, a fence and a command pool holding a command buffer alive, the refusal
+///   names each kind with its count, and leaves out the command buffer, which its pool frees;
+/// * with only the pool left, it names only the pool;
+/// * with nothing left, the device is destroyed, its queue goes with it, and the host holds no
+///   device and no queue; the stale handle and the stale token are both refusals;
+/// * a second device -- the one the engine makes at its next window -- is made and destroyed the
+///   same way.
+#[test]
+#[ignore = "opens the host Vulkan driver; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn the_real_device_is_destroyed_through_the_guest_only_after_its_children() {
+    require_gate();
+    let _serial = serialized();
+    let host = omni_gfx::GfxVulkanHost::load().expect(
+        "this machine must have a Vulkan loader: the gate was set, so a missing driver is a \
+         failure and not a skip",
+    );
+    let f = fixture("live-destroy-device", Some(host.clone()));
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let enumerate = f.resolve(entry_point, instance, "vkEnumeratePhysicalDevices");
+    let count_at = f.alloc(8);
+    assert_eq!(f.call(enumerate, [instance, count_at, 0, 0]).expect("count") as i32, VK_SUCCESS);
+    let array_at = f.alloc(8);
+    let result = f.call(enumerate, [instance, count_at, array_at, 0]).expect("array") as i32;
+    assert!(result == VK_SUCCESS || result == VK_INCOMPLETE, "{result}");
+    let physical = f.guest.read_u64(array_at as GuestAddr);
+    // Through `vkGetInstanceProcAddr`, as the engine was measured reaching it.
+    let destroy_device = f.resolve(entry_point, instance, "vkDestroyDevice");
+    let get_queue = f.resolve(entry_point, instance, "vkGetDeviceQueue");
+    let get_proc = f.resolve(entry_point, instance, "vkGetDeviceProcAddr");
+
+    let device = f.a_device(entry_point, instance, physical, 0);
+    let token = f.vulkan().device_handles()[0].1;
+    let queue_at = f.alloc(8);
+    f.call(get_queue, [device, 0, 0, queue_at]).expect("a queue");
+    let queue = f.guest.read_u64(queue_at as GuestAddr);
+    assert_eq!((host.objects().1, host.objects().2), (1, 1), "one device and one queue");
+
+    // Children of three kinds, and a command buffer its pool will free.
+    let name = |call: &str| f.resolve_device(get_proc, device, call);
+    let wait_idle = name("vkQueueWaitIdle");
+    let out = f.alloc(8);
+    let mut semaphores = Vec::new();
+    for _ in 0..2 {
+        let info = f.flags_only_info(STYPE_SEMAPHORE_CREATE_INFO, 0);
+        f.call(name("vkCreateSemaphore"), [device, info, 0, out]).expect("a semaphore");
+        semaphores.push(f.guest.read_u64(out as GuestAddr));
+    }
+    let info = f.flags_only_info(STYPE_FENCE_CREATE_INFO, 0);
+    f.call(name("vkCreateFence"), [device, info, 0, out]).expect("a fence");
+    let fence = f.guest.read_u64(out as GuestAddr);
+    f.call(name("vkCreateCommandPool"), [device, f.command_pool_info(0, 0), 0, out])
+        .expect("a command pool");
+    let pool = f.guest.read_u64(out as GuestAddr);
+    let buffers_at = f.alloc(8);
+    f.call(
+        name("vkAllocateCommandBuffers"),
+        [device, f.command_buffer_allocate_info(pool, 1), buffers_at, 0],
+    )
+    .expect("a command buffer");
+
+    // **Refused, naming every kind that lives, and the device is untouched.**
+    let text = f.refusal(destroy_device, &[device, 0]).to_string();
+    assert!(text.contains("2 `VkSemaphore`"), "{text}");
+    assert!(text.contains("1 `VkFence`"), "{text}");
+    assert!(text.contains("1 `VkCommandPool`"), "{text}");
+    assert!(!text.contains("VkCommandBuffer"), "a pool frees its own buffers: {text}");
+    assert_eq!((host.objects().1, host.objects().2), (1, 1), "nothing was destroyed");
+    assert_eq!(f.vulkan().device_handles().len(), 1, "the guest's handle still names it");
+    let idle = f.call(wait_idle, [queue, 0, 0, 0]).expect("the queue still answers") as i32;
+    assert_eq!(idle, VK_SUCCESS, "and the device still works");
+    eprintln!("\n=== vkDestroyDevice evidence ===");
+    eprintln!("with children alive, refused by name:\n  {text}");
+
+    // Only the pool left: only the pool named.
+    for semaphore in &semaphores {
+        f.call(name("vkDestroySemaphore"), [device, *semaphore, 0, 0]).expect("destroy");
+    }
+    f.call(name("vkDestroyFence"), [device, fence, 0, 0]).expect("destroy the fence");
+    let text = f.refusal(destroy_device, &[device, 0]).to_string();
+    assert!(text.contains("1 `VkCommandPool`"), "{text}");
+    assert!(!text.contains("VkSemaphore") && !text.contains("VkFence"), "{text}");
+    f.call(name("vkDestroyCommandPool"), [device, pool, 0, 0]).expect("destroy the pool");
+
+    // **Nothing left: destroyed, once, and gone from the host with its queue.**
+    f.call(destroy_device, [device, 0, 0, 0]).expect("destroy the device");
+    assert_eq!((host.objects().1, host.objects().2), (0, 0), "no device and no queue on the host");
+    assert!(f.vulkan().device_handles().is_empty());
+    assert!(f.vulkan().queue_handles().is_empty(), "the queue's handle went with the device");
+    let text = f.refusal(destroy_device, &[device, 0]).to_string();
+    assert!(text.contains("`VkDevice`"), "the stale handle refuses by name: {text}");
+    let stale = host.destroy_device(token).expect_err("the host refuses the stale token too");
+    assert!(stale.to_string().contains("already destroyed"), "{stale}");
+    eprintln!(
+        "vkDestroyDevice({device:#x}) -> the host holds {:?} (surfaces, devices, queues)",
+        host.objects()
+    );
+
+    // **The next window's device**: a new token, never the old one, destroyed the same way.
+    let again = f.a_device(entry_point, instance, physical, 0);
+    let fresh = f.vulkan().device_handles()[0].1;
+    assert_ne!(fresh, token, "a destroyed device's token is never handed out again");
+    f.call(get_queue, [again, 0, 0, queue_at]).expect("a queue of the new device");
+    assert_eq!((host.objects().1, host.objects().2), (1, 1));
+    f.call(destroy_device, [again, 0, 0, 0]).expect("destroy the second device");
+    assert_eq!((host.objects().1, host.objects().2), (0, 0));
+    eprintln!("a second device ({fresh:?}, the first {token:?}) was made and destroyed alike");
 }
 
 /// **Stage 5's evidence: a textured triangle, drawn by guest code, presented, and its pixels

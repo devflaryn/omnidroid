@@ -141,22 +141,23 @@ impl<T: Copy + PartialEq> Handles<T> {
     ///
     /// # Why stage 4 needs this and stage 3 did not, and what it costs
     ///
-    /// Stage 3 implemented no destructor at all — there is no `vkDestroyInstance` or
-    /// `vkDestroyDevice` in [`VulkanHost`](super::VulkanHost) — so every handle it issued stayed
-    /// live and a registry that only grew was the honest shape. Stage 4 is the first one whose
+    /// Stage 3 implemented no destructor at all — there is still no `vkDestroyInstance` in
+    /// [`VulkanHost`](super::VulkanHost) — so every handle it issued stayed live and a registry
+    /// that only grew was the honest shape. Stage 4 is the first one whose
     /// objects the guest genuinely destroys, once per frame in the case of a swapchain that
     /// follows a resize, so a registry with no removal would run a renderer out of
     /// [`MAX_SWAPCHAINS`](super::MAX_SWAPCHAINS) in a few seconds of dragging a window.
-    /// `vkDestroySurfaceKHR` joined later, when the engine was measured calling it on the way out
-    /// of `APP_CMD_TERM_WINDOW`; the surface family does not deduplicate, so it meets the
-    /// condition below.
+    /// `vkDestroySurfaceKHR` and `vkDestroyDevice` joined later, when the engine was measured
+    /// calling them on the way out of `APP_CMD_TERM_WINDOW`; neither family deduplicates, so both
+    /// meet the condition below.
     ///
     /// **Removal makes one thing unsound that was sound before, and it is named here rather than
     /// discovered later.** [`Handles::insert_or_get`] deduplicates on the token, and a freed slot
     /// can be refilled — so if a host ever reused a token for a *new* object, a stale guest handle
     /// would silently name the new one. The two registries that deduplicate are `VkQueue`, whose
-    /// tokens nothing frees because a queue is never destroyed, and `VkImage`, whose tokens are
-    /// freed only by `vkDestroySwapchainKHR` and whose host never reuses an index. A family that
+    /// tokens are freed only by `vkDestroyDevice` and whose host never hands a destroyed device's
+    /// queue tokens out again, and `VkImage`, whose tokens are freed only by
+    /// `vkDestroySwapchainKHR` and whose host never reuses an index. A family that
     /// both deduplicates and has its tokens recycled must not use this method.
     ///
     /// The slot's sixteen bytes are deliberately **not** cleared: nothing reads them, this module

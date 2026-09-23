@@ -773,8 +773,9 @@ pub(super) fn unimplemented(
              bootstrap (`vkEnumerateInstanceExtensionProperties`, `vkCreateInstance`), the \
              surface substitution (`vkCreateAndroidSurfaceKHR`) and its end \
              (`vkDestroySurfaceKHR`), the ten queries a renderer \
-             makes in order to choose a physical device, `vkCreateDevice`, `vkGetDeviceQueue` and \
-             `vkGetDeviceProcAddr`, the whole presentation spine -- the swapchain and its images, \
+             makes in order to choose a physical device, `vkCreateDevice`, `vkGetDeviceQueue`, \
+             `vkGetDeviceProcAddr` and `vkDestroyDevice`, the whole presentation spine -- the \
+             swapchain and its images, \
              image views, semaphores and fences, command pools and command buffers, \
              `vkCmdPipelineBarrier` and `vkCmdClearColorImage`, and \
              `vkAcquireNextImageKHR`/`vkQueueSubmit`/`vkQueuePresentKHR` with the two idle waits \

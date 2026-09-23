@@ -1,4 +1,5 @@
-//! **`vkCreateDevice`, `vkGetDeviceQueue`, `vkGetDeviceProcAddr`: the end of stage 3.**
+//! **`vkCreateDevice`, `vkGetDeviceQueue`, `vkGetDeviceProcAddr`: the end of stage 3** -- and
+//! `vkDestroyDevice`, measured on the engine's way out of `APP_CMD_TERM_WINDOW`.
 //!
 //! # Where this sits
 //!
@@ -43,7 +44,7 @@ use crate::error::AbiResult;
 
 use super::chain;
 use super::host::{DeviceRequest, DriverAnswer, QueueRequest};
-use super::instance::{decode_names, guest_pointer};
+use super::instance::{decode_names, guest_pointer, refuse_allocator};
 use super::physical::PHYSICAL_DEVICE_FEATURES_BYTES;
 use super::{Site, Vulkan, VK_SUCCESS};
 
@@ -430,6 +431,71 @@ pub(super) fn get_device_proc_addr(
 
     let answer = vulkan.resolve_on_device(at, device, &name)?;
     c.ret().u64(answer.address());
+    Ok(())
+}
+
+/// `void vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)`
+///
+/// # Why it exists: measured
+///
+/// A gate run measured the engine's render thread calling it on `APP_CMD_TERM_WINDOW`, right after
+/// `vkGetPipelineCacheData`, through the thunk `vkGetInstanceProcAddr` handed out, with
+/// `x0` its `VkDevice` and `pAllocator = NULL`. The engine tears its whole device down when the
+/// window goes. Refusing it killed the render thread.
+///
+/// # The order every destroy here uses
+///
+/// The allocator is observed and a non-null one refused first. `VK_NULL_HANDLE` is then the
+/// specified no-op ([`swapchain::destroy_swapchain`](super::swapchain) carries the argument). A
+/// device this layer did not issue, or one it has already taken back, is a refusal naming the
+/// handle.
+///
+/// # Children first, and what the check covers
+///
+/// The specification requires every object created from the device to be destroyed before it,
+/// and the guest-side registries do not record which device an object came from. The host does,
+/// so [`VulkanHost::destroy_device`](super::VulkanHost::destroy_device) refuses a device with live
+/// children, naming each kind with a count and a few tokens, and the device is left exactly as it
+/// was. That covers **every driver object this layer creates on a device**: swapchains, image
+/// views, semaphores, fences, command pools, device memory, buffers, images, samplers, shader
+/// modules, pipeline layouts, render passes, framebuffers, pipelines, pipeline caches, query pools,
+/// descriptor set layouts and descriptor pools. Command buffers and descriptor sets are freed with
+/// their pools, and swapchain images with their swapchains.
+///
+/// **One kind is not covered**: descriptor update templates. This layer keeps them itself
+/// ([`descriptor`](super::descriptor)), the driver never sees one, and nothing records which
+/// device one was created on. A template left alive does not reach the driver with the device; it
+/// is still the guest's to destroy, and this check does not claim otherwise.
+///
+/// # What goes with it
+///
+/// On success the device's slot is freed, and so are the guest's `VkQueue` handles for the
+/// queues the host says went with it: a queue is retrieved, never destroyed, and its lifetime is
+/// its device's. A later call with either handle is a refusal naming it.
+pub(super) fn destroy_device(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkDestroyDevice";
+    refuse_allocator(vulkan, at, CALL, args[1])?;
+    let host = vulkan.require_host(at)?;
+    if args[0] == 0 {
+        // The specified no-op. See `swapchain::destroy_swapchain`'s documentation.
+        c.ret().void();
+        return Ok(());
+    }
+    let handle = guest_pointer(at, "device", args[0])?;
+    let device = vulkan.device_token(at, CALL, args[0])?;
+
+    // **The driver's device first, the guest's handles second**, as every destroy here orders
+    // it: a refusal for a live child leaves the handle naming a device that still exists.
+    let queues = host.destroy_device(device)?;
+    vulkan.forget_device(handle);
+    vulkan.forget_queues_of(|queue| !queues.contains(&queue));
+
+    c.ret().void();
     Ok(())
 }
 
