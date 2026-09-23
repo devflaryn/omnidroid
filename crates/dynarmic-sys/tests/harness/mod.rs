@@ -482,6 +482,12 @@ pub struct VmOptions {
     /// `silently_mirror_fastmem`. Off, a guest address past `MEM_BITS` misses fastmem and goes to
     /// the callbacks (which mask it into the arena).
     pub mirror: bool,
+    /// Identity fastmem, as `omni-cpu` configures it (D4): base 0, 64 address bits, so a guest
+    /// address *is* the host address and an unmapped one takes a real host fault, which dynarmic's
+    /// fastmem handler turns into the callback path (which masks it into the arena).
+    pub identity: bool,
+    /// `check_halt_on_memory_access`, which `omni-cpu` sets.
+    pub check_halt_on_memory_access: bool,
 }
 
 impl Default for VmOptions {
@@ -502,6 +508,8 @@ impl Default for VmOptions {
             processor_id: 0,
             shared_arena: 0,
             mirror: true,
+            identity: false,
+            check_halt_on_memory_access: false,
         }
     }
 }
@@ -573,8 +581,8 @@ impl Vm {
             tpidr_el0: &mut *tpidr,
             tpidrro_el0: &*tpidrro,
             fastmem_enabled: i32::from(opts.fastmem),
-            fastmem_pointer: fastmem_base,
-            fastmem_address_space_bits: MEM_BITS,
+            fastmem_pointer: if opts.identity { 0 } else { fastmem_base },
+            fastmem_address_space_bits: if opts.identity { 64 } else { MEM_BITS },
             // Masks the guest address into the arena, so a wild guest address
             // wraps instead of reading off the end of the allocation.
             silently_mirror_fastmem: i32::from(opts.mirror),
@@ -590,7 +598,7 @@ impl Vm {
             wall_clock_cntpct: 0,
             hook_hint_instructions: i32::from(opts.hook_hints),
             define_unpredictable_behaviour: 0,
-            check_halt_on_memory_access: 0,
+            check_halt_on_memory_access: i32::from(opts.check_halt_on_memory_access),
             unsafe_optimizations: 0,
             optimizations: opts.optimizations,
         };

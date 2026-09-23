@@ -210,6 +210,29 @@ fastmem-range miss, served by the callbacks with the same answers; and four
 threads on one monitor and one arena doing 50,000 `LDAXR`/`STLXR` increments
 each, all inline and inline mixed with callback threads — no lost update.
 
+### 0008 — arm64: the memory-abort check reads the halt word as the 32 bits it is
+
+`0008-arm64-halt-word-is-32-bit.patch`. **arm64 only.**
+`EmitA64CheckMemoryAbort` — emitted on the fallback of every fastmem access
+when `check_halt_on_memory_access` is set, which `omni-cpu` sets — loaded the
+halt word with `LDAR Xscratch0, [Xhalt]`, a **64-bit** load-acquire, from
+`A64::Jit::Impl::halt_reason`, a `u32` at a 4-byte-aligned address. A
+load-acquire must be naturally aligned, so the check itself took an alignment
+fault inside translated code; dynarmic's handler found no fastmem patch at that
+PC and terminated the process (`Segfault wasn't at a fastmem patch location!`).
+So on arm64 **every guest access to unmapped memory killed the process instead
+of becoming a typed fault** — the first fastmem miss faulted correctly, was
+redirected to the fallback, served, and then the abort check faulted.
+
+MEASURED before the patch, with dynarmic's handler alone (no Omnidroid fault
+handler installed): fault 1 at the patched `LDR`, redirected; fault 2 at
+`c8dfff70` (`LDAR X16, [X27]`) with `X27 = 0x…1ac`. `tests/host_fault.rs`
+(identity fastmem, `check_halt_on_memory_access`, guest address `0x2000` in
+`__PAGEZERO`) aborted before the patch and passes after, for a load, a store,
+and the inline exclusive pair and doubleword pair of 0007. The A32 twin in
+`emit_arm64_a32.cpp` has the same instruction; A32 is not built here, so it is
+left alone.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is
