@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
+use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
 use omni_android::jni::{script, slots, Jni};
 use omni_android::ndk::assets::{AssetSource, ASSET_MANAGER_CLASS};
 use omni_android::ndk::{
@@ -1461,6 +1462,47 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         guest.jni.new_object(SURFACE_CLASS).expect("a Java Surface")
     };
 
+    // ---- §8 row 26: the window's pointer, as the Java side's touch listener delivers it ------
+    //
+    // Only with a window, because the events are the window's. The density is the display's --
+    // the figure `DisplayMetrics.density` answers, which is what `vk.e` divides by. The surface
+    // starts dead and comes alive when `onSurfaceCreatedNative` returns, as `jk.o0` does; see
+    // `omni_android::jni::input`.
+    let mut touch: Option<TouchInput> = window.as_ref().map(|_| {
+        TouchInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied(), display.density())
+            .unwrap_or_else(|error| panic!("§8 row 26: the touch seam could not be built: {error}"))
+    });
+    let mut input_failure: Option<String> = None;
+    // **OMNI_INPUT_PROBE=1: one SYNTHETIC press-drag-release**, through the same seam, at the
+    // centre of the view -- so a run nobody touches can still show that the engine's own
+    // `nativePassInput` is called and returns. Opt-in and said so, because it is a stimulus this
+    // gate invents: whatever sits at the centre of the engine's screen receives it.
+    let mut input_probe: Vec<omni_platform::window::WindowEvent> =
+        match (&touch, std::env::var_os("OMNI_INPUT_PROBE")) {
+            (Some(_), Some(_)) => {
+                let (x, y) = (surface_width / 2, surface_height / 2);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "INPUT PROBE: a SYNTHETIC press at ({x}, {y}) px, a drag of 24 px and a \
+                     release will be delivered once the surface is alive (OMNI_INPUT_PROBE)"
+                );
+                vec![
+                    omni_platform::window::WindowEvent::PointerDown {
+                        button: omni_platform::window::PointerButton::Primary,
+                        x,
+                        y,
+                    },
+                    omni_platform::window::WindowEvent::PointerMoved { x: x + 24, y },
+                    omni_platform::window::WindowEvent::PointerUp {
+                        button: omni_platform::window::PointerButton::Primary,
+                        x: x + 24,
+                        y,
+                    },
+                ]
+            }
+            _ => Vec::new(),
+        };
+
     // The watchdog is re-armed, because **row 17 blocks**. The GameActivity glue's
     // `android_app_set_window` writes `APP_CMD_INIT_WINDOW` and then waits on its own condition
     // variable until the game thread has taken the window — so this call cannot return until the
@@ -1940,6 +1982,13 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             }
         );
         report_dead_guest_threads(&guest, &format!("after §8 row `{member}`"));
+        // `MainGameActivity.surfaceCreated` is `super.surfaceCreated` -- this row -- and then
+        // `Y.a(!isDestroyed())`, the flag `vk.e.onTouch` reads as `D.b()`.
+        if member == "onSurfaceCreatedNative" && result.is_ok() {
+            if let Some(seam) = touch.as_mut() {
+                seam.set_surface_alive(true);
+            }
+        }
         let failed = result.is_err();
         row_outcomes.push((
             member.to_string(),
@@ -2262,10 +2311,72 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         // window nobody pumps is one the OS marks as not responding, and a geometry nobody
         // samples goes stale at the first resize.
         if let (Some(open), Some(source)) = (window.as_mut(), window_source.as_ref()) {
-            let _ = open.poll_events().count();
+            let events: Vec<omni_platform::window::WindowEvent> = match &touch {
+                Some(seam) if seam.surface_alive() => {
+                    input_probe.drain(..).chain(open.poll_events()).collect()
+                }
+                _ => open.poll_events().collect(),
+            };
             let _ = source.sample(open);
+            // **§8 row 26, on this thread** -- the UI thread, which is where `vk.e.onTouch` runs
+            // on a device and where every lifecycle row above was called from.
+            if let Some(seam) = touch.as_mut() {
+                let view = open.client_size().map_err(|error| {
+                    format!("the window's client size, which is the view `vk.e` divides: {error}")
+                });
+                for event in &events {
+                    let delivered = view.clone().and_then(|view| {
+                        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                        let _jni = guest.jni.activate().expect("publish the JNI instance");
+                        let _ndk = guest.ndk.activate();
+                        seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event, view)
+                            .map_err(|error| format!("{event:?}: {error}"))
+                    });
+                    match delivered {
+                        Ok(calls) => {
+                            for call in calls.iter().filter(|call| call.state != STATE_MOVED) {
+                                let _ = writeln!(std::io::stderr(), "INPUT: nativePassInput {call:?}");
+                            }
+                        }
+                        Err(error) => {
+                            let _ = writeln!(std::io::stderr(), "INPUT: delivery failed: {error}");
+                            report_dead_guest_threads(&guest, "after a failed nativePassInput");
+                            input_failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            if input_failure.is_some() {
+                touch = None;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    match &touch {
+        Some(seam) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "INPUT: {} nativePassInput call(s) returned; {} held back while the surface was \
+                 dead; finger {}{}",
+                seam.delivered(),
+                seam.held_back(),
+                if seam.finger_down() { "down" } else { "up" },
+                if input_probe.is_empty() { "" } else { "; the SYNTHETIC probe was never sent" }
+            );
+        }
+        None => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "INPUT: {}",
+                match &input_failure {
+                    Some(error) => format!("delivery stopped at the first failure: {error}"),
+                    None => format!(
+                        "not wired -- no window to take pointer events from ({GRAPHICS_GATE} unset)"
+                    ),
+                }
+            );
+        }
     }
     // **What the engine asked the Vulkan loader for, in order** -- the census the stage tests
     // said the first run that reached graphics would produce. Printed whether or not anything
@@ -2540,6 +2651,15 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
              failure mode: {failure:?}"
         );
     }
+
+    // **§8 row 26, asserted rather than printed**: a touch the engine's own `nativePassInput` did
+    // not return from is a call that failed on this thread, and the line printed at the time is
+    // not a detector (`VERIFICATION.md` entry 11).
+    assert!(
+        input_failure.is_none(),
+        "§8 row 26: a window event did not reach the engine: {}",
+        input_failure.as_deref().unwrap_or_default()
+    );
 }
 
 /// The bytes **before** an address a refusal named as unreadable.
@@ -3390,6 +3510,68 @@ fn the_activity_class_answers_every_member_row_23_looks_up_on_it() {
             .is_none(),
         "the superclass must not resolve the subclass's members"
     );
+}
+
+/// **The registers the real `nativePassInput` reads are the ones the touch seam writes.**
+///
+/// `tests/input.rs` proves `jni::input` puts the pointer id in `w2`, x and y in `s0`/`s1` and the
+/// state in `w3`, through real translated code. This proves that is where **`libroblox.so`'s own
+/// native** takes them from: the moves at the top of `0x02bbba88` that park each argument in a
+/// callee-saved register before the first call, and the moves that hand them on to the engine's
+/// handler before the second -- `(input, sxtw(pointerId), state, x, y)` into `0x2e4e68c`.
+///
+/// Each is matched as an exact instruction word, encoded from its fields, so a build that moved an
+/// argument to another register fails here naming it rather than delivering touches whose x is a
+/// state. Needs the ELF and not a run.
+#[test]
+fn the_touch_native_reads_the_registers_the_seam_writes() {
+    let _serial = serialized();
+    let bytes = main_lib_bytes();
+    let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+    let symbol = elf
+        .exported_symbols()
+        .expect("read .dynsym")
+        .into_iter()
+        .find(|symbol| symbol.name == PASS_INPUT_SYMBOL)
+        .unwrap_or_else(|| panic!("libroblox.so does not export `{PASS_INPUT_SYMBOL}`"));
+    let offset = elf.vaddr_to_offset(symbol.sym.st_value).expect("the native is in a load segment");
+    let words: Vec<u32> = bytes[offset..offset + symbol.sym.st_size as usize]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+        .collect();
+    // `MOV Wd, Wm` is `ORR Wd, WZR, Wm`; `FMOV Sd, Sn` is the single-precision register move;
+    // `SXTW Xd, Wn` is `SBFM Xd, Xn, #0, #31`. Fields as the ARM ARM lays them out.
+    let mov_w = |rd: u32, rm: u32| 0x2A00_03E0 | (rm << 16) | rd;
+    let fmov_s = |rd: u32, rn: u32| 0x1E20_4000 | (rn << 5) | rd;
+    let sxtw = |rd: u32, rn: u32| 0x9340_7C00 | (rn << 5) | rd;
+    let is_bl = |word: &u32| word & 0xFC00_0000 == 0x9400_0000;
+    let first = words.iter().position(is_bl).expect("the native calls the input singleton");
+    let second = first
+        + 1
+        + words[first + 1..].iter().position(is_bl).expect("and then the engine's handler");
+    let (parked, handed_on) = (&words[..first], &words[first + 1..second]);
+    for (what, word) in [
+        ("the pointer id is read from w2", mov_w(20, 2)),
+        ("x is read from s0", fmov_s(9, 0)),
+        ("y is read from s1", fmov_s(8, 1)),
+        ("the state is read from w3", mov_w(19, 3)),
+    ] {
+        assert!(
+            parked.contains(&word),
+            "{what} ({word:#010x}) is not in {PASS_INPUT_SYMBOL}'s prologue: {parked:08x?}"
+        );
+    }
+    for (what, word) in [
+        ("x is handed on in s0", fmov_s(0, 9)),
+        ("y is handed on in s1", fmov_s(1, 8)),
+        ("the pointer id is handed on, sign-extended, in x1", sxtw(1, 20)),
+        ("the state is handed on in w2", mov_w(2, 19)),
+    ] {
+        assert!(
+            handed_on.contains(&word),
+            "{what} ({word:#010x}) is not before the handler call: {handed_on:08x?}"
+        );
+    }
 }
 
 /// NDK symbols this layer binds that **`libroblox.so` does not import**, and why each is bound.
