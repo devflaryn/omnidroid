@@ -2514,7 +2514,7 @@ impl Filesystem {
                 ));
             }
             let name = entry.file_name();
-            let Some(name) = name.to_str() else {
+            let Some(host_name) = name.to_str() else {
                 return Err(FsError::refused(
                     OP,
                     shown,
@@ -2525,6 +2525,10 @@ impl Filesystem {
                     ),
                 ));
             };
+            // As the guest wrote it: a stand-in back to the character it stores (`path`'s
+            // `STORED_AS_STAND_IN`), before the guest's own `d_name` bound is applied to it.
+            let name = path::guest_component(host_name);
+            let name = name.as_str();
             if name.len() > NAME_MAX {
                 return Err(FsError::refused(
                     OP,
@@ -2977,6 +2981,39 @@ mod tests {
             Some(FsErrorKind::NotFound)
         );
         assert_eq!(fs.fstat(999).unwrap_err().kind(), Some(FsErrorKind::BadDescriptor));
+    }
+
+    /// **A name with a character Windows reserves is created, found and listed as the guest wrote
+    /// it**, and the host file carries the stand-in.
+    ///
+    /// MEASURED: the engine's content cache is named after URLs --
+    /// `ContentProvider_…/rbxthumb://type=AvatarHeadShot&…` -- an ordinary path on a device.
+    #[test]
+    fn a_name_with_a_character_windows_reserves_round_trips_through_the_seam() {
+        let scratch = Scratch::new("standin");
+        let fs = scratch.fs();
+        fs.mkdir(b"/cache").expect("mkdir");
+        // Before it exists, the answer a device gives: not found, not refused.
+        assert_eq!(
+            fs.stat(b"/cache/rbxthumb://type=a&w=48").unwrap_err().kind(),
+            Some(FsErrorKind::NotFound)
+        );
+        fs.mkdir(b"/cache/rbxthumb:").expect("a directory named with a colon");
+        let path: &[u8] = b"/cache/rbxthumb://type=a&w=48?x*y";
+        let fd = fs.open(path, write_flags()).expect("a file named with `?` and `*`");
+        assert_eq!(fs.write(fd, b"thumb").expect("write"), 5);
+        fs.close(fd).expect("close");
+        assert!(fs.stat(path).is_ok(), "found again by the same name");
+        let dir = fs.opendir(b"/cache").expect("opendir");
+        let mut names = Vec::new();
+        while let Some(entry) = fs.readdir(dir).expect("readdir") {
+            names.push(entry.name);
+        }
+        fs.closedir(dir).expect("closedir");
+        assert!(names.contains(&"rbxthumb:".to_string()), "listed as written: {names:?}");
+        // On the host: the stand-ins, so no reserved character reached a host call.
+        let host = scratch.0.join("cache").join("rbxthumb\u{F03A}").join("type=a&w=48\u{F03F}x\u{F02A}y");
+        assert!(host.is_file(), "{} is the host file", host.display());
     }
 
     /// A directory stream yields `.`, `..` and then the entries, once each, and then nothing.

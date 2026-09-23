@@ -37,10 +37,13 @@
 //!    has no working directory to be relative to — see below. **After this step no `..` exists**,
 //!    so none ever reaches the host.
 //! 4. **Component hygiene**, which is where the host-specific hazards are refused. A component
-//!    containing a path separator, a drive letter, a wildcard or a control character, a component
-//!    that names a Windows character device, and a component with a trailing dot or space are all
-//!    refused. Each is a way to name something outside the root, or to name two different guest
-//!    paths as one host file, on at least one of the five targets.
+//!    containing a control character, a component that names a Windows character device, and a
+//!    component with a trailing dot or space are all refused. Each is a way to name something
+//!    outside the root, or to name two different guest paths as one host file, on at least one of
+//!    the five targets. The eight characters Linux allows and Windows reserves -- a separator, a
+//!    drive or stream marker, the wildcards -- are **not** refused but stored as private-use
+//!    stand-ins ([`host_component`]), because a device accepts them and the engine uses them;
+//!    the stand-in is none of those things on any host.
 //! 5. **Symlinks.** Every component of the resolved path is checked, and a symlink anywhere in it
 //!    is refused — except a symlink as the *final* component of an `lstat`, which is exactly the
 //!    call whose job is to describe one without following it.
@@ -293,6 +296,41 @@ const WINDOWS_DEVICES: [&str; 30] = [
     "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
 ];
 
+/// The characters Linux allows in a file name and Windows reserves, each stored on the host as a
+/// private-use **stand-in**: U+F000 plus the character, the scheme WSL and Cygwin use.
+///
+/// **Stored rather than refused, because a device accepts them.** MEASURED: the engine names its
+/// content cache after URLs -- `cache/ContentProvider_…/rbxthumb://type=AvatarHeadShot&…` -- which
+/// on Android is an ordinary path that does not exist yet, and refusing it killed the render
+/// thread. Each is a hazard only as the character itself: `\` a separator, `:` a drive or a
+/// stream, `*` and `?` wildcards, the rest reserved. The stand-in is an ordinary character on
+/// every host, and the mapping is one-to-one because a stand-in the guest writes itself is refused
+/// ([`hostile_component`]).
+pub const STORED_AS_STAND_IN: [char; 8] = ['\\', ':', '<', '>', '"', '|', '?', '*'];
+
+/// The first code point of the stand-in range.
+const STAND_IN_BASE: u32 = 0xF000;
+
+/// The private-use character `reserved` is stored as.
+fn stand_in(reserved: char) -> char {
+    char::from_u32(STAND_IN_BASE + u32::from(reserved)).expect("U+F000 plus an ASCII code is a scalar value")
+}
+
+/// A guest path component as the host stores it: each [`STORED_AS_STAND_IN`] character replaced
+/// by its stand-in, everything else unchanged. [`guest_component`] is its inverse.
+#[must_use]
+pub fn host_component(name: &str) -> String {
+    name.chars().map(|c| if STORED_AS_STAND_IN.contains(&c) { stand_in(c) } else { c }).collect()
+}
+
+/// A host directory entry's name as the guest sees it: each stand-in back to its character.
+#[must_use]
+pub fn guest_component(name: &str) -> String {
+    name.chars()
+        .map(|c| STORED_AS_STAND_IN.iter().copied().find(|&reserved| stand_in(reserved) == c).unwrap_or(c))
+        .collect()
+}
+
 /// Why one path component may not be turned into a host path component, if it may not.
 ///
 /// **Every rule here is a way to leave the root or to alias two guest paths onto one host file**,
@@ -330,13 +368,19 @@ pub fn hostile_component(name: &str) -> Option<String> {
             u32::from(bad)
         ));
     }
-    // `\` is a path separator on Windows, so `a\..\..\b` is a traversal the `/` split never sees.
-    // `:` names a drive (`C:`) or an NTFS alternate data stream (`file:stream`). Both leave the
-    // root outright.
-    if let Some(bad) = name.chars().find(|c| matches!(c, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')) {
+    // `\` is a path separator on Windows, so `a\..\..\b` is a traversal the `/` split never sees,
+    // and `:` names a drive (`C:`) or an NTFS alternate data stream (`file:stream`). They, and the
+    // other reserved characters, are stored as stand-ins (`host_component`) and never reach a host
+    // call as themselves. **A stand-in the guest writes is refused**: it would name the same host
+    // file as the character it stands for -- two guest paths, one host file.
+    if let Some(bad) = name.chars().find(|&c| STORED_AS_STAND_IN.iter().any(|&r| stand_in(r) == c)) {
         return Some(format!(
-            "the component `{name}` contains `{bad}`, which is a path separator, a drive or \
-             stream marker, or a wildcard on at least one of the five targets"
+            "the component `{}` contains U+{:04X}, the private-use character this layer stores \
+             `{}` as on the host, so it would name the same host file as the component written \
+             with that character",
+            name.escape_debug(),
+            u32::from(bad),
+            guest_component(&bad.to_string())
         ));
     }
     // Win32 strips a trailing dot or space from a path component, so `secret.` and `secret` are
@@ -357,7 +401,15 @@ pub fn hostile_component(name: &str) -> Option<String> {
     // such as `NUL .txt` — which MEASURED as *not* a device on this build, and is refused anyway
     // because it is one strip away from being one and over-refusing cannot create an escape.
     // Trailing dots need no trimming here: the split on `.` has already removed them.
-    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    //
+    // The stem also ends at a reserved character: `NUL:` is a device to Win32, and whether its
+    // stand-in form is too has not been measured -- so the stem is taken as though it were, which
+    // can only over-refuse.
+    let stem = name
+        .split(|c: char| c == '.' || STORED_AS_STAND_IN.contains(&c))
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ');
     if WINDOWS_DEVICES.iter().any(|device| stem.eq_ignore_ascii_case(device)) {
         return Some(format!(
             "the component `{name}` names the Windows character device `{}`, which is a device \
@@ -385,7 +437,7 @@ pub fn locate(
     let mut host = root.to_path_buf();
     let last = resolved.components.len().saturating_sub(1);
     for (index, component) in resolved.components.iter().enumerate() {
-        host.push(component);
+        host.push(host_component(component));
         // `symlink_metadata` does not follow, so this asks about the component itself. A
         // component that does not exist yet is not an error here: `open(O_CREAT)`, `rename`'s
         // destination and `mkdir` all name something that is about to exist, and the call itself
@@ -441,7 +493,9 @@ mod tests {
     #[test]
     fn an_absolute_component_is_refused_by_the_containment_check() {
         let root = std::path::Path::new(if cfg!(windows) { r"C:\omnidroid-root" } else { "/omnidroid-root" });
-        let escape = if cfg!(windows) { r"C:\Windows" } else { "/etc" };
+        // Root-relative on Windows: `PathBuf::push` replaces everything but the drive, and the
+        // component holds no character `host_component` would change.
+        let escape = if cfg!(windows) { "/Windows" } else { "/etc" };
 
         // Built by hand: `hostile_component` would never let this through, which is the point.
         let resolved = Resolved { components: vec![escape.to_string(), "secret.txt".to_string()] };
@@ -510,14 +564,24 @@ mod tests {
     /// The host-specific hazards, each refused with a reason.
     #[test]
     fn the_component_rules_refuse_every_way_to_name_something_outside_the_root() {
-        // A backslash traversal the `/` split cannot see.
-        assert!(hostile_component(r"..\..\windows").is_some());
-        assert!(hostile_component(r"a\b").is_some());
-        // Drive-relative and alternate data streams.
-        assert!(hostile_component("C:").is_some());
-        assert!(hostile_component("file:stream").is_some());
-        // Wildcards, which some host APIs expand.
-        for name in ["*", "?", "a*b", "a?b", "<", ">", "\"", "|"] {
+        // A backslash traversal the `/` split cannot see, drive-relative names, alternate data
+        // streams and wildcards: **ordinary names on a device**, so accepted -- and stored under
+        // stand-ins, so not one reserved character reaches a host call, and each comes back as
+        // itself.
+        for name in [r"..\..\windows", r"a\b", "C:", "file:stream", "*", "?", "a*b", "a?b", "<", ">", "\"", "|", "rbxthumb:"] {
+            assert!(hostile_component(name).is_none(), "`{name}` is an ordinary Android name");
+            let host = host_component(name);
+            assert!(
+                !host.chars().any(|c| STORED_AS_STAND_IN.contains(&c)),
+                "`{name}` is stored as `{host}`, which still holds a reserved character"
+            );
+            assert_eq!(guest_component(&host), name, "and it comes back as itself");
+        }
+        // A stand-in the guest writes itself would alias the character it stands for.
+        assert!(hostile_component("a\u{F03A}b").is_some(), "U+F03A is `:` on the host");
+        assert!(hostile_component("\u{F05C}").is_some(), "U+F05C is `\\` on the host");
+        // A device name ended by a reserved character is still that device's stem.
+        for name in ["NUL:", "CON:x", "aux?", "COM1*"] {
             assert!(hostile_component(name).is_some(), "`{name}` was accepted");
         }
         // Windows character devices, in any directory and with any extension.
