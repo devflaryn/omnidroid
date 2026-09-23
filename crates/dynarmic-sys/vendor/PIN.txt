@@ -8,6 +8,7 @@ dynarmic/
     version    6.7.0 (2024-03-05)
     licence    ISC / 0BSD  (see dynarmic/LICENSE.txt)
     state      that revision plus ../patches/0001-a64-mrs-cntvct_el0.patch
+               and ../patches/0002-arm64-interpret-terminal.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

@@ -33,6 +33,36 @@ same count, at the same `CNTFRQ_EL0` — which is what `omni-cpu`'s
 `cntvct_reads_the_same_clock_as_cntpct` asserts, from guest `MRS`
 instructions.
 
+### 0002 — arm64: the `Interpret` terminal calls the interpreter fallback
+
+`0002-arm64-interpret-terminal.patch`. **arm64 hosts only; the x64 backend is
+untouched.** The A64 frontend ends a block with `IR::Term::Interpret` in front
+of every word it cannot translate — the 231 commented-out decoder entries,
+including every LSE atomic, and every visitor that calls
+`InterpretThisInstruction()`. The x64 backend turns that terminal into a call to
+`UserCallbacks::InterpreterFallback`; the pin's arm64 backend had
+`ASSERT_FALSE("Interpret should never be emitted.")`
+(`emit_arm64_a64.cpp:36`), so on an arm64 host **the first undecodable guest
+word terminated the process**. MEASURED on Apple M1: `hostile.rs`'s fuzzer died
+at trial 2 with exactly that message, and `tests/interpret.rs` aborted with
+`SIGABRT` before the patch.
+
+The patch gives arm64 the x64 terminal, step for step: charge the cycles used
+so far (`AddTicks`), store the PC, install the **host's** `FPCR` (the x64
+terminal does `SwitchMxcsrOnExit`), call
+`InterpreterFallback(pc, num_instructions)` through a new prelude trampoline
+(`LinkTarget::InterpreterFallback`), reload the guest's `FPCR` from `JitState`
+(x64's `return_from_run_code[MXCSR_ALREADY_EXITED]` does
+`SwitchMxcsrOnEntry`), re-read the budget (`GetTicksRemaining`), and return to
+the dispatcher, which checks the halt flag and the budget before looking up the
+next block — the same loop x64's `ReturnFromRunCode(true)` enters.
+
+`tests/interpret.rs` asserts the contract from guest code: the preceding
+instructions are committed, the PC handed over is the unknown instruction's,
+`num_instructions` counts a merged run, a fallback that does not halt resumes at
+the PC it left, and the fallback runs under the host's `FPCR` while the guest's
+is back in force afterwards (a subnormal multiply under `FPCR.FZ`, both ways).
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is
@@ -40,6 +70,15 @@ committed here alongside, so `git apply --check` against a fresh clone of the
 pin verifies that the tree is exactly upstream plus these patches. Touch
 `vendor/PIN.txt` afterwards; it is the only thing under `vendor/` that the build
 script tells Cargo to watch.
+
+`python3 crates/dynarmic-sys/tools/verify_patches.py` does that check without a
+network: the pristine tree is the one committed when the pin was vendored
+(`64034d4`), every patch is applied to it in order (`git apply --check` first),
+and the result must be the vendored tree **byte for byte** (in git object
+space, so eol attributes and ignored build outputs cannot confuse it); the
+vendored tree must also reverse-apply back to pristine. An edit made under
+`vendor/` without its patch fails the first half, which is the half a
+reconstruction from the tree itself could never catch.
 
 ## Known candidates, not yet applied
 

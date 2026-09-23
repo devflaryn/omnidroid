@@ -243,6 +243,35 @@ pub const fn mrs_tpidr_el0(rt: u32) -> u32 {
     0xD53B_D040 | rt
 }
 
+/// `MSR FPCR, Xt` — system register move, `op0=3 op1=3 CRn=4 CRm=4 op2=0`:
+/// `1101010100 0 1 1 011 0100 0100 000 Rt:5`.
+pub const fn msr_fpcr(rt: u32) -> u32 {
+    0xD51B_4400 | rt
+}
+
+/// `MRS Xt, FPCR` — as [`msr_fpcr`] with `L=1`.
+pub const fn mrs_fpcr(rt: u32) -> u32 {
+    0xD53B_4400 | rt
+}
+
+/// `MRS Xt, FPSR` — `op2=1` of the `FPCR` encoding.
+pub const fn mrs_fpsr(rt: u32) -> u32 {
+    0xD53B_4420 | rt
+}
+
+/// `MSR FPSR, Xt`.
+pub const fn msr_fpsr(rt: u32) -> u32 {
+    0xD51B_4420 | rt
+}
+
+/// `LDADD Xs, Xt, [Xn]` — an ARMv8.1 LSE atomic, `size=11 111 0 00 A=0 R=0 1 Rs:5 o3=0 opc=000 00
+/// Rn:5 Rt:5`. **Not in the pin's A64 decoder** (`decoder/a64.inc` has the line commented out), so
+/// the frontend translates it as `InterpretThisInstruction()`: it is the canonical way to reach the
+/// `Interpret` terminal.
+pub const fn ldadd_x(rs: u32, rt: u32, rn: u32) -> u32 {
+    0xF820_0000 | (rs << 16) | (rn << 5) | rt
+}
+
 /// `SVC #imm16` — `11010100 000 imm16:16 000 01`.
 pub const fn svc(imm16: u16) -> u32 {
     0xD400_0001 | ((imm16 as u32) << 5)

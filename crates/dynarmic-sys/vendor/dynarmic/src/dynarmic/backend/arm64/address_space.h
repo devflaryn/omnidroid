@@ -132,6 +132,9 @@ protected:
         void* get_cntpct;
         void* add_ticks;
         void* get_ticks_remaining;
+
+        // Omnidroid patch 0002.
+        void* interpreter_fallback;
     } prelude_info;
 };
 
