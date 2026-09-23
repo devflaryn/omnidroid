@@ -920,6 +920,7 @@ OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --releas
   OMNI_PROFILE=1             where every guest thread's time goes (in guest code / which handler)
   OMNI_CLIENT_APP_SETTINGS=<json>  Roblox's own ClientAppSettings.json, for turning on an engine log
   OMNI_DATA_DIR=<dir>        keep the app's storage between runs (a signed-in session included)
+  OMNI_WEBVIEW_PROBE=<s>     SYNTHETIC: open a page through the engine's bus that calls the app's web-view bridge
 ```
 
 **2026-09-23: a person signed in, reached Home, and pressed Play.** `tools\play.ps1` is how the
@@ -1008,48 +1009,53 @@ What a run reaches, every time:
 
 ## The frontier -- CURRENT
 
-1. **The person's next test: enter a game -- without the VPN.** Every death the signed-in
-   sessions found is fixed. The person turned the VPN off (it was only there to get past Roblox's
-   bot flagging) and wants to test the first sign-in without it once the web view exists, since a
-   captcha is then solvable in the runtime itself. Relaunch `tools\play.ps1` (`-Fresh` while
-   item 4 stands), sign in (Quick Sign-in, or password + the captcha once item 2 lands), open a
-   game, Play, and watch the log for `GUEST THREAD DIED`. Everything after the join -- the RCC
-   connection over UDP, the 3D renderer, physics -- has never run here; expect refusals, each
-   naming itself.
-2. **The web view (the person asked for it; captchas at sign-in and sometimes at game join).**
-   DECODED so far (`classes2.dex` and `libroblox.so`):
-   * `com.roblox.protocols.webview.WebViewProtocol` is Java that talks to the engine's **message
-     bus**. Its constructor calls `MessageBus.p(protocolName, isAvailableId, handler)` (a request
-     handler) and `MessageBus.t(messageId, Callback)` three times: `openWindow`, `mutateWindow`,
-     `closeWindow` (each id is `MessageBus.getMessageId(protocolName, <id>)`; the names come from
-     the static natives `WebViewProtocol.getProtocolName/getOpenWindowId/...`, all exported).
-   * The Java `MessageBus` is a thin shell over **instance natives** (all exported,
-     `Java_com_roblox_universalapp_messagebus_MessageBus_*`): `doSubscribeRaw(String messageId,
-     RawCallback cb, boolean) -> Connection`, `setRequestHandlerRaw(String protocol, String method,
-     RequestHandlerRaw h)`, `publishRaw(String id, String json)`, `getMessageId`, and more. The
-     engine calls back **`RawCallback.run(String json)`** for a message and
-     **`RequestHandlerRaw.run(String json) -> String`** for a request (see `MessageBus$a`/`$b`).
-     `Connection` holds a native pointer (`long a`) with `isConnected(J)Z`/`deleteSharedPtr(J)V`.
-   * `openWindow`'s handler (`WebViewProtocol$b`) reads from the JSON: the URL (log "Attempted to
-     open WebView window with no URL" when absent), title, search params (an object) and search
-     type, show-domain-as-title, window type, is-visible, hide-header, back-button -- each key name
-     from a native (`getUrlKey`, `getTitleKey`, ...) -- and hands them to `vl.b.a(url, title, ...)`,
-     the UI that opens `com.roblox.client.hybrid.RBHybridWebView`.
-   * The page's way back: `cl.d.d(Context)` calls `WebView.addJavascriptInterface(obj, name)`
-     (**object class, name and methods not yet decoded**); `jk.a0.a/f` -> `WebViewProtocol.u(msg)`
-     -> the static native **`signalJavascriptCallback(String)`**, which is how the challenge result
-     reaches the engine. **Where the real app constructs `WebViewProtocol`** (and so when the
-     subscriptions are made) is not yet decoded: `jk.a0` holds one (field `e`),
-     `ActivityNativeMain$a` too.
-   * **The plan:** (a) the host seam, `omni_platform::webview` over WebView2 --
-     `docs/briefs/webview2-seam.md`, ready to hand a subagent; (b) the Android side in
-     `crates/omni-android` (the JNI layer): host-backed `RawCallback`/`RequestHandlerRaw` objects
-     (a new `Answer` whose `run` goes to a Rust closure), registered through the engine's own
-     `doSubscribeRaw`/`setRequestHandlerRaw` at the point the real app does, answering
-     `isAvailable`, opening a `WebView` on `openWindow`, closing on `closeWindow`, publishing
-     `handleWindowClose` when the person closes it, and a JavaScript shim (the seam's
-     `init_script`) that defines the page's Android interface object and forwards its calls
-     through `window.chrome.webview.postMessage` to `signalJavascriptCallback`.
+1. **The person's next test: enter a game.** Every death the signed-in sessions found is fixed.
+   Relaunch `tools\play.ps1` (`-Fresh` while item 4 stands), sign in (Quick Sign-in, or password +
+   the captcha in the new web view), open a game, Play, and watch the log for `GUEST THREAD DIED`.
+   Everything after the join -- the RCC connection over UDP, the 3D renderer, physics -- has never
+   run here; expect refusals, each naming itself.
+   **MEASURED 2026-09-23: without the VPN this machine's network cannot reach Roblox at all.** The
+   system resolver answers `195.175.254.2` for `clientsettingscdn.roblox.com` and
+   `www.roblox.com` (a public resolver answers CloudFront's `65.9.9.68`), and that address presents
+   a certificate Windows rejects (`SEC_E_UNTRUSTED_ROOT`). The engine's first fetch then fails
+   `HttpError: TlsVerificationFail`, `getFlags: success = false`, no frame is ever drawn, and the
+   gate's close assertion fails on a `SessionHistory` of `I` (wv1 in that session's scratchpad). A
+   gate failure with those lines is the network, not the runtime. The VPN is how the owner reaches
+   Roblox from here; the runtime does not work around a network's block.
+2. **The web view -- BUILT (`b74f62d`, `9cdef80`); not yet met a real captcha.** The whole path,
+   DECODED, is in `crates/omni-android/src/jni/webview.rs`'s module docs. In short:
+   * **Where it is built:** `MainGameActivity.B2`'s UI runnable (`jk.c1`) forces the lazy `fh.c`
+     and `jk.a0`; `jk.a0`'s constructor is `new WebViewProtocol(jk.a0)`:
+     `setRequestHandlerRaw("WebView", "isAvailable")`, `doSubscribeRaw` for `WebView.openWindow`,
+     `.mutateWindow`, `.closeWindow`, then `initializeAndroidWebViewProtocol` (installs the engine's
+     `AndroidWebViewProtocol`); then `fh.c.c()` binds `BrowserService.OpenBrowserWindow`,
+     `.CloseBrowserWindow`, `.SendCommand` in `MemStorage`. The gate does all of it before step 12,
+     with a window (`WEBVIEW:` lines), and pumps it on the UI thread every session turn.
+   * **The page's bridge:** `cl.d.d` adds `cl.d$c` as **`__globalRobloxAndroidBridge__`**, one
+     method, **`executeRoblox(String)`**; in `ri.a` (the web view `jk.a0.g` puts up) the string goes
+     raw to `signalJavascriptCallback`, which the engine publishes as `WebView`/
+     `handleJavascriptCallback` (`0x2bac648`). The host defines the object with the seam's
+     `init_script` and forwards through `window.chrome.webview.postMessage`.
+   * **The user agent** is the app's (`el.i.c`: `... ROBLOX Android App 2.738.1397 Phone Hybrid()
+     ...`), built from the facts the engine is given; Roblox's pages read it to use the bridge.
+   * **MEASURED:** every install call returns; `OMNI_WEBVIEW_PROBE=<s>` (opt-in, SYNTHETIC)
+     publishes `openWindow` on the engine's own bus with a page that calls the bridge: the page
+     opened, `executeRoblox` reached the engine (`[FLog::WebView] Sending command: {...} to
+     WebViewService`), `closeWindow` closed it and `handleWindowClose` was published (wv4). Unit
+     tests 13/13; `tools/mutate.py --only webview-` 11/11.
+   * **Assumed, and what would falsify it:** the Java flag `EnableAndroidWebViewService4` (whether
+     `ri.a` gets the listener that reaches `signalJavascriptCallback`) is taken as **on** -- its
+     compiled default is off and a device reads Roblox's settings service, which this host does not
+     fetch; the engine forces its own two web-view flags on (`0x2bd58a0`). If a captcha's result
+     never arrives and the engine is waiting on `MemStorage` `BrowserService.JavaScriptCallback`,
+     this is wrong.
+   * **Not done, each said in the code:** a page calling the bridge **from an iframe** -- the init
+     script runs there, but WebView2 routes an iframe's `postMessage` to `ICoreWebView2Frame2`,
+     which the seam does not subscribe (measured; about five COM pieces to add); the telemetry call
+     `MessageBus$b.run` makes; `BrowserService.OpenBrowserWindow` (the Java side throws on it in this
+     version) and `.SendCommand` (not decoded) refuse by name; cookies, deep links and back
+     navigation inside the page; `NativeGLJavaInterface.getWebViewUserAgent()V` is still a `Sink`
+     (on a device it asks a `WebViewUserAgentGetter`; not decoded).
 3. **Performance -- 1 to 7 frames per second, the person's main complaint.** Measured state and a
    ready brief in **`docs/briefs/performance.md`**. In short: CPU is not saturated (2.3-2.4 cores);
    one core is the game loop spinning on `ALooper_pollOnce(0)` + a mutex (DECODED at `0x2bcd648`;
@@ -1074,8 +1080,7 @@ What a run reaches, every time:
    channel has been turned on yet -- `OMNI_CLIENT_APP_SETTINGS` with 12, 1030, "1030" and 65535 all
    printed nothing (gate115-116). The log site's check is DECODED (`0x61c96a4`: the flag's low byte
    >= 6 and a bit of `0xfc00`); how a settings value becomes those bits is not.
-7. **`tools/mutate.py --only aaudio-` has not been run** (six rows, added with the audio work; two
-   of their mutations were checked by hand and caught). Run it with the tree to itself.
+7. **`tools/mutate.py --only aaudio-`: 6/6 caught** (2026-09-23, the tree to itself).
 8. **The one unexplained corruption**: gate42's MemoryFault in a libc++ `unordered_map` rehash at
    link `0x21db208` -- 32 bytes of `0xFF`, seen once in ~20 runs, not since. Treat it as live.
 

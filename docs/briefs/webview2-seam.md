@@ -1,5 +1,8 @@
 # Brief: a host web-view seam in `omni-platform` (WebView2)
 
+**DONE 2026-09-23 (`b74f62d`).** Built from this brief, with three additions: `user_agent`,
+`WebViewEvent::NonStringMessage` and `WebViewError::InvalidArgument`. Kept for the record.
+
 Written 2026-09-23 for a subagent; the first attempt was stopped when its session ended, before it
 had written any code. Relaunch it with this text (adjust the file-ownership list to whoever else is
 editing at the time).
