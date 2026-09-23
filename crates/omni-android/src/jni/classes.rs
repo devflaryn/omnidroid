@@ -1293,6 +1293,17 @@ pub static DECLARED: &[ClassSpec] = &[
         ],
     },
     ClassSpec {
+        name: "android/os/Debug",
+        tier: Tier::One,
+        // MEASURED: a worker asks `Debug.isDebuggerConnected()` (the null-class death that named
+        // it, once `FindClass` had answered null for the undeclared class). **`false` is a fact of
+        // this runtime, not a default**: a Java debugger attaches through JDWP to a VM, and there
+        // is no VM here and no JDWP agent -- nothing can be connected. A native debugger on the
+        // host process is not what this method reports on a device either.
+        methods: &[s("isDebuggerConnected", "()Z", Answer::Bool(false))],
+        fields: NONE,
+    },
+    ClassSpec {
         name: "android/os/LocaleList",
         tier: Tier::One,
         methods: &[
@@ -1882,6 +1893,23 @@ mod tests {
             assert_eq!(seen & bit, 0, "{} repeats a bit", member.name);
             seen |= bit;
         }
+    }
+
+    /// **`android.os.Debug.isDebuggerConnected()` is `false`**, declared on its class so that
+    /// `FindClass` finds it: there is no JDWP agent in this runtime to be connected to.
+    #[test]
+    fn no_java_debugger_is_connected_to_a_runtime_with_no_jdwp() {
+        let registry = Registry::with_declared();
+        let id = registry.find("android/os/Debug").expect("declared, so FindClass answers it");
+        let method = registry
+            .class(id)
+            .expect("just found")
+            .methods
+            .iter()
+            .find(|m| m.name == "isDebuggerConnected" && m.descriptor == "()Z")
+            .expect("isDebuggerConnected()Z is declared");
+        assert!(method.is_static, "a static method, as GetStaticMethodID asks for it");
+        assert_eq!(method.answer, Answer::Bool(false));
     }
 
     /// `Answer::Unanswered` must not evaluate to anything. It is the variant that refuses, and a
