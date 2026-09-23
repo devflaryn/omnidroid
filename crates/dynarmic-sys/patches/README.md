@@ -85,6 +85,54 @@ and in range, the cleared upper bits of `Vd`, and `QC` (set, clear, and sticky),
 against values worked from the ARM ARM pseudocode (`SatQ`, and
 `(2 * a * b) >> esize` for `SQDMULH`).
 
+### 0004 — arm64: half-precision arithmetic, and a fallback that dropped its result
+
+`0004-arm64-half-precision.patch`. **arm64 only.** Two defects in one family.
+
+**Unimplemented.** Every FP16 opcode the A64 frontend can emit and the arm64
+backend lacked was `ASSERT_FALSE("Unimplemented")`: scalar `FPAbs16`, `FPNeg16`,
+`FPMulAdd16`, `FPMulSub16`, `FPRoundInt16`, `FPRecipEstimate16`,
+`FPRecipExponent16`, `FPRSqrtEstimate16`, `FPRecipStepFused16`,
+`FPRSqrtStepFused16`, `FPHalfToFixed{S,U}{32,64}`, and vector `FPVectorEqual16`,
+`FPVectorMulAdd16`, `FPVectorNeg16`, `FPVectorRecipEstimate16`,
+`FPVectorRSqrtEstimate16`, `FPVectorRecipStepFused16`, `FPVectorRSqrtStepFused16`.
+They are reached by `FMADD`/`FMSUB`/`FNMADD`/`FNMSUB`, `FABS`, `FNEG`, `FRINT*`,
+`FRECPE`, `FRECPX`, `FRSQRTE`, `FRECPS`, `FRSQRTS`, `FCVT*`, `FCMEQ`, `FMLA`/`FMLS`
+at `ftype == 0b11` / `.4H`/`.8H` — `hostile.rs`'s fuzzer died on `FMSUB H` at
+trial 1002. The arithmetic ones now call dynarmic's own `FP::` routines, **the
+same ones the x64 backend calls for these opcodes** (x64 has no half-precision
+arithmetic), so both hosts produce the same bits and no host FEAT_FP16 is
+assumed; `FPAbs16`/`FPNeg16`/`FPVectorNeg16` are the sign-bit operations they
+are. Exceptions accumulate into the guest's `FPSR` after the FPSR manager is
+spilled.
+
+**A silent wrong answer.** `EmitTwoOpFallbackWithoutRegAlloc` saved and restored
+`ABI_CALLER_SAVE & ~(1ull << Qresult.index())` — which removes the
+*general-purpose* register with the result's number and keeps the result's `Q`
+register in the list, so the pop put the result register's old contents back
+over the computed value. It serves `FPVectorRoundInt16`, reached by
+`FRINT{N,M,P,Z,A,X,I}` (vector, half), which is **active** in the decoder.
+MEASURED before the patch: `FRINTN V0.8H, V1.8H` returned `[0, 0]`. The mask is
+now `~ToRegList(Qresult)`, and the new three- and four-operand helpers use the
+same.
+
+**Unreachable from A64, left as they are, with the evidence:**
+`FPHalfToFixedS16/U16` (only `FPToFixedS16/U16`, which only the A32 frontend
+calls, `A32/translate/impl/vfp.cpp:1073`); `FPVectorToSignedFixed16`,
+`FPVectorToUnsignedFixed16` (`FloatConvertToInteger` fixes esize at 32/64,
+`simd_two_register_misc.cpp:107`; `ConvertFloat` rejects `immh` 0001-0011,
+`simd_shift_by_immediate.cpp:197`; the half forms are `//INST` in `a64.inc`);
+and the `RoundingMode::ToOdd` arms of both `EmitToFixed` helpers (A64 passes a
+constant mode or `FPCR.RMode`, a 2-bit field that cannot hold `ToOdd` = 5; the
+only `ToOdd` in the A64 frontend is `FCVTXN`, which is not a to-fixed
+conversion).
+
+`tests/a64_fp16.rs`: every reachable form, with encodings checked against the
+LLVM assembler and values worked from IEEE binary16 and the ARM ARM (the 8-bit
+estimate tables, `FPRecpX`, fused single rounding shown by a lane whose exact
+result is a subnormal that a two-rounding implementation would flush to +0),
+plus FPSR `IOC`/`DZC`/`IXC` where the ARM ARM raises them.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is
