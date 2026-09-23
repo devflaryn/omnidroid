@@ -32,3 +32,7 @@ Thumbs.db
 # Python bytecode from tools/ (they are scripts, not a package).
 __pycache__/
 *.pyc
+
+# dynarmic's CMake runs `mig` on macOS and writes the Mach exception stubs into the SOURCE tree
+# (`src/dynarmic/CMakeLists.txt`, the APPLE branch). Generated per SDK; never part of the pin.
+crates/dynarmic-sys/vendor/dynarmic/src/dynarmic/backend/*/mig/
