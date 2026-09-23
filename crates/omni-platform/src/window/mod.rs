@@ -122,6 +122,11 @@ mod unix;
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as backend;
+/// The set-1 scancode (`0xE000` for an `E0`-extended key) the Linux backend reports for a Linux
+/// input code: see the Linux backend's `keymap` module. Public so that the consumer that decodes
+/// it (`omni-android`'s keyboard path) can be tested against it.
+#[cfg(target_os = "linux")]
+pub use linux::keymap::scancode_from_evdev;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -414,6 +419,14 @@ pub enum RawWindow {
         /// The `HINSTANCE` the window class was registered with, as an integer.
         hinstance: isize,
     },
+    /// An X11 window on an Xlib connection -- `VkXlibSurfaceCreateInfoKHR` wants both. The
+    /// connection is the window's own and lives exactly as long as the `Window` does.
+    Xlib {
+        /// The `Display *`, as an integer.
+        display: usize,
+        /// The X window id (an `XID`, a `Window` in Xlib's spelling).
+        window: u64,
+    },
 }
 
 impl RawWindow {
@@ -425,6 +438,7 @@ impl RawWindow {
     pub const fn system_name(self) -> &'static str {
         match self {
             RawWindow::Win32 { .. } => "win32",
+            RawWindow::Xlib { .. } => "xlib",
         }
     }
 }

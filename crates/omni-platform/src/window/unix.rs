@@ -52,6 +52,10 @@
 //! physical pixels everywhere (see [`super`]), so both backends multiply, and both have to handle
 //! the factor *changing* when a window moves between displays.
 
+// Linux has its own backend now (`linux.rs`); this structural body is macOS's alone, and on a
+// Linux build it is compiled (the module is `cfg(unix)`) and unused.
+#![cfg_attr(target_os = "linux", allow(dead_code))]
+
 use super::{RawWindow, WindowDesc, WindowError, WindowResult};
 
 /// The platform this backend was compiled for, for error messages.

@@ -1769,13 +1769,62 @@ impl VulkanHost for GfxVulkanHost {
                     Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
                 }
             }
+            RawWindow::Xlib { display, window } => {
+                // **The instance must have been given `VK_KHR_xlib_surface`**, and the only way
+                // it was is the rewrite: the guest enabled `VK_KHR_android_surface`, and
+                // `platform_surface_extension` substituted whatever this loader's probe chose.
+                // Index 1 is Xlib in both pairing tables. A loader whose probe chose another
+                // extension (one without Xlib) created this instance without it, and
+                // `vkCreateXlibSurfaceKHR` on it would be a function the instance never loaded --
+                // so that is refused by name before `ash` is asked for it.
+                const XLIB: usize = 1;
+                debug_assert_eq!(PLATFORM_SURFACE_EXTENSIONS[XLIB], "VK_KHR_xlib_surface");
+                let chosen = self.platform_index()?;
+                if chosen != XLIB {
+                    return Err(refused(
+                        "vkCreateAndroidSurfaceKHR",
+                        &format!(
+                            "the guest's `ANativeWindow *` resolved to an Xlib window, but this \
+                             loader's window-system extension is `{}`, which is what the guest's \
+                             `VK_KHR_android_surface` was rewritten to -- so the instance has no \
+                             `VK_KHR_xlib_surface` to make the surface with",
+                            PLATFORM_SURFACE_EXTENSIONS[chosen]
+                        ),
+                    ));
+                }
+                let key = crate::claim::WindowKey::xlib(window);
+                let info = vk::XlibSurfaceCreateInfoKHR::default()
+                    .dpy(display as *mut vk::Display)
+                    .window(window as vk::Window);
+                let xlib = khr::xlib_surface::Instance::new(&self.entry, handle);
+                // SAFETY: `display` and `window` came from a live `omni_platform::window::Window`
+                // that `ndk::WindowSource::raw_window` published, the instance was created with
+                // `VK_KHR_xlib_surface` (checked above), `info` borrows nothing that does not
+                // outlive this call, and `pAllocator` is `None` because a guest allocator is
+                // refused by name one layer up.
+                match unsafe { xlib.create_xlib_surface(&info, None) } {
+                    Ok(surface) => {
+                        let token = self.locked_surfaces().insert(SurfaceEntry {
+                            instance: index,
+                            surface,
+                            window: key,
+                        });
+                        Ok(DriverAnswer::Ok(SurfaceCreated {
+                            surface: HostSurface::from_token(token),
+                            // From the pairing table, as the Win32 arm's is.
+                            host_call: PLATFORM_SURFACE_ENTRY_POINTS[XLIB].to_string(),
+                        }))
+                    }
+                    Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+                }
+            }
             other => Err(refused(
                 "vkCreateAndroidSurfaceKHR",
                 &format!(
                     "the guest's `ANativeWindow *` resolved to a {system} window, and this host \
                      has no Vulkan surface call for that window system -- only \
-                     `VK_KHR_win32_surface`. This is a refusal rather than a `VkResult` because \
-                     the specification has no code for \"this build of the host cannot make a \
+                     `VK_KHR_win32_surface` and `VK_KHR_xlib_surface`. This is a refusal rather \
+                     than a `VkResult` because the specification has no code for \"this build of the host cannot make a \
                      surface here\", and `VK_ERROR_INITIALIZATION_FAILED` would send the engine \
                      looking at its driver. `crate::vulkan::create_surface` is the other place \
                      that grows when `RawWindow` gains a variant",

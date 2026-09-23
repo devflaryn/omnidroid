@@ -267,6 +267,10 @@ pub struct Renderer {
     /// Set when something observed that the swapchain no longer matches the surface -- a resize
     /// event, or a `VK_SUBOPTIMAL_KHR` from acquire or present.
     swapchain_dirty: bool,
+    /// Whether a zero-pixel [`notify_resized`](Renderer::notify_resized) means *no swapchain*
+    /// even when the surface states an extent of its own, as [`zero_size_is_the_windows`] decides
+    /// for this window's system.
+    zero_size_is_the_windows: bool,
 
     frames_presented: u64,
     swapchain_generations: u64,
@@ -318,7 +322,8 @@ impl Renderer {
             |claimed| GfxError::WindowInUse { owner: claimed.owner, window: claimed.window.raw() },
         )?;
 
-        let (instance, available_layers, validation_enabled) = create_instance(&entry)?;
+        let (instance, available_layers, validation_enabled) =
+            create_instance(&entry, platform_extension(window)?)?;
         let surface_fn = khr::surface::Instance::new(&entry, &instance);
         // From here on, every `?` unwinds through `Base::drop`.
         let mut base = Base { surface: vk::SurfaceKHR::null(), surface_fn, instance, entry };
@@ -391,6 +396,7 @@ impl Renderer {
             present_mode: select::present_mode(config.present_mode, &modes),
             target_extent: extent,
             swapchain_dirty: false,
+            zero_size_is_the_windows: zero_size_is_the_windows(window),
             frames_presented: 0,
             swapchain_generations: 0,
             dev,
@@ -828,7 +834,13 @@ impl Renderer {
             return Err(GfxError::SurfaceCannotBeTransferDestination);
         }
 
-        let extent = select::clamp_extent(self.target_extent, &caps);
+        let minimised = self.zero_size_is_the_windows
+            && (self.target_extent.0 == 0 || self.target_extent.1 == 0);
+        let extent = if minimised {
+            vk::Extent2D { width: 0, height: 0 }
+        } else {
+            select::clamp_extent(self.target_extent, &caps)
+        };
         if extent.width == 0 || extent.height == 0 {
             self.destroy_swapchain();
             self.swapchain_dirty = false;
@@ -1121,8 +1133,36 @@ unsafe fn barrier(
     }
 }
 
+/// One row of `create_instance`'s extension probe: `ash`'s constant, the name the refusal
+/// reports, and what the extension's absence means.
+type PlatformExtension = (&'static CStr, &'static str, &'static str);
+
+/// The window-system instance extension `window` needs.
+///
+/// **The same `match` shape as [`create_surface`]**, so that the extension an instance is created
+/// with and the surface call made on it are chosen by the same arm of the same enum.
+fn platform_extension(window: RawWindow) -> GfxResult<PlatformExtension> {
+    match window {
+        RawWindow::Win32 { .. } => Ok((
+            khr::win32_surface::NAME,
+            "VK_KHR_win32_surface",
+            "the Vulkan loader found a driver, but not one that can present to a Win32 window",
+        )),
+        RawWindow::Xlib { .. } => Ok((
+            khr::xlib_surface::NAME,
+            "VK_KHR_xlib_surface",
+            "the Vulkan loader found a driver, but not one that can present to an X11 window \
+             through Xlib",
+        )),
+        other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
+    }
+}
+
 /// Create the instance, enabling validation only if the host has it.
-fn create_instance(entry: &ash::Entry) -> GfxResult<(ash::Instance, Vec<String>, bool)> {
+fn create_instance(
+    entry: &ash::Entry,
+    platform: PlatformExtension,
+) -> GfxResult<(ash::Instance, Vec<String>, bool)> {
     // SAFETY: both enumerations take no handles and write into `ash`-owned vectors.
     let (layer_props, extension_props) = unsafe {
         (
@@ -1157,11 +1197,7 @@ fn create_instance(entry: &ash::Entry) -> GfxResult<(ash::Instance, Vec<String>,
             "VK_KHR_surface",
             "the Vulkan loader found no installable client driver that can present at all",
         ),
-        (
-            khr::win32_surface::NAME,
-            "VK_KHR_win32_surface",
-            "the Vulkan loader found a driver, but not one that can present to a Win32 window",
-        ),
+        platform,
     ] {
         // A `debug_assert!`, not an `if`: no input can make these disagree, because both are
         // literals on the same row. VERIFICATION entry 12 is the rule — a guard that nothing can
@@ -1184,7 +1220,7 @@ fn create_instance(entry: &ash::Entry) -> GfxResult<(ash::Instance, Vec<String>,
         // reports 1.4.325 (spike §3), which is compatible with a 1.0 request.
         .api_version(vk::make_api_version(0, 1, 0, 0));
 
-    let extensions = [khr::surface::NAME.as_ptr(), khr::win32_surface::NAME.as_ptr()];
+    let extensions = [khr::surface::NAME.as_ptr(), platform.0.as_ptr()];
     let layers = [VALIDATION_LAYER.as_ptr()];
     let mut info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
@@ -1216,11 +1252,37 @@ fn create_surface(
             unsafe { win32.create_win32_surface(&info, None) }
                 .map_err(GfxError::vk("create", "vkCreateWin32SurfaceKHR"))
         }
+        RawWindow::Xlib { display, window } => {
+            let info = vk::XlibSurfaceCreateInfoKHR::default()
+                .dpy(display as *mut vk::Display)
+                .window(window as vk::Window);
+            let xlib = khr::xlib_surface::Instance::new(entry, instance);
+            // SAFETY: `display` and `window` came from a live `omni_platform::window::Window`,
+            // whose documentation requires it to outlive any surface made from it, and the
+            // instance was created with `VK_KHR_xlib_surface` by `platform_extension`'s same arm.
+            unsafe { xlib.create_xlib_surface(&info, None) }
+                .map_err(GfxError::vk("create", "vkCreateXlibSurfaceKHR"))
+        }
         // `RawWindow` is `#[non_exhaustive]`, so a Wayland or AppKit variant added to the seam
         // later lands here and refuses **naming itself**, rather than turning this `match` into
         // one that silently stopped being exhaustive.
         other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
     }
+}
+
+/// Whether, on `window`'s system, the window's own zero-pixel size is the only sign that it has
+/// no pixels -- so that the renderer must hold no swapchain even though the surface still states
+/// an extent.
+///
+/// **Win32: no**, and nothing changes there: a minimised window's surface reports a
+/// `currentExtent` of 0x0 itself, which [`select::clamp_extent`] already returns. **Xlib: yes**,
+/// MEASURED: an iconified X window keeps its geometry -- the server has no notion of minimised,
+/// only the window manager's `WM_STATE` does (see `omni_platform`'s Linux backend) -- and Mesa's
+/// X11 surface reports that geometry as `currentExtent` (640x480 for a 640x480 window iconified
+/// under xfwm4, with lavapipe). Without this the renderer went on presenting to an unmapped window,
+/// 14,863 frames in the ten seconds `renderer_live`'s minimise test waited.
+const fn zero_size_is_the_windows(window: RawWindow) -> bool {
+    matches!(window, RawWindow::Xlib { .. })
 }
 
 /// The [`claim::WindowKey`] for a window, or a refusal naming the system it belongs to.
@@ -1234,6 +1296,7 @@ fn create_surface(
 fn window_key(window: RawWindow) -> GfxResult<claim::WindowKey> {
     match window {
         RawWindow::Win32 { hwnd, .. } => Ok(claim::WindowKey::win32(hwnd)),
+        RawWindow::Xlib { window, .. } => Ok(claim::WindowKey::xlib(window)),
         other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
     }
 }
