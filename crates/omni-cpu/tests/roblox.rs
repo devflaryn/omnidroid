@@ -753,9 +753,14 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
         MAX_THREAD_COMMIT_BYTES as f64 / 1048576.0
     );
     // And a floor, so the ceiling cannot be met by a measurement that measured nothing: creating
-    // eight jits has to move the counter.
+    // eight jits has to move the counter. On macOS the counter is `phys_footprint`, which charges a
+    // page when it is first touched rather than when it is committed, and since patch 0009 a new
+    // jit touches its code cache only where it writes the prelude: the floor there is that one
+    // host page per jit (measured 0.027 and 0.029 MiB/jit in two runs of n = 8, M1), not the
+    // megabyte a commit-charge host moves.
+    let floor = if cfg!(target_os = "macos") { omni_platform::vm::page_size() as u64 } else { 1024 * 1024 };
     assert!(
-        per_thread_created >= 1024 * 1024,
+        per_thread_created >= floor,
         "creating a guest thread moved the commit charge by {per_thread_created} bytes, which is \
          too little to be a real jit -- the measurement is not measuring what it claims"
     );
