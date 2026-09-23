@@ -1307,6 +1307,18 @@ pub static DECLARED: &[ClassSpec] = &[
         fields: &[sf("MANUFACTURER", "Ljava/lang/String;", Answer::Unanswered)],
     },
     ClassSpec {
+        name: "android/os/Build$VERSION",
+        tier: Tier::One,
+        // MEASURED: with `Build` found, the same workers' next `FindClass` was this, and its null
+        // again reached `GetStaticMethodID(.., "isDebuggerConnected")` -- the engine's lookups
+        // short-circuit on the first that fails. Every device has it. `SDK_INT` is
+        // `script::ANDROID_SDK_LEVEL`, the one figure every other SDK answer here reads
+        // (`ro.build.version.sdk`, `DeviceStaticParams.osVersion`, `FMOD.supportsAAudio`), and
+        // FMOD reads this field itself (`0x4fc0088`..`0x4fc00ac`).
+        methods: NONE,
+        fields: &[sf("SDK_INT", "I", Answer::Int(super::script::ANDROID_SDK_LEVEL))],
+    },
+    ClassSpec {
         name: "android/os/Debug",
         tier: Tier::One,
         // MEASURED: a worker asks `Debug.isDebuggerConnected()` (the null-class death that named
@@ -1928,6 +1940,23 @@ mod tests {
             .expect("MANUFACTURER is declared");
         assert!(maker.is_static);
         assert_eq!(maker.answer, Answer::Unanswered, "the embedding's to state");
+    }
+
+    /// **`Build.VERSION.SDK_INT` is the one SDK level** every other answer uses.
+    #[test]
+    fn build_version_sdk_int_is_the_one_sdk_level() {
+        let registry = Registry::with_declared();
+        let id = registry.find("android/os/Build$VERSION").expect("declared, so FindClass finds it");
+        let sdk = registry
+            .class(id)
+            .expect("just found")
+            .fields
+            .iter()
+            .find(|f| f.name == "SDK_INT" && f.descriptor == "I")
+            .expect("SDK_INT is declared");
+        assert!(sdk.is_static);
+        assert_eq!(sdk.answer, Answer::Int(super::super::script::ANDROID_SDK_LEVEL));
+        assert_eq!(sdk.answer, Answer::Int(33), "Android 13");
     }
 
     /// **`android.os.Debug.isDebuggerConnected()` is `false`**, declared on its class so that
