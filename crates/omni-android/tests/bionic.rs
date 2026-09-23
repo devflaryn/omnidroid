@@ -13870,3 +13870,47 @@ fn gethostname_answers_android_localhost_or_enametoolong() {
     assert_eq!(read_u64_guest(&f, out + 8) as i32, -1, "9 bytes cannot hold it");
     assert_eq!(read_u64_guest(&f, out + 16) as u32, 36, "ENAMETOOLONG");
 }
+
+/// **An empty service is bionic's `EAI_SERVICE`** (and `EAI_NONAME` under `AI_NUMERICSERV`), not a
+/// refusal. bionic's `str2number` rejects `""` before `strtoul`, so `get_port` looks the empty name
+/// up with `getservbyname`, which nothing can match. MEASURED why: pressing Play on a game page, a
+/// worker called `getaddrinfo(host, "", ...)` and died on the numeric-only refusal (2026-09-23).
+/// A service *name* still refuses -- that one does need the host's services database.
+#[test]
+fn getaddrinfo_answers_an_empty_service_as_bionic_does() {
+    let _guard = serialized();
+    let (f, _root) = networked("gai-empty-service");
+    let res = f.guest.data + 0x180;
+    let hints = f.guest.data + 0x200;
+    let literal = f.cstring(f.guest.data + 0x100, b"127.0.0.1");
+    let empty = f.cstring(f.guest.data + 0x140, b"");
+
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, literal as u64);
+        asm.mov(1, empty as u64);
+        asm.mov(2, 0);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 9, "EAI_SERVICE: getservbyname(\"\") matches nothing");
+
+    f.guest.write_bytes(hints, &[0u8; 48]);
+    f.guest.write_bytes(hints, &0x0008i32.to_le_bytes()); // ai_flags = AI_NUMERICSERV
+    let code = value_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, literal as u64);
+        asm.mov(1, empty as u64);
+        asm.mov(2, hints as u64);
+        asm.mov(3, res as u64);
+    }) as i32;
+    assert_eq!(code, 8, "EAI_NONAME under AI_NUMERICSERV: \"\" is not a number");
+    assert_eq!(f.bionic.addrinfo_slab().live(), 0, "no list was handed out");
+
+    // A service name is still the host's services database, which this layer does not read.
+    let named = f.cstring(f.guest.data + 0x160, b"https");
+    let refusal = refusal_of(&f, "getaddrinfo", |asm| {
+        asm.mov(0, literal as u64);
+        asm.mov(1, named as u64);
+        asm.mov(2, 0);
+        asm.mov(3, res as u64);
+    });
+    assert!(refusal.to_string().contains("numeric service only"), "{refusal}");
+}

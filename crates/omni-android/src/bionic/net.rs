@@ -1688,6 +1688,9 @@ const EAI_FAIL: i32 = 4;
 const EAI_FAMILY: i32 = 5;
 /// `EAI_SOCKTYPE`: `ai_socktype` is one this layer has no socket for.
 const EAI_SOCKTYPE: i32 = 10;
+/// `EAI_SERVICE`: the service is not one this socket type can use -- "Servname not supported for
+/// ai_socktype", row 9 of bionic's `ai_errlist` (`omni_bionic::net::gai_strerror_message`).
+const EAI_SERVICE: i32 = 9;
 
 // ---------------------------------------------------------------- the socket errno numbers
 //
@@ -3887,6 +3890,17 @@ fn resolve_into(
     } else {
         let at = guest_address(view, service)?;
         let bytes = view.mem().cstr(at, Blame::new(view.symbol(), view.address(), 1))?;
+        if bytes.is_empty() {
+            // **An empty service is answered, and needs no services database to answer.** bionic's
+            // `str2number` rejects the empty string before `strtoul` (`if (*p == ' ') return
+            // -1`), so `get_port` takes the name path: `EAI_NONAME` under `AI_NUMERICSERV`, and
+            // otherwise `getservbyname("", proto)`, which no entry of any services table can match
+            // -- `EAI_SERVICE`. That is `get_portmatch`, which bionic runs before it resolves the
+            // node, so the name is never looked up. MEASURED why: pressing Play on a game page,
+            // a TaskScheduler worker called `getaddrinfo(host, "", ...)` and died on this seam's
+            // numeric-only refusal (2026-09-23), and the join froze.
+            return Ok(if hints.flags & AI_NUMERICSERV != 0 { net::EAI_NONAME } else { EAI_SERVICE });
+        }
         let text = String::from_utf8_lossy(&bytes).into_owned();
         match platnet::service_port(&text) {
             Ok(port) => port,

@@ -301,6 +301,8 @@ BIONIC_SCHED = ["cargo", "test", "-p", "omni-android", "--release", "--test", "b
 BIONIC_HOSTNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
                    "gethostname"]
 JNI_THEME = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "system_theme"]
+BIONIC_GAI = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+              "getaddrinfo"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7244,6 +7246,20 @@ directory", ADAPTER_FILES,
      """            s("getSystemTheme", "()I", Answer::Int(system_theme_for(UI_MODE))),""",
      """            s("getSystemTheme", "()I", Answer::Int(4)),""",
      JNI_THEME),
+
+    # getaddrinfo with an empty service: what pressing Play reached next (2026-09-23).
+    ("gai-A1", "A", "an empty getaddrinfo service is refused again, as a service name",
+     "crates/omni-android/src/bionic/net.rs",
+     """        if bytes.is_empty() {
+            // **An empty service""",
+     """        if false {
+            // **An empty service""",
+     BIONIC_GAI),
+    ("gai-B1", "B", "AI_NUMERICSERV is ignored for an empty service: EAI_SERVICE where bionic says EAI_NONAME",
+     "crates/omni-android/src/bionic/net.rs",
+     """            return Ok(if hints.flags & AI_NUMERICSERV != 0 { net::EAI_NONAME } else { EAI_SERVICE });""",
+     """            return Ok(EAI_SERVICE);""",
+     BIONIC_GAI),
 ]
 
 
