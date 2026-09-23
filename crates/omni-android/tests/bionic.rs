@@ -2789,6 +2789,25 @@ fn an_unterminated_string_faults_at_the_end_of_its_mapping() {
 /// atomic on an unaligned address is undefined behaviour in Rust, and on the guest's own hardware
 /// `LDXR`/`STXR` take an alignment fault there too — so refusing is what the guest would see on a
 /// real device, and it is the only answer here that is not undefined behaviour.
+/// **A lock wait the instance's shutdown interrupts is refused, never returned.** A default mutex
+/// held by the caller, the instance's threads stopped (which stops its futex), and a second
+/// `pthread_mutex_lock` -- the contention path, with nobody to release it -- refuses naming the
+/// shutdown: it neither loops in the host (gate87's stranded thread) nor returns the `EINTR` POSIX
+/// does not give a lock. Without the handler's check the call completes with 4 and this fails.
+#[test]
+fn a_lock_wait_the_shutdown_interrupts_is_refused_naming_it() {
+    let _guard = serialized();
+    let f = fixture();
+    let mutex = f.guest.data + 0x200;
+    f.guest.write_bytes(mutex, &[0u8; 40]);
+    assert_eq!(value_of(&f, "pthread_mutex_lock", |asm| { asm.mov(0, mutex as u64); }), 0);
+    f.bionic.stop_guest_threads();
+    let error = refusal_of(&f, "pthread_mutex_lock", |asm| {
+        asm.mov(0, mutex as u64);
+    });
+    assert!(error.to_string().contains("shutting down"), "{error}");
+}
+
 #[test]
 fn an_unaligned_mutex_word_is_refused_rather_than_atomically_accessed() {
     let _guard = serialized();

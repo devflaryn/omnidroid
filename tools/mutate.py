@@ -6947,6 +6947,11 @@ directory", ADAPTER_FILES,
      """    let control = character < ' ' || character == '\\u{7F}';""",
      """    let control = false;""",
      PLATFORM_LIB),
+    ("shutdownlock-A1", "A", "a lock wait the shutdown interrupts returns EINTR to the guest",
+     "crates/omni-android/src/bionic/handlers.rs",
+     """    if code == omni_bionic::errno::consts::EINTR && omni_bionic::threads::Futex::interrupted(futex) {""",
+     """    if false {""",
+     ANDROID),
 ]
 
 
