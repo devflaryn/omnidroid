@@ -27,7 +27,7 @@
 //! would change the meaning of `wait` for every caller at once.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omni_bionic::metadata::Yield;
@@ -88,8 +88,8 @@ impl AddressFutex {
         (self.waits.load(Ordering::Relaxed), self.wakes.load(Ordering::Relaxed))
     }
 
-    /// Park on `addr` **only if `still_expected()` still holds**, checked atomically with the
-    /// decision to block.
+    /// Park on the guest word at `addr` **only if it still holds `expected`**, checked atomically
+    /// with the decision to block.
     ///
     /// # This is the comparison the trait's `wait` deliberately does not make
     ///
@@ -103,31 +103,83 @@ impl AddressFutex {
     ///
     /// So the capability is added here rather than by changing what `wait` means for everyone.
     ///
-    /// # Why this closes the window, and where the closure runs
+    /// # Why this closes the window, and where the comparison runs
     ///
-    /// `still_expected` is `parking_lot_core::park`'s **`validate`** callback, which runs with the
+    /// The comparison is `parking_lot_core::park`'s **`validate`** callback, which runs with the
     /// queue's bucket lock held. A concurrent [`Futex::wake`] on the same address must take that
     /// lock to find the queue, so it cannot land between the comparison and the park. That is the
     /// same property the kernel gets from its hash-bucket spinlock, and it is the whole reason
-    /// this is a callback rather than a value compared before the call.
+    /// the comparison is a callback rather than a value compared before the call.
     ///
-    /// **The closure must not panic and must not itself park**, which is `parking_lot_core`'s
-    /// requirement. A reader of guest memory satisfies both: it returns a `Result` and takes only
-    /// the address space's own lock. That lock is safe to take here because **nothing in this
-    /// runtime parks while holding it** — the pager's own invariant is that the thread running
-    /// guest code must not hold the space lock, so the inversion that would deadlock (hold the
-    /// space lock, then wait on a futex) has no path.
+    /// # Two steps, and the one lock rule that separates them
+    ///
+    /// `validate` **must not call into `parking_lot` at all**. That is `parking_lot_core`'s
+    /// contract (`parking_lot.rs:584`), and it is why the word is handled in two steps:
+    ///
+    /// 1. **`admit` runs first, before the park, holding nothing.** This is where the caller
+    ///    resolves the word, checks it and commits it, through the address space. That path takes
+    ///    the space's map lock, which is a `parking_lot::Mutex`, and here it may. An error is
+    ///    returned unchanged, without parking. It is the caller's `EFAULT`.
+    /// 2. **The comparison inside `validate` is one atomic load of the admitted word**, and
+    ///    nothing else. D4's identity mapping makes the guest address the host address, so there
+    ///    is nothing to resolve.
+    ///
+    /// MEASURED, as a 180-second freeze with every thread blocked and the CPU flat: the first
+    /// version compared by reading the word *through the space* inside `validate`. Its reasoning
+    /// was that nothing parks while holding the space lock, which is true and was not the
+    /// question. **The space lock parks when it is contended**: `RawMutex::lock_slow` spins ten
+    /// times and then parks on the mutex's own address, which needs that address's bucket while
+    /// `validate` already holds the futex's. If the two share a bucket, the waiter blocks on a
+    /// lock it holds itself, and the space lock's owner blocks when it unlocks and tries to wake
+    /// it. If they do not share one, a table growth (which locks every bucket in order) does the
+    /// same. The unit test
+    /// `checking_the_word_under_a_contended_lock_in_the_same_bucket_does_not_deadlock` builds
+    /// that collision on purpose.
+    ///
+    /// # What a concurrent `munmap` does
+    ///
+    /// * **To a waiter already asleep: nothing.** A parked waiter never touches the word again.
+    ///   It is keyed by the address alone and stays parked until a wake on that address, its
+    ///   timeout, or [`stop`](AddressFutex::stop). Linux's private futex behaves the same way.
+    /// * **Between `admit` and the load:** this is the same check-then-access window that every
+    ///   [`GuestMem`](crate::mem::GuestMem) read has, and it is a guest use-after-free: a thread
+    ///   unmaps a word another thread is entering `FUTEX_WAIT` on. The load raises an access
+    ///   violation inside `validate`. The demand pager examines it, which takes the space lock
+    ///   under the bucket lock (the hazard above). It declines a free address, and the violation
+    ///   goes on to the next host fault handler, which is the same outcome as a racing
+    ///   `read_bytes`. An `madvise(MADV_DONTNEED)` in the same window is the one legal case: the
+    ///   pager commits the page again and the load reads zero, as Linux would. Both now need
+    ///   that narrow race; the defect this replaced needed only a contended space lock.
     ///
     /// Returns [`WaitResult::WouldBlock`] when the comparison failed, which is the caller's
     /// `EAGAIN`.
-    pub fn wait_compared(
+    ///
+    /// # Errors
+    ///
+    /// Whatever `admit` returned. Nothing has parked or been counted when it does.
+    ///
+    /// # Safety
+    ///
+    /// When `admit` returns `Ok`, `addr` must be four-byte aligned, and its four bytes must be
+    /// mapped, readable and committed memory of this process. D4 makes a checked guest address
+    /// exactly that. The only thing that can falsify it later is the guest unmapping the word,
+    /// described above.
+    pub unsafe fn wait_compared<E>(
         &self,
         addr: u64,
-        still_expected: impl Fn() -> bool,
+        expected: u32,
+        admit: impl FnOnce() -> Result<(), E>,
         timeout: Option<Duration>,
-    ) -> WaitResult {
+    ) -> Result<WaitResult, E> {
+        // Step 1, outside every `parking_lot` lock. **First**, before the stop check: an
+        // unreadable word is `EFAULT` whether or not the instance is shutting down, which is the
+        // order the caller's own check used to give.
+        admit()?;
+        // Step 2. SAFETY: `admit` returned `Ok`, which is this function's precondition for
+        // `word_holds`.
+        let still_expected = || unsafe { word_holds(addr, expected) };
         if self.stopped() {
-            return WaitResult::WouldBlock;
+            return Ok(WaitResult::WouldBlock);
         }
         let _parked = self.enter_park(addr);
         self.waits.fetch_add(1, Ordering::Relaxed);
@@ -139,10 +191,9 @@ impl AddressFutex {
         // SAFETY: as `Futex::wait`, and with one addition. `park` requires that the key is not
         // concurrently used by another parking implementation with incompatible invariants — the
         // key is a guest address, which no other parker in this process uses — and that
-        // `validate`, `before_sleep` and `timed_out` neither panic nor park. `before_sleep` and
-        // `timed_out` are empty. `validate` is the caller's `still_expected`, whose contract is
-        // stated above and is discharged by its only caller, which reads four bytes of guest
-        // memory through the checked path.
+        // `validate` and `timed_out` neither panic nor call into `parking_lot`. `before_sleep` and
+        // `timed_out` are empty. `validate` is `still_expected`: one atomic load and a
+        // comparison, which takes no lock of any kind.
         let result = unsafe {
             parking_lot_core::park(
                 addr as usize,
@@ -153,14 +204,14 @@ impl AddressFutex {
                 deadline,
             )
         };
-        match result {
+        Ok(match result {
             parking_lot_core::ParkResult::Unparked(_) => WaitResult::Woken,
             parking_lot_core::ParkResult::TimedOut => WaitResult::TimedOut,
             // `validate` said the word had already changed. **This is the answer, not a
             // degenerate case**: it is `FUTEX_WAIT`'s `EAGAIN`, and it is the whole value of
             // performing the comparison.
             parking_lot_core::ParkResult::Invalid => WaitResult::WouldBlock,
-        }
+        })
     }
 
     /// **Stop accepting waits, and wake everything already parked.**
@@ -290,6 +341,24 @@ impl AddressFutex {
     pub fn parked_on(&self) -> u64 {
         self.last_wait.load(Ordering::Relaxed)
     }
+}
+
+/// Whether the admitted word at `addr` holds `expected`: **one atomic load, and nothing else.**
+///
+/// This is everything [`AddressFutex::wait_compared`] runs under the bucket lock, and it is a
+/// function of its own so that the rule is visible: no lock, no address-space call, no path into
+/// `parking_lot`. A plain `SeqCst` load of four bytes is one the standard library also permits
+/// on read-only memory, and `FUTEX_WAIT` only reads its word.
+///
+/// # Safety
+///
+/// `addr` is four-byte aligned and its four bytes are mapped, readable, committed memory of this
+/// process, which is what [`AddressFutex::wait_compared`]'s `admit` established.
+unsafe fn word_holds(addr: u64, expected: u32) -> bool {
+    // SAFETY: the caller's contract, above. Identity mapping (D4) makes the guest address the
+    // host address, and the reference lives only for this one load.
+    let word = unsafe { AtomicU32::from_ptr(addr as usize as *mut u32) };
+    word.load(Ordering::SeqCst) == expected
 }
 
 /// Keeps an address in [`AddressFutex::parked`] for as long as a thread is on its queue.
@@ -703,5 +772,283 @@ impl ThreadRegistry for CallThreads<'_> {
 
     fn live_count(&self) -> usize {
         self.table.live()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Set in the child copy of this test binary that [`in_a_child`] runs.
+    const CHILD: &str = "OMNI_ANDROID_FUTEX_BUCKET_CHILD";
+
+    /// The bucket `parking_lot_core` 0.9.12 files `key` under, in a table of 2^16 buckets.
+    ///
+    /// Its hash is `key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)` (`parking_lot.rs:351`).
+    /// A smaller table takes a **prefix** of these sixteen bits, so two keys that agree here share a
+    /// bucket at every table size up to 2^16. That matters because the table only grows, and grows
+    /// whenever a thread is created. Up to 21,845 live threads, a collision found now is still one
+    /// when the park happens.
+    fn bucket(key: usize) -> usize {
+        key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48
+    }
+
+    /// A value from `candidates` whose address shares `target`'s bucket.
+    ///
+    /// Sixteen bits of hash make a match about one candidate in 65,536. The pools below hold 2^20,
+    /// so a search that finds nothing has probability about e^-16, and it fails by name rather
+    /// than quietly testing two keys in different buckets.
+    fn sharing_a_bucket_with<T>(
+        target: usize,
+        candidates: &'static [T],
+        key_of: impl Fn(&T) -> usize,
+    ) -> &'static T {
+        candidates.iter().find(|candidate| bucket(key_of(candidate)) == bucket(target)).unwrap_or_else(
+            || {
+                panic!(
+                    "none of {} candidates shares parking_lot_core's bucket with {target:#x}",
+                    candidates.len()
+                )
+            },
+        )
+    }
+
+    /// Run the test named `name` in a child copy of this test binary. Fail if the child fails,
+    /// runs no test, or has not finished within `limit`.
+    ///
+    /// # Why a child
+    ///
+    /// The defect these tests exist for is a deadlock **inside `parking_lot_core`'s own table**,
+    /// where the losing thread keeps a bucket lock forever. In this process that would not stay one
+    /// test's problem. Every later park that hashes to that bucket would stop with it, and so would
+    /// any growth of the table, because growing locks every bucket and a new thread can trigger it.
+    /// The rest of the suite would then hang instead of failing. A child keeps the damage inside a
+    /// process that is thrown away. The child's own `recv_timeout` turns the deadlock into a failed
+    /// assertion, and `limit` is only the backstop that kills it if even that does not happen.
+    fn in_a_child(name: &str, limit: Duration) {
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
+        let path = format!("{module}::{name}");
+        let mut child = Command::new(std::env::current_exe().expect("the test binary"))
+            .args([path.as_str(), "--exact", "--nocapture", "--test-threads", "1"])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the child");
+        // Drained on their own threads so that a chatty child cannot fill a pipe and look hung.
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let out = thread::spawn(move || {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut stdout, &mut text).ok();
+            text
+        });
+        let err = thread::spawn(move || {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut stderr, &mut text).ok();
+            text
+        });
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the child") {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let output = format!(
+            "{}{}",
+            out.join().unwrap_or_default(),
+            err.join().unwrap_or_default()
+        );
+        let Some(status) = status else {
+            panic!("`{path}` had not finished after {limit:?} and was killed. Its output:\n{output}");
+        };
+        assert!(status.success(), "`{path}` failed in the child ({status}). Its output:\n{output}");
+        // A filter that matched nothing also exits 0. That would be a pass that tested nothing.
+        assert!(
+            output.contains("test result: ok. 1 passed"),
+            "`{path}` did not run exactly one test in the child. Its output:\n{output}"
+        );
+    }
+
+    /// **Checking the futex word may take a lock that shares the futex's own bucket without
+    /// deadlocking.**
+    ///
+    /// # The deadlock this is the detector for
+    ///
+    /// A gate run froze for 180 s: every thread blocked, CPU flat. `FUTEX_WAIT` compared the word
+    /// inside `parking_lot_core::park`'s `validate` by reading it through the guest address space.
+    /// That read takes the space's map lock, which is a `parking_lot::Mutex`. `validate` runs
+    /// holding the futex's bucket lock, and its contract is that it must not call into
+    /// `parking_lot` at all. An uncontended mutex never does. A contended one parks on its own
+    /// address, and parking needs that address's bucket. When that is the bucket already held (or
+    /// the table grows meanwhile), the waiter blocks on a lock it holds itself, and the mutex's
+    /// owner blocks too when it unlocks and tries to wake the waiter.
+    ///
+    /// Constructed rather than waited for. The futex word and a `parking_lot` mutex are chosen so
+    /// that they share a bucket. One thread holds the mutex, and the waiter's `admit` (the step
+    /// that, in production, goes through the address space) has to take it. MEASURED before the
+    /// fix, when that step ran inside `validate`: `DEADLOCK: after 5 s only [] had finished`.
+    /// Neither the waiter nor the mutex's holder came back. Row `futexlock-A1` puts it back.
+    #[test]
+    fn checking_the_word_under_a_contended_lock_in_the_same_bucket_does_not_deadlock() {
+        if std::env::var_os(CHILD).is_some() {
+            return checking_the_word_contends_a_lock_in_the_futex_bucket();
+        }
+        in_a_child(
+            "checking_the_word_under_a_contended_lock_in_the_same_bucket_does_not_deadlock",
+            Duration::from_secs(60),
+        );
+    }
+
+    /// The body of the test above, which runs only in the child.
+    fn checking_the_word_contends_a_lock_in_the_futex_bucket() {
+        let word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let addr = word.as_ptr() as usize;
+        let pool: &'static [Mutex<()>] = Box::leak((0..1 << 20).map(|_| Mutex::new(())).collect());
+        // SAFETY: `raw` is used only for its address, which is the key `parking_lot`'s
+        // `RawMutex::lock_slow` parks on (`raw_mutex.rs:248`). Nothing locks or unlocks through it.
+        let lock = sharing_a_bucket_with(addr, pool, |m| unsafe { m.raw() } as *const _ as usize);
+        let futex: &'static AddressFutex = Box::leak(Box::new(AddressFutex::new()));
+
+        let (held_tx, held_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let holder_done = done_tx.clone();
+        thread::spawn(move || {
+            let guard = lock.lock();
+            held_tx.send(()).ok();
+            // Far longer than `lock_slow`'s ten spins, so the waiter really parks on the mutex.
+            thread::sleep(Duration::from_millis(200));
+            drop(guard);
+            holder_done.send(("holder", None)).ok();
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).expect("the holder took the mutex");
+
+        thread::spawn(move || {
+            // SAFETY: `word` is a live, aligned `AtomicU32` this test leaked, so it is readable
+            // whatever `admit` does.
+            let result = unsafe {
+                futex.wait_compared(
+                    addr as u64,
+                    0,
+                    || {
+                        drop(lock.lock());
+                        Ok::<(), ()>(())
+                    },
+                    Some(Duration::from_millis(50)),
+                )
+            };
+            done_tx.send(("waiter", Some(result))).ok();
+        });
+
+        let mut finished = Vec::new();
+        while finished.len() < 2 {
+            match done_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(done) => finished.push(done),
+                Err(_) => panic!(
+                    "DEADLOCK: after 5 s only {finished:?} had finished. The futex word {addr:#x} \
+                     and the mutex {:#x} share parking_lot_core's bucket {:#06x}, and checking the \
+                     word took that mutex while the futex held the bucket",
+                    // SAFETY: as above, the address only.
+                    unsafe { lock.raw() } as *const _ as usize,
+                    bucket(addr),
+                ),
+            }
+        }
+        assert!(
+            finished.contains(&("waiter", Some(Ok(WaitResult::TimedOut)))),
+            "the word held what was expected and nobody woke it, so the wait parks and times \
+             out: {finished:?}"
+        );
+    }
+
+    /// **The word is compared under the bucket lock, not before it.**
+    ///
+    /// The over-correction the fix above invites: "the comparison may not take locks, so compare
+    /// first, then park." That reopens the lost-wake window `FUTEX_WAIT` exists to close. A
+    /// waiter that compares, and then has the word change and the wake land before it reaches
+    /// the queue, sleeps through a wake that has already happened.
+    ///
+    /// Constructed rather than raced. A second thread parks on a key of this test's own that
+    /// shares the word's bucket, and it holds that bucket from inside its `validate`, which
+    /// calls nothing in `parking_lot`. The waiter can then get as far as the queue and no
+    /// further. The word changes while it waits there. Compared under the bucket lock, it sees
+    /// the change and refuses to park. Compared before it, it parks on a stale value and times
+    /// out. Row `futexlock-B1` is that version.
+    #[test]
+    fn the_word_is_compared_under_the_bucket_lock_and_not_before_it() {
+        let word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let addr = word.as_ptr() as usize;
+        let pool: &'static [u8] = Box::leak(vec![0u8; 1 << 20].into_boxed_slice());
+        let holder_key = std::ptr::from_ref(sharing_a_bucket_with(addr, pool, |byte| {
+            std::ptr::from_ref(byte) as usize
+        })) as usize;
+        let futex: &'static AddressFutex = Box::leak(Box::new(AddressFutex::new()));
+
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            // SAFETY: `holder_key` is the address of a byte in a buffer this test owns and nothing
+            // else parks on. `validate` uses only `std` channels, never `parking_lot`, and
+            // discards their results rather than panicking. The other two callbacks are empty.
+            unsafe {
+                parking_lot_core::park(
+                    holder_key,
+                    || {
+                        holding_tx.send(()).ok();
+                        release_rx.recv_timeout(Duration::from_secs(10)).ok();
+                        false
+                    },
+                    || {},
+                    |_, _| {},
+                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                    None,
+                )
+            }
+        });
+        holding_rx.recv_timeout(Duration::from_secs(5)).expect("the holder is holding the bucket");
+
+        let waits_before = futex.activity().0;
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            // SAFETY: `word` is a live, aligned `AtomicU32` this test leaked.
+            let result = unsafe {
+                futex.wait_compared(addr as u64, 0, || Ok::<(), ()>(()), Some(Duration::from_secs(2)))
+            };
+            result_tx.send(result).ok();
+        });
+        // **Wait for the witness, not for a duration.** `waits` is counted after `admit` and
+        // before the park, so once it moves, anything compared before the park has been compared
+        // against the word as it is now. It is an atomic, not a lock, so polling it cannot
+        // contend for the bucket the holder has.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while futex.activity().0 == waits_before {
+            assert!(Instant::now() < deadline, "the waiter never reached the park");
+            thread::sleep(Duration::from_millis(1));
+        }
+        word.store(1, Ordering::SeqCst);
+        release_tx.send(()).expect("the holder is still waiting to be released");
+
+        let result = result_rx.recv_timeout(Duration::from_secs(10)).expect("the waiter returned");
+        assert_eq!(
+            result,
+            Ok(WaitResult::WouldBlock),
+            "the word changed before the waiter could reach the queue, so the comparison under \
+             the bucket lock must see it and refuse to park. TimedOut means it compared before \
+             the park and slept on a stale value: the lost-wake window"
+        );
+        assert_eq!(
+            holder.join().expect("the holder"),
+            parking_lot_core::ParkResult::Invalid,
+            "the holder's own park refuses, which is how it gives the bucket back"
+        );
     }
 }
