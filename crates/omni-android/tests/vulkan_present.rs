@@ -68,6 +68,7 @@ use omni_android::vulkan::{
     DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES, STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
     HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
     MemoryPlan, PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest,
+    PIPELINE_CACHE_CREATE_INFO_BYTES,
     Presented, RenderPassRequest, RewriteSite, SubmitRequest, SurfaceCreated, SwapchainRequest,
     Vulkan, VulkanHost, ANDROID_SURFACE_CREATE_INFO_BYTES,
     ATTACHMENT_DESCRIPTION_BYTES, ATTACHMENT_REFERENCE_BYTES, BUFFER_CREATE_INFO_BYTES,
@@ -342,6 +343,13 @@ struct HostLog {
     /// Every `vkDestroySurfaceKHR` that reached the host: the instance it was destroyed through
     /// and the surface, as the tokens the shim resolved them to.
     surfaces_destroyed: Vec<(HostInstance, HostSurface)>,
+    /// Every live pipeline cache and the blob it holds: the guest's `pInitialData` when it gave
+    /// one, [`fake_cache_blob`] when it did not.
+    caches: Vec<(HostPipelineCache, Vec<u8>)>,
+    /// Every `pInitialData` a `vkCreatePipelineCache` carried, byte for byte.
+    cache_initial_data: Vec<Vec<u8>>,
+    /// Every `vkGetPipelineCacheData` that reached the host.
+    cache_reads: Vec<(HostDevice, HostPipelineCache)>,
 
     // ---------------------------------------------------------------------------- stage 5
     /// Every `vkAllocateMemory`, as the shim decoded it, with the token it was answered with —
@@ -396,6 +404,28 @@ fn requirements(size: u64, alignment: u64, type_bits: u32) -> Vec<u8> {
     bytes[8..16].copy_from_slice(&alignment.to_le_bytes());
     bytes[16..20].copy_from_slice(&type_bits.to_le_bytes());
     bytes
+}
+
+/// `sizeof(VkPipelineCacheHeaderVersionOne)`: the part of every cache blob the specification
+/// defines -- `headerSize`, `headerVersion`, `vendorID`, `deviceID`, `pipelineCacheUUID[16]`.
+const CACHE_HEADER_BYTES: usize = 32;
+/// One entry of [`fake_cache_blob`]'s private body: a format the shim knows nothing about, which
+/// is why it may not cut one.
+const FAKE_CACHE_ENTRY_BYTES: usize = 16;
+
+/// The blob a [`StageFourHost`] cache holds when the guest gave it no `pInitialData`: the header
+/// the specification defines, then three entries of a private format, each a distinct byte.
+fn fake_cache_blob() -> Vec<u8> {
+    let mut blob = Vec::with_capacity(CACHE_HEADER_BYTES + 3 * FAKE_CACHE_ENTRY_BYTES);
+    blob.extend_from_slice(&(CACHE_HEADER_BYTES as u32).to_le_bytes());
+    blob.extend_from_slice(&1u32.to_le_bytes()); // VK_PIPELINE_CACHE_HEADER_VERSION_ONE
+    blob.extend_from_slice(&0x10DEu32.to_le_bytes()); // vendorID
+    blob.extend_from_slice(&0x2882u32.to_le_bytes()); // deviceID
+    blob.extend((0xA0u8..0xB0).collect::<Vec<u8>>()); // pipelineCacheUUID
+    for entry in 0..3u8 {
+        blob.extend_from_slice(&[0xC0 + entry; FAKE_CACHE_ENTRY_BYTES]);
+    }
+    blob
 }
 
 /// A [`VulkanHost`] whose answers the test chooses. **Not a driver, and not guest-facing.**
@@ -630,6 +660,9 @@ impl VulkanHost for StageFourHost {
                 | "vkDestroySampler"
                 | "vkCreateShaderModule"
                 | "vkDestroyShaderModule"
+                | "vkCreatePipelineCache"
+                | "vkDestroyPipelineCache"
+                | "vkGetPipelineCacheData"
                 | "vkCreatePipelineLayout"
                 | "vkDestroyPipelineLayout"
                 | "vkCreateRenderPass"
@@ -751,6 +784,46 @@ impl VulkanHost for StageFourHost {
     fn destroy_query_pool(&self, _pool: HostQueryPool) -> AbiResult<()> {
         self.note("vkDestroyQueryPool");
         Ok(())
+    }
+
+    /// Keeps the guest's `pInitialData` as the cache's blob, as a driver that accepted it would,
+    /// so that a blob read back out is a blob that went in.
+    fn create_pipeline_cache(
+        &self,
+        _device: HostDevice,
+        _flags: u32,
+        initial_data: &[u8],
+    ) -> AbiResult<DriverAnswer<HostPipelineCache>> {
+        let token = HostPipelineCache::from_token(self.token());
+        let mut log = self.log();
+        log.cache_initial_data.push(initial_data.to_vec());
+        let blob = if initial_data.is_empty() { fake_cache_blob() } else { initial_data.to_vec() };
+        log.caches.push((token, blob));
+        Ok(DriverAnswer::Ok(token))
+    }
+
+    fn destroy_pipeline_cache(&self, cache: HostPipelineCache) -> AbiResult<()> {
+        self.log().caches.retain(|(token, _)| *token != cache);
+        self.note("vkDestroyPipelineCache");
+        Ok(())
+    }
+
+    /// The whole blob, as the trait requires: the guest's two-call idiom is the shim's to run.
+    fn pipeline_cache_data(
+        &self,
+        device: HostDevice,
+        cache: HostPipelineCache,
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        let mut log = self.log();
+        log.cache_reads.push((device, cache));
+        let Some((_, blob)) = log.caches.iter().find(|(token, _)| *token == cache) else {
+            return Err(AbiError::Refused {
+                symbol: "StageFourHost::pipeline_cache_data".to_string(),
+                address: 0,
+                why: format!("{cache:?} is not a cache this double holds"),
+            });
+        };
+        Ok(DriverAnswer::Ok(blob.clone()))
     }
 
     fn cmd_reset_query_pool(
@@ -2431,6 +2504,121 @@ fn a_surface_is_destroyed_once_and_its_handle_names_nothing_afterwards() {
     let again = up.f.a_surface(up.entry_point, up.instance);
     assert_eq!(again, up.surface, "the lowest free slot, which is the one just freed");
     assert_eq!(up.f.vulkan().surface_handles().len(), 1);
+}
+
+// ====================================================================== vkGetPipelineCacheData
+
+/// **`vkGetPipelineCacheData`'s two-call idiom, and a short buffer that gets nothing.**
+///
+/// Measured: the engine's render thread saves its pipeline cache on `APP_CMD_TERM_WINDOW`, through
+/// the thunk `vkGetInstanceProcAddr` handed out, so that the next launch can pass it back to
+/// `vkCreatePipelineCache`. What this test owns:
+///
+/// * `pData = NULL` writes the size and nothing else, `VK_SUCCESS`;
+/// * a buffer big enough gets the whole blob, `VK_SUCCESS`, and nothing past it;
+/// * a buffer one byte short, or with room for the header alone, gets **nothing**: `*pDataSize = 0`
+///   and `VK_INCOMPLETE`. A prefix of a driver's private format is not valid `pInitialData`, and
+///   the real driver cannot be asked to cut one -- the live test's header says what it does;
+/// * a terabyte of claimed room is only a bound on a write into the guest's own buffer;
+/// * a wild cache, a NULL `pDataSize` and an unmapped `pData` refuse by name;
+/// * the bytes read out go back into `vkCreatePipelineCache` unchanged.
+#[test]
+fn a_pipeline_cache_is_read_by_the_two_call_idiom_and_a_short_buffer_gets_nothing() {
+    let _serial = serialized();
+    let up = up_to_a_device("cache-data");
+    let create = up.f.resolve_device(up.get_proc, up.device, "vkCreatePipelineCache");
+    let destroy = up.f.resolve_device(up.get_proc, up.device, "vkDestroyPipelineCache");
+    // Through `vkGetInstanceProcAddr`, as the engine was measured reaching it.
+    let get_data = up.f.resolve(up.entry_point, up.instance, "vkGetPipelineCacheData");
+    let device_token = up.f.vulkan().device_handles()[0].1;
+
+    let out = up.f.alloc(8);
+    let info = up.f.pipeline_cache_info(&[]);
+    assert_eq!(up.f.call(create, [up.device, info, 0, out]).expect("create") as i32, VK_SUCCESS);
+    let cache = up.f.guest.read_u64(out as GuestAddr);
+    let token = up.host.log().caches[0].0;
+    let blob = fake_cache_blob();
+    let whole = blob.len() as u64;
+
+    // 1. `pData = NULL`: the size, and nothing else.
+    let size_at = up.f.poisoned(8, 0x5A);
+    let result = up.f.call(get_data, [up.device, cache, size_at, 0]).expect("the size");
+    assert_eq!(result as i32, VK_SUCCESS);
+    assert_eq!(up.f.guest.read_u64(size_at as GuestAddr), whole, "the whole blob's size");
+
+    // 2. A buffer big enough: the whole blob, and nothing past it.
+    let data_at = up.f.poisoned(blob.len() + 8, 0x5A);
+    let result = up.f.call(get_data, [up.device, cache, size_at, data_at]).expect("the blob");
+    assert_eq!(result as i32, VK_SUCCESS);
+    assert_eq!(up.f.read_bytes(data_at, blob.len()), blob, "the driver's bytes, unchanged");
+    assert_eq!(up.f.guest.read_u64(size_at as GuestAddr), whole);
+    assert_eq!(
+        up.f.guest.read_u64(data_at as GuestAddr + whole as usize),
+        u64::from_le_bytes([0x5A; 8]),
+        "nothing past the blob"
+    );
+
+    // 3. **A short buffer gets nothing, and `VK_INCOMPLETE`.** One byte short, and then room for
+    // the header and a few bytes of the body -- a prefix a driver would read as a blob whose
+    // entries end mid-way. Neither is written: not a byte, and `*pDataSize` says so.
+    for room in [whole - 1, CACHE_HEADER_BYTES as u64 + 8] {
+        let short_at = up.f.poisoned(blob.len(), 0x5A);
+        up.f.guest.write_u64(size_at as GuestAddr, room);
+        let result = up.f.call(get_data, [up.device, cache, size_at, short_at]).expect("short");
+        assert_eq!(result as i32, VK_INCOMPLETE, "room for {room}: VK_INCOMPLETE, not VK_SUCCESS");
+        assert_eq!(up.f.guest.read_u64(size_at as GuestAddr), 0, "room for {room}: none written");
+        assert_eq!(
+            up.f.read_bytes(short_at, blob.len()),
+            vec![0x5A; blob.len()],
+            "room for {room}: not one byte of a blob that would not load back"
+        );
+    }
+
+    // 4. **The guest's `size_t` bounds only a write into its own buffer.** A terabyte of claimed
+    // room gets the blob -- the host was asked for the blob and nothing else, every time.
+    up.f.guest.write_u64(size_at as GuestAddr, 1 << 40);
+    let result = up.f.call(get_data, [up.device, cache, size_at, data_at]).expect("huge");
+    assert_eq!(result as i32, VK_SUCCESS);
+    assert_eq!(up.f.guest.read_u64(size_at as GuestAddr), whole);
+    let reads = up.host.log().cache_reads.clone();
+    assert_eq!(reads.len(), 5, "one host read per guest call");
+    assert!(reads.iter().all(|read| *read == (device_token, token)), "{reads:?}");
+
+    // 5. Refusals by name, none of which writes anything.
+    let before = up.host.log().cache_reads.len();
+    let wild = cache + HANDLE_SLOT_BYTES as u64;
+    let text = up.f.refusal(get_data, &[up.device, wild, size_at, 0]).to_string();
+    assert!(text.contains("`VkPipelineCache`"), "it names the family: {text}");
+    assert!(text.contains(&format!("{wild:#x}")), "and the handle: {text}");
+    let text = up.f.refusal(get_data, &[up.device, cache, 0, data_at]).to_string();
+    assert!(text.contains("pDataSize = NULL"), "{text}");
+    assert_eq!(up.host.log().cache_reads.len(), before, "none of those reached the host");
+    up.f.guest.write_u64(size_at as GuestAddr, whole);
+    let error = up.f.refusal(get_data, &[up.device, cache, size_at, up.f.guest.unmapped as u64]);
+    assert!(
+        matches!(error, AbiError::BadPointer { argument: 3, .. }),
+        "an unmapped `pData` is a refusal naming argument 3, not a host write: {error:?}"
+    );
+    assert_eq!(up.f.guest.read_u64(size_at as GuestAddr), whole, "and `*pDataSize` is untouched");
+
+    // 6. **The round trip**: the bytes read out are the bytes the next `vkCreatePipelineCache`
+    // hands the host, and reading that cache back gives them again.
+    let saved = up.f.read_bytes(data_at, blob.len());
+    let info = up.f.pipeline_cache_info(&saved);
+    assert_eq!(up.f.call(create, [up.device, info, 0, out]).expect("reload") as i32, VK_SUCCESS);
+    let reloaded = up.f.guest.read_u64(out as GuestAddr);
+    assert_eq!(up.host.log().cache_initial_data.last(), Some(&blob), "pInitialData crossed whole");
+    let again_at = up.f.poisoned(blob.len(), 0x5A);
+    up.f.guest.write_u64(size_at as GuestAddr, whole);
+    let result = up.f.call(get_data, [up.device, reloaded, size_at, again_at]).expect("again");
+    assert_eq!(result as i32, VK_SUCCESS);
+    assert_eq!(up.f.read_bytes(again_at, blob.len()), blob);
+
+    // A destroyed cache's handle names nothing.
+    up.f.call(destroy, [up.device, cache, 0, 0]).expect("destroy");
+    let text = up.f.refusal(get_data, &[up.device, cache, size_at, 0]).to_string();
+    assert!(text.contains("`VkPipelineCache`"), "{text}");
+    up.f.call(destroy, [up.device, reloaded, 0, 0]).expect("destroy the reloaded one");
 }
 
 // ======================================================================= vkAcquireNextImageKHR
@@ -4177,6 +4365,8 @@ fn a_surface_is_destroyed_through_the_guest_only_after_its_swapchains_and_leaves
 
 /// `VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO`.
 const STYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
+/// `VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO`.
+const STYPE_PIPELINE_CACHE_CREATE_INFO: u32 = 17;
 /// `VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO`.
 const STYPE_GRAPHICS_PIPELINE_CREATE_INFO: u32 = 28;
 /// `VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO`.
@@ -4351,6 +4541,18 @@ impl Fixture {
         bytes[56..60].copy_from_slice(&usage.to_le_bytes());
         bytes[60..64].copy_from_slice(&SHARING_EXCLUSIVE.to_le_bytes());
         bytes[80..84].copy_from_slice(&LAYOUT_UNDEFINED.to_le_bytes());
+        self.bytes(&bytes)
+    }
+
+    /// A `VkPipelineCacheCreateInfo`, with `initial` as `pInitialData` when it is not empty.
+    fn pipeline_cache_info(&self, initial: &[u8]) -> u64 {
+        let mut bytes = vec![0u8; PIPELINE_CACHE_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_PIPELINE_CACHE_CREATE_INFO.to_le_bytes());
+        if !initial.is_empty() {
+            let data = self.bytes(initial);
+            bytes[24..32].copy_from_slice(&(initial.len() as u64).to_le_bytes());
+            bytes[32..40].copy_from_slice(&data.to_le_bytes());
+        }
         self.bytes(&bytes)
     }
 
@@ -5449,6 +5651,157 @@ fn a_real_driver_builds_the_compute_pipeline_the_guest_describes() {
 
     f.call(destroy, [device, pipeline, 0, 0]).expect("the pipeline is destroyed");
     assert!(f.vulkan().pipeline_handles().is_empty(), "and its handle is forgotten");
+}
+
+/// **The real driver's pipeline cache, saved through the guest path and loaded back.**
+///
+/// The engine was measured calling `vkGetPipelineCacheData` on `APP_CMD_TERM_WINDOW`, to write the
+/// cache to disk for the next launch's `vkCreatePipelineCache`. Against the real driver this test
+/// checks three things:
+///
+/// * the blob's header is this machine's: `VK_PIPELINE_CACHE_HEADER_VERSION_ONE`, and the
+///   vendor, device and `pipelineCacheUUID` that `vkGetPhysicalDeviceProperties` reports;
+/// * a short buffer is `VK_INCOMPLETE` with nothing written, **and the process survives it**;
+/// * a cache loaded from the saved blob holds exactly what was saved.
+///
+/// # The short buffer is this test's detector for a measured driver defect
+///
+/// The first version of this layer handed the guest's short capacity to the driver, so the
+/// driver would make the cut. Given room for 2,766 bytes of a 5,499-byte cache, this machine's
+/// driver wrote all 5,499 bytes, 2,733 past the end of the host's buffer, then answered
+/// `VK_INCOMPLETE` with a count of 36. This test died of it, `STATUS_HEAP_CORRUPTION`. A layer
+/// that ever gives the driver a short buffer again brings that back.
+#[test]
+#[ignore = "opens the host Vulkan driver; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn the_real_drivers_pipeline_cache_is_saved_through_the_guest_and_loads_back() {
+    require_gate();
+    let _serial = serialized();
+    let host = omni_gfx::GfxVulkanHost::load().expect(
+        "this machine must have a Vulkan loader: the gate was set, so a missing driver is a \
+         failure and not a skip",
+    );
+    let f = fixture("live-cache", Some(host.clone()));
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let enumerate = f.resolve(entry_point, instance, "vkEnumeratePhysicalDevices");
+    let count_at = f.alloc(8);
+    assert_eq!(f.call(enumerate, [instance, count_at, 0, 0]).expect("count") as i32, VK_SUCCESS);
+    let array_at = f.alloc(8);
+    let result = f.call(enumerate, [instance, count_at, array_at, 0]).expect("array") as i32;
+    assert!(result == VK_SUCCESS || result == VK_INCOMPLETE, "{result}");
+    let physical = f.guest.read_u64(array_at as GuestAddr);
+    let properties = f.resolve(entry_point, instance, "vkGetPhysicalDeviceProperties");
+    let properties_at = f.alloc(PHYSICAL_DEVICE_PROPERTIES_BYTES);
+    f.call(properties, [physical, properties_at, 0, 0]).expect("properties");
+    let properties = f.read_bytes(properties_at, PHYSICAL_DEVICE_PROPERTIES_BYTES);
+    let device = f.a_device(entry_point, instance, physical, 0);
+    let get_proc = f.resolve(entry_point, instance, "vkGetDeviceProcAddr");
+    let name = |call: &str| f.resolve_device(get_proc, device, call);
+    let create_cache = name("vkCreatePipelineCache");
+    let destroy_cache = name("vkDestroyPipelineCache");
+    // Through `vkGetInstanceProcAddr`, as the engine was measured reaching it.
+    let get_data = f.resolve(entry_point, instance, "vkGetPipelineCacheData");
+
+    let out = f.alloc(8);
+    let size_at = f.alloc(8);
+    let new_cache = |initial: &[u8]| {
+        let info = f.pipeline_cache_info(initial);
+        let result = f.call(create_cache, [device, info, 0, out]).expect("the call completes");
+        assert_eq!(result as i32, VK_SUCCESS, "the driver answered VkResult {}", result as i32);
+        f.guest.read_u64(out as GuestAddr)
+    };
+    let size_of = |cache: u64| {
+        let result = f.call(get_data, [device, cache, size_at, 0]).expect("the size");
+        assert_eq!(result as i32, VK_SUCCESS);
+        f.guest.read_u64(size_at as GuestAddr) as usize
+    };
+    // Room for `capacity` bytes and 8 more, all poisoned: the result, what `*pDataSize` says was
+    // written, and the whole buffer afterwards.
+    let read = |cache: u64, capacity: usize| {
+        let data_at = f.poisoned(capacity + 8, 0x5A);
+        f.guest.write_u64(size_at as GuestAddr, capacity as u64);
+        let result = f.call(get_data, [device, cache, size_at, data_at]).expect("the data") as i32;
+        let written = f.guest.read_u64(size_at as GuestAddr) as usize;
+        assert!(written <= capacity, "{written} bytes written into room for {capacity}");
+        (result, written, f.read_bytes(data_at, capacity + 8))
+    };
+
+    let empty = new_cache(&[]);
+    let empty_size = size_of(empty);
+
+    // A pipeline built **through** a cache, which is what gives the cache something to save.
+    let cache = new_cache(&[]);
+    f.call(name("vkCreateDescriptorSetLayout"), [device, f.descriptor_set_layout_info(), 0, out])
+        .expect("set layout");
+    let set_layout = f.guest.read_u64(out as GuestAddr);
+    f.call(name("vkCreatePipelineLayout"), [device, f.pipeline_layout_info(set_layout), 0, out])
+        .expect("layout");
+    let layout = f.guest.read_u64(out as GuestAddr);
+    f.call(name("vkCreateShaderModule"), [device, f.shader_module_info(&COMPUTE_SPIRV), 0, out])
+        .expect("module");
+    let module = f.guest.read_u64(out as GuestAddr);
+    let info = f.compute_pipeline_info(layout, module, SHADER_STAGE_COMPUTE, 0);
+    let pipeline_at = f.alloc(8);
+    let result = f
+        .call_n(name("vkCreateComputePipelines"), &[device, cache, 1, info, 0, pipeline_at])
+        .expect("the call completes");
+    assert_eq!(result as i32, VK_SUCCESS, "the driver compiled the pipeline through the cache");
+
+    // **The whole blob**, and its header is this machine's.
+    let size = size_of(cache);
+    assert!(size > empty_size, "building a pipeline through the cache gave it something to save");
+    let (result, written, buffer) = read(cache, size);
+    assert_eq!(result, VK_SUCCESS);
+    assert_eq!(written, size);
+    assert_eq!(buffer[size..], [0x5A; 8], "nothing past the blob");
+    let blob = buffer[..size].to_vec();
+    let word =
+        |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four"));
+    assert_eq!(word(&blob, 0) as usize, CACHE_HEADER_BYTES, "headerSize");
+    assert_eq!(word(&blob, 4), 1, "VK_PIPELINE_CACHE_HEADER_VERSION_ONE");
+    assert_eq!(word(&blob, 8), word(&properties, 8), "vendorID is the device's");
+    assert_eq!(word(&blob, 12), word(&properties, 12), "deviceID is the device's");
+    assert_eq!(blob[16..32], properties[276..292], "pipelineCacheUUID is the device's");
+
+    // **A short buffer: nothing, `VK_INCOMPLETE`, and a process still standing.** Room for the
+    // header and one byte more than half the body: the length the defect was measured at.
+    let short = CACHE_HEADER_BYTES + (size - CACHE_HEADER_BYTES) / 2 + 1;
+    let (result, written, buffer) = read(cache, short);
+    assert_eq!(result, VK_INCOMPLETE, "a truncated save is VK_INCOMPLETE, not VK_SUCCESS");
+    assert_eq!(written, 0, "and nothing was written");
+    assert_eq!(buffer, vec![0x5A; short + 8], "not one byte, in the buffer or past it");
+
+    // **The round trip**: a cache created from the saved blob holds exactly it.
+    let reloaded = new_cache(&blob);
+    let reloaded_size = size_of(reloaded);
+    let (result, written, buffer) = read(reloaded, reloaded_size);
+    assert_eq!(result, VK_SUCCESS);
+    let reloaded_blob = &buffer[..written];
+
+    eprintln!("\n=== vkGetPipelineCacheData evidence ===");
+    eprintln!(
+        "vendor {:#x}, device {:#x}, pipelineCacheUUID {:02x?}",
+        word(&blob, 8),
+        word(&blob, 12),
+        &blob[16..32]
+    );
+    eprintln!("an empty cache: {empty_size} bytes; after one compute pipeline: {size} bytes");
+    eprintln!("room for {short}: VkResult {VK_INCOMPLETE}, nothing written, process intact");
+    eprintln!(
+        "loaded back from the saved blob: {reloaded_size} bytes, identical: {}",
+        reloaded_blob == blob.as_slice()
+    );
+    assert_eq!(
+        reloaded_blob,
+        blob.as_slice(),
+        "a cache loaded from the saved blob holds exactly what was saved -- the driver took it"
+    );
+
+    for handle in [empty, cache, reloaded] {
+        f.call(destroy_cache, [device, handle, 0, 0]).expect("destroy a cache");
+    }
+    let pipeline = f.guest.read_u64(pipeline_at as GuestAddr);
+    f.call(name("vkDestroyPipeline"), [device, pipeline, 0, 0]).expect("destroy the pipeline");
 }
 
 /// **Stage 5's evidence: a textured triangle, drawn by guest code, presented, and its pixels

@@ -3103,6 +3103,38 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         Err(host_has_no("VulkanHost::destroy_pipeline_cache", "the cache cannot be destroyed"))
     }
 
+    /// `vkGetPipelineCacheData`, forwarded: the driver's **whole** cache blob, whose header names
+    /// this machine's vendor, device and `pipelineCacheUUID`.
+    ///
+    /// Measured: the engine's render thread calls it on `APP_CMD_TERM_WINDOW`, to save the cache
+    /// for the next launch's `vkCreatePipelineCache` to take back as `pInitialData`.
+    ///
+    /// # Whole, and never read through a short buffer
+    ///
+    /// The guest's two-call idiom is the shim's to run over the answer; the host's job is the
+    /// blob. It must be read into a buffer of the size the driver reported, and the size must not
+    /// be able to change in between. Measured on this machine's NVIDIA driver: asked to fill 2,766
+    /// bytes of a 5,499-byte cache, it wrote all 5,499 -- 2,733 past the end of the buffer --
+    /// then answered `VK_INCOMPLETE` with a count of 36, and the process died of
+    /// `STATUS_HEAP_CORRUPTION`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued, or when the cache belongs
+    /// to another device.
+    fn pipeline_cache_data(
+        &self,
+        device: HostDevice,
+        cache: HostPipelineCache,
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        let _ = (device, cache);
+        Err(host_has_no(
+            "VulkanHost::pipeline_cache_data",
+            "there is no cache blob to hand the engine, and a size of zero would tell it the \
+             driver has nothing worth saving",
+        ))
+    }
+
     /// `vkCreateGraphicsPipelines`, forwarded. **One call, many pipelines, and it may partly
     /// succeed.**
     ///
@@ -3700,6 +3732,11 @@ mod tests {
             .destroy_surface(HostInstance::from_token(0), HostSurface::from_token(0))
             .expect_err("nor a surface destroyed");
         assert_eq!(error.symbol(), Some("VulkanHost::destroy_surface"));
+
+        let error = host
+            .pipeline_cache_data(HostDevice::from_token(0), HostPipelineCache::from_token(0))
+            .expect_err("nor a cache blob");
+        assert_eq!(error.symbol(), Some("VulkanHost::pipeline_cache_data"));
     }
 
     /// The two arms of [`DriverAnswer`] are not the same value, which is the whole of D22's point

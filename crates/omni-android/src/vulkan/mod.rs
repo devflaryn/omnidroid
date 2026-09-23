@@ -3565,6 +3565,8 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkDestroyShaderModule" => shader::destroy_shader_module(c, &at, &vulkan, args),
         "vkCreatePipelineCache" => shader::create_pipeline_cache(c, &at, &vulkan, args),
         "vkDestroyPipelineCache" => shader::destroy_pipeline_cache(c, &at, &vulkan, args),
+        // The engine saves its cache on `APP_CMD_TERM_WINDOW`, measured.
+        "vkGetPipelineCacheData" => shader::get_pipeline_cache_data(c, &at, &vulkan, args),
         // The engine's own renderer: its GPU timer.
         "vkCreateQueryPool" => query::create_query_pool(c, &at, &vulkan, args),
         // Its descriptor update templates, kept by this layer (see `descriptor`).
