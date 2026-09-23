@@ -124,7 +124,7 @@ replace translation. Two facts decide its shape, MEASURED with a C probe (`hv_vm
 
 Against D17's in-loop import dispatch (26.7-31.0 ns on the x64 host), an import that became a VM
 exit would cost ~25x more, and Windows measured the engine crossing the import boundary about
-1.3 million times a second (HANDOFF, 2026-09-22) -- which at 708 ns is ~0.9 s of exits per second
+1.3 million times a second (VERIFICATION entry 15, a startup phase on Windows) -- which at 708 ns is ~0.9 s of exits per second
 of guest time. And the engine runs up to 256 guest threads (`MAX_GUEST_THREADS`) against 64 vCPUs.
 So a hypervisor backend is only a win if the hot imports stop being exits (served in-guest) and
 guest threads are multiplexed onto vCPUs; whether the compute it buys back outweighs that is the
