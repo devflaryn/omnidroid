@@ -101,6 +101,9 @@ pub struct Ctx {
     /// The host thread's `(TPIDR_EL0, TPIDRRO_EL0)` as read inside the most recent `SVC` callback,
     /// on arm64 hosts; `(0, 0)` elsewhere.
     pub host_thread_pointers_in_svc: (u64, u64),
+    /// Test hook: `SVC #3` stores this `(guest address, u64)` into guest memory from the host --
+    /// another observer's plain store, in the middle of the guest's code. `None` = off.
+    pub poke_on_svc3: Option<(u64, u64)>,
     /// Test hook: make `interpreter_fallback` behave as an interpreter that
     /// executed its `num_insns` instructions as no-ops -- advance the guest PC
     /// past them and do **not** halt -- so a test can see where execution goes
@@ -385,6 +388,12 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
                 core::arch::asm!("mrs {}, tpidr_el0", "mrs {}, tpidrro_el0", out(reg) tp, out(reg) tpro, options(nomem, nostack));
                 c.host_thread_pointers_in_svc = (tp, tpro);
             }
+            if swi == 3 {
+                if let Some((addr, value)) = c.poke_on_svc3 {
+                    c.write_u64(addr, value);
+                    return;
+                }
+            }
             if swi == 2 && c.rewrite_byte_on_svc2 != 0 {
                 let p = c.rewrite_byte_on_svc2 as *mut u8;
                 // SAFETY: deliberately a write the host may refuse; `tests/wx.rs` runs it in a
@@ -584,6 +593,7 @@ impl Vm {
             sleep_on_svc1_us: 0,
             rewrite_byte_on_svc2: 0,
             host_thread_pointers_in_svc: (0, 0),
+            poke_on_svc3: None,
             fallback_skips: false,
             fallback_host_fpcr: 0,
             zero_invalidate_on_svc: false,

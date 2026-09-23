@@ -186,6 +186,71 @@ fn an_address_outside_fastmem_falls_back_to_the_callbacks_and_still_works() {
     assert_eq!(vm.stats().slow_path_total, 0, "{:?}", vm.stats());
 }
 
+#[test]
+fn another_observer_s_store_between_the_pair_makes_the_store_exclusive_fail() {
+    // ARM ARM: a store by another observer to the reserved location clears this PE's global monitor,
+    // so the store-exclusive must fail and write nothing. The "other observer" is the host, storing
+    // from inside `SVC #3` between the LDXR and the STXR.
+    // LDXR X1, [X4] ; SVC #3 ; STXR W2, X5, [X4] ; SVC #0
+    for opts in [inline(), VmOptions::default()] {
+        let label = if opts.fastmem_exclusive { "inline" } else { "callbacks" };
+        let vm = Vm::new(vec![ldxr(3, 1, 4), a64::svc(3), stxr(3, 2, 5, 4), a64::svc(0)], opts);
+        vm.with_ctx(|c| {
+            c.write_u64(ADDR, 7);
+            c.poke_on_svc3 = Some((ADDR, 8));
+        });
+        vm.set_reg(4, ADDR);
+        vm.set_reg(5, 9);
+        vm.start(1_000_000);
+        assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+        assert_eq!(vm.reg(1), 7);
+        assert_eq!(vm.reg(2), 1, "{label}: the store-exclusive must fail after another observer stored");
+        assert_eq!(vm.with_ctx(|c| c.read_u64(ADDR)), 8, "{label}: and must not overwrite that store");
+    }
+}
+
+#[test]
+fn a_successful_store_exclusive_clears_another_processor_s_reservation_of_the_address() {
+    // Processor A reserves ADDR ; processor B reserves it and stores to it -- the *same* value, so
+    // only the monitor, not the memory, can tell A its reservation is gone ; A's store-exclusive
+    // must then fail (ARM ARM: B's store clears A's global monitor).
+    // A: LDXR X1, [X4] ; SVC #0 ; STXR W2, X1, [X4] ; SVC #0
+    // B: LDXR X1, [X4] ; STXR W2, X1, [X4] ; SVC #0
+    for inline_a in [true, false] {
+        // SAFETY: freed below, after both jits are dropped.
+        let monitor = unsafe { od_monitor_new(2) } as usize;
+        let arena: &'static mut [u64] = Box::leak(vec![0u64; (MEM_SIZE + MEM_GUARD) / 8].into_boxed_slice());
+        let arena = arena.as_mut_ptr() as usize;
+        let shared = |pid: u32, fastmem_exclusive: bool| VmOptions {
+            fastmem_exclusive,
+            shared_monitor: monitor,
+            processor_id: pid,
+            shared_arena: arena,
+            ..VmOptions::default()
+        };
+        {
+            let a = Vm::new(vec![ldxr(3, 1, 4), a64::svc(0), stxr(3, 2, 1, 4), a64::svc(0)], shared(0, inline_a));
+            let b = Vm::new(vec![ldxr(3, 1, 4), stxr(3, 2, 1, 4), a64::svc(0)], shared(1, true));
+            a.with_ctx(|c| c.write_u64(ADDR, 0x42));
+            for vm in [&a, &b] {
+                vm.set_reg(4, ADDR);
+                vm.start(1_000_000);
+            }
+            assert_eq!(a.run_to_completion(64) & HALT_DONE, HALT_DONE, "A reserved");
+            assert_eq!(b.run_to_completion(64) & HALT_DONE, HALT_DONE, "B reserved and stored");
+            assert_eq!(b.reg(2), 0, "B's store-exclusive succeeded");
+            assert_eq!(a.run_to_completion(64) & HALT_DONE, HALT_DONE, "A tried to store");
+            assert_eq!(
+                a.reg(2),
+                1,
+                "A's reservation must have been cleared by B's store (A inline: {inline_a})"
+            );
+        }
+        // SAFETY: both jits using it are dropped.
+        unsafe { od_monitor_free(monitor as *mut std::ffi::c_void) };
+    }
+}
+
 /// `THREADS` guest threads on one monitor and one arena, each adding 1 to one doubleword
 /// `ITERATIONS` times with the canonical retry loop. Any lost update -- two threads' `STXR` both
 /// succeeding against the same old value -- shows as a short total.

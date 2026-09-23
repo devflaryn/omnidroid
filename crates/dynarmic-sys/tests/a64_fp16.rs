@@ -212,19 +212,22 @@ fn fcmeq_half_scalar_and_vector() {
 
 #[test]
 fn fmla_and_fmls_half_vector() {
-    // V0 = 1.0 in every lane, V1 = 2.0, V2 = 3.0 -- except lane 7, which carries the fused case
-    // (V0 = -(1 + 2^-9), V1 = V2 = 1 + 2^-10), as in `fmadd_rounds_once`.
+    // V0 = 1.0 in every lane, V1 = 2.0, V2 = 3.0 -- except lane 6, where V1 = -2.0 (so a negation
+    // that merely *sets* the sign bit is told from one that flips it), and lane 7, which carries the
+    // fused case (V0 = -(1 + 2^-9), V1 = V2 = 1 + 2^-10), as in `fmadd_rounds_once`.
     let v0 = lanes([0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0xBC02]);
-    let v1 = lanes([0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0x3C01]);
+    let v1 = lanes([0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0xC000, 0x3C01]);
     let v2 = lanes([0x4200, 0x4200, 0x4200, 0x4200, 0x4200, 0x4200, 0x4200, 0x3C01]);
-    // FMLA V0.8H, V1.8H, V2.8H (4E420C20): V0 + V1*V2 = 7.0 ; lane 7: 2^-20 = 0x0010.
+    // FMLA V0.8H, V1.8H, V2.8H (4E420C20): V0 + V1*V2 = 7.0 ; lane 6: 1 + (-6) = -5.0 ;
+    // lane 7: 2^-20 = 0x0010.
     let out = run(0x4E42_0C20, &[v0, v1, v2]);
-    assert_eq!(out.v0, lanes([0x4700, 0x4700, 0x4700, 0x4700, 0x4700, 0x4700, 0x4700, 0x0010]));
-    // FMLS V0.8H, V1.8H, V2.8H (4EC20C20): V0 - V1*V2 = -5.0 ; lane 7: -(1+2^-9) - (1+2^-9+2^-20)
-    // = -(2 + 2^-8 + 2^-20), which rounds to nearest in binary16 (exponent 1, ulp 2^-9) as
-    // -(2 + 2^-8) = -(1 + 2^-9) * 2 -> biased exponent 16, fraction 2 -> 0xC002.
+    assert_eq!(out.v0, lanes([0x4700, 0x4700, 0x4700, 0x4700, 0x4700, 0x4700, 0xC500, 0x0010]));
+    // FMLS V0.8H, V1.8H, V2.8H (4EC20C20): V0 - V1*V2 = -5.0 ; lane 6: 1 - (-6) = 7.0 ;
+    // lane 7: -(1+2^-9) - (1+2^-9+2^-20) = -(2 + 2^-8 + 2^-20), which rounds to nearest in binary16
+    // (exponent 1, ulp 2^-9) as -(2 + 2^-8) = -(1 + 2^-9) * 2 -> biased exponent 16, fraction 2 ->
+    // 0xC002.
     let out = run(0x4EC2_0C20, &[v0, v1, v2]);
-    assert_eq!(out.v0, lanes([0xC500, 0xC500, 0xC500, 0xC500, 0xC500, 0xC500, 0xC500, 0xC002]));
+    assert_eq!(out.v0, lanes([0xC500, 0xC500, 0xC500, 0xC500, 0xC500, 0xC500, 0x4700, 0xC002]));
 }
 
 #[test]
