@@ -35,13 +35,24 @@ fn is_child() -> Option<String> {
     std::env::var("OD_WX_CHILD").ok()
 }
 
-/// Runs this binary's `name` in a child; returns its exit status.
-fn child(name: &str) -> std::process::ExitStatus {
-    Command::new(std::env::current_exe().unwrap())
+/// Runs this binary's `name` in a child; returns its exit status and stdout.
+///
+/// The stdout matters as much as the status. A child can die *before* it reaches the write -- a
+/// mutation that leaves the cache writable also leaves this thread unable to execute it, and the
+/// child then dies running guest code -- and a death is only this test's answer if the child had
+/// printed that it was about to write, and had not printed that the write succeeded.
+fn child(name: &str) -> (std::process::ExitStatus, String) {
+    let out = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture", "--test-threads", "1"])
         .env("OD_WX_CHILD", name)
-        .status()
-        .expect("spawn child")
+        .output()
+        .expect("spawn child");
+    (out.status, String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The child died by a signal, after `marker`, without reporting a successful write.
+fn died_writing(st: std::process::ExitStatus, stdout: &str, marker: &str) -> bool {
+    !st.success() && st.code().is_none() && stdout.contains(marker) && !stdout.contains("WRITE SUCCEEDED")
 }
 
 /// A jit that has run `SVC #0` once, and the host address inside its cache that `SVC` returned to.
@@ -75,11 +86,12 @@ fn the_cache_is_not_writable_from_a_thread_resting_between_runs() {
         println!("WRITE SUCCEEDED");
         return; // exit 0: the cache was writable
     }
-    let st = child(NAME);
+    let (st, stdout) = child(NAME);
     assert!(
-        !st.success() && st.code().is_none(),
-        "the write to the code cache from the jit's own thread, between runs, did not fault ({st}) \
-         -- the cache is writable there, and W^X does not hold"
+        died_writing(st, &stdout, "now writing it"),
+        "the write to the code cache from the jit's own thread, between runs, did not fault where \
+         it was made ({st}; child said: {stdout:?}) -- either the cache is writable there, or the \
+         child died before it wrote"
     );
 }
 
@@ -96,9 +108,10 @@ fn the_cache_is_not_writable_from_the_guest_thread_while_guest_code_runs() {
         println!("WRITE SUCCEEDED");
         return;
     }
-    let st = child(NAME);
+    let (st, stdout) = child(NAME);
     assert!(
-        !st.success() && st.code().is_none(),
-        "a write to the code cache from inside guest execution did not fault ({st})"
+        died_writing(st, &stdout, "FROM INSIDE GUEST EXECUTION"),
+        "a write to the code cache from inside guest execution did not fault where it was made \
+         ({st}; child said: {stdout:?})"
     );
 }

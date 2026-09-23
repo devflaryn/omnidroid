@@ -396,6 +396,8 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
             }
             if swi == 2 && c.rewrite_byte_on_svc2 != 0 {
                 let p = c.rewrite_byte_on_svc2 as *mut u8;
+                // The marker `tests/wx.rs` requires before it will count a death as this write's.
+                println!("REWRITING {:#x} FROM INSIDE GUEST EXECUTION", p as u64);
                 // SAFETY: deliberately a write the host may refuse; `tests/wx.rs` runs it in a
                 // child process whose death is the measurement. The byte written is the byte read.
                 core::ptr::write_volatile(p, core::ptr::read_volatile(p));
