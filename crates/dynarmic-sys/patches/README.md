@@ -147,6 +147,24 @@ promise). `tests/a64_sm4.rs` runs the SM4 specification's own example — key
 schedule and 32 rounds through eight `SM4EKEY` and eight `SM4E` — and checks
 the ciphertext `681edf34 d206965e 86b3e94f 536e4246`.
 
+### 0006 — arm64: 64-bit unsigned max/min, which is how `CMHS`/`CMHI` compare
+
+`0006-arm64-unsigned-compare64.patch`. **arm64 only.** The IR has no 64-bit
+unsigned compare; `IREmitter::VectorGreaterEqualUnsigned` is
+`VectorEqual(VectorMaxUnsigned(a, b), a)` and `VectorGreaterUnsigned` is
+`NOT VectorEqual(VectorMinUnsigned(a, b), a)`. At `esize == 64` those are
+`VectorMaxU64`/`VectorMinU64`, `ASSERT_FALSE("Unimplemented")` on arm64, and
+`CMHS`/`CMHI` scalar (`D` only) and vector `.2D` are active decoder entries.
+FOUND by `hostile.rs`'s fuzzer at trial 158,510 (`CMHS D18, D23, D24`), in a
+300,000-trial run made after 0002-0005. AdvSIMD has no 64-bit `UMAX`/`UMIN`, so
+each selects per lane on `CMHI` with `BSL`. `tests/a64_compare.rs` checks
+both forms with operands a signed compare would order the other way.
+
+`VectorMaxS64`/`VectorMinS64` stay unimplemented: their only caller is
+`VectorMinMaxOperation` (`SMAX`/`SMIN`), which rejects `size == 0b11`
+(`simd_three_same.cpp:174`), and the signed compares are built from
+`VectorGreaterSigned`, not from max/min.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is
