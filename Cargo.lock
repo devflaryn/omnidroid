@@ -326,6 +326,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "omni-android",
+ "omni-gfx",
  "thiserror",
  "windows-sys",
 ]

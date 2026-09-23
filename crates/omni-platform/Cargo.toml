@@ -103,3 +103,6 @@ objc2-quartz-core = { version = "0.3", default-features = false, features = [
 # key. A dev-dependency cycle (omni-android depends on this crate), which Cargo supports and which
 # `omni-gfx`'s manifest already relies on; `omni-cpu` is built without dynarmic through it.
 omni-android = { workspace = true }
+# `tests/screen_capture_macos.rs` presents with omni-gfx's renderer and captures the screen, which
+# is where a macOS-only capture belongs: omni-gfx may not name a platform.
+omni-gfx = { workspace = true }
