@@ -24,6 +24,7 @@
 //! | [`mod@env`] | the `JNIEnv` handlers, and the refusal every unimplemented slot gets |
 //! | [`script`] | §8 steps 7-12, as an ordered list of downcalls a host can run |
 //! | [`input`] | §8 row 26: `vk.e.onTouch`, host pointer events to `nativePassInput` |
+//! | [`keys`] | `vk.g`, host keys to `nativePassKeyEvent`, for a declared hardware keyboard |
 //!
 //! # Only what the engine uses, and the rest refuse by name
 //!
@@ -45,6 +46,7 @@
 pub mod classes;
 pub mod env;
 pub mod input;
+pub mod keys;
 pub mod pool;
 pub mod refs;
 pub mod script;

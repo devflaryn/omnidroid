@@ -10,6 +10,9 @@
 //! A test that only checked that `deliver` returned `Ok` would pass with a seam that put x in
 //! `s1`, or the state where the pointer id goes.
 //!
+//! The same probe stands in for `nativePassKeyEvent` (`jni::keys`), whose `(Z I I Z)` land in the
+//! same four integer registers.
+//!
 //! ```text
 //! cargo test -p omni-android --test input
 //! ```
@@ -108,6 +111,11 @@ impl Fixture {
 
     fn calls(&self) -> u64 {
         self.guest.read_u64(self.guest.data + slot::CALLS)
+    }
+
+    /// What `x1` named on the last call.
+    fn class_of_last_call(&self) -> String {
+        self.jni.describe(self.seen().class).expect("a live handle")
     }
 
     fn seen(&self) -> Seen {
@@ -212,6 +220,49 @@ fn a_hover_and_the_other_buttons_never_reach_the_native() {
         fixture.deliver(&mut seam, WindowEvent::PointerUp { button, x: 20, y: 20 });
     }
     assert_eq!(fixture.calls(), 0);
+}
+
+/// **A key, in the registers `nativePassKeyEvent` reads**: `w2` down, `w3` the Linux input code,
+/// `w4` the Android key code, `w5` repeat -- decoded at `0x02baebdc`, where `w3` is what the
+/// engine turns into a key and `w4` is never read, so a scan code in `w4` would be a keyboard the
+/// engine never hears.
+#[test]
+fn a_key_reaches_the_native_in_the_registers_the_engine_reads() {
+    use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput, PASS_KEY_EVENT_SYMBOL};
+    let _serial = serialized();
+    let fixture = Fixture::new();
+    declare_hardware_keyboard(&fixture.jni).expect("a hardware keyboard");
+    let probe = fixture.probe;
+    let mut keys = KeyInput::new(&fixture.jni, &|symbol| {
+        (symbol == PASS_KEY_EVENT_SYMBOL).then_some(probe)
+    })
+    .expect("a key seam over the probe");
+    let mut deliver = |event: WindowEvent| {
+        let mut cpu = fixture.guest.thread(&fixture.boundary);
+        keys.deliver(&fixture.jni, &fixture.boundary, &mut cpu, 0, &event)
+            .unwrap_or_else(|error| panic!("{event:?} was not delivered: {error}"))
+    };
+    let registers = || {
+        let seen = fixture.seen();
+        (seen.pointer_id, seen.state, seen.width, seen.height)
+    };
+
+    // `W`, make code 0x11: KEY_W 17, AKEYCODE_W 51.
+    deliver(WindowEvent::KeyDown { keycode: 0x57, scancode: 0x11, repeat: false });
+    assert_eq!(registers(), (1, 17, 51, 0), "(w2 down, w3 scan, w4 key, w5 repeat)");
+    assert_eq!(fixture.class_of_last_call(), "class com/roblox/engine/jni/NativeGLInterface");
+    deliver(WindowEvent::KeyDown { keycode: 0x57, scancode: 0x11, repeat: true });
+    assert_eq!(registers(), (1, 17, 51, 1), "an auto-repeat");
+    deliver(WindowEvent::KeyUp { keycode: 0x57, scancode: 0x11 });
+    assert_eq!(registers(), (0, 17, 51, 0), "a release");
+    // The Up arrow, extended make code 0x48: KEY_UP 103, AKEYCODE_DPAD_UP 19.
+    deliver(WindowEvent::KeyDown { keycode: 0x26, scancode: 0xE048, repeat: false });
+    assert_eq!(registers(), (1, 103, 19, 0));
+    // A pointer event is not a key, and a key with no code reaches nothing.
+    deliver(down(10, 10));
+    deliver(WindowEvent::KeyDown { keycode: 0x41, scancode: 0, repeat: false });
+    assert_eq!(fixture.calls(), 4);
+    assert_eq!((keys.delivered(), keys.unmapped()), (4, 1));
 }
 
 /// **An engine that does not export the native is refused by name**, not answered with a seam
