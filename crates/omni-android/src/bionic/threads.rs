@@ -1289,6 +1289,11 @@ pub(super) fn pthread_detach(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 /// stops being an answer and becomes a lie, and it has to grow a real per-thread policy or become
 /// a refusal.
 ///
+/// **Two setters are bound now (2026-09-23), and fact 1 still holds**, because neither can change
+/// a policy: `pthread_attr_setschedparam` stores a priority that `pthread_create` ignores under
+/// `SCHED_NORMAL`, and [`pthread_setschedparam`] answers what the kernel answers an unprivileged
+/// app and **refuses** the one request it would grant that changes something.
+///
 /// `ESRCH` for an id this instance never handed out — including `pthread_self()` of a host thread
 /// that attached without being created by `pthread_create`, which is the main thread. That is
 /// deliberate and it is the honest answer: the main thread is not one of this registry's, and
@@ -1322,6 +1327,57 @@ pub(super) fn pthread_getschedparam(c: &mut ImportCall<'_, '_>) -> AbiResult<()>
     call.mem.write_u32(policy_at, SCHED_OTHER as u32, call.blame(1))?;
     call.mem.write_bytes(param_at, &[0u8; SCHED_PARAM_BYTES], call.blame(2))?;
     c.ret().i32(0);
+    Ok(())
+}
+
+// ================================================================== pthread_setschedparam
+
+/// `int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param)`
+///
+/// What the kernel answers an ordinary Android application, checked in the kernel's order --
+/// the thread, then the parameters, then the permission:
+///
+/// | request | answer |
+/// |---|---|
+/// | a `pthread_t` this instance does not know | `ESRCH`, as [`pthread_getschedparam`] answers |
+/// | `SCHED_FIFO`/`SCHED_RR`, priority 1..=99 | `EPERM`: no `CAP_SYS_NICE`, the same answer this layer's `sched_setscheduler` gives |
+/// | `SCHED_FIFO`/`SCHED_RR`, any other priority | `EINVAL` |
+/// | `SCHED_OTHER`, priority 0 | 0, and nothing changes: every thread here already runs at it |
+/// | `SCHED_OTHER`/`SCHED_BATCH`/`SCHED_IDLE`, priority not 0 | `EINVAL` |
+/// | `SCHED_BATCH`/`SCHED_IDLE`, priority 0 | **refused by name** -- the kernel grants it, it is a real change of policy, and this layer neither makes it nor tracks it, so [`pthread_getschedparam`] would then report `SCHED_OTHER` falsely |
+/// | any other policy | `EINVAL` |
+///
+/// Inline, for [`pthread_getschedparam`]'s reason: no guest code, no mapping.
+pub(super) fn pthread_setschedparam(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    use omni_bionic::metadata::sched_policy::{BATCH, FIFO, IDLE, OTHER, RR};
+    let (thread, policy, param) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()? as u32 as i32, a.next_u64()?)
+    };
+    let call = Call::inline(c)?;
+    let known = call.bionic().knows_guest_thread(thread)
+        || call.bionic().threads_table().knows(GuestThreadId(thread));
+    if !known {
+        c.ret().i32(consts::ESRCH);
+        return Ok(());
+    }
+    let param_at = guest_address(&call, param, 2)?;
+    let priority = call.mem.read_u32(param_at, call.blame(2))? as i32;
+    let code = match policy {
+        FIFO | RR if (1..=99).contains(&priority) => consts::EPERM,
+        FIFO | RR => consts::EINVAL,
+        OTHER | BATCH | IDLE if priority != 0 => consts::EINVAL,
+        OTHER => 0,
+        BATCH | IDLE => {
+            return call.refuse(format!(
+                "policy {policy} (SCHED_BATCH or SCHED_IDLE) would be granted to an unprivileged app \
+                 and change the thread's scheduling, which this layer neither makes nor tracks -- \
+                 pthread_getschedparam would then report SCHED_OTHER for it"
+            ))
+        }
+        _ => consts::EINVAL,
+    };
+    c.ret().i32(code);
     Ok(())
 }
 

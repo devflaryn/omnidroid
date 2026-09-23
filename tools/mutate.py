@@ -295,6 +295,9 @@ WEBVIEW = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fa
 # The condattr bindings, from guest code: `tests/bionic.rs` filtered to the one test. No APK.
 BIONIC_CONDATTR = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
                    "condattr"]
+# The scheduling-parameter bindings, from guest code: `tests/bionic.rs` filtered by name. No APK.
+BIONIC_SCHED = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+                "sched"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7192,6 +7195,26 @@ directory", ADAPTER_FILES,
      """    ("pthread_condattr_setclock", pthread_condattr_setclock),""",
      """    ("pthread_condattr_setclock", pthread_condattr_destroy),""",
      BIONIC_CONDATTR),
+
+    # pthread_attr_setschedparam / pthread_setschedparam: imported, bound before a run reached them
+    # (2026-09-23). Each row was also applied by hand once and caught.
+    ("setsched-A1", "A", "pthread_setschedparam grants SCHED_FIFO, where an app gets EPERM",
+     "crates/omni-android/src/bionic/threads.rs",
+     """        FIFO | RR if (1..=99).contains(&priority) => consts::EPERM,""",
+     """        FIFO | RR if (1..=99).contains(&priority) => 0,""",
+     BIONIC_SCHED),
+    ("setsched-A2", "A", "pthread_attr_setschedparam answers 0 and stores nothing",
+     "crates/omni-bionic/src/metadata.rs",
+     """    mem.write(attr_addr + ATTR_SCHED_PRIORITY, &priority)?;""",
+     """    let _ = priority;""",
+     BIONIC_SCHED),
+    ("setsched-B1", "B", "SCHED_BATCH/SCHED_IDLE are granted silently, so getschedparam would lie",
+     "crates/omni-android/src/bionic/threads.rs",
+     """        OTHER => 0,
+""",
+     """        OTHER | BATCH | IDLE => 0,
+""",
+     BIONIC_SCHED),
 ]
 
 

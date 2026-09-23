@@ -13711,3 +13711,130 @@ fn condattr_is_bound_and_its_clock_reaches_the_cond() {
         "a cond made from a CLOCK_MONOTONIC attr is the default realtime cond: the clock was lost"
     );
 }
+
+/// **`pthread_attr_setschedparam` stores the priority, and a thread is still created from the
+/// attr; `pthread_setschedparam` answers what the kernel answers an unprivileged app.** Bound
+/// before a run reached either (2026-09-23): both are `libroblox.so` imports, and the first game
+/// join had just died on `pthread_condattr_init`, an unbound import in the same position.
+///
+/// The child asks about itself, because a thread `pthread_create` made is one this instance
+/// certainly knows. Its policy reads back as `SCHED_OTHER` 0 after every request -- the one the
+/// layer grants changes nothing, and the ones it cannot make are errors, not silent successes.
+#[test]
+fn sched_params_are_stored_or_answered_as_the_kernel_answers() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let attr = f.guest.data + 0x300;
+    let param = f.guest.data + 0x380;
+    let out = f.guest.data + 0x800;
+    let seen = f.guest.data + 0x900;
+    f.guest.write_bytes(attr, &[0xAA; 56]);
+    f.guest.write_bytes(seen, &[0xEE; 0x60]);
+
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.mov(20, seen as u64);
+        asm.bl(f.thunk("pthread_self"));
+        asm.push(mov_reg(21, 0));
+        // (policy, priority) pairs, each result at seen + 8 * n.
+        for (n, (policy, priority)) in
+            [(1u64, 50u64), (1, 0), (0, 0), (0, 5), (7, 0)].into_iter().enumerate()
+        {
+            asm.mov(9, param as u64);
+            asm.mov(10, priority);
+            asm.push(str_imm(10, 9, 0));
+            asm.push(mov_reg(0, 21));
+            asm.mov(1, policy);
+            asm.mov(2, param as u64);
+            asm.bl(f.thunk("pthread_setschedparam"));
+            asm.push(str_imm(0, 20, 8 * n as u32));
+        }
+        // A pthread_t nobody has.
+        asm.mov(0, 0xDEAD_BEEF);
+        asm.mov(1, 0);
+        asm.mov(2, param as u64);
+        asm.bl(f.thunk("pthread_setschedparam"));
+        asm.push(str_imm(0, 20, 0x28));
+        // And the policy afterwards.
+        asm.push(mov_reg(0, 21));
+        asm.mov(1, (seen + 0x30) as u64);
+        asm.mov(2, (seen + 0x38) as u64);
+        asm.bl(f.thunk("pthread_getschedparam"));
+        asm.push(str_imm(0, 20, 0x40));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+
+    let entry = program(&f, |asm| {
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_attr_init"));
+        asm.mov(9, param as u64);
+        asm.mov(10, 42);
+        asm.push(str_imm(10, 9, 0));
+        asm.mov(0, attr as u64);
+        asm.mov(1, param as u64);
+        asm.bl(f.thunk("pthread_attr_setschedparam"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 16));
+        create_call(&f, asm, out, attr as u64, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.push(str_imm(0, 22, 24));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(f.guest.read_u64(out + 16) as u32, 0, "pthread_attr_setschedparam");
+    assert_eq!(read_u32_guest(&f, attr + 36), 42, "the priority is stored at sched_priority");
+    assert_eq!(read_u32_guest(&f, attr + 32), 0, "and the policy stays SCHED_NORMAL");
+    assert_eq!(f.guest.read_u64(out + 8) as u32, 0, "a thread is created from that attr");
+    assert_eq!(f.guest.read_u64(out + 24) as u32, 0, "and joined");
+
+    let result = |n: usize| read_u64_guest(&f, seen + 8 * n) as u32;
+    assert_eq!(result(0), 1, "SCHED_FIFO 50 is EPERM: an app has no CAP_SYS_NICE");
+    assert_eq!(result(1), 22, "SCHED_FIFO 0 is EINVAL: a real-time priority is 1..=99");
+    assert_eq!(result(2), 0, "SCHED_OTHER 0 is granted, and is what the thread already runs at");
+    assert_eq!(result(3), 22, "SCHED_OTHER 5 is EINVAL: its only priority is 0");
+    assert_eq!(result(4), 22, "policy 7 is no policy");
+    assert_eq!(result(5), 3, "a pthread_t nobody has is ESRCH");
+    assert_eq!(read_u64_guest(&f, seen + 0x40) as u32, 0, "pthread_getschedparam");
+    assert_eq!(read_u32_guest(&f, seen + 0x30), 0, "still SCHED_OTHER");
+    assert_eq!(read_u32_guest(&f, seen + 0x38), 0, "still priority 0");
+}
+
+/// `SCHED_BATCH` is the one request the kernel would grant that changes something, and this
+/// layer neither makes nor tracks it: **refused by name**, not answered 0.
+#[test]
+fn sched_batch_is_refused_by_name_rather_than_granted() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let param = f.guest.data + 0x380;
+    let out = f.guest.data + 0x800;
+    f.guest.write_u64(param, 0);
+    let start = start_routine(&f, |asm| {
+        asm.push(mov_reg(19, 30));
+        asm.bl(f.thunk("pthread_self"));
+        asm.mov(1, 3); // SCHED_BATCH
+        asm.mov(2, param as u64);
+        asm.bl(f.thunk("pthread_setschedparam"));
+        asm.mov(0, 0);
+        asm.push(mov_reg(30, 19));
+    });
+    // No join: a thread that dies on a refusal is not one to wait for (`docs/VERIFICATION.md`
+    // entry 8 -- a test must not hang under the defect it exists to detect). The host waits for
+    // the death, bounded.
+    let entry = program(&f, |asm| create_call(&f, asm, out, 0, start, 0));
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 8) as u32, 0, "the thread was created");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while f.bionic.guest_thread_failures().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let failures = f.bionic.guest_thread_failures();
+    assert!(
+        failures.iter().any(|failure| failure.why.contains("pthread_setschedparam")
+            && failure.why.contains("SCHED_BATCH")),
+        "the child must die on a refusal naming pthread_setschedparam: {failures:?}"
+    );
+}

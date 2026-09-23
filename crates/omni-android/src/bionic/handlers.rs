@@ -766,6 +766,14 @@ handlers! {
     fn pthread_attr_setdetachstate(attr: ptr, state: i32) -> i32 =
         |v| omni_bionic::metadata::attr_setdetachstate(&mut v, attr, state);
 
+    /// `int pthread_attr_setschedparam(pthread_attr_t *attr, const struct sched_param *param)`:
+    /// the priority, stored in the attr, which `pthread_create` then leaves unused because the
+    /// policy stays `SCHED_NORMAL` -- see `omni_bionic::metadata::attr_setschedparam`. Bound before
+    /// a run reached it (2026-09-23): `libroblox.so` imports it, and the first game join had just
+    /// died on `pthread_condattr_init`, an import in the same position.
+    fn pthread_attr_setschedparam(attr: ptr, param: ptr) -> i32 =
+        |v| omni_bionic::metadata::attr_setschedparam(&mut v, attr, param);
+
     /// `int pthread_getattr_np(pthread_t thid, pthread_attr_t *attr)`
     ///
     /// The only member of this family that reports a **live** thread rather than storing a
@@ -1724,6 +1732,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pthread_attr_destroy", pthread_attr_destroy),
     ("pthread_attr_setstacksize", pthread_attr_setstacksize),
     ("pthread_attr_setdetachstate", pthread_attr_setdetachstate),
+    ("pthread_attr_setschedparam", pthread_attr_setschedparam),
     ("pthread_attr_getstack", pthread_attr_getstack),
     ("pthread_getattr_np", pthread_getattr_np),
     // pthread mutex
@@ -1922,6 +1931,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // ---- phase 3c: the one thread symbol that runs no guest code and touches no mapping, so
     // the exit path would cost it 3x per call for nothing.
     ("pthread_getschedparam", threads::pthread_getschedparam),
+    ("pthread_setschedparam", threads::pthread_setschedparam),
     // ---- phase 3d: the network group. Two are answered out of `omni-bionic` (pure computation),
     // two are answered here over the descriptor table `files` already has -- with **no new
     // `omni-platform` surface at all**, which is the third phase running whose five-target

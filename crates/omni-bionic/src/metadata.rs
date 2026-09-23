@@ -110,6 +110,35 @@ pub fn attr_setstacksize(
     Ok(0)
 }
 
+/// Where this crate keeps an attr's scheduling fields: `sched_policy` at +32 and `sched_priority`
+/// at +36, which is where bionic's own `pthread_attr_t` has them (after `flags`, the padding and
+/// three `size_t`s) and which no other accessor here writes (+0 detach state, +8 stack size, +16
+/// guard size, +24 stack base).
+pub const ATTR_SCHED_POLICY: u64 = 32;
+/// See [`ATTR_SCHED_POLICY`].
+pub const ATTR_SCHED_PRIORITY: u64 = 36;
+
+/// `pthread_attr_setschedparam(attr, param)`: `attr->sched_priority = param->sched_priority`, and
+/// 0 -- bionic's whole body (`pthread_attr.cpp`); it validates nothing.
+///
+/// What the priority is **for** is `pthread_create`'s business, and bionic applies an attr's
+/// scheduling only when its policy is not `SCHED_NORMAL`. The policy is written by
+/// `pthread_attr_setschedpolicy`, which this crate does not implement and the engine does not
+/// import, so every attr this crate hands out keeps `attr_init`'s `SCHED_NORMAL` (0) at
+/// [`ATTR_SCHED_POLICY`] -- and a thread created from it runs at the normal policy with the
+/// stored priority unused, as on a device.
+pub fn attr_setschedparam(
+    mem: &mut impl GuestMemory,
+    attr_addr: u64,
+    param_addr: u64,
+) -> Result<i32, crate::memory::Fault> {
+    check_range(attr_addr, sizes::PTHREAD_ATTR_T)?;
+    let mut priority = [0u8; 4];
+    mem.read(param_addr, &mut priority)?;
+    mem.write(attr_addr + ATTR_SCHED_PRIORITY, &priority)?;
+    Ok(0)
+}
+
 /// `pthread_attr_getstacksize`: `Ok(Ok(size))`.
 pub fn attr_getstacksize(
     mem: &mut impl GuestMemory,
