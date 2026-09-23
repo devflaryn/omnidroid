@@ -3190,6 +3190,32 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     let mut turns = 0u64;
     // The last pointer-capture outcome logged, `(asked for, held)`.
     let mut capture_said: Option<(bool, bool)> = None;
+    // **OMNI_CROSSING_RATE=1: a measurement, off by default.** Every `FRAMES_EVERY`, the import
+    // crossings the census counted in the window -- inline and exit path together, which is every
+    // call a native backend would turn into a VM exit -- how many of them took the exit path, how
+    // many guest threads crossed, and the busiest symbols and threads. It only reads the census the
+    // gate already keeps on, so the guest runs exactly as it does without it. For
+    // `docs/ports/macos-hvf.md`: the rate an exit's cost is multiplied by.
+    let crossing_rate = std::env::var_os("OMNI_CROSSING_RATE").is_some();
+    let census_now = || -> std::collections::BTreeMap<String, u64> {
+        guest
+            .boundary
+            .census()
+            .map(|census| census.into_iter().map(|(symbol, n)| (symbol.to_string(), n)).collect())
+            .unwrap_or_default()
+    };
+    let threads_now = || -> std::collections::BTreeMap<u64, u64> {
+        // Summed per guest thread: a guest thread id can have more than one host-thread record.
+        let mut per_thread = std::collections::BTreeMap::new();
+        for record in guest.boundary.threads() {
+            *per_thread.entry(record.guest_thread).or_insert(0u64) += record.crossings;
+        }
+        per_thread
+    };
+    let mut rate_census = if crossing_rate { census_now() } else { Default::default() };
+    let mut rate_threads = if crossing_rate { threads_now() } else { Default::default() };
+    let mut rate_exits = guest.boundary.crossings().exits;
+    let mut rate_at = std::time::Instant::now();
     while settle.elapsed() < session {
         if guest.bionic.live_guest_threads() == 0 || close_requested {
             break;
@@ -3244,6 +3270,43 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 descriptors
             );
             last_presents = now;
+            if crossing_rate {
+                let census = census_now();
+                let threads = threads_now();
+                let exits = guest.boundary.crossings().exits;
+                let seconds = rate_at.elapsed().as_secs_f64().max(1e-3);
+                let mut symbols: Vec<(&str, u64)> = census
+                    .iter()
+                    .map(|(symbol, n)| (symbol.as_str(), n.saturating_sub(rate_census.get(symbol).copied().unwrap_or(0))))
+                    .filter(|(_, delta)| *delta > 0)
+                    .collect();
+                symbols.sort_by(|a, b| b.1.cmp(&a.1));
+                let mut busiest: Vec<(u64, u64)> = threads
+                    .iter()
+                    .map(|(thread, n)| (*thread, n.saturating_sub(rate_threads.get(thread).copied().unwrap_or(0))))
+                    .filter(|(_, delta)| *delta > 0)
+                    .collect();
+                busiest.sort_by(|a, b| b.1.cmp(&a.1));
+                let total: u64 = symbols.iter().map(|(_, delta)| delta).sum();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "CROSSING RATE: +{:.0}s: {total} crossings in {seconds:.2} s = {:.0}/s, {} on the \
+                     exit path ({:.0}/s), {} of {} live guest threads crossed; busiest threads \
+                     (id, crossings): {:?}; top symbols: {:?}",
+                    settle.elapsed().as_secs_f32(),
+                    total as f64 / seconds,
+                    exits.saturating_sub(rate_exits),
+                    exits.saturating_sub(rate_exits) as f64 / seconds,
+                    busiest.len(),
+                    guest.bionic.live_guest_threads(),
+                    &busiest[..busiest.len().min(6)],
+                    &symbols[..symbols.len().min(12)]
+                );
+                rate_census = census;
+                rate_threads = threads;
+                rate_exits = exits;
+                rate_at = std::time::Instant::now();
+            }
         }
         if let Some(open) = window.as_ref() {
             let due = resize_probe
