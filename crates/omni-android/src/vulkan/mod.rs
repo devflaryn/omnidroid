@@ -990,6 +990,7 @@ struct State {
     /// `Option` for [`instances`](State::instances)' reason and not for a different one: an
     /// instance that was never bound into a boundary has no data area, and the refusal that
     /// produces names `Vulkan::bind_into` rather than panicking inside an import.
+    /// Supports removal, driven by `vkDestroyInstance`: an instance's physical devices go with it.
     physical_devices: Option<Handles<HostPhysicalDevice>>,
     /// Supports removal: `vkDestroySurfaceKHR` frees a slot.
     surfaces: Option<Handles<HostSurface>>,
@@ -2144,8 +2145,9 @@ impl Vulkan {
             let issued = state.instances.as_ref().map_or(0, Instances::live);
             at.refuse(format!(
                 "the guest called `{call}` from {caller:#x} with {handle:#x} as its `VkInstance`, \
-                 and that is not a handle this layer issued -- it holds {issued} live one(s), \
-                 each on a {INSTANCE_SLOT_BYTES}-byte boundary of its registry. A `VkInstance` is \
+                 and that is not a handle this layer issued, or is one `vkDestroyInstance` has \
+                 taken back -- it holds {issued} live one(s), each on a \
+                 {INSTANCE_SLOT_BYTES}-byte boundary of its registry. A `VkInstance` is \
                  a dispatchable handle a host driver dereferences, so forwarding this one would \
                  be dereferencing a number the guest chose (Global Constraint 11). \
                  `Vulkan::instance_handles()` is the list of the ones that are real",
@@ -2840,6 +2842,25 @@ impl Vulkan {
         register(at, state.devices.as_mut(), "vkCreateDevice", token, false)
     }
 
+    /// Free the slot a live `VkInstance` handle names, once `vkDestroyInstance` has destroyed the
+    /// host's instance. Safe to remove from because the family never deduplicates.
+    fn forget_instance(&self, handle: GuestAddr) -> bool {
+        let mut state = self.state.lock();
+        state.instances.as_mut().and_then(|i| i.remove(handle)).is_some()
+    }
+
+    /// Drop the `VkPhysicalDevice` handles of an instance that has just been destroyed.
+    ///
+    /// [`Vulkan::forget_queues_of`]'s argument, one level up: a physical device is enumerated,
+    /// never destroyed, and its lifetime is its instance's. The family **deduplicates**, which
+    /// [`Handles::remove`](handles::Handles::remove) permits only for tokens a host never recycles
+    /// -- and a destroyed instance's physical-device tokens carry its index, which the host never
+    /// hands out again.
+    fn forget_physical_devices_of(&self, keep: impl Fn(HostPhysicalDevice) -> bool) -> usize {
+        let mut state = self.state.lock();
+        state.physical_devices.as_mut().map_or(0, |h| h.retain(keep))
+    }
+
     /// Free the slot a live `VkDevice` handle names, once `vkDestroyDevice` has destroyed the
     /// host's device. Safe to remove from because the family never deduplicates.
     fn forget_device(&self, handle: GuestAddr) -> bool {
@@ -3085,7 +3106,8 @@ impl Vulkan {
                 return Err(at.refuse(format!(
                     "the guest called `vkGetInstanceProcAddr(instance = {instance:#x}, \
                      pName = \"{name}\")` from {caller:#x}, and {instance:#x} is not a \
-                     `VkInstance` this layer issued -- it holds {issued} live handle(s), each on a \
+                     `VkInstance` this layer issued, or is one `vkDestroyInstance` has taken \
+                     back -- it holds {issued} live handle(s), each on a \
                      {INSTANCE_SLOT_BYTES}-byte boundary of its registry. A `VkInstance` is a \
                      dispatchable handle a host driver dereferences, so forwarding this one would \
                      be dereferencing a number the guest chose. NULL is not the answer either: \
@@ -3478,6 +3500,8 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             instance::enumerate_instance_extension_properties(c, &at, &vulkan, args)
         }
         "vkCreateInstance" => instance::create_instance(c, &at, &vulkan, args),
+        // The last call of the engine's `APP_CMD_TERM_WINDOW` teardown, measured.
+        "vkDestroyInstance" => instance::destroy_instance(c, &at, &vulkan, args),
         "vkEnumerateInstanceLayerProperties" => {
             instance::enumerate_instance_layer_properties(c, &at, args)
         }

@@ -16,19 +16,18 @@
 //!
 //! # Nothing here destroys anything on the guest's behalf, and that is what keeps [`Drop`] right
 //!
-//! There is **no `vkDestroyInstance`** in the trait, because the guest has never been measured
-//! calling it: the decoded bootstrap at guest `0x02595160` resolves two names, and stage 3
-//! implements the set a renderer needs in order to *reach* a device. A guest that calls a
-//! destructor this host lacks gets a refusal naming the function from the thunk, which is the
-//! honest answer and is also what makes this file's tables exactly what this host made — nothing
-//! can have gone away behind their back.
+//! A destructor is in the trait **only once the guest was measured calling it**: the decoded
+//! bootstrap at guest `0x02595160` resolves two names, and stage 3 implements the set a renderer
+//! needs in order to *reach* a device. A guest that calls a destructor this host lacks gets a
+//! refusal naming the function from the thunk, which is the honest answer and is also what makes
+//! this file's tables exactly what this host made — nothing can have gone away behind their back.
 //!
-//! `vkDestroySurfaceKHR` and `vkDestroyDevice` **are** in the trait, and for the same reason
-//! `vkDestroyInstance` is not: they were measured. The engine's render thread answers
-//! `APP_CMD_TERM_WINDOW` — the app closed the way a device closes it — by destroying its swapchain
-//! and its surface, saving its pipeline cache, and destroying its device. The guest's own destroys
-//! go through [`GfxVulkanHost::destroy_surface`] and [`GfxVulkanHost::destroy_device`], which
-//! empty the table entries they destroy.
+//! `vkDestroySurfaceKHR`, `vkDestroyDevice` and `vkDestroyInstance` were measured. The engine's
+//! render thread answers `APP_CMD_TERM_WINDOW` — the app closed the way a device closes it — by
+//! destroying its swapchain and its surface, saving its pipeline cache, destroying its device and
+//! then its instance. The guest's own destroys go through [`GfxVulkanHost::destroy_surface`],
+//! [`GfxVulkanHost::destroy_device`] and [`GfxVulkanHost::destroy_instance`], which empty the
+//! table entries they destroy.
 //!
 //! So [`Drop`] destroys whatever is left, and it runs the whole tree in Vulkan's required order:
 //! devices (each waited on first), then surfaces, then instances. Queues are not destroyed and
@@ -116,12 +115,16 @@ pub const PLATFORM_SURFACE_ENTRY_POINTS: [&str; 6] = [
     "vkCreateAndroidSurfaceKHR",
 ];
 
-/// How many `VkInstance`s this host will create before it refuses.
+/// How many **live** `VkInstance`s this host will hold before it refuses a new one.
 ///
 /// An allocation bound rather than a Vulkan limit. `omni_android::vulkan::MAX_INSTANCES` bounds
 /// the guest-visible registry at four; this is deliberately a little larger, so that the refusal a
 /// guest sees comes from the registry — which can name the handle and the count — rather than from
 /// here, where the only thing that could be said is "the host is full".
+///
+/// **Live, not ever created**, since `vkDestroyInstance`: the engine destroys its instance with
+/// its window and creates a new one when the window comes back, so a count of every instance ever
+/// made would refuse the ninth return to the foreground.
 pub const MAX_INSTANCES: usize = 8;
 
 /// A real Vulkan driver, as [`VulkanHost`].
@@ -133,12 +136,14 @@ pub const MAX_INSTANCES: usize = 8;
 /// address and never the driver's pointer.
 pub struct GfxVulkanHost {
     entry: ash::Entry,
-    /// Every instance this host created, indexed by [`HostInstance`] token.
+    /// Every instance this host created, indexed by [`HostInstance`] token, and `None` once the
+    /// guest has destroyed it.
     ///
-    /// **Never removed from.** A token is an index, so removing an entry would make a later token
-    /// name an earlier instance. Nothing removes today in any case: there is no
-    /// `vkDestroyInstance` in the trait, for the reason this module's header gives.
-    instances: Mutex<Vec<ash::Instance>>,
+    /// **Emptied, never removed from and never refilled**, for [`GfxVulkanHost::devices`]'
+    /// reason: a token is an index, so removing an entry would make a later token name an earlier
+    /// instance, and refilling a slot would make a destroyed instance's token -- and every
+    /// surface, device and physical-device token that carries its index -- name a new one.
+    instances: Mutex<Vec<Option<ash::Instance>>>,
     /// Each instance's physical devices, **cached on first enumeration**, indexed by instance
     /// token.
     ///
@@ -560,10 +565,17 @@ impl GfxVulkanHost {
         }))
     }
 
-    /// How many instances this host has created. Diagnostic (Global Constraint 6).
+    /// How many instances this host has created, destroyed ones included. Diagnostic (Global
+    /// Constraint 6).
     #[must_use]
     pub fn instances_created(&self) -> usize {
         self.locked().len()
+    }
+
+    /// How many instances this host holds live: created and not destroyed by the guest.
+    #[must_use]
+    pub fn instances_live(&self) -> usize {
+        self.locked().iter().flatten().count()
     }
 
     /// The driver's own name for a created instance's first physical device, if it has one.
@@ -596,27 +608,29 @@ impl GfxVulkanHost {
     /// host bug and not a guest one — and the response to it must not be that every later Vulkan
     /// call refuses for a reason unrelated to what the guest did. The data behind it is a `Vec` of
     /// handles with no invariant a panic could have broken halfway.
-    fn locked(&self) -> std::sync::MutexGuard<'_, Vec<ash::Instance>> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, Vec<Option<ash::Instance>>> {
         self.instances.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The `ash::Instance` a token names, or a refusal naming the token.
+    /// The live `ash::Instance` a token names, or a refusal naming the token.
     fn lookup(
-        instances: &[ash::Instance],
+        instances: &[Option<ash::Instance>],
         instance: HostInstance,
     ) -> AbiResult<&ash::Instance> {
         usize::try_from(instance.token())
             .ok()
             .and_then(|index| instances.get(index))
+            .and_then(Option::as_ref)
             .ok_or_else(|| {
                 refused(
                     "VulkanHost::lookup",
                     &format!(
-                        "{instance:?} is not a token this host issued -- it has issued {} -- so \
-                         there is no `VkInstance` to forward to. A token reaching here that this \
-                         host did not mint means the loader's registry and this host disagree, \
-                         which happens when `Vulkan::set_host` replaced one host with another \
-                         while the guest still held a handle",
+                        "{instance:?} is not a live instance of this host -- it has issued {} -- \
+                         so there is no `VkInstance` to forward to. An instance the guest has \
+                         destroyed lands here, and so does a token this host did not mint, which \
+                         means the loader's registry and this host disagree: that happens when \
+                         `Vulkan::set_host` replaced one host with another while the guest still \
+                         held a handle",
                         instances.len()
                     ),
                 )
@@ -1528,15 +1542,15 @@ impl VulkanHost for GfxVulkanHost {
 
     fn create_instance(&self, request: &InstanceRequest) -> AbiResult<DriverAnswer<HostInstance>> {
         let mut instances = self.locked();
-        if instances.len() >= MAX_INSTANCES {
+        if instances.iter().flatten().count() >= MAX_INSTANCES {
             return Err(refused(
                 "vkCreateInstance",
                 &format!(
-                    "this host has already created {MAX_INSTANCES} instances and keeps every one \
-                     of them, because a `HostInstance` token is an index into that table and \
-                     reusing a slot would make an old token name a new instance. Nothing destroys \
-                     an instance today: there is no `vkDestroyInstance` in `VulkanHost`, because \
-                     the guest has never called one"
+                    "this host already holds {MAX_INSTANCES} live instances, which is \
+                     `omni_gfx::host::MAX_INSTANCES`. The guest's registry holds fewer, so an \
+                     instance reaching here past that bound was created some other way than \
+                     through this loader, or `vkDestroyInstance` was never called for the ones \
+                     before it"
                 ),
             ));
         }
@@ -1584,7 +1598,7 @@ impl VulkanHost for GfxVulkanHost {
         match unsafe { self.entry.create_instance(&info, None) } {
             Ok(instance) => {
                 let token = instances.len() as u64;
-                instances.push(instance);
+                instances.push(Some(instance));
                 Ok(DriverAnswer::Ok(HostInstance::from_token(token)))
             }
             Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
@@ -1610,6 +1624,103 @@ impl VulkanHost for GfxVulkanHost {
         // around, and this is the one place in the workspace where the pointer exists at all.
         let found = unsafe { self.entry.get_instance_proc_addr(handle, name.as_ptr()) };
         Ok(found.is_some())
+    }
+
+    /// `vkDestroyInstance`, after the check the specification requires: **no `VkDevice` and no
+    /// `VkSurfaceKHR` made from the instance may still be alive**.
+    ///
+    /// [`GfxVulkanHost::destroy_device`]'s argument, one level up: no validation layers here, a
+    /// driver measured failing silently when misused, so live children are refused **naming each
+    /// kind with a count and a few tokens**, and the instance is left exactly as it was. This host
+    /// makes no debug messenger -- the shim refuses a `pNext` chain on `vkCreateInstance`, and
+    /// `vkCreateDebugUtilsMessengerEXT` is not forwarded -- so there is no third kind to check.
+    ///
+    /// # Held across the check and the removal
+    ///
+    /// `instances` is held from the check until the slot is emptied. Creating a device and
+    /// creating a surface both look the instance up in that table first, so neither can happen in
+    /// between. `surfaces`, `devices` and `physical` follow `instances` in the lock order and are
+    /// each taken on their own. The driver is called with no lock held.
+    ///
+    /// # What goes with it
+    ///
+    /// Its physical devices: their tokens are the answer, and the enumeration cached for the
+    /// instance is emptied. Also the import probes cached for those physical devices, which are
+    /// keyed by the driver's raw handle, a value a later instance's physical device may reuse.
+    fn destroy_instance(&self, instance: HostInstance) -> AbiResult<Vec<HostPhysicalDevice>> {
+        const CALL: &str = "vkDestroyInstance";
+        let index = usize::try_from(instance.token()).unwrap_or(usize::MAX);
+        let (doomed, gone) = {
+            let mut instances = self.locked();
+            if instances.get(index).and_then(Option::as_ref).is_none() {
+                return Err(refused(
+                    CALL,
+                    &format!(
+                        "{instance:?} is not an instance this host holds -- it has created {}. An \
+                         instance the guest has already destroyed lands here too, and a second \
+                         `vkDestroyInstance` of one instance is a double free the driver is not \
+                         required to notice",
+                        instances.len()
+                    ),
+                ));
+            }
+            let mut live = Vec::new();
+            let surfaces: Vec<u64> = self
+                .locked_surfaces()
+                .iter()
+                .filter(|(_, surface)| surface.instance == index)
+                .map(|(token, _)| token)
+                .collect();
+            if !surfaces.is_empty() {
+                live.push(("VkSurfaceKHR", surfaces));
+            }
+            let devices: Vec<u64> = self
+                .locked_devices()
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.as_ref().is_some_and(|device| device.instance == index))
+                .map(|(token, _)| token as u64)
+                .collect();
+            if !devices.is_empty() {
+                live.push(("VkDevice", devices));
+            }
+            if !live.is_empty() {
+                return Err(refused(
+                    CALL,
+                    &format!(
+                        "{instance:?} still has objects created from it: {}. The specification \
+                         requires every device and surface made from an instance to be destroyed \
+                         before it is, and there is no validation layer on this machine to report \
+                         the violation -- its NVIDIA driver has been measured failing silently or \
+                         corrupting the heap when misused instead. So the instance is left \
+                         exactly as it was",
+                        describe_children(&live)
+                    ),
+                ));
+            }
+            let Some(doomed) = instances.get_mut(index).and_then(Option::take) else {
+                // Checked live above, under this same lock.
+                return Err(refused(CALL, &format!("{instance:?} vanished under its own lock")));
+            };
+            let enumerated =
+                self.locked_physical().get_mut(index).map(std::mem::take).unwrap_or_default();
+            let raw: Vec<u64> =
+                enumerated.iter().map(|device| vk::Handle::as_raw(*device)).collect();
+            self.importable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|probe| !raw.contains(&probe.physical));
+            // The tokens `physical_devices` minted for this instance: `(instance << 32) | index`.
+            let gone: Vec<HostPhysicalDevice> = (0..enumerated.len() as u64)
+                .map(|device| HostPhysicalDevice::from_token(((index as u64) << 32) | device))
+                .collect();
+            (doomed, gone)
+        };
+        // SAFETY: the instance is live and this host created it; every device and surface made
+        // from it is gone -- checked above, under the lock that then emptied its slot, so no new
+        // one can have been made through this host -- and `pAllocator` was `None` at creation.
+        unsafe { doomed.destroy_instance(None) };
+        Ok(gone)
     }
 
     // ------------------------------------------------------------------------ stage 3
@@ -6353,14 +6464,17 @@ impl Drop for GfxVulkanHost {
         // entry it destroys, so nothing here is destroyed twice.
         let surfaces = self.locked_surfaces().drain();
         for surface in surfaces {
-            let Some(instance) = instances.get(surface.instance) else { continue };
+            let Some(instance) = instances.get(surface.instance).and_then(Option::as_ref) else {
+                continue;
+            };
             let surface_fn = khr::surface::Instance::new(&self.entry, instance);
             // SAFETY: the surface is live, it was created from this instance, every swapchain
             // made from it was destroyed above, and `pAllocator` was `None`.
             unsafe { surface_fn.destroy_surface(surface.surface, None) };
         }
 
-        for instance in instances {
+        // Only the instances the guest did not destroy itself, for the surfaces' reason.
+        for instance in instances.into_iter().flatten() {
             // SAFETY: each is a live instance this host created; every device and surface made
             // from it has just been destroyed above, and `pAllocator` was `None` at creation.
             unsafe { instance.destroy_instance(None) };
@@ -6372,7 +6486,9 @@ impl core::fmt::Debug for GfxVulkanHost {
     /// Prints how many instances are live, because a [`VulkanHost`] is interpolated into
     /// `omni_android::vulkan::Vulkan`'s own `Debug` and that is what a reader wants from it.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "GfxVulkanHost {{ {} instance(s) created }}", self.locked().len())
+        let instances = self.locked();
+        let live = instances.iter().flatten().count();
+        write!(f, "GfxVulkanHost {{ {live} instance(s) live of {} created }}", instances.len())
     }
 }
 

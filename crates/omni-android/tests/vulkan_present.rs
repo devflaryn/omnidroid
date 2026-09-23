@@ -356,6 +356,12 @@ struct HostLog {
     queues_handed: Vec<HostQueue>,
     /// Every device a `vkDestroyDevice` actually destroyed.
     devices_destroyed: Vec<HostDevice>,
+    /// Devices created and not destroyed, and surfaces likewise: what `destroy_instance` refuses
+    /// over.
+    devices_live: usize,
+    surfaces_live: usize,
+    /// Every instance a `vkDestroyInstance` actually destroyed.
+    instances_destroyed: Vec<HostInstance>,
 
     // ---------------------------------------------------------------------------- stage 5
     /// Every `vkAllocateMemory`, as the shim decoded it, with the token it was answered with —
@@ -517,6 +523,7 @@ impl VulkanHost for StageFourHost {
             || name == "vkCreateWin32SurfaceKHR"
             || name == "vkDestroySurfaceKHR"
             || name == "vkDestroyDevice"
+            || name == "vkDestroyInstance"
             || name == "vkCreateDevice")
     }
 
@@ -525,10 +532,33 @@ impl VulkanHost for StageFourHost {
         _instance: HostInstance,
         _window: RawWindow,
     ) -> AbiResult<DriverAnswer<SurfaceCreated>> {
+        let surface = HostSurface::from_token(self.token());
+        self.log().surfaces_live += 1;
         Ok(DriverAnswer::Ok(SurfaceCreated {
-            surface: HostSurface::from_token(self.token()),
+            surface,
             host_call: "vkCreateWin32SurfaceKHR".to_string(),
         }))
+    }
+
+    /// **Refuses while a device or a surface lives**, standing in for the real host's check --
+    /// which the live test exercises against `GfxVulkanHost`. Answers the one physical device this
+    /// double enumerates, which goes with the instance.
+    fn destroy_instance(&self, instance: HostInstance) -> AbiResult<Vec<HostPhysicalDevice>> {
+        let mut log = self.log();
+        if log.devices_live > 0 || log.surfaces_live > 0 {
+            return Err(AbiError::Refused {
+                symbol: "vkDestroyInstance".to_string(),
+                address: 0,
+                why: format!(
+                    "{instance:?} still has objects created from it: {} `VkDevice`; {} \
+                     `VkSurfaceKHR`",
+                    log.devices_live, log.surfaces_live
+                ),
+            });
+        }
+        log.instances_destroyed.push(instance);
+        log.destroyed.push("vkDestroyInstance".to_string());
+        Ok(vec![HostPhysicalDevice::from_token(0)])
     }
 
     /// **Records and nothing else.** The two rules only a host can see -- the instance pairing
@@ -536,7 +566,10 @@ impl VulkanHost for StageFourHost {
     /// checks them against it; what this double lets a test count is how many destroys reached a
     /// host at all, which is the guest-side registry's property.
     fn destroy_surface(&self, instance: HostInstance, surface: HostSurface) -> AbiResult<()> {
-        self.log().surfaces_destroyed.push((instance, surface));
+        let mut log = self.log();
+        log.surfaces_destroyed.push((instance, surface));
+        log.surfaces_live = log.surfaces_live.saturating_sub(1);
+        drop(log);
         self.note("vkDestroySurfaceKHR");
         Ok(())
     }
@@ -637,6 +670,7 @@ impl VulkanHost for StageFourHost {
         _device: HostPhysicalDevice,
         _request: &DeviceRequest,
     ) -> AbiResult<DriverAnswer<HostDevice>> {
+        self.log().devices_live += 1;
         Ok(DriverAnswer::Ok(HostDevice::from_token(0)))
     }
 
@@ -666,6 +700,7 @@ impl VulkanHost for StageFourHost {
             });
         }
         log.devices_destroyed.push(device);
+        log.devices_live = log.devices_live.saturating_sub(1);
         log.destroyed.push("vkDestroyDevice".to_string());
         Ok(std::mem::take(&mut log.queues_handed))
     }
@@ -2727,6 +2762,91 @@ fn a_device_is_destroyed_once_after_its_children_and_its_queues_go_with_it() {
     assert!(text.contains("`VkDevice`"), "{text}");
     let text = up.f.refusal(wait_idle, &[up.queue, 0, 0, 0]).to_string();
     assert!(text.contains("`VkQueue`"), "a destroyed device's queue names nothing: {text}");
+}
+
+// =========================================================================== vkDestroyInstance
+
+/// **An instance is destroyed once, only after its device and surface, and its handles -- the
+/// instance's and its physical devices' -- go with it. Then a second instance works.**
+///
+/// Measured: `vkDestroyInstance` is the last call of the engine's `APP_CMD_TERM_WINDOW` teardown,
+/// and the engine creates a new instance when the window comes back. This test owns the guest
+/// side:
+///
+/// * `VK_NULL_HANDLE` is the specified no-op; a wild `VkInstance` and a guest allocator refuse;
+/// * with a device and a surface alive the host's refusal names both, and nothing is taken back;
+///   with only the surface, only the surface;
+/// * once both are gone the host destroys the instance **once**, and the guest's `VkInstance` and
+///   `VkPhysicalDevice` handles stop being handles -- a second destroy, `vkGetInstanceProcAddr`,
+///   a thunk handed out earlier and a physical-device query all refuse by name;
+/// * a second `vkCreateInstance` works, with a physical device and a surface of its own.
+///
+/// The host's own check is the live test's, against `GfxVulkanHost`.
+#[test]
+fn an_instance_is_destroyed_once_after_its_children_and_a_second_one_can_be_made() {
+    let _serial = serialized();
+    let up = up_to_a_device("destroy-instance");
+    // All three through `vkGetInstanceProcAddr`, as the engine was measured reaching them.
+    let destroy = up.f.resolve(up.entry_point, up.instance, "vkDestroyInstance");
+    let destroy_surface = up.f.resolve(up.entry_point, up.instance, "vkDestroySurfaceKHR");
+    let destroy_device = up.f.resolve(up.entry_point, up.instance, "vkDestroyDevice");
+    let enumerate = up.f.resolve(up.entry_point, up.instance, "vkEnumeratePhysicalDevices");
+    let properties = up.f.resolve(up.entry_point, up.instance, "vkGetPhysicalDeviceProperties");
+    let physical = up.f.vulkan().physical_device_handles()[0].0 as u64;
+    assert_eq!(up.f.vulkan().instance_handles().len(), 1);
+
+    // `VK_NULL_HANDLE`: the specified no-op. A wild instance and a guest allocator refuse.
+    up.f.call(destroy, [0, 0, 0, 0]).expect("a null destroy is a no-op");
+    let wild = up.instance + 16;
+    let text = up.f.refusal(destroy, &[wild, 0]).to_string();
+    assert!(text.contains("`VkInstance`"), "it names the family: {text}");
+    assert!(text.contains(&format!("{wild:#x}")), "and the handle: {text}");
+    let text = up.f.refusal(destroy, &[up.instance, 0x1000]).to_string();
+    assert!(text.contains("pAllocator"), "{text}");
+    assert!(up.host.log().instances_destroyed.is_empty(), "none of those destroyed anything");
+
+    // **A live device and a live surface: refused, naming both, and nothing taken back.**
+    let text = up.f.refusal(destroy, &[up.instance, 0]).to_string();
+    assert!(text.contains("VkDevice"), "the refusal names the live device: {text}");
+    assert!(text.contains("VkSurfaceKHR"), "and the live surface: {text}");
+    assert!(up.host.log().instances_destroyed.is_empty());
+    assert_eq!(up.f.vulkan().instance_handles().len(), 1, "the handle still names it");
+    assert_eq!(up.f.vulkan().physical_device_handles().len(), 1, "and so does the GPU's");
+    // The device first: then only the surface is named.
+    up.f.call(destroy_device, [up.device, 0, 0, 0]).expect("destroy the device");
+    let text = up.f.refusal(destroy, &[up.instance, 0]).to_string();
+    assert!(text.contains("0 `VkDevice`") && text.contains("1 `VkSurfaceKHR`"), "{text}");
+
+    // **Then the surface, then the instance: destroyed once, with its handles.**
+    up.f.call(destroy_surface, [up.instance, up.surface, 0, 0]).expect("destroy the surface");
+    up.f.call(destroy, [up.instance, 0, 0, 0]).expect("destroy the instance");
+    assert_eq!(up.host.log().instances_destroyed, vec![HostInstance::from_token(0)], "once");
+    assert!(up.f.vulkan().instance_handles().is_empty(), "the instance's slot is free");
+    assert!(up.f.vulkan().physical_device_handles().is_empty(), "and its GPU's handle is gone");
+
+    // **Stale handles name nothing**: a second destroy, the loader's own lookup, a thunk handed
+    // out while the instance lived, and a query on the physical device that went with it.
+    let text = up.f.refusal(destroy, &[up.instance, 0]).to_string();
+    assert!(text.contains("`VkInstance`"), "{text}");
+    assert_eq!(up.host.log().instances_destroyed.len(), 1, "the host was asked once, not twice");
+    let name = up.f.cstr("vkCreateDevice");
+    let text = up.f.refusal(up.entry_point, &[up.instance, name]).to_string();
+    assert!(text.contains("vkGetInstanceProcAddr") && text.contains("taken back"), "{text}");
+    let count_at = up.f.alloc(8);
+    let text = up.f.refusal(enumerate, &[up.instance, count_at, 0]).to_string();
+    assert!(text.contains("`VkInstance`"), "an earlier thunk checks its handle again: {text}");
+    let properties_at = up.f.alloc(PHYSICAL_DEVICE_PROPERTIES_BYTES);
+    let text = up.f.refusal(properties, &[physical, properties_at]).to_string();
+    assert!(text.contains("`VkPhysicalDevice`"), "the GPU's handle went with it: {text}");
+
+    // **The next window's instance**: made, enumerated, and given a surface, as the engine will.
+    let again = up.f.an_instance(up.entry_point);
+    let result = up.f.call(enumerate, [again, count_at, 0, 0]).expect("count") as i32;
+    assert_eq!(result, VK_SUCCESS);
+    assert_eq!(up.f.read_u32(count_at), 1, "the second instance sees its GPU");
+    let surface = up.f.a_surface(up.entry_point, again);
+    assert_ne!(surface, 0);
+    assert_eq!(up.f.vulkan().instance_handles().len(), 1);
 }
 
 // ======================================================================= vkAcquireNextImageKHR
@@ -5910,6 +6030,113 @@ fn the_real_drivers_pipeline_cache_is_saved_through_the_guest_and_loads_back() {
     }
     let pipeline = f.guest.read_u64(pipeline_at as GuestAddr);
     f.call(name("vkDestroyPipeline"), [device, pipeline, 0, 0]).expect("destroy the pipeline");
+}
+
+/// **The engine's whole `APP_CMD_TERM_WINDOW` teardown and the next window's bring-up, against the
+/// real driver: an instance is destroyed only after its device and surface, and a second one
+/// works.**
+///
+/// Measured: `vkDestroyInstance` is the last call of the engine's teardown, and a resumed app
+/// creates a new instance, surface and device when its window comes back. The children check is
+/// `GfxVulkanHost`'s -- the guest-side registries do not know which instance a device or surface
+/// came from -- so it is exercised here:
+///
+/// * with a device and a surface alive, the refusal names both, and the instance still works;
+/// * with only the surface, only the surface;
+/// * then destroyed: the host holds no live instance, the stale handle and the stale token are
+///   refusals, and the physical device's handle went with it;
+/// * a second instance gets a new token, sees the GPU, and carries a surface and a device through
+///   the same teardown.
+#[test]
+#[ignore = "opens a window and the host Vulkan driver; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn the_real_instance_is_destroyed_after_its_children_and_the_next_window_gets_a_new_one() {
+    require_gate();
+    let _serial = serialized();
+
+    let mut window = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
+        "Omnidroid — Vulkan: the guest destroys its instance",
+        800,
+        450,
+    ))
+    .unwrap_or_else(|err| panic!("could not create the window: {err}"));
+    window.show();
+    let _ = window.poll_events().count();
+    let source = HostWindowSource::watching(&window).expect("a source watching the window");
+
+    let host = omni_gfx::GfxVulkanHost::load().expect("this machine must have a Vulkan loader");
+    let f = fixture("live-destroy-instance", Some(host.clone()));
+    f.ndk.set_window_source(Arc::clone(&source) as Arc<dyn WindowSource>);
+    let entry_point = f.entry_point();
+
+    // One window's worth: an instance, its surface, its GPU, a device and a queue.
+    let bring_up = |label: &str| {
+        let instance = f.an_instance(entry_point);
+        let surface = f.a_surface(entry_point, instance);
+        let enumerate = f.resolve(entry_point, instance, "vkEnumeratePhysicalDevices");
+        let count_at = f.alloc(8);
+        f.call(enumerate, [instance, count_at, 0, 0]).expect("count");
+        let devices_at = f.alloc(8);
+        f.call(enumerate, [instance, count_at, devices_at, 0]).expect("array");
+        let physical = f.guest.read_u64(devices_at as GuestAddr);
+        let device = f.a_device(entry_point, instance, physical, 0);
+        let get_queue = f.resolve(entry_point, instance, "vkGetDeviceQueue");
+        let queue_at = f.alloc(8);
+        f.call(get_queue, [device, 0, 0, queue_at]).expect("a queue");
+        eprintln!("{label}: instance {instance:#x}, surface {surface:#x}, device {device:#x}");
+        (instance, surface, physical, device)
+    };
+    let (instance, surface, physical, device) = bring_up("the first window");
+    let token = f.vulkan().instance_handles()[0].1;
+    assert_eq!(host.instances_live(), 1);
+    // All through `vkGetInstanceProcAddr`, as the engine was measured reaching them.
+    let destroy_instance = f.resolve(entry_point, instance, "vkDestroyInstance");
+    let destroy_device = f.resolve(entry_point, instance, "vkDestroyDevice");
+    let destroy_surface = f.resolve(entry_point, instance, "vkDestroySurfaceKHR");
+    let properties = f.resolve(entry_point, instance, "vkGetPhysicalDeviceProperties");
+    let properties_at = f.alloc(PHYSICAL_DEVICE_PROPERTIES_BYTES);
+
+    // **Refused while the device and the surface live, naming both; the instance still works.**
+    let text = f.refusal(destroy_instance, &[instance, 0]).to_string();
+    assert!(text.contains("1 `VkSurfaceKHR`"), "{text}");
+    assert!(text.contains("1 `VkDevice`"), "{text}");
+    assert_eq!(host.instances_live(), 1, "nothing was destroyed");
+    f.call(properties, [physical, properties_at, 0, 0]).expect("the GPU still answers");
+    eprintln!("\n=== vkDestroyInstance evidence ===");
+    eprintln!("with a device and a surface alive, refused by name:\n  {text}");
+
+    // The engine's order: the device, then (here) the surface, then the instance.
+    f.call(destroy_device, [device, 0, 0, 0]).expect("destroy the device");
+    let text = f.refusal(destroy_instance, &[instance, 0]).to_string();
+    assert!(text.contains("1 `VkSurfaceKHR`") && !text.contains("VkDevice"), "{text}");
+    f.call(destroy_surface, [instance, surface, 0, 0]).expect("destroy the surface");
+    f.call(destroy_instance, [instance, 0, 0, 0]).expect("destroy the instance");
+    assert_eq!(host.instances_live(), 0, "no live instance on the host");
+    assert_eq!(host.objects(), (0, 0, 0), "and no surface, device or queue");
+    assert!(f.vulkan().instance_handles().is_empty());
+    assert!(f.vulkan().physical_device_handles().is_empty(), "the GPU's handle went with it");
+    let text = f.refusal(destroy_instance, &[instance, 0]).to_string();
+    assert!(text.contains("`VkInstance`"), "the stale handle refuses by name: {text}");
+    let text = f.refusal(properties, &[physical, properties_at]).to_string();
+    assert!(text.contains("`VkPhysicalDevice`"), "{text}");
+    let stale = host.destroy_instance(token).expect_err("the host refuses the stale token too");
+    assert!(stale.to_string().contains("already destroyed"), "{stale}");
+    eprintln!("after the teardown the host holds {} live instance(s) of {} created: {host:?}",
+        host.instances_live(), host.instances_created());
+
+    // **The next window**: a new instance, token and all, carried through the same teardown.
+    let (instance, surface, physical, device) = bring_up("the next window");
+    let fresh = f.vulkan().instance_handles()[0].1;
+    assert_ne!(fresh, token, "a destroyed instance's token is never handed out again");
+    assert_eq!((host.instances_live(), host.instances_created()), (1, 2));
+    f.call(properties, [physical, properties_at, 0, 0]).expect("the new GPU handle answers");
+    let bytes = f.read_bytes(properties_at, PHYSICAL_DEVICE_PROPERTIES_BYTES);
+    assert_ne!(bytes[20], 0, "and it has a device name");
+    f.call(destroy_device, [device, 0, 0, 0]).expect("destroy the second device");
+    f.call(destroy_surface, [instance, surface, 0, 0]).expect("destroy the second surface");
+    f.call(destroy_instance, [instance, 0, 0, 0]).expect("destroy the second instance");
+    assert_eq!(host.instances_live(), 0);
+    assert_eq!(host.objects(), (0, 0, 0));
+    eprintln!("the next window's instance ({fresh:?}, the first {token:?}) went the same way");
 }
 
 /// **The real driver's device is destroyed through the guest path only once nothing made from it
