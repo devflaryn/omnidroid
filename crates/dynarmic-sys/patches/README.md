@@ -165,6 +165,74 @@ both forms with operands a signed compare would order the other way.
 (`simd_three_same.cpp:174`), and the signed compares are built from
 `VectorGreaterSigned`, not from max/min.
 
+### 0007 — arm64: `fastmem_exclusive_access` is honoured (inline `LDXR`/`STXR`)
+
+`0007-arm64-inline-exclusives.patch`. **arm64 only.** Root cause of
+`a64_exec::atomic_load_exclusive_store_exclusive` failing on the arm64 host:
+the backend accepted `fastmem_exclusive_access` and ignored it —
+`EmitExclusiveReadMemory`/`EmitExclusiveWriteMemory` called the callback-only
+versions unconditionally, and `EmitConfig` never carried the flag. Every
+exclusive pair therefore cost a slow-path read plus an exclusive-write callback
+(MEASURED: `slow_path_total == 2` where x64 gives 0), which is also exactly
+what `omni-cpu`'s per-slice invariant refuses as `DegradedMemoryPath` — so on
+arm64 the first `LDXR`/`STXR` in a slice would have stopped the guest.
+
+The patch is the x64 backend's inline protocol (`EmitExclusiveReadMemoryInline`,
+`EmitExclusiveWriteMemoryInline`) on arm64, against the **same** monitor
+fields and the same `SpinLock` word, so inline and callback threads of one
+monitor interoperate:
+
+* read: lock; `exclusive_state = 1`; `address[pid] = vaddr`; load-acquire
+  through fastmem; `value[pid] = value`; unlock.
+* write: lock; `status = 1`; if the state is set and `address[pid] == vaddr`,
+  compare-and-swap `value[pid] -> value` at the host address with an
+  `LDAXR`/`STLXR` loop (`LDAXP`/`STLXP` for 128 bits; ARMv8.0, no LSE assumed),
+  then clear every processor's reservation of the address (the monitor's
+  `CheckAndClear`, this one's included); `exclusive_state = 0` either way (a
+  store-exclusive always leaves the local monitor open); unlock.
+* a fastmem miss — out of the fastmem range, or a host fault at the patched
+  load — goes to a fallback that **releases the lock first** and then does the
+  whole access through new `Wrapped*` trampolines that call the monitor exactly
+  as the callback-only path does; `recompile_on_fastmem_failure` rebuilds the
+  block without the inline path.
+
+`EmitConfig` gains `fastmem_exclusive_access`, `global_monitor`, `processor_id`.
+128-bit stores borrow four general-purpose registers on the stack for the length
+of the sequence (the arm64 register allocator has no scratch-register request);
+the host-fault entry gives them back before falling into the fallback.
+The monitor accessors come from `backend/x64/exclusive_monitor_friend.h`, which
+is backend-neutral. **dynarmic's exception handler is untouched.**
+
+`tests/exclusive.rs`: every width and the pair form, inline, with
+`slow_path_total == 0`; the failure cases (no reservation, `CLREX`, a spent
+reservation, another address) on both paths; the fallback through a
+fastmem-range miss, served by the callbacks with the same answers; and four
+threads on one monitor and one arena doing 50,000 `LDAXR`/`STLXR` increments
+each, all inline and inline mixed with callback threads — no lost update.
+
+### 0008 — arm64: the memory-abort check reads the halt word as the 32 bits it is
+
+`0008-arm64-halt-word-is-32-bit.patch`. **arm64 only.**
+`EmitA64CheckMemoryAbort` — emitted on the fallback of every fastmem access
+when `check_halt_on_memory_access` is set, which `omni-cpu` sets — loaded the
+halt word with `LDAR Xscratch0, [Xhalt]`, a **64-bit** load-acquire, from
+`A64::Jit::Impl::halt_reason`, a `u32` at a 4-byte-aligned address. A
+load-acquire must be naturally aligned, so the check itself took an alignment
+fault inside translated code; dynarmic's handler found no fastmem patch at that
+PC and terminated the process (`Segfault wasn't at a fastmem patch location!`).
+So on arm64 **every guest access to unmapped memory killed the process instead
+of becoming a typed fault** — the first fastmem miss faulted correctly, was
+redirected to the fallback, served, and then the abort check faulted.
+
+MEASURED before the patch, with dynarmic's handler alone (no Omnidroid fault
+handler installed): fault 1 at the patched `LDR`, redirected; fault 2 at
+`c8dfff70` (`LDAR X16, [X27]`) with `X27 = 0x…1ac`. `tests/host_fault.rs`
+(identity fastmem, `check_halt_on_memory_access`, guest address `0x2000` in
+`__PAGEZERO`) aborted before the patch and passes after, for a load, a store,
+and the inline exclusive pair and doubleword pair of 0007. The A32 twin in
+`emit_arm64_a32.cpp` has the same instruction; A32 is not built here, so it is
+left alone.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

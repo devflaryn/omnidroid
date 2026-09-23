@@ -135,6 +135,18 @@ protected:
 
         // Omnidroid patch 0002.
         void* interpreter_fallback;
+
+        // Omnidroid patch 0007.
+        void* wrapped_exclusive_read_memory_8;
+        void* wrapped_exclusive_read_memory_16;
+        void* wrapped_exclusive_read_memory_32;
+        void* wrapped_exclusive_read_memory_64;
+        void* wrapped_exclusive_read_memory_128;
+        void* wrapped_exclusive_write_memory_8;
+        void* wrapped_exclusive_write_memory_16;
+        void* wrapped_exclusive_write_memory_32;
+        void* wrapped_exclusive_write_memory_64;
+        void* wrapped_exclusive_write_memory_128;
     } prelude_info;
 };
 

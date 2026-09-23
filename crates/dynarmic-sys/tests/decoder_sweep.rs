@@ -114,6 +114,8 @@ fn run_from(corpus: &[(String, Vec<u32>)], start: usize, fastmem: bool) {
         vec![a64::svc(0)],
         VmOptions {
             fastmem,
+            // The configuration omni-cpu runs: exclusives inline whenever fastmem is on.
+            fastmem_exclusive: fastmem,
             cycle_counting: true,
             optimizations: optimization::INTERRUPTIBLE,
             ..VmOptions::default()

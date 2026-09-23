@@ -180,8 +180,12 @@ void EmitA64CheckMemoryAbort(oaknut::CodeGenerator& code, EmitContext& ctx, IR::
 
     const A64::LocationDescriptor current_location{IR::LocationDescriptor{inst->GetArg(0).GetU64()}};
 
-    code.LDAR(Xscratch0, Xhalt);
-    code.TST(Xscratch0, static_cast<u32>(HaltReason::MemoryAbort));
+    // Omnidroid patch 0008: the halt word is a u32 (`A64::Jit::Impl::halt_reason`). The pin loaded
+    // it with a 64-bit LDAR, which needs 8-byte alignment the 4-byte word does not have: an alignment
+    // fault inside translated code, on the fallback of every fastmem miss, whenever
+    // check_halt_on_memory_access is set -- and dynarmic's handler, finding no patch there, terminated.
+    code.LDAR(Wscratch0, Xhalt);
+    code.TST(Wscratch0, static_cast<u32>(HaltReason::MemoryAbort));
     code.B(EQ, end);
     code.MOV(Xscratch0, current_location.PC());
     code.STR(Xscratch0, Xstate, offsetof(A64JitState, pc));
