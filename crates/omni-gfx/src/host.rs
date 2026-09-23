@@ -16,14 +16,20 @@
 //!
 //! # Nothing here destroys anything on the guest's behalf, and that is what keeps [`Drop`] right
 //!
-//! There is **no `vkDestroyInstance`, `vkDestroySurfaceKHR` or `vkDestroyDevice`** in the trait,
-//! because the guest has never called one: the decoded bootstrap at guest `0x02595160` resolves
-//! two names, and stage 3 implements the set a renderer needs in order to *reach* a device. A
-//! guest that calls a destructor gets a refusal naming the function from the thunk, which is the
-//! honest answer and is also what makes this file's tables exactly what this host made — nothing
-//! can have gone away behind their back.
+//! There is **no `vkDestroyInstance` or `vkDestroyDevice`** in the trait, because the guest has
+//! never called one: the decoded bootstrap at guest `0x02595160` resolves two names, and stage 3
+//! implements the set a renderer needs in order to *reach* a device. A guest that calls a
+//! destructor gets a refusal naming the function from the thunk, which is the honest answer and
+//! is also what makes this file's tables exactly what this host made — nothing can have gone
+//! away behind their back.
 //!
-//! So [`Drop`] is the only destructor, and it runs the whole tree in Vulkan's required order:
+//! `vkDestroySurfaceKHR` **is** in the trait, and for the same reason the other two are not: it
+//! was measured. The engine's render thread answers `APP_CMD_TERM_WINDOW` — the app closed the way
+//! a device closes it — by destroying its swapchain and then its surface, and the guest's own
+//! destroy goes through [`GfxVulkanHost::destroy_surface`], which removes the table entry it
+//! destroys.
+//!
+//! So [`Drop`] destroys whatever is left, and it runs the whole tree in Vulkan's required order:
 //! devices (each waited on first), then surfaces, then instances. Queues are not destroyed and
 //! never could be — a `VkQueue` is owned by its device and goes away with it.
 //!
@@ -145,8 +151,13 @@ pub struct GfxVulkanHost {
     /// asked once and the order is frozen here, which makes the promise this host's own rather
     /// than one borrowed from a driver that never made it.
     physical: Mutex<Vec<Vec<vk::PhysicalDevice>>>,
-    /// Every surface this host created, indexed by [`HostSurface`] token.
-    surfaces: Mutex<Vec<SurfaceEntry>>,
+    /// Every surface this host created and the guest has not destroyed.
+    ///
+    /// **A [`Slab`], unlike the other stage 3 tables**, because it is the one stage 3 family the
+    /// guest destroys: `vkDestroySurfaceKHR` removes the entry, and the generation tag is what
+    /// makes the destroyed surface's token a refusal rather than a name for the next surface the
+    /// Android lifecycle creates in that slot.
+    surfaces: Mutex<Slab<SurfaceEntry>>,
     /// Every logical device this host created, indexed by [`HostDevice`] token.
     devices: Mutex<Vec<DeviceEntry>>,
     /// Every queue this host has handed out, indexed by [`HostQueue`] token.
@@ -268,8 +279,10 @@ struct ObjectEntry<T> {
 /// One swapchain, everything needed to use it, and the window claim it holds.
 struct SwapchainEntry {
     device: usize,
-    /// Which [`SurfaceEntry`] this was created over. Checked against `oldSwapchain`'s.
-    surface: usize,
+    /// Which [`SurfaceEntry`] this was created over, as its [`HostSurface`] token. Checked against
+    /// `oldSwapchain`'s, and by `vkDestroySurfaceKHR`, which must not destroy a surface a
+    /// swapchain — retired or not — was created over.
+    surface: u64,
     handle: vk::SwapchainKHR,
     /// What the guest asked for, kept because the read-back path needs them and there is no
     /// `vkGetSwapchainCreateInfoKHR` to ask.
@@ -331,9 +344,10 @@ struct SurfaceEntry {
 /// # Why stage 4 needed this and stage 3 did not
 ///
 /// Stage 3's tables are plain `Vec`s that are never removed from, because nothing it implemented
-/// destroys anything — there is no `vkDestroyInstance`, `vkDestroySurfaceKHR` or
-/// `vkDestroyDevice` in [`VulkanHost`]. A token was an index, and an index into a vector that only
-/// grows is stable forever.
+/// destroys anything — there is no `vkDestroyInstance` or `vkDestroyDevice` in [`VulkanHost`]. A
+/// token was an index, and an index into a vector that only grows is stable forever. The
+/// exception is the surface table, which became one of these when `vkDestroySurfaceKHR` was
+/// measured.
 ///
 /// Stage 4 is the first stage whose objects the guest genuinely destroys, once per frame in the
 /// case of a swapchain that follows a resize. Two ways of handling that are wrong and the
@@ -495,7 +509,7 @@ impl GfxVulkanHost {
             entry,
             instances: Mutex::new(Vec::new()),
             physical: Mutex::new(Vec::new()),
-            surfaces: Mutex::new(Vec::new()),
+            surfaces: Mutex::new(Slab::new()),
             devices: Mutex::new(Vec::new()),
             queues: Mutex::new(Vec::new()),
             swapchains: Mutex::new(Slab::new()),
@@ -678,7 +692,7 @@ impl GfxVulkanHost {
         self.physical.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn locked_surfaces(&self) -> std::sync::MutexGuard<'_, Vec<SurfaceEntry>> {
+    fn locked_surfaces(&self) -> std::sync::MutexGuard<'_, Slab<SurfaceEntry>> {
         self.surfaces.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -748,18 +762,16 @@ impl GfxVulkanHost {
         let (instance_index, _) = Self::split(token);
         self.with_physical(token, |instance, device| {
             let surfaces = self.locked_surfaces();
-            let entry = surfaces
-                .get(usize::try_from(surface_token.token()).unwrap_or(usize::MAX))
-                .ok_or_else(|| {
-                    refused(
-                        "VulkanHost::with_surface",
-                        &format!(
-                            "{surface_token:?} is not a surface this host created -- it has \
-                             created {}",
-                            surfaces.len()
-                        ),
-                    )
-                })?;
+            let entry = surfaces.get(surface_token.token()).ok_or_else(|| {
+                refused(
+                    "VulkanHost::with_surface",
+                    &format!(
+                        "{surface_token:?} is not a surface this host holds -- it holds {}, and \
+                         a surface the guest has destroyed lands here too",
+                        surfaces.len()
+                    ),
+                )
+            })?;
             if entry.instance != instance_index {
                 return Err(refused(
                     "VulkanHost::with_surface",
@@ -815,8 +827,9 @@ impl GfxVulkanHost {
     /// reason to hold two at once — and a driver call made while a table is locked would block
     /// every other guest thread's Vulkan for as long as the driver took.
     ///
-    /// The exceptions are named where they occur, and each holds two adjacent tables in the order
-    /// above for the length of a `Vec` lookup and nothing else.
+    /// The exceptions are named where they occur, and each holds two tables in the order above
+    /// for the length of a lookup and nothing else. The one that skips tables in between is
+    /// `vkDestroySurfaceKHR`'s, `surfaces` across `swapchains`, still downward.
     fn locked_swapchains(&self) -> std::sync::MutexGuard<'_, Slab<SwapchainEntry>> {
         self.swapchains.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1542,9 +1555,11 @@ impl VulkanHost for GfxVulkanHost {
                 // refused by name one layer up.
                 match unsafe { win32.create_win32_surface(&info, None) } {
                     Ok(surface) => {
-                        let mut surfaces = self.locked_surfaces();
-                        let token = surfaces.len() as u64;
-                        surfaces.push(SurfaceEntry { instance: index, surface, window: key });
+                        let token = self.locked_surfaces().insert(SurfaceEntry {
+                            instance: index,
+                            surface,
+                            window: key,
+                        });
                         Ok(DriverAnswer::Ok(SurfaceCreated {
                             surface: HostSurface::from_token(token),
                             // **The name the rewrite log records**, taken from the pairing table
@@ -1572,6 +1587,101 @@ impl VulkanHost for GfxVulkanHost {
                 ),
             )),
         }
+    }
+
+    /// `vkDestroySurfaceKHR`: the end of a surface [`GfxVulkanHost::create_platform_surface`]
+    /// made, after the two checks the specification requires and nothing on this machine would
+    /// otherwise make.
+    ///
+    /// # Why this host checks rather than trusting the driver to
+    ///
+    /// Destroying a surface a swapchain was created over is undefined behaviour, and so is
+    /// destroying it through an instance it did not come from. There are no validation layers here
+    /// (`docs/research/graphics-spike.md` §6), and the spike measured what the NVIDIA driver does
+    /// with swapchain misuse it is not required to notice: it crashed, with no diagnostic anywhere.
+    /// So both are refused **naming both objects**, before the driver is asked.
+    ///
+    /// **A retired swapchain counts.** `oldSwapchain` retires the outgoing swapchain without
+    /// destroying it; it no longer owns the window, but it was created over this surface and the
+    /// guest still owes its `vkDestroySwapchainKHR`.
+    ///
+    /// # Lock order
+    ///
+    /// The instance is cloned out first and released, because `instances` precedes `surfaces`.
+    /// `surfaces` is then held across `swapchains` — downward in the order
+    /// [`GfxVulkanHost::locked_swapchains`] states, and one of its named exceptions to "copy out
+    /// and release" — so that the check and the removal are one step: no swapchain can be recorded
+    /// over this surface between them. The driver is called with neither held.
+    fn destroy_surface(&self, instance: HostInstance, surface: HostSurface) -> AbiResult<()> {
+        const CALL: &str = "vkDestroySurfaceKHR";
+        let handle = {
+            let instances = self.locked();
+            Self::lookup(&instances, instance)?.clone()
+        };
+        let doomed = {
+            let mut surfaces = self.locked_surfaces();
+            let Some(entry) = surfaces.get(surface.token()) else {
+                return Err(refused(
+                    CALL,
+                    &format!(
+                        "{surface:?} is not a surface this host holds -- it holds {}. A surface \
+                         the guest has already destroyed lands here too, and a second \
+                         `vkDestroySurfaceKHR` of one surface is a double free the driver is not \
+                         required to notice",
+                        surfaces.len()
+                    ),
+                ));
+            };
+            let created = HostInstance::from_token(entry.instance as u64);
+            let doomed = entry.surface;
+            if created != instance {
+                return Err(refused(
+                    CALL,
+                    &format!(
+                        "{surface:?} was created from {created:?}, and the guest destroyed it \
+                         through {instance:?}. The specification requires a surface to be \
+                         destroyed through the instance it was created from -- the call is \
+                         dispatched through that instance's `VK_KHR_surface` table -- and a driver \
+                         is not required to notice that it was not; on this machine nothing \
+                         would, because there are no validation layers installed. Both handles \
+                         are real; the pairing is what is wrong"
+                    ),
+                ));
+            }
+            let swapchains = self.locked_swapchains();
+            let over: Vec<HostSwapchain> = swapchains
+                .iter()
+                .filter(|(_, entry)| entry.surface == surface.token())
+                .map(|(token, _)| HostSwapchain::from_token(token))
+                .collect();
+            if !over.is_empty() {
+                return Err(refused(
+                    CALL,
+                    &format!(
+                        "{surface:?} still has {count} swapchain(s) created over it: {over:?}. \
+                         The specification requires every `VkSwapchainKHR` created for a surface \
+                         to be destroyed before the surface is -- a retired one included, because \
+                         `oldSwapchain` retires a swapchain without destroying it and the guest \
+                         still owes `vkDestroySwapchainKHR` on it. Destroying the surface anyway \
+                         is undefined behaviour with no validation layer on this machine to \
+                         report it, so the surface is left exactly as it was",
+                        count = over.len()
+                    ),
+                ));
+            }
+            drop(swapchains);
+            // The entry goes while the lock that checked it is still held, and its slot's
+            // generation moves on: the guest's stale token is a refusal from here, not a name for
+            // whichever surface is created in this slot next.
+            surfaces.remove(surface.token());
+            doomed
+        };
+        let surface_fn = khr::surface::Instance::new(&self.entry, &handle);
+        // SAFETY: `doomed` is a live surface created from `handle` -- both checked above, under
+        // the lock that then removed its entry, so nothing else can reach it through this host --
+        // no swapchain created over it survives, and `pAllocator` was `None` at creation.
+        unsafe { surface_fn.destroy_surface(doomed, None) };
+        Ok(())
     }
 
     fn physical_devices(
@@ -2114,19 +2224,19 @@ impl VulkanHost for GfxVulkanHost {
             )
         })?;
 
-        let (surface_index, surface, window) = {
+        let (surface, window) = {
             let surfaces = self.locked_surfaces();
-            let index = usize::try_from(surface_token.token()).unwrap_or(usize::MAX);
-            let entry = surfaces.get(index).ok_or_else(|| {
+            let entry = surfaces.get(surface_token.token()).ok_or_else(|| {
                 refused(
                     "vkCreateSwapchainKHR",
                     &format!(
-                        "{surface_token:?} is not a surface this host created -- it has created {}",
+                        "{surface_token:?} is not a surface this host holds -- it holds {}, and a \
+                         surface the guest has destroyed lands here too",
                         surfaces.len()
                     ),
                 )
             })?;
-            (index, entry.surface, entry.window)
+            (entry.surface, entry.window)
         };
 
         // **The claim.** With an `oldSwapchain` it is transferred from the outgoing swapchain,
@@ -2171,17 +2281,17 @@ impl VulkanHost for GfxVulkanHost {
                         ),
                     )
                 })?;
-                if entry.surface != surface_index {
+                if entry.surface != surface_token.token() {
                     return Err(refused(
                         "vkCreateSwapchainKHR",
                         &format!(
-                            "{old:?} was passed as `oldSwapchain` and belongs to surface \
-                             #{had}, while the swapchain being created is over surface \
-                             #{surface_index}. The specification requires them to be the same \
-                             surface -- retiring a swapchain on one window in order to create one \
-                             on another would release the first window's claim and take the \
-                             second's, and neither is what the caller asked for",
-                            had = entry.surface
+                            "{old:?} was passed as `oldSwapchain` and belongs to {had:?}, while \
+                             the swapchain being created is over {surface_token:?}. The \
+                             specification requires them to be the same surface -- retiring a \
+                             swapchain on one window in order to create one on another would \
+                             release the first window's claim and take the second's, and neither \
+                             is what the caller asked for",
+                            had = HostSurface::from_token(entry.surface)
                         ),
                     ));
                 }
@@ -2254,7 +2364,7 @@ impl VulkanHost for GfxVulkanHost {
         let mut swapchains = self.locked_swapchains();
         let token = swapchains.insert(SwapchainEntry {
             device: parts.index,
-            surface: surface_index,
+            surface: surface_token.token(),
             handle,
             format,
             extent,
@@ -5983,12 +6093,14 @@ impl Drop for GfxVulkanHost {
         }
 
         let instances = std::mem::take(&mut *self.locked());
-        let surfaces = std::mem::take(&mut *self.locked_surfaces());
+        // Only the surfaces the guest did not destroy itself: `vkDestroySurfaceKHR` removes the
+        // entry it destroys, so nothing here is destroyed twice.
+        let surfaces = self.locked_surfaces().drain();
         for surface in surfaces {
             let Some(instance) = instances.get(surface.instance) else { continue };
             let surface_fn = khr::surface::Instance::new(&self.entry, instance);
             // SAFETY: the surface is live, it was created from this instance, every swapchain
-            // made from it is gone (this file creates none), and `pAllocator` was `None`.
+            // made from it was destroyed above, and `pAllocator` was `None`.
             unsafe { surface_fn.destroy_surface(surface.surface, None) };
         }
 

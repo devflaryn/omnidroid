@@ -339,6 +339,9 @@ struct HostLog {
     waits: Vec<(Vec<HostFence>, bool, u64)>,
     /// Destroy calls, by name, so a test can say what was and was not torn down.
     destroyed: Vec<String>,
+    /// Every `vkDestroySurfaceKHR` that reached the host: the instance it was destroyed through
+    /// and the surface, as the tokens the shim resolved them to.
+    surfaces_destroyed: Vec<(HostInstance, HostSurface)>,
 
     // ---------------------------------------------------------------------------- stage 5
     /// Every `vkAllocateMemory`, as the shim decoded it, with the token it was answered with —
@@ -476,6 +479,7 @@ impl VulkanHost for StageFourHost {
         Ok(name.starts_with("vkGet")
             || name.starts_with("vkEnumerate")
             || name == "vkCreateWin32SurfaceKHR"
+            || name == "vkDestroySurfaceKHR"
             || name == "vkCreateDevice")
     }
 
@@ -488,6 +492,16 @@ impl VulkanHost for StageFourHost {
             surface: HostSurface::from_token(self.token()),
             host_call: "vkCreateWin32SurfaceKHR".to_string(),
         }))
+    }
+
+    /// **Records and nothing else.** The two rules only a host can see -- the instance pairing
+    /// and a live swapchain over the surface -- are the real host's to check, and the live test
+    /// checks them against it; what this double lets a test count is how many destroys reached a
+    /// host at all, which is the guest-side registry's property.
+    fn destroy_surface(&self, instance: HostInstance, surface: HostSurface) -> AbiResult<()> {
+        self.log().surfaces_destroyed.push((instance, surface));
+        self.note("vkDestroySurfaceKHR");
+        Ok(())
     }
 
     fn physical_devices(
@@ -1769,6 +1783,9 @@ fn a_source_with_a_handle() -> Arc<HostWindowSource> {
 struct UpToADevice {
     f: Fixture,
     host: Arc<StageFourHost>,
+    /// `vkGetInstanceProcAddr`, for the instance-level names -- `vkDestroySurfaceKHR` among them.
+    entry_point: u64,
+    instance: u64,
     surface: u64,
     device: u64,
     get_proc: u64,
@@ -1802,8 +1819,7 @@ fn up_to_a_device(tag: &str) -> UpToADevice {
     let queue = f.guest.read_u64(queue_at as GuestAddr);
     assert_ne!(queue, 0);
 
-    let _ = entry_point;
-    UpToADevice { f, host, surface, device, get_proc, queue }
+    UpToADevice { f, host, entry_point, instance, surface, device, get_proc, queue }
 }
 
 // ========================================================================= vkCreateSwapchainKHR
@@ -2341,6 +2357,80 @@ fn swapchain_images_are_stable_across_calls_and_die_with_their_swapchain() {
 
     // `VK_NULL_HANDLE` is the specified no-op and must not refuse.
     up.f.call(destroy, [up.device, 0, 0, 0]).expect("a null destroy is a no-op");
+}
+
+// ========================================================================= vkDestroySurfaceKHR
+
+/// **A surface is destroyed once: the host is asked exactly once, and afterwards the guest's
+/// handle names nothing.**
+///
+/// The call the engine was measured making on its way out of `APP_CMD_TERM_WINDOW`, right after
+/// `vkDestroySwapchainKHR`, reached through `vkGetInstanceProcAddr`. This test owns the guest-side
+/// half: the handle is looked up rather than forwarded, the slot is freed after the host destroyed
+/// the surface, and a second destroy of the same handle is a refusal naming it rather than a
+/// second host destroy -- a double free no driver is required to notice. `VK_NULL_HANDLE` is the
+/// specified no-op; a wild handle, a wild `VkInstance` and a guest allocator refuse and reach no
+/// host. The two rules only a host can see -- the instance pairing and a swapchain still live over
+/// the surface -- are the live test's, against the real one.
+#[test]
+fn a_surface_is_destroyed_once_and_its_handle_names_nothing_afterwards() {
+    let _serial = serialized();
+    let up = up_to_a_device("destroy-surface");
+    let destroy = up.f.resolve(up.entry_point, up.instance, "vkDestroySurfaceKHR");
+    let issued = up.f.vulkan().surface_handles();
+    assert_eq!(issued.len(), 1);
+    let (handle, token) = issued[0];
+    assert_eq!(handle as u64, up.surface);
+
+    // `VK_NULL_HANDLE`: the specified no-op. Nothing reaches the host and nothing is freed.
+    up.f.call(destroy, [up.instance, 0, 0, 0]).expect("a null destroy is a no-op");
+    assert!(up.host.log().surfaces_destroyed.is_empty(), "a null destroy reached the host");
+    assert_eq!(up.f.vulkan().surface_handles().len(), 1);
+
+    // A handle this layer did not issue -- the next slot of the surface registry, in range and on
+    // a slot boundary, and empty -- refuses naming the family and the value.
+    let wild = up.surface + HANDLE_SLOT_BYTES as u64;
+    let text = up.f.refusal(destroy, &[up.instance, wild, 0, 0]).to_string();
+    assert!(text.contains("`VkSurfaceKHR`"), "it names the family: {text}");
+    assert!(text.contains(&format!("{wild:#x}")), "it names the handle: {text}");
+    // A `VkInstance` that is not one, even beside a real surface.
+    let text = up.f.refusal(destroy, &[up.instance + 8, up.surface, 0, 0]).to_string();
+    assert!(text.contains("`VkInstance`"), "{text}");
+    // A guest allocator is refused and counted, as on every other destroy.
+    let before = up.f.vulkan().allocator_non_null();
+    let text = up.f.refusal(destroy, &[up.instance, up.surface, 0x1000, 0]).to_string();
+    assert!(text.contains("pAllocator"), "{text}");
+    assert_eq!(up.f.vulkan().allocator_non_null(), before + 1);
+    assert!(up.host.log().surfaces_destroyed.is_empty(), "none of the three reached the host");
+    assert_eq!(up.f.vulkan().surface_handles().len(), 1, "and the surface is still live");
+
+    // **The destroy**: once, with the instance and the surface as the tokens the shim resolved.
+    up.f.call(destroy, [up.instance, up.surface, 0, 0]).expect("destroy the surface");
+    assert_eq!(
+        up.host.log().surfaces_destroyed,
+        vec![(HostInstance::from_token(0), token)],
+        "the host was asked once, about this surface, through this instance"
+    );
+    assert!(up.f.vulkan().surface_handles().is_empty(), "the slot is freed");
+
+    // **The second destroy refuses naming the handle, and reaches no host.**
+    let text = up.f.refusal(destroy, &[up.instance, up.surface, 0, 0]).to_string();
+    assert!(text.contains("`VkSurfaceKHR`"), "{text}");
+    assert!(text.contains(&format!("{:#x}", up.surface)), "it names the handle: {text}");
+    assert!(text.contains("0 live one(s)"), "and says none is live: {text}");
+    assert_eq!(up.host.log().surfaces_destroyed.len(), 1, "the host was asked once, not twice");
+
+    // Nor does anything else that takes a surface accept the stale handle.
+    let support = up.f.resolve(up.entry_point, up.instance, "vkGetPhysicalDeviceSurfaceSupportKHR");
+    let physical = up.f.vulkan().physical_device_handles()[0].0 as u64;
+    let supported_at = up.f.alloc(8);
+    let text = up.f.refusal(support, &[physical, 0, up.surface, supported_at]).to_string();
+    assert!(text.contains("`VkSurfaceKHR`"), "{text}");
+
+    // The freed slot is reused rather than leaked: the next `onSurfaceCreated` gets a surface.
+    let again = up.f.a_surface(up.entry_point, up.instance);
+    assert_eq!(again, up.surface, "the lowest free slot, which is the one just freed");
+    assert_eq!(up.f.vulkan().surface_handles().len(), 1);
 }
 
 // ======================================================================= vkAcquireNextImageKHR
@@ -3955,6 +4045,132 @@ fn the_guest_cannot_take_a_window_omni_gfxs_renderer_already_owns() {
     f.call(destroy, [logical, swapchain, 0, 0]).expect("destroy the retired one");
     assert!(f.vulkan().swapchain_handles().is_empty());
     assert_eq!(host.stage_four_objects().swapchains, 0, "and the window is free again");
+}
+
+/// **The engine's measured teardown against the real driver: `vkDestroySurfaceKHR` refuses by
+/// name while any swapchain over the surface lives -- a retired one included -- and through
+/// another instance, and then the driver's surface is gone from the host.**
+///
+/// A gate run measured the engine's render thread answering `APP_CMD_TERM_WINDOW` with
+/// `vkDestroySwapchainKHR` and then `vkDestroySurfaceKHR(instance, surface, NULL)`. This test
+/// makes that call through the guest path. It is live because both ordering rules are the
+/// **host's** to check -- the guest-side registries record neither which instance a surface came
+/// from nor which surface a swapchain was made over -- and because "the surface is gone" is a
+/// statement about `GfxVulkanHost`'s own table, which a double does not have.
+#[test]
+#[ignore = "opens a window and the host Vulkan driver; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn a_surface_is_destroyed_through_the_guest_only_after_its_swapchains_and_leaves_the_host() {
+    require_gate();
+    let _serial = serialized();
+
+    let mut window = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
+        "Omnidroid — Vulkan: the guest destroys its surface",
+        800,
+        450,
+    ))
+    .unwrap_or_else(|err| panic!("could not create the window: {err}"));
+    window.show();
+    let _ = window.poll_events().count();
+    let source = HostWindowSource::watching(&window).expect("a source watching the window");
+    let size = window.client_size().expect("the window has a client area");
+
+    let host = omni_gfx::GfxVulkanHost::load().expect("this machine must have a Vulkan loader");
+    let f = fixture("live-destroy-surface", Some(host.clone()));
+    f.ndk.set_window_source(Arc::clone(&source) as Arc<dyn WindowSource>);
+
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let surface = f.a_surface(entry_point, instance);
+    let token = f.vulkan().surface_handles()[0].1;
+    assert_eq!(host.objects().0, 1, "the driver made one surface");
+    // Through `vkGetInstanceProcAddr`, as the engine was measured reaching it: the real driver
+    // has the command, so this is a guest thunk and not the driver's NULL.
+    let destroy_surface = f.resolve(entry_point, instance, "vkDestroySurfaceKHR");
+
+    let enumerate = f.resolve(entry_point, instance, "vkEnumeratePhysicalDevices");
+    let count_at = f.alloc(8);
+    f.call(enumerate, [instance, count_at, 0, 0]).expect("count");
+    let devices_at = f.alloc(8);
+    f.call(enumerate, [instance, count_at, devices_at, 0]).expect("array");
+    let physical = f.guest.read_u64(devices_at as GuestAddr);
+    let logical = f.a_device(entry_point, instance, physical, 0);
+    let get_proc = f.resolve(entry_point, instance, "vkGetDeviceProcAddr");
+    let create_swapchain = f.resolve_device(get_proc, logical, "vkCreateSwapchainKHR");
+    let destroy_swapchain = f.resolve_device(get_proc, logical, "vkDestroySwapchainKHR");
+
+    // A swapchain over the surface, then its replacement: the first is **retired**, not destroyed.
+    let info = f.swapchain_info(surface, 2, FORMAT_B8G8R8A8_UNORM, size.0, size.1, 0x10, 1, 0);
+    let out = f.alloc(8);
+    let result = f.call(create_swapchain, [logical, info, 0, out]).expect("the call completes");
+    assert_eq!(result as i32, VK_SUCCESS, "the driver answered VkResult {}", result as i32);
+    let retired = f.guest.read_u64(out as GuestAddr);
+    let replacing =
+        f.swapchain_info(surface, 2, FORMAT_B8G8R8A8_UNORM, size.0, size.1, 0x10, 1, retired);
+    let out = f.alloc(8);
+    let result =
+        f.call(create_swapchain, [logical, replacing, 0, out]).expect("the call completes");
+    assert_eq!(result as i32, VK_SUCCESS, "the driver answered VkResult {}", result as i32);
+    let replacement = f.guest.read_u64(out as GuestAddr);
+
+    // **Refused while both live**, naming the surface and the swapchains over it.
+    let text = f.refusal(destroy_surface, &[instance, surface, 0, 0]).to_string();
+    assert!(text.contains(&format!("{token:?}")), "it names the surface: {text}");
+    assert!(text.contains("2 swapchain(s)"), "{text}");
+    assert!(text.contains("HostSwapchain(#"), "it names the swapchains: {text}");
+    assert_eq!(host.objects().0, 1, "the surface is untouched");
+    assert_eq!(f.vulkan().surface_handles().len(), 1, "and the guest's handle still names it");
+    eprintln!("\n=== vkDestroySurfaceKHR evidence ===");
+    eprintln!("with two swapchains over the surface, refused by name:\n  {text}");
+
+    // **The retired one still counts**: it no longer owns the window, but it was created over this
+    // surface and the guest still owes its destroy.
+    f.call(destroy_swapchain, [logical, replacement, 0, 0]).expect("destroy the replacement");
+    let text = f.refusal(destroy_surface, &[instance, surface, 0, 0]).to_string();
+    assert!(text.contains("1 swapchain(s)"), "{text}");
+    assert!(text.contains("retired one included"), "{text}");
+    assert_eq!(host.objects().0, 1);
+    f.call(destroy_swapchain, [logical, retired, 0, 0]).expect("destroy the retired one");
+    assert_eq!(host.stage_four_objects().swapchains, 0);
+
+    // **Through another instance: refused naming both.** Both handles are real; the pairing is
+    // not, and there is no validation layer on this machine to say so.
+    let other = f.an_instance(entry_point);
+    let text = f.refusal(destroy_surface, &[other, surface, 0, 0]).to_string();
+    assert!(text.contains("created from HostInstance(#0)"), "{text}");
+    assert!(text.contains("through HostInstance(#1)"), "{text}");
+    assert_eq!(host.objects().0, 1);
+    eprintln!("through another instance, refused by name:\n  {text}");
+
+    // `VK_NULL_HANDLE` is the specified no-op against a real host too.
+    f.call(destroy_surface, [instance, 0, 0, 0]).expect("a null destroy is a no-op");
+    assert_eq!(host.objects().0, 1);
+
+    // **The destroy, and the host's surface is gone.**
+    f.call(destroy_surface, [instance, surface, 0, 0]).expect("destroy the surface");
+    assert_eq!(host.objects().0, 0, "the driver's surface has left the host's table");
+    assert!(f.vulkan().surface_handles().is_empty(), "and the guest's slot is free");
+    eprintln!(
+        "vkDestroySurfaceKHR({surface:#x}) -> the host holds {} surface(s)",
+        host.objects().0
+    );
+
+    // A second destroy is refused by the guest registry, and the host would refuse the stale
+    // token itself -- its slot's generation moved on -- rather than destroy anything twice.
+    let text = f.refusal(destroy_surface, &[instance, surface, 0, 0]).to_string();
+    assert!(text.contains("`VkSurfaceKHR`"), "{text}");
+    let stale = host.destroy_surface(HostInstance::from_token(0), token).expect_err("stale");
+    assert!(stale.to_string().contains("already destroyed"), "{stale}");
+
+    // The next `onSurfaceCreated`: a new surface, in the same host slot under a new token, so the
+    // stale one still names nothing.
+    let again = f.a_surface(entry_point, instance);
+    let fresh = f.vulkan().surface_handles()[0].1;
+    assert_ne!(fresh, token, "a reused slot answers to a new token");
+    assert!(host.destroy_surface(HostInstance::from_token(0), token).is_err(), "still stale");
+    assert_eq!(host.objects().0, 1);
+    f.call(destroy_surface, [instance, again, 0, 0]).expect("destroy the second surface");
+    assert_eq!(host.objects().0, 0);
+    eprintln!("a second surface ({fresh:?}, was {token:?}) was created and destroyed the same way");
 }
 
 // ============================================== stage 5: the structures a textured draw needs

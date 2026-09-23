@@ -141,12 +141,15 @@ impl<T: Copy + PartialEq> Handles<T> {
     ///
     /// # Why stage 4 needs this and stage 3 did not, and what it costs
     ///
-    /// Stage 3 implemented no destructor at all — there is no `vkDestroyInstance`,
-    /// `vkDestroySurfaceKHR` or `vkDestroyDevice` in [`VulkanHost`](super::VulkanHost) — so every
-    /// handle it ever issued stayed live and a registry that only grew was the honest shape. Stage
-    /// 4 is the first one whose objects the guest genuinely destroys, once per frame in the case
-    /// of a swapchain that follows a resize, so a registry with no removal would run a renderer
-    /// out of [`MAX_SWAPCHAINS`](super::MAX_SWAPCHAINS) in a few seconds of dragging a window.
+    /// Stage 3 implemented no destructor at all — there is no `vkDestroyInstance` or
+    /// `vkDestroyDevice` in [`VulkanHost`](super::VulkanHost) — so every handle it issued stayed
+    /// live and a registry that only grew was the honest shape. Stage 4 is the first one whose
+    /// objects the guest genuinely destroys, once per frame in the case of a swapchain that
+    /// follows a resize, so a registry with no removal would run a renderer out of
+    /// [`MAX_SWAPCHAINS`](super::MAX_SWAPCHAINS) in a few seconds of dragging a window.
+    /// `vkDestroySurfaceKHR` joined later, when the engine was measured calling it on the way out
+    /// of `APP_CMD_TERM_WINDOW`; the surface family does not deduplicate, so it meets the
+    /// condition below.
     ///
     /// **Removal makes one thing unsound that was sound before, and it is named here rather than
     /// discovered later.** [`Handles::insert_or_get`] deduplicates on the token, and a freed slot
