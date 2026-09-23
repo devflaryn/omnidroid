@@ -55,6 +55,16 @@ pub(super) fn pwrite(_file: &File, _buf: &[u8], _offset: u64) -> FsResult<usize>
     unsupported("pwrite", "pwrite(2) via std::os::unix::fs::FileExt::write_at")
 }
 
+/// Intended: `fallocate(2)` mode 0, through `libc::posix_fallocate`.
+///
+/// The decision in it: **`File::set_len` is not enough here**, as it is on Windows. Extending a
+/// file with `ftruncate` on ext4, f2fs or APFS makes a sparse tail, so a later write into it can
+/// still fail with `ENOSPC` -- exactly what `posix_fallocate` promises will not happen. The unix
+/// half has to ask the kernel to allocate.
+pub(super) fn allocate(_file: &File, _end: u64) -> FsResult<()> {
+    unsupported("fallocate", "fallocate(2) mode 0 via libc::posix_fallocate")
+}
+
 /// Intended: `statvfs(3)` on both, through `libc::statvfs`.
 ///
 /// The decisions in it, and they differ between the two unix targets:

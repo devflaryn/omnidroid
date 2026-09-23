@@ -1702,6 +1702,54 @@ impl Filesystem {
         }
     }
 
+    /// A regular file's bytes from `offset`, for an `mmap` of it: `buf` filled as far as the file
+    /// goes, and how far that was.
+    ///
+    /// Linux's answers for what cannot be mapped (`do_mmap`): no such descriptor is `EBADF`, and a
+    /// file not open for reading is `EACCES` -- not `pread`'s `EBADF`, which is why this is its own
+    /// operation. A descriptor that is not a regular file is refused by name: Linux maps some
+    /// devices and answers `ENODEV` for the rest, and no run has asked for either.
+    ///
+    /// # Errors
+    ///
+    /// As above, and the host's own read failure as it reports it.
+    pub fn read_for_mapping(&self, fd: i32, buf: &mut [u8], offset: u64) -> FsResult<usize> {
+        const OP: &str = "mmap";
+        let table = self.table();
+        match table.open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::File { readable: false, guest, .. }) => Err(FsError::kinded(
+                OP,
+                guest.clone(),
+                FsErrorKind::PermissionDenied,
+                "a file mapping of a descriptor not open for reading (EACCES)",
+            )),
+            Some(Entry::File { file, guest, .. }) => {
+                let mut filled = 0usize;
+                while filled < buf.len() {
+                    let read = backend::pread(file, &mut buf[filled..], offset + filled as u64)
+                        .map_err(|error| match error {
+                            FsError::Io { kind, detail, .. } => {
+                                FsError::Io { operation: OP, path: guest.clone(), kind, detail }
+                            }
+                            other => other,
+                        })?;
+                    if read == 0 {
+                        break;
+                    }
+                    filled += read;
+                }
+                Ok(filled)
+            }
+            Some(_) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "a mapping of a descriptor that is not a regular file: Linux maps some devices \
+                 and answers ENODEV for everything else, and no run has asked for either",
+            )),
+        }
+    }
+
     /// `fsync(2)`: push a regular file's data and metadata to the device.
     ///
     /// `File::sync_all`, portable `std` -- `FlushFileBuffers` on Windows, `fsync` on unix -- so no
@@ -1767,6 +1815,56 @@ impl Filesystem {
                 format!("fd {fd}"),
                 FsErrorKind::InvalidInput,
                 "not a regular file open for writing (EINVAL)",
+            )),
+        }
+    }
+
+    /// `fallocate(2)` with mode 0, which is what `posix_fallocate` is on bionic: make sure the
+    /// bytes `offset..offset + len` of a regular file are allocated, extending it when the range
+    /// ends past it and never shortening it.
+    ///
+    /// Linux's order (`vfs_fallocate`), after the caller's `EINVAL` for a negative offset or a
+    /// length that is not positive: no such descriptor, or one not open for writing, is `EBADF`;
+    /// a pipe or socket is `ESPIPE`; a directory is `EISDIR`; anything else that is not a regular
+    /// file is `ENODEV` -- refused by name here, since this seam has no kind for it and no run
+    /// has asked; an end past `i64::MAX` is `EFBIG`. What "allocated" takes is the
+    /// backend's -- see each one's `allocate`.
+    ///
+    /// # Errors
+    ///
+    /// As above, and the host's own failure (`ENOSPC` for a full volume) as it reports it.
+    pub fn fallocate(&self, fd: i32, offset: u64, len: u64) -> FsResult<()> {
+        const OP: &str = "fallocate";
+        let table = self.table();
+        let refuse = |kind: FsErrorKind, why: &'static str| {
+            Err(FsError::kinded(OP, format!("fd {fd}"), kind, why))
+        };
+        match table.open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::File { writable: false, .. }) => {
+                refuse(FsErrorKind::BadDescriptor, "not open for writing (EBADF)")
+            }
+            Some(Entry::File { file, .. }) => {
+                let Some(end) = offset.checked_add(len).filter(|end| i64::try_from(*end).is_ok())
+                else {
+                    return refuse(FsErrorKind::FileTooLarge, "the range ends past i64::MAX (EFBIG)");
+                };
+                backend::allocate(file, end)
+            }
+            Some(Entry::Pipe(_) | Entry::Socket(_)) => {
+                refuse(FsErrorKind::NotSeekable, "a pipe or socket (ESPIPE)")
+            }
+            Some(Entry::Directory { .. }) => refuse(FsErrorKind::IsADirectory, "a directory (EISDIR)"),
+            Some(
+                Entry::Standard(_)
+                | Entry::Device(_)
+                | Entry::EventFd(_)
+                | Entry::Epoll(_)
+                | Entry::TimerFd(_),
+            ) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "fallocate on a descriptor that is neither a regular file, a pipe, a socket nor a                  directory: Linux answers ENODEV, which this seam has no kind for, and no run has                  reached it -- so it is refused by name rather than answered",
             )),
         }
     }

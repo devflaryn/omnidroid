@@ -293,6 +293,19 @@ fn a_datagram_arrives_at_a_bound_socket_with_the_senders_address() {
     assert_eq!(&back[..read], b"pong");
 }
 
+/// **A datagram too large to send is `MessageSize`, as `Socket::send_to` promises** -- not an
+/// unclassified host error. 65,508 bytes is one more than an IPv4 UDP payload can be, so every host
+/// refuses it; MEASURED first on the engine's path-MTU probe, which Windows refused with
+/// `WSAEMSGSIZE` and `std` left uncategorised.
+#[test]
+fn an_oversized_datagram_is_message_size() {
+    let sender = socket(SocketKind::Datagram, IpFamily::V4);
+    let receiver = HostDatagram::bind("127.0.0.1:0").expect("a host datagram socket");
+    let to = SocketAddress::from_std(receiver.local_addr().expect("its address"));
+    let error = sender.send_to(&vec![0u8; 65_508], &to).expect_err("too large to send");
+    assert_eq!(error.kind(), Some(NetErrorKind::MessageSize), "{error}");
+}
+
 /// An IPv6 loopback stream carries bytes, so the v6 marshalling is exercised and not only unit
 /// tested.
 ///

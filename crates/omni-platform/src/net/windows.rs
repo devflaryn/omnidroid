@@ -163,6 +163,14 @@ fn kind_from_wsa(code: i32) -> NetErrorKind {
     }
 }
 
+/// A host error's raw code as this seam's kind, for an error `std` has no `ErrorKind` for.
+///
+/// The same table [`wsa_error`] uses for the raw calls, so one Winsock code means one kind
+/// whichever path produced it. `std`'s own Windows table leaves `WSAEMSGSIZE` uncategorised.
+pub(super) fn kind_from_raw(code: i32) -> NetErrorKind {
+    kind_from_wsa(code)
+}
+
 /// Build a [`NetError::Io`] from the thread's last Winsock error.
 fn wsa_error(operation: &'static str, endpoint: impl Into<String>, api: &str) -> NetError {
     let code = last_error();

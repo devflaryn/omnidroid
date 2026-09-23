@@ -19,4 +19,4 @@
 //!   the host's and is worth knowing about before a guest is trusted to tell two such paths
 //!   apart.
 
-pub(super) use super::unix::{pread, pwrite, volume_stats};
+pub(super) use super::unix::{allocate, pread, pwrite, volume_stats};

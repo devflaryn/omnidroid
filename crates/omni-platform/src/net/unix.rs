@@ -82,6 +82,13 @@ fn platform() -> &'static str {
     std::env::consts::OS
 }
 
+/// Intended: a host `errno` as this seam's kind, for an error `std` has no `ErrorKind` for --
+/// `EMSGSIZE` first, which `std` leaves uncategorised here as on Windows. Until the table is
+/// written, such an error stays [`NetErrorKind::Other`], which the adapter refuses by name.
+pub(super) fn kind_from_raw(_code: i32) -> NetErrorKind {
+    NetErrorKind::Other
+}
+
 fn unsupported<T>(operation: &'static str, intended: &'static str) -> NetResult<T> {
     Err(NetError::Unsupported { operation, intended, platform: platform() })
 }

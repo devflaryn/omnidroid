@@ -86,6 +86,22 @@ pub(super) fn pwrite(file: &File, buf: &[u8], offset: u64) -> FsResult<usize> {
     Ok(count)
 }
 
+/// `fallocate(2)` mode 0 on Windows: the file made at least `end` bytes long, never shorter.
+///
+/// **Extending is allocating here.** `File::set_len` is `SetEndOfFile`, and on NTFS a file that is
+/// not sparse -- none this seam creates is -- gets its clusters reserved when its end moves out:
+/// the allocation size grows with the file size, and a volume without the space fails the call
+/// (`ERROR_DISK_FULL`, `ENOSPC`) rather than a later write. A range inside the file is already
+/// allocated for the same reason. So "`offset..offset + len` will not fail for space" is true of
+/// this host once the file is `end` bytes long, which is the whole of `posix_fallocate`'s promise.
+pub(super) fn allocate(file: &File, end: u64) -> FsResult<()> {
+    let size = file.metadata().map_err(|error| FsError::io("fallocate", "a descriptor", &error))?.len();
+    if end > size {
+        file.set_len(end).map_err(|error| FsError::io("fallocate", "a descriptor", &error))?;
+    }
+    Ok(())
+}
+
 /// `statvfs(3)` on Windows, from three Win32 queries and no invented numbers.
 ///
 /// | `statvfs` field | where it comes from |

@@ -431,12 +431,19 @@ impl NetError {
         endpoint: impl Into<String>,
         error: &std::io::Error,
     ) -> NetError {
-        NetError::Io {
-            operation,
-            endpoint: endpoint.into(),
-            kind: NetErrorKind::classify(error),
-            detail: error.to_string(),
-        }
+        // `std` has no `ErrorKind` for every code a socket call produces -- `EMSGSIZE` among
+        // them, on both families of host -- so the backend's own table of raw codes is asked
+        // before a failure is left unclassified. MEASURED: a 1444-byte datagram with
+        // don't-fragment set, over the path MTU, reached the guest as an unclassified refusal
+        // rather than the `EMSGSIZE` `Socket::send_to` promises and ngtcp2's path-MTU discovery
+        // handles.
+        let kind = match NetErrorKind::classify(error) {
+            NetErrorKind::Other => {
+                error.raw_os_error().map_or(NetErrorKind::Other, super::backend::kind_from_raw)
+            }
+            kind => kind,
+        };
+        NetError::Io { operation, endpoint: endpoint.into(), kind, detail: error.to_string() }
     }
 
     /// Build a [`NetError::Io`] with a kind this seam decided rather than the host.
