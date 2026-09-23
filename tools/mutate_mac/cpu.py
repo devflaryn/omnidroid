@@ -324,4 +324,19 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
      """            if (range.first <= last && first <= range.last) {""",
      """            if (true) {""",
      dyn("a64_exec")),
+    # --- mac-mem: patch 0012, an invalidation that leaves nothing standing is a clear ---------------
+    ("mac-mem-A7", "A", "0012 reverted: a jit whose blocks were all invalidated keeps their records and code",
+     ARM64 + "a64_address_space.cpp",
+     """    if (block_entries.empty()) {
+        ClearCache();
+    }""",
+     """""",
+     dyn("bookkeeping")),
+    ("mac-mem-B2", "B", "0012 over-reaches: every range invalidation clears the whole cache",
+     ARM64 + "a64_address_space.cpp",
+     """    if (block_entries.empty()) {
+        ClearCache();
+    }""",
+     """    ClearCache();""",
+     dyn("a64_exec")),
 ]

@@ -294,3 +294,38 @@ fn an_invalidation_of_the_whole_address_space_reaches_every_block() {
     assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
     assert_eq!(vm.reg(0), 110, "both blocks were retranslated");
 }
+
+#[test]
+fn an_invalidation_that_leaves_no_block_standing_gives_their_bookkeeping_back() {
+    let _g = lock();
+    // Patch 0012. `omni-android` invalidates a context's whole guest space when its queue of other
+    // threads' invalidations overflows, which leaves every block of that jit invalidated. With
+    // nothing left standing and no generated code on the stack, what the invalidated blocks hold
+    // can never be used again.
+    run_chain(&chain_vm());
+
+    let vm = chain_vm();
+    let created = heap_in_use();
+    run_chain(&vm);
+    let ran = heap_in_use();
+
+    // SAFETY: `vm.raw()` is live and not executing.
+    unsafe { dynarmic_sys::od_jit_invalidate_range(vm.raw(), 0x1000, 0x4_0000_0000) };
+    vm.set_pc(CODE_BASE + 4 * (2 * BLOCKS as u64));
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE, "the SVC after the invalidation");
+    let invalidated = heap_in_use();
+
+    let held = (ran as f64 - created as f64) / BLOCKS as f64;
+    let kept = (invalidated as f64 - created as f64) / BLOCKS as f64;
+    eprintln!("per block: {held:.0} bytes held after running, {kept:.0} after invalidating them all");
+    assert!(held > 20.0, "the run was measured holding something: {held:.0} bytes per block");
+    assert!(
+        kept < 16.0,
+        "{kept:.0} bytes per block are still held for blocks that were all invalidated between runs"
+    );
+
+    // And the chain still runs, translated afresh.
+    vm.reset_stats();
+    run_chain(&vm);
+    assert!(vm.stats().read_code >= 2 * BLOCKS as u64, "the chain was translated again");
+}

@@ -334,6 +334,37 @@ bound is 16). Three behaviour tests cover the index, and pass on the pin as well
 second page of a two-page block, a write to the last word of a 70,001-instruction block (more than
 64 pages: the retranslation fetches all of it), and a 16 GiB invalidation reaching every block.
 
+### 0012 — arm64: an invalidation that leaves no block standing is a clear
+
+`0012-arm64-an-invalidation-that-leaves-nothing-is-a-clear.patch`. **arm64 only.** After
+`InvalidateCacheRanges`, if no block is left in `block_entries`, `A64AddressSpace` calls
+`ClearCache`.
+
+**Why it matters here, MEASURED** (census build of the pin, gate, n = 1 run): at +85 s the jits held
+835,605 block records of which **451,075 were invalidated blocks** -- 1,045,686 of 1,581,230 blocks
+emitted since start had been invalidated. Almost all of it came from one request: a 16 GiB range
+`[0x7000000000, 0x73ffffffff]`, the whole guest space, found up to 78,357 blocks at a time. That is
+`omni-android`'s cross-thread code invalidation (`boundary.rs`, `CodeWatch::broadcast`): every
+guest `munmap`/`mprotect`/`MADV_DONTNEED` is queued for every other live context, and a context
+that has not crossed the boundary for 64 of them has its queue collapse to "the whole address
+space". Invalidated blocks keep their records and their code until the cache is cleared, so each
+such jit held a dead copy of its whole translation and kept emitting above it until the cache filled.
+
+**Why it is the same thing the guest could see.** `InvalidateCacheRanges` runs only from
+`Jit::Impl::PerformRequestedCacheInvalidation`, before or after `RunCode` -- never with generated
+code on the stack. The return stack buffer is on `RunCode`'s frame and rebuilt at every entry, and
+every link to an invalidated location was pointed back at the dispatcher when it was invalidated
+(`RelinkForDescriptor(descriptor, nullptr)`). So when nothing is left in `block_entries`, no
+invalidated block can run again, and `ClearCache` -- what `Jit::ClearCache` (the guest's
+`IC IALLU`) does at the same point -- gives back exactly what cannot be used: the records and the
+cache space. The fastmem recompile path, which invalidates from inside generated code, calls
+`InvalidateBasicBlocks` directly and is not affected.
+
+`tests/bookkeeping.rs`, n = 32,768 blocks: after invalidating every block between runs, **364 bytes
+per block still held without the patch, 1 with it**; the chain then runs again, retranslated.
+Rows mac-mem-A7 (reverted) and mac-mem-B2 (every invalidation clears: `a64_exec`'s test that a
+small invalidation spares the other translations must fail).
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

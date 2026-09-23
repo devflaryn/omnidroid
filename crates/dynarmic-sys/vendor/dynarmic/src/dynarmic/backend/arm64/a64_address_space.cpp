@@ -542,6 +542,17 @@ void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>&
         }
     }
     InvalidateBasicBlocks(erase_locations);
+
+    // Omnidroid patch 0012: an invalidation that has left no block standing is a clear. This runs
+    // only from `Jit::Impl::PerformRequestedCacheInvalidation`, before or after `RunCode` -- never
+    // with generated code on the stack -- so no invalidated block can still be executing (the
+    // return stack buffer is rebuilt on every entry), and nothing links to one: every link to an
+    // invalidated location was pointed back at the dispatcher. What the invalidated blocks still
+    // hold -- their records, and their code in the cache -- can never be used again, which is
+    // what `ClearCache` gives back. The pin kept both until the cache filled.
+    if (block_entries.empty()) {
+        ClearCache();
+    }
 }
 
 void A64AddressSpace::ClearCache() {
