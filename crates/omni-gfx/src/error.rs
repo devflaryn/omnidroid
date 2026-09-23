@@ -188,7 +188,7 @@ pub enum GfxError {
     /// itself** rather than as a match that silently stopped being exhaustive.
     #[error(
         "this renderer has no Vulkan surface implementation for the `{system}` windowing system; \
-         only win32 (VK_KHR_win32_surface) is implemented"
+         win32 (VK_KHR_win32_surface) and xlib (VK_KHR_xlib_surface) are implemented"
     )]
     UnsupportedWindowSystem {
         /// The windowing system's short name, from

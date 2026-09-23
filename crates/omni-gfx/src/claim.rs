@@ -71,6 +71,19 @@ impl WindowKey {
         WindowKey(hwnd as u64)
     }
 
+    /// The key for an X11 window, which is its window id.
+    ///
+    /// **The id alone, not the connection with it.** An X window id is unique among live windows
+    /// on one server, and every connection that names the window names it by that id -- so two
+    /// swapchains over one window conflict whichever connection each came through, which the
+    /// connection pointer mixed in would hide. The cost is in the safe direction: two windows on
+    /// two different X servers in one process that happen to share an id would be refused as a
+    /// conflict they are not, by name, rather than a real conflict being allowed.
+    #[must_use]
+    pub const fn xlib(window: u64) -> WindowKey {
+        WindowKey(window)
+    }
+
     /// The key as the number it is, for a diagnostic.
     #[must_use]
     pub const fn raw(self) -> u64 {
