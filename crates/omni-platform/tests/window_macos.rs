@@ -462,16 +462,20 @@ fn wheel_lines_are_120_each_with_physical_signs() {
     require_gate();
     let mut window = open("omnidroid: wheel", 400, 300);
     let (_, ns_view) = handles(&window);
+    // The deltas are printed from this thread, not from the main one: libtest captures output per
+    // test thread, and a line printed on the main thread lands in the middle of the harness's
+    // `test <name> ... FAILED` line, which the mutation harness then cannot attribute.
     let scroll = |vertical: i32, horizontal: i32| {
-        on_main(|| {
+        let read = on_main(|| {
             let cg = unsafe { CGEventCreateScrollWheelEvent2(core::ptr::null(), 1, 2, vertical, horizontal, 0) };
             let event = ns_event(cg);
             let dy: f64 = unsafe { msg_send![&*event, deltaY] };
             let dx: f64 = unsafe { msg_send![&*event, deltaX] };
             let inverted: bool = unsafe { msg_send![&*event, isDirectionInvertedFromDevice] };
-            println!("wheel1 {vertical}, wheel2 {horizontal}: deltaY {dy}, deltaX {dx}, inverted {inverted}");
             let _: () = unsafe { msg_send![object(ns_view), scrollWheel: &*event] };
+            (dy, dx, inverted)
         });
+        println!("wheel1 {vertical}, wheel2 {horizontal}: deltaY {}, deltaX {}, inverted {}", read.0, read.1, read.2);
     };
     scroll(1, 0);
     scroll(-2, 0);
