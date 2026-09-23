@@ -662,6 +662,15 @@ fn writing_to_sealed_relro_faults() {
         Some(NO_FAULT),
         "the child wrote into PT_GNU_RELRO after sealing: relro is not actually read-only"
     );
+    // A unix child killed by a fault has no exit code at all: the verdict is the signal. SIGSEGV
+    // is 11 on every unix this project names.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(11), "expected the child to die of SIGSEGV, got {status:?}");
+        return;
+    }
+    #[cfg(not(unix))]
     assert_eq!(
         code,
         Some(ACCESS_VIOLATION),
