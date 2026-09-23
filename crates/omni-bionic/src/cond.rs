@@ -466,7 +466,12 @@ pub fn wait_end(
     // Reacquire the mutex BEFORE returning — every exit path. The owners table
     // captured by `with_owners` and the ambient id drive the identity checks.
     let owners = NopOwners::ambient();
-    crate::mutex::lock(mem, futex, &owners, &NopThreads, mutex_addr)?;
+    // A relock the futex's shutdown interrupted did **not** take the mutex, so it must not be
+    // reported as a wait that returned holding it: its `EINTR` is passed on, for the
+    // embedding's handler to refuse (see `mutex::lock`).
+    if crate::mutex::lock(mem, futex, &owners, &NopThreads, mutex_addr)? == consts::EINTR {
+        return Ok(consts::EINTR);
+    }
     Ok(if signalled { 0 } else { consts::ETIMEDOUT })
 }
 

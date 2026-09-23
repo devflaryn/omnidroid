@@ -875,6 +875,29 @@ pub(super) fn pthread_setname_np(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// **A lock wait the instance's shutdown interrupted: refused, never returned.**
+///
+/// `omni_bionic::mutex` answers `EINTR` when its futex is interrupted rather than loop in the
+/// host (`Futex::interrupted`), and POSIX gives neither `pthread_mutex_lock` nor
+/// `pthread_cond_wait` an `EINTR`. So it is not given to the guest: the call refuses, naming
+/// the shutdown, and the thread runner files a refusal made while stopping as the thread
+/// stopping -- the path `ALooper_pollOnce` and socket `poll` already take. MEASURED: gate87's
+/// thread 3 sat in `pthread_mutex_lock` (call site link `0x2b53a78`) past
+/// `join_guest_threads`, and the teardown failed.
+fn shutdown_interrupted(
+    view: &GuestView<'_>,
+    futex: &super::AddressFutex,
+    code: i32,
+) -> AbiResult<i32> {
+    if code == omni_bionic::errno::consts::EINTR && omni_bionic::threads::Futex::interrupted(futex) {
+        return Err(view.refusal(
+            "the instance is shutting down, and a lock wait interrupted by it has no true \
+             value to return: POSIX gives pthread_mutex_lock and pthread_cond_wait no EINTR",
+        ));
+    }
+    Ok(code)
+}
+
 /// Handlers whose `omni-bionic` function needs the thread registry, the futex and the owner
 /// table together. Written out rather than macro-generated because the capability set differs
 /// per function and spelling it makes the dependency visible.
@@ -916,9 +939,12 @@ sync_handler! {
     fn pthread_mutex_destroy(m) = |v, threads, futex, owners, conds|
         omni_bionic::mutex::destroy(&mut v, owners, m);
 
-    /// `int pthread_mutex_lock(pthread_mutex_t *m)` — blocks the calling guest thread.
-    fn pthread_mutex_lock(m) = |v, threads, futex, owners, conds|
-        omni_bionic::mutex::lock(&mut v, futex, owners, &threads, m);
+    /// `int pthread_mutex_lock(pthread_mutex_t *m)` — blocks the calling guest thread, and
+    /// refuses when the instance's shutdown interrupts the wait ([`shutdown_interrupted`]).
+    fn pthread_mutex_lock(m) = |v, threads, futex, owners, conds| {
+        let code = Lift::lift(omni_bionic::mutex::lock(&mut v, futex, owners, &threads, m), &v)?;
+        shutdown_interrupted(&v, futex, code)
+    };
 
     /// `int pthread_mutex_trylock(pthread_mutex_t *m)` — takes the mutex or answers `EBUSY`,
     /// and never blocks.
@@ -1175,7 +1201,8 @@ pub(super) fn pthread_cond_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 )
             })
         });
-        Lift::lift(produced, &view)?
+        let code = Lift::lift(produced, &view)?;
+        shutdown_interrupted(&view, futex, code)?
     };
     c.ret().i32(code);
     Ok(())
@@ -1311,7 +1338,8 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
                 )
             })
         });
-        Lift::lift(produced, &view)?
+        let code = Lift::lift(produced, &view)?;
+        shutdown_interrupted(&view, futex, code)?
     };
     c.ret().i32(code);
     Ok(())

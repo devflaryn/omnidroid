@@ -617,6 +617,15 @@ fn contend(
             Some(_) => remaining,
             None => Duration::from_millis(1_000),
         };
+        // **A futex that will not block again ends the wait here** (see
+        // `Futex::interrupted`): this loop runs in the host, inside one import, and would
+        // otherwise re-read the word forever and never return to a guest that could be
+        // stopped. `EINTR` is **not** a lock's answer in POSIX, so it never reaches a guest:
+        // the embedding's handler turns it into its shutdown refusal. MEASURED: a worker sat in
+        // `pthread_mutex_lock` past the embedding's join, which failed the teardown.
+        if futex.interrupted() {
+            return Ok(Err(consts::EINTR));
+        }
         match futex.wait(mutex_addr, lock_state::LOCKED_WITH_WAITERS, Some(bounded)) {
             WaitResult::Woken => continue, // re-run the acquire protocol
             WaitResult::TimedOut => {
@@ -838,6 +847,41 @@ mod tests {
 
     /// timedlock returns ETIMEDOUT when the holder never releases, and the
     /// measured elapsed time is at least the timeout.
+    /// A futex shut down the way an embedding's is: every wait refused, and interrupted.
+    struct ShutDown;
+
+    impl Futex for ShutDown {
+        fn wait(&self, _addr: u64, _expected: u32, _timeout: Option<Duration>) -> WaitResult {
+            WaitResult::WouldBlock
+        }
+        fn wake(&self, _addr: u64, _count: u32) -> u32 {
+            0
+        }
+        fn interrupted(&self) -> bool {
+            true
+        }
+    }
+
+    /// **A held mutex on an interrupted futex answers `EINTR` instead of looping in the host.**
+    /// The owner relocking a NORMAL mutex is the contention path with nobody to release it --
+    /// without the check this loops forever, which the channel's deadline turns into a failure.
+    /// A free mutex is still taken: interruption only answers a wait.
+    #[test]
+    fn a_contended_lock_on_an_interrupted_futex_answers_eintr() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut mem, _f, o, t) = setup(0x1000);
+            set_type(&mut mem, 0x1000, mutex_type::NORMAL);
+            let free = lock(&mut mem.clone(), &ShutDown, &o, &t, 0x1000).unwrap();
+            let held = lock(&mut mem.clone(), &ShutDown, &o, &t, 0x1000).unwrap();
+            let _ = tx.send((free, held));
+        });
+        let answers = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a lock on an interrupted futex must return, not loop in the host");
+        assert_eq!(answers, (0, consts::EINTR));
+    }
+
     #[test]
     fn timedlock_times_out() {
         let (mut mem, f, o, t) = setup(0x1000);
