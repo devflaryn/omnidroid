@@ -81,6 +81,86 @@ pub fn realtime_now() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO)
 }
 
+/// **A request to the host for a finer timer tick, for this process, held until dropped.**
+///
+/// The module documentation records the gap this closes: on Windows every sleep and every timed
+/// wait -- `std::thread::sleep`, and the `parking_lot` parks behind the guest's `futex` and
+/// condition variables -- is rounded to the scheduler tick, ~15.6 ms by default. A guest written
+/// for Linux's high-resolution timers pays that on every short wait it makes. `timeBeginPeriod`
+/// is the host's own remedy, per process since Windows 10 2004, and what a game on Windows does
+/// for the length of a session; its cost is power, which is the embedding's to weigh, so this is
+/// a guard an embedding holds rather than something the runtime does on its own.
+///
+/// On a unix host there is no coarse process tick to raise, and nothing is done -- **not measured
+/// here**, like the rest of this module off Windows.
+#[derive(Debug)]
+#[must_use = "the resolution is given back when this is dropped"]
+pub struct TimerResolution {
+    period_ms: u32,
+}
+
+/// The host refused a timer resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the host refused a {requested_ms} ms timer resolution (`timeBeginPeriod` answered {code})")]
+pub struct TimerResolutionError {
+    /// The period asked for, in whole milliseconds.
+    pub requested_ms: u32,
+    /// What the host answered.
+    pub code: u32,
+}
+
+impl TimerResolution {
+    /// Ask for timers that fire within `period` of when they are due, rounded **up** to whole
+    /// milliseconds and at least one -- the host's unit.
+    ///
+    /// # Errors
+    ///
+    /// [`TimerResolutionError`] if the host refuses the period.
+    pub fn raise(period: Duration) -> Result<TimerResolution, TimerResolutionError> {
+        let period_ms = u32::try_from(period.as_nanos().div_ceil(1_000_000)).unwrap_or(u32::MAX).max(1);
+        backend_raise(period_ms)?;
+        Ok(TimerResolution { period_ms })
+    }
+
+    /// The period this holds.
+    #[must_use]
+    pub fn period(&self) -> Duration {
+        Duration::from_millis(u64::from(self.period_ms))
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        backend_lower(self.period_ms);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn backend_raise(period_ms: u32) -> Result<(), TimerResolutionError> {
+    // SAFETY: `timeBeginPeriod` takes a period by value and touches no memory of ours.
+    let code = unsafe { windows_sys::Win32::Media::timeBeginPeriod(period_ms) };
+    if code == windows_sys::Win32::Media::TIMERR_NOERROR {
+        Ok(())
+    } else {
+        Err(TimerResolutionError { requested_ms: period_ms, code })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn backend_lower(period_ms: u32) {
+    // SAFETY: as `timeBeginPeriod`, and paired with the successful call that made this guard --
+    // the host requires exactly that pairing.
+    let _ = unsafe { windows_sys::Win32::Media::timeEndPeriod(period_ms) };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn backend_raise(_period_ms: u32) -> Result<(), TimerResolutionError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn backend_lower(_period_ms: u32) {}
+
 /// Block the calling thread for **at least** `duration`.
 ///
 /// There is no upper bound: see the module documentation on Windows' ~15.6 ms timer tick. A
@@ -122,6 +202,29 @@ mod tests {
             "n = {READS} reads advanced the clock not at all ({first:?} -> {previous:?}), which is \
              what a per-call epoch looks like"
         );
+    }
+
+    /// **A raised resolution makes a 1 ms sleep a 1 ms sleep**, where the default tick made it
+    /// ~15 ms; and it is given back. Measured as the median of 21 sleeps each way, so a single
+    /// preempted sleep cannot decide it. Windows only: elsewhere there is no tick to raise.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_raised_resolution_shortens_a_short_sleep() {
+        fn median_sleep() -> Duration {
+            let mut took: Vec<Duration> = (0..21)
+                .map(|_| {
+                    let started = Instant::now();
+                    sleep(Duration::from_millis(1));
+                    started.elapsed()
+                })
+                .collect();
+            took.sort();
+            took[took.len() / 2]
+        }
+        let resolution = TimerResolution::raise(Duration::from_micros(500)).expect("1 ms");
+        assert_eq!(resolution.period(), Duration::from_millis(1), "rounded up to the host's unit");
+        let fine = median_sleep();
+        assert!(fine < Duration::from_millis(4), "a 1 ms sleep took {fine:?} with the tick raised");
     }
 
     /// The wall clock is after 2020 and before 2100.

@@ -36,6 +36,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use omni_android::aaudio::{AAudio, PlatformOutput};
 use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
@@ -418,6 +419,8 @@ struct Guest {
     ndk: Arc<Ndk>,
     /// Bound only under [`GRAPHICS_GATE`]; see [`Guest::load`].
     vulkan: Option<Arc<Vulkan>>,
+    /// `libaaudio.so` over the host's default output, bound with the window for the same reason.
+    audio: Option<Arc<AAudio>>,
     boundary: Arc<Boundary>,
     object: LoadedObject,
     stack_top: GuestAddr,
@@ -526,8 +529,16 @@ impl Guest {
         // Room for every import, the 241 JNI slots and the NDK surface -- and, with graphics, the
         // Vulkan loader's pool and the data area its handle registries need (8192, not 4096:
         // `vulkan::REQUIRED_DATA_BYTES` records why no smaller arrangement exists).
+        //
+        // **And `libaaudio.so`, with the window**: a session a person sits at has the host's audio
+        // output behind FMOD's AAudio output (`omni_android::aaudio`), and a session without a
+        // window has none -- FMOD's NOSOUND fallback, as before.
+        let with_audio = graphics.is_some();
         let (vulkan_slots, data_bytes) = if graphics.is_some() {
-            (omni_android::vulkan::BOUND_SYMBOLS, omni_android::vulkan::REQUIRED_DATA_BYTES)
+            (
+                omni_android::vulkan::BOUND_SYMBOLS + omni_android::aaudio::BOUND_SYMBOLS,
+                omni_android::vulkan::REQUIRED_DATA_BYTES + omni_android::aaudio::REQUIRED_DATA_BYTES,
+            )
         } else {
             (0, 4096)
         };
@@ -544,6 +555,11 @@ impl Guest {
             vulkan.bind_into(&builder).expect("bind the Vulkan loader");
             vulkan.set_host(host);
             vulkan
+        });
+        let audio = with_audio.then(|| {
+            let audio = AAudio::new(Arc::new(PlatformOutput));
+            audio.bind_into(&builder).expect("bind libaaudio.so");
+            audio
         });
         bionic
             .declare_data_into(
@@ -614,6 +630,11 @@ impl Guest {
         if let Some(vulkan) = &vulkan {
             thread_host = thread_host.with_instance(vulkan.thread_instance());
         }
+        // **And AAudio**: FMOD opens its output on the engine's game thread, and the data callback
+        // runs on a thread the library itself starts.
+        if let Some(audio) = &audio {
+            thread_host = thread_host.with_instance(audio.thread_instance());
+        }
         bionic.set_thread_host(thread_host).expect("a thread host");
 
         ndk.set_asset_source(Arc::new(ApkAssets::open())).expect("the real APK's assets");
@@ -681,6 +702,7 @@ impl Guest {
             jni,
             ndk,
             vulkan,
+            audio,
             boundary,
             object,
             stack_top,
@@ -1173,6 +1195,12 @@ mod native_code {
 #[test]
 fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     let _serial = serialized();
+    // **The host's timers at 1 ms for the whole session**, as a game on Windows holds them. The
+    // guest was written for Linux's high-resolution timers; at Windows' default ~15.6 ms tick
+    // every short sleep and timed wait in its frame pipeline overslept by up to a tick (see
+    // `omni_platform::clock::TimerResolution`).
+    let _timers = omni_platform::clock::TimerResolution::raise(std::time::Duration::from_millis(1))
+        .expect("a 1 ms timer resolution");
     // **The socket record, off unless this run was asked for it.** See
     // `omni_platform::net::record` for what it can and cannot show -- the short version is that
     // the engine's TLS is its own, so what lands here is a `ClientHello` and then ciphertext, and
@@ -2786,12 +2814,29 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // **A person closing the window ends the session**, and the app is then closed as a device
     // closes it (below), rather than the run carrying on into a window that is gone.
     let mut close_requested = false;
+    // **A guest thread's death, reported when it happens.** They were reported only after the
+    // stop request, so a session whose game thread died read as "frozen" for as long as a person
+    // sat in front of it -- MEASURED, the first signed-in sessions: the render thread died on a
+    // refused JNI lookup and the window simply stopped changing.
+    let mut deaths_reported = guest.bionic.guest_thread_failures().len();
     while settle.elapsed() < session {
         if guest.bionic.live_guest_threads() == 0 || close_requested {
             break;
         }
         if std::time::Instant::now() >= next_frames {
             next_frames += FRAMES_EVERY;
+            let failures = guest.bionic.guest_thread_failures();
+            for failure in failures.iter().skip(deaths_reported) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "GUEST THREAD DIED at +{:.0}s: thread {} (started at link {:#x}): {}",
+                    settle.elapsed().as_secs_f32(),
+                    failure.thread,
+                    failure.start_routine.wrapping_sub(guest.object.base),
+                    failure.why
+                );
+            }
+            deaths_reported = failures.len();
             let now = presents();
             let _ = writeln!(
                 std::io::stderr(),
@@ -3065,6 +3110,15 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         None => {
             let _ = writeln!(std::io::stderr(), "VULKAN: not bound ({GRAPHICS_GATE} unset)");
+        }
+    }
+    // **And what FMOD asked `libaaudio.so` for**, the same way.
+    match &guest.audio {
+        Some(audio) => {
+            let _ = writeln!(std::io::stderr(), "AAUDIO: {}", audio.report());
+        }
+        None => {
+            let _ = writeln!(std::io::stderr(), "AAUDIO: not bound ({GRAPHICS_GATE} unset)");
         }
     }
 
