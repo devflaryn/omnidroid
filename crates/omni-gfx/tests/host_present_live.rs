@@ -113,6 +113,11 @@ fn present_and_read_back(api_version: u32) {
     }).unwrap());
     let surface = ok("vkCreateAndroidSurfaceKHR", host.create_platform_surface(instance, window.raw()).unwrap());
     println!("api {api_version:#x}: {platform}, surface made by {}", surface.host_call);
+    assert_eq!(
+        surface.host_call,
+        host.platform_surface_entry_point().unwrap(),
+        "the surface must be made by the call the extension pairs with"
+    );
     let surface = surface.surface;
 
     let physical = ok("vkEnumeratePhysicalDevices", host.physical_devices(instance).unwrap())

@@ -263,6 +263,22 @@ fn wait_wakes_for_an_event_and_times_out_without_one() {
     assert_eq!(drain(&mut window), vec![WindowEvent::CloseRequested]);
 }
 
+/// **The close button is a request**: `performClose:` (what the button does) reports
+/// `CloseRequested` and the window stays on screen, where AppKit's default would have closed it.
+#[test]
+#[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+fn the_close_button_is_a_request_and_the_window_stays_on_screen() {
+    require_gate();
+    let mut window = open("omnidroid: close stays", 320, 240);
+    window.show();
+    let (ns_window, _) = handles(&window);
+    let visible = || -> bool { on_main(|| unsafe { msg_send![object(ns_window), isVisible] }) };
+    assert!(visible(), "a shown window is visible");
+    window.request_close().unwrap();
+    poll_until(&mut window, "the close request", |e| *e == WindowEvent::CloseRequested);
+    assert!(visible(), "the window was closed rather than asked");
+}
+
 /// Keys through `-[NSWindow sendEvent:]`: `keycode` is the kVK, `scancode` the set-1 code of the
 /// same physical key, typed text follows its key, and Return (a control character) types nothing.
 #[test]
@@ -471,12 +487,26 @@ fn child() {
     }
 }
 
+/// Run this binary's `child` test with `mode`, **killed after 20 s**: a hang is a failure this
+/// test must report, not wait out.
 fn run_child(binary: &std::path::Path, mode: &str) -> std::process::Output {
-    Command::new(binary)
+    let mut child = Command::new(binary)
         .args(["--ignored", "--exact", "child", "--nocapture", "--test-threads=1"])
         .env("OMNI_MACOS_CHILD", mode)
-        .output()
-        .expect("the test binary runs as a child")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the test binary runs as a child");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("the child ({mode}) hung for 20 s and was killed: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
 }
 
 /// With `main` on a pthread, a test binary still ends the way it would have: a passing run 0, a
