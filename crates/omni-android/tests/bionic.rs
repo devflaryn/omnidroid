@@ -13838,3 +13838,35 @@ fn sched_batch_is_refused_by_name_rather_than_granted() {
         "the child must die on a refusal naming pthread_setschedparam: {failures:?}"
     );
 }
+
+/// **`gethostname` answers Android's `localhost`**, with its NUL, and `ENAMETOOLONG` for a buffer
+/// that cannot hold it -- bionic's two answers. MEASURED why it is bound: a TaskScheduler worker
+/// died on it unbound in the owner's signed-in session (2026-09-23, +435 s).
+#[test]
+fn gethostname_answers_android_localhost_or_enametoolong() {
+    let _guard = serialized();
+    let f = fixture();
+    let name = f.guest.data + 0x300;
+    let out = f.guest.data + 0x400;
+    f.guest.write_bytes(name, &[0xAA; 16]);
+    let entry = program(&f, |asm| {
+        asm.mov(23, out as u64);
+        asm.mov(0, name as u64);
+        asm.mov(1, 16);
+        asm.bl(f.thunk("gethostname"));
+        asm.push(str_imm(0, 23, 0));
+        asm.mov(0, (name + 0x40) as u64);
+        asm.mov(1, 9); // "localhost" without room for its NUL
+        asm.bl(f.thunk("gethostname"));
+        asm.push(str_imm(0, 23, 8));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_imm(0, 0, 0));
+        asm.push(str_imm(0, 23, 16));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(read_u64_guest(&f, out) as u32, 0, "gethostname into 16 bytes");
+    assert_eq!(read_guest(&f, name, 10), b"localhost\0", "the node name, with its NUL");
+    assert_eq!(read_guest(&f, name + 10, 1), [0xAA], "and not a byte more");
+    assert_eq!(read_u64_guest(&f, out + 8) as i32, -1, "9 bytes cannot hold it");
+    assert_eq!(read_u64_guest(&f, out + 16) as u32, 36, "ENAMETOOLONG");
+}

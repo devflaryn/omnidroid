@@ -1796,6 +1796,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // ---- phase 3a: process and environment. Four answers, two facts about a process that was
     // given nothing, two terminations reported rather than performed, and four refusals by name.
     ("getpid", procenv::getpid),
+    ("gethostname", procenv::gethostname),
     // M6: SQLite's `robustFchown` asking whether it is root, on the thread that had just taken its
     // first record lock. Answered from `Bionic::set_app_uid`, which has no default. Outside Task
     // 1's 188; `BEYOND_THE_PREDICTION` records how it was found.

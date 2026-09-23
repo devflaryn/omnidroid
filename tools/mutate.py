@@ -298,6 +298,8 @@ BIONIC_CONDATTR = ["cargo", "test", "-p", "omni-android", "--release", "--test",
 # The scheduling-parameter bindings, from guest code: `tests/bionic.rs` filtered by name. No APK.
 BIONIC_SCHED = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
                 "sched"]
+BIONIC_HOSTNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+                   "gethostname"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7215,6 +7217,19 @@ directory", ADAPTER_FILES,
      """        OTHER | BATCH | IDLE => 0,
 """,
      BIONIC_SCHED),
+
+    # gethostname: a TaskScheduler worker died on it unbound in a signed-in session (2026-09-23).
+    ("gethostname-A1", "A", "a buffer too short for the node name is written anyway, not ENAMETOOLONG",
+     "crates/omni-android/src/bionic/procenv.rs",
+     """    let fits = usize::try_from(len).is_ok_and(|len| len >= node.len());""",
+     """    let fits = true || usize::try_from(len).is_ok_and(|len| len >= node.len());""",
+     BIONIC_HOSTNAME),
+    ("gethostname-B1", "B", "the node name is copied without its NUL",
+     "crates/omni-android/src/bionic/procenv.rs",
+     """    node.push(0);
+    let fits""",
+     """    let fits""",
+     BIONIC_HOSTNAME),
 ]
 
 

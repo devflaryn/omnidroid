@@ -206,6 +206,44 @@ pub(super) fn getpid(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// The kernel hostname of every Android device: AOSP's `init.rc` runs `hostname localhost` in its
+/// `on init` section, and nothing on an application's path changes it. A fact of the platform this
+/// layer presents, as `setpriority`'s answer below is `init.rc`'s `setrlimit nice`.
+pub const ANDROID_HOSTNAME: &str = "localhost";
+
+/// `int gethostname(char *name, size_t len)`
+///
+/// bionic's: `uname`, then the node name copied **with** its NUL when `len` holds it, and
+/// `-1`/`ENAMETOOLONG` when it does not (`libc/bionic/gethostname.cpp`). The node name is
+/// [`ANDROID_HOSTNAME`].
+///
+/// MEASURED why: in the owner's first signed-in session with the faster JIT's predecessor
+/// (2026-09-23), a TaskScheduler worker died on it unbound at +435 s -- `GUEST THREAD DIED: thread
+/// 3 (started at link 0x284d168): ... gethostname ... nothing in the compatibility layer
+/// implements it` -- the same worker start routine the `pthread_condattr_init` death had.
+pub(super) fn gethostname(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (name, len) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let mut node = ANDROID_HOSTNAME.as_bytes().to_vec();
+    node.push(0);
+    let fits = usize::try_from(len).is_ok_and(|len| len >= node.len());
+    let mut view = enter(c, &state);
+    if !fits {
+        view.set_errno(omni_bionic::errno::consts::ENAMETOOLONG);
+        drop(view);
+        c.ret().i32(-1);
+        return Ok(());
+    }
+    let at = guest_address(view.blaming(0), name)?;
+    view.mem().write_bytes(at, &node, Blame::new(view.symbol(), view.address(), 0))?;
+    drop(view);
+    c.ret().i32(0);
+    Ok(())
+}
+
 /// `PRIO_PROCESS`.
 const PRIO_PROCESS: i32 = 0;
 
