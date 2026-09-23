@@ -156,15 +156,12 @@ ROWS = [
      """        if resumed <= 0 {""",
      AUDIO),
 
-    # MEASURED before the fix: in blocking mode, lnx-audio-A1 hung the harness in
-    # a `snd_pcm_writei` into a full, unstarted buffer (1963 s, ended by killing the binary). The row
-    # reverts non-blocking mode.
-    ("lnx-audio-A12", "A", "the PCM is opened blocking, so a write with no room never returns",
-     LINUX_RS,
-     """request.device.as_ptr(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)""",
-     """request.device.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0)""",
-     AUDIO),
-
+    # MEASURED: lnx-audio-A1 once held the harness for 1963 s (ended by killing the test binary):
+    # `write` looped without end on a 0-frame `snd_pcm_writei` into a full, unstarted buffer --
+    # which blocking and non-blocking mode both answer with 0 (C probe, PipeWire plugin and
+    # plughw). This row reverts the handling of that 0. (A row reverting non-blocking mode was
+    # tried as lnx-audio-A12 and was NOT CAUGHT: on this host the two modes behaved identically
+    # in every test, so it was removed rather than kept as a permanent miss; see linux.rs.)
     ("lnx-audio-A13", "A", "a non-blocking write of 0 frames is not treated as no room (spins)",
      LINUX_RS,
      """            if code == -libc::EAGAIN || wrote == 0 {""",

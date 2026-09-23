@@ -38,14 +38,18 @@
 //!
 //! # What `open` does, in order
 //!
-//! 1. `snd_pcm_open("default", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)`. **Non-blocking**, so
-//!    that no ALSA call here can wait for ever: a blocking `snd_pcm_writei` into a full buffer
-//!    that nothing drains (a stream not started, a device that stopped) never returns, and the
-//!    thread it takes is the guest's audio thread. MEASURED as a hang of over half an hour (ended by killing the test binary) under mutation row
-//!    `lnx-audio-A1`, before this was changed. Where `snd_pcm_writei` finds no room (it answers
-//!    `-EAGAIN`, or -- MEASURED on a prepared stream -- a count of 0), `write` waits for room with
-//!    `snd_pcm_wait` for at most [`write_wait`] and then fails naming `snd_pcm_writei` with
-//!    `EAGAIN`, the errno non-blocking ALSA uses for "no room", whichever of the two it saw.
+//! 1. `snd_pcm_open("default", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)`. Where
+//!    `snd_pcm_writei` finds no room -- it answers `-EAGAIN`, or, MEASURED on a prepared stream
+//!    through both PipeWire's plugin and `plughw`, **a count of 0, in blocking mode as well** --
+//!    `write` waits for room with `snd_pcm_wait` for at most [`write_wait`] and then fails naming
+//!    `snd_pcm_writei` with `EAGAIN`, whichever of the two it saw. The 0 is the one that mattered:
+//!    before it was handled, `write` looped on it without end, and under mutation row
+//!    `lnx-audio-A1` that loop held the harness for over half an hour (1963 s, ended by killing
+//!    the test binary). Non-blocking mode is kept so that no ALSA call here waits without a
+//!    bound, but its necessity is **not measured**: a blocking open behaved identically in every
+//!    test on this host (row A12, removed as uncatchable here, said so), and the case it guards
+//!    -- a blocking `snd_pcm_writei` on a *running* stream whose device has stopped draining,
+//!    which alsa-lib documents as waiting for room -- could not be produced.
 //! 2. hw params: `RW_INTERLEAVED`, `FLOAT_LE` (the only sample shape the seam writes; refused by
 //!    the host means [`AudioError::Alsa`] naming `snd_pcm_hw_params_set_format`), channels and rate
 //!    *near* the preference, then the rate again **exactly** so that a rate that is not a whole
