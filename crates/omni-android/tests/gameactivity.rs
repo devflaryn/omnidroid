@@ -171,6 +171,77 @@ fn session_length() -> std::time::Duration {
 /// How often the session prints its frame count.
 const FRAMES_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// **Where each guest thread's time goes**, from the boundary's own per-thread records: every
+/// `PROFILE_EVERY` a thread is either in guest code (`crossings == exits`) or inside the handler
+/// its last crossing named. Sampled on its own host thread until `stop`, then summarised.
+///
+/// "In guest code" is translated code running **and** the JIT translating it, and the demand
+/// pager resolving its faults -- the boundary cannot tell those apart -- while every blocking wait
+/// is inside a handler (`futex`, `pthread_cond_wait`, ...), so a thread pinned at a core that
+/// samples in guest code is CPU-bound in the guest or the translator, not waiting.
+fn sample_profile(boundary: &Boundary, stop: &std::sync::atomic::AtomicBool) -> String {
+    use std::collections::BTreeMap;
+    struct Seen {
+        samples: u64,
+        in_guest: u64,
+        handlers: BTreeMap<String, u64>,
+        first_crossings: u64,
+        last_crossings: u64,
+    }
+    let started = std::time::Instant::now();
+    let mut seen: BTreeMap<u64, Seen> = BTreeMap::new();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        for report in boundary.threads() {
+            let entry = seen.entry(report.guest_thread).or_insert(Seen {
+                samples: 0,
+                in_guest: 0,
+                handlers: BTreeMap::new(),
+                first_crossings: report.crossings,
+                last_crossings: report.crossings,
+            });
+            entry.samples += 1;
+            entry.last_crossings = report.crossings;
+            if report.crossings == report.exits {
+                entry.in_guest += 1;
+            } else {
+                let symbol = report.symbol.unwrap_or_else(|| "?".to_string());
+                *entry.handlers.entry(symbol).or_insert(0) += 1;
+            }
+        }
+        std::thread::sleep(PROFILE_EVERY);
+    }
+    let seconds = started.elapsed().as_secs_f64().max(0.001);
+    let mut threads: Vec<(u64, Seen)> = seen.into_iter().collect();
+    // Busiest first: the most samples not parked in a handler that blocks is not knowable here,
+    // so order by crossings per second, the one rate every thread has.
+    threads.sort_by(|a, b| {
+        (b.1.last_crossings - b.1.first_crossings).cmp(&(a.1.last_crossings - a.1.first_crossings))
+    });
+    let mut out = format!("PROFILE: {seconds:.1}s sampled every {PROFILE_EVERY:?}\n");
+    for (thread, seen) in threads {
+        let percent = |n: u64| 100.0 * n as f64 / seen.samples.max(1) as f64;
+        let mut handlers: Vec<(&String, &u64)> = seen.handlers.iter().collect();
+        handlers.sort_by(|a, b| b.1.cmp(a.1));
+        let top: Vec<String> = handlers
+            .iter()
+            .take(6)
+            .map(|(symbol, n)| format!("{symbol} {:.0}%", percent(**n)))
+            .collect();
+        out.push_str(&format!(
+            "  guest thread {thread:#x}: {} samples, {:.0}% in guest code, {:.0} crossings/s; in \
+             handlers: {}\n",
+            seen.samples,
+            percent(seen.in_guest),
+            (seen.last_crossings - seen.first_crossings) as f64 / seconds,
+            top.join(", ")
+        ));
+    }
+    out
+}
+
+/// How often [`sample_profile`] looks.
+const PROFILE_EVERY: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// How long the gate waits for the engine's own flag fetch to answer, before sending the window
 /// again.
 ///
@@ -2371,6 +2442,16 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // (presents when the size was delivered, the size) for each resize, to check frames follow.
     let mut resizes: Vec<(u64, (u32, u32))> = Vec::new();
     let mut resize_failure: Option<String> = None;
+    // **OMNI_PROFILE=1**: `sample_profile` on its own thread for the whole session.
+    let profiler = std::env::var_os("OMNI_PROFILE").is_some().then(|| {
+        let boundary = Arc::clone(&guest.boundary);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || sample_profile(&boundary, &stop))
+        };
+        (stop, handle)
+    });
     let settle = std::time::Instant::now();
     while settle.elapsed() < session {
         if guest.bionic.live_guest_threads() == 0 {
@@ -2511,6 +2592,17 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if let Some((stop, handle)) = profiler {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        match handle.join() {
+            Ok(report) => {
+                let _ = write!(std::io::stderr(), "{report}");
+            }
+            Err(_) => {
+                let _ = writeln!(std::io::stderr(), "PROFILE: the sampler panicked");
+            }
+        }
     }
     // **After each resize, frames**: the engine has to have presented again since the size it
     // was told changed, or the window survived the resize and the game did not.
